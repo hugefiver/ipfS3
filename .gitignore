@@ -1,0 +1,8 @@
+/target
+*.db
+*.db-*
+.env
+config.toml
+largefile.bin
+*.png
+*.txt

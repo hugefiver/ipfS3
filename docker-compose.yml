@@ -1,0 +1,53 @@
+services:
+  kubo:
+    build: ./ipfs
+    image: ghcr.io/hugefiver/ipfs3-kubo:latest
+    container_name: ipfs-s3-kubo
+    ports:
+      - "4001:4001"   # Swarm (P2P; expose for multi-node / public reachability)
+      - "5001:5001"   # RPC (internal; do NOT expose to public internet in prod)
+      - "8080:8080"   # Gateway (optional; for direct IPFS access verification)
+    volumes:
+      - ipfs_data:/data/ipfs
+    environment:
+      - IPFS_PATH=/data/ipfs
+    healthcheck:
+      test: ["CMD", "ipfs", "id"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+    restart: unless-stopped
+
+  gateway:
+    build: .
+    image: ghcr.io/hugefiver/ipfs3:latest
+    container_name: ipfs-s3-gateway
+    ports:
+      - "9000:9000"
+    volumes:
+      - gateway_data:/data
+    environment:
+      - IPFS_S3_CONFIG=/data/config.toml
+      - IPFS_S3_ACCESS_KEY_ID=${IPFS_S3_ACCESS_KEY_ID}
+      - IPFS_S3_SECRET_ACCESS_KEY=${IPFS_S3_SECRET_ACCESS_KEY}
+      - IPFS_S3_MASTER_KEY=${IPFS_S3_MASTER_KEY}
+      - RUST_LOG=info
+    depends_on:
+      kubo:
+        condition: service_healthy
+    restart: unless-stopped
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: ipfs-s3-cloudflared
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on:
+      - gateway
+    restart: unless-stopped
+
+volumes:
+  ipfs_data:
+  gateway_data:

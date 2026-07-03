@@ -1,0 +1,15 @@
+/target
+.git
+.github
+docs
+tests
+*.md
+.env
+.env.example
+config.toml
+config.example.toml
+*.db
+*.db-*
+*.png
+*.txt
+largefile.bin

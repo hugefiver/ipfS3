@@ -1,0 +1,56 @@
+[package]
+name = "ipfs-s3-gateway"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "ipfs-s3-gateway"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+tower = "0.5"
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "tokio"] }
+s3s = "0.14"
+reqwest = { version = "0.13", features = ["stream", "json", "multipart"] }
+sea-orm = { version = "1", features = ["sqlx-sqlite", "sqlx-postgres", "runtime-tokio-rustls", "macros", "with-json", "with-uuid", "with-chrono"] }
+sea-orm-migration = { version = "1", features = ["sqlx-sqlite", "sqlx-postgres", "runtime-tokio-rustls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1.1"
+
+# Crypto
+aes-gcm = "0.11"
+sha2 = "0.11"
+hmac = "0.13"
+hkdf = "0.13"
+rand = "0.10"
+
+uuid = { version = "1", features = ["v4"] }
+bytes = "1"
+futures-util = "0.3"
+tokio-util = { version = "0.7", features = ["io"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-trait = "0.1"
+thiserror = "2"
+hex = "0.4"
+base64 = "0.22"
+percent-encoding = "2"
+http = "1"
+anyhow = "1"
+async-stream = "0.3"
+subtle = "2"
+quick-xml = "0.41"
+md5 = "0.8.0"
+
+[dev-dependencies]
+wiremock = "0.6"
+tempfile = "3"
+rust-s3 = { version = "0.37", default-features = false, features = ["tokio-rustls-tls", "fail-on-err"] }
