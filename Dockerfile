@@ -1,4 +1,4 @@
-FROM rust:latest-bookworm AS chef
+FROM rust:latest AS chef
 RUN cargo install cargo-chef --locked
 WORKDIR /app
 
@@ -29,7 +29,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/sccache,sharing=locked \
     cargo build --release --bin ipfs-s3-gateway
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
