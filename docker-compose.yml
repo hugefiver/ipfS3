@@ -27,10 +27,9 @@ services:
       - "9000:9000"
     volumes:
       - gateway_data:/data
+      - ./config.toml:/data/config.toml:ro
     environment:
       - IPFS_S3_CONFIG=/data/config.toml
-      - IPFS_S3_ACCESS_KEY_ID=${IPFS_S3_ACCESS_KEY_ID}
-      - IPFS_S3_SECRET_ACCESS_KEY=${IPFS_S3_SECRET_ACCESS_KEY}
       - IPFS_S3_MASTER_KEY=${IPFS_S3_MASTER_KEY}
       - RUST_LOG=info
     depends_on:

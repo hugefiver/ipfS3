@@ -183,10 +183,12 @@ impl Config {
             std::env::var("IPFS_S3_ACCESS_KEY_ID"),
             std::env::var("IPFS_S3_SECRET_ACCESS_KEY"),
         ) {
-            config.auth.credentials = vec![Credential {
-                access_key,
-                secret_key,
-            }];
+            if !access_key.is_empty() && !secret_key.is_empty() {
+                config.auth.credentials = vec![Credential {
+                    access_key,
+                    secret_key,
+                }];
+            }
         }
         if let Ok(master_key) = std::env::var("IPFS_S3_MASTER_KEY") {
             config.crypto.master_key = master_key;
