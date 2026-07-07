@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
@@ -521,6 +522,9 @@ pub async fn list_objects_v2(
 ) -> S3Result<S3Response<ListObjectsV2Output>> {
     let bucket = &req.input.bucket;
     let prefix = req.input.prefix.clone();
+    let delimiter = req.input.delimiter.clone();
+    let encoding_type = req.input.encoding_type.clone();
+    let start_after = req.input.start_after.clone();
     let continuation_token = req.input.continuation_token.clone();
     let max_keys = req.input.max_keys.unwrap_or(1000).clamp(1, 1000) as u64;
     let db = state.store.db();
@@ -530,57 +534,558 @@ pub async fn list_objects_v2(
         return Err(s3s::s3_error!(NoSuchBucket, "bucket not found: {}", bucket));
     }
 
-    // Query max_keys + 1 to determine if there are more objects without
-    // relying on an exact-count heuristic that misreports at boundaries.
-    let query_limit = max_keys + 1;
-    let objects = crate::store::object::list(
-        db,
-        bucket,
-        prefix.as_deref(),
-        continuation_token.as_deref(),
-        query_limit,
-    )
-    .await?;
+    // Internal cursor: explicit continuation token takes priority over
+    // StartAfter. Both are exclusive via `store::object::list`'s key > token
+    // filter.
+    let mut cursor = continuation_token
+        .clone()
+        .filter(|t| !t.is_empty())
+        .or_else(|| start_after.clone().filter(|s| !s.is_empty()));
+    let batch_limit = (max_keys + 1).max(1000);
 
-    let is_truncated = objects.len() as u64 > max_keys;
-    let next_token = if is_truncated {
-        // The next continuation token is the last key we're returning (not
-        // the extra one).
-        objects.get(max_keys as usize - 1).map(|m| m.key.clone())
-    } else {
-        None
-    };
+    let mut builder = ListObjectsV2PageBuilder::new(
+        prefix.as_deref().unwrap_or(""),
+        delimiter.as_deref(),
+        max_keys as usize,
+    );
 
-    // Truncate to max_keys, dropping the extra probe row.
-    let returned: Vec<_> = objects.into_iter().take(max_keys as usize).collect();
-    let returned_count = returned.len() as i64;
+    loop {
+        let rows = crate::store::object::list(
+            db,
+            bucket,
+            prefix.as_deref(),
+            cursor.as_deref(),
+            batch_limit,
+        )
+        .await?;
 
-    let contents: Vec<Object> = returned
-        .into_iter()
-        .map(|m| Object {
-            key: Some(m.key),
-            size: Some(m.size),
-            e_tag: Some(ETag::Strong(m.etag)),
-            last_modified: Some(Timestamp::from(SystemTime::from(m.created_at))),
-            ..Default::default()
+        let exhausted = rows.len() < batch_limit as usize;
+        for row in rows {
+            cursor = Some(row.key.clone());
+            if builder.push_row(row) == PushListEntryResult::PageComplete {
+                break;
+            }
+        }
+
+        if exhausted || builder.is_truncated {
+            break;
+        }
+    }
+
+    let page = builder.finish();
+
+    let contents: Vec<Object> = page
+        .entries
+        .iter()
+        .filter_map(|e| match e {
+            ListObjectsV2Entry::Object(m) => Some(Object {
+                key: Some(m.key.clone()),
+                size: Some(m.size),
+                e_tag: Some(ETag::Strong(m.etag.clone())),
+                last_modified: Some(Timestamp::from(SystemTime::from(m.created_at))),
+                ..Default::default()
+            }),
+            ListObjectsV2Entry::CommonPrefix { .. } => None,
+        })
+        .collect();
+
+    let common_prefixes: Vec<CommonPrefix> = page
+        .entries
+        .iter()
+        .filter_map(|e| match e {
+            ListObjectsV2Entry::CommonPrefix { prefix, .. } => Some(CommonPrefix {
+                prefix: Some(prefix.clone()),
+            }),
+            ListObjectsV2Entry::Object(_) => None,
         })
         .collect();
 
     Ok(S3Response::new(ListObjectsV2Output {
         contents: Some(contents),
-        is_truncated: Some(is_truncated),
-        continuation_token,
-        next_continuation_token: next_token,
-        key_count: Some(returned_count as i32),
+        common_prefixes: (!common_prefixes.is_empty()).then_some(common_prefixes),
+        is_truncated: Some(page.is_truncated),
+        continuation_token: continuation_token.clone(),
+        next_continuation_token: page.next_token,
+        key_count: Some(page.entries.len() as i32),
         max_keys: Some(max_keys as i32),
         name: Some(bucket.clone()),
+        prefix: Some(prefix.unwrap_or_default()),
+        delimiter,
+        encoding_type,
+        start_after,
         ..Default::default()
     }))
+}
+
+// ---------------------------------------------------------------------------
+// ListObjectsV2 delimiter / CommonPrefixes folding model
+// ---------------------------------------------------------------------------
+
+use crate::store::entities::object;
+
+/// A single entry that may be returned by ListObjectsV2: either a concrete
+/// object or a folded common prefix.
+#[derive(Clone, Debug)]
+enum ListObjectsV2Entry {
+    Object(object::Model),
+    CommonPrefix {
+        prefix: String,
+        /// The key of the most recent object row that contributed to this
+        /// common prefix. Used to build the continuation token for the next
+        /// page so pagination can resume after all consumed rows.
+        continuation_key: String,
+    },
+}
+
+impl ListObjectsV2Entry {
+    #[cfg(test)]
+    #[allow(dead_code)]
+    fn key(&self) -> &str {
+        match self {
+            ListObjectsV2Entry::Object(m) => &m.key,
+            ListObjectsV2Entry::CommonPrefix { prefix, .. } => prefix,
+        }
+    }
+}
+
+/// Result of folding one page of object rows.
+#[derive(Clone, Debug)]
+struct ListObjectsV2Page {
+    entries: Vec<ListObjectsV2Entry>,
+    is_truncated: bool,
+    next_token: Option<String>,
+}
+
+#[cfg(test)]
+impl ListObjectsV2Page {
+    fn object_keys(&self) -> Vec<&str> {
+        self.entries
+            .iter()
+            .filter_map(|e| match e {
+                ListObjectsV2Entry::Object(m) => Some(m.key.as_str()),
+                ListObjectsV2Entry::CommonPrefix { .. } => None,
+            })
+            .collect()
+    }
+
+    fn common_prefixes(&self) -> Vec<&str> {
+        self.entries
+            .iter()
+            .filter_map(|e| match e {
+                ListObjectsV2Entry::Object(_) => None,
+                ListObjectsV2Entry::CommonPrefix { prefix, .. } => Some(prefix.as_str()),
+            })
+            .collect()
+    }
+}
+
+/// Determine the common prefix for `key` under `prefix` and `delimiter`.
+///
+/// Returns `None` when there is no delimiter, when the key does not start with
+/// `prefix`, or when the remaining suffix contains no delimiter.
+fn common_prefix_for_key(key: &str, prefix: &str, delimiter: Option<&str>) -> Option<String> {
+    let delimiter = delimiter?;
+    let rest = key.strip_prefix(prefix)?;
+    let idx = rest.find(delimiter)?;
+    let end = idx + delimiter.len();
+    Some(format!("{}{}", prefix, &rest[..end]))
+}
+
+/// Result of pushing a row into the page builder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PushListEntryResult {
+    /// The row was consumed (added or merged) and the page can accept more.
+    Continue,
+    /// The row was not added because the page is full.
+    PageComplete,
+}
+
+/// Builds a single ListObjectsV2 page with delimiter folding and max-keys
+/// accounting.
+struct ListObjectsV2PageBuilder {
+    prefix: String,
+    delimiter: Option<String>,
+    max_keys: usize,
+    entries: Vec<ListObjectsV2Entry>,
+    /// Maps a common prefix string to its position in `entries`.
+    common_prefix_positions: HashMap<String, usize>,
+    /// The key of the last row that was returned/merged into this page.
+    last_returned_token: Option<String>,
+    /// Set to true once we determine that at least one additional row exists
+    /// after `max_keys` entries have been returned.
+    is_truncated: bool,
+}
+
+impl ListObjectsV2PageBuilder {
+    fn new(prefix: &str, delimiter: Option<&str>, max_keys: usize) -> Self {
+        Self {
+            prefix: prefix.to_string(),
+            delimiter: delimiter.map(|s| s.to_string()),
+            max_keys,
+            entries: Vec::new(),
+            common_prefix_positions: HashMap::new(),
+            last_returned_token: None,
+            is_truncated: false,
+        }
+    }
+
+    /// Fold a single object row into the page.
+    fn push_row(&mut self, row: object::Model) -> PushListEntryResult {
+        let key = row.key.clone();
+
+        if let Some(common_prefix) =
+            common_prefix_for_key(&key, &self.prefix, self.delimiter.as_deref())
+        {
+            if let Some(&pos) = self.common_prefix_positions.get(&common_prefix) {
+                // Row merges into an already-returned common prefix: update
+                // its continuation key and our last consumed token, but do
+                // not increase the visible entry count.
+                if let ListObjectsV2Entry::CommonPrefix {
+                    ref mut continuation_key,
+                    ..
+                } = self.entries[pos]
+                {
+                    *continuation_key = key.clone();
+                }
+                self.last_returned_token = Some(key);
+                return PushListEntryResult::Continue;
+            }
+
+            if self.entries.len() >= self.max_keys {
+                self.is_truncated = true;
+                return PushListEntryResult::PageComplete;
+            }
+
+            let pos = self.entries.len();
+            self.entries.push(ListObjectsV2Entry::CommonPrefix {
+                prefix: common_prefix.clone(),
+                continuation_key: key.clone(),
+            });
+            self.common_prefix_positions.insert(common_prefix, pos);
+            self.last_returned_token = Some(key);
+            return PushListEntryResult::Continue;
+        }
+
+        if self.entries.len() >= self.max_keys {
+            self.is_truncated = true;
+            return PushListEntryResult::PageComplete;
+        }
+
+        self.entries.push(ListObjectsV2Entry::Object(row));
+        self.last_returned_token = Some(key);
+        PushListEntryResult::Continue
+    }
+
+    fn finish(mut self) -> ListObjectsV2Page {
+        let next_token = if self.is_truncated {
+            self.last_returned_token.take()
+        } else {
+            None
+        };
+        ListObjectsV2Page {
+            entries: self.entries,
+            is_truncated: self.is_truncated,
+            next_token,
+        }
+    }
+}
+
+#[cfg(test)]
+fn fold_list_objects_v2_rows(
+    rows: Vec<object::Model>,
+    prefix: &str,
+    delimiter: Option<&str>,
+    max_keys: usize,
+) -> ListObjectsV2Page {
+    let mut builder = ListObjectsV2PageBuilder::new(prefix, delimiter, max_keys);
+    for row in rows {
+        if builder.push_row(row) == PushListEntryResult::PageComplete {
+            break;
+        }
+    }
+    builder.finish()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::entities::object;
+    use chrono::Utc;
+
+    fn object_model(key: &str) -> object::Model {
+        object::Model {
+            id: "id".to_string(),
+            bucket: "bucket".to_string(),
+            key: key.to_string(),
+            cid: "QmTest".to_string(),
+            size: 0,
+            content_type: None,
+            etag: "etag".to_string(),
+            metadata: None,
+            encrypted: false,
+            key_wrap: None,
+            multipart: false,
+            is_latest: true,
+            created_at: Utc::now(),
+        }
+    }
+
+    async fn list_state_with_keys(keys: &[&str]) -> Arc<AppState> {
+        use sea_orm::Database;
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::store::run_migrations(&db).await.unwrap();
+        crate::store::bucket::create(&db, "bucket", None)
+            .await
+            .unwrap();
+
+        for (idx, key) in keys.iter().enumerate() {
+            let cid = format!("Qm{idx:08x}");
+            let etag = format!("etag-{idx:08x}");
+            crate::store::object::upsert(
+                &db,
+                &format!("id-{idx:08x}"),
+                "bucket",
+                key,
+                &cid,
+                0,
+                None,
+                &etag,
+                None,
+                false,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        }
+
+        let kubo = crate::kubo::KuboClient::new("http://127.0.0.1:5001".to_string());
+        let store = crate::store::Store::new(db);
+        let credentials = std::collections::HashMap::new();
+        let master_key = crate::crypto::key::MasterKey::from_hex(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .unwrap();
+
+        Arc::new(AppState {
+            kubo,
+            store,
+            credentials,
+            master_key,
+        })
+    }
+
+    fn list_v2_request(input: ListObjectsV2Input) -> S3Request<ListObjectsV2Input> {
+        use http::{HeaderMap, Method, Uri};
+
+        S3Request {
+            input,
+            method: Method::GET,
+            uri: Uri::from_static("/bucket?list-type=2"),
+            headers: HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn list_objects_v2_sets_common_prefixes_when_delimiter_is_present() {
+        let state = list_state_with_keys(&[
+            "a.txt",
+            "photos/cat.jpg",
+            "photos/dog.jpg",
+            "videos/clip.mp4",
+        ])
+        .await;
+        let input = ListObjectsV2Input {
+            bucket: "bucket".to_string(),
+            prefix: Some("".to_string()),
+            delimiter: Some("/".to_string()),
+            max_keys: Some(1000),
+            ..Default::default()
+        };
+        let resp = list_objects_v2(&state, list_v2_request(input))
+            .await
+            .unwrap()
+            .output;
+
+        let keys: Vec<_> = resp
+            .contents
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter_map(|o| o.key.as_deref())
+            .collect();
+        let prefixes: Vec<_> = resp
+            .common_prefixes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p.prefix.as_deref())
+            .collect();
+
+        assert_eq!(keys, vec!["a.txt"]);
+        assert_eq!(prefixes, vec!["photos/", "videos/"]);
+        assert_eq!(resp.key_count, Some(3));
+        assert_eq!(resp.prefix, Some("".to_string()));
+        assert_eq!(resp.delimiter, Some("/".to_string()));
+        assert_eq!(resp.is_truncated, Some(false));
+    }
+
+    #[tokio::test]
+    async fn list_objects_v2_uses_start_after_when_no_continuation_token_exists() {
+        let state = list_state_with_keys(&["a.txt", "b.txt", "c.txt"]).await;
+        let input = ListObjectsV2Input {
+            bucket: "bucket".to_string(),
+            start_after: Some("a.txt".to_string()),
+            max_keys: Some(1000),
+            ..Default::default()
+        };
+        let resp = list_objects_v2(&state, list_v2_request(input))
+            .await
+            .unwrap()
+            .output;
+
+        let keys: Vec<_> = resp
+            .contents
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter_map(|o| o.key.as_deref())
+            .collect();
+        assert_eq!(keys, vec!["b.txt", "c.txt"]);
+        assert_eq!(resp.is_truncated, Some(false));
+    }
+
+    #[tokio::test]
+    async fn list_objects_v2_scans_past_duplicate_prefix_rows_to_detect_truncation() {
+        let state = list_state_with_keys(&[
+            "a.txt",
+            "photos/cat.jpg",
+            "photos/dog.jpg",
+            "videos/clip.mp4",
+        ])
+        .await;
+
+        let first_input = ListObjectsV2Input {
+            bucket: "bucket".to_string(),
+            prefix: Some("".to_string()),
+            delimiter: Some("/".to_string()),
+            max_keys: Some(2),
+            ..Default::default()
+        };
+        let first = list_objects_v2(&state, list_v2_request(first_input))
+            .await
+            .unwrap()
+            .output;
+
+        let keys: Vec<_> = first
+            .contents
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter_map(|o| o.key.as_deref())
+            .collect();
+        let prefixes: Vec<_> = first
+            .common_prefixes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p.prefix.as_deref())
+            .collect();
+
+        assert_eq!(first.key_count, Some(2));
+        assert_eq!(keys, vec!["a.txt"]);
+        assert_eq!(prefixes, vec!["photos/"]);
+        assert_eq!(first.is_truncated, Some(true));
+        let next_token = first.next_continuation_token.clone().unwrap();
+        assert_eq!(next_token, "photos/dog.jpg");
+
+        let second_input = ListObjectsV2Input {
+            bucket: "bucket".to_string(),
+            prefix: Some("".to_string()),
+            delimiter: Some("/".to_string()),
+            continuation_token: Some(next_token),
+            max_keys: Some(2),
+            ..Default::default()
+        };
+        let second = list_objects_v2(&state, list_v2_request(second_input))
+            .await
+            .unwrap()
+            .output;
+
+        let second_prefixes: Vec<_> = second
+            .common_prefixes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p.prefix.as_deref())
+            .collect();
+        assert_eq!(second_prefixes, vec!["videos/"]);
+        assert_eq!(second.is_truncated, Some(false));
+    }
+
+    #[test]
+    fn list_v2_fold_without_delimiter_returns_flat_objects() {
+        let rows = vec![
+            object_model("a.txt"),
+            object_model("b.txt"),
+            object_model("c.txt"),
+        ];
+        let page = fold_list_objects_v2_rows(rows, "", None, 1000);
+        assert_eq!(page.object_keys(), vec!["a.txt", "b.txt", "c.txt"]);
+        assert!(page.common_prefixes().is_empty());
+        assert!(!page.is_truncated);
+        assert!(page.next_token.is_none());
+    }
+
+    #[test]
+    fn list_v2_fold_with_delimiter_returns_direct_objects_and_common_prefixes() {
+        let rows = vec![
+            object_model("a.txt"),
+            object_model("photos/cat.jpg"),
+            object_model("photos/dog.jpg"),
+            object_model("b.txt"),
+        ];
+        let page = fold_list_objects_v2_rows(rows, "", Some("/"), 1000);
+        assert_eq!(page.object_keys(), vec!["a.txt", "b.txt"]);
+        assert_eq!(page.common_prefixes(), vec!["photos/"]);
+        assert!(!page.is_truncated);
+        assert!(page.next_token.is_none());
+    }
+
+    #[test]
+    fn list_v2_fold_with_prefix_and_delimiter_scopes_common_prefixes() {
+        let rows = vec![
+            object_model("photos/2024/jan.jpg"),
+            object_model("photos/2024/feb.jpg"),
+            object_model("photos/2025/mar.jpg"),
+        ];
+        let page = fold_list_objects_v2_rows(rows, "photos/", Some("/"), 1000);
+        assert!(page.object_keys().is_empty());
+        assert_eq!(page.common_prefixes(), vec!["photos/2024/", "photos/2025/"]);
+        assert!(!page.is_truncated);
+        assert!(page.next_token.is_none());
+    }
+
+    #[test]
+    fn list_v2_fold_max_keys_counts_common_prefixes_and_tracks_consumed_prefix_rows() {
+        let rows = vec![
+            object_model("a.txt"),
+            object_model("photos/cat.jpg"),
+            object_model("photos/dog.jpg"),
+            object_model("videos/clip.mp4"),
+        ];
+        let page = fold_list_objects_v2_rows(rows, "", Some("/"), 2);
+        assert_eq!(page.object_keys(), vec!["a.txt"]);
+        assert_eq!(page.common_prefixes(), vec!["photos/"]);
+        assert!(page.is_truncated);
+        assert_eq!(page.next_token, Some("photos/dog.jpg".to_string()));
+    }
 
     #[test]
     fn test_resolve_range_none_returns_full_object() {

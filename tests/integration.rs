@@ -192,6 +192,30 @@ async fn test_create_and_put_and_get_plain_object() {
     assert_eq!(resp.as_slice(), b"hello world");
 }
 
+/// HeadObject on a nested key returns 200 and the CID as ETag.
+#[tokio::test]
+async fn test_head_object_signed_nested_key_succeeds() {
+    let (addr, bucket_name, _kubo) = harness().await;
+    let bucket = test_bucket(&addr, &bucket_name);
+
+    bucket
+        .put_object("nested/path/file.txt", b"hello world")
+        .await
+        .expect("put nested object");
+
+    let (head, status_code) = bucket
+        .head_object("nested/path/file.txt")
+        .await
+        .expect("head nested path");
+    assert_eq!(status_code, 200);
+
+    let etag = head.e_tag.expect("etag header");
+    assert!(
+        etag.contains("QmTestCid"),
+        "ETag should contain the CID, got: {etag}"
+    );
+}
+
 /// Put two objects, then list them.
 #[tokio::test]
 async fn test_list_objects() {
@@ -216,6 +240,99 @@ async fn test_list_objects() {
         }
         Err(e) => panic!("unexpected list error: {e}"),
     }
+}
+
+/// Directory-style delimiter at the root returns direct keys and common prefixes.
+#[tokio::test]
+async fn test_list_objects_with_delimiter_returns_common_prefixes() {
+    let (addr, bucket_name, _kubo) = harness().await;
+    let bucket = test_bucket(&addr, &bucket_name);
+
+    bucket
+        .put_object("a.txt", b"hello world")
+        .await
+        .expect("put a.txt");
+    bucket
+        .put_object("photos/cat.jpg", b"hello world")
+        .await
+        .expect("put photos/cat.jpg");
+    bucket
+        .put_object("photos/dog.jpg", b"hello world")
+        .await
+        .expect("put photos/dog.jpg");
+    bucket
+        .put_object("videos/clip.mp4", b"hello world")
+        .await
+        .expect("put videos/clip.mp4");
+
+    let pages = bucket
+        .list(String::new(), Some("/".to_string()))
+        .await
+        .expect("list with delimiter");
+
+    let mut keys: Vec<String> = pages
+        .iter()
+        .flat_map(|p| p.contents.iter().map(|o| o.key.clone()))
+        .collect();
+    keys.sort();
+    assert_eq!(keys, vec!["a.txt".to_string()]);
+
+    let mut prefixes: Vec<String> = pages
+        .iter()
+        .flat_map(|p| {
+            p.common_prefixes
+                .iter()
+                .flat_map(|v| v.iter().map(|cp| cp.prefix.clone()))
+        })
+        .collect();
+    prefixes.sort();
+    assert_eq!(prefixes, vec!["photos/".to_string(), "videos/".to_string()]);
+}
+
+/// Prefix + delimiter returns one level of keys and the next common prefix.
+#[tokio::test]
+async fn test_list_objects_with_prefix_and_delimiter_returns_one_level() {
+    let (addr, bucket_name, _kubo) = harness().await;
+    let bucket = test_bucket(&addr, &bucket_name);
+
+    bucket
+        .put_object("photos/cat.jpg", b"hello world")
+        .await
+        .expect("put photos/cat.jpg");
+    bucket
+        .put_object("photos/dog.jpg", b"hello world")
+        .await
+        .expect("put photos/dog.jpg");
+    bucket
+        .put_object("photos/2024/jan.jpg", b"hello world")
+        .await
+        .expect("put photos/2024/jan.jpg");
+
+    let pages = bucket
+        .list("photos/".to_string(), Some("/".to_string()))
+        .await
+        .expect("list with prefix and delimiter");
+
+    let mut keys: Vec<String> = pages
+        .iter()
+        .flat_map(|p| p.contents.iter().map(|o| o.key.clone()))
+        .collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec!["photos/cat.jpg".to_string(), "photos/dog.jpg".to_string()]
+    );
+
+    let mut prefixes: Vec<String> = pages
+        .iter()
+        .flat_map(|p| {
+            p.common_prefixes
+                .iter()
+                .flat_map(|v| v.iter().map(|cp| cp.prefix.clone()))
+        })
+        .collect();
+    prefixes.sort();
+    assert_eq!(prefixes, vec!["photos/2024/".to_string()]);
 }
 
 /// Wrong credentials must be rejected by the auth layer.
