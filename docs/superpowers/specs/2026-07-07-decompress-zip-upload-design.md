@@ -14,10 +14,12 @@
 ### 1.2 MVP 范围
 
 - 支持 zip 格式(Stored 无压缩 + Deflate 压缩)
+- PutObject + decompress-zip:单请求流式上传 + 流式解压
+- Multipart Upload + decompress-zip:Create 记录目标,Complete 拼接后解压
 - 流式上传 + 流式解压 + 流式写入 Kubo,全程不 collect
 - 路径穿越防护(Zip Slip 攻击)
 - 压缩包本身与解压文件均存储
-- 复用现有 SigV4 鉴权与 PutObject 内部逻辑
+- 复用现有 SigV4 鉴权与 PutObject / Multipart 内部逻辑
 
 ### 1.3 不在 MVP 范围
 
@@ -29,17 +31,50 @@
 
 ### 1.4 验收标准
 
-1. `PUT /bucket/key.zip?decompress-zip=prefix/` 上传 zip,响应 200
+**PutObject + decompress-zip**:
+
+1. `PUT /bucket/key.zip?decompress-zip=prefix/` 上传 zip,响应 200 + DecompressZipResult XML
 2. 压缩包以 `s3://bucket/key.zip` 存储,ETag 为其 CID
 3. zip 内 `foo/bar.txt` 解压到 `s3://bucket/prefix/foo/bar.txt`
 4. zip 内 `../escape.txt` 被拒绝(400 InvalidParameterValue),不写入任何文件
 5. 绝对路径条目 `/etc/passwd` 被拒绝
 6. 全程内存占用恒定,与 zip 大小无关
 7. 解压中途失败的文件:已成功的保留,失败项在响应 body 中列出
+8. `decompress-zip-result=false` 返回标准 PutObject 空 body 响应
+9. 不含 `decompress-zip` 的 `PUT /bucket/key` 走标准 PutObject,行为与 AWS S3 一致
+
+**Multipart + decompress-zip**:
+
+10. `POST /bucket/key?uploads&decompress-zip=prefix/` 创建 multipart upload,记录解压目标
+11. UploadPart 行为与标准 Multipart 一致,不感知解压
+12. CompleteMultipartUpload 拼接 parts 后解压,archive 与解压文件均存储
+13. AbortMultipartUpload 不触发解压,行为与标准 Multipart 一致
+14. Multipart 解压响应同 PutObject(DecompressZipResult XML 或标准 CompleteMultipartUploadResult)
 
 ## 2. 接口设计
 
-### 2.1 请求
+### 2.1 行为分支:由 query 参数决定
+
+`decompress-zip` 是**纯增量扩展**:不传入该参数的请求完全走标准 s3s PutObject 链路,行为与 AWS S3 一致。仅当 query 含 `decompress-zip` 时,S3Route 才拦截并进入解压流程。
+
+| 请求 | 路由 | 行为 |
+|---|---|---|
+| `PUT /bucket/key` | 标准 s3s PutObject | 标准 S3 语义,空 body 响应,ETag=CID |
+| `PUT /bucket/key?decompress-zip=prefix/` | DecompressZipRoute 拦截 | 解压 + 存储,返回 DecompressZipResult XML |
+| `PUT /bucket/key?decompress-zip=prefix/&decompress-zip-result=false` | DecompressZipRoute 拦截 | 解压 + 存储,但返回标准 PutObject 空 body |
+
+**匹配规则**(S3Route::is_match):
+
+```rust
+fn is_match(&self, method: &Method, uri: &Uri, _: &HeaderMap, _: &mut Extensions) -> bool {
+    method == Method::PUT
+        && uri.query().map_or(false, |q| q.contains("decompress-zip"))
+}
+```
+
+不含 `decompress-zip` 的请求 `is_match` 返回 false,直接走标准 s3s PutObject,网关现有 PutObject 代码路径零改动。
+
+### 2.2 解压请求格式
 
 ```
 PUT /<bucket>/<key>?decompress-zip=<target-prefix> HTTP/1.1
@@ -54,8 +89,9 @@ Content-Length: <zip 字节数>
 - `<bucket>`:压缩包存储的 bucket,也是解压目标 bucket(必须相同)
 - `<key>`:压缩包本身的存储 key(如 `2026/archive.zip`)
 - `decompress-zip=<target-prefix>`:解压目标前缀,zip 内文件按层级拼接在其后
+- `decompress-zip-result=false`(可选):取消 result body,返回标准 PutObject 空 body 响应
 
-### 2.2 路径映射规则
+### 2.3 路径映射规则
 
 | zip 内 entry 名 | target-prefix | 最终 S3 key |
 |---|---|---|
@@ -65,20 +101,60 @@ Content-Length: <zip 字节数>
 | `../escape.txt` | 任意 | **拒绝整个请求 400** |
 | `/etc/passwd` | 任意 | **拒绝整个请求 400** |
 
-### 2.3 响应
+### 2.4 响应
 
-成功响应(部分失败也用 200,详情在 body):
+`decompress-zip` 是网关自定义扩展,默认返回 `DecompressZipResult` XML body,提供解压详情(压缩包 CID、各解压文件 CID、失败列表)。需要标准 S3 PutObject 兼容(空 body)的客户端可加 `decompress-zip-result=false` 取消 result body。
+
+#### 默认:返回 result body
+
+```
+PUT /bucket/key.zip?decompress-zip=prefix/
+```
 
 ```
 HTTP/1.1 200 OK
 Content-Type: application/xml
+ETag: "QmArchiveCID..."
 
+<DecompressZipResult>
+  <ArchiveKey>2026/archive.zip</ArchiveKey>
+  <ArchiveETag>QmArchiveCID...</ArchiveETag>
+  <ArchiveSize>1048576</ArchiveSize>
+  <ExtractedCount>2</ExtractedCount>
+  <FailedCount>0</FailedCount>
+  <Entries>
+    <Entry>
+      <Key>prefix/foo.txt</Key>
+      <ETag>QmFooCID...</ETag>
+      <Size>512</Size>
+    </Entry>
+    <Entry>
+      <Key>prefix/dir/bar.txt</Key>
+      <ETag>QmBarCID...</ETag>
+      <Size>1024</Size>
+    </Entry>
+  </Entries>
+  <Failures/>
+</DecompressZipResult>
+```
+
+部分失败也返回 200,详情在 body 的 `Failures` 中:
+
+```xml
 <DecompressZipResult>
   <ArchiveKey>2026/archive.zip</ArchiveKey>
   <ArchiveETag>Qm...</ArchiveETag>
   <ArchiveSize>1048576</ArchiveSize>
   <ExtractedCount>49</ExtractedCount>
   <FailedCount>1</FailedCount>
+  <Entries>
+    <Entry>
+      <Key>prefix/good.txt</Key>
+      <ETag>QmGoodCID...</ETag>
+      <Size>512</Size>
+    </Entry>
+    <!-- ... 其余 48 个成功 entry ... -->
+  </Entries>
   <Failures>
     <Failure>
       <EntryName>bad/corrupt.txt</EntryName>
@@ -87,17 +163,141 @@ Content-Type: application/xml
     </Failure>
   </Failures>
 </DecompressZipResult>
-</DecompressZipResult>
 ```
 
-整体拒绝(路径穿越等):
+#### 兼容模式:标准 PutObject 空 body
+
+```
+PUT /bucket/key.zip?decompress-zip=prefix/&decompress-zip-result=false
+```
+
+```
+HTTP/1.1 200 OK
+ETag: "QmArchiveCID..."
+
+(无 body)
+```
+
+压缩包 CID 仍在 `ETag` header 中。解压文件清单通过 `ListObjectsV2 ?prefix=prefix/` 二次查询,每个文件的 ETag 即其 CID。
+
+#### 整体拒绝(路径穿越等)
 
 ```
 HTTP/1.1 400 Bad Request
-<Error><Code>InvalidParameterValue</Code>
-<Message>zip entry '../escape.txt' escapes target directory</Message>
+Content-Type: application/xml
+
+<Error>
+  <Code>InvalidParameterValue</Code>
+  <Message>zip entry '../escape.txt' escapes target directory</Message>
 </Error>
 ```
+
+### 2.5 Multipart Upload 支持
+
+大 zip 包(超过单次 PutObject 限制或客户端内存限制)可通过 Multipart Upload 上传。解压时机在 **CompleteMultipartUpload** — 此时所有 part 已拼接成完整 zip 并产生 root CID,网关读取 root CID 对应的完整 zip 字节流进行解压。
+
+#### 2.5.1 接口流程
+
+| 步骤 | 请求 | 行为 |
+|---|---|---|
+| 1. Create | `POST /bucket/key?uploads&decompress-zip=prefix/` | 创建 upload,持久化 `decompress_zip_target` 到 multipart upload 记录 |
+| 2. Upload parts | `PUT /bucket/key?partNumber=N&uploadId=xxx` | 标准 UploadPart,**不**做解压,part 作为 zip 字节片段存储 |
+| 3. Complete | `POST /bucket/key?uploadId=xxx` | 拼接 parts → root CID → **读取完整 zip 流解压** → 逐 entry PutObject |
+| 4. Abort(可选) | `DELETE /bucket/key?uploadId=xxx` | 标准 AbortMultipartUpload,不触发解压 |
+
+#### 2.5.2 CreateMultipartUpload 改动
+
+`POST /bucket/key?uploads&decompress-zip=prefix/` 被 DecompressZipRoute 拦截(或标准 CreateMultipartUpload 增加参数解析)。`decompress_zip_target` 字段持久化到 multipart upload 记录:
+
+```rust
+// store/entities/multipart.rs 新增字段
+pub decompress_zip_target: Option<String>, // None = 普通上传,Some(prefix) = Complete 时解压
+```
+
+Complete 时根据该字段判断是否触发解压。
+
+#### 2.5.3 CompleteMultipartUpload 解压流程
+
+```
+POST /bucket/key?uploadId=xxx  (upload 记录含 decompress_zip_target)
+  │
+  ▼
+1. 标准 Complete 流程(不变):
+   ├─ 校验 parts 升序、ETag 匹配、part ≥ 5MiB(除最后)
+   ├─ 拼接所有 part → stream_add → root_cid
+   ├─ pin_add(root_cid)
+   ├─ DB upsert(archive 对象:cid=root_cid, etag=root_cid)
+   └─ pin_rm 所有 part CID
+  │
+  ▼
+2. 解压流程(新增,仅 decompress_zip_target.is_some()):
+   ├─ 从 Kubo stream_cat(root_cid) 读取完整 zip 字节流
+   ├─ async-zip 流式解压,逐 entry:
+   │   ├─ sanitize_entry(name, target_prefix)
+   │   ├─ 路径穿越 → 收集到 failures,跳过该 entry
+   │   └─ entry body 流 → kubo stream_add → pin_add → DB 写入
+   └─ 汇总 ExtractResult
+  │
+  ▼
+3. 响应(根据 decompress-zip-result):
+   ├─ 默认:DecompressZipResult XML body
+   └─ result=false:标准 CompleteMultipartUploadResult XML(仅 archive CID)
+```
+
+#### 2.5.4 解压时机选择:Complete 后而非 Complete 中
+
+**选择**:先完成标准 Complete(拼接 + 存 archive + 回收 part CID),**再**从 Kubo 读 root CID 解压。
+
+**理由**:
+
+| 方案 | 做法 | 问题 |
+|---|---|---|
+| Complete 中解压 | 边拼接边解压(zip 是流式格式,理论可行) | zip Central Directory 在文件末尾,流式解压需要特殊处理;且 part 拼接是逐 part stream_cat,zip 解压器需要从头读,与 part 顺序解压耦合 |
+| **Complete 后解压**(选择) | 先存 archive,再 stream_cat(root_cid) 读完整 zip 解压 | 多一次 Kubo 读,但解压独立、清晰、可失败重试(archive 已持久化) |
+
+archive 先持久化保证:**即使解压全失败,zip 包本身仍可用**,符合"压缩包与解压文件均存储"的设计目标。
+
+#### 2.5.5 Multipart 解压响应
+
+默认返回 DecompressZipResult XML(同 2.4 节),archive 部分用 root_cid:
+
+```xml
+<DecompressZipResult>
+  <ArchiveKey>2026/archive.zip</ArchiveKey>
+  <ArchiveETag>QmRootCID...</ArchiveETag>
+  <ArchiveSize>52428800</ArchiveSize>
+  <ExtractedCount>49</ExtractedCount>
+  <FailedCount>0</FailedCount>
+  <Entries>
+    <Entry>
+      <Key>prefix/foo/bar.txt</Key>
+      <ETag>QmFooCID...</ETag>
+      <Size>1024</Size>
+    </Entry>
+    <!-- ... -->
+  </Entries>
+  <Failures/>
+</DecompressZipResult>
+```
+
+`decompress-zip-result=false` 时返回标准 CompleteMultipartUploadResult:
+
+```xml
+<CompleteMultipartUploadResult>
+  <Location>https://ipfs3.moyuteam.me/2026/archive.zip</Location>
+  <Bucket>pixivbot-images</Bucket>
+  <Key>2026/archive.zip</Key>
+  <ETag>"QmRootCID..."</ETag>
+</CompleteMultipartUploadResult>
+```
+
+#### 2.5.6 Create 时不校验 zip 有效性
+
+CreateMultipartUpload 只记录 `decompress_zip_target`,不检查 zip 有效性(zip 内容还没上传)。zip 格式校验在 Complete 解压阶段。
+
+#### 2.5.7 UploadPart 不感知解压
+
+UploadPart 行为与标准 Multipart 完全一致:part 作为字节片段存储,part CID 即其 ETag。part 不含完整 zip 结构,不解压。
 
 ## 3. 架构设计
 
@@ -272,7 +472,25 @@ pub async fn extract_zip_to_bucket(
 | `Cargo.toml` | 加 `async-zip = "0.0.17"` |
 | `src/main.rs` | `S3ServiceBuilder::set_route(DecompressZipRoute)` |
 | `src/s3/ops/object.rs` | 抽取 `put_object_inner` 供 route 复用(不改对外接口) |
+| `src/s3/ops/multipart.rs` | `create_multipart_upload` 解析 `decompress-zip` query 并持久化到 upload 记录;`complete_multipart_upload` 在标准 Complete 流程后检查 `decompress_zip_target`,若 Some 则调用解压逻辑 |
+| `src/store/entities/multipart.rs` | 加 `decompress_zip_target: Option<String>` 字段 |
+| `src/store/multipart.rs` | `create_upload` / `get_upload` 读写新字段 |
+| `migrations/m20250701_000001_init.rs` 或新 migration | multipart 表加 `decompress_zip_target TEXT NULL` 列 |
 | `src/error.rs` | 加 `InvalidZipEntry(String)` / `ZipSlip(String)` 变体 |
+
+### 4.4 Multipart 解压的复用
+
+`extract_zip_to_bucket` 接收 `zip_stream: DynByteStream`,对 PutObject 路径来自请求 body,对 Multipart 路径来自 `kubo::cat::stream_cat(root_cid)`。解压逻辑完全复用,差异仅在 zip 流来源:
+
+```rust
+// PutObject 路径
+let zip_stream = req.body;  // S3Request<Body>
+let result = extract_zip_to_bucket(&state, bucket, key, prefix, zip_stream).await?;
+
+// Multipart 路径(Complete 后)
+let zip_stream = kubo::cat::stream_cat(&state.kubo, &root_cid).await?;
+let result = extract_zip_to_bucket(&state, bucket, key, prefix, zip_stream).await?;
+```
 
 ## 5. 安全考量
 
@@ -321,6 +539,57 @@ curl -X PUT \
 
 AWS CLI 不直接支持自定义 query 参数。需用 `--cli-input-json` 或 SDK。**WIP:评估 `aws s3api put-object` 是否能通过 `--metadata` 传递,待验证**。
 
+### 6.4 Multipart Upload + decompress-zip
+
+```python
+import boto3
+import requests
+
+s3 = boto3.client("s3", endpoint_url="https://ipfs3.moyuteam.me",
+                  aws_access_key_id="pixivbot", aws_secret_access_key="...",
+                  region_name="us-east-1")
+
+bucket = "pixivbot-images"
+key = "2026/big-archive.zip"
+prefix = "2026/"
+
+# 1. CreateMultipartUpload,追加 decompress-zip
+create_url = s3.generate_presigned_url(
+    "create_multipart_upload",
+    Params={"Bucket": bucket, "Key": key},
+    HttpMethod="POST",
+)
+create_url += "&decompress-zip=" + prefix
+resp = requests.post(create_url)
+upload_id = parse_xml(resp.text).find("UploadId").text
+
+# 2. UploadPart(标准,可多个 part)
+parts = []
+for i, chunk in enumerate(read_chunks("big-archive.zip", 5 * 1024 * 1024), start=1):
+    upload_url = s3.generate_presigned_url(
+        "upload_part",
+        Params={"Bucket": bucket, "Key": key, "UploadId": upload_id, "PartNumber": i},
+        HttpMethod="PUT",
+    )
+    r = requests.put(upload_url, data=chunk)
+    etag = r.headers["ETag"]
+    parts.append({"PartNumber": i, "ETag": etag})
+
+# 3. CompleteMultipartUpload,触发解压
+complete_url = s3.generate_presigned_url(
+    "complete_multipart_upload",
+    Params={"Bucket": bucket, "Key": key, "UploadId": upload_id},
+    HttpMethod="POST",
+)
+complete_body = "<CompleteMultipartUpload>" + "".join(
+    f"<Part><PartNumber>{p['PartNumber']}</PartNumber><ETag>{p['ETag']}</ETag></Part>"
+    for p in parts
+) + "</CompleteMultipartUpload>"
+resp = requests.post(complete_url, data=complete_body)
+print(resp.status_code, resp.text)
+# DecompressZipResult XML,含 root_cid 与各解压文件 CID
+```
+
 ## 7. 开放问题(WIP)
 
 1. **tee 方案**:方案 A(双消费者)vs 方案 B(先存后解压)。初版倾向 B,待性能测试。
@@ -330,6 +599,8 @@ AWS CLI 不直接支持自定义 query 参数。需用 `--cli-input-json` 或 SD
 5. **加密 zip**:zip 支持密码保护。MVP 拒绝加密 zip(返回 InvalidParameterValue),v1 可加密码参数。
 6. **响应格式**:XML 还是 JSON?S3 惯例 XML,但自定义操作可自由。MVP 用 XML。
 7. **幂等性**:同 key 重传是否覆盖?MVP 沿用 PutObject 覆盖语义,已存在的 key 被覆盖。
+8. **Multipart 解压失败后 archive 保留**:Complete 后 archive 已入库,若解压全失败,archive 仍保留(符合设计)。是否需要返回 warning?MVP 在 Failures 中体现。
+9. **Multipart part CID 回收时机**:Complete 后 part CID 已 pin_rm,若随后解压读取 root_cid(含全部 part 数据)是否仍可用?是 — root_cid 是完整拼接后重新 stream_add 的新 CID,独立于 part CID,part 回收不影响 root。
 
 ## 8. 测试策略
 
@@ -345,6 +616,8 @@ AWS CLI 不直接支持自定义 query 参数。需用 `--cli-input-json` 或 SD
 - 部分失败(构造损坏 zip,第 3 个 entry 解压失败)
 - 大文件流式(100MB zip,验证内存恒定)
 - 压缩包本身可独立 GetObject
+- Multipart + decompress-zip:多 part 上传 → Complete 触发解压 → 验证 archive 与解压文件均可用
+- Multipart + decompress-zip-result=false:返回标准 CompleteMultipartUploadResult
 
 ### 8.3 端到端
 
