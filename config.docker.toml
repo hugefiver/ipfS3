@@ -1,8 +1,9 @@
+# Development-only Docker Compose configuration. Do not use this key in production.
 [server]
 bind = "0.0.0.0:9000"
 
 [kubo]
-rpc_url = "http://127.0.0.1:5001"
+rpc_url = "http://kubo:5001"
 
 [storage]
 database_url = "sqlite:///data/ipfs-s3.db?mode=rwc"
@@ -12,9 +13,7 @@ access_key = "test"
 secret_key = "test"
 
 [crypto]
-# Generate with: openssl rand -hex 32
-# WARNING: Do NOT use all-zeros in production. The gateway will refuse to
-#          start with an all-zero key in release builds.
+# Development-only key. Supply a non-empty IPFS_S3_MASTER_KEY in production.
 master_key = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90"
 
 [pinning]

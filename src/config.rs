@@ -157,7 +157,7 @@ impl Config {
     ///    - `IPFS_S3_DATABASE_URL`
     ///    - `IPFS_S3_ACCESS_KEY_ID` + `IPFS_S3_SECRET_ACCESS_KEY` (together
     ///      replace the credentials list).
-    ///    - `IPFS_S3_MASTER_KEY`
+    ///    - `IPFS_S3_MASTER_KEY` (non-empty values only).
     pub fn load() -> anyhow::Result<Self> {
         let config_path =
             std::env::var("IPFS_S3_CONFIG").unwrap_or_else(|_| "config.toml".to_string());
@@ -169,31 +169,98 @@ impl Config {
             Self::build_default()
         };
 
-        // Environment-variable overrides (apply regardless of file existence).
-        if let Ok(bind) = std::env::var("IPFS_S3_BIND") {
-            config.server.bind = bind.parse()?;
+        config.apply_env_overrides(|name| std::env::var(name).ok())?;
+
+        Ok(config)
+    }
+
+    fn apply_env_overrides<F>(&mut self, get_env: F) -> anyhow::Result<()>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        if let Some(bind) = get_env("IPFS_S3_BIND") {
+            self.server.bind = bind.parse()?;
         }
-        if let Ok(rpc_url) = std::env::var("IPFS_S3_KUBO_RPC_URL") {
-            config.kubo.rpc_url = rpc_url;
+        if let Some(rpc_url) = get_env("IPFS_S3_KUBO_RPC_URL") {
+            self.kubo.rpc_url = rpc_url;
         }
-        if let Ok(database_url) = std::env::var("IPFS_S3_DATABASE_URL") {
-            config.storage.database_url = database_url;
+        if let Some(database_url) = get_env("IPFS_S3_DATABASE_URL") {
+            self.storage.database_url = database_url;
         }
-        if let (Ok(access_key), Ok(secret_key)) = (
-            std::env::var("IPFS_S3_ACCESS_KEY_ID"),
-            std::env::var("IPFS_S3_SECRET_ACCESS_KEY"),
+        if let (Some(access_key), Some(secret_key)) = (
+            get_env("IPFS_S3_ACCESS_KEY_ID"),
+            get_env("IPFS_S3_SECRET_ACCESS_KEY"),
         ) && !access_key.is_empty()
             && !secret_key.is_empty()
         {
-            config.auth.credentials = vec![Credential {
+            self.auth.credentials = vec![Credential {
                 access_key,
                 secret_key,
             }];
         }
-        if let Ok(master_key) = std::env::var("IPFS_S3_MASTER_KEY") {
-            config.crypto.master_key = master_key;
+        if let Some(master_key) = get_env("IPFS_S3_MASTER_KEY").filter(|value| !value.is_empty()) {
+            self.crypto.master_key = master_key;
         }
 
-        Ok(config)
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FILE_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const ENV_KEY: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+    fn file_config() -> Config {
+        let mut config = Config::build_default();
+        config.crypto.master_key = FILE_KEY.to_owned();
+        config
+    }
+
+    #[test]
+    fn missing_master_key_env_preserves_file_value() {
+        let mut config = file_config();
+        config.apply_env_overrides(|_| None).unwrap();
+        assert_eq!(config.crypto.master_key, FILE_KEY);
+    }
+
+    #[test]
+    fn empty_master_key_env_preserves_file_value() {
+        let mut config = file_config();
+        config
+            .apply_env_overrides(|name| (name == "IPFS_S3_MASTER_KEY").then(String::new))
+            .unwrap();
+        assert_eq!(config.crypto.master_key, FILE_KEY);
+    }
+
+    #[test]
+    fn non_empty_master_key_env_replaces_file_value() {
+        let mut config = file_config();
+        config
+            .apply_env_overrides(|name| (name == "IPFS_S3_MASTER_KEY").then(|| ENV_KEY.to_owned()))
+            .unwrap();
+        assert_eq!(config.crypto.master_key, ENV_KEY);
+    }
+
+    #[tokio::test]
+    async fn non_empty_invalid_master_key_env_fails_state_initialization() {
+        let mut config = file_config();
+        config
+            .apply_env_overrides(|name| {
+                (name == "IPFS_S3_MASTER_KEY").then(|| "not-hex".to_owned())
+            })
+            .unwrap();
+
+        let result = crate::state::AppState::new(&config).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("invalid master key hex")
+        );
     }
 }

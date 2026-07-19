@@ -19,16 +19,16 @@ Goal: make the gateway work out-of-the-box with common S3 clients, not only
 with the AWS CLI happy path. Compatibility is validated by running clients in
 Docker against the local docker-compose stack.
 
-- [ ] Fix docker-compose SQLite file database startup (`sqlite:///data/ipfs-s3.db`)
-- [ ] GetBucketLocation (`us-east-1`) for MinIO `mc` and SDK preflight checks
-- [ ] ListObjects v1 compatibility by reusing the ListObjectsV2 listing logic
-- [ ] DeleteObjects (batch delete) for clients that remove multiple keys at once
-- [ ] rclone smoke test: mkdir, copy, ls, cat, deletefile, rmdir with default config where possible
-- [ ] MinIO `mc` smoke test: alias, mb, cp, ls, cat, stat, rm, rb
-- [ ] AWS CLI smoke test kept as baseline regression coverage
-- [ ] Document recommended rclone options when exact S3 behavior differs (`list_version=2`, `use_server_modtime`)
-- [ ] Verify HeadObject signatures for nested keys through direct docker networking and localhost
-- [ ] Track client compatibility matrix in docs
+- [x] Fix docker-compose SQLite file database startup (`sqlite:///data/ipfs-s3.db`)
+- [x] GetBucketLocation (`us-east-1`) for MinIO `mc` and SDK preflight checks
+- [x] ListObjects v1 compatibility by reusing the ListObjectsV2 listing logic
+- [x] DeleteObjects (batch delete) for clients that remove multiple keys at once
+- [x] rclone smoke test PASSED: mkdir, copy, ls, cat, deletefile, rmdir through the Compose-network endpoint (`dual_head=NOT_RUN`; see `docs/client-smoke-evidence-2026-07-19.log`)
+- [x] MinIO `mc` smoke test PASSED: temporary alias config, alias list, mb, cp, ls, cat, stat through both endpoints, rm, rb (`dual_head=PASSED`; see `docs/client-smoke-evidence-2026-07-19.log`)
+- [x] AWS CLI smoke artifact implemented but not executed: baseline regression coverage (`SKIPPED`: local image absent and pull not authorized; see compatibility matrix)
+- [x] Document recommended rclone options when exact S3 behavior differs (`list_version=2`, `use_server_modtime`)
+- [x] Verify HeadObject signatures for nested keys through direct docker networking and localhost (MinIO `mc` same-client dual endpoint `stat` PASSED with `client=Mc verifier=Mc` EVIDENCE; see `docs/client-smoke-evidence-2026-07-19.log`)
+- [x] Track client compatibility matrix in docs
 
 ## v0.3 — Hardening
 

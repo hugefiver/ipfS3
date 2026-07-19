@@ -170,6 +170,89 @@ async fn kubo_query_args(harness: &TestHarness, path: &str) -> Vec<String> {
         .collect()
 }
 
+async fn seed_latest(harness: &TestHarness, key: &str, cid: &str, size: i64) {
+    store::object::upsert(
+        harness.state.store.db(),
+        &format!("id-{}", key.replace('/', "-")),
+        &harness.bucket,
+        key,
+        cid,
+        size,
+        Some("text/plain"),
+        cid,
+        None,
+        false,
+        None,
+        false,
+    )
+    .await
+    .expect("seed latest object");
+}
+
+fn xml_sections(xml: &str, tag: &str) -> Vec<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let mut rest = xml;
+    let mut values = Vec::new();
+    while let Some(start) = rest.find(&open) {
+        let content = &rest[start + open.len()..];
+        let Some(end) = content.find(&close) else {
+            break;
+        };
+        values.push(content[..end].to_owned());
+        rest = &content[end + close.len()..];
+    }
+    values
+}
+
+fn xml_text(xml: &str, tag: &str) -> Option<String> {
+    xml_sections(xml, tag).into_iter().next()
+}
+
+fn delete_xml(keys: &[&str], quiet: bool) -> Vec<u8> {
+    let objects = keys
+        .iter()
+        .map(|key| format!("<Object><Key>{key}</Key></Object>"))
+        .collect::<String>();
+    format!(
+        "<Delete xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{objects}<Quiet>{quiet}</Quiet></Delete>"
+    )
+    .into_bytes()
+}
+
+fn delete_headers(body: &[u8]) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/xml"),
+    );
+    let digest = base64::engine::general_purpose::STANDARD.encode(md5::compute(body).0);
+    headers.insert(
+        "content-md5",
+        HeaderValue::from_str(&digest).expect("base64 MD5 header"),
+    );
+    headers
+}
+
+async fn signed_delete_objects(
+    harness: &TestHarness,
+    keys: &[&str],
+    quiet: bool,
+) -> reqwest::Response {
+    let body = delete_xml(keys, quiet);
+    send_sigv4(
+        reqwest::Method::POST,
+        &harness.endpoint,
+        &harness.bucket,
+        "",
+        &[("delete", "")],
+        body.clone(),
+        delete_headers(&body),
+        "test",
+    )
+    .await
+}
+
 fn sse_c_headers() -> HeaderMap {
     let key = [7_u8; 32];
     let key_b64 = base64::engine::general_purpose::STANDARD.encode(key);
@@ -217,20 +300,37 @@ async fn test_create_and_put_and_get_plain_object() {
 }
 
 #[tokio::test]
-async fn test_head_object_signed_nested_key_succeeds() {
-    let harness = start_harness(standard_script(1)).await;
-    let bucket = test_bucket(&harness);
-    bucket
-        .put_object("nested/path/file.txt", b"hello world")
-        .await
-        .expect("put nested object");
-
-    let (head, status) = bucket
-        .head_object("nested/path/file.txt")
-        .await
-        .expect("head nested object");
-    assert_eq!(status, 200);
-    assert!(head.e_tag.expect("etag header").contains("QmTestCid"));
+async fn test_client_compat_head_nested_key_signed_on_localhost() {
+    let harness = start_harness(standard_script(0)).await;
+    seed_latest(&harness, "nested/path/file.txt", "QmNestedCid", 11).await;
+    let response = send_sigv4(
+        reqwest::Method::HEAD,
+        &harness.endpoint,
+        &harness.bucket,
+        "nested/path/file.txt",
+        &[],
+        Vec::new(),
+        HeaderMap::new(),
+        "test",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(http::header::CONTENT_LENGTH)
+            .expect("Content-Length"),
+        "11"
+    );
+    assert!(
+        response
+            .headers()
+            .get(http::header::ETAG)
+            .expect("ETag")
+            .to_str()
+            .expect("ETag is text")
+            .contains("QmNestedCid")
+    );
 }
 
 #[tokio::test]
@@ -339,6 +439,356 @@ async fn test_wrong_credentials_rejected() {
 // ---------------------------------------------------------------------------
 // Task 8: PutObject, authentication, and failure acceptance coverage
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_client_compat_get_bucket_location_is_standard_us_east_1() {
+    let harness = start_harness(standard_script(0)).await;
+    let raw = send_sigv4(
+        reqwest::Method::GET,
+        &harness.endpoint,
+        &harness.bucket,
+        "",
+        &[("location", "")],
+        Vec::new(),
+        HeaderMap::new(),
+        "test",
+    )
+    .await;
+    assert_eq!(raw.status(), StatusCode::OK);
+    let body = raw.bytes().await.expect("GetBucketLocation body");
+    let mut deserializer = s3s::xml::Deserializer::new(body.as_ref());
+    let decoded = <s3s::dto::GetBucketLocationOutput as s3s::xml::Deserialize>::deserialize(
+        &mut deserializer,
+    )
+    .expect("decode GetBucketLocationOutput with s3s 0.14 restXml");
+    deserializer
+        .expect_eof()
+        .expect("GetBucketLocation XML EOF");
+    assert_eq!(decoded.location_constraint, None);
+
+    let body_text = std::str::from_utf8(body.as_ref()).expect("GetBucketLocation UTF-8 XML");
+    assert!(body_text.contains("<LocationConstraint"), "{body_text}");
+    assert!(!body_text.contains("us-east-1"), "{body_text}");
+
+    let missing = send_sigv4(
+        reqwest::Method::GET,
+        &harness.endpoint,
+        "missing-bkt",
+        "",
+        &[("location", "")],
+        Vec::new(),
+        HeaderMap::new(),
+        "test",
+    )
+    .await;
+    assert_s3_error(
+        missing,
+        StatusCode::NOT_FOUND,
+        "NoSuchBucket",
+        "bucket not found: missing-bkt",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_client_compat_list_v1_delimiter_marker_pages_without_replay() {
+    let harness = start_harness(standard_script(0)).await;
+    for key in ["a", "photos/1", "photos/2", "videos/1"] {
+        seed_latest(&harness, key, &format!("Qm-{}", key.replace('/', "-")), 1).await;
+    }
+
+    let first = send_sigv4(
+        reqwest::Method::GET,
+        &harness.endpoint,
+        &harness.bucket,
+        "",
+        &[("delimiter", "/"), ("max-keys", "2")],
+        Vec::new(),
+        HeaderMap::new(),
+        "test",
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_body = first.text().await.expect("first ListObjects body");
+    assert_eq!(xml_sections(&first_body, "Key"), vec!["a"]);
+    assert_eq!(
+        xml_sections(&first_body, "Prefix")
+            .into_iter()
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>(),
+        vec!["photos/"]
+    );
+    assert_eq!(
+        xml_text(&first_body, "IsTruncated").as_deref(),
+        Some("true")
+    );
+    let marker = xml_text(&first_body, "NextMarker").expect("NextMarker");
+    assert_eq!(marker, "photos/2");
+
+    let second = send_sigv4(
+        reqwest::Method::GET,
+        &harness.endpoint,
+        &harness.bucket,
+        "",
+        &[
+            ("delimiter", "/"),
+            ("marker", marker.as_str()),
+            ("max-keys", "2"),
+        ],
+        Vec::new(),
+        HeaderMap::new(),
+        "test",
+    )
+    .await;
+    assert_eq!(second.status(), StatusCode::OK);
+    let second_body = second.text().await.expect("second ListObjects body");
+    assert!(xml_sections(&second_body, "Key").is_empty());
+    assert_eq!(
+        xml_sections(&second_body, "Prefix")
+            .into_iter()
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>(),
+        vec!["videos/"]
+    );
+    assert_eq!(
+        xml_text(&second_body, "IsTruncated").as_deref(),
+        Some("false")
+    );
+    assert!(xml_text(&second_body, "NextMarker").is_none());
+}
+
+#[tokio::test]
+async fn test_client_compat_list_url_encoding_projects_wire_fields_and_preserves_raw_pagination() {
+    let harness = start_harness(standard_script(0)).await;
+    let raw_prefix = "prefix/";
+    let raw_object = "prefix/a%2F(é)";
+    let raw_common_key = "prefix/dir%2F(é)/one";
+    for key in [raw_object, raw_common_key, "prefix/z"] {
+        seed_latest(&harness, key, &format!("Qm-{}", key.replace('/', "-")), 1).await;
+    }
+
+    let first_v1 = send_sigv4(
+        reqwest::Method::GET,
+        &harness.endpoint,
+        &harness.bucket,
+        "",
+        &[
+            ("prefix", raw_prefix),
+            ("delimiter", "/"),
+            ("marker", raw_prefix),
+            ("max-keys", "2"),
+            ("encoding-type", "url"),
+        ],
+        Vec::new(),
+        HeaderMap::new(),
+        "test",
+    )
+    .await;
+    assert_eq!(first_v1.status(), StatusCode::OK);
+    let first_v1_body = first_v1.text().await.expect("v1 URL-encoded body");
+    assert_eq!(
+        xml_text(&first_v1_body, "Name").as_deref(),
+        Some("test-bkt")
+    );
+    assert_eq!(
+        xml_text(&first_v1_body, "Prefix").as_deref(),
+        Some("prefix%2F")
+    );
+    assert_eq!(
+        xml_text(&first_v1_body, "Delimiter").as_deref(),
+        Some("%2F")
+    );
+    assert_eq!(
+        xml_text(&first_v1_body, "Marker").as_deref(),
+        Some("prefix%2F")
+    );
+    assert_eq!(
+        xml_sections(&first_v1_body, "Key"),
+        vec!["prefix%2Fa%252F%28%C3%A9%29"]
+    );
+    assert!(
+        xml_sections(&first_v1_body, "Prefix")
+            .contains(&"prefix%2Fdir%252F%28%C3%A9%29%2F".to_owned())
+    );
+    assert_eq!(
+        xml_text(&first_v1_body, "NextMarker").as_deref(),
+        Some("prefix%2Fdir%252F%28%C3%A9%29%2Fone")
+    );
+
+    let second_v1 = send_sigv4(
+        reqwest::Method::GET,
+        &harness.endpoint,
+        &harness.bucket,
+        "",
+        &[
+            ("prefix", raw_prefix),
+            ("delimiter", "/"),
+            ("marker", raw_common_key),
+            ("max-keys", "2"),
+            ("encoding-type", "url"),
+        ],
+        Vec::new(),
+        HeaderMap::new(),
+        "test",
+    )
+    .await;
+    assert_eq!(second_v1.status(), StatusCode::OK);
+    let second_v1_body = second_v1.text().await.expect("second v1 URL-encoded body");
+    assert_eq!(xml_sections(&second_v1_body, "Key"), vec!["prefix%2Fz"]);
+    assert!(xml_sections(&second_v1_body, "CommonPrefixes").is_empty());
+    assert!(xml_text(&second_v1_body, "NextMarker").is_none());
+
+    let v2 = send_sigv4(
+        reqwest::Method::GET,
+        &harness.endpoint,
+        &harness.bucket,
+        "",
+        &[
+            ("list-type", "2"),
+            ("prefix", raw_prefix),
+            ("delimiter", "/"),
+            ("continuation-token", raw_prefix),
+            ("start-after", "ignored/%2F(é)"),
+            ("max-keys", "2"),
+            ("encoding-type", "url"),
+        ],
+        Vec::new(),
+        HeaderMap::new(),
+        "test",
+    )
+    .await;
+    assert_eq!(v2.status(), StatusCode::OK);
+    let v2_body = v2.text().await.expect("v2 URL-encoded body");
+    assert_eq!(xml_text(&v2_body, "Name").as_deref(), Some("test-bkt"));
+    assert_eq!(xml_text(&v2_body, "Prefix").as_deref(), Some("prefix%2F"));
+    assert_eq!(xml_text(&v2_body, "Delimiter").as_deref(), Some("%2F"));
+    assert_eq!(
+        xml_text(&v2_body, "StartAfter").as_deref(),
+        Some("ignored%2F%252F%28%C3%A9%29")
+    );
+    assert_eq!(
+        xml_text(&v2_body, "ContinuationToken").as_deref(),
+        Some(raw_prefix),
+        "continuation tokens remain opaque"
+    );
+    assert_eq!(
+        xml_text(&v2_body, "NextContinuationToken").as_deref(),
+        Some(raw_common_key),
+        "the raw cursor identity is not URL-projected"
+    );
+    assert_eq!(
+        xml_sections(&v2_body, "Key"),
+        vec!["prefix%2Fa%252F%28%C3%A9%29"]
+    );
+    assert!(
+        xml_sections(&v2_body, "Prefix").contains(&"prefix%2Fdir%252F%28%C3%A9%29%2F".to_owned())
+    );
+}
+
+#[tokio::test]
+async fn test_client_compat_delete_objects_is_retry_safe_and_ordered() {
+    let harness = start_harness(standard_script(0)).await;
+    seed_latest(&harness, "a", "QmA", 1).await;
+    seed_latest(&harness, "b", "QmB", 1).await;
+
+    let response = signed_delete_objects(&harness, &["a", "missing", "a", "b"], false).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.expect("DeleteObjects body");
+    let deleted = xml_sections(&body, "Deleted")
+        .into_iter()
+        .map(|section| xml_text(&section, "Key").expect("Deleted key"))
+        .collect::<Vec<_>>();
+    assert_eq!(deleted, vec!["a", "missing", "a", "b"]);
+    assert!(xml_sections(&body, "Error").is_empty());
+    assert_latest_absent(&harness, "a").await;
+    assert_latest_absent(&harness, "b").await;
+    assert!(kubo_query_args(&harness, "/api/v0/pin/rm").await.is_empty());
+}
+
+#[tokio::test]
+async fn test_client_compat_delete_objects_quiet_hides_successes() {
+    let harness = start_harness(standard_script(0)).await;
+    seed_latest(&harness, "quiet", "QmQuiet", 5).await;
+
+    let response = signed_delete_objects(&harness, &["quiet", "missing"], true).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.expect("quiet DeleteObjects body");
+    assert!(xml_sections(&body, "Deleted").is_empty());
+    assert!(xml_sections(&body, "Error").is_empty());
+    assert_latest_absent(&harness, "quiet").await;
+    assert!(kubo_query_args(&harness, "/api/v0/pin/rm").await.is_empty());
+}
+
+#[tokio::test]
+async fn test_client_compat_delete_objects_continues_after_store_error() {
+    let harness = start_harness(standard_script(0)).await;
+    seed_latest(&harness, "before", "QmBefore", 6).await;
+    seed_latest(&harness, "fail", "QmFail", 4).await;
+    seed_latest(&harness, "after", "QmAfter", 5).await;
+    harness
+        .state
+        .store
+        .db()
+        .execute_unprepared(
+            "CREATE TRIGGER fail_one_batch_delete BEFORE UPDATE OF is_latest ON objects \
+             WHEN OLD.bucket = 'test-bkt' AND OLD.key = 'fail' AND NEW.is_latest = FALSE \
+             BEGIN SELECT RAISE(FAIL, 'injected delete failure'); END",
+        )
+        .await
+        .expect("install delete failure trigger");
+
+    let response = signed_delete_objects(&harness, &["before", "fail", "after"], false).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.expect("partial DeleteObjects body");
+    let deleted = xml_sections(&body, "Deleted")
+        .into_iter()
+        .map(|section| xml_text(&section, "Key").expect("Deleted key"))
+        .collect::<Vec<_>>();
+    assert_eq!(deleted, vec!["before", "after"]);
+    let errors = xml_sections(&body, "Error");
+    assert_eq!(errors.len(), 1);
+    assert_eq!(xml_text(&errors[0], "Key").as_deref(), Some("fail"));
+    assert_eq!(
+        xml_text(&errors[0], "Code").as_deref(),
+        Some("InternalError")
+    );
+    assert_eq!(
+        xml_text(&errors[0], "Message").as_deref(),
+        Some("failed to delete object")
+    );
+    assert_latest_absent(&harness, "before").await;
+    store::object::get_latest(harness.state.store.db(), &harness.bucket, "fail")
+        .await
+        .expect("failed item remains latest");
+    assert_latest_absent(&harness, "after").await;
+    assert!(kubo_query_args(&harness, "/api/v0/pin/rm").await.is_empty());
+}
+
+#[tokio::test]
+async fn test_client_compat_delete_objects_missing_bucket_is_request_error() {
+    let harness = start_harness(standard_script(0)).await;
+    let body = delete_xml(&["a"], false);
+    let response = send_sigv4(
+        reqwest::Method::POST,
+        &harness.endpoint,
+        "missing-bkt",
+        "",
+        &[("delete", "")],
+        body.clone(),
+        delete_headers(&body),
+        "test",
+    )
+    .await;
+
+    assert_s3_error(
+        response,
+        StatusCode::NOT_FOUND,
+        "NoSuchBucket",
+        "bucket not found: missing-bkt",
+    )
+    .await;
+    assert!(kubo_query_args(&harness, "/api/v0/pin/rm").await.is_empty());
+}
 
 #[tokio::test]
 async fn test_sigv4_valid_request_reaches_decompress_route() {

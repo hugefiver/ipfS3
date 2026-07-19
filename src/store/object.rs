@@ -133,7 +133,11 @@ pub async fn get_latest<C: ConnectionTrait>(
         .ok_or_else(|| AppError::NoSuchKey(format!("{bucket}/{key}")))
 }
 
-pub async fn delete_latest<C: ConnectionTrait>(db: &C, bucket: &str, key: &str) -> AppResult<()> {
+pub async fn delete_latest_if_present<C: ConnectionTrait>(
+    db: &C,
+    bucket: &str,
+    key: &str,
+) -> AppResult<bool> {
     let result = object::Entity::update_many()
         .col_expr(object::Column::IsLatest, false.into())
         .filter(object::Column::Bucket.eq(bucket))
@@ -142,7 +146,11 @@ pub async fn delete_latest<C: ConnectionTrait>(db: &C, bucket: &str, key: &str) 
         .exec(db)
         .await?;
 
-    if result.rows_affected == 0 {
+    Ok(result.rows_affected > 0)
+}
+
+pub async fn delete_latest<C: ConnectionTrait>(db: &C, bucket: &str, key: &str) -> AppResult<()> {
+    if !delete_latest_if_present(db, bucket, key).await? {
         return Err(AppError::NoSuchKey(format!("{bucket}/{key}")));
     }
 
@@ -220,6 +228,12 @@ mod tests {
         }
     }
 
+    async fn seed_latest(db: &sea_orm::DatabaseConnection, id: &str, key: &str) {
+        let mut row = latest_row(id, &format!("Qm{id}"));
+        row.key = key.to_owned();
+        write_latest_in_transaction(db, row).await.unwrap();
+    }
+
     #[tokio::test]
     async fn write_latest_in_transaction_replaces_latest_and_preserves_all_fields() {
         let db = setup().await;
@@ -254,5 +268,36 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!old.is_latest);
+    }
+
+    #[tokio::test]
+    async fn delete_latest_if_present_is_idempotent_and_hides_latest() {
+        let db = setup().await;
+        seed_latest(&db, "object-1", "archive.zip").await;
+
+        assert!(
+            delete_latest_if_present(&db, "test-bucket", "archive.zip")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !delete_latest_if_present(&db, "test-bucket", "archive.zip")
+                .await
+                .unwrap()
+        );
+        assert!(matches!(
+            get_latest(&db, "test-bucket", "archive.zip").await,
+            Err(AppError::NoSuchKey(path)) if path == "test-bucket/archive.zip"
+        ));
+    }
+
+    #[tokio::test]
+    async fn delete_latest_missing_remains_no_such_key() {
+        let db = setup().await;
+
+        assert!(matches!(
+            delete_latest(&db, "test-bucket", "missing").await,
+            Err(AppError::NoSuchKey(path)) if path == "test-bucket/missing"
+        ));
     }
 }

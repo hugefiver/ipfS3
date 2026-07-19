@@ -1,0 +1,97 @@
+Required command: docker pull amazon/aws-cli:latest
+[RESULT] client=Aws status=SKIPPED dual_head=NOT_RUN detail=local image missing: amazon/aws-cli:latest evidence=client-smoke.log
+Standard Compose build images unavailable: debian:trixie-slim
+Building the current gateway source from an offline vendored dependency context.
+cargo vendor --locked --offline <temp>/ipfs-s3-client-smoke-20260720010551\vendor
+cargo vendor completed from the local cache
+docker build --pull=false --network none --quiet --build-context vendor=<temp>/ipfs-s3-client-smoke-20260720010551\vendor --tag ghcr.io/hugefiver/ipfs3:latest --file <temp>/ipfs-s3-client-smoke-20260720010551\Dockerfile.gateway-runtime <repo>
+sha256:2000ae390aa7f9f7c5179bf29b2082abeecaa363f46b2375263086d8d6f0ac69
+docker compose -f <repo>\docker-compose.yml up -d --pull never --no-build kubo gateway
+ Container ipfs-s3-kubo  Running
+ Container ipfs-s3-gateway  Recreate
+ Container ipfs-s3-gateway  Recreated
+ Container ipfs-s3-kubo  Waiting
+ Container ipfs-s3-kubo  Healthy
+ Container ipfs-s3-gateway  Starting
+ Container ipfs-s3-gateway  Started
+docker compose -f <repo>\docker-compose.yml ps -q gateway
+d8165593e3364e16617668a3fa323ee4a9489cc11097992c5958e149ca97f0d8
+docker inspect --format {{.State.Health.Status}} d8165593e3364e16617668a3fa323ee4a9489cc11097992c5958e149ca97f0d8
+starting
+docker inspect --format {{.State.Health.Status}} d8165593e3364e16617668a3fa323ee4a9489cc11097992c5958e149ca97f0d8
+healthy
+docker compose -f <repo>\docker-compose.yml ps
+NAME              IMAGE                                 COMMAND                   SERVICE   CREATED          STATUS                   PORTS
+ipfs-s3-gateway   ghcr.io/hugefiver/ipfs3:latest        "/app/ipfs-s3-gateway"    gateway   21 seconds ago   Up 9 seconds (healthy)   0.0.0.0:9000->9000/tcp, [::]:9000->9000/tcp
+ipfs-s3-kubo      ghcr.io/hugefiver/ipfs3-kubo:latest   "/custom-entrypoint.鈥?   kubo      10 days ago      Up 10 days (healthy)     0.0.0.0:4001->4001/tcp, [::]:4001->4001/tcp, 0.0.0.0:5001->5001/tcp, [::]:5001->5001/tcp, 0.0.0.0:8080->8080/tcp, [::]:8080->8080/tcp
+docker compose -f <repo>\docker-compose.yml ps -q gateway
+d8165593e3364e16617668a3fa323ee4a9489cc11097992c5958e149ca97f0d8
+docker inspect --format {{json .NetworkSettings.Networks}} d8165593e3364e16617668a3fa323ee4a9489cc11097992c5958e149ca97f0d8
+{"ipfs3_default":{"IPAMConfig":null,"Links":null,"Aliases":["ipfs-s3-gateway","gateway"],"MacAddress":"92:b0:0c:0a:f1:43","DriverOpts":null,"GwPriority":0,"NetworkID":"510067540c83ce4083f6a231515d571e7cd2f9d89e314771e258dbbec047f58d","EndpointID":"5b2470151fe319b3e162cedcb5bdd5338e4d5281e3699b12fe0f07af606ff499","Gateway":"172.18.0.1","IPAddress":"172.18.0.3","IPPrefixLen":16,"IPv6Gateway":"","GlobalIPv6Address":"","GlobalIPv6PrefixLen":0,"DNSNames":["ipfs-s3-gateway","gateway","d8165593e336"]}}
+docker image inspect rclone/rclone:1.74.4 --format {{.Id}}
+sha256:c61954aaa32328a5486715dd063a81c7879f5195ad3505cd362deddd509dc4a1
+client=Rclone image=rclone/rclone:1.74.4 image_id=sha256:c61954aaa32328a5486715dd063a81c7879f5195ad3505cd362deddd509dc4a1
+docker run --rm rclone/rclone:1.74.4 version
+rclone v1.74.4
+- os/version: alpine 3.24.1 (64 bit)
+- os/kernel: 6.6.87.2-microsoft-standard-WSL2 (x86_64)
+- os/type: linux
+- os/arch: amd64
+- go/version: go1.26.5
+- go/linking: static
+- go/tags: none
+rclone effective options: list_version=2 use_server_modtime=true
+docker run --rm --network ipfs3_default --mount type=bind,src=<temp>/ipfs-s3-client-smoke-20260720010551\rclone.conf,dst=/config/rclone.conf,readonly --mount type=bind,src=<temp>/ipfs-s3-client-smoke-20260720010551\file.txt,dst=/work/file.txt,readonly rclone/rclone:1.74.4 --config /config/rclone.conf mkdir ipfs-s3:ipfs-s3-rclone-20260720010551
+docker run --rm --network ipfs3_default --mount type=bind,src=<temp>/ipfs-s3-client-smoke-20260720010551\rclone.conf,dst=/config/rclone.conf,readonly --mount type=bind,src=<temp>/ipfs-s3-client-smoke-20260720010551\file.txt,dst=/work/file.txt,readonly rclone/rclone:1.74.4 --config /config/rclone.conf copy /work/file.txt ipfs-s3:ipfs-s3-rclone-20260720010551/nested/path
+docker run --rm --network ipfs3_default --mount type=bind,src=<temp>/ipfs-s3-client-smoke-20260720010551\rclone.conf,dst=/config/rclone.conf,readonly --mount type=bind,src=<temp>/ipfs-s3-client-smoke-20260720010551\file.txt,dst=/work/file.txt,readonly rclone/rclone:1.74.4 --config /config/rclone.conf ls ipfs-s3:ipfs-s3-rclone-20260720010551
+       35 nested/path/file.txt
+docker run --rm --network ipfs3_default --mount type=bind,src=<temp>/ipfs-s3-client-smoke-20260720010551\rclone.conf,dst=/config/rclone.conf,readonly --mount type=bind,src=<temp>/ipfs-s3-client-smoke-20260720010551\file.txt,dst=/work/file.txt,readonly rclone/rclone:1.74.4 --config /config/rclone.conf cat ipfs-s3:ipfs-s3-rclone-20260720010551/nested/path/file.txt
+ipfs-s3-client-smoke-20260720010551
+docker run --rm --network ipfs3_default --mount type=bind,src=<temp>/ipfs-s3-client-smoke-20260720010551\rclone.conf,dst=/config/rclone.conf,readonly --mount type=bind,src=<temp>/ipfs-s3-client-smoke-20260720010551\file.txt,dst=/work/file.txt,readonly rclone/rclone:1.74.4 --config /config/rclone.conf deletefile ipfs-s3:ipfs-s3-rclone-20260720010551/nested/path/file.txt
+docker run --rm --network ipfs3_default --mount type=bind,src=<temp>/ipfs-s3-client-smoke-20260720010551\rclone.conf,dst=/config/rclone.conf,readonly --mount type=bind,src=<temp>/ipfs-s3-client-smoke-20260720010551\file.txt,dst=/work/file.txt,readonly rclone/rclone:1.74.4 --config /config/rclone.conf rmdir ipfs-s3:ipfs-s3-rclone-20260720010551
+[RESULT] client=Rclone status=PASSED dual_head=NOT_RUN detail=all commands and assertions completed evidence=client-smoke.log
+docker image inspect minio/mc:latest --format {{.Id}}
+sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
+client=Mc image=minio/mc:latest image_id=sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
+docker run --rm minio/mc:latest --version
+mc version RELEASE.2025-08-13T08-35-41Z (commit-id=7394ce0dd2a80935aded936b09fa12cbb3cb8096)
+Runtime: go1.24.6 linux/amd64
+Copyright (c) 2015-2025 MinIO, Inc.
+License GNU AGPLv3 <https://www.gnu.org/licenses/agpl-3.0.html>
+docker run --rm --network ipfs3_default --mount type=bind,src=<temp>/ipfs-s3-client-smoke-20260720010551\mc,dst=/root/.mc --mount type=bind,src=<temp>/ipfs-s3-client-smoke-20260720010551\file.txt,dst=/work/file.txt,readonly minio/mc:latest alias list network
+network
+  URL       : http://gateway:9000
+  AccessKey : test
+  SecretKey : test
+  API       : S3v4
+  Path      : on
+  Src       : /root/.mc/config.json
+docker run --rm --network host --mount type=bind,src=<temp>/ipfs-s3-client-smoke-20260720010551\mc,dst=/root/.mc --mount type=bind,src=<temp>/ipfs-s3-client-smoke-20260720010551\file.txt,dst=/work/file.txt,readonly minio/mc:latest alias list localhost
+localhost
+  URL       : http://127.0.0.1:9000
+  AccessKey : test
+  SecretKey : test
+  API       : S3v4
+  Path      : on
+  Src       : /root/.mc/config.json
+docker run --rm --network ipfs3_default --mount type=bind,src=<temp>/ipfs-s3-client-smoke-20260720010551\mc,dst=/root/.mc --mount type=bind,src=<temp>/ipfs-s3-client-smoke-20260720010551\file.txt,dst=/work/file.txt,readonly minio/mc:latest mb network/ipfs-s3-mc-20260720010551
+Bucket created successfully `network/ipfs-s3-mc-20260720010551`.
+docker run --rm --network ipfs3_default --mount type=bind,src=<temp>/ipfs-s3-client-smoke-20260720010551\mc,dst=/root/.mc --mount type=bind,src=<temp>/ipfs-s3-client-smoke-20260720010551\file.txt,dst=/work/file.txt,readonly minio/mc:latest cp /work/file.txt network/ipfs-s3-mc-20260720010551/nested/path/file.txt
+`/work/file.txt` -> `network/ipfs-s3-mc-20260720010551/nested/path/file.txt`
+鈹屸攢鈹€鈹€鈹€鈹€鈹€鈹€鈹攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?鈹?Total 鈹?Transferred 鈹?Duration 鈹?Speed   鈹?鈹?35 B  鈹?35 B        鈹?00m00s   鈹?583 B/s 鈹?鈹斺攢鈹€鈹€鈹€鈹€鈹€鈹€鈹粹攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹粹攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹粹攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?
+docker run --rm --network ipfs3_default --mount type=bind,src=<temp>/ipfs-s3-client-smoke-20260720010551\mc,dst=/root/.mc --mount type=bind,src=<temp>/ipfs-s3-client-smoke-20260720010551\file.txt,dst=/work/file.txt,readonly minio/mc:latest ls network/ipfs-s3-mc-20260720010551/nested/path/
+[2026-07-19 17:16:53 UTC]    35B file.txt
+docker run --rm --network ipfs3_default --mount type=bind,src=<temp>/ipfs-s3-client-smoke-20260720010551\mc,dst=/root/.mc --mount type=bind,src=<temp>/ipfs-s3-client-smoke-20260720010551\file.txt,dst=/work/file.txt,readonly minio/mc:latest cat network/ipfs-s3-mc-20260720010551/nested/path/file.txt
+ipfs-s3-client-smoke-20260720010551
+docker run --rm --network ipfs3_default --mount type=bind,src=<temp>/ipfs-s3-client-smoke-20260720010551\mc,dst=/root/.mc --mount type=bind,src=<temp>/ipfs-s3-client-smoke-20260720010551\file.txt,dst=/work/file.txt,readonly minio/mc:latest stat --json network/ipfs-s3-mc-20260720010551/nested/path/file.txt
+{"status":"success","name":"file.txt","lastModified":"2026-07-19T17:16:53Z","size":35,"etag":"bafkreidhpvmvc5fn6iaw43ziam52yddai42antweazjdjmzj3kacmblzwq","type":"file","metadata":{"Content-Type":"text/plain"}}
+docker run --rm --network host --mount type=bind,src=<temp>/ipfs-s3-client-smoke-20260720010551\mc,dst=/root/.mc --mount type=bind,src=<temp>/ipfs-s3-client-smoke-20260720010551\file.txt,dst=/work/file.txt,readonly minio/mc:latest stat --json localhost/ipfs-s3-mc-20260720010551/nested/path/file.txt
+{"status":"success","name":"file.txt","lastModified":"2026-07-19T17:16:53Z","size":35,"etag":"bafkreidhpvmvc5fn6iaw43ziam52yddai42antweazjdjmzj3kacmblzwq","type":"file","metadata":{"Content-Type":"text/plain"}}
+[EVIDENCE] client=Mc verifier=Mc dual_head=PASSED key=nested/path/file.txt localhost=http://127.0.0.1:9000 network=http://gateway:9000 etag=bafkreidhpvmvc5fn6iaw43ziam52yddai42antweazjdjmzj3kacmblzwq content_length=35
+docker run --rm --network ipfs3_default --mount type=bind,src=<temp>/ipfs-s3-client-smoke-20260720010551\mc,dst=/root/.mc --mount type=bind,src=<temp>/ipfs-s3-client-smoke-20260720010551\file.txt,dst=/work/file.txt,readonly minio/mc:latest rm network/ipfs-s3-mc-20260720010551/nested/path/file.txt
+Removed `network/ipfs-s3-mc-20260720010551/nested/path/file.txt`.
+docker run --rm --network ipfs3_default --mount type=bind,src=<temp>/ipfs-s3-client-smoke-20260720010551\mc,dst=/root/.mc --mount type=bind,src=<temp>/ipfs-s3-client-smoke-20260720010551\file.txt,dst=/work/file.txt,readonly minio/mc:latest rb network/ipfs-s3-mc-20260720010551
+Removed `network/ipfs-s3-mc-20260720010551` successfully.
+[RESULT] client=Mc status=PASSED dual_head=PASSED detail=all commands and assertions completed evidence=client-smoke.log
+Compose volumes preserved. Explicit cleanup: pwsh -NoProfile -File scripts/client-smoke.ps1 -Run -CleanupVolumes
+Evidence log: client-smoke.log

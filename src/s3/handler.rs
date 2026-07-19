@@ -42,6 +42,13 @@ impl S3 for S3Impl {
         super::ops::bucket::head_bucket(&self.state, req).await
     }
 
+    async fn get_bucket_location(
+        &self,
+        req: S3Request<GetBucketLocationInput>,
+    ) -> S3Result<S3Response<GetBucketLocationOutput>> {
+        super::ops::bucket::get_bucket_location(&self.state, req).await
+    }
+
     async fn list_buckets(
         &self,
         req: S3Request<ListBucketsInput>,
@@ -77,11 +84,25 @@ impl S3 for S3Impl {
         super::ops::object::delete_object(&self.state, req).await
     }
 
+    async fn delete_objects(
+        &self,
+        req: S3Request<DeleteObjectsInput>,
+    ) -> S3Result<S3Response<DeleteObjectsOutput>> {
+        super::ops::object::delete_objects(&self.state, req).await
+    }
+
     async fn copy_object(
         &self,
         req: S3Request<CopyObjectInput>,
     ) -> S3Result<S3Response<CopyObjectOutput>> {
         super::ops::object::copy_object(&self.state, req).await
+    }
+
+    async fn list_objects(
+        &self,
+        req: S3Request<ListObjectsInput>,
+    ) -> S3Result<S3Response<ListObjectsOutput>> {
+        super::ops::object::list_objects(&self.state, req).await
     }
 
     async fn list_objects_v2(

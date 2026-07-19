@@ -204,12 +204,16 @@ fn request_url(endpoint: &Endpoint, canonical_uri: &str, canonical_query: &str) 
 }
 
 fn canonical_uri(bucket: &str, key: &str) -> String {
+    let bucket = rfc3986_encode(bucket);
+    if key.is_empty() {
+        return format!("/{bucket}");
+    }
     let key = key
         .split('/')
         .map(rfc3986_encode)
         .collect::<Vec<_>>()
         .join("/");
-    format!("/{}/{}", rfc3986_encode(bucket), key)
+    format!("/{bucket}/{key}")
 }
 
 fn canonical_query<I>(query: I) -> String
@@ -423,5 +427,14 @@ fn presign_sigv4_query_includes_custom_query_before_signature() {
             .split('&')
             .find(|pair| pair.starts_with("X-Amz-Signature=")),
         "custom query tuples must affect the signature"
+    );
+}
+
+#[test]
+fn canonical_uri_omits_trailing_slash_for_bucket_operations() {
+    assert_eq!(canonical_uri("test-bkt", ""), "/test-bkt");
+    assert_eq!(
+        canonical_uri("test bkt", "nested/path with space.txt"),
+        "/test%20bkt/nested/path%20with%20space.txt"
     );
 }

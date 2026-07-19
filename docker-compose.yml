@@ -27,7 +27,7 @@ services:
       - "9000:9000"
     volumes:
       - gateway_data:/data
-      - ./config.toml:/data/config.toml:ro
+      - ./config.docker.toml:/data/config.toml:ro
     environment:
       - IPFS_S3_CONFIG=/data/config.toml
       - IPFS_S3_MASTER_KEY=${IPFS_S3_MASTER_KEY}
@@ -35,6 +35,12 @@ services:
     depends_on:
       kubo:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "while read -r _ local _; do if [ \"$$local\" = \"00000000:2328\" ]; then exit 0; fi; done < /proc/net/tcp; exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
     restart: unless-stopped
 
   cloudflared:
@@ -44,7 +50,8 @@ services:
     environment:
       - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
     depends_on:
-      - gateway
+      gateway:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:
