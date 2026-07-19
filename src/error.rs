@@ -1,5 +1,14 @@
-use s3s::S3Error;
 use s3s::s3_error;
+use s3s::{S3Error, S3ErrorCode};
+
+fn invalid_parameter_value(error: &AppError) -> S3Error {
+    let mut s3_error = S3Error::with_message(
+        S3ErrorCode::Custom("InvalidParameterValue".into()),
+        error.to_string(),
+    );
+    s3_error.set_status_code(http::StatusCode::BAD_REQUEST);
+    s3_error
+}
 
 /// Application-level errors. Converted to S3Error at the S3 handler boundary.
 #[derive(Debug, thiserror::Error)]
@@ -31,6 +40,21 @@ pub enum AppError {
     #[error("invalid range")]
     InvalidRange,
 
+    #[error("invalid decompress-zip parameter: {0}")]
+    InvalidZipParameter(String),
+
+    #[error("invalid zip entry: {0}")]
+    InvalidZipEntry(String),
+
+    #[error("zip entry escapes target prefix: {0}")]
+    ZipSlip(String),
+
+    #[error("unsupported zip entry: {0}")]
+    UnsupportedZipEntry(String),
+
+    #[error("zip archive rejected: {0}")]
+    ZipArchiveRejected(String),
+
     #[error("access denied: {0}")]
     AccessDenied(String),
 
@@ -59,6 +83,11 @@ impl From<AppError> for S3Error {
             AppError::InvalidPartOrder => s3_error!(InvalidPartOrder, "{}", e),
             AppError::EntityTooSmall => s3_error!(EntityTooSmall, "{}", e),
             AppError::InvalidRange => s3_error!(InvalidRange, "{}", e),
+            AppError::InvalidZipParameter(_) => s3_error!(InvalidArgument, "{}", e),
+            AppError::InvalidZipEntry(_)
+            | AppError::ZipSlip(_)
+            | AppError::UnsupportedZipEntry(_)
+            | AppError::ZipArchiveRejected(_) => invalid_parameter_value(&e),
             AppError::AccessDenied(_) => s3_error!(AccessDenied, "{}", e),
             _ => s3_error!(InternalError, "{}", e),
         }
@@ -77,5 +106,31 @@ impl From<sea_orm::DbErr> for AppError {
 impl From<reqwest::Error> for AppError {
     fn from(e: reqwest::Error) -> Self {
         AppError::KuboRpc(e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zip_validation_errors_map_to_client_errors() {
+        let err: S3Error = AppError::ZipSlip("../escape.txt".to_string()).into();
+        assert_eq!(err.code().as_str(), "InvalidParameterValue");
+        assert_eq!(err.status_code(), Some(http::StatusCode::BAD_REQUEST));
+
+        let err: S3Error = AppError::InvalidZipParameter("bad prefix".to_string()).into();
+        assert_eq!(err.code().as_str(), "InvalidArgument");
+        assert_eq!(err.status_code(), Some(http::StatusCode::BAD_REQUEST));
+
+        for error in [
+            AppError::InvalidZipEntry("bad.txt".to_string()),
+            AppError::UnsupportedZipEntry("encrypted.txt".to_string()),
+            AppError::ZipArchiveRejected("archive is corrupt".to_string()),
+        ] {
+            let err: S3Error = error.into();
+            assert_eq!(err.code().as_str(), "InvalidParameterValue");
+            assert_eq!(err.status_code(), Some(http::StatusCode::BAD_REQUEST));
+        }
     }
 }

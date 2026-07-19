@@ -8,7 +8,7 @@ pub async fn stream_cat(
     cid: &str,
     range: Option<(u64, u64)>,
 ) -> Result<
-    impl Stream<Item = Result<Bytes, std::io::Error>>,
+    impl Stream<Item = Result<Bytes, std::io::Error>> + use<>,
     Box<dyn std::error::Error + Send + Sync>,
 > {
     let url = if let Some((start, end)) = range {

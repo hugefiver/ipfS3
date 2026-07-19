@@ -9,3 +9,4 @@ pub mod pinning;
 pub mod s3;
 pub mod state;
 pub mod store;
+pub mod zip;

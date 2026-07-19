@@ -13,6 +13,8 @@ pub struct Model {
     pub key_wrap: Option<String>,
     pub content_type: Option<String>,
     pub metadata: Option<Json>,
+    pub decompress_zip_target: Option<String>,
+    pub decompress_zip_result: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

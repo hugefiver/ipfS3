@@ -14,6 +14,7 @@ mod pinning;
 mod s3;
 mod state;
 mod store;
+mod zip;
 
 use auth::GatewayAuth;
 use config::Config;
@@ -47,6 +48,9 @@ async fn main() -> anyhow::Result<()> {
     let s3_service = {
         let mut builder = S3ServiceBuilder::new(s3_impl);
         builder.set_auth(gateway_auth);
+        builder.set_route(crate::s3::route::decompress_zip::DecompressZipRoute::new(
+            state.clone(),
+        ));
         builder.build()
     };
 
@@ -54,7 +58,10 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/health", get(health_check))
-        .fallback_service(s3_service);
+        .fallback_service(s3_service)
+        .layer(axum::middleware::from_fn(
+            crate::s3::http::bridge_chunked_content_length,
+        ));
 
     let listener = tokio::net::TcpListener::bind(cfg.server.bind).await?;
     tracing::info!("listening on {}", cfg.server.bind);

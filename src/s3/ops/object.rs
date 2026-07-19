@@ -45,6 +45,95 @@ impl ByteCounter {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredObject {
+    pub cid: String,
+    pub size: i64,
+}
+
+pub async fn add_plain_object_stream<S, E>(
+    state: &Arc<AppState>,
+    stream: S,
+) -> S3Result<StoredObject>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
+    E: Into<Box<dyn std::error::Error + Send + Sync>> + Send + 'static,
+{
+    let (counter, count_handle) = ByteCounter::new();
+    let counted = counter.wrap(stream);
+    let cid = crate::kubo::add::stream_add(&state.kubo, counted, 1)
+        .await
+        .map_err(|e| s3s::s3_error!(InternalError, "kubo add: {e}"))?;
+
+    if let Err(e) = crate::kubo::pin::pin_add(&state.kubo, &cid).await {
+        return Err(s3s::s3_error!(InternalError, "pin: {e}"));
+    }
+
+    Ok(StoredObject {
+        cid,
+        size: count_handle.load(Ordering::Relaxed) as i64,
+    })
+}
+
+pub async fn publish_plain_object(
+    state: &Arc<AppState>,
+    bucket: &str,
+    key: &str,
+    content_type: Option<&str>,
+    metadata: Option<serde_json::Value>,
+    stored: &StoredObject,
+    multipart: bool,
+) -> S3Result<()> {
+    let object_id = uuid::Uuid::new_v4().to_string();
+    if let Err(e) = crate::store::object::upsert(
+        state.store.db(),
+        &object_id,
+        bucket,
+        key,
+        &stored.cid,
+        stored.size,
+        content_type,
+        &stored.cid,
+        metadata,
+        false,
+        None,
+        multipart,
+    )
+    .await
+    {
+        return Err(e.into());
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub async fn put_plain_object_stream<S, E>(
+    state: &Arc<AppState>,
+    bucket: &str,
+    key: &str,
+    content_type: Option<&str>,
+    metadata: Option<serde_json::Value>,
+    stream: S,
+    multipart: bool,
+) -> S3Result<StoredObject>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
+    E: Into<Box<dyn std::error::Error + Send + Sync>> + Send + 'static,
+{
+    let stored = add_plain_object_stream(state, stream).await?;
+    publish_plain_object(
+        state,
+        bucket,
+        key,
+        content_type,
+        metadata,
+        &stored,
+        multipart,
+    )
+    .await?;
+    Ok(stored)
+}
+
 /// Determine the requested server-side encryption mode from request headers.
 pub fn determine_encryption_mode(headers: &http::HeaderMap) -> S3Result<EncryptionMode> {
     if let Some(val) = headers.get("x-amz-server-side-encryption-customer-algorithm") {
@@ -270,8 +359,15 @@ pub async fn put_object(
         return Err(e.into());
     }
 
+    let server_side_encryption = if enc_mode == EncryptionMode::SseS3 {
+        Some(ServerSideEncryption::from_static("AES256"))
+    } else {
+        None
+    };
+
     Ok(S3Response::new(PutObjectOutput {
         e_tag: Some(ETag::Strong(cid.clone())),
+        server_side_encryption,
         ..Default::default()
     }))
 }
@@ -812,6 +908,23 @@ mod tests {
     use crate::store::entities::object;
     use chrono::Utc;
 
+    async fn test_state(kubo_uri: String) -> Arc<AppState> {
+        use sea_orm::Database;
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::store::run_migrations(&db).await.unwrap();
+
+        Arc::new(AppState {
+            kubo: crate::kubo::KuboClient::new(kubo_uri),
+            store: crate::store::Store::new(db),
+            credentials: HashMap::new(),
+            master_key: crate::crypto::key::MasterKey::from_hex(
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            )
+            .unwrap(),
+        })
+    }
+
     fn object_model(key: &str) -> object::Model {
         object::Model {
             id: "id".to_string(),
@@ -890,6 +1003,212 @@ mod tests {
             service: None,
             trailing_headers: None,
         }
+    }
+
+    #[tokio::test]
+    async fn add_plain_object_stream_counts_pins_and_returns_cid() {
+        use futures_util::stream;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let kubo = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/add"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("{\"Hash\":\"QmPlain\",\"Size\":\"5\"}\n"),
+            )
+            .mount(&kubo)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/pin/add"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{\"Pins\":[\"QmPlain\"]}"))
+            .mount(&kubo)
+            .await;
+
+        let state = test_state(kubo.uri()).await;
+        let stored = add_plain_object_stream(
+            &state,
+            stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"hello",
+            ))]),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stored.cid, "QmPlain");
+        assert_eq!(stored.size, 5);
+
+        let requests = kubo.received_requests().await.unwrap();
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.url.path() == "/api/v0/add")
+        );
+        assert!(requests.iter().any(|request| {
+            request.url.path() == "/api/v0/pin/add" && request.url.query() == Some("arg=QmPlain")
+        }));
+    }
+
+    #[tokio::test]
+    async fn publish_plain_object_writes_latest_metadata() {
+        use futures_util::stream;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let kubo = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/add"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("{\"Hash\":\"QmPlain\",\"Size\":\"5\"}\n"),
+            )
+            .mount(&kubo)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/pin/add"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{\"Pins\":[\"QmPlain\"]}"))
+            .mount(&kubo)
+            .await;
+
+        let state = test_state(kubo.uri()).await;
+        crate::store::bucket::create(state.store.db(), "test-bucket", None)
+            .await
+            .unwrap();
+        let stored = add_plain_object_stream(
+            &state,
+            stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"hello",
+            ))]),
+        )
+        .await
+        .unwrap();
+
+        publish_plain_object(
+            &state,
+            "test-bucket",
+            "prefix/file.txt",
+            None,
+            None,
+            &stored,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let obj =
+            crate::store::object::get_latest(state.store.db(), "test-bucket", "prefix/file.txt")
+                .await
+                .unwrap();
+        assert_eq!(obj.cid, "QmPlain");
+        assert_eq!(obj.size, 5);
+        assert_eq!(obj.etag, "QmPlain");
+        assert!(!obj.encrypted);
+        assert!(obj.key_wrap.is_none());
+    }
+
+    #[tokio::test]
+    async fn pin_add_error_does_not_remove_a_possibly_shared_cid() {
+        use futures_util::stream;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let kubo = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/add"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("{\"Hash\":\"QmShared\",\"Size\":\"5\"}\n"),
+            )
+            .mount(&kubo)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/pin/add"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("pin failed"))
+            .mount(&kubo)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/pin/rm"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&kubo)
+            .await;
+
+        let state = test_state(kubo.uri()).await;
+        let err = add_plain_object_stream(
+            &state,
+            stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"hello",
+            ))]),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code().as_str(), "InternalError");
+        let requests = kubo.received_requests().await.unwrap();
+        assert!(!requests.iter().any(|request| {
+            request.url.path() == "/api/v0/pin/rm" && request.url.query() == Some("arg=QmShared")
+        }));
+    }
+
+    #[tokio::test]
+    async fn publish_failure_keeps_the_successfully_pinned_cid() {
+        use futures_util::stream;
+        use sea_orm::ConnectionTrait;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let kubo = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/add"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("{\"Hash\":\"QmShared\",\"Size\":\"5\"}\n"),
+            )
+            .mount(&kubo)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/pin/add"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{\"Pins\":[\"QmShared\"]}"))
+            .mount(&kubo)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/pin/rm"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&kubo)
+            .await;
+
+        let state = test_state(kubo.uri()).await;
+        let stored = add_plain_object_stream(
+            &state,
+            stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"hello",
+            ))]),
+        )
+        .await
+        .unwrap();
+
+        state
+            .store
+            .db()
+            .execute_unprepared("DROP TABLE objects")
+            .await
+            .unwrap();
+        let result = publish_plain_object(
+            &state,
+            "test-bucket",
+            "prefix/file.txt",
+            None,
+            None,
+            &stored,
+            false,
+        )
+        .await;
+
+        assert!(result.is_err());
+        let requests = kubo.received_requests().await.unwrap();
+        assert!(!requests.iter().any(|request| {
+            request.url.path() == "/api/v0/pin/rm" && request.url.query() == Some("arg=QmShared")
+        }));
     }
 
     #[tokio::test]

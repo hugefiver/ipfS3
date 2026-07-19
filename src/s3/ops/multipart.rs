@@ -13,6 +13,25 @@ use super::object::{
     ByteCounter, determine_encryption_mode, extract_custom_metadata, extract_sse_c_key,
 };
 
+fn parse_decompress_upload_options(uri: &http::Uri) -> S3Result<(Option<String>, bool)> {
+    let mut raw_target = None;
+    let mut result = true;
+    for (name, value) in crate::s3::query::decoded_query_pairs(uri)? {
+        match name.as_str() {
+            "decompress-zip" => {
+                raw_target = Some(value);
+            }
+            "decompress-zip-result" => result = value != "false",
+            _ => {}
+        }
+    }
+    let target = raw_target
+        .as_deref()
+        .map(crate::zip::sanitize::normalize_target_prefix)
+        .transpose()?;
+    Ok((target, result))
+}
+
 /// Initiate a multipart upload.
 ///
 /// Allocates a fresh `object_id` and `upload_id`, records the upload metadata
@@ -33,6 +52,22 @@ pub async fn create_multipart_upload(
         return Err(s3s::s3_error!(NoSuchBucket, "bucket not found: {}", bucket));
     }
 
+    let (decompress_zip_target, decompress_zip_result) = parse_decompress_upload_options(&req.uri)?;
+    if decompress_zip_target.is_some()
+        && [
+            "x-amz-server-side-encryption",
+            "x-amz-server-side-encryption-customer-algorithm",
+            "x-amz-server-side-encryption-customer-key",
+            "x-amz-server-side-encryption-customer-key-md5",
+        ]
+        .iter()
+        .any(|name| req.headers.contains_key(*name))
+    {
+        return Err(s3s::s3_error!(
+            InvalidArgument,
+            "decompress-zip cannot be combined with server-side encryption"
+        ));
+    }
     let enc_mode = determine_encryption_mode(&req.headers)?;
     let metadata = extract_custom_metadata(&req.headers);
     let object_id = uuid::Uuid::new_v4().to_string();
@@ -63,6 +98,8 @@ pub async fn create_multipart_upload(
         key_wrap.as_deref(),
         content_type.as_deref(),
         metadata,
+        decompress_zip_target.as_deref(),
+        decompress_zip_result,
     )
     .await?;
 
@@ -163,28 +200,11 @@ pub async fn upload_part(
 
     let part_size = count_handle.load(Ordering::Relaxed) as i64;
 
-    // S3 allows re-uploading a part with the same part_number to replace a
-    // previous upload. If a part with this number already exists, unpin its
-    // old CID and delete the record before inserting the new one.
-    if let Ok(old_part) = crate::store::multipart::get_part(db, upload_id, part_number).await {
-        let _ = crate::kubo::pin::pin_rm(&state.kubo, &old_part.cid).await;
-        let _ = crate::store::multipart::delete_part(db, upload_id, part_number).await;
-    }
-
-    // Pin the part before recording it; if the DB insert fails we unpin so the
-    // CID does not linger as garbage in the IPFS node.
     crate::kubo::pin::pin_add(&state.kubo, &cid)
         .await
         .map_err(|e| s3s::s3_error!(InternalError, "pin: {e}"))?;
 
-    if let Err(e) =
-        crate::store::multipart::insert_part(db, upload_id, part_number, &cid, part_size, &cid)
-            .await
-    {
-        // Best-effort cleanup of the pinned part on DB failure.
-        let _ = crate::kubo::pin::pin_rm(&state.kubo, &cid).await;
-        return Err(e.into());
-    }
+    crate::store::multipart::upsert_part(db, upload_id, part_number, &cid, part_size, &cid).await?;
 
     let server_side_encryption = if enc_mode == EncryptionMode::SseS3 {
         Some(ServerSideEncryption::from_static("AES256"))
@@ -199,6 +219,128 @@ pub async fn upload_part(
     }))
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompletedMultipartArchive {
+    pub bucket: String,
+    pub key: String,
+    pub upload_id: String,
+    pub encryption_object_id: String,
+    pub completion_attempt_id: String,
+    pub root_cid: String,
+    pub total_size: i64,
+    pub content_type: Option<String>,
+    pub metadata: Option<serde_json::Value>,
+    pub encrypted: bool,
+    pub key_wrap: Option<String>,
+    pub decompress_zip_target: Option<String>,
+    pub decompress_zip_result: bool,
+    pub server_side_encryption: Option<ServerSideEncryption>,
+}
+
+#[async_trait::async_trait]
+pub(crate) trait CompletedUploadFinalizerStore: Send + Sync {
+    async fn commit(
+        &self,
+        upload_id: &str,
+        attempt: crate::store::object::LatestObjectRow,
+    ) -> Result<(), crate::store::multipart::CommitCompletedUploadError>;
+
+    async fn reconcile(
+        &self,
+        upload_id: &str,
+        expected_attempt: &crate::store::object::LatestObjectRow,
+    ) -> crate::store::multipart::ReconciledCommitOutcome;
+}
+
+struct DatabaseCompletedUploadFinalizer<'a> {
+    db: &'a sea_orm::DatabaseConnection,
+}
+
+#[async_trait::async_trait]
+impl CompletedUploadFinalizerStore for DatabaseCompletedUploadFinalizer<'_> {
+    async fn commit(
+        &self,
+        upload_id: &str,
+        attempt: crate::store::object::LatestObjectRow,
+    ) -> Result<(), crate::store::multipart::CommitCompletedUploadError> {
+        crate::store::multipart::commit_completed_upload(self.db, upload_id, attempt).await
+    }
+
+    async fn reconcile(
+        &self,
+        upload_id: &str,
+        expected_attempt: &crate::store::object::LatestObjectRow,
+    ) -> crate::store::multipart::ReconciledCommitOutcome {
+        crate::store::multipart::reconcile_completion_attempt(self.db, upload_id, expected_attempt)
+            .await
+    }
+}
+
+pub async fn finalize_completed_multipart_archive(
+    state: &Arc<AppState>,
+    completed: &CompletedMultipartArchive,
+) -> S3Result<()> {
+    let store = DatabaseCompletedUploadFinalizer {
+        db: state.store.db(),
+    };
+    finalize_completed_multipart_archive_with_store(completed, &store).await
+}
+
+async fn finalize_completed_multipart_archive_with_store<
+    S: CompletedUploadFinalizerStore + ?Sized,
+>(
+    completed: &CompletedMultipartArchive,
+    store: &S,
+) -> S3Result<()> {
+    let attempt = crate::store::object::LatestObjectRow {
+        id: completed.completion_attempt_id.clone(),
+        bucket: completed.bucket.clone(),
+        key: completed.key.clone(),
+        cid: completed.root_cid.clone(),
+        size: completed.total_size,
+        content_type: completed.content_type.clone(),
+        etag: completed.root_cid.clone(),
+        metadata: completed.metadata.clone(),
+        encrypted: completed.encrypted,
+        key_wrap: completed.key_wrap.clone(),
+        multipart: true,
+        created_at: chrono::Utc::now(),
+    };
+
+    match store.commit(&completed.upload_id, attempt.clone()).await {
+        Ok(()) => Ok(()),
+        Err(crate::store::multipart::CommitCompletedUploadError::RolledBack {
+            completion_attempt_id,
+            source,
+        }) => {
+            if completion_attempt_id != completed.completion_attempt_id {
+                return Err(s3s::s3_error!(InternalError, "completion attempt mismatch"));
+            }
+            Err(source.into())
+        }
+        Err(crate::store::multipart::CommitCompletedUploadError::OutcomeUnknown {
+            completion_attempt_id,
+            source,
+        }) => {
+            if completion_attempt_id != completed.completion_attempt_id {
+                return Err(s3s::s3_error!(InternalError, "completion attempt mismatch"));
+            }
+            match store.reconcile(&completed.upload_id, &attempt).await {
+                crate::store::multipart::ReconciledCommitOutcome::Committed => Ok(()),
+                crate::store::multipart::ReconciledCommitOutcome::NotCommitted => {
+                    Err(source.into())
+                }
+                crate::store::multipart::ReconciledCommitOutcome::Unknown(reconcile_error) => {
+                    Err(s3s::s3_error!(
+                        InternalError,
+                        "commit outcome unknown ({source}); reconciliation failed ({reconcile_error})"
+                    ))
+                }
+            }
+        }
+    }
+}
+
 /// Complete a multipart upload by concatenating the parts into a single object.
 ///
 /// The client-supplied part list is validated against the recorded parts
@@ -209,6 +351,23 @@ pub async fn complete_multipart_upload(
     state: &Arc<AppState>,
     req: S3Request<CompleteMultipartUploadInput>,
 ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
+    let completed = complete_multipart_upload_inner(state, req).await?;
+    finalize_completed_multipart_archive(state, &completed).await?;
+
+    Ok(S3Response::new(CompleteMultipartUploadOutput {
+        bucket: Some(completed.bucket),
+        key: Some(completed.key),
+        e_tag: Some(ETag::Strong(completed.root_cid)),
+        server_side_encryption: completed.server_side_encryption,
+        ..Default::default()
+    }))
+}
+
+pub async fn complete_multipart_upload_inner(
+    state: &Arc<AppState>,
+    req: S3Request<CompleteMultipartUploadInput>,
+) -> S3Result<CompletedMultipartArchive> {
+    let completion_attempt_id = uuid::Uuid::new_v4().to_string();
     let bucket = &req.input.bucket;
     let key = &req.input.key;
     let upload_id = &req.input.upload_id;
@@ -249,6 +408,7 @@ pub async fn complete_multipart_upload(
     }
 
     let upload = crate::store::multipart::get_upload(db, upload_id).await?;
+    let encryption_object_id = upload.object_id.clone();
 
     if upload.bucket != *bucket || upload.key != *key {
         return Err(s3s::s3_error!(
@@ -344,8 +504,6 @@ pub async fn complete_multipart_upload(
                 _ => unreachable!(),
             };
             let ok_arc = Arc::new(ok);
-            let object_id = upload.object_id.clone();
-
             // Step 1: Build a plaintext concat stream by decrypting each part.
             // We use an out-of-band flag to capture decryption failures,
             // because the error gets buried inside reqwest's body stream and
@@ -392,7 +550,7 @@ pub async fn complete_multipart_upload(
             let encrypted_stream = crate::crypto::chunker::encrypt_chunk_stream(
                 Box::pin(plaintext_concat),
                 ok_arc,
-                object_id,
+                encryption_object_id.clone(),
                 0, // single object, part_number = 0
             );
 
@@ -421,56 +579,31 @@ pub async fn complete_multipart_upload(
         EncryptionMode::SseC => (true, None),
     };
 
-    // Store metadata. If DB fails, unpin root_cid so it can be GC'd
-    // (consistent with PutObject's cleanup logic).
-    if let Err(e) = crate::store::object::upsert(
-        db,
-        &upload.object_id,
-        bucket,
-        key,
-        &root_cid,
-        total_size,
-        upload.content_type.as_deref(),
-        &root_cid,
-        upload.metadata.clone(),
-        encrypted,
-        key_wrap.as_deref(),
-        true,
-    )
-    .await
-    {
-        let _ = crate::kubo::pin::pin_rm(&state.kubo, &root_cid).await;
-        return Err(e.into());
-    }
-
-    // The part CIDs are now subsumed by the root object; unpin them so they
-    // can be garbage-collected by the IPFS node.
-    for (part_cid, _) in &parts_to_concat {
-        let _ = crate::kubo::pin::pin_rm(&state.kubo, part_cid).await;
-    }
-
-    // Delete the upload record; ON DELETE CASCADE automatically removes parts.
-    crate::store::multipart::delete_upload(db, upload_id).await?;
-
     let server_side_encryption = if encrypted && key_wrap.is_some() {
         Some(ServerSideEncryption::from_static("AES256"))
     } else {
         None
     };
 
-    Ok(S3Response::new(CompleteMultipartUploadOutput {
-        bucket: Some(bucket.clone()),
-        key: Some(key.clone()),
-        e_tag: Some(ETag::Strong(root_cid.clone())),
+    Ok(CompletedMultipartArchive {
+        bucket: bucket.clone(),
+        key: key.clone(),
+        upload_id: upload_id.clone(),
+        encryption_object_id,
+        completion_attempt_id,
+        root_cid,
+        total_size,
+        content_type: upload.content_type,
+        metadata: upload.metadata,
+        encrypted,
+        key_wrap,
+        decompress_zip_target: upload.decompress_zip_target,
+        decompress_zip_result: upload.decompress_zip_result,
         server_side_encryption,
-        ..Default::default()
-    }))
+    })
 }
 
-/// Abort a multipart upload, discarding all uploaded parts.
-///
-/// Best-effort: part pins and DB rows are removed even if some pin-rm calls
-/// fail, then the upload record itself is deleted.
+/// Abort a multipart upload, discarding its database records.
 pub async fn abort_multipart_upload(
     state: &Arc<AppState>,
     req: S3Request<AbortMultipartUploadInput>,
@@ -487,18 +620,6 @@ pub async fn abort_multipart_upload(
             InvalidArgument,
             "bucket/key mismatch for upload_id"
         ));
-    }
-
-    // List parts for cleanup. Distinguish NoSuchUpload (safe to ignore —
-    // nothing to clean up) from other DB errors (must propagate).
-    let parts = match crate::store::multipart::list_parts(db, upload_id).await {
-        Ok(p) => p,
-        Err(crate::error::AppError::NoSuchUpload(_)) => Vec::new(),
-        Err(e) => return Err(e.into()),
-    };
-
-    for part in &parts {
-        let _ = crate::kubo::pin::pin_rm(&state.kubo, &part.cid).await;
     }
 
     // Delete the upload record; ON DELETE CASCADE removes parts.
@@ -546,4 +667,1400 @@ pub async fn list_parts(
         parts: Some(parts_dto),
         ..Default::default()
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use sea_orm::{ConnectionTrait, DatabaseBackend, EntityTrait, Statement};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    enum FakeCommitResult {
+        Ok,
+        RolledBack(String),
+        OutcomeUnknown(String),
+    }
+
+    enum FakeReconcileResult {
+        Committed,
+        NotCommitted,
+        Unknown,
+    }
+
+    struct FakeFinalizerStore {
+        commit: FakeCommitResult,
+        reconcile: FakeReconcileResult,
+        reconcile_calls: AtomicUsize,
+    }
+
+    struct BlockingUnknownFinalizerStore {
+        db: sea_orm::DatabaseConnection,
+        commit_signal: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        reconcile_signal: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release_reconcile: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CompletedUploadFinalizerStore for FakeFinalizerStore {
+        async fn commit(
+            &self,
+            _upload_id: &str,
+            _attempt: crate::store::object::LatestObjectRow,
+        ) -> Result<(), crate::store::multipart::CommitCompletedUploadError> {
+            match &self.commit {
+                FakeCommitResult::Ok => Ok(()),
+                FakeCommitResult::RolledBack(completion_attempt_id) => Err(
+                    crate::store::multipart::CommitCompletedUploadError::RolledBack {
+                        completion_attempt_id: completion_attempt_id.clone(),
+                        source: crate::error::AppError::Internal("forced rollback".to_owned()),
+                    },
+                ),
+                FakeCommitResult::OutcomeUnknown(completion_attempt_id) => Err(
+                    crate::store::multipart::CommitCompletedUploadError::OutcomeUnknown {
+                        completion_attempt_id: completion_attempt_id.clone(),
+                        source: crate::error::AppError::Internal(
+                            "forced unknown commit outcome".to_owned(),
+                        ),
+                    },
+                ),
+            }
+        }
+
+        async fn reconcile(
+            &self,
+            _upload_id: &str,
+            _expected_attempt: &crate::store::object::LatestObjectRow,
+        ) -> crate::store::multipart::ReconciledCommitOutcome {
+            self.reconcile_calls.fetch_add(1, Ordering::SeqCst);
+            match self.reconcile {
+                FakeReconcileResult::Committed => {
+                    crate::store::multipart::ReconciledCommitOutcome::Committed
+                }
+                FakeReconcileResult::NotCommitted => {
+                    crate::store::multipart::ReconciledCommitOutcome::NotCommitted
+                }
+                FakeReconcileResult::Unknown => {
+                    crate::store::multipart::ReconciledCommitOutcome::Unknown(
+                        crate::error::AppError::Internal("forced query failure".to_owned()),
+                    )
+                }
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CompletedUploadFinalizerStore for BlockingUnknownFinalizerStore {
+        async fn commit(
+            &self,
+            _upload_id: &str,
+            attempt: crate::store::object::LatestObjectRow,
+        ) -> Result<(), crate::store::multipart::CommitCompletedUploadError> {
+            if let Some(signal) = self.commit_signal.lock().await.take() {
+                let _ = signal.send(());
+            }
+            Err(
+                crate::store::multipart::CommitCompletedUploadError::OutcomeUnknown {
+                    completion_attempt_id: attempt.id,
+                    source: crate::error::AppError::Internal(
+                        "forced unknown commit outcome".to_owned(),
+                    ),
+                },
+            )
+        }
+
+        async fn reconcile(
+            &self,
+            upload_id: &str,
+            expected_attempt: &crate::store::object::LatestObjectRow,
+        ) -> crate::store::multipart::ReconciledCommitOutcome {
+            if let Some(signal) = self.reconcile_signal.lock().await.take() {
+                let _ = signal.send(());
+            }
+            if let Some(release) = self.release_reconcile.lock().await.take() {
+                let _ = release.await;
+            }
+            crate::store::multipart::reconcile_completion_attempt(
+                &self.db,
+                upload_id,
+                expected_attempt,
+            )
+            .await
+        }
+    }
+
+    async fn test_state_with_bucket_and_kubo(name: &str, kubo_uri: String) -> Arc<AppState> {
+        let db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+        crate::store::run_migrations(&db).await.unwrap();
+        crate::store::bucket::create(&db, name, None).await.unwrap();
+        Arc::new(AppState {
+            kubo: crate::kubo::KuboClient::new(kubo_uri),
+            store: crate::store::Store::new(db),
+            credentials: HashMap::new(),
+            master_key: crate::crypto::key::MasterKey::from_hex(
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            )
+            .unwrap(),
+        })
+    }
+
+    async fn test_state_with_bucket(name: &str) -> Arc<AppState> {
+        test_state_with_bucket_and_kubo(name, "http://127.0.0.1:5001".to_owned()).await
+    }
+
+    async fn file_backed_test_state_with_bucket_and_kubo(
+        name: &str,
+        kubo_uri: String,
+        directory: &tempfile::TempDir,
+    ) -> Arc<AppState> {
+        let database_path = directory.path().join("multipart-concurrency.sqlite");
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            database_path.display().to_string().replace('\\', "/")
+        );
+        let mut options = sea_orm::ConnectOptions::new(database_url);
+        options.max_connections(4).min_connections(2);
+        let db = sea_orm::Database::connect(options).await.unwrap();
+        crate::store::run_migrations(&db).await.unwrap();
+        crate::store::bucket::create(&db, name, None).await.unwrap();
+        Arc::new(AppState {
+            kubo: crate::kubo::KuboClient::new(kubo_uri),
+            store: crate::store::Store::new(db),
+            credentials: HashMap::new(),
+            master_key: crate::crypto::key::MasterKey::from_hex(
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            )
+            .unwrap(),
+        })
+    }
+
+    async fn multipart_kubo(add_cids: &[&str]) -> MockServer {
+        let kubo = MockServer::start().await;
+        let responses: Arc<Vec<String>> = Arc::new(
+            add_cids
+                .iter()
+                .map(|cid| format!("{{\"Hash\":\"{cid}\",\"Size\":\"5\"}}\n"))
+                .collect(),
+        );
+        let response_index = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/api/v0/add"))
+            .respond_with({
+                let responses = responses.clone();
+                let response_index = response_index.clone();
+                move |_: &wiremock::Request| {
+                    let index = response_index.fetch_add(1, Ordering::SeqCst);
+                    ResponseTemplate::new(200).set_body_string(responses[index].clone())
+                }
+            })
+            .mount(&kubo)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/pin/add"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{\"Pins\":[]}"))
+            .mount(&kubo)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/pin/rm"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{\"Pins\":[]}"))
+            .mount(&kubo)
+            .await;
+        kubo
+    }
+
+    async fn seed_plain_upload(state: &Arc<AppState>, upload_id: &str) {
+        crate::store::multipart::create_upload(
+            state.store.db(),
+            upload_id,
+            "encryption-object-1",
+            "test-bucket",
+            "archive.zip",
+            "none",
+            None,
+            Some("application/zip"),
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+    }
+
+    fn upload_part_request(upload_id: &str, bytes: &'static [u8]) -> S3Request<UploadPartInput> {
+        S3Request {
+            input: UploadPartInput {
+                bucket: "test-bucket".to_owned(),
+                key: "archive.zip".to_owned(),
+                part_number: 1,
+                upload_id: upload_id.to_owned(),
+                body: Some(StreamingBlob::from(s3s::Body::from(Bytes::from_static(
+                    bytes,
+                )))),
+                ..Default::default()
+            },
+            method: http::Method::PUT,
+            uri: format!("/test-bucket/archive.zip?partNumber=1&uploadId={upload_id}")
+                .parse()
+                .unwrap(),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    fn complete_request(upload_id: &str, etag: &str) -> S3Request<CompleteMultipartUploadInput> {
+        S3Request {
+            input: CompleteMultipartUploadInput {
+                bucket: "test-bucket".to_owned(),
+                key: "archive.zip".to_owned(),
+                upload_id: upload_id.to_owned(),
+                multipart_upload: Some(CompletedMultipartUpload {
+                    parts: Some(vec![CompletedPart {
+                        e_tag: Some(ETag::Strong(etag.to_owned())),
+                        part_number: Some(1),
+                        ..Default::default()
+                    }]),
+                }),
+                ..Default::default()
+            },
+            method: http::Method::POST,
+            uri: format!("/test-bucket/archive.zip?uploadId={upload_id}")
+                .parse()
+                .unwrap(),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    fn abort_request(upload_id: &str) -> S3Request<AbortMultipartUploadInput> {
+        S3Request {
+            input: AbortMultipartUploadInput {
+                bucket: "test-bucket".to_owned(),
+                key: "archive.zip".to_owned(),
+                upload_id: upload_id.to_owned(),
+                ..Default::default()
+            },
+            method: http::Method::DELETE,
+            uri: format!("/test-bucket/archive.zip?uploadId={upload_id}")
+                .parse()
+                .unwrap(),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    fn get_object_request(key: &str) -> S3Request<GetObjectInput> {
+        S3Request {
+            input: GetObjectInput {
+                bucket: "test-bucket".to_owned(),
+                key: key.to_owned(),
+                ..Default::default()
+            },
+            method: http::Method::GET,
+            uri: format!("/test-bucket/{key}").parse().unwrap(),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    async fn read_object_through_get(state: &Arc<AppState>, key: &str) -> Vec<u8> {
+        let response = crate::s3::ops::object::get_object(state, get_object_request(key))
+            .await
+            .unwrap();
+        let mut body = response.output.body.unwrap();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = body.next().await {
+            bytes.extend_from_slice(&chunk.unwrap());
+        }
+        bytes
+    }
+
+    async fn seed_ordinary_shared_object(state: &Arc<AppState>, cid: &str, size: i64) {
+        crate::store::object::upsert(
+            state.store.db(),
+            "ordinary-object",
+            "test-bucket",
+            "ordinary.txt",
+            cid,
+            size,
+            Some("text/plain"),
+            cid,
+            None,
+            false,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    }
+
+    fn completed_archive(completion_attempt_id: &str) -> CompletedMultipartArchive {
+        CompletedMultipartArchive {
+            bucket: "test-bucket".to_owned(),
+            key: "archive.zip".to_owned(),
+            upload_id: "upload-1".to_owned(),
+            encryption_object_id: "encryption-object-1".to_owned(),
+            completion_attempt_id: completion_attempt_id.to_owned(),
+            root_cid: "QmRoot".to_owned(),
+            total_size: 9,
+            content_type: Some("application/zip".to_owned()),
+            metadata: Some(serde_json::json!({"source": "multipart"})),
+            encrypted: false,
+            key_wrap: None,
+            decompress_zip_target: None,
+            decompress_zip_result: true,
+            server_side_encryption: None,
+        }
+    }
+
+    fn latest_attempt_for_archive(
+        archive: &CompletedMultipartArchive,
+    ) -> crate::store::object::LatestObjectRow {
+        crate::store::object::LatestObjectRow {
+            id: archive.completion_attempt_id.clone(),
+            bucket: archive.bucket.clone(),
+            key: archive.key.clone(),
+            cid: archive.root_cid.clone(),
+            size: archive.total_size,
+            content_type: archive.content_type.clone(),
+            etag: archive.root_cid.clone(),
+            metadata: archive.metadata.clone(),
+            encrypted: archive.encrypted,
+            key_wrap: archive.key_wrap.clone(),
+            multipart: true,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    async fn assert_pin_add_count(kubo: &MockServer, cid: &str, expected: usize) {
+        let expected_query = format!("arg={cid}");
+        let requests = kubo.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| {
+                    request.url.path() == "/api/v0/pin/add"
+                        && request.url.query() == Some(expected_query.as_str())
+                })
+                .count(),
+            expected,
+            "unexpected pin/add count for {cid}"
+        );
+    }
+
+    async fn assert_no_pin_removes(kubo: &MockServer, cids: &[&str]) {
+        let requests = kubo.received_requests().await.unwrap();
+        for cid in cids {
+            let expected_query = format!("arg={cid}");
+            assert!(
+                !requests.iter().any(|request| {
+                    request.url.path() == "/api/v0/pin/rm"
+                        && request.url.query() == Some(expected_query.as_str())
+                }),
+                "must not remove pin for {cid}"
+            );
+        }
+    }
+
+    fn multipart_create_request(bucket: &str, key: &str) -> S3Request<CreateMultipartUploadInput> {
+        S3Request {
+            input: CreateMultipartUploadInput {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                ..Default::default()
+            },
+            method: http::Method::POST,
+            uri: format!("/{bucket}/{key}?uploads").parse().unwrap(),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn create_multipart_upload_decodes_shared_query_once() {
+        let state = test_state_with_bucket("test-bucket").await;
+        let mut req = multipart_create_request("test-bucket", "archive.zip");
+        req.uri = "/test-bucket/archive.zip?uploads=&decompress-zip=prefix%2Fnested%2F&decompress-zip-result=false"
+            .parse()
+            .unwrap();
+
+        create_multipart_upload(&state, req).await.unwrap();
+
+        let upload = crate::store::entities::multipart_upload::Entity::find()
+            .one(state.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            upload.decompress_zip_target.as_deref(),
+            Some("prefix/nested/")
+        );
+        assert!(!upload.decompress_zip_result);
+    }
+
+    #[tokio::test]
+    async fn create_multipart_upload_rejects_invalid_query_utf8() {
+        let state = test_state_with_bucket("test-bucket").await;
+        let mut req = multipart_create_request("test-bucket", "archive.zip");
+        req.uri = "/test-bucket/archive.zip?uploads=&decompress-zip=%FF"
+            .parse()
+            .unwrap();
+
+        assert_eq!(
+            create_multipart_upload(&state, req)
+                .await
+                .unwrap_err()
+                .code()
+                .as_str(),
+            "InvalidArgument"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_multipart_upload_rejects_decompress_sse() {
+        let state = test_state_with_bucket("test-bucket").await;
+        let mut req = multipart_create_request("test-bucket", "archive.zip");
+        req.uri = "/test-bucket/archive.zip?uploads=&decompress-zip=prefix%2F"
+            .parse()
+            .unwrap();
+        req.headers.insert(
+            "x-amz-server-side-encryption",
+            http::HeaderValue::from_static("AES256"),
+        );
+
+        assert_eq!(
+            create_multipart_upload(&state, req)
+                .await
+                .unwrap_err()
+                .code()
+                .as_str(),
+            "InvalidArgument"
+        );
+    }
+
+    #[test]
+    fn decompress_upload_options_use_last_values_and_exact_false_only() {
+        let uri = "/test-bucket/archive.zip?uploads=&decompress-zip=first%2F&decompress-zip-result=false&decompress-zip=last%2Fnested%2F&decompress-zip-result=False"
+            .parse::<http::Uri>()
+            .unwrap();
+        assert_eq!(
+            parse_decompress_upload_options(&uri).unwrap(),
+            (Some("last/nested/".to_owned()), true)
+        );
+        let defaults = "/test-bucket/archive.zip?uploads"
+            .parse::<http::Uri>()
+            .unwrap();
+        assert_eq!(
+            parse_decompress_upload_options(&defaults).unwrap(),
+            (None, true)
+        );
+    }
+
+    #[test]
+    fn decompress_upload_options_normalize_only_the_final_target_value() {
+        let valid_final =
+            "/test-bucket/archive.zip?uploads&decompress-zip=../bad&decompress-zip=prefix%2F"
+                .parse::<http::Uri>()
+                .unwrap();
+        assert_eq!(
+            parse_decompress_upload_options(&valid_final).unwrap(),
+            (Some("prefix/".to_owned()), true)
+        );
+
+        let invalid_final =
+            "/test-bucket/archive.zip?uploads&decompress-zip=prefix%2F&decompress-zip=../bad"
+                .parse::<http::Uri>()
+                .unwrap();
+        assert_eq!(
+            parse_decompress_upload_options(&invalid_final)
+                .unwrap_err()
+                .code()
+                .as_str(),
+            "InvalidArgument"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_multipart_upload_rejects_decompress_with_any_sse_header() {
+        for header in [
+            "x-amz-server-side-encryption",
+            "x-amz-server-side-encryption-customer-algorithm",
+            "x-amz-server-side-encryption-customer-key",
+            "x-amz-server-side-encryption-customer-key-md5",
+        ] {
+            let state = test_state_with_bucket("test-bucket").await;
+            let mut req = multipart_create_request("test-bucket", "archive.zip");
+            req.uri = "/test-bucket/archive.zip?uploads=&decompress-zip=prefix%2F"
+                .parse()
+                .unwrap();
+            req.headers.insert(
+                http::header::HeaderName::from_static(header),
+                http::HeaderValue::from_static("bogus"),
+            );
+
+            assert_eq!(
+                create_multipart_upload(&state, req)
+                    .await
+                    .unwrap_err()
+                    .code()
+                    .as_str(),
+                "InvalidArgument",
+                "header {header} must be rejected before encryption parsing"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_part_replacement_keeps_old_and_new_part_pins() {
+        let kubo = multipart_kubo(&["QmOldPart", "QmNewPart"]).await;
+        let state = test_state_with_bucket_and_kubo("test-bucket", kubo.uri()).await;
+        seed_plain_upload(&state, "upload-1").await;
+
+        upload_part(&state, upload_part_request("upload-1", b"old"))
+            .await
+            .unwrap();
+        upload_part(&state, upload_part_request("upload-1", b"new data"))
+            .await
+            .unwrap();
+
+        let part = crate::store::multipart::get_part(state.store.db(), "upload-1", 1)
+            .await
+            .unwrap();
+        assert_eq!(part.cid, "QmNewPart");
+        assert_eq!(part.size, 8);
+        assert_pin_add_count(&kubo, "QmOldPart", 1).await;
+        assert_pin_add_count(&kubo, "QmNewPart", 1).await;
+        assert_no_pin_removes(&kubo, &["QmOldPart", "QmNewPart"]).await;
+    }
+
+    #[tokio::test]
+    async fn upload_part_initial_db_failure_keeps_new_pin() {
+        let kubo = multipart_kubo(&["QmNewPart"]).await;
+        let state = test_state_with_bucket_and_kubo("test-bucket", kubo.uri()).await;
+        seed_plain_upload(&state, "upload-1").await;
+        state
+            .store
+            .db()
+            .execute(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "CREATE TRIGGER fail_part_insert BEFORE INSERT ON multipart_parts \
+                 BEGIN SELECT RAISE(FAIL, 'forced part insert failure'); END;",
+            ))
+            .await
+            .unwrap();
+
+        let error = upload_part(&state, upload_part_request("upload-1", b"new"))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code().as_str(), "InternalError");
+        assert!(
+            crate::store::multipart::list_parts(state.store.db(), "upload-1")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_pin_add_count(&kubo, "QmNewPart", 1).await;
+        assert_no_pin_removes(&kubo, &["QmNewPart"]).await;
+    }
+
+    #[tokio::test]
+    async fn upload_part_db_failure_keeps_new_pin_and_old_row() {
+        let kubo = multipart_kubo(&["QmNewPart"]).await;
+        let state = test_state_with_bucket_and_kubo("test-bucket", kubo.uri()).await;
+        seed_plain_upload(&state, "upload-1").await;
+        crate::store::multipart::upsert_part(
+            state.store.db(),
+            "upload-1",
+            1,
+            "QmOldPart",
+            3,
+            "QmOldPart",
+        )
+        .await
+        .unwrap();
+        state
+            .store
+            .db()
+            .execute(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "CREATE TRIGGER fail_part_update BEFORE UPDATE ON multipart_parts \
+                 BEGIN SELECT RAISE(FAIL, 'forced part update failure'); END;",
+            ))
+            .await
+            .unwrap();
+
+        let error = upload_part(&state, upload_part_request("upload-1", b"new"))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code().as_str(), "InternalError");
+        let part = crate::store::multipart::get_part(state.store.db(), "upload-1", 1)
+            .await
+            .unwrap();
+        assert_eq!(part.cid, "QmOldPart");
+        assert_pin_add_count(&kubo, "QmNewPart", 1).await;
+        assert_no_pin_removes(&kubo, &["QmOldPart", "QmNewPart"]).await;
+    }
+
+    #[tokio::test]
+    async fn complete_inner_returns_archive_with_distinct_encryption_and_attempt_identities() {
+        let kubo = multipart_kubo(&["QmRoot", "QmRoot"]).await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/cat"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"part data"))
+            .mount(&kubo)
+            .await;
+        let state = test_state_with_bucket_and_kubo("test-bucket", kubo.uri()).await;
+        crate::store::multipart::create_upload(
+            state.store.db(),
+            "upload-1",
+            "encryption-object-1",
+            "test-bucket",
+            "archive.zip",
+            "none",
+            None,
+            Some("application/zip"),
+            Some(serde_json::json!({"source": "multipart"})),
+            Some("prefix/"),
+            false,
+        )
+        .await
+        .unwrap();
+        crate::store::multipart::upsert_part(
+            state.store.db(),
+            "upload-1",
+            1,
+            "QmPart",
+            9,
+            "QmPart",
+        )
+        .await
+        .unwrap();
+
+        let first = complete_multipart_upload_inner(&state, complete_request("upload-1", "QmPart"))
+            .await
+            .unwrap();
+        let second =
+            complete_multipart_upload_inner(&state, complete_request("upload-1", "QmPart"))
+                .await
+                .unwrap();
+
+        assert_eq!(first.bucket, "test-bucket");
+        assert_eq!(first.key, "archive.zip");
+        assert_eq!(first.upload_id, "upload-1");
+        assert_eq!(first.encryption_object_id, "encryption-object-1");
+        assert_eq!(second.encryption_object_id, "encryption-object-1");
+        uuid::Uuid::parse_str(&first.completion_attempt_id).unwrap();
+        uuid::Uuid::parse_str(&second.completion_attempt_id).unwrap();
+        assert_ne!(first.completion_attempt_id, second.completion_attempt_id);
+        assert_eq!(first.root_cid, "QmRoot");
+        assert_eq!(second.root_cid, "QmRoot");
+        assert_eq!(first.total_size, 9);
+        assert_eq!(first.content_type.as_deref(), Some("application/zip"));
+        assert_eq!(
+            first.metadata,
+            Some(serde_json::json!({"source": "multipart"}))
+        );
+        assert!(!first.encrypted);
+        assert!(first.key_wrap.is_none());
+        assert_eq!(first.decompress_zip_target.as_deref(), Some("prefix/"));
+        assert!(!first.decompress_zip_result);
+        assert!(first.server_side_encryption.is_none());
+        assert!(
+            crate::store::entities::object::Entity::find_by_id(&first.completion_attempt_id)
+                .one(state.store.db())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            crate::store::entities::object::Entity::find_by_id(&second.completion_attempt_id)
+                .one(state.store.db())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            crate::store::multipart::get_upload(state.store.db(), "upload-1")
+                .await
+                .is_ok()
+        );
+        assert!(
+            crate::store::multipart::get_part(state.store.db(), "upload-1", 1)
+                .await
+                .is_ok()
+        );
+        assert_pin_add_count(&kubo, "QmRoot", 2).await;
+        assert_no_pin_removes(&kubo, &["QmRoot", "QmPart"]).await;
+    }
+
+    #[tokio::test]
+    async fn complete_inner_sse_uses_encryption_object_identity() {
+        let object_key = crate::crypto::key::ObjectKey { bytes: [7; 32] };
+        let master_key = crate::crypto::key::MasterKey::from_hex(
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap();
+        let wrapped_key = master_key.wrap(&object_key).unwrap();
+        let part_nonce = object_key.derive_nonce("encryption-object-1", 1, 0);
+        let encrypted_part =
+            crate::crypto::aes_gcm::encrypt_chunk(&object_key, &part_nonce, b"part data").unwrap();
+        let kubo = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/add"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("{\"Hash\":\"QmRoot\",\"Size\":\"9\"}\n"),
+            )
+            .mount(&kubo)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/pin/add"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{\"Pins\":[]}"))
+            .mount(&kubo)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/cat"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(encrypted_part))
+            .mount(&kubo)
+            .await;
+        let db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+        crate::store::run_migrations(&db).await.unwrap();
+        crate::store::bucket::create(&db, "test-bucket", None)
+            .await
+            .unwrap();
+        let state = Arc::new(AppState {
+            kubo: crate::kubo::KuboClient::new(kubo.uri()),
+            store: crate::store::Store::new(db),
+            credentials: HashMap::new(),
+            master_key,
+        });
+        crate::store::multipart::create_upload(
+            state.store.db(),
+            "upload-1",
+            "encryption-object-1",
+            "test-bucket",
+            "archive.zip",
+            "sse_s3",
+            Some(&wrapped_key),
+            Some("application/zip"),
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        crate::store::multipart::upsert_part(
+            state.store.db(),
+            "upload-1",
+            1,
+            "QmEncryptedPart",
+            9,
+            "QmEncryptedPart",
+        )
+        .await
+        .unwrap();
+
+        let completed = complete_multipart_upload_inner(
+            &state,
+            complete_request("upload-1", "QmEncryptedPart"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(completed.encryption_object_id, "encryption-object-1");
+        assert!(completed.encrypted);
+        assert_eq!(completed.key_wrap.as_deref(), Some(wrapped_key.as_str()));
+        let root_nonce = object_key.derive_nonce("encryption-object-1", 0, 0);
+        let expected_root =
+            crate::crypto::aes_gcm::encrypt_chunk(&object_key, &root_nonce, b"part data").unwrap();
+        let attempt_nonce = object_key.derive_nonce(&completed.completion_attempt_id, 0, 0);
+        let wrong_attempt_root =
+            crate::crypto::aes_gcm::encrypt_chunk(&object_key, &attempt_nonce, b"part data")
+                .unwrap();
+        let requests = kubo.received_requests().await.unwrap();
+        let add_body = &requests
+            .iter()
+            .find(|request| request.url.path() == "/api/v0/add")
+            .unwrap()
+            .body;
+        assert!(
+            add_body
+                .windows(expected_root.len())
+                .any(|window| window == expected_root.as_ref())
+        );
+        assert!(
+            !add_body
+                .windows(wrong_attempt_root.len())
+                .any(|window| window == wrong_attempt_root.as_ref())
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_part_cid_survives_upload_part_replacement() {
+        let kubo = multipart_kubo(&["QmNewPart"]).await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/cat"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"shared bytes"))
+            .mount(&kubo)
+            .await;
+        let state = test_state_with_bucket_and_kubo("test-bucket", kubo.uri()).await;
+        seed_ordinary_shared_object(&state, "QmSharedPart", 12).await;
+        seed_plain_upload(&state, "upload-1").await;
+        crate::store::multipart::upsert_part(
+            state.store.db(),
+            "upload-1",
+            1,
+            "QmSharedPart",
+            12,
+            "QmSharedPart",
+        )
+        .await
+        .unwrap();
+
+        upload_part(&state, upload_part_request("upload-1", b"replacement"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            read_object_through_get(&state, "ordinary.txt").await,
+            b"shared bytes"
+        );
+        assert_no_pin_removes(&kubo, &["QmSharedPart", "QmNewPart"]).await;
+    }
+
+    #[tokio::test]
+    async fn shared_part_cid_survives_abort() {
+        let kubo = multipart_kubo(&[]).await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/cat"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"shared bytes"))
+            .mount(&kubo)
+            .await;
+        let state = test_state_with_bucket_and_kubo("test-bucket", kubo.uri()).await;
+        seed_ordinary_shared_object(&state, "QmSharedPart", 12).await;
+        seed_plain_upload(&state, "upload-1").await;
+        crate::store::multipart::upsert_part(
+            state.store.db(),
+            "upload-1",
+            1,
+            "QmSharedPart",
+            12,
+            "QmSharedPart",
+        )
+        .await
+        .unwrap();
+
+        abort_multipart_upload(&state, abort_request("upload-1"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            read_object_through_get(&state, "ordinary.txt").await,
+            b"shared bytes"
+        );
+        assert!(
+            crate::store::multipart::get_upload(state.store.db(), "upload-1")
+                .await
+                .is_err()
+        );
+        assert!(
+            crate::store::multipart::list_parts(state.store.db(), "upload-1")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_no_pin_removes(&kubo, &["QmSharedPart"]).await;
+    }
+
+    #[tokio::test]
+    async fn shared_part_cid_survives_complete() {
+        let kubo = multipart_kubo(&["QmRoot"]).await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/cat"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"shared bytes"))
+            .mount(&kubo)
+            .await;
+        let state = test_state_with_bucket_and_kubo("test-bucket", kubo.uri()).await;
+        seed_ordinary_shared_object(&state, "QmSharedPart", 12).await;
+        seed_plain_upload(&state, "upload-1").await;
+        crate::store::multipart::upsert_part(
+            state.store.db(),
+            "upload-1",
+            1,
+            "QmSharedPart",
+            12,
+            "QmSharedPart",
+        )
+        .await
+        .unwrap();
+
+        complete_multipart_upload(&state, complete_request("upload-1", "QmSharedPart"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            read_object_through_get(&state, "ordinary.txt").await,
+            b"shared bytes"
+        );
+        assert_no_pin_removes(&kubo, &["QmSharedPart", "QmRoot"]).await;
+    }
+
+    #[tokio::test]
+    async fn complete_single_part_equal_root_keeps_readable_cid() {
+        let kubo = multipart_kubo(&["QmPart"]).await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/cat"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"part data"))
+            .mount(&kubo)
+            .await;
+        let state = test_state_with_bucket_and_kubo("test-bucket", kubo.uri()).await;
+        seed_plain_upload(&state, "upload-1").await;
+        crate::store::multipart::upsert_part(
+            state.store.db(),
+            "upload-1",
+            1,
+            "QmPart",
+            9,
+            "QmPart",
+        )
+        .await
+        .unwrap();
+
+        complete_multipart_upload(&state, complete_request("upload-1", "QmPart"))
+            .await
+            .unwrap();
+
+        let latest =
+            crate::store::object::get_latest(state.store.db(), "test-bucket", "archive.zip")
+                .await
+                .unwrap();
+        assert_eq!(latest.cid, "QmPart");
+        assert!(
+            crate::store::multipart::get_upload(state.store.db(), "upload-1")
+                .await
+                .is_err()
+        );
+        assert!(
+            crate::store::multipart::list_parts(state.store.db(), "upload-1")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            read_object_through_get(&state, "archive.zip").await,
+            b"part data"
+        );
+        assert_no_pin_removes(&kubo, &["QmPart"]).await;
+    }
+
+    #[tokio::test]
+    async fn outcome_unknown_committed_reconciliation_succeeds_without_pin_removal() {
+        let kubo = MockServer::start().await;
+        let archive = completed_archive("attempt-1");
+        let store = FakeFinalizerStore {
+            commit: FakeCommitResult::OutcomeUnknown("attempt-1".to_owned()),
+            reconcile: FakeReconcileResult::Committed,
+            reconcile_calls: AtomicUsize::new(0),
+        };
+
+        finalize_completed_multipart_archive_with_store(&archive, &store)
+            .await
+            .unwrap();
+
+        assert_eq!(store.reconcile_calls.load(Ordering::SeqCst), 1);
+        assert_no_pin_removes(&kubo, &["QmRoot", "QmPart"]).await;
+    }
+
+    #[tokio::test]
+    async fn finalizer_direct_commit_and_rollback_do_not_reconcile_or_remove_pins() {
+        let kubo = MockServer::start().await;
+        let archive = completed_archive("attempt-1");
+        let committed = FakeFinalizerStore {
+            commit: FakeCommitResult::Ok,
+            reconcile: FakeReconcileResult::Unknown,
+            reconcile_calls: AtomicUsize::new(0),
+        };
+        finalize_completed_multipart_archive_with_store(&archive, &committed)
+            .await
+            .unwrap();
+        assert_eq!(committed.reconcile_calls.load(Ordering::SeqCst), 0);
+
+        let rolled_back = FakeFinalizerStore {
+            commit: FakeCommitResult::RolledBack("attempt-1".to_owned()),
+            reconcile: FakeReconcileResult::Unknown,
+            reconcile_calls: AtomicUsize::new(0),
+        };
+        let error = finalize_completed_multipart_archive_with_store(&archive, &rolled_back)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code().as_str(), "InternalError");
+        assert_eq!(rolled_back.reconcile_calls.load(Ordering::SeqCst), 0);
+        assert_no_pin_removes(&kubo, &["QmRoot", "QmPart"]).await;
+    }
+
+    #[tokio::test]
+    async fn outcome_unknown_not_committed_returns_error_without_pin_removal() {
+        let kubo = MockServer::start().await;
+        let archive = completed_archive("attempt-1");
+        let store = FakeFinalizerStore {
+            commit: FakeCommitResult::OutcomeUnknown("attempt-1".to_owned()),
+            reconcile: FakeReconcileResult::NotCommitted,
+            reconcile_calls: AtomicUsize::new(0),
+        };
+
+        let error = finalize_completed_multipart_archive_with_store(&archive, &store)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code().as_str(), "InternalError");
+        assert_eq!(store.reconcile_calls.load(Ordering::SeqCst), 1);
+        assert_no_pin_removes(&kubo, &["QmRoot", "QmPart"]).await;
+    }
+
+    #[tokio::test]
+    async fn outcome_unknown_query_failure_returns_error_without_pin_removal() {
+        let kubo = MockServer::start().await;
+        let archive = completed_archive("attempt-1");
+        let store = FakeFinalizerStore {
+            commit: FakeCommitResult::OutcomeUnknown("attempt-1".to_owned()),
+            reconcile: FakeReconcileResult::Unknown,
+            reconcile_calls: AtomicUsize::new(0),
+        };
+
+        let error = finalize_completed_multipart_archive_with_store(&archive, &store)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code().as_str(), "InternalError");
+        assert!(error.to_string().contains("reconciliation failed"));
+        assert_eq!(store.reconcile_calls.load(Ordering::SeqCst), 1);
+        assert_no_pin_removes(&kubo, &["QmRoot", "QmPart"]).await;
+    }
+
+    #[tokio::test]
+    async fn finalizer_rejects_error_for_different_completion_attempt() {
+        let kubo = MockServer::start().await;
+        let archive = completed_archive("attempt-1");
+        let store = FakeFinalizerStore {
+            commit: FakeCommitResult::OutcomeUnknown("other-attempt".to_owned()),
+            reconcile: FakeReconcileResult::Committed,
+            reconcile_calls: AtomicUsize::new(0),
+        };
+
+        let error = finalize_completed_multipart_archive_with_store(&archive, &store)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code().as_str(), "InternalError");
+        assert_eq!(store.reconcile_calls.load(Ordering::SeqCst), 0);
+        assert_no_pin_removes(&kubo, &["QmRoot", "QmPart"]).await;
+    }
+
+    #[tokio::test]
+    async fn finalize_delete_trigger_reports_rolled_back_and_keeps_all_pins() {
+        let kubo = multipart_kubo(&["QmRootFirst", "QmRootRetry"]).await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/cat"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"part data"))
+            .mount(&kubo)
+            .await;
+        let state = test_state_with_bucket_and_kubo("test-bucket", kubo.uri()).await;
+        crate::store::object::upsert(
+            state.store.db(),
+            "old-object",
+            "test-bucket",
+            "archive.zip",
+            "QmOld",
+            3,
+            Some("text/plain"),
+            "QmOld",
+            None,
+            false,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        seed_plain_upload(&state, "upload-1").await;
+        crate::store::multipart::upsert_part(
+            state.store.db(),
+            "upload-1",
+            1,
+            "QmPart",
+            9,
+            "QmPart",
+        )
+        .await
+        .unwrap();
+
+        let first = complete_multipart_upload_inner(&state, complete_request("upload-1", "QmPart"))
+            .await
+            .unwrap();
+        state
+            .store
+            .db()
+            .execute(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "CREATE TRIGGER fail_multipart_upload_delete \
+                 BEFORE DELETE ON multipart_uploads \
+                 BEGIN SELECT RAISE(FAIL, 'forced multipart delete failure'); END;",
+            ))
+            .await
+            .unwrap();
+
+        let store_error = crate::store::multipart::commit_completed_upload(
+            state.store.db(),
+            "upload-1",
+            latest_attempt_for_archive(&first),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            store_error,
+            crate::store::multipart::CommitCompletedUploadError::RolledBack {
+                ref completion_attempt_id,
+                ..
+            } if completion_attempt_id == &first.completion_attempt_id
+        ));
+        let finalize_error = finalize_completed_multipart_archive(&state, &first)
+            .await
+            .unwrap_err();
+        assert_eq!(finalize_error.code().as_str(), "InternalError");
+        assert_eq!(
+            crate::store::object::get_latest(state.store.db(), "test-bucket", "archive.zip",)
+                .await
+                .unwrap()
+                .id,
+            "old-object"
+        );
+        assert!(
+            crate::store::entities::object::Entity::find_by_id(&first.completion_attempt_id)
+                .one(state.store.db())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            crate::store::multipart::get_upload(state.store.db(), "upload-1")
+                .await
+                .is_ok()
+        );
+        assert!(
+            crate::store::multipart::get_part(state.store.db(), "upload-1", 1)
+                .await
+                .is_ok()
+        );
+        assert_no_pin_removes(&kubo, &["QmRootFirst", "QmPart"]).await;
+
+        state
+            .store
+            .db()
+            .execute(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "DROP TRIGGER fail_multipart_upload_delete",
+            ))
+            .await
+            .unwrap();
+        let second =
+            complete_multipart_upload_inner(&state, complete_request("upload-1", "QmPart"))
+                .await
+                .unwrap();
+        finalize_completed_multipart_archive(&state, &second)
+            .await
+            .unwrap();
+
+        let latest =
+            crate::store::object::get_latest(state.store.db(), "test-bucket", "archive.zip")
+                .await
+                .unwrap();
+        assert_eq!(latest.id, second.completion_attempt_id);
+        let old = crate::store::entities::object::Entity::find_by_id("old-object")
+            .one(state.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!old.is_latest);
+        assert!(
+            crate::store::multipart::get_upload(state.store.db(), "upload-1")
+                .await
+                .is_err()
+        );
+        assert!(
+            crate::store::multipart::list_parts(state.store.db(), "upload-1")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_no_pin_removes(&kubo, &["QmRootFirst", "QmRootRetry", "QmPart"]).await;
+    }
+
+    #[tokio::test]
+    async fn outcome_unknown_attempt_a_does_not_adopt_attempt_b_commit() {
+        let kubo = MockServer::start().await;
+        let state = test_state_with_bucket_and_kubo("test-bucket", kubo.uri()).await;
+        seed_plain_upload(&state, "upload-1").await;
+        crate::store::multipart::upsert_part(
+            state.store.db(),
+            "upload-1",
+            1,
+            "QmPart",
+            9,
+            "QmPart",
+        )
+        .await
+        .unwrap();
+        let archive_a = completed_archive("attempt-a");
+        let archive_b = completed_archive("attempt-b");
+        let (commit_tx, commit_rx) = tokio::sync::oneshot::channel();
+        let (reconcile_tx, reconcile_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let a_store = Arc::new(BlockingUnknownFinalizerStore {
+            db: state.store.db().clone(),
+            commit_signal: tokio::sync::Mutex::new(Some(commit_tx)),
+            reconcile_signal: tokio::sync::Mutex::new(Some(reconcile_tx)),
+            release_reconcile: tokio::sync::Mutex::new(Some(release_rx)),
+        });
+
+        let a_task = tokio::spawn({
+            let store = a_store.clone();
+            async move {
+                finalize_completed_multipart_archive_with_store(&archive_a, store.as_ref()).await
+            }
+        });
+        commit_rx.await.unwrap();
+        reconcile_rx.await.unwrap();
+
+        let b_result = finalize_completed_multipart_archive(&state, &archive_b).await;
+        release_tx.send(()).unwrap();
+        let a_result = a_task.await.unwrap();
+
+        assert!(a_result.is_err());
+        assert!(b_result.is_ok());
+        assert!(
+            crate::store::entities::object::Entity::find_by_id("attempt-a")
+                .one(state.store.db())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let winner = crate::store::entities::object::Entity::find_by_id("attempt-b")
+            .one(state.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(winner.is_latest);
+        assert_eq!(winner.cid, "QmRoot");
+        assert!(
+            crate::store::multipart::get_upload(state.store.db(), "upload-1")
+                .await
+                .is_err()
+        );
+        assert_no_pin_removes(&kubo, &["QmRoot", "QmPart"]).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_complete_same_upload_uses_distinct_attempt_ids() {
+        let kubo = multipart_kubo(&["QmRoot", "QmRoot"]).await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/cat"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"part data"))
+            .mount(&kubo)
+            .await;
+        let directory = tempfile::tempdir().unwrap();
+        let state =
+            file_backed_test_state_with_bucket_and_kubo("test-bucket", kubo.uri(), &directory)
+                .await;
+        seed_plain_upload(&state, "upload-1").await;
+        crate::store::multipart::upsert_part(
+            state.store.db(),
+            "upload-1",
+            1,
+            "QmPart",
+            9,
+            "QmPart",
+        )
+        .await
+        .unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+
+        let spawn_complete = |state: Arc<AppState>, barrier: Arc<tokio::sync::Barrier>| {
+            tokio::spawn(async move {
+                let completed =
+                    complete_multipart_upload_inner(&state, complete_request("upload-1", "QmPart"))
+                        .await
+                        .unwrap();
+                let attempt_id = completed.completion_attempt_id.clone();
+                let encryption_object_id = completed.encryption_object_id.clone();
+                barrier.wait().await;
+                let result = finalize_completed_multipart_archive(&state, &completed).await;
+                (attempt_id, encryption_object_id, result)
+            })
+        };
+        let first = spawn_complete(state.clone(), barrier.clone());
+        let second = spawn_complete(state.clone(), barrier.clone());
+        barrier.wait().await;
+
+        let first = first.await.unwrap();
+        let second = second.await.unwrap();
+        assert_ne!(first.0, second.0);
+        assert_eq!(first.1, "encryption-object-1");
+        assert_eq!(second.1, "encryption-object-1");
+        assert_ne!(first.2.is_ok(), second.2.is_ok());
+        let (winner_attempt_id, loser_attempt_id) = if first.2.is_ok() {
+            (&first.0, &second.0)
+        } else {
+            (&second.0, &first.0)
+        };
+
+        let latest =
+            crate::store::object::get_latest(state.store.db(), "test-bucket", "archive.zip")
+                .await
+                .unwrap();
+        assert_eq!(&latest.id, winner_attempt_id);
+        assert_eq!(latest.cid, "QmRoot");
+        assert!(
+            crate::store::entities::object::Entity::find_by_id(loser_attempt_id)
+                .one(state.store.db())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            crate::store::multipart::get_upload(state.store.db(), "upload-1")
+                .await
+                .is_err()
+        );
+        assert!(
+            crate::store::multipart::list_parts(state.store.db(), "upload-1")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_pin_add_count(&kubo, "QmRoot", 2).await;
+        assert_no_pin_removes(&kubo, &["QmRoot", "QmPart"]).await;
+    }
 }

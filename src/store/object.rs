@@ -8,6 +8,56 @@ use serde_json::Value as JsonValue;
 
 use super::entities::object;
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct LatestObjectRow {
+    pub id: String,
+    pub bucket: String,
+    pub key: String,
+    pub cid: String,
+    pub size: i64,
+    pub content_type: Option<String>,
+    pub etag: String,
+    pub metadata: Option<JsonValue>,
+    pub encrypted: bool,
+    pub key_wrap: Option<String>,
+    pub multipart: bool,
+    pub created_at: chrono::DateTime<Utc>,
+}
+
+pub(crate) async fn write_latest_in_transaction<C: ConnectionTrait>(
+    db: &C,
+    row: LatestObjectRow,
+) -> Result<(), sea_orm::DbErr> {
+    let bucket = row.bucket.clone();
+    let key = row.key.clone();
+    object::Entity::update_many()
+        .col_expr(object::Column::IsLatest, false.into())
+        .filter(object::Column::Bucket.eq(bucket))
+        .filter(object::Column::Key.eq(key))
+        .filter(object::Column::IsLatest.eq(true))
+        .exec(db)
+        .await?;
+
+    object::Entity::insert(object::ActiveModel {
+        id: Set(row.id),
+        bucket: Set(row.bucket),
+        key: Set(row.key),
+        cid: Set(row.cid),
+        size: Set(row.size),
+        content_type: Set(row.content_type),
+        etag: Set(row.etag),
+        metadata: Set(row.metadata),
+        encrypted: Set(row.encrypted),
+        key_wrap: Set(row.key_wrap),
+        multipart: Set(row.multipart),
+        is_latest: Set(true),
+        created_at: Set(row.created_at),
+    })
+    .exec(db)
+    .await?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn upsert<C: ConnectionTrait + TransactionTrait>(
     db: &C,
@@ -27,46 +77,26 @@ pub async fn upsert<C: ConnectionTrait + TransactionTrait>(
     // the same (bucket, key). S3 semantics are last-writer-wins; the partial
     // unique index `idx_objects_latest` may cause one transaction to fail if
     // two concurrent writes race. A small retry window resolves this.
+    let row = LatestObjectRow {
+        id: id.to_owned(),
+        bucket: bucket.to_owned(),
+        key: key.to_owned(),
+        cid: cid.to_owned(),
+        size,
+        content_type: content_type.map(str::to_owned),
+        etag: etag.to_owned(),
+        metadata,
+        encrypted,
+        key_wrap: key_wrap.map(str::to_owned),
+        multipart,
+        created_at: Utc::now(),
+    };
     const MAX_RETRIES: usize = 3;
     for attempt in 0..=MAX_RETRIES {
-        let metadata_clone = metadata.clone();
         let result = db
             .transaction(|txn| {
-                let id = id.to_owned();
-                let bucket = bucket.to_owned();
-                let key = key.to_owned();
-                let cid = cid.to_owned();
-                let content_type = content_type.map(|s| s.to_owned());
-                let etag = etag.to_owned();
-                let key_wrap = key_wrap.map(|s| s.to_owned());
-                let metadata = metadata_clone.clone();
-                Box::pin(async move {
-                    object::Entity::update_many()
-                        .col_expr(object::Column::IsLatest, false.into())
-                        .filter(object::Column::Bucket.eq(&bucket))
-                        .filter(object::Column::Key.eq(&key))
-                        .filter(object::Column::IsLatest.eq(true))
-                        .exec(txn)
-                        .await?;
-
-                    let model = object::ActiveModel {
-                        id: Set(id),
-                        bucket: Set(bucket),
-                        key: Set(key),
-                        cid: Set(cid),
-                        size: Set(size),
-                        content_type: Set(content_type),
-                        etag: Set(etag),
-                        metadata: Set(metadata),
-                        encrypted: Set(encrypted),
-                        key_wrap: Set(key_wrap),
-                        multipart: Set(multipart),
-                        is_latest: Set(true),
-                        created_at: Set(Utc::now()),
-                    };
-                    object::Entity::insert(model).exec(txn).await?;
-                    Ok::<_, sea_orm::DbErr>(())
-                })
+                let row = row.clone();
+                Box::pin(async move { write_latest_in_transaction(txn, row).await })
             })
             .await;
 
@@ -157,4 +187,72 @@ pub async fn count<C: ConnectionTrait>(db: &C, bucket: &str) -> AppResult<u64> {
         .count(db)
         .await?;
     Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sea_orm::Database;
+
+    async fn setup() -> sea_orm::DatabaseConnection {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::store::run_migrations(&db).await.unwrap();
+        crate::store::bucket::create(&db, "test-bucket", None)
+            .await
+            .unwrap();
+        db
+    }
+
+    fn latest_row(id: &str, cid: &str) -> LatestObjectRow {
+        LatestObjectRow {
+            id: id.to_owned(),
+            bucket: "test-bucket".to_owned(),
+            key: "archive.zip".to_owned(),
+            cid: cid.to_owned(),
+            size: 7,
+            content_type: Some("application/zip".to_owned()),
+            etag: cid.to_owned(),
+            metadata: Some(serde_json::json!({"source": "multipart"})),
+            encrypted: true,
+            key_wrap: Some("wrapped-key".to_owned()),
+            multipart: true,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn write_latest_in_transaction_replaces_latest_and_preserves_all_fields() {
+        let db = setup().await;
+        let first = latest_row("object-1", "QmOld");
+        write_latest_in_transaction(&db, first.clone())
+            .await
+            .unwrap();
+
+        let second = latest_row("object-2", "QmNew");
+        write_latest_in_transaction(&db, second.clone())
+            .await
+            .unwrap();
+
+        let latest = get_latest(&db, "test-bucket", "archive.zip").await.unwrap();
+        assert_eq!(latest.id, second.id);
+        assert_eq!(latest.bucket, second.bucket);
+        assert_eq!(latest.key, second.key);
+        assert_eq!(latest.cid, second.cid);
+        assert_eq!(latest.size, second.size);
+        assert_eq!(latest.content_type, second.content_type);
+        assert_eq!(latest.etag, second.etag);
+        assert_eq!(latest.metadata, second.metadata);
+        assert_eq!(latest.encrypted, second.encrypted);
+        assert_eq!(latest.key_wrap, second.key_wrap);
+        assert_eq!(latest.multipart, second.multipart);
+        assert_eq!(latest.created_at, second.created_at);
+        assert!(latest.is_latest);
+
+        let old = object::Entity::find_by_id("object-1")
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!old.is_latest);
+    }
 }

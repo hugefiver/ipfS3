@@ -34,7 +34,10 @@ rand = "0.10"
 uuid = { version = "1", features = ["v4"] }
 bytes = "1"
 futures-util = "0.3"
-tokio-util = { version = "0.7", features = ["io"] }
+async_zip = { version = "0.0.18", features = ["tokio", "deflate"] }
+tokio-util = { version = "0.7", features = ["io", "compat"] }
+futures-io = "0.3"
+http-body-util = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
