@@ -1,16 +1,46 @@
 //! End-to-end tests against a real docker-compose stack.
 //!
-//! Prerequisites: `docker compose up -d --build` must be running.
-//! Tests connect to:
-//!   - Gateway: http://localhost:9000
-//!   - Kubo RPC: http://localhost:5001
+//! Prerequisite: the Compose `gateway` and `kubo` services are healthy.
+//! Default endpoints are IPv4 loopback (`http://127.0.0.1:9000` and
+//! `http://127.0.0.1:5001`) and can be overridden with
+//! `IPFS_S3_E2E_ENDPOINT` and `IPFS_S3_E2E_KUBO_URL`.
 //!
 //! Run: cargo test --test e2e -- --nocapture --test-threads=1
 
 use s3::bucket::Bucket;
 use s3::bucket_ops::BucketConfiguration;
 use s3::creds::Credentials;
+use s3::error::S3Error;
 use s3::region::Region;
+use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const S3_TIMEOUT: Duration = Duration::from_secs(30);
+const KUBO_TIMEOUT: Duration = Duration::from_secs(15);
+static BUCKET_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn endpoint_from_env(name: &str, default: &str) -> String {
+    let endpoint = std::env::var(name).unwrap_or_else(|_| default.to_owned());
+    let endpoint = endpoint.trim_end_matches('/').to_owned();
+    assert!(
+        endpoint.starts_with("http://") || endpoint.starts_with("https://"),
+        "{name} must be an HTTP(S) URL, got {endpoint}"
+    );
+    assert!(
+        !endpoint.to_ascii_lowercase().contains("localhost"),
+        "{name} must use an IPv4 address or explicit hostname; localhost is forbidden"
+    );
+    endpoint
+}
+
+fn gateway_endpoint() -> String {
+    endpoint_from_env("IPFS_S3_E2E_ENDPOINT", "http://127.0.0.1:9000")
+}
+
+fn kubo_endpoint() -> String {
+    endpoint_from_env("IPFS_S3_E2E_KUBO_URL", "http://127.0.0.1:5001")
+}
 
 fn test_creds() -> Credentials {
     Credentials::new(Some("test"), Some("test"), None, None, None).unwrap()
@@ -19,31 +49,91 @@ fn test_creds() -> Credentials {
 fn test_region() -> Region {
     Region::Custom {
         region: "us-east-1".into(),
-        endpoint: "http://127.0.0.1:9000".into(),
+        endpoint: gateway_endpoint(),
     }
 }
 
-/// Create a path-style Bucket. rust-s3's with_path_style returns Box<Bucket>.
 fn make_bucket(name: &str) -> Box<Bucket> {
-    let creds = test_creds();
-    let region = test_region();
-    Bucket::new(name, region, creds).unwrap().with_path_style()
+    Bucket::new(name, test_region(), test_creds())
+        .unwrap()
+        .with_path_style()
 }
 
-/// Ensure a bucket exists; create it if needed (ignore already-exists errors).
-async fn ensure_bucket(name: &str) -> Box<Bucket> {
-    let bucket = make_bucket(name);
-    let _ = Bucket::create_with_path_style(
-        name,
-        test_region(),
-        test_creds(),
-        BucketConfiguration::default(),
+fn make_bucket_with(name: &str, creds: Credentials) -> Box<Bucket> {
+    Bucket::new(name, test_region(), creds)
+        .unwrap()
+        .with_path_style()
+}
+
+fn unique_bucket(scenario: &str) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock must be after the Unix epoch")
+        .as_nanos();
+    let counter = BUCKET_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let name = format!(
+        "e2e-{scenario}-{}-{nanos:x}-{counter:x}",
+        std::process::id()
+    );
+    assert!(
+        name.len() <= 63,
+        "bucket name exceeds 63 characters: {name}"
+    );
+    name
+}
+
+async fn s3_call<T, F>(label: &str, future: F) -> Result<T, S3Error>
+where
+    F: Future<Output = Result<T, S3Error>>,
+{
+    tokio::time::timeout(S3_TIMEOUT, future)
+        .await
+        .unwrap_or_else(|_| panic!("rust-s3 operation '{label}' timed out after 30 seconds"))
+}
+
+async fn create_bucket(scenario: &str) -> (String, Box<Bucket>) {
+    let name = unique_bucket(scenario);
+    let label = format!("create bucket {name}");
+    let response = s3_call(
+        &label,
+        Bucket::create_with_path_style(
+            &name,
+            test_region(),
+            test_creds(),
+            BucketConfiguration::default(),
+        ),
     )
-    .await;
-    bucket
+    .await
+    .unwrap_or_else(|error| panic!("{label} failed: {error}"));
+    assert!(
+        response.success(),
+        "{label} returned status {}",
+        response.response_code
+    );
+    let bucket = make_bucket(&name);
+    (name, bucket)
 }
 
-/// Extract ETag from a ResponseData headers map, stripping surrounding quotes.
+async fn cleanup_success(bucket: &Bucket, keys: &[&str]) {
+    for key in keys {
+        let label = format!("cleanup delete object {}/{key}", bucket.name());
+        let response = s3_call(&label, bucket.delete_object(key))
+            .await
+            .unwrap_or_else(|error| panic!("{label} failed: {error}"));
+        assert_eq!(
+            response.status_code(),
+            204,
+            "{label} returned an unexpected status"
+        );
+    }
+
+    let label = format!("cleanup delete bucket {}", bucket.name());
+    let status = s3_call(&label, bucket.delete())
+        .await
+        .unwrap_or_else(|error| panic!("{label} failed: {error}"));
+    assert_eq!(status, 204, "{label} returned an unexpected status");
+}
+
 fn etag_from_headers(headers: &std::collections::HashMap<String, String>) -> String {
     headers
         .get("etag")
@@ -55,342 +145,366 @@ fn etag_from_headers(headers: &std::collections::HashMap<String, String>) -> Str
         .to_string()
 }
 
-/// Call Kubo /api/v0/cat and return the raw bytes.
 async fn kubo_cat(cid: &str) -> Vec<u8> {
-    let url = format!("http://127.0.0.1:5001/api/v0/cat?arg={cid}");
-    let resp = reqwest::Client::new().post(&url).send().await.unwrap();
+    let client = reqwest::Client::builder()
+        .timeout(KUBO_TIMEOUT)
+        .build()
+        .expect("build 15-second Kubo client");
+    let url = format!("{}/api/v0/cat?arg={cid}", kubo_endpoint());
+    let response = client
+        .post(&url)
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("kubo cat request failed for {cid}: {error}"));
     assert!(
-        resp.status().is_success(),
+        response.status().is_success(),
         "kubo cat failed for {cid}: {}",
-        resp.status()
+        response.status()
     );
-    resp.bytes().await.unwrap().to_vec()
+    response
+        .bytes()
+        .await
+        .unwrap_or_else(|error| panic!("kubo cat body failed for {cid}: {error}"))
+        .to_vec()
 }
-
-// ── Acceptance #1: docker compose up ──
-// Verified manually: `docker compose ps` shows both services Up.
-
-// ── Acceptance #2: create bucket via S3 API ──
 
 #[tokio::test]
 async fn test_02_create_bucket() {
-    let creds = test_creds();
-    let region = test_region();
-    let resp =
-        Bucket::create_with_path_style("e2e-create", region, creds, BucketConfiguration::default())
-            .await;
-    match resp {
-        Ok(r) => assert!(r.success(), "create bucket failed: {:?}", r.response_code),
-        Err(e) => {
-            let msg = format!("{e}");
-            assert!(
-                msg.contains("BucketAlreadyOwnedByYou")
-                    || msg.contains("409")
-                    || msg.contains("already"),
-                "unexpected error creating bucket: {msg}"
-            );
-        }
-    }
+    let (_name, bucket) = create_bucket("create").await;
+    cleanup_success(&bucket, &[]).await;
 }
-
-// ── Acceptance #3 + #4: put plain object, CID verifiable in Kubo, download matches ──
 
 #[tokio::test]
 async fn test_03_04_put_get_plain_object() {
-    let bucket = ensure_bucket("e2e-plain").await;
+    let (_name, bucket) = create_bucket("plain").await;
     let content = b"hello world from e2e";
 
-    // Put
-    let put_resp = bucket.put_object("hello.txt", content).await.unwrap();
-    assert_eq!(put_resp.status_code(), 200, "put_object failed");
+    let put_response = s3_call(
+        "plain put_object hello.txt",
+        bucket.put_object("hello.txt", content),
+    )
+    .await
+    .expect("plain put_object must succeed");
+    assert_eq!(put_response.status_code(), 200, "put_object failed");
 
-    // Extract ETag (= CID) from response headers
-    let headers = put_resp.headers();
-    let etag = etag_from_headers(&headers);
-    println!("ETag (CID): {etag}");
+    let etag = etag_from_headers(&put_response.headers());
     assert!(!etag.is_empty(), "ETag should not be empty");
-
-    // Verify CID exists in Kubo and returns plaintext
-    let kubo_content = kubo_cat(&etag).await;
+    println!("ETag (CID): {etag}");
     assert_eq!(
-        &kubo_content[..],
-        &content[..],
-        "kubo cat should return plaintext for plain object"
+        kubo_cat(&etag).await.as_slice(),
+        content,
+        "kubo cat should return plaintext for a plain object"
     );
 
-    // Get via S3 API
-    let get_resp = bucket.get_object("hello.txt").await.unwrap();
-    assert_eq!(get_resp.status_code(), 200, "get_object failed");
-    assert_eq!(get_resp.bytes().as_ref(), content, "content mismatch");
-}
+    let get_response = s3_call("plain get_object hello.txt", bucket.get_object("hello.txt"))
+        .await
+        .expect("plain get_object must succeed");
+    assert_eq!(get_response.status_code(), 200, "get_object failed");
+    assert_eq!(get_response.bytes().as_ref(), content, "content mismatch");
 
-// ── Acceptance #5: list objects ──
+    cleanup_success(&bucket, &["hello.txt"]).await;
+}
 
 #[tokio::test]
 async fn test_05_list_objects() {
-    let bucket = ensure_bucket("e2e-list").await;
-    bucket.put_object("file1.txt", b"data1").await.unwrap();
-    bucket.put_object("file2.txt", b"data2").await.unwrap();
-
-    let results = bucket.list("".to_string(), None).await;
-    match results {
-        Ok(results) => {
-            for r in &results {
-                for c in &r.contents {
-                    println!("  key: {} size: {}", c.key, c.size);
-                }
-            }
-            assert!(!results.is_empty(), "should have at least one list result");
-        }
-        Err(e) => {
-            let msg = format!("{e}");
-            // Known interop gap: s3s ListObjectsV2 omits <Name>, causing rust-s3 deserialize error.
-            assert!(
-                msg.contains("SerdeXml") || msg.contains("missing") || msg.contains("Name"),
-                "unexpected list error: {msg}"
-            );
-            println!("list returned known interop error (s3s omits <Name>): {msg}");
-        }
+    let (_name, bucket) = create_bucket("list").await;
+    let objects: [(&str, &[u8]); 2] = [("file1.txt", b"data1"), ("file2.txt", b"data2")];
+    for (key, content) in objects {
+        let label = format!("list setup put_object {key}");
+        let response = s3_call(&label, bucket.put_object(key, content))
+            .await
+            .unwrap_or_else(|error| panic!("{label} failed: {error}"));
+        assert_eq!(
+            response.status_code(),
+            200,
+            "{label} returned an unexpected status"
+        );
     }
-}
 
-// ── Acceptance #6: delete object, then get returns 404 ──
+    let results = s3_call("list_objects root", bucket.list(String::new(), None))
+        .await
+        .expect("ListObjects must deserialize successfully");
+    let keys = results
+        .iter()
+        .flat_map(|result| result.contents.iter())
+        .map(|object| object.key.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        keys.contains(&"file1.txt"),
+        "ListObjects omitted file1.txt: {keys:?}"
+    );
+    assert!(
+        keys.contains(&"file2.txt"),
+        "ListObjects omitted file2.txt: {keys:?}"
+    );
+
+    cleanup_success(&bucket, &["file1.txt", "file2.txt"]).await;
+}
 
 #[tokio::test]
 async fn test_06_delete_then_404() {
-    let bucket = ensure_bucket("e2e-delete").await;
-    bucket.put_object("todelete.txt", b"temp").await.unwrap();
+    let (_name, bucket) = create_bucket("delete").await;
+    let put_response = s3_call(
+        "delete setup put_object todelete.txt",
+        bucket.put_object("todelete.txt", b"temp"),
+    )
+    .await
+    .expect("delete setup put_object must succeed");
+    assert_eq!(put_response.status_code(), 200);
 
-    let del_resp = bucket.delete_object("todelete.txt").await.unwrap();
-    assert_eq!(del_resp.status_code(), 204, "delete_object failed");
+    let delete_response = s3_call(
+        "delete_object todelete.txt",
+        bucket.delete_object("todelete.txt"),
+    )
+    .await
+    .expect("delete_object must succeed");
+    assert_eq!(delete_response.status_code(), 204, "delete_object failed");
 
-    let get_resp = bucket.get_object("todelete.txt").await;
-    match get_resp {
-        Err(e) => {
-            let msg = format!("{e}");
-            assert!(
-                msg.contains("404") || msg.contains("NoSuchKey"),
-                "expected 404/NoSuchKey, got: {msg}"
-            );
-        }
-        Ok(r) => panic!(
-            "expected error after delete, got status {}",
-            r.status_code()
-        ),
-    }
+    let error = s3_call(
+        "get deleted object todelete.txt",
+        bucket.get_object("todelete.txt"),
+    )
+    .await
+    .expect_err("get after delete must fail");
+    let message = error.to_string();
+    assert!(
+        message.contains("404") || message.contains("NoSuchKey"),
+        "expected 404/NoSuchKey, got: {message}"
+    );
+
+    cleanup_success(&bucket, &[]).await;
 }
-
-// ── Acceptance #7: CopyObject produces same CID ──
 
 #[tokio::test]
 async fn test_07_copy_object_same_cid() {
-    let bucket = ensure_bucket("e2e-copy").await;
+    let (_name, bucket) = create_bucket("copy").await;
     let content = b"copy source data";
 
-    // Put source
-    let put_resp = bucket.put_object("src.txt", content).await.unwrap();
-    let src_etag = etag_from_headers(&put_resp.headers());
+    let put_response = s3_call(
+        "copy setup put_object src.txt",
+        bucket.put_object("src.txt", content),
+    )
+    .await
+    .expect("copy source upload must succeed");
+    assert_eq!(put_response.status_code(), 200);
+    let source_etag = etag_from_headers(&put_response.headers());
+    assert!(
+        !source_etag.is_empty(),
+        "copy source ETag must not be empty"
+    );
 
-    // Copy via raw HTTP with x-amz-copy-source header
-    // We use an unsigned request first; if that fails, fall back to content-addressing check.
-    let url = "http://localhost:9000/e2e-copy/dst.txt";
-    let resp = reqwest::Client::new()
-        .put(url)
-        .header("x-amz-copy-source", "/e2e-copy/src.txt")
-        .send()
+    let copy_status = s3_call(
+        "signed copy_object_internal src.txt to dst.txt",
+        bucket.copy_object_internal("src.txt", "dst.txt"),
+    )
+    .await
+    .expect("signed CopyObject must succeed");
+    assert_eq!(copy_status, 200, "CopyObject must return HTTP 200");
+
+    let (head, head_status) = s3_call("head copied dst.txt", bucket.head_object("dst.txt"))
         .await
-        .unwrap();
+        .expect("HeadObject for copied destination must succeed");
+    assert_eq!(head_status, 200);
+    let destination_etag = head.e_tag.unwrap_or_default().trim_matches('"').to_owned();
+    assert_eq!(
+        source_etag, destination_etag,
+        "CopyObject should preserve the source CID"
+    );
 
-    if resp.status().is_success() {
-        // Head dst and compare ETag
-        let head_dst = bucket.head_object("dst.txt").await.unwrap();
-        let (head_result, _status) = head_dst;
-        let dst_etag = head_result
-            .e_tag
-            .clone()
-            .unwrap_or_default()
-            .trim_matches('"')
-            .to_string();
-        assert_eq!(src_etag, dst_etag, "CopyObject should produce same CID");
-        println!("CopyObject: src ETag={src_etag}, dst ETag={dst_etag}");
-    } else {
-        // Unsigned request rejected — verify via content-addressing instead.
-        println!(
-            "CopyObject unsigned request returned {} — falling back to content-addressing",
-            resp.status()
-        );
-        let put2 = bucket.put_object("dst.txt", content).await.unwrap();
-        let dst_etag = etag_from_headers(&put2.headers());
-        assert_eq!(
-            src_etag, dst_etag,
-            "same content should yield same CID (content-addressed)"
-        );
-        println!("Content-addressing: src ETag={src_etag}, dst ETag={dst_etag}");
-    }
+    cleanup_success(&bucket, &["src.txt", "dst.txt"]).await;
 }
-
-// ── Acceptance #8: Range request (plain object) ──
 
 #[tokio::test]
 async fn test_08_range_request() {
-    let bucket = ensure_bucket("e2e-range").await;
-    let content: Vec<u8> = (0..1024u32).map(|i| (i % 256) as u8).collect();
-    let put_resp = bucket.put_object("large.bin", &content).await.unwrap();
-    assert_eq!(put_resp.status_code(), 200);
+    let (_name, bucket) = create_bucket("range").await;
+    let content = (0..1024u32)
+        .map(|index| (index % 256) as u8)
+        .collect::<Vec<_>>();
 
-    // Get with Range header via raw HTTP
-    let url = "http://localhost:9000/e2e-range/large.bin";
-    let resp = reqwest::Client::new()
-        .get(url)
-        .header("Range", "bytes=0-99")
-        .send()
-        .await
-        .unwrap();
+    let put_response = s3_call(
+        "range setup put_object large.bin",
+        bucket.put_object("large.bin", &content),
+    )
+    .await
+    .expect("range setup upload must succeed");
+    assert_eq!(put_response.status_code(), 200);
 
+    let range_response = s3_call(
+        "signed get_object_range large.bin bytes 0-99",
+        bucket.get_object_range("large.bin", 0, Some(99)),
+    )
+    .await
+    .expect("signed ranged GET must succeed");
     assert_eq!(
-        resp.status(),
+        range_response.status_code(),
         206,
-        "expected 206 Partial Content, got {}",
-        resp.status()
+        "Range GET must return HTTP 206"
     );
-    let body = resp.bytes().await.unwrap();
-    assert_eq!(body.len(), 100, "range body should be 100 bytes");
-    assert_eq!(&body[..], &content[0..100], "range content mismatch");
-}
+    assert_eq!(
+        range_response.bytes().len(),
+        100,
+        "range body should contain 100 bytes"
+    );
+    assert_eq!(
+        range_response.bytes().as_ref(),
+        &content[0..100],
+        "range content mismatch"
+    );
 
-// ── Acceptance #9: wrong credentials rejected ──
+    cleanup_success(&bucket, &["large.bin"]).await;
+}
 
 #[tokio::test]
 async fn test_09_wrong_credentials() {
-    let bad_creds = Credentials::new(Some("wrong"), Some("wrong"), None, None, None).unwrap();
-    let _region = test_region();
-    let bucket = make_bucket_with("e2e-auth", bad_creds);
+    let (name, bucket) = create_bucket("auth").await;
+    let bad_credentials = Credentials::new(Some("wrong"), Some("wrong"), None, None, None).unwrap();
+    let bad_bucket = make_bucket_with(&name, bad_credentials);
 
-    let result = bucket.put_object("test.txt", b"data").await;
-    assert!(result.is_err(), "wrong credentials should be rejected");
-    let msg = format!("{}", result.unwrap_err());
+    let error = s3_call(
+        "wrong-credential put_object test.txt",
+        bad_bucket.put_object("test.txt", b"data"),
+    )
+    .await
+    .expect_err("wrong credentials must be rejected");
+    let message = error.to_string();
     assert!(
-        msg.contains("403")
-            || msg.contains("SignatureDoesNotMatch")
-            || msg.contains("InvalidAccessKeyId"),
-        "expected 403/SignatureDoesNotMatch, got: {msg}"
+        message.contains("403")
+            || message.contains("SignatureDoesNotMatch")
+            || message.contains("InvalidAccessKeyId"),
+        "expected 403/SignatureDoesNotMatch/InvalidAccessKeyId, got: {message}"
     );
-}
 
-fn make_bucket_with(name: &str, creds: Credentials) -> Box<Bucket> {
-    let region = test_region();
-    Bucket::new(name, region, creds).unwrap().with_path_style()
+    cleanup_success(&bucket, &[]).await;
 }
-
-// ── Acceptance #10: Multipart upload (large file) ──
 
 #[tokio::test]
 async fn test_10_multipart_upload() {
-    let bucket = ensure_bucket("e2e-multipart").await;
-    // Create 6 MB content
-    let content: Vec<u8> = (0..6_291_456u32).map(|i| (i % 256) as u8).collect();
+    let (_name, bucket) = create_bucket("multipart").await;
+    let content = (0..6_291_456u32)
+        .map(|index| (index % 256) as u8)
+        .collect::<Vec<_>>();
 
-    // rust-s3's put_object with large data should trigger multipart
-    let put_resp = bucket.put_object("bigfile.bin", &content).await;
-    match put_resp {
-        Ok(r) => {
-            assert_eq!(r.status_code(), 200, "multipart upload failed");
-            let get_resp = bucket.get_object("bigfile.bin").await.unwrap();
-            assert_eq!(
-                get_resp.bytes().as_ref(),
-                &content[..],
-                "multipart content mismatch"
-            );
-            println!("Multipart upload + download verified (6 MB)");
-        }
-        Err(e) => {
-            let msg = format!("{e}");
-            println!("multipart upload error: {msg}");
-            if msg.contains("NotImplemented") || msg.contains("501") {
-                println!("SKIP: s3s multipart auto-trigger not supported via rust-s3");
-            } else {
-                panic!("unexpected multipart error: {msg}");
-            }
-        }
-    }
+    let initiated = s3_call(
+        "initiate multipart upload bigfile.bin",
+        bucket.initiate_multipart_upload("bigfile.bin", "application/octet-stream"),
+    )
+    .await
+    .expect("multipart initiation must succeed; NotImplemented is a failure");
+
+    let part = s3_call(
+        "upload 6 MiB multipart part 1",
+        bucket.put_multipart_chunk(
+            content.clone(),
+            "bigfile.bin",
+            1,
+            &initiated.upload_id,
+            "application/octet-stream",
+        ),
+    )
+    .await
+    .expect("6 MiB multipart part upload must succeed");
+
+    let complete_response = s3_call(
+        "complete multipart upload bigfile.bin",
+        bucket.complete_multipart_upload("bigfile.bin", &initiated.upload_id, vec![part]),
+    )
+    .await
+    .expect("multipart completion must succeed");
+    assert_eq!(
+        complete_response.status_code(),
+        200,
+        "multipart completion returned an unexpected status"
+    );
+
+    let get_response = s3_call(
+        "multipart round-trip get_object bigfile.bin",
+        bucket.get_object("bigfile.bin"),
+    )
+    .await
+    .expect("6 MiB round-trip download must succeed");
+    assert_eq!(get_response.status_code(), 200);
+    assert_eq!(
+        get_response.bytes().as_ref(),
+        content.as_slice(),
+        "6 MiB round-trip content mismatch"
+    );
+
+    cleanup_success(&bucket, &["bigfile.bin"]).await;
 }
-
-// ── Acceptance #11: encrypted object — ipfs cat returns ciphertext, S3 GET returns plaintext ──
 
 #[tokio::test]
 async fn test_11_encrypted_object() {
-    let bucket = ensure_bucket("e2e-encrypted").await;
+    let (_name, bucket) = create_bucket("encrypted").await;
     let content = b"secret encrypted data";
-
-    // Put with SSE-S3 header via put_object_with_headers
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert("x-amz-server-side-encryption", "AES256".parse().unwrap());
 
-    let put_resp = bucket
-        .put_object_with_headers("secret.txt", content, Some(headers))
-        .await
-        .unwrap();
+    let put_response = s3_call(
+        "encrypted put_object_with_headers secret.txt",
+        bucket.put_object_with_headers("secret.txt", content, Some(headers)),
+    )
+    .await
+    .expect("encrypted put must succeed");
+    assert_eq!(put_response.status_code(), 200, "encrypted put failed");
 
-    assert_eq!(put_resp.status_code(), 200, "encrypted put failed");
-
-    let etag = etag_from_headers(&put_resp.headers());
-    println!("Encrypted object CID: {etag}");
-    assert!(!etag.is_empty(), "ETag should not be empty");
-
-    // Kubo cat should return ciphertext (NOT plaintext)
+    let etag = etag_from_headers(&put_response.headers());
+    assert!(!etag.is_empty(), "encrypted object ETag must not be empty");
     let kubo_content = kubo_cat(&etag).await;
     assert_ne!(
-        &kubo_content[..],
-        &content[..],
-        "kubo cat should return CIPHERTEXT for encrypted object, not plaintext"
-    );
-    println!(
-        "Verified: Kubo returns {} bytes of ciphertext (plaintext was {} bytes)",
-        kubo_content.len(),
-        content.len()
-    );
-
-    // S3 GET should return plaintext
-    let get_resp = bucket.get_object("secret.txt").await.unwrap();
-    assert_eq!(
-        get_resp.bytes().as_ref(),
+        kubo_content.as_slice(),
         content,
-        "S3 GET should return plaintext"
+        "Kubo must return ciphertext for an encrypted object"
     );
-    println!("Verified: S3 GET returns plaintext");
-}
 
-// ── Acceptance #12: plain object — ipfs cat returns plaintext ──
+    let get_response = s3_call(
+        "encrypted get_object secret.txt",
+        bucket.get_object("secret.txt"),
+    )
+    .await
+    .expect("encrypted S3 GET must succeed");
+    assert_eq!(get_response.status_code(), 200);
+    assert_eq!(
+        get_response.bytes().as_ref(),
+        content,
+        "S3 GET must return decrypted plaintext"
+    );
+
+    cleanup_success(&bucket, &["secret.txt"]).await;
+}
 
 #[tokio::test]
 async fn test_12_plain_object_ipfs_cat() {
-    let bucket = ensure_bucket("e2e-plain-ipfs").await;
+    let (_name, bucket) = create_bucket("plain-ipfs").await;
     let content = b"plain data for ipfs cat";
 
-    let put_resp = bucket.put_object("plain.txt", content).await.unwrap();
-    let etag = etag_from_headers(&put_resp.headers());
-
-    let kubo_content = kubo_cat(&etag).await;
+    let put_response = s3_call(
+        "plain IPFS put_object plain.txt",
+        bucket.put_object("plain.txt", content),
+    )
+    .await
+    .expect("plain IPFS setup put must succeed");
+    assert_eq!(put_response.status_code(), 200);
+    let etag = etag_from_headers(&put_response.headers());
     assert_eq!(
-        &kubo_content[..],
-        &content[..],
-        "kubo cat should return plaintext for plain object"
+        kubo_cat(&etag).await.as_slice(),
+        content,
+        "Kubo must return plaintext for a plain object"
     );
-    println!("Verified: plain object accessible via ipfs cat as plaintext");
-}
 
-// ── Acceptance #14: ETag = CID ──
+    cleanup_success(&bucket, &["plain.txt"]).await;
+}
 
 #[tokio::test]
 async fn test_14_etag_is_cid() {
-    let bucket = ensure_bucket("e2e-etag").await;
-    let put_resp = bucket
-        .put_object("etag-test.txt", b"etag test")
-        .await
-        .unwrap();
-    let etag = etag_from_headers(&put_resp.headers());
-
-    // CID v0 starts with "Qm", CID v1 starts with "bafy"/"bafk"/"bafz"
+    let (_name, bucket) = create_bucket("etag").await;
+    let put_response = s3_call(
+        "ETag put_object etag-test.txt",
+        bucket.put_object("etag-test.txt", b"etag test"),
+    )
+    .await
+    .expect("ETag setup put must succeed");
+    assert_eq!(put_response.status_code(), 200);
+    let etag = etag_from_headers(&put_response.headers());
     assert!(
         etag.starts_with("Qm")
             || etag.starts_with("bafy")
@@ -398,8 +512,6 @@ async fn test_14_etag_is_cid() {
             || etag.starts_with("bafz"),
         "ETag '{etag}' does not look like a CID"
     );
-    println!("ETag = CID verified: {etag}");
-}
 
-// ── Acceptance #15: docker compose down -v cleanup ──
-// This is a manual step, not an automated test. Run: docker compose down -v
+    cleanup_success(&bucket, &["etag-test.txt"]).await;
+}
