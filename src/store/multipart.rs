@@ -17,6 +17,7 @@ pub async fn create_upload<C: ConnectionTrait>(
     key: &str,
     encryption_mode: &str,
     key_wrap: Option<&str>,
+    sse_c_key_fingerprint: Option<&str>,
     content_type: Option<&str>,
     metadata: Option<JsonValue>,
     decompress_zip_target: Option<&str>,
@@ -30,6 +31,7 @@ pub async fn create_upload<C: ConnectionTrait>(
         created_at: Set(Utc::now()),
         encryption_mode: Set(encryption_mode.to_owned()),
         key_wrap: Set(key_wrap.map(|s| s.to_owned())),
+        sse_c_key_fingerprint: Set(sse_c_key_fingerprint.map(|s| s.to_owned())),
         content_type: Set(content_type.map(|s| s.to_owned())),
         metadata: Set(metadata),
         decompress_zip_target: Set(decompress_zip_target.map(str::to_owned)),
@@ -38,6 +40,25 @@ pub async fn create_upload<C: ConnectionTrait>(
 
     multipart_upload::Entity::insert(model).exec(db).await?;
     Ok(())
+}
+
+pub async fn claim_sse_c_key_fingerprint<C: ConnectionTrait>(
+    db: &C,
+    upload_id: &str,
+    candidate: &str,
+) -> AppResult<multipart_upload::Model> {
+    multipart_upload::Entity::update_many()
+        .col_expr(
+            multipart_upload::Column::SseCKeyFingerprint,
+            candidate.to_owned().into(),
+        )
+        .filter(multipart_upload::Column::UploadId.eq(upload_id))
+        .filter(multipart_upload::Column::EncryptionMode.eq("sse_c"))
+        .filter(multipart_upload::Column::SseCKeyFingerprint.is_null())
+        .exec(db)
+        .await?;
+
+    get_upload(db, upload_id).await
 }
 
 pub async fn get_upload<C: ConnectionTrait>(
@@ -214,6 +235,7 @@ pub(crate) fn classify_completion_attempt_state(
         && row.metadata == expected.metadata
         && row.encrypted == expected.encrypted
         && row.key_wrap == expected.key_wrap
+        && row.sse_c_key_fingerprint == expected.sse_c_key_fingerprint
         && row.multipart == expected.multipart
         && row.is_latest;
     if exact && upload.is_none() {
@@ -267,6 +289,7 @@ mod tests {
             metadata: Some(serde_json::json!({"source": "multipart"})),
             encrypted: false,
             key_wrap: None,
+            sse_c_key_fingerprint: None,
             multipart: true,
             created_at: Utc::now(),
         }
@@ -286,6 +309,7 @@ mod tests {
             metadata: attempt.metadata.clone(),
             encrypted: attempt.encrypted,
             key_wrap: attempt.key_wrap.clone(),
+            sse_c_key_fingerprint: attempt.sse_c_key_fingerprint.clone(),
             multipart: attempt.multipart,
             is_latest: true,
             created_at: attempt.created_at,
@@ -302,6 +326,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_upload_persists_sse_c_key_fingerprint() {
+        let db = setup().await;
+
+        create_upload(
+            &db,
+            "upload-sse-c",
+            "object-sse-c",
+            "test-bucket",
+            "archive.zip",
+            "sse_c",
+            None,
+            Some("v1:hmac-sha256:fixture"),
+            Some("application/zip"),
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let upload = get_upload(&db, "upload-sse-c").await.unwrap();
+        assert_eq!(
+            upload.sse_c_key_fingerprint.as_deref(),
+            Some("v1:hmac-sha256:fixture")
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_sse_c_key_fingerprint_claims_keep_one_legacy_winner() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("multipart-claim.sqlite");
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            database_path.display().to_string().replace('\\', "/")
+        );
+        let mut options = sea_orm::ConnectOptions::new(database_url);
+        options.max_connections(4).min_connections(2);
+        let db = Database::connect(options).await.unwrap();
+        crate::store::run_migrations(&db).await.unwrap();
+        crate::store::bucket::create(&db, "test-bucket", None)
+            .await
+            .unwrap();
+        create_upload(
+            &db,
+            "legacy-upload",
+            "legacy-object",
+            "test-bucket",
+            "archive.zip",
+            "sse_c",
+            None,
+            None,
+            Some("application/zip"),
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let (first, second) = tokio::join!(
+            claim_sse_c_key_fingerprint(&db, "legacy-upload", "fp-a"),
+            claim_sse_c_key_fingerprint(&db, "legacy-upload", "fp-b"),
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        let winner = get_upload(&db, "legacy-upload").await.unwrap();
+
+        assert!(matches!(
+            winner.sse_c_key_fingerprint.as_deref(),
+            Some("fp-a" | "fp-b")
+        ));
+        assert_eq!(
+            first.sse_c_key_fingerprint, winner.sse_c_key_fingerprint,
+            "first claimant must reload the database winner"
+        );
+        assert_eq!(
+            second.sse_c_key_fingerprint, winner.sse_c_key_fingerprint,
+            "second claimant must reload the database winner"
+        );
+    }
+
+    #[tokio::test]
     async fn create_upload_persists_decompress_metadata() {
         let db = setup().await;
 
@@ -312,6 +418,7 @@ mod tests {
             "test-bucket",
             "archive.zip",
             "none",
+            None,
             None,
             Some("application/zip"),
             None,
@@ -334,6 +441,7 @@ mod tests {
             "test-bucket",
             "archive.zip",
             "none",
+            None,
             None,
             Some("application/zip"),
             None,
@@ -411,6 +519,7 @@ mod tests {
             None,
             false,
             None,
+            None,
             false,
         )
         .await
@@ -478,6 +587,7 @@ mod tests {
             created_at: Utc::now(),
             encryption_mode: "none".to_owned(),
             key_wrap: None,
+            sse_c_key_fingerprint: None,
             content_type: Some("application/zip".to_owned()),
             metadata: None,
             decompress_zip_target: None,
@@ -507,6 +617,7 @@ mod tests {
             created_at: Utc::now(),
             encryption_mode: "none".to_owned(),
             key_wrap: None,
+            sse_c_key_fingerprint: None,
             content_type: Some("application/zip".to_owned()),
             metadata: None,
             decompress_zip_target: None,

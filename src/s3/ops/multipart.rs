@@ -75,17 +75,21 @@ pub async fn create_multipart_upload(
 
     // For SSE-S3 we generate a per-object key now and persist its wrapped form
     // so the same key can be reused for every part. SSE-C keys are supplied
-    // per-request and are never stored.
-    let key_wrap: Option<String> = match enc_mode {
+    // per-request and are never stored; only their HMAC fingerprint is kept.
+    let (key_wrap, sse_c_key_fingerprint) = match enc_mode {
         EncryptionMode::SseS3 => {
             let ok = state.master_key.generate_object_key();
             let wrapped = state
                 .master_key
                 .wrap(&ok)
                 .map_err(|e| s3s::s3_error!(InternalError, "key wrap: {e}"))?;
-            Some(wrapped)
+            (Some(wrapped), None)
         }
-        _ => None,
+        EncryptionMode::SseC => {
+            let key = extract_sse_c_key(&req.headers)?;
+            (None, Some(state.master_key.sse_c_key_fingerprint(&key)))
+        }
+        EncryptionMode::None => (None, None),
     };
 
     crate::store::multipart::create_upload(
@@ -96,6 +100,7 @@ pub async fn create_multipart_upload(
         key,
         enc_mode.as_str(),
         key_wrap.as_deref(),
+        sse_c_key_fingerprint.as_deref(),
         content_type.as_deref(),
         metadata,
         decompress_zip_target.as_deref(),
@@ -116,6 +121,125 @@ pub async fn create_multipart_upload(
         server_side_encryption,
         ..Default::default()
     }))
+}
+
+async fn validate_sse_c_upload_key(
+    state: &Arc<AppState>,
+    upload_id: &str,
+    headers: &http::HeaderMap,
+) -> S3Result<crate::crypto::ObjectKey> {
+    if determine_encryption_mode(headers)? != EncryptionMode::SseC {
+        return Err(s3s::s3_error!(
+            InvalidArgument,
+            "complete, unmixed SSE-C headers are required for this upload"
+        ));
+    }
+
+    let key = extract_sse_c_key(headers)?;
+    let candidate = state.master_key.sse_c_key_fingerprint(&key);
+    let upload = crate::store::multipart::claim_sse_c_key_fingerprint(
+        state.store.db(),
+        upload_id,
+        &candidate,
+    )
+    .await?;
+    let persisted = upload.sse_c_key_fingerprint.as_deref().ok_or_else(|| {
+        s3s::s3_error!(
+            InternalError,
+            "missing persisted SSE-C key fingerprint for multipart upload"
+        )
+    })?;
+    let matches = state
+        .master_key
+        .verify_sse_c_key_fingerprint(persisted, &key)
+        .map_err(|e| {
+            s3s::s3_error!(
+                InternalError,
+                "invalid persisted SSE-C key fingerprint: {e}"
+            )
+        })?;
+    if !matches {
+        return Err(s3s::s3_error!(
+            InvalidArgument,
+            "SSE-C customer key does not match multipart upload"
+        ));
+    }
+
+    Ok(key)
+}
+
+/// Authenticate every SSE-C part before starting the root-object add request.
+///
+/// This keeps a corrupt part (or a legacy upload claimed by a key that did not
+/// encrypt its existing parts) retryable without creating an unpinned root
+/// object. Kubo content is addressed by CID, so the normal streaming complete
+/// path can safely fetch the authenticated bytes again for re-encryption.
+async fn authenticate_sse_c_parts(
+    kubo: &crate::kubo::KuboClient,
+    parts: &[(String, i64)],
+    key: Arc<crate::crypto::ObjectKey>,
+) -> S3Result<()> {
+    preflight_sse_c_part_sizes(parts)?;
+
+    for (cid, expected_size) in parts {
+        let part_stream = crate::kubo::cat::stream_cat(kubo, cid, None)
+            .await
+            .map_err(|e| s3s::s3_error!(InternalError, "cat: {e}"))?;
+        let decrypted = crate::crypto::chunker::decrypt_chunk_stream(part_stream, key.clone());
+        tokio::pin!(decrypted);
+        let mut observed_size = 0_i64;
+        while let Some(chunk) = decrypted.next().await {
+            match chunk {
+                Ok(chunk) => {
+                    observed_size = checked_part_plaintext_size(observed_size, chunk.len())?;
+                    if observed_size > *expected_size {
+                        return Err(s3s::s3_error!(
+                            InvalidPart,
+                            "decrypted part exceeds recorded plaintext size"
+                        ));
+                    }
+                }
+                Err(crate::error::AppError::Crypto(_)) => {
+                    return Err(s3s::s3_error!(
+                        InvalidPart,
+                        "failed to decrypt part during complete — SSE-C key may not match the key used to upload parts"
+                    ));
+                }
+                Err(error) => {
+                    return Err(s3s::s3_error!(
+                        InternalError,
+                        "failed to stream encrypted multipart part: {error}"
+                    ));
+                }
+            }
+        }
+        if observed_size != *expected_size {
+            return Err(s3s::s3_error!(
+                InvalidPart,
+                "decrypted part size {observed_size} does not match recorded size {expected_size}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn preflight_sse_c_part_sizes(parts: &[(String, i64)]) -> S3Result<()> {
+    if parts.iter().any(|(_, expected_size)| *expected_size < 0) {
+        return Err(s3s::s3_error!(
+            InvalidPart,
+            "multipart part has a negative recorded plaintext size"
+        ));
+    }
+    Ok(())
+}
+
+fn checked_part_plaintext_size(observed: i64, chunk_size: usize) -> S3Result<i64> {
+    let chunk_size = i64::try_from(chunk_size)
+        .map_err(|_| s3s::s3_error!(InvalidPart, "multipart part plaintext size overflow"))?;
+    observed
+        .checked_add(chunk_size)
+        .ok_or_else(|| s3s::s3_error!(InvalidPart, "multipart part plaintext size overflow"))
 }
 
 /// Upload a single part of an initiated multipart upload.
@@ -150,6 +274,14 @@ pub async fn upload_part(
         ));
     }
 
+    let enc_mode = EncryptionMode::parse(&upload.encryption_mode);
+    let sse_c_key = match enc_mode {
+        EncryptionMode::SseC => {
+            Some(validate_sse_c_upload_key(state, upload_id, &req.headers).await?)
+        }
+        EncryptionMode::None | EncryptionMode::SseS3 => None,
+    };
+
     let body = req
         .input
         .body
@@ -157,8 +289,6 @@ pub async fn upload_part(
 
     let (counter, count_handle) = ByteCounter::new();
     let stream = counter.wrap(body);
-
-    let enc_mode = EncryptionMode::parse(&upload.encryption_mode);
 
     let cid: String = match enc_mode {
         EncryptionMode::None => crate::kubo::add::stream_add(&state.kubo, stream, 1)
@@ -173,25 +303,22 @@ pub async fn upload_part(
                 .unwrap(wrapped)
                 .map_err(|e| s3s::s3_error!(InternalError, "key unwrap: {e}"))?;
             let pinned = Box::pin(stream);
-            let encrypted_stream = crate::crypto::chunker::encrypt_chunk_stream(
-                pinned,
-                Arc::new(ok),
-                upload.object_id.clone(),
-                part_number as u32,
-            );
+            let encrypted_stream =
+                crate::crypto::chunker::encrypt_chunk_stream(pinned, Arc::new(ok));
             crate::kubo::add::stream_add(&state.kubo, encrypted_stream, 1)
                 .await
                 .map_err(|e| s3s::s3_error!(InternalError, "kubo add: {e}"))?
         }
         EncryptionMode::SseC => {
-            let ok = extract_sse_c_key(&req.headers)?;
+            let ok = sse_c_key.ok_or_else(|| {
+                s3s::s3_error!(
+                    InternalError,
+                    "missing validated SSE-C key for multipart upload"
+                )
+            })?;
             let pinned = Box::pin(stream);
-            let encrypted_stream = crate::crypto::chunker::encrypt_chunk_stream(
-                pinned,
-                Arc::new(ok),
-                upload.object_id.clone(),
-                part_number as u32,
-            );
+            let encrypted_stream =
+                crate::crypto::chunker::encrypt_chunk_stream(pinned, Arc::new(ok));
             crate::kubo::add::stream_add(&state.kubo, encrypted_stream, 1)
                 .await
                 .map_err(|e| s3s::s3_error!(InternalError, "kubo add: {e}"))?
@@ -232,6 +359,7 @@ pub struct CompletedMultipartArchive {
     pub metadata: Option<serde_json::Value>,
     pub encrypted: bool,
     pub key_wrap: Option<String>,
+    pub sse_c_key_fingerprint: Option<String>,
     pub decompress_zip_target: Option<String>,
     pub decompress_zip_result: bool,
     pub server_side_encryption: Option<ServerSideEncryption>,
@@ -303,6 +431,7 @@ async fn finalize_completed_multipart_archive_with_store<
         metadata: completed.metadata.clone(),
         encrypted: completed.encrypted,
         key_wrap: completed.key_wrap.clone(),
+        sse_c_key_fingerprint: completed.sse_c_key_fingerprint.clone(),
         multipart: true,
         created_at: chrono::Utc::now(),
     };
@@ -417,6 +546,14 @@ pub async fn complete_multipart_upload_inner(
         ));
     }
 
+    let enc_mode = EncryptionMode::parse(&upload.encryption_mode);
+    let sse_c_key = match enc_mode {
+        EncryptionMode::SseC => {
+            Some(validate_sse_c_upload_key(state, upload_id, &req.headers).await?)
+        }
+        EncryptionMode::None | EncryptionMode::SseS3 => None,
+    };
+
     // Resolve each client-declared part to its stored record, verifying the
     // ETag matches. Collect the (cid, size) pairs needed to build the concat
     // stream.
@@ -434,6 +571,10 @@ pub async fn complete_multipart_upload_inner(
         }
 
         parts_to_concat.push((part.cid.clone(), part.size));
+    }
+
+    if enc_mode == EncryptionMode::SseC {
+        preflight_sse_c_part_sizes(&parts_to_concat)?;
     }
 
     // S3 requires every part except the last to be at least 5 MiB.
@@ -454,10 +595,13 @@ pub async fn complete_multipart_upload_inner(
 
     // Concatenate every part's bytes (in order) and re-add as a single object.
     // The concat stream must be `'static` for `stream_add`.
-    let total_size: i64 = parts_to_concat.iter().map(|(_, s)| s).sum();
+    let total_size = parts_to_concat.iter().try_fold(0_i64, |total, (_, size)| {
+        total
+            .checked_add(*size)
+            .ok_or_else(|| s3s::s3_error!(InvalidPart, "multipart object size overflow"))
+    })?;
     let part_cids: Vec<String> = parts_to_concat.iter().map(|(c, _)| c.clone()).collect();
 
-    let enc_mode = EncryptionMode::parse(&upload.encryption_mode);
     let kubo = state.kubo.clone();
 
     let root_cid = match enc_mode {
@@ -496,14 +640,18 @@ pub async fn complete_multipart_upload_inner(
                         .unwrap(wrapped)
                         .map_err(|e| s3s::s3_error!(InternalError, "key unwrap: {e}"))?
                 }
-                EncryptionMode::SseC => {
-                    // SSE-C: the customer key must be provided on Complete.
-                    // We need it to decrypt the parts.
-                    super::object::extract_sse_c_key(&req.headers)?
-                }
+                EncryptionMode::SseC => sse_c_key.ok_or_else(|| {
+                    s3s::s3_error!(
+                        InternalError,
+                        "missing validated SSE-C key for multipart complete"
+                    )
+                })?,
                 _ => unreachable!(),
             };
             let ok_arc = Arc::new(ok);
+            if enc_mode == EncryptionMode::SseC {
+                authenticate_sse_c_parts(&kubo, &parts_to_concat, ok_arc.clone()).await?;
+            }
             // Step 1: Build a plaintext concat stream by decrypting each part.
             // We use an out-of-band flag to capture decryption failures,
             // because the error gets buried inside reqwest's body stream and
@@ -547,12 +695,8 @@ pub async fn complete_multipart_upload_inner(
             };
 
             // Step 2: Re-encrypt the concatenated plaintext as a single object.
-            let encrypted_stream = crate::crypto::chunker::encrypt_chunk_stream(
-                Box::pin(plaintext_concat),
-                ok_arc,
-                encryption_object_id.clone(),
-                0, // single object, part_number = 0
-            );
+            let encrypted_stream =
+                crate::crypto::chunker::encrypt_chunk_stream(Box::pin(plaintext_concat), ok_arc);
 
             let root_result = crate::kubo::add::stream_add(&state.kubo, encrypted_stream, 1).await;
 
@@ -597,6 +741,7 @@ pub async fn complete_multipart_upload_inner(
         metadata: upload.metadata,
         encrypted,
         key_wrap,
+        sse_c_key_fingerprint: upload.sse_c_key_fingerprint,
         decompress_zip_target: upload.decompress_zip_target,
         decompress_zip_result: upload.decompress_zip_result,
         server_side_encryption,
@@ -880,6 +1025,7 @@ mod tests {
             "archive.zip",
             "none",
             None,
+            None,
             Some("application/zip"),
             None,
             None,
@@ -1006,6 +1152,7 @@ mod tests {
             None,
             false,
             None,
+            None,
             false,
         )
         .await
@@ -1025,6 +1172,7 @@ mod tests {
             metadata: Some(serde_json::json!({"source": "multipart"})),
             encrypted: false,
             key_wrap: None,
+            sse_c_key_fingerprint: None,
             decompress_zip_target: None,
             decompress_zip_result: true,
             server_side_encryption: None,
@@ -1045,6 +1193,7 @@ mod tests {
             metadata: archive.metadata.clone(),
             encrypted: archive.encrypted,
             key_wrap: archive.key_wrap.clone(),
+            sse_c_key_fingerprint: archive.sse_c_key_fingerprint.clone(),
             multipart: true,
             created_at: chrono::Utc::now(),
         }
@@ -1095,6 +1244,250 @@ mod tests {
             region: None,
             service: None,
             trailing_headers: None,
+        }
+    }
+
+    fn valid_sse_c_headers() -> http::HeaderMap {
+        use base64::Engine;
+
+        let key = [0x42; 32];
+        let key_b64 = base64::engine::general_purpose::STANDARD.encode(key);
+        let key_md5 = base64::engine::general_purpose::STANDARD.encode(md5::compute(key).as_ref());
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-amz-server-side-encryption-customer-algorithm",
+            http::HeaderValue::from_static("AES256"),
+        );
+        headers.insert(
+            "x-amz-server-side-encryption-customer-key",
+            key_b64.parse().unwrap(),
+        );
+        headers.insert(
+            "x-amz-server-side-encryption-customer-key-md5",
+            key_md5.parse().unwrap(),
+        );
+        headers
+    }
+
+    async fn authentication_kubo(bodies: HashMap<String, Vec<u8>>) -> MockServer {
+        let kubo = MockServer::start().await;
+        let bodies = Arc::new(bodies);
+        Mock::given(method("POST"))
+            .and(path("/api/v0/cat"))
+            .respond_with(move |request: &wiremock::Request| {
+                let cid = request
+                    .url
+                    .query_pairs()
+                    .find(|(name, _)| name == "arg")
+                    .map(|(_, value)| value.into_owned())
+                    .expect("cat CID");
+                match bodies.get(&cid) {
+                    Some(body) => ResponseTemplate::new(200).set_body_bytes(body.clone()),
+                    None => ResponseTemplate::new(404).set_body_string("unknown CID"),
+                }
+            })
+            .mount(&kubo)
+            .await;
+        kubo
+    }
+
+    fn fixed_encrypted_chunk(
+        key: &crate::crypto::ObjectKey,
+        nonce_byte: u8,
+        plaintext: &[u8],
+    ) -> Vec<u8> {
+        crate::crypto::aes_gcm::encrypt_chunk(key, &[nonce_byte; 12], plaintext)
+            .unwrap()
+            .to_vec()
+    }
+
+    #[tokio::test]
+    async fn authenticate_sse_c_parts_preflights_all_negative_sizes_before_cat() {
+        let kubo = authentication_kubo(HashMap::from([
+            ("valid".to_owned(), Vec::new()),
+            ("negative".to_owned(), Vec::new()),
+        ]))
+        .await;
+        let parts = vec![("valid".to_owned(), 0), ("negative".to_owned(), -1)];
+
+        let error = authenticate_sse_c_parts(
+            &crate::kubo::KuboClient::new(kubo.uri()),
+            &parts,
+            Arc::new(crate::crypto::ObjectKey { bytes: [7; 32] }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code().as_str(), "InvalidPart");
+        assert!(kubo.received_requests().await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn authenticate_sse_c_parts_checked_size_overflow_is_invalid_part() {
+        let error = checked_part_plaintext_size(i64::MAX, 1).unwrap_err();
+        assert_eq!(error.code().as_str(), "InvalidPart");
+    }
+
+    #[tokio::test]
+    async fn authenticate_sse_c_parts_enforces_exact_recorded_plaintext_size() {
+        let key = crate::crypto::ObjectKey { bytes: [7; 32] };
+        let full = vec![0x41; crate::crypto::chunker::CHUNK_SIZE];
+        let tail = b"tail";
+        let mut exact_multi = fixed_encrypted_chunk(&key, 1, &full);
+        exact_multi.extend_from_slice(&fixed_encrypted_chunk(&key, 2, tail));
+        let full_boundary = fixed_encrypted_chunk(&key, 3, &full);
+        let mut truncated = fixed_encrypted_chunk(&key, 4, b"truncated");
+        truncated.pop();
+        let mut invalid_tag = fixed_encrypted_chunk(&key, 5, b"tag");
+        *invalid_tag.last_mut().unwrap() ^= 0x80;
+        let kubo = authentication_kubo(HashMap::from([
+            ("empty".to_owned(), Vec::new()),
+            ("truncated".to_owned(), truncated),
+            ("boundary".to_owned(), full_boundary),
+            ("invalid-tag".to_owned(), invalid_tag),
+            ("exact".to_owned(), exact_multi),
+        ]))
+        .await;
+        let client = crate::kubo::KuboClient::new(kubo.uri());
+        let key = Arc::new(key);
+
+        authenticate_sse_c_parts(&client, &[("empty".to_owned(), 0)], key.clone())
+            .await
+            .unwrap();
+
+        for (cid, expected) in [
+            ("empty", 1_i64),
+            ("truncated", 9),
+            (
+                "boundary",
+                i64::try_from(crate::crypto::chunker::CHUNK_SIZE).unwrap() - 1,
+            ),
+            ("invalid-tag", 3),
+        ] {
+            let error =
+                authenticate_sse_c_parts(&client, &[(cid.to_owned(), expected)], key.clone())
+                    .await
+                    .unwrap_err();
+            assert_eq!(error.code().as_str(), "InvalidPart", "case {cid}");
+        }
+
+        authenticate_sse_c_parts(
+            &client,
+            &[(
+                "exact".to_owned(),
+                i64::try_from(crate::crypto::chunker::CHUNK_SIZE + tail.len()).unwrap(),
+            )],
+            key,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_sse_c_persists_exact_fingerprint() {
+        let state = test_state_with_bucket("test-bucket").await;
+        let mut req = multipart_create_request("test-bucket", "archive.zip");
+        req.headers = valid_sse_c_headers();
+        let expected_fingerprint = state
+            .master_key
+            .sse_c_key_fingerprint(&extract_sse_c_key(&req.headers).unwrap());
+
+        let response = create_multipart_upload(&state, req).await.unwrap();
+        let upload_id = response.output.upload_id.unwrap();
+        let upload = crate::store::entities::multipart_upload::Entity::find_by_id(upload_id)
+            .one(state.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(upload.encryption_mode, "sse_c");
+        assert!(upload.key_wrap.is_none());
+        assert_eq!(
+            upload.sse_c_key_fingerprint.as_deref(),
+            Some(expected_fingerprint.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn create_sse_c_rejects_invalid_or_partial_headers_before_insert() {
+        use base64::Engine;
+
+        let state = test_state_with_bucket("test-bucket").await;
+        let mut malformed_headers = Vec::new();
+
+        let mut wrong_md5 = valid_sse_c_headers();
+        wrong_md5.insert(
+            "x-amz-server-side-encryption-customer-key-md5",
+            base64::engine::general_purpose::STANDARD
+                .encode([0; 16])
+                .parse()
+                .unwrap(),
+        );
+        malformed_headers.push(wrong_md5);
+
+        for missing_header in [
+            "x-amz-server-side-encryption-customer-algorithm",
+            "x-amz-server-side-encryption-customer-key",
+            "x-amz-server-side-encryption-customer-key-md5",
+        ] {
+            let mut headers = valid_sse_c_headers();
+            headers.remove(missing_header);
+            malformed_headers.push(headers);
+        }
+
+        let mut mixed_headers = valid_sse_c_headers();
+        mixed_headers.insert(
+            "x-amz-server-side-encryption",
+            http::HeaderValue::from_static("AES256"),
+        );
+        malformed_headers.push(mixed_headers);
+
+        for headers in malformed_headers {
+            let mut req = multipart_create_request("test-bucket", "archive.zip");
+            req.headers = headers;
+            assert_eq!(
+                create_multipart_upload(&state, req)
+                    .await
+                    .unwrap_err()
+                    .code()
+                    .as_str(),
+                "InvalidArgument"
+            );
+            assert!(
+                crate::store::entities::multipart_upload::Entity::find()
+                    .all(state.store.db())
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn create_plain_and_sse_s3_store_no_sse_c_fingerprint() {
+        let state = test_state_with_bucket("test-bucket").await;
+
+        let plain =
+            create_multipart_upload(&state, multipart_create_request("test-bucket", "plain.zip"))
+                .await
+                .unwrap();
+        let mut sse_s3_req = multipart_create_request("test-bucket", "sse-s3.zip");
+        sse_s3_req.headers.insert(
+            "x-amz-server-side-encryption",
+            http::HeaderValue::from_static("AES256"),
+        );
+        let sse_s3 = create_multipart_upload(&state, sse_s3_req).await.unwrap();
+
+        for upload_id in [
+            plain.output.upload_id.unwrap(),
+            sse_s3.output.upload_id.unwrap(),
+        ] {
+            let upload = crate::store::entities::multipart_upload::Entity::find_by_id(upload_id)
+                .one(state.store.db())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(upload.sse_c_key_fingerprint.is_none());
         }
     }
 
@@ -1342,6 +1735,7 @@ mod tests {
             "archive.zip",
             "none",
             None,
+            None,
             Some("application/zip"),
             Some(serde_json::json!({"source": "multipart"})),
             Some("prefix/"),
@@ -1418,14 +1812,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn complete_inner_sse_uses_encryption_object_identity() {
+    async fn complete_inner_sse_reencrypts_with_an_embedded_random_nonce() {
         let object_key = crate::crypto::key::ObjectKey { bytes: [7; 32] };
         let master_key = crate::crypto::key::MasterKey::from_hex(
             "0000000000000000000000000000000000000000000000000000000000000000",
         )
         .unwrap();
         let wrapped_key = master_key.wrap(&object_key).unwrap();
-        let part_nonce = object_key.derive_nonce("encryption-object-1", 1, 0);
+        let part_nonce = [0x21; 12];
         let encrypted_part =
             crate::crypto::aes_gcm::encrypt_chunk(&object_key, &part_nonce, b"part data").unwrap();
         let kubo = MockServer::start().await;
@@ -1466,6 +1860,7 @@ mod tests {
             "archive.zip",
             "sse_s3",
             Some(&wrapped_key),
+            None,
             Some("application/zip"),
             None,
             None,
@@ -1494,29 +1889,17 @@ mod tests {
         assert_eq!(completed.encryption_object_id, "encryption-object-1");
         assert!(completed.encrypted);
         assert_eq!(completed.key_wrap.as_deref(), Some(wrapped_key.as_str()));
-        let root_nonce = object_key.derive_nonce("encryption-object-1", 0, 0);
-        let expected_root =
-            crate::crypto::aes_gcm::encrypt_chunk(&object_key, &root_nonce, b"part data").unwrap();
-        let attempt_nonce = object_key.derive_nonce(&completed.completion_attempt_id, 0, 0);
-        let wrong_attempt_root =
-            crate::crypto::aes_gcm::encrypt_chunk(&object_key, &attempt_nonce, b"part data")
-                .unwrap();
         let requests = kubo.received_requests().await.unwrap();
         let add_body = &requests
             .iter()
             .find(|request| request.url.path() == "/api/v0/add")
             .unwrap()
             .body;
-        assert!(
-            add_body
-                .windows(expected_root.len())
-                .any(|window| window == expected_root.as_ref())
-        );
-        assert!(
-            !add_body
-                .windows(wrong_attempt_root.len())
-                .any(|window| window == wrong_attempt_root.as_ref())
-        );
+        let frame_len = b"part data".len() + 12 + 16;
+        assert!(add_body.windows(frame_len).any(|window| {
+            crate::crypto::aes_gcm::decrypt_chunk(&object_key, window)
+                .is_ok_and(|plaintext| plaintext.as_ref() == b"part data")
+        }));
     }
 
     #[tokio::test]
@@ -1800,6 +2183,7 @@ mod tests {
             "QmOld",
             None,
             false,
+            None,
             None,
             false,
         )

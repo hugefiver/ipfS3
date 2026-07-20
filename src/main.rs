@@ -3,6 +3,7 @@ use axum::error_handling::HandleError;
 use axum::http::{Response, StatusCode};
 use axum::routing::get;
 use s3s::service::S3ServiceBuilder;
+use s3s::validation::AwsNameValidation;
 use s3s::{Body as S3Body, HttpError};
 
 mod auth;
@@ -47,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
 
     let s3_service = {
         let mut builder = S3ServiceBuilder::new(s3_impl);
+        builder.set_validation(AwsNameValidation::new());
         builder.set_auth(gateway_auth);
         builder.set_route(crate::s3::route::decompress_zip::DecompressZipRoute::new(
             state.clone(),

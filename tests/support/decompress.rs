@@ -12,6 +12,7 @@ use axum::middleware::{self, Next};
 use axum::response::Response as AxumResponse;
 use axum::{Router, extract};
 use s3s::service::S3ServiceBuilder;
+use s3s::validation::AwsNameValidation;
 use s3s::{Body as S3Body, HttpError};
 use sea_orm::Database;
 use wiremock::matchers::{method, path};
@@ -49,6 +50,24 @@ pub struct TestHarness {
     pub state: Arc<ipfs_s3_gateway::state::AppState>,
     pub kubo: wiremock::MockServer,
     pub observed_http: Arc<tokio::sync::Mutex<Vec<ObservedHttpRequest>>>,
+    add_file_bytes: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    cat_bodies: Arc<std::sync::RwLock<HashMap<String, Vec<u8>>>>,
+}
+
+impl TestHarness {
+    pub fn captured_add_file_bytes(&self) -> Vec<Vec<u8>> {
+        self.add_file_bytes
+            .lock()
+            .expect("add capture mutex")
+            .clone()
+    }
+
+    pub fn set_cat_body(&self, cid: &str, body: Vec<u8>) {
+        self.cat_bodies
+            .write()
+            .expect("cat body map")
+            .insert(cid.to_owned(), body);
+    }
 }
 
 #[derive(Clone)]
@@ -64,6 +83,8 @@ pub async fn start_harness(script: KuboScript) -> TestHarness {
         add_replies,
         cat_bodies,
     } = script;
+    let add_file_bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let cat_bodies = Arc::new(std::sync::RwLock::new(cat_bodies));
 
     if !add_replies.is_empty() {
         let reply_count = add_replies.len() as u64;
@@ -72,7 +93,12 @@ pub async fn start_harness(script: KuboScript) -> TestHarness {
             .and(path("/api/v0/add"))
             .respond_with({
                 let add_replies = add_replies.clone();
-                move |_: &wiremock::Request| {
+                let add_file_bytes = add_file_bytes.clone();
+                move |request: &wiremock::Request| {
+                    add_file_bytes
+                        .lock()
+                        .expect("add capture mutex")
+                        .push(kubo_add_file_bytes(request));
                     let reply = add_replies
                         .lock()
                         .expect("scripted add reply mutex")
@@ -92,18 +118,24 @@ pub async fn start_harness(script: KuboScript) -> TestHarness {
             .await;
     }
 
-    let cat_bodies = Arc::new(cat_bodies);
     Mock::given(method("POST"))
         .and(path("/api/v0/cat"))
-        .respond_with(move |request: &wiremock::Request| {
-            let arg = request
-                .url
-                .query_pairs()
-                .find(|(name, _)| name == "arg")
-                .map(|(_, value)| value.into_owned());
-            match arg.and_then(|arg| cat_bodies.get(&arg).cloned()) {
-                Some(body) => ResponseTemplate::new(200).set_body_bytes(body),
-                None => ResponseTemplate::new(404).set_body_string("unknown scripted CID"),
+        .respond_with({
+            let cat_bodies = cat_bodies.clone();
+            move |request: &wiremock::Request| {
+                let arg = request
+                    .url
+                    .query_pairs()
+                    .find(|(name, _)| name == "arg")
+                    .map(|(_, value)| value.into_owned());
+                match arg
+                    .and_then(|arg| cat_bodies.read().expect("cat body map").get(&arg).cloned())
+                {
+                    Some(body) => {
+                        ResponseTemplate::new(200).set_body_bytes(kubo_cat_body(request, body))
+                    }
+                    None => ResponseTemplate::new(404).set_body_string("unknown scripted CID"),
+                }
             }
         })
         .mount(&kubo)
@@ -136,6 +168,7 @@ pub async fn start_harness(script: KuboScript) -> TestHarness {
 
     let s3_impl = ipfs_s3_gateway::s3::handler::S3Impl::new(state.clone());
     let mut builder = S3ServiceBuilder::new(s3_impl);
+    builder.set_validation(AwsNameValidation::new());
     builder.set_auth(ipfs_s3_gateway::auth::GatewayAuth::new(state.clone()));
     builder.set_route(
         ipfs_s3_gateway::s3::route::decompress_zip::DecompressZipRoute::new(state.clone()),
@@ -167,7 +200,51 @@ pub async fn start_harness(script: KuboScript) -> TestHarness {
         state,
         kubo,
         observed_http,
+        add_file_bytes,
+        cat_bodies,
     }
+}
+
+fn kubo_add_file_bytes(request: &wiremock::Request) -> Vec<u8> {
+    let content_type = request
+        .headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .expect("Kubo add Content-Type");
+    let boundary = content_type
+        .split("boundary=")
+        .nth(1)
+        .map(|value| value.trim_matches('"'))
+        .expect("multipart boundary");
+    let header_end = request
+        .body
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("multipart file headers")
+        + 4;
+    let terminator = format!("\r\n--{boundary}").into_bytes();
+    let file_end = request.body[header_end..]
+        .windows(terminator.len())
+        .position(|window| window == terminator.as_slice())
+        .expect("multipart file terminator");
+    request.body[header_end..header_end + file_end].to_vec()
+}
+
+fn kubo_cat_body(request: &wiremock::Request, body: Vec<u8>) -> Vec<u8> {
+    let range = request
+        .url
+        .query_pairs()
+        .find(|(name, _)| name == "bytes")
+        .map(|(_, value)| value.into_owned());
+    let Some(range) = range else {
+        return body;
+    };
+    let (start, end) = range.split_once('-').expect("Kubo bytes=start-end");
+    let start: usize = start.parse().expect("Kubo byte start");
+    let end: usize = end.parse().expect("Kubo byte end");
+    assert!(start <= end, "Kubo byte range is ascending");
+    assert!(end < body.len(), "S3 range is checked before Kubo");
+    body[start..=end].to_vec()
 }
 
 pub async fn assert_pin_calls(
@@ -227,6 +304,15 @@ pub async fn create_multipart(
     key: &str,
     options: &[(&str, &str)],
 ) -> String {
+    create_multipart_with_headers(harness, key, options, http::HeaderMap::new()).await
+}
+
+pub async fn create_multipart_with_headers(
+    harness: &TestHarness,
+    key: &str,
+    options: &[(&str, &str)],
+    headers: http::HeaderMap,
+) -> String {
     let mut query = Vec::with_capacity(options.len() + 1);
     query.push(("uploads", ""));
     query.extend_from_slice(options);
@@ -237,7 +323,7 @@ pub async fn create_multipart(
         key,
         &query,
         Vec::new(),
-        http::HeaderMap::new(),
+        headers,
         "test",
     )
     .await;
@@ -254,18 +340,49 @@ pub async fn upload_part(
     part_number: i32,
     body: Vec<u8>,
 ) -> String {
+    upload_part_with_headers(
+        harness,
+        key,
+        upload_id,
+        part_number,
+        body,
+        http::HeaderMap::new(),
+    )
+    .await
+}
+
+pub async fn send_upload_part_with_headers(
+    harness: &TestHarness,
+    key: &str,
+    upload_id: &str,
+    part_number: i32,
+    body: Vec<u8>,
+    headers: http::HeaderMap,
+) -> reqwest::Response {
     let part_number = part_number.to_string();
-    let response = crate::support::sigv4::send_sigv4(
+    crate::support::sigv4::send_sigv4(
         reqwest::Method::PUT,
         &harness.endpoint,
         &harness.bucket,
         key,
         &[("partNumber", &part_number), ("uploadId", upload_id)],
         body,
-        http::HeaderMap::new(),
+        headers,
         "test",
     )
-    .await;
+    .await
+}
+
+pub async fn upload_part_with_headers(
+    harness: &TestHarness,
+    key: &str,
+    upload_id: &str,
+    part_number: i32,
+    body: Vec<u8>,
+    headers: http::HeaderMap,
+) -> String {
+    let response =
+        send_upload_part_with_headers(harness, key, upload_id, part_number, body, headers).await;
     assert_eq!(response.status(), StatusCode::OK, "UploadPart");
     response
         .headers()
@@ -283,6 +400,16 @@ pub async fn complete_multipart(
     upload_id: &str,
     parts: &[(i32, String)],
 ) -> reqwest::Response {
+    complete_multipart_with_headers(harness, key, upload_id, parts, http::HeaderMap::new()).await
+}
+
+pub async fn complete_multipart_with_headers(
+    harness: &TestHarness,
+    key: &str,
+    upload_id: &str,
+    parts: &[(i32, String)],
+    headers: http::HeaderMap,
+) -> reqwest::Response {
     let mut parts = parts.to_vec();
     parts.sort_by_key(|(number, _)| *number);
     let mut xml = String::from("<CompleteMultipartUpload>");
@@ -293,7 +420,17 @@ pub async fn complete_multipart(
         ));
     }
     xml.push_str("</CompleteMultipartUpload>");
-    complete_multipart_xml(harness, key, upload_id, xml).await
+    crate::support::sigv4::send_sigv4(
+        reqwest::Method::POST,
+        &harness.endpoint,
+        &harness.bucket,
+        key,
+        &[("uploadId", upload_id)],
+        xml.into_bytes(),
+        headers,
+        "test",
+    )
+    .await
 }
 
 pub async fn complete_multipart_xml(

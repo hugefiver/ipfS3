@@ -11,6 +11,7 @@ pub struct Model {
     pub created_at: DateTimeUtc,
     pub encryption_mode: String,
     pub key_wrap: Option<String>,
+    pub sse_c_key_fingerprint: Option<String>,
     pub content_type: Option<String>,
     pub metadata: Option<Json>,
     pub decompress_zip_target: Option<String>,

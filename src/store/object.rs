@@ -20,6 +20,7 @@ pub struct LatestObjectRow {
     pub metadata: Option<JsonValue>,
     pub encrypted: bool,
     pub key_wrap: Option<String>,
+    pub sse_c_key_fingerprint: Option<String>,
     pub multipart: bool,
     pub created_at: chrono::DateTime<Utc>,
 }
@@ -49,6 +50,7 @@ pub(crate) async fn write_latest_in_transaction<C: ConnectionTrait>(
         metadata: Set(row.metadata),
         encrypted: Set(row.encrypted),
         key_wrap: Set(row.key_wrap),
+        sse_c_key_fingerprint: Set(row.sse_c_key_fingerprint),
         multipart: Set(row.multipart),
         is_latest: Set(true),
         created_at: Set(row.created_at),
@@ -71,6 +73,7 @@ pub async fn upsert<C: ConnectionTrait + TransactionTrait>(
     metadata: Option<JsonValue>,
     encrypted: bool,
     key_wrap: Option<&str>,
+    sse_c_key_fingerprint: Option<&str>,
     multipart: bool,
 ) -> AppResult<()> {
     // Retry on unique-constraint violations caused by concurrent upserts on
@@ -88,6 +91,7 @@ pub async fn upsert<C: ConnectionTrait + TransactionTrait>(
         metadata,
         encrypted,
         key_wrap: key_wrap.map(str::to_owned),
+        sse_c_key_fingerprint: sse_c_key_fingerprint.map(str::to_owned),
         multipart,
         created_at: Utc::now(),
     };
@@ -117,6 +121,32 @@ pub async fn upsert<C: ConnectionTrait + TransactionTrait>(
         }
     }
     unreachable!("retry loop exhausted without returning")
+}
+
+/// Atomically records the first verified SSE-C key fingerprint for a legacy
+/// object, then reloads the immutable object row so concurrent claims observe
+/// one database winner.
+pub async fn claim_sse_c_key_fingerprint<C: ConnectionTrait>(
+    db: &C,
+    object_id: &str,
+    candidate: &str,
+) -> AppResult<object::Model> {
+    object::Entity::update_many()
+        .col_expr(
+            object::Column::SseCKeyFingerprint,
+            candidate.to_owned().into(),
+        )
+        .filter(object::Column::Id.eq(object_id))
+        .filter(object::Column::Encrypted.eq(true))
+        .filter(object::Column::KeyWrap.is_null())
+        .filter(object::Column::SseCKeyFingerprint.is_null())
+        .exec(db)
+        .await?;
+
+    object::Entity::find_by_id(object_id.to_owned())
+        .one(db)
+        .await?
+        .ok_or_else(|| AppError::NoSuchKey(object_id.to_owned()))
 }
 
 pub async fn get_latest<C: ConnectionTrait>(
@@ -222,7 +252,8 @@ mod tests {
             etag: cid.to_owned(),
             metadata: Some(serde_json::json!({"source": "multipart"})),
             encrypted: true,
-            key_wrap: Some("wrapped-key".to_owned()),
+            key_wrap: None,
+            sse_c_key_fingerprint: Some("v1:hmac-sha256:fixture".to_owned()),
             multipart: true,
             created_at: Utc::now(),
         }
@@ -258,6 +289,7 @@ mod tests {
         assert_eq!(latest.metadata, second.metadata);
         assert_eq!(latest.encrypted, second.encrypted);
         assert_eq!(latest.key_wrap, second.key_wrap);
+        assert_eq!(latest.sse_c_key_fingerprint, second.sse_c_key_fingerprint);
         assert_eq!(latest.multipart, second.multipart);
         assert_eq!(latest.created_at, second.created_at);
         assert!(latest.is_latest);
@@ -299,5 +331,89 @@ mod tests {
             delete_latest(&db, "test-bucket", "missing").await,
             Err(AppError::NoSuchKey(path)) if path == "test-bucket/missing"
         ));
+    }
+
+    #[tokio::test]
+    async fn concurrent_sse_c_object_fingerprint_claims_reload_one_winner() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("object-claim.sqlite");
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            database_path.display().to_string().replace('\\', "/")
+        );
+        let mut options = sea_orm::ConnectOptions::new(database_url);
+        options.max_connections(4).min_connections(2);
+        let db = Database::connect(options).await.unwrap();
+        crate::store::run_migrations(&db).await.unwrap();
+        crate::store::bucket::create(&db, "test-bucket", None)
+            .await
+            .unwrap();
+        upsert(
+            &db,
+            "legacy-object",
+            "test-bucket",
+            "legacy.bin",
+            "QmLegacy",
+            7,
+            None,
+            "QmLegacy",
+            None,
+            true,
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let (first, second) = tokio::join!(
+            claim_sse_c_key_fingerprint(&db, "legacy-object", "fp-a"),
+            claim_sse_c_key_fingerprint(&db, "legacy-object", "fp-b"),
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        let winner = object::Entity::find_by_id("legacy-object")
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(
+            winner.sse_c_key_fingerprint.as_deref(),
+            Some("fp-a" | "fp-b")
+        ));
+        assert_eq!(first.sse_c_key_fingerprint, winner.sse_c_key_fingerprint);
+        assert_eq!(second.sse_c_key_fingerprint, winner.sse_c_key_fingerprint);
+    }
+
+    #[tokio::test]
+    async fn object_fingerprint_claim_only_updates_legacy_sse_c_rows() {
+        let db = setup().await;
+        for (id, key, encrypted, key_wrap) in [
+            ("plain", "plain.bin", false, None),
+            ("sse-s3", "sse-s3.bin", true, Some("wrapped")),
+        ] {
+            upsert(
+                &db,
+                id,
+                "test-bucket",
+                key,
+                "QmValue",
+                1,
+                None,
+                "QmValue",
+                None,
+                encrypted,
+                key_wrap,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+            let row = claim_sse_c_key_fingerprint(&db, id, "must-not-stick")
+                .await
+                .unwrap();
+            assert!(row.sse_c_key_fingerprint.is_none(), "row {id}");
+        }
     }
 }

@@ -63,4 +63,17 @@ mod tests {
 
         assert!(result.is_err());
     }
+
+    #[test]
+    fn decrypt_chunk_accepts_fixed_legacy_hkdf_framed_ciphertext() {
+        let key = ObjectKey { bytes: [0; 32] };
+        let legacy = hex::decode(concat!(
+            "000000000000000000000000",
+            "cea7403d4d606b6e074ec5d3baf39d18",
+            "d0d1c8a799996bf0265b98b5d48ab919",
+        ))
+        .unwrap();
+
+        assert_eq!(decrypt_chunk(&key, &legacy).unwrap().as_ref(), [0; 16]);
+    }
 }

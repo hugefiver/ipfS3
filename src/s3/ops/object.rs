@@ -97,6 +97,7 @@ pub async fn publish_plain_object(
         metadata,
         false,
         None,
+        None,
         multipart,
     )
     .await
@@ -136,8 +137,30 @@ where
 
 /// Determine the requested server-side encryption mode from request headers.
 pub fn determine_encryption_mode(headers: &http::HeaderMap) -> S3Result<EncryptionMode> {
-    if let Some(val) = headers.get("x-amz-server-side-encryption-customer-algorithm") {
+    let sse_c_headers = [
+        "x-amz-server-side-encryption-customer-algorithm",
+        "x-amz-server-side-encryption-customer-key",
+        "x-amz-server-side-encryption-customer-key-md5",
+    ];
+    let sse_c_header_count = sse_c_headers
+        .iter()
+        .filter(|&&name| headers.contains_key(name))
+        .count();
+
+    if sse_c_header_count != 0 {
+        if sse_c_header_count != sse_c_headers.len()
+            || headers.contains_key("x-amz-server-side-encryption")
+        {
+            return Err(s3s::s3_error!(
+                InvalidArgument,
+                "SSE-C headers must be complete and cannot be combined with SSE-S3"
+            ));
+        }
+
         // SSE-C: customer provides key. Algorithm must be AES256.
+        let val = headers
+            .get("x-amz-server-side-encryption-customer-algorithm")
+            .expect("complete SSE-C headers include algorithm");
         if val != "AES256" {
             return Err(s3s::s3_error!(
                 InvalidArgument,
@@ -176,18 +199,79 @@ pub fn extract_custom_metadata(headers: &http::HeaderMap) -> Option<serde_json::
     }
 }
 
-/// Decode the SSE-C customer key from the `x-amz-server-side-encryption-customer-key`
-/// header (base64-encoded, 32 bytes) and validate it against the
-/// `x-amz-server-side-encryption-customer-key-MD5` header.
-///
-/// S3 requires the client to send the MD5 of the raw key so the server can
-/// detect transmission corruption. We use constant-time comparison to avoid
-/// timing side-channels.
-pub fn extract_sse_c_key(headers: &http::HeaderMap) -> S3Result<crate::crypto::ObjectKey> {
+/// Build the IPFS identity headers returned after a successful standard PutObject.
+pub fn put_object_ipfs_headers(cid: &str) -> S3Result<http::HeaderMap> {
+    let cid_header = http::HeaderValue::from_str(cid)
+        .map_err(|e| s3s::s3_error!(InternalError, "invalid IPFS CID header: {e}"))?;
+    let url_header = http::HeaderValue::from_str(&format!("ipfs://{cid}"))
+        .map_err(|e| s3s::s3_error!(InternalError, "invalid IPFS URL header: {e}"))?;
+
+    let mut headers = http::HeaderMap::new();
+    headers.insert("x-amz-meta-ipfs-cid", cid_header);
+    headers.insert("x-amz-meta-ipfs-url", url_header);
+    Ok(headers)
+}
+
+const NORMAL_SSE_C_HEADERS: [&str; 3] = [
+    "x-amz-server-side-encryption-customer-algorithm",
+    "x-amz-server-side-encryption-customer-key",
+    "x-amz-server-side-encryption-customer-key-md5",
+];
+const COPY_SOURCE_SSE_C_HEADERS: [&str; 3] = [
+    "x-amz-copy-source-server-side-encryption-customer-algorithm",
+    "x-amz-copy-source-server-side-encryption-customer-key",
+    "x-amz-copy-source-server-side-encryption-customer-key-md5",
+];
+
+struct ValidatedSseCHeaders {
+    key: crate::crypto::ObjectKey,
+    key_md5: String,
+}
+
+fn parse_sse_c_header_set(
+    headers: &http::HeaderMap,
+    names: [&str; 3],
+    forbidden_names: &[&str],
+    required: bool,
+) -> S3Result<Option<ValidatedSseCHeaders>> {
     use base64::Engine;
 
+    let present = names
+        .iter()
+        .filter(|name| headers.contains_key(**name))
+        .count();
+    let forbidden_present = forbidden_names
+        .iter()
+        .any(|name| headers.contains_key(*name));
+    if forbidden_present || (present != 0 && present != names.len()) {
+        return Err(s3s::s3_error!(
+            InvalidArgument,
+            "SSE-C headers must be complete and unmixed"
+        ));
+    }
+    if present == 0 {
+        return if required {
+            Err(s3s::s3_error!(
+                InvalidArgument,
+                "complete SSE-C headers are required"
+            ))
+        } else {
+            Ok(None)
+        };
+    }
+
+    let algorithm = headers[names[0]]
+        .to_str()
+        .map_err(|_| s3s::s3_error!(InvalidArgument, "invalid SSE-C algorithm header"))?;
+    if algorithm != "AES256" {
+        return Err(s3s::s3_error!(
+            InvalidArgument,
+            "unsupported SSE-C algorithm; must be AES256"
+        ));
+    }
+
     let key_b64 = headers
-        .get("x-amz-server-side-encryption-customer-key")
+        .get(names[1])
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| s3s::s3_error!(InvalidArgument, "missing SSE-C customer key"))?;
     let key_bytes = base64::engine::general_purpose::STANDARD
@@ -202,13 +286,19 @@ pub fn extract_sse_c_key(headers: &http::HeaderMap) -> S3Result<crate::crypto::O
 
     // Validate key-MD5 — AWS requires this header for all SSE-C operations.
     let md5_b64 = headers
-        .get("x-amz-server-side-encryption-customer-key-MD5")
+        .get(names[2])
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| s3s::s3_error!(InvalidArgument, "missing SSE-C customer key MD5"))?;
     {
         let client_md5 = base64::engine::general_purpose::STANDARD
             .decode(md5_b64)
             .map_err(|e| s3s::s3_error!(InvalidArgument, "invalid SSE-C key-MD5: {e}"))?;
+        if client_md5.len() != 16 {
+            return Err(s3s::s3_error!(
+                InvalidArgument,
+                "SSE-C key MD5 must be 16 bytes"
+            ));
+        }
         let computed = md5::compute(&key_bytes);
         if !bool::from(subtle::ConstantTimeEq::ct_eq(
             client_md5.as_slice(),
@@ -223,7 +313,32 @@ pub fn extract_sse_c_key(headers: &http::HeaderMap) -> S3Result<crate::crypto::O
 
     let mut ok_arr = [0u8; 32];
     ok_arr.copy_from_slice(&key_bytes);
-    Ok(crate::crypto::ObjectKey { bytes: ok_arr })
+    Ok(Some(ValidatedSseCHeaders {
+        key: crate::crypto::ObjectKey { bytes: ok_arr },
+        key_md5: md5_b64.to_owned(),
+    }))
+}
+
+fn extract_sse_c_headers(headers: &http::HeaderMap) -> S3Result<ValidatedSseCHeaders> {
+    parse_sse_c_header_set(
+        headers,
+        NORMAL_SSE_C_HEADERS,
+        &["x-amz-server-side-encryption"],
+        true,
+    )?
+    .ok_or_else(|| s3s::s3_error!(InvalidArgument, "complete SSE-C headers are required"))
+}
+
+pub fn extract_sse_c_key(headers: &http::HeaderMap) -> S3Result<crate::crypto::ObjectKey> {
+    Ok(extract_sse_c_headers(headers)?.key)
+}
+
+fn extract_copy_source_sse_c_headers(
+    headers: &http::HeaderMap,
+) -> S3Result<Option<ValidatedSseCHeaders>> {
+    let mut forbidden = NORMAL_SSE_C_HEADERS.to_vec();
+    forbidden.push("x-amz-server-side-encryption");
+    parse_sse_c_header_set(headers, COPY_SOURCE_SSE_C_HEADERS, &forbidden, false)
 }
 
 /// Convert stored JSON metadata back to a `Metadata` map for S3 responses.
@@ -250,6 +365,110 @@ fn resolve_range(range: Option<&Range>, total_size: u64) -> S3Result<(u64, u64)>
             Ok((checked.start, checked.end))
         }
     }
+}
+
+struct AuthenticatedSseCObject {
+    key: Arc<crate::crypto::ObjectKey>,
+    key_md5: String,
+    fingerprint: String,
+    legacy_plaintext: Option<Vec<u8>>,
+}
+
+fn verify_object_sse_c_fingerprint(
+    state: &Arc<AppState>,
+    fingerprint: &str,
+    key: &crate::crypto::ObjectKey,
+) -> S3Result<()> {
+    let matches = state
+        .master_key
+        .verify_sse_c_key_fingerprint(fingerprint, key)
+        .map_err(|error| {
+            s3s::s3_error!(
+                InternalError,
+                "invalid persisted SSE-C key fingerprint: {error}"
+            )
+        })?;
+    if !matches {
+        return Err(s3s::s3_error!(
+            AccessDenied,
+            "SSE-C customer key does not match object"
+        ));
+    }
+    Ok(())
+}
+
+async fn collect_legacy_sse_c_plaintext(
+    state: &Arc<AppState>,
+    obj: &crate::store::entities::object::Model,
+    key: Arc<crate::crypto::ObjectKey>,
+    collect_plaintext: bool,
+) -> S3Result<Option<Vec<u8>>> {
+    let cat = crate::kubo::cat::stream_cat(&state.kubo, &obj.cid, None)
+        .await
+        .map_err(|e| s3s::s3_error!(InternalError, "cat: {e}"))?;
+    let decrypted = crate::crypto::chunker::decrypt_chunk_stream(cat, key);
+    tokio::pin!(decrypted);
+    let mut observed = 0_i64;
+    let mut plaintext = collect_plaintext.then(Vec::new);
+    while let Some(chunk) = decrypted.next().await {
+        let chunk = chunk.map_err(|error| match error {
+            crate::error::AppError::Crypto(_) => {
+                s3s::s3_error!(AccessDenied, "SSE-C object authentication failed")
+            }
+            other => s3s::s3_error!(InternalError, "decrypt: {other}"),
+        })?;
+        let len = i64::try_from(chunk.len())
+            .map_err(|_| s3s::s3_error!(AccessDenied, "SSE-C object size mismatch"))?;
+        observed = observed
+            .checked_add(len)
+            .ok_or_else(|| s3s::s3_error!(AccessDenied, "SSE-C object size mismatch"))?;
+        if let Some(plaintext) = plaintext.as_mut() {
+            plaintext.extend_from_slice(&chunk);
+        }
+    }
+    if observed == 0 || observed != obj.size {
+        return Err(s3s::s3_error!(AccessDenied, "SSE-C object size mismatch"));
+    }
+    Ok(plaintext)
+}
+
+async fn authenticate_sse_c_object(
+    state: &Arc<AppState>,
+    obj: &crate::store::entities::object::Model,
+    headers: ValidatedSseCHeaders,
+    collect_legacy_plaintext: bool,
+) -> S3Result<AuthenticatedSseCObject> {
+    if let Some(fingerprint) = obj.sse_c_key_fingerprint.as_deref() {
+        verify_object_sse_c_fingerprint(state, fingerprint, &headers.key)?;
+        return Ok(AuthenticatedSseCObject {
+            key: Arc::new(headers.key),
+            key_md5: headers.key_md5,
+            fingerprint: fingerprint.to_owned(),
+            legacy_plaintext: None,
+        });
+    }
+
+    let key = Arc::new(headers.key);
+    let plaintext =
+        collect_legacy_sse_c_plaintext(state, obj, key.clone(), collect_legacy_plaintext).await?;
+    let candidate = state.master_key.sse_c_key_fingerprint(&key);
+    let claimed =
+        crate::store::object::claim_sse_c_key_fingerprint(state.store.db(), &obj.id, &candidate)
+            .await?;
+    let fingerprint = claimed.sse_c_key_fingerprint.ok_or_else(|| {
+        s3s::s3_error!(
+            InternalError,
+            "verified legacy SSE-C object fingerprint was not persisted"
+        )
+    })?;
+    verify_object_sse_c_fingerprint(state, &fingerprint, &key)?;
+
+    Ok(AuthenticatedSseCObject {
+        key,
+        key_md5: headers.key_md5,
+        fingerprint,
+        legacy_plaintext: plaintext,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -285,12 +504,17 @@ pub async fn put_object(
     let (counter, count_handle) = ByteCounter::new();
     let stream = counter.wrap(body);
 
-    let (cid, encrypted, key_wrap): (String, bool, Option<String>) = match enc_mode {
+    let (cid, encrypted, key_wrap, sse_c_key_fingerprint): (
+        String,
+        bool,
+        Option<String>,
+        Option<String>,
+    ) = match enc_mode {
         EncryptionMode::None => {
             let cid = crate::kubo::add::stream_add(&state.kubo, stream, 1)
                 .await
                 .map_err(|e| s3s::s3_error!(InternalError, "kubo add: {e}"))?;
-            (cid, false, None)
+            (cid, false, None, None)
         }
         EncryptionMode::SseS3 => {
             let ok = state.master_key.generate_object_key();
@@ -301,30 +525,23 @@ pub async fn put_object(
             // encrypt_chunk_stream requires an Unpin stream; Box::pin satisfies
             // that because Pin<Box<T>> is always Unpin.
             let pinned = Box::pin(stream);
-            let encrypted_stream = crate::crypto::chunker::encrypt_chunk_stream(
-                pinned,
-                Arc::new(ok),
-                object_id.clone(),
-                0, // single-object upload, part_number = 0
-            );
+            let encrypted_stream =
+                crate::crypto::chunker::encrypt_chunk_stream(pinned, Arc::new(ok));
             let cid = crate::kubo::add::stream_add(&state.kubo, encrypted_stream, 1)
                 .await
                 .map_err(|e| s3s::s3_error!(InternalError, "kubo add: {e}"))?;
-            (cid, true, Some(wrapped))
+            (cid, true, Some(wrapped), None)
         }
         EncryptionMode::SseC => {
-            let ok = extract_sse_c_key(&req.headers)?;
+            let validated = extract_sse_c_headers(&req.headers)?;
+            let fingerprint = state.master_key.sse_c_key_fingerprint(&validated.key);
             let pinned = Box::pin(stream);
-            let encrypted_stream = crate::crypto::chunker::encrypt_chunk_stream(
-                pinned,
-                Arc::new(ok),
-                object_id.clone(),
-                0, // single-object upload, part_number = 0
-            );
+            let encrypted_stream =
+                crate::crypto::chunker::encrypt_chunk_stream(pinned, Arc::new(validated.key));
             let cid = crate::kubo::add::stream_add(&state.kubo, encrypted_stream, 1)
                 .await
                 .map_err(|e| s3s::s3_error!(InternalError, "kubo add: {e}"))?;
-            (cid, true, None)
+            (cid, true, None, Some(fingerprint))
         }
     };
 
@@ -351,6 +568,7 @@ pub async fn put_object(
         metadata,
         encrypted,
         key_wrap.as_deref(),
+        sse_c_key_fingerprint.as_deref(),
         false,
     )
     .await
@@ -365,11 +583,15 @@ pub async fn put_object(
         None
     };
 
-    Ok(S3Response::new(PutObjectOutput {
-        e_tag: Some(ETag::Strong(cid.clone())),
-        server_side_encryption,
-        ..Default::default()
-    }))
+    let headers = put_object_ipfs_headers(&cid)?;
+    Ok(S3Response::with_headers(
+        PutObjectOutput {
+            e_tag: Some(ETag::Strong(cid.clone())),
+            server_side_encryption,
+            ..Default::default()
+        },
+        headers,
+    ))
 }
 
 pub async fn get_object(
@@ -382,9 +604,22 @@ pub async fn get_object(
 
     let obj = crate::store::object::get_latest(db, bucket, key).await?;
 
+    let has_range = req.input.range.is_some();
+    let is_sse_c = obj.encrypted && obj.key_wrap.is_none();
+    let mut sse_c_auth = if is_sse_c {
+        Some(
+            authenticate_sse_c_object(state, &obj, extract_sse_c_headers(&req.headers)?, has_range)
+                .await?,
+        )
+    } else {
+        None
+    };
+    let sse_customer_key_md5 = sse_c_auth.as_ref().map(|auth| auth.key_md5.clone());
+
     let range_ref = req.input.range.as_ref();
-    let (start, end) = resolve_range(range_ref, obj.size as u64)?;
-    let has_range = range_ref.is_some();
+    let total_size = u64::try_from(obj.size)
+        .map_err(|_| s3s::s3_error!(InternalError, "negative stored object size"))?;
+    let (start, end) = resolve_range(range_ref, total_size)?;
 
     // Build the response body stream.
     let body: StreamingBlob = if obj.encrypted {
@@ -396,8 +631,18 @@ pub async fn get_object(
                 .unwrap(wrapped)
                 .map_err(|e| s3s::s3_error!(InternalError, "key unwrap: {e}"))?
         } else {
-            // SSE-C: key provided by the caller.
-            extract_sse_c_key(&req.headers)?
+            return build_sse_c_get_response(
+                &obj,
+                sse_c_auth.take().ok_or_else(|| {
+                    s3s::s3_error!(InternalError, "missing authenticated SSE-C object key")
+                })?,
+                state,
+                start,
+                end,
+                has_range,
+                sse_customer_key_md5,
+            )
+            .await;
         };
 
         let ok_arc = Arc::new(ok);
@@ -508,6 +753,95 @@ pub async fn get_object(
     }))
 }
 
+async fn build_sse_c_get_response(
+    obj: &crate::store::entities::object::Model,
+    mut auth: AuthenticatedSseCObject,
+    state: &Arc<AppState>,
+    start: u64,
+    end: u64,
+    has_range: bool,
+    sse_customer_key_md5: Option<String>,
+) -> S3Result<S3Response<GetObjectOutput>> {
+    let body = if has_range {
+        let plaintext = if let Some(plaintext) = auth.legacy_plaintext.take() {
+            plaintext
+        } else {
+            let cat = crate::kubo::cat::stream_cat(&state.kubo, &obj.cid, None)
+                .await
+                .map_err(|e| s3s::s3_error!(InternalError, "cat: {e}"))?;
+            let decrypted = crate::crypto::chunker::decrypt_chunk_stream(cat, auth.key.clone());
+            let chunks: Vec<Bytes> =
+                decrypted.try_collect().await.map_err(|error| match error {
+                    crate::error::AppError::Crypto(_) => {
+                        s3s::s3_error!(AccessDenied, "SSE-C object authentication failed")
+                    }
+                    other => s3s::s3_error!(InternalError, "decrypt: {other}"),
+                })?;
+            let mut plaintext = Vec::with_capacity(chunks.iter().map(Bytes::len).sum());
+            for chunk in chunks {
+                plaintext.extend_from_slice(&chunk);
+            }
+            plaintext
+        };
+        let start = usize::try_from(start)
+            .map_err(|_| s3s::s3_error!(InvalidRange, "range start is too large"))?;
+        let end = usize::try_from(end)
+            .map_err(|_| s3s::s3_error!(InvalidRange, "range end is too large"))?;
+        if end > plaintext.len() || start > end {
+            return Err(s3s::s3_error!(
+                InvalidRange,
+                "requested range exceeds available decrypted data"
+            ));
+        }
+        StreamingBlob::wrap(futures_util::stream::iter(vec![
+            Ok::<Bytes, std::io::Error>(Bytes::copy_from_slice(&plaintext[start..end])),
+        ]))
+    } else {
+        // A legacy object's first request authenticated one complete cat above;
+        // use a second cat here so the successful no-range response stays streaming.
+        let kubo = state.kubo.clone();
+        let cid = obj.cid.clone();
+        let key = auth.key;
+        let stream = async_stream::stream! {
+            let cat = crate::kubo::cat::stream_cat(&kubo, &cid, None)
+                .await
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            let decrypted = crate::crypto::chunker::decrypt_chunk_stream(cat, key);
+            tokio::pin!(decrypted);
+            while let Some(chunk) = decrypted.next().await {
+                match chunk {
+                    Ok(bytes) => yield Ok(bytes),
+                    Err(crate::error::AppError::Crypto(_)) => {
+                        yield Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "SSE-C object authentication failed",
+                        ));
+                        return;
+                    }
+                    Err(error) => yield Err(std::io::Error::other(error.to_string())),
+                }
+            }
+        };
+        StreamingBlob::wrap(stream)
+    };
+
+    let content_length = end.saturating_sub(start) as i64;
+    let content_range =
+        has_range.then(|| format!("bytes {}-{}/{}", start, end.saturating_sub(1), obj.size));
+    Ok(S3Response::new(GetObjectOutput {
+        body: Some(body),
+        content_length: Some(content_length),
+        content_type: obj.content_type.clone(),
+        e_tag: Some(ETag::Strong(obj.etag.clone())),
+        last_modified: Some(Timestamp::from(SystemTime::from(obj.created_at))),
+        content_range,
+        sse_customer_algorithm: Some("AES256".to_owned()),
+        sse_customer_key_md5,
+        metadata: restore_metadata(&obj.metadata),
+        ..Default::default()
+    }))
+}
+
 pub async fn head_object(
     state: &Arc<AppState>,
     req: S3Request<HeadObjectInput>,
@@ -517,6 +851,18 @@ pub async fn head_object(
     let db = state.store.db();
 
     let obj = crate::store::object::get_latest(db, bucket, key).await?;
+    let sse_c_auth = if obj.encrypted && obj.key_wrap.is_none() {
+        Some(
+            authenticate_sse_c_object(state, &obj, extract_sse_c_headers(&req.headers)?, false)
+                .await?,
+        )
+    } else {
+        None
+    };
+    let total_size = u64::try_from(obj.size)
+        .map_err(|_| s3s::s3_error!(InternalError, "negative stored object size"))?;
+    let (start, end) = resolve_range(req.input.range.as_ref(), total_size)?;
+    let selected_length = end.saturating_sub(start) as i64;
 
     let server_side_encryption = if obj.encrypted && obj.key_wrap.is_some() {
         Some(ServerSideEncryption::from_static("AES256"))
@@ -525,11 +871,13 @@ pub async fn head_object(
     };
 
     Ok(S3Response::new(HeadObjectOutput {
-        content_length: Some(obj.size),
+        content_length: Some(selected_length),
         content_type: obj.content_type.clone(),
         e_tag: Some(ETag::Strong(obj.etag.clone())),
         last_modified: Some(Timestamp::from(SystemTime::from(obj.created_at))),
         server_side_encryption,
+        sse_customer_algorithm: sse_c_auth.as_ref().map(|_| "AES256".to_owned()),
+        sse_customer_key_md5: sse_c_auth.map(|auth| auth.key_md5),
         metadata: restore_metadata(&obj.metadata),
         ..Default::default()
     }))
@@ -611,6 +959,28 @@ pub async fn copy_object(
     };
 
     let src_obj = crate::store::object::get_latest(db, &src_bucket, &src_key).await?;
+    let source_sse_c_headers = extract_copy_source_sse_c_headers(&req.headers)?;
+    let verified_source_fingerprint = if src_obj.encrypted && src_obj.key_wrap.is_none() {
+        let headers = source_sse_c_headers.ok_or_else(|| {
+            s3s::s3_error!(
+                InvalidArgument,
+                "complete copy-source SSE-C headers are required"
+            )
+        })?;
+        Some(
+            authenticate_sse_c_object(state, &src_obj, headers, false)
+                .await?
+                .fingerprint,
+        )
+    } else {
+        if source_sse_c_headers.is_some() {
+            return Err(s3s::s3_error!(
+                InvalidArgument,
+                "copy-source SSE-C headers were provided for a non-SSE-C object"
+            ));
+        }
+        None
+    };
 
     // Validate destination bucket exists.
     let dst_exists = crate::store::bucket::exists(db, dst_bucket).await?;
@@ -641,6 +1011,7 @@ pub async fn copy_object(
         src_obj.metadata.clone(),
         src_obj.encrypted,
         src_obj.key_wrap.as_deref(),
+        verified_source_fingerprint.as_deref(),
         src_obj.multipart,
     )
     .await?;
@@ -1045,6 +1416,165 @@ mod tests {
         })
     }
 
+    fn valid_sse_c_headers() -> http::HeaderMap {
+        use base64::Engine;
+
+        let key = [0x42; 32];
+        let key_b64 = base64::engine::general_purpose::STANDARD.encode(key);
+        let key_md5 = base64::engine::general_purpose::STANDARD.encode(md5::compute(key).as_ref());
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-amz-server-side-encryption-customer-algorithm",
+            http::HeaderValue::from_static("AES256"),
+        );
+        headers.insert(
+            "x-amz-server-side-encryption-customer-key",
+            key_b64.parse().unwrap(),
+        );
+        headers.insert(
+            "x-amz-server-side-encryption-customer-key-md5",
+            key_md5.parse().unwrap(),
+        );
+        headers
+    }
+
+    fn assert_invalid_argument<T>(result: S3Result<T>) {
+        assert_eq!(
+            result
+                .err()
+                .expect("expected InvalidArgument")
+                .code()
+                .as_str(),
+            "InvalidArgument"
+        );
+    }
+
+    #[test]
+    fn determine_encryption_mode_requires_complete_unmixed_sse_c_headers() {
+        let complete_headers = valid_sse_c_headers();
+        assert_eq!(
+            determine_encryption_mode(&complete_headers).unwrap(),
+            EncryptionMode::SseC
+        );
+
+        for missing_header in [
+            "x-amz-server-side-encryption-customer-algorithm",
+            "x-amz-server-side-encryption-customer-key",
+            "x-amz-server-side-encryption-customer-key-md5",
+        ] {
+            let mut headers = complete_headers.clone();
+            headers.remove(missing_header);
+            assert_invalid_argument(determine_encryption_mode(&headers));
+        }
+
+        let mut mixed_headers = complete_headers.clone();
+        mixed_headers.insert(
+            "x-amz-server-side-encryption",
+            http::HeaderValue::from_static("AES256"),
+        );
+        assert_invalid_argument(determine_encryption_mode(&mixed_headers));
+
+        let mut unsupported_algorithm = complete_headers;
+        unsupported_algorithm.insert(
+            "x-amz-server-side-encryption-customer-algorithm",
+            http::HeaderValue::from_static("AES128"),
+        );
+        assert_invalid_argument(determine_encryption_mode(&unsupported_algorithm));
+    }
+
+    #[test]
+    fn extract_sse_c_key_rejects_malformed_values() {
+        use base64::Engine;
+
+        let mut missing_algorithm = valid_sse_c_headers();
+        missing_algorithm.remove("x-amz-server-side-encryption-customer-algorithm");
+
+        let mut unsupported_algorithm = valid_sse_c_headers();
+        unsupported_algorithm.insert(
+            "x-amz-server-side-encryption-customer-algorithm",
+            http::HeaderValue::from_static("AES128"),
+        );
+
+        let mut mixed_with_sse_s3 = valid_sse_c_headers();
+        mixed_with_sse_s3.insert(
+            "x-amz-server-side-encryption",
+            http::HeaderValue::from_static("AES256"),
+        );
+
+        let mut invalid_key_base64 = valid_sse_c_headers();
+        invalid_key_base64.insert(
+            "x-amz-server-side-encryption-customer-key",
+            http::HeaderValue::from_static("not base64"),
+        );
+
+        let mut short_key = valid_sse_c_headers();
+        short_key.insert(
+            "x-amz-server-side-encryption-customer-key",
+            base64::engine::general_purpose::STANDARD
+                .encode([0x42; 31])
+                .parse()
+                .unwrap(),
+        );
+
+        let mut invalid_md5_base64 = valid_sse_c_headers();
+        invalid_md5_base64.insert(
+            "x-amz-server-side-encryption-customer-key-md5",
+            http::HeaderValue::from_static("not base64"),
+        );
+
+        let mut short_md5 = valid_sse_c_headers();
+        short_md5.insert(
+            "x-amz-server-side-encryption-customer-key-md5",
+            base64::engine::general_purpose::STANDARD
+                .encode([0; 15])
+                .parse()
+                .unwrap(),
+        );
+
+        let mut incorrect_md5 = valid_sse_c_headers();
+        incorrect_md5.insert(
+            "x-amz-server-side-encryption-customer-key-md5",
+            base64::engine::general_purpose::STANDARD
+                .encode([0; 16])
+                .parse()
+                .unwrap(),
+        );
+
+        for headers in [
+            missing_algorithm,
+            unsupported_algorithm,
+            mixed_with_sse_s3,
+            invalid_key_base64,
+            short_key,
+            invalid_md5_base64,
+            short_md5,
+            incorrect_md5,
+        ] {
+            assert_invalid_argument(extract_sse_c_key(&headers));
+        }
+    }
+
+    #[test]
+    fn put_object_ipfs_headers_include_cid_and_reject_invalid_values() {
+        let headers = put_object_ipfs_headers("QmValidCid").expect("valid CID headers");
+        assert_eq!(
+            headers["x-amz-meta-ipfs-cid"]
+                .to_str()
+                .expect("CID header text"),
+            "QmValidCid"
+        );
+        assert_eq!(
+            headers["x-amz-meta-ipfs-url"]
+                .to_str()
+                .expect("IPFS URL header text"),
+            "ipfs://QmValidCid"
+        );
+
+        let error =
+            put_object_ipfs_headers("QmInvalid\nCid").expect_err("invalid CID header must fail");
+        assert_eq!(error.code().as_str(), "InternalError");
+    }
+
     fn object_model(key: &str) -> object::Model {
         object::Model {
             id: "id".to_string(),
@@ -1057,6 +1587,7 @@ mod tests {
             metadata: None,
             encrypted: false,
             key_wrap: None,
+            sse_c_key_fingerprint: None,
             multipart: false,
             is_latest: true,
             created_at: Utc::now(),
@@ -1086,6 +1617,7 @@ mod tests {
                 &etag,
                 None,
                 false,
+                None,
                 None,
                 false,
             )

@@ -35,23 +35,22 @@ where
 pub fn encrypt_chunk_stream<S, E>(
     stream: S,
     ok: std::sync::Arc<super::key::ObjectKey>,
-    object_id: String,
-    part_number: u32,
 ) -> impl Stream<Item = Result<Bytes, AppError>>
 where
     S: Stream<Item = Result<Bytes, E>> + Unpin,
     E: Into<Box<dyn std::error::Error + Send + Sync>> + Send + 'static,
 {
     use super::aes_gcm::encrypt_chunk;
-    let mut chunk_index: u64 = 0;
+    use rand::Rng;
+
     async_stream::stream! {
         let mut chunked = Box::pin(chunk_stream::<_, E>(stream));
         while let Some(chunk) = chunked.next().await {
             match chunk {
                 Ok(bytes) => {
-                    let nonce = ok.derive_nonce(&object_id, part_number, chunk_index);
+                    let mut nonce = [0u8; 12];
+                    rand::rng().fill_bytes(&mut nonce);
                     let encrypted = encrypt_chunk(&ok, &nonce, &bytes)?;
-                    chunk_index += 1;
                     yield Ok(encrypted);
                 }
                 Err(e) => {
@@ -104,5 +103,60 @@ where
                 Err(e) => yield Err(e),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    use bytes::Bytes;
+    use futures_util::TryStreamExt;
+
+    use super::*;
+    use crate::crypto::ObjectKey;
+
+    #[tokio::test]
+    async fn encrypt_chunk_stream_uses_distinct_random_nonces_for_equal_inputs() {
+        let key = Arc::new(ObjectKey { bytes: [7; 32] });
+        let input = || {
+            Box::pin(futures_util::stream::iter(vec![Ok::<_, std::io::Error>(
+                Bytes::from_static(b"same part"),
+            )]))
+        };
+
+        let one = encrypt_chunk_stream(input(), key.clone())
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let two = encrypt_chunk_stream(input(), key)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_ne!(&one[0][..12], &two[0][..12]);
+        assert_ne!(one, two);
+    }
+
+    #[tokio::test]
+    async fn encrypt_chunk_stream_assigns_a_unique_nonce_to_each_chunk() {
+        let input = Bytes::from(vec![0x55; CHUNK_SIZE * 3 + 1]);
+        let encrypted = encrypt_chunk_stream(
+            Box::pin(futures_util::stream::iter(vec![Ok::<_, std::io::Error>(
+                input,
+            )])),
+            Arc::new(ObjectKey { bytes: [9; 32] }),
+        )
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+        let nonces: HashSet<[u8; 12]> = encrypted
+            .iter()
+            .map(|chunk| chunk[..12].try_into().unwrap())
+            .collect();
+
+        assert_eq!(encrypted.len(), 4);
+        assert_eq!(nonces.len(), encrypted.len());
     }
 }

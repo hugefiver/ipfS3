@@ -932,6 +932,7 @@ mod tests {
             "archive.zip",
             "none",
             None,
+            None,
             Some("application/zip"),
             None,
             target,
@@ -988,7 +989,7 @@ mod tests {
         .unwrap();
         let object_key = crate::crypto::key::ObjectKey { bytes: [42; 32] };
         let wrapped_key = master_key.wrap(&object_key).unwrap();
-        let nonce = object_key.derive_nonce("encryption-object-1", 1, 0);
+        let nonce = [0x31; 12];
         let encrypted_part =
             crate::crypto::aes_gcm::encrypt_chunk(&object_key, &nonce, b"plain part").unwrap();
         Mock::given(method("POST"))
@@ -1016,6 +1017,7 @@ mod tests {
             "archive.zip",
             "sse_s3",
             Some(&wrapped_key),
+            None,
             Some("application/zip"),
             None,
             None,

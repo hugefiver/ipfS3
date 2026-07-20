@@ -58,6 +58,19 @@ aws --endpoint-url http://localhost:9000 s3api head-object --bucket my-bucket --
 curl https://ipfs.io/ipfs/bafybei...
 ```
 
+### PutObject IPFS response headers
+
+After a standard `PutObject` successfully completes Kubo `add`, `pin`, and
+database publication, its response includes:
+
+- `ETag: "<CID>"`
+- `x-amz-meta-ipfs-cid: <CID>`
+- `x-amz-meta-ipfs-url: ipfs://<CID>`
+
+The `ipfs://` value is an IPFS URI, not a public HTTP gateway URL. These
+headers are returned for plain, SSE-S3, and SSE-C uploads. For encrypted
+objects, the CID identifies the ciphertext stored in IPFS, not the plaintext.
+
 ## Configuration
 
 Configuration is loaded from `config.toml` (or path specified by `IPFS_S3_CONFIG`), then overridden by environment variables.
@@ -70,9 +83,15 @@ Configuration is loaded from `config.toml` (or path specified by `IPFS_S3_CONFIG
 | `IPFS_S3_DATABASE_URL`      | Database URL                                | `sqlite::memory:`       |
 | `IPFS_S3_ACCESS_KEY_ID`     | S3 access key                               | `test`                  |
 | `IPFS_S3_SECRET_ACCESS_KEY` | S3 secret key                               | `test`                  |
-| `IPFS_S3_MASTER_KEY`        | Hex-encoded 32-byte master key (for SSE-S3) | `00...00` (dev only)    |
+| `IPFS_S3_MASTER_KEY`        | Hex-encoded 32-byte master key (for SSE-S3 and SSE-C fingerprints) | `00...00` (dev only)    |
 
 See [`config.example.toml`](config.example.toml) for the full schema.
+
+`IPFS_S3_MASTER_KEY` must remain unchanged for the full lifetime of every SSE-C
+object and multipart upload. The gateway uses it to verify the persisted
+SSE-C key fingerprint during PutObject, UploadPart, CompleteMultipartUpload,
+GetObject, HeadObject, and CopyObject. v0.3 has no master-key rotation
+procedure. Changing this value can make an existing SSE-C object inaccessible.
 
 ## Architecture
 

@@ -1,6 +1,6 @@
 # Roadmap
 
-## Current: v0.1 — MVP
+## v0.1 — MVP
 
 - [x] S3 CRUD: PutObject, GetObject, HeadObject, DeleteObject, CopyObject, ListObjectsV2
 - [x] Bucket operations: CreateBucket, DeleteBucket, HeadBucket, ListBuckets
@@ -30,14 +30,14 @@ Docker against the local docker-compose stack.
 - [x] Verify HeadObject signatures for nested keys through direct docker networking and localhost (MinIO `mc` same-client dual endpoint `stat` PASSED with `client=Mc verifier=Mc` EVIDENCE; see `docs/client-smoke-evidence-2026-07-19.log`)
 - [x] Track client compatibility matrix in docs
 
-## v0.3 — Hardening
+## Current: v0.3 — Hardening
 
-- [ ] Presigned URL (GET/PUT)
-- [ ] Bucket name validation
-- [ ] HeadObject Range support
-- [ ] SSE-C key consistency validation for multipart
-- [ ] Integration tests for encryption, multipart, SSE-C, Range
-- [ ] PutObject response custom headers (x-amz-meta-ipfs-cid, x-amz-meta-ipfs-url)
+- [x] Presigned URL (GET/PUT)
+- [x] Bucket name validation
+- [x] HeadObject Range support
+- [x] SSE-C key consistency validation for multipart
+- [x] Integration tests for encryption, multipart, SSE-C, Range
+- [x] PutObject response custom headers (x-amz-meta-ipfs-cid, x-amz-meta-ipfs-url)
 
 ## v0.4 — Pinning Service
 

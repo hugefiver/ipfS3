@@ -15,6 +15,7 @@ pub struct Model {
     pub metadata: Option<Json>,
     pub encrypted: bool,
     pub key_wrap: Option<String>,
+    pub sse_c_key_fingerprint: Option<String>,
     pub multipart: bool,
     pub is_latest: bool,
     pub created_at: DateTimeUtc,
