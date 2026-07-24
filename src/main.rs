@@ -2,25 +2,14 @@ use axum::Router;
 use axum::error_handling::HandleError;
 use axum::http::{Response, StatusCode};
 use axum::routing::get;
+use ipfs_s3_gateway::auth::GatewayAuth;
+use ipfs_s3_gateway::config::Config;
+use ipfs_s3_gateway::s3;
+use ipfs_s3_gateway::s3::handler::S3Impl;
+use ipfs_s3_gateway::state::AppState;
 use s3s::service::S3ServiceBuilder;
 use s3s::validation::AwsNameValidation;
 use s3s::{Body as S3Body, HttpError};
-
-mod auth;
-mod config;
-mod crypto;
-mod error;
-mod kubo;
-mod pinning;
-mod s3;
-mod state;
-mod store;
-mod zip;
-
-use auth::GatewayAuth;
-use config::Config;
-use s3::handler::S3Impl;
-use state::AppState;
 
 async fn health_check() -> &'static str {
     "OK"
@@ -50,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
         let mut builder = S3ServiceBuilder::new(s3_impl);
         builder.set_validation(AwsNameValidation::new());
         builder.set_auth(gateway_auth);
-        builder.set_route(crate::s3::route::decompress_zip::DecompressZipRoute::new(
+        builder.set_route(s3::route::decompress_zip::DecompressZipRoute::new(
             state.clone(),
         ));
         builder.build()
@@ -62,12 +51,26 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(health_check))
         .fallback_service(s3_service)
         .layer(axum::middleware::from_fn(
-            crate::s3::http::bridge_chunked_content_length,
+            s3::http::bridge_chunked_content_length,
         ));
 
     let listener = tokio::net::TcpListener::bind(cfg.server.bind).await?;
     tracing::info!("listening on {}", cfg.server.bind);
-    axum::serve(listener, app).await?;
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let worker = state
+        .pinning
+        .start(state.store.clone(), shutdown.child_token());
+    let signal_token = shutdown.clone();
+    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::error!(%error, "failed to install shutdown signal");
+        }
+        signal_token.cancel();
+    });
+    let server_result = server.await;
+    shutdown.cancel();
+    worker.shutdown(std::time::Duration::from_secs(30)).await;
+    server_result?;
 
     Ok(())
 }

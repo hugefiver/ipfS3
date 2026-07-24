@@ -84,14 +84,66 @@ fn default_master_key() -> String {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-#[allow(dead_code)]
 pub struct PinningConfig {
-    #[serde(default = "default_pinning_provider")]
-    pub provider: String,
+    #[serde(default = "default_worker_interval")]
+    pub worker_interval: String,
+    #[serde(default = "default_worker_concurrency")]
+    pub worker_concurrency: usize,
+    #[serde(default)]
+    pub providers: Vec<ProviderConfig>,
+    #[serde(default)]
+    pub policies: Vec<PolicyConfig>,
 }
 
-fn default_pinning_provider() -> String {
-    "noop".to_string()
+#[derive(Debug, Deserialize, Clone)]
+pub struct ProviderConfig {
+    pub name: String,
+    pub kind: String,
+    pub token_env: Option<String>,
+    pub endpoint: Option<String>,
+    #[serde(default = "enabled")]
+    pub enabled: bool,
+    pub priority: u32,
+    pub max_bytes: u64,
+    pub max_pins: u64,
+    pub requests_per_second: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct PolicyConfig {
+    pub bucket: String,
+    #[serde(default)]
+    pub prefix: String,
+    pub trigger: String,
+    pub provider_mode: String,
+    pub providers: Vec<String>,
+    pub default_duration: String,
+    pub max_duration: String,
+    #[serde(default)]
+    pub allow_decompressed: bool,
+}
+
+fn default_worker_interval() -> String {
+    "5s".to_owned()
+}
+
+fn default_worker_concurrency() -> usize {
+    4
+}
+
+fn enabled() -> bool {
+    true
+}
+
+impl Default for PinningConfig {
+    fn default() -> Self {
+        Self {
+            worker_interval: default_worker_interval(),
+            worker_concurrency: default_worker_concurrency(),
+            providers: Vec::new(),
+            policies: Vec::new(),
+        }
+    }
 }
 
 // ---- Default constructors for the Config-level #[serde(default)] ----
@@ -127,9 +179,7 @@ fn default_crypto_config() -> CryptoConfig {
 }
 
 fn default_pinning_config() -> PinningConfig {
-    PinningConfig {
-        provider: default_pinning_provider(),
-    }
+    PinningConfig::default()
 }
 
 // ----------------------------------------------------------------
@@ -144,6 +194,11 @@ impl Config {
             crypto: default_crypto_config(),
             pinning: default_pinning_config(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn default_for_test() -> Self {
+        Self::build_default()
     }
 
     /// Load configuration, with the following precedence (highest last):
@@ -242,6 +297,16 @@ mod tests {
             .apply_env_overrides(|name| (name == "IPFS_S3_MASTER_KEY").then(|| ENV_KEY.to_owned()))
             .unwrap();
         assert_eq!(config.crypto.master_key, ENV_KEY);
+    }
+
+    #[test]
+    fn default_pinning_configuration_is_empty() {
+        let config = Config::build_default();
+
+        assert_eq!(config.pinning.worker_interval, "5s");
+        assert_eq!(config.pinning.worker_concurrency, 4);
+        assert!(config.pinning.providers.is_empty());
+        assert!(config.pinning.policies.is_empty());
     }
 
     #[tokio::test]

@@ -18,4 +18,36 @@ secret_key = "test"
 master_key = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90"
 
 [pinning]
-provider = "noop"
+worker_interval = "5s"
+worker_concurrency = 4
+
+# Provider tokens are read from the named environment variables. Never put a
+# token in this file. Built-in public endpoints are used by default; endpoint
+# overrides are only for tests or private PSA-compatible services.
+[[pinning.providers]]
+name = "pinata-primary"
+kind = "pinata"
+token_env = "PINATA_JWT"
+priority = 10
+max_bytes = 107374182400
+max_pins = 10000
+
+[[pinning.providers]]
+name = "filebase-primary"
+kind = "filebase"
+token_env = "FILEBASE_PINNING_TOKEN"
+priority = 20
+max_bytes = 107374182400
+max_pins = 10000
+
+# Policies are evaluated in file order. The first exact-bucket (or "*") and
+# literal-prefix match wins.
+[[pinning.policies]]
+bucket = "*"
+prefix = ""
+trigger = "always"
+provider_mode = "all"
+providers = ["pinata-primary", "filebase-primary"]
+default_duration = "30d"
+max_duration = "365d"
+allow_decompressed = true

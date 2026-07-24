@@ -17,4 +17,9 @@ secret_key = "test"
 master_key = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90"
 
 [pinning]
-provider = "noop"
+worker_interval = "5s"
+worker_concurrency = 4
+# Safe default: remote pinning is disabled until providers and policies are
+# explicitly configured. Provider tokens must be environment-variable refs.
+providers = []
+policies = []

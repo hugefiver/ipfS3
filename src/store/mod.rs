@@ -3,9 +3,11 @@ pub mod entities;
 pub mod migrations;
 pub mod multipart;
 pub mod object;
+pub mod pinning;
 
 use sea_orm::DatabaseConnection;
 
+#[derive(Clone)]
 pub struct Store {
     db: DatabaseConnection,
 }
@@ -27,6 +29,7 @@ pub async fn run_migrations(db: &DatabaseConnection) -> Result<(), sea_orm::DbEr
         use crate::store::migrations::m20250701_000001_init::Migration as InitMigration;
         use crate::store::migrations::m20260707_000001_decompress_zip::Migration as DecompressZipMigration;
         use crate::store::migrations::m20260720_000001_sse_c_key_fingerprint::Migration as SseCKeyFingerprintMigration;
+        use crate::store::migrations::m20260721_000001_multi_provider_pinning::Migration as MultiProviderPinningMigration;
         use sea_orm_migration::prelude::*;
 
         pub struct Migrator;
@@ -36,6 +39,7 @@ pub async fn run_migrations(db: &DatabaseConnection) -> Result<(), sea_orm::DbEr
                     Box::new(InitMigration),
                     Box::new(DecompressZipMigration),
                     Box::new(SseCKeyFingerprintMigration),
+                    Box::new(MultiProviderPinningMigration),
                 ]
             }
         }
@@ -53,18 +57,40 @@ mod tests {
     async fn test_migration_runs() {
         let db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
         run_migrations(&db).await.unwrap();
-        let result: i64 = db
+        let rows = db
             .query_one(sea_orm::Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Sqlite,
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
+                "SELECT GROUP_CONCAT(name, ',') FROM (\
+                 SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (\
+                     'buckets', 'objects', 'multipart_uploads', 'multipart_parts', \
+                     'object_tags', 'pin_leases', 'pin_lease_targets', 'remote_pins', \
+                     'pin_jobs', 'pin_provider_usage'\
+                 ) ORDER BY name)",
                 [],
             ))
             .await
             .unwrap()
-            .unwrap()
-            .try_get_by(0)
             .unwrap();
-        assert!(result >= 4, "expected at least 4 tables, got {result}");
+        let names: String = rows.try_get_by(0).unwrap();
+        let table_names: std::collections::BTreeSet<_> = names.split(',').collect();
+        let expected: std::collections::BTreeSet<_> = [
+            "buckets",
+            "objects",
+            "multipart_uploads",
+            "multipart_parts",
+            "object_tags",
+            "pin_leases",
+            "pin_lease_targets",
+            "remote_pins",
+            "pin_jobs",
+            "pin_provider_usage",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            table_names, expected,
+            "all ten application tables must exist"
+        );
     }
 
     #[tokio::test]
@@ -97,6 +123,10 @@ mod tests {
         assert!(
             names.contains(&"sse_c_key_fingerprint".to_string()),
             "multipart_uploads must persist the SSE-C key fingerprint"
+        );
+        assert!(
+            names.contains(&"tags_json".to_string()),
+            "multipart_uploads must persist object tags as JSON"
         );
 
         let object_rows = db

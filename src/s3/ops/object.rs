@@ -9,7 +9,10 @@ use s3s::dto::*;
 use s3s::{S3Request, S3Response, S3Result};
 
 use crate::crypto::EncryptionMode;
+use crate::pinning::policy::{PublicationContext, PublicationPolicy};
+use crate::pinning::tags::ObjectTag;
 use crate::state::AppState;
+use crate::store::pinning::publication::{PinTargetSpec, PublicationObject, PublicationRequest};
 
 /// Wraps a byte stream and counts the total bytes that flow through it.
 /// The count handle is read after the stream has been fully consumed.
@@ -341,6 +344,104 @@ fn extract_copy_source_sse_c_headers(
     parse_sse_c_header_set(headers, COPY_SOURCE_SSE_C_HEADERS, &forbidden, false)
 }
 
+fn invalid_pinning_argument(message: &str) -> s3s::S3Error {
+    crate::error::AppError::InvalidPinningRequest(message.to_owned()).into()
+}
+
+fn single_control_header<'a>(
+    headers: &'a http::HeaderMap,
+    name: &'static str,
+    duplicate_error: &'static str,
+) -> S3Result<Option<&'a http::HeaderValue>> {
+    let mut values = headers.get_all(name).iter();
+    let first = values.next();
+    if values.next().is_some() {
+        return Err(invalid_pinning_argument(duplicate_error));
+    }
+    Ok(first)
+}
+
+fn parse_publication_tags(headers: &http::HeaderMap) -> S3Result<Vec<ObjectTag>> {
+    let Some(header) =
+        single_control_header(headers, "x-amz-tagging", "duplicate x-amz-tagging header")?
+    else {
+        return Ok(Vec::new());
+    };
+    let value = header
+        .to_str()
+        .map_err(|_| invalid_pinning_argument("invalid x-amz-tagging header"))?;
+    crate::pinning::tags::parse_tagging_header(value)
+        .map_err(|_| invalid_pinning_argument("invalid x-amz-tagging header"))
+}
+
+fn evaluate_publication_policy(
+    state: &Arc<AppState>,
+    bucket: &str,
+    key: &str,
+    tags: &[ObjectTag],
+) -> S3Result<PublicationPolicy> {
+    state
+        .pinning
+        .policy()
+        .evaluate_publication(PublicationContext {
+            bucket,
+            key,
+            tags,
+            is_decompress_zip: false,
+        })
+        .map_err(crate::error::AppError::from)
+        .map_err(s3s::S3Error::from)
+}
+
+async fn copy_publication_tags(
+    state: &Arc<AppState>,
+    source_object_id: &str,
+    headers: &http::HeaderMap,
+) -> S3Result<Vec<ObjectTag>> {
+    let directive_header = single_control_header(
+        headers,
+        "x-amz-tagging-directive",
+        "duplicate x-amz-tagging-directive header",
+    )?;
+    let tagging =
+        single_control_header(headers, "x-amz-tagging", "duplicate x-amz-tagging header")?;
+    let directive = directive_header
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| invalid_pinning_argument("invalid tagging directive"))
+        })
+        .transpose()?
+        .unwrap_or("COPY");
+
+    match directive {
+        "COPY" => {
+            if tagging.is_some_and(|value| !value.as_bytes().is_empty()) {
+                return Err(invalid_pinning_argument(
+                    "x-amz-tagging must be empty when tagging directive is COPY",
+                ));
+            }
+            crate::store::pinning::tags::list_object_tags(state.store.db(), source_object_id)
+                .await
+                .map_err(crate::error::AppError::from)
+                .map_err(s3s::S3Error::from)
+        }
+        "REPLACE" => {
+            let header = tagging.ok_or_else(|| {
+                invalid_pinning_argument(
+                    "x-amz-tagging is required when tagging directive is REPLACE",
+                )
+            })?;
+            let value = header
+                .to_str()
+                .map_err(|_| invalid_pinning_argument("invalid x-amz-tagging header"))?;
+            crate::pinning::tags::parse_tagging_header(value)
+                .map_err(|_| invalid_pinning_argument("invalid x-amz-tagging header"))
+        }
+        _ => Err(invalid_pinning_argument("invalid tagging directive")),
+    }
+}
+
 /// Convert stored JSON metadata back to a `Metadata` map for S3 responses.
 fn restore_metadata(json: &Option<serde_json::Value>) -> Option<Metadata> {
     let obj = json.as_ref()?.as_object()?;
@@ -483,6 +584,8 @@ pub async fn put_object(
     let key = &req.input.key;
     let content_type = req.input.content_type.clone();
     let db = state.store.db();
+    let tags = parse_publication_tags(&req.headers)?;
+    let policy = evaluate_publication_policy(state, bucket, key, &tags)?;
 
     // Validate the bucket exists.
     let exists = crate::store::bucket::exists(db, bucket).await?;
@@ -547,33 +650,42 @@ pub async fn put_object(
 
     let size = count_handle.load(Ordering::Relaxed) as i64;
 
-    // Pin the CID. If pin fails, the CID is already in Kubo (from stream_add)
-    // but unpinned; best-effort clean up by pin::rm (which is a no-op if not
-    // pinned) so it can be GC'd later.
+    // A CID can be shared with an earlier publication, and an RPC failure does
+    // not prove Kubo left the pin unchanged. Conservative cleanup here could
+    // therefore remove content that another object still needs.
     if let Err(e) = crate::kubo::pin::pin_add(&state.kubo, &cid).await {
-        let _ = crate::kubo::pin::pin_rm(&state.kubo, &cid).await;
         return Err(s3s::s3_error!(InternalError, "pin: {e}"));
     }
 
-    // Store metadata. If DB fails, unpin so the CID can be GC'd.
-    if let Err(e) = crate::store::object::upsert(
+    let object_created_at = chrono::Utc::now();
+    let publication = PublicationRequest {
+        object: PublicationObject::from_put(
+            object_id,
+            bucket,
+            key,
+            cid.clone(),
+            size,
+            content_type,
+            metadata,
+            encrypted,
+            key_wrap,
+            sse_c_key_fingerprint,
+            object_created_at,
+        ),
+        tags: policy.tags.clone(),
+        policy,
+        object_target: PinTargetSpec {
+            cid: cid.clone(),
+            logical_size: size,
+        },
+    };
+    if let Err(e) = crate::store::pinning::publication::publish_object(
         db,
-        &object_id,
-        bucket,
-        key,
-        &cid,
-        size,
-        content_type.as_deref(),
-        &cid,
-        metadata,
-        encrypted,
-        key_wrap.as_deref(),
-        sse_c_key_fingerprint.as_deref(),
-        false,
+        publication,
+        state.pinning.provider_limits(),
     )
     .await
     {
-        let _ = crate::kubo::pin::pin_rm(&state.kubo, &cid).await;
         return Err(e.into());
     }
 
@@ -891,7 +1003,16 @@ pub async fn delete_object(
     let key = &req.input.key;
     let db = state.store.db();
 
-    crate::store::object::delete_latest(db, bucket, key).await?;
+    if !crate::store::pinning::publication::delete_latest_with_leases(
+        db,
+        bucket,
+        key,
+        chrono::Utc::now(),
+    )
+    .await?
+    {
+        return Err(crate::error::AppError::NoSuchKey(format!("{bucket}/{key}")).into());
+    }
 
     Ok(S3Response::new(DeleteObjectOutput::default()))
 }
@@ -914,7 +1035,14 @@ pub async fn delete_objects(
     for object in delete.objects {
         // v0.2 has no versioning; ObjectIdentifier::version_id is deliberately ignored.
         let key = object.key;
-        match crate::store::object::delete_latest_if_present(db, &bucket, &key).await {
+        match crate::store::pinning::publication::delete_latest_with_leases(
+            db,
+            &bucket,
+            &key,
+            chrono::Utc::now(),
+        )
+        .await
+        {
             Ok(_) if !quiet => deleted.push(DeletedObject {
                 key: Some(key),
                 ..Default::default()
@@ -959,6 +1087,19 @@ pub async fn copy_object(
     };
 
     let src_obj = crate::store::object::get_latest(db, &src_bucket, &src_key).await?;
+    let tags = copy_publication_tags(state, &src_obj.id, &req.headers).await?;
+
+    // Validate destination bucket exists.
+    let dst_exists = crate::store::bucket::exists(db, dst_bucket).await?;
+    if !dst_exists {
+        return Err(s3s::s3_error!(
+            NoSuchBucket,
+            "bucket not found: {}",
+            dst_bucket
+        ));
+    }
+    let policy = evaluate_publication_policy(state, dst_bucket, dst_key, &tags)?;
+
     let source_sse_c_headers = extract_copy_source_sse_c_headers(&req.headers)?;
     let verified_source_fingerprint = if src_obj.encrypted && src_obj.key_wrap.is_none() {
         let headers = source_sse_c_headers.ok_or_else(|| {
@@ -982,44 +1123,46 @@ pub async fn copy_object(
         None
     };
 
-    // Validate destination bucket exists.
-    let dst_exists = crate::store::bucket::exists(db, dst_bucket).await?;
-    if !dst_exists {
-        return Err(s3s::s3_error!(
-            NoSuchBucket,
-            "bucket not found: {}",
-            dst_bucket
-        ));
-    }
-
     // Re-pin the (content-addressed) CID so the copy is independently pinned.
     crate::kubo::pin::pin_add(&state.kubo, &src_obj.cid)
         .await
         .map_err(|e| s3s::s3_error!(InternalError, "pin: {e}"))?;
 
     let new_id = uuid::Uuid::new_v4().to_string();
-
-    crate::store::object::upsert(
-        db,
-        &new_id,
+    let object_created_at = chrono::Utc::now();
+    let mut object = PublicationObject::from_put(
+        new_id,
         dst_bucket,
         dst_key,
-        &src_obj.cid,
+        src_obj.cid.clone(),
         src_obj.size,
-        src_obj.content_type.as_deref(),
-        &src_obj.etag,
+        src_obj.content_type.clone(),
         src_obj.metadata.clone(),
         src_obj.encrypted,
-        src_obj.key_wrap.as_deref(),
-        verified_source_fingerprint.as_deref(),
-        src_obj.multipart,
+        src_obj.key_wrap.clone(),
+        verified_source_fingerprint,
+        object_created_at,
+    );
+    object.multipart = src_obj.multipart;
+    crate::store::pinning::publication::publish_object(
+        db,
+        PublicationRequest {
+            object,
+            tags: policy.tags.clone(),
+            policy,
+            object_target: PinTargetSpec {
+                cid: src_obj.cid.clone(),
+                logical_size: src_obj.size,
+            },
+        },
+        state.pinning.provider_limits(),
     )
     .await?;
 
     Ok(S3Response::new(CopyObjectOutput {
         copy_object_result: Some(CopyObjectResult {
             e_tag: Some(ETag::Strong(src_obj.etag.clone())),
-            last_modified: Some(Timestamp::from(SystemTime::from(chrono::Utc::now()))),
+            last_modified: Some(Timestamp::from(SystemTime::from(object_created_at))),
             ..Default::default()
         }),
         ..Default::default()
@@ -1396,8 +1539,13 @@ impl ListingPage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::entities::object;
+    use crate::store::entities::{
+        object, pin_job, pin_lease, pin_lease_target, pin_provider_usage, remote_pin,
+    };
     use chrono::Utc;
+    use sea_orm::{
+        ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
+    };
 
     async fn test_state(kubo_uri: String) -> Arc<AppState> {
         use sea_orm::Database;
@@ -1413,7 +1561,300 @@ mod tests {
                 "0000000000000000000000000000000000000000000000000000000000000000",
             )
             .unwrap(),
+            pinning: crate::pinning::coordinator::PinningCoordinator::disabled_for_test(),
         })
+    }
+
+    fn configured_coordinator(
+        endpoint: &str,
+        trigger: &str,
+        provider_mode: &str,
+        prefix: &str,
+    ) -> Arc<crate::pinning::coordinator::PinningCoordinator> {
+        use crate::config::{PinningConfig, PolicyConfig, ProviderConfig};
+        use crate::pinning::config::ValidatedPinningConfig;
+
+        let provider = |name: &str, kind: &str, priority: u32| ProviderConfig {
+            name: name.to_owned(),
+            kind: kind.to_owned(),
+            token_env: Some(format!("{name}_TOKEN")),
+            endpoint: Some(endpoint.to_owned()),
+            enabled: true,
+            priority,
+            max_bytes: 10_000,
+            max_pins: 100,
+            requests_per_second: None,
+        };
+        let validated = ValidatedPinningConfig::from_raw(
+            &PinningConfig {
+                worker_interval: "5s".to_owned(),
+                worker_concurrency: 2,
+                providers: vec![
+                    provider("alpha", "pinata", 1),
+                    provider("beta", "filebase", 2),
+                ],
+                policies: vec![PolicyConfig {
+                    bucket: "bucket".to_owned(),
+                    prefix: prefix.to_owned(),
+                    trigger: trigger.to_owned(),
+                    provider_mode: provider_mode.to_owned(),
+                    providers: vec!["alpha".to_owned(), "beta".to_owned()],
+                    default_duration: "1h".to_owned(),
+                    max_duration: "24h".to_owned(),
+                    allow_decompressed: false,
+                }],
+            },
+            |_| Some("test-provider-token".to_owned()),
+        )
+        .unwrap();
+        crate::pinning::coordinator::PinningCoordinator::build(validated).unwrap()
+    }
+
+    async fn pinning_state(
+        kubo_uri: String,
+        trigger: &str,
+        provider_mode: &str,
+        prefix: &str,
+    ) -> Arc<AppState> {
+        use sea_orm::Database;
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        db.execute_unprepared("PRAGMA foreign_keys = ON")
+            .await
+            .unwrap();
+        crate::store::run_migrations(&db).await.unwrap();
+        crate::store::bucket::create(&db, "bucket", None)
+            .await
+            .unwrap();
+
+        Arc::new(AppState {
+            kubo: crate::kubo::KuboClient::new(kubo_uri.clone()),
+            store: crate::store::Store::new(db),
+            credentials: HashMap::new(),
+            master_key: crate::crypto::key::MasterKey::from_hex(
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            )
+            .unwrap(),
+            pinning: configured_coordinator(&kubo_uri, trigger, provider_mode, prefix),
+        })
+    }
+
+    async fn kubo_server(cid: &str) -> wiremock::MockServer {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let kubo = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/add"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(format!("{{\"Hash\":\"{cid}\",\"Size\":\"4\"}}\n")),
+            )
+            .mount(&kubo)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/pin/add"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(format!("{{\"Pins\":[\"{cid}\"]}}")),
+            )
+            .mount(&kubo)
+            .await;
+        kubo
+    }
+
+    fn s3_request<T>(
+        input: T,
+        method: http::Method,
+        uri: &str,
+        headers: http::HeaderMap,
+    ) -> S3Request<T> {
+        S3Request {
+            input,
+            method,
+            uri: uri.parse().unwrap(),
+            headers,
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    fn put_request(key: &str, tagging: Option<&str>) -> S3Request<PutObjectInput> {
+        let mut headers = http::HeaderMap::new();
+        if let Some(tagging) = tagging {
+            headers.insert("x-amz-tagging", tagging.parse().unwrap());
+        }
+        s3_request(
+            PutObjectInput {
+                body: Some(StreamingBlob::from(s3s::Body::from(Bytes::from_static(
+                    b"body",
+                )))),
+                bucket: "bucket".to_owned(),
+                content_type: Some("text/plain".to_owned()),
+                key: key.to_owned(),
+                ..Default::default()
+            },
+            http::Method::PUT,
+            &format!("/bucket/{key}"),
+            headers,
+        )
+    }
+
+    fn copy_request(
+        source_key: &str,
+        destination_key: &str,
+        directive: Option<&str>,
+        tagging: Option<&str>,
+    ) -> S3Request<CopyObjectInput> {
+        let mut headers = http::HeaderMap::new();
+        if let Some(directive) = directive {
+            headers.insert("x-amz-tagging-directive", directive.parse().unwrap());
+        }
+        if let Some(tagging) = tagging {
+            headers.insert("x-amz-tagging", tagging.parse().unwrap());
+        }
+        s3_request(
+            CopyObjectInput::builder()
+                .bucket("bucket".to_owned())
+                .copy_source(CopySource::Bucket {
+                    bucket: "bucket".into(),
+                    key: source_key.into(),
+                    version_id: None,
+                })
+                .key(destination_key.to_owned())
+                .build()
+                .unwrap(),
+            http::Method::PUT,
+            &format!("/bucket/{destination_key}"),
+            headers,
+        )
+    }
+
+    fn delete_object_request(key: &str) -> S3Request<DeleteObjectInput> {
+        s3_request(
+            DeleteObjectInput {
+                bucket: "bucket".to_owned(),
+                key: key.to_owned(),
+                ..Default::default()
+            },
+            http::Method::DELETE,
+            &format!("/bucket/{key}"),
+            http::HeaderMap::new(),
+        )
+    }
+
+    async fn lease_sources_for_latest(state: &Arc<AppState>, key: &str) -> Vec<String> {
+        let latest = crate::store::object::get_latest(state.store.db(), "bucket", key)
+            .await
+            .unwrap();
+        pin_lease::Entity::find()
+            .filter(pin_lease::Column::OwnerObjectId.eq(latest.id))
+            .filter(pin_lease::Column::State.eq("active"))
+            .order_by_asc(pin_lease::Column::Source)
+            .all(state.store.db())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|lease| lease.source)
+            .collect()
+    }
+
+    async fn pending_operations(state: &Arc<AppState>) -> Vec<String> {
+        pin_job::Entity::find()
+            .filter(pin_job::Column::State.eq("pending"))
+            .order_by_asc(pin_job::Column::Provider)
+            .all(state.store.db())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|job| job.operation)
+            .collect()
+    }
+
+    async fn publish_seed(
+        state: &Arc<AppState>,
+        id: &str,
+        key: &str,
+        cid: &str,
+        tags: Vec<crate::pinning::tags::ObjectTag>,
+    ) {
+        use crate::pinning::policy::PublicationContext;
+        use crate::store::pinning::publication::{
+            PinTargetSpec, PublicationObject, PublicationRequest,
+        };
+
+        let policy = state
+            .pinning
+            .policy()
+            .evaluate_publication(PublicationContext {
+                bucket: "bucket",
+                key,
+                tags: &tags,
+                is_decompress_zip: false,
+            })
+            .unwrap();
+        let object = PublicationObject::from_put(
+            id.to_owned(),
+            "bucket",
+            key,
+            cid.to_owned(),
+            4,
+            Some("text/plain".to_owned()),
+            None,
+            false,
+            None,
+            None,
+            Utc::now(),
+        );
+        crate::store::pinning::publication::publish_object(
+            state.store.db(),
+            PublicationRequest {
+                object,
+                tags: policy.tags.clone(),
+                policy,
+                object_target: PinTargetSpec {
+                    cid: cid.to_owned(),
+                    logical_size: 4,
+                },
+            },
+            state.pinning.provider_limits(),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn seed_copy_source(
+        state: &Arc<AppState>,
+        key: &str,
+        cid: &str,
+        tags: &[crate::pinning::tags::ObjectTag],
+    ) {
+        crate::store::object::upsert(
+            state.store.db(),
+            &format!("source-{key}"),
+            "bucket",
+            key,
+            cid,
+            4,
+            Some("text/plain"),
+            cid,
+            None,
+            false,
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        crate::store::pinning::tags::replace_object_tags(
+            state.store.db(),
+            &format!("source-{key}"),
+            tags,
+        )
+        .await
+        .unwrap();
     }
 
     fn valid_sse_c_headers() -> http::HeaderMap {
@@ -1638,6 +2079,7 @@ mod tests {
             store,
             credentials,
             master_key,
+            pinning: crate::pinning::coordinator::PinningCoordinator::disabled_for_test(),
         })
     }
 
@@ -1700,6 +2142,558 @@ mod tests {
             service: None,
             trailing_headers: None,
         }
+    }
+
+    #[tokio::test]
+    async fn pinning_put_automatic_commits_outbox_without_provider_request() {
+        let kubo = kubo_server("bafy-put").await;
+        let state = pinning_state(kubo.uri(), "always", "all", "").await;
+
+        let response = put_object(&state, put_request("automatic", None))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.output.e_tag.as_ref().map(ETag::value),
+            Some("bafy-put")
+        );
+        assert_eq!(
+            lease_sources_for_latest(&state, "automatic").await,
+            vec!["automatic"]
+        );
+        assert_eq!(pending_operations(&state).await, vec!["submit", "submit"]);
+        let requests = kubo.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path() == "/api/v0/add")
+                .count(),
+            1
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path() == "/api/v0/pin/add")
+                .count(),
+            1
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.url.path().starts_with("/api/v0/")),
+            "the response path must not call a remote pinning provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_object_pin_add_failure_never_removes_the_uploaded_cid() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let kubo = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/add"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("{\"Hash\":\"bafy-shared-pin-failure\",\"Size\":\"4\"}\n"),
+            )
+            .mount(&kubo)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/pin/add"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("pin failed"))
+            .mount(&kubo)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/pin/rm"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&kubo)
+            .await;
+
+        let state = pinning_state(kubo.uri(), "request", "one", "").await;
+        let error = put_object(&state, put_request("pin-add-failure", None))
+            .await
+            .expect_err("a Kubo pin-add failure must fail PutObject");
+
+        assert_eq!(error.code().as_str(), "InternalError");
+        assert!(
+            kubo.received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.url.path() != "/api/v0/pin/rm"),
+            "standard PutObject must never unpin a CID after pin-add failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_object_publication_failure_never_removes_the_pinned_cid() {
+        use sea_orm::ConnectionTrait;
+
+        let kubo = kubo_server("bafy-shared-publication-failure").await;
+        let state = pinning_state(kubo.uri(), "request", "one", "").await;
+        state
+            .store
+            .db()
+            .execute_unprepared("DROP TABLE objects")
+            .await
+            .unwrap();
+
+        let error = put_object(&state, put_request("publication-failure", None))
+            .await
+            .expect_err("a publication database failure must fail PutObject");
+
+        assert_eq!(error.code().as_str(), "InternalError");
+        let requests = kubo.received_requests().await.unwrap();
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.url.path() == "/api/v0/pin/add"),
+            "the fixture must reach the successful local pin before publication fails"
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.url.path() != "/api/v0/pin/rm"),
+            "standard PutObject must never unpin a CID after publication failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn pinning_put_request_manual_and_always_manual_create_expected_leases() {
+        let request_kubo = kubo_server("bafy-request").await;
+        let request_state = pinning_state(request_kubo.uri(), "request", "one", "").await;
+
+        put_object(&request_state, put_request("ordinary", None))
+            .await
+            .unwrap();
+        assert!(
+            lease_sources_for_latest(&request_state, "ordinary")
+                .await
+                .is_empty()
+        );
+        put_object(
+            &request_state,
+            put_request("manual", Some("ipfs-s3%3Apin=true&ipfs-s3%3Aduration=2h")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            lease_sources_for_latest(&request_state, "manual").await,
+            vec!["manual"]
+        );
+
+        let always_kubo = kubo_server("bafy-always").await;
+        let always_state = pinning_state(always_kubo.uri(), "always", "one", "").await;
+        put_object(
+            &always_state,
+            put_request(
+                "combined",
+                Some("team=storage&ipfs-s3%3Apin=true&ipfs-s3%3Aduration=2h"),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            lease_sources_for_latest(&always_state, "combined").await,
+            vec!["automatic", "manual"]
+        );
+        assert_eq!(
+            pin_lease::Entity::find()
+                .filter(
+                    pin_lease::Column::OwnerObjectId.eq(crate::store::object::get_latest(
+                        always_state.store.db(),
+                        "bucket",
+                        "combined",
+                    )
+                    .await
+                    .unwrap()
+                    .id,)
+                )
+                .count(always_state.store.db())
+                .await
+                .unwrap(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn pinning_put_invalid_tag_control_and_policy_fail_before_kubo_add() {
+        let kubo = kubo_server("bafy-never-added").await;
+        let state = pinning_state(kubo.uri(), "request", "one", "matched/").await;
+
+        for request in [
+            put_request("matched/malformed", Some("team=%GG")),
+            put_request("matched/control", Some("ipfs-s3%3Aduration=1h")),
+            put_request("unmatched", Some("ipfs-s3%3Apin=true")),
+        ] {
+            let error = put_object(&state, request).await.unwrap_err();
+            assert_eq!(error.code().as_str(), "InvalidArgument");
+        }
+
+        assert!(
+            kubo.received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.url.path() != "/api/v0/add")
+        );
+    }
+
+    #[tokio::test]
+    async fn pinning_put_rejects_duplicate_tagging_before_kubo() {
+        let kubo = kubo_server("bafy-never-added").await;
+        let state = pinning_state(kubo.uri(), "request", "one", "").await;
+        let mut request = put_request("duplicate-tags", Some("team=legal"));
+        request
+            .headers
+            .append("x-amz-tagging", http::HeaderValue::from_static("team=%GG"));
+
+        let error = put_object(&state, request).await.unwrap_err();
+        assert_eq!(error.code().as_str(), "InvalidArgument");
+        assert_eq!(
+            error.message(),
+            Some("invalid pinning request: duplicate x-amz-tagging header")
+        );
+        assert!(kubo.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pinning_copy_rejects_duplicate_tagging_before_kubo_or_publish() {
+        let kubo = kubo_server("unused-add-response").await;
+        let state = pinning_state(kubo.uri(), "request", "one", "dest/").await;
+        seed_copy_source(&state, "source", "bafy-shared", &[]).await;
+        let mut request = copy_request("source", "dest/duplicate-tags", Some("COPY"), Some(""));
+        request.headers.append(
+            "x-amz-tagging",
+            http::HeaderValue::from_static("team=missed"),
+        );
+
+        let error = copy_object(&state, request).await.unwrap_err();
+        assert_eq!(error.code().as_str(), "InvalidArgument");
+        assert_eq!(
+            error.message(),
+            Some("invalid pinning request: duplicate x-amz-tagging header")
+        );
+        assert!(
+            crate::store::object::get_latest(state.store.db(), "bucket", "dest/duplicate-tags")
+                .await
+                .is_err()
+        );
+        assert!(kubo.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pinning_copy_rejects_duplicate_tagging_directive_before_kubo_or_publish() {
+        let kubo = kubo_server("unused-add-response").await;
+        let state = pinning_state(kubo.uri(), "request", "one", "dest/").await;
+        seed_copy_source(&state, "source", "bafy-shared", &[]).await;
+        let mut request = copy_request("source", "dest/duplicate-directive", Some("COPY"), None);
+        request.headers.append(
+            "x-amz-tagging-directive",
+            http::HeaderValue::from_static("REPLACE"),
+        );
+
+        let error = copy_object(&state, request).await.unwrap_err();
+        assert_eq!(error.code().as_str(), "InvalidArgument");
+        assert_eq!(
+            error.message(),
+            Some("invalid pinning request: duplicate x-amz-tagging-directive header")
+        );
+        assert!(
+            crate::store::object::get_latest(
+                state.store.db(),
+                "bucket",
+                "dest/duplicate-directive"
+            )
+            .await
+            .is_err()
+        );
+        assert!(kubo.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pinning_overwrite_ends_old_leases_and_publishes_new_latest_together() {
+        let kubo = kubo_server("bafy-new").await;
+        let state = pinning_state(kubo.uri(), "always", "one", "").await;
+        publish_seed(&state, "old-object", "key", "bafy-old", Vec::new()).await;
+
+        put_object(
+            &state,
+            put_request("key", Some("ipfs-s3%3Apin=true&ipfs-s3%3Aduration=2h")),
+        )
+        .await
+        .unwrap();
+
+        let old = pin_lease::Entity::find()
+            .filter(pin_lease::Column::OwnerObjectId.eq("old-object"))
+            .all(state.store.db())
+            .await
+            .unwrap();
+        assert_eq!(old.len(), 1);
+        assert_eq!(old[0].state, "cancelled");
+        assert_eq!(old[0].generation, 2);
+        let latest = crate::store::object::get_latest(state.store.db(), "bucket", "key")
+            .await
+            .unwrap();
+        assert_eq!(latest.cid, "bafy-new");
+        assert_ne!(latest.id, "old-object");
+        assert_eq!(
+            lease_sources_for_latest(&state, "key").await,
+            vec!["automatic", "manual"]
+        );
+    }
+
+    #[tokio::test]
+    async fn pinning_copy_directives_use_source_or_replacement_tags_and_destination_policy() {
+        let kubo = kubo_server("unused-add-response").await;
+        let state = pinning_state(kubo.uri(), "request", "one", "dest/").await;
+        let source_tags = vec![
+            crate::pinning::tags::ObjectTag::new("team", "source"),
+            crate::pinning::tags::ObjectTag::new("ipfs-s3:pin", "true"),
+        ];
+        seed_copy_source(&state, "source", "bafy-shared", &source_tags).await;
+
+        copy_object(&state, copy_request("source", "dest/default", None, None))
+            .await
+            .unwrap();
+        copy_object(
+            &state,
+            copy_request("source", "dest/copy", Some("COPY"), Some("")),
+        )
+        .await
+        .unwrap();
+        copy_object(
+            &state,
+            copy_request(
+                "source",
+                "dest/replaced",
+                Some("REPLACE"),
+                Some("team=replaced&ipfs-s3%3Apin=true"),
+            ),
+        )
+        .await
+        .unwrap();
+        for request in [
+            copy_request("source", "dest/reject-tags", None, Some("team=override")),
+            copy_request(
+                "source",
+                "dest/reject-copy-tags",
+                Some("COPY"),
+                Some("team=override"),
+            ),
+            copy_request("source", "dest/missing", Some("REPLACE"), None),
+            copy_request("source", "dest/invalid", Some("MERGE"), None),
+        ] {
+            let error = copy_object(&state, request).await.unwrap_err();
+            assert_eq!(error.code().as_str(), "InvalidArgument");
+        }
+        copy_object(
+            &state,
+            copy_request("source", "dest/empty", Some("REPLACE"), Some("")),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            crate::store::pinning::tags::list_object_tags(
+                state.store.db(),
+                &crate::store::object::get_latest(state.store.db(), "bucket", "dest/default")
+                    .await
+                    .unwrap()
+                    .id,
+            )
+            .await
+            .unwrap(),
+            vec![
+                crate::pinning::tags::ObjectTag::new("ipfs-s3:pin", "true"),
+                crate::pinning::tags::ObjectTag::new("team", "source"),
+            ]
+        );
+        assert!(
+            crate::store::pinning::tags::list_object_tags(
+                state.store.db(),
+                &crate::store::object::get_latest(state.store.db(), "bucket", "dest/empty")
+                    .await
+                    .unwrap()
+                    .id,
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(
+            crate::store::pinning::tags::list_object_tags(
+                state.store.db(),
+                &crate::store::object::get_latest(state.store.db(), "bucket", "dest/replaced")
+                    .await
+                    .unwrap()
+                    .id,
+            )
+            .await
+            .unwrap(),
+            vec![
+                crate::pinning::tags::ObjectTag::new("ipfs-s3:pin", "true"),
+                crate::pinning::tags::ObjectTag::new("team", "replaced"),
+            ]
+        );
+        assert_eq!(
+            lease_sources_for_latest(&state, "dest/default").await,
+            vec!["manual"]
+        );
+        assert_eq!(
+            lease_sources_for_latest(&state, "dest/copy").await,
+            vec!["manual"]
+        );
+        assert_eq!(
+            lease_sources_for_latest(&state, "dest/replaced").await,
+            vec!["manual"]
+        );
+        assert!(
+            lease_sources_for_latest(&state, "dest/empty")
+                .await
+                .is_empty()
+        );
+        let usage = pin_provider_usage::Entity::find_by_id("alpha")
+            .one(state.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((usage.reserved_bytes, usage.reserved_pins), (4, 1));
+        let requests = kubo.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.url.path() == "/api/v0/pin/add"),
+            "copy must only touch the local Kubo pin endpoint synchronously"
+        );
+    }
+
+    #[tokio::test]
+    async fn pinning_copy_reuses_pinned_remote_without_submit_or_poll() {
+        let kubo = kubo_server("unused-add-response").await;
+        let state = pinning_state(kubo.uri(), "request", "one", "dest/").await;
+        let source_tags = vec![crate::pinning::tags::ObjectTag::new("ipfs-s3:pin", "true")];
+        seed_copy_source(&state, "source", "bafy-pinned-copy", &source_tags).await;
+        copy_object(&state, copy_request("source", "dest/first", None, None))
+            .await
+            .unwrap();
+        remote_pin::Entity::update_many()
+            .col_expr(remote_pin::Column::Status, "pinned".into())
+            .col_expr(
+                remote_pin::Column::RequestId,
+                Some("remote-request".to_owned()).into(),
+            )
+            .filter(remote_pin::Column::Provider.eq("alpha"))
+            .filter(remote_pin::Column::Cid.eq("bafy-pinned-copy"))
+            .exec(state.store.db())
+            .await
+            .unwrap();
+        pin_job::Entity::delete_many()
+            .exec(state.store.db())
+            .await
+            .unwrap();
+
+        copy_object(&state, copy_request("source", "dest/second", None, None))
+            .await
+            .unwrap();
+
+        assert!(pending_operations(&state).await.is_empty());
+        let latest = crate::store::object::get_latest(state.store.db(), "bucket", "dest/second")
+            .await
+            .unwrap();
+        let lease = pin_lease::Entity::find()
+            .filter(pin_lease::Column::OwnerObjectId.eq(latest.id))
+            .one(state.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease.state, "active");
+        assert_eq!(
+            pin_lease_target::Entity::find()
+                .filter(pin_lease_target::Column::LeaseId.eq(lease.id))
+                .one(state.store.db())
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "pinned"
+        );
+    }
+
+    #[tokio::test]
+    async fn pinning_delete_operations_close_only_removed_latest_owner_leases_without_kubo_unpin() {
+        let kubo = kubo_server("unused-add-response").await;
+        let state = pinning_state(kubo.uri(), "always", "one", "").await;
+        publish_seed(&state, "delete-a", "a", "bafy-a", Vec::new()).await;
+        publish_seed(&state, "delete-b", "b", "bafy-b", Vec::new()).await;
+
+        delete_object(&state, delete_object_request("a"))
+            .await
+            .unwrap();
+        assert_eq!(
+            delete_object(&state, delete_object_request("missing"))
+                .await
+                .unwrap_err()
+                .code()
+                .as_str(),
+            "NoSuchKey"
+        );
+        assert_eq!(
+            pin_lease::Entity::find()
+                .filter(pin_lease::Column::OwnerObjectId.eq("delete-a"))
+                .one(state.store.db())
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "cancelled"
+        );
+        assert_eq!(
+            pin_lease::Entity::find()
+                .filter(pin_lease::Column::OwnerObjectId.eq("delete-b"))
+                .one(state.store.db())
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "active"
+        );
+
+        let output = delete_objects(
+            &state,
+            delete_objects_request(&["missing", "b", "b"], false),
+        )
+        .await
+        .unwrap()
+        .output;
+        assert_eq!(
+            output
+                .deleted
+                .unwrap()
+                .into_iter()
+                .map(|object| object.key.unwrap())
+                .collect::<Vec<_>>(),
+            vec!["missing", "b", "b"]
+        );
+        assert_eq!(
+            pin_lease::Entity::find()
+                .filter(pin_lease::Column::OwnerObjectId.eq("delete-b"))
+                .one(state.store.db())
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "cancelled"
+        );
+        assert!(
+            kubo.received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.url.path() != "/api/v0/pin/rm")
+        );
     }
 
     #[tokio::test]

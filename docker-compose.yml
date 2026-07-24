@@ -31,6 +31,8 @@ services:
     environment:
       - IPFS_S3_CONFIG=/data/config.toml
       - IPFS_S3_MASTER_KEY=${IPFS_S3_MASTER_KEY}
+      - PINATA_JWT=${PINATA_JWT}
+      - FILEBASE_PINNING_TOKEN=${FILEBASE_PINNING_TOKEN}
       - RUST_LOG=info
     depends_on:
       kubo:

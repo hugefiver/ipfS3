@@ -91,6 +91,27 @@ impl S3 for S3Impl {
         super::ops::object::delete_objects(&self.state, req).await
     }
 
+    async fn get_object_tagging(
+        &self,
+        req: S3Request<GetObjectTaggingInput>,
+    ) -> S3Result<S3Response<GetObjectTaggingOutput>> {
+        super::ops::tagging::get_object_tagging(&self.state, req).await
+    }
+
+    async fn put_object_tagging(
+        &self,
+        req: S3Request<PutObjectTaggingInput>,
+    ) -> S3Result<S3Response<PutObjectTaggingOutput>> {
+        super::ops::tagging::put_object_tagging(&self.state, req).await
+    }
+
+    async fn delete_object_tagging(
+        &self,
+        req: S3Request<DeleteObjectTaggingInput>,
+    ) -> S3Result<S3Response<DeleteObjectTaggingOutput>> {
+        super::ops::tagging::delete_object_tagging(&self.state, req).await
+    }
+
     async fn copy_object(
         &self,
         req: S3Request<CopyObjectInput>,

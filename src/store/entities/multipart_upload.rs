@@ -14,6 +14,7 @@ pub struct Model {
     pub sse_c_key_fingerprint: Option<String>,
     pub content_type: Option<String>,
     pub metadata: Option<Json>,
+    pub tags_json: Json,
     pub decompress_zip_target: Option<String>,
     pub decompress_zip_result: bool,
 }

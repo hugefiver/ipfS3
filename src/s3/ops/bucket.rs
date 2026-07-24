@@ -112,6 +112,7 @@ mod tests {
                 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             )
             .unwrap(),
+            pinning: crate::pinning::coordinator::PinningCoordinator::disabled_for_test(),
         })
     }
 

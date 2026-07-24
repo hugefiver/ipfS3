@@ -30,7 +30,7 @@ Docker against the local docker-compose stack.
 - [x] Verify HeadObject signatures for nested keys through direct docker networking and localhost (MinIO `mc` same-client dual endpoint `stat` PASSED with `client=Mc verifier=Mc` EVIDENCE; see `docs/client-smoke-evidence-2026-07-19.log`)
 - [x] Track client compatibility matrix in docs
 
-## Current: v0.3 — Hardening
+## v0.3 — Hardening
 
 - [x] Presigned URL (GET/PUT)
 - [x] Bucket name validation
@@ -39,12 +39,16 @@ Docker against the local docker-compose stack.
 - [x] Integration tests for encryption, multipart, SSE-C, Range
 - [x] PutObject response custom headers (x-amz-meta-ipfs-cid, x-amz-meta-ipfs-url)
 
-## v0.4 — Pinning Service
+## Current: v0.4 — Pinning Service
 
-- [ ] Pinata integration (PinningService trait implementation)
-- [ ] Automatic pin on PutObject/CompleteMultipartUpload
-- [ ] Unpin on DeleteObject
-- [ ] Configurable pinning provider
+- [x] Filebase and Pinata PSA clients
+- [x] Ordered automatic and manual pinning policies
+- [x] Standard S3 object-tag control
+- [x] Durable asynchronous worker and crash recovery
+- [x] Sticky `one` failover and `all` provider coordination
+- [x] Lease duration, renewal, expiry, and remote unpin
+- [x] Decompressed ZIP entry targets
+- [x] Unique-CID local soft quota and eviction
 
 ## v0.5 — Multi-node
 
@@ -80,7 +84,7 @@ Docker against the local docker-compose stack.
 ## v0.9 — Ecosystem
 
 - [ ] S3 Select
-- [ ] Object Tagging
+- [ ] Advanced tag-based search and policy conditions
 - [ ] Event notifications (webhook on Put/Delete)
 - [ ] Static website hosting (via IPFS Gateway + DNSLink)
 - [ ] rclone backend plugin

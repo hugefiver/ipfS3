@@ -18,6 +18,11 @@ use sea_orm::Database;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+pub trait S3TestEndpoint {
+    fn endpoint(&self) -> &str;
+    fn bucket(&self) -> &str;
+}
+
 #[allow(dead_code)]
 pub enum AddReply {
     Ok(&'static str),
@@ -52,6 +57,7 @@ pub struct TestHarness {
     pub observed_http: Arc<tokio::sync::Mutex<Vec<ObservedHttpRequest>>>,
     add_file_bytes: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
     cat_bodies: Arc<std::sync::RwLock<HashMap<String, Vec<u8>>>>,
+    _server: S3ServerHandle,
 }
 
 impl TestHarness {
@@ -70,6 +76,52 @@ impl TestHarness {
     }
 }
 
+impl S3TestEndpoint for TestHarness {
+    fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    fn bucket(&self) -> &str {
+        &self.bucket
+    }
+}
+
+pub struct KuboHarness {
+    pub server: MockServer,
+    add_file_bytes: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    cat_bodies: Arc<std::sync::RwLock<HashMap<String, Vec<u8>>>>,
+}
+
+pub struct S3ServerHandle {
+    pub endpoint: String,
+    cancellation: tokio_util::sync::CancellationToken,
+    join: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl S3ServerHandle {
+    pub async fn shutdown(mut self) {
+        self.cancellation.cancel();
+        if let Some(mut join) = self.join.take() {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), &mut join).await {
+                Ok(result) => result.expect("test S3 server task failed"),
+                Err(_) => {
+                    join.abort();
+                    let _ = join.await;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for S3ServerHandle {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        if let Some(join) = self.join.take() {
+            join.abort();
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ObservedHttpRequest {
     pub method: http::Method,
@@ -77,7 +129,7 @@ pub struct ObservedHttpRequest {
     pub headers: http::HeaderMap,
 }
 
-pub async fn start_harness(script: KuboScript) -> TestHarness {
+pub async fn start_kubo_harness(script: KuboScript) -> KuboHarness {
     let kubo = MockServer::start().await;
     let KuboScript {
         add_replies,
@@ -148,6 +200,20 @@ pub async fn start_harness(script: KuboScript) -> TestHarness {
             .await;
     }
 
+    KuboHarness {
+        server: kubo,
+        add_file_bytes,
+        cat_bodies,
+    }
+}
+
+pub async fn start_harness(script: KuboScript) -> TestHarness {
+    let KuboHarness {
+        server: kubo,
+        add_file_bytes,
+        cat_bodies,
+    } = start_kubo_harness(script).await;
+
     let db = Database::connect("sqlite::memory:")
         .await
         .expect("in-memory SQLite database");
@@ -164,8 +230,28 @@ pub async fn start_harness(script: KuboScript) -> TestHarness {
         credentials: HashMap::from([("test".to_owned(), s3s::auth::SecretKey::from("test"))]),
         master_key: ipfs_s3_gateway::crypto::key::MasterKey::from_hex(&"0".repeat(64))
             .expect("zero test master key"),
+        pinning: ipfs_s3_gateway::pinning::coordinator::PinningCoordinator::disabled_for_test(),
     });
 
+    let observed_http = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let server = start_s3_server(state.clone(), observed_http.clone()).await;
+
+    TestHarness {
+        endpoint: server.endpoint.clone(),
+        bucket,
+        state,
+        kubo,
+        observed_http,
+        add_file_bytes,
+        cat_bodies,
+        _server: server,
+    }
+}
+
+pub async fn start_s3_server(
+    state: Arc<ipfs_s3_gateway::state::AppState>,
+    observed_http: Arc<tokio::sync::Mutex<Vec<ObservedHttpRequest>>>,
+) -> S3ServerHandle {
     let s3_impl = ipfs_s3_gateway::s3::handler::S3Impl::new(state.clone());
     let mut builder = S3ServiceBuilder::new(s3_impl);
     builder.set_validation(AwsNameValidation::new());
@@ -174,7 +260,6 @@ pub async fn start_harness(script: KuboScript) -> TestHarness {
         ipfs_s3_gateway::s3::route::decompress_zip::DecompressZipRoute::new(state.clone()),
     );
     let service = HandleError::new(builder.build(), handle_s3_error);
-    let observed_http = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let app = Router::new()
         .fallback_service(service)
         .layer(middleware::from_fn(
@@ -188,20 +273,19 @@ pub async fn start_harness(script: KuboScript) -> TestHarness {
         .await
         .expect("bind test S3 listener");
     let port = listener.local_addr().expect("test listener address").port();
-    tokio::spawn(async move {
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let server_cancellation = cancellation.clone();
+    let join = tokio::spawn(async move {
         axum::serve(listener, app)
+            .with_graceful_shutdown(server_cancellation.cancelled_owned())
             .await
             .expect("test S3 server terminated unexpectedly");
     });
 
-    TestHarness {
+    S3ServerHandle {
         endpoint: format!("http://127.0.0.1:{port}"),
-        bucket,
-        state,
-        kubo,
-        observed_http,
-        add_file_bytes,
-        cat_bodies,
+        cancellation,
+        join: Some(join),
     }
 }
 

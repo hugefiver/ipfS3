@@ -1,8 +1,8 @@
 use crate::error::{AppError, AppResult};
 use chrono::Utc;
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
-    QuerySelect, Set, TransactionTrait,
+    ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, PaginatorTrait, QueryFilter,
+    QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use serde_json::Value as JsonValue;
 
@@ -28,16 +28,31 @@ pub struct LatestObjectRow {
 pub(crate) async fn write_latest_in_transaction<C: ConnectionTrait>(
     db: &C,
     row: LatestObjectRow,
-) -> Result<(), sea_orm::DbErr> {
+) -> Result<Option<String>, sea_orm::DbErr> {
     let bucket = row.bucket.clone();
     let key = row.key.clone();
-    object::Entity::update_many()
+    let previous_query = object::Entity::find()
+        .filter(object::Column::Bucket.eq(bucket.clone()))
+        .filter(object::Column::Key.eq(key.clone()))
+        .filter(object::Column::IsLatest.eq(true));
+    let previous = if db.get_database_backend() == DatabaseBackend::Postgres {
+        previous_query.lock_exclusive().one(db).await?
+    } else {
+        previous_query.one(db).await?
+    };
+
+    let updated = object::Entity::update_many()
         .col_expr(object::Column::IsLatest, false.into())
         .filter(object::Column::Bucket.eq(bucket))
         .filter(object::Column::Key.eq(key))
         .filter(object::Column::IsLatest.eq(true))
         .exec(db)
         .await?;
+    if updated.rows_affected != u64::from(previous.is_some()) {
+        return Err(sea_orm::DbErr::Custom(
+            "latest object changed during replacement".to_owned(),
+        ));
+    }
 
     object::Entity::insert(object::ActiveModel {
         id: Set(row.id),
@@ -57,7 +72,7 @@ pub(crate) async fn write_latest_in_transaction<C: ConnectionTrait>(
     })
     .exec(db)
     .await?;
-    Ok(())
+    Ok(previous.map(|object| object.id))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -105,7 +120,7 @@ pub async fn upsert<C: ConnectionTrait + TransactionTrait>(
             .await;
 
         match result {
-            Ok(()) => return Ok(()),
+            Ok(_) => return Ok(()),
             Err(sea_orm::TransactionError::Transaction(db_err)) => {
                 let msg = db_err.to_string().to_lowercase();
                 if (msg.contains("unique") || msg.contains("constraint")) && attempt < MAX_RETRIES {
@@ -269,14 +284,20 @@ mod tests {
     async fn write_latest_in_transaction_replaces_latest_and_preserves_all_fields() {
         let db = setup().await;
         let first = latest_row("object-1", "QmOld");
-        write_latest_in_transaction(&db, first.clone())
-            .await
-            .unwrap();
+        assert_eq!(
+            write_latest_in_transaction(&db, first.clone())
+                .await
+                .unwrap(),
+            None
+        );
 
         let second = latest_row("object-2", "QmNew");
-        write_latest_in_transaction(&db, second.clone())
-            .await
-            .unwrap();
+        assert_eq!(
+            write_latest_in_transaction(&db, second.clone())
+                .await
+                .unwrap(),
+            Some("object-1".to_owned())
+        );
 
         let latest = get_latest(&db, "test-bucket", "archive.zip").await.unwrap();
         assert_eq!(latest.id, second.id);

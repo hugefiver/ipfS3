@@ -1,12 +1,11 @@
 use crate::error::{AppError, AppResult};
 use chrono::Utc;
 use sea_orm::sea_query::OnConflict;
-use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set, TransactionTrait,
-};
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set};
 use serde_json::Value as JsonValue;
 
 use super::entities::{multipart_part, multipart_upload};
+use crate::pinning::tags::ObjectTag;
 
 #[allow(clippy::too_many_arguments)]
 pub async fn create_upload<C: ConnectionTrait>(
@@ -20,6 +19,7 @@ pub async fn create_upload<C: ConnectionTrait>(
     sse_c_key_fingerprint: Option<&str>,
     content_type: Option<&str>,
     metadata: Option<JsonValue>,
+    tags: &[ObjectTag],
     decompress_zip_target: Option<&str>,
     decompress_zip_result: bool,
 ) -> AppResult<()> {
@@ -34,6 +34,8 @@ pub async fn create_upload<C: ConnectionTrait>(
         sse_c_key_fingerprint: Set(sse_c_key_fingerprint.map(|s| s.to_owned())),
         content_type: Set(content_type.map(|s| s.to_owned())),
         metadata: Set(metadata),
+        tags_json: Set(crate::store::pinning::tags::tags_to_json(tags)
+            .map_err(|_| AppError::Internal("failed to serialize multipart tags".to_owned()))?),
         decompress_zip_target: Set(decompress_zip_target.map(str::to_owned)),
         decompress_zip_result: Set(decompress_zip_result),
     };
@@ -80,6 +82,30 @@ pub async fn delete_upload<C: ConnectionTrait>(db: &C, upload_id: &str) -> AppRe
         return Err(AppError::NoSuchUpload(upload_id.to_owned()));
     }
 
+    Ok(())
+}
+
+/// Deletes exactly one upload owned by the expected object location.
+///
+/// The caller supplies the publication transaction, so the upload and its cascading parts are
+/// removed atomically with the completed object, tags, leases, targets, usage, and outbox rows.
+pub(crate) async fn delete_matching_upload_in_transaction<C: ConnectionTrait>(
+    db: &C,
+    upload_id: &str,
+    bucket: &str,
+    key: &str,
+) -> AppResult<()> {
+    let upload = get_upload(db, upload_id).await?;
+    if upload.bucket != bucket || upload.key != key {
+        return Err(AppError::NoSuchUpload(upload_id.to_owned()));
+    }
+
+    let deleted = multipart_upload::Entity::delete_by_id(upload_id.to_owned())
+        .exec(db)
+        .await?;
+    if deleted.rows_affected != 1 {
+        return Err(AppError::NoSuchUpload(upload_id.to_owned()));
+    }
     Ok(())
 }
 
@@ -165,58 +191,6 @@ pub enum ReconciledCommitOutcome {
     Unknown(AppError),
 }
 
-pub async fn commit_completed_upload<C: ConnectionTrait + TransactionTrait>(
-    db: &C,
-    upload_id: &str,
-    attempt: crate::store::object::LatestObjectRow,
-) -> Result<(), CommitCompletedUploadError> {
-    let completion_attempt_id = attempt.id.clone();
-    const MAX_RETRIES: usize = 3;
-    for retry in 0..=MAX_RETRIES {
-        let upload_id = upload_id.to_owned();
-        let attempt = attempt.clone();
-        let result = db
-            .transaction(|txn| {
-                Box::pin(async move {
-                    crate::store::object::write_latest_in_transaction(txn, attempt).await?;
-                    let deleted = multipart_upload::Entity::delete_by_id(upload_id.clone())
-                        .exec(txn)
-                        .await?;
-                    if deleted.rows_affected != 1 {
-                        return Err(sea_orm::DbErr::RecordNotFound(format!(
-                            "multipart upload not found: {upload_id}"
-                        )));
-                    }
-                    Ok::<_, sea_orm::DbErr>(())
-                })
-            })
-            .await;
-
-        match result {
-            Ok(()) => return Ok(()),
-            Err(sea_orm::TransactionError::Transaction(db_err)) => {
-                let message = db_err.to_string().to_lowercase();
-                if (message.contains("unique") || message.contains("constraint"))
-                    && retry < MAX_RETRIES
-                {
-                    continue;
-                }
-                return Err(CommitCompletedUploadError::RolledBack {
-                    completion_attempt_id,
-                    source: AppError::from(db_err),
-                });
-            }
-            Err(sea_orm::TransactionError::Connection(db_err)) => {
-                return Err(CommitCompletedUploadError::OutcomeUnknown {
-                    completion_attempt_id,
-                    source: AppError::from(db_err),
-                });
-            }
-        }
-    }
-    unreachable!("retry loop exhausted without returning")
-}
-
 pub(crate) fn classify_completion_attempt_state(
     expected: &crate::store::object::LatestObjectRow,
     object: Option<&crate::store::entities::object::Model>,
@@ -247,29 +221,6 @@ pub(crate) fn classify_completion_attempt_state(
             upload.map_or("absent", |row| row.upload_id.as_str()),
         )))
     }
-}
-
-pub async fn reconcile_completion_attempt<C: ConnectionTrait>(
-    db: &C,
-    upload_id: &str,
-    expected: &crate::store::object::LatestObjectRow,
-) -> ReconciledCommitOutcome {
-    let object = match crate::store::entities::object::Entity::find_by_id(expected.id.clone())
-        .one(db)
-        .await
-    {
-        Ok(Some(object)) => object,
-        Ok(None) => return ReconciledCommitOutcome::NotCommitted,
-        Err(error) => return ReconciledCommitOutcome::Unknown(AppError::from(error)),
-    };
-    let upload = match multipart_upload::Entity::find_by_id(upload_id.to_owned())
-        .one(db)
-        .await
-    {
-        Ok(upload) => upload,
-        Err(error) => return ReconciledCommitOutcome::Unknown(AppError::from(error)),
-    };
-    classify_completion_attempt_state(expected, Some(&object), upload.as_ref())
 }
 
 #[cfg(test)]
@@ -340,6 +291,7 @@ mod tests {
             Some("v1:hmac-sha256:fixture"),
             Some("application/zip"),
             None,
+            &[],
             None,
             true,
         )
@@ -351,6 +303,75 @@ mod tests {
             upload.sse_c_key_fingerprint.as_deref(),
             Some("v1:hmac-sha256:fixture")
         );
+    }
+
+    #[tokio::test]
+    async fn create_upload_round_trips_normalized_tags() {
+        let db = setup().await;
+        let tags = vec![
+            crate::pinning::tags::ObjectTag::new("team", "R&D"),
+            crate::pinning::tags::ObjectTag::new("space", "hello world"),
+        ];
+
+        create_upload(
+            &db,
+            "upload-tags",
+            "object-tags",
+            "test-bucket",
+            "archive.zip",
+            "none",
+            None,
+            None,
+            Some("application/zip"),
+            None,
+            &tags,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let upload = get_upload(&db, "upload-tags").await.unwrap();
+        assert_eq!(
+            crate::store::pinning::tags::tags_from_json(&upload.tags_json).unwrap(),
+            tags
+        );
+    }
+
+    #[tokio::test]
+    async fn create_upload_rejects_invalid_tags_without_leaking_values() {
+        let db = setup().await;
+        let tags = vec![crate::pinning::tags::ObjectTag::new(
+            "ipfs-s3:unknown",
+            "sensitive-value",
+        )];
+
+        let error = create_upload(
+            &db,
+            "upload-invalid-tags",
+            "object-invalid-tags",
+            "test-bucket",
+            "archive.zip",
+            "none",
+            None,
+            None,
+            Some("application/zip"),
+            None,
+            &tags,
+            None,
+            true,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, AppError::Internal(ref message) if message == "failed to serialize multipart tags")
+        );
+        assert!(!format!("{error:?}").contains("sensitive-value"));
+        assert!(matches!(
+            get_upload(&db, "upload-invalid-tags").await,
+            Err(AppError::NoSuchUpload(_))
+        ));
     }
 
     #[tokio::test]
@@ -379,6 +400,7 @@ mod tests {
             None,
             Some("application/zip"),
             None,
+            &[],
             None,
             true,
         )
@@ -422,6 +444,7 @@ mod tests {
             None,
             Some("application/zip"),
             None,
+            &[],
             Some("prefix/"),
             false,
         )
@@ -445,6 +468,7 @@ mod tests {
             None,
             Some("application/zip"),
             None,
+            &[],
             None,
             true,
         )
@@ -504,55 +528,6 @@ mod tests {
         assert_eq!(get_part(&db, "upload-1", 1).await.unwrap(), original);
     }
 
-    #[tokio::test]
-    async fn commit_completed_upload_requires_exactly_one_upload_row() {
-        let db = setup().await;
-        crate::store::object::upsert(
-            &db,
-            "old-object",
-            "test-bucket",
-            "archive.zip",
-            "QmOld",
-            3,
-            Some("text/plain"),
-            "QmOld",
-            None,
-            false,
-            None,
-            None,
-            false,
-        )
-        .await
-        .unwrap();
-        let attempt = completion_attempt("attempt-missing-upload");
-
-        let error = commit_completed_upload(&db, "missing-upload", attempt.clone())
-            .await
-            .unwrap_err();
-
-        assert!(matches!(
-            error,
-            CommitCompletedUploadError::RolledBack {
-                ref completion_attempt_id,
-                ..
-            } if completion_attempt_id == "attempt-missing-upload"
-        ));
-        assert_eq!(
-            crate::store::object::get_latest(&db, "test-bucket", "archive.zip")
-                .await
-                .unwrap()
-                .id,
-            "old-object"
-        );
-        assert!(
-            crate::store::entities::object::Entity::find_by_id("attempt-missing-upload")
-                .one(&db)
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-
     #[test]
     fn unknown_commit_exact_attempt_and_missing_upload_is_committed() {
         let attempt = completion_attempt("attempt-1");
@@ -590,6 +565,7 @@ mod tests {
             sse_c_key_fingerprint: None,
             content_type: Some("application/zip".to_owned()),
             metadata: None,
+            tags_json: serde_json::json!([]),
             decompress_zip_target: None,
             decompress_zip_result: true,
         };
@@ -620,6 +596,7 @@ mod tests {
             sse_c_key_fingerprint: None,
             content_type: Some("application/zip".to_owned()),
             metadata: None,
+            tags_json: serde_json::json!([]),
             decompress_zip_target: None,
             decompress_zip_result: true,
         };

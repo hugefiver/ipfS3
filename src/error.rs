@@ -46,6 +46,9 @@ pub enum AppError {
     #[error("invalid zip entry: {0}")]
     InvalidZipEntry(String),
 
+    #[error("invalid pinning request: {0}")]
+    InvalidPinningRequest(String),
+
     #[error("zip entry escapes target prefix: {0}")]
     ZipSlip(String),
 
@@ -84,11 +87,13 @@ impl From<AppError> for S3Error {
             AppError::EntityTooSmall => s3_error!(EntityTooSmall, "{}", e),
             AppError::InvalidRange => s3_error!(InvalidRange, "{}", e),
             AppError::InvalidZipParameter(_) => s3_error!(InvalidArgument, "{}", e),
+            AppError::InvalidPinningRequest(_) => s3_error!(InvalidArgument, "{}", e),
             AppError::InvalidZipEntry(_)
             | AppError::ZipSlip(_)
             | AppError::UnsupportedZipEntry(_)
             | AppError::ZipArchiveRejected(_) => invalid_parameter_value(&e),
             AppError::AccessDenied(_) => s3_error!(AccessDenied, "{}", e),
+            AppError::Database(_) => s3_error!(InternalError, "internal database error"),
             _ => s3_error!(InternalError, "{}", e),
         }
     }
@@ -132,5 +137,13 @@ mod tests {
             assert_eq!(err.code().as_str(), "InvalidParameterValue");
             assert_eq!(err.status_code(), Some(http::StatusCode::BAD_REQUEST));
         }
+    }
+
+    #[test]
+    fn database_errors_map_to_a_stable_generic_internal_error() {
+        let err: S3Error = AppError::Database("private driver and query details".to_owned()).into();
+
+        assert_eq!(err.code().as_str(), "InternalError");
+        assert_eq!(err.message(), Some("internal database error"));
     }
 }

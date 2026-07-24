@@ -7,7 +7,13 @@ use s3s::dto::*;
 use s3s::{S3Request, S3Response, S3Result};
 
 use crate::crypto::EncryptionMode;
+use crate::pinning::config::ProviderLimitMap;
+use crate::pinning::policy::{PublicationContext, PublicationPolicy};
+use crate::pinning::tags::ObjectTag;
 use crate::state::AppState;
+use crate::store::pinning::publication::{
+    PinTargetSpec, PublicationObject, PublicationRequest, PublicationResult, ZipPublicationRequest,
+};
 
 use super::object::{
     ByteCounter, determine_encryption_mode, extract_custom_metadata, extract_sse_c_key,
@@ -32,6 +38,45 @@ fn parse_decompress_upload_options(uri: &http::Uri) -> S3Result<(Option<String>,
     Ok((target, result))
 }
 
+fn invalid_pinning_argument(message: &str) -> s3s::S3Error {
+    crate::error::AppError::InvalidPinningRequest(message.to_owned()).into()
+}
+
+fn parse_publication_tags(headers: &http::HeaderMap) -> S3Result<Vec<ObjectTag>> {
+    let mut values = headers.get_all("x-amz-tagging").iter();
+    let Some(header) = values.next() else {
+        return Ok(Vec::new());
+    };
+    if values.next().is_some() {
+        return Err(invalid_pinning_argument("duplicate x-amz-tagging header"));
+    }
+    let value = header
+        .to_str()
+        .map_err(|_| invalid_pinning_argument("invalid x-amz-tagging header"))?;
+    crate::pinning::tags::parse_tagging_header(value)
+        .map_err(|_| invalid_pinning_argument("invalid x-amz-tagging header"))
+}
+
+fn evaluate_publication_policy(
+    state: &Arc<AppState>,
+    bucket: &str,
+    key: &str,
+    tags: &[ObjectTag],
+    is_decompress_zip: bool,
+) -> S3Result<PublicationPolicy> {
+    state
+        .pinning
+        .policy()
+        .evaluate_publication(PublicationContext {
+            bucket,
+            key,
+            tags,
+            is_decompress_zip,
+        })
+        .map_err(crate::error::AppError::from)
+        .map_err(s3s::S3Error::from)
+}
+
 /// Initiate a multipart upload.
 ///
 /// Allocates a fresh `object_id` and `upload_id`, records the upload metadata
@@ -44,15 +89,18 @@ pub async fn create_multipart_upload(
     let bucket = &req.input.bucket;
     let key = &req.input.key;
     let content_type = req.input.content_type.clone();
-    let db = state.store.db();
+
+    let (decompress_zip_target, decompress_zip_result) = parse_decompress_upload_options(&req.uri)?;
+    let tags = parse_publication_tags(&req.headers)?;
+    evaluate_publication_policy(state, bucket, key, &tags, decompress_zip_target.is_some())?;
 
     // Validate the bucket exists.
+    let db = state.store.db();
     let exists = crate::store::bucket::exists(db, bucket).await?;
     if !exists {
         return Err(s3s::s3_error!(NoSuchBucket, "bucket not found: {}", bucket));
     }
 
-    let (decompress_zip_target, decompress_zip_result) = parse_decompress_upload_options(&req.uri)?;
     if decompress_zip_target.is_some()
         && [
             "x-amz-server-side-encryption",
@@ -103,6 +151,7 @@ pub async fn create_multipart_upload(
         sse_c_key_fingerprint.as_deref(),
         content_type.as_deref(),
         metadata,
+        &tags,
         decompress_zip_target.as_deref(),
         decompress_zip_result,
     )
@@ -348,6 +397,8 @@ pub async fn upload_part(
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompletedMultipartArchive {
+    pub tags: Vec<ObjectTag>,
+    pub publication_policy: PublicationPolicy,
     pub bucket: String,
     pub key: String,
     pub upload_id: String,
@@ -367,16 +418,24 @@ pub struct CompletedMultipartArchive {
 
 #[async_trait::async_trait]
 pub(crate) trait CompletedUploadFinalizerStore: Send + Sync {
-    async fn commit(
+    async fn commit_object(
         &self,
         upload_id: &str,
-        attempt: crate::store::object::LatestObjectRow,
-    ) -> Result<(), crate::store::multipart::CommitCompletedUploadError>;
+        request: PublicationRequest,
+        limits: &ProviderLimitMap,
+    ) -> Result<PublicationResult, crate::store::multipart::CommitCompletedUploadError>;
+
+    async fn commit_zip(
+        &self,
+        upload_id: &str,
+        request: ZipPublicationRequest,
+        limits: &ProviderLimitMap,
+    ) -> Result<PublicationResult, crate::store::multipart::CommitCompletedUploadError>;
 
     async fn reconcile(
         &self,
         upload_id: &str,
-        expected_attempt: &crate::store::object::LatestObjectRow,
+        expected_archive: &PublicationObject,
     ) -> crate::store::multipart::ReconciledCommitOutcome;
 }
 
@@ -386,58 +445,107 @@ struct DatabaseCompletedUploadFinalizer<'a> {
 
 #[async_trait::async_trait]
 impl CompletedUploadFinalizerStore for DatabaseCompletedUploadFinalizer<'_> {
-    async fn commit(
+    async fn commit_object(
         &self,
         upload_id: &str,
-        attempt: crate::store::object::LatestObjectRow,
-    ) -> Result<(), crate::store::multipart::CommitCompletedUploadError> {
-        crate::store::multipart::commit_completed_upload(self.db, upload_id, attempt).await
+        request: PublicationRequest,
+        limits: &ProviderLimitMap,
+    ) -> Result<PublicationResult, crate::store::multipart::CommitCompletedUploadError> {
+        crate::store::pinning::publication::publish_completed_upload(
+            self.db, upload_id, request, limits,
+        )
+        .await
+    }
+
+    async fn commit_zip(
+        &self,
+        upload_id: &str,
+        request: ZipPublicationRequest,
+        limits: &ProviderLimitMap,
+    ) -> Result<PublicationResult, crate::store::multipart::CommitCompletedUploadError> {
+        crate::store::pinning::publication::publish_completed_zip(
+            self.db, upload_id, request, limits,
+        )
+        .await
     }
 
     async fn reconcile(
         &self,
         upload_id: &str,
-        expected_attempt: &crate::store::object::LatestObjectRow,
+        expected_archive: &PublicationObject,
     ) -> crate::store::multipart::ReconciledCommitOutcome {
-        crate::store::multipart::reconcile_completion_attempt(self.db, upload_id, expected_attempt)
-            .await
+        crate::store::pinning::publication::reconcile_completed_publication(
+            self.db,
+            upload_id,
+            expected_archive,
+        )
+        .await
     }
 }
 
-pub async fn finalize_completed_multipart_archive(
+pub(crate) fn completed_publication_request(
+    completed: &CompletedMultipartArchive,
+) -> PublicationRequest {
+    PublicationRequest {
+        object: PublicationObject {
+            id: completed.completion_attempt_id.clone(),
+            bucket: completed.bucket.clone(),
+            key: completed.key.clone(),
+            cid: completed.root_cid.clone(),
+            logical_size: completed.total_size,
+            content_type: completed.content_type.clone(),
+            etag: completed.root_cid.clone(),
+            metadata: completed.metadata.clone(),
+            encrypted: completed.encrypted,
+            key_wrap: completed.key_wrap.clone(),
+            sse_c_key_fingerprint: completed.sse_c_key_fingerprint.clone(),
+            multipart: true,
+            created_at: chrono::Utc::now(),
+        },
+        tags: completed.tags.clone(),
+        policy: completed.publication_policy.clone(),
+        object_target: PinTargetSpec {
+            cid: completed.root_cid.clone(),
+            logical_size: completed.total_size,
+        },
+    }
+}
+
+pub async fn finalize_completed_multipart_zip(
     state: &Arc<AppState>,
     completed: &CompletedMultipartArchive,
-) -> S3Result<()> {
+    request: ZipPublicationRequest,
+) -> S3Result<PublicationResult> {
     let store = DatabaseCompletedUploadFinalizer {
         db: state.store.db(),
     };
-    finalize_completed_multipart_archive_with_store(completed, &store).await
+    finalize_completed_multipart_zip_with_store(
+        completed,
+        request,
+        state.pinning.provider_limits(),
+        &store,
+    )
+    .await
 }
 
-async fn finalize_completed_multipart_archive_with_store<
+pub(crate) async fn finalize_completed_multipart_zip_with_store<
     S: CompletedUploadFinalizerStore + ?Sized,
 >(
     completed: &CompletedMultipartArchive,
+    request: ZipPublicationRequest,
+    limits: &ProviderLimitMap,
     store: &S,
-) -> S3Result<()> {
-    let attempt = crate::store::object::LatestObjectRow {
-        id: completed.completion_attempt_id.clone(),
-        bucket: completed.bucket.clone(),
-        key: completed.key.clone(),
-        cid: completed.root_cid.clone(),
-        size: completed.total_size,
-        content_type: completed.content_type.clone(),
-        etag: completed.root_cid.clone(),
-        metadata: completed.metadata.clone(),
-        encrypted: completed.encrypted,
-        key_wrap: completed.key_wrap.clone(),
-        sse_c_key_fingerprint: completed.sse_c_key_fingerprint.clone(),
-        multipart: true,
-        created_at: chrono::Utc::now(),
-    };
+) -> S3Result<PublicationResult> {
+    if request.archive.object.id != completed.completion_attempt_id {
+        return Err(s3s::s3_error!(InternalError, "completion attempt mismatch"));
+    }
+    let expected_archive = request.archive.object.clone();
 
-    match store.commit(&completed.upload_id, attempt.clone()).await {
-        Ok(()) => Ok(()),
+    match store
+        .commit_zip(&completed.upload_id, request, limits)
+        .await
+    {
+        Ok(result) => Ok(result),
         Err(crate::store::multipart::CommitCompletedUploadError::RolledBack {
             completion_attempt_id,
             source,
@@ -454,12 +562,100 @@ async fn finalize_completed_multipart_archive_with_store<
             if completion_attempt_id != completed.completion_attempt_id {
                 return Err(s3s::s3_error!(InternalError, "completion attempt mismatch"));
             }
-            match store.reconcile(&completed.upload_id, &attempt).await {
+            match store
+                .reconcile(&completed.upload_id, &expected_archive)
+                .await
+            {
+                crate::store::multipart::ReconciledCommitOutcome::Committed => {
+                    Ok(PublicationResult {
+                        object_id: expected_archive.id,
+                    })
+                }
+                crate::store::multipart::ReconciledCommitOutcome::NotCommitted => {
+                    Err(source.into())
+                }
+                crate::store::multipart::ReconciledCommitOutcome::Unknown(reconcile_error) => {
+                    let source = bounded_diagnostic(&source);
+                    let reconcile_error = bounded_diagnostic(&reconcile_error);
+                    Err(s3s::s3_error!(
+                        InternalError,
+                        "commit outcome unknown ({source}); reconciliation failed ({reconcile_error})"
+                    ))
+                }
+            }
+        }
+    }
+}
+
+fn bounded_diagnostic(error: &impl std::fmt::Display) -> String {
+    const MAX_CHARS: usize = 512;
+    let diagnostic = error.to_string();
+    let mut chars = diagnostic.chars();
+    let bounded = chars.by_ref().take(MAX_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        format!("{bounded}…")
+    } else {
+        bounded
+    }
+}
+
+pub async fn finalize_completed_multipart_archive(
+    state: &Arc<AppState>,
+    completed: &CompletedMultipartArchive,
+) -> S3Result<()> {
+    let store = DatabaseCompletedUploadFinalizer {
+        db: state.store.db(),
+    };
+    finalize_completed_multipart_archive_with_store(
+        completed,
+        state.pinning.provider_limits(),
+        &store,
+    )
+    .await
+}
+
+async fn finalize_completed_multipart_archive_with_store<
+    S: CompletedUploadFinalizerStore + ?Sized,
+>(
+    completed: &CompletedMultipartArchive,
+    limits: &ProviderLimitMap,
+    store: &S,
+) -> S3Result<()> {
+    let request = completed_publication_request(completed);
+    let expected_archive = request.object.clone();
+
+    match store
+        .commit_object(&completed.upload_id, request, limits)
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(crate::store::multipart::CommitCompletedUploadError::RolledBack {
+            completion_attempt_id,
+            source,
+        }) => {
+            if completion_attempt_id != completed.completion_attempt_id {
+                return Err(s3s::s3_error!(InternalError, "completion attempt mismatch"));
+            }
+            Err(source.into())
+        }
+        Err(crate::store::multipart::CommitCompletedUploadError::OutcomeUnknown {
+            completion_attempt_id,
+            source,
+        }) => {
+            if completion_attempt_id != completed.completion_attempt_id {
+                return Err(s3s::s3_error!(InternalError, "completion attempt mismatch"));
+            }
+            match store
+                .reconcile(&completed.upload_id, &expected_archive)
+                .await
+            {
                 crate::store::multipart::ReconciledCommitOutcome::Committed => Ok(()),
                 crate::store::multipart::ReconciledCommitOutcome::NotCommitted => {
                     Err(source.into())
                 }
                 crate::store::multipart::ReconciledCommitOutcome::Unknown(reconcile_error) => {
+                    let source = bounded_diagnostic(&source);
+                    let reconcile_error = bounded_diagnostic(&reconcile_error);
                     Err(s3s::s3_error!(
                         InternalError,
                         "commit outcome unknown ({source}); reconciliation failed ({reconcile_error})"
@@ -545,6 +741,16 @@ pub async fn complete_multipart_upload_inner(
             "bucket/key mismatch for upload_id"
         ));
     }
+
+    let tags = crate::store::pinning::tags::tags_from_json(&upload.tags_json)
+        .map_err(|_| s3s::s3_error!(InternalError, "invalid persisted multipart upload tags"))?;
+    let publication_policy = evaluate_publication_policy(
+        state,
+        bucket,
+        key,
+        &tags,
+        upload.decompress_zip_target.is_some(),
+    )?;
 
     let enc_mode = EncryptionMode::parse(&upload.encryption_mode);
     let sse_c_key = match enc_mode {
@@ -730,6 +936,8 @@ pub async fn complete_multipart_upload_inner(
     };
 
     Ok(CompletedMultipartArchive {
+        tags,
+        publication_policy,
         bucket: bucket.clone(),
         key: key.clone(),
         upload_id: upload_id.clone(),
@@ -818,8 +1026,12 @@ pub async fn list_parts(
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use sea_orm::{ConnectionTrait, DatabaseBackend, EntityTrait, Statement};
+    use sea_orm::{
+        ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, PaginatorTrait, QueryFilter,
+        Statement,
+    };
     use std::collections::HashMap;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -830,6 +1042,7 @@ mod tests {
         OutcomeUnknown(String),
     }
 
+    #[derive(Clone, Copy)]
     enum FakeReconcileResult {
         Committed,
         NotCommitted,
@@ -839,7 +1052,25 @@ mod tests {
     struct FakeFinalizerStore {
         commit: FakeCommitResult,
         reconcile: FakeReconcileResult,
+        commit_calls: AtomicUsize,
         reconcile_calls: AtomicUsize,
+        committed_requests: Mutex<Vec<(String, PublicationRequest, ProviderLimitMap)>>,
+        committed_zip_requests: Mutex<Vec<(String, ZipPublicationRequest, ProviderLimitMap)>>,
+        reconciled_archives: Mutex<Vec<(String, PublicationObject)>>,
+    }
+
+    impl FakeFinalizerStore {
+        fn new(commit: FakeCommitResult, reconcile: FakeReconcileResult) -> Self {
+            Self {
+                commit,
+                reconcile,
+                commit_calls: AtomicUsize::new(0),
+                reconcile_calls: AtomicUsize::new(0),
+                committed_requests: Mutex::new(Vec::new()),
+                committed_zip_requests: Mutex::new(Vec::new()),
+                reconciled_archives: Mutex::new(Vec::new()),
+            }
+        }
     }
 
     struct BlockingUnknownFinalizerStore {
@@ -851,13 +1082,23 @@ mod tests {
 
     #[async_trait::async_trait]
     impl CompletedUploadFinalizerStore for FakeFinalizerStore {
-        async fn commit(
+        async fn commit_object(
             &self,
-            _upload_id: &str,
-            _attempt: crate::store::object::LatestObjectRow,
-        ) -> Result<(), crate::store::multipart::CommitCompletedUploadError> {
+            upload_id: &str,
+            request: PublicationRequest,
+            limits: &ProviderLimitMap,
+        ) -> Result<PublicationResult, crate::store::multipart::CommitCompletedUploadError>
+        {
+            self.commit_calls.fetch_add(1, Ordering::SeqCst);
+            self.committed_requests.lock().unwrap().push((
+                upload_id.to_owned(),
+                request.clone(),
+                limits.clone(),
+            ));
             match &self.commit {
-                FakeCommitResult::Ok => Ok(()),
+                FakeCommitResult::Ok => Ok(PublicationResult {
+                    object_id: request.object.id,
+                }),
                 FakeCommitResult::RolledBack(completion_attempt_id) => Err(
                     crate::store::multipart::CommitCompletedUploadError::RolledBack {
                         completion_attempt_id: completion_attempt_id.clone(),
@@ -877,10 +1118,14 @@ mod tests {
 
         async fn reconcile(
             &self,
-            _upload_id: &str,
-            _expected_attempt: &crate::store::object::LatestObjectRow,
+            upload_id: &str,
+            expected_archive: &PublicationObject,
         ) -> crate::store::multipart::ReconciledCommitOutcome {
             self.reconcile_calls.fetch_add(1, Ordering::SeqCst);
+            self.reconciled_archives
+                .lock()
+                .unwrap()
+                .push((upload_id.to_owned(), expected_archive.clone()));
             match self.reconcile {
                 FakeReconcileResult::Committed => {
                     crate::store::multipart::ReconciledCommitOutcome::Committed
@@ -890,26 +1135,65 @@ mod tests {
                 }
                 FakeReconcileResult::Unknown => {
                     crate::store::multipart::ReconciledCommitOutcome::Unknown(
-                        crate::error::AppError::Internal("forced query failure".to_owned()),
+                        crate::error::AppError::Internal(format!(
+                            "forced query failure {}",
+                            "q".repeat(2_000)
+                        )),
                     )
                 }
+            }
+        }
+
+        async fn commit_zip(
+            &self,
+            upload_id: &str,
+            request: ZipPublicationRequest,
+            limits: &ProviderLimitMap,
+        ) -> Result<PublicationResult, crate::store::multipart::CommitCompletedUploadError>
+        {
+            self.commit_calls.fetch_add(1, Ordering::SeqCst);
+            self.committed_zip_requests.lock().unwrap().push((
+                upload_id.to_owned(),
+                request.clone(),
+                limits.clone(),
+            ));
+            match &self.commit {
+                FakeCommitResult::Ok => Ok(PublicationResult {
+                    object_id: request.archive.object.id,
+                }),
+                FakeCommitResult::RolledBack(completion_attempt_id) => Err(
+                    crate::store::multipart::CommitCompletedUploadError::RolledBack {
+                        completion_attempt_id: completion_attempt_id.clone(),
+                        source: crate::error::AppError::Internal("forced rollback".to_owned()),
+                    },
+                ),
+                FakeCommitResult::OutcomeUnknown(completion_attempt_id) => Err(
+                    crate::store::multipart::CommitCompletedUploadError::OutcomeUnknown {
+                        completion_attempt_id: completion_attempt_id.clone(),
+                        source: crate::error::AppError::Internal(
+                            "forced unknown commit outcome".to_owned(),
+                        ),
+                    },
+                ),
             }
         }
     }
 
     #[async_trait::async_trait]
     impl CompletedUploadFinalizerStore for BlockingUnknownFinalizerStore {
-        async fn commit(
+        async fn commit_object(
             &self,
             _upload_id: &str,
-            attempt: crate::store::object::LatestObjectRow,
-        ) -> Result<(), crate::store::multipart::CommitCompletedUploadError> {
+            request: PublicationRequest,
+            _limits: &ProviderLimitMap,
+        ) -> Result<PublicationResult, crate::store::multipart::CommitCompletedUploadError>
+        {
             if let Some(signal) = self.commit_signal.lock().await.take() {
                 let _ = signal.send(());
             }
             Err(
                 crate::store::multipart::CommitCompletedUploadError::OutcomeUnknown {
-                    completion_attempt_id: attempt.id,
+                    completion_attempt_id: request.object.id,
                     source: crate::error::AppError::Internal(
                         "forced unknown commit outcome".to_owned(),
                     ),
@@ -920,7 +1204,7 @@ mod tests {
         async fn reconcile(
             &self,
             upload_id: &str,
-            expected_attempt: &crate::store::object::LatestObjectRow,
+            expected_archive: &PublicationObject,
         ) -> crate::store::multipart::ReconciledCommitOutcome {
             if let Some(signal) = self.reconcile_signal.lock().await.take() {
                 let _ = signal.send(());
@@ -928,12 +1212,32 @@ mod tests {
             if let Some(release) = self.release_reconcile.lock().await.take() {
                 let _ = release.await;
             }
-            crate::store::multipart::reconcile_completion_attempt(
+            crate::store::pinning::publication::reconcile_completed_publication(
                 &self.db,
                 upload_id,
-                expected_attempt,
+                expected_archive,
             )
             .await
+        }
+
+        async fn commit_zip(
+            &self,
+            _upload_id: &str,
+            request: ZipPublicationRequest,
+            _limits: &ProviderLimitMap,
+        ) -> Result<PublicationResult, crate::store::multipart::CommitCompletedUploadError>
+        {
+            if let Some(signal) = self.commit_signal.lock().await.take() {
+                let _ = signal.send(());
+            }
+            Err(
+                crate::store::multipart::CommitCompletedUploadError::OutcomeUnknown {
+                    completion_attempt_id: request.archive.object.id,
+                    source: crate::error::AppError::Internal(
+                        "forced unknown commit outcome".to_owned(),
+                    ),
+                },
+            )
         }
     }
 
@@ -949,11 +1253,139 @@ mod tests {
                 "0000000000000000000000000000000000000000000000000000000000000000",
             )
             .unwrap(),
+            pinning: crate::pinning::coordinator::PinningCoordinator::disabled_for_test(),
         })
     }
 
     async fn test_state_with_bucket(name: &str) -> Arc<AppState> {
         test_state_with_bucket_and_kubo(name, "http://127.0.0.1:5001".to_owned()).await
+    }
+
+    fn configured_pinning_coordinator(
+        trigger: &str,
+        provider_mode: &str,
+        prefix: &str,
+        allow_decompressed: bool,
+    ) -> Arc<crate::pinning::coordinator::PinningCoordinator> {
+        use crate::config::{PinningConfig, PolicyConfig, ProviderConfig};
+        use crate::pinning::config::ValidatedPinningConfig;
+
+        let provider = |name: &str, priority: u32| ProviderConfig {
+            name: name.to_owned(),
+            kind: "noop".to_owned(),
+            token_env: None,
+            endpoint: None,
+            enabled: true,
+            priority,
+            max_bytes: 10_000,
+            max_pins: 100,
+            requests_per_second: None,
+        };
+        let validated = ValidatedPinningConfig::from_raw(
+            &PinningConfig {
+                worker_interval: "5s".to_owned(),
+                worker_concurrency: 2,
+                providers: vec![provider("alpha", 1), provider("beta", 2)],
+                policies: vec![PolicyConfig {
+                    bucket: "test-bucket".to_owned(),
+                    prefix: prefix.to_owned(),
+                    trigger: trigger.to_owned(),
+                    provider_mode: provider_mode.to_owned(),
+                    providers: vec!["alpha".to_owned(), "beta".to_owned()],
+                    default_duration: "1h".to_owned(),
+                    max_duration: "24h".to_owned(),
+                    allow_decompressed,
+                }],
+            },
+            |_| None,
+        )
+        .unwrap();
+        crate::pinning::coordinator::PinningCoordinator::build(validated).unwrap()
+    }
+
+    async fn pinning_test_state(
+        kubo_uri: String,
+        trigger: &str,
+        provider_mode: &str,
+        prefix: &str,
+        allow_decompressed: bool,
+    ) -> Arc<AppState> {
+        let db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+        db.execute_unprepared("PRAGMA foreign_keys = ON")
+            .await
+            .unwrap();
+        crate::store::run_migrations(&db).await.unwrap();
+        crate::store::bucket::create(&db, "test-bucket", None)
+            .await
+            .unwrap();
+        Arc::new(AppState {
+            kubo: crate::kubo::KuboClient::new(kubo_uri),
+            store: crate::store::Store::new(db),
+            credentials: HashMap::new(),
+            master_key: crate::crypto::key::MasterKey::from_hex(
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            )
+            .unwrap(),
+            pinning: configured_pinning_coordinator(
+                trigger,
+                provider_mode,
+                prefix,
+                allow_decompressed,
+            ),
+        })
+    }
+
+    fn multipart_create_request_with_tagging(
+        bucket: &str,
+        key: &str,
+        tagging: &str,
+    ) -> S3Request<CreateMultipartUploadInput> {
+        let mut request = multipart_create_request(bucket, key);
+        request
+            .headers
+            .insert("x-amz-tagging", tagging.parse().unwrap());
+        request
+    }
+
+    async fn create_tagged_upload(state: &Arc<AppState>, key: &str, tagging: &str) -> String {
+        create_multipart_upload(
+            state,
+            multipart_create_request_with_tagging("test-bucket", key, tagging),
+        )
+        .await
+        .unwrap()
+        .output
+        .upload_id
+        .unwrap()
+    }
+
+    async fn pinning_row_counts(state: &Arc<AppState>) -> [u64; 5] {
+        use crate::store::entities::{
+            pin_job, pin_lease, pin_lease_target, pin_provider_usage, remote_pin,
+        };
+
+        [
+            pin_lease::Entity::find()
+                .count(state.store.db())
+                .await
+                .unwrap(),
+            pin_lease_target::Entity::find()
+                .count(state.store.db())
+                .await
+                .unwrap(),
+            remote_pin::Entity::find()
+                .count(state.store.db())
+                .await
+                .unwrap(),
+            pin_provider_usage::Entity::find()
+                .count(state.store.db())
+                .await
+                .unwrap(),
+            pin_job::Entity::find()
+                .count(state.store.db())
+                .await
+                .unwrap(),
+        ]
     }
 
     async fn file_backed_test_state_with_bucket_and_kubo(
@@ -979,6 +1411,7 @@ mod tests {
                 "0000000000000000000000000000000000000000000000000000000000000000",
             )
             .unwrap(),
+            pinning: crate::pinning::coordinator::PinningCoordinator::disabled_for_test(),
         })
     }
 
@@ -1028,6 +1461,7 @@ mod tests {
             None,
             Some("application/zip"),
             None,
+            &[],
             None,
             true,
         )
@@ -1160,7 +1594,13 @@ mod tests {
     }
 
     fn completed_archive(completion_attempt_id: &str) -> CompletedMultipartArchive {
+        let tags = vec![crate::pinning::tags::ObjectTag::new("team", "storage")];
         CompletedMultipartArchive {
+            tags: tags.clone(),
+            publication_policy: crate::pinning::policy::PublicationPolicy {
+                tags,
+                leases: Vec::new(),
+            },
             bucket: "test-bucket".to_owned(),
             key: "archive.zip".to_owned(),
             upload_id: "upload-1".to_owned(),
@@ -1179,24 +1619,119 @@ mod tests {
         }
     }
 
-    fn latest_attempt_for_archive(
-        archive: &CompletedMultipartArchive,
-    ) -> crate::store::object::LatestObjectRow {
-        crate::store::object::LatestObjectRow {
-            id: archive.completion_attempt_id.clone(),
-            bucket: archive.bucket.clone(),
-            key: archive.key.clone(),
-            cid: archive.root_cid.clone(),
-            size: archive.total_size,
-            content_type: archive.content_type.clone(),
-            etag: archive.root_cid.clone(),
-            metadata: archive.metadata.clone(),
-            encrypted: archive.encrypted,
-            key_wrap: archive.key_wrap.clone(),
-            sse_c_key_fingerprint: archive.sse_c_key_fingerprint.clone(),
-            multipart: true,
-            created_at: chrono::Utc::now(),
+    fn completed_zip_request(completed: &CompletedMultipartArchive) -> ZipPublicationRequest {
+        ZipPublicationRequest {
+            archive: completed_publication_request(completed),
+            entries: vec![
+                PublicationObject::from_put(
+                    "entry-a".to_owned(),
+                    &completed.bucket,
+                    "out/a.txt",
+                    "QmEntryA".to_owned(),
+                    3,
+                    None,
+                    None,
+                    false,
+                    None,
+                    None,
+                    chrono::Utc::now(),
+                ),
+                PublicationObject::from_put(
+                    "entry-b".to_owned(),
+                    &completed.bucket,
+                    "out/b.txt",
+                    "QmEntryB".to_owned(),
+                    4,
+                    None,
+                    None,
+                    false,
+                    None,
+                    None,
+                    chrono::Utc::now(),
+                ),
+            ],
         }
+    }
+
+    #[tokio::test]
+    async fn test_pinning_multipart_zip_outcome_unknown_reconciles_exact_attempt() {
+        let completed = completed_archive("completion-attempt-1");
+        let request = completed_zip_request(&completed);
+
+        for (reconcile, expected_success) in [
+            (FakeReconcileResult::Committed, true),
+            (FakeReconcileResult::NotCommitted, false),
+            (FakeReconcileResult::Unknown, false),
+        ] {
+            let store = FakeFinalizerStore::new(
+                FakeCommitResult::OutcomeUnknown("completion-attempt-1".to_owned()),
+                reconcile,
+            );
+
+            let result = finalize_completed_multipart_zip_with_store(
+                &completed,
+                request.clone(),
+                &no_provider_limits(),
+                &store,
+            )
+            .await;
+
+            assert_eq!(result.is_ok(), expected_success);
+            assert_eq!(store.commit_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(store.reconcile_calls.load(Ordering::SeqCst), 1);
+            assert!(store.committed_requests.lock().unwrap().is_empty());
+            let zip_requests = store.committed_zip_requests.lock().unwrap();
+            assert_eq!(zip_requests.len(), 1);
+            assert_eq!(zip_requests[0].0, "upload-1");
+            assert_eq!(zip_requests[0].1.archive.object.id, "completion-attempt-1");
+            drop(zip_requests);
+            let reconciled = store.reconciled_archives.lock().unwrap();
+            assert_eq!(reconciled.len(), 1);
+            assert_eq!(reconciled[0].0, "upload-1");
+            assert_eq!(reconciled[0].1.id, "completion-attempt-1");
+            match reconcile {
+                FakeReconcileResult::Committed => {
+                    assert_eq!(result.unwrap().object_id, "completion-attempt-1");
+                }
+                FakeReconcileResult::NotCommitted => {
+                    let error = result.unwrap_err();
+                    assert_eq!(error.code().as_str(), "InternalError");
+                    assert_eq!(
+                        error.message(),
+                        Some("internal error: forced unknown commit outcome")
+                    );
+                }
+                FakeReconcileResult::Unknown => {
+                    let error = result.unwrap_err();
+                    assert_eq!(error.code().as_str(), "InternalError");
+                    assert!(
+                        error
+                            .message()
+                            .is_some_and(|message| message.contains("reconciliation failed"))
+                    );
+                }
+            }
+        }
+
+        let mismatched =
+            FakeFinalizerStore::new(FakeCommitResult::Ok, FakeReconcileResult::Committed);
+        let mut mismatched_request = request;
+        mismatched_request.archive.object.id = "wrong-attempt".to_owned();
+        let error = finalize_completed_multipart_zip_with_store(
+            &completed,
+            mismatched_request,
+            &no_provider_limits(),
+            &mismatched,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code().as_str(), "InternalError");
+        assert_eq!(mismatched.commit_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(mismatched.reconcile_calls.load(Ordering::SeqCst), 0);
+    }
+
+    fn no_provider_limits() -> ProviderLimitMap {
+        ProviderLimitMap::new()
     }
 
     async fn assert_pin_add_count(kubo: &MockServer, cid: &str, expected: usize) {
@@ -1738,6 +2273,7 @@ mod tests {
             None,
             Some("application/zip"),
             Some(serde_json::json!({"source": "multipart"})),
+            &[],
             Some("prefix/"),
             false,
         )
@@ -1851,6 +2387,7 @@ mod tests {
             store: crate::store::Store::new(db),
             credentials: HashMap::new(),
             master_key,
+            pinning: crate::pinning::coordinator::PinningCoordinator::disabled_for_test(),
         });
         crate::store::multipart::create_upload(
             state.store.db(),
@@ -1863,6 +2400,7 @@ mod tests {
             None,
             Some("application/zip"),
             None,
+            &[],
             None,
             true,
         )
@@ -2061,110 +2599,162 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn outcome_unknown_committed_reconciliation_succeeds_without_pin_removal() {
+    async fn pinning_finalizer_outcome_unknown_committed_reconciles_full_request_once() {
         let kubo = MockServer::start().await;
         let archive = completed_archive("attempt-1");
-        let store = FakeFinalizerStore {
-            commit: FakeCommitResult::OutcomeUnknown("attempt-1".to_owned()),
-            reconcile: FakeReconcileResult::Committed,
-            reconcile_calls: AtomicUsize::new(0),
-        };
+        let store = FakeFinalizerStore::new(
+            FakeCommitResult::OutcomeUnknown("attempt-1".to_owned()),
+            FakeReconcileResult::Committed,
+        );
 
-        finalize_completed_multipart_archive_with_store(&archive, &store)
+        finalize_completed_multipart_archive_with_store(&archive, &no_provider_limits(), &store)
             .await
             .unwrap();
 
+        assert_eq!(store.commit_calls.load(Ordering::SeqCst), 1);
         assert_eq!(store.reconcile_calls.load(Ordering::SeqCst), 1);
+        {
+            let requests = store.committed_requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].0, "upload-1");
+            assert_eq!(requests[0].1.object.id, "attempt-1");
+            assert_eq!(requests[0].1.object.bucket, archive.bucket);
+            assert_eq!(requests[0].1.object.key, archive.key);
+            assert_eq!(requests[0].1.object.cid, "QmRoot");
+            assert_eq!(requests[0].1.object.logical_size, archive.total_size);
+            assert_eq!(requests[0].1.object.content_type, archive.content_type);
+            assert_eq!(requests[0].1.object.etag, archive.root_cid);
+            assert_eq!(requests[0].1.object.metadata, archive.metadata);
+            assert_eq!(requests[0].1.object.encrypted, archive.encrypted);
+            assert_eq!(requests[0].1.object.key_wrap, archive.key_wrap);
+            assert_eq!(
+                requests[0].1.object.sse_c_key_fingerprint,
+                archive.sse_c_key_fingerprint
+            );
+            assert!(requests[0].1.object.multipart);
+            assert_eq!(requests[0].1.tags, archive.tags);
+            assert_eq!(requests[0].1.policy, archive.publication_policy);
+            assert_eq!(requests[0].1.object_target.cid, archive.root_cid);
+            assert_eq!(requests[0].1.object_target.logical_size, archive.total_size);
+            assert!(requests[0].2.is_empty());
+        }
+        {
+            let reconciled = store.reconciled_archives.lock().unwrap();
+            assert_eq!(reconciled.len(), 1);
+            assert_eq!(reconciled[0].0, "upload-1");
+            assert_eq!(reconciled[0].1.id, "attempt-1");
+        }
         assert_no_pin_removes(&kubo, &["QmRoot", "QmPart"]).await;
     }
 
     #[tokio::test]
-    async fn finalizer_direct_commit_and_rollback_do_not_reconcile_or_remove_pins() {
+    async fn pinning_finalizer_success_and_rolled_back_preserve_decision_table() {
         let kubo = MockServer::start().await;
         let archive = completed_archive("attempt-1");
-        let committed = FakeFinalizerStore {
-            commit: FakeCommitResult::Ok,
-            reconcile: FakeReconcileResult::Unknown,
-            reconcile_calls: AtomicUsize::new(0),
-        };
-        finalize_completed_multipart_archive_with_store(&archive, &committed)
-            .await
-            .unwrap();
+        let committed = FakeFinalizerStore::new(FakeCommitResult::Ok, FakeReconcileResult::Unknown);
+        finalize_completed_multipart_archive_with_store(
+            &archive,
+            &no_provider_limits(),
+            &committed,
+        )
+        .await
+        .unwrap();
+        assert_eq!(committed.commit_calls.load(Ordering::SeqCst), 1);
         assert_eq!(committed.reconcile_calls.load(Ordering::SeqCst), 0);
 
-        let rolled_back = FakeFinalizerStore {
-            commit: FakeCommitResult::RolledBack("attempt-1".to_owned()),
-            reconcile: FakeReconcileResult::Unknown,
-            reconcile_calls: AtomicUsize::new(0),
-        };
-        let error = finalize_completed_multipart_archive_with_store(&archive, &rolled_back)
-            .await
-            .unwrap_err();
+        let rolled_back = FakeFinalizerStore::new(
+            FakeCommitResult::RolledBack("attempt-1".to_owned()),
+            FakeReconcileResult::Unknown,
+        );
+        let error = finalize_completed_multipart_archive_with_store(
+            &archive,
+            &no_provider_limits(),
+            &rolled_back,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(error.code().as_str(), "InternalError");
+        assert_eq!(rolled_back.commit_calls.load(Ordering::SeqCst), 1);
         assert_eq!(rolled_back.reconcile_calls.load(Ordering::SeqCst), 0);
         assert_no_pin_removes(&kubo, &["QmRoot", "QmPart"]).await;
     }
 
     #[tokio::test]
-    async fn outcome_unknown_not_committed_returns_error_without_pin_removal() {
+    async fn pinning_finalizer_outcome_unknown_not_committed_returns_original_error() {
         let kubo = MockServer::start().await;
         let archive = completed_archive("attempt-1");
-        let store = FakeFinalizerStore {
-            commit: FakeCommitResult::OutcomeUnknown("attempt-1".to_owned()),
-            reconcile: FakeReconcileResult::NotCommitted,
-            reconcile_calls: AtomicUsize::new(0),
-        };
+        let store = FakeFinalizerStore::new(
+            FakeCommitResult::OutcomeUnknown("attempt-1".to_owned()),
+            FakeReconcileResult::NotCommitted,
+        );
 
-        let error = finalize_completed_multipart_archive_with_store(&archive, &store)
-            .await
-            .unwrap_err();
+        let error = finalize_completed_multipart_archive_with_store(
+            &archive,
+            &no_provider_limits(),
+            &store,
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(error.code().as_str(), "InternalError");
+        assert!(error.to_string().contains("forced unknown commit outcome"));
+        assert_eq!(store.commit_calls.load(Ordering::SeqCst), 1);
         assert_eq!(store.reconcile_calls.load(Ordering::SeqCst), 1);
         assert_no_pin_removes(&kubo, &["QmRoot", "QmPart"]).await;
     }
 
     #[tokio::test]
-    async fn outcome_unknown_query_failure_returns_error_without_pin_removal() {
+    async fn pinning_finalizer_outcome_unknown_query_failure_reports_bounded_diagnostics() {
         let kubo = MockServer::start().await;
         let archive = completed_archive("attempt-1");
-        let store = FakeFinalizerStore {
-            commit: FakeCommitResult::OutcomeUnknown("attempt-1".to_owned()),
-            reconcile: FakeReconcileResult::Unknown,
-            reconcile_calls: AtomicUsize::new(0),
-        };
+        let store = FakeFinalizerStore::new(
+            FakeCommitResult::OutcomeUnknown("attempt-1".to_owned()),
+            FakeReconcileResult::Unknown,
+        );
 
-        let error = finalize_completed_multipart_archive_with_store(&archive, &store)
-            .await
-            .unwrap_err();
+        let error = finalize_completed_multipart_archive_with_store(
+            &archive,
+            &no_provider_limits(),
+            &store,
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(error.code().as_str(), "InternalError");
+        assert!(error.to_string().contains("forced unknown commit outcome"));
+        assert!(error.to_string().contains("forced query failure"));
         assert!(error.to_string().contains("reconciliation failed"));
+        assert!(error.to_string().len() < 1_200);
+        assert_eq!(store.commit_calls.load(Ordering::SeqCst), 1);
         assert_eq!(store.reconcile_calls.load(Ordering::SeqCst), 1);
         assert_no_pin_removes(&kubo, &["QmRoot", "QmPart"]).await;
     }
 
     #[tokio::test]
-    async fn finalizer_rejects_error_for_different_completion_attempt() {
+    async fn pinning_finalizer_rejects_error_for_different_completion_attempt() {
         let kubo = MockServer::start().await;
         let archive = completed_archive("attempt-1");
-        let store = FakeFinalizerStore {
-            commit: FakeCommitResult::OutcomeUnknown("other-attempt".to_owned()),
-            reconcile: FakeReconcileResult::Committed,
-            reconcile_calls: AtomicUsize::new(0),
-        };
+        let store = FakeFinalizerStore::new(
+            FakeCommitResult::OutcomeUnknown("other-attempt".to_owned()),
+            FakeReconcileResult::Committed,
+        );
 
-        let error = finalize_completed_multipart_archive_with_store(&archive, &store)
-            .await
-            .unwrap_err();
+        let error = finalize_completed_multipart_archive_with_store(
+            &archive,
+            &no_provider_limits(),
+            &store,
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(error.code().as_str(), "InternalError");
+        assert_eq!(store.commit_calls.load(Ordering::SeqCst), 1);
         assert_eq!(store.reconcile_calls.load(Ordering::SeqCst), 0);
         assert_no_pin_removes(&kubo, &["QmRoot", "QmPart"]).await;
     }
 
     #[tokio::test]
-    async fn finalize_delete_trigger_reports_rolled_back_and_keeps_all_pins() {
+    async fn pinning_finalize_delete_trigger_reports_rolled_back_and_keeps_all_pins() {
         let kubo = multipart_kubo(&["QmRootFirst", "QmRootRetry"]).await;
         Mock::given(method("POST"))
             .and(path("/api/v0/cat"))
@@ -2216,20 +2806,6 @@ mod tests {
             .await
             .unwrap();
 
-        let store_error = crate::store::multipart::commit_completed_upload(
-            state.store.db(),
-            "upload-1",
-            latest_attempt_for_archive(&first),
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(
-            store_error,
-            crate::store::multipart::CommitCompletedUploadError::RolledBack {
-                ref completion_attempt_id,
-                ..
-            } if completion_attempt_id == &first.completion_attempt_id
-        ));
         let finalize_error = finalize_completed_multipart_archive(&state, &first)
             .await
             .unwrap_err();
@@ -2332,7 +2908,12 @@ mod tests {
         let a_task = tokio::spawn({
             let store = a_store.clone();
             async move {
-                finalize_completed_multipart_archive_with_store(&archive_a, store.as_ref()).await
+                finalize_completed_multipart_archive_with_store(
+                    &archive_a,
+                    &no_provider_limits(),
+                    store.as_ref(),
+                )
+                .await
             }
         });
         commit_rx.await.unwrap();
@@ -2446,5 +3027,448 @@ mod tests {
         );
         assert_pin_add_count(&kubo, "QmRoot", 2).await;
         assert_no_pin_removes(&kubo, &["QmRoot", "QmPart"]).await;
+    }
+
+    #[tokio::test]
+    async fn pinning_create_persists_normalized_tags_before_any_part_publication() {
+        let kubo = multipart_kubo(&[]).await;
+        let state = pinning_test_state(kubo.uri(), "request", "one", "", false).await;
+
+        let upload_id = create_tagged_upload(
+            &state,
+            "archive.zip",
+            "team=storage&ipfs-s3%3Apin=true&space=hello+world",
+        )
+        .await;
+        let upload = crate::store::multipart::get_upload(state.store.db(), &upload_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            crate::store::pinning::tags::tags_from_json(&upload.tags_json).unwrap(),
+            vec![
+                crate::pinning::tags::ObjectTag::new("team", "storage"),
+                crate::pinning::tags::ObjectTag::new("ipfs-s3:pin", "true"),
+                crate::pinning::tags::ObjectTag::new("space", "hello world"),
+            ]
+        );
+        assert_eq!(pinning_row_counts(&state).await, [0; 5]);
+        assert!(kubo.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pinning_create_rejects_invalid_controls_before_database_or_kubo_work() {
+        let kubo = multipart_kubo(&[]).await;
+        let state = pinning_test_state(kubo.uri(), "request", "one", "", false).await;
+        let cases = [
+            (
+                "ipfs-s3%3Apin=true&ipfs-s3%3Aretain-until=2026-08-01T00%3A00%3A00Z",
+                None,
+            ),
+            ("ipfs-s3%3Apin=true&ipfs-s3%3Aduration=25h", None),
+            ("ipfs-s3%3Apin=true&ipfs-s3%3Acontent=decompressed", None),
+            (
+                "ipfs-s3%3Apin=true&ipfs-s3%3Acontent=decompressed",
+                Some("/test-bucket/archive.zip?uploads=&decompress-zip=prefix%2F"),
+            ),
+            ("ipfs-s3%3Aunknown=sensitive-control-value", None),
+        ];
+
+        for (tagging, uri) in cases {
+            let mut request =
+                multipart_create_request_with_tagging("test-bucket", "archive.zip", tagging);
+            if let Some(uri) = uri {
+                request.uri = uri.parse().unwrap();
+            }
+            let error = create_multipart_upload(&state, request).await.unwrap_err();
+            assert_eq!(error.code().as_str(), "InvalidArgument");
+            assert!(!error.to_string().contains("sensitive-control-value"));
+        }
+
+        let no_match = pinning_test_state(kubo.uri(), "request", "one", "allowed/", true).await;
+        let error = create_multipart_upload(
+            &no_match,
+            multipart_create_request_with_tagging(
+                "test-bucket",
+                "archive.zip",
+                "ipfs-s3%3Apin=true",
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code().as_str(), "InvalidArgument");
+        assert_eq!(
+            crate::store::entities::multipart_upload::Entity::find()
+                .count(no_match.store.db())
+                .await
+                .unwrap(),
+            0
+        );
+
+        assert_eq!(
+            crate::store::entities::multipart_upload::Entity::find()
+                .count(state.store.db())
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(pinning_row_counts(&state).await, [0; 5]);
+        assert!(kubo.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pinning_create_accepts_decompressed_control_only_with_allowed_zip_context() {
+        let kubo = multipart_kubo(&[]).await;
+        let state = pinning_test_state(kubo.uri(), "request", "one", "", true).await;
+        let mut request = multipart_create_request_with_tagging(
+            "test-bucket",
+            "archive.zip",
+            "ipfs-s3%3Apin=true&ipfs-s3%3Acontent=decompressed",
+        );
+        request.uri = "/test-bucket/archive.zip?uploads=&decompress-zip=prefix%2F"
+            .parse()
+            .unwrap();
+
+        let upload_id = create_multipart_upload(&state, request)
+            .await
+            .unwrap()
+            .output
+            .upload_id
+            .unwrap();
+        let upload = crate::store::multipart::get_upload(state.store.db(), &upload_id)
+            .await
+            .unwrap();
+        assert_eq!(upload.decompress_zip_target.as_deref(), Some("prefix/"));
+        assert_eq!(
+            crate::store::pinning::tags::tags_from_json(&upload.tags_json).unwrap(),
+            vec![
+                crate::pinning::tags::ObjectTag::new("ipfs-s3:pin", "true"),
+                crate::pinning::tags::ObjectTag::new("ipfs-s3:content", "decompressed"),
+            ]
+        );
+        assert_eq!(pinning_row_counts(&state).await, [0; 5]);
+        assert!(kubo.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn upload_part_pinning_rows_remain_empty_and_abort_never_remotely_unpins() {
+        let kubo = multipart_kubo(&["QmPart"]).await;
+        let state = pinning_test_state(kubo.uri(), "request", "one", "", false).await;
+        let upload_id =
+            create_tagged_upload(&state, "archive.zip", "team=storage&ipfs-s3%3Apin=true").await;
+
+        upload_part(&state, upload_part_request(&upload_id, b"part"))
+            .await
+            .unwrap();
+        assert_eq!(pinning_row_counts(&state).await, [0; 5]);
+
+        abort_multipart_upload(&state, abort_request(&upload_id))
+            .await
+            .unwrap();
+        assert_eq!(pinning_row_counts(&state).await, [0; 5]);
+        assert_no_pin_removes(&kubo, &["QmPart"]).await;
+    }
+
+    #[tokio::test]
+    async fn pinning_complete_atomically_publishes_all_mode_from_commit_time() {
+        use crate::store::entities::{pin_job, pin_lease, pin_lease_target, pin_provider_usage};
+
+        let kubo = multipart_kubo(&["QmRoot"]).await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/cat"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"part data"))
+            .mount(&kubo)
+            .await;
+        let state = pinning_test_state(kubo.uri(), "request", "all", "", false).await;
+        let upload_id = create_tagged_upload(
+            &state,
+            "archive.zip",
+            "team=storage&ipfs-s3%3Apin=true&ipfs-s3%3Aduration=1h",
+        )
+        .await;
+        let upload_created_at = crate::store::multipart::get_upload(state.store.db(), &upload_id)
+            .await
+            .unwrap()
+            .created_at;
+        crate::store::multipart::upsert_part(
+            state.store.db(),
+            &upload_id,
+            1,
+            "QmPart",
+            9,
+            "QmPart",
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        complete_multipart_upload(&state, complete_request(&upload_id, "QmPart"))
+            .await
+            .unwrap();
+
+        let object =
+            crate::store::object::get_latest(state.store.db(), "test-bucket", "archive.zip")
+                .await
+                .unwrap();
+        uuid::Uuid::parse_str(&object.id).unwrap();
+        assert!(object.multipart);
+        assert_eq!(object.cid, "QmRoot");
+        assert_eq!(
+            crate::store::pinning::tags::list_object_tags(state.store.db(), &object.id)
+                .await
+                .unwrap(),
+            vec![
+                crate::pinning::tags::ObjectTag::new("ipfs-s3:duration", "1h"),
+                crate::pinning::tags::ObjectTag::new("ipfs-s3:pin", "true"),
+                crate::pinning::tags::ObjectTag::new("team", "storage"),
+            ]
+        );
+        let lease = pin_lease::Entity::find()
+            .filter(pin_lease::Column::OwnerObjectId.eq(&object.id))
+            .one(state.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(lease.created_at > upload_created_at);
+        assert_eq!((lease.expires_at - lease.created_at).num_seconds(), 3_600);
+        assert_eq!(
+            pin_lease_target::Entity::find()
+                .filter(pin_lease_target::Column::LeaseId.eq(&lease.id))
+                .count(state.store.db())
+                .await
+                .unwrap(),
+            2
+        );
+        for provider in ["alpha", "beta"] {
+            let usage = pin_provider_usage::Entity::find_by_id(provider)
+                .one(state.store.db())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!((usage.reserved_bytes, usage.reserved_pins), (9, 1));
+        }
+        assert_eq!(
+            pin_job::Entity::find()
+                .filter(pin_job::Column::Operation.eq("submit"))
+                .count(state.store.db())
+                .await
+                .unwrap(),
+            2
+        );
+        assert!(
+            crate::store::multipart::get_upload(state.store.db(), &upload_id)
+                .await
+                .is_err()
+        );
+        assert!(
+            crate::store::multipart::list_parts(state.store.db(), &upload_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_pin_add_count(&kubo, "QmRoot", 1).await;
+        assert_no_pin_removes(&kubo, &["QmRoot", "QmPart"]).await;
+    }
+
+    #[tokio::test]
+    async fn pinning_complete_lease_or_job_failure_rolls_back_every_database_change() {
+        for (failure, trigger) in [
+            (
+                "lease",
+                "CREATE TRIGGER fail_complete_publication BEFORE INSERT ON pin_leases BEGIN SELECT RAISE(FAIL, 'forced lease failure'); END;",
+            ),
+            (
+                "job",
+                "CREATE TRIGGER fail_complete_publication BEFORE INSERT ON pin_jobs BEGIN SELECT RAISE(FAIL, 'forced job failure'); END;",
+            ),
+        ] {
+            let kubo = multipart_kubo(&["QmRoot"]).await;
+            Mock::given(method("POST"))
+                .and(path("/api/v0/cat"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"part data"))
+                .mount(&kubo)
+                .await;
+            let state = pinning_test_state(kubo.uri(), "request", "one", "", false).await;
+            crate::store::object::upsert(
+                state.store.db(),
+                "old-object",
+                "test-bucket",
+                "archive.zip",
+                "QmOld",
+                3,
+                Some("text/plain"),
+                "QmOld",
+                None,
+                false,
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+            let upload_id =
+                create_tagged_upload(&state, "archive.zip", "team=storage&ipfs-s3%3Apin=true")
+                    .await;
+            crate::store::multipart::upsert_part(
+                state.store.db(),
+                &upload_id,
+                1,
+                "QmPart",
+                9,
+                "QmPart",
+            )
+            .await
+            .unwrap();
+            state.store.db().execute_unprepared(trigger).await.unwrap();
+
+            let error = complete_multipart_upload(&state, complete_request(&upload_id, "QmPart"))
+                .await
+                .unwrap_err();
+
+            assert_eq!(error.code().as_str(), "InternalError", "{failure}");
+            assert_eq!(
+                crate::store::object::get_latest(state.store.db(), "test-bucket", "archive.zip",)
+                    .await
+                    .unwrap()
+                    .id,
+                "old-object",
+                "{failure}"
+            );
+            assert!(
+                crate::store::multipart::get_upload(state.store.db(), &upload_id)
+                    .await
+                    .is_ok(),
+                "{failure}"
+            );
+            assert_eq!(
+                crate::store::multipart::list_parts(state.store.db(), &upload_id)
+                    .await
+                    .unwrap()
+                    .len(),
+                1,
+                "{failure}"
+            );
+            assert_eq!(pinning_row_counts(&state).await, [0; 5], "{failure}");
+            assert_eq!(
+                crate::store::entities::object::Entity::find()
+                    .count(state.store.db())
+                    .await
+                    .unwrap(),
+                1,
+                "{failure}"
+            );
+            assert_eq!(
+                crate::store::entities::object_tag::Entity::find()
+                    .count(state.store.db())
+                    .await
+                    .unwrap(),
+                0,
+                "{failure}"
+            );
+            assert_no_pin_removes(&kubo, &["QmRoot", "QmPart"]).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn pinning_complete_overwrite_ends_previous_leases() {
+        use crate::pinning::policy::PublicationContext;
+        use crate::store::entities::{pin_lease, pin_lease_target};
+        use crate::store::pinning::publication::{
+            PinTargetSpec, PublicationObject, PublicationRequest,
+        };
+
+        let kubo = multipart_kubo(&["QmRoot"]).await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/cat"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"part data"))
+            .mount(&kubo)
+            .await;
+        let state = pinning_test_state(kubo.uri(), "request", "one", "", false).await;
+        let old_tags = vec![crate::pinning::tags::ObjectTag::new("ipfs-s3:pin", "true")];
+        let old_policy = state
+            .pinning
+            .policy()
+            .evaluate_publication(PublicationContext {
+                bucket: "test-bucket",
+                key: "archive.zip",
+                tags: &old_tags,
+                is_decompress_zip: false,
+            })
+            .unwrap();
+        crate::store::pinning::publication::publish_object(
+            state.store.db(),
+            PublicationRequest {
+                object: PublicationObject::from_put(
+                    "old-object".to_owned(),
+                    "test-bucket",
+                    "archive.zip",
+                    "QmOld".to_owned(),
+                    3,
+                    Some("text/plain".to_owned()),
+                    None,
+                    false,
+                    None,
+                    None,
+                    chrono::Utc::now(),
+                ),
+                tags: old_policy.tags.clone(),
+                policy: old_policy,
+                object_target: PinTargetSpec {
+                    cid: "QmOld".to_owned(),
+                    logical_size: 3,
+                },
+            },
+            state.pinning.provider_limits(),
+        )
+        .await
+        .unwrap();
+        let upload_id =
+            create_tagged_upload(&state, "archive.zip", "ipfs-s3%3Apin=true&team=new").await;
+        crate::store::multipart::upsert_part(
+            state.store.db(),
+            &upload_id,
+            1,
+            "QmPart",
+            9,
+            "QmPart",
+        )
+        .await
+        .unwrap();
+
+        complete_multipart_upload(&state, complete_request(&upload_id, "QmPart"))
+            .await
+            .unwrap();
+
+        let old_lease = pin_lease::Entity::find()
+            .filter(pin_lease::Column::OwnerObjectId.eq("old-object"))
+            .one(state.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(old_lease.state, "cancelled");
+        assert_eq!(old_lease.generation, 2);
+        assert!(
+            pin_lease_target::Entity::find()
+                .filter(pin_lease_target::Column::LeaseId.eq(&old_lease.id))
+                .all(state.store.db())
+                .await
+                .unwrap()
+                .iter()
+                .all(|target| target.state == "released")
+        );
+        let latest =
+            crate::store::object::get_latest(state.store.db(), "test-bucket", "archive.zip")
+                .await
+                .unwrap();
+        assert_eq!(
+            pin_lease::Entity::find()
+                .filter(pin_lease::Column::OwnerObjectId.eq(latest.id))
+                .filter(pin_lease::Column::State.eq("active"))
+                .count(state.store.db())
+                .await
+                .unwrap(),
+            1
+        );
+        assert_no_pin_removes(&kubo, &["QmOld", "QmRoot", "QmPart"]).await;
     }
 }

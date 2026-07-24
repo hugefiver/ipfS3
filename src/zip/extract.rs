@@ -383,6 +383,7 @@ mod tests {
                 "0000000000000000000000000000000000000000000000000000000000000000",
             )
             .unwrap(),
+            pinning: crate::pinning::coordinator::PinningCoordinator::disabled_for_test(),
         })
     }
 
