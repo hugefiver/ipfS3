@@ -6,11 +6,12 @@ use tokio::sync::{Mutex, RwLock, Semaphore};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+use crate::kubo::KuboClient;
 use crate::pinning::{
     config::{ProviderKind, ProviderLimitMap, ValidatedPinningConfig},
     filebase::build_filebase,
     noop::NoopProvider,
-    pinata::build_pinata,
+    pinata::build_pinata_with_options,
     policy::PinPolicyEvaluator,
     provider::PinningProvider,
 };
@@ -59,6 +60,13 @@ pub struct ProviderRuntime {
 
 impl PinningCoordinator {
     pub fn build(config: ValidatedPinningConfig) -> anyhow::Result<Arc<Self>> {
+        Self::build_with_kubo(config, None)
+    }
+
+    pub fn build_with_kubo(
+        config: ValidatedPinningConfig,
+        kubo: Option<KuboClient>,
+    ) -> anyhow::Result<Arc<Self>> {
         let claim_limit = config
             .worker_concurrency
             .checked_mul(2)
@@ -105,12 +113,16 @@ impl PinningCoordinator {
                 },
             );
             let implementation: Arc<dyn PinningProvider> = match provider.kind {
-                ProviderKind::Pinata => Arc::new(build_pinata(
+                ProviderKind::Pinata => Arc::new(build_pinata_with_options(
                     provider.name,
                     provider
                         .token
                         .context("validated Pinata provider is missing its token")?,
                     provider.endpoint,
+                    provider
+                        .pinata
+                        .context("validated Pinata provider is missing its options")?,
+                    kubo.clone(),
                 )),
                 ProviderKind::Filebase => Arc::new(build_filebase(
                     provider.name,
@@ -276,6 +288,9 @@ mod tests {
                     kind: "noop".to_owned(),
                     token_env: None,
                     endpoint: None,
+                    api: None,
+                    strategy: None,
+                    upload_endpoint: None,
                     enabled: true,
                     priority: 1,
                     max_bytes: 1_000,
@@ -371,6 +386,9 @@ mod tests {
                         kind: "pinata".to_owned(),
                         token_env: Some("PINATA_TOKEN".to_owned()),
                         endpoint: None,
+                        api: None,
+                        strategy: None,
+                        upload_endpoint: None,
                         enabled: true,
                         priority: 2,
                         max_bytes: 1_000,
@@ -382,6 +400,9 @@ mod tests {
                         kind: "filebase".to_owned(),
                         token_env: Some("FILEBASE_TOKEN".to_owned()),
                         endpoint: None,
+                        api: None,
+                        strategy: None,
+                        upload_endpoint: None,
                         enabled: true,
                         priority: 3,
                         max_bytes: 1_000,
@@ -418,6 +439,9 @@ mod tests {
             kind: "noop".to_owned(),
             token_env: None,
             endpoint: None,
+            api: None,
+            strategy: None,
+            upload_endpoint: None,
             enabled,
             priority,
             max_bytes: 1_000,

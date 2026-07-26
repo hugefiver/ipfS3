@@ -101,6 +101,9 @@ pub struct ProviderConfig {
     pub kind: String,
     pub token_env: Option<String>,
     pub endpoint: Option<String>,
+    pub api: Option<String>,
+    pub strategy: Option<String>,
+    pub upload_endpoint: Option<String>,
     #[serde(default = "enabled")]
     pub enabled: bool,
     pub priority: u32,

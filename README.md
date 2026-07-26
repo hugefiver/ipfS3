@@ -119,8 +119,17 @@ legitimately produce no remote work when no rule or manual request matches.
 Provider credentials are never literal config values. Each provider's
 `token_env` names an environment variable such as `PINATA_JWT` or
 `FILEBASE_PINNING_TOKEN`. Pinata and Filebase use their built-in public
-endpoints by default. An `endpoint` override is supported only for tests or
-private PSA-compatible services.
+endpoints by default. Pinata also supports `api = "v3" | "legacy"` and
+`strategy = "cid" | "upload"`. The CID strategy asks Pinata to pin the gateway's
+existing Kubo CID; the upload strategy streams the object back from local Kubo
+and uploads it to Pinata, which can support free-plan accounts that reject
+pin-by-CID. Upload requests are not bound by the 30s request timeout that
+applies to every other provider call, so large objects are limited by the
+provider and by `max_bytes` rather than by a gateway deadline; only the connect
+phase is bounded. The upload strategy also requires Pinata to return the same
+CID the gateway computed, otherwise the submit fails permanently. An `endpoint`
+override is only for tests or private compatible services; Pinata V3 upload
+endpoint overrides use `upload_endpoint`.
 
 ### Policies and coordination
 

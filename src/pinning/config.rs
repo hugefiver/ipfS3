@@ -27,6 +27,45 @@ impl ProviderKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinataApi {
+    V3,
+    Legacy,
+}
+
+impl PinataApi {
+    fn parse(raw: Option<&str>) -> anyhow::Result<Self> {
+        match raw.unwrap_or("v3") {
+            "v3" => Ok(Self::V3),
+            "legacy" => Ok(Self::Legacy),
+            raw => bail!("unknown Pinata API `{raw}`"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinataStrategy {
+    Cid,
+    Upload,
+}
+
+impl PinataStrategy {
+    fn parse(raw: Option<&str>) -> anyhow::Result<Self> {
+        match raw.unwrap_or("cid") {
+            "cid" => Ok(Self::Cid),
+            "upload" => Ok(Self::Upload),
+            raw => bail!("unknown Pinata strategy `{raw}`"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinataProviderOptions {
+    pub api: PinataApi,
+    pub strategy: PinataStrategy,
+    pub upload_endpoint: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyTrigger {
     Always,
     Request,
@@ -143,6 +182,7 @@ pub struct ValidatedProvider {
     pub kind: ProviderKind,
     pub token: Option<SecretToken>,
     pub endpoint: Option<String>,
+    pub pinata: Option<PinataProviderOptions>,
     pub limits: ProviderLimits,
     pub requests_per_second: Option<u32>,
 }
@@ -247,6 +287,51 @@ impl ValidatedPinningConfig {
             max_pins: quota_as_i64(provider.max_pins, &provider.name, "max_pins")?,
             enabled: provider.enabled,
         };
+        let pinata = match kind {
+            ProviderKind::Pinata => {
+                let options = PinataProviderOptions {
+                    api: PinataApi::parse(provider.api.as_deref())?,
+                    strategy: PinataStrategy::parse(provider.strategy.as_deref())?,
+                    upload_endpoint: provider.upload_endpoint.clone(),
+                };
+                let endpoint_is_psa = provider
+                    .endpoint
+                    .as_deref()
+                    .is_some_and(|endpoint| endpoint.trim_end_matches('/').ends_with("/psa"));
+                if endpoint_is_psa
+                    && (provider.api.is_some()
+                        || provider.strategy.is_some()
+                        || provider.upload_endpoint.is_some())
+                {
+                    bail!(
+                        "provider `{}` must not combine a `/psa` endpoint with api/strategy/upload_endpoint",
+                        provider.name
+                    );
+                }
+                if options.upload_endpoint.is_some()
+                    && (options.api != PinataApi::V3 || options.strategy != PinataStrategy::Upload)
+                {
+                    bail!(
+                        "provider `{}` upload_endpoint requires api = \"v3\" and strategy = \"upload\"",
+                        provider.name
+                    );
+                }
+                Some(options)
+            }
+            ProviderKind::Filebase | ProviderKind::Noop => {
+                if provider.api.is_some()
+                    || provider.strategy.is_some()
+                    || provider.upload_endpoint.is_some()
+                {
+                    bail!(
+                        "provider `{}` may only configure api/strategy/upload_endpoint when kind is pinata",
+                        provider.name
+                    );
+                }
+                None
+            }
+        };
+
         let token = match kind {
             ProviderKind::Pinata | ProviderKind::Filebase => {
                 let token_env = provider
@@ -285,6 +370,7 @@ impl ValidatedPinningConfig {
             kind,
             token,
             endpoint: provider.endpoint.clone(),
+            pinata,
             limits,
             requests_per_second: provider.requests_per_second,
         })
@@ -429,8 +515,8 @@ fn append_canonical_field(canonical: &mut String, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        LeaseDuration, PolicyTrigger, ProviderKind, ProviderMode, SecretToken,
-        ValidatedPinningConfig,
+        LeaseDuration, PinataApi, PinataStrategy, PolicyTrigger, ProviderKind, ProviderMode,
+        SecretToken, ValidatedPinningConfig,
     };
     use crate::config::{PinningConfig, PolicyConfig, ProviderConfig};
 
@@ -444,6 +530,9 @@ mod tests {
                 _ => None,
             },
             endpoint: Some(format!("https://{name}.example.test")),
+            api: None,
+            strategy: None,
+            upload_endpoint: None,
             enabled: true,
             priority: 10,
             max_bytes: 100,
@@ -616,6 +705,100 @@ mod tests {
             |_| None,
             "token environment variable `PINATA_TOKEN` is not set",
         );
+    }
+
+    #[test]
+    fn validates_pinata_api_and_strategy_options() {
+        let default_pinata = raw(vec![provider("pinata-default", "pinata")], Vec::new());
+        let validated = ValidatedPinningConfig::from_raw(&default_pinata, environment).unwrap();
+        let options = validated.providers[0].pinata.as_ref().unwrap();
+        assert_eq!(options.api, PinataApi::V3);
+        assert_eq!(options.strategy, PinataStrategy::Cid);
+
+        let mut legacy_upload = raw(vec![provider("pinata-upload", "pinata")], Vec::new());
+        legacy_upload.providers[0].api = Some("legacy".to_owned());
+        legacy_upload.providers[0].strategy = Some("upload".to_owned());
+        let validated = ValidatedPinningConfig::from_raw(&legacy_upload, environment).unwrap();
+        let options = validated.providers[0].pinata.as_ref().unwrap();
+        assert_eq!(options.api, PinataApi::Legacy);
+        assert_eq!(options.strategy, PinataStrategy::Upload);
+        assert_eq!(options.upload_endpoint, None);
+
+        let mut v3_upload = raw(vec![provider("pinata-v3-upload", "pinata")], Vec::new());
+        v3_upload.providers[0].strategy = Some("upload".to_owned());
+        v3_upload.providers[0].upload_endpoint = Some("https://uploads.example.test/v3".to_owned());
+        let validated = ValidatedPinningConfig::from_raw(&v3_upload, environment).unwrap();
+        let options = validated.providers[0].pinata.as_ref().unwrap();
+        assert_eq!(options.api, PinataApi::V3);
+        assert_eq!(options.strategy, PinataStrategy::Upload);
+        assert_eq!(
+            options.upload_endpoint.as_deref(),
+            Some("https://uploads.example.test/v3")
+        );
+
+        let mut invalid_api = raw(vec![provider("pinata-invalid", "pinata")], Vec::new());
+        invalid_api.providers[0].api = Some("psa".to_owned());
+        assert_validation_error(&invalid_api, environment, "unknown Pinata API");
+
+        let mut invalid_strategy = raw(vec![provider("pinata-invalid", "pinata")], Vec::new());
+        invalid_strategy.providers[0].strategy = Some("magic".to_owned());
+        assert_validation_error(&invalid_strategy, environment, "unknown Pinata strategy");
+
+        let mut filebase_with_pinata_options =
+            raw(vec![provider("filebase", "filebase")], Vec::new());
+        filebase_with_pinata_options.providers[0].strategy = Some("upload".to_owned());
+        assert_validation_error(
+            &filebase_with_pinata_options,
+            environment,
+            "may only configure api/strategy/upload_endpoint when kind is pinata",
+        );
+    }
+
+    #[test]
+    fn rejects_psa_endpoints_combined_with_native_pinata_options() {
+        let mut psa_defaults = raw(vec![provider("pinata-psa", "pinata")], Vec::new());
+        psa_defaults.providers[0].endpoint = Some("https://api.pinata.cloud/psa".to_owned());
+        ValidatedPinningConfig::from_raw(&psa_defaults, environment).unwrap();
+
+        let mut psa_api = psa_defaults.clone();
+        psa_api.providers[0].api = Some("legacy".to_owned());
+
+        let mut psa_strategy = psa_defaults.clone();
+        psa_strategy.providers[0].strategy = Some("upload".to_owned());
+
+        let mut psa_upload_endpoint = psa_defaults.clone();
+        psa_upload_endpoint.providers[0].api = Some("v3".to_owned());
+        psa_upload_endpoint.providers[0].strategy = Some("upload".to_owned());
+        psa_upload_endpoint.providers[0].upload_endpoint =
+            Some("https://uploads.example.test/v3".to_owned());
+
+        for config in [psa_api, psa_strategy, psa_upload_endpoint] {
+            assert_validation_error(
+                &config,
+                environment,
+                "must not combine a `/psa` endpoint with api/strategy/upload_endpoint",
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_upload_endpoints_that_the_selected_pinata_api_would_ignore() {
+        let mut legacy_upload = raw(vec![provider("pinata-upload", "pinata")], Vec::new());
+        legacy_upload.providers[0].api = Some("legacy".to_owned());
+        legacy_upload.providers[0].strategy = Some("upload".to_owned());
+        legacy_upload.providers[0].upload_endpoint =
+            Some("https://uploads.example.test/v3".to_owned());
+
+        let mut v3_cid = raw(vec![provider("pinata-cid", "pinata")], Vec::new());
+        v3_cid.providers[0].upload_endpoint = Some("https://uploads.example.test/v3".to_owned());
+
+        for config in [legacy_upload, v3_cid] {
+            assert_validation_error(
+                &config,
+                environment,
+                "upload_endpoint requires api = \"v3\" and strategy = \"upload\"",
+            );
+        }
     }
 
     #[test]

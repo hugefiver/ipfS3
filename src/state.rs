@@ -34,7 +34,7 @@ impl AppState {
         let db = sea_orm::Database::connect(&cfg.storage.database_url).await?;
         crate::store::run_migrations(&db).await?;
         let store = Store::new(db);
-        let pinning = PinningCoordinator::build(validated_pinning)?;
+        let pinning = PinningCoordinator::build_with_kubo(validated_pinning, Some(kubo.clone()))?;
 
         let credentials: HashMap<String, SecretKey> = cfg
             .auth
@@ -89,6 +89,9 @@ mod tests {
             kind: "pinata".to_owned(),
             token_env: Some("TASK15_MISSING_PINATA_TOKEN".to_owned()),
             endpoint: None,
+            api: None,
+            strategy: None,
+            upload_endpoint: None,
             enabled: true,
             priority: 1,
             max_bytes: 1_000,

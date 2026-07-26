@@ -442,6 +442,9 @@ pub(crate) fn test_token(value: &str) -> SecretToken {
             kind: "pinata".to_owned(),
             token_env: Some("TEST_TOKEN".to_owned()),
             endpoint: None,
+            api: None,
+            strategy: None,
+            upload_endpoint: None,
             enabled: true,
             priority: 0,
             max_bytes: 1,
@@ -473,7 +476,6 @@ mod tests {
     use crate::pinning::{
         config::ProviderKind,
         filebase::build_filebase,
-        pinata::build_pinata,
         provider::{FindPin, PinningProvider, ProviderErrorClass, RemotePinStatus, SubmitPin},
     };
 
@@ -483,17 +485,14 @@ mod tests {
 
     fn provider_for(kind: ProviderKind, server: &MockServer) -> PsaClient {
         match kind {
-            ProviderKind::Pinata => build_pinata(
-                "pinata".to_owned(),
-                super::test_token(TOKEN),
-                Some(format!("{}/psa", server.uri())),
-            ),
             ProviderKind::Filebase => build_filebase(
                 "filebase".to_owned(),
                 super::test_token(TOKEN),
                 Some(format!("{}/v1/ipfs", server.uri())),
             ),
-            ProviderKind::Noop => unreachable!("PSA tests only cover remote providers"),
+            ProviderKind::Pinata | ProviderKind::Noop => {
+                unreachable!("PSA tests only cover Filebase")
+            }
         }
     }
 
@@ -561,11 +560,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pinata_and_filebase_obey_the_same_psa_contract() {
-        for (kind, prefix) in [
-            (ProviderKind::Pinata, "/psa"),
-            (ProviderKind::Filebase, "/v1/ipfs"),
-        ] {
+    async fn filebase_obeys_the_psa_contract() {
+        for (kind, prefix) in [(ProviderKind::Filebase, "/v1/ipfs")] {
             let server = MockServer::start().await;
             mount_contract(&server, prefix).await;
             let provider = provider_for(kind, &server);
