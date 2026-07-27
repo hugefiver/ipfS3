@@ -199,6 +199,7 @@ async fn setup_file_backed(name: &str) -> (tempfile::TempDir, DatabaseConnection
     );
     let mut options = ConnectOptions::new(database_url);
     options.max_connections(4).min_connections(2);
+    crate::store::apply_sqlite_busy_timeout(&mut options);
     let db = Database::connect(options).await.unwrap();
     db.execute_unprepared("PRAGMA foreign_keys = ON")
         .await

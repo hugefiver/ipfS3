@@ -93,7 +93,14 @@ where
                         }
                     }
                 }
-                Err(e) => yield Err(AppError::Internal(e.into().to_string())),
+                Err(e) => {
+                    let error: Box<dyn std::error::Error + Send + Sync> = e.into();
+                    if crate::error::has_kubo_stream_provenance(error.as_ref()) {
+                        yield Err(AppError::kubo_rpc_detail("Kubo response stream failed"));
+                    } else {
+                        yield Err(AppError::Internal(error.to_string()));
+                    }
+                }
             }
         }
         // Decrypt any remaining bytes (the final, possibly smaller chunk).

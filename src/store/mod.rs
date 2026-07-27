@@ -7,6 +7,31 @@ pub mod pinning;
 
 use sea_orm::DatabaseConnection;
 
+/// Busy timeout applied to every SQLite connection. Without it, a concurrent
+/// writer fails immediately with `database is locked (code 5)` instead of
+/// waiting for the current writer to finish.
+pub const SQLITE_BUSY_TIMEOUT_MS: i32 = 5_000;
+
+pub fn is_sqlite_url(database_url: &str) -> bool {
+    database_url.starts_with("sqlite:")
+}
+
+/// Apply the SQLite busy timeout to `options`. No-op for non-SQLite URLs.
+pub fn apply_sqlite_busy_timeout(options: &mut sea_orm::ConnectOptions) {
+    if !is_sqlite_url(options.get_url()) {
+        return;
+    }
+    let timeout = std::time::Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS as u64);
+    options.map_sqlx_sqlite_opts(move |sqlite_opts| sqlite_opts.busy_timeout(timeout));
+}
+
+/// Connect to the configured database, applying the SQLite busy timeout.
+pub async fn connect_database(database_url: &str) -> Result<DatabaseConnection, sea_orm::DbErr> {
+    let mut options = sea_orm::ConnectOptions::new(database_url.to_owned());
+    apply_sqlite_busy_timeout(&mut options);
+    sea_orm::Database::connect(options).await
+}
+
 #[derive(Clone)]
 pub struct Store {
     db: DatabaseConnection,
@@ -52,6 +77,40 @@ pub async fn run_migrations(db: &DatabaseConnection) -> Result<(), sea_orm::DbEr
 mod tests {
     use super::*;
     use sea_orm::ConnectionTrait;
+
+    #[tokio::test]
+    async fn file_backed_sqlite_connections_have_a_five_second_busy_timeout() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("busy-timeout.db");
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            database_path.display().to_string().replace('\\', "/")
+        );
+
+        let db = connect_database(&database_url).await.unwrap();
+
+        let row = db
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "PRAGMA busy_timeout",
+            ))
+            .await
+            .unwrap()
+            .expect("PRAGMA busy_timeout must return a row");
+        let timeout_ms: i32 = row.try_get_by(0).unwrap();
+        assert_eq!(
+            timeout_ms, SQLITE_BUSY_TIMEOUT_MS,
+            "file-backed SQLite connections must wait instead of failing with `database is locked`"
+        );
+    }
+
+    #[test]
+    fn busy_timeout_is_only_applied_to_sqlite_urls() {
+        assert!(is_sqlite_url("sqlite:///data/ipfs-s3.db"));
+        assert!(is_sqlite_url("sqlite::memory:"));
+        assert!(!is_sqlite_url("postgres://user:pw@localhost/ipfs_s3"));
+        assert!(!is_sqlite_url("postgresql://user:pw@localhost/ipfs_s3"));
+    }
 
     #[tokio::test]
     async fn test_migration_runs() {

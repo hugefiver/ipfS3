@@ -481,6 +481,18 @@ impl DecompressZipRoute {
     }
 
     async fn call_put(&self, req: S3Request<Body>) -> S3Result<S3Response<Body>> {
+        self.call_put_with_decompressed_limit(
+            req,
+            crate::zip::extract::MAX_DECOMPRESSED_ARCHIVE_BYTES,
+        )
+        .await
+    }
+
+    async fn call_put_with_decompressed_limit(
+        &self,
+        req: S3Request<Body>,
+        max_decompressed_bytes: u64,
+    ) -> S3Result<S3Response<Body>> {
         let parsed = parse_decompress_put_uri(&req.uri)?;
         if has_sse_header(&req.headers) {
             return Err(s3s::s3_error!(
@@ -508,13 +520,13 @@ impl DecompressZipRoute {
 
         let archive =
             crate::s3::ops::object::add_plain_object_stream(&self.state, req.input).await?;
-        let archive_stream = crate::kubo::cat::stream_cat(&self.state.kubo, &archive.cid, None)
-            .await
-            .map_err(|err| s3s::s3_error!(InternalError, "cat archive: {err}"))?;
-        let outcome = crate::zip::extract::extract_zip_stream(
+        let archive_stream =
+            crate::kubo::cat::stream_cat(&self.state.kubo, &archive.cid, None).await?;
+        let outcome = crate::zip::extract::extract_zip_stream_with_limit(
             &self.state,
             &parsed.target_prefix,
             archive_stream,
+            max_decompressed_bytes,
         )
         .await?;
 
@@ -630,11 +642,7 @@ impl DecompressZipRoute {
 
         if let Some(target_prefix) = completed.decompress_zip_target.clone() {
             let archive_stream =
-                crate::kubo::cat::stream_cat(&self.state.kubo, &completed.root_cid, None)
-                    .await
-                    .map_err(|error| {
-                        s3s::s3_error!(InternalError, "cat completed archive: {error}")
-                    })?;
+                crate::kubo::cat::stream_cat(&self.state.kubo, &completed.root_cid, None).await?;
             let outcome = crate::zip::extract::extract_zip_stream(
                 &self.state,
                 &target_prefix,
@@ -2637,6 +2645,70 @@ mod tests {
         assert_eq!(error.code().as_str(), "InvalidParameterValue");
         assert_no_zip_publication_rows(&state).await;
         assert_no_pin_removes(&kubo, &["QmArchive", "QmSharedEntry"]).await;
+    }
+
+    #[tokio::test]
+    async fn put_budget_rejection_is_a_global_400_without_publication() {
+        let archive_body = zip(&[
+            ZipEntryFixture {
+                name: b"first.txt",
+                data: HELLO,
+            },
+            ZipEntryFixture {
+                name: b"second.txt",
+                data: HELLO,
+            },
+        ]);
+        let (route, state, kubo) = route_with_mock_kubo(
+            vec![
+                "{\"Hash\":\"QmArchive\",\"Size\":\"13\"}\n",
+                "{\"Hash\":\"QmFirst\",\"Size\":\"5\"}\n",
+            ],
+            archive_body,
+        )
+        .await;
+        crate::store::bucket::create(state.store.db(), "bucket", None)
+            .await
+            .unwrap();
+
+        // This private helper is the production PUT implementation with only
+        // the test-injected limit varied; it exposes the S3Error before HTTP
+        // serialization, so status/code are asserted here.
+        let error = route
+            .call_put_with_decompressed_limit(
+                signed_route_request(
+                    Method::PUT,
+                    "/bucket/archive.zip?decompress-zip=prefix/",
+                    Body::from("archive bytes".to_owned()),
+                ),
+                7,
+            )
+            .await
+            .expect_err("two five-byte entries must exceed the seven-byte global budget");
+
+        assert_eq!(error.code().as_str(), "InvalidParameterValue");
+        assert_eq!(error.status_code(), Some(http::StatusCode::BAD_REQUEST));
+        assert_no_zip_publication_rows(&state).await;
+        let requests = kubo.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path() == "/api/v0/add")
+                .count(),
+            2
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path() == "/api/v0/pin/add")
+                .count(),
+            2
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.url.path() != "/api/v0/pin/rm")
+        );
     }
 
     #[tokio::test]

@@ -23,23 +23,27 @@ S3Impl (impl S3 trait) ── holds Arc<AppState>
     └── ops/multipart.rs  → store/multipart.rs + kubo + crypto
 ```
 
-**AppState** holds: `KuboClient` (reqwest), `Store` (sea-orm DatabaseConnection), `credentials` (HashMap<access_key, SecretKey>), `master_key` (MasterKey).
+**AppState** holds: `KuboClient` (reqwest), `Store` (sea-orm DatabaseConnection), `credentials` (HashMap<access_key, SecretKey>), `master_key` (MasterKey), `pinning` (Arc<PinningCoordinator>).
 
 ## Module Map
 
 | Module | Responsibility |
 |--------|---------------|
-| `main.rs` | Entry point: config, state, server |
-| `config.rs` | Toml + env config loading |
-| `state.rs` | AppState struct + init |
-| `error.rs` | AppError → S3Error mapping |
+| `main.rs` | Entry point: config, state, HTTP server, worker lifecycle |
+| `config.rs` | Toml + env config loading (server, kubo, storage, auth, crypto, pinning) |
+| `state.rs` | AppState struct + init (Kubo, Store, credentials, master key, pinning coordinator) |
+| `error.rs` | AppError → S3Error mapping (database and Kubo details are redacted) |
 | `auth.rs` | S3Auth impl (credential lookup) |
-| `kubo/` | Kubo RPC client (add/cat/pin) |
-| `store/` | sea-orm entities + CRUD |
+| `kubo/` | Kubo RPC client (add/cat/pin): bounded control-plane client, unbounded upload client, idle-bounded download client |
+| `store/` | sea-orm entities, migrations, CRUD |
+| `store/pinning/` | Pin tags, leases, targets, remotes, jobs, quota, atomic publication transactions |
 | `crypto/` | AES-256-GCM + key wrap + chunker |
-| `pinning/` | PinningService trait + Noop |
+| `pinning/` | Provider clients (Pinata/Filebase/Noop), policy evaluation, coordinator, quota, durable worker |
+| `zip/` | decompress-zip streaming extraction, local-header observation, path sanitization |
 | `s3/handler.rs` | S3Impl: impl S3, delegates to ops |
-| `s3/ops/` | Per-operation implementations |
+| `s3/ops/` | Per-operation implementations, including `tagging.rs` for the pin control plane |
+| `s3/route/` | Custom routes layered on the s3s service (decompress-zip) |
+| `s3/query.rs`, `s3/http.rs` | Query parsing and request bridging middleware |
 
 ## Key Design Decisions
 

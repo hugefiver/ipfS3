@@ -184,6 +184,7 @@ struct ObservationAfterStatusCommitGate {
     job_id: String,
     request_id: String,
     fail_once: std::sync::atomic::AtomicBool,
+    arrived: tokio::sync::Notify,
 }
 
 #[cfg(test)]
@@ -245,10 +246,11 @@ async fn fail_once_after_observation_status_commit(
         .await
         .get(&(job_id.to_owned(), request_id.to_owned()))
         .cloned();
-    if gate.is_some_and(|gate| {
+    if let Some(gate) = gate.filter(|gate| {
         gate.fail_once
             .swap(false, std::sync::atomic::Ordering::SeqCst)
     }) {
+        gate.arrived.notify_one();
         return Err(AppError::Database(
             "test coordination failure after durable pin status projection".to_owned(),
         ));
@@ -317,6 +319,61 @@ pub(crate) fn start(
     PinningWorkerHandle { cancellation, join }
 }
 
+#[derive(Clone)]
+struct JobLogContext {
+    job_id: String,
+    provider: String,
+    cid: String,
+    lease_id: Option<String>,
+    target_id: Option<String>,
+}
+
+impl JobLogContext {
+    fn from_model(model: &crate::store::entities::pin_job::Model) -> Self {
+        Self {
+            job_id: model.id.clone(),
+            provider: model.provider.clone(),
+            cid: model.cid.clone(),
+            lease_id: model.lease_id.clone(),
+            target_id: model.target_id.clone(),
+        }
+    }
+
+    fn log_task_failure(&self, error: &tokio::task::JoinError, message: &'static str) {
+        tracing::error!(
+            job_id = %self.job_id,
+            provider = %self.provider,
+            cid = %self.cid,
+            lease_id = ?self.lease_id,
+            target_id = ?self.target_id,
+            error = %error,
+            "{message}"
+        );
+    }
+}
+
+fn handle_join_result(
+    completed: Result<(tokio::task::Id, ()), tokio::task::JoinError>,
+    job_contexts: &mut std::collections::HashMap<tokio::task::Id, JobLogContext>,
+    failure_message: &'static str,
+) {
+    match completed {
+        Ok((id, ())) => {
+            job_contexts.remove(&id);
+        }
+        Err(error) => {
+            let id = error.id();
+            match job_contexts.remove(&id) {
+                Some(context) => context.log_task_failure(&error, failure_message),
+                None => tracing::error!(
+                    error = %error,
+                    "{failure_message} with no recorded job context"
+                ),
+            }
+        }
+    }
+}
+
 async fn run_worker(
     coordinator: Arc<PinningCoordinator>,
     store: Arc<Store>,
@@ -327,25 +384,25 @@ async fn run_worker(
     let mut interval = tokio::time::interval(settings.interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut in_flight = JoinSet::new();
+    let mut job_contexts: std::collections::HashMap<tokio::task::Id, JobLogContext> =
+        std::collections::HashMap::new();
     let provider_occupancy = ProviderOccupancy::default();
 
     loop {
         tokio::select! {
             biased;
             _ = cancellation.cancelled() => break,
-            completed = in_flight.join_next(), if !in_flight.is_empty() => {
-                if let Some(Err(error)) = completed {
-                    tracing::error!(error = %error, "pinning worker task failed");
+            completed = in_flight.join_next_with_id(), if !in_flight.is_empty() => {
+                if let Some(completed) = completed {
+                    handle_join_result(completed, &mut job_contexts, "pinning worker task failed");
                 }
             }
             _ = interval.tick() => {
                 if cancellation.is_cancelled() {
                     break;
                 }
-                while let Some(completed) = in_flight.try_join_next() {
-                    if let Err(error) = completed {
-                        tracing::error!(error = %error, "pinning worker task failed");
-                    }
+                while let Some(completed) = in_flight.try_join_next_with_id() {
+                    handle_join_result(completed, &mut job_contexts, "pinning worker task failed");
                 }
                 let available = settings.worker_concurrency.saturating_sub(in_flight.len());
                 let scan = scan_and_claim(
@@ -371,9 +428,11 @@ async fn run_worker(
                             let store = store.clone();
                             let global = global.clone();
                             let cancellation = cancellation.clone();
+                            let context = JobLogContext::from_model(&job.model);
+                            let task_context = context.clone();
                             let occupancy =
                                 provider_occupancy.enter(job.model.provider.clone());
-                            in_flight.spawn(async move {
+                            let handle = in_flight.spawn(async move {
                                 let _occupancy = occupancy;
                                 if let Err(error) = execute_claimed_job_with_cancellation(
                                     &store,
@@ -384,9 +443,18 @@ async fn run_worker(
                                 )
                                 .await
                                 {
-                                    tracing::error!(error = %error, "pinning job execution failed");
+                                    tracing::error!(
+                                        job_id = %task_context.job_id,
+                                        provider = %task_context.provider,
+                                        cid = %task_context.cid,
+                                        lease_id = ?task_context.lease_id,
+                                        target_id = ?task_context.target_id,
+                                        error = %error,
+                                        "pinning job execution failed"
+                                    );
                                 }
                             });
+                            job_contexts.insert(handle.id(), context);
                         }
                     }
                     Err(error) => tracing::error!(error = %error, "pinning worker scan failed"),
@@ -396,10 +464,12 @@ async fn run_worker(
     }
 
     let drain = async {
-        while let Some(result) = in_flight.join_next().await {
-            if let Err(error) = result {
-                tracing::error!(error = %error, "pinning worker task failed during drain");
-            }
+        while let Some(result) = in_flight.join_next_with_id().await {
+            handle_join_result(
+                result,
+                &mut job_contexts,
+                "pinning worker task failed during drain",
+            );
         }
     };
     if tokio::time::timeout(settings.shutdown_grace, drain)
@@ -2908,7 +2978,7 @@ fn audit_follow_up_failure(claimed: &ClaimedPinJob, phase: &str, error: &AppErro
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::{BTreeSet, VecDeque},
+        collections::{BTreeSet, HashMap, VecDeque},
         io::Write,
         sync::{
             Arc,
@@ -2944,11 +3014,40 @@ mod tests {
         Submit(Result<RemotePin, ProviderError>),
         BlockSubmit(Arc<SubmitBlocker>),
         Get(Result<RemotePin, ProviderError>),
+        PanicGet(Arc<Notify>),
         BlockGet(Arc<GetBlocker>),
         Find(Result<Vec<RemotePin>, ProviderError>),
         BlockFind(Arc<FindBlocker>),
         Unpin(Result<(), ProviderError>),
         BlockUnpin(Arc<UnpinBlocker>),
+    }
+
+    #[tokio::test]
+    async fn successful_join_result_removes_its_recorded_context() {
+        let mut in_flight = tokio::task::JoinSet::new();
+        let handle = in_flight.spawn(async {});
+        let task_id = handle.id();
+        let mut contexts = HashMap::from([(
+            task_id,
+            super::JobLogContext {
+                job_id: "success-job".to_owned(),
+                provider: "noop".to_owned(),
+                cid: "bafy-success".to_owned(),
+                lease_id: Some("lease-success".to_owned()),
+                target_id: Some("target-success".to_owned()),
+            },
+        )]);
+
+        let completed = in_flight
+            .join_next_with_id()
+            .await
+            .expect("the completed task must have a JoinSet result");
+        super::handle_join_result(completed, &mut contexts, "test worker task failure");
+
+        assert!(
+            contexts.is_empty(),
+            "a normal JoinSet completion must remove only its matching context"
+        );
     }
 
     struct SubmitBlocker {
@@ -3062,6 +3161,10 @@ mod tests {
             self.gets.fetch_add(1, Ordering::SeqCst);
             match self.next().await {
                 Script::Get(result) => result,
+                Script::PanicGet(arrived) => {
+                    arrived.notify_one();
+                    panic!("scripted Get panic")
+                }
                 Script::BlockGet(blocker) => {
                     blocker.entered.notify_one();
                     blocker.release.notified().await;
@@ -3137,7 +3240,7 @@ mod tests {
         max_pins: u64,
     ) -> Fixture {
         let db = Database::connect("sqlite::memory:").await.unwrap();
-        fixture_with_database(scripts, db, max_bytes, max_pins, None).await
+        fixture_with_database(scripts, db, max_bytes, max_pins, None, "1s").await
     }
 
     async fn file_backed_fixture(scripts: impl IntoIterator<Item = Script>) -> Fixture {
@@ -3148,7 +3251,7 @@ mod tests {
             database_path.display().to_string().replace('\\', "/")
         );
         let db = Database::connect(database_url).await.unwrap();
-        fixture_with_database(scripts, db, 10_000, 100, Some(directory)).await
+        fixture_with_database(scripts, db, 10_000, 100, Some(directory), "1s").await
     }
 
     async fn fixture_with_database(
@@ -3157,6 +3260,7 @@ mod tests {
         max_bytes: u64,
         max_pins: u64,
         database_directory: Option<tempfile::TempDir>,
+        worker_interval: &str,
     ) -> Fixture {
         db.execute_unprepared("PRAGMA foreign_keys = ON")
             .await
@@ -3208,7 +3312,7 @@ mod tests {
 
         let provider = ScriptProvider::new(scripts);
         let raw = PinningConfig {
-            worker_interval: "1s".to_owned(),
+            worker_interval: worker_interval.to_owned(),
             worker_concurrency: 2,
             providers: vec![
                 ProviderConfig {
@@ -5418,6 +5522,7 @@ mod tests {
             job_id: initial_job.id.clone(),
             request_id: "crash-window-failed".to_owned(),
             fail_once: std::sync::atomic::AtomicBool::new(true),
+            arrived: Notify::new(),
         });
         let gate_key = (gate.job_id.clone(), gate.request_id.clone());
         super::OBSERVATION_AFTER_STATUS_COMMIT
@@ -10157,6 +10262,7 @@ mod tests {
             job_id: job.id.clone(),
             request_id: "trace-status-failed".to_owned(),
             fail_once: std::sync::atomic::AtomicBool::new(true),
+            arrived: Notify::new(),
         });
         let gate_key = (gate.job_id.clone(), gate.request_id.clone());
         super::OBSERVATION_AFTER_STATUS_COMMIT
@@ -10230,6 +10336,291 @@ mod tests {
             assert!(
                 !output.contains(secret),
                 "provider material leaked into phase tracing: {output}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_task_failures_are_logged_with_their_job_identity() {
+        const ISOLATED_TRACE_ENV: &str = "IPFS_S3_ISOLATED_WORKER_FAILURE_TRACE_TEST";
+        if std::env::var_os(ISOLATED_TRACE_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "pinning::worker::tests::worker_task_failures_are_logged_with_their_job_identity",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(ISOLATED_TRACE_ENV, "1")
+                .output()
+                .expect("failed to start isolated tracing test process");
+            assert!(
+                output.status.success(),
+                "isolated tracing test failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let capture = TraceCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(capture.clone())
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let _default_guard = tracing::dispatcher::set_default(&dispatch);
+        tracing::callsite::rebuild_interest_cache();
+
+        // The blocker proves the spawned task actually reached the provider.
+        // Its release then lets the blocked Submit panic, which surfaces to
+        // `run_worker` as a `JoinError`.
+        let blocker = Arc::new(SubmitBlocker {
+            entered: Notify::new(),
+            release: Notify::new(),
+            result: Mutex::new(None),
+        });
+        let fixture = fixture([Script::BlockSubmit(blocker.clone())]).await;
+        fixture.enqueue_submit().await;
+        let job = pin_job::Entity::find()
+            .filter(pin_job::Column::Operation.eq("submit"))
+            .one(fixture.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let entered = blocker.entered.notified();
+        let handle = fixture
+            .coordinator
+            .clone()
+            .start(fixture.store.clone(), CancellationToken::new());
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered)
+            .await
+            .expect("worker did not enter Submit");
+
+        // `result` is None, so the blocked Submit panics on release.
+        blocker.release.notify_one();
+        handle.shutdown(std::time::Duration::from_secs(5)).await;
+
+        let text = capture.text();
+        let failure_line = text
+            .lines()
+            .find(|line| line.contains("pinning worker task failed"))
+            .unwrap_or_else(|| panic!("expected a worker task-failure log line in:\n{text}"));
+
+        for field in [
+            format!("job_id={}", job.id),
+            "provider=noop".to_owned(),
+            "cid=bafy-worker".to_owned(),
+            "lease_id=Some(\"lease-1\")".to_owned(),
+            "target_id=Some(\"target-1\")".to_owned(),
+        ] {
+            assert!(
+                failure_line.contains(&field),
+                "worker task-failure log must carry `{field}`: {failure_line}"
+            );
+        }
+        assert!(
+            !failure_line.contains("no recorded job context"),
+            "the failing task must be attributable to its claimed job: {failure_line}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_tick_join_keeps_a_later_panic_bound_to_its_own_job() {
+        const ISOLATED_TRACE_ENV: &str = "IPFS_S3_ISOLATED_WORKER_TICK_FAILURE_TRACE_TEST";
+        if std::env::var_os(ISOLATED_TRACE_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "pinning::worker::tests::worker_tick_join_keeps_a_later_panic_bound_to_its_own_job",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(ISOLATED_TRACE_ENV, "1")
+                .output()
+                .expect("failed to start isolated tracing test process");
+            assert!(
+                output.status.success(),
+                "isolated tracing test failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let capture = TraceCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(capture.clone())
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let _default_guard = tracing::dispatcher::set_default(&dispatch);
+        tracing::callsite::rebuild_interest_cache();
+
+        let first_submit = Arc::new(SubmitBlocker {
+            entered: Notify::new(),
+            release: Notify::new(),
+            result: Mutex::new(None),
+        });
+        let panic_get = Arc::new(Notify::new());
+        let fixture = fixture([
+            Script::BlockSubmit(first_submit.clone()),
+            Script::PanicGet(panic_get.clone()),
+        ])
+        .await;
+        fixture.enqueue_submit().await;
+        let handle = fixture
+            .coordinator
+            .clone()
+            .start(fixture.store.clone(), CancellationToken::new());
+
+        first_submit.entered.notified().await;
+        *first_submit.result.lock().await =
+            Some(Ok(remote("tick-poll-request", RemotePinStatus::Queued)));
+        first_submit.release.notify_one();
+        panic_get.notified().await;
+        tokio::task::yield_now().await;
+
+        let panic_job = pin_job::Entity::find()
+            .filter(pin_job::Column::Operation.eq("poll"))
+            .one(fixture.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        let text = capture.text();
+        let failure_line = text
+            .lines()
+            .find(|line| {
+                line.contains("pinning worker task failed")
+                    && !line.contains("during drain")
+                    && line.contains(&format!("job_id={}", panic_job.id))
+            })
+            .unwrap_or_else(|| panic!("expected main/tick worker failure line in:\n{text}"));
+        for field in [
+            format!("job_id={}", panic_job.id),
+            "provider=noop".to_owned(),
+            "cid=bafy-worker".to_owned(),
+            "lease_id=Some(\"lease-1\")".to_owned(),
+            "target_id=Some(\"target-1\")".to_owned(),
+        ] {
+            assert!(
+                failure_line.contains(&field),
+                "main/tick join associated the panic with the wrong task: {failure_line}"
+            );
+        }
+        handle.shutdown(std::time::Duration::from_secs(5)).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_job_execution_failures_log_all_identity_fields() {
+        const ISOLATED_TRACE_ENV: &str = "IPFS_S3_ISOLATED_WORKER_EXECUTION_FAILURE_TRACE_TEST";
+        if std::env::var_os(ISOLATED_TRACE_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "pinning::worker::tests::worker_job_execution_failures_log_all_identity_fields",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(ISOLATED_TRACE_ENV, "1")
+                .output()
+                .expect("failed to start isolated tracing test process");
+            assert!(
+                output.status.success(),
+                "isolated tracing test failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let capture = TraceCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(capture.clone())
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let _default_guard = tracing::dispatcher::set_default(&dispatch);
+        tracing::callsite::rebuild_interest_cache();
+
+        let blocker = Arc::new(SubmitBlocker {
+            entered: Notify::new(),
+            release: Notify::new(),
+            result: Mutex::new(None),
+        });
+        let fixture = fixture([Script::BlockSubmit(blocker.clone())]).await;
+        fixture.enqueue_submit().await;
+        let job = pin_job::Entity::find()
+            .filter(pin_job::Column::Operation.eq("submit"))
+            .one(fixture.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        let request_id = "execution-failure-request".to_owned();
+        let gate = Arc::new(super::ObservationAfterStatusCommitGate {
+            job_id: job.id.clone(),
+            request_id: request_id.clone(),
+            fail_once: std::sync::atomic::AtomicBool::new(true),
+            arrived: Notify::new(),
+        });
+        let gate_key = (job.id.clone(), request_id.clone());
+        super::OBSERVATION_AFTER_STATUS_COMMIT
+            .lock()
+            .await
+            .insert(gate_key.clone(), gate.clone());
+
+        let handle = fixture
+            .coordinator
+            .clone()
+            .start(fixture.store.clone(), CancellationToken::new());
+        blocker.entered.notified().await;
+        let gate_arrived = gate.arrived.notified();
+        let mut failed = remote(&request_id, RemotePinStatus::Failed);
+        failed.failure_reason = Some("Bearer raw-provider-body test-provider-token".to_owned());
+        *blocker.result.lock().await = Some(Ok(failed));
+        blocker.release.notify_one();
+        gate_arrived.await;
+        tokio::task::yield_now().await;
+        handle.shutdown(std::time::Duration::from_secs(5)).await;
+        super::OBSERVATION_AFTER_STATUS_COMMIT
+            .lock()
+            .await
+            .remove(&gate_key);
+
+        let text = capture.text();
+        let failure_line = text
+            .lines()
+            .find(|line| {
+                line.contains("pinning job execution failed")
+                    && line.contains(&format!("job_id={}", job.id))
+            })
+            .unwrap_or_else(|| panic!("expected job-execution failure line in:\n{text}"));
+        for field in [
+            format!("job_id={}", job.id),
+            "provider=noop".to_owned(),
+            "cid=bafy-worker".to_owned(),
+            "lease_id=Some(\"lease-1\")".to_owned(),
+            "target_id=Some(\"target-1\")".to_owned(),
+        ] {
+            assert!(
+                failure_line.contains(&field),
+                "job-execution failure omitted `{field}`: {failure_line}"
+            );
+        }
+        for secret in ["Bearer", "raw-provider-body", "test-provider-token"] {
+            assert!(
+                !text.contains(secret),
+                "worker failure logging must not expose provider material: {text}"
             );
         }
     }

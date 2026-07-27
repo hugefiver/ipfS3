@@ -10023,40 +10023,65 @@ mod tests {
     async fn publication_prelocks_union_of_leases_then_targets_then_remotes() {
         let _order_test_guard = test_gates::LIFECYCLE_ORDER_TEST_LOCK.lock().await;
         let db = setup().await;
-        seed_remote(&db, "pinata", "bafy-z", "reserved", None, 1).await;
-        seed_remote(&db, "filebase", "bafy-a", "reserved", None, 1).await;
+        seed_remote(
+            &db,
+            "pinata",
+            "bafy-publication-frontier-z",
+            "reserved",
+            None,
+            1,
+        )
+        .await;
+        seed_remote(
+            &db,
+            "filebase",
+            "bafy-publication-frontier-a",
+            "reserved",
+            None,
+            1,
+        )
+        .await;
         seed_lease_target(
             &db,
-            "lease-z",
+            "lease-publication-frontier-z",
             "automatic",
             "all",
             "active",
             1,
-            "target-z",
+            "target-publication-frontier-z",
             "pinata",
-            "bafy-z",
+            "bafy-publication-frontier-z",
             "waiting",
             time(100),
         )
         .await;
         seed_lease_target(
             &db,
-            "lease-a",
+            "lease-publication-frontier-a",
             "manual",
             "all",
             "active",
             1,
-            "target-a",
+            "target-publication-frontier-a",
             "filebase",
-            "bafy-a",
+            "bafy-publication-frontier-a",
             "waiting",
             time(100),
         )
         .await;
         start_lifecycle_order_recording(
-            &["lease-a", "lease-z"],
-            &["target-a", "target-z"],
-            &[("filebase", "bafy-a"), ("pinata", "bafy-z")],
+            &[
+                "lease-publication-frontier-a",
+                "lease-publication-frontier-z",
+            ],
+            &[
+                "target-publication-frontier-a",
+                "target-publication-frontier-z",
+            ],
+            &[
+                ("filebase", "bafy-publication-frontier-a"),
+                ("pinata", "bafy-publication-frontier-z"),
+            ],
         )
         .await;
 
@@ -10064,8 +10089,14 @@ mod tests {
             &db,
             &["object-1".to_owned()],
             &[
-                ("pinata".to_owned(), "bafy-z".to_owned()),
-                ("filebase".to_owned(), "bafy-a".to_owned()),
+                (
+                    "pinata".to_owned(),
+                    "bafy-publication-frontier-z".to_owned(),
+                ),
+                (
+                    "filebase".to_owned(),
+                    "bafy-publication-frontier-a".to_owned(),
+                ),
             ],
         )
         .await
@@ -10074,17 +10105,25 @@ mod tests {
         assert_eq!(
             finish_lifecycle_order_recording().await,
             vec![
-                test_gates::LifecycleOrderEvent::LeaseLock("lease-a".to_owned()),
-                test_gates::LifecycleOrderEvent::LeaseLock("lease-z".to_owned()),
-                test_gates::LifecycleOrderEvent::TargetLock("target-a".to_owned()),
-                test_gates::LifecycleOrderEvent::TargetLock("target-z".to_owned()),
+                test_gates::LifecycleOrderEvent::LeaseLock(
+                    "lease-publication-frontier-a".to_owned(),
+                ),
+                test_gates::LifecycleOrderEvent::LeaseLock(
+                    "lease-publication-frontier-z".to_owned(),
+                ),
+                test_gates::LifecycleOrderEvent::TargetLock(
+                    "target-publication-frontier-a".to_owned(),
+                ),
+                test_gates::LifecycleOrderEvent::TargetLock(
+                    "target-publication-frontier-z".to_owned(),
+                ),
                 test_gates::LifecycleOrderEvent::RemoteLock(
                     "filebase".to_owned(),
-                    "bafy-a".to_owned(),
+                    "bafy-publication-frontier-a".to_owned(),
                 ),
                 test_gates::LifecycleOrderEvent::RemoteLock(
                     "pinata".to_owned(),
-                    "bafy-z".to_owned(),
+                    "bafy-publication-frontier-z".to_owned(),
                 ),
             ]
         );

@@ -31,7 +31,7 @@ impl AppState {
         let kubo = KuboClient::new(cfg.kubo.rpc_url.clone());
         let validated_pinning = ValidatedPinningConfig::from_raw(&cfg.pinning, get_env)?;
 
-        let db = sea_orm::Database::connect(&cfg.storage.database_url).await?;
+        let db = crate::store::connect_database(&cfg.storage.database_url).await?;
         crate::store::run_migrations(&db).await?;
         let store = Store::new(db);
         let pinning = PinningCoordinator::build_with_kubo(validated_pinning, Some(kubo.clone()))?;

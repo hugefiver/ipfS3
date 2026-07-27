@@ -12,7 +12,7 @@ An S3-compatible gateway backed by IPFS (Kubo). Translates S3 API calls into Kub
 - **SigV4 Authentication** — AWS Signature Version 4 via [s3s](https://github.com/s3s-project/s3s)
 - **Per-object Encryption** — SSE-S3 (gateway-managed key) and SSE-C (customer-provided key) with AES-256-GCM
 - **Content-addressed Storage** — ETag = IPFS CID; plain objects accessible via any public IPFS gateway (`https://ipfs.io/ipfs/<CID>`)
-- **Streaming** — Never buffers entire request/response bodies; true end-to-end streaming
+- **Streaming** — Request and response bodies stream end to end; the one documented exception is a Range read of an encrypted object, which decrypts the full object before slicing (chunk-level encrypted Range is a roadmap item)
 - **Dual Backend** — SQLite (dev) or PostgreSQL (prod) via sea-orm, with sequential schema migrations
 - **Remote Pinning** — Asynchronous Pinata/Filebase PSA pinning with ordered policies, durable work, leases, and local soft quotas
 

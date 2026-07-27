@@ -57,20 +57,16 @@ pub struct StoredObject {
 pub async fn add_plain_object_stream<S, E>(
     state: &Arc<AppState>,
     stream: S,
-) -> S3Result<StoredObject>
+) -> crate::error::AppResult<StoredObject>
 where
     S: Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
     E: Into<Box<dyn std::error::Error + Send + Sync>> + Send + 'static,
 {
     let (counter, count_handle) = ByteCounter::new();
     let counted = counter.wrap(stream);
-    let cid = crate::kubo::add::stream_add(&state.kubo, counted, 1)
-        .await
-        .map_err(|e| s3s::s3_error!(InternalError, "kubo add: {e}"))?;
+    let cid = crate::kubo::add::stream_add(&state.kubo, counted, 1).await?;
 
-    if let Err(e) = crate::kubo::pin::pin_add(&state.kubo, &cid).await {
-        return Err(s3s::s3_error!(InternalError, "pin: {e}"));
-    }
+    crate::kubo::pin::pin_add(&state.kubo, &cid).await?;
 
     Ok(StoredObject {
         cid,
@@ -504,9 +500,7 @@ async fn collect_legacy_sse_c_plaintext(
     key: Arc<crate::crypto::ObjectKey>,
     collect_plaintext: bool,
 ) -> S3Result<Option<Vec<u8>>> {
-    let cat = crate::kubo::cat::stream_cat(&state.kubo, &obj.cid, None)
-        .await
-        .map_err(|e| s3s::s3_error!(InternalError, "cat: {e}"))?;
+    let cat = crate::kubo::cat::stream_cat(&state.kubo, &obj.cid, None).await?;
     let decrypted = crate::crypto::chunker::decrypt_chunk_stream(cat, key);
     tokio::pin!(decrypted);
     let mut observed = 0_i64;
@@ -516,6 +510,7 @@ async fn collect_legacy_sse_c_plaintext(
             crate::error::AppError::Crypto(_) => {
                 s3s::s3_error!(AccessDenied, "SSE-C object authentication failed")
             }
+            error @ crate::error::AppError::KuboRpc { .. } => error.into(),
             other => s3s::s3_error!(InternalError, "decrypt: {other}"),
         })?;
         let len = i64::try_from(chunk.len())
@@ -614,9 +609,7 @@ pub async fn put_object(
         Option<String>,
     ) = match enc_mode {
         EncryptionMode::None => {
-            let cid = crate::kubo::add::stream_add(&state.kubo, stream, 1)
-                .await
-                .map_err(|e| s3s::s3_error!(InternalError, "kubo add: {e}"))?;
+            let cid = crate::kubo::add::stream_add(&state.kubo, stream, 1).await?;
             (cid, false, None, None)
         }
         EncryptionMode::SseS3 => {
@@ -630,9 +623,7 @@ pub async fn put_object(
             let pinned = Box::pin(stream);
             let encrypted_stream =
                 crate::crypto::chunker::encrypt_chunk_stream(pinned, Arc::new(ok));
-            let cid = crate::kubo::add::stream_add(&state.kubo, encrypted_stream, 1)
-                .await
-                .map_err(|e| s3s::s3_error!(InternalError, "kubo add: {e}"))?;
+            let cid = crate::kubo::add::stream_add(&state.kubo, encrypted_stream, 1).await?;
             (cid, true, Some(wrapped), None)
         }
         EncryptionMode::SseC => {
@@ -641,9 +632,7 @@ pub async fn put_object(
             let pinned = Box::pin(stream);
             let encrypted_stream =
                 crate::crypto::chunker::encrypt_chunk_stream(pinned, Arc::new(validated.key));
-            let cid = crate::kubo::add::stream_add(&state.kubo, encrypted_stream, 1)
-                .await
-                .map_err(|e| s3s::s3_error!(InternalError, "kubo add: {e}"))?;
+            let cid = crate::kubo::add::stream_add(&state.kubo, encrypted_stream, 1).await?;
             (cid, true, None, Some(fingerprint))
         }
     };
@@ -653,9 +642,7 @@ pub async fn put_object(
     // A CID can be shared with an earlier publication, and an RPC failure does
     // not prove Kubo left the pin unchanged. Conservative cleanup here could
     // therefore remove content that another object still needs.
-    if let Err(e) = crate::kubo::pin::pin_add(&state.kubo, &cid).await {
-        return Err(s3s::s3_error!(InternalError, "pin: {e}"));
-    }
+    crate::kubo::pin::pin_add(&state.kubo, &cid).await?;
 
     let object_created_at = chrono::Utc::now();
     let publication = PublicationRequest {
@@ -763,15 +750,14 @@ pub async fn get_object(
             // Encrypted objects are chunked, so we cannot ask Kubo for a byte
             // range directly. Collect the decrypted plaintext and slice it.
             // (MVP trade-off: v0.9 will optimize to chunk-level Range.)
-            let cat_stream = crate::kubo::cat::stream_cat(&state.kubo, &obj.cid, None)
-                .await
-                .map_err(|e| s3s::s3_error!(InternalError, "cat: {e}"))?;
+            let cat_stream = crate::kubo::cat::stream_cat(&state.kubo, &obj.cid, None).await?;
             let decrypted = crate::crypto::chunker::decrypt_chunk_stream(cat_stream, ok_arc);
             let chunks: Vec<Bytes> = decrypted.try_collect().await.map_err(|e| match e {
                 crate::error::AppError::Crypto(_) => s3s::s3_error!(
                     AccessDenied,
                     "decryption failed — SSE-C key may not match the key used during upload"
                 ),
+                error @ crate::error::AppError::KuboRpc { .. } => error.into(),
                 other => s3s::s3_error!(InternalError, "decrypt: {other}"),
             })?;
             let mut collected = Vec::with_capacity(chunks.iter().map(Bytes::len).sum());
@@ -800,7 +786,7 @@ pub async fn get_object(
             let stream = async_stream::stream! {
                 let cat = crate::kubo::cat::stream_cat(&kubo, &cid, None)
                     .await
-                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    .map_err(|_| std::io::Error::other(crate::error::INTERNAL_STORAGE_BACKEND_ERROR))?;
                 let decrypted = crate::crypto::chunker::decrypt_chunk_stream(cat, ok_clone);
                 let mut s = Box::pin(decrypted);
                 while let Some(chunk) = s.next().await {
@@ -809,8 +795,10 @@ pub async fn get_object(
                         Err(crate::error::AppError::Crypto(_)) => {
                             yield Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "decryption failed — SSE-C key mismatch"));
                         }
-                        Err(e) => {
-                            yield Err(std::io::Error::other(e.to_string()));
+                        Err(_) => {
+                            yield Err(std::io::Error::other(
+                                crate::error::INTERNAL_STORAGE_BACKEND_ERROR,
+                            ));
                         }
                     }
                 }
@@ -825,7 +813,7 @@ pub async fn get_object(
         let stream = async_stream::stream! {
             let cat = crate::kubo::cat::stream_cat(&kubo, &cid, kubo_range)
                 .await
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
+                .map_err(|_| std::io::Error::other(crate::error::INTERNAL_STORAGE_BACKEND_ERROR))?;
             tokio::pin!(cat);
             while let Some(chunk) = cat.next().await {
                 yield chunk;
@@ -878,15 +866,14 @@ async fn build_sse_c_get_response(
         let plaintext = if let Some(plaintext) = auth.legacy_plaintext.take() {
             plaintext
         } else {
-            let cat = crate::kubo::cat::stream_cat(&state.kubo, &obj.cid, None)
-                .await
-                .map_err(|e| s3s::s3_error!(InternalError, "cat: {e}"))?;
+            let cat = crate::kubo::cat::stream_cat(&state.kubo, &obj.cid, None).await?;
             let decrypted = crate::crypto::chunker::decrypt_chunk_stream(cat, auth.key.clone());
             let chunks: Vec<Bytes> =
                 decrypted.try_collect().await.map_err(|error| match error {
                     crate::error::AppError::Crypto(_) => {
                         s3s::s3_error!(AccessDenied, "SSE-C object authentication failed")
                     }
+                    error @ crate::error::AppError::KuboRpc { .. } => error.into(),
                     other => s3s::s3_error!(InternalError, "decrypt: {other}"),
                 })?;
             let mut plaintext = Vec::with_capacity(chunks.iter().map(Bytes::len).sum());
@@ -917,7 +904,7 @@ async fn build_sse_c_get_response(
         let stream = async_stream::stream! {
             let cat = crate::kubo::cat::stream_cat(&kubo, &cid, None)
                 .await
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
+                .map_err(|_| std::io::Error::other(crate::error::INTERNAL_STORAGE_BACKEND_ERROR))?;
             let decrypted = crate::crypto::chunker::decrypt_chunk_stream(cat, key);
             tokio::pin!(decrypted);
             while let Some(chunk) = decrypted.next().await {
@@ -930,7 +917,9 @@ async fn build_sse_c_get_response(
                         ));
                         return;
                     }
-                    Err(error) => yield Err(std::io::Error::other(error.to_string())),
+                    Err(_) => yield Err(std::io::Error::other(
+                        crate::error::INTERNAL_STORAGE_BACKEND_ERROR,
+                    )),
                 }
             }
         };
@@ -1124,9 +1113,7 @@ pub async fn copy_object(
     };
 
     // Re-pin the (content-addressed) CID so the copy is independently pinned.
-    crate::kubo::pin::pin_add(&state.kubo, &src_obj.cid)
-        .await
-        .map_err(|e| s3s::s3_error!(InternalError, "pin: {e}"))?;
+    crate::kubo::pin::pin_add(&state.kubo, &src_obj.cid).await?;
 
     let new_id = uuid::Uuid::new_v4().to_string();
     let object_created_at = chrono::Utc::now();
@@ -2204,7 +2191,10 @@ mod tests {
             .await;
         Mock::given(method("POST"))
             .and(path("/api/v0/pin/add"))
-            .respond_with(ResponseTemplate::new(500).set_body_string("pin failed"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_string("kubo-body-marker-do-not-leak http://127.0.0.1:5001"),
+            )
             .mount(&kubo)
             .await;
         Mock::given(method("POST"))
@@ -2219,6 +2209,12 @@ mod tests {
             .expect_err("a Kubo pin-add failure must fail PutObject");
 
         assert_eq!(error.code().as_str(), "InternalError");
+        assert_eq!(error.message(), Some("internal storage backend error"));
+        assert!(
+            !error.to_string().contains("kubo-body-marker-do-not-leak")
+                && !error.to_string().contains("127.0.0.1"),
+            "PutObject must not expose Kubo body or endpoint: {error}"
+        );
         assert!(
             kubo.received_requests()
                 .await
@@ -2828,14 +2824,15 @@ mod tests {
             .await;
 
         let state = test_state(kubo.uri()).await;
-        let err = add_plain_object_stream(
+        let err: s3s::S3Error = add_plain_object_stream(
             &state,
             stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from_static(
                 b"hello",
             ))]),
         )
         .await
-        .unwrap_err();
+        .unwrap_err()
+        .into();
 
         assert_eq!(err.code().as_str(), "InternalError");
         let requests = kubo.received_requests().await.unwrap();

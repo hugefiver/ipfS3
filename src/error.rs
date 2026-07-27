@@ -1,6 +1,41 @@
 use s3s::s3_error;
 use s3s::{S3Error, S3ErrorCode};
 
+pub const INTERNAL_STORAGE_BACKEND_ERROR: &str = "internal storage backend error";
+
+/// Private provenance attached to a successful Kubo response whose body fails
+/// after headers have been accepted. Its display text is safe for response
+/// streams, while callers can still distinguish it from ordinary I/O failures.
+#[derive(Debug, thiserror::Error)]
+#[error("internal storage backend error")]
+pub(crate) struct KuboStreamError;
+
+pub(crate) fn kubo_stream_error() -> std::io::Error {
+    std::io::Error::other(KuboStreamError)
+}
+
+pub(crate) fn has_kubo_stream_provenance(error: &(dyn std::error::Error + 'static)) -> bool {
+    fn contains_kubo_stream_error(error: &(dyn std::error::Error + 'static), depth: u8) -> bool {
+        if depth == 0 {
+            return false;
+        }
+        if error.is::<KuboStreamError>() {
+            return true;
+        }
+        if let Some(io_error) = error.downcast_ref::<std::io::Error>()
+            && let Some(source) = io_error.get_ref()
+            && contains_kubo_stream_error(source, depth - 1)
+        {
+            return true;
+        }
+        error
+            .source()
+            .is_some_and(|source| contains_kubo_stream_error(source, depth - 1))
+    }
+
+    contains_kubo_stream_error(error, 32)
+}
+
 fn invalid_parameter_value(error: &AppError) -> S3Error {
     let mut s3_error = S3Error::with_message(
         S3ErrorCode::Custom("InvalidParameterValue".into()),
@@ -61,8 +96,10 @@ pub enum AppError {
     #[error("access denied: {0}")]
     AccessDenied(String),
 
-    #[error("kubo rpc error: {0}")]
-    KuboRpc(String),
+    /// Kubo failures retain diagnostic detail for controlled inspection, but
+    /// their Display output must be safe for ordinary logs and S3 responses.
+    #[error("kubo rpc failure")]
+    KuboRpc { status: Option<u16>, detail: String },
 
     #[error("database error: {0}")]
     Database(String),
@@ -94,6 +131,7 @@ impl From<AppError> for S3Error {
             | AppError::ZipArchiveRejected(_) => invalid_parameter_value(&e),
             AppError::AccessDenied(_) => s3_error!(AccessDenied, "{}", e),
             AppError::Database(_) => s3_error!(InternalError, "internal database error"),
+            AppError::KuboRpc { .. } => s3_error!(InternalError, "internal storage backend error"),
             _ => s3_error!(InternalError, "{}", e),
         }
     }
@@ -110,7 +148,26 @@ impl From<sea_orm::DbErr> for AppError {
 
 impl From<reqwest::Error> for AppError {
     fn from(e: reqwest::Error) -> Self {
-        AppError::KuboRpc(e.to_string())
+        AppError::KuboRpc {
+            status: e.status().map(|status| status.as_u16()),
+            detail: e.to_string(),
+        }
+    }
+}
+
+impl AppError {
+    pub(crate) fn kubo_rpc_status(status: http::StatusCode) -> Self {
+        Self::KuboRpc {
+            status: Some(status.as_u16()),
+            detail: format!("Kubo returned HTTP {}", status.as_u16()),
+        }
+    }
+
+    pub(crate) fn kubo_rpc_detail(detail: impl Into<String>) -> Self {
+        Self::KuboRpc {
+            status: None,
+            detail: detail.into(),
+        }
     }
 }
 
@@ -145,5 +202,16 @@ mod tests {
 
         assert_eq!(err.code().as_str(), "InternalError");
         assert_eq!(err.message(), Some("internal database error"));
+    }
+
+    #[test]
+    fn kubo_rpc_errors_map_to_a_stable_generic_internal_error() {
+        let kubo_error = AppError::kubo_rpc_detail("private daemon details");
+        assert_eq!(kubo_error.to_string(), "kubo rpc failure");
+
+        let err: S3Error = kubo_error.into();
+
+        assert_eq!(err.code().as_str(), "InternalError");
+        assert_eq!(err.message(), Some(INTERNAL_STORAGE_BACKEND_ERROR));
     }
 }

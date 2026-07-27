@@ -231,9 +231,7 @@ async fn authenticate_sse_c_parts(
     preflight_sse_c_part_sizes(parts)?;
 
     for (cid, expected_size) in parts {
-        let part_stream = crate::kubo::cat::stream_cat(kubo, cid, None)
-            .await
-            .map_err(|e| s3s::s3_error!(InternalError, "cat: {e}"))?;
+        let part_stream = crate::kubo::cat::stream_cat(kubo, cid, None).await?;
         let decrypted = crate::crypto::chunker::decrypt_chunk_stream(part_stream, key.clone());
         tokio::pin!(decrypted);
         let mut observed_size = 0_i64;
@@ -254,6 +252,7 @@ async fn authenticate_sse_c_parts(
                         "failed to decrypt part during complete — SSE-C key may not match the key used to upload parts"
                     ));
                 }
+                Err(error @ crate::error::AppError::KuboRpc { .. }) => return Err(error.into()),
                 Err(error) => {
                     return Err(s3s::s3_error!(
                         InternalError,
@@ -340,9 +339,7 @@ pub async fn upload_part(
     let stream = counter.wrap(body);
 
     let cid: String = match enc_mode {
-        EncryptionMode::None => crate::kubo::add::stream_add(&state.kubo, stream, 1)
-            .await
-            .map_err(|e| s3s::s3_error!(InternalError, "kubo add: {e}"))?,
+        EncryptionMode::None => crate::kubo::add::stream_add(&state.kubo, stream, 1).await?,
         EncryptionMode::SseS3 => {
             let wrapped = upload.key_wrap.as_ref().ok_or_else(|| {
                 s3s::s3_error!(InternalError, "missing wrapped key for SSE-S3 upload")
@@ -354,9 +351,7 @@ pub async fn upload_part(
             let pinned = Box::pin(stream);
             let encrypted_stream =
                 crate::crypto::chunker::encrypt_chunk_stream(pinned, Arc::new(ok));
-            crate::kubo::add::stream_add(&state.kubo, encrypted_stream, 1)
-                .await
-                .map_err(|e| s3s::s3_error!(InternalError, "kubo add: {e}"))?
+            crate::kubo::add::stream_add(&state.kubo, encrypted_stream, 1).await?
         }
         EncryptionMode::SseC => {
             let ok = sse_c_key.ok_or_else(|| {
@@ -368,17 +363,13 @@ pub async fn upload_part(
             let pinned = Box::pin(stream);
             let encrypted_stream =
                 crate::crypto::chunker::encrypt_chunk_stream(pinned, Arc::new(ok));
-            crate::kubo::add::stream_add(&state.kubo, encrypted_stream, 1)
-                .await
-                .map_err(|e| s3s::s3_error!(InternalError, "kubo add: {e}"))?
+            crate::kubo::add::stream_add(&state.kubo, encrypted_stream, 1).await?
         }
     };
 
     let part_size = count_handle.load(Ordering::Relaxed) as i64;
 
-    crate::kubo::pin::pin_add(&state.kubo, &cid)
-        .await
-        .map_err(|e| s3s::s3_error!(InternalError, "pin: {e}"))?;
+    crate::kubo::pin::pin_add(&state.kubo, &cid).await?;
 
     crate::store::multipart::upsert_part(db, upload_id, part_number, &cid, part_size, &cid).await?;
 
@@ -817,16 +808,14 @@ pub async fn complete_multipart_upload_inner(
                 for cid in &part_cids {
                     let part_stream = crate::kubo::cat::stream_cat(&kubo, cid, None)
                         .await
-                        .map_err(|e| std::io::Error::other(e.to_string()))?;
+                        .map_err(|_| std::io::Error::other(crate::error::INTERNAL_STORAGE_BACKEND_ERROR))?;
                     tokio::pin!(part_stream);
                     while let Some(chunk) = part_stream.next().await {
                         yield chunk;
                     }
                 }
             };
-            crate::kubo::add::stream_add(&state.kubo, concat_stream, 1)
-                .await
-                .map_err(|e| s3s::s3_error!(InternalError, "add: {e}"))?
+            crate::kubo::add::stream_add(&state.kubo, concat_stream, 1).await?
         }
         EncryptionMode::SseS3 | EncryptionMode::SseC => {
             // Encrypted: each part was independently encrypted with its own
@@ -871,7 +860,7 @@ pub async fn complete_multipart_upload_inner(
                 for cid in &part_cids {
                     let part_stream = crate::kubo::cat::stream_cat(&decrypt_kubo, cid, None)
                         .await
-                        .map_err(|e| std::io::Error::other(e.to_string()))?;
+                        .map_err(|_| std::io::Error::other(crate::error::INTERNAL_STORAGE_BACKEND_ERROR))?;
                     let decrypted = crate::crypto::chunker::decrypt_chunk_stream(
                         part_stream,
                         decrypt_ok.clone(),
@@ -890,10 +879,18 @@ pub async fn complete_multipart_upload_inner(
                                 ));
                                 return;
                             }
-                            Err(e) => {
+                            Err(error @ crate::error::AppError::KuboRpc { .. }) => {
+                                *err_flag.lock().unwrap() = Some(error);
                                 yield Err(std::io::Error::other(
-                                    e.to_string(),
+                                    crate::error::INTERNAL_STORAGE_BACKEND_ERROR,
                                 ));
+                                return;
+                            }
+                            Err(_) => {
+                                yield Err(std::io::Error::other(
+                                    crate::error::INTERNAL_STORAGE_BACKEND_ERROR,
+                                ));
+                                return;
                             }
                         }
                     }
@@ -908,20 +905,26 @@ pub async fn complete_multipart_upload_inner(
 
             // Check the out-of-band decryption error flag FIRST — if the
             // decrypt failed, the stream_add error is just a side effect.
-            if decrypt_err.lock().unwrap().take().is_some() {
-                return Err(s3s::s3_error!(
-                    InvalidPart,
-                    "failed to decrypt part during complete — SSE-C key may not match the key used to upload parts"
-                ));
+            if let Some(error) = decrypt_err.lock().unwrap().take() {
+                return match error {
+                    crate::error::AppError::Crypto(_) => Err(s3s::s3_error!(
+                        InvalidPart,
+                        "failed to decrypt part during complete — SSE-C key may not match the key used to upload parts"
+                    )),
+                    error @ crate::error::AppError::KuboRpc { .. } => Err(error.into()),
+                    _ => Err(s3s::s3_error!(
+                        InternalError,
+                        "{}",
+                        crate::error::INTERNAL_STORAGE_BACKEND_ERROR
+                    )),
+                };
             }
 
-            root_result.map_err(|e| s3s::s3_error!(InternalError, "add: {e}"))?
+            root_result?
         }
     };
 
-    crate::kubo::pin::pin_add(&state.kubo, &root_cid)
-        .await
-        .map_err(|e| s3s::s3_error!(InternalError, "pin: {e}"))?;
+    crate::kubo::pin::pin_add(&state.kubo, &root_cid).await?;
 
     let (encrypted, key_wrap): (bool, Option<String>) = match enc_mode {
         EncryptionMode::None => (false, None),
@@ -1033,6 +1036,10 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1858,6 +1865,60 @@ mod tests {
 
         assert_eq!(error.code().as_str(), "InvalidPart");
         assert!(kubo.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn authenticate_sse_c_parts_maps_a_stalled_kubo_body_to_fixed_internal_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (first_chunk_sent, first_chunk_observed) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut byte = [0_u8; 1];
+                socket.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nX\r\n")
+                .await
+                .unwrap();
+            first_chunk_sent.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let client = crate::kubo::KuboClient::new_with_timeouts(
+            endpoint,
+            Duration::from_secs(300),
+            Duration::from_millis(50),
+        );
+        let parts = vec![("QmStalled".to_owned(), 1)];
+        let authentication = tokio::spawn(async move {
+            authenticate_sse_c_parts(
+                &client,
+                &parts,
+                Arc::new(crate::crypto::ObjectKey { bytes: [7; 32] }),
+            )
+            .await
+        });
+        first_chunk_observed.await.unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(2), authentication)
+            .await
+            .expect("a stalled Kubo part body must not hang authentication")
+            .unwrap()
+            .expect_err("a stalled Kubo part body must fail authentication");
+
+        assert_eq!(error.code().as_str(), "InternalError");
+        assert_eq!(
+            error.message(),
+            Some(crate::error::INTERNAL_STORAGE_BACKEND_ERROR)
+        );
+        server.abort();
+        let _ = server.await;
     }
 
     #[test]
