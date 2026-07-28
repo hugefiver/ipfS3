@@ -2384,7 +2384,7 @@ mod tests {
             .and(path("/uploads/v3/files"))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_delay(Duration::from_millis(200))
+                    .set_delay(Duration::from_secs(2))
                     .set_body_json(json!({ "data": { "id": "file-7", "cid": "bafy-target" } })),
             )
             .mount(&server)
@@ -2425,7 +2425,7 @@ mod tests {
                 .build()
                 .unwrap(),
             reqwest::Client::builder()
-                .timeout(Duration::from_millis(20))
+                .timeout(Duration::from_secs(1))
                 .build()
                 .unwrap(),
         );
@@ -2477,7 +2477,7 @@ mod tests {
             .and(path("/pinning/pinFileToIPFS"))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_delay(Duration::from_millis(200))
+                    .set_delay(Duration::from_secs(2))
                     .set_body_json(json!({ "IpfsHash": "bafy-target", "ID": "legacy-file-7" })),
             )
             .mount(&server)
@@ -2516,7 +2516,7 @@ mod tests {
                 .build()
                 .unwrap(),
             reqwest::Client::builder()
-                .timeout(Duration::from_millis(20))
+                .timeout(Duration::from_secs(1))
                 .build()
                 .unwrap(),
         );

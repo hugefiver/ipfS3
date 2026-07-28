@@ -1,7 +1,9 @@
+use std::time::Duration;
+
 use chrono::Utc;
 use sea_orm::{
     ColumnTrait, ConnectOptions, ConnectionTrait, Database, DatabaseBackend, DatabaseConnection,
-    EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, Statement,
+    EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, Statement, TransactionTrait,
 };
 
 use super::*;
@@ -209,6 +211,47 @@ async fn setup_file_backed(name: &str) -> (tempfile::TempDir, DatabaseConnection
         .await
         .unwrap();
     (directory, db)
+}
+
+#[tokio::test]
+async fn sqlite_publication_waits_for_existing_writer_before_starting_read_snapshot() {
+    let (_directory, db) = setup_file_backed("publication-write-intent.sqlite").await;
+    let blocker = db.begin().await.unwrap();
+    blocker
+        .execute(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "UPDATE buckets SET owner = owner WHERE name = 'bucket'",
+        ))
+        .await
+        .unwrap();
+
+    let publication = request(
+        object(
+            "write-intent-publication",
+            "write-intent-key",
+            "bafy-write-intent",
+            7,
+        ),
+        vec![],
+        vec![],
+    );
+    let provider_limits = limits();
+    let (published, ()) = tokio::join!(publish_object(&db, publication, &provider_limits), async {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        blocker.rollback().await.unwrap();
+    },);
+    assert!(
+        published.is_ok(),
+        "publication should wait for the existing writer: {published:?}"
+    );
+
+    let latest = crate::store::object::get_latest(&db, "bucket", "write-intent-key")
+        .await
+        .unwrap();
+    assert_eq!(
+        (latest.id.as_str(), latest.cid.as_str(), latest.is_latest),
+        ("write-intent-publication", "bafy-write-intent", true)
+    );
 }
 
 async fn seed_upload(db: &DatabaseConnection, upload_id: &str, key: &str) {

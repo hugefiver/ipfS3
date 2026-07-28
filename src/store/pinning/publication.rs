@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
+use sea_orm::sea_query::Expr;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait, QueryFilter,
     QueryOrder, QuerySelect, Set, TransactionError, TransactionTrait,
@@ -15,7 +16,7 @@ use crate::{
         tags::{ContentMode, ObjectTag},
     },
     store::{
-        entities::{multipart_upload, object, pin_lease, pin_lease_target, remote_pin},
+        entities::{bucket, multipart_upload, object, pin_lease, pin_lease_target, remote_pin},
         multipart::{CommitCompletedUploadError, ReconciledCommitOutcome},
         object::LatestObjectRow,
     },
@@ -310,6 +311,25 @@ async fn publication_attempt(
     .await
 }
 
+async fn acquire_sqlite_publication_write_intent<C: ConnectionTrait>(
+    db: &C,
+    bucket_name: &str,
+) -> AppResult<()> {
+    if db.get_database_backend() != DatabaseBackend::Sqlite {
+        return Ok(());
+    }
+
+    bucket::Entity::update_many()
+        .col_expr(
+            bucket::Column::Owner,
+            Expr::col(bucket::Column::Owner).into(),
+        )
+        .filter(bucket::Column::Name.eq(bucket_name))
+        .exec(db)
+        .await?;
+    Ok(())
+}
+
 async fn publish_in_transaction<C: ConnectionTrait>(
     db: &C,
     request: PublicationRequest,
@@ -325,12 +345,13 @@ async fn publish_in_transaction<C: ConnectionTrait>(
             ));
         }
     }
+    let attachment_pairs = publication_attachment_pairs(&request, &entries, limits)?;
+    acquire_sqlite_publication_write_intent(db, &request.object.bucket).await?;
     let publication_time = Utc::now();
     let object_id = request.object.id.clone();
 
     let previous_owner_ids =
         lock_previous_publication_owners(db, &request.object, &entries).await?;
-    let attachment_pairs = publication_attachment_pairs(&request, &entries, limits)?;
     leases::lock_publication_lifecycle_frontier(db, &previous_owner_ids, &attachment_pairs).await?;
     let attachment_providers: Vec<_> = attachment_pairs
         .iter()

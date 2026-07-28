@@ -9229,6 +9229,11 @@ mod tests {
     async fn manual_renewal_orders_owner_then_lease_target_and_remote_work() {
         let _order_test_guard = test_gates::LIFECYCLE_ORDER_TEST_LOCK.lock().await;
         let db = setup().await;
+        db.execute_unprepared(
+            "INSERT INTO objects (id, bucket, key, cid, size, etag, is_latest) VALUES ('object-renewal-order', 'bucket', 'renewal-order-key', 'bafy-renewal-order', 100, 'bafy-renewal-order', TRUE)",
+        )
+        .await
+        .unwrap();
         seed_remote(
             &db,
             "pinata",
@@ -9252,29 +9257,42 @@ mod tests {
             time(10),
         )
         .await;
+        let updated = db
+            .execute_unprepared(
+                "UPDATE pin_leases SET owner_object_id = 'object-renewal-order' WHERE id = 'lease-renewal-order'",
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.rows_affected(), 1);
         start_lifecycle_order_recording(
             &["lease-renewal-order"],
             &["target-renewal-order"],
             &[("pinata", "bafy-renewal-order")],
         )
         .await;
-        include_owner_in_lifecycle_order_recording("object-1").await;
+        include_owner_in_lifecycle_order_recording("object-renewal-order").await;
 
-        renew_manual_lease(&db, "object-1", "lease-renewal-order", time(20), time(1))
-            .await
-            .unwrap();
+        renew_manual_lease(
+            &db,
+            "object-renewal-order",
+            "lease-renewal-order",
+            time(20),
+            time(1),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             finish_lifecycle_order_recording().await,
             vec![
-                test_gates::LifecycleOrderEvent::OwnerLock("object-1".to_owned()),
+                test_gates::LifecycleOrderEvent::OwnerLock("object-renewal-order".to_owned()),
                 test_gates::LifecycleOrderEvent::LeaseLock("lease-renewal-order".to_owned()),
                 test_gates::LifecycleOrderEvent::TargetLock("target-renewal-order".to_owned(),),
                 test_gates::LifecycleOrderEvent::RemoteLock(
                     "pinata".to_owned(),
                     "bafy-renewal-order".to_owned(),
                 ),
-                test_gates::LifecycleOrderEvent::OwnerGuard("object-1".to_owned()),
+                test_gates::LifecycleOrderEvent::OwnerGuard("object-renewal-order".to_owned()),
                 test_gates::LifecycleOrderEvent::LeaseCas("lease-renewal-order".to_owned()),
                 test_gates::LifecycleOrderEvent::TargetCas("target-renewal-order".to_owned()),
                 test_gates::LifecycleOrderEvent::RemoteWork(

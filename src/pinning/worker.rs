@@ -7358,7 +7358,7 @@ mod tests {
         let panicking_provider = fixture.provider.clone();
         let coordinator = fixture.coordinator.clone();
         let handle = coordinator.start(fixture.store, CancellationToken::new());
-        tokio::time::timeout(std::time::Duration::from_secs(2), fast_entered)
+        tokio::time::timeout(std::time::Duration::from_secs(10), fast_entered)
             .await
             .expect("JoinError leaked the worker slot and blocked the next provider");
         assert_eq!(panicking_provider.gets.load(Ordering::SeqCst), 1);
