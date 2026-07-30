@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
@@ -471,6 +471,11 @@ struct AuthenticatedSseCObject {
     legacy_plaintext: Option<Vec<u8>>,
 }
 
+enum CopySourceSseCAuthentication {
+    StoredFingerprint(String),
+    Legacy(ValidatedSseCHeaders),
+}
+
 fn verify_object_sse_c_fingerprint(
     state: &Arc<AppState>,
     fingerprint: &str,
@@ -589,6 +594,10 @@ pub async fn put_object(
     }
 
     let enc_mode = determine_encryption_mode(&req.headers)?;
+    let sse_c_headers = match enc_mode {
+        EncryptionMode::SseC => Some(extract_sse_c_headers(&req.headers)?),
+        EncryptionMode::None | EncryptionMode::SseS3 => None,
+    };
     let metadata = extract_custom_metadata(&req.headers);
     let object_id = uuid::Uuid::new_v4().to_string();
 
@@ -597,6 +606,16 @@ pub async fn put_object(
         .input
         .body
         .ok_or_else(|| s3s::s3_error!(IncompleteBody, "request body is missing"))?;
+
+    let mutation_guard = crate::store::import::ownership::admit_content_mutation(
+        db,
+        bucket,
+        key,
+        None,
+        crate::import::SupersedeReason::PutObject,
+        chrono::Utc::now(),
+    )
+    .await?;
 
     // Wrap the body with a byte counter so we can record the plaintext size.
     let (counter, count_handle) = ByteCounter::new();
@@ -627,7 +646,7 @@ pub async fn put_object(
             (cid, true, Some(wrapped), None)
         }
         EncryptionMode::SseC => {
-            let validated = extract_sse_c_headers(&req.headers)?;
+            let validated = sse_c_headers.expect("SSE-C headers validated before admission");
             let fingerprint = state.master_key.sse_c_key_fingerprint(&validated.key);
             let pinned = Box::pin(stream);
             let encrypted_stream =
@@ -666,9 +685,10 @@ pub async fn put_object(
             logical_size: size,
         },
     };
-    if let Err(e) = crate::store::pinning::publication::publish_object(
+    if let Err(e) = crate::store::pinning::publication::publish_standard_object(
         db,
         publication,
+        mutation_guard,
         state.pinning.provider_limits(),
     )
     .await
@@ -992,10 +1012,21 @@ pub async fn delete_object(
     let key = &req.input.key;
     let db = state.store.db();
 
-    if !crate::store::pinning::publication::delete_latest_with_leases(
+    let mutation_guard = crate::store::import::ownership::admit_content_mutation(
         db,
         bucket,
         key,
+        None,
+        crate::import::SupersedeReason::DeleteObject,
+        chrono::Utc::now(),
+    )
+    .await?;
+
+    if !crate::store::pinning::publication::delete_latest_with_leases_guarded(
+        db,
+        bucket,
+        key,
+        mutation_guard,
         chrono::Utc::now(),
     )
     .await?
@@ -1011,6 +1042,12 @@ pub async fn delete_objects(
     req: S3Request<DeleteObjectsInput>,
 ) -> S3Result<S3Response<DeleteObjectsOutput>> {
     let DeleteObjectsInput { bucket, delete, .. } = req.input;
+    if delete.objects.len() > 1000 {
+        return Err(s3s::s3_error!(
+            MalformedXML,
+            "DeleteObjects accepts at most 1000 object identifiers"
+        ));
+    }
     let db = state.store.db();
 
     if !crate::store::bucket::exists(db, &bucket).await? {
@@ -1018,31 +1055,91 @@ pub async fn delete_objects(
     }
 
     let quiet = delete.quiet.unwrap_or(false);
+    let objects = delete.objects;
+    let keys = objects
+        .iter()
+        .map(|object| object.key.clone())
+        .collect::<Vec<_>>();
+    let mutation_guards = crate::store::import::ownership::admit_content_mutations(
+        db,
+        &bucket,
+        &keys,
+        None,
+        crate::import::SupersedeReason::DeleteObject,
+        chrono::Utc::now(),
+    )
+    .await?;
+    let mut mutation_guards = mutation_guards
+        .into_iter()
+        .map(|guard| (guard.key.clone(), guard))
+        .collect::<BTreeMap<_, _>>();
     let mut deleted = Vec::new();
     let mut errors = Vec::new();
+    let mut outcomes = HashMap::<String, Option<(String, String)>>::new();
 
-    for object in delete.objects {
+    for object in objects {
         // v0.2 has no versioning; ObjectIdentifier::version_id is deliberately ignored.
         let key = object.key;
-        match crate::store::pinning::publication::delete_latest_with_leases(
+        if let Some(previous) = outcomes.get(&key) {
+            if let Some((code, message)) = previous {
+                errors.push(Error {
+                    code: Some(code.clone()),
+                    key: Some(key),
+                    message: Some(message.clone()),
+                    version_id: None,
+                });
+            } else if !quiet {
+                deleted.push(DeletedObject {
+                    key: Some(key),
+                    ..Default::default()
+                });
+            }
+            continue;
+        }
+        let Some(guard) = mutation_guards.remove(&key) else {
+            return Err(crate::error::AppError::Internal(
+                "DeleteObjects admission returned no mutation guard".to_owned(),
+            )
+            .into());
+        };
+        match crate::store::pinning::publication::delete_latest_with_leases_guarded(
             db,
             &bucket,
             &key,
+            guard,
             chrono::Utc::now(),
         )
         .await
         {
-            Ok(_) if !quiet => deleted.push(DeletedObject {
-                key: Some(key),
-                ..Default::default()
-            }),
-            Ok(_) => {}
+            Ok(_) if !quiet => {
+                outcomes.insert(key.clone(), None);
+                deleted.push(DeletedObject {
+                    key: Some(key),
+                    ..Default::default()
+                });
+            }
+            Ok(_) => {
+                outcomes.insert(key, None);
+            }
             Err(error) => {
                 tracing::error!(%bucket, %key, %error, "failed to delete object");
+                let (code, message) =
+                    if matches!(error, crate::error::AppError::StaleContentMutation) {
+                        (
+                            "OperationAborted".to_owned(),
+                            "content mutation was superseded by a newer operation".to_owned(),
+                        )
+                    } else {
+                        (
+                            "InternalError".to_owned(),
+                            "failed to delete object".to_owned(),
+                        )
+                    };
+                outcomes.insert(key.clone(), Some((code.clone(), message.clone())));
                 errors.push(Error {
-                    code: Some("InternalError".to_owned()),
+                    code: Some(code),
                     key: Some(key),
-                    message: Some("failed to delete object".to_owned()),
+                    message: Some(message),
                     version_id: None,
                 });
             }
@@ -1090,18 +1187,21 @@ pub async fn copy_object(
     let policy = evaluate_publication_policy(state, dst_bucket, dst_key, &tags)?;
 
     let source_sse_c_headers = extract_copy_source_sse_c_headers(&req.headers)?;
-    let verified_source_fingerprint = if src_obj.encrypted && src_obj.key_wrap.is_none() {
+    let source_sse_c_authentication = if src_obj.encrypted && src_obj.key_wrap.is_none() {
         let headers = source_sse_c_headers.ok_or_else(|| {
             s3s::s3_error!(
                 InvalidArgument,
                 "complete copy-source SSE-C headers are required"
             )
         })?;
-        Some(
-            authenticate_sse_c_object(state, &src_obj, headers, false)
-                .await?
-                .fingerprint,
-        )
+        if let Some(fingerprint) = src_obj.sse_c_key_fingerprint.as_deref() {
+            verify_object_sse_c_fingerprint(state, fingerprint, &headers.key)?;
+            Some(CopySourceSseCAuthentication::StoredFingerprint(
+                fingerprint.to_owned(),
+            ))
+        } else {
+            Some(CopySourceSseCAuthentication::Legacy(headers))
+        }
     } else {
         if source_sse_c_headers.is_some() {
             return Err(s3s::s3_error!(
@@ -1110,6 +1210,26 @@ pub async fn copy_object(
             ));
         }
         None
+    };
+
+    let mutation_guard = crate::store::import::ownership::admit_content_mutation(
+        db,
+        dst_bucket,
+        dst_key,
+        None,
+        crate::import::SupersedeReason::CopyObject,
+        chrono::Utc::now(),
+    )
+    .await?;
+
+    let verified_source_fingerprint = match source_sse_c_authentication {
+        Some(CopySourceSseCAuthentication::StoredFingerprint(fingerprint)) => Some(fingerprint),
+        Some(CopySourceSseCAuthentication::Legacy(headers)) => Some(
+            authenticate_sse_c_object(state, &src_obj, headers, false)
+                .await?
+                .fingerprint,
+        ),
+        None => None,
     };
 
     // Re-pin the (content-addressed) CID so the copy is independently pinned.
@@ -1131,7 +1251,7 @@ pub async fn copy_object(
         object_created_at,
     );
     object.multipart = src_obj.multipart;
-    crate::store::pinning::publication::publish_object(
+    crate::store::pinning::publication::publish_standard_object(
         db,
         PublicationRequest {
             object,
@@ -1142,6 +1262,7 @@ pub async fn copy_object(
                 logical_size: src_obj.size,
             },
         },
+        mutation_guard,
         state.pinning.provider_limits(),
     )
     .await?;

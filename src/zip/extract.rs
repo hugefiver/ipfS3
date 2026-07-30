@@ -1,3 +1,4 @@
+use std::convert::Infallible;
 use std::io;
 use std::sync::Arc;
 
@@ -20,21 +21,73 @@ pub struct ExtractOutcome {
     pub failures: Vec<ExtractFailure>,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum ObservedExtractionError<E>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    #[error("ZIP archive extraction failed")]
+    Archive(#[source] S3Error),
+    #[error("ZIP archive exceeds the decompression limit")]
+    Limit(#[source] S3Error),
+    #[error("ZIP extraction observer failed")]
+    Observer(#[source] E),
+}
+
+#[async_trait::async_trait]
+pub trait ExtractionObserver: Send {
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    async fn entry_started(&mut self, key: &str) -> Result<(), Self::Error>;
+    async fn entry_finished(&mut self, entry: &ExtractedEntry) -> Result<(), Self::Error>;
+    async fn entry_failed(&mut self, key: &str, error: &ExtractFailure) -> Result<(), Self::Error>;
+    async fn bytes_processed(&mut self, bytes: u64) -> Result<(), Self::Error>;
+}
+
+struct NoopObserver;
+
+#[async_trait::async_trait]
+impl ExtractionObserver for NoopObserver {
+    type Error = Infallible;
+
+    async fn entry_started(&mut self, _key: &str) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    async fn entry_finished(&mut self, _entry: &ExtractedEntry) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    async fn entry_failed(
+        &mut self,
+        _key: &str,
+        _error: &ExtractFailure,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    async fn bytes_processed(&mut self, _bytes: u64) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
 /// Total decompressed bytes a single `decompress-zip` archive may expand to.
 ///
 /// Remote pin quotas bound only provider storage; this bounds the local Kubo
 /// datastore against a compression bomb.
 pub const MAX_DECOMPRESSED_ARCHIVE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
-enum EntryTransferError {
+enum EntryTransferError<E> {
     Upload(S3Error),
     Read(io::Error),
     BudgetExceeded,
+    Observer(E),
 }
 
-enum CopyFailure {
+enum CopyFailure<E> {
     Io(io::Error),
     BudgetExceeded,
+    Observer(E),
 }
 
 /// Copy `reader` into `writer`, charging every byte against `remaining`.
@@ -42,14 +95,16 @@ enum CopyFailure {
 /// Returns `CopyFailure::BudgetExceeded` as soon as the budget would go
 /// negative, before those bytes reach `writer`. The caller is responsible for
 /// shutting `writer` down afterwards; see `upload_entry_to_kubo`.
-async fn copy_with_budget<R, W>(
+async fn copy_with_budget<R, W, O>(
     reader: &mut R,
     writer: &mut W,
     remaining: &mut u64,
-) -> Result<(), CopyFailure>
+    observer: &mut O,
+) -> Result<(), CopyFailure<O::Error>>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
+    O: ExtractionObserver,
 {
     let mut buffer = vec![0u8; 64 * 1024];
     loop {
@@ -58,6 +113,10 @@ where
             return Ok(());
         }
         let read = u64::try_from(read).map_err(|_| CopyFailure::BudgetExceeded)?;
+        observer
+            .bytes_processed(read)
+            .await
+            .map_err(CopyFailure::Observer)?;
         if read > *remaining {
             return Err(CopyFailure::BudgetExceeded);
         }
@@ -70,13 +129,15 @@ where
     }
 }
 
-async fn upload_entry_to_kubo<R>(
+async fn upload_entry_to_kubo<R, O>(
     state: &Arc<AppState>,
     reader: &mut R,
     remaining: &mut u64,
-) -> Result<StoredObject, EntryTransferError>
+    observer: &mut O,
+) -> Result<StoredObject, EntryTransferError<O::Error>>
 where
     R: futures_io::AsyncRead + Unpin + Send,
+    O: ExtractionObserver,
 {
     let (duplex_reader, mut duplex_writer) = tokio::io::duplex(64 * 1024);
     let mut upload = Box::pin(async {
@@ -86,7 +147,7 @@ where
     });
     let mut copy = Box::pin(async {
         let mut tokio_reader = reader.compat();
-        copy_with_budget(&mut tokio_reader, &mut duplex_writer, remaining).await
+        copy_with_budget(&mut tokio_reader, &mut duplex_writer, remaining, observer).await
     });
 
     tokio::select! {
@@ -105,6 +166,7 @@ where
                     (Ok(()), Err(error)) => Err(EntryTransferError::Read(error)),
                     (Err(CopyFailure::BudgetExceeded), _) => Err(EntryTransferError::BudgetExceeded),
                     (Err(CopyFailure::Io(error)), _) => Err(EntryTransferError::Read(error)),
+                    (Err(CopyFailure::Observer(error)), _) => Err(EntryTransferError::Observer(error)),
                 }
             }
         },
@@ -113,6 +175,7 @@ where
             let shutdown = duplex_writer.shutdown().await;
             match (copy_result, shutdown) {
                 (Err(CopyFailure::BudgetExceeded), _) => Err(EntryTransferError::BudgetExceeded),
+                (Err(CopyFailure::Observer(error)), _) => Err(EntryTransferError::Observer(error)),
                 (Err(CopyFailure::Io(error)), _) => match upload.await {
                     Err(upload) if error.kind() == io::ErrorKind::BrokenPipe => {
                         Err(EntryTransferError::Upload(upload))
@@ -149,6 +212,20 @@ fn failure(entry_name: &str, code: &str, message: impl ToString) -> ExtractFailu
     }
 }
 
+async fn record_failure<O: ExtractionObserver>(
+    observer: &mut O,
+    failures: &mut Vec<ExtractFailure>,
+    key: &str,
+    failure: ExtractFailure,
+) -> Result<(), ObservedExtractionError<O::Error>> {
+    observer
+        .entry_failed(key, &failure)
+        .await
+        .map_err(ObservedExtractionError::Observer)?;
+    failures.push(failure);
+    Ok(())
+}
+
 pub async fn extract_zip_stream<S, E>(
     state: &Arc<AppState>,
     target_prefix: &str,
@@ -172,6 +249,36 @@ where
     S: Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
     E: std::error::Error + Send + Sync + 'static,
 {
+    let mut observer = NoopObserver;
+    match extract_zip_stream_observed(
+        state,
+        target_prefix,
+        stream,
+        max_decompressed_bytes,
+        &mut observer,
+    )
+    .await
+    {
+        Ok(outcome) => Ok(outcome),
+        Err(ObservedExtractionError::Archive(error) | ObservedExtractionError::Limit(error)) => {
+            Err(error)
+        }
+        Err(ObservedExtractionError::Observer(error)) => match error {},
+    }
+}
+
+pub async fn extract_zip_stream_observed<S, E, O>(
+    state: &Arc<AppState>,
+    target_prefix: &str,
+    stream: S,
+    max_decompressed_bytes: u64,
+    observer: &mut O,
+) -> Result<ExtractOutcome, ObservedExtractionError<O::Error>>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
+    E: std::error::Error + Send + Sync + 'static,
+    O: ExtractionObserver,
+{
     let mut remaining = max_decompressed_bytes;
     let source = StreamReader::new(stream.map_err(io::Error::other));
     let (source, local_headers) = observe_local_headers(source);
@@ -185,12 +292,14 @@ where
             Ok(next) => next,
             Err(error) => {
                 if let Some(error) = backend_stream_error(&error) {
-                    return Err(error);
+                    return Err(ObservedExtractionError::Archive(error));
                 }
-                return Err(crate::error::AppError::ZipArchiveRejected(format!(
-                    "invalid zip archive: {error}"
-                ))
-                .into());
+                return Err(ObservedExtractionError::Archive(
+                    crate::error::AppError::ZipArchiveRejected(format!(
+                        "invalid zip archive: {error}"
+                    ))
+                    .into(),
+                ));
             }
         };
         let Some(mut entry_reader) = next else {
@@ -200,12 +309,14 @@ where
             Ok(local) => local,
             Err(error) => {
                 if let Some(error) = backend_stream_error(&error) {
-                    return Err(error);
+                    return Err(ObservedExtractionError::Archive(error));
                 }
-                return Err(crate::error::AppError::ZipArchiveRejected(format!(
-                    "invalid zip local header: {error}"
-                ))
-                .into());
+                return Err(ObservedExtractionError::Archive(
+                    crate::error::AppError::ZipArchiveRejected(format!(
+                        "invalid zip local header: {error}"
+                    ))
+                    .into(),
+                ));
             }
         };
         let entry = entry_reader.reader().entry().clone();
@@ -215,43 +326,67 @@ where
             (async_zip::Compression::Stored, 0) | (async_zip::Compression::Deflate, 8)
         );
         if !supported {
-            return Err(crate::error::AppError::UnsupportedZipEntry(
-                "local-header compression method must match Stored(0) or Deflate(8)".to_string(),
-            )
-            .into());
+            return Err(ObservedExtractionError::Archive(
+                crate::error::AppError::UnsupportedZipEntry(
+                    "local-header compression method must match Stored(0) or Deflate(8)"
+                        .to_string(),
+                )
+                .into(),
+            ));
         }
         if local.compression_method == 0 && local.uses_descriptor() {
-            return Err(crate::error::AppError::UnsupportedZipEntry(
-                "Stored entry uses general-purpose bit 3 (data descriptor)".to_string(),
-            )
-            .into());
+            return Err(ObservedExtractionError::Archive(
+                crate::error::AppError::UnsupportedZipEntry(
+                    "Stored entry uses general-purpose bit 3 (data descriptor)".to_string(),
+                )
+                .into(),
+            ));
         }
         let name = entry
             .filename()
             .as_str()
             .map_err(|_| {
-                crate::error::AppError::InvalidZipEntry("entry name is not valid UTF-8".to_string())
+                ObservedExtractionError::Archive(
+                    crate::error::AppError::InvalidZipEntry(
+                        "entry name is not valid UTF-8".to_string(),
+                    )
+                    .into(),
+                )
             })?
             .to_string();
-        let sanitized = sanitize_entry(&name, target_prefix).map_err(S3Error::from)?;
+        let sanitized = sanitize_entry(&name, target_prefix)
+            .map_err(S3Error::from)
+            .map_err(ObservedExtractionError::Archive)?;
 
         let key = match sanitized {
             SanitizedEntry::Directory => {
                 // A `dir/`-named entry may still carry a payload; charge the
                 // inflate work rather than skipping it uncounted.
+                let directory_key = format!("{target_prefix}{}", name.trim_matches('/'));
                 let drain_result = {
                     let mut reader = entry_reader.reader_mut().compat();
                     let mut sink = tokio::io::sink();
-                    copy_with_budget(&mut reader, &mut sink, &mut remaining).await
+                    copy_with_budget(&mut reader, &mut sink, &mut remaining, observer).await
                 };
                 match drain_result {
                     Ok(()) => {}
-                    Err(CopyFailure::BudgetExceeded) => return Err(budget_rejection()),
+                    Err(CopyFailure::BudgetExceeded) => {
+                        return Err(ObservedExtractionError::Limit(budget_rejection()));
+                    }
+                    Err(CopyFailure::Observer(error)) => {
+                        return Err(ObservedExtractionError::Observer(error));
+                    }
                     Err(CopyFailure::Io(error)) => {
                         if let Some(error) = backend_stream_error(&error) {
-                            return Err(error);
+                            return Err(ObservedExtractionError::Archive(error));
                         }
-                        failures.push(failure(&name, "EntryReadFailed", error));
+                        record_failure(
+                            observer,
+                            &mut failures,
+                            &directory_key,
+                            failure(&name, "EntryReadFailed", error),
+                        )
+                        .await?;
                         return Ok(ExtractOutcome { entries, failures });
                     }
                 }
@@ -262,9 +397,15 @@ where
                     }
                     Err(error) => {
                         if let Some(error) = backend_stream_error(&error) {
-                            return Err(error);
+                            return Err(ObservedExtractionError::Archive(error));
                         }
-                        failures.push(failure(&name, "EntryReadFailed", error));
+                        record_failure(
+                            observer,
+                            &mut failures,
+                            &directory_key,
+                            failure(&name, "EntryReadFailed", error),
+                        )
+                        .await?;
                         return Ok(ExtractOutcome { entries, failures });
                     }
                 }
@@ -272,24 +413,48 @@ where
             SanitizedEntry::File { key } => key,
         };
 
+        observer
+            .entry_started(&key)
+            .await
+            .map_err(ObservedExtractionError::Observer)?;
+
         let stored =
-            match upload_entry_to_kubo(state, entry_reader.reader_mut(), &mut remaining).await {
+            match upload_entry_to_kubo(state, entry_reader.reader_mut(), &mut remaining, observer)
+                .await
+            {
                 Ok(stored) => stored,
                 Err(EntryTransferError::Upload(error)) => {
-                    failures.push(failure(&name, "EntryUploadFailed", error));
+                    record_failure(
+                        observer,
+                        &mut failures,
+                        &key,
+                        failure(&name, "EntryUploadFailed", error),
+                    )
+                    .await?;
                     let drain_result = {
                         let mut reader = entry_reader.reader_mut().compat();
                         let mut sink = tokio::io::sink();
-                        copy_with_budget(&mut reader, &mut sink, &mut remaining).await
+                        copy_with_budget(&mut reader, &mut sink, &mut remaining, observer).await
                     };
                     match drain_result {
                         Ok(()) => {}
-                        Err(CopyFailure::BudgetExceeded) => return Err(budget_rejection()),
+                        Err(CopyFailure::BudgetExceeded) => {
+                            return Err(ObservedExtractionError::Limit(budget_rejection()));
+                        }
+                        Err(CopyFailure::Observer(error)) => {
+                            return Err(ObservedExtractionError::Observer(error));
+                        }
                         Err(CopyFailure::Io(error)) => {
                             if let Some(error) = backend_stream_error(&error) {
-                                return Err(error);
+                                return Err(ObservedExtractionError::Archive(error));
                             }
-                            failures.push(failure(&name, "EntryReadFailed", error));
+                            record_failure(
+                                observer,
+                                &mut failures,
+                                &key,
+                                failure(&name, "EntryReadFailed", error),
+                            )
+                            .await?;
                             return Ok(ExtractOutcome { entries, failures });
                         }
                     }
@@ -300,37 +465,65 @@ where
                         }
                         Err(error) => {
                             if let Some(error) = backend_stream_error(&error) {
-                                return Err(error);
+                                return Err(ObservedExtractionError::Archive(error));
                             }
-                            failures.push(failure(&name, "EntryReadFailed", error));
+                            record_failure(
+                                observer,
+                                &mut failures,
+                                &key,
+                                failure(&name, "EntryReadFailed", error),
+                            )
+                            .await?;
                             return Ok(ExtractOutcome { entries, failures });
                         }
                     }
                 }
                 Err(EntryTransferError::Read(error)) => {
                     if let Some(error) = backend_stream_error(&error) {
-                        return Err(error);
+                        return Err(ObservedExtractionError::Archive(error));
                     }
-                    failures.push(failure(&name, "EntryReadFailed", error));
+                    record_failure(
+                        observer,
+                        &mut failures,
+                        &key,
+                        failure(&name, "EntryReadFailed", error),
+                    )
+                    .await?;
                     return Ok(ExtractOutcome { entries, failures });
                 }
-                Err(EntryTransferError::BudgetExceeded) => return Err(budget_rejection()),
+                Err(EntryTransferError::BudgetExceeded) => {
+                    return Err(ObservedExtractionError::Limit(budget_rejection()));
+                }
+                Err(EntryTransferError::Observer(error)) => {
+                    return Err(ObservedExtractionError::Observer(error));
+                }
             };
 
         match entry_reader.done().await {
             Ok(ready) => {
-                entries.push(ExtractedEntry {
+                let extracted = ExtractedEntry {
                     key,
                     cid: stored.cid,
                     size: stored.size,
-                });
+                };
+                observer
+                    .entry_finished(&extracted)
+                    .await
+                    .map_err(ObservedExtractionError::Observer)?;
+                entries.push(extracted);
                 zip = ready;
             }
             Err(error) => {
                 if let Some(error) = backend_stream_error(&error) {
-                    return Err(error);
+                    return Err(ObservedExtractionError::Archive(error));
                 }
-                failures.push(failure(&name, "EntryReadFailed", error));
+                record_failure(
+                    observer,
+                    &mut failures,
+                    &key,
+                    failure(&name, "EntryReadFailed", error),
+                )
+                .await?;
                 return Ok(ExtractOutcome { entries, failures });
             }
         }
@@ -361,7 +554,10 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use super::extract_zip_stream;
+    use super::{
+        ExtractFailure, ExtractedEntry, ExtractionObserver, ObservedExtractionError,
+        extract_zip_stream, extract_zip_stream_observed,
+    };
     use crate::crypto::key::MasterKey;
     use crate::kubo::KuboClient;
     use crate::state::AppState;
@@ -983,6 +1179,17 @@ mod tests {
 
         assert_eq!(error.code().as_str(), "InvalidParameterValue");
         assert_eq!(error.status_code(), Some(http::StatusCode::BAD_REQUEST));
+        let message = error
+            .message()
+            .expect("budget rejection must have a message");
+        assert!(
+            message.contains(&super::MAX_DECOMPRESSED_ARCHIVE_BYTES.to_string()),
+            "wrapper-visible message must retain the global limit: {message}"
+        );
+        assert!(
+            !message.contains("the 7 byte decompression limit"),
+            "custom limits must not change the compatibility message: {message}"
+        );
         assert_kubo_call_counts(&server, 1, 1).await;
         assert!(
             requests_for(&server)
@@ -1146,5 +1353,320 @@ mod tests {
         assert_eq!(outcome.entries.len(), 1);
         assert!(outcome.failures.is_empty());
         drop(server);
+    }
+
+    #[derive(Default)]
+    struct RecordingObserver {
+        events: Arc<Mutex<Vec<String>>>,
+        bytes: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl ExtractionObserver for RecordingObserver {
+        type Error = io::Error;
+
+        async fn entry_started(&mut self, key: &str) -> Result<(), Self::Error> {
+            self.events.lock().unwrap().push(format!("start:{key}"));
+            Ok(())
+        }
+
+        async fn entry_finished(&mut self, entry: &ExtractedEntry) -> Result<(), Self::Error> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("finish:{}", entry.key));
+            Ok(())
+        }
+
+        async fn entry_failed(
+            &mut self,
+            key: &str,
+            error: &ExtractFailure,
+        ) -> Result<(), Self::Error> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("failed:{key}:{}", error.code));
+            Ok(())
+        }
+
+        async fn bytes_processed(&mut self, bytes: u64) -> Result<(), Self::Error> {
+            self.bytes = self
+                .bytes
+                .checked_add(bytes)
+                .ok_or_else(|| io::Error::other("byte counter overflow"))?;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn observer_sees_sanitized_key_before_kubo_add_and_truthful_bytes() {
+        let kubo = MockServer::start().await;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        Mock::given(method("POST"))
+            .and(path("/api/v0/add"))
+            .respond_with({
+                let events = events.clone();
+                move |_: &wiremock::Request| {
+                    events.lock().unwrap().push("kubo-add".to_owned());
+                    ResponseTemplate::new(200)
+                        .set_body_string("{\"Hash\":\"QmEntry\",\"Size\":\"5\"}\n")
+                }
+            })
+            .expect(1)
+            .mount(&kubo)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/pin/add"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&kubo)
+            .await;
+        let state = test_state(kubo.uri()).await;
+        let mut observer = RecordingObserver {
+            events: events.clone(),
+            bytes: 0,
+        };
+
+        let outcome = extract_zip_stream_observed(
+            &state,
+            "prefix/",
+            stream::iter(vec![Ok::<_, io::Error>(Bytes::from(single_entry_zip(
+                0, false,
+            )))]),
+            HELLO.len() as u64,
+            &mut observer,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.entries[0].key, "prefix/file.txt");
+        assert_eq!(observer.bytes, HELLO.len() as u64);
+        let events = events.lock().unwrap();
+        let started = events
+            .iter()
+            .position(|event| event == "start:prefix/file.txt")
+            .unwrap();
+        let added = events.iter().position(|event| event == "kubo-add").unwrap();
+        let finished = events
+            .iter()
+            .position(|event| event == "finish:prefix/file.txt")
+            .unwrap();
+        assert!(started < added, "observer events: {events:?}");
+        assert!(added < finished, "observer events: {events:?}");
+    }
+
+    #[tokio::test]
+    async fn observer_reports_the_full_overflowing_read_before_budget_rejection() {
+        let (state, kubo) = extractor_state_with_add_responses(
+            vec![
+                ResponseTemplate::new(200)
+                    .set_body_string("{\"Hash\":\"QmOverflow\",\"Size\":\"0\"}\n"),
+            ],
+            0,
+        )
+        .await;
+        let mut observer = RecordingObserver::default();
+
+        let error = extract_zip_stream_observed(
+            &state,
+            "prefix/",
+            stream::iter(vec![Ok::<_, io::Error>(Bytes::from(single_entry_zip(
+                0, false,
+            )))]),
+            2,
+            &mut observer,
+        )
+        .await
+        .expect_err("a five-byte read must exceed a two-byte budget");
+
+        let archive_error = match error {
+            ObservedExtractionError::Limit(error) => error,
+            ObservedExtractionError::Archive(error) => {
+                panic!("budget rejection lost its typed limit classification: {error}")
+            }
+            ObservedExtractionError::Observer(error) => {
+                panic!("observer error was reclassified: {error}")
+            }
+        };
+        assert_eq!(observer.bytes, HELLO.len() as u64);
+        let message = archive_error
+            .message()
+            .expect("budget rejection must have a message");
+        assert!(message.contains(&super::MAX_DECOMPRESSED_ARCHIVE_BYTES.to_string()));
+        assert!(!message.contains("the 2 byte decompression limit"));
+        let requests = requests_for(&kubo).await;
+        assert!(
+            requests
+                .iter()
+                .filter(|request| request.url.path() == "/api/v0/add")
+                .all(|request| !request
+                    .body
+                    .windows(HELLO.len())
+                    .any(|bytes| bytes == HELLO)),
+            "overflow bytes must never reach Kubo"
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.url.path() != "/api/v0/pin/add")
+        );
+        assert_eq!(
+            crate::store::entities::object::Entity::find()
+                .count(state.store.db())
+                .await
+                .unwrap(),
+            0,
+            "budget rejection must remain pre-publication"
+        );
+    }
+
+    #[derive(Debug, PartialEq, Eq, thiserror::Error)]
+    #[error("overflow observer sentinel")]
+    struct OverflowObserverSentinel;
+
+    #[derive(Default)]
+    struct RejectingOverflowObserver {
+        started: Vec<String>,
+        reads: Vec<u64>,
+    }
+
+    #[async_trait::async_trait]
+    impl ExtractionObserver for RejectingOverflowObserver {
+        type Error = OverflowObserverSentinel;
+
+        async fn entry_started(&mut self, key: &str) -> Result<(), Self::Error> {
+            self.started.push(key.to_owned());
+            Ok(())
+        }
+
+        async fn entry_finished(&mut self, _entry: &ExtractedEntry) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        async fn entry_failed(
+            &mut self,
+            _key: &str,
+            _error: &ExtractFailure,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        async fn bytes_processed(&mut self, bytes: u64) -> Result<(), Self::Error> {
+            self.reads.push(bytes);
+            Err(OverflowObserverSentinel)
+        }
+    }
+
+    #[tokio::test]
+    async fn overflowing_read_preserves_observer_error_without_writing_overflow_bytes() {
+        let (state, kubo) = extractor_state_with_add_responses(
+            vec![
+                ResponseTemplate::new(200)
+                    .set_body_string("{\"Hash\":\"QmOverflow\",\"Size\":\"0\"}\n"),
+            ],
+            0,
+        )
+        .await;
+        let mut observer = RejectingOverflowObserver::default();
+
+        let error = extract_zip_stream_observed(
+            &state,
+            "prefix/",
+            stream::iter(vec![Ok::<_, io::Error>(Bytes::from(single_entry_zip(
+                0, false,
+            )))]),
+            2,
+            &mut observer,
+        )
+        .await
+        .expect_err("the sentinel observer must abort the overflowing read");
+
+        match error {
+            ObservedExtractionError::Observer(error) => {
+                assert_eq!(error, OverflowObserverSentinel)
+            }
+            ObservedExtractionError::Archive(error) => {
+                panic!("budget rejection incorrectly outranked the observer sentinel: {error}")
+            }
+            ObservedExtractionError::Limit(error) => {
+                panic!("budget rejection incorrectly outranked the observer sentinel: {error}")
+            }
+        }
+        assert_eq!(observer.started, ["prefix/file.txt"]);
+        assert_eq!(observer.reads, [HELLO.len() as u64]);
+        let requests = requests_for(&kubo).await;
+        let add_requests = requests
+            .iter()
+            .filter(|request| request.url.path() == "/api/v0/add")
+            .collect::<Vec<_>>();
+        assert!(
+            add_requests.iter().all(|request| !request
+                .body
+                .windows(HELLO.len())
+                .any(|bytes| bytes == HELLO)),
+            "observer-rejected overflow bytes must never reach Kubo"
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.url.path() != "/api/v0/pin/add")
+        );
+        assert_eq!(
+            crate::store::entities::object::Entity::find()
+                .count(state.store.db())
+                .await
+                .unwrap(),
+            0,
+            "observer rejection must remain pre-publication"
+        );
+    }
+
+    struct RejectingObserver;
+
+    #[async_trait::async_trait]
+    impl ExtractionObserver for RejectingObserver {
+        type Error = io::Error;
+
+        async fn entry_started(&mut self, _key: &str) -> Result<(), Self::Error> {
+            Err(io::Error::other("superseded"))
+        }
+
+        async fn entry_finished(&mut self, _entry: &ExtractedEntry) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        async fn entry_failed(
+            &mut self,
+            _key: &str,
+            _error: &ExtractFailure,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        async fn bytes_processed(&mut self, _bytes: u64) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn observer_error_aborts_before_kubo_add_without_reclassification() {
+        let (state, kubo) = extractor_state_with_add_responses(Vec::new(), 0).await;
+        let mut observer = RejectingObserver;
+
+        let error = extract_zip_stream_observed(
+            &state,
+            "prefix/",
+            stream::iter(vec![Ok::<_, io::Error>(Bytes::from(single_entry_zip(
+                0, false,
+            )))]),
+            HELLO.len() as u64,
+            &mut observer,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, ObservedExtractionError::Observer(_)));
+        assert_kubo_call_counts(&kubo, 0, 0).await;
     }
 }

@@ -1,0 +1,14 @@
+services:
+  postgres-import:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: ipfs3_import_test
+      POSTGRES_USER: ipfs3
+      POSTGRES_PASSWORD: ipfs3
+    ports:
+      - "${IPFS3_IMPORT_POSTGRES_PORT:-55432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ipfs3 -d ipfs3_import_test"]
+      interval: 1s
+      timeout: 5s
+      retries: 30

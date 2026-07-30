@@ -4,7 +4,7 @@
 //! starts the production S3 service against scripted Kubo RPC responses.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, mpsc};
 
 use axum::error_handling::HandleError;
 use axum::http::{Response, StatusCode};
@@ -92,6 +92,63 @@ pub struct KuboHarness {
     cat_bodies: Arc<std::sync::RwLock<HashMap<String, Vec<u8>>>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KuboBlockTarget {
+    Add,
+    Cat,
+    PinAdd,
+}
+
+pub struct KuboBlockControl {
+    reached: Option<mpsc::Receiver<()>>,
+    release: Option<mpsc::Sender<()>>,
+}
+
+impl KuboBlockControl {
+    pub async fn wait_until_blocked(&mut self) {
+        let reached = self.reached.take().expect("Kubo block is awaited once");
+        tokio::task::spawn_blocking(move || {
+            reached
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("Kubo request reached deterministic block")
+        })
+        .await
+        .expect("join Kubo block waiter");
+    }
+
+    pub fn release(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+    }
+}
+
+impl Drop for KuboBlockControl {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+#[derive(Clone)]
+struct KuboBlocker {
+    target: KuboBlockTarget,
+    reached: mpsc::Sender<()>,
+    release: Arc<Mutex<Option<mpsc::Receiver<()>>>>,
+}
+
+impl KuboBlocker {
+    fn block_once(&self, target: KuboBlockTarget) {
+        if self.target != target {
+            return;
+        }
+        let Some(release) = self.release.lock().expect("Kubo block mutex").take() else {
+            return;
+        };
+        let _ = self.reached.send(());
+        let _ = release.recv_timeout(std::time::Duration::from_secs(10));
+    }
+}
+
 pub struct S3ServerHandle {
     pub endpoint: String,
     cancellation: tokio_util::sync::CancellationToken,
@@ -130,6 +187,13 @@ pub struct ObservedHttpRequest {
 }
 
 pub async fn start_kubo_harness(script: KuboScript) -> KuboHarness {
+    start_kubo_harness_with_blocker(script, None).await
+}
+
+async fn start_kubo_harness_with_blocker(
+    script: KuboScript,
+    blocker: Option<KuboBlocker>,
+) -> KuboHarness {
     let kubo = MockServer::start().await;
     let KuboScript {
         add_replies,
@@ -146,7 +210,11 @@ pub async fn start_kubo_harness(script: KuboScript) -> KuboHarness {
             .respond_with({
                 let add_replies = add_replies.clone();
                 let add_file_bytes = add_file_bytes.clone();
+                let blocker = blocker.clone();
                 move |request: &wiremock::Request| {
+                    if let Some(blocker) = &blocker {
+                        blocker.block_once(KuboBlockTarget::Add);
+                    }
                     add_file_bytes
                         .lock()
                         .expect("add capture mutex")
@@ -174,7 +242,11 @@ pub async fn start_kubo_harness(script: KuboScript) -> KuboHarness {
         .and(path("/api/v0/cat"))
         .respond_with({
             let cat_bodies = cat_bodies.clone();
+            let blocker = blocker.clone();
             move |request: &wiremock::Request| {
+                if let Some(blocker) = &blocker {
+                    blocker.block_once(KuboBlockTarget::Cat);
+                }
                 let arg = request
                     .url
                     .query_pairs()
@@ -193,9 +265,16 @@ pub async fn start_kubo_harness(script: KuboScript) -> KuboHarness {
         .mount(&kubo)
         .await;
     for pin_path in ["/api/v0/pin/add", "/api/v0/pin/rm"] {
+        let blocker = blocker.clone();
+        let block_target = (pin_path == "/api/v0/pin/add").then_some(KuboBlockTarget::PinAdd);
         Mock::given(method("POST"))
             .and(path(pin_path))
-            .respond_with(ResponseTemplate::new(200).set_body_string("{\"Pins\":[]}"))
+            .respond_with(move |_: &wiremock::Request| {
+                if let (Some(blocker), Some(target)) = (&blocker, block_target) {
+                    blocker.block_once(target);
+                }
+                ResponseTemplate::new(200).set_body_string("{\"Pins\":[]}")
+            })
             .mount(&kubo)
             .await;
     }
@@ -208,11 +287,37 @@ pub async fn start_kubo_harness(script: KuboScript) -> KuboHarness {
 }
 
 pub async fn start_harness(script: KuboScript) -> TestHarness {
+    build_harness(start_kubo_harness(script).await).await
+}
+
+pub async fn start_blocking_harness(
+    script: KuboScript,
+    target: KuboBlockTarget,
+) -> (TestHarness, KuboBlockControl) {
+    let (reached_tx, reached_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let blocker = KuboBlocker {
+        target,
+        reached: reached_tx,
+        release: Arc::new(Mutex::new(Some(release_rx))),
+    };
+    let kubo = start_kubo_harness_with_blocker(script, Some(blocker)).await;
+    let harness = build_harness(kubo).await;
+    (
+        harness,
+        KuboBlockControl {
+            reached: Some(reached_rx),
+            release: Some(release_tx),
+        },
+    )
+}
+
+async fn build_harness(kubo_harness: KuboHarness) -> TestHarness {
     let KuboHarness {
         server: kubo,
         add_file_bytes,
         cat_bodies,
-    } = start_kubo_harness(script).await;
+    } = kubo_harness;
 
     let db = Database::connect("sqlite::memory:")
         .await
@@ -252,13 +357,30 @@ pub async fn start_s3_server(
     state: Arc<ipfs_s3_gateway::state::AppState>,
     observed_http: Arc<tokio::sync::Mutex<Vec<ObservedHttpRequest>>>,
 ) -> S3ServerHandle {
+    let import_config = ipfs_s3_gateway::import::ImportConfig::default()
+        .validate()
+        .expect("validate default import configuration");
+    let downloader = ipfs_s3_gateway::import::downloader::SourceDownloader::production(Arc::new(
+        import_config.clone(),
+    ));
+    let imports =
+        ipfs_s3_gateway::import::pipeline::ImportCoordinator::new(import_config, downloader);
+    start_s3_server_with_imports(state, observed_http, imports).await
+}
+
+pub async fn start_s3_server_with_imports(
+    state: Arc<ipfs_s3_gateway::state::AppState>,
+    observed_http: Arc<tokio::sync::Mutex<Vec<ObservedHttpRequest>>>,
+    imports: Arc<ipfs_s3_gateway::import::pipeline::ImportCoordinator>,
+) -> S3ServerHandle {
     let s3_impl = ipfs_s3_gateway::s3::handler::S3Impl::new(state.clone());
     let mut builder = S3ServiceBuilder::new(s3_impl);
     builder.set_validation(AwsNameValidation::new());
     builder.set_auth(ipfs_s3_gateway::auth::GatewayAuth::new(state.clone()));
-    builder.set_route(
-        ipfs_s3_gateway::s3::route::decompress_zip::DecompressZipRoute::new(state.clone()),
-    );
+    builder.set_route(ipfs_s3_gateway::s3::route::gateway::GatewayRoute::new(
+        state.clone(),
+        imports,
+    ));
     let service = HandleError::new(builder.build(), handle_s3_error);
     let app = Router::new()
         .fallback_service(service)
@@ -479,7 +601,7 @@ pub async fn upload_part_with_headers(
 }
 
 pub async fn complete_multipart(
-    harness: &TestHarness,
+    harness: &(impl S3TestEndpoint + ?Sized),
     key: &str,
     upload_id: &str,
     parts: &[(i32, String)],
@@ -488,7 +610,7 @@ pub async fn complete_multipart(
 }
 
 pub async fn complete_multipart_with_headers(
-    harness: &TestHarness,
+    harness: &(impl S3TestEndpoint + ?Sized),
     key: &str,
     upload_id: &str,
     parts: &[(i32, String)],
@@ -506,8 +628,8 @@ pub async fn complete_multipart_with_headers(
     xml.push_str("</CompleteMultipartUpload>");
     crate::support::sigv4::send_sigv4(
         reqwest::Method::POST,
-        &harness.endpoint,
-        &harness.bucket,
+        harness.endpoint(),
+        harness.bucket(),
         key,
         &[("uploadId", upload_id)],
         xml.into_bytes(),

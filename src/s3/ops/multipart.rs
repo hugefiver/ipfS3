@@ -405,6 +405,7 @@ pub struct CompletedMultipartArchive {
     pub decompress_zip_target: Option<String>,
     pub decompress_zip_result: bool,
     pub server_side_encryption: Option<ServerSideEncryption>,
+    pub mutation_guard: crate::store::import::ownership::StandardMutationGuard,
 }
 
 #[async_trait::async_trait]
@@ -413,6 +414,7 @@ pub(crate) trait CompletedUploadFinalizerStore: Send + Sync {
         &self,
         upload_id: &str,
         request: PublicationRequest,
+        guard: crate::store::import::ownership::StandardMutationGuard,
         limits: &ProviderLimitMap,
     ) -> Result<PublicationResult, crate::store::multipart::CommitCompletedUploadError>;
 
@@ -420,6 +422,7 @@ pub(crate) trait CompletedUploadFinalizerStore: Send + Sync {
         &self,
         upload_id: &str,
         request: ZipPublicationRequest,
+        guard: crate::store::import::ownership::StandardMutationGuard,
         limits: &ProviderLimitMap,
     ) -> Result<PublicationResult, crate::store::multipart::CommitCompletedUploadError>;
 
@@ -440,10 +443,11 @@ impl CompletedUploadFinalizerStore for DatabaseCompletedUploadFinalizer<'_> {
         &self,
         upload_id: &str,
         request: PublicationRequest,
+        guard: crate::store::import::ownership::StandardMutationGuard,
         limits: &ProviderLimitMap,
     ) -> Result<PublicationResult, crate::store::multipart::CommitCompletedUploadError> {
-        crate::store::pinning::publication::publish_completed_upload(
-            self.db, upload_id, request, limits,
+        crate::store::pinning::publication::publish_standard_completed_upload(
+            self.db, upload_id, request, guard, limits,
         )
         .await
     }
@@ -452,10 +456,11 @@ impl CompletedUploadFinalizerStore for DatabaseCompletedUploadFinalizer<'_> {
         &self,
         upload_id: &str,
         request: ZipPublicationRequest,
+        guard: crate::store::import::ownership::StandardMutationGuard,
         limits: &ProviderLimitMap,
     ) -> Result<PublicationResult, crate::store::multipart::CommitCompletedUploadError> {
-        crate::store::pinning::publication::publish_completed_zip(
-            self.db, upload_id, request, limits,
+        crate::store::pinning::publication::publish_standard_completed_zip(
+            self.db, upload_id, request, guard, limits,
         )
         .await
     }
@@ -533,7 +538,12 @@ pub(crate) async fn finalize_completed_multipart_zip_with_store<
     let expected_archive = request.archive.object.clone();
 
     match store
-        .commit_zip(&completed.upload_id, request, limits)
+        .commit_zip(
+            &completed.upload_id,
+            request,
+            completed.mutation_guard.clone(),
+            limits,
+        )
         .await
     {
         Ok(result) => Ok(result),
@@ -616,7 +626,12 @@ async fn finalize_completed_multipart_archive_with_store<
     let expected_archive = request.object.clone();
 
     match store
-        .commit_object(&completed.upload_id, request, limits)
+        .commit_object(
+            &completed.upload_id,
+            request,
+            completed.mutation_guard.clone(),
+            limits,
+        )
         .await
     {
         Ok(_) => Ok(()),
@@ -733,15 +748,16 @@ pub async fn complete_multipart_upload_inner(
         ));
     }
 
+    let decompress_zip_target = upload
+        .decompress_zip_target
+        .as_deref()
+        .map(crate::zip::sanitize::normalize_target_prefix)
+        .transpose()?;
+
     let tags = crate::store::pinning::tags::tags_from_json(&upload.tags_json)
         .map_err(|_| s3s::s3_error!(InternalError, "invalid persisted multipart upload tags"))?;
-    let publication_policy = evaluate_publication_policy(
-        state,
-        bucket,
-        key,
-        &tags,
-        upload.decompress_zip_target.is_some(),
-    )?;
+    let publication_policy =
+        evaluate_publication_policy(state, bucket, key, &tags, decompress_zip_target.is_some())?;
 
     let enc_mode = EncryptionMode::parse(&upload.encryption_mode);
     let sse_c_key = match enc_mode {
@@ -797,6 +813,29 @@ pub async fn complete_multipart_upload_inner(
             .checked_add(*size)
             .ok_or_else(|| s3s::s3_error!(InvalidPart, "multipart object size overflow"))
     })?;
+
+    let mutation_guard = if let Some(prefix) = decompress_zip_target.as_deref() {
+        crate::store::import::ownership::admit_content_and_prefix_mutation(
+            db,
+            bucket,
+            key,
+            prefix,
+            crate::import::SupersedeReason::CompleteMultipartUpload,
+            chrono::Utc::now(),
+        )
+        .await?
+    } else {
+        crate::store::import::ownership::admit_content_mutation(
+            db,
+            bucket,
+            key,
+            None,
+            crate::import::SupersedeReason::CompleteMultipartUpload,
+            chrono::Utc::now(),
+        )
+        .await?
+    };
+
     let part_cids: Vec<String> = parts_to_concat.iter().map(|(c, _)| c.clone()).collect();
 
     let kubo = state.kubo.clone();
@@ -953,9 +992,10 @@ pub async fn complete_multipart_upload_inner(
         encrypted,
         key_wrap,
         sse_c_key_fingerprint: upload.sse_c_key_fingerprint,
-        decompress_zip_target: upload.decompress_zip_target,
+        decompress_zip_target,
         decompress_zip_result: upload.decompress_zip_result,
         server_side_encryption,
+        mutation_guard,
     })
 }
 
@@ -1093,6 +1133,7 @@ mod tests {
             &self,
             upload_id: &str,
             request: PublicationRequest,
+            _guard: crate::store::import::ownership::StandardMutationGuard,
             limits: &ProviderLimitMap,
         ) -> Result<PublicationResult, crate::store::multipart::CommitCompletedUploadError>
         {
@@ -1155,6 +1196,7 @@ mod tests {
             &self,
             upload_id: &str,
             request: ZipPublicationRequest,
+            _guard: crate::store::import::ownership::StandardMutationGuard,
             limits: &ProviderLimitMap,
         ) -> Result<PublicationResult, crate::store::multipart::CommitCompletedUploadError>
         {
@@ -1192,6 +1234,7 @@ mod tests {
             &self,
             _upload_id: &str,
             request: PublicationRequest,
+            _guard: crate::store::import::ownership::StandardMutationGuard,
             _limits: &ProviderLimitMap,
         ) -> Result<PublicationResult, crate::store::multipart::CommitCompletedUploadError>
         {
@@ -1231,6 +1274,7 @@ mod tests {
             &self,
             _upload_id: &str,
             request: ZipPublicationRequest,
+            _guard: crate::store::import::ownership::StandardMutationGuard,
             _limits: &ProviderLimitMap,
         ) -> Result<PublicationResult, crate::store::multipart::CommitCompletedUploadError>
         {
@@ -1626,6 +1670,13 @@ mod tests {
             decompress_zip_target: None,
             decompress_zip_result: true,
             server_side_encryption: None,
+            mutation_guard: crate::store::import::ownership::StandardMutationGuard {
+                bucket: "test-bucket".to_owned(),
+                key: "archive.zip".to_owned(),
+                mutation_id: "mutation-1".to_owned(),
+                expected_generation: 1,
+                mutation_prefix: None,
+            },
         }
     }
 
@@ -2957,8 +3008,17 @@ mod tests {
         )
         .await
         .unwrap();
-        let archive_a = completed_archive("attempt-a");
-        let archive_b = completed_archive("attempt-b");
+        let mut archive_a = completed_archive("attempt-a");
+        archive_a.mutation_guard = crate::store::import::ownership::admit_content_mutation(
+            state.store.db(),
+            &archive_a.bucket,
+            &archive_a.key,
+            None,
+            crate::import::SupersedeReason::CompleteMultipartUpload,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
         let (commit_tx, commit_rx) = tokio::sync::oneshot::channel();
         let (reconcile_tx, reconcile_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
@@ -2983,6 +3043,17 @@ mod tests {
         commit_rx.await.unwrap();
         reconcile_rx.await.unwrap();
 
+        let mut archive_b = completed_archive("attempt-b");
+        archive_b.mutation_guard = crate::store::import::ownership::admit_content_mutation(
+            state.store.db(),
+            &archive_b.bucket,
+            &archive_b.key,
+            None,
+            crate::import::SupersedeReason::CompleteMultipartUpload,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
         let b_result = finalize_completed_multipart_archive(&state, &archive_b).await;
         release_tx.send(()).unwrap();
         let a_result = a_task.await.unwrap();

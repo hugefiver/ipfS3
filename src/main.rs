@@ -1,9 +1,12 @@
+use std::sync::Arc;
+
 use axum::Router;
 use axum::error_handling::HandleError;
 use axum::http::{Response, StatusCode};
 use axum::routing::get;
 use ipfs_s3_gateway::auth::GatewayAuth;
 use ipfs_s3_gateway::config::Config;
+use ipfs_s3_gateway::import::{downloader::SourceDownloader, pipeline::ImportCoordinator};
 use ipfs_s3_gateway::s3;
 use ipfs_s3_gateway::s3::handler::S3Impl;
 use ipfs_s3_gateway::state::AppState;
@@ -31,6 +34,9 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(bind = %cfg.server.bind, kubo = %cfg.kubo.rpc_url, "starting ipfs-s3-gateway");
 
     let state = AppState::new(&cfg).await?;
+    let import_config = cfg.imports.validate()?;
+    let downloader = SourceDownloader::production(Arc::new(import_config.clone()));
+    let imports = ImportCoordinator::new(import_config, downloader);
 
     let s3_impl = S3Impl::new(state.clone());
     let gateway_auth = GatewayAuth::new(state.clone());
@@ -39,8 +45,9 @@ async fn main() -> anyhow::Result<()> {
         let mut builder = S3ServiceBuilder::new(s3_impl);
         builder.set_validation(AwsNameValidation::new());
         builder.set_auth(gateway_auth);
-        builder.set_route(s3::route::decompress_zip::DecompressZipRoute::new(
+        builder.set_route(s3::route::gateway::GatewayRoute::new(
             state.clone(),
+            imports.clone(),
         ));
         builder.build()
     };
@@ -57,9 +64,10 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(cfg.server.bind).await?;
     tracing::info!("listening on {}", cfg.server.bind);
     let shutdown = tokio_util::sync::CancellationToken::new();
-    let worker = state
+    let pinning_worker = state
         .pinning
         .start(state.store.clone(), shutdown.child_token());
+    let import_worker = imports.start(state.clone(), shutdown.child_token());
     let signal_token = shutdown.clone();
     let server = axum::serve(listener, app).with_graceful_shutdown(async move {
         if let Err(error) = tokio::signal::ctrl_c().await {
@@ -69,7 +77,11 @@ async fn main() -> anyhow::Result<()> {
     });
     let server_result = server.await;
     shutdown.cancel();
-    worker.shutdown(std::time::Duration::from_secs(30)).await;
+    let grace = std::time::Duration::from_secs(30);
+    tokio::join!(
+        pinning_worker.shutdown(grace),
+        import_worker.shutdown(grace)
+    );
     server_result?;
 
     Ok(())

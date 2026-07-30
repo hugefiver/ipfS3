@@ -480,6 +480,22 @@ impl DecompressZipRoute {
         Self { state }
     }
 
+    pub(super) async fn call_authenticated(
+        &self,
+        req: S3Request<Body>,
+    ) -> S3Result<S3Response<Body>> {
+        if req.method == Method::PUT {
+            return self.call_put(req).await;
+        }
+        if req.method == Method::POST {
+            return self.call_complete(req).await;
+        }
+        Err(s3s::s3_error!(
+            MethodNotAllowed,
+            "unsupported decompress route method"
+        ))
+    }
+
     async fn call_put(&self, req: S3Request<Body>) -> S3Result<S3Response<Body>> {
         self.call_put_with_decompressed_limit(
             req,
@@ -517,6 +533,16 @@ impl DecompressZipRoute {
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
         let metadata = crate::s3::ops::object::extract_custom_metadata(&req.headers);
+
+        let mutation_guard = crate::store::import::ownership::admit_content_and_prefix_mutation(
+            self.state.store.db(),
+            &parsed.bucket,
+            &parsed.key,
+            &parsed.target_prefix,
+            crate::import::SupersedeReason::DecompressZip,
+            chrono::Utc::now(),
+        )
+        .await?;
 
         let archive =
             crate::s3::ops::object::add_plain_object_stream(&self.state, req.input).await?;
@@ -559,9 +585,10 @@ impl DecompressZipRoute {
             },
             entries: publication_entries(&parsed.bucket, &published),
         };
-        crate::store::pinning::publication::publish_zip(
+        crate::store::pinning::publication::publish_standard_zip(
             self.state.store.db(),
             request,
+            mutation_guard,
             self.state.pinning.provider_limits(),
         )
         .await?;
@@ -787,16 +814,7 @@ impl S3Route for DecompressZipRoute {
 
     async fn call(&self, mut req: S3Request<Body>) -> S3Result<S3Response<Body>> {
         self.check_access(&mut req).await?;
-        if req.method == Method::PUT {
-            return self.call_put(req).await;
-        }
-        if req.method == Method::POST {
-            return self.call_complete(req).await;
-        }
-        Err(s3s::s3_error!(
-            MethodNotAllowed,
-            "unsupported decompress route method"
-        ))
+        self.call_authenticated(req).await
     }
 }
 

@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 
+use crate::import::ImportConfig;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize, Clone)]
@@ -22,6 +23,9 @@ pub struct Config {
     #[serde(default = "default_pinning_config")]
     #[allow(dead_code)]
     pub pinning: PinningConfig,
+
+    #[serde(default)]
+    pub imports: ImportConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -196,6 +200,7 @@ impl Config {
             auth: default_auth_config(),
             crypto: default_crypto_config(),
             pinning: default_pinning_config(),
+            imports: ImportConfig::default(),
         }
     }
 
@@ -310,6 +315,85 @@ mod tests {
         assert_eq!(config.pinning.worker_concurrency, 4);
         assert!(config.pinning.providers.is_empty());
         assert!(config.pinning.policies.is_empty());
+    }
+
+    #[test]
+    fn import_defaults_preserve_existing_config_files() {
+        let config: Config = toml::from_str(
+            r#"
+                [server]
+                bind = "127.0.0.1:9000"
+            "#,
+        )
+        .unwrap();
+
+        assert!(config.imports.enabled);
+        assert!(config.imports.allowed_https_origins.is_empty());
+        assert_eq!(config.imports.worker_concurrency, 4);
+        assert_eq!(config.imports.poll_interval_ms, 500);
+        assert_eq!(config.imports.lease_duration_secs, 60);
+        assert_eq!(config.imports.progress_flush_interval_ms, 1_000);
+        assert_eq!(config.imports.connect_timeout_secs, 10);
+        assert_eq!(config.imports.idle_timeout_secs, 120);
+        assert_eq!(config.imports.job_timeout_secs, 86_400);
+        assert_eq!(config.imports.max_download_bytes, 5_368_709_120);
+        assert_eq!(config.imports.max_attempts, 5);
+        assert_eq!(config.imports.terminal_retention_secs, 604_800);
+        assert_eq!(config.imports.max_provider_records, 20);
+    }
+
+    #[test]
+    fn import_origins_require_normalized_https_origins() {
+        for origin in [
+            "http://example.com",
+            "https://user@example.com",
+            "https://@example.com",
+            "https://example.com/path",
+            "https://example.com?query=1",
+            "https://example.com#fragment",
+            "https://127.0.0.1",
+            "https://[::1]",
+        ] {
+            let config = ImportConfig {
+                allowed_https_origins: vec![origin.to_owned()],
+                ..ImportConfig::default()
+            };
+            assert!(config.validate().is_err(), "accepted {origin}");
+        }
+
+        let config = ImportConfig {
+            allowed_https_origins: vec![
+                "https://downloads.example.com".to_owned(),
+                "https://downloads.example.com:443".to_owned(),
+            ],
+            ..ImportConfig::default()
+        };
+        assert_eq!(config.validate().unwrap().allowed_origins.len(), 1);
+    }
+
+    #[test]
+    fn empty_import_origin_list_keeps_cid_import_enabled() {
+        let validated = ImportConfig::default().validate().unwrap();
+
+        assert!(validated.raw.enabled);
+        assert!(validated.allowed_origins.is_empty());
+    }
+
+    #[test]
+    fn import_numeric_bounds_are_fail_fast() {
+        for count in [0, 21] {
+            let config = ImportConfig {
+                max_provider_records: count,
+                ..ImportConfig::default()
+            };
+            assert!(config.validate().is_err());
+        }
+
+        let config = ImportConfig {
+            idle_timeout_secs: 0,
+            ..ImportConfig::default()
+        };
+        assert!(config.validate().is_err());
     }
 
     #[tokio::test]

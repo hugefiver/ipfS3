@@ -45,6 +45,12 @@ fn invalid_parameter_value(error: &AppError) -> S3Error {
     s3_error
 }
 
+fn import_route_error(code: &str, status: http::StatusCode, message: &'static str) -> S3Error {
+    let mut s3_error = S3Error::with_message(S3ErrorCode::Custom(code.into()), message);
+    s3_error.set_status_code(status);
+    s3_error
+}
+
 /// Application-level errors. Converted to S3Error at the S3 handler boundary.
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
@@ -83,6 +89,27 @@ pub enum AppError {
 
     #[error("invalid pinning request: {0}")]
     InvalidPinningRequest(String),
+
+    #[error("invalid import request")]
+    InvalidImportRequest,
+
+    #[error("import source URL is not allowed")]
+    ImportUrlDenied,
+
+    #[error("import job not found")]
+    NoSuchImportJob,
+
+    #[error("import idempotency token conflicts with an existing job")]
+    ImportIdempotencyConflict,
+
+    #[error("ipfs3 import is disabled")]
+    ImportDisabled,
+
+    #[error("stale import ownership")]
+    StaleImportOwnership,
+
+    #[error("stale content mutation")]
+    StaleContentMutation,
 
     #[error("zip entry escapes target prefix: {0}")]
     ZipSlip(String),
@@ -125,6 +152,39 @@ impl From<AppError> for S3Error {
             AppError::InvalidRange => s3_error!(InvalidRange, "{}", e),
             AppError::InvalidZipParameter(_) => s3_error!(InvalidArgument, "{}", e),
             AppError::InvalidPinningRequest(_) => s3_error!(InvalidArgument, "{}", e),
+            AppError::InvalidImportRequest => import_route_error(
+                "InvalidArgument",
+                http::StatusCode::BAD_REQUEST,
+                "invalid import request",
+            ),
+            AppError::ImportUrlDenied => import_route_error(
+                "AccessDenied",
+                http::StatusCode::FORBIDDEN,
+                "import source URL is not allowed",
+            ),
+            AppError::NoSuchImportJob => import_route_error(
+                "NoSuchImportJob",
+                http::StatusCode::NOT_FOUND,
+                "import job not found",
+            ),
+            AppError::ImportIdempotencyConflict => import_route_error(
+                "IdempotentParameterMismatch",
+                http::StatusCode::CONFLICT,
+                "import idempotency token conflicts with an existing job",
+            ),
+            AppError::ImportDisabled => import_route_error(
+                "NotImplemented",
+                http::StatusCode::NOT_IMPLEMENTED,
+                "ipfs3 import is disabled",
+            ),
+            AppError::StaleImportOwnership => {
+                s3_error!(InternalError, "internal import ownership error")
+            }
+            AppError::StaleContentMutation => import_route_error(
+                "OperationAborted",
+                http::StatusCode::CONFLICT,
+                "content mutation was superseded by a newer operation",
+            ),
             AppError::InvalidZipEntry(_)
             | AppError::ZipSlip(_)
             | AppError::UnsupportedZipEntry(_)
@@ -213,5 +273,61 @@ mod tests {
 
         assert_eq!(err.code().as_str(), "InternalError");
         assert_eq!(err.message(), Some(INTERNAL_STORAGE_BACKEND_ERROR));
+    }
+
+    #[test]
+    fn import_errors_are_stable_and_redacted() {
+        let cases = [
+            (
+                AppError::InvalidImportRequest,
+                "InvalidArgument",
+                http::StatusCode::BAD_REQUEST,
+                "invalid import request",
+            ),
+            (
+                AppError::ImportUrlDenied,
+                "AccessDenied",
+                http::StatusCode::FORBIDDEN,
+                "import source URL is not allowed",
+            ),
+            (
+                AppError::NoSuchImportJob,
+                "NoSuchImportJob",
+                http::StatusCode::NOT_FOUND,
+                "import job not found",
+            ),
+            (
+                AppError::ImportIdempotencyConflict,
+                "IdempotentParameterMismatch",
+                http::StatusCode::CONFLICT,
+                "import idempotency token conflicts with an existing job",
+            ),
+            (
+                AppError::ImportDisabled,
+                "NotImplemented",
+                http::StatusCode::NOT_IMPLEMENTED,
+                "ipfs3 import is disabled",
+            ),
+        ];
+
+        for (app_error, code, status, message) in cases {
+            let s3_error: S3Error = app_error.into();
+            assert_eq!(s3_error.code().as_str(), code);
+            assert_eq!(s3_error.status_code(), Some(status));
+            assert_eq!(s3_error.message(), Some(message));
+            assert!(!s3_error.to_string().contains("secret"));
+        }
+    }
+
+    #[test]
+    fn stale_content_mutation_maps_to_stable_operation_aborted_conflict() {
+        let error: S3Error = AppError::StaleContentMutation.into();
+
+        assert_eq!(error.code().as_str(), "OperationAborted");
+        assert_eq!(error.status_code(), Some(http::StatusCode::CONFLICT));
+        assert_eq!(
+            error.message(),
+            Some("content mutation was superseded by a newer operation")
+        );
     }
 }

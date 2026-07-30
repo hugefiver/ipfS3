@@ -11,6 +11,7 @@ pub struct KuboClient {
     http: reqwest::Client,
     upload_http: reqwest::Client,
     download_http: reqwest::Client,
+    stream_idle_timeout: std::time::Duration,
 }
 
 impl KuboClient {
@@ -55,6 +56,7 @@ impl KuboClient {
                 .read_timeout(download_idle_timeout)
                 .build()
                 .expect("failed to build reqwest download client"),
+            stream_idle_timeout: download_idle_timeout,
         }
     }
 
@@ -74,16 +76,9 @@ impl KuboClient {
     /// whole-request `timeout` nor a `read_timeout`. `read_timeout` cannot be
     /// used here: in reqwest 0.13 it is a one-shot deadline during the pending
     /// phase (armed at dispatch, never reset until response headers arrive), so
-    /// it would abort an upload that is making continuous progress. Since
-    /// `/api/v0/add` is invoked without `progress=true`, Kubo emits no response
-    /// bytes at all until ingestion finishes, and a large object legitimately
-    /// spends that entire time in the pending phase.
-    ///
-    /// The honest consequence: a Kubo daemon that accepts the connection,
-    /// consumes the upload, and then never responds will hang the request
-    /// indefinitely. Closing that gap requires requesting `progress=true` on the
-    /// add request so the daemon emits periodic progress frames, plus a response
-    /// parser tolerant of those frames; that work is deferred.
+    /// it would abort an upload that is making continuous progress. Callers of
+    /// Kubo's `progress=true` response streams enforce the configured idle bound
+    /// while incrementally parsing those response frames.
     pub fn upload_http(&self) -> &reqwest::Client {
         &self.upload_http
     }
@@ -96,6 +91,11 @@ impl KuboClient {
     /// arriving reqwest resets the deadline on every received frame.
     pub fn download_http(&self) -> &reqwest::Client {
         &self.download_http
+    }
+
+    /// Inter-frame liveness bound for Kubo RPC response streams.
+    pub(crate) fn stream_idle_timeout(&self) -> std::time::Duration {
+        self.stream_idle_timeout
     }
 }
 

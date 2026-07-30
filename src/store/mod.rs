@@ -1,5 +1,6 @@
 pub mod bucket;
 pub mod entities;
+pub mod import;
 pub mod migrations;
 pub mod multipart;
 pub mod object;
@@ -47,28 +48,34 @@ impl Store {
     }
 }
 
-pub async fn run_migrations(db: &DatabaseConnection) -> Result<(), sea_orm::DbErr> {
-    use sea_orm_migration::MigratorTrait;
+mod migrator {
+    use crate::store::migrations::m20250701_000001_init::Migration as InitMigration;
+    use crate::store::migrations::m20260707_000001_decompress_zip::Migration as DecompressZipMigration;
+    use crate::store::migrations::m20260720_000001_sse_c_key_fingerprint::Migration as SseCKeyFingerprintMigration;
+    use crate::store::migrations::m20260721_000001_multi_provider_pinning::Migration as MultiProviderPinningMigration;
+    use crate::store::migrations::m20260729_000001_ipfs3_import::Migration as Ipfs3ImportMigration;
+    use crate::store::migrations::m20260729_000002_postgres_utc_timestamps::Migration as PostgresUtcTimestampsMigration;
+    use crate::store::migrations::m20260730_000001_standard_mutation_fence::Migration as StandardMutationFenceMigration;
+    use sea_orm_migration::prelude::*;
 
-    mod migrator {
-        use crate::store::migrations::m20250701_000001_init::Migration as InitMigration;
-        use crate::store::migrations::m20260707_000001_decompress_zip::Migration as DecompressZipMigration;
-        use crate::store::migrations::m20260720_000001_sse_c_key_fingerprint::Migration as SseCKeyFingerprintMigration;
-        use crate::store::migrations::m20260721_000001_multi_provider_pinning::Migration as MultiProviderPinningMigration;
-        use sea_orm_migration::prelude::*;
-
-        pub struct Migrator;
-        impl MigratorTrait for Migrator {
-            fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-                vec![
-                    Box::new(InitMigration),
-                    Box::new(DecompressZipMigration),
-                    Box::new(SseCKeyFingerprintMigration),
-                    Box::new(MultiProviderPinningMigration),
-                ]
-            }
+    pub struct Migrator;
+    impl MigratorTrait for Migrator {
+        fn migrations() -> Vec<Box<dyn MigrationTrait>> {
+            vec![
+                Box::new(InitMigration),
+                Box::new(DecompressZipMigration),
+                Box::new(SseCKeyFingerprintMigration),
+                Box::new(MultiProviderPinningMigration),
+                Box::new(Ipfs3ImportMigration),
+                Box::new(PostgresUtcTimestampsMigration),
+                Box::new(StandardMutationFenceMigration),
+            ]
         }
     }
+}
+
+pub async fn run_migrations(db: &DatabaseConnection) -> Result<(), sea_orm::DbErr> {
+    use sea_orm_migration::MigratorTrait;
 
     migrator::Migrator::up(db, None).await
 }
@@ -77,6 +84,27 @@ pub async fn run_migrations(db: &DatabaseConnection) -> Result<(), sea_orm::DbEr
 mod tests {
     use super::*;
     use sea_orm::ConnectionTrait;
+    use sea_orm_migration::MigratorTrait;
+
+    #[test]
+    fn standard_mutation_fence_migration_is_registered_after_import_migrations() {
+        let names = migrator::Migrator::migrations()
+            .into_iter()
+            .map(|migration| migration.name().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "m20250701_000001_init",
+                "m20260707_000001_decompress_zip",
+                "m20260720_000001_sse_c_key_fingerprint",
+                "m20260721_000001_multi_provider_pinning",
+                "m20260729_000001_ipfs3_import",
+                "m20260729_000002_postgres_utc_timestamps",
+                "m20260730_000001_standard_mutation_fence",
+            ]
+        );
+    }
 
     #[tokio::test]
     async fn file_backed_sqlite_connections_have_a_five_second_busy_timeout() {
@@ -122,8 +150,9 @@ mod tests {
                 "SELECT GROUP_CONCAT(name, ',') FROM (\
                  SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (\
                      'buckets', 'objects', 'multipart_uploads', 'multipart_parts', \
-                     'object_tags', 'pin_leases', 'pin_lease_targets', 'remote_pins', \
-                     'pin_jobs', 'pin_provider_usage'\
+                      'object_tags', 'pin_leases', 'pin_lease_targets', 'remote_pins', \
+                      'pin_jobs', 'pin_provider_usage', 'import_jobs', 'import_destinations', \
+                      'import_prefix_claims', 'import_job_targets', 'import_job_results'\
                  ) ORDER BY name)",
                 [],
             ))
@@ -143,12 +172,47 @@ mod tests {
             "remote_pins",
             "pin_jobs",
             "pin_provider_usage",
+            "import_jobs",
+            "import_destinations",
+            "import_prefix_claims",
+            "import_job_targets",
+            "import_job_results",
         ]
         .into_iter()
         .collect();
         assert_eq!(
             table_names, expected,
-            "all ten application tables must exist"
+            "all fifteen application tables must exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn migrations_create_import_tables() {
+        let db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+        run_migrations(&db).await.unwrap();
+
+        let rows = db
+            .query_all(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (\
+                     'import_jobs', 'import_destinations', 'import_prefix_claims', \
+                     'import_job_targets', 'import_job_results'\
+                 ) ORDER BY name",
+            ))
+            .await
+            .unwrap();
+        let names: Vec<String> = rows.iter().map(|row| row.try_get_by(0).unwrap()).collect();
+
+        assert_eq!(
+            names,
+            [
+                "import_destinations",
+                "import_job_results",
+                "import_job_targets",
+                "import_jobs",
+                "import_prefix_claims",
+            ],
+            "all five import tables must exist"
         );
     }
 

@@ -2,3 +2,6 @@ pub mod m20250701_000001_init;
 pub mod m20260707_000001_decompress_zip;
 pub mod m20260720_000001_sse_c_key_fingerprint;
 pub mod m20260721_000001_multi_provider_pinning;
+pub mod m20260729_000001_ipfs3_import;
+pub mod m20260729_000002_postgres_utc_timestamps;
+pub mod m20260730_000001_standard_mutation_fence;

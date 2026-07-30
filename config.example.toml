@@ -17,6 +17,22 @@ secret_key = "test"
 #          start with an all-zero key in release builds.
 master_key = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90"
 
+[imports]
+# CID imports are enabled by default. URL imports require exact HTTPS origins.
+enabled = true
+allowed_https_origins = []
+worker_concurrency = 4
+poll_interval_ms = 500
+lease_duration_secs = 60
+progress_flush_interval_ms = 1000
+connect_timeout_secs = 10
+idle_timeout_secs = 120
+job_timeout_secs = 86400
+max_download_bytes = 5368709120
+max_attempts = 5
+terminal_retention_secs = 604800
+max_provider_records = 20
+
 [pinning]
 worker_interval = "5s"
 worker_concurrency = 4

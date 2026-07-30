@@ -51,8 +51,13 @@ async-stream = "0.3"
 subtle = "2"
 quick-xml = "0.41"
 md5 = "0.8.0"
+cid = "0.11"
+url = "2"
+rustls = "0.23"
 
 [dev-dependencies]
 wiremock = "0.6"
 tempfile = "3"
 rust-s3 = { version = "0.37", default-features = false, features = ["tokio-rustls-tls", "fail-on-err"] }
+tokio-rustls = "0.26"
+rcgen = "0.14"

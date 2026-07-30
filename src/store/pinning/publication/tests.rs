@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
 use chrono::Utc;
 use sea_orm::{
@@ -9,6 +9,7 @@ use sea_orm::{
 use super::*;
 use crate::{
     error::AppError,
+    import::{ImportSource, SupersedeReason},
     pinning::{
         config::{LeaseDuration, ProviderLimitMap, ProviderLimits, ProviderMode},
         policy::{LeaseIntent, LeaseSource, PublicationPolicy},
@@ -16,8 +17,15 @@ use crate::{
     },
     store::{
         entities::{
-            object, object_tag, pin_job, pin_lease, pin_lease_target, pin_provider_usage,
-            remote_pin,
+            import_destination, import_job, import_job_result, import_job_target, object,
+            object_tag, pin_job, pin_lease, pin_lease_target, pin_provider_usage, remote_pin,
+        },
+        import::{
+            jobs::{NewImportJob, claim_due},
+            ownership::{
+                ExpectedImportTarget, ImportPublicationGuard, admit_content_mutation,
+                admit_content_mutations, claim_extracted_target, submit,
+            },
         },
         multipart::{self, CommitCompletedUploadError, ReconciledCommitOutcome},
     },
@@ -301,6 +309,901 @@ async fn assert_no_publication_rows(db: &DatabaseConnection) {
     assert_eq!(rows::<remote_pin::Entity>(db).await, 0);
     assert_eq!(rows::<pin_provider_usage::Entity>(db).await, 0);
     assert_eq!(rows::<pin_job::Entity>(db).await, 0);
+}
+
+fn import_request(id: &str, key: &str, decompress_prefix: Option<&str>) -> NewImportJob {
+    NewImportJob {
+        id: id.to_owned(),
+        bucket: "bucket".to_owned(),
+        key: key.to_owned(),
+        source: ImportSource::Cid(
+            "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku".to_owned(),
+        ),
+        request_fingerprint: format!("sha256:{id}"),
+        client_token: None,
+        object_content_type: Some("application/octet-stream".to_owned()),
+        metadata: HashMap::new(),
+        tags: vec![tag("fixture", "true")],
+        decompress_prefix: decompress_prefix.map(str::to_owned),
+    }
+}
+
+async fn claimed_import(
+    db: &DatabaseConnection,
+    id: &str,
+    key: &str,
+    now: chrono::DateTime<Utc>,
+) -> crate::import::ImportClaim {
+    submit(db, import_request(id, key, None), now)
+        .await
+        .unwrap();
+    claim_due(
+        db,
+        "import-worker",
+        now,
+        now + chrono::Duration::seconds(30),
+        1,
+    )
+    .await
+    .unwrap()
+    .pop()
+    .unwrap()
+    .claim
+}
+
+async fn publish_import_winner(
+    db: &DatabaseConnection,
+    job_id: &str,
+    key: &str,
+    cid: &str,
+    now: chrono::DateTime<Utc>,
+) {
+    let claim = claimed_import(db, job_id, key, now).await;
+    let destination = import_destination::Entity::find_by_id(("bucket".to_owned(), key.to_owned()))
+        .one(db)
+        .await
+        .unwrap()
+        .unwrap();
+    publish_import_object(
+        db,
+        request(
+            object(&format!("{job_id}-object"), key, cid, 7),
+            vec![],
+            vec![],
+        ),
+        ImportPublicationGuard {
+            job_id: claim.job_id,
+            worker_id: claim.worker_id,
+            claim_epoch: claim.claim_epoch,
+            targets: vec![ExpectedImportTarget {
+                bucket: "bucket".to_owned(),
+                key: key.to_owned(),
+                generation: destination.generation,
+            }],
+        },
+        vec![],
+        now,
+        &limits(),
+    )
+    .await
+    .unwrap();
+}
+
+async fn publication_row_counts(db: &DatabaseConnection) -> [u64; 7] {
+    [
+        rows::<object::Entity>(db).await,
+        rows::<object_tag::Entity>(db).await,
+        rows::<pin_lease::Entity>(db).await,
+        rows::<pin_lease_target::Entity>(db).await,
+        rows::<remote_pin::Entity>(db).await,
+        rows::<pin_provider_usage::Entity>(db).await,
+        rows::<pin_job::Entity>(db).await,
+    ]
+}
+
+#[tokio::test]
+async fn newer_completed_import_fences_every_older_exact_standard_publication() {
+    for (key, reason) in [
+        ("put-key", SupersedeReason::PutObject),
+        ("copy-key", SupersedeReason::CopyObject),
+        ("complete-key", SupersedeReason::CompleteMultipartUpload),
+    ] {
+        let db = setup().await;
+        let now = Utc::now();
+        let guard = admit_content_mutation(&db, "bucket", key, None, reason, now)
+            .await
+            .unwrap();
+        publish_import_winner(
+            &db,
+            &format!("newer-{key}"),
+            key,
+            &format!("bafy-newer-{key}"),
+            now,
+        )
+        .await;
+        let rows_after_import = publication_row_counts(&db).await;
+
+        let error = publish_standard_object(
+            &db,
+            automatic_and_manual_request(
+                &format!("stale-{key}"),
+                key,
+                &format!("bafy-stale-{key}"),
+            ),
+            guard,
+            &limits(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, AppError::StaleContentMutation));
+        assert_eq!(publication_row_counts(&db).await, rows_after_import);
+        assert_eq!(
+            crate::store::object::get_latest(&db, "bucket", key)
+                .await
+                .unwrap()
+                .cid,
+            format!("bafy-newer-{key}")
+        );
+    }
+}
+
+#[tokio::test]
+async fn newer_completed_import_fences_older_delete_and_delete_objects_keys() {
+    for (key, label, uses_batch_admission) in [
+        ("delete-key", "delete", false),
+        ("batch-key", "delete-objects", true),
+    ] {
+        let db = setup().await;
+        let now = Utc::now();
+        publish_object(
+            &db,
+            request(
+                object(&format!("old-{label}"), key, "bafy-old", 7),
+                vec![],
+                vec![],
+            ),
+            &limits(),
+        )
+        .await
+        .unwrap();
+        let guard = if uses_batch_admission {
+            let mut guards = admit_content_mutations(
+                &db,
+                "bucket",
+                &[key.to_owned()],
+                None,
+                SupersedeReason::DeleteObject,
+                now,
+            )
+            .await
+            .unwrap();
+            assert_eq!(guards.len(), 1);
+            guards.pop().unwrap()
+        } else {
+            admit_content_mutation(&db, "bucket", key, None, SupersedeReason::DeleteObject, now)
+                .await
+                .unwrap()
+        };
+        publish_import_winner(
+            &db,
+            &format!("newer-{label}"),
+            key,
+            &format!("bafy-newer-{label}"),
+            now,
+        )
+        .await;
+        let rows_after_import = publication_row_counts(&db).await;
+
+        let error = delete_latest_with_leases_guarded(&db, "bucket", key, guard, now)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, AppError::StaleContentMutation));
+        assert_eq!(publication_row_counts(&db).await, rows_after_import);
+        assert_eq!(
+            crate::store::object::get_latest(&db, "bucket", key)
+                .await
+                .unwrap()
+                .cid,
+            format!("bafy-newer-{label}")
+        );
+    }
+}
+
+#[tokio::test]
+async fn newer_exact_import_fences_older_prefix_publication_without_side_effects() {
+    let db = setup().await;
+    let now = Utc::now();
+    let guard = crate::store::import::ownership::admit_content_and_prefix_mutation(
+        &db,
+        "bucket",
+        "archive.zip",
+        "literal%_/Case/",
+        SupersedeReason::DecompressZip,
+        now,
+    )
+    .await
+    .unwrap();
+    publish_import_winner(
+        &db,
+        "newer-prefix-winner",
+        "literal%_/Case/file.txt",
+        "bafy-newer-prefix",
+        now,
+    )
+    .await;
+    let rows_after_import = publication_row_counts(&db).await;
+
+    let error = publish_standard_zip(
+        &db,
+        ZipPublicationRequest {
+            archive: automatic_and_manual_request(
+                "stale-archive",
+                "archive.zip",
+                "bafy-stale-archive",
+            ),
+            entries: vec![object(
+                "stale-entry",
+                "literal%_/Case/file.txt",
+                "bafy-stale-entry",
+                3,
+            )],
+        },
+        guard,
+        &limits(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(error, AppError::StaleContentMutation));
+    assert_eq!(publication_row_counts(&db).await, rows_after_import);
+    assert!(
+        crate::store::object::get_latest(&db, "bucket", "archive.zip")
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        crate::store::object::get_latest(&db, "bucket", "literal%_/Case/file.txt")
+            .await
+            .unwrap()
+            .cid,
+        "bafy-newer-prefix"
+    );
+}
+
+#[tokio::test]
+async fn unrelated_exact_import_does_not_fence_older_prefix_publication() {
+    let db = setup().await;
+    let now = Utc::now();
+    let guard = crate::store::import::ownership::admit_content_and_prefix_mutation(
+        &db,
+        "bucket",
+        "archive.zip",
+        "outputs/",
+        SupersedeReason::DecompressZip,
+        now,
+    )
+    .await
+    .unwrap();
+    publish_import_winner(
+        &db,
+        "unrelated-winner",
+        "outside/file.txt",
+        "bafy-unrelated",
+        now,
+    )
+    .await;
+
+    publish_standard_zip(
+        &db,
+        ZipPublicationRequest {
+            archive: request(
+                object("archive", "archive.zip", "bafy-archive", 7),
+                vec![],
+                vec![],
+            ),
+            entries: vec![object("entry", "outputs/file.txt", "bafy-entry", 3)],
+        },
+        guard,
+        &limits(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        crate::store::object::get_latest(&db, "bucket", "outputs/file.txt")
+            .await
+            .unwrap()
+            .cid,
+        "bafy-entry"
+    );
+    assert_eq!(
+        crate::store::object::get_latest(&db, "bucket", "outside/file.txt")
+            .await
+            .unwrap()
+            .cid,
+        "bafy-unrelated"
+    );
+}
+
+#[tokio::test]
+async fn newer_overlapping_prefix_fences_older_exact_standard_publication() {
+    let db = setup().await;
+    let now = Utc::now();
+    let old_guard = admit_content_mutation(
+        &db,
+        "bucket",
+        "outputs/file.txt",
+        None,
+        SupersedeReason::PutObject,
+        now,
+    )
+    .await
+    .unwrap();
+    let _new_guard = crate::store::import::ownership::admit_content_and_prefix_mutation(
+        &db,
+        "bucket",
+        "newer.zip",
+        "outputs/",
+        SupersedeReason::DecompressZip,
+        now,
+    )
+    .await
+    .unwrap();
+
+    let error = publish_standard_object(
+        &db,
+        request(
+            object("stale-exact", "outputs/file.txt", "bafy-stale", 7),
+            vec![],
+            vec![],
+        ),
+        old_guard,
+        &limits(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(error, AppError::StaleContentMutation));
+    assert_no_publication_rows(&db).await;
+}
+
+#[tokio::test]
+async fn newer_overlapping_prefix_fences_older_prefix_even_if_newer_never_publishes() {
+    let db = setup().await;
+    let now = Utc::now();
+    let old_guard = crate::store::import::ownership::admit_content_and_prefix_mutation(
+        &db,
+        "bucket",
+        "older.zip",
+        "literal%_/Case/",
+        SupersedeReason::DecompressZip,
+        now,
+    )
+    .await
+    .unwrap();
+    let _new_guard = crate::store::import::ownership::admit_content_and_prefix_mutation(
+        &db,
+        "bucket",
+        "newer.zip",
+        "literal%_/Case/nested/",
+        SupersedeReason::DecompressZip,
+        now,
+    )
+    .await
+    .unwrap();
+
+    let error = publish_standard_zip(
+        &db,
+        ZipPublicationRequest {
+            archive: request(
+                object("stale-archive", "older.zip", "bafy-stale-archive", 7),
+                vec![],
+                vec![],
+            ),
+            entries: vec![object(
+                "stale-entry",
+                "literal%_/Case/file.txt",
+                "bafy-stale-entry",
+                3,
+            )],
+        },
+        old_guard,
+        &limits(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(error, AppError::StaleContentMutation));
+    assert_no_publication_rows(&db).await;
+}
+
+#[tokio::test]
+async fn stale_import_guard_rolls_back_everything() {
+    let db = setup().await;
+    let now = Utc::now();
+    let claim = claimed_import(&db, "job", "key", now).await;
+    let guard = ImportPublicationGuard {
+        job_id: claim.job_id.clone(),
+        worker_id: claim.worker_id.clone(),
+        claim_epoch: claim.claim_epoch,
+        targets: vec![ExpectedImportTarget {
+            bucket: "bucket".to_owned(),
+            key: "key".to_owned(),
+            generation: 2,
+        }],
+    };
+    let rows = vec![import_job_result::ActiveModel {
+        job_id: Set("job".to_owned()),
+        sequence: Set(0),
+        key: Set("key".to_owned()),
+        cid: Set(Some("bafy-result".to_owned())),
+        size: Set(Some(7)),
+        error_code: Set(None),
+        error_message: Set(None),
+    }];
+
+    let error = publish_import_object(
+        &db,
+        automatic_and_manual_request("published", "key", "bafy-published"),
+        guard,
+        rows,
+        now,
+        &limits(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, AppError::StaleImportOwnership));
+    assert_no_publication_rows(&db).await;
+    assert_eq!(
+        import_job_result::Entity::find().count(&db).await.unwrap(),
+        0
+    );
+    let job = import_job::Entity::find_by_id("job".to_owned())
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (job.state.as_str(), job.locked_by.as_deref()),
+        ("running", Some("import-worker"))
+    );
+    assert_eq!(
+        import_job_target::Entity::find()
+            .filter(import_job_target::Column::JobId.eq("job"))
+            .count(&db)
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn guarded_import_publication_completes_and_releases_ownership() {
+    let db = setup().await;
+    let now = Utc::now();
+    let claim = claimed_import(&db, "job", "key", now).await;
+    let result = publish_import_object(
+        &db,
+        request(
+            object("published", "key", "bafy-published", 7),
+            vec![],
+            vec![],
+        ),
+        ImportPublicationGuard {
+            job_id: claim.job_id.clone(),
+            worker_id: claim.worker_id.clone(),
+            claim_epoch: claim.claim_epoch,
+            targets: vec![ExpectedImportTarget {
+                bucket: "bucket".to_owned(),
+                key: "key".to_owned(),
+                generation: 1,
+            }],
+        },
+        vec![import_job_result::ActiveModel {
+            job_id: Set("wrong-job-id-is-overwritten".to_owned()),
+            sequence: Set(0),
+            key: Set("key".to_owned()),
+            cid: Set(Some("bafy-published".to_owned())),
+            size: Set(Some(7)),
+            error_code: Set(None),
+            error_message: Set(None),
+        }],
+        now,
+        &limits(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.object_id, "published");
+    let job = import_job::Entity::find_by_id("job".to_owned())
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            job.state.as_str(),
+            job.final_cid.as_deref(),
+            job.logical_size
+        ),
+        ("completed", Some("bafy-published"), Some(7))
+    );
+    let destination = crate::store::entities::import_destination::Entity::find_by_id((
+        "bucket".to_owned(),
+        "key".to_owned(),
+    ))
+    .one(&db)
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        (destination.generation, destination.owner_job_id),
+        (1, None)
+    );
+    assert_eq!(
+        import_job_target::Entity::find()
+            .filter(import_job_target::Column::JobId.eq("job"))
+            .count(&db)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        import_job_result::Entity::find()
+            .filter(import_job_result::Column::JobId.eq("job"))
+            .count(&db)
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn guarded_import_waiting_for_bucket_lock_rechecks_expired_lease_with_fresh_time() {
+    let (_directory, db) = setup_file_backed("import-fresh-guard-time.sqlite").await;
+    let submitted_at = Utc::now();
+    submit(
+        &db,
+        import_request("fresh-time-job", "fresh-time-key", None),
+        submitted_at,
+    )
+    .await
+    .unwrap();
+    let claim = claim_due(
+        &db,
+        "import-worker",
+        submitted_at,
+        submitted_at + chrono::Duration::milliseconds(200),
+        1,
+    )
+    .await
+    .unwrap()
+    .pop()
+    .unwrap()
+    .claim;
+    let blocker = db.begin().await.unwrap();
+    blocker
+        .execute(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "UPDATE buckets SET owner = owner WHERE name = 'bucket'",
+        ))
+        .await
+        .unwrap();
+
+    let worker_db = db.clone();
+    let publication = tokio::spawn(async move {
+        publish_import_object(
+            &worker_db,
+            request(
+                object("fresh-time-object", "fresh-time-key", "bafy-fresh-time", 7),
+                vec![],
+                vec![],
+            ),
+            ImportPublicationGuard {
+                job_id: claim.job_id,
+                worker_id: claim.worker_id,
+                claim_epoch: claim.claim_epoch,
+                targets: vec![ExpectedImportTarget {
+                    bucket: "bucket".to_owned(),
+                    key: "fresh-time-key".to_owned(),
+                    generation: 1,
+                }],
+            },
+            vec![import_job_result::ActiveModel {
+                job_id: sea_orm::Set("fresh-time-job".to_owned()),
+                sequence: sea_orm::Set(0),
+                key: sea_orm::Set("fresh-time-key".to_owned()),
+                cid: sea_orm::Set(Some("bafy-fresh-time".to_owned())),
+                size: sea_orm::Set(Some(7)),
+                error_code: sea_orm::Set(None),
+                error_message: sea_orm::Set(None),
+            }],
+            submitted_at,
+            &limits(),
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    blocker.rollback().await.unwrap();
+
+    let error = publication.await.unwrap().unwrap_err();
+    assert!(matches!(error, AppError::StaleImportOwnership));
+    assert_no_publication_rows(&db).await;
+    assert_eq!(
+        import_job_result::Entity::find().count(&db).await.unwrap(),
+        0
+    );
+    let job = import_job::Entity::find_by_id("fresh-time-job")
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((job.state.as_str(), job.final_cid), ("running", None));
+    assert_eq!(
+        import_job_target::Entity::find()
+            .filter(import_job_target::Column::JobId.eq("fresh-time-job"))
+            .count(&db)
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn guarded_import_completion_after_capped_job_deadline_rolls_back() {
+    let _test_lock = test_gates::IMPORT_COMPLETION_TEST_LOCK.lock().await;
+    let db = setup().await;
+    let submitted_at = Utc::now();
+    submit(
+        &db,
+        import_request("completion-deadline-job", "completion-deadline-key", None),
+        submitted_at,
+    )
+    .await
+    .unwrap();
+    let claim = claim_due(
+        &db,
+        "import-worker",
+        submitted_at,
+        submitted_at + chrono::Duration::milliseconds(250),
+        1,
+    )
+    .await
+    .unwrap()
+    .pop()
+    .unwrap()
+    .claim;
+    let gate = std::sync::Arc::new(test_gates::ImportCompletionGate {
+        job_id: "completion-deadline-job".to_owned(),
+        arrived: tokio::sync::Notify::new(),
+        resume: tokio::sync::Notify::new(),
+    });
+    *test_gates::IMPORT_BEFORE_COMPLETION.lock().await = Some(gate.clone());
+
+    let worker_db = db.clone();
+    let publication = tokio::spawn(async move {
+        publish_import_object(
+            &worker_db,
+            request(
+                object(
+                    "completion-deadline-object",
+                    "completion-deadline-key",
+                    "bafy-completion-deadline",
+                    7,
+                ),
+                vec![],
+                vec![],
+            ),
+            ImportPublicationGuard {
+                job_id: claim.job_id,
+                worker_id: claim.worker_id,
+                claim_epoch: claim.claim_epoch,
+                targets: vec![ExpectedImportTarget {
+                    bucket: "bucket".to_owned(),
+                    key: "completion-deadline-key".to_owned(),
+                    generation: 1,
+                }],
+            },
+            vec![],
+            submitted_at,
+            &limits(),
+        )
+        .await
+    });
+    gate.arrived.notified().await;
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    gate.resume.notify_one();
+    let result = publication.await.unwrap();
+    *test_gates::IMPORT_BEFORE_COMPLETION.lock().await = None;
+
+    assert!(matches!(result, Err(AppError::StaleImportOwnership)));
+    assert_no_publication_rows(&db).await;
+    assert_eq!(
+        import_job_result::Entity::find().count(&db).await.unwrap(),
+        0
+    );
+    let job = import_job::Entity::find_by_id("completion-deadline-job")
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((job.state.as_str(), job.final_cid), ("running", None));
+}
+
+#[tokio::test]
+async fn lost_import_zip_target_rolls_back_archive_entries_results_and_leases() {
+    let db = setup().await;
+    let now = Utc::now();
+    let claim = claimed_import(&db, "zip-job", "archive.zip", now).await;
+    let entry_generation = claim_extracted_target(&db, &claim, "bucket", "out/file.txt", now)
+        .await
+        .unwrap();
+    import_job_target::Entity::delete_by_id((
+        "zip-job".to_owned(),
+        "bucket".to_owned(),
+        "out/file.txt".to_owned(),
+    ))
+    .exec(&db)
+    .await
+    .unwrap();
+    let guard = ImportPublicationGuard {
+        job_id: claim.job_id.clone(),
+        worker_id: claim.worker_id.clone(),
+        claim_epoch: claim.claim_epoch,
+        targets: vec![
+            ExpectedImportTarget {
+                bucket: "bucket".to_owned(),
+                key: "archive.zip".to_owned(),
+                generation: 1,
+            },
+            ExpectedImportTarget {
+                bucket: "bucket".to_owned(),
+                key: "out/file.txt".to_owned(),
+                generation: entry_generation,
+            },
+        ],
+    };
+    let archive = automatic_and_manual_request("archive-object", "archive.zip", "bafy-archive");
+    let error = publish_import_zip(
+        &db,
+        ZipPublicationRequest {
+            archive,
+            entries: vec![object("entry-object", "out/file.txt", "bafy-entry", 3)],
+        },
+        guard,
+        vec![import_job_result::ActiveModel {
+            job_id: Set("zip-job".to_owned()),
+            sequence: Set(0),
+            key: Set("out/file.txt".to_owned()),
+            cid: Set(Some("bafy-entry".to_owned())),
+            size: Set(Some(3)),
+            error_code: Set(None),
+            error_message: Set(None),
+        }],
+        now,
+        &limits(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, AppError::StaleImportOwnership));
+    assert_no_publication_rows(&db).await;
+    assert_eq!(
+        import_job_result::Entity::find().count(&db).await.unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn expired_attempt_cannot_publish_after_reclaim() {
+    let db = setup().await;
+    let now = Utc::now();
+    let first = claimed_import(&db, "job", "key", now).await;
+    let second = claim_due(
+        &db,
+        "replacement-worker",
+        now + chrono::Duration::seconds(30),
+        now + chrono::Duration::seconds(60),
+        1,
+    )
+    .await
+    .unwrap()
+    .pop()
+    .unwrap()
+    .claim;
+    assert_eq!(second.claim_epoch, first.claim_epoch + 1);
+    let stale_guard = ImportPublicationGuard {
+        job_id: first.job_id.clone(),
+        worker_id: first.worker_id.clone(),
+        claim_epoch: first.claim_epoch,
+        targets: vec![ExpectedImportTarget {
+            bucket: "bucket".to_owned(),
+            key: "key".to_owned(),
+            generation: 1,
+        }],
+    };
+    let error = publish_import_object(
+        &db,
+        request(
+            object("published", "key", "bafy-published", 7),
+            vec![],
+            vec![],
+        ),
+        stale_guard,
+        vec![],
+        now + chrono::Duration::seconds(30),
+        &limits(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, AppError::StaleImportOwnership));
+    assert_no_publication_rows(&db).await;
+    let job = import_job::Entity::find_by_id("job".to_owned())
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            job.state.as_str(),
+            job.locked_by.as_deref(),
+            job.claim_epoch
+        ),
+        ("running", Some("replacement-worker"), second.claim_epoch)
+    );
+}
+
+#[tokio::test]
+async fn stale_worker_released_at_prepublication_barrier_cannot_write() {
+    let db = setup().await;
+    let now = Utc::now();
+    let claim = claimed_import(&db, "job", "key", now).await;
+    let guard = ImportPublicationGuard {
+        job_id: claim.job_id.clone(),
+        worker_id: claim.worker_id.clone(),
+        claim_epoch: claim.claim_epoch,
+        targets: vec![ExpectedImportTarget {
+            bucket: "bucket".to_owned(),
+            key: "key".to_owned(),
+            generation: 1,
+        }],
+    };
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+    let worker_barrier = barrier.clone();
+    let worker_db = db.clone();
+    let (release_worker, wait_for_release) = tokio::sync::oneshot::channel();
+    let worker = tokio::spawn(async move {
+        worker_barrier.wait().await;
+        wait_for_release.await.unwrap();
+        publish_import_object(
+            &worker_db,
+            request(
+                object("published", "key", "bafy-published", 7),
+                vec![],
+                vec![],
+            ),
+            guard,
+            vec![],
+            now,
+            &limits(),
+        )
+        .await
+    });
+    barrier.wait().await;
+    admit_content_mutation(
+        &db,
+        "bucket",
+        "key",
+        None,
+        crate::import::SupersedeReason::PutObject,
+        now,
+    )
+    .await
+    .unwrap();
+    release_worker.send(()).unwrap();
+    let error = worker.await.unwrap().unwrap_err();
+    assert!(matches!(error, AppError::StaleImportOwnership));
+    assert_no_publication_rows(&db).await;
 }
 
 #[test]

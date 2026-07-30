@@ -4,6 +4,7 @@ pub mod auth;
 pub mod config;
 pub mod crypto;
 pub mod error;
+pub mod import;
 pub mod kubo;
 pub mod pinning;
 pub mod s3;

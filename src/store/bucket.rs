@@ -1,6 +1,9 @@
 use crate::error::{AppError, AppResult};
 use chrono::Utc;
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter, Set};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter, Set, TransactionError,
+    TransactionTrait,
+};
 
 use super::entities::bucket;
 
@@ -44,30 +47,37 @@ pub async fn exists<C: ConnectionTrait>(db: &C, name: &str) -> AppResult<bool> {
     Ok(count > 0)
 }
 
-pub async fn delete<C: ConnectionTrait>(db: &C, name: &str) -> AppResult<()> {
-    use super::entities::object;
+pub async fn delete<C: ConnectionTrait + TransactionTrait>(db: &C, name: &str) -> AppResult<()> {
+    let name = name.to_owned();
+    db.transaction(move |txn| {
+        Box::pin(async move {
+            use super::entities::object;
 
-    // Check if bucket has latest objects
-    let has_objects = object::Entity::find()
-        .filter(object::Column::Bucket.eq(name))
-        .filter(object::Column::IsLatest.eq(true))
-        .count(db)
-        .await?
-        > 0;
+            super::import::ownership::lock_bucket_for_ownership(txn, &name).await?;
 
-    if has_objects {
-        return Err(AppError::BucketNotEmpty(name.to_owned()));
-    }
+            let has_objects = object::Entity::find()
+                .filter(object::Column::Bucket.eq(&name))
+                .filter(object::Column::IsLatest.eq(true))
+                .count(txn)
+                .await?
+                > 0;
+            if has_objects {
+                return Err(AppError::BucketNotEmpty(name));
+            }
 
-    let result = bucket::Entity::delete_by_id(name.to_owned())
-        .exec(db)
-        .await?;
-
-    if result.rows_affected == 0 {
-        return Err(AppError::NoSuchBucket(name.to_owned()));
-    }
-
-    Ok(())
+            super::import::ownership::supersede_bucket(txn, &name, Utc::now()).await?;
+            let result = bucket::Entity::delete_by_id(name.clone()).exec(txn).await?;
+            if result.rows_affected != 1 {
+                return Err(AppError::NoSuchBucket(name));
+            }
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|error| match error {
+        TransactionError::Transaction(error) => error,
+        TransactionError::Connection(error) => error.into(),
+    })
 }
 
 pub async fn list<C: ConnectionTrait>(db: &C) -> AppResult<Vec<bucket::Model>> {

@@ -16,7 +16,15 @@ use crate::{
         tags::{ContentMode, ObjectTag},
     },
     store::{
-        entities::{bucket, multipart_upload, object, pin_lease, pin_lease_target, remote_pin},
+        entities::{
+            bucket, import_job_result, multipart_upload, object, pin_lease, pin_lease_target,
+            remote_pin,
+        },
+        import::ownership::{
+            ImportPublicationGuard, StandardMutationGuard, complete_publication_in_transaction,
+            complete_standard_mutation_in_transaction, lock_bucket_for_ownership,
+            verify_publication_guard, verify_standard_mutation_guard,
+        },
         multipart::{CommitCompletedUploadError, ReconciledCommitOutcome},
         object::LatestObjectRow,
     },
@@ -30,6 +38,23 @@ const TARGET_WAITING: &str = "waiting";
 const TARGET_QUOTA_WAITING: &str = "quota_waiting";
 const TARGET_QUOTA_BLOCKED: &str = "quota_blocked";
 const REMOTE_FAILED: &str = "failed";
+
+#[cfg(test)]
+pub(crate) mod test_gates {
+    use std::sync::{Arc, LazyLock};
+
+    use tokio::sync::{Mutex, Notify};
+
+    pub static IMPORT_COMPLETION_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+    pub static IMPORT_BEFORE_COMPLETION: LazyLock<Mutex<Option<Arc<ImportCompletionGate>>>> =
+        LazyLock::new(|| Mutex::new(None));
+
+    pub struct ImportCompletionGate {
+        pub job_id: String,
+        pub arrived: Notify,
+        pub resume: Notify,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct PublicationObject {
@@ -129,7 +154,40 @@ pub async fn publish_object(
     request: PublicationRequest,
     limits: &ProviderLimitMap,
 ) -> AppResult<PublicationResult> {
-    run_publication_with_retries(db, request, Vec::new(), None, limits).await
+    run_publication_with_retries(
+        db,
+        request,
+        Vec::new(),
+        None,
+        None,
+        None,
+        Vec::new(),
+        None,
+        limits,
+    )
+    .await
+}
+
+/// Publishes an admitted standard exact-key mutation only while its durable
+/// admission token is still current.
+pub async fn publish_standard_object(
+    db: &DatabaseConnection,
+    request: PublicationRequest,
+    guard: StandardMutationGuard,
+    limits: &ProviderLimitMap,
+) -> AppResult<PublicationResult> {
+    run_publication_with_retries(
+        db,
+        request,
+        Vec::new(),
+        None,
+        Some(guard),
+        None,
+        Vec::new(),
+        None,
+        limits,
+    )
+    .await
 }
 
 pub async fn publish_completed_upload(
@@ -138,7 +196,18 @@ pub async fn publish_completed_upload(
     request: PublicationRequest,
     limits: &ProviderLimitMap,
 ) -> Result<PublicationResult, CommitCompletedUploadError> {
-    run_completed_publication_with_retries(db, upload_id, request, Vec::new(), limits).await
+    run_completed_publication_with_retries(db, upload_id, request, Vec::new(), None, limits).await
+}
+
+pub async fn publish_standard_completed_upload(
+    db: &DatabaseConnection,
+    upload_id: &str,
+    request: PublicationRequest,
+    guard: StandardMutationGuard,
+    limits: &ProviderLimitMap,
+) -> Result<PublicationResult, CommitCompletedUploadError> {
+    run_completed_publication_with_retries(db, upload_id, request, Vec::new(), Some(guard), limits)
+        .await
 }
 
 pub async fn publish_zip(
@@ -146,7 +215,88 @@ pub async fn publish_zip(
     request: ZipPublicationRequest,
     limits: &ProviderLimitMap,
 ) -> AppResult<PublicationResult> {
-    run_publication_with_retries(db, request.archive, request.entries, None, limits).await
+    run_publication_with_retries(
+        db,
+        request.archive,
+        request.entries,
+        None,
+        None,
+        None,
+        Vec::new(),
+        None,
+        limits,
+    )
+    .await
+}
+
+/// Publishes an admitted standard archive and its extracted entries only while
+/// the archive's durable prefix token remains current.
+pub async fn publish_standard_zip(
+    db: &DatabaseConnection,
+    request: ZipPublicationRequest,
+    guard: StandardMutationGuard,
+    limits: &ProviderLimitMap,
+) -> AppResult<PublicationResult> {
+    run_publication_with_retries(
+        db,
+        request.archive,
+        request.entries,
+        None,
+        Some(guard),
+        None,
+        Vec::new(),
+        None,
+        limits,
+    )
+    .await
+}
+
+/// Publishes an import archive only if its destination generations, durable
+/// targets, and worker lease still match inside the publication transaction.
+pub async fn publish_import_object(
+    db: &DatabaseConnection,
+    request: PublicationRequest,
+    guard: ImportPublicationGuard,
+    result_rows: Vec<import_job_result::ActiveModel>,
+    now: DateTime<Utc>,
+    limits: &ProviderLimitMap,
+) -> AppResult<PublicationResult> {
+    run_publication_with_retries(
+        db,
+        request,
+        Vec::new(),
+        None,
+        None,
+        Some(guard),
+        result_rows,
+        Some(now),
+        limits,
+    )
+    .await
+}
+
+/// Publishes an import archive and all successful ZIP entries atomically under
+/// one import ownership guard.
+pub async fn publish_import_zip(
+    db: &DatabaseConnection,
+    request: ZipPublicationRequest,
+    guard: ImportPublicationGuard,
+    result_rows: Vec<import_job_result::ActiveModel>,
+    now: DateTime<Utc>,
+    limits: &ProviderLimitMap,
+) -> AppResult<PublicationResult> {
+    run_publication_with_retries(
+        db,
+        request.archive,
+        request.entries,
+        None,
+        None,
+        Some(guard),
+        result_rows,
+        Some(now),
+        limits,
+    )
+    .await
 }
 
 pub async fn publish_completed_zip(
@@ -155,8 +305,33 @@ pub async fn publish_completed_zip(
     request: ZipPublicationRequest,
     limits: &ProviderLimitMap,
 ) -> Result<PublicationResult, CommitCompletedUploadError> {
-    run_completed_publication_with_retries(db, upload_id, request.archive, request.entries, limits)
-        .await
+    run_completed_publication_with_retries(
+        db,
+        upload_id,
+        request.archive,
+        request.entries,
+        None,
+        limits,
+    )
+    .await
+}
+
+pub async fn publish_standard_completed_zip(
+    db: &DatabaseConnection,
+    upload_id: &str,
+    request: ZipPublicationRequest,
+    guard: StandardMutationGuard,
+    limits: &ProviderLimitMap,
+) -> Result<PublicationResult, CommitCompletedUploadError> {
+    run_completed_publication_with_retries(
+        db,
+        upload_id,
+        request.archive,
+        request.entries,
+        Some(guard),
+        limits,
+    )
+    .await
 }
 
 pub async fn reconcile_completed_publication(
@@ -192,10 +367,47 @@ pub async fn delete_latest_with_leases(
     key: &str,
     now: DateTime<Utc>,
 ) -> AppResult<bool> {
+    delete_latest_attempt(db, bucket, key, None, now)
+        .await
+        .map_err(transaction_error_into_app)
+}
+
+pub async fn delete_latest_with_leases_guarded(
+    db: &DatabaseConnection,
+    bucket: &str,
+    key: &str,
+    guard: StandardMutationGuard,
+    now: DateTime<Utc>,
+) -> AppResult<bool> {
+    for retry in 0..=MAX_TRANSACTION_RETRIES {
+        match delete_latest_attempt(db, bucket, key, Some(guard.clone()), now).await {
+            Ok(deleted) => return Ok(deleted),
+            Err(TransactionError::Transaction(error))
+                if is_retryable_transaction_conflict(&error) && retry < MAX_TRANSACTION_RETRIES =>
+            {
+                publication_retry_delay(retry).await;
+            }
+            Err(error) => return Err(transaction_error_into_app(error)),
+        }
+    }
+    unreachable!("guarded delete retry loop exhausted without returning")
+}
+
+async fn delete_latest_attempt(
+    db: &DatabaseConnection,
+    bucket: &str,
+    key: &str,
+    guard: Option<StandardMutationGuard>,
+    now: DateTime<Utc>,
+) -> Result<bool, TransactionError<AppError>> {
     let bucket = bucket.to_owned();
     let key = key.to_owned();
     db.transaction(|txn| {
         Box::pin(async move {
+            if let Some(guard) = guard.as_ref() {
+                lock_bucket_for_ownership(txn, &bucket).await?;
+                verify_standard_mutation_guard(txn, guard, &bucket, &key, &[]).await?;
+            }
             let latest_query = object::Entity::find()
                 .filter(object::Column::Bucket.eq(bucket.clone()))
                 .filter(object::Column::Key.eq(key.clone()))
@@ -206,6 +418,9 @@ pub async fn delete_latest_with_leases(
                 latest_query.one(txn).await?
             };
             let Some(latest) = latest else {
+                if let Some(guard) = guard.as_ref() {
+                    complete_standard_mutation_in_transaction(txn, guard, now).await?;
+                }
                 return Ok(false);
             };
             let updated = object::Entity::update_many()
@@ -220,18 +435,25 @@ pub async fn delete_latest_with_leases(
                 ));
             }
             leases::end_active_leases_for_object(txn, &latest.id, now).await?;
+            if let Some(guard) = guard.as_ref() {
+                complete_standard_mutation_in_transaction(txn, guard, now).await?;
+            }
             Ok(true)
         })
     })
     .await
-    .map_err(transaction_error_into_app)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_publication_with_retries(
     db: &DatabaseConnection,
     request: PublicationRequest,
     entries: Vec<PublicationObject>,
     upload_id: Option<String>,
+    standard_guard: Option<StandardMutationGuard>,
+    import_guard: Option<ImportPublicationGuard>,
+    result_rows: Vec<import_job_result::ActiveModel>,
+    import_now: Option<DateTime<Utc>>,
     limits: &ProviderLimitMap,
 ) -> AppResult<PublicationResult> {
     for retry in 0..=MAX_TRANSACTION_RETRIES {
@@ -240,6 +462,10 @@ async fn run_publication_with_retries(
             request.clone(),
             entries.clone(),
             upload_id.clone(),
+            standard_guard.clone(),
+            import_guard.clone(),
+            result_rows.clone(),
+            import_now,
             limits.clone(),
         )
         .await
@@ -261,6 +487,7 @@ async fn run_completed_publication_with_retries(
     upload_id: &str,
     request: PublicationRequest,
     entries: Vec<PublicationObject>,
+    standard_guard: Option<StandardMutationGuard>,
     limits: &ProviderLimitMap,
 ) -> Result<PublicationResult, CommitCompletedUploadError> {
     let completion_attempt_id = request.object.id.clone();
@@ -270,6 +497,10 @@ async fn run_completed_publication_with_retries(
             request.clone(),
             entries.clone(),
             Some(upload_id.to_owned()),
+            standard_guard.clone(),
+            None,
+            Vec::new(),
+            None,
             limits.clone(),
         )
         .await
@@ -296,16 +527,32 @@ async fn run_completed_publication_with_retries(
     unreachable!("completed publication retry loop exhausted without returning")
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn publication_attempt(
     db: &DatabaseConnection,
     request: PublicationRequest,
     entries: Vec<PublicationObject>,
     upload_id: Option<String>,
+    standard_guard: Option<StandardMutationGuard>,
+    import_guard: Option<ImportPublicationGuard>,
+    result_rows: Vec<import_job_result::ActiveModel>,
+    import_now: Option<DateTime<Utc>>,
     limits: ProviderLimitMap,
 ) -> Result<PublicationResult, TransactionError<AppError>> {
     db.transaction(|txn| {
         Box::pin(async move {
-            publish_in_transaction(txn, request, entries, upload_id.as_deref(), &limits).await
+            publish_in_transaction(
+                txn,
+                request,
+                entries,
+                upload_id.as_deref(),
+                standard_guard.as_ref(),
+                import_guard.as_ref(),
+                result_rows,
+                import_now,
+                &limits,
+            )
+            .await
         })
     })
     .await
@@ -330,11 +577,16 @@ async fn acquire_sqlite_publication_write_intent<C: ConnectionTrait>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn publish_in_transaction<C: ConnectionTrait>(
     db: &C,
     request: PublicationRequest,
     entries: Vec<PublicationObject>,
     upload_id: Option<&str>,
+    standard_guard: Option<&StandardMutationGuard>,
+    import_guard: Option<&ImportPublicationGuard>,
+    mut result_rows: Vec<import_job_result::ActiveModel>,
+    import_now: Option<DateTime<Utc>>,
     limits: &ProviderLimitMap,
 ) -> AppResult<PublicationResult> {
     validate_request(&request)?;
@@ -346,8 +598,33 @@ async fn publish_in_transaction<C: ConnectionTrait>(
         }
     }
     let attachment_pairs = publication_attachment_pairs(&request, &entries, limits)?;
-    acquire_sqlite_publication_write_intent(db, &request.object.bucket).await?;
-    let publication_time = Utc::now();
+    if standard_guard.is_some() && import_guard.is_some() {
+        return Err(AppError::Internal(
+            "publication cannot have both standard and import guards".to_owned(),
+        ));
+    }
+    if let Some(guard) = standard_guard {
+        lock_bucket_for_ownership(db, &request.object.bucket).await?;
+        let entry_keys = entries
+            .iter()
+            .map(|entry| entry.key.clone())
+            .collect::<Vec<_>>();
+        verify_standard_mutation_guard(
+            db,
+            guard,
+            &request.object.bucket,
+            &request.object.key,
+            &entry_keys,
+        )
+        .await?;
+    } else if let Some(guard) = import_guard {
+        lock_bucket_for_ownership(db, &request.object.bucket).await?;
+        let publication_targets = publication_locations(&request.object, &entries);
+        verify_publication_guard(db, guard, &request.object.bucket, &publication_targets).await?;
+    } else {
+        acquire_sqlite_publication_write_intent(db, &request.object.bucket).await?;
+    }
+    let publication_time = import_now.unwrap_or_else(Utc::now);
     let object_id = request.object.id.clone();
 
     let previous_owner_ids =
@@ -375,7 +652,53 @@ async fn publish_in_transaction<C: ConnectionTrait>(
         )
         .await?;
     }
+    if let Some(guard) = standard_guard {
+        complete_standard_mutation_in_transaction(db, guard, Utc::now()).await?;
+    }
+    if let Some(guard) = import_guard {
+        for result in &mut result_rows {
+            result.job_id = Set(guard.job_id.clone());
+        }
+        if !result_rows.is_empty() {
+            import_job_result::Entity::insert_many(result_rows)
+                .exec(db)
+                .await?;
+        }
+        #[cfg(test)]
+        pause_before_import_completion_for_test(&guard.job_id).await;
+        complete_publication_in_transaction(
+            db,
+            guard,
+            &request.object.cid,
+            request.object.logical_size,
+            Utc::now(),
+        )
+        .await?;
+    }
     Ok(PublicationResult { object_id })
+}
+
+#[cfg(test)]
+async fn pause_before_import_completion_for_test(job_id: &str) {
+    let gate = test_gates::IMPORT_BEFORE_COMPLETION.lock().await.clone();
+    if let Some(gate) = gate.filter(|gate| gate.job_id == job_id) {
+        gate.arrived.notify_one();
+        gate.resume.notified().await;
+    }
+}
+
+fn publication_locations(
+    archive: &PublicationObject,
+    entries: &[PublicationObject],
+) -> Vec<(String, String)> {
+    let mut locations = Vec::with_capacity(entries.len() + 1);
+    locations.push((archive.bucket.clone(), archive.key.clone()));
+    locations.extend(
+        entries
+            .iter()
+            .map(|entry| (entry.bucket.clone(), entry.key.clone())),
+    );
+    locations
 }
 
 fn ordered_publication_objects<'a>(
