@@ -222,6 +222,23 @@ async fn delete_bucket_seam(
     })
 }
 
+async fn supersede_active_test_jobs(
+    db: &DatabaseConnection,
+    bucket_name: &str,
+    now: DateTime<Utc>,
+) {
+    let bucket_name = bucket_name.to_owned();
+    db.transaction(|txn| {
+        Box::pin(async move {
+            lock_bucket_for_ownership(txn, &bucket_name).await?;
+            supersede_bucket(txn, &bucket_name, now).await?;
+            Ok::<_, AppError>(())
+        })
+    })
+    .await
+    .unwrap();
+}
+
 async fn backend_pid(db: &DatabaseConnection) -> i32 {
     db.query_one(Statement::from_string(
         DatabaseBackend::Postgres,
@@ -887,6 +904,8 @@ async fn postgres_claim_due_contends_with_prefix_and_bucket_supersession_without
         assert_eq!((row.generation, row.owner_job_id), (1, None));
     }
     assert_eq!(prefix_count(&holder, &bucket_name).await, 0);
+
+    supersede_active_test_jobs(&holder, &prefix_bucket, Utc::now()).await;
 }
 
 #[tokio::test]
@@ -1547,4 +1566,12 @@ async fn postgres_bucket_first_ownership_serializes_all_task_four_races() {
     );
     assert_no_targets(&delete_holder, "delete-first-old").await;
     assert_eq!(prefix_count(&delete_holder, &bucket_delete_first).await, 0);
+
+    for bucket_name in [
+        &bucket_exact_admit,
+        &bucket_prefix_admit,
+        &bucket_empty_admit,
+    ] {
+        supersede_active_test_jobs(&delete_holder, bucket_name, Utc::now()).await;
+    }
 }
