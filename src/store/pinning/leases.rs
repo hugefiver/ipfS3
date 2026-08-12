@@ -9785,6 +9785,13 @@ mod tests {
     async fn renewal_projects_only_its_locked_targets_but_uses_shared_oldest_canonical_target() {
         let _order_test_guard = test_gates::LIFECYCLE_ORDER_TEST_LOCK.lock().await;
         let db = setup().await;
+        db.execute_unprepared(
+            "INSERT INTO objects (id, bucket, key, cid, size, etag, is_latest) \
+             VALUES ('object-shared-renewal-order', 'bucket', 'shared-renewal-order-key', \
+                     'bafy-shared-renewal-owner', 100, 'bafy-shared-renewal-owner', TRUE)",
+        )
+        .await
+        .unwrap();
         seed_remote(&db, "pinata", "bafy-shared-renewal", "reserved", None, 1).await;
         seed_lease_target(
             &db,
@@ -9814,6 +9821,14 @@ mod tests {
             time(100),
         )
         .await;
+        let updated = db
+            .execute_unprepared(
+                "UPDATE pin_leases SET owner_object_id = 'object-shared-renewal-order' \
+                 WHERE id = 'lease-renewed-shared'",
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.rows_affected(), 1);
         db.execute_unprepared(&format!(
             "UPDATE pin_lease_targets SET created_at = '{}', last_touched_at = '{}' \
              WHERE id = 'target-unrelated-shared'",
@@ -9840,12 +9855,18 @@ mod tests {
             &[("pinata", "bafy-shared-renewal")],
         )
         .await;
-        include_owner_in_lifecycle_order_recording("object-1").await;
+        include_owner_in_lifecycle_order_recording("object-shared-renewal-order").await;
 
         assert_eq!(
-            renew_manual_lease(&db, "object-1", "lease-renewed-shared", time(200), time(3))
-                .await
-                .unwrap(),
+            renew_manual_lease(
+                &db,
+                "object-shared-renewal-order",
+                "lease-renewed-shared",
+                time(200),
+                time(3)
+            )
+            .await
+            .unwrap(),
             ManualLeaseRenewalOutcome::Extended { generation: 2 }
         );
 
@@ -9878,7 +9899,9 @@ mod tests {
                     "pinata".to_owned(),
                     "bafy-shared-renewal".to_owned(),
                 ),
-                test_gates::LifecycleOrderEvent::OwnerLock("object-1".to_owned()),
+                test_gates::LifecycleOrderEvent::OwnerLock(
+                    "object-shared-renewal-order".to_owned(),
+                ),
                 test_gates::LifecycleOrderEvent::LeaseLock("lease-renewed-shared".to_owned(),),
                 test_gates::LifecycleOrderEvent::LeaseLock("lease-unrelated-shared".to_owned(),),
                 test_gates::LifecycleOrderEvent::TargetLock("target-unrelated-shared".to_owned(),),
@@ -9887,7 +9910,9 @@ mod tests {
                     "pinata".to_owned(),
                     "bafy-shared-renewal".to_owned(),
                 ),
-                test_gates::LifecycleOrderEvent::OwnerGuard("object-1".to_owned()),
+                test_gates::LifecycleOrderEvent::OwnerGuard(
+                    "object-shared-renewal-order".to_owned(),
+                ),
                 test_gates::LifecycleOrderEvent::LeaseCas("lease-renewed-shared".to_owned()),
                 test_gates::LifecycleOrderEvent::TargetCas("target-renewed-shared".to_owned()),
                 test_gates::LifecycleOrderEvent::RemoteWork(
