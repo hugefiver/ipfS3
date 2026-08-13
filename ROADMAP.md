@@ -25,7 +25,7 @@ Docker against the local docker-compose stack.
 - [x] DeleteObjects (batch delete) for clients that remove multiple keys at once
 - [x] rclone smoke test PASSED: mkdir, copy, ls, cat, deletefile, rmdir through the Compose-network endpoint (`dual_head=NOT_RUN`; see `docs/client-smoke-evidence-2026-07-19.log`)
 - [x] MinIO `mc` smoke test PASSED: temporary alias config, alias list, mb, cp, ls, cat, stat through both endpoints, rm, rb (`dual_head=PASSED`; see `docs/client-smoke-evidence-2026-07-19.log`)
-- [x] AWS CLI smoke artifact implemented but not executed: baseline regression coverage (`SKIPPED`: local image absent and pull not authorized; see compatibility matrix)
+- [x] AWS CLI smoke test PASSED: mb, cp, ls, get-bucket-location, ListObjects v1, same-client dual-endpoint HeadObject, DeleteObjects, rm, and rb (`dual_head=PASSED`; see `docs/client-smoke-evidence-2026-08-13.log`)
 - [x] Document recommended rclone options when exact S3 behavior differs (`list_version=2`, `use_server_modtime`)
 - [x] Verify HeadObject signatures for nested keys through direct docker networking and localhost (MinIO `mc` same-client dual endpoint `stat` PASSED with `client=Mc verifier=Mc` EVIDENCE; see `docs/client-smoke-evidence-2026-07-19.log`)
 - [x] Track client compatibility matrix in docs
@@ -49,6 +49,18 @@ Docker against the local docker-compose stack.
 - [x] Lease duration, renewal, expiry, and remote unpin
 - [x] Decompressed ZIP entry targets
 - [x] Unique-CID local soft quota and eviction
+
+## Delivered — Release Assignment Pending
+
+Package version remains `0.1.0`. This unnumbered section records delivered
+functionality without assigning durable import to v0.4, v0.5, or any other
+numbered release.
+
+- [x] Durable SigV4 `ipfs3-import` submission from a CID or allowlisted HTTPS URL
+- [x] Persisted import status, progress, lease-based retries, and crash recovery
+- [x] Idempotent replay through the optional `x-ipfs3-client-token` header
+- [x] Optional ZIP extraction with ownership-fenced atomic publication
+- [x] Stale-worker and overlapping content-mutation fencing
 
 ## v0.5 — Multi-node
 
@@ -75,7 +87,7 @@ Docker against the local docker-compose stack.
 
 ## v0.8 — Performance
 
-- [ ] Chunk-level encrypted Range (v0.9 optimization)
+- [ ] Chunk-level encrypted Range
 - [ ] Pebble datastore backend for Kubo
 - [ ] Connection pooling tuning
 - [ ] Metrics and Prometheus exporter

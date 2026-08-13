@@ -12,9 +12,10 @@ An S3-compatible gateway backed by IPFS (Kubo). Translates S3 API calls into Kub
 - **SigV4 Authentication** — AWS Signature Version 4 via [s3s](https://github.com/s3s-project/s3s)
 - **Per-object Encryption** — SSE-S3 (gateway-managed key) and SSE-C (customer-provided key) with AES-256-GCM
 - **Content-addressed Storage** — ETag = IPFS CID; plain objects accessible via any public IPFS gateway (`https://ipfs.io/ipfs/<CID>`)
-- **Streaming** — Request and response bodies stream end to end; the one documented exception is a Range read of an encrypted object, which decrypts the full object before slicing (chunk-level encrypted Range is a roadmap item)
+- **Streaming** — Request and response bodies stream end to end; the documented exception is a Range read of an encrypted object, which decrypts the full object before slicing; chunk-level encrypted Range reads are planned for v0.8
 - **Dual Backend** — SQLite (dev) or PostgreSQL (prod) via sea-orm, with sequential schema migrations
 - **Remote Pinning** — Asynchronous Pinata/Filebase PSA pinning with ordered policies, durable work, leases, and local soft quotas
+- **Durable Import** — SigV4-authenticated CID or allowlisted HTTPS import with persisted progress, lease-based recovery, optional idempotency, optional ZIP extraction, and stale-publication fencing
 
 ## Quick Start
 
@@ -73,6 +74,91 @@ The `ipfs://` value is an IPFS URI, not a public HTTP gateway URL. These
 headers are returned for plain, SSE-S3, and SSE-C uploads. For encrypted
 objects, the CID identifies the ciphertext stored in IPFS, not the plaintext.
 
+## Durable `ipfs3-import`
+
+`ipfs3-import` is a SigV4-authenticated S3 extension. Submit a job with
+`POST /{bucket}/{key}?ipfs3-import`, `Content-Type: application/xml`, and an XML
+document containing exactly one source: `CID` or `URL`; query persisted progress
+or a terminal result with `GET /{bucket}/{key}?ipfs3-import={job-id}`. All import
+submission and status requests require the same valid SigV4 authentication as
+ordinary S3 requests; the abbreviated signing values below show the HTTP shape.
+
+```http
+POST /my-bucket/imported.bin?ipfs3-import HTTP/1.1
+Host: localhost:9000
+Authorization: AWS4-HMAC-SHA256 Credential=ACCESS_KEY/20260813/us-east-1/s3/aws4_request, SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date, Signature=SIGNATURE
+x-amz-date: 20260813T000000Z
+x-amz-content-sha256: SHA256_OF_XML_BODY
+Content-Type: application/xml
+x-ipfs3-client-token: deployment-42
+
+<?xml version="1.0" encoding="UTF-8"?>
+<IPFS3ImportRequest>
+  <CID>bafkreicfodt3gdlunhj7ojhh5roa2gm554sufkc7awvmi3d4jjkrium7zm</CID>
+</IPFS3ImportRequest>
+```
+
+For an HTTPS source, replace the `CID` element rather than adding a second
+source:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<IPFS3ImportRequest>
+  <URL>https://downloads.example.com/object.bin</URL>
+</IPFS3ImportRequest>
+```
+
+An accepted request returns the persisted job identifier in the response body
+and both status-discovery headers:
+
+```http
+HTTP/1.1 202 Accepted
+Content-Type: application/xml
+Location: /my-bucket/imported.bin?ipfs3-import=7c8b6c8f-2898-4dc7-bab4-71b13cb472b8
+x-ipfs3-import-job-id: 7c8b6c8f-2898-4dc7-bab4-71b13cb472b8
+
+<?xml version="1.0" encoding="UTF-8"?>
+<IPFS3ImportAccepted><JobId>7c8b6c8f-2898-4dc7-bab4-71b13cb472b8</JobId><State>queued</State><Phase>queued</Phase></IPFS3ImportAccepted>
+```
+
+Query that path with a signed GET to read persisted progress or the terminal
+result:
+
+```http
+GET /my-bucket/imported.bin?ipfs3-import=7c8b6c8f-2898-4dc7-bab4-71b13cb472b8 HTTP/1.1
+Host: localhost:9000
+Authorization: AWS4-HMAC-SHA256 Credential=ACCESS_KEY/20260813/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=SIGNATURE
+x-amz-date: 20260813T000100Z
+x-amz-content-sha256: SHA256_OF_EMPTY_BODY
+```
+
+The optional `x-ipfs3-client-token` header makes an identical replay return the
+same job; reusing a token with different source, metadata, tags, content type,
+or decompression prefix is rejected. Add `decompress-zip=<prefix>` to the
+submission query to import a ZIP and publish the archive plus successful
+entries together, for example
+`POST /my-bucket/archive.zip?ipfs3-import&decompress-zip=expanded%2F`.
+
+Jobs, attempts, and progress are persisted. If a process or worker stops, a
+lease can expire so another worker reclaims and retries the job. This recovery
+is job-level retry/reclaim, not byte-range URL resume; a retried URL attempt may
+download the source again from byte zero. Submission validation failures are
+returned synchronously as S3 errors, while execution failures appear as a
+terminal state in the status XML.
+
+Ordinary S3 reads and listings expose only committed objects. Publication is
+ownership-fenced and atomic, so a stale worker cannot overwrite a newer import
+or an overlapping S3 content mutation. Combined ZIP output is also hidden
+until its fenced publication transaction commits.
+
+URL imports accept only exact origins listed in `allowed_https_origins`. The
+source must use HTTPS and resolve exclusively to public addresses. Redirects,
+HTTP, private-network addresses, loopback/link-local sources, and forwarded
+authentication are rejected; the gateway does not forward the incoming S3
+`Authorization` header, cookies, or client credentials to the source. The
+import extension does not support SSE-S3 or SSE-C: their submission headers are
+rejected.
+
 ## Configuration
 
 Configuration is loaded from `config.toml` (or path specified by `IPFS_S3_CONFIG`), then overridden by environment variables.
@@ -89,7 +175,10 @@ Configuration is loaded from `config.toml` (or path specified by `IPFS_S3_CONFIG
 | `PINATA_JWT`                | Pinata token referenced by `token_env`      | unset                   |
 | `FILEBASE_PINNING_TOKEN`    | Filebase token referenced by `token_env`    | unset                   |
 
-See [`config.example.toml`](config.example.toml) for the full schema.
+See [`config.example.toml`](config.example.toml) for the full schema. Durable
+import settings are under its `[imports]` table. CID imports are enabled by
+default when `enabled = true`; URL imports remain unavailable until
+`allowed_https_origins` contains each exact HTTPS origin that may be used.
 
 `IPFS_S3_MASTER_KEY` must remain unchanged for the full lifetime of every SSE-C
 object and multipart upload. The gateway uses it to verify the persisted
@@ -204,25 +293,45 @@ leases cannot be revived.
 
 ## Architecture
 
-```
+```text
 aws cli / sdk
     │  (SigV4)
     ▼
 axum (HTTP :9000) ── /health ──► health_check
-    │
-    ▼ (fallback_service)
-s3s (SigV4 verify + S3 route + DTO)
-    │
+    │  (fallback_service)
     ▼
-S3Impl (impl S3 trait) ── holds Arc<AppState>
+s3s (SigV4 verify + standard S3 dispatch + custom S3Route)
     │
-    ├── ops/bucket.rs     → store/bucket.rs   (sea-orm)
-    ├── ops/object.rs     → store/object.rs   + kubo/add,cat,pin + crypto
-    ├── ops/multipart.rs  → store/multipart.rs + kubo + crypto
-    └── pinning/          → PSA clients + durable jobs + policy/lease coordination
+    ├── S3Impl (impl S3 trait) ── holds Arc<AppState>
+    │   ├── ops/bucket.rs     → store/bucket.rs   (sea-orm)
+    │   ├── ops/object.rs     → store/object.rs   + kubo/add,cat,pin + crypto
+    │   ├── ops/multipart.rs  → store/multipart.rs + kubo + crypto
+    │   └── pinning/          → PSA clients + durable jobs + policy/lease coordination
+    │
+    └── GatewayRoute (composite custom route)
+        ├── ImportObjectRoute → persisted import jobs and status XML
+        └── DecompressZipRoute → signed direct ZIP extraction
+
+ImportCoordinator (constructed separately from AppState)
+    └── durable import worker → store/import + Kubo + optional ZIP publication
 ```
 
-**AppState** holds: `KuboClient` (reqwest), `Store` (sea-orm DatabaseConnection), `credentials` (HashMap), `master_key` (MasterKey), and `pinning` (`Arc<PinningCoordinator>`).
+The durable import flow is:
+
+```text
+signed POST
+  → GatewayRoute / ImportObjectRoute
+  → validate source and persist queued job
+  → 202 Accepted + job ID
+  → durable worker performs CID pin or HTTPS download/add
+  → optional ZIP extraction
+  → ownership-fenced atomic publication
+  → signed GET returns progress or terminal result
+```
+
+**AppState** holds `KuboClient` (reqwest), `Store` (sea-orm
+`DatabaseConnection`), `credentials` (`HashMap`), `master_key` (`MasterKey`),
+and `pinning` (`Arc<PinningCoordinator>`). `ImportCoordinator` is constructed separately from `AppState`, passed to `GatewayRoute`, and starts its durable worker beside the pinning worker.
 
 ## Key Design Decisions
 
@@ -231,7 +340,7 @@ S3Impl (impl S3 trait) ── holds Arc<AppState>
 3. **Metadata in DB, content in IPFS.** S3-strong-consistency via DB ACID + IPFS content addressing.
 4. **No pin::rm on delete.** Kubo's pin API has no reference counting. GC is disabled.
 5. **Multipart Complete = overall add.** Parts are concatenated and re-added as a single UnixFS file.
-6. **Encrypted Range = full decrypt + slice.** MVP decrypts entire object then slices. v0.9 will optimize to chunk-level Range.
+6. **Encrypted Range = full decrypt + slice.** The gateway currently decrypts the entire encrypted object and then slices the response; chunk-level encrypted Range reads are planned for v0.8.
 
 ## Development
 
