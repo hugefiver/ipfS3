@@ -56,6 +56,7 @@ mod migrator {
     use crate::store::migrations::m20260729_000001_ipfs3_import::Migration as Ipfs3ImportMigration;
     use crate::store::migrations::m20260729_000002_postgres_utc_timestamps::Migration as PostgresUtcTimestampsMigration;
     use crate::store::migrations::m20260730_000001_standard_mutation_fence::Migration as StandardMutationFenceMigration;
+    use crate::store::migrations::m20260813_000001_postgres_json_columns::Migration as PostgresJsonColumnsMigration;
     use sea_orm_migration::prelude::*;
 
     pub struct Migrator;
@@ -69,6 +70,7 @@ mod migrator {
                 Box::new(Ipfs3ImportMigration),
                 Box::new(PostgresUtcTimestampsMigration),
                 Box::new(StandardMutationFenceMigration),
+                Box::new(PostgresJsonColumnsMigration),
             ]
         }
     }
@@ -87,7 +89,7 @@ mod tests {
     use sea_orm_migration::MigratorTrait;
 
     #[test]
-    fn standard_mutation_fence_migration_is_registered_after_import_migrations() {
+    fn postgres_json_columns_migration_is_registered_last() {
         let names = migrator::Migrator::migrations()
             .into_iter()
             .map(|migration| migration.name().to_owned())
@@ -102,6 +104,7 @@ mod tests {
                 "m20260729_000001_ipfs3_import",
                 "m20260729_000002_postgres_utc_timestamps",
                 "m20260730_000001_standard_mutation_fence",
+                "m20260813_000001_postgres_json_columns",
             ]
         );
     }

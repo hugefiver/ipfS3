@@ -64,7 +64,7 @@ numbered release.
 
 ## v0.5 — Multi-node
 
-- [ ] PostgreSQL production deployment
+- [x] PostgreSQL production deployment
 - [ ] Multiple gateway instances (horizontal scaling)
 - [ ] IPFS Cluster for pinset replication
 - [ ] Private swarm (swarm.key) for node-to-node communication

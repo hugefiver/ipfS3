@@ -18,6 +18,7 @@ use ipfs_s3_gateway::{
                 lock_bucket_for_ownership, submit, supersede_bucket,
             },
         },
+        multipart,
         pinning::publication::{
             PinTargetSpec, PublicationObject, PublicationRequest, publish_import_object,
             publish_object, publish_standard_object,
@@ -28,10 +29,51 @@ use sea_orm::{
     ColumnTrait, ConnectOptions, ConnectionTrait, Database, DatabaseBackend, DatabaseConnection,
     EntityTrait, PaginatorTrait, QueryFilter, Statement, TransactionError, TransactionTrait,
 };
+use sea_orm_migration::{MigrationTrait, MigratorTrait};
 use tokio::{sync::oneshot, task::JoinHandle};
+
+use ipfs_s3_gateway::store::migrations::{
+    m20250701_000001_init, m20260707_000001_decompress_zip, m20260720_000001_sse_c_key_fingerprint,
+    m20260721_000001_multi_provider_pinning, m20260729_000001_ipfs3_import,
+    m20260729_000002_postgres_utc_timestamps, m20260730_000001_standard_mutation_fence,
+    m20260813_000001_postgres_json_columns,
+};
 
 static POSTGRES_MIGRATIONS: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
 static POSTGRES_TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct PreJsonCompatibilityMigrator;
+
+impl MigratorTrait for PreJsonCompatibilityMigrator {
+    fn migrations() -> Vec<Box<dyn MigrationTrait>> {
+        vec![
+            Box::new(m20250701_000001_init::Migration),
+            Box::new(m20260707_000001_decompress_zip::Migration),
+            Box::new(m20260720_000001_sse_c_key_fingerprint::Migration),
+            Box::new(m20260721_000001_multi_provider_pinning::Migration),
+            Box::new(m20260729_000001_ipfs3_import::Migration),
+            Box::new(m20260729_000002_postgres_utc_timestamps::Migration),
+            Box::new(m20260730_000001_standard_mutation_fence::Migration),
+        ]
+    }
+}
+
+struct CurrentJsonCompatibilityMigrator;
+
+impl MigratorTrait for CurrentJsonCompatibilityMigrator {
+    fn migrations() -> Vec<Box<dyn MigrationTrait>> {
+        vec![
+            Box::new(m20250701_000001_init::Migration),
+            Box::new(m20260707_000001_decompress_zip::Migration),
+            Box::new(m20260720_000001_sse_c_key_fingerprint::Migration),
+            Box::new(m20260721_000001_multi_provider_pinning::Migration),
+            Box::new(m20260729_000001_ipfs3_import::Migration),
+            Box::new(m20260729_000002_postgres_utc_timestamps::Migration),
+            Box::new(m20260730_000001_standard_mutation_fence::Migration),
+            Box::new(m20260813_000001_postgres_json_columns::Migration),
+        ]
+    }
+}
 
 fn request(id: &str, bucket: &str, key: &str, prefix: Option<&str>) -> NewImportJob {
     NewImportJob {
@@ -1574,4 +1616,255 @@ async fn postgres_bucket_first_ownership_serializes_all_task_four_races() {
     ] {
         supersede_active_test_jobs(&delete_holder, bucket_name, Utc::now()).await;
     }
+}
+
+#[tokio::test]
+async fn postgres_json_columns_require_compatibility_migration() {
+    let Ok(url) = std::env::var("IPFS_S3_TEST_POSTGRES_URL") else {
+        eprintln!(
+            "skipping PostgreSQL JSON compatibility test: IPFS_S3_TEST_POSTGRES_URL is unset"
+        );
+        return;
+    };
+    let _serial = POSTGRES_TEST_SERIAL.lock().await;
+    let schema = format!("json_{}", uuid::Uuid::new_v4().simple());
+    let suffix = uuid::Uuid::new_v4();
+    let bucket_name = format!("json-bucket-{suffix}");
+    let upload_id = format!("json-upload-{suffix}");
+    let upload_object_id = format!("json-upload-object-{suffix}");
+    let invalid_object_id = format!("json-invalid-object-{suffix}");
+    let invalid_key = format!("json-invalid-key-{suffix}");
+    let fixture = connect_single(&url).await;
+
+    fixture
+        .execute_unprepared(&format!("CREATE SCHEMA {schema}"))
+        .await
+        .unwrap();
+    fixture
+        .execute_unprepared(&format!("SET search_path TO {schema}"))
+        .await
+        .unwrap();
+    PreJsonCompatibilityMigrator::up(&fixture, None)
+        .await
+        .unwrap();
+    crate_bucket(&fixture, &bucket_name).await;
+    multipart::create_upload(
+        &fixture,
+        &upload_id,
+        &upload_object_id,
+        &bucket_name,
+        "object",
+        "none",
+        None,
+        None,
+        None,
+        None,
+        &[],
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+
+    let decode_error = multipart::get_upload(&fixture, &upload_id)
+        .await
+        .unwrap_err();
+    let decode_diagnostic = format!("{decode_error:?}").to_lowercase();
+    for expected in [
+        "error occurred while decoding column",
+        "mismatched types",
+        "json",
+        "text",
+    ] {
+        assert!(
+            decode_diagnostic.contains(expected),
+            "missing PostgreSQL JSON/TEXT decode diagnostic: {expected}"
+        );
+    }
+    assert!(
+        !decode_diagnostic.contains("[]"),
+        "decode diagnostic must not leak the stored tags value"
+    );
+
+    fixture
+        .execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "INSERT INTO objects (id, bucket, key, cid, size, etag, metadata, encrypted, multipart, is_latest) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, FALSE, FALSE, TRUE)",
+            [
+                invalid_object_id.clone().into(),
+                bucket_name.clone().into(),
+                invalid_key.clone().into(),
+                "bafy-invalid-json".into(),
+                1_i64.into(),
+                "bafy-invalid-json".into(),
+                "not-json".into(),
+            ],
+        ))
+        .await
+        .unwrap();
+
+    let invalid_json_error = CurrentJsonCompatibilityMigrator::up(&fixture, None)
+        .await
+        .unwrap_err();
+    let invalid_json_diagnostic = format!("{invalid_json_error:?}");
+    assert!(
+        invalid_json_diagnostic.contains("invalid JSON in objects.metadata"),
+        "migration must fail with the sanitized invalid-JSON message"
+    );
+    assert!(
+        !invalid_json_diagnostic.contains("not-json"),
+        "migration diagnostic must not leak invalid stored content"
+    );
+
+    let marker_count: i64 = fixture
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT COUNT(*) AS count FROM seaql_migrations \
+             WHERE version = 'm20260813_000001_postgres_json_columns'",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "count")
+        .unwrap();
+    assert_eq!(
+        marker_count, 0,
+        "failed migration must not record its marker"
+    );
+
+    let text_types = fixture
+        .query_all(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT table_name || '.' || column_name AS name, data_type \
+             FROM information_schema.columns \
+             WHERE table_schema = current_schema() \
+               AND (table_name, column_name) IN ( \
+                    ('multipart_uploads', 'metadata'), \
+                    ('multipart_uploads', 'tags_json'), \
+                    ('objects', 'metadata') \
+               ) \
+             ORDER BY table_name, column_name",
+        ))
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row.try_get::<String>("", "name").unwrap(),
+                row.try_get::<String>("", "data_type").unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        text_types,
+        [
+            ("multipart_uploads.metadata".to_owned(), "text".to_owned()),
+            ("multipart_uploads.tags_json".to_owned(), "text".to_owned()),
+            ("objects.metadata".to_owned(), "text".to_owned()),
+        ],
+        "failed migration must roll back all column-type changes"
+    );
+    fixture
+        .execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "DELETE FROM objects WHERE id = $1",
+            [invalid_object_id.into()],
+        ))
+        .await
+        .unwrap();
+
+    CurrentJsonCompatibilityMigrator::up(&fixture, None)
+        .await
+        .unwrap();
+    let marker: String = fixture
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT version FROM seaql_migrations ORDER BY version DESC LIMIT 1",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "version")
+        .unwrap();
+    assert_eq!(marker, "m20260813_000001_postgres_json_columns");
+
+    let json_columns = fixture
+        .query_all(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT table_name || '.' || column_name AS name, data_type, is_nullable, column_default \
+             FROM information_schema.columns \
+             WHERE table_schema = current_schema() \
+               AND (table_name, column_name) IN ( \
+                    ('multipart_uploads', 'metadata'), \
+                    ('multipart_uploads', 'tags_json'), \
+                    ('objects', 'metadata') \
+               ) \
+             ORDER BY table_name, column_name",
+        ))
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row.try_get::<String>("", "name").unwrap(),
+                row.try_get::<String>("", "data_type").unwrap(),
+                row.try_get::<String>("", "is_nullable").unwrap(),
+                row.try_get::<Option<String>>("", "column_default").unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        json_columns,
+        [
+            (
+                "multipart_uploads.metadata".to_owned(),
+                "jsonb".to_owned(),
+                "YES".to_owned(),
+                None,
+            ),
+            (
+                "multipart_uploads.tags_json".to_owned(),
+                "jsonb".to_owned(),
+                "NO".to_owned(),
+                Some("'[]'::jsonb".to_owned()),
+            ),
+            (
+                "objects.metadata".to_owned(),
+                "jsonb".to_owned(),
+                "YES".to_owned(),
+                None,
+            ),
+        ]
+    );
+
+    fixture.close().await.unwrap();
+    let fixture = connect_single(&url).await;
+    fixture
+        .execute_unprepared(&format!("SET search_path TO {schema}"))
+        .await
+        .unwrap();
+    let upload = multipart::get_upload(&fixture, &upload_id).await.unwrap();
+    assert!(upload.metadata.is_none());
+    assert_eq!(upload.tags_json, serde_json::json!([]));
+    multipart::upsert_part(
+        &fixture,
+        &upload_id,
+        1,
+        "bafy-six-mib-part",
+        6_291_456,
+        "bafy-six-mib-part",
+    )
+    .await
+    .unwrap();
+    let part = multipart::get_part(&fixture, &upload_id, 1).await.unwrap();
+    assert_eq!(part.size, 6_291_456);
+
+    fixture.close().await.unwrap();
+    let cleanup = connect_single(&url).await;
+    cleanup
+        .execute_unprepared(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+    cleanup.close().await.unwrap();
 }

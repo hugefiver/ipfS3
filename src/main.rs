@@ -1,8 +1,14 @@
-use std::sync::Arc;
+use std::{
+    future::Future,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::Router;
 use axum::error_handling::HandleError;
-use axum::http::{Response, StatusCode};
+use axum::extract::State;
+use axum::http::{Response as HttpResponse, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use ipfs_s3_gateway::auth::GatewayAuth;
 use ipfs_s3_gateway::config::Config;
@@ -13,21 +19,82 @@ use ipfs_s3_gateway::state::AppState;
 use s3s::service::S3ServiceBuilder;
 use s3s::validation::AwsNameValidation;
 use s3s::{Body as S3Body, HttpError};
+use sea_orm::DbErr;
+
+const READY_DEADLINE: Duration = Duration::from_secs(2);
+const READY_PROBE_URL: &str = "http://127.0.0.1:9000/ready";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunMode {
+    Gateway,
+    ReadyProbe,
+}
 
 async fn health_check() -> &'static str {
     "OK"
 }
 
-async fn handle_s3_error(err: HttpError) -> Response<S3Body> {
+fn parse_run_mode(args: &[String]) -> anyhow::Result<RunMode> {
+    match args {
+        [] => Ok(RunMode::Gateway),
+        [flag] if flag == "--ready-probe" => Ok(RunMode::ReadyProbe),
+        _ => anyhow::bail!("usage: ipfs-s3-gateway [--ready-probe]"),
+    }
+}
+
+async fn readiness_response<F>(ping: F, deadline: Duration) -> Response
+where
+    F: Future<Output = Result<(), DbErr>>,
+{
+    match tokio::time::timeout(deadline, ping).await {
+        Ok(Ok(())) => (StatusCode::OK, "READY").into_response(),
+        Ok(Err(_)) => {
+            tracing::warn!(failure = "error");
+            (StatusCode::SERVICE_UNAVAILABLE, "NOT READY").into_response()
+        }
+        Err(_) => {
+            tracing::warn!(failure = "timeout");
+            (StatusCode::SERVICE_UNAVAILABLE, "NOT READY").into_response()
+        }
+    }
+}
+
+async fn ready_handler(State(state): State<Arc<AppState>>) -> Response {
+    readiness_response(state.store.db().ping(), READY_DEADLINE).await
+}
+
+async fn ready_probe_url(url: &str, deadline: Duration) -> bool {
+    let started = Instant::now();
+    let client = match reqwest::Client::builder().build() {
+        Ok(client) => client,
+        Err(_) => return false,
+    };
+    matches!(
+        tokio::time::timeout(deadline.saturating_sub(started.elapsed()), async {
+            let response = client.get(url).send().await.ok()?;
+            if response.status().as_u16() != 200 {
+                return Some(false);
+            }
+            Some(response.text().await.ok()? == "READY")
+        })
+        .await,
+        Ok(Some(true))
+    )
+}
+
+async fn ready_probe() -> bool {
+    ready_probe_url(READY_PROBE_URL, READY_DEADLINE).await
+}
+
+async fn handle_s3_error(err: HttpError) -> HttpResponse<S3Body> {
     tracing::error!(?err, "s3 service error");
-    Response::builder()
+    HttpResponse::builder()
         .status(StatusCode::INTERNAL_SERVER_ERROR)
         .body(S3Body::from("Internal Server Error".to_string()))
         .unwrap()
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn run_gateway() -> anyhow::Result<()> {
     tracing_subscriber::fmt().init();
 
     let cfg = Config::load()?;
@@ -56,10 +123,12 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/health", get(health_check))
+        .route("/ready", get(ready_handler))
         .fallback_service(s3_service)
         .layer(axum::middleware::from_fn(
             s3::http::bridge_chunked_content_length,
-        ));
+        ))
+        .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind(cfg.server.bind).await?;
     tracing::info!("listening on {}", cfg.server.bind);
@@ -85,4 +154,237 @@ async fn main() -> anyhow::Result<()> {
     server_result?;
 
     Ok(())
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    match parse_run_mode(&args)? {
+        RunMode::Gateway => run_gateway().await,
+        RunMode::ReadyProbe => {
+            if ready_probe().await {
+                Ok(())
+            } else {
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::HashMap,
+        io::{self, Write},
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+
+    use axum::{
+        Router,
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+        routing::get,
+    };
+    use ipfs_s3_gateway::{
+        crypto::key::MasterKey, kubo::KuboClient, pinning::coordinator::PinningCoordinator,
+        store::Store,
+    };
+    use sea_orm::Database;
+    use tokio::{net::TcpListener, task::JoinHandle};
+    use tower::ServiceExt as _;
+
+    use super::*;
+
+    #[derive(Clone)]
+    struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+
+    struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for LogWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.0.lock().unwrap().flush()
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedWriter {
+        type Writer = LogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            LogWriter(self.0.clone())
+        }
+    }
+
+    async fn test_state() -> Arc<AppState> {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        ipfs_s3_gateway::store::run_migrations(&db).await.unwrap();
+        Arc::new(AppState {
+            kubo: KuboClient::new("http://127.0.0.1:1".to_owned()),
+            store: Store::new(db),
+            credentials: HashMap::new(),
+            master_key: MasterKey::from_hex(&"0".repeat(64)).unwrap(),
+            pinning: PinningCoordinator::disabled_for_test(),
+        })
+    }
+
+    async fn response_body(response: axum::response::Response) -> String {
+        String::from_utf8(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap()
+    }
+
+    fn captured_warn_subscriber() -> (Arc<Mutex<Vec<u8>>>, tracing::Dispatch) {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(CapturedWriter(output.clone()))
+            .finish();
+        (output, tracing::Dispatch::new(subscriber))
+    }
+
+    async fn start_probe_server(
+        status: StatusCode,
+        body: &'static str,
+        delay: Duration,
+    ) -> (String, JoinHandle<()>) {
+        let app = Router::new().route(
+            "/ready",
+            get(move || async move {
+                tokio::time::sleep(delay).await;
+                (status, body)
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (url, server)
+    }
+
+    #[tokio::test]
+    async fn health_check_returns_ok() {
+        assert_eq!(health_check().await, "OK");
+    }
+
+    #[tokio::test]
+    async fn ready_handler_returns_ready_when_database_is_available() {
+        let app = Router::new()
+            .route("/ready", get(ready_handler))
+            .with_state(test_state().await);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_body(response).await, "READY");
+    }
+
+    #[tokio::test]
+    async fn readiness_database_error_is_redacted_and_classified() {
+        let (output, subscriber) = captured_warn_subscriber();
+        let response = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            tracing::dispatcher::with_default(&subscriber, || {
+                runtime.block_on(readiness_response(
+                    async {
+                        Err(sea_orm::DbErr::Custom(
+                            "postgres://user:password@db/internal".to_owned(),
+                        ))
+                    },
+                    Duration::from_millis(10),
+                ))
+            })
+        })
+        .join()
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response_body(response).await, "NOT READY");
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("failure=\"error\""), "logs: {logs}");
+        assert!(!logs.contains("postgres://user:password@db/internal"));
+    }
+
+    #[tokio::test]
+    async fn readiness_timeout_is_redacted_and_classified() {
+        let (output, subscriber) = captured_warn_subscriber();
+        let response = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            tracing::dispatcher::with_default(&subscriber, || {
+                runtime.block_on(readiness_response(
+                    std::future::pending::<Result<(), sea_orm::DbErr>>(),
+                    Duration::from_millis(10),
+                ))
+            })
+        })
+        .join()
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response_body(response).await, "NOT READY");
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("failure=\"timeout\""), "logs: {logs}");
+        assert!(!logs.contains("http://127.0.0.1:9000/ready"));
+    }
+
+    #[test]
+    fn parse_run_mode_accepts_only_the_supported_argument_shapes() {
+        assert_eq!(parse_run_mode(&[]).unwrap(), RunMode::Gateway);
+        assert_eq!(
+            parse_run_mode(&["--ready-probe".to_owned()]).unwrap(),
+            RunMode::ReadyProbe
+        );
+        assert!(parse_run_mode(&["--unknown".to_owned()]).is_err());
+        assert!(parse_run_mode(&["--ready-probe".to_owned(), "extra".to_owned()]).is_err());
+    }
+
+    #[tokio::test]
+    async fn ready_probe_requires_an_exact_ready_response_within_deadline() {
+        let (url, server) = start_probe_server(StatusCode::OK, "READY", Duration::ZERO).await;
+        assert!(ready_probe_url(&format!("{url}/ready"), Duration::from_millis(100)).await);
+        server.abort();
+
+        let (url, server) =
+            start_probe_server(StatusCode::SERVICE_UNAVAILABLE, "READY", Duration::ZERO).await;
+        assert!(!ready_probe_url(&format!("{url}/ready"), Duration::from_millis(100)).await);
+        server.abort();
+
+        let (url, server) = start_probe_server(StatusCode::OK, "READY\n", Duration::ZERO).await;
+        assert!(!ready_probe_url(&format!("{url}/ready"), Duration::from_millis(100)).await);
+        server.abort();
+
+        let (url, server) =
+            start_probe_server(StatusCode::OK, "READY", Duration::from_secs(1)).await;
+        assert!(!ready_probe_url(&format!("{url}/ready"), Duration::from_millis(10)).await);
+        server.abort();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/ready", listener.local_addr().unwrap());
+        drop(listener);
+        assert!(!ready_probe_url(&url, Duration::from_millis(100)).await);
+    }
 }

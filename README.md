@@ -35,6 +35,51 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
+### PostgreSQL production baseline
+
+`docker-compose.postgres.yml` is an explicit single-node production baseline:
+one PostgreSQL 17 service, one Kubo service, and one gateway. The default
+`docker-compose.yml` remains the SQLite development stack. PostgreSQL and Kubo
+publish no host ports; only the gateway is published, and its host bind must be
+an explicit non-wildcard address.
+
+The PostgreSQL password is interpolated into a URL and must contain only
+`A-Z`, `a-z`, `0-9`, `.`, `_`, `~`, or `-`. Keep the 64-hex-character master
+key unchanged for the lifetime of encrypted data. Compose environment values
+can be inspected by principals with Docker or host access, so restrict that
+access and do not print `docker compose config` output into logs.
+
+```powershell
+$env:POSTGRES_PASSWORD = "replace-with-url-safe-password"
+$env:IPFS_S3_ACCESS_KEY_ID = "replace-with-access-key"
+$env:IPFS_S3_SECRET_ACCESS_KEY = "replace-with-secret-key"
+$masterKey = [byte[]]::new(32)
+[Security.Cryptography.RandomNumberGenerator]::Fill($masterKey)
+$env:IPFS_S3_MASTER_KEY = [Convert]::ToHexString($masterKey).ToLowerInvariant()
+$env:IPFS_S3_GATEWAY_BIND = "127.0.0.1"
+$env:IPFS_S3_GATEWAY_PORT = "9000"
+
+docker compose -f docker-compose.postgres.yml config --quiet
+docker compose -f docker-compose.postgres.yml up --detach --build --wait --wait-timeout 300
+```
+
+`GET /health` is process liveness and returns `200 OK` with `OK` while the HTTP
+server runs. `GET /ready` is database readiness and returns `200 OK` with
+`READY` only when PostgreSQL responds; it returns `503 Service Unavailable`
+with `NOT READY` after a database error or two-second timeout. Readiness does
+not test Kubo or remote pinning providers.
+
+Stop the production stack without deleting its named data volumes:
+
+```powershell
+docker compose -f docker-compose.postgres.yml down --remove-orphans
+```
+
+Never add `--volumes` to the production shutdown command: it deletes the
+PostgreSQL and IPFS named volumes. This baseline does not provide multiple
+gateways, migration leader election, PostgreSQL high availability, backups,
+TLS, IPFS Cluster, a private swarm, a secret manager, or key rotation.
+
 ### Use with aws cli
 
 ```powershell
@@ -297,7 +342,8 @@ leases cannot be revived.
 aws cli / sdk
     │  (SigV4)
     ▼
-axum (HTTP :9000) ── /health ──► health_check
+axum (HTTP :9000) ── /health ──► unconditional liveness
+                  └─ /ready  ──► bounded database ping
     │  (fallback_service)
     ▼
 s3s (SigV4 verify + standard S3 dispatch + custom S3Route)

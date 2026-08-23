@@ -47,6 +47,184 @@ jobs:
       - name: Run live PostgreSQL import tests
         run: cargo test --test postgres_import -- --nocapture --test-threads=1
 
+  postgres-production-deployment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      COMPOSE_DISABLE_ENV_FILE: "1"
+      COMPOSE_PROJECT_NAME: ipfs3-pg-${{ github.run_id }}-${{ github.run_attempt }}
+      POSTGRES_PASSWORD: pg-${{ github.run_id }}-${{ github.run_attempt }}
+      IPFS_S3_ACCESS_KEY_ID: test
+      IPFS_S3_SECRET_ACCESS_KEY: test
+      IPFS_S3_MASTER_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      IPFS_S3_GATEWAY_BIND: 127.0.0.1
+      IPFS_S3_GATEWAY_PORT: 59000
+      IPFS_S3_E2E_ENDPOINT: http://127.0.0.1:59000
+      IPFS_S3_E2E_KUBO_URL: http://127.0.0.1:55001
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: "1.92"
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify Docker Compose
+        shell: pwsh
+        run: |
+          docker compose version
+          if ($LASTEXITCODE -ne 0) { throw "Docker Compose v2 is unavailable" }
+          $composeVersionText = (docker compose version --short).Trim()
+          $composeVersionMatch = [regex]::Match($composeVersionText, '^v?(?<core>\d+\.\d+\.\d+)(?:[-+][0-9A-Za-z.-]+)?$')
+          $composeVersion = $null
+          if (-not $composeVersionMatch.Success -or -not [Version]::TryParse($composeVersionMatch.Groups["core"].Value, [ref]$composeVersion) -or $composeVersion -lt [Version]"2.23.1") { throw "Docker Compose 2.23.1 or newer is required for inline configs.content" }
+
+      - name: Verify production environment contract
+        shell: pwsh
+        run: |
+          $compose = @(
+            "--project-name", $env:COMPOSE_PROJECT_NAME,
+            "-f", "docker-compose.postgres.yml",
+            "-f", "tests/compose.postgres-production-validation.yml"
+          )
+          $savedRequiredValues = @{}
+          foreach ($requiredName in @("POSTGRES_PASSWORD", "IPFS_S3_ACCESS_KEY_ID", "IPFS_S3_SECRET_ACCESS_KEY", "IPFS_S3_MASTER_KEY")) {
+            if (-not (Test-Path -LiteralPath "Env:$requiredName")) { throw "Required job variable is absent before validation: $requiredName" }
+            $savedRequiredValues[$requiredName] = [Environment]::GetEnvironmentVariable($requiredName, "Process")
+          }
+          if ($env:POSTGRES_PASSWORD -notmatch '^[A-Za-z0-9._~-]+$') { throw "POSTGRES_PASSWORD is not URL-safe unreserved text" }
+          if ($env:IPFS_S3_MASTER_KEY -notmatch '^[0-9A-Fa-f]{64}$') { throw "IPFS_S3_MASTER_KEY is not exactly 64 hexadecimal characters" }
+          if ($env:IPFS_S3_GATEWAY_BIND -in @("", "0.0.0.0", "::", "[::]")) { throw "IPFS_S3_GATEWAY_BIND must be explicit and non-wildcard" }
+          $gatewayPort = 0
+          if (-not [int]::TryParse($env:IPFS_S3_GATEWAY_PORT, [ref]$gatewayPort) -or $gatewayPort -lt 1 -or $gatewayPort -gt 65535) { throw "IPFS_S3_GATEWAY_PORT must be decimal 1 through 65535" }
+          foreach ($name in @(
+            "POSTGRES_PASSWORD",
+            "IPFS_S3_ACCESS_KEY_ID",
+            "IPFS_S3_SECRET_ACCESS_KEY",
+            "IPFS_S3_MASTER_KEY"
+          )) {
+            try {
+              Remove-Item -LiteralPath "Env:$name" -ErrorAction Stop
+              if (Test-Path -LiteralPath "Env:$name") { throw "Required variable removal did not produce absence: $name" }
+              if ($null -ne [Environment]::GetEnvironmentVariable($name, "Process")) { throw "Required variable removal retained a process value: $name" }
+              docker compose @compose config --quiet
+              $missingExit = $LASTEXITCODE
+            } finally {
+              foreach ($requiredName in $savedRequiredValues.Keys) {
+                [Environment]::SetEnvironmentVariable($requiredName, $savedRequiredValues[$requiredName], "Process")
+                if (-not (Test-Path -LiteralPath "Env:$requiredName")) { throw "Required variable restoration lost presence: $requiredName" }
+                $restoredRequiredValue = [Environment]::GetEnvironmentVariable($requiredName, "Process")
+                if ($restoredRequiredValue -cne $savedRequiredValues[$requiredName]) { throw "Required variable restoration changed value: $requiredName" }
+              }
+            }
+            if ($missingExit -eq 0) { throw "Compose accepted missing required variable: $name" }
+          }
+          docker compose @compose config --quiet
+          if ($LASTEXITCODE -ne 0) { throw "Complete production Compose configuration failed" }
+
+      - name: Claim unique Compose project and fixed ports
+        shell: pwsh
+        run: |
+          $project = $env:COMPOSE_PROJECT_NAME
+          $containers = @(docker ps --all --quiet --filter "label=com.docker.compose.project=$project" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+          if ($LASTEXITCODE -ne 0) { throw "Container ownership preflight failed" }
+          $networks = @(docker network ls --quiet --filter "label=com.docker.compose.project=$project" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+          if ($LASTEXITCODE -ne 0) { throw "Network ownership preflight failed" }
+          $volumes = @(docker volume ls --quiet --filter "label=com.docker.compose.project=$project" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+          if ($LASTEXITCODE -ne 0) { throw "Volume ownership preflight failed" }
+          if (($containers.Count + $networks.Count + $volumes.Count) -ne 0) {
+            throw "Unique Compose project already owns resources: $project"
+          }
+          foreach ($port in @(55433, 55001, 59000)) {
+            $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, $port)
+            try { $listener.Start() } catch { throw "Fixed validation port is occupied: $port" } finally { $listener.Stop() }
+          }
+          "POSTGRES_PRODUCTION_OWNED=true" | Add-Content -LiteralPath $env:GITHUB_ENV
+
+      - name: Build and start production topology
+        shell: pwsh
+        run: |
+          "POSTGRES_PRODUCTION_ATTEMPTED=true" | Add-Content -LiteralPath $env:GITHUB_ENV
+          docker compose --project-name $env:COMPOSE_PROJECT_NAME -f docker-compose.postgres.yml -f tests/compose.postgres-production-validation.yml up --detach --build --wait --wait-timeout 300 postgres kubo gateway
+          if ($LASTEXITCODE -ne 0) { throw "Production topology did not become healthy" }
+
+      - name: Verify liveness and readiness
+        shell: pwsh
+        run: |
+          $health = Invoke-WebRequest -Uri "http://127.0.0.1:59000/health" -TimeoutSec 5
+          if ($health.StatusCode -ne 200 -or $health.Content -cne "OK") { throw "Unexpected liveness response" }
+          $ready = Invoke-WebRequest -Uri "http://127.0.0.1:59000/ready" -TimeoutSec 5
+          if ($ready.StatusCode -ne 200 -or $ready.Content -cne "READY") { throw "Unexpected readiness response" }
+
+      - name: Verify latest migration, JSON columns, and application role
+        shell: pwsh
+        run: |
+          $migrationOutput = @(docker compose --project-name $env:COMPOSE_PROJECT_NAME -f docker-compose.postgres.yml -f tests/compose.postgres-production-validation.yml exec -T postgres psql -U postgres -d ipfs3 -tA -c "SELECT version FROM seaql_migrations WHERE version = 'm20260813_000001_postgres_json_columns'; SELECT rolname || ':' || rolsuper::text FROM pg_roles WHERE rolname = 'ipfs3'; SELECT table_name || '.' || column_name || ':' || data_type FROM information_schema.columns WHERE table_schema = current_schema() AND (table_name, column_name) IN (('multipart_uploads', 'metadata'), ('multipart_uploads', 'tags_json'), ('objects', 'metadata')) ORDER BY table_name, column_name;")
+          if ($LASTEXITCODE -ne 0) { throw "Migration, JSON-column, and application-role query failed" }
+          $databaseContract = @($migrationOutput | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
+          $expectedDatabaseContract = @(
+            "m20260813_000001_postgres_json_columns",
+            "ipfs3:false",
+            "multipart_uploads.metadata:jsonb",
+            "multipart_uploads.tags_json:jsonb",
+            "objects.metadata:jsonb"
+          )
+          if ($databaseContract.Count -ne $expectedDatabaseContract.Count) { throw "Unexpected database contract rows: $($databaseContract -join ', ')" }
+          for ($index = 0; $index -lt $expectedDatabaseContract.Count; $index++) {
+            if ($databaseContract[$index] -cne $expectedDatabaseContract[$index]) { throw "Unexpected database contract row ${index}: $($databaseContract[$index])" }
+          }
+
+      - name: Run serial PostgreSQL-backed end-to-end tests
+        run: cargo test --test e2e -- --nocapture --test-threads=1
+
+      - name: Stop PostgreSQL and verify readiness failure
+        shell: pwsh
+        run: |
+          docker compose --project-name $env:COMPOSE_PROJECT_NAME -f docker-compose.postgres.yml -f tests/compose.postgres-production-validation.yml stop postgres
+          if ($LASTEXITCODE -ne 0) { throw "PostgreSQL stop failed" }
+          $health = Invoke-WebRequest -Uri "http://127.0.0.1:59000/health" -TimeoutSec 5
+          if ($health.StatusCode -ne 200 -or $health.Content -cne "OK") { throw "Liveness failed after PostgreSQL stopped" }
+          $deadline = [DateTime]::UtcNow.AddSeconds(10)
+          $observed = $false
+          do {
+            try {
+              $ready = Invoke-WebRequest -Uri "http://127.0.0.1:59000/ready" -TimeoutSec 3 -SkipHttpErrorCheck
+              if ($ready.StatusCode -eq 503 -and $ready.Content -ceq "NOT READY") { $observed = $true; break }
+            } catch {
+              Write-Host "Readiness request has not reached the expected 503 response"
+            }
+            Start-Sleep -Milliseconds 500
+          } while ([DateTime]::UtcNow -lt $deadline)
+          if (-not $observed) { throw "Readiness did not become 503 NOT READY within ten seconds" }
+
+      - name: Production Compose diagnostics
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          if ($env:POSTGRES_PRODUCTION_ATTEMPTED -ne "true") { Write-Host "Production topology was not attempted"; exit 0 }
+          docker compose --project-name $env:COMPOSE_PROJECT_NAME -f docker-compose.postgres.yml -f tests/compose.postgres-production-validation.yml logs --no-color postgres kubo gateway
+          if ($LASTEXITCODE -ne 0) { Write-Warning "Production Compose diagnostics failed" }
+
+      - name: Production Compose cleanup and residual assertion
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          if ($env:POSTGRES_PRODUCTION_OWNED -ne "true" -or $env:POSTGRES_PRODUCTION_ATTEMPTED -ne "true") { Write-Host "No owned production topology requires cleanup"; exit 0 }
+          $project = $env:COMPOSE_PROJECT_NAME
+          docker compose --project-name $project -f docker-compose.postgres.yml -f tests/compose.postgres-production-validation.yml down --volumes --remove-orphans
+          $downExit = $LASTEXITCODE
+          $containers = @(docker ps --all --quiet --filter "label=com.docker.compose.project=$project" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+          $containerExit = $LASTEXITCODE
+          $networks = @(docker network ls --quiet --filter "label=com.docker.compose.project=$project" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+          $networkExit = $LASTEXITCODE
+          $volumes = @(docker volume ls --quiet --filter "label=com.docker.compose.project=$project" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+          $volumeExit = $LASTEXITCODE
+          if ($downExit -ne 0 -or $containerExit -ne 0 -or $networkExit -ne 0 -or $volumeExit -ne 0) { throw "Production cleanup or residual query failed" }
+          if (($containers.Count + $networks.Count + $volumes.Count) -ne 0) { throw "Residual Compose resources remain for project: $project" }
+
   e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -88,6 +266,9 @@ jobs:
 
       - name: Test release-validation workflow contract
         run: pwsh -NoProfile -File tests/release-validation.Tests.ps1
+
+      - name: Test PostgreSQL production baseline contract
+        run: pwsh -NoProfile -File tests/postgres-production-baseline.Tests.ps1
 
       - name: Test client-smoke infrastructure
         run: pwsh -NoProfile -File tests/client-smoke.Tests.ps1

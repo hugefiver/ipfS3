@@ -152,14 +152,20 @@ Assert-Contains $concurrencyBlock "  cancel-in-progress: true" "Concurrency must
 
 $jobsBlock = Get-YamlBlock -Text $Workflow -Key "jobs" -Indent 0
 $jobNames = @([regex]::Matches($jobsBlock, '(?m)^  ([A-Za-z0-9_-]+):\s*$') | ForEach-Object { $_.Groups[1].Value })
-Assert-True ($jobNames.Count -eq 3) "Expected exactly three jobs, found $($jobNames.Count): $($jobNames -join ', ')"
-foreach ($expectedJob in @("postgres-import", "e2e", "client-smoke-infrastructure")) {
+Assert-True ($jobNames.Count -eq 4) "Expected exactly four jobs, found $($jobNames.Count): $($jobNames -join ', ')"
+foreach ($expectedJob in @(
+    "postgres-import",
+    "postgres-production-deployment",
+    "e2e",
+    "client-smoke-infrastructure"
+)) {
     Assert-True ($jobNames -ccontains $expectedJob) "Required job is missing: $expectedJob"
 }
 Assert-NotMatches $jobsBlock '(?m)^    needs:' "Release-validation jobs must be independent"
 Assert-NotMatches $jobsBlock '(?m)^    continue-on-error:' "Release-validation jobs must be blocking"
 
 $postgresJob = Get-YamlBlock -Text $jobsBlock -Key "postgres-import" -Indent 2
+$productionJob = Get-YamlBlock -Text $jobsBlock -Key "postgres-production-deployment" -Indent 2
 $e2eJob = Get-YamlBlock -Text $jobsBlock -Key "e2e" -Indent 2
 $clientJob = Get-YamlBlock -Text $jobsBlock -Key "client-smoke-infrastructure" -Indent 2
 
@@ -188,6 +194,68 @@ foreach ($fragment in @(
 $postgresRunLines = @($postgresJob -split "`n" | Where-Object { $_ -match '^\s+run:' })
 Assert-True ($postgresRunLines.Count -eq 1) "PostgreSQL job must contain exactly one run command"
 Assert-ExactLine $postgresJob "        run: cargo test --test postgres_import -- --nocapture --test-threads=1" "PostgreSQL job must run the exact serial target."
+
+Assert-Contains $productionJob "    runs-on: ubuntu-latest" "Production deployment job must use ubuntu-latest"
+Assert-Contains $productionJob "    timeout-minutes: 60" "Production deployment timeout must be 60 minutes"
+Assert-RustSetup -JobBlock $productionJob -JobName "Production deployment job"
+$productionEnv = Get-YamlBlock -Text $productionJob -Key "env" -Indent 4
+Assert-ExactLine $productionEnv '      COMPOSE_DISABLE_ENV_FILE: "1"' "Production deployment job must disable implicit project environment files."
+Assert-NotMatches $productionEnv '(?im)^\s*COMPOSE_DISABLE_ENV_FILE:\s*(?:"?0"?|"?false"?)\s*$' "Production deployment job must not enable implicit project environment files"
+Assert-NotContains $productionJob "--env-file" "Production deployment job must not use an explicit Compose environment file"
+Assert-Contains $productionJob '      COMPOSE_PROJECT_NAME: ipfs3-pg-${{ github.run_id }}-${{ github.run_attempt }}' "Production project name must include run ID and attempt"
+Assert-Contains $productionJob "      IPFS_S3_ACCESS_KEY_ID: test" "Production E2E access key must match tests/e2e.rs"
+Assert-Contains $productionJob "      IPFS_S3_SECRET_ACCESS_KEY: test" "Production E2E secret key must match tests/e2e.rs"
+Assert-Contains $productionJob "      IPFS_S3_E2E_ENDPOINT: http://127.0.0.1:59000" "Production E2E endpoint is incorrect"
+Assert-Contains $productionJob "      IPFS_S3_E2E_KUBO_URL: http://127.0.0.1:55001" "Production Kubo endpoint is incorrect"
+Assert-NotMatches $productionJob '(?m)^    continue-on-error:' "Production deployment job must be blocking"
+Assert-InOrder -Text $productionJob -Message "Production deployment checks are missing or out of order." -Fragments @(
+    "      - name: Verify Docker Compose",
+    "      - name: Verify production environment contract",
+    "      - name: Claim unique Compose project and fixed ports",
+    "      - name: Build and start production topology",
+    "      - name: Verify liveness and readiness",
+    "      - name: Verify latest migration, JSON columns, and application role",
+    "      - name: Run serial PostgreSQL-backed end-to-end tests",
+    "      - name: Stop PostgreSQL and verify readiness failure",
+    "      - name: Production Compose diagnostics",
+    "      - name: Production Compose cleanup and residual assertion"
+)
+foreach ($fragment in @(
+    "docker-compose.postgres.yml",
+    "tests/compose.postgres-production-validation.yml",
+    "Docker Compose 2.23.1 or newer",
+    "config --quiet",
+    "up --detach --build --wait --wait-timeout 300 postgres kubo gateway",
+    'm20260813_000001_postgres_json_columns',
+    'multipart_uploads.metadata:jsonb',
+    'multipart_uploads.tags_json:jsonb',
+    'objects.metadata:jsonb',
+    "cargo test --test e2e -- --nocapture --test-threads=1",
+    "stop postgres",
+    'http://127.0.0.1:59000/health',
+    'http://127.0.0.1:59000/ready',
+    "logs --no-color postgres kubo gateway",
+    "down --volumes --remove-orphans",
+    "com.docker.compose.project"
+)) {
+    Assert-Contains $productionJob $fragment "Production deployment contract is missing: $fragment"
+}
+Assert-NotContains $productionJob 'm20260730_000001_standard_mutation_fence' "Production deployment job must not validate the previous latest migration"
+Assert-NotContains $productionJob "compose --wait" "No Compose wait is allowed after PostgreSQL is stopped"
+Assert-True (([regex]::Matches($productionJob, '(?m)^        if: \$\{\{ always\(\) \}\}\s*$')).Count -eq 2) "Production diagnostics and cleanup must both use always()"
+Assert-NotMatches $productionJob 'SetEnvironmentVariable\([^,\r\n]+,\s*\$null,\s*"Process"\)' "Production job must not use SetEnvironmentVariable(..., `$null, ...) to remove or restore an environment variable"
+foreach ($restoreFragment in @(
+    'if (-not (Test-Path -LiteralPath "Env:$requiredName")) { throw "Required job variable is absent before validation: $requiredName" }',
+    'Remove-Item -LiteralPath "Env:$name" -ErrorAction Stop',
+    'if (Test-Path -LiteralPath "Env:$name") { throw "Required variable removal did not produce absence: $name" }',
+    'if ($null -ne [Environment]::GetEnvironmentVariable($name, "Process")) { throw "Required variable removal retained a process value: $name" }',
+    'if (-not (Test-Path -LiteralPath "Env:$requiredName")) { throw "Required variable restoration lost presence: $requiredName" }',
+    '$restoredRequiredValue = [Environment]::GetEnvironmentVariable($requiredName, "Process")',
+    'if ($restoredRequiredValue -cne $savedRequiredValues[$requiredName]) { throw "Required variable restoration changed value: $requiredName" }'
+)) {
+    Assert-Contains $productionJob $restoreFragment "Production environment restoration contract is missing: $restoreFragment"
+}
+Assert-Matches $productionJob '(?s)try \{.*?Remove-Item -LiteralPath "Env:\$name" -ErrorAction Stop.*?config --quiet.*?\} finally \{.*?SetEnvironmentVariable\(\$requiredName, \$savedRequiredValues\[\$requiredName\], "Process"\).*?Test-Path -LiteralPath "Env:\$requiredName".*?\$restoredRequiredValue -cne \$savedRequiredValues\[\$requiredName\]' "Each missing-secret probe must remove deterministically and restore exact presence/value in finally"
 
 Assert-Contains $e2eJob "    runs-on: ubuntu-latest" "E2E job must use ubuntu-latest"
 Assert-Contains $e2eJob "    timeout-minutes: 60" "E2E job timeout must be 60 minutes"
@@ -220,13 +288,16 @@ Assert-Contains $clientJob "    runs-on: ubuntu-latest" "Client-smoke infrastruc
 Assert-Contains $clientJob "    timeout-minutes: 15" "Client-smoke infrastructure timeout must be 15 minutes"
 Assert-Contains $clientJob "      - uses: actions/checkout@v7" "Client-smoke infrastructure job must check out the repository"
 $clientRunLines = @($clientJob -split "`n" | Where-Object { $_ -match '^\s+run:' })
-Assert-True ($clientRunLines.Count -eq 2) "Client-smoke infrastructure job must contain exactly two run commands"
+Assert-True ($clientRunLines.Count -eq 3) "Client-smoke infrastructure job must contain exactly three run commands"
 Assert-ExactLine $clientJob "        run: pwsh -NoProfile -File tests/release-validation.Tests.ps1" "Release-validation contract command is missing or changed."
+Assert-ExactLine $clientJob "        run: pwsh -NoProfile -File tests/postgres-production-baseline.Tests.ps1" "PostgreSQL production baseline contract command is missing or changed."
 Assert-ExactLine $clientJob "        run: pwsh -NoProfile -File tests/client-smoke.Tests.ps1" "Client-smoke infrastructure command is missing or changed."
-Assert-InOrder -Text $clientJob -Message "Client-smoke contract test must run before the existing infrastructure test." -Fragments @(
+Assert-InOrder -Text $clientJob -Message "Static release contracts must run before the existing client-smoke infrastructure test." -Fragments @(
     "        run: pwsh -NoProfile -File tests/release-validation.Tests.ps1",
+    "        run: pwsh -NoProfile -File tests/postgres-production-baseline.Tests.ps1",
     "        run: pwsh -NoProfile -File tests/client-smoke.Tests.ps1"
 )
+Assert-NotMatches $clientJob '(?m)^        continue-on-error:' "Client-smoke infrastructure contract steps must be blocking"
 
 Assert-NotContains $Workflow "cloudflared" "Release validation must not start or reference cloudflared"
 Assert-NotContains $Workflow "scripts/client-smoke.ps1" "Release validation must not invoke the real client-smoke runner"
