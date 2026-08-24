@@ -130,6 +130,96 @@ points of failure. It does not add PostgreSQL HA, Kubo replication, load-balance
 HA, IPFS Cluster, a private swarm, TLS, distributed provider coordination, or
 master-key rotation.
 
+### IPFS Cluster pinset replication
+
+`docker-compose.cluster.yml` is a separate one-gateway profile, not combined
+with horizontal scaling. It starts exactly six roles: PostgreSQL 17; Kubo A and
+Kubo B at v0.43.0 with separate repositories; Cluster A and Cluster B in full
+CRDT mode at v1.1.6 with separate identities; and the gateway through the
+Cluster A proxy. Each peer's connector and proxy forwarder target its paired
+Kubo DNS endpoint. They never use a container-local Kubo loopback address or a
+different peer's Kubo endpoint. Replication is min=max 2, with same-host Compose
+mDNS only. This profile makes no claim beyond one Docker host.
+
+Set fresh values in the current PowerShell session. The password, access key,
+and secret below are cryptographically random URL-safe values. The 32-byte
+master key and 32-byte Cluster secret are rendered as lowercase hex. The bind
+and port are explicit, and Compose ignores any `.env` file.
+
+This bounded same-host profile publishes the gateway only on fixed host loopback
+`127.0.0.1`. `IPFS_S3_GATEWAY_BIND=127.0.0.1` is a required acknowledgement;
+other values are rejected. Direct non-loopback publication is unsupported.
+External clients require a separately secured TLS/auth reverse proxy, which is
+out of scope and not shipped by this profile.
+
+```powershell
+function New-UrlSafeSecret {
+    param([int]$ByteCount = 32)
+
+    $bytes = [byte[]]::new($ByteCount)
+    [Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+    [Convert]::ToBase64String($bytes).TrimEnd("=").Replace("+", "-").Replace("/", "_")
+}
+
+$env:POSTGRES_PASSWORD = New-UrlSafeSecret
+$env:IPFS_S3_ACCESS_KEY_ID = New-UrlSafeSecret
+$env:IPFS_S3_SECRET_ACCESS_KEY = New-UrlSafeSecret
+$masterKey = [byte[]]::new(32)
+[Security.Cryptography.RandomNumberGenerator]::Fill($masterKey)
+$env:IPFS_S3_MASTER_KEY = [Convert]::ToHexString($masterKey).ToLowerInvariant()
+$clusterSecret = [byte[]]::new(32)
+[Security.Cryptography.RandomNumberGenerator]::Fill($clusterSecret)
+$env:IPFS_S3_CLUSTER_SECRET = [Convert]::ToHexString($clusterSecret).ToLowerInvariant()
+$env:IPFS_S3_GATEWAY_BIND = "127.0.0.1"
+$env:IPFS_S3_GATEWAY_PORT = "9000"
+$env:COMPOSE_DISABLE_ENV_FILE = "1"
+
+docker compose -f docker-compose.cluster.yml config --quiet
+if ($LASTEXITCODE -ne 0) { throw "Cluster Compose configuration failed" }
+
+docker compose -f docker-compose.cluster.yml up --detach --build --wait --wait-timeout 300
+if ($LASTEXITCODE -ne 0) { throw "Cluster profile did not become healthy" }
+```
+
+Store these generated secrets before the first write and restore them unchanged
+for every later start. Changing the master key breaks encrypted objects;
+changing the Cluster secret breaks membership.
+
+Local service health is insufficient. The shipped validator first runs an
+identity-suppressed no-write exact-two-peer gate, which reports only
+count/normalized v1.1.6, then proves complete production
+`add(pin=false)` -> `pin/add` -> `cat` compatibility before replication. It
+does not print identities.
+
+A PUT followed by an immediate GET proves the local A path only. Replication is
+accepted only at exact 2/2 allocations and when both physical tracker states are
+`pinned`. Kubo B reads only afterward, and the gateway has no fallback. `S3
+DELETE` removes metadata and produces `HEAD 404`, but intentionally does not
+unpin, so the allocation and Kubo B bytes remain.
+
+Peer-B stop/restart evidence proves loss and recovery of the two-pin state with
+the existing volumes. It does not demonstrate high availability, and 2/2 does
+not guarantee writes while degraded. PostgreSQL, gateway, Cluster A, Kubo A, and
+the Docker host are single points. This profile does not provide PostgreSQL,
+Kubo, Cluster, gateway, or host high availability.
+
+Production PostgreSQL, Kubo, Cluster REST, Cluster proxy, and swarm endpoints
+are internal. The validation alone exposes the Cluster A proxy at loopback
+`59103`; any non-loopback access needs TLS and authentication, and TLS and
+authentication are not implemented. The Cluster secret protects Cluster
+membership, not the private Kubo swarm. Private swarm remains unchecked. Hosted
+job: `NOT RUN`.
+
+For production shutdown, use only the following command and check its exit
+status:
+
+```powershell
+docker compose -f docker-compose.cluster.yml down --remove-orphans
+if ($LASTEXITCODE -ne 0) { throw "Cluster shutdown failed" }
+```
+
+Never use the `--volumes` flag: the five named volumes are durable.
+
 ### Use with aws cli
 
 ```powershell

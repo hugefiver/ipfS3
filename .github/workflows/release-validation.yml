@@ -415,8 +415,381 @@ jobs:
           $networkExit = $LASTEXITCODE
           $volumes = @(docker volume ls --quiet --filter "label=com.docker.compose.project=$project" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
           $volumeExit = $LASTEXITCODE
-          if ($downExit -ne 0 -or $containerExit -ne 0 -or $networkExit -ne 0 -or $volumeExit -ne 0) { throw "Multi-gateway cleanup or residual query failed" }
-          if (($containers.Count + $networks.Count + $volumes.Count) -ne 0) { throw "Residual Compose resources remain for project: $project" }
+           if ($downExit -ne 0 -or $containerExit -ne 0 -or $networkExit -ne 0 -or $volumeExit -ne 0) { throw "Multi-gateway cleanup or residual query failed" }
+           if (($containers.Count + $networks.Count + $volumes.Count) -ne 0) { throw "Residual Compose resources remain for project: $project" }
+
+  cluster-pinset-replication:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      COMPOSE_DISABLE_ENV_FILE: "1"
+      COMPOSE_PROJECT_NAME: ipfs3-cl-${{ github.run_id }}-${{ github.run_attempt }}
+      POSTGRES_PASSWORD: cl-${{ github.run_id }}-${{ github.run_attempt }}
+      IPFS_S3_ACCESS_KEY_ID: test
+      IPFS_S3_SECRET_ACCESS_KEY: test
+      IPFS_S3_MASTER_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      IPFS_S3_CLUSTER_SECRET: abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789
+      IPFS_S3_GATEWAY_BIND: 127.0.0.1
+      IPFS_S3_GATEWAY_PORT: 59100
+      IPFS_S3_CLUSTER_GATEWAY_ENDPOINT: http://127.0.0.1:59100
+      IPFS_S3_CLUSTER_A_REST_URL: http://127.0.0.1:59101
+      IPFS_S3_CLUSTER_B_REST_URL: http://127.0.0.1:59102
+      IPFS_S3_CLUSTER_A_PROXY_URL: http://127.0.0.1:59103
+      IPFS_S3_CLUSTER_KUBO_A_URL: http://127.0.0.1:55100
+      IPFS_S3_CLUSTER_KUBO_B_URL: http://127.0.0.1:55101
+      IPFS_S3_CLUSTER_STATE_PATH: ${{ runner.temp }}/ipfs3-cluster-${{ github.run_id }}-${{ github.run_attempt }}.json
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: "1.92"
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify Docker Compose for Cluster deployment
+        shell: pwsh
+        run: |
+          docker compose version
+          if ($LASTEXITCODE -ne 0) { throw "Docker Compose v2 is unavailable" }
+          $composeVersionText = (docker compose version --short).Trim()
+          $composeVersionMatch = [regex]::Match($composeVersionText, '^v?(?<core>\d+\.\d+\.\d+)(?:[-+][0-9A-Za-z.-]+)?$')
+          $composeVersion = $null
+          if (-not $composeVersionMatch.Success -or
+              -not [Version]::TryParse($composeVersionMatch.Groups["core"].Value, [ref]$composeVersion) -or
+              $composeVersion -lt [Version]"2.23.1") {
+              throw "Docker Compose 2.23.1 or newer is required for inline configs.content"
+          }
+
+      - name: Verify Cluster environment contract
+        shell: pwsh
+        run: |
+          $compose = @(
+              "--project-name", $env:COMPOSE_PROJECT_NAME,
+              "-f", "docker-compose.cluster.yml",
+              "-f", "tests/compose.cluster-validation.yml"
+          )
+          $requiredNames = @(
+              "POSTGRES_PASSWORD",
+              "IPFS_S3_ACCESS_KEY_ID",
+              "IPFS_S3_SECRET_ACCESS_KEY",
+              "IPFS_S3_MASTER_KEY",
+              "IPFS_S3_CLUSTER_SECRET",
+              "IPFS_S3_GATEWAY_BIND",
+              "IPFS_S3_GATEWAY_PORT"
+          )
+          $savedRequiredValues = @{}
+          foreach ($requiredName in $requiredNames) {
+              if (-not (Test-Path -LiteralPath "Env:$requiredName")) { throw "Required job variable is absent: $requiredName" }
+              $savedRequiredValues[$requiredName] = [Environment]::GetEnvironmentVariable($requiredName, "Process")
+          }
+          if ($env:POSTGRES_PASSWORD -notmatch '^[A-Za-z0-9._~-]+$') { throw "POSTGRES_PASSWORD must be URL-safe unreserved text" }
+          if ([string]::IsNullOrWhiteSpace($env:IPFS_S3_ACCESS_KEY_ID)) { throw "S3 access key must be nonempty" }
+          if ([string]::IsNullOrWhiteSpace($env:IPFS_S3_SECRET_ACCESS_KEY)) { throw "S3 secret key must be nonempty" }
+          if ($env:IPFS_S3_MASTER_KEY -notmatch '^[0-9A-Fa-f]{64}$' -or $env:IPFS_S3_MASTER_KEY -match '^0{64}$') { throw "Master key must be nonzero 64-hex" }
+          if ($env:IPFS_S3_CLUSTER_SECRET -notmatch '^[0-9A-Fa-f]{64}$') { throw "Cluster secret must be exactly 64-hex" }
+          if ($env:IPFS_S3_GATEWAY_BIND -cne "127.0.0.1") { throw "Gateway bind must be exactly 127.0.0.1" }
+          $gatewayPort = 0
+          if (-not [int]::TryParse($env:IPFS_S3_GATEWAY_PORT, [ref]$gatewayPort) -or $gatewayPort -ne 59100) { throw "Validation gateway port must be exactly 59100" }
+          foreach ($name in $requiredNames) {
+              try {
+                  Remove-Item -LiteralPath "Env:$name" -ErrorAction Stop
+                  if (Test-Path -LiteralPath "Env:$name") { throw "Required variable removal retained presence: $name" }
+                  docker compose @compose config --quiet
+                  $missingExit = $LASTEXITCODE
+              } finally {
+                  foreach ($requiredName in $savedRequiredValues.Keys) {
+                      [Environment]::SetEnvironmentVariable($requiredName, $savedRequiredValues[$requiredName], "Process")
+                      if (-not (Test-Path -LiteralPath "Env:$requiredName")) { throw "Required variable restoration lost presence: $requiredName" }
+                      if ([Environment]::GetEnvironmentVariable($requiredName, "Process") -cne $savedRequiredValues[$requiredName]) {
+                          throw "Required variable restoration changed value: $requiredName"
+                      }
+                  }
+              }
+              if ($missingExit -eq 0) { throw "Compose accepted missing required variable: $name" }
+          }
+          docker compose @compose config --quiet
+          if ($LASTEXITCODE -ne 0) { throw "Complete Cluster Compose configuration failed" }
+
+      - name: Claim unique Cluster project, ports, and state receipt
+        shell: pwsh
+        run: |
+          $project = $env:COMPOSE_PROJECT_NAME
+          $containers = @(docker ps --all --quiet --filter "label=com.docker.compose.project=$project" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+          $containerExit = $LASTEXITCODE
+          $networks = @(docker network ls --quiet --filter "label=com.docker.compose.project=$project" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+          $networkExit = $LASTEXITCODE
+          $volumes = @(docker volume ls --quiet --filter "label=com.docker.compose.project=$project" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+          $volumeExit = $LASTEXITCODE
+          if ($containerExit -ne 0 -or $networkExit -ne 0 -or $volumeExit -ne 0) { throw "Project ownership preflight query failed" }
+          if (($containers.Count + $networks.Count + $volumes.Count) -ne 0) { throw "Unique project already owns resources: $project" }
+          foreach ($port in @(55435, 55100, 55101, 59100, 59101, 59102, 59103)) {
+              $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, $port)
+              try { $listener.Start() } catch { throw "Fixed validation port is occupied: $port" } finally { $listener.Stop() }
+          }
+          if (Test-Path -LiteralPath $env:IPFS_S3_CLUSTER_STATE_PATH) { throw "Cluster state receipt already exists" }
+          "CLUSTER_PINSET_OWNED=true" | Add-Content -LiteralPath $env:GITHUB_ENV
+          $stateReceiptOwned = $false
+          $receipt = $null
+          try {
+              $receipt = [IO.File]::Open(
+                  $env:IPFS_S3_CLUSTER_STATE_PATH,
+                  [IO.FileMode]::CreateNew,
+                  [IO.FileAccess]::Write,
+                  [IO.FileShare]::None
+              )
+              $receipt.Dispose()
+              $stateReceiptOwned = $true
+          } finally {
+              if ($null -ne $receipt) { $receipt.Dispose() }
+          }
+          if (-not $stateReceiptOwned) { throw "State receipt claim did not complete" }
+          "CLUSTER_STATE_RECEIPT_OWNED=true" | Add-Content -LiteralPath $env:GITHUB_ENV
+
+      - name: Build and start Cluster topology
+        shell: pwsh
+        run: |
+          "CLUSTER_PINSET_ATTEMPTED=true" | Add-Content -LiteralPath $env:GITHUB_ENV
+          docker compose --project-name $env:COMPOSE_PROJECT_NAME -f docker-compose.cluster.yml -f tests/compose.cluster-validation.yml up --detach --build --wait --wait-timeout 300 postgres kubo-a kubo-b cluster-a cluster-b gateway
+          if ($LASTEXITCODE -ne 0) { throw "Cluster topology did not become healthy" }
+
+      - name: Prove Cluster release-version representation contract
+        shell: pwsh
+        run: |
+          cargo test --test cluster cluster_support::release_version_validator_accepts_exact_release_and_build_metadata -- --exact
+          if ($LASTEXITCODE -ne 0) { throw "Cluster release-version unit contract failed" }
+
+      - name: Prove exact two-peer topology without writes
+        shell: pwsh
+        run: |
+          cargo test --test cluster cluster_topology_converges -- --exact --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "TOPOLOGY_CONVERGENCE_BLOCKER: exact v1.1.6 two-peer topology did not converge" }
+          "CLUSTER_TOPOLOGY_GREEN=true" | Add-Content -LiteralPath $env:GITHUB_ENV
+
+      - name: Prove direct Kubo wire compatibility against Cluster A proxy
+        shell: pwsh
+        run: |
+          if ($env:CLUSTER_TOPOLOGY_GREEN -ne "true") { throw "Topology GREEN receipt is required before compatibility" }
+          cargo test --test cluster cluster_proxy_compatibility -- --exact --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "PROXY_COMPATIBILITY_BLOCKER: stop and revise the approved design; do not add app fallback code" }
+          "CLUSTER_PROXY_COMPATIBILITY_GREEN=true" | Add-Content -LiteralPath $env:GITHUB_ENV
+
+      - name: Prove replication and retained deletion
+        shell: pwsh
+        run: |
+          if ($env:CLUSTER_PROXY_COMPATIBILITY_GREEN -ne "true") { throw "Add-pin-cat proxy GREEN receipt is required before replication" }
+          if ($env:CLUSTER_STATE_RECEIPT_OWNED -ne "true") { throw "Owned state receipt is required before replication" }
+          cargo test --test cluster cluster_replication_and_retention -- --exact --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "Cluster replication and retention contract failed" }
+
+      - name: Capture diagnostics before peer B stop
+        shell: pwsh
+        run: |
+          function Protect-ClusterDiagnosticLine {
+              param([AllowEmptyString()][string]$Line)
+              $safe = $Line
+              $safe = [regex]::Replace(
+                  $safe,
+                  '(?i)((?:"?)(?:PeerID|peer_id|peer-id)(?:"?)\s*[:=]\s*)(?:"[^"]*"|''[^'']*''|[^\s,;]+)',
+                  '$1[REDACTED_PEER_ID]'
+              )
+              $safe = [regex]::Replace(
+                  $safe,
+                  '(?i)(/p2p/)[1-9A-HJ-NP-Za-km-z]+',
+                  '$1[REDACTED_PEER_ID]'
+              )
+              $safe = [regex]::Replace(
+                  $safe,
+                  '(?<![1-9A-HJ-NP-Za-km-z])12D3Koo[1-9A-HJ-NP-Za-km-z]{20,}(?![1-9A-HJ-NP-Za-km-z])',
+                  '[REDACTED_PEER_ID]'
+              )
+              if ($safe -match '(?i)\b(?:peer(?:[_-]?id)?|peerid|identity|peerstore)\b') {
+                  $safe = [regex]::Replace(
+                      $safe,
+                      '(?<![1-9A-HJ-NP-Za-km-z])Qm[1-9A-HJ-NP-Za-km-z]{44}(?![1-9A-HJ-NP-Za-km-z])',
+                      '[REDACTED_PEER_ID]'
+                  )
+              }
+              $safe
+          }
+          function Write-SanitizedClusterDiagnostics {
+              param(
+                  [Parameter(Mandatory)][string[]]$ComposeArgs,
+                  [Parameter(Mandatory)][string]$FailureMessage
+              )
+              $rawDiagnosticLines = @(
+                  docker compose @ComposeArgs logs --no-color postgres kubo-a kubo-b cluster-a cluster-b gateway 2>&1
+              )
+              $diagnosticExit = $LASTEXITCODE
+              foreach ($rawLine in $rawDiagnosticLines) {
+                  [Console]::Out.WriteLine((Protect-ClusterDiagnosticLine -Line "$rawLine"))
+              }
+              if ($diagnosticExit -ne 0) { throw "$FailureMessage (exit=$diagnosticExit)" }
+          }
+          $compose = @("--project-name", $env:COMPOSE_PROJECT_NAME, "-f", "docker-compose.cluster.yml", "-f", "tests/compose.cluster-validation.yml")
+          Write-SanitizedClusterDiagnostics -ComposeArgs $compose -FailureMessage "Pre-stop Cluster diagnostics failed"
+
+      - name: Stop Cluster and Kubo peer B
+        shell: pwsh
+        run: |
+          docker compose --project-name $env:COMPOSE_PROJECT_NAME -f docker-compose.cluster.yml -f tests/compose.cluster-validation.yml stop cluster-b kubo-b
+          if ($LASTEXITCODE -ne 0) { throw "Peer B stop failed" }
+
+      - name: Prove stopped peer loses two-pin evidence
+        shell: pwsh
+        run: |
+          if ($env:CLUSTER_STATE_RECEIPT_OWNED -ne "true") { throw "Owned state receipt is required before outage validation" }
+          cargo test --test cluster cluster_peer_b_outage_contract -- --exact --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "Peer B outage contract failed" }
+
+      - name: Capture stopped-peer diagnostics before restart
+        shell: pwsh
+        run: |
+          function Protect-ClusterDiagnosticLine {
+              param([AllowEmptyString()][string]$Line)
+              $safe = $Line
+              $safe = [regex]::Replace(
+                  $safe,
+                  '(?i)((?:"?)(?:PeerID|peer_id|peer-id)(?:"?)\s*[:=]\s*)(?:"[^"]*"|''[^'']*''|[^\s,;]+)',
+                  '$1[REDACTED_PEER_ID]'
+              )
+              $safe = [regex]::Replace(
+                  $safe,
+                  '(?i)(/p2p/)[1-9A-HJ-NP-Za-km-z]+',
+                  '$1[REDACTED_PEER_ID]'
+              )
+              $safe = [regex]::Replace(
+                  $safe,
+                  '(?<![1-9A-HJ-NP-Za-km-z])12D3Koo[1-9A-HJ-NP-Za-km-z]{20,}(?![1-9A-HJ-NP-Za-km-z])',
+                  '[REDACTED_PEER_ID]'
+              )
+              if ($safe -match '(?i)\b(?:peer(?:[_-]?id)?|peerid|identity|peerstore)\b') {
+                  $safe = [regex]::Replace(
+                      $safe,
+                      '(?<![1-9A-HJ-NP-Za-km-z])Qm[1-9A-HJ-NP-Za-km-z]{44}(?![1-9A-HJ-NP-Za-km-z])',
+                      '[REDACTED_PEER_ID]'
+                  )
+              }
+              $safe
+          }
+          function Write-SanitizedClusterDiagnostics {
+              param(
+                  [Parameter(Mandatory)][string[]]$ComposeArgs,
+                  [Parameter(Mandatory)][string]$FailureMessage
+              )
+              $rawDiagnosticLines = @(
+                  docker compose @ComposeArgs logs --no-color postgres kubo-a kubo-b cluster-a cluster-b gateway 2>&1
+              )
+              $diagnosticExit = $LASTEXITCODE
+              foreach ($rawLine in $rawDiagnosticLines) {
+                  [Console]::Out.WriteLine((Protect-ClusterDiagnosticLine -Line "$rawLine"))
+              }
+              if ($diagnosticExit -ne 0) { throw "$FailureMessage (exit=$diagnosticExit)" }
+          }
+          $compose = @("--project-name", $env:COMPOSE_PROJECT_NAME, "-f", "docker-compose.cluster.yml", "-f", "tests/compose.cluster-validation.yml")
+          Write-SanitizedClusterDiagnostics -ComposeArgs $compose -FailureMessage "Stopped-peer diagnostics failed"
+
+      - name: Restart Cluster and Kubo peer B with existing volumes
+        shell: pwsh
+        run: |
+          docker compose --project-name $env:COMPOSE_PROJECT_NAME -f docker-compose.cluster.yml -f tests/compose.cluster-validation.yml start kubo-b cluster-b
+          if ($LASTEXITCODE -ne 0) { throw "Peer B restart failed" }
+
+      - name: Prove same-volume peer B recovery
+        shell: pwsh
+        run: |
+          if ($env:CLUSTER_STATE_RECEIPT_OWNED -ne "true") { throw "Owned state receipt is required before recovery validation" }
+          cargo test --test cluster cluster_peer_b_restart_recovery -- --exact --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "Peer B same-volume recovery contract failed" }
+
+      - name: Final sanitized Cluster diagnostics
+        if: ${{ always() && env.CLUSTER_PINSET_ATTEMPTED == 'true' }}
+        shell: pwsh
+        run: |
+          function Protect-ClusterDiagnosticLine {
+              param([AllowEmptyString()][string]$Line)
+              $safe = $Line
+              $safe = [regex]::Replace(
+                  $safe,
+                  '(?i)((?:"?)(?:PeerID|peer_id|peer-id)(?:"?)\s*[:=]\s*)(?:"[^"]*"|''[^'']*''|[^\s,;]+)',
+                  '$1[REDACTED_PEER_ID]'
+              )
+              $safe = [regex]::Replace(
+                  $safe,
+                  '(?i)(/p2p/)[1-9A-HJ-NP-Za-km-z]+',
+                  '$1[REDACTED_PEER_ID]'
+              )
+              $safe = [regex]::Replace(
+                  $safe,
+                  '(?<![1-9A-HJ-NP-Za-km-z])12D3Koo[1-9A-HJ-NP-Za-km-z]{20,}(?![1-9A-HJ-NP-Za-km-z])',
+                  '[REDACTED_PEER_ID]'
+              )
+              if ($safe -match '(?i)\b(?:peer(?:[_-]?id)?|peerid|identity|peerstore)\b') {
+                  $safe = [regex]::Replace(
+                      $safe,
+                      '(?<![1-9A-HJ-NP-Za-km-z])Qm[1-9A-HJ-NP-Za-km-z]{44}(?![1-9A-HJ-NP-Za-km-z])',
+                      '[REDACTED_PEER_ID]'
+                  )
+              }
+              $safe
+          }
+          function Write-SanitizedClusterDiagnostics {
+              param(
+                  [Parameter(Mandatory)][string[]]$ComposeArgs,
+                  [Parameter(Mandatory)][string]$FailureMessage
+              )
+              $rawDiagnosticLines = @(
+                  docker compose @ComposeArgs logs --no-color postgres kubo-a kubo-b cluster-a cluster-b gateway 2>&1
+              )
+              $diagnosticExit = $LASTEXITCODE
+              foreach ($rawLine in $rawDiagnosticLines) {
+                  [Console]::Out.WriteLine((Protect-ClusterDiagnosticLine -Line "$rawLine"))
+              }
+              if ($diagnosticExit -ne 0) { throw "$FailureMessage (exit=$diagnosticExit)" }
+          }
+          $compose = @("--project-name", $env:COMPOSE_PROJECT_NAME, "-f", "docker-compose.cluster.yml", "-f", "tests/compose.cluster-validation.yml")
+          Write-SanitizedClusterDiagnostics -ComposeArgs $compose -FailureMessage "Final Cluster diagnostics failed"
+
+      - name: Cluster cleanup and residual assertion
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          if (($env:CLUSTER_PINSET_OWNED -ne "true" -or $env:CLUSTER_PINSET_ATTEMPTED -ne "true") -and
+              $env:CLUSTER_STATE_RECEIPT_OWNED -ne "true") {
+              Write-Host "No owned Cluster topology or receipt requires cleanup"
+              exit 0
+          }
+          $project = $env:COMPOSE_PROJECT_NAME
+          $errors = [Collections.Generic.List[string]]::new()
+          if ($env:CLUSTER_PINSET_OWNED -eq "true" -and $env:CLUSTER_PINSET_ATTEMPTED -eq "true") {
+              docker compose --project-name $project -f docker-compose.cluster.yml -f tests/compose.cluster-validation.yml down --volumes --remove-orphans
+              $downExit = $LASTEXITCODE
+              if ($downExit -ne 0) { $errors.Add("down exited $downExit") }
+              $containers = @(docker ps --all --quiet --filter "label=com.docker.compose.project=$project" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+              $containerExit = $LASTEXITCODE
+              $networks = @(docker network ls --quiet --filter "label=com.docker.compose.project=$project" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+              $networkExit = $LASTEXITCODE
+              $volumes = @(docker volume ls --quiet --filter "label=com.docker.compose.project=$project" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+              $volumeExit = $LASTEXITCODE
+              if ($containerExit -ne 0) { $errors.Add("container residual query exited $containerExit") }
+              if ($networkExit -ne 0) { $errors.Add("network residual query exited $networkExit") }
+              if ($volumeExit -ne 0) { $errors.Add("volume residual query exited $volumeExit") }
+              if (($containers.Count + $networks.Count + $volumes.Count) -ne 0) { $errors.Add("project-labelled residual resources remain") }
+          }
+          if ($env:CLUSTER_STATE_RECEIPT_OWNED -eq "true") {
+              try {
+                  if (-not (Test-Path -LiteralPath $env:IPFS_S3_CLUSTER_STATE_PATH -PathType Leaf)) {
+                      throw "owned state receipt is missing before cleanup"
+                  }
+                  Remove-Item -LiteralPath $env:IPFS_S3_CLUSTER_STATE_PATH -ErrorAction Stop
+                  if (Test-Path -LiteralPath $env:IPFS_S3_CLUSTER_STATE_PATH) { throw "state receipt remains" }
+              } catch {
+                  $errors.Add("owned state receipt cleanup failed: $($_.Exception.Message)")
+              }
+          }
+          if ($errors.Count -ne 0) { throw ($errors -join "; ") }
 
   e2e:
     runs-on: ubuntu-latest
@@ -465,6 +838,9 @@ jobs:
 
       - name: Test multi-gateway deployment contract
         run: pwsh -NoProfile -File tests/multi-gateway.Tests.ps1
+
+      - name: Test Cluster pinset replication contract
+        run: pwsh -NoProfile -File tests/cluster.Tests.ps1
 
       - name: Test client-smoke infrastructure
         run: pwsh -NoProfile -File tests/client-smoke.Tests.ps1

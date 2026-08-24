@@ -1,0 +1,161 @@
+name: ipfs3-cluster
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    configs:
+      - source: postgres_init
+        target: /docker-entrypoint-initdb.d/10-ipfs3.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ipfs3 -d ipfs3"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  kubo-a:
+    build:
+      context: ./ipfs
+      dockerfile: cluster.Dockerfile
+    image: ghcr.io/hugefiver/ipfs3-kubo-cluster:v0.43.0
+    volumes:
+      - kubo_a_data:/data/ipfs
+    environment:
+      IPFS_PATH: /data/ipfs
+    healthcheck:
+      test: ["CMD", "ipfs", "id"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 15s
+    restart: unless-stopped
+
+  kubo-b:
+    build:
+      context: ./ipfs
+      dockerfile: cluster.Dockerfile
+    image: ghcr.io/hugefiver/ipfs3-kubo-cluster:v0.43.0
+    volumes:
+      - kubo_b_data:/data/ipfs
+    environment:
+      IPFS_PATH: /data/ipfs
+    healthcheck:
+      test: ["CMD", "ipfs", "id"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 15s
+    restart: unless-stopped
+
+  cluster-a:
+    image: ipfs/ipfs-cluster:v1.1.6@sha256:a83266c524f1c0bc81d14fe3c8b46c5b83a7b2d8432fb8a50300f27d3c863dcd
+    environment:
+      IPFS_CLUSTER_CONSENSUS: crdt
+      CLUSTER_PEERNAME: cluster-a
+      CLUSTER_SECRET: "${IPFS_S3_CLUSTER_SECRET:?IPFS_S3_CLUSTER_SECRET is required}"
+      CLUSTER_CRDT_TRUSTEDPEERS: "*"
+      CLUSTER_REPLICATIONFACTORMIN: "2"
+      CLUSTER_REPLICATIONFACTORMAX: "2"
+      CLUSTER_IPFSHTTP_NODEMULTIADDRESS: /dns4/kubo-a/tcp/5001
+      CLUSTER_IPFSPROXY_NODEMULTIADDRESS: /dns4/kubo-a/tcp/5001
+      CLUSTER_RESTAPI_HTTPLISTENMULTIADDRESS: /ip4/0.0.0.0/tcp/9094
+      CLUSTER_IPFSPROXY_LISTENMULTIADDRESS: /ip4/0.0.0.0/tcp/9095
+    volumes:
+      - cluster_a_data:/data/ipfs-cluster
+    depends_on:
+      kubo-a:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "ipfs-cluster-ctl", "id"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+    restart: unless-stopped
+
+  cluster-b:
+    image: ipfs/ipfs-cluster:v1.1.6@sha256:a83266c524f1c0bc81d14fe3c8b46c5b83a7b2d8432fb8a50300f27d3c863dcd
+    environment:
+      IPFS_CLUSTER_CONSENSUS: crdt
+      CLUSTER_PEERNAME: cluster-b
+      CLUSTER_SECRET: "${IPFS_S3_CLUSTER_SECRET:?IPFS_S3_CLUSTER_SECRET is required}"
+      CLUSTER_CRDT_TRUSTEDPEERS: "*"
+      CLUSTER_REPLICATIONFACTORMIN: "2"
+      CLUSTER_REPLICATIONFACTORMAX: "2"
+      CLUSTER_IPFSHTTP_NODEMULTIADDRESS: /dns4/kubo-b/tcp/5001
+      CLUSTER_IPFSPROXY_NODEMULTIADDRESS: /dns4/kubo-b/tcp/5001
+      CLUSTER_RESTAPI_HTTPLISTENMULTIADDRESS: /ip4/0.0.0.0/tcp/9094
+      CLUSTER_IPFSPROXY_LISTENMULTIADDRESS: /ip4/0.0.0.0/tcp/9095
+    volumes:
+      - cluster_b_data:/data/ipfs-cluster
+    depends_on:
+      kubo-b:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "ipfs-cluster-ctl", "id"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+    restart: unless-stopped
+
+  gateway:
+    build: .
+    image: ghcr.io/hugefiver/ipfs3:latest
+    ports:
+      - "127.0.0.1:${IPFS_S3_GATEWAY_PORT:?IPFS_S3_GATEWAY_PORT is required}:9000"
+    environment:
+      IPFS_S3_BIND: 0.0.0.0:9000
+      IPFS_S3_PUBLISHED_BIND: "${IPFS_S3_GATEWAY_BIND:?IPFS_S3_GATEWAY_BIND is required}"
+      IPFS_S3_KUBO_RPC_URL: http://cluster-a:9095
+      IPFS_S3_DATABASE_URL: "postgres://ipfs3:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/ipfs3"
+      IPFS_S3_ACCESS_KEY_ID: "${IPFS_S3_ACCESS_KEY_ID:?IPFS_S3_ACCESS_KEY_ID is required}"
+      IPFS_S3_SECRET_ACCESS_KEY: "${IPFS_S3_SECRET_ACCESS_KEY:?IPFS_S3_SECRET_ACCESS_KEY is required}"
+      IPFS_S3_MASTER_KEY: "${IPFS_S3_MASTER_KEY:?IPFS_S3_MASTER_KEY is required}"
+      RUST_LOG: info
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        case "$${IPFS_S3_PUBLISHED_BIND}" in
+          "127.0.0.1")
+            ;;
+          *)
+            exit 64
+            ;;
+        esac
+        exec /app/ipfs-s3-gateway
+    depends_on:
+      postgres:
+        condition: service_healthy
+      cluster-a:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/ipfs-s3-gateway", "--ready-probe"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  kubo_a_data:
+  kubo_b_data:
+  cluster_a_data:
+  cluster_b_data:
+
+configs:
+  postgres_init:
+    content: |
+      \set app_password '${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}'
+      CREATE ROLE ipfs3 LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE;
+      SELECT format('ALTER ROLE ipfs3 PASSWORD %L', :'app_password') \gexec
+      CREATE DATABASE ipfs3 OWNER ipfs3;

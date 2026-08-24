@@ -152,11 +152,12 @@ Assert-Contains $concurrencyBlock "  cancel-in-progress: true" "Concurrency must
 
 $jobsBlock = Get-YamlBlock -Text $Workflow -Key "jobs" -Indent 0
 $jobNames = @([regex]::Matches($jobsBlock, '(?m)^  ([A-Za-z0-9_-]+):\s*$') | ForEach-Object { $_.Groups[1].Value })
-Assert-True ($jobNames.Count -eq 5) "Expected exactly five jobs, found $($jobNames.Count): $($jobNames -join ', ')"
+Assert-True ($jobNames.Count -eq 6) "Expected exactly six jobs, found $($jobNames.Count): $($jobNames -join ', ')"
 foreach ($expectedJob in @(
     "postgres-import",
     "postgres-production-deployment",
     "multi-gateway-deployment",
+    "cluster-pinset-replication",
     "e2e",
     "client-smoke-infrastructure"
 )) {
@@ -168,6 +169,7 @@ Assert-NotMatches $jobsBlock '(?m)^    continue-on-error:' "Release-validation j
 $postgresJob = Get-YamlBlock -Text $jobsBlock -Key "postgres-import" -Indent 2
 $productionJob = Get-YamlBlock -Text $jobsBlock -Key "postgres-production-deployment" -Indent 2
 $multiGatewayJob = Get-YamlBlock -Text $jobsBlock -Key "multi-gateway-deployment" -Indent 2
+$clusterJob = Get-YamlBlock -Text $jobsBlock -Key "cluster-pinset-replication" -Indent 2
 $e2eJob = Get-YamlBlock -Text $jobsBlock -Key "e2e" -Indent 2
 $clientJob = Get-YamlBlock -Text $jobsBlock -Key "client-smoke-infrastructure" -Indent 2
 
@@ -308,6 +310,119 @@ foreach ($fragment in @(
 Assert-True (([regex]::Matches($multiGatewayJob, '(?m)^        if: \$\{\{ always\(\) \}\}\s*$')).Count -eq 2) "Multi-gateway diagnostics and cleanup must both use always()"
 Assert-NotMatches $multiGatewayJob 'SetEnvironmentVariable\([^,\r\n]+,\s*\$null,\s*"Process"\)' "Multi-gateway job must not use null SetEnvironmentVariable removal"
 
+Assert-Contains $clusterJob "    runs-on: ubuntu-latest" "Cluster pinset replication job must use ubuntu-latest"
+Assert-Contains $clusterJob "    timeout-minutes: 60" "Cluster pinset replication job timeout must be 60 minutes"
+Assert-RustSetup -JobBlock $clusterJob -JobName "Cluster pinset replication job"
+Assert-NotMatches $clusterJob '(?m)^    (?:needs|continue-on-error):' "Cluster pinset replication job must be independent and blocking"
+Assert-NotMatches $clusterJob '(?m)^        continue-on-error:' "Cluster pinset replication product gates must be blocking"
+$clusterEnv = Get-YamlBlock -Text $clusterJob -Key "env" -Indent 4
+$clusterEnvLines = @($clusterEnv -split "`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+Assert-True ($clusterEnvLines.Count -eq 16) "Cluster pinset replication job must contain exactly sixteen job environment values"
+foreach ($line in @(
+    '      COMPOSE_DISABLE_ENV_FILE: "1"',
+    '      COMPOSE_PROJECT_NAME: ipfs3-cl-${{ github.run_id }}-${{ github.run_attempt }}',
+    '      POSTGRES_PASSWORD: cl-${{ github.run_id }}-${{ github.run_attempt }}',
+    "      IPFS_S3_ACCESS_KEY_ID: test",
+    "      IPFS_S3_SECRET_ACCESS_KEY: test",
+    "      IPFS_S3_MASTER_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "      IPFS_S3_CLUSTER_SECRET: abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+    "      IPFS_S3_GATEWAY_BIND: 127.0.0.1",
+    "      IPFS_S3_GATEWAY_PORT: 59100",
+    "      IPFS_S3_CLUSTER_GATEWAY_ENDPOINT: http://127.0.0.1:59100",
+    "      IPFS_S3_CLUSTER_A_REST_URL: http://127.0.0.1:59101",
+    "      IPFS_S3_CLUSTER_B_REST_URL: http://127.0.0.1:59102",
+    "      IPFS_S3_CLUSTER_A_PROXY_URL: http://127.0.0.1:59103",
+    "      IPFS_S3_CLUSTER_KUBO_A_URL: http://127.0.0.1:55100",
+    "      IPFS_S3_CLUSTER_KUBO_B_URL: http://127.0.0.1:55101",
+    '      IPFS_S3_CLUSTER_STATE_PATH: ${{ runner.temp }}/ipfs3-cluster-${{ github.run_id }}-${{ github.run_attempt }}.json'
+)) {
+    Assert-ExactLine $clusterEnv $line "Cluster pinset replication environment line is missing or changed."
+}
+Assert-NotContains $clusterJob "--env-file" "Cluster validation must not use an explicit environment file"
+Assert-NotMatches $clusterJob '(?i)(?<![A-Za-z0-9_])\.env(?![A-Za-z0-9_])' "Cluster validation must not read, modify, or emit a project environment file"
+Assert-InOrder -Text $clusterJob -Message "Cluster pinset replication steps are missing or out of order." -Fragments @(
+    "      - name: Verify Docker Compose for Cluster deployment",
+    "      - name: Verify Cluster environment contract",
+    "      - name: Claim unique Cluster project, ports, and state receipt",
+    "      - name: Build and start Cluster topology",
+    "      - name: Prove Cluster release-version representation contract",
+    "      - name: Prove exact two-peer topology without writes",
+    "      - name: Prove direct Kubo wire compatibility against Cluster A proxy",
+    "      - name: Prove replication and retained deletion",
+    "      - name: Capture diagnostics before peer B stop",
+    "      - name: Stop Cluster and Kubo peer B",
+    "      - name: Prove stopped peer loses two-pin evidence",
+    "      - name: Capture stopped-peer diagnostics before restart",
+    "      - name: Restart Cluster and Kubo peer B with existing volumes",
+    "      - name: Prove same-volume peer B recovery",
+    "      - name: Final sanitized Cluster diagnostics",
+    "      - name: Cluster cleanup and residual assertion"
+)
+foreach ($fragment in @(
+    "docker-compose.cluster.yml",
+    "tests/compose.cluster-validation.yml",
+    "Docker Compose 2.23.1 or newer",
+    "config --quiet",
+    'if ($env:IPFS_S3_GATEWAY_BIND -cne "127.0.0.1") { throw "Gateway bind must be exactly 127.0.0.1" }',
+    "[IO.FileMode]::CreateNew",
+    "CLUSTER_PINSET_OWNED=true",
+    "CLUSTER_STATE_RECEIPT_OWNED=true",
+    "CLUSTER_PINSET_ATTEMPTED=true",
+    "55435, 55100, 55101, 59100, 59101, 59102, 59103",
+    "up --detach --build --wait --wait-timeout 300 postgres kubo-a kubo-b cluster-a cluster-b gateway",
+    "cargo test --test cluster cluster_support::release_version_validator_accepts_exact_release_and_build_metadata -- --exact",
+    "Cluster release-version unit contract failed",
+    "cargo test --test cluster cluster_topology_converges -- --exact --nocapture --test-threads=1",
+    "CLUSTER_TOPOLOGY_GREEN=true",
+    "Topology GREEN receipt is required before compatibility",
+    "PROXY_COMPATIBILITY_BLOCKER",
+    "CLUSTER_PROXY_COMPATIBILITY_GREEN=true",
+    "Add-pin-cat proxy GREEN receipt is required before replication",
+    "cargo test --test cluster cluster_replication_and_retention -- --exact --nocapture --test-threads=1",
+    "stop cluster-b kubo-b",
+    "cargo test --test cluster cluster_peer_b_outage_contract -- --exact --nocapture --test-threads=1",
+    "start kubo-b cluster-b",
+    "cargo test --test cluster cluster_peer_b_restart_recovery -- --exact --nocapture --test-threads=1",
+    "logs --no-color postgres kubo-a kubo-b cluster-a cluster-b gateway",
+    "down --volumes --remove-orphans",
+    "com.docker.compose.project"
+)) {
+    Assert-Contains $clusterJob $fragment "Cluster pinset replication contract is missing: $fragment"
+}
+Assert-NotContains $clusterJob 'IPFS_S3_GATEWAY_BIND -in @("", "0.0.0.0", "::", "[::]")' "Cluster validation must not retain the weaker wildcard-only bind check"
+Assert-InOrder -Text $clusterJob -Message "Cluster validation must validate fixed loopback before any Compose config or startup." -Fragments @(
+    'if ($env:IPFS_S3_GATEWAY_BIND -cne "127.0.0.1") { throw "Gateway bind must be exactly 127.0.0.1" }',
+    "docker compose @compose config --quiet",
+    "up --detach --build --wait --wait-timeout 300 postgres kubo-a kubo-b cluster-a cluster-b gateway"
+)
+Assert-True (([regex]::Matches($clusterJob, '(?m)^          cargo test --test cluster [^\r\n]+$')).Count -eq 6) "Cluster pinset replication job must contain exactly six explicit Cluster cargo commands"
+Assert-InOrder -Text $clusterJob -Message "Cluster cargo commands must preserve pure-unit then live causal order." -Fragments @(
+    "cargo test --test cluster cluster_support::release_version_validator_accepts_exact_release_and_build_metadata -- --exact",
+    "cargo test --test cluster cluster_topology_converges -- --exact --nocapture --test-threads=1",
+    "cargo test --test cluster cluster_proxy_compatibility -- --exact --nocapture --test-threads=1",
+    "cargo test --test cluster cluster_replication_and_retention -- --exact --nocapture --test-threads=1",
+    "cargo test --test cluster cluster_peer_b_outage_contract -- --exact --nocapture --test-threads=1",
+    "cargo test --test cluster cluster_peer_b_restart_recovery -- --exact --nocapture --test-threads=1"
+)
+Assert-InOrder -Text $clusterJob -Message "Cluster topology receipt must be written only after a successful topology gate and checked before proxy compatibility." -Fragments @(
+    "cargo test --test cluster cluster_topology_converges -- --exact --nocapture --test-threads=1",
+    'if ($LASTEXITCODE -ne 0) { throw "TOPOLOGY_CONVERGENCE_BLOCKER: exact v1.1.6 two-peer topology did not converge" }',
+    '"CLUSTER_TOPOLOGY_GREEN=true" | Add-Content -LiteralPath $env:GITHUB_ENV',
+    'if ($env:CLUSTER_TOPOLOGY_GREEN -ne "true") { throw "Topology GREEN receipt is required before compatibility" }',
+    "cargo test --test cluster cluster_proxy_compatibility -- --exact --nocapture --test-threads=1"
+)
+Assert-InOrder -Text $clusterJob -Message "Cluster proxy receipt must be written only after compatibility success and checked before replication receipt ownership." -Fragments @(
+    "cargo test --test cluster cluster_proxy_compatibility -- --exact --nocapture --test-threads=1",
+    'if ($LASTEXITCODE -ne 0) { throw "PROXY_COMPATIBILITY_BLOCKER: stop and revise the approved design; do not add app fallback code" }',
+    '"CLUSTER_PROXY_COMPATIBILITY_GREEN=true" | Add-Content -LiteralPath $env:GITHUB_ENV',
+    'if ($env:CLUSTER_PROXY_COMPATIBILITY_GREEN -ne "true") { throw "Add-pin-cat proxy GREEN receipt is required before replication" }',
+    'if ($env:CLUSTER_STATE_RECEIPT_OWNED -ne "true") { throw "Owned state receipt is required before replication" }',
+    "cargo test --test cluster cluster_replication_and_retention -- --exact --nocapture --test-threads=1"
+)
+Assert-NotMatches $clusterJob '(?i)docker\s+(?:compose\s+)?pull\b|--pull(?:=|\s)' "Cluster validation must not explicitly pull images"
+Assert-NotMatches $clusterJob '(?i)docker\s+(?:system|container|network|volume)\s+prune|docker\s+rm\s+-f' "Cluster cleanup must not prune broad Docker resources"
+Assert-NotMatches $clusterJob 'SetEnvironmentVariable\([^,\r\n]+,\s*\$null,\s*"Process"\)' "Cluster validation must not use null environment removal"
+
 Assert-Contains $e2eJob "    runs-on: ubuntu-latest" "E2E job must use ubuntu-latest"
 Assert-Contains $e2eJob "    timeout-minutes: 60" "E2E job timeout must be 60 minutes"
 Assert-RustSetup -JobBlock $e2eJob -JobName "E2E job"
@@ -339,15 +454,17 @@ Assert-Contains $clientJob "    runs-on: ubuntu-latest" "Client-smoke infrastruc
 Assert-Contains $clientJob "    timeout-minutes: 15" "Client-smoke infrastructure timeout must be 15 minutes"
 Assert-Contains $clientJob "      - uses: actions/checkout@v7" "Client-smoke infrastructure job must check out the repository"
 $clientRunLines = @($clientJob -split "`n" | Where-Object { $_ -match '^\s+run:' })
-Assert-True ($clientRunLines.Count -eq 4) "Client-smoke infrastructure job must contain exactly four run commands"
+Assert-True ($clientRunLines.Count -eq 5) "Client-smoke infrastructure job must contain exactly five run commands"
 Assert-ExactLine $clientJob "        run: pwsh -NoProfile -File tests/release-validation.Tests.ps1" "Release-validation contract command is missing or changed."
 Assert-ExactLine $clientJob "        run: pwsh -NoProfile -File tests/postgres-production-baseline.Tests.ps1" "PostgreSQL production baseline contract command is missing or changed."
 Assert-ExactLine $clientJob "        run: pwsh -NoProfile -File tests/multi-gateway.Tests.ps1" "Multi-gateway deployment contract command is missing or changed."
+Assert-ExactLine $clientJob "        run: pwsh -NoProfile -File tests/cluster.Tests.ps1" "Cluster pinset replication contract command is missing or changed."
 Assert-ExactLine $clientJob "        run: pwsh -NoProfile -File tests/client-smoke.Tests.ps1" "Client-smoke infrastructure command is missing or changed."
 Assert-InOrder -Text $clientJob -Message "Static release contracts must run before the existing client-smoke infrastructure test." -Fragments @(
     "        run: pwsh -NoProfile -File tests/release-validation.Tests.ps1",
     "        run: pwsh -NoProfile -File tests/postgres-production-baseline.Tests.ps1",
     "        run: pwsh -NoProfile -File tests/multi-gateway.Tests.ps1",
+    "        run: pwsh -NoProfile -File tests/cluster.Tests.ps1",
     "        run: pwsh -NoProfile -File tests/client-smoke.Tests.ps1"
 )
 Assert-NotMatches $clientJob '(?m)^        continue-on-error:' "Client-smoke infrastructure contract steps must be blocking"

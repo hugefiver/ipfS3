@@ -575,11 +575,24 @@ Assert-NotMatches $RustLive '(?i)std::process::Command|Command::new|\baws\b|\brc
 $Workflow = Read-NormalizedText $WorkflowPath
 $workflowJobs = Get-YamlBlock $Workflow "jobs" 0
 $workflowJobNames = @([regex]::Matches($workflowJobs, '(?m)^  ([A-Za-z0-9_-]+):\s*$') | ForEach-Object { $_.Groups[1].Value })
-Assert-True ($workflowJobNames.Count -eq 5) "Release validation must define exactly five jobs"
-Assert-True ($workflowJobNames -ccontains "multi-gateway-deployment") "Release validation is missing multi-gateway-deployment"
+Assert-True ($workflowJobNames.Count -eq 6) "Release validation must define exactly six jobs"
+foreach ($requiredJob in @("postgres-import", "postgres-production-deployment", "multi-gateway-deployment", "cluster-pinset-replication", "e2e", "client-smoke-infrastructure")) {
+    Assert-True ($workflowJobNames -ccontains $requiredJob) "Release validation is missing $requiredJob"
+}
 $multiJob = Get-YamlBlock $workflowJobs "multi-gateway-deployment" 2
 $clientJob = Get-YamlBlock $workflowJobs "client-smoke-infrastructure" 2
-Assert-Contains $clientJob "        run: pwsh -NoProfile -File tests/multi-gateway.Tests.ps1" "Multi-gateway static contract is not blocking CI"
+$expectedClientRunLines = @(
+    "        run: pwsh -NoProfile -File tests/release-validation.Tests.ps1",
+    "        run: pwsh -NoProfile -File tests/postgres-production-baseline.Tests.ps1",
+    "        run: pwsh -NoProfile -File tests/multi-gateway.Tests.ps1",
+    "        run: pwsh -NoProfile -File tests/cluster.Tests.ps1",
+    "        run: pwsh -NoProfile -File tests/client-smoke.Tests.ps1"
+)
+$clientRunLines = @($clientJob -split "`n" | Where-Object { $_ -match '^\s+run:' })
+Assert-True ($clientRunLines.Count -eq 5) "Client-smoke infrastructure job must contain exactly five blocking run commands"
+for ($index = 0; $index -lt $expectedClientRunLines.Count; $index++) {
+    Assert-True ($clientRunLines[$index].TrimEnd() -ceq $expectedClientRunLines[$index]) "Client-smoke infrastructure command $($index + 1) is missing, changed, or out of order"
+}
 Assert-Contains $multiJob "    runs-on: ubuntu-latest" "Multi-gateway job must use ubuntu-latest"
 Assert-Contains $multiJob "    timeout-minutes: 60" "Multi-gateway job timeout must be 60 minutes"
 Assert-NotMatches $multiJob '(?m)^    (?:needs|continue-on-error):' "Multi-gateway job must remain independent and blocking"

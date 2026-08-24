@@ -181,8 +181,8 @@ $WorkflowPath = Join-Path $RepoRoot ".github/workflows/release-validation.yml"
 $Workflow = Read-NormalizedText $WorkflowPath
 $workflowJobs = Get-YamlBlock $Workflow "jobs" 0
 $workflowJobNames = @([regex]::Matches($workflowJobs, '(?m)^  ([A-Za-z0-9_-]+):\s*$') | ForEach-Object { $_.Groups[1].Value })
-Assert-True ($workflowJobNames.Count -eq 5) "Release-validation must contain exactly five jobs"
-foreach ($requiredJob in @("postgres-import", "postgres-production-deployment", "multi-gateway-deployment", "e2e", "client-smoke-infrastructure")) {
+Assert-True ($workflowJobNames.Count -eq 6) "Release-validation must contain exactly six jobs"
+foreach ($requiredJob in @("postgres-import", "postgres-production-deployment", "multi-gateway-deployment", "cluster-pinset-replication", "e2e", "client-smoke-infrastructure")) {
     Assert-True ($workflowJobNames -ccontains $requiredJob) "Release-validation job is missing: $requiredJob"
 }
 $productionJob = Get-YamlBlock $workflowJobs "postgres-production-deployment" 2
@@ -196,9 +196,10 @@ $expectedClientRunLines = @(
     "        run: pwsh -NoProfile -File tests/release-validation.Tests.ps1",
     "        run: pwsh -NoProfile -File tests/postgres-production-baseline.Tests.ps1",
     "        run: pwsh -NoProfile -File tests/multi-gateway.Tests.ps1",
+    "        run: pwsh -NoProfile -File tests/cluster.Tests.ps1",
     "        run: pwsh -NoProfile -File tests/client-smoke.Tests.ps1"
 )
-Assert-True ($clientRunLines.Count -eq 4) "Client-smoke infrastructure job must contain exactly four blocking run commands"
+Assert-True ($clientRunLines.Count -eq 5) "Client-smoke infrastructure job must contain exactly five blocking run commands"
 for ($index = 0; $index -lt $expectedClientRunLines.Count; $index++) {
     Assert-True ($clientRunLines[$index].TrimEnd() -ceq $expectedClientRunLines[$index]) "Client-smoke infrastructure command $($index + 1) is missing, changed, or out of order"
 }
