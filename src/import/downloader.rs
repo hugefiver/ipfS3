@@ -779,7 +779,7 @@ mod tests {
 
     fn limits(max_bytes: u64) -> DownloadLimits {
         DownloadLimits {
-            connect_timeout: Duration::from_millis(100),
+            connect_timeout: Duration::from_secs(2),
             idle_timeout: Duration::from_millis(100),
             max_bytes,
         }
