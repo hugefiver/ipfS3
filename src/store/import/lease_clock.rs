@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use sea_orm::{
     DatabaseBackend,
-    sea_query::{Expr, SimpleExpr},
+    sea_query::{Expr, ExprTrait, SimpleExpr},
 };
 
 /// Database-clock lease predicate used by every claim-owned statement.
@@ -25,7 +25,7 @@ pub(crate) fn lease_end_is_future(
     lease_until: DateTime<Utc>,
 ) -> SimpleExpr {
     match backend {
-        DatabaseBackend::Postgres => Expr::cust_with_values("? > clock_timestamp()", [lease_until]),
+        DatabaseBackend::Postgres => Expr::value(lease_until).gt(Expr::cust("clock_timestamp()")),
         DatabaseBackend::Sqlite => {
             Expr::cust_with_values("julianday(?) > julianday('now')", [lease_until])
         }
@@ -54,6 +54,20 @@ mod tests {
 
         assert_eq!(sql.matches("clock_timestamp()").count(), 2);
         assert!(!sql.to_ascii_lowercase().contains("current_timestamp"));
+    }
+
+    #[test]
+    fn postgres_future_lease_uses_numbered_bind_instead_of_literal_question_mark() {
+        let query = Query::select()
+            .column(import_job::Column::Id)
+            .from(import_job::Entity)
+            .and_where(lease_end_is_future(DatabaseBackend::Postgres, Utc::now()))
+            .to_owned();
+        let (sql, values) = query.build(sea_orm::sea_query::PostgresQueryBuilder);
+
+        assert!(sql.contains("$1 > (clock_timestamp())"), "sql: {sql}");
+        assert!(!sql.contains('?'), "sql: {sql}");
+        assert_eq!(values.0.len(), 1);
     }
 
     #[test]

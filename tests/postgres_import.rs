@@ -1,4 +1,9 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    io::{self, Write},
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 use chrono::{DateTime, Duration, Utc};
 use ipfs_s3_gateway::{
@@ -27,7 +32,7 @@ use ipfs_s3_gateway::{
 };
 use sea_orm::{
     ColumnTrait, ConnectOptions, ConnectionTrait, Database, DatabaseBackend, DatabaseConnection,
-    EntityTrait, PaginatorTrait, QueryFilter, Statement, TransactionError, TransactionTrait,
+    DbErr, EntityTrait, PaginatorTrait, QueryFilter, Statement, TransactionError, TransactionTrait,
 };
 use sea_orm_migration::{MigrationTrait, MigratorTrait};
 use tokio::{sync::oneshot, task::JoinHandle};
@@ -41,6 +46,44 @@ use ipfs_s3_gateway::store::migrations::{
 
 static POSTGRES_MIGRATIONS: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
 static POSTGRES_TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+const MIGRATION_LOCK_KEY_1: i32 = 1_229_997_651;
+const MIGRATION_LOCK_KEY_2: i32 = 1_395_879_239;
+type MigrationTask = JoinHandle<Result<(), DbErr>>;
+type MigrationTaskPair = (MigrationTask, MigrationTask);
+const EXPECTED_MIGRATIONS: [&str; 8] = [
+    "m20250701_000001_init",
+    "m20260707_000001_decompress_zip",
+    "m20260720_000001_sse_c_key_fingerprint",
+    "m20260721_000001_multi_provider_pinning",
+    "m20260729_000001_ipfs3_import",
+    "m20260729_000002_postgres_utc_timestamps",
+    "m20260730_000001_standard_mutation_fence",
+    "m20260813_000001_postgres_json_columns",
+];
+
+#[derive(Clone)]
+struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+
+struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+impl Write for LogWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.lock().unwrap().flush()
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedWriter {
+    type Writer = LogWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        LogWriter(self.0.clone())
+    }
+}
 
 struct PreJsonCompatibilityMigrator;
 
@@ -96,6 +139,95 @@ async fn connect_single(url: &str) -> DatabaseConnection {
     let mut options = ConnectOptions::new(url.to_owned());
     options.max_connections(1).min_connections(1);
     Database::connect(options).await.unwrap()
+}
+
+async fn set_search_path(db: &DatabaseConnection, schema: &str) -> Result<(), DbErr> {
+    assert!(schema.starts_with("migration_"));
+    db.execute_unprepared(&format!("SET search_path TO {schema}"))
+        .await
+        .map(|_| ())
+}
+
+async fn acquire_migration_lock(db: &DatabaseConnection) -> Result<(), DbErr> {
+    db.execute_unprepared(&format!(
+        "SELECT pg_advisory_lock({MIGRATION_LOCK_KEY_1}, {MIGRATION_LOCK_KEY_2})"
+    ))
+    .await
+    .map(|_| ())
+}
+
+async fn release_migration_lock(db: &DatabaseConnection) -> Result<(), DbErr> {
+    let row = db
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!(
+                "SELECT pg_advisory_unlock({MIGRATION_LOCK_KEY_1}, {MIGRATION_LOCK_KEY_2}) AS unlocked"
+            ),
+        ))
+        .await?
+        .ok_or_else(|| DbErr::Custom("migration advisory unlock returned no row".to_owned()))?;
+    if row.try_get::<bool>("", "unlocked")? {
+        Ok(())
+    } else {
+        Err(DbErr::Custom(
+            "migration advisory lock was not held".to_owned(),
+        ))
+    }
+}
+
+async fn wait_for_two_migration_lock_waiters(
+    observer: &DatabaseConnection,
+) -> Result<(), &'static str> {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let row = observer
+                .query_one(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    format!(
+                        "SELECT COUNT(*)::bigint AS count FROM pg_locks \
+                         WHERE locktype = 'advisory' \
+                           AND classid = {MIGRATION_LOCK_KEY_1}::oid \
+                           AND objid = {MIGRATION_LOCK_KEY_2}::oid \
+                           AND NOT granted"
+                    ),
+                ))
+                .await
+                .map_err(|_| "could not inspect PostgreSQL advisory locks")?
+                .ok_or("PostgreSQL advisory-lock observation returned no row")?;
+            if row
+                .try_get::<i64>("", "count")
+                .map_err(|_| "could not decode PostgreSQL advisory-lock count")?
+                == 2
+            {
+                return Ok(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| "both migration connections must wait on the stable advisory key")?
+}
+
+async fn join_migration_task(task: JoinHandle<Result<(), DbErr>>) -> Result<(), &'static str> {
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+        .await
+        .map_err(|_| "migration task did not finish after advisory-lock release")?
+        .map_err(|_| "migration task panicked")?;
+    result.map_err(|_| "migration task returned an error after advisory-lock release")
+}
+
+fn captured_migration_subscriber() -> (Arc<Mutex<Vec<u8>>>, tracing::Dispatch) {
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "ipfs_s3_gateway::store=info",
+        ))
+        .without_time()
+        .with_ansi(false)
+        .with_target(false)
+        .with_writer(CapturedWriter(output.clone()))
+        .finish();
+    (output, tracing::Dispatch::new(subscriber))
 }
 
 async fn connect_triplet(
@@ -1867,4 +1999,282 @@ async fn postgres_json_columns_require_compatibility_migration() {
         .await
         .unwrap();
     cleanup.close().await.unwrap();
+}
+
+#[test]
+fn postgres_concurrent_startup_uses_transaction_advisory_lock_once() {
+    let url = std::env::var("IPFS_S3_TEST_POSTGRES_URL")
+        .expect("IPFS_S3_TEST_POSTGRES_URL is required for the migration-lock test");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .unwrap();
+
+    runtime.block_on(async {
+        let _serial = POSTGRES_TEST_SERIAL.lock().await;
+        let schema = format!("migration_{}", uuid::Uuid::new_v4().simple());
+        let admin = connect_single(&url).await;
+        let gate = connect_single(&url).await;
+        let first = connect_single(&url).await;
+        let second = connect_single(&url).await;
+        let observer = connect_single(&url).await;
+        admin
+            .execute_unprepared(&format!("CREATE SCHEMA {schema}"))
+            .await
+            .unwrap();
+
+        let mut gate_locked = false;
+        let start_result: Result<MigrationTaskPair, &'static str> = async {
+            set_search_path(&first, &schema)
+                .await
+                .map_err(|_| "could not set first migration search path")?;
+            set_search_path(&second, &schema)
+                .await
+                .map_err(|_| "could not set second migration search path")?;
+            set_search_path(&observer, &schema)
+                .await
+                .map_err(|_| "could not set migration observer search path")?;
+            acquire_migration_lock(&gate)
+                .await
+                .map_err(|_| "could not acquire migration gate lock")?;
+            gate_locked = true;
+            Ok((
+                tokio::spawn(async move { store::run_migrations(&first).await }),
+                tokio::spawn(async move { store::run_migrations(&second).await }),
+            ))
+        }
+        .await;
+
+        let mut failure = None;
+        let tasks = match start_result {
+            Ok(tasks) => Some(tasks),
+            Err(error) => {
+                failure = Some(error);
+                None
+            }
+        };
+        if let Some((first_task, second_task)) = tasks {
+            if let Err(error) = wait_for_two_migration_lock_waiters(&observer).await {
+                failure.get_or_insert(error);
+            }
+            match release_migration_lock(&gate).await {
+                Ok(()) => gate_locked = false,
+                Err(_) => {
+                    failure.get_or_insert("could not release migration gate lock");
+                }
+            }
+            if let Err(error) = join_migration_task(first_task).await {
+                failure.get_or_insert(error);
+            }
+            if let Err(error) = join_migration_task(second_task).await {
+                failure.get_or_insert(error);
+            }
+
+            match observer
+                .query_all(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    "SELECT version, COUNT(*)::bigint AS count FROM seaql_migrations \
+                     GROUP BY version ORDER BY version",
+                ))
+                .await
+            {
+                Ok(rows) => {
+                    let actual = rows
+                        .iter()
+                        .map(|row| {
+                            Ok((
+                                row.try_get::<String>("", "version")?,
+                                row.try_get::<i64>("", "count")?,
+                            ))
+                        })
+                        .collect::<Result<Vec<_>, DbErr>>();
+                    match actual {
+                        Ok(actual) => {
+                            let expected = EXPECTED_MIGRATIONS
+                                .iter()
+                                .map(|version| ((*version).to_owned(), 1_i64))
+                                .collect::<Vec<_>>();
+                            if actual != expected {
+                                failure.get_or_insert(
+                                    "migration markers were not exactly the expected eight versions",
+                                );
+                            }
+                        }
+                        Err(_) => {
+                            failure.get_or_insert("could not decode migration marker rows");
+                        }
+                    }
+                }
+                Err(_) => {
+                    failure.get_or_insert("could not read migration marker rows");
+                }
+            }
+        }
+
+        if gate_locked && release_migration_lock(&gate).await.is_err() {
+            failure.get_or_insert("finally-style migration gate release failed");
+        }
+        if admin
+            .execute_unprepared(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .is_err()
+        {
+            failure.get_or_insert("finally-style migration schema cleanup failed");
+        }
+        if let Some(failure) = failure {
+            panic!("{failure}");
+        }
+    });
+}
+
+#[test]
+fn postgres_migration_lock_timeout_is_fail_closed_and_redacted() {
+    let url = std::env::var("IPFS_S3_TEST_POSTGRES_URL")
+        .expect("IPFS_S3_TEST_POSTGRES_URL is required for the migration-lock test");
+    let password = url
+        .split_once("://")
+        .and_then(|(_, authority)| authority.split_once('@'))
+        .and_then(|(credentials, _)| credentials.split_once(':'))
+        .map(|(_, password)| password.to_owned())
+        .expect("IPFS_S3_TEST_POSTGRES_URL must include a password");
+    let (output, subscriber) = captured_migration_subscriber();
+    let runtime_url = url.clone();
+
+    let result = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+        tracing::dispatcher::with_default(&subscriber, || {
+            runtime.block_on(async move {
+                let _serial = POSTGRES_TEST_SERIAL.lock().await;
+                let schema = format!("migration_timeout_{}", uuid::Uuid::new_v4().simple());
+                let admin = connect_single(&runtime_url).await;
+                let gate = connect_single(&runtime_url).await;
+                let target = connect_single(&runtime_url).await;
+                let observer = connect_single(&runtime_url).await;
+                admin
+                    .execute_unprepared(&format!("CREATE SCHEMA {schema}"))
+                    .await
+                    .unwrap();
+
+                let mut gate_locked = false;
+                let setup_result: Result<(), &'static str> = async {
+                    set_search_path(&target, &schema)
+                        .await
+                        .map_err(|_| "could not set timeout migration search path")?;
+                    set_search_path(&observer, &schema)
+                        .await
+                        .map_err(|_| "could not set timeout observer search path")?;
+                    acquire_migration_lock(&gate)
+                        .await
+                        .map_err(|_| "could not acquire timeout migration gate lock")?;
+                    gate_locked = true;
+                    Ok(())
+                }
+                .await;
+
+                let mut failure = setup_result.err();
+                if failure.is_none() {
+                    let started = Instant::now();
+                    let migration_result = tokio::time::timeout(
+                        std::time::Duration::from_secs(70),
+                        store::run_migrations(&target),
+                    )
+                    .await;
+                    let elapsed = started.elapsed();
+                    if !matches!(
+                        migration_result,
+                        Ok(Err(DbErr::Custom(message)))
+                            if message == "PostgreSQL migration timeout failed"
+                    ) {
+                        failure.get_or_insert(
+                            "migration lock timeout did not return the sanitized error",
+                        );
+                    }
+                    if !(std::time::Duration::from_secs(55)..=std::time::Duration::from_secs(65))
+                        .contains(&elapsed)
+                    {
+                        failure.get_or_insert(
+                            "migration lock timeout did not take approximately 60 seconds",
+                        );
+                    }
+                }
+
+                match release_migration_lock(&gate).await {
+                    Ok(()) => gate_locked = false,
+                    Err(_) => {
+                        failure.get_or_insert("could not release timeout migration gate lock");
+                    }
+                }
+                match observer
+                    .query_all(Statement::from_sql_and_values(
+                        DatabaseBackend::Postgres,
+                        "SELECT table_name FROM information_schema.tables \
+                         WHERE table_schema = $1 \
+                           AND table_name IN ('buckets', 'seaql_migrations') \
+                         ORDER BY table_name",
+                        [schema.clone().into()],
+                    ))
+                    .await
+                {
+                    Ok(rows) if rows.is_empty() => {}
+                    Ok(_) => {
+                        failure.get_or_insert(
+                            "timed-out migration published buckets or seaql_migrations",
+                        );
+                    }
+                    Err(_) => {
+                        failure.get_or_insert("could not inspect timeout migration tables");
+                    }
+                }
+
+                if gate_locked && release_migration_lock(&gate).await.is_err() {
+                    failure.get_or_insert("finally-style timeout migration gate release failed");
+                }
+                if admin
+                    .execute_unprepared(&format!("DROP SCHEMA {schema} CASCADE"))
+                    .await
+                    .is_err()
+                {
+                    failure.get_or_insert("finally-style timeout migration schema cleanup failed");
+                }
+                failure.map_or(Ok(()), Err)
+            })
+        })
+    })
+    .join()
+    .expect("timeout migration test thread panicked");
+
+    result.unwrap();
+    let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    let migration_log_lines = logs
+        .lines()
+        .filter(|line| line.contains("migration_lock="))
+        .collect::<Vec<_>>();
+    assert_eq!(migration_log_lines.len(), 2, "logs: {logs}");
+    assert!(
+        migration_log_lines[0].contains("migration_lock=\"waiting\"")
+            && !migration_log_lines[0].contains("category="),
+        "logs: {logs}"
+    );
+    assert!(
+        migration_log_lines[1].contains("migration_lock=\"failure\"")
+            && migration_log_lines[1].contains("category=\"timeout\""),
+        "logs: {logs}"
+    );
+    for forbidden in [
+        url.as_str(),
+        password.as_str(),
+        "canceling statement",
+        "DbErr",
+        "sqlx",
+    ] {
+        assert!(
+            !logs.contains(forbidden),
+            "captured migration logs leaked a forbidden diagnostic"
+        );
+    }
 }

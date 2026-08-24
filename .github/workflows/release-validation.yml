@@ -225,6 +225,199 @@ jobs:
           if ($downExit -ne 0 -or $containerExit -ne 0 -or $networkExit -ne 0 -or $volumeExit -ne 0) { throw "Production cleanup or residual query failed" }
           if (($containers.Count + $networks.Count + $volumes.Count) -ne 0) { throw "Residual Compose resources remain for project: $project" }
 
+  multi-gateway-deployment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      COMPOSE_DISABLE_ENV_FILE: "1"
+      COMPOSE_PROJECT_NAME: ipfs3-mg-${{ github.run_id }}-${{ github.run_attempt }}
+      POSTGRES_PASSWORD: mg-${{ github.run_id }}-${{ github.run_attempt }}
+      IPFS_S3_ACCESS_KEY_ID: test
+      IPFS_S3_SECRET_ACCESS_KEY: test
+      IPFS_S3_MASTER_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      IPFS_S3_LOAD_BALANCER_BIND: 127.0.0.1
+      IPFS_S3_LOAD_BALANCER_PORT: 59000
+      IPFS_S3_MULTI_GATEWAY_A_ENDPOINT: http://127.0.0.1:59001
+      IPFS_S3_MULTI_GATEWAY_B_ENDPOINT: http://127.0.0.1:59002
+      IPFS_S3_MULTI_GATEWAY_LOAD_BALANCER_ENDPOINT: http://127.0.0.1:59000
+      IPFS_S3_MULTI_GATEWAY_KUBO_URL: http://127.0.0.1:55002
+      IPFS_S3_E2E_ENDPOINT: http://127.0.0.1:59000
+      IPFS_S3_E2E_KUBO_URL: http://127.0.0.1:55002
+      IPFS_S3_TEST_POSTGRES_URL: postgres://ipfs3:mg-${{ github.run_id }}-${{ github.run_attempt }}@127.0.0.1:55434/ipfs3
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: "1.92"
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify Docker Compose for multi-gateway deployment
+        shell: pwsh
+        run: |
+          docker compose version
+          if ($LASTEXITCODE -ne 0) { throw "Docker Compose v2 is unavailable" }
+          $composeVersionText = (docker compose version --short).Trim()
+          $composeVersionMatch = [regex]::Match($composeVersionText, '^v?(?<core>\d+\.\d+\.\d+)(?:[-+][0-9A-Za-z.-]+)?$')
+          $composeVersion = $null
+          if (-not $composeVersionMatch.Success -or -not [Version]::TryParse($composeVersionMatch.Groups["core"].Value, [ref]$composeVersion) -or $composeVersion -lt [Version]"2.23.1") { throw "Docker Compose 2.23.1 or newer is required for inline configs.content" }
+
+      - name: Verify multi-gateway environment contract
+        shell: pwsh
+        run: |
+          $compose = @(
+            "--project-name", $env:COMPOSE_PROJECT_NAME,
+            "-f", "docker-compose.multi-gateway.yml",
+            "-f", "tests/compose.multi-gateway-validation.yml"
+          )
+          $requiredNames = @("POSTGRES_PASSWORD", "IPFS_S3_ACCESS_KEY_ID", "IPFS_S3_SECRET_ACCESS_KEY", "IPFS_S3_MASTER_KEY")
+          $savedRequiredValues = @{}
+          foreach ($requiredName in $requiredNames) {
+            if (-not (Test-Path -LiteralPath "Env:$requiredName")) { throw "Required job variable is absent before validation: $requiredName" }
+            $savedRequiredValues[$requiredName] = [Environment]::GetEnvironmentVariable($requiredName, "Process")
+          }
+          if ($env:POSTGRES_PASSWORD -notmatch '^[A-Za-z0-9._~-]+$') { throw "POSTGRES_PASSWORD is not URL-safe unreserved text" }
+          if ($env:IPFS_S3_MASTER_KEY -notmatch '^[0-9A-Fa-f]{64}$') { throw "IPFS_S3_MASTER_KEY is not exactly 64 hexadecimal characters" }
+          if ($env:IPFS_S3_LOAD_BALANCER_BIND -in @("", "0.0.0.0", "::", "[::]")) { throw "IPFS_S3_LOAD_BALANCER_BIND must be explicit and non-wildcard" }
+          $loadBalancerPort = 0
+          if (-not [int]::TryParse($env:IPFS_S3_LOAD_BALANCER_PORT, [ref]$loadBalancerPort) -or $loadBalancerPort -lt 1 -or $loadBalancerPort -gt 65535) { throw "IPFS_S3_LOAD_BALANCER_PORT must be decimal 1 through 65535" }
+          foreach ($name in $requiredNames) {
+            try {
+              Remove-Item -LiteralPath "Env:$name" -ErrorAction Stop
+              if (Test-Path -LiteralPath "Env:$name") { throw "Required variable removal did not produce absence: $name" }
+              if ($null -ne [Environment]::GetEnvironmentVariable($name, "Process")) { throw "Required variable removal retained a process value: $name" }
+              docker compose @compose config --quiet
+              $missingExit = $LASTEXITCODE
+            } finally {
+              foreach ($requiredName in $savedRequiredValues.Keys) {
+                [Environment]::SetEnvironmentVariable($requiredName, $savedRequiredValues[$requiredName], "Process")
+                if (-not (Test-Path -LiteralPath "Env:$requiredName")) { throw "Required variable restoration lost presence: $requiredName" }
+                $restoredRequiredValue = [Environment]::GetEnvironmentVariable($requiredName, "Process")
+                if ($restoredRequiredValue -cne $savedRequiredValues[$requiredName]) { throw "Required variable restoration changed value: $requiredName" }
+              }
+            }
+            if ($missingExit -eq 0) { throw "Compose accepted missing required variable: $name" }
+          }
+          docker compose @compose config --quiet
+          if ($LASTEXITCODE -ne 0) { throw "Complete multi-gateway Compose configuration failed" }
+
+      - name: Claim unique multi-gateway project and fixed ports
+        shell: pwsh
+        run: |
+          $project = $env:COMPOSE_PROJECT_NAME
+          $containers = @(docker ps --all --quiet --filter "label=com.docker.compose.project=$project" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+          if ($LASTEXITCODE -ne 0) { throw "Container ownership preflight failed" }
+          $networks = @(docker network ls --quiet --filter "label=com.docker.compose.project=$project" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+          if ($LASTEXITCODE -ne 0) { throw "Network ownership preflight failed" }
+          $volumes = @(docker volume ls --quiet --filter "label=com.docker.compose.project=$project" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+          if ($LASTEXITCODE -ne 0) { throw "Volume ownership preflight failed" }
+          if (($containers.Count + $networks.Count + $volumes.Count) -ne 0) { throw "Unique Compose project already owns resources: $project" }
+          foreach ($port in @(55434, 55002, 59000, 59001, 59002)) {
+            $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, $port)
+            try { $listener.Start() } catch { throw "Fixed validation port is occupied: $port" } finally { $listener.Stop() }
+          }
+          "MULTI_GATEWAY_OWNED=true" | Add-Content -LiteralPath $env:GITHUB_ENV
+
+      - name: Build and start the multi-gateway topology
+        shell: pwsh
+        run: |
+          "MULTI_GATEWAY_ATTEMPTED=true" | Add-Content -LiteralPath $env:GITHUB_ENV
+          docker compose --project-name $env:COMPOSE_PROJECT_NAME -f docker-compose.multi-gateway.yml -f tests/compose.multi-gateway-validation.yml up --detach --build --wait --wait-timeout 300 postgres kubo gateway-a gateway-b load-balancer
+          if ($LASTEXITCODE -ne 0) { throw "Multi-gateway topology did not become healthy" }
+
+      - name: Verify both gateways, load balancer, and migrations
+        shell: pwsh
+        run: |
+          foreach ($probe in @(
+            @("http://127.0.0.1:59001/ready", "READY"),
+            @("http://127.0.0.1:59002/ready", "READY"),
+            @("http://127.0.0.1:59000/health", "READY"),
+            @("http://127.0.0.1:59000/ready", "READY")
+          )) {
+            $response = Invoke-WebRequest -Uri $probe[0] -TimeoutSec 5
+            if ($response.StatusCode -ne 200 -or $response.Content -cne $probe[1]) { throw "Unexpected multi-gateway readiness response: $($probe[0])" }
+          }
+          $migrationOutput = @(docker compose --project-name $env:COMPOSE_PROJECT_NAME -f docker-compose.multi-gateway.yml -f tests/compose.multi-gateway-validation.yml exec -T postgres psql -U postgres -d ipfs3 -tA -c "SELECT version || ':' || COUNT(*)::text FROM seaql_migrations GROUP BY version ORDER BY version;")
+          if ($LASTEXITCODE -ne 0) { throw "Migration marker query failed" }
+          $actualMigrations = @($migrationOutput | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
+          $expectedMigrations = @(
+            "m20250701_000001_init:1",
+            "m20260707_000001_decompress_zip:1",
+            "m20260720_000001_sse_c_key_fingerprint:1",
+            "m20260721_000001_multi_provider_pinning:1",
+            "m20260729_000001_ipfs3_import:1",
+            "m20260729_000002_postgres_utc_timestamps:1",
+            "m20260730_000001_standard_mutation_fence:1",
+            "m20260813_000001_postgres_json_columns:1"
+          )
+          if ($actualMigrations.Count -ne $expectedMigrations.Count) { throw "Unexpected migration marker count" }
+          for ($index = 0; $index -lt $expectedMigrations.Count; $index++) {
+            if ($actualMigrations[$index] -cne $expectedMigrations[$index]) { throw "Unexpected migration marker at index $index" }
+          }
+
+      - name: Run direct cross-replica acceptance
+        run: cargo test --test multi_gateway multi_gateway_cross_replica_contract -- --exact --nocapture --test-threads=1
+
+      - name: Run existing E2E through the load balancer
+        run: cargo test --test e2e -- --nocapture --test-threads=1
+
+      - name: Capture pre-failover diagnostics
+        shell: pwsh
+        run: |
+          docker compose --project-name $env:COMPOSE_PROJECT_NAME -f docker-compose.multi-gateway.yml -f tests/compose.multi-gateway-validation.yml logs --no-color postgres kubo gateway-a gateway-b load-balancer
+          if ($LASTEXITCODE -ne 0) { throw "Pre-failover diagnostics failed" }
+
+      - name: Stop gateway A and verify surviving route
+        shell: pwsh
+        run: |
+          docker compose --project-name $env:COMPOSE_PROJECT_NAME -f docker-compose.multi-gateway.yml -f tests/compose.multi-gateway-validation.yml stop gateway-a
+          if ($LASTEXITCODE -ne 0) { throw "Gateway A stop failed" }
+          $gatewayB = Invoke-WebRequest -Uri "http://127.0.0.1:59002/ready" -TimeoutSec 5
+          if ($gatewayB.StatusCode -ne 200 -or $gatewayB.Content -cne "READY") { throw "Gateway B is not ready after gateway A stopped" }
+          $deadline = [DateTime]::UtcNow.AddSeconds(30)
+          $observed = $false
+          do {
+            try {
+              $loadBalancer = Invoke-WebRequest -Uri "http://127.0.0.1:59000/ready" -TimeoutSec 5 -SkipHttpErrorCheck
+              if ($loadBalancer.StatusCode -eq 200 -and $loadBalancer.Content -ceq "READY") { $observed = $true; break }
+            } catch {
+              Write-Host "Load balancer has not reached the surviving gateway"
+            }
+            Start-Sleep -Milliseconds 500
+          } while ([DateTime]::UtcNow -lt $deadline)
+          if (-not $observed) { throw "Load balancer did not recover through gateway B within 30 seconds" }
+
+      - name: Run new CRUD through the surviving load-balanced path
+        run: cargo test --test multi_gateway load_balancer_surviving_replica_crud -- --exact --nocapture --test-threads=1
+
+      - name: Multi-gateway Compose diagnostics
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          if ($env:MULTI_GATEWAY_ATTEMPTED -ne "true") { Write-Host "Multi-gateway topology was not attempted"; exit 0 }
+          docker compose --project-name $env:COMPOSE_PROJECT_NAME -f docker-compose.multi-gateway.yml -f tests/compose.multi-gateway-validation.yml logs --no-color postgres kubo gateway-a gateway-b load-balancer
+          if ($LASTEXITCODE -ne 0) { Write-Warning "Multi-gateway Compose diagnostics failed" }
+
+      - name: Multi-gateway Compose cleanup and residual assertion
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          if ($env:MULTI_GATEWAY_OWNED -ne "true" -or $env:MULTI_GATEWAY_ATTEMPTED -ne "true") { Write-Host "No owned multi-gateway topology requires cleanup"; exit 0 }
+          $project = $env:COMPOSE_PROJECT_NAME
+          docker compose --project-name $project -f docker-compose.multi-gateway.yml -f tests/compose.multi-gateway-validation.yml down --volumes --remove-orphans
+          $downExit = $LASTEXITCODE
+          $containers = @(docker ps --all --quiet --filter "label=com.docker.compose.project=$project" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+          $containerExit = $LASTEXITCODE
+          $networks = @(docker network ls --quiet --filter "label=com.docker.compose.project=$project" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+          $networkExit = $LASTEXITCODE
+          $volumes = @(docker volume ls --quiet --filter "label=com.docker.compose.project=$project" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+          $volumeExit = $LASTEXITCODE
+          if ($downExit -ne 0 -or $containerExit -ne 0 -or $networkExit -ne 0 -or $volumeExit -ne 0) { throw "Multi-gateway cleanup or residual query failed" }
+          if (($containers.Count + $networks.Count + $volumes.Count) -ne 0) { throw "Residual Compose resources remain for project: $project" }
+
   e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -269,6 +462,9 @@ jobs:
 
       - name: Test PostgreSQL production baseline contract
         run: pwsh -NoProfile -File tests/postgres-production-baseline.Tests.ps1
+
+      - name: Test multi-gateway deployment contract
+        run: pwsh -NoProfile -File tests/multi-gateway.Tests.ps1
 
       - name: Test client-smoke infrastructure
         run: pwsh -NoProfile -File tests/client-smoke.Tests.ps1

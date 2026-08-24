@@ -76,9 +76,59 @@ docker compose -f docker-compose.postgres.yml down --remove-orphans
 ```
 
 Never add `--volumes` to the production shutdown command: it deletes the
-PostgreSQL and IPFS named volumes. This baseline does not provide multiple
-gateways, migration leader election, PostgreSQL high availability, backups,
-TLS, IPFS Cluster, a private swarm, a secret manager, or key rotation.
+PostgreSQL and IPFS named volumes. This single-gateway baseline does not provide
+PostgreSQL high availability, backups, TLS, IPFS Cluster, a private swarm, a
+secret manager, or key rotation. For the bounded two-gateway topology, use the
+separate deployment below.
+
+### Two-gateway horizontal scaling
+
+`docker-compose.multi-gateway.yml` runs exactly two normal gateway replicas
+behind one Nginx entry point. Both replicas share one PostgreSQL 17 service, one
+Kubo service, identical S3 credentials, and the same master key. There is no
+session stickiness: PostgreSQL provides shared metadata and Kubo provides shared
+content. PostgreSQL startup migrations are serialized with a transaction-scoped
+advisory lock before either gateway binds its listener.
+
+Set the four required secret values as in the PostgreSQL baseline, then provide
+an explicit non-wildcard load-balancer bind and port:
+
+```powershell
+$env:POSTGRES_PASSWORD = "replace-with-url-safe-password"
+$env:IPFS_S3_ACCESS_KEY_ID = "replace-with-access-key"
+$env:IPFS_S3_SECRET_ACCESS_KEY = "replace-with-secret-key"
+$env:IPFS_S3_MASTER_KEY = "replace-with-one-stable-64-hex-character-key"
+$env:IPFS_S3_LOAD_BALANCER_BIND = "127.0.0.1"
+$env:IPFS_S3_LOAD_BALANCER_PORT = "9000"
+
+docker compose -f docker-compose.multi-gateway.yml config --quiet
+docker compose -f docker-compose.multi-gateway.yml up --detach --build --wait --wait-timeout 300
+```
+
+Only Nginx is published by the production file. PostgreSQL, Kubo, and the two
+gateway replicas have no host ports. Nginx preserves the signed Host header,
+streams request and response bodies without buffering, and passively retries
+the other replica for bounded connection/timeout/502/503/504 failures. Its
+`/health` and `/ready` routes both proxy a selected gateway's database-only
+`/ready`; they are not active health checks for every component.
+
+Both replicas run the existing durable import and pinning workers. This topology
+configures no remote pinning providers and does not provide cluster-wide remote
+provider rate limits, concurrency, health, or fairness. Direct replica ports in
+`tests/compose.multi-gateway-validation.yml` are disposable loopback-only test
+surfaces, not operator endpoints.
+
+Stop the stack without deleting PostgreSQL or Kubo data:
+
+```powershell
+docker compose -f docker-compose.multi-gateway.yml down --remove-orphans
+```
+
+This is gateway-layer horizontal scaling, not full-stack high availability. The
+single PostgreSQL instance, Kubo instance, Nginx process, and host remain single
+points of failure. It does not add PostgreSQL HA, Kubo replication, load-balancer
+HA, IPFS Cluster, a private swarm, TLS, distributed provider coordination, or
+master-key rotation.
 
 ### Use with aws cli
 

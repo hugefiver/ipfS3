@@ -152,10 +152,11 @@ Assert-Contains $concurrencyBlock "  cancel-in-progress: true" "Concurrency must
 
 $jobsBlock = Get-YamlBlock -Text $Workflow -Key "jobs" -Indent 0
 $jobNames = @([regex]::Matches($jobsBlock, '(?m)^  ([A-Za-z0-9_-]+):\s*$') | ForEach-Object { $_.Groups[1].Value })
-Assert-True ($jobNames.Count -eq 4) "Expected exactly four jobs, found $($jobNames.Count): $($jobNames -join ', ')"
+Assert-True ($jobNames.Count -eq 5) "Expected exactly five jobs, found $($jobNames.Count): $($jobNames -join ', ')"
 foreach ($expectedJob in @(
     "postgres-import",
     "postgres-production-deployment",
+    "multi-gateway-deployment",
     "e2e",
     "client-smoke-infrastructure"
 )) {
@@ -166,6 +167,7 @@ Assert-NotMatches $jobsBlock '(?m)^    continue-on-error:' "Release-validation j
 
 $postgresJob = Get-YamlBlock -Text $jobsBlock -Key "postgres-import" -Indent 2
 $productionJob = Get-YamlBlock -Text $jobsBlock -Key "postgres-production-deployment" -Indent 2
+$multiGatewayJob = Get-YamlBlock -Text $jobsBlock -Key "multi-gateway-deployment" -Indent 2
 $e2eJob = Get-YamlBlock -Text $jobsBlock -Key "e2e" -Indent 2
 $clientJob = Get-YamlBlock -Text $jobsBlock -Key "client-smoke-infrastructure" -Indent 2
 
@@ -257,6 +259,55 @@ foreach ($restoreFragment in @(
 }
 Assert-Matches $productionJob '(?s)try \{.*?Remove-Item -LiteralPath "Env:\$name" -ErrorAction Stop.*?config --quiet.*?\} finally \{.*?SetEnvironmentVariable\(\$requiredName, \$savedRequiredValues\[\$requiredName\], "Process"\).*?Test-Path -LiteralPath "Env:\$requiredName".*?\$restoredRequiredValue -cne \$savedRequiredValues\[\$requiredName\]' "Each missing-secret probe must remove deterministically and restore exact presence/value in finally"
 
+Assert-Contains $multiGatewayJob "    runs-on: ubuntu-latest" "Multi-gateway job must use ubuntu-latest"
+Assert-Contains $multiGatewayJob "    timeout-minutes: 60" "Multi-gateway job timeout must be 60 minutes"
+Assert-RustSetup -JobBlock $multiGatewayJob -JobName "Multi-gateway job"
+$multiGatewayEnv = Get-YamlBlock -Text $multiGatewayJob -Key "env" -Indent 4
+foreach ($line in @(
+    '      COMPOSE_DISABLE_ENV_FILE: "1"',
+    '      COMPOSE_PROJECT_NAME: ipfs3-mg-${{ github.run_id }}-${{ github.run_attempt }}',
+    "      IPFS_S3_MULTI_GATEWAY_A_ENDPOINT: http://127.0.0.1:59001",
+    "      IPFS_S3_MULTI_GATEWAY_B_ENDPOINT: http://127.0.0.1:59002",
+    "      IPFS_S3_MULTI_GATEWAY_LOAD_BALANCER_ENDPOINT: http://127.0.0.1:59000",
+    "      IPFS_S3_MULTI_GATEWAY_KUBO_URL: http://127.0.0.1:55002",
+    "      IPFS_S3_E2E_ENDPOINT: http://127.0.0.1:59000",
+    "      IPFS_S3_E2E_KUBO_URL: http://127.0.0.1:55002"
+)) {
+    Assert-ExactLine $multiGatewayEnv $line "Multi-gateway environment line is missing or changed."
+}
+Assert-NotContains $multiGatewayJob "--env-file" "Multi-gateway validation must not use an explicit environment file"
+Assert-NotMatches $multiGatewayJob '(?m)^    (?:needs|continue-on-error):' "Multi-gateway job must be independent and blocking"
+Assert-InOrder -Text $multiGatewayJob -Message "Multi-gateway deployment steps are missing or out of order." -Fragments @(
+    "      - name: Verify Docker Compose for multi-gateway deployment",
+    "      - name: Verify multi-gateway environment contract",
+    "      - name: Claim unique multi-gateway project and fixed ports",
+    "      - name: Build and start the multi-gateway topology",
+    "      - name: Verify both gateways, load balancer, and migrations",
+    "      - name: Run direct cross-replica acceptance",
+    "      - name: Run existing E2E through the load balancer",
+    "      - name: Capture pre-failover diagnostics",
+    "      - name: Stop gateway A and verify surviving route",
+    "      - name: Run new CRUD through the surviving load-balanced path",
+    "      - name: Multi-gateway Compose diagnostics",
+    "      - name: Multi-gateway Compose cleanup and residual assertion"
+)
+foreach ($fragment in @(
+    "docker-compose.multi-gateway.yml",
+    "tests/compose.multi-gateway-validation.yml",
+    "up --detach --build --wait --wait-timeout 300 postgres kubo gateway-a gateway-b load-balancer",
+    "cargo test --test multi_gateway multi_gateway_cross_replica_contract -- --exact --nocapture --test-threads=1",
+    "cargo test --test e2e -- --nocapture --test-threads=1",
+    "logs --no-color postgres kubo gateway-a gateway-b load-balancer",
+    "stop gateway-a",
+    "cargo test --test multi_gateway load_balancer_surviving_replica_crud -- --exact --nocapture --test-threads=1",
+    "down --volumes --remove-orphans",
+    "com.docker.compose.project"
+)) {
+    Assert-Contains $multiGatewayJob $fragment "Multi-gateway deployment contract is missing: $fragment"
+}
+Assert-True (([regex]::Matches($multiGatewayJob, '(?m)^        if: \$\{\{ always\(\) \}\}\s*$')).Count -eq 2) "Multi-gateway diagnostics and cleanup must both use always()"
+Assert-NotMatches $multiGatewayJob 'SetEnvironmentVariable\([^,\r\n]+,\s*\$null,\s*"Process"\)' "Multi-gateway job must not use null SetEnvironmentVariable removal"
+
 Assert-Contains $e2eJob "    runs-on: ubuntu-latest" "E2E job must use ubuntu-latest"
 Assert-Contains $e2eJob "    timeout-minutes: 60" "E2E job timeout must be 60 minutes"
 Assert-RustSetup -JobBlock $e2eJob -JobName "E2E job"
@@ -288,13 +339,15 @@ Assert-Contains $clientJob "    runs-on: ubuntu-latest" "Client-smoke infrastruc
 Assert-Contains $clientJob "    timeout-minutes: 15" "Client-smoke infrastructure timeout must be 15 minutes"
 Assert-Contains $clientJob "      - uses: actions/checkout@v7" "Client-smoke infrastructure job must check out the repository"
 $clientRunLines = @($clientJob -split "`n" | Where-Object { $_ -match '^\s+run:' })
-Assert-True ($clientRunLines.Count -eq 3) "Client-smoke infrastructure job must contain exactly three run commands"
+Assert-True ($clientRunLines.Count -eq 4) "Client-smoke infrastructure job must contain exactly four run commands"
 Assert-ExactLine $clientJob "        run: pwsh -NoProfile -File tests/release-validation.Tests.ps1" "Release-validation contract command is missing or changed."
 Assert-ExactLine $clientJob "        run: pwsh -NoProfile -File tests/postgres-production-baseline.Tests.ps1" "PostgreSQL production baseline contract command is missing or changed."
+Assert-ExactLine $clientJob "        run: pwsh -NoProfile -File tests/multi-gateway.Tests.ps1" "Multi-gateway deployment contract command is missing or changed."
 Assert-ExactLine $clientJob "        run: pwsh -NoProfile -File tests/client-smoke.Tests.ps1" "Client-smoke infrastructure command is missing or changed."
 Assert-InOrder -Text $clientJob -Message "Static release contracts must run before the existing client-smoke infrastructure test." -Fragments @(
     "        run: pwsh -NoProfile -File tests/release-validation.Tests.ps1",
     "        run: pwsh -NoProfile -File tests/postgres-production-baseline.Tests.ps1",
+    "        run: pwsh -NoProfile -File tests/multi-gateway.Tests.ps1",
     "        run: pwsh -NoProfile -File tests/client-smoke.Tests.ps1"
 )
 Assert-NotMatches $clientJob '(?m)^        continue-on-error:' "Client-smoke infrastructure contract steps must be blocking"

@@ -12,6 +12,8 @@ use sea_orm::DatabaseConnection;
 /// writer fails immediately with `database is locked (code 5)` instead of
 /// waiting for the current writer to finish.
 pub const SQLITE_BUSY_TIMEOUT_MS: i32 = 5_000;
+pub const POSTGRES_MIGRATION_LOCK_KEY_1: i32 = 1_229_997_651;
+pub const POSTGRES_MIGRATION_LOCK_KEY_2: i32 = 1_395_879_239;
 
 pub fn is_sqlite_url(database_url: &str) -> bool {
     database_url.starts_with("sqlite:")
@@ -76,10 +78,43 @@ mod migrator {
     }
 }
 
-pub async fn run_migrations(db: &DatabaseConnection) -> Result<(), sea_orm::DbErr> {
+fn postgres_migration_failure(category: &'static str) -> sea_orm::DbErr {
+    tracing::error!(migration_lock = "failure", category);
+    sea_orm::DbErr::Custom(format!("PostgreSQL migration {category} failed"))
+}
+
+async fn run_postgres_migrations(db: &sea_orm::DatabaseConnection) -> Result<(), sea_orm::DbErr> {
+    use sea_orm::{ConnectionTrait, TransactionTrait};
     use sea_orm_migration::MigratorTrait;
 
-    migrator::Migrator::up(db, None).await
+    let txn = db
+        .begin()
+        .await
+        .map_err(|_| postgres_migration_failure("setup"))?;
+    txn.execute_unprepared("SET LOCAL lock_timeout = '60s'")
+        .await
+        .map_err(|_| postgres_migration_failure("setup"))?;
+    tracing::info!(migration_lock = "waiting");
+    txn.execute_unprepared("SELECT pg_advisory_xact_lock(1229997651, 1395879239)")
+        .await
+        .map_err(|_| postgres_migration_failure("timeout"))?;
+    tracing::info!(migration_lock = "acquired");
+    migrator::Migrator::up(&txn, None)
+        .await
+        .map_err(|_| postgres_migration_failure("migration"))?;
+    txn.commit()
+        .await
+        .map_err(|_| postgres_migration_failure("commit"))
+}
+
+pub async fn run_migrations(db: &sea_orm::DatabaseConnection) -> Result<(), sea_orm::DbErr> {
+    use sea_orm::ConnectionTrait;
+    use sea_orm_migration::MigratorTrait;
+
+    if db.get_database_backend() != sea_orm::DatabaseBackend::Postgres {
+        return migrator::Migrator::up(db, None).await;
+    }
+    run_postgres_migrations(db).await
 }
 
 #[cfg(test)]

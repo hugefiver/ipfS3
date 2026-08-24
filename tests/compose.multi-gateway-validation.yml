@@ -1,0 +1,20 @@
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:55434:5432"
+
+  kubo:
+    ports:
+      - "127.0.0.1:55002:5001"
+
+  gateway-a:
+    ports:
+      - "127.0.0.1:59001:9000"
+
+  gateway-b:
+    ports:
+      - "127.0.0.1:59002:9000"
+
+  load-balancer:
+    ports:
+      - "127.0.0.1:59000:9000"
