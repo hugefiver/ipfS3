@@ -6,7 +6,8 @@ mod support;
 use anyhow::{Result as AnyResult, anyhow, ensure};
 use bytes::Bytes;
 use cluster_support::{
-    ClusterClient, RecoveryState, kubo_cat, peer_set_digest, wait_for_shared_two_peer_view,
+    ClusterClient, KuboApiClient, RecoveryState, kubo_cat, peer_set_digest,
+    prove_wrong_key_rejection, wait_for_private_swarm, wait_for_shared_two_peer_view,
     wait_for_two_pinned, wait_until_not_fully_pinned,
 };
 use futures_util::StreamExt;
@@ -128,6 +129,13 @@ fn cluster_client(name: &str) -> ClusterClient {
     }
 }
 
+fn kubo_api_client(name: &str) -> KuboApiClient {
+    match KuboApiClient::new(&endpoint(name)) {
+        Ok(client) => client,
+        Err(_) => panic!("kubo_api_client_configuration_invalid"),
+    }
+}
+
 fn expect_cluster_result<T>(
     result: Result<T, cluster_support::ProbeError>,
     category: &'static str,
@@ -143,6 +151,34 @@ fn expect_local_kubo(result: AnyResult<Vec<u8>>, category: &'static str) -> Vec<
         Ok(value) => value,
         Err(_) => panic!("{category}"),
     }
+}
+
+#[tokio::test]
+async fn private_swarm_configuration_and_peering() {
+    let kubo_a = kubo_api_client("IPFS_S3_CLUSTER_KUBO_A_URL");
+    let kubo_b = kubo_api_client("IPFS_S3_CLUSTER_KUBO_B_URL");
+    let kubo_c = kubo_api_client("IPFS_S3_CLUSTER_KUBO_C_URL");
+    let _ = expect_cluster_result(
+        wait_for_private_swarm(&kubo_a, &kubo_b, &kubo_c, CONVERGENCE_TIMEOUT).await,
+        "private_swarm_configuration_and_peering_failed",
+    );
+    println!("private_swarm_peers=2 wrong_key_peers=0");
+}
+
+#[tokio::test]
+async fn private_swarm_wrong_key_rejected() {
+    let kubo_a = kubo_api_client("IPFS_S3_CLUSTER_KUBO_A_URL");
+    let kubo_b = kubo_api_client("IPFS_S3_CLUSTER_KUBO_B_URL");
+    let kubo_c = kubo_api_client("IPFS_S3_CLUSTER_KUBO_C_URL");
+    let evidence = expect_cluster_result(
+        wait_for_private_swarm(&kubo_a, &kubo_b, &kubo_c, CONVERGENCE_TIMEOUT).await,
+        "private_swarm_convergence_failed",
+    );
+    expect_cluster_result(
+        prove_wrong_key_rejection(&kubo_a, &kubo_b, &kubo_c, &evidence).await,
+        "private_swarm_wrong_key_rejection_failed",
+    );
+    println!("wrong_key_connect=rejected");
 }
 
 #[tokio::test]

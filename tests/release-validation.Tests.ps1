@@ -98,6 +98,33 @@ function Get-YamlBlock {
     return ($lines[($start + 1)..($end - 1)] -join "`n")
 }
 
+function Get-PwshRunBlocks {
+    param([Parameter(Mandatory)][string]$JobBlock)
+
+    $jobLines = @($JobBlock -split "`n")
+    $blocks = [Collections.Generic.List[string]]::new()
+    for ($lineIndex = 0; $lineIndex -lt $jobLines.Count; $lineIndex++) {
+        if ($jobLines[$lineIndex].Trim() -cne "shell: pwsh") { continue }
+        $runIndex = $lineIndex + 1
+        while ($runIndex -lt $jobLines.Count -and [string]::IsNullOrWhiteSpace($jobLines[$runIndex])) { $runIndex++ }
+        Assert-True ($runIndex -lt $jobLines.Count -and $jobLines[$runIndex].Trim() -ceq "run: |") "Each workflow PowerShell step must use a literal run block"
+
+        $sourceLines = [Collections.Generic.List[string]]::new()
+        for ($bodyIndex = $runIndex + 1; $bodyIndex -lt $jobLines.Count; $bodyIndex++) {
+            $line = $jobLines[$bodyIndex]
+            if (-not [string]::IsNullOrWhiteSpace($line) -and ([regex]::Match($line, '^( *)').Groups[1].Length -le 8)) { break }
+            if ([string]::IsNullOrWhiteSpace($line)) {
+                $sourceLines.Add("")
+                continue
+            }
+            Assert-True ($line.StartsWith("          ", [StringComparison]::Ordinal)) "Workflow PowerShell run line lost YAML indentation"
+            $sourceLines.Add($line.Substring(10))
+        }
+        $blocks.Add($sourceLines -join "`n")
+    }
+    return @($blocks.ToArray())
+}
+
 function Assert-InOrder {
     param(
         [Parameter(Mandatory)][string]$Text,
@@ -172,6 +199,20 @@ $multiGatewayJob = Get-YamlBlock -Text $jobsBlock -Key "multi-gateway-deployment
 $clusterJob = Get-YamlBlock -Text $jobsBlock -Key "cluster-pinset-replication" -Indent 2
 $e2eJob = Get-YamlBlock -Text $jobsBlock -Key "e2e" -Indent 2
 $clientJob = Get-YamlBlock -Text $jobsBlock -Key "client-smoke-infrastructure" -Indent 2
+
+$allWorkflowPwshBlocks = [Collections.Generic.List[string]]::new()
+foreach ($jobName in $jobNames) {
+    $jobBlock = Get-YamlBlock -Text $jobsBlock -Key $jobName -Indent 2
+    foreach ($source in (Get-PwshRunBlocks $jobBlock)) {
+        $tokens = $null
+        $parseErrors = $null
+        [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$parseErrors) | Out-Null
+        if ($parseErrors.Count -ne 0) { throw "Workflow PowerShell AST parse failed in ${jobName}: $($parseErrors.Message -join '; ')" }
+        Assert-NotMatches $source '(?m)(?:^|\s)(?:export\s+|source\s+)|&&|/dev/null' "Workflow PowerShell contains Bash syntax in $jobName"
+        $allWorkflowPwshBlocks.Add($source)
+    }
+}
+Assert-True ($allWorkflowPwshBlocks.Count -gt 0) "Release workflow must contain PowerShell run blocks to parse"
 
 Assert-Contains $postgresJob "    runs-on: ubuntu-latest" "PostgreSQL job must use ubuntu-latest"
 Assert-Contains $postgresJob "    timeout-minutes: 30" "PostgreSQL job timeout must be 30 minutes"
@@ -317,7 +358,7 @@ Assert-NotMatches $clusterJob '(?m)^    (?:needs|continue-on-error):' "Cluster p
 Assert-NotMatches $clusterJob '(?m)^        continue-on-error:' "Cluster pinset replication product gates must be blocking"
 $clusterEnv = Get-YamlBlock -Text $clusterJob -Key "env" -Indent 4
 $clusterEnvLines = @($clusterEnv -split "`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-Assert-True ($clusterEnvLines.Count -eq 16) "Cluster pinset replication job must contain exactly sixteen job environment values"
+Assert-True ($clusterEnvLines.Count -eq 19) "Cluster pinset replication job must contain exactly nineteen job environment values"
 foreach ($line in @(
     '      COMPOSE_DISABLE_ENV_FILE: "1"',
     '      COMPOSE_PROJECT_NAME: ipfs3-cl-${{ github.run_id }}-${{ github.run_attempt }}',
@@ -334,6 +375,9 @@ foreach ($line in @(
     "      IPFS_S3_CLUSTER_A_PROXY_URL: http://127.0.0.1:59103",
     "      IPFS_S3_CLUSTER_KUBO_A_URL: http://127.0.0.1:55100",
     "      IPFS_S3_CLUSTER_KUBO_B_URL: http://127.0.0.1:55101",
+    "      IPFS_S3_CLUSTER_KUBO_C_URL: http://127.0.0.1:55102",
+    '      IPFS_S3_SWARM_KEY_FILE: ${{ runner.temp }}/ipfs3-swarm-${{ github.run_id }}-${{ github.run_attempt }}.key',
+    '      IPFS_S3_SWARM_KEY_WRONG_FILE: ${{ runner.temp }}/ipfs3-swarm-wrong-${{ github.run_id }}-${{ github.run_attempt }}.key',
     '      IPFS_S3_CLUSTER_STATE_PATH: ${{ runner.temp }}/ipfs3-cluster-${{ github.run_id }}-${{ github.run_attempt }}.json'
 )) {
     Assert-ExactLine $clusterEnv $line "Cluster pinset replication environment line is missing or changed."
@@ -346,6 +390,7 @@ Assert-InOrder -Text $clusterJob -Message "Cluster pinset replication steps are 
     "      - name: Claim unique Cluster project, ports, and state receipt",
     "      - name: Build and start Cluster topology",
     "      - name: Prove Cluster release-version representation contract",
+    "      - name: Prove private swarm causality before topology",
     "      - name: Prove exact two-peer topology without writes",
     "      - name: Prove direct Kubo wire compatibility against Cluster A proxy",
     "      - name: Prove replication and retained deletion",
@@ -353,8 +398,8 @@ Assert-InOrder -Text $clusterJob -Message "Cluster pinset replication steps are 
     "      - name: Stop Cluster and Kubo peer B",
     "      - name: Prove stopped peer loses two-pin evidence",
     "      - name: Capture stopped-peer diagnostics before restart",
-    "      - name: Restart Cluster and Kubo peer B with existing volumes",
-    "      - name: Prove same-volume peer B recovery",
+    "      - name: Restart both Cluster peers and Kubo swarm with existing volumes",
+    "      - name: Prove same-volume private swarm and peer B recovery",
     "      - name: Final sanitized Cluster diagnostics",
     "      - name: Cluster cleanup and residual assertion"
 )
@@ -368,8 +413,8 @@ foreach ($fragment in @(
     "CLUSTER_PINSET_OWNED=true",
     "CLUSTER_STATE_RECEIPT_OWNED=true",
     "CLUSTER_PINSET_ATTEMPTED=true",
-    "55435, 55100, 55101, 59100, 59101, 59102, 59103",
-    "up --detach --build --wait --wait-timeout 300 postgres kubo-a kubo-b cluster-a cluster-b gateway",
+    "55435, 55100, 55101, 55102, 59100, 59101, 59102, 59103",
+    "--profile private-swarm-validation @compose up --detach --build --wait --wait-timeout 300 postgres kubo-a kubo-b kubo-c swarm-bootstrap cluster-a cluster-b gateway",
     "cargo test --test cluster cluster_support::release_version_validator_accepts_exact_release_and_build_metadata -- --exact",
     "Cluster release-version unit contract failed",
     "cargo test --test cluster cluster_topology_converges -- --exact --nocapture --test-threads=1",
@@ -381,9 +426,12 @@ foreach ($fragment in @(
     "cargo test --test cluster cluster_replication_and_retention -- --exact --nocapture --test-threads=1",
     "stop cluster-b kubo-b",
     "cargo test --test cluster cluster_peer_b_outage_contract -- --exact --nocapture --test-threads=1",
-    "start kubo-b cluster-b",
+    "stop cluster-a kubo-a",
+    "start kubo-a kubo-b",
+    "restart --timeout 30 swarm-bootstrap",
+    "start cluster-a cluster-b",
     "cargo test --test cluster cluster_peer_b_restart_recovery -- --exact --nocapture --test-threads=1",
-    "logs --no-color postgres kubo-a kubo-b cluster-a cluster-b gateway",
+    "logs --no-color postgres kubo-a kubo-b kubo-c swarm-bootstrap cluster-a cluster-b gateway",
     "down --volumes --remove-orphans",
     "com.docker.compose.project"
 )) {
@@ -393,15 +441,21 @@ Assert-NotContains $clusterJob 'IPFS_S3_GATEWAY_BIND -in @("", "0.0.0.0", "::", 
 Assert-InOrder -Text $clusterJob -Message "Cluster validation must validate fixed loopback before any Compose config or startup." -Fragments @(
     'if ($env:IPFS_S3_GATEWAY_BIND -cne "127.0.0.1") { throw "Gateway bind must be exactly 127.0.0.1" }',
     "docker compose @compose config --quiet",
-    "up --detach --build --wait --wait-timeout 300 postgres kubo-a kubo-b cluster-a cluster-b gateway"
+    "--profile private-swarm-validation @compose up --detach --build --wait --wait-timeout 300 postgres kubo-a kubo-b kubo-c swarm-bootstrap cluster-a cluster-b gateway"
 )
-Assert-True (([regex]::Matches($clusterJob, '(?m)^          cargo test --test cluster [^\r\n]+$')).Count -eq 6) "Cluster pinset replication job must contain exactly six explicit Cluster cargo commands"
+Assert-True (([regex]::Matches($clusterJob, '(?m)^          cargo test --test cluster [^\r\n]+$')).Count -eq 12) "Cluster pinset replication job must contain exactly twelve explicit Cluster cargo commands"
 Assert-InOrder -Text $clusterJob -Message "Cluster cargo commands must preserve pure-unit then live causal order." -Fragments @(
     "cargo test --test cluster cluster_support::release_version_validator_accepts_exact_release_and_build_metadata -- --exact",
+    "cargo test --test cluster cluster_support::private_kubo_config_contract_rejects_open_discovery -- --exact",
+    "cargo test --test cluster cluster_support::private_peering_json_contract_matches_kubo_v0_43_addrinfo -- --exact",
+    "cargo test --test cluster cluster_support::kubo_swarm_peers_null_is_empty_without_ndjson -- --exact",
+    "cargo test --test cluster private_swarm_configuration_and_peering -- --exact --nocapture --test-threads=1",
+    "cargo test --test cluster private_swarm_wrong_key_rejected -- --exact --nocapture --test-threads=1",
     "cargo test --test cluster cluster_topology_converges -- --exact --nocapture --test-threads=1",
     "cargo test --test cluster cluster_proxy_compatibility -- --exact --nocapture --test-threads=1",
     "cargo test --test cluster cluster_replication_and_retention -- --exact --nocapture --test-threads=1",
     "cargo test --test cluster cluster_peer_b_outage_contract -- --exact --nocapture --test-threads=1",
+    "cargo test --test cluster private_swarm_configuration_and_peering -- --exact --nocapture --test-threads=1",
     "cargo test --test cluster cluster_peer_b_restart_recovery -- --exact --nocapture --test-threads=1"
 )
 Assert-InOrder -Text $clusterJob -Message "Cluster topology receipt must be written only after a successful topology gate and checked before proxy compatibility." -Fragments @(
@@ -422,6 +476,43 @@ Assert-InOrder -Text $clusterJob -Message "Cluster proxy receipt must be written
 Assert-NotMatches $clusterJob '(?i)docker\s+(?:compose\s+)?pull\b|--pull(?:=|\s)' "Cluster validation must not explicitly pull images"
 Assert-NotMatches $clusterJob '(?i)docker\s+(?:system|container|network|volume)\s+prune|docker\s+rm\s+-f' "Cluster cleanup must not prune broad Docker resources"
 Assert-NotMatches $clusterJob 'SetEnvironmentVariable\([^,\r\n]+,\s*\$null,\s*"Process"\)' "Cluster validation must not use null environment removal"
+Assert-Contains $clusterJob 'dst=/run/secrets/swarm_key,readonly' "Cluster supervisor proof must mount only the exact swarm-key secret path"
+foreach ($fragment in @(
+    '"--mount", "type=bind,src=$fullKeyPath,dst=/run/secrets/swarm_key,readonly"',
+    '"--env", "IPFS_SWARM_KEY_FILE=/run/secrets/swarm_key"',
+    'docker run --rm --entrypoint /bin/sh ghcr.io/hugefiver/ipfs3-kubo-cluster:v0.43.0 -ec $sourceFixture 2>&1',
+    '. /private-swarm-entrypoint.sh',
+    'redact_swarm_fingerprint',
+    'select_supervisor_exit',
+    'ordinary=0123456789abcdef0123456789abcdef',
+    "cid=Qm`$(printf '%044d' 0 | tr 0 c)",
+    'Swarm key fingerprint: [redacted]',
+    'check_selector 37 37 1 1',
+    'check_selector 1 0 1 0',
+    'check_selector 1 0 0 1',
+    'check_selector 0 0 0 0',
+    'CLUSTER_PRIVATE_SWARM_FILTER_GREEN=true',
+    'logs --no-color kubo-a kubo-b kubo-c 2>&1',
+    'Swarm key fingerprint: [redacted]',
+    '$rawKuboRedactedFingerprintCount -lt 3',
+    '$rawKuboLogs = $null',
+    '$rawKuboText = $null',
+    '$rawKuboRedactedFingerprintCount = $null',
+    'docker compose --profile private-swarm-validation --project-name $project -f docker-compose.cluster.yml -f tests/compose.cluster-validation.yml down --volumes --remove-orphans'
+)) {
+    Assert-Contains $clusterJob $fragment "Cluster private-swarm completion contract is missing: $fragment"
+}
+foreach ($forbiddenMountFragment in @('src=$keyParent', 'dst=/run/ipfs3-swarm', 'src=$env:RUNNER_TEMP', 'IPFS_SWARM_KEY_FILE=/run/ipfs3-swarm/')) {
+    Assert-NotContains $clusterJob $forbiddenMountFragment "Cluster private-swarm proof must not expose a key directory or non-secret key path: $forbiddenMountFragment"
+}
+Assert-InOrder -Text $clusterJob -Message "Source-only filter receipt must precede disposable supervisor proofs." -Fragments @(
+    'docker run --rm --entrypoint /bin/sh ghcr.io/hugefiver/ipfs3-kubo-cluster:v0.43.0 -ec $sourceFixture 2>&1',
+    'CLUSTER_PRIVATE_SWARM_FILTER_GREEN=true',
+    'Invoke-PrivateSwarmSupervisorProof -Mode normal -ExpectedExit 37',
+    'Invoke-PrivateSwarmSupervisorProof -Mode handled -ExpectedExit 43',
+    'Invoke-PrivateSwarmSupervisorProof -Mode unhandled -ExpectedExit 143',
+    'CLUSTER_PRIVATE_SWARM_SUPERVISOR_GREEN=true'
+)
 
 Assert-Contains $e2eJob "    runs-on: ubuntu-latest" "E2E job must use ubuntu-latest"
 Assert-Contains $e2eJob "    timeout-minutes: 60" "E2E job timeout must be 60 minutes"

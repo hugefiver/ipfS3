@@ -11,6 +11,30 @@ services:
     ports:
       - "127.0.0.1:55101:5001"
 
+  swarm-bootstrap: {}
+
+  kubo-c:
+    profiles: ["private-swarm-validation"]
+    image: ghcr.io/hugefiver/ipfs3-kubo-cluster:v0.43.0
+    ports:
+      - "127.0.0.1:55102:5001"
+    tmpfs:
+      - /data/ipfs
+    environment:
+      IPFS_PATH: /data/ipfs
+      IPFS_SWARM_KEY_FILE: /run/secrets/swarm_key_wrong
+      LIBP2P_FORCE_PNET: "1"
+    secrets:
+      - source: swarm_key_wrong
+        target: swarm_key_wrong
+    healthcheck:
+      test: ["CMD", "ipfs", "id"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 15s
+    restart: unless-stopped
+
   cluster-a:
     ports:
       - "127.0.0.1:59101:9094"
@@ -23,3 +47,7 @@ services:
   gateway:
     ports:
       - "127.0.0.1:59100:9000"
+
+secrets:
+  swarm_key_wrong:
+    file: "${IPFS_S3_SWARM_KEY_WRONG_FILE:?IPFS_S3_SWARM_KEY_WRONG_FILE is required}"

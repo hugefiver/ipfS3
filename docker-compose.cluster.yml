@@ -29,6 +29,11 @@ services:
       - kubo_a_data:/data/ipfs
     environment:
       IPFS_PATH: /data/ipfs
+      IPFS_SWARM_KEY_FILE: /run/secrets/swarm_key
+      LIBP2P_FORCE_PNET: "1"
+    secrets:
+      - source: swarm_key
+        target: swarm_key
     healthcheck:
       test: ["CMD", "ipfs", "id"]
       interval: 5s
@@ -46,6 +51,11 @@ services:
       - kubo_b_data:/data/ipfs
     environment:
       IPFS_PATH: /data/ipfs
+      IPFS_SWARM_KEY_FILE: /run/secrets/swarm_key
+      LIBP2P_FORCE_PNET: "1"
+    secrets:
+      - source: swarm_key
+        target: swarm_key
     healthcheck:
       test: ["CMD", "ipfs", "id"]
       interval: 5s
@@ -53,6 +63,88 @@ services:
       retries: 20
       start_period: 15s
     restart: unless-stopped
+
+  swarm-bootstrap:
+    image: ipfs/kubo:v0.43.0
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        fail() {
+          printf '%s\n' 'private swarm bootstrap failed' >&2
+          exit 1
+        }
+
+        ensure_peering() {
+          api=$$1
+          address=$$2
+          expected_id=$$3
+          expected_transport=$$4
+          tab=$$(printf '\t')
+          expected=$$(printf '%s\n%s' "$$expected_id" "$$tab$$expected_transport")
+          peering=$$(ipfs --api "$$api" swarm peering ls 2>/dev/null) || return 1
+          peering=$$(printf '%s\n' "$$peering" | sed '/^[[:space:]]*$$/d') || return 1
+          if [ -z "$$peering" ]; then
+            ipfs --api "$$api" swarm peering add "$$address" >/dev/null 2>&1 || return 1
+            return 0
+          fi
+          [ "$$peering" = "$$expected" ]
+        }
+
+        peering_matches() {
+          api=$$1
+          expected_id=$$2
+          expected_transport=$$3
+          tab=$$(printf '\t')
+          expected=$$(printf '%s\n%s' "$$expected_id" "$$tab$$expected_transport")
+          peering=$$(ipfs --api "$$api" swarm peering ls 2>/dev/null) || return 1
+          peering=$$(printf '%s\n' "$$peering" | sed '/^[[:space:]]*$$/d') || return 1
+          [ "$$peering" = "$$expected" ]
+        }
+
+        sole_peer() {
+          api=$$1
+          expected_id=$$2
+          peers=$$(ipfs --api "$$api" swarm peers 2>/dev/null) || return 1
+          peers=$$(printf '%s\n' "$$peers" | sed '/^[[:space:]]*$$/d') || return 1
+          [ -n "$$peers" ] || return 1
+          peer_count=$$(printf '%s\n' "$$peers" | wc -l | tr -d '[:space:]') || return 1
+          [ "$$peer_count" -eq 1 ] || return 1
+          line=$$(printf '%s\n' "$$peers" | sed -n '1p') || return 1
+          case "$$line" in
+            */p2p/"$$expected_id") return 0 ;;
+            *) return 1 ;;
+          esac
+        }
+
+        attempt=1
+        while [ "$$attempt" -le 60 ]; do
+          kubo_a_id=$$(ipfs --api /dns4/kubo-a/tcp/5001 id -f '<id>' 2>/dev/null) || kubo_a_id=
+          kubo_b_id=$$(ipfs --api /dns4/kubo-b/tcp/5001 id -f '<id>' 2>/dev/null) || kubo_b_id=
+          if [ -n "$$kubo_a_id" ] && [ -n "$$kubo_b_id" ]; then
+            if ensure_peering /dns4/kubo-a/tcp/5001 "/dns4/kubo-b/tcp/4001/p2p/$$kubo_b_id" "$$kubo_b_id" "/dns4/kubo-b/tcp/4001" && \
+              ensure_peering /dns4/kubo-b/tcp/5001 "/dns4/kubo-a/tcp/4001/p2p/$$kubo_a_id" "$$kubo_a_id" "/dns4/kubo-a/tcp/4001"; then
+              ipfs --api /dns4/kubo-a/tcp/5001 swarm connect "/dns4/kubo-b/tcp/4001/p2p/$$kubo_b_id" >/dev/null 2>&1 || :
+              ipfs --api /dns4/kubo-b/tcp/5001 swarm connect "/dns4/kubo-a/tcp/4001/p2p/$$kubo_a_id" >/dev/null 2>&1 || :
+              if peering_matches /dns4/kubo-a/tcp/5001 "$$kubo_b_id" "/dns4/kubo-b/tcp/4001" && \
+                peering_matches /dns4/kubo-b/tcp/5001 "$$kubo_a_id" "/dns4/kubo-a/tcp/4001"; then
+                if sole_peer /dns4/kubo-a/tcp/5001 "$$kubo_b_id" && \
+                  sole_peer /dns4/kubo-b/tcp/5001 "$$kubo_a_id"; then
+                  exit 0
+                fi
+              fi
+            fi
+          fi
+          attempt=$$((attempt + 1))
+          sleep 1
+        done
+        fail
+    depends_on:
+      kubo-a:
+        condition: service_healthy
+      kubo-b:
+        condition: service_healthy
+    restart: "no"
 
   cluster-a:
     image: ipfs/ipfs-cluster:v1.1.6@sha256:a83266c524f1c0bc81d14fe3c8b46c5b83a7b2d8432fb8a50300f27d3c863dcd
@@ -72,6 +164,8 @@ services:
     depends_on:
       kubo-a:
         condition: service_healthy
+      swarm-bootstrap:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "ipfs-cluster-ctl", "id"]
       interval: 5s
@@ -98,6 +192,8 @@ services:
     depends_on:
       kubo-b:
         condition: service_healthy
+      swarm-bootstrap:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "ipfs-cluster-ctl", "id"]
       interval: 5s
@@ -159,3 +255,7 @@ configs:
       CREATE ROLE ipfs3 LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE;
       SELECT format('ALTER ROLE ipfs3 PASSWORD %L', :'app_password') \gexec
       CREATE DATABASE ipfs3 OWNER ipfs3;
+
+secrets:
+  swarm_key:
+    file: "${IPFS_S3_SWARM_KEY_FILE:?IPFS_S3_SWARM_KEY_FILE is required}"

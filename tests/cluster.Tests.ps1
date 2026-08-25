@@ -4,6 +4,7 @@ Set-StrictMode -Version Latest
 $RepoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 $ComposePath = Join-Path $RepoRoot "docker-compose.cluster.yml"
 $KuboDockerfilePath = Join-Path $RepoRoot "ipfs/cluster.Dockerfile"
+$PrivateSwarmEntrypointPath = Join-Path $RepoRoot "ipfs/private-swarm-entrypoint.sh"
 $OverridePath = Join-Path $RepoRoot "tests/compose.cluster-validation.yml"
 $RustPath = Join-Path $RepoRoot "tests/cluster.rs"
 $RustSupportPath = Join-Path $RepoRoot "tests/support/cluster.rs"
@@ -98,6 +99,10 @@ function Protect-ClusterDiagnosticLine {
     param([AllowEmptyString()][string]$Line)
 
     $safe = $Line
+    $safe = [regex]::Replace($safe, '(Swarm key fingerprint: )[0-9a-f]{32}(?=\s*$)', '$1[redacted]')
+    $safe = [regex]::Replace($safe, '(?m)^/key/swarm/psk/1\.0\.0/\s*$', '[REDACTED_SWARM_KEY_HEADER]')
+    $safe = [regex]::Replace($safe, '(?m)^/base16/\s*$', '[REDACTED_SWARM_KEY_HEADER]')
+    $safe = [regex]::Replace($safe, '(?<![0-9A-Fa-f])[0-9A-Fa-f]{64}(?![0-9A-Fa-f])', '[REDACTED_HEX]')
     $safe = [regex]::Replace(
         $safe,
         '(?i)((?:"?)(?:PeerID|peer_id|peer-id)(?:"?)\s*[:=]\s*)(?:"[^"]*"|''[^'']*''|[^\s,;]+)',
@@ -293,15 +298,16 @@ if (-not [IO.File]::Exists($ComposePath)) {
 
 $Compose = Read-NormalizedText $ComposePath
 $KuboDockerfile = Read-NormalizedText $KuboDockerfilePath
+$PrivateSwarmEntrypoint = Read-NormalizedText $PrivateSwarmEntrypointPath
 $Override = Read-NormalizedText $OverridePath
 
 $ExpectedKuboDockerfile = @'
 FROM ipfs/kubo:v0.43.0
 
-COPY entrypoint.sh /custom-entrypoint.sh
-RUN chmod +x /custom-entrypoint.sh
+COPY private-swarm-entrypoint.sh /private-swarm-entrypoint.sh
+RUN chmod 0755 /private-swarm-entrypoint.sh
 
-ENTRYPOINT ["/custom-entrypoint.sh"]
+ENTRYPOINT ["/private-swarm-entrypoint.sh"]
 '@
 $ExpectedKuboDockerfile = $ExpectedKuboDockerfile.Replace("`r`n", "`n").TrimEnd("`n")
 Assert-True ($KuboDockerfile.TrimEnd("`n") -ceq $ExpectedKuboDockerfile) "Cluster Kubo Dockerfile changed"
@@ -313,7 +319,7 @@ Assert-NotMatches $Compose '(?m)^\s*[A-Za-z0-9_-]+:\s*&' "Cluster Compose must n
 
 $services = Get-YamlBlock $Compose "services" 0
 $serviceNames = @([regex]::Matches($services, '(?m)^  ([A-Za-z0-9_-]+):\s*$') | ForEach-Object { $_.Groups[1].Value })
-$expectedServices = @("postgres", "kubo-a", "kubo-b", "cluster-a", "cluster-b", "gateway")
+$expectedServices = @("postgres", "kubo-a", "kubo-b", "swarm-bootstrap", "cluster-a", "cluster-b", "gateway")
 Assert-ExactSet $serviceNames $expectedServices "Cluster service set changed"
 
 $volumes = Get-YamlBlock $Compose "volumes" 0
@@ -324,6 +330,7 @@ Assert-ExactSet $volumeNames $expectedVolumes "Cluster volume set changed"
 $postgres = Get-YamlBlock $services "postgres" 2
 $kuboA = Get-YamlBlock $services "kubo-a" 2
 $kuboB = Get-YamlBlock $services "kubo-b" 2
+$swarmBootstrap = Get-YamlBlock $services "swarm-bootstrap" 2
 $clusterA = Get-YamlBlock $services "cluster-a" 2
 $clusterB = Get-YamlBlock $services "cluster-b" 2
 $gateway = Get-YamlBlock $services "gateway" 2
@@ -379,6 +386,232 @@ foreach ($kubo in @($kuboA, $kuboB)) {
 }
 Assert-Contains $kuboA "      - kubo_a_data:/data/ipfs" "Kubo A volume changed"
 Assert-Contains $kuboB "      - kubo_b_data:/data/ipfs" "Kubo B volume changed"
+
+$swarmSecrets = Get-YamlBlock $Compose "secrets" 0
+$swarmKey = Get-YamlBlock $swarmSecrets "swarm_key" 2
+Assert-True ($swarmKey.Trim() -ceq 'file: "${IPFS_S3_SWARM_KEY_FILE:?IPFS_S3_SWARM_KEY_FILE is required}"') "Private swarm key secret contract changed"
+Assert-True (([regex]::Matches($swarmSecrets, '(?m)^  swarm_key:\s*$')).Count -eq 1) "Production Compose must define exactly one swarm_key secret"
+
+foreach ($kubo in @($kuboA, $kuboB)) {
+    $kuboEnvironment = Get-YamlBlock $kubo "environment" 4
+    $kuboSecrets = Get-YamlBlock $kubo "secrets" 4
+    Assert-True (([regex]::Matches($kuboEnvironment, '(?m)^      IPFS_SWARM_KEY_FILE: /run/secrets/swarm_key\s*$')).Count -eq 1) "Kubo must expose the approved private swarm key-path variable"
+    Assert-NotContains $kuboEnvironment "IPFS_S3_SWARM_KEY_FILE" "Kubo environment must not expose the host secret-file interpolation variable"
+    Assert-True (([regex]::Matches($kuboEnvironment, '(?m)^      LIBP2P_FORCE_PNET: "1"\s*$')).Count -eq 1) "Kubo must force private networking"
+    Assert-True ($kuboSecrets.Trim() -ceq "- source: swarm_key`n        target: swarm_key") "Kubo long secret target must be the secret name"
+}
+Assert-True (([regex]::Matches($PrivateSwarmEntrypoint, '(?m)^        ipfs config Swarm\.AddrFilters --json ''\[\]'' >/dev/null 2>&1 &&\s*$')).Count -eq 1) "Private swarm entrypoint must clear AddrFilters exactly once"
+
+foreach ($fragment in @(
+    "    image: ipfs/kubo:v0.43.0",
+    "      kubo-a:",
+    "        condition: service_healthy",
+    "      kubo-b:",
+    "        condition: service_healthy",
+    '    restart: "no"',
+    "private swarm bootstrap failed",
+    "ipfs --api /dns4/kubo-a/tcp/5001 id -f '<id>'",
+    "ipfs --api /dns4/kubo-b/tcp/5001 id -f '<id>'",
+    'swarm peering add "$$address"',
+    'swarm connect "/dns4/kubo-b/tcp/4001/p2p/$$kubo_b_id"',
+    'swarm connect "/dns4/kubo-a/tcp/4001/p2p/$$kubo_a_id"',
+    "swarm peering ls",
+    "swarm peers 2>/dev/null",
+    'while [ "$$attempt" -le 60 ]',
+    "sleep 1"
+)) {
+    Assert-Contains $swarmBootstrap $fragment "Private swarm bootstrap contract is missing: $fragment"
+}
+Assert-Contains $swarmBootstrap "      - /bin/sh" "Private swarm bootstrap must use POSIX sh"
+Assert-Contains $swarmBootstrap "      - -ec" "Private swarm bootstrap must fail closed"
+Assert-NotMatches $swarmBootstrap '(?m)^    (?:ports|volumes):\s*$' "Private swarm bootstrap must not publish ports or persist data"
+Assert-Contains $swarmBootstrap 'ensure_peering() {' "Bootstrap must isolate idempotent peering setup"
+Assert-Contains $swarmBootstrap 'peering=$$(ipfs --api "$$api" swarm peering ls 2>/dev/null) || return 1' "Bootstrap must capture existing peering before deciding whether to add"
+Assert-Contains $swarmBootstrap 'peering=$$(printf ''%s\n'' "$$peering" | sed ''/^[[:space:]]*$$/d'') || return 1' "Bootstrap must discard only empty peering lines"
+Assert-Contains $swarmBootstrap 'peering_matches() {' "Bootstrap must separately verify exact peering after connection"
+Assert-Contains $swarmBootstrap '[ "$$peering" = "$$expected" ]' "Bootstrap must require exactly its two expected peering lines"
+Assert-Contains $swarmBootstrap "tab=`$`$(printf '\t')" "Private swarm bootstrap must construct its exact tab indentation without YAML tabs"
+Assert-Contains $swarmBootstrap 'expected=$$(printf ''%s\n%s'' "$$expected_id" "$$tab$$expected_transport")' "Peering output must be peer ID then one tab-indented transport address"
+Assert-InOrder $swarmBootstrap @(
+    "ensure_peering() {",
+    'peering=$$(ipfs --api "$$api" swarm peering ls 2>/dev/null) || return 1',
+    'if [ -z "$$peering" ]; then',
+    'ipfs --api "$$api" swarm peering add "$$address" >/dev/null 2>&1',
+    '[ "$$peering" = "$$expected" ]',
+    'ensure_peering /dns4/kubo-a/tcp/5001 "/dns4/kubo-b/tcp/4001/p2p/$$kubo_b_id" "$$kubo_b_id" "/dns4/kubo-b/tcp/4001"',
+    'ensure_peering /dns4/kubo-b/tcp/5001 "/dns4/kubo-a/tcp/4001/p2p/$$kubo_a_id" "$$kubo_a_id" "/dns4/kubo-a/tcp/4001"',
+    'swarm connect "/dns4/kubo-b/tcp/4001/p2p/$$kubo_b_id"'
+) "Bootstrap must verify existing peering before conditionally adding only a missing entry"
+Assert-Matches $swarmBootstrap '(?s)ensure_peering\(\).*?if \[ -z "\$\$peering" \]; then\s*ipfs --api "\$\$api" swarm peering add "\$\$address" >/dev/null 2>&1 \|\| return 1\s*return 0\s*fi\s*\[ "\$\$peering" = "\$\$expected" \]' "Existing peering must avoid duplicate add commands and require exact two-line output"
+Assert-Contains $swarmBootstrap 'sole_peer() {' "Bootstrap must isolate exact sole-peer verification"
+Assert-Contains $swarmBootstrap 'peers=$$(ipfs --api "$$api" swarm peers 2>/dev/null) || return 1' "Bootstrap must capture full peer multiaddrs"
+Assert-Contains $swarmBootstrap 'peers=$$(printf ''%s\n'' "$$peers" | sed ''/^[[:space:]]*$$/d'') || return 1' "Bootstrap must discard only empty peer lines"
+Assert-Contains $swarmBootstrap '[ -n "$$peers" ] || return 1' "Bootstrap must reject an empty peer set"
+Assert-Contains $swarmBootstrap 'peer_count=$$(printf ''%s\n'' "$$peers" | wc -l | tr -d ''[:space:]'') || return 1' "Bootstrap must count normalized peer lines"
+Assert-Contains $swarmBootstrap '[ "$$peer_count" -eq 1 ] || return 1' "Bootstrap must require exactly one nonempty peer line"
+Assert-Contains $swarmBootstrap 'line=$$(printf ''%s\n'' "$$peers" | sed -n ''1p'') || return 1' "Bootstrap must select its one peer multiaddr"
+Assert-Contains $swarmBootstrap 'case "$$line" in' "Bootstrap must match a full peer multiaddr"
+Assert-Contains $swarmBootstrap '*/p2p/"$$expected_id") return 0 ;;' "Bootstrap must accept only the expected peer ID at a multiaddr suffix"
+Assert-Contains $swarmBootstrap 'sole_peer /dns4/kubo-a/tcp/5001 "$$kubo_b_id"' "Bootstrap must verify Kubo A has only Kubo B"
+Assert-Contains $swarmBootstrap 'sole_peer /dns4/kubo-b/tcp/5001 "$$kubo_a_id"' "Bootstrap must verify Kubo B has only Kubo A"
+Assert-NotContains $swarmBootstrap "swarm peers -q" "Bootstrap must not use the unsupported swarm peers -q form"
+Assert-NotMatches $swarmBootstrap '\[ "\$\$peers_[ab]" = "\$\$kubo_[ab]_id" \]' "Bootstrap must not compare a peer transport line as a bare peer ID"
+Assert-NotMatches $swarmBootstrap '(?im)^\s*(?:echo|printf)\b(?![^\r\n]*private swarm bootstrap failed)' "Bootstrap must not emit CLI-derived data"
+
+foreach ($cluster in @($clusterA, $clusterB)) {
+    Assert-Contains $cluster "      swarm-bootstrap:`n        condition: service_completed_successfully" "Cluster must wait for successful private swarm bootstrap"
+}
+
+foreach ($fragment in @(
+    "#!/bin/sh",
+    "private swarm startup rejected",
+    '"${LIBP2P_FORCE_PNET-}" = "1"',
+    'case "${IPFS_SWARM_KEY_FILE-}" in',
+    '/run/secrets/*)',
+    'wc -c < "$swarm_key_path"',
+    'wc -l < "$swarm_key_path"',
+    '-eq 96',
+    '-eq 3',
+    'first_line" = "/key/swarm/psk/1.0.0/"',
+    'second_line" = "/base16/"',
+    '[!0123456789abcdef]',
+    '-eq 64',
+    'ipfs init --empty-repo --profile=server',
+    'ipfs config Addresses.API "/ip4/0.0.0.0/tcp/5001"',
+    'ipfs config Addresses.Gateway "/ip4/0.0.0.0/tcp/8080"',
+    'ipfs config Addresses.Swarm --json ''["/ip4/0.0.0.0/tcp/4001"]''',
+    'ipfs config Swarm.AddrFilters --json ''[]''',
+    "ipfs config Bootstrap --json '[]'",
+    'ipfs config Routing.Type none',
+    'ipfs config AutoConf.Enabled --json false',
+    'ipfs config Discovery.MDNS.Enabled --json false',
+    'ipfs config Gateway.NoDNSLink --json true',
+    'ipfs config Gateway.HTTPHeaders.Cache-Control --json ''["public, max-age=29030400, immutable"]''',
+    'ipfs config Datastore.BloomFilterSize --json 0',
+    'cp "$IPFS_SWARM_KEY_FILE" "$IPFS_PATH/swarm.key"',
+    'chmod 0400 "$IPFS_PATH/swarm.key"',
+    'ipfs daemon --migrate=true --enable-gc=false',
+    'mkfifo "$fifo_path"',
+    'redact_swarm_fingerprint < "$fifo_path" &',
+    'trap ''forward_term'' TERM',
+    'trap ''forward_int'' INT',
+    'trap ''forward_hup'' HUP',
+    'wait_interrupted=0',
+    'set +e',
+    'rm -f "$fifo_path"',
+    'basename "$0"'
+)) {
+    Assert-Contains $PrivateSwarmEntrypoint $fragment "Private swarm entrypoint contract is missing: $fragment"
+}
+foreach ($legacyTypedConfigCommand in @(
+    'ipfs config AutoConf.Enabled false',
+    'ipfs config Discovery.MDNS.Enabled false',
+    'ipfs config Gateway.HTTPHeaders.Cache-Control "public, max-age=29030400, immutable"',
+    'ipfs config Datastore.BloomFilterSize 0'
+)) {
+    Assert-NotContains $PrivateSwarmEntrypoint $legacyTypedConfigCommand "Private swarm entrypoint must use --json for the Kubo v0.43 typed setting: $legacyTypedConfigCommand"
+}
+Assert-True (([regex]::Matches($PrivateSwarmEntrypoint, '(?m)^        ipfs config AutoConf\.Enabled --json false >/dev/null 2>&1 &&\s*$')).Count -eq 1) "Private swarm entrypoint must apply AutoConf exactly once"
+Assert-Matches $PrivateSwarmEntrypoint '(?s)ipfs config Routing\.Type none >/dev/null 2>&1 &&\s*ipfs config AutoConf\.Enabled --json false >/dev/null 2>&1 &&\s*ipfs config Discovery\.MDNS\.Enabled --json false >/dev/null 2>&1 &&' "AutoConf must be fail-closed in the private swarm config chain between Routing and mDNS"
+Assert-True (([regex]::Matches($PrivateSwarmEntrypoint, '(?m)^        ipfs config Swarm\.AddrFilters --json ''\[\]'' >/dev/null 2>&1 &&\s*$')).Count -eq 1) "Private swarm entrypoint must clear AddrFilters exactly once"
+$addrFilterCommands = @([regex]::Matches($PrivateSwarmEntrypoint, '(?m)^\s*ipfs config Swarm\.AddrFilters[^\r\n]*$') | ForEach-Object { $_.Value.Trim() })
+Assert-ExactSet $addrFilterCommands @("ipfs config Swarm.AddrFilters --json '[]' >/dev/null 2>&1 &&") "AddrFilters must use only the exact empty JSON list command"
+Assert-Matches $PrivateSwarmEntrypoint '(?s)ipfs config Addresses\.Swarm --json ''\["/ip4/0\.0\.0\.0/tcp/4001"\]'' >/dev/null 2>&1 &&\s*ipfs config Swarm\.AddrFilters --json ''\[\]'' >/dev/null 2>&1 &&\s*ipfs config Bootstrap --json ''\[\]'' >/dev/null 2>&1 &&' "AddrFilters must be fail-closed in the private swarm config chain"
+Assert-NotMatches $PrivateSwarmEntrypoint '(?s)redact_swarm_fingerprint\(\).*?\bsed\b' "Fingerprint filter must not use buffered sed"
+Assert-InOrder $PrivateSwarmEntrypoint @(
+    "redact_swarm_fingerprint() {",
+    'while IFS= read -r log_line || [ -n "$log_line" ]; do',
+    'case "$log_line" in',
+    'fingerprint=${log_line#Swarm key fingerprint: }',
+    '[ "${#fingerprint}" -eq 32 ]',
+    'case "$fingerprint" in',
+    "Swarm key fingerprint: [redacted]",
+    'continue',
+    'printf ''%s\n'' "$log_line"',
+    'done'
+) "Fingerprint filter must process each line immediately and redact only the exact marker"
+Assert-Matches $PrivateSwarmEntrypoint '(?m)^\s*(?:\[0-9a-f\]){32}\)\s*$' "Fingerprint filter must validate exactly 32 lowercase hexadecimal characters"
+Assert-NotMatches $PrivateSwarmEntrypoint '(?i)(?:sha256|digest|mask|redact).*\*' "Entrypoint must not add a broad fingerprint or digest masker"
+Assert-NotContains $PrivateSwarmEntrypoint "kill -0" "Entrypoint must not use kill -0 as a wait retry criterion"
+Assert-NotContains $PrivateSwarmEntrypoint "exec ipfs daemon" "Entrypoint must retain PID 1 supervision instead of execing the daemon"
+Assert-NotContains $PrivateSwarmEntrypoint "IPFS_S3_SWARM_KEY_FILE" "Entrypoint must not read the host secret-file interpolation variable"
+Assert-Matches $PrivateSwarmEntrypoint '(?s)wait_interrupted=0\s*set \+e\s*wait "\$child_pid"\s*child_status=\$\?\s*if \[ "\$wait_interrupted" -eq 1 \] && \[ "\$child_status" -gt 128 \]; then\s*continue\s*fi' "Daemon wait must retry only a signal-interrupted wait with an over-128 status"
+Assert-Matches $PrivateSwarmEntrypoint '(?s)select_supervisor_exit\(\).*?if \[ "\$daemon_status" -ne 0 \]; then.*?return "\$daemon_status".*?if \[ "\$filter_status" -ne 0 \] \|\| \[ "\$fifo_cleanup_status" -ne 0 \]; then.*?return 1' "Daemon failure must take precedence and clean daemon exits must reject filter or FIFO failures"
+Assert-Matches $PrivateSwarmEntrypoint '(?s)wait_for_pid "\$daemon_pid".*?wait_for_pid "\$filter_pid".*?cleanup_fifo.*?select_supervisor_exit' "Entrypoint must reap both children, clean up the FIFO, then select its final status"
+Assert-InOrder $PrivateSwarmEntrypoint @(
+    'wait_for_pid "$daemon_pid"',
+    'daemon_status=$?',
+    'daemon_pid=',
+    'wait_for_pid "$filter_pid"',
+    'filter_status=$?',
+    'filter_pid=',
+    'cleanup_fifo',
+    'fifo_cleanup_status=$?',
+    'select_supervisor_exit "$daemon_status" "$filter_status" "$fifo_cleanup_status"'
+) "Supervisor must clear each reaped PID and include FIFO cleanup status in final selection"
+Assert-Matches $PrivateSwarmEntrypoint '(?s)cleanup_fifo\(\).*?rm -f "\$fifo_path".*?fifo_cleanup_status=\$\?.*?if \[ "\$fifo_cleanup_status" -eq 0 \]; then\s*fifo_path=.*?fi.*?return "\$fifo_cleanup_status"' "FIFO cleanup must retain a failed path and return its actual status"
+$cleanupRuntimeSource = (Get-BracedBlock -Text $PrivateSwarmEntrypoint -HeaderPattern '(?m)^cleanup_runtime\(\) \{' -Label 'runtime cleanup').Body
+Assert-InOrder $cleanupRuntimeSource @(
+    'trap - 0 TERM INT HUP',
+    'kill -TERM "$daemon_pid"',
+    'wait_for_pid "$daemon_pid"',
+    'daemon_pid=',
+    'wait_for_pid "$filter_pid"',
+    'filter_pid=',
+    'cleanup_fifo'
+) "EXIT cleanup must terminate and reap the daemon before reaping the FIFO filter and removing the FIFO"
+Assert-Matches $cleanupRuntimeSource '(?s)if \[ -n "\$filter_pid" \]; then\s*wait_for_pid "\$filter_pid"' "EXIT cleanup must reap the FIFO filter only after daemon closure can deliver FIFO EOF"
+Assert-NotMatches $cleanupRuntimeSource 'kill\s+-[A-Z]+\s+"\$filter_pid"' "EXIT cleanup must not signal the FIFO filter"
+foreach ($signalHandler in @(
+    [pscustomobject]@{ Name = 'forward_term'; Signal = 'TERM' },
+    [pscustomobject]@{ Name = 'forward_int'; Signal = 'INT' },
+    [pscustomobject]@{ Name = 'forward_hup'; Signal = 'HUP' }
+)) {
+    $handlerSource = (Get-BracedBlock -Text $PrivateSwarmEntrypoint -HeaderPattern ("(?m)^$($signalHandler.Name)\(\) \{") -Label $signalHandler.Name).Body
+    Assert-Matches $handlerSource ('(?s)wait_interrupted=1.*?kill -' + $signalHandler.Signal + ' "\$daemon_pid"') "$($signalHandler.Name) must mark an interrupted wait before forwarding to Kubo"
+    Assert-NotMatches $handlerSource 'kill\s+-[A-Z]+\s+"\$filter_pid"' "$($signalHandler.Name) must never signal the FIFO filter"
+}
+Assert-Contains $PrivateSwarmEntrypoint "trap 'cleanup_runtime' 0" "Entrypoint must install full abnormal runtime cleanup"
+Assert-InOrder $PrivateSwarmEntrypoint @(
+    'export IPFS_PATH',
+    'umask 077',
+    'rm -f "$IPFS_PATH/swarm.key"',
+    'cp "$IPFS_SWARM_KEY_FILE" "$IPFS_PATH/swarm.key"',
+    'chmod 0400 "$IPFS_PATH/swarm.key"'
+) "Private swarm key installation must remove a persisted target before securely copying the secret"
+Assert-Matches $PrivateSwarmEntrypoint '(?s)supervise_daemon\s*runtime_status=\$\?.*?if \[ "\$daemon_started" -eq 0 \] && \[ "\$runtime_status" -ne 0 \]; then\s*private_swarm_failure' "Pre-daemon FIFO setup failure must emit the fixed startup rejection"
+Assert-Matches $PrivateSwarmEntrypoint '(?m)^if \[ "\$\(basename "\$0"\)" = "private-swarm-entrypoint\.sh" \]; then\s*$\r?\n^    main "\$@"\s*$\r?\n^fi\s*$' "Entrypoint main must run only when invoked under its entrypoint basename"
+
+$temporaryKeyPath = [IO.Path]::GetTempFileName()
+try {
+    $validPrivateSwarmKey = "/key/swarm/psk/1.0.0/`n/base16/`n" + ("a" * 64) + "`n"
+    [IO.File]::WriteAllText($temporaryKeyPath, $validPrivateSwarmKey, [Text.Encoding]::ASCII)
+    $shPath = (Get-Command sh -ErrorAction Stop).Source
+    & $shPath -c '. "$1"; validate_swarm_key "$2"' sh $PrivateSwarmEntrypointPath $temporaryKeyPath
+    Assert-True ($LASTEXITCODE -eq 0) "Source-only private swarm key fixture rejected the exact valid key"
+
+    $invalidPrivateSwarmKey = $validPrivateSwarmKey.Replace(("a" * 64), ("A" + ("a" * 63)))
+    [IO.File]::WriteAllText($temporaryKeyPath, $invalidPrivateSwarmKey, [Text.Encoding]::ASCII)
+    & $shPath -c '. "$1"; validate_swarm_key "$2"' sh $PrivateSwarmEntrypointPath $temporaryKeyPath
+    Assert-True ($LASTEXITCODE -ne 0) "Source-only private swarm key fixture accepted uppercase hex"
+
+    $sourceOnlyCid = 'Qm' + ('c' * 44)
+    $filteredLines = @(& $shPath -c '. "$1"; printf "%s\n" "Swarm key fingerprint: 0123456789abcdef0123456789abcdef" "ordinary 0123456789abcdef0123456789abcdef" "cid=$2" "Swarm key fingerprint: 0123456789abcdef0123456789abcdeF" | redact_swarm_fingerprint' sh $PrivateSwarmEntrypointPath $sourceOnlyCid)
+    Assert-True (($filteredLines -join "`n") -ceq "Swarm key fingerprint: [redacted]`nordinary 0123456789abcdef0123456789abcdef`ncid=$sourceOnlyCid`nSwarm key fingerprint: 0123456789abcdef0123456789abcdeF") "Source-only fingerprint fixture must redact only the exact prefix while preserving ordinary 32-hex and content CIDs"
+
+    foreach ($selection in @(
+        [pscustomobject]@{ Daemon = 37; Filter = 0; Fifo = 0; Expected = 37 },
+        [pscustomobject]@{ Daemon = 43; Filter = 0; Fifo = 0; Expected = 43 },
+        [pscustomobject]@{ Daemon = 143; Filter = 0; Fifo = 0; Expected = 143 },
+        [pscustomobject]@{ Daemon = 0; Filter = 1; Fifo = 0; Expected = 1 },
+        [pscustomobject]@{ Daemon = 0; Filter = 0; Fifo = 1; Expected = 1 }
+    )) {
+        & $shPath -c '. "$1"; select_supervisor_exit "$2" "$3" "$4"' sh $PrivateSwarmEntrypointPath $selection.Daemon $selection.Filter $selection.Fifo
+        Assert-True ($LASTEXITCODE -eq $selection.Expected) "Source-only supervisor selection returned an incorrect status"
+    }
+} finally {
+    Remove-Item -LiteralPath $temporaryKeyPath -Force -ErrorAction SilentlyContinue
+}
 
 $clusterImage = "    image: ipfs/ipfs-cluster:v1.1.6@sha256:a83266c524f1c0bc81d14fe3c8b46c5b83a7b2d8432fb8a50300f27d3c863dcd"
 foreach ($cluster in @($clusterA, $clusterB)) {
@@ -493,13 +726,14 @@ foreach ($required in @(
     "IPFS_S3_MASTER_KEY",
     "IPFS_S3_CLUSTER_SECRET",
     "IPFS_S3_GATEWAY_BIND",
-    "IPFS_S3_GATEWAY_PORT"
+    "IPFS_S3_GATEWAY_PORT",
+    "IPFS_S3_SWARM_KEY_FILE"
 )) {
     Assert-Contains $Compose ('${' + $required + ':?') "Required interpolation missing: $required"
     Assert-NotContains $Compose ('${' + $required + ':-') "Required interpolation gained a default: $required"
     Assert-NotContains $Compose ('${' + $required + '-default') "Required interpolation gained an alternate default: $required"
 }
-Assert-NotMatches $Compose '(?i)\$\{(?:POSTGRES_PASSWORD|IPFS_S3_ACCESS_KEY_ID|IPFS_S3_SECRET_ACCESS_KEY|IPFS_S3_MASTER_KEY|IPFS_S3_CLUSTER_SECRET|IPFS_S3_GATEWAY_BIND|IPFS_S3_GATEWAY_PORT)(?::-[^}]*)?\}' "Production secrets must not have development fallbacks"
+Assert-NotMatches $Compose '(?i)\$\{(?:POSTGRES_PASSWORD|IPFS_S3_ACCESS_KEY_ID|IPFS_S3_SECRET_ACCESS_KEY|IPFS_S3_MASTER_KEY|IPFS_S3_CLUSTER_SECRET|IPFS_S3_GATEWAY_BIND|IPFS_S3_GATEWAY_PORT|IPFS_S3_SWARM_KEY_FILE)(?::-[^}]*)?\}' "Production secrets must not have development fallbacks"
 foreach ($forbidden in @(
     "container_name:",
     "cloudflared",
@@ -515,19 +749,20 @@ foreach ($forbidden in @(
     "identity.json",
     "peerstore",
     "service.json",
-    "private swarm",
     "remote"
 )) {
     Assert-NotContains $Compose $forbidden "Forbidden Cluster production fragment: $forbidden"
 }
 
 $validationServices = Get-YamlBlock $Override "services" 0
-$validationServiceNames = @([regex]::Matches($validationServices, '(?m)^  ([A-Za-z0-9_-]+):\s*$') | ForEach-Object { $_.Groups[1].Value })
-Assert-ExactSet $validationServiceNames $expectedServices "Validation override service set changed"
+$validationServiceNames = @([regex]::Matches($validationServices, '(?m)^  ([A-Za-z0-9_-]+):(?:\s*\{\})?\s*$') | ForEach-Object { $_.Groups[1].Value })
+$expectedValidationServices = @($expectedServices + "kubo-c")
+Assert-ExactSet $validationServiceNames $expectedValidationServices "Validation override service set changed"
 $expectedMappings = @(
     "127.0.0.1:55435:5432",
     "127.0.0.1:55100:5001",
     "127.0.0.1:55101:5001",
+    "127.0.0.1:55102:5001",
     "127.0.0.1:59101:9094",
     "127.0.0.1:59103:9095",
     "127.0.0.1:59102:9094",
@@ -542,6 +777,7 @@ $expectedMappingsByService = [ordered]@{
     "postgres" = @("127.0.0.1:55435:5432")
     "kubo-a" = @("127.0.0.1:55100:5001")
     "kubo-b" = @("127.0.0.1:55101:5001")
+    "kubo-c" = @("127.0.0.1:55102:5001")
     "cluster-a" = @("127.0.0.1:59101:9094", "127.0.0.1:59103:9095")
     "cluster-b" = @("127.0.0.1:59102:9094")
     "gateway" = @("127.0.0.1:59100:9000")
@@ -555,6 +791,25 @@ foreach ($serviceName in $expectedMappingsByService.Keys) {
 Assert-NotContains $Override "0.0.0.0" "Validation ports must be loopback-only"
 Assert-NotMatches $Override '(?m)^volumes:\s*$' "Validation override must not declare volumes"
 Assert-NotContains (Get-YamlBlock $validationServices "cluster-b" 2) ":9095" "Validation must not expose Cluster B proxy"
+$wrongSwarmKey = Get-YamlBlock $Override "swarm_key_wrong" 2
+Assert-True ($wrongSwarmKey.Trim() -ceq 'file: "${IPFS_S3_SWARM_KEY_WRONG_FILE:?IPFS_S3_SWARM_KEY_WRONG_FILE is required}"') "Validation wrong swarm key secret contract changed"
+$kuboC = Get-YamlBlock $validationServices "kubo-c" 2
+foreach ($fragment in @(
+    '    profiles: ["private-swarm-validation"]',
+    "    image: ghcr.io/hugefiver/ipfs3-kubo-cluster:v0.43.0",
+    "      - /data/ipfs",
+    "      IPFS_PATH: /data/ipfs",
+    "      IPFS_SWARM_KEY_FILE: /run/secrets/swarm_key_wrong",
+    '      LIBP2P_FORCE_PNET: "1"',
+    '      test: ["CMD", "ipfs", "id"]',
+    "    restart: unless-stopped"
+)) {
+    Assert-Contains $kuboC $fragment "Validation Kubo C contract is missing: $fragment"
+}
+$kuboCSecrets = Get-YamlBlock $kuboC "secrets" 4
+Assert-NotContains (Get-YamlBlock $kuboC "environment" 4) "IPFS_S3_SWARM_KEY_FILE" "Validation Kubo C must not expose the host secret-file interpolation variable"
+Assert-True ($kuboCSecrets.Trim() -ceq "- source: swarm_key_wrong`n        target: swarm_key_wrong") "Validation Kubo C long secret target must be the wrong secret name"
+Assert-NotMatches $kuboC '(?m)^    (?:build|volumes):\s*$' "Validation Kubo C must use the already-built image and a tmpfs repository"
 
 $AddSource = Read-NormalizedText (Join-Path $RepoRoot "src/kubo/add.rs")
 $PinSource = Read-NormalizedText (Join-Path $RepoRoot "src/kubo/pin.rs")
@@ -589,9 +844,11 @@ $RustSupport = Read-NormalizedText $RustSupportPath
 
 Assert-Matches $Rust '(?m)^#\[allow\(dead_code\)\]\s*$\r?\nmod support;$' "Cluster target must retain its private shared support module"
 Assert-Matches $Rust '(?m)^#\[path = "support/cluster\.rs"\]\s*$\r?\nmod cluster_support;$' "Cluster target must load the split Cluster support module"
-Assert-True (([regex]::Matches($Rust, '(?m)^#\[tokio::test\]\s*$')).Count -eq 5) "Cluster target must define exactly five Tokio tests"
+Assert-True (([regex]::Matches($Rust, '(?m)^#\[tokio::test\]\s*$')).Count -eq 7) "Cluster target must define exactly seven Tokio tests"
 
 foreach ($testName in @(
+    "private_swarm_configuration_and_peering",
+    "private_swarm_wrong_key_rejected",
     "cluster_topology_converges",
     "cluster_proxy_compatibility",
     "cluster_replication_and_retention",
@@ -601,6 +858,8 @@ foreach ($testName in @(
     Assert-True (([regex]::Matches($Rust, "(?m)^async fn $testName\(\) \{")).Count -eq 1) "Expected one live test named $testName"
 }
 Assert-InOrder $Rust @(
+    "async fn private_swarm_configuration_and_peering()",
+    "async fn private_swarm_wrong_key_rejected()",
     "async fn cluster_topology_converges()",
     "async fn cluster_proxy_compatibility()",
     "async fn cluster_replication_and_retention()",
@@ -614,6 +873,7 @@ foreach ($environmentName in @(
     "IPFS_S3_CLUSTER_A_PROXY_URL",
     "IPFS_S3_CLUSTER_KUBO_A_URL",
     "IPFS_S3_CLUSTER_KUBO_B_URL",
+    "IPFS_S3_CLUSTER_KUBO_C_URL",
     "IPFS_S3_CLUSTER_STATE_PATH"
 )) {
     Assert-Contains $Rust $environmentName "Cluster live environment contract is missing: $environmentName"
@@ -641,6 +901,23 @@ foreach ($requiredSupportFragment in @(
     "pub async fn wait_for_two_pinned",
     "pub async fn wait_until_not_fully_pinned",
     "pub async fn kubo_cat",
+    "pub struct KuboApiClient",
+    "pub fn new(endpoint: &str) -> Result<Self>",
+    "pub async fn config_probe",
+    "pub async fn identity_probe",
+    "pub async fn swarm_peers_probe",
+    "pub async fn peering_probe",
+    "pub async fn connect_probe",
+    "pub struct KuboConfig",
+    "pub struct KuboIdentity",
+    "pub struct KuboSwarmPeers",
+    "pub struct KuboPeeringPeers",
+    "pub enum ConnectObservation",
+    "pub struct PrivateSwarmEvidence",
+    "pub async fn wait_for_private_swarm",
+    "pub async fn prove_wrong_key_rejection",
+    "fn validate_private_kubo_config",
+    "fn validate_private_peering",
     "pub struct RecoveryState",
     "pub fn write_claimed",
     "pub fn read",
@@ -678,7 +955,7 @@ Assert-Matches $RustSupport 'byte\.is_ascii_alphanumeric\(\) \|\| byte == b''-''
 Assert-NotContains $RustSupport 'peer.version != "1.1.6"' "Cluster version must not require byte-exact bare output"
 Assert-NotMatches $RustSupport '(?i)peer_ids' "Recovery state must never serialize peer identities"
 Assert-NotMatches $RustSupport 'OpenOptions::new\(\)[\s\S]*?\.create\(' "Recovery state must not create its receipt"
-Assert-True (([regex]::Matches($RustSupport, '(?m)^#\[test\]\s*$')).Count -eq 1) "Cluster support must define exactly one deterministic plain unit test"
+Assert-True (([regex]::Matches($RustSupport, '(?m)^#\[test\]\s*$')).Count -eq 4) "Cluster support must define exactly four deterministic plain unit tests"
 $versionTest = Get-BracedBlock $RustSupport '(?m)^fn release_version_validator_accepts_exact_release_and_build_metadata\(\) \{' 'release version validator test'
 foreach ($acceptedVersion in @(
     "1.1.6",
@@ -705,6 +982,128 @@ foreach ($rejectedVersion in @(
 Assert-Matches $versionTest.Body '(?m)^\s*assert!\(is_release_1_1_6_version\(version\)\);\s*$' "Release version validator must assert accepted fixtures"
 Assert-Matches $versionTest.Body '(?m)^\s*assert!\(!is_release_1_1_6_version\(version\)\);\s*$' "Release version validator must assert rejected fixtures"
 
+$privateKuboConfigTest = Get-BracedBlock $RustSupport '(?m)^fn private_kubo_config_contract_rejects_open_discovery\(\) \{' 'private Kubo configuration unit test'
+foreach ($fixture in @(
+    '"Bootstrap": []',
+    '"Type": "none"',
+    '"Enabled": false',
+    '"/ip4/0.0.0.0/tcp/4001"',
+    '"Bootstrap": ["bootstrap"]',
+    '"Type": "dht"',
+    '"Enabled": true',
+    '"/ip6/::/tcp/4001"'
+)) {
+    Assert-Contains $privateKuboConfigTest.Body $fixture "Private Kubo configuration fixture is missing: $fixture"
+}
+Assert-Contains $privateKuboConfigTest.Body "private_kubo_config_contract_invalid" "Private Kubo configuration must use a fixed terminal category"
+foreach ($dtoDefaultContract in @(
+    [pscustomobject]@{ Header = '(?m)^pub struct KuboConfig \{'; Label = 'KuboConfig'; Attribute = 'Bootstrap'; Field = 'bootstrap'; Type = 'String' },
+    [pscustomobject]@{ Header = '(?m)^struct KuboAddresses \{'; Label = 'KuboAddresses'; Attribute = 'Swarm'; Field = 'swarm'; Type = 'String' },
+    [pscustomobject]@{ Header = '(?m)^pub struct KuboPeeringPeers \{'; Label = 'KuboPeeringPeers'; Attribute = 'Peers'; Field = 'peers'; Type = 'KuboPeeringPeer' },
+    [pscustomobject]@{ Header = '(?m)^struct KuboPeeringPeer \{'; Label = 'KuboPeeringPeer'; Attribute = 'Addrs'; Field = 'addrs'; Type = 'String' }
+)) {
+    $dtoBlock = Get-BracedBlock $RustSupport $dtoDefaultContract.Header $dtoDefaultContract.Label
+    $attributePattern = '(?m)^\s*#\[serde\(rename = "' + $dtoDefaultContract.Attribute + '", default\)\]\s*$\r?\n^\s*' + $dtoDefaultContract.Field + ': Vec<' + $dtoDefaultContract.Type + '>,'
+    Assert-Matches $dtoBlock.Body $attributePattern "$($dtoDefaultContract.Label).$($dtoDefaultContract.Field) must default only when the field is absent"
+}
+foreach ($fixture in @("missing_bootstrap", "missing_swarm")) {
+    Assert-Contains $privateKuboConfigTest.Body $fixture "Private Kubo configuration missing-field fixture is missing: $fixture"
+}
+$kuboConfigDto = Get-BracedBlock $RustSupport '(?m)^pub struct KuboConfig \{' 'KuboConfig DTO'
+Assert-Matches $kuboConfigDto.Body '(?m)^\s*#\[serde\(rename = "AutoConf"\)\]\s*$\r?\n^\s*auto_conf: KuboAutoConf,' "KuboConfig must require the exact-cased AutoConf DTO"
+$kuboAutoConfDto = Get-BracedBlock $RustSupport '(?m)^struct KuboAutoConf \{' 'KuboAutoConf DTO'
+Assert-Matches $kuboAutoConfDto.Body '(?m)^\s*#\[serde\(rename = "Enabled"\)\]\s*$\r?\n^\s*enabled: bool,' "KuboAutoConf must require the exact-cased Enabled boolean"
+Assert-NotMatches $kuboAutoConfDto.Body '#\[serde\([^\]]*default' "KuboAutoConf must not default a missing runtime blocker"
+Assert-Contains $RustSupport "!config.auto_conf.enabled" "Private Kubo validation must reject enabled AutoConf"
+Assert-InOrder $RustSupport @(
+    "validate_private_kubo_config(&a_config)?;",
+    "let Some(evidence) = private_swarm_identities"
+) "Private Kubo configuration must be validated before peer topology"
+foreach ($fixture in @("auto_conf_enabled", "missing_auto_conf", "missing_auto_conf_enabled")) {
+    Assert-Contains $privateKuboConfigTest.Body $fixture "AutoConf fixture is missing: $fixture"
+}
+Assert-Contains $privateKuboConfigTest.Body '"AutoConf": { "Enabled": false }' "Closed Kubo fixture must disable AutoConf"
+Assert-Contains $privateKuboConfigTest.Body '"AutoConf": { "Enabled": true }' "Enabled AutoConf fixture is missing"
+Assert-Matches $privateKuboConfigTest.Body 'missing_auto_conf[\s\S]*?is_err\(\)' "Missing AutoConf must fail deserialization"
+Assert-Matches $privateKuboConfigTest.Body 'missing_auto_conf_enabled[\s\S]*?is_err\(\)' "Missing AutoConf.Enabled must fail deserialization"
+Assert-Matches $kuboConfigDto.Body '(?m)^\s*#\[serde\(rename = "Swarm"\)\]\s*$\r?\n^\s*swarm: KuboSwarmConfig,' "KuboConfig must require the exact-cased Swarm configuration DTO"
+$kuboSwarmConfigDto = Get-BracedBlock $RustSupport '(?m)^struct KuboSwarmConfig \{' 'KuboSwarmConfig DTO'
+Assert-Matches $kuboSwarmConfigDto.Body '(?m)^\s*#\[serde\(rename = "AddrFilters"\)\]\s*$\r?\n^\s*addr_filters: Vec<String>,' "KuboSwarmConfig must require the exact-cased AddrFilters list"
+Assert-NotMatches $kuboSwarmConfigDto.Body '#\[serde\([^\]]*default' "KuboSwarmConfig must not default missing AddrFilters"
+Assert-Contains $RustSupport "config.swarm.addr_filters.is_empty()" "Private Kubo validation must reject nonempty Swarm AddrFilters"
+foreach ($fixture in @("addr_filters_open", "missing_swarm_config", "missing_addr_filters")) {
+    Assert-Contains $privateKuboConfigTest.Body $fixture "Swarm AddrFilters fixture is missing: $fixture"
+}
+Assert-Contains $privateKuboConfigTest.Body '"Swarm": { "AddrFilters": [] }' "Closed Kubo fixture must clear Swarm AddrFilters"
+Assert-Contains $privateKuboConfigTest.Body '"/ip4/172.16.0.0/ipcidr/12"' "Nonempty Swarm AddrFilters fixture is missing"
+Assert-Matches $privateKuboConfigTest.Body 'missing_swarm_config[\s\S]*?is_err\(\)' "Missing Swarm must fail deserialization"
+Assert-Matches $privateKuboConfigTest.Body 'missing_addr_filters[\s\S]*?is_err\(\)' "Missing Swarm.AddrFilters must fail deserialization"
+
+$privatePeeringTest = Get-BracedBlock $RustSupport '(?m)^fn private_peering_json_contract_matches_kubo_v0_43_addrinfo\(\) \{' 'private peering JSON unit test'
+foreach ($fixture in @(
+    '"Peers"',
+    '"ID"',
+    '"Addrs"',
+    'extra-peer',
+    'extra-address',
+    'wrong-id',
+    'wrong-address',
+    'private_kubo_peering_contract_invalid'
+)) {
+    Assert-Contains $privatePeeringTest.Body $fixture "Private Kubo peering fixture is missing: $fixture"
+}
+Assert-NotContains $privatePeeringTest.Body "/p2p/" "Peering AddrInfo fixtures must not include a peer suffix"
+foreach ($fixture in @(
+    "empty_swarm_peers",
+    "missing_swarm_peers",
+    "empty_peering_peers",
+    "missing_peering_peers",
+    "missing_addrs"
+)) {
+    Assert-Contains $privatePeeringTest.Body $fixture "Private Kubo peer missing-field fixture is missing: $fixture"
+}
+$kuboSwarmPeersDto = Get-BracedBlock $RustSupport '(?m)^pub struct KuboSwarmPeers \{' 'KuboSwarmPeers DTO'
+Assert-Matches $kuboSwarmPeersDto.Body '(?ms)^\s*#\[serde\(\s*rename = "Peers",\s*default,\s*deserialize_with = "deserialize_null_vec_as_empty"\s*\)\]\s*^\s*peers: Vec<KuboSwarmPeer>,' "Kubo swarm peers must map only null Peers to an empty list"
+$kuboPeeringPeersDto = Get-BracedBlock $RustSupport '(?m)^pub struct KuboPeeringPeers \{' 'KuboPeeringPeers DTO'
+Assert-Matches $kuboPeeringPeersDto.Body '(?m)^\s*#\[serde\(rename = "Peers", default\)\]\s*$\r?\n^\s*peers: Vec<KuboPeeringPeer>,' "Kubo peering peers must retain its ordinary missing-list behavior"
+Assert-NotContains $kuboPeeringPeersDto.Body "deserialize_with" "Kubo peering peers must not accept null"
+Assert-True (([regex]::Matches($RustSupport, '#\[serde\([^\]]*deserialize_with\s*=')).Count -eq 1) "Only Kubo swarm peers may use a custom null-list deserializer"
+Assert-Matches $RustSupport 'fn deserialize_null_vec_as_empty<''de, D, T>\(\s*deserializer: D,?\s*\) -> std::result::Result<Vec<T>, D::Error>' "Null-list deserializer signature changed"
+Assert-Matches $RustSupport 'Option::<Vec<T>>::deserialize\(deserializer\)\.map\(Option::unwrap_or_default\)' "Null-list deserializer must preserve arrays and default only null"
+$nullSwarmPeersTest = Get-BracedBlock $RustSupport '(?m)^fn kubo_swarm_peers_null_is_empty_without_ndjson\(\) \{' 'null swarm peers unit test'
+foreach ($fragment in @(
+    '"Peers": null',
+    '"Peers": [{ "Peer": "peer-a" }]',
+    '"Peers": {}',
+    'wrapped.peers.len() == 1',
+    'wrapped.peers[0].peer == "peer-a"',
+    'is_err()'
+)) {
+    Assert-Contains $nullSwarmPeersTest.Body $fragment "Null swarm peers fixture is missing: $fragment"
+}
+Assert-NotMatches $nullSwarmPeersTest.Body '(?i)(?:ndjson|\.lines\(\)|line splitting)' "Null swarm peers test must not use an NDJSON decoder"
+
+$kuboApiClientStart = $RustSupport.IndexOf("impl KuboApiClient {", [StringComparison]::Ordinal)
+$kuboApiClientEnd = $RustSupport.IndexOf("#[derive(Debug)]`nenum PeerView", [StringComparison]::Ordinal)
+Assert-True ($kuboApiClientStart -ge 0 -and $kuboApiClientEnd -gt $kuboApiClientStart) "Kubo API client implementation boundaries are missing"
+$kuboApiClientImpl = $RustSupport.Substring($kuboApiClientStart, $kuboApiClientEnd - $kuboApiClientStart)
+foreach ($path in @(
+    '"/api/v0/config/show"',
+    '"/api/v0/id"',
+    '"/api/v0/swarm/peers"',
+    '"/api/v0/swarm/peering/ls"',
+    '"/api/v0/swarm/connect"'
+)) {
+    Assert-Contains $kuboApiClientImpl $path "Kubo API client path is missing: $path"
+}
+Assert-Contains $kuboApiClientImpl ".post(" "Kubo API client must use POST"
+Assert-NotContains $kuboApiClientImpl ".get(" "Kubo API client must not use GET"
+Assert-Contains $kuboApiClientImpl 'query_pairs_mut().append_pair("arg"' "Kubo connect must encode its argument as a URL query pair"
+Assert-Matches $kuboApiClientImpl 'connect_timeout\(Duration::from_secs\(5\)\)[\s\S]*?timeout\(CALL_TIMEOUT\)' "Kubo API client must bound loopback connect and call time"
+Assert-NotMatches $kuboApiClientImpl '(?m)(?:anyhow!|ProbeError::(?:Transient|Terminal))\([^\r\n]*(?:\{|format!)' "Kubo API errors must use fixed categories only"
+Assert-NotMatches $RustSupport '(?m)^#\[derive\(Debug[^\r\n]*\)\]\s*$\r?\n^pub struct KuboIdentity' "Kubo identity DTO must not derive Debug"
+Assert-NotMatches $RustSupport '(?m)^#\[derive\([^\r\n]*Serialize[^\r\n]*\)\]\s*$\r?\n^pub struct KuboIdentity' "Kubo identity DTO must not derive Serialize"
+
 foreach ($requiredLiveImport in @(
     "use ipfs_s3_gateway::kubo::{",
     "KuboClient",
@@ -722,6 +1121,27 @@ Assert-Contains $Rust "IPFS_S3_CLUSTER_KUBO_A_URL" "Cluster A Kubo validation en
 Assert-Contains $Rust "IPFS_S3_CLUSTER_KUBO_B_URL" "Cluster B Kubo validation endpoint is missing"
 Assert-Contains $Rust 'println!("peers=2 version=1.1.6");' "Topology output must normalize the Cluster release version"
 Assert-Matches $Rust 'Err\(error\) => panic!\("\{category\}: \{error\}"\)' "Cluster probe failures may print only their static category display"
+
+foreach ($privateSwarmTestName in @("private_swarm_configuration_and_peering", "private_swarm_wrong_key_rejected")) {
+    $privateSwarmTest = Get-BracedBlock $Rust ("(?m)^async fn " + $privateSwarmTestName + "\(\) \{") $privateSwarmTestName
+    foreach ($forbiddenPrivateSwarmFragment in @(
+        "std::fs",
+        "std::process",
+        "Command::new",
+        "docker",
+        "state_path",
+        "RecoveryState",
+        "create_bucket",
+        "kubo_cat"
+    )) {
+        Assert-NotContains $privateSwarmTest.Body $forbiddenPrivateSwarmFragment "Private swarm live test must not use: $forbiddenPrivateSwarmFragment"
+    }
+    Assert-NotMatches $privateSwarmTest.Body '(?i)(?:panic!|assert!|println!|eprintln!)\([^\r\n]*(?:\{(?:id|peer|identity)|/p2p/)' "Private swarm live test must not emit identities or peer addresses"
+}
+$privateSwarmConfigurationTest = Get-BracedBlock $Rust '(?m)^async fn private_swarm_configuration_and_peering\(\) \{' 'private swarm configuration test'
+Assert-Contains $privateSwarmConfigurationTest.Body 'println!("private_swarm_peers=2 wrong_key_peers=0");' "Private swarm configuration test output changed"
+$privateSwarmWrongKeyTest = Get-BracedBlock $Rust '(?m)^async fn private_swarm_wrong_key_rejected\(\) \{' 'private swarm wrong-key test'
+Assert-Contains $privateSwarmWrongKeyTest.Body 'println!("wrong_key_connect=rejected");' "Private swarm wrong-key test output changed"
 
 $proxyTest = Get-BracedBlock $Rust '(?m)^async fn cluster_proxy_compatibility\(\) \{' 'cluster_proxy_compatibility test'
 foreach ($requiredProxyFragment in @(
@@ -834,7 +1254,7 @@ foreach ($fragment in @(
 
 $clusterEnv = Get-YamlBlock $clusterJob "env" 4
 $clusterEnvLines = @($clusterEnv -split "`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-Assert-True ($clusterEnvLines.Count -eq 16) "Cluster release job must contain exactly sixteen environment lines"
+Assert-True ($clusterEnvLines.Count -eq 19) "Cluster release job must contain exactly nineteen environment lines"
 foreach ($exactEnvironmentLine in @(
     '      COMPOSE_DISABLE_ENV_FILE: "1"',
     '      COMPOSE_PROJECT_NAME: ipfs3-cl-${{ github.run_id }}-${{ github.run_attempt }}',
@@ -851,6 +1271,9 @@ foreach ($exactEnvironmentLine in @(
     "      IPFS_S3_CLUSTER_A_PROXY_URL: http://127.0.0.1:59103",
     "      IPFS_S3_CLUSTER_KUBO_A_URL: http://127.0.0.1:55100",
     "      IPFS_S3_CLUSTER_KUBO_B_URL: http://127.0.0.1:55101",
+    "      IPFS_S3_CLUSTER_KUBO_C_URL: http://127.0.0.1:55102",
+    '      IPFS_S3_SWARM_KEY_FILE: ${{ runner.temp }}/ipfs3-swarm-${{ github.run_id }}-${{ github.run_attempt }}.key',
+    '      IPFS_S3_SWARM_KEY_WRONG_FILE: ${{ runner.temp }}/ipfs3-swarm-wrong-${{ github.run_id }}-${{ github.run_attempt }}.key',
     '      IPFS_S3_CLUSTER_STATE_PATH: ${{ runner.temp }}/ipfs3-cluster-${{ github.run_id }}-${{ github.run_attempt }}.json'
 )) {
     Assert-True ((@($clusterEnv -split "`n" | Where-Object { $_ -ceq $exactEnvironmentLine })).Count -eq 1) "Cluster release environment line changed: $exactEnvironmentLine"
@@ -870,6 +1293,7 @@ Assert-InOrder $clusterJob @(
     "      - name: Claim unique Cluster project, ports, and state receipt",
     "      - name: Build and start Cluster topology",
     "      - name: Prove Cluster release-version representation contract",
+    "      - name: Prove private swarm causality before topology",
     "      - name: Prove exact two-peer topology without writes",
     "      - name: Prove direct Kubo wire compatibility against Cluster A proxy",
     "      - name: Prove replication and retained deletion",
@@ -877,14 +1301,14 @@ Assert-InOrder $clusterJob @(
     "      - name: Stop Cluster and Kubo peer B",
     "      - name: Prove stopped peer loses two-pin evidence",
     "      - name: Capture stopped-peer diagnostics before restart",
-    "      - name: Restart Cluster and Kubo peer B with existing volumes",
-    "      - name: Prove same-volume peer B recovery",
+    "      - name: Restart both Cluster peers and Kubo swarm with existing volumes",
+    "      - name: Prove same-volume private swarm and peer B recovery",
     "      - name: Final sanitized Cluster diagnostics",
     "      - name: Cluster cleanup and residual assertion"
 ) "Cluster release workflow order changed"
 
 $pwshBlocks = Get-PwshRunBlocks $clusterJob
-Assert-True ($pwshBlocks.Count -eq 16) "Expected exactly sixteen Cluster PowerShell run blocks"
+Assert-True ($pwshBlocks.Count -eq 17) "Expected exactly seventeen Cluster PowerShell run blocks"
 foreach ($source in $pwshBlocks) {
     $tokens = $null
     $parseErrors = $null
@@ -898,34 +1322,36 @@ $configurationSource = $pwshBlocks[1]
 $ownershipSource = $pwshBlocks[2]
 $startupSource = $pwshBlocks[3]
 $releaseVersionSource = $pwshBlocks[4]
-$topologySource = $pwshBlocks[5]
-$proxySource = $pwshBlocks[6]
-$replicationSource = $pwshBlocks[7]
-$preStopDiagnosticSource = $pwshBlocks[8]
-$stopSource = $pwshBlocks[9]
-$outageSource = $pwshBlocks[10]
-$preRestartDiagnosticSource = $pwshBlocks[11]
-$restartSource = $pwshBlocks[12]
-$recoverySource = $pwshBlocks[13]
-$finalDiagnosticSource = $pwshBlocks[14]
-$cleanupSource = $pwshBlocks[15]
+$privateCausalitySource = $pwshBlocks[5]
+$topologySource = $pwshBlocks[6]
+$proxySource = $pwshBlocks[7]
+$replicationSource = $pwshBlocks[8]
+$preStopDiagnosticSource = $pwshBlocks[9]
+$stopSource = $pwshBlocks[10]
+$outageSource = $pwshBlocks[11]
+$preRestartDiagnosticSource = $pwshBlocks[12]
+$restartSource = $pwshBlocks[13]
+$recoverySource = $pwshBlocks[14]
+$finalDiagnosticSource = $pwshBlocks[15]
+$cleanupSource = $pwshBlocks[16]
 foreach ($blockContract in @(
     [pscustomobject]@{ Index = 0; Fragment = 'docker compose version'; Role = 'compose' },
     [pscustomobject]@{ Index = 1; Fragment = 'docker compose @compose config --quiet'; Role = 'configuration' },
     [pscustomobject]@{ Index = 2; Fragment = 'CLUSTER_PINSET_OWNED=true'; Role = 'ownership' },
-    [pscustomobject]@{ Index = 3; Fragment = 'up --detach --build --wait --wait-timeout 300 postgres kubo-a kubo-b cluster-a cluster-b gateway'; Role = 'startup' },
+    [pscustomobject]@{ Index = 3; Fragment = '--profile private-swarm-validation @compose up --detach --build --wait --wait-timeout 300 postgres kubo-a kubo-b kubo-c swarm-bootstrap cluster-a cluster-b gateway'; Role = 'startup' },
     [pscustomobject]@{ Index = 4; Fragment = 'cluster_support::release_version_validator_accepts_exact_release_and_build_metadata'; Role = 'release-version unit' },
-    [pscustomobject]@{ Index = 5; Fragment = 'cluster_topology_converges'; Role = 'topology' },
-    [pscustomobject]@{ Index = 6; Fragment = 'cluster_proxy_compatibility'; Role = 'proxy compatibility' },
-    [pscustomobject]@{ Index = 7; Fragment = 'cluster_replication_and_retention'; Role = 'replication' },
-    [pscustomobject]@{ Index = 8; Fragment = 'Pre-stop Cluster diagnostics failed'; Role = 'pre-stop diagnostics' },
-    [pscustomobject]@{ Index = 9; Fragment = 'stop cluster-b kubo-b'; Role = 'peer stop' },
-    [pscustomobject]@{ Index = 10; Fragment = 'cluster_peer_b_outage_contract'; Role = 'outage' },
-    [pscustomobject]@{ Index = 11; Fragment = 'Stopped-peer diagnostics failed'; Role = 'pre-restart diagnostics' },
-    [pscustomobject]@{ Index = 12; Fragment = 'start kubo-b cluster-b'; Role = 'peer restart' },
-    [pscustomobject]@{ Index = 13; Fragment = 'cluster_peer_b_restart_recovery'; Role = 'recovery' },
-    [pscustomobject]@{ Index = 14; Fragment = 'Final Cluster diagnostics failed'; Role = 'final diagnostics' },
-    [pscustomobject]@{ Index = 15; Fragment = '$errors = [Collections.Generic.List[string]]::new()'; Role = 'cleanup' }
+    [pscustomobject]@{ Index = 5; Fragment = 'private_swarm_configuration_and_peering'; Role = 'private swarm causality' },
+    [pscustomobject]@{ Index = 6; Fragment = 'cluster_topology_converges'; Role = 'topology' },
+    [pscustomobject]@{ Index = 7; Fragment = 'cluster_proxy_compatibility'; Role = 'proxy compatibility' },
+    [pscustomobject]@{ Index = 8; Fragment = 'cluster_replication_and_retention'; Role = 'replication' },
+    [pscustomobject]@{ Index = 9; Fragment = 'Pre-stop Cluster diagnostics failed'; Role = 'pre-stop diagnostics' },
+    [pscustomobject]@{ Index = 10; Fragment = 'stop cluster-b kubo-b'; Role = 'peer stop' },
+    [pscustomobject]@{ Index = 11; Fragment = 'cluster_peer_b_outage_contract'; Role = 'outage' },
+    [pscustomobject]@{ Index = 12; Fragment = 'Stopped-peer diagnostics failed'; Role = 'pre-restart diagnostics' },
+    [pscustomobject]@{ Index = 13; Fragment = 'restart --timeout 30 swarm-bootstrap'; Role = 'full swarm restart' },
+    [pscustomobject]@{ Index = 14; Fragment = 'cluster_peer_b_restart_recovery'; Role = 'recovery' },
+    [pscustomobject]@{ Index = 15; Fragment = 'Final Cluster diagnostics failed'; Role = 'final diagnostics' },
+    [pscustomobject]@{ Index = 16; Fragment = '$errors = [Collections.Generic.List[string]]::new()'; Role = 'cleanup' }
 )) {
     Assert-Contains $pwshBlocks[$blockContract.Index] $blockContract.Fragment "Cluster PowerShell block $($blockContract.Index) must remain $($blockContract.Role)"
 }
@@ -978,7 +1404,7 @@ Assert-InOrder $ownershipSource @(
     '$networkExit = $LASTEXITCODE',
     '$volumeExit = $LASTEXITCODE',
     'if ($containerExit -ne 0 -or $networkExit -ne 0 -or $volumeExit -ne 0)',
-    '55435, 55100, 55101, 59100, 59101, 59102, 59103',
+    '55435, 55100, 55101, 55102, 59100, 59101, 59102, 59103',
     'if (Test-Path -LiteralPath $env:IPFS_S3_CLUSTER_STATE_PATH)',
     '"CLUSTER_PINSET_OWNED=true" | Add-Content -LiteralPath $env:GITHUB_ENV',
     '[IO.File]::Open(',
@@ -991,20 +1417,36 @@ Assert-InOrder $ownershipSource @(
 Assert-Contains $ownershipSource 'if (-not $stateReceiptOwned) { throw "State receipt claim did not complete" }' "Cluster state receipt claim must fail closed"
 Assert-InOrder $clusterJob @(
     '"CLUSTER_PINSET_ATTEMPTED=true" | Add-Content -LiteralPath $env:GITHUB_ENV',
-    'up --detach --build --wait --wait-timeout 300 postgres kubo-a kubo-b cluster-a cluster-b gateway'
-) "Cluster attempted marker must precede exact six-service startup"
+    'docker compose @compose build kubo-a',
+    '--profile private-swarm-validation @compose up --detach --build --wait --wait-timeout 300 postgres kubo-a kubo-b kubo-c swarm-bootstrap cluster-a cluster-b gateway'
+) "Cluster attempted marker must precede Kubo A build and exact private-swarm startup"
 Assert-Contains $startupSource 'if ($LASTEXITCODE -ne 0) { throw "Cluster topology did not become healthy" }' "Cluster startup failure must be blocking"
-Assert-Matches $startupSource '(?s)\A\s*"CLUSTER_PINSET_ATTEMPTED=true" \| Add-Content -LiteralPath \$env:GITHUB_ENV\s*docker compose --project-name \$env:COMPOSE_PROJECT_NAME -f docker-compose\.cluster\.yml -f tests/compose\.cluster-validation\.yml up --detach --build --wait --wait-timeout 300 postgres kubo-a kubo-b cluster-a cluster-b gateway' "Cluster attempted marker must occur immediately before exact startup"
+Assert-InOrder $startupSource @(
+    '"CLUSTER_PINSET_ATTEMPTED=true" | Add-Content -LiteralPath $env:GITHUB_ENV',
+    'docker compose @compose build kubo-a',
+    'IPFS_SWARM_KEY_FILE=/run/secrets/missing-swarm-key',
+    'LIBP2P_FORCE_PNET=0',
+    'Invoke-PrivateSwarmSupervisorProof -Mode normal -ExpectedExit 37',
+    'Invoke-PrivateSwarmSupervisorProof -Mode handled -ExpectedExit 43',
+    'Invoke-PrivateSwarmSupervisorProof -Mode unhandled -ExpectedExit 143',
+    '--profile private-swarm-validation @compose up --detach --build --wait --wait-timeout 300 postgres kubo-a kubo-b kubo-c swarm-bootstrap cluster-a cluster-b gateway'
+) "Cluster startup must build, reject invalid private swarms, prove PID 1, then start the exact validation profile"
 
 $expectedCargoCommands = @(
     'cargo test --test cluster cluster_support::release_version_validator_accepts_exact_release_and_build_metadata -- --exact',
+    'cargo test --test cluster cluster_support::private_kubo_config_contract_rejects_open_discovery -- --exact',
+    'cargo test --test cluster cluster_support::private_peering_json_contract_matches_kubo_v0_43_addrinfo -- --exact',
+    'cargo test --test cluster cluster_support::kubo_swarm_peers_null_is_empty_without_ndjson -- --exact',
+    'cargo test --test cluster private_swarm_configuration_and_peering -- --exact --nocapture --test-threads=1',
+    'cargo test --test cluster private_swarm_wrong_key_rejected -- --exact --nocapture --test-threads=1',
     'cargo test --test cluster cluster_topology_converges -- --exact --nocapture --test-threads=1',
     'cargo test --test cluster cluster_proxy_compatibility -- --exact --nocapture --test-threads=1',
     'cargo test --test cluster cluster_replication_and_retention -- --exact --nocapture --test-threads=1',
     'cargo test --test cluster cluster_peer_b_outage_contract -- --exact --nocapture --test-threads=1',
+    'cargo test --test cluster private_swarm_configuration_and_peering -- --exact --nocapture --test-threads=1',
     'cargo test --test cluster cluster_peer_b_restart_recovery -- --exact --nocapture --test-threads=1'
 )
-Assert-True (([regex]::Matches($clusterJob, '(?m)^          cargo test --test cluster [^\r\n]+$')).Count -eq 6) "Cluster job must contain exactly six explicit Cluster cargo commands"
+Assert-True (([regex]::Matches($clusterJob, '(?m)^          cargo test --test cluster [^\r\n]+$')).Count -eq 12) "Cluster job must contain exactly twelve explicit Cluster cargo commands"
 Assert-InOrder $clusterJob $expectedCargoCommands "Cluster cargo commands changed causal order"
 Assert-InOrder $releaseVersionSource @(
     $expectedCargoCommands[0],
@@ -1015,25 +1457,26 @@ Assert-Contains $proxySource 'PROXY_COMPATIBILITY_BLOCKER: stop and revise the a
 Assert-NotContains $topologySource 'PROXY_COMPATIBILITY_BLOCKER' "Topology failure must not be relabeled as proxy incompatibility"
 Assert-True (([regex]::Matches($clusterJob, [regex]::Escape('PROXY_COMPATIBILITY_BLOCKER'))).Count -eq 1) "Only direct proxy compatibility may use PROXY_COMPATIBILITY_BLOCKER"
 Assert-InOrder $topologySource @(
-    $expectedCargoCommands[1],
+    'if ($env:CLUSTER_PRIVATE_SWARM_GREEN -ne "true") { throw "Private swarm GREEN receipt is required before topology" }',
+    $expectedCargoCommands[6],
     'if ($LASTEXITCODE -ne 0) { throw "TOPOLOGY_CONVERGENCE_BLOCKER: exact v1.1.6 two-peer topology did not converge" }',
     '"CLUSTER_TOPOLOGY_GREEN=true" | Add-Content -LiteralPath $env:GITHUB_ENV'
 ) "Topology GREEN receipt must follow only a successful topology gate"
 Assert-InOrder $proxySource @(
     'if ($env:CLUSTER_TOPOLOGY_GREEN -ne "true") { throw "Topology GREEN receipt is required before compatibility" }',
-    $expectedCargoCommands[2],
+    $expectedCargoCommands[7],
     'if ($LASTEXITCODE -ne 0) { throw "PROXY_COMPATIBILITY_BLOCKER: stop and revise the approved design; do not add app fallback code" }',
     '"CLUSTER_PROXY_COMPATIBILITY_GREEN=true" | Add-Content -LiteralPath $env:GITHUB_ENV'
 ) "Proxy compatibility must require topology GREEN and write its receipt only after add-pin-cat success"
 Assert-InOrder $replicationSource @(
     'if ($env:CLUSTER_PROXY_COMPATIBILITY_GREEN -ne "true") { throw "Add-pin-cat proxy GREEN receipt is required before replication" }',
     'if ($env:CLUSTER_STATE_RECEIPT_OWNED -ne "true") { throw "Owned state receipt is required before replication" }',
-    $expectedCargoCommands[3]
+    $expectedCargoCommands[8]
 ) "Replication must require proxy GREEN before its receipt-owned check"
 $stateConsumerBlocks = @(
-    [pscustomobject]@{ Index = 7; CargoCommand = $expectedCargoCommands[3] },
-    [pscustomobject]@{ Index = 10; CargoCommand = $expectedCargoCommands[4] },
-    [pscustomobject]@{ Index = 13; CargoCommand = $expectedCargoCommands[5] }
+    [pscustomobject]@{ Index = 8; CargoCommand = $expectedCargoCommands[8] },
+    [pscustomobject]@{ Index = 11; CargoCommand = $expectedCargoCommands[9] },
+    [pscustomobject]@{ Index = 14; CargoCommand = $expectedCargoCommands[11] }
 )
 foreach ($stateConsumerBlock in $stateConsumerBlocks) {
     Assert-Contains $pwshBlocks[$stateConsumerBlock.Index] 'if ($env:CLUSTER_STATE_RECEIPT_OWNED -ne "true")' "Every state-consuming Cluster test must require the owned receipt"
@@ -1043,30 +1486,39 @@ foreach ($stateConsumerBlock in $stateConsumerBlocks) {
     ) "Owned state receipt must be checked before its Cluster live test"
 }
 Assert-InOrder $clusterJob @(
-    'logs --no-color postgres kubo-a kubo-b cluster-a cluster-b gateway',
+    'logs --no-color postgres kubo-a kubo-b kubo-c swarm-bootstrap cluster-a cluster-b gateway',
     'stop cluster-b kubo-b',
-    'logs --no-color postgres kubo-a kubo-b cluster-a cluster-b gateway',
-    'start kubo-b cluster-b',
-    'logs --no-color postgres kubo-a kubo-b cluster-a cluster-b gateway',
+    'logs --no-color postgres kubo-a kubo-b kubo-c swarm-bootstrap cluster-a cluster-b gateway',
+    'stop cluster-a kubo-a',
+    'start kubo-a kubo-b',
+    'restart --timeout 30 swarm-bootstrap',
+    'start cluster-a cluster-b',
+    'logs --no-color postgres kubo-a kubo-b kubo-c swarm-bootstrap cluster-a cluster-b gateway',
     'down --volumes --remove-orphans'
 ) "Cluster diagnostics, peer stop/restart, and cleanup order changed"
 
+$workflowFingerprintRedactorSources = @($startupSource, $preStopDiagnosticSource, $preRestartDiagnosticSource, $finalDiagnosticSource)
+Assert-True ($workflowFingerprintRedactorSources.Count -eq 4) "Cluster workflow must retain exactly four fingerprint redactor copies"
+foreach ($workflowFingerprintRedactorSource in $workflowFingerprintRedactorSources) {
+    Assert-Contains $workflowFingerprintRedactorSource '$safe = [regex]::Replace($safe, ''(Swarm key fingerprint: )[0-9a-f]{32}(?=\s*$)'', ''$1[redacted]'')' "Cluster workflow fingerprint redactor must retain Compose prefixes while replacing only the exact fingerprint"
+    Assert-NotContains $workflowFingerprintRedactorSource '$safe = [regex]::Replace($safe, ''(?m)^Swarm key fingerprint: [0-9a-f]{32}\s*$'', ''Swarm key fingerprint: [redacted]'')' "Cluster workflow fingerprint redactor must not anchor the marker at line start"
+}
 $diagnosticSources = @($preStopDiagnosticSource, $preRestartDiagnosticSource, $finalDiagnosticSource)
-Assert-True (([regex]::Matches($clusterJob, [regex]::Escape('logs --no-color postgres kubo-a kubo-b cluster-a cluster-b gateway'))).Count -eq 3) "Cluster job must have exactly three sanitized diagnostics captures"
+Assert-True (([regex]::Matches($clusterJob, [regex]::Escape('logs --no-color postgres kubo-a kubo-b kubo-c swarm-bootstrap cluster-a cluster-b gateway'))).Count -eq 3) "Cluster job must have exactly three sanitized diagnostics captures"
 Assert-NotMatches $clusterJob '(?m)^\s*docker compose .*logs --no-color .*\|' "Cluster diagnostics must not stream raw logs through a pipeline"
 foreach ($diagnosticSource in $diagnosticSources) {
     foreach ($fragment in @(
         'function Protect-ClusterDiagnosticLine',
         'function Write-SanitizedClusterDiagnostics',
         '$rawDiagnosticLines = @(',
-        'docker compose @ComposeArgs logs --no-color postgres kubo-a kubo-b cluster-a cluster-b gateway 2>&1',
+        'docker compose @ComposeArgs logs --no-color postgres kubo-a kubo-b kubo-c swarm-bootstrap cluster-a cluster-b gateway 2>&1',
         '$diagnosticExit = $LASTEXITCODE',
         '[Console]::Out.WriteLine((Protect-ClusterDiagnosticLine -Line "$rawLine"))',
         'if ($diagnosticExit -ne 0) { throw "$FailureMessage (exit=$diagnosticExit)" }'
     )) {
         Assert-Contains $diagnosticSource $fragment "Cluster diagnostics must sanitize before output: $fragment"
     }
-    Assert-Matches $diagnosticSource '(?s)\$rawDiagnosticLines\s*=\s*@\(\s*docker compose @ComposeArgs logs --no-color postgres kubo-a kubo-b cluster-a cluster-b gateway 2>&1\s*\)\s*\$diagnosticExit = \$LASTEXITCODE.*?\[Console\]::Out\.WriteLine\(\(Protect-ClusterDiagnosticLine -Line "\$rawLine"\)\).*?if \(\$diagnosticExit -ne 0\)' "Cluster diagnostics must capture, record exit, sanitize, then fail"
+    Assert-Matches $diagnosticSource '(?s)\$rawDiagnosticLines\s*=\s*@\(\s*docker compose @ComposeArgs logs --no-color postgres kubo-a kubo-b kubo-c swarm-bootstrap cluster-a cluster-b gateway 2>&1\s*\)\s*\$diagnosticExit = \$LASTEXITCODE.*?\[Console\]::Out\.WriteLine\(\(Protect-ClusterDiagnosticLine -Line "\$rawLine"\)\).*?if \(\$diagnosticExit -ne 0\)' "Cluster diagnostics must capture, record exit, sanitize, then fail"
     Assert-NotMatches $diagnosticSource '(?m)^\s*(?:Write-Host|Write-Output|Write-Warning)\b' "Cluster diagnostics must not emit unredacted output"
 }
 Assert-Matches $clusterJob '(?m)^        if: \$\{\{ always\(\) && env\.CLUSTER_PINSET_ATTEMPTED == ''true'' \}\}\s*$' "Final Cluster diagnostics must run only after an attempted topology"
@@ -1090,34 +1542,210 @@ foreach ($fixture in @(
 $contentCid = 'Qm' + (('b' * 44) -join '')
 $contentFixture = "content cid=$contentCid retained"
 Assert-True ((Protect-ClusterDiagnosticLine $contentFixture) -ceq $contentFixture) "Cluster diagnostic redactor must preserve ordinary content CIDs byte-for-byte"
+$ordinary32 = '0123456789abcdef0123456789abcdef'
+$standalone64 = $ordinary32 + $ordinary32
+foreach ($fixture in @(
+    "Swarm key fingerprint: $ordinary32",
+    '/key/swarm/psk/1.0.0/',
+    '/base16/',
+    "digest=$standalone64"
+)) {
+    $sanitized = Protect-ClusterDiagnosticLine $fixture
+    Assert-NotContains $sanitized $ordinary32 "Cluster diagnostic redactor leaked private swarm material"
+    Assert-NotContains $sanitized $standalone64 "Cluster diagnostic redactor leaked standalone 64-hex material"
+}
+Assert-True ((Protect-ClusterDiagnosticLine "ordinary $ordinary32") -ceq "ordinary $ordinary32") "Cluster diagnostic redactor must preserve ordinary 32-hex text"
+$composePrefixedFingerprint = "kubo-a  | Swarm key fingerprint: $ordinary32"
+Assert-True (
+    (Protect-ClusterDiagnosticLine $composePrefixedFingerprint) -ceq "kubo-a  | Swarm key fingerprint: [redacted]"
+) "Cluster diagnostic redactor must retain the Compose prefix while redacting only the swarm fingerprint"
+
+Assert-InOrder $configurationSource @(
+    'function New-PrivateSwarmHex',
+    '[Security.Cryptography.RandomNumberGenerator]::Fill($bytes)',
+    '[Convert]::FromHexString($hex)',
+    'do { $wrongSwarmHex = New-PrivateSwarmHex } while ($wrongSwarmHex -ceq $mainSwarmHex)',
+    'Write-PrivateSwarmKey -Path $env:IPFS_S3_SWARM_KEY_FILE -Hex $mainSwarmHex',
+    '"CLUSTER_SWARM_KEY_OWNED=true" | Add-Content -LiteralPath $env:GITHUB_ENV',
+    'Write-PrivateSwarmKey -Path $env:IPFS_S3_SWARM_KEY_WRONG_FILE -Hex $wrongSwarmHex',
+    '"CLUSTER_SWARM_KEY_WRONG_OWNED=true" | Add-Content -LiteralPath $env:GITHUB_ENV',
+    'docker compose @compose config --quiet'
+) "Private swarm key files must be independently generated and marked before Compose configuration"
+foreach ($fragment in @(
+    '$runnerTemp = [IO.Path]::GetFullPath($env:RUNNER_TEMP)',
+    '[IO.Path]::GetFullPath($Path)',
+    '[IO.FileMode]::CreateNew',
+    '[IO.FileShare]::None',
+    '$stream.Flush($true)',
+    '"/key/swarm/psk/1.0.0/`n/base16/`n$Hex`n"',
+    '$bytes.Length -ne 96',
+    'if ($created) { Remove-Item -LiteralPath $canonicalPath -Force -ErrorAction SilentlyContinue }',
+    '"IPFS_S3_SWARM_KEY_FILE"',
+    '"IPFS_S3_SWARM_KEY_WRONG_FILE"'
+)) {
+    Assert-Contains $configurationSource $fragment "Private swarm file lifecycle contract is missing: $fragment"
+}
+Assert-NotMatches $configurationSource '(?im)^\s*(?:Write-Host|Write-Output|Write-Warning|\[Console\]::Out\.WriteLine).*?(?:\$mainSwarmHex|\$wrongSwarmHex|\$Hex)' "Private swarm generation must emit receipts, never key contents"
+
+foreach ($fragment in @(
+    'run --no-deps --rm @RunArgs kubo-a 2>&1',
+    'IPFS_SWARM_KEY_FILE=/run/secrets/missing-swarm-key',
+    'LIBP2P_FORCE_PNET=0',
+    '$safeLines = @($rawLines | ForEach-Object { Protect-ClusterDiagnosticLine -Line "$_" })',
+    "[Console]::Out.WriteLine('private swarm startup rejected')",
+    'docker wait $name',
+    "'{{.State.Pid}} {{.State.ExitCode}}'",
+    '"0 $ExpectedExit"',
+    'docker diff $name',
+    "'(?im)(?:fifo|daemon-log)'",
+    'ipfs3.cluster.private-swarm-proof=$Mode',
+    '"--mount", "type=bind,src=$fullKeyPath,dst=/run/secrets/swarm_key,readonly"',
+    '"--env", "IPFS_SWARM_KEY_FILE=/run/secrets/swarm_key"',
+    'Invoke-PrivateSwarmSupervisorProof -Mode normal -ExpectedExit 37',
+    'Invoke-PrivateSwarmSupervisorProof -Mode handled -ExpectedExit 43',
+    'Invoke-PrivateSwarmSupervisorProof -Mode unhandled -ExpectedExit 143',
+    'docker stop --time 30 $name'
+)) {
+    Assert-Contains $startupSource $fragment "Private swarm wrapper/filter/PID 1 proof contract is missing: $fragment"
+}
+Assert-True (([regex]::Matches($startupSource, [regex]::Escape('Invoke-PrivateSwarmNegative -RunArgs'))).Count -eq 2) "Private swarm startup must run exactly two negative Compose probes"
+Assert-NotContains $startupSource 'kill -0' "Private swarm proof must not use kill -0 polling"
+Assert-Contains $startupSource '"--mount", "type=bind,src=$fullKeyPath,dst=/run/secrets/swarm_key,readonly"' "Supervisor proof must bind only the exact swarm key file at its approved secret path"
+Assert-Contains $startupSource '$fullKeyPath = [IO.Path]::GetFullPath($env:IPFS_S3_SWARM_KEY_FILE)' "Supervisor proof must canonicalize the exact key-file path"
+foreach ($forbiddenMountFragment in @('$keyParent', '$keyLeaf', 'dst=/run/ipfs3-swarm', 'src=$env:RUNNER_TEMP', 'IPFS_SWARM_KEY_FILE=/run/ipfs3-swarm/')) {
+    Assert-NotContains $startupSource $forbiddenMountFragment "Supervisor proof must not mount a swarm-key directory or use a non-secret key path: $forbiddenMountFragment"
+}
+Assert-InOrder $startupSource @(
+    '$sourceFixture = @''',
+    '. /private-swarm-entrypoint.sh',
+    'ordinary=0123456789abcdef0123456789abcdef',
+    "cid=Qm`$(printf '%044d' 0 | tr 0 c)",
+    'redact_swarm_fingerprint',
+    'Swarm key fingerprint: [redacted]',
+    'ordinary $ordinary',
+    'cid=$cid',
+    'select_supervisor_exit',
+    'check_selector 37 37 1 1',
+    'check_selector 1 0 1 0',
+    'check_selector 1 0 0 1',
+    'check_selector 0 0 0 0',
+    'docker run --rm --entrypoint /bin/sh ghcr.io/hugefiver/ipfs3-kubo-cluster:v0.43.0 -ec $sourceFixture 2>&1',
+    '$sourceFixtureOutput = $null',
+    'if ($sourceFixtureExit -ne 0) { throw "Private swarm source-only filter and supervisor fixture failed" }',
+    '"CLUSTER_PRIVATE_SWARM_FILTER_GREEN=true" | Add-Content -LiteralPath $env:GITHUB_ENV',
+    'Invoke-PrivateSwarmSupervisorProof -Mode normal -ExpectedExit 37',
+    'Invoke-PrivateSwarmSupervisorProof -Mode handled -ExpectedExit 43',
+    'Invoke-PrivateSwarmSupervisorProof -Mode unhandled -ExpectedExit 143',
+    '"CLUSTER_PRIVATE_SWARM_SUPERVISOR_GREEN=true" | Add-Content -LiteralPath $env:GITHUB_ENV'
+) "Source-only actual filter/selector fixture must pass before the disposable PID 1 supervisor proofs and their receipts"
+Assert-InOrder $startupSource @(
+    '$rawKuboLogs = @(docker compose @compose logs --no-color kubo-a kubo-b kubo-c 2>&1)',
+    '$rawKuboText = $rawKuboLogs -join "`n"',
+    'Direct Kubo logs exposed a raw swarm fingerprint',
+    '$rawKuboRedactedFingerprintCount = ([regex]::Matches($rawKuboText, [regex]::Escape(''Swarm key fingerprint: [redacted]''))).Count',
+    '$rawKuboRedactedFingerprintCount -lt 3',
+    'PRIVATE_SWARM_DIRECT_KUBO_LOGS_CAPTURED',
+    'PRIVATE_SWARM_DIRECT_KUBO_FINGERPRINT_ABSENT',
+    'PRIVATE_SWARM_DIRECT_KUBO_MARKERS_VERIFIED',
+    'CLUSTER_PRIVATE_SWARM_DIRECT_LOGS_GREEN=true',
+    '$rawKuboLogs = $null',
+    '$rawKuboText = $null',
+    '$rawKuboRedactedFingerprintCount = $null'
+) "Direct Kubo logs must be checked before any diagnostic redaction and emit fixed receipts only"
+Assert-NotContains $startupSource '"Initializing daemon...", "Kubo version:", "Daemon is ready"' "Direct Kubo log gate must prove the redaction barrier, not generic daemon markers"
+foreach ($fragment in @(
+    'ps --all -q swarm-bootstrap',
+    'com.docker.compose.project',
+    'com.docker.compose.service',
+    'swarm-bootstrap exited 0',
+    'CLUSTER_PRIVATE_SWARM_BOOTSTRAP_GREEN=true',
+    'stat -c "%a" "$IPFS_PATH/swarm.key"',
+    'sha256sum "$IPFS_PATH/swarm.key"',
+    "'^400 (?<digest>[0-9a-f]{64})$'",
+    'CLUSTER_PRIVATE_SWARM_KEY_MATERIAL_GREEN=true',
+    '$modeDigestA = $null',
+    '$modeDigestB = $null'
+)) {
+    Assert-Contains $startupSource $fragment "Private swarm bootstrap/mode receipt contract is missing: $fragment"
+}
+Assert-NotMatches $startupSource '(?im)^\s*(?:Write-Host|Write-Output|Write-Warning|\[Console\]::Out\.WriteLine).*?(?:\$modeDigest|\$bootstrapId)' "Private swarm receipts must not emit digests or container IDs"
+Assert-InOrder $privateCausalitySource @(
+    'CLUSTER_PRIVATE_SWARM_WRAPPER_GREEN',
+    'CLUSTER_PRIVATE_SWARM_FILTER_GREEN',
+    'CLUSTER_PRIVATE_SWARM_SUPERVISOR_GREEN',
+    'CLUSTER_PRIVATE_SWARM_DIRECT_LOGS_GREEN',
+    'CLUSTER_PRIVATE_SWARM_BOOTSTRAP_GREEN',
+    'CLUSTER_PRIVATE_SWARM_KEY_MATERIAL_GREEN',
+    $expectedCargoCommands[1],
+    $expectedCargoCommands[2],
+    $expectedCargoCommands[3],
+    $expectedCargoCommands[4],
+    $expectedCargoCommands[5],
+    '"CLUSTER_PRIVATE_SWARM_GREEN=true" | Add-Content -LiteralPath $env:GITHUB_ENV'
+) "Private swarm units and live gates must complete before topology"
+foreach ($diagnosticSource in $diagnosticSources) {
+    foreach ($fragment in @(
+        '''(Swarm key fingerprint: )[0-9a-f]{32}(?=\s*$)''',
+        "'(?m)^/key/swarm/psk/1",
+        "'(?m)^/base16/",
+        "'[REDACTED_HEX]'"
+    )) {
+        Assert-Contains $diagnosticSource $fragment "Cluster diagnostic defense-in-depth redactor is missing: $fragment"
+    }
+}
+Assert-InOrder $restartSource @(
+    'stop cluster-a kubo-a',
+    'start kubo-a kubo-b',
+    'Wait-HealthyClusterService -Service kubo-a',
+    'Wait-HealthyClusterService -Service kubo-b',
+    'restart --timeout 30 swarm-bootstrap',
+    'Wait-CompletedSwarmBootstrap',
+    'start cluster-a cluster-b',
+    'Wait-HealthyClusterService -Service cluster-a',
+    'Wait-HealthyClusterService -Service cluster-b'
+) "A/B recovery must re-establish the private swarm before restarting both Cluster peers"
+Assert-InOrder $recoverySource @(
+    $expectedCargoCommands[10],
+    $expectedCargoCommands[11]
+) "Post-restart private swarm proof must precede existing peer-B recovery"
 
 foreach ($fragment in @(
     '$errors = [Collections.Generic.List[string]]::new()',
-    'if ($env:CLUSTER_PINSET_OWNED -eq "true" -and $env:CLUSTER_PINSET_ATTEMPTED -eq "true")',
+    '$topologyOwned = $env:CLUSTER_PINSET_OWNED -eq "true" -and $env:CLUSTER_PINSET_ATTEMPTED -eq "true"',
+    '$proofsAttempted = $env:CLUSTER_PRIVATE_SWARM_PROOFS_ATTEMPTED -eq "true"',
+    '$fileMarkersPresent = $env:CLUSTER_SWARM_KEY_OWNED -eq "true"',
+    'if ($proofsAttempted)',
+    'label=ipfs3.cluster.private-swarm-proof',
+    'docker stop --time 30 $proofContainer',
+    'docker rm $proofContainer',
+    'if ($topologyOwned)',
+    'docker compose --profile private-swarm-validation --project-name $project -f docker-compose.cluster.yml -f tests/compose.cluster-validation.yml down --volumes --remove-orphans',
     'down --volumes --remove-orphans',
     '$downExit = $LASTEXITCODE',
     '$containerExit = $LASTEXITCODE',
     '$networkExit = $LASTEXITCODE',
     '$volumeExit = $LASTEXITCODE',
-    'if ($env:CLUSTER_STATE_RECEIPT_OWNED -eq "true")',
-    'Test-Path -LiteralPath $env:IPFS_S3_CLUSTER_STATE_PATH -PathType Leaf',
-    'Remove-Item -LiteralPath $env:IPFS_S3_CLUSTER_STATE_PATH -ErrorAction Stop',
-    '$errors.Add("owned state receipt cleanup failed: $($_.Exception.Message)")',
+    'Marker = "CLUSTER_SWARM_KEY_OWNED"; Path = $env:IPFS_S3_SWARM_KEY_FILE',
+    'Marker = "CLUSTER_SWARM_KEY_WRONG_OWNED"; Path = $env:IPFS_S3_SWARM_KEY_WRONG_FILE',
+    'Marker = "CLUSTER_STATE_RECEIPT_OWNED"; Path = $env:IPFS_S3_CLUSTER_STATE_PATH',
+    'Remove-Item -LiteralPath $ownedFile.Path -ErrorAction Stop',
     'if ($errors.Count -ne 0) { throw ($errors -join "; ") }'
 )) {
     Assert-Contains $cleanupSource $fragment "Cluster cleanup contract is missing: $fragment"
 }
 Assert-InOrder $cleanupSource @(
+    'label=ipfs3.cluster.private-swarm-proof',
+    'docker stop --time 30 $proofContainer',
+    'docker rm $proofContainer',
+    'docker compose --profile private-swarm-validation --project-name $project -f docker-compose.cluster.yml -f tests/compose.cluster-validation.yml down --volumes --remove-orphans',
     '$downExit = $LASTEXITCODE',
     '$containerExit = $LASTEXITCODE',
     '$networkExit = $LASTEXITCODE',
     '$volumeExit = $LASTEXITCODE',
-    'if ($env:CLUSTER_STATE_RECEIPT_OWNED -eq "true")',
-    'if (-not (Test-Path -LiteralPath $env:IPFS_S3_CLUSTER_STATE_PATH -PathType Leaf))',
-    'Remove-Item -LiteralPath $env:IPFS_S3_CLUSTER_STATE_PATH -ErrorAction Stop',
-    '$errors.Add("owned state receipt cleanup failed: $($_.Exception.Message)")',
+    'foreach ($ownedFile in @(',
+    'Remove-Item -LiteralPath $ownedFile.Path -ErrorAction Stop',
     'if ($errors.Count -ne 0) { throw ($errors -join "; ") }'
-) "Cluster cleanup must aggregate failures only after all residual checks and owned receipt cleanup"
+) "Cluster cleanup must clean proof residue, aggregate topology residual checks, then delete every marked temporary file"
 
 $clientRunLines = @($clientJob -split "`n" | Where-Object { $_ -match '^\s+run:' })
 $expectedClientRunLines = @(
@@ -1161,7 +1789,24 @@ foreach ($fragment in @(
     "connector and proxy forwarder",
     "paired Kubo DNS endpoint",
     "min=max 2",
-    "same-host Compose mDNS only",
+    "exactly seven roles",
+    "one-shot swarm-bootstrap",
+    "same-host only",
+    'shared Kubo `swarm.key` PSK',
+    'separate from `IPFS_S3_CLUSTER_SECRET`',
+    "Kubo A and Kubo B each retain one persistent Peering entry for the other as their sole peer",
+    "AutoConf disabled",
+    "public bootstrap is empty",
+    'routing is `none`',
+    "mDNS is disabled",
+    'server-profile RFC1918 `Swarm.AddrFilters` are cleared solely for the PSK-gated internal Docker bridge',
+    'Validation-only Kubo C on loopback `55102` uses a wrong key',
+    "eventually reaches exact 2/2 allocations",
+    "PSK membership and libp2p connection protection",
+    "does not control container egress",
+    "does not encrypt or authenticate REST",
+    "does not provide high availability, multi-host discovery, online rotation, or member revocation",
+    "Rotation requires coordinated downtime and is not automated",
     'fixed host loopback `127.0.0.1`',
     '`IPFS_S3_GATEWAY_BIND=127.0.0.1` is a required acknowledgement',
     "other values are rejected",
@@ -1190,9 +1835,6 @@ foreach ($fragment in @(
     "Production PostgreSQL, Kubo, Cluster REST, Cluster proxy, and swarm endpoints are internal",
     'validation alone exposes the Cluster A proxy at loopback `59103`',
     "TLS and authentication are not implemented",
-    "Cluster secret protects Cluster membership",
-    "not the private Kubo swarm",
-    "Private swarm remains unchecked",
     'Hosted job: `NOT RUN`',
     '$env:IPFS_S3_GATEWAY_BIND = "127.0.0.1"',
     '$env:IPFS_S3_GATEWAY_PORT = "9000"',
@@ -1201,13 +1843,23 @@ foreach ($fragment in @(
     "32-byte master key",
     "32-byte Cluster secret",
     "lowercase hex",
+    "32 random bytes",
+    "exactly three LF-terminated lines",
+    "persistent operator path outside the repository",
+    'protect the directory and file with host ACLs',
+    "Never commit the swarm-key file",
+    'the exact path in `$env:IPFS_S3_SWARM_KEY_FILE`',
+    "UTF-8 without a BOM",
+    '`CreateNew`',
+    "does not print the key or a digest",
     "Store these generated secrets before the first write and restore them unchanged",
     "Changing the master key breaks encrypted objects",
-    "changing the Cluster secret breaks membership",
+    "changing the Cluster secret breaks Cluster membership",
     "docker compose -f docker-compose.cluster.yml config --quiet",
     "Cluster Compose configuration failed",
     "docker compose -f docker-compose.cluster.yml up --detach --build --wait --wait-timeout 300",
     "Cluster profile did not become healthy",
+    'base `docker-compose.cluster.yml` and its required environment paths',
     "For production shutdown, use only the following command",
     "down --remove-orphans",
     'Never use the `--volumes` flag',
@@ -1219,11 +1871,24 @@ foreach ($fragment in @(
 foreach ($forbidden in @(
     "127.0.0.1:5001",
     "cross-wire",
+    "same-host Compose mDNS only",
+    "Private swarm remains unchecked",
     "down --volumes",
     "ipfs-cluster-ctl peers ls",
     "docker compose logs"
 )) {
     Assert-NotContains $clusterReadme $forbidden "Cluster README must not contain: $forbidden"
+}
+Assert-NotContains $clusterReadme '$swarmKeyPath = Join-Path (Get-Location) "ipfs3-swarm.key"' "Cluster README must not write the swarm key into the repository"
+Assert-NotMatches $clusterReadme '(?m)^\$swarmKey(?:Directory|Path)\s*=\s*Join-Path\s+(?:\(Get-Location\)|\(Resolve-Path\s+\.\)|\$PSScriptRoot|\$PSCommandPath|\$RepoRoot|\.)(?:\s|$)' "Cluster README must not use a repository-relative swarm-key path"
+foreach ($fragment in @(
+    '$swarmKeyDirectory = Join-Path $HOME ".ipfs3/secrets"',
+    '[IO.Directory]::CreateDirectory($swarmKeyDirectory)',
+    '$swarmKeyPath = Join-Path $swarmKeyDirectory "swarm.key"',
+    '[IO.FileMode]::CreateNew',
+    '$env:IPFS_S3_SWARM_KEY_FILE = $swarmKeyPath'
+)) {
+    Assert-Contains $clusterReadme $fragment "Cluster README persistent swarm-key contract is missing: $fragment"
 }
 Assert-NotMatches $clusterReadme '(?im)^.*(?:peer list|PeerID|peer_id|peer-id).*$' "Cluster README must not show peer-list commands or output"
 Assert-NotMatches $clusterReadme '(?i)docker compose(?:\s+[^\r\n]+)?\s+logs\b' "Cluster README must not show raw Compose logs"
@@ -1231,9 +1896,17 @@ Assert-NotMatches $clusterReadme '(?i)0\.0\.0\.0[^\r\n]*59103|59103[^\r\n]*0\.0\
 Assert-NotMatches $clusterReadme '(?i)production[^\r\n]*(?:publish|expose)[^\r\n]*proxy|proxy[^\r\n]*(?:publish|expose)[^\r\n]*production' "Cluster README must not claim production proxy publication"
 Assert-NotMatches $clusterReadme '(?i)\bdirect non-loopback(?: gateway)? (?:publication|access) (?:is )?supported\b' "Cluster README must not claim direct non-loopback publication support"
 Assert-NotMatches $clusterReadme '(?i)hosted[^\r\n]*\bPASS\b|\bPASS\b[^\r\n]*hosted' "Cluster README must not claim hosted PASS"
-Assert-NotMatches $clusterReadme '(?i)\bHA\b|multi-host' "Cluster README must not claim HA or multi-host operation"
+Assert-NotMatches $clusterReadme '(?i)\bHA\b' "Cluster README must not claim HA"
+Assert-NotMatches $clusterReadme '(?i)\b(?:supports|provides|enables|runs on|for) multi-host\b' "Cluster README must not claim multi-host operation"
 
-Assert-Matches $Roadmap '(?m)^- \[x\] IPFS Cluster for pinset replication\s*$' "RED: ROADMAP Cluster checkbox must be checked"
-Assert-Matches $Roadmap '(?m)^- \[ \] Private swarm \(swarm\.key\) for node-to-node communication\s*$' "ROADMAP Private swarm checkbox must remain unchecked"
+$v05RoadmapSections = [regex]::Matches($Roadmap, '(?ms)^## v0\.5 — Multi-node\r?\n(?<body>.*?)(?=^## |\z)')
+Assert-True ($v05RoadmapSections.Count -eq 1) "ROADMAP must contain exactly one v0.5 section"
+$expectedV05Roadmap = @(
+    "- [x] PostgreSQL production deployment",
+    "- [x] Multiple gateway instances (horizontal scaling)",
+    "- [x] IPFS Cluster for pinset replication",
+    "- [x] Private swarm (swarm.key) for node-to-node communication"
+) -join "`n"
+Assert-True ($v05RoadmapSections[0].Groups["body"].Value.Trim() -ceq $expectedV05Roadmap) "ROADMAP v0.5 must change only the Private swarm checkbox"
 
 Write-Host "cluster static contract tests: PASSED"

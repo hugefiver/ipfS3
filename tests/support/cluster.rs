@@ -1,11 +1,24 @@
 use anyhow::{Result, anyhow, ensure};
 use reqwest::{Client, StatusCode, Url};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{
+    Deserialize, Serialize,
+    de::{DeserializeOwned, Deserializer},
+};
 use sha2::{Digest, Sha256};
 use std::{collections::HashSet, fmt, fs::OpenOptions, io::Write, path::Path, time::Duration};
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+fn deserialize_null_vec_as_empty<'de, D, T>(
+    deserializer: D,
+) -> std::result::Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<Vec<T>>::deserialize(deserializer).map(Option::unwrap_or_default)
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClusterPeer {
@@ -49,6 +62,104 @@ pub struct PeerPinInfo {
     pub status: String,
     #[serde(default)]
     pub error: String,
+}
+
+#[derive(Deserialize)]
+pub struct KuboConfig {
+    #[serde(rename = "Bootstrap", default)]
+    bootstrap: Vec<String>,
+    #[serde(rename = "Routing")]
+    routing: KuboRouting,
+    #[serde(rename = "Discovery")]
+    discovery: KuboDiscovery,
+    #[serde(rename = "Addresses")]
+    addresses: KuboAddresses,
+    #[serde(rename = "AutoConf")]
+    auto_conf: KuboAutoConf,
+    #[serde(rename = "Swarm")]
+    swarm: KuboSwarmConfig,
+}
+
+#[derive(Deserialize)]
+struct KuboRouting {
+    #[serde(rename = "Type")]
+    kind: String,
+}
+
+#[derive(Deserialize)]
+struct KuboDiscovery {
+    #[serde(rename = "MDNS")]
+    mdns: KuboMdns,
+}
+
+#[derive(Deserialize)]
+struct KuboMdns {
+    #[serde(rename = "Enabled")]
+    enabled: bool,
+}
+
+#[derive(Deserialize)]
+struct KuboAutoConf {
+    #[serde(rename = "Enabled")]
+    enabled: bool,
+}
+
+#[derive(Deserialize)]
+struct KuboSwarmConfig {
+    #[serde(rename = "AddrFilters")]
+    addr_filters: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct KuboAddresses {
+    #[serde(rename = "Swarm", default)]
+    swarm: Vec<String>,
+}
+
+#[derive(Deserialize)]
+pub struct KuboIdentity {
+    #[serde(rename = "ID")]
+    id: String,
+}
+
+#[derive(Deserialize)]
+pub struct KuboSwarmPeers {
+    #[serde(
+        rename = "Peers",
+        default,
+        deserialize_with = "deserialize_null_vec_as_empty"
+    )]
+    peers: Vec<KuboSwarmPeer>,
+}
+
+#[derive(Deserialize)]
+struct KuboSwarmPeer {
+    #[serde(rename = "Peer")]
+    peer: String,
+}
+
+#[derive(Deserialize)]
+pub struct KuboPeeringPeers {
+    #[serde(rename = "Peers", default)]
+    peers: Vec<KuboPeeringPeer>,
+}
+
+#[derive(Deserialize)]
+struct KuboPeeringPeer {
+    #[serde(rename = "ID")]
+    id: String,
+    #[serde(rename = "Addrs", default)]
+    addrs: Vec<String>,
+}
+
+pub enum ConnectObservation {
+    Connected,
+    Rejected,
+}
+
+pub struct PrivateSwarmEvidence {
+    pub a_id: String,
+    pub b_id: String,
 }
 
 #[derive(Debug)]
@@ -95,6 +206,11 @@ pub struct RecoveryState {
 
 pub struct ClusterClient {
     base_url: String,
+    http: Client,
+}
+
+pub struct KuboApiClient {
+    base_url: Url,
     http: Client,
 }
 
@@ -189,6 +305,88 @@ impl ClusterClient {
     }
 }
 
+impl KuboApiClient {
+    pub fn new(endpoint: &str) -> Result<Self> {
+        let endpoint = validate_loopback_http(endpoint, "kubo_endpoint_not_loopback_http")?;
+        let base_url = Url::parse(&endpoint).map_err(|_| anyhow!("kubo_client_url_invalid"))?;
+        let http = Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(CALL_TIMEOUT)
+            .build()
+            .map_err(|_| anyhow!("kubo_client_build_failed"))?;
+
+        Ok(Self { base_url, http })
+    }
+
+    fn api_url(&self, path: &'static str) -> Url {
+        let mut url = self.base_url.clone();
+        url.set_path(path);
+        url
+    }
+
+    async fn post_json<T: DeserializeOwned>(
+        &self,
+        path: &'static str,
+        malformed_category: &'static str,
+    ) -> ProbeResult<T> {
+        let response = self
+            .http
+            .post(self.api_url(path))
+            .send()
+            .await
+            .map_err(|_| ProbeError::Transient("kubo_request_transport"))?;
+        if !response.status().is_success() {
+            return Err(ProbeError::Terminal("kubo_api_status_not_success"));
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|_| ProbeError::Transient("kubo_response_body_transport"))?;
+        serde_json::from_slice(&bytes).map_err(|_| ProbeError::Terminal(malformed_category))
+    }
+
+    pub async fn config_probe(&self) -> ProbeResult<KuboConfig> {
+        self.post_json("/api/v0/config/show", "kubo_config_malformed_json")
+            .await
+    }
+
+    pub async fn identity_probe(&self) -> ProbeResult<KuboIdentity> {
+        self.post_json("/api/v0/id", "kubo_identity_malformed_json")
+            .await
+    }
+
+    pub async fn swarm_peers_probe(&self) -> ProbeResult<KuboSwarmPeers> {
+        self.post_json("/api/v0/swarm/peers", "kubo_swarm_peers_malformed_json")
+            .await
+    }
+
+    pub async fn peering_probe(&self) -> ProbeResult<KuboPeeringPeers> {
+        self.post_json(
+            "/api/v0/swarm/peering/ls",
+            "kubo_peering_peers_malformed_json",
+        )
+        .await
+    }
+
+    pub async fn connect_probe(&self, address: &str) -> ProbeResult<ConnectObservation> {
+        let mut url = self.api_url("/api/v0/swarm/connect");
+        url.query_pairs_mut().append_pair("arg", address);
+        let response = self
+            .http
+            .post(url)
+            .send()
+            .await
+            .map_err(|_| ProbeError::Transient("kubo_connect_transport"))?;
+        let status = response.status();
+        drop(response);
+        if status.is_success() {
+            Ok(ConnectObservation::Connected)
+        } else {
+            Ok(ConnectObservation::Rejected)
+        }
+    }
+}
+
 #[derive(Debug)]
 enum PeerView {
     Pending(usize),
@@ -218,6 +416,226 @@ fn sorted_set(values: &[String]) -> Vec<String> {
         .collect::<Vec<_>>();
     unique.sort();
     unique
+}
+
+const PRIVATE_SWARM_LISTEN_ADDRESS: &str = "/ip4/0.0.0.0/tcp/4001";
+const PRIVATE_SWARM_A_TRANSPORT: &str = "/dns4/kubo-a/tcp/4001";
+const PRIVATE_SWARM_B_TRANSPORT: &str = "/dns4/kubo-b/tcp/4001";
+
+fn validate_private_kubo_config(config: &KuboConfig) -> ProbeResult<()> {
+    if config.bootstrap.is_empty()
+        && config.routing.kind == "none"
+        && !config.discovery.mdns.enabled
+        && !config.auto_conf.enabled
+        && config.swarm.addr_filters.is_empty()
+        && config.addresses.swarm.as_slice() == [PRIVATE_SWARM_LISTEN_ADDRESS]
+    {
+        Ok(())
+    } else {
+        Err(ProbeError::Terminal("private_kubo_config_contract_invalid"))
+    }
+}
+
+fn validate_private_peering(
+    peers: &KuboPeeringPeers,
+    expected_id: &str,
+    expected_transport: &str,
+) -> ProbeResult<()> {
+    let Some(peer) = peers.peers.first() else {
+        return Err(ProbeError::Terminal(
+            "private_kubo_peering_contract_invalid",
+        ));
+    };
+    if peers.peers.len() == 1
+        && peer.id == expected_id
+        && peer.addrs.as_slice() == [expected_transport]
+    {
+        Ok(())
+    } else {
+        Err(ProbeError::Terminal(
+            "private_kubo_peering_contract_invalid",
+        ))
+    }
+}
+
+fn private_swarm_identities(
+    a: &KuboIdentity,
+    b: &KuboIdentity,
+    c: &KuboIdentity,
+) -> ProbeResult<Option<PrivateSwarmEvidence>> {
+    if a.id.is_empty() || b.id.is_empty() || c.id.is_empty() {
+        return Ok(None);
+    }
+    if a.id == b.id || a.id == c.id || b.id == c.id {
+        return Err(ProbeError::Terminal(
+            "private_swarm_identity_contract_invalid",
+        ));
+    }
+    Ok(Some(PrivateSwarmEvidence {
+        a_id: a.id.clone(),
+        b_id: b.id.clone(),
+    }))
+}
+
+fn private_swarm_peer_set_ready(peers: &KuboSwarmPeers, expected_id: &str) -> ProbeResult<bool> {
+    if peers.peers.is_empty() {
+        return Ok(false);
+    }
+    if peers.peers.len() == 1 && peers.peers[0].peer == expected_id {
+        Ok(true)
+    } else {
+        Err(ProbeError::Terminal("private_swarm_peer_set_invalid"))
+    }
+}
+
+fn validate_empty_private_swarm_peer_set(peers: &KuboSwarmPeers) -> ProbeResult<()> {
+    if peers.peers.is_empty() {
+        Ok(())
+    } else {
+        Err(ProbeError::Terminal("private_swarm_peer_set_invalid"))
+    }
+}
+
+async fn observe_private_swarm(
+    a: &KuboApiClient,
+    b: &KuboApiClient,
+    c: &KuboApiClient,
+) -> ProbeResult<Option<PrivateSwarmEvidence>> {
+    let (
+        a_config,
+        b_config,
+        c_config,
+        a_identity,
+        b_identity,
+        c_identity,
+        a_peers,
+        b_peers,
+        c_peers,
+        a_peering,
+        b_peering,
+        c_peering,
+    ) = tokio::join!(
+        a.config_probe(),
+        b.config_probe(),
+        c.config_probe(),
+        a.identity_probe(),
+        b.identity_probe(),
+        c.identity_probe(),
+        a.swarm_peers_probe(),
+        b.swarm_peers_probe(),
+        c.swarm_peers_probe(),
+        a.peering_probe(),
+        b.peering_probe(),
+        c.peering_probe(),
+    );
+    let a_config = a_config?;
+    let b_config = b_config?;
+    let c_config = c_config?;
+    let a_identity = a_identity?;
+    let b_identity = b_identity?;
+    let c_identity = c_identity?;
+    let a_peers = a_peers?;
+    let b_peers = b_peers?;
+    let c_peers = c_peers?;
+    let a_peering = a_peering?;
+    let b_peering = b_peering?;
+    let c_peering = c_peering?;
+
+    validate_private_kubo_config(&a_config)?;
+    validate_private_kubo_config(&b_config)?;
+    validate_private_kubo_config(&c_config)?;
+    let Some(evidence) = private_swarm_identities(&a_identity, &b_identity, &c_identity)? else {
+        return Ok(None);
+    };
+
+    let a_peers_ready = private_swarm_peer_set_ready(&a_peers, &evidence.b_id)?;
+    let b_peers_ready = private_swarm_peer_set_ready(&b_peers, &evidence.a_id)?;
+    validate_empty_private_swarm_peer_set(&c_peers)?;
+    if !c_peering.peers.is_empty() {
+        return Err(ProbeError::Terminal(
+            "private_kubo_peering_contract_invalid",
+        ));
+    }
+    if !a_peers_ready || !b_peers_ready {
+        return Ok(None);
+    }
+
+    if a_peering.peers.is_empty() || b_peering.peers.is_empty() {
+        return Ok(None);
+    }
+    validate_private_peering(&a_peering, &evidence.b_id, PRIVATE_SWARM_B_TRANSPORT)?;
+    validate_private_peering(&b_peering, &evidence.a_id, PRIVATE_SWARM_A_TRANSPORT)?;
+    Ok(Some(evidence))
+}
+
+async fn wait_for_private_swarm_retry(
+    deadline: tokio::time::Instant,
+    timeout_category: &'static str,
+) -> ProbeResult<()> {
+    let now = tokio::time::Instant::now();
+    if now >= deadline {
+        return Err(ProbeError::Terminal(timeout_category));
+    }
+    let remaining = deadline.saturating_duration_since(now);
+    let sleep_for = if remaining < POLL_INTERVAL {
+        remaining
+    } else {
+        POLL_INTERVAL
+    };
+    tokio::time::sleep(sleep_for).await;
+    Ok(())
+}
+
+pub async fn wait_for_private_swarm(
+    a: &KuboApiClient,
+    b: &KuboApiClient,
+    c: &KuboApiClient,
+    timeout: Duration,
+) -> ProbeResult<PrivateSwarmEvidence> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        match observe_private_swarm(a, b, c).await {
+            Ok(Some(evidence)) => return Ok(evidence),
+            Ok(None) | Err(ProbeError::Transient(_)) => {
+                wait_for_private_swarm_retry(deadline, "private_swarm_convergence_timeout").await?;
+            }
+            Err(error @ ProbeError::Terminal(_)) => return Err(error),
+        }
+    }
+}
+
+pub async fn prove_wrong_key_rejection(
+    a: &KuboApiClient,
+    b: &KuboApiClient,
+    c: &KuboApiClient,
+    evidence: &PrivateSwarmEvidence,
+) -> ProbeResult<()> {
+    let a_address = format!("{PRIVATE_SWARM_A_TRANSPORT}/p2p/{}", evidence.a_id);
+    let b_address = format!("{PRIVATE_SWARM_B_TRANSPORT}/p2p/{}", evidence.b_id);
+    let (a_connect, b_connect) =
+        tokio::join!(c.connect_probe(&a_address), c.connect_probe(&b_address));
+    let a_connect = a_connect?;
+    let b_connect = b_connect?;
+    if !matches!(a_connect, ConnectObservation::Rejected)
+        || !matches!(b_connect, ConnectObservation::Rejected)
+    {
+        return Err(ProbeError::Terminal("wrong_key_connect_not_rejected"));
+    }
+
+    let (a_peers, b_peers, c_peers) = tokio::join!(
+        a.swarm_peers_probe(),
+        b.swarm_peers_probe(),
+        c.swarm_peers_probe(),
+    );
+    let a_peers = a_peers?;
+    let b_peers = b_peers?;
+    let c_peers = c_peers?;
+    if !private_swarm_peer_set_ready(&a_peers, &evidence.b_id)?
+        || !private_swarm_peer_set_ready(&b_peers, &evidence.a_id)?
+    {
+        return Err(ProbeError::Terminal("private_swarm_peer_set_invalid"));
+    }
+    validate_empty_private_swarm_peer_set(&c_peers)
 }
 
 async fn probe_peer_view(client: &ClusterClient) -> ProbeResult<PeerView> {
@@ -637,5 +1055,272 @@ fn release_version_validator_accepts_exact_release_and_build_metadata() {
         "1.1.6+*",
     ] {
         assert!(!is_release_1_1_6_version(version));
+    }
+}
+
+#[test]
+fn private_kubo_config_contract_rejects_open_discovery() {
+    let config: KuboConfig = serde_json::from_value(serde_json::json!({
+        "Bootstrap": [],
+        "Routing": { "Type": "none" },
+        "Discovery": { "MDNS": { "Enabled": false } },
+        "AutoConf": { "Enabled": false },
+        "Swarm": { "AddrFilters": [] },
+        "Addresses": { "Swarm": ["/ip4/0.0.0.0/tcp/4001"] }
+    }))
+    .expect("closed_kubo_config_fixture_invalid");
+    assert!(validate_private_kubo_config(&config).is_ok());
+
+    let missing_bootstrap: KuboConfig = serde_json::from_value(serde_json::json!({
+        "Routing": { "Type": "none" },
+        "Discovery": { "MDNS": { "Enabled": false } },
+        "AutoConf": { "Enabled": false },
+        "Swarm": { "AddrFilters": [] },
+        "Addresses": { "Swarm": ["/ip4/0.0.0.0/tcp/4001"] }
+    }))
+    .expect("missing_bootstrap_fixture_invalid");
+    assert!(missing_bootstrap.bootstrap.is_empty());
+    assert!(validate_private_kubo_config(&missing_bootstrap).is_ok());
+
+    let missing_swarm: KuboConfig = serde_json::from_value(serde_json::json!({
+        "Bootstrap": [],
+        "Routing": { "Type": "none" },
+        "Discovery": { "MDNS": { "Enabled": false } },
+        "AutoConf": { "Enabled": false },
+        "Swarm": { "AddrFilters": [] },
+        "Addresses": {}
+    }))
+    .expect("missing_swarm_fixture_invalid");
+    assert!(missing_swarm.addresses.swarm.is_empty());
+    assert!(matches!(
+        validate_private_kubo_config(&missing_swarm),
+        Err(ProbeError::Terminal("private_kubo_config_contract_invalid"))
+    ));
+
+    let auto_conf_enabled: KuboConfig = serde_json::from_value(serde_json::json!({
+        "Bootstrap": [],
+        "Routing": { "Type": "none" },
+        "Discovery": { "MDNS": { "Enabled": false } },
+        "AutoConf": { "Enabled": true },
+        "Swarm": { "AddrFilters": [] },
+        "Addresses": { "Swarm": ["/ip4/0.0.0.0/tcp/4001"] }
+    }))
+    .expect("auto_conf_enabled_fixture_invalid");
+    assert!(matches!(
+        validate_private_kubo_config(&auto_conf_enabled),
+        Err(ProbeError::Terminal("private_kubo_config_contract_invalid"))
+    ));
+
+    let missing_auto_conf = serde_json::from_value::<KuboConfig>(serde_json::json!({
+        "Bootstrap": [],
+        "Routing": { "Type": "none" },
+        "Discovery": { "MDNS": { "Enabled": false } },
+        "Swarm": { "AddrFilters": [] },
+        "Addresses": { "Swarm": ["/ip4/0.0.0.0/tcp/4001"] }
+    }));
+    assert!(missing_auto_conf.is_err());
+
+    let missing_auto_conf_enabled = serde_json::from_value::<KuboConfig>(serde_json::json!({
+        "Bootstrap": [],
+        "Routing": { "Type": "none" },
+        "Discovery": { "MDNS": { "Enabled": false } },
+        "AutoConf": {},
+        "Swarm": { "AddrFilters": [] },
+        "Addresses": { "Swarm": ["/ip4/0.0.0.0/tcp/4001"] }
+    }));
+    assert!(missing_auto_conf_enabled.is_err());
+
+    let addr_filters_open: KuboConfig = serde_json::from_value(serde_json::json!({
+        "Bootstrap": [],
+        "Routing": { "Type": "none" },
+        "Discovery": { "MDNS": { "Enabled": false } },
+        "AutoConf": { "Enabled": false },
+        "Swarm": { "AddrFilters": ["/ip4/172.16.0.0/ipcidr/12"] },
+        "Addresses": { "Swarm": ["/ip4/0.0.0.0/tcp/4001"] }
+    }))
+    .expect("addr_filters_open_fixture_invalid");
+    assert!(matches!(
+        validate_private_kubo_config(&addr_filters_open),
+        Err(ProbeError::Terminal("private_kubo_config_contract_invalid"))
+    ));
+
+    let missing_swarm_config = serde_json::from_value::<KuboConfig>(serde_json::json!({
+        "Bootstrap": [],
+        "Routing": { "Type": "none" },
+        "Discovery": { "MDNS": { "Enabled": false } },
+        "AutoConf": { "Enabled": false },
+        "Addresses": { "Swarm": ["/ip4/0.0.0.0/tcp/4001"] }
+    }));
+    assert!(missing_swarm_config.is_err());
+
+    let missing_addr_filters = serde_json::from_value::<KuboConfig>(serde_json::json!({
+        "Bootstrap": [],
+        "Routing": { "Type": "none" },
+        "Discovery": { "MDNS": { "Enabled": false } },
+        "AutoConf": { "Enabled": false },
+        "Swarm": {},
+        "Addresses": { "Swarm": ["/ip4/0.0.0.0/tcp/4001"] }
+    }));
+    assert!(missing_addr_filters.is_err());
+
+    for fixture in [
+        serde_json::json!({
+            "Bootstrap": ["bootstrap"],
+            "Routing": { "Type": "none" },
+            "Discovery": { "MDNS": { "Enabled": false } },
+            "AutoConf": { "Enabled": false },
+            "Swarm": { "AddrFilters": [] },
+            "Addresses": { "Swarm": ["/ip4/0.0.0.0/tcp/4001"] }
+        }),
+        serde_json::json!({
+            "Bootstrap": [],
+            "Routing": { "Type": "dht" },
+            "Discovery": { "MDNS": { "Enabled": false } },
+            "AutoConf": { "Enabled": false },
+            "Swarm": { "AddrFilters": [] },
+            "Addresses": { "Swarm": ["/ip4/0.0.0.0/tcp/4001"] }
+        }),
+        serde_json::json!({
+            "Bootstrap": [],
+            "Routing": { "Type": "none" },
+            "Discovery": { "MDNS": { "Enabled": true } },
+            "AutoConf": { "Enabled": false },
+            "Swarm": { "AddrFilters": [] },
+            "Addresses": { "Swarm": ["/ip4/0.0.0.0/tcp/4001"] }
+        }),
+        serde_json::json!({
+            "Bootstrap": [],
+            "Routing": { "Type": "none" },
+            "Discovery": { "MDNS": { "Enabled": false } },
+            "AutoConf": { "Enabled": false },
+            "Swarm": { "AddrFilters": [] },
+            "Addresses": {
+                "Swarm": ["/ip4/0.0.0.0/tcp/4001", "/ip6/::/tcp/4001"]
+            }
+        }),
+    ] {
+        let config: KuboConfig =
+            serde_json::from_value(fixture).expect("open_kubo_config_fixture_invalid");
+        assert!(matches!(
+            validate_private_kubo_config(&config),
+            Err(ProbeError::Terminal("private_kubo_config_contract_invalid"))
+        ));
+    }
+}
+
+#[test]
+fn kubo_swarm_peers_null_is_empty_without_ndjson() {
+    let wrapped: KuboSwarmPeers = serde_json::from_value(serde_json::json!({
+        "Peers": [{ "Peer": "peer-a" }]
+    }))
+    .expect("wrapped_swarm_peers_fixture_invalid");
+    assert!(wrapped.peers.len() == 1);
+    assert!(wrapped.peers[0].peer == "peer-a");
+
+    for fixture in [serde_json::json!({ "Peers": null }), serde_json::json!({})] {
+        let peers: KuboSwarmPeers =
+            serde_json::from_value(fixture).expect("empty_swarm_peers_fixture_invalid");
+        assert!(peers.peers.is_empty());
+    }
+
+    let non_array = serde_json::from_value::<KuboSwarmPeers>(serde_json::json!({
+        "Peers": {}
+    }));
+    assert!(non_array.is_err());
+}
+
+#[test]
+fn private_peering_json_contract_matches_kubo_v0_43_addrinfo() {
+    for (_, fixture) in [
+        ("empty_swarm_peers", serde_json::json!({ "Peers": [] })),
+        ("missing_swarm_peers", serde_json::json!({})),
+    ] {
+        let peers: KuboSwarmPeers =
+            serde_json::from_value(fixture).expect("swarm_peers_fixture_invalid");
+        assert!(peers.peers.is_empty());
+    }
+
+    for (_, fixture) in [
+        ("empty_peering_peers", serde_json::json!({ "Peers": [] })),
+        ("missing_peering_peers", serde_json::json!({})),
+    ] {
+        let peers: KuboPeeringPeers =
+            serde_json::from_value(fixture).expect("peering_peers_fixture_invalid");
+        assert!(peers.peers.is_empty());
+    }
+
+    let missing_addrs: KuboPeeringPeers = serde_json::from_value(serde_json::json!({
+        "Peers": [{ "ID": "peer-b" }]
+    }))
+    .expect("missing_addrs_fixture_invalid");
+    assert!(missing_addrs.peers[0].addrs.is_empty());
+    assert!(matches!(
+        validate_private_peering(&missing_addrs, "peer-b", PRIVATE_SWARM_B_TRANSPORT),
+        Err(ProbeError::Terminal(
+            "private_kubo_peering_contract_invalid"
+        ))
+    ));
+
+    let peers: KuboPeeringPeers = serde_json::from_value(serde_json::json!({
+        "Peers": [
+            { "ID": "peer-b", "Addrs": ["/dns4/kubo-b/tcp/4001"] }
+        ]
+    }))
+    .expect("valid_peering_fixture_invalid");
+    assert!(validate_private_peering(&peers, "peer-b", PRIVATE_SWARM_B_TRANSPORT).is_ok());
+
+    for (name, fixture) in [
+        (
+            "extra-peer",
+            serde_json::json!({
+                "Peers": [
+                    { "ID": "peer-b", "Addrs": ["/dns4/kubo-b/tcp/4001"] },
+                    { "ID": "peer-c", "Addrs": ["/dns4/kubo-c/tcp/4001"] }
+                ]
+            }),
+        ),
+        (
+            "extra-address",
+            serde_json::json!({
+                "Peers": [
+                    {
+                        "ID": "peer-b",
+                        "Addrs": [
+                            "/dns4/kubo-b/tcp/4001",
+                            "/dns4/extra-address/tcp/4001"
+                        ]
+                    }
+                ]
+            }),
+        ),
+        (
+            "wrong-id",
+            serde_json::json!({
+                "Peers": [
+                    { "ID": "wrong-id", "Addrs": ["/dns4/kubo-b/tcp/4001"] }
+                ]
+            }),
+        ),
+        (
+            "wrong-address",
+            serde_json::json!({
+                "Peers": [
+                    {
+                        "ID": "peer-b",
+                        "Addrs": ["/dns4/wrong-address/tcp/4001"]
+                    }
+                ]
+            }),
+        ),
+    ] {
+        let peers: KuboPeeringPeers =
+            serde_json::from_value(fixture).expect("invalid_peering_fixture_invalid");
+        assert!(matches!(
+            validate_private_peering(&peers, "peer-b", PRIVATE_SWARM_B_TRANSPORT),
+            Err(ProbeError::Terminal(
+                "private_kubo_peering_contract_invalid"
+            ))
+        ));
+        assert!(!name.is_empty());
     }
 }

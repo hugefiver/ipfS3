@@ -133,18 +133,39 @@ master-key rotation.
 ### IPFS Cluster pinset replication
 
 `docker-compose.cluster.yml` is a separate one-gateway profile, not combined
-with horizontal scaling. It starts exactly six roles: PostgreSQL 17; Kubo A and
-Kubo B at v0.43.0 with separate repositories; Cluster A and Cluster B in full
-CRDT mode at v1.1.6 with separate identities; and the gateway through the
-Cluster A proxy. Each peer's connector and proxy forwarder target its paired
-Kubo DNS endpoint. They never use a container-local Kubo loopback address or a
-different peer's Kubo endpoint. Replication is min=max 2, with same-host Compose
-mDNS only. This profile makes no claim beyond one Docker host.
+with horizontal scaling. It starts exactly seven roles: PostgreSQL 17; Kubo A
+and Kubo B at v0.43.0 with separate repositories; a one-shot swarm-bootstrap
+service; Cluster A and Cluster B in full CRDT mode at v1.1.6 with separate
+identities; and the gateway through the Cluster A proxy. Each peer's connector
+and proxy forwarder target its paired Kubo DNS endpoint. They never use a
+container-local Kubo loopback address or a different peer's Kubo endpoint.
+Replication is min=max 2. This profile is same-host only and makes no claim
+beyond one Docker host.
+
+Kubo A and Kubo B use a shared Kubo `swarm.key` PSK that is separate from
+`IPFS_S3_CLUSTER_SECRET`. The one-shot swarm-bootstrap service ensures that
+Kubo A and Kubo B each retain one persistent Peering entry for the other as their
+sole peer. AutoConf disabled, public bootstrap is empty, routing is `none`, and
+mDNS is disabled. The server-profile RFC1918 `Swarm.AddrFilters` are cleared
+solely for the PSK-gated internal Docker bridge.
+
+The PSK is limited to PSK membership and libp2p connection protection for Kubo
+node-to-node traffic. It does not control container egress, does not encrypt or
+authenticate REST, and does not provide high availability, multi-host discovery,
+online rotation, or member revocation. Rotation requires coordinated downtime
+and is not automated.
 
 Set fresh values in the current PowerShell session. The password, access key,
 and secret below are cryptographically random URL-safe values. The 32-byte
-master key and 32-byte Cluster secret are rendered as lowercase hex. The bind
-and port are explicit, and Compose ignores any `.env` file.
+master key and 32-byte Cluster secret are rendered as lowercase hex. Generate
+the shared swarm key from 32 random bytes before the remaining variables. Its
+file has exactly three LF-terminated lines: `/key/swarm/psk/1.0.0/`, `/base16/`,
+and the lowercase 64-hex-character key. The generator writes UTF-8 without a
+BOM through `CreateNew`, sets only the exact path in
+`$env:IPFS_S3_SWARM_KEY_FILE`, and does not print the key or a digest. Use a
+persistent operator path outside the repository, protect the directory and file
+with host ACLs. Never commit the swarm-key file. The bind and port are explicit,
+and Compose ignores any `.env` file.
 
 This bounded same-host profile publishes the gateway only on fixed host loopback
 `127.0.0.1`. `IPFS_S3_GATEWAY_BIND=127.0.0.1` is a required acknowledgement;
@@ -153,6 +174,28 @@ External clients require a separately secured TLS/auth reverse proxy, which is
 out of scope and not shipped by this profile.
 
 ```powershell
+$swarmKeyDirectory = Join-Path $HOME ".ipfs3/secrets"
+$null = [IO.Directory]::CreateDirectory($swarmKeyDirectory)
+$swarmKeyPath = Join-Path $swarmKeyDirectory "swarm.key"
+$swarmKeyBytes = [byte[]]::new(32)
+[Security.Cryptography.RandomNumberGenerator]::Fill($swarmKeyBytes)
+$swarmKeyHex = [Convert]::ToHexString($swarmKeyBytes).ToLowerInvariant()
+$swarmKeyText = "/key/swarm/psk/1.0.0/`n/base16/`n$swarmKeyHex`n"
+$swarmKeyPayload = [Text.UTF8Encoding]::new($false).GetBytes($swarmKeyText)
+$swarmKeyStream = [IO.File]::Open(
+    $swarmKeyPath,
+    [IO.FileMode]::CreateNew,
+    [IO.FileAccess]::Write,
+    [IO.FileShare]::None
+)
+try {
+    $swarmKeyStream.Write($swarmKeyPayload, 0, $swarmKeyPayload.Length)
+    $swarmKeyStream.Flush($true)
+} finally {
+    $swarmKeyStream.Dispose()
+}
+$env:IPFS_S3_SWARM_KEY_FILE = $swarmKeyPath
+
 function New-UrlSafeSecret {
     param([int]$ByteCount = 32)
 
@@ -181,9 +224,13 @@ docker compose -f docker-compose.cluster.yml up --detach --build --wait --wait-t
 if ($LASTEXITCODE -ne 0) { throw "Cluster profile did not become healthy" }
 ```
 
+These production commands use the base `docker-compose.cluster.yml` and its
+required environment paths. Do not add the validation override to production.
+
 Store these generated secrets before the first write and restore them unchanged
 for every later start. Changing the master key breaks encrypted objects;
-changing the Cluster secret breaks membership.
+changing the Cluster secret breaks Cluster membership. Keep the same swarm-key
+file path and content for both Kubo peers.
 
 Local service health is insufficient. The shipped validator first runs an
 identity-suppressed no-write exact-two-peer gate, which reports only
@@ -191,11 +238,11 @@ count/normalized v1.1.6, then proves complete production
 `add(pin=false)` -> `pin/add` -> `cat` compatibility before replication. It
 does not print identities.
 
-A PUT followed by an immediate GET proves the local A path only. Replication is
-accepted only at exact 2/2 allocations and when both physical tracker states are
-`pinned`. Kubo B reads only afterward, and the gateway has no fallback. `S3
-DELETE` removes metadata and produces `HEAD 404`, but intentionally does not
-unpin, so the allocation and Kubo B bytes remain.
+A PUT followed by an immediate GET proves the local A path only. Replication
+eventually reaches exact 2/2 allocations and is accepted only when both physical
+tracker states are `pinned`. Kubo B reads only afterward, and the gateway has no
+fallback. `S3 DELETE` removes metadata and produces `HEAD 404`, but intentionally
+does not unpin, so the allocation and Kubo B bytes remain.
 
 Peer-B stop/restart evidence proves loss and recovery of the two-pin state with
 the existing volumes. It does not demonstrate high availability, and 2/2 does
@@ -206,9 +253,8 @@ Kubo, Cluster, gateway, or host high availability.
 Production PostgreSQL, Kubo, Cluster REST, Cluster proxy, and swarm endpoints
 are internal. The validation alone exposes the Cluster A proxy at loopback
 `59103`; any non-loopback access needs TLS and authentication, and TLS and
-authentication are not implemented. The Cluster secret protects Cluster
-membership, not the private Kubo swarm. Private swarm remains unchecked. Hosted
-job: `NOT RUN`.
+authentication are not implemented. Validation-only Kubo C on loopback `55102`
+uses a wrong key to prove it cannot join the private swarm. Hosted job: `NOT RUN`.
 
 For production shutdown, use only the following command and check its exit
 status:

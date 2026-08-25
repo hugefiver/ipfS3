@@ -437,6 +437,9 @@ jobs:
       IPFS_S3_CLUSTER_A_PROXY_URL: http://127.0.0.1:59103
       IPFS_S3_CLUSTER_KUBO_A_URL: http://127.0.0.1:55100
       IPFS_S3_CLUSTER_KUBO_B_URL: http://127.0.0.1:55101
+      IPFS_S3_CLUSTER_KUBO_C_URL: http://127.0.0.1:55102
+      IPFS_S3_SWARM_KEY_FILE: ${{ runner.temp }}/ipfs3-swarm-${{ github.run_id }}-${{ github.run_attempt }}.key
+      IPFS_S3_SWARM_KEY_WRONG_FILE: ${{ runner.temp }}/ipfs3-swarm-wrong-${{ github.run_id }}-${{ github.run_attempt }}.key
       IPFS_S3_CLUSTER_STATE_PATH: ${{ runner.temp }}/ipfs3-cluster-${{ github.run_id }}-${{ github.run_attempt }}.json
     steps:
       - uses: actions/checkout@v7
@@ -466,6 +469,54 @@ jobs:
       - name: Verify Cluster environment contract
         shell: pwsh
         run: |
+          function New-PrivateSwarmHex {
+              $bytes = [byte[]]::new(32)
+              [Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+              $hex = [Convert]::ToHexString($bytes).ToLowerInvariant()
+              $decoded = [Convert]::FromHexString($hex)
+              if ($hex -notmatch '^[0-9a-f]{64}$' -or $decoded.Length -ne 32 -or [Convert]::ToHexString($decoded).ToLowerInvariant() -cne $hex) {
+                  throw "Private swarm random key decoding failed"
+              }
+              return $hex
+          }
+          function Write-PrivateSwarmKey {
+              param(
+                  [Parameter(Mandatory)][string]$Path,
+                  [Parameter(Mandatory)][string]$Hex
+              )
+              $runnerTemp = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+              $canonicalPath = [IO.Path]::GetFullPath($Path)
+              if ([IO.Path]::GetDirectoryName($canonicalPath) -cne $runnerTemp) { throw "Private swarm key path must have RUNNER_TEMP as its canonical parent" }
+              $decoded = [Convert]::FromHexString($Hex)
+              if ($Hex -notmatch '^[0-9a-f]{64}$' -or $decoded.Length -ne 32 -or [Convert]::ToHexString($decoded).ToLowerInvariant() -cne $Hex) {
+                  throw "Private swarm key encoding is invalid"
+              }
+              $bytes = [Text.Encoding]::ASCII.GetBytes("/key/swarm/psk/1.0.0/`n/base16/`n$Hex`n")
+              if ($bytes.Length -ne 96) { throw "Private swarm key must be exactly 96 ASCII LF bytes" }
+              $stream = $null
+              $created = $false
+              try {
+                  $stream = [IO.File]::Open($canonicalPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+                  $created = $true
+                  $stream.Write($bytes, 0, $bytes.Length)
+                  $stream.Flush($true)
+              } catch {
+                  if ($null -ne $stream) { $stream.Dispose(); $stream = $null }
+                  if ($created) { Remove-Item -LiteralPath $canonicalPath -Force -ErrorAction SilentlyContinue }
+                  throw
+              } finally {
+                  if ($null -ne $stream) { $stream.Dispose() }
+              }
+          }
+          $mainSwarmHex = New-PrivateSwarmHex
+          do { $wrongSwarmHex = New-PrivateSwarmHex } while ($wrongSwarmHex -ceq $mainSwarmHex)
+          Write-PrivateSwarmKey -Path $env:IPFS_S3_SWARM_KEY_FILE -Hex $mainSwarmHex
+          "CLUSTER_SWARM_KEY_OWNED=true" | Add-Content -LiteralPath $env:GITHUB_ENV
+          Write-PrivateSwarmKey -Path $env:IPFS_S3_SWARM_KEY_WRONG_FILE -Hex $wrongSwarmHex
+          "CLUSTER_SWARM_KEY_WRONG_OWNED=true" | Add-Content -LiteralPath $env:GITHUB_ENV
+          $mainSwarmHex = $null
+          $wrongSwarmHex = $null
+          "CLUSTER_SWARM_KEY_FILES_READY=true" | Add-Content -LiteralPath $env:GITHUB_ENV
           $compose = @(
               "--project-name", $env:COMPOSE_PROJECT_NAME,
               "-f", "docker-compose.cluster.yml",
@@ -478,7 +529,9 @@ jobs:
               "IPFS_S3_MASTER_KEY",
               "IPFS_S3_CLUSTER_SECRET",
               "IPFS_S3_GATEWAY_BIND",
-              "IPFS_S3_GATEWAY_PORT"
+              "IPFS_S3_GATEWAY_PORT",
+              "IPFS_S3_SWARM_KEY_FILE",
+              "IPFS_S3_SWARM_KEY_WRONG_FILE"
           )
           $savedRequiredValues = @{}
           foreach ($requiredName in $requiredNames) {
@@ -525,7 +578,7 @@ jobs:
           $volumeExit = $LASTEXITCODE
           if ($containerExit -ne 0 -or $networkExit -ne 0 -or $volumeExit -ne 0) { throw "Project ownership preflight query failed" }
           if (($containers.Count + $networks.Count + $volumes.Count) -ne 0) { throw "Unique project already owns resources: $project" }
-          foreach ($port in @(55435, 55100, 55101, 59100, 59101, 59102, 59103)) {
+          foreach ($port in @(55435, 55100, 55101, 55102, 59100, 59101, 59102, 59103)) {
               $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, $port)
               try { $listener.Start() } catch { throw "Fixed validation port is occupied: $port" } finally { $listener.Stop() }
           }
@@ -552,8 +605,167 @@ jobs:
         shell: pwsh
         run: |
           "CLUSTER_PINSET_ATTEMPTED=true" | Add-Content -LiteralPath $env:GITHUB_ENV
-          docker compose --project-name $env:COMPOSE_PROJECT_NAME -f docker-compose.cluster.yml -f tests/compose.cluster-validation.yml up --detach --build --wait --wait-timeout 300 postgres kubo-a kubo-b cluster-a cluster-b gateway
+          function Protect-ClusterDiagnosticLine {
+              param([AllowEmptyString()][string]$Line)
+              $safe = $Line
+              $safe = [regex]::Replace($safe, '(Swarm key fingerprint: )[0-9a-f]{32}(?=\s*$)', '$1[redacted]')
+              $safe = [regex]::Replace($safe, '(?m)^/key/swarm/psk/1\.0\.0/\s*$', '[REDACTED_SWARM_KEY_HEADER]')
+              $safe = [regex]::Replace($safe, '(?m)^/base16/\s*$', '[REDACTED_SWARM_KEY_HEADER]')
+              $safe = [regex]::Replace($safe, '(?<![0-9A-Fa-f])[0-9A-Fa-f]{64}(?![0-9A-Fa-f])', '[REDACTED_HEX]')
+              $safe = [regex]::Replace($safe, '(?i)((?:"?)(?:PeerID|peer_id|peer-id)(?:"?)\s*[:=]\s*)(?:"[^"]*"|''[^'']*''|[^\s,;]+)', '$1[REDACTED_PEER_ID]')
+              $safe = [regex]::Replace($safe, '(?i)(/p2p/)[1-9A-HJ-NP-Za-km-z]+', '$1[REDACTED_PEER_ID]')
+              $safe = [regex]::Replace($safe, '(?<![1-9A-HJ-NP-Za-km-z])12D3Koo[1-9A-HJ-NP-Za-km-z]{20,}(?![1-9A-HJ-NP-Za-km-z])', '[REDACTED_PEER_ID]')
+              if ($safe -match '(?i)\b(?:peer(?:[_-]?id)?|peerid|identity|peerstore)\b') {
+                  $safe = [regex]::Replace($safe, '(?<![1-9A-HJ-NP-Za-km-z])Qm[1-9A-HJ-NP-Za-km-z]{44}(?![1-9A-HJ-NP-Za-km-z])', '[REDACTED_PEER_ID]')
+              }
+              return $safe
+          }
+          function Invoke-PrivateSwarmNegative {
+              param([Parameter(Mandatory)][string[]]$RunArgs)
+              $rawLines = @(docker compose --project-name $env:COMPOSE_PROJECT_NAME -f docker-compose.cluster.yml -f tests/compose.cluster-validation.yml run --no-deps --rm @RunArgs kubo-a 2>&1)
+              $exitCode = $LASTEXITCODE
+              $safeLines = @($rawLines | ForEach-Object { Protect-ClusterDiagnosticLine -Line "$_" })
+              $safeText = $safeLines -join "`n"
+              if ($exitCode -eq 0) { throw "Private swarm negative probe unexpectedly succeeded" }
+              if (([regex]::Matches($safeText, [regex]::Escape('private swarm startup rejected'))).Count -ne 1) { throw "Private swarm negative probe did not produce its fixed rejection" }
+              if ($safeText -match '(?i)\b(?:ready|readiness|swarm key|/key/swarm)\b|(?<![0-9A-Fa-f])[0-9A-Fa-f]{64}(?![0-9A-Fa-f])') { throw "Private swarm negative probe emitted forbidden output" }
+              [Console]::Out.WriteLine('private swarm startup rejected')
+          }
+          function Invoke-PrivateSwarmSupervisorProof {
+              param(
+                  [Parameter(Mandatory)][ValidateSet('normal', 'handled', 'unhandled')][string]$Mode,
+                  [Parameter(Mandatory)][int]$ExpectedExit
+              )
+              $project = $env:COMPOSE_PROJECT_NAME
+              $name = "$project-private-swarm-proof-$Mode"
+              $fullKeyPath = [IO.Path]::GetFullPath($env:IPFS_S3_SWARM_KEY_FILE)
+              $stub = @'
+          mkdir -p /tmp/ipfs-stub
+          printf '%s\n' '#!/bin/sh' 'case "$1" in' '  init|config) exit 0 ;;' '  daemon)' '    printf "%s\n" "Swarm key fingerprint: $(printf "%032d" 0)"' '    case "$PROOF_MODE" in' '      normal) exit 37 ;;' '      handled) trap "exit 43" TERM; while :; do sleep 1; done ;;' '      unhandled) while :; do sleep 1; done ;;' '    esac' '    ;;' '  *) exit 0 ;;' 'esac' > /tmp/ipfs-stub/ipfs
+          chmod 0755 /tmp/ipfs-stub/ipfs
+          PATH=/tmp/ipfs-stub:$PATH exec /private-swarm-entrypoint.sh
+          '@
+              $runArgs = @(
+                  "--detach", "--name", $name,
+                  "--label", "com.docker.compose.project=$project",
+                  "--label", "ipfs3.cluster.private-swarm-proof=$Mode",
+                  "--network", "none",
+                  "--mount", "type=bind,src=$fullKeyPath,dst=/run/secrets/swarm_key,readonly",
+                  "--env", "IPFS_SWARM_KEY_FILE=/run/secrets/swarm_key",
+                  "--env", "LIBP2P_FORCE_PNET=1",
+                  "--env", "IPFS_PATH=/tmp/ipfs-proof",
+                  "--env", "PROOF_MODE=$Mode",
+                  "--entrypoint", "/bin/sh",
+                  "ghcr.io/hugefiver/ipfs3-kubo-cluster:v0.43.0", "-ec", $stub
+              )
+              $createOutput = @(docker run @runArgs 2>&1)
+              $createExit = $LASTEXITCODE
+              if ($createExit -ne 0) { throw "Private swarm supervisor proof container creation failed" }
+              if ($Mode -ne 'normal') {
+                  Start-Sleep -Milliseconds 500
+                  $stopOutput = @(docker stop --time 30 $name 2>&1)
+                  if ($LASTEXITCODE -ne 0) { throw "Private swarm supervisor proof TERM delivery failed" }
+              }
+              $waitOutput = @(docker wait $name 2>&1)
+              $waitExit = $LASTEXITCODE
+              $waitValues = @($waitOutput | ForEach-Object { "$($_)".Trim() } | Where-Object { $_ -ne "" })
+              if ($waitExit -ne 0 -or $waitValues.Count -ne 1 -or $waitValues[0] -cne "$ExpectedExit") { throw "Private swarm supervisor proof docker wait status was unexpected" }
+              $stateOutput = @(docker inspect --format '{{.State.Pid}} {{.State.ExitCode}}' $name 2>&1)
+              $stateExit = $LASTEXITCODE
+              $stateValues = @($stateOutput | ForEach-Object { "$($_)".Trim() } | Where-Object { $_ -ne "" })
+              if ($stateExit -ne 0 -or $stateValues.Count -ne 1 -or $stateValues[0] -cne "0 $ExpectedExit") { throw "Private swarm supervisor proof must finish with PID 0 and its exact exit" }
+              $proofLogs = @(docker logs $name 2>&1)
+              $logsExit = $LASTEXITCODE
+              $safeProofLogs = @($proofLogs | ForEach-Object { Protect-ClusterDiagnosticLine -Line "$_" })
+              $safeProofText = $safeProofLogs -join "`n"
+              if ($logsExit -ne 0 -or $safeProofText -match '(?m)^Swarm key fingerprint: [0-9a-f]{32}\s*$' -or $safeProofText -notmatch [regex]::Escape('Swarm key fingerprint: [redacted]')) { throw "Private swarm supervisor proof did not filter its fingerprint" }
+              $proofDiff = @(docker diff $name 2>&1)
+              if ($LASTEXITCODE -ne 0 -or ($proofDiff -join "`n") -match '(?im)(?:fifo|daemon-log)') { throw "Private swarm supervisor proof retained a FIFO" }
+          }
+          $compose = @("--project-name", $env:COMPOSE_PROJECT_NAME, "-f", "docker-compose.cluster.yml", "-f", "tests/compose.cluster-validation.yml")
+          $buildOutput = @(docker compose @compose build kubo-a 2>&1)
+          if ($LASTEXITCODE -ne 0) { throw "Cluster Kubo A build failed" }
+          Invoke-PrivateSwarmNegative -RunArgs @("--env", "IPFS_SWARM_KEY_FILE=/run/secrets/missing-swarm-key", "--env", "LIBP2P_FORCE_PNET=1")
+          Invoke-PrivateSwarmNegative -RunArgs @("--env", "LIBP2P_FORCE_PNET=0")
+          $sourceFixture = @'
+          . /private-swarm-entrypoint.sh
+          ordinary=0123456789abcdef0123456789abcdef
+          cid=Qm$(printf '%044d' 0 | tr 0 c)
+          filtered=$(printf '%s\n' "Swarm key fingerprint: $(printf '%032d' 0)" "ordinary $ordinary" "cid=$cid" | redact_swarm_fingerprint)
+          expected="Swarm key fingerprint: [redacted]
+          ordinary $ordinary
+          cid=$cid"
+          [ "$filtered" = "$expected" ] || exit 71
+          check_selector() {
+            expected_status=$1
+            daemon_status=$2
+            filter_status=$3
+            fifo_status=$4
+            set +e
+            select_supervisor_exit "$daemon_status" "$filter_status" "$fifo_status"
+            actual_status=$?
+            set -e
+            [ "$actual_status" -eq "$expected_status" ] || exit 72
+          }
+          check_selector 37 37 1 1
+          check_selector 1 0 1 0
+          check_selector 1 0 0 1
+          check_selector 0 0 0 0
+          '@
+          $sourceFixtureOutput = @(docker run --rm --entrypoint /bin/sh ghcr.io/hugefiver/ipfs3-kubo-cluster:v0.43.0 -ec $sourceFixture 2>&1)
+          $sourceFixtureExit = $LASTEXITCODE
+          $sourceFixtureOutput = $null
+          if ($sourceFixtureExit -ne 0) { throw "Private swarm source-only filter and supervisor fixture failed" }
+          "CLUSTER_PRIVATE_SWARM_FILTER_GREEN=true" | Add-Content -LiteralPath $env:GITHUB_ENV
+          "CLUSTER_PRIVATE_SWARM_PROOFS_ATTEMPTED=true" | Add-Content -LiteralPath $env:GITHUB_ENV
+          Invoke-PrivateSwarmSupervisorProof -Mode normal -ExpectedExit 37
+          Invoke-PrivateSwarmSupervisorProof -Mode handled -ExpectedExit 43
+          Invoke-PrivateSwarmSupervisorProof -Mode unhandled -ExpectedExit 143
+          "CLUSTER_PRIVATE_SWARM_WRAPPER_GREEN=true" | Add-Content -LiteralPath $env:GITHUB_ENV
+          "CLUSTER_PRIVATE_SWARM_SUPERVISOR_GREEN=true" | Add-Content -LiteralPath $env:GITHUB_ENV
+          $startupOutput = @(docker compose --profile private-swarm-validation @compose up --detach --build --wait --wait-timeout 300 postgres kubo-a kubo-b kubo-c swarm-bootstrap cluster-a cluster-b gateway 2>&1)
           if ($LASTEXITCODE -ne 0) { throw "Cluster topology did not become healthy" }
+          $rawKuboLogs = @(docker compose @compose logs --no-color kubo-a kubo-b kubo-c 2>&1)
+          $rawKuboLogExit = $LASTEXITCODE
+          if ($rawKuboLogExit -ne 0) { throw "Direct Kubo log receipt failed" }
+          $rawKuboText = $rawKuboLogs -join "`n"
+          if ($rawKuboText -match '(?m)^.*Swarm key fingerprint: [0-9a-f]{32}\s*$') { throw "Direct Kubo logs exposed a raw swarm fingerprint" }
+          $rawKuboRedactedFingerprintCount = ([regex]::Matches($rawKuboText, [regex]::Escape('Swarm key fingerprint: [redacted]'))).Count
+          if ($rawKuboRedactedFingerprintCount -lt 3) { throw "Direct Kubo logs did not contain three redacted swarm fingerprint markers" }
+          Write-Host "PRIVATE_SWARM_DIRECT_KUBO_LOGS_CAPTURED"
+          Write-Host "PRIVATE_SWARM_DIRECT_KUBO_FINGERPRINT_ABSENT"
+          Write-Host "PRIVATE_SWARM_DIRECT_KUBO_MARKERS_VERIFIED"
+          "CLUSTER_PRIVATE_SWARM_DIRECT_LOGS_GREEN=true" | Add-Content -LiteralPath $env:GITHUB_ENV
+          $rawKuboLogs = $null
+          $rawKuboText = $null
+          $rawKuboRedactedFingerprintCount = $null
+          $bootstrapId = @(docker compose @compose ps --all -q swarm-bootstrap 2>&1)
+          if ($LASTEXITCODE -ne 0 -or $bootstrapId.Count -ne 1 -or [string]::IsNullOrWhiteSpace("$($bootstrapId[0])")) { throw "Private swarm bootstrap container receipt is unavailable" }
+          $bootstrapState = @(docker inspect --format '{{ index .Config.Labels "com.docker.compose.project" }} {{ index .Config.Labels "com.docker.compose.service" }} {{ .State.Status }} {{ .State.ExitCode }}' $bootstrapId[0] 2>&1)
+          if ($LASTEXITCODE -ne 0 -or $bootstrapState.Count -ne 1 -or "$($bootstrapState[0])".Trim() -cne "$($env:COMPOSE_PROJECT_NAME) swarm-bootstrap exited 0") { throw "Private swarm bootstrap container receipt is invalid" }
+          Write-Host "PRIVATE_SWARM_BOOTSTRAP_RECEIPT"
+          "CLUSTER_PRIVATE_SWARM_BOOTSTRAP_GREEN=true" | Add-Content -LiteralPath $env:GITHUB_ENV
+          $modeDigestA = $null
+          $modeDigestB = $null
+          $modeDigestAMatch = $null
+          $modeDigestBMatch = $null
+          try {
+              $modeDigestA = @(docker compose @compose exec -T kubo-a /bin/sh -ec 'mode=$(stat -c "%a" "$IPFS_PATH/swarm.key") || exit 1; digest=$(sha256sum "$IPFS_PATH/swarm.key" | awk "{print \$1}") || exit 1; printf "%s %s\n" "$mode" "$digest"' 2>&1)
+              $modeDigestAExit = $LASTEXITCODE
+              $modeDigestB = @(docker compose @compose exec -T kubo-b /bin/sh -ec 'mode=$(stat -c "%a" "$IPFS_PATH/swarm.key") || exit 1; digest=$(sha256sum "$IPFS_PATH/swarm.key" | awk "{print \$1}") || exit 1; printf "%s %s\n" "$mode" "$digest"' 2>&1)
+              $modeDigestBExit = $LASTEXITCODE
+              if ($modeDigestAExit -ne 0 -or $modeDigestBExit -ne 0 -or $modeDigestA.Count -ne 1 -or $modeDigestB.Count -ne 1) { throw "Private swarm key mode receipt failed" }
+              $modeDigestAMatch = [regex]::Match("$($modeDigestA[0])".Trim(), '^400 (?<digest>[0-9a-f]{64})$')
+              $modeDigestBMatch = [regex]::Match("$($modeDigestB[0])".Trim(), '^400 (?<digest>[0-9a-f]{64})$')
+              if (-not $modeDigestAMatch.Success -or -not $modeDigestBMatch.Success -or $modeDigestAMatch.Groups['digest'].Value -cne $modeDigestBMatch.Groups['digest'].Value) { throw "Private swarm key mode or equality receipt failed" }
+          } finally {
+              $modeDigestA = $null
+              $modeDigestB = $null
+              $modeDigestAMatch = $null
+              $modeDigestBMatch = $null
+          }
+          Write-Host "PRIVATE_SWARM_KEY_MODE_AND_EQUALITY_RECEIPT"
+          "CLUSTER_PRIVATE_SWARM_KEY_MATERIAL_GREEN=true" | Add-Content -LiteralPath $env:GITHUB_ENV
 
       - name: Prove Cluster release-version representation contract
         shell: pwsh
@@ -561,9 +773,35 @@ jobs:
           cargo test --test cluster cluster_support::release_version_validator_accepts_exact_release_and_build_metadata -- --exact
           if ($LASTEXITCODE -ne 0) { throw "Cluster release-version unit contract failed" }
 
+      - name: Prove private swarm causality before topology
+        shell: pwsh
+        run: |
+          foreach ($receipt in @(
+              "CLUSTER_PRIVATE_SWARM_WRAPPER_GREEN",
+              "CLUSTER_PRIVATE_SWARM_FILTER_GREEN",
+              "CLUSTER_PRIVATE_SWARM_SUPERVISOR_GREEN",
+              "CLUSTER_PRIVATE_SWARM_DIRECT_LOGS_GREEN",
+              "CLUSTER_PRIVATE_SWARM_BOOTSTRAP_GREEN",
+              "CLUSTER_PRIVATE_SWARM_KEY_MATERIAL_GREEN"
+          )) {
+              if ([Environment]::GetEnvironmentVariable($receipt, "Process") -ne "true") { throw "Private swarm receipt is required before topology" }
+          }
+          cargo test --test cluster cluster_support::private_kubo_config_contract_rejects_open_discovery -- --exact
+          if ($LASTEXITCODE -ne 0) { throw "Private Kubo configuration unit contract failed" }
+          cargo test --test cluster cluster_support::private_peering_json_contract_matches_kubo_v0_43_addrinfo -- --exact
+          if ($LASTEXITCODE -ne 0) { throw "Private Kubo peering unit contract failed" }
+          cargo test --test cluster cluster_support::kubo_swarm_peers_null_is_empty_without_ndjson -- --exact
+          if ($LASTEXITCODE -ne 0) { throw "Kubo swarm-peers null unit contract failed" }
+          cargo test --test cluster private_swarm_configuration_and_peering -- --exact --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "Private swarm configuration and peering contract failed" }
+          cargo test --test cluster private_swarm_wrong_key_rejected -- --exact --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "Private swarm wrong-key rejection contract failed" }
+          "CLUSTER_PRIVATE_SWARM_GREEN=true" | Add-Content -LiteralPath $env:GITHUB_ENV
+
       - name: Prove exact two-peer topology without writes
         shell: pwsh
         run: |
+          if ($env:CLUSTER_PRIVATE_SWARM_GREEN -ne "true") { throw "Private swarm GREEN receipt is required before topology" }
           cargo test --test cluster cluster_topology_converges -- --exact --nocapture --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw "TOPOLOGY_CONVERGENCE_BLOCKER: exact v1.1.6 two-peer topology did not converge" }
           "CLUSTER_TOPOLOGY_GREEN=true" | Add-Content -LiteralPath $env:GITHUB_ENV
@@ -590,6 +828,10 @@ jobs:
           function Protect-ClusterDiagnosticLine {
               param([AllowEmptyString()][string]$Line)
               $safe = $Line
+              $safe = [regex]::Replace($safe, '(Swarm key fingerprint: )[0-9a-f]{32}(?=\s*$)', '$1[redacted]')
+              $safe = [regex]::Replace($safe, '(?m)^/key/swarm/psk/1\.0\.0/\s*$', '[REDACTED_SWARM_KEY_HEADER]')
+              $safe = [regex]::Replace($safe, '(?m)^/base16/\s*$', '[REDACTED_SWARM_KEY_HEADER]')
+              $safe = [regex]::Replace($safe, '(?<![0-9A-Fa-f])[0-9A-Fa-f]{64}(?![0-9A-Fa-f])', '[REDACTED_HEX]')
               $safe = [regex]::Replace(
                   $safe,
                   '(?i)((?:"?)(?:PeerID|peer_id|peer-id)(?:"?)\s*[:=]\s*)(?:"[^"]*"|''[^'']*''|[^\s,;]+)',
@@ -620,7 +862,7 @@ jobs:
                   [Parameter(Mandatory)][string]$FailureMessage
               )
               $rawDiagnosticLines = @(
-                  docker compose @ComposeArgs logs --no-color postgres kubo-a kubo-b cluster-a cluster-b gateway 2>&1
+                  docker compose @ComposeArgs logs --no-color postgres kubo-a kubo-b kubo-c swarm-bootstrap cluster-a cluster-b gateway 2>&1
               )
               $diagnosticExit = $LASTEXITCODE
               foreach ($rawLine in $rawDiagnosticLines) {
@@ -650,6 +892,10 @@ jobs:
           function Protect-ClusterDiagnosticLine {
               param([AllowEmptyString()][string]$Line)
               $safe = $Line
+              $safe = [regex]::Replace($safe, '(Swarm key fingerprint: )[0-9a-f]{32}(?=\s*$)', '$1[redacted]')
+              $safe = [regex]::Replace($safe, '(?m)^/key/swarm/psk/1\.0\.0/\s*$', '[REDACTED_SWARM_KEY_HEADER]')
+              $safe = [regex]::Replace($safe, '(?m)^/base16/\s*$', '[REDACTED_SWARM_KEY_HEADER]')
+              $safe = [regex]::Replace($safe, '(?<![0-9A-Fa-f])[0-9A-Fa-f]{64}(?![0-9A-Fa-f])', '[REDACTED_HEX]')
               $safe = [regex]::Replace(
                   $safe,
                   '(?i)((?:"?)(?:PeerID|peer_id|peer-id)(?:"?)\s*[:=]\s*)(?:"[^"]*"|''[^'']*''|[^\s,;]+)',
@@ -680,7 +926,7 @@ jobs:
                   [Parameter(Mandatory)][string]$FailureMessage
               )
               $rawDiagnosticLines = @(
-                  docker compose @ComposeArgs logs --no-color postgres kubo-a kubo-b cluster-a cluster-b gateway 2>&1
+                  docker compose @ComposeArgs logs --no-color postgres kubo-a kubo-b kubo-c swarm-bootstrap cluster-a cluster-b gateway 2>&1
               )
               $diagnosticExit = $LASTEXITCODE
               foreach ($rawLine in $rawDiagnosticLines) {
@@ -691,16 +937,59 @@ jobs:
           $compose = @("--project-name", $env:COMPOSE_PROJECT_NAME, "-f", "docker-compose.cluster.yml", "-f", "tests/compose.cluster-validation.yml")
           Write-SanitizedClusterDiagnostics -ComposeArgs $compose -FailureMessage "Stopped-peer diagnostics failed"
 
-      - name: Restart Cluster and Kubo peer B with existing volumes
+      - name: Restart both Cluster peers and Kubo swarm with existing volumes
         shell: pwsh
         run: |
-          docker compose --project-name $env:COMPOSE_PROJECT_NAME -f docker-compose.cluster.yml -f tests/compose.cluster-validation.yml start kubo-b cluster-b
-          if ($LASTEXITCODE -ne 0) { throw "Peer B restart failed" }
+          function Wait-HealthyClusterService {
+              param([Parameter(Mandatory)][string]$Service)
+              $compose = @("--project-name", $env:COMPOSE_PROJECT_NAME, "-f", "docker-compose.cluster.yml", "-f", "tests/compose.cluster-validation.yml")
+              $deadline = [DateTime]::UtcNow.AddSeconds(30)
+              do {
+                  $containerId = @(docker compose @compose ps -q $Service 2>&1)
+                  $queryExit = $LASTEXITCODE
+                  if ($queryExit -eq 0 -and $containerId.Count -eq 1 -and -not [string]::IsNullOrWhiteSpace("$($containerId[0])")) {
+                      $health = @(docker inspect --format '{{.State.Health.Status}}' $containerId[0] 2>&1)
+                      if ($LASTEXITCODE -eq 0 -and $health.Count -eq 1 -and "$($health[0])".Trim() -ceq "healthy") { return }
+                  }
+                  Start-Sleep -Milliseconds 500
+              } while ([DateTime]::UtcNow -lt $deadline)
+              throw "Cluster service did not become healthy within 30 seconds"
+          }
+          function Wait-CompletedSwarmBootstrap {
+              $compose = @("--project-name", $env:COMPOSE_PROJECT_NAME, "-f", "docker-compose.cluster.yml", "-f", "tests/compose.cluster-validation.yml")
+              $deadline = [DateTime]::UtcNow.AddSeconds(30)
+              do {
+                  $containerId = @(docker compose @compose ps --all -q swarm-bootstrap 2>&1)
+                  $queryExit = $LASTEXITCODE
+                  if ($queryExit -eq 0 -and $containerId.Count -eq 1 -and -not [string]::IsNullOrWhiteSpace("$($containerId[0])")) {
+                      $state = @(docker inspect --format '{{.State.Status}} {{.State.ExitCode}}' $containerId[0] 2>&1)
+                      if ($LASTEXITCODE -eq 0 -and $state.Count -eq 1 -and "$($state[0])".Trim() -ceq "exited 0") { return }
+                  }
+                  Start-Sleep -Milliseconds 500
+              } while ([DateTime]::UtcNow -lt $deadline)
+              throw "Swarm bootstrap did not complete with exact exited 0 within 30 seconds"
+          }
+          $compose = @("--project-name", $env:COMPOSE_PROJECT_NAME, "-f", "docker-compose.cluster.yml", "-f", "tests/compose.cluster-validation.yml")
+          $stopAOutput = @(docker compose @compose stop cluster-a kubo-a 2>&1)
+          if ($LASTEXITCODE -ne 0) { throw "Cluster A and Kubo A stop failed" }
+          $startKuboOutput = @(docker compose @compose start kubo-a kubo-b 2>&1)
+          if ($LASTEXITCODE -ne 0) { throw "Kubo A and Kubo B restart failed" }
+          Wait-HealthyClusterService -Service kubo-a
+          Wait-HealthyClusterService -Service kubo-b
+          $bootstrapRestartOutput = @(docker compose @compose restart --timeout 30 swarm-bootstrap 2>&1)
+          if ($LASTEXITCODE -ne 0) { throw "Swarm bootstrap restart failed" }
+          Wait-CompletedSwarmBootstrap
+          $startClusterOutput = @(docker compose @compose start cluster-a cluster-b 2>&1)
+          if ($LASTEXITCODE -ne 0) { throw "Cluster A and Cluster B restart failed" }
+          Wait-HealthyClusterService -Service cluster-a
+          Wait-HealthyClusterService -Service cluster-b
 
-      - name: Prove same-volume peer B recovery
+      - name: Prove same-volume private swarm and peer B recovery
         shell: pwsh
         run: |
           if ($env:CLUSTER_STATE_RECEIPT_OWNED -ne "true") { throw "Owned state receipt is required before recovery validation" }
+          cargo test --test cluster private_swarm_configuration_and_peering -- --exact --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "Private swarm post-restart configuration and peering contract failed" }
           cargo test --test cluster cluster_peer_b_restart_recovery -- --exact --nocapture --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw "Peer B same-volume recovery contract failed" }
 
@@ -711,6 +1000,10 @@ jobs:
           function Protect-ClusterDiagnosticLine {
               param([AllowEmptyString()][string]$Line)
               $safe = $Line
+              $safe = [regex]::Replace($safe, '(Swarm key fingerprint: )[0-9a-f]{32}(?=\s*$)', '$1[redacted]')
+              $safe = [regex]::Replace($safe, '(?m)^/key/swarm/psk/1\.0\.0/\s*$', '[REDACTED_SWARM_KEY_HEADER]')
+              $safe = [regex]::Replace($safe, '(?m)^/base16/\s*$', '[REDACTED_SWARM_KEY_HEADER]')
+              $safe = [regex]::Replace($safe, '(?<![0-9A-Fa-f])[0-9A-Fa-f]{64}(?![0-9A-Fa-f])', '[REDACTED_HEX]')
               $safe = [regex]::Replace(
                   $safe,
                   '(?i)((?:"?)(?:PeerID|peer_id|peer-id)(?:"?)\s*[:=]\s*)(?:"[^"]*"|''[^'']*''|[^\s,;]+)',
@@ -741,7 +1034,7 @@ jobs:
                   [Parameter(Mandatory)][string]$FailureMessage
               )
               $rawDiagnosticLines = @(
-                  docker compose @ComposeArgs logs --no-color postgres kubo-a kubo-b cluster-a cluster-b gateway 2>&1
+                  docker compose @ComposeArgs logs --no-color postgres kubo-a kubo-b kubo-c swarm-bootstrap cluster-a cluster-b gateway 2>&1
               )
               $diagnosticExit = $LASTEXITCODE
               foreach ($rawLine in $rawDiagnosticLines) {
@@ -756,15 +1049,52 @@ jobs:
         if: ${{ always() }}
         shell: pwsh
         run: |
-          if (($env:CLUSTER_PINSET_OWNED -ne "true" -or $env:CLUSTER_PINSET_ATTEMPTED -ne "true") -and
-              $env:CLUSTER_STATE_RECEIPT_OWNED -ne "true") {
-              Write-Host "No owned Cluster topology or receipt requires cleanup"
-              exit 0
-          }
           $project = $env:COMPOSE_PROJECT_NAME
           $errors = [Collections.Generic.List[string]]::new()
-          if ($env:CLUSTER_PINSET_OWNED -eq "true" -and $env:CLUSTER_PINSET_ATTEMPTED -eq "true") {
-              docker compose --project-name $project -f docker-compose.cluster.yml -f tests/compose.cluster-validation.yml down --volumes --remove-orphans
+          $topologyOwned = $env:CLUSTER_PINSET_OWNED -eq "true" -and $env:CLUSTER_PINSET_ATTEMPTED -eq "true"
+          $proofsAttempted = $env:CLUSTER_PRIVATE_SWARM_PROOFS_ATTEMPTED -eq "true"
+          $fileMarkersPresent = $env:CLUSTER_SWARM_KEY_OWNED -eq "true" -or
+              $env:CLUSTER_SWARM_KEY_WRONG_OWNED -eq "true" -or
+              $env:CLUSTER_STATE_RECEIPT_OWNED -eq "true"
+          if (-not $topologyOwned -and -not $proofsAttempted -and -not $fileMarkersPresent) {
+              Write-Host "No owned Cluster topology, proof, or receipt requires cleanup"
+              exit 0
+          }
+          if ($proofsAttempted) {
+              $proofContainers = @(docker ps --all --quiet --filter "label=com.docker.compose.project=$project" --filter "label=ipfs3.cluster.private-swarm-proof" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+              $proofQueryExit = $LASTEXITCODE
+              if ($proofQueryExit -ne 0) {
+                  $errors.Add("proof residual query exited $proofQueryExit")
+              } else {
+                  foreach ($proofContainer in $proofContainers) {
+                      $proofProjectLabel = @(docker inspect --format '{{ index .Config.Labels "com.docker.compose.project" }}' $proofContainer 2>&1)
+                      $proofProjectLabelExit = $LASTEXITCODE
+                      $proofLabel = @(docker inspect --format '{{ index .Config.Labels "ipfs3.cluster.private-swarm-proof" }}' $proofContainer 2>&1)
+                      $proofLabelExit = $LASTEXITCODE
+                      if ($proofProjectLabelExit -ne 0 -or $proofLabelExit -ne 0 -or $proofProjectLabel.Count -ne 1 -or $proofLabel.Count -ne 1 -or "$($proofProjectLabel[0])".Trim() -cne $project -or "$($proofLabel[0])".Trim() -notin @("normal", "handled", "unhandled")) {
+                          $errors.Add("proof container ownership label check failed")
+                          continue
+                      }
+                      $proofRunning = @(docker inspect --format '{{.State.Running}}' $proofContainer 2>&1)
+                      if ($LASTEXITCODE -ne 0 -or $proofRunning.Count -ne 1) {
+                          $errors.Add("proof container running-state query failed")
+                          continue
+                      }
+                      if ("$($proofRunning[0])".Trim() -ceq "true") {
+                          $proofStopOutput = @(docker stop --time 30 $proofContainer 2>&1)
+                          if ($LASTEXITCODE -ne 0) { $errors.Add("proof container stop failed") }
+                      }
+                      $proofRemoveOutput = @(docker rm $proofContainer 2>&1)
+                      if ($LASTEXITCODE -ne 0) { $errors.Add("proof container removal failed") }
+                  }
+              }
+              $proofResidual = @(docker ps --all --quiet --filter "label=com.docker.compose.project=$project" --filter "label=ipfs3.cluster.private-swarm-proof" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+              $proofResidualExit = $LASTEXITCODE
+              if ($proofResidualExit -ne 0) { $errors.Add("proof residual assertion query exited $proofResidualExit") }
+              if ($proofResidual.Count -ne 0) { $errors.Add("proof container residue remains") }
+          }
+          if ($topologyOwned) {
+              docker compose --profile private-swarm-validation --project-name $project -f docker-compose.cluster.yml -f tests/compose.cluster-validation.yml down --volumes --remove-orphans
               $downExit = $LASTEXITCODE
               if ($downExit -ne 0) { $errors.Add("down exited $downExit") }
               $containers = @(docker ps --all --quiet --filter "label=com.docker.compose.project=$project" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
@@ -775,21 +1105,26 @@ jobs:
               $volumeExit = $LASTEXITCODE
               if ($containerExit -ne 0) { $errors.Add("container residual query exited $containerExit") }
               if ($networkExit -ne 0) { $errors.Add("network residual query exited $networkExit") }
-              if ($volumeExit -ne 0) { $errors.Add("volume residual query exited $volumeExit") }
-              if (($containers.Count + $networks.Count + $volumes.Count) -ne 0) { $errors.Add("project-labelled residual resources remain") }
-          }
-          if ($env:CLUSTER_STATE_RECEIPT_OWNED -eq "true") {
-              try {
-                  if (-not (Test-Path -LiteralPath $env:IPFS_S3_CLUSTER_STATE_PATH -PathType Leaf)) {
-                      throw "owned state receipt is missing before cleanup"
-                  }
-                  Remove-Item -LiteralPath $env:IPFS_S3_CLUSTER_STATE_PATH -ErrorAction Stop
-                  if (Test-Path -LiteralPath $env:IPFS_S3_CLUSTER_STATE_PATH) { throw "state receipt remains" }
-              } catch {
-                  $errors.Add("owned state receipt cleanup failed: $($_.Exception.Message)")
-              }
-          }
-          if ($errors.Count -ne 0) { throw ($errors -join "; ") }
+               if ($volumeExit -ne 0) { $errors.Add("volume residual query exited $volumeExit") }
+               if (($containers.Count + $networks.Count + $volumes.Count) -ne 0) { $errors.Add("project-labelled residual resources remain") }
+           }
+           foreach ($ownedFile in @(
+               [pscustomobject]@{ Marker = "CLUSTER_SWARM_KEY_OWNED"; Path = $env:IPFS_S3_SWARM_KEY_FILE; Label = "owned main swarm key" },
+               [pscustomobject]@{ Marker = "CLUSTER_SWARM_KEY_WRONG_OWNED"; Path = $env:IPFS_S3_SWARM_KEY_WRONG_FILE; Label = "owned wrong swarm key" },
+               [pscustomobject]@{ Marker = "CLUSTER_STATE_RECEIPT_OWNED"; Path = $env:IPFS_S3_CLUSTER_STATE_PATH; Label = "owned state receipt" }
+           )) {
+               if ([Environment]::GetEnvironmentVariable($ownedFile.Marker, "Process") -ne "true") { continue }
+               try {
+                   if (-not (Test-Path -LiteralPath $ownedFile.Path -PathType Leaf)) {
+                       throw "$($ownedFile.Label) is missing before cleanup"
+                   }
+                   Remove-Item -LiteralPath $ownedFile.Path -ErrorAction Stop
+                   if (Test-Path -LiteralPath $ownedFile.Path) { throw "$($ownedFile.Label) remains" }
+               } catch {
+                   $errors.Add("$($ownedFile.Label) cleanup failed: $($_.Exception.Message)")
+               }
+           }
+           if ($errors.Count -ne 0) { throw ($errors -join "; ") }
 
   e2e:
     runs-on: ubuntu-latest

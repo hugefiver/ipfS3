@@ -67,7 +67,7 @@ numbered release.
 - [x] PostgreSQL production deployment
 - [x] Multiple gateway instances (horizontal scaling)
 - [x] IPFS Cluster for pinset replication
-- [ ] Private swarm (swarm.key) for node-to-node communication
+- [x] Private swarm (swarm.key) for node-to-node communication
 
 ## v0.6 — Versioning & Lifecycle
 
