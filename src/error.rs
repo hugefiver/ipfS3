@@ -1,3 +1,8 @@
+use std::time::SystemTime;
+
+use chrono::{DateTime, Utc};
+use http::{HeaderMap, HeaderValue};
+use s3s::dto::{Timestamp, TimestampFormat};
 use s3s::s3_error;
 use s3s::{S3Error, S3ErrorCode};
 
@@ -51,6 +56,45 @@ fn import_route_error(code: &str, status: http::StatusCode, message: &'static st
     s3_error
 }
 
+fn delete_marker_error(version_id: &str, created_at: DateTime<Utc>, current: bool) -> S3Error {
+    let result = (|| -> Result<S3Error, ()> {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-delete-marker", HeaderValue::from_static("true"));
+        headers.insert(
+            "x-amz-version-id",
+            HeaderValue::from_str(version_id).map_err(|_| ())?,
+        );
+
+        let (code, status) = if current {
+            (S3ErrorCode::NoSuchKey, http::StatusCode::NOT_FOUND)
+        } else {
+            let mut formatted = Vec::new();
+            Timestamp::from(SystemTime::from(created_at))
+                .format(TimestampFormat::HttpDate, &mut formatted)
+                .map_err(|_| ())?;
+            headers.insert(
+                http::header::LAST_MODIFIED,
+                HeaderValue::from_bytes(&formatted).map_err(|_| ())?,
+            );
+            (
+                S3ErrorCode::MethodNotAllowed,
+                http::StatusCode::METHOD_NOT_ALLOWED,
+            )
+        };
+
+        let mut error = S3Error::with_message(code, "delete marker");
+        error.set_status_code(status);
+        error.set_headers(headers);
+        Ok(error)
+    })();
+
+    result.unwrap_or_else(|()| {
+        let mut error = s3_error!(InternalError, "internal error");
+        error.set_status_code(http::StatusCode::INTERNAL_SERVER_ERROR);
+        error
+    })
+}
+
 /// Application-level errors. Converted to S3Error at the S3 handler boundary.
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
@@ -59,6 +103,23 @@ pub enum AppError {
 
     #[error("key not found: {0}")]
     NoSuchKey(String),
+
+    #[error("version not found")]
+    NoSuchVersion {
+        bucket: String,
+        key: String,
+        version_id: String,
+    },
+
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
+
+    #[error("delete marker")]
+    DeleteMarker {
+        version_id: String,
+        created_at: DateTime<Utc>,
+        current: bool,
+    },
 
     #[error("bucket already exists: {0}")]
     BucketAlreadyExists(String),
@@ -143,6 +204,21 @@ impl From<AppError> for S3Error {
         match &e {
             AppError::NoSuchBucket(_) => s3_error!(NoSuchBucket, "{}", e),
             AppError::NoSuchKey(_) => s3_error!(NoSuchKey, "{}", e),
+            AppError::NoSuchVersion { .. } => {
+                let mut error = s3_error!(NoSuchVersion, "version not found");
+                error.set_status_code(http::StatusCode::NOT_FOUND);
+                error
+            }
+            AppError::InvalidArgument(_) => {
+                let mut error = s3_error!(InvalidArgument, "{}", e);
+                error.set_status_code(http::StatusCode::BAD_REQUEST);
+                error
+            }
+            AppError::DeleteMarker {
+                version_id,
+                created_at,
+                current,
+            } => delete_marker_error(version_id, *created_at, *current),
             AppError::BucketAlreadyExists(_) => s3_error!(BucketAlreadyOwnedByYou, "{}", e),
             AppError::BucketNotEmpty(_) => s3_error!(BucketNotEmpty, "{}", e),
             AppError::NoSuchUpload(_) => s3_error!(NoSuchUpload, "{}", e),
@@ -234,6 +310,7 @@ impl AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{TimeZone, Utc};
 
     #[test]
     fn zip_validation_errors_map_to_client_errors() {
@@ -328,6 +405,74 @@ mod tests {
         assert_eq!(
             error.message(),
             Some("content mutation was superseded by a newer operation")
+        );
+    }
+
+    #[test]
+    fn version_errors_are_redacted_and_distinct() {
+        let no_such_version: S3Error = AppError::NoSuchVersion {
+            bucket: "private-bucket".to_owned(),
+            key: "private-key".to_owned(),
+            version_id: "private-version".to_owned(),
+        }
+        .into();
+        assert_eq!(no_such_version.code().as_str(), "NoSuchVersion");
+        assert_eq!(
+            no_such_version.status_code(),
+            Some(http::StatusCode::NOT_FOUND)
+        );
+        assert_eq!(no_such_version.message(), Some("version not found"));
+        assert!(!no_such_version.to_string().contains("private"));
+
+        let invalid_argument: S3Error =
+            AppError::InvalidArgument("version ID is malformed".to_owned()).into();
+        assert_eq!(invalid_argument.code().as_str(), "InvalidArgument");
+        assert_eq!(
+            invalid_argument.status_code(),
+            Some(http::StatusCode::BAD_REQUEST)
+        );
+        assert_ne!(invalid_argument.code(), no_such_version.code());
+    }
+
+    #[test]
+    fn current_marker_error_is_404_with_required_headers() {
+        let error: S3Error = AppError::DeleteMarker {
+            version_id: "public-version".to_owned(),
+            created_at: Utc.with_ymd_and_hms(2015, 10, 21, 7, 28, 0).unwrap(),
+            current: true,
+        }
+        .into();
+
+        assert_eq!(error.code().as_str(), "NoSuchKey");
+        assert_eq!(error.status_code(), Some(http::StatusCode::NOT_FOUND));
+        let headers = error.headers().expect("delete marker headers");
+        assert_eq!(headers.len(), 2);
+        assert_eq!(headers["x-amz-delete-marker"], "true");
+        assert_eq!(headers["x-amz-version-id"], "public-version");
+        assert!(headers.get(http::header::LAST_MODIFIED).is_none());
+    }
+
+    #[test]
+    fn explicit_marker_error_is_405_with_rfc1123_last_modified() {
+        let error: S3Error = AppError::DeleteMarker {
+            version_id: "public-version".to_owned(),
+            created_at: Utc.with_ymd_and_hms(2015, 10, 21, 7, 28, 0).unwrap(),
+            current: false,
+        }
+        .into();
+
+        assert_eq!(error.code().as_str(), "MethodNotAllowed");
+        assert_eq!(
+            error.status_code(),
+            Some(http::StatusCode::METHOD_NOT_ALLOWED)
+        );
+        let headers = error.headers().expect("delete marker headers");
+        assert_eq!(headers.len(), 3);
+        assert_eq!(headers["x-amz-delete-marker"], "true");
+        assert_eq!(headers["x-amz-version-id"], "public-version");
+        assert_eq!(
+            headers[http::header::LAST_MODIFIED],
+            "Wed, 21 Oct 2015 07:28:00 GMT"
         );
     }
 }

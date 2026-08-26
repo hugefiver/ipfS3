@@ -59,6 +59,17 @@ fn evaluate_publication_policy(
         .map_err(s3s::S3Error::from)
 }
 
+fn insert_version_id_header(headers: &mut HeaderMap, version_id: Option<&str>) -> S3Result<()> {
+    if let Some(version_id) = version_id {
+        headers.insert(
+            "x-amz-version-id",
+            http::HeaderValue::from_str(version_id)
+                .map_err(|_| s3s::s3_error!(InternalError, "invalid object version ID"))?,
+        );
+    }
+    Ok(())
+}
+
 fn publication_entries(
     bucket: &str,
     entries: &[crate::zip::response::ExtractedEntry],
@@ -585,7 +596,7 @@ impl DecompressZipRoute {
             },
             entries: publication_entries(&parsed.bucket, &published),
         };
-        crate::store::pinning::publication::publish_standard_zip(
+        let publication_result = crate::store::pinning::publication::publish_standard_zip(
             self.state.store.db(),
             request,
             mutation_guard,
@@ -598,6 +609,7 @@ impl DecompressZipRoute {
             http::header::ETAG,
             http::HeaderValue::from_str(&format!("\"{}\"", archive.cid)).unwrap(),
         );
+        insert_version_id_header(&mut headers, publication_result.version_id.as_deref())?;
         if parsed.return_result_xml {
             let result = crate::zip::response::DecompressZipResult {
                 archive_key: parsed.key,
@@ -684,12 +696,13 @@ impl DecompressZipRoute {
                 archive: crate::s3::ops::multipart::completed_publication_request(&completed),
                 entries: publication_entries(&completed.bucket, &published),
             };
-            crate::s3::ops::multipart::finalize_completed_multipart_zip(
+            let publication_result = crate::s3::ops::multipart::finalize_completed_multipart_zip(
                 &self.state,
                 &completed,
                 request,
             )
             .await?;
+            insert_version_id_header(&mut headers, publication_result.version_id.as_deref())?;
 
             let xml = if completed.decompress_zip_result {
                 crate::zip::response::decompress_result_xml(
@@ -711,8 +724,12 @@ impl DecompressZipRoute {
             return Ok(S3Response::with_headers(Body::from(xml), headers));
         }
 
-        crate::s3::ops::multipart::finalize_completed_multipart_archive(&self.state, &completed)
-            .await?;
+        let publication_result = crate::s3::ops::multipart::finalize_completed_multipart_archive(
+            &self.state,
+            &completed,
+        )
+        .await?;
+        insert_version_id_header(&mut headers, publication_result.version_id.as_deref())?;
         let xml = crate::zip::response::complete_multipart_result_xml(
             &completed.bucket,
             &completed.key,
@@ -1886,6 +1903,13 @@ mod tests {
         crate::store::bucket::create(state.store.db(), "bucket", None)
             .await
             .unwrap();
+        crate::store::bucket::set_versioning_state(
+            state.store.db(),
+            "bucket",
+            crate::store::object_version::BucketVersioningState::Enabled,
+        )
+        .await
+        .unwrap();
 
         let response = route
             .call(signed_route_request(
@@ -1900,6 +1924,15 @@ mod tests {
             response.headers.get(http::header::ETAG).unwrap(),
             "\"QmArchive\""
         );
+        uuid::Uuid::parse_str(
+            response
+                .headers
+                .get("x-amz-version-id")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+        )
+        .unwrap();
         let xml = response.output.collect().await.unwrap().to_bytes();
         let xml = std::str::from_utf8(&xml).unwrap();
         assert!(xml.contains("<DecompressZipResult>"));

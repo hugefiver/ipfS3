@@ -2,7 +2,7 @@ use crate::error::{AppError, AppResult};
 use chrono::Utc;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set, TransactionTrait,
+    QueryOrder, QuerySelect, Set, TransactionTrait, sea_query::Expr,
 };
 use serde_json::Value as JsonValue;
 
@@ -73,6 +73,35 @@ pub(crate) async fn write_latest_in_transaction<C: ConnectionTrait>(
     .exec(db)
     .await?;
     Ok(previous.map(|object| object.id))
+}
+
+/// Inserts one immutable object row without changing the current-object projection.
+/// The caller owns the surrounding publication transaction and installs the
+/// corresponding version/projection only after all lifecycle locks are held.
+pub(crate) async fn insert_immutable_in_transaction<C: ConnectionTrait>(
+    db: &C,
+    row: LatestObjectRow,
+) -> AppResult<object::Model> {
+    let object_id = row.id.clone();
+    object::Entity::insert(object::ActiveModel {
+        id: Set(row.id),
+        bucket: Set(row.bucket),
+        key: Set(row.key),
+        cid: Set(row.cid),
+        size: Set(row.size),
+        content_type: Set(row.content_type),
+        etag: Set(row.etag),
+        metadata: Set(row.metadata),
+        encrypted: Set(row.encrypted),
+        key_wrap: Set(row.key_wrap),
+        sse_c_key_fingerprint: Set(row.sse_c_key_fingerprint),
+        multipart: Set(row.multipart),
+        is_latest: Set(false),
+        created_at: Set(row.created_at),
+    })
+    .exec(db)
+    .await?;
+    get_by_id(db, &object_id).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -176,6 +205,76 @@ pub async fn get_latest<C: ConnectionTrait>(
         .one(db)
         .await?
         .ok_or_else(|| AppError::NoSuchKey(format!("{bucket}/{key}")))
+}
+
+pub async fn get_by_id<C: ConnectionTrait>(db: &C, object_id: &str) -> AppResult<object::Model> {
+    object::Entity::find_by_id(object_id.to_owned())
+        .one(db)
+        .await?
+        .ok_or_else(|| AppError::NoSuchKey(object_id.to_owned()))
+}
+
+/// Rebuilds the ordinary current-object projection for one key. The caller must
+/// own the surrounding transaction and any required version-row locks.
+pub(crate) async fn set_only_latest<C: ConnectionTrait>(
+    db: &C,
+    bucket: &str,
+    key: &str,
+    object_id: Option<&str>,
+) -> AppResult<()> {
+    if let Some(object_id) = object_id {
+        let selected = get_by_id(db, object_id).await?;
+        if selected.bucket != bucket || selected.key != key {
+            return Err(AppError::InvalidArgument(
+                "selected object does not belong to the requested bucket/key".to_owned(),
+            ));
+        }
+    }
+
+    let cleared = object::Entity::update_many()
+        .col_expr(object::Column::IsLatest, Expr::value(false))
+        .filter(object::Column::Bucket.eq(bucket))
+        .filter(object::Column::Key.eq(key))
+        .filter(object::Column::IsLatest.eq(true))
+        .exec(db)
+        .await?;
+    if cleared.rows_affected > 1 {
+        return Err(AppError::Internal(
+            "multiple current object projections for one key".to_owned(),
+        ));
+    }
+
+    let expected_current = if let Some(object_id) = object_id {
+        let updated = object::Entity::update_many()
+            .col_expr(object::Column::IsLatest, Expr::value(true))
+            .filter(object::Column::Id.eq(object_id))
+            .filter(object::Column::Bucket.eq(bucket))
+            .filter(object::Column::Key.eq(key))
+            .filter(object::Column::IsLatest.eq(false))
+            .exec(db)
+            .await?;
+        if updated.rows_affected != 1 {
+            return Err(AppError::Internal(
+                "selected object changed while rebuilding current projection".to_owned(),
+            ));
+        }
+        1
+    } else {
+        0
+    };
+
+    let current_count = object::Entity::find()
+        .filter(object::Column::Bucket.eq(bucket))
+        .filter(object::Column::Key.eq(key))
+        .filter(object::Column::IsLatest.eq(true))
+        .count(db)
+        .await?;
+    if current_count != expected_current {
+        return Err(AppError::Internal(
+            "current object projection verification failed".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 pub async fn delete_latest_if_present<C: ConnectionTrait>(

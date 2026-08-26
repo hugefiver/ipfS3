@@ -2250,6 +2250,17 @@ mod tests {
         );
         assert_eq!(destination(&db, "key").await, destination_before);
 
+        let superseded = db
+            .transaction(|txn| {
+                Box::pin(async move {
+                    lock_bucket_for_ownership(txn, "bucket").await?;
+                    supersede_bucket(txn, "bucket", time(1)).await
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(superseded, 1);
+        assert_eq!(job(&db, "job-1").await.state, STATE_SUPERSEDED);
         crate::store::bucket::delete(&db, "bucket").await.unwrap();
         let retained_before = job(&db, "job-1").await;
         assert!(matches!(

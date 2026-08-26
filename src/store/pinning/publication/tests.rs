@@ -1,4 +1,4 @@
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use chrono::Utc;
 use sea_orm::{
@@ -18,7 +18,8 @@ use crate::{
     store::{
         entities::{
             import_destination, import_job, import_job_result, import_job_target, object,
-            object_tag, pin_job, pin_lease, pin_lease_target, pin_provider_usage, remote_pin,
+            object_tag, object_version, pin_job, pin_lease, pin_lease_target, pin_provider_usage,
+            remote_pin,
         },
         import::{
             jobs::{NewImportJob, claim_due},
@@ -27,7 +28,8 @@ use crate::{
                 admit_content_mutations, claim_extracted_target, submit,
             },
         },
-        multipart::{self, CommitCompletedUploadError, ReconciledCommitOutcome},
+        multipart::{self, CommitCompletedUploadError},
+        object_version::{BucketVersioningState, PublicVersionId, VersionSelector},
     },
 };
 
@@ -221,6 +223,530 @@ async fn setup_file_backed(name: &str) -> (tempfile::TempDir, DatabaseConnection
     (directory, db)
 }
 
+async fn setup_independent_file_backed(
+    name: &str,
+) -> (tempfile::TempDir, DatabaseConnection, DatabaseConnection) {
+    let directory = tempfile::tempdir().unwrap();
+    let database_path = directory.path().join(name);
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        database_path.display().to_string().replace('\\', "/")
+    );
+    let first = crate::store::connect_database(&database_url).await.unwrap();
+    first
+        .execute_unprepared("PRAGMA foreign_keys = ON")
+        .await
+        .unwrap();
+    crate::store::run_migrations(&first).await.unwrap();
+    crate::store::bucket::create(&first, "bucket", None)
+        .await
+        .unwrap();
+    let second = crate::store::connect_database(&database_url).await.unwrap();
+    second
+        .execute_unprepared("PRAGMA foreign_keys = ON")
+        .await
+        .unwrap();
+    (directory, first, second)
+}
+
+async fn set_versioning(db: &DatabaseConnection, state: BucketVersioningState) {
+    crate::store::bucket::set_versioning_state(db, "bucket", state)
+        .await
+        .unwrap();
+}
+
+async fn versions_for(db: &DatabaseConnection, key: &str) -> Vec<object_version::Model> {
+    object_version::Entity::find()
+        .filter(object_version::Column::Bucket.eq("bucket"))
+        .filter(object_version::Column::Key.eq(key))
+        .order_by_asc(object_version::Column::Sequence)
+        .all(db)
+        .await
+        .unwrap()
+}
+
+async fn guarded_delete(
+    db: &DatabaseConnection,
+    key: &str,
+    selector: VersionSelector,
+    now: chrono::DateTime<Utc>,
+) -> AppResult<crate::store::object_version::DeleteVersionResult> {
+    let guard =
+        admit_content_mutation(db, "bucket", key, None, SupersedeReason::DeleteObject, now).await?;
+    delete_version_with_leases_guarded(db, "bucket", key, selector, guard, now).await
+}
+
+async fn assert_version_projection_agrees(db: &DatabaseConnection, key: &str) {
+    let versions = versions_for(db, key).await;
+    assert_eq!(
+        versions.iter().filter(|version| version.is_latest).count(),
+        1
+    );
+    assert!(
+        versions
+            .windows(2)
+            .all(|pair| pair[0].sequence < pair[1].sequence)
+    );
+    let latest = versions.iter().find(|version| version.is_latest).unwrap();
+    match latest.object_id.as_deref() {
+        Some(object_id) => assert_eq!(
+            crate::store::object::get_latest(db, "bucket", key)
+                .await
+                .unwrap()
+                .id,
+            object_id
+        ),
+        None => assert!(matches!(
+            crate::store::object::get_latest(db, "bucket", key).await,
+            Err(AppError::NoSuchKey(_))
+        )),
+    }
+}
+
+#[tokio::test]
+async fn sqlite_parallel_publish_delete_tag_has_one_latest_and_no_null_leak() {
+    let (_directory, first, second) =
+        setup_independent_file_backed("versioning-contention.sqlite").await;
+    set_versioning(&first, BucketVersioningState::Enabled).await;
+
+    let start = Arc::new(tokio::sync::Barrier::new(3));
+    let publish = |db: DatabaseConnection,
+                   start: Arc<tokio::sync::Barrier>,
+                   id: &'static str,
+                   cid: &'static str| {
+        tokio::spawn(async move {
+            start.wait().await;
+            publish_object(
+                &db,
+                automatic_and_manual_request(id, "enabled-race", cid),
+                &limits(),
+            )
+            .await
+        })
+    };
+    let first_publish = publish(
+        first.clone(),
+        start.clone(),
+        "enabled-first",
+        "bafy-enabled-first",
+    );
+    let second_publish = publish(
+        second.clone(),
+        start.clone(),
+        "enabled-second",
+        "bafy-enabled-second",
+    );
+    start.wait().await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        first_publish.await.unwrap().unwrap();
+        second_publish.await.unwrap().unwrap();
+    })
+    .await
+    .expect("parallel Enabled publications must finish within the retry bound");
+
+    let enabled = versions_for(&first, "enabled-race").await;
+    assert_eq!(enabled.len(), 2);
+    assert_eq!(
+        enabled
+            .iter()
+            .map(|version| version.sequence)
+            .collect::<Vec<_>>(),
+        [1, 2]
+    );
+    assert_version_projection_agrees(&first, "enabled-race").await;
+    for object_id in ["enabled-first", "enabled-second"] {
+        assert_eq!(
+            object_tag::Entity::find()
+                .filter(object_tag::Column::ObjectId.eq(object_id))
+                .count(&first)
+                .await
+                .unwrap(),
+            3
+        );
+        assert!(
+            pin_lease::Entity::find()
+                .filter(pin_lease::Column::OwnerObjectId.eq(object_id))
+                .all(&first)
+                .await
+                .unwrap()
+                .iter()
+                .all(|lease| lease.state == "active")
+        );
+    }
+
+    let current = enabled.iter().find(|version| version.is_latest).unwrap();
+    let current_owner = current.object_id.clone().unwrap();
+    let current_version_id = current.version_id.clone().unwrap();
+    let delete_guard = admit_content_mutation(
+        &first,
+        "bucket",
+        "enabled-race",
+        None,
+        SupersedeReason::DeleteObject,
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+    let start = Arc::new(tokio::sync::Barrier::new(3));
+    let tag_update = {
+        let db = first.clone();
+        let start = start.clone();
+        let current_owner = current_owner.clone();
+        tokio::spawn(async move {
+            start.wait().await;
+            crate::store::pinning::tags::replace_object_tags(
+                &db,
+                &current_owner,
+                &[
+                    tag("team", "retained-after-delete"),
+                    tag("ipfs-s3:pin", "true"),
+                    tag("ipfs-s3:duration", "1h"),
+                ],
+            )
+            .await
+        })
+    };
+    let simple_delete = {
+        let db = second.clone();
+        let start = start.clone();
+        tokio::spawn(async move {
+            start.wait().await;
+            delete_version_with_leases_guarded(
+                &db,
+                "bucket",
+                "enabled-race",
+                VersionSelector::Current,
+                delete_guard,
+                Utc::now(),
+            )
+            .await
+        })
+    };
+    start.wait().await;
+    let simple_result = tokio::time::timeout(Duration::from_secs(10), async {
+        tag_update.await.unwrap().unwrap();
+        simple_delete.await.unwrap().unwrap()
+    })
+    .await
+    .expect("tag replacement and simple delete must serialize without deadlock");
+    assert!(simple_result.created_delete_marker);
+    let after_simple_delete = versions_for(&first, "enabled-race").await;
+    assert_eq!(after_simple_delete.len(), 3);
+    assert_eq!(
+        after_simple_delete
+            .iter()
+            .filter(|version| version.is_latest)
+            .count(),
+        1
+    );
+    assert_eq!(
+        after_simple_delete
+            .iter()
+            .find(|version| version.is_latest)
+            .unwrap()
+            .kind,
+        "delete_marker"
+    );
+    assert_eq!(
+        crate::store::pinning::tags::list_object_tags(&first, &current_owner)
+            .await
+            .unwrap(),
+        vec![
+            tag("ipfs-s3:duration", "1h"),
+            tag("ipfs-s3:pin", "true"),
+            tag("team", "retained-after-delete"),
+        ]
+    );
+    assert!(
+        pin_lease::Entity::find()
+            .filter(pin_lease::Column::OwnerObjectId.eq(&current_owner))
+            .all(&first)
+            .await
+            .unwrap()
+            .iter()
+            .all(|lease| lease.state == "active")
+    );
+
+    let exact_guard = admit_content_mutation(
+        &first,
+        "bucket",
+        "enabled-race",
+        None,
+        SupersedeReason::DeleteObject,
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+    delete_version_with_leases_guarded(
+        &second,
+        "bucket",
+        "enabled-race",
+        VersionSelector::Exact(PublicVersionId::parse_s3(&current_version_id).unwrap()),
+        exact_guard,
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        object_tag::Entity::find()
+            .filter(object_tag::Column::ObjectId.eq(&current_owner))
+            .count(&first)
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(
+        pin_lease::Entity::find()
+            .filter(pin_lease::Column::OwnerObjectId.eq(&current_owner))
+            .all(&first)
+            .await
+            .unwrap()
+            .iter()
+            .all(|lease| lease.state == "cancelled")
+    );
+
+    set_versioning(&first, BucketVersioningState::Suspended).await;
+    let start = Arc::new(tokio::sync::Barrier::new(3));
+    let first_publish = {
+        let db = first.clone();
+        let start = start.clone();
+        tokio::spawn(async move {
+            start.wait().await;
+            publish_object(
+                &db,
+                automatic_and_manual_request(
+                    "suspended-first",
+                    "suspended-race",
+                    "bafy-suspended-first",
+                ),
+                &limits(),
+            )
+            .await
+        })
+    };
+    let second_publish = {
+        let db = second.clone();
+        let start = start.clone();
+        tokio::spawn(async move {
+            start.wait().await;
+            publish_object(
+                &db,
+                automatic_and_manual_request(
+                    "suspended-second",
+                    "suspended-race",
+                    "bafy-suspended-second",
+                ),
+                &limits(),
+            )
+            .await
+        })
+    };
+    start.wait().await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        first_publish.await.unwrap().unwrap();
+        second_publish.await.unwrap().unwrap();
+    })
+    .await
+    .expect("parallel Suspended publications must finish within the retry bound");
+
+    let suspended = versions_for(&first, "suspended-race").await;
+    assert_eq!(suspended.len(), 1);
+    assert_eq!(suspended[0].sequence, 2);
+    assert!(suspended[0].version_id.is_none());
+    assert!(suspended[0].is_latest);
+    assert_version_projection_agrees(&first, "suspended-race").await;
+    let winner = suspended[0].object_id.as_deref().unwrap();
+    let loser = if winner == "suspended-first" {
+        "suspended-second"
+    } else {
+        "suspended-first"
+    };
+    assert_eq!(
+        object_tag::Entity::find()
+            .filter(object_tag::Column::ObjectId.eq(loser))
+            .count(&first)
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(
+        pin_lease::Entity::find()
+            .filter(pin_lease::Column::OwnerObjectId.eq(loser))
+            .all(&first)
+            .await
+            .unwrap()
+            .iter()
+            .all(|lease| lease.state == "cancelled")
+    );
+
+    crate::store::pinning::tags::replace_object_tags(
+        &second,
+        winner,
+        &[
+            tag("team", "immutable-owner"),
+            tag("ipfs-s3:pin", "true"),
+            tag("ipfs-s3:duration", "1h"),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        crate::store::pinning::tags::list_object_tags(&first, winner)
+            .await
+            .unwrap(),
+        vec![
+            tag("ipfs-s3:duration", "1h"),
+            tag("ipfs-s3:pin", "true"),
+            tag("team", "immutable-owner"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn stale_import_cannot_resurrect_after_delete() {
+    let (_directory, first, second) =
+        setup_independent_file_backed("stale-import-delete.sqlite").await;
+    let now = Utc::now();
+    let claim = claimed_import(&first, "stale-delete-job", "stale-key", now).await;
+    let destination =
+        import_destination::Entity::find_by_id(("bucket".to_owned(), "stale-key".to_owned()))
+            .one(&first)
+            .await
+            .unwrap()
+            .unwrap();
+    let guard = ImportPublicationGuard {
+        job_id: claim.job_id,
+        worker_id: claim.worker_id,
+        claim_epoch: claim.claim_epoch,
+        targets: vec![ExpectedImportTarget {
+            bucket: "bucket".to_owned(),
+            key: "stale-key".to_owned(),
+            generation: destination.generation,
+        }],
+    };
+    let ready = Arc::new(tokio::sync::Barrier::new(2));
+    let worker_ready = ready.clone();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let stale_worker = tokio::spawn(async move {
+        worker_ready.wait().await;
+        released.await.unwrap();
+        publish_import_object(
+            &second,
+            request(
+                object("stale-after-delete", "stale-key", "bafy-stale-delete", 7),
+                vec![],
+                vec![],
+            ),
+            guard,
+            vec![],
+            now,
+            &limits(),
+        )
+        .await
+    });
+
+    ready.wait().await;
+    let _superseding_guard = admit_content_mutation(
+        &first,
+        "bucket",
+        "stale-key",
+        None,
+        SupersedeReason::PutObject,
+        now,
+    )
+    .await
+    .unwrap();
+    crate::store::bucket::delete(&first, "bucket")
+        .await
+        .unwrap();
+    release.send(()).unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(10), stale_worker)
+        .await
+        .expect("stale import must finish without waiting on a deleted bucket")
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        AppError::NoSuchBucket(_) | AppError::StaleImportOwnership
+    ));
+    assert!(
+        !crate::store::bucket::exists(&first, "bucket")
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        object::Entity::find_by_id("stale-after-delete")
+            .count(&first)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        object_version::Entity::find().count(&first).await.unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn failed_transition_rolls_back_index_projection_and_leases() {
+    let (_directory, first, _second) =
+        setup_independent_file_backed("failed-version-transition.sqlite").await;
+    set_versioning(&first, BucketVersioningState::Enabled).await;
+    publish_object(
+        &first,
+        automatic_and_manual_request("rollback-owner", "rollback-key", "bafy-rollback-owner"),
+        &limits(),
+    )
+    .await
+    .unwrap();
+    let before_versions = versions_for(&first, "rollback-key").await;
+    let before_counts = publication_row_counts(&first).await;
+    first
+        .execute_unprepared(
+            "CREATE TRIGGER fail_version_transition BEFORE INSERT ON object_versions \
+             WHEN NEW.object_id = 'rollback-new' \
+             BEGIN SELECT RAISE(FAIL, 'forced post-demotion version failure'); END;",
+        )
+        .await
+        .unwrap();
+
+    let error = publish_object(
+        &first,
+        automatic_and_manual_request("rollback-new", "rollback-key", "bafy-rollback-new"),
+        &limits(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(error, AppError::Database(_)));
+    assert_eq!(versions_for(&first, "rollback-key").await, before_versions);
+    assert_eq!(publication_row_counts(&first).await, before_counts);
+    assert_eq!(
+        crate::store::object::get_latest(&first, "bucket", "rollback-key")
+            .await
+            .unwrap()
+            .id,
+        "rollback-owner"
+    );
+    assert_eq!(
+        object_tag::Entity::find()
+            .filter(object_tag::Column::ObjectId.eq("rollback-owner"))
+            .count(&first)
+            .await
+            .unwrap(),
+        3
+    );
+    assert!(
+        pin_lease::Entity::find()
+            .filter(pin_lease::Column::OwnerObjectId.eq("rollback-owner"))
+            .all(&first)
+            .await
+            .unwrap()
+            .iter()
+            .all(|lease| lease.state == "active" && lease.generation == 1)
+    );
+}
+
 #[tokio::test]
 async fn sqlite_publication_waits_for_existing_writer_before_starting_read_snapshot() {
     let (_directory, db) = setup_file_backed("publication-write-intent.sqlite").await;
@@ -303,12 +829,703 @@ async fn jobs(db: &DatabaseConnection) -> Vec<pin_job::Model> {
 
 async fn assert_no_publication_rows(db: &DatabaseConnection) {
     assert_eq!(rows::<object::Entity>(db).await, 0);
+    assert_eq!(rows::<object_version::Entity>(db).await, 0);
     assert_eq!(rows::<object_tag::Entity>(db).await, 0);
     assert_eq!(rows::<pin_lease::Entity>(db).await, 0);
     assert_eq!(rows::<pin_lease_target::Entity>(db).await, 0);
     assert_eq!(rows::<remote_pin::Entity>(db).await, 0);
     assert_eq!(rows::<pin_provider_usage::Entity>(db).await, 0);
     assert_eq!(rows::<pin_job::Entity>(db).await, 0);
+}
+
+#[tokio::test]
+async fn unversioned_publication_replaces_hidden_null_and_ends_displaced_lease() {
+    let db = setup().await;
+    let first = publish_object(
+        &db,
+        automatic_and_manual_request("unversioned-old", "key", "bafy-old"),
+        &limits(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.version_id, None);
+
+    let second = publish_object(
+        &db,
+        request(
+            object("unversioned-new", "key", "bafy-new", 9),
+            vec![],
+            vec![],
+        ),
+        &limits(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(second.version_id, None);
+    let versions = versions_for(&db, "key").await;
+    assert_eq!(versions.len(), 1);
+    assert_eq!(versions[0].version_id, None);
+    assert_eq!(versions[0].object_id.as_deref(), Some("unversioned-new"));
+    assert!(versions[0].is_latest);
+    assert_eq!(
+        crate::store::object::get_latest(&db, "bucket", "key")
+            .await
+            .unwrap()
+            .id,
+        "unversioned-new"
+    );
+    assert_eq!(
+        object_tag::Entity::find()
+            .filter(object_tag::Column::ObjectId.eq("unversioned-old"))
+            .count(&db)
+            .await
+            .unwrap(),
+        0
+    );
+    let displaced = pin_lease::Entity::find()
+        .filter(pin_lease::Column::OwnerObjectId.eq("unversioned-old"))
+        .all(&db)
+        .await
+        .unwrap();
+    assert_eq!(displaced.len(), 2);
+    assert!(displaced.iter().all(|lease| lease.state == "cancelled"));
+}
+
+#[tokio::test]
+async fn enabled_publication_retains_prior_version_tags_and_lease() {
+    let db = setup().await;
+    set_versioning(&db, BucketVersioningState::Enabled).await;
+    let first = publish_object(
+        &db,
+        automatic_and_manual_request("enabled-old", "key", "bafy-old"),
+        &limits(),
+    )
+    .await
+    .unwrap();
+    let first_version = first.version_id.unwrap();
+    uuid::Uuid::parse_str(&first_version).unwrap();
+
+    let second = publish_object(
+        &db,
+        request(object("enabled-new", "key", "bafy-new", 9), vec![], vec![]),
+        &limits(),
+    )
+    .await
+    .unwrap();
+    let second_version = second.version_id.unwrap();
+    uuid::Uuid::parse_str(&second_version).unwrap();
+    assert_ne!(first_version, second_version);
+
+    let versions = versions_for(&db, "key").await;
+    assert_eq!(versions.len(), 2);
+    assert_eq!(
+        versions[0].version_id.as_deref(),
+        Some(first_version.as_str())
+    );
+    assert!(!versions[0].is_latest);
+    assert_eq!(
+        versions[1].version_id.as_deref(),
+        Some(second_version.as_str())
+    );
+    assert!(versions[1].is_latest);
+    assert_eq!(
+        object_tag::Entity::find()
+            .filter(object_tag::Column::ObjectId.eq("enabled-old"))
+            .count(&db)
+            .await
+            .unwrap(),
+        3
+    );
+    let retained = pin_lease::Entity::find()
+        .filter(pin_lease::Column::OwnerObjectId.eq("enabled-old"))
+        .all(&db)
+        .await
+        .unwrap();
+    assert_eq!(retained.len(), 2);
+    assert!(retained.iter().all(|lease| lease.state == "active"));
+}
+
+#[tokio::test]
+async fn suspended_publication_replaces_null_and_ends_only_displaced_null_lease() {
+    let db = setup().await;
+    set_versioning(&db, BucketVersioningState::Enabled).await;
+    publish_object(
+        &db,
+        automatic_and_manual_request("opaque-old", "key", "bafy-opaque-old"),
+        &limits(),
+    )
+    .await
+    .unwrap();
+
+    set_versioning(&db, BucketVersioningState::Suspended).await;
+    let null = publish_object(
+        &db,
+        automatic_and_manual_request("null-old", "key", "bafy-null-old"),
+        &limits(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(null.version_id.as_deref(), Some("null"));
+
+    set_versioning(&db, BucketVersioningState::Enabled).await;
+    publish_object(
+        &db,
+        automatic_and_manual_request("opaque-current", "key", "bafy-opaque-current"),
+        &limits(),
+    )
+    .await
+    .unwrap();
+    set_versioning(&db, BucketVersioningState::Suspended).await;
+    let replacement = publish_object(
+        &db,
+        request(
+            object("null-new", "key", "bafy-null-new", 11),
+            vec![],
+            vec![],
+        ),
+        &limits(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(replacement.version_id.as_deref(), Some("null"));
+    let versions = versions_for(&db, "key").await;
+    assert_eq!(versions.len(), 3);
+    assert_eq!(
+        versions
+            .iter()
+            .filter(|version| version.version_id.is_none())
+            .count(),
+        1
+    );
+    assert_eq!(
+        versions
+            .iter()
+            .find(|version| version.version_id.is_none())
+            .and_then(|version| version.object_id.as_deref()),
+        Some("null-new")
+    );
+    for retained_id in ["opaque-old", "opaque-current"] {
+        assert!(
+            pin_lease::Entity::find()
+                .filter(pin_lease::Column::OwnerObjectId.eq(retained_id))
+                .all(&db)
+                .await
+                .unwrap()
+                .iter()
+                .all(|lease| lease.state == "active")
+        );
+    }
+    assert!(
+        pin_lease::Entity::find()
+            .filter(pin_lease::Column::OwnerObjectId.eq("null-old"))
+            .all(&db)
+            .await
+            .unwrap()
+            .iter()
+            .all(|lease| lease.state == "cancelled")
+    );
+    assert_eq!(
+        object_tag::Entity::find()
+            .filter(object_tag::Column::ObjectId.eq("null-old"))
+            .count(&db)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        object_tag::Entity::find()
+            .filter(object_tag::Column::ObjectId.eq("opaque-current"))
+            .count(&db)
+            .await
+            .unwrap(),
+        3
+    );
+}
+
+#[tokio::test]
+async fn publication_rollback_preserves_index_projection_tags_leases_quota_and_jobs() {
+    let db = setup().await;
+    publish_object(
+        &db,
+        automatic_and_manual_request("rollback-old", "key", "bafy-old"),
+        &limits(),
+    )
+    .await
+    .unwrap();
+    let before_versions = versions_for(&db, "key").await;
+    let before_counts = publication_row_counts(&db).await;
+    db.execute_unprepared(
+        "CREATE TRIGGER fail_new_pin_job BEFORE INSERT ON pin_jobs \
+         BEGIN SELECT RAISE(FAIL, 'forced new pin job failure'); END;",
+    )
+    .await
+    .unwrap();
+
+    let error = publish_object(
+        &db,
+        automatic_and_manual_request("rollback-new", "key", "bafy-new"),
+        &limits(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(error, AppError::Database(_)));
+    assert_eq!(versions_for(&db, "key").await, before_versions);
+    assert_eq!(publication_row_counts(&db).await, before_counts);
+    assert_eq!(
+        crate::store::object::get_latest(&db, "bucket", "key")
+            .await
+            .unwrap()
+            .id,
+        "rollback-old"
+    );
+    assert_eq!(
+        object_tag::Entity::find()
+            .filter(object_tag::Column::ObjectId.eq("rollback-old"))
+            .count(&db)
+            .await
+            .unwrap(),
+        3
+    );
+    assert!(
+        pin_lease::Entity::find()
+            .filter(pin_lease::Column::OwnerObjectId.eq("rollback-old"))
+            .all(&db)
+            .await
+            .unwrap()
+            .iter()
+            .all(|lease| lease.state == "active" && lease.generation == 1)
+    );
+    for provider in ["pinata", "filebase"] {
+        let usage = pin_provider_usage::Entity::find_by_id(provider)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((usage.reserved_bytes, usage.reserved_pins), (7, 1));
+    }
+    assert_eq!(jobs(&db).await.len(), 2);
+}
+
+#[tokio::test]
+async fn stale_standard_and_import_guards_publish_no_version() {
+    let db = setup().await;
+    set_versioning(&db, BucketVersioningState::Enabled).await;
+    let now = Utc::now();
+    let stale_standard = admit_content_mutation(
+        &db,
+        "bucket",
+        "standard-key",
+        None,
+        SupersedeReason::PutObject,
+        now,
+    )
+    .await
+    .unwrap();
+    publish_import_winner(&db, "standard-winner", "standard-key", "bafy-winner", now).await;
+    let winner_versions = versions_for(&db, "standard-key").await;
+
+    let standard_error = publish_standard_object(
+        &db,
+        request(
+            object("stale-standard", "standard-key", "bafy-stale", 7),
+            vec![],
+            vec![],
+        ),
+        stale_standard,
+        &limits(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(standard_error, AppError::StaleContentMutation));
+    assert_eq!(versions_for(&db, "standard-key").await, winner_versions);
+
+    let claim = claimed_import(&db, "stale-import-job", "import-key", now).await;
+    let import_error = publish_import_object(
+        &db,
+        request(
+            object("stale-import", "import-key", "bafy-stale-import", 7),
+            vec![],
+            vec![],
+        ),
+        ImportPublicationGuard {
+            job_id: claim.job_id,
+            worker_id: claim.worker_id,
+            claim_epoch: claim.claim_epoch,
+            targets: vec![ExpectedImportTarget {
+                bucket: "bucket".to_owned(),
+                key: "import-key".to_owned(),
+                generation: 2,
+            }],
+        },
+        vec![],
+        now,
+        &limits(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(import_error, AppError::StaleImportOwnership));
+    assert!(versions_for(&db, "import-key").await.is_empty());
+}
+
+#[tokio::test]
+async fn zip_archive_and_entries_share_one_atomic_version_transition() {
+    let db = setup().await;
+    set_versioning(&db, BucketVersioningState::Enabled).await;
+    db.execute_unprepared(
+        "CREATE TRIGGER fail_zip_entry BEFORE INSERT ON objects \
+         WHEN NEW.id = 'atomic-entry-b' \
+         BEGIN SELECT RAISE(FAIL, 'forced ZIP entry failure'); END;",
+    )
+    .await
+    .unwrap();
+    let publication = ZipPublicationRequest {
+        archive: request(
+            object("atomic-archive", "archive.zip", "bafy-archive", 7),
+            vec![],
+            vec![],
+        ),
+        entries: vec![
+            object("atomic-entry-a", "out/a.txt", "bafy-a", 3),
+            object("atomic-entry-b", "out/b.txt", "bafy-b", 4),
+        ],
+    };
+
+    assert!(matches!(
+        publish_zip(&db, publication.clone(), &limits()).await,
+        Err(AppError::Database(_))
+    ));
+    assert_no_publication_rows(&db).await;
+
+    db.execute_unprepared("DROP TRIGGER fail_zip_entry")
+        .await
+        .unwrap();
+    let result = publish_zip(&db, publication, &limits()).await.unwrap();
+    let archive_version = result.version_id.unwrap();
+    uuid::Uuid::parse_str(&archive_version).unwrap();
+    for (key, object_id) in [
+        ("archive.zip", "atomic-archive"),
+        ("out/a.txt", "atomic-entry-a"),
+        ("out/b.txt", "atomic-entry-b"),
+    ] {
+        let versions = versions_for(&db, key).await;
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].object_id.as_deref(), Some(object_id));
+        assert!(versions[0].version_id.is_some());
+        assert!(versions[0].is_latest);
+    }
+    assert_eq!(
+        versions_for(&db, "archive.zip").await[0]
+            .version_id
+            .as_deref(),
+        Some(archive_version.as_str())
+    );
+}
+
+#[tokio::test]
+async fn exact_content_delete_ends_only_selected_internal_owner() {
+    let db = setup().await;
+    set_versioning(&db, BucketVersioningState::Enabled).await;
+    let selected = publish_object(
+        &db,
+        automatic_and_manual_request("exact-selected", "key", "bafy-selected"),
+        &limits(),
+    )
+    .await
+    .unwrap()
+    .version_id
+    .unwrap();
+    let retained = publish_object(
+        &db,
+        automatic_and_manual_request("exact-retained", "key", "bafy-retained"),
+        &limits(),
+    )
+    .await
+    .unwrap()
+    .version_id
+    .unwrap();
+
+    let result = guarded_delete(
+        &db,
+        "key",
+        VersionSelector::Exact(PublicVersionId::parse_s3(&selected).unwrap()),
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.version_id.as_deref(), Some(selected.as_str()));
+    assert!(!result.deleted_delete_marker);
+    assert!(!result.created_delete_marker);
+    let versions = versions_for(&db, "key").await;
+    assert_eq!(versions.len(), 1);
+    assert_eq!(versions[0].version_id.as_deref(), Some(retained.as_str()));
+    assert!(versions[0].is_latest);
+    assert_eq!(
+        crate::store::object::get_latest(&db, "bucket", "key")
+            .await
+            .unwrap()
+            .id,
+        "exact-retained"
+    );
+    assert!(
+        pin_lease::Entity::find()
+            .filter(pin_lease::Column::OwnerObjectId.eq("exact-selected"))
+            .all(&db)
+            .await
+            .unwrap()
+            .iter()
+            .all(|lease| lease.state == "cancelled")
+    );
+    assert!(
+        pin_lease::Entity::find()
+            .filter(pin_lease::Column::OwnerObjectId.eq("exact-retained"))
+            .all(&db)
+            .await
+            .unwrap()
+            .iter()
+            .all(|lease| lease.state == "active")
+    );
+    assert_eq!(
+        object_tag::Entity::find()
+            .filter(object_tag::Column::ObjectId.eq("exact-selected"))
+            .count(&db)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        object_tag::Entity::find()
+            .filter(object_tag::Column::ObjectId.eq("exact-retained"))
+            .count(&db)
+            .await
+            .unwrap(),
+        3
+    );
+}
+
+#[tokio::test]
+async fn exact_marker_delete_has_no_lease_work() {
+    let db = setup().await;
+    set_versioning(&db, BucketVersioningState::Enabled).await;
+    publish_object(
+        &db,
+        automatic_and_manual_request("marker-owner", "key", "bafy-marker-owner"),
+        &limits(),
+    )
+    .await
+    .unwrap();
+    let marker = guarded_delete(&db, "key", VersionSelector::Current, Utc::now())
+        .await
+        .unwrap()
+        .version_id
+        .unwrap();
+    let leases_before = pin_lease::Entity::find()
+        .order_by_asc(pin_lease::Column::Id)
+        .all(&db)
+        .await
+        .unwrap();
+    let targets_before = pin_lease_target::Entity::find()
+        .order_by_asc(pin_lease_target::Column::Id)
+        .all(&db)
+        .await
+        .unwrap();
+    let remotes_before = remote_pin::Entity::find()
+        .order_by_asc(remote_pin::Column::Provider)
+        .order_by_asc(remote_pin::Column::Cid)
+        .all(&db)
+        .await
+        .unwrap();
+    let jobs_before = jobs(&db).await;
+
+    let result = guarded_delete(
+        &db,
+        "key",
+        VersionSelector::Exact(PublicVersionId::parse_s3(&marker).unwrap()),
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.version_id.as_deref(), Some(marker.as_str()));
+    assert!(result.deleted_delete_marker);
+    assert!(!result.created_delete_marker);
+    assert_eq!(
+        crate::store::object::get_latest(&db, "bucket", "key")
+            .await
+            .unwrap()
+            .id,
+        "marker-owner"
+    );
+    assert_eq!(
+        pin_lease::Entity::find()
+            .order_by_asc(pin_lease::Column::Id)
+            .all(&db)
+            .await
+            .unwrap(),
+        leases_before
+    );
+    assert_eq!(
+        pin_lease_target::Entity::find()
+            .order_by_asc(pin_lease_target::Column::Id)
+            .all(&db)
+            .await
+            .unwrap(),
+        targets_before
+    );
+    assert_eq!(
+        remote_pin::Entity::find()
+            .order_by_asc(remote_pin::Column::Provider)
+            .order_by_asc(remote_pin::Column::Cid)
+            .all(&db)
+            .await
+            .unwrap(),
+        remotes_before
+    );
+    assert_eq!(jobs(&db).await, jobs_before);
+}
+
+#[tokio::test]
+async fn exact_latest_delete_promotes_next_object_or_marker() {
+    let db = setup().await;
+    set_versioning(&db, BucketVersioningState::Enabled).await;
+    let base = publish_object(
+        &db,
+        request(
+            object("promotion-base", "key", "bafy-base", 7),
+            vec![],
+            vec![],
+        ),
+        &limits(),
+    )
+    .await
+    .unwrap()
+    .version_id
+    .unwrap();
+    let marker = guarded_delete(&db, "key", VersionSelector::Current, Utc::now())
+        .await
+        .unwrap()
+        .version_id
+        .unwrap();
+    let latest = publish_object(
+        &db,
+        request(
+            object("promotion-latest", "key", "bafy-latest", 9),
+            vec![],
+            vec![],
+        ),
+        &limits(),
+    )
+    .await
+    .unwrap()
+    .version_id
+    .unwrap();
+
+    guarded_delete(
+        &db,
+        "key",
+        VersionSelector::Exact(PublicVersionId::parse_s3(&latest).unwrap()),
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        crate::store::object::get_latest(&db, "bucket", "key").await,
+        Err(AppError::NoSuchKey(_))
+    ));
+    let promoted_marker = versions_for(&db, "key")
+        .await
+        .into_iter()
+        .find(|version| version.is_latest)
+        .unwrap();
+    assert_eq!(promoted_marker.kind, "delete_marker");
+    assert_eq!(promoted_marker.version_id.as_deref(), Some(marker.as_str()));
+
+    guarded_delete(
+        &db,
+        "key",
+        VersionSelector::Exact(PublicVersionId::parse_s3(&marker).unwrap()),
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        crate::store::object::get_latest(&db, "bucket", "key")
+            .await
+            .unwrap()
+            .id,
+        "promotion-base"
+    );
+    let promoted_object = versions_for(&db, "key")
+        .await
+        .into_iter()
+        .find(|version| version.is_latest)
+        .unwrap();
+    assert_eq!(promoted_object.kind, "object");
+    assert_eq!(promoted_object.version_id.as_deref(), Some(base.as_str()));
+}
+
+#[tokio::test]
+async fn delete_race_loses_to_newer_mutation_fence() {
+    let db = setup().await;
+    set_versioning(&db, BucketVersioningState::Enabled).await;
+    publish_object(
+        &db,
+        request(object("race-owner", "race", "bafy-race", 7), vec![], vec![]),
+        &limits(),
+    )
+    .await
+    .unwrap();
+    let now = Utc::now();
+    let stale = admit_content_mutation(
+        &db,
+        "bucket",
+        "race",
+        None,
+        SupersedeReason::DeleteObject,
+        now,
+    )
+    .await
+    .unwrap();
+    let winner =
+        admit_content_mutation(&db, "bucket", "race", None, SupersedeReason::PutObject, now)
+            .await
+            .unwrap();
+    let versions_before = versions_for(&db, "race").await;
+
+    let error = delete_version_with_leases_guarded(
+        &db,
+        "bucket",
+        "race",
+        VersionSelector::Current,
+        stale,
+        now,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, AppError::StaleContentMutation));
+    assert_eq!(versions_for(&db, "race").await, versions_before);
+    assert_eq!(
+        crate::store::object::get_latest(&db, "bucket", "race")
+            .await
+            .unwrap()
+            .id,
+        "race-owner"
+    );
+
+    let result = delete_version_with_leases_guarded(
+        &db,
+        "bucket",
+        "race",
+        VersionSelector::Current,
+        winner,
+        now,
+    )
+    .await
+    .unwrap();
+    assert!(result.created_delete_marker);
 }
 
 fn import_request(id: &str, key: &str, decompress_prefix: Option<&str>) -> NewImportJob {
@@ -495,9 +1712,16 @@ async fn newer_completed_import_fences_older_delete_and_delete_objects_keys() {
         .await;
         let rows_after_import = publication_row_counts(&db).await;
 
-        let error = delete_latest_with_leases_guarded(&db, "bucket", key, guard, now)
-            .await
-            .unwrap_err();
+        let error = delete_version_with_leases_guarded(
+            &db,
+            "bucket",
+            key,
+            VersionSelector::Current,
+            guard,
+            now,
+        )
+        .await
+        .unwrap_err();
 
         assert!(matches!(error, AppError::StaleContentMutation));
         assert_eq!(publication_row_counts(&db).await, rows_after_import);
@@ -2593,19 +3817,22 @@ async fn completed_publication_reconciliation_uses_exact_attempt_and_upload_abse
     .unwrap();
     assert!(matches!(
         reconcile_completed_publication(&db, "upload-reconcile", &expected).await,
-        ReconciledCommitOutcome::Committed
+        ReconciledPublicationOutcome::Committed(PublicationResult {
+            ref object_id,
+            version_id: None,
+        }) if object_id == "attempt-exact"
     ));
 
     let absent = object("attempt-absent", "root.bin", "bafy-exact", 7);
     assert!(matches!(
         reconcile_completed_publication(&db, "upload-reconcile", &absent).await,
-        ReconciledCommitOutcome::NotCommitted
+        ReconciledPublicationOutcome::NotCommitted
     ));
 
     let mut mismatched = expected.clone();
     mismatched.cid = "bafy-other".to_owned();
     assert!(matches!(
         reconcile_completed_publication(&db, "upload-reconcile", &mismatched).await,
-        ReconciledCommitOutcome::Unknown(AppError::Internal(_))
+        ReconciledPublicationOutcome::Unknown(AppError::Internal(_))
     ));
 }

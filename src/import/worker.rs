@@ -656,7 +656,9 @@ mod tests {
     const CID: &str = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
 
     async fn test_state(kubo_uri: String) -> Arc<AppState> {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let mut options = ConnectOptions::new("sqlite::memory:");
+        options.max_connections(1).min_connections(1);
+        let db = Database::connect(options).await.unwrap();
         crate::store::run_migrations(&db).await.unwrap();
         crate::store::bucket::create(&db, "bucket", None)
             .await
@@ -837,6 +839,29 @@ mod tests {
         assert_eq!(concurrency.saturating_sub(3), 1);
         assert_eq!(concurrency.saturating_sub(4), 0);
         assert_eq!(concurrency.saturating_sub(8), 0);
+    }
+
+    #[tokio::test]
+    async fn in_memory_test_state_uses_one_connection_so_migrations_are_shared() {
+        let state = test_state("http://127.0.0.1:1".to_owned()).await;
+        let holder = state.store.db().begin().await.unwrap();
+        let db = state.store.db().clone();
+        let query = tokio::spawn(async move { import_job::Entity::find().count(&db).await });
+
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !query.is_finished(),
+            "a second independent in-memory connection bypassed migrations instead of waiting for the held connection"
+        );
+
+        drop(holder);
+        let count = tokio::time::timeout(Duration::from_secs(1), query)
+            .await
+            .expect("query must complete after the held connection is released")
+            .expect("query task must not panic")
+            .expect("query through the migrated in-memory database must succeed");
+        assert_eq!(count, 0);
     }
 
     #[tokio::test]

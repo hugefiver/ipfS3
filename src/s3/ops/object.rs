@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
@@ -9,10 +9,16 @@ use s3s::dto::*;
 use s3s::{S3Request, S3Response, S3Result};
 
 use crate::crypto::EncryptionMode;
+use crate::error::AppError;
 use crate::pinning::policy::{PublicationContext, PublicationPolicy};
 use crate::pinning::tags::ObjectTag;
 use crate::state::AppState;
-use crate::store::pinning::publication::{PinTargetSpec, PublicationObject, PublicationRequest};
+use crate::store::object_version::{
+    BucketVersioningState, PublicVersionId, VersionKind, VersionSelector,
+};
+use crate::store::pinning::publication::{
+    PinTargetSpec, PublicationObject, PublicationRequest, PublicationResult,
+};
 
 /// Wraps a byte stream and counts the total bytes that flow through it.
 /// The count handle is read after the stream has been fully consumed.
@@ -82,28 +88,39 @@ pub async fn publish_plain_object(
     metadata: Option<serde_json::Value>,
     stored: &StoredObject,
     multipart: bool,
-) -> S3Result<()> {
+) -> S3Result<PublicationResult> {
     let object_id = uuid::Uuid::new_v4().to_string();
-    if let Err(e) = crate::store::object::upsert(
-        state.store.db(),
-        &object_id,
+    let tags = Vec::new();
+    let policy = evaluate_publication_policy(state, bucket, key, &tags)?;
+    let mut object = PublicationObject::from_put(
+        object_id,
         bucket,
         key,
-        &stored.cid,
+        stored.cid.clone(),
         stored.size,
-        content_type,
-        &stored.cid,
+        content_type.map(str::to_owned),
         metadata,
         false,
         None,
         None,
-        multipart,
+        chrono::Utc::now(),
+    );
+    object.multipart = multipart;
+    crate::store::pinning::publication::publish_object(
+        state.store.db(),
+        PublicationRequest {
+            object,
+            tags: policy.tags.clone(),
+            policy,
+            object_target: PinTargetSpec {
+                cid: stored.cid.clone(),
+                logical_size: stored.size,
+            },
+        },
+        state.pinning.provider_limits(),
     )
     .await
-    {
-        return Err(e.into());
-    }
-    Ok(())
+    .map_err(Into::into)
 }
 
 #[allow(dead_code)]
@@ -576,6 +593,39 @@ async fn authenticate_sse_c_object(
 // Operations
 // ---------------------------------------------------------------------------
 
+async fn select_s3_object(
+    state: &Arc<AppState>,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+) -> S3Result<(object::Model, Option<String>)> {
+    let selector = match version_id {
+        Some(version_id) => VersionSelector::Exact(PublicVersionId::parse_s3(version_id)?),
+        None => VersionSelector::Current,
+    };
+    let db = state.store.db();
+    let resolved =
+        crate::store::object_version::resolve_version(db, bucket, key, &selector).await?;
+    match resolved.kind {
+        VersionKind::DeleteMarker => Err(AppError::DeleteMarker {
+            version_id: resolved.public_version_id,
+            created_at: resolved.created_at,
+            current: version_id.is_none(),
+        }
+        .into()),
+        VersionKind::Object => {
+            let object = resolved.object.ok_or_else(|| {
+                s3s::s3_error!(InternalError, "object version index is missing its object")
+            })?;
+            let public_version_id = (crate::store::bucket::get_versioning_state(db, bucket)
+                .await?
+                != BucketVersioningState::Unversioned)
+                .then_some(resolved.public_version_id);
+            Ok((object, public_version_id))
+        }
+    }
+}
+
 pub async fn put_object(
     state: &Arc<AppState>,
     req: S3Request<PutObjectInput>,
@@ -685,16 +735,13 @@ pub async fn put_object(
             logical_size: size,
         },
     };
-    if let Err(e) = crate::store::pinning::publication::publish_standard_object(
+    let publication_result = crate::store::pinning::publication::publish_standard_object(
         db,
         publication,
         mutation_guard,
         state.pinning.provider_limits(),
     )
-    .await
-    {
-        return Err(e.into());
-    }
+    .await?;
 
     let server_side_encryption = if enc_mode == EncryptionMode::SseS3 {
         Some(ServerSideEncryption::from_static("AES256"))
@@ -707,6 +754,7 @@ pub async fn put_object(
         PutObjectOutput {
             e_tag: Some(ETag::Strong(cid.clone())),
             server_side_encryption,
+            version_id: publication_result.version_id,
             ..Default::default()
         },
         headers,
@@ -719,9 +767,8 @@ pub async fn get_object(
 ) -> S3Result<S3Response<GetObjectOutput>> {
     let bucket = &req.input.bucket;
     let key = &req.input.key;
-    let db = state.store.db();
-
-    let obj = crate::store::object::get_latest(db, bucket, key).await?;
+    let (obj, version_id) =
+        select_s3_object(state, bucket, key, req.input.version_id.as_deref()).await?;
 
     let has_range = req.input.range.is_some();
     let is_sse_c = obj.encrypted && obj.key_wrap.is_none();
@@ -760,6 +807,7 @@ pub async fn get_object(
                 end,
                 has_range,
                 sse_customer_key_md5,
+                version_id,
             )
             .await;
         };
@@ -869,10 +917,12 @@ pub async fn get_object(
         content_range,
         server_side_encryption,
         metadata: restore_metadata(&obj.metadata),
+        version_id,
         ..Default::default()
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn build_sse_c_get_response(
     obj: &crate::store::entities::object::Model,
     mut auth: AuthenticatedSseCObject,
@@ -881,6 +931,7 @@ async fn build_sse_c_get_response(
     end: u64,
     has_range: bool,
     sse_customer_key_md5: Option<String>,
+    version_id: Option<String>,
 ) -> S3Result<S3Response<GetObjectOutput>> {
     let body = if has_range {
         let plaintext = if let Some(plaintext) = auth.legacy_plaintext.take() {
@@ -959,6 +1010,7 @@ async fn build_sse_c_get_response(
         sse_customer_algorithm: Some("AES256".to_owned()),
         sse_customer_key_md5,
         metadata: restore_metadata(&obj.metadata),
+        version_id,
         ..Default::default()
     }))
 }
@@ -969,9 +1021,8 @@ pub async fn head_object(
 ) -> S3Result<S3Response<HeadObjectOutput>> {
     let bucket = &req.input.bucket;
     let key = &req.input.key;
-    let db = state.store.db();
-
-    let obj = crate::store::object::get_latest(db, bucket, key).await?;
+    let (obj, version_id) =
+        select_s3_object(state, bucket, key, req.input.version_id.as_deref()).await?;
     let sse_c_auth = if obj.encrypted && obj.key_wrap.is_none() {
         Some(
             authenticate_sse_c_object(state, &obj, extract_sse_c_headers(&req.headers)?, false)
@@ -1000,6 +1051,7 @@ pub async fn head_object(
         sse_customer_algorithm: sse_c_auth.as_ref().map(|_| "AES256".to_owned()),
         sse_customer_key_md5: sse_c_auth.map(|auth| auth.key_md5),
         metadata: restore_metadata(&obj.metadata),
+        version_id,
         ..Default::default()
     }))
 }
@@ -1011,6 +1063,19 @@ pub async fn delete_object(
     let bucket = &req.input.bucket;
     let key = &req.input.key;
     let db = state.store.db();
+    let selector = match req.input.version_id.as_deref() {
+        Some(version_id) => VersionSelector::Exact(PublicVersionId::parse_s3(version_id)?),
+        None => VersionSelector::Current,
+    };
+    if matches!(&selector, VersionSelector::Exact(_))
+        && crate::store::bucket::get_versioning_state(db, bucket).await?
+            == BucketVersioningState::Unversioned
+    {
+        return Err(AppError::InvalidArgument(
+            "version IDs are unavailable for an unversioned bucket".to_owned(),
+        )
+        .into());
+    }
 
     let mutation_guard = crate::store::import::ownership::admit_content_mutation(
         db,
@@ -1022,19 +1087,39 @@ pub async fn delete_object(
     )
     .await?;
 
-    if !crate::store::pinning::publication::delete_latest_with_leases_guarded(
+    let result = crate::store::pinning::publication::delete_version_with_leases_guarded(
         db,
         bucket,
         key,
+        selector,
         mutation_guard,
         chrono::Utc::now(),
     )
-    .await?
-    {
-        return Err(crate::error::AppError::NoSuchKey(format!("{bucket}/{key}")).into());
-    }
+    .await?;
 
-    Ok(S3Response::new(DeleteObjectOutput::default()))
+    Ok(S3Response::new(DeleteObjectOutput {
+        delete_marker: (result.created_delete_marker || result.deleted_delete_marker)
+            .then_some(true),
+        version_id: result.version_id,
+        ..Default::default()
+    }))
+}
+
+fn delete_objects_item_error(error: &AppError) -> (String, String) {
+    match error {
+        AppError::NoSuchVersion { .. } => {
+            ("NoSuchVersion".to_owned(), "version not found".to_owned())
+        }
+        AppError::InvalidArgument(_) => ("InvalidArgument".to_owned(), error.to_string()),
+        AppError::StaleContentMutation => (
+            "OperationAborted".to_owned(),
+            "content mutation was superseded by a newer operation".to_owned(),
+        ),
+        _ => (
+            "InternalError".to_owned(),
+            "failed to delete object".to_owned(),
+        ),
+    }
 }
 
 pub async fn delete_objects(
@@ -1056,91 +1141,116 @@ pub async fn delete_objects(
 
     let quiet = delete.quiet.unwrap_or(false);
     let objects = delete.objects;
-    let keys = objects
-        .iter()
-        .map(|object| object.key.clone())
-        .collect::<Vec<_>>();
-    let mutation_guards = crate::store::import::ownership::admit_content_mutations(
-        db,
-        &bucket,
-        &keys,
-        None,
-        crate::import::SupersedeReason::DeleteObject,
-        chrono::Utc::now(),
-    )
-    .await?;
-    let mut mutation_guards = mutation_guards
-        .into_iter()
-        .map(|guard| (guard.key.clone(), guard))
-        .collect::<BTreeMap<_, _>>();
     let mut deleted = Vec::new();
     let mut errors = Vec::new();
-    let mut outcomes = HashMap::<String, Option<(String, String)>>::new();
 
     for object in objects {
-        // v0.2 has no versioning; ObjectIdentifier::version_id is deliberately ignored.
         let key = object.key;
-        if let Some(previous) = outcomes.get(&key) {
-            if let Some((code, message)) = previous {
-                errors.push(Error {
-                    code: Some(code.clone()),
-                    key: Some(key),
-                    message: Some(message.clone()),
-                    version_id: None,
-                });
-            } else if !quiet {
-                deleted.push(DeletedObject {
-                    key: Some(key),
-                    ..Default::default()
-                });
-            }
-            continue;
-        }
-        let Some(guard) = mutation_guards.remove(&key) else {
-            return Err(crate::error::AppError::Internal(
-                "DeleteObjects admission returned no mutation guard".to_owned(),
-            )
-            .into());
+        let incoming_version_id = object.version_id;
+        let selector = match incoming_version_id.as_deref() {
+            Some(version_id) => match PublicVersionId::parse_s3(version_id) {
+                Ok(version_id) => VersionSelector::Exact(version_id),
+                Err(error) => {
+                    let (code, message) = delete_objects_item_error(&error);
+                    errors.push(Error {
+                        code: Some(code),
+                        key: Some(key),
+                        message: Some(message),
+                        version_id: incoming_version_id,
+                    });
+                    continue;
+                }
+            },
+            None => VersionSelector::Current,
         };
-        match crate::store::pinning::publication::delete_latest_with_leases_guarded(
+        if matches!(&selector, VersionSelector::Exact(_)) {
+            match crate::store::bucket::get_versioning_state(db, &bucket).await {
+                Ok(BucketVersioningState::Unversioned) => {
+                    let error = AppError::InvalidArgument(
+                        "version IDs are unavailable for an unversioned bucket".to_owned(),
+                    );
+                    let (code, message) = delete_objects_item_error(&error);
+                    errors.push(Error {
+                        code: Some(code),
+                        key: Some(key),
+                        message: Some(message),
+                        version_id: incoming_version_id,
+                    });
+                    continue;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::error!(%bucket, %key, %error, "failed to read versioning state for delete");
+                    let (code, message) = delete_objects_item_error(&error);
+                    errors.push(Error {
+                        code: Some(code),
+                        key: Some(key),
+                        message: Some(message),
+                        version_id: incoming_version_id,
+                    });
+                    continue;
+                }
+            }
+        }
+        let guard = match crate::store::import::ownership::admit_content_mutation(
             db,
             &bucket,
             &key,
+            None,
+            crate::import::SupersedeReason::DeleteObject,
+            chrono::Utc::now(),
+        )
+        .await
+        {
+            Ok(guard) => guard,
+            Err(error) => {
+                tracing::error!(%bucket, %key, %error, "failed to admit object delete");
+                let (code, message) = delete_objects_item_error(&error);
+                errors.push(Error {
+                    code: Some(code),
+                    key: Some(key),
+                    message: Some(message),
+                    version_id: incoming_version_id,
+                });
+                continue;
+            }
+        };
+        match crate::store::pinning::publication::delete_version_with_leases_guarded(
+            db,
+            &bucket,
+            &key,
+            selector,
             guard,
             chrono::Utc::now(),
         )
         .await
         {
-            Ok(_) if !quiet => {
-                outcomes.insert(key.clone(), None);
+            Ok(result) if !quiet => {
+                let exact_version_id = incoming_version_id.clone();
+                let delete_marker_version_id = if result.created_delete_marker {
+                    result.version_id.clone()
+                } else if result.deleted_delete_marker {
+                    exact_version_id.clone()
+                } else {
+                    None
+                };
                 deleted.push(DeletedObject {
                     key: Some(key),
-                    ..Default::default()
+                    version_id: exact_version_id,
+                    delete_marker: (result.created_delete_marker || result.deleted_delete_marker)
+                        .then_some(true),
+                    delete_marker_version_id,
                 });
             }
-            Ok(_) => {
-                outcomes.insert(key, None);
-            }
+            Ok(_) => {}
             Err(error) => {
                 tracing::error!(%bucket, %key, %error, "failed to delete object");
-                let (code, message) =
-                    if matches!(error, crate::error::AppError::StaleContentMutation) {
-                        (
-                            "OperationAborted".to_owned(),
-                            "content mutation was superseded by a newer operation".to_owned(),
-                        )
-                    } else {
-                        (
-                            "InternalError".to_owned(),
-                            "failed to delete object".to_owned(),
-                        )
-                    };
-                outcomes.insert(key.clone(), Some((code.clone(), message.clone())));
+                let (code, message) = delete_objects_item_error(&error);
                 errors.push(Error {
                     code: Some(code),
                     key: Some(key),
                     message: Some(message),
-                    version_id: None,
+                    version_id: incoming_version_id,
                 });
             }
         }
@@ -1161,18 +1271,23 @@ pub async fn copy_object(
     let dst_key = &req.input.key;
     let db = state.store.db();
 
-    let (src_bucket, src_key) = match req.input.copy_source {
+    let (src_bucket, src_key, src_version_id) = match req.input.copy_source {
         CopySource::Bucket {
             ref bucket,
             ref key,
-            ..
-        } => (bucket.to_string(), key.to_string()),
+            ref version_id,
+        } => (
+            bucket.to_string(),
+            key.to_string(),
+            version_id.as_deref().map(str::to_owned),
+        ),
         _ => {
             return Err(s3s::s3_error!(InvalidArgument, "unsupported copy source"));
         }
     };
 
-    let src_obj = crate::store::object::get_latest(db, &src_bucket, &src_key).await?;
+    let (src_obj, copy_source_version_id) =
+        select_s3_object(state, &src_bucket, &src_key, src_version_id.as_deref()).await?;
     let tags = copy_publication_tags(state, &src_obj.id, &req.headers).await?;
 
     // Validate destination bucket exists.
@@ -1251,7 +1366,7 @@ pub async fn copy_object(
         object_created_at,
     );
     object.multipart = src_obj.multipart;
-    crate::store::pinning::publication::publish_standard_object(
+    let publication_result = crate::store::pinning::publication::publish_standard_object(
         db,
         PublicationRequest {
             object,
@@ -1273,6 +1388,8 @@ pub async fn copy_object(
             last_modified: Some(Timestamp::from(SystemTime::from(object_created_at))),
             ..Default::default()
         }),
+        copy_source_version_id,
+        version_id: publication_result.version_id,
         ..Default::default()
     }))
 }
@@ -1303,7 +1420,7 @@ struct ListingPage {
     next_cursor: Option<String>,
 }
 
-fn normalized_max_keys(value: Option<i32>) -> usize {
+pub(crate) fn normalized_max_keys(value: Option<i32>) -> usize {
     value.unwrap_or(1000).clamp(1, 1000) as usize
 }
 
@@ -1372,11 +1489,11 @@ fn rfc3986_url_encode(value: &str) -> String {
     encoded
 }
 
-fn url_encoding_requested(encoding_type: Option<&EncodingType>) -> bool {
+pub(crate) fn url_encoding_requested(encoding_type: Option<&EncodingType>) -> bool {
     encoding_type.is_some_and(|encoding_type| encoding_type.as_str() == EncodingType::URL)
 }
 
-fn project_listing_field(value: &str, url_encode: bool) -> String {
+pub(crate) fn project_listing_field(value: &str, url_encode: bool) -> String {
     if url_encode {
         rfc3986_url_encode(value)
     } else {
@@ -1384,7 +1501,10 @@ fn project_listing_field(value: &str, url_encode: bool) -> String {
     }
 }
 
-fn project_optional_listing_field(value: Option<String>, url_encode: bool) -> Option<String> {
+pub(crate) fn project_optional_listing_field(
+    value: Option<String>,
+    url_encode: bool,
+) -> Option<String> {
     value.map(|value| project_listing_field(&value, url_encode))
 }
 
@@ -1648,11 +1768,13 @@ impl ListingPage {
 mod tests {
     use super::*;
     use crate::store::entities::{
-        object, pin_job, pin_lease, pin_lease_target, pin_provider_usage, remote_pin,
+        object, object_tag, object_version, pin_job, pin_lease, pin_lease_target,
+        pin_provider_usage, remote_pin,
     };
     use chrono::Utc;
     use sea_orm::{
         ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
+        TransactionTrait,
     };
 
     async fn test_state(kubo_uri: String) -> Arc<AppState> {
@@ -1843,17 +1965,189 @@ mod tests {
         )
     }
 
-    fn delete_object_request(key: &str) -> S3Request<DeleteObjectInput> {
+    fn copy_request_version(
+        source_key: &str,
+        source_version_id: Option<&str>,
+        destination_key: &str,
+        headers: http::HeaderMap,
+    ) -> S3Request<CopyObjectInput> {
+        s3_request(
+            CopyObjectInput::builder()
+                .bucket("bucket".to_owned())
+                .copy_source(CopySource::Bucket {
+                    bucket: "bucket".into(),
+                    key: source_key.into(),
+                    version_id: source_version_id.map(Into::into),
+                })
+                .key(destination_key.to_owned())
+                .build()
+                .unwrap(),
+            http::Method::PUT,
+            &format!("/bucket/{destination_key}"),
+            headers,
+        )
+    }
+
+    fn get_object_request(
+        key: &str,
+        version_id: Option<&str>,
+        headers: http::HeaderMap,
+    ) -> S3Request<GetObjectInput> {
+        s3_request(
+            GetObjectInput {
+                bucket: "bucket".to_owned(),
+                key: key.to_owned(),
+                version_id: version_id.map(str::to_owned),
+                ..Default::default()
+            },
+            http::Method::GET,
+            &format!("/bucket/{key}"),
+            headers,
+        )
+    }
+
+    fn head_object_request(
+        key: &str,
+        version_id: Option<&str>,
+        headers: http::HeaderMap,
+    ) -> S3Request<HeadObjectInput> {
+        s3_request(
+            HeadObjectInput {
+                bucket: "bucket".to_owned(),
+                key: key.to_owned(),
+                version_id: version_id.map(str::to_owned),
+                ..Default::default()
+            },
+            http::Method::HEAD,
+            &format!("/bucket/{key}"),
+            headers,
+        )
+    }
+
+    async fn versioned_read_state() -> (Arc<AppState>, wiremock::MockServer) {
+        let kubo = kubo_server("unused").await;
+        let state = pinning_state(kubo.uri(), "request", "one", "").await;
+        crate::store::bucket::set_versioning_state(
+            state.store.db(),
+            "bucket",
+            crate::store::object_version::BucketVersioningState::Enabled,
+        )
+        .await
+        .unwrap();
+        (state, kubo)
+    }
+
+    async fn mount_cat_body(kubo: &wiremock::MockServer, cid: &str, body: Vec<u8>) {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+
+        Mock::given(method("POST"))
+            .and(path("/api/v0/cat"))
+            .and(query_param("arg", cid))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(kubo)
+            .await;
+    }
+
+    async fn read_get_body(response: S3Response<GetObjectOutput>) -> Vec<u8> {
+        let mut body = response.output.body.expect("GetObject body");
+        let mut bytes = Vec::new();
+        while let Some(chunk) = body.next().await {
+            bytes.extend_from_slice(&chunk.expect("GetObject body chunk"));
+        }
+        bytes
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_versioned_read_object(
+        state: &Arc<AppState>,
+        object_id: &str,
+        key: &str,
+        cid: &str,
+        encrypted: bool,
+        key_wrap: Option<String>,
+        sse_c_key_fingerprint: Option<String>,
+        tags: Vec<crate::pinning::tags::ObjectTag>,
+    ) -> PublicationResult {
+        let policy = state
+            .pinning
+            .policy()
+            .evaluate_publication(PublicationContext {
+                bucket: "bucket",
+                key,
+                tags: &tags,
+                is_decompress_zip: false,
+            })
+            .unwrap();
+        crate::store::pinning::publication::publish_object(
+            state.store.db(),
+            PublicationRequest {
+                object: PublicationObject::from_put(
+                    object_id.to_owned(),
+                    "bucket",
+                    key,
+                    cid.to_owned(),
+                    4,
+                    Some("text/plain".to_owned()),
+                    None,
+                    encrypted,
+                    key_wrap,
+                    sse_c_key_fingerprint,
+                    Utc::now(),
+                ),
+                tags: policy.tags.clone(),
+                policy,
+                object_target: PinTargetSpec {
+                    cid: cid.to_owned(),
+                    logical_size: 4,
+                },
+            },
+            state.pinning.provider_limits(),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn install_current_marker(state: &Arc<AppState>, key: &str) -> String {
+        state
+            .store
+            .db()
+            .transaction(move |txn| {
+                let key = key.to_owned();
+                Box::pin(async move {
+                    crate::store::object_version::install_delete_marker(
+                        txn,
+                        crate::store::object_version::BucketVersioningState::Enabled,
+                        "bucket",
+                        &key,
+                        Utc::now(),
+                    )
+                    .await
+                })
+            })
+            .await
+            .unwrap()
+    }
+
+    fn delete_object_version_request(
+        key: &str,
+        version_id: Option<&str>,
+    ) -> S3Request<DeleteObjectInput> {
         s3_request(
             DeleteObjectInput {
                 bucket: "bucket".to_owned(),
                 key: key.to_owned(),
+                version_id: version_id.map(str::to_owned),
                 ..Default::default()
             },
             http::Method::DELETE,
             &format!("/bucket/{key}"),
             http::HeaderMap::new(),
         )
+    }
+
+    fn delete_object_request(key: &str) -> S3Request<DeleteObjectInput> {
+        delete_object_version_request(key, None)
     }
 
     async fn lease_sources_for_latest(state: &Arc<AppState>, key: &str) -> Vec<String> {
@@ -2127,6 +2421,569 @@ mod tests {
         assert_eq!(error.code().as_str(), "InternalError");
     }
 
+    #[tokio::test]
+    async fn get_and_head_current_content_return_public_version() {
+        let (state, _kubo) = versioned_read_state().await;
+        publish_versioned_read_object(
+            &state,
+            "current-old",
+            "current.txt",
+            "QmCurrentOld",
+            false,
+            None,
+            None,
+            Vec::new(),
+        )
+        .await;
+        let current = publish_versioned_read_object(
+            &state,
+            "current-new",
+            "current.txt",
+            "QmCurrentNew",
+            false,
+            None,
+            None,
+            Vec::new(),
+        )
+        .await;
+        let current_version = current.version_id.expect("versioned current ID");
+
+        let get = get_object(
+            &state,
+            get_object_request("current.txt", None, http::HeaderMap::new()),
+        )
+        .await
+        .expect("current GetObject");
+        assert_eq!(
+            get.output.e_tag.as_ref().map(ETag::value),
+            Some("QmCurrentNew")
+        );
+        assert_eq!(
+            get.output.version_id.as_deref(),
+            Some(current_version.as_str())
+        );
+
+        let head = head_object(
+            &state,
+            head_object_request("current.txt", None, http::HeaderMap::new()),
+        )
+        .await
+        .expect("current HeadObject");
+        assert_eq!(
+            head.output.e_tag.as_ref().map(ETag::value),
+            Some("QmCurrentNew")
+        );
+        assert_eq!(
+            head.output.version_id.as_deref(),
+            Some(current_version.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn get_and_head_exact_historical_plain_sse_s3_and_sse_c_versions() {
+        let (state, kubo) = versioned_read_state().await;
+
+        let plain_old = publish_versioned_read_object(
+            &state,
+            "plain-old",
+            "plain.txt",
+            "QmPlainOld",
+            false,
+            None,
+            None,
+            Vec::new(),
+        )
+        .await;
+        publish_versioned_read_object(
+            &state,
+            "plain-new",
+            "plain.txt",
+            "QmPlainNew",
+            false,
+            None,
+            None,
+            Vec::new(),
+        )
+        .await;
+
+        let sse_s3_old_key = state.master_key.generate_object_key();
+        let sse_s3_old = publish_versioned_read_object(
+            &state,
+            "sse-s3-old",
+            "sse-s3.txt",
+            "QmSseS3Old",
+            true,
+            Some(state.master_key.wrap(&sse_s3_old_key).unwrap()),
+            None,
+            Vec::new(),
+        )
+        .await;
+        let sse_s3_new_key = state.master_key.generate_object_key();
+        publish_versioned_read_object(
+            &state,
+            "sse-s3-new",
+            "sse-s3.txt",
+            "QmSseS3New",
+            true,
+            Some(state.master_key.wrap(&sse_s3_new_key).unwrap()),
+            None,
+            Vec::new(),
+        )
+        .await;
+
+        mount_cat_body(
+            &kubo,
+            "QmSseS3Old",
+            crate::crypto::aes_gcm::encrypt_chunk(&sse_s3_old_key, &[0x11; 12], b"old!")
+                .unwrap()
+                .to_vec(),
+        )
+        .await;
+
+        let sse_c_key = crate::crypto::ObjectKey { bytes: [0x42; 32] };
+        let sse_c_fingerprint = state.master_key.sse_c_key_fingerprint(&sse_c_key);
+        let sse_c_old = publish_versioned_read_object(
+            &state,
+            "sse-c-old",
+            "sse-c.txt",
+            "QmSseCOld",
+            true,
+            None,
+            Some(sse_c_fingerprint.clone()),
+            Vec::new(),
+        )
+        .await;
+        publish_versioned_read_object(
+            &state,
+            "sse-c-new",
+            "sse-c.txt",
+            "QmSseCNew",
+            true,
+            None,
+            Some(sse_c_fingerprint),
+            Vec::new(),
+        )
+        .await;
+        mount_cat_body(
+            &kubo,
+            "QmSseCOld",
+            crate::crypto::aes_gcm::encrypt_chunk(&sse_c_key, &[0x22; 12], b"cold")
+                .unwrap()
+                .to_vec(),
+        )
+        .await;
+
+        let plain_version = plain_old.version_id.expect("plain historical version");
+        let plain = get_object(
+            &state,
+            get_object_request("plain.txt", Some(&plain_version), http::HeaderMap::new()),
+        )
+        .await
+        .expect("historical plain GetObject");
+        assert_eq!(
+            plain.output.e_tag.as_ref().map(ETag::value),
+            Some("QmPlainOld")
+        );
+        assert_eq!(
+            plain.output.version_id.as_deref(),
+            Some(plain_version.as_str())
+        );
+
+        let sse_s3_version = sse_s3_old.version_id.expect("SSE-S3 historical version");
+        let sse_s3 = get_object(
+            &state,
+            get_object_request("sse-s3.txt", Some(&sse_s3_version), http::HeaderMap::new()),
+        )
+        .await
+        .expect("historical SSE-S3 GetObject");
+        assert_eq!(
+            sse_s3.output.e_tag.as_ref().map(ETag::value),
+            Some("QmSseS3Old")
+        );
+        assert_eq!(
+            sse_s3.output.version_id.as_deref(),
+            Some(sse_s3_version.as_str())
+        );
+        assert_eq!(
+            sse_s3.output.server_side_encryption,
+            Some(ServerSideEncryption::from_static("AES256"))
+        );
+        assert_eq!(read_get_body(sse_s3).await, b"old!");
+
+        let sse_c_version = sse_c_old.version_id.expect("SSE-C historical version");
+        let sse_c = get_object(
+            &state,
+            get_object_request("sse-c.txt", Some(&sse_c_version), valid_sse_c_headers()),
+        )
+        .await
+        .expect("historical SSE-C GetObject");
+        assert_eq!(
+            sse_c.output.e_tag.as_ref().map(ETag::value),
+            Some("QmSseCOld")
+        );
+        assert_eq!(
+            sse_c.output.version_id.as_deref(),
+            Some(sse_c_version.as_str())
+        );
+        assert_eq!(
+            sse_c.output.sse_customer_algorithm.as_deref(),
+            Some("AES256")
+        );
+        assert_eq!(read_get_body(sse_c).await, b"cold");
+
+        let head = head_object(
+            &state,
+            head_object_request("sse-c.txt", Some(&sse_c_version), valid_sse_c_headers()),
+        )
+        .await
+        .expect("historical SSE-C HeadObject");
+        assert_eq!(
+            head.output.e_tag.as_ref().map(ETag::value),
+            Some("QmSseCOld")
+        );
+        assert_eq!(
+            head.output.version_id.as_deref(),
+            Some(sse_c_version.as_str())
+        );
+        assert_eq!(
+            head.output.sse_customer_algorithm.as_deref(),
+            Some("AES256")
+        );
+    }
+
+    #[tokio::test]
+    async fn current_marker_returns_404_headers_without_kubo() {
+        let (state, kubo) = versioned_read_state().await;
+        publish_versioned_read_object(
+            &state,
+            "marker-source",
+            "marker-current.txt",
+            "QmMarkerSource",
+            false,
+            None,
+            None,
+            Vec::new(),
+        )
+        .await;
+        let marker_version = install_current_marker(&state, "marker-current.txt").await;
+
+        for error in [
+            get_object(
+                &state,
+                get_object_request("marker-current.txt", None, http::HeaderMap::new()),
+            )
+            .await
+            .expect_err("current-marker GetObject must fail"),
+            head_object(
+                &state,
+                head_object_request("marker-current.txt", None, http::HeaderMap::new()),
+            )
+            .await
+            .expect_err("current-marker HeadObject must fail"),
+        ] {
+            assert_eq!(error.code().as_str(), "NoSuchKey");
+            assert_eq!(error.status_code(), Some(http::StatusCode::NOT_FOUND));
+            let headers = error.headers().expect("current-marker headers");
+            assert_eq!(headers["x-amz-delete-marker"], "true");
+            assert_eq!(headers["x-amz-version-id"], marker_version);
+        }
+        assert!(kubo.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn explicit_marker_returns_405_headers_without_range_or_sse_c() {
+        let (state, kubo) = versioned_read_state().await;
+        publish_versioned_read_object(
+            &state,
+            "marker-source",
+            "marker-explicit.txt",
+            "QmMarkerSource",
+            false,
+            None,
+            None,
+            Vec::new(),
+        )
+        .await;
+        let marker_version = install_current_marker(&state, "marker-explicit.txt").await;
+        let mut malformed_sse_c = http::HeaderMap::new();
+        malformed_sse_c.insert(
+            "x-amz-server-side-encryption-customer-algorithm",
+            http::HeaderValue::from_static("AES256"),
+        );
+        let mut get_request = get_object_request(
+            "marker-explicit.txt",
+            Some(&marker_version),
+            malformed_sse_c.clone(),
+        );
+        get_request.input.range = Some(Range::Int {
+            first: 5,
+            last: Some(4),
+        });
+        let mut head_request = head_object_request(
+            "marker-explicit.txt",
+            Some(&marker_version),
+            malformed_sse_c,
+        );
+        head_request.input.range = Some(Range::Int {
+            first: 5,
+            last: Some(4),
+        });
+
+        for error in [
+            get_object(&state, get_request)
+                .await
+                .expect_err("explicit-marker GetObject must fail before range or SSE-C"),
+            head_object(&state, head_request)
+                .await
+                .expect_err("explicit-marker HeadObject must fail before range or SSE-C"),
+        ] {
+            assert_eq!(error.code().as_str(), "MethodNotAllowed");
+            assert_eq!(
+                error.status_code(),
+                Some(http::StatusCode::METHOD_NOT_ALLOWED)
+            );
+            let headers = error.headers().expect("explicit-marker headers");
+            assert_eq!(headers["x-amz-delete-marker"], "true");
+            assert_eq!(headers["x-amz-version-id"], marker_version);
+            assert!(headers.get(http::header::LAST_MODIFIED).is_some());
+        }
+        assert!(kubo.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unknown_exact_is_no_such_version() {
+        let (state, _kubo) = versioned_read_state().await;
+        publish_versioned_read_object(
+            &state,
+            "unknown-source",
+            "unknown.txt",
+            "QmUnknown",
+            false,
+            None,
+            None,
+            Vec::new(),
+        )
+        .await;
+        let unknown = uuid::Uuid::new_v4().to_string();
+
+        for error in [
+            get_object(
+                &state,
+                get_object_request("unknown.txt", Some(&unknown), http::HeaderMap::new()),
+            )
+            .await
+            .expect_err("unknown GetObject version must fail"),
+            head_object(
+                &state,
+                head_object_request("unknown.txt", Some(&unknown), http::HeaderMap::new()),
+            )
+            .await
+            .expect_err("unknown HeadObject version must fail"),
+        ] {
+            assert_eq!(error.code().as_str(), "NoSuchVersion");
+        }
+    }
+
+    #[tokio::test]
+    async fn unversioned_exact_is_invalid_argument() {
+        let kubo = kubo_server("unused").await;
+        let state = pinning_state(kubo.uri(), "request", "one", "").await;
+        publish_versioned_read_object(
+            &state,
+            "unversioned-source",
+            "unversioned.txt",
+            "QmUnversioned",
+            false,
+            None,
+            None,
+            Vec::new(),
+        )
+        .await;
+        let supplied = uuid::Uuid::new_v4().to_string();
+
+        for error in [
+            get_object(
+                &state,
+                get_object_request("unversioned.txt", Some(&supplied), http::HeaderMap::new()),
+            )
+            .await
+            .expect_err("unversioned GetObject version must fail"),
+            head_object(
+                &state,
+                head_object_request("unversioned.txt", Some(&supplied), http::HeaderMap::new()),
+            )
+            .await
+            .expect_err("unversioned HeadObject version must fail"),
+        ] {
+            assert_eq!(error.code().as_str(), "InvalidArgument");
+        }
+    }
+
+    #[tokio::test]
+    async fn copy_source_exact_version_uses_selected_content_and_tags() {
+        let (state, _kubo) = versioned_read_state().await;
+        let source_tags = vec![crate::pinning::tags::ObjectTag::new("team", "historical")];
+        let source_old = publish_versioned_read_object(
+            &state,
+            "copy-old",
+            "copy-source.txt",
+            "QmCopyOld",
+            false,
+            None,
+            None,
+            source_tags.clone(),
+        )
+        .await;
+        publish_versioned_read_object(
+            &state,
+            "copy-new",
+            "copy-source.txt",
+            "QmCopyNew",
+            false,
+            None,
+            None,
+            vec![crate::pinning::tags::ObjectTag::new("team", "current")],
+        )
+        .await;
+        let source_version = source_old.version_id.expect("historical source version");
+
+        let copy = copy_object(
+            &state,
+            copy_request_version(
+                "copy-source.txt",
+                Some(&source_version),
+                "copy-destination.txt",
+                http::HeaderMap::new(),
+            ),
+        )
+        .await
+        .expect("historical CopyObject");
+        assert_eq!(
+            copy.output
+                .copy_object_result
+                .as_ref()
+                .and_then(|result| result.e_tag.as_ref())
+                .map(ETag::value),
+            Some("QmCopyOld")
+        );
+        assert_eq!(
+            copy.output.copy_source_version_id.as_deref(),
+            Some(source_version.as_str())
+        );
+        let destination =
+            crate::store::object::get_latest(state.store.db(), "bucket", "copy-destination.txt")
+                .await
+                .unwrap();
+        assert_eq!(destination.cid, "QmCopyOld");
+        assert_eq!(
+            crate::store::pinning::tags::list_object_tags(state.store.db(), &destination.id)
+                .await
+                .unwrap(),
+            source_tags
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_source_marker_uses_current_404_or_explicit_405() {
+        let (state, kubo) = versioned_read_state().await;
+        publish_versioned_read_object(
+            &state,
+            "copy-marker-source",
+            "copy-marker.txt",
+            "QmCopyMarker",
+            false,
+            None,
+            None,
+            Vec::new(),
+        )
+        .await;
+        let marker_version = install_current_marker(&state, "copy-marker.txt").await;
+        let mut malformed_copy_source_sse_c = http::HeaderMap::new();
+        malformed_copy_source_sse_c.insert(
+            "x-amz-copy-source-server-side-encryption-customer-algorithm",
+            http::HeaderValue::from_static("AES256"),
+        );
+
+        for (version_id, code, status) in [
+            (None, "NoSuchKey", http::StatusCode::NOT_FOUND),
+            (
+                Some(marker_version.as_str()),
+                "MethodNotAllowed",
+                http::StatusCode::METHOD_NOT_ALLOWED,
+            ),
+        ] {
+            let error = copy_object(
+                &state,
+                copy_request_version(
+                    "copy-marker.txt",
+                    version_id,
+                    "copy-marker-destination.txt",
+                    malformed_copy_source_sse_c.clone(),
+                ),
+            )
+            .await
+            .expect_err("delete-marker CopyObject must fail");
+            assert_eq!(error.code().as_str(), code);
+            assert_eq!(error.status_code(), Some(status));
+            let headers = error.headers().expect("delete-marker headers");
+            assert_eq!(headers["x-amz-delete-marker"], "true");
+            assert_eq!(headers["x-amz-version-id"], marker_version);
+        }
+        assert!(kubo.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn copy_destination_gets_independent_object_and_public_ids() {
+        let (state, _kubo) = versioned_read_state().await;
+        let source = publish_versioned_read_object(
+            &state,
+            "copy-independent-source",
+            "copy-independent-source.txt",
+            "QmCopyIndependent",
+            false,
+            None,
+            None,
+            Vec::new(),
+        )
+        .await;
+        let source_version = source.version_id.expect("source version");
+
+        let copy = copy_object(
+            &state,
+            copy_request_version(
+                "copy-independent-source.txt",
+                None,
+                "copy-independent-destination.txt",
+                http::HeaderMap::new(),
+            ),
+        )
+        .await
+        .expect("CopyObject");
+        let destination_version = copy.output.version_id.expect("destination version");
+        assert_eq!(
+            copy.output.copy_source_version_id.as_deref(),
+            Some(source_version.as_str())
+        );
+        assert_ne!(destination_version, source_version);
+
+        let source = crate::store::object::get_latest(
+            state.store.db(),
+            "bucket",
+            "copy-independent-source.txt",
+        )
+        .await
+        .unwrap();
+        let destination = crate::store::object::get_latest(
+            state.store.db(),
+            "bucket",
+            "copy-independent-destination.txt",
+        )
+        .await
+        .unwrap();
+        assert_ne!(destination.id, source.id);
+        assert_eq!(destination.cid, source.cid);
+    }
+
     fn object_model(key: &str) -> object::Model {
         object::Model {
             id: "id".to_string(),
@@ -2225,16 +3082,27 @@ mod tests {
     }
 
     fn delete_objects_request(keys: &[&str], quiet: bool) -> S3Request<DeleteObjectsInput> {
+        delete_objects_version_request(
+            keys.iter().map(|key| ((*key).to_owned(), None)).collect(),
+            quiet,
+        )
+    }
+
+    fn delete_objects_version_request(
+        objects: Vec<(String, Option<String>)>,
+        quiet: bool,
+    ) -> S3Request<DeleteObjectsInput> {
         S3Request {
             input: DeleteObjectsInput {
                 bucket: "bucket".to_owned(),
                 bypass_governance_retention: None,
                 checksum_algorithm: None,
                 delete: Delete {
-                    objects: keys
-                        .iter()
-                        .map(|key| ObjectIdentifier {
-                            key: (*key).to_owned(),
+                    objects: objects
+                        .into_iter()
+                        .map(|(key, version_id)| ObjectIdentifier {
+                            key,
+                            version_id,
                             ..Default::default()
                         })
                         .collect(),
@@ -2259,6 +3127,13 @@ mod tests {
     async fn pinning_put_automatic_commits_outbox_without_provider_request() {
         let kubo = kubo_server("bafy-put").await;
         let state = pinning_state(kubo.uri(), "always", "all", "").await;
+        crate::store::bucket::set_versioning_state(
+            state.store.db(),
+            "bucket",
+            crate::store::object_version::BucketVersioningState::Enabled,
+        )
+        .await
+        .unwrap();
 
         let response = put_object(&state, put_request("automatic", None))
             .await
@@ -2268,6 +3143,7 @@ mod tests {
             response.output.e_tag.as_ref().map(ETag::value),
             Some("bafy-put")
         );
+        uuid::Uuid::parse_str(response.output.version_id.as_deref().unwrap()).unwrap();
         assert_eq!(
             lease_sources_for_latest(&state, "automatic").await,
             vec!["automatic"]
@@ -2572,11 +3448,33 @@ mod tests {
             crate::pinning::tags::ObjectTag::new("team", "source"),
             crate::pinning::tags::ObjectTag::new("ipfs-s3:pin", "true"),
         ];
-        seed_copy_source(&state, "source", "bafy-shared", &source_tags).await;
+        publish_seed(
+            &state,
+            "source-source",
+            "source",
+            "bafy-shared",
+            vec![crate::pinning::tags::ObjectTag::new("team", "source")],
+        )
+        .await;
+        crate::store::pinning::tags::replace_object_tags(
+            state.store.db(),
+            "source-source",
+            &source_tags,
+        )
+        .await
+        .unwrap();
+        crate::store::bucket::set_versioning_state(
+            state.store.db(),
+            "bucket",
+            crate::store::object_version::BucketVersioningState::Enabled,
+        )
+        .await
+        .unwrap();
 
-        copy_object(&state, copy_request("source", "dest/default", None, None))
+        let first_copy = copy_object(&state, copy_request("source", "dest/default", None, None))
             .await
             .unwrap();
+        uuid::Uuid::parse_str(first_copy.output.version_id.as_deref().unwrap()).unwrap();
         copy_object(
             &state,
             copy_request("source", "dest/copy", Some("COPY"), Some("")),
@@ -2743,6 +3641,317 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unversioned_simple_delete_is_idempotent_and_removes_hidden_null() {
+        let kubo = kubo_server("unused-add-response").await;
+        let state = pinning_state(kubo.uri(), "always", "one", "").await;
+        publish_seed(
+            &state,
+            "unversioned-delete",
+            "key",
+            "bafy-unversioned",
+            vec![crate::pinning::tags::ObjectTag::new("team", "storage")],
+        )
+        .await;
+
+        let exact_error = delete_object(&state, delete_object_version_request("key", Some("null")))
+            .await
+            .unwrap_err();
+        assert_eq!(exact_error.code().as_str(), "InvalidArgument");
+        assert_eq!(
+            crate::store::object::get_latest(state.store.db(), "bucket", "key")
+                .await
+                .unwrap()
+                .id,
+            "unversioned-delete"
+        );
+
+        let first = delete_object(&state, delete_object_request("key"))
+            .await
+            .unwrap()
+            .output;
+        assert_eq!(first, DeleteObjectOutput::default());
+        let second = delete_object(&state, delete_object_request("key"))
+            .await
+            .expect("missing unversioned simple delete is idempotent")
+            .output;
+        assert_eq!(second, DeleteObjectOutput::default());
+        assert!(matches!(
+            crate::store::object::get_latest(state.store.db(), "bucket", "key").await,
+            Err(crate::error::AppError::NoSuchKey(_))
+        ));
+        assert_eq!(
+            object_version::Entity::find()
+                .filter(object_version::Column::Bucket.eq("bucket"))
+                .filter(object_version::Column::Key.eq("key"))
+                .count(state.store.db())
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            object_tag::Entity::find()
+                .filter(object_tag::Column::ObjectId.eq("unversioned-delete"))
+                .count(state.store.db())
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(
+            pin_lease::Entity::find()
+                .filter(pin_lease::Column::OwnerObjectId.eq("unversioned-delete"))
+                .all(state.store.db())
+                .await
+                .unwrap()
+                .iter()
+                .all(|lease| lease.state == "cancelled")
+        );
+    }
+
+    #[tokio::test]
+    async fn enabled_simple_delete_always_creates_new_opaque_marker() {
+        let kubo = kubo_server("unused-add-response").await;
+        let state = pinning_state(kubo.uri(), "always", "one", "").await;
+        crate::store::bucket::set_versioning_state(
+            state.store.db(),
+            "bucket",
+            crate::store::object_version::BucketVersioningState::Enabled,
+        )
+        .await
+        .unwrap();
+        publish_seed(&state, "enabled-delete", "key", "bafy-enabled", vec![]).await;
+
+        let first = delete_object(&state, delete_object_request("key"))
+            .await
+            .unwrap()
+            .output;
+        assert_eq!(first.delete_marker, Some(true));
+        let first_marker = first.version_id.expect("first marker version ID");
+        uuid::Uuid::parse_str(&first_marker).unwrap();
+        assert!(matches!(
+            crate::store::object::get_latest(state.store.db(), "bucket", "key").await,
+            Err(crate::error::AppError::NoSuchKey(_))
+        ));
+        assert!(
+            pin_lease::Entity::find()
+                .filter(pin_lease::Column::OwnerObjectId.eq("enabled-delete"))
+                .all(state.store.db())
+                .await
+                .unwrap()
+                .iter()
+                .all(|lease| lease.state == "active")
+        );
+
+        let second = delete_object(&state, delete_object_request("key"))
+            .await
+            .unwrap()
+            .output;
+        assert_eq!(second.delete_marker, Some(true));
+        let second_marker = second.version_id.expect("second marker version ID");
+        uuid::Uuid::parse_str(&second_marker).unwrap();
+        assert_ne!(first_marker, second_marker);
+        let versions = object_version::Entity::find()
+            .filter(object_version::Column::Bucket.eq("bucket"))
+            .filter(object_version::Column::Key.eq("key"))
+            .order_by_asc(object_version::Column::Sequence)
+            .all(state.store.db())
+            .await
+            .unwrap();
+        assert_eq!(versions.len(), 3);
+        assert_eq!(
+            versions
+                .iter()
+                .filter(|version| version.kind == "delete_marker")
+                .count(),
+            2
+        );
+        assert_eq!(
+            versions
+                .iter()
+                .find(|version| version.is_latest)
+                .and_then(|version| version.version_id.as_deref()),
+            Some(second_marker.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn suspended_simple_delete_replaces_null_and_releases_only_displaced_null() {
+        let kubo = kubo_server("unused-add-response").await;
+        let state = pinning_state(kubo.uri(), "always", "one", "").await;
+        crate::store::bucket::set_versioning_state(
+            state.store.db(),
+            "bucket",
+            crate::store::object_version::BucketVersioningState::Enabled,
+        )
+        .await
+        .unwrap();
+        publish_seed(&state, "opaque-old", "key", "bafy-opaque-old", vec![]).await;
+        crate::store::bucket::set_versioning_state(
+            state.store.db(),
+            "bucket",
+            crate::store::object_version::BucketVersioningState::Suspended,
+        )
+        .await
+        .unwrap();
+        publish_seed(
+            &state,
+            "null-old",
+            "key",
+            "bafy-null-old",
+            vec![crate::pinning::tags::ObjectTag::new("team", "null")],
+        )
+        .await;
+        crate::store::bucket::set_versioning_state(
+            state.store.db(),
+            "bucket",
+            crate::store::object_version::BucketVersioningState::Enabled,
+        )
+        .await
+        .unwrap();
+        publish_seed(
+            &state,
+            "opaque-current",
+            "key",
+            "bafy-opaque-current",
+            vec![],
+        )
+        .await;
+        crate::store::bucket::set_versioning_state(
+            state.store.db(),
+            "bucket",
+            crate::store::object_version::BucketVersioningState::Suspended,
+        )
+        .await
+        .unwrap();
+
+        let output = delete_object(&state, delete_object_request("key"))
+            .await
+            .unwrap()
+            .output;
+        assert_eq!(output.delete_marker, Some(true));
+        assert_eq!(output.version_id.as_deref(), Some("null"));
+        let versions = object_version::Entity::find()
+            .filter(object_version::Column::Bucket.eq("bucket"))
+            .filter(object_version::Column::Key.eq("key"))
+            .order_by_asc(object_version::Column::Sequence)
+            .all(state.store.db())
+            .await
+            .unwrap();
+        assert_eq!(versions.len(), 3);
+        let null = versions
+            .iter()
+            .find(|version| version.version_id.is_none())
+            .unwrap();
+        assert_eq!(null.kind, "delete_marker");
+        assert!(null.is_latest);
+        assert!(matches!(
+            crate::store::object::get_latest(state.store.db(), "bucket", "key").await,
+            Err(crate::error::AppError::NoSuchKey(_))
+        ));
+        for retained in ["opaque-old", "opaque-current"] {
+            assert!(
+                pin_lease::Entity::find()
+                    .filter(pin_lease::Column::OwnerObjectId.eq(retained))
+                    .all(state.store.db())
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|lease| lease.state == "active")
+            );
+        }
+        assert!(
+            pin_lease::Entity::find()
+                .filter(pin_lease::Column::OwnerObjectId.eq("null-old"))
+                .all(state.store.db())
+                .await
+                .unwrap()
+                .iter()
+                .all(|lease| lease.state == "cancelled")
+        );
+        assert_eq!(
+            object_tag::Entity::find()
+                .filter(object_tag::Column::ObjectId.eq("null-old"))
+                .count(state.store.db())
+                .await
+                .unwrap(),
+            0
+        );
+
+        let lifecycle_before_marker_replacement = pin_lease::Entity::find()
+            .order_by_asc(pin_lease::Column::Id)
+            .all(state.store.db())
+            .await
+            .unwrap();
+        let replacement = delete_object(&state, delete_object_request("key"))
+            .await
+            .unwrap()
+            .output;
+        assert_eq!(replacement.delete_marker, Some(true));
+        assert_eq!(replacement.version_id.as_deref(), Some("null"));
+        assert_eq!(
+            pin_lease::Entity::find()
+                .order_by_asc(pin_lease::Column::Id)
+                .all(state.store.db())
+                .await
+                .unwrap(),
+            lifecycle_before_marker_replacement
+        );
+        assert_eq!(
+            object_version::Entity::find()
+                .filter(object_version::Column::Bucket.eq("bucket"))
+                .filter(object_version::Column::Key.eq("key"))
+                .count(state.store.db())
+                .await
+                .unwrap(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_never_calls_pin_rm() {
+        let kubo = kubo_server("unused-add-response").await;
+        let state = pinning_state(kubo.uri(), "always", "one", "").await;
+        crate::store::bucket::set_versioning_state(
+            state.store.db(),
+            "bucket",
+            crate::store::object_version::BucketVersioningState::Enabled,
+        )
+        .await
+        .unwrap();
+        publish_seed(&state, "never-unpin", "key", "bafy-never-unpin", vec![]).await;
+        let content_version = object_version::Entity::find()
+            .filter(object_version::Column::ObjectId.eq("never-unpin"))
+            .one(state.store.db())
+            .await
+            .unwrap()
+            .unwrap()
+            .version_id
+            .unwrap();
+        let marker = delete_object(&state, delete_object_request("key"))
+            .await
+            .unwrap()
+            .output
+            .version_id
+            .unwrap();
+        delete_object(
+            &state,
+            delete_object_version_request("key", Some(&content_version)),
+        )
+        .await
+        .unwrap();
+        delete_object(&state, delete_object_version_request("key", Some(&marker)))
+            .await
+            .unwrap();
+
+        assert!(
+            kubo.received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.url.path() != "/api/v0/pin/rm")
+        );
+    }
+
+    #[tokio::test]
     async fn pinning_delete_operations_close_only_removed_latest_owner_leases_without_kubo_unpin() {
         let kubo = kubo_server("unused-add-response").await;
         let state = pinning_state(kubo.uri(), "always", "one", "").await;
@@ -2752,14 +3961,9 @@ mod tests {
         delete_object(&state, delete_object_request("a"))
             .await
             .unwrap();
-        assert_eq!(
-            delete_object(&state, delete_object_request("missing"))
-                .await
-                .unwrap_err()
-                .code()
-                .as_str(),
-            "NoSuchKey"
-        );
+        delete_object(&state, delete_object_request("missing"))
+            .await
+            .expect("missing unversioned simple delete is idempotent");
         assert_eq!(
             pin_lease::Entity::find()
                 .filter(pin_lease::Column::OwnerObjectId.eq("delete-a"))
@@ -3021,6 +4225,133 @@ mod tests {
         assert!(!requests.iter().any(|request| {
             request.url.path() == "/api/v0/pin/rm" && request.url.query() == Some("arg=QmShared")
         }));
+    }
+
+    #[tokio::test]
+    async fn delete_objects_preserves_duplicates_order_quiet_and_per_item_errors() {
+        let kubo = kubo_server("unused-add-response").await;
+        let state = pinning_state(kubo.uri(), "always", "one", "").await;
+        crate::store::bucket::set_versioning_state(
+            state.store.db(),
+            "bucket",
+            crate::store::object_version::BucketVersioningState::Enabled,
+        )
+        .await
+        .unwrap();
+        publish_seed(&state, "batch-a", "a", "bafy-a", vec![]).await;
+        publish_seed(&state, "batch-b", "b", "bafy-b", vec![]).await;
+        let retained_a = object_version::Entity::find()
+            .filter(object_version::Column::Bucket.eq("bucket"))
+            .filter(object_version::Column::Key.eq("a"))
+            .one(state.store.db())
+            .await
+            .unwrap()
+            .unwrap()
+            .version_id
+            .unwrap();
+        let unknown = "00000000-0000-0000-0000-000000000001".to_owned();
+
+        let output = delete_objects(
+            &state,
+            delete_objects_version_request(
+                vec![
+                    ("a".to_owned(), None),
+                    ("a".to_owned(), None),
+                    ("a".to_owned(), Some(retained_a.clone())),
+                    ("bad".to_owned(), Some("not-a-version".to_owned())),
+                    ("missing".to_owned(), Some(unknown.clone())),
+                    ("b".to_owned(), None),
+                ],
+                false,
+            ),
+        )
+        .await
+        .unwrap()
+        .output;
+        let deleted = output.deleted.unwrap();
+        assert_eq!(
+            deleted
+                .iter()
+                .map(|deleted| deleted.key.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("a"), Some("a"), Some("a"), Some("b")]
+        );
+        assert_eq!(deleted[0].delete_marker, Some(true));
+        assert_eq!(deleted[1].delete_marker, Some(true));
+        assert_ne!(
+            deleted[0].delete_marker_version_id,
+            deleted[1].delete_marker_version_id
+        );
+        assert_eq!(deleted[0].version_id, None);
+        assert_eq!(deleted[1].version_id, None);
+        assert_eq!(deleted[2].version_id.as_deref(), Some(retained_a.as_str()));
+        assert_eq!(deleted[2].delete_marker, None);
+        assert_eq!(deleted[3].delete_marker, Some(true));
+        assert_eq!(
+            output
+                .errors
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|error| {
+                    (
+                        error.code.as_deref(),
+                        error.key.as_deref(),
+                        error.version_id.as_deref(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                (Some("InvalidArgument"), Some("bad"), Some("not-a-version")),
+                (
+                    Some("NoSuchVersion"),
+                    Some("missing"),
+                    Some(unknown.as_str())
+                ),
+            ]
+        );
+
+        let before_quiet = object_version::Entity::find()
+            .filter(object_version::Column::Bucket.eq("bucket"))
+            .filter(object_version::Column::Key.eq("a"))
+            .count(state.store.db())
+            .await
+            .unwrap();
+        let quiet = delete_objects(
+            &state,
+            delete_objects_version_request(
+                vec![
+                    ("a".to_owned(), None),
+                    ("a".to_owned(), None),
+                    ("bad".to_owned(), Some("still-not-a-version".to_owned())),
+                ],
+                true,
+            ),
+        )
+        .await
+        .unwrap()
+        .output;
+        assert_eq!(quiet.deleted, None);
+        assert_eq!(
+            quiet.errors.as_ref().unwrap()[0].code.as_deref(),
+            Some("InvalidArgument")
+        );
+        assert_eq!(
+            object_version::Entity::find()
+                .filter(object_version::Column::Bucket.eq("bucket"))
+                .filter(object_version::Column::Key.eq("a"))
+                .count(state.store.db())
+                .await
+                .unwrap(),
+            before_quiet + 2
+        );
+        assert_eq!(
+            delete_objects_item_error(&AppError::StaleContentMutation),
+            (
+                "OperationAborted".to_owned(),
+                "content mutation was superseded by a newer operation".to_owned()
+            )
+        );
     }
 
     #[tokio::test]
@@ -3575,6 +4906,119 @@ mod tests {
             .collect();
         assert_eq!(second_prefixes, vec!["videos/"]);
         assert_eq!(second.is_truncated, Some(false));
+    }
+
+    #[tokio::test]
+    async fn ordinary_lists_hide_noncurrent_and_markers() {
+        use crate::store::object_version::BucketVersioningState;
+
+        let state = list_state_with_keys(&[]).await;
+        crate::store::bucket::set_versioning_state(
+            state.store.db(),
+            "bucket",
+            BucketVersioningState::Enabled,
+        )
+        .await
+        .unwrap();
+
+        async fn publish(state: &Arc<AppState>, id: &str, key: &str, cid: &str) -> String {
+            crate::store::object::upsert(
+                state.store.db(),
+                id,
+                "bucket",
+                key,
+                cid,
+                1,
+                None,
+                cid,
+                None,
+                false,
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+            let object = crate::store::object::get_by_id(state.store.db(), id)
+                .await
+                .unwrap();
+            state
+                .store
+                .db()
+                .transaction(move |txn| {
+                    Box::pin(async move {
+                        crate::store::object_version::install_content_version(
+                            txn,
+                            BucketVersioningState::Enabled,
+                            &object,
+                            Utc::now(),
+                        )
+                        .await
+                    })
+                })
+                .await
+                .unwrap()
+        }
+
+        publish(&state, "visible-old", "visible", "QmVisibleOld").await;
+        publish(&state, "visible-new", "visible", "QmVisibleNew").await;
+        publish(&state, "deleted-content", "deleted", "QmDeleted").await;
+        state
+            .store
+            .db()
+            .transaction(|txn| {
+                Box::pin(async move {
+                    crate::store::object_version::install_delete_marker(
+                        txn,
+                        BucketVersioningState::Enabled,
+                        "bucket",
+                        "deleted",
+                        Utc::now(),
+                    )
+                    .await
+                })
+            })
+            .await
+            .unwrap();
+
+        let v1 = list_objects(
+            &state,
+            list_v1_request(ListObjectsInput {
+                bucket: "bucket".to_owned(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .output;
+        assert_eq!(
+            v1.contents
+                .unwrap()
+                .into_iter()
+                .filter_map(|object| object.key)
+                .collect::<Vec<_>>(),
+            vec!["visible"]
+        );
+
+        let v2 = list_objects_v2(
+            &state,
+            list_v2_request(ListObjectsV2Input {
+                bucket: "bucket".to_owned(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .output;
+        assert_eq!(
+            v2.contents
+                .unwrap()
+                .into_iter()
+                .filter_map(|object| object.key)
+                .collect::<Vec<_>>(),
+            vec!["visible"]
+        );
+        assert_eq!(v2.key_count, Some(1));
     }
 
     #[test]

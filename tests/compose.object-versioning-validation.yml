@@ -1,0 +1,59 @@
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: ipfs3
+      POSTGRES_USER: ipfs3
+      POSTGRES_PASSWORD: ipfs3
+    ports:
+      - "127.0.0.1:${IPFS_S3_OBJECT_VERSIONING_POSTGRES_PORT:?required}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ipfs3 -d ipfs3"]
+      interval: 1s
+      timeout: 5s
+      retries: 30
+
+  kubo:
+    image: ghcr.io/hugefiver/ipfs3-kubo:latest
+    environment:
+      IPFS_PATH: /data/ipfs
+    ports:
+      - "127.0.0.1:${IPFS_S3_OBJECT_VERSIONING_KUBO_PORT:?required}:5001"
+    volumes:
+      - kubo_data:/data/ipfs
+    healthcheck:
+      test: ["CMD", "ipfs", "id"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+
+  gateway:
+    image: "${IPFS_S3_OBJECT_VERSION_IMAGE:?required}"
+    environment:
+      IPFS_S3_BIND: 0.0.0.0:9000
+      IPFS_S3_KUBO_RPC_URL: http://kubo:5001
+      IPFS_S3_DATABASE_URL: "postgres://ipfs3:ipfs3@postgres:5432/ipfs3"
+      IPFS_S3_ACCESS_KEY_ID: test
+      IPFS_S3_SECRET_ACCESS_KEY: test
+      IPFS_S3_MASTER_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      RUST_LOG: info
+    ports:
+      - "127.0.0.1:${IPFS_S3_OBJECT_VERSIONING_GATEWAY_PORT:?required}:9000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kubo:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/ipfs-s3-gateway", "--ready-probe"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+volumes:
+  postgres_data:
+  kubo_data:

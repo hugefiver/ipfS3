@@ -3,8 +3,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use s3s::{S3Request, S3Response, S3Result, dto::*};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, QueryFilter, QuerySelect,
-    TransactionError, TransactionTrait,
+    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, TransactionError, TransactionTrait,
 };
 
 use crate::{
@@ -16,6 +15,9 @@ use crate::{
     state::AppState,
     store::{
         entities::{object, pin_lease},
+        object_version::{
+            BucketVersioningState, PublicVersionId, ResolvedVersion, VersionKind, VersionSelector,
+        },
         pinning::{leases, tags},
     },
 };
@@ -39,6 +41,7 @@ mod test_hooks {
 
     pub static POLICY_EVALUATED: LazyLock<Mutex<Option<Arc<PolicyEvaluatedGate>>>> =
         LazyLock::new(|| Mutex::new(None));
+    pub static POLICY_EVALUATED_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 }
 
 #[cfg(test)]
@@ -55,11 +58,19 @@ pub async fn get_object_tagging(
     req: S3Request<GetObjectTaggingInput>,
 ) -> S3Result<S3Response<GetObjectTaggingOutput>> {
     let input = req.input;
-    require_unversioned(input.version_id.as_deref())?;
-    let object = crate::store::object::get_latest(state.store.db(), &input.bucket, &input.key)
-        .await
-        .map_err(s3s::S3Error::from)?;
-    let stored = tags::list_object_tags(state.store.db(), &object.id)
+    let selector = version_selector(input.version_id.as_deref())?;
+    let resolved = crate::store::object_version::resolve_version(
+        state.store.db(),
+        &input.bucket,
+        &input.key,
+        &selector,
+    )
+    .await?;
+    let owner_id = selected_content_owner(&resolved, matches!(selector, VersionSelector::Current))?
+        .id
+        .clone();
+    let version_id = response_version_id(state.store.db(), &input.bucket, &resolved).await?;
+    let stored = tags::list_object_tags(state.store.db(), &owner_id)
         .await
         .map_err(AppError::from)
         .map_err(s3s::S3Error::from)?;
@@ -73,7 +84,7 @@ pub async fn get_object_tagging(
 
     Ok(S3Response::new(GetObjectTaggingOutput {
         tag_set,
-        version_id: None,
+        version_id,
     }))
 }
 
@@ -90,13 +101,13 @@ pub(crate) async fn put_object_tagging_at(
     now: DateTime<Utc>,
 ) -> S3Result<S3Response<PutObjectTaggingOutput>> {
     let input = req.input;
-    require_unversioned(input.version_id.as_deref())?;
+    let selector = version_selector(input.version_id.as_deref())?;
     let replacement = dto_to_object_tags(input.tagging.tag_set).map_err(s3s::S3Error::from)?;
     validate_replacement(&replacement).map_err(s3s::S3Error::from)?;
-    replace_tag_set(state, input.bucket, input.key, replacement, now)
+    let version_id = replace_tag_set(state, input.bucket, input.key, selector, replacement, now)
         .await
         .map_err(s3s::S3Error::from)?;
-    Ok(S3Response::new(PutObjectTaggingOutput::default()))
+    Ok(S3Response::new(PutObjectTaggingOutput { version_id }))
 }
 
 pub async fn delete_object_tagging(
@@ -112,13 +123,13 @@ pub(crate) async fn delete_object_tagging_at(
     now: DateTime<Utc>,
 ) -> S3Result<S3Response<DeleteObjectTaggingOutput>> {
     let input = req.input;
-    require_unversioned(input.version_id.as_deref())?;
+    let selector = version_selector(input.version_id.as_deref())?;
     let replacement = Vec::new();
     validate_replacement(&replacement).map_err(s3s::S3Error::from)?;
-    replace_tag_set(state, input.bucket, input.key, replacement, now)
+    let version_id = replace_tag_set(state, input.bucket, input.key, selector, replacement, now)
         .await
         .map_err(s3s::S3Error::from)?;
-    Ok(S3Response::new(DeleteObjectTaggingOutput::default()))
+    Ok(S3Response::new(DeleteObjectTaggingOutput { version_id }))
 }
 
 fn dto_to_object_tags(tag_set: Vec<Tag>) -> AppResult<Vec<ObjectTag>> {
@@ -142,31 +153,69 @@ fn validate_replacement(replacement: &[ObjectTag]) -> AppResult<()> {
     Ok(())
 }
 
-fn require_unversioned(version_id: Option<&str>) -> S3Result<()> {
-    if version_id.is_some() {
-        return Err(s3s::s3_error!(
-            InvalidArgument,
-            "versionId is not supported"
-        ));
+fn version_selector(version_id: Option<&str>) -> AppResult<VersionSelector> {
+    match version_id {
+        Some(version_id) => Ok(VersionSelector::Exact(PublicVersionId::parse_s3(
+            version_id,
+        )?)),
+        None => Ok(VersionSelector::Current),
     }
-    Ok(())
+}
+
+fn selected_content_owner(resolved: &ResolvedVersion, current: bool) -> AppResult<&object::Model> {
+    match resolved.kind {
+        VersionKind::DeleteMarker => Err(AppError::DeleteMarker {
+            version_id: resolved.public_version_id.clone(),
+            created_at: resolved.created_at,
+            current,
+        }),
+        VersionKind::Object => resolved.object.as_ref().ok_or_else(|| {
+            AppError::Internal("object version index is missing its object".to_owned())
+        }),
+    }
+}
+
+async fn response_version_id<C: ConnectionTrait>(
+    db: &C,
+    bucket: &str,
+    resolved: &ResolvedVersion,
+) -> AppResult<Option<String>> {
+    Ok(
+        (crate::store::bucket::get_versioning_state(db, bucket).await?
+            != BucketVersioningState::Unversioned)
+            .then_some(resolved.public_version_id.clone()),
+    )
 }
 
 async fn replace_tag_set(
     state: &Arc<AppState>,
     bucket: String,
     key: String,
+    selector: VersionSelector,
     replacement: Vec<ObjectTag>,
     now: DateTime<Utc>,
-) -> AppResult<()> {
+) -> AppResult<Option<String>> {
     let operation_state = Arc::clone(state);
-    state
+    let selector_for_recheck = selector.clone();
+    let bucket_for_recheck = bucket.clone();
+    let key_for_recheck = key.clone();
+    let result = state
         .store
         .db()
         .transaction(move |txn| {
             Box::pin(async move {
-                let owner = lock_latest_object(txn, &bucket, &key).await?;
-                let manual = load_manual_lease(txn, &owner.id).await?;
+                let selected = crate::store::object_version::lock_resolved_version(
+                    txn, &bucket, &key, &selector,
+                )
+                .await?;
+                let owner_id = selected_content_owner(
+                    &selected,
+                    matches!(&selector, VersionSelector::Current),
+                )?
+                .id
+                .clone();
+                let version_id = response_version_id(txn, &bucket, &selected).await?;
+                let manual = load_manual_lease(txn, &owner_id).await?;
                 let existing = manual.as_ref().map(existing_manual_lease).transpose()?;
                 let mutation = operation_state
                     .pinning
@@ -176,6 +225,20 @@ async fn replace_tag_set(
 
                 #[cfg(test)]
                 pause_after_policy_evaluation(manual.as_ref().map(|lease| lease.id.as_str())).await;
+
+                let revalidated = crate::store::object_version::lock_resolved_version(
+                    txn, &bucket, &key, &selector,
+                )
+                .await?;
+                let revalidated_owner_id = selected_content_owner(
+                    &revalidated,
+                    matches!(&selector, VersionSelector::Current),
+                )?
+                .id
+                .clone();
+                if revalidated_owner_id != owner_id {
+                    return Err(AppError::StaleContentMutation);
+                }
 
                 match mutation {
                     ManualLeaseMutation::Keep => {
@@ -191,7 +254,7 @@ async fn replace_tag_set(
                             .expect("renewal policy requires an existing manual lease")
                             .id
                             .as_str();
-                        leases::renew_manual_lease(txn, &owner.id, lease_id, retain_until, now)
+                        leases::renew_manual_lease(txn, &owner_id, lease_id, retain_until, now)
                             .await
                             .map_err(map_renewal_error)?;
                     }
@@ -204,29 +267,45 @@ async fn replace_tag_set(
                         leases::cancel_lease(txn, lease_id, now).await?;
                     }
                 }
-                tags::replace_object_tags(txn, &owner.id, &replacement).await?;
-                Ok(())
+                tags::replace_object_tags(txn, &owner_id, &replacement).await?;
+                Ok(version_id)
             })
         })
-        .await
-        .map_err(transaction_error_into_app)
-}
+        .await;
 
-async fn lock_latest_object<C: ConnectionTrait>(
-    db: &C,
-    bucket: &str,
-    key: &str,
-) -> AppResult<object::Model> {
-    let query = object::Entity::find()
-        .filter(object::Column::Bucket.eq(bucket))
-        .filter(object::Column::Key.eq(key))
-        .filter(object::Column::IsLatest.eq(true));
-    let object = if db.get_database_backend() == DatabaseBackend::Postgres {
-        query.lock_exclusive().one(db).await?
-    } else {
-        query.one(db).await?
-    };
-    object.ok_or_else(|| AppError::NoSuchKey(format!("{bucket}/{key}")))
+    match result {
+        Ok(version_id) => Ok(version_id),
+        Err(error) => {
+            let error = transaction_error_into_app(error);
+            // SQLite retains the transaction's read snapshot across the test
+            // seam. A concurrent exact delete can therefore surface as a
+            // write-upgrade conflict even though the in-transaction
+            // revalidation saw the old row. After rollback, resolve the same
+            // exact selector once more so that this race is reported as
+            // NoSuchVersion rather than an internal database error.
+            if matches!(&selector_for_recheck, VersionSelector::Exact(_))
+                && matches!(&error, AppError::Database(_))
+                && let Err(AppError::NoSuchVersion {
+                    bucket,
+                    key,
+                    version_id,
+                }) = crate::store::object_version::resolve_version(
+                    state.store.db(),
+                    &bucket_for_recheck,
+                    &key_for_recheck,
+                    &selector_for_recheck,
+                )
+                .await
+            {
+                return Err(AppError::NoSuchVersion {
+                    bucket,
+                    key,
+                    version_id,
+                });
+            }
+            Err(error)
+        }
+    }
 }
 
 async fn load_manual_lease<C: ConnectionTrait>(
@@ -298,7 +377,7 @@ mod tests {
     use s3s::{S3Request, dto::*};
     use sea_orm::sea_query::Expr;
     use sea_orm::{
-        ActiveValue::Set, ColumnTrait, ConnectOptions, ConnectionTrait, Database,
+        ActiveValue::Set, ColumnTrait, ConnectOptions, ConnectionTrait, Database, DatabaseBackend,
         DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QueryTrait,
     };
 
@@ -314,7 +393,10 @@ mod tests {
         state::AppState,
         store::{
             Store,
-            entities::{pin_job, pin_lease, pin_lease_target, pin_provider_usage, remote_pin},
+            entities::{
+                object_tag, object_version, pin_job, pin_lease, pin_lease_target,
+                pin_provider_usage, remote_pin,
+            },
             pinning::{
                 jobs,
                 publication::{self, PinTargetSpec, PublicationObject, PublicationRequest},
@@ -330,6 +412,14 @@ mod tests {
     struct Fixture {
         state: Arc<AppState>,
         policy_id: String,
+    }
+
+    struct VersionedFixture {
+        fixture: Fixture,
+        historical_object_id: String,
+        historical_version_id: String,
+        current_object_id: String,
+        current_version_id: String,
     }
 
     #[derive(Clone, Copy)]
@@ -432,6 +522,112 @@ mod tests {
             .unwrap();
         let fixture = fixture_from_db(db).await;
         (directory, fixture)
+    }
+
+    async fn versioned_fixture() -> VersionedFixture {
+        versioned_fixture_from(fixture().await).await
+    }
+
+    async fn file_backed_versioned_fixture() -> (tempfile::TempDir, VersionedFixture) {
+        let (directory, fixture) = file_backed_fixture().await;
+        (directory, versioned_fixture_from(fixture).await)
+    }
+
+    async fn versioned_fixture_from(fixture: Fixture) -> VersionedFixture {
+        let db = fixture.state.store.db();
+        crate::store::bucket::set_versioning_state(
+            db,
+            BUCKET,
+            crate::store::object_version::BucketVersioningState::Enabled,
+        )
+        .await
+        .unwrap();
+        let historical = crate::store::object::get_latest(db, BUCKET, KEY)
+            .await
+            .unwrap();
+        let historical_version_id = db
+            .transaction({
+                let historical = historical.clone();
+                move |txn| {
+                    Box::pin(async move {
+                        crate::store::object_version::install_content_version(
+                            txn,
+                            crate::store::object_version::BucketVersioningState::Enabled,
+                            &historical,
+                            time(1),
+                        )
+                        .await
+                    })
+                }
+            })
+            .await
+            .unwrap();
+        crate::store::object::upsert(
+            db,
+            "object-2",
+            BUCKET,
+            KEY,
+            "bafy-object-2",
+            20,
+            Some("application/octet-stream"),
+            "bafy-object-2",
+            None,
+            false,
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        let current = crate::store::object::get_latest(db, BUCKET, KEY)
+            .await
+            .unwrap();
+        let current_version_id = db
+            .transaction({
+                let current = current.clone();
+                move |txn| {
+                    Box::pin(async move {
+                        crate::store::object_version::install_content_version(
+                            txn,
+                            crate::store::object_version::BucketVersioningState::Enabled,
+                            &current,
+                            time(2),
+                        )
+                        .await
+                    })
+                }
+            })
+            .await
+            .unwrap();
+
+        VersionedFixture {
+            fixture,
+            historical_object_id: historical.id,
+            historical_version_id,
+            current_object_id: current.id,
+            current_version_id,
+        }
+    }
+
+    async fn install_current_marker(fixture: &Fixture) -> String {
+        fixture
+            .state
+            .store
+            .db()
+            .transaction(move |txn| {
+                Box::pin(async move {
+                    crate::store::object_version::install_delete_marker(
+                        txn,
+                        crate::store::object_version::BucketVersioningState::Enabled,
+                        BUCKET,
+                        KEY,
+                        time(3),
+                    )
+                    .await
+                })
+            })
+            .await
+            .unwrap()
     }
 
     async fn fixture_from_db(db: DatabaseConnection) -> Fixture {
@@ -559,6 +755,13 @@ mod tests {
     }
 
     fn put_request(pairs: &[(&str, &str)]) -> S3Request<PutObjectTaggingInput> {
+        put_version_request(pairs, None)
+    }
+
+    fn put_version_request(
+        pairs: &[(&str, &str)],
+        version_id: Option<&str>,
+    ) -> S3Request<PutObjectTaggingInput> {
         request(
             PutObjectTaggingInput {
                 bucket: BUCKET.to_owned(),
@@ -568,17 +771,25 @@ mod tests {
                 key: KEY.to_owned(),
                 request_payer: None,
                 tagging: dto_tags(pairs),
-                version_id: None,
+                version_id: version_id.map(str::to_owned),
             },
             http::Method::PUT,
         )
     }
 
     fn get_request(key: &str) -> S3Request<GetObjectTaggingInput> {
+        get_version_request(key, None)
+    }
+
+    fn get_version_request(
+        key: &str,
+        version_id: Option<&str>,
+    ) -> S3Request<GetObjectTaggingInput> {
         request(
             GetObjectTaggingInput {
                 bucket: BUCKET.to_owned(),
                 key: key.to_owned(),
+                version_id: version_id.map(str::to_owned),
                 ..Default::default()
             },
             http::Method::GET,
@@ -586,10 +797,18 @@ mod tests {
     }
 
     fn delete_request(key: &str) -> S3Request<DeleteObjectTaggingInput> {
+        delete_version_request(key, None)
+    }
+
+    fn delete_version_request(
+        key: &str,
+        version_id: Option<&str>,
+    ) -> S3Request<DeleteObjectTaggingInput> {
         request(
             DeleteObjectTaggingInput {
                 bucket: BUCKET.to_owned(),
                 key: key.to_owned(),
+                version_id: version_id.map(str::to_owned),
                 ..Default::default()
             },
             http::Method::DELETE,
@@ -597,11 +816,15 @@ mod tests {
     }
 
     async fn seed_tags(fixture: &Fixture, pairs: &[(&str, &str)]) {
+        seed_tags_for_owner(fixture, OBJECT_ID, pairs).await;
+    }
+
+    async fn seed_tags_for_owner(fixture: &Fixture, object_id: &str, pairs: &[(&str, &str)]) {
         let tags = pairs
             .iter()
             .map(|(key, value)| crate::pinning::tags::ObjectTag::new(*key, *value))
             .collect::<Vec<_>>();
-        stored_tags::replace_object_tags(fixture.state.store.db(), OBJECT_ID, &tags)
+        stored_tags::replace_object_tags(fixture.state.store.db(), object_id, &tags)
             .await
             .unwrap();
     }
@@ -865,7 +1088,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unsupported_version_ids_are_rejected_before_reads_or_mutations() {
+    async fn malformed_version_ids_are_rejected_before_reads_or_mutations() {
         let fixture = fixture().await;
         seed_tags(&fixture, &[("before", "kept")]).await;
         seed_lease(
@@ -900,7 +1123,6 @@ mod tests {
         ] {
             let error = result.unwrap_err();
             assert_eq!(error.code().as_str(), "InvalidArgument");
-            assert_eq!(error.message(), Some("versionId is not supported"));
         }
         assert_eq!(manual_lease(&fixture).await, lease_before);
         let tags = get_object_tagging(&fixture.state, get_request(KEY))
@@ -1045,6 +1267,7 @@ mod tests {
 
     #[tokio::test]
     async fn keep_snapshot_race_rolls_back_tags_when_expired_lease_is_reactivated() {
+        let _serial = test_hooks::POLICY_EVALUATED_TEST_LOCK.lock().await;
         let (_directory, fixture) = file_backed_fixture().await;
         seed_tags(&fixture, &[("before", "kept")]).await;
         seed_lease(
@@ -1820,5 +2043,434 @@ mod tests {
             .unwrap()
             .output;
         assert_eq!(tag_pairs(&output.tag_set), vec![("before", "kept")]);
+    }
+
+    #[tokio::test]
+    async fn get_tagging_reads_exact_historical_owner() {
+        let versions = versioned_fixture().await;
+        seed_tags_for_owner(
+            &versions.fixture,
+            &versions.historical_object_id,
+            &[("historical", "one")],
+        )
+        .await;
+        seed_tags_for_owner(
+            &versions.fixture,
+            &versions.current_object_id,
+            &[("current", "two")],
+        )
+        .await;
+
+        let exact = get_object_tagging(
+            &versions.fixture.state,
+            get_version_request(KEY, Some(&versions.historical_version_id)),
+        )
+        .await
+        .unwrap()
+        .output;
+        let current = get_object_tagging(&versions.fixture.state, get_request(KEY))
+            .await
+            .unwrap()
+            .output;
+
+        assert_eq!(tag_pairs(&exact.tag_set), vec![("historical", "one")]);
+        assert_eq!(
+            exact.version_id.as_deref(),
+            Some(versions.historical_version_id.as_str())
+        );
+        assert_eq!(tag_pairs(&current.tag_set), vec![("current", "two")]);
+        assert_eq!(
+            current.version_id.as_deref(),
+            Some(versions.current_version_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn put_and_delete_tagging_mutate_only_exact_internal_owner() {
+        let versions = versioned_fixture().await;
+        seed_tags_for_owner(
+            &versions.fixture,
+            &versions.historical_object_id,
+            &[("historical", "before")],
+        )
+        .await;
+        seed_tags_for_owner(
+            &versions.fixture,
+            &versions.current_object_id,
+            &[("current", "kept")],
+        )
+        .await;
+
+        let put = put_object_tagging_at(
+            &versions.fixture.state,
+            put_version_request(
+                &[("historical", "replacement")],
+                Some(&versions.historical_version_id),
+            ),
+            time(4),
+        )
+        .await
+        .unwrap()
+        .output;
+        assert_eq!(
+            put.version_id.as_deref(),
+            Some(versions.historical_version_id.as_str())
+        );
+        let historical = get_object_tagging(
+            &versions.fixture.state,
+            get_version_request(KEY, Some(&versions.historical_version_id)),
+        )
+        .await
+        .unwrap()
+        .output;
+        let current = get_object_tagging(&versions.fixture.state, get_request(KEY))
+            .await
+            .unwrap()
+            .output;
+        assert_eq!(
+            tag_pairs(&historical.tag_set),
+            vec![("historical", "replacement")]
+        );
+        assert_eq!(tag_pairs(&current.tag_set), vec![("current", "kept")]);
+
+        let deleted = delete_object_tagging_at(
+            &versions.fixture.state,
+            delete_version_request(KEY, Some(&versions.historical_version_id)),
+            time(5),
+        )
+        .await
+        .unwrap()
+        .output;
+        assert_eq!(
+            deleted.version_id.as_deref(),
+            Some(versions.historical_version_id.as_str())
+        );
+        let historical = get_object_tagging(
+            &versions.fixture.state,
+            get_version_request(KEY, Some(&versions.historical_version_id)),
+        )
+        .await
+        .unwrap()
+        .output;
+        let current = get_object_tagging(&versions.fixture.state, get_request(KEY))
+            .await
+            .unwrap()
+            .output;
+        assert!(historical.tag_set.is_empty());
+        assert_eq!(tag_pairs(&current.tag_set), vec![("current", "kept")]);
+    }
+
+    #[tokio::test]
+    async fn current_tagging_marker_is_404() {
+        let versions = versioned_fixture().await;
+        let marker_version_id = install_current_marker(&versions.fixture).await;
+
+        for error in [
+            get_object_tagging(&versions.fixture.state, get_request(KEY))
+                .await
+                .expect_err("current marker GetObjectTagging must fail"),
+            put_object_tagging_at(
+                &versions.fixture.state,
+                put_request(&[("unexpected", "mutation")]),
+                time(4),
+            )
+            .await
+            .expect_err("current marker PutObjectTagging must fail"),
+            delete_object_tagging_at(&versions.fixture.state, delete_request(KEY), time(4))
+                .await
+                .expect_err("current marker DeleteObjectTagging must fail"),
+        ] {
+            assert_eq!(error.code().as_str(), "NoSuchKey");
+            assert_eq!(error.status_code(), Some(http::StatusCode::NOT_FOUND));
+            let headers = error.headers().expect("current marker headers");
+            assert_eq!(headers["x-amz-delete-marker"], "true");
+            assert_eq!(headers["x-amz-version-id"], marker_version_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_tagging_marker_is_method_not_allowed() {
+        let versions = versioned_fixture().await;
+        let marker_version_id = install_current_marker(&versions.fixture).await;
+
+        for error in [
+            get_object_tagging(
+                &versions.fixture.state,
+                get_version_request(KEY, Some(&marker_version_id)),
+            )
+            .await
+            .expect_err("explicit marker GetObjectTagging must fail"),
+            put_object_tagging_at(
+                &versions.fixture.state,
+                put_version_request(&[("unexpected", "mutation")], Some(&marker_version_id)),
+                time(4),
+            )
+            .await
+            .expect_err("explicit marker PutObjectTagging must fail"),
+            delete_object_tagging_at(
+                &versions.fixture.state,
+                delete_version_request(KEY, Some(&marker_version_id)),
+                time(4),
+            )
+            .await
+            .expect_err("explicit marker DeleteObjectTagging must fail"),
+        ] {
+            assert_eq!(error.code().as_str(), "MethodNotAllowed");
+            assert_eq!(
+                error.status_code(),
+                Some(http::StatusCode::METHOD_NOT_ALLOWED)
+            );
+            let headers = error.headers().expect("explicit marker headers");
+            assert_eq!(headers["x-amz-delete-marker"], "true");
+            assert_eq!(headers["x-amz-version-id"], marker_version_id);
+            assert!(headers.get(http::header::LAST_MODIFIED).is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_tagging_version_is_no_such_version() {
+        let versions = versioned_fixture().await;
+        let unknown = "00000000-0000-0000-0000-000000000001";
+
+        for error in [
+            get_object_tagging(
+                &versions.fixture.state,
+                get_version_request(KEY, Some(unknown)),
+            )
+            .await
+            .expect_err("unknown GetObjectTagging version must fail"),
+            put_object_tagging_at(
+                &versions.fixture.state,
+                put_version_request(&[("unexpected", "mutation")], Some(unknown)),
+                time(4),
+            )
+            .await
+            .expect_err("unknown PutObjectTagging version must fail"),
+            delete_object_tagging_at(
+                &versions.fixture.state,
+                delete_version_request(KEY, Some(unknown)),
+                time(4),
+            )
+            .await
+            .expect_err("unknown DeleteObjectTagging version must fail"),
+        ] {
+            assert_eq!(error.code().as_str(), "NoSuchVersion");
+            assert_eq!(error.status_code(), Some(http::StatusCode::NOT_FOUND));
+        }
+    }
+
+    #[tokio::test]
+    async fn unversioned_tagging_version_is_invalid_argument() {
+        let fixture = fixture().await;
+
+        for error in [
+            get_object_tagging(&fixture.state, get_version_request(KEY, Some("null")))
+                .await
+                .expect_err("unversioned GetObjectTagging version must fail"),
+            put_object_tagging_at(
+                &fixture.state,
+                put_version_request(&[("unexpected", "mutation")], Some("null")),
+                time(2),
+            )
+            .await
+            .expect_err("unversioned PutObjectTagging version must fail"),
+            delete_object_tagging_at(
+                &fixture.state,
+                delete_version_request(KEY, Some("null")),
+                time(2),
+            )
+            .await
+            .expect_err("unversioned DeleteObjectTagging version must fail"),
+        ] {
+            assert_eq!(error.code().as_str(), "InvalidArgument");
+            assert_eq!(error.status_code(), Some(http::StatusCode::BAD_REQUEST));
+        }
+    }
+
+    #[tokio::test]
+    async fn tagging_revalidates_version_and_lease_under_lock() {
+        let _serial = test_hooks::POLICY_EVALUATED_TEST_LOCK.lock().await;
+        let (_directory, versions) = file_backed_versioned_fixture().await;
+        seed_tags_for_owner(
+            &versions.fixture,
+            &versions.historical_object_id,
+            &[("before", "kept")],
+        )
+        .await;
+        seed_tags_for_owner(
+            &versions.fixture,
+            &versions.current_object_id,
+            &[("current", "kept")],
+        )
+        .await;
+        seed_lease_for_owner(
+            &versions.fixture,
+            &versions.historical_object_id,
+            "version-race-manual",
+            "manual",
+            "active",
+            "full",
+            time(5),
+            7,
+            &[],
+        )
+        .await;
+        let lease_before = pin_lease::Entity::find_by_id("version-race-manual")
+            .one(versions.fixture.state.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        let gate = Arc::new(test_hooks::PolicyEvaluatedGate {
+            lease_id: "version-race-manual",
+            arrived: tokio::sync::Notify::new(),
+            resume: tokio::sync::Notify::new(),
+        });
+        *test_hooks::POLICY_EVALUATED.lock().await = Some(gate.clone());
+        let historical_version_id = versions.historical_version_id.clone();
+        let state = versions.fixture.state.clone();
+        let tagging = tokio::spawn(async move {
+            put_object_tagging_at(
+                &state,
+                put_version_request(
+                    &[("after", "must-not-replace")],
+                    Some(&historical_version_id),
+                ),
+                time(4),
+            )
+            .await
+        });
+
+        gate.arrived.notified().await;
+        let removed = object_version::Entity::delete_many()
+            .filter(object_version::Column::Bucket.eq(BUCKET))
+            .filter(object_version::Column::Key.eq(KEY))
+            .filter(object_version::Column::VersionId.eq(&versions.historical_version_id))
+            .exec(versions.fixture.state.store.db())
+            .await
+            .unwrap();
+        assert_eq!(removed.rows_affected, 1);
+        gate.resume.notify_one();
+        let result = tagging.await.unwrap();
+        *test_hooks::POLICY_EVALUATED.lock().await = None;
+
+        assert_eq!(result.unwrap_err().code().as_str(), "NoSuchVersion");
+        let historical_tags = stored_tags::list_object_tags(
+            versions.fixture.state.store.db(),
+            &versions.historical_object_id,
+        )
+        .await
+        .unwrap();
+        let current_tags = stored_tags::list_object_tags(
+            versions.fixture.state.store.db(),
+            &versions.current_object_id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(historical_tags, vec![ObjectTag::new("before", "kept")]);
+        assert_eq!(current_tags, vec![ObjectTag::new("current", "kept")]);
+        assert_eq!(
+            pin_lease::Entity::find_by_id("version-race-manual")
+                .one(versions.fixture.state.store.db())
+                .await
+                .unwrap()
+                .unwrap(),
+            lease_before
+        );
+    }
+
+    #[tokio::test]
+    async fn tagging_never_uses_public_id_as_owner_object_id() {
+        let versions = versioned_fixture().await;
+        assert_ne!(
+            versions.historical_version_id, versions.historical_object_id,
+            "public version IDs must not be used as immutable object owners"
+        );
+        seed_tags_for_owner(
+            &versions.fixture,
+            &versions.historical_object_id,
+            &[("before", "replace")],
+        )
+        .await;
+        seed_tags_for_owner(
+            &versions.fixture,
+            &versions.current_object_id,
+            &[("current", "kept")],
+        )
+        .await;
+        seed_lease_for_owner(
+            &versions.fixture,
+            &versions.historical_object_id,
+            "historical-manual",
+            "manual",
+            "active",
+            "full",
+            time(5),
+            1,
+            &[],
+        )
+        .await;
+
+        let output = put_object_tagging_at(
+            &versions.fixture.state,
+            put_version_request(
+                &[("historical", "replacement")],
+                Some(&versions.historical_version_id),
+            ),
+            time(4),
+        )
+        .await
+        .unwrap()
+        .output;
+
+        assert_eq!(
+            output.version_id.as_deref(),
+            Some(versions.historical_version_id.as_str())
+        );
+        let historical_tags = object_tag::Entity::find()
+            .filter(object_tag::Column::ObjectId.eq(&versions.historical_object_id))
+            .order_by_asc(object_tag::Column::Key)
+            .all(versions.fixture.state.store.db())
+            .await
+            .unwrap();
+        assert_eq!(
+            historical_tags
+                .iter()
+                .map(|tag| (tag.key.as_str(), tag.value.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("historical", "replacement")]
+        );
+        assert_eq!(
+            object_tag::Entity::find()
+                .filter(object_tag::Column::ObjectId.eq(&versions.historical_version_id))
+                .count(versions.fixture.state.store.db())
+                .await
+                .unwrap(),
+            0
+        );
+        let historical_lease = pin_lease::Entity::find_by_id("historical-manual")
+            .one(versions.fixture.state.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            historical_lease.owner_object_id,
+            versions.historical_object_id
+        );
+        assert_eq!(historical_lease.state, "cancelled");
+        assert_eq!(
+            pin_lease::Entity::find()
+                .filter(pin_lease::Column::OwnerObjectId.eq(&versions.historical_version_id))
+                .count(versions.fixture.state.store.db())
+                .await
+                .unwrap(),
+            0
+        );
+        let current_tags = stored_tags::list_object_tags(
+            versions.fixture.state.store.db(),
+            &versions.current_object_id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(current_tags, vec![ObjectTag::new("current", "kept")]);
     }
 }

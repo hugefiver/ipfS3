@@ -1,0 +1,17 @@
+OBJECT VERSIONING REAL CLIENT: PASSED
+Validated: 2026-08-26
+Spec SHA-256: 56e53b0983ac9f244c5379a50454c6f7e64ab4105ceccc45f9c5ed5cf34ef489
+Package: 0.1.0
+Git HEAD: 59051485b4e9efe52121d9a213b82b8c8a6f5684
+AWS CLI: 2.36.9
+AWS CLI image: sha256:00dee8ccaf669721f8163944ea9e6ac13183851b23d5b7a9868a608bc932cfdb
+postgres_versioning=PASSED
+existing_e2e=PASSED
+enable_two_writes_delete_list=PASSED
+historical_get=PASSED
+marker_404_405=PASSED
+exact_marker_delete=PASSED
+suspended_null_overwrite=PASSED
+version_aware_cleanup=PASSED
+cleanup_verification=PASSED
+HOSTED object-versioning: NOT RUN

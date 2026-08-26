@@ -71,9 +71,9 @@ numbered release.
 
 ## v0.6 — Versioning & Lifecycle
 
-- [ ] Object versioning (enable/suspend on bucket)
-- [ ] ListObjectVersions
-- [ ] DeleteMarker support
+- [x] Object versioning (enable/suspend on bucket)
+- [x] ListObjectVersions
+- [x] DeleteMarker support
 - [ ] Lifecycle rules (expiration, transition)
 - [ ] Bucket CORS configuration
 

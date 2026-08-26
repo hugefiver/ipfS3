@@ -6,3 +6,4 @@ pub mod m20260729_000001_ipfs3_import;
 pub mod m20260729_000002_postgres_utc_timestamps;
 pub mod m20260730_000001_standard_mutation_fence;
 pub mod m20260813_000001_postgres_json_columns;
+pub mod m20260825_000001_object_versioning;

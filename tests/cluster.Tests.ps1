@@ -281,8 +281,8 @@ $protectedHashes = [ordered]@{
     "src/kubo/pin.rs" = "6047757369227cf6fa4c4bbc7debe1cbabe5a9aa1a0bba1498b2c834c7a22216"
     "src/kubo/cat.rs" = "e970271249f4e10efb61f0720a11ee0cbca18b1aad7d5a0f2629bb432c0c90bf"
     "src/state.rs" = "bfbe43c3d9acb9a0b4b3cb901e6cd6c0af8c7e4c728d3149f19c0bb77f938541"
-    "src/s3/ops/object.rs" = "3cef9c6b169a717720b721399ea35d28e405943529a2fe7b680c16a01624296e"
-    "src/s3/ops/multipart.rs" = "3e08ab1dca7ded499193bee88e9c0014fe34a744d907259ac60573e57bcda4cf"
+    "src/s3/ops/object.rs" = "c2c56a1b0ceb8cb3fd577be83bdd464018657b08843773c4b09056d45966e3e6"
+    "src/s3/ops/multipart.rs" = "6a29e4204f59a413423ca25b8a6c79304a78ff3f2f69acc440408e73ccaba55a"
 }
 
 foreach ($entry in $protectedHashes.GetEnumerator()) {

@@ -8,6 +8,7 @@ pub mod multipart_part;
 pub mod multipart_upload;
 pub mod object;
 pub mod object_tag;
+pub mod object_version;
 pub mod pin_job;
 pub mod pin_lease;
 pub mod pin_lease_target;

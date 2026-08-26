@@ -430,7 +430,7 @@ pub(crate) trait CompletedUploadFinalizerStore: Send + Sync {
         &self,
         upload_id: &str,
         expected_archive: &PublicationObject,
-    ) -> crate::store::multipart::ReconciledCommitOutcome;
+    ) -> crate::store::pinning::publication::ReconciledPublicationOutcome;
 }
 
 struct DatabaseCompletedUploadFinalizer<'a> {
@@ -469,7 +469,7 @@ impl CompletedUploadFinalizerStore for DatabaseCompletedUploadFinalizer<'_> {
         &self,
         upload_id: &str,
         expected_archive: &PublicationObject,
-    ) -> crate::store::multipart::ReconciledCommitOutcome {
+    ) -> crate::store::pinning::publication::ReconciledPublicationOutcome {
         crate::store::pinning::publication::reconcile_completed_publication(
             self.db,
             upload_id,
@@ -567,15 +567,15 @@ pub(crate) async fn finalize_completed_multipart_zip_with_store<
                 .reconcile(&completed.upload_id, &expected_archive)
                 .await
             {
-                crate::store::multipart::ReconciledCommitOutcome::Committed => {
-                    Ok(PublicationResult {
-                        object_id: expected_archive.id,
-                    })
-                }
-                crate::store::multipart::ReconciledCommitOutcome::NotCommitted => {
+                crate::store::pinning::publication::ReconciledPublicationOutcome::Committed(
+                    result,
+                ) => Ok(result),
+                crate::store::pinning::publication::ReconciledPublicationOutcome::NotCommitted => {
                     Err(source.into())
                 }
-                crate::store::multipart::ReconciledCommitOutcome::Unknown(reconcile_error) => {
+                crate::store::pinning::publication::ReconciledPublicationOutcome::Unknown(
+                    reconcile_error,
+                ) => {
                     let source = bounded_diagnostic(&source);
                     let reconcile_error = bounded_diagnostic(&reconcile_error);
                     Err(s3s::s3_error!(
@@ -603,7 +603,7 @@ fn bounded_diagnostic(error: &impl std::fmt::Display) -> String {
 pub async fn finalize_completed_multipart_archive(
     state: &Arc<AppState>,
     completed: &CompletedMultipartArchive,
-) -> S3Result<()> {
+) -> S3Result<PublicationResult> {
     let store = DatabaseCompletedUploadFinalizer {
         db: state.store.db(),
     };
@@ -621,7 +621,7 @@ async fn finalize_completed_multipart_archive_with_store<
     completed: &CompletedMultipartArchive,
     limits: &ProviderLimitMap,
     store: &S,
-) -> S3Result<()> {
+) -> S3Result<PublicationResult> {
     let request = completed_publication_request(completed);
     let expected_archive = request.object.clone();
 
@@ -634,7 +634,7 @@ async fn finalize_completed_multipart_archive_with_store<
         )
         .await
     {
-        Ok(_) => Ok(()),
+        Ok(result) => Ok(result),
         Err(crate::store::multipart::CommitCompletedUploadError::RolledBack {
             completion_attempt_id,
             source,
@@ -655,11 +655,15 @@ async fn finalize_completed_multipart_archive_with_store<
                 .reconcile(&completed.upload_id, &expected_archive)
                 .await
             {
-                crate::store::multipart::ReconciledCommitOutcome::Committed => Ok(()),
-                crate::store::multipart::ReconciledCommitOutcome::NotCommitted => {
+                crate::store::pinning::publication::ReconciledPublicationOutcome::Committed(
+                    result,
+                ) => Ok(result),
+                crate::store::pinning::publication::ReconciledPublicationOutcome::NotCommitted => {
                     Err(source.into())
                 }
-                crate::store::multipart::ReconciledCommitOutcome::Unknown(reconcile_error) => {
+                crate::store::pinning::publication::ReconciledPublicationOutcome::Unknown(
+                    reconcile_error,
+                ) => {
                     let source = bounded_diagnostic(&source);
                     let reconcile_error = bounded_diagnostic(&reconcile_error);
                     Err(s3s::s3_error!(
@@ -683,13 +687,14 @@ pub async fn complete_multipart_upload(
     req: S3Request<CompleteMultipartUploadInput>,
 ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
     let completed = complete_multipart_upload_inner(state, req).await?;
-    finalize_completed_multipart_archive(state, &completed).await?;
+    let publication_result = finalize_completed_multipart_archive(state, &completed).await?;
 
     Ok(S3Response::new(CompleteMultipartUploadOutput {
         bucket: Some(completed.bucket),
         key: Some(completed.key),
         e_tag: Some(ETag::Strong(completed.root_cid)),
         server_side_encryption: completed.server_side_encryption,
+        version_id: publication_result.version_id,
         ..Default::default()
     }))
 }
@@ -1146,6 +1151,7 @@ mod tests {
             match &self.commit {
                 FakeCommitResult::Ok => Ok(PublicationResult {
                     object_id: request.object.id,
+                    version_id: Some("fake-object-version".to_owned()),
                 }),
                 FakeCommitResult::RolledBack(completion_attempt_id) => Err(
                     crate::store::multipart::CommitCompletedUploadError::RolledBack {
@@ -1168,7 +1174,7 @@ mod tests {
             &self,
             upload_id: &str,
             expected_archive: &PublicationObject,
-        ) -> crate::store::multipart::ReconciledCommitOutcome {
+        ) -> crate::store::pinning::publication::ReconciledPublicationOutcome {
             self.reconcile_calls.fetch_add(1, Ordering::SeqCst);
             self.reconciled_archives
                 .lock()
@@ -1176,13 +1182,18 @@ mod tests {
                 .push((upload_id.to_owned(), expected_archive.clone()));
             match self.reconcile {
                 FakeReconcileResult::Committed => {
-                    crate::store::multipart::ReconciledCommitOutcome::Committed
+                    crate::store::pinning::publication::ReconciledPublicationOutcome::Committed(
+                        PublicationResult {
+                            object_id: expected_archive.id.clone(),
+                            version_id: Some("fake-reconciled-version".to_owned()),
+                        },
+                    )
                 }
                 FakeReconcileResult::NotCommitted => {
-                    crate::store::multipart::ReconciledCommitOutcome::NotCommitted
+                    crate::store::pinning::publication::ReconciledPublicationOutcome::NotCommitted
                 }
                 FakeReconcileResult::Unknown => {
-                    crate::store::multipart::ReconciledCommitOutcome::Unknown(
+                    crate::store::pinning::publication::ReconciledPublicationOutcome::Unknown(
                         crate::error::AppError::Internal(format!(
                             "forced query failure {}",
                             "q".repeat(2_000)
@@ -1209,6 +1220,7 @@ mod tests {
             match &self.commit {
                 FakeCommitResult::Ok => Ok(PublicationResult {
                     object_id: request.archive.object.id,
+                    version_id: Some("fake-zip-version".to_owned()),
                 }),
                 FakeCommitResult::RolledBack(completion_attempt_id) => Err(
                     crate::store::multipart::CommitCompletedUploadError::RolledBack {
@@ -1255,7 +1267,7 @@ mod tests {
             &self,
             upload_id: &str,
             expected_archive: &PublicationObject,
-        ) -> crate::store::multipart::ReconciledCommitOutcome {
+        ) -> crate::store::pinning::publication::ReconciledPublicationOutcome {
             if let Some(signal) = self.reconcile_signal.lock().await.take() {
                 let _ = signal.send(());
             }
@@ -1789,6 +1801,34 @@ mod tests {
         assert_eq!(error.code().as_str(), "InternalError");
         assert_eq!(mismatched.commit_calls.load(Ordering::SeqCst), 0);
         assert_eq!(mismatched.reconcile_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn completed_multipart_reconciliation_checks_internal_object_not_public_version() {
+        let completed = completed_archive("internal-completion-attempt");
+        let request = completed_zip_request(&completed);
+        let store = FakeFinalizerStore::new(
+            FakeCommitResult::OutcomeUnknown("internal-completion-attempt".to_owned()),
+            FakeReconcileResult::Committed,
+        );
+
+        let result = finalize_completed_multipart_zip_with_store(
+            &completed,
+            request,
+            &no_provider_limits(),
+            &store,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.object_id, "internal-completion-attempt");
+        assert_ne!(
+            result.version_id.as_deref(),
+            Some("internal-completion-attempt")
+        );
+        let reconciled = store.reconciled_archives.lock().unwrap();
+        assert_eq!(reconciled.len(), 1);
+        assert_eq!(reconciled[0].1.id, "internal-completion-attempt");
     }
 
     fn no_provider_limits() -> ProviderLimitMap {
@@ -2674,6 +2714,13 @@ mod tests {
             .mount(&kubo)
             .await;
         let state = test_state_with_bucket_and_kubo("test-bucket", kubo.uri()).await;
+        crate::store::bucket::set_versioning_state(
+            state.store.db(),
+            "test-bucket",
+            crate::store::object_version::BucketVersioningState::Enabled,
+        )
+        .await
+        .unwrap();
         seed_plain_upload(&state, "upload-1").await;
         crate::store::multipart::upsert_part(
             state.store.db(),
@@ -2686,9 +2733,10 @@ mod tests {
         .await
         .unwrap();
 
-        complete_multipart_upload(&state, complete_request("upload-1", "QmPart"))
+        let response = complete_multipart_upload(&state, complete_request("upload-1", "QmPart"))
             .await
             .unwrap();
+        uuid::Uuid::parse_str(response.output.version_id.as_deref().unwrap()).unwrap();
 
         let latest =
             crate::store::object::get_latest(state.store.db(), "test-bucket", "archive.zip")

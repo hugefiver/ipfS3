@@ -56,6 +56,20 @@ impl S3 for S3Impl {
         super::ops::bucket::list_buckets(&self.state, req).await
     }
 
+    async fn get_bucket_versioning(
+        &self,
+        req: S3Request<GetBucketVersioningInput>,
+    ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
+        super::ops::versioning::get_bucket_versioning(&self.state, req).await
+    }
+
+    async fn put_bucket_versioning(
+        &self,
+        req: S3Request<PutBucketVersioningInput>,
+    ) -> S3Result<S3Response<PutBucketVersioningOutput>> {
+        super::ops::versioning::put_bucket_versioning(&self.state, req).await
+    }
+
     async fn put_object(
         &self,
         req: S3Request<PutObjectInput>,
@@ -124,6 +138,13 @@ impl S3 for S3Impl {
         req: S3Request<ListObjectsInput>,
     ) -> S3Result<S3Response<ListObjectsOutput>> {
         super::ops::object::list_objects(&self.state, req).await
+    }
+
+    async fn list_object_versions(
+        &self,
+        req: S3Request<ListObjectVersionsInput>,
+    ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
+        super::ops::versioning::list_object_versions(&self.state, req).await
     }
 
     async fn list_objects_v2(

@@ -8,7 +8,7 @@ use std::{
 };
 
 use http_body_util::BodyExt as _;
-use sea_orm::{ActiveModelTrait, Database, EntityTrait, PaginatorTrait, Set};
+use sea_orm::{ActiveModelTrait, Database, EntityTrait, PaginatorTrait, Set, TransactionTrait};
 
 use super::request::*;
 use super::*;
@@ -559,6 +559,35 @@ async fn deleted_bucket_precedes_token_replay_or_conflict_without_resolver_or_ow
         .unwrap()
         .to_owned();
     assert_eq!(resolves.load(Ordering::SeqCst), 1);
+
+    let submitted = import_job::Entity::find_by_id(&job_id)
+        .one(state.store.db())
+        .await
+        .unwrap()
+        .unwrap();
+    let superseded_at = submitted.updated_at + chrono::Duration::seconds(1);
+    let superseded = state
+        .store
+        .db()
+        .transaction(|txn| {
+            Box::pin(async move {
+                crate::store::import::ownership::lock_bucket_for_ownership(txn, "bucket").await?;
+                crate::store::import::ownership::supersede_bucket(txn, "bucket", superseded_at)
+                    .await
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(superseded, 1);
+    assert_eq!(
+        import_job::Entity::find_by_id(&job_id)
+            .one(state.store.db())
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        "superseded"
+    );
 
     crate::store::bucket::delete(state.store.db(), "bucket")
         .await

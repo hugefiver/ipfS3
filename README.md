@@ -12,6 +12,7 @@ An S3-compatible gateway backed by IPFS (Kubo). Translates S3 API calls into Kub
 - **SigV4 Authentication** — AWS Signature Version 4 via [s3s](https://github.com/s3s-project/s3s)
 - **Per-object Encryption** — SSE-S3 (gateway-managed key) and SSE-C (customer-provided key) with AES-256-GCM
 - **Content-addressed Storage** — ETag = IPFS CID; plain objects accessible via any public IPFS gateway (`https://ipfs.io/ipfs/<CID>`)
+- **Object Versioning** — Unversioned, Enabled, and Suspended bucket states with S3-style version IDs, delete markers, and `ListObjectVersions`
 - **Streaming** — Request and response bodies stream end to end; the documented exception is a Range read of an encrypted object, which decrypts the full object before slicing; chunk-level encrypted Range reads are planned for v0.8
 - **Dual Backend** — SQLite (dev) or PostgreSQL (prod) via sea-orm, with sequential schema migrations
 - **Remote Pinning** — Asynchronous Pinata/Filebase PSA pinning with ordered policies, durable work, leases, and local soft quotas
@@ -304,6 +305,32 @@ database publication, its response includes:
 The `ipfs://` value is an IPFS URI, not a public HTTP gateway URL. These
 headers are returned for plain, SSE-S3, and SSE-C uploads. For encrypted
 objects, the CID identifies the ciphertext stored in IPFS, not the plaintext.
+
+## Object versioning
+
+The [approved design](docs/superpowers/specs/2026-08-25-object-versioning-design.md)
+and [sanitized LOCAL evidence](docs/object-versioning-evidence-2026-08-25.log)
+describe the implemented scope. **Unversioned** buckets overwrite the current
+object; **Enabled** assigns opaque VersionIds to each write and can thereafter
+only be **Suspended**; **Suspended** overwrites the literal `null` version while
+retaining prior opaque versions.
+
+Deletes in versioned states create a delete marker. A current read of a marker
+returns `404` (`NoSuchKey`); `HeadObject` or `GetObject` targeting that marker
+explicitly returns `405`. Deleting the exact marker restores the previous
+version. `GetObject`, `HeadObject`, `CopyObject`, object tagging, and
+`DeleteObject` support current or exact-version requests.
+
+`ListObjectVersions` returns versions and delete markers in combined order; its
+key-marker and version-id-marker pagination continue that same order.
+`PutObject`, `CopyObject`, completed multipart uploads, `ipfs3-import`, and ZIP
+extraction all publish version-aware objects. Each version retains `ETag = CID`
+and its encryption metadata. Deleting a version removes only public metadata:
+gateway Kubo pins are retained and `pin/rm` is not called. Bucket deletion
+requires exact removal of every public version and delete marker.
+
+Non-goals: Lifecycle, CORS, MFA Delete, Object Lock, pin reclamation, and
+replication.
 
 ## Durable `ipfs3-import`
 

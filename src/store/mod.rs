@@ -4,6 +4,7 @@ pub mod import;
 pub mod migrations;
 pub mod multipart;
 pub mod object;
+pub mod object_version;
 pub mod pinning;
 
 use sea_orm::DatabaseConnection;
@@ -59,6 +60,7 @@ mod migrator {
     use crate::store::migrations::m20260729_000002_postgres_utc_timestamps::Migration as PostgresUtcTimestampsMigration;
     use crate::store::migrations::m20260730_000001_standard_mutation_fence::Migration as StandardMutationFenceMigration;
     use crate::store::migrations::m20260813_000001_postgres_json_columns::Migration as PostgresJsonColumnsMigration;
+    use crate::store::migrations::m20260825_000001_object_versioning::Migration as ObjectVersioningMigration;
     use sea_orm_migration::prelude::*;
 
     pub struct Migrator;
@@ -73,6 +75,7 @@ mod migrator {
                 Box::new(PostgresUtcTimestampsMigration),
                 Box::new(StandardMutationFenceMigration),
                 Box::new(PostgresJsonColumnsMigration),
+                Box::new(ObjectVersioningMigration),
             ]
         }
     }
@@ -124,7 +127,7 @@ mod tests {
     use sea_orm_migration::MigratorTrait;
 
     #[test]
-    fn postgres_json_columns_migration_is_registered_last() {
+    fn object_versioning_migration_is_registered_last() {
         let names = migrator::Migrator::migrations()
             .into_iter()
             .map(|migration| migration.name().to_owned())
@@ -140,6 +143,7 @@ mod tests {
                 "m20260729_000002_postgres_utc_timestamps",
                 "m20260730_000001_standard_mutation_fence",
                 "m20260813_000001_postgres_json_columns",
+                "m20260825_000001_object_versioning",
             ]
         );
     }
@@ -187,10 +191,11 @@ mod tests {
                 sea_orm::DatabaseBackend::Sqlite,
                 "SELECT GROUP_CONCAT(name, ',') FROM (\
                  SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (\
-                     'buckets', 'objects', 'multipart_uploads', 'multipart_parts', \
-                      'object_tags', 'pin_leases', 'pin_lease_targets', 'remote_pins', \
-                      'pin_jobs', 'pin_provider_usage', 'import_jobs', 'import_destinations', \
-                      'import_prefix_claims', 'import_job_targets', 'import_job_results'\
+                      'buckets', 'objects', 'multipart_uploads', 'multipart_parts', \
+                       'object_tags', 'pin_leases', 'pin_lease_targets', 'remote_pins', \
+                       'pin_jobs', 'pin_provider_usage', 'import_jobs', 'import_destinations', \
+                       'import_prefix_claims', 'import_job_targets', 'import_job_results', \
+                       'object_versions'\
                  ) ORDER BY name)",
                 [],
             ))
@@ -215,12 +220,13 @@ mod tests {
             "import_prefix_claims",
             "import_job_targets",
             "import_job_results",
+            "object_versions",
         ]
         .into_iter()
         .collect();
         assert_eq!(
             table_names, expected,
-            "all fifteen application tables must exist"
+            "all sixteen application tables must exist"
         );
     }
 
