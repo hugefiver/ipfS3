@@ -6,6 +6,7 @@ pub mod crypto;
 pub mod error;
 pub mod import;
 pub mod kubo;
+pub mod lifecycle;
 pub mod pinning;
 pub mod s3;
 pub mod state;

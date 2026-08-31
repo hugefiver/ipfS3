@@ -1533,11 +1533,10 @@ async fn reconcile_without_desired(
     )
     .await?;
     let released = completion == NoRequestRemoteCompletion::Released;
-    let outcome_state;
-    match completion {
+    let outcome_state = match completion {
         NoRequestRemoteCompletion::Released => {
             complete_claimed_if_live(&txn, claimed, now).await?;
-            outcome_state = "released";
+            "released"
         }
         NoRequestRemoteCompletion::Wait { next_check_at } => {
             let minimum = now + chrono_duration(Duration::from_secs(1))?;
@@ -1548,15 +1547,15 @@ async fn reconcile_without_desired(
                 next_check_at.max(minimum),
             )
             .await?;
-            outcome_state = "reconcile_wait";
+            "reconcile_wait"
         }
         NoRequestRemoteCompletion::Stale => {
             complete_claimed_if_live(&txn, claimed, now).await?;
             ensure_current_reconcile(&txn, &claimed.model.provider, &claimed.model.cid, now)
                 .await?;
-            outcome_state = "stale_current_reconcile";
+            "stale_current_reconcile"
         }
-    }
+    };
     txn.commit().await?;
     if released {
         wake_provider_waiters_after_release(store, coordinator, &claimed.model.provider, now)

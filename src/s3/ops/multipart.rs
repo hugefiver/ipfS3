@@ -1076,7 +1076,7 @@ mod tests {
     use bytes::Bytes;
     use sea_orm::{
         ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, PaginatorTrait, QueryFilter,
-        Statement,
+        Statement, TransactionTrait,
     };
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -1657,6 +1657,26 @@ mod tests {
         )
         .await
         .unwrap();
+        let object =
+            crate::store::object::get_latest(state.store.db(), "test-bucket", "ordinary.txt")
+                .await
+                .unwrap();
+        state
+            .store
+            .db()
+            .transaction(move |txn| {
+                Box::pin(async move {
+                    crate::store::object_version::install_content_version(
+                        txn,
+                        crate::store::object_version::BucketVersioningState::Unversioned,
+                        &object,
+                        chrono::Utc::now(),
+                    )
+                    .await
+                })
+            })
+            .await
+            .unwrap();
     }
 
     fn completed_archive(completion_attempt_id: &str) -> CompletedMultipartArchive {

@@ -1,0 +1,23 @@
+LIFECYCLE EXPIRATION REAL CLIENT: PASSED
+Completed: 2026-08-31
+Expiration spec SHA-256: 0c11f4df0b4f6e81e9834fde45368df5b330e1229dc2cdff4e8d8ab573f35742
+Lifecycle program spec SHA-256: fdcfbb22447ea7c7bfae9c549b2722664a2e8df859076e7fd3c2d20b3b0e4574
+Package: 0.1.0
+Candidate base HEAD: f42515a
+Focused lifecycle actions regression: PASSED 14/14
+Lifecycle admission priority regressions: PASSED 2/2
+Complete nonlive matrix: PASSED 880 library / 143 integration
+AWS-only lifecycle diagnostic: PASSED
+Final normal lifecycle validation: PASSED
+postgres_versioning: PASSED
+postgres_lifecycle hard-loss and reclaim: PASSED
+e2e: PASSED
+multi_gateway: PASSED
+signed integration lifecycle_expiration_invariants: PASSED
+AWS lifecycle control plane: PASSED
+AWS current expiration unversioned enabled suspended: PASSED
+AWS noncurrent content and marker expiration: PASSED
+AWS timed sole-marker and EODM cleanup: PASSED
+Kubo /api/v0/pin/rm requests: ZERO
+Owned cleanup and independent residual checks: PASSED
+HOSTED lifecycle-expiration: NOT RUN

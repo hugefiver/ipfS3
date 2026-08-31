@@ -11,6 +11,8 @@ $StorePath = Join-Path $RepoRoot "src/store/mod.rs"
 $StatePath = Join-Path $RepoRoot "src/state.rs"
 $MainPath = Join-Path $RepoRoot "src/main.rs"
 $RustLivePath = Join-Path $RepoRoot "tests/multi_gateway.rs"
+$WorkerPath = Join-Path $RepoRoot "src/lifecycle/worker.rs"
+$PostgresLifecyclePath = Join-Path $RepoRoot "tests/postgres_lifecycle.rs"
 $WorkflowPath = Join-Path $RepoRoot ".github/workflows/release-validation.yml"
 $E2ePath = Join-Path $RepoRoot "tests/e2e.rs"
 
@@ -572,6 +574,169 @@ foreach ($requiredLiveFragment in @(
 }
 Assert-NotMatches $RustLive '(?i)std::process::Command|Command::new|\baws\b|\brclone\b|\bmc\b' "Live target must not execute native client tools"
 
+# Task 11: deterministic PostgreSQL reclaim proof and endpoint-only lifecycle scenarios.
+$Worker = Read-NormalizedText $WorkerPath
+$PostgresLifecycle = Read-NormalizedText $PostgresLifecyclePath
+foreach ($fragment in @(
+    "#[doc(hidden)]`n#[derive(Clone)]`npub struct LifecycleWorkerTestControl",
+    "pub worker_id: String,",
+    "pub after_claim: Option<Arc<LifecycleAfterClaimGate>>",
+    "#[doc(hidden)]`npub struct LifecycleAfterClaimGate",
+    "pub fn new(expected_worker_id: impl Into<String>) -> Arc<Self>",
+    "pub async fn wait_claim(&self) -> ClaimedLifecycleAction",
+    "pub fn release(&self)",
+    "pub fn start_worker_for_test(",
+    "#[doc(hidden)]`n    pub fn abort_for_test(self) -> JoinHandle<()>",
+    'let worker_id = format!("lifecycle-worker-{}", uuid::Uuid::new_v4());'
+)) {
+    Assert-Contains $Worker $fragment "Lifecycle worker deterministic test seam is incomplete: $fragment"
+}
+Assert-Matches $Worker '(?s)pub async fn wait_claim\(&self\) -> ClaimedLifecycleAction\s*\{\s*loop\s*\{' "Lifecycle after-claim gate must wait in a predicate loop"
+Assert-Matches $Worker '(?s)pub fn abort_for_test\(self\) -> JoinHandle<\(\)>\s*\{\s*self\.join\.abort\(\);\s*self\.join\s*\}' "Worker test abort must abort and return only its join handle"
+Assert-NotContains $Main "start_worker_for_test" "Production startup must not call the lifecycle test seam"
+
+foreach ($testName in @(
+    "postgres_lifecycle_migration_and_database_clock_are_engine_owned",
+    "postgres_lifecycle_down_refuses_durable_configuration",
+    "postgres_lifecycle_claim_uses_database_clock_locks_and_epoch_fences",
+    "postgres_lifecycle_worker_abort_reclaims_and_fences_stale_epoch"
+)) {
+    Assert-True (([regex]::Matches($PostgresLifecycle, "(?m)^async fn $testName\(\) \{")).Count -eq 1) "Expected one PostgreSQL lifecycle test named $testName"
+}
+foreach ($fragment in @(
+    "lifecycle_{}",
+    "uuid::Uuid::new_v4().simple()",
+    "OwnedPgSchemaCleanup",
+    "impl Drop for OwnedPgSchemaCleanup",
+    "DROP SCHEMA {schema} CASCADE",
+    "start_worker_for_test",
+    "LifecycleWorkerTestControl",
+    "LifecycleAfterClaimGate",
+    "worker-a",
+    "worker-b",
+    "action_lease_secs: 1",
+    "Duration::from_secs(15)",
+    "assert_eq!(claim_b.claim_epoch, claim_a.claim_epoch + 1);",
+    "database_now(store_b.db()).await.unwrap() > lease_until",
+    "tokio::sync::Barrier",
+    "tokio::sync::Notify"
+)) {
+    Assert-Contains $PostgresLifecycle $fragment "PostgreSQL lifecycle reclaim proof is incomplete: $fragment"
+}
+Assert-Matches $PostgresLifecycle '(?s)abort_for_test\(\).*?is_cancelled\(\).*?claimed_by.*?worker-a' "Abort proof must observe a cancelled join and unchanged worker-A claim"
+Assert-Matches $PostgresLifecycle '(?s)state.*?succeeded.*?stale_terminal_write.*?mark_succeeded\(.*?!stale_terminal_write.*?stale terminal CAS must affect zero rows' "Stale epoch proof must leave a terminal row and assert a zero-row CAS"
+
+foreach ($testName in @(
+    "multi_gateway_cross_replica_contract",
+    "load_balancer_surviving_replica_crud",
+    "multi_gateway_lifecycle_configuration_visible_across_replicas",
+    "multi_gateway_lifecycle_publication_action_race_has_one_terminal_outcome"
+)) {
+    Assert-True (([regex]::Matches($RustLive, "(?m)^async fn $testName\(\) \{")).Count -eq 1) "Expected one endpoint-only lifecycle test named $testName"
+}
+Assert-True (([regex]::Matches($RustLive, '(?m)^#\[tokio::test\]\s*$')).Count -eq 4) "Multi-gateway target must retain its two existing tests and add exactly two endpoint-only lifecycle tests"
+foreach ($fragment in @(
+    "lifecycle_configuration_xml",
+    "signed_put_lifecycle_configuration",
+    "signed_get_lifecycle_configuration",
+    "signed_delete_lifecycle_configuration",
+    "signed_list_object_versions",
+    "tokio::join!",
+    "LifecycleConfiguration",
+    "timeout(HTTP_TIMEOUT",
+    "successor never deleted"
+)) {
+    Assert-Contains $RustLive $fragment "Endpoint-only lifecycle scenario is incomplete: $fragment"
+}
+foreach ($fragment in @(
+    "lifecycle_race_configuration_xml",
+    "<Filter><Tag><Key>lifecycle-race</Key><Value>expire</Value></Tag></Filter>",
+    "signed_put_object_with_tagging",
+    'HeaderValue::from_static("lifecycle-race=expire")',
+    "signed_put_object_with_tagging(&endpoint_a, &bucket_name, key, predecessor_body)",
+    "signed_put_object(&endpoint_b, &bucket_name, key, successor_body.clone())"
+)) {
+    Assert-Contains $RustLive $fragment "Lifecycle publication race must tag only the predecessor: $fragment"
+}
+Assert-NotMatches $RustLive '(?i)DatabaseConnection|\b(?:SELECT|INSERT|UPDATE|CREATE|DROP)\s+(?:FROM|INTO|TABLE|SCHEMA)|\bdocker\b|(?:Command::new|process::(?:kill|abort)|abort_for_test|start_worker_for_test|LifecycleWorkerTestControl|LifecycleAfterClaimGate|LifecycleWorkerHandle)' "Endpoint-only lifecycle tests must not use database, Docker, process-stop, or worker controls"
+
+$raceTimeoutDeclaration = 'const LIFECYCLE_RACE_TIMEOUT: Duration = Duration::from_secs(60);'
+Assert-True (([regex]::Matches($RustLive, [regex]::Escape($raceTimeoutDeclaration))).Count -eq 1) "Lifecycle race timeout declaration is missing or duplicated"
+Assert-True (([regex]::Matches($RustLive, [regex]::Escape('tokio::time::timeout(LIFECYCLE_RACE_TIMEOUT, async {'))).Count -eq 2) "Lifecycle race timeout must have exactly two outer uses"
+Assert-True (([regex]::Matches($RustLive, '\bLIFECYCLE_RACE_TIMEOUT\b')).Count -eq 3) "Lifecycle race timeout leaked beyond declaration plus two uses"
+Assert-Contains $RustLive "signed successor must become visible within 60 seconds" "Successor convergence timeout message must state 60 seconds"
+Assert-Contains $RustLive "lifecycle race must reach a stable S3-visible state within 60 seconds" "Terminal convergence timeout message must state 60 seconds"
+
+foreach ($fragment in @(
+    'const LIFECYCLE_RACE_TEST_NAME: &str =',
+    '"multi_gateway_lifecycle_publication_action_race_has_one_terminal_outcome";',
+    'enum LifecycleRaceStage',
+    'BucketCreated',
+    'VersioningEnabled',
+    'LifecycleConfigured',
+    'PredecessorCreated',
+    'RaceStarted',
+    'SuccessorRequestDispatched',
+    'SuccessorRequestComplete',
+    'ObserverLoopEntered',
+    'ObserverGetResponse',
+    'ObserverListResponse',
+    'ObserverListStatusOk',
+    'ObserverSuccessorVisible',
+    'SuccessorResponse',
+    'SuccessorObserved',
+    'LifecycleConfigDeleted',
+    'TerminalWaitEntered',
+    'TerminalStateEvaluation',
+    'SuccessorRead',
+    'VersionCleanup',
+    'BucketDelete',
+    '"terminal-state-evaluation"',
+    '"bucket-created"',
+    '"versioning-enabled"',
+    '"lifecycle-configured"',
+    '"predecessor-created"',
+    '"race-started"',
+    '"successor-request-dispatched"',
+    '"successor-request-complete"',
+    '"observer-loop-entered"',
+    '"observer-get-response"',
+    '"observer-list-response"',
+    '"observer-list-status-ok"',
+    '"observer-successor-visible"',
+    '"successor-response"',
+    '"successor-observed"',
+    '"lifecycle-config-deleted"',
+    '"terminal-wait-entered"',
+    '"successor-read"',
+    '"version-cleanup"',
+    '"bucket-delete"',
+    'fn record_lifecycle_race_stage(stage: LifecycleRaceStage)',
+    '[LIFECYCLE-RACE-STAGE] test={LIFECYCLE_RACE_TEST_NAME} stage={}',
+    'stage.as_str()'
+)) {
+    Assert-Contains $RustLive $fragment "Lifecycle race safe stage source is incomplete: $fragment"
+}
+Assert-True (([regex]::Matches($RustLive, '(?m)^fn record_lifecycle_race_stage\(stage: LifecycleRaceStage\) \{$')).Count -eq 1) "Lifecycle race safe stage emitter must exist exactly once"
+$raceTestStart = $RustLive.IndexOf('async fn multi_gateway_lifecycle_publication_action_race_has_one_terminal_outcome()', [StringComparison]::Ordinal)
+$requestDispatchedStage = $RustLive.IndexOf('record_lifecycle_race_stage(LifecycleRaceStage::SuccessorRequestDispatched);', $raceTestStart, [StringComparison]::Ordinal)
+$requestCompleteStage = $RustLive.IndexOf('record_lifecycle_race_stage(LifecycleRaceStage::SuccessorRequestComplete);', $raceTestStart, [StringComparison]::Ordinal)
+$observerStage = $RustLive.IndexOf('record_lifecycle_race_stage(LifecycleRaceStage::ObserverLoopEntered);', $raceTestStart, [StringComparison]::Ordinal)
+$terminalStage = $RustLive.IndexOf('record_lifecycle_race_stage(LifecycleRaceStage::TerminalStateEvaluation);', $raceTestStart, [StringComparison]::Ordinal)
+$successorStage = $RustLive.IndexOf('record_lifecycle_race_stage(LifecycleRaceStage::SuccessorRead);', $raceTestStart, [StringComparison]::Ordinal)
+$cleanupStage = $RustLive.IndexOf('record_lifecycle_race_stage(LifecycleRaceStage::VersionCleanup);', $raceTestStart, [StringComparison]::Ordinal)
+$bucketStage = $RustLive.IndexOf('record_lifecycle_race_stage(LifecycleRaceStage::BucketDelete);', $raceTestStart, [StringComparison]::Ordinal)
+Assert-True (
+    $raceTestStart -ge 0 -and
+    $requestDispatchedStage -gt $raceTestStart -and
+    $requestCompleteStage -gt $requestDispatchedStage -and
+    $observerStage -gt $requestCompleteStage -and
+    $terminalStage -gt $raceTestStart -and
+    $successorStage -gt $terminalStage -and
+    $cleanupStage -gt $successorStage -and
+    $bucketStage -gt $cleanupStage
+) "Lifecycle race safe stages must put the successor before observation and retain terminal/successor/cleanup/bucket order"
+
 $Workflow = Read-NormalizedText $WorkflowPath
 $workflowJobs = Get-YamlBlock $Workflow "jobs" 0
 $workflowJobNames = @([regex]::Matches($workflowJobs, '(?m)^  ([A-Za-z0-9_-]+):\s*$') | ForEach-Object { $_.Groups[1].Value })
@@ -686,7 +851,7 @@ foreach ($source in $pwshBlocks) {
 }
 
 $E2e = Read-NormalizedText $E2ePath
-Assert-True (([regex]::Matches($E2e, '(?m)^#\[tokio::test\]\s*$')).Count -eq 11) "Existing E2E target must contain exactly eleven Tokio tests"
+Assert-True (([regex]::Matches($E2e, '(?m)^#\[tokio::test\]\s*$')).Count -eq 12) "Existing E2E target must contain exactly twelve Tokio tests"
 Assert-True (([regex]::Matches($multiJob, [regex]::Escape('cargo test --test e2e -- --nocapture --test-threads=1'))).Count -eq 1) "Multi-gateway job must run the complete serial E2E target exactly once"
 
 Write-Host "multi-gateway static contract tests: PASSED"

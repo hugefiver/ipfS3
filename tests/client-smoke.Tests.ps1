@@ -107,6 +107,924 @@ function Assert-NotContains {
     Assert-True (-not $Text.Contains($Fragment, [StringComparison]::Ordinal)) $Message
 }
 
+# Lifecycle-expiration evidence is intentionally a Docker-free source/AST contract.
+# It is added before the artifacts so its first execution is a causal RED.
+$LifecycleRunnerPath = Join-Path $RepoRoot "scripts/lifecycle-expiration-smoke.ps1"
+$LifecycleComposePath = Join-Path $RepoRoot "tests/compose.lifecycle-expiration-validation.yml"
+$LifecycleEvidencePath = Join-Path $RepoRoot "docs/lifecycle-expiration-evidence-2026-08-26.log"
+$missingLifecycleContracts = @(
+    @($LifecycleRunnerPath, $LifecycleComposePath, $LifecycleEvidencePath) | Where-Object {
+        -not (Test-Path -LiteralPath $_ -PathType Leaf)
+    }
+)
+if ($missingLifecycleContracts.Count -ne 0) {
+    throw "Lifecycle-expiration static contracts are missing: $($missingLifecycleContracts -join '; ')"
+}
+
+$lifecycleTokens = $null
+$lifecycleParseErrors = $null
+$LifecycleRunnerAst = [System.Management.Automation.Language.Parser]::ParseFile(
+    $LifecycleRunnerPath,
+    [ref]$lifecycleTokens,
+    [ref]$lifecycleParseErrors
+)
+if ($lifecycleParseErrors.Count -ne 0) {
+    $lifecycleParseErrors | Format-List | Out-String | Write-Host
+    throw "scripts/lifecycle-expiration-smoke.ps1 has parse errors"
+}
+$LifecycleRunnerSource = [IO.File]::ReadAllText($LifecycleRunnerPath)
+$LifecycleComposeSource = [IO.File]::ReadAllText($LifecycleComposePath).
+    Replace("`r`n", "`n").
+    Replace("`r", "`n")
+$LifecycleEvidenceBytes = [IO.File]::ReadAllBytes($LifecycleEvidencePath)
+$LifecycleEvidenceRaw = [Text.UTF8Encoding]::new($false, $true).GetString($LifecycleEvidenceBytes)
+
+function Get-LifecycleRunnerFunctionSource {
+    param([Parameter(Mandatory)][string]$Name)
+    $matches = @($LifecycleRunnerAst.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq $Name
+    }, $true))
+    if ($matches.Count -ne 1) { throw "Expected one lifecycle-expiration function named $Name, found $($matches.Count)" }
+    return $matches[0].Extent.Text
+}
+
+Assert-Contains $LifecycleRunnerSource '[switch]$Run' "Lifecycle runner must expose the opt-in Run switch"
+Assert-Contains $LifecycleRunnerSource '"[RESULT] lifecycle-expiration=NOT RUN reason=execution-not-requested"' "Lifecycle runner must retain the exact no-run receipt"
+
+# Task 12 correction RED: optional ListObjectVersions properties are genuinely
+# absent when empty, and pin_jobs cannot prove a Kubo request boundary.
+$lifecycleCorrectionRedFailures = [Collections.Generic.List[string]]::new()
+foreach ($directProperty in @('$versions.Versions', '$versions.DeleteMarkers')) {
+    if ($LifecycleRunnerSource.Contains($directProperty, [StringComparison]::Ordinal)) {
+        $lifecycleCorrectionRedFailures.Add("direct optional ListObjectVersions property remains: $directProperty")
+    }
+}
+foreach ($weakCondition in @('Count -le 1', 'Assert-NoPinRm', 'zero-pin-rm', "pin_jobs WHERE operation = 'pin_rm'")) {
+    if ($LifecycleRunnerSource.Contains($weakCondition, [StringComparison]::Ordinal)) {
+        $lifecycleCorrectionRedFailures.Add("weak lifecycle evidence remains: $weakCondition")
+    }
+}
+foreach ($requiredCorrectionFunction in @(
+    'Get-AwsOptionalListEntries',
+    'Get-AwsRequiredProperty',
+    'Get-LifecycleVersionList',
+    'Assert-LifecycleCurrentDaysState',
+    'Assert-LifecycleNoncurrentState',
+    'Assert-LifecycleConfigurationShape'
+)) {
+    if (-not $LifecycleRunnerSource.Contains("function $requiredCorrectionFunction", [StringComparison]::Ordinal)) {
+        $lifecycleCorrectionRedFailures.Add("required lifecycle assertion helper is absent: $requiredCorrectionFunction")
+    }
+}
+if ($lifecycleCorrectionRedFailures.Count -ne 0) {
+    throw "Lifecycle Task 12 correction RED: $($lifecycleCorrectionRedFailures -join '; ')"
+}
+
+foreach ($name in @(
+    "Write-LifecycleEvidence",
+    "New-LifecycleRunId",
+    "New-LifecycleProjectName",
+    "New-LifecycleBucketName",
+    "Assert-CanonicalChildPath",
+    "New-LifecycleRunRoot",
+    "New-LifecycleOwnershipReceipt",
+    "Invoke-NativeCommand",
+    "Test-LocalImage",
+    "Assert-ComposeVersion",
+    "Assert-ProjectResourcesAbsent",
+    "Assert-LoopbackPortsFree",
+    "Save-EnvironmentState",
+    "Restore-EnvironmentState",
+    "Invoke-OfflineGatewayBuild",
+    "Wait-TopologyHealthy",
+    "Get-ComposeNetwork",
+    "Assert-RustSuiteExecuted",
+    "Invoke-LifecycleRustSuites",
+    "Invoke-LifecycleAwsEvidence",
+    "Get-AwsOptionalListEntries",
+    "Get-AwsRequiredProperty",
+    "Get-LifecycleVersionList",
+    "Assert-LifecycleCurrentDaysState",
+    "Assert-LifecycleNoncurrentState",
+    "Assert-LifecycleConfigurationShape",
+    "Test-LifecycleCleanupResiduals",
+    "Remove-OwnedLifecycleResources",
+    "Invoke-LifecycleMain"
+)) {
+    $null = Get-LifecycleRunnerFunctionSource $name
+}
+
+$lifecycleRunIdSource = Get-LifecycleRunnerFunctionSource "New-LifecycleRunId"
+Assert-Contains $lifecycleRunIdSource "^[0-9]{8}t[0-9]{9}z-[0-9]+-[0-9a-f]{8}$" "Lifecycle RunId grammar changed"
+$lifecycleProjectSource = Get-LifecycleRunnerFunctionSource "New-LifecycleProjectName"
+$lifecycleBucketSource = Get-LifecycleRunnerFunctionSource "New-LifecycleBucketName"
+Assert-Contains $lifecycleProjectSource '"ipfs3-lifecycle-$RunId"' "Lifecycle project grammar is missing"
+Assert-Contains $lifecycleBucketSource '[string]$Prefix = "ipfs3-lifecycle"' "Lifecycle bucket grammar is missing"
+Assert-Contains $lifecycleBucketSource '"$Prefix-$RunId"' "Lifecycle bucket identity must derive from its generated run identity"
+Assert-Contains $lifecycleProjectSource "'^[a-z0-9][a-z0-9_-]*$'" "Lifecycle project grammar must be anchored"
+Assert-Contains $lifecycleBucketSource "'^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])$'" "Lifecycle bucket grammar must be anchored"
+$lifecycleRootSource = Get-LifecycleRunnerFunctionSource "New-LifecycleRunRoot"
+foreach ($fragment in @('"ipfs-s3-lifecycle-expiration-$RunId"', 'RunRoot must be a direct child')) {
+    Assert-Contains $lifecycleRootSource $fragment "Lifecycle root direct-child guard is missing: $fragment"
+}
+$lifecycleReceiptSource = Get-LifecycleRunnerFunctionSource "New-LifecycleOwnershipReceipt"
+foreach ($fragment in @('[IO.FileMode]::CreateNew', 'ownership-receipt')) {
+    Assert-Contains $lifecycleReceiptSource $fragment "Lifecycle receipt ownership guard is missing: $fragment"
+}
+
+$lifecyclePreflightSource = Get-LifecycleRunnerFunctionSource "Assert-ProjectResourcesAbsent"
+foreach ($fragment in @(
+    '"ps", "-aq"',
+    '"network", "ls", "-q"',
+    '"volume", "ls", "-q"',
+    '"label=com.docker.compose.project=$Project"',
+    'BLOCKED'
+)) {
+    Assert-Contains $lifecyclePreflightSource $fragment "Lifecycle project-label preflight is incomplete: $fragment"
+}
+$lifecycleImageSource = Get-LifecycleRunnerFunctionSource "Test-LocalImage"
+Assert-Contains $lifecycleImageSource '"image", "inspect", $Image, "--format", "{{.Id}}"' "Lifecycle local image inspection is not exact"
+foreach ($image in @("postgres:17", "ghcr.io/hugefiver/ipfs3-kubo:latest", "ghcr.io/hugefiver/ipfs3:latest", "rust:latest", "amazon/aws-cli:latest", "nginx:1.28.0-alpine")) {
+    Assert-Contains $LifecycleRunnerSource $image "Lifecycle exact local image prerequisite is missing: $image"
+}
+foreach ($forbidden in @("docker pull", "Install-Module", "choco install", "winget install", "scoop install", "Invoke-WebRequest", "--pull=always")) {
+    Assert-NotContains $LifecycleRunnerSource $forbidden "Lifecycle runner may not install or pull: $forbidden"
+}
+
+$lifecycleComposeVersionSource = Get-LifecycleRunnerFunctionSource "Assert-ComposeVersion"
+foreach ($fragment in @(
+    '"compose", "version", "--short"',
+    "'^(?<core>[0-9]+\.[0-9]+\.[0-9]+)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$'",
+    '[Version]::TryParse($composeVersionMatch.Groups["core"].Value, [ref]$composeVersion)',
+    '[Version]"2.23.1"'
+)) {
+    Assert-Contains $lifecycleComposeVersionSource $fragment "Lifecycle strict Compose version preflight is missing: $fragment"
+}
+Assert-NotContains $lifecycleComposeVersionSource '"compose", "version", "--format", "{{.Version}}"' "Lifecycle Compose version preflight must use --short"
+
+$lifecyclePortsSource = Get-LifecycleRunnerFunctionSource "Assert-LoopbackPortsFree"
+foreach ($port in @("55437", "55004", "59004", "59005", "59006")) {
+    Assert-Contains ($lifecyclePortsSource + $LifecycleRunnerSource) $port "Lifecycle loopback port is missing: $port"
+}
+Assert-Contains $lifecyclePortsSource "TcpListener" "Lifecycle port preflight must bind-probe loopback"
+Assert-Contains $lifecyclePortsSource "IPAddress]::Loopback" "Lifecycle port preflight must use loopback"
+
+$lifecycleOfflineSource = Get-LifecycleRunnerFunctionSource "Invoke-OfflineGatewayBuild"
+foreach ($fragment in @(
+    '"vendor", "--locked", "--offline"',
+    '"build", "--pull=false", "--network", "none", "--quiet"',
+    '"--build-context", "vendor-archive=$archiveContext"'
+)) {
+    Assert-Contains $lifecycleOfflineSource $fragment "Lifecycle offline build contract is missing: $fragment"
+}
+$lifecycleMainSource = Get-LifecycleRunnerFunctionSource "Invoke-LifecycleMain"
+foreach ($fragment in @(
+    '"config", "--quiet"',
+    '"up", "--detach", "--pull", "never", "--no-build"',
+    '"down", "--volumes", "--remove-orphans"',
+    'cargo test --test postgres_versioning -- --nocapture --test-threads=1',
+    'cargo test --test postgres_lifecycle -- --nocapture --test-threads=1',
+    'cargo test --test e2e -- --nocapture --test-threads=1',
+    'cargo test --test multi_gateway -- --nocapture --test-threads=1'
+)) {
+    Assert-Contains $LifecycleRunnerSource $fragment "Lifecycle execution contract is missing: $fragment"
+}
+foreach ($environmentName in @(
+    "COMPOSE_DISABLE_ENV_FILE",
+    "IPFS_S3_TEST_POSTGRES_URL",
+    "IPFS_S3_E2E_ENDPOINT",
+    "IPFS_S3_E2E_KUBO_URL",
+    "IPFS_S3_MULTI_GATEWAY_A_ENDPOINT",
+    "IPFS_S3_MULTI_GATEWAY_B_ENDPOINT",
+    "IPFS_S3_MULTI_GATEWAY_LOAD_BALANCER_ENDPOINT",
+    "IPFS_S3_MULTI_GATEWAY_KUBO_URL"
+)) {
+    Assert-Contains $LifecycleRunnerSource ('"' + $environmentName + '"') "Lifecycle runner must own and restore $environmentName"
+}
+
+$lifecycleEvidenceFunctionSource = Get-LifecycleRunnerFunctionSource "Write-LifecycleEvidence"
+Assert-Contains $lifecycleEvidenceFunctionSource "'^[A-Za-z0-9._:=/ -]+$'" "Lifecycle evidence must have a safe fixed charset"
+$lifecycleStageSource = Get-LifecycleRunnerFunctionSource "Set-LifecycleStage"
+foreach ($stage in @("preflight", "config", "offline-build", "compose-up", "health", "network", "postgres", "e2e", "multi-gateway", "integration", "aws", "cleanup")) {
+    Assert-Contains $lifecycleStageSource ('"' + $stage + '"') "Lifecycle stage allowlist is missing: $stage"
+}
+
+$optionalEntriesSource = Get-LifecycleRunnerFunctionSource "Get-AwsOptionalListEntries"
+$requiredPropertySource = Get-LifecycleRunnerFunctionSource "Get-AwsRequiredProperty"
+foreach ($fragment in @(
+    '[Parameter(Mandatory)][object]$Document',
+    '[ValidateSet("Versions", "DeleteMarkers", "Rules")][string]$PropertyName',
+    '$Document -isnot [pscustomobject]',
+    '$Document.PSObject.Properties.Match($PropertyName)',
+    '$properties.Count -eq 0',
+    '$properties.Count -ne 1',
+    '$entries.Count -gt 1000',
+    '$entry -isnot [pscustomobject]'
+)) {
+    Assert-Contains $optionalEntriesSource $fragment "Lifecycle optional-list parser is incomplete: $fragment"
+}
+foreach ($fragment in @(
+    '$Document -isnot [pscustomobject]',
+    '$Document.PSObject.Properties.Match($PropertyName)',
+    '$properties.Count -ne 1'
+)) {
+    Assert-Contains $requiredPropertySource $fragment "Lifecycle required-property parser is incomplete: $fragment"
+}
+foreach ($forbidden in @('$versions.Versions', '$versions.DeleteMarkers', 'Count -le 1', 'Assert-NoPinRm', 'zero-pin-rm', "pin_jobs WHERE operation = 'pin_rm'")) {
+    Assert-NotContains $LifecycleRunnerSource $forbidden "Lifecycle runner retains unsafe or false evidence: $forbidden"
+}
+
+$versionListSource = Get-LifecycleRunnerFunctionSource "Get-LifecycleVersionList"
+foreach ($fragment in @(
+    'Invoke-AwsJson',
+    'Get-AwsOptionalListEntries -Document $document -PropertyName "Versions"',
+    'Get-AwsOptionalListEntries -Document $document -PropertyName "DeleteMarkers"'
+)) {
+    Assert-Contains $versionListSource $fragment "Lifecycle version-list parser does not use the safe optional helper: $fragment"
+}
+$currentDaysSource = Get-LifecycleRunnerFunctionSource "Assert-LifecycleCurrentDaysState"
+foreach ($fragment in @(
+    '[ValidateSet("unversioned", "enabled", "suspended")][string]$Versioning',
+    '$list.Versions.Count -ne 0 -or $list.DeleteMarkers.Count -ne 0',
+    '$list.Versions.Count -ne 1 -or $list.DeleteMarkers.Count -ne 1',
+    '$list.Versions.Count -ne 0 -or $list.DeleteMarkers.Count -ne 1',
+    'Get-AwsRequiredProperty -Document $list.Versions[0] -PropertyName "IsLatest"',
+    'Get-AwsRequiredProperty -Document $list.DeleteMarkers[0] -PropertyName "IsLatest"',
+    'Get-AwsRequiredProperty -Document $list.DeleteMarkers[0] -PropertyName "VersionId"',
+    '-cne "null"',
+    '-ceq "null"'
+)) {
+    Assert-Contains $currentDaysSource $fragment "Lifecycle current-Days state assertion is incomplete: $fragment"
+}
+$noncurrentSource = Get-LifecycleRunnerFunctionSource "Assert-LifecycleNoncurrentState"
+foreach ($fragment in @(
+    '$list.Versions.Count -ne 1',
+    '$list.DeleteMarkers.Count -ne 0',
+    'Get-AwsRequiredProperty -Document $list.Versions[0] -PropertyName "IsLatest"',
+    'Invoke-Aws -Network $Network -RunRoot $RunRoot -Endpoint $Endpoint -Arguments @("s3api", "head-object", "--bucket", $Bucket, "--key", $Key)'
+)) {
+    Assert-Contains $noncurrentSource $fragment "Lifecycle NVE final-state assertion is incomplete: $fragment"
+}
+$controlPlaneSource = Get-LifecycleRunnerFunctionSource "Invoke-LifecycleControlPlaneEvidence"
+Assert-Contains $controlPlaneSource 'Assert-LifecycleConfigurationShape -Document $initialConfiguration -ExpectedKind "current-days"' "Lifecycle initial GET must assert its canonical shape"
+Assert-Contains $controlPlaneSource 'Assert-LifecycleConfigurationShape -Document $replacementConfiguration -ExpectedKind "noncurrent"' "Lifecycle replacement GET must assert its canonical shape"
+$configurationShapeSource = Get-LifecycleRunnerFunctionSource "Assert-LifecycleConfigurationShape"
+foreach ($fragment in @(
+    'Get-AwsOptionalListEntries -Document $Document -PropertyName "Rules"',
+    '$rules.Count -ne 1',
+    'Get-AwsRequiredProperty -Document $rule -PropertyName "Status"',
+    'Get-AwsRequiredProperty -Document $rule -PropertyName "Expiration"',
+    'Get-AwsRequiredProperty -Document $rule -PropertyName "NoncurrentVersionExpiration"'
+)) {
+    Assert-Contains $configurationShapeSource $fragment "Lifecycle GET shape assertion is incomplete: $fragment"
+}
+foreach ($semanticSource in @($optionalEntriesSource, $requiredPropertySource, $versionListSource, $currentDaysSource, $noncurrentSource, $configurationShapeSource)) {
+    Assert-NotContains $semanticSource 'Write-LifecycleEvidence' "Lifecycle semantic helpers must not emit raw response content"
+    Assert-NotContains $semanticSource 'Write-Host' "Lifecycle semantic helpers must not emit raw response content"
+}
+
+$rustSuiteSource = Get-LifecycleRunnerFunctionSource "Invoke-LifecycleRustSuites"
+$rustSuiteAssertionSource = Get-LifecycleRunnerFunctionSource "Assert-RustSuiteExecuted"
+Invoke-Expression $rustSuiteAssertionSource
+function Test-LifecycleRustReceiptFixture {
+    param([Parameter(Mandatory)][AllowEmptyString()][string[]]$Lines)
+    $result = [pscustomobject]@{ StdOut = @($Lines); StdErr = @() }
+    try {
+        Assert-RustSuiteExecuted -Result $result -Name "static fixture"
+        return $true
+    } catch {
+        return $false
+    }
+}
+$singularRustReceipt = @(
+    "running 1 test",
+    "",
+    "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"
+)
+$pluralRustReceipt = @(
+    "running 16 tests",
+    "",
+    "test result: ok. 16 passed; 0 failed; 2 ignored; 0 measured; 3 filtered out; finished in 12.34s"
+)
+Assert-True (Test-LifecycleRustReceiptFixture -Lines $singularRustReceipt) "Lifecycle Rust receipt must accept one complete executed test"
+Assert-True (Test-LifecycleRustReceiptFixture -Lines $pluralRustReceipt) "Lifecycle Rust receipt must accept plural complete executed tests"
+Assert-True (-not (Test-LifecycleRustReceiptFixture -Lines @("running 1 test", "test result: ok."))) "Lifecycle Rust receipt must reject a bare result marker"
+Assert-True (-not (Test-LifecycleRustReceiptFixture -Lines @("running 2 tests", "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"))) "Lifecycle Rust receipt must reject mismatched running and passed counts"
+Assert-True (-not (Test-LifecycleRustReceiptFixture -Lines @("running 0 tests", "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"))) "Lifecycle Rust receipt must reject zero running tests"
+Assert-True (-not (Test-LifecycleRustReceiptFixture -Lines @("running 1 test", "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"))) "Lifecycle Rust receipt must reject zero passed tests"
+Assert-True (-not (Test-LifecycleRustReceiptFixture -Lines @("running 1 test", "test result: ok. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"))) "Lifecycle Rust receipt must reject failed tests"
+Assert-True (-not (Test-LifecycleRustReceiptFixture -Lines @("running 1 test", "test result: ok. 1 passed; 0 failed; -1 ignored; 0 measured; 0 filtered out; finished in 0.01s"))) "Lifecycle Rust receipt must reject negative summary counters"
+Assert-True (-not (Test-LifecycleRustReceiptFixture -Lines @("running 1 test", "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3601.00s"))) "Lifecycle Rust receipt must reject unbounded duration"
+Assert-True (-not (Test-LifecycleRustReceiptFixture -Lines @("running 1 test", "running 1 test", "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"))) "Lifecycle Rust receipt must reject duplicate running lines"
+Assert-True (-not (Test-LifecycleRustReceiptFixture -Lines @("running 1 test", "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s", "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s"))) "Lifecycle Rust receipt must reject duplicate summary lines"
+Assert-True (-not (Test-LifecycleRustReceiptFixture -Lines @("prefix running 1 test", "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"))) "Lifecycle Rust receipt must reject malformed substring output"
+foreach ($fragment in @(
+    "'(?m)^running (?<running>[1-9][0-9]*) tests?$'",
+    "'(?m)^test result: ok\. (?<passed>[1-9][0-9]*) passed; 0 failed; (?<ignored>[0-9]+) ignored; (?<measured>[0-9]+) measured; (?<filtered>[0-9]+) filtered out; finished in (?<seconds>[0-9]{1,4}(?:\.[0-9]{1,3})?)s$'",
+    '$runningMatches.Count -ne 1',
+    '$summaryMatches.Count -ne 1',
+    '$runningCount -ne $passedCount',
+    '$seconds -gt [decimal]3600'
+)) {
+    Assert-Contains $rustSuiteAssertionSource $fragment "Lifecycle Rust receipt grammar is missing: $fragment"
+}
+$expectedLifecycleRustCommands = @(
+    'cargo test --test postgres_versioning -- --nocapture --test-threads=1',
+    'cargo test --test postgres_lifecycle -- --nocapture --test-threads=1',
+    'cargo test --test e2e -- --nocapture --test-threads=1',
+    'cargo test --test multi_gateway -- --nocapture --test-threads=1',
+    'cargo test --test integration lifecycle_expiration_invariants -- --nocapture --test-threads=1'
+)
+$actualLifecycleRustCommands = @([regex]::Matches($rustSuiteSource, '(?m)^\s*Write-LifecycleEvidence -Category "command" -Value "(?<command>cargo test [^"]+)"\s*$') | ForEach-Object { $_.Groups['command'].Value })
+Assert-True (($actualLifecycleRustCommands -join "`n") -ceq ($expectedLifecycleRustCommands -join "`n")) "Lifecycle Rust suite commands must be exactly the four plan binaries followed by the signed pin-rm invariant"
+Assert-Contains $rustSuiteSource 'Write-LifecycleEvidence -Category "assertion" -Value "pin-rm-request=zero-signed-integration"' "Lifecycle pin-rm receipt must be tied to the signed integration invariant"
+
+$pinRmMatches = @(& rg -n --glob "*.rs" "pin_rm\(" src)
+if ($LASTEXITCODE -gt 1) { throw "Lifecycle production pin-rm scan failed" }
+Assert-True ($pinRmMatches.Count -eq 4) "Unexpected pin_rm call-site count in src: $($pinRmMatches -join '; ')"
+Assert-True (@($pinRmMatches | Where-Object { $_ -match '^src[\\/]kubo[\\/]pin\.rs:[0-9]+:' }).Count -eq 3) "pin_rm must remain limited to its Kubo definition and unit tests"
+Assert-True (@($pinRmMatches | Where-Object { $_ -match '^src[\\/]s3[\\/]ops[\\/]object\.rs:[0-9]+:\s*async fn delete_never_calls_pin_rm\(\)' }).Count -eq 1) "The only non-Kubo pin_rm match must be the existing no-call test name"
+
+$lifecycleCleanupSource = Get-LifecycleRunnerFunctionSource "Remove-OwnedLifecycleResources"
+$lifecycleResidualSource = Get-LifecycleRunnerFunctionSource "Test-LifecycleCleanupResiduals"
+foreach ($fragment in @(
+    '"down", "--volumes", "--remove-orphans"',
+    '"image", "rm", $State.GatewayImage',
+    'Test-LifecycleCleanupResiduals -State $State',
+    'Remove-OwnedLifecycleRunRoot'
+)) {
+    Assert-Contains $lifecycleCleanupSource $fragment "Lifecycle exact cleanup contract is missing: $fragment"
+}
+Assert-Contains $LifecycleRunnerSource 'Restore-EnvironmentState -State $state.EnvironmentState' "Lifecycle cleanup must exactly restore its owned environment"
+foreach ($residual in @("containers", "networks", "volumes")) {
+    Assert-Contains $lifecycleResidualSource ('Name = "' + $residual + '"') "Lifecycle cleanup must independently query $residual"
+}
+Assert-Contains $lifecycleResidualSource '"residual-$($query.Name)=zero"' "Lifecycle cleanup must prove each queried project residual is zero"
+Assert-Contains $lifecycleResidualSource '"residual-image=zero"' "Lifecycle cleanup must prove image residual is zero"
+foreach ($forbidden in @('"image", "rm", "*"', '"image", "rm", "-f"', 'system prune', 'compose", "down", "-v"')) {
+    Assert-NotContains $LifecycleRunnerSource $forbidden "Lifecycle cleanup may not be broad: $forbidden"
+}
+
+foreach ($fragment in @(
+    'services:',
+    '  postgres:',
+    '  kubo:',
+    '  gateway-a:',
+    '  gateway-b:',
+    '  load-balancer:',
+    'image: postgres:17',
+    'image: ghcr.io/hugefiver/ipfs3-kubo:latest',
+    'image: "${IPFS_S3_LIFECYCLE_IMAGE:?required}"',
+    'image: nginx:1.28.0-alpine',
+    '../deploy/nginx/multi-gateway.conf:/etc/nginx/nginx.conf:ro',
+    'IPFS_S3_LIFECYCLE_POLL_INTERVAL_MS: "100"',
+    'IPFS_S3_LIFECYCLE_SCAN_LEASE_SECS: "3"',
+    'IPFS_S3_LIFECYCLE_ACTION_LEASE_SECS: "3"',
+    'IPFS_S3_MASTER_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"',
+    'postgres_data:',
+    'kubo_data:'
+)) {
+    Assert-Contains $LifecycleComposeSource $fragment "Lifecycle Compose topology is missing: $fragment"
+}
+Assert-True (([regex]::Matches($LifecycleComposeSource, '(?m)^  (?:postgres|kubo|gateway-a|gateway-b|load-balancer):$')).Count -eq 5) "Lifecycle Compose must contain exactly five services"
+Assert-True (([regex]::Matches($LifecycleComposeSource, '(?m)^\s*- "127\.0\.0\.1:\$\{IPFS_S3_LIFECYCLE_[A-Z_]+_PORT:\?required\}:(?:5432|5001|9000)"$')).Count -eq 5) "Lifecycle Compose must contain exactly five required loopback ports"
+Assert-NotContains $LifecycleComposeSource "container_name:" "Lifecycle Compose must not set container_name"
+
+$expectedLifecycleEvidenceLines = @(
+    'LIFECYCLE EXPIRATION REAL CLIENT: PASSED',
+    'Completed: 2026-08-31',
+    'Expiration spec SHA-256: 0c11f4df0b4f6e81e9834fde45368df5b330e1229dc2cdff4e8d8ab573f35742',
+    'Lifecycle program spec SHA-256: fdcfbb22447ea7c7bfae9c549b2722664a2e8df859076e7fd3c2d20b3b0e4574',
+    'Package: 0.1.0',
+    'Candidate base HEAD: f42515a',
+    'Focused lifecycle actions regression: PASSED 14/14',
+    'Lifecycle admission priority regressions: PASSED 2/2',
+    'Complete nonlive matrix: PASSED 880 library / 143 integration',
+    'AWS-only lifecycle diagnostic: PASSED',
+    'Final normal lifecycle validation: PASSED',
+    'postgres_versioning: PASSED',
+    'postgres_lifecycle hard-loss and reclaim: PASSED',
+    'e2e: PASSED',
+    'multi_gateway: PASSED',
+    'signed integration lifecycle_expiration_invariants: PASSED',
+    'AWS lifecycle control plane: PASSED',
+    'AWS current expiration unversioned enabled suspended: PASSED',
+    'AWS noncurrent content and marker expiration: PASSED',
+    'AWS timed sole-marker and EODM cleanup: PASSED',
+    'Kubo /api/v0/pin/rm requests: ZERO',
+    'Owned cleanup and independent residual checks: PASSED',
+    'HOSTED lifecycle-expiration: NOT RUN'
+)
+$expectedLifecycleEvidence = ($expectedLifecycleEvidenceLines -join "`n") + "`n"
+Assert-True ($LifecycleEvidenceRaw -ceq $expectedLifecycleEvidence) "Lifecycle evidence must be the exact initial sanitized NOT RUN receipt"
+Assert-True ($LifecycleEvidenceBytes.Count -lt 3 -or -not ($LifecycleEvidenceBytes[0] -eq 0xef -and $LifecycleEvidenceBytes[1] -eq 0xbb -and $LifecycleEvidenceBytes[2] -eq 0xbf)) "Lifecycle evidence must be UTF-8 without a BOM"
+Assert-True (-not $LifecycleEvidenceRaw.Contains("`r", [StringComparison]::Ordinal)) "Lifecycle evidence must use portable LF line endings"
+Assert-True ([regex]::IsMatch($LifecycleEvidenceRaw, '\A[\x20-\x7E\n]*\z')) "Lifecycle evidence must contain only portable sanitized text"
+Assert-Contains $LifecycleEvidenceRaw "LIFECYCLE EXPIRATION REAL CLIENT: PASSED" "Lifecycle evidence must claim the accepted LOCAL result"
+Assert-NotContains $LifecycleRunnerSource "README.md" "Task 12 runner must not promote README without live PASS"
+Assert-NotContains $LifecycleRunnerSource "ROADMAP.md" "Task 12 runner must not promote ROADMAP without live PASS"
+
+# Task 13 diagnostic surface is a Docker-free parser and topology contract.
+# This block intentionally precedes runner implementation so its first execution
+# records the causal RED for the missing diagnostic switch and receipt parser.
+$multiGatewayDiagnosticFailures = [Collections.Generic.List[string]]::new()
+function Test-MultiGatewayDiagnosticContract {
+    param(
+        [Parameter(Mandatory)][bool]$Condition,
+        [Parameter(Mandatory)][string]$Message
+    )
+    if (-not $Condition) { $multiGatewayDiagnosticFailures.Add($Message) }
+}
+
+$lifecycleParameterNames = @($LifecycleRunnerAst.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+Test-MultiGatewayDiagnosticContract (
+    ($lifecycleParameterNames -join ",") -ceq "Run,DiagnoseMultiGateway,DiagnoseLifecycleRaceExact,DiagnoseLifecycleRaceStability,DiagnoseLifecycleAws" -and
+    $LifecycleRunnerSource.Contains('[switch]$Run', [StringComparison]::Ordinal) -and
+    $LifecycleRunnerSource.Contains('[switch]$DiagnoseMultiGateway', [StringComparison]::Ordinal) -and
+    $LifecycleRunnerSource.Contains('[switch]$DiagnoseLifecycleRaceExact', [StringComparison]::Ordinal) -and
+    $LifecycleRunnerSource.Contains('[switch]$DiagnoseLifecycleRaceStability', [StringComparison]::Ordinal) -and
+    $LifecycleRunnerSource.Contains('[switch]$DiagnoseLifecycleAws', [StringComparison]::Ordinal)
+) "Lifecycle runner must expose exactly five diagnostic/run switches"
+Test-MultiGatewayDiagnosticContract (
+    $LifecycleRunnerSource.Contains('$selectedModeCount = @(', [StringComparison]::Ordinal) -and
+    $LifecycleRunnerSource.Contains('$DiagnoseLifecycleRaceExact.IsPresent', [StringComparison]::Ordinal) -and
+    $LifecycleRunnerSource.Contains('$DiagnoseLifecycleRaceStability.IsPresent', [StringComparison]::Ordinal) -and
+    $LifecycleRunnerSource.Contains('$DiagnoseLifecycleAws.IsPresent', [StringComparison]::Ordinal) -and
+    $LifecycleRunnerSource.Contains('if ($selectedModeCount -gt 1)', [StringComparison]::Ordinal) -and
+    $LifecycleRunnerSource.Contains('throw "Lifecycle runner modes are mutually exclusive"', [StringComparison]::Ordinal) -and
+    $LifecycleRunnerSource.Contains('if ($selectedModeCount -eq 0)', [StringComparison]::Ordinal) -and
+    $LifecycleRunnerSource.Contains('"[RESULT] lifecycle-expiration=NOT RUN reason=execution-not-requested"', [StringComparison]::Ordinal)
+) "Lifecycle modes must be mutually exclusive while retaining the exact no-run receipt"
+
+$multiGatewayParserMatches = @($LifecycleRunnerAst.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq "Get-MultiGatewayFailureReceipt"
+}, $true))
+$multiGatewayDiagnosticMatches = @($LifecycleRunnerAst.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq "Invoke-LifecycleMultiGatewayDiagnostic"
+}, $true))
+$exactRaceParserMatches = @($LifecycleRunnerAst.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq "Get-LifecycleRaceExactReceipt"
+}, $true))
+$exactRaceDiagnosticMatches = @($LifecycleRunnerAst.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq "Invoke-LifecycleRaceExactDiagnostic"
+}, $true))
+$stabilityDiagnosticMatches = @($LifecycleRunnerAst.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq "Invoke-LifecycleRaceStabilityDiagnostic"
+}, $true))
+$multiGatewayParserSource = if ($multiGatewayParserMatches.Count -eq 1) { $multiGatewayParserMatches[0].Extent.Text } else { "" }
+$multiGatewayDiagnosticSource = if ($multiGatewayDiagnosticMatches.Count -eq 1) { $multiGatewayDiagnosticMatches[0].Extent.Text } else { "" }
+Test-MultiGatewayDiagnosticContract ($multiGatewayParserMatches.Count -eq 1) "Get-MultiGatewayFailureReceipt must exist exactly once"
+Test-MultiGatewayDiagnosticContract ($multiGatewayDiagnosticMatches.Count -eq 1) "Invoke-LifecycleMultiGatewayDiagnostic must exist exactly once"
+Test-MultiGatewayDiagnosticContract ($exactRaceParserMatches.Count -eq 1) "Get-LifecycleRaceExactReceipt must exist exactly once"
+Test-MultiGatewayDiagnosticContract ($exactRaceDiagnosticMatches.Count -eq 1) "Invoke-LifecycleRaceExactDiagnostic must exist exactly once"
+Test-MultiGatewayDiagnosticContract ($stabilityDiagnosticMatches.Count -eq 1) "Invoke-LifecycleRaceStabilityDiagnostic must exist exactly once"
+
+if ($multiGatewayParserMatches.Count -eq 1) {
+    $multiGatewayParserParameterNames = @($multiGatewayParserMatches[0].Body.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+    Test-MultiGatewayDiagnosticContract (
+        ($multiGatewayParserParameterNames -join ",") -ceq "Result" -and
+        $multiGatewayParserSource.Contains('[Parameter(Mandatory)][object]$Result', [StringComparison]::Ordinal)
+    ) "Multi-gateway receipt parser must take exactly one mandatory Result"
+    foreach ($fragment in @(
+        "'(?m)^running (?<running>[1-9][0-9]*) tests?$'",
+        "'(?m)^test result: FAILED\. (?<passed>[0-9]+) passed; (?<failed>[1-9][0-9]*) failed; (?<ignored>[0-9]+) ignored; (?<measured>[0-9]+) measured; (?<filtered>[0-9]+) filtered out; finished in (?<seconds>[0-9]{1,4}(?:\.[0-9]{1,3})?)s$'",
+        "'(?m)^test (?<name>[A-Za-z0-9_:]+) \.\.\. FAILED$'",
+        '$runningMatches.Count -ne 1',
+        '$summaryMatches.Count -ne 1',
+        '$running -ne ($passed + $failed + $ignored + $measured)',
+        '$names.Count -ne $failed',
+        '@($names | Sort-Object -Unique).Count -ne $names.Count',
+        '$seconds -gt 3600',
+        "timeout = '(?i)\b(timed out|deadline has elapsed)\b'",
+        "assertion = '(?i)\b(assertion|panicked at)\b'",
+        "'http-status' = '(?i)\b(http|status code)\b'",
+        "connection = '(?i)\b(connection|connect|refused)\b'",
+        "database = '(?i)\b(database|postgres|sqlx)\b'",
+        "'process-exit'",
+        "'(?m)^\[LIFECYCLE-RACE-STAGE\].*\r?$'",
+        "'(?m)^\[LIFECYCLE-RACE-STAGE\] test=multi_gateway_lifecycle_publication_action_race_has_one_terminal_outcome stage=(?<stage>bucket-created|versioning-enabled|lifecycle-configured|predecessor-created|race-started|successor-request-dispatched|successor-request-complete|observer-loop-entered|observer-get-response|observer-list-response|observer-list-status-ok|observer-successor-visible|successor-response|successor-observed|lifecycle-config-deleted|terminal-wait-entered|terminal-state-evaluation|successor-read|version-cleanup|bucket-delete)\r?$'",
+        '$stagePrefixMatches.Count -ne $stageMatches.Count',
+        '$names -contains $raceTestName -and $lastStage -ceq "not-reached"',
+        'LastStage = $lastStage'
+    )) {
+        Test-MultiGatewayDiagnosticContract $multiGatewayParserSource.Contains($fragment, [StringComparison]::Ordinal) "Multi-gateway receipt parser grammar is incomplete: $fragment"
+    }
+    Test-MultiGatewayDiagnosticContract (
+        -not $multiGatewayParserSource.Contains('Write-LifecycleEvidence', [StringComparison]::Ordinal) -and
+        -not [regex]::IsMatch($multiGatewayParserSource, '(?m)^\s*(?:Write-Host|Write-Output|Write-Error)\b')
+    ) "Multi-gateway receipt parser must not emit raw process output"
+}
+
+if ($multiGatewayDiagnosticMatches.Count -eq 1) {
+    $diagnosticNativeCalls = @($multiGatewayDiagnosticMatches[0].FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.CommandAst] -and
+            $node.GetCommandName() -eq "Invoke-NativeCommand"
+    }, $true))
+    Test-MultiGatewayDiagnosticContract (
+        $diagnosticNativeCalls.Count -eq 1 -and
+        $multiGatewayDiagnosticSource.Contains('Set-LifecycleEndpointEnvironment', [StringComparison]::Ordinal) -and
+        $multiGatewayDiagnosticSource.Contains('Set-LifecycleStage -State $State -Stage "multi-gateway"', [StringComparison]::Ordinal) -and
+        $multiGatewayDiagnosticSource.Contains('-FilePath "cargo"', [StringComparison]::Ordinal) -and
+        $multiGatewayDiagnosticSource.Contains('-ArgumentList @("test", "--test", "multi_gateway", "--", "--nocapture", "--test-threads=1")', [StringComparison]::Ordinal) -and
+        $multiGatewayDiagnosticSource.Contains('-AllowedExitCodes @(0, 101)', [StringComparison]::Ordinal) -and
+        $multiGatewayDiagnosticSource.Contains('-WorkingDirectory $RepoRoot', [StringComparison]::Ordinal) -and
+        $multiGatewayDiagnosticSource.Contains('Assert-RustSuiteExecuted -Result $result -Name "Owned multi-gateway diagnostic"', [StringComparison]::Ordinal) -and
+        $multiGatewayDiagnosticSource.Contains('cargo test --test multi_gateway -- --nocapture --test-threads=1', [StringComparison]::Ordinal)
+    ) "Multi-gateway diagnostic must run exactly the owned cargo test command with exits 0 and 101"
+    Test-MultiGatewayDiagnosticContract (
+        -not $multiGatewayDiagnosticSource.Contains('Invoke-LifecycleRustSuites', [StringComparison]::Ordinal) -and
+        -not $multiGatewayDiagnosticSource.Contains('Invoke-LifecycleAwsEvidence', [StringComparison]::Ordinal) -and
+        -not $multiGatewayDiagnosticSource.Contains('StdOut', [StringComparison]::Ordinal) -and
+        -not $multiGatewayDiagnosticSource.Contains('StdErr', [StringComparison]::Ordinal) -and
+        -not [regex]::IsMatch($multiGatewayDiagnosticSource, '(?m)^\s*(?:Write-Host|Write-Output|Write-Error)\b')
+    ) "Multi-gateway diagnostic must not run normal suites/AWS or emit raw process output"
+    foreach ($fragment in @(
+        '$State.DiagnosticOutcome = "not-reproduced"',
+        '"multi-gateway=not-reproduced"',
+        'Get-MultiGatewayFailureReceipt -Result $result',
+        '"multi-gateway-running=$($receipt.Running)"',
+        '"multi-gateway-passed=$($receipt.Passed)"',
+        '"multi-gateway-failed=$($receipt.Failed)"',
+        '"multi-gateway-failed-test=$name"',
+        '"multi-gateway-first-error-category=$($receipt.FirstErrorCategory)"',
+        '"multi-gateway-last-stage=$($receipt.LastStage)"',
+        '$State.DiagnosticOutcome = "captured"',
+        'throw "Owned multi-gateway diagnostic captured a safe failure receipt"'
+    )) {
+        Test-MultiGatewayDiagnosticContract $multiGatewayDiagnosticSource.Contains($fragment, [StringComparison]::Ordinal) "Multi-gateway diagnostic safe receipt is incomplete: $fragment"
+    }
+}
+
+$lifecycleMainSource = Get-LifecycleRunnerFunctionSource "Invoke-LifecycleMain"
+$metadataIndex = $lifecycleMainSource.IndexOf('Set-LifecycleStage -State $State -Stage "metadata"', [StringComparison]::Ordinal)
+$awsBranchIndex = $lifecycleMainSource.IndexOf('if ($DiagnoseLifecycleAws)', [StringComparison]::Ordinal)
+$stabilityBranchIndex = $lifecycleMainSource.IndexOf('elseif ($DiagnoseLifecycleRaceStability)', [StringComparison]::Ordinal)
+$exactBranchIndex = $lifecycleMainSource.IndexOf('elseif ($DiagnoseLifecycleRaceExact)', [StringComparison]::Ordinal)
+$diagnosticBranchIndex = $lifecycleMainSource.IndexOf('elseif ($DiagnoseMultiGateway)', [StringComparison]::Ordinal)
+$exactCallIndex = $lifecycleMainSource.IndexOf('Invoke-LifecycleRaceExactDiagnostic -State $State', [StringComparison]::Ordinal)
+$diagnosticCallIndex = $lifecycleMainSource.IndexOf('Invoke-LifecycleMultiGatewayDiagnostic -State $State', [StringComparison]::Ordinal)
+$normalSuiteIndex = $lifecycleMainSource.IndexOf('Invoke-LifecycleRustSuites -State $State', [StringComparison]::Ordinal)
+$normalAwsIndex = if ($normalSuiteIndex -ge 0) {
+    $lifecycleMainSource.IndexOf('Invoke-LifecycleAwsEvidence -State $State -Network $network', $normalSuiteIndex, [StringComparison]::Ordinal)
+} else {
+    -1
+}
+$diagnosticBranchPattern = '(?s)if \(\$DiagnoseLifecycleAws\) \{\s*Set-LifecycleStage -State \$State -Stage "aws"\s*Invoke-LifecycleAwsEvidence -State \$State -Network \$network\s*\$State\.DiagnosticOutcome = "aws-diagnostic-passed"\s*\} elseif \(\$DiagnoseLifecycleRaceStability\) \{\s*Invoke-LifecycleRaceStabilityDiagnostic -State \$State\s*\} elseif \(\$DiagnoseLifecycleRaceExact\) \{\s*Invoke-LifecycleRaceExactDiagnostic -State \$State\s*\} elseif \(\$DiagnoseMultiGateway\) \{\s*Invoke-LifecycleMultiGatewayDiagnostic -State \$State\s*\} else \{\s*Invoke-LifecycleRustSuites -State \$State\s*Set-LifecycleStage -State \$State -Stage "aws"\s*Invoke-LifecycleAwsEvidence -State \$State -Network \$network\s*\}'
+Test-MultiGatewayDiagnosticContract (
+    $metadataIndex -ge 0 -and
+    $awsBranchIndex -gt $metadataIndex -and
+    $stabilityBranchIndex -gt $awsBranchIndex -and
+    $exactBranchIndex -gt $stabilityBranchIndex -and
+    $exactCallIndex -gt $exactBranchIndex -and
+    $diagnosticBranchIndex -gt $exactCallIndex -and
+    $diagnosticCallIndex -gt $diagnosticBranchIndex -and
+    $normalSuiteIndex -gt $diagnosticCallIndex -and
+    $normalAwsIndex -gt $normalSuiteIndex -and
+    $lifecycleMainSource.Contains('Invoke-LifecycleAwsEvidence -State $State -Network $network', [StringComparison]::Ordinal)
+) "Lifecycle main must branch after metadata so diagnostic mode cannot overlap normal suites or AWS"
+
+$awsEvidenceSource = Get-LifecycleRunnerFunctionSource "Invoke-LifecycleAwsEvidence"
+$awsSubstages = @("control-plane", "current-unversioned", "current-enabled", "current-suspended", "noncurrent-content", "noncurrent-marker", "sole-marker-timed", "sole-marker-eodm")
+$previousAwsStage = -1
+foreach ($awsSubstage in $awsSubstages) {
+    $startReceipt = '"aws-substage=' + $awsSubstage + '"'
+    $passReceipt = '"aws-substage=' + $awsSubstage + '-passed"'
+    $startIndex = $awsEvidenceSource.IndexOf($startReceipt, [StringComparison]::Ordinal)
+    $passIndex = $awsEvidenceSource.IndexOf($passReceipt, [StringComparison]::Ordinal)
+    Test-MultiGatewayDiagnosticContract ($startIndex -gt $previousAwsStage -and $passIndex -gt $startIndex) "AWS lifecycle substage receipts are missing or out of order: $awsSubstage"
+    $previousAwsStage = $passIndex
+}
+Test-MultiGatewayDiagnosticContract ($LifecycleRunnerSource.Contains('"[RESULT] lifecycle-expiration=DIAGNOSTIC outcome=aws-passed"', [StringComparison]::Ordinal)) "AWS-only diagnostic result is missing"
+$awsControlSource = Get-LifecycleRunnerFunctionSource "Invoke-LifecycleControlPlaneEvidence"
+$awsControlSubstages = @("files-written", "bucket-created", "initial-put", "initial-get-shape", "initial-revision", "unsupported-rejected", "revision-unchanged", "replacement-put", "replacement-get-shape", "lifecycle-deleted", "absent-get-verified")
+$previousControlStage = -1
+foreach ($controlStage in $awsControlSubstages) {
+    $passedReceipt = '"aws-control-plane-substage=' + $controlStage + '-passed"'
+    $passedIndex = $awsControlSource.IndexOf($passedReceipt, [StringComparison]::Ordinal)
+    $startReceipt = '"aws-control-plane-substage=' + $controlStage + '"'
+    $startIndex = $awsControlSource.IndexOf($startReceipt, [StringComparison]::Ordinal)
+    Test-MultiGatewayDiagnosticContract ($startIndex -gt $previousControlStage -and $passedIndex -gt $startIndex) "AWS control-plane receipt is missing or out of order: $controlStage"
+    $previousControlStage = $passedIndex
+}
+Test-MultiGatewayDiagnosticContract (-not $LifecycleRunnerSource.Contains('.xml', [StringComparison]::Ordinal) -and $LifecycleRunnerSource.Contains('$Kind.json', [StringComparison]::Ordinal)) "AWS lifecycle CLI configurations must be strict JSON files, not REST XML"
+$nveSource = Get-LifecycleRunnerFunctionSource "Invoke-LifecycleNoncurrentScenario"
+$nveStageOrder = @("setup-complete", "age-applied", "wait-complete", "final-assert-passed")
+$previousNveStage = -1
+foreach ($nveStage in $nveStageOrder) {
+    $fragment = '"aws-nve-$Target-substage=' + $nveStage + '"'
+    $index = $nveSource.IndexOf($fragment, [StringComparison]::Ordinal)
+    Test-MultiGatewayDiagnosticContract ($index -gt $previousNveStage) "NVE safe substage receipt is missing or out of order: $nveStage"
+    $previousNveStage = $index
+}
+$revisionSource = Get-LifecycleRunnerFunctionSource "Get-LifecycleRevision"
+$composeSource = Get-LifecycleRunnerFunctionSource "Invoke-Compose"
+$lifecycleSqlSource = Get-LifecycleRunnerFunctionSource "Invoke-LifecycleSql"
+Test-MultiGatewayDiagnosticContract ($composeSource.Contains('[int[]]$AllowedExitCodes = @(0)', [StringComparison]::Ordinal) -and $composeSource.Contains('-AllowedExitCodes $AllowedExitCodes', [StringComparison]::Ordinal)) "Compose wrapper must preserve default exits and pass explicit allowed exits"
+foreach ($fragment in @(
+    '-AllowedExitCodes @(0, 1)',
+    '"missing-relation"',
+    '"connection"',
+    '"other"',
+    '"lifecycle-sql-outcome=failed"',
+    '"lifecycle-sql-error-category=$errorCategory"',
+    '"lifecycle-sql-outcome=passed"',
+    'throw "Lifecycle SQL command failed"'
+)) {
+    Test-MultiGatewayDiagnosticContract $lifecycleSqlSource.Contains($fragment, [StringComparison]::Ordinal) "Lifecycle SQL fixed classification is incomplete: $fragment"
+}
+foreach ($fragment in @(
+    '$Bucket.Length -gt 63',
+    "'^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])$'",
+    '$Key.Length -gt 256',
+    "'^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$'",
+    'throw "Lifecycle SQL bucket is invalid"',
+    'throw "Lifecycle SQL key is invalid"',
+    '"-c", $query'
+)) {
+    Test-MultiGatewayDiagnosticContract $lifecycleSqlSource.Contains($fragment, [StringComparison]::Ordinal) "Lifecycle SQL validator-first literal contract is incomplete: $fragment"
+}
+Test-MultiGatewayDiagnosticContract (-not $lifecycleSqlSource.Contains("`:'bucket'", [StringComparison]::Ordinal) -and -not $lifecycleSqlSource.Contains("`:'key'", [StringComparison]::Ordinal) -and -not $lifecycleSqlSource.Contains('"bucket=$Bucket"', [StringComparison]::Ordinal) -and -not $lifecycleSqlSource.Contains('"key=$Key"', [StringComparison]::Ordinal)) "Lifecycle SQL must not use psql variable substitution"
+Test-MultiGatewayDiagnosticContract (-not $lifecycleSqlSource.Contains('Write-Host', [StringComparison]::Ordinal) -and -not $lifecycleSqlSource.Contains('Write-Output', [StringComparison]::Ordinal)) "Lifecycle SQL classifier must not emit raw output"
+foreach ($fragment in @(
+    '$rows = @(Invoke-LifecycleSql -State $State -Statement "revision" -Bucket $Bucket -Key "lifecycle-control.txt")',
+    '$rowCountReceipt = if ($rows.Count -eq 0) { "0" } elseif ($rows.Count -eq 1) { "1" } else { "many" }',
+    '$shapeValid = $rows.Count -eq 1',
+    '"revision-row-count=$rowCountReceipt"',
+    '"revision-shape-valid=$($shapeValid.ToString().ToLowerInvariant())"',
+    'if (-not $shapeValid) { throw "Lifecycle revision receipt is invalid" }'
+)) {
+    Test-MultiGatewayDiagnosticContract $revisionSource.Contains($fragment, [StringComparison]::Ordinal) "Lifecycle revision safe receipt is incomplete: $fragment"
+}
+Test-MultiGatewayDiagnosticContract (-not $revisionSource.Contains('$rows[0].Trim())"', [StringComparison]::Ordinal)) "Lifecycle revision receipt must not emit the revision value"
+Test-MultiGatewayDiagnosticContract (
+    $LifecycleRunnerSource.Contains('DiagnosticOutcome = $null', [StringComparison]::Ordinal) -and
+    $LifecycleRunnerSource.Contains('"[RESULT] lifecycle-expiration=DIAGNOSTIC outcome=not-reproduced"', [StringComparison]::Ordinal) -and
+    $LifecycleRunnerSource.Contains('"[RESULT] lifecycle-expiration=FAILED reason=multi-gateway-diagnostic-captured"', [StringComparison]::Ordinal) -and
+    $LifecycleRunnerSource.Contains('"[RESULT] lifecycle-expiration=PASSED"', [StringComparison]::Ordinal) -and
+    $LifecycleRunnerSource.Contains('Remove-OwnedLifecycleResources -State $state', [StringComparison]::Ordinal) -and
+    $LifecycleRunnerSource.Contains('Restore-EnvironmentState -State $state.EnvironmentState', [StringComparison]::Ordinal)
+) "Diagnostic mode must reuse lifecycle ownership/cleanup and retain normal Run terminal behavior"
+
+if ($multiGatewayParserMatches.Count -eq 1) {
+    Invoke-Expression $multiGatewayParserSource
+    function Test-MultiGatewayFailureReceiptRejected {
+        param([Parameter(Mandatory)][string[]]$Lines)
+        try {
+            $null = Get-MultiGatewayFailureReceipt -Result ([pscustomobject]@{ StdOut = @($Lines); StdErr = @() })
+            return $false
+        } catch {
+            return $true
+        }
+    }
+
+    $acceptedReceipt = Get-MultiGatewayFailureReceipt -Result ([pscustomobject]@{
+        StdOut = @(
+            "running 3 tests",
+            "test multi_gateway::replica_a ... FAILED",
+            "test multi_gateway::replica_b ... FAILED",
+            "test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.34s"
+        )
+        StdErr = @("connection refused")
+    })
+    Test-MultiGatewayDiagnosticContract (
+        $acceptedReceipt.Running -eq 3 -and
+        $acceptedReceipt.Passed -eq 1 -and
+        $acceptedReceipt.Failed -eq 2 -and
+        ($acceptedReceipt.FailedNames -join ",") -ceq "multi_gateway::replica_a,multi_gateway::replica_b" -and
+        $acceptedReceipt.FirstErrorCategory -ceq "connection" -and
+        $acceptedReceipt.LastStage -ceq "not-reached"
+    ) "Multi-gateway receipt parser must accept one bounded anchored failed-suite receipt"
+    foreach ($fixture in @(
+        [pscustomobject]@{ Category = "timeout"; Text = "deadline has elapsed" },
+        [pscustomobject]@{ Category = "assertion"; Text = "panicked at fixture assertion" },
+        [pscustomobject]@{ Category = "http-status"; Text = "HTTP status code 500" },
+        [pscustomobject]@{ Category = "connection"; Text = "connection refused" },
+        [pscustomobject]@{ Category = "database"; Text = "postgres database error" },
+        [pscustomobject]@{ Category = "process-exit"; Text = "opaque safe fixture" }
+    )) {
+        $receipt = Get-MultiGatewayFailureReceipt -Result ([pscustomobject]@{
+            StdOut = @(
+                "running 1 test",
+                "test multi_gateway::receipt_fixture ... FAILED",
+                "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"
+            )
+            StdErr = @($fixture.Text)
+        })
+        Test-MultiGatewayDiagnosticContract ($receipt.FirstErrorCategory -ceq $fixture.Category) "Multi-gateway receipt parser category changed: $($fixture.Category)"
+    }
+    foreach ($rejected in @(
+        @("running 1 test", "test multi-gateway::unsafe ... FAILED", "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"),
+        @("running 1 test", "test multi_gateway::zero ... FAILED", "test result: FAILED. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"),
+        @("running 2 tests", "test multi_gateway::duplicate ... FAILED", "test multi_gateway::duplicate ... FAILED", "test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"),
+        @("running 2 tests", "test multi_gateway::mismatch ... FAILED", "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"),
+        @("running 1 test", "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"),
+        @("running 1 test", "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"),
+        @("running 1 test", "test multi_gateway::slow ... FAILED", "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3601s"),
+        @("prefix running 1 test", "test multi_gateway::substring ... FAILED", "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"),
+        @("running 1 test", "running 1 test", "test multi_gateway::duplicate_running ... FAILED", "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s")
+    )) {
+        Test-MultiGatewayDiagnosticContract (Test-MultiGatewayFailureReceiptRejected -Lines $rejected) "Multi-gateway receipt parser accepted an invalid fixture"
+    }
+
+    $raceTestName = "multi_gateway_lifecycle_publication_action_race_has_one_terminal_outcome"
+    $safeStages = @(
+        "terminal-state-evaluation",
+        "successor-read",
+        "version-cleanup",
+        "bucket-delete"
+    )
+    foreach ($stage in $safeStages) {
+        $receipt = Get-MultiGatewayFailureReceipt -Result ([pscustomobject]@{
+            StdOut = @(
+                "running 1 test",
+                "[LIFECYCLE-RACE-STAGE] test=$raceTestName stage=$stage",
+                "test $raceTestName ... FAILED",
+                "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"
+            )
+            StdErr = @("fixture assertion")
+        })
+        Test-MultiGatewayDiagnosticContract ($receipt.LastStage -ceq $stage) "Multi-gateway receipt parser rejected safe stage $stage"
+    }
+    $repeatedReceipt = Get-MultiGatewayFailureReceipt -Result ([pscustomobject]@{
+        StdOut = @(
+            "running 1 test",
+            "[LIFECYCLE-RACE-STAGE] test=$raceTestName stage=terminal-state-evaluation",
+            "[LIFECYCLE-RACE-STAGE] test=$raceTestName stage=successor-read",
+            "[LIFECYCLE-RACE-STAGE] test=$raceTestName stage=version-cleanup",
+            "[LIFECYCLE-RACE-STAGE] test=$raceTestName stage=bucket-delete",
+            "[LIFECYCLE-RACE-STAGE] test=$raceTestName stage=version-cleanup",
+            "[LIFECYCLE-RACE-STAGE] test=$raceTestName stage=bucket-delete",
+            "test $raceTestName ... FAILED",
+            "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s"
+        )
+        StdErr = @("fixture assertion")
+    })
+    Test-MultiGatewayDiagnosticContract ($repeatedReceipt.LastStage -ceq "bucket-delete") "Multi-gateway receipt parser did not retain the last bounded stage"
+    foreach ($rejectedStage in @(
+        @("running 1 test", "[LIFECYCLE-RACE-STAGE] test=$raceTestName stage=unknown", "test $raceTestName ... FAILED", "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"),
+        @("running 1 test", "[LIFECYCLE-RACE-STAGE] test=$raceTestName stage=bucket-delete payload=raw", "test $raceTestName ... FAILED", "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"),
+        @("running 1 test", "test $raceTestName ... FAILED", "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s")
+    )) {
+        Test-MultiGatewayDiagnosticContract (Test-MultiGatewayFailureReceiptRejected -Lines $rejectedStage) "Multi-gateway receipt parser accepted an unsafe stage fixture"
+    }
+}
+
+if ($exactRaceParserMatches.Count -eq 1 -and $exactRaceDiagnosticMatches.Count -eq 1) {
+    $exactParserSource = $exactRaceParserMatches[0].Extent.Text
+    $exactDiagnosticSource = $exactRaceDiagnosticMatches[0].Extent.Text
+    foreach ($fragment in @(
+        '[Parameter(Mandatory)][object]$Result',
+        '[Parameter(Mandatory)][ValidateSet(0, 101)][int]$ExitCode',
+        '$outcome = if ($ExitCode -eq 0',
+        'Outcome = $outcome',
+        'LastStage = $lastStage',
+        'FirstErrorCategory = $errorCategory',
+        'FailedName = if ($ExitCode -eq 101)',
+        'CommandOutcome = if ($ExitCode -eq 0)',
+        'ParserFailureCategory',
+        'CountShape',
+        "'(?m)\[LIFECYCLE-RACE-STAGE\][^\r\n]*'",
+        'stage-rejected',
+        'output-shape-rejected'
+        'SuccessorRequestDispatchedSeen'
+        'SuccessorRequestCompleteSeen'
+        'ObserverGetResponseSeen'
+        'ObserverListResponseSeen'
+        'ObserverSuccessorVisibleSeen'
+    )) {
+        Test-MultiGatewayDiagnosticContract $exactParserSource.Contains($fragment, [StringComparison]::Ordinal) "Exact lifecycle-race parser is incomplete: $fragment"
+    }
+    foreach ($fragment in @(
+        'cargo test --test multi_gateway multi_gateway_lifecycle_publication_action_race_has_one_terminal_outcome -- --exact --nocapture --test-threads=1',
+        '"multi_gateway_lifecycle_publication_action_race_has_one_terminal_outcome"',
+        'Get-LifecycleRaceExactReceipt -Result $result -ExitCode $result.ExitCode',
+        '"exact-race-running=$($receipt.Running)"',
+        '"exact-race-passed=$($receipt.Passed)"',
+        '"exact-race-failed=$($receipt.Failed)"',
+        '"exact-race-failed-test=$($receipt.FailedName)"',
+        '"exact-race-first-error-category=$($receipt.FirstErrorCategory)"',
+        '"exact-race-last-stage=$($receipt.LastStage)"',
+        '"exact-race-command-outcome=$($receipt.CommandOutcome)"',
+        '"exact-race-parser-failure-category=$($receipt.ParserFailureCategory)"',
+        '"exact-race-count-shape=$($receipt.CountShape)"'
+        '"exact-race-successor-request-dispatched-seen=$($receipt.SuccessorRequestDispatchedSeen.ToString().ToLowerInvariant())"'
+        '"exact-race-successor-request-complete-seen=$($receipt.SuccessorRequestCompleteSeen.ToString().ToLowerInvariant())"'
+        '"exact-race-observer-get-response-seen=$($receipt.ObserverGetResponseSeen.ToString().ToLowerInvariant())"'
+        '"exact-race-observer-list-response-seen=$($receipt.ObserverListResponseSeen.ToString().ToLowerInvariant())"'
+        '"exact-race-observer-successor-visible-seen=$($receipt.ObserverSuccessorVisibleSeen.ToString().ToLowerInvariant())"'
+    )) {
+        Test-MultiGatewayDiagnosticContract $exactDiagnosticSource.Contains($fragment, [StringComparison]::Ordinal) "Exact lifecycle-race diagnostic is incomplete: $fragment"
+    }
+    Test-MultiGatewayDiagnosticContract (-not $exactDiagnosticSource.Contains('Invoke-LifecycleRustSuites', [StringComparison]::Ordinal) -and -not $exactDiagnosticSource.Contains('Invoke-LifecycleAwsEvidence', [StringComparison]::Ordinal)) "Exact lifecycle-race diagnostic must not run normal suites or AWS"
+
+    Invoke-Expression $exactParserSource
+    $raceTestName = "multi_gateway_lifecycle_publication_action_race_has_one_terminal_outcome"
+    $passReceipt = Get-LifecycleRaceExactReceipt -Result ([pscustomobject]@{
+        StdOut = @(
+            "running 1 test",
+            "[LIFECYCLE-RACE-STAGE] test=$raceTestName stage=terminal-state-evaluation",
+            "[LIFECYCLE-RACE-STAGE] test=$raceTestName stage=successor-read",
+            "[LIFECYCLE-RACE-STAGE] test=$raceTestName stage=version-cleanup",
+            "[LIFECYCLE-RACE-STAGE] test=$raceTestName stage=bucket-delete",
+            "test $raceTestName ... ok",
+            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.02s"
+        ); StdErr = @()
+    }) -ExitCode 0
+    Test-MultiGatewayDiagnosticContract ($passReceipt.Outcome -ceq "passed" -and $passReceipt.LastStage -ceq "bucket-delete") "Exact lifecycle-race parser rejected safe pass"
+    $failReceipt = Get-LifecycleRaceExactReceipt -Result ([pscustomobject]@{
+        StdOut = @(
+            "running 1 test",
+            "[LIFECYCLE-RACE-STAGE] test=$raceTestName stage=version-cleanup",
+            "test $raceTestName ... FAILED",
+            "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s"
+        ); StdErr = @("fixture assertion")
+    }) -ExitCode 101
+    Test-MultiGatewayDiagnosticContract ($failReceipt.Outcome -ceq "failed" -and $failReceipt.FailedName -ceq $raceTestName -and $failReceipt.LastStage -ceq "version-cleanup") "Exact lifecycle-race parser rejected safe failure"
+    $prefixedReceipt = Get-LifecycleRaceExactReceipt -Result ([pscustomobject]@{
+        StdOut = @(
+            "test-harness-prefix: [LIFECYCLE-RACE-STAGE] test=$raceTestName stage=version-cleanup"
+        ); StdErr = @()
+    }) -ExitCode 101
+    Test-MultiGatewayDiagnosticContract (
+        $prefixedReceipt.LastStage -ceq "version-cleanup" -and
+        $prefixedReceipt.CountShape -ceq "unavailable" -and
+        $prefixedReceipt.ParserFailureCategory -ceq "none" -and
+        $prefixedReceipt.CommandOutcome -ceq "allowed-exit-101"
+    ) "Exact lifecycle-race parser rejected prefixed stage with unavailable counts"
+    $booleanReceipt = Get-LifecycleRaceExactReceipt -Result ([pscustomobject]@{
+        StdOut = @(
+            "running 1 test",
+            "[LIFECYCLE-RACE-STAGE] test=$raceTestName stage=successor-request-dispatched",
+            "[LIFECYCLE-RACE-STAGE] test=$raceTestName stage=successor-request-complete",
+            "[LIFECYCLE-RACE-STAGE] test=$raceTestName stage=observer-get-response",
+            "[LIFECYCLE-RACE-STAGE] test=$raceTestName stage=observer-list-response",
+            "test $raceTestName ... FAILED",
+            "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s"
+        ); StdErr = @("fixture assertion")
+    }) -ExitCode 101
+    Test-MultiGatewayDiagnosticContract (
+        $booleanReceipt.SuccessorRequestDispatchedSeen -and
+        $booleanReceipt.SuccessorRequestCompleteSeen -and
+        $booleanReceipt.ObserverGetResponseSeen -and
+        $booleanReceipt.ObserverListResponseSeen -and
+        -not $booleanReceipt.ObserverSuccessorVisibleSeen
+    ) "Exact lifecycle-race parser did not preserve fixed stage-presence booleans"
+}
+
+if ($stabilityDiagnosticMatches.Count -eq 1) {
+    $stabilitySource = $stabilityDiagnosticMatches[0].Extent.Text
+    foreach ($fragment in @(
+        'foreach ($iteration in 1..5)',
+        'Owned lifecycle-race stability process',
+        'Get-LifecycleRaceExactReceipt -Result $result -ExitCode $result.ExitCode',
+        'exact-race-stability-iteration=$iteration',
+        'exact-race-command-outcome=$($receipt.CommandOutcome)',
+        'exact-race-parser-failure-category=$($receipt.ParserFailureCategory)',
+        'exact-race-count-shape=$($receipt.CountShape)',
+        'exact-race-last-stage=$($receipt.LastStage)',
+        'exact-race-successor-request-dispatched-seen=$($receipt.SuccessorRequestDispatchedSeen.ToString().ToLowerInvariant())',
+        'exact-race-successor-request-complete-seen=$($receipt.SuccessorRequestCompleteSeen.ToString().ToLowerInvariant())',
+        'exact-race-observer-get-response-seen=$($receipt.ObserverGetResponseSeen.ToString().ToLowerInvariant())',
+        'exact-race-observer-list-response-seen=$($receipt.ObserverListResponseSeen.ToString().ToLowerInvariant())',
+        'exact-race-observer-successor-visible-seen=$($receipt.ObserverSuccessorVisibleSeen.ToString().ToLowerInvariant())',
+        '$State.DiagnosticOutcome = "exact-race-stability-passed"'
+    )) {
+        Test-MultiGatewayDiagnosticContract $stabilitySource.Contains($fragment, [StringComparison]::Ordinal) "Lifecycle race stability mode is incomplete: $fragment"
+    }
+    Test-MultiGatewayDiagnosticContract (-not $stabilitySource.Contains('Invoke-LifecycleRustSuites', [StringComparison]::Ordinal) -and -not $stabilitySource.Contains('Invoke-LifecycleAwsEvidence', [StringComparison]::Ordinal)) "Lifecycle race stability mode must not run normal suites or AWS"
+}
+if ($multiGatewayDiagnosticFailures.Count -ne 0) {
+    throw "Lifecycle Task 13 multi-gateway diagnostic contracts are missing: $($multiGatewayDiagnosticFailures -join '; ')"
+}
+
+# Lifecycle promotion may change README only; ROADMAP and deployment surfaces remain protected.
+$protectedLifecyclePaths = @(
+    "ROADMAP.md",
+    ".github/workflows/release-validation.yml",
+    "docker-compose.yml",
+    "docker-compose.postgres.yml",
+    "docker-compose.override.yml",
+    "docker-compose.cluster.yml",
+    "docker-compose.multi-gateway.yml"
+)
+foreach ($protectedPath in $protectedLifecyclePaths) {
+    & git diff --quiet HEAD -- $protectedPath
+    Assert-True ($LASTEXITCODE -eq 0) "Lifecycle work changed protected path: $protectedPath"
+}
+
 foreach ($name in @(
     "New-VersioningRunId",
     "New-VersioningProjectName",
@@ -1088,9 +2006,21 @@ foreach ($fragment in @(
     '`PutObject`, `CopyObject`, completed multipart uploads, `ipfs3-import`, and ZIP extraction all publish version-aware objects.',
     'Each version retains `ETag = CID` and its encryption metadata. Deleting a version removes only public metadata: gateway Kubo pins are retained and `pin/rm` is not called.',
     'Bucket deletion requires exact removal of every public version and delete marker.',
-    'Non-goals: Lifecycle, CORS, MFA Delete, Object Lock, pin reclamation, and replication.'
+    'Non-goals: CORS, MFA Delete, Object Lock, pin reclamation, and replication.'
 )) {
     Assert-Contains $ReadmeContractSource $fragment "README object-versioning contract is missing: $fragment"
+}
+Assert-True (([regex]::Matches($ReadmeSource, '(?m)^## Lifecycle expiration$')).Count -eq 1) "README must contain exactly one Lifecycle expiration section"
+foreach ($fragment in @(
+    '[approved expiration design](docs/superpowers/specs/2026-08-26-lifecycle-expiration-design.md)',
+    '[sanitized LOCAL evidence](docs/lifecycle-expiration-evidence-2026-08-26.log)',
+    '`PutBucketLifecycleConfiguration`, `GetBucketLifecycleConfiguration`, and `DeleteBucketLifecycle` support strict, atomic replacement of expiration rules with expected-owner enforcement.',
+    'Supported actions are current-version `Expiration` by date or days, `NoncurrentVersionExpiration` for content and delete markers, and `ExpiredObjectDeleteMarker`.',
+    'Eligibility uses database UTC and UTC-midnight semantics.',
+    'Lifecycle deletion retains Kubo pins and never calls `pin/rm`.',
+    '`Transition`, `NoncurrentVersionTransition`, and `AbortIncompleteMultipartUpload` are not supported; a configuration containing any unsupported action is rejected as a whole.'
+)) {
+    Assert-Contains $ReadmeContractSource $fragment "README lifecycle expiration contract is missing: $fragment"
 }
 
 $expectedRoadmapVersioningSection = @'

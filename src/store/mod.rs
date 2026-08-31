@@ -1,6 +1,10 @@
 pub mod bucket;
+pub mod database_clock;
 pub mod entities;
 pub mod import;
+pub mod lifecycle_action;
+pub mod lifecycle_config;
+pub mod lifecycle_scan;
 pub mod migrations;
 pub mod multipart;
 pub mod object;
@@ -61,6 +65,7 @@ mod migrator {
     use crate::store::migrations::m20260730_000001_standard_mutation_fence::Migration as StandardMutationFenceMigration;
     use crate::store::migrations::m20260813_000001_postgres_json_columns::Migration as PostgresJsonColumnsMigration;
     use crate::store::migrations::m20260825_000001_object_versioning::Migration as ObjectVersioningMigration;
+    use crate::store::migrations::m20260826_000001_lifecycle_expiration::Migration as LifecycleExpirationMigration;
     use sea_orm_migration::prelude::*;
 
     pub struct Migrator;
@@ -76,6 +81,7 @@ mod migrator {
                 Box::new(StandardMutationFenceMigration),
                 Box::new(PostgresJsonColumnsMigration),
                 Box::new(ObjectVersioningMigration),
+                Box::new(LifecycleExpirationMigration),
             ]
         }
     }
@@ -127,7 +133,7 @@ mod tests {
     use sea_orm_migration::MigratorTrait;
 
     #[test]
-    fn object_versioning_migration_is_registered_last() {
+    fn lifecycle_expiration_migration_is_registered_last() {
         let names = migrator::Migrator::migrations()
             .into_iter()
             .map(|migration| migration.name().to_owned())
@@ -144,6 +150,7 @@ mod tests {
                 "m20260730_000001_standard_mutation_fence",
                 "m20260813_000001_postgres_json_columns",
                 "m20260825_000001_object_versioning",
+                "m20260826_000001_lifecycle_expiration",
             ]
         );
     }
@@ -195,7 +202,7 @@ mod tests {
                        'object_tags', 'pin_leases', 'pin_lease_targets', 'remote_pins', \
                        'pin_jobs', 'pin_provider_usage', 'import_jobs', 'import_destinations', \
                        'import_prefix_claims', 'import_job_targets', 'import_job_results', \
-                       'object_versions'\
+                        'object_versions', 'bucket_lifecycle_configs', 'lifecycle_actions'\
                  ) ORDER BY name)",
                 [],
             ))
@@ -221,12 +228,14 @@ mod tests {
             "import_job_targets",
             "import_job_results",
             "object_versions",
+            "bucket_lifecycle_configs",
+            "lifecycle_actions",
         ]
         .into_iter()
         .collect();
         assert_eq!(
             table_names, expected,
-            "all sixteen application tables must exist"
+            "all eighteen application tables must exist"
         );
     }
 

@@ -315,7 +315,6 @@ mod tests {
 
     use chrono::{TimeZone, Utc};
     use s3s::S3Request;
-    use s3s::dto::*;
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, TransactionTrait};
 
     use super::*;

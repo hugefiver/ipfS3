@@ -7,6 +7,11 @@
 //!
 //! Run: cargo test --test e2e -- --nocapture --test-threads=1
 
+#[allow(dead_code)]
+#[path = "support/sigv4.rs"]
+mod sigv4;
+
+use http::{HeaderMap, HeaderValue, StatusCode};
 use s3::bucket::Bucket;
 use s3::bucket_ops::BucketConfiguration;
 use s3::creds::Credentials;
@@ -514,4 +519,73 @@ async fn test_14_etag_is_cid() {
     );
 
     cleanup_success(&bucket, &["etag-test.txt"]).await;
+}
+
+#[tokio::test]
+async fn test_15_lifecycle_configuration_raw_sigv4() {
+    let (name, bucket) = create_bucket("lifecycle-config").await;
+    let configuration = "<LifecycleConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+        <Rule><ID>e2e-lifecycle</ID><Status>Enabled</Status><Filter/><Expiration>\
+        <Days>365</Days></Expiration></Rule></LifecycleConfiguration>";
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/xml"),
+    );
+    let put = tokio::time::timeout(
+        S3_TIMEOUT,
+        sigv4::send_sigv4(
+            reqwest::Method::PUT,
+            &gateway_endpoint(),
+            &name,
+            "",
+            &[("lifecycle", "")],
+            configuration.as_bytes().to_vec(),
+            headers,
+            "test",
+        ),
+    )
+    .await
+    .expect("lifecycle PUT timed out");
+    assert_eq!(put.status(), StatusCode::OK);
+    let get = tokio::time::timeout(
+        S3_TIMEOUT,
+        sigv4::send_sigv4(
+            reqwest::Method::GET,
+            &gateway_endpoint(),
+            &name,
+            "",
+            &[("lifecycle", "")],
+            Vec::new(),
+            HeaderMap::new(),
+            "test",
+        ),
+    )
+    .await
+    .expect("lifecycle GET timed out");
+    assert_eq!(get.status(), StatusCode::OK);
+    assert!(
+        get.text()
+            .await
+            .expect("read lifecycle GET response")
+            .contains("e2e-lifecycle"),
+        "GET must return the saved lifecycle rule"
+    );
+    let delete = tokio::time::timeout(
+        S3_TIMEOUT,
+        sigv4::send_sigv4(
+            reqwest::Method::DELETE,
+            &gateway_endpoint(),
+            &name,
+            "",
+            &[("lifecycle", "")],
+            Vec::new(),
+            HeaderMap::new(),
+            "test",
+        ),
+    )
+    .await
+    .expect("lifecycle DELETE timed out");
+    assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+    cleanup_success(&bucket, &[]).await;
 }

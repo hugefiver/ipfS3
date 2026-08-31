@@ -93,35 +93,45 @@ pub enum VersionSelector {
 
 #[derive(Clone, Debug)]
 pub struct ResolvedVersion {
+    pub id: String,
     pub key: String,
     pub public_version_id: String,
     pub kind: VersionKind,
     pub object: Option<object::Model>,
     pub is_latest: bool,
     pub sequence: i64,
+    pub lifecycle_age_started_at: DateTime<Utc>,
+    pub became_noncurrent_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
 
 impl ResolvedVersion {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
+        id: String,
         key: String,
         public_version_id: String,
         kind: VersionKind,
         object: Option<object::Model>,
         is_latest: bool,
         sequence: i64,
+        lifecycle_age_started_at: DateTime<Utc>,
+        became_noncurrent_at: Option<DateTime<Utc>>,
         created_at: DateTime<Utc>,
     ) -> AppResult<Self> {
         if matches!(kind, VersionKind::Object) != object.is_some() {
             return Err(invalid_version_index());
         }
         Ok(Self {
+            id,
             key,
             public_version_id,
             kind,
             object,
             is_latest,
             sequence,
+            lifecycle_age_started_at,
+            became_noncurrent_at,
             created_at,
         })
     }
@@ -147,6 +157,14 @@ pub struct DeleteVersionResult {
     pub created_delete_marker: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)] // Task 8 reaches this through Task 7's guarded action primitive.
+pub(crate) enum ExactCurrentMarkerDeleteResult {
+    Deleted(DeleteVersionResult),
+    AlreadySatisfied,
+    Stale,
+}
+
 fn invalid_version_index() -> AppError {
     AppError::Internal("invalid object version index row".to_owned())
 }
@@ -163,7 +181,7 @@ fn no_such_version(bucket_name: &str, key: &str, version_id: &PublicVersionId) -
     }
 }
 
-fn version_kind(row: &object_version::Model) -> AppResult<VersionKind> {
+pub(crate) fn version_kind(row: &object_version::Model) -> AppResult<VersionKind> {
     match row.kind.as_str() {
         "object" if row.object_id.is_some() => Ok(VersionKind::Object),
         "delete_marker" if row.object_id.is_none() => Ok(VersionKind::DeleteMarker),
@@ -171,7 +189,7 @@ fn version_kind(row: &object_version::Model) -> AppResult<VersionKind> {
     }
 }
 
-fn public_version_id(row: &object_version::Model) -> AppResult<PublicVersionId> {
+pub(crate) fn public_version_id(row: &object_version::Model) -> AppResult<PublicVersionId> {
     match row.version_id.as_deref() {
         None => Ok(PublicVersionId::Null),
         Some(value) => PublicVersionId::parse_s3(value).map_err(|_| invalid_version_index()),
@@ -226,6 +244,9 @@ async fn resolved_from_row<C: ConnectionTrait>(
 ) -> AppResult<ResolvedVersion> {
     let kind = version_kind(&row)?;
     let version_id = public_version_id(&row)?.as_s3_str().to_owned();
+    let row_id = row.id.clone();
+    let lifecycle_age_started_at = row.lifecycle_age_started_at;
+    let became_noncurrent_at = row.became_noncurrent_at;
     match kind {
         VersionKind::Object => {
             let object_id = row.object_id.as_deref().ok_or_else(invalid_version_index)?;
@@ -239,12 +260,15 @@ async fn resolved_from_row<C: ConnectionTrait>(
                 return Err(invalid_version_index());
             }
             ResolvedVersion::new(
+                row_id,
                 row.key,
                 version_id,
                 kind,
                 Some(object),
                 row.is_latest,
                 row.sequence,
+                lifecycle_age_started_at,
+                became_noncurrent_at,
                 row.created_at,
             )
         }
@@ -264,12 +288,15 @@ async fn resolved_from_row<C: ConnectionTrait>(
                 }
             }
             ResolvedVersion::new(
+                row_id,
                 row.key,
                 version_id,
                 kind,
                 None,
                 row.is_latest,
                 row.sequence,
+                lifecycle_age_started_at,
+                became_noncurrent_at,
                 row.created_at,
             )
         }
@@ -293,16 +320,10 @@ async fn resolve_with_lock<C: ConnectionTrait>(
     if state == BucketVersioningState::Unversioned {
         return match selector {
             VersionSelector::Current => {
-                let object = super::object::get_latest(db, bucket_name, key).await?;
-                ResolvedVersion::new(
-                    object.key.clone(),
-                    NULL_VERSION_ID.to_owned(),
-                    VersionKind::Object,
-                    Some(object.clone()),
-                    true,
-                    0,
-                    object.created_at,
-                )
+                let row = one_version(db, bucket_name, key, selector, locked)
+                    .await?
+                    .ok_or_else(|| no_such_key(bucket_name, key))?;
+                resolved_from_row(db, row, true).await
             }
             VersionSelector::Exact(_) => Err(AppError::InvalidArgument(
                 "version IDs are unavailable for an unversioned bucket".to_owned(),
@@ -400,9 +421,15 @@ async fn demote_current_version<C: ConnectionTrait>(
     db: &C,
     bucket_name: &str,
     key: &str,
+    now: DateTime<Utc>,
 ) -> AppResult<()> {
     let result = object_version::Entity::update_many()
         .col_expr(object_version::Column::IsLatest, Expr::value(false))
+        .col_expr(
+            object_version::Column::BecameNoncurrentAt,
+            Expr::value(Some(now)),
+        )
+        .col_expr(object_version::Column::UpdatedAt, Expr::value(now))
         .filter(object_version::Column::Bucket.eq(bucket_name))
         .filter(object_version::Column::Key.eq(key))
         .filter(object_version::Column::IsLatest.eq(true))
@@ -458,6 +485,8 @@ async fn insert_version_row<C: ConnectionTrait>(
         object_id: Set(object_id),
         sequence: Set(sequence),
         is_latest: Set(true),
+        lifecycle_age_started_at: Set(now),
+        became_noncurrent_at: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
     })
@@ -471,16 +500,17 @@ async fn prepare_install<C: ConnectionTrait>(
     state: BucketVersioningState,
     bucket_name: &str,
     key: &str,
+    now: DateTime<Utc>,
 ) -> AppResult<(i64, PublicVersionId)> {
     let _ = lock_current_row(db, bucket_name, key).await?;
     let sequence = allocate_next_sequence(db, bucket_name, key).await?;
     let version_id = match state {
         BucketVersioningState::Enabled => {
-            demote_current_version(db, bucket_name, key).await?;
+            demote_current_version(db, bucket_name, key, now).await?;
             PublicVersionId::Opaque(uuid::Uuid::new_v4().to_string())
         }
         BucketVersioningState::Suspended | BucketVersioningState::Unversioned => {
-            demote_current_version(db, bucket_name, key).await?;
+            demote_current_version(db, bucket_name, key, now).await?;
             remove_null_slot(db, bucket_name, key).await?;
             PublicVersionId::Null
         }
@@ -494,7 +524,8 @@ pub(crate) async fn install_content_version<C: ConnectionTrait>(
     object: &object::Model,
     now: DateTime<Utc>,
 ) -> AppResult<String> {
-    let (sequence, version_id) = prepare_install(db, state, &object.bucket, &object.key).await?;
+    let (sequence, version_id) =
+        prepare_install(db, state, &object.bucket, &object.key, now).await?;
     let public_version_id = version_id.as_s3_str().to_owned();
     insert_version_row(
         db,
@@ -518,7 +549,7 @@ pub(crate) async fn install_delete_marker<C: ConnectionTrait>(
     key: &str,
     now: DateTime<Utc>,
 ) -> AppResult<String> {
-    let (sequence, version_id) = prepare_install(db, state, bucket_name, key).await?;
+    let (sequence, version_id) = prepare_install(db, state, bucket_name, key, now).await?;
     let public_version_id = version_id.as_s3_str().to_owned();
     insert_version_row(
         db,
@@ -535,7 +566,7 @@ pub(crate) async fn install_delete_marker<C: ConnectionTrait>(
     Ok(public_version_id)
 }
 
-async fn lock_version_by_id<C: ConnectionTrait>(
+pub(crate) async fn lock_version_by_id<C: ConnectionTrait>(
     db: &C,
     id: &str,
 ) -> AppResult<Option<object_version::Model>> {
@@ -546,6 +577,66 @@ async fn lock_version_by_id<C: ConnectionTrait>(
         query.one(db).await?
     };
     Ok(row)
+}
+
+/// Deletes exactly one current delete-marker version only when it remains the
+/// sole version row for its key. A zero-row exact delete is idempotent only
+/// when the key now has no version rows, which is the desired sole-marker
+/// deletion state after the caller already fenced the exact target.
+#[allow(dead_code)] // Task 8 reaches this through Task 7's guarded action primitive.
+pub(crate) async fn delete_current_sole_marker<C: ConnectionTrait>(
+    db: &C,
+    selected: &object_version::Model,
+) -> AppResult<ExactCurrentMarkerDeleteResult> {
+    if !selected.is_latest || version_kind(selected)? != VersionKind::DeleteMarker {
+        return Ok(ExactCurrentMarkerDeleteResult::Stale);
+    }
+    let version_count = object_version::Entity::find()
+        .filter(object_version::Column::Bucket.eq(&selected.bucket))
+        .filter(object_version::Column::Key.eq(&selected.key))
+        .count(db)
+        .await?;
+    if version_count != 1 {
+        return Ok(ExactCurrentMarkerDeleteResult::Stale);
+    }
+
+    let mut delete = object_version::Entity::delete_many()
+        .filter(object_version::Column::Id.eq(&selected.id))
+        .filter(object_version::Column::Bucket.eq(&selected.bucket))
+        .filter(object_version::Column::Key.eq(&selected.key))
+        .filter(object_version::Column::Kind.eq("delete_marker"))
+        .filter(object_version::Column::ObjectId.is_null())
+        .filter(object_version::Column::Sequence.eq(selected.sequence))
+        .filter(object_version::Column::IsLatest.eq(true));
+    delete = match selected.version_id.as_deref() {
+        Some(version_id) => delete.filter(object_version::Column::VersionId.eq(version_id)),
+        None => delete.filter(object_version::Column::VersionId.is_null()),
+    };
+    let deleted = delete.exec(db).await?;
+    if deleted.rows_affected == 1 {
+        return Ok(ExactCurrentMarkerDeleteResult::Deleted(
+            DeleteVersionResult {
+                version_id: Some(
+                    selected
+                        .version_id
+                        .clone()
+                        .unwrap_or_else(|| NULL_VERSION_ID.to_owned()),
+                ),
+                deleted_delete_marker: true,
+                created_delete_marker: false,
+            },
+        ));
+    }
+
+    let remaining = object_version::Entity::find()
+        .filter(object_version::Column::Bucket.eq(&selected.bucket))
+        .filter(object_version::Column::Key.eq(&selected.key))
+        .count(db)
+        .await?;
+    if remaining == 0 {
+        return Ok(ExactCurrentMarkerDeleteResult::AlreadySatisfied);
+    }
+    Ok(ExactCurrentMarkerDeleteResult::Stale)
 }
 
 pub(crate) async fn remove_and_promote<C: ConnectionTrait>(
@@ -597,9 +688,15 @@ pub(crate) async fn remove_and_promote<C: ConnectionTrait>(
         super::object::set_only_latest(db, &selected.bucket, &selected.key, None).await?;
         return Ok(None);
     };
+    let now = super::database_clock::database_now(db).await?;
 
     let cleared = object_version::Entity::update_many()
         .col_expr(object_version::Column::IsLatest, Expr::value(false))
+        .col_expr(
+            object_version::Column::BecameNoncurrentAt,
+            Expr::value(Some(now)),
+        )
+        .col_expr(object_version::Column::UpdatedAt, Expr::value(now))
         .filter(object_version::Column::Bucket.eq(&selected.bucket))
         .filter(object_version::Column::Key.eq(&selected.key))
         .filter(object_version::Column::IsLatest.eq(true))
@@ -610,6 +707,11 @@ pub(crate) async fn remove_and_promote<C: ConnectionTrait>(
     }
     let made_latest = object_version::Entity::update_many()
         .col_expr(object_version::Column::IsLatest, Expr::value(true))
+        .col_expr(
+            object_version::Column::BecameNoncurrentAt,
+            Expr::value(None::<DateTime<Utc>>),
+        )
+        .col_expr(object_version::Column::UpdatedAt, Expr::value(now))
         .filter(object_version::Column::Id.eq(&promoted.id))
         .filter(object_version::Column::IsLatest.eq(false))
         .exec(db)
@@ -618,6 +720,8 @@ pub(crate) async fn remove_and_promote<C: ConnectionTrait>(
         return Err(invalid_version_index());
     }
     promoted.is_latest = true;
+    promoted.became_noncurrent_at = None;
+    promoted.updated_at = now;
 
     match version_kind(&promoted)? {
         VersionKind::Object => {

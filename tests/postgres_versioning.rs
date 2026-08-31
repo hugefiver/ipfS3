@@ -498,8 +498,9 @@ async fn postgres_object_versioning_migration_adds_status_table_indexes_and_chec
             "SELECT table_name, column_name, data_type \
              FROM information_schema.columns \
              WHERE table_schema = current_schema() \
-               AND (table_name = 'buckets' AND column_name = 'versioning_status' \
-                    OR table_name = 'object_versions') \
+                AND (table_name = 'buckets' AND column_name = 'versioning_status' \
+                     OR (table_name = 'object_versions' \
+                         AND column_name NOT IN ('lifecycle_age_started_at', 'became_noncurrent_at'))) \
              ORDER BY table_name, ordinal_position",
         ))
         .await
@@ -607,9 +608,9 @@ async fn postgres_object_versioning_migration_adds_status_table_indexes_and_chec
     assert_rejected(
         &fixture.db,
         "INSERT INTO object_versions \
-         (id, bucket, key, version_id, kind, object_id, sequence, is_latest, created_at, updated_at) \
+         (id, bucket, key, version_id, kind, object_id, sequence, is_latest, created_at, updated_at, lifecycle_age_started_at) \
          VALUES ('invalid-marker', 'versioning-bucket', 'invalid', NULL, 'delete_marker', \
-                 'current-a', 1, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+                 'current-a', 1, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
     )
     .await;
     fixture.cleanup().await;
@@ -726,13 +727,13 @@ async fn postgres_object_versioning_down_refuses_public_state_versions_and_marke
     for public_state_statement in [
         "UPDATE buckets SET versioning_status = 'Enabled' WHERE name = 'versioning-bucket'",
         "INSERT INTO object_versions \
-         (id, bucket, key, version_id, kind, object_id, sequence, is_latest, created_at, updated_at) \
+         (id, bucket, key, version_id, kind, object_id, sequence, is_latest, created_at, updated_at, lifecycle_age_started_at) \
          VALUES ('public-version', 'versioning-bucket', 'public', 'opaque-version', 'object', \
-                 'current-a', 1, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+                 'current-a', 1, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
         "INSERT INTO object_versions \
-         (id, bucket, key, version_id, kind, object_id, sequence, is_latest, created_at, updated_at) \
+         (id, bucket, key, version_id, kind, object_id, sequence, is_latest, created_at, updated_at, lifecycle_age_started_at) \
          VALUES ('public-marker', 'versioning-bucket', 'marker', NULL, 'delete_marker', NULL, \
-                 1, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+                 1, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
     ] {
         let Some(fixture) = migrated_fixture().await else {
             return;

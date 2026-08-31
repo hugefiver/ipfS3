@@ -329,8 +329,28 @@ and its encryption metadata. Deleting a version removes only public metadata:
 gateway Kubo pins are retained and `pin/rm` is not called. Bucket deletion
 requires exact removal of every public version and delete marker.
 
-Non-goals: Lifecycle, CORS, MFA Delete, Object Lock, pin reclamation, and
+Non-goals: CORS, MFA Delete, Object Lock, pin reclamation, and
 replication.
+
+## Lifecycle expiration
+
+The [approved expiration design](docs/superpowers/specs/2026-08-26-lifecycle-expiration-design.md)
+and [sanitized LOCAL evidence](docs/lifecycle-expiration-evidence-2026-08-26.log)
+describe the implemented subset. `PutBucketLifecycleConfiguration`,
+`GetBucketLifecycleConfiguration`, and `DeleteBucketLifecycle` support strict,
+atomic replacement of expiration rules with expected-owner enforcement.
+
+Supported actions are current-version `Expiration` by date or days,
+`NoncurrentVersionExpiration` for content and delete markers, and
+`ExpiredObjectDeleteMarker`. Eligibility uses database UTC and UTC-midnight
+semantics. Durable scan/action leases, claim epochs, final policy
+revalidation, and version-aware ownership guards make execution safe across
+multiple gateway replicas. Lifecycle deletion retains Kubo pins and never
+calls `pin/rm`.
+
+`Transition`, `NoncurrentVersionTransition`, and
+`AbortIncompleteMultipartUpload` are not supported; a configuration
+containing any unsupported action is rejected as a whole.
 
 ## Durable `ipfs3-import`
 

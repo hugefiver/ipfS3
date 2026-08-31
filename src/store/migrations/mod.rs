@@ -7,3 +7,4 @@ pub mod m20260729_000002_postgres_utc_timestamps;
 pub mod m20260730_000001_standard_mutation_fence;
 pub mod m20260813_000001_postgres_json_columns;
 pub mod m20260825_000001_object_versioning;
+pub mod m20260826_000001_lifecycle_expiration;

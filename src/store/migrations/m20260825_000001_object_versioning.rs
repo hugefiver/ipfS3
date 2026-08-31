@@ -158,21 +158,28 @@ fn backfill_insert_statement(
 }
 
 #[cfg(test)]
-static BACKFILL_INSERT_INJECTION: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-#[cfg(test)]
-static BACKFILL_INSERT_INJECTION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+tokio::task_local! {
+    static BACKFILL_INSERT_INJECTION: u8;
+}
 
-#[cfg(test)]
-fn set_backfill_insert_injection(mode: u8) {
-    BACKFILL_INSERT_INJECTION.store(mode, std::sync::atomic::Ordering::SeqCst);
+fn backfill_insert_injection_mode() -> u8 {
+    #[cfg(test)]
+    {
+        BACKFILL_INSERT_INJECTION
+            .try_with(|mode| *mode)
+            .unwrap_or_default()
+    }
+    #[cfg(not(test))]
+    {
+        0
+    }
 }
 
 async fn execute_backfill_insert(
     connection: &impl ConnectionTrait,
     statement: Statement,
 ) -> Result<u64, DbErr> {
-    #[cfg(test)]
-    match BACKFILL_INSERT_INJECTION.load(std::sync::atomic::Ordering::SeqCst) {
+    match backfill_insert_injection_mode() {
         1 => {
             return Err(DbErr::Custom(
                 "injected object_versions insert failure".to_owned(),
@@ -284,7 +291,7 @@ async fn apply_down(connection: &impl ConnectionTrait) -> Result<(), DbErr> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{future::Future, sync::Arc, time::Duration};
 
     use sea_orm::{
         ConnectOptions, ConnectionTrait, Database, DatabaseBackend, DatabaseConnection, Statement,
@@ -410,14 +417,6 @@ mod tests {
         })
     }
 
-    struct BackfillInjectionReset;
-
-    impl Drop for BackfillInjectionReset {
-        fn drop(&mut self) {
-            set_backfill_insert_injection(0);
-        }
-    }
-
     async fn legacy_db() -> DatabaseConnection {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         db.execute_unprepared("PRAGMA foreign_keys = ON")
@@ -428,8 +427,11 @@ mod tests {
     }
 
     async fn apply_object_versioning_migration(db: &DatabaseConnection) {
-        let _injection_guard = BACKFILL_INSERT_INJECTION_LOCK.lock().await;
         ObjectVersioningMigrator::up(db, None).await.unwrap();
+    }
+
+    async fn with_backfill_insert_injection<T>(mode: u8, future: impl Future<Output = T>) -> T {
+        BACKFILL_INSERT_INJECTION.scope(mode, future).await
     }
 
     async fn assert_rejected(db: &DatabaseConnection, statement: &str) {
@@ -495,6 +497,58 @@ mod tests {
     async fn assert_failed_migration_rolled_back(db: &DatabaseConnection) {
         assert!(!table_exists(db, "object_versions").await);
         assert!(!bucket_has_versioning_status(db).await);
+    }
+
+    #[tokio::test]
+    async fn object_versioning_injection_scope_does_not_leak_to_an_ordinary_migration() {
+        let injected_db = legacy_db().await;
+        insert_legacy_rows(&injected_db).await;
+        let ordinary_db = legacy_db().await;
+        insert_legacy_rows(&ordinary_db).await;
+        let entered_injection = Arc::new(tokio::sync::Barrier::new(2));
+        let release_injection = Arc::new(tokio::sync::Notify::new());
+
+        let injected_barrier = entered_injection.clone();
+        let injected_release = release_injection.clone();
+        let injected = tokio::spawn(async move {
+            with_backfill_insert_injection(1, async {
+                injected_barrier.wait().await;
+                injected_release.notified().await;
+                ObjectVersioningMigrator::up(&injected_db, None).await
+            })
+            .await
+        });
+        entered_injection.wait().await;
+
+        let ordinary =
+            tokio::spawn(async move { ObjectVersioningMigrator::up(&ordinary_db, None).await });
+        let ordinary_result = ordinary.await.unwrap();
+        release_injection.notify_one();
+        let injected_result = injected.await.unwrap();
+
+        assert!(matches!(
+            injected_result,
+            Err(DbErr::Custom(message)) if message == "injected object_versions insert failure"
+        ));
+        assert!(
+            ordinary_result.is_ok(),
+            "ordinary migration observed an injected mode: {ordinary_result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn object_versioning_injection_scope_is_nestable_and_defaults_to_zero() {
+        assert_eq!(backfill_insert_injection_mode(), 0);
+        with_backfill_insert_injection(1, async {
+            assert_eq!(backfill_insert_injection_mode(), 1);
+            with_backfill_insert_injection(2, async {
+                assert_eq!(backfill_insert_injection_mode(), 2);
+            })
+            .await;
+            assert_eq!(backfill_insert_injection_mode(), 1);
+        })
+        .await;
+        assert_eq!(backfill_insert_injection_mode(), 0);
     }
 
     #[tokio::test]
@@ -680,14 +734,11 @@ mod tests {
 
     #[tokio::test]
     async fn object_versioning_backfill_count_must_match() {
-        let _injection_guard = BACKFILL_INSERT_INJECTION_LOCK.lock().await;
         let db = legacy_db().await;
         insert_legacy_rows(&db).await;
         let transaction = db.begin().await.unwrap();
         let manager = SchemaManager::new(&transaction);
-        set_backfill_insert_injection(2);
-        let result = Migration.up(&manager).await;
-        set_backfill_insert_injection(0);
+        let result = with_backfill_insert_injection(2, Migration.up(&manager)).await;
 
         assert!(matches!(
             result,
@@ -699,12 +750,10 @@ mod tests {
 
     #[tokio::test]
     async fn object_versioning_migration_insert_failure_rolls_back() {
-        let _injection_guard = BACKFILL_INSERT_INJECTION_LOCK.lock().await;
         let db = legacy_db().await;
         insert_legacy_rows(&db).await;
-        set_backfill_insert_injection(1);
-        let result = ObjectVersioningMigrator::up(&db, None).await;
-        set_backfill_insert_injection(0);
+        let result =
+            with_backfill_insert_injection(1, ObjectVersioningMigrator::up(&db, None)).await;
 
         assert!(result.is_err());
         assert_failed_migration_rolled_back(&db).await;
@@ -741,12 +790,8 @@ mod tests {
         .await
         .unwrap();
 
-        let result = {
-            let _injection_guard = BACKFILL_INSERT_INJECTION_LOCK.lock().await;
-            let _injection_reset = BackfillInjectionReset;
-            set_backfill_insert_injection(1);
-            ObjectVersioningMigrator::up(&db, None).await
-        };
+        let result =
+            with_backfill_insert_injection(1, ObjectVersioningMigrator::up(&db, None)).await;
         assert!(matches!(
             result,
             Err(DbErr::Custom(message)) if message == "injected object_versions insert failure"

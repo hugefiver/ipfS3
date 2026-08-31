@@ -15,7 +15,11 @@ pub async fn create_bucket(
     let bucket = &req.input.bucket;
     let db = state.store.db();
 
-    crate::store::bucket::create(db, bucket, None).await?;
+    let owner = req
+        .credentials
+        .as_ref()
+        .map(|credentials| credentials.access_key.as_str());
+    crate::store::bucket::create(db, bucket, owner).await?;
 
     Ok(S3Response::new(CreateBucketOutput::default()))
 }
@@ -149,5 +153,34 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code().as_str(), "NoSuchBucket");
         assert_eq!(error.message(), Some("bucket not found: missing"));
+    }
+
+    #[tokio::test]
+    async fn create_bucket_persists_authenticated_access_key_as_owner() {
+        let state = state_with_bucket().await;
+        let input = CreateBucketInput {
+            bucket: "owned-bucket".to_owned(),
+            ..Default::default()
+        };
+        let request = S3Request {
+            input,
+            method: http::Method::PUT,
+            uri: "/owned-bucket".parse().unwrap(),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: Some(s3s::auth::Credentials {
+                access_key: "owner-key".to_owned(),
+                secret_key: s3s::auth::SecretKey::from("secret"),
+            }),
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+
+        create_bucket(&state, request).await.unwrap();
+        let bucket = crate::store::bucket::get(state.store.db(), "owned-bucket")
+            .await
+            .unwrap();
+        assert_eq!(bucket.owner.as_deref(), Some("owner-key"));
     }
 }

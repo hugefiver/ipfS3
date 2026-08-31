@@ -1,21 +1,18 @@
 use sea_orm::entity::prelude::*;
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
-#[sea_orm(table_name = "object_versions")]
+#[sea_orm(table_name = "bucket_lifecycle_configs")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
-    pub id: String,
     pub bucket: String,
-    pub key: String,
-    pub version_id: Option<String>,
-    pub kind: String,
-    pub object_id: Option<String>,
-    pub sequence: i64,
-    pub is_latest: bool,
-    pub lifecycle_age_started_at: DateTimeUtc,
-    pub became_noncurrent_at: Option<DateTimeUtc>,
+    pub canonical_json: Option<String>,
+    pub revision: i64,
+    pub scan_cursor: Option<String>,
+    pub scan_lease_epoch: i64,
+    pub scan_lease_until: Option<DateTimeUtc>,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
+    pub last_scanned_at: Option<DateTimeUtc>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -26,23 +23,11 @@ pub enum Relation {
         to = "super::bucket::Column::Name"
     )]
     Bucket,
-    #[sea_orm(
-        belongs_to = "super::object::Entity",
-        from = "Column::ObjectId",
-        to = "super::object::Column::Id"
-    )]
-    Object,
 }
 
 impl Related<super::bucket::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Bucket.def()
-    }
-}
-
-impl Related<super::object::Entity> for Entity {
-    fn to() -> RelationDef {
-        Relation::Object.def()
     }
 }
 

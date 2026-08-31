@@ -463,20 +463,7 @@ async fn delete_version_attempt(
                         delete_unversioned_current_in_transaction(txn, &bucket, &key, now).await?
                     }
                     BucketVersioningState::Enabled => {
-                        let _ = crate::store::object_version::allocate_next_sequence(
-                            txn, &bucket, &key,
-                        )
-                        .await?;
-                        let _ = lock_current_object_projection(txn, &bucket, &key).await?;
-                        let version_id = crate::store::object_version::install_delete_marker(
-                            txn, state, &bucket, &key, now,
-                        )
-                        .await?;
-                        DeleteVersionResult {
-                            version_id: Some(version_id),
-                            deleted_delete_marker: false,
-                            created_delete_marker: true,
-                        }
+                        delete_enabled_current_in_transaction(txn, &bucket, &key, now).await?
                     }
                     BucketVersioningState::Suspended => {
                         delete_suspended_current_in_transaction(txn, &bucket, &key, now).await?
@@ -493,7 +480,7 @@ async fn delete_version_attempt(
     .await
 }
 
-async fn delete_unversioned_current_in_transaction<C: ConnectionTrait>(
+pub(crate) async fn delete_unversioned_current_in_transaction<C: ConnectionTrait>(
     db: &C,
     bucket: &str,
     key: &str,
@@ -525,7 +512,28 @@ async fn delete_unversioned_current_in_transaction<C: ConnectionTrait>(
     })
 }
 
-async fn delete_suspended_current_in_transaction<C: ConnectionTrait>(
+pub(crate) async fn delete_enabled_current_in_transaction<C: ConnectionTrait>(
+    db: &C,
+    bucket: &str,
+    key: &str,
+    now: DateTime<Utc>,
+) -> AppResult<DeleteVersionResult> {
+    let version_id = crate::store::object_version::install_delete_marker(
+        db,
+        BucketVersioningState::Enabled,
+        bucket,
+        key,
+        now,
+    )
+    .await?;
+    Ok(DeleteVersionResult {
+        version_id: Some(version_id),
+        deleted_delete_marker: false,
+        created_delete_marker: true,
+    })
+}
+
+pub(crate) async fn delete_suspended_current_in_transaction<C: ConnectionTrait>(
     db: &C,
     bucket: &str,
     key: &str,
@@ -565,7 +573,12 @@ async fn delete_suspended_current_in_transaction<C: ConnectionTrait>(
     })
 }
 
-async fn delete_exact_in_transaction<C: ConnectionTrait>(
+/// Permanently deletes one exact public version inside a caller-owned
+/// transaction. Lifecycle execution calls this only after it has locked and
+/// revalidated the exact internal version-row identity; content ownership is
+/// ended for that selected object only, while delete markers touch no content
+/// ownership records.
+pub(crate) async fn delete_exact_in_transaction<C: ConnectionTrait>(
     db: &C,
     bucket: &str,
     key: &str,
@@ -773,7 +786,7 @@ async fn publish_in_transaction<C: ConnectionTrait>(
     standard_guard: Option<&StandardMutationGuard>,
     import_guard: Option<&ImportPublicationGuard>,
     mut result_rows: Vec<import_job_result::ActiveModel>,
-    import_now: Option<DateTime<Utc>>,
+    _import_now: Option<DateTime<Utc>>,
     limits: &ProviderLimitMap,
 ) -> AppResult<PublicationResult> {
     validate_request(&request)?;
@@ -818,7 +831,6 @@ async fn publish_in_transaction<C: ConnectionTrait>(
     }
     let versioning_state =
         crate::store::bucket::lock_versioning_state(db, &request.object.bucket).await?;
-    let publication_time = import_now.unwrap_or_else(Utc::now);
     let object_id = request.object.id.clone();
 
     let previous_owner_ids =
@@ -829,6 +841,7 @@ async fn publish_in_transaction<C: ConnectionTrait>(
         .map(|(provider, _)| provider.clone())
         .collect();
     quota::lock_publication_usage_rows(db, &attachment_providers).await?;
+    let publication_time = crate::store::database_clock::database_now(db).await?;
 
     let mut publication_result = None;
     for object in ordered_publication_objects(&request.object, &entries) {
@@ -857,7 +870,7 @@ async fn publish_in_transaction<C: ConnectionTrait>(
         .await?;
     }
     if let Some(guard) = standard_guard {
-        complete_standard_mutation_in_transaction(db, guard, Utc::now()).await?;
+        complete_standard_mutation_in_transaction(db, guard, publication_time).await?;
     }
     if let Some(guard) = import_guard {
         for result in &mut result_rows {
@@ -875,7 +888,7 @@ async fn publish_in_transaction<C: ConnectionTrait>(
             guard,
             &request.object.cid,
             request.object.logical_size,
-            Utc::now(),
+            publication_time,
         )
         .await?;
     }
@@ -1067,8 +1080,10 @@ async fn write_object_version_and_update_lifecycle<C: ConnectionTrait>(
             lock_null_object_id(db, &object.bucket, &object.key).await?
         }
     };
+    let mut immutable_object = object.latest_row();
+    immutable_object.created_at = now;
     let inserted =
-        crate::store::object::insert_immutable_in_transaction(db, object.latest_row()).await?;
+        crate::store::object::insert_immutable_in_transaction(db, immutable_object).await?;
     if let Some(displaced_object_id) = displaced_object_id {
         leases::end_active_leases_for_object(db, &displaced_object_id, now).await?;
         tags::replace_object_tags(db, &displaced_object_id, &[]).await?;

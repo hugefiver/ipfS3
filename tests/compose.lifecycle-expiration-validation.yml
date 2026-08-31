@@ -1,0 +1,107 @@
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: ipfs3
+      POSTGRES_USER: ipfs3
+      POSTGRES_PASSWORD: ipfs3
+    ports:
+      - "127.0.0.1:${IPFS_S3_LIFECYCLE_POSTGRES_PORT:?required}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ipfs3 -d ipfs3"]
+      interval: 1s
+      timeout: 5s
+      retries: 30
+
+  kubo:
+    image: ghcr.io/hugefiver/ipfs3-kubo:latest
+    environment:
+      IPFS_PATH: /data/ipfs
+    ports:
+      - "127.0.0.1:${IPFS_S3_LIFECYCLE_KUBO_PORT:?required}:5001"
+    volumes:
+      - kubo_data:/data/ipfs
+    healthcheck:
+      test: ["CMD", "ipfs", "id"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+
+  gateway-a:
+    image: "${IPFS_S3_LIFECYCLE_IMAGE:?required}"
+    environment:
+      IPFS_S3_BIND: 0.0.0.0:9000
+      IPFS_S3_KUBO_RPC_URL: http://kubo:5001
+      IPFS_S3_DATABASE_URL: postgres://ipfs3:ipfs3@postgres:5432/ipfs3
+      IPFS_S3_ACCESS_KEY_ID: test
+      IPFS_S3_SECRET_ACCESS_KEY: test
+      IPFS_S3_MASTER_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      IPFS_S3_LIFECYCLE_POLL_INTERVAL_MS: "100"
+      IPFS_S3_LIFECYCLE_SCAN_LEASE_SECS: "3"
+      IPFS_S3_LIFECYCLE_ACTION_LEASE_SECS: "3"
+      RUST_LOG: info
+    ports:
+      - "127.0.0.1:${IPFS_S3_LIFECYCLE_GATEWAY_A_PORT:?required}:9000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kubo:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/ipfs-s3-gateway", "--ready-probe"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  gateway-b:
+    image: "${IPFS_S3_LIFECYCLE_IMAGE:?required}"
+    environment:
+      IPFS_S3_BIND: 0.0.0.0:9000
+      IPFS_S3_KUBO_RPC_URL: http://kubo:5001
+      IPFS_S3_DATABASE_URL: postgres://ipfs3:ipfs3@postgres:5432/ipfs3
+      IPFS_S3_ACCESS_KEY_ID: test
+      IPFS_S3_SECRET_ACCESS_KEY: test
+      IPFS_S3_MASTER_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      IPFS_S3_LIFECYCLE_POLL_INTERVAL_MS: "100"
+      IPFS_S3_LIFECYCLE_SCAN_LEASE_SECS: "3"
+      IPFS_S3_LIFECYCLE_ACTION_LEASE_SECS: "3"
+      RUST_LOG: info
+    ports:
+      - "127.0.0.1:${IPFS_S3_LIFECYCLE_GATEWAY_B_PORT:?required}:9000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kubo:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/ipfs-s3-gateway", "--ready-probe"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  load-balancer:
+    image: nginx:1.28.0-alpine
+    ports:
+      - "127.0.0.1:${IPFS_S3_LIFECYCLE_LOAD_BALANCER_PORT:?required}:9000"
+    volumes:
+      - ../deploy/nginx/multi-gateway.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      gateway-a:
+        condition: service_healthy
+      gateway-b:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:9000/ready | grep -qx READY"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+volumes:
+  postgres_data:
+  kubo_data:

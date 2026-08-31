@@ -1,9 +1,11 @@
 pub mod bucket;
+pub mod bucket_lifecycle_config;
 pub mod import_destination;
 pub mod import_job;
 pub mod import_job_result;
 pub mod import_job_target;
 pub mod import_prefix_claim;
+pub mod lifecycle_action;
 pub mod multipart_part;
 pub mod multipart_upload;
 pub mod object;

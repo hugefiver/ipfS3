@@ -138,6 +138,7 @@ pub enum SupersedeReason {
     CompleteMultipartUpload,
     DecompressZip,
     DeleteBucket,
+    LifecycleExpiration,
 }
 
 impl SupersedeReason {
@@ -150,6 +151,7 @@ impl SupersedeReason {
             Self::CompleteMultipartUpload => "complete_multipart_upload",
             Self::DecompressZip => "decompress_zip",
             Self::DeleteBucket => "delete_bucket",
+            Self::LifecycleExpiration => "lifecycle_expiration",
         }
     }
 }
@@ -248,7 +250,7 @@ pub enum ImportExecutionError {
 
 #[cfg(test)]
 mod tests {
-    use super::{ImportPhase, ImportState};
+    use super::{ImportPhase, ImportState, SupersedeReason};
 
     #[test]
     fn import_model_uses_stable_state_and_phase_strings() {
@@ -283,5 +285,13 @@ mod tests {
         ] {
             assert!(terminal.validate_transition(ImportState::Running).is_err());
         }
+    }
+
+    #[test]
+    fn lifecycle_expiration_has_a_stable_supersede_reason() {
+        assert_eq!(
+            SupersedeReason::LifecycleExpiration.as_str(),
+            "lifecycle_expiration"
+        );
     }
 }

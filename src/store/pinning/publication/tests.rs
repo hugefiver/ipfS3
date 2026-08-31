@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sea_orm::{
     ColumnTrait, ConnectOptions, ConnectionTrait, Database, DatabaseBackend, DatabaseConnection,
     EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, Statement, TransactionTrait,
@@ -10,26 +10,34 @@ use super::*;
 use crate::{
     error::AppError,
     import::{ImportSource, SupersedeReason},
+    lifecycle::{
+        actions::{
+            LifecycleAdmissionResult, admit_lifecycle_expiration, execute_lifecycle_delete_guarded,
+        },
+        model::{GuardedLifecycleExecutionResult, LifecycleActionKind, VersionTargetIdentity},
+    },
     pinning::{
         config::{LeaseDuration, ProviderLimitMap, ProviderLimits, ProviderMode},
         policy::{LeaseIntent, LeaseSource, PublicationPolicy},
         tags::{ContentMode, ObjectTag},
     },
     store::{
+        database_clock::database_now,
         entities::{
-            import_destination, import_job, import_job_result, import_job_target, object,
-            object_tag, object_version, pin_job, pin_lease, pin_lease_target, pin_provider_usage,
-            remote_pin,
+            import_destination, import_job, import_job_result, import_job_target, lifecycle_action,
+            object, object_tag, object_version, pin_job, pin_lease, pin_lease_target,
+            pin_provider_usage, remote_pin,
         },
         import::{
             jobs::{NewImportJob, claim_due},
             ownership::{
                 ExpectedImportTarget, ImportPublicationGuard, admit_content_mutation,
-                admit_content_mutations, claim_extracted_target, submit,
+                admit_content_mutations, claim_extracted_target,
+                complete_standard_mutation_in_transaction, submit,
             },
         },
         multipart::{self, CommitCompletedUploadError},
-        object_version::{BucketVersioningState, PublicVersionId, VersionSelector},
+        object_version::{BucketVersioningState, PublicVersionId, VersionKind, VersionSelector},
     },
 };
 
@@ -300,6 +308,911 @@ async fn assert_version_projection_agrees(db: &DatabaseConnection, key: &str) {
             crate::store::object::get_latest(db, "bucket", key).await,
             Err(AppError::NoSuchKey(_))
         )),
+    }
+}
+
+fn lifecycle_target(version: &object_version::Model) -> VersionTargetIdentity {
+    VersionTargetIdentity {
+        bucket: version.bucket.clone(),
+        key: version.key.clone(),
+        version_row_id: version.id.clone(),
+        public_version_id: match version.version_id.as_deref() {
+            Some(version_id) => PublicVersionId::parse_s3(version_id).unwrap(),
+            None => PublicVersionId::Null,
+        },
+        kind: match version.kind.as_str() {
+            "object" => VersionKind::Object,
+            "delete_marker" => VersionKind::DeleteMarker,
+            kind => panic!("unexpected version kind {kind}"),
+        },
+        object_id: version.object_id.clone(),
+        sequence: version.sequence,
+    }
+}
+
+async fn lifecycle_action_snapshot(db: &DatabaseConnection) -> Vec<lifecycle_action::Model> {
+    lifecycle_action::Entity::find()
+        .order_by_asc(lifecycle_action::Column::Id)
+        .all(db)
+        .await
+        .unwrap()
+}
+
+async fn execute_lifecycle_current_expiration(
+    db: &DatabaseConnection,
+    target: &VersionTargetIdentity,
+    action_kind: LifecycleActionKind,
+    now: DateTime<Utc>,
+) -> AppResult<GuardedLifecycleExecutionResult> {
+    let guard = match admit_lifecycle_expiration(db, target, "publication-test", 1, now).await? {
+        LifecycleAdmissionResult::Admitted(guard) => guard,
+        LifecycleAdmissionResult::Stale => return Ok(GuardedLifecycleExecutionResult::Stale),
+        LifecycleAdmissionResult::Temporary => {
+            return Err(AppError::Database(
+                "lifecycle admission is temporarily unavailable".to_owned(),
+            ));
+        }
+    };
+    let txn = db.begin().await?;
+    let result = execute_lifecycle_delete_guarded(&txn, target, action_kind, &guard, now).await;
+    match result {
+        Ok(result) => {
+            if result == GuardedLifecycleExecutionResult::Stale {
+                complete_standard_mutation_in_transaction(&txn, &guard, now).await?;
+            }
+            txn.commit().await?;
+            Ok(result)
+        }
+        Err(error) => {
+            txn.rollback().await?;
+            Err(error)
+        }
+    }
+}
+
+#[tokio::test]
+async fn lifecycle_current_expiration_applies_each_current_versioning_state() {
+    let db = setup().await;
+
+    publish_object(
+        &db,
+        automatic_and_manual_request("unversioned-current", "unversioned", "bafy-shared"),
+        &limits(),
+    )
+    .await
+    .unwrap();
+    publish_object(
+        &db,
+        automatic_and_manual_request("shared-other", "shared", "bafy-shared"),
+        &limits(),
+    )
+    .await
+    .unwrap();
+    let unversioned_target = lifecycle_target(&versions_for(&db, "unversioned").await.remove(0));
+    let actions_before = lifecycle_action_snapshot(&db).await;
+    let now = database_now(&db).await.unwrap();
+    assert_eq!(
+        execute_lifecycle_current_expiration(
+            &db,
+            &unversioned_target,
+            LifecycleActionKind::ExpireCurrent,
+            now,
+        )
+        .await
+        .unwrap(),
+        GuardedLifecycleExecutionResult::Applied(
+            crate::store::object_version::DeleteVersionResult {
+                version_id: None,
+                deleted_delete_marker: false,
+                created_delete_marker: false,
+            }
+        )
+    );
+    assert!(versions_for(&db, "unversioned").await.is_empty());
+    assert!(matches!(
+        crate::store::object::get_latest(&db, "bucket", "unversioned").await,
+        Err(AppError::NoSuchKey(_))
+    ));
+    assert_eq!(
+        object_tag::Entity::find()
+            .filter(object_tag::Column::ObjectId.eq("unversioned-current"))
+            .count(&db)
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(
+        pin_lease::Entity::find()
+            .filter(pin_lease::Column::OwnerObjectId.eq("unversioned-current"))
+            .all(&db)
+            .await
+            .unwrap()
+            .iter()
+            .all(|lease| lease.state == "cancelled")
+    );
+    assert_eq!(
+        crate::store::object::get_latest(&db, "bucket", "shared")
+            .await
+            .unwrap()
+            .id,
+        "shared-other"
+    );
+    assert!(
+        pin_lease::Entity::find()
+            .filter(pin_lease::Column::OwnerObjectId.eq("shared-other"))
+            .all(&db)
+            .await
+            .unwrap()
+            .iter()
+            .all(|lease| lease.state == "active")
+    );
+    assert_eq!(lifecycle_action_snapshot(&db).await, actions_before);
+
+    set_versioning(&db, BucketVersioningState::Enabled).await;
+    let mut enabled_historical =
+        automatic_and_manual_request("enabled-sse-s3", "enabled", "bafy-enabled-historical");
+    enabled_historical.object.encrypted = true;
+    enabled_historical.object.key_wrap = Some("wrapped-enabled-key".to_owned());
+    publish_object(&db, enabled_historical, &limits())
+        .await
+        .unwrap();
+    let mut enabled_current =
+        automatic_and_manual_request("enabled-sse-c", "enabled", "bafy-enabled-current");
+    enabled_current.object.encrypted = true;
+    enabled_current.object.sse_c_key_fingerprint = Some("sse-c-fingerprint".to_owned());
+    publish_object(&db, enabled_current, &limits())
+        .await
+        .unwrap();
+    let enabled_target = lifecycle_target(
+        versions_for(&db, "enabled")
+            .await
+            .iter()
+            .find(|version| version.is_latest)
+            .unwrap(),
+    );
+    let actions_before = lifecycle_action_snapshot(&db).await;
+    let now = database_now(&db).await.unwrap();
+    assert!(matches!(
+        execute_lifecycle_current_expiration(
+            &db,
+            &enabled_target,
+            LifecycleActionKind::ExpireCurrent,
+            now,
+        )
+        .await
+        .unwrap(),
+        GuardedLifecycleExecutionResult::Applied(ref result)
+            if result.created_delete_marker && !result.deleted_delete_marker
+    ));
+    let enabled = versions_for(&db, "enabled").await;
+    assert_eq!(enabled.len(), 3);
+    let demoted = enabled
+        .iter()
+        .find(|version| version.id == enabled_target.version_row_id)
+        .unwrap();
+    assert!(!demoted.is_latest);
+    assert_eq!(demoted.became_noncurrent_at, Some(now));
+    let marker = enabled.iter().find(|version| version.is_latest).unwrap();
+    assert_eq!(marker.kind, "delete_marker");
+    assert!(matches!(
+        marker.version_id.as_deref().map(PublicVersionId::parse_s3),
+        Some(Ok(PublicVersionId::Opaque(_)))
+    ));
+    let retained = crate::store::object::get_by_id(&db, "enabled-sse-s3")
+        .await
+        .unwrap();
+    assert_eq!(retained.key_wrap.as_deref(), Some("wrapped-enabled-key"));
+    let demoted_object = crate::store::object::get_by_id(&db, "enabled-sse-c")
+        .await
+        .unwrap();
+    assert_eq!(
+        demoted_object.sse_c_key_fingerprint.as_deref(),
+        Some("sse-c-fingerprint")
+    );
+    for object_id in ["enabled-sse-s3", "enabled-sse-c"] {
+        assert_eq!(
+            object_tag::Entity::find()
+                .filter(object_tag::Column::ObjectId.eq(object_id))
+                .count(&db)
+                .await
+                .unwrap(),
+            3
+        );
+        assert!(
+            pin_lease::Entity::find()
+                .filter(pin_lease::Column::OwnerObjectId.eq(object_id))
+                .all(&db)
+                .await
+                .unwrap()
+                .iter()
+                .all(|lease| lease.state == "active")
+        );
+    }
+    assert_eq!(lifecycle_action_snapshot(&db).await, actions_before);
+
+    publish_object(
+        &db,
+        automatic_and_manual_request("suspended-opaque", "suspended", "bafy-suspended-opaque"),
+        &limits(),
+    )
+    .await
+    .unwrap();
+    set_versioning(&db, BucketVersioningState::Suspended).await;
+    let mut suspended_current =
+        automatic_and_manual_request("suspended-sse-c", "suspended", "bafy-suspended-current");
+    suspended_current.object.encrypted = true;
+    suspended_current.object.sse_c_key_fingerprint = Some("suspended-sse-c".to_owned());
+    publish_object(&db, suspended_current, &limits())
+        .await
+        .unwrap();
+    let suspended_target = lifecycle_target(
+        versions_for(&db, "suspended")
+            .await
+            .iter()
+            .find(|version| version.is_latest)
+            .unwrap(),
+    );
+    let actions_before = lifecycle_action_snapshot(&db).await;
+    let now = database_now(&db).await.unwrap();
+    assert!(matches!(
+        execute_lifecycle_current_expiration(
+            &db,
+            &suspended_target,
+            LifecycleActionKind::ExpireCurrent,
+            now,
+        )
+        .await
+        .unwrap(),
+        GuardedLifecycleExecutionResult::Applied(ref result)
+            if result.created_delete_marker && result.version_id.as_deref() == Some("null")
+    ));
+    let suspended = versions_for(&db, "suspended").await;
+    assert_eq!(suspended.len(), 2);
+    let suspended_marker = suspended.iter().find(|version| version.is_latest).unwrap();
+    assert_eq!(suspended_marker.kind, "delete_marker");
+    assert!(suspended_marker.version_id.is_none());
+    let suspended_retained = suspended.iter().find(|version| !version.is_latest).unwrap();
+    assert_eq!(
+        suspended_retained.object_id.as_deref(),
+        Some("suspended-opaque")
+    );
+    assert_eq!(
+        crate::store::object::get_by_id(&db, "suspended-sse-c")
+            .await
+            .unwrap()
+            .sse_c_key_fingerprint
+            .as_deref(),
+        Some("suspended-sse-c")
+    );
+    assert_eq!(
+        object_tag::Entity::find()
+            .filter(object_tag::Column::ObjectId.eq("suspended-sse-c"))
+            .count(&db)
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(
+        pin_lease::Entity::find()
+            .filter(pin_lease::Column::OwnerObjectId.eq("suspended-sse-c"))
+            .all(&db)
+            .await
+            .unwrap()
+            .iter()
+            .all(|lease| lease.state == "cancelled")
+    );
+    assert_eq!(
+        object_tag::Entity::find()
+            .filter(object_tag::Column::ObjectId.eq("suspended-opaque"))
+            .count(&db)
+            .await
+            .unwrap(),
+        3
+    );
+    assert!(
+        pin_lease::Entity::find()
+            .filter(pin_lease::Column::OwnerObjectId.eq("suspended-opaque"))
+            .all(&db)
+            .await
+            .unwrap()
+            .iter()
+            .all(|lease| lease.state == "active")
+    );
+    assert_eq!(lifecycle_action_snapshot(&db).await, actions_before);
+}
+
+#[tokio::test]
+async fn lifecycle_current_expiration_rejects_stale_targets_without_action_writes() {
+    let db = setup().await;
+    set_versioning(&db, BucketVersioningState::Enabled).await;
+    publish_object(
+        &db,
+        request(
+            object("stale-first", "stale", "bafy-stale-first", 7),
+            vec![],
+            vec![],
+        ),
+        &limits(),
+    )
+    .await
+    .unwrap();
+    let target = lifecycle_target(
+        versions_for(&db, "stale")
+            .await
+            .iter()
+            .find(|version| version.is_latest)
+            .unwrap(),
+    );
+
+    let mut stale_targets = Vec::new();
+    let mut row_id = target.clone();
+    row_id.version_row_id = uuid::Uuid::new_v4().to_string();
+    stale_targets.push(row_id);
+    let mut public_id = target.clone();
+    public_id.public_version_id = PublicVersionId::Opaque(uuid::Uuid::new_v4().to_string());
+    stale_targets.push(public_id);
+    let mut kind = target.clone();
+    kind.kind = VersionKind::DeleteMarker;
+    kind.object_id = None;
+    stale_targets.push(kind);
+    let mut object_id = target.clone();
+    object_id.object_id = Some("other-object".to_owned());
+    stale_targets.push(object_id);
+    let mut sequence = target.clone();
+    sequence.sequence += 1;
+    stale_targets.push(sequence);
+
+    for stale_target in stale_targets {
+        let actions_before = lifecycle_action_snapshot(&db).await;
+        assert_eq!(
+            execute_lifecycle_current_expiration(
+                &db,
+                &stale_target,
+                LifecycleActionKind::ExpireCurrent,
+                database_now(&db).await.unwrap(),
+            )
+            .await
+            .unwrap(),
+            GuardedLifecycleExecutionResult::Stale
+        );
+        assert_eq!(lifecycle_action_snapshot(&db).await, actions_before);
+    }
+
+    publish_object(
+        &db,
+        request(
+            object("stale-second", "stale", "bafy-stale-second", 9),
+            vec![],
+            vec![],
+        ),
+        &limits(),
+    )
+    .await
+    .unwrap();
+    let actions_before = lifecycle_action_snapshot(&db).await;
+    assert_eq!(
+        execute_lifecycle_current_expiration(
+            &db,
+            &target,
+            LifecycleActionKind::ExpireCurrent,
+            database_now(&db).await.unwrap(),
+        )
+        .await
+        .unwrap(),
+        GuardedLifecycleExecutionResult::Stale
+    );
+    assert_eq!(lifecycle_action_snapshot(&db).await, actions_before);
+
+    let current = lifecycle_target(
+        versions_for(&db, "stale")
+            .await
+            .iter()
+            .find(|version| version.is_latest)
+            .unwrap(),
+    );
+    let actions_before = lifecycle_action_snapshot(&db).await;
+    assert_eq!(
+        execute_lifecycle_current_expiration(
+            &db,
+            &current,
+            LifecycleActionKind::ExpireNoncurrent,
+            database_now(&db).await.unwrap(),
+        )
+        .await
+        .unwrap(),
+        GuardedLifecycleExecutionResult::Stale,
+        "a current target cannot satisfy exact noncurrent expiration"
+    );
+    assert_eq!(lifecycle_action_snapshot(&db).await, actions_before);
+
+    publish_object(
+        &db,
+        request(
+            object("missing-target", "missing", "bafy-missing", 7),
+            vec![],
+            vec![],
+        ),
+        &limits(),
+    )
+    .await
+    .unwrap();
+    let missing_target = lifecycle_target(&versions_for(&db, "missing").await.remove(0));
+    object_version::Entity::delete_by_id(missing_target.version_row_id.clone())
+        .exec(&db)
+        .await
+        .unwrap();
+    let actions_before = lifecycle_action_snapshot(&db).await;
+    assert_eq!(
+        execute_lifecycle_current_expiration(
+            &db,
+            &missing_target,
+            LifecycleActionKind::ExpireCurrent,
+            database_now(&db).await.unwrap(),
+        )
+        .await
+        .unwrap(),
+        GuardedLifecycleExecutionResult::Stale
+    );
+    assert_eq!(lifecycle_action_snapshot(&db).await, actions_before);
+}
+
+#[tokio::test]
+async fn lifecycle_current_expiration_deletes_only_a_sole_current_marker() {
+    let db = setup().await;
+    set_versioning(&db, BucketVersioningState::Enabled).await;
+    let content_version = publish_object(
+        &db,
+        automatic_and_manual_request("marker-owner", "marker", "bafy-marker"),
+        &limits(),
+    )
+    .await
+    .unwrap()
+    .version_id
+    .unwrap();
+    let marker = guarded_delete(&db, "marker", VersionSelector::Current, Utc::now())
+        .await
+        .unwrap()
+        .version_id
+        .unwrap();
+    guarded_delete(
+        &db,
+        "marker",
+        VersionSelector::Exact(PublicVersionId::parse_s3(&content_version).unwrap()),
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+    let marker_target = lifecycle_target(
+        versions_for(&db, "marker")
+            .await
+            .iter()
+            .find(|version| version.version_id.as_deref() == Some(marker.as_str()))
+            .unwrap(),
+    );
+    let leases_before = pin_lease::Entity::find()
+        .order_by_asc(pin_lease::Column::Id)
+        .all(&db)
+        .await
+        .unwrap();
+    let tags_before = crate::store::pinning::tags::list_object_tags(&db, "marker-owner")
+        .await
+        .unwrap();
+    let actions_before = lifecycle_action_snapshot(&db).await;
+    assert!(matches!(
+        execute_lifecycle_current_expiration(
+            &db,
+            &marker_target,
+            LifecycleActionKind::DeleteExpiredMarker,
+            database_now(&db).await.unwrap(),
+        )
+        .await
+        .unwrap(),
+        GuardedLifecycleExecutionResult::Applied(ref result)
+            if result.deleted_delete_marker && !result.created_delete_marker
+    ));
+    assert!(versions_for(&db, "marker").await.is_empty());
+    assert!(matches!(
+        crate::store::object::get_latest(&db, "bucket", "marker").await,
+        Err(AppError::NoSuchKey(_))
+    ));
+    assert_eq!(
+        pin_lease::Entity::find()
+            .order_by_asc(pin_lease::Column::Id)
+            .all(&db)
+            .await
+            .unwrap(),
+        leases_before
+    );
+    assert_eq!(
+        crate::store::pinning::tags::list_object_tags(&db, "marker-owner")
+            .await
+            .unwrap(),
+        tags_before
+    );
+    assert_eq!(lifecycle_action_snapshot(&db).await, actions_before);
+}
+
+#[tokio::test]
+async fn lifecycle_current_expiration_reports_already_satisfied_only_after_exact_marker_delete() {
+    let db = setup().await;
+    set_versioning(&db, BucketVersioningState::Enabled).await;
+    let content_version = publish_object(
+        &db,
+        request(
+            object("already-owner", "already", "bafy-already", 7),
+            vec![],
+            vec![],
+        ),
+        &limits(),
+    )
+    .await
+    .unwrap()
+    .version_id
+    .unwrap();
+    let marker = guarded_delete(&db, "already", VersionSelector::Current, Utc::now())
+        .await
+        .unwrap()
+        .version_id
+        .unwrap();
+    guarded_delete(
+        &db,
+        "already",
+        VersionSelector::Exact(PublicVersionId::parse_s3(&content_version).unwrap()),
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+    let target = lifecycle_target(
+        versions_for(&db, "already")
+            .await
+            .iter()
+            .find(|version| version.version_id.as_deref() == Some(marker.as_str()))
+            .unwrap(),
+    );
+    db.execute_unprepared(&format!(
+        "CREATE TRIGGER complete_exact_marker_delete BEFORE DELETE ON object_versions \
+         WHEN OLD.id = '{}' BEGIN \
+         DELETE FROM object_versions WHERE id = OLD.id; \
+         SELECT RAISE(IGNORE); END;",
+        target.version_row_id
+    ))
+    .await
+    .unwrap();
+    let actions_before = lifecycle_action_snapshot(&db).await;
+    assert_eq!(
+        execute_lifecycle_current_expiration(
+            &db,
+            &target,
+            LifecycleActionKind::DeleteExpiredMarker,
+            database_now(&db).await.unwrap(),
+        )
+        .await
+        .unwrap(),
+        GuardedLifecycleExecutionResult::AlreadySatisfied
+    );
+    assert!(versions_for(&db, "already").await.is_empty());
+    assert_eq!(lifecycle_action_snapshot(&db).await, actions_before);
+}
+
+#[tokio::test]
+async fn lifecycle_timestamp_publication_demotion_and_promotion_use_database_time() {
+    let db = setup().await;
+    set_versioning(&db, BucketVersioningState::Enabled).await;
+    let supplied_historical_time = Utc::now() - chrono::Duration::days(30);
+
+    let mut first = object(
+        "lifecycle-time-first",
+        "lifecycle-time-key",
+        "bafy-time-first",
+        7,
+    );
+    first.created_at = supplied_historical_time;
+    let first_version_id = publish_object(&db, request(first, vec![], vec![]), &limits())
+        .await
+        .unwrap()
+        .version_id
+        .unwrap();
+
+    let mut second = object(
+        "lifecycle-time-second",
+        "lifecycle-time-key",
+        "bafy-time-second",
+        9,
+    );
+    second.created_at = supplied_historical_time;
+    let second_version_id = publish_object(&db, request(second, vec![], vec![]), &limits())
+        .await
+        .unwrap()
+        .version_id
+        .unwrap();
+
+    let inserted = object::Entity::find_by_id("lifecycle-time-second")
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    let versions = versions_for(&db, "lifecycle-time-key").await;
+    let first = versions
+        .iter()
+        .find(|version| version.version_id.as_deref() == Some(first_version_id.as_str()))
+        .unwrap();
+    let second = versions
+        .iter()
+        .find(|version| version.version_id.as_deref() == Some(second_version_id.as_str()))
+        .unwrap();
+
+    assert_ne!(inserted.created_at, supplied_historical_time);
+    assert_eq!(inserted.created_at, second.created_at);
+    assert_eq!(second.created_at, second.lifecycle_age_started_at);
+    assert_eq!(first.became_noncurrent_at, Some(second.created_at));
+    assert_eq!(first.updated_at, second.created_at);
+    assert!(second.is_latest);
+    assert_eq!(second.became_noncurrent_at, None);
+
+    db.execute_unprepared(
+        "UPDATE object_versions SET became_noncurrent_at = '2020-01-01T00:00:00Z' \
+         WHERE id = 'lifecycle-time-first'",
+    )
+    .await
+    .unwrap();
+    let guard = admit_content_mutation(
+        &db,
+        "bucket",
+        "lifecycle-time-key",
+        None,
+        SupersedeReason::DeleteObject,
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+    delete_version_with_leases_guarded(
+        &db,
+        "bucket",
+        "lifecycle-time-key",
+        VersionSelector::Exact(PublicVersionId::parse_s3(&second_version_id).unwrap()),
+        guard,
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+
+    let promoted = versions_for(&db, "lifecycle-time-key")
+        .await
+        .into_iter()
+        .find(|version| version.is_latest)
+        .unwrap();
+    assert_eq!(promoted.object_id.as_deref(), Some("lifecycle-time-first"));
+    assert_eq!(promoted.became_noncurrent_at, None);
+}
+
+async fn assert_lifecycle_timestamp_for_publication(
+    db: &DatabaseConnection,
+    object_id: &str,
+    supplied_historical_time: chrono::DateTime<Utc>,
+) {
+    let stored = object::Entity::find_by_id(object_id)
+        .one(db)
+        .await
+        .unwrap()
+        .unwrap();
+    let versions = object_version::Entity::find()
+        .filter(object_version::Column::ObjectId.eq(object_id))
+        .all(db)
+        .await
+        .unwrap();
+    assert_eq!(versions.len(), 1, "object {object_id}");
+    let version = &versions[0];
+    assert_ne!(
+        stored.created_at, supplied_historical_time,
+        "object {object_id}"
+    );
+    assert_eq!(stored.created_at, version.created_at, "object {object_id}");
+    assert_eq!(
+        version.created_at, version.lifecycle_age_started_at,
+        "object {object_id}"
+    );
+    assert_eq!(version.became_noncurrent_at, None, "object {object_id}");
+}
+
+#[tokio::test]
+async fn lifecycle_timestamp_all_publication_producers_share_the_database_clock() {
+    let db = setup().await;
+    let supplied_historical_time = Utc::now() - chrono::Duration::days(365);
+    let historical = |id: &str, key: &str, cid: &str, size: i64| {
+        let mut publication = object(id, key, cid, size);
+        publication.created_at = supplied_historical_time;
+        publication
+    };
+
+    publish_object(
+        &db,
+        request(
+            historical("timestamp-put", "timestamp-put", "bafy-timestamp-put", 7),
+            vec![],
+            vec![],
+        ),
+        &limits(),
+    )
+    .await
+    .unwrap();
+
+    let copy_guard = admit_content_mutation(
+        &db,
+        "bucket",
+        "timestamp-copy",
+        None,
+        SupersedeReason::CopyObject,
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+    publish_standard_object(
+        &db,
+        request(
+            historical("timestamp-copy", "timestamp-copy", "bafy-timestamp-copy", 7),
+            vec![],
+            vec![],
+        ),
+        copy_guard,
+        &limits(),
+    )
+    .await
+    .unwrap();
+
+    seed_upload(&db, "timestamp-multipart-upload", "timestamp-multipart").await;
+    let mut multipart_object = historical(
+        "timestamp-multipart",
+        "timestamp-multipart",
+        "bafy-timestamp-multipart",
+        7,
+    );
+    multipart_object.multipart = true;
+    publish_completed_upload(
+        &db,
+        "timestamp-multipart-upload",
+        request(multipart_object, vec![], vec![]),
+        &limits(),
+    )
+    .await
+    .unwrap();
+
+    publish_zip(
+        &db,
+        ZipPublicationRequest {
+            archive: request(
+                historical(
+                    "timestamp-direct-zip",
+                    "timestamp-direct-zip.zip",
+                    "bafy-timestamp-direct-zip",
+                    7,
+                ),
+                vec![],
+                vec![],
+            ),
+            entries: vec![historical(
+                "timestamp-direct-zip-entry",
+                "timestamp-direct-zip-entry.txt",
+                "bafy-timestamp-direct-zip-entry",
+                3,
+            )],
+        },
+        &limits(),
+    )
+    .await
+    .unwrap();
+
+    let import_now = Utc::now();
+    let import_claim =
+        claimed_import(&db, "timestamp-import-job", "timestamp-import", import_now).await;
+    let import_destination = import_destination::Entity::find_by_id((
+        "bucket".to_owned(),
+        "timestamp-import".to_owned(),
+    ))
+    .one(&db)
+    .await
+    .unwrap()
+    .unwrap();
+    publish_import_object(
+        &db,
+        request(
+            historical(
+                "timestamp-import",
+                "timestamp-import",
+                "bafy-timestamp-import",
+                7,
+            ),
+            vec![],
+            vec![],
+        ),
+        ImportPublicationGuard {
+            job_id: import_claim.job_id,
+            worker_id: import_claim.worker_id,
+            claim_epoch: import_claim.claim_epoch,
+            targets: vec![ExpectedImportTarget {
+                bucket: "bucket".to_owned(),
+                key: "timestamp-import".to_owned(),
+                generation: import_destination.generation,
+            }],
+        },
+        vec![],
+        supplied_historical_time,
+        &limits(),
+    )
+    .await
+    .unwrap();
+
+    let import_zip_now = Utc::now();
+    let import_zip_claim = claimed_import(
+        &db,
+        "timestamp-import-zip-job",
+        "timestamp-import-zip.zip",
+        import_zip_now,
+    )
+    .await;
+    let entry_generation = claim_extracted_target(
+        &db,
+        &import_zip_claim,
+        "bucket",
+        "timestamp-import-zip-entry.txt",
+        import_zip_now,
+    )
+    .await
+    .unwrap();
+    publish_import_zip(
+        &db,
+        ZipPublicationRequest {
+            archive: request(
+                historical(
+                    "timestamp-import-zip",
+                    "timestamp-import-zip.zip",
+                    "bafy-timestamp-import-zip",
+                    7,
+                ),
+                vec![],
+                vec![],
+            ),
+            entries: vec![historical(
+                "timestamp-import-zip-entry",
+                "timestamp-import-zip-entry.txt",
+                "bafy-timestamp-import-zip-entry",
+                3,
+            )],
+        },
+        ImportPublicationGuard {
+            job_id: import_zip_claim.job_id,
+            worker_id: import_zip_claim.worker_id,
+            claim_epoch: import_zip_claim.claim_epoch,
+            targets: vec![
+                ExpectedImportTarget {
+                    bucket: "bucket".to_owned(),
+                    key: "timestamp-import-zip.zip".to_owned(),
+                    generation: 1,
+                },
+                ExpectedImportTarget {
+                    bucket: "bucket".to_owned(),
+                    key: "timestamp-import-zip-entry.txt".to_owned(),
+                    generation: entry_generation,
+                },
+            ],
+        },
+        vec![],
+        supplied_historical_time,
+        &limits(),
+    )
+    .await
+    .unwrap();
+
+    for object_id in [
+        "timestamp-put",
+        "timestamp-copy",
+        "timestamp-multipart",
+        "timestamp-direct-zip",
+        "timestamp-direct-zip-entry",
+        "timestamp-import",
+        "timestamp-import-zip",
+        "timestamp-import-zip-entry",
+    ] {
+        assert_lifecycle_timestamp_for_publication(&db, object_id, supplied_historical_time).await;
     }
 }
 

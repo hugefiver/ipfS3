@@ -632,6 +632,155 @@ pub async fn admit_content_mutation<C: ConnectionTrait + TransactionTrait>(
     })
 }
 
+/// Tries to admit a lifecycle mutation without superseding an in-flight import
+/// or standard content mutation. The bucket lock makes the conflict check and
+/// token installation atomic across gateway processes.
+pub async fn try_admit_lifecycle_mutation<C: ConnectionTrait + TransactionTrait>(
+    db: &C,
+    bucket_name: &str,
+    key: &str,
+    action_id: &str,
+    claim_epoch: i64,
+    now: DateTime<Utc>,
+) -> AppResult<Option<StandardMutationGuard>> {
+    if action_id.is_empty() || action_id.contains(':') || claim_epoch <= 0 {
+        return Err(AppError::Internal(
+            "invalid lifecycle mutation owner".to_owned(),
+        ));
+    }
+    let bucket_name = bucket_name.to_owned();
+    let key = key.to_owned();
+    let action_id = action_id.to_owned();
+    let mutation_id = format!("lifecycle:{action_id}:{claim_epoch}");
+    for retry in 0..=MAX_OWNERSHIP_TRANSACTION_RETRIES {
+        let bucket_name = bucket_name.clone();
+        let key = key.clone();
+        let action_id = action_id.clone();
+        let mutation_id = mutation_id.clone();
+        let outcome = db
+            .transaction(move |txn| {
+                Box::pin(async move {
+                    lock_bucket_for_ownership(txn, &bucket_name).await?;
+                    let destination = find_destination_for_update(txn, &bucket_name, &key).await?;
+                    if destination
+                        .as_ref()
+                        .is_some_and(|destination| destination.owner_job_id.is_some())
+                        || !prefix_owner_jobs_for_key(txn, &bucket_name, &key, None, None)
+                            .await?
+                            .is_empty()
+                        || has_overlapping_standard_prefix_mutation(txn, &bucket_name, &key).await?
+                    {
+                        return Ok(None);
+                    }
+                    if let Some(destination) = destination.as_ref()
+                        && let Some(active_mutation_id) = destination.mutation_id.as_deref()
+                    {
+                        if active_mutation_id == mutation_id {
+                            if destination.mutation_prefix.is_some() {
+                                return Ok(None);
+                            }
+                            return Ok(Some(StandardMutationGuard {
+                                bucket: bucket_name,
+                                key,
+                                mutation_id,
+                                expected_generation: destination.generation,
+                                mutation_prefix: None,
+                            }));
+                        }
+                        let older_same_action =
+                            lifecycle_mutation_epoch(active_mutation_id, &action_id)
+                                .is_some_and(|epoch| epoch > 0 && epoch < claim_epoch);
+                        if !older_same_action || destination.mutation_prefix.is_some() {
+                            return Ok(None);
+                        }
+                    }
+                    upsert_standard_mutation(
+                        txn,
+                        destination,
+                        &bucket_name,
+                        &key,
+                        &mutation_id,
+                        None,
+                        now,
+                    )
+                    .await
+                    .map(Some)
+                })
+            })
+            .await;
+        match outcome {
+            Ok(guard) => return Ok(guard),
+            Err(TransactionError::Transaction(error))
+                if is_retryable_transaction_conflict(&error)
+                    && retry < MAX_OWNERSHIP_TRANSACTION_RETRIES =>
+            {
+                ownership_retry_delay(retry).await;
+            }
+            Err(error) => return Err(transaction_error_into_app(error)),
+        }
+    }
+    unreachable!("lifecycle admission retry loop always returns or errors")
+}
+
+/// Clears only an admission token owned by this lifecycle action at this or an
+/// older claim epoch. The caller must hold the bucket ownership fence.
+pub async fn clear_lifecycle_mutation_if_owned<C: ConnectionTrait>(
+    txn: &C,
+    bucket_name: &str,
+    key: &str,
+    action_id: &str,
+    claim_epoch: i64,
+    now: DateTime<Utc>,
+) -> AppResult<bool> {
+    if action_id.is_empty() || action_id.contains(':') || claim_epoch <= 0 {
+        return Err(AppError::Internal(
+            "invalid lifecycle mutation owner".to_owned(),
+        ));
+    }
+    let Some(destination) = find_destination_for_update(txn, bucket_name, key).await? else {
+        return Ok(false);
+    };
+    let Some(active_mutation_id) = destination.mutation_id.as_deref() else {
+        return Ok(false);
+    };
+    let owned = destination.mutation_prefix.is_none()
+        && lifecycle_mutation_epoch(active_mutation_id, action_id)
+            .is_some_and(|epoch| epoch > 0 && epoch <= claim_epoch);
+    if !owned {
+        return Ok(false);
+    }
+    let cleared = import_destination::Entity::update_many()
+        .col_expr(
+            import_destination::Column::MutationId,
+            Expr::value(Option::<String>::None),
+        )
+        .col_expr(
+            import_destination::Column::MutationPrefix,
+            Expr::value(Option::<String>::None),
+        )
+        .col_expr(import_destination::Column::UpdatedAt, Expr::value(now))
+        .filter(import_destination::Column::Bucket.eq(bucket_name))
+        .filter(import_destination::Column::Key.eq(key))
+        .filter(import_destination::Column::MutationId.eq(active_mutation_id))
+        .exec(txn)
+        .await?;
+    if cleared.rows_affected != 1 {
+        return Err(AppError::Database(
+            "stale lifecycle mutation cleanup compare-and-set".to_owned(),
+        ));
+    }
+    Ok(true)
+}
+
+fn lifecycle_mutation_epoch(token: &str, action_id: &str) -> Option<i64> {
+    token
+        .strip_prefix("lifecycle:")?
+        .strip_prefix(action_id)?
+        .strip_prefix(':')?
+        .parse::<i64>()
+        .ok()
+}
+
 /// Admits all unique content keys with one bucket lock. This is the Task 5
 /// DeleteObjects entry point and deliberately delegates to the no-transaction
 /// single-key helper instead of nesting transactions.
@@ -1592,6 +1741,42 @@ async fn invalidate_standard_mutations_in_order<C: ConnectionTrait>(
         after_key = Some(last_key);
     }
     Ok(())
+}
+
+async fn has_overlapping_standard_prefix_mutation<C: ConnectionTrait>(
+    txn: &C,
+    bucket_name: &str,
+    key: &str,
+) -> AppResult<bool> {
+    let mut after_key: Option<String> = None;
+    loop {
+        let mut query = import_destination::Entity::find()
+            .filter(import_destination::Column::Bucket.eq(bucket_name))
+            .filter(import_destination::Column::MutationId.is_not_null())
+            .filter(import_destination::Column::MutationPrefix.is_not_null())
+            .order_by_asc(import_destination::Column::Key)
+            .limit(OWNERSHIP_BATCH_SIZE);
+        if let Some(after_key) = after_key.as_deref() {
+            query = query.filter(import_destination::Column::Key.gt(after_key));
+        }
+        let active = if txn.get_database_backend() == DatabaseBackend::Postgres {
+            query.lock_exclusive().all(txn).await?
+        } else {
+            query.all(txn).await?
+        };
+        let Some(last_key) = active.last().map(|destination| destination.key.clone()) else {
+            return Ok(false);
+        };
+        if active.iter().any(|destination| {
+            destination
+                .mutation_prefix
+                .as_deref()
+                .is_some_and(|prefix| key.starts_with(prefix))
+        }) {
+            return Ok(true);
+        }
+        after_key = Some(last_key);
+    }
 }
 
 async fn find_destination_for_update<C: ConnectionTrait>(

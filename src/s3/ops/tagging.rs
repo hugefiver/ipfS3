@@ -29,9 +29,9 @@ const MANUAL_LEASE_CHANGED: &str = "manual pin lease changed during tag replacem
 
 #[cfg(test)]
 mod test_hooks {
-    use std::sync::{Arc, LazyLock};
+    use std::sync::{Arc, LazyLock, Mutex};
 
-    use tokio::sync::{Mutex, Notify};
+    use tokio::sync::Notify;
 
     pub struct PolicyEvaluatedGate {
         pub lease_id: &'static str,
@@ -41,12 +41,48 @@ mod test_hooks {
 
     pub static POLICY_EVALUATED: LazyLock<Mutex<Option<Arc<PolicyEvaluatedGate>>>> =
         LazyLock::new(|| Mutex::new(None));
-    pub static POLICY_EVALUATED_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+    pub static POLICY_EVALUATED_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+        LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    pub fn install_policy_evaluated_gate(
+        gate: Arc<PolicyEvaluatedGate>,
+    ) -> PolicyEvaluatedGateInstallation {
+        let mut installed = POLICY_EVALUATED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            installed.is_none(),
+            "policy-evaluated test gate is already installed"
+        );
+        *installed = Some(gate.clone());
+        PolicyEvaluatedGateInstallation { gate }
+    }
+
+    pub struct PolicyEvaluatedGateInstallation {
+        gate: Arc<PolicyEvaluatedGate>,
+    }
+
+    impl Drop for PolicyEvaluatedGateInstallation {
+        fn drop(&mut self) {
+            let mut installed = POLICY_EVALUATED
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if installed
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &self.gate))
+            {
+                *installed = None;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 async fn pause_after_policy_evaluation(lease_id: Option<&str>) {
-    let gate = test_hooks::POLICY_EVALUATED.lock().await.clone();
+    let gate = test_hooks::POLICY_EVALUATED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
     if let Some(gate) = gate.filter(|gate| Some(gate.lease_id) == lease_id) {
         gate.arrived.notify_one();
         gate.resume.notified().await;
@@ -371,10 +407,11 @@ mod tests {
     use std::{
         collections::{BTreeSet, HashMap},
         sync::Arc,
+        time::Duration,
     };
 
     use chrono::{DateTime, Utc};
-    use s3s::{S3Request, dto::*};
+    use s3s::S3Request;
     use sea_orm::sea_query::Expr;
     use sea_orm::{
         ActiveValue::Set, ColumnTrait, ConnectOptions, ConnectionTrait, Database, DatabaseBackend,
@@ -435,6 +472,43 @@ mod tests {
 
     fn time(hour: u32) -> DateTime<Utc> {
         format!("2026-07-22T{hour:02}:00:00Z").parse().unwrap()
+    }
+
+    async fn wait_for_policy_evaluation_pause(
+        gate: &test_hooks::PolicyEvaluatedGate,
+        tagging: &mut tokio::task::JoinHandle<S3Result<S3Response<PutObjectTaggingOutput>>>,
+    ) {
+        enum PauseOutcome {
+            Arrived,
+            Finished(String),
+            TimedOut,
+        }
+
+        let deadline = tokio::time::sleep(Duration::from_secs(5));
+        tokio::pin!(deadline);
+        let outcome = tokio::select! {
+            _ = gate.arrived.notified() => PauseOutcome::Arrived,
+            result = &mut *tagging => PauseOutcome::Finished(match result {
+                Ok(Ok(_)) => "success".to_owned(),
+                Ok(Err(error)) => error.code().as_str().to_owned(),
+                Err(_) => "JoinError".to_owned(),
+            }),
+            _ = &mut deadline => PauseOutcome::TimedOut,
+        };
+
+        match outcome {
+            PauseOutcome::Arrived => {}
+            PauseOutcome::Finished(code) => {
+                panic!("tagging finished before policy-evaluated pause: {code}")
+            }
+            PauseOutcome::TimedOut => {
+                tagging.abort();
+                let _ = tagging.await;
+                panic!(
+                    "tagging neither reached policy-evaluated pause nor finished within 5 seconds"
+                );
+            }
+        }
     }
 
     fn coordinator_fixture() -> (Arc<PinningCoordinator>, String) {
@@ -657,6 +731,22 @@ mod tests {
             None,
             false,
         )
+        .await
+        .unwrap();
+        let object = crate::store::object::get_latest(&db, BUCKET, KEY)
+            .await
+            .unwrap();
+        db.transaction(move |txn| {
+            Box::pin(async move {
+                crate::store::object_version::install_content_version(
+                    txn,
+                    BucketVersioningState::Unversioned,
+                    &object,
+                    time(1),
+                )
+                .await
+            })
+        })
         .await
         .unwrap();
         Fixture {
@@ -1165,6 +1255,26 @@ mod tests {
         )
         .await
         .unwrap();
+        let object = crate::store::object::get_latest(fixture.state.store.db(), BUCKET, key)
+            .await
+            .unwrap();
+        fixture
+            .state
+            .store
+            .db()
+            .transaction(move |txn| {
+                Box::pin(async move {
+                    crate::store::object_version::install_content_version(
+                        txn,
+                        BucketVersioningState::Unversioned,
+                        &object,
+                        time(1),
+                    )
+                    .await
+                })
+            })
+            .await
+            .unwrap();
         seed_lease_for_owner(
             &fixture,
             owner_id,
@@ -1286,13 +1396,13 @@ mod tests {
             arrived: tokio::sync::Notify::new(),
             resume: tokio::sync::Notify::new(),
         });
-        *test_hooks::POLICY_EVALUATED.lock().await = Some(gate.clone());
+        let _gate_installation = test_hooks::install_policy_evaluated_gate(gate.clone());
         let state = fixture.state.clone();
-        let tagging = tokio::spawn(async move {
+        let mut tagging = tokio::spawn(async move {
             put_object_tagging_at(&state, put_request(&[("after", "rejected")]), time(2)).await
         });
 
-        gate.arrived.notified().await;
+        wait_for_policy_evaluation_pause(&gate, &mut tagging).await;
         let updated = pin_lease::Entity::update_many()
             .col_expr(pin_lease::Column::State, Expr::value("active"))
             .col_expr(pin_lease::Column::Generation, Expr::value(8_i64))
@@ -1307,7 +1417,6 @@ mod tests {
         assert_eq!(updated.rows_affected, 1);
         gate.resume.notify_one();
         let result = tagging.await.unwrap();
-        *test_hooks::POLICY_EVALUATED.lock().await = None;
 
         assert_eq!(result.unwrap_err().code().as_str(), "InternalError");
         let lease = pin_lease::Entity::find_by_id("race-manual")
@@ -2325,10 +2434,10 @@ mod tests {
             arrived: tokio::sync::Notify::new(),
             resume: tokio::sync::Notify::new(),
         });
-        *test_hooks::POLICY_EVALUATED.lock().await = Some(gate.clone());
+        let _gate_installation = test_hooks::install_policy_evaluated_gate(gate.clone());
         let historical_version_id = versions.historical_version_id.clone();
         let state = versions.fixture.state.clone();
-        let tagging = tokio::spawn(async move {
+        let mut tagging = tokio::spawn(async move {
             put_object_tagging_at(
                 &state,
                 put_version_request(
@@ -2340,7 +2449,7 @@ mod tests {
             .await
         });
 
-        gate.arrived.notified().await;
+        wait_for_policy_evaluation_pause(&gate, &mut tagging).await;
         let removed = object_version::Entity::delete_many()
             .filter(object_version::Column::Bucket.eq(BUCKET))
             .filter(object_version::Column::Key.eq(KEY))
@@ -2351,7 +2460,6 @@ mod tests {
         assert_eq!(removed.rows_affected, 1);
         gate.resume.notify_one();
         let result = tagging.await.unwrap();
-        *test_hooks::POLICY_EVALUATED.lock().await = None;
 
         assert_eq!(result.unwrap_err().code().as_str(), "NoSuchVersion");
         let historical_tags = stored_tags::list_object_tags(

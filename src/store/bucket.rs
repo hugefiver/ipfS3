@@ -403,6 +403,8 @@ mod tests {
             object_id: Set(Some("unversioned-current".to_owned())),
             sequence: Set(1),
             is_latest: Set(true),
+            lifecycle_age_started_at: Set(now),
+            became_noncurrent_at: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
         })
@@ -434,6 +436,8 @@ mod tests {
             object_id: Set(Some("retained-object".to_owned())),
             sequence: Set(1),
             is_latest: Set(false),
+            lifecycle_age_started_at: Set(now),
+            became_noncurrent_at: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
         })
@@ -460,6 +464,8 @@ mod tests {
             object_id: Set(None),
             sequence: Set(2),
             is_latest: Set(true),
+            lifecycle_age_started_at: Set(now),
+            became_noncurrent_at: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
         })

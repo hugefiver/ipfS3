@@ -70,6 +70,27 @@ impl S3 for S3Impl {
         super::ops::versioning::put_bucket_versioning(&self.state, req).await
     }
 
+    async fn delete_bucket_lifecycle(
+        &self,
+        req: S3Request<DeleteBucketLifecycleInput>,
+    ) -> S3Result<S3Response<DeleteBucketLifecycleOutput>> {
+        super::ops::lifecycle::delete_bucket_lifecycle(&self.state, req).await
+    }
+
+    async fn get_bucket_lifecycle_configuration(
+        &self,
+        req: S3Request<GetBucketLifecycleConfigurationInput>,
+    ) -> S3Result<S3Response<GetBucketLifecycleConfigurationOutput>> {
+        super::ops::lifecycle::get_bucket_lifecycle_configuration(&self.state, req).await
+    }
+
+    async fn put_bucket_lifecycle_configuration(
+        &self,
+        req: S3Request<PutBucketLifecycleConfigurationInput>,
+    ) -> S3Result<S3Response<PutBucketLifecycleConfigurationOutput>> {
+        super::ops::lifecycle::put_bucket_lifecycle_configuration(&self.state, req).await
+    }
+
     async fn put_object(
         &self,
         req: S3Request<PutObjectInput>,

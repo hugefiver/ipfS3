@@ -114,6 +114,12 @@ pub enum AppError {
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
 
+    #[error("invalid lifecycle configuration")]
+    InvalidLifecycleConfiguration(String),
+
+    #[error("lifecycle configuration not found")]
+    NoSuchLifecycleConfiguration,
+
     #[error("delete marker")]
     DeleteMarker {
         version_id: String,
@@ -214,6 +220,16 @@ impl From<AppError> for S3Error {
                 error.set_status_code(http::StatusCode::BAD_REQUEST);
                 error
             }
+            AppError::InvalidLifecycleConfiguration(_) => import_route_error(
+                "InvalidRequest",
+                http::StatusCode::BAD_REQUEST,
+                "invalid lifecycle configuration",
+            ),
+            AppError::NoSuchLifecycleConfiguration => import_route_error(
+                "NoSuchLifecycleConfiguration",
+                http::StatusCode::NOT_FOUND,
+                "lifecycle configuration not found",
+            ),
             AppError::DeleteMarker {
                 version_id,
                 created_at,
@@ -432,6 +448,21 @@ mod tests {
             Some(http::StatusCode::BAD_REQUEST)
         );
         assert_ne!(invalid_argument.code(), no_such_version.code());
+    }
+
+    #[test]
+    fn lifecycle_errors_are_stable_and_redacted() {
+        let invalid: S3Error =
+            AppError::InvalidLifecycleConfiguration("private lifecycle detail".to_owned()).into();
+        assert_eq!(invalid.code().as_str(), "InvalidRequest");
+        assert_eq!(invalid.status_code(), Some(http::StatusCode::BAD_REQUEST));
+        assert_eq!(invalid.message(), Some("invalid lifecycle configuration"));
+        assert!(!invalid.to_string().contains("private"));
+
+        let absent: S3Error = AppError::NoSuchLifecycleConfiguration.into();
+        assert_eq!(absent.code().as_str(), "NoSuchLifecycleConfiguration");
+        assert_eq!(absent.status_code(), Some(http::StatusCode::NOT_FOUND));
+        assert_eq!(absent.message(), Some("lifecycle configuration not found"));
     }
 
     #[test]

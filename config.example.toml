@@ -33,6 +33,16 @@ max_attempts = 5
 terminal_retention_secs = 604800
 max_provider_records = 20
 
+[lifecycle]
+poll_interval_ms = 1000
+scan_page_size = 500
+scan_lease_secs = 30
+action_lease_secs = 30
+worker_concurrency = 4
+max_attempts = 8
+base_backoff_secs = 1
+max_backoff_secs = 60
+
 [pinning]
 worker_interval = "5s"
 worker_concurrency = 4

@@ -2253,6 +2253,25 @@ mod tests {
         )
         .await
         .unwrap();
+        let object = crate::store::object::get_latest(state.store.db(), "bucket", key)
+            .await
+            .unwrap();
+        state
+            .store
+            .db()
+            .transaction(move |txn| {
+                Box::pin(async move {
+                    crate::store::object_version::install_content_version(
+                        txn,
+                        crate::store::object_version::BucketVersioningState::Unversioned,
+                        &object,
+                        Utc::now(),
+                    )
+                    .await
+                })
+            })
+            .await
+            .unwrap();
         crate::store::pinning::tags::replace_object_tags(
             state.store.db(),
             &format!("source-{key}"),

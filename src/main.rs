@@ -13,6 +13,7 @@ use axum::routing::get;
 use ipfs_s3_gateway::auth::GatewayAuth;
 use ipfs_s3_gateway::config::Config;
 use ipfs_s3_gateway::import::{downloader::SourceDownloader, pipeline::ImportCoordinator};
+use ipfs_s3_gateway::lifecycle::worker::start_worker;
 use ipfs_s3_gateway::s3;
 use ipfs_s3_gateway::s3::handler::S3Impl;
 use ipfs_s3_gateway::state::AppState;
@@ -94,17 +95,7 @@ async fn handle_s3_error(err: HttpError) -> HttpResponse<S3Body> {
         .unwrap()
 }
 
-async fn run_gateway() -> anyhow::Result<()> {
-    tracing_subscriber::fmt().init();
-
-    let cfg = Config::load()?;
-    tracing::info!(bind = %cfg.server.bind, kubo = %cfg.kubo.rpc_url, "starting ipfs-s3-gateway");
-
-    let state = AppState::new(&cfg).await?;
-    let import_config = cfg.imports.validate()?;
-    let downloader = SourceDownloader::production(Arc::new(import_config.clone()));
-    let imports = ImportCoordinator::new(import_config, downloader);
-
+fn gateway_app(state: Arc<AppState>, imports: Arc<ImportCoordinator>) -> Router {
     let s3_impl = S3Impl::new(state.clone());
     let gateway_auth = GatewayAuth::new(state.clone());
 
@@ -114,21 +105,34 @@ async fn run_gateway() -> anyhow::Result<()> {
         builder.set_auth(gateway_auth);
         builder.set_route(s3::route::gateway::GatewayRoute::new(
             state.clone(),
-            imports.clone(),
+            imports,
         ));
         builder.build()
     };
 
-    let s3_service = HandleError::new(s3_service, handle_s3_error);
-
-    let app = Router::new()
+    Router::new()
         .route("/health", get(health_check))
         .route("/ready", get(ready_handler))
-        .fallback_service(s3_service)
+        .fallback_service(HandleError::new(s3_service, handle_s3_error))
         .layer(axum::middleware::from_fn(
             s3::http::bridge_chunked_content_length,
         ))
-        .with_state(state.clone());
+        .with_state(state)
+}
+
+async fn run_gateway() -> anyhow::Result<()> {
+    tracing_subscriber::fmt().init();
+
+    let cfg = Config::load()?;
+    let lifecycle_config = cfg.lifecycle.validate()?;
+    tracing::info!(bind = %cfg.server.bind, kubo = %cfg.kubo.rpc_url, "starting ipfs-s3-gateway");
+
+    let state = AppState::new(&cfg).await?;
+    let import_config = cfg.imports.validate()?;
+    let downloader = SourceDownloader::production(Arc::new(import_config.clone()));
+    let imports = ImportCoordinator::new(import_config, downloader);
+
+    let app = gateway_app(state.clone(), imports.clone());
 
     let listener = tokio::net::TcpListener::bind(cfg.server.bind).await?;
     tracing::info!("listening on {}", cfg.server.bind);
@@ -137,6 +141,11 @@ async fn run_gateway() -> anyhow::Result<()> {
         .pinning
         .start(state.store.clone(), shutdown.child_token());
     let import_worker = imports.start(state.clone(), shutdown.child_token());
+    let lifecycle_worker = start_worker(
+        state.store.clone(),
+        lifecycle_config,
+        shutdown.child_token(),
+    );
     let signal_token = shutdown.clone();
     let server = axum::serve(listener, app).with_graceful_shutdown(async move {
         if let Err(error) = tokio::signal::ctrl_c().await {
@@ -149,7 +158,8 @@ async fn run_gateway() -> anyhow::Result<()> {
     let grace = std::time::Duration::from_secs(30);
     tokio::join!(
         pinning_worker.shutdown(grace),
-        import_worker.shutdown(grace)
+        import_worker.shutdown(grace),
+        lifecycle_worker.shutdown(grace)
     );
     server_result?;
 
@@ -190,7 +200,7 @@ mod tests {
         crypto::key::MasterKey, kubo::KuboClient, pinning::coordinator::PinningCoordinator,
         store::Store,
     };
-    use sea_orm::Database;
+    use sea_orm::{ColumnTrait, Database, EntityTrait, QueryFilter};
     use tokio::{net::TcpListener, task::JoinHandle};
     use tower::ServiceExt as _;
 
@@ -275,6 +285,75 @@ mod tests {
     #[tokio::test]
     async fn health_check_returns_ok() {
         assert_eq!(health_check().await, "OK");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_http_request_does_not_start_a_worker() {
+        let state = test_state().await;
+        ipfs_s3_gateway::store::bucket::create(state.store.db(), "bucket", None)
+            .await
+            .unwrap();
+        let now = ipfs_s3_gateway::store::database_clock::database_now(state.store.db())
+            .await
+            .unwrap();
+        let mut action = ipfs_s3_gateway::lifecycle::model::NewLifecycleAction {
+            idempotency_key: String::new(),
+            bucket: "bucket".to_owned(),
+            config_revision: 1,
+            rule_identity: ipfs_s3_gateway::lifecycle::model::RuleIdentity::Id("expire".to_owned()),
+            action_kind: ipfs_s3_gateway::lifecycle::model::LifecycleActionKind::ExpireCurrent,
+            target: ipfs_s3_gateway::lifecycle::model::VersionTargetIdentity {
+                bucket: "bucket".to_owned(),
+                key: "object".to_owned(),
+                version_row_id: "missing-version".to_owned(),
+                public_version_id: ipfs_s3_gateway::store::object_version::PublicVersionId::Null,
+                kind: ipfs_s3_gateway::store::object_version::VersionKind::Object,
+                object_id: Some("missing-object".to_owned()),
+                sequence: 1,
+            },
+            due_at: now,
+        };
+        action.idempotency_key =
+            ipfs_s3_gateway::store::lifecycle_action::idempotency_key(&action).unwrap();
+        let action_key = action.idempotency_key.clone();
+        assert!(
+            ipfs_s3_gateway::store::lifecycle_action::insert_idempotent(
+                state.store.db(),
+                action,
+                now,
+            )
+            .await
+            .unwrap()
+        );
+        let import_config = ipfs_s3_gateway::import::ImportConfig::default()
+            .validate()
+            .unwrap();
+        let imports = ImportCoordinator::new(
+            import_config.clone(),
+            SourceDownloader::production(Arc::new(import_config)),
+        );
+        let app = gateway_app(state.clone(), imports);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let action = ipfs_s3_gateway::store::entities::lifecycle_action::Entity::find()
+            .filter(
+                ipfs_s3_gateway::store::entities::lifecycle_action::Column::IdempotencyKey
+                    .eq(action_key),
+            )
+            .one(state.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(action.state, "pending");
     }
 
     #[tokio::test]
