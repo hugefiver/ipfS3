@@ -6,14 +6,10 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, mpsc};
 
-use axum::error_handling::HandleError;
-use axum::http::{Response, StatusCode};
+use axum::extract;
+use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::Response as AxumResponse;
-use axum::{Router, extract};
-use s3s::service::S3ServiceBuilder;
-use s3s::validation::AwsNameValidation;
-use s3s::{Body as S3Body, HttpError};
 use sea_orm::Database;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -149,35 +145,7 @@ impl KuboBlocker {
     }
 }
 
-pub struct S3ServerHandle {
-    pub endpoint: String,
-    cancellation: tokio_util::sync::CancellationToken,
-    join: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl S3ServerHandle {
-    pub async fn shutdown(mut self) {
-        self.cancellation.cancel();
-        if let Some(mut join) = self.join.take() {
-            match tokio::time::timeout(std::time::Duration::from_secs(2), &mut join).await {
-                Ok(result) => result.expect("test S3 server task failed"),
-                Err(_) => {
-                    join.abort();
-                    let _ = join.await;
-                }
-            }
-        }
-    }
-}
-
-impl Drop for S3ServerHandle {
-    fn drop(&mut self) {
-        self.cancellation.cancel();
-        if let Some(join) = self.join.take() {
-            join.abort();
-        }
-    }
-}
+pub use crate::support::cors::S3ServerHandle;
 
 #[derive(Clone)]
 pub struct ObservedHttpRequest {
@@ -357,14 +325,7 @@ pub async fn start_s3_server(
     state: Arc<ipfs_s3_gateway::state::AppState>,
     observed_http: Arc<tokio::sync::Mutex<Vec<ObservedHttpRequest>>>,
 ) -> S3ServerHandle {
-    let import_config = ipfs_s3_gateway::import::ImportConfig::default()
-        .validate()
-        .expect("validate default import configuration");
-    let downloader = ipfs_s3_gateway::import::downloader::SourceDownloader::production(Arc::new(
-        import_config.clone(),
-    ));
-    let imports =
-        ipfs_s3_gateway::import::pipeline::ImportCoordinator::new(import_config, downloader);
+    let imports = crate::support::cors::default_import_coordinator();
     start_s3_server_with_imports(state, observed_http, imports).await
 }
 
@@ -373,42 +334,10 @@ pub async fn start_s3_server_with_imports(
     observed_http: Arc<tokio::sync::Mutex<Vec<ObservedHttpRequest>>>,
     imports: Arc<ipfs_s3_gateway::import::pipeline::ImportCoordinator>,
 ) -> S3ServerHandle {
-    let s3_impl = ipfs_s3_gateway::s3::handler::S3Impl::new(state.clone());
-    let mut builder = S3ServiceBuilder::new(s3_impl);
-    builder.set_validation(AwsNameValidation::new());
-    builder.set_auth(ipfs_s3_gateway::auth::GatewayAuth::new(state.clone()));
-    builder.set_route(ipfs_s3_gateway::s3::route::gateway::GatewayRoute::new(
-        state.clone(),
-        imports,
-    ));
-    let service = HandleError::new(builder.build(), handle_s3_error);
-    let app = Router::new()
-        .fallback_service(service)
-        .layer(middleware::from_fn(
-            ipfs_s3_gateway::s3::http::bridge_chunked_content_length,
-        ))
-        .layer(middleware::from_fn_with_state(
-            observed_http.clone(),
-            observe_request,
-        ));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind test S3 listener");
-    let port = listener.local_addr().expect("test listener address").port();
-    let cancellation = tokio_util::sync::CancellationToken::new();
-    let server_cancellation = cancellation.clone();
-    let join = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(server_cancellation.cancelled_owned())
-            .await
-            .expect("test S3 server terminated unexpectedly");
-    });
-
-    S3ServerHandle {
-        endpoint: format!("http://127.0.0.1:{port}"),
-        cancellation,
-        join: Some(join),
-    }
+    let app = crate::support::cors::gateway_router(state, imports).layer(
+        middleware::from_fn_with_state(observed_http.clone(), observe_request),
+    );
+    crate::support::cors::start_router(app).await
 }
 
 fn kubo_add_file_bytes(request: &wiremock::Request) -> Vec<u8> {
@@ -674,14 +603,6 @@ pub async fn abort_multipart(
         "test",
     )
     .await
-}
-
-async fn handle_s3_error(err: HttpError) -> Response<S3Body> {
-    tracing::error!(?err, "s3 service error");
-    Response::builder()
-        .status(StatusCode::INTERNAL_SERVER_ERROR)
-        .body(S3Body::from("Internal Server Error".to_string()))
-        .expect("internal error response")
 }
 
 async fn observe_request(

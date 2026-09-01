@@ -91,6 +91,27 @@ impl S3 for S3Impl {
         super::ops::lifecycle::put_bucket_lifecycle_configuration(&self.state, req).await
     }
 
+    async fn get_bucket_cors(
+        &self,
+        req: S3Request<GetBucketCorsInput>,
+    ) -> S3Result<S3Response<GetBucketCorsOutput>> {
+        super::ops::cors::get_bucket_cors(&self.state, req).await
+    }
+
+    async fn put_bucket_cors(
+        &self,
+        req: S3Request<PutBucketCorsInput>,
+    ) -> S3Result<S3Response<PutBucketCorsOutput>> {
+        super::ops::cors::put_bucket_cors(&self.state, req).await
+    }
+
+    async fn delete_bucket_cors(
+        &self,
+        req: S3Request<DeleteBucketCorsInput>,
+    ) -> S3Result<S3Response<DeleteBucketCorsOutput>> {
+        super::ops::cors::delete_bucket_cors(&self.state, req).await
+    }
+
     async fn put_object(
         &self,
         req: S3Request<PutObjectInput>,

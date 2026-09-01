@@ -329,8 +329,7 @@ and its encryption metadata. Deleting a version removes only public metadata:
 gateway Kubo pins are retained and `pin/rm` is not called. Bucket deletion
 requires exact removal of every public version and delete marker.
 
-Non-goals: CORS, MFA Delete, Object Lock, pin reclamation, and
-replication.
+Non-goals: MFA Delete, Object Lock, pin reclamation, and replication.
 
 ## Lifecycle expiration
 
@@ -351,6 +350,21 @@ calls `pin/rm`.
 `Transition`, `NoncurrentVersionTransition`, and
 `AbortIncompleteMultipartUpload` are not supported; a configuration
 containing any unsupported action is rejected as a whole.
+
+## Bucket CORS
+
+The [approved Bucket CORS design](docs/superpowers/specs/2026-08-31-bucket-cors-design.md)
+and [sanitized LOCAL evidence](docs/bucket-cors-evidence-2026-08-31.log)
+cover path-style Bucket CORS. The gateway provides native signed management CRUD
+through `PutBucketCors`, `GetBucketCors`, and `DeleteBucketCors`, validating a
+configuration body with MD5 or the AWS CLI default `CRC64NVME`.
+
+Both unsigned preflight requests and signed actual responses, including S3
+errors, receive the matching CORS headers. The policy also covers custom import
+and decompress routes. Rules keep their submitted order, so the first matching
+rule wins. `/health` and `/ready` are excluded. Non-goals: virtual-hosted-style
+routing, IAM or bucket-policy evaluation, directory buckets, TLS or edge
+behavior, global CORS, and Kubo CORS.
 
 ## Durable `ipfs3-import`
 

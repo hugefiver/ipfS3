@@ -117,6 +117,21 @@ pub enum AppError {
     #[error("invalid lifecycle configuration")]
     InvalidLifecycleConfiguration(String),
 
+    #[error("invalid CORS configuration")]
+    InvalidCorsConfiguration,
+
+    #[error("stored CORS configuration is invalid")]
+    CorruptCorsConfiguration,
+
+    #[error("CORS configuration not found")]
+    NoSuchCorsConfiguration,
+
+    #[error("invalid digest")]
+    InvalidCorsDigest,
+
+    #[error("digest mismatch")]
+    BadCorsDigest,
+
     #[error("lifecycle configuration not found")]
     NoSuchLifecycleConfiguration,
 
@@ -224,6 +239,31 @@ impl From<AppError> for S3Error {
                 "InvalidRequest",
                 http::StatusCode::BAD_REQUEST,
                 "invalid lifecycle configuration",
+            ),
+            AppError::InvalidCorsConfiguration => import_route_error(
+                "InvalidRequest",
+                http::StatusCode::BAD_REQUEST,
+                "invalid CORS configuration",
+            ),
+            AppError::CorruptCorsConfiguration => import_route_error(
+                "InternalError",
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                "stored CORS configuration is invalid",
+            ),
+            AppError::NoSuchCorsConfiguration => import_route_error(
+                "NoSuchCORSConfiguration",
+                http::StatusCode::NOT_FOUND,
+                "CORS configuration not found",
+            ),
+            AppError::InvalidCorsDigest => import_route_error(
+                "InvalidDigest",
+                http::StatusCode::BAD_REQUEST,
+                "invalid digest",
+            ),
+            AppError::BadCorsDigest => import_route_error(
+                "BadDigest",
+                http::StatusCode::BAD_REQUEST,
+                "digest mismatch",
             ),
             AppError::NoSuchLifecycleConfiguration => import_route_error(
                 "NoSuchLifecycleConfiguration",
@@ -505,5 +545,53 @@ mod tests {
             headers[http::header::LAST_MODIFIED],
             "Wed, 21 Oct 2015 07:28:00 GMT"
         );
+    }
+
+    #[test]
+    fn cors_errors_are_stable_and_redacted() {
+        let cases = [
+            (
+                AppError::InvalidCorsConfiguration,
+                "InvalidRequest",
+                http::StatusCode::BAD_REQUEST,
+                "invalid CORS configuration",
+            ),
+            (
+                AppError::CorruptCorsConfiguration,
+                "InternalError",
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                "stored CORS configuration is invalid",
+            ),
+            (
+                AppError::NoSuchCorsConfiguration,
+                "NoSuchCORSConfiguration",
+                http::StatusCode::NOT_FOUND,
+                "CORS configuration not found",
+            ),
+            (
+                AppError::InvalidCorsDigest,
+                "InvalidDigest",
+                http::StatusCode::BAD_REQUEST,
+                "invalid digest",
+            ),
+            (
+                AppError::BadCorsDigest,
+                "BadDigest",
+                http::StatusCode::BAD_REQUEST,
+                "digest mismatch",
+            ),
+        ];
+
+        for (app_error, code, status, message) in cases {
+            assert_eq!(app_error.to_string(), message);
+            let s3_error: S3Error = app_error.into();
+            assert_eq!(s3_error.code().as_str(), code);
+            assert_eq!(s3_error.status_code(), Some(status));
+            assert_eq!(s3_error.message(), Some(message));
+            assert!(!s3_error.to_string().contains("private-policy-value"));
+            assert!(!s3_error.to_string().contains("private-body-value"));
+            assert!(!s3_error.to_string().contains("private-digest-value"));
+            assert!(!s3_error.to_string().contains("private-database-value"));
+        }
     }
 }

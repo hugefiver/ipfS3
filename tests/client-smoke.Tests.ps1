@@ -1010,9 +1010,9 @@ if ($multiGatewayDiagnosticFailures.Count -ne 0) {
     throw "Lifecycle Task 13 multi-gateway diagnostic contracts are missing: $($multiGatewayDiagnosticFailures -join '; ')"
 }
 
-# Lifecycle promotion may change README only; ROADMAP and deployment surfaces remain protected.
+# Lifecycle promotion may change README only. Bucket CORS promotion is checked
+# later as an exact v0.6 section, preserving the unchecked Lifecycle item.
 $protectedLifecyclePaths = @(
-    "ROADMAP.md",
     ".github/workflows/release-validation.yml",
     "docker-compose.yml",
     "docker-compose.postgres.yml",
@@ -2006,7 +2006,7 @@ foreach ($fragment in @(
     '`PutObject`, `CopyObject`, completed multipart uploads, `ipfs3-import`, and ZIP extraction all publish version-aware objects.',
     'Each version retains `ETag = CID` and its encryption metadata. Deleting a version removes only public metadata: gateway Kubo pins are retained and `pin/rm` is not called.',
     'Bucket deletion requires exact removal of every public version and delete marker.',
-    'Non-goals: CORS, MFA Delete, Object Lock, pin reclamation, and replication.'
+    'Non-goals: MFA Delete, Object Lock, pin reclamation, and replication.'
 )) {
     Assert-Contains $ReadmeContractSource $fragment "README object-versioning contract is missing: $fragment"
 }
@@ -2030,11 +2030,11 @@ $expectedRoadmapVersioningSection = @'
 - [x] ListObjectVersions
 - [x] DeleteMarker support
 - [ ] Lifecycle rules (expiration, transition)
-- [ ] Bucket CORS configuration
+- [x] Bucket CORS configuration
 '@
 $roadmapVersioningSection = [regex]::Match($RoadmapSource, '(?ms)^## v0\.6 — Versioning & Lifecycle\n.*?(?=^## \S|\z)').Value.TrimEnd("`n")
-Assert-True ($roadmapVersioningSection -ceq $expectedRoadmapVersioningSection.TrimEnd("`n")) "ROADMAP v0.6 must mark exactly the three delivered versioning items complete and retain Lifecycle/CORS as unchecked"
-Assert-True (([regex]::Matches($RoadmapSource, '(?m)^- \[x\] (?:Object versioning \(enable/suspend on bucket\)|ListObjectVersions|DeleteMarker support)$')).Count -eq 3) "ROADMAP must contain exactly three completed object-versioning checkboxes"
+Assert-True ($roadmapVersioningSection -ceq $expectedRoadmapVersioningSection.TrimEnd("`n")) "ROADMAP v0.6 must promote Bucket CORS while retaining Lifecycle as unchecked"
+Assert-True (([regex]::Matches($RoadmapSource, '(?m)^- \[x\] (?:Object versioning \(enable/suspend on bucket\)|ListObjectVersions|DeleteMarker support|Bucket CORS configuration)$')).Count -eq 4) "ROADMAP must contain exactly four completed versioning and CORS checkboxes"
 Assert-True (([regex]::Matches($CargoManifestSource, '(?m)^version = "0\.1\.0"$')).Count -eq 1) "Cargo package version must remain 0.1.0"
 
 $requiredFunctions = @(
@@ -2327,3 +2327,1020 @@ Start-Sleep -Seconds 120
         }
     }
 }
+
+# Bucket CORS Task 6 is a dependency-free safety contract.  Its presence is
+# deliberately checked before its artifacts are read so the first run records
+# the causal RED instead of an incidental parser or existing-runner failure.
+$CorsRunnerPath = Join-Path $RepoRoot "scripts/bucket-cors-smoke.ps1"
+$CorsComposePath = Join-Path $RepoRoot "tests/compose.cors-validation.yml"
+$CorsEvidencePath = Join-Path $RepoRoot "docs/bucket-cors-evidence-2026-08-31.log"
+$missingCorsContracts = @(
+    @($CorsRunnerPath, $CorsComposePath, $CorsEvidencePath) | Where-Object {
+        -not (Test-Path -LiteralPath $_ -PathType Leaf)
+    }
+)
+if ($missingCorsContracts.Count -ne 0) {
+    throw "Bucket CORS static contracts are missing: $($missingCorsContracts -join '; ')"
+}
+
+$corsTokens = $null
+$corsParseErrors = $null
+$CorsRunnerAst = [System.Management.Automation.Language.Parser]::ParseFile(
+    $CorsRunnerPath,
+    [ref]$corsTokens,
+    [ref]$corsParseErrors
+)
+if ($corsParseErrors.Count -ne 0) {
+    $corsParseErrors | Format-List | Out-String | Write-Host
+    throw "scripts/bucket-cors-smoke.ps1 has parse errors"
+}
+$CorsRunnerSource = [IO.File]::ReadAllText($CorsRunnerPath)
+$CorsComposeSource = [IO.File]::ReadAllText($CorsComposePath).Replace("`r`n", "`n").Replace("`r", "`n")
+$CorsEvidenceBytes = [IO.File]::ReadAllBytes($CorsEvidencePath)
+$CorsEvidenceRaw = [Text.UTF8Encoding]::new($false, $true).GetString($CorsEvidenceBytes)
+
+# Task 7 promotion and post-review correction contracts are installed before
+# their evidence so the first run is a causal RED on missing correction receipts.
+$expectedPromotedCorsEvidence = @(
+    'Bucket CORS local validation: PASS',
+    'Hosted Bucket CORS validation: NOT RUN',
+    'Base HEAD: 4224b6da2c74e9dd7288e4751afd78a2f52e9c39',
+    'Runtime input identity: sha256:0a646f3e389e8d19b2d2ec7c8d1be0396216ed08d5e0115ef6f08f4be1c8e832',
+    'Spec SHA-256: 824f5c515ce070cceecf4c7f2171e83e1e4fc039b963fda6e10780cb2dbf9ac5',
+    'Plan SHA-256: f99612c7b8f87416c89d832802dcefcf96533f9f7fa6919bc041c31b0870fbc0',
+    'Package: 0.1.0',
+    'PowerShell: 7.5.4',
+    'Cargo: 1.98.0',
+    'Rustc: 1.98.0',
+    'Docker Server: 28.3.3',
+    'Compose: 2.39.2-desktop.1',
+    'AWS CLI: 2.36.34',
+    'Command: cargo test --lib --locked --offline',
+    'Passed count: 936',
+    'Command: cargo test --test cors --locked --offline -- --test-threads=1',
+    'Passed count: 7',
+    'Command: cargo test --test integration --locked --offline -- --test-threads=1',
+    'Passed count: 143',
+    'Command: pwsh -NoLogo -NoProfile -File tests/client-smoke.Tests.ps1',
+    'Static client-smoke: PASS',
+    'Command: cargo test --test postgres_cors --locked --offline -- --nocapture --test-threads=1',
+    'Passed count: 4',
+    'PostgreSQL 17: PASS',
+    'AWS management CRUD: PASS',
+    'AWS default CRC64NVME PUT parity: PASS',
+    'Browser valid-preflight: PASS',
+    'Browser wildcard-preflight: PASS',
+    'Browser disallowed-preflight: PASS',
+    'Browser partial-preflight: PASS',
+    'Browser plain-options fallthrough: PASS',
+    'Browser signed-actual success: PASS',
+    'Browser signed-actual S3 error: PASS',
+    'Browser custom-import preflight: PASS',
+    'Browser decompress preflight: PASS',
+    'Browser health exclusion: PASS',
+    'Browser ready exclusion: PASS',
+    'Browser overall parity: PASS',
+    'Cleanup logs captured: PASS',
+    'Cleanup Compose down: PASS',
+    'Cleanup environment restore: PASS',
+    'Cleanup residual containers: exit=0 count=0',
+    'Cleanup residual networks: exit=0 count=0',
+    'Cleanup residual volumes: exit=0 count=0',
+    'Cleanup residual images: exit=0 count=0',
+    'Cleanup residual temp: exit=0 count=0',
+    'Cleanup errors: 0',
+    'Documentation promotion: PASS',
+    'Post-review current artifact: PASS',
+    'Duplicate SDK checksum algorithm cardinality: PASS',
+    'Valid MD5 signed regression RED: 200',
+    'Valid MD5 signed regression GREEN: 400 InvalidRequest',
+    'Focused exact regression: PASS1',
+    'Final nonlive matrix: PASS lib937/cors8/integration143',
+    'Clippy: PASS',
+    'Fmt: PASS',
+    'Static: PASS',
+    'Diff: PASS'
+) -join "`n"
+$expectedPromotedCorsEvidence += "`n"
+Assert-True ($CorsEvidenceRaw -ceq $expectedPromotedCorsEvidence) 'Bucket CORS post-review correction causal RED: evidence must contain the exact promoted sanitized PASS receipt'
+
+# CRC64NVME integrity support is intentionally contracted here before its
+# implementation so the first static run records the causal RED.
+$CorsChecksumPath = Join-Path $RepoRoot 'src/cors/checksum.rs'
+$CorsModulePath = Join-Path $RepoRoot 'src/cors/mod.rs'
+$CorsHttpPath = Join-Path $RepoRoot 'src/cors/http.rs'
+$CorsOpsPath = Join-Path $RepoRoot 'src/s3/ops/cors.rs'
+$CorsTestsPath = Join-Path $RepoRoot 'tests/cors.rs'
+$corsChecksumContractFailures = [Collections.Generic.List[string]]::new()
+foreach ($path in @($CorsChecksumPath, $CorsModulePath, $CorsHttpPath, $CorsOpsPath)) {
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        $corsChecksumContractFailures.Add("CRC64NVME contract path is missing: $path")
+    }
+}
+if ($corsChecksumContractFailures.Count -eq 0) {
+    $CorsChecksumSource = [IO.File]::ReadAllText($CorsChecksumPath)
+    $CorsModuleSource = [IO.File]::ReadAllText($CorsModulePath)
+    $CorsHttpChecksumSource = [IO.File]::ReadAllText($CorsHttpPath)
+    $CorsOpsChecksumSource = [IO.File]::ReadAllText($CorsOpsPath)
+    foreach ($fragment in @(
+        '0x9a6c9329ac4bc9b5', '[u8; 8]', 'to_be_bytes', '123456789',
+        'ae8b14860a799888', 'rosUhgp5mIg='
+    )) {
+        if (-not $CorsChecksumSource.Contains($fragment, [StringComparison]::Ordinal)) {
+            $corsChecksumContractFailures.Add("CRC64NVME checksum contract is missing: $fragment")
+        }
+    }
+    foreach ($fragment in @('pub(crate) mod checksum;', 'Crc64NvmeHeader', 'x-amz-checksum-crc64nvme', 'CRC64NVME', 'ct_eq')) {
+        $source = switch ($fragment) {
+            'pub(crate) mod checksum;' { $CorsModuleSource }
+            'Crc64NvmeHeader' { $CorsModuleSource + "`n" + $CorsHttpChecksumSource }
+            'x-amz-checksum-crc64nvme' { $CorsHttpChecksumSource }
+            default { $CorsOpsChecksumSource }
+        }
+        if (-not $source.Contains($fragment, [StringComparison]::Ordinal)) {
+            $corsChecksumContractFailures.Add("CRC64NVME integrity contract is missing: $fragment")
+        }
+    }
+}
+if ($CorsRunnerSource.Contains('AWS_REQUEST_CHECKSUM_CALCULATION', [StringComparison]::Ordinal)) {
+    $corsChecksumContractFailures.Add('Bucket CORS runner must use the modern AWS CLI checksum default without an override')
+}
+if ($corsChecksumContractFailures.Count -ne 0) {
+    throw "Bucket CORS CRC64NVME causal RED: $($corsChecksumContractFailures -join '; ')"
+}
+
+$corsReviewCorrectionFailures = [Collections.Generic.List[string]]::new()
+if (-not (Test-Path -LiteralPath $CorsTestsPath -PathType Leaf)) {
+    $corsReviewCorrectionFailures.Add('focused CORS regression source is missing')
+} else {
+    $CorsTestsSource = [IO.File]::ReadAllText($CorsTestsPath)
+    $corsReviewCorrectionMatches = @([regex]::Matches(
+        $CorsTestsSource,
+        '(?s)async fn signed_management_rejects_duplicate_sdk_checksum_algorithm_with_valid_md5\(\) \{(?<body>.*?)\n\}\n\n#\[tokio::test\]'
+    ))
+    if ($corsReviewCorrectionMatches.Count -ne 1) {
+        $corsReviewCorrectionFailures.Add('focused duplicate SDK checksum regression must exist exactly once')
+    } else {
+        $corsReviewCorrectionSource = $corsReviewCorrectionMatches[0].Groups['body'].Value
+        foreach ($fragment in @(
+            'let mut headers = md5_headers(&body);',
+            'SDK_CHECKSUM_ALGORITHM,',
+            'HeaderValue::from_static("CRC64NVME")',
+            'assert_eq!(response.status(), StatusCode::BAD_REQUEST);',
+            'assert_s3_error(response, StatusCode::BAD_REQUEST, "InvalidRequest").await;'
+        )) {
+            if (-not $corsReviewCorrectionSource.Contains($fragment, [StringComparison]::Ordinal)) {
+                $corsReviewCorrectionFailures.Add("focused duplicate SDK checksum regression is missing: $fragment")
+            }
+        }
+        if (([regex]::Matches($corsReviewCorrectionSource, [regex]::Escape('headers.append('))).Count -ne 2 -or
+            ([regex]::Matches($corsReviewCorrectionSource, [regex]::Escape('SDK_CHECKSUM_ALGORITHM,'))).Count -ne 2) {
+            $corsReviewCorrectionFailures.Add('duplicate SDK checksum regression must prove cardinality two with a valid MD5')
+        }
+    }
+}
+if ($corsReviewCorrectionFailures.Count -ne 0) {
+    throw "Bucket CORS post-review correction static assertion failed: $($corsReviewCorrectionFailures -join '; ')"
+}
+
+function Get-CorsRunnerFunctionSource {
+    param([Parameter(Mandatory)][string]$Name)
+    $matches = @($CorsRunnerAst.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq $Name
+    }, $true))
+    if ($matches.Count -ne 1) { throw "Expected one Bucket CORS function named $Name, found $($matches.Count)" }
+    return $matches[0].Extent.Text
+}
+
+$corsParameterNames = @($CorsRunnerAst.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+Assert-True (($corsParameterNames -join ",") -ceq "Run,PostgresOnly,DiagnoseAws,DiagnoseBrowser") "Bucket CORS runner must expose exactly Run, PostgresOnly, DiagnoseAws, and DiagnoseBrowser switches"
+foreach ($fragment in @(
+    '[CmdletBinding()]', '[switch]$Run', '[switch]$PostgresOnly', '[switch]$DiagnoseAws', '[switch]$DiagnoseBrowser',
+    '$selectedModeCount = @(', '$Run.IsPresent', '$PostgresOnly.IsPresent', '$DiagnoseAws.IsPresent', '$DiagnoseBrowser.IsPresent',
+    'if ($selectedModeCount -gt 1)',
+    'throw "Bucket CORS runner modes are mutually exclusive"',
+    'if ($selectedModeCount -eq 0)',
+    'Write-Output "Bucket CORS validation: NOT RUN"',
+    'return'
+)) {
+    Assert-Contains $CorsRunnerSource $fragment "Bucket CORS entry-point contract is missing: $fragment"
+}
+$corsMutualIndex = $CorsRunnerSource.IndexOf('if ($selectedModeCount -gt 1)', [StringComparison]::Ordinal)
+$corsNoRunIndex = $CorsRunnerSource.IndexOf('if ($selectedModeCount -eq 0)', [StringComparison]::Ordinal)
+$corsFirstSideEffectIndex = @(
+    $CorsRunnerSource.IndexOf('Get-Command', [StringComparison]::Ordinal),
+    $CorsRunnerSource.IndexOf('Invoke-NativeCommand', [StringComparison]::Ordinal),
+    $CorsRunnerSource.IndexOf('TcpListener', [StringComparison]::Ordinal),
+    $CorsRunnerSource.IndexOf('New-CorsRunRoot', [StringComparison]::Ordinal)
+    | Where-Object { $_ -ge 0 } | Measure-Object -Minimum
+).Minimum
+Assert-True ($corsMutualIndex -ge 0 -and $corsNoRunIndex -gt $corsMutualIndex -and $corsFirstSideEffectIndex -gt $corsNoRunIndex) "Bucket CORS no-run/mutual exclusion must precede every tool, port, image, Docker, Cargo, or network action"
+
+foreach ($name in @(
+    'Write-CorsEvidence', 'Set-CorsStage', 'New-CorsRunId', 'New-CorsProjectName',
+    'New-CorsGatewayImage', 'New-CorsBucketName', 'Assert-CanonicalChildPath',
+    'New-CorsRunRoot', 'New-CorsOwnershipReceipt', 'Save-EnvironmentState',
+    'Restore-EnvironmentState', 'Invoke-NativeCommand', 'Invoke-Docker',
+    'Invoke-Compose', 'Assert-RequiredTools', 'Assert-ComposeVersion',
+    'Test-CorsLoopbackPortAvailable', 'Assert-LoopbackPortsFree', 'Test-LocalImage', 'Assert-ProjectResourcesAbsent',
+    'Assert-RequiredLocalImages', 'Invoke-OfflineGatewayBuild', 'Wait-CorsTopologyHealthy',
+    'Assert-Postgres17Ready', 'Assert-RustSuiteExecuted', 'Invoke-CorsRustSuites',
+    'Add-CorsAwsSubstageReceipt', 'Add-CorsBrowserSubstageReceipt', 'Invoke-CorsAwsParity', 'Invoke-CorsAwsDiagnostic', 'Invoke-CorsBrowserDiagnostic', 'Invoke-CorsBrowserParity', 'Test-CorsCleanupResiduals',
+    'Remove-OwnedCorsResources', 'Invoke-CorsMain'
+)) {
+    $null = Get-CorsRunnerFunctionSource $name
+}
+
+foreach ($name in @('Get-CorsHmacHex', 'Get-CorsHmacBytes', 'Get-CorsSha256Hex', 'New-CorsSignedRequest')) {
+    $null = Get-CorsRunnerFunctionSource $name
+}
+$corsSha256Source = Get-CorsRunnerFunctionSource 'Get-CorsSha256Hex'
+Assert-Contains $corsSha256Source '[AllowEmptyString()]' 'Bucket CORS SHA-256 helper must accept the empty GET payload used by the signer'
+foreach ($name in @('Get-CorsHmacHex', 'Get-CorsHmacBytes', 'Get-CorsSha256Hex', 'New-CorsSignedRequest')) {
+    Invoke-Expression (Get-CorsRunnerFunctionSource $name)
+}
+$corsSignedFixture = New-CorsSignedRequest -Method 'GET' -Uri ([uri]'http://127.0.0.1:59000/fixed-bucket/fixed-object') -Origin 'https://allowed.example'
+try {
+    Assert-True ($corsSignedFixture.Method.Method -ceq 'GET') 'Bucket CORS signer fixture must construct GET'
+    foreach ($headerName in @('Authorization', 'Origin', 'x-amz-date', 'x-amz-content-sha256')) {
+        Assert-True $corsSignedFixture.Headers.Contains($headerName) "Bucket CORS signer fixture is missing $headerName"
+    }
+} finally {
+    $corsSignedFixture.Dispose()
+}
+
+$corsRunIdSource = Get-CorsRunnerFunctionSource 'New-CorsRunId'
+$corsProjectSource = Get-CorsRunnerFunctionSource 'New-CorsProjectName'
+$corsImageSource = Get-CorsRunnerFunctionSource 'New-CorsGatewayImage'
+$corsBucketSource = Get-CorsRunnerFunctionSource 'New-CorsBucketName'
+$corsRootSource = Get-CorsRunnerFunctionSource 'New-CorsRunRoot'
+$corsReceiptSource = Get-CorsRunnerFunctionSource 'New-CorsOwnershipReceipt'
+foreach ($fragment in @(
+    'RandomNumberGenerator', "'^[0-9a-f]{32}$'", 'ToLowerInvariant()'
+)) {
+    Assert-Contains $corsRunIdSource $fragment "Bucket CORS cryptographic lowercase RunId contract is missing: $fragment"
+}
+foreach ($fragment in @(
+    '"ipfs3-cors-$RunId"', "'^[a-z0-9][a-z0-9_-]*$'"
+)) {
+    Assert-Contains $corsProjectSource $fragment "Bucket CORS project grammar is missing: $fragment"
+}
+foreach ($fragment in @(
+    '"ipfs3-cors-gateway:$RunId"', "'^[a-z0-9][a-z0-9._:-]*$'"
+)) {
+    Assert-Contains $corsImageSource $fragment "Bucket CORS gateway-image grammar is missing: $fragment"
+}
+foreach ($fragment in @(
+    '"ipfs3-cors-$RunId"', "'^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])$'"
+)) {
+    Assert-Contains $corsBucketSource $fragment "Bucket CORS bucket grammar is missing: $fragment"
+}
+foreach ($fragment in @('"ipfs-s3-bucket-cors-$($State.RunId)"', 'RunRoot must be a direct child')) {
+    Assert-Contains $corsRootSource $fragment "Bucket CORS direct-child root guard is missing: $fragment"
+}
+foreach ($fragment in @('[IO.FileMode]::CreateNew', 'ownership-receipt', 'ipfs3.cors.run')) {
+    Assert-Contains $corsReceiptSource $fragment "Bucket CORS ownership receipt contract is missing: $fragment"
+}
+
+$corsNativeSource = Get-CorsRunnerFunctionSource 'Invoke-NativeCommand'
+foreach ($fragment in @(
+    '[Diagnostics.ProcessStartInfo]::new()', '$startInfo.ArgumentList.Add($argument)',
+    'WaitForExit($timeoutMilliseconds)', 'Kill($true)', '[int[]]$AllowedExitCodes',
+    '[Parameter(Mandatory)][TimeSpan]$Timeout', '[Parameter(Mandatory)][string]$Stage',
+    'raw-output'
+)) {
+    Assert-Contains $corsNativeSource $fragment "Bucket CORS bounded native helper is incomplete: $fragment"
+}
+Assert-NotContains $CorsRunnerSource 'Start-Job' 'Bucket CORS runner must not use unbounded background jobs'
+$corsDirectNative = @($CorsRunnerAst.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.CommandAst] -and
+        $node.GetCommandName() -in @('docker', 'cargo', 'tar.exe', 'pwsh', 'curl', 'curl.exe')
+}, $true))
+Assert-True ($corsDirectNative.Count -eq 0) "Bucket CORS runner may invoke native tools only through Invoke-NativeCommand"
+foreach ($forbidden in @(
+    'docker pull', 'pull_policy:', '--pull=always', 'Install-Module', 'choco install',
+    'winget install', 'scoop install', 'Invoke-WebRequest', 'curl.exe', 'docker login',
+    'system prune', 'container_name:', 'cloudflared'
+)) {
+    Assert-NotContains ($CorsRunnerSource + "`n" + $CorsComposeSource) $forbidden "Bucket CORS validation must not pull, install, remotely inspect, or use a forbidden topology feature: $forbidden"
+}
+
+$corsToolsSource = Get-CorsRunnerFunctionSource 'Assert-RequiredTools'
+Assert-Contains $corsToolsSource '@("pwsh", "cargo", "docker", "tar.exe")' 'Bucket CORS preflight must require pwsh, cargo, docker, and tar'
+$corsComposeVersionSource = Get-CorsRunnerFunctionSource 'Assert-ComposeVersion'
+foreach ($fragment in @(
+    '"compose", "version", "--short"',
+    "'^(?<core>[0-9]+\.[0-9]+\.[0-9]+)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$'",
+    '[Version]::TryParse($composeVersionMatch.Groups["core"].Value, [ref]$composeVersion)',
+    '[Version]"2.23.1"'
+)) {
+    Assert-Contains $corsComposeVersionSource $fragment "Bucket CORS strict Compose version preflight is missing: $fragment"
+}
+$corsPortsSource = Get-CorsRunnerFunctionSource 'Assert-LoopbackPortsFree'
+$corsGeneratedPortsSource = Get-CorsRunnerFunctionSource 'New-CorsLoopbackPorts'
+$corsPortAvailabilityMatches = @($CorsRunnerAst.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Test-CorsLoopbackPortAvailable'
+}, $true))
+$corsPortAvailabilitySource = if ($corsPortAvailabilityMatches.Count -eq 1) { $corsPortAvailabilityMatches[0].Extent.Text } else { '' }
+Assert-True ($corsPortAvailabilityMatches.Count -eq 1) 'Bucket CORS port-availability helper must exist exactly once'
+foreach ($fragment in @(
+    'param([Parameter(Mandatory)][int]$Port)',
+    '$Port -lt 49152 -or $Port -gt 65535',
+    '[System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $Port)',
+    '$listener.Start()', 'return $true', 'return $false', 'finally', '$listener.Stop()'
+)) {
+    Assert-Contains $corsPortAvailabilitySource $fragment "Bucket CORS port-availability helper contract is missing: $fragment"
+}
+foreach ($fragment in @('TcpListener', 'IPAddress]::Loopback')) {
+    Assert-Contains $corsPortsSource $fragment "Bucket CORS loopback port contract is missing: $fragment"
+}
+foreach ($fragment in @(
+    '49152', '65535', '[Convert]::FromHexString($RunId)', 'DistinctPorts',
+    'while ($ports.Contains($candidate) -or -not (Test-CorsLoopbackPortAvailable -Port $candidate))',
+    '$attempt = 0', '$attempt++', '$attempt -ge $rangeSize',
+    '$candidate -eq $rangeEnd',
+    'No bindable Bucket CORS loopback port is available'
+)) {
+    Assert-Contains $corsGeneratedPortsSource $fragment "Bucket CORS generated-port contract is missing: $fragment"
+}
+$corsPortFixtureRunId = '00112233445566778899aabbccddeeff'
+$corsPortFixtureBytes = [Convert]::FromHexString($corsPortFixtureRunId)
+$corsPortFixtureInitial = 49152 + ([BitConverter]::ToUInt16($corsPortFixtureBytes, 0) % (65535 - 49152 + 1))
+$corsPortFixtureOccupied = $null
+$corsPortFixture = $null
+try {
+    Invoke-Expression $corsPortAvailabilitySource
+    Invoke-Expression $corsGeneratedPortsSource
+    $corsPortFixtureOccupied = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $corsPortFixtureInitial)
+    $corsPortFixtureOccupied.Start()
+    $corsPortFixture = New-CorsLoopbackPorts -RunId $corsPortFixtureRunId
+    $corsPortFixturePorts = @($corsPortFixture.Postgres, $corsPortFixture.Kubo, $corsPortFixture.Gateway)
+    Assert-True ($corsPortFixture.Postgres -ne $corsPortFixtureInitial) 'Bucket CORS generated first port must skip its occupied deterministic candidate'
+    Assert-True ((@($corsPortFixturePorts | Sort-Object -Unique).Count -eq 3) -and (@($corsPortFixturePorts | Where-Object { $_ -lt 49152 -or $_ -gt 65535 }).Count -eq 0)) 'Bucket CORS generated ports must remain three distinct high ports'
+} finally {
+    if ($null -ne $corsPortFixtureOccupied) { $corsPortFixtureOccupied.Stop() }
+}
+$corsPortFixtureReboundListeners = [Collections.Generic.List[System.Net.Sockets.TcpListener]]::new()
+$corsPortFixtureReboundListener = $null
+try {
+    foreach ($port in @($corsPortFixture.Postgres, $corsPortFixture.Kubo, $corsPortFixture.Gateway)) {
+        $corsPortFixtureReboundListener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $port)
+        $corsPortFixtureReboundListener.Start()
+        $corsPortFixtureReboundListeners.Add($corsPortFixtureReboundListener)
+        $corsPortFixtureReboundListener = $null
+    }
+} finally {
+    if ($null -ne $corsPortFixtureReboundListener) { $corsPortFixtureReboundListener.Stop() }
+    foreach ($listener in $corsPortFixtureReboundListeners) { $listener.Stop() }
+}
+$corsLocalImageSource = Get-CorsRunnerFunctionSource 'Test-LocalImage'
+Assert-Contains $corsLocalImageSource '"image", "inspect", $Image, "--format", "{{.Id}}"' 'Bucket CORS cached-image inspection must use the exact local image ID query'
+foreach ($image in @('postgres:17', 'ghcr.io/hugefiver/ipfs3-kubo:latest', 'ghcr.io/hugefiver/ipfs3:latest', 'rust:latest', 'amazon/aws-cli:latest')) {
+    Assert-Contains $CorsRunnerSource $image "Bucket CORS required cached image is missing: $image"
+}
+$corsPreflightSource = Get-CorsRunnerFunctionSource 'Assert-ProjectResourcesAbsent'
+foreach ($fragment in @(
+    '"ps", "-aq"', '"network", "ls", "-q"', '"volume", "ls", "-q"',
+    '"image", "ls", "-q"', '"label=com.docker.compose.project=$Project"',
+    '"label=ipfs3.cors.run=$RunId"', 'BLOCKED'
+)) {
+    Assert-Contains $corsPreflightSource $fragment "Bucket CORS project/image ownership preflight is incomplete: $fragment"
+}
+
+$corsOfflineSource = (Get-CorsRunnerFunctionSource 'Invoke-OfflineGatewayBuild') + "`n" + (Get-CorsRunnerFunctionSource 'Copy-CorsBuildInputs')
+foreach ($fragment in @(
+    '"vendor", "--locked", "--offline"', 'Copy-CorsBuildInputs',
+    'Cargo.toml', 'Cargo.lock', 'src', 'tests',
+    'replace-with = "vendored-sources"',
+    '"build", "--pull=false", "--network", "none", "--quiet"',
+    '"--label", "ipfs3.cors.run=$RunId"', '--file', '$BuildContext'
+)) {
+    Assert-Contains $corsOfflineSource $fragment "Bucket CORS offline candidate build contract is missing: $fragment"
+}
+
+$corsRustReceiptSource = Get-CorsRunnerFunctionSource 'Assert-RustSuiteExecuted'
+foreach ($fragment in @(
+    "'(?m)^running (?<running>[1-9][0-9]*) tests?$'",
+    "'(?m)^test result: ok\. (?<passed>[1-9][0-9]*) passed; 0 failed; (?<ignored>[0-9]+) ignored; (?<measured>[0-9]+) measured; (?<filtered>[0-9]+) filtered out; finished in (?<seconds>[0-9]{1,4}(?:\.[0-9]{1,3})?)s$'",
+    '$runningMatches.Count -ne 1', '$summaryMatches.Count -ne 1',
+    '$runningCount -ne $passedCount', '$seconds -gt [decimal]3600'
+)) {
+    Assert-Contains $corsRustReceiptSource $fragment "Bucket CORS Rust summary parser is incomplete: $fragment"
+}
+Invoke-Expression $corsRustReceiptSource
+function Test-CorsRustReceiptFixture {
+    param([Parameter(Mandatory)][string[]]$Lines)
+    try {
+        Assert-RustSuiteExecuted -Result ([pscustomobject]@{ StdOut = @($Lines); StdErr = @() }) -Name 'static fixture'
+        return $true
+    } catch { return $false }
+}
+Assert-True (Test-CorsRustReceiptFixture -Lines @('running 1 test', 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s')) 'Bucket CORS Rust parser must accept one executed test'
+Assert-True (Test-CorsRustReceiptFixture -Lines @('running 2 tests', 'test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3600.00s')) 'Bucket CORS Rust parser must accept bounded plural results'
+Assert-True (-not (Test-CorsRustReceiptFixture -Lines @('running 2 tests', 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s'))) 'Bucket CORS Rust parser must reject mismatched counts'
+Assert-True (-not (Test-CorsRustReceiptFixture -Lines @('running 1 test', 'test result: ok. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s'))) 'Bucket CORS Rust parser must reject failed tests'
+
+$corsSuitesSource = Get-CorsRunnerFunctionSource 'Invoke-CorsRustSuites'
+$expectedCorsRustCommands = @(
+    'cargo test --lib --locked --offline',
+    'cargo test --test cors --locked --offline -- --test-threads=1',
+    'cargo test --test integration --locked --offline -- --test-threads=1',
+    'pwsh -NoLogo -NoProfile -File tests/client-smoke.Tests.ps1',
+    'cargo test --test postgres_cors --locked --offline -- --nocapture --test-threads=1'
+)
+foreach ($command in $expectedCorsRustCommands) {
+    Assert-Contains $corsSuitesSource $command "Bucket CORS required locked/offline command is missing: $command"
+}
+$corsMainSource = Get-CorsRunnerFunctionSource 'Invoke-CorsMain'
+foreach ($fragment in @(
+    '"up", "--detach", "--pull", "never", "--no-build"',
+    'Invoke-CorsAwsParity', 'Invoke-CorsBrowserParity'
+)) {
+    Assert-Contains $corsMainSource $fragment "Bucket CORS execution/main contract is missing: $fragment"
+}
+$corsPostgresSuiteSource = Get-CorsRunnerFunctionSource 'Invoke-CorsPostgresSuite'
+Assert-Contains $corsPostgresSuiteSource 'IPFS_S3_TEST_POSTGRES_URL' 'Bucket CORS PostgreSQL suite must set the owned PostgreSQL URL'
+foreach ($terminalReceipt in @('Bucket CORS PostgreSQL validation: PASS', 'Bucket CORS validation: PASS', 'Bucket CORS AWS diagnostic: PASS', 'Bucket CORS AWS diagnostic: FAILED', 'Bucket CORS browser diagnostic: PASS', 'Bucket CORS browser diagnostic: FAILED')) {
+    Assert-Contains $CorsRunnerSource $terminalReceipt "Bucket CORS terminal receipt is missing: $terminalReceipt"
+}
+$fullOrder = @(
+    $corsMainSource.IndexOf('Invoke-CorsRustSuites -State $state -Mode "full"', [StringComparison]::Ordinal),
+    $corsMainSource.IndexOf('Assert-RequiredLocalImages -State $state -Mode "full"', [StringComparison]::Ordinal),
+    $corsMainSource.IndexOf('Invoke-OfflineGatewayBuild', [StringComparison]::Ordinal),
+    $corsMainSource.IndexOf("Wait-CorsTopologyHealthy -State `$state -Services @('postgres', 'kubo', 'gateway')", [StringComparison]::Ordinal),
+    $corsMainSource.IndexOf('Invoke-CorsPostgresSuite -State $state', [StringComparison]::Ordinal),
+    $corsMainSource.IndexOf('Invoke-CorsAwsParity -State $state', [StringComparison]::Ordinal),
+    $corsMainSource.IndexOf('Invoke-CorsBrowserParity -State $state', [StringComparison]::Ordinal)
+)
+Assert-True (@($fullOrder | Where-Object { $_ -lt 0 }).Count -eq 0 -and $fullOrder -join ',' -ceq (@($fullOrder | Sort-Object) -join ',')) 'Bucket CORS full mode must run Docker-free gates, owned topology, PostgreSQL, AWS, then browser parity in order'
+$corsAwsDiagnosticSource = Get-CorsRunnerFunctionSource 'Invoke-CorsAwsDiagnostic'
+$corsBrowserDiagnosticSource = Get-CorsRunnerFunctionSource 'Invoke-CorsBrowserDiagnostic'
+Assert-Contains $CorsRunnerSource 'Mode = if ($PostgresOnly) { "postgres" } elseif ($DiagnoseAws) { "aws" } elseif ($DiagnoseBrowser) { "browser" } else { "full" }' 'Bucket CORS state mode must select postgres, aws, browser, or full'
+foreach ($source in @(
+    (Get-CorsRunnerFunctionSource 'Assert-RequiredLocalImages'),
+    (Get-CorsRunnerFunctionSource 'Assert-ProjectResourcesAbsent')
+)) {
+    Assert-Contains $source '"full", "postgres", "aws", "browser"' 'Bucket CORS internal mode validation must accept aws and browser alongside full and postgres'
+}
+Assert-Contains $corsMainSource 'elseif ($State.Mode -notin @("aws", "browser"))' 'Bucket CORS main mode validation must reject an internal mode other than full, postgres, aws, or browser'
+foreach ($fragment in @(
+    '$State.Mode -eq "aws"', 'Invoke-CorsAwsDiagnostic -State $State', 'Get-CorsComposeNetwork -State $State',
+    'Set-CorsStage -State $State -Stage "aws"', 'New-CorsAwsConfig -State $State',
+    'Invoke-CorsAwsParity -State $State -Network $network'
+)) {
+    Assert-Contains ($corsMainSource + "`n" + $corsAwsDiagnosticSource) $fragment "Bucket CORS AWS diagnostic branch is incomplete: $fragment"
+}
+foreach ($forbidden in @('Invoke-CorsRustSuites', 'Invoke-CorsPostgresSuite', 'Invoke-CorsBrowserParity')) {
+    Assert-NotContains $corsAwsDiagnosticSource $forbidden "Bucket CORS AWS diagnostic must not invoke $forbidden"
+}
+$corsDiagnosticNetworkIndex = $corsAwsDiagnosticSource.IndexOf('Get-CorsComposeNetwork -State $State', [StringComparison]::Ordinal)
+$corsDiagnosticStageIndex = $corsAwsDiagnosticSource.IndexOf('Set-CorsStage -State $State -Stage "aws"', [StringComparison]::Ordinal)
+$corsDiagnosticConfigIndex = $corsAwsDiagnosticSource.IndexOf('New-CorsAwsConfig -State $State', [StringComparison]::Ordinal)
+$corsDiagnosticAwsIndex = $corsAwsDiagnosticSource.IndexOf('Invoke-CorsAwsParity -State $State -Network $network', [StringComparison]::Ordinal)
+Assert-True ($corsDiagnosticNetworkIndex -ge 0 -and $corsDiagnosticStageIndex -gt $corsDiagnosticNetworkIndex -and $corsDiagnosticConfigIndex -gt $corsDiagnosticStageIndex -and $corsDiagnosticAwsIndex -gt $corsDiagnosticConfigIndex) 'Bucket CORS AWS diagnostic must discover its network before the redacted AWS parity call'
+$corsAwsBranchIndex = $corsMainSource.IndexOf('if ($State.Mode -eq "aws")', [StringComparison]::Ordinal)
+$corsAwsBranchCallIndex = $corsMainSource.IndexOf('Invoke-CorsAwsDiagnostic -State $State', [StringComparison]::Ordinal)
+$corsAwsBranchPostgresIndex = $corsMainSource.IndexOf('Assert-Postgres17Ready -State $State', [StringComparison]::Ordinal)
+Assert-True ($corsAwsBranchIndex -gt $corsAwsBranchPostgresIndex -and $corsAwsBranchCallIndex -gt $corsAwsBranchIndex -and ([regex]::Matches($corsMainSource, [regex]::Escape('if ($State.Mode -eq "aws")')).Count -eq 1)) 'Bucket CORS must have one AWS diagnostic branch after PostgreSQL 17 readiness'
+$corsAwsDiagnosticBranches = @($CorsRunnerAst.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.IfStatementAst] -and
+        $node.Clauses.Count -eq 2 -and
+        $node.Clauses[0].Item1.Extent.Text -ceq '$State.Mode -eq "aws"'
+}, $true))
+Assert-True ($corsAwsDiagnosticBranches.Count -eq 1) 'Bucket CORS AST must contain exactly one AWS diagnostic branch'
+$corsAwsDiagnosticBranchSource = $corsAwsDiagnosticBranches[0].Clauses[0].Item2.Extent.Text
+Assert-True ($corsAwsDiagnosticBranchSource.Contains('Invoke-CorsAwsDiagnostic -State $State', [StringComparison]::Ordinal) -and $corsAwsDiagnosticBranchSource.Contains('return', [StringComparison]::Ordinal)) 'Bucket CORS AWS branch must return after its isolated diagnostic'
+foreach ($forbidden in @('Invoke-CorsRustSuites', 'Invoke-CorsPostgresSuite', 'Invoke-CorsBrowserParity')) {
+    Assert-NotContains $corsAwsDiagnosticBranchSource $forbidden "Bucket CORS AWS branch must not invoke $forbidden"
+}
+foreach ($fragment in @(
+    'if ($State.Mode -in @("aws", "browser"))',
+    'Assert-RequiredLocalImages -State $state -Mode $State.Mode',
+    'Assert-ProjectResourcesAbsent -State $State -Project $State.Project -RunId $State.RunId -Mode $State.Mode',
+    'Assert-LoopbackPortsFree -Ports @($State.Ports.Postgres, $State.Ports.Kubo, $State.Ports.Gateway)',
+    'Invoke-OfflineGatewayBuild -State $State -RunId $State.RunId',
+    '"up", "--detach", "--pull", "never", "--no-build"',
+    "Wait-CorsTopologyHealthy -State `$state -Services @('postgres', 'kubo', 'gateway')",
+    'Assert-Postgres17Ready -State $State'
+)) {
+    Assert-Contains $corsMainSource $fragment "Bucket CORS AWS diagnostic must retain full-topology setup: $fragment"
+}
+$corsBrowserBranchIndex = $corsMainSource.IndexOf('elseif ($State.Mode -eq "browser")', [StringComparison]::Ordinal)
+$corsBrowserBranchCallIndex = $corsMainSource.IndexOf('Invoke-CorsBrowserDiagnostic -State $State', [StringComparison]::Ordinal)
+Assert-True ($corsBrowserBranchIndex -gt $corsAwsBranchCallIndex -and $corsBrowserBranchCallIndex -gt $corsBrowserBranchIndex -and ([regex]::Matches($corsMainSource, [regex]::Escape('elseif ($State.Mode -eq "browser")')).Count -eq 1)) 'Bucket CORS must have one browser diagnostic branch after the AWS diagnostic branch'
+$corsBrowserDiagnosticBranches = @($CorsRunnerAst.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.IfStatementAst] -and
+        $node.Clauses.Count -eq 2 -and
+        $node.Clauses[1].Item1.Extent.Text -ceq '$State.Mode -eq "browser"'
+}, $true))
+Assert-True ($corsBrowserDiagnosticBranches.Count -eq 1) 'Bucket CORS AST must contain exactly one browser diagnostic branch'
+$corsBrowserDiagnosticBranchSource = $corsBrowserDiagnosticBranches[0].Clauses[1].Item2.Extent.Text
+Assert-True ($corsBrowserDiagnosticBranchSource.Contains('Invoke-CorsBrowserDiagnostic -State $State', [StringComparison]::Ordinal) -and $corsBrowserDiagnosticBranchSource.Contains('return', [StringComparison]::Ordinal)) 'Bucket CORS browser branch must return after its isolated diagnostic'
+foreach ($forbidden in @('Invoke-CorsRustSuites', 'Invoke-CorsPostgresSuite')) {
+    Assert-NotContains $corsBrowserDiagnosticBranchSource $forbidden "Bucket CORS browser branch must not invoke $forbidden"
+}
+foreach ($fragment in @(
+    'Get-CorsComposeNetwork -State $State', 'Set-CorsStage -State $State -Stage "aws"',
+    'New-CorsAwsConfig -State $State', 'Invoke-CorsAwsParity -State $State -Network $network',
+    'Set-CorsStage -State $State -Stage "browser"', 'Invoke-CorsBrowserParity -State $State'
+)) {
+    Assert-Contains $corsBrowserDiagnosticSource $fragment "Bucket CORS browser diagnostic is incomplete: $fragment"
+}
+foreach ($forbidden in @('Invoke-CorsRustSuites', 'Invoke-CorsPostgresSuite', 'Write-Host', 'Write-Output', 'StdOut', 'StdErr')) {
+    Assert-NotContains $corsBrowserDiagnosticSource $forbidden "Bucket CORS browser diagnostic must not invoke or expose $forbidden"
+}
+$corsBrowserDiagnosticOrder = @(
+    $corsBrowserDiagnosticSource.IndexOf('Get-CorsComposeNetwork -State $State', [StringComparison]::Ordinal),
+    $corsBrowserDiagnosticSource.IndexOf('Set-CorsStage -State $State -Stage "aws"', [StringComparison]::Ordinal),
+    $corsBrowserDiagnosticSource.IndexOf('New-CorsAwsConfig -State $State', [StringComparison]::Ordinal),
+    $corsBrowserDiagnosticSource.IndexOf('Invoke-CorsAwsParity -State $State -Network $network', [StringComparison]::Ordinal),
+    $corsBrowserDiagnosticSource.IndexOf('Set-CorsStage -State $State -Stage "browser"', [StringComparison]::Ordinal),
+    $corsBrowserDiagnosticSource.IndexOf('Invoke-CorsBrowserParity -State $State', [StringComparison]::Ordinal)
+)
+Assert-True (@($corsBrowserDiagnosticOrder | Where-Object { $_ -lt 0 }).Count -eq 0 -and $corsBrowserDiagnosticOrder -join ',' -ceq (@($corsBrowserDiagnosticOrder | Sort-Object) -join ',')) 'Bucket CORS browser diagnostic must perform AWS setup before browser parity'
+$postgresOnlySource = Get-CorsRunnerFunctionSource 'Invoke-CorsPostgresOnly'
+# Causal RED: Compose interpolates every service definition, including Kubo and
+# gateway, before it starts PostgreSQL-only.  All interpolation values therefore
+# must be established outside the full-topology mode branch before Compose runs.
+$corsEnvironmentSnapshotIndex = $CorsRunnerSource.IndexOf('$state.EnvironmentState = Save-EnvironmentState -Names $TouchedEnvironmentNames', [StringComparison]::Ordinal)
+$corsMainInvocationIndex = $CorsRunnerSource.IndexOf('Invoke-CorsMain -State $state', [StringComparison]::Ordinal)
+Assert-True ($corsEnvironmentSnapshotIndex -ge 0 -and $corsMainInvocationIndex -gt $corsEnvironmentSnapshotIndex) 'Bucket CORS environment setup must follow its snapshot and precede main execution'
+$corsEnvironmentSetupSource = $CorsRunnerSource.Substring($corsEnvironmentSnapshotIndex, $corsMainInvocationIndex - $corsEnvironmentSnapshotIndex)
+foreach ($fragment in @(
+    'Set-CorsEnvironment -Name "IPFS_S3_CORS_POSTGRES_PORT" -Value ([string]$state.Ports.Postgres)',
+    'Set-CorsEnvironment -Name "IPFS_S3_CORS_KUBO_PORT" -Value ([string]$state.Ports.Kubo)',
+    'Set-CorsEnvironment -Name "IPFS_S3_CORS_GATEWAY_PORT" -Value ([string]$state.Ports.Gateway)',
+    'Set-CorsEnvironment -Name "IPFS_S3_CORS_IMAGE" -Value $state.GatewayImage',
+    'Set-CorsEnvironment -Name "IPFS_S3_CORS_PROJECT_LABEL" -Value $state.Project',
+    'Set-CorsEnvironment -Name "IPFS_S3_CORS_RUN_LABEL" -Value $state.RunId'
+)) {
+    Assert-Contains $corsEnvironmentSetupSource $fragment "Bucket CORS Compose interpolation value must be set before Invoke-CorsMain: $fragment"
+}
+Assert-NotContains $corsEnvironmentSetupSource 'if ($state.Mode -in @("full", "aws", "browser"))' 'Bucket CORS Compose interpolation setup must not be conditional on full-topology modes'
+$corsFullPortGateOrder = @(
+    $corsMainSource.IndexOf('Assert-RequiredLocalImages -State $state -Mode "full"', [StringComparison]::Ordinal),
+    $corsMainSource.IndexOf('Assert-ProjectResourcesAbsent -State $State -Project $State.Project -RunId $State.RunId -Mode "full"', [StringComparison]::Ordinal),
+    $corsMainSource.IndexOf('Assert-LoopbackPortsFree -Ports @($State.Ports.Postgres, $State.Ports.Kubo, $State.Ports.Gateway)', [StringComparison]::Ordinal)
+)
+$corsPostgresPortGateOrder = @(
+    $postgresOnlySource.IndexOf('Assert-RequiredLocalImages -State $State -Mode "postgres"', [StringComparison]::Ordinal),
+    $postgresOnlySource.IndexOf('Assert-ProjectResourcesAbsent -State $State -Project $State.Project -RunId $State.RunId -Mode "postgres"', [StringComparison]::Ordinal),
+    $postgresOnlySource.IndexOf('Assert-LoopbackPortsFree -Ports @($State.Ports.Postgres)', [StringComparison]::Ordinal)
+)
+Assert-True (@($corsFullPortGateOrder | Where-Object { $_ -lt 0 }).Count -eq 0 -and $corsFullPortGateOrder -join ',' -ceq (@($corsFullPortGateOrder | Sort-Object) -join ',')) 'Bucket CORS full-mode second bind gate must follow image and ownership preflights'
+Assert-True (@($corsPostgresPortGateOrder | Where-Object { $_ -lt 0 }).Count -eq 0 -and $corsPostgresPortGateOrder -join ',' -ceq (@($corsPostgresPortGateOrder | Sort-Object) -join ',')) 'Bucket CORS PostgreSQL-only second bind gate must follow image and ownership preflights'
+foreach ($forbidden in @('kubo', 'gateway', 'Invoke-CorsAwsParity', 'Invoke-CorsBrowserParity', 'Invoke-OfflineGatewayBuild')) {
+    Assert-NotContains $postgresOnlySource $forbidden "Bucket CORS PostgreSQL-only mode must not invoke $forbidden"
+}
+foreach ($fragment in @('"up", "--detach", "--pull", "never", "--no-build", "postgres"', 'Assert-Postgres17Ready', 'Invoke-CorsPostgresSuite')) {
+    Assert-Contains $postgresOnlySource $fragment "Bucket CORS PostgreSQL-only mode is incomplete: $fragment"
+}
+
+$corsEvidenceSource = Get-CorsRunnerFunctionSource 'Write-CorsEvidence'
+$corsAwsSource = (Get-CorsRunnerFunctionSource 'Invoke-CorsAwsParity') + "`n" + (Get-CorsRunnerFunctionSource 'Invoke-CorsAws') + "`n" + (Get-CorsRunnerFunctionSource 'New-CorsAwsConfig') + "`n" + (Get-CorsRunnerFunctionSource 'Assert-CorsAwsAbsent')
+foreach ($fragment in @(
+    'amazon/aws-cli:latest', '"run", "--rm", "--pull=never"',
+    'AWS_CONFIG_FILE=/work/aws-config', 'addressing_style = path',
+    'create-bucket', 'put-bucket-cors', 'get-bucket-cors', 'delete-bucket-cors',
+    'NoSuchCORSConfiguration'
+)) {
+    Assert-Contains $corsAwsSource $fragment "Bucket CORS AWS management parity contract is missing: $fragment"
+}
+Assert-NotContains ($CorsRunnerSource + "`n" + $CorsComposeSource) 'AWS_REQUEST_CHECKSUM_CALCULATION' 'Bucket CORS runner must preserve the modern AWS CLI checksum default globally'
+$corsAwsParitySource = Get-CorsRunnerFunctionSource 'Invoke-CorsAwsParity'
+$corsAwsReceiptHelperSource = Get-CorsRunnerFunctionSource 'Add-CorsAwsSubstageReceipt'
+$corsAwsSubstages = @('files-written', 'bucket-created', 'initial-put', 'initial-get', 'initial-assert', 'replacement-put', 'replacement-get', 'replacement-assert', 'deleted', 'absent-verified', 'final-put', 'management-passed')
+foreach ($source in @($corsEvidenceSource, $corsAwsReceiptHelperSource)) {
+    Assert-Contains $source 'aws-substage=' 'Bucket CORS AWS substage receipt grammar is missing'
+}
+$corsAwsPreviousReceiptIndex = -1
+foreach ($substage in $corsAwsSubstages) {
+    $startCall = '-Name "' + $substage + '" -Outcome "start"'
+    $passCall = '-Name "' + $substage + '" -Outcome "pass"'
+    $startIndex = $corsAwsParitySource.IndexOf($startCall, [StringComparison]::Ordinal)
+    $passIndex = $corsAwsParitySource.IndexOf($passCall, [StringComparison]::Ordinal)
+    Assert-True ($startIndex -gt $corsAwsPreviousReceiptIndex -and $passIndex -gt $startIndex) "Bucket CORS AWS substage receipts are missing or out of order: $substage"
+    $corsAwsPreviousReceiptIndex = $passIndex
+}
+Invoke-Expression $corsEvidenceSource
+Invoke-Expression $corsAwsReceiptHelperSource
+function Test-CorsAwsSubstageReceiptFixture {
+    param([Parameter(Mandatory)][string[]]$Events)
+    $fixtureState = @{ Receipts = [Collections.Generic.List[string]]::new() }
+    try {
+        foreach ($event in $Events) {
+            $parts = $event.Split(':', 2)
+            Add-CorsAwsSubstageReceipt -State $fixtureState -Name $parts[0] -Outcome $parts[1]
+        }
+        return @($fixtureState.Receipts)
+    } catch {
+        return @()
+    }
+}
+$corsAwsFixtureEvents = foreach ($substage in $corsAwsSubstages) { "${substage}:start"; "${substage}:pass" }
+$corsAwsExpectedReceipts = foreach ($substage in $corsAwsSubstages) { "[assertion] aws-substage=${substage}-start"; "[assertion] aws-substage=${substage}-pass" }
+$corsAwsActualReceipts = @(Test-CorsAwsSubstageReceiptFixture -Events @($corsAwsFixtureEvents))
+Assert-True (($corsAwsActualReceipts -join "`n") -ceq ($corsAwsExpectedReceipts -join "`n")) 'Bucket CORS AWS receipt fixture must preserve the exact fixed substage grammar and order'
+Assert-True (@(Test-CorsAwsSubstageReceiptFixture -Events @('unknown:start')).Count -eq 0) 'Bucket CORS AWS receipt fixture must reject an unknown substage'
+Assert-True (@(Test-CorsAwsSubstageReceiptFixture -Events @('files-written:unknown')).Count -eq 0) 'Bucket CORS AWS receipt fixture must reject an unknown outcome'
+try {
+    $null = Write-CorsEvidence -Category 'assertion' -Value 'aws-substage=unknown-start'
+    throw 'Bucket CORS AWS receipt grammar accepted an unknown substage'
+} catch [System.Management.Automation.RuntimeException] {
+    if ($_.Exception.Message -eq 'Bucket CORS AWS receipt grammar accepted an unknown substage') { throw }
+}
+$corsBrowserSource = Get-CorsRunnerFunctionSource 'Invoke-CorsBrowserParity'
+$corsStrictModeHeaderValuesFixture = {
+    param(
+        [Parameter(Mandatory)][Net.Http.HttpResponseMessage]$Response,
+        [Parameter(Mandatory)][string]$Name
+    )
+    Set-StrictMode -Version Latest
+    if (-not $Response.Headers.Contains($Name)) { return @() }
+    return @($Response.Headers.GetValues($Name))
+}
+$corsStrictModeResponse = [Net.Http.HttpResponseMessage]::new()
+try {
+    $corsStrictModeDirectCountThrew = & {
+        Set-StrictMode -Version Latest
+        try {
+            $null = (& $corsStrictModeHeaderValuesFixture -Response $corsStrictModeResponse -Name 'Access-Control-Allow-Credentials').Count
+            return $false
+        } catch {
+            return $true
+        }
+    }
+    Assert-True $corsStrictModeDirectCountThrew 'Bucket CORS StrictMode fixture must prove direct empty output Count throws before the array-wrapper fix'
+    $corsStrictModeAbsentValues = @(& $corsStrictModeHeaderValuesFixture -Response $corsStrictModeResponse -Name 'Access-Control-Allow-Credentials')
+    Assert-True ($corsStrictModeAbsentValues.Count -eq 0) 'Bucket CORS StrictMode fixture must count absent header output as zero via an array wrapper'
+    $null = $corsStrictModeResponse.Headers.TryAddWithoutValidation('Access-Control-Allow-Credentials', 'true')
+    $corsStrictModePresentValues = @(& $corsStrictModeHeaderValuesFixture -Response $corsStrictModeResponse -Name 'Access-Control-Allow-Credentials')
+    Assert-True ($corsStrictModePresentValues.Count -eq 1 -and $corsStrictModePresentValues[0] -ceq 'true') 'Bucket CORS StrictMode fixture must count present header values as one via an array wrapper'
+} finally {
+    $corsStrictModeResponse.Dispose()
+}
+$expectedWildcardCredentialsCheck = '@(Get-CorsHttpHeaderValues -Response $response -Name "Access-Control-Allow-Credentials").Count'
+$directWildcardCredentialsCheck = '(Get-CorsHttpHeaderValues -Response $response -Name "Access-Control-Allow-Credentials").Count'
+$corsWildcardCredentialsStaticFailures = [Collections.Generic.List[string]]::new()
+if (-not $corsBrowserSource.Contains($expectedWildcardCredentialsCheck, [StringComparison]::Ordinal)) {
+    $corsWildcardCredentialsStaticFailures.Add('wildcard credentials absence check must count the array subexpression')
+}
+if ([regex]::IsMatch($corsBrowserSource, '(?<!@)' + [regex]::Escape($directWildcardCredentialsCheck))) {
+    $corsWildcardCredentialsStaticFailures.Add('wildcard credentials absence check must reject the direct parenthesized Count form')
+}
+if ($corsWildcardCredentialsStaticFailures.Count -ne 0) {
+    throw "Bucket CORS wildcard credentials static RED: $($corsWildcardCredentialsStaticFailures -join '; ')"
+}
+foreach ($fragment in @('valid-preflight', 'disallowed-preflight', 'partial-preflight', 'plain-options', 'signed-actual', 'custom-import-preflight', 'decompress-preflight')) {
+    Assert-Contains $corsBrowserSource $fragment "Bucket CORS browser parity scenario is missing: $fragment"
+}
+Assert-Contains $corsBrowserSource '$disallowed.Headers.TryAddWithoutValidation("Access-Control-Request-Method", "DELETE")' 'Bucket CORS disallowed preflight must use a method rejected by both the exact and wildcard rules'
+Assert-NotContains $corsBrowserSource '$disallowed.Headers.TryAddWithoutValidation("Access-Control-Request-Method", "GET")' 'Bucket CORS disallowed preflight must not expect wildcard GET to be rejected'
+Assert-Contains $corsBrowserSource '-Scenario "plain-options" -ExpectedStatus @(400, 403, 404, 405, 501) -ExpectCors $false' 'Bucket CORS plain OPTIONS must accept the normal s3s NotImplemented 501 while preserving the no-CORS assertion'
+Assert-NotContains $corsBrowserSource '-Scenario "plain-options" -ExpectedStatus @(400, 403, 404, 405) -ExpectCors $false' 'Bucket CORS plain OPTIONS must not reject the normal s3s NotImplemented 501'
+foreach ($forbiddenPlainStatus in @(200, 500, 502, 503, 504)) {
+    Assert-True (-not [regex]::IsMatch($corsBrowserSource, '-Scenario "plain-options" -ExpectedStatus @\([^\)]*\b' + $forbiddenPlainStatus + '\b')) "Bucket CORS plain OPTIONS must reject unsafe status $forbiddenPlainStatus"
+}
+$corsBrowserReceiptHelperSource = Get-CorsRunnerFunctionSource 'Add-CorsBrowserSubstageReceipt'
+$corsBrowserSubstages = @(
+    'valid-preflight', 'wildcard-preflight', 'disallowed-preflight', 'partial-preflight',
+    'plain-options', 'signed-actual', 'signed-actual-error', 'custom-import-preflight',
+    'decompress-preflight', 'health-exclusion', 'ready-exclusion', 'parity'
+)
+foreach ($source in @($corsEvidenceSource, $corsBrowserReceiptHelperSource)) {
+    Assert-Contains $source 'browser-substage=' 'Bucket CORS browser substage receipt grammar is missing'
+}
+Assert-Contains $corsEvidenceSource 'browser-substage=(?:valid-preflight|wildcard-preflight|disallowed-preflight|partial-preflight|plain-options|signed-actual|signed-actual-error|custom-import-preflight|decompress-preflight|health-exclusion|ready-exclusion|parity)-(?:start|pass)' 'Bucket CORS browser substage grammar must allow exactly the fixed 12 names and paired outcomes'
+foreach ($fragment in @(
+    '[ValidateSet("valid-preflight", "wildcard-preflight", "disallowed-preflight", "partial-preflight", "plain-options", "signed-actual", "signed-actual-error", "custom-import-preflight", "decompress-preflight", "health-exclusion", "ready-exclusion", "parity")][string]$Name',
+    '[ValidateSet("start", "pass")][string]$Outcome',
+    'Write-CorsEvidence -Category "assertion" -Value "browser-substage=$Name-$Outcome"'
+)) {
+    Assert-Contains $corsBrowserReceiptHelperSource $fragment "Bucket CORS browser substage helper contract is missing: $fragment"
+}
+foreach ($forbidden in @('Write-Host', 'Write-Output', 'StdOut', 'StdErr')) {
+    Assert-NotContains $corsBrowserReceiptHelperSource $forbidden "Bucket CORS browser substage helper must not expose raw values: $forbidden"
+}
+$corsBrowserPreviousReceiptIndex = -1
+foreach ($substage in $corsBrowserSubstages) {
+    $startCall = '-Name "' + $substage + '" -Outcome "start"'
+    $passCall = '-Name "' + $substage + '" -Outcome "pass"'
+    $startIndex = $corsBrowserSource.IndexOf($startCall, [StringComparison]::Ordinal)
+    $passIndex = $corsBrowserSource.IndexOf($passCall, [StringComparison]::Ordinal)
+    Assert-True ($startIndex -gt $corsBrowserPreviousReceiptIndex -and $passIndex -gt $startIndex) "Bucket CORS browser substage receipts are missing or out of order: $substage"
+    $corsBrowserPreviousReceiptIndex = $passIndex
+}
+Invoke-Expression $corsBrowserReceiptHelperSource
+function Test-CorsBrowserSubstageReceiptFixture {
+    param([Parameter(Mandatory)][string[]]$Events)
+    $fixtureState = @{ Receipts = [Collections.Generic.List[string]]::new() }
+    try {
+        foreach ($event in $Events) {
+            $parts = $event.Split(':', 2)
+            Add-CorsBrowserSubstageReceipt -State $fixtureState -Name $parts[0] -Outcome $parts[1]
+        }
+        return @($fixtureState.Receipts)
+    } catch {
+        return @()
+    }
+}
+$corsBrowserFixtureEvents = foreach ($substage in $corsBrowserSubstages) { "${substage}:start"; "${substage}:pass" }
+$corsBrowserExpectedReceipts = foreach ($substage in $corsBrowserSubstages) { "[assertion] browser-substage=${substage}-start"; "[assertion] browser-substage=${substage}-pass" }
+$corsBrowserActualReceipts = @(Test-CorsBrowserSubstageReceiptFixture -Events @($corsBrowserFixtureEvents))
+Assert-True (($corsBrowserActualReceipts -join "`n") -ceq ($corsBrowserExpectedReceipts -join "`n")) 'Bucket CORS browser receipt fixture must preserve the exact fixed 12-substage grammar and order'
+Assert-True (@(Test-CorsBrowserSubstageReceiptFixture -Events @('unknown:start')).Count -eq 0) 'Bucket CORS browser receipt fixture must reject an unknown substage'
+Assert-True (@(Test-CorsBrowserSubstageReceiptFixture -Events @('valid-preflight:unknown')).Count -eq 0) 'Bucket CORS browser receipt fixture must reject an unknown outcome'
+try {
+    $null = Write-CorsEvidence -Category 'assertion' -Value 'browser-substage=unknown-start'
+    throw 'Bucket CORS browser receipt grammar accepted an unknown substage'
+} catch [System.Management.Automation.RuntimeException] {
+    if ($_.Exception.Message -eq 'Bucket CORS browser receipt grammar accepted an unknown substage') { throw }
+}
+foreach ($scenario in @(
+    'valid-preflight', 'wildcard-preflight', 'disallowed-preflight', 'partial-preflight', 'plain-options',
+    'signed-actual', 'signed-actual-error', 'custom-import-preflight', 'decompress-preflight', 'health-ready-exclusion'
+)) {
+    Assert-Contains $corsBrowserSource ('"' + $scenario + '"') "Bucket CORS browser success receipt scenario must remain available in normal and diagnostic mode: $scenario"
+}
+Assert-Contains $corsBrowserSource 'Value "browser-$scenario=passed"' 'Bucket CORS legacy browser scenario pass receipts must remain available in normal and diagnostic mode'
+Assert-Contains $corsBrowserSource 'Value "browser-parity=passed"' 'Bucket CORS legacy browser parity pass receipt must remain available in normal and diagnostic mode'
+
+$corsBrowserFailureScenarios = @(
+    'valid-preflight', 'wildcard-preflight', 'disallowed-preflight', 'partial-preflight',
+    'plain-options', 'signed-actual', 'signed-actual-error', 'custom-import-preflight',
+    'decompress-preflight', 'health-exclusion', 'ready-exclusion'
+)
+$corsBrowserFailureCategories = @(
+    'transport', 'status', 'cors-presence', 'allow-origin', 'credentials',
+    'allow-method', 'allow-headers', 'max-age', 'expose-headers', 'vary'
+)
+$corsBrowserTrackedAssertionCategories = @(
+    'transport', 'allow-origin', 'credentials', 'allow-method', 'allow-headers',
+    'max-age', 'expose-headers', 'vary'
+)
+$corsBrowserFailureGrammar = 'browser-failure=(?:valid-preflight|wildcard-preflight|disallowed-preflight|partial-preflight|plain-options|signed-actual|signed-actual-error|custom-import-preflight|decompress-preflight|health-exclusion|ready-exclusion)-(?:transport|status|cors-presence|allow-origin|credentials|allow-method|allow-headers|max-age|expose-headers|vary)'
+Assert-Contains $corsEvidenceSource $corsBrowserFailureGrammar 'Bucket CORS browser failure receipt grammar must allow exactly the fixed scenarios and categories'
+foreach ($category in $corsBrowserFailureCategories) {
+    $value = "browser-failure=valid-preflight-$category"
+    Assert-True ((Write-CorsEvidence -Category 'assertion' -Value $value) -ceq "[assertion] $value") 'Bucket CORS browser failure receipt fixture must accept each fixed category for a safe scenario'
+}
+foreach ($value in @(
+    'browser-failure=unknown-transport',
+    'browser-failure=valid-preflight-unknown',
+    'browser-failure=valid-preflight-transport-suffix',
+    'browser-failure=valid-preflight-transport raw-payload'
+)) {
+    $rejected = $false
+    try {
+        $null = Write-CorsEvidence -Category 'assertion' -Value $value
+    } catch {
+        $rejected = $true
+    }
+    Assert-True $rejected 'Bucket CORS browser failure receipt fixture must reject unknown, suffixed, or raw values'
+}
+$corsBrowserFailureSource = Get-CorsRunnerFunctionSource 'Invoke-CorsBrowserParity'
+foreach ($fragment in @(
+    '$currentScenario = $null',
+    '$currentExpectedAssertionCategory = "transport"',
+    'if ($null -ne $currentScenario)',
+    '"Bucket CORS browser scenario returned an unexpected status" { "status" }',
+    '"Bucket CORS browser scenario returned an unexpected CORS header set" { "cors-presence" }',
+    'Write-CorsEvidence -Category "assertion" -Value "browser-failure=$currentScenario-$failureCategory"',
+    'throw "Bucket CORS browser parity failed"'
+)) {
+    Assert-Contains $corsBrowserFailureSource $fragment "Bucket CORS browser failure catch is missing: $fragment"
+}
+Assert-True (([regex]::Matches($corsBrowserFailureSource, [regex]::Escape('browser-failure=$currentScenario-$failureCategory'))).Count -eq 1) 'Bucket CORS browser parity must emit exactly one failure receipt'
+foreach ($scenario in $corsBrowserFailureScenarios) {
+    Assert-Contains $corsBrowserFailureSource ('$currentScenario = "' + $scenario + '"') "Bucket CORS browser failure tracking must identify $scenario"
+}
+foreach ($category in $corsBrowserTrackedAssertionCategories) {
+    Assert-Contains $corsBrowserFailureSource ('$currentExpectedAssertionCategory = "' + $category + '"') "Bucket CORS browser failure tracking must identify $category"
+}
+$browserFailureReceiptIndex = $corsBrowserFailureSource.IndexOf('Write-CorsEvidence -Category "assertion" -Value "browser-failure=$currentScenario-$failureCategory"', [StringComparison]::Ordinal)
+$browserFailureThrowIndex = $corsBrowserFailureSource.IndexOf('throw "Bucket CORS browser parity failed"', [StringComparison]::Ordinal)
+Assert-True ($browserFailureReceiptIndex -ge 0 -and $browserFailureThrowIndex -gt $browserFailureReceiptIndex) 'Bucket CORS browser failure receipt must precede the fixed generic error'
+Assert-NotContains $corsBrowserFailureSource 'throw $_' 'Bucket CORS browser failure must not rethrow raw exception data'
+$corsHttpSource = Get-CorsRunnerFunctionSource 'Invoke-CorsHttp'
+foreach ($fragment in @('$completed = $false', '$completed = $true', 'if (-not $completed -and $null -ne $response)', '$response.Dispose()')) {
+    Assert-Contains $corsHttpSource $fragment "Bucket CORS failed request disposal is missing: $fragment"
+}
+
+$corsCleanupSource = Get-CorsRunnerFunctionSource 'Remove-OwnedCorsResources'
+$corsResidualSource = Get-CorsRunnerFunctionSource 'Test-CorsCleanupResiduals'
+foreach ($fragment in @('"logs", "--no-color"', '"down", "--volumes", "--remove-orphans"', '"image", "rm", $State.GatewayImage', 'Remove-OwnedCorsRunRoot', 'Restore-EnvironmentState -State $State.EnvironmentState')) {
+    Assert-Contains $corsCleanupSource $fragment "Bucket CORS logs-first cleanup contract is incomplete: $fragment"
+}
+foreach ($fragment in @('containers', 'networks', 'volumes', 'images', 'ExitCode', 'Count')) {
+    Assert-Contains $corsResidualSource $fragment "Bucket CORS residual proof is incomplete: $fragment"
+}
+foreach ($fragment in @('temp-root', 'cleanup-errors=$($cleanupErrors.Count)')) {
+    Assert-Contains ($corsCleanupSource + "`n" + $CorsRunnerSource) $fragment "Bucket CORS final cleanup proof is incomplete: $fragment"
+}
+foreach ($fragment in @('$State.Mode -in @("full", "aws", "browser")', 'GatewayImagePreflightAbsent', 'GatewayImageOwned')) {
+    Assert-Contains $corsCleanupSource $fragment "Bucket CORS diagnostics must retain full-mode image cleanup: $fragment"
+}
+foreach ($environmentName in @('COMPOSE_DISABLE_ENV_FILE', 'IPFS_S3_CORS_POSTGRES_PORT', 'IPFS_S3_CORS_KUBO_PORT', 'IPFS_S3_CORS_GATEWAY_PORT', 'IPFS_S3_CORS_IMAGE', 'IPFS_S3_TEST_POSTGRES_URL')) {
+    Assert-Contains $CorsRunnerSource ('"' + $environmentName + '"') "Bucket CORS runner must snapshot and restore $environmentName"
+}
+$corsEvidenceSource = Get-CorsRunnerFunctionSource 'Write-CorsEvidence'
+Assert-Contains $corsEvidenceSource "'^[A-Za-z0-9._:=/ -]+$'" 'Bucket CORS evidence must use a fixed safe grammar'
+foreach ($forbidden in @('StdOut', 'StdErr', 'Write-Host', 'Write-Output')) {
+    Assert-NotContains $corsEvidenceSource $forbidden "Bucket CORS evidence writer must never emit raw process data: $forbidden"
+}
+
+foreach ($fragment in @(
+    'services:', '  postgres:', '  kubo:', '  gateway:', 'image: postgres:17',
+    'image: ghcr.io/hugefiver/ipfs3-kubo:latest', 'image: "${IPFS_S3_CORS_IMAGE:?required}"',
+    '127.0.0.1:${IPFS_S3_CORS_POSTGRES_PORT:?required}:5432',
+    '127.0.0.1:${IPFS_S3_CORS_KUBO_PORT:?required}:5001',
+    '127.0.0.1:${IPFS_S3_CORS_GATEWAY_PORT:?required}:9000',
+    'IPFS_S3_DATABASE_URL: postgres://ipfs3:ipfs3@postgres:5432/ipfs3',
+    'IPFS_S3_KUBO_RPC_URL: http://kubo:5001', 'IPFS_S3_ACCESS_KEY_ID: test',
+    'IPFS_S3_SECRET_ACCESS_KEY: test',
+    'IPFS_S3_MASTER_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"',
+    'ipfs3.cors.project: "${IPFS_S3_CORS_PROJECT_LABEL:?required}"',
+    'ipfs3.cors.run: "${IPFS_S3_CORS_RUN_LABEL:?required}"',
+    'networks:', 'cors_validation:', 'volumes:', 'postgres_data:', 'kubo_data:'
+)) {
+    Assert-Contains $CorsComposeSource $fragment "Bucket CORS isolated Compose topology is missing: $fragment"
+}
+Assert-True (([regex]::Matches($CorsComposeSource, '(?m)^  (?:postgres|kubo|gateway):$')).Count -eq 3) 'Bucket CORS Compose must contain exactly PostgreSQL, Kubo, and gateway services'
+Assert-True (([regex]::Matches($CorsComposeSource, '(?m)^\s*- "127\.0\.0\.1:\$\{IPFS_S3_CORS_[A-Z_]+_PORT:\?required\}:(?:5432|5001|9000)"$')).Count -eq 3) 'Bucket CORS Compose must contain exactly three required loopback ports'
+foreach ($forbidden in @('container_name:', 'pull_policy:', 'external:', 'profiles:', 'cloudflared')) {
+    Assert-NotContains $CorsComposeSource $forbidden "Bucket CORS Compose must not use $forbidden"
+}
+
+$mainSource = [IO.File]::ReadAllText((Join-Path $RepoRoot 'src/main.rs')).Replace("`r`n", "`n")
+$corsHttpSource = [IO.File]::ReadAllText((Join-Path $RepoRoot 'src/cors/http.rs')).Replace("`r`n", "`n")
+$bridgeIndex = $mainSource.IndexOf('s3::http::bridge_chunked_content_length', [StringComparison]::Ordinal)
+$corsLayerIndex = $mainSource.IndexOf('ipfs_s3_gateway::cors::http::bucket_cors', [StringComparison]::Ordinal)
+Assert-True ($bridgeIndex -ge 0 -and $corsLayerIndex -gt $bridgeIndex) 'Bucket CORS middleware must remain outside bridge_chunked_content_length'
+foreach ($fragment in @(
+    'matches!(request.uri().path(), "/health" | "/ready")',
+    'is_put_bucket_cors(&request, bucket_path.bucket_only)',
+    'Request::from_parts(parts, Body::from(bytes))',
+    'fn classify_bucket_path(path: &str)', 'parse_path_style(&format!("/{bucket}"))'
+)) {
+    Assert-Contains $corsHttpSource $fragment "Bucket CORS middleware safety contract is missing: $fragment"
+}
+foreach ($forbidden in @('request.headers().get(HOST)', 'HeaderName::from_static("host")', 'Host')) {
+    Assert-NotContains $corsHttpSource $forbidden "Bucket CORS path classifier must not infer a bucket from Host"
+}
+
+Assert-True ($CorsEvidenceBytes.Count -lt 3 -or -not ($CorsEvidenceBytes[0] -eq 0xef -and $CorsEvidenceBytes[1] -eq 0xbb -and $CorsEvidenceBytes[2] -eq 0xbf)) 'Bucket CORS evidence must be UTF-8 without a BOM'
+Assert-True (-not $CorsEvidenceRaw.Contains("`r", [StringComparison]::Ordinal)) 'Bucket CORS evidence must use LF line endings'
+Assert-True ([regex]::IsMatch($CorsEvidenceRaw, '\A[\x20-\x7E\n]*\z')) 'Bucket CORS evidence must remain portable fixed text'
+$corsReadmePromoted = $ReadmeSource.Contains('## Bucket CORS', [StringComparison]::Ordinal)
+$corsRoadmapPromoted = $RoadmapSource.Contains('- [x] Bucket CORS configuration', [StringComparison]::Ordinal)
+Assert-True ($corsReadmePromoted -and $corsRoadmapPromoted) 'Bucket CORS README and ROADMAP promotion must be atomic after evidence PASS'
+Assert-True ($RoadmapSource.Contains('- [ ] Lifecycle rules (expiration, transition)', [StringComparison]::Ordinal)) 'Bucket CORS promotion must leave Lifecycle unchecked'
+Assert-True (([regex]::Matches($ReadmeSource, '(?m)^## Bucket CORS$')).Count -eq 1) 'README must contain exactly one Bucket CORS section'
+$readmeCorsContractSource = [regex]::Replace($ReadmeSource, '\s+', ' ').Trim()
+foreach ($fragment in @(
+    '[approved Bucket CORS design](docs/superpowers/specs/2026-08-31-bucket-cors-design.md)',
+    '[sanitized LOCAL evidence](docs/bucket-cors-evidence-2026-08-31.log)',
+    'path-style Bucket CORS', 'native signed management CRUD', 'MD5 or the AWS CLI default `CRC64NVME`',
+    'unsigned preflight', 'signed actual responses, including S3 errors', 'custom import and decompress routes',
+    'first matching rule wins', '`/health` and `/ready` are excluded', 'Non-goals: virtual-hosted-style routing'
+)) {
+    Assert-Contains $readmeCorsContractSource $fragment "README Bucket CORS promotion contract is missing: $fragment"
+}
+
+$protectedHashes = @{
+    'Cargo.toml' = '86f5c654c8b54e57d4b324da0faf75df8f0353c4fa2df208da924dddc49f8764'
+    '.github/workflows/ci.yml' = 'e86856e8d49671bb7eee070fcf44eb288dec4649ea107ce926512cf6a6611c34'
+    '.github/workflows/docker.yml' = '433fdd62b297e4f416d16900406e3a4ddc689691cb84cdc6c0da5b2fceeed640'
+    '.github/workflows/release-validation.yml' = 'eb8dc01d50eb77a988254429ba453ddb915191ed852e634e24c14b533e9e51a7'
+}
+foreach ($relativePath in $protectedHashes.Keys) {
+    $protectedPath = Join-Path $RepoRoot $relativePath
+    Assert-True (Test-Path -LiteralPath $protectedPath -PathType Leaf) "Protected CORS path is missing: $relativePath"
+    $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $protectedPath).Hash.ToLowerInvariant()
+    Assert-True ($actualHash -ceq $protectedHashes[$relativePath]) "Protected CORS path changed: $relativePath"
+}
+foreach ($expected in @(
+    '824f5c515ce070cceecf4c7f2171e83e1e4fc039b963fda6e10780cb2dbf9ac5',
+    '981a9abf7e344ddf11826c1c9c45c04c07cbbede3fefe46f2cf7fd1e6b7f7fd8'
+)) {
+    $path = if ($expected.StartsWith('824f', [StringComparison]::Ordinal)) {
+        Join-Path $RepoRoot 'docs/superpowers/specs/2026-08-31-bucket-cors-design.md'
+    } else {
+        Join-Path $RepoRoot 'docs/superpowers/plans/2026-08-31-bucket-cors.md'
+    }
+    Assert-True (((Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant()) -ceq $expected) "Bucket CORS approved document hash changed: $path"
+}
+
+# Task 6 correction causal RED: these guards are intentionally added before
+# their runner changes so stale fixed ports, XML policy files, and partial
+# ownership cleanup cannot be mistaken for a live-validation result.
+$corsCorrectionFailures = [Collections.Generic.List[string]]::new()
+function Test-CorsCorrectionContract {
+    param([Parameter(Mandatory)][bool]$Condition, [Parameter(Mandatory)][string]$Message)
+    if (-not $Condition) { $corsCorrectionFailures.Add($Message) }
+}
+function Get-OptionalCorsRunnerFunctionSource {
+    param([Parameter(Mandatory)][string]$Name)
+    $matches = @($CorsRunnerAst.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $Name
+    }, $true))
+    if ($matches.Count -ne 1) { return '' }
+    return $matches[0].Extent.Text
+}
+
+$corsPortSource = Get-OptionalCorsRunnerFunctionSource 'New-CorsLoopbackPorts'
+$corsReceiptEmissionSource = Get-OptionalCorsRunnerFunctionSource 'Write-CorsReceipts'
+$corsEnvironmentSource = Get-OptionalCorsRunnerFunctionSource 'Restore-EnvironmentState'
+$corsEnvironmentVerifierSource = Get-OptionalCorsRunnerFunctionSource 'Test-CorsEnvironmentStateRestored'
+$corsRootCleanupSource = Get-OptionalCorsRunnerFunctionSource 'Remove-OwnedCorsRunRoot'
+$corsRootOwnershipSource = $corsRootCleanupSource + "`n" + (Get-CorsRunnerFunctionSource 'New-CorsRunRoot')
+Test-CorsCorrectionContract ($corsPortSource.Length -gt 0) 'New-CorsLoopbackPorts is absent'
+foreach ($fragment in @('49152', '65535', '[Convert]::FromHexString($RunId)', 'Distinct')) {
+    Test-CorsCorrectionContract $corsPortSource.Contains($fragment, [StringComparison]::Ordinal) "RunId-derived high-loopback port contract is missing: $fragment"
+}
+foreach ($oldPort in @('55438', '55005', '59007')) {
+    Test-CorsCorrectionContract (-not $CorsRunnerSource.Contains($oldPort, [StringComparison]::Ordinal)) "obsolete fixed operational port remains: $oldPort"
+}
+$corsPostgresSuiteSource = Get-CorsRunnerFunctionSource 'Invoke-CorsPostgresSuite'
+Test-CorsCorrectionContract ($corsPostgresSuiteSource.Contains('$State.Ports.Postgres', [StringComparison]::Ordinal)) 'PostgreSQL URL is not derived from the owned generated port'
+Test-CorsCorrectionContract ($corsBrowserSource.Contains('$State.Ports.Gateway', [StringComparison]::Ordinal)) 'Browser endpoint is not derived from the owned generated gateway port'
+Test-CorsCorrectionContract (-not [regex]::IsMatch(($corsPostgresSuiteSource + "`n" + $corsBrowserSource), '127\.0\.0\.1:[0-9]{2,5}')) 'Operational PostgreSQL/browser URL contains a fixed numeric port'
+Test-CorsCorrectionContract ($CorsRunnerSource.Contains('IPFS_S3_CORS_POSTGRES_PORT" -Value ([string]$state.Ports.Postgres', [StringComparison]::Ordinal) -and $CorsRunnerSource.Contains('IPFS_S3_CORS_KUBO_PORT" -Value ([string]$state.Ports.Kubo', [StringComparison]::Ordinal) -and $CorsRunnerSource.Contains('IPFS_S3_CORS_GATEWAY_PORT" -Value ([string]$state.Ports.Gateway', [StringComparison]::Ordinal)) 'Compose environment ports are not derived from the owned generated ports'
+Test-CorsCorrectionContract (-not [regex]::IsMatch($CorsRunnerSource, 'Set-CorsEnvironment -Name "IPFS_S3_CORS_(?:POSTGRES|KUBO|GATEWAY)_PORT" -Value "[0-9]{2,5}"')) 'Operational Compose environment contains a fixed numeric port'
+Test-CorsCorrectionContract (-not $CorsRunnerSource.Contains('if ($state.Mode -in @("full", "aws", "browser")) {', [StringComparison]::Ordinal) -and $postgresOnlySource.Contains('$State.Ports.Postgres', [StringComparison]::Ordinal) -and -not $postgresOnlySource.Contains('$State.Ports.Kubo', [StringComparison]::Ordinal) -and -not $postgresOnlySource.Contains('$State.Ports.Gateway', [StringComparison]::Ordinal)) 'PostgreSQL-only mode must own only its generated PostgreSQL port while Compose interpolation remains mode-independent'
+
+$corsAwsParitySource = Get-CorsRunnerFunctionSource 'Invoke-CorsAwsParity'
+foreach ($fragment in @('cors-policy.json', 'cors-policy-replacement.json', 'file:///work/cors-policy.json', 'file:///work/cors-policy-replacement.json', 'CORSRules', 'AllowedOrigins', 'AllowedMethods', 'AllowedHeaders', 'ExposeHeaders', 'MaxAgeSeconds', '"GET", "POST", "PUT"')) {
+    Test-CorsCorrectionContract $corsAwsParitySource.Contains($fragment, [StringComparison]::Ordinal) "AWS CLI JSON CORS policy contract is missing: $fragment"
+}
+Test-CorsCorrectionContract (-not $CorsRunnerSource.Contains('.xml', [StringComparison]::Ordinal)) 'AWS CLI CORS policy must not use REST XML files'
+foreach ($fragment in @(
+    'browser-object.txt?ipfs3-import',
+    'browser-object.txt?decompress-zip',
+    '[Net.Http.HttpMethod]::Options',
+    '"Access-Control-Request-Method", "POST"',
+    '"Access-Control-Request-Method", "PUT"'
+)) {
+    Test-CorsCorrectionContract $corsBrowserSource.Contains($fragment, [StringComparison]::Ordinal) "Custom-route browser method mapping is missing: $fragment"
+}
+
+Test-CorsCorrectionContract ($corsReceiptEmissionSource.Length -gt 0 -and $corsReceiptEmissionSource.Contains('foreach ($receipt in $State.Receipts)', [StringComparison]::Ordinal) -and $corsReceiptEmissionSource.Contains('Write-Output', [StringComparison]::Ordinal)) 'State.Receipts deterministic emission is absent'
+Test-CorsCorrectionContract ($corsReceiptEmissionSource.Contains('^\[(?:stage|command|assertion|cleanup|result)\]', [StringComparison]::Ordinal)) 'Receipt emission does not enforce a fixed receipt grammar'
+Test-CorsCorrectionContract ($CorsRunnerSource.Contains('Write-CorsReceipts -State $state', [StringComparison]::Ordinal)) 'Final runner does not emit receipts before its terminal result'
+Test-CorsCorrectionContract ($CorsRunnerSource.Contains('RunRootPreexisting = $false', [StringComparison]::Ordinal) -and $CorsRunnerSource.Contains('RunRootCreated = $false', [StringComparison]::Ordinal) -and $CorsRunnerSource.Contains('ReceiptOwned = $false', [StringComparison]::Ordinal) -and $CorsRunnerSource.Contains('$state.ReceiptOwned = $true', [StringComparison]::Ordinal)) 'Partial RunRoot ownership state flags are absent'
+foreach ($fragment in @('$State.RunRootCreated = $true', '$State.RunRootPreexisting = $false', 'if ($State.ReceiptOwned)', 'elseif (-not $State.RunRootCreated -or $State.RunRootPreexisting)')) {
+    Test-CorsCorrectionContract $corsRootOwnershipSource.Contains($fragment, [StringComparison]::Ordinal) "Partial RunRoot cleanup guard is missing: $fragment"
+}
+foreach ($fragment in @('GatewayImagePreflightAbsent', 'image-ownership-retry=owned', 'image-ownership-retry=absent', 'image-ownership-retry=failed', 'image-ownership-retry=not-needed', 'AllowedExitCodes @(0, 1)')) {
+    Test-CorsCorrectionContract $corsCleanupSource.Contains($fragment, [StringComparison]::Ordinal) "Partial image ownership retry is missing: $fragment"
+}
+Test-CorsCorrectionContract ($corsEnvironmentVerifierSource.Length -gt 0) 'Test-CorsEnvironmentStateRestored is absent'
+foreach ($fragment in @('$entry.Present', '$entry.Value', '-cne', 'return $false', 'return $true')) {
+    Test-CorsCorrectionContract $corsEnvironmentVerifierSource.Contains($fragment, [StringComparison]::Ordinal) "Environment verifier is incomplete: $fragment"
+}
+$restoreIndex = $corsCleanupSource.IndexOf('Restore-EnvironmentState -State $State.EnvironmentState', [StringComparison]::Ordinal)
+$verifyIndex = $corsCleanupSource.IndexOf('Test-CorsEnvironmentStateRestored -Snapshot $State.EnvironmentState', [StringComparison]::Ordinal)
+$environmentPassedIndex = $corsCleanupSource.IndexOf('environment-restore=passed', [StringComparison]::Ordinal)
+Test-CorsCorrectionContract ($restoreIndex -ge 0 -and $verifyIndex -gt $restoreIndex -and $environmentPassedIndex -gt $verifyIndex) 'Cleanup must restore, verify, then emit the environment success receipt'
+Test-CorsCorrectionContract (-not $corsCleanupSource.Contains('$entry.Name', [StringComparison]::Ordinal) -and -not $corsCleanupSource.Contains('$entry.Value', [StringComparison]::Ordinal)) 'Cleanup environment receipts must not emit names or values'
+foreach ($fragment in @('environment-restore=passed', 'environment-restore=failed', 'project-ownership-retry=owned', 'project-ownership-retry=absent', 'project-ownership-retry=failed', 'project-ownership-retry=not-needed')) {
+    Test-CorsCorrectionContract $corsCleanupSource.Contains($fragment, [StringComparison]::Ordinal) "Cleanup receipt is missing: $fragment"
+}
+Test-CorsCorrectionContract (([regex]::Matches($CorsRunnerSource, 'cleanup-errors=\$\(\$cleanupErrors\.Count\)')).Count -eq 1) 'cleanup-errors must be emitted exactly once after all cleanup work'
+Test-CorsCorrectionContract (-not $corsResidualSource.Contains('cleanup-errors=', [StringComparison]::Ordinal)) 'Residual helper emits a premature cleanup-errors receipt'
+$rootCreationIndex = $corsRootOwnershipSource.IndexOf('$created = New-Item -ItemType Directory -Path $runRoot', [StringComparison]::Ordinal)
+$rootOwnedIndex = $corsRootOwnershipSource.IndexOf('$State.RunRootCreated = $true', [StringComparison]::Ordinal)
+Test-CorsCorrectionContract ($rootCreationIndex -ge 0 -and $rootOwnedIndex -gt $rootCreationIndex) 'RunRoot must be marked created immediately after its owned directory is made'
+$projectRetryIndex = $corsCleanupSource.IndexOf('project-ownership-retry=', [StringComparison]::Ordinal)
+$composeDownIndex = $corsCleanupSource.IndexOf('"down", "--volumes", "--remove-orphans"', [StringComparison]::Ordinal)
+Test-CorsCorrectionContract ($projectRetryIndex -ge 0 -and $composeDownIndex -gt $projectRetryIndex) 'Project ownership retry must occur before exact Compose down'
+$cleanupCountIndex = $CorsRunnerSource.LastIndexOf('cleanup-errors=$($cleanupErrors.Count)', [StringComparison]::Ordinal)
+$receiptEmitIndex = $CorsRunnerSource.LastIndexOf('Write-CorsReceipts -State $state', [StringComparison]::Ordinal)
+$terminalIndex = $CorsRunnerSource.LastIndexOf('Write-Output "Bucket CORS validation: FAILED"', [StringComparison]::Ordinal)
+Test-CorsCorrectionContract ($cleanupCountIndex -ge 0 -and $receiptEmitIndex -gt $cleanupCountIndex -and $terminalIndex -gt $receiptEmitIndex) 'Cleanup count, receipt emission, and terminal result are not ordered fail-closed'
+if ($corsCorrectionFailures.Count -ne 0) {
+    throw "Bucket CORS Task 6 correction RED: $($corsCorrectionFailures -join '; ')"
+}
+
+$corsPwsh = (Get-Command pwsh -ErrorAction Stop).Source
+$corsNoRun = @(& $corsPwsh -NoLogo -NoProfile -File $CorsRunnerPath 2>&1) -join "`n"
+Assert-True ($LASTEXITCODE -eq 0 -and $corsNoRun -ceq 'Bucket CORS validation: NOT RUN') 'Bucket CORS no-run receipt changed or reached a preflight side effect'
+foreach ($arguments in @(
+    @('-Run', '-PostgresOnly'), @('-Run', '-DiagnoseAws'), @('-Run', '-DiagnoseBrowser'),
+    @('-PostgresOnly', '-DiagnoseAws'), @('-PostgresOnly', '-DiagnoseBrowser'), @('-DiagnoseAws', '-DiagnoseBrowser'),
+    @('-Run', '-PostgresOnly', '-DiagnoseAws'), @('-Run', '-PostgresOnly', '-DiagnoseBrowser'),
+    @('-Run', '-DiagnoseAws', '-DiagnoseBrowser'), @('-PostgresOnly', '-DiagnoseAws', '-DiagnoseBrowser'),
+    @('-Run', '-PostgresOnly', '-DiagnoseAws', '-DiagnoseBrowser')
+)) {
+    $corsMutual = @(& $corsPwsh -NoLogo -NoProfile -File $CorsRunnerPath @arguments 2>&1) -join "`n"
+    Assert-True ($LASTEXITCODE -ne 0 -and $corsMutual.Contains('Bucket CORS runner modes are mutually exclusive', [StringComparison]::Ordinal) -and -not $corsMutual.Contains('Required local tool', [StringComparison]::Ordinal)) "Bucket CORS mutual exclusion must reject $($arguments -join ' + ') before external tools"
+}
+Write-Host 'Bucket CORS static contracts: PASSED'

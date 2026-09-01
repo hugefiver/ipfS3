@@ -117,6 +117,10 @@ fn gateway_app(state: Arc<AppState>, imports: Arc<ImportCoordinator>) -> Router 
         .layer(axum::middleware::from_fn(
             s3::http::bridge_chunked_content_length,
         ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            ipfs_s3_gateway::cors::http::bucket_cors,
+        ))
         .with_state(state)
 }
 

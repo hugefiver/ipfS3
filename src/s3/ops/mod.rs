@@ -1,4 +1,5 @@
 pub mod bucket;
+pub mod cors;
 pub mod lifecycle;
 pub mod multipart;
 pub mod object;

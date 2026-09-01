@@ -1,4 +1,5 @@
 pub mod bucket;
+pub mod cors_config;
 pub mod database_clock;
 pub mod entities;
 pub mod import;
@@ -66,6 +67,7 @@ mod migrator {
     use crate::store::migrations::m20260813_000001_postgres_json_columns::Migration as PostgresJsonColumnsMigration;
     use crate::store::migrations::m20260825_000001_object_versioning::Migration as ObjectVersioningMigration;
     use crate::store::migrations::m20260826_000001_lifecycle_expiration::Migration as LifecycleExpirationMigration;
+    use crate::store::migrations::m20260831_000001_bucket_cors::Migration as BucketCorsMigration;
     use sea_orm_migration::prelude::*;
 
     pub struct Migrator;
@@ -82,6 +84,7 @@ mod migrator {
                 Box::new(PostgresJsonColumnsMigration),
                 Box::new(ObjectVersioningMigration),
                 Box::new(LifecycleExpirationMigration),
+                Box::new(BucketCorsMigration),
             ]
         }
     }
@@ -133,7 +136,7 @@ mod tests {
     use sea_orm_migration::MigratorTrait;
 
     #[test]
-    fn lifecycle_expiration_migration_is_registered_last() {
+    fn bucket_cors_migration_is_registered_eleventh_and_last() {
         let names = migrator::Migrator::migrations()
             .into_iter()
             .map(|migration| migration.name().to_owned())
@@ -151,6 +154,7 @@ mod tests {
                 "m20260813_000001_postgres_json_columns",
                 "m20260825_000001_object_versioning",
                 "m20260826_000001_lifecycle_expiration",
+                "m20260831_000001_bucket_cors",
             ]
         );
     }
@@ -202,7 +206,8 @@ mod tests {
                        'object_tags', 'pin_leases', 'pin_lease_targets', 'remote_pins', \
                        'pin_jobs', 'pin_provider_usage', 'import_jobs', 'import_destinations', \
                        'import_prefix_claims', 'import_job_targets', 'import_job_results', \
-                        'object_versions', 'bucket_lifecycle_configs', 'lifecycle_actions'\
+                        'object_versions', 'bucket_lifecycle_configs', 'lifecycle_actions', \
+                        'bucket_cors_configs'\
                  ) ORDER BY name)",
                 [],
             ))
@@ -230,12 +235,13 @@ mod tests {
             "object_versions",
             "bucket_lifecycle_configs",
             "lifecycle_actions",
+            "bucket_cors_configs",
         ]
         .into_iter()
         .collect();
         assert_eq!(
             table_names, expected,
-            "all eighteen application tables must exist"
+            "all nineteen application tables must exist"
         );
     }
 

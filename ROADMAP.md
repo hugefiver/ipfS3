@@ -75,7 +75,7 @@ numbered release.
 - [x] ListObjectVersions
 - [x] DeleteMarker support
 - [ ] Lifecycle rules (expiration, transition)
-- [ ] Bucket CORS configuration
+- [x] Bucket CORS configuration
 
 ## v0.7 — IAM & Security
 

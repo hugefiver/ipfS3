@@ -1,0 +1,58 @@
+Bucket CORS local validation: PASS
+Hosted Bucket CORS validation: NOT RUN
+Base HEAD: 4224b6da2c74e9dd7288e4751afd78a2f52e9c39
+Runtime input identity: sha256:0a646f3e389e8d19b2d2ec7c8d1be0396216ed08d5e0115ef6f08f4be1c8e832
+Spec SHA-256: 824f5c515ce070cceecf4c7f2171e83e1e4fc039b963fda6e10780cb2dbf9ac5
+Plan SHA-256: f99612c7b8f87416c89d832802dcefcf96533f9f7fa6919bc041c31b0870fbc0
+Package: 0.1.0
+PowerShell: 7.5.4
+Cargo: 1.98.0
+Rustc: 1.98.0
+Docker Server: 28.3.3
+Compose: 2.39.2-desktop.1
+AWS CLI: 2.36.34
+Command: cargo test --lib --locked --offline
+Passed count: 936
+Command: cargo test --test cors --locked --offline -- --test-threads=1
+Passed count: 7
+Command: cargo test --test integration --locked --offline -- --test-threads=1
+Passed count: 143
+Command: pwsh -NoLogo -NoProfile -File tests/client-smoke.Tests.ps1
+Static client-smoke: PASS
+Command: cargo test --test postgres_cors --locked --offline -- --nocapture --test-threads=1
+Passed count: 4
+PostgreSQL 17: PASS
+AWS management CRUD: PASS
+AWS default CRC64NVME PUT parity: PASS
+Browser valid-preflight: PASS
+Browser wildcard-preflight: PASS
+Browser disallowed-preflight: PASS
+Browser partial-preflight: PASS
+Browser plain-options fallthrough: PASS
+Browser signed-actual success: PASS
+Browser signed-actual S3 error: PASS
+Browser custom-import preflight: PASS
+Browser decompress preflight: PASS
+Browser health exclusion: PASS
+Browser ready exclusion: PASS
+Browser overall parity: PASS
+Cleanup logs captured: PASS
+Cleanup Compose down: PASS
+Cleanup environment restore: PASS
+Cleanup residual containers: exit=0 count=0
+Cleanup residual networks: exit=0 count=0
+Cleanup residual volumes: exit=0 count=0
+Cleanup residual images: exit=0 count=0
+Cleanup residual temp: exit=0 count=0
+Cleanup errors: 0
+Documentation promotion: PASS
+Post-review current artifact: PASS
+Duplicate SDK checksum algorithm cardinality: PASS
+Valid MD5 signed regression RED: 200
+Valid MD5 signed regression GREEN: 400 InvalidRequest
+Focused exact regression: PASS1
+Final nonlive matrix: PASS lib937/cors8/integration143
+Clippy: PASS
+Fmt: PASS
+Static: PASS
+Diff: PASS

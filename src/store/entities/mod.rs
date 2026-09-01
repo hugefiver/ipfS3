@@ -1,4 +1,5 @@
 pub mod bucket;
+pub mod bucket_cors_config;
 pub mod bucket_lifecycle_config;
 pub mod import_destination;
 pub mod import_job;
