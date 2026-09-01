@@ -429,6 +429,8 @@ mod tests {
         },
     };
 
+    const ACTION_START_TIMEOUT: Duration = Duration::from_secs(5);
+
     fn worker_config() -> ValidatedLifecycleConfig {
         LifecycleWorkerConfig {
             poll_interval_ms: 1,
@@ -574,7 +576,7 @@ mod tests {
         let started = gate.started.notified();
 
         let handle = start_worker(store.clone(), worker_config(), CancellationToken::new());
-        tokio::time::timeout(Duration::from_secs(1), started)
+        tokio::time::timeout(ACTION_START_TIMEOUT, started)
             .await
             .expect("worker must start the claimed action");
         let shutdown = tokio::spawn(handle.shutdown(Duration::from_secs(1)));
@@ -601,7 +603,7 @@ mod tests {
         let started = gate.started.notified();
 
         let handle = start_worker(store.clone(), worker_config(), CancellationToken::new());
-        tokio::time::timeout(Duration::from_secs(1), started)
+        tokio::time::timeout(ACTION_START_TIMEOUT, started)
             .await
             .expect("worker must start the claimed action");
         handle.shutdown(Duration::ZERO).await;

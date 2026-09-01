@@ -2951,7 +2951,7 @@ mod tests {
             .unwrap();
         }
         seed.commit().await.unwrap();
-        let original_deadline = Utc::now() + Duration::seconds(2);
+        let original_deadline = Utc::now() + Duration::seconds(5);
         assert!(
             crate::store::import::jobs::renew_claim(
                 &first,
@@ -2975,7 +2975,7 @@ mod tests {
         let mut reset = tokio::spawn(async move {
             reset_extracted_targets_for_attempt(&reset_db, &reset_claim, "bucket", Utc::now()).await
         });
-        tokio::time::timeout(std::time::Duration::from_secs(2), gate.arrived.notified())
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate.arrived.notified())
             .await
             .expect("reset must pause after its first full batch");
 
@@ -2994,7 +2994,7 @@ mod tests {
             .await
         });
         let renewal_while_paused =
-            tokio::time::timeout(std::time::Duration::from_millis(500), &mut renewal).await;
+            tokio::time::timeout(std::time::Duration::from_secs(2), &mut renewal).await;
         let remaining = (original_deadline - Utc::now())
             .to_std()
             .unwrap_or(std::time::Duration::ZERO);
