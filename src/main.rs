@@ -125,7 +125,13 @@ fn gateway_app(state: Arc<AppState>, imports: Arc<ImportCoordinator>) -> Router 
 }
 
 async fn run_gateway() -> anyhow::Result<()> {
-    tracing_subscriber::fmt().init();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::builder()
+                .with_default_directive(tracing_subscriber::filter::LevelFilter::INFO.into())
+                .from_env_lossy(),
+        )
+        .init();
 
     let cfg = Config::load()?;
     let lifecycle_config = cfg.lifecycle.validate()?;
