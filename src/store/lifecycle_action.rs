@@ -10,8 +10,8 @@ use sha2::{Digest, Sha256};
 use crate::{
     error::{AppError, AppResult},
     lifecycle::model::{
-        ClaimedLifecycleAction, LifecycleActionKind, NewLifecycleAction, RuleIdentity,
-        VersionTargetIdentity,
+        ClaimedLifecycleAction, LifecycleActionKind, LifecycleTargetIdentity,
+        MultipartUploadTargetIdentity, NewLifecycleAction, RuleIdentity, VersionTargetIdentity,
     },
     store::{
         database_clock::database_now,
@@ -38,7 +38,7 @@ const STATE_FAILED_SAFE: &str = "failed_safe";
 const MAX_SQLITE_ACTION_CLAIM_RETRIES: usize = 4;
 
 #[derive(Serialize)]
-struct CanonicalActionIdempotency<'a> {
+struct CanonicalVersionActionIdempotency<'a> {
     bucket: &'a str,
     config_revision: i64,
     rule_identity: &'a str,
@@ -50,16 +50,68 @@ struct CanonicalActionIdempotency<'a> {
     due_at: String,
 }
 
+#[derive(Serialize)]
+struct CanonicalMultipartActionIdempotency<'a> {
+    bucket: &'a str,
+    config_revision: i64,
+    rule_identity: &'a str,
+    action_kind: &'a str,
+    target_upload_id: &'a str,
+    target_upload_created_at: String,
+    due_at: String,
+}
+
 struct ValidatedAction {
     idempotency_key: String,
     rule_id: String,
     action_kind: String,
-    public_version_id: String,
 }
 
 /// Returns the durable, lowercase SHA-256 idempotency key for one exact lifecycle action.
 pub fn idempotency_key(action: &NewLifecycleAction) -> AppResult<String> {
     Ok(validate_action(action)?.idempotency_key)
+}
+
+/// Returns the canonical serialized identity used to derive an action's durable idempotency key.
+/// The version representation is the byte-for-byte Phase A representation.
+pub(crate) fn canonical_action_bytes(action: &NewLifecycleAction) -> AppResult<Vec<u8>> {
+    validate_action_identity(action)?;
+    let rule_id = persisted_rule_identity(&action.rule_identity);
+    let action_kind = persisted_action_kind(action.action_kind);
+    match &action.target {
+        LifecycleTargetIdentity::Version(target) => {
+            let public_version_id = target.public_version_id.as_s3_str();
+            let canonical = CanonicalVersionActionIdempotency {
+                bucket: &action.bucket,
+                config_revision: action.config_revision,
+                rule_identity: &rule_id,
+                action_kind,
+                target_version_row_id: &target.version_row_id,
+                target_public_version_id: public_version_id,
+                target_object_id: target.object_id.as_deref(),
+                target_sequence: target.sequence,
+                due_at: action.due_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            };
+            serde_json::to_vec(&canonical)
+        }
+        LifecycleTargetIdentity::MultipartUpload(target) => {
+            let canonical = CanonicalMultipartActionIdempotency {
+                bucket: &action.bucket,
+                config_revision: action.config_revision,
+                rule_identity: &rule_id,
+                action_kind,
+                target_upload_id: &target.upload_id,
+                target_upload_created_at: target
+                    .initiated_at
+                    .to_rfc3339_opts(SecondsFormat::Nanos, true),
+                due_at: action.due_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            };
+            serde_json::to_vec(&canonical)
+        }
+    }
+    .map_err(|_| {
+        AppError::Internal("failed to serialize lifecycle action idempotency identity".to_owned())
+    })
 }
 
 /// Inserts a new action exactly once. Replays conflict only on the idempotency key; every other
@@ -76,18 +128,52 @@ pub async fn insert_idempotent<C: ConnectionTrait>(
         ));
     }
     let id = uuid::Uuid::new_v4().to_string();
+    let (
+        object_key,
+        target_type,
+        target_version_row_id,
+        target_public_version_id,
+        target_object_id,
+        target_sequence,
+        target_upload_id,
+        target_upload_created_at,
+    ) = match action.target {
+        LifecycleTargetIdentity::Version(target) => (
+            target.key,
+            "version".to_owned(),
+            Some(target.version_row_id),
+            Some(target.public_version_id.as_s3_str().to_owned()),
+            target.object_id,
+            Some(target.sequence),
+            None,
+            None,
+        ),
+        LifecycleTargetIdentity::MultipartUpload(target) => (
+            target.key,
+            "multipart_upload".to_owned(),
+            None,
+            None,
+            None,
+            None,
+            Some(target.upload_id),
+            Some(target.initiated_at),
+        ),
+    };
     let inserted = lifecycle_action::Entity::insert(lifecycle_action::ActiveModel {
         id: Set(id),
         idempotency_key: Set(validated.idempotency_key),
         bucket: Set(action.bucket),
-        object_key: Set(action.target.key),
+        object_key: Set(object_key),
         config_revision: Set(action.config_revision),
         rule_id: Set(validated.rule_id),
         action_kind: Set(validated.action_kind),
-        target_version_row_id: Set(action.target.version_row_id),
-        target_public_version_id: Set(validated.public_version_id),
-        target_object_id: Set(action.target.object_id),
-        target_sequence: Set(action.target.sequence),
+        target_type: Set(target_type),
+        target_version_row_id: Set(target_version_row_id),
+        target_public_version_id: Set(target_public_version_id),
+        target_object_id: Set(target_object_id),
+        target_sequence: Set(target_sequence),
+        target_upload_id: Set(target_upload_id),
+        target_upload_created_at: Set(target_upload_created_at),
         due_at: Set(action.due_at),
         state: Set(STATE_PENDING.to_owned()),
         attempts: Set(0),
@@ -176,14 +262,22 @@ pub async fn lock_claim_for_execution<C: ConnectionTrait>(
     db: &C,
     claim: &ClaimedLifecycleAction,
 ) -> AppResult<Option<lifecycle_action::Model>> {
+    let query = lifecycle_action::Entity::find().filter(active_claim_condition(claim));
+    let action = if db.get_database_backend() == DatabaseBackend::Postgres {
+        query.lock_exclusive().one(db).await?
+    } else {
+        query.one(db).await?
+    };
+    let Some(action) = action else {
+        return Ok(None);
+    };
+    // Read the clock after acquiring the row lock so time spent waiting cannot
+    // authorize execution with a lease that expired while the lock was held elsewhere.
     let now = database_now(db).await?;
-    let query = lifecycle_action::Entity::find()
-        .filter(active_claim_condition(claim))
-        .filter(lifecycle_action::Column::LeaseUntil.gt(now));
-    if db.get_database_backend() == DatabaseBackend::Postgres {
-        return Ok(query.lock_exclusive().one(db).await?);
-    }
-    Ok(query.one(db).await?)
+    Ok(action
+        .lease_until
+        .filter(|until| *until > now)
+        .map(|_| action))
 }
 
 pub async fn mark_succeeded<C: ConnectionTrait>(
@@ -424,17 +518,19 @@ async fn fail_safe_exhausted<C: ConnectionTrait>(
     candidate: &lifecycle_action::Model,
     now: DateTime<Utc>,
 ) -> AppResult<()> {
-    lock_bucket_for_ownership(db, &candidate.bucket).await?;
-    if candidate.claim_epoch > 0 {
-        clear_lifecycle_mutation_if_owned(
-            db,
-            &candidate.bucket,
-            &candidate.object_key,
-            &candidate.id,
-            candidate.claim_epoch,
-            now,
-        )
-        .await?;
+    if candidate.target_type == "version" {
+        lock_bucket_for_ownership(db, &candidate.bucket).await?;
+        if candidate.claim_epoch > 0 {
+            clear_lifecycle_mutation_if_owned(
+                db,
+                &candidate.bucket,
+                &candidate.object_key,
+                &candidate.id,
+                candidate.claim_epoch,
+                now,
+            )
+            .await?;
+        }
     }
     let failure_class = candidate
         .failure_class
@@ -508,46 +604,169 @@ async fn terminal_failure_update<C: ConnectionTrait>(
 }
 
 fn validate_action(action: &NewLifecycleAction) -> AppResult<ValidatedAction> {
-    if action.bucket.is_empty()
-        || action.config_revision <= 0
-        || action.target.bucket != action.bucket
-        || action.target.key.is_empty()
-        || action.target.version_row_id.is_empty()
-        || action.target.sequence < 0
-    {
-        return Err(AppError::InvalidArgument(
-            "invalid lifecycle action target identity".to_owned(),
-        ));
-    }
-    validate_target(&action.target)?;
+    validate_action_identity(action)?;
     let rule_id = persisted_rule_identity(&action.rule_identity);
     let action_kind = persisted_action_kind(action.action_kind).to_owned();
-    let public_version_id = action.target.public_version_id.as_s3_str().to_owned();
-    if public_version_id.is_empty() {
-        return Err(AppError::InvalidArgument(
-            "lifecycle action public version ID must not be empty".to_owned(),
-        ));
-    }
-    let canonical = CanonicalActionIdempotency {
-        bucket: &action.bucket,
-        config_revision: action.config_revision,
-        rule_identity: &rule_id,
-        action_kind: &action_kind,
-        target_version_row_id: &action.target.version_row_id,
-        target_public_version_id: &public_version_id,
-        target_object_id: action.target.object_id.as_deref(),
-        target_sequence: action.target.sequence,
-        due_at: action.due_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
-    };
-    let bytes = serde_json::to_vec(&canonical).map_err(|_| {
-        AppError::Internal("failed to serialize lifecycle action idempotency identity".to_owned())
-    })?;
+    let bytes = canonical_action_bytes(action)?;
     Ok(ValidatedAction {
         idempotency_key: hex::encode(Sha256::digest(bytes)),
         rule_id,
         action_kind,
-        public_version_id,
     })
+}
+
+fn validate_action_identity(action: &NewLifecycleAction) -> AppResult<()> {
+    if action.bucket.is_empty() || action.config_revision <= 0 {
+        return Err(AppError::InvalidArgument(
+            "invalid lifecycle action target identity".to_owned(),
+        ));
+    }
+    match (&action.target, action.action_kind) {
+        (
+            LifecycleTargetIdentity::Version(target),
+            LifecycleActionKind::ExpireCurrent
+            | LifecycleActionKind::ExpireNoncurrent
+            | LifecycleActionKind::DeleteExpiredMarker,
+        ) => {
+            if target.bucket != action.bucket
+                || target.key.is_empty()
+                || target.version_row_id.is_empty()
+                || target.sequence < 0
+            {
+                return Err(AppError::InvalidArgument(
+                    "invalid lifecycle action target identity".to_owned(),
+                ));
+            }
+            validate_target(target)?;
+            if target.public_version_id.as_s3_str().is_empty() {
+                return Err(AppError::InvalidArgument(
+                    "lifecycle action public version ID must not be empty".to_owned(),
+                ));
+            }
+            Ok(())
+        }
+        (
+            LifecycleTargetIdentity::MultipartUpload(target),
+            LifecycleActionKind::AbortIncompleteMultipartUpload,
+        ) if target.bucket == action.bucket
+            && !target.key.is_empty()
+            && !target.upload_id.is_empty() =>
+        {
+            Ok(())
+        }
+        _ => Err(AppError::InvalidArgument(
+            "invalid lifecycle action target identity".to_owned(),
+        )),
+    }
+}
+
+/// Decodes and validates the exact persisted target shape without trusting database constraints.
+pub(crate) fn target_from_action(
+    action: &lifecycle_action::Model,
+) -> AppResult<LifecycleTargetIdentity> {
+    if action.bucket.is_empty() || action.object_key.is_empty() || action.config_revision <= 0 {
+        return Err(invalid_persisted_action_identity());
+    }
+    let action_kind = action_kind_from_db(&action.action_kind)?;
+    match action.target_type.as_str() {
+        "version" => {
+            if action_kind == LifecycleActionKind::AbortIncompleteMultipartUpload
+                || action.target_upload_id.is_some()
+                || action.target_upload_created_at.is_some()
+            {
+                return Err(invalid_persisted_action_identity());
+            }
+            let version_row_id = action
+                .target_version_row_id
+                .clone()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(invalid_persisted_action_identity)?;
+            let public_version_id = action
+                .target_public_version_id
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(invalid_persisted_action_identity)?;
+            let sequence = action
+                .target_sequence
+                .filter(|sequence| *sequence >= 0)
+                .ok_or_else(invalid_persisted_action_identity)?;
+            let kind = match action_kind {
+                LifecycleActionKind::ExpireCurrent => VersionKind::Object,
+                LifecycleActionKind::DeleteExpiredMarker => VersionKind::DeleteMarker,
+                LifecycleActionKind::ExpireNoncurrent => {
+                    if action.target_object_id.is_some() {
+                        VersionKind::Object
+                    } else {
+                        VersionKind::DeleteMarker
+                    }
+                }
+                LifecycleActionKind::AbortIncompleteMultipartUpload => {
+                    return Err(invalid_persisted_action_identity());
+                }
+            };
+            let target = VersionTargetIdentity {
+                bucket: action.bucket.clone(),
+                key: action.object_key.clone(),
+                version_row_id,
+                public_version_id: crate::store::object_version::PublicVersionId::parse_s3(
+                    public_version_id,
+                )
+                .map_err(|_| invalid_persisted_action_identity())?,
+                kind,
+                object_id: action.target_object_id.clone(),
+                sequence,
+            };
+            if matches!(target.kind, VersionKind::Object) != target.object_id.is_some() {
+                return Err(invalid_persisted_action_identity());
+            }
+            Ok(LifecycleTargetIdentity::Version(target))
+        }
+        "multipart_upload" => {
+            if action_kind != LifecycleActionKind::AbortIncompleteMultipartUpload
+                || action.target_version_row_id.is_some()
+                || action.target_public_version_id.is_some()
+                || action.target_object_id.is_some()
+                || action.target_sequence.is_some()
+            {
+                return Err(invalid_persisted_action_identity());
+            }
+            let upload_id = action
+                .target_upload_id
+                .clone()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(invalid_persisted_action_identity)?;
+            let initiated_at = action
+                .target_upload_created_at
+                .ok_or_else(invalid_persisted_action_identity)?;
+            Ok(LifecycleTargetIdentity::MultipartUpload(
+                MultipartUploadTargetIdentity {
+                    bucket: action.bucket.clone(),
+                    key: action.object_key.clone(),
+                    upload_id,
+                    initiated_at,
+                },
+            ))
+        }
+        _ => Err(invalid_persisted_action_identity()),
+    }
+}
+
+fn invalid_persisted_action_identity() -> AppError {
+    AppError::Internal("invalid lifecycle action identity".to_owned())
+}
+
+pub(crate) fn action_kind_from_db(value: &str) -> AppResult<LifecycleActionKind> {
+    match value {
+        "expire_current" => Ok(LifecycleActionKind::ExpireCurrent),
+        "expire_noncurrent" => Ok(LifecycleActionKind::ExpireNoncurrent),
+        "delete_expired_marker" => Ok(LifecycleActionKind::DeleteExpiredMarker),
+        "abort_incomplete_multipart_upload" => {
+            Ok(LifecycleActionKind::AbortIncompleteMultipartUpload)
+        }
+        _ => Err(AppError::Internal(
+            "invalid lifecycle action kind".to_owned(),
+        )),
+    }
 }
 
 fn validate_target(target: &VersionTargetIdentity) -> AppResult<()> {
@@ -572,6 +791,7 @@ fn persisted_action_kind(action_kind: LifecycleActionKind) -> &'static str {
         LifecycleActionKind::ExpireCurrent => "expire_current",
         LifecycleActionKind::ExpireNoncurrent => "expire_noncurrent",
         LifecycleActionKind::DeleteExpiredMarker => "delete_expired_marker",
+        LifecycleActionKind::AbortIncompleteMultipartUpload => "abort_incomplete_multipart_upload",
     }
 }
 
@@ -665,6 +885,7 @@ fn normalize_transaction_error(error: TransactionError<AppError>) -> AppError {
 
 #[cfg(test)]
 pub(crate) mod test_hooks {
+    use std::collections::HashMap;
     use std::sync::{LazyLock, Mutex};
 
     use crate::{
@@ -674,26 +895,42 @@ pub(crate) mod test_hooks {
 
     #[derive(Debug)]
     struct PendingTerminalFailure {
-        action_id: String,
         state: String,
+        temporary: bool,
     }
 
-    static NEXT_TERMINAL_FAILURE: LazyLock<Mutex<Option<PendingTerminalFailure>>> =
-        LazyLock::new(|| Mutex::new(None));
+    static NEXT_TERMINAL_FAILURE: LazyLock<Mutex<HashMap<String, PendingTerminalFailure>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
 
     pub struct FailureScope {
         action_id: String,
     }
 
     pub fn fail_next_succeeded(action_id: &str) -> FailureScope {
-        *NEXT_TERMINAL_FAILURE
+        NEXT_TERMINAL_FAILURE
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(PendingTerminalFailure {
-            action_id: action_id.to_owned(),
-            state: STATE_SUCCEEDED.to_owned(),
-        });
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                action_id.to_owned(),
+                PendingTerminalFailure {
+                    state: STATE_SUCCEEDED.to_owned(),
+                    temporary: false,
+                },
+            );
         FailureScope {
             action_id: action_id.to_owned(),
+        }
+    }
+
+    impl FailureScope {
+        pub fn temporarily(self) -> Self {
+            NEXT_TERMINAL_FAILURE
+                .lock()
+                .unwrap()
+                .get_mut(&self.action_id)
+                .unwrap()
+                .temporary = true;
+            self
         }
     }
 
@@ -702,12 +939,17 @@ pub(crate) mod test_hooks {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if failure
-            .as_ref()
-            .is_some_and(|pending| pending.action_id == action_id && pending.state == state)
+            .get(action_id)
+            .is_some_and(|pending| pending.state == state)
         {
-            *failure = None;
+            let temporary = failure.remove(action_id).unwrap().temporary;
             return Err(AppError::Database(
-                "injected lifecycle terminal-store failure".to_owned(),
+                if temporary {
+                    "database is locked"
+                } else {
+                    "injected lifecycle terminal-store failure"
+                }
+                .to_owned(),
             ));
         }
         Ok(())
@@ -718,12 +960,7 @@ pub(crate) mod test_hooks {
             let mut failure = NEXT_TERMINAL_FAILURE
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if failure
-                .as_ref()
-                .is_some_and(|pending| pending.action_id == self.action_id)
-            {
-                *failure = None;
-            }
+            failure.remove(&self.action_id);
         }
     }
 }
@@ -735,6 +972,7 @@ mod tests {
         ColumnTrait, ConnectionTrait, Database, EntityTrait, PaginatorTrait, QueryFilter,
         QueryOrder, sea_query::Expr,
     };
+    use sha2::Digest as _;
 
     use super::{
         MAX_LIFECYCLE_ACTION_ATTEMPTS, STATE_CLAIMED, STATE_FAILED_SAFE, claim_due,
@@ -743,7 +981,8 @@ mod tests {
     };
     use crate::{
         lifecycle::model::{
-            LifecycleActionKind, NewLifecycleAction, RuleIdentity, VersionTargetIdentity,
+            LifecycleActionKind, LifecycleTargetIdentity, NewLifecycleAction, RuleIdentity,
+            VersionTargetIdentity,
         },
         store::{
             bucket, connect_database,
@@ -771,7 +1010,7 @@ mod tests {
             config_revision: 1,
             rule_identity: RuleIdentity::Id("expire".to_owned()),
             action_kind: LifecycleActionKind::ExpireCurrent,
-            target: VersionTargetIdentity {
+            target: LifecycleTargetIdentity::Version(VersionTargetIdentity {
                 bucket: "bucket".to_owned(),
                 key: key.to_owned(),
                 version_row_id: row.to_owned(),
@@ -781,9 +1020,274 @@ mod tests {
                 kind: VersionKind::Object,
                 object_id: Some(format!("object-{row}")),
                 sequence: 1,
-            },
+            }),
             due_at,
         }
+    }
+
+    fn stored_version_action() -> lifecycle_action::Model {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        lifecycle_action::Model {
+            id: "stored-version-action".to_owned(),
+            idempotency_key: "stored-version-key".to_owned(),
+            bucket: "bucket".to_owned(),
+            object_key: "key".to_owned(),
+            config_revision: 7,
+            rule_id: "id:expire".to_owned(),
+            action_kind: "expire_current".to_owned(),
+            target_type: "version".to_owned(),
+            target_version_row_id: Some("version-row".to_owned()),
+            target_public_version_id: Some("00000000-0000-4000-8000-000000000001".to_owned()),
+            target_object_id: Some("object-id".to_owned()),
+            target_sequence: Some(1),
+            target_upload_id: None,
+            target_upload_created_at: None,
+            due_at: now,
+            state: "pending".to_owned(),
+            attempts: 0,
+            next_attempt_at: now,
+            claim_epoch: 0,
+            lease_until: None,
+            claimed_by: None,
+            failure_class: None,
+            last_error_redacted: None,
+            created_at: now,
+            updated_at: now,
+            finished_at: None,
+        }
+    }
+
+    fn stored_multipart_action() -> lifecycle_action::Model {
+        let initiated_at = chrono::DateTime::parse_from_rfc3339("2026-09-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let due_at = chrono::DateTime::parse_from_rfc3339("2026-09-03T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        lifecycle_action::Model {
+            id: "stored-multipart-action".to_owned(),
+            idempotency_key: "stored-multipart-key".to_owned(),
+            bucket: "bucket".to_owned(),
+            object_key: "prefix/key".to_owned(),
+            config_revision: 7,
+            rule_id: "id:abort".to_owned(),
+            action_kind: "abort_incomplete_multipart_upload".to_owned(),
+            target_type: "multipart_upload".to_owned(),
+            target_version_row_id: None,
+            target_public_version_id: None,
+            target_object_id: None,
+            target_sequence: None,
+            target_upload_id: Some("upload-1".to_owned()),
+            target_upload_created_at: Some(initiated_at),
+            due_at,
+            state: "pending".to_owned(),
+            attempts: 0,
+            next_attempt_at: due_at,
+            claim_epoch: 0,
+            lease_until: None,
+            claimed_by: None,
+            failure_class: None,
+            last_error_redacted: None,
+            created_at: initiated_at,
+            updated_at: initiated_at,
+            finished_at: None,
+        }
+    }
+
+    #[test]
+    fn stored_polymorphic_target_decoder_returns_only_the_discriminated_identity() {
+        match super::target_from_action(&stored_version_action()).unwrap() {
+            LifecycleTargetIdentity::Version(target) => {
+                assert_eq!(target.bucket, "bucket");
+                assert_eq!(target.key, "key");
+                assert_eq!(target.version_row_id, "version-row");
+                assert_eq!(target.object_id.as_deref(), Some("object-id"));
+                assert_eq!(target.sequence, 1);
+            }
+            other => panic!("expected a version target, got {other:?}"),
+        }
+
+        match super::target_from_action(&stored_multipart_action()).unwrap() {
+            LifecycleTargetIdentity::MultipartUpload(target) => {
+                assert_eq!(target.bucket, "bucket");
+                assert_eq!(target.key, "prefix/key");
+                assert_eq!(target.upload_id, "upload-1");
+                assert_eq!(
+                    target.initiated_at,
+                    chrono::DateTime::parse_from_rfc3339("2026-09-01T00:00:00Z")
+                        .unwrap()
+                        .with_timezone(&chrono::Utc)
+                );
+            }
+            other => panic!("expected a multipart target, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stored_polymorphic_target_decoder_rejects_hybrid_missing_and_mismatched_rows() {
+        let mut cases = Vec::new();
+
+        let mut action = stored_version_action();
+        action.target_upload_id = Some("hybrid-upload".to_owned());
+        cases.push(("version with upload ID", action));
+
+        let mut action = stored_version_action();
+        action.target_upload_created_at = Some(action.created_at);
+        cases.push(("version with upload initiation", action));
+
+        let mut action = stored_multipart_action();
+        action.target_version_row_id = Some("hybrid-version".to_owned());
+        cases.push(("multipart with version row", action));
+
+        let mut action = stored_multipart_action();
+        action.target_public_version_id = Some("null".to_owned());
+        cases.push(("multipart with public version", action));
+
+        let mut action = stored_multipart_action();
+        action.target_object_id = Some("hybrid-object".to_owned());
+        cases.push(("multipart with object ID", action));
+
+        let mut action = stored_multipart_action();
+        action.target_sequence = Some(0);
+        cases.push(("multipart with sequence", action));
+
+        let mut action = stored_version_action();
+        action.target_version_row_id = None;
+        cases.push(("version missing row ID", action));
+
+        let mut action = stored_version_action();
+        action.target_version_row_id = Some(String::new());
+        cases.push(("version with empty row ID", action));
+
+        let mut action = stored_version_action();
+        action.target_public_version_id = None;
+        cases.push(("version missing public ID", action));
+
+        let mut action = stored_version_action();
+        action.target_public_version_id = Some(String::new());
+        cases.push(("version with empty public ID", action));
+
+        let mut action = stored_version_action();
+        action.target_sequence = None;
+        cases.push(("version missing sequence", action));
+
+        let mut action = stored_version_action();
+        action.target_sequence = Some(-1);
+        cases.push(("version with negative sequence", action));
+
+        let mut action = stored_version_action();
+        action.target_object_id = None;
+        cases.push(("current expiration missing object ID", action));
+
+        let mut action = stored_version_action();
+        action.action_kind = "delete_expired_marker".to_owned();
+        cases.push(("delete-marker expiration carrying object ID", action));
+
+        let mut action = stored_multipart_action();
+        action.target_upload_id = None;
+        cases.push(("multipart missing upload ID", action));
+
+        let mut action = stored_multipart_action();
+        action.target_upload_created_at = None;
+        cases.push(("multipart missing initiation", action));
+
+        let mut action = stored_multipart_action();
+        action.action_kind = "expire_current".to_owned();
+        cases.push(("version kind with multipart target", action));
+
+        let mut action = stored_version_action();
+        action.action_kind = "abort_incomplete_multipart_upload".to_owned();
+        cases.push(("abort kind with version target", action));
+
+        let mut action = stored_multipart_action();
+        action.target_type = "unknown".to_owned();
+        cases.push(("unknown target discriminator", action));
+
+        let mut action = stored_multipart_action();
+        action.action_kind = "unknown".to_owned();
+        cases.push(("unknown action kind", action));
+
+        let mut action = stored_multipart_action();
+        action.config_revision = 0;
+        cases.push(("zero revision", action));
+
+        let mut action = stored_multipart_action();
+        action.config_revision = -1;
+        cases.push(("negative revision", action));
+
+        let mut action = stored_multipart_action();
+        action.target_upload_id = Some(String::new());
+        cases.push(("empty upload ID", action));
+
+        let mut action = stored_multipart_action();
+        action.bucket.clear();
+        cases.push(("empty bucket", action));
+
+        let mut action = stored_multipart_action();
+        action.object_key.clear();
+        cases.push(("empty object key", action));
+
+        for (case, action) in cases {
+            assert!(
+                matches!(
+                    super::target_from_action(&action),
+                    Err(crate::error::AppError::Internal(_))
+                ),
+                "persisted action decoder accepted {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn phase_a_version_idempotency_bytes_are_frozen() {
+        let canonical = super::CanonicalVersionActionIdempotency {
+            bucket: "bucket",
+            config_revision: 7,
+            rule_identity: "id:expire",
+            action_kind: "expire_current",
+            target_version_row_id: "version-row",
+            target_public_version_id: "00000000-0000-4000-8000-000000000001",
+            target_object_id: Some("object-id"),
+            target_sequence: 1,
+            due_at: "2026-09-01T00:00:00.000000000Z".to_owned(),
+        };
+        let bytes = serde_json::to_vec(&canonical).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&bytes).unwrap(),
+            "{\"bucket\":\"bucket\",\"config_revision\":7,\"rule_identity\":\"id:expire\",\"action_kind\":\"expire_current\",\"target_version_row_id\":\"version-row\",\"target_public_version_id\":\"00000000-0000-4000-8000-000000000001\",\"target_object_id\":\"object-id\",\"target_sequence\":1,\"due_at\":\"2026-09-01T00:00:00.000000000Z\"}"
+        );
+        assert_eq!(
+            hex::encode(sha2::Sha256::digest(bytes)),
+            "d9c49eddf8319d6726c99c8162ff9b72150f6d57f23ad121be9a263647f55578"
+        );
+
+        let action = NewLifecycleAction {
+            idempotency_key: String::new(),
+            bucket: "bucket".to_owned(),
+            config_revision: 7,
+            rule_identity: RuleIdentity::Id("expire".to_owned()),
+            action_kind: LifecycleActionKind::ExpireCurrent,
+            target: LifecycleTargetIdentity::Version(VersionTargetIdentity {
+                bucket: "bucket".to_owned(),
+                key: "key".to_owned(),
+                version_row_id: "version-row".to_owned(),
+                public_version_id: PublicVersionId::Opaque(
+                    "00000000-0000-4000-8000-000000000001".to_owned(),
+                ),
+                kind: VersionKind::Object,
+                object_id: Some("object-id".to_owned()),
+                sequence: 1,
+            }),
+            due_at: chrono::DateTime::parse_from_rfc3339("2026-09-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        };
+        assert_eq!(
+            idempotency_key(&action).unwrap(),
+            "d9c49eddf8319d6726c99c8162ff9b72150f6d57f23ad121be9a263647f55578"
+        );
     }
 
     #[tokio::test]
@@ -1031,6 +1535,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multipart_exhausted_claim_never_clears_a_content_mutation_token() {
+        let db = setup().await;
+        let now = database_now(&db).await.unwrap();
+        let mut exhausted = stored_multipart_action();
+        exhausted.id = uuid::Uuid::new_v4().to_string();
+        exhausted.due_at = now - Duration::seconds(2);
+        exhausted.state = STATE_CLAIMED.to_owned();
+        exhausted.attempts = MAX_LIFECYCLE_ACTION_ATTEMPTS + 1;
+        exhausted.next_attempt_at = now - Duration::seconds(2);
+        exhausted.claim_epoch = 2;
+        exhausted.lease_until = Some(now - Duration::seconds(1));
+        exhausted.claimed_by = Some("crashed-multipart-worker".to_owned());
+        exhausted.created_at = now - Duration::seconds(3);
+        exhausted.updated_at = now - Duration::seconds(2);
+        lifecycle_action::Entity::insert(lifecycle_action::ActiveModel::from(exhausted.clone()))
+            .exec(&db)
+            .await
+            .unwrap();
+        let untouched_token = format!("lifecycle:{}:{}", exhausted.id, exhausted.claim_epoch);
+        import_destination::Entity::insert(import_destination::ActiveModel {
+            bucket: sea_orm::Set(exhausted.bucket.clone()),
+            key: sea_orm::Set(exhausted.object_key.clone()),
+            generation: sea_orm::Set(1),
+            owner_job_id: sea_orm::Set(None),
+            mutation_id: sea_orm::Set(Some(untouched_token.clone())),
+            mutation_prefix: sea_orm::Set(None),
+            updated_at: sea_orm::Set(now),
+        })
+        .exec(&db)
+        .await
+        .unwrap();
+
+        assert!(
+            claim_due(&db, "must-not-reclaim-multipart", Duration::seconds(30), 1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let terminal = lifecycle_action::Entity::find_by_id(exhausted.id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal.state, STATE_FAILED_SAFE);
+        let destination =
+            import_destination::Entity::find_by_id((exhausted.bucket, exhausted.object_key))
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            destination.mutation_id.as_deref(),
+            Some(untouched_token.as_str()),
+            "multipart exhaustion must not perform version-token cleanup"
+        );
+    }
+
+    #[tokio::test]
     async fn lifecycle_claim_empty_present_rule_id_is_distinct_from_ordinal_zero() {
         let db = setup().await;
         let now = database_now(&db).await.unwrap();
@@ -1110,7 +1673,10 @@ mod tests {
         let db = setup().await;
         let now = database_now(&db).await.unwrap();
         let mut invalid_marker = action("marker-row", "marker", now - Duration::seconds(1));
-        invalid_marker.target.kind = VersionKind::DeleteMarker;
+        let LifecycleTargetIdentity::Version(target) = &mut invalid_marker.target else {
+            unreachable!()
+        };
+        target.kind = VersionKind::DeleteMarker;
         assert!(matches!(
             insert_idempotent(&db, invalid_marker, now).await,
             Err(crate::error::AppError::InvalidArgument(_))

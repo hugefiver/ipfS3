@@ -8,15 +8,21 @@ use crate::{
     error::{AppError, AppResult},
     lifecycle::{
         config::from_canonical_json,
-        evaluator::{LifecycleEvaluationContext, evaluate_candidate},
+        evaluator::{
+            LifecycleEvaluationContext, evaluate_candidate, next_utc_midnight_after_full_days,
+        },
         model::{
-            ClaimedLifecycleAction, GuardedLifecycleExecutionResult, LifecycleActionKind,
-            LifecycleCandidate, RuleIdentity, VersionTargetIdentity,
+            CanonicalFilter, CanonicalRuleSelector, ClaimedLifecycleAction,
+            GuardedLifecycleExecutionResult, LifecycleActionKind, LifecycleCandidate,
+            LifecycleRuleStatus, LifecycleTargetIdentity, MultipartUploadTargetIdentity,
+            RuleIdentity, VersionLifecycleCandidate, VersionTargetIdentity,
         },
     },
     store::{
         database_clock::database_now,
-        entities::{bucket_lifecycle_config, lifecycle_action, object, object_version},
+        entities::{
+            bucket_lifecycle_config, lifecycle_action, multipart_upload, object, object_version,
+        },
         import::ownership::{
             StandardMutationGuard, clear_lifecycle_mutation_if_owned,
             complete_standard_mutation_in_transaction, lock_bucket_for_ownership,
@@ -25,11 +31,15 @@ use crate::{
         lifecycle_action::{
             FAILURE_ADMISSION_TEMPORARILY_UNAVAILABLE, FAILURE_CANCELLED_STALE,
             FAILURE_DATABASE_CONTENTION, FAILURE_INTERNAL_DEPENDENCY,
-            MAX_LIFECYCLE_ACTION_ATTEMPTS, lock_claim_for_execution, mark_cancelled,
-            mark_failed_safe, mark_succeeded, retry_at, schedule_retry,
+            MAX_LIFECYCLE_ACTION_ATTEMPTS, action_kind_from_db, lock_claim_for_execution,
+            mark_cancelled, mark_failed_safe, mark_succeeded, retry_at, schedule_retry,
+            target_from_action,
+        },
+        multipart::{
+            AbortExactIncompleteUploadResult, abort_exact_incomplete_upload_in_transaction,
         },
         object_version::{
-            BucketVersioningState, ExactCurrentMarkerDeleteResult, PublicVersionId, VersionKind,
+            BucketVersioningState, ExactCurrentMarkerDeleteResult, VersionKind,
             delete_current_sole_marker, lock_version_by_id, public_version_id, version_kind,
         },
         pinning::publication::{
@@ -99,6 +109,43 @@ pub(crate) async fn execute_claimed_lifecycle_action(
                 "invalid_action_identity",
             )
             .await;
+        }
+    };
+    let target = match target {
+        LifecycleTargetIdentity::Version(target) => target,
+        LifecycleTargetIdentity::MultipartUpload(target) => {
+            let transaction_claim = claim.clone();
+            let result = db
+                .transaction(move |txn| {
+                    Box::pin(async move {
+                        execute_multipart_in_transaction(txn, &transaction_claim, &target).await
+                    })
+                })
+                .await;
+            return match result {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    if is_temporary_execution_error(&transaction_error_into_app(error)) {
+                        retry_or_fail_safe(
+                            db,
+                            claim,
+                            max_attempts,
+                            base_backoff_secs,
+                            max_backoff_secs,
+                            FAILURE_DATABASE_CONTENTION,
+                        )
+                        .await
+                    } else {
+                        fail_safe(
+                            db,
+                            claim,
+                            FAILURE_INTERNAL_DEPENDENCY,
+                            "internal_dependency",
+                        )
+                        .await
+                    }
+                }
+            };
         }
     };
     let admission_now = match database_now(db).await {
@@ -224,6 +271,99 @@ fn validate_execution_settings(
         ));
     }
     Ok(())
+}
+
+async fn execute_multipart_in_transaction<C: ConnectionTrait>(
+    txn: &C,
+    claim: &ClaimedLifecycleAction,
+    target: &MultipartUploadTargetIdentity,
+) -> AppResult<()> {
+    let Some(locked_action) = lock_claim_for_execution(txn, claim).await? else {
+        return Ok(());
+    };
+    let now = database_now(txn).await?;
+    if !same_action_definition(&locked_action, &claim.action) {
+        return cancel_without_guard_in_transaction(txn, claim, now, FAILURE_CANCELLED_STALE).await;
+    }
+    lock_bucket_for_ownership(txn, &target.bucket).await?;
+    let Some(configuration_row) = lock_lifecycle_configuration(txn, &target.bucket).await? else {
+        return cancel_without_guard_in_transaction(txn, claim, now, FAILURE_CANCELLED_STALE).await;
+    };
+    if configuration_row.revision != locked_action.config_revision {
+        return cancel_without_guard_in_transaction(txn, claim, now, FAILURE_CANCELLED_STALE).await;
+    }
+    let Some(json) = configuration_row.canonical_json else {
+        return cancel_without_guard_in_transaction(txn, claim, now, FAILURE_CANCELLED_STALE).await;
+    };
+    let configuration = from_canonical_json(&json)?;
+    // Revalidate the named rule, not the evaluator's current winner: another
+    // eligible rule does not revoke this revision-scoped action's entitlement.
+    let rule = if let Some(id) = locked_action.rule_id.strip_prefix("id:") {
+        configuration
+            .rules
+            .iter()
+            .find(|rule| rule.id.as_deref() == Some(id))
+    } else if let Some(ordinal) = locked_action.rule_id.strip_prefix("ordinal:") {
+        ordinal
+            .parse::<u16>()
+            .ok()
+            .filter(|parsed| parsed.to_string() == ordinal)
+            .and_then(|ordinal| configuration.rules.get(usize::from(ordinal)))
+            .filter(|rule| rule.id.is_none())
+    } else {
+        None
+    };
+    let eligible_abort = rule
+        .filter(|rule| rule.status == LifecycleRuleStatus::Enabled)
+        .filter(|rule| match &rule.selector {
+            CanonicalRuleSelector::Modern {
+                filter: CanonicalFilter::All,
+            } => true,
+            CanonicalRuleSelector::LegacyPrefix { prefix }
+            | CanonicalRuleSelector::Modern {
+                filter: CanonicalFilter::Prefix { prefix },
+            } => target.key.starts_with(prefix),
+            _ => false,
+        })
+        .and_then(|rule| rule.abort_incomplete_multipart_upload.as_ref());
+    let Some(abort) = eligible_abort else {
+        return cancel_without_guard_in_transaction(txn, claim, now, FAILURE_CANCELLED_STALE).await;
+    };
+    let query = multipart_upload::Entity::find_by_id(target.upload_id.clone());
+    let upload = if txn.get_database_backend() == DatabaseBackend::Postgres {
+        query.lock_exclusive().one(txn).await?
+    } else {
+        query.one(txn).await?
+    };
+    if upload.is_some_and(|upload| {
+        upload.bucket != target.bucket
+            || upload.key != target.key
+            || upload.created_at != target.initiated_at
+    }) {
+        return cancel_without_guard_in_transaction(txn, claim, now, FAILURE_CANCELLED_STALE).await;
+    }
+    let Ok(due_at) =
+        next_utc_midnight_after_full_days(target.initiated_at, abort.days_after_initiation)
+    else {
+        return cancel_without_guard_in_transaction(txn, claim, now, FAILURE_CANCELLED_STALE).await;
+    };
+    if locked_action.due_at != due_at || now < due_at {
+        return cancel_without_guard_in_transaction(txn, claim, now, FAILURE_CANCELLED_STALE).await;
+    }
+    // Absence is successful only after policy and due-time revalidation; the
+    // action must retain its audit outcome even when completion removed the upload.
+    match abort_exact_incomplete_upload_in_transaction(txn, target).await? {
+        AbortExactIncompleteUploadResult::Applied
+        | AbortExactIncompleteUploadResult::AlreadySatisfied => {
+            if !mark_succeeded(txn, claim, now).await? {
+                return Err(AppError::StaleContentMutation);
+            }
+            Ok(())
+        }
+        AbortExactIncompleteUploadResult::Stale => {
+            cancel_without_guard_in_transaction(txn, claim, now, FAILURE_CANCELLED_STALE).await
+        }
+    }
 }
 
 async fn execute_final_transaction(
@@ -364,6 +504,11 @@ async fn revalidate_candidate<C: ConnectionTrait>(
         (LifecycleActionKind::ExpireCurrent, VersionKind::Object)
         | (LifecycleActionKind::DeleteExpiredMarker, VersionKind::DeleteMarker)
         | (LifecycleActionKind::ExpireNoncurrent, _) => {}
+        (LifecycleActionKind::AbortIncompleteMultipartUpload, _) => {
+            return Err(AppError::Internal(
+                "multipart lifecycle action reached version revalidation".to_owned(),
+            ));
+        }
         _ => return Ok(None),
     }
 
@@ -398,13 +543,15 @@ async fn revalidate_candidate<C: ConnectionTrait>(
             0
         }
     };
-    Ok(Some(LifecycleCandidate {
-        target: target.clone(),
-        is_latest: selected.is_latest,
-        size,
-        lifecycle_age_started_at: selected.lifecycle_age_started_at,
-        became_noncurrent_at: selected.became_noncurrent_at,
-    }))
+    Ok(Some(LifecycleCandidate::Version(
+        VersionLifecycleCandidate {
+            target: target.clone(),
+            is_latest: selected.is_latest,
+            size,
+            lifecycle_age_started_at: selected.lifecycle_age_started_at,
+            became_noncurrent_at: selected.became_noncurrent_at,
+        },
+    )))
 }
 
 async fn lock_object_for_lifecycle<C: ConnectionTrait>(
@@ -532,16 +679,18 @@ async fn retry_or_fail_safe(
             };
             let now = database_now(txn).await?;
             if locked_action.attempts >= max_attempts {
-                lock_bucket_for_ownership(txn, &locked_action.bucket).await?;
-                clear_lifecycle_mutation_if_owned(
-                    txn,
-                    &locked_action.bucket,
-                    &locked_action.object_key,
-                    &locked_action.id,
-                    claim.claim_epoch,
-                    now,
-                )
-                .await?;
+                if locked_action.target_type == "version" {
+                    lock_bucket_for_ownership(txn, &locked_action.bucket).await?;
+                    clear_lifecycle_mutation_if_owned(
+                        txn,
+                        &locked_action.bucket,
+                        &locked_action.object_key,
+                        &locked_action.id,
+                        claim.claim_epoch,
+                        now,
+                    )
+                    .await?;
+                }
                 if !mark_failed_safe(txn, &claim, now, &failure_class).await? {
                     return Err(AppError::StaleContentMutation);
                 }
@@ -575,20 +724,22 @@ async fn fail_safe(
     let diagnostic_class = diagnostic_class.to_owned();
     db.transaction(move |txn| {
         Box::pin(async move {
-            let Some(_) = lock_claim_for_execution(txn, &claim).await? else {
+            let Some(locked_action) = lock_claim_for_execution(txn, &claim).await? else {
                 return Ok(());
             };
             let now = database_now(txn).await?;
-            lock_bucket_for_ownership(txn, &claim.action.bucket).await?;
-            clear_lifecycle_mutation_if_owned(
-                txn,
-                &claim.action.bucket,
-                &claim.action.object_key,
-                &claim.action.id,
-                claim.claim_epoch,
-                now,
-            )
-            .await?;
+            if locked_action.target_type == "version" {
+                lock_bucket_for_ownership(txn, &locked_action.bucket).await?;
+                clear_lifecycle_mutation_if_owned(
+                    txn,
+                    &locked_action.bucket,
+                    &locked_action.object_key,
+                    &locked_action.id,
+                    claim.claim_epoch,
+                    now,
+                )
+                .await?;
+            }
             if !mark_failed_safe(txn, &claim, now, &failure_class).await? {
                 return Err(AppError::StaleContentMutation);
             }
@@ -601,15 +752,26 @@ async fn fail_safe(
 }
 
 fn log_action_diagnostic(claim: &ClaimedLifecycleAction, failure_class: &str) {
-    tracing::warn!(
-        action_id = %claim.action.id,
-        bucket = %claim.action.bucket,
-        key = %claim.action.object_key,
-        public_version_id = %claim.action.target_public_version_id,
-        revision = claim.action.config_revision,
-        failure_class,
-        "lifecycle action terminal outcome"
-    );
+    if claim.action.target_type == "version" {
+        tracing::warn!(
+            action_id = %claim.action.id,
+            bucket = %claim.action.bucket,
+            key = %claim.action.object_key,
+            public_version_id = %claim.action.target_public_version_id.as_deref().unwrap_or("<invalid>"),
+            revision = claim.action.config_revision,
+            failure_class,
+            "lifecycle action terminal outcome"
+        );
+    } else {
+        tracing::warn!(
+            action_id = %claim.action.id,
+            bucket = %claim.action.bucket,
+            key = %claim.action.object_key,
+            revision = claim.action.config_revision,
+            failure_class,
+            "lifecycle action terminal outcome"
+        );
+    }
 }
 
 fn is_temporary_execution_error(error: &AppError) -> bool {
@@ -632,69 +794,48 @@ fn same_action_definition(left: &lifecycle_action::Model, right: &lifecycle_acti
         && left.config_revision == right.config_revision
         && left.rule_id == right.rule_id
         && left.action_kind == right.action_kind
+        && left.target_type == right.target_type
         && left.target_version_row_id == right.target_version_row_id
         && left.target_public_version_id == right.target_public_version_id
         && left.target_object_id == right.target_object_id
         && left.target_sequence == right.target_sequence
+        && left.target_upload_id == right.target_upload_id
+        && left.target_upload_created_at == right.target_upload_created_at
         && left.due_at == right.due_at
-}
-
-fn target_from_action(action: &lifecycle_action::Model) -> AppResult<VersionTargetIdentity> {
-    let action_kind = action_kind_from_db(&action.action_kind)?;
-    let kind = match action_kind {
-        LifecycleActionKind::ExpireCurrent => VersionKind::Object,
-        LifecycleActionKind::DeleteExpiredMarker => VersionKind::DeleteMarker,
-        LifecycleActionKind::ExpireNoncurrent => match action.target_object_id {
-            Some(_) => VersionKind::Object,
-            None => VersionKind::DeleteMarker,
-        },
-    };
-    let object_id = action.target_object_id.clone();
-    if action.bucket.is_empty()
-        || action.object_key.is_empty()
-        || action.target_version_row_id.is_empty()
-        || action.target_sequence < 0
-        || matches!(kind, VersionKind::Object) != object_id.is_some()
-    {
-        return Err(AppError::Internal(
-            "invalid lifecycle action identity".to_owned(),
-        ));
-    }
-    Ok(VersionTargetIdentity {
-        bucket: action.bucket.clone(),
-        key: action.object_key.clone(),
-        version_row_id: action.target_version_row_id.clone(),
-        public_version_id: PublicVersionId::parse_s3(&action.target_public_version_id)
-            .map_err(|_| AppError::Internal("invalid lifecycle action identity".to_owned()))?,
-        kind,
-        object_id,
-        sequence: action.target_sequence,
-    })
-}
-
-fn action_kind_from_db(value: &str) -> AppResult<LifecycleActionKind> {
-    match value {
-        "expire_current" => Ok(LifecycleActionKind::ExpireCurrent),
-        "expire_noncurrent" => Ok(LifecycleActionKind::ExpireNoncurrent),
-        "delete_expired_marker" => Ok(LifecycleActionKind::DeleteExpiredMarker),
-        _ => Err(AppError::Internal(
-            "invalid lifecycle action kind".to_owned(),
-        )),
-    }
 }
 
 fn action_matches_expected(
     action: &lifecycle_action::Model,
     expected: &crate::lifecycle::model::NewLifecycleAction,
 ) -> bool {
-    action.bucket == expected.bucket
+    let target_matches = match &expected.target {
+        LifecycleTargetIdentity::Version(target) => {
+            action.object_key == target.key
+                && action.target_type == "version"
+                && action.target_version_row_id.as_deref() == Some(target.version_row_id.as_str())
+                && action.target_public_version_id.as_deref()
+                    == Some(target.public_version_id.as_s3_str())
+                && action.target_object_id == target.object_id
+                && action.target_sequence == Some(target.sequence)
+                && action.target_upload_id.is_none()
+                && action.target_upload_created_at.is_none()
+        }
+        LifecycleTargetIdentity::MultipartUpload(target) => {
+            action.object_key == target.key
+                && action.target_type == "multipart_upload"
+                && action.target_version_row_id.is_none()
+                && action.target_public_version_id.is_none()
+                && action.target_object_id.is_none()
+                && action.target_sequence.is_none()
+                && action.target_upload_id.as_deref() == Some(target.upload_id.as_str())
+                && action.target_upload_created_at == Some(target.initiated_at)
+        }
+    };
+    target_matches
+        && action.bucket == expected.bucket
         && action.config_revision == expected.config_revision
         && action.rule_id == persisted_rule_identity(&expected.rule_identity)
         && action.action_kind == persisted_action_kind(expected.action_kind)
-        && action.target_version_row_id == expected.target.version_row_id
-        && action.target_public_version_id == expected.target.public_version_id.as_s3_str()
-        && action.target_object_id == expected.target.object_id
-        && action.target_sequence == expected.target.sequence
         && action.due_at == expected.due_at
 }
 
@@ -710,6 +851,7 @@ fn persisted_action_kind(action_kind: LifecycleActionKind) -> &'static str {
         LifecycleActionKind::ExpireCurrent => "expire_current",
         LifecycleActionKind::ExpireNoncurrent => "expire_noncurrent",
         LifecycleActionKind::DeleteExpiredMarker => "delete_expired_marker",
+        LifecycleActionKind::AbortIncompleteMultipartUpload => "abort_incomplete_multipart_upload",
     }
 }
 
@@ -804,6 +946,11 @@ pub(crate) async fn execute_lifecycle_delete_guarded(
                 )
                 .await?,
             )
+        }
+        LifecycleActionKind::AbortIncompleteMultipartUpload => {
+            return Err(AppError::Internal(
+                "multipart lifecycle action reached version deletion".to_owned(),
+            ));
         }
     };
     complete_standard_mutation_in_transaction(txn, guard, now).await?;
@@ -911,8 +1058,8 @@ mod tests {
             model::{
                 CanonicalFilter, CanonicalLifecycleConfiguration, CanonicalLifecycleRule,
                 CanonicalRuleSelector, CanonicalTag, ClaimedLifecycleAction, CurrentExpiration,
-                LifecycleActionKind, LifecycleRuleStatus, NewLifecycleAction, NoncurrentExpiration,
-                RuleIdentity, VersionTargetIdentity,
+                LifecycleActionKind, LifecycleRuleStatus, LifecycleTargetIdentity,
+                NewLifecycleAction, NoncurrentExpiration, RuleIdentity, VersionTargetIdentity,
             },
         },
         pinning::{policy::PublicationPolicy, tags::ObjectTag},
@@ -920,8 +1067,8 @@ mod tests {
             bucket,
             database_clock::database_now,
             entities::{
-                bucket_lifecycle_config, import_destination, lifecycle_action, object, object_tag,
-                object_version,
+                bucket_lifecycle_config, import_destination, lifecycle_action, multipart_upload,
+                object, object_tag, object_version,
             },
             import::ownership::{
                 admit_content_mutation, complete_standard_mutation_in_transaction,
@@ -944,6 +1091,750 @@ mod tests {
     };
 
     const WORKER: &str = "lifecycle-action-execution-test";
+
+    use crate::lifecycle::model::{
+        AbortIncompleteMultipartUploadAction, MultipartUploadTargetIdentity,
+    };
+    use crate::store::{lifecycle_action as action_store, multipart};
+    use sea_orm::sea_query::Expr;
+
+    fn abort_rule() -> CanonicalLifecycleRule {
+        CanonicalLifecycleRule {
+            id: Some("abort".to_owned()),
+            status: LifecycleRuleStatus::Enabled,
+            selector: all(),
+            expiration: None,
+            noncurrent_version_expiration: None,
+            abort_incomplete_multipart_upload: Some(AbortIncompleteMultipartUploadAction {
+                days_after_initiation: 1,
+            }),
+        }
+    }
+
+    async fn multipart_fixture() -> (DatabaseConnection, ClaimedLifecycleAction) {
+        let db = setup().await;
+        let (revision, _) = configure(&db, vec![abort_rule()]).await;
+        multipart::create_upload(
+            &db,
+            "upload",
+            "mpu-object",
+            "bucket",
+            "logs/key",
+            "none",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        let initiated_at = database_now(&db).await.unwrap() - Duration::days(3);
+        multipart_upload::Entity::update_many()
+            .col_expr(
+                multipart_upload::Column::CreatedAt,
+                Expr::value(initiated_at),
+            )
+            .exec(&db)
+            .await
+            .unwrap();
+        multipart::upsert_part(&db, "upload", 1, "part-cid", 5, "part-cid")
+            .await
+            .unwrap();
+        let action = NewLifecycleAction {
+            idempotency_key: String::new(),
+            bucket: "bucket".to_owned(),
+            config_revision: revision,
+            rule_identity: RuleIdentity::Id("abort".to_owned()),
+            action_kind: LifecycleActionKind::AbortIncompleteMultipartUpload,
+            target: LifecycleTargetIdentity::MultipartUpload(MultipartUploadTargetIdentity {
+                bucket: "bucket".to_owned(),
+                key: "logs/key".to_owned(),
+                upload_id: "upload".to_owned(),
+                initiated_at,
+            }),
+            due_at: crate::lifecycle::evaluator::next_utc_midnight_after_full_days(initiated_at, 1)
+                .unwrap(),
+        };
+        insert_idempotent(&db, action, database_now(&db).await.unwrap())
+            .await
+            .unwrap();
+        let claim = claim_due(&db, WORKER, Duration::seconds(30), 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        (db, claim)
+    }
+
+    async fn stored_action(
+        db: &DatabaseConnection,
+        claim: &ClaimedLifecycleAction,
+    ) -> lifecycle_action::Model {
+        lifecycle_action::Entity::find_by_id(claim.action.id.clone())
+            .one(db)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn assert_upload_present(db: &DatabaseConnection, present: bool) {
+        assert_eq!(
+            multipart_upload::Entity::find_by_id("upload")
+                .one(db)
+                .await
+                .unwrap()
+                .is_some(),
+            present
+        );
+        assert_eq!(
+            multipart::list_parts(db, "upload").await.unwrap().len(),
+            usize::from(present)
+        );
+    }
+
+    async fn change_action(
+        db: &DatabaseConnection,
+        claim: &ClaimedLifecycleAction,
+        column: lifecycle_action::Column,
+        value: impl Into<sea_orm::Value>,
+    ) {
+        lifecycle_action::Entity::update_many()
+            .col_expr(column, Expr::value(value))
+            .filter(lifecycle_action::Column::Id.eq(&claim.action.id))
+            .exec(db)
+            .await
+            .unwrap();
+    }
+
+    async fn reclaim_multipart(
+        db: &DatabaseConnection,
+        claim: &ClaimedLifecycleAction,
+    ) -> ClaimedLifecycleAction {
+        let past = database_now(db).await.unwrap() - Duration::seconds(1);
+        if stored_action(db, claim).await.state == "claimed" {
+            change_action(db, claim, lifecycle_action::Column::LeaseUntil, Some(past)).await;
+        }
+        change_action(db, claim, lifecycle_action::Column::NextAttemptAt, past).await;
+        claim_due(db, "replacement", Duration::seconds(30), 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap()
+    }
+
+    async fn seed_foreign_token(
+        db: &DatabaseConnection,
+        claim: &ClaimedLifecycleAction,
+    ) -> import_destination::Model {
+        // Even a token with the apparent lifecycle owner is foreign to MPU execution.
+        import_destination::Entity::insert(import_destination::ActiveModel {
+            bucket: sea_orm::Set("bucket".to_owned()),
+            key: sea_orm::Set("logs/key".to_owned()),
+            generation: sea_orm::Set(42),
+            owner_job_id: sea_orm::Set(None),
+            mutation_id: sea_orm::Set(Some(format!(
+                "lifecycle:{}:{}",
+                claim.action.id, claim.claim_epoch
+            ))),
+            mutation_prefix: sea_orm::Set(None),
+            updated_at: sea_orm::Set(database_now(db).await.unwrap()),
+        })
+        .exec(db)
+        .await
+        .unwrap();
+        foreign_token(db).await
+    }
+
+    async fn foreign_token(db: &DatabaseConnection) -> import_destination::Model {
+        import_destination::Entity::find_by_id(("bucket".to_owned(), "logs/key".to_owned()))
+            .one(db)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    struct QueryRecorder<'a, C> {
+        db: &'a C,
+        queries: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl<C: ConnectionTrait> ConnectionTrait for QueryRecorder<'_, C> {
+        fn get_database_backend(&self) -> sea_orm::DatabaseBackend {
+            self.db.get_database_backend()
+        }
+        async fn execute(
+            &self,
+            statement: sea_orm::Statement,
+        ) -> Result<sea_orm::ExecResult, sea_orm::DbErr> {
+            self.queries.lock().unwrap().push(statement.sql.clone());
+            self.db.execute(statement).await
+        }
+        async fn execute_unprepared(
+            &self,
+            sql: &str,
+        ) -> Result<sea_orm::ExecResult, sea_orm::DbErr> {
+            self.queries.lock().unwrap().push(sql.to_owned());
+            self.db.execute_unprepared(sql).await
+        }
+        async fn query_one(
+            &self,
+            statement: sea_orm::Statement,
+        ) -> Result<Option<sea_orm::QueryResult>, sea_orm::DbErr> {
+            self.queries.lock().unwrap().push(statement.sql.clone());
+            self.db.query_one(statement).await
+        }
+        async fn query_all(
+            &self,
+            statement: sea_orm::Statement,
+        ) -> Result<Vec<sea_orm::QueryResult>, sea_orm::DbErr> {
+            self.queries.lock().unwrap().push(statement.sql.clone());
+            self.db.query_all(statement).await
+        }
+    }
+
+    #[tokio::test]
+    async fn multipart_execution_locks_claim_before_policy_and_never_takes_standard_token() {
+        let (db, claim) = multipart_fixture().await;
+        let txn = db.begin().await.unwrap();
+        let recorder = QueryRecorder {
+            db: &txn,
+            queries: Mutex::new(Vec::new()),
+        };
+        let mut stale = claim.clone();
+        stale.claim_epoch += 1;
+        let LifecycleTargetIdentity::MultipartUpload(target) =
+            action_store::target_from_action(&claim.action).unwrap()
+        else {
+            unreachable!()
+        };
+        super::execute_multipart_in_transaction(&recorder, &stale, &target)
+            .await
+            .unwrap();
+        let queries = recorder.queries.into_inner().unwrap();
+        assert!(
+            queries[0].contains("lifecycle_actions"),
+            "claim must be the first read: {queries:?}"
+        );
+        assert_eq!(
+            queries.len(),
+            1,
+            "rejected epoch must not read database time or target state"
+        );
+        txn.commit().await.unwrap();
+        let user_guard = admit_content_mutation(
+            &db,
+            "bucket",
+            "logs/key",
+            None,
+            crate::import::SupersedeReason::PutObject,
+            database_now(&db).await.unwrap(),
+        )
+        .await
+        .unwrap();
+        let token = foreign_token(&db).await;
+        assert_eq!(
+            token.mutation_id.as_deref(),
+            Some(user_guard.mutation_id.as_str())
+        );
+        execute(&db, &stale).await;
+        assert_eq!(stored_action(&db, &claim).await, claim.action);
+        assert_upload_present(&db, true).await;
+        execute(&db, &claim).await;
+        assert_eq!(state(&db, &claim).await.as_deref(), Some("succeeded"));
+        assert_upload_present(&db, false).await;
+        assert_eq!(foreign_token(&db).await, token);
+    }
+
+    #[tokio::test]
+    async fn multipart_execution_applies_and_claim_fences_terminal_success() {
+        let (db, claim) = multipart_fixture().await;
+        db.execute_unprepared("CREATE TRIGGER invalidate_abort_epoch AFTER DELETE ON multipart_uploads BEGIN UPDATE lifecycle_actions SET claim_epoch = claim_epoch + 1 WHERE target_upload_id = OLD.upload_id; END;").await.unwrap();
+        execute(&db, &claim).await;
+        assert_upload_present(&db, true).await;
+        let pending = stored_action(&db, &claim).await;
+        assert_eq!(
+            pending.state, "pending",
+            "losing the terminal fence must roll back the delete"
+        );
+        assert_eq!(
+            pending.claim_epoch, claim.claim_epoch,
+            "the trigger's mutation must also roll back"
+        );
+        db.execute_unprepared("DROP TRIGGER invalidate_abort_epoch")
+            .await
+            .unwrap();
+        let claim = reclaim_multipart(&db, &claim).await;
+        let txn = db.begin().await.unwrap();
+        let recorder = QueryRecorder {
+            db: &txn,
+            queries: Mutex::new(Vec::new()),
+        };
+        let LifecycleTargetIdentity::MultipartUpload(target) =
+            action_store::target_from_action(&claim.action).unwrap()
+        else {
+            unreachable!()
+        };
+        super::execute_multipart_in_transaction(&recorder, &claim, &target)
+            .await
+            .unwrap();
+        let queries = recorder.queries.into_inner().unwrap();
+        assert!(queries[0].contains("lifecycle_actions"));
+        assert!(queries[1].contains("strftime"));
+        let bucket_lock = queries
+            .iter()
+            .position(|sql| sql.contains("buckets"))
+            .unwrap();
+        let policy = queries
+            .iter()
+            .position(|sql| sql.contains("bucket_lifecycle_configs"))
+            .unwrap();
+        let mutation = queries
+            .iter()
+            .position(|sql| sql.starts_with("DELETE") && sql.contains("multipart_uploads"))
+            .unwrap();
+        let target_read = queries
+            .iter()
+            .position(|sql| sql.starts_with("SELECT") && sql.contains("multipart_uploads"))
+            .expect("exact identity must be revalidated before mutation");
+        assert!(policy < target_read && target_read < mutation);
+        let terminal_write = queries
+            .iter()
+            .position(|sql| sql.starts_with("UPDATE") && sql.contains("lifecycle_actions"))
+            .unwrap();
+        assert!(
+            bucket_lock > 1
+                && bucket_lock < policy
+                && policy < mutation
+                && mutation < terminal_write,
+            "{queries:?}"
+        );
+        assert!(
+            queries
+                .iter()
+                .all(|sql| !sql.contains("import_destinations")),
+            "MPU must never inspect standard admission state: {queries:?}"
+        );
+        txn.commit().await.unwrap();
+        let terminal = stored_action(&db, &claim).await;
+        assert_eq!(terminal.state, "succeeded");
+        assert!(
+            terminal.finished_at.is_some()
+                && terminal.lease_until.is_none()
+                && terminal.claimed_by.is_none()
+        );
+        assert_upload_present(&db, false).await;
+        assert!(
+            !action_store::mark_cancelled(
+                &db,
+                &claim,
+                database_now(&db).await.unwrap(),
+                action_store::FAILURE_CANCELLED_STALE
+            )
+            .await
+            .unwrap()
+        );
+        execute(&db, &claim).await;
+        assert_eq!(stored_action(&db, &claim).await, terminal);
+    }
+
+    #[tokio::test]
+    async fn multipart_execution_missing_target_is_success_but_stale_identity_is_cancelled() {
+        for case in ["missing", "bucket", "key", "initiation"] {
+            let (db, claim) = multipart_fixture().await;
+            match case {
+                "missing" => multipart::delete_upload(&db, "upload").await.unwrap(),
+                "bucket" => {
+                    bucket::create(&db, "other", None).await.unwrap();
+                    multipart_upload::Entity::update_many()
+                        .col_expr(multipart_upload::Column::Bucket, Expr::value("other"))
+                        .exec(&db)
+                        .await
+                        .unwrap();
+                }
+                "key" => {
+                    multipart_upload::Entity::update_many()
+                        .col_expr(multipart_upload::Column::Key, Expr::value("other"))
+                        .exec(&db)
+                        .await
+                        .unwrap();
+                }
+                "initiation" => {
+                    multipart_upload::Entity::update_many()
+                        .col_expr(
+                            multipart_upload::Column::CreatedAt,
+                            Expr::value(database_now(&db).await.unwrap()),
+                        )
+                        .exec(&db)
+                        .await
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            execute(&db, &claim).await;
+            let row = stored_action(&db, &claim).await;
+            assert_eq!(
+                row.state,
+                if case == "missing" {
+                    "succeeded"
+                } else {
+                    "cancelled"
+                },
+                "{case}"
+            );
+            if case != "missing" {
+                assert_eq!(
+                    row.failure_class.as_deref(),
+                    Some(action_store::FAILURE_CANCELLED_STALE)
+                );
+            }
+            assert_upload_present(&db, case != "missing").await;
+        }
+    }
+
+    #[tokio::test]
+    async fn multipart_execution_revalidates_revision_rule_status_selector_due_and_target() {
+        for case in [
+            "replace",
+            "delete",
+            "disabled",
+            "missing_rule",
+            "no_abort",
+            "prefix",
+            "days",
+            "due",
+            "not_due",
+            "action_identity",
+            "ordinal",
+            "bad_ordinal",
+            "legacy",
+            "modern",
+            "named_not_winner",
+        ] {
+            let (db, mut claim) = multipart_fixture().await;
+            let mut rule = abort_rule();
+            match case {
+                "replace" => {
+                    configure(&db, vec![rule.clone()]).await;
+                }
+                "delete" => {
+                    delete_configuration(&db, "bucket").await.unwrap();
+                }
+                "disabled" => rule.status = LifecycleRuleStatus::Disabled,
+                "missing_rule" => rule.id = Some("different".to_owned()),
+                "no_abort" => {
+                    rule.abort_incomplete_multipart_upload = None;
+                    rule.expiration = Some(CurrentExpiration::Days { days: 1 });
+                }
+                "prefix" => {
+                    rule.selector = CanonicalRuleSelector::LegacyPrefix {
+                        prefix: "other/".to_owned(),
+                    }
+                }
+                "days" => {
+                    rule.abort_incomplete_multipart_upload
+                        .as_mut()
+                        .unwrap()
+                        .days_after_initiation = 2
+                }
+                "due" => {
+                    claim.action.due_at -= Duration::seconds(1);
+                    change_action(
+                        &db,
+                        &claim,
+                        lifecycle_action::Column::DueAt,
+                        claim.action.due_at,
+                    )
+                    .await;
+                }
+                "not_due" => {
+                    let initiated = database_now(&db).await.unwrap();
+                    claim.action.target_upload_created_at = Some(initiated);
+                    claim.action.due_at =
+                        crate::lifecycle::evaluator::next_utc_midnight_after_full_days(
+                            initiated, 1,
+                        )
+                        .unwrap();
+                    change_action(
+                        &db,
+                        &claim,
+                        lifecycle_action::Column::TargetUploadCreatedAt,
+                        Some(initiated),
+                    )
+                    .await;
+                    change_action(
+                        &db,
+                        &claim,
+                        lifecycle_action::Column::DueAt,
+                        claim.action.due_at,
+                    )
+                    .await;
+                    multipart_upload::Entity::update_many()
+                        .col_expr(multipart_upload::Column::CreatedAt, Expr::value(initiated))
+                        .exec(&db)
+                        .await
+                        .unwrap();
+                }
+                "action_identity" => {
+                    change_action(&db, &claim, lifecycle_action::Column::ObjectKey, "changed").await
+                }
+                "ordinal" | "bad_ordinal" => {
+                    rule.id = None;
+                    claim.action.rule_id = if case == "ordinal" {
+                        "ordinal:0"
+                    } else {
+                        "ordinal:00"
+                    }
+                    .to_owned();
+                    change_action(
+                        &db,
+                        &claim,
+                        lifecycle_action::Column::RuleId,
+                        claim.action.rule_id.clone(),
+                    )
+                    .await;
+                }
+                "legacy" => {
+                    rule.selector = CanonicalRuleSelector::LegacyPrefix {
+                        prefix: "logs/".to_owned(),
+                    }
+                }
+                "modern" => {
+                    rule.selector = CanonicalRuleSelector::Modern {
+                        filter: CanonicalFilter::Prefix {
+                            prefix: "logs/".to_owned(),
+                        },
+                    }
+                }
+                "named_not_winner" => {}
+                _ => unreachable!(),
+            }
+            if !matches!(case, "replace" | "delete") {
+                let mut rules = vec![rule];
+                if case == "named_not_winner" {
+                    let mut other = abort_rule();
+                    other.id = Some("a-earlier".to_owned());
+                    rules.insert(0, other);
+                }
+                replace_configuration_without_revising(&db, &configuration(rules)).await;
+            }
+            execute(&db, &claim).await;
+            let succeeds = matches!(case, "ordinal" | "legacy" | "modern" | "named_not_winner");
+            let row = stored_action(&db, &claim).await;
+            assert_eq!(
+                row.state,
+                if succeeds { "succeeded" } else { "cancelled" },
+                "{case}"
+            );
+            if !succeeds {
+                assert_eq!(
+                    row.failure_class.as_deref(),
+                    Some(action_store::FAILURE_CANCELLED_STALE),
+                    "{case}"
+                );
+            }
+            assert_upload_present(&db, !succeeds).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn multipart_execution_cancels_when_canonical_due_time_is_not_representable() {
+        let (db, claim) = multipart_fixture().await;
+        let mut rule = abort_rule();
+        rule.abort_incomplete_multipart_upload
+            .as_mut()
+            .unwrap()
+            .days_after_initiation = i32::MAX as u32;
+        replace_configuration_without_revising(&db, &configuration(vec![rule])).await;
+
+        execute(&db, &claim).await;
+
+        let terminal = stored_action(&db, &claim).await;
+        assert_eq!(terminal.state, "cancelled");
+        assert_eq!(
+            terminal.failure_class.as_deref(),
+            Some(action_store::FAILURE_CANCELLED_STALE)
+        );
+        assert!(terminal.finished_at.is_some());
+        assert!(terminal.lease_until.is_none() && terminal.claimed_by.is_none());
+        assert_upload_present(&db, true).await;
+    }
+
+    #[tokio::test]
+    async fn multipart_terminal_failure_never_clears_foreign_standard_token() {
+        for case in [
+            "malformed",
+            "malformed_type",
+            "invalid_policy",
+            "retry_exhausted",
+        ] {
+            let (db, mut claim) = multipart_fixture().await;
+            let token = seed_foreign_token(&db, &claim).await;
+            match case {
+                "malformed" => claim.action.target_upload_id = None,
+                "malformed_type" => claim.action.target_type = "version".to_owned(),
+                "invalid_policy" => {
+                    bucket_lifecycle_config::Entity::update_many()
+                        .col_expr(
+                            bucket_lifecycle_config::Column::CanonicalJson,
+                            Expr::value(Some("{\"schema_version\":1,\"rules\":[]}")),
+                        )
+                        .exec(&db)
+                        .await
+                        .unwrap();
+                }
+                "retry_exhausted" => {
+                    change_action(
+                        &db,
+                        &claim,
+                        lifecycle_action::Column::Attempts,
+                        MAX_LIFECYCLE_ACTION_ATTEMPTS,
+                    )
+                    .await;
+                    retry_or_fail_safe(
+                        &db,
+                        &claim,
+                        MAX_LIFECYCLE_ACTION_ATTEMPTS,
+                        1,
+                        60,
+                        action_store::FAILURE_DATABASE_CONTENTION,
+                    )
+                    .await
+                    .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            if case != "retry_exhausted" {
+                execute(&db, &claim).await;
+            }
+            let row = stored_action(&db, &claim).await;
+            assert_eq!(row.state, "failed_safe", "{case}");
+            assert_eq!(
+                row.last_error_redacted.as_deref(),
+                Some(action_store::REDACTED_LIFECYCLE_ACTION_ERROR)
+            );
+            assert_upload_present(&db, true).await;
+            assert_eq!(foreign_token(&db).await, token, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn multipart_temporary_failure_retries_then_succeeds() {
+        let (db, claim) = multipart_fixture().await;
+        db.execute_unprepared("CREATE TRIGGER temporary_abort BEFORE DELETE ON multipart_uploads BEGIN SELECT RAISE(FAIL, 'database is locked'); END;").await.unwrap();
+        execute(&db, &claim).await;
+        let pending = stored_action(&db, &claim).await;
+        assert_eq!(pending.state, "pending");
+        assert_eq!(
+            pending.failure_class.as_deref(),
+            Some(action_store::FAILURE_DATABASE_CONTENTION)
+        );
+        assert_eq!(
+            pending.next_attempt_at - pending.updated_at,
+            Duration::seconds(1)
+        );
+        assert_upload_present(&db, true).await;
+        db.execute_unprepared("DROP TRIGGER temporary_abort")
+            .await
+            .unwrap();
+        let next = reclaim_multipart(&db, &claim).await;
+        execute(&db, &next).await;
+        assert_eq!(state(&db, &next).await.as_deref(), Some("succeeded"));
+        assert_upload_present(&db, false).await;
+    }
+
+    #[tokio::test]
+    async fn multipart_terminal_write_failure_rolls_back_abort() {
+        let (db, claim) = multipart_fixture().await;
+        let _scope = action_store::test_hooks::fail_next_succeeded(&claim.action.id).temporarily();
+        execute(&db, &claim).await;
+        assert_upload_present(&db, true).await;
+        assert_eq!(state(&db, &claim).await.as_deref(), Some("pending"));
+        let next = reclaim_multipart(&db, &claim).await;
+        assert_eq!(next.action.attempts, 2);
+        execute(&db, &next).await;
+        assert_eq!(state(&db, &next).await.as_deref(), Some("succeeded"));
+        assert_upload_present(&db, false).await;
+    }
+
+    #[tokio::test]
+    async fn multipart_stale_epoch_cannot_abort_or_terminalize() {
+        let (db, first) = multipart_fixture().await;
+        let second = reclaim_multipart(&db, &first).await;
+        execute(&db, &first).await;
+        assert_eq!(stored_action(&db, &first).await, second.action);
+        assert_upload_present(&db, true).await;
+        let now = database_now(&db).await.unwrap();
+        assert!(
+            !action_store::mark_succeeded(&db, &first, now)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !action_store::mark_cancelled(&db, &first, now, action_store::FAILURE_CANCELLED_STALE)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !action_store::mark_failed_safe(
+                &db,
+                &first,
+                now,
+                action_store::FAILURE_INTERNAL_DEPENDENCY
+            )
+            .await
+            .unwrap()
+        );
+        execute(&db, &second).await;
+        assert_eq!(state(&db, &second).await.as_deref(), Some("succeeded"));
+        assert_upload_present(&db, false).await;
+    }
+
+    #[tokio::test]
+    async fn multipart_final_recovery_claim_is_bounded() {
+        for crash_again in [false, true] {
+            let (db, first) = multipart_fixture().await;
+            change_action(
+                &db,
+                &first,
+                lifecycle_action::Column::Attempts,
+                MAX_LIFECYCLE_ACTION_ATTEMPTS,
+            )
+            .await;
+            let recovery = reclaim_multipart(&db, &first).await;
+            assert_eq!(recovery.action.attempts, MAX_LIFECYCLE_ACTION_ATTEMPTS + 1);
+            assert_eq!(recovery.claim_epoch, first.claim_epoch + 1);
+            let token = seed_foreign_token(&db, &recovery).await;
+            if crash_again {
+                change_action(
+                    &db,
+                    &recovery,
+                    lifecycle_action::Column::LeaseUntil,
+                    Some(database_now(&db).await.unwrap() - Duration::seconds(1)),
+                )
+                .await;
+                for _ in 0..2 {
+                    assert!(
+                        claim_due(&db, "last", Duration::seconds(30), 1)
+                            .await
+                            .unwrap()
+                            .is_empty()
+                    );
+                }
+                let terminal = stored_action(&db, &recovery).await;
+                assert_eq!(terminal.state, "failed_safe");
+                assert_eq!(terminal.claim_epoch, recovery.claim_epoch);
+            } else {
+                execute(&db, &recovery).await;
+                assert_eq!(state(&db, &recovery).await.as_deref(), Some("succeeded"));
+            }
+            assert_upload_present(&db, crash_again).await;
+            assert_eq!(foreign_token(&db).await, token);
+        }
+    }
 
     #[derive(Clone)]
     struct LogCapture(Arc<Mutex<Vec<u8>>>);
@@ -990,6 +1881,7 @@ mod tests {
                 utc_midnight: at(2000, 1, 1),
             }),
             noncurrent_version_expiration: None,
+            abort_incomplete_multipart_upload: None,
         }
     }
 
@@ -1003,6 +1895,7 @@ mod tests {
                 noncurrent_days: 1,
                 newer_noncurrent_versions,
             }),
+            abort_incomplete_multipart_upload: None,
         }
     }
 
@@ -1138,7 +2031,7 @@ mod tests {
             config_revision: revision,
             rule_identity: RuleIdentity::Id(rule_id.to_owned()),
             action_kind,
-            target,
+            target: LifecycleTargetIdentity::Version(target),
             due_at,
         };
         action.idempotency_key = idempotency_key(&action).unwrap();
@@ -1205,6 +2098,119 @@ mod tests {
         execute_claimed_lifecycle_action(db, claim, MAX_LIFECYCLE_ACTION_ATTEMPTS, 1, 60)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn multipart_missing_configuration_cancels_and_never_touches_content_token() {
+        let db = setup().await;
+        crate::store::multipart::create_upload(
+            &db,
+            "fail-closed-upload",
+            "fail-closed-object",
+            "bucket",
+            "fail-closed-key",
+            "none",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        let upload = multipart_upload::Entity::find_by_id("fail-closed-upload")
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        let now = database_now(&db).await.unwrap();
+        let action_id = uuid::Uuid::new_v4().to_string();
+        lifecycle_action::Entity::insert(lifecycle_action::ActiveModel {
+            id: sea_orm::Set(action_id.clone()),
+            idempotency_key: sea_orm::Set("fail-closed-multipart-key".to_owned()),
+            bucket: sea_orm::Set("bucket".to_owned()),
+            object_key: sea_orm::Set("fail-closed-key".to_owned()),
+            config_revision: sea_orm::Set(1),
+            rule_id: sea_orm::Set("id:abort".to_owned()),
+            action_kind: sea_orm::Set("abort_incomplete_multipart_upload".to_owned()),
+            target_type: sea_orm::Set("multipart_upload".to_owned()),
+            target_version_row_id: sea_orm::Set(None),
+            target_public_version_id: sea_orm::Set(None),
+            target_object_id: sea_orm::Set(None),
+            target_sequence: sea_orm::Set(None),
+            target_upload_id: sea_orm::Set(Some(upload.upload_id.clone())),
+            target_upload_created_at: sea_orm::Set(Some(upload.created_at)),
+            due_at: sea_orm::Set(now - Duration::seconds(1)),
+            state: sea_orm::Set("pending".to_owned()),
+            attempts: sea_orm::Set(0),
+            next_attempt_at: sea_orm::Set(now - Duration::seconds(1)),
+            claim_epoch: sea_orm::Set(0),
+            lease_until: sea_orm::Set(None),
+            claimed_by: sea_orm::Set(None),
+            failure_class: sea_orm::Set(None),
+            last_error_redacted: sea_orm::Set(None),
+            created_at: sea_orm::Set(now),
+            updated_at: sea_orm::Set(now),
+            finished_at: sea_orm::Set(None),
+        })
+        .exec(&db)
+        .await
+        .unwrap();
+        let claim = claim_due(&db, WORKER, Duration::seconds(30), 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let untouched_token = format!("lifecycle:{}:{}", action_id, claim.claim_epoch);
+        import_destination::Entity::insert(import_destination::ActiveModel {
+            bucket: sea_orm::Set("bucket".to_owned()),
+            key: sea_orm::Set("fail-closed-key".to_owned()),
+            generation: sea_orm::Set(1),
+            owner_job_id: sea_orm::Set(None),
+            mutation_id: sea_orm::Set(Some(untouched_token.clone())),
+            mutation_prefix: sea_orm::Set(None),
+            updated_at: sea_orm::Set(now),
+        })
+        .exec(&db)
+        .await
+        .unwrap();
+
+        execute(&db, &claim).await;
+
+        assert_eq!(state(&db, &claim).await.as_deref(), Some("cancelled"));
+        let terminal = lifecycle_action::Entity::find_by_id(claim.action.id.clone())
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal.failure_class.as_deref(), Some("cancelled_stale"));
+        assert_eq!(
+            terminal.last_error_redacted.as_deref(),
+            Some("lifecycle action failed")
+        );
+        assert!(
+            multipart_upload::Entity::find_by_id(upload.upload_id)
+                .one(&db)
+                .await
+                .unwrap()
+                .is_some(),
+            "an MPU action without an active policy must not mutate its upload"
+        );
+        let destination = import_destination::Entity::find_by_id((
+            "bucket".to_owned(),
+            "fail-closed-key".to_owned(),
+        ))
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            destination.mutation_id.as_deref(),
+            Some(untouched_token.as_str()),
+            "an MPU action never owns or clears a standard content-mutation token"
+        );
     }
 
     #[tokio::test]
@@ -2241,10 +3247,13 @@ mod tests {
                 config_revision: 7,
                 rule_id: "id:rule".to_owned(),
                 action_kind: "expire_current".to_owned(),
-                target_version_row_id: "internal-object-uuid".to_owned(),
-                target_public_version_id: "public-version-id".to_owned(),
+                target_type: "version".to_owned(),
+                target_version_row_id: Some("internal-object-uuid".to_owned()),
+                target_public_version_id: Some("public-version-id".to_owned()),
                 target_object_id: Some("internal-object-uuid".to_owned()),
-                target_sequence: 1,
+                target_sequence: Some(1),
+                target_upload_id: None,
+                target_upload_created_at: None,
                 due_at: at(2000, 1, 1),
                 state: "claimed".to_owned(),
                 attempts: 1,

@@ -9,3 +9,4 @@ pub mod m20260813_000001_postgres_json_columns;
 pub mod m20260825_000001_object_versioning;
 pub mod m20260826_000001_lifecycle_expiration;
 pub mod m20260831_000001_bucket_cors;
+pub mod m20260901_000001_lifecycle_abort_multipart;

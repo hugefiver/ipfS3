@@ -68,6 +68,7 @@ mod migrator {
     use crate::store::migrations::m20260825_000001_object_versioning::Migration as ObjectVersioningMigration;
     use crate::store::migrations::m20260826_000001_lifecycle_expiration::Migration as LifecycleExpirationMigration;
     use crate::store::migrations::m20260831_000001_bucket_cors::Migration as BucketCorsMigration;
+    use crate::store::migrations::m20260901_000001_lifecycle_abort_multipart::Migration as LifecycleAbortMultipartMigration;
     use sea_orm_migration::prelude::*;
 
     pub struct Migrator;
@@ -85,6 +86,7 @@ mod migrator {
                 Box::new(ObjectVersioningMigration),
                 Box::new(LifecycleExpirationMigration),
                 Box::new(BucketCorsMigration),
+                Box::new(LifecycleAbortMultipartMigration),
             ]
         }
     }
@@ -136,7 +138,7 @@ mod tests {
     use sea_orm_migration::MigratorTrait;
 
     #[test]
-    fn bucket_cors_migration_is_registered_eleventh_and_last() {
+    fn lifecycle_abort_multipart_migration_is_registered_twelfth_and_last() {
         let names = migrator::Migrator::migrations()
             .into_iter()
             .map(|migration| migration.name().to_owned())
@@ -155,6 +157,7 @@ mod tests {
                 "m20260825_000001_object_versioning",
                 "m20260826_000001_lifecycle_expiration",
                 "m20260831_000001_bucket_cors",
+                "m20260901_000001_lifecycle_abort_multipart",
             ]
         );
     }

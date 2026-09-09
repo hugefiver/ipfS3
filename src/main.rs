@@ -312,15 +312,18 @@ mod tests {
             config_revision: 1,
             rule_identity: ipfs_s3_gateway::lifecycle::model::RuleIdentity::Id("expire".to_owned()),
             action_kind: ipfs_s3_gateway::lifecycle::model::LifecycleActionKind::ExpireCurrent,
-            target: ipfs_s3_gateway::lifecycle::model::VersionTargetIdentity {
-                bucket: "bucket".to_owned(),
-                key: "object".to_owned(),
-                version_row_id: "missing-version".to_owned(),
-                public_version_id: ipfs_s3_gateway::store::object_version::PublicVersionId::Null,
-                kind: ipfs_s3_gateway::store::object_version::VersionKind::Object,
-                object_id: Some("missing-object".to_owned()),
-                sequence: 1,
-            },
+            target: ipfs_s3_gateway::lifecycle::model::LifecycleTargetIdentity::Version(
+                ipfs_s3_gateway::lifecycle::model::VersionTargetIdentity {
+                    bucket: "bucket".to_owned(),
+                    key: "object".to_owned(),
+                    version_row_id: "missing-version".to_owned(),
+                    public_version_id:
+                        ipfs_s3_gateway::store::object_version::PublicVersionId::Null,
+                    kind: ipfs_s3_gateway::store::object_version::VersionKind::Object,
+                    object_id: Some("missing-object".to_owned()),
+                    sequence: 1,
+                },
+            ),
             due_at: now,
         };
         action.idempotency_key =

@@ -305,12 +305,6 @@ mod tests {
                     "noncurrent_version_transitions": []
                 }]
             }),
-            serde_json::json!({
-                "rules": [{
-                    "prefix": "logs/", "status": "Enabled", "expiration": { "days": 1 },
-                    "abort_incomplete_multipart_upload": { "days_after_initiation": 1 }
-                }]
-            }),
         ] {
             let configuration = serde_json::from_value(unsupported).unwrap();
             let error = put_bucket_lifecycle_configuration(

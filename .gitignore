@@ -6,3 +6,7 @@ config.toml
 largefile.bin
 *.png
 *.txt
+# Raw timestamped runner outputs (machine-local paths, large compiler JSON);
+# the sanitized receipts (*.md) in this directory are tracked.
+tests/results/postgres-lifecycle-validation/*.log
+tests/results/postgres-lifecycle-validation/*.json

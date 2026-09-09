@@ -125,6 +125,41 @@ impl Drop for KuboBlockControl {
     }
 }
 
+/// Arm a single request after setup (for example Complete's add, not a part's add).
+pub async fn block_next_kubo_request(
+    server: &MockServer,
+    target: KuboBlockTarget,
+    response: ResponseTemplate,
+) -> KuboBlockControl {
+    let (reached_tx, reached_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let blocker = KuboBlocker {
+        target,
+        reached: reached_tx,
+        release: Arc::new(Mutex::new(Some(release_rx))),
+    };
+    let endpoint = match target {
+        KuboBlockTarget::Add => "/api/v0/add",
+        KuboBlockTarget::Cat => "/api/v0/cat",
+        KuboBlockTarget::PinAdd => "/api/v0/pin/add",
+    };
+    Mock::given(method("POST"))
+        .and(path(endpoint))
+        .respond_with(move |_: &wiremock::Request| {
+            blocker.block_once(target);
+            response.clone()
+        })
+        .with_priority(1)
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(server)
+        .await;
+    KuboBlockControl {
+        reached: Some(reached_rx),
+        release: Some(release_tx),
+    }
+}
+
 #[derive(Clone)]
 struct KuboBlocker {
     target: KuboBlockTarget,

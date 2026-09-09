@@ -28,6 +28,315 @@ mod tests {
         super::validate_and_canonicalize(input)
     }
 
+    fn abort_rule(days: i32, selector: Value) -> LifecycleRule {
+        let mut value = json!({
+            "status": "Enabled",
+            "abort_incomplete_multipart_upload": { "days_after_initiation": days }
+        });
+        for (key, selected) in selector.as_object().unwrap() {
+            value[key] = selected.clone();
+        }
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn abort_days_are_positive_and_s3s_representable() {
+        for days in [1, i32::MAX] {
+            let canonical = canonicalize(configuration(vec![abort_rule(
+                days,
+                json!({ "filter": {} }),
+            )]))
+            .unwrap();
+            assert_eq!(
+                canonical.rules[0]
+                    .abort_incomplete_multipart_upload
+                    .as_ref()
+                    .unwrap()
+                    .days_after_initiation,
+                u32::try_from(days).unwrap()
+            );
+            let projected = super::to_s3_rules(&canonical).unwrap();
+            assert_eq!(
+                projected[0]
+                    .abort_incomplete_multipart_upload
+                    .as_ref()
+                    .unwrap()
+                    .days_after_initiation,
+                Some(days)
+            );
+        }
+        for days in [0, -1, i32::MIN] {
+            assert!(
+                canonicalize(configuration(vec![abort_rule(
+                    days,
+                    json!({ "filter": {} })
+                )]))
+                .is_err(),
+                "days={days}"
+            );
+        }
+        assert!(
+            canonicalize(configuration(vec![rule(json!({
+                "status": "Enabled",
+                "filter": {},
+                "abort_incomplete_multipart_upload": {}
+            }))]))
+            .is_err()
+        );
+
+        let canonical = canonicalize(configuration(vec![valid_rule()])).unwrap();
+        let mut stored = serde_json::to_value(canonical).unwrap();
+        stored["rules"][0]["abort_incomplete_multipart_upload"] =
+            json!({ "days_after_initiation": 2_147_483_648_u32 });
+        let decoded: CanonicalLifecycleConfiguration =
+            serde_json::from_value(stored.clone()).unwrap();
+        assert!(super::canonical_json(&decoded).is_err());
+        assert!(super::from_canonical_json(&stored.to_string()).is_err());
+    }
+
+    #[test]
+    fn abort_is_a_supported_action_and_mixed_actions_round_trip() {
+        let abort_only = abort_rule(7, json!({ "filter": {} }));
+        assert!(canonicalize(configuration(vec![abort_only.clone()])).is_ok());
+        assert!(
+            canonicalize(configuration(vec![rule(json!({
+                "status": "Enabled", "filter": {}
+            }))]))
+            .is_err()
+        );
+
+        for status in ["Enabled", "Disabled"] {
+            let mut mixed = serde_json::to_value(&abort_only).unwrap();
+            mixed["status"] = json!(status);
+            mixed["expiration"] = json!({ "days": 30 });
+            let canonical = canonicalize(configuration(vec![rule(mixed)])).unwrap();
+            let encoded = super::canonical_json(&canonical).unwrap();
+            assert_eq!(encoded, super::canonical_json(&canonical).unwrap());
+            let stored: Value = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(stored["schema_version"], json!(1));
+            assert_eq!(stored["rules"][0]["expiration"]["days"], json!(30));
+            assert_eq!(
+                stored["rules"][0]["abort_incomplete_multipart_upload"]["days_after_initiation"],
+                json!(7)
+            );
+            let decoded = super::from_canonical_json(&encoded).unwrap();
+            assert_eq!(decoded, canonical);
+            let projected = super::to_s3_rules(&decoded).unwrap();
+            assert_eq!(projected[0].status.as_str(), status);
+            assert_eq!(projected[0].expiration.as_ref().unwrap().days, Some(30));
+            assert_eq!(
+                projected[0]
+                    .abort_incomplete_multipart_upload
+                    .as_ref()
+                    .unwrap()
+                    .days_after_initiation,
+                Some(7)
+            );
+            assert_eq!(canonicalize(configuration(projected)).unwrap(), canonical);
+        }
+    }
+
+    #[test]
+    fn abort_accepts_only_all_or_prefix_selectors() {
+        let cases = [
+            (json!({ "prefix": "legacy/" }), true),
+            (json!({ "filter": {} }), true),
+            (json!({ "filter": { "prefix": "modern/" } }), true),
+            (
+                json!({ "filter": { "tag": { "key": "class", "value": "cold" } } }),
+                false,
+            ),
+            (json!({ "filter": { "and": { "prefix": "logs/" } } }), false),
+            (
+                json!({ "filter": { "and": {
+                "prefix": "logs/", "tags": [{ "key": "class", "value": "cold" }]
+            } } }),
+                false,
+            ),
+            (
+                json!({ "filter": { "object_size_greater_than": 0 } }),
+                false,
+            ),
+            (json!({ "filter": { "object_size_less_than": 10 } }), false),
+        ];
+        for (selector, accepted) in cases {
+            let abort = abort_rule(1, selector.clone());
+            let result = canonicalize(configuration(vec![abort.clone()]));
+            assert_eq!(result.is_ok(), accepted, "{selector}");
+            if let Ok(canonical) = result {
+                let projected = super::to_s3_rules(&canonical).unwrap();
+                assert_eq!(projected[0].prefix, abort.prefix);
+                assert_eq!(projected[0].filter, abort.filter);
+            }
+
+            let mut expiration = serde_json::to_value(abort).unwrap();
+            expiration
+                .as_object_mut()
+                .unwrap()
+                .remove("abort_incomplete_multipart_upload");
+            expiration["expiration"] = json!({ "days": 1 });
+            let canonical = canonicalize(configuration(vec![rule(expiration.clone())])).unwrap();
+            assert_eq!(
+                canonicalize(configuration(super::to_s3_rules(&canonical).unwrap())).unwrap(),
+                canonical
+            );
+            expiration["abort_incomplete_multipart_upload"] = json!({ "days_after_initiation": 1 });
+            assert_eq!(
+                canonicalize(configuration(vec![rule(expiration)])).is_ok(),
+                accepted,
+                "mixed actions: {selector}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn abort_rejection_is_rule_local_but_document_atomic() {
+        use crate::{
+            state::AppState,
+            store::{self, entities::bucket_lifecycle_config},
+        };
+        use sea_orm::EntityTrait;
+        use std::{collections::HashMap, sync::Arc};
+
+        let db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+        store::run_migrations(&db).await.unwrap();
+        store::bucket::create(&db, "bucket", None).await.unwrap();
+        let state = Arc::new(AppState {
+            kubo: crate::kubo::KuboClient::new("http://127.0.0.1:5001".to_owned()),
+            store: store::Store::new(db),
+            credentials: HashMap::new(),
+            master_key: crate::crypto::key::MasterKey::from_hex(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .unwrap(),
+            pinning: crate::pinning::coordinator::PinningCoordinator::disabled_for_test(),
+        });
+        let request = |rules| s3s::S3Request {
+            input: s3s::dto::PutBucketLifecycleConfigurationInput {
+                bucket: "bucket".to_owned(),
+                lifecycle_configuration: Some(configuration(rules)),
+                ..Default::default()
+            },
+            method: http::Method::PUT,
+            uri: "/bucket?lifecycle".parse().unwrap(),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        let tagged_expiration = rule(json!({
+            "status": "Enabled", "expiration": { "days": 1 },
+            "filter": { "tag": { "key": "class", "value": "cold" } }
+        }));
+        let safe_abort = abort_rule(1, json!({ "filter": {} }));
+        crate::s3::ops::lifecycle::put_bucket_lifecycle_configuration(
+            &state,
+            request(vec![tagged_expiration.clone(), safe_abort.clone()]),
+        )
+        .await
+        .unwrap();
+        let before = bucket_lifecycle_config::Entity::find_by_id("bucket")
+            .one(state.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.revision, 1);
+
+        for rejected in [
+            abort_rule(
+                1,
+                json!({ "filter": { "tag": { "key": "class", "value": "cold" } } }),
+            ),
+            rule(
+                json!({ "status": "Enabled", "prefix": "", "expiration": { "days": 1 }, "transitions": [{}] }),
+            ),
+            rule(
+                json!({ "status": "Enabled", "prefix": "", "expiration": { "days": 1 }, "noncurrent_version_transitions": [{}] }),
+            ),
+        ] {
+            let error = crate::s3::ops::lifecycle::put_bucket_lifecycle_configuration(
+                &state,
+                request(vec![
+                    tagged_expiration.clone(),
+                    safe_abort.clone(),
+                    rejected,
+                ]),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code().as_str(), "InvalidRequest");
+            let after = bucket_lifecycle_config::Entity::find_by_id("bucket")
+                .one(state.store.db())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.canonical_json, before.canonical_json);
+            assert_eq!(after.revision, before.revision);
+        }
+    }
+
+    #[test]
+    fn phase_a_canonical_json_decodes_with_absent_abort() {
+        let phase_a = json!({
+            "schema_version": 1,
+            "rules": [{
+                "id": null,
+                "status": "enabled",
+                "selector": { "kind": "legacy_prefix", "prefix": "" },
+                "expiration": { "kind": "days", "days": 1 },
+                "noncurrent_version_expiration": null
+            }]
+        });
+        let decoded = super::from_canonical_json(&phase_a.to_string()).unwrap();
+        assert!(decoded.rules[0].abort_incomplete_multipart_upload.is_none());
+        assert_eq!(
+            decoded,
+            canonicalize(configuration(vec![valid_rule()])).unwrap()
+        );
+        assert!(
+            super::to_s3_rules(&decoded).unwrap()[0]
+                .abort_incomplete_multipart_upload
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn stored_abort_json_is_semantically_revalidated() {
+        let canonical =
+            canonicalize(configuration(vec![abort_rule(1, json!({ "filter": {} }))])).unwrap();
+        let stored: Value =
+            serde_json::from_str(&super::canonical_json(&canonical).unwrap()).unwrap();
+        for days in [0_u32, 2_147_483_648_u32] {
+            let mut tampered = stored.clone();
+            tampered["rules"][0]["abort_incomplete_multipart_upload"]["days_after_initiation"] =
+                json!(days);
+            let decoded: CanonicalLifecycleConfiguration =
+                serde_json::from_value(tampered.clone()).unwrap();
+            assert!(
+                super::from_canonical_json(&tampered.to_string()).is_err(),
+                "days={days}"
+            );
+            assert!(super::canonical_json(&decoded).is_err(), "days={days}");
+            assert!(super::to_s3_rules(&decoded).is_err(), "days={days}");
+        }
+        for filter in [
+            json!({ "kind": "tag", "tag": { "key": "class", "value": "cold" } }),
+            json!({ "kind": "and", "prefix": "logs/", "tags": [], "object_size_greater_than": null, "object_size_less_than": null }),
+            json!({ "kind": "object_size_greater_than", "bytes": 0 }),
+            json!({ "kind": "object_size_less_than", "bytes": 10 }),
+        ] {
+            let mut tampered = stored.clone();
+            tampered["rules"][0]["selector"]["filter"] = filter;
+            let decoded: CanonicalLifecycleConfiguration =
+                serde_json::from_value(tampered.clone()).unwrap();
+            assert!(super::from_canonical_json(&tampered.to_string()).is_err());
+            assert!(super::canonical_json(&decoded).is_err());
+            assert!(super::to_s3_rules(&decoded).is_err());
+        }
+    }
+
     #[test]
     fn rule_count_bounds_are_enforced() {
         let cases = [
@@ -317,7 +626,6 @@ mod tests {
         for (field, future_action) in [
             ("transitions", json!([{}])),
             ("noncurrent_version_transitions", json!([{}])),
-            ("abort_incomplete_multipart_upload", json!({})),
         ] {
             let mut value = serde_json::to_value(valid_rule()).unwrap();
             value[field] = future_action;
@@ -505,9 +813,9 @@ use s3s::dto::{
 
 use crate::error::{AppError, AppResult};
 use crate::lifecycle::model::{
-    CanonicalFilter, CanonicalLifecycleConfiguration, CanonicalLifecycleRule,
-    CanonicalRuleSelector, CanonicalTag, CurrentExpiration, LifecycleRuleStatus,
-    NoncurrentExpiration,
+    AbortIncompleteMultipartUploadAction, CanonicalFilter, CanonicalLifecycleConfiguration,
+    CanonicalLifecycleRule, CanonicalRuleSelector, CanonicalTag, CurrentExpiration,
+    LifecycleRuleStatus, NoncurrentExpiration,
 };
 
 const SCHEMA_VERSION: u8 = 1;
@@ -620,8 +928,31 @@ fn validate_canonical_rule(rule: &CanonicalLifecycleRule) -> AppResult<()> {
         }
     }
 
-    if rule.expiration.is_none() && rule.noncurrent_version_expiration.is_none() {
-        return Err(invalid("lifecycle rule requires an expiration action"));
+    if let Some(abort) = &rule.abort_incomplete_multipart_upload {
+        if abort.days_after_initiation == 0 {
+            return Err(invalid("abort days after initiation must be positive"));
+        }
+        if abort.days_after_initiation > i32::MAX as u32 {
+            return Err(invalid("abort days after initiation are out of range"));
+        }
+        if !matches!(
+            &rule.selector,
+            CanonicalRuleSelector::LegacyPrefix { .. }
+                | CanonicalRuleSelector::Modern {
+                    filter: CanonicalFilter::All | CanonicalFilter::Prefix { .. }
+                }
+        ) {
+            return Err(invalid(
+                "abort incomplete multipart upload requires an all or prefix selector",
+            ));
+        }
+    }
+
+    if rule.expiration.is_none()
+        && rule.noncurrent_version_expiration.is_none()
+        && rule.abort_incomplete_multipart_upload.is_none()
+    {
+        return Err(invalid("lifecycle rule requires a supported action"));
     }
     Ok(())
 }
@@ -680,9 +1011,21 @@ fn canonicalize_rule(rule: LifecycleRule) -> AppResult<CanonicalLifecycleRule> {
         .map(|value| canonicalize_noncurrent_expiration(value, &selector))
         .transpose()?;
 
-    if expiration.is_none() && noncurrent_version_expiration.is_none() {
-        return Err(invalid("lifecycle rule requires an expiration action"));
-    }
+    let abort_incomplete_multipart_upload = rule
+        .abort_incomplete_multipart_upload
+        .map(|abort| -> AppResult<AbortIncompleteMultipartUploadAction> {
+            let days = abort
+                .days_after_initiation
+                .ok_or_else(|| invalid("abort days after initiation are required"))?;
+            if days <= 0 {
+                return Err(invalid("abort days after initiation must be positive"));
+            }
+            Ok(AbortIncompleteMultipartUploadAction {
+                days_after_initiation: u32::try_from(days)
+                    .map_err(|_| invalid("abort days after initiation are out of range"))?,
+            })
+        })
+        .transpose()?;
     if matches!(
         expiration,
         Some(CurrentExpiration::ExpiredObjectDeleteMarker)
@@ -699,6 +1042,7 @@ fn canonicalize_rule(rule: LifecycleRule) -> AppResult<CanonicalLifecycleRule> {
         selector,
         expiration,
         noncurrent_version_expiration,
+        abort_incomplete_multipart_upload,
     })
 }
 
@@ -709,11 +1053,6 @@ fn reject_future_actions(rule: &LifecycleRule) -> AppResult<()> {
     if rule.noncurrent_version_transitions.is_some() {
         return Err(invalid(
             "noncurrent lifecycle transitions are not supported",
-        ));
-    }
-    if rule.abort_incomplete_multipart_upload.is_some() {
-        return Err(invalid(
-            "abort incomplete multipart upload is not supported",
         ));
     }
     Ok(())
@@ -934,7 +1273,21 @@ fn utc_to_timestamp(value: DateTime<Utc>) -> Timestamp {
 
 fn project_rule(rule: &CanonicalLifecycleRule) -> AppResult<LifecycleRule> {
     Ok(LifecycleRule {
-        abort_incomplete_multipart_upload: None,
+        abort_incomplete_multipart_upload: rule
+            .abort_incomplete_multipart_upload
+            .as_ref()
+            .map(
+                |abort| -> AppResult<s3s::dto::AbortIncompleteMultipartUpload> {
+                    Ok(s3s::dto::AbortIncompleteMultipartUpload {
+                        days_after_initiation: Some(
+                            i32::try_from(abort.days_after_initiation).map_err(|_| {
+                                invalid("abort days after initiation are out of range")
+                            })?,
+                        ),
+                    })
+                },
+            )
+            .transpose()?,
         expiration: rule
             .expiration
             .as_ref()

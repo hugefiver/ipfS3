@@ -10,6 +10,7 @@ use sea_orm::{
 
 use crate::{
     error::{AppError, AppResult},
+    lifecycle::model::MultipartUploadTargetIdentity,
     pinning::{
         config::{ProviderLimitMap, ProviderMode},
         policy::{LeaseIntent, LeaseSource, PublicationPolicy},
@@ -25,7 +26,9 @@ use crate::{
             complete_standard_mutation_in_transaction, lock_bucket_for_ownership,
             verify_publication_guard, verify_standard_mutation_guard,
         },
-        multipart::{CommitCompletedUploadError, ReconciledCommitOutcome},
+        multipart::{
+            AbortExactIncompleteUploadResult, CommitCompletedUploadError, ReconciledCommitOutcome,
+        },
         object::LatestObjectRow,
         object_version::{
             BucketVersioningState, DeleteVersionResult, NULL_VERSION_ID, PublicVersionId,
@@ -200,22 +203,30 @@ pub async fn publish_standard_object(
 
 pub async fn publish_completed_upload(
     db: &DatabaseConnection,
-    upload_id: &str,
+    upload_target: &MultipartUploadTargetIdentity,
     request: PublicationRequest,
     limits: &ProviderLimitMap,
 ) -> Result<PublicationResult, CommitCompletedUploadError> {
-    run_completed_publication_with_retries(db, upload_id, request, Vec::new(), None, limits).await
+    run_completed_publication_with_retries(db, upload_target, request, Vec::new(), None, limits)
+        .await
 }
 
 pub async fn publish_standard_completed_upload(
     db: &DatabaseConnection,
-    upload_id: &str,
+    upload_target: &MultipartUploadTargetIdentity,
     request: PublicationRequest,
     guard: StandardMutationGuard,
     limits: &ProviderLimitMap,
 ) -> Result<PublicationResult, CommitCompletedUploadError> {
-    run_completed_publication_with_retries(db, upload_id, request, Vec::new(), Some(guard), limits)
-        .await
+    run_completed_publication_with_retries(
+        db,
+        upload_target,
+        request,
+        Vec::new(),
+        Some(guard),
+        limits,
+    )
+    .await
 }
 
 pub async fn publish_zip(
@@ -309,13 +320,13 @@ pub async fn publish_import_zip(
 
 pub async fn publish_completed_zip(
     db: &DatabaseConnection,
-    upload_id: &str,
+    upload_target: &MultipartUploadTargetIdentity,
     request: ZipPublicationRequest,
     limits: &ProviderLimitMap,
 ) -> Result<PublicationResult, CommitCompletedUploadError> {
     run_completed_publication_with_retries(
         db,
-        upload_id,
+        upload_target,
         request.archive,
         request.entries,
         None,
@@ -326,14 +337,14 @@ pub async fn publish_completed_zip(
 
 pub async fn publish_standard_completed_zip(
     db: &DatabaseConnection,
-    upload_id: &str,
+    upload_target: &MultipartUploadTargetIdentity,
     request: ZipPublicationRequest,
     guard: StandardMutationGuard,
     limits: &ProviderLimitMap,
 ) -> Result<PublicationResult, CommitCompletedUploadError> {
     run_completed_publication_with_retries(
         db,
-        upload_id,
+        upload_target,
         request.archive,
         request.entries,
         Some(guard),
@@ -649,7 +660,7 @@ async fn run_publication_with_retries(
     db: &DatabaseConnection,
     request: PublicationRequest,
     entries: Vec<PublicationObject>,
-    upload_id: Option<String>,
+    upload_target: Option<MultipartUploadTargetIdentity>,
     standard_guard: Option<StandardMutationGuard>,
     import_guard: Option<ImportPublicationGuard>,
     result_rows: Vec<import_job_result::ActiveModel>,
@@ -661,7 +672,7 @@ async fn run_publication_with_retries(
             db,
             request.clone(),
             entries.clone(),
-            upload_id.clone(),
+            upload_target.clone(),
             standard_guard.clone(),
             import_guard.clone(),
             result_rows.clone(),
@@ -684,7 +695,7 @@ async fn run_publication_with_retries(
 
 async fn run_completed_publication_with_retries(
     db: &DatabaseConnection,
-    upload_id: &str,
+    upload_target: &MultipartUploadTargetIdentity,
     request: PublicationRequest,
     entries: Vec<PublicationObject>,
     standard_guard: Option<StandardMutationGuard>,
@@ -696,7 +707,7 @@ async fn run_completed_publication_with_retries(
             db,
             request.clone(),
             entries.clone(),
-            Some(upload_id.to_owned()),
+            Some(upload_target.clone()),
             standard_guard.clone(),
             None,
             Vec::new(),
@@ -732,7 +743,7 @@ async fn publication_attempt(
     db: &DatabaseConnection,
     request: PublicationRequest,
     entries: Vec<PublicationObject>,
-    upload_id: Option<String>,
+    upload_target: Option<MultipartUploadTargetIdentity>,
     standard_guard: Option<StandardMutationGuard>,
     import_guard: Option<ImportPublicationGuard>,
     result_rows: Vec<import_job_result::ActiveModel>,
@@ -745,7 +756,7 @@ async fn publication_attempt(
                 txn,
                 request,
                 entries,
-                upload_id.as_deref(),
+                upload_target.as_ref(),
                 standard_guard.as_ref(),
                 import_guard.as_ref(),
                 result_rows,
@@ -782,7 +793,7 @@ async fn publish_in_transaction<C: ConnectionTrait>(
     db: &C,
     request: PublicationRequest,
     entries: Vec<PublicationObject>,
-    upload_id: Option<&str>,
+    upload_target: Option<&MultipartUploadTargetIdentity>,
     standard_guard: Option<&StandardMutationGuard>,
     import_guard: Option<&ImportPublicationGuard>,
     mut result_rows: Vec<import_job_result::ActiveModel>,
@@ -808,6 +819,12 @@ async fn publish_in_transaction<C: ConnectionTrait>(
             "publication cannot have both standard and import guards".to_owned(),
         ));
     }
+    if let Some(upload_target) = upload_target
+        && (upload_target.bucket != request.object.bucket
+            || upload_target.key != request.object.key)
+    {
+        return Err(AppError::NoSuchUpload(upload_target.upload_id.clone()));
+    }
     if let Some(guard) = standard_guard {
         lock_bucket_for_ownership(db, &request.object.bucket).await?;
         let entry_keys = entries
@@ -826,6 +843,8 @@ async fn publish_in_transaction<C: ConnectionTrait>(
         lock_bucket_for_ownership(db, &request.object.bucket).await?;
         let publication_targets = publication_locations(&request.object, &entries);
         verify_publication_guard(db, guard, &request.object.bucket, &publication_targets).await?;
+    } else if upload_target.is_some() {
+        lock_bucket_for_ownership(db, &request.object.bucket).await?;
     } else {
         acquire_sqlite_publication_write_intent(db, &request.object.bucket).await?;
     }
@@ -860,14 +879,19 @@ async fn publish_in_transaction<C: ConnectionTrait>(
 
     create_publication_leases(db, &request, &entries, limits, publication_time).await?;
 
-    if let Some(upload_id) = upload_id {
-        crate::store::multipart::delete_matching_upload_in_transaction(
+    if let Some(upload_target) = upload_target {
+        match crate::store::multipart::abort_exact_incomplete_upload_in_transaction(
             db,
-            upload_id,
-            &request.object.bucket,
-            &request.object.key,
+            upload_target,
         )
-        .await?;
+        .await?
+        {
+            AbortExactIncompleteUploadResult::Applied => {}
+            AbortExactIncompleteUploadResult::AlreadySatisfied
+            | AbortExactIncompleteUploadResult::Stale => {
+                return Err(AppError::NoSuchUpload(upload_target.upload_id.clone()));
+            }
+        }
     }
     if let Some(guard) = standard_guard {
         complete_standard_mutation_in_transaction(db, guard, publication_time).await?;

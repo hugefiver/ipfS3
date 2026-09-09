@@ -2018,7 +2018,13 @@ foreach ($fragment in @(
     'Supported actions are current-version `Expiration` by date or days, `NoncurrentVersionExpiration` for content and delete markers, and `ExpiredObjectDeleteMarker`.',
     'Eligibility uses database UTC and UTC-midnight semantics.',
     'Lifecycle deletion retains Kubo pins and never calls `pin/rm`.',
-    '`Transition`, `NoncurrentVersionTransition`, and `AbortIncompleteMultipartUpload` are not supported; a configuration containing any unsupported action is rejected as a whole.'
+    '`AbortIncompleteMultipartUpload` is supported with all-objects or prefix selectors.',
+    '`DaysAfterInitiation=N` becomes due at the next UTC midnight after N full days',
+    'an explicit abort of an absent upload still returns `NoSuchUpload`',
+    'a lifecycle action observing the same absence succeeds idempotently.',
+    'Abort response headers (`x-amz-abort-date`, `x-amz-abort-rule-id`) and',
+    '`ListMultipartUploads` are not implemented.',
+    '`Transition` and `NoncurrentVersionTransition` remain unsupported'
 )) {
     Assert-Contains $ReadmeContractSource $fragment "README lifecycle expiration contract is missing: $fragment"
 }

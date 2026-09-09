@@ -282,7 +282,7 @@ $protectedHashes = [ordered]@{
     "src/kubo/cat.rs" = "e970271249f4e10efb61f0720a11ee0cbca18b1aad7d5a0f2629bb432c0c90bf"
     "src/state.rs" = "bfbe43c3d9acb9a0b4b3cb901e6cd6c0af8c7e4c728d3149f19c0bb77f938541"
     "src/s3/ops/object.rs" = "75527b16a8507e933138a8b8d7de8bcda22619d154c7271cfa72af1604b05055"
-    "src/s3/ops/multipart.rs" = "58e3ade2fb3273641a1879b60f86b888adc8d339375e5da61798959229d11b44"
+    "src/s3/ops/multipart.rs" = "457c0070828c135857436b0ce042ddd6002948ecb1c9a61bc3388f5612c5f302"
 }
 
 foreach ($entry in $protectedHashes.GetEnumerator()) {

@@ -252,12 +252,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bucket_cors_migration_is_eleventh_last_and_preserves_pre_cors_bucket() {
+    async fn bucket_cors_migration_remains_eleventh_before_lifecycle_abort_and_preserves_pre_cors_bucket()
+     {
         let migrations = crate::store::migrator::Migrator::migrations();
-        assert_eq!(migrations.len(), 11);
+        assert_eq!(migrations.len(), 12);
+        assert_eq!(migrations[10].name(), "m20260831_000001_bucket_cors");
         assert_eq!(
-            migrations.last().unwrap().name(),
-            "m20260831_000001_bucket_cors"
+            migrations[11].name(),
+            "m20260901_000001_lifecycle_abort_multipart"
         );
 
         let db = first_ten_migrations_db().await;

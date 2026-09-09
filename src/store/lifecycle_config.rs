@@ -1,7 +1,7 @@
 use chrono::Duration;
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set, TransactionError, TransactionTrait,
+    ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, DatabaseTransaction,
+    EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionError, TransactionTrait,
     sea_query::{Condition, Expr, LockBehavior, LockType, OnConflict},
 };
 
@@ -126,6 +126,21 @@ pub async fn finish_scan_page(
     next_cursor: Option<&LifecycleScanCursor>,
     cycle_complete: bool,
 ) -> AppResult<bool> {
+    let txn = db.begin().await?;
+    let completed =
+        finish_scan_page_in_transaction(&txn, claim, next_cursor, cycle_complete).await?;
+    txn.commit().await?;
+    Ok(completed)
+}
+
+/// Completes a page in its caller's transaction. The caller must roll back page inserts when
+/// this returns `false`; only an exact, active lease may publish the page and its cursor.
+pub(crate) async fn finish_scan_page_in_transaction(
+    txn: &DatabaseTransaction,
+    claim: &ClaimedLifecycleScan,
+    next_cursor: Option<&LifecycleScanCursor>,
+    cycle_complete: bool,
+) -> AppResult<bool> {
     let bucket = claim.bucket.clone();
     let revision = claim.config_revision;
     let lease_epoch = claim.lease_epoch;
@@ -141,34 +156,37 @@ pub async fn finish_scan_page(
             .transpose()?
     };
 
-    db.transaction(move |txn| {
-        Box::pin(async move {
-            let now = database_now(txn).await?;
-            let updated = bucket_lifecycle_config::Entity::update_many()
-                .col_expr(
-                    bucket_lifecycle_config::Column::ScanCursor,
-                    Expr::value(stored_cursor),
-                )
-                .col_expr(
-                    bucket_lifecycle_config::Column::LastScannedAt,
-                    Expr::value(Some(now)),
-                )
-                .col_expr(
-                    bucket_lifecycle_config::Column::ScanLeaseUntil,
-                    Expr::value(Option::<chrono::DateTime<chrono::Utc>>::None),
-                )
-                .filter(bucket_lifecycle_config::Column::Bucket.eq(bucket))
-                .filter(bucket_lifecycle_config::Column::Revision.eq(revision))
-                .filter(bucket_lifecycle_config::Column::ScanLeaseEpoch.eq(lease_epoch))
-                .filter(bucket_lifecycle_config::Column::CanonicalJson.is_not_null())
-                .filter(bucket_lifecycle_config::Column::ScanLeaseUntil.gt(now))
-                .exec(txn)
-                .await?;
-            Ok(updated.rows_affected == 1)
-        })
-    })
-    .await
-    .map_err(normalize_transaction_error)
+    let now = database_now(txn).await?;
+    let lease_is_active = match txn.get_database_backend() {
+        DatabaseBackend::Postgres => "\"scan_lease_until\" > clock_timestamp()",
+        DatabaseBackend::Sqlite => "julianday(\"scan_lease_until\") > julianday('now')",
+        DatabaseBackend::MySql => {
+            return Err(AppError::Internal(
+                "lifecycle requires SQLite or PostgreSQL".to_owned(),
+            ));
+        }
+    };
+    let updated = bucket_lifecycle_config::Entity::update_many()
+        .col_expr(
+            bucket_lifecycle_config::Column::ScanCursor,
+            Expr::value(stored_cursor),
+        )
+        .col_expr(
+            bucket_lifecycle_config::Column::LastScannedAt,
+            Expr::value(Some(now)),
+        )
+        .col_expr(
+            bucket_lifecycle_config::Column::ScanLeaseUntil,
+            Expr::value(Option::<chrono::DateTime<chrono::Utc>>::None),
+        )
+        .filter(bucket_lifecycle_config::Column::Bucket.eq(bucket))
+        .filter(bucket_lifecycle_config::Column::Revision.eq(revision))
+        .filter(bucket_lifecycle_config::Column::ScanLeaseEpoch.eq(lease_epoch))
+        .filter(bucket_lifecycle_config::Column::CanonicalJson.is_not_null())
+        .filter(Expr::cust(lease_is_active))
+        .exec(txn)
+        .await?;
+    Ok(updated.rows_affected == 1)
 }
 
 async fn claim_next_scan_in_transaction<C: ConnectionTrait>(
@@ -758,8 +776,10 @@ mod tests {
             source: LifecycleScanSource::Current,
             bucket: "bucket".to_owned(),
             key: "key".to_owned(),
-            sequence: 1,
-            version_row_id: "version-row".to_owned(),
+            sequence: Some(1),
+            version_row_id: Some("version-row".to_owned()),
+            multipart_created_at: None,
+            multipart_upload_id: None,
         };
         assert!(
             !finish_scan_page(&db, &first, Some(&cursor), false)

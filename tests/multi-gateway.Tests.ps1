@@ -11,6 +11,7 @@ $StorePath = Join-Path $RepoRoot "src/store/mod.rs"
 $StatePath = Join-Path $RepoRoot "src/state.rs"
 $MainPath = Join-Path $RepoRoot "src/main.rs"
 $RustLivePath = Join-Path $RepoRoot "tests/multi_gateway.rs"
+$SigV4Path = Join-Path $RepoRoot "tests/support/sigv4.rs"
 $WorkerPath = Join-Path $RepoRoot "src/lifecycle/worker.rs"
 $PostgresLifecyclePath = Join-Path $RepoRoot "tests/postgres_lifecycle.rs"
 $WorkflowPath = Join-Path $RepoRoot ".github/workflows/release-validation.yml"
@@ -539,19 +540,24 @@ Assert-True ($logLine[0].Trim() -ceq "log_format gateway '`$request_method `$uri
 Assert-NotMatches $logLine[0] '(?i)authorization|request_body|http_' "Nginx access log must not contain headers or body variables"
 
 $RustLive = Read-NormalizedText $RustLivePath
+# NO KEY UPDATE permits FK KEY SHARE during action insert but blocks production FOR UPDATE.
+Assert-Contains $RustLive '"SELECT name FROM buckets WHERE name = $1 FOR NO KEY UPDATE"' "MPU race requires the owned FK-compatible bucket row lock before aging"
 foreach ($testName in @(
     "multi_gateway_cross_replica_contract",
     "load_balancer_surviving_replica_crud"
 )) {
     Assert-True (([regex]::Matches($RustLive, "(?m)^async fn $testName\(\) \{")).Count -eq 1) "Expected one live test named $testName"
 }
-foreach ($environmentName in @(
-    "IPFS_S3_MULTI_GATEWAY_A_ENDPOINT",
-    "IPFS_S3_MULTI_GATEWAY_B_ENDPOINT",
-    "IPFS_S3_MULTI_GATEWAY_LOAD_BALANCER_ENDPOINT",
-    "IPFS_S3_MULTI_GATEWAY_KUBO_URL"
+foreach ($environmentContract in @(
+    @{ Name = "IPFS_S3_MULTI_GATEWAY_A_ENDPOINT"; Count = 2 },
+    @{ Name = "IPFS_S3_MULTI_GATEWAY_B_ENDPOINT"; Count = 2 },
+    @{ Name = "IPFS_S3_MULTI_GATEWAY_LOAD_BALANCER_ENDPOINT"; Count = 2 },
+    @{ Name = "IPFS_S3_MULTI_GATEWAY_KUBO_URL"; Count = 1 },
+    @{ Name = "IPFS_S3_MULTI_GATEWAY_DATABASE_URL"; Count = 4 }
 )) {
-    Assert-True (([regex]::Matches($RustLive, [regex]::Escape($environmentName))).Count -eq 1) "Live target environment contract changed: $environmentName"
+    $environmentName = $environmentContract.Name
+    $expectedCount = $environmentContract.Count
+    Assert-True (([regex]::Matches($RustLive, [regex]::Escape($environmentName))).Count -eq $expectedCount) "Live target environment contract changed: $environmentName"
 }
 foreach ($requiredLiveFragment in @(
     "mod support;",
@@ -597,6 +603,10 @@ Assert-NotContains $Main "start_worker_for_test" "Production startup must not ca
 
 foreach ($testName in @(
     "postgres_lifecycle_migration_and_database_clock_are_engine_owned",
+    "postgres_lifecycle_abort_migration_preserves_version_identity_and_checks_shapes",
+    "postgres_lifecycle_abort_down_refuses_abort_state_and_restores_phase_a",
+    "postgres_lifecycle_abort_multiworker_claim_crash_retry_is_fenced",
+    "postgres_lifecycle_abort_configuration_and_bucket_lock_races_are_atomic",
     "postgres_lifecycle_down_refuses_durable_configuration",
     "postgres_lifecycle_claim_uses_database_clock_locks_and_epoch_fences",
     "postgres_lifecycle_worker_abort_reclaims_and_fences_stale_epoch"
@@ -630,11 +640,12 @@ foreach ($testName in @(
     "multi_gateway_cross_replica_contract",
     "load_balancer_surviving_replica_crud",
     "multi_gateway_lifecycle_configuration_visible_across_replicas",
-    "multi_gateway_lifecycle_publication_action_race_has_one_terminal_outcome"
+    "multi_gateway_lifecycle_publication_action_race_has_one_terminal_outcome",
+    "multi_gateway_lifecycle_abort_multipart_race_has_one_terminal_outcome"
 )) {
     Assert-True (([regex]::Matches($RustLive, "(?m)^async fn $testName\(\) \{")).Count -eq 1) "Expected one endpoint-only lifecycle test named $testName"
 }
-Assert-True (([regex]::Matches($RustLive, '(?m)^#\[tokio::test\]\s*$')).Count -eq 4) "Multi-gateway target must retain its two existing tests and add exactly two endpoint-only lifecycle tests"
+Assert-True (([regex]::Matches($RustLive, '(?m)^#\[tokio::test\]\s*$')).Count -eq 5) "Multi-gateway target must retain its existing tests and add exactly one lifecycle abort multipart race test"
 foreach ($fragment in @(
     "lifecycle_configuration_xml",
     "signed_put_lifecycle_configuration",
@@ -658,7 +669,226 @@ foreach ($fragment in @(
 )) {
     Assert-Contains $RustLive $fragment "Lifecycle publication race must tag only the predecessor: $fragment"
 }
-Assert-NotMatches $RustLive '(?i)DatabaseConnection|\b(?:SELECT|INSERT|UPDATE|CREATE|DROP)\s+(?:FROM|INTO|TABLE|SCHEMA)|\bdocker\b|(?:Command::new|process::(?:kill|abort)|abort_for_test|start_worker_for_test|LifecycleWorkerTestControl|LifecycleAfterClaimGate|LifecycleWorkerHandle)' "Endpoint-only lifecycle tests must not use database, Docker, process-stop, or worker controls"
+$ageUploadHelper = Get-BracedBlock $RustLive '(?m)^async fn age_exact_multipart_upload_for_lifecycle\(upload_id: &str\) -> u64 \{' 'multipart lifecycle age helper'
+$actionRowsHelper = Get-BracedBlock $RustLive '(?m)^async fn lifecycle_action_rows_for_bucket\(bucket: &str\) -> Vec<LifecycleMultipartActionRow> \{' 'multipart lifecycle action rows helper'
+$bucketLockHelper = Get-BracedBlock $RustLive '(?m)^async fn lock_lifecycle_bucket\(\s*bucket: &str,\s*\) -> \(sea_orm::DatabaseConnection, sea_orm::DatabaseTransaction\) \{' 'owned bucket row lock helper'
+$RustWithoutLifecycleDatabaseHelpers = $RustLive.Replace($ageUploadHelper.Text, "").Replace($actionRowsHelper.Text, "").Replace($bucketLockHelper.Text, "")
+
+Assert-Contains $bucketLockHelper.Body 'std::env::var("IPFS_S3_MULTI_GATEWAY_DATABASE_URL")' "Bucket lock helper must own its connection"
+Assert-InOrder $bucketLockHelper.Body @(
+    'Database::connect(',
+    'database.begin().await?',
+    'let rows = transaction',
+    '.query_all(Statement::from_sql_and_values(',
+    '"SELECT name FROM buckets WHERE name = $1 FOR NO KEY UPDATE"',
+    '[bucket.into()]',
+    'Ok(transaction)',
+    'Ok(Ok(transaction)) => (database, transaction)'
+) "Bucket lock must return the owned transaction only after locking the exact bucket"
+Assert-Contains $bucketLockHelper.Body 'rows.len() != 1' "Lock helper must require exactly one bucket"
+Assert-Matches $bucketLockHelper.Body 'database\s*\.close\(\)\s*\.await' "Acquisition failure must close the owned connection"
+Assert-True (([regex]::Matches($bucketLockHelper.Body, [regex]::Escape('Database::connect('))).Count -eq 1) "Lock helper must open one connection"
+Assert-True (([regex]::Matches($bucketLockHelper.Body, [regex]::Escape('Statement::from_sql_and_values('))).Count -eq 1) "Lock helper must issue one parameterized statement"
+Assert-True (([regex]::Matches($bucketLockHelper.Body, '\$1')).Count -eq 1) "Lock helper must bind one PostgreSQL parameter"
+Assert-True (([regex]::Matches($bucketLockHelper.Body, '\.query_all\(')).Count -eq 1) "Lock helper must perform one SELECT"
+Assert-NotMatches $bucketLockHelper.Body '(?i)execute_unprepared|Statement::from_string|connect_database|\.execute\(|\.query_one\(|\.query_all_raw\(|\.execute_raw\(|format!\s*\(|push_str|\b(?:CREATE|ALTER|DROP|TRUNCATE|INSERT|DELETE)\b' "Lock helper must not add unreviewed SQL"
+$lockSql = [regex]::Matches($bucketLockHelper.Body, '"((?:UPDATE|SELECT) [^"\r\n]*)"')
+Assert-True ($lockSql.Count -eq 1 -and $lockSql[0].Groups[1].Value -ceq 'SELECT name FROM buckets WHERE name = $1 FOR NO KEY UPDATE') "Bucket lock SQL must be exactly the single reviewed FK-compatible parameterized statement"
+
+Assert-Contains $ageUploadHelper.Body 'std::env::var("IPFS_S3_MULTI_GATEWAY_DATABASE_URL")' "Multipart age helper must own its configured database connection"
+Assert-Contains $actionRowsHelper.Body 'std::env::var("IPFS_S3_MULTI_GATEWAY_DATABASE_URL")' "Lifecycle action rows helper must own its configured database connection"
+foreach ($helperContract in @(
+    @{ Block = $ageUploadHelper; Label = "multipart age helper" },
+    @{ Block = $actionRowsHelper; Label = "lifecycle action rows helper" }
+)) {
+    $helper = $helperContract.Block
+    $label = $helperContract.Label
+    Assert-True (([regex]::Matches($helper.Body, [regex]::Escape('Database::connect('))).Count -eq 1) "$label must open exactly one database connection"
+    Assert-True (([regex]::Matches($helper.Body, [regex]::Escape('Statement::from_sql_and_values('))).Count -eq 1) "$label must issue exactly one parameterized statement"
+    Assert-True (([regex]::Matches($helper.Body, '(?s)\.close\(\)\s*\.await')).Count -eq 1) "$label must close its owned database connection exactly once"
+    Assert-NotMatches $helper.Body '(?i)execute_unprepared|Statement::from_string|connect_database|\b(?:CREATE|ALTER|DROP|TRUNCATE|INSERT|DELETE)\b' "$label may use only its reviewed parameterized statement"
+}
+Assert-Contains $ageUploadHelper.Body 'UPDATE multipart_uploads SET created_at = clock_timestamp() - INTERVAL ''3 days'' WHERE upload_id = $1' "Multipart age helper SQL changed"
+Assert-Contains $actionRowsHelper.Body 'SELECT action_kind, target_type, target_upload_id, state, failure_class FROM lifecycle_actions WHERE bucket = $1' "Lifecycle action rows helper SQL changed"
+Assert-Contains $ageUploadHelper.Body '[upload_id.into()]' "Multipart age helper must bind the upload ID"
+Assert-Contains $actionRowsHelper.Body '[bucket.into()]' "Lifecycle action rows helper must bind the bucket"
+Assert-True (([regex]::Matches($ageUploadHelper.Body, '\$1')).Count -eq 1) "Multipart age helper must bind exactly one PostgreSQL parameter"
+Assert-True (([regex]::Matches($actionRowsHelper.Body, '\$1')).Count -eq 1) "Lifecycle action rows helper must bind exactly one PostgreSQL parameter"
+Assert-True (([regex]::Matches($ageUploadHelper.Body, [regex]::Escape('.execute('))).Count -eq 1) "Multipart age helper must execute exactly one UPDATE"
+Assert-NotContains $ageUploadHelper.Body '.query_all(' "Multipart age helper must not issue a read query"
+Assert-True (([regex]::Matches($actionRowsHelper.Body, [regex]::Escape('.query_all('))).Count -eq 1) "Lifecycle action rows helper must execute exactly one SELECT"
+Assert-NotContains $actionRowsHelper.Body '.execute(' "Lifecycle action rows helper must not issue a write statement"
+foreach ($sqlContract in @(
+    @{ Block = $ageUploadHelper; Sql = "UPDATE multipart_uploads SET created_at = clock_timestamp() - INTERVAL '3 days' WHERE upload_id = `$1" },
+    @{ Block = $actionRowsHelper; Sql = 'SELECT action_kind, target_type, target_upload_id, state, failure_class FROM lifecycle_actions WHERE bucket = $1' }
+)) {
+    $sqlLiterals = [regex]::Matches($sqlContract.Block.Body, '"((?:UPDATE|SELECT) [^"\r\n]*)"')
+    Assert-True ($sqlLiterals.Count -eq 1 -and $sqlLiterals[0].Groups[1].Value -ceq $sqlContract.Sql) "Helper SQL must be exactly the reviewed single statement, without suffixes or additional statements"
+    Assert-NotMatches $sqlContract.Block.Body '\.query_one\(|\.query_all_raw\(|\.execute_raw\(' "Reviewed helper must not add another database operation"
+}
+Assert-NotMatches $ageUploadHelper.Body '(?i)format!\s*\(|push_str|\+\s*&?upload_id' "Multipart age helper SQL must not interpolate the upload ID"
+Assert-NotMatches $actionRowsHelper.Body '(?i)format!\s*\(|push_str|\+\s*&?bucket' "Lifecycle action rows helper SQL must not interpolate the bucket"
+Assert-True (([regex]::Matches($RustLive, [regex]::Escape('Statement::from_sql_and_values('))).Count -eq 3) "Multi-gateway target must contain exactly the three reviewed SQL statements"
+Assert-True (([regex]::Matches($RustLive, '(?i)\bUPDATE\s+multipart_uploads\b')).Count -eq 1) "Multi-gateway target must contain only the reviewed multipart UPDATE"
+Assert-True (([regex]::Matches($RustLive, '(?i)\bSELECT\s+action_kind\b')).Count -eq 1) "Multi-gateway target must contain only the reviewed lifecycle action SELECT"
+Assert-NotMatches $RustWithoutLifecycleDatabaseHelpers '(?i)Database::connect|DatabaseConnection|Statement::|\.query_(?:all|one)(?:_raw)?\(|\.execute(?:_raw)?\(|execute_unprepared|connect_database|\b(?:SELECT|INSERT|UPDATE|CREATE|ALTER|DROP|TRUNCATE)\s+(?:FROM|INTO|TABLE|SCHEMA|multipart_uploads|lifecycle_actions|buckets)' "Database access is forbidden outside the three reviewed lifecycle helpers"
+Assert-NotMatches $RustWithoutLifecycleDatabaseHelpers '\.begin\(|\.transaction\(|\.commit\(|get_postgres_connection_pool|sea_orm::(?:Entity|ActiveModel)|ipfs_s3_gateway::store' "Only the reviewed helper may acquire a database transaction"
+Assert-True (([regex]::Matches($bucketLockHelper.Body, '\.begin\(')).Count -eq 1) "Bucket lock helper must begin exactly one owned transaction"
+Assert-NotMatches $bucketLockHelper.Body '\.commit\(|\.rollback\(|\.clone\(|sleep' "Acquisition helper must retain the lock and transfer sole ownership without a timing gate"
+Assert-True (([regex]::Matches($RustLive, '\.rollback\(')).Count -eq 2) "Only the normal unlock and failure cleanup may roll back the owned transaction"
+Assert-NotMatches $RustLive '(?i)pin/rm|pin_rm\(' "Multi-gateway target must never invoke pin/rm"
+Assert-NotMatches $RustLive '(?i)\bdocker\b|(?:Command::new|process::(?:kill|abort)|abort_for_test|start_worker_for_test|LifecycleWorkerTestControl|LifecycleAfterClaimGate|LifecycleWorkerHandle)' "Endpoint-only lifecycle tests must not use Docker, process-stop, or worker controls"
+
+foreach ($fragment in @(
+    'struct LifecycleMultipartActionRow',
+    '"abort_incomplete_multipart_upload"',
+    '"multipart_upload"',
+    '"pending"',
+    '"succeeded"',
+    '"cancelled"',
+    '"failed_safe"',
+    'skipping multi-gateway lifecycle abort multipart race: required environment variable {missing} is unset',
+    'const LIFECYCLE_ABORT_MULTIPART_CLAIMED_TIMEOUT: Duration = Duration::from_secs(30);',
+    'tokio::time::timeout(LIFECYCLE_ABORT_MULTIPART_CLAIMED_TIMEOUT, async {',
+    'tokio::time::timeout(LIFECYCLE_ABORT_MULTIPART_TERMINAL_TIMEOUT, async {',
+    'backoff.saturating_mul(2).min(Duration::from_millis(400))',
+    'last observed safe row states',
+    'NoSuchUpload'
+)) {
+    Assert-Contains $RustLive $fragment "Lifecycle abort multipart race contract is incomplete: $fragment"
+}
+
+foreach ($fragment in @(
+    'const LIFECYCLE_ABORT_MULTIPART_RACE_TEST_NAME: &str =',
+    '"multi_gateway_lifecycle_abort_multipart_race_has_one_terminal_outcome";',
+    'enum LifecycleAbortMultipartRaceStage',
+    'BucketCreated',
+    'MultipartUploadCreated',
+    'PartUploaded',
+    'UploadAged',
+    'LifecycleConfigured',
+    'BucketLockAcquired',
+    'ClaimedActionObserved',
+    'RaceStarted',
+    'CompleteRequestDispatched',
+    'ClaimedActionRechecked',
+    'BucketLockReleased',
+    'CompleteResponse',
+    'TerminalWaitEntered',
+    'TerminalStateEvaluation',
+    'LifecycleConfigDeleted',
+    'ObjectCleanup',
+    'BucketDelete',
+    'fn record_lifecycle_abort_multipart_race_stage(stage: LifecycleAbortMultipartRaceStage)',
+    '[LIFECYCLE-ABORT-MULTIPART-RACE-STAGE] test={LIFECYCLE_ABORT_MULTIPART_RACE_TEST_NAME} stage={}'
+)) {
+    Assert-Contains $RustLive $fragment "Lifecycle abort multipart race safe stage source is incomplete: $fragment"
+}
+$abortRaceTestStart = $RustLive.IndexOf('async fn multi_gateway_lifecycle_abort_multipart_race_has_one_terminal_outcome()', [StringComparison]::Ordinal)
+$abortRaceTest = Get-BracedBlock $RustLive '(?m)^async fn multi_gateway_lifecycle_abort_multipart_race_has_one_terminal_outcome\(\) \{' 'signed multipart abort race'
+Assert-InOrder $abortRaceTest.Body @(
+    'create_bucket_at(&endpoint_a',
+    'signed_create_multipart_upload(&endpoint_a',
+    'signed_upload_multipart_part(',
+    'signed_put_lifecycle_configuration(',
+    'lock_lifecycle_bucket(&bucket_name)',
+    'age_exact_multipart_upload_for_lifecycle(&upload_id)',
+    'wait_for_claimed_lifecycle_multipart_action(',
+    'assert_eq!(claimed.state, "claimed")',
+    'tokio::sync::oneshot::channel()',
+    'tokio::join!(',
+    'signed_complete_multipart_upload(',
+    'dispatched_rx',
+    'lifecycle_action_rows_for_bucket(&bucket_name)',
+    'matching[0].state, "claimed"',
+    'bucket_lock.take()',
+    '.rollback()',
+    'LifecycleAbortMultipartRaceStage::BucketLockReleased',
+    '.catch_unwind()',
+    'if let Some(transaction) = bucket_lock.take()',
+    'database.close()',
+    'std::panic::resume_unwind',
+    'let complete_status = complete.status()',
+    'wait_for_terminal_lifecycle_multipart_action(',
+    'assert_eq!(terminal.state, "succeeded")',
+    'signed_abort_multipart_upload(&endpoint_b',
+    'signed_delete_lifecycle_configuration(&endpoint_b',
+    'signed_delete_object(&endpoint_a',
+    'signed_delete_bucket(&endpoint_a'
+) "Signed MPU race must gate durable work before Complete and inspect the outcome before cleanup"
+Assert-NotMatches $abortRaceTest.Body '\bsleep(?:_until)?\s*\(' "The signed MPU race must not decide its winner by sleeping"
+$claimedHelper = Get-BracedBlock $RustLive '(?m)^async fn wait_for_claimed_lifecycle_multipart_action\(\s*bucket: &str,\s*upload_id: &str,\s*\) -> LifecycleMultipartActionRow \{' 'pre-race claimed waiter'
+Assert-NotContains $claimedHelper.Body '"succeeded"' "Succeeded must never be a race precondition"
+Assert-NotContains $RustLive 'wait_for_pending_lifecycle_multipart_action' "Remove the old pending-or-terminal race precondition"
+Assert-Contains $claimedHelper.Body 'rows.len() == matching.len() && matching.len() <= 1' "Pre-race observation must reject unrelated or duplicate actions"
+Assert-Contains $claimedHelper.Body '"pending" => {}' "Pre-race waiter must allow pending to advance"
+Assert-Contains $claimedHelper.Body '"claimed" => return (*row).clone()' "Pre-race waiter may return only claimed"
+Assert-Contains $claimedHelper.Body 'state => panic!' "Terminal or unknown states while locked must fail"
+$completeHelper = Get-BracedBlock $RustLive '(?m)^async fn signed_complete_multipart_upload\([\s\S]*?\) -> reqwest::Response \{' 'dispatch-signalled Complete helper'
+Assert-InOrder $completeHelper.Body @(
+    'let request = send_sigv4(',
+    'tokio::pin!(request)',
+    'std::future::poll_fn(|cx|',
+    'let poll = request.as_mut().poll(cx)',
+    'if let Some(dispatched) = dispatched.take()',
+    'assert!(poll.is_pending()',
+    '.send(())',
+    'poll'
+) "Complete must actually poll its network request before signalling dispatch, never just construct a future"
+Assert-NotMatches $completeHelper.Body '(?i)sleep|spawn|Barrier|Notify' "Complete dispatch must not depend on timing or detached tasks"
+# The dispatch wrapper polls this helper, so its first suspension must be the
+# actual network send, not a newly introduced yield or preparation await.
+$SigV4 = Read-NormalizedText $SigV4Path
+$sigv4Send = Get-BracedBlock $SigV4 '(?m)^pub async fn send_sigv4\([\s\S]*?\) -> reqwest::Response \{' 'SigV4 network send helper'
+Assert-True (([regex]::Matches($sigv4Send.Body, '\.await\b')).Count -eq 1) "Dispatch proof requires SigV4's sole await to be the network operation"
+Assert-Matches $sigv4Send.Body 'reqwest::Client::new\(\)\s*\.request\(method, url\)\s*\.headers\(headers\)\s*\.body\(body\)\s*\.send\(\)\s*\.await' "First poll of send_sigv4 must reach reqwest send"
+Assert-NotContains $abortRaceTest.Body 'tokio::spawn' "Race cleanup must not leave detached tasks"
+Assert-InOrder $abortRaceTest.Body @(
+    'let mut bucket_lock = Some(transaction)',
+    'let race_result = AssertUnwindSafe(async {',
+    '.catch_unwind()',
+    'if let Some(transaction) = bucket_lock.take()',
+    'transaction.rollback().await',
+    'let closed = database.close().await',
+    'rollback.is_ok()',
+    'closed.is_ok()',
+    'std::panic::resume_unwind'
+) "A failed race must release the owned transaction and close its connection before propagating panic"
+$preRace = $abortRaceTest.Body.Substring(0, $abortRaceTest.Body.IndexOf('LifecycleAbortMultipartRaceStage::BucketLockReleased', [StringComparison]::Ordinal))
+Assert-NotContains $preRace '"succeeded"' "No terminal success is allowed before unlock"
+Assert-InOrder $preRace @(
+    'dispatched_rx',
+    'LifecycleAbortMultipartRaceStage::CompleteRequestDispatched',
+    'assert_eq!(rows.len(), 1',
+    'matching.len(),',
+    'matching[0].state, "claimed"',
+    'LifecycleAbortMultipartRaceStage::ClaimedActionRechecked',
+    'bucket_lock.take()',
+    '.rollback()'
+) "Dispatch and a second unique claimed observation must precede unlock"
+Assert-Matches $preRace 'assert_eq!\(\s*matching\.len\(\),\s*1,' "Recheck must assert exactly one matching action"
+Assert-Matches $preRace 'assert_eq!\(\s*matching\[0\]\.state,\s*"claimed",' "Recheck must assert claimed, not merely mention it"
+$abortRacePendingStage = $RustLive.IndexOf('LifecycleAbortMultipartRaceStage::ClaimedActionObserved', $abortRaceTestStart, [StringComparison]::Ordinal)
+$abortRaceStartedStage = $RustLive.IndexOf('record_lifecycle_abort_multipart_race_stage(LifecycleAbortMultipartRaceStage::RaceStarted);', $abortRaceTestStart, [StringComparison]::Ordinal)
+$abortRaceCompleteStage = $RustLive.IndexOf('LifecycleAbortMultipartRaceStage::CompleteResponse', $abortRaceTestStart, [StringComparison]::Ordinal)
+$abortRaceTerminalStage = $RustLive.IndexOf('LifecycleAbortMultipartRaceStage::TerminalStateEvaluation', $abortRaceTestStart, [StringComparison]::Ordinal)
+$abortRaceLifecycleCleanupStage = $RustLive.IndexOf('LifecycleAbortMultipartRaceStage::LifecycleConfigDeleted', $abortRaceTestStart, [StringComparison]::Ordinal)
+$abortRaceObjectCleanupStage = $RustLive.IndexOf('record_lifecycle_abort_multipart_race_stage(LifecycleAbortMultipartRaceStage::ObjectCleanup);', $abortRaceTestStart, [StringComparison]::Ordinal)
+$abortRaceBucketStage = $RustLive.IndexOf('record_lifecycle_abort_multipart_race_stage(LifecycleAbortMultipartRaceStage::BucketDelete);', $abortRaceTestStart, [StringComparison]::Ordinal)
+Assert-True (
+    $abortRaceTestStart -ge 0 -and
+    $abortRacePendingStage -gt $abortRaceTestStart -and
+    $abortRaceStartedStage -gt $abortRacePendingStage -and
+    $abortRaceCompleteStage -gt $abortRaceStartedStage -and
+    $abortRaceTerminalStage -gt $abortRaceCompleteStage -and
+    $abortRaceLifecycleCleanupStage -gt $abortRaceTerminalStage -and
+    $abortRaceObjectCleanupStage -gt $abortRaceLifecycleCleanupStage -and
+    $abortRaceBucketStage -gt $abortRaceObjectCleanupStage
+) "Lifecycle abort multipart race stages must preserve claimed/race/terminal/cleanup order"
+
+Assert-True (([regex]::Matches($Main, '(?m)\bstart_worker\(')).Count -eq 1) "Production main must start exactly one generic lifecycle worker"
+Assert-NotMatches $Main '(?i)abort_incomplete_multipart|abort.*start_worker|start_worker.*abort' "Production main must not add abort-specific lifecycle worker or configuration wiring"
+Assert-NotMatches $Main '(?i)\b\w*abort\w*(?:worker|config)\w*\b|\b\w*(?:worker|config)\w*abort\w*\b' "Production main must not introduce abort-specific worker/configuration identifiers"
 
 $raceTimeoutDeclaration = 'const LIFECYCLE_RACE_TIMEOUT: Duration = Duration::from_secs(60);'
 Assert-True (([regex]::Matches($RustLive, [regex]::Escape($raceTimeoutDeclaration))).Count -eq 1) "Lifecycle race timeout declaration is missing or duplicated"

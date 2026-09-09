@@ -14,7 +14,10 @@ use crate::{
         actions::{
             LifecycleAdmissionResult, admit_lifecycle_expiration, execute_lifecycle_delete_guarded,
         },
-        model::{GuardedLifecycleExecutionResult, LifecycleActionKind, VersionTargetIdentity},
+        model::{
+            GuardedLifecycleExecutionResult, LifecycleActionKind, MultipartUploadTargetIdentity,
+            VersionTargetIdentity,
+        },
     },
     pinning::{
         config::{LeaseDuration, ProviderLimitMap, ProviderLimits, ProviderMode},
@@ -1059,7 +1062,8 @@ async fn lifecycle_timestamp_all_publication_producers_share_the_database_clock(
     .await
     .unwrap();
 
-    seed_upload(&db, "timestamp-multipart-upload", "timestamp-multipart").await;
+    let multipart_target =
+        seed_upload(&db, "timestamp-multipart-upload", "timestamp-multipart").await;
     let mut multipart_object = historical(
         "timestamp-multipart",
         "timestamp-multipart",
@@ -1069,7 +1073,7 @@ async fn lifecycle_timestamp_all_publication_producers_share_the_database_clock(
     multipart_object.multipart = true;
     publish_completed_upload(
         &db,
-        "timestamp-multipart-upload",
+        &multipart_target,
         request(multipart_object, vec![], vec![]),
         &limits(),
     )
@@ -1701,7 +1705,11 @@ async fn sqlite_publication_waits_for_existing_writer_before_starting_read_snaps
     );
 }
 
-async fn seed_upload(db: &DatabaseConnection, upload_id: &str, key: &str) {
+async fn seed_upload(
+    db: &DatabaseConnection,
+    upload_id: &str,
+    key: &str,
+) -> MultipartUploadTargetIdentity {
     multipart::create_upload(
         db,
         upload_id,
@@ -1722,6 +1730,13 @@ async fn seed_upload(db: &DatabaseConnection, upload_id: &str, key: &str) {
     multipart::upsert_part(db, upload_id, 1, "bafy-part", 3, "bafy-part")
         .await
         .unwrap();
+    let upload = multipart::get_upload(db, upload_id).await.unwrap();
+    MultipartUploadTargetIdentity {
+        bucket: upload.bucket,
+        key: upload.key,
+        upload_id: upload.upload_id,
+        initiated_at: upload.created_at,
+    }
 }
 
 async fn rows<T>(db: &DatabaseConnection) -> u64
@@ -3660,6 +3675,199 @@ async fn delete_marks_latest_false_and_ends_leases_without_deleting_rows() {
 }
 
 #[tokio::test]
+async fn completed_publication_after_abort_rolls_back_without_object_version() {
+    let (_directory, abort_db, completion_db) =
+        setup_independent_file_backed("completed-publication-abort-wins.sqlite").await;
+    let upload_target = seed_upload(&abort_db, "abort-wins", "root.bin").await;
+    let abort_transaction = abort_db.begin().await.unwrap();
+    lock_bucket_for_ownership(&abort_transaction, "bucket")
+        .await
+        .unwrap();
+
+    let completion_target = upload_target.clone();
+    let completion = tokio::spawn(async move {
+        let mut completed = object("aborted-completion", "root.bin", "bafy-aborted", 7);
+        completed.multipart = true;
+        publish_completed_upload(
+            &completion_db,
+            &completion_target,
+            request(completed, vec![], vec![]),
+            &limits(),
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !completion.is_finished(),
+        "completion must wait for the bucket lock held by abort"
+    );
+
+    assert!(matches!(
+        multipart::abort_exact_incomplete_upload_in_transaction(
+            &abort_transaction,
+            &upload_target,
+        )
+        .await
+        .unwrap(),
+        multipart::AbortExactIncompleteUploadResult::Applied
+    ));
+    abort_transaction.commit().await.unwrap();
+
+    let error = tokio::time::timeout(Duration::from_secs(10), completion)
+        .await
+        .expect("completion must observe the committed abort")
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        CommitCompletedUploadError::RolledBack {
+            source: AppError::NoSuchUpload(ref upload_id),
+            ..
+        } if upload_id == "abort-wins"
+    ));
+    assert_eq!(
+        object::Entity::find_by_id("aborted-completion")
+            .count(&abort_db)
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(versions_for(&abort_db, "root.bin").await.is_empty());
+    assert!(
+        multipart::get_upload(&abort_db, "abort-wins")
+            .await
+            .is_err()
+    );
+    assert!(
+        multipart::list_parts(&abort_db, "abort-wins")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn completed_publication_winner_removes_the_exact_upload() {
+    let (_directory, first, second) =
+        setup_independent_file_backed("completed-publication-wins.sqlite").await;
+    let upload_target = seed_upload(&first, "completion-wins", "archive.zip").await;
+    let retained_target = seed_upload(&first, "retained-upload", "other.bin").await;
+    let mut archive = object(
+        "completion-winner-archive",
+        "archive.zip",
+        "bafy-winner-archive",
+        7,
+    );
+    archive.multipart = true;
+    let publication = ZipPublicationRequest {
+        archive: request(archive, vec![], vec![]),
+        entries: vec![object(
+            "completion-winner-entry",
+            "out/file.txt",
+            "bafy-winner-entry",
+            3,
+        )],
+    };
+
+    let mut stale_created_at = upload_target.clone();
+    stale_created_at.initiated_at += chrono::Duration::seconds(1);
+    let mut wrong_bucket = upload_target.clone();
+    wrong_bucket.bucket = "other-bucket".to_owned();
+    let mut wrong_key = upload_target.clone();
+    wrong_key.key = "other-key".to_owned();
+    for stale_target in [stale_created_at, wrong_bucket, wrong_key] {
+        let stale_error =
+            publish_completed_zip(&second, &stale_target, publication.clone(), &limits())
+                .await
+                .unwrap_err();
+        assert!(matches!(
+            stale_error,
+            CommitCompletedUploadError::RolledBack {
+                source: AppError::NoSuchUpload(ref upload_id),
+                ..
+            } if upload_id == "completion-wins"
+        ));
+        assert_no_publication_rows(&first).await;
+        assert!(
+            multipart::get_upload(&first, "completion-wins")
+                .await
+                .is_ok()
+        );
+    }
+
+    let completion_transaction = first.begin().await.unwrap();
+    let publication_result = publish_in_transaction(
+        &completion_transaction,
+        publication.archive,
+        publication.entries,
+        Some(&upload_target),
+        None,
+        None,
+        Vec::new(),
+        None,
+        &limits(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(publication_result.object_id, "completion-winner-archive");
+
+    let abort_target = upload_target.clone();
+    let later_abort = tokio::spawn(async move {
+        let transaction = second.begin().await.unwrap();
+        lock_bucket_for_ownership(&transaction, &abort_target.bucket)
+            .await
+            .unwrap();
+        let result =
+            multipart::abort_exact_incomplete_upload_in_transaction(&transaction, &abort_target)
+                .await
+                .unwrap();
+        transaction.commit().await.unwrap();
+        result
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !later_abort.is_finished(),
+        "abort must wait for the bucket lock held by completion"
+    );
+    completion_transaction.commit().await.unwrap();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(10), later_abort)
+            .await
+            .expect("abort must observe committed completion")
+            .unwrap(),
+        multipart::AbortExactIncompleteUploadResult::AlreadySatisfied
+    ));
+
+    assert!(
+        multipart::get_upload(&first, "completion-wins")
+            .await
+            .is_err()
+    );
+    assert!(
+        multipart::list_parts(&first, "completion-wins")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        multipart::get_upload(&first, "retained-upload")
+            .await
+            .unwrap()
+            .created_at,
+        retained_target.initiated_at
+    );
+    assert_eq!(
+        multipart::list_parts(&first, "retained-upload")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(versions_for(&first, "archive.zip").await.len(), 1);
+    assert_eq!(versions_for(&first, "out/file.txt").await.len(), 1);
+}
+
+#[tokio::test]
 async fn multipart_zip_failure_points_preserve_upload_parts_prior_latest_and_rollback_new_rows() {
     for failure in ["archive", "entry", "lease", "job"] {
         let db = setup().await;
@@ -3687,7 +3895,7 @@ async fn multipart_zip_failure_points_preserve_upload_parts_prior_latest_and_rol
         )
         .await
         .unwrap();
-        seed_upload(&db, "upload-zip", "archive.zip").await;
+        let upload_target = seed_upload(&db, "upload-zip", "archive.zip").await;
         let trigger = match failure {
             "archive" => {
                 "CREATE TRIGGER fail_publication BEFORE INSERT ON objects WHEN NEW.id = 'archive-new' BEGIN SELECT RAISE(FAIL, 'archive'); END;"
@@ -3713,7 +3921,7 @@ async fn multipart_zip_failure_points_preserve_upload_parts_prior_latest_and_rol
             ],
         };
 
-        let error = publish_completed_zip(&db, "upload-zip", publication, &limits())
+        let error = publish_completed_zip(&db, &upload_target, publication, &limits())
             .await
             .unwrap_err();
 
@@ -3781,7 +3989,7 @@ async fn multipart_zip_failure_points_preserve_upload_parts_prior_latest_and_rol
 #[tokio::test]
 async fn multipart_non_zip_and_zip_success_publish_and_remove_upload_parts_atomically() {
     let db = setup().await;
-    seed_upload(&db, "upload-object", "root.bin").await;
+    let object_upload_target = seed_upload(&db, "upload-object", "root.bin").await;
     let mut root = object("complete-object", "root.bin", "bafy-root", 7);
     root.multipart = true;
     let root = request(
@@ -3794,7 +4002,7 @@ async fn multipart_non_zip_and_zip_success_publish_and_remove_upload_parts_atomi
             ContentMode::Object,
         )],
     );
-    publish_completed_upload(&db, "upload-object", root, &limits())
+    publish_completed_upload(&db, &object_upload_target, root, &limits())
         .await
         .unwrap();
     assert!(multipart::get_upload(&db, "upload-object").await.is_err());
@@ -3820,7 +4028,7 @@ async fn multipart_non_zip_and_zip_success_publish_and_remove_upload_parts_atomi
     );
     assert_eq!(targets_for_object(&db, "complete-object").await.len(), 1);
 
-    seed_upload(&db, "upload-zip", "archive.zip").await;
+    let zip_upload_target = seed_upload(&db, "upload-zip", "archive.zip").await;
     let mut archive_object = object("complete-zip", "archive.zip", "bafy-archive", 7);
     archive_object.multipart = true;
     let archive = request(
@@ -3835,7 +4043,7 @@ async fn multipart_non_zip_and_zip_success_publish_and_remove_upload_parts_atomi
     );
     publish_completed_zip(
         &db,
-        "upload-zip",
+        &zip_upload_target,
         ZipPublicationRequest {
             archive,
             entries: vec![
@@ -4718,11 +4926,11 @@ async fn genuinely_new_failed_all_target_resets_once_while_passive_equal_and_tag
 #[tokio::test]
 async fn completed_publication_reconciliation_uses_exact_attempt_and_upload_absence() {
     let db = setup().await;
-    seed_upload(&db, "upload-reconcile", "root.bin").await;
+    let upload_target = seed_upload(&db, "upload-reconcile", "root.bin").await;
     let expected = object("attempt-exact", "root.bin", "bafy-exact", 7);
     publish_completed_upload(
         &db,
-        "upload-reconcile",
+        &upload_target,
         request(expected.clone(), vec![], vec![]),
         &limits(),
     )

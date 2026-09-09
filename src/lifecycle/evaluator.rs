@@ -7,9 +7,11 @@ use crate::{
         config::from_canonical_json,
         filter::matches_filter,
         model::{
-            CanonicalLifecycleConfiguration, ClaimedLifecycleScan, CurrentExpiration,
-            LifecycleActionKind, LifecycleCandidate, LifecycleCandidatePage, LifecycleRuleStatus,
-            NewLifecycleAction, NoncurrentExpiration, RuleIdentity,
+            CanonicalFilter, CanonicalLifecycleConfiguration, CanonicalRuleSelector,
+            ClaimedLifecycleScan, CurrentExpiration, LifecycleActionKind, LifecycleCandidate,
+            LifecycleCandidatePage, LifecycleRuleStatus, LifecycleTargetIdentity,
+            MultipartUploadTargetIdentity, NewLifecycleAction, NoncurrentExpiration, RuleIdentity,
+            VersionLifecycleCandidate,
         },
     },
     pinning::tags::ObjectTag,
@@ -38,6 +40,11 @@ pub struct LifecycleEvaluationContext<'a> {
 struct LifecycleProposal {
     action: NewLifecycleAction,
     stable_rule_identity: String,
+}
+
+struct VersionEvaluationContext<'a> {
+    candidate: &'a VersionLifecycleCandidate,
+    facts: &'a LifecycleEvaluationContext<'a>,
 }
 
 /// Returns the first UTC midnight strictly after `days` full calendar days from `start`.
@@ -77,14 +84,23 @@ pub fn evaluate_candidate(
         ));
     }
 
+    let candidate = match context.candidate {
+        LifecycleCandidate::Version(candidate) => candidate,
+        LifecycleCandidate::MultipartUpload(target) => return evaluate_multipart(context, target),
+    };
+    let context = &VersionEvaluationContext {
+        candidate,
+        facts: context,
+    };
+
     let mut proposals = Vec::new();
-    for (ordinal, rule) in context.configuration.rules.iter().enumerate() {
+    for (ordinal, rule) in context.facts.configuration.rules.iter().enumerate() {
         if rule.status != LifecycleRuleStatus::Enabled
             || !matches_filter(
                 &rule.selector,
                 &context.candidate.target.key,
                 context.candidate.size,
-                context.tags,
+                context.facts.tags,
             )
         {
             continue;
@@ -113,6 +129,66 @@ pub fn evaluate_candidate(
     Ok(select_winner(proposals).map(|proposal| proposal.action))
 }
 
+fn evaluate_multipart(
+    context: &LifecycleEvaluationContext<'_>,
+    target: &MultipartUploadTargetIdentity,
+) -> AppResult<Option<NewLifecycleAction>> {
+    let mut proposals = Vec::new();
+    for (ordinal, rule) in context.configuration.rules.iter().enumerate() {
+        if rule.status != LifecycleRuleStatus::Enabled {
+            continue;
+        }
+        let Some(abort) = &rule.abort_incomplete_multipart_upload else {
+            continue;
+        };
+        let matches = match &rule.selector {
+            CanonicalRuleSelector::Modern {
+                filter: CanonicalFilter::All,
+            } => true,
+            CanonicalRuleSelector::LegacyPrefix { prefix }
+            | CanonicalRuleSelector::Modern {
+                filter: CanonicalFilter::Prefix { prefix },
+            } => target.key.starts_with(prefix),
+            _ => {
+                return Err(AppError::InvalidArgument(
+                    "invalid multipart lifecycle selector".to_owned(),
+                ));
+            }
+        };
+        if !matches {
+            continue;
+        }
+        // Canonical days are positive. A boundary beyond the timestamp range is therefore
+        // still in the future, not a reason to discard other rules or fail the scan page.
+        let Ok(due_at) =
+            next_utc_midnight_after_full_days(target.initiated_at, abort.days_after_initiation)
+        else {
+            continue;
+        };
+        if context.database_now < due_at {
+            continue;
+        }
+        let (rule_identity, stable_rule_identity) = rule_identity(rule.id.as_deref(), ordinal)?;
+        proposals.push(LifecycleProposal {
+            action: NewLifecycleAction {
+                idempotency_key: String::new(),
+                bucket: target.bucket.clone(),
+                config_revision: context.config_revision,
+                rule_identity,
+                action_kind: LifecycleActionKind::AbortIncompleteMultipartUpload,
+                target: LifecycleTargetIdentity::MultipartUpload(target.clone()),
+                due_at,
+            },
+            stable_rule_identity,
+        });
+    }
+    proposals.sort_by(|left, right| {
+        (left.action.due_at, &left.stable_rule_identity)
+            .cmp(&(right.action.due_at, &right.stable_rule_identity))
+    });
+    Ok(proposals.into_iter().next().map(|proposal| proposal.action))
+}
+
 /// Evaluates one bounded scan page using the scan claim's database clock and idempotently writes
 /// no more than one action for each candidate. It deliberately does not retain scan-time tags in
 /// the durable action; execution must reread them later.
@@ -125,22 +201,28 @@ pub async fn schedule_claimed_scan_page<C: ConnectionTrait>(
     let page = scan_candidate_page(db, &claim.bucket, claim.cursor.as_ref(), page_limit).await?;
 
     for candidate in &page.candidates {
-        let tags = match candidate.target.object_id.as_deref() {
-            Some(object_id) => list_object_tags(db, object_id).await?,
-            None => Vec::new(),
+        let (tags, public_version_count, newer_noncurrent_count) = match candidate {
+            LifecycleCandidate::MultipartUpload(_) => (Vec::new(), 0, 0),
+            LifecycleCandidate::Version(candidate) => {
+                let tags = match candidate.target.object_id.as_deref() {
+                    Some(object_id) => list_object_tags(db, object_id).await?,
+                    None => Vec::new(),
+                };
+                let public_version_count = object_version::Entity::find()
+                    .filter(object_version::Column::Bucket.eq(&candidate.target.bucket))
+                    .filter(object_version::Column::Key.eq(&candidate.target.key))
+                    .count(db)
+                    .await?;
+                let newer_noncurrent_count = object_version::Entity::find()
+                    .filter(object_version::Column::Bucket.eq(&candidate.target.bucket))
+                    .filter(object_version::Column::Key.eq(&candidate.target.key))
+                    .filter(object_version::Column::IsLatest.eq(false))
+                    .filter(object_version::Column::Sequence.gt(candidate.target.sequence))
+                    .count(db)
+                    .await?;
+                (tags, public_version_count, newer_noncurrent_count)
+            }
         };
-        let public_version_count = object_version::Entity::find()
-            .filter(object_version::Column::Bucket.eq(&candidate.target.bucket))
-            .filter(object_version::Column::Key.eq(&candidate.target.key))
-            .count(db)
-            .await?;
-        let newer_noncurrent_count = object_version::Entity::find()
-            .filter(object_version::Column::Bucket.eq(&candidate.target.bucket))
-            .filter(object_version::Column::Key.eq(&candidate.target.key))
-            .filter(object_version::Column::IsLatest.eq(false))
-            .filter(object_version::Column::Sequence.gt(candidate.target.sequence))
-            .count(db)
-            .await?;
         let context = LifecycleEvaluationContext {
             candidate,
             tags: &tags,
@@ -161,7 +243,7 @@ pub async fn schedule_claimed_scan_page<C: ConnectionTrait>(
 
 fn collect_current_proposal(
     proposals: &mut Vec<LifecycleProposal>,
-    context: &LifecycleEvaluationContext<'_>,
+    context: &VersionEvaluationContext<'_>,
     expiration: Option<&CurrentExpiration>,
     rule_identity: RuleIdentity,
     stable_rule_identity: String,
@@ -175,7 +257,7 @@ fn collect_current_proposal(
             let Some(due_at) = current_due_at(expiration, context.candidate)? else {
                 return Ok(());
             };
-            if context.database_now >= due_at {
+            if context.facts.database_now >= due_at {
                 proposals.push(proposal(
                     context,
                     rule_identity,
@@ -186,7 +268,9 @@ fn collect_current_proposal(
             }
         }
         VersionKind::DeleteMarker => match expiration {
-            CurrentExpiration::ExpiredObjectDeleteMarker if context.public_version_count == 1 => {
+            CurrentExpiration::ExpiredObjectDeleteMarker
+                if context.facts.public_version_count == 1 =>
+            {
                 proposals.push(proposal(
                     context,
                     rule_identity,
@@ -196,12 +280,12 @@ fn collect_current_proposal(
                 ));
             }
             CurrentExpiration::Date { .. } | CurrentExpiration::Days { .. }
-                if context.public_version_count == 1 =>
+                if context.facts.public_version_count == 1 =>
             {
                 let Some(due_at) = current_due_at(expiration, context.candidate)? else {
                     return Ok(());
                 };
-                if context.database_now >= due_at {
+                if context.facts.database_now >= due_at {
                     proposals.push(proposal(
                         context,
                         rule_identity,
@@ -219,7 +303,7 @@ fn collect_current_proposal(
 
 fn collect_noncurrent_proposal(
     proposals: &mut Vec<LifecycleProposal>,
-    context: &LifecycleEvaluationContext<'_>,
+    context: &VersionEvaluationContext<'_>,
     expiration: Option<&NoncurrentExpiration>,
     rule_identity: RuleIdentity,
     stable_rule_identity: String,
@@ -234,8 +318,8 @@ fn collect_noncurrent_proposal(
         next_utc_midnight_after_full_days(became_noncurrent_at, expiration.noncurrent_days)?;
     let newer_satisfied = expiration
         .newer_noncurrent_versions
-        .is_none_or(|required| context.newer_noncurrent_count > u64::from(required));
-    if context.database_now >= due_at && newer_satisfied {
+        .is_none_or(|required| context.facts.newer_noncurrent_count > u64::from(required));
+    if context.facts.database_now >= due_at && newer_satisfied {
         proposals.push(proposal(
             context,
             rule_identity,
@@ -249,7 +333,7 @@ fn collect_noncurrent_proposal(
 
 fn current_due_at(
     expiration: &CurrentExpiration,
-    candidate: &LifecycleCandidate,
+    candidate: &VersionLifecycleCandidate,
 ) -> AppResult<Option<DateTime<Utc>>> {
     match expiration {
         CurrentExpiration::Date { utc_midnight } => Ok(Some(*utc_midnight)),
@@ -261,7 +345,7 @@ fn current_due_at(
 }
 
 fn proposal(
-    context: &LifecycleEvaluationContext<'_>,
+    context: &VersionEvaluationContext<'_>,
     rule_identity: RuleIdentity,
     stable_rule_identity: String,
     action_kind: LifecycleActionKind,
@@ -271,10 +355,10 @@ fn proposal(
         action: NewLifecycleAction {
             idempotency_key: String::new(),
             bucket: context.candidate.target.bucket.clone(),
-            config_revision: context.config_revision,
+            config_revision: context.facts.config_revision,
             rule_identity,
             action_kind,
-            target: context.candidate.target.clone(),
+            target: LifecycleTargetIdentity::Version(context.candidate.target.clone()),
             due_at,
         },
         stable_rule_identity,
@@ -290,6 +374,7 @@ fn proposal_sort_key(proposal: &LifecycleProposal) -> (u8, DateTime<Utc>, &str) 
     let permanence = match proposal.action.action_kind {
         LifecycleActionKind::ExpireNoncurrent => 0,
         LifecycleActionKind::ExpireCurrent | LifecycleActionKind::DeleteExpiredMarker => 1,
+        LifecycleActionKind::AbortIncompleteMultipartUpload => 1,
     };
     (
         permanence,
@@ -315,6 +400,11 @@ fn rule_identity(id: Option<&str>, ordinal: usize) -> AppResult<(RuleIdentity, S
 
 #[cfg(test)]
 mod tests {
+    use crate::lifecycle::model::{
+        AbortIncompleteMultipartUploadAction, LifecycleTargetIdentity,
+        MultipartUploadTargetIdentity, VersionLifecycleCandidate,
+    };
+    use crate::store::lifecycle_action::{canonical_action_bytes, insert_idempotent};
     use chrono::{DateTime, TimeZone, Utc};
     use sea_orm::{ConnectionTrait, Database, EntityTrait, PaginatorTrait, Set};
 
@@ -345,6 +435,345 @@ mod tests {
             .unwrap()
     }
 
+    fn upload_candidate(key: &str, initiated_at: DateTime<Utc>) -> LifecycleCandidate {
+        LifecycleCandidate::MultipartUpload(MultipartUploadTargetIdentity {
+            bucket: "bucket".to_owned(),
+            key: key.to_owned(),
+            upload_id: "upload-1".to_owned(),
+            initiated_at,
+        })
+    }
+
+    fn abort_rule(id: &str, days: u32, selector: CanonicalRuleSelector) -> CanonicalLifecycleRule {
+        let mut rule = rule(id, selector, None, None);
+        rule.abort_incomplete_multipart_upload = Some(AbortIncompleteMultipartUploadAction {
+            days_after_initiation: days,
+        });
+        rule
+    }
+
+    fn abort_action() -> NewLifecycleAction {
+        let initiated_at = Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).unwrap();
+        let candidate = upload_candidate("key", initiated_at);
+        let rules = configuration(vec![abort_rule("abort", 1, all())]);
+        evaluate_candidate(&context(
+            &candidate,
+            &[],
+            0,
+            0,
+            &rules,
+            initiated_at + chrono::Duration::days(2),
+        ))
+        .unwrap()
+        .unwrap()
+    }
+
+    #[test]
+    fn abort_max_days_is_not_due_and_preserves_midnight_helper_errors() {
+        let candidate = upload_candidate("key", at(1, 0, 0));
+        let rules = configuration(vec![abort_rule("far-future", i32::MAX as u32, all())]);
+        assert!(next_utc_midnight_after_full_days(at(1, 0, 0), i32::MAX as u32).is_err());
+        assert!(next_utc_midnight_after_full_days(DateTime::<Utc>::MAX_UTC, 1).is_err());
+        assert!(
+            evaluate_candidate(&context(&candidate, &[], 0, 0, &rules, at(9, 0, 0)))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn abort_max_days_does_not_hide_a_due_rule_in_either_order() {
+        let candidate = upload_candidate("key", at(1, 0, 0));
+        let mut rules = configuration(vec![
+            abort_rule("far-future", i32::MAX as u32, all()),
+            abort_rule("due", 1, all()),
+        ]);
+        for _ in 0..2 {
+            let action = evaluate_candidate(&context(&candidate, &[], 0, 0, &rules, at(9, 0, 0)))
+                .unwrap()
+                .unwrap();
+            assert_eq!(action.rule_identity, RuleIdentity::Id("due".to_owned()));
+            assert_eq!(action.due_at, at(3, 0, 0));
+            rules.rules.reverse();
+        }
+    }
+
+    #[test]
+    fn abort_evaluator_uses_initiation_midnight_prefix_and_database_now() {
+        for start in [at(1, 0, 0), at(1, 0, 1), at(1, 23, 59)] {
+            let due = next_utc_midnight_after_full_days(start, 1).unwrap();
+            for selector in [
+                all(),
+                CanonicalRuleSelector::LegacyPrefix {
+                    prefix: "日志/".to_owned(),
+                },
+                CanonicalRuleSelector::Modern {
+                    filter: CanonicalFilter::Prefix {
+                        prefix: "日志/".to_owned(),
+                    },
+                },
+            ] {
+                let mut rules = configuration(vec![abort_rule("abort", 1, selector)]);
+                let candidate = upload_candidate("日志/object", start);
+                assert!(
+                    evaluate_candidate(&context(
+                        &candidate,
+                        &[],
+                        0,
+                        0,
+                        &rules,
+                        due - chrono::Duration::nanoseconds(1)
+                    ))
+                    .unwrap()
+                    .is_none()
+                );
+                let action = evaluate_candidate(&context(
+                    &candidate,
+                    &[ObjectTag::new("ignored", "ignored")],
+                    u64::MAX,
+                    u64::MAX,
+                    &rules,
+                    due,
+                ))
+                .unwrap()
+                .unwrap();
+                assert_eq!(action.due_at, due);
+                assert_eq!(
+                    action.action_kind,
+                    LifecycleActionKind::AbortIncompleteMultipartUpload
+                );
+                assert!(matches!(
+                    action.target,
+                    LifecycleTargetIdentity::MultipartUpload(_)
+                ));
+                rules.rules[0].status = LifecycleRuleStatus::Disabled;
+                assert!(
+                    evaluate_candidate(&context(&candidate, &[], 0, 0, &rules, due))
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        }
+        let rules = configuration(vec![abort_rule(
+            "prefix",
+            1,
+            CanonicalRuleSelector::LegacyPrefix {
+                prefix: "Logs/é/".to_owned(),
+            },
+        )]);
+        for key in [
+            "logs/é/file",
+            "Logs/e\u{301}/file",
+            "Logs/é",
+            "Logs/%C3%A9/file",
+        ] {
+            assert!(
+                evaluate_candidate(&context(
+                    &upload_candidate(key, at(1, 0, 0)),
+                    &[],
+                    0,
+                    0,
+                    &rules,
+                    at(9, 0, 0)
+                ))
+                .unwrap()
+                .is_none(),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn abort_evaluator_chooses_earliest_due_then_stable_rule_identity() {
+        let candidate = upload_candidate("key", at(1, 0, 0));
+        let mut rules = configuration(vec![
+            abort_rule("a-later", 2, all()),
+            abort_rule("z-earlier", 1, all()),
+            abort_rule("b-earlier", 1, all()),
+        ]);
+        for _ in 0..3 {
+            let action = evaluate_candidate(&context(&candidate, &[], 0, 0, &rules, at(9, 0, 0)))
+                .unwrap()
+                .unwrap();
+            assert_eq!(action.due_at, at(3, 0, 0));
+            assert_eq!(
+                action.rule_identity,
+                RuleIdentity::Id("b-earlier".to_owned())
+            );
+            rules.rules.rotate_left(1);
+        }
+        for rule in &mut rules.rules {
+            rule.id = None;
+        }
+        let action = evaluate_candidate(&context(&candidate, &[], 0, 0, &rules, at(9, 0, 0)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(action.rule_identity, RuleIdentity::Ordinal(1));
+    }
+
+    #[tokio::test]
+    async fn abort_scan_replay_inserts_one_polymorphic_action() {
+        use crate::store::entities::multipart_upload;
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        run_migrations(&db).await.unwrap();
+        bucket::create(&db, "bucket", None).await.unwrap();
+        multipart_upload::Entity::insert(multipart_upload::ActiveModel {
+            upload_id: Set("upload-1".to_owned()),
+            object_id: Set("unpublished".to_owned()),
+            bucket: Set("bucket".to_owned()),
+            key: Set("key".to_owned()),
+            created_at: Set(at(1, 0, 0)),
+            encryption_mode: Set("none".to_owned()),
+            key_wrap: Set(None),
+            sse_c_key_fingerprint: Set(None),
+            content_type: Set(None),
+            metadata: Set(None),
+            tags_json: Set(serde_json::json!([])),
+            decompress_zip_target: Set(None),
+            decompress_zip_result: Set(false),
+        })
+        .exec(&db)
+        .await
+        .unwrap();
+        let rules = configuration(vec![abort_rule("z", 2, all()), abort_rule("a", 1, all())]);
+        let claim = ClaimedLifecycleScan {
+            bucket: "bucket".to_owned(),
+            config_revision: 7,
+            canonical_json: crate::lifecycle::config::canonical_json(&rules).unwrap(),
+            cursor: None,
+            lease_epoch: 1,
+            database_now: at(9, 0, 0),
+            lease_until: at(10, 0, 0),
+        };
+        for _ in 0..2 {
+            let page = schedule_claimed_scan_page(&db, &claim, 1).await.unwrap();
+            assert_eq!(page.candidates.len(), 1);
+            assert!(page.cycle_complete);
+        }
+        assert_eq!(
+            lifecycle_action::Entity::find().count(&db).await.unwrap(),
+            1
+        );
+        let stored = lifecycle_action::Entity::find()
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.target_type, "multipart_upload");
+        assert_eq!(stored.target_upload_id.as_deref(), Some("upload-1"));
+        assert_eq!(stored.target_upload_created_at, Some(at(1, 0, 0)));
+        assert!(stored.target_version_row_id.is_none());
+        assert!(stored.target_public_version_id.is_none());
+        assert!(stored.target_object_id.is_none());
+        assert!(stored.target_sequence.is_none());
+        assert_eq!(stored.rule_id, "id:a");
+        let proposed = evaluate_candidate(&context(
+            &upload_candidate("key", at(1, 0, 0)),
+            &[],
+            0,
+            0,
+            &rules,
+            claim.database_now,
+        ))
+        .unwrap()
+        .unwrap();
+        assert!(
+            !insert_idempotent(&db, proposed, claim.database_now)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn multipart_action_key_is_canonical_and_version_key_is_unchanged() {
+        let action = abort_action();
+        assert_eq!(
+            String::from_utf8(canonical_action_bytes(&action).unwrap()).unwrap(),
+            r#"{"bucket":"bucket","config_revision":7,"rule_identity":"id:abort","action_kind":"abort_incomplete_multipart_upload","target_upload_id":"upload-1","target_upload_created_at":"2026-09-01T00:00:00.000000000Z","due_at":"2026-09-03T00:00:00.000000000Z"}"#
+        );
+        assert_eq!(
+            idempotency_key(&action).unwrap(),
+            "b0cc004f498978dab985d957699c30782cc76a2f6a0e2d4fe769fa0a543cd8c5"
+        );
+        let version = NewLifecycleAction {
+            idempotency_key: String::new(),
+            bucket: "bucket".to_owned(),
+            config_revision: 7,
+            rule_identity: RuleIdentity::Id("expire".to_owned()),
+            action_kind: LifecycleActionKind::ExpireCurrent,
+            target: LifecycleTargetIdentity::Version(VersionTargetIdentity {
+                bucket: "bucket".to_owned(),
+                key: "key".to_owned(),
+                version_row_id: "version-row".to_owned(),
+                public_version_id: PublicVersionId::Opaque(
+                    "00000000-0000-4000-8000-000000000001".to_owned(),
+                ),
+                kind: VersionKind::Object,
+                object_id: Some("object-id".to_owned()),
+                sequence: 1,
+            }),
+            due_at: Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).unwrap(),
+        };
+        assert_eq!(
+            idempotency_key(&version).unwrap(),
+            "d9c49eddf8319d6726c99c8162ff9b72150f6d57f23ad121be9a263647f55578"
+        );
+    }
+
+    #[tokio::test]
+    async fn polymorphic_action_insert_rejects_shape_kind_or_supplied_key_mismatch() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        run_migrations(&db).await.unwrap();
+        bucket::create(&db, "bucket", None).await.unwrap();
+        for case in [
+            "kind",
+            "bucket",
+            "key",
+            "upload",
+            "revision",
+            "supplied_key",
+            "version_abort",
+        ] {
+            let mut action = abort_action();
+            match case {
+                "kind" => action.action_kind = LifecycleActionKind::ExpireCurrent,
+                "bucket" => action.bucket = "other".to_owned(),
+                "revision" => action.config_revision = 0,
+                "supplied_key" => action.idempotency_key = "wrong".to_owned(),
+                "version_abort" => {
+                    let LifecycleCandidate::Version(candidate) = content_current(at(1, 0, 0))
+                    else {
+                        unreachable!()
+                    };
+                    action.target = LifecycleTargetIdentity::Version(candidate.target)
+                }
+                "key" | "upload" => {
+                    let LifecycleTargetIdentity::MultipartUpload(target) = &mut action.target
+                    else {
+                        unreachable!()
+                    };
+                    if case == "key" {
+                        target.key.clear();
+                    } else {
+                        target.upload_id.clear();
+                    }
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                matches!(
+                    insert_idempotent(&db, action, at(9, 0, 0)).await,
+                    Err(crate::error::AppError::InvalidArgument(_))
+                ),
+                "{case}"
+            );
+        }
+        assert_eq!(
+            lifecycle_action::Entity::find().count(&db).await.unwrap(),
+            0
+        );
+    }
+
     fn content_current(age: DateTime<Utc>) -> LifecycleCandidate {
         candidate(true, VersionKind::Object, age, None)
     }
@@ -364,7 +793,7 @@ mod tests {
         became_noncurrent_at: Option<DateTime<Utc>>,
     ) -> LifecycleCandidate {
         let is_content = kind == VersionKind::Object;
-        LifecycleCandidate {
+        LifecycleCandidate::Version(VersionLifecycleCandidate {
             target: VersionTargetIdentity {
                 bucket: "bucket".to_owned(),
                 key: "logs/object".to_owned(),
@@ -384,7 +813,7 @@ mod tests {
             size: if is_content { 5 } else { 0 },
             lifecycle_age_started_at,
             became_noncurrent_at,
-        }
+        })
     }
 
     fn rule(
@@ -399,6 +828,7 @@ mod tests {
             selector,
             expiration,
             noncurrent_version_expiration,
+            abort_incomplete_multipart_upload: None,
         }
     }
 
@@ -664,6 +1094,9 @@ mod tests {
             immediate.action_kind,
             LifecycleActionKind::DeleteExpiredMarker
         );
+        let LifecycleCandidate::Version(marker) = marker else {
+            unreachable!()
+        };
         assert_eq!(immediate.due_at, marker.lifecycle_age_started_at);
     }
 
@@ -730,7 +1163,10 @@ mod tests {
 
     #[test]
     fn winner_prefers_permanent_deletion_then_earliest_due_then_stable_rule_identity() {
-        let target = content_current(at(1, 0, 0)).target;
+        let LifecycleCandidate::Version(candidate) = content_current(at(1, 0, 0)) else {
+            unreachable!()
+        };
+        let target = LifecycleTargetIdentity::Version(candidate.target);
         let permanent = super::LifecycleProposal {
             action: NewLifecycleAction {
                 idempotency_key: String::new(),
@@ -931,7 +1367,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(action.target_version_row_id, "version-row");
+        assert_eq!(action.target_version_row_id.as_deref(), Some("version-row"));
         assert_eq!(action.action_kind, "expire_current");
         assert_eq!(
             action.idempotency_key,

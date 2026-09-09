@@ -8,10 +8,10 @@ use crate::{
     error::{AppError, AppResult},
     lifecycle::model::{
         LifecycleCandidate, LifecycleCandidatePage, LifecycleScanCursor, LifecycleScanSource,
-        VersionTargetIdentity,
+        MultipartUploadTargetIdentity, VersionLifecycleCandidate, VersionTargetIdentity,
     },
     store::{
-        entities::{object, object_version},
+        entities::{multipart_upload, object, object_version},
         object_version::{public_version_id, version_kind},
     },
 };
@@ -24,8 +24,14 @@ struct StoredCursor {
     source: LifecycleScanSource,
     bucket: String,
     key: String,
-    sequence: i64,
-    version_row_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sequence: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    version_row_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    multipart_created_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    multipart_upload_id: Option<String>,
 }
 
 impl From<&LifecycleScanCursor> for StoredCursor {
@@ -36,6 +42,8 @@ impl From<&LifecycleScanCursor> for StoredCursor {
             key: cursor.key.clone(),
             sequence: cursor.sequence,
             version_row_id: cursor.version_row_id.clone(),
+            multipart_created_at: cursor.multipart_created_at,
+            multipart_upload_id: cursor.multipart_upload_id.clone(),
         }
     }
 }
@@ -48,6 +56,8 @@ impl From<StoredCursor> for LifecycleScanCursor {
             key: cursor.key,
             sequence: cursor.sequence,
             version_row_id: cursor.version_row_id,
+            multipart_created_at: cursor.multipart_created_at,
+            multipart_upload_id: cursor.multipart_upload_id,
         }
     }
 }
@@ -61,12 +71,29 @@ fn validate_cursor(cursor: &LifecycleScanCursor, bucket: &str) -> AppResult<()> 
         || cursor.bucket.is_empty()
         || cursor.bucket != bucket
         || cursor.key.is_empty()
-        || cursor.sequence <= 0
-        || cursor.version_row_id.is_empty()
     {
         return Err(invalid_cursor());
     }
-    Ok(())
+
+    let valid_shape = match &cursor.source {
+        LifecycleScanSource::Current | LifecycleScanSource::Noncurrent => {
+            matches!(cursor.sequence, Some(sequence) if sequence > 0)
+                && matches!(&cursor.version_row_id, Some(version_row_id) if !version_row_id.is_empty())
+                && cursor.multipart_created_at.is_none()
+                && cursor.multipart_upload_id.is_none()
+        }
+        LifecycleScanSource::Multipart => {
+            cursor.sequence.is_none()
+                && cursor.version_row_id.is_none()
+                && cursor.multipart_created_at.is_some()
+                && matches!(&cursor.multipart_upload_id, Some(upload_id) if !upload_id.is_empty())
+        }
+    };
+    if valid_shape {
+        Ok(())
+    } else {
+        Err(invalid_cursor())
+    }
 }
 
 pub fn encode_cursor(cursor: &LifecycleScanCursor) -> String {
@@ -86,7 +113,14 @@ pub fn decode_cursor(value: &str, bucket: &str) -> AppResult<LifecycleScanCursor
     Ok(cursor)
 }
 
-fn tuple_after(cursor: &LifecycleScanCursor) -> Condition {
+fn version_tuple_after(cursor: &LifecycleScanCursor) -> Condition {
+    let sequence = cursor
+        .sequence
+        .expect("validated version lifecycle cursor has a sequence");
+    let version_row_id = cursor
+        .version_row_id
+        .clone()
+        .expect("validated version lifecycle cursor has a row ID");
     Condition::any()
         .add(object_version::Column::Key.gt(cursor.key.clone()))
         .add(
@@ -94,27 +128,61 @@ fn tuple_after(cursor: &LifecycleScanCursor) -> Condition {
                 .add(object_version::Column::Key.eq(cursor.key.clone()))
                 .add(
                     Condition::any()
-                        .add(object_version::Column::Sequence.gt(cursor.sequence))
+                        .add(object_version::Column::Sequence.gt(sequence))
                         .add(
                             Condition::all()
-                                .add(object_version::Column::Sequence.eq(cursor.sequence))
-                                .add(object_version::Column::Id.gt(cursor.version_row_id.clone())),
+                                .add(object_version::Column::Sequence.eq(sequence))
+                                .add(object_version::Column::Id.gt(version_row_id)),
                         ),
                 ),
         )
 }
 
-fn source_filter(source: LifecycleScanSource) -> bool {
-    matches!(source, LifecycleScanSource::Current)
+fn multipart_tuple_after(cursor: &LifecycleScanCursor) -> Condition {
+    let created_at = cursor
+        .multipart_created_at
+        .expect("validated multipart lifecycle cursor has a creation timestamp");
+    let upload_id = cursor
+        .multipart_upload_id
+        .clone()
+        .expect("validated multipart lifecycle cursor has an upload ID");
+    Condition::any()
+        .add(multipart_upload::Column::Key.gt(cursor.key.clone()))
+        .add(
+            Condition::all()
+                .add(multipart_upload::Column::Key.eq(cursor.key.clone()))
+                .add(
+                    Condition::any()
+                        .add(multipart_upload::Column::CreatedAt.gt(created_at))
+                        .add(
+                            Condition::all()
+                                .add(multipart_upload::Column::CreatedAt.eq(created_at))
+                                .add(multipart_upload::Column::UploadId.gt(upload_id)),
+                        ),
+                ),
+        )
 }
 
 fn cursor_for(source: LifecycleScanSource, candidate: &LifecycleCandidate) -> LifecycleScanCursor {
-    LifecycleScanCursor {
-        source,
-        bucket: candidate.target.bucket.clone(),
-        key: candidate.target.key.clone(),
-        sequence: candidate.target.sequence,
-        version_row_id: candidate.target.version_row_id.clone(),
+    match candidate {
+        LifecycleCandidate::Version(candidate) => LifecycleScanCursor {
+            source,
+            bucket: candidate.target.bucket.clone(),
+            key: candidate.target.key.clone(),
+            sequence: Some(candidate.target.sequence),
+            version_row_id: Some(candidate.target.version_row_id.clone()),
+            multipart_created_at: None,
+            multipart_upload_id: None,
+        },
+        LifecycleCandidate::MultipartUpload(target) => LifecycleScanCursor {
+            source,
+            bucket: target.bucket.clone(),
+            key: target.key.clone(),
+            sequence: None,
+            version_row_id: None,
+            multipart_created_at: Some(target.initiated_at),
+            multipart_upload_id: Some(target.upload_id.clone()),
+        },
     }
 }
 
@@ -146,7 +214,7 @@ fn candidate_from_row(
             (None, 0)
         }
     };
-    Ok(LifecycleCandidate {
+    Ok(LifecycleCandidate::Version(VersionLifecycleCandidate {
         target: VersionTargetIdentity {
             bucket: row.bucket,
             key: row.key,
@@ -160,7 +228,7 @@ fn candidate_from_row(
         size,
         lifecycle_age_started_at: row.lifecycle_age_started_at,
         became_noncurrent_at: row.became_noncurrent_at,
-    })
+    }))
 }
 
 async fn source_page<C: ConnectionTrait>(
@@ -170,23 +238,53 @@ async fn source_page<C: ConnectionTrait>(
     cursor: Option<&LifecycleScanCursor>,
     limit: u64,
 ) -> AppResult<Vec<LifecycleCandidate>> {
-    let mut query = object_version::Entity::find()
-        .find_also_related(object::Entity)
-        .filter(object_version::Column::Bucket.eq(bucket))
-        .filter(object_version::Column::IsLatest.eq(source_filter(source)));
-    if let Some(cursor) = cursor {
-        query = query.filter(tuple_after(cursor));
+    match source {
+        LifecycleScanSource::Current | LifecycleScanSource::Noncurrent => {
+            let is_latest = source == LifecycleScanSource::Current;
+            let mut query = object_version::Entity::find()
+                .find_also_related(object::Entity)
+                .filter(object_version::Column::Bucket.eq(bucket))
+                .filter(object_version::Column::IsLatest.eq(is_latest));
+            if let Some(cursor) = cursor {
+                query = query.filter(version_tuple_after(cursor));
+            }
+            let rows = query
+                .order_by_asc(object_version::Column::Key)
+                .order_by_asc(object_version::Column::Sequence)
+                .order_by_asc(object_version::Column::Id)
+                .limit(limit)
+                .all(db)
+                .await?;
+            rows.into_iter()
+                .map(|(row, joined_object)| candidate_from_row(row, joined_object))
+                .collect()
+        }
+        LifecycleScanSource::Multipart => {
+            let mut query = multipart_upload::Entity::find()
+                .filter(multipart_upload::Column::Bucket.eq(bucket));
+            if let Some(cursor) = cursor {
+                query = query.filter(multipart_tuple_after(cursor));
+            }
+            let rows = query
+                .order_by_asc(multipart_upload::Column::Key)
+                .order_by_asc(multipart_upload::Column::CreatedAt)
+                .order_by_asc(multipart_upload::Column::UploadId)
+                .limit(limit)
+                .all(db)
+                .await?;
+            Ok(rows
+                .into_iter()
+                .map(|row| {
+                    LifecycleCandidate::MultipartUpload(MultipartUploadTargetIdentity {
+                        bucket: row.bucket,
+                        key: row.key,
+                        upload_id: row.upload_id,
+                        initiated_at: row.created_at,
+                    })
+                })
+                .collect())
+        }
     }
-    let rows = query
-        .order_by_asc(object_version::Column::Key)
-        .order_by_asc(object_version::Column::Sequence)
-        .order_by_asc(object_version::Column::Id)
-        .limit(limit)
-        .all(db)
-        .await?;
-    rows.into_iter()
-        .map(|(row, joined_object)| candidate_from_row(row, joined_object))
-        .collect()
 }
 
 async fn source_has_after<C: ConnectionTrait>(
@@ -195,13 +293,26 @@ async fn source_has_after<C: ConnectionTrait>(
     source: LifecycleScanSource,
     cursor: Option<&LifecycleScanCursor>,
 ) -> AppResult<bool> {
-    let mut query = object_version::Entity::find()
-        .filter(object_version::Column::Bucket.eq(bucket))
-        .filter(object_version::Column::IsLatest.eq(source_filter(source)));
-    if let Some(cursor) = cursor {
-        query = query.filter(tuple_after(cursor));
+    match source {
+        LifecycleScanSource::Current | LifecycleScanSource::Noncurrent => {
+            let is_latest = source == LifecycleScanSource::Current;
+            let mut query = object_version::Entity::find()
+                .filter(object_version::Column::Bucket.eq(bucket))
+                .filter(object_version::Column::IsLatest.eq(is_latest));
+            if let Some(cursor) = cursor {
+                query = query.filter(version_tuple_after(cursor));
+            }
+            Ok(query.one(db).await?.is_some())
+        }
+        LifecycleScanSource::Multipart => {
+            let mut query = multipart_upload::Entity::find()
+                .filter(multipart_upload::Column::Bucket.eq(bucket));
+            if let Some(cursor) = cursor {
+                query = query.filter(multipart_tuple_after(cursor));
+            }
+            Ok(query.one(db).await?.is_some())
+        }
     }
-    Ok(query.one(db).await?.is_some())
 }
 
 async fn source_exhausted_after<C: ConnectionTrait>(
@@ -239,65 +350,47 @@ pub async fn scan_candidate_page<C: ConnectionTrait>(
     let mut last_source = None;
     let mut cycle_complete = false;
 
-    if !matches!(
-        cursor.map(|cursor| &cursor.source),
-        Some(LifecycleScanSource::Noncurrent)
-    ) {
-        let current_cursor = cursor.filter(|cursor| cursor.source == LifecycleScanSource::Current);
-        let current = source_page(
-            db,
-            bucket,
-            LifecycleScanSource::Current,
-            current_cursor,
-            limit,
-        )
-        .await?;
-        let current_exhausted =
-            source_exhausted_after(db, bucket, LifecycleScanSource::Current, &current, limit)
-                .await?;
-        if !current.is_empty() {
-            last_source = Some(LifecycleScanSource::Current);
-        }
-        candidates.extend(current);
+    let sources = [
+        LifecycleScanSource::Current,
+        LifecycleScanSource::Noncurrent,
+        LifecycleScanSource::Multipart,
+    ];
+    let start_index = match cursor.map(|cursor| &cursor.source) {
+        None | Some(LifecycleScanSource::Current) => 0,
+        Some(LifecycleScanSource::Noncurrent) => 1,
+        Some(LifecycleScanSource::Multipart) => 2,
+    };
 
-        if current_exhausted {
-            let remaining = limit - candidates.len() as u64;
-            if remaining > 0 {
-                let noncurrent =
-                    source_page(db, bucket, LifecycleScanSource::Noncurrent, None, remaining)
-                        .await?;
-                cycle_complete = source_exhausted_after(
-                    db,
-                    bucket,
-                    LifecycleScanSource::Noncurrent,
-                    &noncurrent,
-                    remaining,
-                )
-                .await?;
-                if !noncurrent.is_empty() {
-                    last_source = Some(LifecycleScanSource::Noncurrent);
+    for (index, source) in sources.iter().enumerate().skip(start_index) {
+        let remaining = limit - candidates.len() as u64;
+        if remaining == 0 {
+            let mut later_source_has_candidates = false;
+            for later_source in sources.iter().skip(index) {
+                if source_has_after(db, bucket, later_source.clone(), None).await? {
+                    later_source_has_candidates = true;
+                    break;
                 }
-                candidates.extend(noncurrent);
-            } else {
-                cycle_complete =
-                    !source_has_after(db, bucket, LifecycleScanSource::Noncurrent, None).await?;
             }
+            cycle_complete = !later_source_has_candidates;
+            break;
         }
-    } else {
-        let noncurrent =
-            source_page(db, bucket, LifecycleScanSource::Noncurrent, cursor, limit).await?;
-        cycle_complete = source_exhausted_after(
-            db,
-            bucket,
-            LifecycleScanSource::Noncurrent,
-            &noncurrent,
-            limit,
-        )
-        .await?;
-        if !noncurrent.is_empty() {
-            last_source = Some(LifecycleScanSource::Noncurrent);
+
+        let source_cursor = cursor.filter(|cursor| cursor.source == *source);
+        let page = source_page(db, bucket, source.clone(), source_cursor, remaining).await?;
+        let exhausted =
+            source_exhausted_after(db, bucket, source.clone(), &page, remaining).await?;
+        if !page.is_empty() {
+            last_source = Some(source.clone());
         }
-        candidates.extend(noncurrent);
+        candidates.extend(page);
+
+        if !exhausted {
+            break;
+        }
+        if *source == LifecycleScanSource::Multipart {
+            cycle_complete = true;
+            break;
+        }
     }
 
     let next_cursor = match (last_source, candidates.last()) {
@@ -322,10 +415,10 @@ mod tests {
     use super::{decode_cursor, encode_cursor, scan_candidate_page};
     use crate::{
         error::AppError,
-        lifecycle::model::{LifecycleScanCursor, LifecycleScanSource},
+        lifecycle::model::{LifecycleCandidate, LifecycleScanCursor, LifecycleScanSource},
         store::{
             bucket,
-            entities::{object, object_version},
+            entities::{multipart_upload, object, object_version},
         },
     };
 
@@ -400,8 +493,339 @@ mod tests {
         .unwrap();
     }
 
+    async fn insert_upload(
+        db: &sea_orm::DatabaseConnection,
+        upload_id: &str,
+        bucket: &str,
+        key: &str,
+        created_at: chrono::DateTime<Utc>,
+    ) {
+        multipart_upload::Entity::insert(multipart_upload::ActiveModel {
+            upload_id: Set(upload_id.to_owned()),
+            object_id: Set(format!("object-{upload_id}")),
+            bucket: Set(bucket.to_owned()),
+            key: Set(key.to_owned()),
+            created_at: Set(created_at),
+            encryption_mode: Set("plain".to_owned()),
+            key_wrap: Set(None),
+            sse_c_key_fingerprint: Set(None),
+            content_type: Set(None),
+            metadata: Set(None),
+            tags_json: Set(serde_json::json!([])),
+            decompress_zip_target: Set(None),
+            decompress_zip_result: Set(false),
+        })
+        .exec(db)
+        .await
+        .unwrap();
+    }
+
+    fn encoded_json(value: &str) -> String {
+        URL_SAFE_NO_PAD.encode(value)
+    }
+
+    fn cursor_json(cursor: &LifecycleScanCursor) -> serde_json::Value {
+        let json = URL_SAFE_NO_PAD.decode(encode_cursor(cursor)).unwrap();
+        serde_json::from_slice(&json).unwrap()
+    }
+
+    fn cursor_signature(cursor: &LifecycleScanCursor) -> String {
+        let cursor = cursor_json(cursor);
+        let source = cursor["source"].as_str().unwrap();
+        let identity = match source {
+            "Current" | "Noncurrent" => cursor["version_row_id"].as_str().unwrap(),
+            "Multipart" => cursor["multipart_upload_id"].as_str().unwrap(),
+            source => panic!("unexpected lifecycle scan source {source}"),
+        };
+        format!("{source}:{identity}")
+    }
+
     fn opaque_version() -> String {
         uuid::Uuid::new_v4().to_string()
+    }
+
+    #[test]
+    fn lifecycle_scan_cursor_decodes_phase_a_and_rejects_mixed_multipart_shapes() {
+        let phase_a_json = r#"{"source":"Current","bucket":"bucket","key":"key","sequence":1,"version_row_id":"row"}"#;
+        let phase_a = decode_cursor(&encoded_json(phase_a_json), "bucket").unwrap();
+        let reencoded = URL_SAFE_NO_PAD.decode(encode_cursor(&phase_a)).unwrap();
+        assert_eq!(std::str::from_utf8(&reencoded).unwrap(), phase_a_json);
+
+        let phase_a_noncurrent = encoded_json(
+            r#"{"source":"Noncurrent","bucket":"bucket","key":"key","sequence":2,"version_row_id":"row-2"}"#,
+        );
+        assert!(decode_cursor(&phase_a_noncurrent, "bucket").is_ok());
+
+        let valid_multipart = encoded_json(
+            r#"{"source":"Multipart","bucket":"bucket","key":"key","multipart_created_at":"2026-09-01T00:00:00Z","multipart_upload_id":"upload-1"}"#,
+        );
+        let invalid = [
+            encoded_json(
+                r#"{"source":"Current","bucket":"bucket","key":"key","version_row_id":"row"}"#,
+            ),
+            encoded_json(r#"{"source":"Noncurrent","bucket":"bucket","key":"key","sequence":1}"#),
+            encoded_json(
+                r#"{"source":"Current","bucket":"bucket","key":"key","sequence":1,"version_row_id":"row","multipart_created_at":"2026-09-01T00:00:00Z","multipart_upload_id":"upload-1"}"#,
+            ),
+            encoded_json(
+                r#"{"source":"Multipart","bucket":"bucket","key":"key","multipart_upload_id":"upload-1"}"#,
+            ),
+            encoded_json(
+                r#"{"source":"Multipart","bucket":"bucket","key":"key","multipart_created_at":"2026-09-01T00:00:00Z"}"#,
+            ),
+            encoded_json(
+                r#"{"source":"Multipart","bucket":"bucket","key":"key","sequence":1,"version_row_id":"row","multipart_created_at":"2026-09-01T00:00:00Z","multipart_upload_id":"upload-1"}"#,
+            ),
+            encoded_json(
+                r#"{"source":"Multipart","bucket":"bucket","key":"","multipart_created_at":"2026-09-01T00:00:00Z","multipart_upload_id":"upload-1"}"#,
+            ),
+            encoded_json(
+                r#"{"source":"Multipart","bucket":"bucket","key":"key","multipart_created_at":"2026-09-01T00:00:00Z","multipart_upload_id":""}"#,
+            ),
+            encoded_json(
+                r#"{"source":"Multipart","bucket":"","key":"key","multipart_created_at":"2026-09-01T00:00:00Z","multipart_upload_id":"upload-1"}"#,
+            ),
+        ];
+        for invalid in invalid {
+            assert!(matches!(
+                decode_cursor(&invalid, "bucket"),
+                Err(AppError::InvalidArgument(_))
+            ));
+        }
+        assert!(matches!(
+            decode_cursor(&valid_multipart, "other"),
+            Err(AppError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            decode_cursor(&valid_multipart, ""),
+            Err(AppError::InvalidArgument(_))
+        ));
+        assert!(decode_cursor(&valid_multipart, "bucket").is_ok());
+    }
+
+    #[tokio::test]
+    async fn lifecycle_scan_pages_current_noncurrent_multipart_without_duplicates_or_loops() {
+        let db = setup().await;
+        insert_candidate(
+            &db,
+            "current-row",
+            "current-key",
+            1,
+            true,
+            Some("current-object"),
+            None,
+        )
+        .await;
+        insert_candidate(
+            &db,
+            "noncurrent-row",
+            "noncurrent-key",
+            2,
+            false,
+            Some("noncurrent-object"),
+            Some(opaque_version()),
+        )
+        .await;
+        insert_upload(&db, "active-upload", "bucket", "upload-key", timestamp(3)).await;
+        insert_upload(
+            &db,
+            "other-bucket-upload",
+            "other",
+            "other-key",
+            timestamp(4),
+        )
+        .await;
+        object::Entity::insert(object::ActiveModel {
+            id: Set("published-multipart".to_owned()),
+            bucket: Set("bucket".to_owned()),
+            key: Set("published-not-active".to_owned()),
+            cid: Set("cid-published-multipart".to_owned()),
+            size: Set(10),
+            content_type: Set(None),
+            etag: Set("cid-published-multipart".to_owned()),
+            metadata: Set(None),
+            encrypted: Set(false),
+            key_wrap: Set(None),
+            sse_c_key_fingerprint: Set(None),
+            multipart: Set(true),
+            is_latest: Set(true),
+            created_at: Set(timestamp(5)),
+        })
+        .exec(&db)
+        .await
+        .unwrap();
+
+        let mut cursor = None;
+        let mut signatures = Vec::new();
+        let mut cycle_complete = false;
+        for _ in 0..8 {
+            let page = scan_candidate_page(&db, "bucket", cursor.as_ref(), 1)
+                .await
+                .unwrap();
+            assert_eq!(page.candidates.len(), 1, "each bounded page must advance");
+            let next = page
+                .next_cursor
+                .expect("a nonempty lifecycle page must return a cursor");
+            signatures.push(cursor_signature(&next));
+            cycle_complete = page.cycle_complete;
+            cursor = Some(next);
+            if cycle_complete {
+                break;
+            }
+        }
+
+        assert!(cycle_complete, "bounded traversal must terminate");
+        assert_eq!(
+            signatures,
+            [
+                "Current:current-row",
+                "Noncurrent:noncurrent-row",
+                "Multipart:active-upload",
+            ]
+        );
+        assert_eq!(
+            signatures.len(),
+            signatures
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            "a source transition must not duplicate or loop"
+        );
+        let combined = scan_candidate_page(&db, "bucket", None, 3).await.unwrap();
+        assert!(combined.cycle_complete);
+        assert_eq!(combined.candidates.len(), 3);
+        assert!(
+            matches!(&combined.candidates[0], LifecycleCandidate::Version(candidate) if candidate.is_latest)
+        );
+        assert!(
+            matches!(&combined.candidates[1], LifecycleCandidate::Version(candidate) if !candidate.is_latest)
+        );
+        assert!(
+            matches!(&combined.candidates[2], LifecycleCandidate::MultipartUpload(target) if target.upload_id == "active-upload")
+        );
+    }
+
+    #[tokio::test]
+    async fn multipart_scan_uses_strict_key_created_upload_tuple_order() {
+        let db = setup().await;
+        let early = timestamp(1);
+        let middle = timestamp(2);
+        let late = timestamp(3);
+        insert_upload(&db, "upload-b", "bucket", "a-key", middle).await;
+        insert_upload(&db, "upload-a", "bucket", "a-key", middle).await;
+        insert_upload(&db, "upload-z", "bucket", "a-key", late).await;
+        insert_upload(&db, "upload-0", "bucket", "b-key", early).await;
+
+        let mut cursor = None;
+        let mut tuples = Vec::new();
+        let mut cycle_complete = false;
+        for _ in 0..8 {
+            let page = scan_candidate_page(&db, "bucket", cursor.as_ref(), 1)
+                .await
+                .unwrap();
+            assert_eq!(page.candidates.len(), 1, "each multipart page must advance");
+            let next = page
+                .next_cursor
+                .expect("a multipart candidate must produce a cursor");
+            let json = cursor_json(&next);
+            assert_eq!(json["source"], "Multipart");
+            tuples.push((
+                json["key"].as_str().unwrap().to_owned(),
+                json["multipart_created_at"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<chrono::DateTime<Utc>>()
+                    .unwrap(),
+                json["multipart_upload_id"].as_str().unwrap().to_owned(),
+            ));
+            cycle_complete = page.cycle_complete;
+            cursor = Some(next);
+            if cycle_complete {
+                break;
+            }
+        }
+
+        assert!(cycle_complete, "multipart traversal must terminate");
+        assert_eq!(
+            tuples,
+            [
+                ("a-key".to_owned(), middle, "upload-a".to_owned()),
+                ("a-key".to_owned(), middle, "upload-b".to_owned()),
+                ("a-key".to_owned(), late, "upload-z".to_owned()),
+                ("b-key".to_owned(), early, "upload-0".to_owned()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn multipart_cursor_race_defers_before_cursor_insert_until_fresh_cycle() {
+        let db = setup().await;
+        let initiated_at = timestamp(1);
+        insert_upload(&db, "upload-b", "bucket", "same-key", initiated_at).await;
+        insert_upload(&db, "upload-d", "bucket", "same-key", initiated_at).await;
+
+        let first = scan_candidate_page(&db, "bucket", None, 1).await.unwrap();
+        assert_eq!(first.candidates.len(), 1);
+        assert!(!first.cycle_complete);
+        let first_cursor = first.next_cursor.unwrap();
+        assert_eq!(cursor_signature(&first_cursor), "Multipart:upload-b");
+
+        insert_upload(&db, "upload-a", "bucket", "same-key", initiated_at).await;
+        insert_upload(&db, "upload-c", "bucket", "same-key", initiated_at).await;
+
+        let mut current_cycle = vec![cursor_signature(&first_cursor)];
+        let mut cursor = Some(first_cursor);
+        let mut cycle_complete = false;
+        for _ in 0..6 {
+            let page = scan_candidate_page(&db, "bucket", cursor.as_ref(), 1)
+                .await
+                .unwrap();
+            assert_eq!(page.candidates.len(), 1, "resumed scan must advance");
+            let next = page.next_cursor.unwrap();
+            current_cycle.push(cursor_signature(&next));
+            cycle_complete = page.cycle_complete;
+            cursor = Some(next);
+            if cycle_complete {
+                break;
+            }
+        }
+        assert!(cycle_complete);
+        assert_eq!(
+            current_cycle,
+            [
+                "Multipart:upload-b",
+                "Multipart:upload-c",
+                "Multipart:upload-d",
+            ],
+            "an insert before the stored cursor waits while one after it is visible"
+        );
+
+        let mut fresh_cycle = Vec::new();
+        let mut cursor = None;
+        let mut fresh_complete = false;
+        for _ in 0..8 {
+            let page = scan_candidate_page(&db, "bucket", cursor.as_ref(), 1)
+                .await
+                .unwrap();
+            assert_eq!(page.candidates.len(), 1, "fresh scan must advance");
+            let next = page.next_cursor.unwrap();
+            fresh_cycle.push(cursor_signature(&next));
+            fresh_complete = page.cycle_complete;
+            cursor = Some(next);
+            if fresh_complete {
+                break;
+            }
+        }
+        assert!(fresh_complete);
+        assert_eq!(
+            fresh_cycle,
+            [
+                "Multipart:upload-a",
+                "Multipart:upload-b",
+                "Multipart:upload-c",
+                "Multipart:upload-d",
+            ]
+        );
     }
 
     #[test]
@@ -410,8 +834,10 @@ mod tests {
             source: LifecycleScanSource::Current,
             bucket: "bucket".to_owned(),
             key: "a/key".to_owned(),
-            sequence: 7,
-            version_row_id: "version-row".to_owned(),
+            sequence: Some(7),
+            version_row_id: Some("version-row".to_owned()),
+            multipart_created_at: None,
+            multipart_upload_id: None,
         };
         let encoded = encode_cursor(&cursor);
         assert!(!encoded.contains('='));
@@ -509,11 +935,13 @@ mod tests {
             let page = scan_candidate_page(&db, "bucket", cursor.as_ref(), 1)
                 .await
                 .unwrap();
-            seen.extend(
-                page.candidates
-                    .iter()
-                    .map(|candidate| candidate.target.version_row_id.clone()),
-            );
+            seen.extend(page.candidates.iter().map(|candidate| {
+                let crate::lifecycle::model::LifecycleCandidate::Version(candidate) = candidate
+                else {
+                    panic!("version scan returned a multipart candidate");
+                };
+                candidate.target.version_row_id.clone()
+            }));
             cursor = page.next_cursor;
             if page.cycle_complete {
                 break;
@@ -535,8 +963,16 @@ mod tests {
             .unwrap()
             .candidates
             .into_iter()
-            .find(|candidate| candidate.target.version_row_id == "marker-noncurrent")
+            .find(|candidate| match candidate {
+                crate::lifecycle::model::LifecycleCandidate::Version(candidate) => {
+                    candidate.target.version_row_id == "marker-noncurrent"
+                }
+                crate::lifecycle::model::LifecycleCandidate::MultipartUpload(_) => false,
+            })
             .unwrap();
+        let crate::lifecycle::model::LifecycleCandidate::Version(marker) = marker else {
+            panic!("version scan returned a multipart candidate");
+        };
         assert_eq!(marker.size, 0);
         assert!(marker.target.object_id.is_none());
     }
@@ -566,7 +1002,12 @@ mod tests {
         .await;
 
         let first = scan_candidate_page(&db, "bucket", None, 1).await.unwrap();
-        assert_eq!(first.candidates[0].target.version_row_id, "before-cursor");
+        let crate::lifecycle::model::LifecycleCandidate::Version(first_candidate) =
+            &first.candidates[0]
+        else {
+            panic!("version scan returned a multipart candidate");
+        };
+        assert_eq!(first_candidate.target.version_row_id, "before-cursor");
         let cursor = first.next_cursor.unwrap();
 
         insert_candidate(
@@ -596,11 +1037,13 @@ mod tests {
             let page = scan_candidate_page(&db, "bucket", next.as_ref(), 1)
                 .await
                 .unwrap();
-            seen.extend(
-                page.candidates
-                    .iter()
-                    .map(|candidate| candidate.target.version_row_id.clone()),
-            );
+            seen.extend(page.candidates.iter().map(|candidate| {
+                let crate::lifecycle::model::LifecycleCandidate::Version(candidate) = candidate
+                else {
+                    panic!("version scan returned a multipart candidate");
+                };
+                candidate.target.version_row_id.clone()
+            }));
             next = page.next_cursor;
             if page.cycle_complete {
                 break;
@@ -613,12 +1056,12 @@ mod tests {
         );
 
         let fresh = scan_candidate_page(&db, "bucket", None, 10).await.unwrap();
-        assert!(
-            fresh
-                .candidates
-                .iter()
-                .any(|candidate| candidate.target.version_row_id == "new-before-cursor")
-        );
+        assert!(fresh.candidates.iter().any(|candidate| {
+            let crate::lifecycle::model::LifecycleCandidate::Version(candidate) = candidate else {
+                return false;
+            };
+            candidate.target.version_row_id == "new-before-cursor"
+        }));
     }
 
     #[tokio::test]

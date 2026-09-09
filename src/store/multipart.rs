@@ -1,7 +1,11 @@
 use crate::error::{AppError, AppResult};
+use crate::lifecycle::model::MultipartUploadTargetIdentity;
 use chrono::Utc;
 use sea_orm::sea_query::OnConflict;
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait, QueryFilter,
+    QueryOrder, QuerySelect, Set, TransactionError, TransactionTrait,
+};
 use serde_json::Value as JsonValue;
 
 use super::entities::{multipart_part, multipart_upload};
@@ -23,12 +27,13 @@ pub async fn create_upload<C: ConnectionTrait>(
     decompress_zip_target: Option<&str>,
     decompress_zip_result: bool,
 ) -> AppResult<()> {
+    let created_at = crate::store::database_clock::database_now(db).await?;
     let model = multipart_upload::ActiveModel {
         upload_id: Set(upload_id.to_owned()),
         object_id: Set(object_id.to_owned()),
         bucket: Set(bucket.to_owned()),
         key: Set(key.to_owned()),
-        created_at: Set(Utc::now()),
+        created_at: Set(created_at),
         encryption_mode: Set(encryption_mode.to_owned()),
         key_wrap: Set(key_wrap.map(|s| s.to_owned())),
         sse_c_key_fingerprint: Set(sse_c_key_fingerprint.map(|s| s.to_owned())),
@@ -85,28 +90,40 @@ pub async fn delete_upload<C: ConnectionTrait>(db: &C, upload_id: &str) -> AppRe
     Ok(())
 }
 
-/// Deletes exactly one upload owned by the expected object location.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AbortExactIncompleteUploadResult {
+    Applied,
+    AlreadySatisfied,
+    Stale,
+}
+
+/// Deletes an exact incomplete upload and lets the foreign key cascade remove its parts.
 ///
-/// The caller supplies the publication transaction, so the upload and its cascading parts are
-/// removed atomically with the completed object, tags, leases, targets, usage, and outbox rows.
-pub(crate) async fn delete_matching_upload_in_transaction<C: ConnectionTrait>(
-    db: &C,
-    upload_id: &str,
-    bucket: &str,
-    key: &str,
-) -> AppResult<()> {
-    let upload = get_upload(db, upload_id).await?;
-    if upload.bucket != bucket || upload.key != key {
-        return Err(AppError::NoSuchUpload(upload_id.to_owned()));
+/// The caller must already hold the ownership lock for `target.bucket` in `txn`.
+pub async fn abort_exact_incomplete_upload_in_transaction<C: ConnectionTrait>(
+    txn: &C,
+    target: &MultipartUploadTargetIdentity,
+) -> AppResult<AbortExactIncompleteUploadResult> {
+    let deleted = multipart_upload::Entity::delete_many()
+        .filter(multipart_upload::Column::UploadId.eq(&target.upload_id))
+        .filter(multipart_upload::Column::Bucket.eq(&target.bucket))
+        .filter(multipart_upload::Column::Key.eq(&target.key))
+        .filter(multipart_upload::Column::CreatedAt.eq(target.initiated_at))
+        .exec(txn)
+        .await?;
+    if deleted.rows_affected == 1 {
+        return Ok(AbortExactIncompleteUploadResult::Applied);
     }
 
-    let deleted = multipart_upload::Entity::delete_by_id(upload_id.to_owned())
-        .exec(db)
-        .await?;
-    if deleted.rows_affected != 1 {
-        return Err(AppError::NoSuchUpload(upload_id.to_owned()));
-    }
-    Ok(())
+    let upload_exists = multipart_upload::Entity::find_by_id(target.upload_id.clone())
+        .one(txn)
+        .await?
+        .is_some();
+    Ok(if upload_exists {
+        AbortExactIncompleteUploadResult::Stale
+    } else {
+        AbortExactIncompleteUploadResult::AlreadySatisfied
+    })
 }
 
 pub async fn upsert_part<C: ConnectionTrait>(
@@ -143,6 +160,51 @@ pub async fn upsert_part<C: ConnectionTrait>(
         .exec(db)
         .await?;
     Ok(())
+}
+
+pub async fn upsert_part_for_active_upload(
+    db: &DatabaseConnection,
+    target: &MultipartUploadTargetIdentity,
+    part_number: i32,
+    cid: &str,
+    size: i64,
+    etag: &str,
+) -> AppResult<()> {
+    let target = target.clone();
+    let cid = cid.to_owned();
+    let etag = etag.to_owned();
+    db.transaction(move |txn| {
+        Box::pin(async move {
+            crate::store::import::ownership::lock_bucket_for_ownership(txn, &target.bucket).await?;
+
+            let query = multipart_upload::Entity::find_by_id(target.upload_id.clone());
+            let upload = if txn.get_database_backend() == DatabaseBackend::Postgres {
+                query.lock_exclusive().one(txn).await?
+            } else {
+                query.one(txn).await?
+            };
+            let Some(upload) = upload else {
+                return Err(AppError::NoSuchUpload(target.upload_id.clone()));
+            };
+            if upload.bucket != target.bucket
+                || upload.key != target.key
+                || upload.created_at != target.initiated_at
+            {
+                return Err(AppError::NoSuchUpload(target.upload_id.clone()));
+            }
+
+            upsert_part(txn, &target.upload_id, part_number, &cid, size, &etag).await
+        })
+    })
+    .await
+    .map_err(transaction_error_into_app)
+}
+
+fn transaction_error_into_app(error: TransactionError<AppError>) -> AppError {
+    match error {
+        TransactionError::Transaction(error) => error,
+        TransactionError::Connection(error) => error.into(),
+    }
 }
 
 pub async fn list_parts<C: ConnectionTrait>(
@@ -226,7 +288,51 @@ pub(crate) fn classify_completion_attempt_state(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sea_orm::{ConnectionTrait, Database, DatabaseBackend, EntityTrait, Set, Statement};
+    use chrono::{DateTime, SecondsFormat};
+    use sea_orm::{
+        ConnectionTrait, Database, DatabaseBackend, DatabaseConnection, DbErr, EntityTrait,
+        ExecResult, QueryResult, Set, Statement, TransactionTrait,
+    };
+
+    use crate::lifecycle::model::MultipartUploadTargetIdentity;
+
+    struct ControlledClockConnection {
+        inner: DatabaseConnection,
+        now: DateTime<Utc>,
+    }
+
+    #[async_trait::async_trait]
+    impl ConnectionTrait for ControlledClockConnection {
+        fn get_database_backend(&self) -> DatabaseBackend {
+            self.inner.get_database_backend()
+        }
+
+        async fn execute(&self, statement: Statement) -> Result<ExecResult, DbErr> {
+            self.inner.execute(statement).await
+        }
+
+        async fn execute_unprepared(&self, sql: &str) -> Result<ExecResult, DbErr> {
+            self.inner.execute_unprepared(sql).await
+        }
+
+        async fn query_one(&self, statement: Statement) -> Result<Option<QueryResult>, DbErr> {
+            if statement.sql == "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now') AS now" {
+                let now = self.now.to_rfc3339_opts(SecondsFormat::Millis, true);
+                return self
+                    .inner
+                    .query_one(Statement::from_string(
+                        DatabaseBackend::Sqlite,
+                        format!("SELECT '{now}' AS now"),
+                    ))
+                    .await;
+            }
+            self.inner.query_one(statement).await
+        }
+
+        async fn query_all(&self, statement: Statement) -> Result<Vec<QueryResult>, DbErr> {
+            self.inner.query_all(statement).await
+        }
+    }
 
     fn completion_attempt(id: &str) -> crate::store::object::LatestObjectRow {
         crate::store::object::LatestObjectRow {
@@ -274,6 +380,215 @@ mod tests {
             .await
             .unwrap();
         db
+    }
+
+    async fn abort_with_bucket_lock(
+        db: &DatabaseConnection,
+        target: &MultipartUploadTargetIdentity,
+    ) -> AbortExactIncompleteUploadResult {
+        let transaction = db.begin().await.unwrap();
+        crate::store::import::ownership::lock_bucket_for_ownership(&transaction, &target.bucket)
+            .await
+            .unwrap();
+        let result = abort_exact_incomplete_upload_in_transaction(&transaction, target)
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn create_upload_uses_database_clock_and_parts_do_not_reset_it() {
+        let db = setup().await;
+        let database_time = DateTime::parse_from_rfc3339("2041-02-03T04:05:06.789Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let controlled = ControlledClockConnection {
+            inner: db.clone(),
+            now: database_time,
+        };
+
+        create_upload(
+            &controlled,
+            "clock-upload",
+            "clock-object",
+            "test-bucket",
+            "clock.bin",
+            "none",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        let upload = get_upload(&db, "clock-upload").await.unwrap();
+        assert_eq!(upload.created_at, database_time);
+        let target = MultipartUploadTargetIdentity {
+            bucket: upload.bucket,
+            key: upload.key,
+            upload_id: upload.upload_id,
+            initiated_at: upload.created_at,
+        };
+
+        upsert_part_for_active_upload(&db, &target, 1, "QmFirst", 3, "QmFirst")
+            .await
+            .unwrap();
+        upsert_part_for_active_upload(&db, &target, 1, "QmReplacement", 7, "QmReplacement")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            get_upload(&db, "clock-upload").await.unwrap().created_at,
+            database_time
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_exact_upload_applies_cascades_and_distinguishes_missing_from_stale() {
+        let db = setup().await;
+        crate::store::bucket::create(&db, "other-bucket", None)
+            .await
+            .unwrap();
+        seed_upload_and_part(&db).await;
+        let upload = get_upload(&db, "upload-1").await.unwrap();
+        let target = MultipartUploadTargetIdentity {
+            bucket: upload.bucket,
+            key: upload.key,
+            upload_id: upload.upload_id,
+            initiated_at: upload.created_at,
+        };
+
+        let mut missing = target.clone();
+        missing.upload_id = "missing-upload".to_owned();
+        assert_eq!(
+            abort_with_bucket_lock(&db, &missing).await,
+            AbortExactIncompleteUploadResult::AlreadySatisfied
+        );
+
+        let mut wrong_bucket = target.clone();
+        wrong_bucket.bucket = "other-bucket".to_owned();
+        let mut wrong_key = target.clone();
+        wrong_key.key = "other-key".to_owned();
+        let mut wrong_initiated_at = target.clone();
+        wrong_initiated_at.initiated_at += chrono::Duration::seconds(1);
+        for stale in [wrong_bucket, wrong_key, wrong_initiated_at] {
+            assert_eq!(
+                abort_with_bucket_lock(&db, &stale).await,
+                AbortExactIncompleteUploadResult::Stale
+            );
+            assert!(get_upload(&db, "upload-1").await.is_ok());
+            assert_eq!(list_parts(&db, "upload-1").await.unwrap().len(), 1);
+        }
+
+        assert_eq!(
+            abort_with_bucket_lock(&db, &target).await,
+            AbortExactIncompleteUploadResult::Applied
+        );
+        assert!(matches!(
+            get_upload(&db, "upload-1").await,
+            Err(AppError::NoSuchUpload(_))
+        ));
+        assert!(list_parts(&db, "upload-1").await.unwrap().is_empty());
+        assert_eq!(
+            abort_with_bucket_lock(&db, &target).await,
+            AbortExactIncompleteUploadResult::AlreadySatisfied
+        );
+    }
+
+    #[tokio::test]
+    async fn late_store_part_after_abort_fails_without_resurrecting_upload() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("multipart-late-part.sqlite");
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            database_path.display().to_string().replace('\\', "/")
+        );
+        let first = crate::store::connect_database(&database_url).await.unwrap();
+        first
+            .execute_unprepared("PRAGMA foreign_keys = ON")
+            .await
+            .unwrap();
+        crate::store::run_migrations(&first).await.unwrap();
+        crate::store::bucket::create(&first, "test-bucket", None)
+            .await
+            .unwrap();
+        let second = crate::store::connect_database(&database_url).await.unwrap();
+        second
+            .execute_unprepared("PRAGMA foreign_keys = ON")
+            .await
+            .unwrap();
+        create_upload(
+            &first,
+            "late-part-upload",
+            "late-part-object",
+            "test-bucket",
+            "late.bin",
+            "none",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        let upload = get_upload(&first, "late-part-upload").await.unwrap();
+        let target = MultipartUploadTargetIdentity {
+            bucket: upload.bucket,
+            key: upload.key,
+            upload_id: upload.upload_id,
+            initiated_at: upload.created_at,
+        };
+        let abort_transaction = first.begin().await.unwrap();
+        crate::store::import::ownership::lock_bucket_for_ownership(
+            &abort_transaction,
+            &target.bucket,
+        )
+        .await
+        .unwrap();
+
+        let late_target = target.clone();
+        let late_part = tokio::spawn(async move {
+            upsert_part_for_active_upload(&second, &late_target, 1, "QmLate", 4, "QmLate").await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !late_part.is_finished(),
+            "late part must wait for the abort bucket lock"
+        );
+
+        assert_eq!(
+            abort_exact_incomplete_upload_in_transaction(&abort_transaction, &target)
+                .await
+                .unwrap(),
+            AbortExactIncompleteUploadResult::Applied
+        );
+        abort_transaction.commit().await.unwrap();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(10), late_part)
+            .await
+            .expect("late part must observe the committed abort")
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::NoSuchUpload(ref upload_id) if upload_id == "late-part-upload"
+        ));
+        assert!(matches!(
+            get_upload(&first, "late-part-upload").await,
+            Err(AppError::NoSuchUpload(_))
+        ));
+        assert!(
+            list_parts(&first, "late-part-upload")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

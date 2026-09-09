@@ -5,8 +5,10 @@ use std::time::SystemTime;
 use futures_util::StreamExt;
 use s3s::dto::*;
 use s3s::{S3Request, S3Response, S3Result};
+use sea_orm::TransactionTrait;
 
 use crate::crypto::EncryptionMode;
+use crate::lifecycle::model::MultipartUploadTargetIdentity;
 use crate::pinning::config::ProviderLimitMap;
 use crate::pinning::policy::{PublicationContext, PublicationPolicy};
 use crate::pinning::tags::ObjectTag;
@@ -321,6 +323,12 @@ pub async fn upload_part(
             "bucket/key mismatch for upload_id"
         ));
     }
+    let upload_target = MultipartUploadTargetIdentity {
+        bucket: upload.bucket.clone(),
+        key: upload.key.clone(),
+        upload_id: upload.upload_id.clone(),
+        initiated_at: upload.created_at,
+    };
 
     let enc_mode = EncryptionMode::parse(&upload.encryption_mode);
     let sse_c_key = match enc_mode {
@@ -371,7 +379,15 @@ pub async fn upload_part(
 
     crate::kubo::pin::pin_add(&state.kubo, &cid).await?;
 
-    crate::store::multipart::upsert_part(db, upload_id, part_number, &cid, part_size, &cid).await?;
+    crate::store::multipart::upsert_part_for_active_upload(
+        db,
+        &upload_target,
+        part_number,
+        &cid,
+        part_size,
+        &cid,
+    )
+    .await?;
 
     let server_side_encryption = if enc_mode == EncryptionMode::SseS3 {
         Some(ServerSideEncryption::from_static("AES256"))
@@ -393,6 +409,7 @@ pub struct CompletedMultipartArchive {
     pub bucket: String,
     pub key: String,
     pub upload_id: String,
+    pub upload_target: MultipartUploadTargetIdentity,
     pub encryption_object_id: String,
     pub completion_attempt_id: String,
     pub root_cid: String,
@@ -412,7 +429,7 @@ pub struct CompletedMultipartArchive {
 pub(crate) trait CompletedUploadFinalizerStore: Send + Sync {
     async fn commit_object(
         &self,
-        upload_id: &str,
+        upload_target: &MultipartUploadTargetIdentity,
         request: PublicationRequest,
         guard: crate::store::import::ownership::StandardMutationGuard,
         limits: &ProviderLimitMap,
@@ -420,7 +437,7 @@ pub(crate) trait CompletedUploadFinalizerStore: Send + Sync {
 
     async fn commit_zip(
         &self,
-        upload_id: &str,
+        upload_target: &MultipartUploadTargetIdentity,
         request: ZipPublicationRequest,
         guard: crate::store::import::ownership::StandardMutationGuard,
         limits: &ProviderLimitMap,
@@ -441,26 +458,34 @@ struct DatabaseCompletedUploadFinalizer<'a> {
 impl CompletedUploadFinalizerStore for DatabaseCompletedUploadFinalizer<'_> {
     async fn commit_object(
         &self,
-        upload_id: &str,
+        upload_target: &MultipartUploadTargetIdentity,
         request: PublicationRequest,
         guard: crate::store::import::ownership::StandardMutationGuard,
         limits: &ProviderLimitMap,
     ) -> Result<PublicationResult, crate::store::multipart::CommitCompletedUploadError> {
         crate::store::pinning::publication::publish_standard_completed_upload(
-            self.db, upload_id, request, guard, limits,
+            self.db,
+            upload_target,
+            request,
+            guard,
+            limits,
         )
         .await
     }
 
     async fn commit_zip(
         &self,
-        upload_id: &str,
+        upload_target: &MultipartUploadTargetIdentity,
         request: ZipPublicationRequest,
         guard: crate::store::import::ownership::StandardMutationGuard,
         limits: &ProviderLimitMap,
     ) -> Result<PublicationResult, crate::store::multipart::CommitCompletedUploadError> {
         crate::store::pinning::publication::publish_standard_completed_zip(
-            self.db, upload_id, request, guard, limits,
+            self.db,
+            upload_target,
+            request,
+            guard,
+            limits,
         )
         .await
     }
@@ -539,7 +564,7 @@ pub(crate) async fn finalize_completed_multipart_zip_with_store<
 
     match store
         .commit_zip(
-            &completed.upload_id,
+            &completed.upload_target,
             request,
             completed.mutation_guard.clone(),
             limits,
@@ -627,7 +652,7 @@ async fn finalize_completed_multipart_archive_with_store<
 
     match store
         .commit_object(
-            &completed.upload_id,
+            &completed.upload_target,
             request,
             completed.mutation_guard.clone(),
             limits,
@@ -745,6 +770,12 @@ pub async fn complete_multipart_upload_inner(
 
     let upload = crate::store::multipart::get_upload(db, upload_id).await?;
     let encryption_object_id = upload.object_id.clone();
+    let upload_target = MultipartUploadTargetIdentity {
+        bucket: upload.bucket.clone(),
+        key: upload.key.clone(),
+        upload_id: upload.upload_id.clone(),
+        initiated_at: upload.created_at,
+    };
 
     if upload.bucket != *bucket || upload.key != *key {
         return Err(s3s::s3_error!(
@@ -988,6 +1019,7 @@ pub async fn complete_multipart_upload_inner(
         bucket: bucket.clone(),
         key: key.clone(),
         upload_id: upload_id.clone(),
+        upload_target,
         encryption_object_id,
         completion_attempt_id,
         root_cid,
@@ -1014,17 +1046,29 @@ pub async fn abort_multipart_upload(
     let upload_id = &req.input.upload_id;
     let db = state.store.db();
 
-    // Verify bucket/key match the upload record.
-    let upload = crate::store::multipart::get_upload(db, upload_id).await?;
+    let txn = db.begin().await.map_err(crate::error::AppError::from)?;
+    crate::store::import::ownership::lock_bucket_for_ownership(&txn, bucket).await?;
+    let upload = crate::store::multipart::get_upload(&txn, upload_id).await?;
     if upload.bucket != *bucket || upload.key != *key {
-        return Err(s3s::s3_error!(
-            InvalidArgument,
-            "bucket/key mismatch for upload_id"
-        ));
+        return Err(crate::error::AppError::NoSuchUpload(upload_id.clone()).into());
     }
-
-    // Delete the upload record; ON DELETE CASCADE removes parts.
-    crate::store::multipart::delete_upload(db, upload_id).await?;
+    let target = MultipartUploadTargetIdentity {
+        bucket: upload.bucket,
+        key: upload.key,
+        upload_id: upload.upload_id,
+        initiated_at: upload.created_at,
+    };
+    use crate::store::multipart::AbortExactIncompleteUploadResult;
+    match crate::store::multipart::abort_exact_incomplete_upload_in_transaction(&txn, &target)
+        .await?
+    {
+        AbortExactIncompleteUploadResult::Applied => {}
+        AbortExactIncompleteUploadResult::AlreadySatisfied
+        | AbortExactIncompleteUploadResult::Stale => {
+            return Err(crate::error::AppError::NoSuchUpload(upload_id.clone()).into());
+        }
+    }
+    txn.commit().await.map_err(crate::error::AppError::from)?;
 
     Ok(S3Response::new(AbortMultipartUploadOutput::default()))
 }
@@ -1106,8 +1150,20 @@ mod tests {
         reconcile: FakeReconcileResult,
         commit_calls: AtomicUsize,
         reconcile_calls: AtomicUsize,
-        committed_requests: Mutex<Vec<(String, PublicationRequest, ProviderLimitMap)>>,
-        committed_zip_requests: Mutex<Vec<(String, ZipPublicationRequest, ProviderLimitMap)>>,
+        committed_requests: Mutex<
+            Vec<(
+                MultipartUploadTargetIdentity,
+                PublicationRequest,
+                ProviderLimitMap,
+            )>,
+        >,
+        committed_zip_requests: Mutex<
+            Vec<(
+                MultipartUploadTargetIdentity,
+                ZipPublicationRequest,
+                ProviderLimitMap,
+            )>,
+        >,
         reconciled_archives: Mutex<Vec<(String, PublicationObject)>>,
     }
 
@@ -1136,7 +1192,7 @@ mod tests {
     impl CompletedUploadFinalizerStore for FakeFinalizerStore {
         async fn commit_object(
             &self,
-            upload_id: &str,
+            upload_target: &MultipartUploadTargetIdentity,
             request: PublicationRequest,
             _guard: crate::store::import::ownership::StandardMutationGuard,
             limits: &ProviderLimitMap,
@@ -1144,7 +1200,7 @@ mod tests {
         {
             self.commit_calls.fetch_add(1, Ordering::SeqCst);
             self.committed_requests.lock().unwrap().push((
-                upload_id.to_owned(),
+                upload_target.clone(),
                 request.clone(),
                 limits.clone(),
             ));
@@ -1205,7 +1261,7 @@ mod tests {
 
         async fn commit_zip(
             &self,
-            upload_id: &str,
+            upload_target: &MultipartUploadTargetIdentity,
             request: ZipPublicationRequest,
             _guard: crate::store::import::ownership::StandardMutationGuard,
             limits: &ProviderLimitMap,
@@ -1213,7 +1269,7 @@ mod tests {
         {
             self.commit_calls.fetch_add(1, Ordering::SeqCst);
             self.committed_zip_requests.lock().unwrap().push((
-                upload_id.to_owned(),
+                upload_target.clone(),
                 request.clone(),
                 limits.clone(),
             ));
@@ -1244,7 +1300,7 @@ mod tests {
     impl CompletedUploadFinalizerStore for BlockingUnknownFinalizerStore {
         async fn commit_object(
             &self,
-            _upload_id: &str,
+            _upload_target: &MultipartUploadTargetIdentity,
             request: PublicationRequest,
             _guard: crate::store::import::ownership::StandardMutationGuard,
             _limits: &ProviderLimitMap,
@@ -1284,7 +1340,7 @@ mod tests {
 
         async fn commit_zip(
             &self,
-            _upload_id: &str,
+            _upload_target: &MultipartUploadTargetIdentity,
             request: ZipPublicationRequest,
             _guard: crate::store::import::ownership::StandardMutationGuard,
             _limits: &ProviderLimitMap,
@@ -1609,6 +1665,148 @@ mod tests {
         }
     }
 
+    async fn independent_multipart_connection(
+        directory: &tempfile::TempDir,
+    ) -> sea_orm::DatabaseConnection {
+        let path = directory.path().join("multipart-concurrency.sqlite");
+        let mut options = sea_orm::ConnectOptions::new(format!(
+            "sqlite://{}?mode=rwc",
+            path.display().to_string().replace('\\', "/")
+        ));
+        options.max_connections(1).min_connections(1);
+        sea_orm::Database::connect(options).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn explicit_abort_is_bucket_locked_and_maps_missing_or_mismatch_to_no_such_upload() {
+        let kubo = MockServer::start().await;
+        let directory = tempfile::tempdir().unwrap();
+        let state =
+            file_backed_test_state_with_bucket_and_kubo("test-bucket", kubo.uri(), &directory)
+                .await;
+        let other = independent_multipart_connection(&directory).await;
+        seed_plain_upload(&state, "upload-1").await;
+        crate::store::bucket::create(&other, "other-bucket", None)
+            .await
+            .unwrap();
+
+        for (id, bucket, key) in [
+            ("absent", "test-bucket", "archive.zip"),
+            ("upload-1", "other-bucket", "archive.zip"),
+            ("upload-1", "test-bucket", "other.zip"),
+        ] {
+            let mut request = abort_request(id);
+            request.input.bucket = bucket.to_owned();
+            request.input.key = key.to_owned();
+            let error = abort_multipart_upload(&state, request).await.unwrap_err();
+            assert_eq!(error.code().as_str(), "NoSuchUpload");
+        }
+
+        let txn = other.begin().await.unwrap();
+        crate::store::import::ownership::lock_bucket_for_ownership(&txn, "test-bucket")
+            .await
+            .unwrap();
+        crate::store::entities::multipart_upload::Entity::update_many()
+            .col_expr(
+                crate::store::entities::multipart_upload::Column::Key,
+                sea_orm::sea_query::Expr::value("changed.zip"),
+            )
+            .filter(crate::store::entities::multipart_upload::Column::UploadId.eq("upload-1"))
+            .exec(&txn)
+            .await
+            .unwrap();
+        let abort = abort_multipart_upload(&state, abort_request("upload-1"));
+        tokio::pin!(abort);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut abort)
+                .await
+                .is_err()
+        );
+        txn.commit().await.unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(5), abort)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code().as_str(), "NoSuchUpload");
+        assert_eq!(
+            crate::store::multipart::get_upload(&other, "upload-1")
+                .await
+                .unwrap()
+                .key,
+            "changed.zip"
+        );
+        assert!(kubo.received_requests().await.unwrap().is_empty());
+        other.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn upload_part_after_abort_returns_no_such_upload_without_resurrection() {
+        let kubo = multipart_kubo(&["QmLatePart"]).await;
+        let directory = tempfile::tempdir().unwrap();
+        let state =
+            file_backed_test_state_with_bucket_and_kubo("test-bucket", kubo.uri(), &directory)
+                .await;
+        let other = independent_multipart_connection(&directory).await;
+        seed_plain_upload(&state, "upload-1").await;
+        let upload = crate::store::multipart::get_upload(&other, "upload-1")
+            .await
+            .unwrap();
+        let target = crate::lifecycle::model::MultipartUploadTargetIdentity {
+            bucket: upload.bucket,
+            key: upload.key,
+            upload_id: upload.upload_id,
+            initiated_at: upload.created_at,
+        };
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (resume_tx, resume_rx) = oneshot::channel();
+        let body = async_stream::stream! {
+            entered_tx.send(()).unwrap();
+            resume_rx.await.unwrap();
+            yield Ok::<_, std::io::Error>(Bytes::from_static(b"late part"));
+        };
+        let mut request = upload_part_request("upload-1", b"");
+        request.input.body = Some(StreamingBlob::wrap(body));
+        let part = tokio::spawn({
+            let state = state.clone();
+            async move { upload_part(&state, request).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let txn = other.begin().await.unwrap();
+        crate::store::import::ownership::lock_bucket_for_ownership(&txn, "test-bucket")
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::store::multipart::abort_exact_incomplete_upload_in_transaction(&txn, &target,)
+                .await
+                .unwrap(),
+            crate::store::multipart::AbortExactIncompleteUploadResult::Applied
+        );
+        txn.commit().await.unwrap();
+        resume_tx.send(()).unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(5), part)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code().as_str(), "NoSuchUpload");
+        assert!(matches!(
+            crate::store::multipart::get_upload(&other, "upload-1").await,
+            Err(crate::error::AppError::NoSuchUpload(_))
+        ));
+        assert!(
+            crate::store::multipart::list_parts(&other, "upload-1")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_pin_add_count(&kubo, "QmLatePart", 1).await;
+        assert_no_pin_removes(&kubo, &["QmLatePart"]).await;
+        other.close().await.unwrap();
+    }
+
     fn get_object_request(key: &str) -> S3Request<GetObjectInput> {
         S3Request {
             input: GetObjectInput {
@@ -1690,6 +1888,12 @@ mod tests {
             bucket: "test-bucket".to_owned(),
             key: "archive.zip".to_owned(),
             upload_id: "upload-1".to_owned(),
+            upload_target: MultipartUploadTargetIdentity {
+                bucket: "test-bucket".to_owned(),
+                key: "archive.zip".to_owned(),
+                upload_id: "upload-1".to_owned(),
+                initiated_at: chrono::Utc::now(),
+            },
             encryption_object_id: "encryption-object-1".to_owned(),
             completion_attempt_id: completion_attempt_id.to_owned(),
             root_cid: "QmRoot".to_owned(),
@@ -1775,7 +1979,7 @@ mod tests {
             assert!(store.committed_requests.lock().unwrap().is_empty());
             let zip_requests = store.committed_zip_requests.lock().unwrap();
             assert_eq!(zip_requests.len(), 1);
-            assert_eq!(zip_requests[0].0, "upload-1");
+            assert_eq!(zip_requests[0].0, completed.upload_target);
             assert_eq!(zip_requests[0].1.archive.object.id, "completion-attempt-1");
             drop(zip_requests);
             let reconciled = store.reconciled_archives.lock().unwrap();
@@ -2799,7 +3003,7 @@ mod tests {
         {
             let requests = store.committed_requests.lock().unwrap();
             assert_eq!(requests.len(), 1);
-            assert_eq!(requests[0].0, "upload-1");
+            assert_eq!(requests[0].0, archive.upload_target);
             assert_eq!(requests[0].1.object.id, "attempt-1");
             assert_eq!(requests[0].1.object.bucket, archive.bucket);
             assert_eq!(requests[0].1.object.key, archive.key);
@@ -3112,6 +3316,11 @@ mod tests {
         reconcile_rx.await.unwrap();
 
         let mut archive_b = completed_archive("attempt-b");
+        archive_b.upload_target.initiated_at =
+            crate::store::multipart::get_upload(state.store.db(), "upload-1")
+                .await
+                .unwrap()
+                .created_at;
         archive_b.mutation_guard = crate::store::import::ownership::admit_content_mutation(
             state.store.db(),
             &archive_b.bucket,

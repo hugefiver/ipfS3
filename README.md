@@ -347,9 +347,20 @@ revalidation, and version-aware ownership guards make execution safe across
 multiple gateway replicas. Lifecycle deletion retains Kubo pins and never
 calls `pin/rm`.
 
-`Transition`, `NoncurrentVersionTransition`, and
-`AbortIncompleteMultipartUpload` are not supported; a configuration
-containing any unsupported action is rejected as a whole.
+`AbortIncompleteMultipartUpload` is supported with all-objects or prefix selectors.
+`DaysAfterInitiation=N` becomes due at the next UTC midnight after N full days
+from initiation, using the database UTC clock; uploading parts does not reset it.
+Lifecycle aborts are durable, bucket-locked actions safe across gateway
+replicas; an explicit abort of an absent upload still returns `NoSuchUpload`,
+while a lifecycle action observing the same absence succeeds idempotently.
+Aborted CID pins are retained; no lifecycle path calls `pin/rm`.
+Abort response headers (`x-amz-abort-date`, `x-amz-abort-rule-id`) and
+`ListMultipartUploads` are not implemented.
+PG17 runner (requires two gateways, a load balancer, and Kubo endpoints):
+`pwsh tests/run-postgres-lifecycle-validation.ps1 -PostgresUrl <url>`
+See [validation evidence](tests/results/postgres-lifecycle-validation/) for run status.
+`Transition` and `NoncurrentVersionTransition` remain unsupported; configurations
+containing unsupported actions are rejected as a whole.
 
 ## Bucket CORS
 

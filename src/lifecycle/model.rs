@@ -14,6 +14,8 @@ pub struct CanonicalLifecycleRule {
     pub selector: CanonicalRuleSelector,
     pub expiration: Option<CurrentExpiration>,
     pub noncurrent_version_expiration: Option<NoncurrentExpiration>,
+    #[serde(default)]
+    pub abort_incomplete_multipart_upload: Option<AbortIncompleteMultipartUploadAction>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -74,6 +76,11 @@ pub struct NoncurrentExpiration {
     pub newer_noncurrent_versions: Option<u16>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AbortIncompleteMultipartUploadAction {
+    pub days_after_initiation: u32,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuleIdentity {
     Id(String),
@@ -85,6 +92,7 @@ pub enum LifecycleActionKind {
     ExpireCurrent,
     ExpireNoncurrent,
     DeleteExpiredMarker,
+    AbortIncompleteMultipartUpload,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -98,13 +106,33 @@ pub struct VersionTargetIdentity {
     pub sequence: i64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultipartUploadTargetIdentity {
+    pub bucket: String,
+    pub key: String,
+    pub upload_id: String,
+    pub initiated_at: DateTime<Utc>,
+}
+
 #[derive(Clone, Debug)]
-pub struct LifecycleCandidate {
+pub struct VersionLifecycleCandidate {
     pub target: VersionTargetIdentity,
     pub is_latest: bool,
     pub size: i64,
     pub lifecycle_age_started_at: DateTime<Utc>,
     pub became_noncurrent_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug)]
+pub enum LifecycleCandidate {
+    Version(VersionLifecycleCandidate),
+    MultipartUpload(MultipartUploadTargetIdentity),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LifecycleTargetIdentity {
+    Version(VersionTargetIdentity),
+    MultipartUpload(MultipartUploadTargetIdentity),
 }
 
 #[derive(Clone, Debug)]
@@ -118,6 +146,7 @@ pub struct LifecycleCandidatePage {
 pub enum LifecycleScanSource {
     Current,
     Noncurrent,
+    Multipart,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -125,8 +154,10 @@ pub struct LifecycleScanCursor {
     pub source: LifecycleScanSource,
     pub bucket: String,
     pub key: String,
-    pub sequence: i64,
-    pub version_row_id: String,
+    pub sequence: Option<i64>,
+    pub version_row_id: Option<String>,
+    pub multipart_created_at: Option<DateTime<Utc>>,
+    pub multipart_upload_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -147,7 +178,7 @@ pub struct NewLifecycleAction {
     pub config_revision: i64,
     pub rule_identity: RuleIdentity,
     pub action_kind: LifecycleActionKind,
-    pub target: VersionTargetIdentity,
+    pub target: LifecycleTargetIdentity,
     pub due_at: DateTime<Utc>,
 }
 
