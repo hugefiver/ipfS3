@@ -1,7 +1,7 @@
 use axum::extract::Request;
 use axum::middleware::Next;
 use axum::response::Response;
-use http::header::{CONTENT_LENGTH, TRANSFER_ENCODING};
+use http::header::CONTENT_LENGTH;
 
 /// Supplies s3s with the signed decoded length for a chunked request.
 ///
@@ -10,18 +10,17 @@ use http::header::{CONTENT_LENGTH, TRANSFER_ENCODING};
 /// `x-amz-decoded-content-length` is part of the signed request and describes
 /// the decoded body without changing the observed wire framing.
 pub async fn bridge_chunked_content_length(mut request: Request, next: Next) -> Response {
-    let is_chunked = request
-        .headers()
-        .get(TRANSFER_ENCODING)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            value
-                .split(',')
-                .any(|encoding| encoding.trim().eq_ignore_ascii_case("chunked"))
-        });
+    // let is_chunked = request
+    //     .headers()
+    //     .get(TRANSFER_ENCODING)
+    //     .and_then(|value| value.to_str().ok())
+    //     .is_some_and(|value| {
+    //         value
+    //             .split(',')
+    //             .any(|encoding| encoding.trim().eq_ignore_ascii_case("chunked"))
+    //     });
 
-    if is_chunked
-        && !request.headers().contains_key(CONTENT_LENGTH)
+    if !request.headers().contains_key(CONTENT_LENGTH)
         && let Some(length) = request
             .headers()
             .get("x-amz-decoded-content-length")
