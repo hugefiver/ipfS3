@@ -12,9 +12,9 @@ use crate::pinning::{
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_FAILURE_REASON_CHARS: usize = 256;
 const MAX_SUCCESS_RESPONSE_BYTES: usize = 1024 * 1024;
 
+#[derive(Clone)]
 pub struct PsaClient {
     name: String,
     base_url: Result<Url, ()>,
@@ -25,6 +25,7 @@ pub struct PsaClient {
 impl PsaClient {
     pub fn new(name: String, endpoint: String, token: SecretToken) -> Self {
         let http = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(DEFAULT_TIMEOUT)
             .build()
             .expect("default PSA HTTP client must build");
@@ -88,7 +89,7 @@ impl PsaClient {
             .map_err(|error| self.transport_error(operation, &error))
     }
 
-    fn require_success(
+    async fn require_success(
         &self,
         response: Response,
         operation: Operation,
@@ -100,13 +101,14 @@ impl PsaClient {
         let status = response.status();
         let retry_after = parse_retry_after(response.headers());
         let class = match status.as_u16() {
-            401 | 403 => ProviderErrorClass::Authentication,
+            401 => ProviderErrorClass::Authentication,
+            403 => super::provider::classify_forbidden_response(response, DEFAULT_TIMEOUT).await,
             404 if operation == Operation::Get => ProviderErrorClass::NotFound,
             409 if operation == Operation::Submit => ProviderErrorClass::Ambiguous,
             429 => ProviderErrorClass::RateLimited,
             507 => ProviderErrorClass::Quota,
             _ if status.is_server_error() => ProviderErrorClass::Transient,
-            _ if status.is_client_error() => ProviderErrorClass::Terminal,
+            _ if status.is_client_error() => ProviderErrorClass::InvalidInput,
             _ => ProviderErrorClass::Protocol,
         };
         Err(ProviderError {
@@ -212,7 +214,9 @@ impl PsaClient {
             return None;
         }
 
-        Some(reason.chars().take(MAX_FAILURE_REASON_CHARS).collect())
+        // Arbitrary provider text can contain credentials unrelated to this
+        // account's bearer token; truncation/token replacement is not redaction.
+        Some("provider reported pin failure".to_owned())
     }
 
     fn transport_error(&self, operation: Operation, error: &reqwest::Error) -> ProviderError {
@@ -258,6 +262,10 @@ impl PsaClient {
 
 #[async_trait::async_trait]
 impl PinningProvider for PsaClient {
+    fn invocation_route(&self) -> (&'static str, &'static str) {
+        ("psa", "cid")
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -275,7 +283,7 @@ impl PinningProvider for PsaClient {
             .await?;
         let status = self
             .decode_status(
-                self.require_success(response, Operation::Submit)?,
+                self.require_success(response, Operation::Submit).await?,
                 Operation::Submit,
             )
             .await?;
@@ -291,7 +299,7 @@ impl PinningProvider for PsaClient {
         let response = self.execute(self.http.get(url), Operation::Get).await?;
         let status = self
             .decode_status(
-                self.require_success(response, Operation::Get)?,
+                self.require_success(response, Operation::Get).await?,
                 Operation::Get,
             )
             .await?;
@@ -313,7 +321,7 @@ impl PinningProvider for PsaClient {
                 Operation::Find,
             )
             .await?;
-        let response = self.require_success(response, Operation::Find)?;
+        let response = self.require_success(response, Operation::Find).await?;
         let list = self.decode_list(response, Operation::Find).await?;
         let result_count = u64::try_from(list.results.len())
             .map_err(|_| protocol_error("provider returned an incomplete pin list"))?;
@@ -344,7 +352,7 @@ impl PinningProvider for PsaClient {
         if response.status() == StatusCode::NOT_FOUND {
             return Ok(());
         }
-        self.require_success(response, Operation::Unpin)?;
+        self.require_success(response, Operation::Unpin).await?;
         Ok(())
     }
 }
@@ -744,12 +752,12 @@ mod tests {
     async fn classifies_http_errors_and_hides_provider_bodies() {
         for (status_code, expected, retry_after) in [
             (401, ProviderErrorClass::Authentication, None),
-            (403, ProviderErrorClass::Authentication, None),
+            (403, ProviderErrorClass::UnknownForbidden, None),
             (409, ProviderErrorClass::Ambiguous, None),
             (429, ProviderErrorClass::RateLimited, Some("17")),
             (507, ProviderErrorClass::Quota, None),
             (500, ProviderErrorClass::Transient, None),
-            (418, ProviderErrorClass::Terminal, None),
+            (418, ProviderErrorClass::InvalidInput, None),
         ] {
             let server = MockServer::start().await;
             let mut response = ResponseTemplate::new(status_code)
@@ -893,7 +901,7 @@ mod tests {
 
         let server = MockServer::start().await;
         let mut failed = status("request-8", "failed", "bafy-target");
-        failed["info"] = json!({ "reason": "x".repeat(300) });
+        failed["info"] = json!({ "reason": format!("eyJhbGci.JWT-SENTINEL SSE-C-SENTINEL ?credential=QUERY-SENTINEL {}", "x".repeat(300)) });
         Mock::given(method("POST"))
             .and(path("/pins"))
             .respond_with(ResponseTemplate::new(200).set_body_json(failed))
@@ -907,7 +915,27 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(remote.failure_reason.unwrap().chars().count(), 256);
+        assert_eq!(
+            remote.failure_reason.as_deref(),
+            Some("provider reported pin failure")
+        );
+    }
+
+    #[tokio::test]
+    async fn stage1_psa_known_plan_restriction_is_not_credential_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).respond_with(ResponseTemplate::new(403).set_body_json(json!({"error":{"code":"PLAN_RESTRICTED","message":"JWT-SENTINEL SSE-C-SENTINEL ?credential=QUERY-SENTINEL"}}))).mount(&server).await;
+        let error = PsaClient::new("test".into(), server.uri(), super::test_token(TOKEN))
+            .submit(SubmitPin {
+                cid: "cid".into(),
+                name: "name".into(),
+                metadata: BTreeMap::new(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.class, ProviderErrorClass::PlanRestricted);
+        assert!(!format!("{error:?}").contains("SENTINEL"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]

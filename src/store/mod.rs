@@ -96,6 +96,7 @@ mod migrator {
                 Box::new(
                     crate::store::migrations::m20260919_000001_standard_mutation_lease::Migration,
                 ),
+                Box::new(crate::store::migrations::m20260920_000001_pin_submit_history::Migration),
             ]
         }
     }

@@ -4,7 +4,7 @@ use std::{
 };
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use sea_orm::sea_query::{Condition, Expr};
+use sea_orm::sea_query::{Condition, Expr, Func};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
     TransactionTrait, TryInsertResult,
@@ -33,6 +33,399 @@ const MAX_SUBMIT_RECOVERY_ATTEMPTS: i32 = 8;
 const MIN_SUBMIT_RECOVERY_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_SUBMIT_RECOVERY_BACKOFF: Duration = Duration::from_secs(300);
 const MAX_SQLITE_CLAIM_RETRIES: usize = 4;
+const PARKED_RECONCILE_REASON: &str = "submit requires operator attention";
+
+/// Minimal Stage 1 execution history. Secrets and arbitrary provider text never enter it.
+pub mod history {
+    use sea_orm::entity::prelude::*;
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq)]
+    #[sea_orm(table_name = "pin_submit_history")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub job_id: String,
+        pub api: String,
+        pub strategy: String,
+        pub effect: String,
+        pub state: String,
+        pub first_error: Option<String>,
+        pub last_error: Option<String>,
+        pub submit_calls: i32,
+        pub recovery_queries: i32,
+        pub started_at: DateTimeUtc,
+    }
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub async fn submission_history<C: ConnectionTrait>(
+    db: &C,
+    id: &str,
+) -> AppResult<Option<history::Model>> {
+    Ok(history::Entity::find_by_id(id.to_owned()).one(db).await?)
+}
+
+/// Explicit operator repair hook, never called by ordinary scheduling or TOML
+/// reload. Only a definitively rejected call on the same historical route can
+/// resume. Unknown effects require reconciliation, not this hook.
+pub async fn resume_rejected_submit_after_repair<C: ConnectionTrait + TransactionTrait>(
+    db: &C,
+    id: &str,
+    api: &str,
+    strategy: &str,
+    now: DateTimeUtc,
+) -> AppResult<bool> {
+    let txn = db.begin().await?;
+    let updated = pin_job::Entity::update_many()
+        .col_expr(pin_job::Column::UpdatedAt, Expr::value(now))
+        .filter(pin_job::Column::Id.eq(id))
+        .filter(pin_job::Column::Operation.eq("submit"))
+        .filter(pin_job::Column::State.eq(STATE_RUNNING))
+        .filter(pin_job::Column::LockedUntil.is_null())
+        .exec(&txn)
+        .await?;
+    if updated.rows_affected != 1 {
+        txn.rollback().await?;
+        return Ok(false);
+    }
+    let Some(history) = submission_history(&txn, id).await? else {
+        txn.rollback().await?;
+        return Ok(false);
+    };
+    if history.state != "blocked"
+        || history.effect != "not_created"
+        || history.api != api
+        || history.strategy != strategy
+        || history.submit_calls >= MAX_SUBMIT_RECOVERY_ATTEMPTS
+    {
+        txn.rollback().await?;
+        return Ok(false);
+    }
+    history::Entity::update_many()
+        .col_expr(history::Column::State, Expr::value("active"))
+        .col_expr(history::Column::StartedAt, Expr::value(now))
+        .filter(history::Column::JobId.eq(id))
+        .exec(&txn)
+        .await?;
+    pin_job::Entity::update_many()
+        .col_expr(pin_job::Column::State, Expr::value(STATE_PENDING))
+        .col_expr(
+            pin_job::Column::SubmitPhase,
+            Expr::value(SUBMIT_PHASE_READY),
+        )
+        .col_expr(pin_job::Column::NextAttemptAt, Expr::value(now))
+        .filter(pin_job::Column::Id.eq(id))
+        .exec(&txn)
+        .await?;
+    // Only explicit repair wakes matching parked reconciliation. Routine scans
+    // must not reactivate this manual isolation barrier.
+    let job = pin_job::Entity::find_by_id(id.to_owned())
+        .one(&txn)
+        .await?
+        .ok_or_else(|| invalid_job("repaired Submit disappeared"))?;
+    pin_job::Entity::update_many()
+        .col_expr(pin_job::Column::State, Expr::value(STATE_PENDING))
+        .col_expr(pin_job::Column::NextAttemptAt, Expr::value(now))
+        .filter(pin_job::Column::Provider.eq(job.provider))
+        .filter(pin_job::Column::Cid.eq(job.cid))
+        .filter(pin_job::Column::Operation.eq("reconcile"))
+        .filter(pin_job::Column::State.eq(STATE_RUNNING))
+        .filter(pin_job::Column::LockedUntil.is_null())
+        .filter(pin_job::Column::LastError.eq(PARKED_RECONCILE_REASON))
+        .exec(&txn)
+        .await?;
+    txn.commit().await?;
+    Ok(true)
+}
+
+pub async fn record_submit_invocation<C: ConnectionTrait>(
+    db: &C,
+    claimed: &ClaimedPinJob,
+    api: &str,
+    strategy: &str,
+    now: DateTimeUtc,
+) -> AppResult<()> {
+    if !fence_job_claim(db, &claimed.model.id, claimed_lock(&claimed.model)?).await? {
+        return Err(stale_claim_error(&claimed.model.id));
+    }
+    let old = submission_history(db, &claimed.model.id).await?;
+    if let Some(old) = old {
+        if old.api != api
+            || old.strategy != strategy
+            || old.submit_calls >= MAX_SUBMIT_RECOVERY_ATTEMPTS
+        {
+            return Err(invalid_job(
+                "historical submit route changed or budget exhausted",
+            ));
+        }
+        history::Entity::update_many()
+            .col_expr(
+                history::Column::SubmitCalls,
+                Expr::col(history::Column::SubmitCalls).add(1),
+            )
+            .col_expr(history::Column::Effect, Expr::value("unknown"))
+            .col_expr(history::Column::State, Expr::value("active"))
+            .filter(history::Column::JobId.eq(&claimed.model.id))
+            .exec(db)
+            .await?;
+    } else {
+        history::Entity::insert(history::ActiveModel {
+            job_id: Set(claimed.model.id.clone()),
+            api: Set(api.to_owned()),
+            strategy: Set(strategy.to_owned()),
+            effect: Set("unknown".into()),
+            state: Set("active".into()),
+            first_error: Set(None),
+            last_error: Set(None),
+            submit_calls: Set(1),
+            recovery_queries: Set(0),
+            started_at: Set(now),
+        })
+        .exec(db)
+        .await?;
+    }
+    Ok(())
+}
+
+pub async fn record_submit_error<C: ConnectionTrait>(
+    db: &C,
+    claimed: &ClaimedPinJob,
+    effect: &str,
+    safe_error: &str,
+) -> AppResult<()> {
+    if !fence_job_claim(db, &claimed.model.id, claimed_lock(&claimed.model)?).await? {
+        return Err(stale_claim_error(&claimed.model.id));
+    }
+    history::Entity::update_many()
+        .col_expr(history::Column::Effect, Expr::value(effect))
+        .col_expr(
+            history::Column::FirstError,
+            Func::coalesce([
+                Expr::col(history::Column::FirstError).into(),
+                Expr::value(safe_error),
+            ])
+            .into(),
+        )
+        .col_expr(history::Column::LastError, Expr::value(safe_error))
+        .filter(history::Column::JobId.eq(&claimed.model.id))
+        .exec(db)
+        .await?;
+    Ok(())
+}
+
+/// Non-done/calling barrier retains references and reservations. NULL lock is
+/// unclaimable even by legacy workers; the detailed terminal state lives in history.
+#[cfg(test)]
+struct ParkTestGate {
+    job_id: String,
+    fenced: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+static PARK_TEST_GATE: std::sync::LazyLock<
+    tokio::sync::Mutex<Option<std::sync::Arc<ParkTestGate>>>,
+> = std::sync::LazyLock::new(|| tokio::sync::Mutex::new(None));
+
+pub async fn park_submit<C: ConnectionTrait + TransactionTrait>(
+    db: &C,
+    claimed: &ClaimedPinJob,
+    state: &str,
+    safe_error: &str,
+    now: DateTimeUtc,
+) -> AppResult<()> {
+    let txn = db.begin().await?;
+    match park_submit_in_transaction(&txn, claimed, state, safe_error, now).await {
+        Ok(()) => {
+            txn.commit().await?;
+            Ok(())
+        }
+        Err(error) => {
+            txn.rollback().await?;
+            Err(error)
+        }
+    }
+}
+
+async fn park_submit_in_transaction(
+    db: &sea_orm::DatabaseTransaction,
+    claimed: &ClaimedPinJob,
+    state: &str,
+    safe_error: &str,
+    now: DateTimeUtc,
+) -> AppResult<()> {
+    if !fence_job_claim(db, &claimed.model.id, claimed_lock(&claimed.model)?).await? {
+        return Err(stale_claim_error(&claimed.model.id));
+    }
+    #[cfg(test)]
+    {
+        let gate = PARK_TEST_GATE.lock().await.clone();
+        if let Some(gate) = gate.filter(|gate| gate.job_id == claimed.model.id) {
+            gate.fenced.notify_one();
+            gate.resume.notified().await;
+        }
+    }
+    if submission_history(db, &claimed.model.id).await?.is_none() {
+        history::Entity::insert(history::ActiveModel {
+            job_id: Set(claimed.model.id.clone()),
+            api: Set("unknown".into()),
+            strategy: Set("unknown".into()),
+            effect: Set("unknown".into()),
+            state: Set(state.into()),
+            first_error: Set(Some(safe_error.into())),
+            last_error: Set(Some(safe_error.into())),
+            submit_calls: Set(0),
+            recovery_queries: Set(0),
+            started_at: Set(now),
+        })
+        .exec(db)
+        .await?;
+    }
+    history::Entity::update_many()
+        .col_expr(history::Column::State, Expr::value(state))
+        .col_expr(
+            history::Column::LastError,
+            Func::coalesce([
+                Expr::col(history::Column::LastError).into(),
+                Expr::value(safe_error),
+            ])
+            .into(),
+        )
+        .filter(history::Column::JobId.eq(&claimed.model.id))
+        .exec(db)
+        .await?;
+    let updated = pin_job::Entity::update_many()
+        .col_expr(pin_job::Column::State, Expr::value(STATE_RUNNING))
+        .col_expr(
+            pin_job::Column::SubmitPhase,
+            Expr::value(SUBMIT_PHASE_RECOVERING),
+        )
+        .col_expr(
+            pin_job::Column::LockedUntil,
+            Expr::value(Option::<DateTimeUtc>::None),
+        )
+        .col_expr(pin_job::Column::LastError, Expr::value(safe_error))
+        .col_expr(pin_job::Column::UpdatedAt, Expr::value(now))
+        .filter(pin_job::Column::Id.eq(&claimed.model.id))
+        .filter(pin_job::Column::State.eq(STATE_RUNNING))
+        .filter(pin_job::Column::LockedUntil.eq(claimed_lock(&claimed.model)?))
+        .exec(db)
+        .await?;
+    if updated.rows_affected != 1 {
+        return Err(stale_claim_error(&claimed.model.id));
+    }
+    Ok(())
+}
+
+pub async fn begin_recovery_query<C: ConnectionTrait + TransactionTrait>(
+    db: &C,
+    claimed: &ClaimedPinJob,
+    now: DateTimeUtc,
+) -> AppResult<Option<history::Model>> {
+    if !fence_job_claim(db, &claimed.model.id, claimed_lock(&claimed.model)?).await? {
+        return Err(stale_claim_error(&claimed.model.id));
+    }
+    let history = submission_history(db, &claimed.model.id).await?;
+    match history {
+        Some(history)
+            if history.api != "unknown"
+                && history.state == "active"
+                && history.recovery_queries < MAX_SUBMIT_RECOVERY_ATTEMPTS
+                && now.signed_duration_since(history.started_at) < ChronoDuration::hours(1) =>
+        {
+            history::Entity::update_many()
+                .col_expr(
+                    history::Column::RecoveryQueries,
+                    Expr::col(history::Column::RecoveryQueries).add(1),
+                )
+                .filter(history::Column::JobId.eq(&claimed.model.id))
+                .exec(db)
+                .await?;
+            Ok(Some(history))
+        }
+        _ => {
+            park_submit(
+                db,
+                claimed,
+                "needs_attention",
+                "historical route unknown or recovery budget exhausted",
+                now,
+            )
+            .await?;
+            Ok(None)
+        }
+    }
+}
+
+/// Lock and recheck the parked Submit rows shared with explicit repair. Call
+/// before acquiring remote/Reconcile locks, and retain this transaction through
+/// the Reconcile park decision. IDs are ordered to serialize multi-row scopes.
+pub async fn fence_parked_submits(
+    db: &sea_orm::DatabaseTransaction,
+    provider: &str,
+    cid: &str,
+) -> AppResult<bool> {
+    let candidates = pin_job::Entity::find()
+        .filter(pin_job::Column::Provider.eq(provider))
+        .filter(pin_job::Column::Cid.eq(cid))
+        .filter(pin_job::Column::Operation.eq("submit"))
+        .filter(pin_job::Column::State.eq(STATE_RUNNING))
+        .filter(pin_job::Column::LockedUntil.is_null())
+        .order_by_asc(pin_job::Column::Id)
+        .all(db)
+        .await?;
+    let mut parked = false;
+    for candidate in candidates {
+        // The UPDATE predicate is rechecked after any wait on repair's row
+        // lock. A stale SELECT must never authorize a later Reconcile park.
+        let fenced = pin_job::Entity::update_many()
+            .col_expr(
+                pin_job::Column::LockedUntil,
+                Expr::col(pin_job::Column::LockedUntil).into(),
+            )
+            .filter(pin_job::Column::Id.eq(candidate.id))
+            .filter(pin_job::Column::Operation.eq("submit"))
+            .filter(pin_job::Column::State.eq(STATE_RUNNING))
+            .filter(pin_job::Column::LockedUntil.is_null())
+            .exec(db)
+            .await?;
+        parked |= fenced.rows_affected == 1;
+    }
+    Ok(parked)
+}
+
+/// Keep remote responsibility without periodically scheduling work which cannot
+/// make progress until an operator resolves a parked Submit.
+/// The caller must first hold `fence_parked_submits` in this same transaction,
+/// before taking remote/Reconcile locks, so repair cannot miss this park.
+pub async fn park_reconcile_for_submit_attention(
+    db: &sea_orm::DatabaseTransaction,
+    claimed: &ClaimedPinJob,
+    now: DateTimeUtc,
+) -> AppResult<()> {
+    if claimed.model.operation != "reconcile" {
+        return Err(invalid_job("only Reconcile may wait for Submit attention"));
+    }
+    let updated = pin_job::Entity::update_many()
+        .col_expr(
+            pin_job::Column::LockedUntil,
+            Expr::value(Option::<DateTimeUtc>::None),
+        )
+        .col_expr(
+            pin_job::Column::LastError,
+            Expr::value(PARKED_RECONCILE_REASON),
+        )
+        .col_expr(pin_job::Column::UpdatedAt, Expr::value(now))
+        .filter(pin_job::Column::Id.eq(&claimed.model.id))
+        .filter(pin_job::Column::State.eq(STATE_RUNNING))
+        .filter(pin_job::Column::LockedUntil.eq(claimed_lock(&claimed.model)?))
+        .exec(db)
+        .await?;
+    if updated.rows_affected != 1 {
+        return Err(stale_claim_error(&claimed.model.id));
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 type ClaimUpdateRecorder = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
@@ -1004,8 +1397,8 @@ pub async fn record_submit_recovery_no_match<C: ConnectionTrait>(
     Ok(SubmitRecoveryDecision::RetryScheduled { next_attempt_at })
 }
 
-/// Keeps ambiguous Submit recovery durable. Its attempt counter caps but the safety lookup continues.
-pub async fn retry_submit_recovery<C: ConnectionTrait>(
+/// Keeps ambiguous Submit recovery durable, but stops automatic work at the budget.
+pub async fn retry_submit_recovery<C: ConnectionTrait + TransactionTrait>(
     db: &C,
     claimed: &ClaimedPinJob,
     now: DateTimeUtc,
@@ -1021,6 +1414,9 @@ pub async fn retry_submit_recovery<C: ConnectionTrait>(
     } else {
         attempts
     };
+    if attempts >= MAX_SUBMIT_RECOVERY_ATTEMPTS {
+        return park_submit(db, claimed, "needs_attention", redacted_error, now).await;
+    }
     let cadence = if attempts == MAX_SUBMIT_RECOVERY_ATTEMPTS {
         MAX_SUBMIT_RECOVERY_BACKOFF
     } else {
@@ -1196,6 +1592,9 @@ pub async fn complete_job<C: ConnectionTrait>(
     expected_locked_until: DateTimeUtc,
     now: DateTimeUtc,
 ) -> AppResult<()> {
+    if !fence_job_claim(db, job_id, expected_locked_until).await? {
+        return Err(stale_claim_error(job_id));
+    }
     let job = pin_job::Entity::find_by_id(job_id.to_owned())
         .one(db)
         .await?
@@ -1207,6 +1606,12 @@ pub async fn complete_job<C: ConnectionTrait>(
         if remote.and_then(|row| row.request_id).is_none() {
             Some(SubmitPhase::Ready.persisted())
         } else {
+            history::Entity::update_many()
+                .col_expr(history::Column::Effect, Expr::value("created"))
+                .col_expr(history::Column::State, Expr::value("settled"))
+                .filter(history::Column::JobId.eq(&job.id))
+                .exec(db)
+                .await?;
             job.submit_phase.as_deref()
         }
     } else {
@@ -1679,6 +2084,169 @@ mod tests {
     use super::*;
     use crate::store::entities::pin_job;
 
+    #[tokio::test]
+    async fn stage1_review_park_fence_and_history_are_atomic_during_real_takeover() {
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            directory
+                .path()
+                .join("park-race.db")
+                .display()
+                .to_string()
+                .replace('\\', "/")
+        );
+        let db = Database::connect(&url).await.unwrap();
+        crate::store::run_migrations(&db).await.unwrap();
+        db.execute_unprepared("INSERT INTO buckets (name) VALUES ('bucket'); INSERT INTO objects (id,bucket,key,cid,size,etag) VALUES ('object-1','bucket','key','cid',1,'cid')").await.unwrap();
+        seed_target_and_remote(
+            &db,
+            "lease",
+            "target",
+            "park-race",
+            "cid",
+            1,
+            "waiting",
+            "reserved",
+            None,
+            1,
+            time(0),
+        )
+        .await;
+        enqueue_job(
+            &db,
+            submit_job("park-race", "cid", "lease", "target", 1, time(0)),
+        )
+        .await
+        .unwrap();
+        let claim = claim_due_jobs(&db, time(1), Duration::seconds(30), 1)
+            .await
+            .unwrap()
+            .remove(0);
+        let id = claim.model.id.clone();
+        record_submit_invocation(&db, &claim, "psa", "cid", time(1))
+            .await
+            .unwrap();
+        let gate = std::sync::Arc::new(ParkTestGate {
+            job_id: id.clone(),
+            fenced: tokio::sync::Notify::new(),
+            resume: tokio::sync::Notify::new(),
+        });
+        *PARK_TEST_GATE.lock().await = Some(gate.clone());
+        let old_db = db.clone();
+        let old = tokio::spawn(async move {
+            park_submit(
+                &old_db,
+                &claim,
+                "needs_attention",
+                "old-owner-error",
+                time(2),
+            )
+            .await
+        });
+        gate.fenced.notified().await;
+        let new_db = Database::connect(&url).await.unwrap();
+        let new_id = id.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let mut successor = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            let claims = claim_due_jobs(&new_db, time(60), Duration::seconds(30), 1).await?;
+            if !claims.is_empty() {
+                history::Entity::update_many()
+                    .col_expr(history::Column::State, Expr::value("active"))
+                    .col_expr(
+                        history::Column::LastError,
+                        Expr::value("new-owner-evidence"),
+                    )
+                    .filter(history::Column::JobId.eq(new_id))
+                    .exec(&new_db)
+                    .await?;
+            }
+            Ok::<_, AppError>(claims.len())
+        });
+        started_rx.await.unwrap();
+        let early =
+            tokio::time::timeout(std::time::Duration::from_millis(250), &mut successor).await;
+        gate.resume.notify_one();
+        let old_result = old.await.unwrap();
+        let count = match early {
+            Ok(result) => result.unwrap(),
+            Err(_) => successor.await.unwrap(),
+        };
+        let count = match count {
+            Ok(count) => count,
+            Err(AppError::Database(message)) if message.contains("database is locked") => {
+                // SQLite cannot upgrade a deferred reader while the parker owns
+                // the write transaction. Retry only after that transaction ends.
+                claim_due_jobs(&db, time(60), Duration::seconds(30), 1)
+                    .await
+                    .unwrap()
+                    .len()
+            }
+            Err(error) => panic!("unexpected takeover failure: {error}"),
+        };
+        *PARK_TEST_GATE.lock().await = None;
+        let persisted = submission_history(&db, &id).await.unwrap().unwrap();
+        if count == 1 {
+            assert!(old_result.is_err());
+            assert_eq!(
+                persisted.state, "active",
+                "a stale parker must not mutate successor history"
+            );
+            assert_eq!(persisted.last_error.as_deref(), Some("new-owner-evidence"));
+        } else {
+            old_result.unwrap();
+            assert_eq!(persisted.state, "needs_attention");
+        }
+    }
+
+    #[tokio::test]
+    async fn stage1_review_park_cas_failure_rolls_back_history_with_job() {
+        let db = setup().await;
+        seed_target_and_remote(
+            &db,
+            "lease",
+            "target",
+            "pinata",
+            "cid",
+            1,
+            "waiting",
+            "reserved",
+            None,
+            1,
+            time(0),
+        )
+        .await;
+        enqueue_job(
+            &db,
+            submit_job("pinata", "cid", "lease", "target", 1, time(0)),
+        )
+        .await
+        .unwrap();
+        let claim = claim_due_jobs(&db, time(1), Duration::seconds(30), 1)
+            .await
+            .unwrap()
+            .remove(0);
+        record_submit_invocation(&db, &claim, "pinata_v3", "cid", time(1))
+            .await
+            .unwrap();
+        let before = submission_history(&db, &claim.model.id).await.unwrap();
+        db.execute_unprepared("CREATE TRIGGER reject_park_cas BEFORE UPDATE OF locked_until ON pin_jobs WHEN OLD.locked_until IS NOT NULL AND NEW.locked_until IS NULL BEGIN SELECT RAISE(IGNORE); END").await.unwrap();
+        assert!(
+            park_submit(&db, &claim, "needs_attention", "must-rollback", time(2))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            submission_history(&db, &claim.model.id).await.unwrap(),
+            before
+        );
+        assert_eq!(
+            job(&db, &claim.model.id).await.locked_until,
+            claim.model.locked_until
+        );
+    }
+
     fn time(seconds: i64) -> DateTimeUtc {
         Utc.with_ymd_and_hms(2026, 7, 21, 0, 0, 0).single().unwrap() + Duration::seconds(seconds)
     }
@@ -1752,6 +2320,66 @@ mod tests {
             .await
             .unwrap()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn stage1_recovery_budget_parks_unclaimable_without_releasing_responsibility() {
+        let db = setup().await;
+        seed_target_and_remote(
+            &db,
+            "lease",
+            "target",
+            "pinata",
+            "cid",
+            1,
+            "waiting",
+            "reserved",
+            None,
+            1,
+            time(0),
+        )
+        .await;
+        enqueue_job(
+            &db,
+            submit_job("pinata", "cid", "lease", "target", 1, time(0)),
+        )
+        .await
+        .unwrap();
+        let id = "submit:pinata:cid:target:g1";
+        db.execute_unprepared("UPDATE pin_jobs SET submit_phase='recovering', attempts=7")
+            .await
+            .unwrap();
+        let claimed = claim_due_jobs(&db, time(1), Duration::seconds(30), 1)
+            .await
+            .unwrap()
+            .remove(0);
+        retry_submit_recovery(
+            &db,
+            &claimed,
+            time(1),
+            std::time::Duration::from_secs(1),
+            "protocol error",
+        )
+        .await
+        .unwrap();
+        let row = job(&db, id).await;
+        assert_eq!(row.state, "running");
+        assert_eq!(
+            row.locked_until, None,
+            "parked claims must not be acquired by old workers"
+        );
+        assert!(
+            claim_due_jobs(&db, time(10000), Duration::seconds(30), 1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(matches!(
+            resolve_no_request_submit_ambiguity(&db, "pinata", "cid", time(10000))
+                .await
+                .unwrap(),
+            NoRequestSubmitAmbiguity::Wait { .. }
+        ));
     }
 
     #[test]
@@ -2406,13 +3034,14 @@ mod tests {
         .await
         .unwrap();
         let maximum = job(&db, &submit_id).await;
-        assert_eq!(maximum.next_attempt_at, now + Duration::seconds(301));
+        assert_eq!(maximum.state, "running");
+        assert_eq!(maximum.locked_until, None);
         assert_eq!(maximum.attempts, 8);
         assert_eq!(maximum.submit_phase.as_deref(), Some("recovering"));
     }
 
     #[tokio::test]
-    async fn submit_recovery_at_attempt_cap_forces_max_cadence() {
+    async fn submit_recovery_at_attempt_cap_parks_without_claimable_lock() {
         let db = setup().await;
         let now = time(0);
         seed_target_and_remote(
@@ -2448,8 +3077,8 @@ mod tests {
         .unwrap();
 
         let persisted = job(&db, &submit_id).await;
-        assert_eq!(persisted.next_attempt_at, now + Duration::seconds(300));
-        assert_eq!(persisted.state, "pending");
+        assert_eq!(persisted.locked_until, None);
+        assert_eq!(persisted.state, "running");
         assert_eq!(persisted.submit_phase.as_deref(), Some("recovering"));
         assert_eq!(persisted.attempts, 8);
     }

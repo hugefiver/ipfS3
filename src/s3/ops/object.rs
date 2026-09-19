@@ -1147,6 +1147,18 @@ fn delete_objects_item_error(error: &AppError) -> (String, String) {
     }
 }
 
+fn log_delete_objects_item_failure(operation: &'static str, error: &AppError) {
+    let failure_class = match error {
+        AppError::Database(_) => "database",
+        AppError::StaleContentMutation => "stale_content_mutation",
+        AppError::InvalidArgument(_) => "invalid_argument",
+        AppError::NoSuchVersion { .. } => "no_such_version",
+        AppError::KuboRpc { .. } | AppError::Tier(_) => "storage_backend",
+        _ => "internal",
+    };
+    tracing::error!(operation, failure_class, "delete objects item failed");
+}
+
 pub async fn delete_objects(
     state: &Arc<AppState>,
     req: S3Request<DeleteObjectsInput>,
@@ -1205,7 +1217,7 @@ pub async fn delete_objects(
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    tracing::error!(%bucket, %key, %error, "failed to read versioning state for delete");
+                    log_delete_objects_item_failure("read_versioning", &error);
                     let (code, message) = delete_objects_item_error(&error);
                     errors.push(Error {
                         code: Some(code),
@@ -1229,7 +1241,7 @@ pub async fn delete_objects(
         {
             Ok(guard) => guard,
             Err(error) => {
-                tracing::error!(%bucket, %key, %error, "failed to admit object delete");
+                log_delete_objects_item_failure("admit", &error);
                 let (code, message) = delete_objects_item_error(&error);
                 errors.push(Error {
                     code: Some(code),
@@ -1279,7 +1291,7 @@ pub async fn delete_objects(
             }
             Ok(_) => {}
             Err(error) => {
-                tracing::error!(%bucket, %key, %error, "failed to delete object");
+                log_delete_objects_item_failure("delete", &error);
                 let (code, message) = delete_objects_item_error(&error);
                 errors.push(Error {
                     code: Some(code),

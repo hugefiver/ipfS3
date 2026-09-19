@@ -640,6 +640,25 @@ async fn execute_submit(
         return recover_submit(store, coordinator, global, &mut claimed, cancellation).await;
     }
 
+    if let Some(history) = jobs::submission_history(store.db(), &claimed.model.id).await? {
+        let route = coordinator
+            .provider(&claimed.model.provider)
+            .map(|provider| provider.invocation_route());
+        if route != Some((history.api.as_str(), history.strategy.as_str()))
+            || history.submit_calls >= 8
+            || Utc::now().signed_duration_since(history.started_at) >= ChronoDuration::hours(1)
+        {
+            return jobs::park_submit(
+                store.db(),
+                &claimed,
+                "needs_attention",
+                "submit route changed or budget exhausted",
+                Utc::now(),
+            )
+            .await;
+        }
+    }
+
     let Some(slot) = acquire_provider_slot(
         coordinator,
         store,
@@ -656,6 +675,10 @@ async fn execute_submit(
     let now = Utc::now();
     let txn = store.db().begin().await?;
     let decision = jobs::prepare_submit_call(&txn, &claimed, now).await?;
+    if decision == SubmitCallDecision::ReadyToCall {
+        let (api, strategy) = slot.provider.invocation_route();
+        jobs::record_submit_invocation(&txn, &claimed, api, strategy, now).await?;
+    }
     txn.commit().await?;
     if decision == SubmitCallDecision::NoLongerDesired {
         transition(&claimed, "running", "done_current_reconcile", None);
@@ -721,6 +744,55 @@ async fn execute_submit(
             recover_submit(store, coordinator, global, &mut claimed, cancellation).await
         }
         Err(error) => {
+            if error.definitely_not_submitted() {
+                let now = Utc::now();
+                let txn = store.db().begin().await?;
+                jobs::record_submit_error(
+                    &txn,
+                    &claimed,
+                    "not_created",
+                    &error.safe_evidence("submit"),
+                )
+                .await?;
+                let evicted = if error.class == ProviderErrorClass::Quota {
+                    quota_coordination_hook(&txn, coordinator, &claimed.model, now).await?
+                } else {
+                    Vec::new()
+                };
+                if matches!(
+                    error.class,
+                    ProviderErrorClass::RateLimited
+                        | ProviderErrorClass::NotSubmitted
+                        | ProviderErrorClass::Quota
+                ) {
+                    jobs::record_submit_recovery_no_match(
+                        &txn,
+                        &claimed,
+                        now,
+                        provider_retry_delay(
+                            &claimed.model,
+                            &error,
+                            coordinator.settings().base_backoff,
+                            coordinator.settings().max_backoff,
+                        ),
+                    )
+                    .await?;
+                } else {
+                    jobs::park_submit(
+                        &txn,
+                        &claimed,
+                        "blocked",
+                        provider_error_label(error.class),
+                        now,
+                    )
+                    .await?;
+                }
+                txn.commit().await?;
+                if !evicted.is_empty() {
+                    coordinate_quota_evicted_one_targets(store, coordinator, &evicted, now).await?;
+                }
+                return Ok(());
+            }
             if !mark_submit_recovering(store, &claimed, &error).await? {
                 return Ok(());
             }
@@ -753,6 +825,7 @@ async fn mark_submit_recovering(
     if error.class != ProviderErrorClass::Quota {
         leases::mark_all_mode_target_degraded_for_retry(&txn, &claimed.model, now).await?;
     }
+    jobs::record_submit_error(&txn, claimed, "unknown", &error.safe_evidence("submit")).await?;
     jobs::mark_submit_recovering_after_call(&txn, claimed, now, provider_error_label(error.class))
         .await?;
     txn.commit().await?;
@@ -768,6 +841,12 @@ async fn recover_submit(
     cancellation: &CancellationToken,
 ) -> AppResult<()> {
     let query = FindPin::for_job(&claimed.model.cid, &claimed.model.id);
+    let txn = store.db().begin().await?;
+    let history = jobs::begin_recovery_query(&txn, claimed, Utc::now()).await?;
+    txn.commit().await?;
+    let Some(history) = history else {
+        return Ok(());
+    };
     let Some(slot) = acquire_provider_slot(
         coordinator,
         store,
@@ -787,7 +866,11 @@ async fn recover_submit(
         coordinator.settings().lock_for,
         cancellation,
         || async { Ok(true) },
-        move |provider| async move { provider.find(query).await },
+        move |provider| async move {
+            provider
+                .find_historical(query, &history.api, &history.strategy)
+                .await
+        },
     )
     .await?
     {
@@ -888,6 +971,7 @@ async fn retry_submit_recovery(
         leases::mark_all_mode_target_degraded_for_retry(&txn, &claimed.model, now).await?;
         Vec::new()
     };
+    jobs::record_submit_error(&txn, claimed, "unknown", &error.safe_evidence("find")).await?;
     jobs::retry_submit_recovery(&txn, claimed, now, delay, provider_error_label(error.class))
         .await?;
     txn.commit().await?;
@@ -1521,6 +1605,11 @@ async fn reconcile_without_desired(
         );
         return Ok(());
     }
+    // Match repair's Submit -> Reconcile lock order. This must precede the
+    // remote epoch fence below; never acquire Submit after holding remote or
+    // this Reconcile's row lock.
+    let submit_needs_attention =
+        jobs::fence_parked_submits(&txn, &claimed.model.provider, &claimed.model.cid).await?;
     let completion = leases::complete_no_request_remote_absence(
         &txn,
         &claimed.model.provider,
@@ -1539,6 +1628,12 @@ async fn reconcile_without_desired(
             "released"
         }
         NoRequestRemoteCompletion::Wait { next_check_at } => {
+            if submit_needs_attention {
+                jobs::park_reconcile_for_submit_attention(&txn, claimed, now).await?;
+                txn.commit().await?;
+                transition(claimed, "running", "submit_needs_attention", None);
+                return Ok(());
+            }
             let minimum = now + chrono_duration(Duration::from_secs(1))?;
             jobs::reschedule_reconcile_job(
                 &txn,
@@ -2449,9 +2544,7 @@ async fn update_provider_health<T>(runtime: &ProviderRuntime, result: &Result<T,
     let health = match &result {
         Ok(_) => ProviderHealth::Healthy,
         Err(error) => match error.class {
-            ProviderErrorClass::Authentication | ProviderErrorClass::Terminal => {
-                ProviderHealth::Terminal
-            }
+            ProviderErrorClass::Authentication => ProviderHealth::Terminal,
             _ => ProviderHealth::Degraded,
         },
     };
@@ -2463,8 +2556,8 @@ async fn update_provider_health<T>(runtime: &ProviderRuntime, result: &Result<T,
 
 fn terminal_health_error() -> ProviderError {
     ProviderError {
-        class: ProviderErrorClass::Terminal,
-        message: "provider health is terminal".to_owned(),
+        class: ProviderErrorClass::Authentication,
+        message: "provider credential runtime is blocked".to_owned(),
         retry_after: None,
     }
 }
@@ -2507,6 +2600,11 @@ fn protocol_error() -> ProviderError {
 fn provider_error_label(class: ProviderErrorClass) -> &'static str {
     match class {
         ProviderErrorClass::Authentication => "provider authentication error",
+        ProviderErrorClass::PermissionDenied => "provider permission denied",
+        ProviderErrorClass::PlanRestricted => "provider plan restricted",
+        ProviderErrorClass::UnknownForbidden => "provider forbidden (unknown reason)",
+        ProviderErrorClass::InvalidInput => "provider rejected invalid input",
+        ProviderErrorClass::NotSubmitted => "provider request not submitted",
         ProviderErrorClass::NotFound => "provider request not found",
         ProviderErrorClass::Ambiguous => "provider ambiguous response",
         ProviderErrorClass::RateLimited => "provider rate limited",
@@ -3133,6 +3231,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl PinningProvider for ScriptProvider {
+        fn invocation_route(&self) -> (&'static str, &'static str) {
+            ("psa", "cid")
+        }
+
         fn name(&self) -> &str {
             "noop"
         }
@@ -3671,6 +3773,9 @@ mod tests {
             )
             .await
             .unwrap();
+            // Modern fixture: tests may simulate a crash by writing calling
+            // directly. Supply that simulated call's explicit historical route.
+            self.store.db().execute_unprepared("INSERT INTO pin_submit_history (job_id,api,strategy,effect,state,submit_calls,recovery_queries,started_at) SELECT id,'psa','cid','unknown','active',0,0,created_at FROM pin_jobs WHERE operation='submit' ON CONFLICT(job_id) DO NOTHING").await.unwrap();
         }
 
         async fn enqueue_poll(&self, request_id: &str) {
@@ -4378,6 +4483,593 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stage1_http_forbidden_blocks_only_submit_and_persists_safe_evidence() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/v3/files/public/pin_by_cid"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({"error":{"code":"PLAN_RESTRICTED","message":"JWT-SENTINEL SSE-C-SENTINEL ?credential=QUERY-SENTINEL"}})))
+            .mount(&server).await;
+        let mut fixture = fixture([]).await;
+        let client = Arc::new(crate::pinning::pinata::build_pinata(
+            "noop".into(),
+            crate::pinning::psa::test_token("test-token"),
+            Some(format!("{}/v3", server.uri())),
+        ));
+        PinningCoordinator::replace_provider_for_test(&mut fixture.coordinator, "noop", client);
+        // Production enqueue, not the simulated-modern-crash fixture helper.
+        jobs::enqueue_job(
+            fixture.store.db(),
+            jobs::submit_job("noop", "bafy-worker", "lease-1", "target-1", 1, Utc::now()),
+        )
+        .await
+        .unwrap();
+        fixture.run_one_due().await;
+        let row =
+            jobs::submission_history(fixture.store.db(), "submit:noop:bafy-worker:target-1:g1")
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            (
+                row.api.as_str(),
+                row.strategy.as_str(),
+                row.effect.as_str(),
+                row.state.as_str()
+            ),
+            ("pinata_v3", "cid", "not_created", "blocked")
+        );
+        assert_eq!((row.submit_calls, row.recovery_queries), (1, 0));
+        assert!(row.first_error.as_ref().unwrap().contains("403"));
+        for secret in ["JWT-SENTINEL", "SSE-C-SENTINEL", "QUERY-SENTINEL"] {
+            assert!(!format!("{row:?}").contains(secret));
+        }
+        assert_ne!(
+            *fixture
+                .coordinator
+                .provider_runtime("noop")
+                .unwrap()
+                .health
+                .read()
+                .await,
+            super::ProviderHealth::Terminal
+        );
+        assert!(
+            jobs::claim_due_jobs(
+                fixture.store.db(),
+                Utc::now() + chrono::Duration::days(30),
+                chrono::Duration::seconds(30),
+                10
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stage1_unknown_old_call_is_quarantined_without_any_provider_io() {
+        let fixture = fixture([]).await;
+        jobs::enqueue_job(
+            fixture.store.db(),
+            jobs::submit_job("noop", "bafy-worker", "lease-1", "target-1", 1, Utc::now()),
+        )
+        .await
+        .unwrap();
+        fixture
+            .store
+            .db()
+            .execute_unprepared("UPDATE pin_jobs SET submit_phase='recovering'")
+            .await
+            .unwrap();
+        fixture.run_one_due().await;
+        let row = pin_job::Entity::find()
+            .one(fixture.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, "running");
+        assert_eq!(row.locked_until, None);
+        assert_eq!(fixture.provider.finds.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.provider.submits.load(Ordering::SeqCst), 0);
+        let usage = pin_provider_usage::Entity::find_by_id("noop")
+            .one(fixture.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((usage.reserved_bytes, usage.reserved_pins), (100, 1));
+        assert!(
+            !jobs::resume_rejected_submit_after_repair(
+                fixture.store.db(),
+                &row.id,
+                "psa",
+                "cid",
+                Utc::now()
+            )
+            .await
+            .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn stage1_auth_rejection_can_resume_only_after_explicit_same_route_repair() {
+        let fixture = fixture([
+            Script::Submit(Err(provider_error(
+                crate::pinning::provider::ProviderErrorClass::Authentication,
+                "secret",
+            ))),
+            Script::Submit(Ok(remote("repaired", RemotePinStatus::Pinned))),
+        ])
+        .await;
+        fixture.enqueue_submit().await;
+        fixture.run_one_due().await;
+        let id = "submit:noop:bafy-worker:target-1:g1";
+        assert!(
+            !jobs::resume_rejected_submit_after_repair(
+                fixture.store.db(),
+                id,
+                "pinata_v3",
+                "upload",
+                Utc::now()
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            jobs::resume_rejected_submit_after_repair(
+                fixture.store.db(),
+                id,
+                "psa",
+                "cid",
+                Utc::now()
+            )
+            .await
+            .unwrap()
+        );
+        // A repaired configuration starts a new runtime with Healthy health.
+        *fixture
+            .coordinator
+            .provider_runtime("noop")
+            .unwrap()
+            .health
+            .write()
+            .await = super::ProviderHealth::Healthy;
+        fixture.run_one_due().await;
+        assert_eq!(fixture.provider.submits.load(Ordering::SeqCst), 2);
+        assert_eq!(fixture.provider.finds.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            jobs::submission_history(fixture.store.db(), id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "settled"
+        );
+    }
+
+    #[tokio::test]
+    async fn stage1_http_restart_uses_persisted_cid_route_after_upload_config_change() {
+        use crate::pinning::{
+            config::{PinataApi, PinataProviderOptions, PinataStrategy},
+            pinata::build_pinata_with_options,
+            psa::test_token,
+        };
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v3/files/public/pin_by_cid"))
+            .respond_with(ResponseTemplate::new(409))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v3/files/public"))
+            .respond_with(ResponseTemplate::new(502))
+            .with_priority(1)
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v3/files/public"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"data":{"files":[]}})),
+            )
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET")).and(path("/v3/files/public/pin_by_cid"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data":{"jobs":[{"id":"accepted","cid":"bafy-worker","status":"pinned","keyvalues":{"gateway_job_id":"submit:noop:bafy-worker:target-1:g1"}}]}}))).mount(&server).await;
+        let mut fixture = fixture([]).await;
+        let client = |strategy| {
+            Arc::new(build_pinata_with_options(
+                "noop".into(),
+                test_token("test-token"),
+                Some(format!("{}/v3", server.uri())),
+                PinataProviderOptions {
+                    api: PinataApi::V3,
+                    strategy,
+                    upload_endpoint: None,
+                },
+                None,
+            ))
+        };
+        PinningCoordinator::replace_provider_for_test(
+            &mut fixture.coordinator,
+            "noop",
+            client(PinataStrategy::Cid),
+        );
+        jobs::enqueue_job(
+            fixture.store.db(),
+            jobs::submit_job("noop", "bafy-worker", "lease-1", "target-1", 1, Utc::now()),
+        )
+        .await
+        .unwrap();
+        fixture.run_one_due().await;
+        PinningCoordinator::replace_provider_for_test(
+            &mut fixture.coordinator,
+            "noop",
+            client(PinataStrategy::Upload),
+        );
+        fixture.run_one_due().await;
+        let row =
+            jobs::submission_history(fixture.store.db(), "submit:noop:bafy-worker:target-1:g1")
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            (
+                row.api.as_str(),
+                row.strategy.as_str(),
+                row.effect.as_str(),
+                row.state.as_str()
+            ),
+            ("pinata_v3", "cid", "created", "settled")
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method == "POST")
+                .count(),
+            1
+        );
+        assert_eq!(requests.len(), 4);
+        let remote = remote_pin::Entity::find_by_id(("noop".to_owned(), "bafy-worker".to_owned()))
+            .one(fixture.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(remote.status, "pinned");
+    }
+
+    #[tokio::test]
+    async fn stage1_http_recovery_budget_stops_network_and_retains_quota() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(409))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let mut fixture = fixture([]).await;
+        PinningCoordinator::replace_provider_for_test(
+            &mut fixture.coordinator,
+            "noop",
+            Arc::new(crate::pinning::pinata::build_pinata(
+                "noop".into(),
+                crate::pinning::psa::test_token("test-token"),
+                Some(format!("{}/v3", server.uri())),
+            )),
+        );
+        jobs::enqueue_job(
+            fixture.store.db(),
+            jobs::submit_job("noop", "bafy-worker", "lease-1", "target-1", 1, Utc::now()),
+        )
+        .await
+        .unwrap();
+        for _ in 0..8 {
+            fixture.run_one_due().await;
+        }
+        let history =
+            jobs::submission_history(fixture.store.db(), "submit:noop:bafy-worker:target-1:g1")
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            (
+                history.state.as_str(),
+                history.effect.as_str(),
+                history.recovery_queries
+            ),
+            ("needs_attention", "unknown", 8)
+        );
+        for _ in 0..3 {
+            assert!(
+                jobs::claim_due_jobs(
+                    fixture.store.db(),
+                    Utc::now() + chrono::Duration::days(30),
+                    chrono::Duration::seconds(30),
+                    10
+                )
+                .await
+                .unwrap()
+                .is_empty()
+            );
+        }
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method == "POST")
+                .count(),
+            1
+        );
+        assert_eq!(requests.len(), 9);
+        let usage = pin_provider_usage::Entity::find_by_id("noop")
+            .one(fixture.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((usage.reserved_bytes, usage.reserved_pins), (100, 1));
+    }
+
+    #[tokio::test]
+    async fn stage1_recovery_time_budget_stops_before_io() {
+        let fixture = fixture([]).await;
+        fixture.enqueue_submit().await;
+        fixture.store.db().execute_unprepared(&format!("UPDATE pin_submit_history SET started_at='{}'; UPDATE pin_jobs SET submit_phase='recovering'", (Utc::now() - chrono::Duration::hours(2)).to_rfc3339())).await.unwrap();
+        fixture.run_one_due().await;
+        let history =
+            jobs::submission_history(fixture.store.db(), "submit:noop:bafy-worker:target-1:g1")
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(history.state, "needs_attention");
+        assert_eq!(fixture.provider.finds.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn stage1_review_redirect_cannot_reclassify_an_accepted_post_as_unsubmitted() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        for psa in [false, true] {
+            for status in [401, 429, 0] {
+                let server = MockServer::start().await;
+                let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let unavailable = format!("http://{}/unavailable", closed.local_addr().unwrap());
+                drop(closed);
+                let destination = if status == 0 {
+                    unavailable
+                } else {
+                    format!("{}/redirect", server.uri())
+                };
+                let submit_path = if psa {
+                    "/psa/pins"
+                } else {
+                    "/v3/files/public/pin_by_cid"
+                };
+                let find_path = if psa { "/psa/pins" } else { "/v3/files/public" };
+                Mock::given(method("POST"))
+                    .and(path(submit_path))
+                    .respond_with(ResponseTemplate::new(303).insert_header("Location", destination))
+                    .mount(&server)
+                    .await;
+                if status != 0 {
+                    Mock::given(method("GET"))
+                        .and(path("/redirect"))
+                        .respond_with(ResponseTemplate::new(status))
+                        .mount(&server)
+                        .await;
+                }
+                Mock::given(method("GET"))
+                    .and(path(find_path))
+                    .respond_with(ResponseTemplate::new(503))
+                    .mount(&server)
+                    .await;
+                let mut fixture = fixture([]).await;
+                let provider: Arc<dyn PinningProvider> = if psa {
+                    Arc::new(crate::pinning::psa::PsaClient::new(
+                        "noop".into(),
+                        format!("{}/psa", server.uri()),
+                        crate::pinning::psa::test_token("test-token"),
+                    ))
+                } else {
+                    Arc::new(crate::pinning::pinata::build_pinata(
+                        "noop".into(),
+                        crate::pinning::psa::test_token("test-token"),
+                        Some(format!("{}/v3", server.uri())),
+                    ))
+                };
+                PinningCoordinator::replace_provider_for_test(
+                    &mut fixture.coordinator,
+                    "noop",
+                    provider,
+                );
+                jobs::enqueue_job(
+                    fixture.store.db(),
+                    jobs::submit_job("noop", "bafy-worker", "lease-1", "target-1", 1, Utc::now()),
+                )
+                .await
+                .unwrap();
+                fixture.run_one_due().await;
+                let history = jobs::submission_history(
+                    fixture.store.db(),
+                    "submit:noop:bafy-worker:target-1:g1",
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(
+                    history.effect, "unknown",
+                    "psa={psa}, redirected status={status}"
+                );
+                assert_eq!(history.recovery_queries, 1);
+                fixture.run_one_due().await;
+                let requests = server.received_requests().await.unwrap();
+                assert_eq!(
+                    requests
+                        .iter()
+                        .filter(|request| request.method == "POST")
+                        .count(),
+                    1
+                );
+                assert_eq!(requests.iter().filter(|request| request.url.path() == find_path && request.method == "GET").count(), 2);
+                assert_eq!(
+                    requests
+                        .iter()
+                        .filter(|request| request.url.path() == "/redirect")
+                        .count(),
+                    0
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stage1_review_settled_submit_reactivates_on_legal_failed_remote_resubmit() {
+        for class in [
+            crate::pinning::provider::ProviderErrorClass::Ambiguous,
+            crate::pinning::provider::ProviderErrorClass::Transient,
+        ] {
+            let fixture = fixture([
+                Script::Submit(Err(provider_error(
+                    crate::pinning::provider::ProviderErrorClass::Ambiguous,
+                    "first",
+                ))),
+                Script::Find(Ok(vec![remote("first-request", RemotePinStatus::Queued)])),
+                Script::Get(Ok(remote("first-request", RemotePinStatus::Failed))),
+                Script::Unpin(Ok(())),
+                Script::Submit(Err(provider_error(class, "second"))),
+                Script::Find(Ok(vec![remote("second-request", RemotePinStatus::Pinned)])),
+            ])
+            .await;
+            fixture.enqueue_submit().await;
+            fixture.run_one_due().await;
+            let id = "submit:noop:bafy-worker:target-1:g1";
+            let first = jobs::submission_history(fixture.store.db(), id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(first.state, "settled");
+            fixture.run_one_due().await;
+            fixture
+                .store
+                .db()
+                .execute_unprepared(&format!(
+                    "UPDATE remote_pins SET next_retry_at='{}'",
+                    (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339()
+                ))
+                .await
+                .unwrap();
+            fixture.run_one_due().await;
+            fixture.run_one_due().await;
+            let final_history = jobs::submission_history(fixture.store.db(), id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(fixture.provider.submits.load(Ordering::SeqCst), 2);
+            assert_eq!(fixture.provider.finds.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                (final_history.state.as_str(), final_history.effect.as_str()),
+                ("settled", "created")
+            );
+            assert_eq!(
+                (final_history.submit_calls, final_history.recovery_queries),
+                (2, 2)
+            );
+            assert_eq!(final_history.first_error, first.first_error);
+            assert_eq!(final_history.started_at, first.started_at);
+        }
+    }
+
+    #[tokio::test]
+    async fn stage1_review_parked_submit_expiry_and_cancel_do_not_hotloop_reconcile() {
+        for expire in [false, true] {
+            let fixture = fixture([]).await;
+            fixture.enqueue_submit().await;
+            fixture.store.db().execute_unprepared("UPDATE pin_jobs SET submit_phase='recovering'; UPDATE pin_submit_history SET recovery_queries=8").await.unwrap();
+            fixture.run_one_due().await;
+            if expire {
+                fixture
+                    .store
+                    .db()
+                    .execute_unprepared(&format!(
+                        "UPDATE pin_leases SET expires_at='{}'",
+                        (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339()
+                    ))
+                    .await
+                    .unwrap();
+            } else {
+                let txn = fixture.store.db().begin().await.unwrap();
+                leases::cancel_lease(&txn, "lease-1", Utc::now())
+                    .await
+                    .unwrap();
+                txn.commit().await.unwrap();
+            }
+            let mut rounds = Vec::new();
+            for tick in 0..5 {
+                let claims = super::scan_and_claim(
+                    &fixture.coordinator,
+                    &fixture.store,
+                    &CancellationToken::new(),
+                    &super::ProviderOccupancy::default(),
+                    Utc::now() + chrono::Duration::seconds(tick * 60),
+                    10,
+                )
+                .await
+                .unwrap();
+                rounds.push(
+                    claims
+                        .iter()
+                        .map(|claim| claim.model.id.clone())
+                        .collect::<Vec<_>>(),
+                );
+                for claim in claims {
+                    super::execute_claimed_job(
+                        &fixture.store,
+                        &fixture.coordinator,
+                        &Arc::new(Semaphore::new(2)),
+                        claim,
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+            assert!(!rounds[0].is_empty());
+            assert!(
+                rounds.iter().skip(2).all(Vec::is_empty),
+                "no repeated scans after the no-request Unpin hands off to Reconcile: expire={expire}, rounds={rounds:?}"
+            );
+            let reconcile = pin_job::Entity::find()
+                .filter(pin_job::Column::Operation.eq("reconcile"))
+                .one(fixture.store.db())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(reconcile.state, "running");
+            assert_eq!(reconcile.locked_until, None);
+            assert_eq!(fixture.provider.submits.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.provider.finds.load(Ordering::SeqCst), 0);
+            let usage = pin_provider_usage::Entity::find_by_id("noop")
+                .one(fixture.store.db())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!((usage.reserved_bytes, usage.reserved_pins), (100, 1));
+        }
+    }
+
+    #[tokio::test]
     async fn ambiguous_submit_finds_and_adopts_without_second_post() {
         let fixture = fixture([
             Script::Submit(Err(provider_error(
@@ -4570,7 +5262,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn eight_ambiguous_recovery_finds_hold_quota_then_one_match_converges_without_post() {
+    async fn eight_ambiguous_recovery_finds_park_and_hold_quota_without_more_io() {
         let ambiguous = || {
             Script::Find(Ok(vec![
                 remote("ambiguous-a", RemotePinStatus::Queued),
@@ -4606,13 +5298,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(ambiguous_row.state, "pending");
+        assert_eq!(ambiguous_row.state, "running");
+        assert_eq!(ambiguous_row.locked_until, None);
         assert_eq!(ambiguous_row.submit_phase.as_deref(), Some("recovering"));
-        assert_eq!(ambiguous_row.attempts, 8);
-        assert!(
-            ambiguous_row.next_attempt_at
-                >= ambiguous_row.updated_at + chrono::Duration::seconds(300)
-        );
+        assert_eq!(ambiguous_row.attempts, 7);
         assert_eq!(fixture.provider.submits.load(Ordering::SeqCst), 0);
         assert_eq!(fixture.provider.finds.load(Ordering::SeqCst), 8);
         assert_eq!(fixture.provider.unpins.load(Ordering::SeqCst), 0);
@@ -4631,23 +5320,33 @@ mod tests {
             .unwrap();
         assert_eq!((usage.reserved_bytes, usage.reserved_pins), (100, 1));
 
-        fixture.run_one_due().await;
+        assert!(
+            jobs::claim_due_jobs(
+                fixture.store.db(),
+                Utc::now() + chrono::Duration::days(30),
+                chrono::Duration::seconds(30),
+                10
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
         let converged = pin_job::Entity::find_by_id(ambiguous_row.id)
             .one(fixture.store.db())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(converged.state, "done");
-        assert_eq!(converged.attempts, 8);
+        assert_eq!(converged.state, "running");
+        assert_eq!(converged.attempts, 7);
         assert_eq!(fixture.provider.submits.load(Ordering::SeqCst), 0);
-        assert_eq!(fixture.provider.finds.load(Ordering::SeqCst), 9);
+        assert_eq!(fixture.provider.finds.load(Ordering::SeqCst), 8);
         let remote = remote_pin::Entity::find_by_id(("noop".to_owned(), "bafy-worker".to_owned()))
             .one(fixture.store.db())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(remote.request_id.as_deref(), Some("conclusive-match"));
-        assert_eq!(remote.status, "pinned");
+        assert_eq!(remote.request_id, None);
+        assert_eq!(remote.status, "reserved");
     }
 
     #[tokio::test]
@@ -6761,7 +7460,7 @@ mod tests {
         assert_eq!(second_retry.attempts, 2);
         assert_eq!(
             second_retry.last_error.as_deref(),
-            Some("provider terminal error")
+            Some("provider authentication error")
         );
     }
 
@@ -8899,11 +9598,11 @@ mod tests {
                     crate::pinning::provider::ProviderErrorClass::Quota,
                     "provider quota reached",
                 ))),
-                Script::Find(Err(provider_error(
+                Script::Submit(Err(provider_error(
                     crate::pinning::provider::ProviderErrorClass::Quota,
                     "provider quota reached",
                 ))),
-                Script::Find(Err(provider_error(
+                Script::Submit(Err(provider_error(
                     crate::pinning::provider::ProviderErrorClass::Quota,
                     "provider quota reached",
                 ))),

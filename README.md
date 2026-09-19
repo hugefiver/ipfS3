@@ -649,13 +649,56 @@ endpoints by default. Pinata also supports `api = "v3" | "legacy"` and
 `strategy = "cid" | "upload"`. The CID strategy asks Pinata to pin the gateway's
 existing Kubo CID; the upload strategy streams the object back from local Kubo
 and uploads it to Pinata, which can support free-plan accounts that reject
-pin-by-CID. Upload requests are not bound by the 30s request timeout that
-applies to every other provider call, so large objects are limited by the
-provider and by `max_bytes` rather than by a gateway deadline; only the connect
-phase is bounded. The upload strategy also requires Pinata to return the same
+pin-by-CID. Uploads have a 30s **idle** deadline, not a short total deadline:
+the whole multipart send (including transport backpressure), response headers,
+and response body through EOF must keep progressing. Active large transfers can
+outlive 30s. A timed-out/cancelled dispatch may already have created a resource;
+it is not permission to upload again. The upload strategy requires the same
 CID the gateway computed, otherwise the submit fails permanently. An `endpoint`
 override is only for tests or private compatible services; Pinata V3 upload
 endpoint overrides use `upload_endpoint`.
+
+### Pinning Stage 1 upgrade and recovery safety
+
+Before applying `m20260920_000001_pin_submit_history`, **stop and drain every old
+gateway writer and pinning worker**, including other replicas. Back up the DB;
+then migrate and start only upgraded binaries. This is a stop-the-world upgrade,
+not mixed-version rolling operation: an old writer cannot produce the required
+execution history. Do not change provider account/scope or endpoint during this
+upgrade. Stable identity/revision migration remains a later stage.
+
+`pin_submit_history` records the actual API/strategy selected before dispatch,
+effect certainty, finite safe first/last error evidence, and separate submission
+and recovery budgets. Its counters count durable **dispatch intents**, not HTTP
+requests or billing: crashes can interrupt an intent before network IO and one
+Find can paginate. New recovery uses the historical route, not the current
+strategy. Existing unfinished jobs with no history are isolated as
+`unknown / needs_attention`; their original API is never guessed from TOML.
+
+401 blocks the credential runtime until an explicit configuration repair and
+restart. Known plan/permission 403 and unknown 403 remain distinct; they block
+that submission, not unrelated upload/list operations. Definitive rejection
+does not trigger recovery Find. Explicit transient non-creation retries with
+backoff; uncertain dispatches reconcile first. Automatic recovery is bounded by
+eight recovery attempts and one hour from initial dispatch; new dispatches also
+have an eight-attempt ceiling. Exhaustion becomes `needs_attention`, not absent.
+
+Blocked/attention rows preserve lease/remote responsibility and reservations.
+For compatibility, the corresponding `pin_jobs` row is **running with a NULL
+lock**, deliberately unclaimable by old and new workers while retaining the
+existing no-request ambiguity barrier. Do not manually clear its phase, delete
+its history, release quota, or set it pending as a retry procedure. Stage 1 has
+no new public management/reapply API; its internal
+`resume_rejected_submit_after_repair` hook accepts only an explicitly repaired,
+definitively uncreated blocked call on the same historical route. It cannot
+resume unknown effects. Public reconciliation/repair tooling is a follow-up,
+not automatic strategy fallback. Do not mix up accepted local
+publication, a remote submission, and a confirmed remote pin.
+
+Rollback requires stopping allocation and workers first. The down migration
+refuses unsettled/orphaned histories rather than erasing remote responsibility.
+Keep the upgraded database and historical routes until reconciliation is
+complete; do not drop the history table to force an old binary to run.
 
 ### Policies and coordination
 

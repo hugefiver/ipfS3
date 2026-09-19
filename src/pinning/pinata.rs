@@ -23,6 +23,10 @@ const MAX_SUCCESS_RESPONSE_BYTES: usize = 1024 * 1024;
 const V3_REQUEST_ID_PREFIX: &str = "pinata-v3:";
 const LEGACY_REQUEST_ID_PREFIX: &str = "pinata-legacy:";
 
+#[cfg(test)]
+#[path = "pinata_stage1_tests.rs"]
+mod stage1_tests;
+
 pub const PINATA_BASE_URL: &str = "https://api.pinata.cloud/v3";
 pub const PINATA_UPLOAD_BASE_URL: &str = "https://uploads.pinata.cloud/v3";
 pub const PINATA_LEGACY_BASE_URL: &str = "https://api.pinata.cloud";
@@ -55,6 +59,7 @@ pub fn build_pinata_with_options(
     PinataClient::new(name, endpoint, options, kubo, token)
 }
 
+#[derive(Clone)]
 pub struct PinataClient {
     name: String,
     v3_base_url: Result<Url, ()>,
@@ -63,6 +68,7 @@ pub struct PinataClient {
     token: SecretToken,
     http: Client,
     upload_http: Client,
+    upload_idle: Duration,
     api: PinataApi,
     strategy: PinataStrategy,
     kubo: Option<KuboClient>,
@@ -79,12 +85,14 @@ impl PinataClient {
         token: SecretToken,
     ) -> Self {
         let http = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(DEFAULT_TIMEOUT)
             .build()
             .expect("default Pinata HTTP client must build");
         // Streaming uploads must not inherit a whole-request deadline; large objects
         // legitimately outlive it, so only the connect phase is bounded.
         let upload_http = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(DEFAULT_TIMEOUT)
             .build()
             .expect("Pinata upload HTTP client must build");
@@ -133,6 +141,7 @@ impl PinataClient {
             token,
             http,
             upload_http,
+            upload_idle: DEFAULT_TIMEOUT,
             api: options.api,
             strategy: options.strategy,
             kubo,
@@ -303,7 +312,48 @@ impl PinataClient {
             .map_err(|error| self.transport_error(operation, &error))
     }
 
-    fn require_success(
+    async fn execute_upload(
+        &self,
+        url: Url,
+        form: multipart::Form,
+    ) -> Result<Response, ProviderError> {
+        use std::sync::{Arc, Mutex};
+        let content_type = format!("multipart/form-data; boundary={}", form.boundary());
+        let progress = Arc::new(Mutex::new(tokio::time::Instant::now()));
+        let sending = progress.clone();
+        // Observe the whole multipart body as the HTTP transport polls it, not
+        // merely a source reader. Backpressure/stalled socket writes stop polls.
+        let body = form.into_stream().inspect_ok(move |chunk| {
+            if !chunk.is_empty() {
+                *sending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    tokio::time::Instant::now();
+            }
+        });
+        let request = self
+            .upload_http
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, content_type)
+            .body(ReqwestBody::wrap_stream(body));
+        let send = self.execute(request, Operation::Submit);
+        tokio::pin!(send);
+        loop {
+            let deadline = *progress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                + self.upload_idle;
+            tokio::select! {
+                result = &mut send => return result,
+                _ = tokio::time::sleep_until(deadline) => {
+                    let last = *progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if last.elapsed() >= self.upload_idle { return Err(upload_idle_error()); }
+                }
+            }
+        }
+    }
+
+    async fn require_success(
         &self,
         response: Response,
         operation: Operation,
@@ -315,7 +365,8 @@ impl PinataClient {
         let status = response.status();
         let retry_after = parse_retry_after(response.headers());
         let class = match status.as_u16() {
-            401 | 403 => ProviderErrorClass::Authentication,
+            401 => ProviderErrorClass::Authentication,
+            403 => super::provider::classify_forbidden_response(response, self.upload_idle).await,
             404 if operation == Operation::Get => ProviderErrorClass::NotFound,
             // Intentional divergence from the PSA baseline, which maps only 507 to
             // Quota: Pinata reports free-tier plan limits as 402.
@@ -323,7 +374,7 @@ impl PinataClient {
             409 if operation == Operation::Submit => ProviderErrorClass::Ambiguous,
             429 => ProviderErrorClass::RateLimited,
             _ if status.is_server_error() => ProviderErrorClass::Transient,
-            _ if status.is_client_error() => ProviderErrorClass::Terminal,
+            _ if status.is_client_error() => ProviderErrorClass::InvalidInput,
             _ => ProviderErrorClass::Protocol,
         };
         Err(ProviderError {
@@ -360,9 +411,9 @@ impl PinataClient {
         }
 
         let mut body = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
+        while let Some(chunk) = tokio::time::timeout(self.upload_idle, response.chunk())
             .await
+            .map_err(|_| upload_idle_error())?
             .map_err(|error| self.transport_error(operation, &error))?
         {
             let body_length = body
@@ -381,6 +432,8 @@ impl PinataClient {
 
     async fn list_files(&self, cid: Option<&str>) -> Result<Vec<PinataFile>, ProviderError> {
         let mut page_token = None;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut expected_count = None;
         let mut files = Vec::new();
         for _ in 0..10 {
             let response = self
@@ -389,11 +442,21 @@ impl PinataClient {
                     Operation::Find,
                 )
                 .await?;
-            let response = self.require_success(response, Operation::Find)?;
+            let response = self.require_success(response, Operation::Find).await?;
             let page: PinataData<PinataFilesPage> = self.decode(response, Operation::Find).await?;
+            check_page_count(&mut expected_count, page.data.count)?;
             files.extend(page.data.files);
             page_token = page.data.next_page_token.filter(|token| !token.is_empty());
+            if page_token
+                .as_ref()
+                .is_some_and(|token| !seen.insert(token.clone()))
+            {
+                return Err(protocol_error("provider returned a pagination cycle"));
+            }
             if page_token.is_none() {
+                if expected_count.is_some_and(|count| count != files.len()) {
+                    return Err(protocol_error("provider returned an incomplete file list"));
+                }
                 return Ok(files);
             }
         }
@@ -402,6 +465,8 @@ impl PinataClient {
 
     async fn list_queue(&self, cid: Option<&str>) -> Result<Vec<PinataJob>, ProviderError> {
         let mut page_token = None;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut expected_count = None;
         let mut jobs = Vec::new();
         for _ in 0..10 {
             let response = self
@@ -410,11 +475,21 @@ impl PinataClient {
                     Operation::Find,
                 )
                 .await?;
-            let response = self.require_success(response, Operation::Find)?;
+            let response = self.require_success(response, Operation::Find).await?;
             let page: PinataData<PinataQueuePage> = self.decode(response, Operation::Find).await?;
+            check_page_count(&mut expected_count, page.data.count)?;
             jobs.extend(page.data.jobs);
             page_token = page.data.next_page_token.filter(|token| !token.is_empty());
+            if page_token
+                .as_ref()
+                .is_some_and(|token| !seen.insert(token.clone()))
+            {
+                return Err(protocol_error("provider returned a pagination cycle"));
+            }
             if page_token.is_none() {
+                if expected_count.is_some_and(|count| count != jobs.len()) {
+                    return Err(protocol_error("provider returned an incomplete pin queue"));
+                }
                 return Ok(jobs);
             }
         }
@@ -428,8 +503,13 @@ impl PinataClient {
                 Operation::Find,
             )
             .await?;
-        let response = self.require_success(response, Operation::Find)?;
+        let response = self.require_success(response, Operation::Find).await?;
         let list: LegacyPinList = self.decode(response, Operation::Find).await?;
+        if list.rows.len() >= 100 || list.count.is_some_and(|count| count != list.rows.len()) {
+            return Err(protocol_error(
+                "provider returned an incomplete legacy file list",
+            ));
+        }
         Ok(list.rows)
     }
 
@@ -442,13 +522,16 @@ impl PinataClient {
                     Operation::Find,
                 )
                 .await?;
-            let response = self.require_success(response, Operation::Find)?;
+            let response = self.require_success(response, Operation::Find).await?;
             let list: LegacyPinJobs = self.decode(response, Operation::Find).await?;
             let count = list.count;
             let page_len = list.rows.len();
             jobs.extend(list.rows);
-            if jobs.len() >= count || page_len < 100 {
+            if jobs.len() == count {
                 return Ok(jobs);
+            }
+            if jobs.len() > count || page_len < 100 {
+                return Err(protocol_error("provider returned an incomplete pin queue"));
             }
         }
         Err(protocol_error("provider returned an incomplete pin queue"))
@@ -466,7 +549,7 @@ impl PinataClient {
                 Operation::Submit,
             )
             .await?;
-        let response = self.require_success(response, Operation::Submit)?;
+        let response = self.require_success(response, Operation::Submit).await?;
         let response: PinataData<PinataJob> = self.decode(response, Operation::Submit).await?;
         let remote = self.remote_from_job_with_metadata(response.data, &request.metadata)?;
         if remote.cid != request.cid {
@@ -489,7 +572,7 @@ impl PinataClient {
                 Operation::Submit,
             )
             .await?;
-        let response = self.require_success(response, Operation::Submit)?;
+        let response = self.require_success(response, Operation::Submit).await?;
         let pinned: LegacyPinResponse = self.decode(response, Operation::Submit).await?;
         self.remote_from_legacy_pin_response(pinned, &request.cid, &request.metadata)
     }
@@ -510,15 +593,8 @@ impl PinataClient {
             .text("network", "public".to_owned())
             .text("name", request.name.clone())
             .text("keyvalues", keyvalues);
-        let response = self
-            .execute(
-                self.upload_http
-                    .post(self.upload_files_url()?)
-                    .multipart(form),
-                Operation::Submit,
-            )
-            .await?;
-        let response = self.require_success(response, Operation::Submit)?;
+        let response = self.execute_upload(self.upload_files_url()?, form).await?;
+        let response = self.require_success(response, Operation::Submit).await?;
         let uploaded: PinataData<PinataFileUpload> =
             self.decode(response, Operation::Submit).await?;
         let uploaded = uploaded.data;
@@ -544,14 +620,9 @@ impl PinataClient {
             .text("pinataMetadata", metadata)
             .text("pinataOptions", options);
         let response = self
-            .execute(
-                self.upload_http
-                    .post(self.legacy_pin_file_url()?)
-                    .multipart(form),
-                Operation::Submit,
-            )
+            .execute_upload(self.legacy_pin_file_url()?, form)
             .await?;
-        let response = self.require_success(response, Operation::Submit)?;
+        let response = self.require_success(response, Operation::Submit).await?;
         let pinned: LegacyPinResponse = self.decode(response, Operation::Submit).await?;
         self.validate_provider_field(&pinned.ipfs_hash)?;
         if pinned.ipfs_hash != request.cid {
@@ -581,13 +652,21 @@ impl PinataClient {
         let kubo = self.kubo.as_ref().ok_or_else(|| {
             protocol_error("Pinata upload strategy requires a Kubo content source")
         })?;
-        let stream = crate::kubo::cat::stream_cat(kubo, &request.cid, None)
-            .await
-            .map_err(|_| ProviderError {
-                class: ProviderErrorClass::Transient,
-                message: "Kubo content could not be read for provider upload".to_owned(),
-                retry_after: None,
-            })?;
+        let stream = tokio::time::timeout(
+            self.upload_idle,
+            crate::kubo::cat::stream_cat(kubo, &request.cid, None),
+        )
+        .await
+        .map_err(|_| ProviderError {
+            class: ProviderErrorClass::NotSubmitted,
+            message: "provider upload source idle before dispatch".into(),
+            retry_after: None,
+        })?
+        .map_err(|_| ProviderError {
+            class: ProviderErrorClass::NotSubmitted,
+            message: "Kubo content could not be read for provider upload".to_owned(),
+            retry_after: None,
+        })?;
         let mapped =
             stream.map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) });
         multipart::Part::stream(ReqwestBody::wrap_stream(mapped))
@@ -839,8 +918,8 @@ impl PinataClient {
     }
 
     fn transport_error(&self, operation: Operation, error: &reqwest::Error) -> ProviderError {
-        let class = if error.is_builder() {
-            ProviderErrorClass::Protocol
+        let class = if error.is_builder() || error.is_connect() {
+            ProviderErrorClass::NotSubmitted
         } else if operation == Operation::Submit && error.is_timeout() {
             ProviderErrorClass::Ambiguous
         } else {
@@ -863,6 +942,53 @@ impl PinataClient {
 impl PinningProvider for PinataClient {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn invocation_route(&self) -> (&'static str, &'static str) {
+        if self.legacy_psa.is_some() {
+            return ("psa", "cid");
+        }
+        (
+            match self.api {
+                PinataApi::V3 => "pinata_v3",
+                PinataApi::Legacy => "pinata_legacy",
+            },
+            match self.strategy {
+                PinataStrategy::Cid => "cid",
+                PinataStrategy::Upload => "upload",
+            },
+        )
+    }
+
+    async fn find_historical(
+        &self,
+        query: FindPin,
+        api: &str,
+        strategy: &str,
+    ) -> Result<Vec<RemotePin>, ProviderError> {
+        if api == "psa" {
+            return match self
+                .legacy_psa
+                .as_ref()
+                .or(self.legacy_request_psa.as_ref())
+            {
+                Some(psa) if strategy == "cid" => psa.find(query).await,
+                _ => Err(protocol_error("historical provider route unavailable")),
+            };
+        }
+        let mut historical = self.clone();
+        historical.legacy_psa = None;
+        historical.api = match api {
+            "pinata_v3" => PinataApi::V3,
+            "pinata_legacy" => PinataApi::Legacy,
+            _ => return Err(protocol_error("historical provider route unavailable")),
+        };
+        historical.strategy = match strategy {
+            "cid" => PinataStrategy::Cid,
+            "upload" => PinataStrategy::Upload,
+            _ => return Err(protocol_error("historical provider route unavailable")),
+        };
+        historical.find(query).await
     }
 
     async fn submit(&self, request: SubmitPin) -> Result<RemotePin, ProviderError> {
@@ -953,7 +1079,11 @@ impl PinningProvider for PinataClient {
                 .filter_map(|remote| self.request_ref(&remote.request_id).ok())
                 .map(|reference| reference.provider_id)
                 .collect::<std::collections::BTreeSet<_>>();
-            let jobs = self.list_queue(Some(&query.cid)).await?;
+            let jobs = if self.strategy == PinataStrategy::Cid {
+                self.list_queue(Some(&query.cid)).await?
+            } else {
+                Vec::new()
+            };
             for job in jobs {
                 if job.cid != query.cid {
                     return Err(protocol_error("provider response failed pin correlation"));
@@ -977,7 +1107,12 @@ impl PinningProvider for PinataClient {
                     remotes.push(self.remote_from_legacy_row_with_metadata(row, &query.metadata)?);
                 }
             }
-            for job in self.list_legacy_jobs(&query.cid).await? {
+            let jobs = if self.strategy == PinataStrategy::Cid {
+                self.list_legacy_jobs(&query.cid).await?
+            } else {
+                Vec::new()
+            };
+            for job in jobs {
                 if job.ipfs_pin_hash != query.cid {
                     return Err(protocol_error("provider response failed pin correlation"));
                 }
@@ -1013,7 +1148,7 @@ impl PinningProvider for PinataClient {
             if response.status() == StatusCode::NOT_FOUND {
                 return Ok(());
             }
-            self.require_success(response, Operation::Unpin)?;
+            self.require_success(response, Operation::Unpin).await?;
             return Ok(());
         }
         let response = self
@@ -1045,7 +1180,7 @@ impl PinningProvider for PinataClient {
                         )
                         .await?;
                     if cancel.status() != StatusCode::NOT_FOUND {
-                        self.require_success(cancel, Operation::Unpin)?;
+                        self.require_success(cancel, Operation::Unpin).await?;
                         return Ok(());
                     }
                 }
@@ -1059,7 +1194,7 @@ impl PinningProvider for PinataClient {
             }
             return Ok(());
         }
-        self.require_success(response, Operation::Unpin)?;
+        self.require_success(response, Operation::Unpin).await?;
         Ok(())
     }
 }
@@ -1087,7 +1222,7 @@ impl PinataClient {
                 .execute(self.http.delete(self.file_url(&file.id)?), Operation::Unpin)
                 .await?;
             if response.status() != StatusCode::NOT_FOUND {
-                self.require_success(response, Operation::Unpin)?;
+                self.require_success(response, Operation::Unpin).await?;
             }
             deleted = true;
         }
@@ -1168,8 +1303,10 @@ struct PinataJob {
 #[derive(Deserialize)]
 struct PinataQueuePage {
     #[serde(default)]
+    count: Option<usize>,
+    #[serde(default, deserialize_with = "nullable_list")]
     jobs: Vec<PinataJob>,
-    #[serde(default)]
+    #[serde(default, alias = "nextPageToken")]
     next_page_token: Option<String>,
 }
 
@@ -1184,9 +1321,30 @@ struct PinataFile {
 #[derive(Deserialize)]
 struct PinataFilesPage {
     #[serde(default)]
+    count: Option<usize>,
+    #[serde(default, deserialize_with = "nullable_list")]
     files: Vec<PinataFile>,
-    #[serde(default)]
+    #[serde(default, alias = "nextPageToken")]
     next_page_token: Option<String>,
+}
+
+fn nullable_list<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<Vec<T>, D::Error> {
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn check_page_count(
+    expected: &mut Option<usize>,
+    current: Option<usize>,
+) -> Result<(), ProviderError> {
+    if let Some(current) = current {
+        if expected.is_some_and(|previous| previous != current) {
+            return Err(protocol_error("provider returned conflicting page counts"));
+        }
+        *expected = Some(current);
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -1222,6 +1380,8 @@ struct LegacyPinResponse {
 #[derive(Deserialize)]
 struct LegacyPinList {
     #[serde(default)]
+    count: Option<usize>,
+    #[serde(default, deserialize_with = "nullable_list")]
     rows: Vec<LegacyPinRow>,
 }
 
@@ -1245,7 +1405,7 @@ struct LegacyPinRowMetadata {
 struct LegacyPinJobs {
     #[serde(default)]
     count: usize,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nullable_list")]
     rows: Vec<LegacyPinJob>,
 }
 
@@ -1427,6 +1587,14 @@ fn protocol_error(message: &str) -> ProviderError {
     }
 }
 
+fn upload_idle_error() -> ProviderError {
+    ProviderError {
+        class: ProviderErrorClass::Ambiguous,
+        message: "provider upload idle deadline exceeded; remote effect unknown".into(),
+        retry_after: None,
+    }
+}
+
 /// An upload-strategy CID mismatch is a deterministic chunking/DAG parity defect:
 /// retrying re-uploads the whole object and leaks another remote pin, so it is
 /// terminal rather than recoverable.
@@ -1459,6 +1627,152 @@ mod tests {
     };
 
     const TOKEN: &str = "provider-token";
+
+    #[tokio::test]
+    async fn stage1_upload_idle_bounds_response_wait() {
+        let server = MockServer::start().await;
+        let kubo_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/cat"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![42; 64]))
+            .mount(&kubo_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v3/files"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(3))
+                    .set_body_json(json!({"data":{"id":"id","cid":"cid"}})),
+            )
+            .mount(&server)
+            .await;
+        let mut client = build_pinata_with_options(
+            "pinata".into(),
+            test_token(TOKEN),
+            Some(format!("{}/v3", server.uri())),
+            PinataProviderOptions {
+                api: PinataApi::V3,
+                strategy: PinataStrategy::Upload,
+                upload_endpoint: Some(format!("{}/v3", server.uri())),
+            },
+            Some(KuboClient::new(kubo_server.uri())),
+        );
+        client.upload_idle = Duration::from_millis(100);
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.submit(SubmitPin {
+                cid: "cid".into(),
+                name: "name".into(),
+                metadata: BTreeMap::new(),
+            }),
+        )
+        .await;
+        let error = result
+            .expect("idle upload must release its slot before outer deadline")
+            .unwrap_err();
+        assert_eq!(error.class, ProviderErrorClass::Ambiguous);
+        assert_eq!(requests(&server).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stage1_nullable_lists_and_camel_pagination_are_complete() {
+        for empty in [json!(null), json!([])] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v3/files/public"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(json!({"data":{"files":empty}})),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/v3/files/public/pin_by_cid"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(json!({"data":{"jobs":empty}})),
+                )
+                .mount(&server)
+                .await;
+            assert!(
+                provider(&server)
+                    .find(FindPin::for_job("cid", "job-7"))
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(requests(&server).await.len(), 2);
+        }
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v3/files/public"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"data":{"files":[],"nextPageToken":"again"}})),
+            )
+            .mount(&server)
+            .await;
+        assert!(
+            provider(&server)
+                .find(FindPin::for_job("cid", "job-7"))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            requests(&server).await.len(),
+            2,
+            "cycle must be detected before repeating HTTP"
+        );
+    }
+
+    #[tokio::test]
+    async fn stage1_upload_find_never_calls_cid_queue() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v3/files/public"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":{"files":[]}})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v3/files/public/pin_by_cid"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        let mut client = provider(&server);
+        client.strategy = PinataStrategy::Upload;
+        assert!(
+            client
+                .find(FindPin::for_job("cid", "job-7"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(requests(&server).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stage1_forbidden_is_not_auth_and_never_echoes_body_secrets() {
+        for (code, expected) in [
+            ("PLAN_RESTRICTED", "PlanRestricted"),
+            ("PERMISSION_DENIED", "PermissionDenied"),
+            ("unexpected", "UnknownForbidden"),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST")).respond_with(ResponseTemplate::new(403).set_body_json(json!({"error":{"code":code,"message":"eyJhbGci.JWT-SENTINEL SSE-C-SENTINEL ?credential=QUERY-SENTINEL"}}))).mount(&server).await;
+            let error = provider(&server)
+                .submit(SubmitPin {
+                    cid: "cid".into(),
+                    name: "name".into(),
+                    metadata: BTreeMap::new(),
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(format!("{:?}", error.class), expected);
+            let rendered = format!("{error:?} {error}");
+            for secret in ["JWT-SENTINEL", "SSE-C-SENTINEL", "QUERY-SENTINEL"] {
+                assert!(!rendered.contains(secret));
+            }
+            assert_eq!(requests(&server).await.len(), 1);
+        }
+    }
 
     fn provider(server: &MockServer) -> crate::pinning::pinata::PinataClient {
         build_pinata(
@@ -2560,13 +2874,13 @@ mod tests {
     async fn submit_http_error_statuses_map_to_their_provider_error_classes() {
         for (status, expected) in [
             (401, ProviderErrorClass::Authentication),
-            (403, ProviderErrorClass::Authentication),
+            (403, ProviderErrorClass::UnknownForbidden),
             (402, ProviderErrorClass::Quota),
             (507, ProviderErrorClass::Quota),
             (409, ProviderErrorClass::Ambiguous),
             (429, ProviderErrorClass::RateLimited),
-            (400, ProviderErrorClass::Terminal),
-            (404, ProviderErrorClass::Terminal),
+            (400, ProviderErrorClass::InvalidInput),
+            (404, ProviderErrorClass::InvalidInput),
             (500, ProviderErrorClass::Transient),
         ] {
             let server = MockServer::start().await;

@@ -24,6 +24,7 @@ use s3s::{Body as S3Body, HttpError};
 use sea_orm::DbErr;
 
 mod shutdown;
+mod telemetry;
 
 const READY_DEADLINE: Duration = Duration::from_secs(2);
 const READY_PROBE_URL: &str = "http://127.0.0.1:9000/ready";
@@ -90,8 +91,8 @@ async fn ready_probe() -> bool {
     ready_probe_url(READY_PROBE_URL, READY_DEADLINE).await
 }
 
-async fn handle_s3_error(err: HttpError) -> HttpResponse<S3Body> {
-    tracing::error!(?err, "s3 service error");
+async fn handle_s3_error(_err: HttpError) -> HttpResponse<S3Body> {
+    tracing::error!(failure = "s3_service", "s3 service error");
     HttpResponse::builder()
         .status(StatusCode::INTERNAL_SERVER_ERROR)
         .body(S3Body::from("Internal Server Error".to_string()))
@@ -120,6 +121,7 @@ fn gateway_app(state: Arc<AppState>, imports: Arc<ImportCoordinator>) -> Router 
         .layer(axum::middleware::from_fn(
             s3::http::bridge_chunked_content_length,
         ))
+        .layer(axum::middleware::from_fn(telemetry::record_request_status))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             ipfs_s3_gateway::cors::http::bucket_cors,
@@ -128,17 +130,11 @@ fn gateway_app(state: Arc<AppState>, imports: Arc<ImportCoordinator>) -> Router 
 }
 
 async fn run_gateway() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::builder()
-                .with_default_directive(tracing_subscriber::filter::LevelFilter::INFO.into())
-                .from_env_lossy(),
-        )
-        .init();
+    telemetry::init();
 
     let cfg = Config::load()?;
     let lifecycle_config = cfg.lifecycle.validate()?;
-    tracing::info!(bind = %cfg.server.bind, kubo = %cfg.kubo.rpc_url, "starting ipfs-s3-gateway");
+    tracing::info!(bind = %cfg.server.bind, "starting ipfs-s3-gateway");
 
     let state = AppState::new(&cfg).await?;
     let import_config = cfg.imports.validate()?;
