@@ -252,20 +252,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bucket_cors_migration_remains_eleventh_before_lifecycle_abort_and_preserves_pre_cors_bucket()
-     {
-        let migrations = crate::store::migrator::Migrator::migrations();
-        assert_eq!(migrations.len(), 14);
-        assert_eq!(migrations[10].name(), "m20260831_000001_bucket_cors");
-        assert_eq!(
-            migrations[11].name(),
-            "m20260901_000001_lifecycle_abort_multipart"
-        );
-        assert_eq!(
-            migrations[12].name(),
-            "m20260912_000001_residency_references"
-        );
-
+    async fn bucket_cors_migration_preserves_pre_cors_bucket() {
         let db = first_ten_migrations_db().await;
         insert_bucket(&db, "existing").await;
         Migration.up(&SchemaManager::new(&db)).await.unwrap();

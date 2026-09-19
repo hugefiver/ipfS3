@@ -521,6 +521,7 @@ impl DecompressZipRoute {
         max_decompressed_bytes: u64,
     ) -> S3Result<S3Response<Body>> {
         let parsed = parse_decompress_put_uri(&req.uri)?;
+        crate::s3::http::reject_write_conditions(&req.headers, false)?;
         crate::s3::ops::storage_class::require_standard_write_headers(&req.headers)?;
         if has_sse_header(&req.headers) {
             return Err(s3s::s3_error!(
@@ -556,83 +557,92 @@ impl DecompressZipRoute {
         )
         .await?;
 
-        let archive =
-            crate::s3::ops::object::add_plain_object_stream(&self.state, req.input).await?;
-        let archive_stream =
-            crate::kubo::cat::stream_cat(&self.state.kubo, &archive.cid, None).await?;
-        let outcome = crate::zip::extract::extract_zip_stream_with_limit(
-            &self.state,
-            &parsed.target_prefix,
-            archive_stream,
-            max_decompressed_bytes,
-        )
-        .await?;
-
-        reject_archive_key_collision(&parsed.key, &outcome.entries)?;
-
-        let published = outcome.entries;
-        let failures = outcome.failures;
-        let archive_object = PublicationObject::from_put(
-            uuid::Uuid::new_v4().to_string(),
-            &parsed.bucket,
-            &parsed.key,
-            archive.cid.clone(),
-            archive.size,
-            content_type,
-            metadata,
-            false,
-            None,
-            None,
-            chrono::Utc::now(),
-        );
-        let request = ZipPublicationRequest {
-            archive: PublicationRequest {
-                object: archive_object,
-                tags: tags.clone(),
-                policy,
-                object_target: PinTargetSpec {
-                    cid: archive.cid.clone(),
-                    logical_size: archive.size,
-                },
-            },
-            entries: publication_entries(&parsed.bucket, &published),
-        };
-        let publication_result = crate::store::pinning::publication::publish_standard_zip(
+        crate::store::import::ownership::run_mutation(
             self.state.store.db(),
-            request,
-            mutation_guard,
-            self.state.pinning.provider_limits(),
-        )
-        .await?;
+            &mutation_guard.clone(),
+            |lease| async move {
+                let archive =
+                    crate::s3::ops::object::add_plain_object_stream(&self.state, req.input).await?;
+                let archive_stream =
+                    crate::kubo::cat::stream_cat(&self.state.kubo, &archive.cid, None).await?;
+                let outcome = crate::zip::extract::extract_zip_stream_with_limit(
+                    &self.state,
+                    &parsed.target_prefix,
+                    archive_stream,
+                    max_decompressed_bytes,
+                )
+                .await?;
 
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            http::header::ETAG,
-            http::HeaderValue::from_str(&format!("\"{}\"", archive.cid)).unwrap(),
-        );
-        insert_version_id_header(&mut headers, publication_result.version_id.as_deref())?;
-        if parsed.return_result_xml {
-            let result = crate::zip::response::DecompressZipResult {
-                archive_key: parsed.key,
-                archive_cid: archive.cid,
-                archive_size: archive.size,
-                entries: published,
-                failures,
-            };
-            headers.insert(
-                http::header::CONTENT_TYPE,
-                http::HeaderValue::from_static("application/xml"),
-            );
-            Ok(S3Response::with_headers(
-                Body::from(crate::zip::response::decompress_result_xml(&result)),
-                headers,
-            ))
-        } else {
-            Ok(S3Response::with_headers(Body::empty(), headers))
-        }
+                reject_archive_key_collision(&parsed.key, &outcome.entries)?;
+
+                let published = outcome.entries;
+                let failures = outcome.failures;
+                let archive_object = PublicationObject::from_put(
+                    uuid::Uuid::new_v4().to_string(),
+                    &parsed.bucket,
+                    &parsed.key,
+                    archive.cid.clone(),
+                    archive.size,
+                    content_type,
+                    metadata,
+                    false,
+                    None,
+                    None,
+                    chrono::Utc::now(),
+                );
+                let request = ZipPublicationRequest {
+                    archive: PublicationRequest {
+                        object: archive_object,
+                        tags: tags.clone(),
+                        policy,
+                        object_target: PinTargetSpec {
+                            cid: archive.cid.clone(),
+                            logical_size: archive.size,
+                        },
+                    },
+                    entries: publication_entries(&parsed.bucket, &published),
+                };
+                let publication_result = lease
+                    .commit(crate::store::pinning::publication::publish_standard_zip(
+                        self.state.store.db(),
+                        request,
+                        mutation_guard,
+                        self.state.pinning.provider_limits(),
+                    ))
+                    .await?;
+
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    http::header::ETAG,
+                    http::HeaderValue::from_str(&format!("\"{}\"", archive.cid)).unwrap(),
+                );
+                insert_version_id_header(&mut headers, publication_result.version_id.as_deref())?;
+                if parsed.return_result_xml {
+                    let result = crate::zip::response::DecompressZipResult {
+                        archive_key: parsed.key,
+                        archive_cid: archive.cid,
+                        archive_size: archive.size,
+                        entries: published,
+                        failures,
+                    };
+                    headers.insert(
+                        http::header::CONTENT_TYPE,
+                        http::HeaderValue::from_static("application/xml"),
+                    );
+                    Ok(S3Response::with_headers(
+                        Body::from(crate::zip::response::decompress_result_xml(&result)),
+                        headers,
+                    ))
+                } else {
+                    Ok(S3Response::with_headers(Body::empty(), headers))
+                }
+            },
+        )
+        .await
     }
 
     async fn call_complete(&self, mut req: S3Request<Body>) -> S3Result<S3Response<Body>> {
+        crate::s3::http::reject_write_conditions(&req.headers, false)?;
         crate::s3::ops::storage_class::require_standard_write_headers(&req.headers)?;
         let (bucket, key) = parse_path_bucket_key(&req.uri)?;
         let upload_id = crate::s3::query::decoded_query_pairs(&req.uri)?
@@ -665,79 +675,97 @@ impl DecompressZipRoute {
             crate::s3::ops::multipart::complete_multipart_upload_inner(&self.state, inner_req)
                 .await?;
 
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            http::header::CONTENT_TYPE,
-            http::HeaderValue::from_static("application/xml"),
-        );
-        headers.insert(
-            http::header::ETAG,
-            http::HeaderValue::from_str(&format!("\"{}\"", completed.root_cid)).unwrap(),
-        );
-        if let Some(sse) = &completed.server_side_encryption {
-            headers.insert(
-                "x-amz-server-side-encryption",
-                http::HeaderValue::from_str(sse.as_str()).unwrap(),
-            );
-        }
+        let lease = completed
+            .mutation_lease
+            .clone()
+            .ok_or_else(|| s3s::s3_error!(InternalError, "missing multipart mutation lease"))?;
+        let result = lease
+            .run(async {
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    http::header::CONTENT_TYPE,
+                    http::HeaderValue::from_static("application/xml"),
+                );
+                headers.insert(
+                    http::header::ETAG,
+                    http::HeaderValue::from_str(&format!("\"{}\"", completed.root_cid)).unwrap(),
+                );
+                if let Some(sse) = &completed.server_side_encryption {
+                    headers.insert(
+                        "x-amz-server-side-encryption",
+                        http::HeaderValue::from_str(sse.as_str()).unwrap(),
+                    );
+                }
 
-        if let Some(target_prefix) = completed.decompress_zip_target.clone() {
-            let archive_stream =
-                crate::kubo::cat::stream_cat(&self.state.kubo, &completed.root_cid, None).await?;
-            let outcome = crate::zip::extract::extract_zip_stream(
-                &self.state,
-                &target_prefix,
-                archive_stream,
-            )
-            .await?;
+                if let Some(target_prefix) = completed.decompress_zip_target.clone() {
+                    let archive_stream =
+                        crate::kubo::cat::stream_cat(&self.state.kubo, &completed.root_cid, None)
+                            .await?;
+                    let outcome = crate::zip::extract::extract_zip_stream(
+                        &self.state,
+                        &target_prefix,
+                        archive_stream,
+                    )
+                    .await?;
 
-            reject_archive_key_collision(&completed.key, &outcome.entries)?;
-            let published = outcome.entries;
-            let failures = outcome.failures;
-            let request = ZipPublicationRequest {
-                archive: crate::s3::ops::multipart::completed_publication_request(&completed),
-                entries: publication_entries(&completed.bucket, &published),
-            };
-            let publication_result = crate::s3::ops::multipart::finalize_completed_multipart_zip(
-                &self.state,
-                &completed,
-                request,
-            )
-            .await?;
-            insert_version_id_header(&mut headers, publication_result.version_id.as_deref())?;
+                    reject_archive_key_collision(&completed.key, &outcome.entries)?;
+                    let published = outcome.entries;
+                    let failures = outcome.failures;
+                    let request = ZipPublicationRequest {
+                        archive: crate::s3::ops::multipart::completed_publication_request(
+                            &completed,
+                        ),
+                        entries: publication_entries(&completed.bucket, &published),
+                    };
+                    let publication_result =
+                        crate::s3::ops::multipart::finalize_completed_multipart_zip(
+                            &self.state,
+                            &completed,
+                            request,
+                        )
+                        .await?;
+                    insert_version_id_header(
+                        &mut headers,
+                        publication_result.version_id.as_deref(),
+                    )?;
 
-            let xml = if completed.decompress_zip_result {
-                crate::zip::response::decompress_result_xml(
-                    &crate::zip::response::DecompressZipResult {
-                        archive_key: completed.key.clone(),
-                        archive_cid: completed.root_cid.clone(),
-                        archive_size: completed.total_size,
-                        entries: published,
-                        failures,
-                    },
-                )
-            } else {
-                crate::zip::response::complete_multipart_result_xml(
+                    let xml = if completed.decompress_zip_result {
+                        crate::zip::response::decompress_result_xml(
+                            &crate::zip::response::DecompressZipResult {
+                                archive_key: completed.key.clone(),
+                                archive_cid: completed.root_cid.clone(),
+                                archive_size: completed.total_size,
+                                entries: published,
+                                failures,
+                            },
+                        )
+                    } else {
+                        crate::zip::response::complete_multipart_result_xml(
+                            &completed.bucket,
+                            &completed.key,
+                            &completed.root_cid,
+                        )
+                    };
+                    return Ok(S3Response::with_headers(Body::from(xml), headers));
+                }
+
+                let publication_result =
+                    crate::s3::ops::multipart::finalize_completed_multipart_archive(
+                        &self.state,
+                        &completed,
+                    )
+                    .await?;
+                insert_version_id_header(&mut headers, publication_result.version_id.as_deref())?;
+                let xml = crate::zip::response::complete_multipart_result_xml(
                     &completed.bucket,
                     &completed.key,
                     &completed.root_cid,
-                )
-            };
-            return Ok(S3Response::with_headers(Body::from(xml), headers));
-        }
-
-        let publication_result = crate::s3::ops::multipart::finalize_completed_multipart_archive(
-            &self.state,
-            &completed,
-        )
-        .await?;
-        insert_version_id_header(&mut headers, publication_result.version_id.as_deref())?;
-        let xml = crate::zip::response::complete_multipart_result_xml(
-            &completed.bucket,
-            &completed.key,
-            &completed.root_cid,
-        );
-        Ok(S3Response::with_headers(Body::from(xml), headers))
+                );
+                Ok(S3Response::with_headers(Body::from(xml), headers))
+            })
+            .await;
+        lease.finish().await;
+        result
     }
 }
 

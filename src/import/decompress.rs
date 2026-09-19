@@ -119,7 +119,7 @@ pub(crate) async fn decompress_import_with_context(
                 Err(ObservedExtractionError::Limit(_)) => {
                     return Err(terminal_failure(
                         ImportFailureCode::DecompressionLimitExceeded,
-                        "ZIP archive exceeds the decompressed byte limit",
+                        "ZIP archive exceeds a decompression resource limit",
                     ));
                 }
                 Err(ObservedExtractionError::Archive(error)) => {

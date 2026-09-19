@@ -424,6 +424,7 @@ pub struct CompletedMultipartArchive {
     pub decompress_zip_result: bool,
     pub server_side_encryption: Option<ServerSideEncryption>,
     pub mutation_guard: crate::store::import::ownership::StandardMutationGuard,
+    pub mutation_lease: Option<Arc<crate::store::import::ownership::MutationLease>>,
 }
 
 #[async_trait::async_trait]
@@ -541,13 +542,20 @@ pub async fn finalize_completed_multipart_zip(
     let store = DatabaseCompletedUploadFinalizer {
         db: state.store.db(),
     };
-    finalize_completed_multipart_zip_with_store(
+    let work = finalize_completed_multipart_zip_with_store(
         completed,
         request,
         state.pinning.provider_limits(),
         &store,
-    )
-    .await
+    );
+    let result = match &completed.mutation_lease {
+        Some(lease) => lease.commit(work).await,
+        None => work.await,
+    };
+    if let Some(lease) = &completed.mutation_lease {
+        lease.finish().await;
+    }
+    result
 }
 
 pub(crate) async fn finalize_completed_multipart_zip_with_store<
@@ -633,12 +641,19 @@ pub async fn finalize_completed_multipart_archive(
     let store = DatabaseCompletedUploadFinalizer {
         db: state.store.db(),
     };
-    finalize_completed_multipart_archive_with_store(
+    let work = finalize_completed_multipart_archive_with_store(
         completed,
         state.pinning.provider_limits(),
         &store,
-    )
-    .await
+    );
+    let result = match &completed.mutation_lease {
+        Some(lease) => lease.commit(work).await,
+        None => work.await,
+    };
+    if let Some(lease) = &completed.mutation_lease {
+        lease.finish().await;
+    }
+    result
 }
 
 async fn finalize_completed_multipart_archive_with_store<
@@ -729,6 +744,10 @@ pub async fn complete_multipart_upload_inner(
     state: &Arc<AppState>,
     req: S3Request<CompleteMultipartUploadInput>,
 ) -> S3Result<CompletedMultipartArchive> {
+    crate::s3::http::reject_write_conditions(
+        &req.headers,
+        req.input.if_match.is_some() || req.input.if_none_match.is_some(),
+    )?;
     let completion_attempt_id = uuid::Uuid::new_v4().to_string();
     let bucket = &req.input.bucket;
     let key = &req.input.key;
@@ -873,6 +892,11 @@ pub async fn complete_multipart_upload_inner(
         .await?
     };
 
+    let lease = Arc::new(crate::store::import::ownership::MutationLease::start(
+        db,
+        &mutation_guard,
+    ));
+    let result = lease.run(async {
     let part_cids: Vec<String> = parts_to_concat.iter().map(|(c, _)| c.clone()).collect();
 
     let kubo = state.kubo.clone();
@@ -1034,7 +1058,13 @@ pub async fn complete_multipart_upload_inner(
         decompress_zip_result: upload.decompress_zip_result,
         server_side_encryption,
         mutation_guard,
+        mutation_lease: Some(lease.clone()),
     })
+    }).await;
+    if result.is_err() {
+        lease.finish().await;
+    }
+    result
 }
 
 /// Abort a multipart upload, discarding its database records.
@@ -1917,6 +1947,7 @@ mod tests {
                 expected_generation: 1,
                 mutation_prefix: None,
             },
+            mutation_lease: None,
         }
     }
 

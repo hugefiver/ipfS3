@@ -21,6 +21,7 @@ pub mod pin_provider_usage;
 pub mod remote_pin;
 pub mod residency_backfill;
 pub mod residency_reference;
+pub mod standard_mutation_lease;
 pub mod version_residency;
 
 #[cfg(test)]

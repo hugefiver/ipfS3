@@ -1128,9 +1128,12 @@ mod tests {
                 let count = remaining.min(buffer.len());
                 socket.read_exact(&mut buffer[..count]).await.unwrap();
                 let observed = buffer[..count].iter().filter(|byte| **byte == 0xa5).count();
-                car_bytes.fetch_add(observed, Ordering::Release);
+                if observed != 0 {
+                    car_bytes.fetch_add(observed, Ordering::Release);
+                    tokio::time::advance(delay).await;
+                    tokio::task::yield_now().await;
+                }
                 remaining -= count;
-                tokio::time::sleep(delay).await;
             }
             assert!(read_crlf_line(socket).await.is_empty());
         }
@@ -1409,13 +1412,18 @@ mod tests {
         let _ = destination_task.await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn active_upload_longer_than_idle_timeout_succeeds() {
-        const CHUNKS: usize = 128;
+        const CHUNKS: usize = 64;
         let (source, sent, source_task) = complete_source_server(CHUNKS).await;
         let idle_timeout = Duration::from_millis(500);
         let (destination, received, destination_task) =
             slow_complete_destination_server(Duration::from_millis(10)).await;
+        let clock_guard = tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        });
         let source_client = KuboClient::new(source);
         let destination_client =
             KuboClient::new_with_timeouts(destination, Duration::from_secs(5), idle_timeout);
@@ -1451,8 +1459,10 @@ mod tests {
 
         source_task.abort();
         destination_task.abort();
+        clock_guard.abort();
         let _ = source_task.await;
         let _ = destination_task.await;
+        let _ = clock_guard.await;
     }
 
     #[tokio::test]

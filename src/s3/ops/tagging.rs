@@ -290,9 +290,29 @@ async fn replace_tag_set(
                             .expect("renewal policy requires an existing manual lease")
                             .id
                             .as_str();
-                        leases::renew_manual_lease(txn, &owner_id, lease_id, retain_until, now)
-                            .await
-                            .map_err(map_renewal_error)?;
+                        match &selector {
+                            VersionSelector::Current => {
+                                leases::renew_manual_lease(
+                                    txn,
+                                    &owner_id,
+                                    lease_id,
+                                    retain_until,
+                                    now,
+                                )
+                                .await
+                            }
+                            VersionSelector::Exact(_) => {
+                                leases::renew_retained_version_manual_lease(
+                                    txn,
+                                    &owner_id,
+                                    lease_id,
+                                    retain_until,
+                                    now,
+                                )
+                                .await
+                            }
+                        }
+                        .map_err(map_renewal_error)?;
                     }
                     ManualLeaseMutation::Cancel => {
                         let lease_id = manual
@@ -2267,6 +2287,72 @@ mod tests {
             .unwrap()
             .output;
         assert!(historical.tag_set.is_empty());
+        assert_eq!(tag_pairs(&current.tag_set), vec![("current", "kept")]);
+    }
+
+    #[tokio::test]
+    async fn exact_historical_tagging_renews_its_manual_lease() {
+        let versions = versioned_fixture().await;
+        seed_tags_for_owner(
+            &versions.fixture,
+            &versions.current_object_id,
+            &[("current", "kept")],
+        )
+        .await;
+        seed_lease_for_owner(
+            &versions.fixture,
+            &versions.historical_object_id,
+            "historical-manual-renewal",
+            "manual",
+            "active",
+            "full",
+            time(5),
+            7,
+            &[TargetSeed {
+                id: "historical-manual-target",
+                cid: "bafy-object",
+                provider: "alpha",
+                target_state: "pinned",
+                remote_status: "pinned",
+                remote_epoch: 3,
+                request_id: Some("historical-manual-request"),
+            }],
+        )
+        .await;
+        seed_usage(&versions.fixture, "alpha", 1).await;
+
+        let output = put_object_tagging_at(
+            &versions.fixture.state,
+            put_version_request(
+                &[
+                    ("ipfs-s3:pin", "true"),
+                    ("ipfs-s3:retain-until", "2026-07-22T08:00:00Z"),
+                    ("historical", "renewed"),
+                ],
+                Some(&versions.historical_version_id),
+            ),
+            time(4),
+        )
+        .await
+        .expect("an exact retained version must control its own manual lease")
+        .output;
+
+        assert_eq!(
+            output.version_id.as_deref(),
+            Some(versions.historical_version_id.as_str())
+        );
+        let renewed = pin_lease::Entity::find_by_id("historical-manual-renewal")
+            .one(versions.fixture.state.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(renewed.owner_object_id, versions.historical_object_id);
+        assert_eq!(renewed.generation, 8);
+        assert_eq!(renewed.expires_at, time(8));
+        let current = get_object_tagging(&versions.fixture.state, get_request(KEY))
+            .await
+            .unwrap()
+            .output;
         assert_eq!(tag_pairs(&current.tag_set), vec![("current", "kept")]);
     }
 

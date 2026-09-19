@@ -59,6 +59,12 @@ pub fn sanitize_entry(name: &str, target_prefix: &str) -> AppResult<SanitizedEnt
         return Err(AppError::InvalidZipEntry(name.to_owned()));
     }
 
+    if target_prefix.len().saturating_add(trimmed.len()) > 1024 {
+        return Err(AppError::InvalidZipEntry(
+            "final object key exceeds 1024 UTF-8 bytes".to_owned(),
+        ));
+    }
+
     if is_directory {
         return Ok(SanitizedEntry::Directory);
     }

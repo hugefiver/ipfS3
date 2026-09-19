@@ -105,6 +105,56 @@ pub struct ResolvedVersion {
     pub created_at: DateTime<Utc>,
 }
 
+/// Fully resolved metadata for one S3 read. Network work must use this owned
+/// value only after the database snapshot has been released.
+pub struct ObjectReadSnapshot {
+    pub version: ResolvedVersion,
+    pub versioning_state: BucketVersioningState,
+    pub residency: Option<crate::residency::ResolvedVersionResidency>,
+    pub tags: Vec<crate::pinning::tags::ObjectTag>,
+}
+
+pub async fn read_snapshot(
+    db: &sea_orm::DatabaseConnection,
+    bucket_name: &str,
+    key: &str,
+    selector: &VersionSelector,
+) -> AppResult<ObjectReadSnapshot> {
+    use sea_orm::{AccessMode, IsolationLevel, TransactionTrait};
+
+    // SQLite BEGIN retains the snapshot from the first SELECT. PostgreSQL's
+    // default READ COMMITTED does not, so explicitly request REPEATABLE READ.
+    let txn = if db.get_database_backend() == DatabaseBackend::Sqlite {
+        db.begin().await?
+    } else {
+        db.begin_with_config(
+            Some(IsolationLevel::RepeatableRead),
+            Some(AccessMode::ReadOnly),
+        )
+        .await?
+    };
+    let version = resolve_version(&txn, bucket_name, key, selector).await?;
+    #[cfg(test)]
+    snapshot_tests::checkpoint("object").await;
+    let residency = if version.kind == VersionKind::Object {
+        Some(super::residency::resolve_version_residency(&txn, &version.id).await?)
+    } else {
+        None
+    };
+    let versioning_state = bucket::get_versioning_state(&txn, bucket_name).await?;
+    let tags = match version.object.as_ref() {
+        Some(object) => super::pinning::tags::list_object_tags(&txn, &object.id).await?,
+        None => Vec::new(),
+    };
+    txn.commit().await?;
+    Ok(ObjectReadSnapshot {
+        version,
+        versioning_state,
+        residency,
+        tags,
+    })
+}
+
 impl ResolvedVersion {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -234,8 +284,14 @@ async fn one_version<C: ConnectionTrait>(
     } else {
         query.one(db).await?
     };
+    #[cfg(test)]
+    snapshot_tests::checkpoint("version").await;
     Ok(row)
 }
+
+#[cfg(test)]
+#[path = "object_version/snapshot_tests.rs"]
+mod snapshot_tests;
 
 async fn resolved_from_row<C: ConnectionTrait>(
     db: &C,

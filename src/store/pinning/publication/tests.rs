@@ -352,7 +352,7 @@ async fn execute_lifecycle_current_expiration(
     let guard = match admit_lifecycle_expiration(db, target, "publication-test", 1, now).await? {
         LifecycleAdmissionResult::Admitted(guard) => guard,
         LifecycleAdmissionResult::Stale => return Ok(GuardedLifecycleExecutionResult::Stale),
-        LifecycleAdmissionResult::Temporary => {
+        LifecycleAdmissionResult::Temporary | LifecycleAdmissionResult::Dependency => {
             return Err(AppError::Database(
                 "lifecycle admission is temporarily unavailable".to_owned(),
             ));

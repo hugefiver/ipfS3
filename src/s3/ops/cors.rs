@@ -19,16 +19,13 @@ pub async fn get_bucket_cors(
     req: S3Request<GetBucketCorsInput>,
 ) -> S3Result<S3Response<GetBucketCorsOutput>> {
     let input = req.input;
-    let bucket = load_bucket_and_verify_owner(
+    let json = crate::store::cors_config::get_optional_configuration_for_owner(
         state.store.db(),
         &input.bucket,
         input.expected_bucket_owner.as_deref(),
     )
-    .await?;
-    let json =
-        crate::store::cors_config::get_optional_configuration(state.store.db(), &bucket.name)
-            .await?
-            .ok_or(AppError::NoSuchCorsConfiguration)?;
+    .await?
+    .ok_or(AppError::NoSuchCorsConfiguration)?;
     let configuration = crate::cors::config::from_canonical_json(&json)?;
     let configuration = crate::cors::config::to_s3_configuration(&configuration);
 
@@ -42,7 +39,8 @@ pub async fn put_bucket_cors(
     req: S3Request<PutBucketCorsInput>,
 ) -> S3Result<S3Response<PutBucketCorsOutput>> {
     let input = req.input;
-    let bucket = load_bucket_and_verify_owner(
+    // Preserve the existing S3 validation order; the store repeats this check under its lock.
+    load_bucket_and_verify_owner(
         state.store.db(),
         &input.bucket,
         input.expected_bucket_owner.as_deref(),
@@ -102,7 +100,13 @@ pub async fn put_bucket_cors(
 
     let configuration = crate::cors::config::validate_and_canonicalize(input.cors_configuration)?;
     let json = crate::cors::config::canonical_json(&configuration)?;
-    crate::store::cors_config::put_configuration(state.store.db(), &bucket.name, &json).await?;
+    crate::store::cors_config::put_configuration_for_owner(
+        state.store.db(),
+        &input.bucket,
+        &json,
+        input.expected_bucket_owner.as_deref(),
+    )
+    .await?;
 
     Ok(S3Response::new(PutBucketCorsOutput::default()))
 }
@@ -112,13 +116,12 @@ pub async fn delete_bucket_cors(
     req: S3Request<DeleteBucketCorsInput>,
 ) -> S3Result<S3Response<DeleteBucketCorsOutput>> {
     let input = req.input;
-    let bucket = load_bucket_and_verify_owner(
+    crate::store::cors_config::delete_configuration_for_owner(
         state.store.db(),
         &input.bucket,
         input.expected_bucket_owner.as_deref(),
     )
     .await?;
-    crate::store::cors_config::delete_configuration(state.store.db(), &bucket.name).await?;
 
     Ok(S3Response::new(DeleteBucketCorsOutput::default()))
 }

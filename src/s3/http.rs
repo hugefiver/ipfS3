@@ -3,11 +3,40 @@ use axum::middleware::Next;
 use axum::response::Response;
 use http::header::CONTENT_LENGTH;
 
-/// Supplies s3s with the signed decoded length when `Content-Length` is absent.
+/// Rejects browser forms before s3s reads them, then bridges decoded length.
 ///
 /// `x-amz-decoded-content-length` is part of the signed request and gives s3s
 /// the exact decoded body length without changing the observed wire framing.
 pub async fn bridge_chunked_content_length(mut request: Request, next: Next) -> Response {
+    // s3s parses browser forms before authentication and may aggregate gigabytes.
+    // This must stay outside the s3s service, not in its custom route callback.
+    // s3s selects form authentication by method/media type before inspecting
+    // the route. Do not exempt query keys: that would reopen aggregation via
+    // ?uploads, ?uploadId or a custom route. Their normal XML POSTs are untouched.
+    if request.method() == http::Method::POST
+        && request
+            .headers()
+            .get_all(http::header::CONTENT_TYPE)
+            .iter()
+            .any(|value| {
+                value.to_str().is_ok_and(|value| {
+                    value
+                        .split(';')
+                        .next()
+                        .unwrap_or_default()
+                        .trim()
+                        .eq_ignore_ascii_case("multipart/form-data")
+                })
+            })
+    {
+        return Response::builder()
+            .status(http::StatusCode::BAD_REQUEST)
+            .header(http::header::CONTENT_TYPE, "application/xml")
+            .body(axum::body::Body::from(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>InvalidRequest</Code><Message>Browser multipart/form-data uploads are not supported</Message></Error>",
+            ))
+            .expect("static admission response");
+    }
     if !request.headers().contains_key(CONTENT_LENGTH)
         && let Some(length) = request
             .headers()
@@ -20,6 +49,21 @@ pub async fn bridge_chunked_content_length(mut request: Request, next: Next) -> 
     }
 
     next.run(request).await
+}
+
+/// Conditions must not disappear when a custom route builds an s3s DTO. Check
+/// raw header presence (including empty values) as well as typed DTO presence.
+pub(crate) fn reject_write_conditions(headers: &http::HeaderMap, typed: bool) -> s3s::S3Result<()> {
+    if typed
+        || headers.contains_key(http::header::IF_MATCH)
+        || headers.contains_key(http::header::IF_NONE_MATCH)
+    {
+        return Err(s3s::s3_error!(
+            InvalidRequest,
+            "conditional writes are not supported"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -1,4 +1,3 @@
-use std::cell::Cell;
 use std::io;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -22,17 +21,27 @@ impl LocalHeaderMeta {
 }
 
 struct ProbeState {
-    generation: u64,
     armed: bool,
     header: Vec<u8>,
+    descriptor: bool,
+    position: u64,
+    entries_left: u64,
+    metadata_left: u64,
+    prefix_bytes: u64,
+    limit_exceeded: bool,
 }
 
 impl ProbeState {
     fn new() -> Self {
         Self {
-            generation: 0,
             armed: false,
             header: Vec::with_capacity(LOCAL_HEADER_LEN),
+            descriptor: false,
+            position: 0,
+            entries_left: super::extract::MAX_ARCHIVE_ENTRIES,
+            metadata_left: super::extract::MAX_ARCHIVE_METADATA_BYTES,
+            prefix_bytes: 0,
+            limit_exceeded: false,
         }
     }
 }
@@ -40,8 +49,6 @@ impl ProbeState {
 pub struct LocalHeaderObserver<R> {
     inner: BufReader<R>,
     shared: Arc<Mutex<ProbeState>>,
-    seen_generation: u64,
-    fill_observed: Cell<usize>,
 }
 
 #[derive(Clone)]
@@ -58,21 +65,71 @@ where
         LocalHeaderObserver {
             inner: BufReader::new(reader),
             shared: shared.clone(),
-            seen_generation: 0,
-            fill_observed: Cell::new(0),
         },
         LocalHeaderProbe { shared },
     )
 }
 
 impl LocalHeaderProbe {
+    pub(super) fn set_budget(&self, entries: u64, metadata: u64, prefix_bytes: usize) {
+        let mut state = self
+            .shared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.entries_left = entries;
+        state.metadata_left = metadata;
+        state.prefix_bytes = prefix_bytes as u64;
+    }
+
+    pub(super) fn limit_exceeded(&self) -> bool {
+        self.shared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .limit_exceeded
+    }
+
+    pub(super) fn position(&self) -> u64 {
+        self.shared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .position
+    }
+
+    pub(super) fn begin_descriptor(&self) {
+        let mut state = self
+            .shared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.armed = true;
+        state.descriptor = true;
+        state.header.clear();
+    }
+
+    pub(super) fn descriptor_matches(&self, crc: u32, compressed: u64, size: u64) -> bool {
+        let mut state = self
+            .shared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.armed = false;
+        let bytes = state.header.as_slice();
+        let bytes = if bytes.starts_with(&0x0807_4b50_u32.to_le_bytes()) {
+            &bytes[4..]
+        } else {
+            bytes
+        };
+        bytes.len() == 12
+            && u32_at(bytes, 0) == crc
+            && u64::from(u32_at(bytes, 4)) == compressed
+            && u64::from(u32_at(bytes, 8)) == size
+    }
+
     pub fn begin(&self) {
         let mut state = self
             .shared
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        state.generation = state.generation.wrapping_add(1);
         state.armed = true;
+        state.descriptor = false;
         state.header.clear();
     }
 
@@ -102,29 +159,45 @@ impl LocalHeaderProbe {
     }
 }
 
-fn observe_prefix(shared: &Arc<Mutex<ProbeState>>, bytes: &[u8]) -> usize {
-    let mut state = shared.lock().unwrap_or_else(|error| error.into_inner());
-    if !state.armed || state.header.len() == LOCAL_HEADER_LEN {
-        return 0;
-    }
-
-    let length = bytes.len().min(LOCAL_HEADER_LEN - state.header.len());
-    state.header.extend_from_slice(&bytes[..length]);
-    length
+fn u32_at(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(
+        bytes[offset..offset + 4]
+            .try_into()
+            .expect("fixed ZIP field"),
+    )
 }
 
-impl<R> LocalHeaderObserver<R> {
-    fn sync_generation(&mut self) {
-        let generation = self
-            .shared
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .generation;
-        if self.seen_generation != generation {
-            self.seen_generation = generation;
-            self.fill_observed.set(0);
-        }
+fn observe_consumed(shared: &Arc<Mutex<ProbeState>>, bytes: &[u8]) -> io::Result<()> {
+    let mut state = shared.lock().unwrap_or_else(|error| error.into_inner());
+    state.position += bytes.len() as u64;
+    let length = if state.descriptor {
+        16
+    } else {
+        LOCAL_HEADER_LEN
+    };
+    if !state.armed || state.header.len() == length {
+        return Ok(());
     }
+    let length = bytes.len().min(length - state.header.len());
+    state.header.extend_from_slice(&bytes[..length]);
+    if !state.descriptor
+        && state.header.len() == LOCAL_HEADER_LEN
+        && state.header[..4] == LOCAL_HEADER_SIGNATURE
+    {
+        let name = u16::from_le_bytes([state.header[26], state.header[27]]) as u64;
+        let extra = u16::from_le_bytes([state.header[28], state.header[29]]) as u64;
+        // Reserve fixed result/error bookkeeping plus copies of names, keys and
+        // extra fields (including Unicode aliases) retained by parser/observers.
+        let charge =
+            4096_u64.saturating_add(8_u64.saturating_mul(name + extra + state.prefix_bytes));
+        if state.entries_left == 0 || state.metadata_left < charge {
+            state.limit_exceeded = true;
+            return Err(io::Error::other("ZIP entry or metadata budget exceeded"));
+        }
+        state.entries_left -= 1;
+        state.metadata_left -= charge;
+    }
+    Ok(())
 }
 
 impl<R> AsyncRead for LocalHeaderObserver<R>
@@ -137,12 +210,26 @@ where
         buffer: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        this.sync_generation();
-        let before = buffer.filled().len();
-        match Pin::new(&mut this.inner).poll_read(cx, buffer) {
+        let cap = {
+            let state = this
+                .shared
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if state.armed && !state.descriptor && state.header.len() < LOCAL_HEADER_LEN {
+                buffer
+                    .remaining()
+                    .min(LOCAL_HEADER_LEN - state.header.len())
+            } else {
+                buffer.remaining()
+            }
+        };
+        let mut limited = ReadBuf::new(&mut buffer.initialize_unfilled()[..cap]);
+        match Pin::new(&mut this.inner).poll_read(cx, &mut limited) {
             Poll::Ready(Ok(())) => {
-                observe_prefix(&this.shared, &buffer.filled()[before..]);
-                Poll::Ready(Ok(()))
+                let count = limited.filled().len();
+                let result = observe_consumed(&this.shared, limited.filled());
+                buffer.advance(count);
+                Poll::Ready(result)
             }
             Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
             Poll::Pending => Poll::Pending,
@@ -156,29 +243,18 @@ where
 {
     fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
         let this = self.get_mut();
-        this.sync_generation();
-        let shared = &this.shared;
-        let fill_observed = &this.fill_observed;
-        let previously_observed = fill_observed.get();
-
-        match Pin::new(&mut this.inner).poll_fill_buf(cx) {
-            Poll::Ready(Ok(buffer)) => {
-                let start = previously_observed.min(buffer.len());
-                let observed = observe_prefix(shared, &buffer[start..]);
-                fill_observed.set(start + observed);
-                Poll::Ready(Ok(buffer))
-            }
-            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
-            Poll::Pending => Poll::Pending,
-        }
+        // async_zip reads fixed headers through AsyncRead; the decompressor uses
+        // fill_buf/consume. Count only consumed bytes, never decoder read-ahead.
+        Pin::new(&mut this.inner).poll_fill_buf(cx)
     }
 
     fn consume(self: Pin<&mut Self>, amount: usize) {
         let this = self.get_mut();
-        this.sync_generation();
+        this.shared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .position += amount as u64;
         Pin::new(&mut this.inner).consume(amount);
-        this.fill_observed
-            .set(this.fill_observed.get().saturating_sub(amount));
     }
 }
 

@@ -1,7 +1,6 @@
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait, QueryFilter,
-    QuerySelect, Set, TransactionError, TransactionTrait,
-    sea_query::{Expr, OnConflict},
+    ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait, Set, Statement,
+    TransactionError, TransactionTrait, sea_query::OnConflict,
 };
 
 use crate::error::{AppError, AppResult};
@@ -24,17 +23,57 @@ pub async fn get_optional_configuration<C: ConnectionTrait>(
     )
 }
 
+/// Returns the stored CORS configuration after atomically checking the current bucket owner.
+pub async fn get_optional_configuration_for_owner<C: ConnectionTrait>(
+    db: &C,
+    bucket_name: &str,
+    expected_owner: Option<&str>,
+) -> AppResult<Option<String>> {
+    let backend = db.get_database_backend();
+    let parameter = match backend {
+        DatabaseBackend::Postgres => "$1",
+        DatabaseBackend::Sqlite | DatabaseBackend::MySql => "?",
+    };
+    let row = db
+        .query_one(Statement::from_sql_and_values(
+            backend,
+            format!(
+                "SELECT b.owner, c.canonical_json \
+                 FROM buckets AS b \
+                 LEFT JOIN bucket_cors_configs AS c ON c.bucket = b.name \
+                 WHERE b.name = {parameter}"
+            ),
+            [bucket_name.to_owned().into()],
+        ))
+        .await?
+        .ok_or_else(|| AppError::NoSuchBucket(bucket_name.to_owned()))?;
+    let owner: Option<String> = row.try_get("", "owner")?;
+    verify_expected_owner(owner.as_deref(), expected_owner)?;
+    row.try_get("", "canonical_json").map_err(AppError::from)
+}
+
 /// Atomically replaces a bucket's complete CORS configuration.
 pub async fn put_configuration(
     db: &DatabaseConnection,
     bucket_name: &str,
     canonical_json: &str,
 ) -> AppResult<()> {
+    put_configuration_for_owner(db, bucket_name, canonical_json, None).await
+}
+
+/// Atomically replaces a bucket's CORS configuration after checking its current owner.
+pub async fn put_configuration_for_owner(
+    db: &DatabaseConnection,
+    bucket_name: &str,
+    canonical_json: &str,
+    expected_owner: Option<&str>,
+) -> AppResult<()> {
     let bucket_name = bucket_name.to_owned();
     let canonical_json = canonical_json.to_owned();
+    let expected_owner = expected_owner.map(str::to_owned);
     db.transaction(move |txn| {
         Box::pin(async move {
-            lock_bucket(txn, &bucket_name).await?;
+            lock_bucket_and_verify_owner(txn, &bucket_name, expected_owner.as_deref()).await?;
             let now = database_now(txn).await?;
             let previous = bucket_cors_config::Entity::find_by_id(bucket_name.clone())
                 .one(txn)
@@ -66,10 +105,20 @@ pub async fn put_configuration(
 
 /// Physically removes a bucket's CORS configuration. Deleting an absent row succeeds.
 pub async fn delete_configuration(db: &DatabaseConnection, bucket_name: &str) -> AppResult<()> {
+    delete_configuration_for_owner(db, bucket_name, None).await
+}
+
+/// Removes a bucket's CORS configuration after atomically checking its current owner.
+pub async fn delete_configuration_for_owner(
+    db: &DatabaseConnection,
+    bucket_name: &str,
+    expected_owner: Option<&str>,
+) -> AppResult<()> {
     let bucket_name = bucket_name.to_owned();
+    let expected_owner = expected_owner.map(str::to_owned);
     db.transaction(move |txn| {
         Box::pin(async move {
-            lock_bucket(txn, &bucket_name).await?;
+            lock_bucket_and_verify_owner(txn, &bucket_name, expected_owner.as_deref()).await?;
             database_now(txn).await?;
             before_write(WriteOperation::Delete).await?;
             bucket_cors_config::Entity::delete_by_id(bucket_name)
@@ -88,30 +137,30 @@ enum WriteOperation {
     Delete,
 }
 
-async fn lock_bucket<C: ConnectionTrait>(db: &C, bucket_name: &str) -> AppResult<bucket::Model> {
-    if db.get_database_backend() == DatabaseBackend::Postgres {
-        return bucket::Entity::find_by_id(bucket_name.to_owned())
-            .lock_exclusive()
-            .one(db)
-            .await?
-            .ok_or_else(|| AppError::NoSuchBucket(bucket_name.to_owned()));
-    }
-
-    let locked = bucket::Entity::update_many()
-        .col_expr(
-            bucket::Column::CreatedAt,
-            Expr::col(bucket::Column::CreatedAt).into(),
-        )
-        .filter(bucket::Column::Name.eq(bucket_name))
-        .exec(db)
-        .await?;
-    if locked.rows_affected != 1 {
-        return Err(AppError::NoSuchBucket(bucket_name.to_owned()));
-    }
-    bucket::Entity::find_by_id(bucket_name.to_owned())
+async fn lock_bucket_and_verify_owner<C: ConnectionTrait>(
+    db: &C,
+    bucket_name: &str,
+    expected_owner: Option<&str>,
+) -> AppResult<()> {
+    super::import::ownership::lock_bucket_for_ownership(db, bucket_name).await?;
+    let bucket = bucket::Entity::find_by_id(bucket_name.to_owned())
         .one(db)
         .await?
-        .ok_or_else(|| AppError::NoSuchBucket(bucket_name.to_owned()))
+        .ok_or_else(|| AppError::NoSuchBucket(bucket_name.to_owned()))?;
+    verify_expected_owner(bucket.owner.as_deref(), expected_owner)
+}
+
+fn verify_expected_owner(
+    bucket_owner: Option<&str>,
+    expected_owner: Option<&str>,
+) -> AppResult<()> {
+    match expected_owner {
+        None => Ok(()),
+        Some(value) if bucket_owner == Some(value) => Ok(()),
+        Some(_) => Err(AppError::AccessDenied(
+            "expected bucket owner mismatch".to_owned(),
+        )),
+    }
 }
 
 async fn before_write(operation: WriteOperation) -> AppResult<()> {

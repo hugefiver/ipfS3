@@ -647,6 +647,12 @@ pub enum ManualLeaseRenewalOutcome {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManualLeaseOwnerScope {
+    Latest,
+    RetainedVersion,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RenewManualLeaseError {
     #[error("manual lease is not owned by the latest object")]
@@ -2309,7 +2315,47 @@ pub async fn renew_manual_lease<C: ConnectionTrait>(
     retain_until: DateTimeUtc,
     now: DateTimeUtc,
 ) -> Result<ManualLeaseRenewalOutcome, RenewManualLeaseError> {
-    let snapshot = renewal_snapshot(db, owner_object_id, lease_id).await?;
+    renew_manual_lease_for_owner(
+        db,
+        owner_object_id,
+        lease_id,
+        retain_until,
+        now,
+        ManualLeaseOwnerScope::Latest,
+    )
+    .await
+}
+
+/// Renews a manual lease owned by an exact retained version.
+///
+/// The caller must lock and revalidate the exact public version identity in the same transaction.
+pub(crate) async fn renew_retained_version_manual_lease<C: ConnectionTrait>(
+    db: &C,
+    owner_object_id: &str,
+    lease_id: &str,
+    retain_until: DateTimeUtc,
+    now: DateTimeUtc,
+) -> Result<ManualLeaseRenewalOutcome, RenewManualLeaseError> {
+    renew_manual_lease_for_owner(
+        db,
+        owner_object_id,
+        lease_id,
+        retain_until,
+        now,
+        ManualLeaseOwnerScope::RetainedVersion,
+    )
+    .await
+}
+
+async fn renew_manual_lease_for_owner<C: ConnectionTrait>(
+    db: &C,
+    owner_object_id: &str,
+    lease_id: &str,
+    retain_until: DateTimeUtc,
+    now: DateTimeUtc,
+    owner_scope: ManualLeaseOwnerScope,
+) -> Result<ManualLeaseRenewalOutcome, RenewManualLeaseError> {
+    let snapshot = renewal_snapshot(db, owner_object_id, lease_id, owner_scope).await?;
 
     #[cfg(test)]
     pause_after_renewal_snapshot(lease_id).await;
@@ -2318,7 +2364,9 @@ pub async fn renew_manual_lease<C: ConnectionTrait>(
     if lease.source != MANUAL_SOURCE {
         return Err(RenewManualLeaseError::InvalidState);
     }
-    if lease.owner_object_id != owner_object_id || !snapshot.owner.is_latest {
+    if lease.owner_object_id != owner_object_id
+        || (owner_scope == ManualLeaseOwnerScope::Latest && !snapshot.owner.is_latest)
+    {
         return Err(RenewManualLeaseError::NotLatestOwner);
     }
     match lease.state.as_str() {
@@ -2328,7 +2376,7 @@ pub async fn renew_manual_lease<C: ConnectionTrait>(
                 stage_renewal_owner_before_guard(db, lease_id, &snapshot.owner)
                     .await
                     .map_err(app_to_renewal_error)?;
-                guard_latest_owner(db, &snapshot.owner).await?;
+                guard_renewal_owner(db, &snapshot.owner, owner_scope).await?;
                 return Ok(ManualLeaseRenewalOutcome::Kept {
                     generation: lease.generation,
                 });
@@ -2341,7 +2389,7 @@ pub async fn renew_manual_lease<C: ConnectionTrait>(
             stage_renewal_owner_before_guard(db, lease_id, &snapshot.owner)
                 .await
                 .map_err(app_to_renewal_error)?;
-            guard_latest_owner(db, &snapshot.owner).await?;
+            guard_renewal_owner(db, &snapshot.owner, owner_scope).await?;
             let generation = advance_active_manual_lease(db, lease, retain_until, now).await?;
             let targets: Vec<_> = snapshot
                 .targets
@@ -2371,7 +2419,7 @@ pub async fn renew_manual_lease<C: ConnectionTrait>(
     stage_renewal_owner_before_guard(db, lease_id, &snapshot.owner)
         .await
         .map_err(app_to_renewal_error)?;
-    guard_latest_owner(db, &snapshot.owner).await?;
+    guard_renewal_owner(db, &snapshot.owner, owner_scope).await?;
     let generation = reactivate_expired_manual_lease(db, lease, retain_until, now).await?;
     let restored_target_ids = restore_snapshot_targets(db, &snapshot, &recoverable, now).await?;
     if restored_target_ids.is_empty() {
@@ -2412,7 +2460,7 @@ fn renewal_owner_condition(expected: &object::Model) -> Condition {
         .add(object::Column::Etag.eq(&expected.etag))
         .add(object::Column::Encrypted.eq(expected.encrypted))
         .add(object::Column::Multipart.eq(expected.multipart))
-        .add(object::Column::IsLatest.eq(true))
+        .add(object::Column::IsLatest.eq(expected.is_latest))
 }
 
 fn renewal_owner_query(expected: &object::Model) -> sea_orm::Select<object::Entity> {
@@ -2430,6 +2478,7 @@ fn renewal_owner_lock_query(expected: &object::Model) -> sea_orm::Select<object:
 async fn lock_renewal_owner<C: ConnectionTrait>(
     db: &C,
     expected: &object::Model,
+    owner_scope: ManualLeaseOwnerScope,
 ) -> Result<object::Model, RenewManualLeaseError> {
     #[cfg(test)]
     record_owner_lock(&expected.id).await;
@@ -2448,11 +2497,12 @@ async fn lock_renewal_owner<C: ConnectionTrait>(
     }
 
     // This check is still before lifecycle locking, so it cannot invert owner → lease ordering.
-    // Later paths must use `guard_latest_owner` only, never acquire this row again.
-    if object::Entity::find_by_id(expected.id.clone())
-        .one(db)
-        .await?
-        .is_some_and(|owner| !owner.is_latest)
+    // Later paths must use `guard_renewal_owner` only, never acquire this row again.
+    if owner_scope == ManualLeaseOwnerScope::Latest
+        && object::Entity::find_by_id(expected.id.clone())
+            .one(db)
+            .await?
+            .is_some_and(|owner| !owner.is_latest)
     {
         Err(RenewManualLeaseError::NotLatestOwner)
     } else {
@@ -2460,14 +2510,16 @@ async fn lock_renewal_owner<C: ConnectionTrait>(
     }
 }
 
-/// Performs the portable latest-owner compare-and-set after revalidation and immediately before
-/// each successful renewal mutation. It intentionally uses the caller's connection and never
-/// opens a transaction or reacquires the owner after lifecycle locks.
-async fn guard_latest_owner<C: ConnectionTrait>(
+/// Performs the portable exact-owner compare-and-set after revalidation and immediately before
+/// each successful renewal mutation. Latest-owner callers additionally require `is_latest=true`.
+/// It intentionally uses the caller's connection and never opens a transaction or reacquires the
+/// owner after lifecycle locks.
+async fn guard_renewal_owner<C: ConnectionTrait>(
     db: &C,
     expected: &object::Model,
+    owner_scope: ManualLeaseOwnerScope,
 ) -> Result<(), RenewManualLeaseError> {
-    if !expected.is_latest {
+    if owner_scope == ManualLeaseOwnerScope::Latest && !expected.is_latest {
         return Err(RenewManualLeaseError::NotLatestOwner);
     }
 
@@ -2475,7 +2527,7 @@ async fn guard_latest_owner<C: ConnectionTrait>(
     record_owner_guard(&expected.id).await;
 
     let guarded = object::Entity::update_many()
-        .col_expr(object::Column::IsLatest, Expr::value(true))
+        .col_expr(object::Column::IsLatest, Expr::value(expected.is_latest))
         .filter(renewal_owner_condition(expected))
         .exec(db)
         .await?;
@@ -2554,6 +2606,7 @@ async fn renewal_snapshot<C: ConnectionTrait>(
     db: &C,
     owner_object_id: &str,
     lease_id: &str,
+    owner_scope: ManualLeaseOwnerScope,
 ) -> Result<RenewalSnapshot, RenewManualLeaseError> {
     let Some(owner) = object::Entity::find_by_id(owner_object_id.to_owned())
         .one(db)
@@ -2561,7 +2614,7 @@ async fn renewal_snapshot<C: ConnectionTrait>(
     else {
         return Err(RenewManualLeaseError::NotLatestOwner);
     };
-    if !owner.is_latest {
+    if owner_scope == ManualLeaseOwnerScope::Latest && !owner.is_latest {
         return Err(RenewManualLeaseError::NotLatestOwner);
     }
     let Some(lease) = pin_lease::Entity::find_by_id(lease_id.to_owned())
@@ -2606,7 +2659,7 @@ async fn renewal_snapshot<C: ConnectionTrait>(
     // The owner is always the first lifecycle lock. PostgreSQL keeps this exact FOR UPDATE row
     // lock through the caller-owned transaction; SQLite defers its no-op CAS to the final guard
     // so unrelated writers can still resolve the snapshot before a renewal mutates anything.
-    let owner = lock_renewal_owner(db, &owner).await?;
+    let owner = lock_renewal_owner(db, &owner, owner_scope).await?;
     let mut lifecycle_leases = BTreeMap::new();
     for (id, expected) in &discovered_leases {
         let locked = lock_lifecycle_lease(db, expected, false)
@@ -2699,7 +2752,7 @@ async fn revalidate_renewal_snapshot<C: ConnectionTrait>(
     snapshot: &RenewalSnapshot,
 ) -> Result<(), RenewManualLeaseError> {
     // The owner was acquired before the lifecycle frontier. Re-reading it here would invert
-    // owner → lease → target → remote lock order; `guard_latest_owner` validates it immediately
+    // owner → lease → target → remote lock order; `guard_renewal_owner` validates it immediately
     // before every successful mutation instead.
     for expected in snapshot.lifecycle_leases.values() {
         let current = pin_lease::Entity::find_by_id(expected.id.clone())

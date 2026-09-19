@@ -30,6 +30,7 @@ pub const FAILURE_INTERNAL_DEPENDENCY: &str = "internal_dependency";
 pub const FAILURE_CANCELLED_STALE: &str = "cancelled_stale";
 pub const TRANSITION_SETTLEMENT_REQUIRED: &str = "transition_settlement_required";
 const WAITING_FOR_TRANSITION: &str = "waiting_for_transition";
+const WAITING_FOR_MUTATION: &str = "waiting_for_mutation";
 const TRANSITION_RECHECK_SECONDS: i64 = 30;
 pub const REDACTED_LIFECYCLE_ACTION_ERROR: &str = "lifecycle action failed";
 
@@ -262,12 +263,21 @@ pub async fn claim_due_with_max_attempts(
     unreachable!("SQLite lifecycle action claim retry loop always returns or errors")
 }
 
-/// Obtains the current, active claim row while holding a PostgreSQL row lock when applicable.
+/// Locks the bucket before the current active action row on PostgreSQL (SQLite
+/// acquires write intent). This is the shared execution/renewal lock hierarchy.
 /// Callers use this immediately before execution to reject a reclaimed or expired worker token.
 pub async fn lock_claim_for_execution<C: ConnectionTrait>(
     db: &C,
     claim: &ClaimedLifecycleAction,
 ) -> AppResult<Option<lifecycle_action::Model>> {
+    // Bucket -> action -> destination/lease, including renewal and cleanup.
+    // Bucket deletion cascades action rows, so action -> bucket would deadlock
+    // against deletion (and any bucket-owned configuration transaction).
+    match lock_bucket_for_ownership(db, &claim.action.bucket).await {
+        Ok(()) => {}
+        Err(AppError::NoSuchBucket(_)) => return Ok(None),
+        Err(error) => return Err(error),
+    }
     let query = lifecycle_action::Entity::find().filter(active_claim_condition(claim));
     let action = if db.get_database_backend() == DatabaseBackend::Postgres {
         query.lock_exclusive().one(db).await?
@@ -313,7 +323,6 @@ async fn renew_claim_in_transaction<C: ConnectionTrait>(
     claim: &ClaimedLifecycleAction,
     lease_for: Duration,
 ) -> AppResult<bool> {
-    acquire_sqlite_action_write_intent(db, &claim.action.id).await?;
     if lock_claim_for_execution(db, claim).await?.is_none() {
         return Ok(false);
     }
@@ -338,6 +347,16 @@ async fn renew_claim_in_transaction<C: ConnectionTrait>(
         .filter(lifecycle_action::Column::LeaseUntil.gt(now))
         .exec(db)
         .await?;
+    if updated.rows_affected == 1 && claim.action.target_type == "version" {
+        crate::store::import::ownership::renew_lifecycle_mutation_in_transaction(
+            db,
+            &claim.action.bucket,
+            &claim.action.object_key,
+            &claim.action.id,
+            claim.claim_epoch,
+        )
+        .await?;
+    }
     Ok(updated.rows_affected == 1)
 }
 
@@ -446,6 +465,43 @@ pub(crate) fn waiting_for_transition(action: &lifecycle_action::Model) -> bool {
         && action.failure_class.as_deref() == Some(WAITING_FOR_TRANSITION)
 }
 
+pub(crate) fn waiting_for_dependency(action: &lifecycle_action::Model) -> bool {
+    waiting_for_transition(action)
+        || (action.target_type == "version"
+            && action.failure_class.as_deref() == Some(WAITING_FOR_MUTATION))
+}
+
+fn consumed_attempts(action: &lifecycle_action::Model) -> i64 {
+    action
+        .attempts
+        .saturating_sub(i64::from(!waiting_for_dependency(action)))
+}
+
+/// Park the same durable action for an ownership dependency. Return false only
+/// if its ordinary failure budget was already spent; callers retain their
+/// existing terminal/saga-settlement path in that case.
+pub(crate) async fn wait_for_mutation_dependency(
+    db: &DatabaseConnection,
+    claim: &ClaimedLifecycleAction,
+    max_attempts: i64,
+) -> AppResult<bool> {
+    let claim = claim.clone();
+    db.transaction(move |txn| {
+        Box::pin(async move {
+            let Some(action) = lock_claim_for_execution(txn, &claim).await? else {
+                return Ok(true);
+            };
+            if consumed_attempts(&action) >= max_attempts {
+                return Ok(false);
+            }
+            park_dependency_in_transaction(txn, &claim, &action, WAITING_FOR_MUTATION).await?;
+            Ok(true)
+        })
+    })
+    .await
+    .map_err(normalize_transaction_error)
+}
+
 /// Keep the same durable identity while transition temporarily wins. This is a
 /// dependency, not an execution failure. Rechecks (including crashed/reclaimed
 /// rechecks) do not consume the ordinary failure budget. The caller must prove
@@ -463,12 +519,17 @@ pub(crate) async fn wait_for_transition_in_transaction(
             "invalid transition dependency action".into(),
         ));
     }
+    park_dependency_in_transaction(txn, claim, &action, WAITING_FOR_TRANSITION).await
+}
+
+async fn park_dependency_in_transaction(
+    txn: &sea_orm::DatabaseTransaction,
+    claim: &ClaimedLifecycleAction,
+    action: &lifecycle_action::Model,
+    reason: &str,
+) -> AppResult<bool> {
     let now = database_now(txn).await?;
-    let attempts = if waiting_for_transition(&action) {
-        action.attempts
-    } else {
-        action.attempts.saturating_sub(1)
-    };
+    let attempts = consumed_attempts(action);
     let updated = lifecycle_action::Entity::update_many()
         .col_expr(lifecycle_action::Column::State, Expr::value(STATE_PENDING))
         .col_expr(lifecycle_action::Column::Attempts, Expr::value(attempts))
@@ -486,7 +547,7 @@ pub(crate) async fn wait_for_transition_in_transaction(
         )
         .col_expr(
             lifecycle_action::Column::FailureClass,
-            Expr::value(Some(WAITING_FOR_TRANSITION.to_owned())),
+            Expr::value(Some(reason.to_owned())),
         )
         .col_expr(
             lifecycle_action::Column::LastErrorRedacted,
@@ -527,7 +588,7 @@ pub(crate) async fn wait_for_hot_verification_in_transaction(
         .col_expr(lifecycle_action::Column::State, Expr::value(STATE_PENDING))
         .col_expr(
             lifecycle_action::Column::Attempts,
-            Expr::value(action.attempts.saturating_sub(1)),
+            Expr::value(consumed_attempts(&action)),
         )
         .col_expr(
             lifecycle_action::Column::NextAttemptAt,
@@ -576,7 +637,7 @@ pub async fn schedule_retry<C: ConnectionTrait>(
         // failure leaves dependency mode and uses the ordinary bounded budget.
         .col_expr(
             lifecycle_action::Column::Attempts,
-            Expr::value(claim.action.attempts + i64::from(waiting_for_transition(&claim.action))),
+            Expr::value(claim.action.attempts + i64::from(waiting_for_dependency(&claim.action))),
         )
         .col_expr(
             lifecycle_action::Column::NextAttemptAt,
@@ -616,15 +677,54 @@ async fn claim_due_in_transaction<C: ConnectionTrait>(
     max_attempts: i64,
     limit: u64,
 ) -> AppResult<Vec<ClaimedLifecycleAction>> {
+    if db.get_database_backend() == DatabaseBackend::Sqlite {
+        // SQLite has one writer, not row locks. Obtain write intent before
+        // candidate discovery so two deferred read snapshots cannot deadlock
+        // while both attempt to upgrade to the bucket write fence.
+        db.execute_unprepared("UPDATE lifecycle_actions SET claim_epoch = claim_epoch WHERE 0")
+            .await?;
+    }
+    let candidates = due_candidates(db, database_now(db).await?, limit).await?;
+    let mut locked_buckets = std::collections::BTreeSet::new();
+    for bucket in candidates
+        .iter()
+        .map(|candidate| candidate.bucket.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        match lock_bucket_for_ownership(db, &bucket).await {
+            Ok(()) => {
+                locked_buckets.insert(bucket);
+            }
+            Err(AppError::NoSuchBucket(_)) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    // Candidate discovery is not authorization. After all bucket locks are held,
+    // re-read due rows and sample the engine clock before installing a lease.
     let now = database_now(db).await?;
     let lease_until = now.checked_add_signed(lease_for).ok_or_else(|| {
         AppError::InvalidArgument(
             "lifecycle action lease is outside the database timestamp range".to_owned(),
         )
     })?;
-    let candidates = due_candidates(db, now, limit).await?;
     let mut claimed = Vec::with_capacity(candidates.len());
     for candidate in candidates {
+        if !locked_buckets.contains(&candidate.bucket) {
+            continue;
+        }
+        let query =
+            lifecycle_action::Entity::find_by_id(candidate.id).filter(due_claim_condition(now));
+        let candidate = if db.get_database_backend() == DatabaseBackend::Postgres {
+            query
+                .lock_with_behavior(LockType::Update, LockBehavior::SkipLocked)
+                .one(db)
+                .await?
+        } else {
+            query.one(db).await?
+        };
+        let Some(candidate) = candidate else {
+            continue;
+        };
         let transition = is_transition_action(&candidate);
         let transition_saga = if transition {
             transition_saga_state(db, &candidate.id).await?
@@ -643,7 +743,7 @@ async fn claim_due_in_transaction<C: ConnectionTrait>(
             // recovery claim, a probe does not increment attempts, so granting
             // this exception would allow unlimited recovery claims at the cap.
             let one_recovery_claim =
-                !waiting_for_transition(&candidate) && candidate.attempts == max_attempts;
+                !waiting_for_dependency(&candidate) && candidate.attempts == max_attempts;
             let one_recovery_claim =
                 one_recovery_claim && (candidate.state == STATE_CLAIMED || transition);
             if !one_recovery_claim && !published_cleanup && !final_saga_settlement {
@@ -668,12 +768,6 @@ async fn due_candidates<C: ConnectionTrait>(
         .order_by_asc(lifecycle_action::Column::DueAt)
         .order_by_asc(lifecycle_action::Column::Id)
         .limit(limit);
-    if db.get_database_backend() == DatabaseBackend::Postgres {
-        return Ok(query
-            .lock_with_behavior(LockType::Update, LockBehavior::SkipLocked)
-            .all(db)
-            .await?);
-    }
     Ok(query.all(db).await?)
 }
 
@@ -689,7 +783,7 @@ async fn claim_candidate<C: ConnectionTrait>(
         || candidate.last_error_redacted.as_deref() == Some(TRANSITION_SETTLEMENT_REQUIRED);
     let attempts = candidate
         .attempts
-        .saturating_add(i64::from(!waiting_for_transition(&candidate)));
+        .saturating_add(i64::from(!waiting_for_dependency(&candidate)));
     let claim_epoch = candidate
         .claim_epoch
         .checked_add(1)

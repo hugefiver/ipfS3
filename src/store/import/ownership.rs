@@ -14,6 +14,7 @@ use crate::{
     store::{
         entities::{
             bucket, import_destination, import_job, import_job_target, import_prefix_claim,
+            standard_mutation_lease,
         },
         import::{
             jobs::{NewImportJob, SubmitImportOutcome, find_idempotent, insert_queued},
@@ -34,6 +35,21 @@ const POSTGRES_BUCKET_OWNERSHIP_LOCK_SQL: &str =
     "SELECT name FROM buckets WHERE name = $1 FOR NO KEY UPDATE";
 /// Bounds ownership discovery and release while preserving the global ascending job-ID lock order.
 const OWNERSHIP_BATCH_SIZE: u64 = 128;
+
+#[cfg(test)]
+mod mutation_tests;
+
+mod mutation_lease;
+pub(crate) use mutation_lease::renew_lifecycle_mutation_in_transaction;
+pub use mutation_lease::{MutationLease, run_mutation};
+use mutation_lease::{
+    mutation_lease_identity, recover_expired_mutations_in_transaction, verify_mutation_lease,
+};
+pub use mutation_lease::{release_standard_mutation, renew_standard_mutation};
+
+/// Long streaming requests renew every 30 seconds; a vanished process cannot
+/// block lifecycle for more than this database-clock lease interval.
+pub const STANDARD_MUTATION_LEASE_SECONDS: i64 = 120;
 
 enum IdempotencyPreflightOutcome {
     Match(Box<import_job::Model>),
@@ -58,9 +74,10 @@ pub struct ImportPublicationGuard {
 
 /// Durable fence returned by a standard content-mutation admission.
 ///
-/// The token lives on the archive/exact destination row until the operation's
-/// final publication or delete transaction validates and clears it. A newer
-/// overlapping admission clears the token, making the older operation stale.
+/// The token and destination generation identify a finite database-clock lease.
+/// Publication/delete validates both at entry and completion. Explicit release,
+/// expiry recovery, or a newer overlapping admission can clear the token; none
+/// of these paths restores superseded import ownership.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StandardMutationGuard {
     pub bucket: String,
@@ -661,6 +678,7 @@ pub async fn try_admit_lifecycle_mutation<C: ConnectionTrait + TransactionTrait>
             .transaction(move |txn| {
                 Box::pin(async move {
                     lock_bucket_for_ownership(txn, &bucket_name).await?;
+                    recover_expired_mutations_in_transaction(txn, &bucket_name).await?;
                     let destination = find_destination_for_update(txn, &bucket_name, &key).await?;
                     if destination
                         .as_ref()
@@ -1287,6 +1305,7 @@ pub(crate) async fn verify_standard_mutation_guard<C: ConnectionTrait>(
     {
         return Err(AppError::StaleContentMutation);
     }
+    verify_mutation_lease(txn, guard).await?;
     Ok(())
 }
 
@@ -1297,6 +1316,29 @@ pub(crate) async fn complete_standard_mutation_in_transaction<C: ConnectionTrait
     guard: &StandardMutationGuard,
     now: DateTime<Utc>,
 ) -> AppResult<()> {
+    verify_mutation_lease(txn, guard).await?;
+    if !clear_standard_mutation_in_transaction(txn, guard, now, true).await? {
+        return Err(AppError::StaleContentMutation);
+    }
+    Ok(())
+}
+
+/// Release does not require a live lease: a failed/expired attempt may clean up
+/// only its exact token and generation, never a replacement admission.
+pub(crate) async fn release_standard_mutation_in_transaction<C: ConnectionTrait>(
+    txn: &C,
+    guard: &StandardMutationGuard,
+    now: DateTime<Utc>,
+) -> AppResult<bool> {
+    clear_standard_mutation_in_transaction(txn, guard, now, false).await
+}
+
+async fn clear_standard_mutation_in_transaction<C: ConnectionTrait>(
+    txn: &C,
+    guard: &StandardMutationGuard,
+    now: DateTime<Utc>,
+    require_active: bool,
+) -> AppResult<bool> {
     let cleared = import_destination::Entity::update_many()
         .col_expr(
             import_destination::Column::MutationId,
@@ -1312,12 +1354,18 @@ pub(crate) async fn complete_standard_mutation_in_transaction<C: ConnectionTrait
         .filter(import_destination::Column::Generation.eq(guard.expected_generation))
         .filter(import_destination::Column::OwnerJobId.is_null())
         .filter(import_destination::Column::MutationId.eq(&guard.mutation_id))
+        .filter(if require_active {
+            mutation_lease::active_destination_lease(txn.get_database_backend())
+        } else {
+            Expr::cust("TRUE")
+        })
         .exec(txn)
         .await?;
-    if cleared.rows_affected != 1 {
-        return Err(AppError::StaleContentMutation);
-    }
-    Ok(())
+    standard_mutation_lease::Entity::delete_many()
+        .filter(mutation_lease_identity(guard))
+        .exec(txn)
+        .await?;
+    Ok(cleared.rows_affected == 1)
 }
 
 /// Completes an already verified guard and releases all destination/prefix/
@@ -1659,6 +1707,29 @@ async fn upsert_standard_mutation<C: ConnectionTrait>(
             1
         }
     };
+    let lease_until = crate::store::database_clock::database_now(txn).await?
+        + chrono::Duration::seconds(STANDARD_MUTATION_LEASE_SECONDS);
+    standard_mutation_lease::Entity::insert(standard_mutation_lease::ActiveModel {
+        bucket: Set(bucket_name.to_owned()),
+        key: Set(key.to_owned()),
+        mutation_id: Set(mutation_id.to_owned()),
+        generation: Set(generation),
+        lease_until: Set(lease_until),
+    })
+    .on_conflict(
+        sea_orm::sea_query::OnConflict::columns([
+            standard_mutation_lease::Column::Bucket,
+            standard_mutation_lease::Column::Key,
+        ])
+        .update_columns([
+            standard_mutation_lease::Column::MutationId,
+            standard_mutation_lease::Column::Generation,
+            standard_mutation_lease::Column::LeaseUntil,
+        ])
+        .to_owned(),
+    )
+    .exec(txn)
+    .await?;
     Ok(StandardMutationGuard {
         bucket: bucket_name.to_owned(),
         key: key.to_owned(),
@@ -2321,6 +2392,44 @@ mod tests {
             .pop()
             .unwrap()
             .claim
+    }
+
+    #[tokio::test]
+    async fn failed_standard_writer_never_revives_superseded_import() {
+        let db = setup().await;
+        submit(
+            &db,
+            request("superseded", "key", None, Some("out/")),
+            time(0),
+        )
+        .await
+        .unwrap();
+        let guard = admit_content_mutation(
+            &db,
+            "bucket",
+            "key",
+            None,
+            SupersedeReason::PutObject,
+            time(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(job(&db, "superseded").await.state, STATE_SUPERSEDED);
+        release_standard_mutation(&db, &guard).await.unwrap();
+        assert_eq!(job(&db, "superseded").await.state, STATE_SUPERSEDED);
+        assert!(destination(&db, "key").await.owner_job_id.is_none());
+        assert!(
+            claim_due(&db, "new-worker", time(2), time(32), 1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            try_admit_lifecycle_mutation(&db, "bucket", "out/entry", "action", 1, time(3))
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]

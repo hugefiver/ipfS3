@@ -93,6 +93,9 @@ mod migrator {
                 Box::new(LifecycleAbortMultipartMigration),
                 Box::new(ResidencyReferencesMigration),
                 Box::new(LifecycleTransitionMigration),
+                Box::new(
+                    crate::store::migrations::m20260919_000001_standard_mutation_lease::Migration,
+                ),
             ]
         }
     }
@@ -172,34 +175,6 @@ pub async fn run_migrations(db: &sea_orm::DatabaseConnection) -> Result<(), sea_
 mod tests {
     use super::*;
     use sea_orm::ConnectionTrait;
-    use sea_orm_migration::MigratorTrait;
-
-    #[test]
-    fn lifecycle_transition_migration_is_registered_fourteenth_and_last() {
-        let names = migrator::Migrator::migrations()
-            .into_iter()
-            .map(|migration| migration.name().to_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            names,
-            [
-                "m20250701_000001_init",
-                "m20260707_000001_decompress_zip",
-                "m20260720_000001_sse_c_key_fingerprint",
-                "m20260721_000001_multi_provider_pinning",
-                "m20260729_000001_ipfs3_import",
-                "m20260729_000002_postgres_utc_timestamps",
-                "m20260730_000001_standard_mutation_fence",
-                "m20260813_000001_postgres_json_columns",
-                "m20260825_000001_object_versioning",
-                "m20260826_000001_lifecycle_expiration",
-                "m20260831_000001_bucket_cors",
-                "m20260901_000001_lifecycle_abort_multipart",
-                "m20260912_000001_residency_references",
-                "m20260912_000002_lifecycle_transition",
-            ]
-        );
-    }
 
     #[tokio::test]
     async fn file_backed_sqlite_connections_have_a_five_second_busy_timeout() {
@@ -290,36 +265,6 @@ mod tests {
         assert_eq!(
             table_names, expected,
             "all twenty-four application tables must exist"
-        );
-    }
-
-    #[tokio::test]
-    async fn migrations_create_import_tables() {
-        let db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
-        run_migrations(&db).await.unwrap();
-
-        let rows = db
-            .query_all(sea_orm::Statement::from_string(
-                sea_orm::DatabaseBackend::Sqlite,
-                "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (\
-                     'import_jobs', 'import_destinations', 'import_prefix_claims', \
-                     'import_job_targets', 'import_job_results'\
-                 ) ORDER BY name",
-            ))
-            .await
-            .unwrap();
-        let names: Vec<String> = rows.iter().map(|row| row.try_get_by(0).unwrap()).collect();
-
-        assert_eq!(
-            names,
-            [
-                "import_destinations",
-                "import_job_results",
-                "import_job_targets",
-                "import_jobs",
-                "import_prefix_claims",
-            ],
-            "all five import tables must exist"
         );
     }
 

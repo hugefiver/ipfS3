@@ -11,6 +11,7 @@ use tokio_util::io::{ReaderStream, StreamReader};
 
 use crate::s3::ops::object::{StoredObject, add_plain_object_stream};
 use crate::state::AppState;
+use crate::zip::integrity::finish_entry;
 use crate::zip::local_header::observe_local_headers;
 use crate::zip::response::{ExtractFailure, ExtractedEntry};
 use crate::zip::sanitize::{SanitizedEntry, sanitize_entry};
@@ -76,6 +77,27 @@ impl ExtractionObserver for NoopObserver {
 /// Remote pin quotas bound only provider storage; this bounds the local Kubo
 /// datastore against a compression bomb.
 pub const MAX_DECOMPRESSED_ARCHIVE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Includes directories, empty files and failed entries, not just successes.
+pub const MAX_ARCHIVE_ENTRIES: u64 = 10_000;
+/// Reservation units: 4096 per entry + 8 * (raw name + extra + prefix bytes).
+/// Bounds retained results/observer keys as well as parser metadata. Not an RSS cap.
+pub const MAX_ARCHIVE_METADATA_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+struct MetadataLimits {
+    entries: u64,
+    bytes: u64,
+}
+
+impl Default for MetadataLimits {
+    fn default() -> Self {
+        Self {
+            entries: MAX_ARCHIVE_ENTRIES,
+            bytes: MAX_ARCHIVE_METADATA_BYTES,
+        }
+    }
+}
 
 enum EntryTransferError<E> {
     Upload(S3Error),
@@ -204,11 +226,26 @@ fn backend_stream_error(error: &(dyn std::error::Error + 'static)) -> Option<S3E
         .then(|| crate::error::AppError::kubo_rpc_detail("Kubo response stream failed").into())
 }
 
-fn failure(entry_name: &str, code: &str, message: impl ToString) -> ExtractFailure {
+fn failure(entry_name: &str, code: &str, message: impl std::fmt::Display) -> ExtractFailure {
+    // Error text also lives in accumulated results and import observer records.
+    // Format directly into a bounded buffer rather than allocate then truncate.
+    struct Message(String);
+    impl std::fmt::Write for Message {
+        fn write_str(&mut self, value: &str) -> std::fmt::Result {
+            let mut end = value.len().min(512 - self.0.len());
+            while !value.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.0.push_str(&value[..end]);
+            Ok(())
+        }
+    }
+    let mut bounded = Message(String::with_capacity(512));
+    let _ = std::fmt::write(&mut bounded, format_args!("{message}"));
     ExtractFailure {
         entry_name: entry_name.to_owned(),
         code: code.to_owned(),
-        message: message.to_string(),
+        message: bounded.0,
     }
 }
 
@@ -279,9 +316,34 @@ where
     E: std::error::Error + Send + Sync + 'static,
     O: ExtractionObserver,
 {
+    extract_observed_with_metadata_limits(
+        state,
+        target_prefix,
+        stream,
+        max_decompressed_bytes,
+        observer,
+        MetadataLimits::default(),
+    )
+    .await
+}
+
+async fn extract_observed_with_metadata_limits<S, E, O>(
+    state: &Arc<AppState>,
+    target_prefix: &str,
+    stream: S,
+    max_decompressed_bytes: u64,
+    observer: &mut O,
+    limits: MetadataLimits,
+) -> Result<ExtractOutcome, ObservedExtractionError<O::Error>>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
+    E: std::error::Error + Send + Sync + 'static,
+    O: ExtractionObserver,
+{
     let mut remaining = max_decompressed_bytes;
     let source = StreamReader::new(stream.map_err(io::Error::other));
     let (source, local_headers) = observe_local_headers(source);
+    local_headers.set_budget(limits.entries, limits.bytes, target_prefix.len());
     let mut zip = async_zip::base::read::stream::ZipFileReader::with_tokio(source);
     let mut entries = Vec::new();
     let mut failures = Vec::new();
@@ -291,6 +353,14 @@ where
         let next = match zip.next_with_entry().await {
             Ok(next) => next,
             Err(error) => {
+                if local_headers.limit_exceeded() {
+                    return Err(ObservedExtractionError::Limit(
+                        crate::error::AppError::ZipArchiveRejected(
+                            "archive exceeds ZIP entry or metadata budget".to_owned(),
+                        )
+                        .into(),
+                    ));
+                }
                 if let Some(error) = backend_stream_error(&error) {
                     return Err(ObservedExtractionError::Archive(error));
                 }
@@ -319,7 +389,9 @@ where
                 ));
             }
         };
-        let entry = entry_reader.reader().entry().clone();
+        let compressed_start = local_headers.position();
+        let remaining_before_entry = remaining;
+        let entry = entry_reader.reader().entry();
 
         let supported = matches!(
             (entry.compression(), local.compression_method),
@@ -390,8 +462,25 @@ where
                         return Ok(ExtractOutcome { entries, failures });
                     }
                 }
-                match entry_reader.done().await {
-                    Ok(ready) => {
+                match finish_entry(
+                    entry_reader,
+                    &local_headers,
+                    local.uses_descriptor(),
+                    compressed_start,
+                    remaining_before_entry - remaining,
+                )
+                .await
+                {
+                    Ok((ready, valid)) => {
+                        if !valid {
+                            record_failure(
+                                observer,
+                                &mut failures,
+                                &directory_key,
+                                failure(&name, "EntryReadFailed", "ZIP CRC or size mismatch"),
+                            )
+                            .await?;
+                        }
                         zip = ready;
                         continue;
                     }
@@ -458,8 +547,25 @@ where
                             return Ok(ExtractOutcome { entries, failures });
                         }
                     }
-                    match entry_reader.done().await {
-                        Ok(ready) => {
+                    match finish_entry(
+                        entry_reader,
+                        &local_headers,
+                        local.uses_descriptor(),
+                        compressed_start,
+                        remaining_before_entry - remaining,
+                    )
+                    .await
+                    {
+                        Ok((ready, valid)) => {
+                            if !valid {
+                                record_failure(
+                                    observer,
+                                    &mut failures,
+                                    &key,
+                                    failure(&name, "EntryReadFailed", "ZIP CRC or size mismatch"),
+                                )
+                                .await?;
+                            }
                             zip = ready;
                             continue;
                         }
@@ -499,8 +605,27 @@ where
                 }
             };
 
-        match entry_reader.done().await {
-            Ok(ready) => {
+        match finish_entry(
+            entry_reader,
+            &local_headers,
+            local.uses_descriptor(),
+            compressed_start,
+            remaining_before_entry - remaining,
+        )
+        .await
+        {
+            Ok((ready, valid)) => {
+                if !valid {
+                    record_failure(
+                        observer,
+                        &mut failures,
+                        &key,
+                        failure(&name, "EntryReadFailed", "ZIP CRC or size mismatch"),
+                    )
+                    .await?;
+                    zip = ready;
+                    continue;
+                }
                 let extracted = ExtractedEntry {
                     key,
                     cid: stored.cid,
@@ -534,6 +659,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    include!("hardening_tests.rs");
     use std::collections::HashMap;
     use std::io;
     use std::sync::atomic::{AtomicUsize, Ordering};

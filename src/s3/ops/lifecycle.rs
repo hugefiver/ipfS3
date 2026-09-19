@@ -16,13 +16,12 @@ pub async fn delete_bucket_lifecycle(
     req: S3Request<DeleteBucketLifecycleInput>,
 ) -> S3Result<S3Response<DeleteBucketLifecycleOutput>> {
     let input = req.input;
-    let bucket = load_bucket_and_verify_owner(
+    crate::store::lifecycle_config::delete_configuration_for_owner(
         state.store.db(),
         &input.bucket,
         input.expected_bucket_owner.as_deref(),
     )
     .await?;
-    crate::store::lifecycle_config::delete_configuration(state.store.db(), &bucket.name).await?;
     Ok(S3Response::new(DeleteBucketLifecycleOutput::default()))
 }
 
@@ -31,14 +30,12 @@ pub async fn get_bucket_lifecycle_configuration(
     req: S3Request<GetBucketLifecycleConfigurationInput>,
 ) -> S3Result<S3Response<GetBucketLifecycleConfigurationOutput>> {
     let input = req.input;
-    let bucket = load_bucket_and_verify_owner(
+    let json = crate::store::lifecycle_config::get_configuration_for_owner(
         state.store.db(),
         &input.bucket,
         input.expected_bucket_owner.as_deref(),
     )
     .await?;
-    let json =
-        crate::store::lifecycle_config::get_configuration(state.store.db(), &bucket.name).await?;
     let configuration = from_canonical_json(&json)?;
     let rules = to_s3_rules(&configuration)?;
     Ok(S3Response::new(GetBucketLifecycleConfigurationOutput {
@@ -52,7 +49,8 @@ pub async fn put_bucket_lifecycle_configuration(
     req: S3Request<PutBucketLifecycleConfigurationInput>,
 ) -> S3Result<S3Response<PutBucketLifecycleConfigurationOutput>> {
     let input = req.input;
-    let bucket = load_bucket_and_verify_owner(
+    // Preserve the existing S3 validation order; the store repeats this check under its lock.
+    load_bucket_and_verify_owner(
         state.store.db(),
         &input.bucket,
         input.expected_bucket_owner.as_deref(),
@@ -70,8 +68,13 @@ pub async fn put_bucket_lifecycle_configuration(
     require_cold_kubo_for_transitions(state, &configuration)?;
     let canonical = validate_and_canonicalize(configuration)?;
     let json = canonical_json(&canonical)?;
-    crate::store::lifecycle_config::put_configuration(state.store.db(), &bucket.name, &json)
-        .await?;
+    crate::store::lifecycle_config::put_configuration_for_owner(
+        state.store.db(),
+        &input.bucket,
+        &json,
+        input.expected_bucket_owner.as_deref(),
+    )
+    .await?;
     Ok(S3Response::new(PutBucketLifecycleConfigurationOutput {
         transition_default_minimum_object_size: None,
     }))

@@ -20,6 +20,7 @@ use crate::{
         lifecycle_action::{
             FAILURE_INTERNAL_DEPENDENCY, TRANSITION_SETTLEMENT_REQUIRED, lock_claim_for_execution,
             renew_claim, retry_at, schedule_retry, wait_for_hot_verification_in_transaction,
+            wait_for_mutation_dependency, waiting_for_dependency,
         },
         lifecycle_transition::{
             self as saga_store, TransitionPrepareResult, TransitionPublishResult,
@@ -46,7 +47,13 @@ pub(crate) async fn execute(
     }
     let guard = match admit_claimed(db, claim).await {
         Ok(Some(guard)) => guard,
-        Ok(None) | Err(_) => return settle_failure(db, claim, config).await,
+        Ok(None) => {
+            if wait_for_mutation_dependency(db, claim, config.max_attempts).await? {
+                return Ok(());
+            }
+            return settle_failure(db, claim, config).await;
+        }
+        Err(_) => return settle_failure(db, claim, config).await,
     };
     let result = execute_admitted(db, claim, clients, config, cancel, &guard).await;
     match result {
@@ -124,6 +131,9 @@ async fn execute_admitted(
     cancel: &CancellationToken,
     guard: &StandardMutationGuard,
 ) -> AppResult<()> {
+    if waiting_for_dependency(&claim.action) && claim.action.attempts >= config.max_attempts {
+        return settle_failure(db, claim, config).await;
+    }
     // Revalidate before contacting a tier, including when cold is unconfigured.
     let txn = db.begin().await?;
     if lock_claim_for_execution(&txn, claim).await?.is_none() {

@@ -70,6 +70,80 @@ const KEY: &str = "primary";
 const RULE_ID: &str = "transition";
 
 #[tokio::test]
+async fn ownership_dependency_wait_survives_transition_failure_budget() {
+    let mut fixture = fixture(Selector::All).await;
+    let id = fixture.claim.action.id.clone();
+    let writer = admit_content_mutation(
+        fixture.db(),
+        BUCKET,
+        KEY,
+        None,
+        SupersedeReason::PutObject,
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+    let harness = TierHarness::new(ImportBehavior::Success, HOT_NODE).await;
+    let mut config = worker_config();
+    config.max_attempts = 2;
+    for _ in 0..5 {
+        execute(
+            fixture.db(),
+            &fixture.claim,
+            &harness.clients(),
+            &config,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let action = stored_action(&fixture).await;
+        assert_eq!(action.state, "pending");
+        assert_eq!(
+            action.attempts, 0,
+            "ownership dependency must not spend transition failure attempts"
+        );
+        lifecycle_action::Entity::update_many()
+            .col_expr(
+                lifecycle_action::Column::NextAttemptAt,
+                Expr::value(Utc::now() - Duration::seconds(1)),
+            )
+            .filter(lifecycle_action::Column::Id.eq(&id))
+            .exec(fixture.db())
+            .await
+            .unwrap();
+        fixture.claim = store::lifecycle_action::claim_due_with_max_attempts(
+            fixture.db(),
+            "wait-worker",
+            Duration::seconds(30),
+            2,
+            1,
+        )
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+        assert_eq!(fixture.claim.action.id, id);
+    }
+    store::import::ownership::release_standard_mutation(fixture.db(), &writer)
+        .await
+        .unwrap();
+    execute(
+        fixture.db(),
+        &fixture.claim,
+        &harness.clients(),
+        &config,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(stored_action(&fixture).await.state, "succeeded");
+    assert_eq!(
+        residency(&fixture, &fixture.version.id).await.storage_class,
+        StorageClass::StandardIa
+    );
+}
+
+#[tokio::test]
 async fn expired_claim_cannot_install_an_ownership_admission() {
     let fixture = fixture(Selector::All).await;
     lifecycle_action::Entity::update_many()

@@ -26,14 +26,16 @@ use crate::{
         import::ownership::{
             StandardMutationGuard, clear_lifecycle_mutation_if_owned,
             complete_standard_mutation_in_transaction, lock_bucket_for_ownership,
-            try_admit_lifecycle_mutation, verify_standard_mutation_guard,
+            release_standard_mutation_in_transaction, try_admit_lifecycle_mutation,
+            verify_standard_mutation_guard,
         },
         lifecycle_action::{
             FAILURE_ADMISSION_TEMPORARILY_UNAVAILABLE, FAILURE_CANCELLED_STALE,
             FAILURE_DATABASE_CONTENTION, FAILURE_INTERNAL_DEPENDENCY,
             MAX_LIFECYCLE_ACTION_ATTEMPTS, action_kind_from_db, lock_claim_for_execution,
             mark_cancelled, mark_failed_safe, mark_succeeded, retry_at, schedule_retry,
-            target_from_action, wait_for_transition_in_transaction, waiting_for_transition,
+            target_from_action, wait_for_mutation_dependency, wait_for_transition_in_transaction,
+            waiting_for_dependency,
         },
         multipart::{
             AbortExactIncompleteUploadResult, abort_exact_incomplete_upload_in_transaction,
@@ -62,6 +64,7 @@ pub(crate) enum LifecycleAdmissionResult {
     Admitted(StandardMutationGuard),
     Stale,
     Temporary,
+    Dependency,
 }
 
 /// Admits the exact key that a lifecycle worker plans to mutate. Task 8 owns
@@ -79,7 +82,7 @@ pub(crate) async fn admit_lifecycle_expiration(
             .await;
     match result {
         Ok(Some(guard)) => Ok(LifecycleAdmissionResult::Admitted(guard)),
-        Ok(None) => Ok(LifecycleAdmissionResult::Temporary),
+        Ok(None) => Ok(LifecycleAdmissionResult::Dependency),
         Err(error) => match classify_lifecycle_admission_error(&error) {
             LifecycleAdmissionClassification::Stale => Ok(LifecycleAdmissionResult::Stale),
             LifecycleAdmissionClassification::Temporary => Ok(LifecycleAdmissionResult::Temporary),
@@ -260,6 +263,20 @@ pub(crate) async fn execute_claimed_lifecycle_action(
             )
             .await
         }
+        LifecycleAdmissionResult::Dependency => {
+            if wait_for_mutation_dependency(db, claim, max_attempts).await? {
+                return Ok(());
+            }
+            retry_or_fail_safe(
+                db,
+                claim,
+                max_attempts,
+                base_backoff_secs,
+                max_backoff_secs,
+                FAILURE_ADMISSION_TEMPORARILY_UNAVAILABLE,
+            )
+            .await
+        }
     }
 }
 
@@ -386,18 +403,15 @@ async fn execute_final_transaction(
     let guard = guard.clone();
     db.transaction(move |txn| {
         Box::pin(async move {
-            // This must remain the first transaction operation: a reclaimed or
-            // expired epoch is forbidden from even reading lifecycle policy.
+            // The execution fence acquires bucket then action, before any
+            // lifecycle policy read; reclaimed/expired epochs cannot proceed.
             let Some(locked_action) = lock_claim_for_execution(txn, &claim).await? else {
                 // Admission can race an administrative action-row removal or a
                 // lease reclaim. Clear only our still-current admission token;
                 // a newer admission makes this a benign stale no-op.
                 let now = database_now(txn).await?;
                 lock_bucket_for_ownership(txn, &target.bucket).await?;
-                match complete_standard_mutation_in_transaction(txn, &guard, now).await {
-                    Ok(()) | Err(AppError::StaleContentMutation) => {}
-                    Err(error) => return Err(error),
-                }
+                release_standard_mutation_in_transaction(txn, &guard, now).await?;
                 return Ok(());
             };
             let now = database_now(txn).await?;
@@ -422,7 +436,7 @@ async fn execute_final_transaction(
             // A probe can have been claimed under a larger budget. Check the
             // locked row against this executor's cap before any content mutation;
             // ordinary actions keep their existing final-recovery semantics.
-            if waiting_for_transition(&locked_action) && locked_action.attempts >= max_attempts {
+            if waiting_for_dependency(&locked_action) && locked_action.attempts >= max_attempts {
                 if !mark_failed_safe(txn, &claim, now, FAILURE_INTERNAL_DEPENDENCY).await? {
                     return Err(AppError::StaleContentMutation);
                 }
@@ -646,7 +660,7 @@ async fn cancel_guarded_in_transaction<C: ConnectionTrait>(
     guard: &StandardMutationGuard,
     now: DateTime<Utc>,
 ) -> AppResult<()> {
-    complete_standard_mutation_in_transaction(db, guard, now).await?;
+    release_standard_mutation_in_transaction(db, guard, now).await?;
     cancel_without_guard_in_transaction(db, claim, now, FAILURE_CANCELLED_STALE).await
 }
 
@@ -708,10 +722,7 @@ async fn settle_post_admission_failure(
             let locked_action = lock_claim_for_execution(txn, &claim).await?;
             let now = database_now(txn).await?;
             lock_bucket_for_ownership(txn, &target.bucket).await?;
-            match complete_standard_mutation_in_transaction(txn, &guard, now).await {
-                Ok(()) | Err(AppError::StaleContentMutation) => {}
-                Err(error) => return Err(error),
-            }
+            release_standard_mutation_in_transaction(txn, &guard, now).await?;
 
             let Some(locked_action) = locked_action else {
                 return Ok(());
@@ -1408,12 +1419,16 @@ mod tests {
             .unwrap();
         let queries = recorder.queries.into_inner().unwrap();
         assert!(
-            queries[0].contains("lifecycle_actions"),
+            queries[0].contains("buckets"),
+            "bucket must lock before action"
+        );
+        assert!(
+            queries[1].contains("lifecycle_actions"),
             "claim must be the first read: {queries:?}"
         );
         assert_eq!(
             queries.len(),
-            1,
+            2,
             "rejected epoch must not read database time or target state"
         );
         txn.commit().await.unwrap();
@@ -1474,8 +1489,9 @@ mod tests {
             .await
             .unwrap();
         let queries = recorder.queries.into_inner().unwrap();
-        assert!(queries[0].contains("lifecycle_actions"));
-        assert!(queries[1].contains("strftime"));
+        assert!(queries[0].contains("buckets"));
+        assert!(queries[1].contains("lifecycle_actions"));
+        assert!(queries[2].contains("strftime"));
         let bucket_lock = queries
             .iter()
             .position(|sql| sql.contains("buckets"))
@@ -1498,7 +1514,7 @@ mod tests {
             .position(|sql| sql.starts_with("UPDATE") && sql.contains("lifecycle_actions"))
             .unwrap();
         assert!(
-            bucket_lock > 1
+            bucket_lock == 0
                 && bucket_lock < policy
                 && policy < mutation
                 && mutation < terminal_write,
@@ -3715,7 +3731,7 @@ mod tests {
             admit_lifecycle_expiration(&db, &target, "blocked-lifecycle-test", 1, now)
                 .await
                 .unwrap(),
-            super::LifecycleAdmissionResult::Temporary
+            super::LifecycleAdmissionResult::Dependency
         ));
         let destination =
             import_destination::Entity::find_by_id((target.bucket.clone(), target.key.clone()))
@@ -3737,6 +3753,202 @@ mod tests {
         .await
         .unwrap();
         assert_standard_guard_settled(&db, "user-wins").await;
+    }
+
+    #[tokio::test]
+    async fn ownership_dependency_wait_survives_more_than_failure_budget() {
+        for import_owner in [false, true] {
+            let db = setup().await;
+            let (revision, _) = configure(&db, vec![current_rule("current", all())]).await;
+            let version = publish(&db, "wait-owner", "wait-key", 7, vec![]).await;
+            let mut claim = claim(
+                &db,
+                revision,
+                "current",
+                LifecycleActionKind::ExpireCurrent,
+                target(&version),
+            )
+            .await;
+            let id = claim.action.id.clone();
+            let writer = if import_owner {
+                crate::store::import::ownership::submit(
+                    &db,
+                    crate::store::import::jobs::NewImportJob {
+                        id: "blocked-import".into(),
+                        bucket: "bucket".into(),
+                        key: "wait-key".into(),
+                        source: crate::import::ImportSource::Cid(
+                            "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku".into(),
+                        ),
+                        request_fingerprint: "fixture".into(),
+                        client_token: None,
+                        object_content_type: None,
+                        metadata: Default::default(),
+                        tags: vec![],
+                        decompress_prefix: None,
+                    },
+                    Utc::now(),
+                )
+                .await
+                .unwrap();
+                None
+            } else {
+                Some(
+                    admit_content_mutation(
+                        &db,
+                        "bucket",
+                        "wait-key",
+                        None,
+                        crate::import::SupersedeReason::PutObject,
+                        Utc::now(),
+                    )
+                    .await
+                    .unwrap(),
+                )
+            };
+            for _ in 0..5 {
+                execute_claimed_lifecycle_action(&db, &claim, 2, 1, 2)
+                    .await
+                    .unwrap();
+                let action = stored_action(&db, &claim).await;
+                assert_eq!(
+                    action.state, "pending",
+                    "ownership dependency must remain recoverable"
+                );
+                assert_eq!(
+                    action.attempts, 0,
+                    "ownership dependency must not spend failure attempts"
+                );
+                lifecycle_action::Entity::update_many()
+                    .col_expr(
+                        lifecycle_action::Column::NextAttemptAt,
+                        Expr::value(Utc::now() - Duration::seconds(1)),
+                    )
+                    .filter(lifecycle_action::Column::Id.eq(&id))
+                    .exec(&db)
+                    .await
+                    .unwrap();
+                claim = action_store::claim_due_with_max_attempts(
+                    &db,
+                    WORKER,
+                    Duration::seconds(30),
+                    2,
+                    1,
+                )
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+                assert_eq!(claim.action.id, id);
+            }
+            if let Some(writer) = writer {
+                crate::store::import::ownership::release_standard_mutation(&db, &writer)
+                    .await
+                    .unwrap();
+            } else {
+                let txn = db.begin().await.unwrap();
+                lock_bucket_for_ownership(&txn, "bucket").await.unwrap();
+                crate::store::import::ownership::supersede_bucket(&txn, "bucket", Utc::now())
+                    .await
+                    .unwrap();
+                txn.commit().await.unwrap();
+            }
+            execute_claimed_lifecycle_action(&db, &claim, 2, 1, 2)
+                .await
+                .unwrap();
+            assert_eq!(stored_action(&db, &claim).await.state, "succeeded");
+        }
+    }
+
+    #[tokio::test]
+    async fn ownership_dependency_cannot_refund_previously_exhausted_failures() {
+        let db = setup().await;
+        let (revision, _) = configure(&db, vec![current_rule("current", all())]).await;
+        let version = publish(&db, "exhausted-owner", "exhausted-key", 7, vec![]).await;
+        let claim = claim(
+            &db,
+            revision,
+            "current",
+            LifecycleActionKind::ExpireCurrent,
+            target(&version),
+        )
+        .await;
+        let _writer = admit_content_mutation(
+            &db,
+            "bucket",
+            "exhausted-key",
+            None,
+            crate::import::SupersedeReason::PutObject,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        lifecycle_action::Entity::update_many()
+            .col_expr(lifecycle_action::Column::Attempts, Expr::value(3_i64))
+            .filter(lifecycle_action::Column::Id.eq(&claim.action.id))
+            .exec(&db)
+            .await
+            .unwrap();
+        execute_claimed_lifecycle_action(&db, &claim, 2, 1, 2)
+            .await
+            .unwrap();
+        assert_eq!(stored_action(&db, &claim).await.state, "failed_safe");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_claim_renewal_extends_only_its_active_content_fence() {
+        use crate::store::entities::standard_mutation_lease;
+        let db = setup().await;
+        let (revision, _) = configure(&db, vec![current_rule("current", all())]).await;
+        let version = publish(&db, "lease-owner", "lease-renew", 7, vec![]).await;
+        let target = target(&version);
+        let claim = claim(
+            &db,
+            revision,
+            "current",
+            LifecycleActionKind::ExpireCurrent,
+            target.clone(),
+        )
+        .await;
+        let now = database_now(&db).await.unwrap();
+        assert!(matches!(
+            admit_lifecycle_expiration(&db, &target, &claim.action.id, claim.claim_epoch, now)
+                .await
+                .unwrap(),
+            super::LifecycleAdmissionResult::Admitted(_)
+        ));
+        let shorter = now + Duration::seconds(60);
+        standard_mutation_lease::Entity::update_many()
+            .col_expr(
+                standard_mutation_lease::Column::LeaseUntil,
+                Expr::value(shorter),
+            )
+            .exec(&db)
+            .await
+            .unwrap();
+        assert!(
+            action_store::renew_claim(&db, &claim, Duration::seconds(30))
+                .await
+                .unwrap()
+        );
+        let lease = standard_mutation_lease::Entity::find()
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(lease.lease_until > shorter);
+        standard_mutation_lease::Entity::update_many()
+            .col_expr(
+                standard_mutation_lease::Column::LeaseUntil,
+                Expr::value(now - Duration::seconds(1)),
+            )
+            .exec(&db)
+            .await
+            .unwrap();
+        assert!(matches!(
+            action_store::renew_claim(&db, &claim, Duration::seconds(30)).await,
+            Err(AppError::StaleContentMutation)
+        ));
     }
 
     #[tokio::test]

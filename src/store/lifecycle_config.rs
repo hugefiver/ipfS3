@@ -1,7 +1,8 @@
 use chrono::Duration;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, DatabaseTransaction,
-    EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionError, TransactionTrait,
+    EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionError,
+    TransactionTrait,
     sea_query::{Condition, Expr, LockBehavior, LockType, OnConflict},
 };
 
@@ -24,11 +25,22 @@ pub async fn put_configuration(
     bucket_name: &str,
     canonical_json: &str,
 ) -> AppResult<i64> {
+    put_configuration_for_owner(db, bucket_name, canonical_json, None).await
+}
+
+/// Replaces the active lifecycle configuration after atomically checking the current owner.
+pub async fn put_configuration_for_owner(
+    db: &DatabaseConnection,
+    bucket_name: &str,
+    canonical_json: &str,
+    expected_owner: Option<&str>,
+) -> AppResult<i64> {
     let bucket_name = bucket_name.to_owned();
     let canonical_json = canonical_json.to_owned();
+    let expected_owner = expected_owner.map(str::to_owned);
     db.transaction(move |txn| {
         Box::pin(async move {
-            lock_bucket(txn, &bucket_name).await?;
+            lock_bucket_and_verify_owner(txn, &bucket_name, expected_owner.as_deref()).await?;
             let now = database_now(txn).await?;
             let previous = lock_configuration(txn, &bucket_name).await?;
             let revision = next_revision(previous.as_ref())?;
@@ -63,12 +75,52 @@ pub async fn get_configuration<C: ConnectionTrait>(db: &C, bucket_name: &str) ->
         .ok_or(AppError::NoSuchLifecycleConfiguration)
 }
 
+/// Returns the active lifecycle configuration after atomically checking the current owner.
+pub async fn get_configuration_for_owner<C: ConnectionTrait>(
+    db: &C,
+    bucket_name: &str,
+    expected_owner: Option<&str>,
+) -> AppResult<String> {
+    let backend = db.get_database_backend();
+    let parameter = match backend {
+        DatabaseBackend::Postgres => "$1",
+        DatabaseBackend::Sqlite | DatabaseBackend::MySql => "?",
+    };
+    let row = db
+        .query_one(Statement::from_sql_and_values(
+            backend,
+            format!(
+                "SELECT b.owner, c.canonical_json \
+                 FROM buckets AS b \
+                 LEFT JOIN bucket_lifecycle_configs AS c ON c.bucket = b.name \
+                 WHERE b.name = {parameter}"
+            ),
+            [bucket_name.to_owned().into()],
+        ))
+        .await?
+        .ok_or_else(|| AppError::NoSuchBucket(bucket_name.to_owned()))?;
+    let owner: Option<String> = row.try_get("", "owner")?;
+    verify_expected_owner(owner.as_deref(), expected_owner)?;
+    let configuration: Option<String> = row.try_get("", "canonical_json")?;
+    configuration.ok_or(AppError::NoSuchLifecycleConfiguration)
+}
+
 /// Writes (or advances) a lifecycle tombstone and returns its new revision.
 pub async fn delete_configuration(db: &DatabaseConnection, bucket_name: &str) -> AppResult<i64> {
+    delete_configuration_for_owner(db, bucket_name, None).await
+}
+
+/// Advances the lifecycle tombstone after atomically checking the current owner.
+pub async fn delete_configuration_for_owner(
+    db: &DatabaseConnection,
+    bucket_name: &str,
+    expected_owner: Option<&str>,
+) -> AppResult<i64> {
     let bucket_name = bucket_name.to_owned();
+    let expected_owner = expected_owner.map(str::to_owned);
     db.transaction(move |txn| {
         Box::pin(async move {
-            lock_bucket(txn, &bucket_name).await?;
+            lock_bucket_and_verify_owner(txn, &bucket_name, expected_owner.as_deref()).await?;
             let now = database_now(txn).await?;
             let previous = lock_configuration(txn, &bucket_name).await?;
             let revision = next_revision(previous.as_ref())?;
@@ -303,30 +355,30 @@ async fn sqlite_claim_retry_delay(attempt: usize) {
     tokio::time::sleep(std::time::Duration::from_millis(milliseconds)).await;
 }
 
-async fn lock_bucket<C: ConnectionTrait>(db: &C, bucket_name: &str) -> AppResult<bucket::Model> {
-    if db.get_database_backend() == DatabaseBackend::Postgres {
-        return bucket::Entity::find_by_id(bucket_name.to_owned())
-            .lock_exclusive()
-            .one(db)
-            .await?
-            .ok_or_else(|| AppError::NoSuchBucket(bucket_name.to_owned()));
-    }
-
-    let locked = bucket::Entity::update_many()
-        .col_expr(
-            bucket::Column::CreatedAt,
-            Expr::col(bucket::Column::CreatedAt).into(),
-        )
-        .filter(bucket::Column::Name.eq(bucket_name))
-        .exec(db)
-        .await?;
-    if locked.rows_affected != 1 {
-        return Err(AppError::NoSuchBucket(bucket_name.to_owned()));
-    }
-    bucket::Entity::find_by_id(bucket_name.to_owned())
+async fn lock_bucket_and_verify_owner<C: ConnectionTrait>(
+    db: &C,
+    bucket_name: &str,
+    expected_owner: Option<&str>,
+) -> AppResult<()> {
+    super::import::ownership::lock_bucket_for_ownership(db, bucket_name).await?;
+    let bucket = bucket::Entity::find_by_id(bucket_name.to_owned())
         .one(db)
         .await?
-        .ok_or_else(|| AppError::NoSuchBucket(bucket_name.to_owned()))
+        .ok_or_else(|| AppError::NoSuchBucket(bucket_name.to_owned()))?;
+    verify_expected_owner(bucket.owner.as_deref(), expected_owner)
+}
+
+fn verify_expected_owner(
+    bucket_owner: Option<&str>,
+    expected_owner: Option<&str>,
+) -> AppResult<()> {
+    match expected_owner {
+        None => Ok(()),
+        Some(value) if bucket_owner == Some(value) => Ok(()),
+        Some(_) => Err(AppError::AccessDenied(
+            "expected bucket owner mismatch".to_owned(),
+        )),
+    }
 }
 
 async fn lock_configuration<C: ConnectionTrait>(

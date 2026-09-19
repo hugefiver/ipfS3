@@ -162,12 +162,13 @@ impl ReqwestImportHttpTransport {
         limits: DownloadLimits,
     ) -> Result<reqwest::Client, DownloadError> {
         install_rustls_crypto_provider();
+        let connect_timeout = self.connect_timeout.min(limits.connect_timeout);
         let mut builder = reqwest::Client::builder()
             .use_rustls_tls()
             .https_only(true)
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(self.connect_timeout.min(limits.connect_timeout))
+            .connect_timeout(connect_timeout)
             .resolve_to_addrs(&source.server_name, &source.addresses);
 
         for certificate in &self.extra_root_certificates {
@@ -199,9 +200,20 @@ impl ImportHttpTransport for ReqwestImportHttpTransport {
         }
 
         let client = self.client_for(&source, limits)?;
+        // Reqwest does not expose the TLS-complete boundary. Combining the
+        // connection and header-idle budgets preserves the full TLS allowance
+        // while bounding `send` without attaching a total deadline to the body.
+        let response_header_timeout = self
+            .connect_timeout
+            .min(limits.connect_timeout)
+            .saturating_add(limits.idle_timeout);
         let response = tokio::select! {
             _ = cancel.cancelled() => return Err(DownloadError::Canceled),
-            result = client.get(source.url.clone()).send() => result.map_err(|error| classify_reqwest_error(&error))?,
+            result = tokio::time::timeout(response_header_timeout, client.get(source.url.clone()).send()) => {
+                result
+                    .map_err(|_| DownloadError::Stalled)?
+                    .map_err(|error| classify_reqwest_error(&error))?
+            },
         };
 
         let status = response.status();
@@ -304,11 +316,13 @@ impl SourceDownloader {
             return Err(DownloadError::NotAllowed);
         }
 
-        let addresses = self
-            .resolver
-            .resolve(host, port)
-            .await
-            .map_err(|_| DownloadError::Dns)?;
+        let addresses = tokio::time::timeout(
+            Duration::from_secs(self.config.raw.connect_timeout_secs),
+            self.resolver.resolve(host, port),
+        )
+        .await
+        .map_err(|_| DownloadError::Dns)?
+        .map_err(|_| DownloadError::Dns)?;
         if addresses.is_empty() {
             return Err(DownloadError::Dns);
         }
@@ -559,11 +573,11 @@ fn classify_reqwest_error(error: &reqwest::Error) -> DownloadError {
     if error_chain_contains_invalid_certificate(error) || has_certificate_fallback(error) {
         return DownloadError::TlsCertificate;
     }
-    if error_chain_has_tls_transport(error) || has_tls_transport_fallback(error) {
-        return DownloadError::TlsTransport;
-    }
     if error.is_timeout() {
         return DownloadError::Connect;
+    }
+    if error_chain_has_tls_transport(error) || has_tls_transport_fallback(error) {
+        return DownloadError::TlsTransport;
     }
     if error.is_connect() {
         return if error_chain_has_ordinary_connect_failure(error) {
@@ -683,6 +697,7 @@ mod tests {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
+        sync::oneshot,
     };
     use tokio_rustls::TlsAcceptor;
     use tokio_util::sync::CancellationToken;
@@ -1275,6 +1290,36 @@ mod tests {
         (address, root, task)
     }
 
+    async fn tls_stalled_headers_server() -> (
+        SocketAddr,
+        reqwest::Certificate,
+        tokio::task::JoinHandle<()>,
+        oneshot::Receiver<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (acceptor, root) = test_server_material(SOURCE_HOST);
+        let (headers_stalled, stalled) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(socket).await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut byte = [0_u8; 1];
+                if tls.read_exact(&mut byte).await.is_err() {
+                    return;
+                }
+                request.push(byte[0]);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = headers_stalled.send(());
+            std::future::pending::<()>().await;
+        });
+        (address, root, task, stalled)
+    }
+
     async fn tls_header_only_server() -> (
         SocketAddr,
         reqwest::Certificate,
@@ -1581,8 +1626,105 @@ mod tests {
         .await
         .expect("TLS setup must honor the connection timeout")
         .unwrap_err();
-        assert!(matches!(error, DownloadError::Connect));
+        assert!(
+            matches!(error, DownloadError::Connect),
+            "connection setup timeout was classified as {error:?}"
+        );
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn production_transport_bounds_tls_peer_that_withholds_response_headers() {
+        let (address, root, server, headers_stalled) = tls_stalled_headers_server().await;
+        let transport = ReqwestImportHttpTransport::new(
+            DownloadLimits {
+                connect_timeout: Duration::from_secs(1),
+                idle_timeout: Duration::from_millis(500),
+                max_bytes: 10,
+            },
+            vec![root],
+        );
+        let (progress, _) = tokio::sync::watch::channel(0);
+        let open = tokio::spawn(async move {
+            transport
+                .open(
+                    authorized_tls_source(address, "/object"),
+                    DownloadLimits {
+                        connect_timeout: Duration::from_secs(1),
+                        idle_timeout: Duration::from_millis(500),
+                        max_bytes: 10,
+                    },
+                    progress,
+                    CancellationToken::new(),
+                )
+                .await
+        });
+        headers_stalled.await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), open)
+            .await
+            .expect("response-header wait must be covered by the idle timeout")
+            .unwrap();
+        assert!(matches!(result, Err(DownloadError::Stalled)));
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn production_transport_cancels_while_waiting_for_response_headers() {
+        let (address, root, server, headers_stalled) = tls_stalled_headers_server().await;
+        let header_limits = DownloadLimits {
+            connect_timeout: Duration::from_secs(1),
+            idle_timeout: Duration::from_secs(2),
+            max_bytes: 10,
+        };
+        let transport = ReqwestImportHttpTransport::new(header_limits, vec![root]);
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let (progress, _) = tokio::sync::watch::channel(0);
+        let open = tokio::spawn(async move {
+            transport
+                .open(
+                    authorized_tls_source(address, "/object"),
+                    header_limits,
+                    progress,
+                    task_cancel,
+                )
+                .await
+        });
+
+        headers_stalled.await.unwrap();
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_millis(250), open)
+            .await
+            .expect("cancellation must interrupt the response-header wait")
+            .unwrap();
+        assert!(matches!(result, Err(DownloadError::Canceled)));
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn submission_dns_authorization_uses_the_connection_timeout_budget() {
+        let resolver = Arc::new(BlockingResolver {
+            started: tokio::sync::Notify::new(),
+        });
+        let downloader = fake_downloader(
+            validated_config(&["https://downloads.example.test"], 100),
+            resolver.clone(),
+            Arc::new(PermitAllAddresses),
+            Arc::new(RecordingTransport::default()),
+        );
+        let authorize = tokio::spawn(async move { downloader.authorize(&source("/object")).await });
+
+        resolver.started.notified().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            authorize.is_finished(),
+            "submission DNS must not wait forever when the resolver remains pending"
+        );
+        assert!(matches!(authorize.await.unwrap(), Err(DownloadError::Dns)));
     }
 
     #[tokio::test]
@@ -1603,6 +1745,9 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(error, DownloadError::Connect));
+        assert!(
+            matches!(error, DownloadError::Connect),
+            "connection refusal was classified as {error:?}"
+        );
     }
 }

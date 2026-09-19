@@ -2,7 +2,7 @@ use crate::error::{AppError, AppResult};
 use chrono::Utc;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
-    QuerySelect, Set, TransactionError, TransactionTrait, sea_query::Expr,
+    Set, TransactionError, TransactionTrait, sea_query::Expr,
 };
 
 use super::{
@@ -150,32 +150,13 @@ pub async fn get_versioning_state<C: ConnectionTrait>(
 }
 
 /// Locks the bucket row before its versioning state is consumed by a caller-owned transaction.
-/// PostgreSQL uses `FOR UPDATE`; SQLite takes its serialized write intent with a no-op update.
+/// Versioning never changes the bucket key. Reuse the ownership NO KEY UPDATE
+/// lock instead of upgrading it behind a scanner's foreign-key KEY SHARE lock.
 pub async fn lock_versioning_state<C: ConnectionTrait>(
     db: &C,
     bucket_name: &str,
 ) -> AppResult<BucketVersioningState> {
-    if db.get_database_backend() == sea_orm::DatabaseBackend::Postgres {
-        let bucket = bucket::Entity::find_by_id(bucket_name.to_owned())
-            .lock_exclusive()
-            .one(db)
-            .await?
-            .ok_or_else(|| AppError::NoSuchBucket(bucket_name.to_owned()))?;
-        return BucketVersioningState::from_db_value(bucket.versioning_status.as_deref());
-    }
-
-    let locked = bucket::Entity::update_many()
-        .col_expr(
-            bucket::Column::CreatedAt,
-            Expr::col(bucket::Column::CreatedAt).into(),
-        )
-        .filter(bucket::Column::Name.eq(bucket_name))
-        .exec(db)
-        .await?;
-    if locked.rows_affected != 1 {
-        return Err(AppError::NoSuchBucket(bucket_name.to_owned()));
-    }
-
+    super::import::ownership::lock_bucket_for_ownership(db, bucket_name).await?;
     get_versioning_state(db, bucket_name).await
 }
 

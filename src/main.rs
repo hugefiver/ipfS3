@@ -23,6 +23,8 @@ use s3s::validation::AwsNameValidation;
 use s3s::{Body as S3Body, HttpError};
 use sea_orm::DbErr;
 
+mod shutdown;
+
 const READY_DEADLINE: Duration = Duration::from_secs(2);
 const READY_PROBE_URL: &str = "http://127.0.0.1:9000/ready";
 
@@ -145,6 +147,7 @@ async fn run_gateway() -> anyhow::Result<()> {
 
     let app = gateway_app(state.clone(), imports.clone());
 
+    let signal = shutdown::ShutdownSignal::install()?;
     let listener = tokio::net::TcpListener::bind(cfg.server.bind).await?;
     tracing::info!("listening on {}", cfg.server.bind);
     let shutdown = tokio_util::sync::CancellationToken::new();
@@ -164,23 +167,34 @@ async fn run_gateway() -> anyhow::Result<()> {
         state.kubo.clone(),
         shutdown.child_token(),
     );
-    let signal_token = shutdown.clone();
-    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
-        if let Err(error) = tokio::signal::ctrl_c().await {
-            tracing::error!(%error, "failed to install shutdown signal");
-        }
-        signal_token.cancel();
-    });
-    let server_result = server.await;
-    shutdown.cancel();
-    let grace = std::time::Duration::from_secs(30);
-    tokio::join!(
-        pinning_worker.shutdown(grace),
-        import_worker.shutdown(grace),
-        lifecycle_worker.shutdown(grace),
-        residency_backfill_worker.shutdown(grace)
-    );
-    server_result?;
+    let server =
+        axum::serve(listener, app).with_graceful_shutdown(shutdown.clone().cancelled_owned());
+    let workers = async move {
+        tokio::join!(
+            pinning_worker.shutdown(shutdown::WORKER_GRACE),
+            import_worker.shutdown(shutdown::WORKER_GRACE),
+            lifecycle_worker.shutdown(shutdown::WORKER_GRACE),
+            residency_backfill_worker.shutdown(shutdown::WORKER_GRACE)
+        );
+    };
+    let result = shutdown::drain(
+        async move { server.await },
+        signal.wait(),
+        shutdown,
+        workers,
+        shutdown::EXIT_BUDGET,
+    )
+    .await;
+    if let Err(error) = &result
+        && error.kind() == std::io::ErrorKind::TimedOut
+    {
+        // Dropping axum's serve future alone does not terminate its spawned
+        // connection tasks. End the process so no late writer/renewer survives.
+        // Unfinished ownership cleanup is recovered by fenced DB lease expiry.
+        tracing::error!(%error, "forcing process exit; unfinished leases recover by expiry");
+        std::process::exit(1);
+    }
+    result?;
 
     Ok(())
 }

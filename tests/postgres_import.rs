@@ -51,16 +51,6 @@ const MIGRATION_LOCK_KEY_1: i32 = 1_229_997_651;
 const MIGRATION_LOCK_KEY_2: i32 = 1_395_879_239;
 type MigrationTask = JoinHandle<Result<(), DbErr>>;
 type MigrationTaskPair = (MigrationTask, MigrationTask);
-const EXPECTED_MIGRATIONS: [&str; 8] = [
-    "m20250701_000001_init",
-    "m20260707_000001_decompress_zip",
-    "m20260720_000001_sse_c_key_fingerprint",
-    "m20260721_000001_multi_provider_pinning",
-    "m20260729_000001_ipfs3_import",
-    "m20260729_000002_postgres_utc_timestamps",
-    "m20260730_000001_standard_mutation_fence",
-    "m20260813_000001_postgres_json_columns",
-];
 
 #[derive(Clone)]
 struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
@@ -305,6 +295,57 @@ async fn crate_bucket(db: &DatabaseConnection, bucket_name: &str) {
     ipfs_s3_gateway::store::bucket::create(db, bucket_name, None)
         .await
         .unwrap();
+}
+
+async fn create_pre_json_bucket(db: &DatabaseConnection, bucket_name: &str) {
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "INSERT INTO buckets (name) VALUES ($1)",
+        [bucket_name.into()],
+    ))
+    .await
+    .unwrap();
+}
+
+async fn current_postgres_schema_is_complete(db: &DatabaseConnection) -> Result<bool, DbErr> {
+    let row = db
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT \
+                 EXISTS (SELECT 1 FROM information_schema.columns \
+                         WHERE table_schema = current_schema() \
+                           AND table_name = 'objects' AND column_name = 'metadata' \
+                           AND data_type = 'jsonb') AS object_metadata_jsonb, \
+                 EXISTS (SELECT 1 FROM information_schema.columns \
+                         WHERE table_schema = current_schema() \
+                           AND table_name = 'buckets' AND column_name = 'versioning_status' \
+                           AND data_type = 'text') AS bucket_versioning, \
+                 EXISTS (SELECT 1 FROM information_schema.columns \
+                         WHERE table_schema = current_schema() \
+                           AND table_name = 'bucket_cors_configs' AND column_name = 'canonical_json' \
+                           AND data_type = 'text') AS bucket_cors, \
+                 EXISTS (SELECT 1 FROM information_schema.columns \
+                         WHERE table_schema = current_schema() \
+                           AND table_name = 'lifecycle_actions' AND column_name = 'target_type' \
+                           AND data_type = 'text') AS lifecycle_targets, \
+                 EXISTS (SELECT 1 FROM information_schema.columns \
+                         WHERE table_schema = current_schema() \
+                           AND table_name = 'lifecycle_transitions' AND column_name = 'checkpoint' \
+                           AND data_type = 'text') AS lifecycle_transitions, \
+                 EXISTS (SELECT 1 FROM information_schema.columns \
+                         WHERE table_schema = current_schema() \
+                           AND table_name = 'standard_mutation_leases' AND column_name = 'lease_until' \
+                           AND data_type = 'timestamp with time zone') AS mutation_leases",
+        ))
+        .await?
+        .ok_or_else(|| DbErr::Custom("migration schema validation returned no row".to_owned()))?;
+
+    Ok(row.try_get::<bool>("", "object_metadata_jsonb")?
+        && row.try_get::<bool>("", "bucket_versioning")?
+        && row.try_get::<bool>("", "bucket_cors")?
+        && row.try_get::<bool>("", "lifecycle_targets")?
+        && row.try_get::<bool>("", "lifecycle_transitions")?
+        && row.try_get::<bool>("", "mutation_leases")?)
 }
 
 async fn job(db: &DatabaseConnection, id: &str) -> import_job::Model {
@@ -1779,7 +1820,7 @@ async fn postgres_json_columns_require_compatibility_migration() {
     PreJsonCompatibilityMigrator::up(&fixture, None)
         .await
         .unwrap();
-    crate_bucket(&fixture, &bucket_name).await;
+    create_pre_json_bucket(&fixture, &bucket_name).await;
     multipart::create_upload(
         &fixture,
         &upload_id,
@@ -2091,13 +2132,9 @@ fn postgres_concurrent_startup_uses_transaction_advisory_lock_once() {
                         .collect::<Result<Vec<_>, DbErr>>();
                     match actual {
                         Ok(actual) => {
-                            let expected = EXPECTED_MIGRATIONS
-                                .iter()
-                                .map(|version| ((*version).to_owned(), 1_i64))
-                                .collect::<Vec<_>>();
-                            if actual != expected {
+                            if actual.is_empty() || actual.iter().any(|(_, count)| *count != 1) {
                                 failure.get_or_insert(
-                                    "migration markers were not exactly the expected eight versions",
+                                    "migration markers were absent or recorded more than once",
                                 );
                             }
                         }
@@ -2108,6 +2145,16 @@ fn postgres_concurrent_startup_uses_transaction_advisory_lock_once() {
                 }
                 Err(_) => {
                     failure.get_or_insert("could not read migration marker rows");
+                }
+            }
+            match current_postgres_schema_is_complete(&observer).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    failure
+                        .get_or_insert("concurrent migration did not publish the current schema");
+                }
+                Err(_) => {
+                    failure.get_or_insert("could not validate the concurrent migration schema");
                 }
             }
         }

@@ -608,6 +608,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cid_inspection_stream_error_prevents_object_publication() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/routing/findprovs"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("{\"Type\":4,\"Responses\":[{\"ID\":\"provider-a\"}]}\n"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_pin(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/cat"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("X-Stream-Error", "private backend failure")
+                    .set_body_bytes(b"partial"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let state = test_state(server.uri()).await;
+        let coordinator =
+            coordinator_with_downloader(import_config(), Arc::new(AtomicUsize::new(0)));
+        let (job, claim) = submit_and_claim(
+            &state,
+            "cid-stream-error",
+            ImportSource::Cid(CID.to_owned()),
+        )
+        .await;
+
+        execute_job(coordinator, state.clone(), job, claim, cancellation())
+            .await
+            .expect_err("Kubo inspection failure must stop before publication");
+        assert_eq!(
+            object::Entity::find()
+                .filter(object::Column::Bucket.eq("bucket"))
+                .filter(object::Column::Key.eq("key-cid-stream-error"))
+                .count(state.store.db())
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn combined_cid_pipeline_decompresses_then_atomically_publishes_without_direct_publish() {
         const ENTRY_CID: &str = "QmEntry";
         let archive = stored_zip("file.txt", b"hello");

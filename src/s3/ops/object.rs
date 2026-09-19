@@ -406,9 +406,8 @@ fn evaluate_publication_policy(
         .map_err(s3s::S3Error::from)
 }
 
-async fn copy_publication_tags(
-    state: &Arc<AppState>,
-    source_object_id: &str,
+fn copy_publication_tags(
+    source_tags: Vec<ObjectTag>,
     headers: &http::HeaderMap,
 ) -> S3Result<Vec<ObjectTag>> {
     let directive_header = single_control_header(
@@ -434,10 +433,7 @@ async fn copy_publication_tags(
                     "x-amz-tagging must be empty when tagging directive is COPY",
                 ));
             }
-            crate::store::pinning::tags::list_object_tags(state.store.db(), source_object_id)
-                .await
-                .map_err(crate::error::AppError::from)
-                .map_err(s3s::S3Error::from)
+            Ok(source_tags)
         }
         "REPLACE" => {
             let header = tagging.ok_or_else(|| {
@@ -671,6 +667,7 @@ struct SelectedS3Object {
     public_version_id: Option<String>,
     residency: crate::residency::ResolvedVersionResidency,
     read_client: crate::kubo::KuboClient,
+    tags: Vec<ObjectTag>,
 }
 
 async fn select_s3_object(
@@ -684,8 +681,8 @@ async fn select_s3_object(
         None => VersionSelector::Current,
     };
     let db = state.store.db();
-    let resolved =
-        crate::store::object_version::resolve_version(db, bucket, key, &selector).await?;
+    let snapshot = crate::store::object_version::read_snapshot(db, bucket, key, &selector).await?;
+    let resolved = snapshot.version;
     match resolved.kind {
         VersionKind::DeleteMarker => Err(AppError::DeleteMarker {
             version_id: resolved.public_version_id,
@@ -697,8 +694,9 @@ async fn select_s3_object(
             let object = resolved.object.ok_or_else(|| {
                 s3s::s3_error!(InternalError, "object version index is missing its object")
             })?;
-            let residency =
-                crate::store::residency::resolve_version_residency(db, &resolved.id).await?;
+            let residency = snapshot.residency.ok_or_else(|| {
+                s3s::s3_error!(InternalError, "object snapshot is missing its residency")
+            })?;
             if residency.identity.object_id != object.id || residency.identity.cid != object.cid {
                 return Err(s3s::s3_error!(
                     InternalError,
@@ -711,8 +709,7 @@ async fn select_s3_object(
             }
             .resolve_read_source(&residency)
             .await?;
-            let public_version_id = (crate::store::bucket::get_versioning_state(db, bucket)
-                .await?
+            let public_version_id = (snapshot.versioning_state
                 != BucketVersioningState::Unversioned)
                 .then_some(resolved.public_version_id);
             Ok(SelectedS3Object {
@@ -720,6 +717,7 @@ async fn select_s3_object(
                 public_version_id,
                 residency,
                 read_client,
+                tags: snapshot.tags,
             })
         }
     }
@@ -729,6 +727,10 @@ pub async fn put_object(
     state: &Arc<AppState>,
     req: S3Request<PutObjectInput>,
 ) -> S3Result<S3Response<PutObjectOutput>> {
+    crate::s3::http::reject_write_conditions(
+        &req.headers,
+        req.input.if_match.is_some() || req.input.if_none_match.is_some(),
+    )?;
     super::storage_class::require_standard_write(req.input.storage_class.as_ref())?;
     let bucket = &req.input.bucket;
     let key = &req.input.key;
@@ -767,98 +769,102 @@ pub async fn put_object(
     )
     .await?;
 
-    // Wrap the body with a byte counter so we can record the plaintext size.
-    let (counter, count_handle) = ByteCounter::new();
-    let stream = counter.wrap(body);
+    crate::store::import::ownership::run_mutation(db, &mutation_guard.clone(), |lease| async move {
+        // Wrap the body with a byte counter so we can record the plaintext size.
+        let (counter, count_handle) = ByteCounter::new();
+        let stream = counter.wrap(body);
 
-    let (cid, encrypted, key_wrap, sse_c_key_fingerprint): (
-        String,
-        bool,
-        Option<String>,
-        Option<String>,
-    ) = match enc_mode {
-        EncryptionMode::None => {
-            let cid = crate::kubo::add::stream_add(&state.kubo, stream, 1).await?;
-            (cid, false, None, None)
-        }
-        EncryptionMode::SseS3 => {
-            let ok = state.master_key.generate_object_key();
-            let wrapped = state
-                .master_key
-                .wrap(&ok)
-                .map_err(|e| s3s::s3_error!(InternalError, "key wrap: {e}"))?;
-            // encrypt_chunk_stream requires an Unpin stream; Box::pin satisfies
-            // that because Pin<Box<T>> is always Unpin.
-            let pinned = Box::pin(stream);
-            let encrypted_stream =
-                crate::crypto::chunker::encrypt_chunk_stream(pinned, Arc::new(ok));
-            let cid = crate::kubo::add::stream_add(&state.kubo, encrypted_stream, 1).await?;
-            (cid, true, Some(wrapped), None)
-        }
-        EncryptionMode::SseC => {
-            let validated = sse_c_headers.expect("SSE-C headers validated before admission");
-            let fingerprint = state.master_key.sse_c_key_fingerprint(&validated.key);
-            let pinned = Box::pin(stream);
-            let encrypted_stream =
-                crate::crypto::chunker::encrypt_chunk_stream(pinned, Arc::new(validated.key));
-            let cid = crate::kubo::add::stream_add(&state.kubo, encrypted_stream, 1).await?;
-            (cid, true, None, Some(fingerprint))
-        }
-    };
+        let (cid, encrypted, key_wrap, sse_c_key_fingerprint): (
+            String,
+            bool,
+            Option<String>,
+            Option<String>,
+        ) = match enc_mode {
+            EncryptionMode::None => {
+                let cid = crate::kubo::add::stream_add(&state.kubo, stream, 1).await?;
+                (cid, false, None, None)
+            }
+            EncryptionMode::SseS3 => {
+                let ok = state.master_key.generate_object_key();
+                let wrapped = state
+                    .master_key
+                    .wrap(&ok)
+                    .map_err(|e| s3s::s3_error!(InternalError, "key wrap: {e}"))?;
+                // encrypt_chunk_stream requires an Unpin stream; Box::pin satisfies
+                // that because Pin<Box<T>> is always Unpin.
+                let pinned = Box::pin(stream);
+                let encrypted_stream =
+                    crate::crypto::chunker::encrypt_chunk_stream(pinned, Arc::new(ok));
+                let cid = crate::kubo::add::stream_add(&state.kubo, encrypted_stream, 1).await?;
+                (cid, true, Some(wrapped), None)
+            }
+            EncryptionMode::SseC => {
+                let validated = sse_c_headers.expect("SSE-C headers validated before admission");
+                let fingerprint = state.master_key.sse_c_key_fingerprint(&validated.key);
+                let pinned = Box::pin(stream);
+                let encrypted_stream =
+                    crate::crypto::chunker::encrypt_chunk_stream(pinned, Arc::new(validated.key));
+                let cid = crate::kubo::add::stream_add(&state.kubo, encrypted_stream, 1).await?;
+                (cid, true, None, Some(fingerprint))
+            }
+        };
 
-    let size = count_handle.load(Ordering::Relaxed) as i64;
+        let size = count_handle.load(Ordering::Relaxed) as i64;
 
-    // A CID can be shared with an earlier publication, and an RPC failure does
-    // not prove Kubo left the pin unchanged. Conservative cleanup here could
-    // therefore remove content that another object still needs.
-    crate::kubo::pin::pin_add(&state.kubo, &cid).await?;
+        // A CID can be shared with an earlier publication, and an RPC failure does
+        // not prove Kubo left the pin unchanged. Conservative cleanup here could
+        // therefore remove content that another object still needs.
+        crate::kubo::pin::pin_add(&state.kubo, &cid).await?;
 
-    let object_created_at = chrono::Utc::now();
-    let publication = PublicationRequest {
-        object: PublicationObject::from_put(
-            object_id,
-            bucket,
-            key,
-            cid.clone(),
-            size,
-            content_type,
-            metadata,
-            encrypted,
-            key_wrap,
-            sse_c_key_fingerprint,
-            object_created_at,
-        ),
-        tags: policy.tags.clone(),
-        policy,
-        object_target: PinTargetSpec {
-            cid: cid.clone(),
-            logical_size: size,
-        },
-    };
-    let publication_result = crate::store::pinning::publication::publish_standard_object(
-        db,
-        publication,
-        mutation_guard,
-        state.pinning.provider_limits(),
-    )
-    .await?;
+        let object_created_at = chrono::Utc::now();
+        let publication = PublicationRequest {
+            object: PublicationObject::from_put(
+                object_id,
+                bucket,
+                key,
+                cid.clone(),
+                size,
+                content_type,
+                metadata,
+                encrypted,
+                key_wrap,
+                sse_c_key_fingerprint,
+                object_created_at,
+            ),
+            tags: policy.tags.clone(),
+            policy,
+            object_target: PinTargetSpec {
+                cid: cid.clone(),
+                logical_size: size,
+            },
+        };
+        let publication_result = lease
+            .commit(crate::store::pinning::publication::publish_standard_object(
+                db,
+                publication,
+                mutation_guard,
+                state.pinning.provider_limits(),
+            ))
+            .await?;
 
-    let server_side_encryption = if enc_mode == EncryptionMode::SseS3 {
-        Some(ServerSideEncryption::from_static("AES256"))
-    } else {
-        None
-    };
+        let server_side_encryption = if enc_mode == EncryptionMode::SseS3 {
+            Some(ServerSideEncryption::from_static("AES256"))
+        } else {
+            None
+        };
 
-    let headers = put_object_ipfs_headers(&cid)?;
-    Ok(S3Response::with_headers(
-        PutObjectOutput {
-            e_tag: Some(ETag::Strong(cid.clone())),
-            server_side_encryption,
-            version_id: publication_result.version_id,
-            ..Default::default()
-        },
-        headers,
-    ))
+        let headers = put_object_ipfs_headers(&cid)?;
+        Ok(S3Response::with_headers(
+            PutObjectOutput {
+                e_tag: Some(ETag::Strong(cid.clone())),
+                server_side_encryption,
+                version_id: publication_result.version_id,
+                ..Default::default()
+            },
+            headers,
+        ))
+    })
+    .await
 }
 
 pub async fn get_object(
@@ -1100,22 +1106,28 @@ pub async fn delete_object(
     )
     .await?;
 
-    let result = crate::store::pinning::publication::delete_version_with_leases_guarded(
-        db,
-        bucket,
-        key,
-        selector,
-        mutation_guard,
-        chrono::Utc::now(),
-    )
-    .await?;
+    crate::store::import::ownership::run_mutation(db, &mutation_guard.clone(), |lease| async move {
+        let result = lease
+            .commit(
+                crate::store::pinning::publication::delete_version_with_leases_guarded(
+                    db,
+                    bucket,
+                    key,
+                    selector,
+                    mutation_guard,
+                    chrono::Utc::now(),
+                ),
+            )
+            .await?;
 
-    Ok(S3Response::new(DeleteObjectOutput {
-        delete_marker: (result.created_delete_marker || result.deleted_delete_marker)
-            .then_some(true),
-        version_id: result.version_id,
-        ..Default::default()
-    }))
+        Ok(S3Response::new(DeleteObjectOutput {
+            delete_marker: (result.created_delete_marker || result.deleted_delete_marker)
+                .then_some(true),
+            version_id: result.version_id,
+            ..Default::default()
+        }))
+    })
+    .await
 }
 
 fn delete_objects_item_error(error: &AppError) -> (String, String) {
@@ -1228,14 +1240,24 @@ pub async fn delete_objects(
                 continue;
             }
         };
-        match crate::store::pinning::publication::delete_version_with_leases_guarded(
-            db,
-            &bucket,
-            &key,
-            selector,
-            guard,
-            chrono::Utc::now(),
-        )
+        match crate::store::import::ownership::run_mutation(db, &guard.clone(), |lease| {
+            let bucket = &bucket;
+            let key = &key;
+            async move {
+                lease
+                    .commit(
+                        crate::store::pinning::publication::delete_version_with_leases_guarded(
+                            db,
+                            bucket,
+                            key,
+                            selector,
+                            guard,
+                            chrono::Utc::now(),
+                        ),
+                    )
+                    .await
+            }
+        })
         .await
         {
             Ok(result) if !quiet => {
@@ -1304,7 +1326,7 @@ pub async fn copy_object(
         select_s3_object(state, &src_bucket, &src_key, src_version_id.as_deref()).await?;
     let src_obj = selected_source.object;
     let copy_source_version_id = selected_source.public_version_id;
-    let tags = copy_publication_tags(state, &src_obj.id, &req.headers).await?;
+    let tags = copy_publication_tags(selected_source.tags, &req.headers)?;
 
     // Validate destination bucket exists.
     let dst_exists = crate::store::bucket::exists(db, dst_bucket).await?;
@@ -1353,98 +1375,103 @@ pub async fn copy_object(
     )
     .await?;
 
-    let verified_source_fingerprint = match source_sse_c_authentication {
-        Some(CopySourceSseCAuthentication::StoredFingerprint(fingerprint)) => Some(fingerprint),
-        Some(CopySourceSseCAuthentication::Legacy(headers)) => Some(
-            authenticate_sse_c_object(state, &src_obj, &selected_source.read_client, headers)
-                .await?
-                .fingerprint,
-        ),
-        None => None,
-    };
+    crate::store::import::ownership::run_mutation(db, &mutation_guard.clone(), |lease| async move {
+        let verified_source_fingerprint = match source_sse_c_authentication {
+            Some(CopySourceSseCAuthentication::StoredFingerprint(fingerprint)) => Some(fingerprint),
+            Some(CopySourceSseCAuthentication::Legacy(headers)) => Some(
+                authenticate_sse_c_object(state, &src_obj, &selected_source.read_client, headers)
+                    .await?
+                    .fingerprint,
+            ),
+            None => None,
+        };
 
-    let hot_receipt = match selected_source.residency.primary.tier {
-        crate::residency::KuboTier::Hot => {
-            // The source is already local to the publication tier. Re-pin its
-            // content-addressed root before creating the independent owner.
-            crate::kubo::pin::pin_add(&state.kubo, &src_obj.cid).await?;
-            None
-        }
-        crate::residency::KuboTier::Cold => {
-            // A hot pin request is not a transport primitive: the hot node may
-            // be deliberately disconnected from cold. Copy and verify the
-            // exact encrypted/plain DAG before publishing a STANDARD owner.
-            Some(
-                crate::kubo::tier_copy::stream_copy_verified(
-                    &selected_source.read_client,
-                    &state.kubo,
-                    &src_obj.cid,
-                    selected_source.residency.physical.node_identity.as_deref(),
-                    None,
-                    &tokio_util::sync::CancellationToken::new(),
+        let hot_receipt = match selected_source.residency.primary.tier {
+            crate::residency::KuboTier::Hot => {
+                // The source is already local to the publication tier. Re-pin its
+                // content-addressed root before creating the independent owner.
+                crate::kubo::pin::pin_add(&state.kubo, &src_obj.cid).await?;
+                None
+            }
+            crate::residency::KuboTier::Cold => {
+                // A hot pin request is not a transport primitive: the hot node may
+                // be deliberately disconnected from cold. Copy and verify the
+                // exact encrypted/plain DAG before publishing a STANDARD owner.
+                Some(
+                    crate::kubo::tier_copy::stream_copy_verified(
+                        &selected_source.read_client,
+                        &state.kubo,
+                        &src_obj.cid,
+                        selected_source.residency.physical.node_identity.as_deref(),
+                        None,
+                        &tokio_util::sync::CancellationToken::new(),
+                    )
+                    .await?,
+                )
+            }
+        };
+
+        let new_id = uuid::Uuid::new_v4().to_string();
+        let object_created_at = chrono::Utc::now();
+        let mut object = PublicationObject::from_put(
+            new_id,
+            dst_bucket,
+            dst_key,
+            src_obj.cid.clone(),
+            src_obj.size,
+            src_obj.content_type.clone(),
+            src_obj.metadata.clone(),
+            src_obj.encrypted,
+            src_obj.key_wrap.clone(),
+            verified_source_fingerprint,
+            object_created_at,
+        );
+        object.multipart = src_obj.multipart;
+        let publication = PublicationRequest {
+            object,
+            tags: policy.tags.clone(),
+            policy,
+            object_target: PinTargetSpec {
+                cid: src_obj.cid.clone(),
+                logical_size: src_obj.size,
+            },
+        };
+        let publication_result = match hot_receipt {
+            Some(receipt) => lease
+                .commit(
+                    crate::store::pinning::publication::publish_standard_object_with_hot_receipt(
+                        db,
+                        publication,
+                        mutation_guard,
+                        receipt,
+                        state.pinning.provider_limits(),
+                    ),
                 )
                 .await?,
-            )
-        }
-    };
+            None => {
+                lease
+                    .commit(crate::store::pinning::publication::publish_standard_object(
+                        db,
+                        publication,
+                        mutation_guard,
+                        state.pinning.provider_limits(),
+                    ))
+                    .await?
+            }
+        };
 
-    let new_id = uuid::Uuid::new_v4().to_string();
-    let object_created_at = chrono::Utc::now();
-    let mut object = PublicationObject::from_put(
-        new_id,
-        dst_bucket,
-        dst_key,
-        src_obj.cid.clone(),
-        src_obj.size,
-        src_obj.content_type.clone(),
-        src_obj.metadata.clone(),
-        src_obj.encrypted,
-        src_obj.key_wrap.clone(),
-        verified_source_fingerprint,
-        object_created_at,
-    );
-    object.multipart = src_obj.multipart;
-    let publication = PublicationRequest {
-        object,
-        tags: policy.tags.clone(),
-        policy,
-        object_target: PinTargetSpec {
-            cid: src_obj.cid.clone(),
-            logical_size: src_obj.size,
-        },
-    };
-    let publication_result = match hot_receipt {
-        Some(receipt) => {
-            crate::store::pinning::publication::publish_standard_object_with_hot_receipt(
-                db,
-                publication,
-                mutation_guard,
-                receipt,
-                state.pinning.provider_limits(),
-            )
-            .await?
-        }
-        None => {
-            crate::store::pinning::publication::publish_standard_object(
-                db,
-                publication,
-                mutation_guard,
-                state.pinning.provider_limits(),
-            )
-            .await?
-        }
-    };
-
-    Ok(S3Response::new(CopyObjectOutput {
-        copy_object_result: Some(CopyObjectResult {
-            e_tag: Some(ETag::Strong(src_obj.etag.clone())),
-            last_modified: Some(Timestamp::from(SystemTime::from(object_created_at))),
+        Ok(S3Response::new(CopyObjectOutput {
+            copy_object_result: Some(CopyObjectResult {
+                e_tag: Some(ETag::Strong(src_obj.etag.clone())),
+                last_modified: Some(Timestamp::from(SystemTime::from(object_created_at))),
+                ..Default::default()
+            }),
+            copy_source_version_id,
+            version_id: publication_result.version_id,
             ..Default::default()
-        }),
-        copy_source_version_id,
-        version_id: publication_result.version_id,
-        ..Default::default()
-    }))
+        }))
+    })
+    .await
 }
 
 use crate::store::entities::object;
@@ -3989,6 +4016,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_streaming_put_releases_guard_and_never_publishes() {
+        use http_body_util::BodyExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        // Unlike Wiremock's full-body collector, this streaming endpoint treats
+        // request cancellation as ordinary EOF/error rather than a mock panic.
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().fallback(|mut body: axum::body::Body| async move {
+                    while let Some(frame) = body.frame().await {
+                        if frame.is_err() {
+                            break;
+                        }
+                    }
+                    http::StatusCode::BAD_REQUEST
+                }),
+            )
+            .await
+            .unwrap();
+        });
+        let state = pinning_state(uri, "request", "one", "").await;
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let body = async_stream::stream! {
+            started.send(()).unwrap();
+            std::future::pending::<()>().await;
+            yield Ok::<_, std::io::Error>(Bytes::from_static(b"never sent"));
+        };
+        let mut req = put_request("cancelled", None);
+        req.input.body = Some(StreamingBlob::wrap(body));
+        let task_state = state.clone();
+        let task = tokio::spawn(async move { put_object(&task_state, req).await });
+        ready.await.unwrap();
+        assert!(
+            crate::store::import::ownership::try_admit_lifecycle_mutation(
+                state.store.db(),
+                "bucket",
+                "cancelled",
+                "recovery",
+                1,
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if crate::store::import::ownership::try_admit_lifecycle_mutation(
+                    state.store.db(),
+                    "bucket",
+                    "cancelled",
+                    "recovery",
+                    1,
+                    chrono::Utc::now(),
+                )
+                .await
+                .unwrap()
+                .is_some()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            crate::store::object::get_latest(state.store.db(), "bucket", "cancelled").await,
+            Err(AppError::NoSuchKey(_))
+        ));
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
     async fn put_object_pin_add_failure_never_removes_the_uploaded_cid() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -4023,6 +4128,20 @@ mod tests {
 
         assert_eq!(error.code().as_str(), "InternalError");
         assert_eq!(error.message(), Some("internal storage backend error"));
+        assert!(
+            crate::store::import::ownership::try_admit_lifecycle_mutation(
+                state.store.db(),
+                "bucket",
+                "pin-add-failure",
+                "recovery",
+                1,
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap()
+            .is_some(),
+            "failed streaming PUT must release its ownership"
+        );
         assert!(
             !error.to_string().contains("kubo-body-marker-do-not-leak")
                 && !error.to_string().contains("127.0.0.1"),

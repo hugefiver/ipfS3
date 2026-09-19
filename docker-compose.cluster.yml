@@ -203,6 +203,8 @@ services:
     restart: unless-stopped
 
   gateway:
+    stop_grace_period: 40s
+    stop_signal: SIGTERM
     build: .
     image: ghcr.io/hugefiver/ipfs3:latest
     ports:

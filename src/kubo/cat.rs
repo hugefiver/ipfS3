@@ -3,8 +3,14 @@ use futures_util::{Stream, StreamExt};
 use http_body_util::BodyExt as _;
 use tokio_util::sync::CancellationToken;
 
-use super::{KuboClient, next_response_frame, send_request};
+use super::{KuboClient, send_request};
 use crate::error::{AppError, AppResult};
+
+const STREAM_ERROR_HEADER: &str = "x-stream-error";
+
+fn has_stream_error(headers: &reqwest::header::HeaderMap) -> bool {
+    headers.contains_key(STREAM_ERROR_HEADER)
+}
 
 pub async fn stream_cat(
     kubo: &KuboClient,
@@ -39,7 +45,7 @@ pub async fn stream_cat(
     }
 
     let idle_timeout = kubo.stream_idle_timeout();
-    if resp.headers().contains_key("x-stream-error") {
+    if has_stream_error(resp.headers()) {
         return Err(AppError::kubo_rpc_detail(
             "Kubo cat reported stream failure",
         ));
@@ -58,7 +64,7 @@ pub async fn stream_cat(
             match frame.into_data() {
                 Ok(data) => yield Ok(data),
                 Err(frame) => match frame.into_trailers() {
-                    Ok(trailers) if trailers.contains_key("x-stream-error") => {
+                    Ok(trailers) if has_stream_error(&trailers) => {
                         yield Err(crate::error::kubo_stream_error());
                         return;
                     }
@@ -87,23 +93,52 @@ pub async fn inspect_file(
         );
         return Err(AppError::kubo_rpc_status(status));
     }
-    if let Some(size) = response.content_length() {
-        // Dropping the response here closes its body without materializing file
-        // data. Kubo's cat response supplies the logical file bytes directly.
-        return Ok(size);
+    if has_stream_error(response.headers()) {
+        return Err(AppError::kubo_rpc_detail(
+            "Kubo cat inspection reported stream failure",
+        ));
     }
 
-    let mut body = response.bytes_stream();
+    let expected_size = response.content_length();
+    let mut body: reqwest::Body = response.into();
     let mut size = 0_u64;
     loop {
-        let Some(frame) = next_response_frame(&mut body, kubo, &cancel).await? else {
-            break;
+        let next = tokio::select! {
+            _ = cancel.cancelled() => return Err(super::canceled_rpc_error()),
+            frame = tokio::time::timeout(kubo.stream_idle_timeout(), body.frame()) => frame,
         };
-        let chunk_len = u64::try_from(frame.len())
-            .map_err(|_| AppError::kubo_rpc_detail("Kubo file size exceeds limit"))?;
-        size = size
-            .checked_add(chunk_len)
-            .ok_or_else(|| AppError::kubo_rpc_detail("Kubo file size exceeds limit"))?;
+        let frame = match next {
+            Ok(Some(Ok(frame))) => frame,
+            Ok(Some(Err(_))) => {
+                return Err(AppError::kubo_rpc_detail("Kubo response stream failed"));
+            }
+            Ok(None) => break,
+            Err(_) => {
+                return Err(AppError::kubo_rpc_detail("Kubo response stream timed out"));
+            }
+        };
+        match frame.into_data() {
+            Ok(data) => {
+                let chunk_len = u64::try_from(data.len())
+                    .map_err(|_| AppError::kubo_rpc_detail("Kubo file size exceeds limit"))?;
+                size = size
+                    .checked_add(chunk_len)
+                    .ok_or_else(|| AppError::kubo_rpc_detail("Kubo file size exceeds limit"))?;
+            }
+            Err(frame) => match frame.into_trailers() {
+                Ok(trailers) if has_stream_error(&trailers) => {
+                    return Err(AppError::kubo_rpc_detail(
+                        "Kubo cat inspection reported stream failure",
+                    ));
+                }
+                Ok(_) | Err(_) => {}
+            },
+        }
+    }
+    if expected_size.is_some_and(|expected| expected != size) {
+        return Err(AppError::kubo_rpc_detail(
+            "Kubo response stream ended before Content-Length",
+        ));
     }
     Ok(size)
 }
@@ -243,6 +278,37 @@ mod tests {
         (endpoint, task)
     }
 
+    async fn fixed_length_cat_server(
+        declared: usize,
+        body: &'static [u8],
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut byte = [0_u8; 1];
+                socket.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {declared}\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            socket.write_all(body).await.unwrap();
+        });
+        (endpoint, task)
+    }
+
     #[tokio::test]
     async fn test_stream_cat_returns_bytes() {
         let server = MockServer::start().await;
@@ -308,6 +374,50 @@ mod tests {
         .await
         .expect("chunked cat must be counted incrementally");
         assert_eq!(counted_size, 12);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn inspect_file_rejects_initial_and_trailer_stream_errors() {
+        let initial = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/cat"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("X-Stream-Error", "private backend failure")
+                    .set_body_bytes(b"partial"),
+            )
+            .mount(&initial)
+            .await;
+        inspect_file(
+            &KuboClient::new(initial.uri()),
+            "QmInitialError",
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("initial X-Stream-Error must reject inspection even with Content-Length");
+
+        let (endpoint, server) = trailer_cat_server().await;
+        inspect_file(
+            &KuboClient::new(endpoint),
+            "QmLateError",
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("late X-Stream-Error must reject inspection after partial data");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn inspect_file_rejects_a_short_body_with_content_length() {
+        let (endpoint, server) = fixed_length_cat_server(10, b"short").await;
+        inspect_file(
+            &KuboClient::new(endpoint),
+            "QmShortBody",
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("Content-Length is not proof that all bytes arrived");
         server.await.unwrap();
     }
 

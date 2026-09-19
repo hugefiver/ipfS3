@@ -383,6 +383,18 @@ struct ControlledResolver {
     fail: Arc<AtomicBool>,
 }
 
+struct BlockingSubmissionResolver {
+    started: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl ImportResolver for BlockingSubmissionResolver {
+    async fn resolve(&self, _host: &str, _port: u16) -> Result<Vec<SocketAddr>, DownloadError> {
+        self.started.notify_one();
+        std::future::pending().await
+    }
+}
+
 #[async_trait::async_trait]
 impl ImportResolver for ControlledResolver {
     async fn resolve(&self, _host: &str, port: u16) -> Result<Vec<SocketAddr>, DownloadError> {
@@ -496,6 +508,62 @@ async fn url_is_authorized_before_atomic_submit_and_never_appears_in_api_xml() {
             .await
             .unwrap(),
         1
+    );
+}
+
+#[tokio::test]
+async fn submission_dns_timeout_rejects_before_database_work() {
+    let state = test_state().await;
+    let config = ImportConfig {
+        allowed_https_origins: vec!["https://example.com".to_owned()],
+        connect_timeout_secs: 1,
+        ..ImportConfig::default()
+    }
+    .validate()
+    .unwrap();
+    let resolver = Arc::new(BlockingSubmissionResolver {
+        started: tokio::sync::Notify::new(),
+    });
+    let limits = DownloadLimits {
+        connect_timeout: std::time::Duration::from_secs(1),
+        idle_timeout: std::time::Duration::from_secs(1),
+        max_bytes: 1,
+    };
+    let downloader = SourceDownloader::with_components(
+        Arc::new(config.clone()),
+        resolver.clone(),
+        Arc::new(StrictPublicAddressPolicy),
+        Arc::new(ReqwestImportHttpTransport::new(limits, Vec::new())),
+    );
+    let route = ImportObjectRoute::new(state.clone(), ImportCoordinator::new(config, downloader));
+    tokio::time::pause();
+    let submit = tokio::spawn(async move {
+        route
+            .call(request(
+                Method::POST,
+                "/bucket/key?ipfs3-import",
+                Body::from(
+                    "<IPFS3ImportRequest><URL>https://example.com/object</URL></IPFS3ImportRequest>"
+                        .to_owned(),
+                ),
+            ))
+            .await
+    });
+
+    resolver.started.notified().await;
+    tokio::time::advance(std::time::Duration::from_secs(2)).await;
+    tokio::time::timeout(std::time::Duration::from_secs(1), submit)
+        .await
+        .expect("submission must finish after the DNS deadline")
+        .unwrap()
+        .expect_err("timed-out submission DNS must be rejected");
+    tokio::time::resume();
+    assert_eq!(
+        import_job::Entity::find()
+            .count(state.store.db())
+            .await
+            .unwrap(),
+        0
     );
 }
 

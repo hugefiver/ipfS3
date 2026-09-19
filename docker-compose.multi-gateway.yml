@@ -36,6 +36,8 @@ services:
     restart: unless-stopped
 
   gateway-a:
+    stop_grace_period: 40s
+    stop_signal: SIGTERM
     build: .
     image: ghcr.io/hugefiver/ipfs3:latest
     environment:
@@ -60,6 +62,8 @@ services:
     restart: unless-stopped
 
   gateway-b:
+    stop_grace_period: 40s
+    stop_signal: SIGTERM
     build: .
     image: ghcr.io/hugefiver/ipfs3:latest
     environment:

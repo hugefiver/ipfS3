@@ -214,7 +214,13 @@ pub async fn publish_standard_object_with_hot_receipt(
     receipt: crate::kubo::LocalResidencyVerificationReceipt,
     limits: &ProviderLimitMap,
 ) -> AppResult<PublicationResult> {
-    let receipt = HotPublicationReceipt::validate(receipt, &request.object.cid)?;
+    let receipt = match HotPublicationReceipt::validate(receipt, &request.object.cid) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            release_failed_mutation(db, Some(&guard), true).await;
+            return Err(error);
+        }
+    };
     run_publication_with_retries_and_hot_receipt(
         db,
         request,
@@ -459,18 +465,47 @@ pub async fn delete_version_with_leases_guarded(
     guard: StandardMutationGuard,
     now: DateTime<Utc>,
 ) -> AppResult<DeleteVersionResult> {
-    for retry in 0..=MAX_TRANSACTION_RETRIES {
-        match delete_version_attempt(db, bucket, key, selector.clone(), guard.clone(), now).await {
-            Ok(deleted) => return Ok(deleted),
-            Err(TransactionError::Transaction(error))
-                if is_retryable_transaction_conflict(&error) && retry < MAX_TRANSACTION_RETRIES =>
+    let result = async {
+        for retry in 0..=MAX_TRANSACTION_RETRIES {
+            match delete_version_attempt(db, bucket, key, selector.clone(), guard.clone(), now)
+                .await
             {
-                publication_retry_delay(retry).await;
+                Ok(deleted) => return Ok(deleted),
+                Err(TransactionError::Transaction(error))
+                    if is_retryable_transaction_conflict(&error)
+                        && retry < MAX_TRANSACTION_RETRIES =>
+                {
+                    publication_retry_delay(retry).await;
+                }
+                Err(error) => return Err(transaction_error_into_app(error)),
             }
-            Err(error) => return Err(transaction_error_into_app(error)),
+        }
+        unreachable!("guarded version delete retry loop exhausted without returning")
+    }
+    .await;
+    release_failed_mutation(db, Some(&guard), result.is_err()).await;
+    result
+}
+
+async fn release_failed_mutation(
+    db: &DatabaseConnection,
+    guard: Option<&StandardMutationGuard>,
+    failed: bool,
+) {
+    if failed && let Some(guard) = guard {
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::store::import::ownership::release_standard_mutation(db, guard),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "failed mutation cleanup deferred to lease expiry")
+            }
+            Err(_) => tracing::warn!("failed mutation cleanup timed out; deferred to lease expiry"),
         }
     }
-    unreachable!("guarded version delete retry loop exhausted without returning")
 }
 
 async fn delete_version_attempt(
@@ -724,31 +759,37 @@ async fn run_publication_with_retries_and_hot_receipt(
     hot_receipt: Option<HotPublicationReceipt>,
     limits: &ProviderLimitMap,
 ) -> AppResult<PublicationResult> {
-    for retry in 0..=MAX_TRANSACTION_RETRIES {
-        match publication_attempt(
-            db,
-            request.clone(),
-            entries.clone(),
-            upload_target.clone(),
-            standard_guard.clone(),
-            import_guard.clone(),
-            result_rows.clone(),
-            import_now,
-            hot_receipt.clone(),
-            limits.clone(),
-        )
-        .await
-        {
-            Ok(result) => return Ok(result),
-            Err(TransactionError::Transaction(error))
-                if is_retryable_transaction_conflict(&error) && retry < MAX_TRANSACTION_RETRIES =>
+    let result = async {
+        for retry in 0..=MAX_TRANSACTION_RETRIES {
+            match publication_attempt(
+                db,
+                request.clone(),
+                entries.clone(),
+                upload_target.clone(),
+                standard_guard.clone(),
+                import_guard.clone(),
+                result_rows.clone(),
+                import_now,
+                hot_receipt.clone(),
+                limits.clone(),
+            )
+            .await
             {
-                publication_retry_delay(retry).await;
+                Ok(result) => return Ok(result),
+                Err(TransactionError::Transaction(error))
+                    if is_retryable_transaction_conflict(&error)
+                        && retry < MAX_TRANSACTION_RETRIES =>
+                {
+                    publication_retry_delay(retry).await;
+                }
+                Err(error) => return Err(transaction_error_into_app(error)),
             }
-            Err(error) => return Err(transaction_error_into_app(error)),
         }
+        unreachable!("publication retry loop exhausted without returning")
     }
-    unreachable!("publication retry loop exhausted without returning")
+    .await;
+    release_failed_mutation(db, standard_guard.as_ref(), result.is_err()).await;
+    result
 }
 
 async fn run_completed_publication_with_retries(
@@ -760,41 +801,47 @@ async fn run_completed_publication_with_retries(
     limits: &ProviderLimitMap,
 ) -> Result<PublicationResult, CommitCompletedUploadError> {
     let completion_attempt_id = request.object.id.clone();
-    for retry in 0..=MAX_TRANSACTION_RETRIES {
-        match publication_attempt(
-            db,
-            request.clone(),
-            entries.clone(),
-            Some(upload_target.clone()),
-            standard_guard.clone(),
-            None,
-            Vec::new(),
-            None,
-            None,
-            limits.clone(),
-        )
-        .await
-        {
-            Ok(result) => return Ok(result),
-            Err(TransactionError::Transaction(source)) => {
-                if is_retryable_transaction_conflict(&source) && retry < MAX_TRANSACTION_RETRIES {
-                    publication_retry_delay(retry).await;
-                    continue;
+    let result = async {
+        for retry in 0..=MAX_TRANSACTION_RETRIES {
+            match publication_attempt(
+                db,
+                request.clone(),
+                entries.clone(),
+                Some(upload_target.clone()),
+                standard_guard.clone(),
+                None,
+                Vec::new(),
+                None,
+                None,
+                limits.clone(),
+            )
+            .await
+            {
+                Ok(result) => return Ok(result),
+                Err(TransactionError::Transaction(source)) => {
+                    if is_retryable_transaction_conflict(&source) && retry < MAX_TRANSACTION_RETRIES
+                    {
+                        publication_retry_delay(retry).await;
+                        continue;
+                    }
+                    return Err(CommitCompletedUploadError::RolledBack {
+                        completion_attempt_id,
+                        source,
+                    });
                 }
-                return Err(CommitCompletedUploadError::RolledBack {
-                    completion_attempt_id,
-                    source,
-                });
-            }
-            Err(TransactionError::Connection(source)) => {
-                return Err(CommitCompletedUploadError::OutcomeUnknown {
-                    completion_attempt_id,
-                    source: source.into(),
-                });
+                Err(TransactionError::Connection(source)) => {
+                    return Err(CommitCompletedUploadError::OutcomeUnknown {
+                        completion_attempt_id,
+                        source: source.into(),
+                    });
+                }
             }
         }
+        unreachable!("completed publication retry loop exhausted without returning")
     }
-    unreachable!("completed publication retry loop exhausted without returning")
+    .await;
+    release_failed_mutation(db, standard_guard.as_ref(), result.is_err()).await;
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
