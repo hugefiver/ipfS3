@@ -334,6 +334,7 @@ async fn build_harness(kubo_harness: KuboHarness) -> TestHarness {
         .expect("create test bucket");
     let state = Arc::new(ipfs_s3_gateway::state::AppState {
         kubo: ipfs_s3_gateway::kubo::KuboClient::new(kubo.uri()),
+        cold_kubo: None,
         store: ipfs_s3_gateway::store::Store::new(db),
         credentials: HashMap::from([("test".to_owned(), s3s::auth::SecretKey::from("test"))]),
         master_key: ipfs_s3_gateway::crypto::key::MasterKey::from_hex(&"0".repeat(64))
@@ -401,20 +402,26 @@ fn kubo_add_file_bytes(request: &wiremock::Request) -> Vec<u8> {
 }
 
 fn kubo_cat_body(request: &wiremock::Request, body: Vec<u8>) -> Vec<u8> {
-    let range = request
+    let offset = request
         .url
         .query_pairs()
-        .find(|(name, _)| name == "bytes")
+        .find(|(name, _)| name == "offset")
         .map(|(_, value)| value.into_owned());
-    let Some(range) = range else {
+    let Some(offset) = offset else {
         return body;
     };
-    let (start, end) = range.split_once('-').expect("Kubo bytes=start-end");
-    let start: usize = start.parse().expect("Kubo byte start");
-    let end: usize = end.parse().expect("Kubo byte end");
-    assert!(start <= end, "Kubo byte range is ascending");
-    assert!(end < body.len(), "S3 range is checked before Kubo");
-    body[start..=end].to_vec()
+    let length = request
+        .url
+        .query_pairs()
+        .find(|(name, _)| name == "length")
+        .expect("Kubo range length")
+        .1
+        .parse::<usize>()
+        .expect("Kubo byte length");
+    let start: usize = offset.parse().expect("Kubo byte offset");
+    let end = start.checked_add(length).expect("Kubo range end");
+    assert!(end <= body.len(), "S3 range is checked before Kubo");
+    body[start..end].to_vec()
 }
 
 pub async fn assert_pin_calls(

@@ -11,6 +11,7 @@ use crate::store::Store;
 
 pub struct AppState {
     pub kubo: KuboClient,
+    pub cold_kubo: Option<KuboClient>,
     pub store: Store,
     pub credentials: HashMap<String, SecretKey>,
     pub master_key: MasterKey,
@@ -28,7 +29,12 @@ impl AppState {
     where
         F: Fn(&str) -> Option<String>,
     {
+        cfg.validate_kubo()?;
         let kubo = KuboClient::new(cfg.kubo.rpc_url.clone());
+        let cold_kubo = cfg
+            .cold_kubo
+            .as_ref()
+            .map(|config| KuboClient::new(config.rpc_url.clone()));
         let validated_pinning = ValidatedPinningConfig::from_raw(&cfg.pinning, get_env)?;
 
         let db = crate::store::connect_database(&cfg.storage.database_url).await?;
@@ -67,6 +73,7 @@ impl AppState {
 
         Ok(Arc::new(Self {
             kubo,
+            cold_kubo,
             store,
             credentials,
             master_key,
@@ -121,6 +128,18 @@ mod tests {
             .expect("empty pinning configuration must initialize");
 
         assert!(state.pinning.provider_limits().is_empty());
+        assert!(state.cold_kubo.is_none());
         let _worker_store = state.store.clone();
+    }
+
+    #[tokio::test]
+    async fn unavailable_optional_cold_does_not_block_startup() {
+        let mut config = Config::default_for_test();
+        config.cold_kubo = Some(crate::config::KuboConfig {
+            rpc_url: "http://127.0.0.1:1".to_owned(),
+        });
+        let state = AppState::new_with_env(&config, |_| None).await.unwrap();
+        assert!(state.cold_kubo.is_some());
+        assert!(state.pinning.provider_limits().is_empty());
     }
 }

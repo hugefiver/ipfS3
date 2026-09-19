@@ -1,0 +1,4 @@
+[postgres:17]
+[ipfs/kubo:v0.43.0]
+[amazon/aws-cli:latest]
+

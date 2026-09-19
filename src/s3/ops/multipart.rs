@@ -88,6 +88,7 @@ pub async fn create_multipart_upload(
     state: &Arc<AppState>,
     req: S3Request<CreateMultipartUploadInput>,
 ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
+    super::storage_class::require_standard_write(req.input.storage_class.as_ref())?;
     let bucket = &req.input.bucket;
     let key = &req.input.key;
     let content_type = req.input.content_type.clone();
@@ -1366,6 +1367,7 @@ mod tests {
         crate::store::bucket::create(&db, name, None).await.unwrap();
         Arc::new(AppState {
             kubo: crate::kubo::KuboClient::new(kubo_uri),
+            cold_kubo: None,
             store: crate::store::Store::new(db),
             credentials: HashMap::new(),
             master_key: crate::crypto::key::MasterKey::from_hex(
@@ -1442,6 +1444,7 @@ mod tests {
             .unwrap();
         Arc::new(AppState {
             kubo: crate::kubo::KuboClient::new(kubo_uri),
+            cold_kubo: None,
             store: crate::store::Store::new(db),
             credentials: HashMap::new(),
             master_key: crate::crypto::key::MasterKey::from_hex(
@@ -1527,6 +1530,7 @@ mod tests {
         crate::store::bucket::create(&db, name, None).await.unwrap();
         Arc::new(AppState {
             kubo: crate::kubo::KuboClient::new(kubo_uri),
+            cold_kubo: None,
             store: crate::store::Store::new(db),
             credentials: HashMap::new(),
             master_key: crate::crypto::key::MasterKey::from_hex(
@@ -2763,6 +2767,7 @@ mod tests {
             .unwrap();
         let state = Arc::new(AppState {
             kubo: crate::kubo::KuboClient::new(kubo.uri()),
+            cold_kubo: None,
             store: crate::store::Store::new(db),
             credentials: HashMap::new(),
             master_key,

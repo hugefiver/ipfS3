@@ -1,0 +1,12 @@
+
+running 1 test
+test real_lifecycle_transition_integrity_multipart_root_to_ia ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 5.54s
+
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.06s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests\lifecycle_transition.rs (target\debug\deps\lifecycle_transition-a3e8f421edadc602.exe)
+[LIFECYCLE-TRANSITION-EVIDENCE] scenario=multipart-root result=pass signed_multipart_xml=pass headers=pass bytes=pass range_crosses_part_boundary=pass cold_full_dag=pass

@@ -521,6 +521,7 @@ impl DecompressZipRoute {
         max_decompressed_bytes: u64,
     ) -> S3Result<S3Response<Body>> {
         let parsed = parse_decompress_put_uri(&req.uri)?;
+        crate::s3::ops::storage_class::require_standard_write_headers(&req.headers)?;
         if has_sse_header(&req.headers) {
             return Err(s3s::s3_error!(
                 InvalidArgument,
@@ -632,6 +633,7 @@ impl DecompressZipRoute {
     }
 
     async fn call_complete(&self, mut req: S3Request<Body>) -> S3Result<S3Response<Body>> {
+        crate::s3::ops::storage_class::require_standard_write_headers(&req.headers)?;
         let (bucket, key) = parse_path_bucket_key(&req.uri)?;
         let upload_id = crate::s3::query::decoded_query_pairs(&req.uri)?
             .into_iter()
@@ -971,6 +973,7 @@ mod tests {
         crate::store::run_migrations(&db).await.unwrap();
         let state = Arc::new(AppState {
             kubo: crate::kubo::KuboClient::new(kubo.uri()),
+            cold_kubo: None,
             store: crate::store::Store::new(db),
             credentials: HashMap::new(),
             master_key: crate::crypto::key::MasterKey::from_hex(
@@ -1413,6 +1416,7 @@ mod tests {
         crate::store::run_migrations(&db).await.unwrap();
         let state = Arc::new(AppState {
             kubo: crate::kubo::KuboClient::new(kubo.uri()),
+            cold_kubo: None,
             store: crate::store::Store::new(db),
             credentials: HashMap::new(),
             master_key,

@@ -1,0 +1,12 @@
+Diff in [REPO]\tests\lifecycle_transition_balancer.rs:12:
+         let upstream = if index % 2 == 0 { a.clone() } else { b.clone() };
+         thread::spawn(move || {
+             let Ok(mut client) = incoming else { return };
+-            let Ok(mut server) = TcpStream::connect(upstream) else { return };
++            let Ok(mut server) = TcpStream::connect(upstream) else {
++                return;
++            };
+             let mut client_read = client.try_clone().expect("clone client");
+             let mut server_write = server.try_clone().expect("clone server");
+             let upload = thread::spawn(move || {
+

@@ -97,6 +97,22 @@ pub async fn delete<C: ConnectionTrait + TransactionTrait>(db: &C, name: &str) -
                 return Err(AppError::BucketNotEmpty(name));
             }
 
+            // A durable receipt protects an unfinished transition from bucket
+            // cascades. Once atomically settled it is no longer a live owner;
+            // remove only settled receipts through their guarded deletion API.
+            // These action rows are terminal and cannot be claimed, so acquiring
+            // their deletion locks here cannot invert an active action's order.
+            let transitions = super::entities::lifecycle_transition::Entity::find()
+                .filter(super::entities::lifecycle_transition::Column::Bucket.eq(&name))
+                .all(txn)
+                .await?;
+            if transitions.iter().any(|saga| saga.completed_at.is_none()) {
+                return Err(AppError::BucketNotEmpty(name));
+            }
+            for saga in transitions {
+                super::lifecycle_transition::delete_settled_in_transaction(txn, &saga.id).await?;
+            }
+
             super::import::ownership::supersede_bucket(txn, &name, Utc::now()).await?;
             let result = bucket::Entity::delete_by_id(name.clone()).exec(txn).await?;
             if result.rows_affected != 1 {

@@ -23,6 +23,7 @@ use super::decompress::{
     AddReply, KuboScript, ObservedHttpRequest, S3ServerHandle, S3TestEndpoint,
     start_s3_server_with_imports,
 };
+use super::residency::assert_hot_standard_residency_invariant;
 use super::sigv4::send_sigv4;
 use ipfs_s3_gateway::import::downloader::{
     AddressPolicy, AuthorizedSource, DownloadError, DownloadLimits, DownloadStream,
@@ -824,6 +825,7 @@ impl ImportHarness {
         if let Some(streaming_kubo) = self.streaming_kubo {
             streaming_kubo.shutdown().await;
         }
+        assert_hot_standard_residency_invariant(self.state.store.db()).await;
     }
 }
 
@@ -843,6 +845,7 @@ pub async fn start_import_harness(config: ImportHarnessConfig) -> ImportHarness 
         .expect("create test bucket");
     let state = Arc::new(AppState {
         kubo: ipfs_s3_gateway::kubo::KuboClient::new(kubo_harness.endpoint.clone()),
+        cold_kubo: None,
         store: store::Store::new(db),
         credentials: HashMap::from([("test".to_owned(), s3s::auth::SecretKey::from("test"))]),
         master_key: ipfs_s3_gateway::crypto::key::MasterKey::from_hex(&"0".repeat(64))
@@ -924,6 +927,7 @@ pub async fn start_strict_import_harness() -> StrictImportHarness {
         .expect("strict harness bucket");
     let state = Arc::new(AppState {
         kubo: ipfs_s3_gateway::kubo::KuboClient::new(kubo_harness.endpoint.clone()),
+        cold_kubo: None,
         store: store::Store::new(db),
         credentials: HashMap::from([("test".to_owned(), s3s::auth::SecretKey::from("test"))]),
         master_key: ipfs_s3_gateway::crypto::key::MasterKey::from_hex(&"0".repeat(64))

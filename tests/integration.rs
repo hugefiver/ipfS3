@@ -1,6 +1,16 @@
 mod support;
 
 #[tokio::test]
+async fn tier_reads_signed_real_service_routes_by_immutable_residency() {
+    support::tier_reads::assert_signed_tier_reads().await;
+}
+
+#[tokio::test]
+async fn signed_fixed_length_gets_reject_late_kubo_error_trailers() {
+    support::tier_reads::assert_signed_fixed_length_gets_wait_for_kubo_eof().await;
+}
+
+#[tokio::test]
 async fn lifecycle_abort_multipart_signed_api_and_absence_semantics() {
     let mut harness = start_lifecycle_harness(standard_script(2)).await;
     let xml = abort_lifecycle_xml("Enabled", "<Prefix>logs/</Prefix>", 1);
@@ -4387,9 +4397,15 @@ async fn install_unversioned_content_version(harness: &TestHarness, key: &str, n
         .db()
         .transaction(move |txn| {
             Box::pin(async move {
+                let row_id = uuid::Uuid::new_v4().to_string();
+                let identity = ipfs_s3_gateway::residency::VersionResidencyIdentity::new(
+                    row_id.clone(),
+                    object.id.clone(),
+                    object.cid.clone(),
+                );
                 store::entities::object_version::Entity::insert(
                     store::entities::object_version::ActiveModel {
-                        id: Set(uuid::Uuid::new_v4().to_string()),
+                        id: Set(row_id),
                         bucket: Set(object.bucket),
                         key: Set(object.key),
                         version_id: Set(version_id),
@@ -4404,7 +4420,14 @@ async fn install_unversioned_content_version(harness: &TestHarness, key: &str, n
                     },
                 )
                 .exec(txn)
-                .await
+                .await?;
+                store::residency::attach_hot_in_transaction(
+                    txn,
+                    &identity,
+                    &ipfs_s3_gateway::residency::PhysicalVerification::Pending,
+                )
+                .await?;
+                Ok::<_, ipfs_s3_gateway::error::AppError>(())
             })
         })
         .await
@@ -12065,7 +12088,8 @@ async fn v03_plaintext_get_and_head_range_matrix() {
             .collect::<Vec<_>>(),
         vec![
             ("arg".to_owned(), cid.to_owned()),
-            ("bytes".to_owned(), "2-5".to_owned()),
+            ("offset".to_owned(), "2".to_owned()),
+            ("length".to_owned(), "4".to_owned()),
         ]
     );
 
@@ -12176,7 +12200,10 @@ async fn v03_sse_s3_put_get_and_range_matrix() {
             Some(cid)
         );
         assert!(
-            request.url.query_pairs().all(|(name, _)| name != "bytes"),
+            request
+                .url
+                .query_pairs()
+                .all(|(name, _)| !matches!(name.as_ref(), "bytes" | "offset" | "length")),
             "encrypted GET must fully cat, decrypt, then slice"
         );
     }
@@ -15058,11 +15085,11 @@ async fn lifecycle_signed_configuration() {
     for invalid_xml in [
         "<LifecycleConfiguration><Rule><ID>transition</ID><Status>Enabled</Status><Filter/>\
          <Expiration><Days>3</Days></Expiration><Transition><Days>1</Days>\
-         <StorageClass>GLACIER</StorageClass></Transition></Rule></LifecycleConfiguration>"
+         <StorageClass>STANDARD_IA</StorageClass></Transition></Rule></LifecycleConfiguration>"
             .to_owned(),
         "<LifecycleConfiguration><Rule><ID>noncurrent-transition</ID><Status>Enabled</Status>\
          <Filter/><Expiration><Days>3</Days></Expiration><NoncurrentVersionTransition>\
-         <NoncurrentDays>1</NoncurrentDays><StorageClass>GLACIER</StorageClass>\
+         <NoncurrentDays>1</NoncurrentDays><StorageClass>STANDARD_IA</StorageClass>\
          </NoncurrentVersionTransition></Rule></LifecycleConfiguration>"
             .to_owned(),
         "<LifecycleConfiguration><Rule><ID>abort-zero</ID><Status>Enabled</Status><Filter/>\

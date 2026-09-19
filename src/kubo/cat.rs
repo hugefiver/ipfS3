@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
+use http_body_util::BodyExt as _;
 use tokio_util::sync::CancellationToken;
 
 use super::{KuboClient, next_response_frame, send_request};
@@ -10,15 +11,20 @@ pub async fn stream_cat(
     cid: &str,
     range: Option<(u64, u64)>,
 ) -> AppResult<impl Stream<Item = Result<Bytes, std::io::Error>> + use<>> {
-    let url = if let Some((start, end)) = range {
+    let mut url = if let Some((start, end)) = range {
         format!(
-            "{}/api/v0/cat?arg={cid}&bytes={start}-{}",
+            "{}/api/v0/cat?arg={cid}&offset={start}&length={}",
             kubo.base_url(),
-            end.saturating_sub(1)
+            end.saturating_sub(start)
         )
     } else {
         format!("{}/api/v0/cat?arg={cid}", kubo.base_url())
     };
+    if kubo.local_reads_only() {
+        // Kubo v0.43 GetApi applies Api.Offline(true), replacing the block
+        // exchange for this entire UnixFS read, including linked/raw leaves.
+        url.push_str("&offline=true");
+    }
 
     let resp = kubo.download_http().post(&url).send().await?;
     if !resp.status().is_success() {
@@ -32,10 +38,36 @@ pub async fn stream_cat(
         return Err(AppError::kubo_rpc_status(status));
     }
 
-    let stream = resp
-        .bytes_stream()
-        .map(|result| result.map_err(|_| crate::error::kubo_stream_error()));
-    Ok(stream)
+    let idle_timeout = kubo.stream_idle_timeout();
+    if resp.headers().contains_key("x-stream-error") {
+        return Err(AppError::kubo_rpc_detail(
+            "Kubo cat reported stream failure",
+        ));
+    }
+    let mut body: reqwest::Body = resp.into();
+    let stream = async_stream::stream! {
+        loop {
+            let frame = match tokio::time::timeout(idle_timeout, body.frame()).await {
+                Ok(Some(Ok(frame))) => frame,
+                Ok(Some(Err(_))) | Err(_) => {
+                    yield Err(crate::error::kubo_stream_error());
+                    return;
+                }
+                Ok(None) => return,
+            };
+            match frame.into_data() {
+                Ok(data) => yield Ok(data),
+                Err(frame) => match frame.into_trailers() {
+                    Ok(trailers) if trailers.contains_key("x-stream-error") => {
+                        yield Err(crate::error::kubo_stream_error());
+                        return;
+                    }
+                    Ok(_) | Err(_) => {}
+                },
+            }
+        }
+    };
+    Ok(Box::pin(stream))
 }
 
 pub async fn inspect_file(
@@ -101,10 +133,31 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use crate::error::AppError;
+
+    #[tokio::test]
+    async fn initial_stream_error_is_rejected_before_returning_a_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/cat"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("X-Stream-Error", "private backend failure")
+                    .set_body_bytes(b"partial"),
+            )
+            .mount(&server)
+            .await;
+        let result = stream_cat(&KuboClient::new(server.uri()), "QmTest", None).await;
+        let error = match result {
+            Ok(_) => panic!("initial error must fail before constructing a body"),
+            Err(error) => error,
+        };
+        assert_eq!(error.to_string(), "kubo rpc failure");
+        assert!(!format!("{error:?}").contains("private backend failure"));
+    }
 
     #[derive(Clone, Default)]
     struct TraceCapture(Arc<Mutex<Vec<u8>>>);
@@ -166,6 +219,30 @@ mod tests {
         (endpoint, task)
     }
 
+    async fn trailer_cat_server() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut byte = [0_u8; 1];
+                socket.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: X-Stream-Error\r\nConnection: close\r\n\r\n5\r\nfirst\r\n0\r\nX-Stream-Error: late cat failure\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        (endpoint, task)
+    }
+
     #[tokio::test]
     async fn test_stream_cat_returns_bytes() {
         let server = MockServer::start().await;
@@ -178,6 +255,30 @@ mod tests {
         let client = KuboClient::new(server.uri());
         let result = cat_to_vec(&client, "QmTest").await.unwrap();
         assert_eq!(result, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn stream_cat_translates_half_open_range_to_offset_and_length() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/cat"))
+            .and(query_param("arg", "QmTest"))
+            .and(query_param("offset", "7"))
+            .and(query_param("length", "5"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("world"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let stream = stream_cat(&KuboClient::new(server.uri()), "QmTest", Some((7, 12)))
+            .await
+            .unwrap();
+        tokio::pin!(stream);
+        let mut bytes = Vec::new();
+        while let Some(frame) = stream.next().await {
+            bytes.extend_from_slice(&frame.unwrap());
+        }
+        assert_eq!(bytes, b"world");
     }
 
     #[tokio::test]
@@ -311,6 +412,27 @@ mod tests {
         );
         server.abort();
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn late_cat_error_trailer_becomes_a_safe_stream_error() {
+        let (endpoint, server) = trailer_cat_server().await;
+        let stream = stream_cat(&KuboClient::new(endpoint), "QmLateError", None)
+            .await
+            .unwrap();
+        tokio::pin!(stream);
+        assert_eq!(
+            stream.next().await.unwrap().unwrap(),
+            Bytes::from_static(b"first")
+        );
+        let error = stream
+            .next()
+            .await
+            .expect("trailer must emit a terminal error")
+            .expect_err("X-Stream-Error must not be accepted as EOF");
+        assert!(crate::error::has_kubo_stream_provenance(&error));
+        assert!(stream.next().await.is_none());
+        server.await.unwrap();
     }
 
     #[tokio::test]

@@ -699,9 +699,15 @@ async fn postgres_object_versioning_backfill_count_must_match() {
 
 #[tokio::test]
 async fn postgres_object_versioning_down_allows_only_hidden_null_rows() {
-    let Some(fixture) = migrated_fixture().await else {
+    // Exercise this historical migration at its own schema boundary, not beneath
+    // later residency foreign keys. This is not a downgrade of current schema.
+    let Some(fixture) = legacy_fixture().await else {
         return;
     };
+    m20260825_000001_object_versioning::Migration
+        .up(&SchemaManager::new(&fixture.db))
+        .await
+        .unwrap();
     m20260825_000001_object_versioning::Migration
         .down(&SchemaManager::new(&fixture.db))
         .await
@@ -1061,6 +1067,7 @@ async fn postgres_synchronized_publish_exact_delete_tag_serializes_without_deadl
         .expect("historical object version must retain its owner");
     let tagging_state = Arc::new(AppState {
         kubo: KuboClient::new("http://127.0.0.1:5001".to_owned()),
+        cold_kubo: None,
         store: Store::new(tagger),
         credentials: HashMap::from([("test".to_owned(), s3s::auth::SecretKey::from("test"))]),
         master_key: MasterKey::from_hex(&"0".repeat(64)).expect("zero test master key"),
@@ -1575,6 +1582,7 @@ async fn postgres_http_marker_restore_then_suspended_replacement_preserves_all_v
     .await;
     let state = Arc::new(AppState {
         kubo: KuboClient::new(kubo.server.uri()),
+        cold_kubo: None,
         store: Store::new(fixture.db.clone()),
         credentials: HashMap::from([("test".to_owned(), s3s::auth::SecretKey::from("test"))]),
         master_key: MasterKey::from_hex(&"0".repeat(64)).expect("zero test master key"),

@@ -1,0 +1,15 @@
+
+running 4 tests
+test fresh_schema_accepts_only_content_version_transition_actions_and_legal_sagas ... ok
+test prepared_transition_insert_snapshots_action_residency_and_database_clock ... ok
+test published_unsettled_saga_blocks_all_cascades_until_cleanup_is_settled ... ok
+test sqlite_upgrade_preserves_phase_ab_rows_and_indexes_byte_for_byte ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+
+
+   Compiling ipfs-s3-gateway v0.1.0 ([REPO])
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.69s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests\lifecycle_transition_schema.rs (target\debug\deps\lifecycle_transition_schema-346f45a2da6acc1e.exe)

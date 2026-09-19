@@ -1,0 +1,19 @@
+
+running 9 tests
+test postgres_lifecycle_abort_configuration_and_bucket_lock_races_are_atomic ... ok
+test postgres_lifecycle_abort_down_refuses_abort_state_and_restores_phase_a ... ok
+test postgres_lifecycle_abort_migration_preserves_version_identity_and_checks_shapes ... ok
+test postgres_lifecycle_abort_multiworker_claim_crash_retry_is_fenced ... ok
+test postgres_lifecycle_claim_uses_database_clock_locks_and_epoch_fences ... ok
+test postgres_lifecycle_down_refuses_durable_configuration ... ok
+test postgres_lifecycle_final_recovery_crash_is_bounded_and_preserves_foreign_tokens ... ok
+test postgres_lifecycle_migration_and_database_clock_are_engine_owned ... ok
+test postgres_lifecycle_worker_abort_reclaims_and_fences_stale_epoch ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.61s
+
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.78s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests\postgres_lifecycle.rs (target\debug\deps\postgres_lifecycle-56b9f48ac0864626.exe)

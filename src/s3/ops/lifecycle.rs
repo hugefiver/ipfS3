@@ -67,6 +67,7 @@ pub async fn put_bucket_lifecycle_configuration(
     let configuration = input.lifecycle_configuration.ok_or_else(|| {
         AppError::InvalidLifecycleConfiguration("lifecycle configuration is required".to_owned())
     })?;
+    require_cold_kubo_for_transitions(state, &configuration)?;
     let canonical = validate_and_canonicalize(configuration)?;
     let json = canonical_json(&canonical)?;
     crate::store::lifecycle_config::put_configuration(state.store.db(), &bucket.name, &json)
@@ -74,6 +75,22 @@ pub async fn put_bucket_lifecycle_configuration(
     Ok(S3Response::new(PutBucketLifecycleConfigurationOutput {
         transition_default_minimum_object_size: None,
     }))
+}
+
+fn require_cold_kubo_for_transitions(
+    state: &AppState,
+    configuration: &BucketLifecycleConfiguration,
+) -> AppResult<()> {
+    let has_transition = configuration
+        .rules
+        .iter()
+        .any(|rule| rule.transitions.is_some() || rule.noncurrent_version_transitions.is_some());
+    if has_transition && state.cold_kubo.is_none() {
+        return Err(AppError::InvalidLifecycleConfiguration(
+            "lifecycle transitions require a configured cold Kubo node".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 async fn load_bucket_and_verify_owner<C: sea_orm::ConnectionTrait>(
@@ -121,6 +138,7 @@ mod tests {
         store::bucket::create(&db, "bucket", owner).await.unwrap();
         Arc::new(AppState {
             kubo: crate::kubo::KuboClient::new("http://127.0.0.1:5001".to_owned()),
+            cold_kubo: None,
             store: store::Store::new(db),
             credentials: HashMap::new(),
             master_key: crate::crypto::key::MasterKey::from_hex(
@@ -296,13 +314,15 @@ mod tests {
             serde_json::json!({
                 "rules": [{
                     "prefix": "logs/", "status": "Enabled", "expiration": { "days": 1 },
-                    "transitions": []
+                    "transitions": [{ "days": 1, "storage_class": "STANDARD_IA" }]
                 }]
             }),
             serde_json::json!({
                 "rules": [{
                     "prefix": "logs/", "status": "Enabled", "expiration": { "days": 1 },
-                    "noncurrent_version_transitions": []
+                    "noncurrent_version_transitions": [{
+                        "noncurrent_days": 1, "storage_class": "STANDARD_IA"
+                    }]
                 }]
             }),
         ] {

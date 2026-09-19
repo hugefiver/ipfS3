@@ -1,0 +1,271 @@
+{
+  "run_id": "20260912T225500Z-1a49cda0",
+  "phase": "live",
+  "status": "FAIL",
+  "started_utc": "2026-09-12T22:55:00.8846172Z",
+  "steps": [
+    {
+      "name": "revision",
+      "command": "git rev-parse HEAD",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "dirty-paths",
+      "command": "git status --short",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "rust-version",
+      "command": "rustc --version --verbose",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "cargo-version",
+      "command": "cargo --version",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "docker-version",
+      "command": "docker version --format {{.Server.Version}}",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "cached-images",
+      "command": "docker image inspect postgres:17 ipfs/kubo:v0.43.0 amazon/aws-cli:latest --format {{.RepoTags}}",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "aws-version",
+      "command": "docker run --rm --pull=never amazon/aws-cli:latest --version",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "topology-up",
+      "command": "docker compose -f [REPO]\\tests\\compose.lifecycle-transition-validation.yml -p ipfs3-f1-20260912t225500z-1a49cda0 up -d --pull never --wait --wait-timeout 90",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "hot-container",
+      "command": "docker compose -f [REPO]\\tests\\compose.lifecycle-transition-validation.yml -p ipfs3-f1-20260912t225500z-1a49cda0 ps -q hot",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "cold-container",
+      "command": "docker compose -f [REPO]\\tests\\compose.lifecycle-transition-validation.yml -p ipfs3-f1-20260912t225500z-1a49cda0 ps -q cold",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "hot-volume",
+      "command": "docker inspect [REDACTED_INTERNAL_ID] --format {{range .Mounts}}{{.Name}}{{end}}",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "cold-volume",
+      "command": "docker inspect [REDACTED_INTERNAL_ID] --format {{range .Mounts}}{{.Name}}{{end}}",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "postgres-version",
+      "command": "docker compose -f [REPO]\\tests\\compose.lifecycle-transition-validation.yml -p ipfs3-f1-20260912t225500z-1a49cda0 exec -T postgres psql -U ipfs3 -d ipfs3 -Atc SHOW server_version",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "kubo-version",
+      "command": "docker compose -f [REPO]\\tests\\compose.lifecycle-transition-validation.yml -p ipfs3-f1-20260912t225500z-1a49cda0 exec -T hot ipfs version",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "build-gateway",
+      "command": "cargo build --locked --offline --bin ipfs-s3-gateway",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "aws-signed-list-buckets",
+      "command": "docker run --rm --pull=never -e AWS_ACCESS_KEY_ID=test -e AWS_SECRET_ACCESS_KEY=[REDACTED] -e AWS_DEFAULT_REGION=us-east-1 amazon/aws-cli:latest --endpoint-url http://host.docker.internal:55502 s3api list-buckets",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "lifecycle_transition-real_lifecycle_transition_current_plain_encrypted_copy_and_reporting_matrix",
+      "command": "cargo test --locked --offline --test lifecycle_transition real_lifecycle_transition_current_plain_encrypted_copy_and_reporting_matrix -- --nocapture --test-threads=1 --ignored --exact",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": [
+        {
+          "failed": 0,
+          "filtered": 5,
+          "passed": 1,
+          "ignored": 0
+        }
+      ]
+    },
+    {
+      "name": "lifecycle_transition-real_lifecycle_transition_noncurrent_public_and_null_version_matrix",
+      "command": "cargo test --locked --offline --test lifecycle_transition real_lifecycle_transition_noncurrent_public_and_null_version_matrix -- --nocapture --test-threads=1 --ignored --exact",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": [
+        {
+          "failed": 0,
+          "filtered": 5,
+          "passed": 1,
+          "ignored": 0
+        }
+      ]
+    },
+    {
+      "name": "lifecycle_transition-real_lifecycle_transition_backend_stop_1_prepare_fixture",
+      "command": "cargo test --locked --offline --test lifecycle_transition real_lifecycle_transition_backend_stop_1_prepare_fixture -- --nocapture --test-threads=1 --ignored --exact",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": [
+        {
+          "failed": 0,
+          "filtered": 5,
+          "passed": 1,
+          "ignored": 0
+        }
+      ]
+    },
+    {
+      "name": "stop-hot",
+      "command": "docker compose -f [REPO]\\tests\\compose.lifecycle-transition-validation.yml -p ipfs3-f1-20260912t225500z-1a49cda0 stop hot",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "lifecycle_transition-real_lifecycle_transition_backend_stop_2_hot_down_cold_read_succeeds",
+      "command": "cargo test --locked --offline --test lifecycle_transition real_lifecycle_transition_backend_stop_2_hot_down_cold_read_succeeds -- --nocapture --test-threads=1 --ignored --exact",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": [
+        {
+          "failed": 0,
+          "filtered": 5,
+          "passed": 1,
+          "ignored": 0
+        }
+      ]
+    },
+    {
+      "name": "start-hot",
+      "command": "docker compose -f [REPO]\\tests\\compose.lifecycle-transition-validation.yml -p ipfs3-f1-20260912t225500z-1a49cda0 start hot",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "stop-cold",
+      "command": "docker compose -f [REPO]\\tests\\compose.lifecycle-transition-validation.yml -p ipfs3-f1-20260912t225500z-1a49cda0 stop cold",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "lifecycle_transition-real_lifecycle_transition_backend_stop_3_cold_down_fails_without_hot_fallback",
+      "command": "cargo test --locked --offline --test lifecycle_transition real_lifecycle_transition_backend_stop_3_cold_down_fails_without_hot_fallback -- --nocapture --test-threads=1 --ignored --exact",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": [
+        {
+          "failed": 0,
+          "filtered": 5,
+          "passed": 1,
+          "ignored": 0
+        }
+      ]
+    },
+    {
+      "name": "start-cold",
+      "command": "docker compose -f [REPO]\\tests\\compose.lifecycle-transition-validation.yml -p ipfs3-f1-20260912t225500z-1a49cda0 start cold",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "lifecycle_transition-real_lifecycle_transition_backend_stop_4_cleanup_fixture",
+      "command": "cargo test --locked --offline --test lifecycle_transition real_lifecycle_transition_backend_stop_4_cleanup_fixture -- --nocapture --test-threads=1 --ignored --exact",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": [
+        {
+          "failed": 0,
+          "filtered": 5,
+          "passed": 1,
+          "ignored": 0
+        }
+      ]
+    },
+    {
+      "name": "lifecycle_transition_process-lifecycle_transition_process_crash_restart_f1",
+      "command": "cargo test --locked --offline --test lifecycle_transition_process lifecycle_transition_process_crash_restart_f1 -- --nocapture --test-threads=1 --ignored --exact",
+      "exit_code": 101,
+      "status": "FAIL",
+      "counts": []
+    },
+    {
+      "name": "topology-logs",
+      "command": "docker compose -f [REPO]\\tests\\compose.lifecycle-transition-validation.yml -p ipfs3-f1-20260912t225500z-1a49cda0 logs --no-color",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "topology-down",
+      "command": "docker compose -f [REPO]\\tests\\compose.lifecycle-transition-validation.yml -p ipfs3-f1-20260912t225500z-1a49cda0 down --volumes --remove-orphans --timeout 10",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    }
+  ],
+  "topology": {
+    "load_balancer": "test-only TCP round robin",
+    "cold_node": "12D3KooWQJMUMA7T8ezdjEXG1M8fBq2KUSi2YKPWdyK9G8PZV18k",
+    "swarm": "both daemon --offline",
+    "cold_volume": "ipfs3-f1-20260912t225500z-1a49cda0_cold_data",
+    "hot_volume": "ipfs3-f1-20260912t225500z-1a49cda0_hot_data",
+    "gateways": "two native production OS processes",
+    "postgres_major": 17,
+    "hot_node": "12D3KooWPPAQWzThGDkBr6PUeCn3thbpqQJ9a7wk1xpdr9r71aNq"
+  },
+  "cleanup": [
+    "gateway-a: logs captured, process tree stopped",
+    "gateway-b: logs captured, process tree stopped",
+    "compose-owned containers/networks/volumes removed; label-scoped inventory empty"
+  ],
+  "remaining_gates": [],
+  "error": "lifecycle_transition_process-lifecycle_transition_process_crash_restart_f1 exited 101; see lifecycle_transition_process-lifecycle_transition_process_crash_restart_f1.log",
+  "finished_utc": "2026-09-12T22:56:07.5962602Z"
+}

@@ -8,18 +8,19 @@ use crate::{
         filter::matches_filter,
         model::{
             CanonicalFilter, CanonicalLifecycleConfiguration, CanonicalRuleSelector,
-            ClaimedLifecycleScan, CurrentExpiration, LifecycleActionKind, LifecycleCandidate,
-            LifecycleCandidatePage, LifecycleRuleStatus, LifecycleTargetIdentity,
-            MultipartUploadTargetIdentity, NewLifecycleAction, NoncurrentExpiration, RuleIdentity,
-            VersionLifecycleCandidate,
+            ClaimedLifecycleScan, CurrentExpiration, CurrentTransition, LifecycleActionKind,
+            LifecycleCandidate, LifecycleCandidatePage, LifecycleRuleStatus,
+            LifecycleTargetIdentity, MultipartUploadTargetIdentity, NewLifecycleAction,
+            NoncurrentExpiration, RuleIdentity, VersionLifecycleCandidate,
         },
     },
     pinning::tags::ObjectTag,
+    residency::model::StorageClass,
     store::{
         entities::object_version,
         lifecycle_action::{idempotency_key, insert_idempotent},
         lifecycle_scan::scan_candidate_page,
-        object_version::VersionKind,
+        object_version::{BucketVersioningState, PublicVersionId, VersionKind},
         pinning::tags::list_object_tags,
     },
 };
@@ -40,6 +41,7 @@ pub struct LifecycleEvaluationContext<'a> {
 struct LifecycleProposal {
     action: NewLifecycleAction,
     stable_rule_identity: String,
+    effect_priority: u8,
 }
 
 struct VersionEvaluationContext<'a> {
@@ -107,6 +109,13 @@ pub fn evaluate_candidate(
         }
 
         let (rule_identity, stable_rule_identity) = rule_identity(rule.id.as_deref(), ordinal)?;
+        collect_transition_proposal(
+            &mut proposals,
+            context,
+            rule,
+            rule_identity.clone(),
+            stable_rule_identity.clone(),
+        )?;
         if context.candidate.is_latest {
             collect_current_proposal(
                 &mut proposals,
@@ -180,6 +189,7 @@ fn evaluate_multipart(
                 due_at,
             },
             stable_rule_identity,
+            effect_priority: 0,
         });
     }
     proposals.sort_by(|left, right| {
@@ -233,6 +243,15 @@ pub async fn schedule_claimed_scan_page<C: ConnectionTrait>(
             database_now: claim.database_now,
         };
         if let Some(mut action) = evaluate_candidate(&context)? {
+            if matches!(
+                action.action_kind,
+                LifecycleActionKind::TransitionCurrent | LifecycleActionKind::TransitionNoncurrent
+            ) && matches!(candidate, LifecycleCandidate::Version(version) if !version.hot_residency_verified)
+            {
+                // Do not let marker creation win while hot verification is pending.
+                // The bounded scan cycles again under the same config revision.
+                continue;
+            }
             action.idempotency_key = idempotency_key(&action)?;
             insert_idempotent(db, action, claim.database_now).await?;
         }
@@ -301,6 +320,67 @@ fn collect_current_proposal(
     Ok(())
 }
 
+fn collect_transition_proposal(
+    proposals: &mut Vec<LifecycleProposal>,
+    context: &VersionEvaluationContext<'_>,
+    rule: &crate::lifecycle::model::CanonicalLifecycleRule,
+    rule_identity: RuleIdentity,
+    stable_rule_identity: String,
+) -> AppResult<()> {
+    let candidate = context.candidate;
+    if candidate.target.kind != VersionKind::Object
+        || candidate.primary_storage_class != Some(StorageClass::Standard)
+    {
+        return Ok(());
+    }
+    let (kind, due_at) = if candidate.is_latest {
+        let Some(transition) = &rule.transition else {
+            return Ok(());
+        };
+        let due = match transition {
+            CurrentTransition::Date { utc_midnight } => *utc_midnight,
+            CurrentTransition::Days { days } => {
+                let Ok(due) =
+                    next_utc_midnight_after_full_days(candidate.lifecycle_age_started_at, *days)
+                else {
+                    // Positive, validated days beyond chrono's range are still in
+                    // the future, just as for multipart abort eligibility.
+                    return Ok(());
+                };
+                due
+            }
+        };
+        (LifecycleActionKind::TransitionCurrent, due)
+    } else {
+        let (Some(transition), Some(start)) = (
+            &rule.noncurrent_version_transition,
+            candidate.became_noncurrent_at,
+        ) else {
+            return Ok(());
+        };
+        if transition
+            .newer_noncurrent_versions
+            .is_some_and(|required| context.facts.newer_noncurrent_count <= u64::from(required))
+        {
+            return Ok(());
+        }
+        let Ok(due) = next_utc_midnight_after_full_days(start, transition.noncurrent_days) else {
+            return Ok(());
+        };
+        (LifecycleActionKind::TransitionNoncurrent, due)
+    };
+    if context.facts.database_now >= due_at {
+        proposals.push(proposal(
+            context,
+            rule_identity,
+            stable_rule_identity,
+            kind,
+            due_at,
+        ));
+    }
+    Ok(())
+}
+
 fn collect_noncurrent_proposal(
     proposals: &mut Vec<LifecycleProposal>,
     context: &VersionEvaluationContext<'_>,
@@ -362,6 +442,21 @@ fn proposal(
             due_at,
         },
         stable_rule_identity,
+        effect_priority: match action_kind {
+            LifecycleActionKind::ExpireCurrent => match context.candidate.bucket_versioning_state {
+                BucketVersioningState::Unversioned => 0,
+                BucketVersioningState::Suspended
+                    if context.candidate.target.public_version_id == PublicVersionId::Null =>
+                {
+                    0
+                }
+                BucketVersioningState::Enabled | BucketVersioningState::Suspended => 2,
+            },
+            LifecycleActionKind::TransitionCurrent | LifecycleActionKind::TransitionNoncurrent => 1,
+            LifecycleActionKind::ExpireNoncurrent
+            | LifecycleActionKind::DeleteExpiredMarker
+            | LifecycleActionKind::AbortIncompleteMultipartUpload => 0,
+        },
     }
 }
 
@@ -371,13 +466,8 @@ fn select_winner(mut proposals: Vec<LifecycleProposal>) -> Option<LifecyclePropo
 }
 
 fn proposal_sort_key(proposal: &LifecycleProposal) -> (u8, DateTime<Utc>, &str) {
-    let permanence = match proposal.action.action_kind {
-        LifecycleActionKind::ExpireNoncurrent => 0,
-        LifecycleActionKind::ExpireCurrent | LifecycleActionKind::DeleteExpiredMarker => 1,
-        LifecycleActionKind::AbortIncompleteMultipartUpload => 1,
-    };
     (
-        permanence,
+        proposal.effect_priority,
         proposal.action.due_at,
         &proposal.stable_rule_identity,
     )
@@ -400,11 +490,14 @@ fn rule_identity(id: Option<&str>, ordinal: usize) -> AppResult<(RuleIdentity, S
 
 #[cfg(test)]
 mod tests {
+    mod transition_tests;
     use crate::lifecycle::model::{
         AbortIncompleteMultipartUploadAction, LifecycleTargetIdentity,
         MultipartUploadTargetIdentity, VersionLifecycleCandidate,
     };
+    use crate::residency::model::StorageClass;
     use crate::store::lifecycle_action::{canonical_action_bytes, insert_idempotent};
+    use crate::store::object_version::BucketVersioningState;
     use chrono::{DateTime, TimeZone, Utc};
     use sea_orm::{ConnectionTrait, Database, EntityTrait, PaginatorTrait, Set};
 
@@ -810,6 +903,9 @@ mod tests {
                 sequence: 1,
             },
             is_latest,
+            bucket_versioning_state: BucketVersioningState::Enabled,
+            primary_storage_class: is_content.then_some(StorageClass::Standard),
+            hot_residency_verified: is_content,
             size: if is_content { 5 } else { 0 },
             lifecycle_age_started_at,
             became_noncurrent_at,
@@ -829,6 +925,8 @@ mod tests {
             expiration,
             noncurrent_version_expiration,
             abort_incomplete_multipart_upload: None,
+            transition: None,
+            noncurrent_version_transition: None,
         }
     }
 
@@ -1168,6 +1266,7 @@ mod tests {
         };
         let target = LifecycleTargetIdentity::Version(candidate.target);
         let permanent = super::LifecycleProposal {
+            effect_priority: 0,
             action: NewLifecycleAction {
                 idempotency_key: String::new(),
                 bucket: "bucket".to_owned(),
@@ -1180,6 +1279,7 @@ mod tests {
             stable_rule_identity: "id:permanent".to_owned(),
         };
         let current = super::LifecycleProposal {
+            effect_priority: 2,
             action: NewLifecycleAction {
                 idempotency_key: String::new(),
                 bucket: "bucket".to_owned(),

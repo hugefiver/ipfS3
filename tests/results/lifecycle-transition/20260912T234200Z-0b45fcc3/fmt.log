@@ -1,0 +1,25 @@
+Diff in [REPO]\tests\support\lifecycle_transition_real.rs:662:
+ pub async fn empty_and_multiblock_integrity() {
+     const DEFAULT_BLOCK_BOUNDARY: usize = 256 * 1024;
+     let large_size = std::env::var("IPFS_S3_TRANSITION_LARGE_BYTES")
+-        .map(|value| value.parse::<usize>().expect("large fixture size is numeric"))
++        .map(|value| {
++            value
++                .parse::<usize>()
++                .expect("large fixture size is numeric")
++        })
+         .unwrap_or(700 * 1024 + 29);
+     assert!((700 * 1024..=512 * 1024 * 1024).contains(&large_size));
+ 
+Diff in [REPO]\tests\support\lifecycle_transition_real.rs:755:
+         "empty-multiblock",
+         "headers=pass empty_bytes=pass multiblock_bytes=pass range_crosses_256k=pass cold_full_dag=pass",
+     );
+-    eprintln!("[LIFECYCLE-TRANSITION-EVIDENCE] scenario=empty-multiblock logical_bytes={large_size}");
++    eprintln!(
++        "[LIFECYCLE-TRANSITION-EVIDENCE] scenario=empty-multiblock logical_bytes={large_size}"
++    );
+ 
+     api::delete_lifecycle(&endpoints.gateway_b, &bucket).await;
+     for object in [&empty, &large] {
+

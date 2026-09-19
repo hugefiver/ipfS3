@@ -1743,7 +1743,7 @@ async fn invalidate_standard_mutations_in_order<C: ConnectionTrait>(
     Ok(())
 }
 
-async fn has_overlapping_standard_prefix_mutation<C: ConnectionTrait>(
+pub(crate) async fn has_overlapping_standard_prefix_mutation<C: ConnectionTrait>(
     txn: &C,
     bucket_name: &str,
     key: &str,

@@ -7,16 +7,21 @@ pub mod import_job_result;
 pub mod import_job_target;
 pub mod import_prefix_claim;
 pub mod lifecycle_action;
+pub mod lifecycle_transition;
 pub mod multipart_part;
 pub mod multipart_upload;
 pub mod object;
 pub mod object_tag;
 pub mod object_version;
+pub mod physical_residency;
 pub mod pin_job;
 pub mod pin_lease;
 pub mod pin_lease_target;
 pub mod pin_provider_usage;
 pub mod remote_pin;
+pub mod residency_backfill;
+pub mod residency_reference;
+pub mod version_residency;
 
 #[cfg(test)]
 mod tests {

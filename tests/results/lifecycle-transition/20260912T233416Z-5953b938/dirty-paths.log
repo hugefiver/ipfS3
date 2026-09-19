@@ -1,0 +1,102 @@
+ M src/config.rs
+ M src/cors/http.rs
+ M src/error.rs
+ M src/import/decompress/tests.rs
+ M src/import/pipeline.rs
+ M src/import/worker.rs
+ M src/kubo/cat.rs
+ M src/kubo/client.rs
+ M src/kubo/mod.rs
+ M src/lib.rs
+ M src/lifecycle/actions.rs
+ M src/lifecycle/config.rs
+ M src/lifecycle/evaluator.rs
+ M src/lifecycle/mod.rs
+ M src/lifecycle/model.rs
+ M src/lifecycle/worker.rs
+ M src/main.rs
+ M src/s3/ops/bucket.rs
+ M src/s3/ops/cors.rs
+ M src/s3/ops/lifecycle.rs
+ M src/s3/ops/mod.rs
+ M src/s3/ops/multipart.rs
+ M src/s3/ops/object.rs
+ M src/s3/ops/tagging.rs
+ M src/s3/ops/versioning.rs
+ M src/s3/route/decompress_zip.rs
+ M src/s3/route/gateway.rs
+ M src/s3/route/import_object.rs
+ M src/s3/route/import_object/tests.rs
+ M src/state.rs
+ M src/store/bucket.rs
+ M src/store/entities/mod.rs
+ M src/store/import/ownership.rs
+ M src/store/lifecycle_action.rs
+ M src/store/lifecycle_scan.rs
+ M src/store/migrations/m20260831_000001_bucket_cors.rs
+ M src/store/migrations/mod.rs
+ M src/store/mod.rs
+ M src/store/object_version.rs
+ M src/store/pinning/publication.rs
+ M src/store/pinning/publication/tests.rs
+ M src/zip/extract.rs
+ M tests/integration.rs
+ M tests/postgres_lifecycle.rs
+ M tests/postgres_versioning.rs
+ M tests/support/cors.rs
+ M tests/support/decompress.rs
+ M tests/support/import.rs
+ M tests/support/lifecycle.rs
+ M tests/support/mod.rs
+ M tests/support/pinning.rs
+?? docs/superpowers/plans/2026-09-12-lifecycle-phase-d-evidence.md
+?? docs/superpowers/plans/2026-09-12-lifecycle-transition.md
+?? src/kubo/health.rs
+?? src/kubo/tier_copy.rs
+?? src/kubo/verification.rs
+?? src/lifecycle/config/
+?? src/lifecycle/evaluator/
+?? src/lifecycle/revalidation.rs
+?? src/lifecycle/transition.rs
+?? src/lifecycle/transition/
+?? src/residency/
+?? src/s3/ops/object/
+?? src/s3/ops/object_body.rs
+?? src/s3/ops/storage_class.rs
+?? src/store/entities/lifecycle_transition.rs
+?? src/store/entities/physical_residency.rs
+?? src/store/entities/residency_backfill.rs
+?? src/store/entities/residency_reference.rs
+?? src/store/entities/version_residency.rs
+?? src/store/lifecycle_transition.rs
+?? src/store/lifecycle_transition/
+?? src/store/migrations/m20260912_000001_residency_references.rs
+?? src/store/migrations/m20260912_000002_lifecycle_transition.rs
+?? src/store/pinning/publication/hot_receipt.rs
+?? src/store/pinning/publication/tests/
+?? src/store/residency/
+?? tests/compose.lifecycle-transition-validation.yml
+?? tests/lifecycle-transition.Tests.ps1
+?? tests/lifecycle_transition.rs
+?? tests/lifecycle_transition_balancer.rs
+?? tests/lifecycle_transition_process.rs
+?? tests/lifecycle_transition_schema.rs
+?? tests/postgres_lifecycle_transition.rs
+?? tests/postgres_residency.rs
+?? tests/postgres_residency_concurrency.rs
+?? tests/postgres_transition_saga.rs
+?? tests/residency.rs
+?? tests/residency_publication.rs
+?? tests/results/lifecycle-transition/
+?? tests/run-lifecycle-transition-validation.ps1
+?? tests/support/lifecycle_transition_api.rs
+?? tests/support/lifecycle_transition_process.rs
+?? tests/support/lifecycle_transition_real.rs
+?? tests/support/lifecycle_transition_real_http.rs
+?? tests/support/lifecycle_transition_real_sigv4.rs
+?? tests/support/pg_residency.rs
+?? tests/support/residency.rs
+?? tests/support/storage_class.rs
+?? tests/support/tier_reads.rs
+?? tests/support/tier_reads/
+

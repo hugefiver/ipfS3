@@ -5,6 +5,10 @@ bind = "0.0.0.0:9000"
 [kubo]
 rpc_url = "http://kubo:5001"
 
+# Default Compose is hot-only: cold_kubo is intentionally absent (disabled).
+# Opt in with docker-compose.lifecycle.yml, which supplies the independent
+# cold endpoint through IPFS_S3_COLD_KUBO_RPC_URL; see README lifecycle guidance.
+
 [storage]
 database_url = "sqlite:///data/ipfs-s3.db?mode=rwc"
 

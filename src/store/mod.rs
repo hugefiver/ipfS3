@@ -6,11 +6,13 @@ pub mod import;
 pub mod lifecycle_action;
 pub mod lifecycle_config;
 pub mod lifecycle_scan;
+pub mod lifecycle_transition;
 pub mod migrations;
 pub mod multipart;
 pub mod object;
 pub mod object_version;
 pub mod pinning;
+pub mod residency;
 
 use sea_orm::DatabaseConnection;
 
@@ -69,6 +71,8 @@ mod migrator {
     use crate::store::migrations::m20260826_000001_lifecycle_expiration::Migration as LifecycleExpirationMigration;
     use crate::store::migrations::m20260831_000001_bucket_cors::Migration as BucketCorsMigration;
     use crate::store::migrations::m20260901_000001_lifecycle_abort_multipart::Migration as LifecycleAbortMultipartMigration;
+    use crate::store::migrations::m20260912_000001_residency_references::Migration as ResidencyReferencesMigration;
+    use crate::store::migrations::m20260912_000002_lifecycle_transition::Migration as LifecycleTransitionMigration;
     use sea_orm_migration::prelude::*;
 
     pub struct Migrator;
@@ -87,6 +91,8 @@ mod migrator {
                 Box::new(LifecycleExpirationMigration),
                 Box::new(BucketCorsMigration),
                 Box::new(LifecycleAbortMultipartMigration),
+                Box::new(ResidencyReferencesMigration),
+                Box::new(LifecycleTransitionMigration),
             ]
         }
     }
@@ -121,14 +127,45 @@ async fn run_postgres_migrations(db: &sea_orm::DatabaseConnection) -> Result<(),
         .map_err(|_| postgres_migration_failure("commit"))
 }
 
+async fn run_sqlite_migrations(db: &sea_orm::DatabaseConnection) -> Result<(), sea_orm::DbErr> {
+    use sea_orm::{ConnectionTrait, TransactionTrait};
+    use sea_orm_migration::MigratorTrait;
+
+    // SeaORM's migration-table check and marker insert are otherwise separate across
+    // DatabaseConnections. Claim a fixed SQLite write row before either operation so a second
+    // gateway rechecks the migration table only after the first gateway commits.
+    db.execute_unprepared(
+        "CREATE TABLE IF NOT EXISTS _ipfs_s3_migration_lock (\
+             id INTEGER PRIMARY KEY NOT NULL CHECK (id = 1))",
+    )
+    .await?;
+    db.execute_unprepared("INSERT OR IGNORE INTO _ipfs_s3_migration_lock (id) VALUES (1)")
+        .await?;
+    let txn = db.begin().await?;
+    let result = async {
+        txn.execute_unprepared("UPDATE _ipfs_s3_migration_lock SET id = id WHERE id = 1")
+            .await?;
+        migrator::Migrator::up(&txn, None).await
+    }
+    .await;
+    match result {
+        Ok(()) => txn.commit().await,
+        Err(error) => {
+            let _ = txn.rollback().await;
+            Err(error)
+        }
+    }
+}
+
 pub async fn run_migrations(db: &sea_orm::DatabaseConnection) -> Result<(), sea_orm::DbErr> {
     use sea_orm::ConnectionTrait;
     use sea_orm_migration::MigratorTrait;
 
-    if db.get_database_backend() != sea_orm::DatabaseBackend::Postgres {
-        return migrator::Migrator::up(db, None).await;
+    match db.get_database_backend() {
+        sea_orm::DatabaseBackend::Postgres => run_postgres_migrations(db).await,
+        sea_orm::DatabaseBackend::Sqlite => run_sqlite_migrations(db).await,
+        sea_orm::DatabaseBackend::MySql => migrator::Migrator::up(db, None).await,
     }
-    run_postgres_migrations(db).await
 }
 
 #[cfg(test)]
@@ -138,7 +175,7 @@ mod tests {
     use sea_orm_migration::MigratorTrait;
 
     #[test]
-    fn lifecycle_abort_multipart_migration_is_registered_twelfth_and_last() {
+    fn lifecycle_transition_migration_is_registered_fourteenth_and_last() {
         let names = migrator::Migrator::migrations()
             .into_iter()
             .map(|migration| migration.name().to_owned())
@@ -158,6 +195,8 @@ mod tests {
                 "m20260826_000001_lifecycle_expiration",
                 "m20260831_000001_bucket_cors",
                 "m20260901_000001_lifecycle_abort_multipart",
+                "m20260912_000001_residency_references",
+                "m20260912_000002_lifecycle_transition",
             ]
         );
     }
@@ -210,7 +249,8 @@ mod tests {
                        'pin_jobs', 'pin_provider_usage', 'import_jobs', 'import_destinations', \
                        'import_prefix_claims', 'import_job_targets', 'import_job_results', \
                         'object_versions', 'bucket_lifecycle_configs', 'lifecycle_actions', \
-                        'bucket_cors_configs'\
+                        'bucket_cors_configs', 'physical_residencies', 'version_residencies', \
+                        'residency_references', 'residency_backfill', 'lifecycle_transitions'\
                  ) ORDER BY name)",
                 [],
             ))
@@ -239,12 +279,17 @@ mod tests {
             "bucket_lifecycle_configs",
             "lifecycle_actions",
             "bucket_cors_configs",
+            "physical_residencies",
+            "version_residencies",
+            "residency_references",
+            "residency_backfill",
+            "lifecycle_transitions",
         ]
         .into_iter()
         .collect();
         assert_eq!(
             table_names, expected,
-            "all nineteen application tables must exist"
+            "all twenty-four application tables must exist"
         );
     }
 

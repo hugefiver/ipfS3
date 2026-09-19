@@ -732,6 +732,7 @@ mod tests {
         crate::store::run_migrations(&db).await.unwrap();
         Arc::new(AppState {
             kubo,
+            cold_kubo: None,
             store: Store::new(db),
             credentials: HashMap::new(),
             master_key: MasterKey::from_hex(

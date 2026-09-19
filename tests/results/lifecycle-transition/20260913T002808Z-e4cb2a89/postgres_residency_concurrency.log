@@ -1,0 +1,16 @@
+
+running 6 tests
+test postgres_backfill_epoch_takeover_fences_old_receipt_checkpoint_and_release ... ok
+test postgres_backfill_writeback_blocks_exact_delete_then_preserves_only_physical_receipt ... ok
+test postgres_backfill_writeback_blocks_then_loses_to_put_overwrite_without_receipt_transfer ... ok
+test postgres_exact_delete_wins_during_backfill_io_and_stale_receipt_is_rejected ... ok
+test postgres_lifecycle_expiration_releases_only_selected_shared_cid_owner ... ok
+test postgres_put_overwrite_wins_during_backfill_io_and_stale_receipt_is_rejected ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.42s
+
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.78s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests\postgres_residency_concurrency.rs (target\debug\deps\postgres_residency_concurrency-7bb838f7f1aa6a60.exe)

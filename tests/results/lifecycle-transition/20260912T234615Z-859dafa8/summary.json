@@ -1,0 +1,73 @@
+{
+  "run_id": "20260912T234615Z-859dafa8",
+  "phase": "quality",
+  "status": "PARTIAL",
+  "started_utc": "2026-09-12T23:46:15.4851760Z",
+  "steps": [
+    {
+      "name": "runner-contracts",
+      "command": "pwsh -NoProfile -File [REPO]\\tests\\lifecycle-transition.Tests.ps1",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "fmt",
+      "command": "cargo fmt --check",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "clippy",
+      "command": "cargo clippy --locked --offline --all-targets -- -D warnings",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "rust-1.92",
+      "command": "cargo +1.92.0-x86_64-pc-windows-gnu check --locked --offline --all-targets",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "diff-check",
+      "command": "git diff --check",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    }
+  ],
+  "topology": {},
+  "cleanup": [],
+  "remaining_gates": [
+    "postgres_residency",
+    "postgres_residency_concurrency",
+    "postgres_lifecycle_transition",
+    "postgres_transition_saga",
+    "postgres_lifecycle",
+    "postgres_versioning",
+    "postgres_cors",
+    "residency_publication-postgres_reuses_publication_and_delete_residency_scenarios",
+    "lib",
+    "integration",
+    "residency",
+    "lifecycle_transition_schema",
+    "cors",
+    "residency_publication",
+    "multi_gateway",
+    "lifecycle_transition_process-lifecycle_transition_process_crash_restart_f1",
+    "lifecycle_transition-real_lifecycle_transition_current_plain_encrypted_copy_and_reporting_matrix",
+    "lifecycle_transition-real_lifecycle_transition_noncurrent_public_and_null_version_matrix",
+    "lifecycle_transition-real_lifecycle_transition_integrity_nondefault_raw_leaf_import_to_ia",
+    "lifecycle_transition-real_lifecycle_transition_integrity_empty_and_multiblock_cross_range",
+    "lifecycle_transition-real_lifecycle_transition_integrity_multipart_root_to_ia",
+    "lifecycle_transition-real_lifecycle_transition_backend_stop_1_prepare_fixture",
+    "lifecycle_transition-real_lifecycle_transition_backend_stop_2_hot_down_cold_read_succeeds",
+    "lifecycle_transition-real_lifecycle_transition_backend_stop_3_cold_down_fails_without_hot_fallback",
+    "lifecycle_transition-real_lifecycle_transition_backend_stop_4_cleanup_fixture"
+  ],
+  "finished_utc": "2026-09-12T23:46:20.7610895Z"
+}

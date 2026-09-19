@@ -1,0 +1,12 @@
+
+running 2 tests
+test postgres_down_waits_for_verification_then_refuses_without_losing_data ... ok
+test postgres_upgrade_constraints_and_two_connection_startup ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.13s
+
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.15s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests\postgres_residency.rs (target\debug\deps\postgres_residency-9018f2524b46886b.exe)

@@ -13,7 +13,8 @@ use axum::routing::get;
 use ipfs_s3_gateway::auth::GatewayAuth;
 use ipfs_s3_gateway::config::Config;
 use ipfs_s3_gateway::import::{downloader::SourceDownloader, pipeline::ImportCoordinator};
-use ipfs_s3_gateway::lifecycle::worker::start_worker;
+use ipfs_s3_gateway::lifecycle::worker::start_worker_with_tiers;
+use ipfs_s3_gateway::residency::backfill::start_worker as start_residency_backfill_worker;
 use ipfs_s3_gateway::s3;
 use ipfs_s3_gateway::s3::handler::S3Impl;
 use ipfs_s3_gateway::state::AppState;
@@ -151,9 +152,16 @@ async fn run_gateway() -> anyhow::Result<()> {
         .pinning
         .start(state.store.clone(), shutdown.child_token());
     let import_worker = imports.start(state.clone(), shutdown.child_token());
-    let lifecycle_worker = start_worker(
+    let lifecycle_worker = start_worker_with_tiers(
         state.store.clone(),
         lifecycle_config,
+        shutdown.child_token(),
+        state.kubo.clone(),
+        state.cold_kubo.clone(),
+    );
+    let residency_backfill_worker = start_residency_backfill_worker(
+        state.store.clone(),
+        state.kubo.clone(),
         shutdown.child_token(),
     );
     let signal_token = shutdown.clone();
@@ -169,7 +177,8 @@ async fn run_gateway() -> anyhow::Result<()> {
     tokio::join!(
         pinning_worker.shutdown(grace),
         import_worker.shutdown(grace),
-        lifecycle_worker.shutdown(grace)
+        lifecycle_worker.shutdown(grace),
+        residency_backfill_worker.shutdown(grace)
     );
     server_result?;
 
@@ -244,6 +253,7 @@ mod tests {
         ipfs_s3_gateway::store::run_migrations(&db).await.unwrap();
         Arc::new(AppState {
             kubo: KuboClient::new("http://127.0.0.1:1".to_owned()),
+            cold_kubo: None,
             store: Store::new(db),
             credentials: HashMap::new(),
             master_key: MasterKey::from_hex(&"0".repeat(64)).unwrap(),

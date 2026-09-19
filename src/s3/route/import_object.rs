@@ -54,6 +54,7 @@ impl ImportObjectRoute {
     }
 
     async fn submit(&self, mut req: S3Request<Body>) -> S3Result<S3Response<Body>> {
+        crate::s3::ops::storage_class::require_standard_write_headers(&req.headers)?;
         let parsed_query = parse_submit_query(&req.uri)?;
         reject_sse_headers(&req.headers)?;
         validate_submission_content_type(&req.headers)?;

@@ -1,0 +1,20 @@
+
+running 10 tests
+test lifecycle_transition_real::fixture_tests::stress_fixture_uses_nonduplicate_256_kib_chunks ... ok
+test real_lifecycle_transition_backend_stop_1_prepare_fixture ... ignored, phase 1: prepare persistent IA and STANDARD fixtures before parent stops a backend
+test real_lifecycle_transition_backend_stop_2_hot_down_cold_read_succeeds ... ignored, phase 2: parent must stop only hot Kubo after the prepare phase
+test real_lifecycle_transition_backend_stop_3_cold_down_fails_without_hot_fallback ... ignored, phase 3: parent must restart hot Kubo and stop only cold Kubo
+test real_lifecycle_transition_backend_stop_4_cleanup_fixture ... ignored, phase 4: parent must restart both Kubo nodes before cleanup
+test real_lifecycle_transition_current_plain_encrypted_copy_and_reporting_matrix ... ignored, NOT RUN by default: requires PG17, two independent Kubo nodes, and two real gateway OS processes
+test real_lifecycle_transition_integrity_empty_and_multiblock_cross_range ... ignored, NOT RUN by default: requires PG17 and independent real hot/cold Kubo nodes
+test real_lifecycle_transition_integrity_multipart_root_to_ia ... ignored, NOT RUN by default: requires PG17 and independent real hot/cold Kubo nodes
+test real_lifecycle_transition_integrity_nondefault_raw_leaf_import_to_ia ... ignored, NOT RUN by default: requires real signed import route plus PG17 and independent hot/cold Kubo nodes
+test real_lifecycle_transition_noncurrent_public_and_null_version_matrix ... ignored, NOT RUN by default: requires PG17, two independent Kubo nodes, and two real gateway OS processes
+
+test result: ok. 1 passed; 0 failed; 9 ignored; 0 measured; 0 filtered out; finished in 2.06s
+
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.35s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests\lifecycle_transition.rs (target\debug\deps\lifecycle_transition-a3e8f421edadc602.exe)

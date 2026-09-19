@@ -1,0 +1,122 @@
+
+running 1 test
+test lifecycle_transition_process_crash_restart_f1 ... 
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+test lifecycle_transition_process_crash_restart_f1 ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.28s
+
+
+running 1 test
+
+running 1 test
+test lifecycle_transition_process_crash_restart_f1 ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 2.35s
+
+test lifecycle_transition_process_crash_restart_f1 ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.98s
+
+
+running 1 test
+test lifecycle_transition_process_crash_restart_f1 ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.89s
+
+
+running 1 test
+test lifecycle_transition_process_crash_restart_f1 ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 2.71s
+
+
+running 1 test
+test lifecycle_transition_process_crash_restart_f1 ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 2.39s
+
+
+running 1 test
+test lifecycle_transition_process_crash_restart_f1 ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.88s
+
+
+running 1 test
+test lifecycle_transition_process_crash_restart_f1 ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 18.61s
+
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 69.93s
+
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.80s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests\lifecycle_transition_process.rs (target\debug\deps\lifecycle_transition_process-998ec345a42d16fe.exe)
+transition-process evidence event=child-ready actor=checkpoint-prepare lease_secs=2
+transition-process evidence event=heartbeat checkpoint=prepare epoch=1 held_secs=31
+transition-process evidence event=process-kill actor=checkpoint-prepare action=requested
+transition-process evidence event=process-kill actor=checkpoint-prepare result=reaped
+transition-process evidence event=checkpoint-survived checkpoint=prepare epoch=1
+transition-process evidence event=child-ready actor=checkpoint-copy lease_secs=2
+transition-process evidence event=restart checkpoint=copy old_epoch=1 new_epoch=2
+transition-process evidence event=process-kill actor=checkpoint-copy action=requested
+transition-process evidence event=process-kill actor=checkpoint-copy result=reaped
+transition-process evidence event=child-ready actor=checkpoint-verify lease_secs=2
+transition-process evidence event=restart checkpoint=verify old_epoch=2 new_epoch=3
+transition-process evidence event=process-kill actor=checkpoint-verify action=requested
+transition-process evidence event=process-kill actor=checkpoint-verify result=reaped
+transition-process evidence event=child-ready actor=checkpoint-publish lease_secs=2
+transition-process evidence event=restart checkpoint=publish old_epoch=3 new_epoch=4
+transition-process evidence event=process-kill actor=checkpoint-publish action=requested
+transition-process evidence event=process-kill actor=checkpoint-publish result=reaped
+transition-process evidence event=gateway-read checkpoint=publish-checkpoint recovery method=get+head storage_class=STANDARD_IA cid=bafkreig4a5q66qezjsyhxdyjydjjvd5tjyeirvjtoz6qkrlovd3djjsisu bytes=70 version_id=null
+transition-process evidence event=child-ready actor=checkpoint-cleanup lease_secs=2
+transition-process evidence event=cleanup checkpoint=cleanup old_epoch=4 new_epoch=5 result=complete
+transition-process evidence event=gateway-read checkpoint=cleanup-checkpoint recovery method=get+head storage_class=STANDARD_IA cid=bafkreig4a5q66qezjsyhxdyjydjjvd5tjyeirvjtoz6qkrlovd3djjsisu bytes=70 version_id=null
+transition-process evidence event=shutdown actor=checkpoint-cleanup result=stopped
+transition-process evidence event=child-ready actor=stale-old lease_secs=1
+transition-process evidence event=child-ready actor=stale-new lease_secs=1
+transition-process evidence event=stale-fenced old_epoch=1 new_epoch=2 stale_process=alive
+transition-process evidence event=gateway-read checkpoint=stale-actor replacement publication method=get+head storage_class=STANDARD_IA cid=bafkreiguzd633mknafxqpggpzzoegnctunudstkipsfsgrg2h3i6flfuxq bytes=65 version_id=null
+transition-process evidence event=shutdown actor=stale-old result=stopped
+transition-process evidence event=shutdown actor=stale-new result=stopped
+transition-process evidence event=child-ready actor=cancel-policy lease_secs=2
+transition-process evidence event=policy-delete checkpoint=verify publication=absent result=cancelled
+transition-process evidence event=gateway-read checkpoint=stale-policy cancellation method=get+head storage_class=STANDARD cid=bafkreib35iyk65ztabfj6cvz2qtlnsyyhcn2uzuuz4qrmesgczyeirj7cq bytes=70 version_id=null
+transition-process evidence event=shutdown actor=cancel-policy result=stopped
+transition-process evidence event=child-ready actor=deleted-target lease_secs=2
+transition-process evidence event=target-delete publication=absent result=cancelled
+transition-process evidence event=shutdown actor=deleted-target result=stopped
+transition-process evidence event=child-ready actor=retry-failing lease_secs=2
+transition-process evidence event=shutdown actor=retry-failing result=stopped
+transition-process evidence event=child-ready actor=retry-recovered lease_secs=2
+transition-process evidence event=retry-restart attempts=2 result=succeeded
+transition-process evidence event=gateway-read checkpoint=persisted retry publication method=get+head storage_class=STANDARD_IA cid=bafkreie7ogtii2rkjwf4uq4hu2yfta3blvd23xtqmllhsyeu266nv6meou bytes=67 version_id=null
+transition-process evidence event=shutdown actor=retry-recovered result=stopped
+transition-process evidence event=child-ready actor=retry-exhausted lease_secs=2
+transition-process evidence event=retry-attempt attempt=1 state=pending
+transition-process evidence event=retry-attempt attempt=2 state=pending
+transition-process evidence event=retry-attempt attempt=3 state=pending
+transition-process evidence event=retry-attempt attempt=4 state=pending
+transition-process evidence event=retry-attempt attempt=5 state=pending
+transition-process evidence event=retry-attempt attempt=6 state=pending
+transition-process evidence event=retry-attempt attempt=7 state=pending
+transition-process evidence event=retry-attempt attempt=8 state=cancelled
+transition-process evidence event=retry-exhausted attempts=8 publication=absent result=cancelled
+transition-process evidence event=gateway-read checkpoint=retry exhaustion method=get+head storage_class=STANDARD cid=bafkreifjxqgvrvg4z6ry63z6msftvfdnz3a4g7zgu64v5dnocdpggjm3di bytes=69 version_id=null
+transition-process evidence event=shutdown actor=retry-exhausted result=stopped
+transition-process evidence event=proxy-audit operation=pin-rm requests=0
+transition-process evidence event=schema-cleanup result=complete

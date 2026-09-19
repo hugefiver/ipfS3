@@ -1,0 +1,31 @@
+
+running 1 test
+test lifecycle_transition_process_crash_restart_f1 ... 
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+FAILED
+
+failures:
+
+failures:
+    lifecycle_transition_process_crash_restart_f1
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.36s
+
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.78s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests\lifecycle_transition_process.rs (target\debug\deps\lifecycle_transition_process-998ec345a42d16fe.exe)
+
+thread 'lifecycle_transition_process_crash_restart_f1' (32280) panicked at [USER_HOME]\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sqlx-postgres-0.8.6\src\types\chrono\datetime.rs:56:17:
+`NaiveDateTime + TimeDelta` overflowed
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+error: test failed, to rerun pass `--test lifecycle_transition_process`

@@ -1,10 +1,14 @@
 pub mod add;
 pub mod cat;
 pub mod client;
+pub mod health;
 pub mod pin;
 pub mod routing;
+pub mod tier_copy;
+pub mod verification;
 
 pub use client::KuboClient;
+pub use verification::LocalResidencyVerificationReceipt;
 
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};

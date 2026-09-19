@@ -1,0 +1,116 @@
+cold-1      | Changing user to ipfs
+cold-1      | ipfs version 0.43.0
+cold-1      | generating ED25519 keypair...done
+cold-1      | peer identity: 12D3KooWRpTUerhD5JYY55rxU87m4q8F72Y9byepyoawJXRJj1yt
+cold-1      | initializing IPFS node at /data/ipfs
+cold-1      | Initializing daemon...
+cold-1      | Kubo version: 0.43.0-e9914bb
+cold-1      | Repo version: 18
+cold-1      | System version: amd64/linux
+hot-1       | Changing user to ipfs
+postgres-1  | The files belonging to this database system will be owned by user "postgres".
+postgres-1  | This user must also own the server process.
+postgres-1  | 
+postgres-1  | The database cluster will be initialized with locale "en_US.utf8".
+postgres-1  | The default database encoding has accordingly been set to "UTF8".
+postgres-1  | The default text search configuration will be set to "english".
+postgres-1  | 
+hot-1       | ipfs version 0.43.0
+postgres-1  | Data page checksums are disabled.
+cold-1      | Golang version: go1.26.5
+postgres-1  | 
+postgres-1  | fixing permissions on existing directory /var/lib/postgresql/data ... ok
+cold-1      | PeerID: 12D3KooWRpTUerhD5JYY55rxU87m4q8F72Y9byepyoawJXRJj1yt
+hot-1       | generating ED25519 keypair...done
+cold-1      | Swarm not listening, running in offline mode.
+hot-1       | peer identity: 12D3KooWDHtnGPf1SRhC1webCtTFJLzC9drstz7AGyid6kvmJA2m
+hot-1       | initializing IPFS node at /data/ipfs
+hot-1       | Initializing daemon...
+hot-1       | Kubo version: 0.43.0-e9914bb
+hot-1       | Repo version: 18
+postgres-1  | creating subdirectories ... ok
+postgres-1  | selecting dynamic shared memory implementation ... posix
+postgres-1  | selecting default "max_connections" ... 100
+postgres-1  | selecting default "shared_buffers" ... 128MB
+postgres-1  | selecting default time zone ... Etc/UTC
+postgres-1  | creating configuration files ... ok
+cold-1      | RPC API server listening on /ip4/0.0.0.0/tcp/5001
+postgres-1  | running bootstrap script ... ok
+postgres-1  | performing post-bootstrap initialization ... ok
+cold-1      | WebUI: http://127.0.0.1:5001/webui
+cold-1      | Gateway server listening on /ip4/0.0.0.0/tcp/8080
+hot-1       | System version: amd64/linux
+postgres-1  | initdb: warning: enabling "trust" authentication for local connections
+cold-1      | Routing V1 API exposed at http://0.0.0.0:8080/routing/v1
+postgres-1  | initdb: hint: You can change this by editing pg_hba.conf or using the option -A, or --auth-local and --auth-host, the next time you run initdb.
+postgres-1  | syncing data to disk ... ok
+postgres-1  | 
+postgres-1  | 
+postgres-1  | Success. You can now start the database server using:
+postgres-1  | 
+postgres-1  |     pg_ctl -D /var/lib/postgresql/data -l logfile start
+postgres-1  | 
+postgres-1  | waiting for server to start....2026-09-12 23:29:04.842 UTC [48] LOG:  starting PostgreSQL 17.11 (Debian 17.11-1.pgdg13+2) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit
+postgres-1  | 2026-09-12 23:29:04.843 UTC [48] LOG:  listening on Unix socket "/var/run/postgresql/.s.PGSQL.5432"
+postgres-1  | 2026-09-12 23:29:04.849 UTC [51] LOG:  database system was shut down at 2026-09-12 23:29:04 UTC
+postgres-1  | 2026-09-12 23:29:04.854 UTC [48] LOG:  database system is ready to accept connections
+postgres-1  |  done
+postgres-1  | server started
+postgres-1  | CREATE DATABASE
+postgres-1  | 
+postgres-1  | 
+postgres-1  | /usr/local/bin/docker-entrypoint.sh: ignoring /docker-entrypoint-initdb.d/*
+postgres-1  | 
+postgres-1  | waiting for server to shut down....2026-09-12 23:29:05.023 UTC [48] LOG:  received fast shutdown request
+postgres-1  | 2026-09-12 23:29:05.025 UTC [48] LOG:  aborting any active transactions
+postgres-1  | 2026-09-12 23:29:05.027 UTC [48] LOG:  background worker "logical replication launcher" (PID 54) exited with exit code 1
+postgres-1  | 2026-09-12 23:29:05.027 UTC [49] LOG:  shutting down
+postgres-1  | 2026-09-12 23:29:05.029 UTC [49] LOG:  checkpoint starting: shutdown immediate
+postgres-1  | 2026-09-12 23:29:05.117 UTC [49] LOG:  checkpoint complete: wrote 925 buffers (5.6%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.016 s, sync=0.067 s, total=0.090 s; sync files=301, longest=0.002 s, average=0.001 s; distance=4256 kB, estimate=4256 kB; lsn=0/19179A0, redo lsn=0/19179A0
+postgres-1  | 2026-09-12 23:29:05.122 UTC [48] LOG:  database system is shut down
+postgres-1  |  done
+postgres-1  | server stopped
+postgres-1  | 
+postgres-1  | PostgreSQL init process complete; ready for start up.
+cold-1      | Daemon is ready
+postgres-1  | 
+hot-1       | Golang version: go1.26.5
+postgres-1  | 2026-09-12 23:29:05.142 UTC [1] LOG:  starting PostgreSQL 17.11 (Debian 17.11-1.pgdg13+2) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit
+hot-1       | PeerID: 12D3KooWDHtnGPf1SRhC1webCtTFJLzC9drstz7AGyid6kvmJA2m
+hot-1       | 2026-09-12T23:29:05.039Z	INFO	failed to sufficiently increase receive buffer size (was: 208 kiB, wanted: 7168 kiB, got: 416 kiB). See https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes for details.
+hot-1       | Swarm listening on 127.0.0.1:4001 (TCP+UDP)
+hot-1       | Swarm listening on 172.18.0.2:4001 (TCP+UDP)
+hot-1       | Swarm listening on [::1]:4001 (TCP+UDP)
+hot-1       | Run 'ipfs id' to inspect announced and discovered multiaddrs of this node.
+postgres-1  | 2026-09-12 23:29:05.143 UTC [1] LOG:  listening on IPv4 address "0.0.0.0", port 5432
+postgres-1  | 2026-09-12 23:29:05.143 UTC [1] LOG:  listening on IPv6 address "::", port 5432
+postgres-1  | 2026-09-12 23:29:05.149 UTC [1] LOG:  listening on Unix socket "/var/run/postgresql/.s.PGSQL.5432"
+postgres-1  | 2026-09-12 23:29:05.153 UTC [64] LOG:  database system was shut down at 2026-09-12 23:29:05 UTC
+hot-1       | 
+hot-1       | 
+hot-1       | 鈩癸笍  Anonymous telemetry will be enabled in 15m0s
+hot-1       | 
+hot-1       | Kubo will collect anonymous usage data to help improve the software:
+hot-1       | 鈥?What:  Feature usage and configuration (no personal data)
+hot-1       |          Use GOLOG_LOG_LEVEL="telemetry=debug" to inspect collected data
+hot-1       | 鈥?When:  First collection in 15m0s, then every 24h
+hot-1       | 鈥?How:   HTTP POST to https://telemetry.ipshipyard.dev
+hot-1       |          Anonymous ID: [REDACTED_INTERNAL_ID]
+hot-1       | 
+hot-1       | No data sent yet. To opt-out before collection starts:
+hot-1       | 鈥?Set environment: IPFS_TELEMETRY=off
+hot-1       | 鈥?Or opt out of telemetry in every tool that honors it: DO_NOT_TRACK=1
+hot-1       | 鈥?Or run: ipfs config Plugins.Plugins.telemetry.Config.Mode off
+hot-1       | 鈥?Then restart daemon
+hot-1       | 
+hot-1       | This message is shown only once.
+hot-1       | Learn more: https://github.com/ipfs/kubo/blob/master/docs/telemetry.md
+postgres-1  | 2026-09-12 23:29:05.158 UTC [1] LOG:  database system is ready to accept connections
+hot-1       | 
+hot-1       | 
+hot-1       | RPC API server listening on /ip4/0.0.0.0/tcp/5001
+hot-1       | WebUI: http://127.0.0.1:5001/webui
+hot-1       | Gateway server listening on /ip4/0.0.0.0/tcp/8080
+hot-1       | Routing V1 API exposed at http://0.0.0.0:8080/routing/v1
+hot-1       | Daemon is ready
+

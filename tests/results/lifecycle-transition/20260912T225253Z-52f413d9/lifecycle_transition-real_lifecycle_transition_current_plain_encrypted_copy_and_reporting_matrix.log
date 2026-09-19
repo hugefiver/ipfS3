@@ -1,0 +1,6 @@
+
+   Compiling ipfs-s3-gateway v0.1.0 ([REPO])
+error: failed to remove file `[REPO]\target\debug\ipfs-s3-gateway.exe`
+
+Caused by:
+  鎷掔粷璁块棶銆?(os error 5)

@@ -1,0 +1,244 @@
+hot-1       | Changing user to ipfs
+postgres-1  | The files belonging to this database system will be owned by user "postgres".
+hot-1       | ipfs version 0.43.0
+postgres-1  | This user must also own the server process.
+hot-1       | generating ED25519 keypair...done
+postgres-1  | 
+hot-1       | peer identity: 12D3KooWMmnEcPknFTR6RN3Sv3jPmq1Df57VWdQ3pV6fnneeuAGQ
+cold-1      | Changing user to ipfs
+cold-1      | ipfs version 0.43.0
+hot-1       | initializing IPFS node at /data/ipfs
+hot-1       | Initializing daemon...
+hot-1       | Kubo version: 0.43.0-e9914bb
+postgres-1  | The database cluster will be initialized with locale "en_US.utf8".
+postgres-1  | The default database encoding has accordingly been set to "UTF8".
+postgres-1  | The default text search configuration will be set to "english".
+postgres-1  | 
+postgres-1  | Data page checksums are disabled.
+postgres-1  | 
+postgres-1  | fixing permissions on existing directory /var/lib/postgresql/data ... ok
+postgres-1  | creating subdirectories ... ok
+postgres-1  | selecting dynamic shared memory implementation ... posix
+hot-1       | Repo version: 18
+hot-1       | System version: amd64/linux
+hot-1       | Golang version: go1.26.5
+hot-1       | PeerID: 12D3KooWMmnEcPknFTR6RN3Sv3jPmq1Df57VWdQ3pV6fnneeuAGQ
+hot-1       | 2026-09-13T00:28:14.378Z	INFO	failed to sufficiently increase receive buffer size (was: 208 kiB, wanted: 7168 kiB, got: 416 kiB). See https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes for details.
+hot-1       | Swarm listening on 127.0.0.1:4001 (TCP+UDP)
+hot-1       | Swarm listening on 172.18.0.4:4001 (TCP+UDP)
+hot-1       | Swarm listening on [::1]:4001 (TCP+UDP)
+hot-1       | Run 'ipfs id' to inspect announced and discovered multiaddrs of this node.
+postgres-1  | selecting default "max_connections" ... 100
+postgres-1  | selecting default "shared_buffers" ... 128MB
+postgres-1  | selecting default time zone ... Etc/UTC
+hot-1       | 
+hot-1       | 
+hot-1       | 鈩癸笍  Anonymous telemetry will be enabled in 15m0s
+hot-1       | 
+cold-1      | generating ED25519 keypair...done
+postgres-1  | creating configuration files ... ok
+postgres-1  | running bootstrap script ... ok
+postgres-1  | performing post-bootstrap initialization ... ok
+hot-1       | Kubo will collect anonymous usage data to help improve the software:
+cold-1      | peer identity: 12D3KooWB6aLEtQXwu9GnprfDvmDHwejernfVPCgv4D58CZC4mfc
+hot-1       | 鈥?What:  Feature usage and configuration (no personal data)
+cold-1      | initializing IPFS node at /data/ipfs
+hot-1       |          Use GOLOG_LOG_LEVEL="telemetry=debug" to inspect collected data
+hot-1       | 鈥?When:  First collection in 15m0s, then every 24h
+hot-1       | 鈥?How:   HTTP POST to https://telemetry.ipshipyard.dev
+hot-1       |          Anonymous ID: [REDACTED_INTERNAL_ID]
+hot-1       | 
+hot-1       | No data sent yet. To opt-out before collection starts:
+hot-1       | 鈥?Set environment: IPFS_TELEMETRY=off
+hot-1       | 鈥?Or opt out of telemetry in every tool that honors it: DO_NOT_TRACK=1
+hot-1       | 鈥?Or run: ipfs config Plugins.Plugins.telemetry.Config.Mode off
+hot-1       | 鈥?Then restart daemon
+hot-1       | 
+hot-1       | This message is shown only once.
+postgres-1  | initdb: warning: enabling "trust" authentication for local connections
+postgres-1  | initdb: hint: You can change this by editing pg_hba.conf or using the option -A, or --auth-local and --auth-host, the next time you run initdb.
+postgres-1  | syncing data to disk ... ok
+hot-1       | Learn more: https://github.com/ipfs/kubo/blob/master/docs/telemetry.md
+postgres-1  | 
+cold-1      | Initializing daemon...
+postgres-1  | 
+hot-1       | 
+cold-1      | Kubo version: 0.43.0-e9914bb
+postgres-1  | Success. You can now start the database server using:
+cold-1      | Repo version: 18
+postgres-1  | 
+cold-1      | System version: amd64/linux
+postgres-1  |     pg_ctl -D /var/lib/postgresql/data -l logfile start
+cold-1      | Golang version: go1.26.5
+cold-1      | PeerID: 12D3KooWB6aLEtQXwu9GnprfDvmDHwejernfVPCgv4D58CZC4mfc
+cold-1      | Swarm not listening, running in offline mode.
+cold-1      | RPC API server listening on /ip4/0.0.0.0/tcp/5001
+cold-1      | WebUI: http://127.0.0.1:5001/webui
+cold-1      | Gateway server listening on /ip4/0.0.0.0/tcp/8080
+postgres-1  | 
+cold-1      | Routing V1 API exposed at http://0.0.0.0:8080/routing/v1
+cold-1      | Daemon is ready
+cold-1      | 
+cold-1      | Received interrupt signal, shutting down...
+postgres-1  | waiting for server to start....2026-09-13 00:28:13.962 UTC [48] LOG:  starting PostgreSQL 17.11 (Debian 17.11-1.pgdg13+2) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit
+postgres-1  | 2026-09-13 00:28:13.964 UTC [48] LOG:  listening on Unix socket "/var/run/postgresql/.s.PGSQL.5432"
+postgres-1  | 2026-09-13 00:28:13.968 UTC [51] LOG:  database system was shut down at 2026-09-13 00:28:13 UTC
+postgres-1  | 2026-09-13 00:28:13.973 UTC [48] LOG:  database system is ready to accept connections
+postgres-1  |  done
+postgres-1  | server started
+cold-1      | (Hit ctrl-c again to force-shutdown the daemon.)
+postgres-1  | CREATE DATABASE
+cold-1      | Changing user to ipfs
+cold-1      | ipfs version 0.43.0
+hot-1       | 
+hot-1       | RPC API server listening on /ip4/0.0.0.0/tcp/5001
+hot-1       | WebUI: http://127.0.0.1:5001/webui
+hot-1       | Gateway server listening on /ip4/0.0.0.0/tcp/8080
+hot-1       | Routing V1 API exposed at http://0.0.0.0:8080/routing/v1
+hot-1       | Daemon is ready
+hot-1       | 
+hot-1       | Received interrupt signal, shutting down...
+cold-1      | Found IPFS fs-repo at /data/ipfs
+hot-1       | (Hit ctrl-c again to force-shutdown the daemon.)
+cold-1      | Initializing daemon...
+hot-1       | Changing user to ipfs
+postgres-1  | 
+hot-1       | ipfs version 0.43.0
+hot-1       | Found IPFS fs-repo at /data/ipfs
+hot-1       | Initializing daemon...
+hot-1       | Kubo version: 0.43.0-e9914bb
+hot-1       | Repo version: 18
+hot-1       | System version: amd64/linux
+hot-1       | Golang version: go1.26.5
+hot-1       | PeerID: 12D3KooWMmnEcPknFTR6RN3Sv3jPmq1Df57VWdQ3pV6fnneeuAGQ
+hot-1       | 2026-09-13T00:28:53.737Z	INFO	failed to sufficiently increase receive buffer size (was: 208 kiB, wanted: 7168 kiB, got: 416 kiB). See https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes for details.
+hot-1       | Swarm listening on 127.0.0.1:4001 (TCP+UDP)
+hot-1       | Swarm listening on 172.18.0.4:4001 (TCP+UDP)
+hot-1       | Swarm listening on [::1]:4001 (TCP+UDP)
+hot-1       | Run 'ipfs id' to inspect announced and discovered multiaddrs of this node.
+hot-1       | RPC API server listening on /ip4/0.0.0.0/tcp/5001
+hot-1       | WebUI: http://127.0.0.1:5001/webui
+hot-1       | Gateway server listening on /ip4/0.0.0.0/tcp/8080
+hot-1       | Routing V1 API exposed at http://0.0.0.0:8080/routing/v1
+hot-1       | Daemon is ready
+postgres-1  | 
+postgres-1  | /usr/local/bin/docker-entrypoint.sh: ignoring /docker-entrypoint-initdb.d/*
+postgres-1  | 
+hot-1       | 2026-09-13T00:29:54.754Z	ERROR	cmd/ipfs	kubo/daemon.go:1394	initial version check failed, will not be run again	{"error": "could not perform version check due to missing or incompatible DHT configuration"}
+postgres-1  | waiting for server to shut down....2026-09-13 00:28:14.163 UTC [48] LOG:  received fast shutdown request
+postgres-1  | 2026-09-13 00:28:14.164 UTC [48] LOG:  aborting any active transactions
+postgres-1  | 2026-09-13 00:28:14.165 UTC [48] LOG:  background worker "logical replication launcher" (PID 54) exited with exit code 1
+postgres-1  | 2026-09-13 00:28:14.166 UTC [49] LOG:  shutting down
+cold-1      | Kubo version: 0.43.0-e9914bb
+postgres-1  | 2026-09-13 00:28:14.167 UTC [49] LOG:  checkpoint starting: shutdown immediate
+cold-1      | Repo version: 18
+postgres-1  | 2026-09-13 00:28:14.228 UTC [49] LOG:  checkpoint complete: wrote 925 buffers (5.6%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.011 s, sync=0.046 s, total=0.063 s; sync files=301, longest=0.002 s, average=0.001 s; distance=4256 kB, estimate=4256 kB; lsn=0/19179A0, redo lsn=0/19179A0
+postgres-1  | 2026-09-13 00:28:14.233 UTC [48] LOG:  database system is shut down
+postgres-1  |  done
+postgres-1  | server stopped
+postgres-1  | 
+postgres-1  | PostgreSQL init process complete; ready for start up.
+cold-1      | System version: amd64/linux
+cold-1      | Golang version: go1.26.5
+cold-1      | PeerID: 12D3KooWB6aLEtQXwu9GnprfDvmDHwejernfVPCgv4D58CZC4mfc
+cold-1      | Swarm not listening, running in offline mode.
+cold-1      | RPC API server listening on /ip4/0.0.0.0/tcp/5001
+cold-1      | WebUI: http://127.0.0.1:5001/webui
+cold-1      | Gateway server listening on /ip4/0.0.0.0/tcp/8080
+postgres-1  | 
+postgres-1  | 2026-09-13 00:28:14.281 UTC [1] LOG:  starting PostgreSQL 17.11 (Debian 17.11-1.pgdg13+2) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit
+postgres-1  | 2026-09-13 00:28:14.282 UTC [1] LOG:  listening on IPv4 address "0.0.0.0", port 5432
+postgres-1  | 2026-09-13 00:28:14.282 UTC [1] LOG:  listening on IPv6 address "::", port 5432
+postgres-1  | 2026-09-13 00:28:14.286 UTC [1] LOG:  listening on Unix socket "/var/run/postgresql/.s.PGSQL.5432"
+postgres-1  | 2026-09-13 00:28:14.291 UTC [70] LOG:  database system was shut down at 2026-09-13 00:28:14 UTC
+postgres-1  | 2026-09-13 00:28:14.295 UTC [1] LOG:  database system is ready to accept connections
+postgres-1  | 2026-09-13 00:30:25.061 UTC [957] LOG:  unexpected EOF on client connection with an open transaction
+postgres-1  | 2026-09-13 00:30:27.519 UTC [974] LOG:  unexpected EOF on client connection with an open transaction
+cold-1      | Routing V1 API exposed at http://0.0.0.0:8080/routing/v1
+cold-1      | Daemon is ready
+postgres-1  | 2026-09-13 00:30:29.916 UTC [991] LOG:  unexpected EOF on client connection with an open transaction
+postgres-1  | 2026-09-13 00:31:04.529 UTC [1237] ERROR:  insert or update on table "version_residencies" violates foreign key constraint "fk_version_residencies_owner"
+postgres-1  | 2026-09-13 00:31:04.529 UTC [1237] DETAIL:  Key (version_row_id, object_id)=(marker, object-a) is not present in table "object_versions".
+postgres-1  | 2026-09-13 00:31:04.529 UTC [1237] STATEMENT:  INSERT INTO version_residencies (version_row_id, object_id, primary_tier, storage_class, cid, revision, created_at, updated_at) VALUES ('marker', 'object-a', 'hot', 'STANDARD', 'QmShared', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+postgres-1  | 2026-09-13 00:31:08.305 UTC [1272] LOG:  unexpected EOF on client connection with an open transaction
+postgres-1  | 2026-09-13 00:31:10.215 UTC [1289] ERROR:  lifecycle transition snapshot is immutable
+postgres-1  | 2026-09-13 00:31:10.215 UTC [1289] CONTEXT:  PL/pgSQL function ipfs_s3_reject_lifecycle_transition_snapshot_update() line 1 at RAISE
+postgres-1  | 2026-09-13 00:31:10.215 UTC [1289] STATEMENT:  UPDATE lifecycle_transitions SET target_sequence = 2 WHERE id = 'saga'
+postgres-1  | 2026-09-13 00:31:10.236 UTC [1289] ERROR:  lifecycle transition is not safely settled
+postgres-1  | 2026-09-13 00:31:10.236 UTC [1289] CONTEXT:  PL/pgSQL function ipfs_s3_guard_lifecycle_transition_delete() line 1 at RAISE
+postgres-1  | 2026-09-13 00:31:10.236 UTC [1289] STATEMENT:  DELETE FROM lifecycle_transitions WHERE id = 'saga'
+postgres-1  | 2026-09-13 00:31:10.238 UTC [1289] ERROR:  update or delete on table "lifecycle_actions" violates foreign key constraint "lifecycle_transitions_action_id_fkey" on table "lifecycle_transitions"
+postgres-1  | 2026-09-13 00:31:10.238 UTC [1289] DETAIL:  Key (id)=(transition) is still referenced from table "lifecycle_transitions".
+postgres-1  | 2026-09-13 00:31:10.238 UTC [1289] STATEMENT:  DELETE FROM lifecycle_actions WHERE id = 'transition'
+postgres-1  | 2026-09-13 00:31:10.241 UTC [1289] ERROR:  update or delete on table "buckets" violates foreign key constraint "lifecycle_transitions_bucket_fkey" on table "lifecycle_transitions"
+postgres-1  | 2026-09-13 00:31:10.241 UTC [1289] DETAIL:  Key (name)=(bucket) is still referenced from table "lifecycle_transitions".
+postgres-1  | 2026-09-13 00:31:10.241 UTC [1289] STATEMENT:  DELETE FROM buckets WHERE name = 'bucket'
+postgres-1  | 2026-09-13 00:31:10.310 UTC [1289] ERROR:  lifecycle transition is not safely settled
+postgres-1  | 2026-09-13 00:31:10.310 UTC [1289] CONTEXT:  PL/pgSQL function ipfs_s3_guard_lifecycle_transition_delete() line 1 at RAISE
+postgres-1  | 2026-09-13 00:31:10.310 UTC [1289] STATEMENT:  DELETE FROM lifecycle_transitions WHERE id = 'published-saga'
+postgres-1  | 2026-09-13 00:31:10.312 UTC [1289] ERROR:  update or delete on table "lifecycle_actions" violates foreign key constraint "lifecycle_transitions_action_id_fkey" on table "lifecycle_transitions"
+postgres-1  | 2026-09-13 00:31:10.312 UTC [1289] DETAIL:  Key (id)=(published-action) is still referenced from table "lifecycle_transitions".
+postgres-1  | 2026-09-13 00:31:10.312 UTC [1289] STATEMENT:  DELETE FROM lifecycle_actions WHERE id = 'published-action'
+postgres-1  | 2026-09-13 00:31:10.314 UTC [1289] ERROR:  update or delete on table "buckets" violates foreign key constraint "lifecycle_transitions_bucket_fkey" on table "lifecycle_transitions"
+postgres-1  | 2026-09-13 00:31:10.314 UTC [1289] DETAIL:  Key (name)=(published-bucket) is still referenced from table "lifecycle_transitions".
+postgres-1  | 2026-09-13 00:31:10.314 UTC [1289] STATEMENT:  DELETE FROM buckets WHERE name = 'published-bucket'
+postgres-1  | 2026-09-13 00:31:10.678 UTC [1296] ERROR:  new row for relation "lifecycle_actions" violates check constraint "ck_lifecycle_actions_kind_target"
+postgres-1  | 2026-09-13 00:31:10.678 UTC [1296] DETAIL:  Failing row contains (transition, transition-key, bucket, key, 2, id:t, transition_current, row, public, null, 1, 2026-09-13 00:31:10.67525+00, pending, 0, 2026-09-13 00:31:10.67525+00, 0, null, null, null, null, 2026-09-13 00:31:10.67525+00, 2026-09-13 00:31:10.67525+00, null, version, null, null).
+postgres-1  | 2026-09-13 00:31:10.678 UTC [1296] STATEMENT:  UPDATE lifecycle_actions SET target_object_id=[REDACTED_INTERNAL_ID] WHERE id = 'transition'
+postgres-1  | 2026-09-13 00:31:17.500 UTC [1356] LOG:  unexpected EOF on client connection with an open transaction
+postgres-1  | 2026-09-13 00:31:18.668 UTC [1371] LOG:  unexpected EOF on client connection with an open transaction
+postgres-1  | 2026-09-13 00:31:19.183 UTC [1382] ERROR:  could not serialize access due to concurrent update; PRIVATE_SQL_PASSWORD_SENTINEL
+postgres-1  | 2026-09-13 00:31:19.183 UTC [1382] CONTEXT:  PL/pgSQL function inject_abort_fault() line 1 at RAISE
+postgres-1  | 2026-09-13 00:31:19.183 UTC [1382] STATEMENT:  DELETE FROM "multipart_uploads" WHERE "multipart_uploads"."upload_id" = $1 AND "multipart_uploads"."bucket" = $2 AND "multipart_uploads"."key" = $3 AND "multipart_uploads"."created_at" = $4
+postgres-1  | 2026-09-13 00:31:20.732 UTC [1391] ERROR:  could not serialize access due to concurrent update; PRIVATE_SQL_PASSWORD_SENTINEL
+postgres-1  | 2026-09-13 00:31:20.732 UTC [1391] CONTEXT:  PL/pgSQL function inject_abort_fault() line 1 at RAISE
+postgres-1  | 2026-09-13 00:31:20.732 UTC [1391] STATEMENT:  DELETE FROM "multipart_uploads" WHERE "multipart_uploads"."upload_id" = $1 AND "multipart_uploads"."bucket" = $2 AND "multipart_uploads"."key" = $3 AND "multipart_uploads"."created_at" = $4
+postgres-1  | 2026-09-13 00:31:21.773 UTC [1391] ERROR:  could not serialize access due to concurrent update; PRIVATE_SQL_PASSWORD_SENTINEL
+postgres-1  | 2026-09-13 00:31:21.773 UTC [1391] CONTEXT:  PL/pgSQL function inject_abort_fault() line 1 at RAISE
+postgres-1  | 2026-09-13 00:31:21.773 UTC [1391] STATEMENT:  DELETE FROM "multipart_uploads" WHERE "multipart_uploads"."upload_id" = $1 AND "multipart_uploads"."bucket" = $2 AND "multipart_uploads"."key" = $3 AND "multipart_uploads"."created_at" = $4
+postgres-1  | 2026-09-13 00:31:22.253 UTC [1400] ERROR:  deadlock detected; PRIVATE_SQL_PASSWORD_SENTINEL
+postgres-1  | 2026-09-13 00:31:22.253 UTC [1400] CONTEXT:  PL/pgSQL function inject_abort_fault() line 1 at RAISE
+postgres-1  | 2026-09-13 00:31:22.253 UTC [1400] STATEMENT:  DELETE FROM "multipart_uploads" WHERE "multipart_uploads"."upload_id" = $1 AND "multipart_uploads"."bucket" = $2 AND "multipart_uploads"."key" = $3 AND "multipart_uploads"."created_at" = $4
+postgres-1  | 2026-09-13 00:31:23.780 UTC [1416] ERROR:  deadlock detected; PRIVATE_SQL_PASSWORD_SENTINEL
+postgres-1  | 2026-09-13 00:31:23.780 UTC [1416] CONTEXT:  PL/pgSQL function inject_abort_fault() line 1 at RAISE
+postgres-1  | 2026-09-13 00:31:23.780 UTC [1416] STATEMENT:  DELETE FROM "multipart_uploads" WHERE "multipart_uploads"."upload_id" = $1 AND "multipart_uploads"."bucket" = $2 AND "multipart_uploads"."key" = $3 AND "multipart_uploads"."created_at" = $4
+postgres-1  | 2026-09-13 00:31:24.834 UTC [1416] ERROR:  deadlock detected; PRIVATE_SQL_PASSWORD_SENTINEL
+postgres-1  | 2026-09-13 00:31:24.834 UTC [1416] CONTEXT:  PL/pgSQL function inject_abort_fault() line 1 at RAISE
+postgres-1  | 2026-09-13 00:31:24.834 UTC [1416] STATEMENT:  DELETE FROM "multipart_uploads" WHERE "multipart_uploads"."upload_id" = $1 AND "multipart_uploads"."bucket" = $2 AND "multipart_uploads"."key" = $3 AND "multipart_uploads"."created_at" = $4
+postgres-1  | 2026-09-13 00:31:24.875 UTC [1416] LOG:  unexpected EOF on client connection with an open transaction
+postgres-1  | 2026-09-13 00:31:25.215 UTC [1425] ERROR:  new row for relation "lifecycle_actions" violates check constraint "ck_lifecycle_actions_action_kind"
+postgres-1  | 2026-09-13 00:31:25.215 UTC [1425] DETAIL:  Failing row contains (phase-a-action, phase-a:key|淇濈暀, lifecycle-bucket, key, 7, id:expire, abort_incomplete_multipart_upload, version-row, null, current-object, 1, 2026-08-25 01:02:03.123456+00, claimed, 3, 2026-08-25 01:02:04+00, 9, 2026-08-25 01:02:05+00, worker-a, database_contention, lifecycle action failed, 2026-08-24 00:00:00+00, 2026-08-25 01:02:06+00, null).
+postgres-1  | 2026-09-13 00:31:25.215 UTC [1425] STATEMENT:  UPDATE lifecycle_actions SET action_kind = 'abort_incomplete_multipart_upload' WHERE id = 'phase-a-action'
+postgres-1  | 2026-09-13 00:31:25.218 UTC [1425] ERROR:  new row for relation "lifecycle_actions" violates check constraint "ck_lifecycle_actions_target_sequence"
+postgres-1  | 2026-09-13 00:31:25.218 UTC [1425] DETAIL:  Failing row contains (phase-a-action, phase-a:key|淇濈暀, lifecycle-bucket, key, 7, id:expire, expire_current, version-row, null, current-object, -1, 2026-08-25 01:02:03.123456+00, claimed, 3, 2026-08-25 01:02:04+00, 9, 2026-08-25 01:02:05+00, worker-a, database_contention, lifecycle action failed, 2026-08-24 00:00:00+00, 2026-08-25 01:02:06+00, null).
+postgres-1  | 2026-09-13 00:31:25.218 UTC [1425] STATEMENT:  UPDATE lifecycle_actions SET target_sequence = -1 WHERE id = 'phase-a-action'
+postgres-1  | 2026-09-13 00:31:25.519 UTC [1426] ERROR:  new row for relation "lifecycle_actions" violates check constraint "ck_lifecycle_actions_target_shape"
+postgres-1  | 2026-09-13 00:31:25.519 UTC [1426] DETAIL:  Failing row contains (phase-a-action, phase-a:key|淇濈暀, lifecycle-bucket, key, 7, id:expire, expire_current, version-row, null, current-object, 1, 2026-08-25 01:02:03.123456+00, claimed, 3, 2026-08-25 01:02:04+00, 9, 2026-08-25 01:02:05+00, worker-a, database_contention, lifecycle action failed, 2026-08-24 00:00:00+00, 2026-08-25 01:02:06+00, null, version, hybrid, null).
+postgres-1  | 2026-09-13 00:31:25.519 UTC [1426] STATEMENT:  UPDATE lifecycle_actions SET target_upload_id = 'hybrid' WHERE id = 'phase-a-action'
+postgres-1  | 2026-09-13 00:31:25.522 UTC [1426] ERROR:  new row for relation "lifecycle_actions" violates check constraint "ck_lifecycle_actions_target_shape"
+postgres-1  | 2026-09-13 00:31:25.522 UTC [1426] DETAIL:  Failing row contains (phase-a-action, phase-a:key|淇濈暀, lifecycle-bucket, key, 7, id:expire, expire_current, version-row, null, current-object, 1, 2026-08-25 01:02:03.123456+00, claimed, 3, 2026-08-25 01:02:04+00, 9, 2026-08-25 01:02:05+00, worker-a, database_contention, lifecycle action failed, 2026-08-24 00:00:00+00, 2026-08-25 01:02:06+00, null, version, null, 2026-09-13 00:31:25.52207+00).
+postgres-1  | 2026-09-13 00:31:25.522 UTC [1426] STATEMENT:  UPDATE lifecycle_actions SET target_upload_created_at = clock_timestamp() WHERE id = 'phase-a-action'
+postgres-1  | 2026-09-13 00:31:25.525 UTC [1426] ERROR:  new row for relation "lifecycle_actions" violates check constraint "ck_lifecycle_actions_target_shape"
+postgres-1  | 2026-09-13 00:31:25.525 UTC [1426] DETAIL:  Failing row contains (phase-a-action, phase-a:key|淇濈暀, lifecycle-bucket, key, 7, id:expire, expire_current, null, null, current-object, 1, 2026-08-25 01:02:03.123456+00, claimed, 3, 2026-08-25 01:02:04+00, 9, 2026-08-25 01:02:05+00, worker-a, database_contention, lifecycle action failed, 2026-08-24 00:00:00+00, 2026-08-25 01:02:06+00, null, version, null, null).
+postgres-1  | 2026-09-13 00:31:25.525 UTC [1426] STATEMENT:  UPDATE lifecycle_actions SET target_version_row_id=[REDACTED_INTERNAL_ID] WHERE id = 'phase-a-action'
+postgres-1  | 2026-09-13 00:31:25.527 UTC [1426] ERROR:  new row for relation "lifecycle_actions" violates check constraint "ck_lifecycle_actions_kind_target"
+postgres-1  | 2026-09-13 00:31:25.527 UTC [1426] DETAIL:  Failing row contains (phase-a-action, phase-a:key|淇濈暀, lifecycle-bucket, key, 7, id:expire, abort_incomplete_multipart_upload, version-row, null, current-object, 1, 2026-08-25 01:02:03.123456+00, claimed, 3, 2026-08-25 01:02:04+00, 9, 2026-08-25 01:02:05+00, worker-a, database_contention, lifecycle action failed, 2026-08-24 00:00:00+00, 2026-08-25 01:02:06+00, null, version, null, null).
+postgres-1  | 2026-09-13 00:31:25.527 UTC [1426] STATEMENT:  UPDATE lifecycle_actions SET action_kind = 'abort_incomplete_multipart_upload' WHERE id = 'phase-a-action'
+postgres-1  | 2026-09-13 00:31:25.532 UTC [1426] ERROR:  new row for relation "lifecycle_actions" violates check constraint "ck_lifecycle_actions_target_shape"
+postgres-1  | 2026-09-13 00:31:25.532 UTC [1426] DETAIL:  Failing row contains (multipart-action, multipart-key, lifecycle-bucket, mpu-key, 7, id:abort, abort_incomplete_multipart_upload, null, null, hybrid, null, 2026-08-03 00:00:00+00, pending, 0, 2026-08-03 00:00:00+00, 0, null, null, null, null, 2026-08-03 00:00:00+00, 2026-08-03 00:00:00+00, null, multipart_upload, missing-upload, 2026-08-01 00:00:00+00).
+postgres-1  | 2026-09-13 00:31:25.532 UTC [1426] STATEMENT:  UPDATE lifecycle_actions SET target_object_id=[REDACTED_INTERNAL_ID] WHERE id = 'multipart-action'
+postgres-1  | 2026-09-13 00:31:25.533 UTC [1426] ERROR:  new row for relation "lifecycle_actions" violates check constraint "ck_lifecycle_actions_target_shape"
+postgres-1  | 2026-09-13 00:31:25.533 UTC [1426] DETAIL:  Failing row contains (multipart-action, multipart-key, lifecycle-bucket, mpu-key, 7, id:abort, abort_incomplete_multipart_upload, null, null, null, 1, 2026-08-03 00:00:00+00, pending, 0, 2026-08-03 00:00:00+00, 0, null, null, null, null, 2026-08-03 00:00:00+00, 2026-08-03 00:00:00+00, null, multipart_upload, missing-upload, 2026-08-01 00:00:00+00).
+postgres-1  | 2026-09-13 00:31:25.533 UTC [1426] STATEMENT:  UPDATE lifecycle_actions SET target_sequence = 1 WHERE id = 'multipart-action'
+postgres-1  | 2026-09-13 00:31:25.536 UTC [1426] ERROR:  new row for relation "lifecycle_actions" violates check constraint "ck_lifecycle_actions_target_shape"
+postgres-1  | 2026-09-13 00:31:25.536 UTC [1426] DETAIL:  Failing row contains (multipart-action, multipart-key, lifecycle-bucket, mpu-key, 7, id:abort, abort_incomplete_multipart_upload, null, null, null, null, 2026-08-03 00:00:00+00, pending, 0, 2026-08-03 00:00:00+00, 0, null, null, null, null, 2026-08-03 00:00:00+00, 2026-08-03 00:00:00+00, null, multipart_upload, missing-upload, null).
+postgres-1  | 2026-09-13 00:31:25.536 UTC [1426] STATEMENT:  UPDATE lifecycle_actions SET target_upload_created_at = NULL WHERE id = 'multipart-action'
+postgres-1  | 2026-09-13 00:31:26.159 UTC [1436] LOG:  unexpected EOF on client connection with an open transaction
+postgres-1  | 2026-09-13 00:31:33.251 UTC [1494] ERROR:  new row for relation "buckets" violates check constraint "ck_buckets_versioning_status"
+postgres-1  | 2026-09-13 00:31:33.251 UTC [1494] DETAIL:  Failing row contains (versioning-bucket, 2026-09-13 00:31:33.112538+00, null, enabled).
+postgres-1  | 2026-09-13 00:31:33.251 UTC [1494] STATEMENT:  UPDATE buckets SET versioning_status = 'enabled' WHERE name = 'versioning-bucket'
+postgres-1  | 2026-09-13 00:31:33.253 UTC [1494] ERROR:  new row for relation "object_versions" violates check constraint "ck_object_versions_kind_object"
+postgres-1  | 2026-09-13 00:31:33.253 UTC [1494] DETAIL:  Failing row contains (invalid-marker, versioning-bucket, invalid, null, delete_marker, current-a, 1, t, 2026-09-13 00:31:33.253144+00, 2026-09-13 00:31:33.253144+00, 2026-09-13 00:31:33.253144+00, null).
+postgres-1  | 2026-09-13 00:31:33.253 UTC [1494] STATEMENT:  INSERT INTO object_versions (id, bucket, key, version_id, kind, object_id, sequence, is_latest, created_at, updated_at, lifecycle_age_started_at) VALUES ('invalid-marker', 'versioning-bucket', 'invalid', NULL, 'delete_marker', 'current-a', 1, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+postgres-1  | 2026-09-13 00:33:14.792 UTC [68] LOG:  checkpoint starting: time
+

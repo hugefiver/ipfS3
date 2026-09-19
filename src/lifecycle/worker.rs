@@ -16,16 +16,26 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     config::ValidatedLifecycleConfig,
     error::AppResult,
+    kubo::KuboClient,
     lifecycle::{
         actions::execute_claimed_lifecycle_action,
         evaluator::schedule_claimed_scan_page,
-        model::{ClaimedLifecycleAction, ClaimedLifecycleScan},
+        model::{ClaimedLifecycleAction, ClaimedLifecycleScan, LifecycleActionKind},
+        transition,
     },
+    residency::router::TierClients,
     store::{
         Store,
+        lifecycle_action::action_kind_from_db,
         lifecycle_config::{claim_next_scan, finish_scan_page_in_transaction},
     },
 };
+
+#[derive(Clone)]
+pub(super) struct OwnedTierClients {
+    hot: KuboClient,
+    cold: Option<KuboClient>,
+}
 
 pub struct LifecycleWorkerHandle {
     cancellation: CancellationToken,
@@ -114,11 +124,30 @@ pub fn start_worker(
     config: ValidatedLifecycleConfig,
     parent: CancellationToken,
 ) -> LifecycleWorkerHandle {
+    start_worker_inner(store, config, parent, None)
+}
+
+pub fn start_worker_with_tiers(
+    store: Store,
+    config: ValidatedLifecycleConfig,
+    parent: CancellationToken,
+    hot: KuboClient,
+    cold: Option<KuboClient>,
+) -> LifecycleWorkerHandle {
+    start_worker_inner(store, config, parent, Some(OwnedTierClients { hot, cold }))
+}
+
+fn start_worker_inner(
+    store: Store,
+    config: ValidatedLifecycleConfig,
+    parent: CancellationToken,
+    tiers: Option<OwnedTierClients>,
+) -> LifecycleWorkerHandle {
     let cancellation = parent.child_token();
     let worker_cancellation = cancellation.clone();
     let worker_id = format!("lifecycle-worker-{}", uuid::Uuid::new_v4());
     let join = tokio::spawn(async move {
-        run_worker(store, config, worker_cancellation, worker_id, None).await;
+        run_worker(store, config, worker_cancellation, worker_id, None, tiers).await;
     });
     LifecycleWorkerHandle { cancellation, join }
 }
@@ -139,6 +168,7 @@ pub fn start_worker_for_test(
             worker_cancellation,
             control.worker_id,
             control.after_claim,
+            None,
         )
         .await;
     });
@@ -151,6 +181,7 @@ async fn run_worker(
     cancellation: CancellationToken,
     worker_id: String,
     after_claim: Option<Arc<LifecycleAfterClaimGate>>,
+    tiers: Option<OwnedTierClients>,
 ) {
     let mut actions = JoinSet::new();
     let mut poll = tokio::time::interval(config.poll_interval);
@@ -179,6 +210,7 @@ async fn run_worker(
                     &worker_id,
                     &cancellation,
                     after_claim.as_deref(),
+                    tiers.as_ref(),
                     &mut actions,
                 )
                 .await
@@ -278,6 +310,7 @@ async fn claim_and_start_actions(
     worker_id: &str,
     cancellation: &CancellationToken,
     after_claim: Option<&LifecycleAfterClaimGate>,
+    tiers: Option<&OwnedTierClients>,
     actions: &mut JoinSet<()>,
 ) -> bool {
     let available = config.worker_concurrency.saturating_sub(actions.len());
@@ -313,14 +346,16 @@ async fn claim_and_start_actions(
         }
         let store = store.clone();
         let config = config.clone();
+        let tiers = tiers.cloned();
+        let action_cancellation = cancellation.child_token();
         actions.spawn(async move {
             pause_before_action_execution_for_test().await;
-            if execute_claimed_lifecycle_action(
+            if execute_claimed_action(
                 store.db(),
                 &claim,
-                config.max_attempts,
-                config.base_backoff_secs,
-                config.max_backoff_secs,
+                &config,
+                tiers.as_ref(),
+                &action_cancellation,
             )
             .await
             .is_err()
@@ -330,6 +365,40 @@ async fn claim_and_start_actions(
         });
     }
     true
+}
+
+pub(super) async fn execute_claimed_action(
+    db: &DatabaseConnection,
+    claim: &ClaimedLifecycleAction,
+    config: &ValidatedLifecycleConfig,
+    tiers: Option<&OwnedTierClients>,
+    cancellation: &CancellationToken,
+) -> AppResult<()> {
+    if matches!(
+        action_kind_from_db(&claim.action.action_kind),
+        Ok(LifecycleActionKind::TransitionCurrent | LifecycleActionKind::TransitionNoncurrent)
+    ) {
+        let Some(tiers) = tiers else {
+            if transition::recover_published(db, claim, config, cancellation).await? {
+                return Ok(());
+            }
+            return transition::settle_failure(db, claim, config).await;
+        };
+        let clients = TierClients {
+            hot: &tiers.hot,
+            cold: tiers.cold.as_ref(),
+        };
+        transition::execute(db, claim, &clients, config, cancellation).await
+    } else {
+        execute_claimed_lifecycle_action(
+            db,
+            claim,
+            config.max_attempts,
+            config.base_backoff_secs,
+            config.max_backoff_secs,
+        )
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -496,13 +565,20 @@ mod tests {
     }
 
     async fn insert_due_action(store: &Store) -> String {
+        insert_due_action_with_kind(store, LifecycleActionKind::ExpireCurrent).await
+    }
+
+    async fn insert_due_action_with_kind(
+        store: &Store,
+        action_kind: LifecycleActionKind,
+    ) -> String {
         let now = database_now(store.db()).await.unwrap();
         let mut action = NewLifecycleAction {
             idempotency_key: String::new(),
             bucket: "bucket".to_owned(),
             config_revision: 1,
             rule_identity: RuleIdentity::Id("expire".to_owned()),
-            action_kind: LifecycleActionKind::ExpireCurrent,
+            action_kind,
             target: crate::lifecycle::model::LifecycleTargetIdentity::Version(
                 VersionTargetIdentity {
                     bucket: "bucket".to_owned(),
@@ -548,6 +624,8 @@ mod tests {
                 },
                 expiration: Some(CurrentExpiration::Days { days: 1 }),
                 noncurrent_version_expiration: None,
+                transition: None,
+                noncurrent_version_transition: None,
                 abort_incomplete_multipart_upload: None,
             }],
         }
@@ -564,6 +642,8 @@ mod tests {
                 },
                 expiration: None,
                 noncurrent_version_expiration: None,
+                transition: None,
+                noncurrent_version_transition: None,
                 abort_incomplete_multipart_upload: Some(AbortIncompleteMultipartUploadAction {
                     days_after_initiation: 1,
                 }),
@@ -951,6 +1031,48 @@ mod tests {
         handle.shutdown(Duration::from_secs(1)).await;
 
         assert_eq!(action_state(&store, &action_id).await, "pending");
+    }
+
+    #[tokio::test]
+    async fn legacy_worker_cancels_missing_transition_target_without_tier_clients() {
+        let _lock = test_hooks::TEST_LOCK.lock().await;
+        let (_directory, store) = setup_store().await;
+        let action_id =
+            insert_due_action_with_kind(&store, LifecycleActionKind::TransitionCurrent).await;
+        let gate = Arc::new(test_hooks::ActionGate::new());
+        let _scope = test_hooks::install_action_gate(gate.clone());
+        let started = gate.started.notified();
+
+        let handle = start_worker(store.clone(), worker_config(), CancellationToken::new());
+        tokio::time::timeout(ACTION_START_TIMEOUT, started)
+            .await
+            .expect("legacy worker must claim the transition action");
+        assert_eq!(action_state(&store, &action_id).await, "claimed");
+        gate.resume.notify_one();
+
+        tokio::time::timeout(ACTION_START_TIMEOUT, async {
+            loop {
+                if action_state(&store, &action_id).await != "claimed" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("missing tiers must release the transition claim");
+        handle.shutdown(Duration::from_secs(1)).await;
+
+        let action = lifecycle_action::Entity::find_by_id(action_id)
+            .one(store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(action.state, "cancelled");
+        assert_eq!(
+            action.failure_class.as_deref(),
+            Some(crate::store::lifecycle_action::FAILURE_CANCELLED_STALE)
+        );
+        assert!(action.finished_at.is_some());
     }
 
     #[tokio::test]

@@ -665,6 +665,7 @@ mod tests {
             .unwrap();
         Arc::new(AppState {
             kubo: crate::kubo::KuboClient::new(kubo_uri),
+            cold_kubo: None,
             store: Store::new(db),
             credentials: HashMap::new(),
             master_key: crate::crypto::key::MasterKey::from_hex(
@@ -697,6 +698,7 @@ mod tests {
             directory,
             Arc::new(AppState {
                 kubo: crate::kubo::KuboClient::new(kubo_uri),
+                cold_kubo: None,
                 store: Store::new(db),
                 credentials: HashMap::new(),
                 master_key: crate::crypto::key::MasterKey::from_hex(

@@ -39,6 +39,10 @@ use crate::{
 
 use super::{jobs, leases, quota, tags};
 
+mod hot_receipt;
+
+use hot_receipt::HotPublicationReceipt;
+
 const MAX_TRANSACTION_RETRIES: usize = 3;
 const LEASE_ACTIVE: &str = "active";
 const TARGET_WAITING: &str = "waiting";
@@ -196,6 +200,31 @@ pub async fn publish_standard_object(
         None,
         Vec::new(),
         None,
+        limits,
+    )
+    .await
+}
+
+/// Publishes a standard object after a caller has proved that its CID is
+/// recursively pinned and complete on the hot Kubo node.
+pub async fn publish_standard_object_with_hot_receipt(
+    db: &DatabaseConnection,
+    request: PublicationRequest,
+    guard: StandardMutationGuard,
+    receipt: crate::kubo::LocalResidencyVerificationReceipt,
+    limits: &ProviderLimitMap,
+) -> AppResult<PublicationResult> {
+    let receipt = HotPublicationReceipt::validate(receipt, &request.object.cid)?;
+    run_publication_with_retries_and_hot_receipt(
+        db,
+        request,
+        Vec::new(),
+        None,
+        Some(guard),
+        None,
+        Vec::new(),
+        None,
+        Some(receipt),
         limits,
     )
     .await
@@ -667,6 +696,34 @@ async fn run_publication_with_retries(
     import_now: Option<DateTime<Utc>>,
     limits: &ProviderLimitMap,
 ) -> AppResult<PublicationResult> {
+    run_publication_with_retries_and_hot_receipt(
+        db,
+        request,
+        entries,
+        upload_target,
+        standard_guard,
+        import_guard,
+        result_rows,
+        import_now,
+        None,
+        limits,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_publication_with_retries_and_hot_receipt(
+    db: &DatabaseConnection,
+    request: PublicationRequest,
+    entries: Vec<PublicationObject>,
+    upload_target: Option<MultipartUploadTargetIdentity>,
+    standard_guard: Option<StandardMutationGuard>,
+    import_guard: Option<ImportPublicationGuard>,
+    result_rows: Vec<import_job_result::ActiveModel>,
+    import_now: Option<DateTime<Utc>>,
+    hot_receipt: Option<HotPublicationReceipt>,
+    limits: &ProviderLimitMap,
+) -> AppResult<PublicationResult> {
     for retry in 0..=MAX_TRANSACTION_RETRIES {
         match publication_attempt(
             db,
@@ -677,6 +734,7 @@ async fn run_publication_with_retries(
             import_guard.clone(),
             result_rows.clone(),
             import_now,
+            hot_receipt.clone(),
             limits.clone(),
         )
         .await
@@ -711,6 +769,7 @@ async fn run_completed_publication_with_retries(
             standard_guard.clone(),
             None,
             Vec::new(),
+            None,
             None,
             limits.clone(),
         )
@@ -748,6 +807,7 @@ async fn publication_attempt(
     import_guard: Option<ImportPublicationGuard>,
     result_rows: Vec<import_job_result::ActiveModel>,
     import_now: Option<DateTime<Utc>>,
+    hot_receipt: Option<HotPublicationReceipt>,
     limits: ProviderLimitMap,
 ) -> Result<PublicationResult, TransactionError<AppError>> {
     db.transaction(|txn| {
@@ -761,6 +821,7 @@ async fn publication_attempt(
                 import_guard.as_ref(),
                 result_rows,
                 import_now,
+                hot_receipt.as_ref(),
                 &limits,
             )
             .await
@@ -798,6 +859,7 @@ async fn publish_in_transaction<C: ConnectionTrait>(
     import_guard: Option<&ImportPublicationGuard>,
     mut result_rows: Vec<import_job_result::ActiveModel>,
     _import_now: Option<DateTime<Utc>>,
+    hot_receipt: Option<&HotPublicationReceipt>,
     limits: &ProviderLimitMap,
 ) -> AppResult<PublicationResult> {
     validate_request(&request)?;
@@ -860,6 +922,22 @@ async fn publish_in_transaction<C: ConnectionTrait>(
         .map(|(provider, _)| provider.clone())
         .collect();
     quota::lock_publication_usage_rows(db, &attachment_providers).await?;
+    crate::store::residency::prepare_hot_publication_frontier(
+        db,
+        ordered_publication_objects(&request.object, &entries)
+            .into_iter()
+            .map(|object| object.cid.clone())
+            .collect(),
+    )
+    .await?;
+    if let Some(receipt) = hot_receipt {
+        crate::store::residency::apply_hot_publication_verification(
+            db,
+            &request.object.cid,
+            receipt.verification(),
+        )
+        .await?;
+    }
     let publication_time = crate::store::database_clock::database_now(db).await?;
 
     let mut publication_result = None;

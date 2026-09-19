@@ -35,6 +35,7 @@ use super::decompress::{
     KuboHarness, KuboScript, ObservedHttpRequest, S3ServerHandle, S3TestEndpoint,
     start_kubo_harness, start_s3_server,
 };
+use super::residency::assert_hot_standard_residency_invariant;
 
 const WORKER_WAIT: Duration = Duration::from_secs(10);
 const WORKER_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
@@ -45,6 +46,7 @@ pub struct LifecycleHarness {
     pub owner: String,
     pub state: Arc<AppState>,
     pub kubo: wiremock::MockServer,
+    pub cold_kubo: Option<wiremock::MockServer>,
     worker: Option<LifecycleWorkerHandle>,
     cancellation: CancellationToken,
     s3_server: Option<S3ServerHandle>,
@@ -62,7 +64,23 @@ impl S3TestEndpoint for LifecycleHarness {
 }
 
 pub async fn start_lifecycle_harness(script: KuboScript) -> LifecycleHarness {
+    start_lifecycle_harness_inner(script, false).await
+}
+
+pub async fn start_lifecycle_harness_with_cold(script: KuboScript) -> LifecycleHarness {
+    start_lifecycle_harness_inner(script, true).await
+}
+
+async fn start_lifecycle_harness_inner(
+    script: KuboScript,
+    enable_cold_kubo: bool,
+) -> LifecycleHarness {
     let KuboHarness { server: kubo, .. } = start_kubo_harness(script).await;
+    let cold_kubo = if enable_cold_kubo {
+        Some(wiremock::MockServer::start().await)
+    } else {
+        None
+    };
     let database_directory = tempfile::tempdir().expect("create lifecycle SQLite directory");
     let database_path = database_directory.path().join(format!(
         "lifecycle-{}.sqlite",
@@ -91,6 +109,9 @@ pub async fn start_lifecycle_harness(script: KuboScript) -> LifecycleHarness {
         .expect("create lifecycle test bucket");
     let state = Arc::new(AppState {
         kubo: ipfs_s3_gateway::kubo::KuboClient::new(kubo.uri()),
+        cold_kubo: cold_kubo
+            .as_ref()
+            .map(|server| ipfs_s3_gateway::kubo::KuboClient::new(server.uri())),
         store: Store::new(db),
         credentials: HashMap::from([("test".to_owned(), s3s::auth::SecretKey::from("test"))]),
         master_key: ipfs_s3_gateway::crypto::key::MasterKey::from_hex(&"0".repeat(64))
@@ -106,12 +127,17 @@ pub async fn start_lifecycle_harness(script: KuboScript) -> LifecycleHarness {
         owner,
         state,
         kubo,
+        cold_kubo,
         worker: None,
         cancellation: CancellationToken::new(),
         s3_server: Some(s3_server),
         _database_directory: database_directory,
     }
 }
+
+#[cfg(test)]
+#[path = "lifecycle_transition_api.rs"]
+mod lifecycle_transition_api;
 
 impl LifecycleHarness {
     /// Overrides the immutable lifecycle timestamps for one known public version.
@@ -290,6 +316,7 @@ impl LifecycleHarness {
         if let Some(server) = self.s3_server.take() {
             server.shutdown().await;
         }
+        assert_hot_standard_residency_invariant(self.state.store.db()).await;
     }
 
     async fn stop_worker(&mut self) {

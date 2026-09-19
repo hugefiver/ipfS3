@@ -119,6 +119,7 @@ async fn test_state_with_kubo(kubo: KuboClient) -> Arc<AppState> {
         .unwrap();
     Arc::new(AppState {
         kubo,
+        cold_kubo: None,
         store: Store::new(db),
         credentials: HashMap::new(),
         master_key: MasterKey::from_hex(

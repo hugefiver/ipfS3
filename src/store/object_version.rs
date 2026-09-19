@@ -446,6 +446,18 @@ pub(crate) async fn remove_null_slot<C: ConnectionTrait>(
     bucket_name: &str,
     key: &str,
 ) -> AppResult<()> {
+    if let Some(selected) = one_version(
+        db,
+        bucket_name,
+        key,
+        &VersionSelector::Exact(PublicVersionId::Null),
+        true,
+    )
+    .await?
+        && version_kind(&selected)? == VersionKind::Object
+    {
+        super::residency::release_version_reference_in_transaction(db, &selected.id).await?;
+    }
     let result = object_version::Entity::delete_many()
         .filter(object_version::Column::Bucket.eq(bucket_name))
         .filter(object_version::Column::Key.eq(key))
@@ -472,12 +484,14 @@ async fn insert_version_row<C: ConnectionTrait>(
     if matches!(kind, VersionKind::Object) != object_id.is_some() {
         return Err(invalid_version_index());
     }
+    let row_id = uuid::Uuid::new_v4().to_string();
+    let content_object_id = object_id.clone();
     let kind = match kind {
         VersionKind::Object => "object",
         VersionKind::DeleteMarker => "delete_marker",
     };
     object_version::Entity::insert(object_version::ActiveModel {
-        id: Set(uuid::Uuid::new_v4().to_string()),
+        id: Set(row_id.clone()),
         bucket: Set(bucket_name.to_owned()),
         key: Set(key.to_owned()),
         version_id: Set(version_id.as_db_value()),
@@ -492,6 +506,18 @@ async fn insert_version_row<C: ConnectionTrait>(
     })
     .exec(db)
     .await?;
+    if let Some(object_id) = content_object_id {
+        let object = object::Entity::find_by_id(&object_id)
+            .one(db)
+            .await?
+            .ok_or_else(invalid_version_index)?;
+        super::residency::attach_hot_in_transaction(
+            db,
+            &crate::residency::VersionResidencyIdentity::new(row_id, object_id, object.cid),
+            &crate::residency::PhysicalVerification::Pending,
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -654,7 +680,9 @@ pub(crate) async fn remove_and_promote<C: ConnectionTrait>(
                     .clone()
                     .unwrap_or_else(|| NULL_VERSION_ID.to_owned()),
             })?;
-    let _ = version_kind(&selected)?;
+    if version_kind(&selected)? == VersionKind::Object {
+        super::residency::release_version_reference_in_transaction(db, &selected.id).await?;
+    }
 
     let deleted = object_version::Entity::delete_by_id(selected.id.clone())
         .exec(db)

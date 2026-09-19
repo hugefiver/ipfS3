@@ -1,0 +1,11 @@
+
+running 1 test
+test postgres_reuses_publication_and_delete_residency_scenarios ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 10.66s
+
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.34s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests\residency_publication.rs (target\debug\deps\residency_publication-01515ce38bf9a394.exe)

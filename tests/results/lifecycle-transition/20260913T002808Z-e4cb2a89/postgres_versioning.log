@@ -1,0 +1,41 @@
+
+running 31 tests
+test postgres_http_marker_restore_then_suspended_replacement_preserves_all_versions ... ok
+test postgres_object_versioning_backfill_count_must_match ... ok
+test postgres_object_versioning_backfills_only_legacy_latest_as_hidden_null ... ok
+test postgres_object_versioning_down_allows_only_hidden_null_rows ... ok
+test postgres_object_versioning_down_refuses_public_state_versions_and_markers ... ok
+test postgres_object_versioning_migration_adds_status_table_indexes_and_checks ... ok
+test postgres_parallel_publish_delete_tag_serializes_without_deadlock ... ok
+test postgres_suspended_null_replacement_preserves_opaque_versions ... ok
+test postgres_synchronized_publish_exact_delete_tag_serializes_without_deadlock ... ok
+test support::import::test_import_worker_guard_drop_cancels_external_shutdown ... ok
+test support::lifecycle::lifecycle_transition_api::signed_no_cold_transition_rejection_is_atomic_and_get_delete_still_work ... ok
+test support::lifecycle::lifecycle_transition_api::signed_transition_put_get_accepts_supported_forms_only_with_cold_kubo ... ok
+test support::pinning::tests::psa_script_consumes_identical_get_signatures_in_script_order ... ok
+test support::pinning::tests::psa_script_does_not_consume_an_unmatched_reply ... ok
+test support::pinning::tests::psa_script_matches_reversed_submit_requests_by_cid ... ok
+test support::pinning::tests::psa_script_rejects_ambiguous_matches_without_consuming_them ... ok
+test support::sigv4::canonical_uri_omits_trailing_slash_for_bucket_operations ... ok
+test support::sigv4::presign_sigv4_query_includes_custom_query_before_signature ... ok
+test support::storage_class::signed_decompress_multipart_complete_rejects_nonstandard_class_before_side_effects ... ok
+test support::storage_class::signed_direct_writes_reject_nonstandard_class_before_side_effects ... ok
+test support::storage_class::signed_import_rejects_nonstandard_class_without_creating_jobs ... ok
+test support::storage_class::signed_standard_put_copy_and_multipart_remain_hot ... ok
+test support::tier_reads::reporting::concurrency::list_object_versions_keeps_one_storage_class_snapshot_during_publication ... ok
+test support::tier_reads::reporting::concurrency::list_objects_v1_keeps_one_storage_class_snapshot_during_publication ... ok
+test support::tier_reads::reporting::concurrency::list_objects_v2_keeps_one_storage_class_snapshot_during_publication ... ok
+test support::tier_reads::reporting::receipts::signed_lists_reject_cold_receipt_cid_mismatch_like_get_and_head ... ok
+test support::tier_reads::reporting::receipts::signed_lists_reject_cold_receipt_node_mismatch_like_get_and_head ... ok
+test support::tier_reads::reporting::receipts::signed_lists_reject_malformed_cold_receipt_like_get_and_head ... ok
+test support::tier_reads::reporting::signed_encrypted_get_and_head_report_class_without_mutating_envelopes ... ok
+test support::tier_reads::reporting::signed_object_and_version_lists_report_immutable_storage_classes ... ok
+test support::tier_reads::reporting::signed_plain_get_and_head_report_selected_version_storage_class ... ok
+
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.87s
+
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.90s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests\postgres_versioning.rs (target\debug\deps\postgres_versioning-02f5b6e855f3b1a5.exe)

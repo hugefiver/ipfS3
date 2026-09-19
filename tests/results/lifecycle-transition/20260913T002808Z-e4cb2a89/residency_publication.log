@@ -1,0 +1,16 @@
+
+running 6 tests
+test enabled_delete_marker_preserves_content_residency_and_lease ... ok
+test exact_delete_promotion_preserves_revision_class_and_other_lease ... ok
+test null_overwrite_releases_only_the_displaced_version_reference ... ok
+test postgres_reuses_publication_and_delete_residency_scenarios ... ignored, requires IPFS_S3_TEST_POSTGRES_URL (real PostgreSQL)
+test publication_attaches_pending_hot_residency_for_shared_cid_across_locations ... ok
+test suspended_delete_marker_releases_null_content_only ... ok
+
+test result: ok. 5 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.38s
+
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.78s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests\residency_publication.rs (target\debug\deps\residency_publication-01515ce38bf9a394.exe)

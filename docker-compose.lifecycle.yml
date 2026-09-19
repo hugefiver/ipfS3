@@ -1,0 +1,40 @@
+# Opt-in development overlay; never used by default `docker compose up`.
+# docker compose -f docker-compose.yml -f docker-compose.lifecycle.yml up -d --build kubo cold gateway
+# Requires Compose 2.24.4+ for !override. Not a Cluster/provider topology.
+services:
+  kubo:
+    # Same real Kubo version as the F1 dual-node validation, not a latest tag.
+    build: !reset null
+    image: ipfs/kubo:v0.43.0
+    container_name: !reset null
+    ports: !reset []
+
+  cold:
+    image: ipfs/kubo:v0.43.0
+    # Matches F1's isolated cold node: no swarm retrieval can mask missing data.
+    command: ["daemon", "--offline", "--migrate=true"]
+    volumes:
+      - cold_ipfs_data:/data/ipfs
+    environment:
+      - IPFS_PATH=/data/ipfs
+    # No host RPC, gateway or swarm ports.
+    healthcheck:
+      test: ["CMD", "ipfs", "id"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+    restart: unless-stopped
+
+  gateway:
+    container_name: !reset null
+    ports: !override
+      - "127.0.0.1:${IPFS_S3_LIFECYCLE_PORT:-9000}:9000"
+    environment:
+      - IPFS_S3_COLD_KUBO_RPC_URL=http://cold:5001
+    depends_on:
+      cold:
+        condition: service_healthy
+
+volumes:
+  cold_ipfs_data:

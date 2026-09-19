@@ -1,0 +1,2 @@
+2026-09-12T22:55:49.180878Z ERROR s3s::service: duration=2.0522147s resp=Response { status: 500, version: HTTP/1.1, headers: {"content-type": "application/xml"}, body: Body { once: b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>InternalError</Code><Message>internal storage backend error</Message></Error>" } }
+

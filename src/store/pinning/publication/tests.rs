@@ -44,6 +44,8 @@ use crate::{
     },
 };
 
+mod hot_receipt_tests;
+
 fn limits() -> ProviderLimitMap {
     ProviderLimitMap::from([
         (
@@ -3804,6 +3806,7 @@ async fn completed_publication_winner_removes_the_exact_upload() {
         None,
         None,
         Vec::new(),
+        None,
         None,
         &limits(),
     )

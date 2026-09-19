@@ -186,12 +186,60 @@ fn cursor_for(source: LifecycleScanSource, candidate: &LifecycleCandidate) -> Li
     }
 }
 
-fn candidate_from_row(
+pub(crate) async fn version_evaluation_facts<C: ConnectionTrait>(
+    db: &C,
+    row: &object_version::Model,
+    joined_object: Option<&object::Model>,
+) -> AppResult<(
+    crate::store::object_version::BucketVersioningState,
+    Option<crate::residency::model::StorageClass>,
+    bool,
+)> {
+    use crate::residency::model::{KuboTier, StorageClass, VerificationState};
+    use crate::store::{bucket, entities::version_residency, residency};
+
+    let state = bucket::get_versioning_state(db, &row.bucket).await?;
+    if version_kind(row)? == crate::store::object_version::VersionKind::DeleteMarker {
+        return Ok((state, None, false));
+    }
+    let object = joined_object
+        .ok_or_else(|| AppError::Internal("lifecycle content version has no object".to_owned()))?;
+    if row.object_id.as_deref() != Some(&object.id)
+        || row.bucket != object.bucket
+        || row.key != object.key
+    {
+        return Err(AppError::Internal(
+            "lifecycle content owner mismatch".to_owned(),
+        ));
+    }
+    // Same legacy branch as residency backfill: a live content owner without a
+    // residency record is pending hot, never proof of verified content. Known
+    // residency records must resolve strictly; broken cold records cannot fall back.
+    if version_residency::Entity::find_by_id(&row.id)
+        .one(db)
+        .await?
+        .is_none()
+    {
+        return Ok((state, Some(StorageClass::Standard), false));
+    }
+    let resolved = residency::resolve_version_residency(db, &row.id).await?;
+    Ok((
+        state,
+        Some(resolved.storage_class),
+        resolved.primary.tier == KuboTier::Hot
+            && resolved.physical.verification_state == VerificationState::Verified,
+    ))
+}
+
+async fn candidate_from_row<C: ConnectionTrait>(
+    db: &C,
     row: object_version::Model,
     joined_object: Option<object::Model>,
 ) -> AppResult<LifecycleCandidate> {
     let kind = version_kind(&row)?;
     let public_version_id = public_version_id(&row)?;
+    let (bucket_versioning_state, primary_storage_class, hot_residency_verified) =
+        version_evaluation_facts(db, &row, joined_object.as_ref()).await?;
     let (object_id, size) = match &kind {
         crate::store::object_version::VersionKind::Object => {
             let object_id = row.object_id.as_ref().ok_or_else(invalid_cursor)?;
@@ -225,6 +273,9 @@ fn candidate_from_row(
             sequence: row.sequence,
         },
         is_latest: row.is_latest,
+        bucket_versioning_state,
+        primary_storage_class,
+        hot_residency_verified,
         size,
         lifecycle_age_started_at: row.lifecycle_age_started_at,
         became_noncurrent_at: row.became_noncurrent_at,
@@ -255,9 +306,11 @@ async fn source_page<C: ConnectionTrait>(
                 .limit(limit)
                 .all(db)
                 .await?;
-            rows.into_iter()
-                .map(|(row, joined_object)| candidate_from_row(row, joined_object))
-                .collect()
+            let mut candidates = Vec::with_capacity(rows.len());
+            for (row, joined_object) in rows {
+                candidates.push(candidate_from_row(db, row, joined_object).await?);
+            }
+            Ok(candidates)
         }
         LifecycleScanSource::Multipart => {
             let mut query = multipart_upload::Entity::find()

@@ -2010,11 +2010,11 @@ foreach ($fragment in @(
 )) {
     Assert-Contains $ReadmeContractSource $fragment "README object-versioning contract is missing: $fragment"
 }
-Assert-True (([regex]::Matches($ReadmeSource, '(?m)^## Lifecycle expiration$')).Count -eq 1) "README must contain exactly one Lifecycle expiration section"
+Assert-True (([regex]::Matches($ReadmeSource, '(?m)^## Lifecycle rules$')).Count -eq 1) "README must contain exactly one Lifecycle rules section"
 foreach ($fragment in @(
     '[approved expiration design](docs/superpowers/specs/2026-08-26-lifecycle-expiration-design.md)',
     '[sanitized LOCAL evidence](docs/lifecycle-expiration-evidence-2026-08-26.log)',
-    '`PutBucketLifecycleConfiguration`, `GetBucketLifecycleConfiguration`, and `DeleteBucketLifecycle` support strict, atomic replacement of expiration rules with expected-owner enforcement.',
+    '`PutBucketLifecycleConfiguration`, `GetBucketLifecycleConfiguration`, and `DeleteBucketLifecycle` support strict, atomic replacement of lifecycle rules with expected-owner enforcement.',
     'Supported actions are current-version `Expiration` by date or days, `NoncurrentVersionExpiration` for content and delete markers, and `ExpiredObjectDeleteMarker`.',
     'Eligibility uses database UTC and UTC-midnight semantics.',
     'Lifecycle deletion retains Kubo pins and never calls `pin/rm`.',
@@ -2024,10 +2024,19 @@ foreach ($fragment in @(
     'a lifecycle action observing the same absence succeeds idempotently.',
     'Abort response headers (`x-amz-abort-date`, `x-amz-abort-rule-id`) and',
     '`ListMultipartUploads` are not implemented.',
-    '`Transition` and `NoncurrentVersionTransition` remain unsupported'
+    'Current-version `Transition` (Date or Days) and `NoncurrentVersionTransition` (NoncurrentDays, with the supported newer-version retention filter) move content from `STANDARD -> STANDARD_IA`.',
+    '**Default is hot-only.** Without `[cold_kubo]` / `IPFS_S3_COLD_KUBO_RPC_URL`,',
+    'new lifecycle configurations containing either transition action are rejected atomically with `InvalidRequest`.',
+    'it **does not fall back to hot**, even if hot still has the bytes.',
+    'No lifecycle path calls `pin_rm` (`pin/rm`), runs GC or deletes blocks.',
+    '[F1 CURRENT evidence](tests/results/lifecycle-transition/CURRENT.md).',
+    'The default `docker compose up` and `config.docker.toml` remain single-hot;',
+    'Use the explicit overlay with Docker Compose **2.24.4+**:',
+    'The overlay pins both Kubo nodes to the F1-validated `ipfs/kubo:v0.43.0`'
 )) {
-    Assert-Contains $ReadmeContractSource $fragment "README lifecycle expiration contract is missing: $fragment"
+    Assert-Contains $ReadmeContractSource $fragment "README lifecycle rules contract is missing: $fragment"
 }
+Assert-True ([regex]::IsMatch($ReadmeContractSource, 'direct IA writes \(PUT/COPY/\s*multipart initiation\), and reverse lifecycle transitions are unsupported\.')) "README lifecycle rules must keep direct IA writes unsupported"
 
 $expectedRoadmapVersioningSection = @'
 ## v0.6 — Versioning & Lifecycle
@@ -2035,12 +2044,12 @@ $expectedRoadmapVersioningSection = @'
 - [x] Object versioning (enable/suspend on bucket)
 - [x] ListObjectVersions
 - [x] DeleteMarker support
-- [ ] Lifecycle rules (expiration, transition)
+- [x] Lifecycle rules (expiration, transition)
 - [x] Bucket CORS configuration
 '@
 $roadmapVersioningSection = [regex]::Match($RoadmapSource, '(?ms)^## v0\.6 — Versioning & Lifecycle\n.*?(?=^## \S|\z)').Value.TrimEnd("`n")
-Assert-True ($roadmapVersioningSection -ceq $expectedRoadmapVersioningSection.TrimEnd("`n")) "ROADMAP v0.6 must promote Bucket CORS while retaining Lifecycle as unchecked"
-Assert-True (([regex]::Matches($RoadmapSource, '(?m)^- \[x\] (?:Object versioning \(enable/suspend on bucket\)|ListObjectVersions|DeleteMarker support|Bucket CORS configuration)$')).Count -eq 4) "ROADMAP must contain exactly four completed versioning and CORS checkboxes"
+Assert-True ($roadmapVersioningSection -ceq $expectedRoadmapVersioningSection.TrimEnd("`n")) "ROADMAP v0.6 must contain exactly five completed Versioning & Lifecycle items"
+Assert-True (([regex]::Matches($RoadmapSource, '(?m)^- \[x\] (?:Object versioning \(enable/suspend on bucket\)|ListObjectVersions|DeleteMarker support|Lifecycle rules \(expiration, transition\)|Bucket CORS configuration)$')).Count -eq 5) "ROADMAP must contain exactly five completed versioning, lifecycle, and CORS checkboxes"
 Assert-True (([regex]::Matches($CargoManifestSource, '(?m)^version = "0\.1\.0"$')).Count -eq 1) "Cargo package version must remain 0.1.0"
 
 $requiredFunctions = @(
@@ -3207,7 +3216,7 @@ Assert-True ([regex]::IsMatch($CorsEvidenceRaw, '\A[\x20-\x7E\n]*\z')) 'Bucket C
 $corsReadmePromoted = $ReadmeSource.Contains('## Bucket CORS', [StringComparison]::Ordinal)
 $corsRoadmapPromoted = $RoadmapSource.Contains('- [x] Bucket CORS configuration', [StringComparison]::Ordinal)
 Assert-True ($corsReadmePromoted -and $corsRoadmapPromoted) 'Bucket CORS README and ROADMAP promotion must be atomic after evidence PASS'
-Assert-True ($RoadmapSource.Contains('- [ ] Lifecycle rules (expiration, transition)', [StringComparison]::Ordinal)) 'Bucket CORS promotion must leave Lifecycle unchecked'
+Assert-True ($RoadmapSource.Contains('- [x] Lifecycle rules (expiration, transition)', [StringComparison]::Ordinal)) 'Bucket CORS promotion must coexist with completed Lifecycle rules'
 Assert-True (([regex]::Matches($ReadmeSource, '(?m)^## Bucket CORS$')).Count -eq 1) 'README must contain exactly one Bucket CORS section'
 $readmeCorsContractSource = [regex]::Replace($ReadmeSource, '\s+', ' ').Trim()
 foreach ($fragment in @(

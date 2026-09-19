@@ -1,0 +1,85 @@
+{
+  "run_id": "20260912T224824Z-21bc8c25",
+  "phase": "live",
+  "status": "FAIL",
+  "started_utc": "2026-09-12T22:48:24.8536663Z",
+  "steps": [
+    {
+      "name": "revision",
+      "command": "git rev-parse HEAD",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "dirty-paths",
+      "command": "git status --short",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "rust-version",
+      "command": "rustc --version --verbose",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "cargo-version",
+      "command": "cargo --version",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "docker-version",
+      "command": "docker version --format {{.Server.Version}}",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "cached-images",
+      "command": "docker image inspect postgres:17 ipfs/kubo:v0.43.0 amazon/aws-cli:latest --format {{.RepoTags}}",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "aws-version",
+      "command": "docker run --rm --pull=never amazon/aws-cli:latest --version",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "topology-up",
+      "command": "docker compose -f [REPO]\\tests\\compose.lifecycle-transition-validation.yml -p ipfs3-f1-20260912t224824z-21bc8c25 up -d --pull never --wait --wait-timeout 90",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "topology-logs",
+      "command": "docker compose -f [REPO]\\tests\\compose.lifecycle-transition-validation.yml -p ipfs3-f1-20260912t224824z-21bc8c25 logs --no-color",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "topology-down",
+      "command": "docker compose -f [REPO]\\tests\\compose.lifecycle-transition-validation.yml -p ipfs3-f1-20260912t224824z-21bc8c25 down --volumes --remove-orphans --timeout 10",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    }
+  ],
+  "topology": {},
+  "cleanup": [
+    "compose-owned containers/networks/volumes removed; label-scoped inventory empty"
+  ],
+  "remaining_gates": [],
+  "error": "Owned service did not become ready",
+  "finished_utc": "2026-09-12T22:50:07.1229207Z"
+}

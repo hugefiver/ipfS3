@@ -15,6 +15,10 @@ pub struct CanonicalLifecycleRule {
     pub expiration: Option<CurrentExpiration>,
     pub noncurrent_version_expiration: Option<NoncurrentExpiration>,
     #[serde(default)]
+    pub transition: Option<CurrentTransition>,
+    #[serde(default)]
+    pub noncurrent_version_transition: Option<NoncurrentTransition>,
+    #[serde(default)]
     pub abort_incomplete_multipart_upload: Option<AbortIncompleteMultipartUploadAction>,
 }
 
@@ -77,6 +81,20 @@ pub struct NoncurrentExpiration {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CurrentTransition {
+    Date { utc_midnight: DateTime<Utc> },
+    Days { days: u32 },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NoncurrentTransition {
+    pub noncurrent_days: u32,
+    pub newer_noncurrent_versions: Option<u16>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AbortIncompleteMultipartUploadAction {
     pub days_after_initiation: u32,
 }
@@ -91,6 +109,8 @@ pub enum RuleIdentity {
 pub enum LifecycleActionKind {
     ExpireCurrent,
     ExpireNoncurrent,
+    TransitionCurrent,
+    TransitionNoncurrent,
     DeleteExpiredMarker,
     AbortIncompleteMultipartUpload,
 }
@@ -118,6 +138,10 @@ pub struct MultipartUploadTargetIdentity {
 pub struct VersionLifecycleCandidate {
     pub target: VersionTargetIdentity,
     pub is_latest: bool,
+    pub bucket_versioning_state: crate::store::object_version::BucketVersioningState,
+    pub primary_storage_class: Option<crate::residency::model::StorageClass>,
+    /// Scheduling dependency only: unverified STANDARD must still win conflict evaluation.
+    pub hot_residency_verified: bool,
     pub size: i64,
     pub lifecycle_age_started_at: DateTime<Utc>,
     pub became_noncurrent_at: Option<DateTime<Utc>>,

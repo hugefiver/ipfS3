@@ -1,0 +1,27 @@
+{
+  "run_id": "20260912T234200Z-0b45fcc3",
+  "phase": "quality",
+  "status": "FAIL",
+  "started_utc": "2026-09-12T23:42:00.7762456Z",
+  "steps": [
+    {
+      "name": "runner-contracts",
+      "command": "pwsh -NoProfile -File [REPO]\\tests\\lifecycle-transition.Tests.ps1",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "fmt",
+      "command": "cargo fmt --check",
+      "exit_code": 1,
+      "status": "FAIL",
+      "counts": []
+    }
+  ],
+  "topology": {},
+  "cleanup": [],
+  "remaining_gates": [],
+  "error": "fmt exited 1; see fmt.log",
+  "finished_utc": "2026-09-12T23:42:03.6551950Z"
+}

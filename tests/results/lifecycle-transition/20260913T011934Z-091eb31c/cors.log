@@ -1,0 +1,18 @@
+
+running 8 tests
+test signed_actual_custom_routes_and_probes_use_the_production_stack ... ok
+test signed_management_crc64nvme_only_and_combined_proofs_round_trip ... ok
+test signed_management_rejects_digests_checksums_owners_xml_and_tampering ... ok
+test signed_management_rejects_duplicate_sdk_checksum_algorithm_with_valid_md5 ... ok
+test signed_management_round_trip_replaces_and_deletes_idempotently ... ok
+test sigv4_support::canonical_uri_omits_trailing_slash_for_bucket_operations ... ok
+test sigv4_support::presign_sigv4_query_includes_custom_query_before_signature ... ok
+test unsigned_browser_preflight_matrix_is_enforced_before_authentication ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.52s
+
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.87s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests\cors.rs (target\debug\deps\cors-1bad8781bb833512.exe)

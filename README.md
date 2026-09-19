@@ -13,6 +13,7 @@ An S3-compatible gateway backed by IPFS (Kubo). Translates S3 API calls into Kub
 - **Per-object Encryption** — SSE-S3 (gateway-managed key) and SSE-C (customer-provided key) with AES-256-GCM
 - **Content-addressed Storage** — ETag = IPFS CID; plain objects accessible via any public IPFS gateway (`https://ipfs.io/ipfs/<CID>`)
 - **Object Versioning** — Unversioned, Enabled, and Suspended bucket states with S3-style version IDs, delete markers, and `ListObjectVersions`
+- **Lifecycle Rules** — Expiration, incomplete multipart abort, and current/noncurrent `STANDARD -> STANDARD_IA` transitions to an optional independent cold Kubo
 - **Streaming** — Request and response bodies stream end to end; the documented exception is a Range read of an encrypted object, which decrypts the full object before slicing; chunk-level encrypted Range reads are planned for v0.8
 - **Dual Backend** — SQLite (dev) or PostgreSQL (prod) via sea-orm, with sequential schema migrations
 - **Remote Pinning** — Asynchronous Pinata/Filebase PSA pinning with ordered policies, durable work, leases, and local soft quotas
@@ -331,13 +332,13 @@ requires exact removal of every public version and delete marker.
 
 Non-goals: MFA Delete, Object Lock, pin reclamation, and replication.
 
-## Lifecycle expiration
+## Lifecycle rules
 
 The [approved expiration design](docs/superpowers/specs/2026-08-26-lifecycle-expiration-design.md)
 and [sanitized LOCAL evidence](docs/lifecycle-expiration-evidence-2026-08-26.log)
-describe the implemented subset. `PutBucketLifecycleConfiguration`,
+describe expiration behavior. `PutBucketLifecycleConfiguration`,
 `GetBucketLifecycleConfiguration`, and `DeleteBucketLifecycle` support strict,
-atomic replacement of expiration rules with expected-owner enforcement.
+atomic replacement of lifecycle rules with expected-owner enforcement.
 
 Supported actions are current-version `Expiration` by date or days,
 `NoncurrentVersionExpiration` for content and delete markers, and
@@ -359,8 +360,113 @@ Abort response headers (`x-amz-abort-date`, `x-amz-abort-rule-id`) and
 PG17 runner (requires two gateways, a load balancer, and Kubo endpoints):
 `pwsh tests/run-postgres-lifecycle-validation.ps1 -PostgresUrl <url>`
 See [validation evidence](tests/results/postgres-lifecycle-validation/) for run status.
-`Transition` and `NoncurrentVersionTransition` remain unsupported; configurations
-containing unsupported actions are rejected as a whole.
+
+### Transition to independent cold storage
+
+Current-version `Transition` (Date or Days) and `NoncurrentVersionTransition`
+(NoncurrentDays, with the supported newer-version retention filter) move content
+from `STANDARD -> STANDARD_IA`. Delete markers and incomplete multipart uploads
+are not transition targets. This is a real transfer to an **independent cold
+Kubo node**, not a metadata-only class label, an IPFS Cluster replica, or a
+Pinata/Filebase provider pin. The original DAG is streamed to cold, its original
+CID and complete local pinned content are verified, and only then is that
+immutable version's cold residency/class published atomically.
+
+CID, ETag, public version ID, object bytes, metadata, tags, and encryption remain
+unchanged, including SSE-S3 key wrapping and SSE-C key identity. GET/HEAD, Range,
+object listings and version listings use the selected version's residency;
+different versions sharing a CID can have different classes. Copying an IA
+source creates a new `STANDARD` destination; it does not reverse the source's
+transition.
+
+- **Default is hot-only.** Without `[cold_kubo]` / `IPFS_S3_COLD_KUBO_RPC_URL`,
+  new and legacy objects remain `STANDARD`; new lifecycle configurations
+  containing either transition action are rejected atomically with
+  `InvalidRequest`. Expiration/abort-only rules continue to work. Existing
+  objects are backfilled as `STANDARD`, with hot-local verification before they
+  can transition; backfill does not change CID, version identity or encryption.
+- **Temporary cold outage is not a configuration syntax error.** With cold
+  configured, valid transition rules can still be stored. Execution retries
+  transient failures with bounded attempts and fails safe without publishing IA
+  if copy/verification cannot complete. An already-published IA read fails when
+  cold is unavailable; it **does not fall back to hot**, even if hot still has
+  the bytes. `/health` is liveness and `/ready` is database readiness, not proof
+  that either Kubo tier is usable.
+- **Disabling/deleting rules cancels only unpublished actions.** Published IA
+  versions stay IA; recovery can finish their idempotent logical cleanup.
+  Keep cold configured and its repository intact for those versions.
+- **No physical reclamation promise.** Transition cleanup releases only its
+  logical references. No lifecycle path calls `pin_rm` (`pin/rm`), runs GC or
+  deletes blocks. Shared-CID owners and pinning leases remain protected; hot
+  disk usage need not shrink, and extra cold copies may remain after failures.
+- Archive/restore tiers, provider pseudo-tiers, direct IA writes (PUT/COPY/
+  multipart initiation), and reverse lifecycle transitions are unsupported.
+  Unsupported actions/classes reject the entire configuration, not just one
+  rule. This is not AWS archival storage or its billing/minimum-size policy.
+
+**Upgrade all gateway and worker instances together before enabling transitions.**
+Every instance sharing the database must support the new residency/action schema
+and tier-aware reader/writer, with identical hot/cold bindings to the same two
+node identities and separate repositories/volumes. Do not mix old workers or
+readers with the upgraded database. Keep the master key stable. Disabling rules
+is not a schema rollback: do not blindly downgrade binaries or remove residency
+tables/cold storage after IA publication. A separately designed reverse migration
+would be required; this release does not provide one.
+
+See the [lifecycle program design](docs/superpowers/specs/2026-08-26-lifecycle-program-design.md),
+[transition implementation plan](docs/superpowers/plans/2026-09-12-lifecycle-transition.md),
+and [F1 CURRENT evidence](tests/results/lifecycle-transition/CURRENT.md).
+The linked CURRENT receipt identifies the sole authoritative full F1 run (exit
+0); the deployment smoke below is not a replacement for that full validation matrix.
+
+F2 deployment smoke (2026-09-13, current-source offline image
+`ipfs3-f2-current:20260913-b631aa`, image ID prefix `4233de1f7f3f`) verified a
+signed Days=1 transition using one precisely aged disposable SQLite version,
+DB cold/IA publication, unchanged CID/ETag and 67 bytes, IA GET/HEAD/listing,
+and complete pinned cold-local content with hot stopped; its project data and
+unique image were removed after logs-first cleanup.
+
+### Opt-in dual-Kubo development deployment
+
+The default `docker compose up` and `config.docker.toml` remain single-hot;
+`config.example.toml` shows the optional, commented-out `[cold_kubo] rpc_url`.
+Use the explicit overlay with Docker Compose **2.24.4+**:
+
+```powershell
+docker compose -p ipfs3-lifecycle -f docker-compose.yml -f docker-compose.lifecycle.yml config --quiet
+docker compose -p ipfs3-lifecycle -f docker-compose.yml -f docker-compose.lifecycle.yml up --detach --build --wait --wait-timeout 180 kubo cold gateway
+curl.exe --fail http://127.0.0.1:9000/ready
+```
+
+Build the gateway from the upgraded source; an old cached `latest` image is not
+evidence of transition support. For an already-built, verified gateway and cached
+Kubo images, replace `--build` with `--no-build --pull never`. The overlay pins
+both Kubo nodes to the F1-validated `ipfs/kubo:v0.43.0`, with separate project-scoped
+`ipfs_data` (hot) and `cold_ipfs_data` (cold) named volumes. Cold runs offline as
+in F1: CAR import over private RPC provides its data, not swarm retrieval from hot.
+Neither Kubo publishes host ports in this overlay; the gateway binds only to
+`127.0.0.1:${IPFS_S3_LIFECYCLE_PORT:-9000}`. The gateway uses
+`IPFS_S3_COLD_KUBO_RPC_URL=http://cold:5001`, and waits for both nodes at startup.
+The explicit service list does not start the optional Cloudflare tunnel.
+
+This is a same-host SQLite development topology, not a production HA, Cluster,
+or provider setup. It does not modify the separate PostgreSQL/multi-gateway
+deployment files. Multi-gateway operators must configure **every gateway and
+worker with the same hot/cold tier bindings**, never one cold node per replica.
+Keep RPC private and protect Docker/host access; Compose configuration output
+may include secrets. Do not reuse a hot repository or volume as cold.
+
+Inspect logs before shutdown, and retain data volumes:
+
+```powershell
+docker compose -p ipfs3-lifecycle -f docker-compose.yml -f docker-compose.lifecycle.yml logs --no-color
+docker compose -p ipfs3-lifecycle -f docker-compose.yml -f docker-compose.lifecycle.yml down --remove-orphans
+```
+
+Only for a disposable smoke project with no retained data, add `--volumes` to
+`down` and verify that no containers, networks or volumes with that project's
+`com.docker.compose.project` label remain. Never use that cleanup on a persistent
+deployment; removing cold data makes published IA versions unreadable.
 
 ## Bucket CORS
 

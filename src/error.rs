@@ -8,6 +8,25 @@ use s3s::{S3Error, S3ErrorCode};
 
 pub const INTERNAL_STORAGE_BACKEND_ERROR: &str = "internal storage backend error";
 
+/// Safe, bounded classifications: never carry endpoints, credentials or RPC bodies.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum TierError {
+    #[error("cold_not_configured")]
+    ColdNotConfigured,
+    #[error("tier_unavailable")]
+    TierUnavailable,
+    #[error("cid_mismatch")]
+    CidMismatch,
+    #[error("local_copy_incomplete")]
+    LocalCopyIncomplete,
+    #[error("node_identity_mismatch")]
+    NodeIdentityMismatch,
+    #[error("same_node")]
+    SameNode,
+    #[error("cancelled")]
+    Cancelled,
+}
+
 /// Private provenance attached to a successful Kubo response whose body fails
 /// after headers have been accepted. Its display text is safe for response
 /// streams, while callers can still distinguish it from ordinary I/O failures.
@@ -98,6 +117,8 @@ fn delete_marker_error(version_id: &str, created_at: DateTime<Utc>, current: boo
 /// Application-level errors. Converted to S3Error at the S3 handler boundary.
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
+    #[error("storage tier error: {0}")]
+    Tier(TierError),
     #[error("bucket not found: {0}")]
     NoSuchBucket(String),
 
@@ -323,7 +344,9 @@ impl From<AppError> for S3Error {
             | AppError::ZipArchiveRejected(_) => invalid_parameter_value(&e),
             AppError::AccessDenied(_) => s3_error!(AccessDenied, "{}", e),
             AppError::Database(_) => s3_error!(InternalError, "internal database error"),
-            AppError::KuboRpc { .. } => s3_error!(InternalError, "internal storage backend error"),
+            AppError::KuboRpc { .. } | AppError::Tier(_) => {
+                s3_error!(InternalError, "internal storage backend error")
+            }
             _ => s3_error!(InternalError, "{}", e),
         }
     }

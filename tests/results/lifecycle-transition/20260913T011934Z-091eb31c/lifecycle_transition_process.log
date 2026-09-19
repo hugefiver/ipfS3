@@ -1,0 +1,12 @@
+
+running 2 tests
+test lifecycle_transition_process::tests::process_publication_size_matches_actual_payload ... ok
+test lifecycle_transition_process_crash_restart_f1 ... ignored, NOT RUN by default: requires PG17 and two independent, healthy Kubo RPC endpoints
+
+test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.10s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests\lifecycle_transition_process.rs (target\debug\deps\lifecycle_transition_process-998ec345a42d16fe.exe)

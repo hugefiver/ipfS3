@@ -2,7 +2,7 @@ use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait, QueryFilter,
     QueryOrder, QuerySelect, Set, TransactionError, TransactionTrait,
-    sea_query::{Condition, Expr, LockBehavior, LockType, OnConflict},
+    sea_query::{Condition, Expr, LockBehavior, LockType, OnConflict, Query, SimpleExpr},
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -15,7 +15,7 @@ use crate::{
     },
     store::{
         database_clock::database_now,
-        entities::lifecycle_action,
+        entities::{lifecycle_action, lifecycle_transition},
         import::ownership::{clear_lifecycle_mutation_if_owned, lock_bucket_for_ownership},
         object_version::VersionKind,
     },
@@ -28,6 +28,9 @@ pub const FAILURE_DATABASE_CONTENTION: &str = "database_contention";
 pub const FAILURE_ADMISSION_TEMPORARILY_UNAVAILABLE: &str = "admission_temporarily_unavailable";
 pub const FAILURE_INTERNAL_DEPENDENCY: &str = "internal_dependency";
 pub const FAILURE_CANCELLED_STALE: &str = "cancelled_stale";
+pub const TRANSITION_SETTLEMENT_REQUIRED: &str = "transition_settlement_required";
+const WAITING_FOR_TRANSITION: &str = "waiting_for_transition";
+const TRANSITION_RECHECK_SECONDS: i64 = 30;
 pub const REDACTED_LIFECYCLE_ACTION_ERROR: &str = "lifecycle action failed";
 
 const STATE_PENDING: &str = "pending";
@@ -198,7 +201,8 @@ pub async fn insert_idempotent<C: ConnectionTrait>(
 }
 
 /// Claims due work (or expired leases) in stable `(due_at, id)` order using a database-owned
-/// clock. Reclaiming increments both the attempt and the epoch fence.
+/// clock. Reclaiming increments the epoch fence and normally increments the saturating attempt
+/// counter; expiration dependency probes retain their refunded attempt.
 pub async fn claim_due(
     db: &DatabaseConnection,
     worker_id: &str,
@@ -215,8 +219,10 @@ pub async fn claim_due(
     .await
 }
 
-/// Claims due work using the validated worker-specific attempt cap. An expired claim at the cap
-/// receives one final recovery claim; a subsequent crash is terminalized without another claim.
+/// Claims due work using the validated worker-specific attempt cap. Generic expired claims at the
+/// cap receive one final recovery claim. Transition work also receives a final E2 settlement claim;
+/// an outstanding saga can reclaim that settlement claim after a crash, and a published saga
+/// remains claimable until cleanup succeeds.
 pub async fn claim_due_with_max_attempts(
     db: &DatabaseConnection,
     worker_id: &str,
@@ -278,6 +284,79 @@ pub async fn lock_claim_for_execution<C: ConnectionTrait>(
         .lease_until
         .filter(|until| *until > now)
         .map(|_| action))
+}
+
+/// Extends an active claim from the database clock. The action identity, worker,
+/// and epoch are a compare-and-set fence, and an already expired lease cannot be
+/// revived by renewal.
+pub async fn renew_claim<C>(
+    db: &C,
+    claim: &ClaimedLifecycleAction,
+    lease_for: Duration,
+) -> AppResult<bool>
+where
+    C: ConnectionTrait + TransactionTrait,
+{
+    validate_lease_duration(lease_for)?;
+    let claim = claim.clone();
+    let result = db
+        .transaction(move |txn| {
+            let claim = claim.clone();
+            Box::pin(async move { renew_claim_in_transaction(txn, &claim, lease_for).await })
+        })
+        .await;
+    result.map_err(normalize_transaction_error)
+}
+
+async fn renew_claim_in_transaction<C: ConnectionTrait>(
+    db: &C,
+    claim: &ClaimedLifecycleAction,
+    lease_for: Duration,
+) -> AppResult<bool> {
+    acquire_sqlite_action_write_intent(db, &claim.action.id).await?;
+    if lock_claim_for_execution(db, claim).await?.is_none() {
+        return Ok(false);
+    }
+    #[cfg(test)]
+    test_hooks::pause_after_renewal_claim_lock(&claim.action.id).await;
+    // This sample must remain after the row lock. Sampling before a contended
+    // PostgreSQL lock can authorize renewal using time at which the lease was
+    // valid even though it expired while the UPDATE waited.
+    let now = database_now(db).await?;
+    let lease_until = now.checked_add_signed(lease_for).ok_or_else(|| {
+        AppError::InvalidArgument(
+            "lifecycle action lease is outside the database timestamp range".to_owned(),
+        )
+    })?;
+    let updated = lifecycle_action::Entity::update_many()
+        .col_expr(
+            lifecycle_action::Column::LeaseUntil,
+            Expr::value(Some(lease_until)),
+        )
+        .col_expr(lifecycle_action::Column::UpdatedAt, Expr::value(now))
+        .filter(active_claim_condition(claim))
+        .filter(lifecycle_action::Column::LeaseUntil.gt(now))
+        .exec(db)
+        .await?;
+    Ok(updated.rows_affected == 1)
+}
+
+async fn acquire_sqlite_action_write_intent<C: ConnectionTrait>(
+    db: &C,
+    action_id: &str,
+) -> AppResult<()> {
+    if db.get_database_backend() != DatabaseBackend::Sqlite {
+        return Ok(());
+    }
+    lifecycle_action::Entity::update_many()
+        .col_expr(
+            lifecycle_action::Column::UpdatedAt,
+            Expr::col(lifecycle_action::Column::UpdatedAt).into(),
+        )
+        .filter(lifecycle_action::Column::Id.eq(action_id))
+        .exec(db)
+        .await?;
+    Ok(())
 }
 
 pub async fn mark_succeeded<C: ConnectionTrait>(
@@ -362,6 +441,122 @@ pub async fn mark_failed_safe<C: ConnectionTrait>(
     terminal_failure_update(db, claim, now, STATE_FAILED_SAFE, failure_class).await
 }
 
+pub(crate) fn waiting_for_transition(action: &lifecycle_action::Model) -> bool {
+    action.action_kind == "expire_current"
+        && action.failure_class.as_deref() == Some(WAITING_FOR_TRANSITION)
+}
+
+/// Keep the same durable identity while transition temporarily wins. This is a
+/// dependency, not an execution failure. Rechecks (including crashed/reclaimed
+/// rechecks) do not consume the ordinary failure budget. The caller must prove
+/// this expiration is otherwise still the winner and settle its ownership guard
+/// in this same transaction.
+pub(crate) async fn wait_for_transition_in_transaction(
+    txn: &sea_orm::DatabaseTransaction,
+    claim: &ClaimedLifecycleAction,
+) -> AppResult<bool> {
+    let Some(action) = lock_claim_for_execution(txn, claim).await? else {
+        return Ok(false);
+    };
+    if action.action_kind != "expire_current" {
+        return Err(AppError::Internal(
+            "invalid transition dependency action".into(),
+        ));
+    }
+    let now = database_now(txn).await?;
+    let attempts = if waiting_for_transition(&action) {
+        action.attempts
+    } else {
+        action.attempts.saturating_sub(1)
+    };
+    let updated = lifecycle_action::Entity::update_many()
+        .col_expr(lifecycle_action::Column::State, Expr::value(STATE_PENDING))
+        .col_expr(lifecycle_action::Column::Attempts, Expr::value(attempts))
+        .col_expr(
+            lifecycle_action::Column::NextAttemptAt,
+            Expr::value(now + Duration::seconds(TRANSITION_RECHECK_SECONDS)),
+        )
+        .col_expr(
+            lifecycle_action::Column::LeaseUntil,
+            Expr::value(Option::<DateTime<Utc>>::None),
+        )
+        .col_expr(
+            lifecycle_action::Column::ClaimedBy,
+            Expr::value(Option::<String>::None),
+        )
+        .col_expr(
+            lifecycle_action::Column::FailureClass,
+            Expr::value(Some(WAITING_FOR_TRANSITION.to_owned())),
+        )
+        .col_expr(
+            lifecycle_action::Column::LastErrorRedacted,
+            Expr::value(Option::<String>::None),
+        )
+        .col_expr(lifecycle_action::Column::UpdatedAt, Expr::value(now))
+        .filter(active_claim_condition(claim))
+        .filter(lifecycle_action::Column::LeaseUntil.gt(now))
+        .exec(txn)
+        .await?;
+    Ok(updated.rows_affected == 1)
+}
+
+/// Returns a transition claim to the queue while its hot source is awaiting
+/// verification. The claim-time attempt is refunded without entering the
+/// expiration-specific `waiting_for_transition` mode.
+pub(crate) async fn wait_for_hot_verification_in_transaction(
+    txn: &sea_orm::DatabaseTransaction,
+    claim: &ClaimedLifecycleAction,
+) -> AppResult<bool> {
+    let Some(action) = lock_claim_for_execution(txn, claim).await? else {
+        return Ok(false);
+    };
+    if !is_transition_action(&action) {
+        return Err(AppError::Internal(
+            "invalid hot verification dependency action".into(),
+        ));
+    }
+    let now = database_now(txn).await?;
+    let next_attempt_at = now
+        .checked_add_signed(Duration::seconds(TRANSITION_RECHECK_SECONDS))
+        .ok_or_else(|| {
+            AppError::Internal(
+                "lifecycle transition recheck time is outside the database range".into(),
+            )
+        })?;
+    let updated = lifecycle_action::Entity::update_many()
+        .col_expr(lifecycle_action::Column::State, Expr::value(STATE_PENDING))
+        .col_expr(
+            lifecycle_action::Column::Attempts,
+            Expr::value(action.attempts.saturating_sub(1)),
+        )
+        .col_expr(
+            lifecycle_action::Column::NextAttemptAt,
+            Expr::value(next_attempt_at),
+        )
+        .col_expr(
+            lifecycle_action::Column::LeaseUntil,
+            Expr::value(Option::<DateTime<Utc>>::None),
+        )
+        .col_expr(
+            lifecycle_action::Column::ClaimedBy,
+            Expr::value(Option::<String>::None),
+        )
+        .col_expr(
+            lifecycle_action::Column::FailureClass,
+            Expr::value(Option::<String>::None),
+        )
+        .col_expr(
+            lifecycle_action::Column::LastErrorRedacted,
+            Expr::value(Option::<String>::None),
+        )
+        .col_expr(lifecycle_action::Column::UpdatedAt, Expr::value(now))
+        .filter(active_claim_condition(claim))
+        .filter(lifecycle_action::Column::LeaseUntil.gt(now))
+        .exec(txn)
+        .await?;
+    Ok(updated.rows_affected == 1)
+}
+
 pub async fn schedule_retry<C: ConnectionTrait>(
     db: &C,
     claim: &ClaimedLifecycleAction,
@@ -377,6 +572,12 @@ pub async fn schedule_retry<C: ConnectionTrait>(
     }
     let updated = lifecycle_action::Entity::update_many()
         .col_expr(lifecycle_action::Column::State, Expr::value(STATE_PENDING))
+        // A dependency probe is not charged at claim time. An actual execution
+        // failure leaves dependency mode and uses the ordinary bounded budget.
+        .col_expr(
+            lifecycle_action::Column::Attempts,
+            Expr::value(claim.action.attempts + i64::from(waiting_for_transition(&claim.action))),
+        )
         .col_expr(
             lifecycle_action::Column::NextAttemptAt,
             Expr::value(next_attempt_at),
@@ -424,10 +625,28 @@ async fn claim_due_in_transaction<C: ConnectionTrait>(
     let candidates = due_candidates(db, now, limit).await?;
     let mut claimed = Vec::with_capacity(candidates.len());
     for candidate in candidates {
+        let transition = is_transition_action(&candidate);
+        let transition_saga = if transition {
+            transition_saga_state(db, &candidate.id).await?
+        } else {
+            TransitionSagaState::None
+        };
+        let published_cleanup = transition_saga == TransitionSagaState::Published;
+        // Once the charged final recovery claim has been issued, reclaims exist
+        // only so E2 can atomically settle the saga/guard. They remain eligible
+        // past the ordinary execution cap, with the counter saturating safely.
+        let final_saga_settlement = transition_saga == TransitionSagaState::Outstanding
+            && candidate.attempts > max_attempts;
         if candidate.attempts >= max_attempts {
+            // Free dependency probes preserve prior ordinary attempts, not an
+            // exemption from the current worker's cap. Unlike an ordinary
+            // recovery claim, a probe does not increment attempts, so granting
+            // this exception would allow unlimited recovery claims at the cap.
             let one_recovery_claim =
-                candidate.state == STATE_CLAIMED && candidate.attempts == max_attempts;
-            if !one_recovery_claim {
+                !waiting_for_transition(&candidate) && candidate.attempts == max_attempts;
+            let one_recovery_claim =
+                one_recovery_claim && (candidate.state == STATE_CLAIMED || transition);
+            if !one_recovery_claim && !published_cleanup && !final_saga_settlement {
                 fail_safe_exhausted(db, &candidate, now).await?;
                 continue;
             }
@@ -465,15 +684,17 @@ async fn claim_candidate<C: ConnectionTrait>(
     now: DateTime<Utc>,
     lease_until: DateTime<Utc>,
 ) -> AppResult<Option<ClaimedLifecycleAction>> {
+    acquire_sqlite_action_write_intent(db, &candidate.id).await?;
+    let settlement_recovery = candidate.state == STATE_FAILED_SAFE
+        || candidate.last_error_redacted.as_deref() == Some(TRANSITION_SETTLEMENT_REQUIRED);
     let attempts = candidate
         .attempts
-        .checked_add(1)
-        .ok_or_else(|| AppError::Database("lifecycle action attempts overflow".to_owned()))?;
+        .saturating_add(i64::from(!waiting_for_transition(&candidate)));
     let claim_epoch = candidate
         .claim_epoch
         .checked_add(1)
         .ok_or_else(|| AppError::Database("lifecycle action claim epoch overflow".to_owned()))?;
-    let updated = lifecycle_action::Entity::update_many()
+    let mut update = lifecycle_action::Entity::update_many()
         .col_expr(lifecycle_action::Column::State, Expr::value(STATE_CLAIMED))
         .col_expr(lifecycle_action::Column::Attempts, Expr::value(attempts))
         .col_expr(
@@ -496,9 +717,14 @@ async fn claim_candidate<C: ConnectionTrait>(
         .filter(lifecycle_action::Column::Id.eq(candidate.id.clone()))
         .filter(lifecycle_action::Column::Attempts.eq(candidate.attempts))
         .filter(lifecycle_action::Column::ClaimEpoch.eq(candidate.claim_epoch))
-        .filter(due_claim_condition(now))
-        .exec(db)
-        .await?;
+        .filter(due_claim_condition(now));
+    if settlement_recovery {
+        update = update.col_expr(
+            lifecycle_action::Column::LastErrorRedacted,
+            Expr::value(Some(TRANSITION_SETTLEMENT_REQUIRED.to_owned())),
+        );
+    }
+    let updated = update.exec(db).await?;
     if updated.rows_affected != 1 {
         return Ok(None);
     }
@@ -626,6 +852,8 @@ fn validate_action_identity(action: &NewLifecycleAction) -> AppResult<()> {
             LifecycleTargetIdentity::Version(target),
             LifecycleActionKind::ExpireCurrent
             | LifecycleActionKind::ExpireNoncurrent
+            | LifecycleActionKind::TransitionCurrent
+            | LifecycleActionKind::TransitionNoncurrent
             | LifecycleActionKind::DeleteExpiredMarker,
         ) => {
             if target.bucket != action.bucket
@@ -638,6 +866,15 @@ fn validate_action_identity(action: &NewLifecycleAction) -> AppResult<()> {
                 ));
             }
             validate_target(target)?;
+            if matches!(
+                action.action_kind,
+                LifecycleActionKind::TransitionCurrent | LifecycleActionKind::TransitionNoncurrent
+            ) && target.kind != VersionKind::Object
+            {
+                return Err(AppError::InvalidArgument(
+                    "lifecycle transition target must be a content version".to_owned(),
+                ));
+            }
             if target.public_version_id.as_s3_str().is_empty() {
                 return Err(AppError::InvalidArgument(
                     "lifecycle action public version ID must not be empty".to_owned(),
@@ -692,6 +929,8 @@ pub(crate) fn target_from_action(
                 .ok_or_else(invalid_persisted_action_identity)?;
             let kind = match action_kind {
                 LifecycleActionKind::ExpireCurrent => VersionKind::Object,
+                LifecycleActionKind::TransitionCurrent
+                | LifecycleActionKind::TransitionNoncurrent => VersionKind::Object,
                 LifecycleActionKind::DeleteExpiredMarker => VersionKind::DeleteMarker,
                 LifecycleActionKind::ExpireNoncurrent => {
                     if action.target_object_id.is_some() {
@@ -759,6 +998,8 @@ pub(crate) fn action_kind_from_db(value: &str) -> AppResult<LifecycleActionKind>
     match value {
         "expire_current" => Ok(LifecycleActionKind::ExpireCurrent),
         "expire_noncurrent" => Ok(LifecycleActionKind::ExpireNoncurrent),
+        "transition_current" => Ok(LifecycleActionKind::TransitionCurrent),
+        "transition_noncurrent" => Ok(LifecycleActionKind::TransitionNoncurrent),
         "delete_expired_marker" => Ok(LifecycleActionKind::DeleteExpiredMarker),
         "abort_incomplete_multipart_upload" => {
             Ok(LifecycleActionKind::AbortIncompleteMultipartUpload)
@@ -790,6 +1031,8 @@ fn persisted_action_kind(action_kind: LifecycleActionKind) -> &'static str {
     match action_kind {
         LifecycleActionKind::ExpireCurrent => "expire_current",
         LifecycleActionKind::ExpireNoncurrent => "expire_noncurrent",
+        LifecycleActionKind::TransitionCurrent => "transition_current",
+        LifecycleActionKind::TransitionNoncurrent => "transition_noncurrent",
         LifecycleActionKind::DeleteExpiredMarker => "delete_expired_marker",
         LifecycleActionKind::AbortIncompleteMultipartUpload => "abort_incomplete_multipart_upload",
     }
@@ -801,16 +1044,21 @@ fn validate_claim_request(worker_id: &str, lease_for: Duration, limit: u64) -> A
             "lifecycle worker ID must not be empty".to_owned(),
         ));
     }
+    validate_lease_duration(lease_for)?;
+    if limit == 0 || limit > MAX_LIFECYCLE_ACTION_CLAIM_LIMIT {
+        return Err(AppError::InvalidArgument(format!(
+            "lifecycle action claim limit must be between 1 and {MAX_LIFECYCLE_ACTION_CLAIM_LIMIT}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_lease_duration(lease_for: Duration) -> AppResult<()> {
     if lease_for <= Duration::zero()
         || lease_for > Duration::seconds(MAX_LIFECYCLE_ACTION_LEASE_SECONDS)
     {
         return Err(AppError::InvalidArgument(format!(
             "lifecycle action lease must be between 1 second and {MAX_LIFECYCLE_ACTION_LEASE_SECONDS} seconds"
-        )));
-    }
-    if limit == 0 || limit > MAX_LIFECYCLE_ACTION_CLAIM_LIMIT {
-        return Err(AppError::InvalidArgument(format!(
-            "lifecycle action claim limit must be between 1 and {MAX_LIFECYCLE_ACTION_CLAIM_LIMIT}"
         )));
     }
     Ok(())
@@ -827,8 +1075,96 @@ fn due_claim_condition(now: DateTime<Utc>) -> Condition {
         .add(
             Condition::all()
                 .add(lifecycle_action::Column::State.eq(STATE_CLAIMED))
-                .add(lifecycle_action::Column::LeaseUntil.lte(now)),
+                .add(lifecycle_action::Column::LeaseUntil.lte(now))
+                .add(
+                    Condition::any()
+                        .add(lifecycle_action::Column::LastErrorRedacted.is_null())
+                        .add(
+                            lifecycle_action::Column::LastErrorRedacted
+                                .ne(TRANSITION_SETTLEMENT_REQUIRED),
+                        )
+                        .add(unfinished_transition_saga_exists()),
+                ),
         )
+        .add(
+            Condition::all()
+                .add(lifecycle_action::Column::State.eq(STATE_FAILED_SAFE))
+                .add(
+                    Condition::any()
+                        .add(lifecycle_action::Column::ActionKind.eq("transition_current"))
+                        .add(lifecycle_action::Column::ActionKind.eq("transition_noncurrent")),
+                )
+                .add(unfinished_transition_saga_exists()),
+        )
+}
+
+fn unfinished_transition_saga_exists() -> SimpleExpr {
+    Expr::exists(
+        Query::select()
+            .column(lifecycle_transition::Column::Id)
+            .from(lifecycle_transition::Entity)
+            .and_where(
+                Expr::col((
+                    lifecycle_transition::Entity,
+                    lifecycle_transition::Column::ActionId,
+                ))
+                .equals((lifecycle_action::Entity, lifecycle_action::Column::Id)),
+            )
+            .and_where(
+                Expr::col((
+                    lifecycle_transition::Entity,
+                    lifecycle_transition::Column::SettlementKind,
+                ))
+                .is_null(),
+            )
+            .and_where(
+                Expr::col((
+                    lifecycle_transition::Entity,
+                    lifecycle_transition::Column::CompletedAt,
+                ))
+                .is_null(),
+            )
+            .to_owned(),
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransitionSagaState {
+    None,
+    Outstanding,
+    Published,
+}
+
+async fn transition_saga_state<C: ConnectionTrait>(
+    db: &C,
+    action_id: &str,
+) -> AppResult<TransitionSagaState> {
+    let saga = lifecycle_transition::Entity::find()
+        .filter(lifecycle_transition::Column::ActionId.eq(action_id))
+        .one(db)
+        .await?;
+    Ok(match saga {
+        None => TransitionSagaState::None,
+        Some(saga)
+            if saga.settlement_kind.is_none()
+                && saga.completed_at.is_none()
+                && saga.publication_receipt.is_some()
+                && matches!(saga.checkpoint.as_str(), "publish" | "cleanup") =>
+        {
+            TransitionSagaState::Published
+        }
+        Some(saga) if saga.settlement_kind.is_none() && saga.completed_at.is_none() => {
+            TransitionSagaState::Outstanding
+        }
+        Some(_) => TransitionSagaState::None,
+    })
+}
+
+fn is_transition_action(action: &lifecycle_action::Model) -> bool {
+    matches!(
+        action.action_kind.as_str(),
+        "transition_current" | "transition_noncurrent"
+    )
 }
 
 fn active_claim_condition(claim: &ClaimedLifecycleAction) -> Condition {
@@ -887,6 +1223,7 @@ fn normalize_transaction_error(error: TransactionError<AppError>) -> AppError {
 pub(crate) mod test_hooks {
     use std::collections::HashMap;
     use std::sync::{LazyLock, Mutex};
+    use std::time::Duration;
 
     use crate::{
         error::{AppError, AppResult},
@@ -901,8 +1238,14 @@ pub(crate) mod test_hooks {
 
     static NEXT_TERMINAL_FAILURE: LazyLock<Mutex<HashMap<String, PendingTerminalFailure>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
+    static NEXT_RENEWAL_PAUSE: LazyLock<Mutex<HashMap<String, Duration>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
 
     pub struct FailureScope {
+        action_id: String,
+    }
+
+    pub struct RenewalPauseScope {
         action_id: String,
     }
 
@@ -918,6 +1261,16 @@ pub(crate) mod test_hooks {
                 },
             );
         FailureScope {
+            action_id: action_id.to_owned(),
+        }
+    }
+
+    pub fn pause_next_renewal(action_id: &str, duration: Duration) -> RenewalPauseScope {
+        NEXT_RENEWAL_PAUSE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(action_id.to_owned(), duration);
+        RenewalPauseScope {
             action_id: action_id.to_owned(),
         }
     }
@@ -955,12 +1308,31 @@ pub(crate) mod test_hooks {
         Ok(())
     }
 
+    pub async fn pause_after_renewal_claim_lock(action_id: &str) {
+        let duration = NEXT_RENEWAL_PAUSE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(action_id);
+        if let Some(duration) = duration {
+            tokio::time::sleep(duration).await;
+        }
+    }
+
     impl Drop for FailureScope {
         fn drop(&mut self) {
             let mut failure = NEXT_TERMINAL_FAILURE
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             failure.remove(&self.action_id);
+        }
+    }
+
+    impl Drop for RenewalPauseScope {
+        fn drop(&mut self) {
+            NEXT_RENEWAL_PAUSE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&self.action_id);
         }
     }
 }
@@ -975,9 +1347,10 @@ mod tests {
     use sha2::Digest as _;
 
     use super::{
-        MAX_LIFECYCLE_ACTION_ATTEMPTS, STATE_CLAIMED, STATE_FAILED_SAFE, claim_due,
+        MAX_LIFECYCLE_ACTION_ATTEMPTS, STATE_CLAIMED, STATE_FAILED_SAFE,
+        TRANSITION_SETTLEMENT_REQUIRED, canonical_action_bytes, claim_due,
         claim_due_with_max_attempts, idempotency_key, insert_idempotent, lock_claim_for_execution,
-        mark_cancelled, mark_failed_safe, mark_succeeded, schedule_retry,
+        mark_cancelled, mark_failed_safe, mark_succeeded, renew_claim, schedule_retry,
     };
     use crate::{
         lifecycle::model::{
@@ -987,7 +1360,9 @@ mod tests {
         store::{
             bucket, connect_database,
             database_clock::database_now,
-            entities::{import_destination, lifecycle_action},
+            entities::{
+                import_destination, lifecycle_action, lifecycle_transition, physical_residency,
+            },
             object_version::{PublicVersionId, VersionKind},
             run_migrations,
         },
@@ -1023,6 +1398,66 @@ mod tests {
             }),
             due_at,
         }
+    }
+
+    async fn insert_transition_saga(
+        db: &sea_orm::DatabaseConnection,
+        action: &lifecycle_action::Model,
+        checkpoint: &str,
+    ) {
+        let now = database_now(db).await.unwrap();
+        physical_residency::Entity::insert(physical_residency::ActiveModel {
+            tier: sea_orm::Set("hot".to_owned()),
+            cid: sea_orm::Set("transition-cid".to_owned()),
+            node_identity: sea_orm::Set(Some("hot-node".to_owned())),
+            verification_state: sea_orm::Set("verified".to_owned()),
+            verification_receipt: sea_orm::Set(Some("hot-receipt".to_owned())),
+            verified_at: sea_orm::Set(Some(now)),
+            created_at: sea_orm::Set(now),
+            updated_at: sea_orm::Set(now),
+        })
+        .exec(db)
+        .await
+        .unwrap();
+        lifecycle_transition::Entity::insert(lifecycle_transition::ActiveModel {
+            id: sea_orm::Set(format!("saga-{}", action.id)),
+            action_id: sea_orm::Set(action.id.clone()),
+            action_kind: sea_orm::Set(action.action_kind.clone()),
+            bucket: sea_orm::Set(action.bucket.clone()),
+            object_key: sea_orm::Set(action.object_key.clone()),
+            config_revision: sea_orm::Set(action.config_revision),
+            rule_id: sea_orm::Set(action.rule_id.clone()),
+            target_version_row_id: sea_orm::Set(action.target_version_row_id.clone().unwrap()),
+            target_public_version_id: sea_orm::Set(
+                action.target_public_version_id.clone().unwrap(),
+            ),
+            target_object_id: sea_orm::Set(action.target_object_id.clone().unwrap()),
+            target_sequence: sea_orm::Set(action.target_sequence.unwrap()),
+            source_tier: sea_orm::Set("hot".to_owned()),
+            destination_tier: sea_orm::Set("cold".to_owned()),
+            source_cid: sea_orm::Set("transition-cid".to_owned()),
+            destination_cid: sea_orm::Set("transition-cid".to_owned()),
+            source_residency_revision: sea_orm::Set(1),
+            expected_source_node_identity: sea_orm::Set("hot-node".to_owned()),
+            expected_destination_node_identity: sea_orm::Set("cold-node".to_owned()),
+            ownership_generation: sea_orm::Set(1),
+            checkpoint: sea_orm::Set(checkpoint.to_owned()),
+            verification_receipt: sea_orm::Set(
+                matches!(checkpoint, "verify" | "publish" | "cleanup")
+                    .then(|| "verification-receipt".to_owned()),
+            ),
+            publication_receipt: sea_orm::Set(
+                matches!(checkpoint, "publish" | "cleanup")
+                    .then(|| "publication-receipt".to_owned()),
+            ),
+            settlement_kind: sea_orm::Set(None),
+            created_at: sea_orm::Set(now),
+            updated_at: sea_orm::Set(now),
+            completed_at: sea_orm::Set(None),
+        })
+        .exec(db)
+        .await
+        .unwrap();
     }
 
     fn stored_version_action() -> lifecycle_action::Model {
@@ -1259,7 +1694,7 @@ mod tests {
             "{\"bucket\":\"bucket\",\"config_revision\":7,\"rule_identity\":\"id:expire\",\"action_kind\":\"expire_current\",\"target_version_row_id\":\"version-row\",\"target_public_version_id\":\"00000000-0000-4000-8000-000000000001\",\"target_object_id\":\"object-id\",\"target_sequence\":1,\"due_at\":\"2026-09-01T00:00:00.000000000Z\"}"
         );
         assert_eq!(
-            hex::encode(sha2::Sha256::digest(bytes)),
+            hex::encode(sha2::Sha256::digest(&bytes)),
             "d9c49eddf8319d6726c99c8162ff9b72150f6d57f23ad121be9a263647f55578"
         );
 
@@ -1288,6 +1723,813 @@ mod tests {
             idempotency_key(&action).unwrap(),
             "d9c49eddf8319d6726c99c8162ff9b72150f6d57f23ad121be9a263647f55578"
         );
+        assert_eq!(canonical_action_bytes(&action).unwrap(), bytes);
+    }
+
+    #[test]
+    fn transition_action_identities_are_distinct_and_content_only() {
+        let due_at = chrono::DateTime::parse_from_rfc3339("2026-09-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut current = action("version-row", "key", due_at);
+        current.config_revision = 7;
+        current.rule_identity = RuleIdentity::Id("transition".to_owned());
+        current.action_kind = LifecycleActionKind::TransitionCurrent;
+
+        let current_bytes = canonical_action_bytes(&current).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&current_bytes).unwrap(),
+            "{\"bucket\":\"bucket\",\"config_revision\":7,\"rule_identity\":\"id:transition\",\"action_kind\":\"transition_current\",\"target_version_row_id\":\"version-row\",\"target_public_version_id\":\"00000000-0000-4000-8000-000000000001\",\"target_object_id\":\"object-version-row\",\"target_sequence\":1,\"due_at\":\"2026-09-01T00:00:00.000000000Z\"}"
+        );
+
+        let mut noncurrent = current.clone();
+        noncurrent.action_kind = LifecycleActionKind::TransitionNoncurrent;
+        let noncurrent_bytes = canonical_action_bytes(&noncurrent).unwrap();
+        assert_ne!(current_bytes, noncurrent_bytes);
+        assert_ne!(
+            idempotency_key(&current).unwrap(),
+            idempotency_key(&noncurrent).unwrap()
+        );
+
+        for action_kind in [
+            LifecycleActionKind::TransitionCurrent,
+            LifecycleActionKind::TransitionNoncurrent,
+        ] {
+            let mut marker = current.clone();
+            marker.action_kind = action_kind;
+            let LifecycleTargetIdentity::Version(target) = &mut marker.target else {
+                unreachable!()
+            };
+            target.kind = VersionKind::DeleteMarker;
+            target.object_id = None;
+            assert!(matches!(
+                canonical_action_bytes(&marker),
+                Err(crate::error::AppError::InvalidArgument(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn stored_transition_decoder_requires_a_content_version_shape() {
+        for (persisted, expected) in [
+            ("transition_current", LifecycleActionKind::TransitionCurrent),
+            (
+                "transition_noncurrent",
+                LifecycleActionKind::TransitionNoncurrent,
+            ),
+        ] {
+            assert_eq!(super::action_kind_from_db(persisted).unwrap(), expected);
+            let mut stored = stored_version_action();
+            stored.action_kind = persisted.to_owned();
+            let LifecycleTargetIdentity::Version(target) =
+                super::target_from_action(&stored).unwrap()
+            else {
+                panic!("transition must decode as a version target")
+            };
+            assert_eq!(target.kind, VersionKind::Object);
+
+            stored.target_object_id = None;
+            assert!(matches!(
+                super::target_from_action(&stored),
+                Err(crate::error::AppError::Internal(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn generic_claims_include_transition_actions_for_e2() {
+        let db = setup().await;
+        let now = database_now(&db).await.unwrap();
+
+        let mut expiration = action("expiration-row", "expiration", now - Duration::seconds(1));
+        expiration.idempotency_key = idempotency_key(&expiration).unwrap();
+        assert!(insert_idempotent(&db, expiration, now).await.unwrap());
+
+        let mut transition = action("transition-row", "transition", now - Duration::seconds(1));
+        transition.action_kind = LifecycleActionKind::TransitionCurrent;
+        transition.idempotency_key = idempotency_key(&transition).unwrap();
+        assert!(insert_idempotent(&db, transition, now).await.unwrap());
+
+        let claimed = claim_due(&db, "worker", Duration::seconds(30), 10)
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 2);
+        assert!(
+            claimed
+                .iter()
+                .any(|claim| claim.action.action_kind == "expire_current")
+        );
+        assert!(
+            claimed
+                .iter()
+                .any(|claim| claim.action.action_kind == "transition_current")
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_renewal_uses_database_time_and_cannot_revive_an_expired_claim() {
+        let db = setup().await;
+        let now = database_now(&db).await.unwrap();
+        let mut value = action("renew-row", "renew", now - Duration::seconds(1));
+        value.idempotency_key = idempotency_key(&value).unwrap();
+        insert_idempotent(&db, value, now).await.unwrap();
+        let claim = claim_due(&db, "renew-worker", Duration::seconds(2), 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let original_lease = claim.action.lease_until.unwrap();
+
+        assert!(
+            renew_claim(&db, &claim, Duration::seconds(30))
+                .await
+                .unwrap()
+        );
+        let renewed = lifecycle_action::Entity::find_by_id(&claim.action.id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(renewed.lease_until.unwrap() > original_lease);
+
+        let mut wrong_worker = claim.clone();
+        wrong_worker.worker_id = "wrong-worker".to_owned();
+        assert!(
+            !renew_claim(&db, &wrong_worker, Duration::seconds(30))
+                .await
+                .unwrap()
+        );
+
+        lifecycle_action::Entity::update_many()
+            .col_expr(
+                lifecycle_action::Column::LeaseUntil,
+                Expr::value(Some(
+                    database_now(&db).await.unwrap() - Duration::seconds(1),
+                )),
+            )
+            .filter(lifecycle_action::Column::Id.eq(&claim.action.id))
+            .exec(&db)
+            .await
+            .unwrap();
+        assert!(
+            !renew_claim(&db, &claim, Duration::seconds(30))
+                .await
+                .unwrap()
+        );
+
+        let reclaimed = claim_due(&db, "replacement-worker", Duration::seconds(30), 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(reclaimed.claim_epoch, claim.claim_epoch + 1);
+        assert!(
+            !renew_claim(&db, &claim, Duration::seconds(30))
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_renewal_rechecks_database_time_after_obtaining_the_claim_lock() {
+        let db = setup().await;
+        let now = database_now(&db).await.unwrap();
+        let mut value = action("renew-lock-row", "renew-lock", now - Duration::seconds(1));
+        value.idempotency_key = idempotency_key(&value).unwrap();
+        insert_idempotent(&db, value, now).await.unwrap();
+        let claim = claim_due(&db, "renew-worker", Duration::milliseconds(100), 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let _pause = super::test_hooks::pause_next_renewal(
+            &claim.action.id,
+            std::time::Duration::from_millis(250),
+        );
+
+        assert!(
+            !renew_claim(&db, &claim, Duration::seconds(30))
+                .await
+                .unwrap(),
+            "the post-lock database clock must observe expiration"
+        );
+    }
+
+    #[tokio::test]
+    async fn published_transition_cleanup_remains_claimable_beyond_the_attempt_budget() {
+        let db = setup().await;
+        let now = database_now(&db).await.unwrap();
+        let mut value = action("published-row", "published", now - Duration::seconds(1));
+        value.action_kind = LifecycleActionKind::TransitionCurrent;
+        value.idempotency_key = idempotency_key(&value).unwrap();
+        insert_idempotent(&db, value, now).await.unwrap();
+        let stored = lifecycle_action::Entity::find()
+            .filter(lifecycle_action::Column::TargetVersionRowId.eq("published-row"))
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        insert_transition_saga(&db, &stored, "publish").await;
+        lifecycle_action::Entity::update_many()
+            .col_expr(
+                lifecycle_action::Column::Attempts,
+                Expr::value(MAX_LIFECYCLE_ACTION_ATTEMPTS),
+            )
+            .filter(lifecycle_action::Column::Id.eq(&stored.id))
+            .exec(&db)
+            .await
+            .unwrap();
+
+        for epoch in 1..=3 {
+            let claim = claim_due(&db, "cleanup-worker", Duration::seconds(30), 1)
+                .await
+                .unwrap()
+                .pop()
+                .expect("published cleanup must remain claimable");
+            assert_eq!(claim.action.attempts, MAX_LIFECYCLE_ACTION_ATTEMPTS + epoch);
+            assert_eq!(claim.claim_epoch, epoch);
+            lifecycle_action::Entity::update_many()
+                .col_expr(lifecycle_action::Column::State, Expr::value("pending"))
+                .col_expr(
+                    lifecycle_action::Column::LeaseUntil,
+                    Expr::value(Option::<chrono::DateTime<chrono::Utc>>::None),
+                )
+                .col_expr(
+                    lifecycle_action::Column::ClaimedBy,
+                    Expr::value(Option::<String>::None),
+                )
+                .col_expr(
+                    lifecycle_action::Column::NextAttemptAt,
+                    Expr::value(now - Duration::seconds(1)),
+                )
+                .filter(lifecycle_action::Column::Id.eq(&stored.id))
+                .exec(&db)
+                .await
+                .unwrap();
+        }
+
+        lifecycle_action::Entity::update_many()
+            .col_expr(lifecycle_action::Column::Attempts, Expr::value(i64::MAX))
+            .filter(lifecycle_action::Column::Id.eq(&stored.id))
+            .exec(&db)
+            .await
+            .unwrap();
+        let overflow_fenced = claim_due(&db, "cleanup-worker", Duration::seconds(30), 1)
+            .await
+            .unwrap()
+            .pop()
+            .expect("published cleanup must not overflow the attempt counter");
+        assert_eq!(overflow_fenced.action.attempts, i64::MAX);
+    }
+
+    #[tokio::test]
+    async fn legacy_failed_safe_transition_sagas_are_claimed_for_settlement_only() {
+        for checkpoint in ["prepare", "copy", "verify", "publish"] {
+            let db = setup().await;
+            let now = database_now(&db).await.unwrap();
+            let mut value = action(
+                &format!("legacy-{checkpoint}-row"),
+                &format!("legacy-{checkpoint}"),
+                now - Duration::seconds(1),
+            );
+            value.action_kind = LifecycleActionKind::TransitionCurrent;
+            value.idempotency_key = idempotency_key(&value).unwrap();
+            insert_idempotent(&db, value, now).await.unwrap();
+            let original = claim_due(&db, "legacy-worker", Duration::seconds(30), 1)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            insert_transition_saga(&db, &original.action, checkpoint).await;
+            assert!(
+                mark_failed_safe(&db, &original, now, super::FAILURE_INTERNAL_DEPENDENCY)
+                    .await
+                    .unwrap()
+            );
+
+            let recovery = claim_due_with_max_attempts(
+                &db,
+                "settlement-worker",
+                Duration::seconds(30),
+                MAX_LIFECYCLE_ACTION_ATTEMPTS,
+                1,
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap_or_else(|| panic!("{checkpoint} saga must be recoverable"));
+            assert_eq!(recovery.action.id, original.action.id);
+            assert_eq!(recovery.action.state, STATE_CLAIMED);
+            assert_eq!(recovery.action.attempts, original.action.attempts + 1);
+            assert_eq!(recovery.claim_epoch, original.claim_epoch + 1);
+            assert_eq!(recovery.worker_id, "settlement-worker");
+            assert_eq!(
+                recovery.action.last_error_redacted.as_deref(),
+                Some(TRANSITION_SETTLEMENT_REQUIRED),
+                "the claim must advertise cleanup-only responsibility"
+            );
+            assert!(recovery.action.finished_at.is_none());
+            assert!(
+                recovery.action.lease_until.unwrap() > database_now(&db).await.unwrap(),
+                "recovery uses a live lease derived from the database clock"
+            );
+            assert!(
+                !mark_succeeded(&db, &original, database_now(&db).await.unwrap())
+                    .await
+                    .unwrap(),
+                "the pre-recovery epoch must remain fenced"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_actions_without_unfinished_transition_sagas_remain_terminal() {
+        for terminal_case in [
+            "ordinary_failed_safe",
+            "transition_failed_safe_without_saga",
+            "failed_safe_mismatched_saga",
+            "succeeded_with_saga",
+            "cancelled_with_saga",
+            "failed_safe_with_settled_saga",
+        ] {
+            let db = setup().await;
+            let now = database_now(&db).await.unwrap();
+            let mut value = action(
+                &format!("{terminal_case}-row"),
+                terminal_case,
+                now - Duration::seconds(1),
+            );
+            if terminal_case != "ordinary_failed_safe" {
+                value.action_kind = LifecycleActionKind::TransitionCurrent;
+            }
+            value.idempotency_key = idempotency_key(&value).unwrap();
+            insert_idempotent(&db, value, now).await.unwrap();
+            let claim = claim_due(&db, "terminal-worker", Duration::seconds(30), 1)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            if matches!(
+                terminal_case,
+                "failed_safe_mismatched_saga"
+                    | "succeeded_with_saga"
+                    | "cancelled_with_saga"
+                    | "failed_safe_with_settled_saga"
+            ) {
+                insert_transition_saga(&db, &claim.action, "prepare").await;
+            }
+            match terminal_case {
+                "succeeded_with_saga" => {
+                    assert!(mark_succeeded(&db, &claim, now).await.unwrap());
+                }
+                "cancelled_with_saga" => {
+                    assert!(
+                        mark_cancelled(&db, &claim, now, super::FAILURE_CANCELLED_STALE)
+                            .await
+                            .unwrap()
+                    );
+                }
+                _ => {
+                    assert!(
+                        mark_failed_safe(&db, &claim, now, super::FAILURE_INTERNAL_DEPENDENCY,)
+                            .await
+                            .unwrap()
+                    );
+                }
+            }
+            if terminal_case == "failed_safe_mismatched_saga" {
+                lifecycle_action::Entity::update_many()
+                    .col_expr(
+                        lifecycle_action::Column::ActionKind,
+                        Expr::value("expire_current"),
+                    )
+                    .filter(lifecycle_action::Column::Id.eq(&claim.action.id))
+                    .exec(&db)
+                    .await
+                    .unwrap();
+            }
+            if terminal_case == "failed_safe_with_settled_saga" {
+                lifecycle_transition::Entity::update_many()
+                    .col_expr(
+                        lifecycle_transition::Column::SettlementKind,
+                        Expr::value(Some("cancelled".to_owned())),
+                    )
+                    .col_expr(
+                        lifecycle_transition::Column::CompletedAt,
+                        Expr::value(Some(now)),
+                    )
+                    .filter(lifecycle_transition::Column::ActionId.eq(&claim.action.id))
+                    .exec(&db)
+                    .await
+                    .unwrap();
+            }
+
+            assert!(
+                claim_due(&db, "must-not-reopen", Duration::seconds(30), 1)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "{terminal_case} must remain terminal"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_legacy_settlement_claim_has_one_owner_per_epoch_across_connections() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("lifecycle-settlement-claim.db");
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            path.display().to_string().replace('\\', "/")
+        );
+        let primary = connect_database(&database_url).await.unwrap();
+        run_migrations(&primary).await.unwrap();
+        bucket::create(&primary, "bucket", None).await.unwrap();
+        let now = database_now(&primary).await.unwrap();
+        let mut value = action(
+            "concurrent-legacy-row",
+            "concurrent-legacy",
+            now - Duration::seconds(1),
+        );
+        value.action_kind = LifecycleActionKind::TransitionCurrent;
+        value.idempotency_key = idempotency_key(&value).unwrap();
+        insert_idempotent(&primary, value, now).await.unwrap();
+        let original = claim_due(&primary, "original-worker", Duration::seconds(30), 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        insert_transition_saga(&primary, &original.action, "prepare").await;
+        assert!(
+            mark_failed_safe(&primary, &original, now, super::FAILURE_INTERNAL_DEPENDENCY,)
+                .await
+                .unwrap()
+        );
+
+        let first_barrier = std::sync::Arc::new(tokio::sync::Barrier::new(3));
+        let first_left_db = connect_database(&database_url).await.unwrap();
+        let first_right_db = connect_database(&database_url).await.unwrap();
+        let left_barrier = first_barrier.clone();
+        let first_left = tokio::spawn(async move {
+            left_barrier.wait().await;
+            claim_due(&first_left_db, "first-left", Duration::seconds(30), 1).await
+        });
+        let right_barrier = first_barrier.clone();
+        let first_right = tokio::spawn(async move {
+            right_barrier.wait().await;
+            claim_due(&first_right_db, "first-right", Duration::seconds(30), 1).await
+        });
+        first_barrier.wait().await;
+        let first_claims = [
+            first_left.await.unwrap().unwrap(),
+            first_right.await.unwrap().unwrap(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        assert_eq!(first_claims.len(), 1, "only one recovery owner may win");
+        let recovery = first_claims.into_iter().next().unwrap();
+        assert_eq!(recovery.claim_epoch, original.claim_epoch + 1);
+        assert!(matches!(
+            recovery.worker_id.as_str(),
+            "first-left" | "first-right"
+        ));
+        assert_eq!(
+            recovery.action.last_error_redacted.as_deref(),
+            Some(TRANSITION_SETTLEMENT_REQUIRED)
+        );
+
+        lifecycle_action::Entity::update_many()
+            .col_expr(
+                lifecycle_action::Column::LeaseUntil,
+                Expr::value(Some(
+                    database_now(&primary).await.unwrap() - Duration::seconds(1),
+                )),
+            )
+            .filter(lifecycle_action::Column::Id.eq(&recovery.action.id))
+            .exec(&primary)
+            .await
+            .unwrap();
+
+        let second_barrier = std::sync::Arc::new(tokio::sync::Barrier::new(3));
+        let second_left_db = connect_database(&database_url).await.unwrap();
+        let second_right_db = connect_database(&database_url).await.unwrap();
+        let left_barrier = second_barrier.clone();
+        let second_left = tokio::spawn(async move {
+            left_barrier.wait().await;
+            claim_due(&second_left_db, "second-left", Duration::seconds(30), 1).await
+        });
+        let right_barrier = second_barrier.clone();
+        let second_right = tokio::spawn(async move {
+            right_barrier.wait().await;
+            claim_due(&second_right_db, "second-right", Duration::seconds(30), 1).await
+        });
+        second_barrier.wait().await;
+        let second_claims = [
+            second_left.await.unwrap().unwrap(),
+            second_right.await.unwrap().unwrap(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        assert_eq!(
+            second_claims.len(),
+            1,
+            "only one expired-lease takeover may win"
+        );
+        let takeover = second_claims.into_iter().next().unwrap();
+        assert_eq!(takeover.claim_epoch, recovery.claim_epoch + 1);
+        assert!(matches!(
+            takeover.worker_id.as_str(),
+            "second-left" | "second-right"
+        ));
+        assert_eq!(
+            takeover.action.last_error_redacted.as_deref(),
+            Some(TRANSITION_SETTLEMENT_REQUIRED)
+        );
+        assert!(
+            !mark_succeeded(&primary, &recovery, database_now(&primary).await.unwrap(),)
+                .await
+                .unwrap(),
+            "the expired recovery epoch must not settle after takeover"
+        );
+        let stored = lifecycle_action::Entity::find_by_id(&takeover.action.id)
+            .one(&primary)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.claim_epoch, takeover.claim_epoch);
+        assert_eq!(
+            stored.claimed_by.as_deref(),
+            Some(takeover.worker_id.as_str())
+        );
+        assert_eq!(stored.state, STATE_CLAIMED);
+    }
+
+    #[tokio::test]
+    async fn crashed_legacy_settlement_claim_retains_marker_until_the_saga_is_settled() {
+        let db = setup().await;
+        let now = database_now(&db).await.unwrap();
+        let mut value = action(
+            "legacy-reclaim-row",
+            "legacy-reclaim",
+            now - Duration::seconds(1),
+        );
+        value.action_kind = LifecycleActionKind::TransitionCurrent;
+        value.idempotency_key = idempotency_key(&value).unwrap();
+        insert_idempotent(&db, value, now).await.unwrap();
+        let original = claim_due(&db, "original-worker", Duration::seconds(30), 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        insert_transition_saga(&db, &original.action, "copy").await;
+        assert!(
+            mark_failed_safe(&db, &original, now, super::FAILURE_INTERNAL_DEPENDENCY)
+                .await
+                .unwrap()
+        );
+        let recovery = claim_due(&db, "recovery-worker", Duration::seconds(30), 1)
+            .await
+            .unwrap()
+            .pop()
+            .expect("legacy failed-safe saga must be recovered");
+        lifecycle_action::Entity::update_many()
+            .col_expr(
+                lifecycle_action::Column::LeaseUntil,
+                Expr::value(Some(
+                    database_now(&db).await.unwrap() - Duration::seconds(1),
+                )),
+            )
+            .filter(lifecycle_action::Column::Id.eq(&recovery.action.id))
+            .exec(&db)
+            .await
+            .unwrap();
+
+        let reclaimed = claim_due(&db, "replacement-worker", Duration::seconds(30), 1)
+            .await
+            .unwrap()
+            .pop()
+            .expect("crashed settlement cleanup must remain recoverable");
+        assert_eq!(reclaimed.claim_epoch, recovery.claim_epoch + 1);
+        assert_eq!(reclaimed.action.attempts, recovery.action.attempts + 1);
+        assert_eq!(reclaimed.worker_id, "replacement-worker");
+        assert_eq!(
+            reclaimed.action.last_error_redacted.as_deref(),
+            Some(TRANSITION_SETTLEMENT_REQUIRED)
+        );
+        assert!(
+            !mark_failed_safe(
+                &db,
+                &recovery,
+                database_now(&db).await.unwrap(),
+                super::FAILURE_INTERNAL_DEPENDENCY,
+            )
+            .await
+            .unwrap(),
+            "the crashed recovery epoch must remain fenced"
+        );
+
+        lifecycle_transition::Entity::update_many()
+            .col_expr(
+                lifecycle_transition::Column::SettlementKind,
+                Expr::value(Some("cancelled".to_owned())),
+            )
+            .col_expr(
+                lifecycle_transition::Column::CompletedAt,
+                Expr::value(Some(database_now(&db).await.unwrap())),
+            )
+            .filter(lifecycle_transition::Column::ActionId.eq(&reclaimed.action.id))
+            .exec(&db)
+            .await
+            .unwrap();
+        lifecycle_action::Entity::update_many()
+            .col_expr(
+                lifecycle_action::Column::LeaseUntil,
+                Expr::value(Some(
+                    database_now(&db).await.unwrap() - Duration::seconds(1),
+                )),
+            )
+            .filter(lifecycle_action::Column::Id.eq(&reclaimed.action.id))
+            .exec(&db)
+            .await
+            .unwrap();
+        assert!(
+            claim_due(&db, "settled-must-not-reclaim", Duration::seconds(30), 1)
+                .await
+                .unwrap()
+                .is_empty(),
+            "settled cleanup work must not be reclaimed"
+        );
+    }
+
+    #[tokio::test]
+    async fn transition_hot_verification_wait_refunds_the_claim_attempt_without_expiration_mode() {
+        use sea_orm::TransactionTrait;
+
+        let db = setup().await;
+        let now = database_now(&db).await.unwrap();
+        let mut value = action("hot-wait-row", "hot-wait", now - Duration::seconds(1));
+        value.action_kind = LifecycleActionKind::TransitionCurrent;
+        value.idempotency_key = idempotency_key(&value).unwrap();
+        insert_idempotent(&db, value, now).await.unwrap();
+        let claim = claim_due(&db, "hot-wait-worker", Duration::seconds(30), 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(claim.action.attempts, 1);
+
+        let before = database_now(&db).await.unwrap();
+        let txn = db.begin().await.unwrap();
+        assert!(
+            super::wait_for_hot_verification_in_transaction(&txn, &claim)
+                .await
+                .unwrap()
+        );
+        txn.commit().await.unwrap();
+        let after = database_now(&db).await.unwrap();
+        let stored = lifecycle_action::Entity::find_by_id(&claim.action.id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, "pending");
+        assert_eq!(stored.attempts, 0);
+        assert!(stored.failure_class.is_none());
+        assert!(!super::waiting_for_transition(&stored));
+        assert!(stored.next_attempt_at >= before + Duration::seconds(30));
+        assert!(stored.next_attempt_at <= after + Duration::seconds(30));
+    }
+
+    #[tokio::test]
+    async fn unpublished_transition_gets_one_final_recovery_claim_at_the_attempt_cap() {
+        let db = setup().await;
+        let now = database_now(&db).await.unwrap();
+        let mut value = action(
+            "final-transition-row",
+            "final-transition",
+            now - Duration::seconds(1),
+        );
+        value.action_kind = LifecycleActionKind::TransitionCurrent;
+        value.idempotency_key = idempotency_key(&value).unwrap();
+        insert_idempotent(&db, value, now).await.unwrap();
+        let stored = lifecycle_action::Entity::find()
+            .filter(lifecycle_action::Column::TargetVersionRowId.eq("final-transition-row"))
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        insert_transition_saga(&db, &stored, "prepare").await;
+        lifecycle_action::Entity::update_many()
+            .col_expr(
+                lifecycle_action::Column::Attempts,
+                Expr::value(MAX_LIFECYCLE_ACTION_ATTEMPTS),
+            )
+            .filter(lifecycle_action::Column::TargetVersionRowId.eq("final-transition-row"))
+            .exec(&db)
+            .await
+            .unwrap();
+
+        let recovery = claim_due(&db, "recovery-worker", Duration::seconds(30), 1)
+            .await
+            .unwrap()
+            .pop()
+            .expect("transition must receive a final E2 settlement claim");
+        assert_eq!(recovery.action.attempts, MAX_LIFECYCLE_ACTION_ATTEMPTS + 1);
+
+        lifecycle_action::Entity::update_many()
+            .col_expr(
+                lifecycle_action::Column::LeaseUntil,
+                Expr::value(Some(
+                    database_now(&db).await.unwrap() - Duration::seconds(1),
+                )),
+            )
+            .filter(lifecycle_action::Column::Id.eq(&recovery.action.id))
+            .exec(&db)
+            .await
+            .unwrap();
+        let settlement_reclaim = claim_due(&db, "must-not-drop-saga", Duration::seconds(30), 1)
+            .await
+            .unwrap()
+            .pop()
+            .expect("final E2 settlement must remain reclaimable after a crash");
+        assert_eq!(
+            settlement_reclaim.action.attempts,
+            MAX_LIFECYCLE_ACTION_ATTEMPTS + 2
+        );
+        assert_eq!(settlement_reclaim.claim_epoch, recovery.claim_epoch + 1);
+    }
+
+    #[tokio::test]
+    async fn dependency_probe_failure_returns_to_the_ordinary_attempt_budget() {
+        use sea_orm::TransactionTrait;
+        let db = setup().await;
+        let now = database_now(&db).await.unwrap();
+        let mut value = action("waiting-row", "waiting", now - Duration::seconds(1));
+        value.idempotency_key = idempotency_key(&value).unwrap();
+        insert_idempotent(&db, value, now).await.unwrap();
+        let first = claim_due(&db, "worker", Duration::seconds(30), 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let txn = db.begin().await.unwrap();
+        assert!(
+            super::wait_for_transition_in_transaction(&txn, &first)
+                .await
+                .unwrap()
+        );
+        txn.commit().await.unwrap();
+        lifecycle_action::Entity::update_many()
+            .col_expr(
+                lifecycle_action::Column::NextAttemptAt,
+                Expr::value(now - Duration::seconds(1)),
+            )
+            .filter(lifecycle_action::Column::Id.eq(&first.action.id))
+            .exec(&db)
+            .await
+            .unwrap();
+        let probe = claim_due(&db, "worker", Duration::seconds(30), 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(probe.action.attempts, 0);
+        let now = database_now(&db).await.unwrap();
+        assert!(
+            schedule_retry(
+                &db,
+                &probe,
+                now,
+                now + Duration::seconds(1),
+                super::FAILURE_DATABASE_CONTENTION
+            )
+            .await
+            .unwrap()
+        );
+        let stored = lifecycle_action::Entity::find_by_id(&first.action.id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.attempts, 1);
+        assert!(!super::waiting_for_transition(&stored));
+        lifecycle_action::Entity::update_many()
+            .col_expr(
+                lifecycle_action::Column::NextAttemptAt,
+                Expr::value(now - Duration::seconds(1)),
+            )
+            .filter(lifecycle_action::Column::Id.eq(&first.action.id))
+            .exec(&db)
+            .await
+            .unwrap();
+        let next = claim_due(&db, "worker", Duration::seconds(30), 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(next.action.attempts, 2);
     }
 
     #[tokio::test]

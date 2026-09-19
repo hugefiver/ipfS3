@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use bytes::Bytes;
-use futures_util::{Stream, StreamExt, TryStreamExt};
+use futures_util::{Stream, StreamExt};
 use s3s::dto::*;
 use s3s::{S3Request, S3Response, S3Result};
 
@@ -485,7 +485,6 @@ struct AuthenticatedSseCObject {
     key: Arc<crate::crypto::ObjectKey>,
     key_md5: String,
     fingerprint: String,
-    legacy_plaintext: Option<Vec<u8>>,
 }
 
 enum CopySourceSseCAuthentication {
@@ -516,17 +515,15 @@ fn verify_object_sse_c_fingerprint(
     Ok(())
 }
 
-async fn collect_legacy_sse_c_plaintext(
-    state: &Arc<AppState>,
+async fn authenticate_legacy_sse_c_plaintext(
+    read_client: &crate::kubo::KuboClient,
     obj: &crate::store::entities::object::Model,
     key: Arc<crate::crypto::ObjectKey>,
-    collect_plaintext: bool,
-) -> S3Result<Option<Vec<u8>>> {
-    let cat = crate::kubo::cat::stream_cat(&state.kubo, &obj.cid, None).await?;
+) -> S3Result<()> {
+    let cat = crate::kubo::cat::stream_cat(read_client, &obj.cid, None).await?;
     let decrypted = crate::crypto::chunker::decrypt_chunk_stream(cat, key);
     tokio::pin!(decrypted);
     let mut observed = 0_i64;
-    let mut plaintext = collect_plaintext.then(Vec::new);
     while let Some(chunk) = decrypted.next().await {
         let chunk = chunk.map_err(|error| match error {
             crate::error::AppError::Crypto(_) => {
@@ -540,21 +537,18 @@ async fn collect_legacy_sse_c_plaintext(
         observed = observed
             .checked_add(len)
             .ok_or_else(|| s3s::s3_error!(AccessDenied, "SSE-C object size mismatch"))?;
-        if let Some(plaintext) = plaintext.as_mut() {
-            plaintext.extend_from_slice(&chunk);
-        }
     }
     if observed == 0 || observed != obj.size {
         return Err(s3s::s3_error!(AccessDenied, "SSE-C object size mismatch"));
     }
-    Ok(plaintext)
+    Ok(())
 }
 
 async fn authenticate_sse_c_object(
     state: &Arc<AppState>,
     obj: &crate::store::entities::object::Model,
+    read_client: &crate::kubo::KuboClient,
     headers: ValidatedSseCHeaders,
-    collect_legacy_plaintext: bool,
 ) -> S3Result<AuthenticatedSseCObject> {
     if let Some(fingerprint) = obj.sse_c_key_fingerprint.as_deref() {
         verify_object_sse_c_fingerprint(state, fingerprint, &headers.key)?;
@@ -562,13 +556,11 @@ async fn authenticate_sse_c_object(
             key: Arc::new(headers.key),
             key_md5: headers.key_md5,
             fingerprint: fingerprint.to_owned(),
-            legacy_plaintext: None,
         });
     }
 
     let key = Arc::new(headers.key);
-    let plaintext =
-        collect_legacy_sse_c_plaintext(state, obj, key.clone(), collect_legacy_plaintext).await?;
+    authenticate_legacy_sse_c_plaintext(read_client, obj, key.clone()).await?;
     let candidate = state.master_key.sse_c_key_fingerprint(&key);
     let claimed =
         crate::store::object::claim_sse_c_key_fingerprint(state.store.db(), &obj.id, &candidate)
@@ -585,20 +577,108 @@ async fn authenticate_sse_c_object(
         key,
         key_md5: headers.key_md5,
         fingerprint,
-        legacy_plaintext: plaintext,
     })
+}
+
+fn encrypted_object_body<S>(
+    cat: S,
+    key: Arc<crate::crypto::ObjectKey>,
+    range: Option<(u64, u64)>,
+    authentication_error: &'static str,
+) -> StreamingBlob
+where
+    S: Stream<Item = Result<Bytes, std::io::Error>> + Send + Sync + Unpin + 'static,
+{
+    let stream = async_stream::stream! {
+        let decrypted = crate::crypto::chunker::decrypt_chunk_stream(cat, key);
+        tokio::pin!(decrypted);
+        let mut plaintext_offset = 0_u64;
+        // For ranges, retaining only the final selected slice ensures fixed
+        // Content-Length cannot complete until every later cipher chunk has
+        // authenticated. `Bytes::slice` retains at most one plaintext chunk.
+        let mut pending_selected = None;
+        while let Some(chunk) = decrypted.next().await {
+            let bytes = match chunk {
+                Ok(bytes) => bytes,
+                Err(crate::error::AppError::Crypto(_)) => {
+                    yield Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        authentication_error,
+                    ));
+                    return;
+                }
+                Err(_) => {
+                    yield Err(std::io::Error::other(
+                        crate::error::INTERNAL_STORAGE_BACKEND_ERROR,
+                    ));
+                    return;
+                }
+            };
+            let chunk_len = match u64::try_from(bytes.len()) {
+                Ok(chunk_len) => chunk_len,
+                Err(_) => {
+                    yield Err(std::io::Error::other("decrypted object size exceeds limit"));
+                    return;
+                }
+            };
+            let chunk_end = match plaintext_offset.checked_add(chunk_len) {
+                Some(chunk_end) => chunk_end,
+                None => {
+                    yield Err(std::io::Error::other("decrypted object size exceeds limit"));
+                    return;
+                }
+            };
+
+            if let Some((start, end)) = range {
+                let selected_start = start.max(plaintext_offset);
+                let selected_end = end.min(chunk_end);
+                if selected_start < selected_end {
+                    let local_start = (selected_start - plaintext_offset) as usize;
+                    let local_end = (selected_end - plaintext_offset) as usize;
+                    let selected = bytes.slice(local_start..local_end);
+                    if let Some(previous) = pending_selected.replace(selected) {
+                        yield Ok(previous);
+                    }
+                }
+            } else {
+                yield Ok(bytes);
+            }
+            plaintext_offset = chunk_end;
+        }
+
+        if let Some((_, end)) = range
+            && plaintext_offset < end
+        {
+            yield Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "requested range exceeds available decrypted data",
+            ));
+            return;
+        }
+        if let Some(final_selected) = pending_selected {
+            yield Ok(final_selected);
+        }
+    };
+    StreamingBlob::wrap(stream)
 }
 
 // ---------------------------------------------------------------------------
 // Operations
 // ---------------------------------------------------------------------------
 
+struct SelectedS3Object {
+    object: object::Model,
+    public_version_id: Option<String>,
+    residency: crate::residency::ResolvedVersionResidency,
+    read_client: crate::kubo::KuboClient,
+}
+
 async fn select_s3_object(
     state: &Arc<AppState>,
     bucket: &str,
     key: &str,
     version_id: Option<&str>,
-) -> S3Result<(object::Model, Option<String>)> {
+) -> S3Result<SelectedS3Object> {
     let selector = match version_id {
         Some(version_id) => VersionSelector::Exact(PublicVersionId::parse_s3(version_id)?),
         None => VersionSelector::Current,
@@ -617,11 +697,30 @@ async fn select_s3_object(
             let object = resolved.object.ok_or_else(|| {
                 s3s::s3_error!(InternalError, "object version index is missing its object")
             })?;
+            let residency =
+                crate::store::residency::resolve_version_residency(db, &resolved.id).await?;
+            if residency.identity.object_id != object.id || residency.identity.cid != object.cid {
+                return Err(s3s::s3_error!(
+                    InternalError,
+                    "selected object does not match its immutable version residency"
+                ));
+            }
+            let read_client = crate::residency::router::TierClients {
+                hot: &state.kubo,
+                cold: state.cold_kubo.as_ref(),
+            }
+            .resolve_read_source(&residency)
+            .await?;
             let public_version_id = (crate::store::bucket::get_versioning_state(db, bucket)
                 .await?
                 != BucketVersioningState::Unversioned)
                 .then_some(resolved.public_version_id);
-            Ok((object, public_version_id))
+            Ok(SelectedS3Object {
+                object,
+                public_version_id,
+                residency,
+                read_client,
+            })
         }
     }
 }
@@ -630,6 +729,7 @@ pub async fn put_object(
     state: &Arc<AppState>,
     req: S3Request<PutObjectInput>,
 ) -> S3Result<S3Response<PutObjectOutput>> {
+    super::storage_class::require_standard_write(req.input.storage_class.as_ref())?;
     let bucket = &req.input.bucket;
     let key = &req.input.key;
     let content_type = req.input.content_type.clone();
@@ -767,15 +867,22 @@ pub async fn get_object(
 ) -> S3Result<S3Response<GetObjectOutput>> {
     let bucket = &req.input.bucket;
     let key = &req.input.key;
-    let (obj, version_id) =
-        select_s3_object(state, bucket, key, req.input.version_id.as_deref()).await?;
+    let selected = select_s3_object(state, bucket, key, req.input.version_id.as_deref()).await?;
+    let obj = selected.object;
+    let version_id = selected.public_version_id;
+    let storage_class = StorageClass::from_static(selected.residency.storage_class.as_db_str());
 
     let has_range = req.input.range.is_some();
     let is_sse_c = obj.encrypted && obj.key_wrap.is_none();
     let mut sse_c_auth = if is_sse_c {
         Some(
-            authenticate_sse_c_object(state, &obj, extract_sse_c_headers(&req.headers)?, has_range)
-                .await?,
+            authenticate_sse_c_object(
+                state,
+                &obj,
+                &selected.read_client,
+                extract_sse_c_headers(&req.headers)?,
+            )
+            .await?,
         )
     } else {
         None
@@ -802,86 +909,31 @@ pub async fn get_object(
                 sse_c_auth.take().ok_or_else(|| {
                     s3s::s3_error!(InternalError, "missing authenticated SSE-C object key")
                 })?,
-                state,
+                selected.read_client,
                 start,
                 end,
                 has_range,
                 sse_customer_key_md5,
                 version_id,
+                storage_class,
             )
             .await;
         };
 
         let ok_arc = Arc::new(ok);
+        let cat = crate::kubo::cat::stream_cat(&selected.read_client, &obj.cid, None).await?;
 
-        if has_range {
-            // Encrypted objects are chunked, so we cannot ask Kubo for a byte
-            // range directly. Collect the decrypted plaintext and slice it.
-            // (MVP trade-off: v0.9 will optimize to chunk-level Range.)
-            let cat_stream = crate::kubo::cat::stream_cat(&state.kubo, &obj.cid, None).await?;
-            let decrypted = crate::crypto::chunker::decrypt_chunk_stream(cat_stream, ok_arc);
-            let chunks: Vec<Bytes> = decrypted.try_collect().await.map_err(|e| match e {
-                crate::error::AppError::Crypto(_) => s3s::s3_error!(
-                    AccessDenied,
-                    "decryption failed — SSE-C key may not match the key used during upload"
-                ),
-                error @ crate::error::AppError::KuboRpc { .. } => error.into(),
-                other => s3s::s3_error!(InternalError, "decrypt: {other}"),
-            })?;
-            let mut collected = Vec::with_capacity(chunks.iter().map(Bytes::len).sum());
-            for chunk in chunks {
-                collected.extend_from_slice(&chunk);
-            }
-
-            let s = start as usize;
-            let e = (end as usize).min(collected.len());
-            if s > e {
-                return Err(s3s::s3_error!(
-                    InvalidRange,
-                    "requested range exceeds available decrypted data"
-                ));
-            }
-            let sliced = collected[s..e].to_vec();
-            let stream =
-                futures_util::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(sliced))]);
-            StreamingBlob::wrap(stream)
-        } else {
-            // No Range: stream decrypted plaintext directly without collecting.
-            // Clone KuboClient + cid + ObjectKey into the 'static stream.
-            let kubo = state.kubo.clone();
-            let cid = obj.cid.clone();
-            let ok_clone = ok_arc.clone();
-            let stream = async_stream::stream! {
-                let cat = crate::kubo::cat::stream_cat(&kubo, &cid, None)
-                    .await
-                    .map_err(|_| std::io::Error::other(crate::error::INTERNAL_STORAGE_BACKEND_ERROR))?;
-                let decrypted = crate::crypto::chunker::decrypt_chunk_stream(cat, ok_clone);
-                let mut s = Box::pin(decrypted);
-                while let Some(chunk) = s.next().await {
-                    match chunk {
-                        Ok(b) => yield Ok(b),
-                        Err(crate::error::AppError::Crypto(_)) => {
-                            yield Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "decryption failed — SSE-C key mismatch"));
-                        }
-                        Err(_) => {
-                            yield Err(std::io::Error::other(
-                                crate::error::INTERNAL_STORAGE_BACKEND_ERROR,
-                            ));
-                        }
-                    }
-                }
-            };
-            StreamingBlob::wrap(stream)
-        }
+        encrypted_object_body(
+            cat,
+            ok_arc,
+            has_range.then_some((start, end)),
+            "decryption failed",
+        )
     } else {
         // Plaintext: stream directly from Kubo without collecting into memory.
-        let kubo = state.kubo.clone();
-        let cid = obj.cid.clone();
         let kubo_range = if has_range { Some((start, end)) } else { None };
+        let cat = crate::kubo::cat::stream_cat(&selected.read_client, &obj.cid, kubo_range).await?;
         let stream = async_stream::stream! {
-            let cat = crate::kubo::cat::stream_cat(&kubo, &cid, kubo_range)
-                .await
-                .map_err(|_| std::io::Error::other(crate::error::INTERNAL_STORAGE_BACKEND_ERROR))?;
             tokio::pin!(cat);
             while let Some(chunk) = cat.next().await {
                 yield chunk;
@@ -890,6 +942,7 @@ pub async fn get_object(
         StreamingBlob::wrap(stream)
     };
 
+    let body = super::object_body::finish_get_body(body, end.saturating_sub(start)).await?;
     let content_length = end.saturating_sub(start) as i64;
     let content_range = if has_range {
         Some(format!(
@@ -918,6 +971,7 @@ pub async fn get_object(
         server_side_encryption,
         metadata: restore_metadata(&obj.metadata),
         version_id,
+        storage_class: Some(storage_class),
         ..Default::default()
     }))
 }
@@ -925,77 +979,27 @@ pub async fn get_object(
 #[allow(clippy::too_many_arguments)]
 async fn build_sse_c_get_response(
     obj: &crate::store::entities::object::Model,
-    mut auth: AuthenticatedSseCObject,
-    state: &Arc<AppState>,
+    auth: AuthenticatedSseCObject,
+    read_client: crate::kubo::KuboClient,
     start: u64,
     end: u64,
     has_range: bool,
     sse_customer_key_md5: Option<String>,
     version_id: Option<String>,
+    storage_class: StorageClass,
 ) -> S3Result<S3Response<GetObjectOutput>> {
-    let body = if has_range {
-        let plaintext = if let Some(plaintext) = auth.legacy_plaintext.take() {
-            plaintext
-        } else {
-            let cat = crate::kubo::cat::stream_cat(&state.kubo, &obj.cid, None).await?;
-            let decrypted = crate::crypto::chunker::decrypt_chunk_stream(cat, auth.key.clone());
-            let chunks: Vec<Bytes> =
-                decrypted.try_collect().await.map_err(|error| match error {
-                    crate::error::AppError::Crypto(_) => {
-                        s3s::s3_error!(AccessDenied, "SSE-C object authentication failed")
-                    }
-                    error @ crate::error::AppError::KuboRpc { .. } => error.into(),
-                    other => s3s::s3_error!(InternalError, "decrypt: {other}"),
-                })?;
-            let mut plaintext = Vec::with_capacity(chunks.iter().map(Bytes::len).sum());
-            for chunk in chunks {
-                plaintext.extend_from_slice(&chunk);
-            }
-            plaintext
-        };
-        let start = usize::try_from(start)
-            .map_err(|_| s3s::s3_error!(InvalidRange, "range start is too large"))?;
-        let end = usize::try_from(end)
-            .map_err(|_| s3s::s3_error!(InvalidRange, "range end is too large"))?;
-        if end > plaintext.len() || start > end {
-            return Err(s3s::s3_error!(
-                InvalidRange,
-                "requested range exceeds available decrypted data"
-            ));
-        }
-        StreamingBlob::wrap(futures_util::stream::iter(vec![
-            Ok::<Bytes, std::io::Error>(Bytes::copy_from_slice(&plaintext[start..end])),
-        ]))
-    } else {
-        // A legacy object's first request authenticated one complete cat above;
-        // use a second cat here so the successful no-range response stays streaming.
-        let kubo = state.kubo.clone();
-        let cid = obj.cid.clone();
-        let key = auth.key;
-        let stream = async_stream::stream! {
-            let cat = crate::kubo::cat::stream_cat(&kubo, &cid, None)
-                .await
-                .map_err(|_| std::io::Error::other(crate::error::INTERNAL_STORAGE_BACKEND_ERROR))?;
-            let decrypted = crate::crypto::chunker::decrypt_chunk_stream(cat, key);
-            tokio::pin!(decrypted);
-            while let Some(chunk) = decrypted.next().await {
-                match chunk {
-                    Ok(bytes) => yield Ok(bytes),
-                    Err(crate::error::AppError::Crypto(_)) => {
-                        yield Err(std::io::Error::new(
-                            std::io::ErrorKind::PermissionDenied,
-                            "SSE-C object authentication failed",
-                        ));
-                        return;
-                    }
-                    Err(_) => yield Err(std::io::Error::other(
-                        crate::error::INTERNAL_STORAGE_BACKEND_ERROR,
-                    )),
-                }
-            }
-        };
-        StreamingBlob::wrap(stream)
-    };
+    // Legacy SSE-C objects were fully authenticated before reaching this
+    // response. The response still uses a fresh streaming read so ranges never
+    // require retaining the whole plaintext in memory.
+    let cat = crate::kubo::cat::stream_cat(&read_client, &obj.cid, None).await?;
+    let body = encrypted_object_body(
+        cat,
+        auth.key,
+        has_range.then_some((start, end)),
+        "SSE-C object authentication failed",
+    );
+
+    let body = super::object_body::finish_get_body(body, end.saturating_sub(start)).await?;
 
     let content_length = end.saturating_sub(start) as i64;
     let content_range =
@@ -1011,6 +1015,7 @@ async fn build_sse_c_get_response(
         sse_customer_key_md5,
         metadata: restore_metadata(&obj.metadata),
         version_id,
+        storage_class: Some(storage_class),
         ..Default::default()
     }))
 }
@@ -1021,12 +1026,19 @@ pub async fn head_object(
 ) -> S3Result<S3Response<HeadObjectOutput>> {
     let bucket = &req.input.bucket;
     let key = &req.input.key;
-    let (obj, version_id) =
-        select_s3_object(state, bucket, key, req.input.version_id.as_deref()).await?;
+    let selected = select_s3_object(state, bucket, key, req.input.version_id.as_deref()).await?;
+    let obj = selected.object;
+    let version_id = selected.public_version_id;
+    let storage_class = StorageClass::from_static(selected.residency.storage_class.as_db_str());
     let sse_c_auth = if obj.encrypted && obj.key_wrap.is_none() {
         Some(
-            authenticate_sse_c_object(state, &obj, extract_sse_c_headers(&req.headers)?, false)
-                .await?,
+            authenticate_sse_c_object(
+                state,
+                &obj,
+                &selected.read_client,
+                extract_sse_c_headers(&req.headers)?,
+            )
+            .await?,
         )
     } else {
         None
@@ -1052,6 +1064,7 @@ pub async fn head_object(
         sse_customer_key_md5: sse_c_auth.map(|auth| auth.key_md5),
         metadata: restore_metadata(&obj.metadata),
         version_id,
+        storage_class: Some(storage_class),
         ..Default::default()
     }))
 }
@@ -1267,6 +1280,7 @@ pub async fn copy_object(
     state: &Arc<AppState>,
     req: S3Request<CopyObjectInput>,
 ) -> S3Result<S3Response<CopyObjectOutput>> {
+    super::storage_class::require_standard_write(req.input.storage_class.as_ref())?;
     let dst_bucket = &req.input.bucket;
     let dst_key = &req.input.key;
     let db = state.store.db();
@@ -1286,8 +1300,10 @@ pub async fn copy_object(
         }
     };
 
-    let (src_obj, copy_source_version_id) =
+    let selected_source =
         select_s3_object(state, &src_bucket, &src_key, src_version_id.as_deref()).await?;
+    let src_obj = selected_source.object;
+    let copy_source_version_id = selected_source.public_version_id;
     let tags = copy_publication_tags(state, &src_obj.id, &req.headers).await?;
 
     // Validate destination bucket exists.
@@ -1340,15 +1356,37 @@ pub async fn copy_object(
     let verified_source_fingerprint = match source_sse_c_authentication {
         Some(CopySourceSseCAuthentication::StoredFingerprint(fingerprint)) => Some(fingerprint),
         Some(CopySourceSseCAuthentication::Legacy(headers)) => Some(
-            authenticate_sse_c_object(state, &src_obj, headers, false)
+            authenticate_sse_c_object(state, &src_obj, &selected_source.read_client, headers)
                 .await?
                 .fingerprint,
         ),
         None => None,
     };
 
-    // Re-pin the (content-addressed) CID so the copy is independently pinned.
-    crate::kubo::pin::pin_add(&state.kubo, &src_obj.cid).await?;
+    let hot_receipt = match selected_source.residency.primary.tier {
+        crate::residency::KuboTier::Hot => {
+            // The source is already local to the publication tier. Re-pin its
+            // content-addressed root before creating the independent owner.
+            crate::kubo::pin::pin_add(&state.kubo, &src_obj.cid).await?;
+            None
+        }
+        crate::residency::KuboTier::Cold => {
+            // A hot pin request is not a transport primitive: the hot node may
+            // be deliberately disconnected from cold. Copy and verify the
+            // exact encrypted/plain DAG before publishing a STANDARD owner.
+            Some(
+                crate::kubo::tier_copy::stream_copy_verified(
+                    &selected_source.read_client,
+                    &state.kubo,
+                    &src_obj.cid,
+                    selected_source.residency.physical.node_identity.as_deref(),
+                    None,
+                    &tokio_util::sync::CancellationToken::new(),
+                )
+                .await?,
+            )
+        }
+    };
 
     let new_id = uuid::Uuid::new_v4().to_string();
     let object_created_at = chrono::Utc::now();
@@ -1366,21 +1404,36 @@ pub async fn copy_object(
         object_created_at,
     );
     object.multipart = src_obj.multipart;
-    let publication_result = crate::store::pinning::publication::publish_standard_object(
-        db,
-        PublicationRequest {
-            object,
-            tags: policy.tags.clone(),
-            policy,
-            object_target: PinTargetSpec {
-                cid: src_obj.cid.clone(),
-                logical_size: src_obj.size,
-            },
+    let publication = PublicationRequest {
+        object,
+        tags: policy.tags.clone(),
+        policy,
+        object_target: PinTargetSpec {
+            cid: src_obj.cid.clone(),
+            logical_size: src_obj.size,
         },
-        mutation_guard,
-        state.pinning.provider_limits(),
-    )
-    .await?;
+    };
+    let publication_result = match hot_receipt {
+        Some(receipt) => {
+            crate::store::pinning::publication::publish_standard_object_with_hot_receipt(
+                db,
+                publication,
+                mutation_guard,
+                receipt,
+                state.pinning.provider_limits(),
+            )
+            .await?
+        }
+        None => {
+            crate::store::pinning::publication::publish_standard_object(
+                db,
+                publication,
+                mutation_guard,
+                state.pinning.provider_limits(),
+            )
+            .await?
+        }
+    };
 
     Ok(S3Response::new(CopyObjectOutput {
         copy_object_result: Some(CopyObjectResult {
@@ -1508,7 +1561,19 @@ pub(crate) fn project_optional_listing_field(
     value.map(|value| project_listing_field(&value, url_encode))
 }
 
-fn listing_dtos(entries: &[ListingEntry], url_encode: bool) -> (Vec<Object>, Vec<CommonPrefix>) {
+async fn listing_dtos(
+    state: &Arc<AppState>,
+    entries: &[ListingEntry],
+    url_encode: bool,
+) -> S3Result<(Vec<Object>, Vec<CommonPrefix>)> {
+    let objects = entries
+        .iter()
+        .filter_map(|entry| match entry {
+            ListingEntry::Object(model) => Some(model),
+            ListingEntry::CommonPrefix { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    let classes = super::storage_class::classes_for_objects(state.store.db(), &objects).await?;
     let mut contents = Vec::new();
     let mut common_prefixes = Vec::new();
 
@@ -1519,6 +1584,9 @@ fn listing_dtos(entries: &[ListingEntry], url_encode: bool) -> (Vec<Object>, Vec
                 size: Some(model.size),
                 e_tag: Some(ETag::Strong(model.etag.clone())),
                 last_modified: Some(Timestamp::from(SystemTime::from(model.created_at))),
+                storage_class: Some(ObjectStorageClass::from_static(
+                    classes[&model.id].as_db_str(),
+                )),
                 ..Default::default()
             }),
             ListingEntry::CommonPrefix { prefix, .. } => common_prefixes.push(CommonPrefix {
@@ -1527,7 +1595,7 @@ fn listing_dtos(entries: &[ListingEntry], url_encode: bool) -> (Vec<Object>, Vec
         }
     }
 
-    (contents, common_prefixes)
+    Ok((contents, common_prefixes))
 }
 
 pub async fn list_objects(
@@ -1556,7 +1624,7 @@ pub async fn list_objects(
         .is_truncated
         .then(|| page.next_cursor.clone())
         .flatten();
-    let (contents, common_prefixes) = listing_dtos(&page.entries, url_encode);
+    let (contents, common_prefixes) = listing_dtos(state, &page.entries, url_encode).await?;
 
     Ok(S3Response::new(ListObjectsOutput {
         name: Some(bucket),
@@ -1603,7 +1671,7 @@ pub async fn list_objects_v2(
         },
     )
     .await?;
-    let (contents, common_prefixes) = listing_dtos(&page.entries, url_encode);
+    let (contents, common_prefixes) = listing_dtos(state, &page.entries, url_encode).await?;
 
     Ok(S3Response::new(ListObjectsV2Output {
         contents: Some(contents),
@@ -1768,14 +1836,16 @@ impl ListingPage {
 mod tests {
     use super::*;
     use crate::store::entities::{
-        object, object_tag, object_version, pin_job, pin_lease, pin_lease_target,
-        pin_provider_usage, remote_pin,
+        object, object_tag, object_version, physical_residency, pin_job, pin_lease,
+        pin_lease_target, pin_provider_usage, remote_pin, version_residency,
     };
     use chrono::Utc;
     use sea_orm::{
-        ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
-        TransactionTrait,
+        ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, IntoActiveModel,
+        PaginatorTrait, QueryFilter, QueryOrder, Set, TransactionTrait,
     };
+
+    mod copy_hot_receipt_tests;
 
     async fn test_state(kubo_uri: String) -> Arc<AppState> {
         use sea_orm::Database;
@@ -1785,6 +1855,7 @@ mod tests {
 
         Arc::new(AppState {
             kubo: crate::kubo::KuboClient::new(kubo_uri),
+            cold_kubo: None,
             store: crate::store::Store::new(db),
             credentials: HashMap::new(),
             master_key: crate::crypto::key::MasterKey::from_hex(
@@ -1849,6 +1920,16 @@ mod tests {
         provider_mode: &str,
         prefix: &str,
     ) -> Arc<AppState> {
+        pinning_state_with_cold(kubo_uri, None, trigger, provider_mode, prefix).await
+    }
+
+    async fn pinning_state_with_cold(
+        kubo_uri: String,
+        cold_kubo_uri: Option<String>,
+        trigger: &str,
+        provider_mode: &str,
+        prefix: &str,
+    ) -> Arc<AppState> {
         use sea_orm::Database;
 
         let db = Database::connect("sqlite::memory:").await.unwrap();
@@ -1862,6 +1943,7 @@ mod tests {
 
         Arc::new(AppState {
             kubo: crate::kubo::KuboClient::new(kubo_uri.clone()),
+            cold_kubo: cold_kubo_uri.map(crate::kubo::KuboClient::new),
             store: crate::store::Store::new(db),
             credentials: HashMap::new(),
             master_key: crate::crypto::key::MasterKey::from_hex(
@@ -2049,6 +2131,21 @@ mod tests {
             .await;
     }
 
+    async fn mount_node_identity(kubo: &wiremock::MockServer, node_identity: &str) {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+
+        Mock::given(method("POST"))
+            .and(path("/api/v0/id"))
+            .and(query_param("peerid-base", "b58mh"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(format!(r#"{{"ID":"{node_identity}"}}"#)),
+            )
+            .mount(kubo)
+            .await;
+    }
+
     async fn read_get_body(response: S3Response<GetObjectOutput>) -> Vec<u8> {
         let mut body = response.output.body.expect("GetObject body");
         let mut bytes = Vec::new();
@@ -2064,6 +2161,32 @@ mod tests {
         object_id: &str,
         key: &str,
         cid: &str,
+        encrypted: bool,
+        key_wrap: Option<String>,
+        sse_c_key_fingerprint: Option<String>,
+        tags: Vec<crate::pinning::tags::ObjectTag>,
+    ) -> PublicationResult {
+        publish_versioned_read_object_with_size(
+            state,
+            object_id,
+            key,
+            cid,
+            4,
+            encrypted,
+            key_wrap,
+            sse_c_key_fingerprint,
+            tags,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_versioned_read_object_with_size(
+        state: &Arc<AppState>,
+        object_id: &str,
+        key: &str,
+        cid: &str,
+        size: i64,
         encrypted: bool,
         key_wrap: Option<String>,
         sse_c_key_fingerprint: Option<String>,
@@ -2087,7 +2210,7 @@ mod tests {
                     "bucket",
                     key,
                     cid.to_owned(),
-                    4,
+                    size,
                     Some("text/plain".to_owned()),
                     None,
                     encrypted,
@@ -2099,13 +2222,71 @@ mod tests {
                 policy,
                 object_target: PinTargetSpec {
                     cid: cid.to_owned(),
-                    logical_size: 4,
+                    logical_size: size,
                 },
             },
             state.pinning.provider_limits(),
         )
         .await
         .unwrap()
+    }
+
+    async fn move_version_to_verified_cold(
+        state: &Arc<AppState>,
+        key: &str,
+        public_version_id: Option<&str>,
+        node_identity: &str,
+    ) {
+        let mut query = object_version::Entity::find()
+            .filter(object_version::Column::Bucket.eq("bucket"))
+            .filter(object_version::Column::Key.eq(key));
+        query = match public_version_id {
+            Some("null") | None => query.filter(object_version::Column::VersionId.is_null()),
+            Some(version_id) => query.filter(object_version::Column::VersionId.eq(version_id)),
+        };
+        let version = query
+            .one(state.store.db())
+            .await
+            .unwrap()
+            .expect("selected object version");
+        let object_id = version.object_id.expect("content version object owner");
+        let object = object::Entity::find_by_id(&object_id)
+            .one(state.store.db())
+            .await
+            .unwrap()
+            .expect("content object");
+        let now = Utc::now();
+        let receipt = serde_json::to_string(&crate::kubo::LocalResidencyVerificationReceipt {
+            node_identity: node_identity.to_owned(),
+            cid: object.cid.clone(),
+        })
+        .unwrap();
+
+        physical_residency::Entity::insert(physical_residency::ActiveModel {
+            tier: Set("cold".to_owned()),
+            cid: Set(object.cid.clone()),
+            node_identity: Set(Some(node_identity.to_owned())),
+            verification_state: Set("verified".to_owned()),
+            verification_receipt: Set(Some(receipt)),
+            verified_at: Set(Some(now)),
+            created_at: Set(now),
+            updated_at: Set(now),
+        })
+        .exec(state.store.db())
+        .await
+        .unwrap();
+
+        let residency = version_residency::Entity::find_by_id(&version.id)
+            .one(state.store.db())
+            .await
+            .unwrap()
+            .expect("version residency");
+        let mut residency = residency.into_active_model();
+        residency.primary_tier = Set("cold".to_owned());
+        residency.storage_class = Set("STANDARD_IA".to_owned());
+        residency.revision = Set(2);
+        residency.updated_at = Set(now);
+        residency.update(state.store.db()).await.unwrap();
     }
 
     async fn install_current_marker(state: &Arc<AppState>, key: &str) -> String {
@@ -2440,9 +2621,622 @@ mod tests {
         assert_eq!(error.code().as_str(), "InternalError");
     }
 
+    const COLD_NODE_ID: &str = "QmYwAPJzv5CZsnAzt8auVTL7VYhESWDFoCPTqCkiP6fKGE";
+    const TEST_CID: &str = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
+    const TEST_CID_ALT: &str = "bafkreigh2akiscaildc6ii5zji4bq7kly5k3s7svv6q2wx2nn5rtj5xuu4";
+
+    #[tokio::test]
+    async fn current_and_exact_version_reads_use_their_immutable_residency() {
+        let hot = wiremock::MockServer::start().await;
+        let cold = wiremock::MockServer::start().await;
+        mount_node_identity(&cold, COLD_NODE_ID).await;
+        let state =
+            pinning_state_with_cold(hot.uri(), Some(cold.uri()), "request", "one", "").await;
+        crate::store::bucket::set_versioning_state(
+            state.store.db(),
+            "bucket",
+            BucketVersioningState::Enabled,
+        )
+        .await
+        .unwrap();
+
+        let historical = publish_versioned_read_object(
+            &state,
+            "tiered-old",
+            "tiered.txt",
+            TEST_CID,
+            false,
+            None,
+            None,
+            Vec::new(),
+        )
+        .await;
+        let historical_version = historical.version_id.expect("historical version ID");
+        publish_versioned_read_object(
+            &state,
+            "tiered-current",
+            "tiered.txt",
+            TEST_CID_ALT,
+            false,
+            None,
+            None,
+            Vec::new(),
+        )
+        .await;
+        move_version_to_verified_cold(
+            &state,
+            "tiered.txt",
+            Some(&historical_version),
+            COLD_NODE_ID,
+        )
+        .await;
+        mount_cat_body(&hot, TEST_CID_ALT, b"new!".to_vec()).await;
+        mount_cat_body(&cold, TEST_CID, b"old!".to_vec()).await;
+
+        let current = get_object(
+            &state,
+            get_object_request("tiered.txt", None, http::HeaderMap::new()),
+        )
+        .await
+        .expect("current hot read");
+        assert_eq!(read_get_body(current).await, b"new!");
+
+        let historical = get_object(
+            &state,
+            get_object_request(
+                "tiered.txt",
+                Some(&historical_version),
+                http::HeaderMap::new(),
+            ),
+        )
+        .await
+        .expect("historical cold read");
+        assert_eq!(read_get_body(historical).await, b"old!");
+
+        let hot_requests = hot.received_requests().await.unwrap();
+        assert_eq!(
+            hot_requests
+                .iter()
+                .filter(|request| request.url.path() == "/api/v0/cat")
+                .count(),
+            1
+        );
+        let cold_requests = cold.received_requests().await.unwrap();
+        assert_eq!(
+            cold_requests
+                .iter()
+                .filter(|request| request.url.path() == "/api/v0/cat")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_null_version_can_read_from_cold_without_hot_fallback() {
+        let hot = wiremock::MockServer::start().await;
+        let cold = wiremock::MockServer::start().await;
+        mount_node_identity(&cold, COLD_NODE_ID).await;
+        let state =
+            pinning_state_with_cold(hot.uri(), Some(cold.uri()), "request", "one", "").await;
+        crate::store::bucket::set_versioning_state(
+            state.store.db(),
+            "bucket",
+            BucketVersioningState::Suspended,
+        )
+        .await
+        .unwrap();
+        publish_versioned_read_object(
+            &state,
+            "tiered-null",
+            "null.txt",
+            TEST_CID,
+            false,
+            None,
+            None,
+            Vec::new(),
+        )
+        .await;
+        move_version_to_verified_cold(&state, "null.txt", Some("null"), COLD_NODE_ID).await;
+        mount_cat_body(&cold, TEST_CID, b"null".to_vec()).await;
+
+        let response = get_object(
+            &state,
+            get_object_request("null.txt", Some("null"), http::HeaderMap::new()),
+        )
+        .await
+        .expect("explicit null cold read");
+        assert_eq!(response.output.version_id.as_deref(), Some("null"));
+        assert_eq!(read_get_body(response).await, b"null");
+        assert!(
+            hot.received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.url.path() != "/api/v0/cat")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cold_read_failure_never_falls_back_to_hot() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let hot = wiremock::MockServer::start().await;
+        let cold = wiremock::MockServer::start().await;
+        mount_node_identity(&cold, COLD_NODE_ID).await;
+        let state =
+            pinning_state_with_cold(hot.uri(), Some(cold.uri()), "request", "one", "").await;
+        publish_versioned_read_object(
+            &state,
+            "cold-failure",
+            "cold-failure.txt",
+            TEST_CID,
+            false,
+            None,
+            None,
+            Vec::new(),
+        )
+        .await;
+        move_version_to_verified_cold(&state, "cold-failure.txt", None, COLD_NODE_ID).await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/cat"))
+            .and(query_param("arg", TEST_CID))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&cold)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/cat"))
+            .and(query_param("arg", TEST_CID))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hot!"))
+            .expect(0)
+            .mount(&hot)
+            .await;
+
+        let error = get_object(
+            &state,
+            get_object_request("cold-failure.txt", None, http::HeaderMap::new()),
+        )
+        .await
+        .expect_err("cat establishment must fail before response headers");
+        assert_eq!(error.code().as_str(), "InternalError");
+    }
+
+    #[tokio::test]
+    async fn cold_sse_s3_and_sse_c_gets_use_cold_for_full_and_range_reads() {
+        let hot = wiremock::MockServer::start().await;
+        let cold = wiremock::MockServer::start().await;
+        mount_node_identity(&cold, COLD_NODE_ID).await;
+        let state =
+            pinning_state_with_cold(hot.uri(), Some(cold.uri()), "request", "one", "").await;
+
+        let sse_s3_key = state.master_key.generate_object_key();
+        publish_versioned_read_object(
+            &state,
+            "cold-sse-s3",
+            "cold-sse-s3.bin",
+            TEST_CID,
+            true,
+            Some(state.master_key.wrap(&sse_s3_key).unwrap()),
+            None,
+            Vec::new(),
+        )
+        .await;
+        move_version_to_verified_cold(&state, "cold-sse-s3.bin", None, COLD_NODE_ID).await;
+        mount_cat_body(
+            &cold,
+            TEST_CID,
+            crate::crypto::aes_gcm::encrypt_chunk(&sse_s3_key, &[4; 12], b"cold")
+                .unwrap()
+                .to_vec(),
+        )
+        .await;
+
+        let sse_c_key = crate::crypto::ObjectKey { bytes: [0x42; 32] };
+        publish_versioned_read_object(
+            &state,
+            "cold-sse-c",
+            "cold-sse-c.bin",
+            TEST_CID_ALT,
+            true,
+            None,
+            Some(state.master_key.sse_c_key_fingerprint(&sse_c_key)),
+            Vec::new(),
+        )
+        .await;
+        move_version_to_verified_cold(&state, "cold-sse-c.bin", None, COLD_NODE_ID).await;
+        mount_cat_body(
+            &cold,
+            TEST_CID_ALT,
+            crate::crypto::aes_gcm::encrypt_chunk(&sse_c_key, &[5; 12], b"cold")
+                .unwrap()
+                .to_vec(),
+        )
+        .await;
+
+        for (key, headers) in [
+            ("cold-sse-s3.bin", http::HeaderMap::new()),
+            ("cold-sse-c.bin", valid_sse_c_headers()),
+        ] {
+            let full = get_object(&state, get_object_request(key, None, headers.clone()))
+                .await
+                .expect("cold encrypted full read");
+            assert_eq!(read_get_body(full).await, b"cold");
+
+            let mut range_request = get_object_request(key, None, headers);
+            range_request.input.range = Some(Range::Int {
+                first: 1,
+                last: Some(2),
+            });
+            let range = get_object(&state, range_request)
+                .await
+                .expect("cold encrypted range read");
+            assert_eq!(range.output.content_length, Some(2));
+            assert_eq!(range.output.content_range.as_deref(), Some("bytes 1-2/4"));
+            assert_eq!(read_get_body(range).await, b"ol");
+        }
+
+        assert!(
+            hot.received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.url.path() != "/api/v0/cat")
+        );
+        let requests = cold.received_requests().await.unwrap();
+        let cats: Vec<_> = requests
+            .iter()
+            .filter(|request| request.url.path() == "/api/v0/cat")
+            .collect();
+        assert_eq!(cats.len(), 4);
+        for request in cats {
+            assert!(
+                request
+                    .url
+                    .query_pairs()
+                    .any(|(key, value)| key == "offline" && value == "true")
+            );
+            assert!(
+                request
+                    .url
+                    .query_pairs()
+                    .all(|(key, _)| key != "offset" && key != "length"),
+                "encrypted Range still decrypts full ciphertext before slicing"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn encrypted_range_streams_selected_bytes_and_drains_tail_authentication() {
+        let hot = wiremock::MockServer::start().await;
+        let state = pinning_state(hot.uri(), "request", "one", "").await;
+        let key = state.master_key.generate_object_key();
+        let first_plaintext = vec![0x5a; crate::crypto::chunker::CHUNK_SIZE];
+        let mut ciphertext =
+            crate::crypto::aes_gcm::encrypt_chunk(&key, &[1; 12], &first_plaintext)
+                .unwrap()
+                .to_vec();
+        let mut corrupt_tail = crate::crypto::aes_gcm::encrypt_chunk(&key, &[2; 12], b"tail")
+            .unwrap()
+            .to_vec();
+        *corrupt_tail.last_mut().unwrap() ^= 0xff;
+        ciphertext.extend_from_slice(&corrupt_tail);
+        let object_size = i64::try_from(first_plaintext.len() + 4).unwrap();
+        publish_versioned_read_object_with_size(
+            &state,
+            "encrypted-range-drain",
+            "encrypted-range.bin",
+            TEST_CID,
+            object_size,
+            true,
+            Some(state.master_key.wrap(&key).unwrap()),
+            None,
+            Vec::new(),
+        )
+        .await;
+        mount_cat_body(&hot, TEST_CID, ciphertext).await;
+        let mut request = get_object_request("encrypted-range.bin", None, http::HeaderMap::new());
+        request.input.range = Some(Range::Int {
+            first: 0,
+            last: Some(3),
+        });
+
+        let response = get_object(&state, request)
+            .await
+            .expect("encrypted range response");
+        let mut body = response.output.body.expect("encrypted range body");
+        let tail_error = body
+            .next()
+            .await
+            .expect("the unselected tail must be authenticated before the final selected bytes")
+            .expect_err("corrupt tail must fail before completing Content-Length");
+        assert_eq!(
+            tail_error
+                .downcast_ref::<std::io::Error>()
+                .expect("stream error retains I/O kind")
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(body.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn encrypted_cat_establishment_failure_is_an_s3_error_before_response_headers() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let hot = wiremock::MockServer::start().await;
+        let state = pinning_state(hot.uri(), "request", "one", "").await;
+        let key = state.master_key.generate_object_key();
+        publish_versioned_read_object(
+            &state,
+            "encrypted-preheader-failure",
+            "encrypted-preheader-failure.bin",
+            TEST_CID,
+            true,
+            Some(state.master_key.wrap(&key).unwrap()),
+            None,
+            Vec::new(),
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/cat"))
+            .and(query_param("arg", TEST_CID))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&hot)
+            .await;
+
+        let error = get_object(
+            &state,
+            get_object_request(
+                "encrypted-preheader-failure.bin",
+                None,
+                http::HeaderMap::new(),
+            ),
+        )
+        .await
+        .expect_err("encrypted cat failure must precede S3 response construction");
+        assert_eq!(error.code().as_str(), "InternalError");
+    }
+
+    #[tokio::test]
+    async fn legacy_sse_c_head_authenticates_against_the_selected_cold_client() {
+        let hot = wiremock::MockServer::start().await;
+        let cold = wiremock::MockServer::start().await;
+        mount_node_identity(&cold, COLD_NODE_ID).await;
+        let state =
+            pinning_state_with_cold(hot.uri(), Some(cold.uri()), "request", "one", "").await;
+        let key = crate::crypto::ObjectKey { bytes: [0x42; 32] };
+        publish_versioned_read_object(
+            &state,
+            "legacy-cold-head",
+            "legacy-cold-head.bin",
+            TEST_CID,
+            true,
+            None,
+            None,
+            Vec::new(),
+        )
+        .await;
+        move_version_to_verified_cold(&state, "legacy-cold-head.bin", None, COLD_NODE_ID).await;
+        mount_cat_body(
+            &cold,
+            TEST_CID,
+            crate::crypto::aes_gcm::encrypt_chunk(&key, &[3; 12], b"body")
+                .unwrap()
+                .to_vec(),
+        )
+        .await;
+
+        let response = head_object(
+            &state,
+            head_object_request("legacy-cold-head.bin", None, valid_sse_c_headers()),
+        )
+        .await
+        .expect("legacy SSE-C HEAD authenticates against cold");
+        let requests = cold.received_requests().await.unwrap();
+        let cats: Vec<_> = requests
+            .iter()
+            .filter(|request| request.url.path() == "/api/v0/cat")
+            .collect();
+        assert_eq!(cats.len(), 1);
+        assert!(
+            cats[0]
+                .url
+                .query_pairs()
+                .any(|(key, value)| key == "offline" && value == "true"),
+            "legacy SSE-C authentication also requires local-only cold bytes"
+        );
+        assert_eq!(
+            response.output.sse_customer_algorithm.as_deref(),
+            Some("AES256")
+        );
+        assert!(
+            hot.received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.url.path() != "/api/v0/cat")
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_reads_reject_online_only_bytes_in_every_encryption_mode() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+
+        for mode in ["plain", "sse-s3", "sse-c", "legacy-sse-c"] {
+            let hot = wiremock::MockServer::start().await;
+            let cold = wiremock::MockServer::start().await;
+            mount_node_identity(&cold, COLD_NODE_ID).await;
+            let state =
+                pinning_state_with_cold(hot.uri(), Some(cold.uri()), "request", "one", "").await;
+            let key = crate::crypto::ObjectKey { bytes: [0x42; 32] };
+            publish_versioned_read_object(
+                &state,
+                "online-only",
+                "online-only.bin",
+                TEST_CID,
+                mode != "plain",
+                (mode == "sse-s3").then(|| state.master_key.wrap(&key).unwrap()),
+                (mode == "sse-c").then(|| state.master_key.sse_c_key_fingerprint(&key)),
+                Vec::new(),
+            )
+            .await;
+            move_version_to_verified_cold(&state, "online-only.bin", None, COLD_NODE_ID).await;
+            let online_bytes = if mode == "plain" {
+                b"body".to_vec()
+            } else {
+                crate::crypto::aes_gcm::encrypt_chunk(&key, &[3; 12], b"body")
+                    .unwrap()
+                    .to_vec()
+            };
+            // A normal online cat could retrieve these from another peer.
+            mount_cat_body(&cold, TEST_CID, online_bytes).await;
+            Mock::given(method("POST"))
+                .and(path("/api/v0/cat"))
+                .and(query_param("offline", "true"))
+                .respond_with(ResponseTemplate::new(500).set_body_string("block missing locally"))
+                .with_priority(1)
+                .expect(1)
+                .mount(&cold)
+                .await;
+            let headers = if matches!(mode, "sse-c" | "legacy-sse-c") {
+                valid_sse_c_headers()
+            } else {
+                http::HeaderMap::new()
+            };
+            let error = get_object(&state, get_object_request("online-only.bin", None, headers))
+                .await
+                .expect_err("cold must not silently retrieve blocks via swarm");
+            assert_eq!(error.code().as_str(), "InternalError", "mode={mode}");
+            assert!(hot.received_requests().await.unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn copy_from_cold_streams_and_verifies_the_source_dag_into_hot_before_publication() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+
+        const CID: &str = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
+        const HOT_NODE_ID: &str = "QmPChd2hVbrJ6i1a7aDPgS6G9X4YuJ5sS7cGqf6ZkK3vYq";
+
+        let hot = wiremock::MockServer::start().await;
+        let cold = wiremock::MockServer::start().await;
+        mount_node_identity(&cold, COLD_NODE_ID).await;
+        mount_node_identity(&hot, HOT_NODE_ID).await;
+        let state =
+            pinning_state_with_cold(hot.uri(), Some(cold.uri()), "request", "one", "").await;
+        publish_versioned_read_object(
+            &state,
+            "cold-copy-source",
+            "cold-copy-source.bin",
+            CID,
+            false,
+            None,
+            None,
+            Vec::new(),
+        )
+        .await;
+        move_version_to_verified_cold(&state, "cold-copy-source.bin", None, COLD_NODE_ID).await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/v0/dag/export"))
+            .and(query_param("arg", CID))
+            .and(query_param("offline", "true"))
+            .and(query_param("progress", "false"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"faithful-car-bytes"))
+            .expect(1)
+            .mount(&cold)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/dag/import"))
+            .and(query_param("pin-roots", "true"))
+            .and(query_param("stats", "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "{{\"Root\":{{\"Cid\":{{\"/\":\"{CID}\"}},\"PinErrorMsg\":\"\"}}}}\n{{\"Stats\":{{\"BlockCount\":1,\"BlockBytesCount\":18}}}}\n"
+            )))
+            .expect(1)
+            .mount(&hot)
+            .await;
+        for kubo in [&cold, &hot] {
+            Mock::given(method("POST"))
+                .and(path("/api/v0/pin/ls"))
+                .and(query_param("arg", CID))
+                .and(query_param("type", "recursive"))
+                .and(query_param("offline", "true"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_string(format!(
+                        r#"{{"Keys":{{"{CID}":{{"Type":"recursive"}}}}}}"#
+                    )),
+                )
+                .expect(2)
+                .mount(kubo)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/api/v0/files/stat"))
+                .and(query_param("arg", format!("/ipfs/{CID}")))
+                .and(query_param("with-local", "true"))
+                .and(query_param("offline", "true"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                    r#"{{"Hash":"{CID}","WithLocality":true,"Local":true}}"#
+                )))
+                .expect(1)
+                .mount(kubo)
+                .await;
+        }
+
+        let response = copy_object(
+            &state,
+            copy_request_version(
+                "cold-copy-source.bin",
+                None,
+                "hot-copy-destination.bin",
+                http::HeaderMap::new(),
+            ),
+        )
+        .await
+        .expect("verified cold-to-hot CopyObject");
+        assert_eq!(
+            response
+                .output
+                .copy_object_result
+                .as_ref()
+                .and_then(|result| result.e_tag.as_ref())
+                .map(ETag::value),
+            Some(CID)
+        );
+        let destination = crate::store::object::get_latest(
+            state.store.db(),
+            "bucket",
+            "hot-copy-destination.bin",
+        )
+        .await
+        .unwrap();
+        assert_eq!(destination.cid, CID);
+
+        let hot_requests = hot.received_requests().await.unwrap();
+        let import = hot_requests
+            .iter()
+            .find(|request| request.url.path() == "/api/v0/dag/import")
+            .expect("hot import request");
+        assert!(
+            String::from_utf8_lossy(&import.body).contains("faithful-car-bytes"),
+            "the actual cold CAR stream must feed the hot import"
+        );
+        assert!(
+            hot_requests
+                .iter()
+                .all(|request| request.url.path() != "/api/v0/pin/add"),
+            "cold CopyObject must not substitute a hot pin request for transport"
+        );
+    }
+
     #[tokio::test]
     async fn get_and_head_current_content_return_public_version() {
-        let (state, _kubo) = versioned_read_state().await;
+        let (state, kubo) = versioned_read_state().await;
         publish_versioned_read_object(
             &state,
             "current-old",
@@ -2466,6 +3260,7 @@ mod tests {
         )
         .await;
         let current_version = current.version_id.expect("versioned current ID");
+        mount_cat_body(&kubo, "QmCurrentNew", b"body".to_vec()).await;
 
         let get = get_object(
             &state,
@@ -2524,6 +3319,7 @@ mod tests {
             Vec::new(),
         )
         .await;
+        mount_cat_body(&kubo, "QmPlainOld", b"old!".to_vec()).await;
 
         let sse_s3_old_key = state.master_key.generate_object_key();
         let sse_s3_old = publish_versioned_read_object(
@@ -3063,6 +3859,7 @@ mod tests {
 
         Arc::new(AppState {
             kubo,
+            cold_kubo: None,
             store,
             credentials,
             master_key,

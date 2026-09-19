@@ -1,0 +1,323 @@
+{
+  "run_id": "20260912T232251Z-be9bb993",
+  "phase": "regression",
+  "status": "FAIL",
+  "started_utc": "2026-09-12T23:22:51.7749521Z",
+  "steps": [
+    {
+      "name": "revision",
+      "command": "git rev-parse HEAD",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "dirty-paths",
+      "command": "git status --short",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "rust-version",
+      "command": "rustc --version --verbose",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "cargo-version",
+      "command": "cargo --version",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "docker-version",
+      "command": "docker version --format {{.Server.Version}}",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "cached-images",
+      "command": "docker image inspect postgres:17 ipfs/kubo:v0.43.0 amazon/aws-cli:latest --format {{.RepoTags}}",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "aws-version",
+      "command": "docker run --rm --pull=never amazon/aws-cli:latest --version",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "topology-up",
+      "command": "docker compose -f [REPO]\\tests\\compose.lifecycle-transition-validation.yml -p ipfs3-f1-20260912t232251z-be9bb993 up -d --pull never --wait --wait-timeout 90",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "hot-container",
+      "command": "docker compose -f [REPO]\\tests\\compose.lifecycle-transition-validation.yml -p ipfs3-f1-20260912t232251z-be9bb993 ps -q hot",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "cold-container",
+      "command": "docker compose -f [REPO]\\tests\\compose.lifecycle-transition-validation.yml -p ipfs3-f1-20260912t232251z-be9bb993 ps -q cold",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "hot-volume",
+      "command": "docker inspect [REDACTED_INTERNAL_ID] --format {{range .Mounts}}{{.Name}}{{end}}",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "cold-volume",
+      "command": "docker inspect [REDACTED_INTERNAL_ID] --format {{range .Mounts}}{{.Name}}{{end}}",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "postgres-version",
+      "command": "docker compose -f [REPO]\\tests\\compose.lifecycle-transition-validation.yml -p ipfs3-f1-20260912t232251z-be9bb993 exec -T postgres psql -U ipfs3 -d ipfs3 -Atc SHOW server_version",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "kubo-version",
+      "command": "docker compose -f [REPO]\\tests\\compose.lifecycle-transition-validation.yml -p ipfs3-f1-20260912t232251z-be9bb993 exec -T hot ipfs version",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "build-gateway",
+      "command": "cargo build --locked --offline --bin ipfs-s3-gateway",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "aws-signed-list-buckets",
+      "command": "docker run --rm --pull=never -e AWS_ACCESS_KEY_ID=test -e AWS_SECRET_ACCESS_KEY=[REDACTED] -e AWS_DEFAULT_REGION=us-east-1 amazon/aws-cli:latest --endpoint-url http://host.docker.internal:56849 s3api list-buckets",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "status": "NOT RUN",
+      "reason": "explicit resume",
+      "name": "postgres_residency",
+      "exit_code": null
+    },
+    {
+      "status": "NOT RUN",
+      "reason": "explicit resume",
+      "name": "postgres_residency_concurrency",
+      "exit_code": null
+    },
+    {
+      "status": "NOT RUN",
+      "reason": "explicit resume",
+      "name": "postgres_lifecycle_transition",
+      "exit_code": null
+    },
+    {
+      "status": "NOT RUN",
+      "reason": "explicit resume",
+      "name": "postgres_transition_saga",
+      "exit_code": null
+    },
+    {
+      "status": "NOT RUN",
+      "reason": "explicit resume",
+      "name": "postgres_lifecycle",
+      "exit_code": null
+    },
+    {
+      "name": "postgres_versioning",
+      "command": "cargo test --locked --offline --test postgres_versioning -- --nocapture --test-threads=1",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": [
+        {
+          "ignored": 0,
+          "passed": 31,
+          "failed": 0,
+          "filtered": 0
+        }
+      ]
+    },
+    {
+      "name": "postgres_cors",
+      "command": "cargo test --locked --offline --test postgres_cors -- --nocapture --test-threads=1",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": [
+        {
+          "ignored": 0,
+          "passed": 4,
+          "failed": 0,
+          "filtered": 0
+        }
+      ]
+    },
+    {
+      "name": "residency_publication-postgres_reuses_publication_and_delete_residency_scenarios",
+      "command": "cargo test --locked --offline --test residency_publication postgres_reuses_publication_and_delete_residency_scenarios -- --nocapture --test-threads=1 --ignored --exact",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": [
+        {
+          "ignored": 0,
+          "passed": 1,
+          "failed": 0,
+          "filtered": 5
+        }
+      ]
+    },
+    {
+      "name": "lib",
+      "command": "cargo test --locked --offline --lib",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": [
+        {
+          "ignored": 0,
+          "passed": 1118,
+          "failed": 0,
+          "filtered": 0
+        }
+      ]
+    },
+    {
+      "name": "integration",
+      "command": "cargo test --locked --offline --test integration -- --nocapture --test-threads=1",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": [
+        {
+          "ignored": 0,
+          "passed": 164,
+          "failed": 0,
+          "filtered": 0
+        }
+      ]
+    },
+    {
+      "name": "residency",
+      "command": "cargo test --locked --offline --test residency -- --nocapture --test-threads=1",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": [
+        {
+          "ignored": 0,
+          "passed": 10,
+          "failed": 0,
+          "filtered": 0
+        }
+      ]
+    },
+    {
+      "name": "lifecycle_transition_schema",
+      "command": "cargo test --locked --offline --test lifecycle_transition_schema -- --nocapture --test-threads=1",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": [
+        {
+          "ignored": 0,
+          "passed": 4,
+          "failed": 0,
+          "filtered": 0
+        }
+      ]
+    },
+    {
+      "name": "cors",
+      "command": "cargo test --locked --offline --test cors -- --nocapture --test-threads=1",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": [
+        {
+          "ignored": 0,
+          "passed": 8,
+          "failed": 0,
+          "filtered": 0
+        }
+      ]
+    },
+    {
+      "name": "residency_publication",
+      "command": "cargo test --locked --offline --test residency_publication -- --nocapture --test-threads=1",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": [
+        {
+          "ignored": 1,
+          "passed": 5,
+          "failed": 0,
+          "filtered": 0
+        }
+      ]
+    },
+    {
+      "name": "build-balancer",
+      "command": "cargo test --locked --offline --test lifecycle_transition_balancer --no-run --message-format=json",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "multi_gateway",
+      "command": "cargo test --locked --offline --test multi_gateway -- --nocapture --test-threads=1",
+      "exit_code": 101,
+      "status": "FAIL",
+      "counts": []
+    },
+    {
+      "name": "topology-logs",
+      "command": "docker compose -f [REPO]\\tests\\compose.lifecycle-transition-validation.yml -p ipfs3-f1-20260912t232251z-be9bb993 logs --no-color",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "topology-down",
+      "command": "docker compose -f [REPO]\\tests\\compose.lifecycle-transition-validation.yml -p ipfs3-f1-20260912t232251z-be9bb993 down --volumes --remove-orphans --timeout 10",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    }
+  ],
+  "topology": {
+    "swarm": "cold daemon --offline; hot supports CID-import provider discovery",
+    "cold_volume": "ipfs3-f1-20260912t232251z-be9bb993_cold_data",
+    "hot_volume": "ipfs3-f1-20260912t232251z-be9bb993_hot_data",
+    "load_balancer": "test-only TCP round robin",
+    "gateways": "two native production OS processes",
+    "cold_node": "12D3KooWQQnUTkRoUkH6ybNasPxjqTS1W93y4WmUWbywhPBCWU6R",
+    "hot_node": "12D3KooWE6sGy21NTReXUkbCd2MS9t6AWowAZC9AmUEzAimmwpwA",
+    "postgres_major": 17
+  },
+  "cleanup": [
+    "gateway-a: logs captured, process tree stopped",
+    "gateway-b: logs captured, process tree stopped",
+    "balancer: logs captured, process tree stopped",
+    "compose-owned containers/networks/volumes removed; label-scoped inventory empty"
+  ],
+  "remaining_gates": [],
+  "error": "multi_gateway exited 101; see multi_gateway.log",
+  "finished_utc": "2026-09-12T23:27:47.0148841Z"
+}

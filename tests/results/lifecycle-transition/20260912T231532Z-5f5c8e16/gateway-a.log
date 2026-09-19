@@ -1,0 +1,2 @@
+2026-09-12T23:15:58.354376Z  WARN ipfs_s3_gateway::kubo::routing: kubo rpc call failed operation="routing find providers" cid=bafybeid23x4i4s7zygfyhlp6crq3puhm3axf2eeuj7hlehmof6hy7pj6aq status=500
+

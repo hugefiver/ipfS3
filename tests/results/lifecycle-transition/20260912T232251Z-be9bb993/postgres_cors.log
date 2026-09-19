@@ -1,0 +1,15 @@
+
+running 4 tests
+test postgres_cors_delete_put_race_exposes_only_complete_snapshots ... ok
+test postgres_cors_migration_schema_timestamps_and_cascade_are_correct ... ok
+test postgres_cors_put_delete_race_exposes_only_complete_snapshots ... ok
+test postgres_cors_put_put_race_exposes_only_complete_snapshots ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.96s
+
+
+   Compiling ipfs-s3-gateway v0.1.0 ([REPO])
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.10s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests\postgres_cors.rs (target\debug\deps\postgres_cors-fd76e8115e16cbd4.exe)

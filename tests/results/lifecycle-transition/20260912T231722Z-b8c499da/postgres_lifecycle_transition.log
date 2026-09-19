@@ -1,0 +1,13 @@
+
+running 2 tests
+test postgres_fresh_schema_uses_timestamptz_and_creates_transition_foundation ... ok
+test postgres_upgrade_from_thirteen_preserves_ab_rows_and_updates_checks_in_place ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.99s
+
+
+   Compiling ipfs-s3-gateway v0.1.0 ([REPO])
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.15s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests\postgres_lifecycle_transition.rs (target\debug\deps\postgres_lifecycle_transition-076e2197f3265e4f.exe)

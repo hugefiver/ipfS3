@@ -1,0 +1,22 @@
+
+running 1 test
+test real_lifecycle_transition_integrity_nondefault_raw_leaf_import_to_ia ... FAILED
+
+failures:
+
+failures:
+    real_lifecycle_transition_integrity_nondefault_raw_leaf_import_to_ia
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.17s
+
+
+   Compiling ipfs-s3-gateway v0.1.0 ([REPO])
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.37s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests\lifecycle_transition.rs (target\debug\deps\lifecycle_transition-a3e8f421edadc602.exe)
+
+thread 'real_lifecycle_transition_integrity_nondefault_raw_leaf_import_to_ia' (47016) panicked at tests\support\lifecycle_transition_real_http.rs:433:5:
+assertion failed: body.contains("<State>pending</State>")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+error: test failed, to rerun pass `--test lifecycle_transition`

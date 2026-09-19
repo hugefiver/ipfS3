@@ -9,6 +9,7 @@ pub mod import;
 pub mod kubo;
 pub mod lifecycle;
 pub mod pinning;
+pub mod residency;
 pub mod s3;
 pub mod state;
 pub mod store;

@@ -1,0 +1,40 @@
+# Test-only, uniquely project-scoped resources. Cold is offline: no swarm repair.
+services:
+  postgres:
+    image: postgres:17
+    pull_policy: never
+    environment:
+      POSTGRES_DB: ipfs3
+      POSTGRES_USER: ipfs3
+      POSTGRES_PASSWORD: ${IPFS_S3_F1_PASSWORD:?required}
+    ports:
+      - "127.0.0.1:${IPFS_S3_F1_POSTGRES_PORT:?required}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "ipfs3", "-d", "ipfs3"]
+      interval: 1s
+      timeout: 5s
+      retries: 30
+  hot:
+    image: ipfs/kubo:v0.43.0
+    pull_policy: never
+    # CID imports perform provider discovery even for an already-local source.
+    # Null routing makes local-fixture discovery deterministic, without public DHT IO.
+    command: ["daemon", "--routing=none", "--migrate=true"]
+    ports:
+      - "127.0.0.1:${IPFS_S3_F1_HOT_PORT:?required}:5001"
+    volumes:
+      - hot_data:/data/ipfs
+  cold:
+    image: ipfs/kubo:v0.43.0
+    pull_policy: never
+    command: ["daemon", "--offline", "--migrate=true"]
+    ports:
+      - "127.0.0.1:${IPFS_S3_F1_COLD_PORT:?required}:5001"
+    volumes:
+      - cold_data:/data/ipfs
+volumes:
+  postgres_data:
+  hot_data:
+  cold_data:

@@ -4,6 +4,13 @@ bind = "0.0.0.0:9000"
 [kubo]
 rpc_url = "http://127.0.0.1:5001"
 
+# Optional independent cold Kubo for lifecycle STANDARD -> STANDARD_IA.
+# Disabled when this section and IPFS_S3_COLD_KUBO_RPC_URL are absent.
+# Use a different node identity and repository/volume, never a hot replica or
+# pinning provider. Keep its RPC private; all gateways must share tier bindings.
+# [cold_kubo]
+# rpc_url = "http://cold:5001"
+
 [storage]
 database_url = "sqlite:///data/ipfs-s3.db?mode=rwc"
 

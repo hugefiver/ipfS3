@@ -1,0 +1,12 @@
+
+running 1 test
+test postgres_transition_claim_fences_cover_lock_wait_stale_epoch_and_cleanup_reclaim ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.76s
+
+
+   Compiling ipfs-s3-gateway v0.1.0 ([REPO])
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.44s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests\postgres_transition_saga.rs (target\debug\deps\postgres_transition_saga-83b2e7e46372214b.exe)

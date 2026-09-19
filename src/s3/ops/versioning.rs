@@ -41,7 +41,11 @@ fn cursor_matches(version: &ResolvedVersion, cursor: &VersionCursor) -> bool {
         && version.public_version_id == cursor.public_version_id
 }
 
-fn content_dto(version: ResolvedVersion, url_encode: bool) -> Result<ObjectVersion, AppError> {
+fn content_dto(
+    version: ResolvedVersion,
+    storage_class: crate::residency::StorageClass,
+    url_encode: bool,
+) -> Result<ObjectVersion, AppError> {
     let object = version.object.ok_or_else(|| {
         AppError::Internal("content version is missing its immutable object".to_owned())
     })?;
@@ -56,7 +60,7 @@ fn content_dto(version: ResolvedVersion, url_encode: bool) -> Result<ObjectVersi
         restore_status: None,
         size: Some(object.size),
         storage_class: Some(ObjectVersionStorageClass::from_static(
-            ObjectVersionStorageClass::STANDARD,
+            storage_class.as_db_str(),
         )),
         version_id: Some(version.public_version_id),
     })
@@ -106,6 +110,11 @@ async fn build_version_listing_page(
         )
         .await?;
         let exhausted = rows.len() < VERSION_SCAN_BATCH_SIZE as usize;
+        let objects = rows
+            .iter()
+            .filter_map(|version| version.object.as_ref())
+            .collect::<Vec<_>>();
+        let classes = super::storage_class::classes_for_objects(state.store.db(), &objects).await?;
         let mut last_scanned = None;
 
         for version in rows {
@@ -152,7 +161,15 @@ async fn build_version_listing_page(
             }
             output_count += 1;
             match version.kind {
-                VersionKind::Object => versions.push(content_dto(version, url_encode)?),
+                VersionKind::Object => {
+                    let object = version.object.as_ref().ok_or_else(|| {
+                        AppError::Internal(
+                            "content version is missing its immutable object".to_owned(),
+                        )
+                    })?;
+                    let storage_class = classes[&object.id];
+                    versions.push(content_dto(version, storage_class, url_encode)?);
+                }
                 VersionKind::DeleteMarker => {
                     delete_markers.push(delete_marker_dto(version, url_encode));
                 }
@@ -327,6 +344,7 @@ mod tests {
         store::bucket::create(&db, "bucket", None).await.unwrap();
         Arc::new(AppState {
             kubo: crate::kubo::KuboClient::new("http://127.0.0.1:5001".to_owned()),
+            cold_kubo: None,
             store: store::Store::new(db),
             credentials: HashMap::new(),
             master_key: crate::crypto::key::MasterKey::from_hex(

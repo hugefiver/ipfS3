@@ -203,6 +203,7 @@ mod tests {
         store::bucket::create(&db, "bucket", None).await.unwrap();
         let state = Arc::new(AppState {
             kubo: crate::kubo::KuboClient::new("http://127.0.0.1:5001".to_owned()),
+            cold_kubo: None,
             store: store::Store::new(db),
             credentials: HashMap::new(),
             master_key: crate::crypto::key::MasterKey::from_hex(
@@ -622,7 +623,7 @@ mod tests {
     }
 
     #[test]
-    fn forbidden_future_actions_are_rejected_before_serialization() {
+    fn malformed_transition_actions_are_rejected_before_serialization() {
         for (field, future_action) in [
             ("transitions", json!([{}])),
             ("noncurrent_version_transitions", json!([{}])),
@@ -801,21 +802,25 @@ mod tests {
         );
     }
 }
+#[cfg(test)]
+#[path = "config/transition_tests.rs"]
+mod transition_tests;
 use std::collections::BTreeSet;
 use std::time::SystemTime;
 
 use chrono::{DateTime, Timelike, Utc};
 use s3s::dto::{
     BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule,
-    LifecycleRuleAndOperator, LifecycleRuleFilter, NoncurrentVersionExpiration, Tag, Timestamp,
-    TimestampFormat,
+    LifecycleRuleAndOperator, LifecycleRuleFilter, NoncurrentVersionExpiration,
+    NoncurrentVersionTransition, Tag, Timestamp, TimestampFormat, Transition,
+    TransitionStorageClass,
 };
 
 use crate::error::{AppError, AppResult};
 use crate::lifecycle::model::{
     AbortIncompleteMultipartUploadAction, CanonicalFilter, CanonicalLifecycleConfiguration,
     CanonicalLifecycleRule, CanonicalRuleSelector, CanonicalTag, CurrentExpiration,
-    LifecycleRuleStatus, NoncurrentExpiration,
+    CurrentTransition, LifecycleRuleStatus, NoncurrentExpiration, NoncurrentTransition,
 };
 
 const SCHEMA_VERSION: u8 = 1;
@@ -911,21 +916,39 @@ fn validate_canonical_rule(rule: &CanonicalLifecycleRule) -> AppResult<()> {
     }
 
     if let Some(noncurrent) = &rule.noncurrent_version_expiration {
-        if noncurrent.noncurrent_days == 0 {
-            return Err(invalid("noncurrent expiration days must be positive"));
+        validate_noncurrent_thresholds(
+            noncurrent.noncurrent_days,
+            noncurrent.newer_noncurrent_versions,
+            &rule.selector,
+            "noncurrent expiration days must be positive",
+        )?;
+    }
+
+    match &rule.transition {
+        Some(CurrentTransition::Date { utc_midnight })
+            if utc_midnight.hour() != 0
+                || utc_midnight.minute() != 0
+                || utc_midnight.second() != 0
+                || utc_midnight.nanosecond() != 0 =>
+        {
+            return Err(invalid("transition date must be UTC midnight"));
         }
-        if let Some(newer) = noncurrent.newer_noncurrent_versions {
-            if !(1..=100).contains(&newer) {
-                return Err(invalid(
-                    "newer noncurrent versions must be between 1 and 100",
-                ));
-            }
-            if !matches!(&rule.selector, CanonicalRuleSelector::Modern { .. }) {
-                return Err(invalid(
-                    "newer noncurrent versions requires an explicit modern Filter",
-                ));
-            }
+        Some(CurrentTransition::Days { days }) if *days == 0 => {
+            return Err(invalid("lifecycle transition days must be positive"));
         }
+        Some(CurrentTransition::Days { days }) if *days > i32::MAX as u32 => {
+            return Err(invalid("lifecycle transition days are out of range"));
+        }
+        Some(_) | None => {}
+    }
+
+    if let Some(noncurrent) = &rule.noncurrent_version_transition {
+        validate_noncurrent_thresholds(
+            noncurrent.noncurrent_days,
+            noncurrent.newer_noncurrent_versions,
+            &rule.selector,
+            "noncurrent transition days must be positive",
+        )?;
     }
 
     if let Some(abort) = &rule.abort_incomplete_multipart_upload {
@@ -950,6 +973,8 @@ fn validate_canonical_rule(rule: &CanonicalLifecycleRule) -> AppResult<()> {
 
     if rule.expiration.is_none()
         && rule.noncurrent_version_expiration.is_none()
+        && rule.transition.is_none()
+        && rule.noncurrent_version_transition.is_none()
         && rule.abort_incomplete_multipart_upload.is_none()
     {
         return Err(invalid("lifecycle rule requires a supported action"));
@@ -997,8 +1022,6 @@ fn validate_canonical_selector(selector: &CanonicalRuleSelector) -> AppResult<()
 }
 
 fn canonicalize_rule(rule: LifecycleRule) -> AppResult<CanonicalLifecycleRule> {
-    reject_future_actions(&rule)?;
-
     let status = match rule.status.as_str() {
         ExpirationStatus::ENABLED => LifecycleRuleStatus::Enabled,
         ExpirationStatus::DISABLED => LifecycleRuleStatus::Disabled,
@@ -1010,6 +1033,9 @@ fn canonicalize_rule(rule: LifecycleRule) -> AppResult<CanonicalLifecycleRule> {
         .noncurrent_version_expiration
         .map(|value| canonicalize_noncurrent_expiration(value, &selector))
         .transpose()?;
+    let transition = canonicalize_current_transition_list(rule.transitions)?;
+    let noncurrent_version_transition =
+        canonicalize_noncurrent_transition_list(rule.noncurrent_version_transitions, &selector)?;
 
     let abort_incomplete_multipart_upload = rule
         .abort_incomplete_multipart_upload
@@ -1042,20 +1068,10 @@ fn canonicalize_rule(rule: LifecycleRule) -> AppResult<CanonicalLifecycleRule> {
         selector,
         expiration,
         noncurrent_version_expiration,
+        transition,
+        noncurrent_version_transition,
         abort_incomplete_multipart_upload,
     })
-}
-
-fn reject_future_actions(rule: &LifecycleRule) -> AppResult<()> {
-    if rule.transitions.is_some() {
-        return Err(invalid("lifecycle transitions are not supported"));
-    }
-    if rule.noncurrent_version_transitions.is_some() {
-        return Err(invalid(
-            "noncurrent lifecycle transitions are not supported",
-        ));
-    }
-    Ok(())
 }
 
 fn canonicalize_selector(
@@ -1226,6 +1242,132 @@ fn canonicalize_noncurrent_expiration(
     })
 }
 
+fn canonicalize_current_transition_list(
+    transitions: Option<Vec<Transition>>,
+) -> AppResult<Option<CurrentTransition>> {
+    let Some(mut transitions) = transitions else {
+        return Ok(None);
+    };
+    if transitions.len() != 1 {
+        return Err(invalid(
+            "lifecycle Transition must contain exactly one step",
+        ));
+    }
+    canonicalize_current_transition(transitions.pop().expect("one transition")).map(Some)
+}
+
+fn canonicalize_current_transition(transition: Transition) -> AppResult<CurrentTransition> {
+    require_standard_ia(transition.storage_class)?;
+    match (transition.date, transition.days) {
+        (Some(date), None) => Ok(CurrentTransition::Date {
+            utc_midnight: transition_timestamp_to_utc(&date)?,
+        }),
+        (None, Some(days)) => Ok(CurrentTransition::Days {
+            days: positive_days(days, "lifecycle transition days must be positive")?,
+        }),
+        _ => Err(invalid(
+            "lifecycle Transition must contain exactly one of Date or Days",
+        )),
+    }
+}
+
+fn canonicalize_noncurrent_transition_list(
+    transitions: Option<Vec<NoncurrentVersionTransition>>,
+    selector: &CanonicalRuleSelector,
+) -> AppResult<Option<NoncurrentTransition>> {
+    let Some(mut transitions) = transitions else {
+        return Ok(None);
+    };
+    if transitions.len() != 1 {
+        return Err(invalid(
+            "NoncurrentVersionTransition must contain exactly one step",
+        ));
+    }
+    canonicalize_noncurrent_transition(
+        transitions.pop().expect("one noncurrent transition"),
+        selector,
+    )
+    .map(Some)
+}
+
+fn canonicalize_noncurrent_transition(
+    transition: NoncurrentVersionTransition,
+    selector: &CanonicalRuleSelector,
+) -> AppResult<NoncurrentTransition> {
+    require_standard_ia(transition.storage_class)?;
+    let noncurrent_days = transition
+        .noncurrent_days
+        .ok_or_else(|| invalid("noncurrent transition days are required"))?;
+    let noncurrent_days = positive_days(
+        noncurrent_days,
+        "noncurrent transition days must be positive",
+    )?;
+    let newer_noncurrent_versions =
+        canonicalize_newer_noncurrent_versions(transition.newer_noncurrent_versions, selector)?;
+    Ok(NoncurrentTransition {
+        noncurrent_days,
+        newer_noncurrent_versions,
+    })
+}
+
+fn require_standard_ia(storage_class: Option<TransitionStorageClass>) -> AppResult<()> {
+    let storage_class =
+        storage_class.ok_or_else(|| invalid("lifecycle transition storage class is required"))?;
+    if storage_class.as_str() != TransitionStorageClass::STANDARD_IA {
+        return Err(invalid(
+            "lifecycle transition storage class must be STANDARD_IA",
+        ));
+    }
+    Ok(())
+}
+
+fn canonicalize_newer_noncurrent_versions(
+    newer_noncurrent_versions: Option<i32>,
+    selector: &CanonicalRuleSelector,
+) -> AppResult<Option<u16>> {
+    match newer_noncurrent_versions {
+        None => Ok(None),
+        Some(value) if (1..=100).contains(&value) => {
+            if !matches!(selector, CanonicalRuleSelector::Modern { .. }) {
+                return Err(invalid(
+                    "newer noncurrent versions requires an explicit modern Filter",
+                ));
+            }
+            Ok(Some(value as u16))
+        }
+        Some(_) => Err(invalid(
+            "newer noncurrent versions must be between 1 and 100",
+        )),
+    }
+}
+
+fn validate_noncurrent_thresholds(
+    noncurrent_days: u32,
+    newer_noncurrent_versions: Option<u16>,
+    selector: &CanonicalRuleSelector,
+    days_message: &'static str,
+) -> AppResult<()> {
+    if noncurrent_days == 0 {
+        return Err(invalid(days_message));
+    }
+    if noncurrent_days > i32::MAX as u32 {
+        return Err(invalid("noncurrent lifecycle days are out of range"));
+    }
+    if let Some(newer) = newer_noncurrent_versions {
+        if !(1..=100).contains(&newer) {
+            return Err(invalid(
+                "newer noncurrent versions must be between 1 and 100",
+            ));
+        }
+        if !matches!(selector, CanonicalRuleSelector::Modern { .. }) {
+            return Err(invalid(
+                "newer noncurrent versions requires an explicit modern Filter",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn positive_days(value: i32, message: &'static str) -> AppResult<u32> {
     if value <= 0 {
         return Err(invalid(message));
@@ -1246,23 +1388,46 @@ fn selector_has_tag_filter(selector: &CanonicalRuleSelector) -> bool {
 }
 
 fn timestamp_to_utc(value: &Timestamp) -> AppResult<DateTime<Utc>> {
+    timestamp_to_utc_with_messages(
+        value,
+        "expiration date is invalid",
+        "expiration date must use UTC",
+        "expiration date must be UTC midnight",
+    )
+}
+
+fn transition_timestamp_to_utc(value: &Timestamp) -> AppResult<DateTime<Utc>> {
+    timestamp_to_utc_with_messages(
+        value,
+        "transition date is invalid",
+        "transition date must use UTC",
+        "transition date must be UTC midnight",
+    )
+}
+
+fn timestamp_to_utc_with_messages(
+    value: &Timestamp,
+    invalid_message: &'static str,
+    utc_message: &'static str,
+    midnight_message: &'static str,
+) -> AppResult<DateTime<Utc>> {
     let mut bytes = Vec::new();
     value
         .format(TimestampFormat::DateTime, &mut bytes)
-        .map_err(|_| invalid("expiration date is invalid"))?;
-    let text = std::str::from_utf8(&bytes).map_err(|_| invalid("expiration date is invalid"))?;
+        .map_err(|_| invalid(invalid_message))?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| invalid(invalid_message))?;
     let parsed = DateTime::parse_from_rfc3339(text)
         .map(|value| value.with_timezone(&Utc))
-        .map_err(|_| invalid("expiration date is invalid"))?;
+        .map_err(|_| invalid(invalid_message))?;
     if Timestamp::from(SystemTime::from(parsed)) != value.clone() {
-        return Err(invalid("expiration date must use UTC"));
+        return Err(invalid(utc_message));
     }
     if parsed.hour() != 0
         || parsed.minute() != 0
         || parsed.second() != 0
         || parsed.nanosecond() != 0
     {
-        return Err(invalid("expiration date must be UTC midnight"));
+        return Err(invalid(midnight_message));
     }
     Ok(parsed)
 }
@@ -1302,7 +1467,10 @@ fn project_rule(rule: &CanonicalLifecycleRule) -> AppResult<LifecycleRule> {
             .noncurrent_version_expiration
             .as_ref()
             .map(project_noncurrent_expiration),
-        noncurrent_version_transitions: None,
+        noncurrent_version_transitions: rule
+            .noncurrent_version_transition
+            .as_ref()
+            .map(|transition| vec![project_noncurrent_transition(transition)]),
         prefix: match &rule.selector {
             CanonicalRuleSelector::LegacyPrefix { prefix } => Some(prefix.clone()),
             CanonicalRuleSelector::Modern { .. } => None,
@@ -1315,7 +1483,13 @@ fn project_rule(rule: &CanonicalLifecycleRule) -> AppResult<LifecycleRule> {
                 ExpirationStatus::from_static(ExpirationStatus::DISABLED)
             }
         },
-        transitions: None,
+        transitions: rule
+            .transition
+            .as_ref()
+            .map(|transition| -> AppResult<Vec<Transition>> {
+                Ok(vec![project_transition(transition)?])
+            })
+            .transpose()?,
     })
 }
 
@@ -1378,5 +1552,36 @@ fn project_noncurrent_expiration(expiration: &NoncurrentExpiration) -> Noncurren
     NoncurrentVersionExpiration {
         newer_noncurrent_versions: expiration.newer_noncurrent_versions.map(i32::from),
         noncurrent_days: Some(expiration.noncurrent_days as i32),
+    }
+}
+
+fn project_transition(transition: &CurrentTransition) -> AppResult<Transition> {
+    let mut result = Transition {
+        storage_class: Some(TransitionStorageClass::from_static(
+            TransitionStorageClass::STANDARD_IA,
+        )),
+        ..Default::default()
+    };
+    match transition {
+        CurrentTransition::Date { utc_midnight } => {
+            result.date = Some(utc_to_timestamp(*utc_midnight));
+        }
+        CurrentTransition::Days { days } => {
+            result.days = Some(
+                i32::try_from(*days)
+                    .map_err(|_| invalid("lifecycle transition days are out of range"))?,
+            );
+        }
+    }
+    Ok(result)
+}
+
+fn project_noncurrent_transition(transition: &NoncurrentTransition) -> NoncurrentVersionTransition {
+    NoncurrentVersionTransition {
+        newer_noncurrent_versions: transition.newer_noncurrent_versions.map(i32::from),
+        noncurrent_days: Some(transition.noncurrent_days as i32),
+        storage_class: Some(TransitionStorageClass::from_static(
+            TransitionStorageClass::STANDARD_IA,
+        )),
     }
 }

@@ -110,6 +110,7 @@ mod tests {
             .unwrap();
         Arc::new(AppState {
             kubo: crate::kubo::KuboClient::new("http://127.0.0.1:5001".to_owned()),
+            cold_kubo: None,
             store: crate::store::Store::new(db),
             credentials: HashMap::new(),
             master_key: crate::crypto::key::MasterKey::from_hex(

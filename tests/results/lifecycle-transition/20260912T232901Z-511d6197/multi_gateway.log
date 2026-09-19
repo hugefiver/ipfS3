@@ -1,0 +1,75 @@
+
+running 28 tests
+test load_balancer_surviving_replica_crud ... ok
+test multi_gateway_cross_replica_contract ... ok
+test multi_gateway_lifecycle_abort_multipart_race_has_one_terminal_outcome ... ok
+test multi_gateway_lifecycle_cleanup_includes_delete_markers ... ok
+test multi_gateway_lifecycle_configuration_visible_across_replicas ... ok
+test multi_gateway_lifecycle_publication_action_race_has_one_terminal_outcome ... ok
+test support::import::test_import_worker_guard_drop_cancels_external_shutdown ... ok
+test support::lifecycle::lifecycle_transition_api::signed_no_cold_transition_rejection_is_atomic_and_get_delete_still_work ... ok
+test support::lifecycle::lifecycle_transition_api::signed_transition_put_get_accepts_supported_forms_only_with_cold_kubo ... ok
+test support::pinning::tests::psa_script_consumes_identical_get_signatures_in_script_order ... ok
+test support::pinning::tests::psa_script_does_not_consume_an_unmatched_reply ... ok
+test support::pinning::tests::psa_script_matches_reversed_submit_requests_by_cid ... ok
+test support::pinning::tests::psa_script_rejects_ambiguous_matches_without_consuming_them ... ok
+test support::sigv4::canonical_uri_omits_trailing_slash_for_bucket_operations ... ok
+test support::sigv4::presign_sigv4_query_includes_custom_query_before_signature ... ok
+test support::storage_class::signed_decompress_multipart_complete_rejects_nonstandard_class_before_side_effects ... ok
+test support::storage_class::signed_direct_writes_reject_nonstandard_class_before_side_effects ... ok
+test support::storage_class::signed_import_rejects_nonstandard_class_without_creating_jobs ... ok
+test support::storage_class::signed_standard_put_copy_and_multipart_remain_hot ... ok
+test support::tier_reads::reporting::concurrency::list_object_versions_keeps_one_storage_class_snapshot_during_publication ... ok
+test support::tier_reads::reporting::concurrency::list_objects_v1_keeps_one_storage_class_snapshot_during_publication ... ok
+test support::tier_reads::reporting::concurrency::list_objects_v2_keeps_one_storage_class_snapshot_during_publication ... ok
+test support::tier_reads::reporting::receipts::signed_lists_reject_cold_receipt_cid_mismatch_like_get_and_head ... ok
+test support::tier_reads::reporting::receipts::signed_lists_reject_cold_receipt_node_mismatch_like_get_and_head ... ok
+test support::tier_reads::reporting::receipts::signed_lists_reject_malformed_cold_receipt_like_get_and_head ... ok
+test support::tier_reads::reporting::signed_encrypted_get_and_head_report_class_without_mutating_envelopes ... ok
+test support::tier_reads::reporting::signed_object_and_version_lists_report_immutable_storage_classes ... ok
+test support::tier_reads::reporting::signed_plain_get_and_head_report_selected_version_storage_class ... ok
+
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.66s
+
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.85s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests\multi_gateway.rs (target\debug\deps\multi_gateway-6334a48ca5e0467d.exe)
+[LIFECYCLE-ABORT-MULTIPART-RACE-STAGE] test=multi_gateway_lifecycle_abort_multipart_race_has_one_terminal_outcome stage=bucket-created
+[LIFECYCLE-ABORT-MULTIPART-RACE-STAGE] test=multi_gateway_lifecycle_abort_multipart_race_has_one_terminal_outcome stage=multipart-upload-created
+[LIFECYCLE-ABORT-MULTIPART-RACE-STAGE] test=multi_gateway_lifecycle_abort_multipart_race_has_one_terminal_outcome stage=part-uploaded
+[LIFECYCLE-ABORT-MULTIPART-RACE-STAGE] test=multi_gateway_lifecycle_abort_multipart_race_has_one_terminal_outcome stage=lifecycle-configured
+[LIFECYCLE-ABORT-MULTIPART-RACE-STAGE] test=multi_gateway_lifecycle_abort_multipart_race_has_one_terminal_outcome stage=bucket-lock-acquired
+[LIFECYCLE-ABORT-MULTIPART-RACE-STAGE] test=multi_gateway_lifecycle_abort_multipart_race_has_one_terminal_outcome stage=upload-aged
+[LIFECYCLE-ABORT-MULTIPART-RACE-STAGE] test=multi_gateway_lifecycle_abort_multipart_race_has_one_terminal_outcome stage=claimed-action-observed
+[LIFECYCLE-ABORT-MULTIPART-RACE-STAGE] test=multi_gateway_lifecycle_abort_multipart_race_has_one_terminal_outcome stage=race-started
+[LIFECYCLE-ABORT-MULTIPART-RACE-STAGE] test=multi_gateway_lifecycle_abort_multipart_race_has_one_terminal_outcome stage=complete-request-dispatched
+[LIFECYCLE-ABORT-MULTIPART-RACE-STAGE] test=multi_gateway_lifecycle_abort_multipart_race_has_one_terminal_outcome stage=claimed-action-rechecked
+[LIFECYCLE-ABORT-MULTIPART-RACE-STAGE] test=multi_gateway_lifecycle_abort_multipart_race_has_one_terminal_outcome stage=bucket-lock-released
+[LIFECYCLE-ABORT-MULTIPART-RACE-STAGE] test=multi_gateway_lifecycle_abort_multipart_race_has_one_terminal_outcome stage=complete-response
+[LIFECYCLE-ABORT-MULTIPART-RACE-STAGE] test=multi_gateway_lifecycle_abort_multipart_race_has_one_terminal_outcome stage=terminal-wait-entered
+[LIFECYCLE-ABORT-MULTIPART-RACE-STAGE] test=multi_gateway_lifecycle_abort_multipart_race_has_one_terminal_outcome stage=terminal-state-evaluation
+[LIFECYCLE-ABORT-MULTIPART-RACE-STAGE] test=multi_gateway_lifecycle_abort_multipart_race_has_one_terminal_outcome stage=lifecycle-config-deleted
+[LIFECYCLE-ABORT-MULTIPART-RACE-STAGE] test=multi_gateway_lifecycle_abort_multipart_race_has_one_terminal_outcome stage=object-cleanup
+[LIFECYCLE-ABORT-MULTIPART-RACE-STAGE] test=multi_gateway_lifecycle_abort_multipart_race_has_one_terminal_outcome stage=bucket-delete
+[LIFECYCLE-RACE-STAGE] test=multi_gateway_lifecycle_publication_action_race_has_one_terminal_outcome stage=bucket-created
+[LIFECYCLE-RACE-STAGE] test=multi_gateway_lifecycle_publication_action_race_has_one_terminal_outcome stage=versioning-enabled
+[LIFECYCLE-RACE-STAGE] test=multi_gateway_lifecycle_publication_action_race_has_one_terminal_outcome stage=lifecycle-configured
+[LIFECYCLE-RACE-STAGE] test=multi_gateway_lifecycle_publication_action_race_has_one_terminal_outcome stage=predecessor-created
+[LIFECYCLE-RACE-STAGE] test=multi_gateway_lifecycle_publication_action_race_has_one_terminal_outcome stage=race-started
+[LIFECYCLE-RACE-STAGE] test=multi_gateway_lifecycle_publication_action_race_has_one_terminal_outcome stage=successor-request-dispatched
+[LIFECYCLE-RACE-STAGE] test=multi_gateway_lifecycle_publication_action_race_has_one_terminal_outcome stage=successor-request-complete
+[LIFECYCLE-RACE-STAGE] test=multi_gateway_lifecycle_publication_action_race_has_one_terminal_outcome stage=successor-response
+[LIFECYCLE-RACE-STAGE] test=multi_gateway_lifecycle_publication_action_race_has_one_terminal_outcome stage=observer-loop-entered
+[LIFECYCLE-RACE-STAGE] test=multi_gateway_lifecycle_publication_action_race_has_one_terminal_outcome stage=observer-get-response
+[LIFECYCLE-RACE-STAGE] test=multi_gateway_lifecycle_publication_action_race_has_one_terminal_outcome stage=observer-list-response
+[LIFECYCLE-RACE-STAGE] test=multi_gateway_lifecycle_publication_action_race_has_one_terminal_outcome stage=observer-list-status-ok
+[LIFECYCLE-RACE-STAGE] test=multi_gateway_lifecycle_publication_action_race_has_one_terminal_outcome stage=observer-successor-visible
+[LIFECYCLE-RACE-STAGE] test=multi_gateway_lifecycle_publication_action_race_has_one_terminal_outcome stage=successor-observed
+[LIFECYCLE-RACE-STAGE] test=multi_gateway_lifecycle_publication_action_race_has_one_terminal_outcome stage=lifecycle-config-deleted
+[LIFECYCLE-RACE-STAGE] test=multi_gateway_lifecycle_publication_action_race_has_one_terminal_outcome stage=terminal-wait-entered
+[LIFECYCLE-RACE-STAGE] test=multi_gateway_lifecycle_publication_action_race_has_one_terminal_outcome stage=terminal-state-evaluation
+[LIFECYCLE-RACE-STAGE] test=multi_gateway_lifecycle_publication_action_race_has_one_terminal_outcome stage=successor-read
+[LIFECYCLE-RACE-STAGE] test=multi_gateway_lifecycle_publication_action_race_has_one_terminal_outcome stage=version-cleanup
+[LIFECYCLE-RACE-STAGE] test=multi_gateway_lifecycle_publication_action_race_has_one_terminal_outcome stage=bucket-delete

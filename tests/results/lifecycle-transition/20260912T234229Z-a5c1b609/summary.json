@@ -1,0 +1,47 @@
+{
+  "run_id": "20260912T234229Z-a5c1b609",
+  "phase": "quality",
+  "status": "PARTIAL",
+  "started_utc": "2026-09-12T23:42:29.9811218Z",
+  "steps": [
+    {
+      "name": "runner-contracts",
+      "command": "pwsh -NoProfile -File [REPO]\\tests\\lifecycle-transition.Tests.ps1",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "fmt",
+      "command": "cargo fmt --check",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "clippy",
+      "command": "cargo clippy --locked --offline --all-targets -- -D warnings",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "rust-1.92",
+      "command": "cargo +1.92.0-x86_64-pc-windows-gnu check --locked --offline --all-targets",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    },
+    {
+      "name": "diff-check",
+      "command": "git diff --check",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": []
+    }
+  ],
+  "topology": {},
+  "cleanup": [],
+  "remaining_gates": [],
+  "finished_utc": "2026-09-12T23:42:37.1791632Z"
+}

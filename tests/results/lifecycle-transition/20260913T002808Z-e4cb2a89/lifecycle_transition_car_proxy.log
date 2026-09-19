@@ -1,0 +1,12 @@
+
+running 2 tests
+test lifecycle_transition_car_proxy ... ignored, long-lived test utility: parent runner must terminate the process
+test tests::counts_only_fragmented_car_file_part_bytes ... ok
+
+test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.74s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests\lifecycle_transition_car_proxy.rs (target\debug\deps\lifecycle_transition_car_proxy-bce0313acc562450.exe)

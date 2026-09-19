@@ -1,0 +1,5 @@
+
+running 1 test
+test lifecycle_transition_car_proxy has been running for over 60 seconds
+
+[LIFECYCLE-CAR-PROXY] ready bind=127.0.0.1:61675

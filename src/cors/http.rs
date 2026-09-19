@@ -523,6 +523,7 @@ mod tests {
         }
         Arc::new(AppState {
             kubo: KuboClient::new("http://127.0.0.1:1".to_owned()),
+            cold_kubo: None,
             store: Store::new(db),
             credentials: HashMap::new(),
             master_key: MasterKey::from_hex(&"0".repeat(64)).unwrap(),

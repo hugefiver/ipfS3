@@ -36,6 +36,7 @@ use super::decompress::{
     AddReply, KuboHarness, KuboScript, ObservedHttpRequest, S3ServerHandle, S3TestEndpoint,
     start_kubo_harness, start_s3_server,
 };
+use super::residency::assert_hot_standard_residency_invariant;
 
 const PINATA_TOKEN_ENV: &str = "TEST_PINATA_TOKEN";
 const FILEBASE_TOKEN_ENV: &str = "TEST_FILEBASE_TOKEN";
@@ -501,6 +502,7 @@ pub async fn start_pinning_harness(config: PinningHarnessConfig) -> PinningHarne
         .expect("create test bucket");
     let state = Arc::new(AppState {
         kubo: ipfs_s3_gateway::kubo::KuboClient::new(kubo.uri()),
+        cold_kubo: None,
         store: ipfs_s3_gateway::store::Store::new(db),
         credentials: HashMap::from([("test".to_owned(), s3s::auth::SecretKey::from("test"))]),
         master_key: ipfs_s3_gateway::crypto::key::MasterKey::from_hex(&"0".repeat(64))
@@ -899,6 +901,7 @@ impl PinningHarness {
         }
         self.pinata_script.assert_clean("Pinata");
         self.filebase_script.assert_clean("Filebase");
+        assert_hot_standard_residency_invariant(self.state.store.db()).await;
     }
 
     fn proxy_for_provider(&self, provider: &str) -> &ProviderProxy {

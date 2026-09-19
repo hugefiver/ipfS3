@@ -13,6 +13,9 @@ pub struct Config {
     #[serde(default = "default_kubo_config")]
     pub kubo: KuboConfig,
 
+    #[serde(default)]
+    pub cold_kubo: Option<KuboConfig>,
+
     #[serde(default = "default_storage_config")]
     pub storage: StorageConfig,
 
@@ -320,6 +323,7 @@ impl Config {
         Self {
             server: default_server_config(),
             kubo: default_kubo_config(),
+            cold_kubo: None,
             storage: default_storage_config(),
             auth: default_auth_config(),
             crypto: default_crypto_config(),
@@ -342,6 +346,7 @@ impl Config {
     /// 3. Individual environment variables:
     ///    - `IPFS_S3_BIND`
     ///    - `IPFS_S3_KUBO_RPC_URL`
+    ///    - `IPFS_S3_COLD_KUBO_RPC_URL` (optional independent node)
     ///    - `IPFS_S3_DATABASE_URL`
     ///    - `IPFS_S3_ACCESS_KEY_ID` + `IPFS_S3_SECRET_ACCESS_KEY` (together
     ///      replace the credentials list).
@@ -358,6 +363,7 @@ impl Config {
         };
 
         config.apply_env_overrides(|name| std::env::var(name).ok())?;
+        config.validate_kubo()?;
 
         Ok(config)
     }
@@ -371,6 +377,9 @@ impl Config {
         }
         if let Some(rpc_url) = get_env("IPFS_S3_KUBO_RPC_URL") {
             self.kubo.rpc_url = rpc_url;
+        }
+        if let Some(rpc_url) = get_env("IPFS_S3_COLD_KUBO_RPC_URL") {
+            self.cold_kubo = Some(KuboConfig { rpc_url });
         }
         if let Some(database_url) = get_env("IPFS_S3_DATABASE_URL") {
             self.storage.database_url = database_url;
@@ -416,6 +425,24 @@ impl Config {
 
         Ok(())
     }
+
+    pub(crate) fn validate_kubo(&self) -> anyhow::Result<()> {
+        for (config, message) in [
+            (Some(&self.kubo), "invalid hot Kubo RPC URL"),
+            (self.cold_kubo.as_ref(), "invalid cold Kubo RPC URL"),
+        ] {
+            if let Some(config) = config {
+                let valid = reqwest::Url::parse(&config.rpc_url).is_ok_and(|url| {
+                    matches!(url.scheme(), "http" | "https")
+                        && url.host_str().is_some()
+                        && url.query().is_none()
+                        && url.fragment().is_none()
+                });
+                ensure!(valid, message);
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -429,6 +456,41 @@ mod tests {
         let mut config = Config::build_default();
         config.crypto.master_key = FILE_KEY.to_owned();
         config
+    }
+
+    #[test]
+    fn cold_kubo_is_optional_and_env_does_not_replace_hot() {
+        let mut config: Config = toml::from_str("").unwrap();
+        assert!(config.cold_kubo.is_none());
+        let hot = config.kubo.rpc_url.clone();
+        config
+            .apply_env_overrides(|name| {
+                (name == "IPFS_S3_COLD_KUBO_RPC_URL").then(|| "http://cold:5001".to_owned())
+            })
+            .unwrap();
+        assert_eq!(config.kubo.rpc_url, hot);
+        assert_eq!(config.cold_kubo.unwrap().rpc_url, "http://cold:5001");
+    }
+
+    #[test]
+    fn cold_kubo_toml_and_validation_are_redacted() {
+        let config: Config = toml::from_str("[cold_kubo]\nrpc_url = 'http://cold:5001'").unwrap();
+        config.validate_kubo().unwrap();
+        assert_eq!(config.cold_kubo.unwrap().rpc_url, "http://cold:5001");
+        for url in [
+            "",
+            "file:///private",
+            "http://user:secret@",
+            "not-secret-url",
+        ] {
+            let mut config = Config::build_default();
+            config.cold_kubo = Some(KuboConfig {
+                rpc_url: url.to_owned(),
+            });
+            let error = config.validate_kubo().unwrap_err();
+            assert_eq!(error.to_string(), "invalid cold Kubo RPC URL");
+            assert!(!format!("{error:?}").contains("secret"));
+        }
     }
 
     #[test]

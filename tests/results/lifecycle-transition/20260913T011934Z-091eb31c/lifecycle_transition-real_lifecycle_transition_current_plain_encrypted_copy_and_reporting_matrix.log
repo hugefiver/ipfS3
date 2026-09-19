@@ -1,0 +1,13 @@
+
+running 1 test
+test real_lifecycle_transition_current_plain_encrypted_copy_and_reporting_matrix ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 5.05s
+
+
+   Compiling ipfs-s3-gateway v0.1.0 ([REPO])
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.94s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests\lifecycle_transition.rs (target\debug\deps\lifecycle_transition-a3e8f421edadc602.exe)
+[LIFECYCLE-TRANSITION-EVIDENCE] scenario=current-matrix result=pass lifecycle_xml=pass headers=pass bytes=pass ranges=pass encryption_sse_s3_sse_c=pass wrong_key=pass lists=pass copy_to_standard=pass

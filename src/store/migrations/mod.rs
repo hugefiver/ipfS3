@@ -10,3 +10,5 @@ pub mod m20260825_000001_object_versioning;
 pub mod m20260826_000001_lifecycle_expiration;
 pub mod m20260831_000001_bucket_cors;
 pub mod m20260901_000001_lifecycle_abort_multipart;
+pub mod m20260912_000001_residency_references;
+pub mod m20260912_000002_lifecycle_transition;

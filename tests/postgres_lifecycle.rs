@@ -668,6 +668,8 @@ fn abort_configuration() -> CanonicalLifecycleConfiguration {
             },
             expiration: None,
             noncurrent_version_expiration: None,
+            transition: None,
+            noncurrent_version_transition: None,
             abort_incomplete_multipart_upload: Some(AbortIncompleteMultipartUploadAction {
                 days_after_initiation: 1,
             }),
@@ -1587,6 +1589,8 @@ fn abort_reclaim_configuration() -> CanonicalLifecycleConfiguration {
                     .with_timezone(&Utc),
             }),
             noncurrent_version_expiration: None,
+            transition: None,
+            noncurrent_version_transition: None,
             abort_incomplete_multipart_upload: None,
         }],
     }

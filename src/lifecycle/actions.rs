@@ -33,7 +33,7 @@ use crate::{
             FAILURE_DATABASE_CONTENTION, FAILURE_INTERNAL_DEPENDENCY,
             MAX_LIFECYCLE_ACTION_ATTEMPTS, action_kind_from_db, lock_claim_for_execution,
             mark_cancelled, mark_failed_safe, mark_succeeded, retry_at, schedule_retry,
-            target_from_action,
+            target_from_action, wait_for_transition_in_transaction, waiting_for_transition,
         },
         multipart::{
             AbortExactIncompleteUploadResult, abort_exact_incomplete_upload_in_transaction,
@@ -99,6 +99,14 @@ pub(crate) async fn execute_claimed_lifecycle_action(
     max_backoff_secs: u64,
 ) -> AppResult<()> {
     validate_execution_settings(max_attempts, base_backoff_secs, max_backoff_secs)?;
+    if matches!(
+        action_kind_from_db(&claim.action.action_kind),
+        Ok(LifecycleActionKind::TransitionCurrent | LifecycleActionKind::TransitionNoncurrent)
+    ) {
+        return Err(AppError::Internal(
+            "lifecycle transition requires the tier-aware executor".to_owned(),
+        ));
+    }
     let target = match target_from_action(&claim.action) {
         Ok(target) => target,
         Err(_) => {
@@ -204,7 +212,7 @@ pub(crate) async fn execute_claimed_lifecycle_action(
     };
     match admission {
         LifecycleAdmissionResult::Admitted(guard) => {
-            match execute_final_transaction(db, claim, &target, &guard).await {
+            match execute_final_transaction(db, claim, &target, &guard, max_attempts).await {
                 Ok(()) => Ok(()),
                 Err(error) => {
                     let error = transaction_error_into_app(error);
@@ -371,6 +379,7 @@ async fn execute_final_transaction(
     claim: &ClaimedLifecycleAction,
     target: &VersionTargetIdentity,
     guard: &StandardMutationGuard,
+    max_attempts: i64,
 ) -> Result<(), TransactionError<AppError>> {
     let claim = claim.clone();
     let target = target.clone();
@@ -409,6 +418,17 @@ async fn execute_final_transaction(
             }
             #[cfg(test)]
             test_hooks::fail_after_admission(&claim.action.id).await?;
+
+            // A probe can have been claimed under a larger budget. Check the
+            // locked row against this executor's cap before any content mutation;
+            // ordinary actions keep their existing final-recovery semantics.
+            if waiting_for_transition(&locked_action) && locked_action.attempts >= max_attempts {
+                if !mark_failed_safe(txn, &claim, now, FAILURE_INTERNAL_DEPENDENCY).await? {
+                    return Err(AppError::StaleContentMutation);
+                }
+                complete_standard_mutation_in_transaction(txn, &guard, now).await?;
+                return Ok(());
+            }
 
             let Some(configuration_row) = lock_lifecycle_configuration(txn, &target.bucket).await?
             else {
@@ -456,6 +476,18 @@ async fn execute_final_transaction(
                 .as_ref()
                 .is_some_and(|expected| action_matches_expected(&locked_action, expected))
             {
+                if locked_action.action_kind == "expire_current"
+                    && expected.as_ref().is_some_and(|winner| {
+                        winner.action_kind == LifecycleActionKind::TransitionCurrent
+                    })
+                    && expiration_wins_without_transitions(&locked_action, &context)?
+                {
+                    if !wait_for_transition_in_transaction(txn, &claim).await? {
+                        return Err(AppError::StaleContentMutation);
+                    }
+                    complete_standard_mutation_in_transaction(txn, &guard, now).await?;
+                    return Ok(());
+                }
                 return cancel_guarded_in_transaction(txn, &claim, &guard, now).await;
             }
 
@@ -476,7 +508,28 @@ async fn execute_final_transaction(
     .await
 }
 
-async fn lock_lifecycle_configuration<C: ConnectionTrait>(
+fn expiration_wins_without_transitions(
+    action: &lifecycle_action::Model,
+    context: &LifecycleEvaluationContext<'_>,
+) -> AppResult<bool> {
+    // Re-evaluate the remaining rules, not just the preemptor's kind. A changed
+    // filter, disabled expiration, different due, or winning expiration must
+    // still cancel obsolete work rather than turn it into a permanent waiter.
+    let mut configuration = context.configuration.clone();
+    for rule in &mut configuration.rules {
+        rule.transition = None;
+        rule.noncurrent_version_transition = None;
+    }
+    let context = LifecycleEvaluationContext {
+        configuration: &configuration,
+        ..*context
+    };
+    Ok(evaluate_candidate(&context)?
+        .as_ref()
+        .is_some_and(|expected| action_matches_expected(action, expected)))
+}
+
+pub(super) async fn lock_lifecycle_configuration<C: ConnectionTrait>(
     db: &C,
     bucket_name: &str,
 ) -> AppResult<Option<bucket_lifecycle_config::Model>> {
@@ -487,7 +540,7 @@ async fn lock_lifecycle_configuration<C: ConnectionTrait>(
     Ok(query.one(db).await?)
 }
 
-async fn revalidate_candidate<C: ConnectionTrait>(
+pub(super) async fn revalidate_candidate<C: ConnectionTrait>(
     db: &C,
     target: &VersionTargetIdentity,
     action_kind: LifecycleActionKind,
@@ -495,13 +548,24 @@ async fn revalidate_candidate<C: ConnectionTrait>(
     let Some(selected) = lock_version_by_id(db, &target.version_row_id).await? else {
         return Ok(None);
     };
-    if !target_matches_row(&selected, target)?
-        || selected.is_latest != (action_kind != LifecycleActionKind::ExpireNoncurrent)
-    {
+    let expected_is_latest = match action_kind {
+        LifecycleActionKind::ExpireCurrent
+        | LifecycleActionKind::TransitionCurrent
+        | LifecycleActionKind::DeleteExpiredMarker => true,
+        LifecycleActionKind::ExpireNoncurrent | LifecycleActionKind::TransitionNoncurrent => false,
+        LifecycleActionKind::AbortIncompleteMultipartUpload => {
+            return Err(AppError::Internal(
+                "multipart lifecycle action reached version revalidation".to_owned(),
+            ));
+        }
+    };
+    if !target_matches_row(&selected, target)? || selected.is_latest != expected_is_latest {
         return Ok(None);
     }
     match (action_kind, target.kind) {
         (LifecycleActionKind::ExpireCurrent, VersionKind::Object)
+        | (LifecycleActionKind::TransitionCurrent, VersionKind::Object)
+        | (LifecycleActionKind::TransitionNoncurrent, VersionKind::Object)
         | (LifecycleActionKind::DeleteExpiredMarker, VersionKind::DeleteMarker)
         | (LifecycleActionKind::ExpireNoncurrent, _) => {}
         (LifecycleActionKind::AbortIncompleteMultipartUpload, _) => {
@@ -512,7 +576,7 @@ async fn revalidate_candidate<C: ConnectionTrait>(
         _ => return Ok(None),
     }
 
-    let size = match target.kind {
+    let locked_object = match target.kind {
         VersionKind::Object => {
             let object_id = target.object_id.as_deref().ok_or_else(|| {
                 AppError::Internal("lifecycle object target is invalid".to_owned())
@@ -526,7 +590,7 @@ async fn revalidate_candidate<C: ConnectionTrait>(
             {
                 return Ok(None);
             }
-            locked_object.size
+            Some(locked_object)
         }
         VersionKind::DeleteMarker => {
             if selected.is_latest {
@@ -540,9 +604,17 @@ async fn revalidate_candidate<C: ConnectionTrait>(
                     return Ok(None);
                 }
             }
-            0
+            None
         }
     };
+    let size = locked_object.as_ref().map_or(0, |object| object.size);
+    let (bucket_versioning_state, primary_storage_class, hot_residency_verified) =
+        crate::store::lifecycle_scan::version_evaluation_facts(
+            db,
+            &selected,
+            locked_object.as_ref(),
+        )
+        .await?;
     Ok(Some(LifecycleCandidate::Version(
         VersionLifecycleCandidate {
             target: target.clone(),
@@ -550,6 +622,9 @@ async fn revalidate_candidate<C: ConnectionTrait>(
             size,
             lifecycle_age_started_at: selected.lifecycle_age_started_at,
             became_noncurrent_at: selected.became_noncurrent_at,
+            bucket_versioning_state,
+            primary_storage_class,
+            hot_residency_verified,
         },
     )))
 }
@@ -754,7 +829,6 @@ async fn fail_safe(
 fn log_action_diagnostic(claim: &ClaimedLifecycleAction, failure_class: &str) {
     if claim.action.target_type == "version" {
         tracing::warn!(
-            action_id = %claim.action.id,
             bucket = %claim.action.bucket,
             key = %claim.action.object_key,
             public_version_id = %claim.action.target_public_version_id.as_deref().unwrap_or("<invalid>"),
@@ -764,7 +838,6 @@ fn log_action_diagnostic(claim: &ClaimedLifecycleAction, failure_class: &str) {
         );
     } else {
         tracing::warn!(
-            action_id = %claim.action.id,
             bucket = %claim.action.bucket,
             key = %claim.action.object_key,
             revision = claim.action.config_revision,
@@ -786,7 +859,10 @@ fn transaction_error_into_app(error: TransactionError<AppError>) -> AppError {
     }
 }
 
-fn same_action_definition(left: &lifecycle_action::Model, right: &lifecycle_action::Model) -> bool {
+pub(super) fn same_action_definition(
+    left: &lifecycle_action::Model,
+    right: &lifecycle_action::Model,
+) -> bool {
     left.id == right.id
         && left.idempotency_key == right.idempotency_key
         && left.bucket == right.bucket
@@ -804,7 +880,7 @@ fn same_action_definition(left: &lifecycle_action::Model, right: &lifecycle_acti
         && left.due_at == right.due_at
 }
 
-fn action_matches_expected(
+pub(super) fn action_matches_expected(
     action: &lifecycle_action::Model,
     expected: &crate::lifecycle::model::NewLifecycleAction,
 ) -> bool {
@@ -850,6 +926,8 @@ fn persisted_action_kind(action_kind: LifecycleActionKind) -> &'static str {
     match action_kind {
         LifecycleActionKind::ExpireCurrent => "expire_current",
         LifecycleActionKind::ExpireNoncurrent => "expire_noncurrent",
+        LifecycleActionKind::TransitionCurrent => "transition_current",
+        LifecycleActionKind::TransitionNoncurrent => "transition_noncurrent",
         LifecycleActionKind::DeleteExpiredMarker => "delete_expired_marker",
         LifecycleActionKind::AbortIncompleteMultipartUpload => "abort_incomplete_multipart_upload",
     }
@@ -877,6 +955,14 @@ pub(crate) async fn execute_lifecycle_delete_guarded(
     guard: &StandardMutationGuard,
     now: DateTime<Utc>,
 ) -> AppResult<GuardedLifecycleExecutionResult> {
+    if matches!(
+        action_kind,
+        LifecycleActionKind::TransitionCurrent | LifecycleActionKind::TransitionNoncurrent
+    ) {
+        return Err(AppError::Internal(
+            "lifecycle transition cannot execute through lifecycle deletion".to_owned(),
+        ));
+    }
     if target.bucket != guard.bucket || target.key != guard.key {
         return Ok(GuardedLifecycleExecutionResult::Stale);
     }
@@ -951,6 +1037,9 @@ pub(crate) async fn execute_lifecycle_delete_guarded(
             return Err(AppError::Internal(
                 "multipart lifecycle action reached version deletion".to_owned(),
             ));
+        }
+        LifecycleActionKind::TransitionCurrent | LifecycleActionKind::TransitionNoncurrent => {
+            unreachable!("transition kinds are rejected before deletion locks")
         }
     };
     complete_standard_mutation_in_transaction(txn, guard, now).await?;
@@ -1058,8 +1147,9 @@ mod tests {
             model::{
                 CanonicalFilter, CanonicalLifecycleConfiguration, CanonicalLifecycleRule,
                 CanonicalRuleSelector, CanonicalTag, ClaimedLifecycleAction, CurrentExpiration,
-                LifecycleActionKind, LifecycleRuleStatus, LifecycleTargetIdentity,
-                NewLifecycleAction, NoncurrentExpiration, RuleIdentity, VersionTargetIdentity,
+                CurrentTransition, LifecycleActionKind, LifecycleRuleStatus,
+                LifecycleTargetIdentity, NewLifecycleAction, NoncurrentExpiration, RuleIdentity,
+                VersionTargetIdentity,
             },
         },
         pinning::{policy::PublicationPolicy, tags::ObjectTag},
@@ -1068,7 +1158,7 @@ mod tests {
             database_clock::database_now,
             entities::{
                 bucket_lifecycle_config, import_destination, lifecycle_action, multipart_upload,
-                object, object_tag, object_version,
+                object, object_tag, object_version, physical_residency, version_residency,
             },
             import::ownership::{
                 admit_content_mutation, complete_standard_mutation_in_transaction,
@@ -1105,6 +1195,8 @@ mod tests {
             selector: all(),
             expiration: None,
             noncurrent_version_expiration: None,
+            transition: None,
+            noncurrent_version_transition: None,
             abort_incomplete_multipart_upload: Some(AbortIncompleteMultipartUploadAction {
                 days_after_initiation: 1,
             }),
@@ -1881,6 +1973,23 @@ mod tests {
                 utc_midnight: at(2000, 1, 1),
             }),
             noncurrent_version_expiration: None,
+            transition: None,
+            noncurrent_version_transition: None,
+            abort_incomplete_multipart_upload: None,
+        }
+    }
+
+    fn current_transition_rule(id: &str) -> CanonicalLifecycleRule {
+        CanonicalLifecycleRule {
+            id: Some(id.to_owned()),
+            status: LifecycleRuleStatus::Enabled,
+            selector: all(),
+            expiration: None,
+            noncurrent_version_expiration: None,
+            transition: Some(CurrentTransition::Date {
+                utc_midnight: at(2000, 1, 1),
+            }),
+            noncurrent_version_transition: None,
             abort_incomplete_multipart_upload: None,
         }
     }
@@ -1895,6 +2004,8 @@ mod tests {
                 noncurrent_days: 1,
                 newer_noncurrent_versions,
             }),
+            transition: None,
+            noncurrent_version_transition: None,
             abort_incomplete_multipart_upload: None,
         }
     }
@@ -1982,6 +2093,48 @@ mod tests {
             .await
             .unwrap()
             .unwrap()
+    }
+
+    async fn set_fixture_residency_to_standard_ia(
+        db: &DatabaseConnection,
+        version: &object_version::Model,
+    ) {
+        let object_id = version.object_id.as_deref().unwrap();
+        let object = object::Entity::find_by_id(object_id)
+            .one(db)
+            .await
+            .unwrap()
+            .unwrap();
+        let now = database_now(db).await.unwrap();
+        physical_residency::Entity::insert(physical_residency::ActiveModel {
+            tier: sea_orm::Set("cold".to_owned()),
+            cid: sea_orm::Set(object.cid.clone()),
+            node_identity: sea_orm::Set(Some("fixture-cold-node".to_owned())),
+            verification_state: sea_orm::Set("verified".to_owned()),
+            verification_receipt: sea_orm::Set(Some("fixture-cold-receipt".to_owned())),
+            verified_at: sea_orm::Set(Some(now)),
+            created_at: sea_orm::Set(now),
+            updated_at: sea_orm::Set(now),
+        })
+        .exec(db)
+        .await
+        .unwrap();
+        let updated = version_residency::Entity::update_many()
+            .col_expr(version_residency::Column::PrimaryTier, Expr::value("cold"))
+            .col_expr(
+                version_residency::Column::StorageClass,
+                Expr::value("STANDARD_IA"),
+            )
+            .col_expr(
+                version_residency::Column::Revision,
+                Expr::col(version_residency::Column::Revision).add(1),
+            )
+            .col_expr(version_residency::Column::UpdatedAt, Expr::value(now))
+            .filter(version_residency::Column::VersionRowId.eq(&version.id))
+            .exec(db)
+            .await
+            .unwrap();
+        assert_eq!(updated.rows_affected, 1);
     }
 
     fn target(version: &object_version::Model) -> VersionTargetIdentity {
@@ -2098,6 +2251,591 @@ mod tests {
         execute_claimed_lifecycle_action(db, claim, MAX_LIFECYCLE_ACTION_ATTEMPTS, 1, 60)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn worker_revalidation_waits_for_transition_then_executes_same_expiration() {
+        let db = setup().await;
+        bucket::set_versioning_state(&db, "bucket", BucketVersioningState::Enabled)
+            .await
+            .unwrap();
+        let (revision, configuration) = configure(
+            &db,
+            vec![
+                current_rule("expire", all()),
+                current_transition_rule("transition"),
+            ],
+        )
+        .await;
+        let version = publish(&db, "pending-owner", "pending-transition", 7, vec![]).await;
+        let facts =
+            super::revalidate_candidate(&db, &target(&version), LifecycleActionKind::ExpireCurrent)
+                .await
+                .unwrap()
+                .unwrap();
+        let crate::lifecycle::model::LifecycleCandidate::Version(facts) = facts else {
+            panic!("expected version candidate")
+        };
+        assert_eq!(
+            facts.primary_storage_class,
+            Some(crate::residency::model::StorageClass::Standard)
+        );
+        assert!(!facts.hot_residency_verified);
+
+        let claim = claim(
+            &db,
+            revision,
+            "expire",
+            LifecycleActionKind::ExpireCurrent,
+            target(&version),
+        )
+        .await;
+        execute(&db, &claim).await;
+
+        assert_eq!(state(&db, &claim).await.as_deref(), Some("pending"));
+        let retained = object_version::Entity::find_by_id(&version.id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(retained.is_latest);
+        assert_eq!(retained.kind, "object");
+        assert_eq!(
+            object_version::Entity::find()
+                .filter(object_version::Column::Bucket.eq("bucket"))
+                .filter(object_version::Column::Key.eq("pending-transition"))
+                .count(&db)
+                .await
+                .unwrap(),
+            1,
+            "the losing expiration must not create a marker"
+        );
+        for _ in 0..MAX_LIFECYCLE_ACTION_ATTEMPTS + 2 {
+            let stored = lifecycle_action::Entity::find_by_id(&claim.action.id)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                stored.attempts, 0,
+                "dependency waiting must not consume the failure budget"
+            );
+            assert_eq!(stored.idempotency_key, claim.action.idempotency_key);
+            assert!(stored.finished_at.is_none());
+            assert!(stored.lease_until.is_none());
+            assert_standard_guard_settled(&db, "pending-transition").await;
+            make_action_due(&db, &claim.action.id).await;
+            let next = claim_due(&db, WORKER, Duration::seconds(30), 1)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            execute(&db, &next).await;
+        }
+        make_action_due(&db, &claim.action.id).await;
+        let mut probe = claim_due(&db, WORKER, Duration::seconds(30), 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        for _ in 0..MAX_LIFECYCLE_ACTION_ATTEMPTS + 2 {
+            lifecycle_action::Entity::update_many()
+                .col_expr(
+                    lifecycle_action::Column::LeaseUntil,
+                    Expr::value(at(2000, 1, 1)),
+                )
+                .filter(lifecycle_action::Column::Id.eq(&claim.action.id))
+                .exec(&db)
+                .await
+                .unwrap();
+            let newer = claim_due(&db, WORKER, Duration::seconds(30), 1)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert_eq!(
+                newer.action.attempts, 0,
+                "crashed dependency probes must not fail-safe"
+            );
+            assert!(newer.claim_epoch > probe.claim_epoch);
+            let txn = db.begin().await.unwrap();
+            assert!(
+                !crate::store::lifecycle_action::wait_for_transition_in_transaction(&txn, &probe)
+                    .await
+                    .unwrap()
+            );
+            txn.commit().await.unwrap();
+            probe = newer;
+        }
+        execute(&db, &probe).await;
+        set_fixture_residency_to_standard_ia(&db, &version).await;
+        let now = database_now(&db).await.unwrap();
+        let scan = crate::lifecycle::model::ClaimedLifecycleScan {
+            bucket: "bucket".into(),
+            config_revision: revision,
+            canonical_json: canonical_json(&configuration).unwrap(),
+            cursor: None,
+            lease_epoch: 1,
+            database_now: now,
+            lease_until: now + Duration::seconds(30),
+        };
+        crate::lifecycle::evaluator::schedule_claimed_scan_page(&db, &scan, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            lifecycle_action::Entity::find().count(&db).await.unwrap(),
+            1
+        );
+        make_action_due(&db, &claim.action.id).await;
+        let next = claim_due(&db, WORKER, Duration::seconds(30), 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(next.action.id, claim.action.id);
+        assert_eq!(next.action.idempotency_key, claim.action.idempotency_key);
+        execute(&db, &next).await;
+        assert_eq!(state(&db, &claim).await.as_deref(), Some("succeeded"));
+        assert!(
+            !object_version::Entity::find_by_id(&version.id)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_latest
+        );
+    }
+
+    async fn make_action_due(db: &DatabaseConnection, id: &str) {
+        lifecycle_action::Entity::update_many()
+            .col_expr(
+                lifecycle_action::Column::NextAttemptAt,
+                Expr::value(at(2000, 1, 1)),
+            )
+            .filter(lifecycle_action::Column::Id.eq(id))
+            .exec(db)
+            .await
+            .unwrap();
+    }
+
+    async fn waiting_expiration_after_ordinary_failures() -> (
+        DatabaseConnection,
+        object_version::Model,
+        ClaimedLifecycleAction,
+    ) {
+        let db = setup().await;
+        bucket::set_versioning_state(&db, "bucket", BucketVersioningState::Enabled)
+            .await
+            .unwrap();
+        let (revision, _) = configure(
+            &db,
+            vec![
+                current_rule("expire", all()),
+                current_transition_rule("transition"),
+            ],
+        )
+        .await;
+        let version = publish(&db, "budget-owner", "budget-key", 7, vec![]).await;
+        let mut claimed = claim(
+            &db,
+            revision,
+            "expire",
+            LifecycleActionKind::ExpireCurrent,
+            target(&version),
+        )
+        .await;
+        for expected_attempts in 1..=2 {
+            assert_eq!(claimed.action.attempts, expected_attempts);
+            let now = database_now(&db).await.unwrap();
+            assert!(
+                crate::store::lifecycle_action::schedule_retry(
+                    &db,
+                    &claimed,
+                    now,
+                    now + Duration::seconds(1),
+                    super::FAILURE_DATABASE_CONTENTION,
+                )
+                .await
+                .unwrap()
+            );
+            make_action_due(&db, &claimed.action.id).await;
+            claimed = claim_due(&db, WORKER, Duration::seconds(30), 1)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+        }
+        execute(&db, &claimed).await;
+        let stored = lifecycle_action::Entity::find_by_id(&claimed.action.id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, "pending");
+        assert_eq!(
+            stored.attempts, 2,
+            "only the dependency probe's third attempt is refunded"
+        );
+        (db, version, claimed)
+    }
+
+    #[tokio::test]
+    async fn dependency_wait_preserves_consumed_budget_at_claim_and_reclaim() {
+        use crate::store::lifecycle_action::claim_due_with_max_attempts;
+        for cap in [1, 2] {
+            for reclaimed_probe in [false, true] {
+                for ia in [false, true] {
+                    let (db, version, original) =
+                        waiting_expiration_after_ordinary_failures().await;
+                    make_action_due(&db, &original.action.id).await;
+                    let epoch = if reclaimed_probe {
+                        let probe = claim_due(&db, WORKER, Duration::seconds(30), 1)
+                            .await
+                            .unwrap()
+                            .pop()
+                            .unwrap();
+                        assert_eq!(probe.action.attempts, 2);
+                        lifecycle_action::Entity::update_many()
+                            .col_expr(
+                                lifecycle_action::Column::LeaseUntil,
+                                Expr::value(at(2000, 1, 1)),
+                            )
+                            .filter(lifecycle_action::Column::Id.eq(&probe.action.id))
+                            .exec(&db)
+                            .await
+                            .unwrap();
+                        probe.claim_epoch
+                    } else {
+                        original.claim_epoch
+                    };
+                    if ia {
+                        set_fixture_residency_to_standard_ia(&db, &version).await;
+                    }
+                    for _ in 0..2 {
+                        assert!(
+                            claim_due_with_max_attempts(&db, WORKER, Duration::seconds(30), cap, 1)
+                                .await
+                                .unwrap()
+                                .is_empty(),
+                            "exhausted dependency must not get a recovery claim: cap={cap}, reclaimed={reclaimed_probe}, ia={ia}"
+                        );
+                    }
+                    let stored = lifecycle_action::Entity::find_by_id(&original.action.id)
+                        .one(&db)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(stored.state, "failed_safe");
+                    assert_eq!(stored.attempts, 2);
+                    assert_eq!(stored.claim_epoch, epoch);
+                    assert_eq!(stored.idempotency_key, original.action.idempotency_key);
+                    assert!(
+                        object_version::Entity::find_by_id(&version.id)
+                            .one(&db)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .is_latest
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dependency_probe_rechecks_execution_cap_before_ia_mutation() {
+        for cap in [1, 2, 3] {
+            let (db, version, original) = waiting_expiration_after_ordinary_failures().await;
+            make_action_due(&db, &original.action.id).await;
+            let probe = claim_due(&db, WORKER, Duration::seconds(30), 1)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert_eq!(probe.action.attempts, 2);
+            set_fixture_residency_to_standard_ia(&db, &version).await;
+            execute_claimed_lifecycle_action(&db, &probe, cap, 1, 60)
+                .await
+                .unwrap();
+            assert_eq!(
+                state(&db, &probe).await.as_deref(),
+                Some(if cap > 2 { "succeeded" } else { "failed_safe" })
+            );
+            let retained = object_version::Entity::find_by_id(&version.id)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(retained.is_latest, cap <= 2);
+            assert_standard_guard_settled(&db, "budget-key").await;
+        }
+    }
+
+    #[tokio::test]
+    async fn transition_winner_does_not_preserve_genuinely_stale_expiration() {
+        let db = setup().await;
+        bucket::set_versioning_state(&db, "bucket", BucketVersioningState::Enabled)
+            .await
+            .unwrap();
+        let mut expiration = current_rule("expire", all());
+        expiration.status = LifecycleRuleStatus::Disabled;
+        let (revision, _) =
+            configure(&db, vec![expiration, current_transition_rule("transition")]).await;
+        let version = publish(&db, "stale-owner", "stale-key", 7, vec![]).await;
+        let claimed = claim(
+            &db,
+            revision,
+            "expire",
+            LifecycleActionKind::ExpireCurrent,
+            target(&version),
+        )
+        .await;
+        execute(&db, &claimed).await;
+        assert_eq!(state(&db, &claimed).await.as_deref(), Some("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn worker_revalidation_executes_enabled_expiration_after_fixture_is_standard_ia() {
+        let db = setup().await;
+        bucket::set_versioning_state(&db, "bucket", BucketVersioningState::Enabled)
+            .await
+            .unwrap();
+        let (revision, _) = configure(
+            &db,
+            vec![
+                current_rule("expire", all()),
+                current_transition_rule("transition"),
+            ],
+        )
+        .await;
+        let version = publish(&db, "ia-owner", "already-ia", 7, vec![]).await;
+        set_fixture_residency_to_standard_ia(&db, &version).await;
+        let claim = claim(
+            &db,
+            revision,
+            "expire",
+            LifecycleActionKind::ExpireCurrent,
+            target(&version),
+        )
+        .await;
+        execute(&db, &claim).await;
+
+        assert_eq!(state(&db, &claim).await.as_deref(), Some("succeeded"));
+        let retained = object_version::Entity::find_by_id(&version.id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!retained.is_latest);
+        assert_eq!(retained.kind, "object");
+        let current = object_version::Entity::find()
+            .filter(object_version::Column::Bucket.eq("bucket"))
+            .filter(object_version::Column::Key.eq("already-ia"))
+            .filter(object_version::Column::IsLatest.eq(true))
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.kind, "delete_marker");
+        let residency = version_residency::Entity::find_by_id(&version.id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(residency.primary_tier, "cold");
+        assert_eq!(residency.storage_class, "STANDARD_IA");
+    }
+
+    #[tokio::test]
+    async fn worker_revalidation_executes_suspended_null_expiration_ahead_of_transition() {
+        let db = setup().await;
+        bucket::set_versioning_state(&db, "bucket", BucketVersioningState::Suspended)
+            .await
+            .unwrap();
+        let (revision, _) = configure(
+            &db,
+            vec![
+                current_rule("expire", all()),
+                current_transition_rule("transition"),
+            ],
+        )
+        .await;
+        let version = publish(&db, "suspended-owner", "suspended-null", 7, vec![]).await;
+        assert_eq!(target(&version).public_version_id, PublicVersionId::Null);
+        let claim = claim(
+            &db,
+            revision,
+            "expire",
+            LifecycleActionKind::ExpireCurrent,
+            target(&version),
+        )
+        .await;
+        execute(&db, &claim).await;
+
+        assert_eq!(state(&db, &claim).await.as_deref(), Some("succeeded"));
+        assert!(
+            object_version::Entity::find_by_id(&version.id)
+                .one(&db)
+                .await
+                .unwrap()
+                .is_none(),
+            "suspended null expiration permanently removes the public null slot"
+        );
+        assert!(
+            version_residency::Entity::find_by_id(&version.id)
+                .one(&db)
+                .await
+                .unwrap()
+                .is_none(),
+            "suspended null expiration releases the removed version's residency ownership"
+        );
+        let current = object_version::Entity::find()
+            .filter(object_version::Column::Bucket.eq("bucket"))
+            .filter(object_version::Column::Key.eq("suspended-null"))
+            .filter(object_version::Column::IsLatest.eq(true))
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.kind, "delete_marker");
+        assert!(current.version_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn transition_execution_is_rejected_without_mutation_before_e2() {
+        let db = setup().await;
+        let (revision, _) = configure(&db, vec![current_rule("current", all())]).await;
+        let version = publish(&db, "transition-owner", "transition-key", 7, vec![]).await;
+        let claimed = claim(
+            &db,
+            revision,
+            "current",
+            LifecycleActionKind::ExpireCurrent,
+            target(&version),
+        )
+        .await;
+        let before_action = stored_action(&db, &claimed).await;
+        let before_version = object_version::Entity::find_by_id(version.id.clone())
+            .one(&db)
+            .await
+            .unwrap();
+        let before_object = object::Entity::find_by_id("transition-owner")
+            .one(&db)
+            .await
+            .unwrap();
+
+        let mut transition_claim = claimed.clone();
+        transition_claim.action.action_kind = "transition_current".to_owned();
+        let error = execute_claimed_lifecycle_action(
+            &db,
+            &transition_claim,
+            MAX_LIFECYCLE_ACTION_ATTEMPTS,
+            1,
+            60,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, AppError::Internal(_)));
+        assert_eq!(stored_action(&db, &claimed).await, before_action);
+        assert_eq!(
+            object_version::Entity::find_by_id(version.id)
+                .one(&db)
+                .await
+                .unwrap(),
+            before_version
+        );
+        assert_eq!(
+            object::Entity::find_by_id("transition-owner")
+                .one(&db)
+                .await
+                .unwrap(),
+            before_object
+        );
+    }
+
+    #[tokio::test]
+    async fn transition_revalidation_classifies_versions_explicitly_and_rejects_markers() {
+        let db = setup().await;
+        bucket::set_versioning_state(&db, "bucket", BucketVersioningState::Enabled)
+            .await
+            .unwrap();
+
+        let original = publish(&db, "transition-original", "transition-key", 7, vec![]).await;
+        let original_target = target(&original);
+        assert!(
+            super::revalidate_candidate(
+                &db,
+                &original_target,
+                LifecycleActionKind::TransitionCurrent,
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+        assert!(
+            super::revalidate_candidate(
+                &db,
+                &original_target,
+                LifecycleActionKind::TransitionNoncurrent,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+
+        publish(&db, "transition-successor", "transition-key", 9, vec![]).await;
+        assert!(
+            super::revalidate_candidate(
+                &db,
+                &original_target,
+                LifecycleActionKind::TransitionCurrent,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            super::revalidate_candidate(
+                &db,
+                &original_target,
+                LifecycleActionKind::TransitionNoncurrent,
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+
+        let marker_id = db
+            .transaction(|txn| {
+                Box::pin(async move {
+                    install_delete_marker(
+                        txn,
+                        BucketVersioningState::Enabled,
+                        "bucket",
+                        "marker-key",
+                        database_now(txn).await?,
+                    )
+                    .await
+                })
+            })
+            .await
+            .unwrap();
+        let marker = object_version::Entity::find()
+            .filter(object_version::Column::VersionId.eq(marker_id))
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            super::revalidate_candidate(
+                &db,
+                &target(&marker),
+                LifecycleActionKind::TransitionCurrent,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[tokio::test]
@@ -3275,7 +4013,6 @@ mod tests {
 
         let log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
         for required in [
-            "action-id",
             "bucket",
             "key",
             "public-version-id",
@@ -3288,6 +4025,8 @@ mod tests {
             );
         }
         for forbidden in [
+            "action-id",
+            "action_id",
             "SELECT *",
             "internal-object-uuid",
             "raw-provider-response",

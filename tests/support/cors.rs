@@ -207,6 +207,7 @@ pub async fn start_harness() -> CorsHarness {
         .expect("create focused CORS test bucket");
     let state = Arc::new(AppState {
         kubo: ipfs_s3_gateway::kubo::KuboClient::new(kubo.uri()),
+        cold_kubo: None,
         store: Store::new(db),
         credentials: HashMap::from([("test".to_owned(), s3s::auth::SecretKey::from("test"))]),
         master_key: ipfs_s3_gateway::crypto::key::MasterKey::from_hex(&"0".repeat(64))

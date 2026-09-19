@@ -12,6 +12,7 @@ pub struct KuboClient {
     upload_http: reqwest::Client,
     download_http: reqwest::Client,
     stream_idle_timeout: std::time::Duration,
+    local_reads_only: bool,
 }
 
 impl KuboClient {
@@ -57,11 +58,23 @@ impl KuboClient {
                 .build()
                 .expect("failed to build reqwest download client"),
             stream_idle_timeout: download_idle_timeout,
+            local_reads_only: false,
         }
     }
 
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// A request-scoped read policy, not a daemon-wide network configuration.
+    /// The residency router sets it only for selected cold versions.
+    pub(crate) fn with_local_reads_only(mut self) -> Self {
+        self.local_reads_only = true;
+        self
+    }
+
+    pub(crate) fn local_reads_only(&self) -> bool {
+        self.local_reads_only
     }
 
     /// Bounded client for short control-plane calls such as `pin/add` and `pin/rm`.

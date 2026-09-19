@@ -1,0 +1,21 @@
+
+running 10 tests
+test attach_resolve_release_and_summary_preserve_shared_physical_state ... ok
+test backfill_claim_cursor_is_bounded_fenced_and_does_not_resurrect_deleted_versions ... ok
+test downgrade_is_allowed_only_for_reconstructable_pending_standard_state ... ok
+test owner_validation_rejects_marker_mismatch_and_missing_version ... ok
+test quota_delayed_lease_targets_still_protect_only_hot_content ... ok
+test repeated_and_two_connection_upgrade_is_safe ... ok
+test schema_rejects_markers_invalid_states_and_invalid_owner_shapes ... ok
+test two_connections_claim_one_backfill_epoch_without_errors ... ok
+test upgrade_backfills_only_live_content_versions_without_changing_identity ... ok
+test upgrade_preserves_every_lifecycle_configuration_and_action_field ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.12s
+
+
+   Compiling ipfs-s3-gateway v0.1.0 ([REPO])
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.23s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests\residency.rs (target\debug\deps\residency-515919c35e074a30.exe)
