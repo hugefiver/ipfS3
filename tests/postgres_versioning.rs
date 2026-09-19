@@ -1,5 +1,12 @@
 #[allow(dead_code)]
-mod support;
+mod support {
+    #[path = "cors.rs"]
+    pub mod cors;
+    #[path = "decompress.rs"]
+    pub mod decompress;
+    #[path = "sigv4.rs"]
+    pub mod sigv4;
+}
 
 use std::{
     collections::{HashMap, HashSet},

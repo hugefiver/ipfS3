@@ -48,7 +48,8 @@ $TouchedEnvironmentNames = @(
     "IPFS_S3_MULTI_GATEWAY_A_ENDPOINT",
     "IPFS_S3_MULTI_GATEWAY_B_ENDPOINT",
     "IPFS_S3_MULTI_GATEWAY_LOAD_BALANCER_ENDPOINT",
-    "IPFS_S3_MULTI_GATEWAY_KUBO_URL"
+    "IPFS_S3_MULTI_GATEWAY_KUBO_URL",
+    "IPFS_S3_MULTI_GATEWAY_DATABASE_URL"
 )
 $DockerCommandTimeout = [TimeSpan]::FromMinutes(5)
 $ComposeStartupTimeout = [TimeSpan]::FromMinutes(6)
@@ -450,6 +451,7 @@ function Set-LifecycleEndpointEnvironment {
     Set-RunEnvironment -Name "IPFS_S3_MULTI_GATEWAY_B_ENDPOINT" -Value "http://127.0.0.1:59005"
     Set-RunEnvironment -Name "IPFS_S3_MULTI_GATEWAY_LOAD_BALANCER_ENDPOINT" -Value "http://127.0.0.1:59006"
     Set-RunEnvironment -Name "IPFS_S3_MULTI_GATEWAY_KUBO_URL" -Value "http://127.0.0.1:55004"
+    Set-RunEnvironment -Name "IPFS_S3_MULTI_GATEWAY_DATABASE_URL" -Value "postgres://ipfs3:ipfs3@127.0.0.1:55437/ipfs3"
 }
 
 function Assert-RustSuiteExecuted {
@@ -457,7 +459,9 @@ function Assert-RustSuiteExecuted {
     $output = (@($Result.StdOut) + @($Result.StdErr)) -join "`n"
     $runningMatches = [regex]::Matches($output, '(?m)^running (?<running>[1-9][0-9]*) tests?$')
     $summaryMatches = [regex]::Matches($output, '(?m)^test result: ok\. (?<passed>[1-9][0-9]*) passed; 0 failed; (?<ignored>[0-9]+) ignored; (?<measured>[0-9]+) measured; (?<filtered>[0-9]+) filtered out; finished in (?<seconds>[0-9]{1,4}(?:\.[0-9]{1,3})?)s$')
-    if ($runningMatches.Count -ne 1 -or $summaryMatches.Count -ne 1) { throw "$Name did not prove real Rust test execution" }
+    if ($runningMatches.Count -ne 1 -or $summaryMatches.Count -ne 1 -or $output -match '(?i)\bskipping\b') {
+        throw "$Name did not prove real, non-skipped Rust test execution"
+    }
     [long]$runningCount = 0
     [long]$passedCount = 0
     [decimal]$seconds = [decimal]0
@@ -557,10 +561,10 @@ function Invoke-LifecycleMultiGatewayDiagnostic {
 
     Set-LifecycleEndpointEnvironment
     Set-LifecycleStage -State $State -Stage "multi-gateway"
-    Write-LifecycleEvidence -Category "command" -Value "cargo test --test multi_gateway -- --nocapture --test-threads=1"
+    Write-LifecycleEvidence -Category "command" -Value "cargo test --test multi_gateway -- --include-ignored --nocapture --test-threads=1"
     $result = Invoke-NativeCommand `
         -FilePath "cargo" `
-        -ArgumentList @("test", "--test", "multi_gateway", "--", "--nocapture", "--test-threads=1") `
+        -ArgumentList @("test", "--test", "multi_gateway", "--", "--include-ignored", "--nocapture", "--test-threads=1") `
         -Label "Owned multi-gateway diagnostic" `
         -Timeout $RustTestTimeout `
         -AllowedExitCodes @(0, 101) `
@@ -701,7 +705,7 @@ function Invoke-LifecycleRaceExactDiagnostic {
 
     Set-LifecycleEndpointEnvironment
     Set-LifecycleStage -State $State -Stage "multi-gateway"
-    Write-LifecycleEvidence -Category "command" -Value "cargo test --test multi_gateway multi_gateway_lifecycle_publication_action_race_has_one_terminal_outcome -- --exact --nocapture --test-threads=1"
+    Write-LifecycleEvidence -Category "command" -Value "cargo test --test multi_gateway multi_gateway_lifecycle_publication_action_race_has_one_terminal_outcome -- --ignored --exact --nocapture --test-threads=1"
     $receipt = $null
     try {
         $result = Invoke-NativeCommand `
@@ -712,6 +716,7 @@ function Invoke-LifecycleRaceExactDiagnostic {
                 "multi_gateway",
                 "multi_gateway_lifecycle_publication_action_race_has_one_terminal_outcome",
                 "--",
+                "--ignored",
                 "--exact",
                 "--nocapture",
                 "--test-threads=1"
@@ -773,7 +778,7 @@ function Invoke-LifecycleRaceStabilityDiagnostic {
     Set-LifecycleEndpointEnvironment
     Set-LifecycleStage -State $State -Stage "multi-gateway"
     foreach ($iteration in 1..5) {
-        Write-LifecycleEvidence -Category "command" -Value "cargo test --test multi_gateway multi_gateway_lifecycle_publication_action_race_has_one_terminal_outcome -- --exact --nocapture --test-threads=1"
+        Write-LifecycleEvidence -Category "command" -Value "cargo test --test multi_gateway multi_gateway_lifecycle_publication_action_race_has_one_terminal_outcome -- --ignored --exact --nocapture --test-threads=1"
         try {
             $result = Invoke-NativeCommand `
                 -FilePath "cargo" `
@@ -783,6 +788,7 @@ function Invoke-LifecycleRaceStabilityDiagnostic {
                     "multi_gateway",
                     "multi_gateway_lifecycle_publication_action_race_has_one_terminal_outcome",
                     "--",
+                    "--ignored",
                     "--exact",
                     "--nocapture",
                     "--test-threads=1"
@@ -861,14 +867,14 @@ function Invoke-LifecycleRustSuites {
     Write-LifecycleEvidence -Category "assertion" -Value "postgres-lifecycle=A-abort-B-reclaim-stale-CAS"
 
     Set-LifecycleStage -State $State -Stage "e2e"
-    Write-LifecycleEvidence -Category "command" -Value "cargo test --test e2e -- --nocapture --test-threads=1"
-    $e2e = Invoke-NativeCommand -FilePath "cargo" -ArgumentList @("test", "--test", "e2e", "--", "--nocapture", "--test-threads=1") -Label "Owned lifecycle E2E regression" -Timeout $RustTestTimeout -WorkingDirectory $RepoRoot
+    Write-LifecycleEvidence -Category "command" -Value "cargo test --test e2e -- --include-ignored --nocapture --test-threads=1"
+    $e2e = Invoke-NativeCommand -FilePath "cargo" -ArgumentList @("test", "--test", "e2e", "--", "--include-ignored", "--nocapture", "--test-threads=1") -Label "Owned lifecycle E2E regression" -Timeout $RustTestTimeout -WorkingDirectory $RepoRoot
     Assert-RustSuiteExecuted -Result $e2e -Name "Owned lifecycle E2E regression"
     Write-LifecycleEvidence -Category "assertion" -Value "e2e=passed"
 
     Set-LifecycleStage -State $State -Stage "multi-gateway"
-    Write-LifecycleEvidence -Category "command" -Value "cargo test --test multi_gateway -- --nocapture --test-threads=1"
-    $multiGateway = Invoke-NativeCommand -FilePath "cargo" -ArgumentList @("test", "--test", "multi_gateway", "--", "--nocapture", "--test-threads=1") -Label "Owned multi-gateway lifecycle regression" -Timeout $RustTestTimeout -WorkingDirectory $RepoRoot
+    Write-LifecycleEvidence -Category "command" -Value "cargo test --test multi_gateway -- --include-ignored --nocapture --test-threads=1"
+    $multiGateway = Invoke-NativeCommand -FilePath "cargo" -ArgumentList @("test", "--test", "multi_gateway", "--", "--include-ignored", "--nocapture", "--test-threads=1") -Label "Owned multi-gateway lifecycle regression" -Timeout $RustTestTimeout -WorkingDirectory $RepoRoot
     Assert-RustSuiteExecuted -Result $multiGateway -Name "Owned multi-gateway lifecycle regression"
     Write-LifecycleEvidence -Category "assertion" -Value "cross-replica=one-terminal-successor-retained"
 

@@ -33,8 +33,21 @@ jobs:
       - name: Unit tests
         run: cargo test --lib
 
+      - name: Gateway lifecycle and readiness tests
+        run: cargo test --bin ipfs-s3-gateway
+
       - name: Integration tests
         run: cargo test --test integration
+
+      - name: Lightweight security regressions
+        run: |
+          cargo test --test http_admission
+          cargo test --test object_read_snapshot
+          cargo test --test bucket_config_owner_atomicity
+
+      - name: Native runner isolation tests
+        shell: pwsh
+        run: pwsh -NoProfile -File tests/native-runner.Tests.ps1
 
   fmt:
     runs-on: ubuntu-latest

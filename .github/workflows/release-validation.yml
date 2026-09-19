@@ -178,7 +178,7 @@ jobs:
           }
 
       - name: Run serial PostgreSQL-backed end-to-end tests
-        run: cargo test --test e2e -- --nocapture --test-threads=1
+        run: cargo test --test e2e -- --include-ignored --nocapture --test-threads=1
 
       - name: Stop PostgreSQL and verify readiness failure
         shell: pwsh
@@ -359,10 +359,10 @@ jobs:
           }
 
       - name: Run direct cross-replica acceptance
-        run: cargo test --test multi_gateway multi_gateway_cross_replica_contract -- --exact --nocapture --test-threads=1
+        run: cargo test --test multi_gateway multi_gateway_cross_replica_contract -- --ignored --exact --nocapture --test-threads=1
 
       - name: Run existing E2E through the load balancer
-        run: cargo test --test e2e -- --nocapture --test-threads=1
+        run: cargo test --test e2e -- --include-ignored --nocapture --test-threads=1
 
       - name: Capture pre-failover diagnostics
         shell: pwsh
@@ -391,7 +391,7 @@ jobs:
           if (-not $observed) { throw "Load balancer did not recover through gateway B within 30 seconds" }
 
       - name: Run new CRUD through the surviving load-balanced path
-        run: cargo test --test multi_gateway load_balancer_surviving_replica_crud -- --exact --nocapture --test-threads=1
+        run: cargo test --test multi_gateway load_balancer_surviving_replica_crud -- --ignored --exact --nocapture --test-threads=1
 
       - name: Multi-gateway Compose diagnostics
         if: ${{ always() }}
@@ -792,9 +792,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Private Kubo peering unit contract failed" }
           cargo test --test cluster cluster_support::kubo_swarm_peers_null_is_empty_without_ndjson -- --exact
           if ($LASTEXITCODE -ne 0) { throw "Kubo swarm-peers null unit contract failed" }
-          cargo test --test cluster private_swarm_configuration_and_peering -- --exact --nocapture --test-threads=1
+          cargo test --test cluster private_swarm_configuration_and_peering -- --ignored --exact --nocapture --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw "Private swarm configuration and peering contract failed" }
-          cargo test --test cluster private_swarm_wrong_key_rejected -- --exact --nocapture --test-threads=1
+          cargo test --test cluster private_swarm_wrong_key_rejected -- --ignored --exact --nocapture --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw "Private swarm wrong-key rejection contract failed" }
           "CLUSTER_PRIVATE_SWARM_GREEN=true" | Add-Content -LiteralPath $env:GITHUB_ENV
 
@@ -802,7 +802,7 @@ jobs:
         shell: pwsh
         run: |
           if ($env:CLUSTER_PRIVATE_SWARM_GREEN -ne "true") { throw "Private swarm GREEN receipt is required before topology" }
-          cargo test --test cluster cluster_topology_converges -- --exact --nocapture --test-threads=1
+          cargo test --test cluster cluster_topology_converges -- --ignored --exact --nocapture --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw "TOPOLOGY_CONVERGENCE_BLOCKER: exact v1.1.6 two-peer topology did not converge" }
           "CLUSTER_TOPOLOGY_GREEN=true" | Add-Content -LiteralPath $env:GITHUB_ENV
 
@@ -810,7 +810,7 @@ jobs:
         shell: pwsh
         run: |
           if ($env:CLUSTER_TOPOLOGY_GREEN -ne "true") { throw "Topology GREEN receipt is required before compatibility" }
-          cargo test --test cluster cluster_proxy_compatibility -- --exact --nocapture --test-threads=1
+          cargo test --test cluster cluster_proxy_compatibility -- --ignored --exact --nocapture --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw "PROXY_COMPATIBILITY_BLOCKER: stop and revise the approved design; do not add app fallback code" }
           "CLUSTER_PROXY_COMPATIBILITY_GREEN=true" | Add-Content -LiteralPath $env:GITHUB_ENV
 
@@ -819,7 +819,7 @@ jobs:
         run: |
           if ($env:CLUSTER_PROXY_COMPATIBILITY_GREEN -ne "true") { throw "Add-pin-cat proxy GREEN receipt is required before replication" }
           if ($env:CLUSTER_STATE_RECEIPT_OWNED -ne "true") { throw "Owned state receipt is required before replication" }
-          cargo test --test cluster cluster_replication_and_retention -- --exact --nocapture --test-threads=1
+          cargo test --test cluster cluster_replication_and_retention -- --ignored --exact --nocapture --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw "Cluster replication and retention contract failed" }
 
       - name: Capture diagnostics before peer B stop
@@ -883,7 +883,7 @@ jobs:
         shell: pwsh
         run: |
           if ($env:CLUSTER_STATE_RECEIPT_OWNED -ne "true") { throw "Owned state receipt is required before outage validation" }
-          cargo test --test cluster cluster_peer_b_outage_contract -- --exact --nocapture --test-threads=1
+          cargo test --test cluster cluster_peer_b_outage_contract -- --ignored --exact --nocapture --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw "Peer B outage contract failed" }
 
       - name: Capture stopped-peer diagnostics before restart
@@ -988,9 +988,9 @@ jobs:
         shell: pwsh
         run: |
           if ($env:CLUSTER_STATE_RECEIPT_OWNED -ne "true") { throw "Owned state receipt is required before recovery validation" }
-          cargo test --test cluster private_swarm_configuration_and_peering -- --exact --nocapture --test-threads=1
+          cargo test --test cluster private_swarm_configuration_and_peering -- --ignored --exact --nocapture --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw "Private swarm post-restart configuration and peering contract failed" }
-          cargo test --test cluster cluster_peer_b_restart_recovery -- --exact --nocapture --test-threads=1
+          cargo test --test cluster cluster_peer_b_restart_recovery -- --ignored --exact --nocapture --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw "Peer B same-volume recovery contract failed" }
 
       - name: Final sanitized Cluster diagnostics
@@ -1147,7 +1147,7 @@ jobs:
         run: docker compose -f docker-compose.yml up --detach --build --wait --wait-timeout 300 kubo gateway
 
       - name: Run serial end-to-end tests
-        run: cargo test --test e2e -- --nocapture --test-threads=1
+        run: cargo test --test e2e -- --include-ignored --nocapture --test-threads=1
 
       - name: Compose diagnostics
         if: ${{ always() }}

@@ -113,7 +113,10 @@ function Invoke-CargoStep {
     $step.stderr = Join-Path $ResultsPath "$runId.$Name.stderr.log"
     $arguments = @('--test', $Target)
     if ($Compile) { $arguments += @("--no-run", "--message-format=json") }
-    else { $arguments += @('--', "--nocapture", "--test-threads=1") }
+    else {
+        $arguments += @('--', "--nocapture", "--test-threads=1")
+        if ($Target -ceq "multi_gateway") { $arguments += "--include-ignored" }
+    }
     Write-Diagnostic "Starting $Name; stdout=$($step.stdout); stderr=$($step.stderr)"
     $stdout = [IO.StreamWriter]::new($step.stdout, $false)
     $stderr = [IO.StreamWriter]::new($step.stderr, $false)

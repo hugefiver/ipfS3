@@ -19,6 +19,34 @@ An S3-compatible gateway backed by IPFS (Kubo). Translates S3 API calls into Kub
 - **Remote Pinning** — Asynchronous Pinata/Filebase PSA pinning with ordered policies, durable work, leases, and local soft quotas
 - **Durable Import** — SigV4-authenticated CID or allowlisted HTTPS import with persisted progress, lease-based recovery, optional idempotency, optional ZIP extraction, and stale-publication fencing
 
+## Hardening boundaries
+
+- **Mutation-lease upgrades:** Standard content mutations use a database-clock
+  lease of 120 seconds and long requests renew it every 30 seconds. Before the
+  migration that introduces this lease, stop and drain every old writer. Do not
+  run old and new writers against the upgraded database together: an old writer
+  bypasses the fence. Failed renewal or a crashed process is recovered after
+  lease expiry, not by an immediate handoff.
+- **Unsupported write shapes:** `POST` browser `multipart/form-data` is rejected
+  before the body reaches s3s, including requests with media-type parameters.
+  `If-Match` and `If-None-Match` on `PutObject` or multipart completion are
+  explicitly rejected. They do not provide compare-and-swap writes.
+- **ZIP extraction:** Direct decompression and ZIP import share a limit of
+  10,000 local entries and 64 MiB of conservative metadata reservations per
+  archive, independent of the 8 GiB decompressed-byte limit. Final
+  prefix-plus-entry keys are limited to 1024 UTF-8 bytes. CRC32 and size checks,
+  including Deflate data descriptors, must pass before an entry succeeds. See
+  the [ZIP safety boundary](src/zip/README.md) for accounting, compatibility,
+  and retained-staging details.
+- **Shutdown and failover:** On Unix, `SIGTERM` and `SIGINT` begin one shared
+  30-second graceful drain for HTTP and workers; Compose gives the gateway 40
+  seconds. The multi-gateway Nginx configuration retries only `GET` and `HEAD`.
+  A write-side upstream failure fails the request and is never replayed.
+
+**Implementation status (2026-09-19):** The hardening code is present. Final
+suite verification is still running, so this document does not claim a final
+PASS result or treat historical F1 evidence as evidence for this source state.
+
 ## Quick Start
 
 ### Docker Compose
@@ -766,6 +794,9 @@ cargo run
 ```
 
 See [`AGENTS.md`](AGENTS.md) for detailed architecture and conventions.
+See [testing guidance](docs/testing.md) for default and environment-backed
+checks, and the [dependency audit](docs/dependency-audit-2026-09-19.md) for the
+2026-09-19 advisory scope and remaining feature-boundary findings.
 
 ## Tech Stack
 

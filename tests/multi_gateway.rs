@@ -1,5 +1,8 @@
 #[allow(dead_code)]
-mod support;
+mod support {
+    #[path = "sigv4.rs"]
+    pub mod sigv4;
+}
 
 use futures_util::FutureExt;
 use http::{HeaderMap, HeaderValue, header};
@@ -1041,6 +1044,7 @@ async fn wait_for_import(endpoint: &str, bucket: &str, key: &str, job_id: &str, 
 }
 
 #[tokio::test]
+#[ignore = "requires the multi-gateway, load-balancer, PostgreSQL, and Kubo topology"]
 async fn multi_gateway_cross_replica_contract() {
     let (endpoint_a, endpoint_b, _load_balancer, kubo_endpoint) = multi_gateway_endpoints();
     let (bucket_name, bucket_a) = create_bucket_at(&endpoint_a, "cross").await;
@@ -1218,6 +1222,7 @@ async fn multi_gateway_cross_replica_contract() {
 }
 
 #[tokio::test]
+#[ignore = "requires the multi-gateway, load-balancer, PostgreSQL, and Kubo topology"]
 async fn load_balancer_surviving_replica_crud() {
     let (_endpoint_a, _endpoint_b, load_balancer, _kubo_endpoint) = multi_gateway_endpoints();
     let (_bucket_name, bucket) = create_bucket_at(&load_balancer, "failover").await;
@@ -1240,6 +1245,7 @@ async fn load_balancer_surviving_replica_crud() {
 }
 
 #[tokio::test]
+#[ignore = "requires the multi-gateway, load-balancer, PostgreSQL, and Kubo topology"]
 async fn multi_gateway_lifecycle_configuration_visible_across_replicas() {
     let (endpoint_a, endpoint_b, load_balancer, _kubo_endpoint) = multi_gateway_endpoints();
     let (bucket_name, bucket_a) = create_bucket_at(&endpoint_a, "lifecycle-config").await;
@@ -1331,6 +1337,7 @@ async fn multi_gateway_lifecycle_configuration_visible_across_replicas() {
 }
 
 #[tokio::test]
+#[ignore = "requires the multi-gateway, load-balancer, PostgreSQL, and Kubo topology"]
 async fn multi_gateway_lifecycle_publication_action_race_has_one_terminal_outcome() {
     let (endpoint_a, endpoint_b, load_balancer, _kubo_endpoint) = multi_gateway_endpoints();
     let (bucket_name, _bucket_a) = create_bucket_at(&endpoint_a, "lifecycle-race").await;
@@ -1522,6 +1529,7 @@ fn record_lifecycle_abort_multipart_race_stage(stage: LifecycleAbortMultipartRac
 }
 
 #[tokio::test]
+#[ignore = "requires the multi-gateway, load-balancer, PostgreSQL, and Kubo topology"]
 async fn multi_gateway_lifecycle_abort_multipart_race_has_one_terminal_outcome() {
     let required_environment = [
         "IPFS_S3_MULTI_GATEWAY_A_ENDPOINT",
@@ -1533,10 +1541,9 @@ async fn multi_gateway_lifecycle_abort_multipart_race_has_one_terminal_outcome()
         .iter()
         .find(|name| std::env::var(name).is_err())
     {
-        eprintln!(
-            "skipping multi-gateway lifecycle abort multipart race: required environment variable {missing} is unset"
+        panic!(
+            "multi-gateway lifecycle abort multipart race requires environment variable {missing}"
         );
-        return;
     }
 
     let endpoint_a = endpoint_from_env(required_environment[0]);

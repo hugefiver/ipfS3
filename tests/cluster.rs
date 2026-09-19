@@ -1,7 +1,10 @@
 #[path = "support/cluster.rs"]
 mod cluster_support;
 #[allow(dead_code)]
-mod support;
+mod support {
+    #[path = "sigv4.rs"]
+    pub mod sigv4;
+}
 
 use anyhow::{Result as AnyResult, anyhow, ensure};
 use bytes::Bytes;
@@ -154,6 +157,7 @@ fn expect_local_kubo(result: AnyResult<Vec<u8>>, category: &'static str) -> Vec<
 }
 
 #[tokio::test]
+#[ignore = "requires the private two-peer Cluster and Kubo topology"]
 async fn private_swarm_configuration_and_peering() {
     let kubo_a = kubo_api_client("IPFS_S3_CLUSTER_KUBO_A_URL");
     let kubo_b = kubo_api_client("IPFS_S3_CLUSTER_KUBO_B_URL");
@@ -166,6 +170,7 @@ async fn private_swarm_configuration_and_peering() {
 }
 
 #[tokio::test]
+#[ignore = "requires the private two-peer Cluster and Kubo topology"]
 async fn private_swarm_wrong_key_rejected() {
     let kubo_a = kubo_api_client("IPFS_S3_CLUSTER_KUBO_A_URL");
     let kubo_b = kubo_api_client("IPFS_S3_CLUSTER_KUBO_B_URL");
@@ -182,6 +187,7 @@ async fn private_swarm_wrong_key_rejected() {
 }
 
 #[tokio::test]
+#[ignore = "requires the private two-peer Cluster and Kubo topology"]
 async fn cluster_topology_converges() {
     let cluster_a = cluster_client("IPFS_S3_CLUSTER_A_REST_URL");
     let cluster_b = cluster_client("IPFS_S3_CLUSTER_B_REST_URL");
@@ -194,6 +200,7 @@ async fn cluster_topology_converges() {
 }
 
 #[tokio::test]
+#[ignore = "requires the private two-peer Cluster and Kubo topology"]
 async fn cluster_proxy_compatibility() {
     let result: AnyResult<()> = match tokio::time::timeout(PROXY_SEQUENCE_TIMEOUT, async {
         let proxy = endpoint("IPFS_S3_CLUSTER_A_PROXY_URL");
@@ -249,6 +256,7 @@ async fn cluster_proxy_compatibility() {
 }
 
 #[tokio::test]
+#[ignore = "requires the private two-peer Cluster and Kubo topology"]
 async fn cluster_replication_and_retention() {
     let cluster_a = cluster_client("IPFS_S3_CLUSTER_A_REST_URL");
     let cluster_b = cluster_client("IPFS_S3_CLUSTER_B_REST_URL");
@@ -379,6 +387,7 @@ async fn cluster_replication_and_retention() {
 }
 
 #[tokio::test]
+#[ignore = "requires the private two-peer Cluster and Kubo topology"]
 async fn cluster_peer_b_outage_contract() {
     let state = match RecoveryState::read(&state_path()) {
         Ok(state) => state,
@@ -406,6 +415,7 @@ async fn cluster_peer_b_outage_contract() {
 }
 
 #[tokio::test]
+#[ignore = "requires the private two-peer Cluster and Kubo topology"]
 async fn cluster_peer_b_restart_recovery() {
     let state = match RecoveryState::read(&state_path()) {
         Ok(state) => state,

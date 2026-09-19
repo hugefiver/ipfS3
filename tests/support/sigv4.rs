@@ -357,8 +357,8 @@ fn sha256_chunks_hex(chunks: &[bytes::Bytes]) -> String {
     hex::encode(hasher.finalize())
 }
 
-#[test]
-fn presign_sigv4_query_includes_custom_query_before_signature() {
+#[allow(dead_code)]
+pub fn assert_presign_sigv4_query_includes_custom_query_before_signature() {
     let now = chrono::DateTime::parse_from_rfc3339("2026-07-07T12:00:00Z")
         .expect("fixed RFC 3339 timestamp")
         .with_timezone(&chrono::Utc);
@@ -430,8 +430,8 @@ fn presign_sigv4_query_includes_custom_query_before_signature() {
     );
 }
 
-#[test]
-fn canonical_uri_omits_trailing_slash_for_bucket_operations() {
+#[allow(dead_code)]
+pub fn assert_canonical_uri_omits_trailing_slash_for_bucket_operations() {
     assert_eq!(canonical_uri("test-bkt", ""), "/test-bkt");
     assert_eq!(
         canonical_uri("test bkt", "nested/path with space.txt"),

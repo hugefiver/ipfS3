@@ -5,7 +5,7 @@
 //! `http://127.0.0.1:5001`) and can be overridden with
 //! `IPFS_S3_E2E_ENDPOINT` and `IPFS_S3_E2E_KUBO_URL`.
 //!
-//! Run: cargo test --test e2e -- --nocapture --test-threads=1
+//! Run: cargo test --test e2e -- --include-ignored --nocapture --test-threads=1
 
 #[allow(dead_code)]
 #[path = "support/sigv4.rs"]
@@ -174,12 +174,14 @@ async fn kubo_cat(cid: &str) -> Vec<u8> {
 }
 
 #[tokio::test]
+#[ignore = "requires a running gateway and Kubo topology"]
 async fn test_02_create_bucket() {
     let (_name, bucket) = create_bucket("create").await;
     cleanup_success(&bucket, &[]).await;
 }
 
 #[tokio::test]
+#[ignore = "requires a running gateway and Kubo topology"]
 async fn test_03_04_put_get_plain_object() {
     let (_name, bucket) = create_bucket("plain").await;
     let content = b"hello world from e2e";
@@ -211,6 +213,7 @@ async fn test_03_04_put_get_plain_object() {
 }
 
 #[tokio::test]
+#[ignore = "requires a running gateway and Kubo topology"]
 async fn test_05_list_objects() {
     let (_name, bucket) = create_bucket("list").await;
     let objects: [(&str, &[u8]); 2] = [("file1.txt", b"data1"), ("file2.txt", b"data2")];
@@ -247,6 +250,7 @@ async fn test_05_list_objects() {
 }
 
 #[tokio::test]
+#[ignore = "requires a running gateway and Kubo topology"]
 async fn test_06_delete_then_404() {
     let (_name, bucket) = create_bucket("delete").await;
     let put_response = s3_call(
@@ -281,6 +285,7 @@ async fn test_06_delete_then_404() {
 }
 
 #[tokio::test]
+#[ignore = "requires a running gateway and Kubo topology"]
 async fn test_07_copy_object_same_cid() {
     let (_name, bucket) = create_bucket("copy").await;
     let content = b"copy source data";
@@ -320,6 +325,7 @@ async fn test_07_copy_object_same_cid() {
 }
 
 #[tokio::test]
+#[ignore = "requires a running gateway and Kubo topology"]
 async fn test_08_range_request() {
     let (_name, bucket) = create_bucket("range").await;
     let content = (0..1024u32)
@@ -360,6 +366,7 @@ async fn test_08_range_request() {
 }
 
 #[tokio::test]
+#[ignore = "requires a running gateway and Kubo topology"]
 async fn test_09_wrong_credentials() {
     let (name, bucket) = create_bucket("auth").await;
     let bad_credentials = Credentials::new(Some("wrong"), Some("wrong"), None, None, None).unwrap();
@@ -383,6 +390,7 @@ async fn test_09_wrong_credentials() {
 }
 
 #[tokio::test]
+#[ignore = "requires a running gateway and Kubo topology"]
 async fn test_10_multipart_upload() {
     let (_name, bucket) = create_bucket("multipart").await;
     let content = (0..6_291_456u32)
@@ -438,6 +446,7 @@ async fn test_10_multipart_upload() {
 }
 
 #[tokio::test]
+#[ignore = "requires a running gateway and Kubo topology"]
 async fn test_11_encrypted_object() {
     let (_name, bucket) = create_bucket("encrypted").await;
     let content = b"secret encrypted data";
@@ -478,6 +487,7 @@ async fn test_11_encrypted_object() {
 }
 
 #[tokio::test]
+#[ignore = "requires a running gateway and Kubo topology"]
 async fn test_12_plain_object_ipfs_cat() {
     let (_name, bucket) = create_bucket("plain-ipfs").await;
     let content = b"plain data for ipfs cat";
@@ -500,6 +510,7 @@ async fn test_12_plain_object_ipfs_cat() {
 }
 
 #[tokio::test]
+#[ignore = "requires a running gateway and Kubo topology"]
 async fn test_14_etag_is_cid() {
     let (_name, bucket) = create_bucket("etag").await;
     let put_response = s3_call(
@@ -522,6 +533,7 @@ async fn test_14_etag_is_cid() {
 }
 
 #[tokio::test]
+#[ignore = "requires a running gateway and Kubo topology"]
 async fn test_15_lifecycle_configuration_raw_sigv4() {
     let (name, bucket) = create_bucket("lifecycle-config").await;
     let configuration = "<LifecycleConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\

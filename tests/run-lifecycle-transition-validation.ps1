@@ -93,7 +93,7 @@ function Start-Owned([string]$Name, [string]$File, [string[]]$Arguments) {
     $p = [Diagnostics.Process]::Start($info)
     $script:Children.Add(@{name=$Name; process=$p; stdout=$p.StandardOutput.ReadToEndAsync(); stderr=$p.StandardError.ReadToEndAsync()})
 }
-function Cargo-Test([string]$Target, [string]$Filter='', [switch]$Ignored, [int]$ExpectedIgnored=0) {
+function Cargo-Test([string]$Target, [string]$Filter='', [switch]$Ignored, [switch]$IncludeIgnored, [int]$ExpectedIgnored=0) {
     if ($script:ResumePending) {
         if ($Target -ceq $ResumeFromTest -or $Filter -ceq $ResumeFromTest) { $script:ResumePending = $false }
         else { $summary.steps += @{name=$Target; status='NOT RUN'; reason='explicit resume'; exit_code=$null}; return }
@@ -102,6 +102,7 @@ function Cargo-Test([string]$Target, [string]$Filter='', [switch]$Ignored, [int]
     if ($Filter) { $arguments += $Filter }
     $arguments += @('--','--nocapture','--test-threads=1')
     if ($Ignored) { $arguments += '--ignored' }
+    if ($IncludeIgnored) { $arguments += '--include-ignored' }
     if ($Filter) { $arguments += '--exact' }
     $name = if ($Filter) {"$Target-$Filter"} else {$Target}
     $null = Invoke-Step $name cargo $arguments -Tests -ExpectedIgnored $ExpectedIgnored
@@ -229,7 +230,7 @@ try {
         $null = Wait-Http "http://127.0.0.1:$lb/health"
         Set-RunEnv 'IPFS_S3_MULTI_GATEWAY_A_ENDPOINT' "http://127.0.0.1:$a"; Set-RunEnv 'IPFS_S3_MULTI_GATEWAY_B_ENDPOINT' "http://127.0.0.1:$b"
         Set-RunEnv 'IPFS_S3_MULTI_GATEWAY_LOAD_BALANCER_ENDPOINT' "http://127.0.0.1:$lb"; Set-RunEnv 'IPFS_S3_MULTI_GATEWAY_KUBO_URL' $hotUrl; Set-RunEnv 'IPFS_S3_MULTI_GATEWAY_DATABASE_URL' $dbUrl
-        Cargo-Test 'multi_gateway'
+        Cargo-Test 'multi_gateway' -IncludeIgnored
         $null = Invoke-Step 'runner-contracts' pwsh @('-NoProfile','-File',(Join-Path $PSScriptRoot 'lifecycle-transition.Tests.ps1'))
         $null = Invoke-Step 'fmt' cargo @('fmt','--check')
         $null = Invoke-Step 'clippy' cargo @('clippy','--locked','--offline','--all-targets','--','-D','warnings')

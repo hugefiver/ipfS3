@@ -519,7 +519,7 @@ function Assert-RustSuiteExecuted {
     $output = (@($Result.StdOut) + @($Result.StdErr)) -join "`n"
     if ($output -notmatch '(?m)^running [1-9][0-9]* tests$' -or
         $output -notmatch 'test result: ok\.' -or
-        $output -match '(?i)skipping PostgreSQL object-versioning test') {
+        $output -match '(?i)\bskipping\b') {
         throw "$Name did not prove real, non-skipped Rust tests"
     }
 }
@@ -539,9 +539,9 @@ function Invoke-RustEvidenceSuites {
         Set-VersioningStage -State $State -Stage "e2e"
         Set-RunEnvironment -Name "IPFS_S3_E2E_ENDPOINT" -Value "http://127.0.0.1:59003"
         Set-RunEnvironment -Name "IPFS_S3_E2E_KUBO_URL" -Value "http://127.0.0.1:55003"
-        Write-Evidence -Category "command" -Value "cargo test --test e2e -- --nocapture --test-threads=1"
+        Write-Evidence -Category "command" -Value "cargo test --test e2e -- --include-ignored --nocapture --test-threads=1"
         $e2eResult = Invoke-Cargo `
-            -Arguments @("test", "--test", "e2e", "--", "--nocapture", "--test-threads=1") `
+            -Arguments @("test", "--test", "e2e", "--", "--include-ignored", "--nocapture", "--test-threads=1") `
             -Label "existing serial end-to-end test"
         Assert-RustSuiteExecuted -Result $e2eResult -Name "existing serial end-to-end test"
         Write-Evidence -Category "result" -Value "e2e=passed"
