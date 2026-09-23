@@ -25,13 +25,116 @@ pub trait PinningProvider: Send + Sync + 'static {
         self.find(query).await
     }
 
+    async fn observe_historical(
+        &self,
+        query: FindPin,
+        api: &str,
+        strategy: &str,
+    ) -> Result<QueryObservation, ProviderError> {
+        self.find_historical(query, api, strategy)
+            .await
+            .map(QueryObservation::Complete)
+    }
+
     async fn submit(&self, request: SubmitPin) -> Result<RemotePin, ProviderError>;
 
     async fn get(&self, request_id: &str) -> Result<RemotePin, ProviderError>;
 
+    async fn get_historical(
+        &self,
+        request_id: &str,
+        api: &str,
+        strategy: &str,
+    ) -> Result<RemotePin, ProviderError> {
+        if self.invocation_route() != (api, strategy) {
+            return Err(historical_route_error());
+        }
+        self.get(request_id).await
+    }
+
     async fn find(&self, query: FindPin) -> Result<Vec<RemotePin>, ProviderError>;
 
     async fn unpin(&self, request_id: &str) -> Result<(), ProviderError>;
+
+    async fn unpin_historical(
+        &self,
+        request_id: &str,
+        api: &str,
+        strategy: &str,
+    ) -> Result<(), ProviderError> {
+        if self.invocation_route() != (api, strategy) {
+            return Err(historical_route_error());
+        }
+        self.unpin(request_id).await
+    }
+}
+
+fn historical_route_error() -> ProviderError {
+    ProviderError {
+        class: ProviderErrorClass::Protocol,
+        message: "historical provider route unavailable".into(),
+        retry_after: None,
+    }
+}
+
+/// A typed reference always carries the account and historical transport route.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RemoteRef {
+    pub resource_type: crate::pinning::identity::RemoteResourceType,
+    pub cid: String,
+    pub opaque_id: String,
+    pub route: crate::pinning::identity::ProviderRouteSnapshot,
+    pub ownership: crate::pinning::identity::Ownership,
+}
+
+/// Only Complete is authoritative for absence. Unknown is never an empty page.
+#[derive(Debug)]
+pub enum QueryObservation {
+    Complete(Vec<RemotePin>),
+    Unknown(ProviderError),
+}
+
+pub(crate) struct HistoricalProvider {
+    pub inner: std::sync::Arc<dyn PinningProvider>,
+    pub api: &'static str,
+    pub strategy: &'static str,
+}
+
+#[async_trait::async_trait]
+impl PinningProvider for HistoricalProvider {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn invocation_route(&self) -> (&'static str, &'static str) {
+        (self.api, self.strategy)
+    }
+    async fn submit(&self, request: SubmitPin) -> Result<RemotePin, ProviderError> {
+        if self.inner.invocation_route() != self.invocation_route() {
+            return Err(historical_route_error());
+        }
+        self.inner.submit(request).await
+    }
+    async fn get(&self, id: &str) -> Result<RemotePin, ProviderError> {
+        self.inner.get_historical(id, self.api, self.strategy).await
+    }
+    async fn unpin(&self, id: &str) -> Result<(), ProviderError> {
+        self.inner
+            .unpin_historical(id, self.api, self.strategy)
+            .await
+    }
+    async fn find(&self, query: FindPin) -> Result<Vec<RemotePin>, ProviderError> {
+        self.inner
+            .find_historical(query, self.api, self.strategy)
+            .await
+    }
+    async fn find_historical(
+        &self,
+        query: FindPin,
+        api: &str,
+        strategy: &str,
+    ) -> Result<Vec<RemotePin>, ProviderError> {
+        self.inner.find_historical(query, api, strategy).await
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -14,3 +14,4 @@ pub mod m20260912_000001_residency_references;
 pub mod m20260912_000002_lifecycle_transition;
 pub mod m20260919_000001_standard_mutation_lease;
 pub mod m20260920_000001_pin_submit_history;
+pub mod m20260920_000002_pin_identity_ledger;

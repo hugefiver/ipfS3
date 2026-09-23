@@ -81,6 +81,50 @@ priority = 20
 max_bytes = 107374182400
 max_pins = 10000
 
+# Stable runtime identities are separate from routing aliases (`name`). Every
+# configured provider must have exactly one identity when this registry is
+# present. Revisions are administrator-managed and must increase when the
+# referenced credential or endpoint changes. Snapshots persist only secret
+# references such as env names, never secret values or hashes.
+#
+# `storage_domain` is the physical/account pin domain. A provider whose domain
+# equals `primary_storage_domain` is rejected because it is not an independent
+# backup. Aliases for the same backend + scope intentionally share canonical
+# resource accounting. New explicit identities default to cleanup = "retain";
+# set cleanup = "managed" only for an exclusive, operationally verified scope.
+[pinning_identity]
+primary_storage_domain = "kubo:primary"
+
+[[pinning_identity.providers]]
+config_name = "pinata-primary"
+provider_id = "pinata-prod"
+display_name = "Primary Pinata"
+backend = "pinata"
+scope = "account:pinata-prod"
+storage_domain = "pinata:pinata-prod"
+credential_revision = 1
+endpoint_revision = 1
+secret_ref = "env:PINATA_JWT"
+api_profile = "pinata-v3"
+strategy = "cid"
+retired = false
+cleanup = "retain"
+
+[[pinning_identity.providers]]
+config_name = "filebase-primary"
+provider_id = "filebase-prod"
+display_name = "Primary Filebase"
+backend = "filebase"
+scope = "account:filebase-prod"
+storage_domain = "filebase:filebase-prod"
+credential_revision = 1
+endpoint_revision = 1
+secret_ref = "env:FILEBASE_PINNING_TOKEN"
+api_profile = "filebase-psa"
+strategy = "cid"
+retired = false
+cleanup = "retain"
+
 # Policies are evaluated in file order. The first exact-bucket (or "*") and
 # literal-prefix match wins.
 [[pinning.policies]]

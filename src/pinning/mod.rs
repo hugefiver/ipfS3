@@ -1,6 +1,7 @@
 pub mod config;
 pub mod coordinator;
 pub mod filebase;
+pub mod identity;
 pub mod noop;
 pub mod pinata;
 pub mod policy;

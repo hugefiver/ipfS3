@@ -18,9 +18,13 @@ use crate::{
         provider::RemotePinStatus,
     },
     store::{
-        entities::{object, pin_job, pin_lease, pin_lease_target, remote_pin},
+        entities::{
+            object, pin_invocation_route, pin_job, pin_lease, pin_lease_target, pin_provider_route,
+            pin_resource_history, remote_pin,
+        },
         pinning::{
             jobs::{self, NewPinJob, NoRequestSubmitAmbiguity},
+            ledger,
             quota::{self, ConfirmedReleaseOutcome},
         },
     },
@@ -977,8 +981,15 @@ async fn project_target_from_remote_inner<C: ConnectionTrait>(
         return Ok(None);
     }
     Ok(Some(
-        project_prelocked_desired_target(db, desired, &snapshot.desired, &snapshot.remote, now)
-            .await?,
+        project_prelocked_desired_target(
+            db,
+            desired,
+            &snapshot.desired,
+            &snapshot.remote,
+            ProjectionAccess::Admission,
+            now,
+        )
+        .await?,
     ))
 }
 
@@ -1004,7 +1015,15 @@ async fn project_inserted_target_from_prelocked_remote<C: ConnectionTrait>(
         .iter()
         .find(|desired| desired.target.id == target_id)
         .ok_or_else(|| stale_lifecycle_error("inserted target projection"))?;
-    project_prelocked_desired_target(db, inserted, &desired, &remote, now).await
+    project_prelocked_desired_target(
+        db,
+        inserted,
+        &desired,
+        &remote,
+        ProjectionAccess::Admission,
+        now,
+    )
+    .await
 }
 
 /// Acquires the union of lifecycle rows that a publication can replace or attach to.
@@ -1176,6 +1195,7 @@ pub async fn project_target_from_remote_with_limits<C: ConnectionTrait>(
                 desired,
                 &snapshot.desired,
                 &snapshot.remote,
+                ProjectionAccess::Admission,
                 now,
             )
             .await?,
@@ -1197,7 +1217,15 @@ pub async fn project_target_from_remote_with_limits<C: ConnectionTrait>(
             let remote = lock_remote_after_lifecycle(db, &target.provider, &target.cid)
                 .await?
                 .ok_or_else(|| invalid("target remote pin disappeared during reservation"))?;
-            project_prelocked_desired_target(db, desired, &snapshot.desired, &remote, now).await?
+            project_prelocked_desired_target(
+                db,
+                desired,
+                &snapshot.desired,
+                &remote,
+                ProjectionAccess::Admission,
+                now,
+            )
+            .await?
         }
         ReservationOutcome::QuotaWaiting { .. } => {
             set_prelocked_target_state(db, &desired.target, TARGET_QUOTA_WAITING).await?;
@@ -1447,7 +1475,7 @@ pub async fn apply_remote_status<C: ConnectionTrait>(
     db: &C,
     update: RemoteStatusUpdate<'_>,
 ) -> AppResult<RemoteStatusApplyResult> {
-    apply_remote_status_inner(db, update, false, None).await
+    apply_remote_status_inner(db, update, false, None, None).await
 }
 
 /// Applies a live worker observation with monotonic status protection for one request identity.
@@ -1455,7 +1483,17 @@ pub async fn apply_worker_remote_status<C: ConnectionTrait>(
     db: &C,
     update: RemoteStatusUpdate<'_>,
 ) -> AppResult<RemoteStatusApplyResult> {
-    apply_remote_status_inner(db, update, true, None).await
+    apply_remote_status_inner(db, update, true, None, None).await
+}
+
+/// A claimed Submit can follow its own queued response even when the allocation
+/// route has since retired or changed strategy. This does not grant admission.
+pub(crate) async fn apply_claimed_worker_remote_status<C: ConnectionTrait>(
+    db: &C,
+    update: RemoteStatusUpdate<'_>,
+    job: &pin_job::Model,
+) -> AppResult<RemoteStatusApplyResult> {
+    apply_remote_status_inner(db, update, true, None, Some(job)).await
 }
 
 /// Applies a remote-scoped Reconcile observation only at the job's exact remote epoch.
@@ -1466,7 +1504,20 @@ pub async fn apply_reconcile_remote_status<C: ConnectionTrait>(
     expected_remote_epoch: i64,
     update: RemoteStatusUpdate<'_>,
 ) -> AppResult<RemoteStatusApplyResult> {
-    apply_remote_status_inner(db, update, true, Some(expected_remote_epoch)).await
+    apply_remote_status_inner(db, update, true, Some(expected_remote_epoch), None).await
+}
+
+/// Internal worker path: the caller fences the claim in the same transaction.
+/// Reconcile can transfer only an existing request's read-only follow-up.
+pub(crate) async fn apply_claimed_reconcile_remote_status<C: ConnectionTrait>(
+    db: &C,
+    update: RemoteStatusUpdate<'_>,
+    job: &pin_job::Model,
+) -> AppResult<RemoteStatusApplyResult> {
+    let Some(epoch) = job.expected_remote_epoch else {
+        return Ok(RemoteStatusApplyResult::StaleRequest);
+    };
+    apply_remote_status_inner(db, update, true, Some(epoch), Some(job)).await
 }
 
 async fn apply_remote_status_inner<C: ConnectionTrait>(
@@ -1474,6 +1525,7 @@ async fn apply_remote_status_inner<C: ConnectionTrait>(
     update: RemoteStatusUpdate<'_>,
     enforce_monotonic_status: bool,
     expected_remote_epoch: Option<i64>,
+    observation_job: Option<&pin_job::Model>,
 ) -> AppResult<RemoteStatusApplyResult> {
     for attempt in 0..REMOTE_STATUS_WRITE_RETRY_LIMIT {
         let snapshot =
@@ -1535,11 +1587,33 @@ async fn apply_remote_status_inner<C: ConnectionTrait>(
             }
         };
 
+        let historical_poll = if matches!(remote.status.as_str(), REMOTE_QUEUED | REMOTE_PINNING)
+            && remote.request_id.as_deref() == Some(update.request_id)
+        {
+            match observation_job {
+                Some(job)
+                    if job.operation != "submit" || update.origin == RemoteStatusOrigin::Adopt =>
+                {
+                    historical_poll_followup_allowed(db, job, &snapshot.desired, &remote).await?
+                }
+                _ => false,
+            }
+        } else {
+            false
+        };
+
         // The snapshot was locked in lease → target → remote order. Projection deliberately uses
         // only those rows, so it never reacquires a target after the remote status CAS.
         for desired in &snapshot.desired {
-            project_prelocked_desired_target(db, desired, &snapshot.desired, &remote, update.now)
-                .await?;
+            project_prelocked_desired_target(
+                db,
+                desired,
+                &snapshot.desired,
+                &remote,
+                ProjectionAccess::Observation { historical_poll },
+                update.now,
+            )
+            .await?;
         }
 
         let projected_target_state = target_state_from_remote(&remote.status)
@@ -1588,6 +1662,85 @@ async fn apply_remote_status_inner<C: ConnectionTrait>(
     Err(AppError::Database(
         "remote status compare-and-set exhausted concurrent retries".to_owned(),
     ))
+}
+
+/// A claimed Submit's response can hand off its first read-only Poll to the
+/// prelocked desired owner even if its original owner was cancelled. Reconcile
+/// still requires an existing Poll proving the request. Neither grants admission
+/// or crosses an account/credential/endpoint revision or an archived release.
+async fn historical_poll_followup_allowed<C: ConnectionTrait>(
+    db: &C,
+    job: &pin_job::Model,
+    desired: &[DesiredTarget],
+    remote: &remote_pin::Model,
+) -> AppResult<bool> {
+    if job.provider != remote.provider
+        || job.cid != remote.cid
+        || remote.request_id.is_none()
+        || desired.is_empty()
+    {
+        return Ok(false);
+    }
+    match job.operation.as_str() {
+        "submit" if jobs::submit_names_original_target(job) => {}
+        "reconcile"
+            if job.expected_remote_epoch == Some(remote.epoch)
+                && job.lease_id.is_none()
+                && job.target_id.is_none()
+                && job.expected_generation.is_none() => {}
+        _ => return Ok(false),
+    }
+    let captured = pin_invocation_route::Entity::find_by_id(job.id.clone())
+        .one(db)
+        .await?;
+    let ledger_route = ledger::get(db, &job.provider, &job.cid).await?;
+    let configured = pin_provider_route::Entity::find_by_id(job.provider.clone())
+        .one(db)
+        .await?;
+    let (Some(captured), Some(ledger_route), Some(configured)) =
+        (captured, ledger_route, configured)
+    else {
+        return Ok(false);
+    };
+    if ledger_route.route.as_deref() != Some(captured.route.as_str())
+        || captured.remote_epoch > remote.epoch
+    {
+        return Ok(false);
+    }
+    if job.operation == "reconcile"
+        && (captured.remote_epoch != remote.epoch
+            || !ledger::has_historical_poll_request(db, remote, &captured.route).await?)
+    {
+        return Ok(false);
+    }
+    let (Ok(historical), Ok(current)) = (
+        serde_json::from_str::<crate::pinning::identity::ProviderRouteSnapshot>(&captured.route),
+        serde_json::from_str::<crate::pinning::identity::ProviderRouteSnapshot>(
+            &configured.snapshot,
+        ),
+    ) else {
+        return Ok(false);
+    };
+    let mut compatible = historical.clone();
+    compatible.api_profile = current.api_profile.clone();
+    compatible.strategy = current.strategy.clone();
+    compatible.cleanup = current.cleanup;
+    if compatible != current {
+        return Ok(false);
+    }
+    if captured.remote_epoch < remote.epoch
+        && pin_resource_history::Entity::find()
+            .filter(pin_resource_history::Column::Provider.eq(&job.provider))
+            .filter(pin_resource_history::Column::Cid.eq(&job.cid))
+            .filter(pin_resource_history::Column::Epoch.gte(captured.remote_epoch))
+            .filter(pin_resource_history::Column::Epoch.lt(remote.epoch))
+            .one(db)
+            .await?
+            .is_some()
+    {
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -2139,6 +2292,15 @@ pub async fn ensure_failed_remote_retry<C: ConnectionTrait>(
     let Some(at) = remote.next_retry_at else {
         return Ok(FailedRemoteRetryDecision::NotNeeded);
     };
+    // An old request may still report failure after its route is retired or changed.
+    // Record that observation, but do not schedule a fresh attempt on its behalf.
+    match quota::assert_reusable_route(db, provider, cid).await {
+        Ok(()) => {}
+        Err(AppError::InvalidPinningRequest(_)) => {
+            return Ok(FailedRemoteRetryDecision::NotNeeded);
+        }
+        Err(error) => return Err(error),
+    }
     let reconcile_job_id = ensure_reconcile(db, provider, cid, remote.epoch, at).await?;
     Ok(FailedRemoteRetryDecision::Scheduled {
         reconcile_job_id,
@@ -2213,6 +2375,9 @@ pub async fn prepare_failed_remote_resubmit<C: ConnectionTrait>(
     {
         return Ok(FailedRemoteResubmitDecision::NoAllModeTarget);
     }
+    // A historical Reconcile may inspect its captured request, but a new
+    // Submit needs today's matching allocation route.
+    quota::assert_reusable_route(db, provider, cid).await?;
 
     let new_epoch = increment_epoch(remote.epoch)?;
 
@@ -2987,9 +3152,16 @@ async fn refresh_renewal_snapshot_targets<C: ConnectionTrait>(
             .iter()
             .filter(|target| renewed_target_ids.contains(&target.target.id))
         {
-            project_prelocked_desired_target(db, target, desired, &remote, now)
-                .await
-                .map_err(app_to_renewal_error)?;
+            project_prelocked_desired_target(
+                db,
+                target,
+                desired,
+                &remote,
+                ProjectionAccess::Admission,
+                now,
+            )
+            .await
+            .map_err(app_to_renewal_error)?;
         }
         let has_all_mode_target = desired
             .iter()
@@ -4380,13 +4552,42 @@ fn same_desired_lifecycle_snapshot(left: &[DesiredTarget], right: &[DesiredTarge
         })
 }
 
+#[derive(Clone, Copy)]
+enum ProjectionAccess {
+    Admission,
+    Observation { historical_poll: bool },
+}
+
 async fn project_prelocked_desired_target<C: ConnectionTrait>(
     db: &C,
     desired: &DesiredTarget,
     all_desired: &[DesiredTarget],
     remote: &remote_pin::Model,
+    access: ProjectionAccess,
     now: DateTimeUtc,
 ) -> AppResult<TargetProjection> {
+    // Admission may create/attach work; an observation only updates an existing
+    // desired target. A retired/changed route cannot authorize new jobs, but it
+    // cannot invalidate a captured, already-fenced provider response either.
+    let schedule_work = match access {
+        ProjectionAccess::Admission => {
+            quota::assert_reusable_route(db, &desired.target.provider, &desired.target.cid).await?;
+            true
+        }
+        ProjectionAccess::Observation { .. } if remote.status == REMOTE_PINNED => false,
+        ProjectionAccess::Observation { historical_poll } => {
+            match quota::assert_reusable_route(db, &desired.target.provider, &desired.target.cid)
+                .await
+            {
+                Ok(()) => true,
+                Err(AppError::InvalidPinningRequest(_)) => {
+                    historical_poll
+                        && matches!(remote.status.as_str(), REMOTE_QUEUED | REMOTE_PINNING)
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    };
     #[cfg(test)]
     record_target_projection(&desired.target.id).await;
 
@@ -4416,7 +4617,9 @@ async fn project_prelocked_desired_target<C: ConnectionTrait>(
                 unreachable!("poll constructor is target scoped")
             };
             let poll_job_id = job.id.clone();
-            ensure_prelocked_target_job(db, job, now).await?;
+            if schedule_work {
+                ensure_prelocked_target_job(db, job, now).await?;
+            }
             Ok(TargetProjection::Submitted { poll_job_id })
         }
         REMOTE_RESERVED if remote.request_id.is_none() => {
@@ -4433,6 +4636,9 @@ async fn project_prelocked_desired_target<C: ConnectionTrait>(
                 unreachable!("submit constructor is target scoped")
             };
             let submit_job_id = job.id.clone();
+            if !schedule_work {
+                return Ok(TargetProjection::Waiting { submit_job_id });
+            }
             if let Some(blocking) = jobs::blocking_live_submit(
                 db,
                 &desired.target.provider,
@@ -4467,7 +4673,8 @@ async fn project_prelocked_desired_target<C: ConnectionTrait>(
                 unreachable!("reconcile constructor is remote scoped")
             };
             let reconcile_job_id = job.id.clone();
-            if remote.failure_attempts < MAX_FAILED_REQUEST_ATTEMPTS
+            if schedule_work
+                && remote.failure_attempts < MAX_FAILED_REQUEST_ATTEMPTS
                 && remote.next_retry_at.is_some()
                 && all_desired
                     .iter()
@@ -4492,37 +4699,38 @@ async fn ensure_prelocked_target_job<C: ConnectionTrait>(
     job: jobs::TargetPinJob,
     now: DateTimeUtc,
 ) -> AppResult<()> {
-    let (operation, submit_phase) = match job.operation {
-        jobs::TargetJobOperation::Submit => ("submit", Some("ready")),
-        jobs::TargetJobOperation::Poll => ("poll", None),
+    let submit_phase = match job.operation {
+        jobs::TargetJobOperation::Submit => Some("ready"),
+        jobs::TargetJobOperation::Poll => None,
     };
     let Some(existing) = pin_job::Entity::find_by_id(job.id.clone()).one(db).await? else {
-        pin_job::Entity::insert(pin_job::ActiveModel {
-            id: Set(job.id),
-            operation: Set(operation.to_owned()),
-            provider: Set(job.provider),
-            cid: Set(job.cid),
-            lease_id: Set(Some(job.lease_id)),
-            target_id: Set(Some(job.target_id)),
-            expected_generation: Set(Some(job.expected_generation)),
-            expected_remote_epoch: Set(None),
-            state: Set(JOB_PENDING.to_owned()),
-            attempts: Set(0),
-            next_attempt_at: Set(job.next_attempt_at),
-            locked_until: Set(None),
-            submit_phase: Set(submit_phase.map(str::to_owned)),
-            last_error: Set(None),
-            created_at: Set(now),
-            updated_at: Set(now),
-        })
-        .on_conflict_do_nothing()
-        .exec(db)
-        .await?;
+        jobs::insert_new_job(db, NewPinJob::Target(job), now).await?;
         return Ok(());
     };
     match existing.state.as_str() {
         JOB_PENDING | JOB_RUNNING => Ok(()),
         JOB_DONE => {
+            // A stable target job ID can survive a released/reallocated remote. Never
+            // borrow today's route/epoch for a historical or uncaptured done row.
+            if let Some(row) = ledger::get(db, &job.provider, &job.cid).await? {
+                let route = row.route.ok_or_else(|| {
+                    invalid("prelocked target job has no current invocation identity")
+                })?;
+                let captured = pin_invocation_route::Entity::find_by_id(existing.id.clone())
+                    .one(db)
+                    .await?;
+                let remote =
+                    remote_pin::Entity::find_by_id((job.provider.clone(), job.cid.clone()))
+                        .one(db)
+                        .await?;
+                if !captured.zip(remote).is_some_and(|(captured, remote)| {
+                    captured.route == route && captured.remote_epoch == remote.epoch
+                }) {
+                    return Err(invalid(
+                        "prelocked target job has no current invocation identity",
+                    ));
+                }
+            }
             let updated = pin_job::Entity::update_many()
                 .col_expr(pin_job::Column::State, Expr::value(JOB_PENDING.to_owned()))
                 .col_expr(pin_job::Column::Attempts, Expr::value(0_i32))

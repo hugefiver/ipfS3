@@ -77,6 +77,31 @@ pub struct PinataClient {
 }
 
 impl PinataClient {
+    fn historical(&self, api: &str, strategy: &str) -> Result<Self, ProviderError> {
+        let mut historical = self.clone();
+        if api == "psa" && strategy == "cid" {
+            historical.legacy_psa = self
+                .legacy_psa
+                .clone()
+                .or_else(|| self.legacy_request_psa.clone());
+            if historical.legacy_psa.is_none() {
+                return Err(protocol_error("historical provider route unavailable"));
+            }
+            return Ok(historical);
+        }
+        historical.legacy_psa = None;
+        historical.api = match api {
+            "pinata_v3" => PinataApi::V3,
+            "pinata_legacy" => PinataApi::Legacy,
+            _ => return Err(protocol_error("historical provider route unavailable")),
+        };
+        historical.strategy = match strategy {
+            "cid" => PinataStrategy::Cid,
+            "upload" => PinataStrategy::Upload,
+            _ => return Err(protocol_error("historical provider route unavailable")),
+        };
+        Ok(historical)
+    }
     pub fn new(
         name: String,
         endpoint: String,
@@ -1000,6 +1025,24 @@ impl PinningProvider for PinataClient {
             (PinataApi::Legacy, PinataStrategy::Cid) => self.submit_legacy_cid(request).await,
             (_, PinataStrategy::Upload) => self.submit_upload(request).await,
         }
+    }
+
+    async fn get_historical(
+        &self,
+        request_id: &str,
+        api: &str,
+        strategy: &str,
+    ) -> Result<RemotePin, ProviderError> {
+        self.historical(api, strategy)?.get(request_id).await
+    }
+
+    async fn unpin_historical(
+        &self,
+        request_id: &str,
+        api: &str,
+        strategy: &str,
+    ) -> Result<(), ProviderError> {
+        self.historical(api, strategy)?.unpin(request_id).await
     }
 
     async fn get(&self, request_id: &str) -> Result<RemotePin, ProviderError> {
@@ -2061,6 +2104,43 @@ mod tests {
             request.method.as_str() == "DELETE"
                 && request.url.path() == "/v3/files/public/legacy-psa-request-7"
         }));
+    }
+
+    #[tokio::test]
+    async fn stage2_historical_reference_routes_survive_current_psa_profile() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/v3/files/public"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":{"files":[{"id":"file-7","cid":"bafy-target","keyvalues":{"gateway_job_id":"job-7"}}]}})))
+            .expect(1).mount(&server).await;
+        Mock::given(method("DELETE"))
+            .and(path("/v3/files/public/file-7"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut current = provider(&server);
+        current.legacy_psa = current.legacy_request_psa.clone();
+        assert_eq!(current.invocation_route(), ("psa", "cid"));
+        let id = encode_request_id(
+            "file-7",
+            "bafy-target",
+            &BTreeMap::from([("gateway_job_id".into(), "job-7".into())]),
+        );
+        let observed = current
+            .get_historical(&id, "pinata_v3", "cid")
+            .await
+            .unwrap();
+        assert_eq!(observed.status, RemotePinStatus::Pinned);
+        current
+            .unpin_historical(&id, "pinata_v3", "cid")
+            .await
+            .unwrap();
+        assert!(
+            requests(&server)
+                .await
+                .iter()
+                .all(|request| !request.url.path().starts_with("/psa"))
+        );
     }
 
     #[tokio::test]

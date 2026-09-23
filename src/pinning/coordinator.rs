@@ -10,6 +10,7 @@ use crate::kubo::KuboClient;
 use crate::pinning::{
     config::{ProviderKind, ProviderLimitMap, ValidatedPinningConfig},
     filebase::build_filebase,
+    identity::ProviderIdentity,
     noop::NoopProvider,
     pinata::build_pinata_with_options,
     policy::PinPolicyEvaluator,
@@ -40,6 +41,7 @@ pub struct PinningCoordinator {
     limits: ProviderLimitMap,
     settings: WorkerSettings,
     provider_runtime: HashMap<String, ProviderRuntime>,
+    identities: HashMap<String, ProviderIdentity>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,9 +66,63 @@ impl PinningCoordinator {
     }
 
     pub fn build_with_kubo(
-        config: ValidatedPinningConfig,
+        mut config: ValidatedPinningConfig,
         kubo: Option<KuboClient>,
     ) -> anyhow::Result<Arc<Self>> {
+        // Resolve aliases before policy evaluation: all later target, quota and
+        // job keys use the same physical resource namespace.
+        let aliases: HashMap<_, _> = config
+            .providers
+            .iter()
+            .map(|p| (p.name.clone(), p.identity.allocation_key()))
+            .collect();
+        for (index, policy) in config.policies.iter_mut().enumerate() {
+            policy.providers = policy
+                .providers
+                .iter()
+                .map(|name| aliases[name].clone())
+                .collect();
+            let mut seen = std::collections::HashSet::new();
+            policy.providers.retain(|name| seen.insert(name.clone()));
+            policy.refresh_identity(index);
+        }
+        config
+            .providers
+            .sort_by(|a, b| a.identity.provider_id.cmp(&b.identity.provider_id));
+        config.provider_limits.clear();
+        let mut domain_routes: HashMap<String, ProviderIdentity> = HashMap::new();
+        for provider in &mut config.providers {
+            provider.name = provider.identity.allocation_key();
+            if provider.name.len() > 255 {
+                return Err(anyhow!(
+                    "pinning allocation identity exceeds the database key limit"
+                ));
+            }
+            provider.limits.enabled &= !provider.identity.retired;
+            if let Some(existing) = domain_routes.get(&provider.name) {
+                let mut alias = provider.identity.clone();
+                alias.provider_id.clone_from(&existing.provider_id);
+                alias.display_name.clone_from(&existing.display_name);
+                if &alias != existing {
+                    return Err(anyhow!(
+                        "aliases in the same pinning domain must agree on protocol, strategy, revisions and cleanup"
+                    ));
+                }
+            } else {
+                domain_routes.insert(provider.name.clone(), provider.identity.clone());
+            }
+            if let Some(existing) = config.provider_limits.get(&provider.name) {
+                if existing != &provider.limits {
+                    return Err(anyhow!(
+                        "aliases in the same pinning domain must have identical limits"
+                    ));
+                }
+            } else {
+                config
+                    .provider_limits
+                    .insert(provider.name.clone(), provider.limits.clone());
+            }
+        }
         let claim_limit = config
             .worker_concurrency
             .checked_mul(2)
@@ -92,9 +148,14 @@ impl PinningCoordinator {
         let limits = config.provider_limits.clone();
         let mut providers: HashMap<String, Arc<dyn PinningProvider>> = HashMap::new();
         let mut provider_runtime = HashMap::new();
+        let mut identities = HashMap::new();
 
         for provider in config.providers {
             let name = provider.name.clone();
+            if identities.contains_key(&name) {
+                continue;
+            }
+            identities.insert(name.clone(), provider.identity.clone());
             let kind = provider.kind;
             let min_request_interval = match kind {
                 ProviderKind::Noop => Duration::ZERO,
@@ -145,6 +206,7 @@ impl PinningCoordinator {
             limits,
             settings,
             provider_runtime,
+            identities,
         }))
     }
 
@@ -164,7 +226,31 @@ impl PinningCoordinator {
     }
 
     pub fn provider(&self, name: &str) -> Option<Arc<dyn PinningProvider>> {
-        self.providers.get(name).cloned()
+        self.providers.get(self.route_key(name)?).cloned()
+    }
+
+    pub fn provider_identity(&self, key: &str) -> Option<&ProviderIdentity> {
+        self.identities.get(self.route_key(key)?)
+    }
+
+    fn route_key<'a>(&'a self, key: &'a str) -> Option<&'a str> {
+        if self.identities.contains_key(key) {
+            return Some(key);
+        }
+        self.identities
+            .iter()
+            .filter(|(_, identity)| identity.owns_allocation_domain(key))
+            .min_by_key(|(_, identity)| &identity.provider_id)
+            .map(|(key, _)| key.as_str())
+    }
+
+    /// Register the current allocation routes before accepting publications.
+    /// Existing resource snapshots are never overwritten by this operation.
+    pub async fn register_identities(&self, store: &Store) -> crate::error::AppResult<()> {
+        for (key, identity) in &self.identities {
+            crate::store::pinning::ledger::register_route(store.db(), key, identity).await?;
+        }
+        Ok(())
     }
 
     pub fn settings(&self) -> &WorkerSettings {
@@ -172,7 +258,7 @@ impl PinningCoordinator {
     }
 
     pub fn provider_runtime(&self, name: &str) -> Option<&ProviderRuntime> {
-        self.provider_runtime.get(name)
+        self.provider_runtime.get(self.route_key(name)?)
     }
 
     /// Returns the captured policy order anchored at the failed provider, excluding unhealthy

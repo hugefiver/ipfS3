@@ -5,6 +5,8 @@ use anyhow::ensure;
 use chrono::Duration as ChronoDuration;
 use serde::Deserialize;
 
+use crate::pinning::identity::PinningIdentityConfig;
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     #[serde(default = "default_server_config")]
@@ -28,6 +30,9 @@ pub struct Config {
     #[serde(default = "default_pinning_config")]
     #[allow(dead_code)]
     pub pinning: PinningConfig,
+
+    #[serde(default)]
+    pub pinning_identity: PinningIdentityConfig,
 
     #[serde(default)]
     pub imports: ImportConfig,
@@ -328,6 +333,7 @@ impl Config {
             auth: default_auth_config(),
             crypto: default_crypto_config(),
             pinning: default_pinning_config(),
+            pinning_identity: PinningIdentityConfig::default(),
             imports: ImportConfig::default(),
             lifecycle: default_lifecycle_config(),
         }
@@ -526,6 +532,70 @@ mod tests {
         assert_eq!(config.pinning.worker_concurrency, 4);
         assert!(config.pinning.providers.is_empty());
         assert!(config.pinning.policies.is_empty());
+    }
+
+    #[test]
+    fn provider_identity_configuration_defaults_to_legacy_compatibility() {
+        let config: Config = toml::from_str("").unwrap();
+
+        assert!(config.pinning_identity.primary_storage_domain.is_none());
+        assert!(config.pinning_identity.providers.is_empty());
+    }
+
+    #[test]
+    fn provider_identity_configuration_deserializes_without_secrets() {
+        let config: Config = toml::from_str(
+            r#"
+                [pinning_identity]
+                primary_storage_domain = "kubo:primary"
+
+                [[pinning_identity.providers]]
+                config_name = "pinata-primary"
+                provider_id = "pinata-prod"
+                display_name = "Primary Pinata"
+                backend = "pinata"
+                scope = "account:prod"
+                storage_domain = "pinata:prod"
+                credential_revision = 2
+                endpoint_revision = 3
+                secret_ref = "env:PINATA_JWT"
+                api_profile = "pinata-v3"
+                strategy = "cid"
+                retired = true
+            "#,
+        )
+        .unwrap();
+
+        let identity = &config.pinning_identity.providers[0];
+        assert_eq!(identity.config_name, "pinata-primary");
+        assert_eq!(identity.provider_id, "pinata-prod");
+        assert_eq!(identity.display_name, "Primary Pinata");
+        assert_eq!(identity.credential_revision, 2);
+        assert_eq!(identity.endpoint_revision, 3);
+        assert!(identity.retired);
+        assert_eq!(
+            identity.cleanup,
+            crate::pinning::identity::CleanupMode::Retain
+        );
+    }
+
+    #[test]
+    fn example_configuration_has_a_valid_explicit_provider_identity_registry() {
+        let config: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
+        let validated =
+            crate::pinning::config::ValidatedPinningConfig::from_config(&config, |name| {
+                Some(format!("test-token-for-{name}"))
+            })
+            .unwrap();
+
+        assert_eq!(validated.providers.len(), 2);
+        assert!(
+            validated
+                .providers
+                .iter()
+                .all(|provider| provider.identity.cleanup
+                    == crate::pinning::identity::CleanupMode::Retain)
+        );
     }
 
     #[test]

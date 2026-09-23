@@ -148,6 +148,9 @@ pub async fn record_submit_invocation<C: ConnectionTrait>(
     if !fence_job_claim(db, &claimed.model.id, claimed_lock(&claimed.model)?).await? {
         return Err(stale_claim_error(&claimed.model.id));
     }
+    // Preserve the previous Submit effect for the lifetime fence. A retry's
+    // `not_created` evidence is lost as soon as history becomes `unknown`.
+    super::ledger::advance_submit_invocation_epoch(db, claimed, api, strategy).await?;
     let old = submission_history(db, &claimed.model.id).await?;
     if let Some(old) = old {
         if old.api != api
@@ -184,6 +187,14 @@ pub async fn record_submit_invocation<C: ConnectionTrait>(
         .exec(db)
         .await?;
     }
+    super::ledger::mark_effect(db, &claimed.model.provider, &claimed.model.cid, "unknown").await?;
+    super::ledger::capture_invocation(
+        db,
+        &claimed.model.id,
+        &claimed.model.provider,
+        &claimed.model.cid,
+    )
+    .await?;
     Ok(())
 }
 
@@ -210,6 +221,40 @@ pub async fn record_submit_error<C: ConnectionTrait>(
         .filter(history::Column::JobId.eq(&claimed.model.id))
         .exec(db)
         .await?;
+    super::ledger::mark_effect(db, &claimed.model.provider, &claimed.model.cid, effect).await?;
+    super::ledger::record_error(db, &claimed.model.provider, &claimed.model.cid, safe_error)
+        .await?;
+    Ok(())
+}
+
+/// Preserve unknown work as unclaimable by both generations of workers.
+pub async fn park_identity_job<C: ConnectionTrait>(
+    db: &C,
+    claimed: &ClaimedPinJob,
+) -> AppResult<()> {
+    if !fence_job_claim(db, &claimed.model.id, claimed_lock(&claimed.model)?).await? {
+        return Err(stale_claim_error(&claimed.model.id));
+    }
+    pin_job::Entity::update_many()
+        .col_expr(pin_job::Column::State, Expr::value(STATE_RUNNING))
+        .col_expr(
+            pin_job::Column::LockedUntil,
+            Expr::value(Option::<DateTimeUtc>::None),
+        )
+        .col_expr(
+            pin_job::Column::LastError,
+            Expr::value("historical identity unavailable; needs_attention"),
+        )
+        .filter(pin_job::Column::Id.eq(&claimed.model.id))
+        .exec(db)
+        .await?;
+    super::ledger::record_error(
+        db,
+        &claimed.model.provider,
+        &claimed.model.cid,
+        "historical identity unavailable; needs_attention",
+    )
+    .await?;
     Ok(())
 }
 
@@ -1227,6 +1272,51 @@ pub async fn check_target_job_generation<C: ConnectionTrait>(
         && lease.generation == generation)
 }
 
+/// A Poll may follow reference-only remote epoch increments, but it must still
+/// name the original request and the current canonical target/generation.
+pub(crate) async fn poll_continuity_owner<C: ConnectionTrait>(
+    db: &C,
+    job: &pin_job::Model,
+    request_id: &str,
+) -> AppResult<bool> {
+    if job.operation != "poll" || !check_target_job_generation(db, job).await? {
+        return Ok(false);
+    }
+    Ok(poll_names_request(job, request_id)
+        && canonical_desired_target(db, &job.provider, &job.cid)
+            .await?
+            .is_some_and(|target| Some(target.id.as_str()) == job.target_id.as_deref()))
+}
+
+/// Durable request evidence only, not authority to execute the historical owner.
+pub(crate) fn poll_names_request(job: &pin_job::Model, request_id: &str) -> bool {
+    let (Some(_), Some(target_id), Some(generation)) = (
+        job.lease_id.as_deref(),
+        job.target_id.as_deref(),
+        job.expected_generation,
+    ) else {
+        return false;
+    };
+    job.operation == "poll"
+        && job.expected_remote_epoch.is_none()
+        && job.id == stable_poll_id(&job.provider, &job.cid, target_id, generation, request_id)
+}
+
+/// The already-claimed Submit's immutable target/generation remains evidence
+/// of its invocation even after that target's lease is cancelled.
+pub(crate) fn submit_names_original_target(job: &pin_job::Model) -> bool {
+    let (Some(_), Some(target_id), Some(generation)) = (
+        job.lease_id.as_deref(),
+        job.target_id.as_deref(),
+        job.expected_generation,
+    ) else {
+        return false;
+    };
+    job.operation == "submit"
+        && job.expected_remote_epoch.is_none()
+        && job.id == stable_submit_id(&job.provider, &job.cid, target_id, generation)
+}
+
 /// Returns whether remote-scoped work still names the current remote epoch.
 /// Unpin additionally requires that no active desired target remains.
 pub async fn check_remote_job_epoch<C: ConnectionTrait>(
@@ -1581,6 +1671,7 @@ pub async fn retry_job<C: ConnectionTrait>(
     if result.rows_affected != 1 {
         return Err(stale_claim_error(job_id));
     }
+    super::ledger::record_error(db, &job.provider, &job.cid, redacted_error).await?;
     Ok(next_attempt_at)
 }
 
@@ -1684,16 +1775,24 @@ fn new_job_active_model(job: NewPinJob, now: DateTimeUtc) -> pin_job::ActiveMode
     }
 }
 
-async fn insert_new_job<C: ConnectionTrait>(
+pub(crate) async fn insert_new_job<C: ConnectionTrait>(
     db: &C,
     job: NewPinJob,
     now: DateTimeUtc,
 ) -> AppResult<bool> {
-    let result = pin_job::Entity::insert(new_job_active_model(job, now))
+    let model = new_job_active_model(job, now);
+    let job_id = model.id.as_ref().to_owned();
+    let provider = model.provider.as_ref().to_owned();
+    let cid = model.cid.as_ref().to_owned();
+    let result = pin_job::Entity::insert(model)
         .on_conflict_do_nothing()
         .exec(db)
         .await?;
-    Ok(matches!(result, TryInsertResult::Inserted(_)))
+    let inserted = matches!(result, TryInsertResult::Inserted(_));
+    if inserted {
+        super::ledger::capture_invocation(db, &job_id, &provider, &cid).await?;
+    }
+    Ok(inserted)
 }
 
 async fn ensure_target_job<C: ConnectionTrait>(

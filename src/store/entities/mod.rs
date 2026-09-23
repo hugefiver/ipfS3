@@ -688,3 +688,7 @@ mod tests {
         }
     }
 }
+pub mod pin_invocation_route;
+pub mod pin_provider_route;
+pub mod pin_resource_history;
+pub mod remote_pin_ledger;

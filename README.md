@@ -632,7 +632,9 @@ does not wait for a remote provider. At least one configured provider reaching
 pending or degraded. Remote lease durations are retention requests and control
 signals, not guaranteed provider TTLs.
 
-Every lease, including a manual lease, is eligible for quota eviction. Local
+Soft leases, including manual leases, are eligible for quota eviction only when
+their resource is eligible for managed cleanup. Retain/external/unknown resources
+cannot be evicted to manufacture headroom. Local
 quota admission counts each unique CID by its logical S3 byte size and one pin;
 shared leases do not multiply that local charge. This is a soft local control,
 not provider billing or usage truth. Expiry, eviction, an explicit unpin, and
@@ -665,7 +667,8 @@ gateway writer and pinning worker**, including other replicas. Back up the DB;
 then migrate and start only upgraded binaries. This is a stop-the-world upgrade,
 not mixed-version rolling operation: an old writer cannot produce the required
 execution history. Do not change provider account/scope or endpoint during this
-upgrade. Stable identity/revision migration remains a later stage.
+upgrade. The Stage 2 identity migration below adds scope evidence without guessing
+it for these historical records.
 
 `pin_submit_history` records the actual API/strategy selected before dispatch,
 effect certainty, finite safe first/last error evidence, and separate submission
@@ -699,6 +702,108 @@ Rollback requires stopping allocation and workers first. The down migration
 refuses unsettled/orphaned histories rather than erasing remote responsibility.
 Keep the upgraded database and historical routes until reconciliation is
 complete; do not drop the history table to force an old binary to run.
+
+### Stable identities, ownership and the resource ledger (Stage 2)
+
+Use the optional **top-level** `[pinning_identity]` section with one
+`[[pinning_identity.providers]]` entry for every configured provider. See the
+complete example in `config.example.toml`. `config_name` joins the existing
+`[[pinning.providers]].name`; policies still refer to that config name.
+
+- `provider_id` is a stable administrative identity, not a display label.
+  `display_name` and `config_name` may be renamed without changing existing
+  resource/job keys. `backend` is currently `pinata`, `filebase` or `noop`.
+- `scope` identifies an account/bucket/pinset, and `storage_domain` identifies
+  its independent storage domain. They are administrator assertions, **not**
+  derived from the URL, token or a token hash. Moving to another account/bucket
+  requires a different scope. Explicit identities require
+  `primary_storage_domain`; matching the primary domain is rejected, not counted
+  as an independent backup. Noop remains a test provider, not a real replica.
+- `credential_revision` and `endpoint_revision` are positive administrator
+  revisions. Bump them on credential/endpoint changes; never silently change an
+  account while leaving its scope/revisions unchanged. `secret_ref` is an
+  `env:VARIABLE` reference matching `token_env`. Only the reference/revisions are
+  persisted—never credentials, credential hashes or endpoint URLs.
+- `api_profile` must match the configured implementation: `pinata-v3`,
+  `pinata-legacy`, `pinata-psa`, `filebase-psa`, or `noop`; `strategy` must match
+  the configured CID/upload strategy. No implicit strategy fallback is added.
+- `cleanup` defaults to **`retain`** for explicit identities. Setting `managed`
+  requests cleanup only for independently proven application-created resources
+  in that scope. A PSA request ID or matching CID alone is not exclusive creation
+  proof; those resources remain unknown and retained, even in managed mode.
+  It never authorizes deleting external-existing or unknown resources.
+  Cleanup policy is captured for each resource, not retroactively replaced by
+  editing TOML. `retired = true` prevents new allocations while keeping the
+  configured route available for historical work. Do not remove its credentials
+  while reconciliation/cleanup is still required.
+
+Provider aliases in the same backend/scope/resource namespace share remote rows,
+locks and quota. They must agree on limits, protocol/strategy, revisions, storage
+domain and cleanup. The lexically first stable provider ID is the representative;
+keep that historical ID configured (renaming it is fine). Removing it or replacing
+it with another alias is not an ownership migration. Different objects referencing
+one CID retain independent lease deadlines and share one physical reservation.
+TTL starts at the original accepted/publication time; retries and late successful
+responses never restart it. Late success records the resource even if the lease
+has already expired.
+
+`remote_pins` remains the canonical epoch/request/quota row. Its companion
+`remote_pin_ledger` stores the captured route, typed ownership/effect evidence,
+first/latest observations and errors, and separate remote-pinned, gateway-verified
+and content-verified timestamps. The latter two remain unset unless actually
+verified. Lease expiry/cancel does **not** release retain, unknown, cleanup-pending
+or failed-cleanup capacity. Only confirmed absence under the existing claim,
+generation, reference and epoch fences releases quota. Historical confirmation
+is not erased by a later unknown/error observation.
+
+Unscoped occupied rows from an older database cannot be attributed to a new
+explicit account from TOML alone. Such historical capacity blocks new explicit
+allocations until an evidenced migration is available; read-only access to old
+records remains. An already confirmed absent historical row does not block a
+new allocation. Do not clear old reservations merely to bypass this safeguard.
+
+`pin_invocation_routes` freezes each dispatched job's identity separately from
+the current resource lifetime. Confirmed release archives the old reference and
+ledger in `pin_resource_history`; a genuinely absent CID may then be allocated
+under a new credential revision without rewriting the old invocation evidence.
+
+Before `m20260920_000002_pin_identity_ledger`, stop/drain **all writers and all
+workers on all replicas**, back up the database, migrate, then start only the new
+binaries. Mixed-version rolling operation is unsupported. Existing remote rows
+keep their request IDs, epochs and reservations; because old schema has no
+trustworthy account/ownership evidence, they are quarantined as unknown, and
+unfinished jobs are made unclaimable (`running`, NULL lock). Existing Stage 1
+protocol history is preserved, but is not sufficient proof of an account scope.
+Do not fill missing history from the current TOML or clear these locks manually.
+Explicit historical migration/reapply/retirement management arrives in Stage 7.
+This migration deliberately refuses downgrade: stop allocation/workers and
+preserve the ledger rather than dropping it to run old binaries.
+
+For compatibility, configurations without `[pinning_identity]` retain the old
+name-based request routing **for newly allocated work**; names are then
+immutable account identities, not renameable aliases. Do not rotate accounts or
+change those endpoints under the same legacy name. Adopt explicit identities
+before such changes. Old migrated resources are still unknown and do not gain
+delete rights from legacy compatibility. Credential revisions are administrative
+assertions; the gateway intentionally cannot detect an unannounced account change
+by hashing or inspecting a secret.
+
+Internal integration APIs (not a new public HTTP/CLI surface):
+`ValidatedPinningConfig::from_config`, `PinningCoordinator::register_identities`
+(must complete before accepting publications), `provider_identity`,
+`store::pinning::ledger::{status, lease_status, invocation_snapshot}` and typed
+`provider::{RemoteRef, QueryObservation}`. Historical PSA/Pinata get/find/unpin
+routing remains available; a missing/mismatched scope or credential/endpoint
+revision parks work before network IO. A changed strategy cannot resend an old
+pending submit; ambiguous calls query their captured actual protocol instead.
+
+Stage 2 regression tests use real SQLite/PostgreSQL transactions and local mock
+HTTP providers, including concurrent shared-CID publication/cancel/expiry,
+renaming, revision isolation, retained capacity, cleanup-failure handling for
+independently attested ownership and late success. Current PSA responses alone
+do not supply such ownership attestation or trigger managed deletion.
+They are not evidence of a live provider account write or of remote content
+verification. No production account or remote data is touched by these tests.
 
 ### Policies and coordination
 

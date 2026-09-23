@@ -35,12 +35,13 @@ impl AppState {
             .cold_kubo
             .as_ref()
             .map(|config| KuboClient::new(config.rpc_url.clone()));
-        let validated_pinning = ValidatedPinningConfig::from_raw(&cfg.pinning, get_env)?;
+        let validated_pinning = ValidatedPinningConfig::from_config(cfg, get_env)?;
 
         let db = crate::store::connect_database(&cfg.storage.database_url).await?;
         crate::store::run_migrations(&db).await?;
         let store = Store::new(db);
         let pinning = PinningCoordinator::build_with_kubo(validated_pinning, Some(kubo.clone()))?;
+        pinning.register_identities(&store).await?;
 
         let credentials: HashMap<String, SecretKey> = cfg
             .auth

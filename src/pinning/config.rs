@@ -6,7 +6,10 @@ use std::{
 use anyhow::{anyhow, bail};
 use sha2::{Digest, Sha256};
 
-use crate::config::{PinningConfig, PolicyConfig, ProviderConfig};
+use crate::{
+    config::{Config, PinningConfig, PolicyConfig, ProviderConfig},
+    pinning::identity::{PinningIdentityConfig, ProviderIdentity, validate_storage_domain},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderKind {
@@ -179,6 +182,7 @@ pub type ProviderLimitMap = BTreeMap<String, ProviderLimits>;
 #[derive(Debug, Clone)]
 pub struct ValidatedProvider {
     pub name: String,
+    pub identity: ProviderIdentity,
     pub kind: ProviderKind,
     pub token: Option<SecretToken>,
     pub endpoint: Option<String>,
@@ -200,6 +204,41 @@ pub struct ValidatedPolicy {
     pub allow_decompressed: bool,
 }
 
+impl ValidatedPolicy {
+    pub(crate) fn refresh_identity(&mut self, index: usize) {
+        let mut canonical = String::new();
+        for field in [
+            &self.bucket,
+            &self.prefix,
+            self.trigger.as_str(),
+            self.provider_mode.as_str(),
+        ] {
+            append_canonical_field(&mut canonical, field);
+        }
+        append_canonical_field(&mut canonical, &self.providers.len().to_string());
+        for provider in &self.providers {
+            append_canonical_field(&mut canonical, provider);
+        }
+        append_canonical_field(
+            &mut canonical,
+            &self.default_duration.as_seconds().to_string(),
+        );
+        append_canonical_field(&mut canonical, &self.max_duration.as_seconds().to_string());
+        append_canonical_field(
+            &mut canonical,
+            if self.allow_decompressed {
+                "true"
+            } else {
+                "false"
+            },
+        );
+        self.identity = format!(
+            "policy:{index}:{}",
+            hex::encode(Sha256::digest(canonical.as_bytes()))
+        );
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ValidatedPinningConfig {
     pub worker_interval: LeaseDuration,
@@ -214,12 +253,35 @@ impl ValidatedPinningConfig {
     where
         F: Fn(&str) -> Option<String>,
     {
+        Self::from_parts(raw, None, get_env)
+    }
+
+    pub fn from_config<F>(config: &Config, get_env: F) -> anyhow::Result<Self>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        Self::from_parts(&config.pinning, Some(&config.pinning_identity), get_env)
+    }
+
+    fn from_parts<F>(
+        raw: &PinningConfig,
+        identity_config: Option<&PinningIdentityConfig>,
+        get_env: F,
+    ) -> anyhow::Result<Self>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
         let mut provider_names = BTreeSet::new();
         for provider in &raw.providers {
             if !provider_names.insert(provider.name.as_str()) {
                 bail!("duplicate provider name `{}`", provider.name);
             }
         }
+
+        let explicit_identities = identity_config
+            .filter(|config| !config.providers.is_empty())
+            .map(|config| validate_identity_registry(config, &provider_names))
+            .transpose()?;
 
         let worker_interval = LeaseDuration::parse(&raw.worker_interval)?;
         if raw.worker_concurrency == 0 {
@@ -229,7 +291,10 @@ impl ValidatedPinningConfig {
         let mut providers = Vec::with_capacity(raw.providers.len());
         let mut provider_limits = ProviderLimitMap::new();
         for provider in &raw.providers {
-            let validated = Self::validate_provider(provider, &get_env)?;
+            let explicit_identity = explicit_identities
+                .as_ref()
+                .and_then(|identities| identities.get(&provider.name));
+            let validated = Self::validate_provider(provider, explicit_identity, &get_env)?;
             provider_limits.insert(validated.name.clone(), validated.limits.clone());
             providers.push(validated);
         }
@@ -252,6 +317,7 @@ impl ValidatedPinningConfig {
 
     fn validate_provider<F>(
         provider: &ProviderConfig,
+        explicit_identity: Option<&ProviderIdentity>,
         get_env: &F,
     ) -> anyhow::Result<ValidatedProvider>
     where
@@ -281,7 +347,7 @@ impl ValidatedPinningConfig {
             );
         }
 
-        let limits = ProviderLimits {
+        let mut limits = ProviderLimits {
             priority: provider.priority,
             max_bytes: quota_as_i64(provider.max_bytes, &provider.name, "max_bytes")?,
             max_pins: quota_as_i64(provider.max_pins, &provider.name, "max_pins")?,
@@ -332,6 +398,36 @@ impl ValidatedPinningConfig {
             }
         };
 
+        let expected_secret_ref = provider
+            .token_env
+            .as_deref()
+            .filter(|name| !name.is_empty())
+            .map(|name| format!("env:{name}"));
+        let (api_profile, strategy) = provider_route(kind, provider, pinata.as_ref());
+        let identity = match explicit_identity {
+            Some(identity) => {
+                validate_identity_route(
+                    provider,
+                    kind,
+                    identity,
+                    expected_secret_ref.as_deref(),
+                    api_profile,
+                    strategy,
+                )?;
+                identity.clone()
+            }
+            None => ProviderIdentity::legacy(
+                &provider.name,
+                provider_backend(kind),
+                expected_secret_ref.clone(),
+                api_profile,
+                strategy,
+            ),
+        };
+        if identity.retired {
+            limits.enabled = false;
+        }
+
         let token = match kind {
             ProviderKind::Pinata | ProviderKind::Filebase => {
                 let token_env = provider
@@ -367,6 +463,7 @@ impl ValidatedPinningConfig {
 
         Ok(ValidatedProvider {
             name: provider.name.clone(),
+            identity,
             kind,
             token,
             endpoint: provider.endpoint.clone(),
@@ -463,6 +560,129 @@ impl ValidatedPinningConfig {
             allow_decompressed: policy.allow_decompressed,
         })
     }
+}
+
+fn validate_identity_registry(
+    config: &PinningIdentityConfig,
+    provider_names: &BTreeSet<&str>,
+) -> anyhow::Result<BTreeMap<String, ProviderIdentity>> {
+    let primary_storage_domain = config
+        .primary_storage_domain
+        .as_deref()
+        .ok_or_else(|| anyhow!("pinning_identity.primary_storage_domain is required"))?;
+    validate_storage_domain(primary_storage_domain)?;
+
+    let mut config_names = BTreeSet::new();
+    let mut provider_ids = BTreeSet::new();
+    let mut identities = BTreeMap::new();
+    for raw in &config.providers {
+        if !config_names.insert(raw.config_name.as_str()) {
+            bail!(
+                "duplicate provider identity config_name `{}`",
+                raw.config_name
+            );
+        }
+        if !provider_ids.insert(raw.provider_id.as_str()) {
+            bail!("duplicate stable provider_id `{}`", raw.provider_id);
+        }
+        if !provider_names.contains(raw.config_name.as_str()) {
+            bail!(
+                "provider identity references unknown configured provider `{}`",
+                raw.config_name
+            );
+        }
+
+        let identity = ProviderIdentity::explicit(raw)?;
+        if identity.storage_domain == primary_storage_domain {
+            bail!(
+                "provider `{}` uses the primary storage domain and is not an independent backup",
+                raw.config_name
+            );
+        }
+        identities.insert(raw.config_name.clone(), identity);
+    }
+
+    for provider_name in provider_names {
+        if !identities.contains_key(*provider_name) {
+            bail!("configured provider `{provider_name}` is missing an explicit provider identity");
+        }
+    }
+
+    Ok(identities)
+}
+
+fn provider_backend(kind: ProviderKind) -> &'static str {
+    match kind {
+        ProviderKind::Pinata => "pinata",
+        ProviderKind::Filebase => "filebase",
+        ProviderKind::Noop => "noop",
+    }
+}
+
+fn provider_route(
+    kind: ProviderKind,
+    provider: &ProviderConfig,
+    pinata: Option<&PinataProviderOptions>,
+) -> (&'static str, &'static str) {
+    match kind {
+        ProviderKind::Pinata
+            if provider
+                .endpoint
+                .as_deref()
+                .is_some_and(|endpoint| endpoint.trim_end_matches('/').ends_with("/psa")) =>
+        {
+            ("pinata-psa", "cid")
+        }
+        ProviderKind::Pinata => {
+            let options = pinata.expect("validated Pinata route must contain options");
+            let profile = match options.api {
+                PinataApi::V3 => "pinata-v3",
+                PinataApi::Legacy => "pinata-legacy",
+            };
+            let strategy = match options.strategy {
+                PinataStrategy::Cid => "cid",
+                PinataStrategy::Upload => "upload",
+            };
+            (profile, strategy)
+        }
+        ProviderKind::Filebase => ("filebase-psa", "cid"),
+        ProviderKind::Noop => ("noop", "cid"),
+    }
+}
+
+fn validate_identity_route(
+    provider: &ProviderConfig,
+    kind: ProviderKind,
+    identity: &ProviderIdentity,
+    expected_secret_ref: Option<&str>,
+    api_profile: &str,
+    strategy: &str,
+) -> anyhow::Result<()> {
+    if identity.backend != provider_backend(kind) {
+        bail!(
+            "provider `{}` identity backend does not match its configured kind",
+            provider.name
+        );
+    }
+    if identity.api_profile != api_profile {
+        bail!(
+            "provider `{}` identity API profile does not match its configured route",
+            provider.name
+        );
+    }
+    if identity.strategy != strategy {
+        bail!(
+            "provider `{}` identity strategy does not match its configured route",
+            provider.name
+        );
+    }
+    if identity.secret_ref.as_deref() != expected_secret_ref {
+        bail!(
+            "provider `{}` identity secret_ref does not match its configured token reference",
+            provider.name
+        );
+    }
+    Ok(())
 }
 
 fn quota_as_i64(value: u64, provider_name: &str, quota_name: &str) -> anyhow::Result<i64> {
@@ -1102,5 +1322,232 @@ mod tests {
         let validated =
             ValidatedPinningConfig::from_raw(&valid, |_| Some(secret.to_owned())).unwrap();
         assert!(!format!("{validated:?}").contains(secret));
+    }
+
+    #[test]
+    fn validates_explicit_provider_identity_and_safe_route_snapshot() {
+        let config: crate::config::Config = toml::from_str(
+            r#"
+                [pinning]
+                [[pinning.providers]]
+                name = "pinata-primary"
+                kind = "pinata"
+                token_env = "PINATA_TOKEN"
+                api = "v3"
+                strategy = "cid"
+                priority = 1
+                max_bytes = 100
+                max_pins = 10
+
+                [pinning_identity]
+                primary_storage_domain = "kubo:primary"
+                [[pinning_identity.providers]]
+                config_name = "pinata-primary"
+                provider_id = "pinata-prod"
+                display_name = "Primary Pinata"
+                backend = "pinata"
+                scope = "account:prod"
+                storage_domain = "pinata:prod"
+                credential_revision = 2
+                endpoint_revision = 3
+                secret_ref = "env:PINATA_TOKEN"
+                api_profile = "pinata-v3"
+                strategy = "cid"
+            "#,
+        )
+        .unwrap();
+
+        let validated = ValidatedPinningConfig::from_config(&config, environment).unwrap();
+        let provider = &validated.providers[0];
+        assert_eq!(provider.identity.provider_id, "pinata-prod");
+        assert_eq!(provider.identity.display_name, "Primary Pinata");
+        assert_eq!(
+            provider.identity.cleanup,
+            crate::pinning::identity::CleanupMode::Retain
+        );
+
+        let snapshot = provider.identity.route_snapshot();
+        let serialized = serde_json::to_string(&snapshot).unwrap();
+        assert!(serialized.contains("env:PINATA_TOKEN"));
+        assert!(!serialized.contains("token-for-PINATA_TOKEN"));
+        assert!(!serialized.contains("https://"));
+        assert!(!serialized.contains("sha256"));
+        provider
+            .identity
+            .validate_route_snapshot(&snapshot)
+            .unwrap();
+
+        let mut mismatched = snapshot;
+        mismatched.credential_revision += 1;
+        assert!(
+            provider
+                .identity
+                .validate_route_snapshot(&mismatched)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn canonical_resource_keys_deduplicate_provider_aliases() {
+        let config: crate::config::Config = toml::from_str(
+            r#"
+                [pinning]
+                [[pinning.providers]]
+                name = "pinata-a"
+                kind = "pinata"
+                token_env = "PINATA_TOKEN"
+                priority = 1
+                max_bytes = 100
+                max_pins = 10
+                [[pinning.providers]]
+                name = "pinata-b"
+                kind = "pinata"
+                token_env = "PINATA_TOKEN"
+                priority = 2
+                max_bytes = 100
+                max_pins = 10
+
+                [pinning_identity]
+                primary_storage_domain = "kubo:primary"
+                [[pinning_identity.providers]]
+                config_name = "pinata-a"
+                provider_id = "pinata-route-a"
+                display_name = "Pinata A"
+                backend = "pinata"
+                scope = "account:prod"
+                storage_domain = "pinata:prod"
+                credential_revision = 1
+                endpoint_revision = 1
+                secret_ref = "env:PINATA_TOKEN"
+                api_profile = "pinata-v3"
+                strategy = "cid"
+                [[pinning_identity.providers]]
+                config_name = "pinata-b"
+                provider_id = "pinata-route-b"
+                display_name = "Pinata B"
+                backend = "pinata"
+                scope = "account:prod"
+                storage_domain = "pinata:prod"
+                credential_revision = 1
+                endpoint_revision = 1
+                secret_ref = "env:PINATA_TOKEN"
+                api_profile = "pinata-v3"
+                strategy = "cid"
+            "#,
+        )
+        .unwrap();
+
+        let validated = ValidatedPinningConfig::from_config(&config, environment).unwrap();
+        let left = validated.providers[0].identity.resource_key(
+            crate::pinning::identity::RemoteResourceType::PsaRequest,
+            "bafy-resource",
+        );
+        let right = validated.providers[1].identity.resource_key(
+            crate::pinning::identity::RemoteResourceType::PsaRequest,
+            "bafy-resource",
+        );
+        assert_eq!(left, right);
+    }
+
+    #[test]
+    fn explicit_identity_rejects_primary_storage_domain_and_route_drift() {
+        let base = r#"
+            [pinning]
+            [[pinning.providers]]
+            name = "pinata"
+            kind = "pinata"
+            token_env = "PINATA_TOKEN"
+            api = "v3"
+            strategy = "cid"
+            priority = 1
+            max_bytes = 100
+            max_pins = 10
+
+            [pinning_identity]
+            primary_storage_domain = "kubo:primary"
+            [[pinning_identity.providers]]
+            config_name = "pinata"
+            provider_id = "pinata-prod"
+            display_name = "Pinata"
+            backend = "pinata"
+            scope = "account:prod"
+            storage_domain = "{storage_domain}"
+            credential_revision = 1
+            endpoint_revision = 1
+            secret_ref = "env:PINATA_TOKEN"
+            api_profile = "{api_profile}"
+            strategy = "cid"
+        "#;
+
+        for (storage_domain, api_profile, expected) in [
+            ("kubo:primary", "pinata-v3", "primary storage domain"),
+            ("pinata:prod", "pinata-legacy", "API profile"),
+        ] {
+            let source = base
+                .replace("{storage_domain}", storage_domain)
+                .replace("{api_profile}", api_profile);
+            let config: crate::config::Config = toml::from_str(&source).unwrap();
+            assert_validation_error_from_config(&config, expected);
+        }
+    }
+
+    #[test]
+    fn explicit_retirement_disables_allocation_but_legacy_routes_remain_managed() {
+        let legacy = raw(vec![provider("legacy", "pinata")], Vec::new());
+        let legacy = ValidatedPinningConfig::from_raw(&legacy, environment).unwrap();
+        assert_eq!(
+            legacy.providers[0].identity.cleanup,
+            crate::pinning::identity::CleanupMode::Managed
+        );
+
+        let config: crate::config::Config = toml::from_str(
+            r#"
+                [pinning]
+                [[pinning.providers]]
+                name = "retired"
+                kind = "pinata"
+                token_env = "PINATA_TOKEN"
+                priority = 1
+                max_bytes = 100
+                max_pins = 10
+                [[pinning.policies]]
+                bucket = "bucket"
+                trigger = "always"
+                provider_mode = "one"
+                providers = ["retired"]
+                default_duration = "1m"
+                max_duration = "1h"
+
+                [pinning_identity]
+                primary_storage_domain = "kubo:primary"
+                [[pinning_identity.providers]]
+                config_name = "retired"
+                provider_id = "retired-provider"
+                display_name = "Retired provider"
+                backend = "pinata"
+                scope = "account:old"
+                storage_domain = "pinata:old"
+                credential_revision = 1
+                endpoint_revision = 1
+                secret_ref = "env:PINATA_TOKEN"
+                api_profile = "pinata-v3"
+                strategy = "cid"
+                retired = true
+            "#,
+        )
+        .unwrap();
+
+        assert_validation_error_from_config(
+            &config,
+            "must reference at least one enabled provider",
+        );
+    }
+
+    fn assert_validation_error_from_config(config: &crate::config::Config, expected: &str) {
+        let error = ValidatedPinningConfig::from_config(config, environment).unwrap_err();
+        assert!(
+            error.to_string().contains(expected),
+            "expected error containing {expected:?}, got {error:#}",
+        );
     }
 }

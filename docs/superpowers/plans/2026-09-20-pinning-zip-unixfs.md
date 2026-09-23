@@ -1,6 +1,6 @@
 # Pinning、ZIP 产物与 UnixFS 目录根：统一实施计划
 
-日期：2026-09-20。状态：计划已通过审查；Stage 1 实现及验收完成，后续阶段尚未实施。
+日期：2026-09-20。状态：计划已通过审查；Stage 1 已提交，Stage 2 已于 2026-09-23 验收并随本阶段提交；Stage 4 的公共合同已由用户确认。
 
 本文件是本轮唯一权威设计/实施/进度计划；不另建 spec，不单独提交计划。需求来源为用户提供的 `ipfs3_review_report.md`（2026-09-17）及最新 R24 确认。本轮基线为 `master@d3bf5cf`；规划时已确认工作区 clean、与 origin/master 一致，本轮不执行 push。
 
@@ -116,7 +116,7 @@
 - success 返回 complete root；部分条目失败但有成功产物返回 partial root。partial 只表示解压/发布成功集合不含失败项，不能掩饰树构建漏链接。
 - 兼容返回优先使用 `x-ipfs3-zip-root-cid`、`x-ipfs3-zip-root-status` 和 batch 句柄；旧 XML、ETag/VersionId、结果关闭的 body 不变。v2 XML/import 状态增加结构化 root（CID/status/count/revision/safe error）。import 202 只是接受，CID 只能在验证及发布后出现。
 - 根构建失败必须返回可查询的 failed/retryable 状态及有限 warning，**不返回不完整/未经验证的 CID**。不把 root failure 计入旧解压 FailedCount 或把已发布对象说成没发布。
-- 建议 enable=true（无论默认或 signed tag）不是 required/原子成功保证：失败与对象发布隔离，不以新增默认功能破坏旧成功写入。**signed true 是否要强制根成功属于 §8 的待裁定公共合同**；在裁定前不能自行交付 strict-on 或静默 best-effort。若要求 strict-on，必须在发布前构建成功、失败不提交任何新对象，并设计可恢复响应；不得发布后再用整体失败诱导重复写。
+- 用户已确认 enable=true（无论默认或 signed tag）表示尝试构根，不是 required/原子成功保证：失败明确返回 failed/warning、可查状态，不影响原对象发布。不能静默省略失败，也不得发布后以整体失败诱导客户端重复写入；本轮不实现 strict-on。
 
 ### 5.2 最终集合与树的确定性
 
@@ -331,13 +331,13 @@ root 是该批的持久快照，不随单个输出删除/覆盖自动改写或�
 | R23 | 4、7、8：扇出/进度 | 目标和传输分开计数、有界调度、定向retry、公平性证据。 |
 | R24 | 4：UnixFS root | 默认ON/签名覆盖，真实最终路径树、partial/zero、兼容返回、独立owner。 |
 
-## 8. 仅需向调用方返回的实质裁定
+## 8. 已确认的公共合同与剩余环境边界
 
-已确认的范围不再次索取批准。以下剩余选择涉及公共协议/安全，不由执行者猜测；在相应Stage 4编码前裁定并直接更新本节，无需创建第二份设计：
+2026-09-20 用户明确选择以下三项推荐，后续直接据此实施，不重复询问：
 
-1. **signed root=true 的失败强度。**推荐与config ON一致：尝试生成、失败返回可查warning/status，不影响原发布；若用户把true理解为“必须root成功”，则采用发布前严格失败合同，并接受与默认兼容模式区分。文件/目录冲突必须fail-closed root、不返回伪root；不能同时承诺“所有旧S3键组合可写”与“所有成功请求必有UnixFS根”。
-2. **新ZIP逐输出policy组合。**推荐入口允许上限与逐输出规则取交集，服务器强制约束冲突拒绝；legacy保留。报告明确此处待确认，不能自行用并集扩大外发范围，也不能把新限制静默套到旧模式。
-3. **source=false 的新协议协商细节。**推荐v2结果版本+签名幂等token，result=false在该模式下拒绝，除非协商了明确可查询batch句柄。确认对外参数/结果约定后才能实现；不需要重新确认已明确的“允许不发布源包”。
+1. **signed root=true 的失败强度。**与 config ON 一致：尝试生成，失败返回可查 warning/status，不影响原发布。文件/目录冲突必须 fail-closed root，不返回伪 root。
+2. **新 ZIP 逐输出 policy 组合。**入口允许上限与逐输出规则取交集，服务器强制约束冲突拒绝；legacy 保留，不以并集扩大外发范围，不把新限制静默套到旧模式。
+3. **source=false 的新协议协商。**只允许显式 v2 扩展和签名幂等 token，拒绝 result=false；响应以 batch 为身份，不伪造源 ETag/VersionId。对外参数名字依现有扩展命名约定实现并文档化。
 
 实现层的dag/put尺寸/HAMT选择通过有界协议证据解决，不默认上升为用户设计审批；若只能通过新增节点权限、降低原ZIP上限或改变返回承诺实现，再升级该具体问题。真实provider写测试授权、现场后端版本/身份、PG/容器环境是环境与权限gate，不阻塞离线修复或被视为功能已验收。
 
@@ -360,8 +360,8 @@ cargo test --test integration
 
 | 阶段 | 状态 | 行为/测试证据 | 实机未验或裁定 | Commit |
 |---|---|---|---|---|
-| 1 | 完成 | lib 1187 passed / 1 ignored；bin 13、integration 164、真实日志 2；PG 并发 3 passed；pinning 定向 352 passed | 未执行真实 Pinata/Filebase 账号写入；完整身份/账户 scope 模型留给 Stage 2 | 随本阶段代码统一提交，见 Git 历史 |
-| 2 | 未开始 | — | PG环境待确认 | — |
+| 1 | 已提交 | lib 1187 passed / 1 ignored；bin 13、integration 164、真实日志 2；PG 并发 3 passed；pinning 定向 352 passed | 未执行真实 Pinata/Filebase 账号写入；完整身份/账户 scope 模型留给 Stage 2 | `2c948dd` |
+| 2 | 已验收 | lib 1196 passed / 1 ignored、integration 164；Stage 2 专项默认测试通过；隔离 PG 17 迁移/并发/交接 9 passed；fmt、clippy `--all-targets -D warnings` 与限定复核通过 | 曾有一次 PG 路由缺失间歇错误，受控提交/回滚可见性实验与后续整合未再现，根因仍未确认；真实 provider 账号写入未执行 | 本阶段语义提交，见 Git 历史 |
 | 3 | 未开始 | — | 真实客户端可用性待确认 | — |
 | 4 | 未开始 | — | §8；directory协议/实机验证 | — |
 | 5 | 未开始 | — | Filebase账号写授权/双Kubo环境 | — |
@@ -379,3 +379,11 @@ cargo test --test integration
 - `tests/postgres_pinning_stage1.rs` 在专用 PostgreSQL 17 中实际执行 3 项：takeover 阻塞、最终 CAS 失败回滚、repair/park 双向交错；fixture schema 清理确认剩余为零。检查精确 stale 错误，避免较早 SQL 错误造成假通过。
 - `tests/request_logging.rs` 驱动实际 binary 和已认证的 DeleteObjects，注入正文 key/自由 DB error 哨兵，在 info/debug/trace 和恶意 target filter 下验证硬过滤。安全 request ID、状态和有限 failure class 保留；第三方 dump 和敏感字段事件不可由 RUST_LOG 开启。
 - 最后整合命令：`cargo test --locked --offline --lib --bin ipfs-s3-gateway --test integration --test request_logging --quiet` 全部通过；未将 ignored PG snapshot 或真实远端未执行项计作通过。Stage 1 限定复核无剩余 Critical/Important。
+
+### Stage 2 验收补充
+
+- 新的显式 provider 路由以 backend/scope/resource type 作为容量域，别名共用一份占额；历史快照分别绑定资源和实际调用。旧库占额缺少作用域证明时保留且阻止新显式分配，已确认 absent 则允许；不能凭当前 TOML 把旧 pinned CID 或其 owned 状态移交新账户。
+- 同 CID 附加时，Submit/Poll 的 epoch 可在请求、原 target/generation 与路由仍属同一资源生命周期、且无归档释放的条件下接续；历史请求在退役或策略变动后只可只读 Poll，不新建 Submit。A 取消后 B 的读追踪和首个 POST 响应在同一受 fence 的事务内交接，账户/凭据/endpoint 变化仍阻断 IO。
+- PSA 的成功请求 ID 不证明排他创建；缺证明时 ownership 保持 unknown、禁止 managed DELETE。retained 的实际 pinned 资源重新附加活跃引用后只恢复有效性，不重新计额、重置 TTL 或伪造观测时间；仅真实 provider 返回更新 `last_observed_at`。
+- SQLite 及真实隔离 PostgreSQL 17 专项覆盖旧库升级、shared CID、retain/cleanup、迟到响应、两个 PG ledger INSERT 可见性顺序（commit/rollback）、Poll/cancel 的两个锁序；测试仅在各自 UUID schema 内写入，均已清理。真实 Kubo/Pinata/Filebase 账户以及生产数据迁移未执行。
+- PostgreSQL 综合测试曾间歇出现一次 `remote allocation lacks a current, matching historical route`；后续受控双连接 PG 插入、提交/回滚与多次整合均通过，但原始间歇根因未被证实。测试保留失败时的脱敏路由状态诊断，不得宣称已针对该异常修复。

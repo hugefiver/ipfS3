@@ -1569,6 +1569,10 @@ fn ordered_enabled_providers(
             .ok_or_else(|| invalid_publication("pinning lease references an unknown provider"))?;
         if provider_limits.enabled {
             providers.insert(provider.clone());
+        } else if intent.provider_mode == ProviderMode::All {
+            return Err(invalid_publication(
+                "all-provider intent includes a disabled or retired provider",
+            ));
         }
     }
     let mut providers = providers.into_iter().collect::<Vec<_>>();

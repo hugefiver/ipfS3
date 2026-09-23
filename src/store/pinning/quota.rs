@@ -16,7 +16,10 @@ use crate::{
         },
     },
     store::{
-        entities::{pin_lease, pin_lease_target, pin_provider_usage, remote_pin},
+        entities::{
+            pin_lease, pin_lease_target, pin_provider_route, pin_provider_usage, remote_pin,
+            remote_pin_ledger,
+        },
         pinning::leases,
     },
 };
@@ -527,6 +530,8 @@ async fn confirmed_release_inner<C: ConnectionTrait>(
                 .to_owned(),
         ));
     }
+    super::ledger::archive_confirmed_release(db, &remote).await?;
+    super::ledger::mark_effect(db, provider, cid, "absent").await?;
     Ok(ConfirmedReleaseOutcome::Released)
 }
 
@@ -637,14 +642,107 @@ async fn reserve_unique_attempt<C: ConnectionTrait>(
     let existing = acquire_existing_remote(db, provider, cid).await?;
     match existing {
         Some(remote) if is_capacity_holding_status(&remote.status) => {
+            assert_reusable_route(db, provider, cid).await?;
             reuse_capacity_holding_remote(db, provider, cid, remote, now).await
         }
         Some(remote) if remote.status == REMOTE_STATUS_ABSENT => {
+            assert_new_allocation_safe(db, provider).await?;
             reacquire_absent_remote(db, provider, cid, cid_size, provider_limits, remote, now).await
         }
         Some(_) => Err(invalid_quota("remote pin has an unknown status")),
-        None => reserve_new_remote(db, provider, cid, cid_size, provider_limits, now).await,
+        None => {
+            assert_new_allocation_safe(db, provider).await?;
+            reserve_new_remote(db, provider, cid, cid_size, provider_limits, now).await
+        }
     }
+}
+
+/// A pinned CID proves nothing about the account/route that produced it. The ledger
+/// snapshot must agree with the registered allocation route on every identity and
+/// endpoint revision. A changed API/strategy also cannot claim the old pinned
+/// resource without proving equivalent remote resource semantics. Cleanup stays
+/// on the historical snapshot and cannot grant new ownership here.
+pub(crate) async fn assert_reusable_route<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+    cid: &str,
+) -> AppResult<()> {
+    let configured = pin_provider_route::Entity::find_by_id(provider.to_owned())
+        .one(db)
+        .await?;
+    let historical = super::ledger::get(db, provider, cid).await?;
+    match (configured, historical) {
+        (None, None) if !provider.starts_with("domain:") => Ok(()),
+        (Some(current), Some(historical)) if !current.retired => {
+            use crate::pinning::identity::ProviderRouteSnapshot;
+            let old: ProviderRouteSnapshot = serde_json::from_str(
+                historical
+                    .route
+                    .as_deref()
+                    .ok_or_else(|| invalid_quota("historical remote has no scope evidence"))?,
+            )
+            .map_err(|_| invalid_quota("historical remote route is invalid"))?;
+            let new: ProviderRouteSnapshot = serde_json::from_str(&current.snapshot)
+                .map_err(|_| invalid_quota("current provider route is invalid"))?;
+            if old.provider_id == new.provider_id
+                && old.backend == new.backend
+                && old.scope == new.scope
+                && old.storage_domain == new.storage_domain
+                && old.credential_revision == new.credential_revision
+                && old.endpoint_revision == new.endpoint_revision
+                && old.secret_ref == new.secret_ref
+                && old.api_profile == new.api_profile
+                && old.strategy == new.strategy
+            {
+                Ok(())
+            } else {
+                Err(invalid_quota(
+                    "historical remote route does not match this allocation",
+                ))
+            }
+        }
+        _ => Err(invalid_quota(
+            "remote allocation lacks a current, matching historical route",
+        )),
+    }
+}
+
+/// Prior to Stage 2 the provider column was a user-configurable alias, not an
+/// account identifier. No TOML scope can prove that a newly named domain does not
+/// share that historical account. Quarantine only new explicit allocations while
+/// such unscoped capacity remains; legacy reads and existing leases remain intact.
+async fn assert_new_allocation_safe<C: ConnectionTrait>(db: &C, provider: &str) -> AppResult<()> {
+    if !provider.starts_with("domain:") {
+        return Ok(());
+    }
+    let unscoped_usage = pin_provider_usage::Entity::find()
+        .filter(pin_provider_usage::Column::Provider.not_like("domain:%"))
+        .filter(
+            sea_orm::Condition::any()
+                .add(pin_provider_usage::Column::ReservedBytes.gt(0))
+                .add(pin_provider_usage::Column::ReservedPins.gt(0)),
+        )
+        .one(db)
+        .await?
+        .is_some();
+    let unscoped_remote = remote_pin::Entity::find()
+        .filter(remote_pin::Column::Provider.not_like("domain:%"))
+        .filter(remote_pin::Column::Status.is_in(capacity_holding_statuses()))
+        .one(db)
+        .await?
+        .is_some();
+    let unknown_route = remote_pin_ledger::Entity::find()
+        .filter(remote_pin_ledger::Column::Route.is_null())
+        .filter(remote_pin_ledger::Column::Effect.ne("absent"))
+        .one(db)
+        .await?
+        .is_some();
+    if unscoped_usage || unscoped_remote || unknown_route {
+        return Err(invalid_quota(
+            "unscoped legacy remote capacity requires explicit account migration",
+        ));
+    }
+    Ok(())
 }
 
 async fn reuse_capacity_holding_remote<C: ConnectionTrait>(
@@ -669,10 +767,24 @@ async fn reuse_capacity_holding_remote<C: ConnectionTrait>(
         .filter(remote_pin::Column::Provider.eq(provider))
         .filter(remote_pin::Column::Cid.eq(cid))
         .filter(remote_pin::Column::Epoch.eq(remote.epoch))
-        .filter(remote_pin::Column::Status.eq(remote.status))
+        .filter(remote_pin::Column::Status.eq(remote.status.as_str()))
         .exec(db)
         .await?;
     Ok(if updated.rows_affected == 1 {
+        // The caller admits the new desired target in this same transaction. Reusing an
+        // already-pinned retained resource restores availability, not a new pin lifetime:
+        // leave its observation, ownership and capacity evidence untouched. A queued or
+        // unknown remote cannot turn retained history into fresh confirmation.
+        if remote.status == REMOTE_STATUS_PINNED {
+            remote_pin_ledger::Entity::update_many()
+                .col_expr(remote_pin_ledger::Column::Effect, Expr::value("confirmed"))
+                .filter(remote_pin_ledger::Column::Provider.eq(provider))
+                .filter(remote_pin_ledger::Column::Cid.eq(cid))
+                .filter(remote_pin_ledger::Column::Effect.eq("retained"))
+                .filter(remote_pin_ledger::Column::RemotePinnedAt.is_not_null())
+                .exec(db)
+                .await?;
+        }
         ReserveAttempt::Outcome(ReservationOutcome::Reused)
     } else {
         ReserveAttempt::Retry
@@ -703,6 +815,7 @@ async fn reserve_new_remote<C: ConnectionTrait>(
                 }
             };
             if matches!(inserted, TryInsertResult::Inserted(_)) {
+                super::ledger::capture_reservation(db, provider, cid).await?;
                 return Ok(ReserveAttempt::Outcome(ReservationOutcome::Reserved));
             }
             undo_capacity_grant(db, provider, grant).await?;
@@ -774,6 +887,7 @@ async fn reacquire_absent_remote<C: ConnectionTrait>(
                 }
             };
             if activated.rows_affected == 1 {
+                super::ledger::capture_reallocation(db, provider, cid).await?;
                 Ok(ReserveAttempt::Outcome(ReservationOutcome::Reserved))
             } else {
                 undo_capacity_grant(db, provider, grant).await?;
@@ -931,6 +1045,9 @@ async fn eviction_candidates<C: ConnectionTrait>(
         .await?;
     let mut candidates = Vec::with_capacity(remotes.len());
     for remote in remotes {
+        if !super::ledger::cleanup_allowed(db, provider, &remote.cid).await? {
+            continue;
+        }
         let Some(last_active_touch) = newest_active_target_touch(db, provider, &remote.cid).await?
         else {
             continue;

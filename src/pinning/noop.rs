@@ -30,6 +30,9 @@ impl Default for NoopProvider {
 
 #[async_trait::async_trait]
 impl PinningProvider for NoopProvider {
+    fn invocation_route(&self) -> (&'static str, &'static str) {
+        ("noop", "cid")
+    }
     fn name(&self) -> &str {
         &self.name
     }
