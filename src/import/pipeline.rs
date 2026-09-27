@@ -11,7 +11,7 @@ use crate::{
         downloader::SourceDownloader,
         execution_error::{ensure_active, map_publication_error, terminal_failure},
         progress::ProgressReporter,
-        publication::publish_direct,
+        publication::{decided_publish, publish_direct, resolved_policy},
         source::{execute_cid, execute_url},
         worker::{ImportWorkerHandle, start_worker},
     },
@@ -183,6 +183,17 @@ async fn execute_job_inner(
     reporter: &ProgressReporter,
 ) -> Result<ImportArtifact, ImportExecutionError> {
     ensure_active(cancellation)?;
+    // Fail closed before even contacting a source when a historical raw pin tag
+    // has no admission snapshot or an accepted snapshot cannot be safely replayed.
+    let (_, decision) = resolved_policy(state, job, cancellation)?;
+    if let Some(decision) = &decision {
+        crate::store::pinning::publication::preflight_decided_routes(
+            state.store.db(),
+            decided_publish(state, decision),
+        )
+        .await
+        .map_err(|error| map_publication_error(error, cancellation))?;
+    }
     if job.decompress_prefix.is_some() {
         ownership::reset_extracted_targets_for_attempt(
             state.store.db(),
@@ -754,6 +765,167 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn zip_worker_replays_skipped_import_decision_without_remote_pin_work() {
+        use crate::{
+            config::{OptionalPinControlMode, PinningConfig},
+            pinning::{
+                config::ValidatedPinningConfig,
+                decision::{DecisionEffect, DecisionOrigin},
+                policy::PublicationContext,
+                tags::ObjectTag,
+            },
+            store::entities::{pin_job, pin_lease, pin_provider_usage, remote_pin},
+        };
+
+        let archive = stored_zip("file.txt", b"hello");
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/routing/findprovs"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("{\"Type\":4,\"Responses\":[{\"ID\":\"provider-a\"}]}\n"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_pin(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/cat"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(archive.clone()))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/add"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("{\"Hash\":\"QmEntry\",\"Size\":\"5\"}\n"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/pin/add"))
+            .and(query_param("arg", "QmEntry"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let original = test_state(server.uri()).await;
+        let pinning = crate::pinning::coordinator::PinningCoordinator::build_with_kubo_and_mode(
+            ValidatedPinningConfig::from_raw(&PinningConfig::default(), |_| None).unwrap(),
+            None,
+            OptionalPinControlMode::Warn,
+        )
+        .unwrap();
+        let state = Arc::new(AppState {
+            kubo: crate::kubo::KuboClient::new(server.uri()),
+            cold_kubo: None,
+            store: Store::new(original.store.db().clone()),
+            credentials: HashMap::new(),
+            master_key: crate::crypto::key::MasterKey::from_hex(&"0".repeat(64)).unwrap(),
+            pinning,
+        });
+        let tags = vec![
+            ObjectTag::new("ipfs-s3:pin", "true"),
+            ObjectTag::new("private", "do-not-leak"),
+        ];
+        let (_, decision) = state
+            .pinning
+            .policy()
+            .evaluate_publication_decision(
+                PublicationContext {
+                    bucket: "bucket",
+                    key: "archive.zip",
+                    tags: &tags,
+                    is_decompress_zip: true,
+                },
+                DecisionOrigin::new("test", "skipped-zip"),
+            )
+            .unwrap();
+        assert_eq!(decision.effect, DecisionEffect::Skipped);
+        let now = Utc::now();
+        ownership::submit_decided(
+            state.store.db(),
+            NewImportJob {
+                id: "skipped-zip".into(),
+                bucket: "bucket".into(),
+                key: "archive.zip".into(),
+                source: ImportSource::Cid(CID.into()),
+                request_fingerprint: "zip-fingerprint".into(),
+                client_token: None,
+                object_content_type: None,
+                metadata: HashMap::new(),
+                tags,
+                decompress_prefix: Some("out/".into()),
+            },
+            decision,
+            now,
+        )
+        .await
+        .unwrap();
+        let claim = jobs::claim_due(
+            state.store.db(),
+            "zip-worker",
+            now,
+            now + chrono::TimeDelta::seconds(60),
+            1,
+        )
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+        let config = import_config();
+        let coordinator = coordinator_with_downloader(config, Arc::new(AtomicUsize::new(0)));
+        execute_job(
+            coordinator,
+            state.clone(),
+            claim.job,
+            claim.claim,
+            cancellation(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            import_job::Entity::find_by_id("skipped-zip")
+                .one(state.store.db())
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "completed"
+        );
+        for count in [
+            pin_job::Entity::find()
+                .count(state.store.db())
+                .await
+                .unwrap(),
+            pin_lease::Entity::find()
+                .count(state.store.db())
+                .await
+                .unwrap(),
+            pin_provider_usage::Entity::find()
+                .count(state.store.db())
+                .await
+                .unwrap(),
+            remote_pin::Entity::find()
+                .count(state.store.db())
+                .await
+                .unwrap(),
+        ] {
+            assert_eq!(count, 0);
+        }
+        assert_eq!(
+            object::Entity::find()
+                .count(state.store.db())
+                .await
+                .unwrap(),
+            2
+        );
+    }
+
+    #[tokio::test]
     async fn retried_combined_pipeline_resets_old_outputs_before_changed_archive_publication() {
         const ENTRY_CID: &str = "QmChangedEntry";
         let archive = stored_zip("b.txt", b"changed");
@@ -969,6 +1141,355 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_import_reserved_tags_fail_before_any_kubo_side_effect() {
+        let server = MockServer::start().await;
+        let state = test_state(server.uri()).await;
+        let coordinator =
+            coordinator_with_downloader(import_config(), Arc::new(AtomicUsize::new(0)));
+        let (mut job, claim) =
+            submit_and_claim(&state, "legacy-intent", ImportSource::Cid(CID.into())).await;
+        job.tags_json = r#"[{"key":"ipfs-s3:pin","value":"true"}]"#.into();
+        import_job::Entity::update_many()
+            .col_expr(
+                import_job::Column::TagsJson,
+                sea_orm::sea_query::Expr::value(&job.tags_json),
+            )
+            .filter(import_job::Column::Id.eq(&job.id))
+            .exec(state.store.db())
+            .await
+            .unwrap();
+
+        let error = execute_job(coordinator, state.clone(), job, claim, cancellation())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ImportExecutionError::Terminal(ImportFailure {
+                code: ImportFailureCode::PublicationFailed,
+                ..
+            })
+        ));
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert_eq!(
+            object::Entity::find()
+                .count(state.store.db())
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_import_from_another_provider_revision_is_fenced_before_source_io() {
+        use crate::{
+            config::{PinningConfig, PolicyConfig, ProviderConfig},
+            pinning::{
+                config::ValidatedPinningConfig,
+                decision::{DecisionEffect, DecisionOrigin},
+                policy::PublicationContext,
+                tags::ObjectTag,
+            },
+        };
+        let server = MockServer::start().await;
+        let state = test_state(server.uri()).await;
+        let mut raw = PinningConfig::default();
+        raw.providers.push(ProviderConfig {
+            name: "original-provider".into(),
+            kind: "noop".into(),
+            token_env: None,
+            endpoint: None,
+            api: None,
+            strategy: None,
+            upload_endpoint: None,
+            enabled: true,
+            priority: 1,
+            max_bytes: 1000,
+            max_pins: 100,
+            requests_per_second: None,
+        });
+        raw.policies.push(PolicyConfig {
+            bucket: "bucket".into(),
+            prefix: String::new(),
+            trigger: "request".into(),
+            provider_mode: "one".into(),
+            providers: vec!["original-provider".into()],
+            default_duration: "1h".into(),
+            max_duration: "24h".into(),
+            allow_decompressed: false,
+        });
+        let pinning = crate::pinning::coordinator::PinningCoordinator::build(
+            ValidatedPinningConfig::from_raw(&raw, |_| None).unwrap(),
+        )
+        .unwrap();
+        let tags = vec![ObjectTag::new("ipfs-s3:pin", "true")];
+        let (_, decision) = pinning
+            .policy()
+            .evaluate_publication_decision(
+                PublicationContext {
+                    bucket: "bucket",
+                    key: "captured",
+                    tags: &tags,
+                    is_decompress_zip: false,
+                },
+                DecisionOrigin::new("test", "accepted-drift"),
+            )
+            .unwrap();
+        assert_eq!(decision.effect, DecisionEffect::Accepted);
+        let now = Utc::now();
+        ownership::submit_decided(
+            state.store.db(),
+            NewImportJob {
+                id: "accepted-drift".into(),
+                bucket: "bucket".into(),
+                key: "captured".into(),
+                source: ImportSource::Cid(CID.into()),
+                request_fingerprint: "accepted-fingerprint".into(),
+                client_token: None,
+                object_content_type: None,
+                metadata: HashMap::new(),
+                tags,
+                decompress_prefix: None,
+            },
+            decision,
+            now,
+        )
+        .await
+        .unwrap();
+        let claim = jobs::claim_due(
+            state.store.db(),
+            "worker",
+            now,
+            now + chrono::TimeDelta::seconds(60),
+            1,
+        )
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+        let coordinator =
+            coordinator_with_downloader(import_config(), Arc::new(AtomicUsize::new(0)));
+        let error = execute_job(
+            coordinator,
+            state.clone(),
+            claim.job,
+            claim.claim,
+            cancellation(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ImportExecutionError::Terminal(ImportFailure {
+                code: ImportFailureCode::PublicationFailed,
+                ..
+            })
+        ));
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert_eq!(
+            object::Entity::find()
+                .count(state.store.db())
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn registered_route_override_rejects_accepted_import_before_any_kubo_io() {
+        use crate::{
+            config::Config,
+            pinning::{
+                config::ValidatedPinningConfig,
+                coordinator::PinningCoordinator,
+                decision::{DecisionEffect, DecisionOrigin},
+                policy::PublicationContext,
+                tags::ObjectTag,
+            },
+            store::{
+                entities::{import_destination, pin_job, pin_lease, pin_provider_usage},
+                pinning::ledger,
+            },
+        };
+        for zip in [false, true] {
+            let server = MockServer::start().await;
+            let mut state = test_state(server.uri()).await;
+            let config: Config = toml::from_str(
+                r#"
+                [pinning_identity]
+                primary_storage_domain = 'local'
+                [[pinning_identity.providers]]
+                config_name = 'remote'
+                provider_id = 'import-account'
+                display_name = 'Remote'
+                backend = 'filebase'
+                scope = 'import-scope'
+                storage_domain = 'remote'
+                credential_revision = 1
+                endpoint_revision = 1
+                secret_ref = 'env:IMPORT_ROUTE_TOKEN'
+                api_profile = 'filebase-psa'
+                strategy = 'cid'
+                [[pinning.providers]]
+                name = 'remote'
+                kind = 'filebase'
+                token_env = 'IMPORT_ROUTE_TOKEN'
+                priority = 1
+                max_bytes = 1000
+                max_pins = 100
+                [[pinning.policies]]
+                bucket = 'bucket'
+                trigger = 'request'
+                provider_mode = 'one'
+                providers = ['remote']
+                default_duration = '1h'
+                max_duration = '24h'
+                allow_decompressed = true
+            "#,
+            )
+            .unwrap();
+            let runtime = PinningCoordinator::build(
+                ValidatedPinningConfig::from_config(&config, |_| Some("test-token".into()))
+                    .unwrap(),
+            )
+            .unwrap();
+            Arc::get_mut(&mut state).unwrap().pinning = runtime;
+            state
+                .pinning
+                .register_identities(&state.store)
+                .await
+                .unwrap();
+            let id = format!("route-import-{zip}");
+            let tags = vec![ObjectTag::new("ipfs-s3:pin", "true")];
+            let (_, mut decision) = state
+                .pinning
+                .policy()
+                .evaluate_publication_decision(
+                    PublicationContext {
+                        bucket: "bucket",
+                        key: &id,
+                        tags: &tags,
+                        is_decompress_zip: zip,
+                    },
+                    DecisionOrigin::new("test", &id),
+                )
+                .unwrap();
+            assert_eq!(decision.effect, DecisionEffect::Accepted);
+            decision
+                .capture_durable_revision(
+                    state.pinning.effective_config(),
+                    state.pinning.control_mode(),
+                )
+                .unwrap();
+            let now = Utc::now();
+            ownership::submit_decided(
+                state.store.db(),
+                NewImportJob {
+                    id: id.clone(),
+                    bucket: "bucket".into(),
+                    key: id.clone(),
+                    source: ImportSource::Cid(CID.into()),
+                    request_fingerprint: format!("fingerprint-{zip}"),
+                    client_token: None,
+                    object_content_type: None,
+                    metadata: HashMap::new(),
+                    tags,
+                    decompress_prefix: zip.then(|| "out/".into()),
+                },
+                decision,
+                now,
+            )
+            .await
+            .unwrap();
+            let claim = jobs::claim_due(
+                state.store.db(),
+                "worker",
+                now,
+                now + chrono::TimeDelta::seconds(60),
+                1,
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+            let destination_before =
+                import_destination::Entity::find_by_id(("bucket".into(), id.clone()))
+                    .one(state.store.db())
+                    .await
+                    .unwrap();
+            let provider = &state.pinning.effective_config().providers[0];
+            let mut r2 = provider.identity.clone();
+            r2.endpoint_revision += 1;
+            ledger::register_route(state.store.db(), &provider.name, &r2)
+                .await
+                .unwrap();
+            assert!(
+                crate::import::publication::resolved_policy(&state, &claim.job, &cancellation())
+                    .is_ok()
+            );
+            let coordinator =
+                coordinator_with_downloader(import_config(), Arc::new(AtomicUsize::new(0)));
+            let error = execute_job(
+                coordinator,
+                state.clone(),
+                claim.job,
+                claim.claim,
+                cancellation(),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    ImportExecutionError::Terminal(ImportFailure {
+                        code: ImportFailureCode::PublicationFailed,
+                        ..
+                    })
+                ),
+                "zip={zip}: {error:?}"
+            );
+            assert!(
+                server.received_requests().await.unwrap().is_empty(),
+                "zip={zip}"
+            );
+            assert_eq!(
+                import_destination::Entity::find_by_id(("bucket".into(), id))
+                    .one(state.store.db())
+                    .await
+                    .unwrap(),
+                destination_before
+            );
+            assert_eq!(
+                object::Entity::find()
+                    .count(state.store.db())
+                    .await
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                pin_job::Entity::find()
+                    .count(state.store.db())
+                    .await
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                pin_lease::Entity::find()
+                    .count(state.store.db())
+                    .await
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                pin_provider_usage::Entity::find()
+                    .count(state.store.db())
+                    .await
+                    .unwrap(),
+                0
+            );
+        }
     }
 
     #[tokio::test]

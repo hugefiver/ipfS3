@@ -19,9 +19,12 @@ use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, header};
 use axum::response::Response as AxumResponse;
 use chrono::Utc;
-use ipfs_s3_gateway::config::{PinningConfig, PolicyConfig, ProviderConfig};
+use ipfs_s3_gateway::config::{Config, PinningConfig, PolicyConfig, ProviderConfig};
 use ipfs_s3_gateway::pinning::config::ValidatedPinningConfig;
 use ipfs_s3_gateway::pinning::coordinator::{PinningCoordinator, PinningWorkerHandle};
+use ipfs_s3_gateway::pinning::identity::{
+    CleanupMode, PinningIdentityConfig, ProviderIdentityConfig,
+};
 use ipfs_s3_gateway::state::AppState;
 use ipfs_s3_gateway::store::entities::{
     pin_job, pin_lease, pin_lease_target, pin_provider_usage, remote_pin,
@@ -78,6 +81,7 @@ pub struct PinningHarnessConfig {
     pub kubo_script: KuboScript,
     pub pinata_script: Vec<PsaReply>,
     pub filebase_script: Vec<PsaReply>,
+    pub explicit_identity: bool,
 }
 
 impl PinningHarnessConfig {
@@ -104,6 +108,7 @@ impl PinningHarnessConfig {
                 TEST_CID,
             )],
             filebase_script: Vec::new(),
+            explicit_identity: false,
         }
     }
 
@@ -137,6 +142,7 @@ impl PinningHarnessConfig {
                 "filebase-request-1",
                 TEST_CID,
             )],
+            explicit_identity: false,
         }
     }
 }
@@ -467,6 +473,33 @@ pub async fn start_pinning_harness(config: PinningHarnessConfig) -> PinningHarne
     let filebase_proxy = ProviderProxy::start(filebase.uri(), FILEBASE_TOKEN, sequence).await;
 
     let mut provider_kinds = HashMap::new();
+    let explicit_identities = config
+        .providers
+        .iter()
+        .map(|provider| {
+            let (backend, api_profile, secret_ref) = match provider.kind {
+                TestProviderKind::Pinata => ("pinata", "pinata-psa", "env:TEST_PINATA_TOKEN"),
+                TestProviderKind::Filebase => {
+                    ("filebase", "filebase-psa", "env:TEST_FILEBASE_TOKEN")
+                }
+            };
+            ProviderIdentityConfig {
+                config_name: provider.name.clone(),
+                provider_id: format!("test-{}", provider.name),
+                display_name: provider.name.clone(),
+                backend: backend.to_owned(),
+                scope: format!("test-{}", provider.name),
+                storage_domain: format!("test-{}", provider.name),
+                credential_revision: 1,
+                endpoint_revision: 1,
+                secret_ref: Some(secret_ref.to_owned()),
+                api_profile: api_profile.to_owned(),
+                strategy: "cid".to_owned(),
+                retired: false,
+                cleanup: CleanupMode::Managed,
+            }
+        })
+        .collect();
     let providers = config
         .providers
         .into_iter()
@@ -481,11 +514,25 @@ pub async fn start_pinning_harness(config: PinningHarnessConfig) -> PinningHarne
         providers,
         policies: config.policies,
     };
-    let validated = ValidatedPinningConfig::from_raw(&raw_pinning, |name| match name {
-        PINATA_TOKEN_ENV => Some(PINATA_TOKEN.to_owned()),
-        FILEBASE_TOKEN_ENV => Some(FILEBASE_TOKEN.to_owned()),
-        _ => None,
-    })
+    fn get_test_token(name: &str) -> Option<String> {
+        match name {
+            PINATA_TOKEN_ENV => Some(PINATA_TOKEN.to_owned()),
+            FILEBASE_TOKEN_ENV => Some(FILEBASE_TOKEN.to_owned()),
+            _ => None,
+        }
+    }
+    let validated = if config.explicit_identity {
+        let mut full_config: Config =
+            toml::from_str("").expect("default test gateway configuration");
+        full_config.pinning = raw_pinning;
+        full_config.pinning_identity = PinningIdentityConfig {
+            primary_storage_domain: Some("test-local-kubo".to_owned()),
+            providers: explicit_identities,
+        };
+        ValidatedPinningConfig::from_config(&full_config, get_test_token)
+    } else {
+        ValidatedPinningConfig::from_raw(&raw_pinning, get_test_token)
+    }
     .expect("validate test pinning config");
     let pinning = PinningCoordinator::build(validated).expect("build test pinning coordinator");
 
@@ -500,10 +547,15 @@ pub async fn start_pinning_harness(config: PinningHarnessConfig) -> PinningHarne
     ipfs_s3_gateway::store::bucket::create(&db, &bucket, None)
         .await
         .expect("create test bucket");
+    let store = ipfs_s3_gateway::store::Store::new(db);
+    pinning
+        .register_identities(&store)
+        .await
+        .expect("register test provider routes before serving requests");
     let state = Arc::new(AppState {
         kubo: ipfs_s3_gateway::kubo::KuboClient::new(kubo.uri()),
         cold_kubo: None,
-        store: ipfs_s3_gateway::store::Store::new(db),
+        store,
         credentials: HashMap::from([("test".to_owned(), s3s::auth::SecretKey::from("test"))]),
         master_key: ipfs_s3_gateway::crypto::key::MasterKey::from_hex(&"0".repeat(64))
             .expect("zero test master key"),
@@ -530,6 +582,18 @@ pub async fn start_pinning_harness(config: PinningHarnessConfig) -> PinningHarne
 }
 
 impl PinningHarness {
+    pub fn provider_key(&self, name: &str) -> String {
+        self.state
+            .pinning
+            .effective_config()
+            .providers
+            .iter()
+            .find(|provider| provider.identity.display_name == name)
+            .expect("configured test provider")
+            .identity
+            .allocation_key()
+    }
+
     pub async fn pinata_requests(&self) -> Vec<ObservedPsaRequest> {
         self.pinata_proxy().requests().await
     }
@@ -691,9 +755,36 @@ impl PinningHarness {
                 tokio::task::yield_now().await;
             }
         };
-        tokio::time::timeout(WORKER_WAIT, wait)
-            .await
-            .expect("pinning job did not reach the expected state")
+        match tokio::time::timeout(WORKER_WAIT, wait).await {
+            Ok(job) => job,
+            Err(_) => panic!(
+                "pinning job did not reach {state}: {:?}",
+                self.pin_job(job_id).await
+            ),
+        }
+    }
+
+    pub async fn wait_for_job_attention(&self, job_id: &str) -> pin_job::Model {
+        let wait = async {
+            loop {
+                let job = self.pin_job(job_id).await;
+                if job.state == "running"
+                    && job.locked_until.is_none()
+                    && job.last_error.as_deref()
+                        == Some("historical identity unavailable; needs_attention")
+                {
+                    return job;
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+        match tokio::time::timeout(WORKER_WAIT, wait).await {
+            Ok(job) => job,
+            Err(_) => panic!(
+                "job did not park for attention: {:?}",
+                self.pin_job(job_id).await
+            ),
+        }
     }
 
     pub async fn advance_past_lease_expiry(&self, key: &str) {
@@ -717,6 +808,31 @@ impl PinningHarness {
                 .await
                 .expect("advance pinning lease past expiry");
         }
+    }
+
+    pub async fn wait_for_lease_state(&self, key: &str, expected: &str) {
+        tokio::time::timeout(WORKER_WAIT, async {
+            loop {
+                let object = ipfs_s3_gateway::store::object::get_latest(
+                    self.state.store.db(),
+                    &self.bucket,
+                    key,
+                )
+                .await
+                .expect("load object while waiting for lease");
+                let leases = pin_lease::Entity::find()
+                    .filter(pin_lease::Column::OwnerObjectId.eq(object.id))
+                    .all(self.state.store.db())
+                    .await
+                    .expect("load lease while waiting for evaluator");
+                if leases.iter().any(|lease| lease.state == expected) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("lease did not reach expected evaluator state");
     }
 
     pub async fn run_current_reconcile(&mut self, provider: &str, cid: &str) {

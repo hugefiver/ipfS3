@@ -54,6 +54,15 @@ max_backoff_secs = 60
 worker_interval = "5s"
 worker_concurrency = 4
 
+# Optional pin controls fail strictly when this section is omitted (including
+# existing deployments). Explicitly opt in only if a skipped manual pin request
+# with a response warning is acceptable. Authentication, malformed tags, primary
+# writes, and automatic pinning policy are not made optional by this setting.
+# This example keeps the automatic `always` policy below: warn does not turn it
+# into a best-effort subset of the configured providers.
+[pinning_control]
+unavailable = "warn"
+
 # Provider tokens are read from the named environment variables. Never put a
 # token in this file. Built-in public endpoints are used by default; endpoint
 # overrides are only for tests or private compatible services.
@@ -81,11 +90,15 @@ priority = 20
 max_bytes = 107374182400
 max_pins = 10000
 
-# Stable runtime identities are separate from routing aliases (`name`). Every
-# configured provider must have exactly one identity when this registry is
-# present. Revisions are administrator-managed and must increase when the
-# referenced credential or endpoint changes. Snapshots persist only secret
-# references such as env names, never secret values or hashes.
+# Stable runtime identities are separate from routing aliases (`name`). New
+# accepted MPU/import with executable remote intent requires an explicit entry
+# for every executable configured non-Noop provider; legacy name-only async work
+# is refused.
+# Noop or no executable intent does not require these entries. Historical jobs
+# keep their captured routes. Revisions are administrator-managed and must
+# increase when the referenced credential or endpoint changes; a change before
+# accepted MPU completion fails closed, before side effects. Snapshots persist
+# only secret references such as env names, never secret values or hashes.
 #
 # `storage_domain` is the physical/account pin domain. A provider whose domain
 # equals `primary_storage_domain` is rejected because it is not an independent

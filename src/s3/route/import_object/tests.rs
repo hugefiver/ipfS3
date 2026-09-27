@@ -20,6 +20,7 @@ use crate::{
             SourceDownloader, StrictPublicAddressPolicy,
         },
     },
+    s3::sigv4,
     store::{
         Store,
         entities::{import_destination, import_job, import_job_result},
@@ -376,6 +377,382 @@ async fn idempotent_replay_returns_original_job_and_mismatch_is_stable_conflict(
     let error = route.call(mismatch).await.unwrap_err();
     assert_eq!(error.code().as_str(), "IdempotentParameterMismatch");
     assert_eq!(error.status_code(), Some(StatusCode::CONFLICT));
+}
+
+#[tokio::test]
+async fn same_client_token_cannot_replay_another_authenticated_principals_decision() {
+    let (route, state) = setup_route(true).await;
+    let mut first = request(
+        Method::POST,
+        "/bucket/key?ipfs3-import",
+        Body::from(cid_xml()),
+    );
+    first
+        .headers
+        .insert("x-ipfs3-client-token", "shared-token".parse().unwrap());
+    route.call(first).await.unwrap();
+    let mut other = request(
+        Method::POST,
+        "/bucket/key?ipfs3-import",
+        Body::from(cid_xml()),
+    );
+    other
+        .headers
+        .insert("x-ipfs3-client-token", "shared-token".parse().unwrap());
+    other.credentials.as_mut().unwrap().access_key = "other".into();
+    assert_eq!(
+        route.call(other).await.unwrap_err().code().as_str(),
+        "IdempotentParameterMismatch"
+    );
+    assert_eq!(
+        import_job::Entity::find()
+            .count(state.store.db())
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn warn_submission_persists_skipped_decision_and_replay_keeps_its_warning() {
+    use crate::{
+        config::{OptionalPinControlMode, PinningConfig},
+        pinning::{
+            config::ValidatedPinningConfig,
+            decision::{DecisionEffect, ExtensionDecision},
+        },
+    };
+
+    let base = test_state().await;
+    let config = ValidatedPinningConfig::from_raw(&PinningConfig::default(), |_| None).unwrap();
+    let state = Arc::new(AppState {
+        kubo: base.kubo.clone(),
+        cold_kubo: None,
+        store: base.store.clone(),
+        credentials: HashMap::new(),
+        master_key: crate::crypto::key::MasterKey::from_hex(&"0".repeat(64)).unwrap(),
+        pinning: crate::pinning::coordinator::PinningCoordinator::build_with_kubo_and_mode(
+            config,
+            None,
+            OptionalPinControlMode::Warn,
+        )
+        .unwrap(),
+    });
+    let route = ImportObjectRoute::new(state.clone(), coordinator(ImportConfig::default()));
+    let submit = || {
+        let mut req = request(
+            Method::POST,
+            "/bucket/key?ipfs3-import",
+            Body::from(cid_xml()),
+        );
+        req.headers
+            .insert("x-ipfs3-client-token", "token".parse().unwrap());
+        req.headers.insert(
+            "x-amz-tagging",
+            "ipfs-s3%3Apin=true&secret=do-not-leak".parse().unwrap(),
+        );
+        req
+    };
+    let first = route.call(submit()).await.unwrap();
+    assert_eq!(first.status, Some(StatusCode::ACCEPTED));
+    assert_eq!(
+        first.headers["x-ipfs3-pin-warning"],
+        "pin-policy-unavailable"
+    );
+    assert!(!response_xml(first).await.contains("do-not-leak"));
+    let replay = route.call(submit()).await.unwrap();
+    assert_eq!(
+        replay.headers["x-ipfs3-pin-warning"],
+        "pin-policy-unavailable"
+    );
+    let id = replay.headers["x-ipfs3-import-job-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let stored = import_job::Entity::find_by_id(&id)
+        .one(state.store.db())
+        .await
+        .unwrap()
+        .unwrap();
+    let decision: ExtensionDecision =
+        serde_json::from_str(stored.pin_decision_json.as_deref().unwrap()).unwrap();
+    assert_eq!(decision.effect, DecisionEffect::Skipped);
+    assert_eq!(decision.origin.request_id, id);
+    assert_eq!(decision.origin.principal_id, "test");
+    assert!(decision.effective_intents.is_empty());
+    let status = route
+        .call(request(
+            Method::GET,
+            &format!("/bucket/key?ipfs3-import={id}"),
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(status.headers["x-ipfs3-pin-decision"], "skipped");
+    assert_eq!(
+        status.headers["x-ipfs3-pin-warning"],
+        "pin-policy-unavailable"
+    );
+    let xml = response_xml(status).await;
+    assert!(!xml.contains("do-not-leak"));
+    assert!(!xml.contains("Warning"));
+}
+
+#[tokio::test]
+async fn signed_import_restarts_worker_with_new_policy_without_replaying_skipped_pin() {
+    use crate::{
+        config::{OptionalPinControlMode, PinningConfig, PolicyConfig, ProviderConfig},
+        pinning::config::ValidatedPinningConfig,
+        store::entities::{pin_job, pin_lease, pin_provider_usage, remote_pin},
+    };
+    use sea_orm::ConnectOptions;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path, query_param},
+    };
+
+    let directory = tempfile::tempdir().unwrap();
+    let database_path = directory.path().join("restart.sqlite");
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        database_path.display().to_string().replace('\\', "/")
+    );
+    let kubo = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/routing/findprovs"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("{\"Type\":4,\"Responses\":[{\"ID\":\"provider-a\"}]}\n"),
+        )
+        .expect(1)
+        .mount(&kubo)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/pin/add"))
+        .and(query_param("progress", "true"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(format!("{{\"Pins\":[\"{CID}\"]}}\n")),
+        )
+        .expect(1)
+        .mount(&kubo)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/cat"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hello"))
+        .expect(1)
+        .mount(&kubo)
+        .await;
+
+    let make_state = |db, pinning| {
+        Arc::new(AppState {
+            kubo: crate::kubo::KuboClient::new(kubo.uri()),
+            cold_kubo: None,
+            store: Store::new(db),
+            credentials: HashMap::from([("test".into(), s3s::auth::SecretKey::from("test"))]),
+            master_key: crate::crypto::key::MasterKey::from_hex(&"0".repeat(64)).unwrap(),
+            pinning,
+        })
+    };
+    let mut options = ConnectOptions::new(database_url.clone());
+    options.max_connections(2);
+    let db = Database::connect(options).await.unwrap();
+    crate::store::run_migrations(&db).await.unwrap();
+    crate::store::bucket::create(&db, "bucket", None)
+        .await
+        .unwrap();
+    let empty = ValidatedPinningConfig::from_raw(&PinningConfig::default(), |_| None).unwrap();
+    let original = make_state(
+        db,
+        crate::pinning::coordinator::PinningCoordinator::build_with_kubo_and_mode(
+            empty,
+            None,
+            OptionalPinControlMode::Warn,
+        )
+        .unwrap(),
+    );
+    let imports = coordinator(ImportConfig {
+        poll_interval_ms: 10,
+        ..ImportConfig::default()
+    });
+    let (endpoint, server) = signed_import_server(original.clone(), imports.clone()).await;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        "application/xml".parse().unwrap(),
+    );
+    headers.insert("x-ipfs3-client-token", "restart-token".parse().unwrap());
+    headers.insert(
+        "x-amz-tagging",
+        "ipfs-s3%3Apin=true&private=do-not-leak".parse().unwrap(),
+    );
+    let submit = sigv4::send_sigv4(
+        reqwest::Method::POST,
+        &endpoint,
+        "bucket",
+        "key",
+        &[("ipfs3-import", "")],
+        cid_xml().into_bytes(),
+        headers.clone(),
+        "test",
+    )
+    .await;
+    assert_eq!(submit.status(), reqwest::StatusCode::ACCEPTED);
+    assert_eq!(
+        submit.headers()["x-ipfs3-pin-warning"],
+        "pin-policy-unavailable"
+    );
+    assert!(!submit.headers().contains_key("x-ipfs3-pin-decision"));
+    let id = submit.headers()["x-ipfs3-import-job-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(!submit.text().await.unwrap().contains("do-not-leak"));
+    server.abort();
+    drop(original);
+
+    let mut raw = PinningConfig::default();
+    raw.providers.push(ProviderConfig {
+        name: "new-provider".into(),
+        kind: "noop".into(),
+        token_env: None,
+        endpoint: None,
+        api: None,
+        strategy: None,
+        upload_endpoint: None,
+        enabled: true,
+        priority: 1,
+        max_bytes: 1000,
+        max_pins: 100,
+        requests_per_second: None,
+    });
+    raw.policies.push(PolicyConfig {
+        bucket: "bucket".into(),
+        prefix: String::new(),
+        trigger: "request".into(),
+        provider_mode: "one".into(),
+        providers: vec!["new-provider".into()],
+        default_duration: "1h".into(),
+        max_duration: "24h".into(),
+        allow_decompressed: false,
+    });
+    let pinning = crate::pinning::coordinator::PinningCoordinator::build_with_kubo_and_mode(
+        ValidatedPinningConfig::from_raw(&raw, |_| None).unwrap(),
+        None,
+        OptionalPinControlMode::Warn,
+    )
+    .unwrap();
+    let restarted = make_state(Database::connect(database_url).await.unwrap(), pinning);
+    let (endpoint, server) = signed_import_server(restarted.clone(), imports.clone()).await;
+    let replay = sigv4::send_sigv4(
+        reqwest::Method::POST,
+        &endpoint,
+        "bucket",
+        "key",
+        &[("ipfs3-import", "")],
+        cid_xml().into_bytes(),
+        headers,
+        "test",
+    )
+    .await;
+    assert_eq!(replay.status(), reqwest::StatusCode::ACCEPTED);
+    assert_eq!(replay.headers()["x-ipfs3-import-job-id"], id);
+    assert_eq!(
+        replay.headers()["x-ipfs3-pin-warning"],
+        "pin-policy-unavailable"
+    );
+
+    let worker = imports.start(
+        restarted.clone(),
+        tokio_util::sync::CancellationToken::new(),
+    );
+    let completed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let row = import_job::Entity::find_by_id(&id)
+                .one(restarted.store.db())
+                .await
+                .unwrap()
+                .unwrap();
+            if row.state == "completed" {
+                break row;
+            }
+            assert_ne!(
+                row.state, "failed",
+                "worker failed: {:?}",
+                row.failure_message
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    worker.shutdown(std::time::Duration::from_secs(1)).await;
+    assert_eq!(completed.final_cid.as_deref(), Some(CID));
+    let status = sigv4::send_sigv4(
+        reqwest::Method::GET,
+        &endpoint,
+        "bucket",
+        "key",
+        &[("ipfs3-import", &id)],
+        Vec::new(),
+        HeaderMap::new(),
+        "test",
+    )
+    .await;
+    assert_eq!(status.status(), reqwest::StatusCode::OK);
+    assert_eq!(status.headers()["x-ipfs3-pin-decision"], "skipped");
+    assert_eq!(
+        status.headers()["x-ipfs3-pin-warning"],
+        "pin-policy-unavailable"
+    );
+    let xml = status.text().await.unwrap();
+    assert!(xml.contains("<State>completed</State>"));
+    assert!(!xml.contains("Warning"));
+    assert!(!xml.contains("do-not-leak"));
+    for count in [
+        pin_lease::Entity::find()
+            .count(restarted.store.db())
+            .await
+            .unwrap(),
+        pin_job::Entity::find()
+            .count(restarted.store.db())
+            .await
+            .unwrap(),
+        pin_provider_usage::Entity::find()
+            .count(restarted.store.db())
+            .await
+            .unwrap(),
+        remote_pin::Entity::find()
+            .count(restarted.store.db())
+            .await
+            .unwrap(),
+    ] {
+        assert_eq!(count, 0);
+    }
+    server.abort();
+}
+
+async fn signed_import_server(
+    state: Arc<AppState>,
+    imports: Arc<ImportCoordinator>,
+) -> (String, tokio::task::JoinHandle<()>) {
+    use axum::error_handling::HandleError;
+    use s3s::service::S3ServiceBuilder;
+    let mut builder = S3ServiceBuilder::new(crate::s3::handler::S3Impl::new(state.clone()));
+    builder.set_auth(crate::auth::GatewayAuth::new(state.clone()));
+    builder.set_route(crate::s3::route::gateway::GatewayRoute::new(state, imports));
+    let app = axum::Router::new().fallback_service(HandleError::new(
+        builder.build(),
+        |_: s3s::HttpError| async {
+            http::Response::builder()
+                .status(500)
+                .body(s3s::Body::from("error".to_owned()))
+                .unwrap()
+        },
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (endpoint, server)
 }
 
 struct ControlledResolver {

@@ -8,16 +8,100 @@ use crate::{
         execution_error::{ensure_active, map_publication_error, terminal_failure},
         pipeline::{ImportArtifact, JobCancellation},
     },
-    pinning::{policy::PublicationContext, tags::ObjectTag},
+    pinning::{
+        decision::ExtensionDecision,
+        policy::{PublicationContext, PublicationPolicy},
+        tags::{ObjectTag, PinControl},
+    },
     state::AppState,
     store::{
         entities::{import_job, import_job_result, import_job_target},
         import::ownership::{ExpectedImportTarget, ImportPublicationGuard},
-        pinning::publication::{PinTargetSpec, PublicationObject, PublicationRequest},
+        pinning::publication::{
+            DecidedPublish, PinTargetSpec, PublicationObject, PublicationRequest,
+        },
     },
 };
 
 pub(crate) mod zip;
+
+/// Called before source I/O and again at publication. A historical job without
+/// a captured decision can retain its original ordinary/automatic behavior, but
+/// its reserved tags can never turn into newly executable pin instructions.
+pub(crate) fn resolved_policy(
+    state: &AppState,
+    job: &import_job::Model,
+    cancellation: &JobCancellation,
+) -> Result<(PublicationPolicy, Option<ExtensionDecision>), ImportExecutionError> {
+    let tags: Vec<ObjectTag> = serde_json::from_str(&job.tags_json).map_err(|_| {
+        terminal_failure(
+            ImportFailureCode::PublicationFailed,
+            "persisted import tags are invalid",
+        )
+    })?;
+    if let Some(json) = &job.pin_decision_json {
+        let decision: ExtensionDecision = serde_json::from_str(json).map_err(|_| {
+            terminal_failure(
+                ImportFailureCode::PublicationFailed,
+                "persisted import pin decision is invalid",
+            )
+        })?;
+        if decision.origin.request_id != job.id {
+            return Err(terminal_failure(
+                ImportFailureCode::PublicationFailed,
+                "persisted import pin decision is invalid",
+            ));
+        }
+        decision
+            .verify_revision(
+                state.pinning.effective_config(),
+                state.pinning.control_mode(),
+            )
+            .map_err(|_| {
+                terminal_failure(
+                    ImportFailureCode::PublicationFailed,
+                    "captured pinning configuration is unavailable",
+                )
+            })?;
+        let policy = decision.replay_policy(tags).map_err(|_| {
+            terminal_failure(
+                ImportFailureCode::PublicationFailed,
+                "persisted import pin decision is invalid",
+            )
+        })?;
+        return Ok((policy, Some(decision)));
+    }
+    if !matches!(PinControl::from_tags(&tags), Ok(PinControl::Absent)) {
+        return Err(terminal_failure(
+            ImportFailureCode::PublicationFailed,
+            "legacy import pin intent has no captured decision",
+        ));
+    }
+    let policy = state
+        .pinning
+        .policy()
+        .evaluate_publication(PublicationContext {
+            bucket: &job.bucket,
+            key: &job.key,
+            tags: &tags,
+            is_decompress_zip: job.decompress_prefix.is_some(),
+        })
+        .map_err(AppError::from)
+        .map_err(|error| map_publication_error(error, cancellation))?;
+    Ok((policy, None))
+}
+
+pub(crate) fn decided_publish<'a>(
+    state: &'a AppState,
+    decision: &'a ExtensionDecision,
+) -> DecidedPublish<'a> {
+    DecidedPublish {
+        decision,
+        config: state.pinning.effective_config(),
+        mode: state.pinning.control_mode(),
+        limits: state.pinning.provider_limits(),
+    }
+}
 
 pub(crate) async fn publish_direct(
     state: &AppState,
@@ -27,29 +111,13 @@ pub(crate) async fn publish_direct(
     cancellation: &JobCancellation,
 ) -> Result<(), ImportExecutionError> {
     ensure_active(cancellation)?;
-    let tags: Vec<ObjectTag> = serde_json::from_str(&job.tags_json).map_err(|_| {
-        terminal_failure(
-            ImportFailureCode::PublicationFailed,
-            "persisted import tags are invalid",
-        )
-    })?;
+    let (policy, decision) = resolved_policy(state, job, cancellation)?;
     let metadata: serde_json::Value = serde_json::from_str(&job.metadata_json).map_err(|_| {
         terminal_failure(
             ImportFailureCode::PublicationFailed,
             "persisted import metadata is invalid",
         )
     })?;
-    let policy = state
-        .pinning
-        .policy()
-        .evaluate_publication(PublicationContext {
-            bucket: &job.bucket,
-            key: &job.key,
-            tags: &tags,
-            is_decompress_zip: false,
-        })
-        .map_err(AppError::from)
-        .map_err(|error| map_publication_error(error, cancellation))?;
     let logical_size = i64::try_from(artifact.logical_size).map_err(|_| {
         terminal_failure(
             ImportFailureCode::PublicationFailed,
@@ -105,15 +173,27 @@ pub(crate) async fn publish_direct(
         error_code: Set(None),
         error_message: Set(None),
     }];
-    crate::store::pinning::publication::publish_import_object(
-        state.store.db(),
-        request,
-        guard,
-        result_rows,
-        Utc::now(),
-        state.pinning.provider_limits(),
-    )
-    .await
+    if let Some(decision) = &decision {
+        crate::store::pinning::publication::publish_decided_import_object(
+            state.store.db(),
+            request,
+            guard,
+            result_rows,
+            Utc::now(),
+            decided_publish(state, decision),
+        )
+        .await
+    } else {
+        crate::store::pinning::publication::publish_import_object(
+            state.store.db(),
+            request,
+            guard,
+            result_rows,
+            Utc::now(),
+            state.pinning.provider_limits(),
+        )
+        .await
+    }
     .map_err(|error| map_publication_error(error, cancellation))?;
     Ok(())
 }

@@ -1,5 +1,7 @@
 //! Durable identity/ownership evidence layered on the existing remote epoch and
 //! capacity row. No network operations or independently invented resource fences.
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, QueryFilter,
@@ -68,6 +70,37 @@ pub async fn register_route<C: ConnectionTrait>(
     )
     .exec(db)
     .await?;
+    Ok(())
+}
+
+/// Publication callers acquire usage first, then lock every selected registered route
+/// until commit. The short I/O preflight uses the same comparison without a lock;
+/// only the transaction check is an allocation proof.
+pub(crate) async fn verify_selected_routes<C: ConnectionTrait>(
+    db: &C,
+    expected: &BTreeMap<String, ProviderRouteSnapshot>,
+    lock: bool,
+) -> AppResult<()> {
+    for (key, snapshot) in expected {
+        let query = pin_provider_route::Entity::find_by_id(key.clone());
+        let route = if lock && db.get_database_backend() == DatabaseBackend::Postgres {
+            query.lock_exclusive().one(db).await?
+        } else {
+            query.one(db).await?
+        };
+        let route = route.ok_or_else(|| {
+            AppError::InvalidPinningRequest("captured provider route is unavailable".into())
+        })?;
+        let current: ProviderRouteSnapshot =
+            serde_json::from_str(&route.snapshot).map_err(|_| {
+                AppError::InvalidPinningRequest("registered provider route is invalid".into())
+            })?;
+        if route.retired || current != *snapshot {
+            return Err(AppError::InvalidPinningRequest(
+                "captured provider route no longer matches registration".into(),
+            ));
+        }
+    }
     Ok(())
 }
 

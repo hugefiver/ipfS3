@@ -166,6 +166,7 @@ mod tests {
             object_content_type: None,
             metadata_json: "{}".to_owned(),
             tags_json: "[]".to_owned(),
+            pin_decision_json: None,
             decompress_prefix: None,
             state: "running".to_owned(),
             phase: "pinning_local".to_owned(),

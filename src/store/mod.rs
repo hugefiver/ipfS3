@@ -98,6 +98,16 @@ mod migrator {
                 ),
                 Box::new(crate::store::migrations::m20260920_000001_pin_submit_history::Migration),
                 Box::new(crate::store::migrations::m20260920_000002_pin_identity_ledger::Migration),
+                Box::new(
+                    crate::store::migrations::m20260920_000003_pin_extension_decision::Migration,
+                ),
+                Box::new(
+                    crate::store::migrations::m20260920_000004_multipart_pin_decision::Migration,
+                ),
+                Box::new(crate::store::migrations::m20260920_000005_import_pin_decision::Migration),
+                Box::new(
+                    crate::store::migrations::m20260920_000006_pin_submit_correlation::Migration,
+                ),
             ]
         }
     }

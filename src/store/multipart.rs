@@ -9,6 +9,7 @@ use sea_orm::{
 use serde_json::Value as JsonValue;
 
 use super::entities::{multipart_part, multipart_upload};
+use crate::pinning::decision::ExtensionDecision;
 use crate::pinning::tags::ObjectTag;
 
 #[allow(clippy::too_many_arguments)]
@@ -27,6 +28,62 @@ pub async fn create_upload<C: ConnectionTrait>(
     decompress_zip_target: Option<&str>,
     decompress_zip_result: bool,
 ) -> AppResult<()> {
+    create_upload_with_decision(
+        db,
+        upload_id,
+        object_id,
+        bucket,
+        key,
+        encryption_mode,
+        key_wrap,
+        sse_c_key_fingerprint,
+        content_type,
+        metadata,
+        tags,
+        decompress_zip_target,
+        decompress_zip_result,
+        None,
+    )
+    .await
+}
+
+/// Call inside the initiating transaction; the decision and upload are one row
+/// and cannot be independently committed or overwritten at completion.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_upload_with_decision<C: ConnectionTrait>(
+    db: &C,
+    upload_id: &str,
+    object_id: &str,
+    bucket: &str,
+    key: &str,
+    encryption_mode: &str,
+    key_wrap: Option<&str>,
+    sse_c_key_fingerprint: Option<&str>,
+    content_type: Option<&str>,
+    metadata: Option<JsonValue>,
+    tags: &[ObjectTag],
+    decompress_zip_target: Option<&str>,
+    decompress_zip_result: bool,
+    decision: Option<&ExtensionDecision>,
+) -> AppResult<()> {
+    let pin_decision_json = decision
+        .map(|decision| {
+            decision
+                .validate_snapshot()
+                .map_err(|_| AppError::Internal("invalid multipart pin decision".to_owned()))?;
+            decision.replay_policy(tags.to_vec()).map_err(|_| {
+                AppError::Internal("multipart pin decision tags mismatch".to_owned())
+            })?;
+            if decision.origin.request_id != upload_id {
+                return Err(AppError::Internal(
+                    "multipart pin decision upload mismatch".to_owned(),
+                ));
+            }
+            serde_json::to_value(decision).map_err(|_| {
+                AppError::Internal("failed to serialize multipart pin decision".to_owned())
+            })
+        })
+        .transpose()?;
     let created_at = crate::store::database_clock::database_now(db).await?;
     let model = multipart_upload::ActiveModel {
         upload_id: Set(upload_id.to_owned()),
@@ -41,12 +98,32 @@ pub async fn create_upload<C: ConnectionTrait>(
         metadata: Set(metadata),
         tags_json: Set(crate::store::pinning::tags::tags_to_json(tags)
             .map_err(|_| AppError::Internal("failed to serialize multipart tags".to_owned()))?),
+        pin_decision_json: Set(pin_decision_json),
         decompress_zip_target: Set(decompress_zip_target.map(str::to_owned)),
         decompress_zip_result: Set(decompress_zip_result),
     };
 
     multipart_upload::Entity::insert(model).exec(db).await?;
     Ok(())
+}
+
+pub fn decision_from_upload(
+    upload: &multipart_upload::Model,
+) -> AppResult<Option<ExtensionDecision>> {
+    let Some(snapshot) = &upload.pin_decision_json else {
+        return Ok(None);
+    };
+    let decision: ExtensionDecision = serde_json::from_value(snapshot.clone())
+        .map_err(|_| AppError::Internal("invalid persisted multipart pin decision".to_owned()))?;
+    decision
+        .validate_snapshot()
+        .map_err(|_| AppError::Internal("invalid persisted multipart pin decision".to_owned()))?;
+    if decision.origin.request_id != upload.upload_id {
+        return Err(AppError::Internal(
+            "multipart pin decision upload mismatch".to_owned(),
+        ));
+    }
+    Ok(Some(decision))
 }
 
 pub async fn claim_sse_c_key_fingerprint<C: ConnectionTrait>(
@@ -380,6 +457,86 @@ mod tests {
             .await
             .unwrap();
         db
+    }
+
+    #[tokio::test]
+    async fn captured_decision_round_trips_with_upload_and_legacy_remains_unknown() {
+        use crate::config::{OptionalPinControlMode, PinningConfig};
+        use crate::pinning::config::ValidatedPinningConfig;
+        use crate::pinning::decision::{DecisionEffect, DecisionOrigin};
+        use crate::pinning::policy::{PinPolicyEvaluator, PublicationContext};
+
+        let db = setup().await;
+        let tags = vec![
+            ObjectTag::new("ipfs-s3:pin", "true"),
+            ObjectTag::new("private", "do-not-leak"),
+        ];
+        let config = ValidatedPinningConfig::from_raw(&PinningConfig::default(), |_| None).unwrap();
+        let (_, decision) = PinPolicyEvaluator::with_mode(&config, OptionalPinControlMode::Warn)
+            .evaluate_publication_decision(
+                PublicationContext {
+                    bucket: "test-bucket",
+                    key: "archive.zip",
+                    tags: &tags,
+                    is_decompress_zip: false,
+                },
+                DecisionOrigin::new("test", "upload-captured"),
+            )
+            .unwrap();
+        let txn = db.begin().await.unwrap();
+        create_upload_with_decision(
+            &txn,
+            "upload-captured",
+            "object",
+            "test-bucket",
+            "archive.zip",
+            "none",
+            None,
+            None,
+            None,
+            None,
+            &tags,
+            None,
+            true,
+            Some(&decision),
+        )
+        .await
+        .unwrap();
+        txn.commit().await.unwrap();
+        let row = get_upload(&db, "upload-captured").await.unwrap();
+        let replayed = decision_from_upload(&row).unwrap().unwrap();
+        assert_eq!(replayed, decision);
+        assert_eq!(replayed.effect, DecisionEffect::Skipped);
+        assert_eq!(replayed.origin.request_id, row.upload_id);
+        assert!(
+            !row.pin_decision_json
+                .unwrap()
+                .to_string()
+                .contains("do-not-leak")
+        );
+
+        create_upload(
+            &db,
+            "legacy",
+            "object-2",
+            "test-bucket",
+            "archive.zip",
+            "none",
+            None,
+            None,
+            None,
+            None,
+            &tags,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(
+            decision_from_upload(&get_upload(&db, "legacy").await.unwrap())
+                .unwrap()
+                .is_none()
+        );
     }
 
     async fn abort_with_bucket_lock(
@@ -881,6 +1038,7 @@ mod tests {
             content_type: Some("application/zip".to_owned()),
             metadata: None,
             tags_json: serde_json::json!([]),
+            pin_decision_json: None,
             decompress_zip_target: None,
             decompress_zip_result: true,
         };
@@ -912,6 +1070,7 @@ mod tests {
             content_type: Some("application/zip".to_owned()),
             metadata: None,
             tags_json: serde_json::json!([]),
+            pin_decision_json: None,
             decompress_zip_target: None,
             decompress_zip_result: true,
         };

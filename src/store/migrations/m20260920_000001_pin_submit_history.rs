@@ -81,6 +81,10 @@ mod tests {
         Migration.down(&manager).await.unwrap();
         db.execute_unprepared("INSERT INTO pin_jobs (id,operation,provider,cid,lease_id,target_id,expected_generation,state,next_attempt_at,submit_phase) VALUES ('old','submit','pinata','cid','lease','target',1,'pending','2026-09-20T00:00:00Z','recovering')").await.unwrap();
         Migration.up(&manager).await.unwrap();
+        crate::store::migrations::m20260920_000006_pin_submit_correlation::Migration
+            .up(&manager)
+            .await
+            .unwrap();
         let row = crate::store::pinning::jobs::submission_history(&db, "old")
             .await
             .unwrap()

@@ -43,6 +43,9 @@ pub mod history {
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = false)]
         pub job_id: String,
+        /// Captured outbound correlation. NULL means a pre-migration invocation
+        /// whose provider metadata used the structured job ID.
+        pub correlation: Option<String>,
         pub api: String,
         pub strategy: String,
         pub effect: String,
@@ -174,6 +177,7 @@ pub async fn record_submit_invocation<C: ConnectionTrait>(
     } else {
         history::Entity::insert(history::ActiveModel {
             job_id: Set(claimed.model.id.clone()),
+            correlation: Set(None),
             api: Set(api.to_owned()),
             strategy: Set(strategy.to_owned()),
             effect: Set("unknown".into()),
@@ -313,6 +317,7 @@ async fn park_submit_in_transaction(
     if submission_history(db, &claimed.model.id).await?.is_none() {
         history::Entity::insert(history::ActiveModel {
             job_id: Set(claimed.model.id.clone()),
+            correlation: Set(None),
             api: Set("unknown".into()),
             strategy: Set("unknown".into()),
             effect: Set("unknown".into()),

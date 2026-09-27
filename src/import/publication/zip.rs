@@ -3,12 +3,12 @@ use sea_orm::EntityTrait;
 
 use crate::{
     error::AppError,
+    import::publication::{decided_publish, resolved_policy},
     import::{
         ImportClaim, ImportExecutionError, ImportFailureCode,
         execution_error::{ensure_active, map_publication_error, terminal_failure},
         pipeline::{ImportArtifact, JobCancellation},
     },
-    pinning::{policy::PublicationContext, tags::ObjectTag},
     state::AppState,
     store::{
         entities::{import_job, import_job_target},
@@ -40,29 +40,13 @@ pub(crate) async fn publish_zip_import(
     cancellation: &JobCancellation,
 ) -> Result<PublicationResult, ImportExecutionError> {
     ensure_active(cancellation)?;
-    let tags: Vec<ObjectTag> = serde_json::from_str(&job.tags_json).map_err(|_| {
-        terminal_failure(
-            ImportFailureCode::PublicationFailed,
-            "persisted import tags are invalid",
-        )
-    })?;
+    let (policy, decision) = resolved_policy(state, job, cancellation)?;
     let metadata: serde_json::Value = serde_json::from_str(&job.metadata_json).map_err(|_| {
         terminal_failure(
             ImportFailureCode::PublicationFailed,
             "persisted import metadata is invalid",
         )
     })?;
-    let policy = state
-        .pinning
-        .policy()
-        .evaluate_publication(PublicationContext {
-            bucket: &job.bucket,
-            key: &job.key,
-            tags: &tags,
-            is_decompress_zip: true,
-        })
-        .map_err(AppError::from)
-        .map_err(|error| map_publication_error(error, cancellation))?;
     let archive_size = i64::try_from(artifact.logical_size).map_err(|_| {
         terminal_failure(
             ImportFailureCode::PublicationFailed,
@@ -145,14 +129,26 @@ pub(crate) async fn publish_zip_import(
     let result_rows =
         results::zip_publication_rows(&job.id, &job.key, &artifact.cid, archive_size, records)
             .map_err(|error| map_publication_error(error, cancellation))?;
-    crate::store::pinning::publication::publish_import_zip(
-        state.store.db(),
-        request,
-        guard,
-        result_rows,
-        now,
-        state.pinning.provider_limits(),
-    )
-    .await
+    if let Some(decision) = &decision {
+        crate::store::pinning::publication::publish_decided_import_zip(
+            state.store.db(),
+            request,
+            guard,
+            result_rows,
+            now,
+            decided_publish(state, decision),
+        )
+        .await
+    } else {
+        crate::store::pinning::publication::publish_import_zip(
+            state.store.db(),
+            request,
+            guard,
+            result_rows,
+            now,
+            state.pinning.provider_limits(),
+        )
+        .await
+    }
     .map_err(|error| map_publication_error(error, cancellation))
 }

@@ -6,6 +6,7 @@ use tokio::sync::{Mutex, RwLock, Semaphore};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+use crate::config::OptionalPinControlMode;
 use crate::kubo::KuboClient;
 use crate::pinning::{
     config::{ProviderKind, ProviderLimitMap, ValidatedPinningConfig},
@@ -35,6 +36,8 @@ pub struct WorkerSettings {
 }
 
 pub struct PinningCoordinator {
+    effective_config: ValidatedPinningConfig,
+    control_mode: OptionalPinControlMode,
     policy: PinPolicyEvaluator,
     policy_providers: HashMap<String, Vec<String>>,
     providers: HashMap<String, Arc<dyn PinningProvider>>,
@@ -60,69 +63,87 @@ pub struct ProviderRuntime {
     pub(crate) next_request_at: Arc<Mutex<Option<Instant>>>,
 }
 
+/// Resolve the physical allocation namespace and reject incompatible aliases.
+/// This is pure: diagnostics can inspect the same effective pinning config as
+/// startup without constructing providers, connecting to Kubo, or touching a DB.
+pub fn normalize_validated_config(
+    mut config: ValidatedPinningConfig,
+) -> anyhow::Result<ValidatedPinningConfig> {
+    let aliases: HashMap<_, _> = config
+        .providers
+        .iter()
+        .map(|p| (p.name.clone(), p.identity.allocation_key()))
+        .collect();
+    for (index, policy) in config.policies.iter_mut().enumerate() {
+        policy.providers = policy
+            .providers
+            .iter()
+            .map(|name| aliases[name].clone())
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        policy.providers.retain(|name| seen.insert(name.clone()));
+        policy.refresh_identity(index);
+    }
+    config
+        .providers
+        .sort_by(|a, b| a.identity.provider_id.cmp(&b.identity.provider_id));
+    config.provider_limits.clear();
+    let mut domain_routes: HashMap<String, ProviderIdentity> = HashMap::new();
+    for provider in &mut config.providers {
+        provider.name = provider.identity.allocation_key();
+        if provider.name.len() > 255 {
+            return Err(anyhow!(
+                "pinning allocation identity exceeds the database key limit"
+            ));
+        }
+        provider.limits.enabled &= !provider.identity.retired;
+        if let Some(existing) = domain_routes.get(&provider.name) {
+            let mut alias = provider.identity.clone();
+            alias.provider_id.clone_from(&existing.provider_id);
+            alias.display_name.clone_from(&existing.display_name);
+            if &alias != existing {
+                return Err(anyhow!(
+                    "aliases in the same pinning domain must agree on protocol, strategy, revisions and cleanup"
+                ));
+            }
+        } else {
+            domain_routes.insert(provider.name.clone(), provider.identity.clone());
+        }
+        if let Some(existing) = config.provider_limits.get(&provider.name) {
+            if existing != &provider.limits {
+                return Err(anyhow!(
+                    "aliases in the same pinning domain must have identical limits"
+                ));
+            }
+        } else {
+            config
+                .provider_limits
+                .insert(provider.name.clone(), provider.limits.clone());
+        }
+    }
+    Ok(config)
+}
+
 impl PinningCoordinator {
     pub fn build(config: ValidatedPinningConfig) -> anyhow::Result<Arc<Self>> {
         Self::build_with_kubo(config, None)
     }
 
     pub fn build_with_kubo(
-        mut config: ValidatedPinningConfig,
+        config: ValidatedPinningConfig,
         kubo: Option<KuboClient>,
+    ) -> anyhow::Result<Arc<Self>> {
+        Self::build_with_kubo_and_mode(config, kubo, OptionalPinControlMode::Strict)
+    }
+
+    pub fn build_with_kubo_and_mode(
+        config: ValidatedPinningConfig,
+        kubo: Option<KuboClient>,
+        mode: OptionalPinControlMode,
     ) -> anyhow::Result<Arc<Self>> {
         // Resolve aliases before policy evaluation: all later target, quota and
         // job keys use the same physical resource namespace.
-        let aliases: HashMap<_, _> = config
-            .providers
-            .iter()
-            .map(|p| (p.name.clone(), p.identity.allocation_key()))
-            .collect();
-        for (index, policy) in config.policies.iter_mut().enumerate() {
-            policy.providers = policy
-                .providers
-                .iter()
-                .map(|name| aliases[name].clone())
-                .collect();
-            let mut seen = std::collections::HashSet::new();
-            policy.providers.retain(|name| seen.insert(name.clone()));
-            policy.refresh_identity(index);
-        }
-        config
-            .providers
-            .sort_by(|a, b| a.identity.provider_id.cmp(&b.identity.provider_id));
-        config.provider_limits.clear();
-        let mut domain_routes: HashMap<String, ProviderIdentity> = HashMap::new();
-        for provider in &mut config.providers {
-            provider.name = provider.identity.allocation_key();
-            if provider.name.len() > 255 {
-                return Err(anyhow!(
-                    "pinning allocation identity exceeds the database key limit"
-                ));
-            }
-            provider.limits.enabled &= !provider.identity.retired;
-            if let Some(existing) = domain_routes.get(&provider.name) {
-                let mut alias = provider.identity.clone();
-                alias.provider_id.clone_from(&existing.provider_id);
-                alias.display_name.clone_from(&existing.display_name);
-                if &alias != existing {
-                    return Err(anyhow!(
-                        "aliases in the same pinning domain must agree on protocol, strategy, revisions and cleanup"
-                    ));
-                }
-            } else {
-                domain_routes.insert(provider.name.clone(), provider.identity.clone());
-            }
-            if let Some(existing) = config.provider_limits.get(&provider.name) {
-                if existing != &provider.limits {
-                    return Err(anyhow!(
-                        "aliases in the same pinning domain must have identical limits"
-                    ));
-                }
-            } else {
-                config
-                    .provider_limits
-                    .insert(provider.name.clone(), provider.limits.clone());
-            }
-        }
+        let config = normalize_validated_config(config)?;
         let claim_limit = config
             .worker_concurrency
             .checked_mul(2)
@@ -139,13 +160,16 @@ impl PinningCoordinator {
             max_attempts: 8,
             shutdown_grace: Duration::from_secs(30),
         };
-        let policy = PinPolicyEvaluator::new(&config);
+        let policy = PinPolicyEvaluator::with_mode(&config, mode);
         let policy_providers = config
             .policies
             .iter()
             .map(|policy| (policy.identity.clone(), policy.providers.clone()))
             .collect();
         let limits = config.provider_limits.clone();
+        // Preserve the same alias-resolved snapshot used by the policy and worker,
+        // before provider construction consumes credentials and route options.
+        let effective_config = config.clone();
         let mut providers: HashMap<String, Arc<dyn PinningProvider>> = HashMap::new();
         let mut provider_runtime = HashMap::new();
         let mut identities = HashMap::new();
@@ -200,6 +224,8 @@ impl PinningCoordinator {
         }
 
         Ok(Arc::new(Self {
+            effective_config,
+            control_mode: mode,
             policy,
             policy_providers,
             providers,
@@ -219,6 +245,15 @@ impl PinningCoordinator {
 
     pub fn policy(&self) -> &PinPolicyEvaluator {
         &self.policy
+    }
+
+    /// Internal-only: contains resolved provider tokens; never log or expose over HTTP.
+    pub fn effective_config(&self) -> &ValidatedPinningConfig {
+        &self.effective_config
+    }
+
+    pub fn control_mode(&self) -> OptionalPinControlMode {
+        self.control_mode
     }
 
     pub fn provider_limits(&self) -> &ProviderLimitMap {
@@ -360,8 +395,13 @@ impl PinningCoordinator {
 mod tests {
     use super::PinningCoordinator;
     use crate::{
-        config::{PinningConfig, PolicyConfig, ProviderConfig},
-        pinning::{config::ValidatedPinningConfig, policy::PublicationContext, tags::ObjectTag},
+        config::{Config, OptionalPinControlMode, PinningConfig, PolicyConfig, ProviderConfig},
+        pinning::{
+            config::ValidatedPinningConfig,
+            decision::{DecisionEffect, DecisionOrigin},
+            policy::PublicationContext,
+            tags::ObjectTag,
+        },
     };
 
     fn validated_noop_fixture() -> ValidatedPinningConfig {
@@ -402,6 +442,8 @@ mod tests {
     #[test]
     fn foundation_exposes_policy_limits_registry_settings_and_disabled_fixture() {
         let coordinator = PinningCoordinator::build(validated_noop_fixture()).unwrap();
+        assert_eq!(coordinator.control_mode(), OptionalPinControlMode::Strict);
+        assert_eq!(coordinator.effective_config().policies.len(), 1);
         let no_tags: Vec<ObjectTag> = Vec::new();
         assert_eq!(
             coordinator
@@ -456,8 +498,116 @@ mod tests {
         );
 
         let disabled = PinningCoordinator::disabled_for_test();
+        assert_eq!(disabled.control_mode(), OptionalPinControlMode::Strict);
         assert!(disabled.provider_limits().is_empty());
         assert!(disabled.provider("noop").is_none());
+
+        let with_kubo =
+            PinningCoordinator::build_with_kubo(validated_noop_fixture(), None).unwrap();
+        assert_eq!(with_kubo.control_mode(), OptionalPinControlMode::Strict);
+    }
+
+    #[test]
+    fn warn_mode_uses_resolved_aliases_for_policy_and_effective_config() {
+        let raw: Config = toml::from_str(
+            r#"
+                [pinning_control]
+                unavailable = "warn"
+                [pinning]
+                [[pinning.providers]]
+                name = "first"
+                kind = "noop"
+                priority = 1
+                max_bytes = 100
+                max_pins = 10
+                [[pinning.providers]]
+                name = "second"
+                kind = "noop"
+                priority = 1
+                max_bytes = 100
+                max_pins = 10
+                [[pinning.policies]]
+                bucket = "bucket"
+                trigger = "request"
+                provider_mode = "one"
+                providers = ["first", "second"]
+                default_duration = "1h"
+                max_duration = "2h"
+                [pinning_identity]
+                primary_storage_domain = "kubo:primary"
+                [[pinning_identity.providers]]
+                config_name = "first"
+                provider_id = "noop-first"
+                display_name = "First"
+                backend = "noop"
+                scope = "account:shared"
+                storage_domain = "noop:shared"
+                credential_revision = 1
+                endpoint_revision = 1
+                api_profile = "noop"
+                strategy = "cid"
+                [[pinning_identity.providers]]
+                config_name = "second"
+                provider_id = "noop-second"
+                display_name = "Second"
+                backend = "noop"
+                scope = "account:shared"
+                storage_domain = "noop:shared"
+                credential_revision = 1
+                endpoint_revision = 1
+                api_profile = "noop"
+                strategy = "cid"
+            "#,
+        )
+        .unwrap();
+        let validated = ValidatedPinningConfig::from_config(&raw, |_| None).unwrap();
+        let coordinator = PinningCoordinator::build_with_kubo_and_mode(
+            validated,
+            None,
+            raw.pinning_control.unavailable,
+        )
+        .unwrap();
+        let effective = coordinator.effective_config();
+        let key = effective.providers[0].identity.allocation_key();
+        assert_ne!(key, "first");
+        assert_eq!(effective.providers.len(), 2);
+        assert!(
+            effective
+                .providers
+                .iter()
+                .all(|provider| provider.name == key)
+        );
+        assert_eq!(effective.policies[0].providers, vec![key.clone()]);
+        assert_eq!(effective.provider_limits.len(), 1);
+        assert_eq!(coordinator.provider_limits(), &effective.provider_limits);
+        assert_eq!(coordinator.provider(&key).unwrap().name(), key);
+        assert_eq!(coordinator.control_mode(), OptionalPinControlMode::Warn);
+
+        let tags = [ObjectTag::new("ipfs-s3:pin", "true")];
+        let (policy, decision) = coordinator
+            .policy()
+            .evaluate_publication_decision(
+                PublicationContext {
+                    bucket: "bucket",
+                    key: "object",
+                    tags: &tags,
+                    is_decompress_zip: false,
+                },
+                DecisionOrigin::new("principal", "request"),
+            )
+            .unwrap();
+        assert_eq!(policy.leases[0].providers, vec![key]);
+        assert_eq!(decision.effect, DecisionEffect::Accepted);
+        assert!(
+            decision
+                .verify_revision(effective, coordinator.control_mode())
+                .is_ok()
+        );
+        assert!(
+            decision
+                .verify_revision(effective, OptionalPinControlMode::Strict)
+                .is_err()
+        );
     }
 
     #[test]

@@ -7,7 +7,9 @@ use std::{
 };
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, TransactionTrait};
+use sea_orm::{
+    ColumnTrait, EntityTrait, QueryFilter, QueryOrder, TransactionTrait, sea_query::Expr,
+};
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
     task::JoinSet,
@@ -737,9 +739,29 @@ async fn execute_submit(
     let now = Utc::now();
     let txn = store.db().begin().await?;
     let decision = jobs::prepare_submit_call(&txn, &claimed, now).await?;
+    let mut correlation = None;
     if decision == SubmitCallDecision::ReadyToCall {
         let (api, strategy) = slot.provider.invocation_route();
+        let history = jobs::submission_history(&txn, &claimed.model.id).await?;
         jobs::record_submit_invocation(&txn, &claimed, api, strategy, now).await?;
+        correlation = match history {
+            Some(history) => history.correlation,
+            None => {
+                let opaque = uuid::Uuid::new_v4().to_string();
+                let updated = jobs::history::Entity::update_many()
+                    .col_expr(jobs::history::Column::Correlation, Expr::value(&opaque))
+                    .filter(jobs::history::Column::JobId.eq(&claimed.model.id))
+                    .filter(jobs::history::Column::Correlation.is_null())
+                    .exec(&txn)
+                    .await?;
+                if updated.rows_affected != 1 {
+                    return Err(AppError::Internal(
+                        "submit correlation was not captured".to_owned(),
+                    ));
+                }
+                Some(opaque)
+            }
+        };
     }
     txn.commit().await?;
     if decision == SubmitCallDecision::NoLongerDesired {
@@ -751,12 +773,20 @@ async fn execute_submit(
     })?;
     let request = SubmitPin {
         cid: claimed.model.cid.clone(),
-        name: format!("{}/{}", context.owner.bucket, context.owner.key),
-        metadata: BTreeMap::from([
-            ("gateway_job_id".to_owned(), claimed.model.id.clone()),
-            ("gateway_lease_id".to_owned(), context.lease.id.clone()),
-            ("gateway_target_id".to_owned(), context.target.id.clone()),
-        ]),
+        name: correlation
+            .clone()
+            .unwrap_or_else(|| format!("{}/{}", context.owner.bucket, context.owner.key)),
+        metadata: if let Some(correlation) = correlation {
+            BTreeMap::from([("gateway_job_id".to_owned(), correlation)])
+        } else {
+            // A historical invocation must keep its original metadata for
+            // Find and a definitively rejected Submit retry on the same route.
+            BTreeMap::from([
+                ("gateway_job_id".to_owned(), claimed.model.id.clone()),
+                ("gateway_lease_id".to_owned(), context.lease.id.clone()),
+                ("gateway_target_id".to_owned(), context.target.id.clone()),
+            ])
+        },
     };
     transition(
         &claimed,
@@ -903,13 +933,16 @@ async fn recover_submit(
     claimed: &mut ClaimedPinJob,
     cancellation: &CancellationToken,
 ) -> AppResult<()> {
-    let query = FindPin::for_job(&claimed.model.cid, &claimed.model.id);
     let txn = store.db().begin().await?;
     let history = jobs::begin_recovery_query(&txn, claimed, Utc::now()).await?;
     txn.commit().await?;
     let Some(history) = history else {
         return Ok(());
     };
+    let query = FindPin::for_job(
+        &claimed.model.cid,
+        history.correlation.as_deref().unwrap_or(&claimed.model.id),
+    );
     let Some(slot) = acquire_provider_slot(
         coordinator,
         store,
@@ -4937,6 +4970,8 @@ mod tests {
         )
         .await
         .unwrap();
+        // This old invocation already sent a structured correlation before upgrade.
+        fixture.store.db().execute_unprepared("INSERT INTO pin_submit_history (job_id,api,strategy,effect,state,submit_calls,recovery_queries,started_at) SELECT id,'pinata_v3','cid','unknown','active',0,0,created_at FROM pin_jobs WHERE operation='submit'").await.unwrap();
         fixture.run_one_due().await;
         PinningCoordinator::replace_provider_for_test(
             &mut fixture.coordinator,
@@ -4967,6 +5002,370 @@ mod tests {
             1
         );
         assert_eq!(requests.len(), 4);
+        let remote = remote_pin::Entity::find_by_id(("noop".to_owned(), "bafy-worker".to_owned()))
+            .one(fixture.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(remote.status, "pinned");
+    }
+
+    #[tokio::test]
+    async fn stage3_new_submit_http_body_contains_only_opaque_correlation() {
+        use crate::pinning::{filebase::build_filebase, pinata::build_pinata, psa::test_token};
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        for psa in [false, true] {
+            let server = MockServer::start().await;
+            let route = if psa {
+                "/v1/ipfs/pins"
+            } else {
+                "/v3/files/public/pin_by_cid"
+            };
+            let response = if psa {
+                serde_json::json!({"requestid":"request-1", "status":"pinned", "pin":{"cid":"bafy-worker"}})
+            } else {
+                serde_json::json!({"data":{"id":"request-1", "cid":"bafy-worker", "status":"pinned"}})
+            };
+            Mock::given(method("POST"))
+                .and(path(route))
+                .respond_with(ResponseTemplate::new(200).set_body_json(response))
+                .mount(&server)
+                .await;
+            let mut fixture = fixture([]).await;
+            let provider: Arc<dyn PinningProvider> = if psa {
+                Arc::new(build_filebase(
+                    "noop".into(),
+                    test_token("test-token"),
+                    Some(format!("{}/v1/ipfs", server.uri())),
+                ))
+            } else {
+                Arc::new(build_pinata(
+                    "noop".into(),
+                    test_token("test-token"),
+                    Some(format!("{}/v3", server.uri())),
+                ))
+            };
+            PinningCoordinator::replace_provider_for_test(
+                &mut fixture.coordinator,
+                "noop",
+                provider,
+            );
+            jobs::enqueue_job(
+                fixture.store.db(),
+                jobs::submit_job("noop", "bafy-worker", "lease-1", "target-1", 1, Utc::now()),
+            )
+            .await
+            .unwrap();
+            fixture.run_one_due().await;
+
+            let requests = server.received_requests().await.unwrap();
+            let post = requests
+                .iter()
+                .find(|request| request.method.as_str() == "POST")
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&post.body).unwrap();
+            let meta = if psa {
+                &body["meta"]
+            } else {
+                &body["keyvalues"]
+            };
+            let correlation = meta["gateway_job_id"].as_str().unwrap();
+            uuid::Uuid::parse_str(correlation).expect("new correlation must be an opaque UUID");
+            assert_eq!(meta.as_object().unwrap().len(), 1);
+            assert_eq!(body["name"], correlation);
+            let sent = String::from_utf8(post.body.clone()).unwrap();
+            for forbidden in [
+                "bucket",
+                "/key",
+                "noop",
+                "target-1",
+                "lease-1",
+                "submit:",
+                "test-token",
+            ] {
+                assert!(
+                    !sent.contains(forbidden),
+                    "provider body exposed {forbidden}"
+                );
+            }
+            assert_eq!(body["cid"], "bafy-worker");
+        }
+    }
+
+    #[tokio::test]
+    async fn stage3_ambiguous_submit_finds_persisted_correlation_after_recovery() {
+        use crate::pinning::{filebase::build_filebase, pinata::build_pinata, psa::test_token};
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        for psa in [false, true] {
+            let server = MockServer::start().await;
+            let route = if psa {
+                "/v1/ipfs/pins"
+            } else {
+                "/v3/files/public/pin_by_cid"
+            };
+            let listing = if psa { route } else { "/v3/files/public" };
+            Mock::given(method("POST"))
+                .and(path(route))
+                .respond_with(ResponseTemplate::new(409))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(listing))
+                .respond_with(ResponseTemplate::new(502))
+                .with_priority(1)
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            let mut fixture = fixture([]).await;
+            let provider: Arc<dyn PinningProvider> = if psa {
+                Arc::new(build_filebase(
+                    "noop".into(),
+                    test_token("test-token"),
+                    Some(format!("{}/v1/ipfs", server.uri())),
+                ))
+            } else {
+                Arc::new(build_pinata(
+                    "noop".into(),
+                    test_token("test-token"),
+                    Some(format!("{}/v3", server.uri())),
+                ))
+            };
+            PinningCoordinator::replace_provider_for_test(
+                &mut fixture.coordinator,
+                "noop",
+                provider,
+            );
+            jobs::enqueue_job(
+                fixture.store.db(),
+                jobs::submit_job("noop", "bafy-worker", "lease-1", "target-1", 1, Utc::now()),
+            )
+            .await
+            .unwrap();
+            fixture.run_one_due().await;
+
+            let job_id = "submit:noop:bafy-worker:target-1:g1";
+            let history = jobs::submission_history(fixture.store.db(), job_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let correlation = history
+                .correlation
+                .expect("new call captured its correlation");
+            uuid::Uuid::parse_str(&correlation).unwrap();
+            let post = server
+                .received_requests()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|r| r.method.as_str() == "POST")
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&post.body).unwrap();
+            assert_eq!(
+                body[if psa { "meta" } else { "keyvalues" }]["gateway_job_id"],
+                correlation
+            );
+
+            let found = if psa {
+                serde_json::json!({"count":1,"results":[{"requestid":"request-1","status":"pinned","pin":{"cid":"bafy-worker","meta":{"gateway_job_id":correlation}}}]})
+            } else {
+                serde_json::json!({"data":{"files":[{"id":"request-1","cid":"bafy-worker","keyvalues":{"gateway_job_id":correlation}}]}})
+            };
+            Mock::given(method("GET"))
+                .and(path(listing))
+                .respond_with(ResponseTemplate::new(200).set_body_json(found))
+                .with_priority(2)
+                .mount(&server)
+                .await;
+            if !psa {
+                Mock::given(method("GET"))
+                    .and(path(route))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_json(serde_json::json!({"data":{"jobs":[]}})),
+                    )
+                    .mount(&server)
+                    .await;
+            }
+            fixture.run_one_due().await;
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|r| r.method.as_str() == "POST")
+                    .count(),
+                1
+            );
+            let mut listing_requests = requests
+                .iter()
+                .filter(|r| r.method.as_str() == "GET" && r.url.path() == listing);
+            let query = listing_requests.next_back().unwrap();
+            if psa {
+                let metadata = query
+                    .url
+                    .query_pairs()
+                    .find(|(key, _)| key == "meta")
+                    .unwrap()
+                    .1;
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&metadata).unwrap(),
+                    serde_json::json!({"gateway_job_id":correlation})
+                );
+            }
+            let remote =
+                remote_pin::Entity::find_by_id(("noop".to_owned(), "bafy-worker".to_owned()))
+                    .one(fixture.store.db())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(remote.status, "pinned");
+            assert_eq!(
+                jobs::submission_history(fixture.store.db(), job_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .correlation
+                    .as_deref(),
+                Some(correlation.as_str())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stage3_psa_retry_keeps_the_same_opaque_correlation() {
+        use crate::pinning::{filebase::build_filebase, psa::test_token};
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/ipfs/pins"))
+            .respond_with(ResponseTemplate::new(429))
+            .with_priority(1)
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/ipfs/pins"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "requestid":"request-1", "status":"pinned", "pin":{"cid":"bafy-worker"}
+            })))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        let mut fixture = fixture([]).await;
+        PinningCoordinator::replace_provider_for_test(
+            &mut fixture.coordinator,
+            "noop",
+            Arc::new(build_filebase(
+                "noop".into(),
+                test_token("test-token"),
+                Some(format!("{}/v1/ipfs", server.uri())),
+            )),
+        );
+        jobs::enqueue_job(
+            fixture.store.db(),
+            jobs::submit_job("noop", "bafy-worker", "lease-1", "target-1", 1, Utc::now()),
+        )
+        .await
+        .unwrap();
+        fixture.run_one_due().await;
+        fixture.run_one_due().await;
+
+        let posts = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| request.method.as_str() == "POST")
+            .map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(posts.len(), 2);
+        let correlation = posts[0]["meta"]["gateway_job_id"].as_str().unwrap();
+        uuid::Uuid::parse_str(correlation).unwrap();
+        assert_eq!(posts[1]["meta"], posts[0]["meta"]);
+        assert_eq!(posts[1]["name"], posts[0]["name"]);
+        assert_eq!(posts[1]["name"], correlation);
+    }
+
+    #[tokio::test]
+    async fn stage3_psa_historical_submit_and_find_keep_captured_job_id() {
+        use crate::pinning::{filebase::build_filebase, psa::test_token};
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let server = MockServer::start().await;
+        let job_id = "submit:noop:bafy-worker:target-1:g1";
+        Mock::given(method("POST"))
+            .and(path("/v1/ipfs/pins"))
+            .respond_with(ResponseTemplate::new(409))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/ipfs/pins"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "count":1,"results":[{"requestid":"old-request", "status":"pinned",
+                    "pin":{"cid":"bafy-worker","meta":{"gateway_job_id":job_id}}}]
+            })))
+            .mount(&server)
+            .await;
+        let mut fixture = fixture([]).await;
+        PinningCoordinator::replace_provider_for_test(
+            &mut fixture.coordinator,
+            "noop",
+            Arc::new(build_filebase(
+                "noop".into(),
+                test_token("test-token"),
+                Some(format!("{}/v1/ipfs", server.uri())),
+            )),
+        );
+        jobs::enqueue_job(
+            fixture.store.db(),
+            jobs::submit_job("noop", "bafy-worker", "lease-1", "target-1", 1, Utc::now()),
+        )
+        .await
+        .unwrap();
+        fixture.store.db().execute_unprepared("INSERT INTO pin_submit_history (job_id,api,strategy,effect,state,submit_calls,recovery_queries,started_at) SELECT id,'psa','cid','unknown','active',1,0,created_at FROM pin_jobs WHERE operation='submit'").await.unwrap();
+        fixture.run_one_due().await;
+        let requests = server.received_requests().await.unwrap();
+        let post = requests
+            .iter()
+            .find(|request| request.method.as_str() == "POST")
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&post.body).unwrap();
+        assert_eq!(body["name"], "bucket/key");
+        assert_eq!(body["meta"]["gateway_job_id"], job_id);
+        assert_eq!(body["meta"]["gateway_lease_id"], "lease-1");
+        let get = requests
+            .iter()
+            .find(|request| request.method.as_str() == "GET")
+            .unwrap();
+        let meta = get
+            .url
+            .query_pairs()
+            .find(|(key, _)| key == "meta")
+            .unwrap()
+            .1;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&meta).unwrap(),
+            serde_json::json!({"gateway_job_id":job_id})
+        );
+        let history = jobs::submission_history(fixture.store.db(), job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(history.correlation, None);
         let remote = remote_pin::Entity::find_by_id(("noop".to_owned(), "bafy-worker".to_owned()))
             .one(fixture.store.db())
             .await

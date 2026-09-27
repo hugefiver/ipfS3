@@ -11,13 +11,16 @@ use sea_orm::{
 use crate::{
     error::{AppError, AppResult},
     import::{ImportClaim, ImportFailure, SupersedeReason},
+    pinning::decision::ExtensionDecision,
     store::{
         entities::{
             bucket, import_destination, import_job, import_job_target, import_prefix_claim,
             standard_mutation_lease,
         },
         import::{
-            jobs::{NewImportJob, SubmitImportOutcome, find_idempotent, insert_queued},
+            jobs::{
+                NewImportJob, SubmitImportOutcome, find_idempotent, insert_queued_with_decision,
+            },
             lease_clock,
         },
     },
@@ -182,15 +185,36 @@ pub async fn submit(
     request: NewImportJob,
     now: DateTime<Utc>,
 ) -> AppResult<SubmitImportOutcome> {
+    submit_with_decision(db, request, None, now).await
+}
+
+/// The decision is written in the same ownership transaction as the fingerprint,
+/// destination generation, and queued job; replay never replaces the original.
+pub async fn submit_decided(
+    db: &DatabaseConnection,
+    request: NewImportJob,
+    decision: ExtensionDecision,
+    now: DateTime<Utc>,
+) -> AppResult<SubmitImportOutcome> {
+    submit_with_decision(db, request, Some(decision), now).await
+}
+
+async fn submit_with_decision(
+    db: &DatabaseConnection,
+    request: NewImportJob,
+    decision: Option<ExtensionDecision>,
+    now: DateTime<Utc>,
+) -> AppResult<SubmitImportOutcome> {
     let bucket_name = request.bucket.clone();
     for retry in 0..=MAX_OWNERSHIP_TRANSACTION_RETRIES {
         let request = request.clone();
+        let decision = decision.clone();
         let bucket_name = bucket_name.clone();
         let outcome = db
             .transaction(move |txn| {
                 Box::pin(async move {
                     lock_bucket_for_ownership(txn, &bucket_name).await?;
-                    submit_in_transaction(txn, request, now).await
+                    submit_decided_in_transaction(txn, request, decision.as_ref(), now).await
                 })
             })
             .await;
@@ -208,9 +232,19 @@ pub async fn submit(
     unreachable!("ownership submit retry loop always returns or errors")
 }
 
+#[cfg(test)]
 async fn submit_in_transaction<C: ConnectionTrait>(
     txn: &C,
     request: NewImportJob,
+    now: DateTime<Utc>,
+) -> AppResult<SubmitImportOutcome> {
+    submit_decided_in_transaction(txn, request, None, now).await
+}
+
+async fn submit_decided_in_transaction<C: ConnectionTrait>(
+    txn: &C,
+    request: NewImportJob,
+    decision: Option<&ExtensionDecision>,
     now: DateTime<Utc>,
 ) -> AppResult<SubmitImportOutcome> {
     if let Some(token) = request.client_token.as_deref()
@@ -223,7 +257,7 @@ async fn submit_in_transaction<C: ConnectionTrait>(
         };
     }
 
-    let job = insert_queued(txn, request, now).await?;
+    let job = insert_queued_with_decision(txn, request, decision, now).await?;
     let expected_generation =
         claim_primary_destination(txn, &job.id, &job.bucket, &job.key, now).await?;
     insert_target(
@@ -3090,7 +3124,7 @@ mod tests {
 
         let renewal_db = second.clone();
         let renewal_claim = claimed.claim.clone();
-        let extended_deadline = Utc::now() + Duration::seconds(5);
+        let extended_deadline = original_deadline + Duration::seconds(30);
         let mut renewal = tokio::spawn(async move {
             crate::store::import::jobs::renew_claim(
                 &renewal_db,
@@ -3108,6 +3142,19 @@ mod tests {
             .to_std()
             .unwrap_or(std::time::Duration::ZERO);
         tokio::time::sleep(remaining + std::time::Duration::from_millis(75)).await;
+        let lease_clock = first
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "SELECT julianday(?) < julianday('now') AS original_expired, \
+                 julianday(locked_until) > julianday('now') AS renewed_active \
+                 FROM import_jobs WHERE id = ?",
+                [original_deadline.into(), claimed.job.id.clone().into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let original_expired = lease_clock.try_get::<i64>("", "original_expired").unwrap();
+        let renewed_active = lease_clock.try_get::<i64>("", "renewed_active").unwrap();
         gate.resume.notify_one();
         let reset_result = tokio::time::timeout(std::time::Duration::from_secs(3), &mut reset)
             .await
@@ -3119,6 +3166,11 @@ mod tests {
         assert!(
             matches!(renewal_while_paused, Ok(Ok(Ok(true)))),
             "renewal must complete while reset is paused between committed batches"
+        );
+        assert_eq!(
+            (original_expired, renewed_active),
+            (1, 1),
+            "the original lease must expire while the renewed database-clock lease remains live"
         );
         reset_result.unwrap();
 

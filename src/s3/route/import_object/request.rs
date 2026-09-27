@@ -218,6 +218,42 @@ pub(super) fn parse_metadata(headers: &HeaderMap) -> HashMap<String, String> {
 
 pub(super) fn request_fingerprint(
     source: &ImportSource,
+    principal: &str,
+    object_content_type: Option<&str>,
+    metadata: &HashMap<String, String>,
+    tags: &[ObjectTag],
+    decompress_prefix: Option<&str>,
+) -> S3Result<String> {
+    fingerprint(
+        source,
+        Some(principal),
+        object_content_type,
+        metadata,
+        tags,
+        decompress_prefix,
+    )
+}
+
+pub(super) fn legacy_request_fingerprint(
+    source: &ImportSource,
+    object_content_type: Option<&str>,
+    metadata: &HashMap<String, String>,
+    tags: &[ObjectTag],
+    decompress_prefix: Option<&str>,
+) -> S3Result<String> {
+    fingerprint(
+        source,
+        None,
+        object_content_type,
+        metadata,
+        tags,
+        decompress_prefix,
+    )
+}
+
+fn fingerprint(
+    source: &ImportSource,
+    principal: Option<&str>,
     object_content_type: Option<&str>,
     metadata: &HashMap<String, String>,
     tags: &[ObjectTag],
@@ -234,14 +270,27 @@ pub(super) fn request_fingerprint(
         .iter()
         .map(|tag| (&tag.key, &tag.value))
         .collect::<std::collections::BTreeMap<_, _>>();
-    let canonical = serde_json::to_vec(&(
-        source_type,
-        source_value,
-        object_content_type,
-        metadata,
-        tags,
-        decompress_prefix,
-    ))
+    let canonical = if let Some(principal) = principal {
+        serde_json::to_vec(&(
+            "import-pin-decision-v1",
+            principal,
+            source_type,
+            source_value,
+            object_content_type,
+            &metadata,
+            &tags,
+            decompress_prefix,
+        ))
+    } else {
+        serde_json::to_vec(&(
+            source_type,
+            source_value,
+            object_content_type,
+            &metadata,
+            &tags,
+            decompress_prefix,
+        ))
+    }
     .map_err(|_| invalid_import())?;
     Ok(format!("sha256:{}", hex::encode(Sha256::digest(canonical))))
 }

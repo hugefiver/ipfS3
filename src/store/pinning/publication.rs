@@ -13,6 +13,8 @@ use crate::{
     lifecycle::model::MultipartUploadTargetIdentity,
     pinning::{
         config::{ProviderLimitMap, ProviderMode},
+        decision::ExtensionDecision,
+        identity::ProviderRouteSnapshot,
         policy::{LeaseIntent, LeaseSource, PublicationPolicy},
         tags::{ContentMode, ObjectTag},
     },
@@ -37,7 +39,7 @@ use crate::{
     },
 };
 
-use super::{jobs, leases, quota, tags};
+use super::{jobs, leases, ledger, quota, tags};
 
 mod hot_receipt;
 
@@ -183,6 +185,327 @@ pub async fn publish_object(
     .await
 }
 
+/// Stage 3 opt-in path. The decision is captured before upload/MPU/import
+/// side effects and stored with the exact content version on successful publish.
+/// A changed accepted provider revision is a hard error, never a fresh interpretation of tags.
+pub struct DecidedPublish<'a> {
+    pub decision: &'a ExtensionDecision,
+    pub config: &'a crate::pinning::config::ValidatedPinningConfig,
+    pub mode: crate::config::OptionalPinControlMode,
+    pub limits: &'a ProviderLimitMap,
+}
+
+impl DecidedPublish<'_> {
+    fn validate(&self, request: &PublicationRequest) -> AppResult<()> {
+        self.decision
+            .verify_revision(self.config, self.mode)
+            .map_err(invalid_publication)?;
+        self.decision
+            .validate_policy(&request.policy)
+            .map_err(invalid_publication)?;
+        Ok(())
+    }
+
+    fn snapshot(&self) -> AppResult<DecidedSnapshot> {
+        self.decision
+            .verify_revision(self.config, self.mode)
+            .map_err(invalid_publication)?;
+        let mut routes = BTreeMap::new();
+        for name in self
+            .decision
+            .effective_intents
+            .iter()
+            .flat_map(|intent| &intent.providers)
+        {
+            let provider = self
+                .config
+                .providers
+                .iter()
+                .find(|provider| &provider.name == name)
+                .ok_or_else(|| invalid_publication("captured pinning provider is unavailable"))?;
+            if !self.limits.get(name).is_some_and(|limit| limit.enabled) {
+                continue;
+            }
+            if provider.identity.allocation_key() != *name {
+                return Err(invalid_publication(
+                    "captured provider allocation key changed",
+                ));
+            }
+            let route = provider.identity.route_snapshot();
+            if routes
+                .insert(name.clone(), route.clone())
+                .is_some_and(|old| old != route)
+            {
+                return Err(invalid_publication("captured provider route is ambiguous"));
+            }
+        }
+        Ok(DecidedSnapshot {
+            decision: self.decision.clone(),
+            routes,
+        })
+    }
+}
+
+#[derive(Clone)]
+struct DecidedSnapshot {
+    decision: ExtensionDecision,
+    routes: BTreeMap<String, ProviderRouteSnapshot>,
+}
+
+/// Cheap fail-fast check before a durable completion/import starts source or Kubo I/O.
+/// The publication transaction repeats it under locks; this read is not the fence.
+pub async fn preflight_decided_routes(
+    db: &DatabaseConnection,
+    captured: DecidedPublish<'_>,
+) -> AppResult<()> {
+    let snapshot = captured.snapshot()?;
+    ledger::verify_selected_routes(db, &snapshot.routes, false).await
+}
+
+pub async fn publish_decided_object(
+    db: &DatabaseConnection,
+    request: PublicationRequest,
+    captured: DecidedPublish<'_>,
+) -> AppResult<PublicationResult> {
+    captured.validate(&request)?;
+    run_publication_with_retries_and_hot_receipt(
+        db,
+        request,
+        Vec::new(),
+        None,
+        None,
+        None,
+        Vec::new(),
+        None,
+        None,
+        captured.limits,
+        Some(captured.snapshot()?),
+    )
+    .await
+}
+
+/// Guarded standard writes without a separate hot verification receipt retain
+/// the same admission fence as the existing publication path.
+pub async fn publish_decided_standard_object(
+    db: &DatabaseConnection,
+    request: PublicationRequest,
+    guard: StandardMutationGuard,
+    captured: DecidedPublish<'_>,
+) -> AppResult<PublicationResult> {
+    captured.validate(&request)?;
+    require_decision_origin(captured.decision, &guard.mutation_id)?;
+    run_publication_with_retries_and_hot_receipt(
+        db,
+        request,
+        Vec::new(),
+        None,
+        Some(guard),
+        None,
+        Vec::new(),
+        None,
+        None,
+        captured.limits,
+        Some(captured.snapshot()?),
+    )
+    .await
+}
+
+/// Guarded S3 PUT/Copy route. A bad capture is rejected before the hot receipt
+/// and guard are consumed; a valid decision is committed with the exact version.
+pub async fn publish_decided_standard_object_with_hot_receipt(
+    db: &DatabaseConnection,
+    request: PublicationRequest,
+    guard: StandardMutationGuard,
+    receipt: crate::kubo::LocalResidencyVerificationReceipt,
+    captured: DecidedPublish<'_>,
+) -> AppResult<PublicationResult> {
+    captured.validate(&request)?;
+    require_decision_origin(captured.decision, &guard.mutation_id)?;
+    let receipt = match HotPublicationReceipt::validate(receipt, &request.object.cid) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            release_failed_mutation(db, Some(&guard), true).await;
+            return Err(error);
+        }
+    };
+    run_publication_with_retries_and_hot_receipt(
+        db,
+        request,
+        Vec::new(),
+        None,
+        Some(guard),
+        None,
+        Vec::new(),
+        None,
+        Some(receipt),
+        captured.limits,
+        Some(captured.snapshot()?),
+    )
+    .await
+}
+
+pub async fn publish_decided_completed_upload(
+    db: &DatabaseConnection,
+    upload_target: &MultipartUploadTargetIdentity,
+    request: PublicationRequest,
+    guard: Option<StandardMutationGuard>,
+    captured: DecidedPublish<'_>,
+) -> Result<PublicationResult, CommitCompletedUploadError> {
+    let completion_attempt_id = request.object.id.clone();
+    captured
+        .validate(&request)
+        .and_then(|()| require_decision_origin(captured.decision, &upload_target.upload_id))
+        .map_err(|source| CommitCompletedUploadError::RolledBack {
+            completion_attempt_id: completion_attempt_id.clone(),
+            source,
+        })?;
+    let snapshot =
+        captured
+            .snapshot()
+            .map_err(|source| CommitCompletedUploadError::RolledBack {
+                completion_attempt_id,
+                source,
+            })?;
+    run_completed_publication_with_retries_and_decision(
+        db,
+        upload_target,
+        request,
+        Vec::new(),
+        guard,
+        captured.limits,
+        Some(snapshot),
+    )
+    .await
+}
+
+pub async fn publish_decided_import_object(
+    db: &DatabaseConnection,
+    request: PublicationRequest,
+    guard: ImportPublicationGuard,
+    result_rows: Vec<import_job_result::ActiveModel>,
+    now: DateTime<Utc>,
+    captured: DecidedPublish<'_>,
+) -> AppResult<PublicationResult> {
+    captured.validate(&request)?;
+    require_decision_origin(captured.decision, &guard.job_id)?;
+    run_publication_with_retries_and_hot_receipt(
+        db,
+        request,
+        Vec::new(),
+        None,
+        None,
+        Some(guard),
+        result_rows,
+        Some(now),
+        None,
+        captured.limits,
+        Some(captured.snapshot()?),
+    )
+    .await
+}
+
+/// Direct ZIP uses the archive's captured decision; extracted entries do not
+/// silently inherit/execute raw pin tags. Ownership guards retain their old behavior.
+pub async fn publish_decided_zip(
+    db: &DatabaseConnection,
+    request: ZipPublicationRequest,
+    guard: Option<StandardMutationGuard>,
+    captured: DecidedPublish<'_>,
+) -> AppResult<PublicationResult> {
+    captured.validate(&request.archive)?;
+    if let Some(guard) = &guard {
+        require_decision_origin(captured.decision, &guard.mutation_id)?;
+    }
+    run_publication_with_retries_and_hot_receipt(
+        db,
+        request.archive,
+        request.entries,
+        None,
+        guard,
+        None,
+        Vec::new(),
+        None,
+        None,
+        captured.limits,
+        Some(captured.snapshot()?),
+    )
+    .await
+}
+
+pub async fn publish_decided_completed_zip(
+    db: &DatabaseConnection,
+    upload_target: &MultipartUploadTargetIdentity,
+    request: ZipPublicationRequest,
+    guard: Option<StandardMutationGuard>,
+    captured: DecidedPublish<'_>,
+) -> Result<PublicationResult, CommitCompletedUploadError> {
+    let completion_attempt_id = request.archive.object.id.clone();
+    captured
+        .validate(&request.archive)
+        .and_then(|()| require_decision_origin(captured.decision, &upload_target.upload_id))
+        .map_err(|source| CommitCompletedUploadError::RolledBack {
+            completion_attempt_id: completion_attempt_id.clone(),
+            source,
+        })?;
+    let snapshot =
+        captured
+            .snapshot()
+            .map_err(|source| CommitCompletedUploadError::RolledBack {
+                completion_attempt_id,
+                source,
+            })?;
+    run_completed_publication_with_retries_and_decision(
+        db,
+        upload_target,
+        request.archive,
+        request.entries,
+        guard,
+        captured.limits,
+        Some(snapshot),
+    )
+    .await
+}
+
+pub async fn publish_decided_import_zip(
+    db: &DatabaseConnection,
+    request: ZipPublicationRequest,
+    guard: ImportPublicationGuard,
+    result_rows: Vec<import_job_result::ActiveModel>,
+    now: DateTime<Utc>,
+    captured: DecidedPublish<'_>,
+) -> AppResult<PublicationResult> {
+    captured.validate(&request.archive)?;
+    require_decision_origin(captured.decision, &guard.job_id)?;
+    run_publication_with_retries_and_hot_receipt(
+        db,
+        request.archive,
+        request.entries,
+        None,
+        None,
+        Some(guard),
+        result_rows,
+        Some(now),
+        None,
+        captured.limits,
+        Some(captured.snapshot()?),
+    )
+    .await
+}
+
+/// For durable admission the origin request ID is the admission's opaque
+/// mutation ID / upload ID / import job ID. Never reuse another admission's capture.
+fn require_decision_origin(
+    decision: &ExtensionDecision,
+    expected_request_id: &str,
+) -> AppResult<()> {
+    if decision.origin.request_id != expected_request_id {
+        return Err(invalid_publication(
+            "captured pin decision does not belong to this admission",
+        ));
+    }
+    Ok(())
+}
+
 /// Publishes an admitted standard exact-key mutation only while its durable
 /// admission token is still current.
 pub async fn publish_standard_object(
@@ -232,6 +555,7 @@ pub async fn publish_standard_object_with_hot_receipt(
         None,
         Some(receipt),
         limits,
+        None,
     )
     .await
 }
@@ -742,6 +1066,7 @@ async fn run_publication_with_retries(
         import_now,
         None,
         limits,
+        None,
     )
     .await
 }
@@ -758,6 +1083,7 @@ async fn run_publication_with_retries_and_hot_receipt(
     import_now: Option<DateTime<Utc>>,
     hot_receipt: Option<HotPublicationReceipt>,
     limits: &ProviderLimitMap,
+    decision: Option<DecidedSnapshot>,
 ) -> AppResult<PublicationResult> {
     let result = async {
         for retry in 0..=MAX_TRANSACTION_RETRIES {
@@ -772,6 +1098,7 @@ async fn run_publication_with_retries_and_hot_receipt(
                 import_now,
                 hot_receipt.clone(),
                 limits.clone(),
+                decision.clone(),
             )
             .await
             {
@@ -800,6 +1127,27 @@ async fn run_completed_publication_with_retries(
     standard_guard: Option<StandardMutationGuard>,
     limits: &ProviderLimitMap,
 ) -> Result<PublicationResult, CommitCompletedUploadError> {
+    run_completed_publication_with_retries_and_decision(
+        db,
+        upload_target,
+        request,
+        entries,
+        standard_guard,
+        limits,
+        None,
+    )
+    .await
+}
+
+async fn run_completed_publication_with_retries_and_decision(
+    db: &DatabaseConnection,
+    upload_target: &MultipartUploadTargetIdentity,
+    request: PublicationRequest,
+    entries: Vec<PublicationObject>,
+    standard_guard: Option<StandardMutationGuard>,
+    limits: &ProviderLimitMap,
+    decision: Option<DecidedSnapshot>,
+) -> Result<PublicationResult, CommitCompletedUploadError> {
     let completion_attempt_id = request.object.id.clone();
     let result = async {
         for retry in 0..=MAX_TRANSACTION_RETRIES {
@@ -814,6 +1162,7 @@ async fn run_completed_publication_with_retries(
                 None,
                 None,
                 limits.clone(),
+                decision.clone(),
             )
             .await
             {
@@ -856,6 +1205,7 @@ async fn publication_attempt(
     import_now: Option<DateTime<Utc>>,
     hot_receipt: Option<HotPublicationReceipt>,
     limits: ProviderLimitMap,
+    decision: Option<DecidedSnapshot>,
 ) -> Result<PublicationResult, TransactionError<AppError>> {
     db.transaction(|txn| {
         Box::pin(async move {
@@ -870,6 +1220,7 @@ async fn publication_attempt(
                 import_now,
                 hot_receipt.as_ref(),
                 &limits,
+                decision.as_ref(),
             )
             .await
         })
@@ -908,8 +1259,14 @@ async fn publish_in_transaction<C: ConnectionTrait>(
     _import_now: Option<DateTime<Utc>>,
     hot_receipt: Option<&HotPublicationReceipt>,
     limits: &ProviderLimitMap,
+    decided: Option<&DecidedSnapshot>,
 ) -> AppResult<PublicationResult> {
     validate_request(&request)?;
+    if let Some(decision) = decided.map(|snapshot| &snapshot.decision) {
+        decision
+            .validate_policy(&request.policy)
+            .map_err(invalid_publication)?;
+    }
     for entry in &entries {
         if entry.logical_size < 0 {
             return Err(invalid_publication(
@@ -969,6 +1326,9 @@ async fn publish_in_transaction<C: ConnectionTrait>(
         .map(|(provider, _)| provider.clone())
         .collect();
     quota::lock_publication_usage_rows(db, &attachment_providers).await?;
+    if let Some(snapshot) = decided {
+        ledger::verify_selected_routes(db, &snapshot.routes, true).await?;
+    }
     crate::store::residency::prepare_hot_publication_frontier(
         db,
         ordered_publication_objects(&request.object, &entries)
@@ -1001,6 +1361,10 @@ async fn publish_in_transaction<C: ConnectionTrait>(
         }
     }
     tags::replace_object_tags(db, &object_id, &request.tags).await?;
+
+    if let Some(decision) = decided.map(|snapshot| &snapshot.decision) {
+        super::decision::write_for_object_in_transaction(db, &object_id, decision).await?;
+    }
 
     create_publication_leases(db, &request, &entries, limits, publication_time).await?;
 

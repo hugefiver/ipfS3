@@ -34,6 +34,53 @@ The native runner isolation fixture is also directly runnable and is part of CI 
 pwsh -NoProfile -File tests/native-runner.Tests.ps1
 ```
 
+## Stage 3 pin-control checks
+
+Run these focused tests against the new optional-control and read-only CLI
+surfaces. Check the test counts and failures, not just the exit code:
+
+```powershell
+cargo test --lib pinning::
+cargo test --lib s3::
+cargo test --lib import::
+cargo test --test integration
+cargo test --test cors
+cargo test --test multipart_pin_decision
+cargo test --test diagnostics
+cargo test --test stage3_migrations
+cargo test --test stage3_restart
+cargo test --test stage3_route_fence
+cargo test --test import_legacy_replay
+cargo test --lib store::pinning::publication
+```
+
+These exercise captured decisions, warn/strict responses, multipart reuse,
+tag/copy behavior, import paths, CORS and local diagnostic read safety. The
+diagnostic commands themselves can be run as `cargo run -- --pinning-doctor`,
+`cargo run -- --config-explain`, and
+`cargo run -- --pinning-policy-explain my-bucket file.txt`; status requires an
+existing configured DB and must not create one. A local mock or SQLite pass
+doesn't establish PostgreSQL migration/concurrency, real SDK compatibility,
+remote account permissions or remote pin success. Record those separately when
+their environment and authorization are available; don't count them as green
+based on the commands above.
+
+For isolated PostgreSQL 17 coverage, run `postgres_pinning_stage3` and
+`postgres_stage3_route_fence` against the configured test database; these are
+distinct from SQLite checks. Recorded focused results are 5 schema tests and
+2 route-interleaving tests passing. The new Noop path has not been rerun on PG.
+
+```powershell
+cargo test --test postgres_pinning_stage3 -- --include-ignored --test-threads=1
+cargo test --test postgres_stage3_route_fence -- --include-ignored --test-threads=1
+```
+
+A real two-process SigV4 MPU completion test passed 1/1 with the same config;
+changing both credential and endpoint revisions was rejected before side effects.
+The final Stage 3 `--lib` and `--test integration` combined run is still pending;
+don't report its counts as passed until that run finishes. The intermittent
+Stage 2 PG historical-route error still has no confirmed root cause.
+
 Test cleanup may remove static source, hash, documentation-checkbox, and historical TDD-shape assertions. It must retain executable regressions for command argument boundaries, process ownership, path confinement, cleanup scope, redaction, concurrency, and other observable security behavior.
 
 ## Environment-backed and deep checks

@@ -15,3 +15,7 @@ pub mod m20260912_000002_lifecycle_transition;
 pub mod m20260919_000001_standard_mutation_lease;
 pub mod m20260920_000001_pin_submit_history;
 pub mod m20260920_000002_pin_identity_ledger;
+pub mod m20260920_000003_pin_extension_decision;
+pub mod m20260920_000004_multipart_pin_decision;
+pub mod m20260920_000005_import_pin_decision;
+pub mod m20260920_000006_pin_submit_correlation;

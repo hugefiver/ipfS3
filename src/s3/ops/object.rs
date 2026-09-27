@@ -10,14 +10,17 @@ use s3s::{S3Request, S3Response, S3Result};
 
 use crate::crypto::EncryptionMode;
 use crate::error::AppError;
+use crate::pinning::decision::{
+    DecisionEffect, DecisionOrigin, ExtensionDecision, WarningCode, config_revision,
+};
 use crate::pinning::policy::{PublicationContext, PublicationPolicy};
-use crate::pinning::tags::ObjectTag;
+use crate::pinning::tags::{ObjectTag, PinControl};
 use crate::state::AppState;
 use crate::store::object_version::{
     BucketVersioningState, PublicVersionId, VersionKind, VersionSelector,
 };
 use crate::store::pinning::publication::{
-    PinTargetSpec, PublicationObject, PublicationRequest, PublicationResult,
+    DecidedPublish, PinTargetSpec, PublicationObject, PublicationRequest, PublicationResult,
 };
 
 /// Wraps a byte stream and counts the total bytes that flow through it.
@@ -406,6 +409,129 @@ fn evaluate_publication_policy(
         .map_err(s3s::S3Error::from)
 }
 
+pub(crate) fn principal_id<T>(req: &S3Request<T>) -> S3Result<String> {
+    req.credentials
+        .as_ref()
+        .map(|credentials| credentials.access_key.clone())
+        .ok_or_else(|| s3s::s3_error!(AccessDenied, "authenticated principal is required"))
+}
+
+fn capture_publication_decision(
+    state: &Arc<AppState>,
+    bucket: &str,
+    key: &str,
+    tags: &[ObjectTag],
+    principal: &str,
+    mutation_id: &str,
+) -> S3Result<(PublicationPolicy, ExtensionDecision)> {
+    state
+        .pinning
+        .policy()
+        .evaluate_publication_decision(
+            PublicationContext {
+                bucket,
+                key,
+                tags,
+                is_decompress_zip: false,
+            },
+            DecisionOrigin::new(principal, mutation_id),
+        )
+        .map_err(crate::error::AppError::from)
+        .map_err(Into::into)
+}
+
+/// Validate before admission, then capture again with the actual guard ID.
+/// The provisional ID is never stored; only the second capture may be published.
+pub(crate) const PREFLIGHT_MUTATION_ID: &str = "preflight";
+
+pub(crate) fn verify_publication_preflight(
+    expected: &(PublicationPolicy, ExtensionDecision),
+    actual: &(PublicationPolicy, ExtensionDecision),
+) -> S3Result<()> {
+    let (expected_policy, expected_decision) = expected;
+    let (policy, decision) = actual;
+    if expected_policy != policy
+        || expected_decision.effect != decision.effect
+        || expected_decision.warning != decision.warning
+        || expected_decision.legacy_unknown != decision.legacy_unknown
+        || expected_decision.config_revision != decision.config_revision
+        || expected_decision.control != decision.control
+        || expected_decision.effective_intents != decision.effective_intents
+        || expected_decision.origin.principal_id != decision.origin.principal_id
+    {
+        return Err(s3s::s3_error!(
+            InternalError,
+            "pinning decision changed during content admission"
+        ));
+    }
+    Ok(())
+}
+
+fn decided_publish<'a>(state: &'a AppState, decision: &'a ExtensionDecision) -> DecidedPublish<'a> {
+    DecidedPublish {
+        decision,
+        config: state.pinning.effective_config(),
+        mode: state.pinning.control_mode(),
+        limits: state.pinning.provider_limits(),
+    }
+}
+
+/// Only fixed, bounded ASCII codes may enter the public response. Called after commit.
+pub(crate) fn pin_warning_headers(warning: Option<WarningCode>) -> http::HeaderMap {
+    let mut headers = http::HeaderMap::new();
+    if let Some(warning) = warning {
+        headers.insert(
+            "x-ipfs3-pin-warning",
+            http::HeaderValue::from_static(warning.as_header_code()),
+        );
+    }
+    headers
+}
+
+fn inherited_unexecuted_decision(
+    state: &Arc<AppState>,
+    bucket: &str,
+    key: &str,
+    tags: &[ObjectTag],
+    inherited: (PinControl, Option<WarningCode>, bool),
+    principal: &str,
+    mutation_id: &str,
+) -> S3Result<(PublicationPolicy, ExtensionDecision)> {
+    let (control, warning, legacy_unknown) = inherited;
+    // Do not interpret inherited reserved controls as a new application. Only
+    // the destination's independent automatic policy may be evaluated.
+    let ordinary: Vec<_> = tags
+        .iter()
+        .filter(|tag| !tag.key.starts_with("ipfs-s3:"))
+        .cloned()
+        .collect();
+    let (automatic, _) =
+        capture_publication_decision(state, bucket, key, &ordinary, principal, mutation_id)?;
+    let policy = PublicationPolicy {
+        tags: tags.to_vec(),
+        leases: automatic.leases,
+    };
+    let origin = DecisionOrigin::new(principal, mutation_id);
+    let revision = config_revision(
+        state.pinning.effective_config(),
+        state.pinning.control_mode(),
+    );
+    let decision = if legacy_unknown {
+        ExtensionDecision::capture_legacy_unknown(origin, revision, control, &policy)
+    } else {
+        ExtensionDecision::capture(
+            origin,
+            revision,
+            DecisionEffect::Skipped,
+            warning,
+            control,
+            &policy,
+        )
+    }
+    .map_err(invalid_pinning_argument)?;
+    Ok((policy, decision))
+}
+
 fn copy_publication_tags(
     source_tags: Vec<ObjectTag>,
     headers: &http::HeaderMap,
@@ -664,6 +790,7 @@ where
 
 struct SelectedS3Object {
     object: object::Model,
+    version_row_id: String,
     public_version_id: Option<String>,
     residency: crate::residency::ResolvedVersionResidency,
     read_client: crate::kubo::KuboClient,
@@ -714,6 +841,7 @@ async fn select_s3_object(
                 .then_some(resolved.public_version_id);
             Ok(SelectedS3Object {
                 object,
+                version_row_id: resolved.id,
                 public_version_id,
                 residency,
                 read_client,
@@ -737,7 +865,7 @@ pub async fn put_object(
     let content_type = req.input.content_type.clone();
     let db = state.store.db();
     let tags = parse_publication_tags(&req.headers)?;
-    let policy = evaluate_publication_policy(state, bucket, key, &tags)?;
+    let principal = principal_id(&req)?;
 
     // Validate the bucket exists.
     let exists = crate::store::bucket::exists(db, bucket).await?;
@@ -759,6 +887,9 @@ pub async fn put_object(
         .body
         .ok_or_else(|| s3s::s3_error!(IncompleteBody, "request body is missing"))?;
 
+    let preflight =
+        capture_publication_decision(state, bucket, key, &tags, &principal, PREFLIGHT_MUTATION_ID)?;
+
     let mutation_guard = crate::store::import::ownership::admit_content_mutation(
         db,
         bucket,
@@ -768,6 +899,26 @@ pub async fn put_object(
         chrono::Utc::now(),
     )
     .await?;
+
+    let captured = match capture_publication_decision(
+        state,
+        bucket,
+        key,
+        &tags,
+        &principal,
+        &mutation_guard.mutation_id,
+    )
+    .and_then(|captured| {
+        verify_publication_preflight(&preflight, &captured)?;
+        Ok(captured)
+    }) {
+        Ok(captured) => captured,
+        Err(error) => {
+            crate::store::import::ownership::release_standard_mutation(db, &mutation_guard).await?;
+            return Err(error);
+        }
+    };
+    let (policy, decision) = captured;
 
     crate::store::import::ownership::run_mutation(db, &mutation_guard.clone(), |lease| async move {
         // Wrap the body with a byte counter so we can record the plaintext size.
@@ -839,12 +990,14 @@ pub async fn put_object(
             },
         };
         let publication_result = lease
-            .commit(crate::store::pinning::publication::publish_standard_object(
-                db,
-                publication,
-                mutation_guard,
-                state.pinning.provider_limits(),
-            ))
+            .commit(
+                crate::store::pinning::publication::publish_decided_standard_object(
+                    db,
+                    publication,
+                    mutation_guard,
+                    decided_publish(state, &decision),
+                ),
+            )
             .await?;
 
         let server_side_encryption = if enc_mode == EncryptionMode::SseS3 {
@@ -853,7 +1006,8 @@ pub async fn put_object(
             None
         };
 
-        let headers = put_object_ipfs_headers(&cid)?;
+        let mut headers = put_object_ipfs_headers(&cid)?;
+        headers.extend(pin_warning_headers(decision.warning));
         Ok(S3Response::with_headers(
             PutObjectOutput {
                 e_tag: Some(ETag::Strong(cid.clone())),
@@ -1336,9 +1490,32 @@ pub async fn copy_object(
 
     let selected_source =
         select_s3_object(state, &src_bucket, &src_key, src_version_id.as_deref()).await?;
+    let source_decision =
+        crate::store::pinning::decision::read_for_version(db, &selected_source.version_row_id)
+            .await?;
+    if let Some(decision) = &source_decision {
+        decision
+            .replay_policy(selected_source.tags.clone())
+            .map_err(invalid_pinning_argument)?;
+    }
     let src_obj = selected_source.object;
     let copy_source_version_id = selected_source.public_version_id;
     let tags = copy_publication_tags(selected_source.tags, &req.headers)?;
+    let principal = principal_id(&req)?;
+    let inherit_tags = req
+        .headers
+        .get("x-amz-tagging-directive")
+        .is_none_or(|value| value == "COPY");
+    // Absent source decisions are unknown: validate raw controls but do not
+    // interpret them as fresh manual requests under the destination policy.
+    let legacy_control = if inherit_tags && source_decision.is_none() {
+        Some(
+            PinControl::from_tags(&tags)
+                .map_err(|_| invalid_pinning_argument("invalid inherited pin control"))?,
+        )
+    } else {
+        None
+    };
 
     // Validate destination bucket exists.
     let dst_exists = crate::store::bucket::exists(db, dst_bucket).await?;
@@ -1349,7 +1526,6 @@ pub async fn copy_object(
             dst_bucket
         ));
     }
-    let policy = evaluate_publication_policy(state, dst_bucket, dst_key, &tags)?;
 
     let source_sse_c_headers = extract_copy_source_sse_c_headers(&req.headers)?;
     let source_sse_c_authentication = if src_obj.encrypted && src_obj.key_wrap.is_none() {
@@ -1377,6 +1553,41 @@ pub async fn copy_object(
         None
     };
 
+    let inherited = if inherit_tags {
+        match source_decision.as_ref() {
+            Some(decision)
+                if decision.effect == DecisionEffect::Skipped || decision.legacy_unknown =>
+            {
+                Some((
+                    decision.control.clone(),
+                    decision.warning,
+                    decision.legacy_unknown,
+                ))
+            }
+            None => legacy_control
+                .filter(|control| !matches!(control, PinControl::Absent))
+                .map(|control| (control, None, true)),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let capture = |mutation_id: &str| match inherited.clone() {
+        Some(inherited) => inherited_unexecuted_decision(
+            state,
+            dst_bucket,
+            dst_key,
+            &tags,
+            inherited,
+            &principal,
+            mutation_id,
+        ),
+        None => {
+            capture_publication_decision(state, dst_bucket, dst_key, &tags, &principal, mutation_id)
+        }
+    };
+    let preflight = capture(PREFLIGHT_MUTATION_ID)?;
+
     let mutation_guard = crate::store::import::ownership::admit_content_mutation(
         db,
         dst_bucket,
@@ -1386,6 +1597,18 @@ pub async fn copy_object(
         chrono::Utc::now(),
     )
     .await?;
+
+    let captured = capture(&mutation_guard.mutation_id).and_then(|captured| {
+        verify_publication_preflight(&preflight, &captured)?;
+        Ok(captured)
+    });
+    let (policy, decision) = match captured {
+        Ok(captured) => captured,
+        Err(error) => {
+            crate::store::import::ownership::release_standard_mutation(db, &mutation_guard).await?;
+            return Err(error);
+        }
+    };
 
     crate::store::import::ownership::run_mutation(db, &mutation_guard.clone(), |lease| async move {
         let verified_source_fingerprint = match source_sse_c_authentication {
@@ -1451,28 +1674,28 @@ pub async fn copy_object(
         let publication_result = match hot_receipt {
             Some(receipt) => lease
                 .commit(
-                    crate::store::pinning::publication::publish_standard_object_with_hot_receipt(
+                    crate::store::pinning::publication::publish_decided_standard_object_with_hot_receipt(
                         db,
                         publication,
                         mutation_guard,
                         receipt,
-                        state.pinning.provider_limits(),
+                        decided_publish(state, &decision),
                     ),
                 )
                 .await?,
             None => {
                 lease
-                    .commit(crate::store::pinning::publication::publish_standard_object(
+                    .commit(crate::store::pinning::publication::publish_decided_standard_object(
                         db,
                         publication,
                         mutation_guard,
-                        state.pinning.provider_limits(),
+                        decided_publish(state, &decision),
                     ))
                     .await?
             }
         };
 
-        Ok(S3Response::new(CopyObjectOutput {
+        Ok(S3Response::with_headers(CopyObjectOutput {
             copy_object_result: Some(CopyObjectResult {
                 e_tag: Some(ETag::Strong(src_obj.etag.clone())),
                 last_modified: Some(Timestamp::from(SystemTime::from(object_created_at))),
@@ -1481,7 +1704,7 @@ pub async fn copy_object(
             copy_source_version_id,
             version_id: publication_result.version_id,
             ..Default::default()
-        }))
+        }, pin_warning_headers(decision.warning)))
     })
     .await
 }
@@ -1885,6 +2108,7 @@ mod tests {
     };
 
     mod copy_hot_receipt_tests;
+    mod optional_pinning_tests;
 
     async fn test_state(kubo_uri: String) -> Arc<AppState> {
         use sea_orm::Database;
@@ -1980,16 +2204,19 @@ mod tests {
             .await
             .unwrap();
 
+        let store = crate::store::Store::new(db);
+        let pinning = configured_coordinator(&kubo_uri, trigger, provider_mode, prefix);
+        pinning.register_identities(&store).await.unwrap();
         Arc::new(AppState {
             kubo: crate::kubo::KuboClient::new(kubo_uri.clone()),
             cold_kubo: cold_kubo_uri.map(crate::kubo::KuboClient::new),
-            store: crate::store::Store::new(db),
+            store,
             credentials: HashMap::new(),
             master_key: crate::crypto::key::MasterKey::from_hex(
                 "0000000000000000000000000000000000000000000000000000000000000000",
             )
             .unwrap(),
-            pinning: configured_coordinator(&kubo_uri, trigger, provider_mode, prefix),
+            pinning,
         })
     }
 
@@ -2028,7 +2255,10 @@ mod tests {
             uri: uri.parse().unwrap(),
             headers,
             extensions: http::Extensions::new(),
-            credentials: None,
+            credentials: Some(s3s::auth::Credentials {
+                access_key: "test-owner".into(),
+                secret_key: s3s::auth::SecretKey::from("test"),
+            }),
             region: None,
             service: None,
             trailing_headers: None,
@@ -4388,7 +4618,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pinning_copy_directives_use_source_or_replacement_tags_and_destination_policy() {
+    async fn pinning_copy_directives_preserve_unknown_legacy_controls_without_replay() {
         let kubo = kubo_server("unused-add-response").await;
         let state = pinning_state(kubo.uri(), "request", "one", "dest/").await;
         let source_tags = vec![
@@ -4418,16 +4648,18 @@ mod tests {
         .await
         .unwrap();
 
-        let first_copy = copy_object(&state, copy_request("source", "dest/default", None, None))
+        let default_copy = copy_object(&state, copy_request("source", "dest/default", None, None))
             .await
             .unwrap();
-        uuid::Uuid::parse_str(first_copy.output.version_id.as_deref().unwrap()).unwrap();
-        copy_object(
+        uuid::Uuid::parse_str(default_copy.output.version_id.as_deref().unwrap()).unwrap();
+        assert!(!default_copy.headers.contains_key("x-ipfs3-pin-warning"));
+        let explicit_copy = copy_object(
             &state,
             copy_request("source", "dest/copy", Some("COPY"), Some("")),
         )
         .await
         .unwrap();
+        assert!(!explicit_copy.headers.contains_key("x-ipfs3-pin-warning"));
         copy_object(
             &state,
             copy_request(
@@ -4460,21 +4692,36 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(
-            crate::store::pinning::tags::list_object_tags(
-                state.store.db(),
-                &crate::store::object::get_latest(state.store.db(), "bucket", "dest/default")
+        for key in ["dest/default", "dest/copy"] {
+            let object = crate::store::object::get_latest(state.store.db(), "bucket", key)
+                .await
+                .unwrap();
+            assert_eq!(object.cid, "bafy-shared");
+            assert_eq!(
+                crate::store::pinning::tags::list_object_tags(state.store.db(), &object.id)
+                    .await
+                    .unwrap(),
+                vec![
+                    crate::pinning::tags::ObjectTag::new("ipfs-s3:pin", "true"),
+                    crate::pinning::tags::ObjectTag::new("team", "source"),
+                ]
+            );
+            let version = object_version::Entity::find()
+                .filter(object_version::Column::ObjectId.eq(&object.id))
+                .one(state.store.db())
+                .await
+                .unwrap()
+                .unwrap();
+            let decision =
+                crate::store::pinning::decision::read_for_version(state.store.db(), &version.id)
                     .await
                     .unwrap()
-                    .id,
-            )
-            .await
-            .unwrap(),
-            vec![
-                crate::pinning::tags::ObjectTag::new("ipfs-s3:pin", "true"),
-                crate::pinning::tags::ObjectTag::new("team", "source"),
-            ]
-        );
+                    .unwrap();
+            assert!(decision.legacy_unknown);
+            assert_eq!(decision.warning, None);
+            assert!(decision.effective_intents.is_empty());
+            assert!(lease_sources_for_latest(&state, key).await.is_empty());
+        }
         assert!(
             crate::store::pinning::tags::list_object_tags(
                 state.store.db(),
@@ -4501,14 +4748,6 @@ mod tests {
                 crate::pinning::tags::ObjectTag::new("ipfs-s3:pin", "true"),
                 crate::pinning::tags::ObjectTag::new("team", "replaced"),
             ]
-        );
-        assert_eq!(
-            lease_sources_for_latest(&state, "dest/default").await,
-            vec!["manual"]
-        );
-        assert_eq!(
-            lease_sources_for_latest(&state, "dest/copy").await,
-            vec!["manual"]
         );
         assert_eq!(
             lease_sources_for_latest(&state, "dest/replaced").await,
@@ -4541,9 +4780,17 @@ mod tests {
         let state = pinning_state(kubo.uri(), "request", "one", "dest/").await;
         let source_tags = vec![crate::pinning::tags::ObjectTag::new("ipfs-s3:pin", "true")];
         seed_copy_source(&state, "source", "bafy-pinned-copy", &source_tags).await;
-        copy_object(&state, copy_request("source", "dest/first", None, None))
-            .await
-            .unwrap();
+        copy_object(
+            &state,
+            copy_request(
+                "source",
+                "dest/first",
+                Some("REPLACE"),
+                Some("ipfs-s3%3Apin=true"),
+            ),
+        )
+        .await
+        .unwrap();
         remote_pin::Entity::update_many()
             .col_expr(remote_pin::Column::Status, "pinned".into())
             .col_expr(
@@ -4560,9 +4807,17 @@ mod tests {
             .await
             .unwrap();
 
-        copy_object(&state, copy_request("source", "dest/second", None, None))
-            .await
-            .unwrap();
+        copy_object(
+            &state,
+            copy_request(
+                "source",
+                "dest/second",
+                Some("REPLACE"),
+                Some("ipfs-s3%3Apin=true"),
+            ),
+        )
+        .await
+        .unwrap();
 
         assert!(pending_operations(&state).await.is_empty());
         let latest = crate::store::object::get_latest(state.store.db(), "bucket", "dest/second")

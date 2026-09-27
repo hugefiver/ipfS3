@@ -14,6 +14,7 @@ pub mod object;
 pub mod object_tag;
 pub mod object_version;
 pub mod physical_residency;
+pub mod pin_extension_decision;
 pub mod pin_job;
 pub mod pin_lease;
 pub mod pin_lease_target;

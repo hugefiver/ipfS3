@@ -9,7 +9,13 @@ use sea_orm::{
 use crate::{
     error::{AppError, AppResult},
     pinning::{
-        policy::{ExistingManualLease, ExistingManualLeaseState, ManualLeaseMutation},
+        decision::{
+            DecisionEffect, DecisionOrigin, ExtensionDecision, WarningCode, config_revision,
+        },
+        policy::{
+            ExistingManualLease, ExistingManualLeaseState, ManualLeaseMutation, PublicationContext,
+            PublicationPolicy,
+        },
         tags::{ContentMode, ObjectTag, PinControl, validate_tag_set},
     },
     state::AppState,
@@ -136,14 +142,26 @@ pub(crate) async fn put_object_tagging_at(
     req: S3Request<PutObjectTaggingInput>,
     now: DateTime<Utc>,
 ) -> S3Result<S3Response<PutObjectTaggingOutput>> {
+    let principal = super::object::principal_id(&req)?;
     let input = req.input;
     let selector = version_selector(input.version_id.as_deref())?;
     let replacement = dto_to_object_tags(input.tagging.tag_set).map_err(s3s::S3Error::from)?;
     validate_replacement(&replacement).map_err(s3s::S3Error::from)?;
-    let version_id = replace_tag_set(state, input.bucket, input.key, selector, replacement, now)
-        .await
-        .map_err(s3s::S3Error::from)?;
-    Ok(S3Response::new(PutObjectTaggingOutput { version_id }))
+    let (version_id, warning) = replace_tag_set(
+        state,
+        input.bucket,
+        input.key,
+        selector,
+        replacement,
+        principal,
+        now,
+    )
+    .await
+    .map_err(s3s::S3Error::from)?;
+    Ok(S3Response::with_headers(
+        PutObjectTaggingOutput { version_id },
+        super::object::pin_warning_headers(warning),
+    ))
 }
 
 pub async fn delete_object_tagging(
@@ -158,13 +176,22 @@ pub(crate) async fn delete_object_tagging_at(
     req: S3Request<DeleteObjectTaggingInput>,
     now: DateTime<Utc>,
 ) -> S3Result<S3Response<DeleteObjectTaggingOutput>> {
+    let principal = super::object::principal_id(&req)?;
     let input = req.input;
     let selector = version_selector(input.version_id.as_deref())?;
     let replacement = Vec::new();
     validate_replacement(&replacement).map_err(s3s::S3Error::from)?;
-    let version_id = replace_tag_set(state, input.bucket, input.key, selector, replacement, now)
-        .await
-        .map_err(s3s::S3Error::from)?;
+    let (version_id, _) = replace_tag_set(
+        state,
+        input.bucket,
+        input.key,
+        selector,
+        replacement,
+        principal,
+        now,
+    )
+    .await
+    .map_err(s3s::S3Error::from)?;
     Ok(S3Response::new(DeleteObjectTaggingOutput { version_id }))
 }
 
@@ -187,6 +214,98 @@ fn validate_replacement(replacement: &[ObjectTag]) -> AppResult<()> {
     validate_tag_set(replacement).map_err(|_| invalid_pinning_request(INVALID_TAG_SET))?;
     PinControl::from_tags(replacement).map_err(|_| invalid_pinning_request(INVALID_TAG_SET))?;
     Ok(())
+}
+
+fn capture_tag_decision(
+    state: &AppState,
+    (bucket, key): (&str, &str),
+    replacement: &[ObjectTag],
+    current_tags: &[ObjectTag],
+    previous: Option<&ExtensionDecision>,
+    has_manual_lease: bool,
+    principal: &str,
+) -> AppResult<ExtensionDecision> {
+    let control =
+        PinControl::from_tags(replacement).map_err(|_| invalid_pinning_request(INVALID_TAG_SET))?;
+    let origin = DecisionOrigin::new(principal, uuid::Uuid::new_v4().to_string());
+    let revision = config_revision(
+        state.pinning.effective_config(),
+        state.pinning.control_mode(),
+    );
+    let policy = PublicationPolicy {
+        tags: replacement.to_vec(),
+        // Replacing tags is not a publication. Existing automatic work persists
+        // independently, but no new lease/job/quota is admitted here.
+        leases: previous.map_or_else(Vec::new, |decision| {
+            decision
+                .effective_intents
+                .iter()
+                .filter(|intent| intent.source == crate::pinning::policy::LeaseSource::Automatic)
+                .cloned()
+                .collect()
+        }),
+    };
+    if !has_manual_lease && !matches!(control, PinControl::Absent) {
+        let old_control = match previous {
+            Some(previous) if previous.legacy_unknown => Some(previous.control.clone()),
+            None => Some(
+                PinControl::from_tags(current_tags)
+                    .map_err(|_| invalid_pinning_request(INVALID_TAG_SET))?,
+            ),
+            _ => None,
+        };
+        if let Some(old_control) = old_control.filter(|old| !matches!(old, PinControl::Absent)) {
+            if old_control == control {
+                return ExtensionDecision::capture_legacy_unknown(
+                    origin, revision, control, &policy,
+                )
+                .map_err(invalid_pinning_request);
+            }
+            if matches!(control, PinControl::Request { .. }) {
+                return Err(invalid_pinning_request(
+                    "an inherited control cannot be reapplied by tagging",
+                ));
+            }
+        }
+    }
+    let warning = match (&control, previous) {
+        (PinControl::Request { .. }, Some(previous))
+            if previous.effect == DecisionEffect::Skipped =>
+        {
+            if previous.control != control {
+                return Err(invalid_pinning_request(
+                    "a skipped control cannot be reapplied by tagging",
+                ));
+            }
+            previous.warning
+        }
+        (PinControl::Request { .. }, _) if !has_manual_lease => {
+            let (_, attempted) = state
+                .pinning
+                .policy()
+                .evaluate_publication_decision(
+                    PublicationContext {
+                        bucket,
+                        key,
+                        tags: replacement,
+                        is_decompress_zip: false,
+                    },
+                    origin.clone(),
+                )
+                .map_err(AppError::from)?;
+            (attempted.effect == DecisionEffect::Skipped)
+                .then_some(attempted.warning)
+                .flatten()
+        }
+        _ => None,
+    };
+    let effect = if warning.is_some() {
+        DecisionEffect::Skipped
+    } else {
+        DecisionEffect::NoIntent
+    };
+    ExtensionDecision::capture(origin, revision, effect, warning, control, &policy)
+        .map_err(invalid_pinning_request)
 }
 
 fn version_selector(version_id: Option<&str>) -> AppResult<VersionSelector> {
@@ -229,8 +348,9 @@ async fn replace_tag_set(
     key: String,
     selector: VersionSelector,
     replacement: Vec<ObjectTag>,
+    principal: String,
     now: DateTime<Utc>,
-) -> AppResult<Option<String>> {
+) -> AppResult<(Option<String>, Option<WarningCode>)> {
     let operation_state = Arc::clone(state);
     let selector_for_recheck = selector.clone();
     let bucket_for_recheck = bucket.clone();
@@ -251,13 +371,41 @@ async fn replace_tag_set(
                 .id
                 .clone();
                 let version_id = response_version_id(txn, &bucket, &selected).await?;
+                let previous =
+                    crate::store::pinning::decision::read_for_version(txn, &selected.id).await?;
+                let current_tags = tags::list_object_tags(txn, &owner_id).await?;
+                if let Some(previous) = &previous {
+                    previous.replay_policy(current_tags.clone()).map_err(|_| {
+                        AppError::Internal("stored pin decision does not match version tags".into())
+                    })?;
+                }
                 let manual = load_manual_lease(txn, &owner_id).await?;
                 let existing = manual.as_ref().map(existing_manual_lease).transpose()?;
-                let mutation = operation_state
+                let attempted = operation_state
                     .pinning
                     .policy()
                     .evaluate_tag_replacement(existing.as_ref(), &replacement, now)
-                    .map_err(AppError::from)?;
+                    .map_err(AppError::from);
+                let decision = capture_tag_decision(
+                    &operation_state,
+                    (&bucket, &key),
+                    &replacement,
+                    &current_tags,
+                    previous.as_ref(),
+                    manual.is_some(),
+                    &principal,
+                )?;
+                let mutation = match attempted {
+                    Ok(mutation) => mutation,
+                    Err(_)
+                        if manual.is_none()
+                            && (decision.effect == DecisionEffect::Skipped
+                                || decision.legacy_unknown) =>
+                    {
+                        ManualLeaseMutation::Keep
+                    }
+                    Err(error) => return Err(error),
+                };
 
                 #[cfg(test)]
                 pause_after_policy_evaluation(manual.as_ref().map(|lease| lease.id.as_str())).await;
@@ -324,13 +472,20 @@ async fn replace_tag_set(
                     }
                 }
                 tags::replace_object_tags(txn, &owner_id, &replacement).await?;
-                Ok(version_id)
+                crate::store::pinning::decision::replace_for_version_in_transaction(
+                    txn,
+                    &selected.id,
+                    &owner_id,
+                    &decision,
+                )
+                .await?;
+                Ok((version_id, decision.warning))
             })
         })
         .await;
 
     match result {
-        Ok(version_id) => Ok(version_id),
+        Ok(result) => Ok(result),
         Err(error) => {
             let error = transaction_error_into_app(error);
             // SQLite retains the transaction's read snapshot across the test
@@ -461,6 +616,8 @@ mod tests {
             },
         },
     };
+
+    use crate::s3::sigv4;
 
     const BUCKET: &str = "bucket";
     const KEY: &str = "key";
@@ -636,6 +793,12 @@ mod tests {
         )
         .await
         .unwrap();
+        // This fixture begins with an unversioned null slot for the same
+        // internal object. Production publications use a distinct immutable
+        // owner per version; discard that fixture-only duplicate index first.
+        crate::store::object_version::remove_null_slot(db, BUCKET, KEY)
+            .await
+            .unwrap();
         let historical = crate::store::object::get_latest(db, BUCKET, KEY)
             .await
             .unwrap();
@@ -846,7 +1009,10 @@ mod tests {
             uri: format!("/{BUCKET}/{KEY}?tagging").parse().unwrap(),
             headers: http::HeaderMap::new(),
             extensions: http::Extensions::new(),
-            credentials: None,
+            credentials: Some(s3s::auth::Credentials {
+                access_key: "test-owner".to_owned(),
+                secret_key: s3s::auth::SecretKey::from("test"),
+            }),
             region: None,
             service: None,
             trailing_headers: None,
@@ -1146,6 +1312,464 @@ mod tests {
             .unwrap()
             .output;
         assert_eq!(tag_pairs(&output.tag_set), vec![("middle", "replacement")]);
+    }
+
+    #[tokio::test]
+    async fn warn_tagging_skip_is_durable_and_never_reapplied_after_provider_appears() {
+        use crate::{config::OptionalPinControlMode, pinning::decision::DecisionEffect};
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let validated =
+            ValidatedPinningConfig::from_raw(&PinningConfig::default(), |_| None).unwrap();
+        let coordinator = PinningCoordinator::build_with_kubo_and_mode(
+            validated,
+            None,
+            OptionalPinControlMode::Warn,
+        )
+        .unwrap();
+        let fixture = fixture_from_db_and_coordinator(db, (coordinator, "unused".into())).await;
+        let request = [("ipfs-s3:pin", "true"), ("owner", "private")];
+        let response = put_object_tagging_at(&fixture.state, put_request(&request), time(2))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.headers["x-ipfs3-pin-warning"],
+            "pin-policy-unavailable"
+        );
+        let version = object_version::Entity::find()
+            .filter(object_version::Column::ObjectId.eq(OBJECT_ID))
+            .one(fixture.state.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        let first = crate::store::pinning::decision::read_for_version(
+            fixture.state.store.db(),
+            &version.id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(first.effect, DecisionEffect::Skipped);
+        assert_eq!(first.origin.principal_id, "test-owner");
+
+        let available = Arc::new(AppState {
+            kubo: crate::kubo::KuboClient::new("http://127.0.0.1:5001".into()),
+            cold_kubo: None,
+            store: Store::new(fixture.state.store.db().clone()),
+            credentials: HashMap::new(),
+            master_key: crate::crypto::key::MasterKey::from_hex(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .unwrap(),
+            pinning: coordinator_fixture().0,
+        });
+        let response = put_object_tagging_at(
+            &available,
+            put_request(&[("ipfs-s3:pin", "true"), ("owner", "updated")]),
+            time(3),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            response.headers["x-ipfs3-pin-warning"],
+            "pin-policy-unavailable"
+        );
+        let second =
+            crate::store::pinning::decision::read_for_version(available.store.db(), &version.id)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(second.effect, DecisionEffect::Skipped);
+        assert_ne!(first.control_revision, second.control_revision);
+        let reapply = put_object_tagging_at(
+            &available,
+            put_request(&[("ipfs-s3:pin", "true"), ("ipfs-s3:duration", "1h")]),
+            time(4),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(reapply.code().as_str(), "InvalidArgument");
+        assert_eq!(
+            crate::store::pinning::decision::read_for_version(available.store.db(), &version.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .control_revision,
+            second.control_revision
+        );
+        assert_eq!(
+            pin_lease::Entity::find()
+                .count(available.store.db())
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            pin_job::Entity::find()
+                .count(available.store.db())
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            remote_pin::Entity::find()
+                .count(available.store.db())
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            pin_provider_usage::Entity::find()
+                .count(available.store.db())
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn signed_copy_legacy_control_survives_ordinary_tagging_without_manual_work() {
+        use axum::error_handling::HandleError;
+        use s3s::service::S3ServiceBuilder;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let kubo = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/pin/add"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("{\"Pins\":[\"bafy-object\"]}"),
+            )
+            .mount(&kubo)
+            .await;
+        let fixture = fixture().await;
+        seed_tags(&fixture, &[("ipfs-s3:pin", "true"), ("team", "legacy")]).await;
+        let state = Arc::new(AppState {
+            kubo: crate::kubo::KuboClient::new(kubo.uri()),
+            cold_kubo: None,
+            store: Store::new(fixture.state.store.db().clone()),
+            credentials: HashMap::from([("test".into(), s3s::auth::SecretKey::from("test"))]),
+            master_key: crate::crypto::key::MasterKey::from_hex(&"0".repeat(64)).unwrap(),
+            pinning: fixture.state.pinning.clone(),
+        });
+        let mut builder = S3ServiceBuilder::new(crate::s3::handler::S3Impl::new(state.clone()));
+        builder.set_auth(crate::auth::GatewayAuth::new(state.clone()));
+        let app = axum::Router::new().fallback_service(HandleError::new(
+            builder.build(),
+            |_: s3s::HttpError| async {
+                http::Response::builder()
+                    .status(500)
+                    .body(s3s::Body::from("error".to_owned()))
+                    .unwrap()
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-amz-copy-source", "/bucket/key".parse().unwrap());
+        let copy = sigv4::send_sigv4(
+            reqwest::Method::PUT,
+            &endpoint,
+            BUCKET,
+            "dest/legacy",
+            &[],
+            Vec::new(),
+            headers,
+            "test",
+        )
+        .await;
+        assert_eq!(
+            copy.status(),
+            reqwest::StatusCode::OK,
+            "{}",
+            copy.text().await.unwrap_or_default()
+        );
+        let dest = crate::store::object::get_latest(state.store.db(), BUCKET, "dest/legacy")
+            .await
+            .unwrap();
+        let version = object_version::Entity::find()
+            .filter(object_version::Column::ObjectId.eq(&dest.id))
+            .one(state.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        let first =
+            crate::store::pinning::decision::read_for_version(state.store.db(), &version.id)
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(first.legacy_unknown);
+        assert_eq!(first.effect, DecisionEffect::NoIntent);
+        assert_eq!(first.warning, None);
+
+        let tagging = "<Tagging><TagSet><Tag><Key>ipfs-s3:pin</Key><Value>true</Value></Tag><Tag><Key>ipfs-s3:content</Key><Value>object</Value></Tag><Tag><Key>team</Key><Value>updated</Value></Tag></TagSet></Tagging>";
+        let response = sigv4::send_sigv4(
+            reqwest::Method::PUT,
+            &endpoint,
+            BUCKET,
+            "dest/legacy",
+            &[("tagging", "")],
+            tagging.as_bytes().to_vec(),
+            http::HeaderMap::new(),
+            "test",
+        )
+        .await;
+        let status = response.status();
+        let warning = response.headers().get("x-ipfs3-pin-warning").cloned();
+        let body = response.text().await.unwrap();
+        assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+        assert!(warning.is_none());
+        let second =
+            crate::store::pinning::decision::read_for_version(state.store.db(), &version.id)
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(second.legacy_unknown);
+        assert_eq!(second.effect, DecisionEffect::NoIntent);
+        assert_eq!(second.warning, None);
+        assert_eq!(second.control, first.control);
+
+        let expanded_state = Arc::new(AppState {
+            kubo: crate::kubo::KuboClient::new(kubo.uri()),
+            cold_kubo: None,
+            store: Store::new(state.store.db().clone()),
+            credentials: HashMap::new(),
+            master_key: crate::crypto::key::MasterKey::from_hex(&"0".repeat(64)).unwrap(),
+            pinning: coordinator_fixture_with_providers(&["alpha", "beta", "gamma"]).0,
+        });
+        let mut req = put_request(&[("ipfs-s3:pin", "true"), ("team", "expanded")]);
+        req.input.key = "dest/legacy".into();
+        let response = put_object_tagging_at(&expanded_state, req, time(2))
+            .await
+            .unwrap();
+        assert!(!response.headers.contains_key("x-ipfs3-pin-warning"));
+        assert!(
+            crate::store::pinning::decision::read_for_version(state.store.db(), &version.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .legacy_unknown
+        );
+
+        let mut changed = put_request(&[("ipfs-s3:pin", "true"), ("ipfs-s3:duration", "1h")]);
+        changed.input.key = "dest/legacy".into();
+        assert_eq!(
+            put_object_tagging_at(&expanded_state, changed, time(2))
+                .await
+                .unwrap_err()
+                .code()
+                .as_str(),
+            "InvalidArgument"
+        );
+
+        let validated =
+            ValidatedPinningConfig::from_raw(&PinningConfig::default(), |_| None).unwrap();
+        let strict = PinningCoordinator::build_with_kubo_and_mode(
+            validated,
+            None,
+            crate::config::OptionalPinControlMode::Strict,
+        )
+        .unwrap();
+        let strict_state = Arc::new(AppState {
+            kubo: crate::kubo::KuboClient::new(kubo.uri()),
+            cold_kubo: None,
+            store: Store::new(state.store.db().clone()),
+            credentials: HashMap::new(),
+            master_key: crate::crypto::key::MasterKey::from_hex(&"0".repeat(64)).unwrap(),
+            pinning: strict,
+        });
+        let mut req = put_request(&[("ipfs-s3:pin", "true"), ("team", "strict")]);
+        req.input.key = "dest/legacy".into();
+        let response = put_object_tagging_at(&strict_state, req, time(3))
+            .await
+            .unwrap();
+        assert!(!response.headers.contains_key("x-ipfs3-pin-warning"));
+        let third =
+            crate::store::pinning::decision::read_for_version(state.store.db(), &version.id)
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(third.legacy_unknown);
+        assert_eq!(third.warning, None);
+        assert_eq!(third.effect, DecisionEffect::NoIntent);
+
+        let mut changed = put_request(&[("ipfs-s3:pin", "true"), ("ipfs-s3:duration", "1h")]);
+        changed.input.key = "dest/legacy".into();
+        assert_eq!(
+            put_object_tagging_at(&strict_state, changed, time(4))
+                .await
+                .unwrap_err()
+                .code()
+                .as_str(),
+            "InvalidArgument"
+        );
+        assert_eq!(
+            crate::store::pinning::decision::read_for_version(state.store.db(), &version.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            third
+        );
+        assert_eq!(
+            stored_tags::list_object_tags(state.store.db(), &dest.id)
+                .await
+                .unwrap(),
+            vec![
+                ObjectTag::new("ipfs-s3:pin", "true"),
+                ObjectTag::new("team", "strict")
+            ]
+        );
+        for count in [
+            pin_lease::Entity::find()
+                .count(state.store.db())
+                .await
+                .unwrap(),
+            pin_job::Entity::find()
+                .count(state.store.db())
+                .await
+                .unwrap(),
+            pin_provider_usage::Entity::find()
+                .count(state.store.db())
+                .await
+                .unwrap(),
+        ] {
+            assert_eq!(count, 0);
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn legacy_raw_control_without_decision_row_cannot_be_reapplied_by_tagging() {
+        let fixture = fixture().await;
+        seed_tags(&fixture, &[("ipfs-s3:pin", "true"), ("team", "old")]).await;
+        let version = object_version::Entity::find()
+            .filter(object_version::Column::ObjectId.eq(OBJECT_ID))
+            .one(fixture.state.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            crate::store::pinning::decision::read_for_version(
+                fixture.state.store.db(),
+                &version.id
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        let response = put_object_tagging_at(
+            &fixture.state,
+            put_request(&[("ipfs-s3:pin", "true"), ("team", "new")]),
+            time(2),
+        )
+        .await
+        .unwrap();
+        assert!(!response.headers.contains_key("x-ipfs3-pin-warning"));
+        let captured = crate::store::pinning::decision::read_for_version(
+            fixture.state.store.db(),
+            &version.id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(captured.legacy_unknown);
+        assert_eq!(captured.effect, DecisionEffect::NoIntent);
+        assert!(captured.effective_intents.is_empty());
+
+        let error = put_object_tagging_at(
+            &fixture.state,
+            put_request(&[("ipfs-s3:pin", "true"), ("ipfs-s3:duration", "1h")]),
+            time(3),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code().as_str(), "InvalidArgument");
+        assert_eq!(
+            crate::store::pinning::decision::read_for_version(
+                fixture.state.store.db(),
+                &version.id
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            captured
+        );
+        assert_eq!(
+            stored_tags::list_object_tags(fixture.state.store.db(), OBJECT_ID)
+                .await
+                .unwrap(),
+            vec![
+                ObjectTag::new("ipfs-s3:pin", "true"),
+                ObjectTag::new("team", "new")
+            ]
+        );
+        for count in [
+            pin_lease::Entity::find()
+                .count(fixture.state.store.db())
+                .await
+                .unwrap(),
+            pin_job::Entity::find()
+                .count(fixture.state.store.db())
+                .await
+                .unwrap(),
+            pin_provider_usage::Entity::find()
+                .count(fixture.state.store.db())
+                .await
+                .unwrap(),
+        ] {
+            assert_eq!(count, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_unknown_cancel_and_renew_controls_stay_unknown_on_ordinary_tagging() {
+        for controls in [
+            vec![("ipfs-s3:pin", "false")],
+            vec![
+                ("ipfs-s3:pin", "true"),
+                ("ipfs-s3:retain-until", "2026-07-22T08:00:00Z"),
+            ],
+        ] {
+            let fixture = fixture().await;
+            let mut initial = controls.clone();
+            initial.push(("team", "old"));
+            seed_tags(&fixture, &initial).await;
+            let version = object_version::Entity::find()
+                .filter(object_version::Column::ObjectId.eq(OBJECT_ID))
+                .one(fixture.state.store.db())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut replacement = controls;
+            replacement.push(("team", "new"));
+            let response =
+                put_object_tagging_at(&fixture.state, put_request(&replacement), time(2))
+                    .await
+                    .unwrap();
+            assert!(!response.headers.contains_key("x-ipfs3-pin-warning"));
+            let decision = crate::store::pinning::decision::read_for_version(
+                fixture.state.store.db(),
+                &version.id,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(decision.legacy_unknown);
+            assert_eq!(decision.effect, DecisionEffect::NoIntent);
+            assert_eq!(decision.warning, None);
+            assert!(decision.effective_intents.is_empty());
+            assert_eq!(
+                pin_lease::Entity::find()
+                    .count(fixture.state.store.db())
+                    .await
+                    .unwrap(),
+                0
+            );
+        }
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 # Pinning、ZIP 产物与 UnixFS 目录根：统一实施计划
 
-日期：2026-09-20。状态：计划已通过审查；Stage 1 已提交，Stage 2 已于 2026-09-23 验收并随本阶段提交；Stage 4 的公共合同已由用户确认。
+日期：2026-09-20。状态：计划已通过审查；Stage 1–2 已分别提交，Stage 3 已通过限定验收并随本阶段提交；Stage 4 的公共合同已由用户确认。
 
 本文件是本轮唯一权威设计/实施/进度计划；不另建 spec，不单独提交计划。需求来源为用户提供的 `ipfs3_review_report.md`（2026-09-17）及最新 R24 确认。本轮基线为 `master@d3bf5cf`；规划时已确认工作区 clean、与 origin/master 一致，本轮不执行 push。
 
@@ -361,8 +361,8 @@ cargo test --test integration
 | 阶段 | 状态 | 行为/测试证据 | 实机未验或裁定 | Commit |
 |---|---|---|---|---|
 | 1 | 已提交 | lib 1187 passed / 1 ignored；bin 13、integration 164、真实日志 2；PG 并发 3 passed；pinning 定向 352 passed | 未执行真实 Pinata/Filebase 账号写入；完整身份/账户 scope 模型留给 Stage 2 | `2c948dd` |
-| 2 | 已验收 | lib 1196 passed / 1 ignored、integration 164；Stage 2 专项默认测试通过；隔离 PG 17 迁移/并发/交接 9 passed；fmt、clippy `--all-targets -D warnings` 与限定复核通过 | 曾有一次 PG 路由缺失间歇错误，受控提交/回滚可见性实验与后续整合未再现，根因仍未确认；真实 provider 账号写入未执行 | 本阶段语义提交，见 Git 历史 |
-| 3 | 未开始 | — | 真实客户端可用性待确认 | — |
+| 2 | 已验收 | lib 1196 passed / 1 ignored、integration 164；Stage 2 专项默认测试通过；隔离 PG 17 迁移/并发/交接 9 passed；fmt、clippy `--all-targets -D warnings` 与限定复核通过 | 曾有一次 PG 路由缺失间歇错误，受控提交/回滚可见性实验与后续整合未再现，根因仍未确认；真实 provider 账号写入未执行 | `556c8e4` |
+| 3 | 已验收 | 同一整合命令共 1443 passed / 1 ignored / 0 failed（lib 1250、integration 165），fmt、clippy `--all-targets -D warnings`、diff-check；双进程 SigV4 MPU 1/1；隔离 PG17 schema 5/5、route 交错 2/2；限定复核无剩余 Critical/Important | 新 Noop 改动尚未 PG 实跑；真实 Pinata/Filebase 账号、import 跨进程、全量 F1 未验，Stage 2 PG 旧 route 间歇错误根因仍未确认；import `202` 仅 accepted | 本阶段语义提交，见 Git 历史 |
 | 4 | 未开始 | — | §8；directory协议/实机验证 | — |
 | 5 | 未开始 | — | Filebase账号写授权/双Kubo环境 | — |
 | 6 | 未开始 | — | Cluster版本/拓扑/隔离测试授权 | — |
@@ -387,3 +387,11 @@ cargo test --test integration
 - PSA 的成功请求 ID 不证明排他创建；缺证明时 ownership 保持 unknown、禁止 managed DELETE。retained 的实际 pinned 资源重新附加活跃引用后只恢复有效性，不重新计额、重置 TTL 或伪造观测时间；仅真实 provider 返回更新 `last_observed_at`。
 - SQLite 及真实隔离 PostgreSQL 17 专项覆盖旧库升级、shared CID、retain/cleanup、迟到响应、两个 PG ledger INSERT 可见性顺序（commit/rollback）、Poll/cancel 的两个锁序；测试仅在各自 UUID schema 内写入，均已清理。真实 Kubo/Pinata/Filebase 账户以及生产数据迁移未执行。
 - PostgreSQL 综合测试曾间歇出现一次 `remote allocation lacks a current, matching historical route`；后续受控双连接 PG 插入、提交/回滚与多次整合均通过，但原始间歇根因未被证实。测试保留失败时的脱敏路由状态诊断，不得宣称已针对该异常修复。
+
+### Stage 3 验收补充与证据边界
+
+- `src/config.rs` 的 `[pinning_control] unavailable = "warn"` 为显式选择，省略时仍为 strict。`config.example.toml` 展示 warn，但保留原有 `always`/`all` 自动策略；可选手动控制被 skipped 不等于服务器自动意图被放宽。`src/pinning/decision.rs` 的决定保存 effect、受限 warning、control/config revision 和有效意图，不以原始 tag 重扫旧 skipped 或 legacy-unknown 控制。
+- 普通 PUT、Copy、tagging 与直接 ZIP 的成功响应、MPU 初始化/完成和 import 接收/状态路径在代码中接入 `x-ipfs3-pin-warning`；MPU 初始化持久捕获，完成复用而不重新评估；import `202` 仅 accepted，不是对象或远端 pin 完成。警告头只有固定 ASCII 类别，CORS 必须按桶内授权规则显式 expose，不能自动向任意 origin 暴露。
+- 新受理的 MPU/import 若有可执行非 Noop 远端意图，每个可执行的已配置非 Noop provider 均须显式配置 `[pinning_identity.providers]` 及运营指定的 `credential_revision` / `endpoint_revision`；拒绝新 legacy async，不重写旧 job。Noop 或无可执行意图允许。同配置真实双进程 SigV4 MPU 完成 1/1；两种 revision 变动均在副作用前拒绝。新远端提交使用 opaque UUID correlation，旧 job 原结构化 ID 仍用于 Find。0003/0004/0005/0006 仅追加迁移，不修改历史 production up/down；PG17 schema 5/5、route 交错 2/2，新 Noop 改动尚未 PG 实跑。
+- `src/diagnostics.rs` 的 doctor/config/policy 是独立 CLI 的局部有效配置证据，不是运行网关配置或真实账户权限探测；`src/diagnostics/status.rs` 只读查询已配置 DB 的单页快照，不启动迁移/远端探测。SQLite 不创建缺失文件，PG 使用只读事务；分页间并发变动可能改变 offset 结果。
+- 升级 0003/0004/0005/0006 前停净所有旧 writer/worker 并备份；禁止旧新混跑或通过删除 decision 数据回滚，下滚 fail-closed。发布事务在 usage 锁后验证并锁住捕获的 provider route；MPU/import 在源 I/O 前做额外预检。Noop 同名改成真实 provider 也不能让旧决定外发。SQLite 的 Noop 反例与 PostgreSQL 的真实 route 交错分开验收，新 Noop 改动未在 PG 实跑。PSA request ID 不构成独占创建证明，integration 的旧 DELETE 假设调整为 Unknown ownership 禁 DELETE、保留占额；有证明的 managed cleanup 和八次失败预算仍由 store/ledger 回归覆盖。整合命令 `cargo test --locked --offline --lib --test integration --test cors --test multipart_pin_decision --test stage3_migrations --test stage3_route_fence --test stage3_restart --test diagnostics --test import_legacy_replay --quiet` 为 1443 passed、1 ignored、0 failed；这不等同全量 F1 或真实 provider 账号验收。测试入口及未验范围见 `docs/testing.md`。

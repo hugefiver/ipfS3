@@ -1,10 +1,15 @@
 use chrono::{DateTime, TimeDelta, Utc};
+use serde::{Deserialize, Serialize};
 
 use crate::{
+    config::OptionalPinControlMode,
     error::AppError,
     pinning::{
         config::{
             LeaseDuration, PolicyTrigger, ProviderMode, ValidatedPinningConfig, ValidatedPolicy,
+        },
+        decision::{
+            DecisionEffect, DecisionOrigin, ExtensionDecision, WarningCode, config_revision,
         },
         tags::{ContentMode, ObjectTag, PinControl},
     },
@@ -18,13 +23,14 @@ pub struct PublicationContext<'a> {
     pub is_decompress_zip: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LeaseSource {
     Automatic,
     Manual,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaseIntent {
     pub source: LeaseSource,
     pub policy_id: String,
@@ -43,13 +49,113 @@ pub struct PublicationPolicy {
 #[derive(Debug, Clone)]
 pub struct PinPolicyEvaluator {
     policies: Vec<ValidatedPolicy>,
+    provider_limits: crate::pinning::config::ProviderLimitMap,
+    config_revision: String,
+    optional_control: OptionalPinControlMode,
 }
 
 impl PinPolicyEvaluator {
     pub fn new(config: &ValidatedPinningConfig) -> Self {
+        Self::with_mode(config, OptionalPinControlMode::Strict)
+    }
+
+    pub fn with_mode(config: &ValidatedPinningConfig, mode: OptionalPinControlMode) -> Self {
         Self {
             policies: config.policies.clone(),
+            provider_limits: config.provider_limits.clone(),
+            config_revision: config_revision(config, mode),
+            optional_control: mode,
         }
+    }
+
+    /// Capture once after authorization/admission (PUT, MPU init, import receive).
+    /// Serialize the decision with the durable MPU/import record; never re-interpret
+    /// old raw tags at completion. Guarded publication checks the origin ID.
+    pub fn evaluate_publication_decision(
+        &self,
+        context: PublicationContext<'_>,
+        origin: DecisionOrigin,
+    ) -> Result<(PublicationPolicy, ExtensionDecision), PolicyError> {
+        let control = pin_control(context.tags)?;
+        // A decompressed request outside ZIP is invalid even without a matching policy.
+        if matches!(
+            control,
+            PinControl::Request {
+                content: ContentMode::Decompressed,
+                ..
+            }
+        ) && !context.is_decompress_zip
+        {
+            return Err(invalid_request(
+                "decompressed pinning requires a decompress-zip upload",
+            ));
+        }
+        let selected = self.matching_policy(context.bucket, context.key);
+        let mut policy = match self.evaluate_publication(context.clone()) {
+            Ok(policy) => policy,
+            Err(_error)
+                if self.optional_control == OptionalPinControlMode::Warn
+                    && selected.is_none()
+                    && matches!(control, PinControl::Request { .. } | PinControl::Cancel) =>
+            {
+                // Only the absence of a policy is optional; parsing and structure already passed.
+                PublicationPolicy {
+                    tags: context.tags.to_vec(),
+                    leases: Vec::new(),
+                }
+            }
+            Err(error) => return Err(error),
+        };
+        let warning = if selected.is_none() && !matches!(control, PinControl::Absent) {
+            Some(WarningCode::NoMatchingPolicy)
+        } else if let Some(selected) = selected {
+            let enabled = selected
+                .providers
+                .iter()
+                .filter(|name| {
+                    self.provider_limits
+                        .get(*name)
+                        .is_some_and(|limits| limits.enabled)
+                })
+                .count();
+            if !matches!(control, PinControl::Request { .. })
+                || (enabled > 0
+                    && (selected.provider_mode != ProviderMode::All
+                        || enabled == selected.providers.len()))
+            {
+                None
+            } else if self.optional_control == OptionalPinControlMode::Warn {
+                policy
+                    .leases
+                    .retain(|intent| intent.source != LeaseSource::Manual);
+                Some(WarningCode::NoAvailableProvider)
+            } else {
+                return Err(invalid_request("manual pinning has no available provider"));
+            }
+        } else {
+            None
+        };
+        let effect = if warning.is_some() {
+            DecisionEffect::Skipped
+        } else if policy
+            .leases
+            .iter()
+            .any(|intent| intent.source == LeaseSource::Manual)
+        {
+            DecisionEffect::Accepted
+        } else {
+            DecisionEffect::NoIntent
+        };
+        let decision = ExtensionDecision::capture(
+            origin,
+            self.config_revision.clone(),
+            effect,
+            warning,
+            control,
+            &policy,
+        )
+        .map_err(invalid_request)?;
+        Ok((policy, decision))
     }
 
     pub fn evaluate_publication(
@@ -487,6 +593,467 @@ mod tests {
                     tags: &requested,
                     is_decompress_zip: false,
                 })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn warn_skips_unavailable_manual_group_but_never_invalid_controls() {
+        use crate::config::OptionalPinControlMode;
+        use crate::pinning::decision::{DecisionEffect, DecisionOrigin, WarningCode};
+        let validated =
+            ValidatedPinningConfig::from_raw(&PinningConfig::default(), |_| None).unwrap();
+        let evaluator = PinPolicyEvaluator::with_mode(&validated, OptionalPinControlMode::Warn);
+        let raw = tags(&[("ipfs-s3:pin", "true"), ("private", "sensitive")]);
+        let (policy, decision) = evaluator
+            .evaluate_publication_decision(
+                PublicationContext {
+                    bucket: "bucket",
+                    key: "secret",
+                    tags: &raw,
+                    is_decompress_zip: false,
+                },
+                DecisionOrigin::new("principal-1", "request-1"),
+            )
+            .unwrap();
+        assert_eq!(policy.tags, raw);
+        assert!(policy.leases.is_empty());
+        assert_eq!(decision.effect, DecisionEffect::Skipped);
+        assert_eq!(decision.warning, Some(WarningCode::NoMatchingPolicy));
+        let encoded = serde_json::to_string(&decision).unwrap();
+        assert!(!encoded.contains("sensitive"));
+        assert!(!encoded.contains("secret"));
+        for invalid in [
+            tags(&[("ipfs-s3:pin", "TRUE")]),
+            tags(&[("ipfs-s3:pin", "true"), ("ipfs-s3:duration", "0d")]),
+        ] {
+            assert!(
+                evaluator
+                    .evaluate_publication_decision(
+                        PublicationContext {
+                            bucket: "bucket",
+                            key: "key",
+                            tags: &invalid,
+                            is_decompress_zip: false
+                        },
+                        DecisionOrigin::new("principal-1", "request-2"),
+                    )
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn unavailable_manual_does_not_consume_automatic_intent_or_downgrade_all() {
+        use crate::{
+            config::OptionalPinControlMode,
+            pinning::decision::{DecisionEffect, DecisionOrigin, WarningCode},
+        };
+        let mut raw = PinningConfig {
+            providers: vec![
+                provider("alpha", 1),
+                ProviderConfig {
+                    enabled: false,
+                    ..provider("bravo", 2)
+                },
+            ],
+            policies: vec![rule(
+                "bucket",
+                "",
+                "always",
+                "one",
+                &["alpha", "bravo"],
+                "1d",
+                "30d",
+                false,
+            )],
+            ..PinningConfig::default()
+        };
+        let validated = ValidatedPinningConfig::from_raw(&raw, |_| None).unwrap();
+        let evaluator = PinPolicyEvaluator::with_mode(&validated, OptionalPinControlMode::Warn);
+        let requested = tags(&[("ipfs-s3:pin", "true")]);
+        let (policy, decision) = evaluator
+            .evaluate_publication_decision(
+                PublicationContext {
+                    bucket: "bucket",
+                    key: "object",
+                    tags: &requested,
+                    is_decompress_zip: false,
+                },
+                DecisionOrigin::new("principal", "request"),
+            )
+            .unwrap();
+        assert_eq!(decision.effect, DecisionEffect::Accepted);
+        assert_eq!(policy.leases.len(), 2);
+
+        // `all` may not silently shrink to the enabled provider. Automatic intent
+        // remains independent even when the manual group is skipped.
+        raw.policies[0].provider_mode = "all".into();
+        let validated = ValidatedPinningConfig::from_raw(&raw, |_| None).unwrap();
+        let evaluator = PinPolicyEvaluator::with_mode(&validated, OptionalPinControlMode::Warn);
+        let (policy, decision) = evaluator
+            .evaluate_publication_decision(
+                PublicationContext {
+                    bucket: "bucket",
+                    key: "object",
+                    tags: &requested,
+                    is_decompress_zip: false,
+                },
+                DecisionOrigin::new("principal", "request-2"),
+            )
+            .unwrap();
+        assert_eq!(decision.effect, DecisionEffect::Skipped);
+        assert_eq!(decision.warning, Some(WarningCode::NoAvailableProvider));
+        assert_eq!(policy.leases.len(), 1);
+        assert_eq!(policy.leases[0].source, LeaseSource::Automatic);
+        assert_eq!(policy.leases[0].providers, vec!["alpha", "bravo"]);
+    }
+
+    #[test]
+    fn warn_with_only_disabled_provider_is_explicit_but_strict_stays_invalid() {
+        use crate::{
+            config::{Config, OptionalPinControlMode},
+            pinning::decision::{DecisionEffect, DecisionOrigin, WarningCode},
+        };
+        let mut raw: Config = toml::from_str("[pinning_control]\nunavailable = 'warn'").unwrap();
+        raw.pinning.providers = vec![provider("disabled", 1)];
+        raw.pinning.providers[0].enabled = false;
+        raw.pinning.policies = vec![rule(
+            "bucket",
+            "",
+            "request",
+            "all",
+            &["disabled"],
+            "1d",
+            "30d",
+            false,
+        )];
+        assert!(ValidatedPinningConfig::from_raw(&raw.pinning, |_| None).is_err());
+        let validated = ValidatedPinningConfig::from_config(&raw, |_| None).unwrap();
+        let eval = PinPolicyEvaluator::with_mode(&validated, raw.pinning_control.unavailable);
+        let requested = tags(&[("ipfs-s3:pin", "true")]);
+        let (policy, decision) = eval
+            .evaluate_publication_decision(
+                PublicationContext {
+                    bucket: "bucket",
+                    key: "object",
+                    tags: &requested,
+                    is_decompress_zip: false,
+                },
+                DecisionOrigin::new("principal", "request"),
+            )
+            .unwrap();
+        assert_eq!(decision.effect, DecisionEffect::Skipped);
+        assert_eq!(decision.warning, Some(WarningCode::NoAvailableProvider));
+        assert!(policy.leases.is_empty());
+        // Captured skipped control stays skipped even if the deployment switches
+        // back to strict; no new pin work is created during completion.
+        assert!(
+            decision
+                .verify_revision(&validated, OptionalPinControlMode::Strict)
+                .is_ok()
+        );
+        raw.pinning.providers[0].enabled = true;
+        let changed = ValidatedPinningConfig::from_config(&raw, |_| None).unwrap();
+        assert!(
+            decision
+                .verify_revision(&changed, OptionalPinControlMode::Warn)
+                .is_ok()
+        );
+        assert_eq!(decision.effect, DecisionEffect::Skipped); // Never re-evaluate old tags.
+
+        let invalid = tags(&[("ipfs-s3:pin", "true"), ("ipfs-s3:duration", "31d")]);
+        assert!(
+            eval.evaluate_publication_decision(
+                PublicationContext {
+                    bucket: "bucket",
+                    key: "object",
+                    tags: &invalid,
+                    is_decompress_zip: false
+                },
+                DecisionOrigin::new("principal", "request-2"),
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn omitted_control_legacy_route_decides_and_publishes_without_managed_cleanup() {
+        use crate::{
+            config::{Config, OptionalPinControlMode},
+            pinning::decision::{DecisionEffect, DecisionOrigin},
+            store::{
+                self,
+                pinning::{
+                    ledger,
+                    publication::{
+                        DecidedPublish, PinTargetSpec, PublicationObject, PublicationRequest,
+                        publish_decided_object,
+                    },
+                },
+            },
+        };
+        use sea_orm::{Database, EntityTrait, PaginatorTrait};
+
+        let config: Config = toml::from_str(
+            r#"
+            [pinning]
+            [[pinning.providers]]
+            name = "remote"
+            kind = "pinata"
+            token_env = "LEGACY_PIN_TOKEN"
+            priority = 1
+            max_bytes = 1000
+            max_pins = 100
+            [[pinning.policies]]
+            bucket = "bucket"
+            trigger = "always"
+            provider_mode = "one"
+            providers = ["remote"]
+            default_duration = "1h"
+            max_duration = "24h"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.pinning_control.unavailable,
+            OptionalPinControlMode::Strict
+        );
+        let validated =
+            ValidatedPinningConfig::from_config(&config, |_| Some("token".into())).unwrap();
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        store::run_migrations(&db).await.unwrap();
+        store::bucket::create(&db, "bucket", None).await.unwrap();
+        ledger::register_route(&db, "remote", &validated.providers[0].identity)
+            .await
+            .unwrap();
+
+        let tags = tags(&[("ipfs-s3:pin", "true")]);
+        let (policy, decision) = PinPolicyEvaluator::new(&validated)
+            .evaluate_publication_decision(
+                PublicationContext {
+                    bucket: "bucket",
+                    key: "object",
+                    tags: &tags,
+                    is_decompress_zip: false,
+                },
+                DecisionOrigin::new("principal", "request"),
+            )
+            .unwrap();
+        assert_eq!(decision.effect, DecisionEffect::Accepted);
+        assert_eq!(
+            policy
+                .leases
+                .iter()
+                .map(|lease| lease.source)
+                .collect::<Vec<_>>(),
+            vec![LeaseSource::Automatic, LeaseSource::Manual]
+        );
+        let object = PublicationObject::from_put(
+            "object-id".into(),
+            "bucket",
+            "object",
+            "bafy-legacy".into(),
+            7,
+            None,
+            None,
+            false,
+            None,
+            None,
+            Utc::now(),
+        );
+        publish_decided_object(
+            &db,
+            PublicationRequest {
+                object,
+                tags,
+                policy,
+                object_target: PinTargetSpec {
+                    cid: "bafy-legacy".into(),
+                    logical_size: 7,
+                },
+            },
+            DecidedPublish {
+                decision: &decision,
+                config: &validated,
+                mode: OptionalPinControlMode::Strict,
+                limits: &validated.provider_limits,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            store::entities::pin_lease::Entity::find()
+                .count(&db)
+                .await
+                .unwrap(),
+            2
+        );
+        let remote = ledger::get(&db, "remote", "bafy-legacy")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(remote.ownership, "unknown");
+        assert!(
+            !ledger::cleanup_allowed(&db, "remote", "bafy-legacy")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn legacy_custom_route_capture_preserves_local_intent_but_never_cross_replays() {
+        use crate::{
+            config::OptionalPinControlMode,
+            pinning::decision::{DecisionEffect, DecisionOrigin},
+        };
+        let mut remote = provider("remote", 1);
+        remote.kind = "pinata".into();
+        remote.token_env = Some("PINNING_TOKEN".into());
+        remote.endpoint = Some("https://remote.example.test/secret-in-path".into());
+        let raw = PinningConfig {
+            providers: vec![remote],
+            policies: vec![rule(
+                "bucket",
+                "",
+                "request",
+                "one",
+                &["remote"],
+                "1d",
+                "30d",
+                false,
+            )],
+            ..PinningConfig::default()
+        };
+        let secret = "test-secret-not-in-snapshot";
+        let validated =
+            ValidatedPinningConfig::from_raw(&raw, |_| Some(secret.to_owned())).unwrap();
+        let evaluator = PinPolicyEvaluator::with_mode(&validated, OptionalPinControlMode::Warn);
+        let requested = tags(&[("ipfs-s3:pin", "true")]);
+        let (policy, accepted) = evaluator
+            .evaluate_publication_decision(
+                PublicationContext {
+                    bucket: "bucket",
+                    key: "object",
+                    tags: &requested,
+                    is_decompress_zip: false,
+                },
+                DecisionOrigin::new("principal", "request"),
+            )
+            .unwrap();
+        assert_eq!(accepted.effect, DecisionEffect::Accepted);
+        assert_eq!(policy.leases.len(), 1);
+        assert!(
+            accepted
+                .verify_revision(&validated, OptionalPinControlMode::Warn)
+                .is_ok()
+        );
+        assert!(
+            accepted
+                .verify_revision(&validated.clone(), OptionalPinControlMode::Warn)
+                .is_ok()
+        );
+        // A process-local keyed route binding proves an unchanged reload while
+        // rejecting a different endpoint without exposing the URL or token.
+        let reloaded = ValidatedPinningConfig::from_raw(&raw, |_| Some(secret.to_owned())).unwrap();
+        assert!(
+            accepted
+                .verify_revision(&reloaded, OptionalPinControlMode::Warn)
+                .is_ok()
+        );
+        let mut changed = raw.clone();
+        changed.providers[0].endpoint = Some("https://other.example.test/secret-in-path".into());
+        let changed =
+            ValidatedPinningConfig::from_raw(&changed, |_| Some(secret.to_owned())).unwrap();
+        assert!(
+            accepted
+                .verify_revision(&changed, OptionalPinControlMode::Warn)
+                .is_err()
+        );
+        let encoded = serde_json::to_string(&accepted).unwrap();
+        assert!(!encoded.contains(secret));
+        assert!(!encoded.contains("secret-in-path"));
+        let (_, skipped) = evaluator
+            .evaluate_publication_decision(
+                PublicationContext {
+                    bucket: "other",
+                    key: "object",
+                    tags: &requested,
+                    is_decompress_zip: false,
+                },
+                DecisionOrigin::new("principal", "other-request"),
+            )
+            .unwrap();
+        assert!(!serde_json::to_string(&skipped).unwrap().contains(secret));
+    }
+
+    #[test]
+    fn strict_legacy_default_endpoint_is_stable_but_switching_endpoint_is_not() {
+        use crate::{config::OptionalPinControlMode, pinning::decision::DecisionOrigin};
+        let mut remote = provider("remote", 1);
+        remote.kind = "pinata".into();
+        remote.token_env = Some("PINNING_TOKEN".into());
+        remote.endpoint = None;
+        let mut raw = PinningConfig {
+            providers: vec![remote],
+            policies: vec![rule(
+                "bucket",
+                "",
+                "request",
+                "one",
+                &["remote"],
+                "1d",
+                "30d",
+                false,
+            )],
+            ..PinningConfig::default()
+        };
+        let original = ValidatedPinningConfig::from_raw(&raw, |_| Some("token".into())).unwrap();
+        let tags = tags(&[("ipfs-s3:pin", "true")]);
+        let (_, captured) = PinPolicyEvaluator::new(&original)
+            .evaluate_publication_decision(
+                PublicationContext {
+                    bucket: "bucket",
+                    key: "object",
+                    tags: &tags,
+                    is_decompress_zip: false,
+                },
+                DecisionOrigin::new("principal", "request"),
+            )
+            .unwrap();
+        let same = ValidatedPinningConfig::from_raw(&raw, |_| Some("token".into())).unwrap();
+        assert!(
+            captured
+                .verify_revision(&same, OptionalPinControlMode::Strict)
+                .is_ok()
+        );
+        let rotated_token =
+            ValidatedPinningConfig::from_raw(&raw, |_| Some("different-token".into())).unwrap();
+        assert!(
+            captured
+                .verify_revision(&rotated_token, OptionalPinControlMode::Strict)
+                .is_err()
+        );
+        raw.providers[0].endpoint = Some("https://other.example.test/v3".into());
+        let changed = ValidatedPinningConfig::from_raw(&raw, |_| Some("token".into())).unwrap();
+        assert!(
+            captured
+                .verify_revision(&changed, OptionalPinControlMode::Strict)
+                .is_err()
+        );
+        let no_policy =
+            ValidatedPinningConfig::from_raw(&PinningConfig::default(), |_| None).unwrap();
+        assert!(
+            PinPolicyEvaluator::new(&no_policy)
+                .evaluate_publication_decision(
+                    PublicationContext {
+                        bucket: "bucket",
+                        key: "object",
+                        tags: &tags,
+                        is_decompress_zip: false
+                    },
+                    DecisionOrigin::new("principal", "strict-no-policy"),
+                )
                 .is_err()
         );
     }

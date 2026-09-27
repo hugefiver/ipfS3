@@ -67,14 +67,15 @@ mod tests {
         },
     };
 
+    use axum::error_handling::HandleError;
     use http::StatusCode;
     use s3s::service::S3ServiceBuilder;
     use sea_orm::{Database, EntityTrait, PaginatorTrait};
-    use tower::ServiceExt as _;
 
     use super::*;
     use crate::{
         import::{ImportConfig, downloader::SourceDownloader},
+        s3::sigv4,
         store::Store,
     };
 
@@ -90,7 +91,7 @@ mod tests {
             kubo: crate::kubo::KuboClient::new("http://127.0.0.1:1".to_owned()),
             cold_kubo: None,
             store: Store::new(db),
-            credentials: HashMap::new(),
+            credentials: HashMap::from([("test".to_owned(), s3s::auth::SecretKey::from("test"))]),
             master_key: crate::crypto::key::MasterKey::from_hex(&"0".repeat(64)).unwrap(),
             pinning: crate::pinning::coordinator::PinningCoordinator::disabled_for_test(),
         });
@@ -140,28 +141,40 @@ mod tests {
 
     async fn call_through_s3_service(
         method: Method,
-        uri: &str,
+        key: &str,
+        query: &[(&str, &str)],
         headers: HeaderMap,
-        body: axum::body::Body,
+        body: Vec<u8>,
         allow_access: bool,
     ) -> (StatusCode, usize, usize, Arc<AppState>) {
         let (gateway, state) = gateway_and_state().await;
         let access_checks = Arc::new(AtomicUsize::new(0));
         let dispatches = Arc::new(AtomicUsize::new(0));
         let mut builder = S3ServiceBuilder::new(crate::s3::handler::S3Impl::new(state.clone()));
+        builder.set_auth(crate::auth::GatewayAuth::new(state.clone()));
         builder.set_route(ObservedGatewayRoute {
             gateway,
             access_checks: access_checks.clone(),
             dispatches: dispatches.clone(),
             allow_access,
         });
-        let mut request = http::Request::builder()
-            .method(method)
-            .uri(uri)
-            .body(body)
-            .unwrap();
-        *request.headers_mut() = headers;
-        let response = builder.build().oneshot(request).await.unwrap();
+        let app = axum::Router::new().fallback_service(HandleError::new(
+            builder.build(),
+            |_: s3s::HttpError| async {
+                http::Response::builder()
+                    .status(500)
+                    .body(s3s::Body::from("error".to_owned()))
+                    .unwrap()
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let response = sigv4::send_sigv4(
+            method, &endpoint, "bucket", key, query, body, headers, "test",
+        )
+        .await;
+        server.abort();
         (
             response.status(),
             access_checks.load(Ordering::SeqCst),
@@ -251,11 +264,10 @@ mod tests {
         );
         let (status, access_checks, dispatches, _) = call_through_s3_service(
             Method::POST,
-            "/bucket/key?ipfs3-import",
+            "key",
+            &[("ipfs3-import", "")],
             import_headers,
-            axum::body::Body::from(format!(
-                "<IPFS3ImportRequest><CID>{CID}</CID></IPFS3ImportRequest>"
-            )),
+            format!("<IPFS3ImportRequest><CID>{CID}</CID></IPFS3ImportRequest>").into_bytes(),
             true,
         )
         .await;
@@ -270,9 +282,10 @@ mod tests {
         );
         let (status, access_checks, dispatches, _) = call_through_s3_service(
             Method::PUT,
-            "/bucket/archive.zip?decompress-zip=prefix%2F",
+            "archive.zip",
+            &[("decompress-zip", "prefix/")],
             decompress_headers,
-            axum::body::Body::from("archive bytes".to_owned()),
+            b"archive bytes".to_vec(),
             true,
         )
         .await;
@@ -282,9 +295,10 @@ mod tests {
 
         let (status, access_checks, dispatches, _) = call_through_s3_service(
             Method::GET,
-            "/bucket?list-type=2",
+            "",
+            &[("list-type", "2")],
             HeaderMap::new(),
-            axum::body::Body::empty(),
+            Vec::new(),
             true,
         )
         .await;
@@ -302,9 +316,10 @@ mod tests {
         );
         let (status, access_checks, dispatches, state) = call_through_s3_service(
             Method::POST,
-            "/bucket/key?ipfs3-import",
+            "key",
+            &[("ipfs3-import", "")],
             headers,
-            axum::body::Body::from("must not be parsed".to_owned()),
+            b"must not be parsed".to_vec(),
             false,
         )
         .await;

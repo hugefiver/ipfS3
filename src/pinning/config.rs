@@ -4,10 +4,11 @@ use std::{
 };
 
 use anyhow::{anyhow, bail};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    config::{Config, PinningConfig, PolicyConfig, ProviderConfig},
+    config::{Config, OptionalPinControlMode, PinningConfig, PolicyConfig, ProviderConfig},
     pinning::identity::{PinningIdentityConfig, ProviderIdentity, validate_storage_domain},
 };
 
@@ -91,7 +92,8 @@ impl PolicyTrigger {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ProviderMode {
     One,
     All,
@@ -114,7 +116,7 @@ impl ProviderMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct LeaseDuration(u64);
 
 impl LeaseDuration {
@@ -253,19 +255,25 @@ impl ValidatedPinningConfig {
     where
         F: Fn(&str) -> Option<String>,
     {
-        Self::from_parts(raw, None, get_env)
+        Self::from_parts(raw, None, OptionalPinControlMode::Strict, get_env)
     }
 
     pub fn from_config<F>(config: &Config, get_env: F) -> anyhow::Result<Self>
     where
         F: Fn(&str) -> Option<String>,
     {
-        Self::from_parts(&config.pinning, Some(&config.pinning_identity), get_env)
+        Self::from_parts(
+            &config.pinning,
+            Some(&config.pinning_identity),
+            config.pinning_control.unavailable,
+            get_env,
+        )
     }
 
     fn from_parts<F>(
         raw: &PinningConfig,
         identity_config: Option<&PinningIdentityConfig>,
+        optional_control: OptionalPinControlMode,
         get_env: F,
     ) -> anyhow::Result<Self>
     where
@@ -303,7 +311,9 @@ impl ValidatedPinningConfig {
             .policies
             .iter()
             .enumerate()
-            .map(|(index, policy)| Self::validate_policy(index, policy, &provider_limits))
+            .map(|(index, policy)| {
+                Self::validate_policy(index, policy, &provider_limits, optional_control)
+            })
             .collect::<anyhow::Result<Vec<_>>>()?;
 
         Ok(Self {
@@ -477,6 +487,7 @@ impl ValidatedPinningConfig {
         index: usize,
         policy: &PolicyConfig,
         provider_limits: &ProviderLimitMap,
+        optional_control: OptionalPinControlMode,
     ) -> anyhow::Result<ValidatedPolicy> {
         if policy.bucket.is_empty() || (policy.bucket.contains('*') && policy.bucket != "*") {
             bail!("policy bucket must be a non-empty exact name or `*`");
@@ -526,6 +537,8 @@ impl ValidatedPinningConfig {
         if !providers
             .iter()
             .any(|provider_name| provider_limits[provider_name].enabled)
+            && !(optional_control == OptionalPinControlMode::Warn
+                && trigger == PolicyTrigger::Request)
         {
             bail!(
                 "policy `{}` must reference at least one enabled provider",

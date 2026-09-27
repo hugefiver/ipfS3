@@ -215,6 +215,373 @@ async fn setup() -> DatabaseConnection {
     db
 }
 
+#[tokio::test]
+async fn decided_publication_binds_skipped_snapshot_to_exact_version_atomically() {
+    use crate::config::OptionalPinControlMode;
+    use crate::pinning::{
+        config::ValidatedPinningConfig,
+        decision::{DecisionEffect, DecisionOrigin},
+        policy::{PinPolicyEvaluator, PublicationContext},
+    };
+    let db = setup().await;
+    set_versioning(&db, BucketVersioningState::Enabled).await;
+    let config =
+        ValidatedPinningConfig::from_raw(&crate::config::PinningConfig::default(), |_| None)
+            .unwrap();
+    let evaluator = PinPolicyEvaluator::with_mode(&config, OptionalPinControlMode::Warn);
+    let tags = vec![
+        tag("ipfs-s3:pin", "true"),
+        tag("opaque-user-tag", "private-value"),
+    ];
+    let (policy, decision) = evaluator
+        .evaluate_publication_decision(
+            PublicationContext {
+                bucket: "bucket",
+                key: "key",
+                tags: &tags,
+                is_decompress_zip: false,
+            },
+            DecisionOrigin::new("principal-1", "request-1"),
+        )
+        .unwrap();
+    let mut publication = request(
+        object("decided-id", "key", "bafy-decided", 7),
+        tags.clone(),
+        vec![],
+    );
+    publication.policy = policy;
+    let result = publish_decided_object(
+        &db,
+        publication,
+        DecidedPublish {
+            decision: &decision,
+            config: &config,
+            mode: OptionalPinControlMode::Warn,
+            limits: &limits(),
+        },
+    )
+    .await
+    .unwrap();
+    let version = versions_for(&db, "key").await.remove(0);
+    assert_eq!(
+        version.object_id.as_deref(),
+        Some(result.object_id.as_str())
+    );
+    let persisted = crate::store::pinning::decision::read_for_version(&db, &version.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted, decision);
+    assert_eq!(persisted.effect, DecisionEffect::Skipped);
+    let raw = serde_json::to_string(&persisted).unwrap();
+    assert!(!raw.contains("private-value"));
+    assert_eq!(pin_lease::Entity::find().count(&db).await.unwrap(), 0);
+    assert_eq!(pin_job::Entity::find().count(&db).await.unwrap(), 0);
+    assert!(
+        decision
+            .replay_policy(vec![tag("ipfs-s3:pin", "false")])
+            .is_err()
+    );
+
+    let mut wrong_upload = request(
+        object("wrong-upload", "key", "bafy-other", 7),
+        tags.clone(),
+        vec![],
+    );
+    wrong_upload.policy = decision.replay_policy(tags.clone()).unwrap();
+    let target = MultipartUploadTargetIdentity {
+        bucket: "bucket".into(),
+        key: "key".into(),
+        upload_id: "different-upload".into(),
+        initiated_at: Utc::now(),
+    };
+    assert!(matches!(
+        publish_decided_completed_upload(
+            &db,
+            &target,
+            wrong_upload,
+            None,
+            DecidedPublish {
+                decision: &decision,
+                config: &config,
+                mode: OptionalPinControlMode::Warn,
+                limits: &limits()
+            },
+        )
+        .await,
+        Err(CommitCompletedUploadError::RolledBack { .. })
+    ));
+
+    // Reusing the captured control revision for a second version fails *after*
+    // inserting the object/version: the entire transaction must roll back.
+    let mut bad = request(
+        object("rolled-back", "other", "bafy-other", 7),
+        tags,
+        vec![],
+    );
+    bad.policy = crate::pinning::policy::PublicationPolicy {
+        tags: bad.tags.clone(),
+        leases: vec![],
+    };
+    assert!(
+        publish_decided_object(
+            &db,
+            bad,
+            DecidedPublish {
+                decision: &decision,
+                config: &config,
+                mode: OptionalPinControlMode::Warn,
+                limits: &limits(),
+            }
+        )
+        .await
+        .is_err()
+    );
+    assert!(versions_for(&db, "other").await.is_empty());
+    assert!(
+        object::Entity::find_by_id("rolled-back")
+            .one(&db)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn captured_skip_never_becomes_a_new_pin_when_provider_is_added() {
+    use crate::config::{OptionalPinControlMode, PinningConfig, PolicyConfig, ProviderConfig};
+    use crate::pinning::{
+        config::ValidatedPinningConfig,
+        decision::DecisionOrigin,
+        policy::{PinPolicyEvaluator, PublicationContext},
+    };
+    let db = setup().await;
+    let first = ValidatedPinningConfig::from_raw(&PinningConfig::default(), |_| None).unwrap();
+    let tags = vec![tag("ipfs-s3:pin", "true")];
+    let (_, captured) = PinPolicyEvaluator::with_mode(&first, OptionalPinControlMode::Warn)
+        .evaluate_publication_decision(
+            PublicationContext {
+                bucket: "bucket",
+                key: "late",
+                tags: &tags,
+                is_decompress_zip: false,
+            },
+            DecisionOrigin::new("principal", "initial-request"),
+        )
+        .unwrap();
+    let configured = PinningConfig {
+        providers: vec![ProviderConfig {
+            name: "pinata".into(),
+            kind: "noop".into(),
+            token_env: None,
+            endpoint: None,
+            api: None,
+            strategy: None,
+            upload_endpoint: None,
+            enabled: true,
+            priority: 1,
+            max_bytes: 1_000,
+            max_pins: 100,
+            requests_per_second: None,
+        }],
+        policies: vec![PolicyConfig {
+            bucket: "bucket".into(),
+            prefix: String::new(),
+            trigger: "request".into(),
+            provider_mode: "one".into(),
+            providers: vec!["pinata".into()],
+            default_duration: "1h".into(),
+            max_duration: "24h".into(),
+            allow_decompressed: false,
+        }],
+        ..PinningConfig::default()
+    };
+    let after = ValidatedPinningConfig::from_raw(&configured, |_| None).unwrap();
+    super::super::ledger::register_route(&db, "pinata", &after.providers[0].identity)
+        .await
+        .unwrap();
+    let policy = captured.replay_policy(tags.clone()).unwrap();
+    let mut publication = request(object("late-id", "late", "bafy-late", 7), tags, vec![]);
+    publication.policy = policy;
+    publish_decided_object(
+        &db,
+        publication,
+        DecidedPublish {
+            decision: &captured,
+            config: &after,
+            mode: OptionalPinControlMode::Warn,
+            limits: &limits(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(pin_lease::Entity::find().count(&db).await.unwrap(), 0);
+    assert_eq!(pin_job::Entity::find().count(&db).await.unwrap(), 0);
+
+    let tags = vec![tag("ipfs-s3:pin", "true")];
+    let (accepted_policy, accepted) =
+        PinPolicyEvaluator::with_mode(&after, OptionalPinControlMode::Warn)
+            .evaluate_publication_decision(
+                PublicationContext {
+                    bucket: "bucket",
+                    key: "other",
+                    tags: &tags,
+                    is_decompress_zip: false,
+                },
+                DecisionOrigin::new("principal", "second-request"),
+            )
+            .unwrap();
+    let mut publication = request(
+        object("accepted-id", "other", "bafy-accepted", 7),
+        tags,
+        vec![],
+    );
+    publication.policy = accepted_policy;
+    publish_decided_object(
+        &db,
+        publication.clone(),
+        DecidedPublish {
+            decision: &accepted,
+            config: &after,
+            mode: OptionalPinControlMode::Warn,
+            limits: &limits(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(pin_lease::Entity::find().count(&db).await.unwrap(), 1);
+    let version = versions_for(&db, "other").await.remove(0);
+    assert_eq!(
+        crate::store::pinning::decision::read_for_version(&db, &version.id)
+            .await
+            .unwrap(),
+        Some(accepted.clone())
+    );
+    let mut attempted = publication;
+    attempted.object.id = "drift-attempt".into();
+    attempted.object.key = "drift".into();
+    let mut changed_config = configured;
+    changed_config.providers[0].priority = 2;
+    let changed = ValidatedPinningConfig::from_raw(&changed_config, |_| None).unwrap();
+    let error = publish_decided_object(
+        &db,
+        attempted,
+        DecidedPublish {
+            decision: &accepted,
+            config: &changed,
+            mode: OptionalPinControlMode::Warn,
+            limits: &limits(),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("revision"));
+    assert!(versions_for(&db, "drift").await.is_empty());
+}
+
+#[tokio::test]
+async fn strict_legacy_provider_capture_publishes_automatic_and_manual_intents() {
+    use crate::config::{Config, OptionalPinControlMode};
+    use crate::pinning::{
+        config::ValidatedPinningConfig,
+        decision::{DecisionEffect, DecisionOrigin},
+        policy::{PinPolicyEvaluator, PublicationContext},
+    };
+
+    let db = setup().await;
+    let config: Config = toml::from_str(
+        r#"
+        [pinning]
+        [[pinning.providers]]
+        name = "pinata"
+        kind = "pinata"
+        token_env = "LEGACY_PIN_TOKEN"
+        priority = 1
+        max_bytes = 1000
+        max_pins = 100
+        [[pinning.policies]]
+        bucket = "bucket"
+        trigger = "always"
+        provider_mode = "one"
+        providers = ["pinata"]
+        default_duration = "1h"
+        max_duration = "24h"
+        "#,
+    )
+    .unwrap();
+    assert_eq!(
+        config.pinning_control.unavailable,
+        OptionalPinControlMode::Strict
+    );
+    let validated =
+        ValidatedPinningConfig::from_config(&config, |_| Some("do-not-persist-me".into())).unwrap();
+    super::super::ledger::register_route(&db, "pinata", &validated.providers[0].identity)
+        .await
+        .unwrap();
+    let tags = vec![tag("ipfs-s3:pin", "true")];
+    let (policy, decision) = PinPolicyEvaluator::new(&validated)
+        .evaluate_publication_decision(
+            PublicationContext {
+                bucket: "bucket",
+                key: "legacy",
+                tags: &tags,
+                is_decompress_zip: false,
+            },
+            DecisionOrigin::new("principal", "legacy-request"),
+        )
+        .unwrap();
+    assert_eq!(decision.effect, DecisionEffect::Accepted);
+    assert_eq!(
+        policy
+            .leases
+            .iter()
+            .map(|lease| lease.source)
+            .collect::<Vec<_>>(),
+        vec![LeaseSource::Automatic, LeaseSource::Manual]
+    );
+    assert!(
+        !serde_json::to_string(&decision)
+            .unwrap()
+            .contains("do-not-persist-me")
+    );
+    let mut publication = request(
+        object("legacy-id", "legacy", "bafy-legacy", 7),
+        tags.clone(),
+        Vec::new(),
+    );
+    publication.policy = decision.replay_policy(tags).unwrap();
+    publish_decided_object(
+        &db,
+        publication,
+        DecidedPublish {
+            decision: &decision,
+            config: &validated,
+            mode: OptionalPinControlMode::Strict,
+            limits: &limits(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(pin_lease::Entity::find().count(&db).await.unwrap(), 2);
+    let remote = super::super::ledger::get(&db, "pinata", "bafy-legacy")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(remote.ownership, "unknown");
+    assert!(
+        !super::super::ledger::cleanup_allowed(&db, "pinata", "bafy-legacy")
+            .await
+            .unwrap()
+    );
+    let version = versions_for(&db, "legacy").await.remove(0);
+    assert_eq!(
+        crate::store::pinning::decision::read_for_version(&db, &version.id)
+            .await
+            .unwrap(),
+        Some(decision)
+    );
+}
+
 async fn setup_file_backed(name: &str) -> (tempfile::TempDir, DatabaseConnection) {
     let directory = tempfile::tempdir().unwrap();
     let database_path = directory.path().join(name);
@@ -3809,6 +4176,7 @@ async fn completed_publication_winner_removes_the_exact_upload() {
         None,
         None,
         &limits(),
+        None,
     )
     .await
     .unwrap();

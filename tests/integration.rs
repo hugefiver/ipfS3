@@ -3439,7 +3439,9 @@ async fn assert_publication_matrix_pinning(
             .iter()
             .any(|job| job.lease_id.as_deref() == Some(current.id.as_str()))
     );
-    let usage = harness.provider_usage("pinata-primary").await;
+    let usage = harness
+        .provider_usage(&harness.provider_key("pinata-primary"))
+        .await;
     assert!(usage.reserved_pins > 0);
     assert!(usage.reserved_bytes > 0);
 
@@ -3735,7 +3737,7 @@ async fn versioning_publication_path_copy() {
 }
 
 async fn versioning_publication_path_multipart() {
-    let config = matrix_pinning_config(
+    let mut config = matrix_pinning_config(
         [
             "QmMultipartUBase",
             "QmMultipartUPart",
@@ -3757,6 +3759,7 @@ async fn versioning_publication_path_multipart() {
             ("QmMultipartSPart".to_owned(), b"multipart S".to_vec()),
         ]),
     );
+    config.explicit_identity = true;
     let harness = start_pinning_harness(config).await;
     for (matrix_state, part_body, expected_cid) in [
         (
@@ -4213,7 +4216,7 @@ async fn versioning_publication_path_multipart_zip() {
         "QmMultipartZipSRoot",
         "QmMultipartZipSEntry",
     ];
-    let config = matrix_pinning_config(
+    let mut config = matrix_pinning_config(
         add_cids.into_iter().map(AddReply::Ok).collect(),
         HashMap::from([
             ("QmMultipartZipUPart".to_owned(), archive.clone()),
@@ -4224,6 +4227,7 @@ async fn versioning_publication_path_multipart_zip() {
             ("QmMultipartZipSRoot".to_owned(), archive.clone()),
         ]),
     );
+    config.explicit_identity = true;
     let harness = start_pinning_harness(config).await;
     for (matrix_state, root_cid, entry_cid) in [
         (
@@ -4585,11 +4589,59 @@ async fn remote_pin(
     provider: &str,
     cid: &str,
 ) -> store::entities::remote_pin::Model {
-    store::entities::remote_pin::Entity::find_by_id((provider.to_owned(), cid.to_owned()))
-        .one(harness.state.store.db())
+    store::entities::remote_pin::Entity::find_by_id((
+        harness.provider_key(provider),
+        cid.to_owned(),
+    ))
+    .one(harness.state.store.db())
+    .await
+    .expect("load remote pin")
+    .expect("remote pin exists")
+}
+
+async fn assert_unknown_psa_resource(
+    harness: &PinningHarness,
+    provider: &str,
+    cid: &str,
+    effect: &str,
+) {
+    let key = harness.provider_key(provider);
+    let ledger = store::pinning::ledger::get(harness.state.store.db(), &key, cid)
         .await
-        .expect("load remote pin")
-        .expect("remote pin exists")
+        .expect("load PSA ledger")
+        .expect("PSA ledger exists");
+    assert_eq!(
+        ledger.ownership, "unknown",
+        "PSA response is not creation proof"
+    );
+    assert_eq!(ledger.effect, effect);
+    assert_eq!(
+        store::pinning::ledger::decode_route(&ledger)
+            .expect("registered PSA route")
+            .cleanup,
+        ipfs_s3_gateway::pinning::identity::CleanupMode::Managed,
+        "managed route alone cannot prove exclusive creation"
+    );
+    assert!(
+        !store::pinning::ledger::cleanup_allowed(harness.state.store.db(), &key, cid)
+            .await
+            .expect("cleanup eligibility"),
+        "managed route alone cannot authorize DELETE"
+    );
+}
+
+async fn assert_no_psa_delete(harness: &PinningHarness) {
+    let requests = harness.provider_requests().await;
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.method != http::Method::DELETE),
+        "unknown PSA resource must not be deleted: {:?}",
+        requests
+            .iter()
+            .map(|r| (&r.method, &r.path))
+            .collect::<Vec<_>>()
+    );
 }
 
 async fn assert_no_kubo_pin_removes(harness: &PinningHarness) {
@@ -4629,21 +4681,47 @@ fn assert_submit_request_for_job(
 ) {
     assert_submit_request(request, expected_path, expected_cid);
     let body: serde_json::Value = serde_json::from_slice(&request.body).expect("PSA submit JSON");
+    let correlation = body
+        .pointer("/meta/gateway_job_id")
+        .and_then(serde_json::Value::as_str)
+        .expect("opaque submit correlation");
+    uuid::Uuid::parse_str(correlation).expect("new submit correlation must be a UUID");
+    assert_ne!(correlation, job.id);
     assert_eq!(
-        body.pointer("/meta/gateway_job_id")
-            .and_then(serde_json::Value::as_str),
-        Some(job.id.as_str())
+        body["meta"],
+        serde_json::json!({ "gateway_job_id": correlation })
     );
+    assert_eq!(body["name"], correlation);
+}
+
+async fn captured_submit_correlation(harness: &PinningHarness, job_id: &str) -> String {
+    store::pinning::jobs::submission_history(harness.state.store.db(), job_id)
+        .await
+        .expect("submit history")
+        .expect("submit invocation history")
+        .correlation
+        .expect("new invocation captured its correlation")
+}
+
+async fn submitted_job_id_for_correlation(harness: &PinningHarness, correlation: &str) -> String {
+    uuid::Uuid::parse_str(correlation).expect("opaque submit correlation");
+    let mut matching = Vec::new();
+    for job in harness.pin_jobs().await {
+        if job.operation == "submit"
+            && store::pinning::jobs::submission_history(harness.state.store.db(), &job.id)
+                .await
+                .expect("submit history")
+                .is_some_and(|history| history.correlation.as_deref() == Some(correlation))
+        {
+            matching.push(job.id);
+        }
+    }
     assert_eq!(
-        body.pointer("/meta/gateway_lease_id")
-            .and_then(serde_json::Value::as_str),
-        job.lease_id.as_deref()
+        matching.len(),
+        1,
+        "one captured Submit owns the correlation"
     );
-    assert_eq!(
-        body.pointer("/meta/gateway_target_id")
-            .and_then(serde_json::Value::as_str),
-        job.target_id.as_deref()
-    );
+    matching.remove(0)
 }
 
 fn assert_find_request_for_job(
@@ -4667,15 +4745,6 @@ fn assert_find_request_for_job(
                 serde_json::json!({ "gateway_job_id": job_id }).to_string(),
             ),
         ]
-    );
-}
-
-fn assert_delete_request(request: &support::pinning::ObservedPsaRequest, expected_path: &str) {
-    assert_eq!(request.method, http::Method::DELETE);
-    assert_eq!(request.path, expected_path);
-    assert!(
-        request.has_valid_authorization(),
-        "PSA DELETE authorization"
     );
 }
 
@@ -5250,8 +5319,38 @@ async fn test_pinning_copy_copies_or_replaces_tags_and_reuses_cid_usage() {
 }
 
 #[tokio::test]
+async fn test_pinning_multipart_requires_explicit_remote_identity_before_publication() {
+    let mut config = PinningHarnessConfig::request_one();
+    config.pinata_script.clear();
+    let harness = start_pinning_harness(config).await;
+    let create = signed_create_multipart_upload_with_tagging(
+        &harness,
+        "legacy-identity.bin",
+        "ipfs-s3%3Apin=true",
+    )
+    .await;
+    assert_eq!(create.status(), StatusCode::BAD_REQUEST);
+    let body = create.text().await.expect("S3 error XML");
+    assert_eq!(xml_element_values(&body, "Code"), vec!["InvalidArgument"]);
+    assert!(body.contains("explicit provider identity and revisions"));
+    assert_eq!(
+        store::entities::multipart_upload::Entity::find()
+            .count(harness.state.store.db())
+            .await
+            .expect("count multipart uploads"),
+        0
+    );
+    assert!(harness.pin_leases().await.is_empty());
+    assert!(harness.pin_jobs().await.is_empty());
+    assert!(harness.provider_requests().await.is_empty());
+    assert_no_kubo_pin_removes(&harness).await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn test_pinning_multipart_create_tags_apply_only_to_completed_root() {
     let mut config = PinningHarnessConfig::request_one();
+    config.explicit_identity = true;
     config.kubo_script = KuboScript {
         add_replies: vec![AddReply::Ok("QmPart"), AddReply::Ok("QmRoot")],
         cat_bodies: HashMap::from([
@@ -5354,7 +5453,11 @@ async fn test_pinning_multipart_create_tags_apply_only_to_completed_root() {
                 )
             })
             .collect::<Vec<_>>(),
-        vec![("pinata-primary", "QmRoot", "waiting")]
+        vec![(
+            harness.provider_key("pinata-primary").as_str(),
+            "QmRoot",
+            "waiting"
+        )]
     );
     assert_eq!(
         harness
@@ -5376,7 +5479,7 @@ async fn test_pinning_multipart_create_tags_apply_only_to_completed_root() {
                 usage.reserved_pins
             ))
             .collect::<Vec<_>>(),
-        vec![("pinata-primary", 9, 1)]
+        vec![(harness.provider_key("pinata-primary").as_str(), 9, 1)]
     );
 
     harness.run_worker_until_idle().await;
@@ -5656,7 +5759,7 @@ async fn test_pinning_put_tagging_renews_idempotently_and_delete_tagging_cancels
 }
 
 #[tokio::test]
-async fn test_pinning_put_tagging_rejects_expired_lease_after_confirmed_release() {
+async fn test_pinning_put_tagging_reactivates_expired_lease_with_unknown_resource_retained() {
     let archive_bytes = legal_single_entry_zip();
     let mut config = PinningHarnessConfig::request_one();
     config.kubo_script = KuboScript {
@@ -5666,14 +5769,11 @@ async fn test_pinning_put_tagging_rejects_expired_lease_after_confirmed_release(
             ("QmEntry".to_owned(), SINGLE_ENTRY_BYTES.to_vec()),
         ]),
     };
-    config.pinata_script = vec![
-        PsaReply::pinned_submit("/psa/pins", "pinata-entry-request", "QmEntry"),
-        PsaReply::empty(
-            http::Method::DELETE,
-            "/psa/pins/pinata-entry-request",
-            StatusCode::NO_CONTENT.as_u16(),
-        ),
-    ];
+    config.pinata_script = vec![PsaReply::pinned_submit(
+        "/psa/pins",
+        "pinata-entry-request",
+        "QmEntry",
+    )];
     let mut harness = start_pinning_harness(config).await;
 
     let put = signed_decompress_zip_put(
@@ -5755,10 +5855,8 @@ async fn test_pinning_put_tagging_rejects_expired_lease_after_confirmed_release(
     assert_submit_request(&submit[0], "/psa/pins", "QmEntry");
 
     harness.advance_past_lease_expiry("archive.zip").await;
-    let delete_block = harness.block_next_delete("pinata-primary").await;
     harness.restart_worker();
-    delete_block.wait_until_blocked().await;
-    delete_block.release();
+    harness.wait_for_lease_state("archive.zip", "expired").await;
     harness.wait_for_worker_idle().await;
     harness.stop_worker_without_unlocking().await;
     let expired = owner_leases(&harness, &archive.id).await.remove(0);
@@ -5799,20 +5897,18 @@ async fn test_pinning_put_tagging_rejects_expired_lease_after_confirmed_release(
             released_remote.request_id.as_deref(),
             released_remote.epoch,
         ),
-        ("absent", None, 2)
+        ("pinned", Some("pinata-entry-request"), 2)
     );
     let requests_after_release = harness.provider_requests().await;
-    assert_eq!(requests_after_release.len(), 2);
+    assert_eq!(requests_after_release.len(), 1);
+    assert_unknown_psa_resource(&harness, "pinata-primary", "QmEntry", "retained").await;
     assert_eq!(
-        (
-            requests_after_release[1].method.clone(),
-            requests_after_release[1].path.as_str(),
-            requests_after_release[1].has_valid_authorization(),
-        ),
-        (http::Method::DELETE, "/psa/pins/pinata-entry-request", true,)
+        harness.provider_usage("pinata-primary").await.reserved_pins,
+        1
     );
-    let target_count_before_rejected_renewal = harness.pin_targets().await.len();
-    let kubo_requests_before_rejected_renewal = harness
+    assert_no_psa_delete(&harness).await;
+    let target_count_before_renewal = harness.pin_targets().await.len();
+    let kubo_requests_before_renewal = harness
         .kubo
         .received_requests()
         .await
@@ -5830,37 +5926,29 @@ async fn test_pinning_put_tagging_rejects_expired_lease_after_confirmed_release(
         ],
     )
     .await;
-    assert_s3_error(renewal, StatusCode::BAD_REQUEST, "InvalidArgument", "").await;
-    let still_expired = owner_leases(&harness, &archive.id).await.remove(0);
+    assert_eq!(renewal.status(), StatusCode::OK);
+    let reactivated = owner_leases(&harness, &archive.id).await.remove(0);
     assert_eq!(
         (
-            still_expired.id.as_str(),
-            still_expired.owner_object_id.as_str(),
-            still_expired.state.as_str(),
-            still_expired.generation,
+            reactivated.id.as_str(),
+            reactivated.owner_object_id.as_str(),
+            reactivated.state.as_str(),
+            reactivated.generation,
         ),
         (
             manual.id.as_str(),
             archive.id.as_str(),
-            "expired",
-            expired.generation,
+            "active",
+            expired.generation + 1,
         )
     );
     assert_eq!(
-        lease_targets(&harness, &manual.id)
-            .await
-            .into_iter()
-            .map(|target| (target.id, target.cid, target.provider, target.state))
-            .collect::<Vec<_>>(),
-        released_targets
-            .into_iter()
-            .map(|target| (target.id, target.cid, target.provider, target.state))
-            .collect::<Vec<_>>(),
-        "confirmed release must not reconstruct extracted targets"
+        lease_targets(&harness, &manual.id).await[0].id,
+        released_targets[0].id
     );
     assert_eq!(
         harness.pin_targets().await.len(),
-        target_count_before_rejected_renewal
+        target_count_before_renewal
     );
     assert_eq!(
         harness
@@ -5869,26 +5957,32 @@ async fn test_pinning_put_tagging_rejects_expired_lease_after_confirmed_release(
             .await
             .expect("Kubo request log")
             .len(),
-        kubo_requests_before_rejected_renewal,
-        "rejected renewal must not reopen or re-extract the archive"
+        kubo_requests_before_renewal,
+        "reactivation must not reopen or re-extract the archive"
     );
     assert_tagging(
         &harness,
         "archive.zip",
         &[
-            ("ipfs-s3:content", "decompressed"),
             ("ipfs-s3:pin", "true"),
-            ("team", "archive"),
+            ("ipfs-s3:retain-until", retain_until.as_str()),
+            ("team", "renewed"),
         ],
     )
     .await;
+    assert_unknown_psa_resource(&harness, "pinata-primary", "QmEntry", "retained").await;
+    assert_eq!(
+        harness.provider_requests().await.len(),
+        1,
+        "no duplicate Submit"
+    );
     assert_signed_body(&harness, "archive.zip", &legal_single_entry_zip()).await;
     assert_no_kubo_pin_removes(&harness).await;
     harness.shutdown().await;
 }
 
 #[tokio::test]
-async fn test_pinning_overwrite_delete_and_delete_objects_end_only_owned_remote_leases() {
+async fn test_pinning_overwrite_and_deletes_retain_unknown_remote_leases() {
     let mut config = PinningHarnessConfig::request_one();
     config.kubo_script = KuboScript {
         add_replies: vec![
@@ -5912,26 +6006,6 @@ async fn test_pinning_overwrite_delete_and_delete_objects_end_only_owned_remote_
         PsaReply::pinned_submit("/psa/pins", "pinata-delete-request", "QmDelete"),
         PsaReply::pinned_submit("/psa/pins", "pinata-batch-a-request", "QmBatchA"),
         PsaReply::pinned_submit("/psa/pins", "pinata-batch-b-request", "QmBatchB"),
-        PsaReply::empty(
-            http::Method::DELETE,
-            "/psa/pins/pinata-old-request",
-            StatusCode::NO_CONTENT.as_u16(),
-        ),
-        PsaReply::empty(
-            http::Method::DELETE,
-            "/psa/pins/pinata-delete-request",
-            StatusCode::NO_CONTENT.as_u16(),
-        ),
-        PsaReply::empty(
-            http::Method::DELETE,
-            "/psa/pins/pinata-batch-a-request",
-            StatusCode::NO_CONTENT.as_u16(),
-        ),
-        PsaReply::empty(
-            http::Method::DELETE,
-            "/psa/pins/pinata-batch-b-request",
-            StatusCode::NO_CONTENT.as_u16(),
-        ),
     ];
     let mut harness = start_pinning_harness(config).await;
 
@@ -6038,8 +6112,9 @@ async fn test_pinning_overwrite_delete_and_delete_objects_end_only_owned_remote_
                 .request_id
                 .as_deref(),
         ),
-        ("absent", Some("pinata-new-request"))
+        ("pinned", Some("pinata-new-request"))
     );
+    assert_unknown_psa_resource(&harness, "pinata-primary", "QmOld", "retained").await;
     assert_signed_body(&harness, "overwrite.txt", b"new").await;
 
     for (key, body, cid) in [
@@ -6136,9 +6211,18 @@ async fn test_pinning_overwrite_delete_and_delete_objects_end_only_owned_remote_
                 remote.request_id.as_deref(),
                 remote.epoch
             ),
-            ("absent", None, 2),
+            (
+                "pinned",
+                Some(match cid {
+                    "QmDelete" => "pinata-delete-request",
+                    "QmBatchA" => "pinata-batch-a-request",
+                    _ => "pinata-batch-b-request",
+                }),
+                2
+            ),
             "remote lifecycle for {cid}"
         );
+        assert_unknown_psa_resource(&harness, "pinata-primary", cid, "retained").await;
     }
     assert_eq!(
         harness
@@ -6151,8 +6235,8 @@ async fn test_pinning_overwrite_delete_and_delete_objects_end_only_owned_remote_
                 usage.reserved_pins
             ))
             .collect::<Vec<_>>(),
-        vec![("pinata-primary", 3, 1)],
-        "only the replacement CID remains reserved"
+        vec![("pinata-primary", 26, 5)],
+        "all five distinct CID reservations remain until ownership is proven"
     );
     let requests = harness.provider_requests().await;
     let delete_paths = requests
@@ -6166,14 +6250,16 @@ async fn test_pinning_overwrite_delete_and_delete_objects_end_only_owned_remote_
             request.path.clone()
         })
         .collect::<Vec<_>>();
+    assert!(
+        delete_paths.is_empty(),
+        "unknown PSA resources cannot be deleted"
+    );
     assert_eq!(
-        delete_paths,
-        vec![
-            "/psa/pins/pinata-old-request".to_owned(),
-            "/psa/pins/pinata-delete-request".to_owned(),
-            "/psa/pins/pinata-batch-a-request".to_owned(),
-            "/psa/pins/pinata-batch-b-request".to_owned(),
-        ]
+        requests
+            .iter()
+            .filter(|r| r.method == http::Method::POST)
+            .count(),
+        5
     );
     assert_no_kubo_pin_removes(&harness).await;
     harness.shutdown().await;
@@ -6232,7 +6318,12 @@ async fn test_pinning_worker_recovers_expired_claim_and_adopts_ambiguous_submit(
     let failed_find = harness
         .wait_for_provider_request("pinata-primary", http::Method::GET, "/psa/pins", 1)
         .await;
-    assert_find_request_for_job(&failed_find, "/psa/pins", "QmTestCid", &submit.id);
+    assert_find_request_for_job(
+        &failed_find,
+        "/psa/pins",
+        "QmTestCid",
+        &captured_submit_correlation(&harness, &submit.id).await,
+    );
     assert!(
         post.sequence < failed_find.sequence,
         "recovery Find follows the accepted POST"
@@ -6251,7 +6342,12 @@ async fn test_pinning_worker_recovers_expired_claim_and_adopts_ambiguous_submit(
     let adopted_find = harness
         .wait_for_provider_request("pinata-primary", http::Method::GET, "/psa/pins", 2)
         .await;
-    assert_find_request_for_job(&adopted_find, "/psa/pins", "QmTestCid", &submit.id);
+    assert_find_request_for_job(
+        &adopted_find,
+        "/psa/pins",
+        "QmTestCid",
+        &captured_submit_correlation(&harness, &submit.id).await,
+    );
     assert!(failed_find.sequence < adopted_find.sequence);
     let recovered = harness.wait_for_job_state(&submit.id, "done").await;
     harness.stop_worker_without_unlocking().await;
@@ -6289,16 +6385,11 @@ async fn test_pinning_worker_recovers_expired_claim_and_adopts_ambiguous_submit(
 }
 
 #[tokio::test]
-async fn test_pinning_reclaimed_submit_with_cancelled_target_adopts_then_unpins() {
+async fn test_pinning_reclaimed_submit_with_cancelled_target_retains_unknown_remote() {
     let mut config = PinningHarnessConfig::request_one();
     config.pinata_script = vec![
         PsaReply::pinned_submit("/psa/pins", "cancelled-request", "QmTestCid"),
         PsaReply::find_for_job("/psa/pins", "cancelled-request", "QmTestCid", "pinned"),
-        PsaReply::empty(
-            http::Method::DELETE,
-            "/psa/pins/cancelled-request",
-            StatusCode::NO_CONTENT.as_u16(),
-        ),
     ];
     let mut harness = start_pinning_harness(config).await;
 
@@ -6343,10 +6434,15 @@ async fn test_pinning_reclaimed_submit_with_cancelled_target_adopts_then_unpins(
     let find = harness
         .wait_for_provider_request("pinata-primary", http::Method::GET, "/psa/pins", 1)
         .await;
-    assert_find_request_for_job(&find, "/psa/pins", "QmTestCid", &submit.id);
+    assert_find_request_for_job(
+        &find,
+        "/psa/pins",
+        "QmTestCid",
+        &captured_submit_correlation(&harness, &submit.id).await,
+    );
     assert!(
         post.sequence < find.sequence,
-        "Find adopts the accepted POST"
+        "Find observes the accepted POST without proving exclusive creation"
     );
     harness.wait_for_job_state(&submit.id, "done").await;
     harness.stop_worker_without_unlocking().await;
@@ -6364,41 +6460,15 @@ async fn test_pinning_reclaimed_submit_with_cancelled_target_adopts_then_unpins(
         .await
         .into_iter()
         .find(|job| job.operation == "unpin")
-        .expect("current Unpin after adoption");
-    let delete_block = harness.block_next_delete("pinata-primary").await;
-    harness.restart_worker();
-    delete_block.wait_until_blocked().await;
-    let delete = harness
-        .wait_for_provider_request(
-            "pinata-primary",
-            http::Method::DELETE,
-            "/psa/pins/cancelled-request",
-            1,
-        )
-        .await;
-    assert_delete_request(&delete, "/psa/pins/cancelled-request");
-    assert_eq!(
-        remote_pin(&harness, "pinata-primary", "QmTestCid")
-            .await
-            .request_id
-            .as_deref(),
-        Some("cancelled-request"),
-        "release waits for the confirmed provider DELETE"
-    );
-    assert_eq!(
-        harness.provider_usages().await[0].reserved_pins,
-        1,
-        "release waits for the confirmed provider DELETE"
-    );
-    delete_block.release();
-    harness.wait_for_job_state(&unpin.id, "done").await;
-    harness.stop_worker_without_unlocking().await;
+        .expect("cancellation publishes a fenced Unpin");
+    assert_eq!(unpin.state, "done");
 
-    let released = remote_pin(&harness, "pinata-primary", "QmTestCid").await;
+    let retained = remote_pin(&harness, "pinata-primary", "QmTestCid").await;
     assert_eq!(
-        (released.status.as_str(), released.request_id.as_deref()),
-        ("absent", None)
+        (retained.status.as_str(), retained.request_id.as_deref()),
+        ("pinned", Some("cancelled-request"))
     );
+    assert_unknown_psa_resource(&harness, "pinata-primary", "QmTestCid", "retained").await;
     assert_eq!(
         harness
             .provider_usages()
@@ -6406,10 +6476,14 @@ async fn test_pinning_reclaimed_submit_with_cancelled_target_adopts_then_unpins(
             .into_iter()
             .map(|usage| (usage.provider, usage.reserved_bytes, usage.reserved_pins))
             .collect::<Vec<_>>(),
-        vec![("pinata-primary".to_owned(), 0, 0)]
+        vec![("pinata-primary".to_owned(), 4, 1)]
     );
     let requests = harness.provider_requests().await;
-    assert_eq!(requests.len(), 3, "cancelled recovery must not re-submit");
+    assert_eq!(
+        requests.len(),
+        2,
+        "cancelled recovery must not re-submit or DELETE"
+    );
     assert_eq!(
         requests
             .iter()
@@ -6418,7 +6492,6 @@ async fn test_pinning_reclaimed_submit_with_cancelled_target_adopts_then_unpins(
         vec![
             (http::Method::POST, "/psa/pins"),
             (http::Method::GET, "/psa/pins"),
-            (http::Method::DELETE, "/psa/pins/cancelled-request"),
         ]
     );
     assert_signed_body(&harness, "cancelled-recover.txt", b"body").await;
@@ -6466,7 +6539,12 @@ async fn test_pinning_recovery_find_none_with_no_desired_target_never_posts() {
     let find = harness
         .wait_for_provider_request("pinata-primary", http::Method::GET, "/psa/pins", 1)
         .await;
-    assert_find_request_for_job(&find, "/psa/pins", "QmTestCid", &submit.id);
+    assert_find_request_for_job(
+        &find,
+        "/psa/pins",
+        "QmTestCid",
+        &captured_submit_correlation(&harness, &submit.id).await,
+    );
     assert!(
         post.sequence < find.sequence,
         "reclaimed recovery must Find before it can exit for a stale generation"
@@ -6527,16 +6605,11 @@ async fn test_pinning_recovery_find_none_with_no_desired_target_never_posts() {
 }
 
 #[tokio::test]
-async fn test_pinning_running_submit_blocks_no_request_quota_release() {
+async fn test_pinning_running_submit_blocks_quota_release_then_retains_unknown_remote() {
     let mut config = PinningHarnessConfig::request_one();
     config.pinata_script = vec![
         PsaReply::pinned_submit("/psa/pins", "live-lock-request", "QmTestCid"),
         PsaReply::find_for_job("/psa/pins", "live-lock-request", "QmTestCid", "pinned"),
-        PsaReply::empty(
-            http::Method::DELETE,
-            "/psa/pins/live-lock-request",
-            StatusCode::NO_CONTENT.as_u16(),
-        ),
     ];
     let mut harness = start_pinning_harness(config).await;
 
@@ -6618,7 +6691,12 @@ async fn test_pinning_running_submit_blocks_no_request_quota_release() {
     let find = harness
         .wait_for_provider_request("pinata-primary", http::Method::GET, "/psa/pins", 1)
         .await;
-    assert_find_request_for_job(&find, "/psa/pins", "QmTestCid", &submit.id);
+    assert_find_request_for_job(
+        &find,
+        "/psa/pins",
+        "QmTestCid",
+        &captured_submit_correlation(&harness, &submit.id).await,
+    );
     assert!(post.sequence < find.sequence);
     harness.wait_for_job_state(&submit.id, "done").await;
     harness.stop_worker_without_unlocking().await;
@@ -6631,25 +6709,15 @@ async fn test_pinning_running_submit_blocks_no_request_quota_release() {
         .await
         .into_iter()
         .find(|job| job.operation == "unpin")
-        .expect("adopted cancelled remote gets an Unpin");
-    harness.restart_worker();
-    let delete = harness
-        .wait_for_provider_request(
-            "pinata-primary",
-            http::Method::DELETE,
-            "/psa/pins/live-lock-request",
-            1,
-        )
-        .await;
-    assert_delete_request(&delete, "/psa/pins/live-lock-request");
-    harness.wait_for_job_state(&unpin.id, "done").await;
-    harness.stop_worker_without_unlocking().await;
+        .expect("cancelled remote retains a fenced Unpin");
+    assert_eq!(unpin.state, "done");
 
-    let released = remote_pin(&harness, "pinata-primary", "QmTestCid").await;
+    let retained = remote_pin(&harness, "pinata-primary", "QmTestCid").await;
     assert_eq!(
-        (released.status.as_str(), released.request_id.as_deref()),
-        ("absent", None)
+        (retained.status.as_str(), retained.request_id.as_deref()),
+        ("pinned", Some("live-lock-request"))
     );
+    assert_unknown_psa_resource(&harness, "pinata-primary", "QmTestCid", "retained").await;
     assert_eq!(
         harness
             .provider_usages()
@@ -6657,10 +6725,14 @@ async fn test_pinning_running_submit_blocks_no_request_quota_release() {
             .into_iter()
             .map(|usage| (usage.provider, usage.reserved_bytes, usage.reserved_pins))
             .collect::<Vec<_>>(),
-        vec![("pinata-primary".to_owned(), 0, 0)]
+        vec![("pinata-primary".to_owned(), 4, 1)]
     );
     let requests = harness.provider_requests().await;
-    assert_eq!(requests.len(), 3, "live-lock recovery must not re-submit");
+    assert_eq!(
+        requests.len(),
+        2,
+        "live-lock recovery must not re-submit or DELETE"
+    );
     assert_eq!(
         requests
             .iter()
@@ -6669,7 +6741,6 @@ async fn test_pinning_running_submit_blocks_no_request_quota_release() {
         vec![
             (http::Method::POST, "/psa/pins"),
             (http::Method::GET, "/psa/pins"),
-            (http::Method::DELETE, "/psa/pins/live-lock-request"),
         ]
     );
     assert_signed_body(&harness, "live-lock.txt", b"body").await;
@@ -7013,7 +7084,7 @@ async fn test_pinning_shared_terminal_failure_coordinates_each_lease() {
 }
 
 #[tokio::test]
-async fn test_pinning_failed_all_remote_forgets_and_resubmits_once() {
+async fn test_pinning_failed_all_unknown_remote_retains_request_without_resubmission() {
     let mut config = two_provider_request_config(
         vec![
             pinning_policy("one/", "one", &["pinata-primary", "filebase-primary"]),
@@ -7025,12 +7096,6 @@ async fn test_pinning_failed_all_remote_forgets_and_resubmits_once() {
     config.pinata_script = vec![
         PsaReply::submit_status("/psa/pins", "failed-all", "QmShared", "queued"),
         PsaReply::pin_status("/psa/pins/failed-all", "failed-all", "QmShared", "failed"),
-        PsaReply::empty(
-            http::Method::DELETE,
-            "/psa/pins/failed-all",
-            StatusCode::NO_CONTENT.as_u16(),
-        ),
-        PsaReply::pinned_submit("/psa/pins", "replacement-all", "QmShared"),
     ];
     config.filebase_script = vec![PsaReply::pinned_submit(
         "/v1/ipfs/pins",
@@ -7062,6 +7127,7 @@ async fn test_pinning_failed_all_remote_forgets_and_resubmits_once() {
         .and_then(serde_json::Value::as_str)
         .expect("fallback job id")
         .to_owned();
+    let fallback_job_id = submitted_job_id_for_correlation(&harness, &fallback_job_id).await;
     harness.wait_for_job_state(&fallback_job_id, "done").await;
     harness.stop_worker_without_unlocking().await;
 
@@ -7084,41 +7150,28 @@ async fn test_pinning_failed_all_remote_forgets_and_resubmits_once() {
     harness
         .run_current_reconcile("pinata-primary", "QmShared")
         .await;
-    harness.restart_worker();
-    let replacement_post = harness
-        .wait_for_provider_request("pinata-primary", http::Method::POST, "/psa/pins", 2)
-        .await;
-    let replacement_job_id = serde_json::from_slice::<serde_json::Value>(&replacement_post.body)
-        .expect("replacement body")
-        .pointer("/meta/gateway_job_id")
-        .and_then(serde_json::Value::as_str)
-        .expect("replacement job id")
-        .to_owned();
-    harness
-        .wait_for_job_state(&replacement_job_id, "done")
-        .await;
-    harness.stop_worker_without_unlocking().await;
 
-    let replacement = remote_pin(&harness, "pinata-primary", "QmShared").await;
+    let retained = remote_pin(&harness, "pinata-primary", "QmShared").await;
     assert_eq!(
         (
-            replacement.status.as_str(),
-            replacement.request_id.as_deref(),
-            replacement.epoch
+            retained.status.as_str(),
+            retained.request_id.as_deref(),
+            retained.epoch
         ),
-        ("pinned", Some("replacement-all"), failed_epoch + 1),
-        "one durable DELETE/forget advances one epoch before the canonical replacement Submit"
+        ("failed", Some("failed-all"), failed_epoch),
+        "an unowned failed request cannot be deleted to permit a replacement Submit"
     );
-    assert_eq!(replacement.failure_attempts, 0);
+    assert_eq!(retained.failure_attempts, 1);
+    assert_unknown_psa_resource(&harness, "pinata-primary", "QmShared", "retained").await;
     assert_eq!(
         harness.provider_usages().await[0].reserved_pins,
         1,
-        "replacement retains the primary reservation"
+        "failed unknown primary retains its reservation"
     );
     for key in ["all-a/key.txt", "all-b/key.txt"] {
         assert_eq!(
             harness.target_states(key).await,
-            vec![("pinata-primary".to_owned(), "pinned".to_owned())]
+            vec![("pinata-primary".to_owned(), "degraded".to_owned())]
         );
         assert_signed_body(&harness, key, b"shared").await;
     }
@@ -7146,13 +7199,9 @@ async fn test_pinning_failed_all_remote_forgets_and_resubmits_once() {
         vec![
             (http::Method::POST, "/psa/pins"),
             (http::Method::GET, "/psa/pins/failed-all"),
-            (http::Method::DELETE, "/psa/pins/failed-all"),
-            (http::Method::POST, "/psa/pins"),
         ]
     );
-    let replacement_job = harness.pin_job(&replacement_job_id).await;
-    assert_eq!(replacement_job.operation, "submit");
-    assert!(replacement_job.lease_id.is_some() && replacement_job.target_id.is_some());
+    assert_no_psa_delete(&harness).await;
     assert_eq!(
         harness.filebase_requests().await.len(),
         1,
@@ -7163,33 +7212,19 @@ async fn test_pinning_failed_all_remote_forgets_and_resubmits_once() {
 }
 
 #[tokio::test]
-async fn test_pinning_failed_remote_eight_cycles_stop_without_spin() {
+async fn test_pinning_failed_unknown_remote_stops_without_delete_or_retry_spin() {
     let mut config = PinningHarnessConfig::request_one();
     config.policies[0].provider_mode = "all".to_owned();
     config.kubo_script = repeated_shared_kubo(1);
-    config.pinata_script.clear();
-    for cycle in 1..=8 {
-        let request_id = format!("failed-cycle-{cycle}");
-        config.pinata_script.push(PsaReply::submit_status(
-            "/psa/pins",
-            &request_id,
-            "QmShared",
-            "queued",
-        ));
-        config.pinata_script.push(PsaReply::pin_status(
-            format!("/psa/pins/{request_id}"),
-            &request_id,
+    config.pinata_script = vec![
+        PsaReply::submit_status("/psa/pins", "failed-cycle-1", "QmShared", "queued"),
+        PsaReply::pin_status(
+            "/psa/pins/failed-cycle-1",
+            "failed-cycle-1",
             "QmShared",
             "failed",
-        ));
-        if cycle < 8 {
-            config.pinata_script.push(PsaReply::empty(
-                http::Method::DELETE,
-                format!("/psa/pins/{request_id}"),
-                StatusCode::NO_CONTENT.as_u16(),
-            ));
-        }
-    }
+        ),
+    ];
     let mut harness = start_pinning_harness(config).await;
 
     let put = signed_put_with_tagging(
@@ -7202,153 +7237,65 @@ async fn test_pinning_failed_remote_eight_cycles_stop_without_spin() {
     assert_eq!(put.status(), StatusCode::OK);
     harness.run_worker_until_idle().await;
 
-    for cycle in 1..=8 {
-        let poll = harness
+    let poll = harness
+        .pin_jobs()
+        .await
+        .into_iter()
+        .find(|job| job.operation == "poll" && job.state == "pending")
+        .expect("failed request has one pending Poll");
+    harness.advance_job_due(&poll.id).await;
+    harness.run_worker_until_idle().await;
+    let failed = remote_pin(&harness, "pinata-primary", "QmShared").await;
+    assert_eq!(
+        (
+            failed.status.as_str(),
+            failed.failure_attempts,
+            failed.last_failed_request_id.as_deref()
+        ),
+        ("failed", 1, Some("failed-cycle-1"))
+    );
+    assert!(failed.next_retry_at.is_some());
+    harness
+        .run_current_reconcile("pinata-primary", "QmShared")
+        .await;
+    harness
+        .advance_remote_retry_due("pinata-primary", "QmShared")
+        .await;
+    harness
+        .run_current_reconcile("pinata-primary", "QmShared")
+        .await;
+    let retained = remote_pin(&harness, "pinata-primary", "QmShared").await;
+    assert_eq!(
+        (retained.request_id.as_deref(), retained.failure_attempts),
+        (Some("failed-cycle-1"), 1)
+    );
+    assert_unknown_psa_resource(&harness, "pinata-primary", "QmShared", "retained").await;
+    assert_eq!(
+        harness.target_states("eight.txt").await,
+        vec![("pinata-primary".to_owned(), "degraded".to_owned())]
+    );
+    assert_eq!(
+        harness.provider_usage("pinata-primary").await.reserved_pins,
+        1
+    );
+    assert_eq!(
+        harness
+            .pinata_requests()
+            .await
+            .iter()
+            .map(|r| &r.method)
+            .collect::<Vec<_>>(),
+        vec![&http::Method::POST, &http::Method::GET]
+    );
+    assert_no_psa_delete(&harness).await;
+    assert!(
+        harness
             .pin_jobs()
             .await
-            .into_iter()
-            .find(|job| job.operation == "poll" && job.state == "pending")
-            .expect("each replacement has exactly one pending Poll");
-        harness.advance_job_due(&poll.id).await;
-        harness.run_worker_until_idle().await;
-
-        let failed = remote_pin(&harness, "pinata-primary", "QmShared").await;
-        assert_eq!(failed.status, "failed");
-        assert_eq!(
-            failed.failure_attempts, cycle,
-            "one count per failed request cycle"
-        );
-        assert_eq!(
-            failed.last_failed_request_id.as_deref(),
-            Some(format!("failed-cycle-{cycle}").as_str())
-        );
-        let requests = harness.pinata_requests().await;
-        assert_eq!(
-            requests
-                .iter()
-                .filter(|request| request.method == http::Method::POST)
-                .count(),
-            cycle as usize,
-            "one initial/replacement Submit per cycle"
-        );
-        assert_eq!(
-            requests
-                .iter()
-                .filter(|request| request.method == http::Method::GET)
-                .count(),
-            cycle as usize,
-            "each distinct request is observed once by its Poll"
-        );
-
-        if cycle < 8 {
-            assert!(failed.next_retry_at.is_some());
-            // Reconcile re-observes the same failure durably before its backoff; the request ID
-            // must not consume a second failure-budget slot.
-            harness
-                .run_current_reconcile("pinata-primary", "QmShared")
-                .await;
-            assert_eq!(
-                remote_pin(&harness, "pinata-primary", "QmShared")
-                    .await
-                    .failure_attempts,
-                cycle,
-                "duplicate observation of one request is idempotent"
-            );
-            harness
-                .advance_remote_retry_due("pinata-primary", "QmShared")
-                .await;
-            harness
-                .run_current_reconcile("pinata-primary", "QmShared")
-                .await;
-            harness.run_worker_until_idle().await;
-            let requests = harness.pinata_requests().await;
-            assert_eq!(
-                requests
-                    .iter()
-                    .filter(|request| request.method == http::Method::DELETE)
-                    .count(),
-                cycle as usize,
-                "each non-exhausted cycle forgets exactly one remote request"
-            );
-            assert_eq!(
-                requests
-                    .iter()
-                    .filter(|request| request.method == http::Method::POST)
-                    .count(),
-                cycle as usize + 1,
-                "the DELETE creates exactly one canonical replacement Submit"
-            );
-        } else {
-            assert_eq!(
-                failed.next_retry_at, None,
-                "the eighth request exhausts the retry budget"
-            );
-            let requests_before_duplicate = harness.pinata_requests().await;
-            let request_counts_before_duplicate = (
-                requests_before_duplicate.len(),
-                requests_before_duplicate
-                    .iter()
-                    .filter(|request| request.method == http::Method::POST)
-                    .count(),
-                requests_before_duplicate
-                    .iter()
-                    .filter(|request| request.method == http::Method::GET)
-                    .count(),
-                requests_before_duplicate
-                    .iter()
-                    .filter(|request| request.method == http::Method::DELETE)
-                    .count(),
-            );
-            harness
-                .enqueue_current_reconcile("pinata-primary", "QmShared")
-                .await;
-            harness
-                .run_current_reconcile("pinata-primary", "QmShared")
-                .await;
-            let duplicate = remote_pin(&harness, "pinata-primary", "QmShared").await;
-            assert_eq!(
-                (
-                    duplicate.failure_attempts,
-                    duplicate.last_failed_request_id.as_deref(),
-                    duplicate.next_retry_at,
-                ),
-                (8, Some("failed-cycle-8"), None),
-                "the eighth request's duplicate observation is idempotent after exhaustion"
-            );
-            assert_eq!(
-                harness.target_states("eight.txt").await,
-                vec![("pinata-primary".to_owned(), "degraded".to_owned())]
-            );
-            let requests_after_duplicate = harness.pinata_requests().await;
-            assert_eq!(
-                (
-                    requests_after_duplicate.len(),
-                    requests_after_duplicate
-                        .iter()
-                        .filter(|request| request.method == http::Method::POST)
-                        .count(),
-                    requests_after_duplicate
-                        .iter()
-                        .filter(|request| request.method == http::Method::GET)
-                        .count(),
-                    requests_after_duplicate
-                        .iter()
-                        .filter(|request| request.method == http::Method::DELETE)
-                        .count(),
-                ),
-                request_counts_before_duplicate,
-                "the exhausted duplicate must not DELETE, POST, or trigger a ninth request"
-            );
-            assert!(
-                harness
-                    .pin_jobs()
-                    .await
-                    .iter()
-                    .all(|job| { job.state != "pending" || job.next_attempt_at > Utc::now() }),
-                "exhaustion leaves no due retry job to spin"
-            );
-        }
-    }
+            .iter()
+            .all(|job| job.state != "pending" || job.next_attempt_at > Utc::now()),
+        "fenced retry cannot spin"
+    );
 
     let object = latest_pinning_object(&harness, "eight.txt").await;
     let manual = owner_leases(&harness, &object.id).await.remove(0);
@@ -7366,8 +7313,8 @@ async fn test_pinning_failed_remote_eight_cycles_stop_without_spin() {
     let equal_remote = remote_pin(&harness, "pinata-primary", "QmShared").await;
     assert_eq!(
         (equal_remote.failure_attempts, equal_remote.next_retry_at),
-        (8, None),
-        "equal renewal cannot restart exhaustion"
+        (1, retained.next_retry_at),
+        "equal renewal cannot restart a failed unknown request"
     );
 
     let extended_retain_until = (manual.expires_at + ChronoDuration::hours(1)).to_rfc3339();
@@ -7406,6 +7353,12 @@ async fn test_pinning_failed_remote_eight_cycles_stop_without_spin() {
         "a new shared target also keeps the retry reset"
     );
     assert!(reset_by_target.next_retry_at.is_some());
+    assert_eq!(
+        harness.pinata_requests().await.len(),
+        2,
+        "no new PSA request from renewal or shared CID"
+    );
+    assert_no_psa_delete(&harness).await;
     assert_signed_body(&harness, "eight.txt", b"shared").await;
     assert_signed_body(&harness, "eight-new-target.txt", b"shared").await;
     assert_no_kubo_pin_removes(&harness).await;
@@ -7496,7 +7449,7 @@ async fn test_pinning_stale_poll_owner_hands_off_without_duplicate_post() {
 }
 
 #[tokio::test]
-async fn test_pinning_stale_remote_epoch_skips_delete() {
+async fn test_pinning_stale_remote_epoch_parks_unowned_unpin_without_delete() {
     let mut config = PinningHarnessConfig::request_one();
     config.kubo_script = repeated_shared_kubo(1);
     config.pinata_script = vec![PsaReply::pinned_submit(
@@ -7576,20 +7529,37 @@ async fn test_pinning_stale_remote_epoch_skips_delete() {
     );
     let current = remote_pin(&harness, "pinata-primary", "QmShared").await;
     assert_eq!((current.epoch, current.status.as_str()), (5, "pinned"));
+    assert_unknown_psa_resource(&harness, "pinata-primary", "QmShared", "confirmed").await;
 
-    harness.run_worker_until_idle().await;
+    harness.restart_worker();
+    let parked = harness.wait_for_job_attention(&unpin.id).await;
+    harness.stop_worker_without_unlocking().await;
     assert_eq!(
-        harness.pin_job(&unpin.id).await.state,
-        "done",
-        "stale Unpin is fenced before provider I/O"
+        (parked.state.as_str(), parked.locked_until),
+        ("running", None),
+        "old Unpin is durably parked for attention rather than reaching provider I/O"
     );
-    assert!(
-        harness
-            .pin_jobs()
+    assert_eq!(
+        remote_pin(&harness, "pinata-primary", "QmShared")
             .await
-            .iter()
-            .any(|job| job.operation == "reconcile" && job.expected_remote_epoch == Some(5)),
-        "the new desired set owns a current-epoch Reconcile"
+            .epoch,
+        5
+    );
+    assert_eq!(
+        harness.target_states("epoch-shared.txt").await,
+        vec![("pinata-primary".to_owned(), "pinned".to_owned())]
+    );
+    let ledger = store::pinning::ledger::get(
+        harness.state.store.db(),
+        &harness.provider_key("pinata-primary"),
+        "QmShared",
+    )
+    .await
+    .expect("load parked resource ledger")
+    .expect("ledger exists");
+    assert_eq!(
+        ledger.last_error.as_deref(),
+        Some("historical identity unavailable; needs_attention")
     );
     assert!(
         harness
@@ -7598,6 +7568,15 @@ async fn test_pinning_stale_remote_epoch_skips_delete() {
             .iter()
             .all(|request| request.method != http::Method::DELETE),
         "epoch-four Unpin must not DELETE after epoch five becomes desired"
+    );
+    assert_eq!(
+        harness
+            .pinata_requests()
+            .await
+            .iter()
+            .filter(|r| r.method == http::Method::POST)
+            .count(),
+        1
     );
     assert_eq!(
         harness
@@ -7616,7 +7595,7 @@ async fn test_pinning_stale_remote_epoch_skips_delete() {
 }
 
 #[tokio::test]
-async fn test_pinning_one_mode_sticky_priority_failover_converges_duplicate() {
+async fn test_pinning_one_mode_failover_retains_unknown_primary_without_duplicate_post() {
     let mut config = two_provider_request_config(
         vec![pinning_policy(
             "",
@@ -7637,11 +7616,6 @@ async fn test_pinning_one_mode_sticky_priority_failover_converges_duplicate() {
             "sticky-primary",
             "QmShared",
             "failed",
-        ),
-        PsaReply::empty(
-            http::Method::DELETE,
-            "/psa/pins/sticky-primary",
-            StatusCode::NO_CONTENT.as_u16(),
         ),
     ];
     config.filebase_script = vec![PsaReply::pinned_submit(
@@ -7700,23 +7674,8 @@ async fn test_pinning_one_mode_sticky_priority_failover_converges_duplicate() {
         .and_then(serde_json::Value::as_str)
         .expect("fallback job id")
         .to_owned();
+    let fallback_job_id = submitted_job_id_for_correlation(&harness, &fallback_job_id).await;
     harness.wait_for_job_state(&fallback_job_id, "done").await;
-    let delete = harness
-        .wait_for_provider_request(
-            "pinata-primary",
-            http::Method::DELETE,
-            "/psa/pins/sticky-primary",
-            1,
-        )
-        .await;
-    assert_delete_request(&delete, "/psa/pins/sticky-primary");
-    let unpin = harness
-        .pin_jobs()
-        .await
-        .into_iter()
-        .find(|job| job.operation == "unpin" && job.provider == "pinata-primary")
-        .expect("pinned fallback schedules old-primary Unpin");
-    harness.wait_for_job_state(&unpin.id, "done").await;
     harness.stop_worker_without_unlocking().await;
     let converged_lease = owner_leases(&harness, &object.id).await.remove(0);
     assert_eq!(
@@ -7762,8 +7721,9 @@ async fn test_pinning_one_mode_sticky_priority_failover_converges_duplicate() {
                 .status
                 .as_str()
         ),
-        ("pinned", "absent")
+        ("pinned", "failed")
     );
+    assert_unknown_psa_resource(&harness, "pinata-primary", "QmShared", "unknown").await;
     assert_eq!(
         harness
             .pinata_requests()
@@ -7775,8 +7735,12 @@ async fn test_pinning_one_mode_sticky_priority_failover_converges_duplicate() {
             (http::Method::POST, "/psa/pins"),
             (http::Method::GET, "/psa/pins/sticky-primary"),
             (http::Method::GET, "/psa/pins/sticky-primary"),
-            (http::Method::DELETE, "/psa/pins/sticky-primary"),
         ]
+    );
+    assert_no_psa_delete(&harness).await;
+    assert_eq!(
+        harness.provider_usage("pinata-primary").await.reserved_pins,
+        1
     );
     assert_eq!(
         harness
@@ -7841,14 +7805,19 @@ async fn test_pinning_all_mode_partial_success_keeps_retrying_degraded_provider(
     assert_eq!(requests.len(), 3);
     assert_submit_request(&requests[0], "/psa/pins", "QmTestCid");
     assert_submit_request(&requests[1], "/v1/ipfs/pins", "QmTestCid");
-    assert_find_request_for_job(&requests[2], "/v1/ipfs/pins", "QmTestCid", &retry.id);
+    assert_find_request_for_job(
+        &requests[2],
+        "/v1/ipfs/pins",
+        "QmTestCid",
+        &captured_submit_correlation(&harness, &retry.id).await,
+    );
     assert_signed_body(&harness, "partial.txt", b"happy").await;
     assert_no_kubo_pin_removes(&harness).await;
     harness.shutdown().await;
 }
 
 #[tokio::test]
-async fn test_pinning_quota_evicts_oldest_unique_cid_after_confirmed_unpin() {
+async fn test_pinning_quota_keeps_oldest_unknown_cid_reserved_after_eviction() {
     let mut config = PinningHarnessConfig::request_one();
     config.providers[0].max_bytes = 6;
     config.providers[0].max_pins = 2;
@@ -7867,12 +7836,6 @@ async fn test_pinning_quota_evicts_oldest_unique_cid_after_confirmed_unpin() {
     config.pinata_script = vec![
         PsaReply::pinned_submit("/psa/pins", "old-request", "QmOld"),
         PsaReply::pinned_submit("/psa/pins", "newer-request", "QmNewer"),
-        PsaReply::empty(
-            http::Method::DELETE,
-            "/psa/pins/old-request",
-            StatusCode::NO_CONTENT.as_u16(),
-        ),
-        PsaReply::pinned_submit("/psa/pins", "incoming-request", "QmIncoming"),
     ];
     let mut harness = start_pinning_harness(config).await;
 
@@ -7930,18 +7893,7 @@ async fn test_pinning_quota_evicts_oldest_unique_cid_after_confirmed_unpin() {
         "the incoming CID cannot reserve until a remote DELETE is confirmed"
     );
 
-    let delete_block = harness.block_next_delete("pinata-primary").await;
-    harness.restart_worker();
-    delete_block.wait_until_blocked().await;
-    let delete = harness
-        .wait_for_provider_request(
-            "pinata-primary",
-            http::Method::DELETE,
-            "/psa/pins/old-request",
-            1,
-        )
-        .await;
-    assert_delete_request(&delete, "/psa/pins/old-request");
+    harness.run_worker_until_idle().await;
     assert_eq!(
         (
             harness
@@ -7951,33 +7903,26 @@ async fn test_pinning_quota_evicts_oldest_unique_cid_after_confirmed_unpin() {
             harness.provider_usage("pinata-primary").await.reserved_pins,
         ),
         (6, 2),
-        "the eviction reservation remains until the provider confirms DELETE"
+        "eviction of an unknown resource cannot free its reservation"
     );
     assert_eq!(
         harness.target_states("incoming.txt").await,
         vec![("pinata-primary".to_owned(), "quota_waiting".to_owned())]
     );
 
-    delete_block.release();
-    harness.wait_for_worker_idle().await;
-    harness.stop_worker_without_unlocking().await;
-
     assert_eq!(
-        (
-            remote_pin(&harness, "pinata-primary", "QmOld")
-                .await
-                .status
-                .as_str(),
-            remote_pin(&harness, "pinata-primary", "QmIncoming")
-                .await
-                .request_id
-                .as_deref(),
-        ),
-        ("absent", Some("incoming-request"))
+        remote_pin(&harness, "pinata-primary", "QmOld").await.status,
+        "pinned"
     );
     assert_eq!(
+        harness.remote_pins().await.len(),
+        2,
+        "no capacity for incoming CID"
+    );
+    assert_unknown_psa_resource(&harness, "pinata-primary", "QmOld", "retained").await;
+    assert_eq!(
         harness.target_states("incoming.txt").await,
-        vec![("pinata-primary".to_owned(), "pinned".to_owned())]
+        vec![("pinata-primary".to_owned(), "quota_waiting".to_owned())]
     );
     assert_eq!(
         (
@@ -7988,14 +7933,13 @@ async fn test_pinning_quota_evicts_oldest_unique_cid_after_confirmed_unpin() {
             harness.provider_usage("pinata-primary").await.reserved_pins,
         ),
         (6, 2),
-        "the awakened incoming CID replaces exactly one released unique CID"
+        "incoming CID cannot take an unproven resource's capacity"
     );
     let requests = harness.provider_requests().await;
-    assert_eq!(requests.len(), 4);
+    assert_eq!(requests.len(), 2);
     assert_submit_request(&requests[0], "/psa/pins", "QmOld");
     assert_submit_request(&requests[1], "/psa/pins", "QmNewer");
-    assert_delete_request(&requests[2], "/psa/pins/old-request");
-    assert_submit_request(&requests[3], "/psa/pins", "QmIncoming");
+    assert_no_psa_delete(&harness).await;
     assert_signed_body(&harness, "incoming.txt", b"in!").await;
     assert_no_kubo_pin_removes(&harness).await;
     harness.shutdown().await;
@@ -8089,23 +8033,13 @@ async fn test_pinning_shared_cid_counts_once_and_blocks_unsafe_unpin() {
 }
 
 #[tokio::test]
-async fn test_pinning_renewal_generation_wins_against_inflight_expiry_unpin() {
+async fn test_pinning_renewal_generation_reuses_retained_unknown_expiry_pin() {
     let mut config = PinningHarnessConfig::request_one();
-    config.pinata_script = vec![
-        PsaReply::pinned_submit("/psa/pins", "expiry-request", "QmTestCid"),
-        PsaReply::empty(
-            http::Method::DELETE,
-            "/psa/pins/expiry-request",
-            StatusCode::NO_CONTENT.as_u16(),
-        ),
-        PsaReply::submit_status("/psa/pins", "renewed-request", "QmTestCid", "queued"),
-        PsaReply::pin_status(
-            "/psa/pins/renewed-request",
-            "renewed-request",
-            "QmTestCid",
-            "pinned",
-        ),
-    ];
+    config.pinata_script = vec![PsaReply::pinned_submit(
+        "/psa/pins",
+        "expiry-request",
+        "QmTestCid",
+    )];
     let mut harness = start_pinning_harness(config).await;
 
     let put = signed_put_with_tagging(
@@ -8123,18 +8057,12 @@ async fn test_pinning_renewal_generation_wins_against_inflight_expiry_unpin() {
     let initial_target = lease_targets(&harness, &initial_lease.id).await.remove(0);
 
     harness.advance_past_lease_expiry("expiry-renew.txt").await;
-    let delete_block = harness.block_next_delete("pinata-primary").await;
     harness.restart_worker();
-    delete_block.wait_until_blocked().await;
-    let delete = harness
-        .wait_for_provider_request(
-            "pinata-primary",
-            http::Method::DELETE,
-            "/psa/pins/expiry-request",
-            1,
-        )
+    harness
+        .wait_for_lease_state("expiry-renew.txt", "expired")
         .await;
-    assert_delete_request(&delete, "/psa/pins/expiry-request");
+    harness.wait_for_worker_idle().await;
+    harness.stop_worker_without_unlocking().await;
     let expired_lease = owner_leases(&harness, &object.id).await.remove(0);
     let expired_remote = remote_pin(&harness, "pinata-primary", "QmTestCid").await;
     assert_eq!(
@@ -8156,7 +8084,7 @@ async fn test_pinning_renewal_generation_wins_against_inflight_expiry_unpin() {
             harness.provider_usage("pinata-primary").await.reserved_pins,
         ),
         (4, 1),
-        "the claimed DELETE cannot release before its provider response"
+        "expiry cannot release quota on an unproven PSA request"
     );
 
     let retain_until = (Utc::now() + ChronoDuration::hours(1)).to_rfc3339();
@@ -8199,66 +8127,46 @@ async fn test_pinning_renewal_generation_wins_against_inflight_expiry_unpin() {
         "reactivation retains the original unique reservation"
     );
 
-    delete_block.release();
     let unpin = harness
         .pin_jobs()
         .await
         .into_iter()
         .find(|job| job.operation == "unpin")
         .expect("expiry publishes one Unpin");
-    harness.wait_for_job_state(&unpin.id, "done").await;
-    harness.wait_for_worker_idle().await;
-    harness.stop_worker_without_unlocking().await;
-
-    let compensation = harness
-        .pin_jobs()
-        .await
-        .into_iter()
-        .find(|job| job.operation == "submit" && job.id != initial_submit.id)
-        .expect("DELETE compensation publishes a replacement Submit");
-    assert_eq!(compensation.state, "done");
     assert_eq!(
-        compensation.target_id.as_deref(),
-        Some(initial_target.id.as_str())
+        unpin.state, "done",
+        "expired unpin is fenced by reactivation"
     );
-    let poll = harness
-        .pin_jobs()
-        .await
-        .into_iter()
-        .find(|job| job.operation == "poll" && job.state == "pending")
-        .expect("queued compensation Submit publishes a Poll");
-    harness.advance_job_due(&poll.id).await;
-    harness.run_worker_until_idle().await;
+    assert!(
+        harness
+            .pin_jobs()
+            .await
+            .iter()
+            .all(|job| job.operation != "submit" || job.id == initial_submit.id),
+        "retained remote needs no replacement Submit"
+    );
 
     let pinned = remote_pin(&harness, "pinata-primary", "QmTestCid").await;
     assert_eq!(
         (pinned.status.as_str(), pinned.request_id.as_deref()),
-        ("pinned", Some("renewed-request"))
+        ("pinned", Some("expiry-request"))
     );
     assert_eq!(
         lease_targets(&harness, &initial_lease.id).await[0].state,
         "pinned"
     );
     let requests = harness.provider_requests().await;
-    assert_eq!(requests.len(), 4);
+    assert_eq!(requests.len(), 1);
     assert_submit_request_for_job(&requests[0], "/psa/pins", "QmTestCid", &initial_submit);
-    assert_delete_request(&requests[1], "/psa/pins/expiry-request");
-    assert_submit_request_for_job(&requests[2], "/psa/pins", "QmTestCid", &compensation);
-    assert_eq!(
-        (
-            requests[3].method.clone(),
-            requests[3].path.as_str(),
-            requests[3].has_valid_authorization(),
-        ),
-        (http::Method::GET, "/psa/pins/renewed-request", true)
-    );
+    assert_no_psa_delete(&harness).await;
+    assert_unknown_psa_resource(&harness, "pinata-primary", "QmTestCid", "retained").await;
     assert_signed_body(&harness, "expiry-renew.txt", b"body").await;
     assert_no_kubo_pin_removes(&harness).await;
     harness.shutdown().await;
 }
 
 #[tokio::test]
-async fn test_pinning_new_shared_target_during_delete_compensates_without_release() {
+async fn test_pinning_new_shared_target_after_cancel_reuses_unknown_remote_without_release() {
     let mut config = PinningHarnessConfig::request_one();
     config.providers[0].max_bytes = 6;
     config.providers[0].max_pins = 1;
@@ -8273,14 +8181,11 @@ async fn test_pinning_new_shared_target_during_delete_compensates_without_releas
             ("QmWait".to_owned(), b"wait".to_vec()),
         ]),
     };
-    config.pinata_script = vec![
-        PsaReply::pinned_submit("/psa/pins", "shared-before-delete", "QmShared"),
-        PsaReply::empty(
-            http::Method::DELETE,
-            "/psa/pins/shared-before-delete",
-            StatusCode::NOT_FOUND.as_u16(),
-        ),
-    ];
+    config.pinata_script = vec![PsaReply::pinned_submit(
+        "/psa/pins",
+        "shared-before-delete",
+        "QmShared",
+    )];
     let mut harness = start_pinning_harness(config).await;
 
     let first = signed_put_with_tagging(
@@ -8309,18 +8214,8 @@ async fn test_pinning_new_shared_target_during_delete_compensates_without_releas
 
     let cancel = signed_delete_object_tagging(&harness, "delete-race-first.txt").await;
     assert_eq!(cancel.status(), StatusCode::NO_CONTENT);
-    let delete_block = harness.block_next_delete("pinata-primary").await;
-    harness.restart_worker();
-    delete_block.wait_until_blocked().await;
-    let delete = harness
-        .wait_for_provider_request(
-            "pinata-primary",
-            http::Method::DELETE,
-            "/psa/pins/shared-before-delete",
-            1,
-        )
-        .await;
-    assert_delete_request(&delete, "/psa/pins/shared-before-delete");
+    harness.run_worker_until_idle().await;
+    assert_unknown_psa_resource(&harness, "pinata-primary", "QmShared", "retained").await;
 
     let shared_new = signed_put_with_tagging(
         &harness,
@@ -8334,24 +8229,18 @@ async fn test_pinning_new_shared_target_during_delete_compensates_without_releas
     let before_delete_completion = remote_pin(&harness, "pinata-primary", "QmShared").await;
     assert_eq!(before_delete_completion.epoch, initial_remote.epoch + 2);
 
-    delete_block.release();
-    let unpin = harness
-        .pin_jobs()
-        .await
-        .into_iter()
-        .find(|job| job.operation == "unpin")
-        .expect("cancelled original target publishes one Unpin");
-    harness.wait_for_job_state(&unpin.id, "done").await;
-    harness.stop_worker_without_unlocking().await;
-
-    let compensated = remote_pin(&harness, "pinata-primary", "QmShared").await;
+    let retained = remote_pin(&harness, "pinata-primary", "QmShared").await;
     assert_eq!(
         (
-            compensated.status.as_str(),
-            compensated.request_id.as_deref(),
-            compensated.epoch,
+            retained.status.as_str(),
+            retained.request_id.as_deref(),
+            retained.epoch,
         ),
-        ("reserved", None, initial_remote.epoch + 2)
+        (
+            "pinned",
+            Some("shared-before-delete"),
+            initial_remote.epoch + 2
+        )
     );
     assert_eq!(
         (
@@ -8362,7 +8251,7 @@ async fn test_pinning_new_shared_target_during_delete_compensates_without_releas
             harness.provider_usage("pinata-primary").await.reserved_pins,
         ),
         (6, 1),
-        "NotFound DELETE compensates the shared reservation rather than releasing it"
+        "unknown shared remote keeps its reservation rather than releasing it"
     );
     assert_eq!(
         harness.target_states("quota-waiter.txt").await,
@@ -8372,36 +8261,28 @@ async fn test_pinning_new_shared_target_during_delete_compensates_without_releas
     let new_object = latest_pinning_object(&harness, "delete-race-new.txt").await;
     let new_lease = owner_leases(&harness, &new_object.id).await.remove(0);
     let new_target = lease_targets(&harness, &new_lease.id).await.remove(0);
-    let replacement_submit = harness
-        .pin_jobs()
-        .await
-        .into_iter()
-        .find(|job| {
-            job.operation == "submit" && job.target_id.as_deref() == Some(new_target.id.as_str())
-        })
-        .expect("current shared target receives a compensation Submit");
-    assert_eq!(replacement_submit.state, "pending");
-    assert_eq!(new_target.state, "waiting");
+    assert_eq!(new_target.state, "pinned");
     let requests = harness.provider_requests().await;
-    assert_eq!(requests.len(), 2, "the replacement Submit remains pending");
+    assert_eq!(
+        requests.len(),
+        1,
+        "shared CID must not need a replacement Submit"
+    );
     assert_submit_request(&requests[0], "/psa/pins", "QmShared");
-    assert_delete_request(&requests[1], "/psa/pins/shared-before-delete");
+    assert_no_psa_delete(&harness).await;
     assert_signed_body(&harness, "delete-race-new.txt", b"shared").await;
     assert_no_kubo_pin_removes(&harness).await;
     harness.shutdown().await;
 }
 
 #[tokio::test]
-async fn test_pinning_expiry_removes_remote_pin_but_preserves_s3_and_kubo_pin() {
+async fn test_pinning_expiry_retains_unknown_remote_and_preserves_s3_and_kubo_pin() {
     let mut config = PinningHarnessConfig::request_one();
-    config.pinata_script = vec![
-        PsaReply::pinned_submit("/psa/pins", "expiry-delete-request", "QmTestCid"),
-        PsaReply::empty(
-            http::Method::DELETE,
-            "/psa/pins/expiry-delete-request",
-            StatusCode::NO_CONTENT.as_u16(),
-        ),
-    ];
+    config.pinata_script = vec![PsaReply::pinned_submit(
+        "/psa/pins",
+        "expiry-delete-request",
+        "QmTestCid",
+    )];
     let mut harness = start_pinning_harness(config).await;
 
     let put = signed_put_with_tagging(
@@ -8417,12 +8298,11 @@ async fn test_pinning_expiry_removes_remote_pin_but_preserves_s3_and_kubo_pin() 
     let object = latest_pinning_object(&harness, "expired.txt").await;
     let manual = owner_leases(&harness, &object.id).await.remove(0);
     let target = lease_targets(&harness, &manual.id).await.remove(0);
+    assert_unknown_psa_resource(&harness, "pinata-primary", "QmTestCid", "confirmed").await;
 
     harness.advance_past_lease_expiry("expired.txt").await;
-    let delete_block = harness.block_next_delete("pinata-primary").await;
     harness.restart_worker();
-    delete_block.wait_until_blocked().await;
-    delete_block.release();
+    harness.wait_for_lease_state("expired.txt", "expired").await;
     harness.wait_for_worker_idle().await;
     harness.stop_worker_without_unlocking().await;
 
@@ -8451,7 +8331,7 @@ async fn test_pinning_expiry_removes_remote_pin_but_preserves_s3_and_kubo_pin() 
             remote.request_id.as_deref(),
             remote.epoch
         ),
-        ("absent", None, 2)
+        ("pinned", Some("expiry-delete-request"), 2)
     );
     assert_eq!(
         (
@@ -8461,12 +8341,13 @@ async fn test_pinning_expiry_removes_remote_pin_but_preserves_s3_and_kubo_pin() 
                 .reserved_bytes,
             harness.provider_usage("pinata-primary").await.reserved_pins,
         ),
-        (0, 0)
+        (4, 1)
     );
+    assert_unknown_psa_resource(&harness, "pinata-primary", "QmTestCid", "retained").await;
     let requests = harness.provider_requests().await;
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 1);
     assert_submit_request(&requests[0], "/psa/pins", "QmTestCid");
-    assert_delete_request(&requests[1], "/psa/pins/expiry-delete-request");
+    assert_no_psa_delete(&harness).await;
     assert_signed_body(&harness, "expired.txt", b"body").await;
     assert_no_kubo_pin_removes(&harness).await;
     harness.shutdown().await;
@@ -9073,6 +8954,7 @@ async fn test_pinning_zip_global_reject_creates_no_manual_lease() {
 async fn test_pinning_multipart_zip_complete_commits_entries_and_upload_delete_atomically() {
     let archive_bytes = legal_two_entry_zip();
     let mut config = PinningHarnessConfig::request_one();
+    config.explicit_identity = true;
     config.kubo_script = KuboScript {
         add_replies: vec![
             AddReply::Ok("QmPart"),
@@ -9210,10 +9092,9 @@ async fn test_pinning_multipart_zip_complete_commits_entries_and_upload_delete_a
         BTreeSet::from(["QmEntry1".to_owned(), "QmEntry2".to_owned()])
     );
     assert!(!target_cids.contains("QmRoot"));
+    let pinata_key = harness.provider_key("pinata-primary");
     assert!(targets.iter().all(|target| {
-        target.provider == "pinata-primary"
-            && target.state == "waiting"
-            && target.lease_id == manual.id
+        target.provider == pinata_key && target.state == "waiting" && target.lease_id == manual.id
     }));
     assert_eq!(
         harness
@@ -9223,7 +9104,7 @@ async fn test_pinning_multipart_zip_complete_commits_entries_and_upload_delete_a
             .map(|usage| (usage.provider, usage.reserved_bytes, usage.reserved_pins))
             .collect::<Vec<_>>(),
         vec![(
-            "pinata-primary".to_owned(),
+            pinata_key.clone(),
             (FIRST_ENTRY_BYTES.len() + SECOND_ENTRY_BYTES.len()) as i64,
             2,
         )]
@@ -9232,7 +9113,7 @@ async fn test_pinning_multipart_zip_complete_commits_entries_and_upload_delete_a
     assert_eq!(jobs.len(), 2);
     assert!(jobs.iter().all(|job| {
         job.operation == "submit"
-            && job.provider == "pinata-primary"
+            && job.provider == pinata_key
             && job.lease_id.as_deref() == Some(manual.id.as_str())
             && job.expected_generation == Some(1)
             && job.expected_remote_epoch.is_none()
@@ -9295,6 +9176,7 @@ async fn test_pinning_multipart_zip_complete_commits_entries_and_upload_delete_a
 async fn test_pinning_multipart_zip_outbox_failure_preserves_upload_and_parts() {
     let archive_bytes = legal_two_entry_zip();
     let mut config = PinningHarnessConfig::request_one();
+    config.explicit_identity = true;
     config.kubo_script = KuboScript {
         add_replies: vec![
             AddReply::Ok("QmPart"),

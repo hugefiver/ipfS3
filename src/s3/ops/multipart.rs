@@ -10,11 +10,13 @@ use sea_orm::TransactionTrait;
 use crate::crypto::EncryptionMode;
 use crate::lifecycle::model::MultipartUploadTargetIdentity;
 use crate::pinning::config::ProviderLimitMap;
+use crate::pinning::decision::{DecisionOrigin, ExtensionDecision};
 use crate::pinning::policy::{PublicationContext, PublicationPolicy};
 use crate::pinning::tags::ObjectTag;
 use crate::state::AppState;
 use crate::store::pinning::publication::{
-    PinTargetSpec, PublicationObject, PublicationRequest, PublicationResult, ZipPublicationRequest,
+    DecidedPublish, PinTargetSpec, PublicationObject, PublicationRequest, PublicationResult,
+    ZipPublicationRequest,
 };
 
 use super::object::{
@@ -59,26 +61,6 @@ fn parse_publication_tags(headers: &http::HeaderMap) -> S3Result<Vec<ObjectTag>>
         .map_err(|_| invalid_pinning_argument("invalid x-amz-tagging header"))
 }
 
-fn evaluate_publication_policy(
-    state: &Arc<AppState>,
-    bucket: &str,
-    key: &str,
-    tags: &[ObjectTag],
-    is_decompress_zip: bool,
-) -> S3Result<PublicationPolicy> {
-    state
-        .pinning
-        .policy()
-        .evaluate_publication(PublicationContext {
-            bucket,
-            key,
-            tags,
-            is_decompress_zip,
-        })
-        .map_err(crate::error::AppError::from)
-        .map_err(s3s::S3Error::from)
-}
-
 /// Initiate a multipart upload.
 ///
 /// Allocates a fresh `object_id` and `upload_id`, records the upload metadata
@@ -95,7 +77,6 @@ pub async fn create_multipart_upload(
 
     let (decompress_zip_target, decompress_zip_result) = parse_decompress_upload_options(&req.uri)?;
     let tags = parse_publication_tags(&req.headers)?;
-    evaluate_publication_policy(state, bucket, key, &tags, decompress_zip_target.is_some())?;
 
     // Validate the bucket exists.
     let db = state.store.db();
@@ -123,6 +104,26 @@ pub async fn create_multipart_upload(
     let metadata = extract_custom_metadata(&req.headers);
     let object_id = uuid::Uuid::new_v4().to_string();
     let upload_id = uuid::Uuid::new_v4().to_string();
+    let principal = super::object::principal_id(&req)?;
+    let (_, mut decision) = state
+        .pinning
+        .policy()
+        .evaluate_publication_decision(
+            PublicationContext {
+                bucket,
+                key,
+                tags: &tags,
+                is_decompress_zip: decompress_zip_target.is_some(),
+            },
+            DecisionOrigin::new(principal, &upload_id),
+        )
+        .map_err(crate::error::AppError::from)?;
+    decision
+        .capture_durable_revision(
+            state.pinning.effective_config(),
+            state.pinning.control_mode(),
+        )
+        .map_err(invalid_pinning_argument)?;
 
     // For SSE-S3 we generate a per-object key now and persist its wrapped form
     // so the same key can be reused for every part. SSE-C keys are supplied
@@ -143,8 +144,9 @@ pub async fn create_multipart_upload(
         EncryptionMode::None => (None, None),
     };
 
-    crate::store::multipart::create_upload(
-        db,
+    let txn = db.begin().await.map_err(crate::error::AppError::from)?;
+    crate::store::multipart::create_upload_with_decision(
+        &txn,
         &upload_id,
         &object_id,
         bucket,
@@ -157,8 +159,10 @@ pub async fn create_multipart_upload(
         &tags,
         decompress_zip_target.as_deref(),
         decompress_zip_result,
+        Some(&decision),
     )
     .await?;
+    txn.commit().await.map_err(crate::error::AppError::from)?;
 
     let server_side_encryption = if enc_mode == EncryptionMode::SseS3 {
         Some(ServerSideEncryption::from_static("AES256"))
@@ -166,13 +170,16 @@ pub async fn create_multipart_upload(
         None
     };
 
-    Ok(S3Response::new(CreateMultipartUploadOutput {
-        bucket: Some(bucket.clone()),
-        key: Some(key.clone()),
-        upload_id: Some(upload_id),
-        server_side_encryption,
-        ..Default::default()
-    }))
+    Ok(S3Response::with_headers(
+        CreateMultipartUploadOutput {
+            bucket: Some(bucket.clone()),
+            key: Some(key.clone()),
+            upload_id: Some(upload_id),
+            server_side_encryption,
+            ..Default::default()
+        },
+        super::object::pin_warning_headers(decision.warning),
+    ))
 }
 
 async fn validate_sse_c_upload_key(
@@ -407,6 +414,7 @@ pub async fn upload_part(
 pub struct CompletedMultipartArchive {
     pub tags: Vec<ObjectTag>,
     pub publication_policy: PublicationPolicy,
+    pub pin_decision: Option<ExtensionDecision>,
     pub bucket: String,
     pub key: String,
     pub upload_id: String,
@@ -445,6 +453,29 @@ pub(crate) trait CompletedUploadFinalizerStore: Send + Sync {
         limits: &ProviderLimitMap,
     ) -> Result<PublicationResult, crate::store::multipart::CommitCompletedUploadError>;
 
+    async fn commit_decided_object(
+        &self,
+        upload_target: &MultipartUploadTargetIdentity,
+        request: PublicationRequest,
+        guard: crate::store::import::ownership::StandardMutationGuard,
+        limits: &ProviderLimitMap,
+        _decision: &ExtensionDecision,
+    ) -> Result<PublicationResult, crate::store::multipart::CommitCompletedUploadError> {
+        self.commit_object(upload_target, request, guard, limits)
+            .await
+    }
+
+    async fn commit_decided_zip(
+        &self,
+        upload_target: &MultipartUploadTargetIdentity,
+        request: ZipPublicationRequest,
+        guard: crate::store::import::ownership::StandardMutationGuard,
+        limits: &ProviderLimitMap,
+        _decision: &ExtensionDecision,
+    ) -> Result<PublicationResult, crate::store::multipart::CommitCompletedUploadError> {
+        self.commit_zip(upload_target, request, guard, limits).await
+    }
+
     async fn reconcile(
         &self,
         upload_id: &str,
@@ -454,10 +485,57 @@ pub(crate) trait CompletedUploadFinalizerStore: Send + Sync {
 
 struct DatabaseCompletedUploadFinalizer<'a> {
     db: &'a sea_orm::DatabaseConnection,
+    pinning: &'a crate::pinning::coordinator::PinningCoordinator,
 }
 
 #[async_trait::async_trait]
 impl CompletedUploadFinalizerStore for DatabaseCompletedUploadFinalizer<'_> {
+    async fn commit_decided_object(
+        &self,
+        upload_target: &MultipartUploadTargetIdentity,
+        request: PublicationRequest,
+        guard: crate::store::import::ownership::StandardMutationGuard,
+        _limits: &ProviderLimitMap,
+        decision: &ExtensionDecision,
+    ) -> Result<PublicationResult, crate::store::multipart::CommitCompletedUploadError> {
+        crate::store::pinning::publication::publish_decided_completed_upload(
+            self.db,
+            upload_target,
+            request,
+            Some(guard),
+            DecidedPublish {
+                decision,
+                config: self.pinning.effective_config(),
+                mode: self.pinning.control_mode(),
+                limits: self.pinning.provider_limits(),
+            },
+        )
+        .await
+    }
+
+    async fn commit_decided_zip(
+        &self,
+        upload_target: &MultipartUploadTargetIdentity,
+        request: ZipPublicationRequest,
+        guard: crate::store::import::ownership::StandardMutationGuard,
+        _limits: &ProviderLimitMap,
+        decision: &ExtensionDecision,
+    ) -> Result<PublicationResult, crate::store::multipart::CommitCompletedUploadError> {
+        crate::store::pinning::publication::publish_decided_completed_zip(
+            self.db,
+            upload_target,
+            request,
+            Some(guard),
+            DecidedPublish {
+                decision,
+                config: self.pinning.effective_config(),
+                mode: self.pinning.control_mode(),
+                limits: self.pinning.provider_limits(),
+            },
+        )
+        .await
+    }
+
     async fn commit_object(
         &self,
         upload_target: &MultipartUploadTargetIdentity,
@@ -541,6 +619,7 @@ pub async fn finalize_completed_multipart_zip(
 ) -> S3Result<PublicationResult> {
     let store = DatabaseCompletedUploadFinalizer {
         db: state.store.db(),
+        pinning: &state.pinning,
     };
     let work = finalize_completed_multipart_zip_with_store(
         completed,
@@ -571,15 +650,27 @@ pub(crate) async fn finalize_completed_multipart_zip_with_store<
     }
     let expected_archive = request.archive.object.clone();
 
-    match store
-        .commit_zip(
-            &completed.upload_target,
-            request,
-            completed.mutation_guard.clone(),
-            limits,
-        )
-        .await
-    {
+    let commit = if let Some(decision) = &completed.pin_decision {
+        store
+            .commit_decided_zip(
+                &completed.upload_target,
+                request,
+                completed.mutation_guard.clone(),
+                limits,
+                decision,
+            )
+            .await
+    } else {
+        store
+            .commit_zip(
+                &completed.upload_target,
+                request,
+                completed.mutation_guard.clone(),
+                limits,
+            )
+            .await
+    };
+    match commit {
         Ok(result) => Ok(result),
         Err(crate::store::multipart::CommitCompletedUploadError::RolledBack {
             completion_attempt_id,
@@ -640,6 +731,7 @@ pub async fn finalize_completed_multipart_archive(
 ) -> S3Result<PublicationResult> {
     let store = DatabaseCompletedUploadFinalizer {
         db: state.store.db(),
+        pinning: &state.pinning,
     };
     let work = finalize_completed_multipart_archive_with_store(
         completed,
@@ -666,15 +758,27 @@ async fn finalize_completed_multipart_archive_with_store<
     let request = completed_publication_request(completed);
     let expected_archive = request.object.clone();
 
-    match store
-        .commit_object(
-            &completed.upload_target,
-            request,
-            completed.mutation_guard.clone(),
-            limits,
-        )
-        .await
-    {
+    let commit = if let Some(decision) = &completed.pin_decision {
+        store
+            .commit_decided_object(
+                &completed.upload_target,
+                request,
+                completed.mutation_guard.clone(),
+                limits,
+                decision,
+            )
+            .await
+    } else {
+        store
+            .commit_object(
+                &completed.upload_target,
+                request,
+                completed.mutation_guard.clone(),
+                limits,
+            )
+            .await
+    };
+    match commit {
         Ok(result) => Ok(result),
         Err(crate::store::multipart::CommitCompletedUploadError::RolledBack {
             completion_attempt_id,
@@ -730,14 +834,21 @@ pub async fn complete_multipart_upload(
     let completed = complete_multipart_upload_inner(state, req).await?;
     let publication_result = finalize_completed_multipart_archive(state, &completed).await?;
 
-    Ok(S3Response::new(CompleteMultipartUploadOutput {
-        bucket: Some(completed.bucket),
-        key: Some(completed.key),
-        e_tag: Some(ETag::Strong(completed.root_cid)),
-        server_side_encryption: completed.server_side_encryption,
-        version_id: publication_result.version_id,
-        ..Default::default()
-    }))
+    let warning = completed
+        .pin_decision
+        .as_ref()
+        .and_then(|decision| decision.warning);
+    Ok(S3Response::with_headers(
+        CompleteMultipartUploadOutput {
+            bucket: Some(completed.bucket),
+            key: Some(completed.key),
+            e_tag: Some(ETag::Strong(completed.root_cid)),
+            server_side_encryption: completed.server_side_encryption,
+            version_id: publication_result.version_id,
+            ..Default::default()
+        },
+        super::object::pin_warning_headers(warning),
+    ))
 }
 
 pub async fn complete_multipart_upload_inner(
@@ -812,8 +923,41 @@ pub async fn complete_multipart_upload_inner(
 
     let tags = crate::store::pinning::tags::tags_from_json(&upload.tags_json)
         .map_err(|_| s3s::s3_error!(InternalError, "invalid persisted multipart upload tags"))?;
-    let publication_policy =
-        evaluate_publication_policy(state, bucket, key, &tags, decompress_zip_target.is_some())?;
+    let pin_decision = crate::store::multipart::decision_from_upload(&upload)?;
+    if let Some(decision) = &pin_decision {
+        decision
+            .verify_revision(
+                state.pinning.effective_config(),
+                state.pinning.control_mode(),
+            )
+            .map_err(invalid_pinning_argument)?;
+    }
+    // NULL is an unknown historical capture, not permission to reinterpret raw
+    // reserved tags or opt into a newly installed policy at completion.
+    let publication_policy = match &pin_decision {
+        Some(decision) => decision
+            .replay_policy(tags.clone())
+            .map_err(invalid_pinning_argument)?,
+        None => PublicationPolicy {
+            tags: tags.clone(),
+            leases: Vec::new(),
+        },
+    };
+
+    // This read rejects an already-overwritten route before admission or Kubo I/O.
+    // Publication will lock and recheck the same route after the usage frontier.
+    if let Some(decision) = &pin_decision {
+        crate::store::pinning::publication::preflight_decided_routes(
+            db,
+            DecidedPublish {
+                decision,
+                config: state.pinning.effective_config(),
+                mode: state.pinning.control_mode(),
+                limits: state.pinning.provider_limits(),
+            },
+        )
+        .await?;
+    }
 
     let enc_mode = EncryptionMode::parse(&upload.encryption_mode);
     let sse_c_key = match enc_mode {
@@ -1041,6 +1185,7 @@ pub async fn complete_multipart_upload_inner(
     Ok(CompletedMultipartArchive {
         tags,
         publication_policy,
+        pin_decision,
         bucket: bucket.clone(),
         key: key.clone(),
         upload_id: upload_id.clone(),
@@ -1472,21 +1617,20 @@ mod tests {
         crate::store::bucket::create(&db, "test-bucket", None)
             .await
             .unwrap();
+        let store = crate::store::Store::new(db);
+        let pinning =
+            configured_pinning_coordinator(trigger, provider_mode, prefix, allow_decompressed);
+        pinning.register_identities(&store).await.unwrap();
         Arc::new(AppState {
             kubo: crate::kubo::KuboClient::new(kubo_uri),
             cold_kubo: None,
-            store: crate::store::Store::new(db),
+            store,
             credentials: HashMap::new(),
             master_key: crate::crypto::key::MasterKey::from_hex(
                 "0000000000000000000000000000000000000000000000000000000000000000",
             )
             .unwrap(),
-            pinning: configured_pinning_coordinator(
-                trigger,
-                provider_mode,
-                prefix,
-                allow_decompressed,
-            ),
+            pinning,
         })
     }
 
@@ -1919,6 +2063,7 @@ mod tests {
                 tags,
                 leases: Vec::new(),
             },
+            pin_decision: None,
             bucket: "test-bucket".to_owned(),
             key: "archive.zip".to_owned(),
             upload_id: "upload-1".to_owned(),
@@ -2135,7 +2280,10 @@ mod tests {
             uri: format!("/{bucket}/{key}?uploads").parse().unwrap(),
             headers: http::HeaderMap::new(),
             extensions: http::Extensions::new(),
-            credentials: None,
+            credentials: Some(s3s::auth::Credentials {
+                access_key: "test".into(),
+                secret_key: s3s::auth::SecretKey::from("test"),
+            }),
             region: None,
             service: None,
             trailing_headers: None,
@@ -3565,6 +3713,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_remote_intents_reject_new_mpu_before_upload_or_io() {
+        use crate::config::{OptionalPinControlMode, PinningConfig, PolicyConfig, ProviderConfig};
+        use crate::pinning::config::ValidatedPinningConfig;
+        use crate::store::entities::{multipart_upload, standard_mutation_lease};
+        let kubo = multipart_kubo(&[]).await;
+        let mut state = test_state_with_bucket_and_kubo("test-bucket", kubo.uri()).await;
+        for (mode, trigger, tagging, prefix, expected_ok) in [
+            (
+                OptionalPinControlMode::Strict,
+                "request",
+                "ipfs-s3%3Apin=true",
+                "",
+                false,
+            ),
+            (OptionalPinControlMode::Strict, "always", "", "", false),
+            (
+                OptionalPinControlMode::Warn,
+                "always",
+                "ipfs-s3%3Apin=true",
+                "",
+                false,
+            ),
+            (
+                OptionalPinControlMode::Warn,
+                "request",
+                "ipfs-s3%3Apin=false",
+                "",
+                true,
+            ),
+            (
+                OptionalPinControlMode::Warn,
+                "request",
+                "ipfs-s3%3Apin=true",
+                "allowed/",
+                true,
+            ),
+        ] {
+            let config = ValidatedPinningConfig::from_raw(
+                &PinningConfig {
+                    providers: vec![ProviderConfig {
+                        name: "remote".into(),
+                        kind: "pinata".into(),
+                        token_env: Some("PINNING_TOKEN".into()),
+                        endpoint: None,
+                        api: None,
+                        strategy: None,
+                        upload_endpoint: None,
+                        enabled: true,
+                        priority: 1,
+                        max_bytes: 1024,
+                        max_pins: 20,
+                        requests_per_second: None,
+                    }],
+                    policies: vec![PolicyConfig {
+                        bucket: "test-bucket".into(),
+                        prefix: prefix.into(),
+                        trigger: trigger.into(),
+                        provider_mode: "one".into(),
+                        providers: vec!["remote".into()],
+                        default_duration: "1h".into(),
+                        max_duration: "24h".into(),
+                        allow_decompressed: false,
+                    }],
+                    ..Default::default()
+                },
+                |_| Some("test-secret".into()),
+            )
+            .unwrap();
+            Arc::get_mut(&mut state).unwrap().pinning =
+                crate::pinning::coordinator::PinningCoordinator::build_with_kubo_and_mode(
+                    config, None, mode,
+                )
+                .unwrap();
+            let req = if tagging.is_empty() {
+                multipart_create_request("test-bucket", "object")
+            } else {
+                multipart_create_request_with_tagging("test-bucket", "object", tagging)
+            };
+            let result = create_multipart_upload(&state, req).await;
+            if expected_ok {
+                assert!(result.is_ok());
+            } else {
+                assert_eq!(result.unwrap_err().code().as_str(), "InvalidArgument");
+            }
+        }
+        assert_eq!(
+            multipart_upload::Entity::find()
+                .count(state.store.db())
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            standard_mutation_lease::Entity::find()
+                .count(state.store.db())
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(pinning_row_counts(&state).await, [0; 5]);
+        assert!(kubo.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn pinning_create_accepts_decompressed_control_only_with_allowed_zip_context() {
         let kubo = multipart_kubo(&[]).await;
         let state = pinning_test_state(kubo.uri(), "request", "one", "", true).await;
@@ -3615,6 +3867,251 @@ mod tests {
             .unwrap();
         assert_eq!(pinning_row_counts(&state).await, [0; 5]);
         assert_no_pin_removes(&kubo, &["QmPart"]).await;
+    }
+
+    #[tokio::test]
+    async fn accepted_multipart_provider_revision_drift_rejects_before_admission_or_kubo() {
+        use crate::pinning::decision::DecisionEffect;
+        use crate::store::entities::{import_destination, standard_mutation_lease};
+
+        for zip in [false, true] {
+            let kubo = multipart_kubo(&["QmPart", "QmRoot"]).await;
+            Mock::given(method("POST"))
+                .and(path("/api/v0/cat"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"part"))
+                .mount(&kubo)
+                .await;
+            let mut state = pinning_test_state(kubo.uri(), "request", "one", "", true).await;
+            let mut create = multipart_create_request_with_tagging(
+                "test-bucket",
+                "archive.zip",
+                "ipfs-s3%3Apin=true",
+            );
+            if zip {
+                create.uri = "/test-bucket/archive.zip?uploads=&decompress-zip=out%2F"
+                    .parse()
+                    .unwrap();
+            }
+            let upload_id = create_multipart_upload(&state, create)
+                .await
+                .unwrap()
+                .output
+                .upload_id
+                .unwrap();
+            let persisted = crate::store::multipart::get_upload(state.store.db(), &upload_id)
+                .await
+                .unwrap();
+            let decision = crate::store::multipart::decision_from_upload(&persisted)
+                .unwrap()
+                .unwrap();
+            assert_eq!(decision.effect, DecisionEffect::Accepted);
+
+            let part_etag = upload_part(&state, upload_part_request(&upload_id, b"part"))
+                .await
+                .unwrap()
+                .output
+                .e_tag
+                .unwrap();
+            assert_eq!(part_etag.value(), "QmPart");
+            let before = kubo.received_requests().await.unwrap();
+            assert_eq!(before.len(), 2, "zip={zip}");
+            assert_eq!(
+                import_destination::Entity::find()
+                    .count(state.store.db())
+                    .await
+                    .unwrap(),
+                0
+            );
+
+            let mut rotated = state.pinning.effective_config().clone();
+            rotated.providers[0].identity.endpoint_revision += 1;
+            Arc::get_mut(&mut state).unwrap().pinning =
+                crate::pinning::coordinator::PinningCoordinator::build(rotated).unwrap();
+            assert!(
+                decision
+                    .verify_revision(
+                        state.pinning.effective_config(),
+                        state.pinning.control_mode()
+                    )
+                    .is_err()
+            );
+
+            let error = complete_multipart_upload_inner(
+                &state,
+                complete_request(&upload_id, part_etag.value()),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code().as_str(), "InvalidArgument", "zip={zip}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("captured pinning configuration revision is unavailable")
+            );
+            assert_eq!(
+                kubo.received_requests().await.unwrap().len(),
+                before.len(),
+                "zip={zip}"
+            );
+            assert_eq!(
+                import_destination::Entity::find()
+                    .count(state.store.db())
+                    .await
+                    .unwrap(),
+                0,
+                "zip={zip}"
+            );
+            assert_eq!(
+                standard_mutation_lease::Entity::find()
+                    .count(state.store.db())
+                    .await
+                    .unwrap(),
+                0,
+                "zip={zip}"
+            );
+            assert!(
+                crate::store::multipart::get_part(state.store.db(), &upload_id, 1)
+                    .await
+                    .is_ok()
+            );
+            assert_eq!(pinning_row_counts(&state).await, [0; 5]);
+        }
+    }
+
+    #[tokio::test]
+    async fn registered_route_override_rejects_accepted_complete_before_kubo_or_admission() {
+        use crate::{
+            config::Config,
+            pinning::{config::ValidatedPinningConfig, coordinator::PinningCoordinator},
+            store::{
+                entities::{import_destination, standard_mutation_lease},
+                pinning::ledger,
+            },
+        };
+
+        for zip in [false, true] {
+            let kubo = multipart_kubo(&[]).await;
+            let mut state = test_state_with_bucket_and_kubo("test-bucket", kubo.uri()).await;
+            let config: Config = toml::from_str(
+                r#"
+                [pinning_identity]
+                primary_storage_domain = 'local'
+                [[pinning_identity.providers]]
+                config_name = 'remote'
+                provider_id = 'mpu-account'
+                display_name = 'Remote'
+                backend = 'filebase'
+                scope = 'mpu-scope'
+                storage_domain = 'remote'
+                credential_revision = 1
+                endpoint_revision = 1
+                secret_ref = 'env:MPU_ROUTE_TOKEN'
+                api_profile = 'filebase-psa'
+                strategy = 'cid'
+                [[pinning.providers]]
+                name = 'remote'
+                kind = 'filebase'
+                token_env = 'MPU_ROUTE_TOKEN'
+                priority = 1
+                max_bytes = 1000
+                max_pins = 100
+                [[pinning.policies]]
+                bucket = 'test-bucket'
+                trigger = 'request'
+                provider_mode = 'one'
+                providers = ['remote']
+                default_duration = '1h'
+                max_duration = '24h'
+            "#,
+            )
+            .unwrap();
+            let pinning = PinningCoordinator::build(
+                ValidatedPinningConfig::from_config(&config, |_| Some("test-token".into()))
+                    .unwrap(),
+            )
+            .unwrap();
+            Arc::get_mut(&mut state).unwrap().pinning = pinning;
+            state
+                .pinning
+                .register_identities(&state.store)
+                .await
+                .unwrap();
+            let mut create = multipart_create_request_with_tagging(
+                "test-bucket",
+                "archive.zip",
+                "ipfs-s3%3Apin=true",
+            );
+            if zip {
+                create.uri = "/test-bucket/archive.zip?uploads=&decompress-zip=out%2F"
+                    .parse()
+                    .unwrap();
+            }
+            let upload_id = create_multipart_upload(&state, create)
+                .await
+                .unwrap()
+                .output
+                .upload_id
+                .unwrap();
+            let upload = crate::store::multipart::get_upload(state.store.db(), &upload_id)
+                .await
+                .unwrap();
+            let decision = crate::store::multipart::decision_from_upload(&upload)
+                .unwrap()
+                .unwrap();
+            decision
+                .verify_revision(
+                    state.pinning.effective_config(),
+                    state.pinning.control_mode(),
+                )
+                .unwrap();
+            crate::store::multipart::upsert_part(
+                state.store.db(),
+                &upload_id,
+                1,
+                "QmPart",
+                4,
+                "QmPart",
+            )
+            .await
+            .unwrap();
+            let provider = &state.pinning.effective_config().providers[0];
+            let mut r2 = provider.identity.clone();
+            r2.credential_revision += 1;
+            ledger::register_route(state.store.db(), &provider.name, &r2)
+                .await
+                .unwrap();
+
+            let error =
+                complete_multipart_upload_inner(&state, complete_request(&upload_id, "QmPart"))
+                    .await
+                    .unwrap_err();
+            assert_eq!(error.code().as_str(), "InvalidArgument", "zip={zip}");
+            assert!(error.to_string().contains("route"));
+            assert!(
+                kubo.received_requests().await.unwrap().is_empty(),
+                "zip={zip}"
+            );
+            assert_eq!(
+                standard_mutation_lease::Entity::find()
+                    .count(state.store.db())
+                    .await
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                import_destination::Entity::find()
+                    .count(state.store.db())
+                    .await
+                    .unwrap(),
+                0
+            );
+            assert!(
+                crate::store::multipart::get_part(state.store.db(), &upload_id, 1)
+                    .await
+                    .is_ok()
+            );
+            assert_eq!(pinning_row_counts(&state).await, [0; 5]);
+        }
     }
 
     #[tokio::test]

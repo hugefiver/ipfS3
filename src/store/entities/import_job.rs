@@ -14,6 +14,8 @@ pub struct Model {
     pub object_content_type: Option<String>,
     pub metadata_json: String,
     pub tags_json: String,
+    /// Captured at authenticated submission; NULL only for pre-migration jobs.
+    pub pin_decision_json: Option<String>,
     pub decompress_prefix: Option<String>,
     pub state: String,
     pub phase: String,

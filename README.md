@@ -558,6 +558,11 @@ x-ipfs3-import-job-id: 7c8b6c8f-2898-4dc7-bab4-71b13cb472b8
 <IPFS3ImportAccepted><JobId>7c8b6c8f-2898-4dc7-bab4-71b13cb472b8</JobId><State>queued</State><Phase>queued</Phase></IPFS3ImportAccepted>
 ```
 
+`202 Accepted` means the import job was recorded, not that its object was
+published or remotely pinned. A pin-control warning on submission describes
+the captured request decision; check the signed status GET for the later job
+outcome. It isn't a remote pin confirmation.
+
 Query that path with a signed GET to read persisted progress or the terminal
 result:
 
@@ -804,6 +809,85 @@ independently attested ownership and late success. Current PSA responses alone
 do not supply such ownership attestation or trigger managed deletion.
 They are not evidence of a live provider account write or of remote content
 verification. No production account or remote data is touched by these tests.
+
+### Optional pin controls and local diagnostics (Stage 3)
+
+Omitting `[pinning_control]` keeps `unavailable = "strict"` for existing
+deployments. To allow an optional manual pin control to be skipped when its
+policy or provider is unavailable, set this explicitly:
+
+```toml
+[pinning_control]
+unavailable = "warn"
+```
+
+On a successful S3 write or tagging response, `x-ipfs3-pin-warning` can report
+`pin-policy-unavailable` or `pin-provider-unavailable`. A skipped request
+retains its valid tags and durable decision, but creates no executable **manual**
+pin work. A later provider addition, restart, ordinary tag edit, or copy does
+not replay that control. Inherited controls without a captured decision are
+treated as legacy unknown, not as a new manual request. Automatic `always`
+policies still apply independently: warn doesn't relax their provider set or
+turn `all` into a subset. Invalid tag structure, authentication failures,
+server-enforced restrictions, and primary Kubo/DB write failures still fail.
+Warnings aren't proof of cancellation or renewal at a remote provider.
+
+Multipart initiation captures the decision and can return the warning on a
+successful CreateMultipartUpload; completion reuses a captured skipped decision
+and returns its warning after successful publication, even if provider configuration
+changed in between. An accepted intent whose route becomes unsafe fails closed
+rather than being silently remapped. The import `202` warning describes
+admission only, not job completion or a remote pin. Successful direct ZIP
+responses can also carry the warning; this doesn't add the Stage 4 ZIP batch
+or UnixFS root contract.
+
+Before accepting a new multipart upload or import with executable non-Noop
+remote intent, configure an explicit `[[pinning_identity.providers]]` entry for
+every executable configured non-Noop provider, including operator-maintained
+`credential_revision` and `endpoint_revision`. New legacy async work is refused, rather than guessed
+from a provider name. Noop and requests with no executable remote intent remain
+allowed; historical jobs retain their captured route and aren't rewritten.
+Changing either revision before an accepted MPU completes fails before remote
+work or object publication. New remote submissions use an opaque UUID
+correlation; older jobs retain their original structured ID for recovery Find.
+
+Operators can run the following locally with the gateway binary. These aren't
+HTTP endpoints and don't start the gateway or run migrations:
+
+```powershell
+cargo run -- --pinning-doctor
+cargo run -- --config-explain
+cargo run -- --pinning-policy-explain my-bucket file.txt
+cargo run -- --pinning-status my-bucket file.txt
+cargo run -- --pinning-status my-bucket file.txt --version-id null --cursor 50
+```
+
+The first three load this CLI process's effective local config and report
+redacted provenance, configured routes and rule matches. They don't observe
+the running gateway or test the provider account's real permissions. Policy
+explain doesn't evaluate live tags, an object version or remote state.
+`--pinning-status` reads one bounded page of stored evidence for the current or
+specified version from the configured DB; `--cursor` is a page offset, not a
+stable continuation across concurrent writes. It doesn't query Kubo or remote
+providers. SQLite opens read-only without creating a missing file; PostgreSQL
+uses a read-only transaction. Protect local CLI and database access accordingly.
+
+For a browser to read `x-ipfs3-pin-warning`, configure the bucket's authorized
+CORS rule for that origin and method with `ExposeHeader` set to
+`x-ipfs3-pin-warning` using the signed `PutBucketCors` API. Matching rules alone
+don't expose it automatically; only the first matching bucket rule applies.
+Don't use a global wildcard or expose private headers just to read warnings.
+
+Before applying Stage 3 migrations `m20260920_000003_pin_extension_decision`,
+`m20260920_000004_multipart_pin_decision`,
+`m20260920_000005_import_pin_decision` and
+`m20260920_000006_pin_submit_correlation`, stop and drain **all old gateway writers
+and workers across replicas**, then back up and upgrade together. Never run old
+writers alongside the upgraded schema: they can't preserve captured decisions.
+Rollback is not a table drop or a return to an old writer that reinterprets raw
+tags. Stop new writes/workers, retain the decision rows and historical routes,
+and plan a compatible recovery before changing binaries. The Stage 2 rules for
+unknown ownership, retained capacity and historical routing still apply.
 
 ### Policies and coordination
 

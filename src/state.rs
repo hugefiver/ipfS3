@@ -40,7 +40,11 @@ impl AppState {
         let db = crate::store::connect_database(&cfg.storage.database_url).await?;
         crate::store::run_migrations(&db).await?;
         let store = Store::new(db);
-        let pinning = PinningCoordinator::build_with_kubo(validated_pinning, Some(kubo.clone()))?;
+        let pinning = PinningCoordinator::build_with_kubo_and_mode(
+            validated_pinning,
+            Some(kubo.clone()),
+            cfg.pinning_control.unavailable,
+        )?;
         pinning.register_identities(&store).await?;
 
         let credentials: HashMap<String, SecretKey> = cfg
@@ -86,7 +90,15 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::AppState;
-    use crate::config::{Config, ProviderConfig};
+    use crate::{
+        config::{Config, OptionalPinControlMode, PolicyConfig, ProviderConfig},
+        pinning::{
+            decision::{DecisionEffect, DecisionOrigin, WarningCode},
+            policy::PublicationContext,
+            tags::ObjectTag,
+        },
+    };
+    use std::cell::Cell;
 
     #[tokio::test]
     async fn pinning_initialization_rejects_a_missing_provider_token_before_database_connect() {
@@ -131,6 +143,74 @@ mod tests {
         assert!(state.pinning.provider_limits().is_empty());
         assert!(state.cold_kubo.is_none());
         let _worker_store = state.store.clone();
+    }
+
+    #[tokio::test]
+    async fn new_with_env_keeps_warn_mode_and_the_single_resolved_secret() {
+        let mut config = Config::default_for_test();
+        config.pinning_control.unavailable = OptionalPinControlMode::Warn;
+        config.pinning.providers = vec![ProviderConfig {
+            name: "pinata".to_owned(),
+            kind: "pinata".to_owned(),
+            token_env: Some("PINATA_TOKEN".to_owned()),
+            endpoint: None,
+            api: None,
+            strategy: None,
+            upload_endpoint: None,
+            enabled: false,
+            priority: 1,
+            max_bytes: 1_000,
+            max_pins: 10,
+            requests_per_second: None,
+        }];
+        config.pinning.policies = vec![PolicyConfig {
+            bucket: "bucket".to_owned(),
+            prefix: String::new(),
+            trigger: "request".to_owned(),
+            provider_mode: "one".to_owned(),
+            providers: vec!["pinata".to_owned()],
+            default_duration: "1h".to_owned(),
+            max_duration: "2h".to_owned(),
+            allow_decompressed: false,
+        }];
+        let resolutions = Cell::new(0);
+        let secret = "private-token-value";
+        let state = AppState::new_with_env(&config, |name| {
+            assert_eq!(name, "PINATA_TOKEN");
+            resolutions.set(resolutions.get() + 1);
+            Some(secret.to_owned())
+        })
+        .await
+        .unwrap();
+        assert_eq!(resolutions.get(), 1);
+        assert_eq!(state.pinning.control_mode(), OptionalPinControlMode::Warn);
+        assert_eq!(
+            state.pinning.effective_config().providers[0]
+                .token
+                .as_ref()
+                .unwrap()
+                .expose(),
+            secret
+        );
+        assert!(!format!("{:?}", state.pinning.effective_config()).contains(secret));
+        assert!(!state.pinning.provider_limits()["pinata"].enabled);
+        let tags = [ObjectTag::new("ipfs-s3:pin", "true")];
+        let (policy, decision) = state
+            .pinning
+            .policy()
+            .evaluate_publication_decision(
+                PublicationContext {
+                    bucket: "bucket",
+                    key: "object",
+                    tags: &tags,
+                    is_decompress_zip: false,
+                },
+                DecisionOrigin::new("principal", "request"),
+            )
+            .unwrap();
+        assert!(policy.leases.is_empty());
+        assert_eq!(decision.effect, DecisionEffect::Skipped);
+        assert_eq!(decision.warning, Some(WarningCode::NoAvailableProvider));
     }
 
     #[tokio::test]

@@ -13,6 +13,7 @@ use sea_orm::{
 use crate::{
     error::{AppError, AppResult},
     import::{ImportClaim, ImportFailure, ImportPhase, ImportProgress, ImportSource, ImportState},
+    pinning::decision::ExtensionDecision,
     pinning::tags::{ObjectTag, validate_tag_set},
     store::{entities::import_job, import::lease_clock},
 };
@@ -70,6 +71,28 @@ pub(crate) async fn insert_queued<C: ConnectionTrait>(
     request: NewImportJob,
     now: DateTime<Utc>,
 ) -> AppResult<import_job::Model> {
+    insert_queued_with_decision(txn, request, None, now).await
+}
+
+pub(crate) async fn insert_queued_with_decision<C: ConnectionTrait>(
+    txn: &C,
+    request: NewImportJob,
+    decision: Option<&ExtensionDecision>,
+    now: DateTime<Utc>,
+) -> AppResult<import_job::Model> {
+    let pin_decision_json = decision
+        .map(|decision| {
+            decision
+                .replay_policy(request.tags.clone())
+                .map_err(|_| AppError::InvalidImportRequest)?;
+            if decision.origin.request_id != request.id {
+                return Err(AppError::InvalidImportRequest);
+            }
+            serde_json::to_string(decision).map_err(|_| {
+                AppError::Internal("failed to serialize import pin decision".to_owned())
+            })
+        })
+        .transpose()?;
     let (source_type, source_value) = canonical_source(request.source)?;
     let metadata_json = deterministic_metadata_json(&request.metadata)?;
     let tags_json = deterministic_tags_json(request.tags)?;
@@ -86,6 +109,7 @@ pub(crate) async fn insert_queued<C: ConnectionTrait>(
         object_content_type: Set(request.object_content_type),
         metadata_json: Set(metadata_json),
         tags_json: Set(tags_json),
+        pin_decision_json: Set(pin_decision_json),
         decompress_prefix: Set(request.decompress_prefix),
         state: Set(STATE_QUEUED.to_owned()),
         phase: Set(PHASE_QUEUED.to_owned()),
@@ -625,7 +649,7 @@ mod tests {
     use chrono::{DateTime, Duration, Utc};
     use sea_orm::{
         ConnectOptions, ConnectionTrait, Database, DatabaseBackend, DatabaseConnection,
-        EntityTrait, Set, Statement, TransactionTrait,
+        EntityTrait, PaginatorTrait, Set, Statement, TransactionTrait,
     };
 
     use super::*;
@@ -782,6 +806,42 @@ mod tests {
         assert_eq!(inserted.downloaded_bytes, 0);
         assert_eq!(inserted.download_total, None);
         assert_eq!(inserted.ipfs_add_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn decision_from_another_job_cannot_create_a_partial_import_admission() {
+        use crate::{
+            config::PinningConfig,
+            pinning::{
+                config::ValidatedPinningConfig,
+                decision::DecisionOrigin,
+                policy::{PinPolicyEvaluator, PublicationContext},
+            },
+            store::{entities::import_destination, import::ownership},
+        };
+        let db = setup().await;
+        let request = request("job-1", "key");
+        let config = ValidatedPinningConfig::from_raw(&PinningConfig::default(), |_| None).unwrap();
+        let (_, decision) = PinPolicyEvaluator::new(&config)
+            .evaluate_publication_decision(
+                PublicationContext {
+                    bucket: "bucket",
+                    key: "key",
+                    tags: &request.tags,
+                    is_decompress_zip: false,
+                },
+                DecisionOrigin::new("test", "different-job"),
+            )
+            .unwrap();
+        assert!(matches!(
+            ownership::submit_decided(&db, request, decision, time(0)).await,
+            Err(AppError::InvalidImportRequest)
+        ));
+        assert_eq!(import_job::Entity::find().count(&db).await.unwrap(), 0);
+        assert_eq!(
+            import_destination::Entity::find().count(&db).await.unwrap(),
+            0
+        );
     }
 
     #[tokio::test]

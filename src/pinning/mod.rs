@@ -1,5 +1,6 @@
 pub mod config;
 pub mod coordinator;
+pub mod decision;
 pub mod filebase;
 pub mod identity;
 pub mod noop;

@@ -31,6 +31,10 @@ pub struct Config {
     #[allow(dead_code)]
     pub pinning: PinningConfig,
 
+    /// Compatibility opt-in for *optional manual* pin controls only. Omission is strict.
+    #[serde(default)]
+    pub pinning_control: PinningControlConfig,
+
     #[serde(default)]
     pub pinning_identity: PinningIdentityConfig,
 
@@ -227,6 +231,20 @@ pub struct PinningConfig {
     pub policies: Vec<PolicyConfig>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OptionalPinControlMode {
+    #[default]
+    Strict,
+    Warn,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PinningControlConfig {
+    #[serde(default)]
+    pub unavailable: OptionalPinControlMode,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct ProviderConfig {
     pub name: String,
@@ -333,6 +351,7 @@ impl Config {
             auth: default_auth_config(),
             crypto: default_crypto_config(),
             pinning: default_pinning_config(),
+            pinning_control: PinningControlConfig::default(),
             pinning_identity: PinningIdentityConfig::default(),
             imports: ImportConfig::default(),
             lifecycle: default_lifecycle_config(),
@@ -532,6 +551,21 @@ mod tests {
         assert_eq!(config.pinning.worker_concurrency, 4);
         assert!(config.pinning.providers.is_empty());
         assert!(config.pinning.policies.is_empty());
+    }
+
+    #[test]
+    fn optional_pinning_compatibility_requires_explicit_warn() {
+        let legacy: Config = toml::from_str("").unwrap();
+        assert_eq!(
+            legacy.pinning_control.unavailable,
+            OptionalPinControlMode::Strict
+        );
+        let warn: Config = toml::from_str("[pinning_control]\nunavailable = 'warn'").unwrap();
+        assert_eq!(
+            warn.pinning_control.unavailable,
+            OptionalPinControlMode::Warn
+        );
+        assert!(toml::from_str::<Config>("[pinning_control]\nunavailable = 'ignore'").is_err());
     }
 
     #[test]
