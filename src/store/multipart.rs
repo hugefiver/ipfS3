@@ -12,6 +12,8 @@ use super::entities::{multipart_part, multipart_upload};
 use crate::pinning::decision::ExtensionDecision;
 use crate::pinning::tags::ObjectTag;
 
+pub mod v2_zip;
+
 #[allow(clippy::too_many_arguments)]
 pub async fn create_upload<C: ConnectionTrait>(
     db: &C,

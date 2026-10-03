@@ -5,19 +5,21 @@ use std::sync::Arc;
 use http::{HeaderMap, Method, StatusCode, Uri};
 use s3s::route::S3Route;
 use s3s::{Body, S3Request, S3Response, S3Result};
+use sha2::Digest as _;
 
 use self::request::{
-    ParsedImportSource, collect_import_xml, encode_continuation_token, legacy_request_fingerprint,
-    optional_single_header, parse_client_token, parse_import_xml, parse_metadata,
-    parse_status_query, parse_submit_query, parse_tags, reject_sse_headers, request_fingerprint,
-    validate_submission_content_type,
+    ParsedImportSource, V2ImportContract, collect_import_xml, encode_continuation_token,
+    legacy_request_fingerprint, optional_single_header, parse_client_token, parse_import_xml,
+    parse_metadata, parse_status_query, parse_submit_query, parse_tags, reject_sse_headers,
+    request_fingerprint, request_zip_fingerprint, v2_import_contract,
+    validate_submission_content_type, validate_v2_import_headers,
 };
 use crate::{
     error::AppError,
     import::{
         ImportSource,
         pipeline::ImportCoordinator,
-        response::{StatusResultPage, accepted_xml, status_xml},
+        response::{StatusResultPage, ZipRootStatus, accepted_xml, status_xml_with_root},
     },
     pinning::{
         decision::{DecisionEffect, DecisionOrigin, ExtensionDecision},
@@ -29,16 +31,31 @@ use crate::{
         jobs::{self, NewImportJob, SubmitImportOutcome},
         ownership, results,
     },
+    store::zip::{execution, import_intake},
+    zip::options::{ZipOptions, parse_zip_options_for_import},
 };
 
 pub struct ImportObjectRoute {
     state: Arc<AppState>,
     coordinator: Arc<ImportCoordinator>,
+    root_default: bool,
 }
 
 impl ImportObjectRoute {
     pub fn new(state: Arc<AppState>, coordinator: Arc<ImportCoordinator>) -> Self {
-        Self { state, coordinator }
+        Self::with_root_default(state, coordinator, true)
+    }
+
+    pub fn with_root_default(
+        state: Arc<AppState>,
+        coordinator: Arc<ImportCoordinator>,
+        root_default: bool,
+    ) -> Self {
+        Self {
+            state,
+            coordinator,
+            root_default,
+        }
     }
 
     pub(super) async fn call_authenticated(
@@ -67,7 +84,30 @@ impl ImportObjectRoute {
         let object_content_type =
             optional_single_header(&req.headers, "x-ipfs3-object-content-type")?;
         let tags = parse_tags(&req.headers)?;
+        let root_capture = parsed_query
+            .decompress_prefix
+            .as_ref()
+            .map(|_| {
+                crate::pinning::tags::resolve_zip_root_option(&tags, self.root_default)
+                    .map_err(|_| AppError::InvalidPinningRequest("invalid zip-root tag".to_owned()))
+            })
+            .transpose()?;
         let metadata = parse_metadata(&req.headers);
+        let root_override = match root_capture {
+            Some(crate::pinning::tags::ZipRootCapture::Tagged(value)) => Some(value),
+            _ => None,
+        };
+        let (zip_options, expected_sha256) =
+            parse_zip_options_for_import(&req.headers, true, root_override, self.root_default)?;
+        if let ZipOptions::V2(options) = &zip_options {
+            validate_v2_import_headers(&req.headers, options, client_token.as_deref())?;
+            if parsed_query.decompress_prefix.is_none() {
+                return Err(s3s::s3_error!(
+                    InvalidRequest,
+                    "unsupported ZIP v2 import publication mode"
+                ));
+            }
+        }
 
         let body = collect_import_xml(&mut req.input).await?;
         let parsed_source = parse_import_xml(&body)?;
@@ -76,7 +116,75 @@ impl ImportObjectRoute {
             ParsedImportSource::Url(url) => ImportSource::Url(url),
         };
         let principal = crate::s3::ops::object::principal_id(&req)?;
-        let request_fingerprint = request_fingerprint(
+        if let ZipOptions::V2(options) = zip_options {
+            if matches!(source, ImportSource::Url(_)) && expected_sha256.is_none() {
+                return Err(s3s::s3_error!(
+                    InvalidRequest,
+                    "ZIP v2 URL import requires signed expected SHA-256"
+                ));
+            }
+            let prefix = parsed_query
+                .decompress_prefix
+                .as_deref()
+                .expect("v2 prefix validated");
+            let (contract, source_descriptor) = v2_import_contract(&V2ImportContract {
+                source: &source,
+                principal: &principal,
+                bucket: &parsed_query.bucket,
+                key: &parsed_query.key,
+                prefix,
+                expected: expected_sha256.as_deref(),
+                options: &options,
+                object_content_type: object_content_type.as_deref(),
+                metadata: &metadata,
+                tags: &tags,
+            })?;
+            let captured_options = serde_json::json!({
+                "options": &options,
+                "target_prefix": prefix,
+                "rule_revision": self.state.pinning.zip_output_rules().revision(),
+                "source_content_type": object_content_type,
+                "source_metadata": metadata,
+                "source_tags": tags,
+            })
+            .to_string();
+            let intake = import_intake::Request {
+                admission: execution::Admission {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    owner: principal,
+                    source: "import".to_owned(),
+                    token: options.token.clone(),
+                    request_fingerprint: hex::encode(sha2::Sha256::digest(contract.as_bytes())),
+                    request_contract: contract,
+                    bucket: parsed_query.bucket,
+                    source_key: parsed_query.key,
+                    captured_options,
+                },
+                prefix: prefix.to_owned(),
+                source_descriptor,
+                expected_sha256,
+            };
+            if let Some(status) = import_intake::preflight(self.state.store.db(), &intake).await? {
+                return accepted_v2_response(&req.uri, &status);
+            }
+            if let ImportSource::Url(url) = &source {
+                self.coordinator.authorize_url_for_submission(url).await?;
+            }
+            let status = import_intake::admit(self.state.store.db(), &intake).await?;
+            return accepted_v2_response(&req.uri, &status);
+        }
+        if let Some(token) = client_token.as_deref()
+            && import_intake::legacy_token_exists(
+                self.state.store.db(),
+                &parsed_query.bucket,
+                &parsed_query.key,
+                token,
+            )
+            .await?
+        {
+            return Err(AppError::ImportIdempotencyConflict.into());
+        }
+        let prior_fingerprint = request_fingerprint(
             &source,
             &principal,
             object_content_type.as_deref(),
@@ -84,6 +192,18 @@ impl ImportObjectRoute {
             &tags,
             parsed_query.decompress_prefix.as_deref(),
         )?;
+        let request_fingerprint = match (parsed_query.decompress_prefix.as_deref(), root_capture) {
+            (Some(prefix), Some(capture)) => request_zip_fingerprint(
+                &source,
+                &principal,
+                object_content_type.as_deref(),
+                &metadata,
+                &tags,
+                prefix,
+                capture,
+            )?,
+            _ => prior_fingerprint.clone(),
+        };
 
         if let Some(token) = client_token.as_deref() {
             match ownership::preflight_idempotent_submission(
@@ -98,6 +218,24 @@ impl ImportObjectRoute {
                 Ok(Some(existing)) => return accepted_response(&req.uri, &existing),
                 Ok(None) => {}
                 Err(AppError::ImportIdempotencyConflict) => {
+                    if parsed_query.decompress_prefix.is_some() {
+                        match ownership::preflight_idempotent_submission(
+                            self.state.store.db(),
+                            &parsed_query.bucket,
+                            &parsed_query.key,
+                            token,
+                            &prior_fingerprint,
+                        )
+                        .await
+                        {
+                            Ok(Some(existing)) if existing.root_capture_json.is_none() => {
+                                return accepted_response(&req.uri, &existing);
+                            }
+                            Ok(Some(_)) | Err(AppError::ImportIdempotencyConflict) => {}
+                            Ok(None) => {}
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
                     let legacy_fingerprint = legacy_request_fingerprint(
                         &source,
                         object_content_type.as_deref(),
@@ -114,7 +252,10 @@ impl ImportObjectRoute {
                     )
                     .await
                     {
-                        Ok(Some(existing)) if existing.pin_decision_json.is_none() => {
+                        Ok(Some(existing))
+                            if existing.pin_decision_json.is_none()
+                                && existing.root_capture_json.is_none() =>
+                        {
                             // Stage2 did not persist a principal. Preserve the existing
                             // authenticated gate and reject an explicitly different owner.
                             let bucket = crate::store::bucket::get(
@@ -181,14 +322,20 @@ impl ImportObjectRoute {
             tags,
             decompress_prefix: parsed_query.decompress_prefix,
         };
-        let job = match ownership::submit_decided(
-            self.state.store.db(),
-            request,
-            decision,
-            chrono::Utc::now(),
-        )
-        .await?
-        {
+        let submitted = if let Some(capture) = root_capture {
+            ownership::submit_decided_zip(
+                self.state.store.db(),
+                request,
+                decision,
+                capture,
+                chrono::Utc::now(),
+            )
+            .await
+        } else {
+            ownership::submit_decided(self.state.store.db(), request, decision, chrono::Utc::now())
+                .await
+        };
+        let job = match submitted.map_err(import_intake::map_token_conflict)? {
             SubmitImportOutcome::Created(job) | SubmitImportOutcome::Replayed(job) => job,
         };
 
@@ -197,6 +344,21 @@ impl ImportObjectRoute {
 
     async fn status(&self, req: S3Request<Body>) -> S3Result<S3Response<Body>> {
         let parsed = parse_status_query(&req.uri)?;
+        let principal = crate::s3::ops::object::principal_id(&req)?;
+        if let Some(status) = import_intake::read_for_path(
+            self.state.store.db(),
+            &parsed.job_id,
+            &principal,
+            &parsed.bucket,
+            &parsed.key,
+        )
+        .await?
+        {
+            if parsed.continuation_sequence.is_some() {
+                return Err(AppError::InvalidImportRequest.into());
+            }
+            return status_v2_response(&status);
+        }
         let job = jobs::get_for_path(
             self.state.store.db(),
             &parsed.job_id,
@@ -223,12 +385,59 @@ impl ImportObjectRoute {
             .as_ref()
             .and_then(|page| page.next_sequence)
             .map(|sequence| encode_continuation_token(&job.id, sequence));
-        let xml = status_xml(
+        let snapshot = if job.state == "completed" && job.root_capture_json.is_some() {
+            crate::store::zip::snapshot(self.state.store.db(), &job.id).await?
+        } else {
+            None
+        };
+        let root = snapshot
+            .as_ref()
+            .filter(|snapshot| {
+                snapshot.batch.state == "published"
+                    && snapshot.batch.source == "import"
+                    && snapshot.batch.token == job.id
+                    && snapshot.batch.bucket == job.bucket
+                    && snapshot.batch.archive_key == job.key
+            })
+            .map(|snapshot| {
+                let batch = &snapshot.batch;
+                let verified_cid = batch.root_cid.as_deref().filter(|cid| {
+                    matches!(batch.root_status.as_str(), "complete" | "partial")
+                        && snapshot.references.iter().any(|reference| {
+                            reference.state == "adopted"
+                                && reference.verification_receipt.is_some()
+                                && reference.cid == *cid
+                                && reference.revision == batch.root_revision
+                                && reference.epoch == batch.root_epoch
+                                && snapshot.builds.iter().any(|build| {
+                                    build.revision == reference.revision
+                                        && build.epoch == reference.epoch
+                                        && build.status == "verified"
+                                })
+                        })
+                });
+                ZipRootStatus {
+                    status: if matches!(batch.root_status.as_str(), "complete" | "partial")
+                        && verified_cid.is_none()
+                    {
+                        "failed"
+                    } else {
+                        &batch.root_status
+                    },
+                    cid: verified_cid,
+                    error_code: batch.root_error_code.as_deref().filter(|code| {
+                        code.bytes()
+                            .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+                    }),
+                }
+            });
+        let xml = status_xml_with_root(
             &job,
             result_page.as_ref().map(|page| StatusResultPage {
                 rows: &page.rows,
                 next_continuation_token: next_token.as_deref(),
             }),
+            root,
         );
         let mut response = S3Response::new(Body::from(xml));
         if let Some(decision) = stored_decision(&job)? {
@@ -240,6 +449,67 @@ impl ImportObjectRoute {
         );
         Ok(response)
     }
+}
+
+fn accepted_v2_response(uri: &Uri, status: &import_intake::Status) -> S3Result<S3Response<Body>> {
+    let xml = crate::import::response::accepted_xml(&status.id, status.state, "accepted");
+    let mut response = S3Response::with_status(Body::from(xml), StatusCode::ACCEPTED);
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/xml"),
+    );
+    response.headers.insert(
+        http::header::LOCATION,
+        http::HeaderValue::from_str(&format!("{}?ipfs3-import={}", uri.path(), status.id))
+            .map_err(|_| AppError::InvalidImportRequest)?,
+    );
+    response.headers.insert(
+        "x-ipfs3-import-job-id",
+        http::HeaderValue::from_str(&status.id).map_err(|_| AppError::InvalidImportRequest)?,
+    );
+    Ok(response)
+}
+
+fn status_v2_response(status: &import_intake::Status) -> S3Result<S3Response<Body>> {
+    // Digest fields are a signed promise or independently measured byte stream.
+    // Only the sealed source receipt below is a published object identity.
+    let mut xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><IPFS3ImportStatus><JobId>{}</JobId><State>{}</State><Phase>{}</Phase>",
+        status.id,
+        status.state,
+        if status.published_source.is_some() {
+            "published"
+        } else {
+            "source-free"
+        },
+    );
+    if let Some(expected) = &status.expected_sha256 {
+        xml.push_str(&format!("<ExpectedSHA256>{expected}</ExpectedSHA256>"));
+    }
+    xml.push_str(&format!(
+        "<MeasuredSHA256>{}</MeasuredSHA256>",
+        status.measured_sha256.as_deref().unwrap_or("unknown")
+    ));
+    if let Some(source) = &status.published_source {
+        xml.push_str(&format!(
+            "<ETag>{}</ETag><Size>{}</Size>",
+            quick_xml::escape::escape(&source.cid),
+            source.size,
+        ));
+        if let Some(version) = &source.version_id {
+            xml.push_str(&format!(
+                "<VersionId>{}</VersionId>",
+                quick_xml::escape::escape(version),
+            ));
+        }
+    }
+    xml.push_str("</IPFS3ImportStatus>");
+    let mut response = S3Response::new(Body::from(xml));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/xml"),
+    );
+    Ok(response)
 }
 
 fn accepted_response(uri: &Uri, job: &import_job::Model) -> S3Result<S3Response<Body>> {

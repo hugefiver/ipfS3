@@ -178,7 +178,11 @@ async fn stage2_token_replay_is_read_only_and_cannot_be_used_by_another_principa
     assert_eq!(decision.origin.request_id, new_id);
     assert_eq!(
         new_job.request_fingerprint,
-        "sha256:1406a95661268b7313f2a779378b0c494f8f344f6c5c48ea84a731bac19b08e1"
+        "sha256:c436a936da39a91153ee21ab9f50105884ececb2c1a80158cc8acb70cd7ba533"
+    );
+    assert_eq!(
+        new_job.root_capture_json.as_deref(),
+        Some("{\"configured\":true}")
     );
     assert_ne!(new_job.request_fingerprint, STAGE2_FINGERPRINT);
     let mut new_replay = submit_request("test", "alice");

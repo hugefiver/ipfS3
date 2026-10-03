@@ -12,12 +12,13 @@ use crate::{
             ImportArtifact, ImportExecutionObserver, JobCancellation, NoopImportExecutionObserver,
         },
         progress::ProgressReporter,
-        publication::zip::publish_zip_import,
+        publication::zip::{ZipPublicationData, publish_zip_import},
     },
     state::AppState,
     store::{entities::import_job, pinning::publication::PublicationResult},
     zip::extract::{
-        MAX_DECOMPRESSED_ARCHIVE_BYTES, ObservedExtractionError, extract_zip_stream_observed,
+        MAX_DECOMPRESSED_ARCHIVE_BYTES, ObservedExtractionError,
+        extract_zip_stream_observed_with_limits,
     },
 };
 
@@ -101,11 +102,19 @@ pub(crate) async fn decompress_import_with_context(
     let mut observer =
         ImportExtractionObserver::new(state, &job.bucket, &job.key, claim, cancellation, reporter);
     let outcome = {
-        let extraction = extract_zip_stream_observed(
+        let limits = state.pinning.zip_extraction_limits();
+        let total = max_decompressed_bytes.min(limits.max_decompressed_bytes());
+        let limits = limits
+            .with_decompressed_bytes(total)
+            .and_then(|limits| {
+                limits.with_single_entry_bytes(limits.max_single_entry_bytes().min(total))
+            })
+            .expect("minimum of validated ZIP budgets must remain valid");
+        let extraction = extract_zip_stream_observed_with_limits(
             state,
             &target_prefix,
             Box::pin(stream),
-            max_decompressed_bytes,
+            limits,
             &mut observer,
         );
         tokio::pin!(extraction);
@@ -133,6 +142,10 @@ pub(crate) async fn decompress_import_with_context(
         outcome.failures.len() >= observer.records.len().saturating_sub(outcome.entries.len())
     );
 
+    let manifest = job.root_capture_json.as_ref().map(|_| {
+        crate::zip::batch::final_zip_manifest(&outcome.entries, &outcome.failures, &target_prefix)
+    });
+
     tokio::select! {
         biased;
         _ = cancellation.shutdown.cancelled() => return Err(ImportExecutionError::Interrupted),
@@ -147,8 +160,11 @@ pub(crate) async fn decompress_import_with_context(
         job,
         claim,
         &artifact,
-        &observer.successful,
-        &observer.records,
+        ZipPublicationData {
+            entries: &observer.successful,
+            records: &observer.records,
+            manifest: manifest.as_ref(),
+        },
         cancellation,
     )
     .await
@@ -176,4 +192,4 @@ fn map_archive_error(error: S3Error, cancellation: &JobCancellation) -> ImportEx
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

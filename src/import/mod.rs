@@ -14,6 +14,8 @@ mod progress;
 mod publication;
 pub mod response;
 mod source;
+pub mod v2_source;
+mod v2_worker;
 pub mod worker;
 
 pub use model::*;

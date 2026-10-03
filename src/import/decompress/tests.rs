@@ -58,7 +58,7 @@ fn crc32(bytes: &[u8]) -> u32 {
     !crc
 }
 
-fn zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+pub(crate) fn zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
     let mut output = Vec::new();
     let mut offsets = Vec::new();
     for (name, data) in entries {
@@ -175,6 +175,578 @@ async fn claimed_job(
     (claimed.job, claimed.claim)
 }
 
+async fn claimed_stage4_job(
+    state: &AppState,
+    id: &str,
+    enabled: bool,
+) -> (import_job::Model, ImportClaim) {
+    use crate::{
+        pinning::{decision::DecisionOrigin, policy::PublicationContext, tags::ZipRootCapture},
+        store::import::jobs::NewImportJob,
+    };
+    let now = Utc::now();
+    let request = NewImportJob {
+        id: id.into(),
+        bucket: "bucket".into(),
+        key: "archive.zip".into(),
+        source: ImportSource::Cid(
+            "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku".into(),
+        ),
+        request_fingerprint: format!("fingerprint-{id}"),
+        client_token: None,
+        object_content_type: Some("application/zip".into()),
+        metadata: HashMap::new(),
+        tags: Vec::new(),
+        decompress_prefix: Some("out/".into()),
+    };
+    let (_, mut decision) = state
+        .pinning
+        .policy()
+        .evaluate_publication_decision(
+            PublicationContext {
+                bucket: "bucket",
+                key: "archive.zip",
+                tags: &[],
+                is_decompress_zip: true,
+            },
+            DecisionOrigin::new("test", id),
+        )
+        .unwrap();
+    decision
+        .capture_durable_revision(
+            state.pinning.effective_config(),
+            state.pinning.control_mode(),
+        )
+        .unwrap();
+    ownership::submit_decided_zip(
+        state.store.db(),
+        request,
+        decision,
+        ZipRootCapture::Configured(enabled),
+        now,
+    )
+    .await
+    .unwrap();
+    let claimed = jobs::claim_due(
+        state.store.db(),
+        "stage4-worker",
+        now,
+        now + chrono::Duration::seconds(60),
+        1,
+    )
+    .await
+    .unwrap()
+    .pop()
+    .unwrap();
+    (claimed.job, claimed.claim)
+}
+
+#[tokio::test]
+async fn stage4_off_and_zero_files_publish_archive_with_truthful_root_status() {
+    for (id, enabled, entries, expected) in [
+        ("stage4-off", false, vec![("file.txt", HELLO)], "disabled"),
+        ("stage4-zero", true, vec![("failed.txt", HELLO)], "empty"),
+    ] {
+        let server = MockServer::start().await;
+        let archive = zip(&entries);
+        mount_archive(&server, archive.clone()).await;
+        if id == "stage4-zero" {
+            Mock::given(method("POST"))
+                .and(path("/api/v0/add"))
+                .respond_with(ResponseTemplate::new(500))
+                .expect(1)
+                .mount(&server)
+                .await;
+        } else {
+            mount_entry_success(&server).await;
+        }
+        let state = test_state(&server).await;
+        let (job, claim) = claimed_stage4_job(&state, id, enabled).await;
+        decompress_import(
+            &state,
+            &job,
+            artifact(archive.len()),
+            &claim,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let snapshot = crate::store::zip::snapshot(state.store.db(), id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.batch.state, "published");
+        assert_eq!(snapshot.batch.root_status, expected);
+        assert_eq!(snapshot.batch.root_cid, None);
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| { request.url.path() != "/api/v0/dag/put" })
+        );
+        assert_eq!(
+            import_job::Entity::find_by_id(id)
+                .one(state.store.db())
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "completed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn stage4_root_failure_preserves_archive_entries_and_safe_failure_code() {
+    let server = MockServer::start().await;
+    let archive = zip(&[("file.txt", HELLO)]);
+    mount_archive(&server, archive.clone()).await;
+    mount_entry_success(&server).await; // legacy fixture CID is intentionally invalid for a directory.
+    let state = test_state(&server).await;
+    let (job, claim) = claimed_stage4_job(&state, "stage4-failed", true).await;
+    decompress_import(
+        &state,
+        &job,
+        artifact(archive.len()),
+        &claim,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let snapshot = crate::store::zip::snapshot(state.store.db(), "stage4-failed")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.batch.root_status, "failed");
+    assert_eq!(
+        snapshot.batch.root_error_code.as_deref(),
+        Some("invalid_manifest")
+    );
+    assert_eq!(snapshot.entries.len(), 1);
+    assert!(snapshot.entries[0].version_row_id.is_some());
+    assert_eq!(
+        object::Entity::find()
+            .count(state.store.db())
+            .await
+            .unwrap(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn stage4_root_post_put_failures_retain_candidate_and_complete_import() {
+    use wiremock::matchers::query_param;
+
+    const LEAF: &str = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
+    let root =
+        cid::Cid::new_v1(0x70, LEAF.parse::<cid::Cid>().unwrap().hash().to_owned()).to_string();
+    for failed_rpc in ["pin/add", "resolve", "pin/ls"] {
+        let server = MockServer::start().await;
+        let archive = zip(&[("file.txt", HELLO)]);
+        mount_archive(&server, archive.clone()).await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/add"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(format!("{{\"Hash\":\"{LEAF}\",\"Size\":\"5\"}}\n")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/pin/add"))
+            .and(query_param("arg", LEAF))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/files/stat"))
+            .and(query_param("arg", format!("/ipfs/{LEAF}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(format!("{{\"Hash\":\"{LEAF}\",\"CumulativeSize\":5}}")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/id"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{\"ID\":\"localnode\"}"))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/dag/put"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(format!("{{\"Cid\":{{\"/\":\"{root}\"}}}}")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/pin/add"))
+            .and(query_param("arg", root.clone()))
+            .respond_with(if failed_rpc == "pin/add" {
+                ResponseTemplate::new(500).set_body_string("private pin failure")
+            } else {
+                ResponseTemplate::new(200).set_body_string(format!("{{\"Pins\":[\"{root}\"]}}"))
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/resolve"))
+            .respond_with(if failed_rpc == "resolve" {
+                ResponseTemplate::new(500).set_body_string("private resolve failure")
+            } else {
+                ResponseTemplate::new(200).set_body_string(format!("{{\"Path\":\"/ipfs/{LEAF}\"}}"))
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/pin/ls"))
+            .respond_with(if failed_rpc == "pin/ls" {
+                ResponseTemplate::new(500).set_body_string("private verification failure")
+            } else {
+                ResponseTemplate::new(200).set_body_string(format!(
+                    "{{\"Keys\":{{\"{root}\":{{\"Type\":\"recursive\"}}}}}}"
+                ))
+            })
+            .mount(&server)
+            .await;
+
+        let state = test_state(&server).await;
+        let id = format!("stage4-post-put-{}", failed_rpc.replace('/', "-"));
+        let (job, claim) = claimed_stage4_job(&state, &id, true).await;
+        decompress_import(
+            &state,
+            &job,
+            artifact(archive.len()),
+            &claim,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("root failure must not fail the ordinary import");
+        let snapshot = crate::store::zip::snapshot(state.store.db(), &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.batch.state, "published", "{failed_rpc}");
+        assert_eq!(snapshot.batch.root_status, "failed", "{failed_rpc}");
+        assert_eq!(
+            snapshot.batch.root_error_code.as_deref(),
+            Some("directory_build_failed")
+        );
+        assert!(snapshot.batch.root_cid.is_none());
+        assert_eq!(snapshot.references.len(), 1, "{failed_rpc}");
+        assert_eq!(snapshot.references[0].cid, root);
+        assert_eq!(snapshot.references[0].node_identity, "localnode");
+        assert_eq!(snapshot.references[0].state, "retained");
+        assert!(snapshot.references[0].verification_receipt.is_none());
+        assert_eq!(snapshot.entries.len(), 1);
+        assert!(snapshot.entries[0].version_row_id.is_some());
+        assert_eq!(
+            object::Entity::find()
+                .count(state.store.db())
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            import_job_result::Entity::find()
+                .count(state.store.db())
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            import_job::Entity::find_by_id(&id)
+                .one(state.store.db())
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "completed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn stage4_shutdown_during_root_pin_retains_candidate_without_publication() {
+    use wiremock::matchers::query_param;
+
+    const LEAF: &str = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
+    let root =
+        cid::Cid::new_v1(0x70, LEAF.parse::<cid::Cid>().unwrap().hash().to_owned()).to_string();
+    let server = MockServer::start().await;
+    let archive = zip(&[("file.txt", HELLO)]);
+    mount_archive(&server, archive.clone()).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/add"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(format!("{{\"Hash\":\"{LEAF}\",\"Size\":\"5\"}}\n")),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/pin/add"))
+        .and(query_param("arg", LEAF))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/files/stat"))
+        .and(query_param("arg", format!("/ipfs/{LEAF}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(format!("{{\"Hash\":\"{LEAF}\",\"CumulativeSize\":5}}")),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/id"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{\"ID\":\"localnode\"}"))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/dag/put"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(format!("{{\"Cid\":{{\"/\":\"{root}\"}}}}")),
+        )
+        .mount(&server)
+        .await;
+    let reached_pin = Arc::new(tokio::sync::Notify::new());
+    let notify = reached_pin.clone();
+    Mock::given(method("POST"))
+        .and(path("/api/v0/pin/add"))
+        .and(query_param("arg", root.clone()))
+        .respond_with(move |_: &wiremock::Request| {
+            notify.notify_one();
+            ResponseTemplate::new(200)
+                .set_body_string("{\"Pins\":[]}")
+                .set_delay(Duration::from_secs(2))
+        })
+        .mount(&server)
+        .await;
+
+    let state = test_state(&server).await;
+    let (job, claim) = claimed_stage4_job(&state, "stage4-shutdown-root", true).await;
+    let shutdown = CancellationToken::new();
+    let execution_state = state.clone();
+    let execution_shutdown = shutdown.clone();
+    let execution = tokio::spawn(async move {
+        decompress_import(
+            &execution_state,
+            &job,
+            artifact(archive.len()),
+            &claim,
+            execution_shutdown,
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(3), reached_pin.notified())
+        .await
+        .expect("root pin started after root CID was emitted");
+    shutdown.cancel();
+    let result = tokio::time::timeout(Duration::from_secs(3), execution)
+        .await
+        .expect("shutdown waits for root build ownership")
+        .expect("import task joins");
+    assert!(matches!(result, Err(ImportExecutionError::Interrupted)));
+    let snapshot = crate::store::zip::snapshot(state.store.db(), "stage4-shutdown-root")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.batch.state, "open");
+    assert!(snapshot.batch.root_cid.is_none());
+    assert_eq!(snapshot.builds.len(), 1);
+    assert_eq!(snapshot.builds[0].status, "unknown");
+    assert_eq!(snapshot.references.len(), 1);
+    assert_eq!(snapshot.references[0].cid, root);
+    assert_eq!(snapshot.references[0].state, "retained");
+    assert!(snapshot.references[0].verification_receipt.is_none());
+    assert_eq!(
+        object::Entity::find()
+            .count(state.store.db())
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        import_job_result::Entity::find()
+            .count(state.store.db())
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn stage4_reclaimed_worker_reuses_exact_prepared_manifest() {
+    let server = MockServer::start().await;
+    let archive = zip(&[("file.txt", HELLO)]);
+    mount_archive(&server, archive.clone()).await;
+    mount_entry_success(&server).await;
+    let state = test_state(&server).await;
+    let (job, claim) = claimed_stage4_job(&state, "stage4-resume", true).await;
+    let db = state.store.db();
+    crate::store::zip::admit(db, &crate::store::zip::BatchAdmission {
+        id: job.id.clone(), owner: "test".into(), source: "import".into(), token: job.id.clone(),
+        fingerprint: job.request_fingerprint.clone(), bucket: job.bucket.clone(),
+        archive_key: job.key.clone(), input_identity: job.id.clone(),
+        captured_options: serde_json::json!({"root_capture": {"configured": true}, "target_prefix": "out/", "archive_cid": ARCHIVE_CID}).to_string(),
+    }).await.unwrap();
+    crate::store::zip::prepare_manifest(
+        db,
+        &job.id,
+        &[crate::store::zip::ManifestItem::Success {
+            path: "file.txt".into(),
+            object_key: "out/file.txt".into(),
+            cid: ENTRY_CID.into(),
+            size: HELLO.len() as i64,
+        }],
+    )
+    .await
+    .unwrap();
+    decompress_import(
+        &state,
+        &job,
+        artifact(archive.len()),
+        &claim,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let snapshot = crate::store::zip::snapshot(db, &job.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.batch.state, "published");
+    assert_eq!(snapshot.batch.root_status, "failed");
+    assert!(snapshot.entries[0].version_row_id.is_some());
+    assert_eq!(object::Entity::find().count(db).await.unwrap(), 2);
+}
+
+#[tokio::test]
+async fn stage4_stale_guard_blocks_root_side_effect_and_all_publication() {
+    struct SupersedingObserver(Arc<AppState>);
+    #[async_trait::async_trait]
+    impl crate::import::pipeline::ImportExecutionObserver for SupersedingObserver {
+        async fn before_publication(&self, _: &str) {
+            ownership::admit_content_mutation(
+                self.0.store.db(),
+                "bucket",
+                "out/file.txt",
+                None,
+                SupersedeReason::PutObject,
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        }
+    }
+    let server = MockServer::start().await;
+    let archive = zip(&[("file.txt", HELLO)]);
+    mount_archive(&server, archive.clone()).await;
+    mount_entry_success(&server).await;
+    let state = test_state(&server).await;
+    let (job, claim) = claimed_stage4_job(&state, "stage4-stale", true).await;
+    let cancellation = JobCancellation {
+        shutdown: CancellationToken::new(),
+        ownership_lost: CancellationToken::new(),
+    };
+    let reporter = crate::import::progress::ProgressReporter::start(
+        state.clone(),
+        &job,
+        claim.clone(),
+        cancellation.clone(),
+        Duration::from_millis(5),
+    );
+    let result = decompress_import_with_context(
+        &state,
+        &job,
+        artifact(archive.len()),
+        &claim,
+        &cancellation,
+        &reporter,
+        MAX_DECOMPRESSED_ARCHIVE_BYTES,
+        &SupersedingObserver(state.clone()),
+    )
+    .await;
+    let _ = reporter.finish(&cancellation).await;
+    assert!(matches!(result, Err(ImportExecutionError::Superseded)));
+    assert!(
+        crate::store::zip::snapshot(state.store.db(), "stage4-stale")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        object::Entity::find()
+            .count(state.store.db())
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| request.url.path() != "/api/v0/dag/put")
+    );
+}
+
+#[tokio::test]
+async fn stage4_duplicate_destination_is_terminal_without_a_batch_or_root() {
+    let server = MockServer::start().await;
+    let archive = zip(&[("file.txt", HELLO), ("file.txt", HELLO)]);
+    mount_archive(&server, archive.clone()).await;
+    mount_entry_success(&server).await;
+    let state = test_state(&server).await;
+    let (job, claim) = claimed_stage4_job(&state, "stage4-duplicate", true).await;
+    let failure = decompress_import(
+        &state,
+        &job,
+        artifact(archive.len()),
+        &claim,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        failure,
+        ImportExecutionError::Terminal(ImportFailure {
+            code: ImportFailureCode::InvalidArchive,
+            ..
+        })
+    ));
+    assert!(
+        crate::store::zip::snapshot(state.store.db(), "stage4-duplicate")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        object::Entity::find()
+            .count(state.store.db())
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| request.url.path() != "/api/v0/dag/put")
+    );
+}
+
 fn artifact(size: usize) -> ImportArtifact {
     ImportArtifact {
         cid: ARCHIVE_CID.to_owned(),
@@ -208,6 +780,147 @@ async fn mount_entry_success(server: &MockServer) {
         .expect(1)
         .mount(server)
         .await;
+}
+
+pub(crate) async fn mount_verified_directory(server: &MockServer, leaf: &str, root: &str) {
+    use wiremock::matchers::query_param;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/files/stat"))
+        .and(query_param("arg", format!("/ipfs/{leaf}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(format!("{{\"Hash\":\"{leaf}\",\"CumulativeSize\":5}}")),
+        )
+        .expect(1)
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/dag/put"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(format!("{{\"Cid\":{{\"/\":\"{root}\"}}}}")),
+        )
+        .expect(1)
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/pin/add"))
+        .and(query_param("arg", root))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(format!("{{\"Pins\":[\"{root}\"]}}")),
+        )
+        .with_priority(1)
+        .expect(1)
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/resolve"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(format!("{{\"Path\":\"/ipfs/{leaf}\"}}")),
+        )
+        .expect(1)
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/id"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{\"ID\":\"localnode\"}"))
+        .expect(3)
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/pin/ls"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            "{{\"Keys\":{{\"{root}\":{{\"Type\":\"recursive\"}}}}}}"
+        )))
+        .expect(2)
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/files/stat"))
+        .and(query_param("arg", format!("/ipfs/{root}")))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            "{{\"Hash\":\"{root}\",\"WithLocality\":true,\"Local\":true}}"
+        )))
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn stage4_verified_root_is_bound_to_published_version_and_partial_failure_is_retained() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let server = MockServer::start().await;
+    let archive = zip(&[("file.txt", HELLO), ("failed.txt", HELLO)]);
+    mount_archive(&server, archive.clone()).await;
+    const LEAF: &str = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
+    let root =
+        cid::Cid::new_v1(0x70, LEAF.parse::<cid::Cid>().unwrap().hash().to_owned()).to_string();
+    let adds = Arc::new(AtomicUsize::new(0));
+    let add_calls = adds.clone();
+    Mock::given(method("POST"))
+        .and(path("/api/v0/add"))
+        .respond_with(move |_: &wiremock::Request| {
+            if add_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(200)
+                    .set_body_string(format!("{{\"Hash\":\"{LEAF}\",\"Size\":\"5\"}}\n"))
+            } else {
+                ResponseTemplate::new(500)
+            }
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/pin/add"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_verified_directory(&server, LEAF, &root).await;
+    let state = test_state(&server).await;
+    let (job, claim) = claimed_stage4_job(&state, "stage4-partial", true).await;
+    decompress_import(
+        &state,
+        &job,
+        artifact(archive.len()),
+        &claim,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let snapshot = crate::store::zip::snapshot(state.store.db(), "stage4-partial")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        snapshot.batch.root_status,
+        "partial",
+        "root error {:?}; requests {:?}",
+        snapshot.batch.root_error_code,
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|request| request.url.to_string())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(snapshot.batch.root_cid.as_deref(), Some(root.as_str()));
+    assert_eq!(snapshot.entries.len(), 2);
+    assert_eq!(snapshot.references.len(), 1);
+    assert_eq!(snapshot.references[0].state, "adopted");
+    assert!(snapshot.references[0].verification_receipt.is_some());
+    assert!(
+        snapshot
+            .entries
+            .iter()
+            .any(|entry| entry.cid.is_some() && entry.version_row_id.is_some())
+    );
+    assert!(
+        snapshot
+            .entries
+            .iter()
+            .any(|entry| entry.error_code.is_some() && entry.version_row_id.is_none())
+    );
 }
 
 #[tokio::test]
@@ -256,6 +969,14 @@ async fn successful_import_publishes_archive_entry_results_and_progress_atomical
     assert_eq!(completed.entries_succeeded, 1);
     assert_eq!(completed.entries_failed, 0);
     assert_eq!(completed.decompressed_bytes, HELLO.len() as i64);
+    assert!(completed.root_capture_json.is_none());
+    assert!(
+        crate::store::zip::snapshot(state.store.db(), "success")
+            .await
+            .unwrap()
+            .is_none(),
+        "a pre-Stage4 job cannot inherit the new default root"
+    );
 }
 
 #[tokio::test]

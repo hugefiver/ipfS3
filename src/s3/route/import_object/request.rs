@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::zip::options::ZipV2Options;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Buf as _;
 use http::{HeaderMap, Uri};
@@ -7,7 +8,11 @@ use http_body_util::BodyExt as _;
 use s3s::{Body, S3Result};
 use sha2::{Digest as _, Sha256};
 
-use crate::{error::AppError, import::ImportSource, pinning::tags::ObjectTag};
+use crate::{
+    error::AppError,
+    import::ImportSource,
+    pinning::tags::{ObjectTag, ZipRootCapture},
+};
 
 pub(super) const MAX_IMPORT_XML_BYTES: usize = 64 * 1024;
 pub(super) const DEFAULT_MAX_RESULTS: u64 = 100;
@@ -216,6 +221,92 @@ pub(super) fn parse_metadata(headers: &HeaderMap) -> HashMap<String, String> {
         .collect()
 }
 
+/// The ZIP parser verifies its own signed controls. Import adds a second token
+/// and semantic metadata: unsigned values cannot influence durable identity.
+pub(super) fn validate_v2_import_headers(
+    headers: &HeaderMap,
+    options: &ZipV2Options,
+    client_token: Option<&str>,
+) -> S3Result<()> {
+    if client_token != Some(options.token.as_str()) {
+        return Err(s3s::s3_error!(
+            InvalidRequest,
+            "ZIP v2 token must match import client token"
+        ));
+    }
+    let authorization =
+        optional_single_header(headers, "authorization")?.ok_or_else(invalid_import)?;
+    let signed = authorization
+        .split(", ")
+        .find_map(|part| part.strip_prefix("SignedHeaders="))
+        .ok_or_else(invalid_import)?;
+    let names = signed.split(';').collect::<Vec<_>>();
+    if !names.contains(&"x-ipfs3-client-token")
+        || headers.keys().any(|name| {
+            (name.as_str().starts_with("x-amz-meta-")
+                || name.as_str() == "x-ipfs3-object-content-type")
+                && !names.contains(&name.as_str())
+        })
+    {
+        return Err(s3s::s3_error!(
+            InvalidRequest,
+            "ZIP v2 import metadata and client token must be signed"
+        ));
+    }
+    Ok(())
+}
+
+pub(super) struct V2ImportContract<'a> {
+    pub source: &'a ImportSource,
+    pub principal: &'a str,
+    pub bucket: &'a str,
+    pub key: &'a str,
+    pub prefix: &'a str,
+    pub expected: Option<&'a str>,
+    pub options: &'a ZipV2Options,
+    pub object_content_type: Option<&'a str>,
+    pub metadata: &'a HashMap<String, String>,
+    pub tags: &'a [ObjectTag],
+}
+
+pub(super) fn v2_import_contract(request: &V2ImportContract<'_>) -> S3Result<(String, String)> {
+    let descriptor = match request.source {
+        ImportSource::Cid(cid) => serde_json::to_string(&("cid", cid)),
+        ImportSource::Url(url) => serde_json::to_string(&("url", url.as_str())),
+    }
+    .map_err(|_| invalid_import())?;
+    let metadata = request
+        .metadata
+        .iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let tags = request
+        .tags
+        .iter()
+        .map(|t| (&t.key, &t.value))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    // root_enabled is a captured server default, not an incoming signed field.
+    let contract = serde_json::to_string(&(
+        "import-zip-v2",
+        request.principal,
+        request.bucket,
+        request.key,
+        request.prefix,
+        &descriptor,
+        request.expected,
+        request.options.publish_source,
+        request.options.publish_extracted,
+        request.options.targets,
+        &request.options.token,
+        request.options.root_override,
+        request.options.result_version,
+        request.object_content_type,
+        metadata,
+        tags,
+    ))
+    .map_err(|_| invalid_import())?;
+    Ok((contract, descriptor))
+}
+
 pub(super) fn request_fingerprint(
     source: &ImportSource,
     principal: &str,
@@ -232,6 +323,36 @@ pub(super) fn request_fingerprint(
         tags,
         decompress_prefix,
     )
+}
+
+/// A ZIP request's captured default/override is part of the signed admission
+/// identity, not re-evaluated from the current process configuration on replay.
+pub(super) fn request_zip_fingerprint(
+    source: &ImportSource,
+    principal: &str,
+    object_content_type: Option<&str>,
+    metadata: &HashMap<String, String>,
+    tags: &[ObjectTag],
+    decompress_prefix: &str,
+    capture: ZipRootCapture,
+) -> S3Result<String> {
+    let prior = request_fingerprint(
+        source,
+        principal,
+        object_content_type,
+        metadata,
+        tags,
+        Some(decompress_prefix),
+    )?;
+    // The configured default is not a request field: changing it must not
+    // invalidate a signed client-token replay of the original captured job.
+    let signed_override = match capture {
+        ZipRootCapture::Configured(_) => None,
+        ZipRootCapture::Tagged(value) => Some(value),
+    };
+    let canonical = serde_json::to_vec(&("import-zip-root-v1", prior, signed_override))
+        .map_err(|_| invalid_import())?;
+    Ok(format!("sha256:{}", hex::encode(Sha256::digest(canonical))))
 }
 
 pub(super) fn legacy_request_fingerprint(

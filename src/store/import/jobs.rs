@@ -14,7 +14,7 @@ use crate::{
     error::{AppError, AppResult},
     import::{ImportClaim, ImportFailure, ImportPhase, ImportProgress, ImportSource, ImportState},
     pinning::decision::ExtensionDecision,
-    pinning::tags::{ObjectTag, validate_tag_set},
+    pinning::tags::{ObjectTag, ZipRootCapture, validate_tag_set},
     store::{entities::import_job, import::lease_clock},
 };
 
@@ -71,15 +71,19 @@ pub(crate) async fn insert_queued<C: ConnectionTrait>(
     request: NewImportJob,
     now: DateTime<Utc>,
 ) -> AppResult<import_job::Model> {
-    insert_queued_with_decision(txn, request, None, now).await
+    insert_queued_with_decision(txn, request, None, None, now).await
 }
 
 pub(crate) async fn insert_queued_with_decision<C: ConnectionTrait>(
     txn: &C,
     request: NewImportJob,
     decision: Option<&ExtensionDecision>,
+    root_capture: Option<ZipRootCapture>,
     now: DateTime<Utc>,
 ) -> AppResult<import_job::Model> {
+    if root_capture.is_some() && request.decompress_prefix.is_none() {
+        return Err(AppError::InvalidImportRequest);
+    }
     let pin_decision_json = decision
         .map(|decision| {
             decision
@@ -111,6 +115,9 @@ pub(crate) async fn insert_queued_with_decision<C: ConnectionTrait>(
         tags_json: Set(tags_json),
         pin_decision_json: Set(pin_decision_json),
         decompress_prefix: Set(request.decompress_prefix),
+        root_capture_json: Set(root_capture.map(|capture| {
+            serde_json::to_string(&capture).expect("ZIP root capture is serializable")
+        })),
         state: Set(STATE_QUEUED.to_owned()),
         phase: Set(PHASE_QUEUED.to_owned()),
         attempts: Set(0),

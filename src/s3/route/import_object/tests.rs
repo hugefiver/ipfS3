@@ -29,6 +29,95 @@ use crate::{
 
 const CID: &str = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
 
+#[tokio::test]
+async fn signed_zip_submission_captures_root_option_and_replay_preserves_it() {
+    let (route, state) = setup_route(true).await;
+    let uri = "/bucket/archive.zip?ipfs3-import&decompress-zip=out/";
+    let mut first = request(Method::POST, uri, Body::from(cid_xml()));
+    first
+        .headers
+        .insert("x-ipfs3-client-token", "root-capture".parse().unwrap());
+    first
+        .headers
+        .insert("x-amz-tagging", "ipfs-s3%3Azip-root=false".parse().unwrap());
+    assert_eq!(
+        route.call(first).await.unwrap().status,
+        Some(StatusCode::ACCEPTED)
+    );
+    let stored = import_job::Entity::find()
+        .one(state.store.db())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.root_capture_json.as_deref(),
+        Some("{\"tagged\":false}")
+    );
+
+    let mut replay = request(Method::POST, uri, Body::from(cid_xml()));
+    replay
+        .headers
+        .insert("x-ipfs3-client-token", "root-capture".parse().unwrap());
+    replay
+        .headers
+        .insert("x-amz-tagging", "ipfs-s3%3Azip-root=false".parse().unwrap());
+    assert_eq!(
+        route.call(replay).await.unwrap().status,
+        Some(StatusCode::ACCEPTED)
+    );
+    assert_eq!(
+        import_job::Entity::find()
+            .count(state.store.db())
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn configured_root_default_is_not_a_signed_request_fingerprint_field() {
+    let (route, state) = setup_route(true).await;
+    let uri = "/bucket/archive.zip?ipfs3-import&decompress-zip=out/";
+    let mut first = request(Method::POST, uri, Body::from(cid_xml()));
+    first
+        .headers
+        .insert("x-ipfs3-client-token", "default-change".parse().unwrap());
+    assert_eq!(
+        route.call(first).await.unwrap().status,
+        Some(StatusCode::ACCEPTED)
+    );
+    let initial = import_job::Entity::find()
+        .one(state.store.db())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        initial.root_capture_json.as_deref(),
+        Some("{\"configured\":true}")
+    );
+    let changed = ImportObjectRoute::with_root_default(
+        state.clone(),
+        coordinator(ImportConfig {
+            enabled: true,
+            ..ImportConfig::default()
+        }),
+        false,
+    );
+    let mut replay = request(Method::POST, uri, Body::from(cid_xml()));
+    replay
+        .headers
+        .insert("x-ipfs3-client-token", "default-change".parse().unwrap());
+    let response = changed.call(replay).await.unwrap();
+    assert_eq!(response.headers["x-ipfs3-import-job-id"], initial.id);
+    assert_eq!(
+        import_job::Entity::find()
+            .count(state.store.db())
+            .await
+            .unwrap(),
+        1
+    );
+}
+
 fn cid_xml() -> String {
     format!("<IPFS3ImportRequest><CID>{CID}</CID></IPFS3ImportRequest>")
 }
@@ -735,11 +824,23 @@ async fn signed_import_server(
     state: Arc<AppState>,
     imports: Arc<ImportCoordinator>,
 ) -> (String, tokio::task::JoinHandle<()>) {
+    signed_import_server_with_root_default(state, imports, true).await
+}
+
+async fn signed_import_server_with_root_default(
+    state: Arc<AppState>,
+    imports: Arc<ImportCoordinator>,
+    root_default: bool,
+) -> (String, tokio::task::JoinHandle<()>) {
     use axum::error_handling::HandleError;
     use s3s::service::S3ServiceBuilder;
     let mut builder = S3ServiceBuilder::new(crate::s3::handler::S3Impl::new(state.clone()));
     builder.set_auth(crate::auth::GatewayAuth::new(state.clone()));
-    builder.set_route(crate::s3::route::gateway::GatewayRoute::new(state, imports));
+    builder.set_route(crate::s3::route::gateway::GatewayRoute::with_root_default(
+        state,
+        imports,
+        root_default,
+    ));
     let app = axum::Router::new().fallback_service(HandleError::new(
         builder.build(),
         |_: s3s::HttpError| async {
@@ -753,6 +854,769 @@ async fn signed_import_server(
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     (endpoint, server)
+}
+
+#[tokio::test]
+async fn signed_zip_root_is_visible_only_after_restarted_worker_commits_receipt_and_versions() {
+    use crate::import::{
+        decompress::tests::{mount_verified_directory, zip},
+        pipeline::ImportExecutionObserver,
+    };
+    use sea_orm::ConnectOptions;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path, query_param},
+    };
+    struct StopBeforePublication(tokio::sync::Notify);
+    #[async_trait::async_trait]
+    impl ImportExecutionObserver for StopBeforePublication {
+        async fn before_publication(&self, _: &str) {
+            self.0.notify_one();
+            std::future::pending::<()>().await;
+        }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory
+            .path()
+            .join("stage4-root.sqlite")
+            .display()
+            .to_string()
+            .replace('\\', "/")
+    );
+    let kubo = MockServer::start().await;
+    let archive = zip(&[("file.txt", b"hello")]);
+    let root =
+        cid::Cid::new_v1(0x70, CID.parse::<cid::Cid>().unwrap().hash().to_owned()).to_string();
+    Mock::given(method("POST"))
+        .and(path("/api/v0/routing/findprovs"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("{\"Type\":4,\"Responses\":[{\"ID\":\"provider-a\"}]}\n"),
+        )
+        .expect(2)
+        .mount(&kubo)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/cat"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(archive))
+        .expect(4)
+        .mount(&kubo)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/pin/add"))
+        .and(query_param("progress", "true"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(format!("{{\"Pins\":[\"{CID}\"]}}\n")),
+        )
+        .expect(2)
+        .mount(&kubo)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/add"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(format!("{{\"Hash\":\"{CID}\",\"Size\":\"5\"}}\n")),
+        )
+        .expect(2)
+        .mount(&kubo)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/pin/add"))
+        .and(query_param("arg", CID))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(2)
+        .mount(&kubo)
+        .await;
+    mount_verified_directory(&kubo, CID, &root).await;
+
+    let mut options = ConnectOptions::new(database_url.clone());
+    options.max_connections(2);
+    let db = Database::connect(options).await.unwrap();
+    crate::store::run_migrations(&db).await.unwrap();
+    crate::store::bucket::create(&db, "bucket", None)
+        .await
+        .unwrap();
+    let make_state = |db| {
+        Arc::new(AppState {
+            kubo: crate::kubo::KuboClient::new(kubo.uri()),
+            cold_kubo: None,
+            store: Store::new(db),
+            credentials: HashMap::from([("test".into(), s3s::auth::SecretKey::from("test"))]),
+            master_key: crate::crypto::key::MasterKey::from_hex(&"0".repeat(64)).unwrap(),
+            pinning: crate::pinning::coordinator::PinningCoordinator::disabled_for_test(),
+        })
+    };
+    let original = make_state(db);
+    let import_config = ImportConfig {
+        poll_interval_ms: 10,
+        lease_duration_secs: 2,
+        ..ImportConfig::default()
+    };
+    let validated = import_config.clone().validate().unwrap();
+    let downloader = SourceDownloader::production(Arc::new(validated.clone()));
+    let pause = Arc::new(StopBeforePublication(tokio::sync::Notify::new()));
+    let first_imports = ImportCoordinator::new_with_observer(validated, downloader, pause.clone());
+    let (endpoint, server) = signed_import_server(original.clone(), first_imports.clone()).await;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        "application/xml".parse().unwrap(),
+    );
+    headers.insert("x-ipfs3-client-token", "stage4-restart".parse().unwrap());
+    headers.insert("x-amz-tagging", "ipfs-s3%3Azip-root=true".parse().unwrap());
+    let submit = sigv4::send_sigv4(
+        reqwest::Method::POST,
+        &endpoint,
+        "bucket",
+        "archive.zip",
+        &[("ipfs3-import", ""), ("decompress-zip", "out/")],
+        cid_xml().into_bytes(),
+        headers.clone(),
+        "test",
+    )
+    .await;
+    assert_eq!(submit.status(), reqwest::StatusCode::ACCEPTED);
+    assert!(!submit.headers().contains_key("x-ipfs-s3-zip-root-cid"));
+    let id = submit.headers()["x-ipfs3-import-job-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(!submit.text().await.unwrap().contains("ZipRoot"));
+    let before = sigv4::send_sigv4(
+        reqwest::Method::GET,
+        &endpoint,
+        "bucket",
+        "archive.zip",
+        &[("ipfs3-import", &id)],
+        Vec::new(),
+        HeaderMap::new(),
+        "test",
+    )
+    .await;
+    assert!(!before.text().await.unwrap().contains("ZipRoot"));
+    let first_worker =
+        first_imports.start(original.clone(), tokio_util::sync::CancellationToken::new());
+    tokio::time::timeout(std::time::Duration::from_secs(5), pause.0.notified())
+        .await
+        .unwrap();
+    first_worker
+        .shutdown(std::time::Duration::from_secs(2))
+        .await;
+    assert!(
+        crate::store::zip::snapshot(original.store.db(), &id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    server.abort();
+    drop(original);
+
+    let restarted = make_state(Database::connect(database_url).await.unwrap());
+    let imports = coordinator(import_config);
+    let (endpoint, server) =
+        signed_import_server_with_root_default(restarted.clone(), imports.clone(), false).await;
+    let replay = sigv4::send_sigv4(
+        reqwest::Method::POST,
+        &endpoint,
+        "bucket",
+        "archive.zip",
+        &[("ipfs3-import", ""), ("decompress-zip", "out/")],
+        cid_xml().into_bytes(),
+        headers,
+        "test",
+    )
+    .await;
+    assert_eq!(replay.status(), reqwest::StatusCode::ACCEPTED);
+    assert_eq!(replay.headers()["x-ipfs3-import-job-id"], id);
+    let stored = import_job::Entity::find_by_id(&id)
+        .one(restarted.store.db())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.root_capture_json.as_deref(),
+        Some("{\"tagged\":true}")
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+    let worker = imports.start(
+        restarted.clone(),
+        tokio_util::sync::CancellationToken::new(),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(8), async {
+        loop {
+            let job = import_job::Entity::find_by_id(&id)
+                .one(restarted.store.db())
+                .await
+                .unwrap()
+                .unwrap();
+            if job.state == "completed" {
+                break;
+            }
+            assert_ne!(job.state, "failed", "worker error {:?}", job.failure_code);
+            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        }
+    })
+    .await
+    .unwrap();
+    worker.shutdown(std::time::Duration::from_secs(2)).await;
+    let status = sigv4::send_sigv4(
+        reqwest::Method::GET,
+        &endpoint,
+        "bucket",
+        "archive.zip",
+        &[("ipfs3-import", &id)],
+        Vec::new(),
+        HeaderMap::new(),
+        "test",
+    )
+    .await;
+    assert_eq!(status.status(), reqwest::StatusCode::OK);
+    let xml = status.text().await.unwrap();
+    assert!(
+        xml.contains(&format!(
+            "<ZipRoot><Status>complete</Status><CID>{root}</CID></ZipRoot>"
+        )),
+        "{xml}"
+    );
+    assert!(
+        xml.contains(&format!("<Artifact><CID>{CID}</CID>")),
+        "{xml}"
+    );
+    let snapshot = crate::store::zip::snapshot(restarted.store.db(), &id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.batch.root_cid.as_deref(), Some(root.as_str()));
+    assert_eq!(snapshot.references[0].state, "adopted");
+
+    let mut signed_false = HeaderMap::new();
+    signed_false.insert(
+        http::header::CONTENT_TYPE,
+        "application/xml".parse().unwrap(),
+    );
+    signed_false.insert("x-amz-tagging", "ipfs-s3%3Azip-root=false".parse().unwrap());
+    let false_submit = sigv4::send_sigv4(
+        reqwest::Method::POST,
+        &endpoint,
+        "bucket",
+        "another.zip",
+        &[("ipfs3-import", ""), ("decompress-zip", "out/")],
+        cid_xml().into_bytes(),
+        signed_false,
+        "test",
+    )
+    .await;
+    assert_eq!(false_submit.status(), reqwest::StatusCode::ACCEPTED);
+    let false_id = false_submit.headers()["x-ipfs3-import-job-id"]
+        .to_str()
+        .unwrap();
+    assert_eq!(
+        import_job::Entity::find_by_id(false_id)
+            .one(restarted.store.db())
+            .await
+            .unwrap()
+            .unwrap()
+            .root_capture_json
+            .as_deref(),
+        Some("{\"tagged\":false}")
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn signed_zip_config_off_persists_disabled_and_never_builds_a_root() {
+    use crate::import::decompress::tests::zip;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path, query_param},
+    };
+    let kubo = MockServer::start().await;
+    let archive = zip(&[("file.txt", b"hello")]);
+    Mock::given(method("POST"))
+        .and(path("/api/v0/routing/findprovs"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("{\"Type\":4,\"Responses\":[{\"ID\":\"provider-a\"}]}\n"),
+        )
+        .expect(1)
+        .mount(&kubo)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/pin/add"))
+        .and(query_param("progress", "true"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(format!("{{\"Pins\":[\"{CID}\"]}}\n")),
+        )
+        .expect(1)
+        .mount(&kubo)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/cat"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(archive))
+        .expect(2)
+        .mount(&kubo)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/add"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string("{\"Hash\":\"QmEntry\",\"Size\":\"5\"}\n"),
+        )
+        .expect(1)
+        .mount(&kubo)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/pin/add"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&kubo)
+        .await;
+    let db = Database::connect("sqlite::memory:").await.unwrap();
+    crate::store::run_migrations(&db).await.unwrap();
+    crate::store::bucket::create(&db, "bucket", None)
+        .await
+        .unwrap();
+    let state = Arc::new(AppState {
+        kubo: crate::kubo::KuboClient::new(kubo.uri()),
+        cold_kubo: None,
+        store: Store::new(db),
+        credentials: HashMap::from([("test".into(), s3s::auth::SecretKey::from("test"))]),
+        master_key: crate::crypto::key::MasterKey::from_hex(&"0".repeat(64)).unwrap(),
+        pinning: crate::pinning::coordinator::PinningCoordinator::disabled_for_test(),
+    });
+    let imports = coordinator(ImportConfig {
+        poll_interval_ms: 10,
+        ..ImportConfig::default()
+    });
+    let (endpoint, server) =
+        signed_import_server_with_root_default(state.clone(), imports.clone(), false).await;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        "application/xml".parse().unwrap(),
+    );
+    let accepted = sigv4::send_sigv4(
+        reqwest::Method::POST,
+        &endpoint,
+        "bucket",
+        "archive.zip",
+        &[("ipfs3-import", ""), ("decompress-zip", "out/")],
+        cid_xml().into_bytes(),
+        headers,
+        "test",
+    )
+    .await;
+    assert_eq!(accepted.status(), reqwest::StatusCode::ACCEPTED);
+    let id = accepted.headers()["x-ipfs3-import-job-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        import_job::Entity::find_by_id(&id)
+            .one(state.store.db())
+            .await
+            .unwrap()
+            .unwrap()
+            .root_capture_json
+            .as_deref(),
+        Some("{\"configured\":false}")
+    );
+    let worker = imports.start(state.clone(), tokio_util::sync::CancellationToken::new());
+    tokio::time::timeout(std::time::Duration::from_secs(8), async {
+        loop {
+            let job = import_job::Entity::find_by_id(&id)
+                .one(state.store.db())
+                .await
+                .unwrap()
+                .unwrap();
+            if job.state == "completed" {
+                break;
+            }
+            assert_ne!(job.state, "failed", "worker error {:?}", job.failure_code);
+            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        }
+    })
+    .await
+    .unwrap();
+    worker.shutdown(std::time::Duration::from_secs(2)).await;
+    let response = sigv4::send_sigv4(
+        reqwest::Method::GET,
+        &endpoint,
+        "bucket",
+        "archive.zip",
+        &[("ipfs3-import", &id)],
+        Vec::new(),
+        HeaderMap::new(),
+        "test",
+    )
+    .await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        response
+            .text()
+            .await
+            .unwrap()
+            .contains("<ZipRoot><Status>disabled</Status></ZipRoot>")
+    );
+    assert!(
+        kubo.received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| request.url.path() != "/api/v0/dag/put")
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn signed_zip_worker_reports_failed_partial_and_zero_file_roots_without_losing_results() {
+    use crate::import::decompress::tests::{mount_verified_directory, zip};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path, query_param},
+    };
+    for (case, names, expected) in [
+        ("failed", vec!["file.txt"], "failed"),
+        ("partial", vec!["file.txt", "bad.txt"], "partial"),
+        ("zero", vec!["bad.txt"], "empty"),
+    ] {
+        let kubo = MockServer::start().await;
+        let entries = names
+            .iter()
+            .map(|name| (*name, b"hello".as_slice()))
+            .collect::<Vec<_>>();
+        let archive = zip(&entries);
+        Mock::given(method("POST"))
+            .and(path("/api/v0/routing/findprovs"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("{\"Type\":4,\"Responses\":[{\"ID\":\"provider-a\"}]}\n"),
+            )
+            .expect(1)
+            .mount(&kubo)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/pin/add"))
+            .and(query_param("progress", "true"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(format!("{{\"Pins\":[\"{CID}\"]}}\n")),
+            )
+            .expect(1)
+            .mount(&kubo)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/cat"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(archive))
+            .expect(2)
+            .mount(&kubo)
+            .await;
+        let count = Arc::new(AtomicUsize::new(0));
+        let calls = count.clone();
+        let case_owned = case.to_owned();
+        Mock::given(method("POST"))
+            .and(path("/api/v0/add"))
+            .respond_with(move |_: &wiremock::Request| {
+                if case_owned == "zero" || calls.fetch_add(1, Ordering::SeqCst) > 0 {
+                    ResponseTemplate::new(500)
+                } else {
+                    let leaf = if case_owned == "failed" {
+                        "QmEntry"
+                    } else {
+                        CID
+                    };
+                    ResponseTemplate::new(200)
+                        .set_body_string(format!("{{\"Hash\":\"{leaf}\",\"Size\":\"5\"}}\n"))
+                }
+            })
+            .expect(names.len() as u64)
+            .mount(&kubo)
+            .await;
+        if case != "zero" {
+            Mock::given(method("POST"))
+                .and(path("/api/v0/pin/add"))
+                .and(query_param(
+                    "arg",
+                    if case == "failed" { "QmEntry" } else { CID },
+                ))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+                .mount(&kubo)
+                .await;
+        }
+        let root =
+            cid::Cid::new_v1(0x70, CID.parse::<cid::Cid>().unwrap().hash().to_owned()).to_string();
+        if case == "partial" {
+            mount_verified_directory(&kubo, CID, &root).await;
+        }
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::store::run_migrations(&db).await.unwrap();
+        crate::store::bucket::create(&db, "bucket", None)
+            .await
+            .unwrap();
+        let state = Arc::new(AppState {
+            kubo: crate::kubo::KuboClient::new(kubo.uri()),
+            cold_kubo: None,
+            store: Store::new(db),
+            credentials: HashMap::from([("test".into(), s3s::auth::SecretKey::from("test"))]),
+            master_key: crate::crypto::key::MasterKey::from_hex(&"0".repeat(64)).unwrap(),
+            pinning: crate::pinning::coordinator::PinningCoordinator::disabled_for_test(),
+        });
+        let imports = coordinator(ImportConfig {
+            poll_interval_ms: 10,
+            ..ImportConfig::default()
+        });
+        let (endpoint, server) = signed_import_server(state.clone(), imports.clone()).await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            "application/xml".parse().unwrap(),
+        );
+        headers.insert("x-amz-tagging", "ipfs-s3%3Azip-root=true".parse().unwrap());
+        let submit = sigv4::send_sigv4(
+            reqwest::Method::POST,
+            &endpoint,
+            "bucket",
+            "archive.zip",
+            &[("ipfs3-import", ""), ("decompress-zip", "out/")],
+            cid_xml().into_bytes(),
+            headers,
+            "test",
+        )
+        .await;
+        assert_eq!(submit.status(), reqwest::StatusCode::ACCEPTED, "{case}");
+        let id = submit.headers()["x-ipfs3-import-job-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let worker = imports.start(state.clone(), tokio_util::sync::CancellationToken::new());
+        tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            loop {
+                let job = import_job::Entity::find_by_id(&id)
+                    .one(state.store.db())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if job.state == "completed" {
+                    break;
+                }
+                assert_ne!(job.state, "failed", "{case}: {:?}", job.failure_code);
+                tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+            }
+        })
+        .await
+        .unwrap();
+        worker.shutdown(std::time::Duration::from_secs(2)).await;
+        let status = sigv4::send_sigv4(
+            reqwest::Method::GET,
+            &endpoint,
+            "bucket",
+            "archive.zip",
+            &[("ipfs3-import", &id)],
+            Vec::new(),
+            HeaderMap::new(),
+            "test",
+        )
+        .await;
+        assert_eq!(status.status(), reqwest::StatusCode::OK, "{case}");
+        let xml = status.text().await.unwrap();
+        assert!(
+            xml.contains(&format!("<ZipRoot><Status>{expected}</Status>")),
+            "{case}: {xml}"
+        );
+        let snapshot = crate::store::zip::snapshot(state.store.db(), &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.batch.root_status, expected);
+        if case == "partial" {
+            assert!(xml.contains(&format!("<CID>{root}</CID></ZipRoot>")));
+            assert!(xml.contains("<Status>failure</Status>"));
+        } else {
+            assert!(snapshot.batch.root_cid.is_none());
+            if case == "failed" {
+                assert!(xml.contains("<ErrorCode>invalid_manifest</ErrorCode>"));
+            }
+        }
+        assert_eq!(
+            snapshot.entries.len(),
+            if case == "partial" { 2 } else { 1 }
+        );
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn signed_zip_stale_worker_cannot_build_or_publish_after_target_supersession() {
+    use crate::{
+        import::{SupersedeReason, decompress::tests::zip, pipeline::ImportExecutionObserver},
+        store::import::ownership,
+    };
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path, query_param},
+    };
+    struct SupersedeOnPublication(Arc<AppState>);
+    #[async_trait::async_trait]
+    impl ImportExecutionObserver for SupersedeOnPublication {
+        async fn before_publication(&self, _: &str) {
+            ownership::admit_content_mutation(
+                self.0.store.db(),
+                "bucket",
+                "out/file.txt",
+                None,
+                SupersedeReason::PutObject,
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap();
+        }
+    }
+    let kubo = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/routing/findprovs"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("{\"Type\":4,\"Responses\":[{\"ID\":\"provider-a\"}]}\n"),
+        )
+        .expect(1)
+        .mount(&kubo)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/pin/add"))
+        .and(query_param("progress", "true"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(format!("{{\"Pins\":[\"{CID}\"]}}\n")),
+        )
+        .expect(1)
+        .mount(&kubo)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/cat"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(zip(&[("file.txt", b"hello")])))
+        .expect(2)
+        .mount(&kubo)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/add"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string("{\"Hash\":\"QmEntry\",\"Size\":\"5\"}\n"),
+        )
+        .expect(1)
+        .mount(&kubo)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/pin/add"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&kubo)
+        .await;
+    let db = Database::connect("sqlite::memory:").await.unwrap();
+    crate::store::run_migrations(&db).await.unwrap();
+    crate::store::bucket::create(&db, "bucket", None)
+        .await
+        .unwrap();
+    let state = Arc::new(AppState {
+        kubo: crate::kubo::KuboClient::new(kubo.uri()),
+        cold_kubo: None,
+        store: Store::new(db),
+        credentials: HashMap::from([("test".into(), s3s::auth::SecretKey::from("test"))]),
+        master_key: crate::crypto::key::MasterKey::from_hex(&"0".repeat(64)).unwrap(),
+        pinning: crate::pinning::coordinator::PinningCoordinator::disabled_for_test(),
+    });
+    let config = ImportConfig {
+        poll_interval_ms: 10,
+        ..ImportConfig::default()
+    }
+    .validate()
+    .unwrap();
+    let downloader = SourceDownloader::production(Arc::new(config.clone()));
+    let imports = ImportCoordinator::new_with_observer(
+        config,
+        downloader,
+        Arc::new(SupersedeOnPublication(state.clone())),
+    );
+    let (endpoint, server) = signed_import_server(state.clone(), imports.clone()).await;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        "application/xml".parse().unwrap(),
+    );
+    headers.insert("x-amz-tagging", "ipfs-s3%3Azip-root=true".parse().unwrap());
+    let accepted = sigv4::send_sigv4(
+        reqwest::Method::POST,
+        &endpoint,
+        "bucket",
+        "archive.zip",
+        &[("ipfs3-import", ""), ("decompress-zip", "out/")],
+        cid_xml().into_bytes(),
+        headers,
+        "test",
+    )
+    .await;
+    assert_eq!(accepted.status(), reqwest::StatusCode::ACCEPTED);
+    let id = accepted.headers()["x-ipfs3-import-job-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let worker = imports.start(state.clone(), tokio_util::sync::CancellationToken::new());
+    tokio::time::timeout(std::time::Duration::from_secs(8), async {
+        loop {
+            let job = import_job::Entity::find_by_id(&id)
+                .one(state.store.db())
+                .await
+                .unwrap()
+                .unwrap();
+            if job.state == "superseded" {
+                break;
+            }
+            assert_ne!(
+                job.state, "failed",
+                "unexpected worker failure {:?}",
+                job.failure_code
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        }
+    })
+    .await
+    .unwrap();
+    worker.shutdown(std::time::Duration::from_secs(2)).await;
+    assert!(
+        crate::store::zip::snapshot(state.store.db(), &id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        crate::store::entities::object::Entity::find()
+            .count(state.store.db())
+            .await
+            .unwrap(),
+        0
+    );
+    let status = sigv4::send_sigv4(
+        reqwest::Method::GET,
+        &endpoint,
+        "bucket",
+        "archive.zip",
+        &[("ipfs3-import", &id)],
+        Vec::new(),
+        HeaderMap::new(),
+        "test",
+    )
+    .await;
+    assert_eq!(status.status(), reqwest::StatusCode::OK);
+    assert!(!status.text().await.unwrap().contains("<ZipRoot>"));
+    assert!(
+        kubo.received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| request.url.path() != "/api/v0/dag/put")
+    );
+    server.abort();
 }
 
 struct ControlledResolver {

@@ -205,6 +205,9 @@ pub enum AppError {
     #[error("import idempotency token conflicts with an existing job")]
     ImportIdempotencyConflict,
 
+    #[error("ZIP v2 token conflicts with an existing batch")]
+    ZipIdempotencyConflict,
+
     #[error("ipfs3 import is disabled")]
     ImportDisabled,
 
@@ -324,6 +327,11 @@ impl From<AppError> for S3Error {
                 "IdempotentParameterMismatch",
                 http::StatusCode::CONFLICT,
                 "import idempotency token conflicts with an existing job",
+            ),
+            AppError::ZipIdempotencyConflict => import_route_error(
+                "IdempotentParameterMismatch",
+                http::StatusCode::CONFLICT,
+                "ZIP v2 idempotency token conflicts with an existing batch",
             ),
             AppError::ImportDisabled => import_route_error(
                 "NotImplemented",

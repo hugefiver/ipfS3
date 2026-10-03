@@ -5,6 +5,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use futures_util::{Stream, TryStreamExt};
 use s3s::{S3Error, S3Result};
+use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tokio_util::io::{ReaderStream, StreamReader};
@@ -78,11 +79,194 @@ impl ExtractionObserver for NoopObserver {
 /// datastore against a compression bomb.
 pub const MAX_DECOMPRESSED_ARCHIVE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
+/// Default limit for the actual source ZIP bytes, including ZIP framing.
+/// Larger than the legacy 8 GiB decompression default so valid archives still fit.
+pub const MAX_ARCHIVE_INPUT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
 /// Includes directories, empty files and failed entries, not just successes.
 pub const MAX_ARCHIVE_ENTRIES: u64 = 10_000;
 /// Reservation units: 4096 per entry + 8 * (raw name + extra + prefix bytes).
 /// Bounds retained results/observer keys as well as parser metadata. Not an RSS cap.
 pub const MAX_ARCHIVE_METADATA_BYTES: u64 = 64 * 1024 * 1024;
+
+const HARD_MAX_DECOMPRESSED_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
+const HARD_MAX_ARCHIVE_INPUT_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+const HARD_MAX_ENTRIES: u64 = 100_000;
+const HARD_MAX_METADATA_BYTES: u64 = 1024 * 1024 * 1024;
+const HARD_MAX_DEADLINE_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Request-level ZIP budgets. Defaults preserve all legacy ZIP limits. The
+/// optional absolute deadline is *not* an idle timeout: active transfers can
+/// continue for hours when no deadline is configured. Kubo retains its own
+/// independent idle/cancellation behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ZipExtractionLimits {
+    max_archive_bytes: u64,
+    max_decompressed_bytes: u64,
+    max_single_entry_bytes: u64,
+    max_entries: u64,
+    max_metadata_bytes: u64,
+    max_staged_adds: u64,
+    processing_deadline: Option<std::time::Duration>,
+}
+
+impl Default for ZipExtractionLimits {
+    fn default() -> Self {
+        Self {
+            max_archive_bytes: MAX_ARCHIVE_INPUT_BYTES,
+            max_decompressed_bytes: MAX_DECOMPRESSED_ARCHIVE_BYTES,
+            max_single_entry_bytes: MAX_DECOMPRESSED_ARCHIVE_BYTES,
+            max_entries: MAX_ARCHIVE_ENTRIES,
+            max_metadata_bytes: MAX_ARCHIVE_METADATA_BYTES,
+            max_staged_adds: MAX_ARCHIVE_ENTRIES,
+            processing_deadline: None,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(default)]
+struct RawZipExtractionLimits {
+    max_archive_bytes: u64,
+    max_decompressed_bytes: u64,
+    max_single_entry_bytes: u64,
+    max_entries: u64,
+    max_metadata_bytes: u64,
+    max_staged_adds: u64,
+    processing_deadline_secs: Option<u64>,
+}
+
+impl Default for RawZipExtractionLimits {
+    fn default() -> Self {
+        let limits = ZipExtractionLimits::default();
+        Self {
+            max_archive_bytes: limits.max_archive_bytes,
+            max_decompressed_bytes: limits.max_decompressed_bytes,
+            max_single_entry_bytes: limits.max_single_entry_bytes,
+            max_entries: limits.max_entries,
+            max_metadata_bytes: limits.max_metadata_bytes,
+            max_staged_adds: limits.max_staged_adds,
+            processing_deadline_secs: None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ZipExtractionLimits {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let raw = RawZipExtractionLimits::deserialize(deserializer)?;
+        let limits = Self {
+            max_archive_bytes: raw.max_archive_bytes,
+            max_decompressed_bytes: raw.max_decompressed_bytes,
+            max_single_entry_bytes: raw.max_single_entry_bytes,
+            max_entries: raw.max_entries,
+            max_metadata_bytes: raw.max_metadata_bytes,
+            max_staged_adds: raw.max_staged_adds,
+            processing_deadline: raw
+                .processing_deadline_secs
+                .map(std::time::Duration::from_secs),
+        };
+        limits.validate().map_err(D::Error::custom)?;
+        Ok(limits)
+    }
+}
+
+impl ZipExtractionLimits {
+    fn validate(&self) -> Result<(), &'static str> {
+        if !(1..=HARD_MAX_ARCHIVE_INPUT_BYTES).contains(&self.max_archive_bytes) {
+            return Err("decompress_zip.max_archive_bytes is outside hard bounds");
+        }
+        if self.max_decompressed_bytes > HARD_MAX_DECOMPRESSED_BYTES {
+            return Err("decompress_zip.max_decompressed_bytes exceeds hard bound");
+        }
+        if self.max_single_entry_bytes > HARD_MAX_DECOMPRESSED_BYTES {
+            return Err("decompress_zip.max_single_entry_bytes exceeds hard bound");
+        }
+        // Publication and manifest replay support at most 10,000 records.
+        // Do not admit an archive the final manifest cannot represent safely.
+        if !(1..=MAX_ARCHIVE_ENTRIES).contains(&self.max_entries) {
+            return Err("decompress_zip.max_entries is outside hard bounds");
+        }
+        if self.max_metadata_bytes > HARD_MAX_METADATA_BYTES {
+            return Err("decompress_zip.max_metadata_bytes exceeds hard bound");
+        }
+        if !(1..=HARD_MAX_ENTRIES).contains(&self.max_staged_adds) {
+            return Err("decompress_zip.max_staged_adds is outside hard bounds");
+        }
+        if self.processing_deadline.is_some_and(|deadline| {
+            deadline.is_zero() || deadline > std::time::Duration::from_secs(HARD_MAX_DEADLINE_SECS)
+        }) {
+            return Err("decompress_zip.processing_deadline_secs is outside hard bounds");
+        }
+        Ok(())
+    }
+
+    pub fn max_archive_bytes(&self) -> u64 {
+        self.max_archive_bytes
+    }
+    pub fn max_decompressed_bytes(&self) -> u64 {
+        self.max_decompressed_bytes
+    }
+    pub fn max_single_entry_bytes(&self) -> u64 {
+        self.max_single_entry_bytes
+    }
+    pub fn max_entries(&self) -> u64 {
+        self.max_entries
+    }
+    pub fn max_metadata_bytes(&self) -> u64 {
+        self.max_metadata_bytes
+    }
+    /// Bounds attempted per-entry Kubo adds; not Kubo disk usage or the number
+    /// of retained CIDs. Failed/CRC-invalid adds can still leave Kubo data.
+    pub fn max_staged_adds(&self) -> u64 {
+        self.max_staged_adds
+    }
+    pub fn processing_deadline_secs(&self) -> Option<u64> {
+        self.processing_deadline.map(|duration| duration.as_secs())
+    }
+
+    pub fn with_archive_bytes(mut self, bytes: u64) -> Result<Self, &'static str> {
+        self.max_archive_bytes = bytes;
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn with_single_entry_bytes(mut self, bytes: u64) -> Result<Self, &'static str> {
+        self.max_single_entry_bytes = bytes;
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn with_decompressed_bytes(mut self, bytes: u64) -> Result<Self, &'static str> {
+        self.max_decompressed_bytes = bytes;
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn with_entries(mut self, entries: u64) -> Result<Self, &'static str> {
+        self.max_entries = entries;
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn with_metadata_bytes(mut self, bytes: u64) -> Result<Self, &'static str> {
+        self.max_metadata_bytes = bytes;
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn with_staged_adds(mut self, adds: u64) -> Result<Self, &'static str> {
+        self.max_staged_adds = adds;
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn with_deadline(mut self, deadline: std::time::Duration) -> Result<Self, &'static str> {
+        self.processing_deadline = Some(deadline);
+        self.validate()?;
+        Ok(self)
+    }
+}
 
 #[derive(Clone, Copy)]
 struct MetadataLimits {
@@ -102,13 +286,19 @@ impl Default for MetadataLimits {
 enum EntryTransferError<E> {
     Upload(S3Error),
     Read(io::Error),
-    BudgetExceeded,
+    BudgetExceeded(BudgetKind),
     Observer(E),
+}
+
+#[derive(Clone, Copy)]
+enum BudgetKind {
+    Archive,
+    Entry,
 }
 
 enum CopyFailure<E> {
     Io(io::Error),
-    BudgetExceeded,
+    BudgetExceeded(BudgetKind),
     Observer(E),
 }
 
@@ -121,6 +311,7 @@ async fn copy_with_budget<R, W, O>(
     reader: &mut R,
     writer: &mut W,
     remaining: &mut u64,
+    entry_remaining: &mut u64,
     observer: &mut O,
 ) -> Result<(), CopyFailure<O::Error>>
 where
@@ -134,20 +325,26 @@ where
         if read == 0 {
             return Ok(());
         }
-        let read = u64::try_from(read).map_err(|_| CopyFailure::BudgetExceeded)?;
+        let read =
+            u64::try_from(read).map_err(|_| CopyFailure::BudgetExceeded(BudgetKind::Archive))?;
         observer
             .bytes_processed(read)
             .await
             .map_err(CopyFailure::Observer)?;
         if read > *remaining {
-            return Err(CopyFailure::BudgetExceeded);
+            return Err(CopyFailure::BudgetExceeded(BudgetKind::Archive));
+        }
+        if read > *entry_remaining {
+            return Err(CopyFailure::BudgetExceeded(BudgetKind::Entry));
         }
         *remaining -= read;
+        *entry_remaining -= read;
         let end = usize::try_from(read).expect("chunk length fits in usize");
         writer
             .write_all(&buffer[..end])
             .await
             .map_err(CopyFailure::Io)?;
+        tokio::task::yield_now().await;
     }
 }
 
@@ -155,6 +352,7 @@ async fn upload_entry_to_kubo<R, O>(
     state: &Arc<AppState>,
     reader: &mut R,
     remaining: &mut u64,
+    entry_remaining: &mut u64,
     observer: &mut O,
 ) -> Result<StoredObject, EntryTransferError<O::Error>>
 where
@@ -169,7 +367,14 @@ where
     });
     let mut copy = Box::pin(async {
         let mut tokio_reader = reader.compat();
-        copy_with_budget(&mut tokio_reader, &mut duplex_writer, remaining, observer).await
+        copy_with_budget(
+            &mut tokio_reader,
+            &mut duplex_writer,
+            remaining,
+            entry_remaining,
+            observer,
+        )
+        .await
     });
 
     tokio::select! {
@@ -186,7 +391,7 @@ where
                 match (copy_result, shutdown) {
                     (Ok(()), Ok(())) => Ok(stored),
                     (Ok(()), Err(error)) => Err(EntryTransferError::Read(error)),
-                    (Err(CopyFailure::BudgetExceeded), _) => Err(EntryTransferError::BudgetExceeded),
+                    (Err(CopyFailure::BudgetExceeded(kind)), _) => Err(EntryTransferError::BudgetExceeded(kind)),
                     (Err(CopyFailure::Io(error)), _) => Err(EntryTransferError::Read(error)),
                     (Err(CopyFailure::Observer(error)), _) => Err(EntryTransferError::Observer(error)),
                 }
@@ -196,7 +401,7 @@ where
             drop(copy);
             let shutdown = duplex_writer.shutdown().await;
             match (copy_result, shutdown) {
-                (Err(CopyFailure::BudgetExceeded), _) => Err(EntryTransferError::BudgetExceeded),
+                (Err(CopyFailure::BudgetExceeded(kind)), _) => Err(EntryTransferError::BudgetExceeded(kind)),
                 (Err(CopyFailure::Observer(error)), _) => Err(EntryTransferError::Observer(error)),
                 (Err(CopyFailure::Io(error)), _) => match upload.await {
                     Err(upload) if error.kind() == io::ErrorKind::BrokenPipe => {
@@ -214,11 +419,30 @@ where
     }
 }
 
-fn budget_rejection() -> S3Error {
+fn budget_rejection(reported_max: u64) -> S3Error {
     crate::error::AppError::ZipArchiveRejected(format!(
-        "archive expands beyond the {MAX_DECOMPRESSED_ARCHIVE_BYTES} byte decompression limit"
+        "archive expands beyond the {reported_max} byte decompression limit"
     ))
     .into()
+}
+
+fn entry_budget_rejection() -> S3Error {
+    crate::error::AppError::ZipArchiveRejected(
+        "ZIP entry exceeds the single-entry decompression limit".to_owned(),
+    )
+    .into()
+}
+
+fn limit_error(kind: BudgetKind, reported_max: u64) -> S3Error {
+    match kind {
+        BudgetKind::Archive => budget_rejection(reported_max),
+        BudgetKind::Entry => entry_budget_rejection(),
+    }
+}
+
+fn resource_budget_rejection() -> S3Error {
+    crate::error::AppError::ZipArchiveRejected("archive exceeds ZIP staged add budget".to_owned())
+        .into()
 }
 
 fn backend_stream_error(error: &(dyn std::error::Error + 'static)) -> Option<S3Error> {
@@ -304,6 +528,36 @@ where
     }
 }
 
+/// Explicit request-scoped ZIP budgets; the legacy wrappers keep their
+/// pre-existing default behavior. Configured limits only apply when passed.
+pub async fn extract_zip_stream_with_limits<S, E>(
+    state: &Arc<AppState>,
+    target_prefix: &str,
+    stream: S,
+    limits: ZipExtractionLimits,
+) -> S3Result<ExtractOutcome>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let mut observer = NoopObserver;
+    match extract_zip_stream_observed_with_limits(
+        state,
+        target_prefix,
+        stream,
+        limits,
+        &mut observer,
+    )
+    .await
+    {
+        Ok(outcome) => Ok(outcome),
+        Err(ObservedExtractionError::Archive(error) | ObservedExtractionError::Limit(error)) => {
+            Err(error)
+        }
+        Err(ObservedExtractionError::Observer(error)) => match error {},
+    }
+}
+
 pub async fn extract_zip_stream_observed<S, E, O>(
     state: &Arc<AppState>,
     target_prefix: &str,
@@ -327,6 +581,42 @@ where
     .await
 }
 
+pub async fn extract_zip_stream_observed_with_limits<S, E, O>(
+    state: &Arc<AppState>,
+    target_prefix: &str,
+    stream: S,
+    limits: ZipExtractionLimits,
+    observer: &mut O,
+) -> Result<ExtractOutcome, ObservedExtractionError<O::Error>>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
+    E: std::error::Error + Send + Sync + 'static,
+    O: ExtractionObserver,
+{
+    let extraction = extract_observed_with_limits(
+        state,
+        target_prefix,
+        stream,
+        observer,
+        limits,
+        limits.max_decompressed_bytes,
+    );
+    if let Some(deadline) = limits.processing_deadline {
+        tokio::time::timeout(deadline, extraction)
+            .await
+            .map_err(|_| {
+                ObservedExtractionError::Limit(
+                    crate::error::AppError::ZipArchiveRejected(
+                        "ZIP extraction processing deadline exceeded".to_owned(),
+                    )
+                    .into(),
+                )
+            })?
+    } else {
+        extraction.await
+    }
+}
+
 async fn extract_observed_with_metadata_limits<S, E, O>(
     state: &Arc<AppState>,
     target_prefix: &str,
@@ -340,15 +630,111 @@ where
     E: std::error::Error + Send + Sync + 'static,
     O: ExtractionObserver,
 {
-    let mut remaining = max_decompressed_bytes;
-    let source = StreamReader::new(stream.map_err(io::Error::other));
+    let limits = ZipExtractionLimits {
+        max_decompressed_bytes,
+        // The legacy with_limit API accepted a caller-supplied archive budget
+        // without a separate per-entry cap. Retain that exact behavior.
+        max_single_entry_bytes: max_decompressed_bytes,
+        max_entries: limits.entries,
+        max_metadata_bytes: limits.bytes,
+        ..ZipExtractionLimits::default()
+    };
+    extract_observed_with_limits(
+        state,
+        target_prefix,
+        stream,
+        observer,
+        limits,
+        MAX_DECOMPRESSED_ARCHIVE_BYTES,
+    )
+    .await
+}
+
+async fn extract_observed_with_limits<S, E, O>(
+    state: &Arc<AppState>,
+    target_prefix: &str,
+    stream: S,
+    observer: &mut O,
+    limits: ZipExtractionLimits,
+    reported_max: u64,
+) -> Result<ExtractOutcome, ObservedExtractionError<O::Error>>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
+    E: std::error::Error + Send + Sync + 'static,
+    O: ExtractionObserver,
+{
+    let mut remaining = limits.max_decompressed_bytes;
+    let mut staged_adds_left = limits.max_staged_adds;
+    let mut source = StreamReader::new(stream.map_err(io::Error::other));
+    // async_zip's forward-only reader insists on a local entry header and
+    // rejects a valid zero-entry EOCD. Peek only the first four bytes; replay
+    // them for every non-empty archive so its normal parser sees every byte.
+    let mut signature = [0_u8; 4];
+    let mut seen = 0;
+    while seen < signature.len() {
+        match source.read(&mut signature[seen..]).await {
+            Ok(0) => break,
+            Ok(n) => seen += n,
+            Err(error) => {
+                return Err(ObservedExtractionError::Archive(
+                    backend_stream_error(&error).unwrap_or_else(|| {
+                        crate::error::AppError::ZipArchiveRejected(format!(
+                            "invalid zip archive: {error}"
+                        ))
+                        .into()
+                    }),
+                ));
+            }
+        }
+    }
+    if signature == *b"PK\x05\x06" {
+        // A strict 22-byte EOCD with all counts, offsets, disk IDs and comment
+        // length zero is the only empty archive accepted here. A trailer,
+        // partial header, comment or ZIP64 structure must not forge a batch.
+        let mut tail = [0_u8; 19];
+        let mut tail_len = 0;
+        while tail_len < tail.len() {
+            match source.read(&mut tail[tail_len..]).await {
+                Ok(0) => break,
+                Ok(n) => tail_len += n,
+                Err(error) => {
+                    return Err(ObservedExtractionError::Archive(
+                        backend_stream_error(&error).unwrap_or_else(|| {
+                            crate::error::AppError::ZipArchiveRejected(format!(
+                                "invalid zip archive: {error}"
+                            ))
+                            .into()
+                        }),
+                    ));
+                }
+            }
+        }
+        if tail_len == 18 && tail[..18].iter().all(|byte| *byte == 0) {
+            return Ok(ExtractOutcome {
+                entries: Vec::new(),
+                failures: Vec::new(),
+            });
+        }
+        return Err(ObservedExtractionError::Archive(
+            crate::error::AppError::ZipArchiveRejected("invalid empty zip archive".into()).into(),
+        ));
+    }
+    let source = std::io::Cursor::new(signature[..seen].to_vec()).chain(source);
     let (source, local_headers) = observe_local_headers(source);
-    local_headers.set_budget(limits.entries, limits.bytes, target_prefix.len());
+    local_headers.set_budget(
+        limits.max_entries,
+        limits.max_metadata_bytes,
+        target_prefix.len(),
+    );
     let mut zip = async_zip::base::read::stream::ZipFileReader::with_tokio(source);
     let mut entries = Vec::new();
     let mut failures = Vec::new();
 
     loop {
+        // Empty entries can complete without awaiting transport or writes.
+        // Yield so an explicit processing deadline can interrupt CPU-heavy
+        // archives and cancellation can promptly drop the extraction future.
+        tokio::task::yield_now().await;
         local_headers.begin();
         let next = match zip.next_with_entry().await {
             Ok(next) => next,
@@ -391,6 +777,7 @@ where
         };
         let compressed_start = local_headers.position();
         let remaining_before_entry = remaining;
+        let mut entry_remaining = limits.max_single_entry_bytes;
         let entry = entry_reader.reader().entry();
 
         let supported = matches!(
@@ -438,12 +825,22 @@ where
                 let drain_result = {
                     let mut reader = entry_reader.reader_mut().compat();
                     let mut sink = tokio::io::sink();
-                    copy_with_budget(&mut reader, &mut sink, &mut remaining, observer).await
+                    copy_with_budget(
+                        &mut reader,
+                        &mut sink,
+                        &mut remaining,
+                        &mut entry_remaining,
+                        observer,
+                    )
+                    .await
                 };
                 match drain_result {
                     Ok(()) => {}
-                    Err(CopyFailure::BudgetExceeded) => {
-                        return Err(ObservedExtractionError::Limit(budget_rejection()));
+                    Err(CopyFailure::BudgetExceeded(kind)) => {
+                        return Err(ObservedExtractionError::Limit(limit_error(
+                            kind,
+                            reported_max,
+                        )));
                     }
                     Err(CopyFailure::Observer(error)) => {
                         return Err(ObservedExtractionError::Observer(error));
@@ -502,108 +899,131 @@ where
             SanitizedEntry::File { key } => key,
         };
 
+        if staged_adds_left == 0 {
+            return Err(ObservedExtractionError::Limit(resource_budget_rejection()));
+        }
+        staged_adds_left -= 1;
+
         observer
             .entry_started(&key)
             .await
             .map_err(ObservedExtractionError::Observer)?;
 
-        let stored =
-            match upload_entry_to_kubo(state, entry_reader.reader_mut(), &mut remaining, observer)
-                .await
-            {
-                Ok(stored) => stored,
-                Err(EntryTransferError::Upload(error)) => {
-                    record_failure(
+        let stored = match upload_entry_to_kubo(
+            state,
+            entry_reader.reader_mut(),
+            &mut remaining,
+            &mut entry_remaining,
+            observer,
+        )
+        .await
+        {
+            Ok(stored) => stored,
+            Err(EntryTransferError::Upload(error)) => {
+                record_failure(
+                    observer,
+                    &mut failures,
+                    &key,
+                    failure(&name, "EntryUploadFailed", error),
+                )
+                .await?;
+                let drain_result = {
+                    let mut reader = entry_reader.reader_mut().compat();
+                    let mut sink = tokio::io::sink();
+                    copy_with_budget(
+                        &mut reader,
+                        &mut sink,
+                        &mut remaining,
+                        &mut entry_remaining,
                         observer,
-                        &mut failures,
-                        &key,
-                        failure(&name, "EntryUploadFailed", error),
-                    )
-                    .await?;
-                    let drain_result = {
-                        let mut reader = entry_reader.reader_mut().compat();
-                        let mut sink = tokio::io::sink();
-                        copy_with_budget(&mut reader, &mut sink, &mut remaining, observer).await
-                    };
-                    match drain_result {
-                        Ok(()) => {}
-                        Err(CopyFailure::BudgetExceeded) => {
-                            return Err(ObservedExtractionError::Limit(budget_rejection()));
-                        }
-                        Err(CopyFailure::Observer(error)) => {
-                            return Err(ObservedExtractionError::Observer(error));
-                        }
-                        Err(CopyFailure::Io(error)) => {
-                            if let Some(error) = backend_stream_error(&error) {
-                                return Err(ObservedExtractionError::Archive(error));
-                            }
-                            record_failure(
-                                observer,
-                                &mut failures,
-                                &key,
-                                failure(&name, "EntryReadFailed", error),
-                            )
-                            .await?;
-                            return Ok(ExtractOutcome { entries, failures });
-                        }
-                    }
-                    match finish_entry(
-                        entry_reader,
-                        &local_headers,
-                        local.uses_descriptor(),
-                        compressed_start,
-                        remaining_before_entry - remaining,
                     )
                     .await
-                    {
-                        Ok((ready, valid)) => {
-                            if !valid {
-                                record_failure(
-                                    observer,
-                                    &mut failures,
-                                    &key,
-                                    failure(&name, "EntryReadFailed", "ZIP CRC or size mismatch"),
-                                )
-                                .await?;
-                            }
-                            zip = ready;
-                            continue;
+                };
+                match drain_result {
+                    Ok(()) => {}
+                    Err(CopyFailure::BudgetExceeded(kind)) => {
+                        return Err(ObservedExtractionError::Limit(limit_error(
+                            kind,
+                            reported_max,
+                        )));
+                    }
+                    Err(CopyFailure::Observer(error)) => {
+                        return Err(ObservedExtractionError::Observer(error));
+                    }
+                    Err(CopyFailure::Io(error)) => {
+                        if let Some(error) = backend_stream_error(&error) {
+                            return Err(ObservedExtractionError::Archive(error));
                         }
-                        Err(error) => {
-                            if let Some(error) = backend_stream_error(&error) {
-                                return Err(ObservedExtractionError::Archive(error));
-                            }
+                        record_failure(
+                            observer,
+                            &mut failures,
+                            &key,
+                            failure(&name, "EntryReadFailed", error),
+                        )
+                        .await?;
+                        return Ok(ExtractOutcome { entries, failures });
+                    }
+                }
+                match finish_entry(
+                    entry_reader,
+                    &local_headers,
+                    local.uses_descriptor(),
+                    compressed_start,
+                    remaining_before_entry - remaining,
+                )
+                .await
+                {
+                    Ok((ready, valid)) => {
+                        if !valid {
                             record_failure(
                                 observer,
                                 &mut failures,
                                 &key,
-                                failure(&name, "EntryReadFailed", error),
+                                failure(&name, "EntryReadFailed", "ZIP CRC or size mismatch"),
                             )
                             .await?;
-                            return Ok(ExtractOutcome { entries, failures });
                         }
+                        zip = ready;
+                        continue;
+                    }
+                    Err(error) => {
+                        if let Some(error) = backend_stream_error(&error) {
+                            return Err(ObservedExtractionError::Archive(error));
+                        }
+                        record_failure(
+                            observer,
+                            &mut failures,
+                            &key,
+                            failure(&name, "EntryReadFailed", error),
+                        )
+                        .await?;
+                        return Ok(ExtractOutcome { entries, failures });
                     }
                 }
-                Err(EntryTransferError::Read(error)) => {
-                    if let Some(error) = backend_stream_error(&error) {
-                        return Err(ObservedExtractionError::Archive(error));
-                    }
-                    record_failure(
-                        observer,
-                        &mut failures,
-                        &key,
-                        failure(&name, "EntryReadFailed", error),
-                    )
-                    .await?;
-                    return Ok(ExtractOutcome { entries, failures });
+            }
+            Err(EntryTransferError::Read(error)) => {
+                if let Some(error) = backend_stream_error(&error) {
+                    return Err(ObservedExtractionError::Archive(error));
                 }
-                Err(EntryTransferError::BudgetExceeded) => {
-                    return Err(ObservedExtractionError::Limit(budget_rejection()));
-                }
-                Err(EntryTransferError::Observer(error)) => {
-                    return Err(ObservedExtractionError::Observer(error));
-                }
-            };
+                record_failure(
+                    observer,
+                    &mut failures,
+                    &key,
+                    failure(&name, "EntryReadFailed", error),
+                )
+                .await?;
+                return Ok(ExtractOutcome { entries, failures });
+            }
+            Err(EntryTransferError::BudgetExceeded(kind)) => {
+                return Err(ObservedExtractionError::Limit(limit_error(
+                    kind,
+                    reported_max,
+                )));
+            }
+            Err(EntryTransferError::Observer(error)) => {
+                return Err(ObservedExtractionError::Observer(error));
+            }
+        };
 
         match finish_entry(
             entry_reader,
@@ -662,7 +1082,7 @@ mod tests {
     include!("hardening_tests.rs");
     use std::collections::HashMap;
     use std::io;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -691,6 +1111,185 @@ mod tests {
 
     const HELLO: &[u8] = b"hello";
     const HELLO_DEFLATED: &[u8] = &[0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00];
+    const ZEROES: &[u8] = &[0; 1024];
+    const ZEROES_DEFLATED: &[u8] = &[
+        0x63, 0x60, 0x18, 0x05, 0xa3, 0x60, 0x14, 0x8c, 0x54, 0x00, 0x00,
+    ];
+
+    #[test]
+    fn source_zip_limit_is_independent_of_decompression_limits() {
+        let limits = super::ZipExtractionLimits::default()
+            .with_archive_bytes(64 * 1024 * 1024 * 1024)
+            .unwrap();
+        assert_eq!(limits.max_archive_bytes(), 64 * 1024 * 1024 * 1024);
+        assert_eq!(
+            limits.max_decompressed_bytes(),
+            super::MAX_DECOMPRESSED_ARCHIVE_BYTES
+        );
+        assert_eq!(limits.max_entries(), super::MAX_ARCHIVE_ENTRIES);
+        assert_eq!(
+            limits.max_metadata_bytes(),
+            super::MAX_ARCHIVE_METADATA_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn compressed_bomb_is_charged_on_inflate_not_compressed_length() {
+        let (state, kubo) = extractor_state_with_add_responses(Vec::new(), 0).await;
+        let archive = zip(&[ZipEntryFixture {
+            name: b"bomb/",
+            data: ZEROES,
+            method: 8,
+            descriptor: false,
+        }]);
+        let error = super::extract_zip_stream_with_limit(
+            &state,
+            "",
+            stream::iter(vec![Ok::<_, io::Error>(Bytes::from(archive))]),
+            1023,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code().as_str(), "InvalidParameterValue");
+        assert_kubo_call_counts(&kubo, 0, 0).await;
+    }
+
+    #[tokio::test]
+    async fn default_deadline_does_not_expire_active_slow_source() {
+        let (state, kubo) = extractor_state_with_add_responses(
+            vec![
+                ResponseTemplate::new(200)
+                    .set_body_string("{\"Hash\":\"QmEntry\",\"Size\":\"5\"}\n"),
+            ],
+            1,
+        )
+        .await;
+        let archive = single_entry_zip(0, false);
+        let source = Box::pin(async_stream::stream! {
+            for chunk in archive.chunks(15) {
+                tokio::time::sleep(Duration::from_millis(15)).await;
+                yield Ok::<_, io::Error>(Bytes::copy_from_slice(chunk));
+            }
+        });
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(3),
+            super::extract_zip_stream_with_limits(
+                &state,
+                "p/",
+                source,
+                super::ZipExtractionLimits::default(),
+            ),
+        )
+        .await
+        .expect("slow but active input must finish")
+        .unwrap();
+        assert_eq!(outcome.entries.len(), 1);
+        assert_kubo_call_counts(&kubo, 1, 1).await;
+    }
+
+    #[tokio::test]
+    async fn configured_single_entry_limit_counts_real_streamed_bytes() {
+        let (state, kubo) = extractor_state_with_add_responses(
+            vec![
+                ResponseTemplate::new(200)
+                    .set_body_string("{\"Hash\":\"QmEntry\",\"Size\":\"5\"}\n"),
+            ],
+            0,
+        )
+        .await;
+        let mut observer = RecordingObserver::default();
+        let limits = super::ZipExtractionLimits::default()
+            .with_single_entry_bytes(2)
+            .unwrap();
+        let error = super::extract_zip_stream_observed_with_limits(
+            &state,
+            "prefix/",
+            stream::iter(vec![Ok::<_, io::Error>(Bytes::from(single_entry_zip(
+                8, true,
+            )))]),
+            limits,
+            &mut observer,
+        )
+        .await;
+        assert!(matches!(error, Err(ObservedExtractionError::Limit(_))));
+        assert_eq!(observer.bytes, 5);
+        assert!(requests_for(&kubo).await.iter().all(|request| {
+            request.url.path() != "/api/v0/pin/add"
+                && !request
+                    .body
+                    .windows(HELLO.len())
+                    .any(|bytes| bytes == HELLO)
+        }));
+    }
+
+    #[tokio::test]
+    async fn configured_deadline_interrupts_stalled_source_without_relabeling_as_idle() {
+        let (state, kubo) = extractor_state_with_add_responses(Vec::new(), 0).await;
+        let limits = super::ZipExtractionLimits::default()
+            .with_deadline(Duration::from_millis(25))
+            .unwrap();
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_in_source = dropped.clone();
+        let source = Box::pin(async_stream::stream! {
+            let _guard = DropFlag(dropped_in_source);
+            yield Ok::<_, io::Error>(Bytes::from_static(b"PK\x03\x04"));
+            std::future::pending::<()>().await;
+        });
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            super::extract_zip_stream_with_limits(&state, "prefix/", source, limits),
+        )
+        .await
+        .expect("processing deadline must interrupt stalled source")
+        .unwrap_err();
+        assert!(
+            error
+                .message()
+                .unwrap_or_default()
+                .contains("processing deadline")
+        );
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "deadline must drop the source"
+        );
+        assert_kubo_call_counts(&kubo, 0, 0).await;
+    }
+
+    #[tokio::test]
+    async fn configured_staged_add_budget_skips_second_upload() {
+        let (state, kubo) = extractor_state_with_add_responses(
+            vec![
+                ResponseTemplate::new(200)
+                    .set_body_string("{\"Hash\":\"QmEntry\",\"Size\":\"5\"}\n"),
+            ],
+            1,
+        )
+        .await;
+        let entry = ZipEntryFixture {
+            name: b"f",
+            data: HELLO,
+            method: 0,
+            descriptor: false,
+        };
+        let limits = super::ZipExtractionLimits::default()
+            .with_staged_adds(1)
+            .unwrap();
+        let error = super::extract_zip_stream_with_limits(
+            &state,
+            "prefix/",
+            stream::iter(vec![Ok::<_, io::Error>(Bytes::from(zip(&[entry; 2])))]),
+            limits,
+        )
+        .await;
+        assert_eq!(error.unwrap_err().code().as_str(), "InvalidParameterValue");
+        assert_kubo_call_counts(&kubo, 1, 1).await;
+    }
 
     #[derive(Clone, Copy)]
     struct ZipEntryFixture<'a> {
@@ -722,6 +1321,7 @@ mod tests {
     fn encoded_data(entry: ZipEntryFixture<'_>) -> &'_ [u8] {
         match (entry.method, entry.data) {
             (8, HELLO) => HELLO_DEFLATED,
+            (8, ZEROES) => ZEROES_DEFLATED,
             (_, data) => data,
         }
     }
@@ -1215,6 +1815,31 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(error.status_code(), Some(http::StatusCode::BAD_REQUEST));
+    }
+
+    #[tokio::test]
+    async fn strict_empty_eocd_requires_clean_stream_eof_even_across_chunks() {
+        let (state, kubo) = extractor_state_with_add_responses(Vec::new(), 0).await;
+        let mut eocd = [0_u8; 22];
+        eocd[..4].copy_from_slice(b"PK\x05\x06");
+        let chunks = vec![
+            Ok::<_, io::Error>(Bytes::copy_from_slice(&eocd[..1])),
+            Ok(Bytes::copy_from_slice(&eocd[1..5])),
+            Ok(Bytes::copy_from_slice(&eocd[5..18])),
+            Ok(Bytes::copy_from_slice(&eocd[18..])),
+        ];
+        let outcome = extract_zip_stream(&state, "out/", stream::iter(chunks))
+            .await
+            .unwrap();
+        assert!(outcome.entries.is_empty() && outcome.failures.is_empty());
+        assert_kubo_call_counts(&kubo, 0, 0).await;
+
+        let truncated = stream::iter(vec![
+            Ok(Bytes::copy_from_slice(&eocd)),
+            Err(io::Error::other("late stream failure")),
+        ]);
+        assert!(extract_zip_stream(&state, "out/", truncated).await.is_err());
+        assert_kubo_call_counts(&kubo, 0, 0).await;
     }
 
     #[tokio::test]

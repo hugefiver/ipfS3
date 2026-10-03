@@ -31,9 +31,12 @@ An S3-compatible gateway backed by IPFS (Kubo). Translates S3 API calls into Kub
   before the body reaches s3s, including requests with media-type parameters.
   `If-Match` and `If-None-Match` on `PutObject` or multipart completion are
   explicitly rejected. They do not provide compare-and-swap writes.
-- **ZIP extraction:** Direct decompression and ZIP import share a limit of
-  10,000 local entries and 64 MiB of conservative metadata reservations per
-  archive, independent of the 8 GiB decompressed-byte limit. Final
+- **ZIP extraction:** Direct/MPU decompression and ZIP import default to
+  10,000 local entries, 64 MiB of conservative metadata reservations, 8 GiB
+  each for total and per-entry decompressed bytes, and 16 GiB of raw ZIP input.
+  Configure per-input budgets, an optional processing deadline, and the number
+  of attempted per-entry Kubo adds under `[decompress_zip]`. These are intake
+  limits, **not** a global Kubo disk-capacity or retained-CID guarantee. Final
   prefix-plus-entry keys are limited to 1024 UTF-8 bytes. CRC32 and size checks,
   including Deflate data descriptors, must pass before an entry succeeds. See
   the [ZIP safety boundary](src/zip/README.md) for accounting, compatibility,
@@ -43,9 +46,11 @@ An S3-compatible gateway backed by IPFS (Kubo). Translates S3 API calls into Kub
   seconds. The multi-gateway Nginx configuration retries only `GET` and `HEAD`.
   A write-side upstream failure fails the request and is never replayed.
 
-**Implementation status (2026-09-19):** The hardening code is present. Final
-suite verification is still running, so this document does not claim a final
-PASS result or treat historical F1 evidence as evidence for this source state.
+**Verification boundary:** Stage 4 passed isolated Kubo 0.43.0 and PostgreSQL 17
+checks, signed HTTP regressions, and mock URL/provider recovery tests. Real
+Filebase/Pinata account writes remain **NOT RUN**. The process-restart check uses
+two test executables with the production import components, not the production
+`main` binary; it does not claim complete deployment or remote-account coverage.
 
 ## Quick Start
 
@@ -352,8 +357,8 @@ version. `GetObject`, `HeadObject`, `CopyObject`, object tagging, and
 
 `ListObjectVersions` returns versions and delete markers in combined order; its
 key-marker and version-id-marker pagination continue that same order.
-`PutObject`, `CopyObject`, completed multipart uploads, `ipfs3-import`, and ZIP
-extraction all publish version-aware objects. Each version retains `ETag = CID`
+`PutObject`, `CopyObject`, completed multipart uploads, `ipfs3-import`, and legacy
+ZIP extraction publish version-aware objects. Each published version retains `ETag = CID`
 and its encryption metadata. Deleting a version removes only public metadata:
 gateway Kubo pins are retained and `pin/rm` is not called. Bucket deletion
 requires exact removal of every public version and delete marker.
@@ -574,14 +579,67 @@ x-amz-date: 20260813T000100Z
 x-amz-content-sha256: SHA256_OF_EMPTY_BODY
 ```
 
-The optional `x-ipfs3-client-token` header makes an identical replay return the
+The optional legacy `x-ipfs3-client-token` header makes an identical replay return the
 same job; reusing a token with different source, metadata, tags, content type,
 or decompression prefix is rejected. Add `decompress-zip=<prefix>` to the
-submission query to import a ZIP and publish the archive plus successful
+submission query to import a legacy ZIP and publish the archive plus successful
 entries together, for example
 `POST /my-bucket/archive.zip?ipfs3-import&decompress-zip=expanded%2F`.
 
-Jobs, attempts, and progress are persisted. If a process or worker stops, a
+### ZIP batch and UnixFS root contract
+
+Legacy ZIP requests keep their archive object and its real CID ETag and
+VersionId, including existing result-body behavior. The new ZIP-only
+`[decompress_zip] unixfs_directory_root` default is on. A ZIP request can
+override it with the exact signed `x-amz-tagging` value
+`ipfs-s3%3Azip-root=false` or `ipfs-s3%3Azip-root=true`. This tag doesn't
+rebuild a root on later ordinary PUT, CopyObject, or tagging calls. The root
+contains only the batch's final successfully published relative file paths,
+with their actual CIDs and required parent directories. It excludes the ZIP
+archive, extraction prefix, failed entries, and empty directories. A root is
+`disabled` when switched off, `empty` without successful files, `complete`
+when all included files succeeded, and `partial` when some entries failed but
+the successful set forms a verified directory. A build error is `failed` or
+`retryable`, with a safe warning and no unverified CID; it must not erase
+objects already published or turn an entry failure into a successful link.
+
+Each batch and root has its own durable owner and status, independent of the
+archive object's lifetime. A root is a local snapshot, not another S3 object
+or an automatically remote-pinned backup. There is no automatic `pin/rm` or
+physical reclaim, even after a later object delete. ZIP extraction doesn't
+support SSE-S3 or SSE-C. Root-only recovery uses the stored manifest and never
+republishes the source or extracted object versions.
+
+ZIP v2 is an explicit extension, not a change to ordinary PUT or Complete.
+It requires header-based SigV4 with every supplied control header in
+`SignedHeaders`: `x-ipfs3-zip-contract: v2`,
+`x-ipfs3-zip-publish-source: true|false`,
+`x-ipfs3-zip-publish-extracted: true|false`,
+`x-ipfs3-zip-targets: none|source|extracted|both`, and a new
+`x-ipfs3-zip-token` (1 to 128 ASCII letters, digits, `.`, `_`, `~`, or `-`).
+Sign `x-amz-tagging` when supplied; v2 URL imports also require a signed
+`x-ipfs3-zip-expected-sha256` with the expected lowercase 64-hex SHA-256 of
+the complete ZIP input. `decompress-zip-result=false` is not allowed in v2.
+When publishing the source, supplied `Content-Type` and custom metadata must
+also be signed; replay cannot change the captured source attributes.
+`source=false` publishes only successful extracted outputs. It neither
+creates nor overwrites or deletes the source key and returns no made-up archive
+ETag or VersionId. The v2 result identifies the batch, whether the source was
+published, the input SHA-256 (not an S3 ETag), the manifest, and root status.
+Remote targets are restricted to published outputs: each output's own policy,
+including private-prefix denial, intersects the signed batch target ceiling.
+An `always` rule cannot add back an excluded source or bypass a private deny.
+
+For URL import, `202 Accepted` means admission only. The worker must fetch and
+verify the committed digest before publishing; a replay of a committed result
+uses the fixed historical input and does not re-fetch a changed URL. A crash
+before the artifact is persisted can still require another fetch. For a
+source=false MPU Complete with zero successful output files, the agreed
+behavior is a durable failed batch and the same 4xx on first completion and
+replay, queryable through the UploadId. Don't treat an open or pending batch as
+a published object or a successful remote pin.
+
+Legacy jobs, attempts, and progress are persisted. If a process or worker stops, a
 lease can expire so another worker reclaims and retries the job. This recovery
 is job-level retry/reclaim, not byte-range URL resume; a retried URL attempt may
 download the source again from byte zero. Submission validation failures are
@@ -838,8 +896,8 @@ and returns its warning after successful publication, even if provider configura
 changed in between. An accepted intent whose route becomes unsafe fails closed
 rather than being silently remapped. The import `202` warning describes
 admission only, not job completion or a remote pin. Successful direct ZIP
-responses can also carry the warning; this doesn't add the Stage 4 ZIP batch
-or UnixFS root contract.
+responses can also carry the warning; the Stage 3 warning alone isn't proof
+of a Stage 4 ZIP batch or verified UnixFS root.
 
 Before accepting a new multipart upload or import with executable non-Noop
 remote intent, configure an explicit `[[pinning_identity.providers]]` entry for

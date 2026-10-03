@@ -7,6 +7,12 @@ pub struct StatusResultPage<'a> {
     pub next_continuation_token: Option<&'a str>,
 }
 
+pub struct ZipRootStatus<'a> {
+    pub status: &'a str,
+    pub cid: Option<&'a str>,
+    pub error_code: Option<&'a str>,
+}
+
 fn esc(value: &str) -> String {
     quick_xml::escape::escape(value).into_owned()
 }
@@ -36,6 +42,14 @@ pub fn accepted_xml(job_id: &str, state: &str, phase: &str) -> String {
 }
 
 pub fn status_xml(job: &import_job::Model, page: Option<StatusResultPage<'_>>) -> String {
+    status_xml_with_root(job, page, None)
+}
+
+pub fn status_xml_with_root(
+    job: &import_job::Model,
+    page: Option<StatusResultPage<'_>>,
+    root: Option<ZipRootStatus<'_>>,
+) -> String {
     let mut xml = String::from(XML_DECLARATION);
     xml.push_str("<IPFS3ImportStatus>");
     element(&mut xml, "JobId", &job.id);
@@ -87,6 +101,18 @@ pub fn status_xml(job: &import_job::Model, page: Option<StatusResultPage<'_>>) -
             element(&mut xml, "Message", message);
         }
         xml.push_str("</Failure>");
+    }
+
+    if let Some(root) = root {
+        xml.push_str("<ZipRoot>");
+        element(&mut xml, "Status", root.status);
+        if let Some(cid) = root.cid {
+            element(&mut xml, "CID", cid);
+        }
+        if let Some(code) = root.error_code {
+            element(&mut xml, "ErrorCode", code);
+        }
+        xml.push_str("</ZipRoot>");
     }
 
     element(
@@ -168,6 +194,7 @@ mod tests {
             tags_json: "[]".to_owned(),
             pin_decision_json: None,
             decompress_prefix: None,
+            root_capture_json: None,
             state: "running".to_owned(),
             phase: "pinning_local".to_owned(),
             attempts: 2,

@@ -1,6 +1,7 @@
 pub mod add;
 pub mod cat;
 pub mod client;
+pub mod directory;
 pub mod health;
 pub mod pin;
 pub mod routing;

@@ -13,6 +13,7 @@ pub mod object;
 pub mod object_version;
 pub mod pinning;
 pub mod residency;
+pub mod zip;
 
 use sea_orm::DatabaseConnection;
 
@@ -107,6 +108,17 @@ mod migrator {
                 Box::new(crate::store::migrations::m20260920_000005_import_pin_decision::Migration),
                 Box::new(
                     crate::store::migrations::m20260920_000006_pin_submit_correlation::Migration,
+                ),
+                Box::new(crate::store::migrations::m20260927_000001_zip_batches::Migration),
+                Box::new(
+                    crate::store::migrations::m20260927_000002_import_zip_root_capture::Migration,
+                ),
+                Box::new(crate::store::migrations::m20260927_000003_zip_mpu_replay::Migration),
+                Box::new(crate::store::migrations::m20260927_000004_zip_v2_execution::Migration),
+                Box::new(crate::store::migrations::m20260927_000005_zip_v2_import::Migration),
+                Box::new(crate::store::migrations::m20260927_000006_zip_v2_mpu_intake::Migration),
+                Box::new(
+                    crate::store::migrations::m20260927_000007_zip_v2_mpu_completion::Migration,
                 ),
             ]
         }

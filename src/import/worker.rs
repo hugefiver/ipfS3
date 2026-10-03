@@ -18,6 +18,7 @@ use crate::{
     import::{
         ImportClaim, ImportExecutionError, ImportFailure, ImportFailureCode,
         pipeline::{ImportCoordinator, JobCancellation, execute_job},
+        v2_worker,
     },
     state::AppState,
     store::import::{jobs, ownership},
@@ -114,6 +115,10 @@ async fn run_worker(
     let config = coordinator.config().raw.clone();
     let worker_id = format!("import-worker-{}", uuid::Uuid::new_v4());
     let mut jobs_in_flight = JoinSet::new();
+    let mut v2_in_flight = JoinSet::new();
+    let mut v2_cursor = String::new();
+    let mut v2_next = false;
+    let v2_lease = config.lease_duration_secs.clamp(1, 60) as i64;
     let mut poll = tokio::time::interval(Duration::from_millis(config.poll_interval_ms));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let cleanup_interval = Duration::from_secs(config.terminal_retention_secs.max(1))
@@ -128,6 +133,11 @@ async fn run_worker(
             joined = jobs_in_flight.join_next(), if !jobs_in_flight.is_empty() => {
                 if let Some(Err(error)) = joined {
                     tracing::error!(%error, "import job task failed");
+                }
+            }
+            joined = v2_in_flight.join_next(), if !v2_in_flight.is_empty() => {
+                if let Some(Err(error)) = joined {
+                    tracing::error!(%error, "v2 import task failed");
                 }
             }
             _ = cleanup.tick() => {
@@ -152,30 +162,55 @@ async fn run_worker(
                 }
             }
             _ = poll.tick(), if imports_enabled => {
-                let available = config.worker_concurrency.saturating_sub(jobs_in_flight.len());
-                if available == 0 {
-                    continue;
-                }
-                let now = Utc::now();
-                let lease_until = now + lease_delta(config.lease_duration_secs);
-                match jobs::claim_due(
-                    state.store.db(),
-                    &worker_id,
-                    now,
-                    lease_until,
-                    available as u64,
-                ).await {
-                    Ok(claimed) => {
-                        for claimed_job in claimed {
-                            let coordinator = coordinator.clone();
-                            let state = state.clone();
-                            let shutdown = shutdown.clone();
-                            jobs_in_flight.spawn(async move {
-                                execute_claimed_job(coordinator, state, claimed_job, shutdown).await;
-                            });
+                let available = config.worker_concurrency
+                    .saturating_sub(jobs_in_flight.len() + v2_in_flight.len());
+                // Share all slots, alternating successful claims. An empty
+                // queue lends its slot rather than reserving unused capacity;
+                // at W=1 the peer gets first refusal on the next released slot.
+                for _ in 0..available {
+                    let mut claimed_slot = false;
+                    for claim_v2 in [v2_next, !v2_next] {
+                        if claim_v2 {
+                            match v2_worker::claim_due(state.store.db(), &worker_id, v2_lease, 1, &mut v2_cursor).await {
+                                Ok(claimed) => {
+                                    for claim in claimed {
+                                        let coordinator = coordinator.clone();
+                                        let state = state.clone();
+                                        let shutdown = shutdown.clone();
+                                        v2_in_flight.spawn(async move {
+                                            v2_worker::execute_with_heartbeat(coordinator, state, claim, shutdown, v2_lease).await;
+                                        });
+                                        claimed_slot = true;
+                                    }
+                                }
+                                Err(_) => tracing::warn!("v2 import claim scan failed"),
+                            }
+                        } else {
+                            let now = Utc::now();
+                            let lease_until = now + lease_delta(config.lease_duration_secs);
+                            match jobs::claim_due(state.store.db(), &worker_id, now, lease_until, 1).await {
+                                Ok(claimed) => {
+                                    for claimed_job in claimed {
+                                        let coordinator = coordinator.clone();
+                                        let state = state.clone();
+                                        let shutdown = shutdown.clone();
+                                        jobs_in_flight.spawn(async move {
+                                            execute_claimed_job(coordinator, state, claimed_job, shutdown).await;
+                                        });
+                                        claimed_slot = true;
+                                    }
+                                }
+                                Err(error) => tracing::error!(%error, "failed to claim import jobs"),
+                            }
+                        }
+                        if claimed_slot {
+                            v2_next = !claim_v2;
+                            break;
                         }
                     }
-                    Err(error) => tracing::error!(%error, "failed to claim import jobs"),
+                    if !claimed_slot {
+                        break;
+                    }
                 }
             }
         }
@@ -186,6 +221,11 @@ async fn run_worker(
     while let Some(result) = jobs_in_flight.join_next().await {
         if let Err(error) = result {
             tracing::error!(%error, "import job task failed during shutdown");
+        }
+    }
+    while let Some(result) = v2_in_flight.join_next().await {
+        if let Err(error) = result {
+            tracing::error!(%error, "v2 import task failed during shutdown");
         }
     }
 }
@@ -650,7 +690,9 @@ mod tests {
             Store,
             entities::{import_job, object},
             import::jobs::NewImportJob,
+            zip::{execution, import_intake},
         },
+        zip::options::{ZipTargets, ZipV2Options},
     };
 
     const CID: &str = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
@@ -779,6 +821,65 @@ mod tests {
         ownership::submit(state.store.db(), request(id, key), now)
             .await
             .unwrap();
+    }
+
+    async fn submit_v2(state: &AppState, id: &str) {
+        use sha2::{Digest, Sha256};
+
+        let options = ZipV2Options {
+            publish_source: true,
+            publish_extracted: false,
+            targets: ZipTargets::None,
+            token: id.to_owned(),
+            root_override: Some(false),
+            root_enabled: false,
+            result_version: 2,
+        };
+        let request_contract = serde_json::to_string(&options).unwrap();
+        import_intake::admit(
+            state.store.db(),
+            &import_intake::Request {
+                admission: execution::Admission {
+                    id: id.to_owned(),
+                    owner: "test".to_owned(),
+                    source: "import".to_owned(),
+                    token: id.to_owned(),
+                    request_fingerprint: hex::encode(Sha256::digest(request_contract.as_bytes())),
+                    request_contract,
+                    bucket: "bucket".to_owned(),
+                    source_key: id.to_owned(),
+                    captured_options: serde_json::json!({"options": options}).to_string(),
+                },
+                prefix: "out/".to_owned(),
+                source_descriptor: serde_json::to_string(&("cid", CID)).unwrap(),
+                expected_sha256: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn claimed_counts(state: &AppState) -> (usize, usize) {
+        let legacy = import_job::Entity::find()
+            .all(state.store.db())
+            .await
+            .unwrap()
+            .iter()
+            .filter(|job| job.state == "running")
+            .count();
+        let v2: i64 = state
+            .store
+            .db()
+            .query_one(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "SELECT COUNT(*) AS count FROM zip_v2_executions WHERE worker IS NOT NULL AND state IN ('pending','admitted')",
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "count")
+            .unwrap();
+        (legacy, v2 as usize)
     }
 
     async fn submit_source(
@@ -1643,7 +1744,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let worker = coordinator.start(state.clone(), shutdown);
 
-        tokio::time::timeout(Duration::from_secs(1), async {
+        let claimed_slots = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let rows = import_job::Entity::find()
                     .all(state.store.db())
@@ -1655,15 +1756,164 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
-        .await
-        .expect("worker must claim its available slots");
+        .await;
         let rows = import_job::Entity::find()
             .all(state.store.db())
             .await
             .unwrap();
+        worker.shutdown(Duration::from_secs(1)).await;
+        claimed_slots.expect("worker must claim its available slots");
         assert_eq!(rows.iter().filter(|row| row.state == "running").count(), 2);
         assert_eq!(rows.iter().filter(|row| row.state == "queued").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn worker_shares_configured_slots_across_legacy_and_v2_queues() {
+        for concurrency in [1, 2] {
+            let server = MockServer::start().await;
+            for endpoint in ["/api/v0/routing/findprovs", "/api/v0/pin/add"] {
+                Mock::given(method("POST"))
+                    .and(path(endpoint))
+                    .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
+                    .mount(&server)
+                    .await;
+            }
+            let state = test_state(server.uri()).await;
+            let now = Utc::now();
+            for id in ["a", "b", "c"] {
+                submit(&state, id, id, now).await;
+                submit_v2(&state, &format!("v2-{id}")).await;
+            }
+            let worker = coordinator(ImportConfig {
+                worker_concurrency: concurrency,
+                poll_interval_ms: 10,
+                lease_duration_secs: 5,
+                ..ImportConfig::default()
+            })
+            .start(state.clone(), CancellationToken::new());
+            let result = tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let (legacy, v2) = claimed_counts(&state).await;
+                    if legacy + v2 >= concurrency {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                // Keep both sources blocked across ten poll periods: a later
+                // scan may not claim an extra job from the other queue.
+                for _ in 0..10 {
+                    let counts = claimed_counts(&state).await;
+                    if counts.0 + counts.1 != concurrency {
+                        return counts;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                claimed_counts(&state).await
+            })
+            .await;
+            worker.shutdown(Duration::from_secs(1)).await;
+            let counts = result.expect("worker must fill its global available slots");
+            assert_eq!(
+                counts.0 + counts.1,
+                concurrency,
+                "legacy/v2 durable claims {counts:?} exceed global W={concurrency}"
+            );
+            if concurrency == 2 {
+                assert_eq!(counts, (1, 1), "both due queues must get a turn");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_v2_queue_borrows_idle_legacy_slots() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/pin/add"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
+            .mount(&server)
+            .await;
+        let state = test_state(server.uri()).await;
+        for id in ["v2-a", "v2-b", "v2-c"] {
+            submit_v2(&state, id).await;
+        }
+        let worker = coordinator(ImportConfig {
+            worker_concurrency: 2,
+            poll_interval_ms: 10,
+            lease_duration_secs: 5,
+            ..ImportConfig::default()
+        })
+        .start(state.clone(), CancellationToken::new());
+        let result = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let counts = claimed_counts(&state).await;
+                if counts.1 >= 2 {
+                    break counts;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
         worker.shutdown(Duration::from_secs(1)).await;
+        assert_eq!(result.expect("v2 must borrow idle legacy slots"), (0, 2));
+        assert_eq!(
+            execution::read(state.store.db(), "v2-c")
+                .await
+                .unwrap()
+                .unwrap()
+                .epoch,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_single_slot_alternates_queues_when_jobs_finish() {
+        let _test_guard = test_gates::TEST_LOCK.lock().await;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/routing/findprovs"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/pin/add"))
+            .respond_with(ResponseTemplate::new(503).set_delay(Duration::from_millis(100)))
+            .mount(&server)
+            .await;
+        let state = test_state(server.uri()).await;
+        let now = Utc::now();
+        for id in ["a", "b", "c"] {
+            submit(&state, id, id, now).await;
+        }
+        for id in ["v2-a", "v2-b"] {
+            submit_v2(&state, id).await;
+        }
+        let gate = install_worker_db_gate("b", test_gates::WorkerDbStage::InitialLeaseCap).await;
+        let worker = coordinator(ImportConfig {
+            worker_concurrency: 1,
+            poll_interval_ms: 10,
+            lease_duration_secs: 5,
+            max_attempts: 1,
+            ..ImportConfig::default()
+        })
+        .start(state.clone(), CancellationToken::new());
+        let arrived = tokio::time::timeout(Duration::from_secs(1), gate.arrived.notified()).await;
+        let first_v2 = execution::read(state.store.db(), "v2-a")
+            .await
+            .unwrap()
+            .unwrap();
+        let second_v2 = execution::read(state.store.db(), "v2-b")
+            .await
+            .unwrap()
+            .unwrap();
+        worker.shutdown(Duration::from_secs(1)).await;
+        *test_gates::GATE.lock().await = None;
+        arrived.expect("second legacy job must get the next released slot");
+        assert_eq!(persisted(&state, "a").await.state, "failed");
+        assert_eq!(first_v2.state, "fenced", "v2 must finish between a and b");
+        assert_eq!(first_v2.epoch, 1);
+        assert_eq!(second_v2.epoch, 0, "v2 backlog must not starve legacy b");
+        assert_eq!(persisted(&state, "b").await.state, "running");
+        assert_eq!(persisted(&state, "c").await.attempts, 0);
     }
 
     #[tokio::test]

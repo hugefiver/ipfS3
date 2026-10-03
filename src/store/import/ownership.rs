@@ -12,10 +12,11 @@ use crate::{
     error::{AppError, AppResult},
     import::{ImportClaim, ImportFailure, SupersedeReason},
     pinning::decision::ExtensionDecision,
+    pinning::tags::ZipRootCapture,
     store::{
         entities::{
             bucket, import_destination, import_job, import_job_target, import_prefix_claim,
-            standard_mutation_lease,
+            standard_mutation_lease, zip_batch,
         },
         import::{
             jobs::{
@@ -41,6 +42,8 @@ const OWNERSHIP_BATCH_SIZE: u64 = 128;
 
 #[cfg(test)]
 mod mutation_tests;
+#[cfg(test)]
+mod zip_output_tests;
 
 mod mutation_lease;
 pub(crate) use mutation_lease::renew_lifecycle_mutation_in_transaction;
@@ -185,7 +188,7 @@ pub async fn submit(
     request: NewImportJob,
     now: DateTime<Utc>,
 ) -> AppResult<SubmitImportOutcome> {
-    submit_with_decision(db, request, None, now).await
+    submit_with_decision(db, request, None, None, now).await
 }
 
 /// The decision is written in the same ownership transaction as the fingerprint,
@@ -196,13 +199,25 @@ pub async fn submit_decided(
     decision: ExtensionDecision,
     now: DateTime<Utc>,
 ) -> AppResult<SubmitImportOutcome> {
-    submit_with_decision(db, request, Some(decision), now).await
+    submit_with_decision(db, request, Some(decision), None, now).await
+}
+
+/// Persist the signed ZIP-root choice alongside the job, ownership and pin decision.
+pub async fn submit_decided_zip(
+    db: &DatabaseConnection,
+    request: NewImportJob,
+    decision: ExtensionDecision,
+    root_capture: ZipRootCapture,
+    now: DateTime<Utc>,
+) -> AppResult<SubmitImportOutcome> {
+    submit_with_decision(db, request, Some(decision), Some(root_capture), now).await
 }
 
 async fn submit_with_decision(
     db: &DatabaseConnection,
     request: NewImportJob,
     decision: Option<ExtensionDecision>,
+    root_capture: Option<ZipRootCapture>,
     now: DateTime<Utc>,
 ) -> AppResult<SubmitImportOutcome> {
     let bucket_name = request.bucket.clone();
@@ -214,7 +229,14 @@ async fn submit_with_decision(
             .transaction(move |txn| {
                 Box::pin(async move {
                     lock_bucket_for_ownership(txn, &bucket_name).await?;
-                    submit_decided_in_transaction(txn, request, decision.as_ref(), now).await
+                    submit_decided_in_transaction(
+                        txn,
+                        request,
+                        decision.as_ref(),
+                        root_capture,
+                        now,
+                    )
+                    .await
                 })
             })
             .await;
@@ -238,13 +260,14 @@ async fn submit_in_transaction<C: ConnectionTrait>(
     request: NewImportJob,
     now: DateTime<Utc>,
 ) -> AppResult<SubmitImportOutcome> {
-    submit_decided_in_transaction(txn, request, None, now).await
+    submit_decided_in_transaction(txn, request, None, None, now).await
 }
 
 async fn submit_decided_in_transaction<C: ConnectionTrait>(
     txn: &C,
     request: NewImportJob,
     decision: Option<&ExtensionDecision>,
+    root_capture: Option<ZipRootCapture>,
     now: DateTime<Utc>,
 ) -> AppResult<SubmitImportOutcome> {
     if let Some(token) = request.client_token.as_deref()
@@ -257,7 +280,7 @@ async fn submit_decided_in_transaction<C: ConnectionTrait>(
         };
     }
 
-    let job = insert_queued_with_decision(txn, request, decision, now).await?;
+    let job = insert_queued_with_decision(txn, request, decision, root_capture, now).await?;
     let expected_generation =
         claim_primary_destination(txn, &job.id, &job.bucket, &job.key, now).await?;
     insert_target(
@@ -1040,6 +1063,356 @@ async fn admit_content_mutations_in_transaction<C: ConnectionTrait>(
     Ok(guards)
 }
 
+/// Admit exactly the final ZIP outputs, never the source object. The caller
+/// owns a short transaction and has already acquired its bucket ownership lock.
+/// An error must abort that transaction. Unlike ordinary exact admissions, an
+/// overlapping job/prefix guard is rejected if superseding it could also revoke
+/// authority over the source key (even when the source is not in `keys`).
+pub async fn admit_zip_outputs_without_source_in_transaction<C: ConnectionTrait>(
+    txn: &C,
+    bucket_name: &str,
+    source_key: &str,
+    keys: &BTreeSet<String>,
+    mutation_ids: &BTreeMap<String, String>,
+    now: DateTime<Utc>,
+) -> AppResult<Vec<StandardMutationGuard>> {
+    if keys.contains(source_key)
+        || keys.len() != mutation_ids.len()
+        || keys
+            .iter()
+            .any(|key| mutation_ids.get(key).is_none_or(String::is_empty))
+    {
+        return Err(AppError::StaleContentMutation);
+    }
+    // Do not delegate the source check to the exact admission helper: a
+    // superseded import releases *all* its targets and prefix claims, and an
+    // invalidated prefix mutation clears its token at its anchor key.
+    check_zip_outputs_do_not_revoke_source(txn, bucket_name, source_key, keys).await?;
+    admit_content_mutations_in_transaction(
+        txn,
+        bucket_name,
+        keys,
+        mutation_ids,
+        None,
+        SupersedeReason::DecompressZip,
+        now,
+    )
+    .await
+}
+
+/// Direct ZIP v2 source admission, restricted to an exact S mutation. Refuse a
+/// batch whose output admission would indirectly revoke authority over S before
+/// superseding any owner. The caller also admits the outputs and both manifests
+/// in this *same* bucket-first transaction, rolling back on every error.
+pub async fn admit_zip_v2_source_in_transaction<C: ConnectionTrait>(
+    txn: &C,
+    bucket_name: &str,
+    source_key: &str,
+    output_keys: &BTreeSet<String>,
+    mutation_id: &str,
+    now: DateTime<Utc>,
+) -> AppResult<StandardMutationGuard> {
+    if source_key.is_empty() || mutation_id.is_empty() || output_keys.contains(source_key) {
+        return Err(AppError::StaleContentMutation);
+    }
+    check_zip_outputs_do_not_revoke_source(txn, bucket_name, source_key, output_keys).await?;
+    let keys = BTreeSet::from([source_key.to_owned()]);
+    let ids = BTreeMap::from([(source_key.to_owned(), mutation_id.to_owned())]);
+    admit_content_mutations_in_transaction(
+        txn,
+        bucket_name,
+        &keys,
+        &ids,
+        None,
+        SupersedeReason::DecompressZip,
+        now,
+    )
+    .await?
+    .pop()
+    .ok_or(AppError::StaleContentMutation)
+}
+
+/// Renew the exact source token inside the same bucket-locked transaction as
+/// the ZIP v2 execution lease and complete output guard set.
+pub async fn renew_zip_v2_source_in_transaction<C: ConnectionTrait>(
+    txn: &C,
+    guard: &StandardMutationGuard,
+) -> AppResult<()> {
+    verify_standard_mutation_guard(txn, guard, &guard.bucket, &guard.key, &[]).await?;
+    let until = crate::store::database_clock::database_now(txn).await?
+        + chrono::Duration::seconds(STANDARD_MUTATION_LEASE_SECONDS);
+    let active = match txn.get_database_backend() {
+        DatabaseBackend::Postgres => Expr::cust("lease_until > clock_timestamp()"),
+        DatabaseBackend::Sqlite => Expr::cust("julianday(lease_until) > julianday('now')"),
+        DatabaseBackend::MySql => Expr::cust("FALSE"),
+    };
+    let updated = standard_mutation_lease::Entity::update_many()
+        .col_expr(
+            standard_mutation_lease::Column::LeaseUntil,
+            Expr::value(until),
+        )
+        .filter(mutation_lease_identity(guard))
+        .filter(active)
+        .exec(txn)
+        .await?;
+    if updated.rows_affected != 1 {
+        return Err(AppError::StaleContentMutation);
+    }
+    Ok(())
+}
+
+/// Durable exact source guard, written only after the v2 execution and legacy
+/// manifest mirror have been admitted in the caller's one short transaction.
+pub async fn capture_zip_v2_source_guard_in_transaction<C: ConnectionTrait>(
+    txn: &C,
+    claim: &crate::store::zip::execution::Claim,
+    guard: &StandardMutationGuard,
+) -> AppResult<()> {
+    let snapshot = crate::store::zip::execution::read(txn, &claim.batch_id)
+        .await?
+        .ok_or(AppError::StaleContentMutation)?;
+    if snapshot.state != "admitted"
+        || snapshot.epoch != claim.epoch
+        || snapshot.worker.as_deref() != Some(claim.worker.as_str())
+        || guard.bucket != snapshot.bucket
+        || guard.key != snapshot.source_key
+        || guard.mutation_prefix.is_some()
+        || guard.mutation_id != format!("zip-v2-source:{}", claim.batch_id)
+    {
+        return Err(AppError::StaleContentMutation);
+    }
+    verify_standard_mutation_guard(txn, guard, &guard.bucket, &guard.key, &[]).await?;
+    // Open batches require terminal_result IS NULL; the mirror's immutable
+    // input_identity is otherwise only `pending` for v2 direct, so reserve a
+    // non-pending marker carrying the exact generation. The token is derived
+    // from the immutable execution ID, never supplied by the HTTP request.
+    let updated = zip_batch::Entity::update_many()
+        .col_expr(
+            zip_batch::Column::InputIdentity,
+            Expr::value(format!("zip-v2-source-gen:{}", guard.expected_generation)),
+        )
+        .filter(zip_batch::Column::Id.eq(&claim.batch_id))
+        .filter(zip_batch::Column::State.eq("open"))
+        .filter(zip_batch::Column::InputIdentity.eq("pending"))
+        .exec(txn)
+        .await?;
+    if updated.rows_affected != 1 {
+        return Err(AppError::StaleContentMutation);
+    }
+    Ok(())
+}
+
+fn zip_v2_source_guard_from_row(
+    snapshot: &crate::store::zip::execution::Snapshot,
+    row: &zip_batch::Model,
+) -> AppResult<StandardMutationGuard> {
+    if row.state != "open"
+        || row.bucket != snapshot.bucket
+        || row.archive_key != snapshot.source_key
+    {
+        return Err(AppError::StaleContentMutation);
+    }
+    let generation = row
+        .input_identity
+        .strip_prefix("zip-v2-source-gen:")
+        .and_then(|value| value.parse::<i64>().ok())
+        .ok_or(AppError::StaleContentMutation)?;
+    if generation < 1 {
+        return Err(AppError::StaleContentMutation);
+    }
+    Ok(StandardMutationGuard {
+        bucket: snapshot.bucket.clone(),
+        key: snapshot.source_key.clone(),
+        mutation_id: format!("zip-v2-source:{}", snapshot.id),
+        expected_generation: generation,
+        mutation_prefix: None,
+    })
+}
+
+/// Single bucket-first lease renewal verifies and extends both source and all
+/// output guards, then the worker lease. A lost guard fences the whole execution.
+pub async fn renew_zip_v2_direct_group(
+    db: &DatabaseConnection,
+    claim: &crate::store::zip::execution::Claim,
+    seconds: i64,
+) -> AppResult<bool> {
+    use crate::store::zip::execution;
+    if !(1..=60).contains(&seconds) {
+        return Err(AppError::StaleContentMutation);
+    }
+    let Some(initial) = execution::read(db, &claim.batch_id).await? else {
+        return Ok(false);
+    };
+    if initial.state == "pending" {
+        return execution::renew(db, claim, seconds).await;
+    }
+    if initial.state != "admitted" {
+        return Ok(false);
+    }
+    let txn = db.begin().await?;
+    lock_bucket_for_ownership(&txn, &initial.bucket).await?;
+    let row = execution::read(&txn, &claim.batch_id)
+        .await?
+        .ok_or(AppError::StaleContentMutation)?;
+    let now = crate::store::database_clock::database_now(&txn).await?;
+    if row.state != "admitted"
+        || row.epoch != claim.epoch
+        || row.worker.as_deref() != Some(&claim.worker)
+        || row.lease_until.is_none_or(|until| until <= now)
+    {
+        return Ok(false);
+    }
+    let options: serde_json::Value =
+        serde_json::from_str(&row.captured_options).map_err(|_| AppError::StaleContentMutation)?;
+    let source_enabled = options
+        .pointer(if row.source == "mpu" {
+            "/publish_source"
+        } else {
+            "/options/publish_source"
+        })
+        .and_then(|v| v.as_bool())
+        .ok_or(AppError::StaleContentMutation)?;
+    let guards = execution::read_targets(&txn, claim).await;
+    let result = async {
+        let guards = guards?;
+        let keys = guards.iter().map(|g| g.key.clone()).collect::<Vec<_>>();
+        if source_enabled {
+            let batch = zip_batch::Entity::find_by_id(&claim.batch_id).one(&txn).await?
+                .ok_or(AppError::StaleContentMutation)?;
+            let source = zip_v2_source_guard_from_row(&row, &batch)?;
+            renew_zip_v2_source_in_transaction(&txn, &source).await?;
+        }
+        renew_zip_output_guards_in_transaction(&txn, &row.bucket, &row.source_key, &keys, &guards).await?;
+        let backend = txn.get_database_backend();
+        let (sql, values) = if backend == DatabaseBackend::Postgres {
+            ("UPDATE zip_v2_executions SET lease_until=$1,updated_at=$2 WHERE id=$3 AND epoch=$4 AND worker=$5 AND state='admitted' AND lease_until>clock_timestamp()",
+            vec![(now + chrono::Duration::seconds(seconds)).into(), now.into(), claim.batch_id.clone().into(), claim.epoch.into(), claim.worker.clone().into()])
+        } else {
+            ("UPDATE zip_v2_executions SET lease_until=?,updated_at=? WHERE id=? AND epoch=? AND worker=? AND state='admitted' AND julianday(lease_until)>julianday('now')",
+            vec![(now + chrono::Duration::seconds(seconds)).into(), now.into(), claim.batch_id.clone().into(), claim.epoch.into(), claim.worker.clone().into()])
+        };
+        if txn.execute(Statement::from_sql_and_values(backend, sql, values)).await?.rows_affected() != 1 {
+            return Err(AppError::StaleContentMutation);
+        }
+        Ok::<_, AppError>(())
+    }.await;
+    match result {
+        Ok(()) => {
+            txn.commit().await?;
+            Ok(true)
+        }
+        Err(AppError::StaleContentMutation) => {
+            txn.rollback().await?;
+            execution::fence(db, claim).await?;
+            Ok(false)
+        }
+        Err(other) => {
+            txn.rollback().await?;
+            Err(other)
+        }
+    }
+}
+
+async fn check_zip_outputs_do_not_revoke_source<C: ConnectionTrait>(
+    txn: &C,
+    bucket_name: &str,
+    source_key: &str,
+    keys: &BTreeSet<String>,
+) -> AppResult<()> {
+    let source_owner = find_destination_for_update(txn, bucket_name, source_key)
+        .await?
+        .and_then(|destination| destination.owner_job_id);
+    let mut affected_jobs = BTreeSet::new();
+    for key in keys {
+        if let Some(owner) = find_destination_for_update(txn, bucket_name, key)
+            .await?
+            .and_then(|destination| destination.owner_job_id)
+        {
+            affected_jobs.insert(owner);
+        }
+        let mut after = None;
+        loop {
+            let page =
+                prefix_owner_jobs_for_key(txn, bucket_name, key, after.as_deref(), None).await?;
+            let Some(last) = page.last().cloned() else {
+                break;
+            };
+            affected_jobs.extend(page);
+            after = Some(last);
+        }
+    }
+    for job_id in affected_jobs {
+        if source_owner.as_deref() == Some(job_id.as_str()) {
+            return Err(AppError::StaleContentMutation);
+        }
+        let job = find_job_for_update(txn, &job_id).await?;
+        if job.as_ref().is_some_and(|job| {
+            job.bucket == bucket_name
+                && job.key == source_key
+                && matches!(job.state.as_str(), STATE_QUEUED | STATE_RUNNING)
+        }) {
+            return Err(AppError::StaleContentMutation);
+        }
+        if import_job_target::Entity::find_by_id((
+            job_id.clone(),
+            bucket_name.to_owned(),
+            source_key.to_owned(),
+        ))
+        .one(txn)
+        .await?
+        .is_some()
+        {
+            return Err(AppError::StaleContentMutation);
+        }
+        let claims = import_prefix_claim::Entity::find()
+            .filter(import_prefix_claim::Column::JobId.eq(&job_id))
+            .filter(import_prefix_claim::Column::Bucket.eq(bucket_name))
+            .all(txn)
+            .await?;
+        if claims
+            .iter()
+            .any(|claim| source_key.starts_with(&claim.prefix))
+        {
+            return Err(AppError::StaleContentMutation);
+        }
+    }
+
+    // Same overlap predicate as invalidate_standard_mutations_in_order, but
+    // read *before* any supersede or invalidation. Include the guard's anchor:
+    // its prefix can cover outputs without covering its own key (the source).
+    let mut after_key: Option<String> = None;
+    loop {
+        let mut query = import_destination::Entity::find()
+            .filter(import_destination::Column::Bucket.eq(bucket_name))
+            .filter(import_destination::Column::MutationId.is_not_null())
+            .order_by_asc(import_destination::Column::Key)
+            .limit(OWNERSHIP_BATCH_SIZE);
+        if let Some(after_key) = after_key.as_deref() {
+            query = query.filter(import_destination::Column::Key.gt(after_key));
+        }
+        let active = if txn.get_database_backend() == DatabaseBackend::Postgres {
+            query.lock_exclusive().all(txn).await?
+        } else {
+            query.all(txn).await?
+        };
+        let Some(last_key) = active.last().map(|destination| destination.key.clone()) else {
+            break;
+        };
+        for destination in active {
+            let prefix = destination.mutation_prefix.as_deref();
+            if keys.iter().any(|key| {
+                key == &destination.key || prefix.is_some_and(|prefix| key.starts_with(prefix))
+            }) && (destination.key == source_key
+                || prefix.is_some_and(|prefix| source_key.starts_with(prefix)))
+            {
+                return Err(AppError::StaleContentMutation);
+            }
+        }
+        after_key = Some(last_key);
+    }
+    Ok(())
+}
+
 async fn admit_prefix_mutation_in_transaction<C: ConnectionTrait>(
     txn: &C,
     bucket_name: &str,
@@ -1340,6 +1713,92 @@ pub(crate) async fn verify_standard_mutation_guard<C: ConnectionTrait>(
         return Err(AppError::StaleContentMutation);
     }
     verify_mutation_lease(txn, guard).await?;
+    Ok(())
+}
+
+/// Verify the *entire* final output set before the publishing transaction
+/// writes objects, tags or pin records. Call under the bucket lock. ZIP outputs
+/// have exact guards, not a synthetic prefix guard on the source.
+pub async fn verify_zip_output_guards_in_transaction<C: ConnectionTrait>(
+    txn: &C,
+    bucket_name: &str,
+    source_key: &str,
+    keys: &[String],
+    guards: &[StandardMutationGuard],
+) -> AppResult<()> {
+    let expected = keys.iter().collect::<BTreeSet<_>>();
+    if expected.len() != keys.len()
+        || expected.len() != guards.len()
+        || keys.iter().any(|key| key == source_key)
+        || guards.iter().any(|guard| {
+            guard.bucket != bucket_name
+                || guard.key == source_key
+                || guard.mutation_prefix.is_some()
+                || !expected.contains(&guard.key)
+        })
+        || guards
+            .iter()
+            .map(|guard| &guard.key)
+            .collect::<BTreeSet<_>>()
+            .len()
+            != guards.len()
+    {
+        return Err(AppError::StaleContentMutation);
+    }
+    for guard in guards {
+        verify_standard_mutation_guard(txn, guard, bucket_name, &guard.key, &[]).await?;
+    }
+    Ok(())
+}
+
+/// Renew an exact output set in the caller's bucket-locked transaction. The
+/// same durable identities must later be verified at publication/commit time.
+pub async fn renew_zip_output_guards_in_transaction<C: ConnectionTrait>(
+    txn: &C,
+    bucket_name: &str,
+    source_key: &str,
+    keys: &[String],
+    guards: &[StandardMutationGuard],
+) -> AppResult<()> {
+    verify_zip_output_guards_in_transaction(txn, bucket_name, source_key, keys, guards).await?;
+    for guard in guards {
+        let until = crate::store::database_clock::database_now(txn).await?
+            + chrono::Duration::seconds(STANDARD_MUTATION_LEASE_SECONDS);
+        let active = match txn.get_database_backend() {
+            DatabaseBackend::Postgres => Expr::cust("lease_until > clock_timestamp()"),
+            DatabaseBackend::Sqlite => Expr::cust("julianday(lease_until) > julianday('now')"),
+            DatabaseBackend::MySql => Expr::cust("FALSE"),
+        };
+        let updated = standard_mutation_lease::Entity::update_many()
+            .col_expr(
+                standard_mutation_lease::Column::LeaseUntil,
+                Expr::value(until),
+            )
+            .filter(mutation_lease_identity(guard))
+            .filter(active)
+            .exec(txn)
+            .await?;
+        if updated.rows_affected != 1 {
+            return Err(AppError::StaleContentMutation);
+        }
+    }
+    Ok(())
+}
+
+/// Complete exact output tokens as the publishing transaction's final
+/// authorization writes. An error must roll back the whole transaction.
+pub async fn complete_zip_output_guards_in_transaction<C: ConnectionTrait>(
+    txn: &C,
+    bucket_name: &str,
+    source_key: &str,
+    keys: &[String],
+    guards: &[StandardMutationGuard],
+    now: DateTime<Utc>,
+) -> AppResult<()> {
+    verify_zip_output_guards_in_transaction(txn, bucket_name, source_key, keys, guards).await?;
+    for guard in guards {
+        complete_standard_mutation_in_transaction(txn, guard, now).await?;
+    }
     Ok(())
 }
 

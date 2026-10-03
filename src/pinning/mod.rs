@@ -11,3 +11,4 @@ pub mod psa;
 pub mod quota;
 pub mod tags;
 pub mod worker;
+pub mod zip_policy;

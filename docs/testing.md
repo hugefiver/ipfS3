@@ -77,11 +77,63 @@ cargo test --test postgres_stage3_route_fence -- --include-ignored --test-thread
 
 A real two-process SigV4 MPU completion test passed 1/1 with the same config;
 changing both credential and endpoint revisions was rejected before side effects.
-The final Stage 3 `--lib` and `--test integration` combined run is still pending;
-don't report its counts as passed until that run finishes. The intermittent
-Stage 2 PG historical-route error still has no confirmed root cause.
+The final Stage 3 selected-target run passed: 1443 test executions, 1 ignored,
+including 1250 library and 165 integration tests. This is not a real-provider
+account validation. The intermittent Stage 2 PG historical-route error still
+has no confirmed root cause.
 
 Test cleanup may remove static source, hash, documentation-checkbox, and historical TDD-shape assertions. It must retain executable regressions for command argument boundaries, process ownership, path confinement, cleanup scope, redaction, concurrency, and other observable security behavior.
+
+## Stage 4 ZIP verification
+
+Stage 4 passed its selected integration run (1852 executions, 4 ignored),
+followed by focused regressions closing initial-root cancellation, MPU
+root-recovery capture, and source-residency lock-order findings. The affected
+targets passed 198 executions with 1 ignored; counts include repeated support
+self-tests, not 198 independent new scenarios. The isolated acceptance evidence
+includes 15 distinct PostgreSQL cases, 4 real-Kubo directory tests and the
+explicit R23 load test. Real Filebase/Pinata account writes remain NOT RUN.
+Don't count ignored tests as passing. The ZIP checks must cover legacy archive ETag/VersionId and
+result compatibility; default-on and signed-tag root selection; final relative
+paths and exact committed versions; disabled, empty, partial and failed roots;
+separate batch/root ownership and GET status; per-output private denial; and
+v2 signed headers, token replay, source=false, URL digest, and zero-output MPU
+completion/replay. In particular, source=false zero-output Complete must
+persist a queryable failed batch and return the same 4xx on the first call and
+replay, not a successful empty result. Run against the completed implementation,
+not an unfinished worker.
+
+The four real-Kubo directory tests in `zip_directory` are explicitly ignored.
+They need isolated Kubo RPC endpoints via both
+`IPFS3_DIRECTORY_TEST_KUBO_URL` and
+`IPFS3_DIRECTORY_LARGE_TEST_KUBO_URL`, plus explicit `--ignored`. The 10,000-path
+HAMT test is expensive. Set the environment variables to authorized disposable
+nodes before running; no real node is contacted by the default test command.
+
+```powershell
+cargo test --test zip_directory real_kubo_ -- --ignored --nocapture --test-threads=1
+```
+
+R23's 65/30-entry multi-provider real-worker test is also ignored and must be
+selected by its exact name. It doesn't run with default `cargo test`:
+
+```powershell
+cargo test --test zip_v2_pinning_load signed_zip_batches_share_quota_but_not_logical_leases_and_worker_remains_fair -- --ignored --exact --nocapture --test-threads=1
+```
+
+The PostgreSQL ZIP batch and v2 execution targets require a dedicated,
+authorized test database through `IPFS_S3_TEST_POSTGRES_URL`. Don't use a
+production database. These commands only select tests; they don't establish a
+PASS until run against the finished tree and their results are inspected.
+
+```powershell
+cargo test --test postgres_zip_batch_store -- --ignored --test-threads=1
+cargo test --test zip_v2_execution -- --ignored --test-threads=1
+cargo test --test postgres_zip_v2_publication -- --ignored --test-threads=1
+cargo test --test postgres_zip_v2_residency_lock_order -- --ignored --test-threads=1
+cargo test --test zip_v2_mpu_complete -- --ignored --test-threads=1
+cargo test --test import_zip_v2_acceptance -- --ignored --test-threads=1
+```
 
 ## Environment-backed and deep checks
 

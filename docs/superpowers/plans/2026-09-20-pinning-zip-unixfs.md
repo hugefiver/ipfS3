@@ -102,6 +102,8 @@
 - 相同已捕获幂等 token + 相同 fingerprint 重放持久结果；相同 token 不同 fingerprint 冲突。不同 token 不凭字节相同认定同一意图。fingerprint 覆盖输出选择、root override、结果版本、原始语义控制和目的地等；未传 override 的重试使用既有快照，不因 config 改变而冲突或新建。
 - MPU upload_id 映射固定 batch；import 复用既有 token/job 身份；直接 PUT v2 增加签名幂等 token。结果写回断线不重发子版本/整批 pin。
 - manifest 对应本批实际提交的版本/CID，不在构根或重试时读取“当前同 key”替代。条目后来覆盖/删除不篡改历史 root。
+- source=false 的成功输出集合使用 exact-key 写入 guard 与独立 batch execution epoch；在同一个 bucket-first 准入事务内检查所有会被抢占的 ownership，若某个输出的 prefix overlap 会连带失效 source key 的 import job 或 standard mutation，则整批冲突回滚。只有 `source_key ∉ 成功输出集合` 不足以保护 source；准入前并发写按提交顺序决定，准入后任何输出 guard 失效都令整批发布失败，而不是降级为可选 root warning。失去 guard 不得通过重新 admission 抢回覆盖后的 key。代价是 exact guards 只能在成功输出集合确定后取得；不能声称上传开始即锁定目标 prefix。
+- v2 签名 token 的请求语义在入口捕获，完整 ZIP 输入 SHA-256 仅在请求正文 EOF/签名与 trailer 检查成功后绑定；旧 CID 或随机 mutation ID 不作字节摘要。同 token 同请求只重放已提交终态，异内容冲突；提交结果未知须经过相同 bucket serialization lock 判定，不能把暂时读到 open 当作确定回滚。旧 ZIP publication 的首次锁序也须由 bucket/ownership/version frontier 再到 batch，不能与新输出路径形成反向锁序。
 - 批次计数分别表示发布文件、逻辑目标、唯一 CID、目标引用、新传输、skipped/blocked、各 provider 确认、满足全部要求的条目。65 项 × 2 providers 是 130 逻辑目标，不等于 130 次上传。
 
 ## 5. R24：UnixFS directory root 设计与验收合同
@@ -338,6 +340,9 @@ root 是该批的持久快照，不随单个输出删除/覆盖自动改写或�
 1. **signed root=true 的失败强度。**与 config ON 一致：尝试生成，失败返回可查 warning/status，不影响原发布。文件/目录冲突必须 fail-closed root，不返回伪 root。
 2. **新 ZIP 逐输出 policy 组合。**入口允许上限与逐输出规则取交集，服务器强制约束冲突拒绝；legacy 保留，不以并集扩大外发范围，不把新限制静默套到旧模式。
 3. **source=false 的新协议协商。**只允许显式 v2 扩展和签名幂等 token，拒绝 result=false；响应以 batch 为身份，不伪造源 ETag/VersionId。对外参数名字依现有扩展命名约定实现并文档化。
+4. **v2 URL import 的固定输入快照。**URL 仅用于首次取得已承诺的 ZIP：客户端须提供已签名的预期 SHA-256，worker 完整读取并核验实际 ZIP 输入后保存摘要及 artifact。相同 token/同一承诺重放已提交的历史结果，不重新抓取 URL；签名预期摘要或请求合同变化返回冲突。URL 后来改为别的内容不会被历史重放察觉；首次抓取若已不符则安全失败。CID 输入也必须由 worker 实测完整 ZIP SHA-256，不能把 CID 当字节摘要；旧 XML/job 不回填虚假摘要。此为用户明确确认的重放语义，不承诺重复来源 GET 为零（崩溃发生于持久化前可能重抓）。
+5. **source=false 的 v2 Complete 零输出响应。**当没有任何文件成功发布且没有源对象时，先原子结算可查询的 batch 失败终态，再返回明确的 4xx；初次响应与相同 parts 的完成重放须返回相同错误，不重新执行 Kubo 或创建版本。客户端以创建 MPU 时获得的 UploadId 查询 batch；不能仅返回 HTTP 200 并依赖自定义 XML 中的 `failed` 才识别失败。source=true 且真实源对象已发布的零提取结果不受这条无源规则误伤。这是用户在 Stage 4 实施中单独确认的协议裁定。
+6. **Stage 4 的远端账号验收边界。**用户允许以隔离的真实 Kubo／PostgreSQL、真实 SigV4 请求以及模拟 URL／provider 完成本阶段本地验收；真实 Filebase／Pinata 账号写入或付费操作明确为 **NOT RUN**，不能把 mock 等同于账号权限或远端副本证明，也不要求为 Stage 4 提交而执行未经授权的写入。Stage 5／6 的真实外部能力验证仍须单独取得相应授权和测试环境。
 
 实现层的dag/put尺寸/HAMT选择通过有界协议证据解决，不默认上升为用户设计审批；若只能通过新增节点权限、降低原ZIP上限或改变返回承诺实现，再升级该具体问题。真实provider写测试授权、现场后端版本/身份、PG/容器环境是环境与权限gate，不阻塞离线修复或被视为功能已验收。
 
@@ -362,14 +367,16 @@ cargo test --test integration
 |---|---|---|---|---|
 | 1 | 已提交 | lib 1187 passed / 1 ignored；bin 13、integration 164、真实日志 2；PG 并发 3 passed；pinning 定向 352 passed | 未执行真实 Pinata/Filebase 账号写入；完整身份/账户 scope 模型留给 Stage 2 | `2c948dd` |
 | 2 | 已验收 | lib 1196 passed / 1 ignored、integration 164；Stage 2 专项默认测试通过；隔离 PG 17 迁移/并发/交接 9 passed；fmt、clippy `--all-targets -D warnings` 与限定复核通过 | 曾有一次 PG 路由缺失间歇错误，受控提交/回滚可见性实验与后续整合未再现，根因仍未确认；真实 provider 账号写入未执行 | `556c8e4` |
-| 3 | 已验收 | 同一整合命令共 1443 passed / 1 ignored / 0 failed（lib 1250、integration 165），fmt、clippy `--all-targets -D warnings`、diff-check；双进程 SigV4 MPU 1/1；隔离 PG17 schema 5/5、route 交错 2/2；限定复核无剩余 Critical/Important | 新 Noop 改动尚未 PG 实跑；真实 Pinata/Filebase 账号、import 跨进程、全量 F1 未验，Stage 2 PG 旧 route 间歇错误根因仍未确认；import `202` 仅 accepted | 本阶段语义提交，见 Git 历史 |
-| 4 | 未开始 | — | §8；directory协议/实机验证 | — |
+| 3 | 已验收 | 同一整合命令共 1443 passed / 1 ignored / 0 failed（lib 1250、integration 165），fmt、clippy `--all-targets -D warnings`、diff-check；双进程 SigV4 MPU 1/1；隔离 PG17 schema 5/5、route 交错 2/2；限定复核无剩余 Critical/Important | 新 Noop 改动尚未 PG 实跑；真实 Pinata/Filebase 账号、import 跨进程、全量 F1 未验，Stage 2 PG 旧 route 间歇错误根因仍未确认；import `202` 仅 accepted | `ba06d45` |
+| 4 | 已验收，随本阶段提交 | 真实 Kubo 0.43.0 目录 4/4、PG17.11 opt-in 15 个独立用例、R23 显式负载 1/1、独立 OS 进程 import artifact 恢复 1/1；选定整合 1852 passed / 4 ignored；最后三项 Important 修复后受影响 targets 198 passed / 1 ignored；当前 fmt、Rust 1.92 MSRV、严格 all-targets clippy 通过，限定复核无剩余 Critical/Important | 首次构根取消只保留原 claim 的候选，不采用或发布；MPU 扁平 capture 恢复与 source CID 统一预锁已闭合。取消测试的并行 gate 排队问题以 fixture 入场隔离修复，未放宽生产限制或断言。测试数字含重复 support 自测；进程恢复是 test-executable、root off，非生产 main。真实 Filebase/Pinata 账号写 NOT RUN；不 push | 随本阶段提交 |
 | 5 | 未开始 | — | Filebase账号写授权/双Kubo环境 | — |
 | 6 | 未开始 | — | Cluster版本/拓扑/隔离测试授权 | — |
 | 7 | 未开始 | — | 不包含生产迁移授权 | — |
 | 8 | 未开始 | — | 研究不包含生产GC授权 | — |
 
 执行者可调整模块拆分、测试文件名和内部实施顺序，前提是保持目标、已确认合同、权限、安全及上述证据不变。重大偏离记录决定、依据与错误代价；安全、数据、公共协议或外部副作用变化交回调用方裁定。由调用方组织所需plan-critic；本planner不派生审查或执行agent，也不把计划完成当作审查/实现完成。
+
+2026-10-03 用户要求的一次计划复核未发现 Stage 4–8 的计划级阻塞；直接继续实施，不追加设计审批或重复计划评审。已知产品缺陷属于阶段收尾，不得因计划通过而视作实现验收。后续仍按每阶段验证后一个 commit、不 push、不使用 deep agent 执行。
 
 ### Stage 1 验收补充
 

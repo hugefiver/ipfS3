@@ -40,6 +40,27 @@ max_attempts = 5
 terminal_retention_secs = 604800
 max_provider_records = 20
 
+[decompress_zip]
+# ZIP-only default. A signed ipfs-s3:zip-root=true|false object tag overrides
+# this setting per ZIP request; ordinary PUT/Copy/tagging does not build a root.
+unixfs_directory_root = true
+# Optional per-input ZIP limits: 16 GiB raw source ZIP bytes (including ZIP
+# framing), 8 GiB decompressed total and per entry, 10,000 entries, 64 MiB
+# metadata; no overall processing deadline. The new raw-source intake boundary
+# (Stage 4 pending verification across all entry points) rejects ZIPs above
+# 16 GiB, including padding, unless raised (at most 64 GiB). These are
+# per-input limits, NOT a guarantee of global Kubo physical disk capacity.
+# max_staged_adds counts attempted per-entry Kubo adds, NOT Kubo disk usage or
+# retained CIDs. Raw byte enforcement requires each intake path to wrap its
+# actual incoming stream; a source Content-Length is not proof of bytes read.
+# max_archive_bytes = 17179869184
+# max_decompressed_bytes = 8589934592
+# max_single_entry_bytes = 8589934592
+# max_entries = 10000
+# max_metadata_bytes = 67108864
+# max_staged_adds = 10000
+# processing_deadline_secs = 3600  # Optional overall extraction duration, not idle timeout.
+
 [lifecycle]
 poll_interval_ms = 1000
 scan_page_size = 500

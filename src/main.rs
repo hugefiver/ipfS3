@@ -18,6 +18,7 @@ use ipfs_s3_gateway::residency::backfill::start_worker as start_residency_backfi
 use ipfs_s3_gateway::s3;
 use ipfs_s3_gateway::s3::handler::S3Impl;
 use ipfs_s3_gateway::state::AppState;
+use ipfs_s3_gateway::zip::recovery::start_worker as start_zip_root_recovery;
 use s3s::service::S3ServiceBuilder;
 use s3s::validation::AwsNameValidation;
 use s3s::{Body as S3Body, HttpError};
@@ -147,7 +148,16 @@ async fn handle_s3_error(_err: HttpError) -> HttpResponse<S3Body> {
         .unwrap()
 }
 
+#[cfg(test)]
 fn gateway_app(state: Arc<AppState>, imports: Arc<ImportCoordinator>) -> Router {
+    gateway_app_with_root_default(state, imports, true)
+}
+
+fn gateway_app_with_root_default(
+    state: Arc<AppState>,
+    imports: Arc<ImportCoordinator>,
+    root_default: bool,
+) -> Router {
     let s3_impl = S3Impl::new(state.clone());
     let gateway_auth = GatewayAuth::new(state.clone());
 
@@ -155,9 +165,10 @@ fn gateway_app(state: Arc<AppState>, imports: Arc<ImportCoordinator>) -> Router 
         let mut builder = S3ServiceBuilder::new(s3_impl);
         builder.set_validation(AwsNameValidation::new());
         builder.set_auth(gateway_auth);
-        builder.set_route(s3::route::gateway::GatewayRoute::new(
+        builder.set_route(s3::route::gateway::GatewayRoute::with_root_default(
             state.clone(),
             imports,
+            root_default,
         ));
         builder.build()
     };
@@ -195,7 +206,11 @@ async fn run_gateway() -> anyhow::Result<()> {
     let downloader = SourceDownloader::production(Arc::new(import_config.clone()));
     let imports = ImportCoordinator::new(import_config, downloader);
 
-    let app = gateway_app(state.clone(), imports.clone());
+    let app = gateway_app_with_root_default(
+        state.clone(),
+        imports.clone(),
+        cfg.decompress_zip.unixfs_directory_root,
+    );
 
     let signal = shutdown::ShutdownSignal::install()?;
     let listener = tokio::net::TcpListener::bind(cfg.server.bind).await?;
@@ -217,6 +232,11 @@ async fn run_gateway() -> anyhow::Result<()> {
         state.kubo.clone(),
         shutdown.child_token(),
     );
+    let zip_root_worker = start_zip_root_recovery(
+        state.store.clone(),
+        state.kubo.clone(),
+        shutdown.child_token(),
+    );
     let server =
         axum::serve(listener, app).with_graceful_shutdown(shutdown.clone().cancelled_owned());
     let workers = async move {
@@ -224,7 +244,8 @@ async fn run_gateway() -> anyhow::Result<()> {
             pinning_worker.shutdown(shutdown::WORKER_GRACE),
             import_worker.shutdown(shutdown::WORKER_GRACE),
             lifecycle_worker.shutdown(shutdown::WORKER_GRACE),
-            residency_backfill_worker.shutdown(shutdown::WORKER_GRACE)
+            residency_backfill_worker.shutdown(shutdown::WORKER_GRACE),
+            zip_root_worker.shutdown(shutdown::WORKER_GRACE)
         );
     };
     let result = shutdown::drain(

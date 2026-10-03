@@ -38,11 +38,12 @@ const TAGGING_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b'|')
     .add(b'}');
 
-const RESERVED_KEYS: [&str; 4] = [
+const RESERVED_KEYS: [&str; 5] = [
     "ipfs-s3:pin",
     "ipfs-s3:duration",
     "ipfs-s3:content",
     "ipfs-s3:retain-until",
+    "ipfs-s3:zip-root",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +80,41 @@ pub enum PinControl {
 pub enum ContentMode {
     Object,
     Decompressed,
+}
+
+/// Captured ZIP root decision and its origin; persist the capture on ZIP admission
+/// so later config changes do not alter an accepted request's behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ZipRootCapture {
+    Configured(bool),
+    Tagged(bool),
+}
+
+impl ZipRootCapture {
+    pub fn enabled(self) -> bool {
+        match self {
+            Self::Configured(enabled) | Self::Tagged(enabled) => enabled,
+        }
+    }
+}
+
+/// Resolve only at ZIP admission. Callers must retain original tags (including
+/// zip-root) for fingerprinting; resolving a default must not erase an override.
+pub fn resolve_zip_root_option(tags: &[ObjectTag], default: bool) -> Result<ZipRootCapture> {
+    validate_tag_set(tags)?;
+    Ok(match reserved_value(tags, "ipfs-s3:zip-root") {
+        Some(value) => ZipRootCapture::Tagged(parse_zip_root_value(value)?),
+        None => ZipRootCapture::Configured(default),
+    })
+}
+
+fn parse_zip_root_value(value: &str) -> Result<bool> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => bail!("ipfs-s3:zip-root must be exactly true or false"),
+    }
 }
 
 impl PinControl {
@@ -169,6 +205,9 @@ pub fn validate_tag_set(tags: &[ObjectTag]) -> Result<()> {
         if tag.key.starts_with("ipfs-s3:") && !RESERVED_KEYS.contains(&tag.key.as_str()) {
             bail!("unknown ipfs-s3 reserved tag key");
         }
+        if tag.key == "ipfs-s3:zip-root" {
+            parse_zip_root_value(&tag.value)?;
+        }
     }
     Ok(())
 }
@@ -217,8 +256,8 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     use super::{
-        ContentMode, ObjectTag, PinControl, encode_tagging_header, parse_tagging_header,
-        validate_tag_set,
+        ContentMode, ObjectTag, PinControl, ZipRootCapture, encode_tagging_header,
+        parse_tagging_header, resolve_zip_root_option, validate_tag_set,
     };
     use crate::pinning::config::LeaseDuration;
 
@@ -417,5 +456,91 @@ mod tests {
         for tag_set in invalid {
             assert!(PinControl::from_tags(&tag_set).is_err(), "{tag_set:?}");
         }
+    }
+
+    #[test]
+    fn zip_root_capture_preserves_configured_default_and_exact_tag_override() {
+        assert_eq!(
+            resolve_zip_root_option(&[], true).unwrap(),
+            ZipRootCapture::Configured(true)
+        );
+        assert_eq!(
+            resolve_zip_root_option(&[], false).unwrap(),
+            ZipRootCapture::Configured(false)
+        );
+        for (value, expected) in [("true", true), ("false", false)] {
+            let tag_set = tags(&[("ipfs-s3:zip-root", value)]);
+            for default in [true, false] {
+                let capture = resolve_zip_root_option(&tag_set, default).unwrap();
+                assert_eq!(capture, ZipRootCapture::Tagged(expected));
+                assert_eq!(capture.enabled(), expected);
+                assert_eq!(PinControl::from_tags(&tag_set).unwrap(), PinControl::Absent);
+            }
+        }
+    }
+
+    #[test]
+    fn zip_root_tag_validates_exact_values_duplicates_and_existing_tag_rules() {
+        for value in ["False", "TRUE", "1", "yes", "", "true "] {
+            let tag_set = tags(&[("ipfs-s3:zip-root", value)]);
+            assert!(validate_tag_set(&tag_set).is_err(), "{value:?}");
+            assert!(PinControl::from_tags(&tag_set).is_err(), "{value:?}");
+            assert!(
+                resolve_zip_root_option(&tag_set, true).is_err(),
+                "{value:?}"
+            );
+        }
+        for tag_set in [
+            tags(&[("ipfs-s3:zip-root", "true"), ("ipfs-s3:zip-root", "false")]),
+            tags(&[("ipfs-s3:zip-root", "true"), ("ipfs-s3:unknown", "value")]),
+            tags(&[("ipfs-s3:zip-root", "true"), ("", "value")]),
+        ] {
+            assert!(validate_tag_set(&tag_set).is_err());
+            assert!(resolve_zip_root_option(&tag_set, false).is_err());
+        }
+    }
+
+    #[test]
+    fn zip_root_encoding_round_trip_and_pinning_controls_are_orthogonal() {
+        let encoded =
+            "ipfs-s3%3Azip-root=false&ipfs-s3%3Apin=true&ipfs-s3%3Aduration=1d&team=R%26D";
+        let tag_set = parse_tagging_header(encoded).unwrap();
+        assert_eq!(encode_tagging_header(&tag_set), encoded);
+        assert_eq!(
+            parse_tagging_header(&encode_tagging_header(&tag_set)).unwrap(),
+            tag_set
+        );
+        assert_eq!(
+            resolve_zip_root_option(&tag_set, true).unwrap(),
+            ZipRootCapture::Tagged(false)
+        );
+        assert_eq!(
+            PinControl::from_tags(&tag_set).unwrap(),
+            PinControl::Request {
+                duration: Some(LeaseDuration::parse("1d").unwrap()),
+                content: ContentMode::Object,
+            }
+        );
+
+        let without_pin = parse_tagging_header("ipfs-s3%3Azip-root=true&team=R%26D").unwrap();
+        assert_eq!(
+            PinControl::from_tags(&without_pin).unwrap(),
+            PinControl::Absent
+        );
+        let unrelated_case = tags(&[("IPFS-S3:zip-root", "false")]);
+        assert_eq!(
+            resolve_zip_root_option(&unrelated_case, true).unwrap(),
+            ZipRootCapture::Configured(true)
+        );
+        assert!(
+            PinControl::from_tags(&tags(&[
+                ("ipfs-s3:zip-root", "true"),
+                ("ipfs-s3:duration", "1d"),
+            ]))
+            .is_err()
+        );
+        assert!(parse_tagging_header("ipfs-s3%3Azip-root=true&ipfs-s3:zip-root=false").is_err());
+        assert!(parse_tagging_header("ipfs-s3%3Azip-root=FALSE").is_err());
+        assert!(parse_tagging_header("ipfs-s3%3Azip-root=%GG").is_err());
     }
 }

@@ -11,15 +11,40 @@ use crate::{
     pinning::{decision::DecisionOrigin, policy::PublicationContext, tags::ObjectTag},
     state::AppState,
     store::pinning::publication::{
-        DecidedPublish, PinTargetSpec, PublicationObject, PublicationRequest, ZipPublicationRequest,
+        DecidedPublish, PinTargetSpec, PublicationObject, PublicationRequest, ZipBatchEntry,
+        ZipBatchPublication, ZipPublicationRequest,
     },
 };
+
+mod v2;
+mod v2_mpu;
 
 pub struct DecompressZipRoute {
     state: Arc<AppState>,
 }
 
 const MAX_COMPLETE_MULTIPART_XML_BYTES: usize = 4 * 1024 * 1024;
+
+fn zip_limits_for_call(
+    state: &AppState,
+    max_decompressed_bytes: u64,
+) -> crate::zip::extract::ZipExtractionLimits {
+    let limits = state.pinning.zip_extraction_limits();
+    let total = limits.max_decompressed_bytes().min(max_decompressed_bytes);
+    limits
+        .with_decompressed_bytes(total)
+        .and_then(|limits| {
+            limits.with_single_entry_bytes(limits.max_single_entry_bytes().min(total))
+        })
+        .expect("minimum of validated ZIP budgets must remain valid")
+}
+
+fn raw_zip_input_too_large() -> s3s::S3Error {
+    s3s::s3_error!(
+        InvalidRequest,
+        "ZIP raw archive input exceeds configured byte limit"
+    )
+}
 
 fn invalid_pinning_argument(message: &str) -> s3s::S3Error {
     crate::error::AppError::InvalidPinningRequest(message.to_owned()).into()
@@ -75,8 +100,368 @@ fn publication_entries(
         .collect()
 }
 
+pub(crate) fn captured_root_enabled(options: &str) -> S3Result<bool> {
+    serde_json::from_str::<serde_json::Value>(options)
+        .ok()
+        .and_then(|options| options.get("root_enabled")?.as_bool())
+        .ok_or_else(|| s3s::s3_error!(InternalError, "invalid captured ZIP root option"))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn admit_zip_batch(
+    state: &AppState,
+    source: &str,
+    id: &str,
+    principal: &str,
+    bucket: &str,
+    archive_key: &str,
+    prefix: &str,
+    enabled: bool,
+) -> S3Result<()> {
+    crate::store::zip::admit(
+        state.store.db(),
+        &crate::store::zip::BatchAdmission {
+            id: id.to_owned(),
+            owner: principal.to_owned(),
+            source: source.to_owned(),
+            token: id.to_owned(),
+            fingerprint: format!("{source}:{id}:{bucket}:{archive_key}:{prefix}:{enabled}"),
+            bucket: bucket.to_owned(),
+            archive_key: archive_key.to_owned(),
+            input_identity: id.to_owned(),
+            captured_options: serde_json::json!({"root_enabled": enabled, "target_prefix": prefix})
+                .to_string(),
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+fn final_entries(
+    manifest: &crate::zip::batch::FinalZipManifest,
+) -> Vec<crate::zip::response::ExtractedEntry> {
+    manifest
+        .successful
+        .iter()
+        .map(|file| crate::zip::response::ExtractedEntry {
+            key: file.object_key.clone(),
+            cid: file.cid.clone(),
+            size: file.size,
+        })
+        .collect()
+}
+
+fn verify_multipart_batch(
+    snapshot: &crate::store::zip::BatchSnapshot,
+    completed: &crate::s3::ops::multipart::CompletedMultipartArchive,
+    prefix: &str,
+    root_enabled: bool,
+) -> S3Result<()> {
+    let batch = &snapshot.batch;
+    let expected_options = serde_json::json!({
+        "root_enabled": root_enabled,
+        "target_prefix": prefix,
+    });
+    if batch.state != "open"
+        || batch.source != "mpu"
+        || batch.id != completed.upload_id
+        || batch.token != completed.upload_id
+        || batch.input_identity != completed.upload_id
+        || batch.bucket != completed.bucket
+        || batch.archive_key != completed.key
+        || batch.owner
+            != completed
+                .pin_decision
+                .as_ref()
+                .ok_or_else(|| s3s::s3_error!(InternalError, "missing ZIP decision"))?
+                .origin
+                .principal_id
+        || batch.fingerprint
+            != format!(
+                "mpu:{}:{}:{}:{}:{}",
+                completed.upload_id, completed.bucket, completed.key, prefix, root_enabled
+            )
+        || serde_json::from_str::<serde_json::Value>(&batch.captured_options).ok()
+            != Some(expected_options)
+    {
+        return Err(s3s::s3_error!(InternalError, "stale multipart ZIP batch"));
+    }
+    Ok(())
+}
+
+fn verify_prepared_manifest(
+    snapshot: &crate::store::zip::BatchSnapshot,
+    manifest: &crate::zip::batch::FinalZipManifest,
+) -> S3Result<()> {
+    use crate::store::zip::ManifestItem;
+    fn item_path(item: &ManifestItem) -> &str {
+        match item {
+            ManifestItem::Success { path, .. } | ManifestItem::Failure { path, .. } => path,
+        }
+    }
+    let mut items = manifest.manifest_items();
+    items.sort_by(|left, right| item_path(left).cmp(item_path(right)));
+    if !snapshot.batch.manifest_prepared
+        || snapshot.entries.len() != items.len()
+        || snapshot
+            .entries
+            .iter()
+            .any(|entry| entry.version_row_id.is_some())
+        || !snapshot
+            .entries
+            .iter()
+            .zip(items)
+            .all(|(stored, item)| match item {
+                ManifestItem::Success {
+                    path,
+                    object_key,
+                    cid,
+                    size,
+                } => {
+                    stored.path == path
+                        && stored.object_key.as_deref() == Some(object_key.as_str())
+                        && stored.cid.as_deref() == Some(cid.as_str())
+                        && stored.size == Some(size)
+                        && stored.error_code.is_none()
+                }
+                ManifestItem::Failure { path, code } => {
+                    stored.path == path
+                        && stored.object_key.is_none()
+                        && stored.cid.is_none()
+                        && stored.size.is_none()
+                        && stored.error_code.as_deref() == Some(code.as_str())
+                }
+            })
+    {
+        return Err(s3s::s3_error!(
+            InternalError,
+            "multipart ZIP manifest changed"
+        ));
+    }
+    Ok(())
+}
+
+fn batch_publication(
+    id: &str,
+    archive_cid: &str,
+    manifest: &crate::zip::batch::FinalZipManifest,
+    objects: &[PublicationObject],
+    outcome: crate::store::zip::RootOutcome,
+) -> ZipBatchPublication {
+    let (status, warning, root_cid) = match &outcome {
+        crate::store::zip::RootOutcome::Disabled => ("disabled", None, None),
+        crate::store::zip::RootOutcome::Empty => ("empty", None, None),
+        crate::store::zip::RootOutcome::Failed { code } => ("failed", Some(*code), None),
+        crate::store::zip::RootOutcome::ClaimedFailed { code, .. } => ("failed", Some(*code), None),
+        crate::store::zip::RootOutcome::Verified { cid, .. } => (
+            if manifest.failed.is_empty() {
+                "complete"
+            } else {
+                "partial"
+            },
+            None,
+            Some(cid.as_str()),
+        ),
+    };
+    let terminal_result = serde_json::json!({
+        "archive_cid": archive_cid,
+        "batch_id": id,
+        "root_status": status,
+        "root_warning": warning,
+        "root_cid": root_cid,
+    })
+    .to_string();
+    ZipBatchPublication {
+        batch_id: id.to_owned(),
+        entries: manifest
+            .successful
+            .iter()
+            .zip(objects)
+            .map(|(file, object)| ZipBatchEntry {
+                path: file.relative_path.clone(),
+                object_id: object.id.clone(),
+            })
+            .collect(),
+        source_published: true,
+        root_outcome: outcome,
+        terminal_result,
+    }
+}
+
+async fn build_zip_root(
+    state: &AppState,
+    batch_id: &str,
+    manifest: &crate::zip::batch::FinalZipManifest,
+    enabled: bool,
+) -> crate::store::zip::RootOutcome {
+    use crate::store::zip::RootOutcome;
+    if !enabled {
+        return RootOutcome::Disabled;
+    }
+    if manifest.successful.is_empty() {
+        return RootOutcome::Empty;
+    }
+    if let Some(code) = manifest.root_error {
+        return RootOutcome::Failed { code };
+    }
+
+    let db = state.store.db();
+    let worker = uuid::Uuid::new_v4().to_string();
+    let claim = match crate::store::zip::claim_root(db, batch_id, &worker, 600).await {
+        Ok(claim) => claim,
+        Err(_) => {
+            return RootOutcome::Failed {
+                code: "root_intent_failed",
+            };
+        }
+    };
+    if crate::store::zip::mark_invoked(db, &claim).await.is_err() {
+        return RootOutcome::ClaimedFailed {
+            claim,
+            code: "root_intent_failed",
+        };
+    }
+    let root = crate::kubo::directory::build_directory(
+        &state.kubo,
+        &manifest.directory_files(),
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
+    let root = match root {
+        Ok(Some(root)) => root,
+        Ok(None) => {
+            return RootOutcome::ClaimedFailed {
+                claim,
+                code: "invalid_manifest",
+            };
+        }
+        Err(error) => {
+            if let Some(candidate) = error.candidate()
+                && let Err(error) = crate::store::zip::retain_candidate(
+                    db,
+                    &claim,
+                    &candidate.node_identity,
+                    "hot",
+                    &candidate.cid,
+                )
+                .await
+            {
+                tracing::warn!(%error, batch_id, "ZIP root candidate retention failed; claim remains recoverable");
+                return RootOutcome::ClaimedFailed {
+                    claim,
+                    code: "root_receipt_failed",
+                };
+            }
+            let code = match error.reason() {
+                crate::kubo::directory::DirectoryBuildError::PathConflict => "path_conflict",
+                crate::kubo::directory::DirectoryBuildError::InvalidManifest => "invalid_manifest",
+                crate::kubo::directory::DirectoryBuildError::BlockTooLarge => {
+                    "directory_block_too_large"
+                }
+                crate::kubo::directory::DirectoryBuildError::HashCollision => {
+                    "directory_hash_collision"
+                }
+                _ => "directory_build_failed",
+            };
+            return RootOutcome::ClaimedFailed { claim, code };
+        }
+    };
+    let node = root.local_residency.node_identity;
+    let cid = root.cid;
+    let receipt = serde_json::json!({"node_identity": node, "cid": cid}).to_string();
+    if let Err(error) = crate::store::zip::retain_candidate(db, &claim, &node, "hot", &cid).await {
+        tracing::warn!(%error, batch_id, "ZIP root candidate retention failed; claim remains recoverable");
+        return RootOutcome::ClaimedFailed {
+            claim,
+            code: "root_receipt_failed",
+        };
+    }
+    if let Err(error) =
+        crate::store::zip::verify_root(db, &claim, &node, "hot", &cid, &receipt).await
+    {
+        tracing::warn!(%error, batch_id, "ZIP root verification receipt failed; candidate remains retained");
+        return RootOutcome::ClaimedFailed {
+            claim,
+            code: "root_receipt_failed",
+        };
+    }
+    RootOutcome::Verified {
+        claim,
+        node_identity: node,
+        tier: "hot".to_owned(),
+        cid,
+    }
+}
+
+async fn insert_root_headers(headers: &mut HeaderMap, state: &AppState, batch_id: &str) {
+    // A returned CID alone is not sufficient: only the committed adopted reference
+    // in the durable snapshot authorizes an externally visible root CID.
+    let Ok(Some(snapshot)) = crate::store::zip::snapshot(state.store.db(), batch_id).await else {
+        return;
+    };
+    insert_root_headers_from_snapshot(headers, &snapshot);
+}
+
+fn insert_root_headers_from_snapshot(
+    headers: &mut HeaderMap,
+    snapshot: &crate::store::zip::BatchSnapshot,
+) {
+    if snapshot.batch.state != "published" {
+        return;
+    }
+    if let Ok(value) = http::HeaderValue::from_str(&snapshot.batch.id) {
+        headers.insert("x-ipfs-s3-zip-batch-id", value);
+    }
+    if let Ok(value) = http::HeaderValue::from_str(&snapshot.batch.root_status) {
+        headers.insert("x-ipfs-s3-zip-root-status", value);
+    }
+    if let Some(code) = &snapshot.batch.root_error_code
+        && let Ok(value) = http::HeaderValue::from_str(code)
+    {
+        headers.insert("x-ipfs-s3-zip-root-warning", value);
+    }
+    if matches!(snapshot.batch.root_status.as_str(), "complete" | "partial")
+        && let Some(cid) = snapshot.batch.root_cid.as_deref()
+        && snapshot.references.iter().any(|reference| {
+            reference.state == "adopted"
+                && reference.cid == cid
+                && reference.verification_receipt.is_some()
+                && reference.revision == snapshot.batch.root_revision
+                && reference.epoch == snapshot.batch.root_epoch
+                && snapshot.builds.iter().any(|build| {
+                    build.revision == reference.revision
+                        && build.epoch == reference.epoch
+                        && build.status == "verified"
+                })
+        })
+        && let Ok(value) = http::HeaderValue::from_str(cid)
+    {
+        headers.insert("x-ipfs-s3-zip-root-cid", value);
+    }
+}
+
 fn complete_xml_too_large() -> s3s::S3Error {
     s3s::s3_error!(InvalidRequest, "CompleteMultipartUpload XML exceeds 4 MiB")
+}
+
+fn mpu_zip_conflict() -> s3s::S3Error {
+    let mut conflict = s3s::s3_error!(OperationAborted, "ZIP multipart Complete request conflict");
+    conflict.set_status_code(http::StatusCode::CONFLICT);
+    conflict
+}
+
+fn response_from_replay(
+    (response_headers, response_xml): (std::collections::BTreeMap<String, String>, String),
+) -> S3Result<S3Response<Body>> {
+    let mut headers = HeaderMap::new();
+    for (name, value) in response_headers {
+        let name = http::header::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| s3s::s3_error!(InternalError, "invalid persisted ZIP header"))?;
+        let value = http::HeaderValue::from_str(&value)
+            .map_err(|_| s3s::s3_error!(InternalError, "invalid persisted ZIP header"))?;
+        headers.insert(name, value);
+    }
+    Ok(S3Response::with_headers(Body::from(response_xml), headers))
 }
 
 async fn collect_complete_xml(body: &mut Body) -> S3Result<Vec<u8>> {
@@ -482,6 +867,9 @@ impl DecompressZipRoute {
         if req.method == Method::POST {
             return self.call_complete(req).await;
         }
+        if req.method == Method::GET {
+            return v2::status(&self.state, req).await;
+        }
         Err(s3s::s3_error!(
             MethodNotAllowed,
             "unsupported decompress route method"
@@ -502,6 +890,27 @@ impl DecompressZipRoute {
         max_decompressed_bytes: u64,
     ) -> S3Result<S3Response<Body>> {
         let parsed = parse_decompress_put_uri(&req.uri)?;
+        // Only authenticated S3Request headers reach this parser. In particular,
+        // an unsigned ZIP control must not fall back to the legacy source write.
+        let tags = parse_publication_tags(&req.headers)?;
+        let root_capture = crate::pinning::tags::resolve_zip_root_option(
+            &tags,
+            self.state.pinning.zip_root_default(),
+        )
+        .map_err(|_| invalid_pinning_argument("invalid zip-root tag"))?;
+        let root_override = match root_capture {
+            crate::pinning::tags::ZipRootCapture::Tagged(value) => Some(value),
+            crate::pinning::tags::ZipRootCapture::Configured(_) => None,
+        };
+        let options = crate::zip::options::parse_zip_options(
+            &req.headers,
+            parsed.return_result_xml,
+            root_override,
+            self.state.pinning.zip_root_default(),
+        )?;
+        if let crate::zip::options::ZipOptions::V2(options) = options {
+            return v2::put(&self.state, req, parsed, options, max_decompressed_bytes).await;
+        }
         crate::s3::http::reject_write_conditions(&req.headers, false)?;
         crate::s3::ops::storage_class::require_standard_write_headers(&req.headers)?;
         if has_sse_header(&req.headers) {
@@ -518,7 +927,7 @@ impl DecompressZipRoute {
             ));
         }
 
-        let tags = parse_publication_tags(&req.headers)?;
+        let root_enabled = root_capture.enabled();
         let principal = crate::s3::ops::object::principal_id(&req)?;
         let capture = |mutation_id: &str| {
             self.state
@@ -573,21 +982,74 @@ impl DecompressZipRoute {
             self.state.store.db(),
             &mutation_guard.clone(),
             |lease| async move {
+                let batch_id = mutation_guard.mutation_id.clone();
+                admit_zip_batch(
+                    &self.state,
+                    "direct",
+                    &batch_id,
+                    &principal,
+                    &parsed.bucket,
+                    &parsed.key,
+                    &parsed.target_prefix,
+                    root_enabled,
+                )
+                .await?;
+                let (input, progress) = crate::zip::input_budget::ZipInputBudget::new(
+                    futures_util::StreamExt::map(req.input, |chunk| {
+                        chunk.map_err(std::io::Error::other)
+                    }),
+                    self.state
+                        .pinning
+                        .zip_extraction_limits()
+                        .max_archive_bytes(),
+                );
                 let archive =
-                    crate::s3::ops::object::add_plain_object_stream(&self.state, req.input).await?;
+                    match crate::s3::ops::object::add_plain_object_stream(&self.state, input).await
+                    {
+                        Ok(archive) => archive,
+                        Err(_error) if progress.limit_exceeded() => {
+                            return Err(raw_zip_input_too_large());
+                        }
+                        Err(error) => return Err(error.into()),
+                    };
+                if progress.limit_exceeded() {
+                    return Err(raw_zip_input_too_large());
+                }
+                if !progress.clean_eof()
+                    || i64::try_from(progress.total_bytes()).ok() != Some(archive.size)
+                {
+                    return Err(s3s::s3_error!(
+                        IncompleteBody,
+                        "ZIP upload source did not complete"
+                    ));
+                }
                 let archive_stream =
                     crate::kubo::cat::stream_cat(&self.state.kubo, &archive.cid, None).await?;
-                let outcome = crate::zip::extract::extract_zip_stream_with_limit(
+                let limits = zip_limits_for_call(&self.state, max_decompressed_bytes);
+                let outcome = crate::zip::extract::extract_zip_stream_with_limits(
                     &self.state,
                     &parsed.target_prefix,
                     archive_stream,
-                    max_decompressed_bytes,
+                    limits,
                 )
                 .await?;
 
                 reject_archive_key_collision(&parsed.key, &outcome.entries)?;
 
-                let published = outcome.entries;
+                let manifest = crate::zip::batch::final_zip_manifest(
+                    &outcome.entries,
+                    &outcome.failures,
+                    &parsed.target_prefix,
+                );
+                crate::store::zip::prepare_manifest(
+                    self.state.store.db(),
+                    &batch_id,
+                    &manifest.manifest_items(),
+                )
+                .await?;
+                let root_outcome =
+                    build_zip_root(&self.state, &batch_id, &manifest, root_enabled).await;
+                let published = final_entries(&manifest);
                 let failures = outcome.failures;
                 let archive_object = PublicationObject::from_put(
                     uuid::Uuid::new_v4().to_string(),
@@ -602,6 +1064,9 @@ impl DecompressZipRoute {
                     None,
                     chrono::Utc::now(),
                 );
+                let entries = publication_entries(&parsed.bucket, &published);
+                let batch =
+                    batch_publication(&batch_id, &archive.cid, &manifest, &entries, root_outcome);
                 let request = ZipPublicationRequest {
                     archive: PublicationRequest {
                         object: archive_object,
@@ -612,20 +1077,23 @@ impl DecompressZipRoute {
                             logical_size: archive.size,
                         },
                     },
-                    entries: publication_entries(&parsed.bucket, &published),
+                    entries,
                 };
                 let publication_result = lease
-                    .commit(crate::store::pinning::publication::publish_decided_zip(
-                        self.state.store.db(),
-                        request,
-                        Some(mutation_guard),
-                        DecidedPublish {
-                            decision: &decision,
-                            config: self.state.pinning.effective_config(),
-                            mode: self.state.pinning.control_mode(),
-                            limits: self.state.pinning.provider_limits(),
-                        },
-                    ))
+                    .commit(
+                        crate::store::pinning::publication::publish_decided_zip_batch(
+                            self.state.store.db(),
+                            request,
+                            Some(mutation_guard),
+                            batch,
+                            DecidedPublish {
+                                decision: &decision,
+                                config: self.state.pinning.effective_config(),
+                                mode: self.state.pinning.control_mode(),
+                                limits: self.state.pinning.provider_limits(),
+                            },
+                        ),
+                    )
                     .await?;
 
                 let mut headers = HeaderMap::new();
@@ -637,6 +1105,7 @@ impl DecompressZipRoute {
                 headers.extend(crate::s3::ops::object::pin_warning_headers(
                     decision.warning,
                 ));
+                insert_root_headers(&mut headers, &self.state, &batch_id).await;
                 if parsed.return_result_xml {
                     let result = crate::zip::response::DecompressZipResult {
                         archive_key: parsed.key,
@@ -673,11 +1142,41 @@ impl DecompressZipRoute {
 
         let body_bytes = collect_complete_xml(&mut req.input).await?;
         let parts = parse_complete_multipart_xml(&body_bytes)?;
+        let principal = crate::s3::ops::object::principal_id(&req)?;
+        let v2_intake =
+            crate::store::multipart::v2_zip::read_by_upload(self.state.store.db(), &upload_id)
+                .await?;
+        // GatewayRoute is called only after s3s verifies SigV4. Do not require
+        // an Authorization *header*: query-presigned SigV4 is authenticated too.
+        if v2_intake.is_none() {
+            match crate::store::zip::BatchAdmission::replay_lookup(
+                self.state.store.db(),
+                &principal,
+                &bucket,
+                &key,
+                &upload_id,
+                &parts,
+            )
+            .await
+            {
+                Ok(found) => {
+                    if let Some(receipt) = found.completed() {
+                        return response_from_replay(receipt.into_response_parts());
+                    }
+                }
+                Err(crate::error::AppError::InvalidZipParameter(_)) => {
+                    return Err(mpu_zip_conflict());
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
         let input = s3s::dto::CompleteMultipartUploadInput {
             bucket: bucket.clone(),
             key: key.clone(),
             upload_id,
-            multipart_upload: Some(s3s::dto::CompletedMultipartUpload { parts: Some(parts) }),
+            multipart_upload: Some(s3s::dto::CompletedMultipartUpload {
+                parts: Some(parts.clone()),
+            }),
             ..Default::default()
         };
         let inner_req = S3Request {
@@ -691,6 +1190,9 @@ impl DecompressZipRoute {
             service: req.service,
             trailing_headers: req.trailing_headers,
         };
+        if let Some(intake) = v2_intake {
+            return v2_mpu::complete(&self.state, inner_req, intake, &principal).await;
+        }
         let completed =
             crate::s3::ops::multipart::complete_multipart_upload_inner(&self.state, inner_req)
                 .await?;
@@ -718,43 +1220,139 @@ impl DecompressZipRoute {
                 }
 
                 if let Some(target_prefix) = completed.decompress_zip_target.clone() {
+                    // Historical uploads without a captured pin decision cannot be
+                    // passed through the decided batch publication helper. Keep
+                    // their preexisting completion path rather than reinterpret
+                    // reserved tags against a newer policy at completion.
+                    if completed.pin_decision.is_none() {
+                        let archive_stream = crate::kubo::cat::stream_cat(
+                            &self.state.kubo,
+                            &completed.root_cid,
+                            None,
+                        )
+                        .await?;
+                        let limits = zip_limits_for_call(
+                            &self.state,
+                            crate::zip::extract::MAX_DECOMPRESSED_ARCHIVE_BYTES,
+                        );
+                        let outcome = crate::zip::extract::extract_zip_stream_with_limits(
+                            &self.state,
+                            &target_prefix,
+                            archive_stream,
+                            limits,
+                        )
+                        .await?;
+                        reject_archive_key_collision(&completed.key, &outcome.entries)?;
+                        let request = ZipPublicationRequest {
+                            archive: crate::s3::ops::multipart::completed_publication_request(
+                                &completed,
+                            ),
+                            entries: publication_entries(&completed.bucket, &outcome.entries),
+                        };
+                        let publication_result =
+                            crate::s3::ops::multipart::finalize_completed_multipart_zip(
+                                &self.state,
+                                &completed,
+                                request,
+                            )
+                            .await?;
+                        insert_version_id_header(
+                            &mut headers,
+                            publication_result.version_id.as_deref(),
+                        )?;
+                        let xml = if completed.decompress_zip_result {
+                            crate::zip::response::decompress_result_xml(
+                                &crate::zip::response::DecompressZipResult {
+                                    archive_key: completed.key.clone(),
+                                    archive_cid: completed.root_cid.clone(),
+                                    archive_size: completed.total_size,
+                                    entries: outcome.entries,
+                                    failures: outcome.failures,
+                                },
+                            )
+                        } else {
+                            crate::zip::response::complete_multipart_result_xml(
+                                &completed.bucket,
+                                &completed.key,
+                                &completed.root_cid,
+                            )
+                        };
+                        return Ok(S3Response::with_headers(Body::from(xml), headers));
+                    }
+                    let batch_id = completed.upload_id.clone();
+                    let snapshot = crate::store::zip::snapshot(self.state.store.db(), &batch_id)
+                        .await?
+                        .ok_or_else(|| {
+                            s3s::s3_error!(InternalError, "missing multipart ZIP admission")
+                        })?;
+                    let root_enabled = captured_root_enabled(&snapshot.batch.captured_options)?;
+                    verify_multipart_batch(&snapshot, &completed, &target_prefix, root_enabled)?;
+                    match crate::store::zip::BatchAdmission::capture_prepared_archive(
+                        self.state.store.db(),
+                        &principal,
+                        &completed.bucket,
+                        &completed.key,
+                        &batch_id,
+                        &parts,
+                        &completed.root_cid,
+                    )
+                    .await
+                    {
+                        Ok(()) => {}
+                        Err(crate::error::AppError::InvalidZipParameter(_)) => {
+                            return Err(mpu_zip_conflict());
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
                     let archive_stream =
                         crate::kubo::cat::stream_cat(&self.state.kubo, &completed.root_cid, None)
                             .await?;
-                    let outcome = crate::zip::extract::extract_zip_stream(
+                    let limits = zip_limits_for_call(
+                        &self.state,
+                        crate::zip::extract::MAX_DECOMPRESSED_ARCHIVE_BYTES,
+                    );
+                    let outcome = crate::zip::extract::extract_zip_stream_with_limits(
                         &self.state,
                         &target_prefix,
                         archive_stream,
+                        limits,
                     )
                     .await?;
 
                     reject_archive_key_collision(&completed.key, &outcome.entries)?;
-                    let published = outcome.entries;
+                    let manifest = crate::zip::batch::final_zip_manifest(
+                        &outcome.entries,
+                        &outcome.failures,
+                        &target_prefix,
+                    );
+                    if snapshot.batch.manifest_prepared {
+                        verify_prepared_manifest(&snapshot, &manifest)?;
+                    } else {
+                        crate::store::zip::prepare_manifest(
+                            self.state.store.db(),
+                            &batch_id,
+                            &manifest.manifest_items(),
+                        )
+                        .await?;
+                    }
+                    let root_outcome =
+                        build_zip_root(&self.state, &batch_id, &manifest, root_enabled).await;
+                    let published = final_entries(&manifest);
                     let failures = outcome.failures;
+                    let entries = publication_entries(&completed.bucket, &published);
+                    let batch = batch_publication(
+                        &batch_id,
+                        &completed.root_cid,
+                        &manifest,
+                        &entries,
+                        root_outcome,
+                    );
                     let request = ZipPublicationRequest {
                         archive: crate::s3::ops::multipart::completed_publication_request(
                             &completed,
                         ),
-                        entries: publication_entries(&completed.bucket, &published),
+                        entries,
                     };
-                    let publication_result =
-                        crate::s3::ops::multipart::finalize_completed_multipart_zip(
-                            &self.state,
-                            &completed,
-                            request,
-                        )
-                        .await?;
-                    insert_version_id_header(
-                        &mut headers,
-                        publication_result.version_id.as_deref(),
-                    )?;
-                    headers.extend(crate::s3::ops::object::pin_warning_headers(
-                        completed
-                            .pin_decision
-                            .as_ref()
-                            .and_then(|decision| decision.warning),
-                    ));
-
                     let xml = if completed.decompress_zip_result {
                         crate::zip::response::decompress_result_xml(
                             &crate::zip::response::DecompressZipResult {
@@ -772,7 +1370,43 @@ impl DecompressZipRoute {
                             &completed.root_cid,
                         )
                     };
-                    return Ok(S3Response::with_headers(Body::from(xml), headers));
+                    let replay = crate::store::pinning::publication::ZipCompletedReplay {
+                        owner: principal.clone(),
+                        parts: parts.clone(),
+                        response_xml: xml.clone(),
+                        server_side_encryption: completed
+                            .server_side_encryption
+                            .as_ref()
+                            .map(|sse| sse.as_str().to_owned()),
+                        pin_warning: completed
+                            .pin_decision
+                            .as_ref()
+                            .and_then(|decision| decision.warning)
+                            .map(|warning| warning.as_header_code().to_owned()),
+                    };
+                    let _publication_result =
+                        crate::s3::ops::multipart::finalize_completed_multipart_zip_batch(
+                            &self.state,
+                            &completed,
+                            request,
+                            batch,
+                            replay,
+                        )
+                        .await?;
+                    let receipt = crate::store::zip::BatchAdmission::replay_lookup(
+                        self.state.store.db(),
+                        &principal,
+                        &completed.bucket,
+                        &completed.key,
+                        &batch_id,
+                        &parts,
+                    )
+                    .await?
+                    .completed()
+                    .ok_or_else(|| {
+                        s3s::s3_error!(InternalError, "missing committed ZIP completion receipt")
+                    })?;
+                    return response_from_replay(receipt.into_response_parts());
                 }
 
                 let publication_result =
@@ -886,6 +1520,8 @@ impl S3Route for DecompressZipRoute {
         _extensions: &mut http::Extensions,
     ) -> bool {
         (*method == Method::PUT && crate::s3::query::query_key_is_present(uri, "decompress-zip"))
+            || (*method == Method::GET
+                && crate::s3::query::query_key_is_present(uri, "ipfs3-zip-batch"))
             || (*method == Method::POST
                 && crate::s3::query::query_key_is_present(uri, "uploadId")
                 && !crate::s3::query::query_key_is_present(uri, "uploads"))
@@ -2033,6 +2669,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_zip_path_conflict_publishes_objects_but_records_failed_root() {
+        let archive = zip(&[
+            ZipEntryFixture {
+                name: b"a",
+                data: HELLO,
+            },
+            ZipEntryFixture {
+                name: b"a/b",
+                data: HELLO,
+            },
+        ]);
+        let (route, state, kubo) = route_with_mock_kubo(
+            vec![
+                "{\"Hash\":\"QmArchive\",\"Size\":\"13\"}\n",
+                "{\"Hash\":\"QmA\",\"Size\":\"5\"}\n",
+                "{\"Hash\":\"QmB\",\"Size\":\"5\"}\n",
+            ],
+            archive,
+        )
+        .await;
+        crate::store::bucket::create(state.store.db(), "bucket", None)
+            .await
+            .unwrap();
+
+        let response = route
+            .call(signed_route_request(
+                Method::PUT,
+                "/bucket/archive.zip?decompress-zip=prefix/",
+                Body::from("archive bytes".to_owned()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.headers["x-ipfs-s3-zip-root-status"], "failed");
+        assert!(response.headers.get("x-ipfs-s3-zip-root-cid").is_none());
+        assert_eq!(
+            response.headers["x-ipfs-s3-zip-root-warning"],
+            "path_conflict"
+        );
+        assert_eq!(
+            crate::store::object::get_latest(state.store.db(), "bucket", "prefix/a")
+                .await
+                .unwrap()
+                .cid,
+            "QmA"
+        );
+        assert_eq!(
+            crate::store::object::get_latest(state.store.db(), "bucket", "prefix/a/b")
+                .await
+                .unwrap()
+                .cid,
+            "QmB"
+        );
+        let batch_id = response.headers["x-ipfs-s3-zip-batch-id"].to_str().unwrap();
+        let snapshot = crate::store::zip::snapshot(state.store.db(), batch_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.batch.root_status, "failed");
+        assert_eq!(
+            snapshot.batch.root_error_code.as_deref(),
+            Some("path_conflict")
+        );
+        assert!(
+            snapshot
+                .entries
+                .iter()
+                .all(|entry| entry.version_row_id.is_some())
+        );
+        assert_no_pin_removes(&kubo, &["QmArchive", "QmA", "QmB"]).await;
+    }
+
+    #[tokio::test]
     async fn pinning_decompressed_targets_successful_entries_not_archive_and_generated_has_no_lease()
      {
         use crate::store::entities::{object_tag, object_version, pin_lease};
@@ -2892,6 +3600,19 @@ mod tests {
         assert_eq!(error.code().as_str(), "InvalidParameterValue");
         assert_no_zip_publication_rows(&state).await;
         assert_no_pin_removes(&kubo, &["QmArchive", "QmSharedEntry"]).await;
+    }
+
+    #[tokio::test]
+    async fn configured_zip_budget_cannot_relax_a_per_call_total_or_single_entry_cap() {
+        let config: crate::config::Config = toml::from_str(
+            "[decompress_zip]\nmax_decompressed_bytes = 100\nmax_single_entry_bytes = 80\nmax_entries = 2\n",
+        )
+        .unwrap();
+        let state = crate::state::AppState::new(&config).await.unwrap();
+        let limits = zip_limits_for_call(&state, 7);
+        assert_eq!(limits.max_decompressed_bytes(), 7);
+        assert_eq!(limits.max_single_entry_bytes(), 7);
+        assert_eq!(limits.max_entries(), 2);
     }
 
     #[tokio::test]

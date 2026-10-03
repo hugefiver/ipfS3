@@ -24,6 +24,10 @@ pub mod residency_backfill;
 pub mod residency_reference;
 pub mod standard_mutation_lease;
 pub mod version_residency;
+pub mod zip_batch;
+pub mod zip_manifest_entry;
+pub mod zip_root_build;
+pub mod zip_root_reference;
 
 #[cfg(test)]
 mod tests {

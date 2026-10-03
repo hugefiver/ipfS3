@@ -307,4 +307,41 @@ mod tests {
     async fn observes_stored_descriptor_header_from_one_byte_chunks() {
         observe_fragmented_header(8, 0).await;
     }
+
+    #[tokio::test]
+    async fn metadata_reservation_exactly_at_64_mib_and_one_byte_below() {
+        // 10,000 * 4096 fixed units + 8 * 3,268,608 name bytes = 64 MiB.
+        // Reservation granularity is eight bytes; changing the budget by one
+        // byte must reject before any variable-length name is read.
+        let headers: Vec<_> = (0..10_000)
+            .map(|index| {
+                let mut header = local_header(0, 0);
+                let name_len: u16 = if index < 8_608 { 327 } else { 326 };
+                header[26..28].copy_from_slice(&name_len.to_le_bytes());
+                Bytes::from(header)
+            })
+            .collect();
+        for (budget, accepted) in [
+            (super::super::extract::MAX_ARCHIVE_METADATA_BYTES, true),
+            (super::super::extract::MAX_ARCHIVE_METADATA_BYTES - 1, false),
+        ] {
+            let reader = StreamReader::new(stream::iter(
+                headers.iter().cloned().map(Ok::<Bytes, io::Error>),
+            ));
+            let (mut observer, probe) = observe_local_headers(reader);
+            probe.set_budget(10_000, budget, 0);
+            for index in 0..10_000 {
+                probe.begin();
+                let mut header = [0_u8; 30];
+                let read = observer.read_exact(&mut header).await;
+                if index == 9_999 && !accepted {
+                    assert!(read.is_err());
+                    assert!(probe.limit_exceeded());
+                } else {
+                    read.unwrap();
+                    probe.take().unwrap();
+                }
+            }
+        }
+    }
 }

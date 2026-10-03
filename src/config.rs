@@ -6,6 +6,7 @@ use chrono::Duration as ChronoDuration;
 use serde::Deserialize;
 
 use crate::pinning::identity::PinningIdentityConfig;
+use crate::pinning::zip_policy::ZipOutputRuleConfig;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
@@ -43,6 +44,9 @@ pub struct Config {
 
     #[serde(default)]
     pub lifecycle: LifecycleWorkerConfig,
+
+    #[serde(default)]
+    pub decompress_zip: DecompressZipConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -98,6 +102,37 @@ pub struct Credential {
 pub struct CryptoConfig {
     #[serde(default = "default_master_key")]
     pub master_key: String,
+}
+
+/// Default for ZIP decompression requests only; ordinary object operations do not use it.
+#[derive(Debug, Deserialize, Clone)]
+pub struct DecompressZipConfig {
+    #[serde(default = "default_zip_root_enabled")]
+    pub unixfs_directory_root: bool,
+    /// ZIP extraction budgets, declared directly under `[decompress_zip]`.
+    /// The request/import entrypoints must pass these limits explicitly; the
+    /// extractor's legacy entrypoints intentionally continue using defaults.
+    #[serde(flatten)]
+    pub limits: crate::zip::extract::ZipExtractionLimits,
+    /// Optional ZIP v2-only rules ([[decompress_zip.pin_output_rules]]).
+    /// The pure engine must be explicitly compiled/admitted by a v2 caller;
+    /// merely configuring a rule does not authorize or enqueue remote work.
+    #[serde(default)]
+    pub pin_output_rules: Vec<ZipOutputRuleConfig>,
+}
+
+fn default_zip_root_enabled() -> bool {
+    true
+}
+
+impl Default for DecompressZipConfig {
+    fn default() -> Self {
+        Self {
+            unixfs_directory_root: default_zip_root_enabled(),
+            limits: crate::zip::extract::ZipExtractionLimits::default(),
+            pin_output_rules: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -355,6 +390,7 @@ impl Config {
             pinning_identity: PinningIdentityConfig::default(),
             imports: ImportConfig::default(),
             lifecycle: default_lifecycle_config(),
+            decompress_zip: DecompressZipConfig::default(),
         }
     }
 
@@ -730,6 +766,68 @@ mod tests {
         assert_eq!(config.imports.max_attempts, 5);
         assert_eq!(config.imports.terminal_retention_secs, 604_800);
         assert_eq!(config.imports.max_provider_records, 20);
+    }
+
+    #[test]
+    fn zip_root_configuration_defaults_on_and_accepts_explicit_false() {
+        let legacy: Config = toml::from_str("[server]\nbind = '127.0.0.1:9000'").unwrap();
+        assert!(legacy.decompress_zip.unixfs_directory_root);
+        assert!(Config::build_default().decompress_zip.unixfs_directory_root);
+        let empty_section: Config = toml::from_str("[decompress_zip]").unwrap();
+        assert!(empty_section.decompress_zip.unixfs_directory_root);
+
+        let off: Config =
+            toml::from_str("[decompress_zip]\nunixfs_directory_root = false").unwrap();
+        assert!(!off.decompress_zip.unixfs_directory_root);
+        let on: Config = toml::from_str("[decompress_zip]\nunixfs_directory_root = true").unwrap();
+        assert!(on.decompress_zip.unixfs_directory_root);
+        assert!(
+            toml::from_str::<Config>("[decompress_zip]\nunixfs_directory_root = 'false'").is_err()
+        );
+
+        let example: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
+        assert!(example.decompress_zip.unixfs_directory_root);
+    }
+
+    #[test]
+    fn zip_limits_default_and_configured_bounds() {
+        let defaults: Config = toml::from_str("[decompress_zip]").unwrap();
+        assert_eq!(
+            defaults.decompress_zip.limits.max_decompressed_bytes(),
+            crate::zip::extract::MAX_DECOMPRESSED_ARCHIVE_BYTES
+        );
+        assert_eq!(
+            defaults.decompress_zip.limits.max_single_entry_bytes(),
+            crate::zip::extract::MAX_DECOMPRESSED_ARCHIVE_BYTES
+        );
+        let configured: Config = toml::from_str(
+            "[decompress_zip]\nmax_decompressed_bytes = 7\nmax_single_entry_bytes = 2\nmax_entries = 3\nmax_metadata_bytes = 4096\nmax_staged_adds = 1\nprocessing_deadline_secs = 120",
+        )
+        .unwrap();
+        assert_eq!(configured.decompress_zip.limits.max_decompressed_bytes(), 7);
+        assert_eq!(configured.decompress_zip.limits.max_single_entry_bytes(), 2);
+        assert_eq!(configured.decompress_zip.limits.max_entries(), 3);
+        assert_eq!(configured.decompress_zip.limits.max_metadata_bytes(), 4096);
+        assert_eq!(configured.decompress_zip.limits.max_staged_adds(), 1);
+        assert_eq!(
+            configured.decompress_zip.limits.processing_deadline_secs(),
+            Some(120)
+        );
+        for invalid in [
+            "max_entries = 0",
+            "max_entries = 100001",
+            "max_decompressed_bytes = 1099511627777",
+            "max_single_entry_bytes = 1099511627777",
+            "max_metadata_bytes = 1073741825",
+            "max_staged_adds = 100001",
+            "processing_deadline_secs = 0",
+            "processing_deadline_secs = 604801",
+        ] {
+            assert!(
+                toml::from_str::<Config>(&format!("[decompress_zip]\n{invalid}")).is_err(),
+                "accepted {invalid}"
+            );
+        }
     }
 
     #[test]

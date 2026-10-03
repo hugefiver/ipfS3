@@ -16,9 +16,11 @@ use crate::pinning::{
     pinata::build_pinata_with_options,
     policy::PinPolicyEvaluator,
     provider::PinningProvider,
+    zip_policy::{ValidatedZipOutputRules, ZipOutputRuleConfig},
 };
 use crate::store::Store;
 use crate::store::pinning::jobs::POLL_INTERVAL;
+use crate::zip::extract::ZipExtractionLimits;
 
 pub use crate::pinning::worker::PinningWorkerHandle;
 
@@ -38,6 +40,9 @@ pub struct WorkerSettings {
 pub struct PinningCoordinator {
     effective_config: ValidatedPinningConfig,
     control_mode: OptionalPinControlMode,
+    zip_root_default: bool,
+    zip_output_rules: ValidatedZipOutputRules,
+    zip_extraction_limits: ZipExtractionLimits,
     policy: PinPolicyEvaluator,
     policy_providers: HashMap<String, Vec<String>>,
     providers: HashMap<String, Arc<dyn PinningProvider>>,
@@ -141,9 +146,47 @@ impl PinningCoordinator {
         kubo: Option<KuboClient>,
         mode: OptionalPinControlMode,
     ) -> anyhow::Result<Arc<Self>> {
+        Self::build_with_kubo_mode_and_zip_root(config, kubo, mode, true)
+    }
+
+    pub fn build_with_kubo_mode_and_zip_root(
+        config: ValidatedPinningConfig,
+        kubo: Option<KuboClient>,
+        mode: OptionalPinControlMode,
+        zip_root_default: bool,
+    ) -> anyhow::Result<Arc<Self>> {
+        Self::build_with_kubo_mode_and_zip_root_and_rules(config, kubo, mode, zip_root_default, &[])
+    }
+
+    pub fn build_with_kubo_mode_and_zip_root_and_rules(
+        config: ValidatedPinningConfig,
+        kubo: Option<KuboClient>,
+        mode: OptionalPinControlMode,
+        zip_root_default: bool,
+        raw_rules: &[ZipOutputRuleConfig],
+    ) -> anyhow::Result<Arc<Self>> {
+        Self::build_with_zip_limits(
+            config,
+            kubo,
+            mode,
+            zip_root_default,
+            raw_rules,
+            ZipExtractionLimits::default(),
+        )
+    }
+
+    pub fn build_with_zip_limits(
+        config: ValidatedPinningConfig,
+        kubo: Option<KuboClient>,
+        mode: OptionalPinControlMode,
+        zip_root_default: bool,
+        raw_rules: &[ZipOutputRuleConfig],
+        zip_extraction_limits: ZipExtractionLimits,
+    ) -> anyhow::Result<Arc<Self>> {
         // Resolve aliases before policy evaluation: all later target, quota and
         // job keys use the same physical resource namespace.
         let config = normalize_validated_config(config)?;
+        let zip_output_rules = ValidatedZipOutputRules::compile(raw_rules, &config)?;
         let claim_limit = config
             .worker_concurrency
             .checked_mul(2)
@@ -226,6 +269,9 @@ impl PinningCoordinator {
         Ok(Arc::new(Self {
             effective_config,
             control_mode: mode,
+            zip_root_default,
+            zip_output_rules,
+            zip_extraction_limits,
             policy,
             policy_providers,
             providers,
@@ -254,6 +300,18 @@ impl PinningCoordinator {
 
     pub fn control_mode(&self) -> OptionalPinControlMode {
         self.control_mode
+    }
+
+    pub fn zip_root_default(&self) -> bool {
+        self.zip_root_default
+    }
+
+    pub fn zip_output_rules(&self) -> &ValidatedZipOutputRules {
+        &self.zip_output_rules
+    }
+
+    pub fn zip_extraction_limits(&self) -> ZipExtractionLimits {
+        self.zip_extraction_limits
     }
 
     pub fn provider_limits(&self) -> &ProviderLimitMap {
@@ -401,6 +459,9 @@ mod tests {
             decision::{DecisionEffect, DecisionOrigin},
             policy::PublicationContext,
             tags::ObjectTag,
+            zip_policy::{
+                ZipOutputRuleConfig, ZipPlanWarning, ZipPublishedOutput, ZipRuleEffect, ZipTargets,
+            },
         },
     };
 
@@ -501,10 +562,18 @@ mod tests {
         assert_eq!(disabled.control_mode(), OptionalPinControlMode::Strict);
         assert!(disabled.provider_limits().is_empty());
         assert!(disabled.provider("noop").is_none());
+        assert_eq!(
+            disabled.zip_output_rules().revision(),
+            coordinator.zip_output_rules().revision()
+        );
 
         let with_kubo =
             PinningCoordinator::build_with_kubo(validated_noop_fixture(), None).unwrap();
         assert_eq!(with_kubo.control_mode(), OptionalPinControlMode::Strict);
+        assert_eq!(
+            with_kubo.zip_output_rules().revision(),
+            coordinator.zip_output_rules().revision()
+        );
     }
 
     #[test]
@@ -582,6 +651,12 @@ mod tests {
         assert_eq!(coordinator.provider_limits(), &effective.provider_limits);
         assert_eq!(coordinator.provider(&key).unwrap().name(), key);
         assert_eq!(coordinator.control_mode(), OptionalPinControlMode::Warn);
+        assert_eq!(
+            coordinator.zip_output_rules().revision(),
+            PinningCoordinator::disabled_for_test()
+                .zip_output_rules()
+                .revision()
+        );
 
         let tags = [ObjectTag::new("ipfs-s3:pin", "true")];
         let (policy, decision) = coordinator
@@ -607,6 +682,88 @@ mod tests {
             decision
                 .verify_revision(effective, OptionalPinControlMode::Strict)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn zip_rules_compile_against_normalized_policy_and_reject_invalid_rules() {
+        let validated = validated_noop_fixture();
+        let normalized = super::normalize_validated_config(validated.clone()).unwrap();
+        let rule = ZipOutputRuleConfig {
+            name: "allow".to_owned(),
+            priority: 10,
+            bucket: "bucket".to_owned(),
+            prefix: String::new(),
+            effect: ZipRuleEffect::Allow,
+            policy_id: Some(normalized.policies[0].identity.clone()),
+        };
+        let coordinator = PinningCoordinator::build_with_kubo_mode_and_zip_root_and_rules(
+            validated.clone(),
+            None,
+            OptionalPinControlMode::Strict,
+            false,
+            std::slice::from_ref(&rule),
+        )
+        .unwrap();
+        assert!(!coordinator.zip_root_default());
+        assert_ne!(
+            coordinator.zip_output_rules().revision(),
+            PinningCoordinator::build(validated.clone())
+                .unwrap()
+                .zip_output_rules()
+                .revision()
+        );
+        let plan = coordinator
+            .zip_output_rules()
+            .plan(
+                ZipTargets {
+                    source: false,
+                    extracted: true,
+                },
+                None,
+                &[ZipPublishedOutput {
+                    bucket: "bucket".to_owned(),
+                    key: "file".to_owned(),
+                    version_id: "v1".to_owned(),
+                    cid: "cid".to_owned(),
+                }],
+            )
+            .unwrap();
+        assert_eq!(plan.outputs[0].rule_name.as_deref(), Some("allow"));
+        assert_eq!(plan.outputs[0].warning, None);
+
+        let mut invalid = rule;
+        invalid.policy_id = Some("unresolved-policy".to_owned());
+        assert!(
+            PinningCoordinator::build_with_kubo_mode_and_zip_root_and_rules(
+                validated,
+                None,
+                OptionalPinControlMode::Strict,
+                true,
+                &[invalid],
+            )
+            .is_err()
+        );
+        assert_eq!(
+            PinningCoordinator::disabled_for_test()
+                .zip_output_rules()
+                .plan(
+                    ZipTargets {
+                        source: false,
+                        extracted: true
+                    },
+                    None,
+                    &[ZipPublishedOutput {
+                        bucket: "bucket".to_owned(),
+                        key: "file".to_owned(),
+                        version_id: "v1".to_owned(),
+                        cid: "cid".to_owned()
+                    }],
+                )
+                .unwrap()
+                .outputs[0]
+                .warning,
+            Some(ZipPlanWarning::NoMatchingRule)
         );
     }
 

@@ -17,8 +17,16 @@ pub struct GatewayRoute {
 
 impl GatewayRoute {
     pub fn new(state: Arc<AppState>, coordinator: Arc<ImportCoordinator>) -> Self {
+        Self::with_root_default(state, coordinator, true)
+    }
+
+    pub fn with_root_default(
+        state: Arc<AppState>,
+        coordinator: Arc<ImportCoordinator>,
+        root_default: bool,
+    ) -> Self {
         Self {
-            imports: ImportObjectRoute::new(state.clone(), coordinator),
+            imports: ImportObjectRoute::with_root_default(state.clone(), coordinator, root_default),
             decompress: DecompressZipRoute::new(state),
         }
     }

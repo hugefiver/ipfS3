@@ -6,6 +6,7 @@ use futures_util::StreamExt;
 use s3s::dto::*;
 use s3s::{S3Request, S3Response, S3Result};
 use sea_orm::TransactionTrait;
+use sha2::{Digest, Sha256};
 
 use crate::crypto::EncryptionMode;
 use crate::lifecycle::model::MultipartUploadTargetIdentity;
@@ -46,6 +47,26 @@ fn invalid_pinning_argument(message: &str) -> s3s::S3Error {
     crate::error::AppError::InvalidPinningRequest(message.to_owned()).into()
 }
 
+fn raw_zip_input_too_large() -> s3s::S3Error {
+    s3s::s3_error!(
+        InvalidRequest,
+        "ZIP raw archive input exceeds the byte limit"
+    )
+}
+
+fn check_zip_input_progress(progress: &crate::zip::input_budget::ZipInputProgress) -> S3Result<()> {
+    if progress.limit_exceeded() {
+        return Err(raw_zip_input_too_large());
+    }
+    if !progress.clean_eof() {
+        return Err(s3s::s3_error!(
+            IncompleteBody,
+            "ZIP source stream did not complete"
+        ));
+    }
+    Ok(())
+}
+
 fn parse_publication_tags(headers: &http::HeaderMap) -> S3Result<Vec<ObjectTag>> {
     let mut values = headers.get_all("x-amz-tagging").iter();
     let Some(header) = values.next() else {
@@ -77,6 +98,36 @@ pub async fn create_multipart_upload(
 
     let (decompress_zip_target, decompress_zip_result) = parse_decompress_upload_options(&req.uri)?;
     let tags = parse_publication_tags(&req.headers)?;
+    let zip_root_capture = decompress_zip_target
+        .as_deref()
+        .map(|_| {
+            crate::pinning::tags::resolve_zip_root_option(&tags, state.pinning.zip_root_default())
+                .map_err(|_| invalid_pinning_argument("invalid zip-root tag"))
+        })
+        .transpose()?;
+    let root_override = match zip_root_capture {
+        Some(crate::pinning::tags::ZipRootCapture::Tagged(value)) => Some(value),
+        _ => None,
+    };
+    let zip_options = crate::zip::options::parse_zip_options(
+        &req.headers,
+        decompress_zip_result,
+        root_override,
+        state.pinning.zip_root_default(),
+    )?;
+    if decompress_zip_target.is_none()
+        && matches!(&zip_options, crate::zip::options::ZipOptions::V2(_))
+    {
+        return Err(s3s::s3_error!(
+            InvalidRequest,
+            "ZIP v2 requires decompress-zip"
+        ));
+    }
+    let zip_root_enabled = if decompress_zip_target.is_some() {
+        zip_root_capture.map(crate::pinning::tags::ZipRootCapture::enabled)
+    } else {
+        None
+    };
 
     // Validate the bucket exists.
     let db = state.store.db();
@@ -105,6 +156,58 @@ pub async fn create_multipart_upload(
     let object_id = uuid::Uuid::new_v4().to_string();
     let upload_id = uuid::Uuid::new_v4().to_string();
     let principal = super::object::principal_id(&req)?;
+    if let crate::zip::options::ZipOptions::V2(options) = zip_options {
+        let prefix = decompress_zip_target
+            .as_deref()
+            .ok_or_else(|| s3s::s3_error!(InvalidRequest, "ZIP v2 requires decompress-zip"))?;
+        let mut normalized_tags = tags.clone();
+        normalized_tags.sort_by(|left, right| left.key.cmp(&right.key));
+        let contract = serde_json::to_string(&serde_json::json!({
+            "version": 2,
+            "owner": &principal,
+            "bucket": bucket,
+            "key": key,
+            "target_prefix": prefix,
+            "token": &options.token,
+            "publish_source": options.publish_source,
+            "publish_extracted": options.publish_extracted,
+            "targets": options.targets,
+            "root_override": options.root_override,
+            "content_type": &content_type,
+            "metadata": &metadata,
+            "tags": &normalized_tags,
+        }))
+        .map_err(|_| s3s::s3_error!(InternalError, "invalid ZIP v2 request contract"))?;
+        let original_id = crate::store::multipart::v2_zip::create_or_replay(
+            db,
+            &crate::store::multipart::v2_zip::Intake {
+                upload_id,
+                object_id,
+                owner: principal,
+                token: options.token.clone(),
+                bucket: bucket.clone(),
+                key: key.clone(),
+                target_prefix: prefix.to_owned(),
+                request_contract: contract,
+                options,
+                captured_config: serde_json::json!({
+                    "root_default": state.pinning.zip_root_default(),
+                })
+                .to_string(),
+                rule_revision: state.pinning.zip_output_rules().revision().to_owned(),
+                content_type,
+                metadata,
+                tags,
+            },
+        )
+        .await?;
+        return Ok(S3Response::new(CreateMultipartUploadOutput {
+            bucket: Some(bucket.clone()),
+            key: Some(key.clone()),
+            upload_id: Some(original_id),
+            ..Default::default()
+        }));
+    }
     let (_, mut decision) = state
         .pinning
         .policy()
@@ -115,7 +218,7 @@ pub async fn create_multipart_upload(
                 tags: &tags,
                 is_decompress_zip: decompress_zip_target.is_some(),
             },
-            DecisionOrigin::new(principal, &upload_id),
+            DecisionOrigin::new(&principal, &upload_id),
         )
         .map_err(crate::error::AppError::from)?;
     decision
@@ -124,6 +227,13 @@ pub async fn create_multipart_upload(
             state.pinning.control_mode(),
         )
         .map_err(invalid_pinning_argument)?;
+
+    if let (Some(prefix), Some(enabled)) = (decompress_zip_target.as_deref(), zip_root_enabled) {
+        crate::s3::route::decompress_zip::admit_zip_batch(
+            state, "mpu", &upload_id, &principal, bucket, key, prefix, enabled,
+        )
+        .await?;
+    }
 
     // For SSE-S3 we generate a per-object key now and persist its wrapped form
     // so the same key can be reused for every part. SSE-C keys are supplied
@@ -352,10 +462,27 @@ pub async fn upload_part(
         .ok_or_else(|| s3s::s3_error!(IncompleteBody, "request body is missing"))?;
 
     let (counter, count_handle) = ByteCounter::new();
-    let stream = counter.wrap(body);
+    let stream = counter
+        .wrap(body)
+        .map(|chunk| chunk.map_err(std::io::Error::other));
+    // This is a per-ZIP request bound, not a global MPU/disk quota. Measure
+    // actual streamed bytes, including chunked uploads without Content-Length.
+    let (stream, zip_progress): (futures_util::stream::BoxStream<'static, _>, _) =
+        if upload.decompress_zip_target.is_some() {
+            let (stream, progress) = crate::zip::input_budget::ZipInputBudget::new(
+                Box::pin(stream),
+                state.pinning.zip_extraction_limits().max_archive_bytes(),
+            );
+            (
+                Box::pin(stream.map(|chunk| chunk.map_err(std::io::Error::other))),
+                Some(progress),
+            )
+        } else {
+            (Box::pin(stream), None)
+        };
 
-    let cid: String = match enc_mode {
-        EncryptionMode::None => crate::kubo::add::stream_add(&state.kubo, stream, 1).await?,
+    let added = match enc_mode {
+        EncryptionMode::None => crate::kubo::add::stream_add(&state.kubo, stream, 1).await,
         EncryptionMode::SseS3 => {
             let wrapped = upload.key_wrap.as_ref().ok_or_else(|| {
                 s3s::s3_error!(InternalError, "missing wrapped key for SSE-S3 upload")
@@ -367,7 +494,7 @@ pub async fn upload_part(
             let pinned = Box::pin(stream);
             let encrypted_stream =
                 crate::crypto::chunker::encrypt_chunk_stream(pinned, Arc::new(ok));
-            crate::kubo::add::stream_add(&state.kubo, encrypted_stream, 1).await?
+            crate::kubo::add::stream_add(&state.kubo, encrypted_stream, 1).await
         }
         EncryptionMode::SseC => {
             let ok = sse_c_key.ok_or_else(|| {
@@ -379,9 +506,14 @@ pub async fn upload_part(
             let pinned = Box::pin(stream);
             let encrypted_stream =
                 crate::crypto::chunker::encrypt_chunk_stream(pinned, Arc::new(ok));
-            crate::kubo::add::stream_add(&state.kubo, encrypted_stream, 1).await?
+            crate::kubo::add::stream_add(&state.kubo, encrypted_stream, 1).await
         }
     };
+
+    if let Some(progress) = &zip_progress {
+        check_zip_input_progress(progress)?;
+    }
+    let cid = added?;
 
     let part_size = count_handle.load(Ordering::Relaxed) as i64;
 
@@ -433,6 +565,424 @@ pub struct CompletedMultipartArchive {
     pub server_side_encryption: Option<ServerSideEncryption>,
     pub mutation_guard: crate::store::import::ownership::StandardMutationGuard,
     pub mutation_lease: Option<Arc<crate::store::import::ownership::MutationLease>>,
+}
+
+/// Verified, still-unpublished input artifact for ZIP v2 MPU.
+/// The caller must separately own the authenticated Complete route, execution
+/// claim, extraction, publication and upload finalization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZipV2AssembledArchive {
+    pub archive_cid: String,
+    pub archive_size: i64,
+    pub input_sha256: String,
+}
+
+const ZIP_TRAILER_WINDOW: usize = 65_557;
+
+#[derive(Clone, Copy)]
+enum ZipAssemblyFailure {
+    InvalidPart,
+    IncompleteBody,
+}
+
+struct ZipV2StreamAudit {
+    hash: Sha256,
+    size: i64,
+    tail: Vec<u8>,
+    eof: bool,
+    failure: Option<ZipAssemblyFailure>,
+}
+
+impl ZipV2StreamAudit {
+    fn new() -> Self {
+        Self {
+            hash: Sha256::new(),
+            size: 0,
+            tail: Vec::new(),
+            eof: false,
+            failure: None,
+        }
+    }
+
+    fn observe(&mut self, bytes: &[u8]) -> Result<(), ZipAssemblyFailure> {
+        let len = i64::try_from(bytes.len()).map_err(|_| ZipAssemblyFailure::InvalidPart)?;
+        self.size = self
+            .size
+            .checked_add(len)
+            .ok_or(ZipAssemblyFailure::InvalidPart)?;
+        self.hash.update(bytes);
+        if bytes.len() >= ZIP_TRAILER_WINDOW {
+            self.tail.clear();
+            self.tail
+                .extend_from_slice(&bytes[bytes.len() - ZIP_TRAILER_WINDOW..]);
+        } else {
+            let drop = self
+                .tail
+                .len()
+                .saturating_add(bytes.len())
+                .saturating_sub(ZIP_TRAILER_WINDOW);
+            self.tail.drain(..drop);
+            self.tail.extend_from_slice(bytes);
+        }
+        Ok(())
+    }
+
+    fn finish(&self, expected_size: i64) -> S3Result<String> {
+        if let Some(failure) = self.failure {
+            return Err(zip_assembly_error(failure));
+        }
+        if !self.eof || self.size != expected_size {
+            return Err(zip_assembly_error(ZipAssemblyFailure::IncompleteBody));
+        }
+        // A local-header-only prefix is not a complete ZIP. The extracting
+        // route still owns full ZIP parsing; this only attests a bounded EOCD.
+        if !self.tail.windows(4).enumerate().any(|(at, signature)| {
+            signature == b"PK\x05\x06"
+                && self
+                    .tail
+                    .get(at + 20..at + 22)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .map(u16::from_le_bytes)
+                    .is_some_and(|comment| at + 22 + usize::from(comment) == self.tail.len())
+        }) {
+            return Err(zip_assembly_error(ZipAssemblyFailure::IncompleteBody));
+        }
+        Ok(hex::encode(self.hash.clone().finalize()))
+    }
+}
+
+fn zip_assembly_error(failure: ZipAssemblyFailure) -> s3s::S3Error {
+    match failure {
+        ZipAssemblyFailure::InvalidPart => s3s::s3_error!(
+            InvalidPart,
+            "ZIP multipart part bytes or checksum do not match"
+        ),
+        ZipAssemblyFailure::IncompleteBody => s3s::s3_error!(
+            IncompleteBody,
+            "ZIP multipart CAT stream or ZIP trailer is incomplete"
+        ),
+    }
+}
+
+// Shared with the standard plaintext Complete path. ZIP v2 adds an observer
+// rather than duplicating the Kubo CAT -> concat -> add transport.
+fn plain_parts_concat_stream(
+    kubo: crate::kubo::KuboClient,
+    parts: Vec<(String, i64, Option<String>)>,
+    audit: Option<Arc<std::sync::Mutex<ZipV2StreamAudit>>>,
+) -> impl futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static {
+    async_stream::stream! {
+        for (cid, expected_size, expected_sha256) in parts {
+            let part_stream = match crate::kubo::cat::stream_cat(&kubo, &cid, None).await {
+                Ok(stream) => stream,
+                Err(_) => {
+                    if let Some(audit) = &audit {
+                        audit.lock().unwrap().failure = Some(ZipAssemblyFailure::IncompleteBody);
+                    }
+                    yield Err(std::io::Error::other(crate::error::INTERNAL_STORAGE_BACKEND_ERROR));
+                    return;
+                }
+            };
+            tokio::pin!(part_stream);
+            let mut observed = 0_i64;
+            let mut part_hash = Sha256::new();
+            while let Some(chunk) = part_stream.next().await {
+                match chunk {
+                    Ok(chunk) => {
+                        if let Some(audit) = &audit {
+                            let checked = i64::try_from(chunk.len()).ok().and_then(|len| observed.checked_add(len));
+                            if checked.is_none_or(|size| size > expected_size) {
+                                audit.lock().unwrap().failure = Some(ZipAssemblyFailure::InvalidPart);
+                                yield Err(std::io::Error::other("ZIP multipart part size mismatch"));
+                                return;
+                            }
+                            observed = checked.expect("checked above");
+                            part_hash.update(&chunk);
+                            let result = audit.lock().unwrap().observe(&chunk);
+                            if let Err(failure) = result {
+                                audit.lock().unwrap().failure = Some(failure);
+                                yield Err(std::io::Error::other("ZIP multipart size overflow"));
+                                return;
+                            }
+                        }
+                        yield Ok(chunk);
+                    }
+                    Err(error) => {
+                        if let Some(audit) = &audit {
+                            audit.lock().unwrap().failure = Some(ZipAssemblyFailure::IncompleteBody);
+                        }
+                        yield Err(error);
+                        return;
+                    }
+                }
+            }
+            if let Some(audit) = &audit
+                && (observed != expected_size || expected_sha256.as_ref().is_some_and(|sha| {
+                    use base64::Engine as _;
+                    base64::engine::general_purpose::STANDARD.encode(part_hash.finalize()) != *sha
+                }))
+            {
+                audit.lock().unwrap().failure = Some(ZipAssemblyFailure::InvalidPart);
+                yield Err(std::io::Error::other("ZIP multipart part size or checksum mismatch"));
+                return;
+            }
+        }
+        if let Some(audit) = &audit {
+            audit.lock().unwrap().eof = true;
+        }
+    }
+}
+
+/// Assemble only a captured ZIP v2 upload. This is deliberately
+/// NOT called by legacy Complete or the generic S3 handler; routing must first
+/// verify SigV4 and obtain the exact intake record for this upload.
+pub async fn assemble_zip_v2_archive(
+    state: &Arc<AppState>,
+    req: &S3Request<CompleteMultipartUploadInput>,
+    intake: &crate::store::multipart::v2_zip::Record,
+) -> S3Result<ZipV2AssembledArchive> {
+    crate::s3::http::reject_write_conditions(
+        &req.headers,
+        req.input.if_match.is_some() || req.input.if_none_match.is_some(),
+    )?;
+    let principal = super::object::principal_id(req)?;
+    let db = state.store.db();
+    let id = &req.input.upload_id;
+    if intake.original_upload_id != *id
+        || intake.active_upload_id.as_deref() != Some(id)
+        || intake.owner != principal
+        || intake.bucket != req.input.bucket
+        || intake.archive_key != req.input.key
+    {
+        return Err(s3s::s3_error!(
+            AccessDenied,
+            "ZIP multipart intake identity mismatch"
+        ));
+    }
+    let persisted = crate::store::multipart::v2_zip::read_by_upload(db, id)
+        .await?
+        .ok_or_else(|| s3s::s3_error!(NoSuchUpload, "ZIP multipart intake not found"))?;
+    if persisted.original_upload_id != intake.original_upload_id
+        || persisted.active_upload_id != intake.active_upload_id
+        || persisted.owner != intake.owner
+        || persisted.bucket != intake.bucket
+        || persisted.archive_key != intake.archive_key
+        || persisted.execution_id != intake.execution_id
+        || persisted.request_fingerprint != intake.request_fingerprint
+        || persisted.captured_options != intake.captured_options
+        || persisted.captured_config != intake.captured_config
+        || persisted.rule_revision != intake.rule_revision
+        || persisted.target_prefix != intake.target_prefix
+        || persisted.token != intake.token
+    {
+        return Err(s3s::s3_error!(
+            OperationAborted,
+            "ZIP multipart intake changed"
+        ));
+    }
+    let execution = crate::store::zip::execution::read(db, &intake.execution_id)
+        .await?
+        .ok_or_else(|| s3s::s3_error!(OperationAborted, "ZIP multipart execution missing"))?;
+    let options: crate::zip::options::ZipV2Options = serde_json::from_str(&intake.captured_options)
+        .map_err(|_| s3s::s3_error!(InternalError, "invalid captured ZIP multipart options"))?;
+    let captured_config: serde_json::Value = serde_json::from_str(&intake.captured_config)
+        .map_err(|_| s3s::s3_error!(InternalError, "invalid captured ZIP multipart config"))?;
+    let contract: serde_json::Value = serde_json::from_str(&execution.request_contract)
+        .map_err(|_| s3s::s3_error!(InternalError, "invalid captured ZIP multipart contract"))?;
+    if execution.id != *id
+        || execution.source != "mpu"
+        || execution.owner != principal
+        || execution.bucket != req.input.bucket
+        || execution.source_key != req.input.key
+        || execution.token != intake.token
+        || !matches!(execution.state.as_str(), "pending" | "admitted")
+        || execution.terminal_result.is_some()
+        || execution.request_fingerprint != intake.request_fingerprint
+        || execution.captured_options != intake.captured_options
+        || execution.request_fingerprint
+            != hex::encode(Sha256::digest(execution.request_contract.as_bytes()))
+        || options.token != intake.token
+        || (!options.publish_source && !options.publish_extracted)
+        || (matches!(
+            options.targets,
+            crate::zip::options::ZipTargets::Source | crate::zip::options::ZipTargets::Both
+        ) && !options.publish_source)
+        || (matches!(
+            options.targets,
+            crate::zip::options::ZipTargets::Extracted | crate::zip::options::ZipTargets::Both
+        ) && !options.publish_extracted)
+        || captured_config["root_default"]
+            .as_bool()
+            .is_none_or(|default| options.root_enabled != options.root_override.unwrap_or(default))
+        || options.result_version != 2
+        || intake.rule_revision.is_empty()
+        || contract["version"] != 2
+        || contract["owner"] != principal
+        || contract["bucket"] != req.input.bucket
+        || contract["key"] != req.input.key
+        || contract["target_prefix"] != intake.target_prefix
+        || contract["publish_source"] != options.publish_source
+        || contract["publish_extracted"] != options.publish_extracted
+        || contract["token"] != intake.token
+        || contract["targets"] != serde_json::json!(options.targets)
+        || contract["root_override"] != serde_json::json!(options.root_override)
+    {
+        return Err(s3s::s3_error!(
+            OperationAborted,
+            "ZIP multipart capture or execution mismatch"
+        ));
+    }
+    let upload = crate::store::multipart::get_upload(db, id).await?;
+    let mut tags = crate::store::pinning::tags::tags_from_json(&upload.tags_json)
+        .map_err(|_| s3s::s3_error!(InternalError, "invalid multipart upload tags"))?;
+    tags.sort_by(|left, right| left.key.cmp(&right.key));
+    let captured_tags = serde_json::to_value(&tags)
+        .map_err(|_| s3s::s3_error!(InternalError, "invalid multipart upload tags"))?;
+    if upload.upload_id != *id
+        || upload.bucket != req.input.bucket
+        || upload.key != req.input.key
+        || upload.encryption_mode != "none"
+        || upload.key_wrap.is_some()
+        || upload.sse_c_key_fingerprint.is_some()
+        || upload.decompress_zip_target.as_deref() != Some(intake.target_prefix.as_str())
+        || !upload.decompress_zip_result
+        || upload.pin_decision_json.is_some()
+        || contract["content_type"] != serde_json::json!(upload.content_type)
+        || contract["metadata"] != serde_json::json!(upload.metadata)
+        || contract["tags"] != captured_tags
+    {
+        return Err(s3s::s3_error!(
+            InvalidRequest,
+            "ZIP multipart upload configuration mismatch"
+        ));
+    }
+    if [
+        "x-amz-server-side-encryption",
+        "x-amz-server-side-encryption-customer-algorithm",
+        "x-amz-server-side-encryption-customer-key",
+        "x-amz-server-side-encryption-customer-key-md5",
+    ]
+    .iter()
+    .any(|header| req.headers.contains_key(*header))
+    {
+        return Err(s3s::s3_error!(
+            InvalidArgument,
+            "ZIP multipart cannot use server-side encryption"
+        ));
+    }
+    let completed = req
+        .input
+        .multipart_upload
+        .as_ref()
+        .and_then(|body| body.parts.as_ref())
+        .ok_or_else(|| s3s::s3_error!(InvalidRequest, "missing multipart upload parts"))?;
+    if completed.is_empty() || completed.len() > 10_000 {
+        return Err(s3s::s3_error!(
+            InvalidRequest,
+            "invalid ZIP multipart part count"
+        ));
+    }
+    let mut previous = 0;
+    for cp in completed {
+        let pn = cp
+            .part_number
+            .ok_or_else(|| s3s::s3_error!(InvalidArgument, "missing ZIP multipart part number"))?;
+        if pn <= previous || pn > 10_000 {
+            return Err(s3s::s3_error!(
+                InvalidPartOrder,
+                "invalid ZIP multipart part order"
+            ));
+        }
+        previous = pn;
+    }
+    let mut parts = Vec::with_capacity(completed.len());
+    let mut total = 0_i64;
+    for (index, cp) in completed.iter().enumerate() {
+        let pn = cp.part_number.expect("validated above");
+        let part = crate::store::multipart::get_part(db, id, pn).await?;
+        if cp
+            .e_tag
+            .as_ref()
+            .is_none_or(|etag| !matches!(etag, ETag::Strong(value) if value == &part.etag))
+            || part.size < 0
+        {
+            return Err(s3s::s3_error!(
+                InvalidPart,
+                "ZIP multipart part ETag or size mismatch"
+            ));
+        }
+        if cp.checksum_crc32.is_some()
+            || cp.checksum_crc32c.is_some()
+            || cp.checksum_crc64nvme.is_some()
+            || cp.checksum_crc64nvme.is_some()
+            || cp.checksum_sha1.is_some()
+        {
+            // Part records store no checksum. Never claim an unchecked checksum was verified.
+            return Err(s3s::s3_error!(
+                InvalidRequest,
+                "unsupported ZIP multipart part checksum"
+            ));
+        }
+        if let Some(sha) = &cp.checksum_sha256 {
+            use base64::Engine as _;
+            if !base64::engine::general_purpose::STANDARD
+                .decode(sha)
+                .is_ok_and(|bytes| bytes.len() == 32)
+            {
+                return Err(s3s::s3_error!(
+                    InvalidPart,
+                    "invalid ZIP multipart SHA256 checksum"
+                ));
+            }
+        }
+        if index + 1 < completed.len() && part.size < 5 * 1024 * 1024 {
+            return Err(s3s::s3_error!(
+                EntityTooSmall,
+                "ZIP multipart nonfinal part is too small"
+            ));
+        }
+        total = total
+            .checked_add(part.size)
+            .ok_or_else(|| s3s::s3_error!(InvalidPart, "ZIP multipart size overflow"))?;
+        if total as u64 > state.pinning.zip_extraction_limits().max_archive_bytes() {
+            return Err(raw_zip_input_too_large());
+        }
+        parts.push((part.cid, part.size, cp.checksum_sha256.clone()));
+    }
+    let audit = Arc::new(std::sync::Mutex::new(ZipV2StreamAudit::new()));
+    let stream = plain_parts_concat_stream(state.kubo.clone(), parts, Some(audit.clone()));
+    let (stream, progress) = crate::zip::input_budget::ZipInputBudget::new(
+        Box::pin(stream),
+        state.pinning.zip_extraction_limits().max_archive_bytes(),
+    );
+    let added = crate::kubo::add::stream_add(&state.kubo, stream, 1).await;
+    if progress.limit_exceeded() {
+        return Err(raw_zip_input_too_large());
+    }
+    let sha = audit.lock().unwrap().finish(total)?;
+    check_zip_input_progress(&progress)?;
+    let cid = added?;
+    if execution
+        .input_sha256
+        .as_ref()
+        .is_some_and(|bound| bound != &sha)
+        || execution
+            .input_art_cid
+            .as_ref()
+            .is_some_and(|bound| bound != &cid)
+        || execution.input_art_size.is_some_and(|bound| bound != total)
+    {
+        return Err(s3s::s3_error!(
+            OperationAborted,
+            "ZIP multipart input differs from bound execution"
+        ));
+    }
+    crate::kubo::pin::pin_add(&state.kubo, &cid).await?;
+    Ok(ZipV2AssembledArchive {
+        archive_cid: cid,
+        archive_size: total,
+        input_sha256: sha,
+    })
 }
 
 #[async_trait::async_trait]
@@ -635,6 +1185,98 @@ pub async fn finalize_completed_multipart_zip(
         lease.finish().await;
     }
     result
+}
+
+/// Finalize archive, extracted objects, immutable version bindings and root
+/// outcome in one guarded completion transaction. Reconcile an unknown commit
+/// before exposing any batch receipt or permitting a new completion attempt.
+pub async fn finalize_completed_multipart_zip_batch(
+    state: &Arc<AppState>,
+    completed: &CompletedMultipartArchive,
+    request: ZipPublicationRequest,
+    batch: crate::store::pinning::publication::ZipBatchPublication,
+    replay: crate::store::pinning::publication::ZipCompletedReplay,
+) -> S3Result<PublicationResult> {
+    if request.archive.object.id != completed.completion_attempt_id {
+        return Err(s3s::s3_error!(InternalError, "completion attempt mismatch"));
+    }
+    let expected_archive = request.archive.object.clone();
+    let decision = completed.pin_decision.as_ref().ok_or_else(|| {
+        s3s::s3_error!(
+            InternalError,
+            "missing captured multipart publication decision"
+        )
+    })?;
+    let work = async {
+        Ok::<_, s3s::S3Error>(
+            crate::store::pinning::publication::publish_decided_completed_zip_batch(
+                state.store.db(),
+                &completed.upload_target,
+                request,
+                Some(completed.mutation_guard.clone()),
+                batch,
+                replay,
+                DecidedPublish {
+                    decision,
+                    config: state.pinning.effective_config(),
+                    mode: state.pinning.control_mode(),
+                    limits: state.pinning.provider_limits(),
+                },
+            )
+            .await,
+        )
+    };
+    let commit = match &completed.mutation_lease {
+        Some(lease) => lease.commit(work).await,
+        None => work.await,
+    };
+    if let Some(lease) = &completed.mutation_lease {
+        lease.finish().await;
+    }
+    match commit? {
+        Ok(result) => Ok(result),
+        Err(crate::store::multipart::CommitCompletedUploadError::RolledBack {
+            completion_attempt_id,
+            source,
+        }) => {
+            if completion_attempt_id != completed.completion_attempt_id {
+                return Err(s3s::s3_error!(InternalError, "completion attempt mismatch"));
+            }
+            Err(source.into())
+        }
+        Err(crate::store::multipart::CommitCompletedUploadError::OutcomeUnknown {
+            completion_attempt_id,
+            source,
+        }) => {
+            if completion_attempt_id != completed.completion_attempt_id {
+                return Err(s3s::s3_error!(InternalError, "completion attempt mismatch"));
+            }
+            match crate::store::pinning::publication::reconcile_completed_publication(
+                state.store.db(),
+                &completed.upload_id,
+                &expected_archive,
+            )
+            .await
+            {
+                crate::store::pinning::publication::ReconciledPublicationOutcome::Committed(
+                    result,
+                ) => Ok(result),
+                crate::store::pinning::publication::ReconciledPublicationOutcome::NotCommitted => {
+                    Err(source.into())
+                }
+                crate::store::pinning::publication::ReconciledPublicationOutcome::Unknown(
+                    reconcile_error,
+                ) => {
+                    let source = bounded_diagnostic(&source);
+                    let reconcile_error = bounded_diagnostic(&reconcile_error);
+                    Err(s3s::s3_error!(
+                        InternalError,
+                        "commit outcome unknown ({source}); reconciliation failed ({reconcile_error})"
+                    ))
+                }
+            }
+        }
+    }
 }
 
 pub(crate) async fn finalize_completed_multipart_zip_with_store<
@@ -864,6 +1506,15 @@ pub async fn complete_multipart_upload_inner(
     let key = &req.input.key;
     let upload_id = &req.input.upload_id;
     let db = state.store.db();
+    if crate::store::multipart::v2_zip::read_by_upload(db, upload_id)
+        .await?
+        .is_some()
+    {
+        return Err(s3s::s3_error!(
+            NotImplemented,
+            "ZIP v2 multipart completion is not available"
+        ));
+    }
 
     // s3s parses the XML body into `multipart_upload` for us; each
     // `CompletedPart.e_tag` is already an `ETag` with surrounding quotes
@@ -1014,6 +1665,14 @@ pub async fn complete_multipart_upload_inner(
             .ok_or_else(|| s3s::s3_error!(InvalidPart, "multipart object size overflow"))
     })?;
 
+    if decompress_zip_target.is_some()
+        && u64::try_from(total_size)
+            .ok()
+            .is_none_or(|size| size > state.pinning.zip_extraction_limits().max_archive_bytes())
+    {
+        return Err(raw_zip_input_too_large());
+    }
+
     let mutation_guard = if let Some(prefix) = decompress_zip_target.as_deref() {
         crate::store::import::ownership::admit_content_and_prefix_mutation(
             db,
@@ -1036,6 +1695,46 @@ pub async fn complete_multipart_upload_inner(
         .await?
     };
 
+    if let (Some(prefix), Some(_)) = (decompress_zip_target.as_deref(), pin_decision.as_ref()) {
+        // Creation captures even an untagged default in the durable ZIP batch.
+        // Only pre-batch historical uploads lack that record; their old default
+        // was true, independent of the current process configuration.
+        let enabled = match crate::store::zip::read(db, upload_id).await? {
+            Some(batch) => {
+                crate::s3::route::decompress_zip::captured_root_enabled(&batch.captured_options)?
+            }
+            None => crate::pinning::tags::resolve_zip_root_option(&tags, true)
+                .map_err(|_| invalid_pinning_argument("invalid zip-root tag"))?
+                .enabled(),
+        };
+        let principal = super::object::principal_id(&req)?;
+        if let Err(error) = crate::s3::route::decompress_zip::admit_zip_batch(
+            state, "mpu", upload_id, &principal, bucket, key, prefix, enabled,
+        )
+        .await
+        {
+            crate::store::import::ownership::release_standard_mutation(db, &mutation_guard).await?;
+            return Err(error);
+        }
+        // Bind the exact ordered client Complete contract while the upload and
+        // its validated parts still exist. A retry with changed ETags/checksums
+        // must not replace the original contract, even if no root was added yet.
+        if let Err(error) = crate::store::zip::BatchAdmission::capture_mpu_complete(
+            db, &principal, bucket, key, upload_id, completed,
+        )
+        .await
+        {
+            crate::store::import::ownership::release_standard_mutation(db, &mutation_guard).await?;
+            if matches!(error, crate::error::AppError::InvalidZipParameter(_)) {
+                let mut conflict =
+                    s3s::s3_error!(OperationAborted, "ZIP multipart Complete request conflict");
+                conflict.set_status_code(http::StatusCode::CONFLICT);
+                return Err(conflict);
+            }
+            return Err(error.into());
+        }
+    }
+
     let lease = Arc::new(crate::store::import::ownership::MutationLease::start(
         db,
         &mutation_guard,
@@ -1048,18 +1747,21 @@ pub async fn complete_multipart_upload_inner(
     let root_cid = match enc_mode {
         EncryptionMode::None => {
             // Plaintext: concatenate ciphertext (= plaintext here) directly.
-            let concat_stream = async_stream::stream! {
-                for cid in &part_cids {
-                    let part_stream = crate::kubo::cat::stream_cat(&kubo, cid, None)
-                        .await
-                        .map_err(|_| std::io::Error::other(crate::error::INTERNAL_STORAGE_BACKEND_ERROR))?;
-                    tokio::pin!(part_stream);
-                    while let Some(chunk) = part_stream.next().await {
-                        yield chunk;
-                    }
-                }
-            };
-            crate::kubo::add::stream_add(&state.kubo, concat_stream, 1).await?
+            let concat_stream = plain_parts_concat_stream(
+                kubo.clone(),
+                parts_to_concat.iter().map(|(cid, size)| (cid.clone(), *size, None)).collect(),
+                None,
+            );
+            if decompress_zip_target.is_some() {
+                let (stream, progress) = crate::zip::input_budget::ZipInputBudget::new(
+                    Box::pin(concat_stream), state.pinning.zip_extraction_limits().max_archive_bytes(),
+                );
+                let added = crate::kubo::add::stream_add(&state.kubo, stream, 1).await;
+                check_zip_input_progress(&progress)?;
+                added?
+            } else {
+                crate::kubo::add::stream_add(&state.kubo, concat_stream, 1).await?
+            }
         }
         EncryptionMode::SseS3 | EncryptionMode::SseC => {
             // Encrypted: each part was independently encrypted with its own

@@ -4,8 +4,41 @@ use sea_orm::{
 
 use crate::{
     error::{AppError, AppResult},
-    store::entities::import_job_result,
+    store::{
+        entities::{import_job_result, zip_manifest_entry},
+        zip::ManifestItem,
+    },
 };
+
+/// A reclaimed worker may resume an open batch only for the same final path set.
+pub(crate) fn matches_zip_manifest(
+    persisted: &[zip_manifest_entry::Model],
+    intended: &[ManifestItem],
+) -> bool {
+    if persisted.len() != intended.len() {
+        return false;
+    }
+    let by_path = persisted
+        .iter()
+        .map(|item| (item.path.as_str(), item))
+        .collect::<std::collections::HashMap<_, _>>();
+    intended.iter().all(|item| match item {
+        ManifestItem::Success {
+            path,
+            object_key,
+            cid,
+            size,
+        } => by_path.get(path.as_str()).is_some_and(|row| {
+            row.object_key.as_deref() == Some(object_key)
+                && row.cid.as_deref() == Some(cid)
+                && row.size == Some(*size)
+                && row.error_code.is_none()
+        }),
+        ManifestItem::Failure { path, code } => by_path.get(path.as_str()).is_some_and(|row| {
+            row.error_code.as_deref() == Some(code) && row.cid.is_none() && row.object_key.is_none()
+        }),
+    })
+}
 
 const MAX_RESULT_PAGE_SIZE: u64 = 1_000;
 

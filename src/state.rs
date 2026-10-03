@@ -36,15 +36,18 @@ impl AppState {
             .as_ref()
             .map(|config| KuboClient::new(config.rpc_url.clone()));
         let validated_pinning = ValidatedPinningConfig::from_config(cfg, get_env)?;
+        let pinning = PinningCoordinator::build_with_zip_limits(
+            validated_pinning,
+            Some(kubo.clone()),
+            cfg.pinning_control.unavailable,
+            cfg.decompress_zip.unixfs_directory_root,
+            &cfg.decompress_zip.pin_output_rules,
+            cfg.decompress_zip.limits,
+        )?;
 
         let db = crate::store::connect_database(&cfg.storage.database_url).await?;
         crate::store::run_migrations(&db).await?;
         let store = Store::new(db);
-        let pinning = PinningCoordinator::build_with_kubo_and_mode(
-            validated_pinning,
-            Some(kubo.clone()),
-            cfg.pinning_control.unavailable,
-        )?;
         pinning.register_identities(&store).await?;
 
         let credentials: HashMap<String, SecretKey> = cfg
@@ -93,9 +96,15 @@ mod tests {
     use crate::{
         config::{Config, OptionalPinControlMode, PolicyConfig, ProviderConfig},
         pinning::{
+            config::ValidatedPinningConfig,
+            coordinator::normalize_validated_config,
             decision::{DecisionEffect, DecisionOrigin, WarningCode},
             policy::PublicationContext,
             tags::ObjectTag,
+            zip_policy::{
+                ZipOutputKind, ZipOutputRuleConfig, ZipPlanWarning, ZipPublishedOutput,
+                ZipRuleEffect, ZipTargets,
+            },
         },
     };
     use std::cell::Cell;
@@ -143,6 +152,40 @@ mod tests {
         assert!(state.pinning.provider_limits().is_empty());
         assert!(state.cold_kubo.is_none());
         let _worker_store = state.store.clone();
+    }
+
+    #[tokio::test]
+    async fn configured_zip_budget_is_frozen_in_the_runtime_snapshot() {
+        let mut config: Config = toml::from_str(
+            "[decompress_zip]\nmax_decompressed_bytes = 23\nmax_entries = 2\nprocessing_deadline_secs = 3\n",
+        )
+        .unwrap();
+        let state = AppState::new_with_env(&config, |_| None).await.unwrap();
+        assert_eq!(
+            state.pinning.zip_extraction_limits(),
+            config.decompress_zip.limits
+        );
+        config.decompress_zip.limits = crate::zip::extract::ZipExtractionLimits::default();
+        assert_eq!(
+            state
+                .pinning
+                .zip_extraction_limits()
+                .max_decompressed_bytes(),
+            23
+        );
+        assert_eq!(state.pinning.zip_extraction_limits().max_entries(), 2);
+        assert_eq!(
+            state
+                .pinning
+                .zip_extraction_limits()
+                .processing_deadline_secs(),
+            Some(3)
+        );
+        assert_eq!(
+            crate::pinning::coordinator::PinningCoordinator::disabled_for_test()
+                .zip_extraction_limits(),
+            config.decompress_zip.limits,
+        );
     }
 
     #[tokio::test]
@@ -222,5 +265,171 @@ mod tests {
         let state = AppState::new_with_env(&config, |_| None).await.unwrap();
         assert!(state.cold_kubo.is_some());
         assert!(state.pinning.provider_limits().is_empty());
+    }
+
+    #[tokio::test]
+    async fn toml_zip_rules_are_frozen_after_alias_resolution_and_invalid_rules_block_startup() {
+        let base = r#"
+            [decompress_zip]
+            unixfs_directory_root = false
+            [pinning]
+            [[pinning.providers]]
+            name = "first"
+            kind = "noop"
+            priority = 1
+            max_bytes = 100
+            max_pins = 10
+            [[pinning.providers]]
+            name = "second"
+            kind = "noop"
+            priority = 1
+            max_bytes = 100
+            max_pins = 10
+            [[pinning.policies]]
+            bucket = "bucket"
+            prefix = "exports/"
+            trigger = "always"
+            provider_mode = "one"
+            providers = ["first", "second"]
+            default_duration = "1h"
+            max_duration = "2h"
+            allow_decompressed = true
+            [pinning_identity]
+            primary_storage_domain = "kubo:primary"
+            [[pinning_identity.providers]]
+            config_name = "first"
+            provider_id = "noop-first"
+            display_name = "First"
+            backend = "noop"
+            scope = "account:shared"
+            storage_domain = "noop:shared"
+            credential_revision = 1
+            endpoint_revision = 1
+            api_profile = "noop"
+            strategy = "cid"
+            [[pinning_identity.providers]]
+            config_name = "second"
+            provider_id = "noop-second"
+            display_name = "Second"
+            backend = "noop"
+            scope = "account:shared"
+            storage_domain = "noop:shared"
+            credential_revision = 1
+            endpoint_revision = 1
+            api_profile = "noop"
+            strategy = "cid"
+        "#;
+        let without_rules: Config = toml::from_str(base).unwrap();
+        let normalized = normalize_validated_config(
+            ValidatedPinningConfig::from_config(&without_rules, |_| None).unwrap(),
+        )
+        .unwrap();
+        let policy_id = &normalized.policies[0].identity;
+        let raw = format!(
+            r#"{base}
+            [[decompress_zip.pin_output_rules]]
+            name = "low"
+            priority = 20
+            bucket = "bucket"
+            prefix = "exports/"
+            effect = "allow"
+            policy_id = "{policy_id}"
+            [[decompress_zip.pin_output_rules]]
+            name = "high"
+            priority = 5
+            bucket = "bucket"
+            prefix = "exports/"
+            effect = "allow"
+            policy_id = "{policy_id}"
+            [[decompress_zip.pin_output_rules]]
+            name = "private"
+            priority = 99
+            bucket = "bucket"
+            prefix = "exports/private/"
+            effect = "deny"
+        "#,
+        );
+        let mut config: Config = toml::from_str(&raw).unwrap();
+        let state = AppState::new_with_env(&config, |_| None).await.unwrap();
+        assert!(!state.pinning.zip_root_default());
+        let expected_key = &normalized.providers[0].name;
+        assert_ne!(expected_key, "first");
+        assert_eq!(
+            state.pinning.effective_config().policies[0].providers,
+            vec![expected_key.clone()]
+        );
+        let revision = state.pinning.zip_output_rules().revision().to_owned();
+        let outputs = ["exports/public/file", "exports/private/file"]
+            .into_iter()
+            .map(|key| ZipPublishedOutput {
+                bucket: "bucket".to_owned(),
+                key: key.to_owned(),
+                version_id: "v1".to_owned(),
+                cid: "cid".to_owned(),
+            })
+            .collect::<Vec<_>>();
+        let plan = state
+            .pinning
+            .zip_output_rules()
+            .plan(
+                ZipTargets {
+                    source: false,
+                    extracted: true,
+                },
+                None,
+                &outputs,
+            )
+            .unwrap();
+        assert_eq!(plan.rule_revision, revision);
+        assert_eq!(plan.outputs[0].kind, ZipOutputKind::Extracted);
+        assert_eq!(plan.outputs[0].rule_name.as_deref(), Some("high"));
+        assert_eq!(
+            plan.outputs[0].intents[0].providers[0].config_name,
+            *expected_key
+        );
+        assert_eq!(
+            plan.outputs[0].intents[0].intent.providers,
+            vec![expected_key.clone()]
+        );
+        assert_eq!(plan.outputs[1].rule_name.as_deref(), Some("private"));
+        assert_eq!(plan.outputs[1].warning, Some(ZipPlanWarning::Denied));
+        assert!(plan.outputs[1].intents.is_empty());
+
+        config.decompress_zip.pin_output_rules.clear();
+        assert_eq!(state.pinning.zip_output_rules().revision(), revision);
+        assert_eq!(
+            state
+                .pinning
+                .zip_output_rules()
+                .plan(
+                    ZipTargets {
+                        source: false,
+                        extracted: true
+                    },
+                    None,
+                    &outputs,
+                )
+                .unwrap(),
+            plan
+        );
+
+        config.decompress_zip.pin_output_rules = vec![ZipOutputRuleConfig {
+            name: "broken".to_owned(),
+            priority: 1,
+            bucket: "bucket".to_owned(),
+            prefix: "exports/".to_owned(),
+            effect: ZipRuleEffect::Allow,
+            policy_id: Some("missing-policy".to_owned()),
+        }];
+        config.storage.database_url = "not-a-database-url".to_owned();
+        let error = match AppState::new_with_env(&config, |_| None).await {
+            Ok(_) => panic!("invalid ZIP output rules must block startup"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("ZIP rule references unknown policy identity")
+        );
     }
 }

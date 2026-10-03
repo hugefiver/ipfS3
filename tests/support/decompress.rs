@@ -290,7 +290,26 @@ async fn start_kubo_harness_with_blocker(
 }
 
 pub async fn start_harness(script: KuboScript) -> TestHarness {
-    build_harness(start_kubo_harness(script).await).await
+    build_harness(start_kubo_harness(script).await, None, None).await
+}
+
+#[allow(dead_code)] // Shared test support is compiled by targets without the ZIP config cases.
+pub async fn start_harness_with_root_default(script: KuboScript, enabled: bool) -> TestHarness {
+    build_harness(start_kubo_harness(script).await, Some(enabled), None).await
+}
+
+#[allow(dead_code)] // Shared test support is compiled by targets without the ZIP config cases.
+pub async fn start_harness_with_root_default_and_database(
+    script: KuboScript,
+    enabled: bool,
+    database_url: &str,
+) -> TestHarness {
+    build_harness(
+        start_kubo_harness(script).await,
+        Some(enabled),
+        Some(database_url),
+    )
+    .await
 }
 
 pub async fn start_blocking_harness(
@@ -305,7 +324,7 @@ pub async fn start_blocking_harness(
         release: Arc::new(Mutex::new(Some(release_rx))),
     };
     let kubo = start_kubo_harness_with_blocker(script, Some(blocker)).await;
-    let harness = build_harness(kubo).await;
+    let harness = build_harness(kubo, None, None).await;
     (
         harness,
         KuboBlockControl {
@@ -315,32 +334,48 @@ pub async fn start_blocking_harness(
     )
 }
 
-async fn build_harness(kubo_harness: KuboHarness) -> TestHarness {
+async fn build_harness(
+    kubo_harness: KuboHarness,
+    root_default: Option<bool>,
+    database_url: Option<&str>,
+) -> TestHarness {
     let KuboHarness {
         server: kubo,
         add_file_bytes,
         cat_bodies,
     } = kubo_harness;
 
-    let db = Database::connect("sqlite::memory:")
-        .await
-        .expect("in-memory SQLite database");
-    ipfs_s3_gateway::store::run_migrations(&db)
-        .await
-        .expect("run test migrations");
+    let state = if let Some(enabled) = root_default {
+        let cfg: ipfs_s3_gateway::config::Config = toml::from_str(&format!(
+            "[kubo]\nrpc_url = {:?}\n[storage]\ndatabase_url = {:?}\n[decompress_zip]\nunixfs_directory_root = {enabled}\n",
+            kubo.uri(),
+            database_url.unwrap_or("sqlite::memory:")
+        ))
+        .expect("ZIP root test configuration");
+        ipfs_s3_gateway::state::AppState::new(&cfg)
+            .await
+            .expect("configured application state")
+    } else {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite database");
+        ipfs_s3_gateway::store::run_migrations(&db)
+            .await
+            .expect("run test migrations");
+        Arc::new(ipfs_s3_gateway::state::AppState {
+            kubo: ipfs_s3_gateway::kubo::KuboClient::new(kubo.uri()),
+            cold_kubo: None,
+            store: ipfs_s3_gateway::store::Store::new(db),
+            credentials: HashMap::from([("test".to_owned(), s3s::auth::SecretKey::from("test"))]),
+            master_key: ipfs_s3_gateway::crypto::key::MasterKey::from_hex(&"0".repeat(64))
+                .expect("zero test master key"),
+            pinning: ipfs_s3_gateway::pinning::coordinator::PinningCoordinator::disabled_for_test(),
+        })
+    };
     let bucket = "test-bkt".to_owned();
-    ipfs_s3_gateway::store::bucket::create(&db, &bucket, None)
+    ipfs_s3_gateway::store::bucket::create(state.store.db(), &bucket, None)
         .await
         .expect("create test bucket");
-    let state = Arc::new(ipfs_s3_gateway::state::AppState {
-        kubo: ipfs_s3_gateway::kubo::KuboClient::new(kubo.uri()),
-        cold_kubo: None,
-        store: ipfs_s3_gateway::store::Store::new(db),
-        credentials: HashMap::from([("test".to_owned(), s3s::auth::SecretKey::from("test"))]),
-        master_key: ipfs_s3_gateway::crypto::key::MasterKey::from_hex(&"0".repeat(64))
-            .expect("zero test master key"),
-        pinning: ipfs_s3_gateway::pinning::coordinator::PinningCoordinator::disabled_for_test(),
-    });
 
     let observed_http = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let server = start_s3_server(state.clone(), observed_http.clone()).await;
