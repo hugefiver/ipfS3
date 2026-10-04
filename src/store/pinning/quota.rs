@@ -333,8 +333,33 @@ pub async fn reserve_unique<C: ConnectionTrait>(
     limits: &ProviderLimitMap,
     now: DateTimeUtc,
 ) -> AppResult<ReservationOutcome> {
+    reserve_unique_for_intent(db, provider, cid, cid_size, limits, now, false).await
+}
+
+/// An existing waiter retains the *original* admission decision. Operator debt
+/// denies allocation, but cannot permanently erase this already queued target.
+pub(crate) async fn reserve_unique_for_waiter<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+    cid: &str,
+    cid_size: i64,
+    limits: &ProviderLimitMap,
+    now: DateTimeUtc,
+) -> AppResult<ReservationOutcome> {
+    reserve_unique_for_intent(db, provider, cid, cid_size, limits, now, true).await
+}
+
+async fn reserve_unique_for_intent<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+    cid: &str,
+    cid_size: i64,
+    limits: &ProviderLimitMap,
+    now: DateTimeUtc,
+    waiter: bool,
+) -> AppResult<ReservationOutcome> {
     for attempt in 0..SQLITE_RETRY_LIMIT {
-        match reserve_unique_attempt(db, provider, cid, cid_size, limits, now).await {
+        match reserve_unique_attempt(db, provider, cid, cid_size, limits, now, waiter).await {
             Ok(ReserveAttempt::Outcome(outcome)) => return Ok(outcome),
             Ok(ReserveAttempt::Retry) => retry_delay(attempt).await,
             Err(AppError::Database(message)) if is_sqlite_contention(&message) => {
@@ -428,6 +453,17 @@ async fn confirmed_release_inner<C: ConnectionTrait>(
     request_guard: RequestIdentityGuard<'_>,
     now: DateTimeUtc,
 ) -> AppResult<ConfirmedReleaseOutcome> {
+    if super::ledger::submission::has_debt(db, provider).await? {
+        return Ok(ConfirmedReleaseOutcome::Stale);
+    }
+    if let Some(row) = super::ledger::get(db, provider, cid).await?
+        && super::ledger::decode_route(&row)
+            .is_some_and(|route| super::ledger::submission::is_rpc(&route))
+        && (row.effect != "not_created"
+            || super::ledger::submission::matching_pin_held(db, provider, cid).await?)
+    {
+        return Ok(ConfirmedReleaseOutcome::Stale);
+    }
     let Some(remote) = remote_pin::Entity::find_by_id((provider.to_owned(), cid.to_owned()))
         .one(db)
         .await?
@@ -555,6 +591,9 @@ pub(crate) async fn evict_for_provider_waiter(
     limits: &ProviderLimits,
     now: DateTimeUtc,
 ) -> AppResult<Vec<leases::QuotaEvictedTarget>> {
+    if super::ledger::submission::has_debt(db, provider).await? {
+        return Ok(Vec::new());
+    }
     evict_for_required_headroom(db, provider, EvictionRequest::Waiter, limits, now).await
 }
 
@@ -630,7 +669,28 @@ async fn reserve_unique_attempt<C: ConnectionTrait>(
     cid_size: i64,
     limits: &ProviderLimitMap,
     now: DateTimeUtc,
+    waiter: bool,
 ) -> AppResult<ReserveAttempt> {
+    if super::ledger::allocation_cid(db, provider, cid).await? != cid {
+        return Err(invalid_quota(
+            "new RPC target must use the canonical allocation CID",
+        ));
+    }
+    match super::ledger::submission::admission_barrier(db, provider).await? {
+        super::ledger::submission::AdmissionBarrier::Temporary => {
+            return Ok(ReserveAttempt::Outcome(ReservationOutcome::QuotaWaiting {
+                evict: Vec::new(),
+            }));
+        }
+        super::ledger::submission::AdmissionBarrier::Operator => {
+            return Ok(ReserveAttempt::Outcome(if waiter {
+                ReservationOutcome::QuotaWaiting { evict: Vec::new() }
+            } else {
+                ReservationOutcome::QuotaBlocked
+            }));
+        }
+        super::ledger::submission::AdmissionBarrier::Clear => {}
+    }
     let provider_limits = provider_limits(limits, provider)?;
     if cid_size < 0 {
         return Err(invalid_quota("CID size cannot be negative"));
@@ -1644,9 +1704,17 @@ mod tests {
         order_events::clear();
 
         assert!(matches!(
-            reserve_unique_attempt(&db, "pinata", "bafy-order-absent", 10, &limits, time(3),)
-                .await
-                .unwrap(),
+            reserve_unique_attempt(
+                &db,
+                "pinata",
+                "bafy-order-absent",
+                10,
+                &limits,
+                time(3),
+                false
+            )
+            .await
+            .unwrap(),
             ReserveAttempt::Outcome(ReservationOutcome::Reserved)
         ));
         assert_eq!(
@@ -1670,9 +1738,17 @@ mod tests {
         order_events::clear();
 
         assert!(matches!(
-            reserve_unique_attempt(&db, "pinata", "bafy-order-held", 10, &limits, time(2),)
-                .await
-                .unwrap(),
+            reserve_unique_attempt(
+                &db,
+                "pinata",
+                "bafy-order-held",
+                10,
+                &limits,
+                time(2),
+                false
+            )
+            .await
+            .unwrap(),
             ReserveAttempt::Outcome(ReservationOutcome::Reused)
         ));
         assert_eq!(

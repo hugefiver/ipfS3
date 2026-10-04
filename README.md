@@ -16,7 +16,7 @@ An S3-compatible gateway backed by IPFS (Kubo). Translates S3 API calls into Kub
 - **Lifecycle Rules** — Expiration, incomplete multipart abort, and current/noncurrent `STANDARD -> STANDARD_IA` transitions to an optional independent cold Kubo
 - **Streaming** — Request and response bodies stream end to end; the documented exception is a Range read of an encrypted object, which decrypts the full object before slicing; chunk-level encrypted Range reads are planned for v0.8
 - **Dual Backend** — SQLite (dev) or PostgreSQL (prod) via sea-orm, with sequential schema migrations
-- **Remote Pinning** — Asynchronous Pinata/Filebase PSA pinning with ordered policies, durable work, leases, and local soft quotas
+- **Remote Pinning:** Asynchronous Pinata, Filebase PSA/RPC upload, and independent Kubo RPC pinning with ordered policies, durable work, leases, and local soft quotas
 - **Durable Import** — SigV4-authenticated CID or allowlisted HTTPS import with persisted progress, lease-based recovery, optional idempotency, optional ZIP extraction, and stale-publication fencing
 
 ## Hardening boundaries
@@ -775,7 +775,7 @@ complete example in `config.example.toml`. `config_name` joins the existing
 
 - `provider_id` is a stable administrative identity, not a display label.
   `display_name` and `config_name` may be renamed without changing existing
-  resource/job keys. `backend` is currently `pinata`, `filebase` or `noop`.
+  resource/job keys. `backend` is `pinata`, `filebase`, `kubo` or `noop`.
 - `scope` identifies an account/bucket/pinset, and `storage_domain` identifies
   its independent storage domain. They are administrator assertions, **not**
   derived from the URL, token or a token hash. Moving to another account/bucket
@@ -788,8 +788,9 @@ complete example in `config.example.toml`. `config_name` joins the existing
   `env:VARIABLE` reference matching `token_env`. Only the reference/revisions are
   persisted—never credentials, credential hashes or endpoint URLs.
 - `api_profile` must match the configured implementation: `pinata-v3`,
-  `pinata-legacy`, `pinata-psa`, `filebase-psa`, or `noop`; `strategy` must match
-  the configured CID/upload strategy. No implicit strategy fallback is added.
+   `pinata-legacy`, `pinata-psa`, `filebase-psa`, `kubo`, `filebase-rpc`, or `noop`;
+   `strategy` must match the configured strategy (RPC also supports Kubo CAR).
+   No implicit strategy fallback is added.
 - `cleanup` defaults to **`retain`** for explicit identities. Setting `managed`
   requests cleanup only for independently proven application-created resources
   in that scope. A PSA request ID or matching CID alone is not exclusive creation
@@ -947,6 +948,79 @@ tags. Stop new writes/workers, retain the decision rows and historical routes,
 and plan a compatible recovery before changing binaries. The Stage 2 rules for
 unknown ownership, retained capacity and historical routing still apply.
 
+### Scoped IPFS RPC providers (Stage 5)
+
+RPC providers are wired into the existing configuration and coordinator. They
+don't need another provider registry. Use `[[pinning.providers]]` for the route,
+`[[pinning_rpc.providers]]` for RPC options, and
+`[[pinning_identity.providers]]` for the stable identity. Both companion entries
+join the provider's `name` through `config_name`; policies still use that name.
+The commented examples in [`config.example.toml`](config.example.toml) keep the
+existing PSA/Pinata setup unchanged until explicitly enabled.
+
+| Route | Provider configuration | RPC profile / auth | Identity backend / api_profile |
+| --- | --- | --- | --- |
+| Independent Kubo | `kind = "ipfs_rpc"`, optional `api = "rpc"`, explicit `strategy = "cid"`, `"upload"` or `"car"`, required `endpoint` | `kubo` / `none`, `bearer` or `basic` | `kubo` / `kubo` |
+| Filebase RPC | `kind = "filebase"`, `api = "rpc"`, `strategy = "upload"`; default endpoint `https://rpc.filebase.io` | `filebase` / `bearer` only | `filebase` / `filebase-rpc` |
+| Historical Filebase PSA | `kind = "filebase"`, omitted `api` (or explicit `api = "psa"`, `strategy = "cid"`) | No RPC options | `filebase` / `filebase-psa` |
+
+Filebase PSA/upload and Filebase RPC/cid or CAR are rejected. Filebase CAR is
+not enabled by calling it experimental. Pinata V3, legacy and historical PSA
+routes remain available; changing the current route doesn't rewrite an old
+invocation or authorize a resend through RPC.
+
+RPC requires an explicit stable `provider_id`, `backend`, `scope`, independent
+`storage_domain`, and positive `credential_revision` / `endpoint_revision`.
+The identity's profile and strategy must match its route. Scope is an
+administrator assertion, not inferred from a URL or credential. Bump revisions
+when credentials (including a Basic username) or endpoints change, and use a new
+scope for another account/pinset. `cleanup` defaults to `retain`. A successful
+add/import, recursive pin, receipt or matching CID doesn't prove
+`ApplicationCreated` ownership or grant delete authority, even with `managed`.
+
+Secrets are environment references only. `token_env` on the provider names the
+Bearer token or Basic password variable; Basic also uses `username_env` on the
+RPC options entry. Identity `secret_ref = "env:VARIABLE"` must match `token_env`.
+For Kubo `auth = "none"`, omit `token_env`, `username_env` and `secret_ref`.
+RPC references use uppercase letters, digits and underscores. No example
+contains a real credential; don't put secret values in TOML, URLs or logs.
+Source Kubo, target RPC and public gateway credentials aren't interchangeable.
+
+`allow_private_network` defaults to `false`: public RPC requires HTTPS and
+public resolved addresses. Explicitly set it to `true` only for an authorized
+private target, such as an isolated loopback Kubo. All endpoint URLs reject
+userinfo, query strings and fragments. Redirects aren't followed, so credentials
+aren't forwarded to a redirected destination. Certificate verification stays
+enabled. Custom `tls_ca_pem`, `tls_client_cert_pem`, `tls_client_key_pem`, and
+`tls_insecure = true` are explicitly rejected, not silently ignored or supported.
+
+Kubo CID pinning needs the DAG available to the target. Upload streams the actual
+stored bytes from source Kubo (ciphertext for encrypted objects); it can't upload
+a directory with `cat(root)`. CAR transfers a complete single-root DAG and verifies
+the recursive root and local completeness. Filebase upload sends only
+`cid-version` and `wrap-with-directory=false`, not Kubo-specific `raw-leaves`,
+`chunker`, `pin=false` or `progress=true`; it doesn't append `pin/add` after add.
+CID comparison checks **codec and multihash**, allowing equivalent CIDv0/v1
+representations but rejecting a different DAG. It never rewrites an object's
+S3 ETag or stored CID. HTTP 200 plus a Hash isn't success if the stream's terminal
+record, EOF or trailer fails.
+
+Unknown effects and mismatched/reported roots remain durable in
+`pin_submit_observations`, alongside historical route and reservation evidence.
+They block automatic re-POST and deletion; a terminal job or expired lease doesn't
+erase that responsibility or manufacture quota headroom. Stop and drain **all old
+writers and workers on every replica**, back up the database, then apply
+`m20261004_000001_rpc_submission_ledger` and start only upgraded binaries. Don't
+mix versions, infer old scope from current TOML, clear evidence, or switch an old
+PSA job to RPC. The down migration explicitly refuses an unsafe downgrade;
+preserve the upgraded ledger and historical routes instead of dropping tables.
+
+**Acceptance is pending:** Stage 5 verification is currently running, not PASS.
+The [test commands and evidence boundaries](docs/testing.md#stage-5-rpc-verification)
+separate config/worker/publication/diagnostic checks from real leaf RPC testing.
+Basic/Bearer headers sent to anonymous Kubo don't prove authentication enforcement
+or Filebase account access. Real Filebase/Pinata account tests remain **NOT RUN**.
+
 ### Policies and coordination
 
 Policies use ordered first-match evaluation. A rule matches an exact bucket or
@@ -958,9 +1032,11 @@ every provider named by the rule.
 
 The durable worker coordinates retries per unique provider/CID request, not
 once per lease. Failed requests use bounded backoff and stop after eight failed
-attempts. When a crash-recovered `Submit` job is ambiguous, the worker performs
-a provider `find` before another `POST`; the local quota reservation remains
-held while that ambiguity is unresolved.
+attempts. For historical PSA/Pinata routes, an ambiguous crash-recovered `Submit`
+job uses provider `find` before another `POST`; the local quota reservation
+remains held while that ambiguity is unresolved. RPC uses typed observations and
+captured routes instead: unknown effects or mismatched resources block automatic
+re-POST, not a guessed PSA Find or strategy fallback.
 
 ### Standard S3 tag control
 
@@ -1034,7 +1110,7 @@ s3s (SigV4 verify + standard S3 dispatch + custom S3Route)
     │   ├── ops/bucket.rs     → store/bucket.rs   (sea-orm)
     │   ├── ops/object.rs     → store/object.rs   + kubo/add,cat,pin + crypto
     │   ├── ops/multipart.rs  → store/multipart.rs + kubo + crypto
-    │   └── pinning/          → PSA clients + durable jobs + policy/lease coordination
+    │   └── pinning/          → Pinata/PSA/RPC clients + durable jobs + policy/lease coordination
     │
     └── GatewayRoute (composite custom route)
         ├── ImportObjectRoute → persisted import jobs and status XML

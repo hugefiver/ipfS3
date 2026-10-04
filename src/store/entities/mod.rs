@@ -19,6 +19,7 @@ pub mod pin_job;
 pub mod pin_lease;
 pub mod pin_lease_target;
 pub mod pin_provider_usage;
+pub mod pin_submit_observation;
 pub mod remote_pin;
 pub mod residency_backfill;
 pub mod residency_reference;

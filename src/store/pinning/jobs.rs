@@ -34,6 +34,7 @@ const MIN_SUBMIT_RECOVERY_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_SUBMIT_RECOVERY_BACKOFF: Duration = Duration::from_secs(300);
 const MAX_SQLITE_CLAIM_RETRIES: usize = 4;
 const PARKED_RECONCILE_REASON: &str = "submit requires operator attention";
+pub(crate) const RPC_RECOVERY_PARK_REASON: &str = "RPC side effects require operator attention";
 
 /// Minimal Stage 1 execution history. Secrets and arbitrary provider text never enter it.
 pub mod history {
@@ -79,6 +80,13 @@ pub async fn resume_rejected_submit_after_repair<C: ConnectionTrait + Transactio
     now: DateTimeUtc,
 ) -> AppResult<bool> {
     let txn = db.begin().await?;
+    if super::ledger::submission::latest(&txn, id)
+        .await?
+        .is_some_and(|row| row.needs_attention)
+    {
+        txn.rollback().await?;
+        return Ok(false);
+    }
     let updated = pin_job::Entity::update_many()
         .col_expr(pin_job::Column::UpdatedAt, Expr::value(now))
         .filter(pin_job::Column::Id.eq(id))
@@ -151,8 +159,25 @@ pub async fn record_submit_invocation<C: ConnectionTrait>(
     if !fence_job_claim(db, &claimed.model.id, claimed_lock(&claimed.model)?).await? {
         return Err(stale_claim_error(&claimed.model.id));
     }
+    if super::ledger::submission::latest(db, &claimed.model.id)
+        .await?
+        .is_some_and(|row| row.outcome != "not_submitted")
+    {
+        return Err(invalid_job(
+            "RPC invocation has unreconciled effects; repeated POST is unsafe",
+        ));
+    }
     // Preserve the previous Submit effect for the lifetime fence. A retry's
     // `not_created` evidence is lost as soon as history becomes `unknown`.
+    if super::ledger::submission::is_rpc_api(api)
+        && let Some(row) =
+            super::ledger::get(db, &claimed.model.provider, &claimed.model.cid).await?
+        && !super::ledger::submission::held_evidence_known(db, &row).await?
+    {
+        return Err(invalid_job(
+            "historical RPC resource lacks fenced submission evidence",
+        ));
+    }
     super::ledger::advance_submit_invocation_epoch(db, claimed, api, strategy).await?;
     let old = submission_history(db, &claimed.model.id).await?;
     if let Some(old) = old {
@@ -364,7 +389,82 @@ async fn park_submit_in_transaction(
     if updated.rows_affected != 1 {
         return Err(stale_claim_error(&claimed.model.id));
     }
+    // A late receipt may have committed after recovery read `in_flight` but
+    // before this exact claim parked. Serialize both orders on the job first.
+    if state == "needs_attention" && safe_error == RPC_RECOVERY_PARK_REASON {
+        super::ledger::submission::wake_matching_parked(db, &claimed.model.id, now).await?;
+    }
     Ok(())
+}
+
+/// Receipt appends must lock even a *different* current claim before touching
+/// history/remote/evidence. A failed old-claim predicate does not lock a PG row.
+pub(crate) async fn lock_submit_receipt<C: ConnectionTrait>(
+    db: &C,
+    id: &str,
+) -> AppResult<Option<pin_job::Model>> {
+    pin_job::Entity::update_many()
+        .col_expr(
+            pin_job::Column::LockedUntil,
+            Expr::col(pin_job::Column::LockedUntil).into(),
+        )
+        .filter(pin_job::Column::Id.eq(id))
+        .exec(db)
+        .await?;
+    history::Entity::update_many()
+        .col_expr(
+            history::Column::State,
+            Expr::col(history::Column::State).into(),
+        )
+        .filter(history::Column::JobId.eq(id))
+        .exec(db)
+        .await?;
+    Ok(pin_job::Entity::find_by_id(id.to_owned()).one(db).await?)
+}
+
+/// Only the exact RPC attention park can become due local recovery. Never
+/// mutate another caller's live claim or change the captured invocation.
+pub(crate) async fn wake_rpc_receipt<C: ConnectionTrait>(
+    db: &C,
+    job: &pin_job::Model,
+    submit_call: i32,
+    now: DateTimeUtc,
+) -> AppResult<bool> {
+    let changed = pin_job::Entity::update_many()
+        .col_expr(pin_job::Column::State, Expr::value(STATE_PENDING))
+        .col_expr(pin_job::Column::NextAttemptAt, Expr::value(now))
+        .col_expr(
+            pin_job::Column::LastError,
+            Expr::value(Option::<String>::None),
+        )
+        .col_expr(pin_job::Column::UpdatedAt, Expr::value(now))
+        .filter(pin_job::Column::Id.eq(&job.id))
+        .filter(pin_job::Column::Operation.eq("submit"))
+        .filter(pin_job::Column::State.eq(STATE_RUNNING))
+        .filter(pin_job::Column::SubmitPhase.eq(SUBMIT_PHASE_RECOVERING))
+        .filter(pin_job::Column::LockedUntil.is_null())
+        .filter(pin_job::Column::LastError.eq(RPC_RECOVERY_PARK_REASON))
+        .filter(pin_job::Column::Provider.eq(&job.provider))
+        .filter(pin_job::Column::Cid.eq(&job.cid))
+        .filter(pin_job::Column::LeaseId.eq(job.lease_id.clone()))
+        .filter(pin_job::Column::TargetId.eq(job.target_id.clone()))
+        .filter(pin_job::Column::ExpectedGeneration.eq(job.expected_generation))
+        .exec(db)
+        .await?;
+    if changed.rows_affected != 1 {
+        return Ok(false);
+    }
+    let changed = history::Entity::update_many()
+        .col_expr(history::Column::State, Expr::value("active"))
+        .filter(history::Column::JobId.eq(&job.id))
+        .filter(history::Column::SubmitCalls.eq(submit_call))
+        .filter(history::Column::State.eq("needs_attention"))
+        .exec(db)
+        .await?;
+    if changed.rows_affected != 1 {
+        return Err(stale_claim_error(&job.id)); // caller transaction rolls back the job CAS too
+    }
+    Ok(true)
 }
 
 pub async fn begin_recovery_query<C: ConnectionTrait + TransactionTrait>(
@@ -1452,6 +1552,14 @@ pub async fn record_submit_recovery_no_match<C: ConnectionTrait>(
     let job = &claimed.model;
     let locked_until = claimed_lock(job)?;
     validate_claimed_submit(job)?;
+    if super::ledger::submission::latest(db, &job.id)
+        .await?
+        .is_some_and(|row| row.outcome != "not_submitted" || row.needs_attention)
+    {
+        return Err(invalid_job(
+            "expected CID absence cannot erase RPC side effects",
+        ));
+    }
     if canonical_desired_target(db, &job.provider, &job.cid)
         .await?
         .is_none()

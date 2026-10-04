@@ -20,6 +20,62 @@ use crate::{
 
 pub use crate::pinning::identity::Ownership;
 
+#[path = "submission.rs"]
+pub mod submission;
+pub use crate::store::entities::pin_submit_observation as submission_entity;
+
+/// New RPC allocations use CIDv1/base32 keys, never object metadata/ETags.
+/// Existing aliases are not silently rekeyed using today's configuration.
+pub async fn allocation_cid<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+    cid: &str,
+) -> AppResult<String> {
+    let route = pin_provider_route::Entity::find_by_id(provider.to_owned())
+        .one(db)
+        .await?;
+    let Some(route) = route else {
+        return Ok(cid.to_owned());
+    };
+    let route: ProviderRouteSnapshot = serde_json::from_str(&route.snapshot)
+        .map_err(|_| AppError::InvalidPinningRequest("invalid allocation route".into()))?;
+    if route.resource_type() != crate::pinning::identity::RemoteResourceType::RpcPin {
+        return Ok(cid.to_owned());
+    }
+    let canonical = crate::pinning::provider::canonical_resource_cid(cid)
+        .map_err(|_| AppError::InvalidPinningRequest("invalid RPC resource CID".into()))?;
+    // Unknown historical aliases cannot be converted into new scope/ownership.
+    let remotes = crate::store::entities::remote_pin::Entity::find()
+        .filter(crate::store::entities::remote_pin::Column::Provider.eq(provider))
+        .all(db)
+        .await?;
+    for remote in remotes {
+        if remote.cid != canonical
+            && crate::pinning::provider::cids_equivalent(&remote.cid, &canonical).unwrap_or(false)
+        {
+            return Err(AppError::InvalidPinningRequest(
+                "historical RPC CID alias requires explicit migration".into(),
+            ));
+        }
+    }
+    // Job/remote deletion is not proof that an older alias had no side effects.
+    // Do not assign today's registration or ownership to that historical row.
+    for evidence in remote_pin_ledger::Entity::find()
+        .filter(remote_pin_ledger::Column::Provider.eq(provider))
+        .all(db)
+        .await?
+    {
+        if evidence.cid != canonical
+            && crate::pinning::provider::cids_equivalent(&evidence.cid, &canonical).unwrap_or(false)
+        {
+            return Err(AppError::InvalidPinningRequest(
+                "historical RPC ledger alias requires explicit migration".into(),
+            ));
+        }
+    }
+    Ok(canonical)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LedgerEffect {
@@ -683,6 +739,13 @@ pub async fn cleanup_allowed<C: ConnectionTrait>(
     let Some(row) = get(db, provider, cid).await? else {
         return legacy_unregistered_store(db, provider).await;
     };
+    // Stage 5 RPC receipts prove pin state, never exclusive creation. In
+    // particular an opaque RPC request id must not become CID-based delete authority.
+    if decode_route(&row).is_some_and(|route| {
+        route.resource_type() == crate::pinning::identity::RemoteResourceType::RpcPin
+    }) {
+        return Ok(false);
+    }
     Ok(row.ownership == "application_created"
         && decode_route(&row).is_some_and(|route| route.cleanup == CleanupMode::Managed))
 }

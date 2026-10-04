@@ -1,5 +1,62 @@
 use std::{collections::BTreeMap, time::Duration};
 
+use crate::pinning::identity::{Ownership, RemoteResourceType};
+
+/// Submission evidence survives errors and historical adapters. An error class
+/// alone is not proof that a dispatched RPC write had no side effects.
+#[derive(Debug)]
+pub struct SubmitObservation {
+    pub result: Result<RemotePin, ProviderError>,
+    pub resources: Vec<ObservedResource>,
+    pub effect: SubmitEffect,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ObservedResource {
+    pub resource_type: RemoteResourceType,
+    pub cid: String,
+    pub request_id: String,
+    pub status: ObservedResourceStatus,
+    pub ownership: Ownership,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservedResourceStatus {
+    Reported,
+    Stored,
+    PinAccepted,
+    PinError,
+    RecursiveVerified,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubmitEffect {
+    NotSubmitted,
+    Observed,
+    Unknown,
+}
+
+/// Canonicalize only a ledger/comparison CID; never rewrite object CIDs/ETags.
+pub fn canonical_cid(value: &str) -> Result<String, ProviderError> {
+    let cid = cid::Cid::try_from(value).map_err(|_| ProviderError {
+        class: ProviderErrorClass::InvalidInput,
+        message: "invalid resource CID".into(),
+        retry_after: None,
+    })?;
+    Ok(cid::Cid::new_v1(cid.codec(), *cid.hash()).to_string())
+}
+
+/// Explicit ledger name retained for the store/worker shared interface.
+pub fn canonical_resource_cid(value: &str) -> Result<String, ProviderError> {
+    canonical_cid(value)
+}
+
+pub fn cids_equivalent(left: &str, right: &str) -> Result<bool, ProviderError> {
+    Ok(canonical_cid(left)? == canonical_cid(right)?)
+}
+
 #[async_trait::async_trait]
 pub trait PinningProvider: Send + Sync + 'static {
     fn name(&self) -> &str;
@@ -37,6 +94,22 @@ pub trait PinningProvider: Send + Sync + 'static {
     }
 
     async fn submit(&self, request: SubmitPin) -> Result<RemotePin, ProviderError>;
+
+    /// Legacy providers retain their existing rejection/unknown classification.
+    /// RPC implementations override this to preserve resource-level evidence.
+    async fn submit_observed(&self, request: SubmitPin) -> SubmitObservation {
+        let result = self.submit(request).await;
+        let effect = match &result {
+            Ok(_) => SubmitEffect::Observed,
+            Err(error) if error.definitely_not_submitted() => SubmitEffect::NotSubmitted,
+            Err(_) => SubmitEffect::Unknown,
+        };
+        SubmitObservation {
+            result,
+            resources: Vec::new(),
+            effect,
+        }
+    }
 
     async fn get(&self, request_id: &str) -> Result<RemotePin, ProviderError>;
 
@@ -114,6 +187,16 @@ impl PinningProvider for HistoricalProvider {
         }
         self.inner.submit(request).await
     }
+    async fn submit_observed(&self, request: SubmitPin) -> SubmitObservation {
+        if self.inner.invocation_route() != self.invocation_route() {
+            return SubmitObservation {
+                result: Err(historical_route_error()),
+                resources: Vec::new(),
+                effect: SubmitEffect::NotSubmitted,
+            };
+        }
+        self.inner.submit_observed(request).await
+    }
     async fn get(&self, id: &str) -> Result<RemotePin, ProviderError> {
         self.inner.get_historical(id, self.api, self.strategy).await
     }
@@ -134,6 +217,14 @@ impl PinningProvider for HistoricalProvider {
         strategy: &str,
     ) -> Result<Vec<RemotePin>, ProviderError> {
         self.inner.find_historical(query, api, strategy).await
+    }
+    async fn observe_historical(
+        &self,
+        query: FindPin,
+        api: &str,
+        strategy: &str,
+    ) -> Result<QueryObservation, ProviderError> {
+        self.inner.observe_historical(query, api, strategy).await
     }
 }
 

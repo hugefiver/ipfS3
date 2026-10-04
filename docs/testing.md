@@ -135,6 +135,137 @@ cargo test --test zip_v2_mpu_complete -- --ignored --test-threads=1
 cargo test --test import_zip_v2_acceptance -- --ignored --test-threads=1
 ```
 
+## Stage 5 RPC verification
+
+**Status: Stage 5 implementation and isolated-backend acceptance passed.**
+The approved Stage 5 section of
+[`2026-09-20-pinning-zip-unixfs.md`](superpowers/plans/2026-09-20-pinning-zip-unixfs.md)
+is the acceptance authority. The commands below are entry points, not results.
+Don't count an ignored test, compilation-only run or mock response as live
+provider evidence. Real Filebase/Pinata account tests remain **NOT RUN**.
+
+The implemented configuration uses `[[pinning.providers]]` plus
+`[[pinning_rpc.providers]]` joined by `config_name`, with explicit
+`[[pinning_identity.providers]]`. No extra registry is needed. For exact examples
+and safety constraints, see [`config.example.toml`](../config.example.toml) and
+the [RPC usage section](../README.md#scoped-ipfs-rpc-providers-stage-5).
+
+```powershell
+cargo test --test rpc_provider_config
+cargo test --test rpc_submission_ledger
+cargo test --test rpc_publication_cids
+cargo test --locked --offline --test rpc_recovery_availability
+cargo test --test rpc_diagnostics
+cargo test --locked --offline --test rpc_stage5_http
+cargo test --lib pinning::ipfs_rpc::
+cargo test --lib pinning::
+cargo test --lib kubo::
+cargo test --test integration
+cargo test --test lifecycle_transition_car_proxy
+```
+
+The focused targets have distinct evidence boundaries:
+
+- `rpc_provider_config`: actual config parsing/coordinator construction, Kubo
+  cid/upload/car and auth matrix, old Filebase PSA compatibility, rejected
+  Filebase strategies/auth, URL/private-network/TLS restrictions, identities and
+  source/target credential isolation. Its Filebase HTTP requests use mocks.
+- `rpc_submission_ledger`: typed effects/resource evidence, retained quota debt,
+  unknown/mismatch roots, stale claims/epochs, atomic observation persistence and
+  unsafe downgrade refusal. Default coverage uses SQLite. Its PostgreSQL case
+  is ignored and requires an explicitly selected disposable test database.
+- `rpc_recovery_availability`: healthy in-flight allocation waits, late-receipt
+  recovery under a new claim, coherent admission snapshots and negative lifetime
+  fences. Its PostgreSQL opt-in also checks native timestamp precision without
+  weakening the exact claim predicate.
+- `rpc_publication_cids`: scoped canonical RPC targets, equivalent CIDv0/v1
+  reservations, shared logical references, historical debt and route fencing,
+  including legacy/v2 ZIP publication. Original object/version CIDs and S3
+  ETags must remain unchanged; canonical target planning isn't object rewriting.
+- `rpc_diagnostics`: real local CLI subprocess output and credential/username/URL
+  redaction, configured route capabilities and denied unsupported combinations.
+  These config-only commands don't connect to a database or probe a remote
+  provider; configured support isn't account permission or a verification receipt.
+- `rpc_stage5_http`: real SigV4 requests through registered `AppState`, standard
+  publication and the actual pinning worker, with loopback HTTP source/target
+  fixtures and the submission ledger. Its two tests cover shared CID allocation,
+  stored SSE-C ciphertext, MPU and ZIP entries, unchanged public object identity,
+  and evidence surviving terminal-job deletion. This is not a live provider
+  account or production `main` test.
+
+For PostgreSQL ledger coverage, provision a dedicated authorized test database
+through `IPFS_S3_TEST_POSTGRES_URL`, then run the exact ignored case. Never use a
+production database:
+
+```powershell
+cargo test --test rpc_submission_ledger postgres_rpc_submission_evidence_is_real_not_silently_skipped -- --ignored --exact --nocapture --test-threads=1
+```
+
+For the separate recovery PostgreSQL case, select a newly authorized loopback
+database through `IPFS_S3_TEST_RPC_RECOVERY_POSTGRES_URL`:
+
+```powershell
+cargo test --locked --offline --test rpc_recovery_availability postgres_actual_worker_receipt_lock_order_and_recoverable_waiters -- --ignored --exact --nocapture
+```
+
+The real leaf RPC runner needs Docker, PowerShell 7, cached
+`ipfs/kubo:v0.43.0`, and already-available offline Cargo dependencies. It doesn't
+pull images or install software. It creates two fresh repositories on a Docker
+internal network, uses offline daemons with external discovery disabled, and
+exposes only random loopback RPC ports. The output parent must already exist;
+logs/summary are kept there, and cleanup is limited to this run's labeled
+containers, volumes and network.
+
+```powershell
+pwsh -NoProfile -File tests/run-ipfs-rpc-real.ps1
+```
+
+The runner selects the ignored `rpc_provider_real_transports_and_local_dags`
+case in `ipfs_rpc_real`. Its scope is
+**leaf provider transport, exact DAG and stored bytes**, not production `main`,
+configuration/worker integration or signed S3 SDK acceptance. It checks empty,
+small/raw and multiblock files, an arbitrary-chunker upload mismatch followed by
+CAR, gateway-crypto ciphertext, complete directory CAR, and a preexisting shared
+pin. CID mode uses explicit unpinned CAR preseed, not public swarm retrieval.
+Recursive target pins, local DAG completeness and target reads after stopping
+the source are the real-node boundary. This leaf test doesn't prove actual S3
+MPU/ZIP request handling; gateway-crypto ciphertext isn't an SSE-S3/SSE-C SDK test.
+
+Basic/Bearer requests to the anonymous Kubo nodes exercise header transport only.
+They **don't prove authentication enforcement**, a TLS/auth reverse proxy, or
+Filebase account access. Filebase add, strict CID, account pin and public gateway
+bytes require a separately authorized real-account run and remain **NOT RUN**.
+The implementation uses only Filebase's supported upload parameters and doesn't
+follow add with `pin/add`; mock coverage can't establish the account's plan or
+paid capabilities. No Filebase CAR acceptance is claimed.
+
+The isolated two-node runner completed with exit 0 in run
+`24c5b32e5a224c1cb57be7784c564cd2`: the real matrix passed once, all eight roots
+remained readable offline after source shutdown, and exact owned-resource cleanup
+passed. The separate registered-worker/SigV4 target passed both tests.
+
+The concurrent admission and late-receipt findings were fixed and accepted in
+focused review. Latest affected targets passed 28 executions, with two PostgreSQL
+cases ignored by default; recovery PostgreSQL was separately executed on 17.11
+and passed, including the new single-statement snapshot and exact SQL timestamp
+fence. The prior nanosecond-versus-microsecond failure was reproduced by restoring
+the Rust comparison, not addressed with tolerance or longer waits. Latest pinning
+library coverage passed 460 tests and integration passed 165; fmt, strict
+all-targets Clippy, Rust 1.92 check and diff-check passed. The earlier complete
+library run passed 1400 tests with one ignored before these focused corrections;
+it is not presented as a post-correction full-library run. Disposable databases
+and exact owned container inventories were cleaned. These are test execution
+counts and bounded evidence, not account authorization or continuous availability.
+
+Across these checks, HTTP 200 plus Hash must not hide EOF/trailer or stream
+failures. Strict comparison includes codec and multihash, not textual equality
+alone. Unknown effects and mismatched resources must remain persisted and block
+automatic re-POST/deletion; matching CID or recursive pin doesn't imply
+`ApplicationCreated`. Stop/drain old writers and workers before the RPC ledger
+migration and retain the evidence afterward: a refused down migration must not
+be bypassed by dropping tables. Inspect run summaries, failures and cleanup
+receipts before recording a result; commands alone are not acceptance evidence.
+
 ## Environment-backed and deep checks
 
 Run the relevant command when its external environment is available:

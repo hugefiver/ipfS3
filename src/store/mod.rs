@@ -120,6 +120,9 @@ mod migrator {
                 Box::new(
                     crate::store::migrations::m20260927_000007_zip_v2_mpu_completion::Migration,
                 ),
+                Box::new(
+                    crate::store::migrations::m20261004_000001_rpc_submission_ledger::Migration,
+                ),
             ]
         }
     }

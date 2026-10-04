@@ -39,6 +39,11 @@ pub struct Config {
     #[serde(default)]
     pub pinning_identity: PinningIdentityConfig,
 
+    /// RPC-only options keyed by provider config_name; legacy provider literals
+    /// and TOML remain source/schema compatible.
+    #[serde(default)]
+    pub pinning_rpc: crate::pinning::ipfs_rpc::RpcProviderRegistry,
+
     #[serde(default)]
     pub imports: ImportConfig,
 
@@ -388,6 +393,7 @@ impl Config {
             pinning: default_pinning_config(),
             pinning_control: PinningControlConfig::default(),
             pinning_identity: PinningIdentityConfig::default(),
+            pinning_rpc: crate::pinning::ipfs_rpc::RpcProviderRegistry::default(),
             imports: ImportConfig::default(),
             lifecycle: default_lifecycle_config(),
             decompress_zip: DecompressZipConfig::default(),

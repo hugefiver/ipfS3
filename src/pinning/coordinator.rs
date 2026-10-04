@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::OptionalPinControlMode;
 use crate::kubo::KuboClient;
 use crate::pinning::{
-    config::{ProviderKind, ProviderLimitMap, ValidatedPinningConfig},
+    config::{ProviderKind, ProviderLimitMap, ValidatedPinningConfig, ValidatedProvider},
     filebase::build_filebase,
     identity::ProviderIdentity,
     noop::NoopProvider,
@@ -23,6 +23,27 @@ use crate::store::pinning::jobs::POLL_INTERVAL;
 use crate::zip::extract::ZipExtractionLimits;
 
 pub use crate::pinning::worker::PinningWorkerHandle;
+
+/// Also used by worker historical adapters. No network IO or source-token reuse.
+pub(crate) fn build_rpc_provider(
+    provider: &ValidatedProvider,
+    kubo: Option<KuboClient>,
+) -> anyhow::Result<crate::pinning::ipfs_rpc::IpfsRpcProvider> {
+    let options = provider
+        .rpc
+        .as_ref()
+        .context("validated RPC provider is missing its options")?;
+    crate::pinning::ipfs_rpc::IpfsRpcProvider::from_config(
+        provider.name.clone(),
+        provider
+            .endpoint
+            .clone()
+            .unwrap_or_else(|| "https://rpc.filebase.io".into()),
+        kubo,
+        options,
+    )
+    .map_err(Into::into)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerSettings {
@@ -226,9 +247,11 @@ impl PinningCoordinator {
             let kind = provider.kind;
             let min_request_interval = match kind {
                 ProviderKind::Noop => Duration::ZERO,
-                ProviderKind::Pinata | ProviderKind::Filebase => Duration::from_secs_f64(
-                    1.0 / f64::from(provider.requests_per_second.unwrap_or(1)),
-                ),
+                ProviderKind::Pinata | ProviderKind::Filebase | ProviderKind::IpfsRpc => {
+                    Duration::from_secs_f64(
+                        1.0 / f64::from(provider.requests_per_second.unwrap_or(1)),
+                    )
+                }
             };
             provider_runtime.insert(
                 name.clone(),
@@ -241,6 +264,10 @@ impl PinningCoordinator {
                 },
             );
             let implementation: Arc<dyn PinningProvider> = match provider.kind {
+                ProviderKind::IpfsRpc => Arc::new(build_rpc_provider(&provider, kubo.clone())?),
+                ProviderKind::Filebase if provider.rpc.is_some() => {
+                    Arc::new(build_rpc_provider(&provider, kubo.clone())?)
+                }
                 ProviderKind::Pinata => Arc::new(build_pinata_with_options(
                     provider.name,
                     provider

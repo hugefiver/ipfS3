@@ -106,6 +106,8 @@ max_pins = 10000
 [[pinning.providers]]
 name = "filebase-primary"
 kind = "filebase"
+# Omitted api remains historical PSA/cid, NOT RPC. Explicit api = "psa" and
+# strategy = "cid" are also accepted; PSA/upload is rejected.
 token_env = "FILEBASE_PINNING_TOKEN"
 priority = 20
 max_bytes = 107374182400
@@ -170,3 +172,108 @@ providers = ["pinata-primary", "filebase-primary"]
 default_duration = "30d"
 max_duration = "365d"
 allow_decompressed = true
+
+# Stage 5 opt-in RPC examples. All lines below are commented out, so the existing
+# PSA/Pinata routes and policy above are unchanged. Enable each provider/options/
+# identity triple together and explicitly select its name in a policy. Reuse the
+# existing [pinning_identity] table; don't create a second identity registry.
+# RPC requires an explicit identity, positive revisions and an independent domain.
+# Scope/backend are administrator assertions, not inferred from endpoint/token.
+# Bump credential_revision for password/token/Basic username changes and
+# endpoint_revision for endpoint changes. Another account/pinset needs a new scope.
+# cleanup defaults to retain. An add/import/recursive pin/matching CID does NOT
+# establish ApplicationCreated ownership, even if cleanup is set to managed.
+# Stop/drain all old writers/workers and back up before the RPC ledger migration;
+# mixed versions and dangerous down/table deletion are unsupported.
+# Stage 5 verification is running; this example isn't a PASS or account receipt.
+
+# Independent private Kubo: cid, upload or car (explicit strategy required).
+# cid needs target access to the DAG; upload uses stored bytes, not S3 plaintext.
+# Directories require complete single-root CAR, not cat(root) byte upload.
+# [[pinning.providers]]
+# name = "kubo-backup"
+# kind = "ipfs_rpc"
+# api = "rpc"
+# strategy = "car"
+# endpoint = "http://127.0.0.1:5002"
+# priority = 30
+# max_bytes = 107374182400
+# max_pins = 10000
+#
+# [[pinning_rpc.providers]]
+# config_name = "kubo-backup" # joins pinning.providers.name
+# profile = "kubo"
+# auth = "none" # omit token_env, username_env and identity secret_ref
+# allow_private_network = true # explicit authorization for this private target
+# connect_timeout_seconds = 30
+# control_timeout_seconds = 300
+# idle_timeout_seconds = 120
+#
+# [[pinning_identity.providers]]
+# config_name = "kubo-backup"
+# provider_id = "kubo-backup-prod"
+# display_name = "Independent Kubo backup"
+# backend = "kubo" # kind is ipfs_rpc, identity backend is kubo
+# scope = "node:backup"
+# storage_domain = "kubo:backup"
+# credential_revision = 1
+# endpoint_revision = 1
+# api_profile = "kubo"
+# strategy = "car"
+# cleanup = "retain"
+#
+# Kubo Bearer alternative: set auth = "bearer" in its RPC entry, add
+# token_env = "KUBO_BACKUP_TOKEN" to its provider, and add
+# secret_ref = "env:KUBO_BACKUP_TOKEN" to its identity.
+# Kubo Basic alternative: set auth = "basic" and
+# username_env = "KUBO_BACKUP_USERNAME" in the RPC entry; add
+# token_env = "KUBO_BACKUP_PASSWORD" to its provider and
+# secret_ref = "env:KUBO_BACKUP_PASSWORD" to its identity.
+# These are environment variable NAMES only, not secret values. Provision them
+# outside TOML; references accept uppercase letters, digits and underscores.
+# Never reuse source-node credentials or forward RPC credentials to a gateway.
+
+# Filebase RPC: upload only, Bearer only. This does not replace filebase-primary's
+# historical PSA route. Real Filebase/Pinata account tests remain NOT RUN.
+# [[pinning.providers]]
+# name = "filebase-rpc-backup"
+# kind = "filebase"
+# api = "rpc"
+# strategy = "upload"
+# endpoint = "https://rpc.filebase.io" # also the default for this route
+# token_env = "FILEBASE_RPC_TOKEN"
+# priority = 40
+# max_bytes = 107374182400
+# max_pins = 10000
+#
+# [[pinning_rpc.providers]]
+# config_name = "filebase-rpc-backup"
+# profile = "filebase"
+# auth = "bearer"
+# allow_private_network = false
+#
+# [[pinning_identity.providers]]
+# config_name = "filebase-rpc-backup"
+# provider_id = "filebase-rpc-prod"
+# display_name = "Filebase RPC backup"
+# backend = "filebase"
+# scope = "bucket:backup"
+# storage_domain = "filebase:backup"
+# credential_revision = 1
+# endpoint_revision = 1
+# secret_ref = "env:FILEBASE_RPC_TOKEN"
+# api_profile = "filebase-rpc"
+# strategy = "upload"
+# cleanup = "retain"
+#
+# Public RPC requires HTTPS/public resolved addresses; private networking defaults
+# to denied. No endpoint may contain userinfo/query/fragment. Redirects aren't
+# followed and don't forward credentials. Certificate verification remains on.
+# Unsupported and explicitly rejected: tls_ca_pem, tls_client_cert_pem,
+# tls_client_key_pem, tls_insecure = true. Don't add these as working TLS options.
+# Filebase sends official cid-version/wrap-with-directory parameters only, not
+# raw-leaves/chunker/pin=false/progress=true, and never appends pin/add after add.
+# Filebase RPC cid/CAR and PSA upload are rejected; no automatic fallback.
+# Codec + multihash must match (equivalent CIDv0/v1 is allowed). S3 ETag/CID stays
+# unchanged. Unknown/mismatch footprints remain durable and block automatic
+# re-POST/deletion; timeout/terminal job/lease expiry doesn't release that debt.

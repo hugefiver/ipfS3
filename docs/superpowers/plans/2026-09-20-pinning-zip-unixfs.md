@@ -1,6 +1,6 @@
 # Pinning、ZIP 产物与 UnixFS 目录根：统一实施计划
 
-日期：2026-09-20。状态：计划已通过审查；Stage 1–2 已分别提交，Stage 3 已通过限定验收并随本阶段提交；Stage 4 的公共合同已由用户确认。
+日期：2026-09-20。状态：计划已通过审查；Stage 1–4 已分别验收并提交，Stage 5 已完成实现及隔离后端验收、随本阶段提交；Stage 6–8 尚未验收。
 
 本文件是本轮唯一权威设计/实施/进度计划；不另建 spec，不单独提交计划。需求来源为用户提供的 `ipfs3_review_report.md`（2026-09-17）及最新 R24 确认。本轮基线为 `master@d3bf5cf`；规划时已确认工作区 clean、与 origin/master 一致，本轮不执行 push。
 
@@ -368,11 +368,11 @@ cargo test --test integration
 | 1 | 已提交 | lib 1187 passed / 1 ignored；bin 13、integration 164、真实日志 2；PG 并发 3 passed；pinning 定向 352 passed | 未执行真实 Pinata/Filebase 账号写入；完整身份/账户 scope 模型留给 Stage 2 | `2c948dd` |
 | 2 | 已验收 | lib 1196 passed / 1 ignored、integration 164；Stage 2 专项默认测试通过；隔离 PG 17 迁移/并发/交接 9 passed；fmt、clippy `--all-targets -D warnings` 与限定复核通过 | 曾有一次 PG 路由缺失间歇错误，受控提交/回滚可见性实验与后续整合未再现，根因仍未确认；真实 provider 账号写入未执行 | `556c8e4` |
 | 3 | 已验收 | 同一整合命令共 1443 passed / 1 ignored / 0 failed（lib 1250、integration 165），fmt、clippy `--all-targets -D warnings`、diff-check；双进程 SigV4 MPU 1/1；隔离 PG17 schema 5/5、route 交错 2/2；限定复核无剩余 Critical/Important | 新 Noop 改动尚未 PG 实跑；真实 Pinata/Filebase 账号、import 跨进程、全量 F1 未验，Stage 2 PG 旧 route 间歇错误根因仍未确认；import `202` 仅 accepted | `ba06d45` |
-| 4 | 已验收，随本阶段提交 | 真实 Kubo 0.43.0 目录 4/4、PG17.11 opt-in 15 个独立用例、R23 显式负载 1/1、独立 OS 进程 import artifact 恢复 1/1；选定整合 1852 passed / 4 ignored；最后三项 Important 修复后受影响 targets 198 passed / 1 ignored；当前 fmt、Rust 1.92 MSRV、严格 all-targets clippy 通过，限定复核无剩余 Critical/Important | 首次构根取消只保留原 claim 的候选，不采用或发布；MPU 扁平 capture 恢复与 source CID 统一预锁已闭合。取消测试的并行 gate 排队问题以 fixture 入场隔离修复，未放宽生产限制或断言。测试数字含重复 support 自测；进程恢复是 test-executable、root off，非生产 main。真实 Filebase/Pinata 账号写 NOT RUN；不 push | 随本阶段提交 |
-| 5 | 未开始 | — | Filebase账号写授权/双Kubo环境 | — |
-| 6 | 未开始 | — | Cluster版本/拓扑/隔离测试授权 | — |
-| 7 | 未开始 | — | 不包含生产迁移授权 | — |
-| 8 | 未开始 | — | 研究不包含生产GC授权 | — |
+| 4 | 已验收并提交 | 真实 Kubo 0.43.0 目录 4/4、PG17.11 opt-in 15 个独立用例、R23 显式负载 1/1、独立 OS 进程 import artifact 恢复 1/1；选定整合 1852 passed / 4 ignored；最后三项 Important 修复后受影响 targets 198 passed / 1 ignored；当前 fmt、Rust 1.92 MSRV、严格 all-targets clippy 通过，限定复核无剩余 Critical/Important | 首次构根取消只保留原 claim 的候选，不采用或发布；MPU 扁平 capture 恢复与 source CID 统一预锁已闭合。取消测试的并行 gate 排队问题以 fixture 入场隔离修复，未放宽生产限制或断言。测试数字含重复 support 自测；进程恢复是 test-executable、root off，非生产 main。真实 Filebase/Pinata 账号写 NOT RUN；不 push | `5d5e5c8` |
+| 5 | 已验收，随本阶段提交 | 配置 7、CID publication 7、新旧诊断 14、旧 PSA 15、RPC leaf 51、RPC worker 11、SQLite 台账 9、隔离 PG17 台账 1 项与 registered-worker/SigV4 bridge 2 项实际通过。双 Kubo 0.43.0 单次 runner `24c5b32e5a224c1cb57be7784c564cd2` PASS，8 roots 离源后 offline 全块/字节核对、owned cleanup 通过。两并发 Important 及 PG 纳秒/微秒 claim 比较缺陷已最小修复，限定复核无剩余 Critical/Important；最新受影响 targets 28 passed/2 PG ignored，PG17.11 recovery exact 另行实跑 1 passed，涵盖新 UNION/native models 与精确 SQL fence。最新 pinning lib 460、integration 165、fmt、严格 all-targets clippy、Rust 1.92 与 diff-check 通过 | 修正前 full lib 为 1400 passed/1 ignored，不冒充修正后 full lib。临时 PG schemas/container inventory 零残留；未知/多根/mismatch 不重 POST、不清理、不授 AppCreated。双 Kubo 是叶/DAG/stored bytes；匿名 Basic/Bearer 只 header 传输；Filebase/Pinata 真实账号与账号鉴权 NOT RUN，不 push | 随本阶段提交 |
+| 6 | 独立叶已准备，整阶段未验收 | 传输及统一网络策略叶已实现，尚未正式注册。新网络策略下单次 runner `58672868d8ee43baaddd5aa3960881b5` exit 0：默认 34 passed / 1 ignored，真实叶用例 1 passed，四个缺 endpoint 门禁 fail-closed；隔离 Kubo 0.43.0 / Cluster 1.1.6 实际 1/2 → 2/2 → 停分配节点后 fresh observation 非 Complete，旧证明失效，同 pinset 双地址仅一逻辑域，logs-first owned cleanup 及空 inventory 已核对。旧 compile FAIL 与历史运行保留 | 只证明 REST verifier 叶；不代表配置/worker/Proxy/原生 REST CAR 整阶段验收，不包含持续 N/N、账号能力或字节灾难恢复承诺 | — |
+| 7 | 独立叶准备中，未验收 | 纯数据固定计划及完整确认模型已准备；有界 wire v1 定向 54 passed（原 39 + 新 15），导入 applied 仅为未可信声明，完整绑定替换与预算反例通过 | CLI、权威 DB snapshot、确认后的事务执行与 durable receipt 尚未接入；不包含生产迁移授权 | — |
+| 8 | 研究与基准准备中，未验收 | 全 owner / GC NO-GO 报告已准备；双 OS test-executable、共享临时 SQLite、loopback PSA 的一次 60 秒基准实际失败（exit 101），观察到 aggregate HTTP 峰值并发 4、1 次 429、普通/历史查询恢复进展；3 个 Submit 仍 running/ready，正在定点调查 | 失败与部分测量不计 PASS；无单进程 baseline、非 production main、不证明 RPC late receipt；研究不包含生产 GC 授权 | — |
 
 执行者可调整模块拆分、测试文件名和内部实施顺序，前提是保持目标、已确认合同、权限、安全及上述证据不变。重大偏离记录决定、依据与错误代价；安全、数据、公共协议或外部副作用变化交回调用方裁定。由调用方组织所需plan-critic；本planner不派生审查或执行agent，也不把计划完成当作审查/实现完成。
 

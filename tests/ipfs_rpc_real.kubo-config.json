@@ -1,0 +1,28 @@
+{
+  "version": "0.43.0",
+  "official_confirmation": true,
+  "documentation": [
+    "https://github.com/ipfs/kubo/blob/v0.43.0/docs/telemetry.md",
+    "https://github.com/ipfs/kubo/blob/v0.43.0/docs/environment-variables.md",
+    "https://github.com/ipfs/kubo/blob/v0.43.0/docs/config.md",
+    "https://github.com/ipfs/kubo/blob/v0.43.0/bin/container_daemon"
+  ],
+  "environment": [
+    { "purpose": "telemetry_disabled", "name": "IPFS_TELEMETRY", "value": "off" }
+  ],
+  "settings": [
+    { "purpose": "telemetry_plugin_disabled", "key": "Plugins.Plugins.telemetry.Disabled", "value": true },
+    { "purpose": "bootstrap_empty", "key": "Bootstrap", "value": [] },
+    { "purpose": "autoconf_disabled", "key": "AutoConf.Enabled", "value": false },
+    { "purpose": "mdns_disabled", "key": "Discovery.MDNS.Enabled", "value": false },
+    { "purpose": "routing_disabled", "key": "Routing.Type", "value": "none" }
+  ],
+  "required_purposes": [
+    "telemetry_disabled",
+    "bootstrap_empty",
+    "mdns_disabled",
+    "routing_disabled",
+    "autoconf_disabled"
+  ],
+  "note": "Parent-supplied official v0.43.0 lookup. IPFS_TELEMETRY=off is installed before init and each daemon startup; config settings are applied and read back after init, before daemon. Always use new, separately labeled repositories: 0.43.0 can retain old bootstrap backup peers. These values alone are not proof of no external traffic; the mandatory Docker internal network supplies the egress block and each daemon is explicitly --offline. Never reuse Stage4 containers/volumes and never pull/install. No separate unconfirmed provider-disable key is invented."
+}

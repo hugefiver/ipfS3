@@ -494,7 +494,8 @@ async fn lock_version_frontier(
     Ok(owners)
 }
 
-fn attachment_pairs(
+async fn attachment_pairs<C: ConnectionTrait>(
+    db: &C,
     request: &ZipV2Publication,
     limits: &ProviderLimitMap,
 ) -> AppResult<Vec<(String, String)>> {
@@ -502,14 +503,16 @@ fn attachment_pairs(
     for success in &request.successes {
         for intent in &success.policy.leases {
             for provider in ordered_enabled_providers(intent, limits)? {
-                pairs.insert((provider, success.cid.clone()));
+                let cid = ledger::allocation_cid(db, &provider, &success.cid).await?;
+                pairs.insert((provider, cid));
             }
         }
     }
     if let (Some(source), Some(policy)) = (&request.source, &request.source_policy) {
         for intent in &policy.leases {
             for provider in ordered_enabled_providers(intent, limits)? {
-                pairs.insert((provider, source.cid.clone()));
+                let cid = ledger::allocation_cid(db, &provider, &source.cid).await?;
+                pairs.insert((provider, cid));
             }
         }
     }
@@ -759,7 +762,7 @@ async fn publish_in_transaction(
     }
     verify_both_manifests(tx, request).await?;
     execution::verify_in_transaction(tx, &request.claim).await?;
-    let pairs = attachment_pairs(request, limits)?;
+    let pairs = attachment_pairs(tx, request, limits).await?;
     leases::lock_publication_lifecycle_frontier(tx, &owners, &pairs).await?;
     let providers = pairs
         .iter()

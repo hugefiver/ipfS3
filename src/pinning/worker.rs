@@ -36,7 +36,7 @@ use crate::{
                 NoRequestRemoteCompletion, RemoteDeleteCompletion, RemoteStatusApplyResult,
                 RemoteStatusOrigin, RemoteStatusUpdate, RemoteWorkSnapshot,
             },
-            quota as store_quota,
+            ledger, quota as store_quota,
         },
     },
 };
@@ -48,6 +48,10 @@ const STATUS_PINNING: &str = "pinning";
 const STATUS_PINNED: &str = "pinned";
 const STATUS_FAILED: &str = "failed";
 const STATUS_ABSENT: &str = "absent";
+
+#[cfg(test)]
+#[path = "../store/pinning/rpc_worker_tests.rs"]
+mod rpc_submission_tests;
 
 #[derive(Clone, Default)]
 struct ProviderOccupancy {
@@ -710,7 +714,7 @@ async fn execute_submit(
         }
     }
 
-    let Some(slot) = acquire_provider_slot(
+    let Some(mut slot) = acquire_provider_slot(
         coordinator,
         store,
         &mut claimed,
@@ -740,6 +744,7 @@ async fn execute_submit(
     let txn = store.db().begin().await?;
     let decision = jobs::prepare_submit_call(&txn, &claimed, now).await?;
     let mut correlation = None;
+    let mut rpc_invocation = None;
     if decision == SubmitCallDecision::ReadyToCall {
         let (api, strategy) = slot.provider.invocation_route();
         let history = jobs::submission_history(&txn, &claimed.model.id).await?;
@@ -762,6 +767,14 @@ async fn execute_submit(
                 Some(opaque)
             }
         };
+        rpc_invocation = ledger::submission::begin(&txn, &claimed, now).await?;
+        if ledger::submission::is_rpc_api(slot.provider.invocation_route().0)
+            && rpc_invocation.is_none()
+        {
+            return Err(AppError::Internal(
+                "RPC Submit lacks a captured invocation footprint".into(),
+            ));
+        }
     }
     txn.commit().await?;
     if decision == SubmitCallDecision::NoLongerDesired {
@@ -771,8 +784,19 @@ async fn execute_submit(
     let context = context.ok_or_else(|| {
         AppError::Internal("current Submit target has no immutable owner context".to_owned())
     })?;
+    // Canonical allocation keys are not object CIDs/ETags or an import recipe.
+    // Preserve the stored CID's original version for ordinary object uploads;
+    // ZIP/subtree targets use their own CID when the object root is different.
+    let requested_cid =
+        if crate::pinning::provider::cids_equivalent(&context.owner.cid, &claimed.model.cid)
+            .unwrap_or(false)
+        {
+            context.owner.cid.clone()
+        } else {
+            claimed.model.cid.clone()
+        };
     let request = SubmitPin {
-        cid: claimed.model.cid.clone(),
+        cid: requested_cid,
         name: correlation
             .clone()
             .unwrap_or_else(|| format!("{}/{}", context.owner.bucket, context.owner.key)),
@@ -796,6 +820,9 @@ async fn execute_submit(
     );
 
     let preflight_job = claimed.model.clone();
+    let preflight_rpc = rpc_invocation.clone();
+    slot.health_observed_by_call = true;
+    let call_runtime = slot.runtime.clone();
     let result = match provider_call_with_heartbeat(
         slot,
         global,
@@ -803,19 +830,98 @@ async fn execute_submit(
         &mut claimed,
         coordinator.settings().lock_for,
         cancellation,
-        move || async move { jobs::check_target_job_generation(store.db(), &preflight_job).await },
-        move |provider| async move { provider.submit(request).await },
+        move || async move {
+            if let Some(id) = preflight_rpc
+                && !ledger::submission::dispatch_allowed(store.db(), &id).await?
+            {
+                return Ok(false);
+            }
+            jobs::check_target_job_generation(store.db(), &preflight_job).await
+        },
+        move |provider| async move {
+            let observation = provider.submit_observed(request).await;
+            update_provider_health(&call_runtime, &observation.result).await;
+            Ok(observation)
+        },
     )
     .await?
     {
-        ProviderCallOutcome::Cancelled => return Ok(()),
+        ProviderCallOutcome::Cancelled => {
+            if let Some(id) = rpc_invocation.as_deref() {
+                record_rpc_not_dispatched(store, &claimed, id).await?;
+            }
+            return Ok(());
+        }
         ProviderCallOutcome::StaleClaim => return Ok(()),
         ProviderCallOutcome::PreflightRejected => {
+            if let Some(id) = rpc_invocation.as_deref() {
+                record_rpc_not_dispatched(store, &claimed, id).await?;
+            }
             finish_and_reconcile(store, &claimed, Utc::now()).await?;
             return Ok(());
         }
-        ProviderCallOutcome::Completed(result) => result,
+        ProviderCallOutcome::Completed(Ok(observation)) => observation,
+        // This helper's own errors happen before dispatch, never after HTTP.
+        ProviderCallOutcome::Completed(Err(error)) => crate::pinning::provider::SubmitObservation {
+            result: Err(error),
+            resources: Vec::new(),
+            effect: crate::pinning::provider::SubmitEffect::NotSubmitted,
+        },
     };
+    let definitely_not_submitted = result.effect
+        == crate::pinning::provider::SubmitEffect::NotSubmitted
+        && result.resources.is_empty();
+    if let Some(id) = rpc_invocation {
+        let txn = store.db().begin().await?;
+        let can_project =
+            ledger::submission::record(&txn, &claimed, &id, &result, Utc::now()).await?;
+        let evidence = ledger::submission_entity::Entity::find_by_id(id)
+            .one(&txn)
+            .await?
+            .ok_or_else(|| AppError::Internal("RPC observation disappeared".into()))?;
+        // Evidence is independent of mutable lease/job projection. A later
+        // lifecycle CAS, quota, or terminal-job write cannot erase actual roots.
+        txn.commit().await?;
+        if can_project && !definitely_not_submitted && evidence.outcome != "matched" {
+            let txn = store.db().begin().await?;
+            if !jobs::fence_job_claim(&txn, &claimed.model.id, claimed_lock(&claimed)?).await? {
+                txn.rollback().await?;
+                return Ok(());
+            }
+            leases::mark_all_mode_target_degraded_for_retry(&txn, &claimed.model, Utc::now())
+                .await?;
+            jobs::record_submit_error(
+                &txn,
+                &claimed,
+                "unknown",
+                evidence
+                    .safe_error
+                    .as_deref()
+                    .unwrap_or("{\"operation\":\"submit\",\"effect\":\"unknown\"}"),
+            )
+            .await?;
+            ledger::mark_effect(&txn, &claimed.model.provider, &claimed.model.cid, "unknown")
+                .await?;
+            jobs::park_submit(
+                &txn,
+                &claimed,
+                "needs_attention",
+                jobs::RPC_RECOVERY_PARK_REASON,
+                Utc::now(),
+            )
+            .await?;
+            txn.commit().await?;
+        }
+        if !can_project || (!definitely_not_submitted && evidence.outcome != "matched") {
+            return Ok(());
+        }
+    }
+    let safe_error = result
+        .result
+        .as_ref()
+        .err()
+        .map(|error| ledger::submission::typed_error(error, result.effect));
+    let result = result.result;
     match result {
         Ok(remote) if valid_remote(&remote, &claimed.model.cid, None) => {
             apply_observation(
@@ -837,14 +943,14 @@ async fn execute_submit(
             recover_submit(store, coordinator, global, &mut claimed, cancellation).await
         }
         Err(error) => {
-            if error.definitely_not_submitted() {
+            if definitely_not_submitted {
                 let now = Utc::now();
                 let txn = store.db().begin().await?;
                 jobs::record_submit_error(
                     &txn,
                     &claimed,
                     "not_created",
-                    &error.safe_evidence("submit"),
+                    safe_error.as_deref().expect("error evidence exists"),
                 )
                 .await?;
                 let evicted = if error.class == ProviderErrorClass::Quota {
@@ -903,6 +1009,37 @@ async fn execute_submit(
     }
 }
 
+async fn record_rpc_not_dispatched(
+    store: &Store,
+    claimed: &ClaimedPinJob,
+    id: &str,
+) -> AppResult<()> {
+    let observation = crate::pinning::provider::SubmitObservation {
+        result: Err(ProviderError {
+            class: ProviderErrorClass::NotSubmitted,
+            message: "RPC invocation cancelled before dispatch".into(),
+            retry_after: None,
+        }),
+        resources: Vec::new(),
+        effect: crate::pinning::provider::SubmitEffect::NotSubmitted,
+    };
+    let txn = store.db().begin().await?;
+    if ledger::submission::record(&txn, claimed, id, &observation, Utc::now()).await? {
+        jobs::record_submit_error(
+            &txn,
+            claimed,
+            "not_created",
+            &ledger::submission::typed_error(
+                observation.result.as_ref().unwrap_err(),
+                observation.effect,
+            ),
+        )
+        .await?;
+    }
+    txn.commit().await?;
+    Ok(())
+}
+
 async fn mark_submit_recovering(
     store: &Store,
     claimed: &ClaimedPinJob,
@@ -933,6 +1070,78 @@ async fn recover_submit(
     claimed: &mut ClaimedPinJob,
     cancellation: &CancellationToken,
 ) -> AppResult<()> {
+    // RPC expected-CID queries cannot disprove an unknown upload or another
+    // returned root. Only a captured, complete matching receipt can be replayed.
+    if let Some(evidence) = ledger::submission::latest(store.db(), &claimed.model.id).await? {
+        if evidence.outcome == "matched" {
+            let resources: Vec<ledger::submission::ResourceEvidence> =
+                serde_json::from_str(&evidence.resources)
+                    .map_err(|_| AppError::Internal("invalid durable RPC receipt".into()))?;
+            let resource = resources
+                .first()
+                .ok_or_else(|| AppError::Internal("empty matching RPC receipt".into()))?;
+            return apply_observation(
+                store,
+                coordinator,
+                claimed,
+                RemotePin {
+                    request_id: resource.resource.request_id.clone(),
+                    cid: resource.resource.cid.clone(),
+                    status: RemotePinStatus::Pinned,
+                    raw_status: "pinned".into(),
+                    failure_reason: None,
+                },
+                RemoteStatusOrigin::Adopt,
+                ObservationSource::ProviderObserved,
+            )
+            .await;
+        }
+        if evidence.outcome == "not_submitted" {
+            let txn = store.db().begin().await?;
+            if jobs::fence_job_claim(&txn, &claimed.model.id, claimed_lock(claimed)?).await? {
+                jobs::record_submit_error(
+                    &txn,
+                    claimed,
+                    "not_created",
+                    evidence
+                        .safe_error
+                        .as_deref()
+                        .unwrap_or("{\"operation\":\"submit\",\"effect\":\"not_created\"}"),
+                )
+                .await?;
+                jobs::record_submit_recovery_no_match(
+                    &txn,
+                    claimed,
+                    Utc::now(),
+                    coordinator.settings().base_backoff,
+                )
+                .await?;
+            }
+            txn.commit().await?;
+            return Ok(());
+        }
+        return jobs::park_submit(
+            store.db(),
+            claimed,
+            "needs_attention",
+            jobs::RPC_RECOVERY_PARK_REASON,
+            Utc::now(),
+        )
+        .await;
+    }
+    if ledger::job_route(store.db(), &claimed.model.id)
+        .await?
+        .is_some_and(|route| ledger::submission::is_rpc(&route))
+    {
+        return jobs::park_submit(
+            store.db(),
+            claimed,
+            "needs_attention",
+            "historical RPC invocation lacks submission evidence",
+            Utc::now(),
+        )
+        .await;
+    }
     let txn = store.db().begin().await?;
     let history = jobs::begin_recovery_query(&txn, claimed, Utc::now()).await?;
     txn.commit().await?;
@@ -1447,6 +1656,7 @@ async fn persist_observation_status_phase(
             observation_time,
         )
         .await?;
+        ledger::submission::settle_matching(&txn, &claimed.model).await?;
     }
     txn.commit().await?;
     #[cfg(test)]
@@ -2566,6 +2776,7 @@ struct ProviderCallSlot {
     provider: Arc<dyn PinningProvider>,
     runtime: ProviderRuntime,
     _provider_permit: OwnedSemaphorePermit,
+    health_observed_by_call: bool,
 }
 
 async fn acquire_provider_slot(
@@ -2596,11 +2807,15 @@ async fn acquire_provider_slot(
             "pinata-v3" => "pinata_v3",
             "pinata-legacy" => "pinata_legacy",
             "noop" => "noop",
+            "rpc" => "rpc",
+            "kubo" => "kubo",
+            "filebase-rpc" => "filebase-rpc",
             _ => "unknown",
         };
         let strategy = match route.strategy.as_str() {
             "cid" => "cid",
             "upload" => "upload",
+            "car" => "car",
             _ => "unknown",
         };
         provider = Arc::new(crate::pinning::provider::HistoricalProvider {
@@ -2630,6 +2845,7 @@ async fn acquire_provider_slot(
         provider,
         runtime,
         _provider_permit: provider_permit,
+        health_observed_by_call: false,
     }))
 }
 
@@ -2747,16 +2963,29 @@ where
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let provider = slot.provider.clone();
     let mut future = Box::pin(call(provider));
+    // A dispatched Submit must finish collecting its structured evidence even
+    // when a claim is lost. Its caller appends evidence under the old invocation
+    // and independently refuses projection into a new claim/lifetime.
+    let rpc_submit = claimed.model.operation == "submit"
+        && ledger::submission::is_rpc_api(slot.provider.invocation_route().0);
+    let mut lost_rpc_claim = false;
     let result = loop {
         tokio::select! {
             result = &mut future => break result,
-            _ = interval.tick() => renew_claim_once(store, claimed, lock_for).await?,
+            _ = interval.tick(), if !lost_rpc_claim => {
+                let renewal = renew_claim_once(store, claimed, lock_for).await;
+                if rpc_submit && renewal.is_err() { lost_rpc_claim = true; } else { renewal?; }
+            },
         }
     };
-    if !jobs::fence_job_claim(store.db(), &claimed.model.id, claimed_lock(claimed)?).await? {
+    if !rpc_submit
+        && !jobs::fence_job_claim(store.db(), &claimed.model.id, claimed_lock(claimed)?).await?
+    {
         return Ok(ProviderCallOutcome::StaleClaim);
     }
-    update_provider_health(&slot.runtime, &result).await;
+    if !slot.health_observed_by_call {
+        update_provider_health(&slot.runtime, &result).await;
+    }
     Ok(ProviderCallOutcome::Completed(result))
 }
 
@@ -2834,7 +3063,8 @@ async fn mark_runtime_degraded(coordinator: &PinningCoordinator, provider: &str)
 
 fn valid_remote(remote: &RemotePin, cid: &str, request_id: Option<&str>) -> bool {
     !remote.request_id.is_empty()
-        && remote.cid == cid
+        && (remote.cid == cid
+            || crate::pinning::provider::cids_equivalent(&remote.cid, cid).unwrap_or(false))
         && request_id.is_none_or(|expected| remote.request_id == expected)
 }
 

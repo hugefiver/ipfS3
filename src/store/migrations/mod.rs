@@ -26,3 +26,4 @@ pub mod m20260927_000004_zip_v2_execution;
 pub mod m20260927_000005_zip_v2_import;
 pub mod m20260927_000006_zip_v2_mpu_intake;
 pub mod m20260927_000007_zip_v2_mpu_completion;
+pub mod m20261004_000001_rpc_submission_ledger;

@@ -3,6 +3,7 @@ pub mod coordinator;
 pub mod decision;
 pub mod filebase;
 pub mod identity;
+pub mod ipfs_rpc;
 pub mod noop;
 pub mod pinata;
 pub mod policy;

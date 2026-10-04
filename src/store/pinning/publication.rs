@@ -1525,7 +1525,6 @@ async fn publish_in_transaction_with_batch(
             ));
         }
     }
-    let attachment_pairs = publication_attachment_pairs(&request, &entries, limits)?;
     if standard_guard.is_some() && import_guard.is_some() {
         return Err(AppError::Internal(
             "publication cannot have both standard and import guards".to_owned(),
@@ -1591,6 +1590,7 @@ async fn publish_in_transaction_with_batch(
         )
         .await?;
     }
+    let attachment_pairs = publication_attachment_pairs(db, &request, &entries, limits).await?;
     leases::lock_publication_lifecycle_frontier(db, &previous_owner_ids, &attachment_pairs).await?;
     let attachment_providers: Vec<_> = attachment_pairs
         .iter()
@@ -1959,7 +1959,8 @@ async fn lock_object_by_id<C: ConnectionTrait>(
     })
 }
 
-fn publication_attachment_pairs(
+async fn publication_attachment_pairs<C: ConnectionTrait>(
+    db: &C,
     request: &PublicationRequest,
     entries: &[PublicationObject],
     limits: &ProviderLimitMap,
@@ -1969,7 +1970,8 @@ fn publication_attachment_pairs(
         let providers = ordered_enabled_providers(intent, limits)?;
         for target in target_specs(request, entries, intent.content_mode) {
             for provider in &providers {
-                pairs.insert((provider.clone(), target.cid.clone()));
+                let cid = ledger::allocation_cid(db, provider, &target.cid).await?;
+                pairs.insert((provider.clone(), cid));
             }
         }
     }
@@ -2054,6 +2056,9 @@ async fn create_publication_leases<C: ConnectionTrait>(
     for intent in &request.policy.leases {
         let lease_id = lease_id(&request.object.id, intent.source);
         insert_lease(db, &lease_id, &request.object.id, intent, now).await?;
+        // Decompressed entries can have distinct object CID spellings but the
+        // same provider resource. Keep one target/reference per lease/resource.
+        let mut assigned_targets = BTreeMap::new();
         let targets = target_specs(request, entries, intent.content_mode);
         for target in targets {
             assign_target_providers(
@@ -2063,6 +2068,7 @@ async fn create_publication_leases<C: ConnectionTrait>(
                 &target,
                 limits,
                 now,
+                &mut assigned_targets,
                 &mut affected_remotes,
                 &mut failed_user_touches,
             )
@@ -2140,6 +2146,7 @@ async fn assign_target_providers<C: ConnectionTrait>(
     target: &PinTargetSpec,
     limits: &ProviderLimitMap,
     now: DateTime<Utc>,
+    assigned_targets: &mut BTreeMap<(String, String), quota::ReservationOutcome>,
     affected_remotes: &mut BTreeSet<(String, String)>,
     failed_user_touches: &mut BTreeSet<(String, String)>,
 ) -> AppResult<()> {
@@ -2147,22 +2154,50 @@ async fn assign_target_providers<C: ConnectionTrait>(
     match intent.provider_mode {
         ProviderMode::All => {
             for provider in providers {
-                reserve_and_insert_target(
+                let target = PinTargetSpec {
+                    cid: ledger::allocation_cid(db, &provider, &target.cid).await?,
+                    logical_size: target.logical_size,
+                };
+                let pair = (provider.clone(), target.cid.clone());
+                if assigned_targets.contains_key(&pair) {
+                    continue;
+                }
+                let outcome = reserve_and_insert_target(
                     db,
                     lease_id,
                     &provider,
-                    target,
+                    &target,
                     limits,
                     now,
                     affected_remotes,
                     failed_user_touches,
                 )
                 .await?;
+                assigned_targets.insert(pair, outcome);
             }
         }
         ProviderMode::One => {
             let mut first_unavailable = None;
             for provider in providers {
+                let target = PinTargetSpec {
+                    cid: ledger::allocation_cid(db, &provider, &target.cid).await?,
+                    logical_size: target.logical_size,
+                };
+                let pair = (provider.clone(), target.cid.clone());
+                if let Some(outcome) = assigned_targets.get(&pair) {
+                    if matches!(
+                        outcome,
+                        quota::ReservationOutcome::Reserved | quota::ReservationOutcome::Reused
+                    ) {
+                        return Ok(());
+                    }
+                    if first_unavailable.is_none() {
+                        first_unavailable = Some((provider, target, outcome.clone()));
+                    }
+                    // A raw alias may still be a different resource on a later
+                    // non-RPC provider. Preserve that provider's fallback chance.
+                    continue;
+                }
                 let outcome = quota::reserve_unique(
                     db,
                     &provider,
@@ -2177,26 +2212,32 @@ async fn assign_target_providers<C: ConnectionTrait>(
                     quota::ReservationOutcome::Reserved | quota::ReservationOutcome::Reused
                 ) {
                     let was_failed = remote_is_failed(db, &provider, &target.cid).await?;
-                    insert_target(db, lease_id, &provider, target, &outcome, now).await?;
+                    insert_target(db, lease_id, &provider, &target, &outcome, now).await?;
                     record_reserved_target(
                         db,
                         &provider,
-                        target,
+                        &target,
                         was_failed,
                         affected_remotes,
                         failed_user_touches,
                     )
                     .await?;
+                    assigned_targets.insert(pair, outcome);
                     return Ok(());
                 }
                 if first_unavailable.is_none() {
-                    first_unavailable = Some((provider, outcome));
+                    first_unavailable = Some((provider, target, outcome));
                 }
             }
-            let Some((provider, outcome)) = first_unavailable else {
+            let Some((provider, target, outcome)) = first_unavailable else {
                 return Err(invalid_publication("pinning lease has no enabled provider"));
             };
-            insert_target(db, lease_id, &provider, target, &outcome, now).await?;
+            let pair = (provider.clone(), target.cid.clone());
+            if let std::collections::btree_map::Entry::Vacant(entry) = assigned_targets.entry(pair)
+            {
+                insert_target(db, lease_id, &provider, &target, &outcome, now).await?;
+                entry.insert(outcome);
+            }
         }
     }
     Ok(())
@@ -2212,7 +2253,7 @@ async fn reserve_and_insert_target<C: ConnectionTrait>(
     now: DateTime<Utc>,
     affected_remotes: &mut BTreeSet<(String, String)>,
     failed_user_touches: &mut BTreeSet<(String, String)>,
-) -> AppResult<()> {
+) -> AppResult<quota::ReservationOutcome> {
     let outcome =
         quota::reserve_unique(db, provider, &target.cid, target.logical_size, limits, now).await?;
     insert_target(db, lease_id, provider, target, &outcome, now).await?;
@@ -2231,7 +2272,7 @@ async fn reserve_and_insert_target<C: ConnectionTrait>(
         )
         .await?;
     }
-    Ok(())
+    Ok(outcome)
 }
 
 async fn ensure_failed_attachment_reconcile<C: ConnectionTrait>(

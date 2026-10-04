@@ -16,6 +16,7 @@ use crate::{
 pub enum ProviderKind {
     Pinata,
     Filebase,
+    IpfsRpc,
     Noop,
 }
 
@@ -24,6 +25,7 @@ impl ProviderKind {
         match raw {
             "pinata" => Ok(Self::Pinata),
             "filebase" => Ok(Self::Filebase),
+            "ipfs_rpc" => Ok(Self::IpfsRpc),
             "noop" => Ok(Self::Noop),
             _ => bail!("unknown provider kind `{raw}`"),
         }
@@ -189,6 +191,8 @@ pub struct ValidatedProvider {
     pub token: Option<SecretToken>,
     pub endpoint: Option<String>,
     pub pinata: Option<PinataProviderOptions>,
+    /// Present only for native Kubo/Filebase RPC; authoritative execution route.
+    pub rpc: Option<crate::pinning::ipfs_rpc::RpcProviderOptions>,
     pub limits: ProviderLimits,
     pub requests_per_second: Option<u32>,
 }
@@ -255,7 +259,7 @@ impl ValidatedPinningConfig {
     where
         F: Fn(&str) -> Option<String>,
     {
-        Self::from_parts(raw, None, OptionalPinControlMode::Strict, get_env)
+        Self::from_parts(raw, None, &[], OptionalPinControlMode::Strict, get_env)
     }
 
     pub fn from_config<F>(config: &Config, get_env: F) -> anyhow::Result<Self>
@@ -265,6 +269,7 @@ impl ValidatedPinningConfig {
         Self::from_parts(
             &config.pinning,
             Some(&config.pinning_identity),
+            &config.pinning_rpc.providers,
             config.pinning_control.unavailable,
             get_env,
         )
@@ -273,6 +278,7 @@ impl ValidatedPinningConfig {
     fn from_parts<F>(
         raw: &PinningConfig,
         identity_config: Option<&PinningIdentityConfig>,
+        rpc_configs: &[crate::pinning::ipfs_rpc::RpcProviderConfig],
         optional_control: OptionalPinControlMode,
         get_env: F,
     ) -> anyhow::Result<Self>
@@ -298,11 +304,23 @@ impl ValidatedPinningConfig {
 
         let mut providers = Vec::with_capacity(raw.providers.len());
         let mut provider_limits = ProviderLimitMap::new();
+        let mut rpc_names = BTreeSet::new();
+        for rpc in rpc_configs {
+            if !rpc_names.insert(rpc.config_name.as_str()) {
+                bail!("duplicate RPC config_name");
+            }
+            if !provider_names.contains(rpc.config_name.as_str()) {
+                bail!("RPC options reference an unknown configured provider");
+            }
+        }
         for provider in &raw.providers {
             let explicit_identity = explicit_identities
                 .as_ref()
                 .and_then(|identities| identities.get(&provider.name));
-            let validated = Self::validate_provider(provider, explicit_identity, &get_env)?;
+            let rpc = rpc_configs
+                .iter()
+                .find(|rpc| rpc.config_name == provider.name);
+            let validated = Self::validate_provider(provider, explicit_identity, rpc, &get_env)?;
             provider_limits.insert(validated.name.clone(), validated.limits.clone());
             providers.push(validated);
         }
@@ -328,6 +346,7 @@ impl ValidatedPinningConfig {
     fn validate_provider<F>(
         provider: &ProviderConfig,
         explicit_identity: Option<&ProviderIdentity>,
+        rpc_config: Option<&crate::pinning::ipfs_rpc::RpcProviderConfig>,
         get_env: &F,
     ) -> anyhow::Result<ValidatedProvider>
     where
@@ -338,6 +357,17 @@ impl ValidatedPinningConfig {
         }
 
         let kind = ProviderKind::parse(&provider.kind)?;
+        let is_rpc = kind == ProviderKind::IpfsRpc
+            || (kind == ProviderKind::Filebase && provider.api.as_deref() == Some("rpc"));
+        if is_rpc && explicit_identity.is_none() {
+            bail!("RPC providers require an explicit stable pinning_identity");
+        }
+        if rpc_config.is_some() && !is_rpc {
+            bail!("RPC options require kind = ipfs_rpc or Filebase api = rpc");
+        }
+        if is_rpc && provider.upload_endpoint.is_some() {
+            bail!("RPC providers use endpoint, not upload_endpoint");
+        }
         if provider.max_bytes == 0 {
             bail!(
                 "provider `{}` max_bytes must be greater than zero",
@@ -394,17 +424,38 @@ impl ValidatedPinningConfig {
                 }
                 Some(options)
             }
+            ProviderKind::Filebase if is_rpc => None,
+            ProviderKind::IpfsRpc => {
+                if provider.api.as_deref().is_some_and(|api| api != "rpc") {
+                    bail!("ipfs_rpc provider API must be rpc");
+                }
+                None
+            }
             ProviderKind::Filebase | ProviderKind::Noop => {
+                let filebase_psa = kind == ProviderKind::Filebase;
                 if provider.api.is_some()
                     || provider.strategy.is_some()
                     || provider.upload_endpoint.is_some()
                 {
-                    bail!(
-                        "provider `{}` may only configure api/strategy/upload_endpoint when kind is pinata",
-                        provider.name
-                    );
+                    if filebase_psa
+                        && provider.api.as_deref().is_none_or(|api| api == "psa")
+                        && provider
+                            .strategy
+                            .as_deref()
+                            .is_none_or(|strategy| strategy == "cid")
+                        && provider.upload_endpoint.is_none()
+                    {
+                        // Explicit PSA/cid is compatible with omission.
+                        None
+                    } else {
+                        bail!(
+                            "provider `{}` may only configure api/strategy/upload_endpoint when kind is pinata, or a supported Filebase route (PSA/upload is unsupported)",
+                            provider.name
+                        );
+                    }
+                } else {
+                    None
                 }
-                None
             }
         };
 
@@ -413,7 +464,71 @@ impl ValidatedPinningConfig {
             .as_deref()
             .filter(|name| !name.is_empty())
             .map(|name| format!("env:{name}"));
-        let (api_profile, strategy) = provider_route(kind, provider, pinata.as_ref());
+        let token = match kind {
+            ProviderKind::Pinata | ProviderKind::Filebase | ProviderKind::IpfsRpc => {
+                match provider.token_env.as_deref() {
+                    Some(token_env) => {
+                        if token_env.is_empty() {
+                            bail!(
+                                "provider `{}` token environment variable must be configured",
+                                provider.name
+                            );
+                        }
+                        if is_rpc {
+                            crate::pinning::ipfs_rpc::validate_env_reference(token_env)?;
+                        }
+                        let value = get_env(token_env).filter(|value| !value.is_empty())
+                            .ok_or_else(|| anyhow!("provider `{}` token environment variable `{token_env}` is not set", provider.name))?;
+                        Some(SecretToken(value))
+                    }
+                    None if kind == ProviderKind::IpfsRpc => None,
+                    None => bail!(
+                        "provider `{}` token environment variable must be configured",
+                        provider.name
+                    ),
+                }
+            }
+            ProviderKind::Noop => {
+                if provider.token_env.is_some() {
+                    bail!(
+                        "noop provider `{}` must not configure a token environment variable",
+                        provider.name
+                    );
+                }
+                None
+            }
+        };
+        let rpc = if is_rpc {
+            let raw = rpc_config
+                .ok_or_else(|| anyhow!("RPC provider requires pinning_rpc profile/auth options"))?;
+            let options = raw.validate(
+                kind == ProviderKind::Filebase,
+                provider.strategy.as_deref(),
+                token.as_ref().map(SecretToken::expose),
+                get_env,
+            )?;
+            let endpoint = provider
+                .endpoint
+                .as_deref()
+                .unwrap_or("https://rpc.filebase.io");
+            if kind == ProviderKind::IpfsRpc && provider.endpoint.is_none() {
+                bail!("Kubo RPC provider requires an administrator endpoint");
+            }
+            crate::pinning::ipfs_rpc::validate_endpoint(endpoint, options.allow_private_network)?;
+            Some(options)
+        } else {
+            None
+        };
+        let (api_profile, strategy) = match &rpc {
+            Some(options) => (
+                match options.profile {
+                    crate::pinning::ipfs_rpc::RpcProfile::Kubo => "kubo",
+                    crate::pinning::ipfs_rpc::RpcProfile::Filebase => "filebase-rpc",
+                },
+                options.strategy.as_str(),
+            ),
+            None => provider_route(kind, provider, pinata.as_ref()),
+        };
         let identity = match explicit_identity {
             Some(identity) => {
                 validate_identity_route(
@@ -438,39 +553,6 @@ impl ValidatedPinningConfig {
             limits.enabled = false;
         }
 
-        let token = match kind {
-            ProviderKind::Pinata | ProviderKind::Filebase => {
-                let token_env = provider
-                    .token_env
-                    .as_deref()
-                    .filter(|name| !name.is_empty())
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "provider `{}` token environment variable must be configured",
-                            provider.name
-                        )
-                    })?;
-                let token = get_env(token_env)
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "provider `{}` token environment variable `{token_env}` is not set",
-                            provider.name
-                        )
-                    })?;
-                Some(SecretToken(token))
-            }
-            ProviderKind::Noop => {
-                if provider.token_env.is_some() {
-                    bail!(
-                        "noop provider `{}` must not configure a token environment variable",
-                        provider.name
-                    );
-                }
-                None
-            }
-        };
-
         Ok(ValidatedProvider {
             name: provider.name.clone(),
             identity,
@@ -478,6 +560,7 @@ impl ValidatedPinningConfig {
             token,
             endpoint: provider.endpoint.clone(),
             pinata,
+            rpc,
             limits,
             requests_per_second: provider.requests_per_second,
         })
@@ -628,6 +711,7 @@ fn provider_backend(kind: ProviderKind) -> &'static str {
     match kind {
         ProviderKind::Pinata => "pinata",
         ProviderKind::Filebase => "filebase",
+        ProviderKind::IpfsRpc => "kubo",
         ProviderKind::Noop => "noop",
     }
 }
@@ -659,6 +743,7 @@ fn provider_route(
             (profile, strategy)
         }
         ProviderKind::Filebase => ("filebase-psa", "cid"),
+        ProviderKind::IpfsRpc => ("kubo", "cid"),
         ProviderKind::Noop => ("noop", "cid"),
     }
 }

@@ -6,11 +6,13 @@ use anyhow::{Context as _, anyhow};
 use chrono::Utc;
 use ipfs_s3_gateway::{
     config::Config,
-    pinning::config::{
-        PinataStrategy, PolicyTrigger, ProviderKind, ProviderMode, ValidatedPinningConfig,
-        ValidatedProvider,
+    pinning::{
+        config::{
+            PolicyTrigger, ProviderKind, ProviderMode, ValidatedPinningConfig, ValidatedProvider,
+        },
+        coordinator::normalize_validated_config,
+        ipfs_rpc::{RpcProfile, RpcStrategy},
     },
-    pinning::coordinator::normalize_validated_config,
 };
 use serde_json::{Value, json};
 
@@ -93,15 +95,35 @@ fn provider_token_variables(config: &Config) -> Vec<Value> {
         .iter()
         .enumerate()
         .map(|(index, provider)| {
+            let rpc = config
+                .pinning_rpc
+                .providers
+                .iter()
+                .find(|rpc| rpc.config_name == provider.name);
+            let token_required = rpc.map_or(provider.kind != "noop", |rpc| rpc.auth != "none");
+            let (token_reference, token_value) =
+                credential_variable(provider.token_env.as_deref(), token_required);
+            let (username_reference, username_value) = credential_variable(
+                rpc.and_then(|rpc| rpc.username_env.as_deref()),
+                rpc.is_some_and(|rpc| rpc.auth == "basic"),
+            );
             json!({
                 "provider_index": index,
-                "token_env_reference": if provider.token_env.is_some() { "configured" } else { "missing" },
-                "token_env_value": provider.token_env.as_deref().map_or("not_configured", |name| {
-                    presence(std::env::var(name).ok().as_deref())
-                }),
+                "token_env_reference": token_reference,
+                "token_env_value": token_value,
+                "username_env_reference": username_reference,
+                "username_env_value": username_value,
             })
         })
         .collect()
+}
+
+fn credential_variable(name: Option<&str>, required: bool) -> (&'static str, &'static str) {
+    match name.filter(|name| !name.is_empty()) {
+        Some(name) => ("configured", presence(std::env::var(name).ok().as_deref())),
+        None if required => ("missing", "missing"),
+        None => ("not_required", "not_required"),
+    }
 }
 
 fn capability(operation: &'static str, configured: &'static str) -> Value {
@@ -113,10 +135,77 @@ fn capability(operation: &'static str, configured: &'static str) -> Value {
     })
 }
 
+fn provider_strategy(provider: &ValidatedProvider) -> &'static str {
+    if let Some(rpc) = &provider.rpc {
+        return rpc.strategy.as_str();
+    }
+    if provider.kind == ProviderKind::Noop {
+        return "noop";
+    }
+    // Legacy routes come from the validated identity, never endpoint guesses
+    // or Pinata-only options. Only allowlisted strings may be emitted.
+    match provider.identity.strategy.as_str() {
+        "cid" => "cid",
+        "upload" => "upload",
+        "car" => "car",
+        _ => "unknown",
+    }
+}
+
+fn provider_profile(provider: &ValidatedProvider) -> &'static str {
+    if let Some(rpc) = &provider.rpc {
+        return match rpc.profile {
+            RpcProfile::Kubo => "kubo",
+            RpcProfile::Filebase => "filebase-rpc",
+        };
+    }
+    match provider.identity.api_profile.as_str() {
+        "pinata-v3" => "pinata-v3",
+        "pinata-legacy" => "pinata-legacy",
+        "pinata-psa" => "pinata-psa",
+        "filebase-psa" => "filebase-psa",
+        "noop" => "noop",
+        _ => "unknown",
+    }
+}
+
+fn provider_credential(provider: &ValidatedProvider) -> &'static str {
+    if let Some(rpc) = &provider.rpc {
+        // Basic and Bearer credentials were checked by pure config validation;
+        // presence says nothing about remote authorization. Anonymous RPC does
+        // not require a token. Never inspect the credential payload here.
+        if rpc.auth.is_some() {
+            "present"
+        } else {
+            "not_required"
+        }
+    } else if provider.token.is_some() {
+        "present"
+    } else if provider.kind == ProviderKind::Noop {
+        "not_required"
+    } else {
+        "missing"
+    }
+}
+
 fn provider_operations(provider: &ValidatedProvider) -> Value {
     let active = provider.limits.enabled;
     let kind = provider.kind;
-    let route = provider.identity.strategy.as_str();
+    let route = provider_strategy(provider);
+    let (cid, upload, car, recursive) = match &provider.rpc {
+        Some(rpc) => (
+            rpc.profile == RpcProfile::Kubo && rpc.strategy == RpcStrategy::Cid,
+            rpc.strategy == RpcStrategy::Upload,
+            rpc.profile == RpcProfile::Kubo && rpc.strategy == RpcStrategy::Car,
+            true,
+        ),
+        None => (
+            route == "cid",
+            kind == ProviderKind::Pinata && route == "upload",
+            false,
+            false,
+        ),
+    };
     let supported = |operation: &'static str, route_allowed: bool| {
         capability(
             operation,
@@ -136,10 +225,13 @@ fn provider_operations(provider: &ValidatedProvider) -> Value {
             "denied"
         };
     json!([
-        supported("submit_cid", route == "cid"),
-        supported("upload_bytes", route == "upload"),
+        supported("submit_cid", cid),
+        supported("upload_bytes", upload),
         supported("query_remote", true),
         capability("remove_remote", cleanup),
+        // Append new evidence without changing the legacy operation indices.
+        supported("import_car", car),
+        supported("query_recursive", recursive),
     ])
 }
 
@@ -157,22 +249,18 @@ fn providers(validated: &ValidatedPinningConfig, explicit_identity: bool) -> Vec
             let scope = *scopes
                 .entry((identity.backend.clone(), identity.scope.clone()))
                 .or_insert(next);
-            let route = match (provider.kind, provider.pinata.as_ref()) {
-                (ProviderKind::Pinata, Some(options)) if options.strategy == PinataStrategy::Upload => "upload",
-                (ProviderKind::Noop, _) => "noop",
-                _ => "cid",
-            };
             json!({
                 "provider_index": index,
                 "scope_ref": scope,
                 "scope_evidence": if explicit_identity { "explicit_identity" } else { "legacy_config_name" },
-                "backend": match provider.kind { ProviderKind::Pinata => "pinata", ProviderKind::Filebase => "filebase", ProviderKind::Noop => "noop" },
+                "backend": match provider.kind { ProviderKind::Pinata => "pinata", ProviderKind::Filebase => "filebase", ProviderKind::IpfsRpc => "kubo", ProviderKind::Noop => "noop" },
+                "profile": provider_profile(provider),
                 "credential_revision": identity.credential_revision,
                 "endpoint_revision": identity.endpoint_revision,
                 "enabled": provider.limits.enabled,
                 "retired": identity.retired,
-                "credential": if provider.token.is_some() { "present" } else if provider.kind == ProviderKind::Noop { "not_required" } else { "missing" },
-                "strategy": route,
+                "credential": provider_credential(provider),
+                "strategy": provider_strategy(provider),
                 "operations": provider_operations(provider),
             })
         })

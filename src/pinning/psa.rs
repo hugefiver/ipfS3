@@ -498,7 +498,7 @@ mod tests {
                 super::test_token(TOKEN),
                 Some(format!("{}/v1/ipfs", server.uri())),
             ),
-            ProviderKind::Pinata | ProviderKind::Noop => {
+            ProviderKind::Pinata | ProviderKind::IpfsRpc | ProviderKind::Noop => {
                 unreachable!("PSA tests only cover Filebase")
             }
         }

@@ -1320,7 +1320,7 @@ pub(crate) async fn wake_quota_waiting_targets<C: ConnectionTrait>(
     let limit_map = ProviderLimitMap::from([(provider.to_owned(), limits.clone())]);
     let mut woken = Vec::new();
     for (target, _) in candidates {
-        let reservation = quota::reserve_unique(
+        let reservation = quota::reserve_unique_for_waiter(
             db,
             provider,
             &target.cid,
@@ -1332,6 +1332,8 @@ pub(crate) async fn wake_quota_waiting_targets<C: ConnectionTrait>(
         match reservation {
             ReservationOutcome::QuotaWaiting { .. } => break,
             ReservationOutcome::QuotaBlocked => {
+                // This is a stable non-debt budget decision: waiter reservation
+                // maps operator debt to waiting, without rereading mutable debt.
                 set_prelocked_target_state(db, &target, TARGET_QUOTA_BLOCKED).await?;
             }
             ReservationOutcome::Reserved | ReservationOutcome::Reused => {
@@ -1553,6 +1555,11 @@ async fn apply_remote_status_inner<C: ConnectionTrait>(
             };
 
         if expected_remote_epoch.is_some_and(|expected| snapshot.remote.epoch != expected) {
+            return Ok(RemoteStatusApplyResult::StaleRequest);
+        }
+        if let Some(job) = observation_job
+            && !super::ledger::submission::projection_allowed(db, job, &snapshot.remote).await?
+        {
             return Ok(RemoteStatusApplyResult::StaleRequest);
         }
 
@@ -3650,7 +3657,7 @@ pub async fn failover_target_if_feasible<C: ConnectionTrait>(
     };
     if retiring.lease_id != lease_id
         || replacement.lease_id != lease_id
-        || retiring.cid != replacement.cid
+        || !same_content_cid(&retiring.cid, &replacement.cid)
         || retiring.provider == replacement.provider
         || !is_desired_target_state(&retiring.state)
         || !is_desired_target_state(&replacement.state)
@@ -3806,7 +3813,10 @@ pub(crate) async fn fail_one_target_for_job<C: ConnectionTrait>(
     targets.sort_by(compare_target_order);
     if targets
         .iter()
-        .rfind(|candidate| candidate.cid == target.cid && is_desired_target_state(&candidate.state))
+        .rfind(|candidate| {
+            same_content_cid(&candidate.cid, &target.cid)
+                && is_desired_target_state(&candidate.state)
+        })
         .map(|candidate| candidate.id.as_str())
         != Some(target_id)
     {
@@ -3885,7 +3895,7 @@ async fn fail_one_target_at_generation<C: ConnectionTrait>(
     let existing = targets
         .iter()
         .rfind(|target| {
-            target.cid == failed.cid
+            same_content_cid(&target.cid, &failed.cid)
                 && target.id != failed.id
                 && is_desired_target_state(&target.state)
                 && eligible_suffix.contains(&target.provider)
@@ -3906,7 +3916,7 @@ async fn fail_one_target_at_generation<C: ConnectionTrait>(
 
     let existing_providers: BTreeSet<_> = targets
         .iter()
-        .filter(|target| target.cid == failed.cid)
+        .filter(|target| same_content_cid(&target.cid, &failed.cid))
         .map(|target| target.provider.clone())
         .collect();
     let candidates = if existing.is_some() {
@@ -3930,14 +3940,23 @@ async fn fail_one_target_at_generation<C: ConnectionTrait>(
     // Lock the complete remote frontier that immediate pinned convergence could retire before
     // any usage row. This keeps the lifecycle -> remote -> usage order even when a shared
     // fallback is already pinned and convergence occurs inside this caller-owned transaction.
+    let mut candidate_cids = BTreeMap::new();
+    for provider in &candidates {
+        candidate_cids.insert(
+            provider.clone(),
+            super::ledger::allocation_cid(db, provider, &failed.cid).await?,
+        );
+    }
     let mut remote_pairs = targets
         .iter()
-        .filter(|target| target.cid == failed.cid && is_desired_target_state(&target.state))
+        .filter(|target| {
+            same_content_cid(&target.cid, &failed.cid) && is_desired_target_state(&target.state)
+        })
         .map(|target| (target.provider.clone(), target.cid.clone()))
         .chain(
             candidates
                 .iter()
-                .map(|provider| (provider.clone(), failed.cid.clone())),
+                .map(|provider| (provider.clone(), candidate_cids[provider].clone())),
         )
         .collect::<Vec<_>>();
     remote_pairs.sort();
@@ -3966,25 +3985,25 @@ async fn fail_one_target_at_generation<C: ConnectionTrait>(
 
     let mut selected = None;
     for provider in candidates {
+        let cid = &candidate_cids[&provider];
         if candidate_remotes
-            .get(&(provider.clone(), failed.cid.clone()))
+            .get(&(provider.clone(), cid.clone()))
             .and_then(Option::as_ref)
             .is_some_and(|remote| remote.status == REMOTE_FAILED)
         {
             continue;
         }
         let reservation =
-            quota::reserve_unique(db, &provider, &failed.cid, failed.logical_size, limits, now)
-                .await?;
+            quota::reserve_unique(db, &provider, cid, failed.logical_size, limits, now).await?;
         if matches!(
             reservation,
             ReservationOutcome::Reserved | ReservationOutcome::Reused
         ) {
-            selected = Some(provider);
+            selected = Some((provider, cid.clone()));
             break;
         }
     }
-    let Some(provider) = selected else {
+    let Some((provider, cid)) = selected else {
         return Ok(None);
     };
 
@@ -4004,10 +4023,10 @@ async fn fail_one_target_at_generation<C: ConnectionTrait>(
         return Err(stale_lifecycle_error("one failover lease"));
     }
 
-    let replacement_id = target_id(lease_id, &provider, &failed.cid);
+    let replacement_id = target_id(lease_id, &provider, &cid);
     let replacement_created_at = pin_lease_target::Entity::find()
         .filter(pin_lease_target::Column::Provider.eq(&provider))
-        .filter(pin_lease_target::Column::Cid.eq(&failed.cid))
+        .filter(pin_lease_target::Column::Cid.eq(&cid))
         .order_by_desc(pin_lease_target::Column::CreatedAt)
         .order_by_desc(pin_lease_target::Column::Id)
         .one(db)
@@ -4018,7 +4037,7 @@ async fn fail_one_target_at_generation<C: ConnectionTrait>(
     pin_lease_target::Entity::insert(pin_lease_target::ActiveModel {
         id: Set(replacement_id.clone()),
         lease_id: Set(lease_id.to_owned()),
-        cid: Set(failed.cid.clone()),
+        cid: Set(cid.clone()),
         logical_size: Set(failed.logical_size),
         provider: Set(provider.clone()),
         state: Set(TARGET_WAITING.to_owned()),
@@ -4027,8 +4046,8 @@ async fn fail_one_target_at_generation<C: ConnectionTrait>(
     })
     .exec(db)
     .await?;
-    quota::refresh_remote_max_active_touch(db, &provider, &failed.cid).await?;
-    project_inserted_target_from_prelocked_remote(db, &replacement_id, &provider, &failed.cid, now)
+    quota::refresh_remote_max_active_touch(db, &provider, &cid).await?;
+    project_inserted_target_from_prelocked_remote(db, &replacement_id, &provider, &cid, now)
         .await?;
     let replacement = pin_lease_target::Entity::find_by_id(replacement_id)
         .one(db)
@@ -4084,16 +4103,16 @@ async fn converge_one_after_replacement_inner<C: ConnectionTrait>(
     if winner.state != TARGET_PINNED {
         return Ok(Vec::new());
     }
-    let current_assignment = targets
-        .iter()
-        .rfind(|target| target.cid == winner.cid && is_desired_target_state(&target.state));
+    let current_assignment = targets.iter().rfind(|target| {
+        same_content_cid(&target.cid, &winner.cid) && is_desired_target_state(&target.state)
+    });
     if current_assignment.map(|target| target.id.as_str()) != Some(winning_target_id) {
         return Ok(Vec::new());
     }
     let retiring = targets
         .iter()
         .filter(|target| {
-            target.cid == winner.cid
+            same_content_cid(&target.cid, &winner.cid)
                 && target.id != winner.id
                 && is_desired_target_state(&target.state)
         })
@@ -5040,6 +5059,10 @@ pub(crate) fn target_id(lease_id: &str, provider: &str, cid: &str) -> String {
     digest.update([0]);
     digest.update(cid.as_bytes());
     format!("target:{}", hex::encode(digest.finalize()))
+}
+
+fn same_content_cid(left: &str, right: &str) -> bool {
+    left == right || crate::pinning::provider::cids_equivalent(left, right).unwrap_or(false)
 }
 
 fn active_target_states() -> [&'static str; 4] {
