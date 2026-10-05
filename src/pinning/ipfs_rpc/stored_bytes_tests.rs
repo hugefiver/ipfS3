@@ -58,6 +58,11 @@ async fn upload_forwards_zero_small_raw_multiblock_and_sse_stored_bytes_exactly(
             .position(|w| w == b"\r\n\r\n")
             .unwrap()
             + 4;
+        let part_headers = String::from_utf8_lossy(&request.body[..start]).to_ascii_lowercase();
+        assert!(
+            part_headers.contains("content-type: application/octet-stream"),
+            "{shape}: a streamed upload part without a declared content type is rejected by Filebase with HTTP 500"
+        );
         let footer = format!("\r\n--{boundary}--\r\n");
         assert!(request.body.ends_with(footer.as_bytes()));
         assert_eq!(

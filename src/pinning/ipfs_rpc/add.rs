@@ -56,7 +56,12 @@ impl IpfsRpcProvider {
         let body = transfer
             .source_body(response, source.timeouts.idle)
             .map_err(|_| super::not_submitted("RPC stored byte read failed before submit"))?;
-        let part = multipart::Part::stream(body).file_name("object");
+        // Filebase rejects a multipart part that declares no content type with an
+        // opaque HTTP 500. reqwest omits it for a streamed part, so set it here.
+        let part = multipart::Part::stream(body)
+            .file_name("object")
+            .mime_str("application/octet-stream")
+            .map_err(|_| protocol("RPC upload part construction failed"))?;
         let form = multipart::Form::new().part("file", part);
         let version = if expected.version() == ::cid::Version::V0 {
             "0"
