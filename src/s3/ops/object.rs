@@ -2139,6 +2139,7 @@ mod tests {
         use crate::pinning::config::ValidatedPinningConfig;
 
         let provider = |name: &str, kind: &str, priority: u32| ProviderConfig {
+            cluster: None,
             name: name.to_owned(),
             kind: kind.to_owned(),
             token_env: Some(format!("{name}_TOKEN")),

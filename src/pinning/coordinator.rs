@@ -22,6 +22,7 @@ use crate::store::Store;
 use crate::store::pinning::jobs::POLL_INTERVAL;
 use crate::zip::extract::ZipExtractionLimits;
 
+pub use crate::pinning::cluster::build_cluster_provider;
 pub use crate::pinning::worker::PinningWorkerHandle;
 
 /// Also used by worker historical adapters. No network IO or source-token reuse.
@@ -115,6 +116,10 @@ pub fn normalize_validated_config(
         .sort_by(|a, b| a.identity.provider_id.cmp(&b.identity.provider_id));
     config.provider_limits.clear();
     let mut domain_routes: HashMap<String, ProviderIdentity> = HashMap::new();
+    let mut cluster_routes: HashMap<
+        _,
+        Option<crate::pinning::cluster::provider::ClusterProviderOptions>,
+    > = HashMap::new();
     for provider in &mut config.providers {
         provider.name = provider.identity.allocation_key();
         if provider.name.len() > 255 {
@@ -123,6 +128,23 @@ pub fn normalize_validated_config(
             ));
         }
         provider.limits.enabled &= !provider.identity.retired;
+        if let Some(existing) = cluster_routes.get(&provider.name) {
+            let mut alias = provider.cluster.clone();
+            if let (Some(existing), Some(alias)) = (existing, &mut alias) {
+                // Administrator-declared aliases may expose one pinset through
+                // different addresses. They still have one selected route, not
+                // fallback or extra replicas. All other options/revisions agree.
+                alias.rest_endpoint.clone_from(&existing.rest_endpoint);
+                alias.proxy_endpoint.clone_from(&existing.proxy_endpoint);
+            }
+            if existing != &alias {
+                return Err(anyhow!(
+                    "aliases in the same Cluster pinset must agree on transport, credentials and confirmation"
+                ));
+            }
+        } else {
+            cluster_routes.insert(provider.name.clone(), provider.cluster.clone());
+        }
         if let Some(existing) = domain_routes.get(&provider.name) {
             let mut alias = provider.identity.clone();
             alias.provider_id.clone_from(&existing.provider_id);
@@ -247,11 +269,12 @@ impl PinningCoordinator {
             let kind = provider.kind;
             let min_request_interval = match kind {
                 ProviderKind::Noop => Duration::ZERO,
-                ProviderKind::Pinata | ProviderKind::Filebase | ProviderKind::IpfsRpc => {
-                    Duration::from_secs_f64(
-                        1.0 / f64::from(provider.requests_per_second.unwrap_or(1)),
-                    )
-                }
+                ProviderKind::Pinata
+                | ProviderKind::Filebase
+                | ProviderKind::IpfsRpc
+                | ProviderKind::Cluster => Duration::from_secs_f64(
+                    1.0 / f64::from(provider.requests_per_second.unwrap_or(1)),
+                ),
             };
             provider_runtime.insert(
                 name.clone(),
@@ -264,6 +287,7 @@ impl PinningCoordinator {
                 },
             );
             let implementation: Arc<dyn PinningProvider> = match provider.kind {
+                ProviderKind::Cluster => build_cluster_provider(&provider, kubo.clone())?,
                 ProviderKind::IpfsRpc => Arc::new(build_rpc_provider(&provider, kubo.clone())?),
                 ProviderKind::Filebase if provider.rpc.is_some() => {
                     Arc::new(build_rpc_provider(&provider, kubo.clone())?)
@@ -367,8 +391,19 @@ impl PinningCoordinator {
     /// Register the current allocation routes before accepting publications.
     /// Existing resource snapshots are never overwritten by this operation.
     pub async fn register_identities(&self, store: &Store) -> crate::error::AppResult<()> {
-        for (key, identity) in &self.identities {
-            crate::store::pinning::ledger::register_route(store.db(), key, identity).await?;
+        // Match provider construction: canonical order, first alias per allocation.
+        // The validated route also captures its confirmation requirement.
+        let mut registered = std::collections::HashSet::new();
+        for provider in &self.effective_config.providers {
+            if !registered.insert(&provider.name) {
+                continue;
+            }
+            crate::store::pinning::ledger::register_configured_route(
+                store.db(),
+                &provider.name,
+                provider,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -505,6 +540,7 @@ mod tests {
                     api: None,
                     strategy: None,
                     upload_endpoint: None,
+                    cluster: None,
                     enabled: true,
                     priority: 1,
                     max_bytes: 1_000,
@@ -809,6 +845,7 @@ mod tests {
                         api: None,
                         strategy: None,
                         upload_endpoint: None,
+                        cluster: None,
                         enabled: true,
                         priority: 2,
                         max_bytes: 1_000,
@@ -823,6 +860,7 @@ mod tests {
                         api: None,
                         strategy: None,
                         upload_endpoint: None,
+                        cluster: None,
                         enabled: true,
                         priority: 3,
                         max_bytes: 1_000,
@@ -862,6 +900,7 @@ mod tests {
             api: None,
             strategy: None,
             upload_endpoint: None,
+            cluster: None,
             enabled,
             priority,
             max_bytes: 1_000,

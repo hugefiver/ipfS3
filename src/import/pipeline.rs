@@ -1197,6 +1197,7 @@ mod tests {
         let state = test_state(server.uri()).await;
         let mut raw = PinningConfig::default();
         raw.providers.push(ProviderConfig {
+            cluster: None,
             name: "original-provider".into(),
             kind: "noop".into(),
             token_env: None,

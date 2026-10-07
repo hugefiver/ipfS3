@@ -12,6 +12,7 @@ fn fixture() -> ValidatedPinningConfig {
     ValidatedPinningConfig::from_raw(
         &PinningConfig {
             providers: vec![ProviderConfig {
+                cluster: None,
                 name: "remote".into(),
                 kind: "noop".into(),
                 token_env: None,

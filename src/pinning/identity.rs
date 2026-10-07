@@ -86,6 +86,17 @@ pub struct ProviderRouteSnapshot {
     pub api_profile: String,
     pub strategy: String,
     pub cleanup: CleanupMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmation: Option<ConfirmationRequirement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ConfirmationRequirement {
+    ClusterReplicas {
+        min_replicas: u32,
+        max_age_secs: u32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -116,7 +127,7 @@ fn resource_type(profile: &str) -> RemoteResourceType {
     match profile {
         "pinata-v3" | "pinata-legacy" => RemoteResourceType::HostedFile,
         "rpc" | "kubo" | "filebase-rpc" => RemoteResourceType::RpcPin,
-        "cluster" => RemoteResourceType::ClusterPin,
+        "cluster" | "cluster-proxy" | "cluster-rest" => RemoteResourceType::ClusterPin,
         _ => RemoteResourceType::PsaRequest,
     }
 }
@@ -227,6 +238,7 @@ impl ProviderIdentity {
             api_profile: self.api_profile.clone(),
             strategy: self.strategy.clone(),
             cleanup: self.cleanup,
+            confirmation: None,
         }
     }
 

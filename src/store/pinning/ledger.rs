@@ -39,7 +39,11 @@ pub async fn allocation_cid<C: ConnectionTrait>(
     };
     let route: ProviderRouteSnapshot = serde_json::from_str(&route.snapshot)
         .map_err(|_| AppError::InvalidPinningRequest("invalid allocation route".into()))?;
-    if route.resource_type() != crate::pinning::identity::RemoteResourceType::RpcPin {
+    if !matches!(
+        route.resource_type(),
+        crate::pinning::identity::RemoteResourceType::RpcPin
+            | crate::pinning::identity::RemoteResourceType::ClusterPin
+    ) {
         return Ok(cid.to_owned());
     }
     let canonical = crate::pinning::provider::canonical_resource_cid(cid)
@@ -107,7 +111,35 @@ pub async fn register_route<C: ConnectionTrait>(
     key: &str,
     identity: &ProviderIdentity,
 ) -> AppResult<()> {
-    let snapshot = serde_json::to_string(&identity.route_snapshot())
+    register_snapshot(db, key, identity, &identity.route_snapshot()).await
+}
+
+/// Register the validated execution/confirmation contract, including disabled
+/// birth candidates. Identity-only callers remain compatible for older kinds.
+pub async fn register_configured_route<C: ConnectionTrait>(
+    db: &C,
+    key: &str,
+    provider: &crate::pinning::config::ValidatedProvider,
+) -> AppResult<()> {
+    let snapshot = provider.route_snapshot();
+    provider
+        .validate_route_snapshot(&snapshot)
+        .map_err(|_| AppError::InvalidPinningRequest("invalid configured provider route".into()))?;
+    if key != provider.identity.allocation_key() {
+        return Err(AppError::InvalidPinningRequest(
+            "configured provider allocation key changed".into(),
+        ));
+    }
+    register_snapshot(db, key, &provider.identity, &snapshot).await
+}
+
+async fn register_snapshot<C: ConnectionTrait>(
+    db: &C,
+    key: &str,
+    identity: &ProviderIdentity,
+    route: &ProviderRouteSnapshot,
+) -> AppResult<()> {
+    let snapshot = serde_json::to_string(route)
         .map_err(|_| AppError::Internal("invalid provider snapshot".into()))?;
     pin_provider_route::Entity::insert(pin_provider_route::ActiveModel {
         provider: Set(key.into()),
@@ -137,6 +169,17 @@ pub(crate) async fn verify_selected_routes<C: ConnectionTrait>(
     expected: &BTreeMap<String, ProviderRouteSnapshot>,
     lock: bool,
 ) -> AppResult<()> {
+    verify_birth_candidate_routes(db, expected, &expected.keys().cloned().collect(), lock).await
+}
+
+/// Compare/lock the complete frozen set while enforcing retirement for admission.
+/// Disabled/retired birth candidates remain comparable, but cannot grant admission.
+pub(crate) async fn verify_birth_candidate_routes<C: ConnectionTrait>(
+    db: &C,
+    expected: &BTreeMap<String, ProviderRouteSnapshot>,
+    allocatable: &std::collections::BTreeSet<String>,
+    lock: bool,
+) -> AppResult<()> {
     for (key, snapshot) in expected {
         let query = pin_provider_route::Entity::find_by_id(key.clone());
         let route = if lock && db.get_database_backend() == DatabaseBackend::Postgres {
@@ -151,7 +194,7 @@ pub(crate) async fn verify_selected_routes<C: ConnectionTrait>(
             serde_json::from_str(&route.snapshot).map_err(|_| {
                 AppError::InvalidPinningRequest("registered provider route is invalid".into())
             })?;
-        if route.retired || current != *snapshot {
+        if (route.retired && allocatable.contains(key)) || current != *snapshot {
             return Err(AppError::InvalidPinningRequest(
                 "captured provider route no longer matches registration".into(),
             ));
@@ -430,6 +473,9 @@ fn route_compatible(mut route: ProviderRouteSnapshot, identity: &ProviderIdentit
     route.api_profile.clone_from(&identity.api_profile);
     route.strategy.clone_from(&identity.strategy);
     route.cleanup = identity.cleanup;
+    // ProviderIdentity authenticates route/account/credential, not the lease
+    // confirmation contract; replica gates always use the captured contract.
+    route.confirmation = None;
     identity.validate_route_snapshot(&route).is_ok()
 }
 
@@ -477,7 +523,12 @@ pub(crate) async fn job_route_matches<C: ConnectionTrait>(
     if job.operation != "poll"
         || captured.remote_epoch > remote.epoch
         || job.expected_remote_epoch.is_some()
-        || !matches!(remote.status.as_str(), "queued" | "pinning")
+        || !(matches!(remote.status.as_str(), "queued" | "pinning")
+            || (remote.status == "pinned"
+                && decode_route(&row).is_some_and(|route| {
+                    route.resource_type()
+                        == crate::pinning::identity::RemoteResourceType::ClusterPin
+                })))
     {
         return Ok(false);
     }
@@ -742,7 +793,11 @@ pub async fn cleanup_allowed<C: ConnectionTrait>(
     // Stage 5 RPC receipts prove pin state, never exclusive creation. In
     // particular an opaque RPC request id must not become CID-based delete authority.
     if decode_route(&row).is_some_and(|route| {
-        route.resource_type() == crate::pinning::identity::RemoteResourceType::RpcPin
+        matches!(
+            route.resource_type(),
+            crate::pinning::identity::RemoteResourceType::RpcPin
+                | crate::pinning::identity::RemoteResourceType::ClusterPin
+        )
     }) {
         return Ok(false);
     }
@@ -870,7 +925,15 @@ pub async fn lease_status<C: ConnectionTrait>(
         let remote = remote_pin::Entity::find_by_id((target.provider.clone(), target.cid.clone()))
             .one(db)
             .await?;
-        if !remote.is_some_and(|remote| remote.status == "pinned") {
+        let cluster = crate::store::entities::pin_replica_observation::receipt::retained_cluster(
+            db,
+            &target.provider,
+            &target.cid,
+        )
+        .await?;
+        if !remote.is_some_and(|remote| {
+            remote.status == "pinned" || (cluster && remote.status == "pinning")
+        }) {
             continue;
         }
         let evidence = get(db, &target.provider, &target.cid).await?;
@@ -879,6 +942,18 @@ pub async fn lease_status<C: ConnectionTrait>(
         } else {
             legacy_unregistered_store(db, &target.provider).await?
         };
+        let confirmed = if cluster {
+            crate::store::entities::pin_lease_requirement::contract::target_confirmed(
+                db,
+                lease_id,
+                &target.provider,
+                &target.cid,
+                Utc::now(),
+            )
+            .await?
+        } else {
+            confirmed
+        };
         if confirmed {
             pinned += 1;
             available_cids.insert(&target.cid);
@@ -886,6 +961,12 @@ pub async fn lease_status<C: ConnectionTrait>(
     }
     let cids: std::collections::BTreeSet<_> = targets.iter().map(|t| &t.cid).collect();
     let active = lease.state == "active";
+    let birth = crate::store::entities::pin_lease_requirement::contract::completion(
+        db,
+        lease_id,
+        Utc::now(),
+    )
+    .await?;
     let local_metadata_published = object::Entity::find_by_id(lease.owner_object_id.clone())
         .one(db)
         .await?
@@ -896,8 +977,20 @@ pub async fn lease_status<C: ConnectionTrait>(
         lease_state: lease.state,
         created_at: lease.created_at,
         expires_at: lease.expires_at,
-        any_provider_available: active && !cids.is_empty() && cids == available_cids,
-        all_targets_pinned: active && !targets.is_empty() && targets.len() == pinned,
+        any_provider_available: active
+            && lease.expires_at > Utc::now()
+            && birth
+                .as_ref()
+                .map_or(!cids.is_empty() && cids == available_cids, |status| {
+                    status.0
+                }),
+        all_targets_pinned: active
+            && lease.expires_at > Utc::now()
+            && birth
+                .as_ref()
+                .map_or(!targets.is_empty() && targets.len() == pinned, |status| {
+                    status.1
+                }),
         targets: targets.len(),
         pinned_targets: pinned,
     }))
@@ -985,4 +1078,60 @@ pub async fn invocation_snapshot<C: ConnectionTrait>(
         first_error: history.as_ref().and_then(|h| h.first_error.clone()),
         last_error: history.and_then(|h| h.last_error).or(job.last_error),
     }))
+}
+
+#[cfg(test)]
+mod stage6_tests {
+    use super::*;
+    use sea_orm::TransactionTrait;
+
+    #[tokio::test]
+    async fn frozen_retired_candidate_is_not_allocation_authority_and_drift_still_rejects() {
+        let db = crate::store::connect_database("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::store::run_migrations(&db).await.unwrap();
+        let a = ProviderIdentity::legacy("a", "noop", None, "noop", "cid");
+        let mut b = ProviderIdentity::legacy("b", "noop", None, "noop", "cid");
+        b.retired = true;
+        register_route(&db, "a", &a).await.unwrap();
+        register_route(&db, "b", &b).await.unwrap();
+        let expected = [
+            ("a".into(), a.route_snapshot()),
+            ("b".into(), b.route_snapshot()),
+        ]
+        .into();
+        for lock in [false, true] {
+            let txn = db.begin().await.unwrap();
+            verify_birth_candidate_routes(&txn, &expected, &["a".into()].into(), lock)
+                .await
+                .unwrap();
+            assert!(
+                verify_selected_routes(&txn, &expected, lock).await.is_err(),
+                "selected retired routes remain illegal for existing callers"
+            );
+            assert!(
+                verify_birth_candidate_routes(
+                    &txn,
+                    &expected,
+                    &["a".into(), "b".into()].into(),
+                    lock
+                )
+                .await
+                .is_err()
+            );
+            assert!(capture_reservation(&txn, "b", "cid").await.is_err());
+            txn.rollback().await.unwrap();
+        }
+        for provider in ["a", "b"] {
+            let mut drifted = expected.clone();
+            drifted.get_mut(provider).unwrap().credential_revision += 1;
+            assert!(
+                verify_birth_candidate_routes(&db, &drifted, &["a".into()].into(), false)
+                    .await
+                    .is_err(),
+                "full identity drift remains fail-closed, even for frozen retired {provider}"
+            );
+        }
+    }
 }

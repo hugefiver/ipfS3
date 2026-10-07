@@ -200,6 +200,7 @@ async fn remote_ref_never_grants_managed_ownership() {
     let p = provider(&target, &source, RpcProfile::Kubo, RpcStrategy::Cid);
     let pin = p.find(query(CID)).await.unwrap().remove(0);
     let route = ProviderRouteSnapshot {
+        confirmation: None,
         provider_id: "target".into(),
         backend: "kubo".into(),
         scope: "node".into(),

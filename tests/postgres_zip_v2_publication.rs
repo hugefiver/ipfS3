@@ -260,6 +260,7 @@ impl Policy {
         let config = ValidatedPinningConfig::from_raw(
             &PinningConfig {
                 providers: vec![ProviderConfig {
+                    cluster: None,
                     name: "remote".into(),
                     kind: "noop".into(),
                     enabled: true,

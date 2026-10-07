@@ -1572,7 +1572,13 @@ async fn apply_remote_status_inner<C: ConnectionTrait>(
             db,
             &update,
             &snapshot.remote,
-            enforce_monotonic_status,
+            enforce_monotonic_status
+                && !crate::store::entities::pin_replica_observation::receipt::retained_cluster(
+                    db,
+                    update.provider,
+                    update.cid,
+                )
+                .await?,
             snapshot
                 .desired
                 .iter()
@@ -1649,14 +1655,33 @@ async fn apply_remote_status_inner<C: ConnectionTrait>(
 
         let mut affected = Vec::with_capacity(snapshot.desired.len());
         for desired in snapshot.desired {
+            let birth =
+                if crate::store::entities::pin_replica_observation::receipt::retained_cluster(
+                    db,
+                    update.provider,
+                    update.cid,
+                )
+                .await?
+                {
+                    crate::store::entities::pin_lease_requirement::contract::completion(
+                        db,
+                        &desired.lease.id,
+                        update.now,
+                    )
+                    .await?
+                } else {
+                    None
+                };
             affected.push(AffectedLeaseOutcome {
                 lease_id: desired.lease.id.clone(),
                 target_id: desired.target.id,
                 provider_mode: provider_mode(&desired.lease.provider_mode)?,
-                available: availability
-                    .get(&desired.lease.id)
-                    .copied()
-                    .unwrap_or(false),
+                available: birth.map(|status| status.0).unwrap_or_else(|| {
+                    availability
+                        .get(&desired.lease.id)
+                        .copied()
+                        .unwrap_or(false)
+                }),
             });
         }
         return Ok(RemoteStatusApplyResult::Applied {
@@ -3881,14 +3906,41 @@ async fn fail_one_target_at_generation<C: ConnectionTrait>(
         return Ok(None);
     };
 
+    // Caller health ordering may shrink the birth set, never add a later policy
+    // provider or issue a write under a reduced/changed original contract.
+    let birth = crate::store::entities::pin_lease_requirement::contract::get(db, lease_id).await?;
+    let mut allowed = BTreeSet::new();
+    if let Some(birth) = &birth {
+        for (provider, original) in &birth.candidates {
+            if let Some(original) = original
+                && pin_provider_route::Entity::find_by_id(provider.clone())
+                    .one(db)
+                    .await?
+                    .filter(|row| !row.retired)
+                    .and_then(|row| {
+                        serde_json::from_str::<crate::pinning::identity::ProviderRouteSnapshot>(
+                            &row.snapshot,
+                        )
+                        .ok()
+                    })
+                    .as_ref()
+                    == Some(original)
+            {
+                allowed.insert(provider.clone());
+            }
+        }
+    }
+    let frozen_allows = |provider: &String| birth.is_none() || allowed.contains(provider);
+
     let mut targets = lease_targets(db, lease_id).await?;
     targets.sort_by(compare_target_order);
     let eligible_suffix = ordered_providers[failed_index + 1..]
         .iter()
         .filter(|provider| {
-            limits
-                .get(*provider)
-                .is_some_and(|provider_limits| provider_limits.enabled)
+            frozen_allows(provider)
+                && limits
+                    .get(*provider)
+                    .is_some_and(|provider_limits| provider_limits.enabled)
         })
         .cloned()
         .collect::<BTreeSet<_>>();
@@ -3925,9 +3977,10 @@ async fn fail_one_target_at_generation<C: ConnectionTrait>(
         ordered_providers[failed_index + 1..]
             .iter()
             .filter(|provider| {
-                limits
-                    .get(*provider)
-                    .is_some_and(|provider_limits| provider_limits.enabled)
+                frozen_allows(provider)
+                    && limits
+                        .get(*provider)
+                        .is_some_and(|provider_limits| provider_limits.enabled)
                     && !existing_providers.contains(*provider)
             })
             .cloned()
@@ -4103,6 +4156,23 @@ async fn converge_one_after_replacement_inner<C: ConnectionTrait>(
     if winner.state != TARGET_PINNED {
         return Ok(Vec::new());
     }
+    if crate::store::entities::pin_replica_observation::receipt::retained_cluster(
+        db,
+        &winner.provider,
+        &winner.cid,
+    )
+    .await?
+        && !crate::store::entities::pin_lease_requirement::contract::target_confirmed(
+            db,
+            lease_id,
+            &winner.provider,
+            &winner.cid,
+            now,
+        )
+        .await?
+    {
+        return Ok(Vec::new());
+    }
     let current_assignment = targets.iter().rfind(|target| {
         same_content_cid(&target.cid, &winner.cid) && is_desired_target_state(&target.state)
     });
@@ -4258,17 +4328,24 @@ pub(crate) async fn current_remote_outcomes<C: ConnectionTrait>(
                 .or_insert(target.state == TARGET_PINNED);
             availability
         });
-    desired
-        .into_iter()
-        .map(|desired| {
-            Ok(AffectedLeaseOutcome {
-                lease_id: desired.lease.id.clone(),
-                target_id: desired.target.id,
-                provider_mode: provider_mode(&desired.lease.provider_mode)?,
-                available: available.get(&desired.lease.id).copied().unwrap_or(false),
-            })
-        })
-        .collect()
+    let mut outcomes = Vec::new();
+    for desired in desired {
+        let birth = crate::store::entities::pin_lease_requirement::contract::completion(
+            db,
+            &desired.lease.id,
+            Utc::now(),
+        )
+        .await?;
+        outcomes.push(AffectedLeaseOutcome {
+            lease_id: desired.lease.id.clone(),
+            target_id: desired.target.id,
+            provider_mode: provider_mode(&desired.lease.provider_mode)?,
+            available: birth
+                .map(|status| status.0)
+                .unwrap_or_else(|| available.get(&desired.lease.id).copied().unwrap_or(false)),
+        });
+    }
+    Ok(outcomes)
 }
 
 /// Acquires the complete lifecycle frontier for one observed shared remote.
@@ -4617,11 +4694,76 @@ async fn project_prelocked_desired_target<C: ConnectionTrait>(
     };
     match remote.status.as_str() {
         REMOTE_PINNED => {
-            set_prelocked_target_state(db, &desired.target, TARGET_PINNED).await?;
+            let cluster =
+                crate::store::entities::pin_replica_observation::receipt::retained_cluster(
+                    db,
+                    &remote.provider,
+                    &remote.cid,
+                )
+                .await?;
+            let confirmed = !cluster
+                || crate::store::entities::pin_lease_requirement::contract::target_confirmed(
+                    db,
+                    &desired.lease.id,
+                    &remote.provider,
+                    &remote.cid,
+                    now,
+                )
+                .await?;
+            set_prelocked_target_state(
+                db,
+                &desired.target,
+                if confirmed {
+                    TARGET_PINNED
+                } else {
+                    TARGET_SUBMITTED
+                },
+            )
+            .await?;
+            if cluster && let Some(request) = remote.request_id.as_deref() {
+                let owner = canonical()?;
+                let NewPinJob::Target(job) = jobs::poll_job(
+                    &remote.provider,
+                    &remote.cid,
+                    &owner.lease.id,
+                    &owner.target.id,
+                    owner.lease.generation,
+                    request,
+                    now + duration_as_chrono(jobs::POLL_INTERVAL)?,
+                ) else {
+                    unreachable!()
+                };
+                ensure_prelocked_target_job(db, job, now).await?;
+            }
             Ok(TargetProjection::Pinned)
         }
         REMOTE_QUEUED | REMOTE_PINNING if remote.request_id.is_some() => {
-            set_prelocked_target_state(db, &desired.target, TARGET_SUBMITTED).await?;
+            let cluster =
+                crate::store::entities::pin_replica_observation::receipt::retained_cluster(
+                    db,
+                    &remote.provider,
+                    &remote.cid,
+                )
+                .await?;
+            let confirmed = cluster
+                && crate::store::entities::pin_lease_requirement::contract::target_confirmed(
+                    db,
+                    &desired.lease.id,
+                    &remote.provider,
+                    &remote.cid,
+                    now,
+                )
+                .await?;
+            set_prelocked_target_state(
+                db,
+                &desired.target,
+                if confirmed {
+                    TARGET_PINNED
+                } else {
+                    TARGET_SUBMITTED
+                },
+            )
+            .await?;
             let canonical = canonical()?;
             let request_id = remote.request_id.as_deref().expect("checked above");
             let NewPinJob::Target(job) = jobs::poll_job(
@@ -4713,6 +4855,21 @@ async fn project_prelocked_desired_target<C: ConnectionTrait>(
 /// Persists work for a canonical target that was selected from the caller's complete lifecycle
 /// snapshot. Unlike the generic job helpers, this intentionally does not re-query canonical
 /// siblings after the lease → target → remote frontier has been acquired.
+/// Prelock the same frontier used for status application before replica append.
+pub(crate) async fn lock_replica_observation_lifecycle<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+    cid: &str,
+) -> AppResult<()> {
+    if matches!(
+        ordered_desired_lifecycle_snapshot(db, provider, cid).await?,
+        OrderedDesiredLifecycleSnapshotOutcome::Stale
+    ) {
+        return Err(stale_lifecycle_error("replica lifecycle frontier"));
+    }
+    Ok(())
+}
+
 async fn ensure_prelocked_target_job<C: ConnectionTrait>(
     db: &C,
     job: jobs::TargetPinJob,

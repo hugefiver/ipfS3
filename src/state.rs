@@ -114,6 +114,7 @@ mod tests {
         let mut config = Config::default_for_test();
         config.storage.database_url = "not-a-database-url".to_owned();
         config.pinning.providers = vec![ProviderConfig {
+            cluster: None,
             name: "pinata".to_owned(),
             kind: "pinata".to_owned(),
             token_env: Some("TASK15_MISSING_PINATA_TOKEN".to_owned()),
@@ -193,6 +194,7 @@ mod tests {
         let mut config = Config::default_for_test();
         config.pinning_control.unavailable = OptionalPinControlMode::Warn;
         config.pinning.providers = vec![ProviderConfig {
+            cluster: None,
             name: "pinata".to_owned(),
             kind: "pinata".to_owned(),
             token_env: Some("PINATA_TOKEN".to_owned()),

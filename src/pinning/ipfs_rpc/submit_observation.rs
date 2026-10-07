@@ -79,6 +79,7 @@ impl From<RpcSubmitObservation> for crate::pinning::provider::SubmitObservation 
                         }
                     },
                     ownership: resource.ownership,
+                    replica_evidence: None,
                 })
                 .collect(),
             effect: match observation.effect {

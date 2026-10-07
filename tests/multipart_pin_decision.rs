@@ -103,6 +103,7 @@ fn pinning(raw: PinningConfig, mode: OptionalPinControlMode) -> Arc<PinningCoord
 fn available_policy(trigger: &str) -> PinningConfig {
     PinningConfig {
         providers: vec![ProviderConfig {
+            cluster: None,
             name: "new-provider".into(),
             kind: "noop".into(),
             token_env: None,

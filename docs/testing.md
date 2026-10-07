@@ -266,6 +266,94 @@ migration and retain the evidence afterward: a refused down migration must not
 be bypassed by dropping tables. Inspect run summaries, failures and cleanup
 receipts before recording a result; commands alone are not acceptance evidence.
 
+## Stage 6 Cluster acceptance
+
+The Cluster provider is separate from the main Kubo. Proxy transport and native
+REST transport have distinct wire contracts; Proxy `dag/import` forwarding to a
+paired Kubo is not Cluster CAR acceptance. Run the focused default targets:
+
+```powershell
+cargo test --locked --offline --test cluster_provider_config --test cluster_diagnostics --test cluster_provider_contract
+cargo test --locked --offline --test cluster_network_policy --test cluster_replica_verifier --test stage6_cluster_worker
+cargo test --locked --offline --test cluster_documented_config --test stage6_cluster_auth
+```
+
+Inspect the actual counts and assertions. Mock results do not establish physical
+N/N replication. Fresh allocated peer observations must satisfy the lease's
+captured confirmation contract before policy one/all aggregation. Queued, remote,
+missing, failed and stale peers do not count. Old evidence remains audit history,
+not a new live observation; matching CID does not establish deletion ownership.
+
+The isolated provider-phase runner uses cached Kubo 0.43.0 and Cluster 1.1.6,
+an independent third source, two allocated target Kubo nodes, and an internal
+network. It must not pull images, reuse production data, or delete unknown
+resources. Read its current parameters and prerequisites before execution:
+
+```powershell
+cargo test --locked --offline --test cluster_provider_real --no-run
+pwsh -NoProfile -File tests/run-cluster-pinning-real.ps1 -ProviderPhase
+```
+
+The earlier verifier-only run `58672868d8ee43baaddd5aa3960881b5` established
+1/2, 2/2 and loss of a fresh replica in its bounded topology. It does not establish
+provider CAR transport, registered-worker persistence or continuous availability.
+The initial provider-phase run `278435a7f9744af48d3d56a5a53eafd9` stopped at a
+compile failure; its real transmission assertions were NOT RUN. Later acceptance
+must record its own run, offline target DAG/byte checks and owned cleanup evidence.
+Real Filebase/Pinata account writes and account authentication remain NOT RUN.
+
+The later provider-phase run `a5d0e44ad9a44c3e8e7c8deee1d48a4d` passed its
+isolated transport target. Its wire audit recorded 26 POSTs: each transport used
+six adds and seven CID submissions, with zero `dag/import` or DELETE calls.
+Proxy's `Name/Hash/Bytes/Size` and REST's `name/cid/bytes/size/allocations` were
+captured separately. Both target nodes passed complete offline DAG and stored-byte
+checks after the independent source stopped, including ciphertext. Fresh 2/2
+verification and owned logs-first cleanup passed. This bounded same-host run is
+not an account-authentication, billing or multi-host availability result.
+
+PostgreSQL worker/replica-contract coverage is separately opt-in through
+`IPFS_S3_STAGE6_TEST_DATABASE_URL`. Use only an authorized isolated test database;
+an explicitly selected test without its environment must fail, not silently skip.
+Neither SQLite nor an ignored PostgreSQL test is PostgreSQL fence evidence.
+
+The isolated PostgreSQL 17.11 run `4caf2cc3831f456bb92f6dca15b2188d` passed
+`stage6_cluster_postgres_registered_claim_and_replica_contract` (1/1). It used
+actual AppState route registration, signed PUT/tagging/delete and the registered
+worker. Native SQL accepted the original nanosecond caller token despite PG's
+microsecond readback, rejected the previous token, and rolled back the claim
+exactly. Both history tables rejected UPDATE/DELETE, downgrade was refused, and
+deletion retained Unknown ownership and the reservation. Its provider mock is
+not physical replica evidence. The owned container was logs-first removed; no
+owned containers, volumes or networks remained.
+
+`stage6_cluster_auth` passed 3/3: REST 401 at each verifier read remains
+Authentication; a registered worker becomes Terminal and later due Polls issue
+no HTTP while preserving Unknown history and quota. This target calls the S3
+handler directly; signed HTTP evidence comes from the separate PG target.
+The final updated-core PostgreSQL run `1a2319d11ef24384b4537865d56660cb`
+passed all five exact tests, each in a distinct fresh PG17.11 database: the basic
+contract above, late Poll/new-lifetime fencing, owner handoff with a fresh
+successor, typed receipt/projection rollback and recovery, and actual lease-first
+writer locking. The last case used `pg_blocking_pids` plus successful downstream
+`FOR UPDATE NOWAIT` acquisitions, not a sleep-based ordering assumption. Logs and
+SQL were captured before exact owned cleanup; remaining clients and owned
+containers/volumes/networks were zero. An `unexpected EOF ... open transaction`
+diagnostic after the injected rollback remains unassigned; rollback/recovery
+assertions passed, and it is not reported as a fixed defect.
+
+Final stable-tree checks passed: Rust 1.92 GNU `fmt --all -- --check`,
+`check --locked --offline --all-targets`, and strict all-targets Clippy with
+`-D warnings`; library tests **1438 passed / 0 failed / 1 ignored** and the
+integration target **165 passed / 0 failed**. The eight focused targets above
+recorded 171 target PASS results, including reused embedded leaf tests, and
+7 ignored tests; ignored is not PASS. Five of those ignored PG cases were then
+executed explicitly as described above. Quality runs used a run-owned writable
+project-target TEMP/TMP/TMPDIR because this machine's system TEMP rejected file
+creation; no global permissions, dependency versions or lint allowances changed.
+Focused review closed the min/RF, retired-candidate and authentication defects
+and the remaining PG/quality evidence gaps. **Stage 6 local isolated acceptance
+passed**, within the topology and real-account limitations stated above.
+
 ## Environment-backed and deep checks
 
 Run the relevant command when its external environment is available:

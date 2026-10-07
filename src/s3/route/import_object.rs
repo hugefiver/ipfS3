@@ -622,6 +622,7 @@ mod durable_admission_tests {
         let config = ValidatedPinningConfig::from_raw(
             &PinningConfig {
                 providers: vec![ProviderConfig {
+                    cluster: None,
                     name: "remote".into(),
                     kind: "pinata".into(),
                     token_env: Some("PINNING_TOKEN".into()),

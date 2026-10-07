@@ -68,6 +68,7 @@ fn typed_observation_contract_roundtrips_snake_case() {
         ),
     ] {
         let resource = ObservedResource {
+            replica_evidence: None,
             resource_type: RemoteResourceType::RpcPin,
             cid: CID.into(),
             request_id: "historical-receipt".into(),
@@ -202,6 +203,7 @@ async fn invocation(store: &Store, provider: &str, cid: &str) -> (ClaimedPinJob,
 
 fn receipt(cid: &str, status: ObservedResourceStatus) -> ObservedResource {
     ObservedResource {
+        replica_evidence: None,
         resource_type: RemoteResourceType::RpcPin,
         cid: cid.into(),
         request_id: "rpc:opaque-receipt".into(),

@@ -200,6 +200,7 @@ impl TestProviderConfig {
             ),
         };
         ProviderConfig {
+            cluster: None,
             name: self.name,
             kind: kind.to_owned(),
             token_env: Some(token_env.to_owned()),

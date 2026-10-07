@@ -11,6 +11,12 @@ pub struct SubmitObservation {
     pub effect: SubmitEffect,
 }
 
+#[derive(Debug)]
+pub struct PinObservation {
+    pub result: Result<RemotePin, ProviderError>,
+    pub resources: Vec<ObservedResource>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ObservedResource {
     pub resource_type: RemoteResourceType,
@@ -18,6 +24,8 @@ pub struct ObservedResource {
     pub request_id: String,
     pub status: ObservedResourceStatus,
     pub ownership: Ownership,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replica_evidence: Option<crate::pinning::cluster::ReplicaEvidence>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -28,6 +36,7 @@ pub enum ObservedResourceStatus {
     PinAccepted,
     PinError,
     RecursiveVerified,
+    ReplicasVerified,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -112,6 +121,25 @@ pub trait PinningProvider: Send + Sync + 'static {
     }
 
     async fn get(&self, request_id: &str) -> Result<RemotePin, ProviderError>;
+
+    async fn get_observed(&self, request_id: &str) -> PinObservation {
+        PinObservation {
+            result: self.get(request_id).await,
+            resources: Vec::new(),
+        }
+    }
+
+    async fn get_observed_historical(
+        &self,
+        request_id: &str,
+        api: &str,
+        strategy: &str,
+    ) -> PinObservation {
+        PinObservation {
+            result: self.get_historical(request_id, api, strategy).await,
+            resources: Vec::new(),
+        }
+    }
 
     async fn get_historical(
         &self,
@@ -200,6 +228,22 @@ impl PinningProvider for HistoricalProvider {
     async fn get(&self, id: &str) -> Result<RemotePin, ProviderError> {
         self.inner.get_historical(id, self.api, self.strategy).await
     }
+    async fn get_observed(&self, id: &str) -> PinObservation {
+        self.inner
+            .get_observed_historical(id, self.api, self.strategy)
+            .await
+    }
+    async fn get_observed_historical(&self, id: &str, api: &str, strategy: &str) -> PinObservation {
+        self.inner.get_observed_historical(id, api, strategy).await
+    }
+    async fn get_historical(
+        &self,
+        id: &str,
+        api: &str,
+        strategy: &str,
+    ) -> Result<RemotePin, ProviderError> {
+        self.inner.get_historical(id, api, strategy).await
+    }
     async fn unpin(&self, id: &str) -> Result<(), ProviderError> {
         self.inner
             .unpin_historical(id, self.api, self.strategy)
@@ -225,6 +269,14 @@ impl PinningProvider for HistoricalProvider {
         strategy: &str,
     ) -> Result<QueryObservation, ProviderError> {
         self.inner.observe_historical(query, api, strategy).await
+    }
+    async fn unpin_historical(
+        &self,
+        id: &str,
+        api: &str,
+        strategy: &str,
+    ) -> Result<(), ProviderError> {
+        self.inner.unpin_historical(id, api, strategy).await
     }
 }
 

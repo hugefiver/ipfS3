@@ -280,6 +280,7 @@ impl DecidedPublish<'_> {
             .verify_revision(self.config, self.mode)
             .map_err(invalid_publication)?;
         let mut routes = BTreeMap::new();
+        let mut allocatable = BTreeSet::new();
         for name in self
             .decision
             .effective_intents
@@ -292,15 +293,15 @@ impl DecidedPublish<'_> {
                 .iter()
                 .find(|provider| &provider.name == name)
                 .ok_or_else(|| invalid_publication("captured pinning provider is unavailable"))?;
-            if !self.limits.get(name).is_some_and(|limit| limit.enabled) {
-                continue;
-            }
             if provider.identity.allocation_key() != *name {
                 return Err(invalid_publication(
                     "captured provider allocation key changed",
                 ));
             }
-            let route = provider.identity.route_snapshot();
+            let route = provider.route_snapshot();
+            if self.limits.get(name).is_some_and(|limit| limit.enabled) {
+                allocatable.insert(name.clone());
+            }
             if routes
                 .insert(name.clone(), route.clone())
                 .is_some_and(|old| old != route)
@@ -311,6 +312,7 @@ impl DecidedPublish<'_> {
         Ok(DecidedSnapshot {
             decision: self.decision.clone(),
             routes,
+            allocatable,
         })
     }
 }
@@ -319,6 +321,7 @@ impl DecidedPublish<'_> {
 struct DecidedSnapshot {
     decision: ExtensionDecision,
     routes: BTreeMap<String, ProviderRouteSnapshot>,
+    allocatable: BTreeSet<String>,
 }
 
 /// Cheap fail-fast check before a durable completion/import starts source or Kubo I/O.
@@ -328,7 +331,7 @@ pub async fn preflight_decided_routes(
     captured: DecidedPublish<'_>,
 ) -> AppResult<()> {
     let snapshot = captured.snapshot()?;
-    ledger::verify_selected_routes(db, &snapshot.routes, false).await
+    ledger::verify_birth_candidate_routes(db, &snapshot.routes, &snapshot.allocatable, false).await
 }
 
 pub async fn publish_decided_object(
@@ -1598,7 +1601,8 @@ async fn publish_in_transaction_with_batch(
         .collect();
     quota::lock_publication_usage_rows(db, &attachment_providers).await?;
     if let Some(snapshot) = decided {
-        ledger::verify_selected_routes(db, &snapshot.routes, true).await?;
+        ledger::verify_birth_candidate_routes(db, &snapshot.routes, &snapshot.allocatable, true)
+            .await?;
     }
     crate::store::residency::prepare_hot_publication_frontier(
         db,
@@ -2055,11 +2059,11 @@ async fn create_publication_leases<C: ConnectionTrait>(
     let mut failed_user_touches = BTreeSet::new();
     for intent in &request.policy.leases {
         let lease_id = lease_id(&request.object.id, intent.source);
-        insert_lease(db, &lease_id, &request.object.id, intent, now).await?;
+        let targets = target_specs(request, entries, intent.content_mode);
+        insert_lease(db, &lease_id, &request.object.id, intent, &targets, now).await?;
         // Decompressed entries can have distinct object CID spellings but the
         // same provider resource. Keep one target/reference per lease/resource.
         let mut assigned_targets = BTreeMap::new();
-        let targets = target_specs(request, entries, intent.content_mode);
         for target in targets {
             assign_target_providers(
                 db,
@@ -2091,6 +2095,7 @@ async fn insert_lease<C: ConnectionTrait>(
     lease_id: &str,
     owner_object_id: &str,
     intent: &LeaseIntent,
+    targets: &[PinTargetSpec],
     now: DateTime<Utc>,
 ) -> AppResult<()> {
     let seconds = i64::try_from(intent.duration.as_seconds())
@@ -2112,6 +2117,17 @@ async fn insert_lease<C: ConnectionTrait>(
         state: Set(LEASE_ACTIVE.to_owned()),
     })
     .exec(db)
+    .await?;
+    crate::store::entities::pin_lease_requirement::contract::insert(
+        db,
+        lease_id,
+        owner_object_id,
+        provider_mode_name(intent.provider_mode),
+        content_mode_name(intent.content_mode),
+        targets.iter().map(|target| target.cid.clone()),
+        &intent.providers,
+        now,
+    )
     .await?;
     Ok(())
 }

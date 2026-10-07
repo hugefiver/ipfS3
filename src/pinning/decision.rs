@@ -466,6 +466,7 @@ mod tests {
         let raw = PinningConfig {
             providers: vec![
                 ProviderConfig {
+                    cluster: None,
                     name: "selected".into(),
                     kind: "pinata".into(),
                     token_env: Some("PINNING_TOKEN".into()),
@@ -480,6 +481,7 @@ mod tests {
                     requests_per_second: None,
                 },
                 ProviderConfig {
+                    cluster: None,
                     name: "unrelated".into(),
                     kind: "pinata".into(),
                     token_env: Some("OTHER_TOKEN".into()),

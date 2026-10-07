@@ -701,6 +701,7 @@ async fn signed_import_restarts_worker_with_new_policy_without_replaying_skipped
 
     let mut raw = PinningConfig::default();
     raw.providers.push(ProviderConfig {
+        cluster: None,
         name: "new-provider".into(),
         kind: "noop".into(),
         token_env: None,

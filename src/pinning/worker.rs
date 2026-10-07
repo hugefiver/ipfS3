@@ -584,6 +584,12 @@ async fn execute_claimed_job_with_cancellation(
     }
     if claimed.model.operation != "submit"
         && claimed.model.attempts >= coordinator.settings().max_attempts as i32
+        && !(claimed.model.operation == "poll"
+            && crate::store::entities::pin_replica_observation::receipt::is_cluster(
+                store.db(),
+                &claimed.model.id,
+            )
+            .await?)
     {
         return park_exhausted_ordinary_job(store, coordinator, claimed).await;
     }
@@ -623,16 +629,16 @@ async fn registered_poll_route_matches(store: &Store, job: &pin_job::Model) -> A
     let captured = crate::store::pinning::ledger::job_route(store.db(), &job.id).await?;
     match (registered, captured) {
         (None, None) if !job.provider.starts_with("domain:") => Ok(true),
-        (Some(registered), Some(mut captured)) => {
+        (Some(registered), Some(captured)) => {
             let Ok(current) = serde_json::from_str::<crate::pinning::identity::ProviderRouteSnapshot>(
                 &registered.snapshot,
             ) else {
                 return Ok(false);
             };
-            captured.api_profile.clone_from(&current.api_profile);
-            captured.strategy.clone_from(&current.strategy);
-            captured.cleanup = current.cleanup;
-            Ok(captured == current)
+            Ok(!registered.retired
+                && crate::store::entities::pin_lease_requirement::contract::read_route_compatible(
+                    &captured, &current,
+                ))
         }
         _ => Ok(false),
     }
@@ -882,7 +888,10 @@ async fn execute_submit(
         // Evidence is independent of mutable lease/job projection. A later
         // lifecycle CAS, quota, or terminal-job write cannot erase actual roots.
         txn.commit().await?;
-        if can_project && !definitely_not_submitted && evidence.outcome != "matched" {
+        if can_project
+            && !definitely_not_submitted
+            && !matches!(evidence.outcome.as_str(), "matched" | "accepted")
+        {
             let txn = store.db().begin().await?;
             if !jobs::fence_job_claim(&txn, &claimed.model.id, claimed_lock(&claimed)?).await? {
                 txn.rollback().await?;
@@ -912,7 +921,10 @@ async fn execute_submit(
             .await?;
             txn.commit().await?;
         }
-        if !can_project || (!definitely_not_submitted && evidence.outcome != "matched") {
+        if !can_project
+            || (!definitely_not_submitted
+                && !matches!(evidence.outcome.as_str(), "matched" | "accepted"))
+        {
             return Ok(());
         }
     }
@@ -921,16 +933,21 @@ async fn execute_submit(
         .as_ref()
         .err()
         .map(|error| ledger::submission::typed_error(error, result.effect));
-    let result = result.result;
-    match result {
+    let resources = result.resources;
+    match result.result {
         Ok(remote) if valid_remote(&remote, &claimed.model.cid, None) => {
-            apply_observation(
+            let typed = crate::pinning::provider::PinObservation {
+                result: Ok(remote.clone()),
+                resources,
+            };
+            apply_typed_observation(
                 store,
                 coordinator,
                 &claimed,
                 remote,
                 RemoteStatusOrigin::Adopt,
                 ObservationSource::ProviderObserved,
+                Some(&typed),
             )
             .await
         }
@@ -1073,7 +1090,7 @@ async fn recover_submit(
     // RPC expected-CID queries cannot disprove an unknown upload or another
     // returned root. Only a captured, complete matching receipt can be replayed.
     if let Some(evidence) = ledger::submission::latest(store.db(), &claimed.model.id).await? {
-        if evidence.outcome == "matched" {
+        if matches!(evidence.outcome.as_str(), "matched" | "accepted") {
             let resources: Vec<ledger::submission::ResourceEvidence> =
                 serde_json::from_str(&evidence.resources)
                     .map_err(|_| AppError::Internal("invalid durable RPC receipt".into()))?;
@@ -1087,8 +1104,17 @@ async fn recover_submit(
                 RemotePin {
                     request_id: resource.resource.request_id.clone(),
                     cid: resource.resource.cid.clone(),
-                    status: RemotePinStatus::Pinned,
-                    raw_status: "pinned".into(),
+                    status: if evidence.outcome == "accepted" {
+                        RemotePinStatus::Pinning
+                    } else {
+                        RemotePinStatus::Pinned
+                    },
+                    raw_status: if evidence.outcome == "accepted" {
+                        "pinning"
+                    } else {
+                        "pinned"
+                    }
+                    .into(),
                     failure_reason: None,
                 },
                 RemoteStatusOrigin::Adopt,
@@ -1318,7 +1344,7 @@ async fn execute_poll(
         finish_and_reconcile(store, &claimed, Utc::now()).await?;
         return Ok(());
     };
-    let Some(slot) = acquire_provider_slot(
+    let Some(mut slot) = acquire_provider_slot(
         coordinator,
         store,
         &mut claimed,
@@ -1341,6 +1367,8 @@ async fn execute_poll(
     let expected_request_id = request_id.clone();
     let preflight_job = claimed.model.clone();
     let preflight_request_id = request_id.clone();
+    slot.health_observed_by_call = true;
+    let call_runtime = slot.runtime.clone();
     let result = match provider_call_with_heartbeat(
         slot,
         global,
@@ -1361,7 +1389,11 @@ async fn execute_poll(
                     .as_deref()
                     == Some(preflight_request_id.as_str()))
         },
-        move |provider| async move { provider.get(&request_id).await },
+        move |provider| async move {
+            let observation = provider.get_observed(&request_id).await;
+            update_provider_health(&call_runtime, &observation.result).await;
+            Ok(observation)
+        },
     )
     .await?
     {
@@ -1373,6 +1405,46 @@ async fn execute_poll(
         }
         ProviderCallOutcome::Completed(result) => result,
     };
+    let typed = match result {
+        Ok(observation) => observation,
+        Err(error) => crate::pinning::provider::PinObservation {
+            result: Err(error),
+            resources: Vec::new(),
+        },
+    };
+    if crate::store::entities::pin_replica_observation::receipt::is_cluster(
+        store.db(),
+        &claimed.model.id,
+    )
+    .await?
+    {
+        // Errors/partial/unknown are loss of confirmation, never permission for
+        // another POST, upload or unpin. Preserve the actual response separately.
+        let remote = typed
+            .result
+            .as_ref()
+            .ok()
+            .filter(|remote| valid_remote(remote, &claimed.model.cid, Some(&expected_request_id)))
+            .cloned()
+            .unwrap_or_else(|| RemotePin {
+                cid: claimed.model.cid.clone(),
+                request_id: expected_request_id.clone(),
+                status: RemotePinStatus::Pinning,
+                raw_status: "unknown".into(),
+                failure_reason: None,
+            });
+        return apply_typed_observation(
+            store,
+            coordinator,
+            &claimed,
+            remote,
+            RemoteStatusOrigin::ExistingRequest,
+            ObservationSource::ProviderObserved,
+            Some(&typed),
+        )
+        .await;
+    }
+    let result = typed.result;
     match result {
         Ok(remote)
             if valid_remote(
@@ -1425,7 +1497,14 @@ async fn current_poll_request(store: &Store, job: &pin_job::Model) -> AppResult<
     else {
         return Ok(None);
     };
-    if !matches!(remote.status.as_str(), STATUS_QUEUED | STATUS_PINNING) {
+    if !(matches!(remote.status.as_str(), STATUS_QUEUED | STATUS_PINNING)
+        || (remote.status == STATUS_PINNED
+            && crate::store::entities::pin_replica_observation::receipt::is_cluster(
+                store.db(),
+                &job.id,
+            )
+            .await?))
+    {
         return Ok(None);
     }
     let Some(request_id) = remote.request_id else {
@@ -1459,7 +1538,27 @@ async fn apply_observation(
     origin: RemoteStatusOrigin,
     source: ObservationSource,
 ) -> AppResult<()> {
+    apply_typed_observation(store, coordinator, claimed, remote, origin, source, None).await
+}
+
+async fn apply_typed_observation(
+    store: &Store,
+    coordinator: &PinningCoordinator,
+    claimed: &ClaimedPinJob,
+    mut remote: RemotePin,
+    origin: RemoteStatusOrigin,
+    source: ObservationSource,
+    typed: Option<&crate::pinning::provider::PinObservation>,
+) -> AppResult<()> {
     let now = Utc::now();
+    let cluster = crate::store::entities::pin_replica_observation::receipt::is_cluster(
+        store.db(),
+        &claimed.model.id,
+    )
+    .await?;
+    if cluster {
+        remote.status = RemotePinStatus::Pinning;
+    }
     let failure_reason = (remote.status == RemotePinStatus::Failed).then(|| {
         remote
             .failure_reason
@@ -1476,13 +1575,24 @@ async fn apply_observation(
         error_text: failure_reason,
         now,
     };
-    let result = match persist_observation_status_phase(store, claimed, update, source).await? {
+    let result = match persist_typed_observation_status_phase(store, claimed, update, source, typed)
+        .await?
+    {
         PersistObservationResult::Applied(result) => result,
         PersistObservationResult::StaleClaim => {
             transition(claimed, "running", "stale_claim_discarded", None);
             return Ok(());
         }
     };
+    if let RemoteStatusApplyResult::Applied { current_status, .. } = &result
+        && cluster
+    {
+        remote.status = if current_status == STATUS_PINNED {
+            RemotePinStatus::Pinned
+        } else {
+            RemotePinStatus::Pinning
+        };
+    }
     if let RemoteStatusApplyResult::Applied {
         previous_status,
         current_status,
@@ -1541,7 +1651,7 @@ async fn apply_observation(
                     audit_follow_up_failure(claimed, "failed_remote_retry", &error);
                     return Err(error);
                 }
-            } else if remote.status == RemotePinStatus::Pinned
+            } else if (cluster || remote.status == RemotePinStatus::Pinned)
                 && let Err(error) = converge_pinned_one_outcomes(store, &affected, now).await
             {
                 audit_follow_up_failure(claimed, "one_convergence", &error);
@@ -1551,10 +1661,10 @@ async fn apply_observation(
             let finalized: AppResult<&'static str> = async {
                 let txn = store.db().begin().await?;
                 let outcome = if claimed.model.operation == "poll"
-                    && matches!(
+                    && (cluster || matches!(
                         remote.status,
                         RemotePinStatus::Queued | RemotePinStatus::Pinning
-                    ) {
+                    )) {
                     let snapshot = leases::remote_work_snapshot(
                         &txn,
                         &claimed.model.provider,
@@ -1574,12 +1684,24 @@ async fn apply_observation(
                             &claimed.model.id,
                             claimed_lock(claimed)?,
                             now,
-                            coordinator.settings().poll_interval,
+                            if cluster {
+                                ledger::job_route(&txn, &claimed.model.id).await?.and_then(|route| match route.confirmation {
+                                    Some(crate::pinning::identity::ConfirmationRequirement::ClusterReplicas { max_age_secs, .. }) =>
+                                        Some(coordinator.settings().poll_interval.min(Duration::from_secs(u64::from(max_age_secs).max(2) / 2))),
+                                    _ => None,
+                                }).unwrap_or(coordinator.settings().poll_interval)
+                            } else { coordinator.settings().poll_interval },
                         )
                         .await?;
                         "poll_rescheduled"
                     } else {
                         complete_claimed_if_live(&txn, claimed, now).await?;
+                        if cluster {
+                            // One convergence can advance the winning lease's
+                            // generation after the fact transaction committed.
+                            // Hand off its healthy read-only Poll, not a Submit.
+                            ensure_current_reconcile(&txn, &claimed.model.provider, &claimed.model.cid, now).await?;
+                        }
                         "poll_handoff"
                     }
                 } else {
@@ -1627,13 +1749,70 @@ async fn persist_observation_status_phase(
     update: RemoteStatusUpdate<'_>,
     source: ObservationSource,
 ) -> AppResult<PersistObservationResult> {
-    let observation_status = update.status;
+    persist_typed_observation_status_phase(store, claimed, update, source, None).await
+}
+
+async fn persist_typed_observation_status_phase(
+    store: &Store,
+    claimed: &ClaimedPinJob,
+    mut update: RemoteStatusUpdate<'_>,
+    source: ObservationSource,
+    typed: Option<&crate::pinning::provider::PinObservation>,
+) -> AppResult<PersistObservationResult> {
+    let mut observation_status = update.status;
     let observation_time = update.now;
     let observation_request_id = update.request_id;
     let txn = store.db().begin().await?;
-    if !jobs::fence_job_claim(&txn, &claimed.model.id, claimed_lock(claimed)?).await? {
+    let live = jobs::fence_job_claim(&txn, &claimed.model.id, claimed_lock(claimed)?).await?;
+    let cluster = crate::store::entities::pin_replica_observation::receipt::is_cluster(
+        &txn,
+        &claimed.model.id,
+    )
+    .await?;
+    if !(live || cluster && typed.is_some()) {
         txn.rollback().await?;
         return Ok(PersistObservationResult::StaleClaim);
+    }
+    if cluster {
+        // A failed PG predicate does not lock the newer job. Always serialize
+        // receipt appends job -> history -> lifecycle frontier -> remote.
+        jobs::lock_submit_receipt(&txn, &claimed.model.id).await?;
+        // Acquire the established lease -> complete target frontier -> remote
+        // order before appending facts and projecting in this same claim txn.
+        leases::lock_replica_observation_lifecycle(
+            &txn,
+            &claimed.model.provider,
+            &claimed.model.cid,
+        )
+        .await?;
+        let complete = if let Some(typed) = typed {
+            let receipt = crate::store::entities::pin_replica_observation::receipt::append(
+                &txn,
+                claimed,
+                typed,
+                observation_request_id,
+                &claimed.model.operation,
+                observation_time,
+            )
+            .await?;
+            if !receipt.projectable {
+                txn.commit().await?;
+                return Ok(if live {
+                    PersistObservationResult::Applied(RemoteStatusApplyResult::StaleRequest)
+                } else {
+                    PersistObservationResult::StaleClaim
+                });
+            }
+            receipt.complete
+        } else {
+            false
+        };
+        update.status = if complete {
+            RemotePinStatus::Pinned
+        } else {
+            RemotePinStatus::Pinning
+        };
+        observation_status = update.status;
     }
     let result = if claimed.model.operation == "reconcile" {
         leases::apply_claimed_reconcile_remote_status(&txn, update, &claimed.model).await?
@@ -2802,6 +2981,43 @@ async fn acquire_provider_slot(
         crate::store::pinning::ledger::job_route(store.db(), &claimed.model.id).await?
     };
     if let Some(route) = route {
+        if route.resource_type() == crate::pinning::identity::RemoteResourceType::ClusterPin {
+            let mut historical = coordinator
+                .effective_config()
+                .providers
+                .iter()
+                .find(|provider| provider.name == *provider_name)
+                .cloned()
+                .ok_or_else(|| {
+                    AppError::Internal("Cluster historical provider unavailable".into())
+                })?;
+            let options = historical.cluster.as_mut().ok_or_else(|| {
+                AppError::Internal("Cluster historical options unavailable".into())
+            })?;
+            let Some(crate::pinning::identity::ConfirmationRequirement::ClusterReplicas {
+                min_replicas,
+                max_age_secs,
+            }) = route.confirmation
+            else {
+                return Err(AppError::Internal(
+                    "Cluster birth confirmation unavailable; needs_attention".into(),
+                ));
+            };
+            options.min_replicas = min_replicas as usize;
+            options.verifier_limits.max_observation_age =
+                Duration::from_secs(u64::from(max_age_secs));
+            // Factory requires main-source binding for upload/CAR, even though
+            // this historical read never calls source/upload. The source is the
+            // already validated config endpoint, not an observed peer address.
+            let source = options
+                .source
+                .as_ref()
+                .map(|source| crate::kubo::KuboClient::new(source.endpoint.clone()));
+            provider = crate::pinning::cluster::build_cluster_provider(&historical, source)
+                .map_err(|error| {
+                    AppError::Internal(error.safe_evidence("cluster_historical_read"))
+                })?;
+        }
         let api = match route.api_profile.as_str() {
             "pinata-psa" | "filebase-psa" => "psa",
             "pinata-v3" => "pinata_v3",
@@ -2810,6 +3026,8 @@ async fn acquire_provider_slot(
             "rpc" => "rpc",
             "kubo" => "kubo",
             "filebase-rpc" => "filebase-rpc",
+            "cluster-proxy" => "cluster-proxy",
+            "cluster-rest" => "cluster-rest",
             _ => "unknown",
         };
         let strategy = match route.strategy.as_str() {
@@ -2966,19 +3184,25 @@ where
     // A dispatched Submit must finish collecting its structured evidence even
     // when a claim is lost. Its caller appends evidence under the old invocation
     // and independently refuses projection into a new claim/lifetime.
-    let rpc_submit = claimed.model.operation == "submit"
-        && ledger::submission::is_rpc_api(slot.provider.invocation_route().0);
+    let retain_receipt = (claimed.model.operation == "submit"
+        && ledger::submission::is_rpc_api(slot.provider.invocation_route().0))
+        || (claimed.model.operation == "poll"
+            && crate::store::entities::pin_replica_observation::receipt::is_cluster(
+                store.db(),
+                &claimed.model.id,
+            )
+            .await?);
     let mut lost_rpc_claim = false;
     let result = loop {
         tokio::select! {
             result = &mut future => break result,
             _ = interval.tick(), if !lost_rpc_claim => {
                 let renewal = renew_claim_once(store, claimed, lock_for).await;
-                if rpc_submit && renewal.is_err() { lost_rpc_claim = true; } else { renewal?; }
+                if retain_receipt && renewal.is_err() { lost_rpc_claim = true; } else { renewal?; }
             },
         }
     };
-    if !rpc_submit
+    if !retain_receipt
         && !jobs::fence_job_claim(store.db(), &claimed.model.id, claimed_lock(claimed)?).await?
     {
         return Ok(ProviderCallOutcome::StaleClaim);
@@ -3915,6 +4139,7 @@ mod tests {
                     api: None,
                     strategy: None,
                     upload_endpoint: None,
+                    cluster: None,
                     enabled: true,
                     priority: 1,
                     max_bytes,
@@ -3929,6 +4154,7 @@ mod tests {
                     api: None,
                     strategy: None,
                     upload_endpoint: None,
+                    cluster: None,
                     enabled: true,
                     priority: 2,
                     max_bytes: 10_000,
@@ -3943,6 +4169,7 @@ mod tests {
                     api: None,
                     strategy: None,
                     upload_endpoint: None,
+                    cluster: None,
                     enabled: true,
                     priority: 3,
                     max_bytes: 10_000,
@@ -9079,41 +9306,79 @@ mod tests {
             1,
             std::time::Duration::from_secs(1),
         );
-        *fixture
-            .coordinator
-            .provider_runtime("noop")
-            .unwrap()
-            .next_request_at
-            .lock()
-            .await = Some(tokio::time::Instant::now() + std::time::Duration::from_millis(700));
         let due = Utc::now() - chrono::Duration::seconds(1);
         let slow_job = fixture.seed_poll("rate-wait", due).await;
         fixture
             .seed_poll_for("fast", "rate-fast", due + chrono::Duration::milliseconds(1))
             .await;
 
+        // SQLite replies run on helper threads: keep Tokio runnable so only our explicit
+        // advances, not DB latency or automatic advancement, can expire the rate deadline.
+        tokio::time::pause();
+        let paused_runtime_keepalive = tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        });
+        let slow_runtime = fixture
+            .coordinator
+            .provider_runtime("noop")
+            .unwrap()
+            .clone();
+        let rate_deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(700);
+        *slow_runtime.next_request_at.lock().await = Some(rate_deadline);
+
         let db = fixture.store.db().clone();
         let slow_provider = fixture.provider.clone();
         let coordinator = fixture.coordinator.clone();
         let handle = coordinator.start(fixture.store, CancellationToken::new());
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while fast_provider.gets.load(Ordering::SeqCst) == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("fast provider was blocked by another provider's rate wait");
-        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
-
-        let waiting = pin_job::Entity::find_by_id(slow_job)
+        // Register the worker's initial interval tick, then cross Tokio's 1ms timer granularity.
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        // The Tokio clock is frozen; bound progress with the original wall-clock budget.
+        let progress_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while fast_provider.gets.load(Ordering::SeqCst) == 0
+            || slow_runtime.next_request_at.try_lock().is_ok()
+        {
+            assert!(
+                std::time::Instant::now() < progress_deadline,
+                "fast provider did not progress alongside the slow provider's rate wait"
+            );
+            tokio::task::yield_now().await;
+        }
+        let before_heartbeat = pin_job::Entity::find_by_id(slow_job.clone())
             .one(&db)
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(before_heartbeat.state, "running");
+        assert_eq!(slow_provider.gets.load(Ordering::SeqCst), 0);
+        tokio::time::advance(std::time::Duration::from_millis(350)).await;
+
+        let heartbeat_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let waiting = loop {
+            let waiting = pin_job::Entity::find_by_id(slow_job.clone())
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+            if waiting.locked_until > before_heartbeat.locked_until {
+                break waiting;
+            }
+            assert!(
+                std::time::Instant::now() < heartbeat_deadline,
+                "rate waiter did not heartbeat its exact claim"
+            );
+            tokio::task::yield_now().await;
+        };
         assert_eq!(waiting.state, "running");
-        assert!(waiting.locked_until.unwrap() > Utc::now());
+        assert_eq!(waiting.attempts, before_heartbeat.attempts);
+        assert!(tokio::time::Instant::now() < rate_deadline);
+        let old_lock = before_heartbeat.locked_until.unwrap();
+        let reclaim_at = old_lock + (waiting.locked_until.unwrap() - old_lock) / 2;
+        assert!(reclaim_at > old_lock);
         assert!(
-            jobs::claim_due_jobs(&db, Utc::now(), chrono::Duration::milliseconds(120), 2,)
+            jobs::claim_due_jobs(&db, reclaim_at, chrono::Duration::milliseconds(120), 2,)
                 .await
                 .unwrap()
                 .is_empty()
@@ -9121,8 +9386,13 @@ mod tests {
         handle.shutdown(std::time::Duration::from_millis(40)).await;
         assert_eq!(slow_provider.gets.load(Ordering::SeqCst), 0);
         assert_eq!(fast_provider.gets.load(Ordering::SeqCst), 1);
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        tokio::time::advance(std::time::Duration::from_millis(400)).await;
+        assert!(tokio::time::Instant::now() > rate_deadline);
         assert_eq!(slow_provider.gets.load(Ordering::SeqCst), 0);
+        assert_eq!(fast_provider.gets.load(Ordering::SeqCst), 1);
+        paused_runtime_keepalive.abort();
+        assert!(paused_runtime_keepalive.await.unwrap_err().is_cancelled());
+        tokio::time::resume();
     }
 
     #[tokio::test]

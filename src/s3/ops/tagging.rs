@@ -703,6 +703,7 @@ mod tests {
                     .iter()
                     .enumerate()
                     .map(|(index, name)| ProviderConfig {
+                        cluster: None,
                         name: (*name).to_owned(),
                         kind: "noop".to_owned(),
                         token_env: None,

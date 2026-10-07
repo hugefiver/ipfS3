@@ -123,6 +123,9 @@ mod migrator {
                 Box::new(
                     crate::store::migrations::m20261004_000001_rpc_submission_ledger::Migration,
                 ),
+                Box::new(
+                    crate::store::migrations::m20261004_000002_cluster_replica_contract::Migration,
+                ),
             ]
         }
     }

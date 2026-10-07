@@ -17,6 +17,7 @@ pub enum ProviderKind {
     Pinata,
     Filebase,
     IpfsRpc,
+    Cluster,
     Noop,
 }
 
@@ -26,6 +27,7 @@ impl ProviderKind {
             "pinata" => Ok(Self::Pinata),
             "filebase" => Ok(Self::Filebase),
             "ipfs_rpc" => Ok(Self::IpfsRpc),
+            "cluster" => Ok(Self::Cluster),
             "noop" => Ok(Self::Noop),
             _ => bail!("unknown provider kind `{raw}`"),
         }
@@ -193,8 +195,27 @@ pub struct ValidatedProvider {
     pub pinata: Option<PinataProviderOptions>,
     /// Present only for native Kubo/Filebase RPC; authoritative execution route.
     pub rpc: Option<crate::pinning::ipfs_rpc::RpcProviderOptions>,
+    pub cluster: Option<crate::pinning::cluster::provider::ClusterProviderOptions>,
     pub limits: ProviderLimits,
     pub requests_per_second: Option<u32>,
+}
+
+impl ValidatedProvider {
+    pub fn route_snapshot(&self) -> crate::pinning::identity::ProviderRouteSnapshot {
+        let mut snapshot = self.identity.route_snapshot();
+        snapshot.confirmation = self.cluster.as_ref().map(|options| options.confirmation());
+        snapshot
+    }
+
+    pub fn validate_route_snapshot(
+        &self,
+        snapshot: &crate::pinning::identity::ProviderRouteSnapshot,
+    ) -> anyhow::Result<()> {
+        if self.route_snapshot() != *snapshot {
+            bail!("historical provider route or confirmation revision unavailable");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -259,7 +280,14 @@ impl ValidatedPinningConfig {
     where
         F: Fn(&str) -> Option<String>,
     {
-        Self::from_parts(raw, None, &[], OptionalPinControlMode::Strict, get_env)
+        Self::from_parts(
+            raw,
+            None,
+            &[],
+            None,
+            OptionalPinControlMode::Strict,
+            get_env,
+        )
     }
 
     pub fn from_config<F>(config: &Config, get_env: F) -> anyhow::Result<Self>
@@ -270,6 +298,7 @@ impl ValidatedPinningConfig {
             &config.pinning,
             Some(&config.pinning_identity),
             &config.pinning_rpc.providers,
+            Some(&config.kubo.rpc_url),
             config.pinning_control.unavailable,
             get_env,
         )
@@ -279,6 +308,7 @@ impl ValidatedPinningConfig {
         raw: &PinningConfig,
         identity_config: Option<&PinningIdentityConfig>,
         rpc_configs: &[crate::pinning::ipfs_rpc::RpcProviderConfig],
+        primary_kubo: Option<&str>,
         optional_control: OptionalPinControlMode,
         get_env: F,
     ) -> anyhow::Result<Self>
@@ -320,7 +350,8 @@ impl ValidatedPinningConfig {
             let rpc = rpc_configs
                 .iter()
                 .find(|rpc| rpc.config_name == provider.name);
-            let validated = Self::validate_provider(provider, explicit_identity, rpc, &get_env)?;
+            let validated =
+                Self::validate_provider(provider, explicit_identity, rpc, primary_kubo, &get_env)?;
             provider_limits.insert(validated.name.clone(), validated.limits.clone());
             providers.push(validated);
         }
@@ -347,6 +378,7 @@ impl ValidatedPinningConfig {
         provider: &ProviderConfig,
         explicit_identity: Option<&ProviderIdentity>,
         rpc_config: Option<&crate::pinning::ipfs_rpc::RpcProviderConfig>,
+        primary_kubo: Option<&str>,
         get_env: &F,
     ) -> anyhow::Result<ValidatedProvider>
     where
@@ -357,6 +389,12 @@ impl ValidatedPinningConfig {
         }
 
         let kind = ProviderKind::parse(&provider.kind)?;
+        if (kind == ProviderKind::Cluster) != provider.cluster.is_some() {
+            bail!("Cluster options require an explicit kind = cluster registration");
+        }
+        if kind == ProviderKind::Cluster && explicit_identity.is_none() {
+            bail!("Cluster providers require an explicit stable pinning_identity");
+        }
         let is_rpc = kind == ProviderKind::IpfsRpc
             || (kind == ProviderKind::Filebase && provider.api.as_deref() == Some("rpc"));
         if is_rpc && explicit_identity.is_none() {
@@ -431,6 +469,18 @@ impl ValidatedPinningConfig {
                 }
                 None
             }
+            ProviderKind::Cluster => {
+                if provider.api.is_some()
+                    || provider.endpoint.is_some()
+                    || provider.upload_endpoint.is_some()
+                    || provider.token_env.is_some()
+                {
+                    bail!(
+                        "Cluster routes use independent cluster protocol/endpoints/auth, not legacy api/endpoint/token fields"
+                    );
+                }
+                None
+            }
             ProviderKind::Filebase | ProviderKind::Noop => {
                 let filebase_psa = kind == ProviderKind::Filebase;
                 if provider.api.is_some()
@@ -488,7 +538,7 @@ impl ValidatedPinningConfig {
                     ),
                 }
             }
-            ProviderKind::Noop => {
+            ProviderKind::Noop | ProviderKind::Cluster => {
                 if provider.token_env.is_some() {
                     bail!(
                         "noop provider `{}` must not configure a token environment variable",
@@ -519,15 +569,28 @@ impl ValidatedPinningConfig {
         } else {
             None
         };
-        let (api_profile, strategy) = match &rpc {
-            Some(options) => (
+        let cluster = provider
+            .cluster
+            .as_ref()
+            .map(|raw| {
+                raw.validate(
+                    provider.strategy.as_deref(),
+                    explicit_identity.expect("Cluster explicit identity checked"),
+                    primary_kubo,
+                    get_env,
+                )
+            })
+            .transpose()?;
+        let (api_profile, strategy) = match (&rpc, &cluster) {
+            (_, Some(options)) => (options.protocol.api_profile(), options.strategy.as_str()),
+            (Some(options), _) => (
                 match options.profile {
                     crate::pinning::ipfs_rpc::RpcProfile::Kubo => "kubo",
                     crate::pinning::ipfs_rpc::RpcProfile::Filebase => "filebase-rpc",
                 },
                 options.strategy.as_str(),
             ),
-            None => provider_route(kind, provider, pinata.as_ref()),
+            _ => provider_route(kind, provider, pinata.as_ref()),
         };
         let identity = match explicit_identity {
             Some(identity) => {
@@ -535,7 +598,11 @@ impl ValidatedPinningConfig {
                     provider,
                     kind,
                     identity,
-                    expected_secret_ref.as_deref(),
+                    if kind == ProviderKind::Cluster {
+                        identity.secret_ref.as_deref()
+                    } else {
+                        expected_secret_ref.as_deref()
+                    },
                     api_profile,
                     strategy,
                 )?;
@@ -561,6 +628,7 @@ impl ValidatedPinningConfig {
             endpoint: provider.endpoint.clone(),
             pinata,
             rpc,
+            cluster,
             limits,
             requests_per_second: provider.requests_per_second,
         })
@@ -617,10 +685,10 @@ impl ValidatedPinningConfig {
             }
             providers.push(provider_name.clone());
         }
-        if !providers
+        if !(providers
             .iter()
             .any(|provider_name| provider_limits[provider_name].enabled)
-            && !(optional_control == OptionalPinControlMode::Warn
+            || optional_control == OptionalPinControlMode::Warn
                 && trigger == PolicyTrigger::Request)
         {
             bail!(
@@ -712,6 +780,7 @@ fn provider_backend(kind: ProviderKind) -> &'static str {
         ProviderKind::Pinata => "pinata",
         ProviderKind::Filebase => "filebase",
         ProviderKind::IpfsRpc => "kubo",
+        ProviderKind::Cluster => "cluster",
         ProviderKind::Noop => "noop",
     }
 }
@@ -744,6 +813,7 @@ fn provider_route(
         }
         ProviderKind::Filebase => ("filebase-psa", "cid"),
         ProviderKind::IpfsRpc => ("kubo", "cid"),
+        ProviderKind::Cluster => unreachable!("Cluster route comes from typed options"),
         ProviderKind::Noop => ("noop", "cid"),
     }
 }
@@ -851,6 +921,7 @@ mod tests {
             api: None,
             strategy: None,
             upload_endpoint: None,
+            cluster: None,
             enabled: true,
             priority: 10,
             max_bytes: 100,

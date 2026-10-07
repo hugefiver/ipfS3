@@ -446,6 +446,7 @@ pub(crate) fn test_token(value: &str) -> SecretToken {
         worker_interval: "5s".to_owned(),
         worker_concurrency: 1,
         providers: vec![ProviderConfig {
+            cluster: None,
             name: "test".to_owned(),
             kind: "pinata".to_owned(),
             token_env: Some("TEST_TOKEN".to_owned()),
@@ -498,7 +499,10 @@ mod tests {
                 super::test_token(TOKEN),
                 Some(format!("{}/v1/ipfs", server.uri())),
             ),
-            ProviderKind::Pinata | ProviderKind::IpfsRpc | ProviderKind::Noop => {
+            ProviderKind::Pinata
+            | ProviderKind::IpfsRpc
+            | ProviderKind::Cluster
+            | ProviderKind::Noop => {
                 unreachable!("PSA tests only cover Filebase")
             }
         }

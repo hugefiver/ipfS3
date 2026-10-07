@@ -2060,10 +2060,17 @@ async fn validate_poll_owner<C: ConnectionTrait>(db: &C, job: &TargetPinJob) -> 
             "Poll job does not own a queued or pinning request",
         ));
     };
-    if !matches!(
+    if !(matches!(
         remote.status.as_str(),
         REMOTE_STATUS_QUEUED | REMOTE_STATUS_PINNING
-    ) {
+    ) || (remote.status == "pinned"
+        && crate::store::entities::pin_replica_observation::receipt::retained_cluster(
+            db,
+            &job.provider,
+            &job.cid,
+        )
+        .await?))
+    {
         return Err(invalid_job(
             "Poll job does not own a queued or pinning request",
         ));

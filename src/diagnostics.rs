@@ -95,6 +95,16 @@ fn provider_token_variables(config: &Config) -> Vec<Value> {
         .iter()
         .enumerate()
         .map(|(index, provider)| {
+            if let Some(cluster) = &provider.cluster {
+                let credentials = |auth: &ipfs_s3_gateway::pinning::cluster::config::ClusterCredentialConfig| {
+                    let (token_reference, token_value) = credential_variable(auth.token_env.as_deref(), auth.auth != "none");
+                    let (username_reference, username_value) = credential_variable(auth.username_env.as_deref(), auth.auth == "basic");
+                    json!({"token_env_reference": token_reference, "token_env_value": token_value,
+                        "username_env_reference": username_reference, "username_env_value": username_value})
+                };
+                return json!({"provider_index": index, "proxy": credentials(&cluster.proxy_auth),
+                    "rest": credentials(&cluster.rest_auth), "source": credentials(&cluster.source)});
+            }
             let rpc = config
                 .pinning_rpc
                 .providers
@@ -136,6 +146,9 @@ fn capability(operation: &'static str, configured: &'static str) -> Value {
 }
 
 fn provider_strategy(provider: &ValidatedProvider) -> &'static str {
+    if let Some(cluster) = &provider.cluster {
+        return cluster.strategy.as_str();
+    }
     if let Some(rpc) = &provider.rpc {
         return rpc.strategy.as_str();
     }
@@ -153,6 +166,9 @@ fn provider_strategy(provider: &ValidatedProvider) -> &'static str {
 }
 
 fn provider_profile(provider: &ValidatedProvider) -> &'static str {
+    if let Some(cluster) = &provider.cluster {
+        return cluster.protocol.api_profile();
+    }
     if let Some(rpc) = &provider.rpc {
         return match rpc.profile {
             RpcProfile::Kubo => "kubo",
@@ -170,6 +186,21 @@ fn provider_profile(provider: &ValidatedProvider) -> &'static str {
 }
 
 fn provider_credential(provider: &ValidatedProvider) -> &'static str {
+    if let Some(cluster) = &provider.cluster {
+        let auth = match cluster.protocol {
+            ipfs_s3_gateway::pinning::cluster::provider::ClusterProtocol::Proxy => {
+                &cluster.proxy_auth
+            }
+            ipfs_s3_gateway::pinning::cluster::provider::ClusterProtocol::Rest => {
+                &cluster.rest_auth
+            }
+        };
+        return if auth.is_some() {
+            "present"
+        } else {
+            "not_required"
+        };
+    }
     if let Some(rpc) = &provider.rpc {
         // Basic and Bearer credentials were checked by pure config validation;
         // presence says nothing about remote authorization. Anonymous RPC does
@@ -192,14 +223,20 @@ fn provider_operations(provider: &ValidatedProvider) -> Value {
     let active = provider.limits.enabled;
     let kind = provider.kind;
     let route = provider_strategy(provider);
-    let (cid, upload, car, recursive) = match &provider.rpc {
-        Some(rpc) => (
+    let (cid, upload, car, recursive) = match (&provider.rpc, &provider.cluster) {
+        (_, Some(cluster)) => (
+            cluster.strategy.as_str() == "cid",
+            cluster.strategy.as_str() == "upload",
+            cluster.strategy.as_str() == "car",
+            false, // Local recursive pins are never Cluster N/N confirmation.
+        ),
+        (Some(rpc), _) => (
             rpc.profile == RpcProfile::Kubo && rpc.strategy == RpcStrategy::Cid,
             rpc.strategy == RpcStrategy::Upload,
             rpc.profile == RpcProfile::Kubo && rpc.strategy == RpcStrategy::Car,
             true,
         ),
-        None => (
+        _ => (
             route == "cid",
             kind == ProviderKind::Pinata && route == "upload",
             false,
@@ -224,7 +261,7 @@ fn provider_operations(provider: &ValidatedProvider) -> Value {
         } else {
             "denied"
         };
-    json!([
+    let mut operations = vec![
         supported("submit_cid", cid),
         supported("upload_bytes", upload),
         supported("query_remote", true),
@@ -232,7 +269,11 @@ fn provider_operations(provider: &ValidatedProvider) -> Value {
         // Append new evidence without changing the legacy operation indices.
         supported("import_car", car),
         supported("query_recursive", recursive),
-    ])
+    ];
+    if provider.cluster.is_some() {
+        operations.push(supported("query_cluster_replicas", true));
+    }
+    json!(operations)
 }
 
 fn providers(validated: &ValidatedPinningConfig, explicit_identity: bool) -> Vec<Value> {
@@ -249,11 +290,11 @@ fn providers(validated: &ValidatedPinningConfig, explicit_identity: bool) -> Vec
             let scope = *scopes
                 .entry((identity.backend.clone(), identity.scope.clone()))
                 .or_insert(next);
-            json!({
+            let mut report = json!({
                 "provider_index": index,
                 "scope_ref": scope,
                 "scope_evidence": if explicit_identity { "explicit_identity" } else { "legacy_config_name" },
-                "backend": match provider.kind { ProviderKind::Pinata => "pinata", ProviderKind::Filebase => "filebase", ProviderKind::IpfsRpc => "kubo", ProviderKind::Noop => "noop" },
+                "backend": match provider.kind { ProviderKind::Pinata => "pinata", ProviderKind::Filebase => "filebase", ProviderKind::IpfsRpc => "kubo", ProviderKind::Cluster => "cluster", ProviderKind::Noop => "noop" },
                 "profile": provider_profile(provider),
                 "credential_revision": identity.credential_revision,
                 "endpoint_revision": identity.endpoint_revision,
@@ -262,7 +303,24 @@ fn providers(validated: &ValidatedPinningConfig, explicit_identity: bool) -> Vec
                 "credential": provider_credential(provider),
                 "strategy": provider_strategy(provider),
                 "operations": provider_operations(provider),
-            })
+            });
+            if let Some(cluster) = &provider.cluster {
+                report["confirmation"] = json!({
+                    "kind": "cluster_replicas", "min_replicas": cluster.min_replicas,
+                    "max_age_secs": cluster.verifier_limits.max_observation_age.as_secs(),
+                    "configured_route": "fresh_rest_allocated_distinct_pinned_peers",
+                    "remote_permission": "unknown", "remote_observation": "not_performed",
+                    "account_replication": "not_proven", "failure_domain_independence": "not_proven",
+                    "replication_factor": "not_modified_by_confirmation_threshold",
+                });
+                report["route_credentials"] = json!({
+                    "proxy": if cluster.proxy_auth.is_some() { "present" } else { "not_required" },
+                    "rest": if cluster.rest_auth.is_some() { "present" } else { "not_required" },
+                    "source": if cluster.source.as_ref().is_some_and(|s| s.auth.is_some()) { "present" } else { "not_required" },
+                    "evidence": "local_configuration_only_not_account_authorization",
+                });
+            }
+            report
         })
         .collect()
 }

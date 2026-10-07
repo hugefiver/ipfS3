@@ -294,6 +294,9 @@ pub struct ProviderConfig {
     pub api: Option<String>,
     pub strategy: Option<String>,
     pub upload_endpoint: Option<String>,
+    /// Cluster transport options belong to this registration, not a second registry.
+    #[serde(default)]
+    pub cluster: Option<crate::pinning::cluster::config::ClusterProviderConfig>,
     #[serde(default = "enabled")]
     pub enabled: bool,
     pub priority: u32,

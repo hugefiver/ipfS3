@@ -684,7 +684,7 @@ pub async fn fail_if_owned(
         || snapshot.state != "pending"
         || snapshot.epoch != claim.epoch
         || snapshot.worker.as_deref() != Some(&claim.worker)
-        || !snapshot.lease_until.is_some_and(|until| until > now)
+        || snapshot.lease_until.is_none_or(|until| until <= now)
     {
         return Ok(false);
     }

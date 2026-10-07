@@ -229,6 +229,7 @@ fn pin_config() -> ValidatedPinningConfig {
     let providers = ["a", "b"]
         .into_iter()
         .map(|name| ProviderConfig {
+            cluster: None,
             name: name.into(),
             kind: "noop".into(),
             token_env: None,

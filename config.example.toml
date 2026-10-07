@@ -277,3 +277,55 @@ allow_decompressed = true
 # Codec + multihash must match (equivalent CIDv0/v1 is allowed). S3 ETag/CID stays
 # unchanged. Unknown/mismatch footprints remain durable and block automatic
 # re-POST/deletion; timeout/terminal job/lease expiry doesn't release that debt.
+
+# Stage 6 opt-in independent Cluster provider. This does not replace the main
+# [kubo] endpoint or change the Cluster deployment's replication_min/max.
+# Enable the provider/identity together and explicitly select it in a policy.
+# Proxy requires both proxy_endpoint and the independent REST status verifier.
+# For native REST, set protocol = "rest", omit proxy_endpoint/proxy_auth, and
+# use api_profile = "cluster-rest". Both protocols require explicit cid/upload/car.
+# [[pinning.providers]]
+# name = "cluster-backup"
+# kind = "cluster"
+# strategy = "car"
+# priority = 50
+# max_bytes = 107374182400
+# max_pins = 10000
+#
+# [pinning.providers.cluster]
+# protocol = "proxy"
+# proxy_endpoint = "http://127.0.0.1:9095"
+# rest_endpoint = "http://127.0.0.1:9094"
+# min_replicas = 2
+# allow_private_network = true
+# stream_channels = true
+#
+# [pinning.providers.cluster.verifier_limits]
+# max_age_secs = 30
+#
+# [[pinning_identity.providers]]
+# config_name = "cluster-backup"
+# provider_id = "cluster-backup-prod"
+# display_name = "Independent Cluster pinset"
+# backend = "cluster"
+# scope = "backup-pinset"
+# storage_domain = "cluster:backup"
+# credential_revision = 1
+# endpoint_revision = 1
+# api_profile = "cluster-proxy"
+# strategy = "car"
+# cleanup = "retain"
+#
+# Authentication defaults to none independently for proxy_auth, rest_auth and
+# source (the main Kubo bytes/DAG reader). Each subtable accepts auth = "bearer"
+# with token_env, or auth = "basic" with username_env and token_env. These are
+# environment variable names, never secrets. The identity secret_ref must name
+# the write credential (Proxy for proxy protocol, REST for rest protocol).
+# Bump credential/endpoint revisions when any of these independent routes changes.
+# CID strategy does not use source credentials. Upload/CAR only read the captured
+# main Kubo source; no alternate source URL or plaintext decryption is configured.
+# min_replicas is a fresh confirmation threshold, not a deployment RF setting.
+# Same backend/pinset/CID via multiple addresses is one logical resource, not
+# independent disaster recovery. Unknown ownership never authorizes deletion.
+# Stop/drain old writers/workers and back up before the replica-contract migration;
+# keep immutable requirements/observations and do not bypass a refused down.

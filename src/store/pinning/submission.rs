@@ -34,11 +34,17 @@ pub struct ResourceEvidence {
 }
 
 pub fn is_rpc(route: &ProviderRouteSnapshot) -> bool {
-    route.resource_type() == RemoteResourceType::RpcPin
+    matches!(
+        route.resource_type(),
+        RemoteResourceType::RpcPin | RemoteResourceType::ClusterPin
+    )
 }
 
 pub fn is_rpc_api(api: &str) -> bool {
-    matches!(api, "rpc" | "kubo" | "filebase-rpc")
+    matches!(
+        api,
+        "rpc" | "kubo" | "filebase-rpc" | "cluster-proxy" | "cluster-rest"
+    )
 }
 
 pub fn typed_error(error: &ProviderError, effect: SubmitEffect) -> String {
@@ -185,8 +191,10 @@ async fn record_in_transaction<C: ConnectionTrait>(
         .cloned()
         .map(|mut resource| {
             // No RPC state supplied by Stage 5 is ApplicationCreated proof.
-            if resource.resource_type == RemoteResourceType::RpcPin
-                || resource.ownership == Ownership::ApplicationCreated
+            if matches!(
+                resource.resource_type,
+                RemoteResourceType::RpcPin | RemoteResourceType::ClusterPin
+            ) || resource.ownership == Ownership::ApplicationCreated
             {
                 resource.ownership = Ownership::Unknown;
             }
@@ -204,28 +212,39 @@ async fn record_in_transaction<C: ConnectionTrait>(
     let keys: std::collections::BTreeSet<_> =
         resources.iter().filter_map(|r| r.key.as_ref()).collect();
     let matches_expected = resources.iter().all(|r| {
-        r.resource.resource_type == RemoteResourceType::RpcPin
+        r.resource.resource_type == route.resource_type()
             && cids_equivalent(&r.resource.cid, &row.expected_cid).unwrap_or(false)
     });
+    let cluster = route.resource_type() == RemoteResourceType::ClusterPin;
     let successful = observation.result.as_ref().is_ok_and(|remote| {
         !remote.request_id.is_empty()
             && resources
                 .iter()
                 .all(|r| r.resource.request_id == remote.request_id)
-            && remote.status == RemotePinStatus::Pinned
+            && (remote.status == RemotePinStatus::Pinned
+                || (cluster && remote.status == RemotePinStatus::Pinning))
             && cids_equivalent(&remote.cid, &row.expected_cid).unwrap_or(false)
     }) && observation.effect == SubmitEffect::Observed
         && keys.len() == 1
         && matches_expected
         && resources.iter().all(|r| {
-            r.key.is_some() && r.resource.status == ObservedResourceStatus::RecursiveVerified
+            r.key.is_some()
+                && if cluster {
+                    matches!(
+                        r.resource.status,
+                        ObservedResourceStatus::PinAccepted
+                            | ObservedResourceStatus::ReplicasVerified
+                    )
+                } else {
+                    r.resource.status == ObservedResourceStatus::RecursiveVerified
+                }
         });
     let safe_not_submitted = observation.effect == SubmitEffect::NotSubmitted
         && resources.is_empty()
         && observation.result.is_err();
     let mismatch = !matches_expected || keys.len() > 1;
     let outcome = if successful {
-        "matched"
+        if cluster { "accepted" } else { "matched" }
     } else if safe_not_submitted {
         "not_submitted"
     } else if mismatch {
@@ -338,10 +357,17 @@ async fn lock_receipt_remote<C: ConnectionTrait>(
 /// Revalidate complete roots/request and their historical canonical scope;
 /// `matched` alone is not an authorization to replay a malformed receipt.
 fn matching_request(row: &evidence::Model) -> Option<String> {
-    if row.outcome != "matched" || row.effect != "observed" || row.observed_at.is_none() {
+    if !matches!(row.outcome.as_str(), "matched" | "accepted")
+        || row.effect != "observed"
+        || row.observed_at.is_none()
+    {
         return None;
     }
     let route: ProviderRouteSnapshot = serde_json::from_str(&row.route).ok()?;
+    let family = route.resource_type();
+    if (family == RemoteResourceType::ClusterPin) != (row.outcome == "accepted") {
+        return None;
+    }
     let resources: Vec<ResourceEvidence> = serde_json::from_str(&row.resources).ok()?;
     let request = &resources.first()?.resource.request_id;
     if request.is_empty() {
@@ -351,15 +377,23 @@ fn matching_request(row: &evidence::Model) -> Option<String> {
     let key = CanonicalResourceKey {
         backend: route.backend,
         scope: route.scope,
-        resource_type: RemoteResourceType::RpcPin,
+        resource_type: family,
         resource_id: expected,
     };
     resources
         .iter()
         .all(|resource| {
             resource.key.as_ref() == Some(&key)
-                && resource.resource.resource_type == RemoteResourceType::RpcPin
-                && resource.resource.status == ObservedResourceStatus::RecursiveVerified
+                && resource.resource.resource_type == family
+                && if family == RemoteResourceType::ClusterPin {
+                    matches!(
+                        resource.resource.status,
+                        ObservedResourceStatus::PinAccepted
+                            | ObservedResourceStatus::ReplicasVerified
+                    )
+                } else {
+                    resource.resource.status == ObservedResourceStatus::RecursiveVerified
+                }
                 && resource.resource.request_id == *request
                 && cids_equivalent(&resource.resource.cid, &row.expected_cid).unwrap_or(false)
         })
@@ -421,10 +455,11 @@ async fn receipt_context_valid<C: ConnectionTrait>(
         crate::store::entities::pin_provider_route::Entity::find_by_id(row.provider.clone())
             .one(db)
             .await?;
-    if !registered.is_some_and(|registered| !registered.retired && registered.snapshot == row.route)
-        || !super::get(db, &row.provider, &row.expected_cid)
-            .await?
-            .is_some_and(|ledger| ledger.route.as_deref() == Some(row.route.as_str()))
+    if !registered.is_some_and(|registered| {
+        !registered.retired && registered_invocation_matches(&row.route, &registered.snapshot)
+    }) || super::get(db, &row.provider, &row.expected_cid)
+        .await?
+        .is_none_or(|ledger| ledger.route.as_deref() != Some(row.route.as_str()))
     {
         return Ok(false);
     }
@@ -460,9 +495,9 @@ pub(crate) async fn wake_matching_parked<C: ConnectionTrait>(
         || job.locked_until.is_some()
         || job.submit_phase.as_deref() != Some("recovering")
         || job.last_error.as_deref() != Some(jobs::RPC_RECOVERY_PARK_REASON)
-        || !jobs::submission_history(db, id)
+        || jobs::submission_history(db, id)
             .await?
-            .is_some_and(|history| history.state == "needs_attention")
+            .is_none_or(|history| history.state != "needs_attention")
         || !receipt_context_valid(db, &row, &job, &remote, Some(&request)).await?
     {
         return Ok(false);
@@ -741,7 +776,10 @@ impl AdmissionSnapshot {
         }
         rows.into_iter().any(|row| {
             !row.needs_attention
-                && matches!(row.outcome.as_str(), "matched" | "not_submitted")
+                && matches!(
+                    row.outcome.as_str(),
+                    "matched" | "accepted" | "not_submitted"
+                )
                 && ledger.route.as_deref() == Some(row.route.as_str())
                 && (ledger.effect != "not_created" || row.outcome == "not_submitted")
                 && !self.released(row)
@@ -761,7 +799,7 @@ pub async fn settle_matching<C: ConnectionTrait>(
     let Some(row) = latest(db, &job.id).await? else {
         return Ok(());
     };
-    if row.outcome != "matched" {
+    if !matches!(row.outcome.as_str(), "matched" | "accepted") {
         return Ok(());
     }
     let Some(remote) = remote_pin::Entity::find_by_id((job.provider.clone(), job.cid.clone()))
@@ -851,7 +889,10 @@ pub async fn held_evidence_known<C: ConnectionTrait>(
     }
     for row in rows {
         if row.needs_attention
-            || !matches!(row.outcome.as_str(), "matched" | "not_submitted")
+            || !matches!(
+                row.outcome.as_str(),
+                "matched" | "accepted" | "not_submitted"
+            )
             || ledger.route.as_deref() != Some(row.route.as_str())
         {
             continue;
@@ -881,7 +922,7 @@ pub async fn matching_pin_held<C: ConnectionTrait>(
     let rows = evidence::Entity::find()
         .filter(evidence::Column::Provider.eq(provider))
         .filter(evidence::Column::ExpectedCid.eq(cid))
-        .filter(evidence::Column::Outcome.eq("matched"))
+        .filter(evidence::Column::Outcome.is_in(["matched", "accepted"]))
         .all(db)
         .await?;
     for row in rows {
@@ -934,7 +975,7 @@ pub async fn dispatch_allowed<C: ConnectionTrait>(db: &C, id: &str) -> AppResult
     else {
         return Ok(false);
     };
-    if registered.retired || registered.snapshot != row.route {
+    if registered.retired || !registered_invocation_matches(&row.route, &registered.snapshot) {
         return Ok(false);
     }
     let same_route = super::get(db, &row.provider, &row.expected_cid)
@@ -950,6 +991,22 @@ pub async fn dispatch_allowed<C: ConnectionTrait>(db: &C, id: &str) -> AppResult
         .one(db)
         .await?
         .is_none())
+}
+
+fn registered_invocation_matches(original: &str, current: &str) -> bool {
+    if original == current {
+        return true;
+    }
+    match (
+        serde_json::from_str::<ProviderRouteSnapshot>(original),
+        serde_json::from_str::<ProviderRouteSnapshot>(current),
+    ) {
+        (Ok(original), Ok(current)) => original.resource_type() == RemoteResourceType::ClusterPin
+            && crate::store::entities::pin_lease_requirement::contract::invocation_route_compatible(
+                &original, &current,
+            ),
+        _ => false,
+    }
 }
 
 /// Called inside the prelocked lifecycle transaction. Same-lifetime reference

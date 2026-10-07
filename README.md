@@ -1021,6 +1021,45 @@ separate config/worker/publication/diagnostic checks from real leaf RPC testing.
 Basic/Bearer headers sent to anonymous Kubo don't prove authentication enforcement
 or Filebase account access. Real Filebase/Pinata account tests remain **NOT RUN**.
 
+### Independent Cluster provider (Stage 6)
+
+An opt-in `kind = "cluster"` provider backs up the main Kubo rather than replacing
+it. Its nested `[pinning.providers.cluster]` options explicitly choose `proxy` or
+`rest` and `cid`, `upload` or `car`. Both require a REST status verifier;
+Proxy additionally has its own endpoint and authentication. Native REST uses its
+own add/CAR and status protocol, not Proxy `dag/import` forwarding. The commented
+[configuration example](config.example.toml) leaves existing routes unchanged.
+Cluster backend and pinset scope labels accept letters, digits and `-_.` only.
+
+Proxy, REST verification and source-Kubo credentials are independent environment
+references. Private endpoints require explicit `allow_private_network = true`;
+redirects are not followed and certificate verification is not disabled. Upload
+reads stored bytes (including ciphertext), while CAR preserves a complete
+single-root DAG and its codec/multihash. Mismatch never rewrites the S3 CID or
+silently falls back to another strategy.
+
+`min_replicas` is a confirmation threshold, **not** a change to Cluster's
+`replication_min/max`. A lease captures the full provider and confirmation
+requirements at birth, including temporarily unavailable candidates. Fresh,
+deduplicated allocated-peer evidence must satisfy the Cluster threshold before
+policy `one`/`all` aggregation. Missing, remote, queued, failed and stale peers
+do not count as pinned replicas. Historical evidence is preserved for audit, not
+treated as continuous availability. Multiple endpoints for the same pinset/CID
+represent one logical resource and do not establish independent disaster recovery.
+
+Stop/drain old writers and workers and back up before the replica-contract
+migration. Keep the captured requirements and append-only observations; do not
+bypass a refused downgrade by deleting tables. A successful add, matched CID or
+replica observation does not establish ownership or authorize deletion. Unknown
+and retained effects continue to occupy the logical ledger.
+
+**Local isolated acceptance passed:** configuration, registered-worker, native
+PostgreSQL and real provider transport results are recorded separately in
+[Stage 6 acceptance](docs/testing.md#stage-6-cluster-acceptance). The earlier
+verifier-only run is not provider CAR acceptance. Anonymous test-node auth
+headers do not prove account authentication, and Filebase/Pinata account writes
+remain **NOT RUN**. Two same-host peers are not multi-host high availability.
+
 ### Policies and coordination
 
 Policies use ordered first-match evaluation. A rule matches an exact bucket or

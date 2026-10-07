@@ -1,0 +1,48 @@
+{
+  "version": "0.43.0",
+  "daemon_mode": "online-without-content-swarm",
+  "source_daemon_mode": "offline",
+  "documentation": [
+    "https://api.github.com/repos/ipfs/kubo/contents/docs/telemetry.md?ref=v0.43.0",
+    "https://api.github.com/repos/ipfs/kubo/contents/docs/config.md?ref=v0.43.0",
+    "https://api.github.com/repos/ipfs/kubo/contents/core/coreapi/swarm.go?ref=v0.43.0",
+    "https://api.github.com/repos/ipfs/kubo/contents/config/swarm.go?ref=v0.43.0",
+    "https://api.github.com/repos/ipfs/kubo/contents/core/node/libp2p/relay.go?ref=v0.43.0",
+    "https://api.github.com/repos/ipfs/kubo/contents/core/node/libp2p/nat.go?ref=v0.43.0",
+    "https://api.github.com/repos/ipfs-cluster/ipfs-cluster/contents/ipfsconn/ipfshttp/ipfshttp.go?ref=v1.1.6",
+    "https://api.github.com/repos/ipfs-cluster/ipfs-cluster/contents/ipfsconn/ipfshttp/config.go?ref=v1.1.6",
+    "https://api.github.com/repos/ipfs-cluster/ipfs-cluster/contents/cluster_config.go?ref=v1.1.6",
+    "https://api.github.com/repos/ipfs-cluster/ipfs-cluster/contents/cluster.go?ref=v1.1.6",
+    "https://api.github.com/repos/ipfs-cluster/ipfs-cluster/contents/consensus/crdt/config.go?ref=v1.1.6",
+    "https://api.github.com/repos/ipfs-cluster/ipfs-cluster/contents/allocator/balanced/config.go?ref=v1.1.6",
+    "https://api.github.com/repos/ipfs-cluster/ipfs-cluster/contents/allocate.go?ref=v1.1.6",
+    "https://api.github.com/repos/ipfs-cluster/ipfs-cluster/contents/cmd/ipfs-cluster-service/main.go?ref=v1.1.6",
+    "https://api.github.com/repos/ipfs-cluster/ipfs-cluster/contents/api/rest/restapi.go?ref=v1.1.6",
+    "https://api.github.com/repos/ipfs-cluster/ipfs-cluster/contents/api/types.go?ref=v1.1.6",
+    "https://api.github.com/repos/ipfs-cluster/ipfs-cluster/contents/api/add.go?ref=v1.1.6",
+    "https://api.github.com/repos/ipfs-cluster/ipfs-cluster/contents/api/common/config.go?ref=v1.1.6",
+    "https://api.github.com/repos/ipfs-cluster/ipfs-cluster/contents/api/ipfsproxy/config.go?ref=v1.1.6",
+    "https://api.github.com/repos/ipfs-cluster/ipfs-cluster/contents/api/ipfsproxy/ipfsproxy.go?ref=v1.1.6",
+    "https://api.github.com/repos/ipfs-cluster/ipfs-cluster/contents/adder/adderutils/adderutils.go?ref=v1.1.6"
+  ],
+  "environment": [
+    { "name": "IPFS_TELEMETRY", "value": "off" }
+  ],
+  "settings": [
+    { "key": "Plugins.Plugins.telemetry.Disabled", "value": true },
+    { "key": "Bootstrap", "value": [] },
+    { "key": "AutoConf.Enabled", "value": false },
+    { "key": "Discovery.MDNS.Enabled", "value": false },
+    { "key": "Routing.Type", "value": "none" },
+    { "key": "Routing.DelegatedRouters", "value": [] },
+    { "key": "DNS.Resolvers", "value": {} },
+    { "key": "Ipns.DelegatedPublishers", "value": [] },
+    { "key": "AutoTLS.Enabled", "value": false },
+    { "key": "Swarm.RelayClient.Enabled", "value": false },
+    { "key": "Swarm.Transports.Network.Relay", "value": false },
+    { "key": "Swarm.DisableNatPortMap", "value": true },
+    { "key": "Addresses.Swarm", "value": [] },
+    { "key": "Addresses.API", "value": "/ip4/0.0.0.0/tcp/5001" }
+  ],
+  "note": "Fresh repositories only: v0.43.0 empty Bootstrap cannot reliably erase legacy backup peers. Allocated Kubo A/B stay online for Cluster connector APIs, without Kubo swarm listeners/discovery/routing/telemetry, behind a mandatory Docker internal network. ProviderPhase adds a third independent source with these same settings and daemon --offline; it is never an allocation and is stopped before target local-read verification. RelayClient=false alone does not disable the virtual /p2p-circuit listener: Network.Relay=false is required and read back. DisableNatPortMap=true disables NAT mapping; AutoConf placeholders are removed. Default mode preserves the previously accepted single-block verifier case; ProviderPhase never preloads either target and covers Proxy+REST CAR/upload, genuine crypto stored bytes, original reachable full DAG/bytes, fresh REST 2/2, no-fallback mismatch and CID-only re-pin after source stop. Negative CAR/source-failure contracts are local HTTP faults, not real N/N evidence. Not complete Stage6/worker/S3/auth/account/continuous availability. Proxy add uses Name/Hash/Bytes/Size (Size string), REST uses name/cid/bytes/size/allocations (size number); never translate real wire. No public network, reused volumes, pin/rm, unpin or GC."
+}

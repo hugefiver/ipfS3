@@ -378,6 +378,7 @@ async fn captured_skip_never_becomes_a_new_pin_when_provider_is_added() {
             api: None,
             strategy: None,
             upload_endpoint: None,
+            cluster: None,
             enabled: true,
             priority: 1,
             max_bytes: 1_000,

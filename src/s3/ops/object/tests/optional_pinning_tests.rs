@@ -306,6 +306,7 @@ async fn assert_no_remote_work(state: &Arc<AppState>) {
 fn available_policy() -> Arc<crate::pinning::coordinator::PinningCoordinator> {
     let mut raw = PinningConfig::default();
     raw.providers.push(ProviderConfig {
+        cluster: None,
         name: "new-provider".into(),
         kind: "noop".into(),
         token_env: None,
@@ -341,6 +342,7 @@ async fn warn_disabled_provider_only_skips_manual_without_remote_work() {
     let base = warn_state(kubo.uri()).await;
     let mut raw = PinningConfig::default();
     raw.providers.push(ProviderConfig {
+        cluster: None,
         name: "disabled".into(),
         kind: "noop".into(),
         token_env: None,

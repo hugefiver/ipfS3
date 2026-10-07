@@ -318,7 +318,7 @@ async fn car_uses_full_export_and_requires_single_root_terminal_stats_and_local_
         exports[0]
             .url
             .query_pairs()
-            .all(|(k, v)| !(k == "offline" && v == "true") && !(k == "local-only" && v == "true"))
+            .all(|(k, v)| v != "true" || k != "offline" && k != "local-only")
     );
 }
 
