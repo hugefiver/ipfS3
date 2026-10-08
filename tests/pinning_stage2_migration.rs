@@ -11,7 +11,7 @@ use ipfs_s3_gateway::{
         pinning::{ledger, quota},
     },
 };
-use sea_orm::{ConnectionTrait, Database, DatabaseConnection, EntityTrait};
+use sea_orm::{ConnectionTrait, Database, DatabaseConnection, EntityTrait, Statement};
 use sea_orm_migration::{MigrationTrait, SchemaManager};
 
 async fn migrate_prior_schema(db: &DatabaseConnection) {
@@ -40,6 +40,29 @@ async fn migrate_prior_schema(db: &DatabaseConnection) {
         predecessor.up(&manager).await.unwrap();
     }
     assert!(!manager.has_table("remote_pin_ledger").await.unwrap());
+}
+
+async fn migrate_stage2_successors(db: &DatabaseConnection) {
+    let successors: Vec<Box<dyn MigrationTrait>> = vec![
+        Box::new(m::m20260920_000003_pin_extension_decision::Migration),
+        Box::new(m::m20260920_000004_multipart_pin_decision::Migration),
+        Box::new(m::m20260920_000005_import_pin_decision::Migration),
+        Box::new(m::m20260920_000006_pin_submit_correlation::Migration),
+        Box::new(m::m20260927_000001_zip_batches::Migration),
+        Box::new(m::m20260927_000002_import_zip_root_capture::Migration),
+        Box::new(m::m20260927_000003_zip_mpu_replay::Migration),
+        Box::new(m::m20260927_000004_zip_v2_execution::Migration),
+        Box::new(m::m20260927_000005_zip_v2_import::Migration),
+        Box::new(m::m20260927_000006_zip_v2_mpu_intake::Migration),
+        Box::new(m::m20260927_000007_zip_v2_mpu_completion::Migration),
+        Box::new(m::m20261004_000001_rpc_submission_ledger::Migration),
+        Box::new(m::m20261004_000002_cluster_replica_contract::Migration),
+        Box::new(m::m20261007_000001_legacy_pinning_migration::Migration),
+    ];
+    let manager = SchemaManager::new(db);
+    for successor in successors {
+        successor.up(&manager).await.unwrap();
+    }
 }
 
 fn limits(provider: &str) -> ProviderLimitMap {
@@ -115,12 +138,18 @@ async fn exercise_upgrade(db: &DatabaseConnection, with_occupied_remote: bool) {
             .unwrap()
             .is_empty()
     );
+    // Use native SQL because this frozen Stage 2 schema predates columns
+    // required by the current history ORM.
     assert_eq!(
-        store::pinning::jobs::submission_history(db, "historical-submit")
-            .await
-            .unwrap()
-            .unwrap()
-            .effect,
+        db.query_one(Statement::from_string(
+            db.get_database_backend(),
+            "SELECT effect FROM pin_submit_history WHERE job_id='historical-submit'",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<String>("", "effect")
+        .unwrap(),
         "created"
     );
     let usage = quota::read_usage(db, "old-alias").await.unwrap().unwrap();
@@ -133,12 +162,6 @@ async fn exercise_upgrade(db: &DatabaseConnection, with_occupied_remote: bool) {
         }
     );
 
-    let explicit_identity = route_identity("explicit");
-    let explicit_provider = explicit_identity.allocation_key();
-    ledger::register_route(db, &explicit_provider, &explicit_identity)
-        .await
-        .unwrap();
-
     if with_occupied_remote {
         let occupied = ledger::get(db, "old-alias", "bafy-occupied")
             .await
@@ -147,6 +170,19 @@ async fn exercise_upgrade(db: &DatabaseConnection, with_occupied_remote: bool) {
         assert_eq!(occupied.effect, "unknown");
         assert_eq!(occupied.ownership, "unknown");
         assert!(occupied.route.is_none());
+    }
+
+    // The Stage 2 preservation assertions above run before any successors.
+    // Runtime APIs need the full schema, as AppState migrates before startup.
+    migrate_stage2_successors(db).await;
+
+    let explicit_identity = route_identity("explicit");
+    let explicit_provider = explicit_identity.allocation_key();
+    ledger::register_route(db, &explicit_provider, &explicit_identity)
+        .await
+        .unwrap();
+
+    if with_occupied_remote {
         assert!(
             quota::reserve_unique(
                 db,

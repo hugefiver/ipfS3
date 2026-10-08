@@ -36,6 +36,7 @@ enum RunMode {
     Gateway,
     ReadyProbe,
     Diagnostics(diagnostics::Command),
+    LegacyMigration(diagnostics::legacy_migration::Command),
 }
 
 async fn health_check() -> &'static str {
@@ -43,6 +44,9 @@ async fn health_check() -> &'static str {
 }
 
 fn parse_run_mode(args: &[String]) -> anyhow::Result<RunMode> {
+    if let Some(command) = diagnostics::legacy_migration::parse(args)? {
+        return Ok(RunMode::LegacyMigration(command));
+    }
     if let [flag, bucket, key, rest @ ..] = args
         && flag == "--pinning-status"
         && !bucket.is_empty()
@@ -92,7 +96,7 @@ fn parse_run_mode(args: &[String]) -> anyhow::Result<RunMode> {
 
 fn diagnostic_usage() -> anyhow::Error {
     anyhow::anyhow!(
-        "usage: ipfs-s3-gateway [--ready-probe | --pinning-doctor | --config-explain | --pinning-policy-explain BUCKET KEY | --pinning-status BUCKET KEY [--version-id ID] [--cursor OFFSET]]"
+        "usage: ipfs-s3-gateway [--ready-probe | --pinning-doctor | --config-explain | --pinning-policy-explain BUCKET KEY | --pinning-status BUCKET KEY [--version-id ID] [--cursor OFFSET] | --pinning-migrate-legacy DECLARATION [--apply CONFIRMATION] | --rollback RECEIPT CONFIRMATION]"
     )
 }
 
@@ -276,6 +280,7 @@ async fn main() -> anyhow::Result<()> {
     match parse_run_mode(&args)? {
         RunMode::Gateway => run_gateway().await,
         RunMode::Diagnostics(command) => diagnostics::run(command).await,
+        RunMode::LegacyMigration(command) => diagnostics::legacy_migration::run(command).await,
         RunMode::ReadyProbe => {
             if ready_probe().await {
                 Ok(())

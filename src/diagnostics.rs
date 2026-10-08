@@ -16,6 +16,8 @@ use ipfs_s3_gateway::{
 };
 use serde_json::{Value, json};
 
+#[path = "diagnostics/legacy_migration.rs"]
+pub mod legacy_migration;
 #[path = "diagnostics/status.rs"]
 mod status;
 

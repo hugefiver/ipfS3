@@ -19,6 +19,8 @@ pub mod pin_job;
 pub mod pin_lease;
 pub mod pin_lease_requirement;
 pub mod pin_lease_target;
+pub mod pin_legacy_migration;
+pub mod pin_legacy_migration_item;
 pub mod pin_provider_usage;
 pub mod pin_replica_observation;
 pub mod pin_submit_observation;

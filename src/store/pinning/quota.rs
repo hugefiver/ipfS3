@@ -250,7 +250,11 @@ pub async fn read_usage<C: ConnectionTrait>(
     db: &C,
     provider: &str,
 ) -> AppResult<Option<pin_provider_usage::Model>> {
-    Ok(pin_provider_usage::Entity::find_by_id(provider.to_owned())
+    let key = [("provider".into(), provider.to_owned())].into();
+    let operational =
+        super::legacy_migration::captured_provider(db, "pin_provider_usage", &key, provider)
+            .await?;
+    Ok(pin_provider_usage::Entity::find_by_id(operational)
         .one(db)
         .await?)
 }
@@ -358,6 +362,11 @@ async fn reserve_unique_for_intent<C: ConnectionTrait>(
     now: DateTimeUtc,
     waiter: bool,
 ) -> AppResult<ReservationOutcome> {
+    if super::legacy_migration::source_is_migrated(db, provider).await? {
+        return Err(invalid_quota(
+            "migrated legacy namespace cannot allocate or revive",
+        ));
+    }
     for attempt in 0..SQLITE_RETRY_LIMIT {
         match reserve_unique_attempt(db, provider, cid, cid_size, limits, now, waiter).await {
             Ok(ReserveAttempt::Outcome(outcome)) => return Ok(outcome),
@@ -727,6 +736,13 @@ pub(crate) async fn assert_reusable_route<C: ConnectionTrait>(
     provider: &str,
     cid: &str,
 ) -> AppResult<()> {
+    if let Some(binding) = super::legacy_migration::resource_binding(db, provider, cid).await?
+        && binding.source_retired
+    {
+        return Err(invalid_quota(
+            "retired migration source is not allocation authority",
+        ));
+    }
     let configured = pin_provider_route::Entity::find_by_id(provider.to_owned())
         .one(db)
         .await?;
@@ -835,7 +851,11 @@ async fn reuse_capacity_holding_remote<C: ConnectionTrait>(
         // already-pinned retained resource restores availability, not a new pin lifetime:
         // leave its observation, ownership and capacity evidence untouched. A queued or
         // unknown remote cannot turn retained history into fresh confirmation.
-        if remote.status == REMOTE_STATUS_PINNED {
+        if remote.status == REMOTE_STATUS_PINNED
+            && super::legacy_migration::resource_binding(db, provider, cid)
+                .await?
+                .is_none_or(|binding| binding.historical_route.is_some())
+        {
             remote_pin_ledger::Entity::update_many()
                 .col_expr(remote_pin_ledger::Column::Effect, Expr::value("confirmed"))
                 .filter(remote_pin_ledger::Column::Provider.eq(provider))

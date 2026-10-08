@@ -948,6 +948,54 @@ tags. Stop new writes/workers, retain the decision rows and historical routes,
 and plan a compatible recovery before changing binaries. The Stage 2 rules for
 unknown ownership, retained capacity and historical routing still apply.
 
+### Explicit legacy namespace migration (R26)
+
+Legacy nonzero usage, capacity-bearing remote rows, and non-absent ledger rows
+without a captured route continue to block new allocation. Do not clear those
+rows to unblock pinning. The local migration CLI moves explicitly identified
+operational bindings to a declared account/pinset namespace while retaining
+immutable history and the same capacity/ownership obligations. Current TOML,
+provider names, endpoints, or credentials do not prove a legacy row's account.
+
+```powershell
+$env:IPFS_S3_CONFIG = "gateway.toml"
+cargo run -- --pinning-migrate-legacy declaration.json
+cargo run -- --pinning-migrate-legacy declaration.json --apply private-confirmation.json
+cargo run -- --pinning-migrate-legacy rollback-declaration.json
+cargo run -- --rollback committed-receipt-id private-rollback-confirmation.json
+```
+
+The first command is a bounded, read-only dry-run. It does not start the
+gateway, register providers, run schema migrations, or contact Kubo/providers;
+missing provider secrets do not prevent local inventory. The declaration uses
+`version = 1`, an operator-chosen `database_scope`, a bounded `ttl_seconds`,
+`maintenance` assertions, a new private `confirmation_file` path, and explicit
+`namespaces` pairs. Each pair names source/target, backend, scope, resource type,
+the captured target route, and the exact row/JSON-pointer
+`bindings` with their historical route evidence. Binding-only work remains
+explicit. Missing provenance must be investigated, not guessed from configuration.
+
+Keep the exported confirmation private: it contains the complete native DB
+images needed for a fresh comparison, and is never overwritten. Neither that
+file nor stdout is a trusted execution receipt. Before **apply or rollback**,
+back up the database and stop/drain every writer and worker sharing it, including
+old binaries. The schema upgrade is separate; this CLI never repairs a missing
+or unknown schema. DB-native clock/TTL and fresh transaction fences reject
+drift or new work; changes and per-item receipts commit atomically. Repeating
+the same operation reads the durable DB receipt rather than moving or charging
+again. A forged receipt file cannot authorize rollback. Rollback is refused
+once new work changes the post-state; it is not an unconditional restore. For
+a fresh rollback preview, retain the original namespace declarations, set
+`rollback_receipt` to the committed apply receipt ID, and choose a new private
+`confirmation_file`. An expired apply confirmation is not fresh rollback
+authorization.
+
+This operation never grants delete/unpin rights, frees retained quota, discards
+Unknown debt, or runs GC. It is not a provider-account migration or a production
+operation authorization. R26 local isolated acceptance passed; see
+[`docs/testing.md`](docs/testing.md#r26-legacy-namespace-migration-acceptance)
+for the final evidence and real-account limitations.
+
 ### Scoped IPFS RPC providers (Stage 5)
 
 RPC providers are wired into the existing configuration and coordinator. They

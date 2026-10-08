@@ -550,6 +550,12 @@ async fn execute_claimed_job_with_cancellation(
     cancellation: &CancellationToken,
 ) -> AppResult<()> {
     validate_operation_scope(&claimed.model)?;
+    if !crate::store::pinning::legacy_migration::job_io_allowed(store.db(), &claimed.model).await? {
+        let txn = store.db().begin().await?;
+        jobs::park_identity_job(&txn, &claimed).await?;
+        txn.commit().await?;
+        return Ok(());
+    }
     let route_valid = if claimed.model.operation == "submit" {
         crate::store::pinning::ledger::route_matches(
             store.db(),

@@ -52,6 +52,14 @@ pub(crate) mod test_gates {
         pub barrier: Arc<Barrier>,
     }
 
+    pub struct DuplicateProjectionGate {
+        pub cid: &'static str,
+        pub first_written: Notify,
+        pub first_continue: Notify,
+        pub second_read: Notify,
+        pub second_continue: Notify,
+    }
+
     pub struct RenewalAfterSnapshotGate {
         pub lease_id: &'static str,
         pub arrived: Notify,
@@ -111,6 +119,8 @@ pub(crate) mod test_gates {
         LazyLock::new(|| Mutex::new(None));
     pub static STATUS_AFTER_READ: LazyLock<Mutex<Option<Arc<StatusAfterReadGate>>>> =
         LazyLock::new(|| Mutex::new(None));
+    pub static DUPLICATE_PROJECTION: LazyLock<Mutex<Option<Arc<DuplicateProjectionGate>>>> =
+        LazyLock::new(|| Mutex::new(None));
     pub static RENEWAL_AFTER_SNAPSHOT: LazyLock<Mutex<Option<Arc<RenewalAfterSnapshotGate>>>> =
         LazyLock::new(|| Mutex::new(None));
     pub static RENEWAL_BEFORE_OWNER_GUARD: LazyLock<
@@ -154,6 +164,20 @@ async fn pause_after_remote_status_read(provider: &str, cid: &str) {
     let gate = test_gates::STATUS_AFTER_READ.lock().await.clone();
     if let Some(gate) = gate.filter(|gate| gate.provider == provider && gate.cid == cid) {
         gate.barrier.wait().await;
+    }
+}
+
+#[cfg(test)]
+async fn pause_duplicate_projection(cid: &str, second: bool) {
+    let gate = test_gates::DUPLICATE_PROJECTION.lock().await.clone();
+    if let Some(gate) = gate.filter(|gate| gate.cid == cid) {
+        if second {
+            gate.second_read.notify_one();
+            gate.second_continue.notified().await;
+        } else {
+            gate.first_written.notify_one();
+            gate.first_continue.notified().await;
+        }
     }
 }
 
@@ -899,6 +923,8 @@ pub async fn remote_work_snapshot<C: ConnectionTrait>(
     provider: &str,
     cid: &str,
 ) -> AppResult<Option<RemoteWorkSnapshot>> {
+    let operational = super::legacy_migration::resource_key(db, provider, cid).await?;
+    let provider = operational.as_str();
     let Some(remote) = remote_pin::Entity::find_by_id((provider.to_owned(), cid.to_owned()))
         .one(db)
         .await?
@@ -1557,6 +1583,10 @@ async fn apply_remote_status_inner<C: ConnectionTrait>(
         if expected_remote_epoch.is_some_and(|expected| snapshot.remote.epoch != expected) {
             return Ok(RemoteStatusApplyResult::StaleRequest);
         }
+        #[cfg(test)]
+        if snapshot.remote.status == REMOTE_FAILED {
+            pause_duplicate_projection(update.cid, true).await;
+        }
         if let Some(job) = observation_job
             && !super::ledger::submission::projection_allowed(db, job, &snapshot.remote).await?
         {
@@ -1614,6 +1644,13 @@ async fn apply_remote_status_inner<C: ConnectionTrait>(
         } else {
             false
         };
+        #[cfg(test)]
+        if failure
+            .as_ref()
+            .is_some_and(|progress| progress.newly_counted)
+        {
+            pause_duplicate_projection(update.cid, false).await;
+        }
 
         // The snapshot was locked in lease → target → remote order. Projection deliberately uses
         // only those rows, so it never reacquires a target after the remote status CAS.
@@ -4824,7 +4861,11 @@ async fn project_prelocked_desired_target<C: ConnectionTrait>(
             Ok(TargetProjection::Waiting { submit_job_id })
         }
         REMOTE_FAILED => {
-            set_prelocked_target_state(db, &desired.target, TARGET_DEGRADED).await?;
+            if matches!(access, ProjectionAccess::Observation { .. }) {
+                set_failed_observation_target(db, desired, remote, now).await?;
+            } else {
+                set_prelocked_target_state(db, &desired.target, TARGET_DEGRADED).await?;
+            }
             let NewPinJob::Remote(job) = jobs::reconcile_job(
                 &desired.target.provider,
                 &desired.target.cid,
@@ -4961,6 +5002,67 @@ async fn set_prelocked_target_state<C: ConnectionTrait>(
         .await?;
     if updated.rows_affected != 1 {
         return Err(stale_lifecycle_error("prelocked target projection"));
+    }
+    Ok(())
+}
+
+/// Two copies of the same failed observation can race outside a caller-owned
+/// transaction. A winner's identical degraded projection is idempotent, not a
+/// stale lifecycle. Fence the lease and remote in this single UPDATE; never
+/// re-lock lease/target after the remote write or relax admission's strict CAS.
+async fn set_failed_observation_target<C: ConnectionTrait>(
+    db: &C,
+    desired: &DesiredTarget,
+    remote: &remote_pin::Model,
+    now: DateTimeUtc,
+) -> AppResult<()> {
+    let target = &desired.target;
+    let lease = &desired.lease;
+    let live_lease = pin_lease::Entity::find()
+        .select_only()
+        .column(pin_lease::Column::Id)
+        .filter(pin_lease::Column::Id.eq(&lease.id))
+        .filter(pin_lease::Column::OwnerObjectId.eq(&lease.owner_object_id))
+        .filter(pin_lease::Column::Generation.eq(lease.generation))
+        .filter(pin_lease::Column::State.eq(LEASE_ACTIVE))
+        .filter(pin_lease::Column::ExpiresAt.eq(lease.expires_at))
+        .filter(pin_lease::Column::ExpiresAt.gt(now));
+    let mut same_remote = remote_pin::Entity::find()
+        .select_only()
+        .column(remote_pin::Column::Provider)
+        .filter(remote_pin::Column::Provider.eq(&remote.provider))
+        .filter(remote_pin::Column::Cid.eq(&remote.cid))
+        .filter(remote_pin::Column::Epoch.eq(remote.epoch))
+        .filter(remote_pin::Column::Status.eq(REMOTE_FAILED))
+        .filter(remote_pin::Column::FailureAttempts.eq(remote.failure_attempts));
+    same_remote = match &remote.request_id {
+        Some(id) => same_remote.filter(remote_pin::Column::RequestId.eq(id)),
+        None => same_remote.filter(remote_pin::Column::RequestId.is_null()),
+    };
+    same_remote = match &remote.last_failed_request_id {
+        Some(id) => same_remote.filter(remote_pin::Column::LastFailedRequestId.eq(id)),
+        None => same_remote.filter(remote_pin::Column::LastFailedRequestId.is_null()),
+    };
+    let updated = pin_lease_target::Entity::update_many()
+        .col_expr(
+            pin_lease_target::Column::State,
+            Expr::value(TARGET_DEGRADED.to_owned()),
+        )
+        .filter(pin_lease_target::Column::Id.eq(&target.id))
+        .filter(pin_lease_target::Column::LeaseId.eq(&target.lease_id))
+        .filter(pin_lease_target::Column::Provider.eq(&target.provider))
+        .filter(pin_lease_target::Column::Cid.eq(&target.cid))
+        .filter(pin_lease_target::Column::LogicalSize.eq(target.logical_size))
+        .filter(pin_lease_target::Column::CreatedAt.eq(target.created_at))
+        .filter(pin_lease_target::Column::State.is_in([target.state.as_str(), TARGET_DEGRADED]))
+        .filter(pin_lease_target::Column::LeaseId.in_subquery(live_lease.into_query()))
+        .filter(pin_lease_target::Column::Provider.in_subquery(same_remote.into_query()))
+        .exec(db)
+        .await?;
+    if updated.rows_affected != 1 {
+        return Err(stale_lifecycle_error(
+            "failed observation target projection",
+        ));
     }
     Ok(())
 }
@@ -6478,6 +6580,140 @@ mod tests {
             persisted.next_retry_at,
             Some(time(1) + ChronoDuration::seconds(1))
         );
+    }
+
+    #[tokio::test]
+    async fn duplicate_failed_projection_with_winner_committed_after_snapshot_is_idempotent() {
+        const CID: &str = "bafy-controlled-duplicate";
+        let (_directory, db) = setup_file_backed("controlled-duplicate-projection").await;
+        seed_remote(&db, "pinata", CID, "queued", Some("request-1"), 1).await;
+        seed_lease_target(
+            &db,
+            "controlled-lease",
+            "automatic",
+            "all",
+            "active",
+            1,
+            "controlled-target",
+            "pinata",
+            CID,
+            "submitted",
+            time(100),
+        )
+        .await;
+        let gate = Arc::new(test_gates::DuplicateProjectionGate {
+            cid: CID,
+            first_written: tokio::sync::Notify::new(),
+            first_continue: tokio::sync::Notify::new(),
+            second_read: tokio::sync::Notify::new(),
+            second_continue: tokio::sync::Notify::new(),
+        });
+        *test_gates::DUPLICATE_PROJECTION.lock().await = Some(gate.clone());
+        async fn observe(db: DatabaseConnection) -> AppResult<RemoteStatusApplyResult> {
+            apply_remote_status(
+                &db,
+                RemoteStatusUpdate {
+                    provider: "pinata",
+                    cid: CID,
+                    request_id: "request-1",
+                    origin: RemoteStatusOrigin::ExistingRequest,
+                    status: RemotePinStatus::Failed,
+                    error_class: Some("transient"),
+                    error_text: Some("redacted"),
+                    now: time(1),
+                },
+            )
+            .await
+        }
+        let first = tokio::spawn(observe(db.clone()));
+        gate.first_written.notified().await;
+        let second = tokio::spawn(observe(db.clone()));
+        gate.second_read.notified().await;
+        gate.first_continue.notify_one();
+        let first_result = first.await.unwrap().unwrap();
+        assert_eq!(target_state(&db, "controlled-target").await, "degraded");
+        gate.second_continue.notify_one();
+        let second_result = second.await.unwrap();
+        *test_gates::DUPLICATE_PROJECTION.lock().await = None;
+        let results = [first_result, second_result.unwrap()];
+        let counted = results.iter().filter(|r|matches!(r,RemoteStatusApplyResult::Applied{failure:Some(p),..} if p.newly_counted)).count();
+        assert_eq!(counted, 1);
+        assert_eq!(remote(&db, "pinata", CID).await.failure_attempts, 1);
+        assert_eq!(target_state(&db, "controlled-target").await, "degraded");
+    }
+
+    #[tokio::test]
+    async fn duplicate_failed_projection_keeps_native_lease_and_remote_fences() {
+        for drift in ["generation", "epoch", "request"] {
+            let (_directory, db) = setup_file_backed("duplicate-projection-fences").await;
+            seed_remote(
+                &db,
+                "pinata",
+                "bafy-duplicate-fences",
+                "failed",
+                Some("request-1"),
+                1,
+            )
+            .await;
+            seed_lease_target(
+                &db,
+                "duplicate-fence-lease",
+                "automatic",
+                "all",
+                "active",
+                1,
+                "duplicate-fence-target",
+                "pinata",
+                "bafy-duplicate-fences",
+                "degraded",
+                time(100),
+            )
+            .await;
+            let target = pin_lease_target::Entity::find_by_id("duplicate-fence-target")
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+            let lease = pin_lease::Entity::find_by_id("duplicate-fence-lease")
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+            let desired = DesiredTarget { target, lease };
+            let original = remote(&db, "pinata", "bafy-duplicate-fences").await;
+            set_failed_observation_target(&db, &desired, &original, time(1))
+                .await
+                .unwrap();
+            match drift {
+                "generation" => {
+                    db.execute_unprepared(
+                        "UPDATE pin_leases SET generation=2 WHERE id='duplicate-fence-lease'",
+                    )
+                    .await
+                    .unwrap();
+                }
+                "epoch" => {
+                    db.execute_unprepared(
+                        "UPDATE remote_pins SET epoch=2 WHERE cid='bafy-duplicate-fences'",
+                    )
+                    .await
+                    .unwrap();
+                }
+                _ => {
+                    db.execute_unprepared("UPDATE remote_pins SET request_id='new-request' WHERE cid='bafy-duplicate-fences'").await.unwrap();
+                }
+            }
+            assert!(
+                set_failed_observation_target(&db, &desired, &original, time(1))
+                    .await
+                    .is_err(),
+                "same degraded state cannot bypass changed {drift}"
+            );
+            assert_eq!(
+                target_state(&db, "duplicate-fence-target").await,
+                "degraded"
+            );
+        }
     }
 
     #[tokio::test]

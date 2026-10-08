@@ -1387,24 +1387,30 @@ pub(crate) async fn poll_continuity_owner<C: ConnectionTrait>(
     if job.operation != "poll" || !check_target_job_generation(db, job).await? {
         return Ok(false);
     }
-    Ok(poll_names_request(job, request_id)
+    Ok(poll_names_request(db, job, request_id).await?
         && canonical_desired_target(db, &job.provider, &job.cid)
             .await?
             .is_some_and(|target| Some(target.id.as_str()) == job.target_id.as_deref()))
 }
 
 /// Durable request evidence only, not authority to execute the historical owner.
-pub(crate) fn poll_names_request(job: &pin_job::Model, request_id: &str) -> bool {
+pub(crate) async fn poll_names_request<C: ConnectionTrait>(
+    db: &C,
+    job: &pin_job::Model,
+    request_id: &str,
+) -> AppResult<bool> {
     let (Some(_), Some(target_id), Some(generation)) = (
         job.lease_id.as_deref(),
         job.target_id.as_deref(),
         job.expected_generation,
     ) else {
-        return false;
+        return Ok(false);
     };
-    job.operation == "poll"
+    let provider =
+        super::legacy_migration::original_job_provider(db, &job.id, &job.provider).await?;
+    Ok(job.operation == "poll"
         && job.expected_remote_epoch.is_none()
-        && job.id == stable_poll_id(&job.provider, &job.cid, target_id, generation, request_id)
+        && job.id == stable_poll_id(&provider, &job.cid, target_id, generation, request_id))
 }
 
 /// The already-claimed Submit's immutable target/generation remains evidence
@@ -2075,9 +2081,11 @@ async fn validate_poll_owner<C: ConnectionTrait>(db: &C, job: &TargetPinJob) -> 
             "Poll job does not own a queued or pinning request",
         ));
     }
+    let original =
+        super::legacy_migration::original_job_provider(db, &job.id, &job.provider).await?;
     if job.id
         != stable_poll_id(
-            &job.provider,
+            &original,
             &job.cid,
             &job.target_id,
             job.expected_generation,
@@ -2098,15 +2106,17 @@ async fn validate_remote_epoch<C: ConnectionTrait>(db: &C, job: &RemotePinJob) -
     if remote.is_none_or(|remote| remote.epoch != job.expected_remote_epoch) {
         return Err(invalid_job("remote job does not name the current epoch"));
     }
+    let original =
+        super::legacy_migration::original_job_provider(db, &job.id, &job.provider).await?;
     let expected_id = match job.operation {
         RemoteJobOperation::Unpin => {
             format!(
                 "unpin:{}:{}:e{}",
-                job.provider, job.cid, job.expected_remote_epoch
+                original, job.cid, job.expected_remote_epoch
             )
         }
         RemoteJobOperation::Reconcile => {
-            stable_reconcile_id(&job.provider, &job.cid, job.expected_remote_epoch)
+            stable_reconcile_id(&original, &job.cid, job.expected_remote_epoch)
         }
     };
     if job.id != expected_id {

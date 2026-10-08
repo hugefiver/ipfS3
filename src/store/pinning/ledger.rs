@@ -139,6 +139,10 @@ async fn register_snapshot<C: ConnectionTrait>(
     identity: &ProviderIdentity,
     route: &ProviderRouteSnapshot,
 ) -> AppResult<()> {
+    if super::legacy_migration::source_is_migrated(db, key).await? {
+        // Restart must not overwrite, resurrect or reallocate a migrated source.
+        return Ok(());
+    }
     let snapshot = serde_json::to_string(route)
         .map_err(|_| AppError::Internal("invalid provider snapshot".into()))?;
     pin_provider_route::Entity::insert(pin_provider_route::ActiveModel {
@@ -208,8 +212,9 @@ pub async fn get<C: ConnectionTrait>(
     provider: &str,
     cid: &str,
 ) -> AppResult<Option<remote_pin_ledger::Model>> {
+    let provider = super::legacy_migration::resource_key(db, provider, cid).await?;
     Ok(
-        remote_pin_ledger::Entity::find_by_id((provider.to_owned(), cid.to_owned()))
+        remote_pin_ledger::Entity::find_by_id((provider, cid.to_owned()))
             .one(db)
             .await?,
     )
@@ -352,7 +357,7 @@ pub(crate) async fn advance_submit_invocation_epoch<C: ConnectionTrait>(
     api: &str,
     strategy: &str,
 ) -> AppResult<()> {
-    use crate::store::entities::{pin_invocation_route, pin_resource_history, remote_pin};
+    use crate::store::entities::{pin_invocation_route, remote_pin};
     let job = &claimed.model;
     if job.operation != "submit" {
         return Err(AppError::Internal(
@@ -410,14 +415,10 @@ pub(crate) async fn advance_submit_invocation_epoch<C: ConnectionTrait>(
                 && history.strategy == strategy
         }
     };
-    let released = pin_resource_history::Entity::find()
-        .filter(pin_resource_history::Column::Provider.eq(&job.provider))
-        .filter(pin_resource_history::Column::Cid.eq(&job.cid))
-        .filter(pin_resource_history::Column::Epoch.gte(captured.remote_epoch))
-        .filter(pin_resource_history::Column::Epoch.lt(remote.epoch))
-        .one(db)
+    let released = super::legacy_migration::release_history(db, &job.provider, &job.cid)
         .await?
-        .is_some();
+        .iter()
+        .any(|row| row.epoch >= captured.remote_epoch && row.epoch < remote.epoch);
     if captured.remote_epoch > remote.epoch
         || remote.status != "reserved"
         || remote.request_id.is_some()
@@ -459,6 +460,11 @@ pub async fn route_matches<C: ConnectionTrait>(
     cid: &str,
     identity: Option<&ProviderIdentity>,
 ) -> AppResult<bool> {
+    if let Some(binding) = super::legacy_migration::resource_binding(db, provider, cid).await?
+        && (binding.source_retired || binding.historical_route.is_none())
+    {
+        return Ok(false);
+    }
     let Some(row) = get(db, provider, cid).await? else {
         return legacy_unregistered_store(db, provider).await;
     };
@@ -486,7 +492,19 @@ pub(crate) async fn job_route_matches<C: ConnectionTrait>(
     job: &crate::store::entities::pin_job::Model,
     identity: Option<&ProviderIdentity>,
 ) -> AppResult<bool> {
-    use crate::store::entities::{pin_invocation_route, pin_resource_history, remote_pin};
+    let key = [("id".to_owned(), job.id.clone())].into();
+    let migrated =
+        super::legacy_migration::historical_keys(db, "pin_jobs", &job.provider, Some(&job.cid))
+            .await?;
+    for provider in migrated {
+        if let Some(binding) =
+            super::legacy_migration::resolve_legacy_binding(db, "pin_jobs", &key, &provider).await?
+            && (binding.source_retired || !matches!(job.operation.as_str(), "poll" | "reconcile"))
+        {
+            return Ok(false);
+        }
+    }
+    use crate::store::entities::{pin_invocation_route, remote_pin};
     let row = get(db, &job.provider, &job.cid).await?;
     let Some(row) = row else {
         return legacy_unregistered_store(db, &job.provider).await;
@@ -538,14 +556,10 @@ pub(crate) async fn job_route_matches<C: ConnectionTrait>(
     if !super::jobs::poll_continuity_owner(db, job, request_id).await? {
         return Ok(false);
     }
-    let released = pin_resource_history::Entity::find()
-        .filter(pin_resource_history::Column::Provider.eq(&job.provider))
-        .filter(pin_resource_history::Column::Cid.eq(&job.cid))
-        .filter(pin_resource_history::Column::Epoch.gte(captured.remote_epoch))
-        .filter(pin_resource_history::Column::Epoch.lt(remote.epoch))
-        .one(db)
+    let released = super::legacy_migration::release_history(db, &job.provider, &job.cid)
         .await?
-        .is_some();
+        .iter()
+        .any(|row| row.epoch >= captured.remote_epoch && row.epoch < remote.epoch);
     if released {
         return Ok(false);
     }
@@ -575,7 +589,7 @@ pub(crate) async fn has_historical_poll_request<C: ConnectionTrait>(
     remote: &crate::store::entities::remote_pin::Model,
     route: &str,
 ) -> AppResult<bool> {
-    use crate::store::entities::{pin_invocation_route, pin_resource_history};
+    use crate::store::entities::pin_invocation_route;
     let Some(request_id) = remote.request_id.as_deref() else {
         return Ok(false);
     };
@@ -586,7 +600,7 @@ pub(crate) async fn has_historical_poll_request<C: ConnectionTrait>(
         .all(db)
         .await?;
     for poll in polls {
-        if !super::jobs::poll_names_request(&poll, request_id) {
+        if !super::jobs::poll_names_request(db, &poll, request_id).await? {
             continue;
         }
         let Some(captured) = pin_invocation_route::Entity::find_by_id(poll.id)
@@ -598,14 +612,10 @@ pub(crate) async fn has_historical_poll_request<C: ConnectionTrait>(
         if captured.route != route || captured.remote_epoch > remote.epoch {
             continue;
         }
-        if pin_resource_history::Entity::find()
-            .filter(pin_resource_history::Column::Provider.eq(&remote.provider))
-            .filter(pin_resource_history::Column::Cid.eq(&remote.cid))
-            .filter(pin_resource_history::Column::Epoch.gte(captured.remote_epoch))
-            .filter(pin_resource_history::Column::Epoch.lte(remote.epoch))
-            .one(db)
+        if !super::legacy_migration::release_history(db, &remote.provider, &remote.cid)
             .await?
-            .is_none()
+            .iter()
+            .any(|row| row.epoch >= captured.remote_epoch && row.epoch <= remote.epoch)
         {
             return Ok(true);
         }
@@ -730,7 +740,7 @@ async fn retained_confirmation_matches<C: ConnectionTrait>(
     job: &pin_job::Model,
     request_id: &str,
 ) -> AppResult<bool> {
-    use crate::store::entities::{pin_invocation_route, pin_resource_history, remote_pin};
+    use crate::store::entities::{pin_invocation_route, remote_pin};
     if !matches!(job.operation.as_str(), "submit" | "poll")
         || job.provider != row.provider
         || job.cid != row.cid
@@ -771,14 +781,10 @@ async fn retained_confirmation_matches<C: ConnectionTrait>(
     }
     // A Poll's original epoch can precede reference-only attaches, but cannot
     // cross a confirmed release into another resource lifetime.
-    let released = pin_resource_history::Entity::find()
-        .filter(pin_resource_history::Column::Provider.eq(&row.provider))
-        .filter(pin_resource_history::Column::Cid.eq(&row.cid))
-        .filter(pin_resource_history::Column::Epoch.gte(captured.remote_epoch))
-        .filter(pin_resource_history::Column::Epoch.lt(remote.epoch))
-        .one(db)
+    let released = super::legacy_migration::release_history(db, &row.provider, &row.cid)
         .await?
-        .is_some();
+        .iter()
+        .any(|row| row.epoch >= captured.remote_epoch && row.epoch < remote.epoch);
     Ok(!released)
 }
 
@@ -787,6 +793,13 @@ pub async fn cleanup_allowed<C: ConnectionTrait>(
     provider: &str,
     cid: &str,
 ) -> AppResult<bool> {
+    if super::legacy_migration::resource_binding(db, provider, cid)
+        .await?
+        .is_some()
+    {
+        // A namespace declaration is never new delete/ownership authority.
+        return Ok(false);
+    }
     let Some(row) = get(db, provider, cid).await? else {
         return legacy_unregistered_store(db, provider).await;
     };
@@ -817,6 +830,7 @@ async fn legacy_unregistered_store<C: ConnectionTrait>(db: &C, provider: &str) -
 pub struct ResourceStatus {
     pub cid: String,
     pub route: Option<ProviderRouteSnapshot>,
+    pub route_provenance: &'static str,
     pub display_name: Option<String>,
     pub remote_ref: Option<RemoteRef>,
     pub active_references: usize,
@@ -849,6 +863,14 @@ pub async fn status<C: ConnectionTrait>(
         .one(db)
         .await?;
     let route = ledger.as_ref().and_then(decode_route);
+    let route_provenance = if super::legacy_migration::resource_binding(db, provider, cid)
+        .await?
+        .is_some_and(|binding| binding.historical_route.is_none())
+    {
+        "migration_declaration_not_remote_evidence"
+    } else {
+        "historical_snapshot_or_unknown"
+    };
     let ownership = ledger
         .as_ref()
         .map(|r| Ownership::from_persisted(&r.ownership))
@@ -866,6 +888,7 @@ pub async fn status<C: ConnectionTrait>(
     Ok(Some(ResourceStatus {
         cid: remote.cid,
         route,
+        route_provenance,
         remote_ref,
         active_references: snapshot.desired.len(),
         display_name: configured.map(|r| r.display_name),
@@ -937,11 +960,17 @@ pub async fn lease_status<C: ConnectionTrait>(
             continue;
         }
         let evidence = get(db, &target.provider, &target.cid).await?;
-        let confirmed = if let Some(evidence) = evidence {
-            decode_route(&evidence).is_some() && evidence.effect == "confirmed"
-        } else {
-            legacy_unregistered_store(db, &target.provider).await?
-        };
+        let confirmed =
+            if super::legacy_migration::resource_binding(db, &target.provider, &target.cid)
+                .await?
+                .is_some_and(|binding| binding.historical_route.is_none())
+            {
+                false
+            } else if let Some(evidence) = evidence {
+                decode_route(&evidence).is_some() && evidence.effect == "confirmed"
+            } else {
+                legacy_unregistered_store(db, &target.provider).await?
+            };
         let confirmed = if cluster {
             crate::store::entities::pin_lease_requirement::contract::target_confirmed(
                 db,

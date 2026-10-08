@@ -354,6 +354,61 @@ Focused review closed the min/RF, retired-candidate and authentication defects
 and the remaining PG/quality evidence gaps. **Stage 6 local isolated acceptance
 passed**, within the topology and real-account limitations stated above.
 
+## R26 legacy namespace migration acceptance
+
+The default formal CLI mode is read-only inventory. Apply/rollback require
+explicit declarations, stop/drain assertions, fresh native fences and durable
+DB receipts; no migration command may start AppState/provider workers, contact
+remote storage, release retained usage, infer historical ownership, or repair
+schema automatically. Stage7's unregistered management leaf is not this CLI.
+
+```powershell
+cargo test --locked --offline --test legacy_pinning_migration_store
+cargo test --locked --offline --test legacy_pinning_migration_cli
+cargo test --locked --offline --test legacy_pinning_migration_surface
+cargo test --locked --offline --test legacy_pinning_migration_postgres -- --ignored --nocapture --test-threads=1
+```
+
+The PG target requires an explicitly run-owned disposable database and
+`IPFS_S3_R26_PG_OWNED=legacy-r26-fixture-only`; do not supply a production URL.
+Each case creates an isolated schema. Final run on 2026-10-08,
+`b3a3aabdd2fb4ce88f7b4657126601e8`, used the R26-only export over committed
+Stage6 `1515f89`, including the final concurrency fixes. All four R26 PG cases
+and both Stage2 PG cases passed. Coverage includes native NOWAIT/phantom fences,
+receipt-write fault and atomic rollback, route lock/committed drift,
+contradictory historical account identity, the old-resource/new-allocation
+boundary and damaged registered receipt catalogs. PostgreSQL 17.11 was cached,
+pull disabled, data in tmpfs and access loopback-only. Schemas and client
+sessions were zero before logs-first ID/name/label-verified container cleanup;
+owned containers/volumes/networks were zero afterwards. Evidence and an explicitly
+abbreviated diagnostic log excerpt remain at
+`target/stage9-r26-pg-b3a3aabdd2fb4ce88f7b4657126601e8/`.
+Earlier runs `64a9c2878fb5427ab0a013e0197a6b88` and
+`d264f0d36b2d4df19d1773cf62708896` are retained as intermediate evidence only.
+
+**Local isolated acceptance passed.** The formal
+CLI target passed 7/7, including cross-process receipt replay/rollback,
+97-byte/3-pin conservation, fresh read-only rollback preview, missing/corrupt
+schema refusal, and undrained-apply/oversized-input guards. Focused review accepted
+the historical-identity and new-lifetime product fixes. The signed HTTP recovery target passed
+3/3 selected fixture cases (22 reused support tests were filtered): authenticated
+PUT, Copy, CompleteMPU and legacy ZIP were refused before migration and succeeded
+after the formal CLI apply/replay and HTTP restart. The remote fixture combines
+accurate usage with a remote and ledger; it is not an independent remote-guard
+branch proof. This checks publication, leases, capacity and mock Kubo readback,
+not completed remote pinning or every legacy wire byte. The final isolated
+export passed Rust 1.92 fmt check and strict all-targets Clippy, full lib
+1442 passed/0 failed/1 ignored under default parallelism, integration 165,
+store 33, CLI 7 and Stage2 SQLite 2. The two Stage2 PG cases ignored in the
+ordinary command were actually exercised in the final PG run above.
+The empty-receipt hot path and duplicate failed-observation CAS regressions
+were fixed with controlled and deterministic reproductions; no internal
+timeouts, retries, worker counts, default parallelism or original assertions
+were weakened. Implementation review accepted the final fixes and evidence.
+Future Stage7/8 files were excluded from this export and do not prove their own
+delivery. No production migration, remote
+account operation, unpin, or GC has been performed.
+
 ## Environment-backed and deep checks
 
 Run the relevant command when its external environment is available:

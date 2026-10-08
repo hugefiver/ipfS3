@@ -283,13 +283,14 @@ async fn record_in_transaction<C: ConnectionTrait>(
                 && capture.remote_epoch == row.remote_epoch
                 && remote.epoch >= row.remote_epoch
         });
-    let released = pin_resource_history::Entity::find()
-        .filter(pin_resource_history::Column::Provider.eq(&row.provider))
-        .filter(pin_resource_history::Column::Cid.eq(&row.expected_cid))
-        .filter(pin_resource_history::Column::Epoch.gte(row.remote_epoch))
-        .one(db)
-        .await?
-        .is_some();
+    let released = crate::store::pinning::legacy_migration::release_history(
+        db,
+        &row.provider,
+        &row.expected_cid,
+    )
+    .await?
+    .iter()
+    .any(|history| history.epoch >= row.remote_epoch);
     let matched_context = if successful {
         match (current_job.as_ref(), remote.as_ref()) {
             (Some(job), Some(remote)) => {
@@ -407,11 +408,19 @@ async fn receipt_context_valid<C: ConnectionTrait>(
     remote: &remote_pin::Model,
     request: Option<&str>,
 ) -> AppResult<bool> {
+    let pk = [("id".into(), row.id.clone())].into();
+    let operational = crate::store::pinning::legacy_migration::captured_provider(
+        db,
+        "pin_submit_observations",
+        &pk,
+        &row.provider,
+    )
+    .await?;
     if job.id != row.job_id
         || job.operation != "submit"
-        || job.provider != row.provider
+        || job.provider != operational
         || job.cid != row.expected_cid
-        || remote.provider != row.provider
+        || remote.provider != operational
         || remote.cid != row.expected_cid
         || remote.epoch < row.remote_epoch
         || remote.status == "absent"
@@ -452,7 +461,7 @@ async fn receipt_context_valid<C: ConnectionTrait>(
         return Ok(false);
     }
     let registered =
-        crate::store::entities::pin_provider_route::Entity::find_by_id(row.provider.clone())
+        crate::store::entities::pin_provider_route::Entity::find_by_id(operational.clone())
             .one(db)
             .await?;
     if !registered.is_some_and(|registered| {
@@ -463,13 +472,14 @@ async fn receipt_context_valid<C: ConnectionTrait>(
     {
         return Ok(false);
     }
-    Ok(pin_resource_history::Entity::find()
-        .filter(pin_resource_history::Column::Provider.eq(&row.provider))
-        .filter(pin_resource_history::Column::Cid.eq(&row.expected_cid))
-        .filter(pin_resource_history::Column::Epoch.gte(row.remote_epoch))
-        .one(db)
-        .await?
-        .is_none())
+    Ok(!crate::store::pinning::legacy_migration::release_history(
+        db,
+        &operational,
+        &row.expected_cid,
+    )
+    .await?
+    .iter()
+    .any(|history| history.epoch >= row.remote_epoch))
 }
 
 /// Both receipt-arrival and parking call this inside their existing transaction.
@@ -533,40 +543,65 @@ struct AdmissionTable {
     kind: &'static str,
     name: String,
     columns: BTreeSet<String>,
-    filter: &'static str,
+    filter: String,
 }
 
-fn admission_table<E: EntityTrait + Default>(
-    kind: &'static str,
-    filter: &'static str,
-) -> AdmissionTable {
+fn admission_table<E: EntityTrait + Default>(kind: &'static str, filter: &str) -> AdmissionTable {
     AdmissionTable {
         kind,
         name: E::default().table_name().to_owned(),
         columns: E::Column::iter()
             .map(|column| Iden::to_string(&column))
             .collect(),
-        filter,
+        filter: filter.into(),
     }
 }
 
 impl AdmissionSnapshot {
     async fn read<C: ConnectionTrait>(db: &C, provider: &str) -> AppResult<Self> {
-        let scope = "\"provider\" = $1";
-        let invocation_scope = "\"job_id\" IN (SELECT \"job_id\" FROM \"pin_submit_observations\" WHERE \"provider\" = $1)";
+        let mut keys = crate::store::pinning::legacy_migration::historical_keys(
+            db,
+            "pin_submit_observations",
+            provider,
+            None,
+        )
+        .await?;
+        keys.extend(
+            crate::store::pinning::legacy_migration::historical_keys(
+                db,
+                "pin_resource_history",
+                provider,
+                None,
+            )
+            .await?,
+        );
+        keys.retain(|key| key != provider);
+        keys.sort();
+        keys.dedup();
+        keys.insert(0, provider.into());
+        let slots = (1..=keys.len())
+            .map(|i| format!("${i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let scope = format!("\"provider\" IN ({slots})");
+        let invocation_scope = format!(
+            "\"job_id\" IN (SELECT \"job_id\" FROM \"pin_submit_observations\" WHERE {scope})"
+        );
         let tables = [
-            admission_table::<evidence::Entity>("evidence", scope),
-            admission_table::<pin_job::Entity>("job", scope),
-            admission_table::<jobs::history::Entity>("history", invocation_scope),
-            admission_table::<remote_pin::Entity>("remote", scope),
-            admission_table::<pin_invocation_route::Entity>("capture", invocation_scope),
-            admission_table::<remote_pin_ledger::Entity>("ledger", scope),
-            admission_table::<pin_provider_route::Entity>("registered", scope),
-            admission_table::<pin_resource_history::Entity>("archive", scope),
-            admission_table::<pin_lease_target::Entity>("target", scope),
+            admission_table::<evidence::Entity>("evidence", &scope),
+            admission_table::<pin_job::Entity>("job", &scope),
+            admission_table::<jobs::history::Entity>("history", &invocation_scope),
+            admission_table::<remote_pin::Entity>("remote", &scope),
+            admission_table::<pin_invocation_route::Entity>("capture", &invocation_scope),
+            admission_table::<remote_pin_ledger::Entity>("ledger", &scope),
+            admission_table::<pin_provider_route::Entity>("registered", "\"provider\" = $1"),
+            admission_table::<pin_resource_history::Entity>("archive", &scope),
+            admission_table::<pin_lease_target::Entity>("target", &scope),
             admission_table::<pin_lease::Entity>(
                 "lease",
-                "\"id\" IN (SELECT \"lease_id\" FROM \"pin_lease_targets\" WHERE \"provider\" = $1)",
+                &format!(
+                    "\"id\" IN (SELECT \"lease_id\" FROM \"pin_lease_targets\" WHERE {scope})"
+                ),
             ),
         ];
         let mut columns = BTreeMap::new();
@@ -609,14 +644,35 @@ impl AdmissionSnapshot {
             .query_all(Statement::from_sql_and_values(
                 db.get_database_backend(),
                 sql,
-                [provider.into()],
+                keys.into_iter()
+                    .map(sea_orm::Value::from)
+                    .collect::<Vec<_>>(),
             ))
             .await?
         {
             match row.try_get::<String>("", "__admission_kind")?.as_str() {
-                "evidence" => snapshot
-                    .evidence
-                    .push(evidence::Model::from_query_result(&row, "")?),
+                "evidence" => {
+                    let mut model = evidence::Model::from_query_result(&row, "")?;
+                    if model.provider != provider {
+                        let pk = [("id".into(), model.id.clone())].into();
+                        let Some(binding) =
+                            crate::store::pinning::legacy_migration::resolve_legacy_binding(
+                                db,
+                                "pin_submit_observations",
+                                &pk,
+                                &model.provider,
+                            )
+                            .await?
+                        else {
+                            continue;
+                        };
+                        if binding.operational_key != provider {
+                            continue;
+                        }
+                        model.provider = provider.into(); // ephemeral admission projection only
+                    }
+                    snapshot.evidence.push(model);
+                }
                 "job" => {
                     let model = pin_job::Model::from_query_result(&row, "")?;
                     snapshot.jobs.insert(model.id.clone(), model);
@@ -641,9 +697,33 @@ impl AdmissionSnapshot {
                     snapshot.registered =
                         Some(pin_provider_route::Model::from_query_result(&row, "")?)
                 }
-                "archive" => snapshot
-                    .archives
-                    .push(pin_resource_history::Model::from_query_result(&row, "")?),
+                "archive" => {
+                    let mut model = pin_resource_history::Model::from_query_result(&row, "")?;
+                    if model.provider != provider {
+                        let pk = [
+                            ("provider".into(), model.provider.clone()),
+                            ("cid".into(), model.cid.clone()),
+                            ("epoch".into(), model.epoch.to_string()),
+                        ]
+                        .into();
+                        let Some(binding) =
+                            crate::store::pinning::legacy_migration::resolve_legacy_binding(
+                                db,
+                                "pin_resource_history",
+                                &pk,
+                                &model.provider,
+                            )
+                            .await?
+                        else {
+                            continue;
+                        };
+                        if binding.operational_key != provider {
+                            continue;
+                        }
+                        model.provider = provider.into();
+                    }
+                    snapshot.archives.push(model);
+                }
                 "target" => {
                     let model = pin_lease_target::Model::from_query_result(&row, "")?;
                     snapshot.targets.insert(model.id.clone(), model);
@@ -874,11 +954,11 @@ pub async fn held_evidence_known<C: ConnectionTrait>(
     if ledger.effect == "reserved" {
         return Ok(super::decode_route(ledger).is_some_and(|route| is_rpc(&route)));
     }
-    let rows = evidence::Entity::find()
-        .filter(evidence::Column::Provider.eq(&ledger.provider))
-        .filter(evidence::Column::ExpectedCid.eq(&ledger.cid))
-        .all(db)
-        .await?;
+    let rows = observations(db, &ledger.provider)
+        .await?
+        .into_iter()
+        .filter(|row| row.expected_cid == ledger.cid)
+        .collect::<Vec<_>>();
     if ledger.effect == "absent" {
         return Ok(!rows.is_empty()
             && rows.iter().all(|row| {
@@ -900,13 +980,14 @@ pub async fn held_evidence_known<C: ConnectionTrait>(
         if ledger.effect == "not_created" && row.outcome != "not_submitted" {
             continue;
         }
-        if pin_resource_history::Entity::find()
-            .filter(pin_resource_history::Column::Provider.eq(&ledger.provider))
-            .filter(pin_resource_history::Column::Cid.eq(&ledger.cid))
-            .filter(pin_resource_history::Column::Epoch.gte(row.remote_epoch))
-            .one(db)
-            .await?
-            .is_none()
+        if !crate::store::pinning::legacy_migration::release_history(
+            db,
+            &ledger.provider,
+            &ledger.cid,
+        )
+        .await?
+        .iter()
+        .any(|history| history.epoch >= row.remote_epoch)
         {
             return Ok(true);
         }
@@ -919,20 +1000,14 @@ pub async fn matching_pin_held<C: ConnectionTrait>(
     provider: &str,
     cid: &str,
 ) -> AppResult<bool> {
-    let rows = evidence::Entity::find()
-        .filter(evidence::Column::Provider.eq(provider))
-        .filter(evidence::Column::ExpectedCid.eq(cid))
-        .filter(evidence::Column::Outcome.is_in(["matched", "accepted"]))
-        .all(db)
-        .await?;
+    let rows = observations(db, provider).await?.into_iter().filter(|row| {
+        row.expected_cid == cid && matches!(row.outcome.as_str(), "matched" | "accepted")
+    });
     for row in rows {
-        if pin_resource_history::Entity::find()
-            .filter(pin_resource_history::Column::Provider.eq(provider))
-            .filter(pin_resource_history::Column::Cid.eq(cid))
-            .filter(pin_resource_history::Column::Epoch.gte(row.remote_epoch))
-            .one(db)
+        if !crate::store::pinning::legacy_migration::release_history(db, provider, cid)
             .await?
-            .is_none()
+            .iter()
+            .any(|history| history.epoch >= row.remote_epoch)
         {
             return Ok(true);
         }
@@ -946,6 +1021,18 @@ pub async fn dispatch_allowed<C: ConnectionTrait>(db: &C, id: &str) -> AppResult
     let Some(row) = evidence::Entity::find_by_id(id.to_owned()).one(db).await? else {
         return Ok(false);
     };
+    let pk = [("id".into(), row.id.clone())].into();
+    if crate::store::pinning::legacy_migration::resolve_legacy_binding(
+        db,
+        "pin_submit_observations",
+        &pk,
+        &row.provider,
+    )
+    .await?
+    .is_some()
+    {
+        return Ok(false);
+    }
     if row.outcome != "in_flight" || row.observed_at.is_some() {
         return Ok(false);
     }
@@ -1043,13 +1130,10 @@ pub async fn projection_allowed<C: ConnectionTrait>(
     if !same_route {
         return Ok(false);
     }
-    if pin_resource_history::Entity::find()
-        .filter(pin_resource_history::Column::Provider.eq(&job.provider))
-        .filter(pin_resource_history::Column::Cid.eq(&job.cid))
-        .filter(pin_resource_history::Column::Epoch.gte(captured.remote_epoch))
-        .one(db)
+    if crate::store::pinning::legacy_migration::release_history(db, &job.provider, &job.cid)
         .await?
-        .is_some()
+        .iter()
+        .any(|history| history.epoch >= captured.remote_epoch)
     {
         return Ok(false);
     }
@@ -1070,11 +1154,33 @@ pub async fn observations<C: ConnectionTrait>(
     db: &C,
     provider: &str,
 ) -> AppResult<Vec<evidence::Model>> {
-    Ok(evidence::Entity::find()
-        .filter(evidence::Column::Provider.eq(provider))
+    let keys = crate::store::pinning::legacy_migration::historical_keys(
+        db,
+        "pin_submit_observations",
+        provider,
+        None,
+    )
+    .await?;
+    let rows = evidence::Entity::find()
+        .filter(evidence::Column::Provider.is_in(keys))
         .order_by_asc(evidence::Column::StartedAt)
         .all(db)
-        .await?)
+        .await?;
+    let mut result = Vec::new();
+    for row in rows {
+        let pk = [("id".into(), row.id.clone())].into();
+        let mapped = crate::store::pinning::legacy_migration::resolve_legacy_binding(
+            db,
+            "pin_submit_observations",
+            &pk,
+            &row.provider,
+        )
+        .await?;
+        if row.provider == provider || mapped.is_some_and(|m| m.operational_key == provider) {
+            result.push(row);
+        }
+    }
+    Ok(result)
 }
 
 /// Lookup by the recorded historical scope, not current provider registration.
@@ -1089,10 +1195,29 @@ pub async fn resource_observations<C: ConnectionTrait>(
         .await?;
     let mut found = Vec::new();
     for row in rows {
+        let pk = [("id".into(), row.id.clone())].into();
+        let binding = crate::store::pinning::legacy_migration::resolve_legacy_binding(
+            db,
+            "pin_submit_observations",
+            &pk,
+            &row.provider,
+        )
+        .await?;
         let resources: Vec<ResourceEvidence> = serde_json::from_str(&row.resources)
             .map_err(|_| AppError::Internal("invalid durable RPC resources".into()))?;
         for resource in resources {
-            if resource.key.as_ref() == Some(key) {
+            let declared = binding.as_ref().is_some_and(|binding| {
+                resource.key.is_some()
+                    && binding.declaration_route.backend == key.backend
+                    && binding.declaration_route.scope == key.scope
+                    && binding.declaration_route.resource_type() == key.resource_type
+                    && resource.resource.resource_type == key.resource_type
+                    && canonical_resource_cid(&resource.resource.cid)
+                        .ok()
+                        .as_deref()
+                        == Some(key.resource_id.as_str())
+            });
+            if resource.key.as_ref() == Some(key) || declared {
                 found.push((row.clone(), resource));
             }
         }

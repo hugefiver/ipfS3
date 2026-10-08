@@ -72,7 +72,23 @@ pub async fn frozen_candidates<C: ConnectionTrait>(
     db: &C,
     lease_id: &str,
 ) -> AppResult<Option<Vec<String>>> {
-    Ok(get(db, lease_id).await?.map(|birth| birth.candidate_order))
+    let Some(birth) = get(db, lease_id).await? else {
+        return Ok(None);
+    };
+    let key = [("lease_id".into(), lease_id.to_owned())].into();
+    let mut candidates = Vec::new();
+    for provider in birth.candidate_order {
+        candidates.push(
+            crate::store::pinning::legacy_migration::captured_provider(
+                db,
+                "pin_lease_requirements",
+                &key,
+                &provider,
+            )
+            .await?,
+        );
+    }
+    Ok(Some(candidates))
 }
 
 pub fn read_route_compatible(
@@ -120,6 +136,12 @@ pub async fn target_confirmed<C: ConnectionTrait>(
     cid: &str,
     now: DateTime<Utc>,
 ) -> AppResult<bool> {
+    if crate::store::pinning::legacy_migration::resource_binding(db, provider, cid)
+        .await?
+        .is_some_and(|binding| binding.historical_route.is_none())
+    {
+        return Ok(false);
+    }
     let ledger = crate::store::pinning::ledger::get(db, provider, cid).await?;
     let Some(route) = ledger
         .as_ref()
@@ -133,7 +155,24 @@ pub async fn target_confirmed<C: ConnectionTrait>(
             != crate::pinning::identity::RemoteResourceType::ClusterPin
             && ledger.is_some_and(|row| row.effect == "confirmed"));
     };
-    let Some(Some(original)) = birth.candidates.get(provider) else {
+    let key = [("lease_id".into(), lease_id.to_owned())].into();
+    let mut original_route = None;
+    for (candidate, route) in &birth.candidates {
+        let operational = crate::store::pinning::legacy_migration::captured_provider(
+            db,
+            "pin_lease_requirements",
+            &key,
+            candidate,
+        )
+        .await?;
+        if operational == provider || candidate == provider {
+            if original_route.is_some() {
+                return Ok(false);
+            }
+            original_route = route.as_ref();
+        }
+    }
+    let Some(original) = original_route else {
         return Ok(false);
     };
     let same_route =
@@ -172,6 +211,14 @@ pub async fn completion<C: ConnectionTrait>(
     for object_cid in &birth.content_cids {
         let mut available = false;
         for (provider, route) in &birth.candidates {
+            let key = [("lease_id".into(), lease_id.to_owned())].into();
+            let operational = crate::store::pinning::legacy_migration::captured_provider(
+                db,
+                "pin_lease_requirements",
+                &key,
+                provider,
+            )
+            .await?;
             let cid = if route.as_ref().is_some_and(|route| {
                 matches!(
                     route.resource_type(),
@@ -183,12 +230,12 @@ pub async fn completion<C: ConnectionTrait>(
             } else {
                 object_cid.clone()
             };
-            let remote = remote_pin::Entity::find_by_id((provider.clone(), cid.clone()))
+            let remote = remote_pin::Entity::find_by_id((operational.clone(), cid.clone()))
                 .one(db)
                 .await?;
             let attached = pin_lease_target::Entity::find()
                 .filter(pin_lease_target::Column::LeaseId.eq(lease_id))
-                .filter(pin_lease_target::Column::Provider.eq(provider))
+                .filter(pin_lease_target::Column::Provider.eq(&operational))
                 .filter(pin_lease_target::Column::Cid.eq(&cid))
                 .filter(pin_lease_target::Column::State.eq("pinned"))
                 .one(db)

@@ -8,7 +8,7 @@ use crate::{
         provider::PinObservation,
     },
     store::{
-        entities::{pin_invocation_route, pin_provider_route, pin_resource_history, remote_pin},
+        entities::{pin_invocation_route, pin_provider_route, remote_pin},
         pinning::{
             jobs::{self, ClaimedPinJob},
             ledger,
@@ -144,13 +144,12 @@ async fn unreleased<C: ConnectionTrait>(
     cid: &str,
     epoch: i64,
 ) -> AppResult<bool> {
-    Ok(pin_resource_history::Entity::find()
-        .filter(pin_resource_history::Column::Provider.eq(provider))
-        .filter(pin_resource_history::Column::Cid.eq(cid))
-        .filter(pin_resource_history::Column::Epoch.gte(epoch))
-        .one(db)
-        .await?
-        .is_none())
+    Ok(
+        !crate::store::pinning::legacy_migration::release_history(db, provider, cid)
+            .await?
+            .iter()
+            .any(|row| row.epoch >= epoch),
+    )
 }
 
 pub async fn fresh_complete<C: ConnectionTrait>(
@@ -160,6 +159,9 @@ pub async fn fresh_complete<C: ConnectionTrait>(
     route: &ProviderRouteSnapshot,
     now: DateTime<Utc>,
 ) -> AppResult<bool> {
+    let operational =
+        crate::store::pinning::legacy_migration::resource_key(db, provider, cid).await?;
+    let provider = operational.as_str();
     let registered = pin_provider_route::Entity::find_by_id(provider.to_owned())
         .one(db)
         .await?;
@@ -170,13 +172,35 @@ pub async fn fresh_complete<C: ConnectionTrait>(
     {
         return Ok(false);
     }
-    let row = Entity::find()
-        .filter(Column::Provider.eq(provider))
+    let keys = crate::store::pinning::legacy_migration::historical_keys(
+        db,
+        "pin_replica_observations",
+        provider,
+        Some(cid),
+    )
+    .await?;
+    let rows = Entity::find()
+        .filter(Column::Provider.is_in(keys))
         .filter(Column::ExpectedCid.eq(cid))
         .filter(Column::Projectable.eq(true))
         .order_by_desc(Column::Sequence)
-        .one(db)
+        .all(db)
         .await?;
+    let mut row = None;
+    for candidate in rows {
+        let pk = [("sequence".into(), candidate.sequence.to_string())].into();
+        let mapped = crate::store::pinning::legacy_migration::resolve_legacy_binding(
+            db,
+            "pin_replica_observations",
+            &pk,
+            &candidate.provider,
+        )
+        .await?;
+        if candidate.provider == provider || mapped.is_some_and(|m| m.operational_key == provider) {
+            row = Some(candidate);
+            break;
+        }
+    }
     let Some(row) = row else { return Ok(false) };
     let Ok(recorded) = serde_json::from_str::<ProviderRouteSnapshot>(&row.route) else {
         return Ok(false);
