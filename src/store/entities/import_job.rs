@@ -16,6 +16,7 @@ pub struct Model {
     pub tags_json: String,
     /// Captured at authenticated submission; NULL only for pre-migration jobs.
     pub pin_decision_json: Option<String>,
+    pub zip_intent_json: Option<String>,
     pub decompress_prefix: Option<String>,
     /// Signed admission option; NULL for jobs created before Stage4.
     pub root_capture_json: Option<String>,

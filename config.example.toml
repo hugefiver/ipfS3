@@ -41,9 +41,27 @@ terminal_retention_secs = 604800
 max_provider_records = 20
 
 [decompress_zip]
-# ZIP-only default. A signed ipfs-s3:zip-root=true|false object tag overrides
+# ZIP-only default. An authenticated ipfs-s3:zip-root=true|false tag overrides
 # this setting per ZIP request; ordinary PUT/Copy/tagging does not build a root.
 unixfs_directory_root = true
+# Both ZIP contracts use ordinary ordered `pinning.policies` with trigger=always
+# to pin each successfully published output (never archive/root). No providers
+# or Request-only policies means no automatic remote work, even with true.
+# Migration: old Always remote policies or old v2 pin_output_rules require an
+# explicit choice. true adopts extracted semantics; false disables only ZIP
+# automatic outputs, not ordinary objects or explicitly authorized pin requests.
+auto_pin_outputs = true
+# Optional common restrictions: omitted uses ordinary policies; explicit [] or
+# unmatched rules authorize no output. Any matching deny vetoes every allow.
+# pin_output_rules = []
+# [[decompress_zip.pin_output_rules]]
+# name = "exports"
+# priority = 0
+# bucket = "photos"
+# prefix = "exports/"
+# effect = "allow"
+# policy_index = 0 # zero-based position in pinning.policies, resolved at load
+# Historical policy_id aliases are exact matches only; do not use both fields.
 # Optional per-input ZIP limits: 16 GiB raw source ZIP bytes (including ZIP
 # framing), 8 GiB decompressed total and per entry, 10,000 entries, 64 MiB
 # metadata; no overall processing deadline. The new raw-source intake boundary

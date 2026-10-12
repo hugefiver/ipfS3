@@ -333,7 +333,7 @@ fn pin_control(tags: &[ObjectTag]) -> Result<PinControl, PolicyError> {
     PinControl::from_tags(tags).map_err(|error| invalid_request(error.to_string()))
 }
 
-fn lease_intent(
+pub(crate) fn lease_intent(
     policy: &ValidatedPolicy,
     source: LeaseSource,
     content_mode: ContentMode,
@@ -798,6 +798,8 @@ mod tests {
 
         let config: Config = toml::from_str(
             r#"
+            [decompress_zip]
+            auto_pin_outputs = false
             [pinning]
             [[pinning.providers]]
             name = "remote"

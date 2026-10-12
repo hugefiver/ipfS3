@@ -195,6 +195,7 @@ mod tests {
             pin_decision_json: None,
             decompress_prefix: None,
             root_capture_json: None,
+            zip_intent_json: None,
             state: "running".to_owned(),
             phase: "pinning_local".to_owned(),
             attempts: 2,

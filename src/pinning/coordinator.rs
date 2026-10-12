@@ -6,7 +6,7 @@ use tokio::sync::{Mutex, RwLock, Semaphore};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::OptionalPinControlMode;
+use crate::config::{DecompressZipConfig, OptionalPinControlMode};
 use crate::kubo::KuboClient;
 use crate::pinning::{
     config::{ProviderKind, ProviderLimitMap, ValidatedPinningConfig, ValidatedProvider},
@@ -62,9 +62,8 @@ pub struct WorkerSettings {
 pub struct PinningCoordinator {
     effective_config: ValidatedPinningConfig,
     control_mode: OptionalPinControlMode,
-    zip_root_default: bool,
+    decompress_zip_config: DecompressZipConfig,
     zip_output_rules: ValidatedZipOutputRules,
-    zip_extraction_limits: ZipExtractionLimits,
     policy: PinPolicyEvaluator,
     policy_providers: HashMap<String, Vec<String>>,
     providers: HashMap<String, Arc<dyn PinningProvider>>,
@@ -226,10 +225,25 @@ impl PinningCoordinator {
         raw_rules: &[ZipOutputRuleConfig],
         zip_extraction_limits: ZipExtractionLimits,
     ) -> anyhow::Result<Arc<Self>> {
+        let zip = DecompressZipConfig {
+            unixfs_directory_root: zip_root_default,
+            limits: zip_extraction_limits,
+            pin_output_rules: raw_rules.to_vec(),
+            ..DecompressZipConfig::default()
+        };
+        Self::build_with_decompress_config(config, kubo, mode, &zip)
+    }
+
+    pub fn build_with_decompress_config(
+        config: ValidatedPinningConfig,
+        kubo: Option<KuboClient>,
+        mode: OptionalPinControlMode,
+        zip: &DecompressZipConfig,
+    ) -> anyhow::Result<Arc<Self>> {
         // Resolve aliases before policy evaluation: all later target, quota and
         // job keys use the same physical resource namespace.
         let config = normalize_validated_config(config)?;
-        let zip_output_rules = ValidatedZipOutputRules::compile(raw_rules, &config)?;
+        let zip_output_rules = ValidatedZipOutputRules::compile(&zip.pin_output_rules, &config)?;
         let claim_limit = config
             .worker_concurrency
             .checked_mul(2)
@@ -320,9 +334,8 @@ impl PinningCoordinator {
         Ok(Arc::new(Self {
             effective_config,
             control_mode: mode,
-            zip_root_default,
+            decompress_zip_config: zip.clone(),
             zip_output_rules,
-            zip_extraction_limits,
             policy,
             policy_providers,
             providers,
@@ -354,7 +367,11 @@ impl PinningCoordinator {
     }
 
     pub fn zip_root_default(&self) -> bool {
-        self.zip_root_default
+        self.decompress_zip_config.unixfs_directory_root
+    }
+
+    pub fn decompress_zip_config(&self) -> &DecompressZipConfig {
+        &self.decompress_zip_config
     }
 
     pub fn zip_output_rules(&self) -> &ValidatedZipOutputRules {
@@ -362,7 +379,7 @@ impl PinningCoordinator {
     }
 
     pub fn zip_extraction_limits(&self) -> ZipExtractionLimits {
-        self.zip_extraction_limits
+        self.decompress_zip_config.limits
     }
 
     pub fn provider_limits(&self) -> &ProviderLimitMap {

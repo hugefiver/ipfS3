@@ -797,6 +797,7 @@ async fn source_and_entries_targets_intersect_per_output_deny_and_do_not_copy_ar
             database_url = "sqlite::memory:"
             [decompress_zip]
             unixfs_directory_root = false
+            auto_pin_outputs = true
             [[pinning.providers]]
             name = "alpha"
             kind = "noop"
@@ -931,25 +932,114 @@ async fn source_and_entries_targets_intersect_per_output_deny_and_do_not_copy_ar
 
 #[tokio::test]
 async fn changed_remote_rules_after_create_reject_source_complete_before_archive_io() {
-    let (harness, id, _) =
-        setup_source_and_entries_with_targets(BucketVersioningState::Unversioned, false, "both")
-            .await;
+    let archive = legal_single_entry_zip();
+    let mut harness = start_harness_with_root_default(
+        KuboScript {
+            add_replies: vec![AddReply::Ok("QmArchive"), AddReply::Ok("QmOutput")],
+            cat_bodies: [
+                ("QmPart".into(), archive.clone()),
+                ("QmArchive".into(), archive.clone()),
+            ]
+            .into(),
+        },
+        false,
+    )
+    .await;
     let raw = format!(
         r#"
         [kubo]
         rpc_url = {:?}
         [storage]
         database_url = "sqlite::memory:"
-        [[decompress_zip.pin_output_rules]]
-        name = "new-private-rule"
+        [decompress_zip]
+        unixfs_directory_root = false
+        auto_pin_outputs = true
+        [[pinning.providers]]
+        name = "alpha"
+        kind = "noop"
         priority = 1
+        max_bytes = 1000000
+        max_pins = 100
+        [[pinning.policies]]
         bucket = "test-bkt"
-        prefix = "out/"
-        effect = "deny"
+        prefix = ""
+        trigger = "always"
+        provider_mode = "one"
+        providers = ["alpha"]
+        default_duration = "1h"
+        max_duration = "2h"
+        allow_decompressed = true
     "#,
         harness.state.kubo.base_url()
     );
-    let cfg: Config = toml::from_str(&raw).unwrap();
+    let mut cfg: Config = toml::from_str(&raw).unwrap();
+    let original = ipfs_s3_gateway::state::AppState::new(&cfg).await.unwrap();
+    store::bucket::create(original.store.db(), &harness.bucket, None)
+        .await
+        .unwrap();
+    let original_server =
+        support::decompress::start_s3_server(original.clone(), Arc::default()).await;
+    harness.state = original;
+    harness.endpoint = original_server.endpoint.clone();
+    let mut headers = source_and_entries_headers("source-and-entries");
+    headers.insert("x-ipfs3-zip-targets", HeaderValue::from_static("both"));
+    let created = support::sigv4::send_sigv4(
+        reqwest::Method::POST,
+        &harness.endpoint,
+        &harness.bucket,
+        "archive.zip",
+        &[("uploads", ""), ("decompress-zip", "out/")],
+        vec![],
+        headers,
+        "test",
+    )
+    .await;
+    let status = created.status();
+    let xml = created.text().await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{xml}");
+    let id = xml
+        .split("<UploadId>")
+        .nth(1)
+        .unwrap()
+        .split("</UploadId>")
+        .next()
+        .unwrap()
+        .to_owned();
+    let captured = store::multipart::v2_zip::read_by_upload(harness.state.store.db(), &id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        captured.options().unwrap().targets,
+        ipfs_s3_gateway::zip::options::ZipTargets::Both
+    );
+    assert!(
+        captured
+            .zip_intent()
+            .unwrap()
+            .unwrap()
+            .controls()
+            .targets
+            .source
+    );
+    store::multipart::upsert_part(
+        harness.state.store.db(),
+        &id,
+        1,
+        "QmPart",
+        archive.len() as i64,
+        "QmPart",
+    )
+    .await
+    .unwrap();
+    cfg.decompress_zip.pin_output_rules = vec![ZipOutputRuleConfig {
+        name: "new-private-rule".into(),
+        priority: 1,
+        bucket: harness.bucket.clone(),
+        prefix: "".into(),
+        effect: ZipRuleEffect::Deny,
+        policy_id: None,
+    }];
     let changed = ipfs_s3_gateway::state::AppState::new(&cfg).await.unwrap();
     let state = Arc::new(ipfs_s3_gateway::state::AppState {
         kubo: harness.state.kubo.clone(),
@@ -975,11 +1065,28 @@ async fn changed_remote_rules_after_create_reject_source_complete_before_archive
     .await;
     let status = first.status();
     let xml = first.text().await.unwrap();
-    assert_eq!(status, StatusCode::CONFLICT, "{xml}");
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "{xml}; adds={}; cats={}; objects={}; original_revision={}; current_revision={}",
+        harness.captured_add_file_bytes().len(),
+        kubo_cat_calls(&harness).await,
+        count(&harness, "objects").await,
+        captured.rule_revision,
+        changed.pinning.zip_output_rules().revision()
+    );
     assert_eq!(harness.captured_add_file_bytes().len(), 0);
     assert_eq!(kubo_cat_calls(&harness).await, 0);
     assert_eq!(count(&harness, "objects").await, 0);
     assert_eq!(count(&harness, "multipart_uploads").await, 1);
+    assert_eq!(
+        store::multipart::v2_zip::read_by_upload(harness.state.store.db(), &id)
+            .await
+            .unwrap()
+            .unwrap()
+            .captured_options,
+        captured.captured_options
+    );
 }
 
 #[tokio::test]

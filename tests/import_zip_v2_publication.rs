@@ -22,6 +22,9 @@ use sea_orm::{
 };
 use sha2::{Digest, Sha256};
 
+#[path = "support/import_zip_v2_publication.rs"]
+mod native;
+
 async fn setup() -> (tempfile::TempDir, DatabaseConnection, DatabaseConnection) {
     let dir = tempfile::tempdir().unwrap();
     let url = format!(
@@ -41,7 +44,8 @@ async fn setup() -> (tempfile::TempDir, DatabaseConnection, DatabaseConnection) 
 
 async fn prepared(db: &DatabaseConnection, outputs: bool) -> (execution::Claim, ZipV2Publication) {
     let contract = "{\"contract\":\"import\"}";
-    let options = serde_json::json!({"options":{"publish_source":false,"publish_extracted":true,"targets":"none","token":"import-token","root_override":null,"root_enabled":true,"result_version":2},"rule_revision":null}).to_string();
+    let capture = native::capture();
+    let options = serde_json::json!({"options":capture.v2_options().unwrap(),"zip_intent":capture,"rule_revision":null}).to_string();
     let admission = execution::Admission {
         id: "import-execution".into(),
         owner: "principal".into(),
@@ -58,8 +62,8 @@ async fn prepared(db: &DatabaseConnection, outputs: bool) -> (execution::Claim, 
         &import_intake::Request {
             admission: admission.clone(),
             prefix: "out/".into(),
-            source_descriptor: "https://host/source?credential=secret".into(),
-            expected_sha256: Some("a".repeat(64)),
+            source_descriptor: native::descriptor(),
+            expected_sha256: Some(native::input_sha256()),
         },
     )
     .await
@@ -68,9 +72,7 @@ async fn prepared(db: &DatabaseConnection, outputs: bool) -> (execution::Claim, 
         .await
         .unwrap()
         .unwrap();
-    import_intake::bind_verified_input(db, &claim, &"a".repeat(64), "input-cid", 99)
-        .await
-        .unwrap();
+    let verified = native::bind(db, &claim).await;
     let items = if outputs {
         vec![execution::ManifestItem::Success {
             path: "file.txt".into(),
@@ -157,7 +159,7 @@ async fn prepared(db: &DatabaseConnection, outputs: bool) -> (execution::Claim, 
         claim: claim.clone(), source: None, source_policy: None, source_guard: None,
         successes, targets: ZipTargets::None, captured_rule_revision: None,
         root_outcome: if outputs { zip::RootOutcome::Failed { code: "root_build_failed" } } else { zip::RootOutcome::Empty },
-        terminal_result: serde_json::json!({"input_sha256":"a".repeat(64),"published_count":if outputs {1} else {0},"failed_count":0,"status":if outputs {"completed"} else {"failed"}}).to_string(),
+        terminal_result: serde_json::json!({"input_sha256":verified.sha256,"published_count":if outputs {1} else {0},"failed_count":0,"status":if outputs {"completed"} else {"failed"}}).to_string(),
     };
     (claim, publication)
 }
@@ -468,7 +470,7 @@ async fn invalid_import_terminal_cannot_persist_secret_or_fabricated_source_vers
     let (_dir, first, second) = setup().await;
     let (claim, mut publication) = prepared(&first, true).await;
     publication.terminal_result = serde_json::json!({
-        "input_sha256":"a".repeat(64),"published_count":1,"failed_count":0,
+        "input_sha256":native::input_sha256(),"published_count":1,"failed_count":0,
         "status":"completed","source_version_id":"fabricated","raw_error":"https://host/?password=secret"
     }).to_string();
     let (config, rules) = policy();
@@ -564,7 +566,7 @@ async fn root_only_retry_does_not_rewrite_import_receipt_or_execution_terminal()
         .await
         .unwrap();
     let tx = first.begin().await.unwrap();
-    let terminal = serde_json::json!({"input_sha256":"a".repeat(64),"published_count":1,"failed_count":0,"status":"completed","root_status":"failed","root_warning":"root_retry_failed"}).to_string();
+    let terminal = serde_json::json!({"input_sha256":native::input_sha256(),"published_count":1,"failed_count":0,"status":"completed","root_status":"failed","root_warning":"root_retry_failed"}).to_string();
     root_claim
         .settle_failed_retry(&tx, &terminal, "root_retry_failed")
         .await

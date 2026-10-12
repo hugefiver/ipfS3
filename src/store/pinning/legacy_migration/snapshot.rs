@@ -8,6 +8,10 @@ use sea_orm::{
 use sea_orm_migration::MigratorTrait;
 use std::collections::BTreeSet;
 
+const STAGE5: &str = "m20261004_000001_rpc_submission_ledger";
+const STAGE6: &str = "m20261004_000002_cluster_replica_contract";
+const ZIP_CAPTURE: &str = "m20261008_000001_zip_intent_capture";
+
 fn entity<E: EntityTrait + Default>() -> TableImage {
     let mut columns: Vec<_> = E::Column::iter().map(|c| Iden::to_string(&c)).collect();
     columns.sort();
@@ -105,14 +109,16 @@ pub(super) async fn schema<C: ConnectionTrait>(db: &C, writing: bool) -> AppResu
         .iter()
         .map(|m| m.name().to_owned())
         .collect();
-    // Only known Stage5/6/R26 schemas; a prefix is not permission to ignore arbitrary missing tables.
-    if actual.len() < known.len() - 2
-        || actual != known[..actual.len().min(known.len())]
+    // Registered prefixes must end at an explicitly supported catalog shape.
+    if !matches!(
+        actual.last().map(String::as_str),
+        Some(STAGE5 | STAGE6 | SCHEMA | ZIP_CAPTURE)
+    ) || actual != known[..actual.len().min(known.len())]
         || actual.len() > known.len()
     {
         return Err(refused("unknown or incomplete schema"));
     }
-    if writing && actual.last().map(String::as_str) != Some(SCHEMA) {
+    if writing && !actual.iter().any(|v| v == SCHEMA) {
         return Err(refused(
             "upgrade schema through normal gateway migration before apply",
         ));
@@ -130,13 +136,22 @@ pub(super) async fn read<C: ConnectionTrait>(
     versions: &[String],
 ) -> AppResult<Vec<TableImage>> {
     let backend = db.get_database_backend();
-    let stage6 = versions
-        .iter()
-        .any(|v| v == "m20261004_000002_cluster_replica_contract");
+    let stage6 = versions.iter().any(|v| v == STAGE6);
+    let zip_capture = versions.iter().any(|v| v == ZIP_CAPTURE);
     let mut result = Vec::new();
     let mut count = 0;
     let mut bytes = 0;
     for mut table in tables() {
+        match (table.table.as_str(), zip_capture) {
+            ("multipart_uploads" | "import_jobs", false) => {
+                table.columns.retain(|c| c != "zip_intent_json");
+            }
+            ("zip_batches", true) => {
+                table.columns.push("legacy_input_proof_json".into());
+                table.columns.sort();
+            }
+            _ => {}
+        }
         let expected_missing = !stage6
             && matches!(
                 table.table.as_str(),
@@ -157,7 +172,10 @@ pub(super) async fn read<C: ConnectionTrait>(
             .iter()
             .map(|r| r.try_get("", "column_name"))
             .collect::<Result<_, _>>()?;
-        if expected_missing && columns.is_empty() {
+        if expected_missing {
+            if !columns.is_empty() {
+                return Err(refused("unexpected closure table for historical schema"));
+            }
             table.columns.clear();
             result.push(table);
             continue;

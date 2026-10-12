@@ -1,4 +1,6 @@
 //! ZIP v2 import is accepted at SigV4 intake and finished by the shared worker.
+#[path = "support/import_zip_v2_acceptance_fixture.rs"]
+mod native;
 #[allow(dead_code)]
 mod support;
 
@@ -45,19 +47,8 @@ fn headers(token: &str) -> HeaderMap {
     result
 }
 
-async fn submit(
-    harness: &ImportHarness,
-    token: &str,
-    source: &str,
-    expected: Option<&str>,
-) -> String {
-    let mut controls = headers(token);
-    if let Some(digest) = expected {
-        controls.insert(
-            "x-ipfs3-zip-expected-sha256",
-            HeaderValue::from_str(digest).unwrap(),
-        );
-    }
+async fn submit(harness: &ImportHarness, token: &str, source: &str) -> String {
+    let controls = headers(token);
     let accepted = send_sigv4(
         reqwest::Method::POST,
         &harness.endpoint,
@@ -177,7 +168,7 @@ async fn claimed_cid_import_finishes_without_publishing_a_source_object() {
     let harness = start_import_harness(ImportHarnessConfig::default()).await;
     let archive = legal_single_entry_zip();
     harness.set_cat_body(CID, archive);
-    let id = submit(&harness, "worker-cid", &cid_xml(), None).await;
+    let id = submit(&harness, "worker-cid", &cid_xml()).await;
     assert_eq!(wait_for_state(&harness, &id).await, "ready");
     let response =
         get_import_status(&harness, &harness.bucket, "archive.zip", &id, None, None).await;
@@ -216,17 +207,15 @@ async fn url_first_verified_read_is_replayed_without_a_second_get_after_source_c
         "<IPFS3ImportRequest><URL>{}</URL></IPFS3ImportRequest>",
         harness.source.url("/archive.zip?secret=private")
     );
-    let id = submit(&harness, "verified-url", &xml, Some(&expected)).await;
+    let size = legal_single_entry_zip().len() as i64;
+    let id = submit(&harness, "verified-url", &xml).await;
     assert_eq!(wait_for_state(&harness, &id).await, "ready");
     assert_eq!(harness.source.requests().len(), 1);
     harness.source.set_reply(
         "/archive.zip?secret=private",
         TestHttpsReply::chunked(b"changed".to_vec()),
     );
-    assert_eq!(
-        submit(&harness, "verified-url", &xml, Some(&expected)).await,
-        id
-    );
+    assert_eq!(submit(&harness, "verified-url", &xml).await, id);
     let response =
         get_import_status(&harness, &harness.bucket, "archive.zip", &id, None, None).await;
     let status = String::from_utf8(response.into_body()).unwrap();
@@ -238,6 +227,17 @@ async fn url_first_verified_read_is_replayed_without_a_second_get_after_source_c
         "replay/status must never GET the URL again"
     );
     assert_eq!(harness.kubo_call_count("/api/v0/add").await, 2);
+    let measured = execution::read(harness.state.store.db(), &id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(measured.input_sha256.as_deref(), Some(expected.as_str()));
+    assert_eq!(measured.input_art_size, Some(size));
+    assert_eq!(measured.input_art_cid.as_deref(), Some(CID));
+    assert_eq!(
+        harness.captured_add_file_bytes()[0],
+        legal_single_entry_zip()
+    );
     assert_eq!(
         object_version::Entity::find()
             .count(harness.state.store.db())
@@ -256,20 +256,47 @@ async fn url_first_verified_read_is_replayed_without_a_second_get_after_source_c
 }
 
 #[tokio::test]
-async fn changed_first_url_read_is_terminally_failed_with_redacted_measured_mismatch() {
+async fn historical_first_url_promise_mismatch_is_terminally_failed_without_binding_or_pin() {
     let harness = start_import_harness(ImportHarnessConfig::default()).await;
     let archive = legal_single_entry_zip();
+    let measured = hex::encode(Sha256::digest(&archive));
     let expected = hex::encode(Sha256::digest(b"original promised bytes"));
+    assert_ne!(expected, measured);
     harness.source.set_reply(
         "/mismatch.zip?secret=private",
         TestHttpsReply::chunked(archive),
     );
-    let xml = format!(
-        "<IPFS3ImportRequest><URL>{}</URL></IPFS3ImportRequest>",
-        harness.source.url("/mismatch.zip?secret=private")
-    );
-    let id = submit(&harness, "mismatch-url", &xml, Some(&expected)).await;
+    let id = native::historical_empty(
+        &harness.state,
+        &harness.bucket,
+        "archive.zip",
+        "mismatch-url",
+        ipfs_s3_gateway::import::ImportSource::Url(
+            harness
+                .source
+                .url("/mismatch.zip?secret=private")
+                .parse()
+                .unwrap(),
+        ),
+        &expected,
+    )
+    .await;
     assert_eq!(wait_for_state(&harness, &id).await, "failed");
+    assert_eq!(
+        import_intake::read_for_path(
+            harness.state.store.db(),
+            &id,
+            "test",
+            &harness.bucket,
+            "archive.zip"
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .measured_sha256,
+        None,
+        "failed unbound input must not claim a verified public digest"
+    );
     let response =
         get_import_status(&harness, &harness.bucket, "archive.zip", &id, None, None).await;
     let text = String::from_utf8(response.into_body()).unwrap();
@@ -284,6 +311,11 @@ async fn changed_first_url_read_is_terminally_failed_with_redacted_measured_mism
         persisted.terminal_result.as_deref(),
         Some("expected_sha256_mismatch")
     );
+    assert!(persisted.input_sha256.is_none());
+    assert!(persisted.input_art_cid.is_none());
+    assert_eq!(persisted.state, "fenced");
+    assert_eq!(harness.kubo_call_count("/api/v0/pin/add").await, 0);
+    native::assert_no_publication_or_charge(&harness.state).await;
     assert_eq!(
         object::Entity::find()
             .count(harness.state.store.db())
@@ -295,12 +327,38 @@ async fn changed_first_url_read_is_terminally_failed_with_redacted_measured_mism
 }
 
 #[tokio::test]
-async fn cid_expected_digest_is_measured_from_the_complete_cat_body() {
+async fn historical_cid_expected_digest_is_measured_from_the_complete_cat_body() {
     let harness = start_import_harness(ImportHarnessConfig::default()).await;
-    harness.set_cat_body(CID, legal_single_entry_zip());
+    let archive = legal_single_entry_zip();
+    let measured = hex::encode(Sha256::digest(&archive));
+    harness.set_cat_body(CID, archive);
     let wrong = hex::encode(Sha256::digest(CID.as_bytes()));
-    let id = submit(&harness, "cid-measured", &cid_xml(), Some(&wrong)).await;
+    assert_ne!(wrong, measured);
+    let id = native::historical_empty(
+        &harness.state,
+        &harness.bucket,
+        "archive.zip",
+        "cid-measured",
+        ipfs_s3_gateway::import::ImportSource::Cid(CID.into()),
+        &wrong,
+    )
+    .await;
     assert_eq!(wait_for_state(&harness, &id).await, "failed");
+    assert_eq!(
+        import_intake::read_for_path(
+            harness.state.store.db(),
+            &id,
+            "test",
+            &harness.bucket,
+            "archive.zip"
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .measured_sha256,
+        None,
+        "failed unbound input must not claim a verified public digest"
+    );
     assert_eq!(
         harness.kubo_call_count("/api/v0/cat").await,
         2,
@@ -313,6 +371,17 @@ async fn cid_expected_digest_is_measured_from_the_complete_cat_body() {
     assert_eq!(
         stored.terminal_result.as_deref(),
         Some("expected_sha256_mismatch")
+    );
+    assert!(stored.input_sha256.is_none());
+    assert!(stored.input_art_cid.is_none());
+    assert_eq!(stored.state, "fenced");
+    assert_eq!(harness.kubo_call_count("/api/v0/add").await, 0);
+    native::assert_no_publication_or_charge(&harness.state).await;
+    assert_eq!(
+        harness.kubo_call_count("/api/v0/pin/add").await,
+        0,
+        "historical mismatch must not pin an unbound input; observed arguments={:?}",
+        harness.kubo_args("/api/v0/pin/add").await
     );
     assert_eq!(
         object::Entity::find()
@@ -328,7 +397,7 @@ async fn cid_expected_digest_is_measured_from_the_complete_cat_body() {
 async fn duplicate_output_keys_reject_the_entire_import_without_a_last_wins_version() {
     let harness = start_import_harness(ImportHarnessConfig::default()).await;
     harness.set_cat_body(CID, duplicate_entry_zip());
-    let id = submit(&harness, "duplicate-output", &cid_xml(), None).await;
+    let id = submit(&harness, "duplicate-output", &cid_xml()).await;
     assert_eq!(wait_for_state(&harness, &id).await, "failed");
     assert_eq!(
         object::Entity::find()
@@ -349,7 +418,7 @@ async fn duplicate_output_keys_reject_the_entire_import_without_a_last_wins_vers
 async fn invalid_zip_is_terminal_with_a_safe_code_and_no_published_objects() {
     let harness = start_import_harness(ImportHarnessConfig::default()).await;
     harness.set_cat_body(CID, b"not a ZIP file".to_vec());
-    let id = submit(&harness, "invalid-zip", &cid_xml(), None).await;
+    let id = submit(&harness, "invalid-zip", &cid_xml()).await;
     assert_eq!(wait_for_state(&harness, &id).await, "failed");
     let stored = execution::read(harness.state.store.db(), &id)
         .await
@@ -380,7 +449,7 @@ async fn one_failed_entry_does_not_publish_it_or_discard_the_successful_entry() 
     })
     .await;
     harness.set_cat_body(CID, legal_two_entry_zip());
-    let id = submit(&harness, "partial-worker", &cid_xml(), None).await;
+    let id = submit(&harness, "partial-worker", &cid_xml()).await;
     assert_eq!(wait_for_state(&harness, &id).await, "ready");
     let execution = ipfs_s3_gateway::store::zip::execution::read(harness.state.store.db(), &id)
         .await
@@ -623,24 +692,47 @@ async fn bound_url_artifact_survives_a_crash_without_repeating_the_get() {
         "<IPFS3ImportRequest><URL>{}</URL></IPFS3ImportRequest>",
         harness.source.url("/crash.zip?secret=do-not-render")
     );
-    let id = submit(&harness, "bound-recovery", &xml, Some(&sha)).await;
+    harness.source.set_reply(
+        "/crash.zip?secret=do-not-render",
+        TestHttpsReply::chunked(archive.clone()),
+    );
+    let id = submit(&harness, "bound-recovery", &xml).await;
     let old = execution::claim(harness.state.store.db(), &id, "crashed-worker", 30)
         .await
         .unwrap()
         .unwrap();
+    let source = import_intake::claimed_source(harness.state.store.db(), &old)
+        .await
+        .unwrap()
+        .unwrap();
+    let verified = ipfs_s3_gateway::import::v2_source::fetch_v2_zip_source(
+        &harness.coordinator,
+        &harness.state,
+        &source.source_descriptor,
+        source.expected_sha256.as_deref(),
+        tokio_util::sync::CancellationToken::new(),
+        &harness.state.pinning.zip_extraction_limits(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(verified.sha256, sha);
+    assert_eq!(verified.size, archive.len() as u64);
+    assert_eq!(harness.captured_add_file_bytes()[0], archive);
+    let first_gets = harness.source.requests().len();
+    assert_eq!(first_gets, 1);
     import_intake::bind_verified_input(
         harness.state.store.db(),
         &old,
-        &sha,
-        CID,
-        archive.len() as i64,
+        &verified.sha256,
+        &verified.cid,
+        verified.size as i64,
     )
     .await
     .unwrap();
     expire_claim(&harness, &id).await;
     assert_eq!(wait_for_state(&harness, &id).await, "ready");
     assert_eq!(
-        harness.source.requests().len(),
+        harness.source.requests().len() - first_gets,
         0,
         "durably bound URL input is never re-fetched"
     );
@@ -664,7 +756,7 @@ async fn admitted_recovery_rotates_exact_guards_without_cat_reextract_or_re_admi
     })
     .await;
     let archive = legal_single_entry_zip();
-    let id = submit(&harness, "admitted-recovery", &cid_xml(), None).await;
+    let id = submit(&harness, "admitted-recovery", &cid_xml()).await;
     let db = harness.state.store.db();
     let old = admit_one_output(&harness, &id, &archive).await;
     expire_claim(&harness, &id).await;
@@ -779,7 +871,7 @@ async fn source_key_existing_object_remains_the_same_version_after_outputs_only_
         .await
         .unwrap()
         .unwrap();
-    let id = submit(&harness, "existing-source", &cid_xml(), None).await;
+    let id = submit(&harness, "existing-source", &cid_xml()).await;
     assert_eq!(wait_for_state(&harness, &id).await, "ready");
     let after = object::Entity::find()
         .filter(object::Column::Key.eq("archive.zip"))
@@ -806,7 +898,7 @@ async fn lost_admitted_guard_fences_recovery_instead_of_readmitting_an_output() 
         ..ImportHarnessConfig::default()
     })
     .await;
-    let id = submit(&harness, "lost-output-guard", &cid_xml(), None).await;
+    let id = submit(&harness, "lost-output-guard", &cid_xml()).await;
     let old = admit_one_output(&harness, &id, &legal_single_entry_zip()).await;
     let db = harness.state.store.db();
     // Model an independent successor that won the exact destination. The
@@ -843,8 +935,7 @@ async fn transient_source_failure_uses_a_bounded_database_clock_retry_budget() {
         "<IPFS3ImportRequest><URL>{}</URL></IPFS3ImportRequest>",
         harness.source.url("/unavailable.zip")
     );
-    let expected = "a".repeat(64);
-    let id = submit(&harness, "retry-budget", &xml, Some(&expected)).await;
+    let id = submit(&harness, "retry-budget", &xml).await;
     assert_eq!(wait_for_state(&harness, &id).await, "failed");
     assert_eq!(harness.source.requests().len(), 2);
     assert_eq!(
@@ -872,7 +963,7 @@ async fn local_only_targets_ignore_unrelated_output_rule_revision_changes() {
     })
     .await;
     harness.set_cat_body(CID, legal_single_entry_zip());
-    let id = submit(&harness, "local-only-rules", &cid_xml(), None).await;
+    let id = submit(&harness, "local-only-rules", &cid_xml()).await;
     let before = execution::read(harness.state.store.db(), &id)
         .await
         .unwrap()
@@ -911,8 +1002,7 @@ async fn shutdown_cancels_blocked_url_io_and_joins_without_publishing() {
         "<IPFS3ImportRequest><URL>{}</URL></IPFS3ImportRequest>",
         harness.source.url("/shutdown.zip")
     );
-    let digest = hex::encode(Sha256::digest(legal_single_entry_zip()));
-    let id = submit(&harness, "shutdown-v2", &xml, Some(&digest)).await;
+    let id = submit(&harness, "shutdown-v2", &xml).await;
     source.wait_until_blocked().await;
     let replacement = harness.start_additional_worker();
     let old = std::mem::replace(&mut harness.worker, replacement);
@@ -952,7 +1042,7 @@ async fn blocked_v2_url_allows_legacy_progress_with_two_shared_slots() {
         harness.source.url("/slow-v2.zip")
     );
     let digest = hex::encode(Sha256::digest(legal_single_entry_zip()));
-    let v2_id = submit(&harness, "v2-blocks-one-slot", &xml, Some(&digest)).await;
+    let v2_id = submit(&harness, "v2-blocks-one-slot", &xml).await;
     blocker.wait_until_blocked().await;
     harness.set_cat_body(CID, b"legacy unzipped content".to_vec());
     let mut legacy_headers = HeaderMap::new();
@@ -999,6 +1089,11 @@ async fn blocked_v2_url_allows_legacy_progress_with_two_shared_slots() {
     harness.set_cat_body(CID, legal_single_entry_zip());
     blocker.release();
     assert_eq!(wait_for_state(&harness, &v2_id).await, "ready");
+    let measured = execution::read(harness.state.store.db(), &v2_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(measured.input_sha256.as_deref(), Some(digest.as_str()));
     harness.shutdown().await;
 }
 
@@ -1041,6 +1136,7 @@ async fn extracted_target_policy_is_evaluated_per_output_without_source_manual_i
         database_url = "sqlite::memory:"
         [decompress_zip]
         unixfs_directory_root = false
+        auto_pin_outputs = true
         [[pinning.providers]]
         name = "alpha"
         kind = "noop"
@@ -1106,6 +1202,31 @@ async fn extracted_target_policy_is_evaluated_per_output_without_source_manual_i
         "x-amz-tagging",
         HeaderValue::from_static("ipfs-s3%3Azip-root=false&ipfs-s3%3Apin=true"),
     );
+    let rejected = send_sigv4(
+        reqwest::Method::POST,
+        &server.endpoint,
+        "test-bkt",
+        "archive.zip",
+        &[("ipfs3-import", ""), ("decompress-zip", "out/")],
+        cid_xml().into_bytes(),
+        controls.clone(),
+        "test",
+    )
+    .await;
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(native::execution_count(&state).await, 0);
+    assert!(
+        import_intake::pending_ids(state.store.db(), "", 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    native::assert_no_publication_or_charge(&state).await;
+    assert!(kubo.server.received_requests().await.unwrap().is_empty());
+    controls.insert(
+        "x-amz-tagging",
+        HeaderValue::from_static("ipfs-s3%3Azip-root=false"),
+    );
     let accepted = send_sigv4(
         reqwest::Method::POST,
         &server.endpoint,
@@ -1170,6 +1291,32 @@ async fn extracted_target_policy_is_evaluated_per_output_without_source_manual_i
     assert_eq!(leases.len(), 1);
     assert_eq!(leases[0].owner_object_id, first.id);
     assert_eq!(leases[0].policy_id, normalized.policies[0].identity);
+    let second = object::Entity::find()
+        .filter(object::Column::Key.eq("out/second.txt"))
+        .one(state.store.db())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        leases
+            .iter()
+            .all(|lease| lease.owner_object_id != second.id)
+    );
+    assert_eq!(
+        object::Entity::find()
+            .filter(object::Column::Key.eq("archive.zip"))
+            .count(state.store.db())
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        object_version::Entity::find()
+            .count(state.store.db())
+            .await
+            .unwrap(),
+        2
+    );
     assert_eq!(
         object::Entity::find()
             .count(state.store.db())

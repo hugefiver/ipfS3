@@ -21,6 +21,16 @@ async fn setup() -> (
     sea_orm::DatabaseConnection,
     sea_orm::DatabaseConnection,
 ) {
+    setup_with_capture("{\"root_enabled\":true,\"target_prefix\":\"out/\"}").await
+}
+
+async fn setup_with_capture(
+    captured_options: &str,
+) -> (
+    tempfile::TempDir,
+    sea_orm::DatabaseConnection,
+    sea_orm::DatabaseConnection,
+) {
     let directory = tempfile::tempdir().unwrap();
     let url = format!(
         "sqlite://{}?mode=rwc",
@@ -46,7 +56,7 @@ async fn setup() -> (
             bucket: "bucket".into(),
             archive_key: "archive.zip".into(),
             input_identity: "input".into(),
-            captured_options: "{\"root_enabled\":true,\"target_prefix\":\"out/\"}".into(),
+            captured_options: captured_options.into(),
         },
     )
     .await
@@ -545,9 +555,12 @@ async fn import_capture_is_restored_without_consulting_current_configuration() {
 
 #[tokio::test]
 async fn v2_capture_recovers_bound_manifest_without_reconstructing_prefix() {
-    let (_dir, a, b) = setup().await;
-    a.execute_unprepared("UPDATE zip_batches SET captured_options='{\"options\":{\"root_enabled\":true,\"publish_extracted\":true,\"publish_source\":false}}' WHERE id='batch'")
-        .await.unwrap();
+    let captured = serde_json::json!({"options": {
+        "publish_source":false, "publish_extracted":true, "targets":"extracted",
+        "token":"token", "root_override":null, "root_enabled":true, "result_version":2,
+    }, "target_prefix":"out/", "rule_revision":"original-root-revision"})
+    .to_string();
+    let (_dir, a, b) = setup_with_capture(&captured).await;
     let kubo = MockServer::start().await;
     mock_directory(&kubo).await;
     assert_eq!(
@@ -565,6 +578,14 @@ async fn v2_capture_recovers_bound_manifest_without_reconstructing_prefix() {
             .as_deref(),
         Some(ROOT)
     );
+    let after = zip::snapshot(&a, "batch").await.unwrap().unwrap();
+    assert_eq!(after.batch.captured_options, captured);
+    assert!(!after.batch.source_published);
+    assert_eq!(
+        after.entries[0].version_row_id.as_deref(),
+        Some("old-version")
+    );
+    assert_eq!(after.entries[0].cid.as_deref(), Some(LEAF));
 }
 
 #[tokio::test]

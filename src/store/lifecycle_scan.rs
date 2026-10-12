@@ -566,6 +566,7 @@ mod tests {
             metadata: Set(None),
             tags_json: Set(serde_json::json!([])),
             pin_decision_json: Set(None),
+            zip_intent_json: Set(None),
             decompress_zip_target: Set(None),
             decompress_zip_result: Set(false),
         })

@@ -81,6 +81,31 @@ pub(crate) async fn insert_queued_with_decision<C: ConnectionTrait>(
     root_capture: Option<ZipRootCapture>,
     now: DateTime<Utc>,
 ) -> AppResult<import_job::Model> {
+    insert_queued_with_zip_intent(txn, request, decision, root_capture, None, now).await
+}
+
+pub(crate) async fn insert_queued_with_zip_intent<C: ConnectionTrait>(
+    txn: &C,
+    request: NewImportJob,
+    decision: Option<&ExtensionDecision>,
+    root_capture: Option<ZipRootCapture>,
+    zip_intent: Option<&crate::pinning::zip_policy::CapturedZipIntent>,
+    now: DateTime<Utc>,
+) -> AppResult<import_job::Model> {
+    let zip_intent_json = zip_intent
+        .map(|capture| {
+            if capture.bucket() != request.bucket
+                || capture.source_key() != request.key
+                || Some(capture.target_prefix()) != request.decompress_prefix.as_deref()
+                || capture.origin().request_id != request.id
+                || decision != Some(capture.source_decision())
+                || root_capture != Some(capture.controls().root)
+            {
+                return Err(AppError::InvalidImportRequest);
+            }
+            crate::store::pinning::publication::serialize_zip_capture(capture)
+        })
+        .transpose()?;
     if root_capture.is_some() && request.decompress_prefix.is_none() {
         return Err(AppError::InvalidImportRequest);
     }
@@ -114,6 +139,7 @@ pub(crate) async fn insert_queued_with_decision<C: ConnectionTrait>(
         metadata_json: Set(metadata_json),
         tags_json: Set(tags_json),
         pin_decision_json: Set(pin_decision_json),
+        zip_intent_json: Set(zip_intent_json),
         decompress_prefix: Set(request.decompress_prefix),
         root_capture_json: Set(root_capture.map(|capture| {
             serde_json::to_string(&capture).expect("ZIP root capture is serializable")

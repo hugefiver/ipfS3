@@ -386,8 +386,7 @@ fn parse_publication_tags(headers: &http::HeaderMap) -> S3Result<Vec<ObjectTag>>
     let value = header
         .to_str()
         .map_err(|_| invalid_pinning_argument("invalid x-amz-tagging header"))?;
-    crate::pinning::tags::parse_tagging_header(value)
-        .map_err(|_| invalid_pinning_argument("invalid x-amz-tagging header"))
+    crate::zip::options::parse_authenticated_zip_tagging(value, false)
 }
 
 fn evaluate_publication_policy(
@@ -864,8 +863,15 @@ pub async fn put_object(
     let key = &req.input.key;
     let content_type = req.input.content_type.clone();
     let db = state.store.db();
-    let tags = parse_publication_tags(&req.headers)?;
     let principal = principal_id(&req)?;
+    let tags = parse_publication_tags(&req.headers)?;
+    crate::zip::options::parse_authenticated_zip_controls(
+        &req.headers,
+        &crate::s3::query::decoded_query_pairs(&req.uri)?,
+        &tags,
+        false,
+        state.pinning.zip_root_default(),
+    )?;
 
     // Validate the bucket exists.
     let exists = crate::store::bucket::exists(db, bucket).await?;

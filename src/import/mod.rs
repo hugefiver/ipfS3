@@ -14,9 +14,12 @@ mod progress;
 mod publication;
 pub mod response;
 mod source;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod v2_source;
 mod v2_worker;
 pub mod worker;
+mod zip_capture;
 
 pub use model::*;
 

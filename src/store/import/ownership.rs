@@ -19,9 +19,7 @@ use crate::{
             standard_mutation_lease, zip_batch,
         },
         import::{
-            jobs::{
-                NewImportJob, SubmitImportOutcome, find_idempotent, insert_queued_with_decision,
-            },
+            jobs::{NewImportJob, SubmitImportOutcome, find_idempotent},
             lease_clock,
         },
     },
@@ -188,7 +186,7 @@ pub async fn submit(
     request: NewImportJob,
     now: DateTime<Utc>,
 ) -> AppResult<SubmitImportOutcome> {
-    submit_with_decision(db, request, None, None, now).await
+    submit_with_decision(db, request, None, None, None, now).await
 }
 
 /// The decision is written in the same ownership transaction as the fingerprint,
@@ -199,7 +197,7 @@ pub async fn submit_decided(
     decision: ExtensionDecision,
     now: DateTime<Utc>,
 ) -> AppResult<SubmitImportOutcome> {
-    submit_with_decision(db, request, Some(decision), None, now).await
+    submit_with_decision(db, request, Some(decision), None, None, now).await
 }
 
 /// Persist the signed ZIP-root choice alongside the job, ownership and pin decision.
@@ -210,7 +208,25 @@ pub async fn submit_decided_zip(
     root_capture: ZipRootCapture,
     now: DateTime<Utc>,
 ) -> AppResult<SubmitImportOutcome> {
-    submit_with_decision(db, request, Some(decision), Some(root_capture), now).await
+    submit_with_decision(db, request, Some(decision), Some(root_capture), None, now).await
+}
+
+/// R25 intake persists the original intent with the job and ownership, before I/O.
+pub async fn submit_captured_zip(
+    db: &DatabaseConnection,
+    request: NewImportJob,
+    capture: crate::pinning::zip_policy::CapturedZipIntent,
+    now: DateTime<Utc>,
+) -> AppResult<SubmitImportOutcome> {
+    submit_with_decision(
+        db,
+        request,
+        Some(capture.source_decision().clone()),
+        Some(capture.controls().root),
+        Some(capture),
+        now,
+    )
+    .await
 }
 
 async fn submit_with_decision(
@@ -218,12 +234,14 @@ async fn submit_with_decision(
     request: NewImportJob,
     decision: Option<ExtensionDecision>,
     root_capture: Option<ZipRootCapture>,
+    zip_intent: Option<crate::pinning::zip_policy::CapturedZipIntent>,
     now: DateTime<Utc>,
 ) -> AppResult<SubmitImportOutcome> {
     let bucket_name = request.bucket.clone();
     for retry in 0..=MAX_OWNERSHIP_TRANSACTION_RETRIES {
         let request = request.clone();
         let decision = decision.clone();
+        let zip_intent = zip_intent.clone();
         let bucket_name = bucket_name.clone();
         let outcome = db
             .transaction(move |txn| {
@@ -234,6 +252,7 @@ async fn submit_with_decision(
                         request,
                         decision.as_ref(),
                         root_capture,
+                        zip_intent.as_ref(),
                         now,
                     )
                     .await
@@ -260,7 +279,7 @@ async fn submit_in_transaction<C: ConnectionTrait>(
     request: NewImportJob,
     now: DateTime<Utc>,
 ) -> AppResult<SubmitImportOutcome> {
-    submit_decided_in_transaction(txn, request, None, None, now).await
+    submit_decided_in_transaction(txn, request, None, None, None, now).await
 }
 
 async fn submit_decided_in_transaction<C: ConnectionTrait>(
@@ -268,6 +287,7 @@ async fn submit_decided_in_transaction<C: ConnectionTrait>(
     request: NewImportJob,
     decision: Option<&ExtensionDecision>,
     root_capture: Option<ZipRootCapture>,
+    zip_intent: Option<&crate::pinning::zip_policy::CapturedZipIntent>,
     now: DateTime<Utc>,
 ) -> AppResult<SubmitImportOutcome> {
     if let Some(token) = request.client_token.as_deref()
@@ -280,7 +300,15 @@ async fn submit_decided_in_transaction<C: ConnectionTrait>(
         };
     }
 
-    let job = insert_queued_with_decision(txn, request, decision, root_capture, now).await?;
+    let job = super::jobs::insert_queued_with_zip_intent(
+        txn,
+        request,
+        decision,
+        root_capture,
+        zip_intent,
+        now,
+    )
+    .await?;
     let expected_generation =
         claim_primary_destination(txn, &job.id, &job.bucket, &job.key, now).await?;
     insert_target(
@@ -1229,6 +1257,84 @@ fn zip_v2_source_guard_from_row(
     })
 }
 
+async fn zip_v2_mpu_publish_source<C: ConnectionTrait>(
+    txn: &C,
+    row: &crate::store::zip::execution::Snapshot,
+) -> AppResult<bool> {
+    use crate::store::multipart;
+    let mut record = multipart::v2_zip::read_by_upload(txn, &row.id)
+        .await?
+        .ok_or(AppError::StaleContentMutation)?;
+    if record.execution_id != row.id
+        || record.active_upload_id.as_deref() != Some(record.original_upload_id.as_str())
+        || record.owner != row.owner
+        || record.token != row.token
+        || record.bucket != row.bucket
+        || record.archive_key != row.source_key
+        || record.request_fingerprint != row.request_fingerprint
+        || record.captured_options != row.captured_options
+    {
+        return Err(AppError::StaleContentMutation);
+    }
+    let upload = multipart::get_upload(txn, &record.original_upload_id).await?;
+    let original_json = upload
+        .zip_intent_json
+        .as_deref()
+        .ok_or(AppError::StaleContentMutation)?;
+    let original = crate::pinning::zip_policy::CapturedZipIntent::decode_json(original_json)
+        .map_err(|_| AppError::StaleContentMutation)?;
+    let decision: ExtensionDecision = serde_json::from_value(
+        upload
+            .pin_decision_json
+            .ok_or(AppError::StaleContentMutation)?,
+    )
+    .map_err(|_| AppError::StaleContentMutation)?;
+    if upload.bucket != record.bucket
+        || upload.key != record.archive_key
+        || upload.decompress_zip_target.as_deref() != Some(record.target_prefix.as_str())
+        || &decision != original.source_decision()
+    {
+        return Err(AppError::StaleContentMutation);
+    }
+    let mut bare: serde_json::Value = serde_json::from_str(&record.captured_options)
+        .map_err(|_| AppError::StaleContentMutation)?;
+    if bare.get("options").is_none()
+        && ["schema_version", "target_prefix", "rule_revision"]
+            .iter()
+            .any(|field| bare.get(field).is_some())
+    {
+        return Err(AppError::StaleContentMutation);
+    }
+    let options = record
+        .options()
+        .map_err(|_| AppError::StaleContentMutation)?;
+    if record
+        .zip_intent()
+        .map_err(|_| AppError::StaleContentMutation)?
+        .is_none()
+    {
+        // Bare historical options need the existing first-intake upload capture.
+        // Reuse the strict Record verifier without changing either durable row;
+        // envelope markers cannot be reinterpreted as the old bare format.
+        bare.as_object_mut()
+            .ok_or(AppError::StaleContentMutation)?
+            .insert(
+                "zip_intent".into(),
+                serde_json::from_str(original_json).map_err(|_| AppError::StaleContentMutation)?,
+            );
+        record.captured_options = bare.to_string();
+    }
+    if record
+        .zip_intent()
+        .map_err(|_| AppError::StaleContentMutation)?
+        .as_ref()
+        != Some(&original)
+    {
+        return Err(AppError::StaleContentMutation);
+    }
+    Ok(options.publish_source)
+}
+
 /// Single bucket-first lease renewal verifies and extends both source and all
 /// output guards, then the worker lease. A lost guard fences the whole execution.
 pub async fn renew_zip_v2_direct_group(
@@ -1262,18 +1368,16 @@ pub async fn renew_zip_v2_direct_group(
     {
         return Ok(false);
     }
-    let options: serde_json::Value =
-        serde_json::from_str(&row.captured_options).map_err(|_| AppError::StaleContentMutation)?;
-    let source_enabled = options
-        .pointer(if row.source == "mpu" {
-            "/publish_source"
-        } else {
-            "/options/publish_source"
-        })
-        .and_then(|v| v.as_bool())
-        .ok_or(AppError::StaleContentMutation)?;
     let guards = execution::read_targets(&txn, claim).await;
     let result = async {
+        let source_enabled = if row.source == "mpu" {
+            zip_v2_mpu_publish_source(&txn, &row).await?
+        } else {
+            let options: serde_json::Value = serde_json::from_str(&row.captured_options)
+                .map_err(|_| AppError::StaleContentMutation)?;
+            options.pointer("/options/publish_source").and_then(|v| v.as_bool())
+                .ok_or(AppError::StaleContentMutation)?
+        };
         let guards = guards?;
         let keys = guards.iter().map(|g| g.key.clone()).collect::<Vec<_>>();
         if source_enabled {
@@ -1991,7 +2095,7 @@ async fn release_job_ownership_with_invalidation<C: ConnectionTrait>(
     Ok(())
 }
 
-async fn verify_active_claim<C: ConnectionTrait>(
+pub(crate) async fn verify_active_claim<C: ConnectionTrait>(
     txn: &C,
     claim: &ImportClaim,
     bucket_name: &str,

@@ -345,6 +345,7 @@ async fn cid_pin_inspect_and_complete_cat_are_required_before_return() {
         .respond_with(
             ResponseTemplate::new(200).set_body_string(format!("{{\"Pins\":[\"{CID}\"]}}\n")),
         )
+        .expect(1)
         .mount(&kubo)
         .await;
     Mock::given(method("POST"))
@@ -368,6 +369,20 @@ async fn cid_pin_inspect_and_complete_cat_are_required_before_return() {
         (CID, 8, digest(b"full zip").as_str())
     );
     kubo.verify().await;
+    let requests = kubo.received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.url.path())
+            .collect::<Vec<_>>(),
+        ["/api/v0/cat", "/api/v0/cat", "/api/v0/pin/add"]
+    );
+    assert!(requests.iter().all(|request| {
+        request
+            .url
+            .query_pairs()
+            .any(|(name, value)| name == "arg" && value == CID)
+    }));
 }
 
 #[tokio::test]
@@ -497,13 +512,15 @@ async fn cid_partial_second_cat_is_not_a_verified_source() {
         .respond_with(
             ResponseTemplate::new(200).set_body_string(format!("{{\"Pins\":[\"{CID}\"]}}\n")),
         )
+        .expect(0)
         .mount(&kubo)
         .await;
     let calls = Arc::new(AtomicUsize::new(0));
+    let recorded = calls.clone();
     Mock::given(method("POST"))
         .and(path("/api/v0/cat"))
         .respond_with(move |_: &wiremock::Request| {
-            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            if recorded.fetch_add(1, Ordering::SeqCst) == 0 {
                 ResponseTemplate::new(200).set_body_bytes(b"full zip")
             } else {
                 ResponseTemplate::new(200).set_body_bytes(b"part")
@@ -521,6 +538,15 @@ async fn cid_partial_second_cat_is_not_a_verified_source() {
     )
     .await;
     assert_eq!(result.unwrap_err(), V2SourceError::SourceIncomplete);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(
+        kubo.received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| request.url.path() == "/api/v0/cat")
+    );
+    kubo.verify().await;
 }
 
 #[tokio::test]
@@ -534,9 +560,15 @@ async fn cid_late_stream_error_trailer_is_not_a_verified_source() {
         Duration::from_secs(1),
         Duration::from_millis(200),
     );
+    let finished = CancellationToken::new();
+    let stop = finished.clone();
     let server = tokio::spawn(async move {
+        let mut requests = Vec::new();
         for index in 0..3 {
-            let (mut socket, _) = listener.accept().await.unwrap();
+            let (mut socket, _) = tokio::select! {
+                _ = stop.cancelled() => break,
+                accepted = listener.accept() => accepted.unwrap(),
+            };
             let mut headers = Vec::new();
             loop {
                 let mut byte = [0];
@@ -546,16 +578,18 @@ async fn cid_late_stream_error_trailer_is_not_a_verified_source() {
                     break;
                 }
             }
+            requests.push(String::from_utf8(headers).unwrap());
             let response = match index {
-                0 => {
+                0 => "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nfull zip".to_owned(),
+                1 => "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: X-Stream-Error\r\nConnection: close\r\n\r\n8\r\nfull zip\r\n0\r\nX-Stream-Error: private backend failure\r\n\r\n".to_owned(),
+                _ => {
                     let body = format!("{{\"Pins\":[\"{CID}\"]}}\n");
                     format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
                 }
-                1 => "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nfull zip".to_owned(),
-                _ => "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: X-Stream-Error\r\nConnection: close\r\n\r\n8\r\nfull zip\r\n0\r\nX-Stream-Error: private backend failure\r\n\r\n".to_owned(),
             };
             socket.write_all(response.as_bytes()).await.unwrap();
         }
+        requests
     });
     let error = fetch_v2_zip_source(
         &coordinator,
@@ -569,5 +603,166 @@ async fn cid_late_stream_error_trailer_is_not_a_verified_source() {
     .unwrap_err();
     assert_eq!(error, V2SourceError::KuboTransport);
     assert!(!format!("{error:?}").contains("private backend failure"));
-    server.await.unwrap();
+    finished.cancel();
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.starts_with("POST /api/v0/cat?"))
+    );
+}
+
+#[tokio::test]
+async fn cid_promise_budget_and_pre_pin_cancellation_fail_without_pin_or_verification() {
+    for (name, max, inspected, full, cancel_full, expected, failure) in [
+        (
+            "promise",
+            1024,
+            &b"full zip"[..],
+            &b"full zip"[..],
+            false,
+            Some(digest(b"promised archive")),
+            V2SourceError::Sha256Mismatch {
+                measured_sha256: digest(b"full zip"),
+            },
+        ),
+        (
+            "inspect budget",
+            3,
+            &b"full zip"[..],
+            &b"full zip"[..],
+            false,
+            None,
+            V2SourceError::SourceTooLarge,
+        ),
+        (
+            "measured budget",
+            4,
+            &b"tiny"[..],
+            &b"full zip"[..],
+            false,
+            None,
+            V2SourceError::SourceTooLarge,
+        ),
+        (
+            "cancel complete read",
+            1024,
+            &b"full zip"[..],
+            &b"full zip"[..],
+            true,
+            None,
+            V2SourceError::Canceled,
+        ),
+    ] {
+        let source = MockServer::start().await;
+        let kubo = MockServer::start().await;
+        let (coordinator, state) = setup(&source, &kubo, max).await;
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        Mock::given(method("POST"))
+            .and(path("/api/v0/cat"))
+            .respond_with(move |_: &wiremock::Request| {
+                let first = observed.fetch_add(1, Ordering::SeqCst) == 0;
+                if !first && cancel_full {
+                    trigger.cancel();
+                }
+                ResponseTemplate::new(200).set_body_bytes(if first { inspected } else { full })
+            })
+            .mount(&kubo)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/pin/add"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(format!("{{\"Pins\":[\"{CID}\"]}}\n")),
+            )
+            .expect(0)
+            .mount(&kubo)
+            .await;
+        let error = fetch_v2_zip_source(
+            &coordinator,
+            &state,
+            &descriptor("cid", CID),
+            expected.as_deref(),
+            cancel,
+            &ZipExtractionLimits::default(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, failure, "{name}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            if inspected.len() as u64 > max { 1 } else { 2 },
+            "{name}"
+        );
+        assert!(
+            kubo.received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.url.path() == "/api/v0/cat"),
+            "{name}"
+        );
+        kubo.verify().await;
+    }
+}
+
+#[tokio::test]
+async fn cid_verified_bytes_still_require_successful_uncanceled_pin_before_return() {
+    for cancel_pin in [false, true] {
+        let source = MockServer::start().await;
+        let kubo = MockServer::start().await;
+        let (coordinator, state) = setup(&source, &kubo, 1024).await;
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        Mock::given(method("POST"))
+            .and(path("/api/v0/cat"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"full zip"))
+            .expect(2)
+            .mount(&kubo)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/pin/add"))
+            .respond_with(move |_: &wiremock::Request| {
+                if cancel_pin {
+                    trigger.cancel();
+                    ResponseTemplate::new(200)
+                        .set_body_string(format!("{{\"Pins\":[\"{CID}\"]}}\n"))
+                } else {
+                    ResponseTemplate::new(500)
+                }
+            })
+            .expect(1)
+            .mount(&kubo)
+            .await;
+        let error = fetch_v2_zip_source(
+            &coordinator,
+            &state,
+            &descriptor("cid", CID),
+            None,
+            cancel,
+            &ZipExtractionLimits::default(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error,
+            if cancel_pin {
+                V2SourceError::Canceled
+            } else {
+                V2SourceError::KuboTransport
+            }
+        );
+        let requests = kubo.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.url.path())
+                .collect::<Vec<_>>(),
+            ["/api/v0/cat", "/api/v0/cat", "/api/v0/pin/add"]
+        );
+        kubo.verify().await;
+    }
 }

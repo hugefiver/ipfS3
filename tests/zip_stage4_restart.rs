@@ -419,7 +419,7 @@ async fn require_ok(response: reqwest::Response) -> (HeaderMap, String) {
     (headers, body)
 }
 
-async fn submit(endpoint: &str, xml: &str, sha: &str) -> String {
+async fn submit(endpoint: &str, xml: &str) -> String {
     let mut headers = HeaderMap::new();
     for (name, value) in [
         ("content-type", "application/xml"),
@@ -429,7 +429,6 @@ async fn submit(endpoint: &str, xml: &str, sha: &str) -> String {
         ("x-ipfs3-zip-publish-extracted", "true"),
         ("x-ipfs3-zip-targets", "none"),
         ("x-ipfs3-zip-token", TOKEN),
-        ("x-ipfs3-zip-expected-sha256", sha),
         ("x-amz-tagging", "ipfs-s3%3Azip-root=false"),
     ] {
         headers.insert(name, HeaderValue::from_str(value).unwrap());
@@ -647,7 +646,7 @@ poll_interval_ms = 25
         "<IPFS3ImportRequest><URL>{}{SOURCE_PATH}</URL></IPFS3ImportRequest>",
         source.origin()
     );
-    let id = submit(&a.endpoint, &xml, &sha).await;
+    let id = submit(&a.endpoint, &xml).await;
     source.wait_for_get().await;
     let pending = execution::read(&db_a, &id).await.unwrap().unwrap();
     assert_eq!(
@@ -726,7 +725,10 @@ poll_interval_ms = 25
     })
     .await
     .expect("gateway B finished the recovered import");
-    assert!(ready_xml.contains(&format!("<ExpectedSHA256>{sha}</ExpectedSHA256>")));
+    assert!(
+        !ready_xml.contains("<ExpectedSHA256>"),
+        "new intake has no client digest promise"
+    );
     assert!(ready_xml.contains(&format!("<MeasuredSHA256>{sha}</MeasuredSHA256>")));
     assert!(ready_xml.contains("<Phase>source-free</Phase>"));
     assert!(!ready_xml.contains("never-render"));
@@ -875,7 +877,7 @@ poll_interval_ms = 25
     let before_rows = rows(&db).await;
     assert_eq!(before_rows, [3, 3, 0, 0, 0, 0]);
     let before_kubo = kubo.received_requests().await.unwrap().len();
-    assert_eq!(submit(&b.endpoint, &xml, &sha).await, id);
+    assert_eq!(submit(&b.endpoint, &xml).await, id);
     assert_eq!(status(&b.endpoint, &id).await, ready_xml);
     tokio::time::sleep(Duration::from_millis(200)).await; // several worker polls
     assert_eq!(

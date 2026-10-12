@@ -75,3 +75,122 @@ async fn unknown_columns_are_not_an_empty_inventory() {
         .unwrap();
     assert!(super::read(&db, &schema).await.is_err());
 }
+
+async fn native_catalog(last: &str) -> sea_orm::DatabaseConnection {
+    let db = store::connect_database("sqlite::memory:").await.unwrap();
+    let registry = store::migrator::Migrator::migrations();
+    let count = registry.iter().position(|m| m.name() == last).unwrap() + 1;
+    store::migrator::Migrator::up(&db, Some(count as u32))
+        .await
+        .unwrap();
+    let actual: Vec<String> = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Sqlite,
+            "SELECT version FROM seaql_migrations ORDER BY version",
+        ))
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.try_get("", "version").unwrap())
+        .collect();
+    assert_eq!(
+        actual,
+        registry[..count]
+            .iter()
+            .map(|m| m.name().to_owned())
+            .collect::<Vec<_>>()
+    );
+    db
+}
+
+#[tokio::test]
+async fn known_stage6_catalog_remains_read_only() {
+    let db = native_catalog("m20261004_000002_cluster_replica_contract").await;
+    let versions = super::schema(&db, false).await.unwrap();
+    let images = super::read(&db, &versions).await.unwrap();
+    assert!(
+        !images
+            .iter()
+            .find(|t| t.table == "pin_lease_requirements")
+            .unwrap()
+            .columns
+            .is_empty()
+    );
+    assert!(super::schema(&db, true).await.is_err());
+}
+
+#[tokio::test]
+async fn known_r26_catalog_without_zip_capture_remains_exact() {
+    let db = native_catalog(migration::SCHEMA).await;
+    let versions = super::schema(&db, true).await.unwrap();
+    let images = super::read(&db, &versions).await.unwrap();
+    for (table, column) in [
+        ("multipart_uploads", "zip_intent_json"),
+        ("import_jobs", "zip_intent_json"),
+        ("zip_batches", "legacy_input_proof_json"),
+    ] {
+        assert!(
+            !images
+                .iter()
+                .find(|t| t.table == table)
+                .unwrap()
+                .columns
+                .iter()
+                .any(|c| c == column)
+        );
+    }
+}
+
+#[tokio::test]
+async fn current_catalog_includes_registered_zip_capture_columns() {
+    let db = native_catalog("m20261008_000001_zip_intent_capture").await;
+    let versions = super::schema(&db, true).await.unwrap();
+    let images = super::read(&db, &versions).await.unwrap();
+    for (table, column) in [
+        ("multipart_uploads", "zip_intent_json"),
+        ("import_jobs", "zip_intent_json"),
+        ("zip_batches", "legacy_input_proof_json"),
+    ] {
+        assert!(
+            images
+                .iter()
+                .find(|t| t.table == table)
+                .unwrap()
+                .columns
+                .iter()
+                .any(|c| c == column)
+        );
+    }
+}
+
+#[tokio::test]
+async fn registered_prefix_does_not_authorize_hybrid_or_partial_catalog() {
+    let stage5 = native_catalog("m20261004_000001_rpc_submission_ledger").await;
+    crate::store::migrations::m20261004_000002_cluster_replica_contract::Migration
+        .up(&sea_orm_migration::SchemaManager::new(&stage5))
+        .await
+        .unwrap();
+    let versions = super::schema(&stage5, false).await.unwrap();
+    assert!(super::read(&stage5, &versions).await.is_err());
+
+    let r26 = native_catalog(migration::SCHEMA).await;
+    r26.execute_unprepared("ALTER TABLE multipart_uploads ADD COLUMN zip_intent_json TEXT")
+        .await
+        .unwrap();
+    let versions = super::schema(&r26, false).await.unwrap();
+    assert!(super::read(&r26, &versions).await.is_err());
+
+    let current = native_catalog("m20261008_000001_zip_intent_capture").await;
+    current
+        .execute_unprepared("ALTER TABLE import_jobs DROP COLUMN zip_intent_json")
+        .await
+        .unwrap();
+    let versions = super::schema(&current, false).await.unwrap();
+    assert!(super::read(&current, &versions).await.is_err());
+}
+
+#[path = "snapshot_capture_tests.rs"]
+mod capture_tests;
+
+#[path = "zip_capture_binding_tests.rs"]
+mod zip_bindings;

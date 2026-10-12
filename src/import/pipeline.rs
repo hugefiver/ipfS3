@@ -7,7 +7,6 @@ use crate::{
     error::AppError,
     import::{
         ImportClaim, ImportExecutionError, ImportFailureCode, ImportPhase, ValidatedImportConfig,
-        decompress::decompress_import_with_context,
         downloader::SourceDownloader,
         execution_error::{ensure_active, map_publication_error, terminal_failure},
         progress::ProgressReporter,
@@ -16,8 +15,9 @@ use crate::{
         worker::{ImportWorkerHandle, start_worker},
     },
     state::AppState,
-    store::{entities::import_job, import::ownership},
+    store::entities::import_job,
 };
+pub(crate) mod zip;
 
 /// Owns immutable import configuration and the hardened HTTPS downloader.
 pub struct ImportCoordinator {
@@ -183,6 +183,18 @@ async fn execute_job_inner(
     reporter: &ProgressReporter,
 ) -> Result<ImportArtifact, ImportExecutionError> {
     ensure_active(cancellation)?;
+    if job.decompress_prefix.is_some() {
+        return zip::execute_zip_job(
+            coordinator,
+            state,
+            job,
+            claim,
+            cancellation,
+            network_cancel,
+            reporter,
+        )
+        .await;
+    }
     // Fail closed before even contacting a source when a historical raw pin tag
     // has no admission snapshot or an accepted snapshot cannot be safely replayed.
     let (_, decision) = resolved_policy(state, job, cancellation)?;
@@ -193,17 +205,6 @@ async fn execute_job_inner(
         )
         .await
         .map_err(|error| map_publication_error(error, cancellation))?;
-    }
-    if job.decompress_prefix.is_some() {
-        ownership::reset_extracted_targets_for_attempt(
-            state.store.db(),
-            claim,
-            &job.bucket,
-            chrono::Utc::now(),
-        )
-        .await
-        .map_err(|error| map_publication_error(error, cancellation))?;
-        ensure_active(cancellation)?;
     }
     let mut artifact = match job.source_type.as_str() {
         "cid" => {
@@ -237,21 +238,6 @@ async fn execute_job_inner(
     };
     if job.object_content_type.is_some() {
         artifact.object_content_type = job.object_content_type.clone();
-    }
-
-    if job.decompress_prefix.is_some() {
-        decompress_import_with_context(
-            state,
-            job,
-            artifact.clone(),
-            claim,
-            cancellation,
-            reporter,
-            crate::zip::extract::MAX_DECOMPRESSED_ARCHIVE_BYTES,
-            coordinator.execution_observer(),
-        )
-        .await?;
-        return Ok(artifact);
     }
 
     reporter
@@ -378,9 +364,16 @@ mod tests {
             tags: Vec::new(),
             decompress_prefix: decompress_prefix.map(str::to_owned),
         };
-        ownership::submit(state.store.db(), request, now)
-            .await
-            .unwrap();
+        if request.decompress_prefix.is_some() {
+            let capture = crate::import::test_support::capture_legacy(state, &request, false);
+            ownership::submit_captured_zip(state.store.db(), request, capture, now)
+                .await
+                .unwrap();
+        } else {
+            ownership::submit(state.store.db(), request, now)
+                .await
+                .unwrap();
+        }
         let mut claimed = jobs::claim_due(
             state.store.db(),
             "test-worker",
@@ -684,7 +677,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/v0/cat"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(archive.clone()))
-            .expect(2)
+            .expect(3) // inspect, complete source hash, bound extraction
             .mount(&server)
             .await;
         Mock::given(method("POST"))
@@ -792,7 +785,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/v0/cat"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(archive.clone()))
-            .expect(2)
+            .expect(3) // inspect, complete source hash, bound extraction
             .mount(&server)
             .await;
         Mock::given(method("POST"))
@@ -846,25 +839,23 @@ mod tests {
             .unwrap();
         assert_eq!(decision.effect, DecisionEffect::Skipped);
         let now = Utc::now();
-        ownership::submit_decided(
-            state.store.db(),
-            NewImportJob {
-                id: "skipped-zip".into(),
-                bucket: "bucket".into(),
-                key: "archive.zip".into(),
-                source: ImportSource::Cid(CID.into()),
-                request_fingerprint: "zip-fingerprint".into(),
-                client_token: None,
-                object_content_type: None,
-                metadata: HashMap::new(),
-                tags,
-                decompress_prefix: Some("out/".into()),
-            },
-            decision,
-            now,
-        )
-        .await
-        .unwrap();
+        let request = NewImportJob {
+            id: "skipped-zip".into(),
+            bucket: "bucket".into(),
+            key: "archive.zip".into(),
+            source: ImportSource::Cid(CID.into()),
+            request_fingerprint: "zip-fingerprint".into(),
+            client_token: None,
+            object_content_type: None,
+            metadata: HashMap::new(),
+            tags,
+            decompress_prefix: Some("out/".into()),
+        };
+        let capture = crate::import::test_support::capture_legacy(&state, &request, false);
+        assert_eq!(capture.source_decision().effect, decision.effect);
+        ownership::submit_captured_zip(state.store.db(), request, capture, now)
+            .await
+            .unwrap();
         let claim = jobs::claim_due(
             state.store.db(),
             "zip-worker",
@@ -943,7 +934,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/v0/cat"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(archive.clone()))
-            .expect(2)
+            .expect(3) // inspect, complete source hash, bound extraction
             .mount(&server)
             .await;
         Mock::given(method("POST"))

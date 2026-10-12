@@ -97,8 +97,8 @@ Don't count ignored tests as passing. The ZIP checks must cover legacy archive E
 result compatibility; default-on and signed-tag root selection; final relative
 paths and exact committed versions; disabled, empty, partial and failed roots;
 separate batch/root ownership and GET status; per-output private denial; and
-v2 signed headers, token replay, source=false, URL digest, and zero-output MPU
-completion/replay. In particular, source=false zero-output Complete must
+authenticated v2 controls, token replay, source=false, server-measured URL input,
+and zero-output MPU completion/replay. In particular, source=false zero-output Complete must
 persist a queryable failed batch and return the same 4xx on the first call and
 replay, not a successful empty result. Run against the completed implementation,
 not an unfinished worker.
@@ -134,6 +134,97 @@ cargo test --test postgres_zip_v2_residency_lock_order -- --ignored --test-threa
 cargo test --test zip_v2_mpu_complete -- --ignored --test-threads=1
 cargo test --test import_zip_v2_acceptance -- --ignored --test-threads=1
 ```
+
+## Stage 9 R25 ZIP verification
+
+**Status: local isolated R25 acceptance passed.** The final revision3 source is
+the `dc519271` archive plus 135 exact overlay paths, independently built with
+installed Windows GNU Rust 1.92.0, locked/offline, standard profiles and default
+test concurrency. Earlier revision2 failures, cancelled builds and QA-wrapper
+errors are retained as historical evidence, not relabelled as successful runs.
+
+| Current revision3 check | Actual result |
+|---|---|
+| `fmt --all -- --check` | exit 0 |
+| all-targets `check` and Clippy `-D warnings` | both exit 0 |
+| complete default-concurrency lib suite | 1494 passed, 0 failed, 1 ignored |
+| complete integration suite | 165 passed, 0 failed |
+| Stage2 migration target | SQLite 2 passed; PG 2 ignored in this command |
+| 18 complete affected protocol/store/lifecycle/migration binaries | all 0 failed, 0 filtered; one original PG case ignored |
+| current-source isolated PostgreSQL 17.11 | five exact cases passed, 0 failed |
+
+The affected binaries include real production SigV4 HTTP (16), replay (13),
+unchanged literal wire goldens (5), direct capture/route fences (11), control
+review (16), recovery (49), complete MPU and R26 store/CLI/surface targets. Their
+shared support tests are not accumulated as unique scenarios. Compile-only and
+ignored cases are not counted as runtime passes. Other previously verified
+revision2 protocol targets are reused only where substantive dependencies are
+unchanged; they are not reported as new revision3 executions.
+
+Evidence lives under
+`target/stage9-r25-integrate-20261008-dc51927-a718e92c/`:
+`qa-r3-6b9e/report.md`, `r3protocol-6b9e21d4/report.md`, and the PG report below.
+All lanes verified the 135 receipts and unchanged source identities. Coverage
+preserves v1 ETag/CID, VersionId, legacy result bytes and v2 `ZipV2Result`, exact
+successful output owners, manual archive-owned cancellation, non-ZIP behavior,
+frozen configuration, recovery provenance, complete input proof and quota fences.
+
+The Import heartbeat/publication deadlock has an observed same-deadline
+failure/fix/revert proof. Historical Windows Code 32 and other unreproduced
+timing symptoms are not claimed fixed by passing current suites. Stage7/8,
+real paid-provider accounts, physical remote pins and production GC remain
+**NOT RUN**. Local Noop/mock durable jobs do not prove physical pin completion.
+
+The current local targets are `tests/stage9_zip_*.rs` (support directories aren't
+test targets). With Rust 1.92 and already cached dependencies, use these bounded
+PowerShell commands with the already installed Windows GNU toolchain, without
+installing dependencies or adding persistent environment settings:
+
+```powershell
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test 'stage9_zip_*' -- --test-threads=1
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --lib zip::options:: -- --test-threads=1
+```
+
+The glob includes capture/config, direct capture, HTTP, replay, wire, store,
+lifecycle and the four import targets, plus the ignored PostgreSQL target. An
+ignored PostgreSQL case isn't a PASS. Check individual results; a command listed
+here isn't evidence that all its targets passed.
+
+The current-source native PG run executes four existing
+`legacy_pinning_migration_postgres` cases (NOWAIT/phantom and receipt failure,
+historical identity/new lifetime, damaged receipt catalog, committed route
+drift), plus
+`stage9_zip_postgres::r25_pg_tail_rollback_then_exact_shared_cid_publication`.
+All five ran with their original 8-second SQL deadline and passed on a fresh
+loopback/tmpfs PostgreSQL 17.11 instance. The tail case proves zero publication
+and quota writes after the injected fault, then same-capture retry with three
+versions, two leases and shared-CID usage of 5 bytes/1 pin.
+
+The separately authorized official `postgres:17.11` image pull fixed the missing
+local cache; subsequent runs used the fixed image with `--pull=never`. Raw native
+logs, server version, ten schema create/drop pairs, current nullable ALTERs,
+case results and logs-first exact resource cleanup are recorded in
+`qa-pg-rev3-f9768f2e-c2f0-4d29-af86-d8d77f77b63d/evidence.md` under the same parent
+root. Schemas/other clients were zero before stopping the owned container;
+owned run-label containers/volumes/networks were zero afterward.
+
+Non-NULL ZIP capture pointer/identity closure and seeded-history no-fill/down
+tests have SQLite native evidence and use the shared Rust TEXT/JSON scanner;
+these five PG cases do **not** prove those individual fixtures on PostgreSQL.
+No independent PG MPU/root-recovery or physical-provider assertion is implied.
+
+Run that case only with an explicitly authorized disposable PostgreSQL 17 test
+database already configured through `IPFS_S3_TEST_POSTGRES_URL`:
+
+```powershell
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage9_zip_postgres r25_pg_tail_rollback_then_exact_shared_cid_publication -- --ignored --exact --nocapture --test-threads=1
+```
+
+The case owns a fresh UUID schema and removes only that exact schema. Keep the
+owned-run marker and evidence path with the result; `a718e92c` identifies the
+recorded source/root run, not permission to clean up another run's resources.
+Don't substitute a production database, a paid account, unpin/GC operations or
+an unowned test instance for this fixture.
 
 ## Stage 5 RPC verification
 

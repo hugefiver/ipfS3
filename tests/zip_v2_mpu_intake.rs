@@ -2,7 +2,7 @@
 #[allow(dead_code)]
 mod support;
 use http::{HeaderMap, HeaderValue, StatusCode};
-use ipfs_s3_gateway::{store, zip::options::ZipV2Options};
+use ipfs_s3_gateway::store;
 use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
 use support::decompress::{KuboScript, start_harness_with_root_default_and_database};
 
@@ -108,7 +108,12 @@ async fn signed_create_replays_original_snapshot_across_connections_and_rejects_
         .await
         .unwrap()
         .unwrap();
-    let opts: ZipV2Options = serde_json::from_str(&record.captured_options).unwrap();
+    let opts = record.options().unwrap();
+    let intent = record.zip_intent().unwrap().unwrap();
+    assert_eq!(intent.v2_options(), Some(opts.clone()));
+    assert_eq!(intent.origin().principal_id, "test");
+    assert_eq!(intent.origin().request_id, original);
+    assert_eq!(intent.target_prefix(), "out/");
     assert_eq!(opts.token, "same-token");
     assert_eq!(opts.root_override, Some(true));
     assert!(opts.root_enabled);

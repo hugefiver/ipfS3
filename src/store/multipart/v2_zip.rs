@@ -9,9 +9,12 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{AppError, AppResult};
 use crate::pinning::tags::ObjectTag;
+use crate::pinning::zip_policy::CapturedZipIntent;
 use crate::zip::options::ZipV2Options;
 
-use super::create_upload_with_decision;
+use super::create_upload_with_zip_intent;
+
+mod capture;
 
 #[derive(Clone, Debug)]
 pub struct Intake {
@@ -45,6 +48,17 @@ pub struct Record {
     pub captured_options: String,
     pub captured_config: String,
     pub rule_revision: String,
+}
+
+impl Record {
+    /// Receipt decoding only. Bare historical options are not admission authority.
+    pub fn options(&self) -> AppResult<ZipV2Options> {
+        capture::read(self).map(|(options, _)| options)
+    }
+
+    pub fn zip_intent(&self) -> AppResult<Option<CapturedZipIntent>> {
+        capture::read(self).map(|(_, intent)| intent)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -307,8 +321,7 @@ pub async fn finalize_complete_in_transaction(
         .one(tx)
         .await?
         .ok_or_else(conflict)?;
-    let options: ZipV2Options =
-        serde_json::from_str(&record.captured_options).map_err(|_| conflict())?;
+    let options = record.options()?;
     let entries = zip_manifest_entry::Entity::find()
         .filter(zip_manifest_entry::Column::BatchId.eq(&claim.batch_id))
         .all(tx)
@@ -324,6 +337,7 @@ pub async fn finalize_complete_in_transaction(
     if execution.state != "completed"
         || execution.owner != record.owner
         || execution.token != record.token
+        || execution.captured_options != record.captured_options
         || execution.source != "mpu"
         || execution.input_sha256.is_none()
         || root.state != "published"
@@ -510,6 +524,7 @@ async fn replay(
     tx: &DatabaseTransaction,
     existing_id: &str,
     request: &Intake,
+    requested_intent: Option<&CapturedZipIntent>,
 ) -> AppResult<String> {
     let record = read_by_upload(tx, existing_id)
         .await?
@@ -520,16 +535,74 @@ async fn replay(
         || record.target_prefix != request.target_prefix
         || record.token != request.token
         || record.active_upload_id.as_deref() != Some(existing_id)
+        || record.request_fingerprint
+            != hex::encode(Sha256::digest(request.request_contract.as_bytes()))
     {
         return Err(conflict());
     }
-    super::get_upload(tx, existing_id)
+    let execution = crate::store::zip::execution::read(tx, existing_id)
+        .await?
+        .ok_or_else(conflict)?;
+    if execution.request_contract != request.request_contract
+        || execution.request_fingerprint != record.request_fingerprint
+        || execution.captured_options != record.captured_options
+        || execution.owner != record.owner
+        || execution.source != "mpu"
+        || execution.token != record.token
+        || execution.bucket != record.bucket
+        || execution.source_key != record.archive_key
+    {
+        return Err(conflict());
+    }
+    let (options, intent) = capture::read(&record)?;
+    let intent = intent.ok_or_else(capture::attention)?;
+    if requested_intent
+        .is_some_and(|new| new.controls().targets_explicit != intent.controls().targets_explicit)
+    {
+        return Err(conflict());
+    }
+    if !capture::same_contract(
+        &options,
+        &request.options,
+        intent.controls().targets_explicit,
+    ) {
+        return Err(conflict());
+    }
+    let upload = super::get_upload(tx, existing_id)
         .await
         .map_err(|_| conflict())?;
+    let json = upload
+        .zip_intent_json
+        .as_deref()
+        .ok_or_else(capture::attention)?;
+    if crate::store::pinning::publication::decode_zip_capture_json(json)? != intent
+        || super::decision_from_upload(&upload)?.as_ref() != Some(intent.source_decision())
+        || upload.decompress_zip_target.as_deref() != Some(record.target_prefix.as_str())
+        || upload.decompress_zip_result != intent.controls().result_enabled
+    {
+        return Err(capture::attention());
+    }
     Ok(existing_id.to_owned())
 }
 
+/// Compatibility replay only: a fresh v2 upload needs an authenticated capture.
 pub async fn create_or_replay(db: &DatabaseConnection, request: &Intake) -> AppResult<String> {
+    create(db, request, None).await
+}
+
+pub async fn create_or_replay_with_zip_intent(
+    db: &DatabaseConnection,
+    request: &Intake,
+    intent: &CapturedZipIntent,
+) -> AppResult<String> {
+    create(db, request, Some(intent)).await
+}
+
+async fn create(
+    db: &DatabaseConnection,
+    request: &Intake,
+    intent: Option<&CapturedZipIntent>,
+) -> AppResult<String> {
     if (!request.options.publish_extracted && !request.options.publish_source)
         || request.options.token != request.token
         || request.rule_revision.is_empty()
@@ -538,11 +611,24 @@ pub async fn create_or_replay(db: &DatabaseConnection, request: &Intake) -> AppR
             "invalid ZIP v2 upload intake".into(),
         ));
     }
-    let captured_options = serde_json::to_string(&request.options)
-        .map_err(|_| AppError::Internal("invalid ZIP v2 options".into()))?;
     let request_fingerprint = hex::encode(Sha256::digest(request.request_contract.as_bytes()));
     let tx = db.begin().await?;
     crate::store::import::ownership::lock_bucket_for_ownership(&tx, &request.bucket).await?;
+    if let Some(original) = tx
+        .query_one(query(
+            &tx,
+            "SELECT id FROM zip_v2_executions WHERE owner=? AND source='mpu' AND token=?",
+            "SELECT id FROM zip_v2_executions WHERE owner=$1 AND source='mpu' AND token=$2",
+            vec![request.owner.clone().into(), request.token.clone().into()],
+        ))
+        .await?
+    {
+        let id = replay(&tx, &original.try_get::<String>("", "id")?, request, intent).await?;
+        tx.commit().await?;
+        return Ok(id);
+    }
+    let intent = intent.ok_or_else(capture::attention)?;
+    let captured_options = capture::envelope(request, intent)?;
     let execution = crate::store::zip::execution::admit_in_transaction(
         &tx,
         &crate::store::zip::execution::Admission {
@@ -563,11 +649,11 @@ pub async fn create_or_replay(db: &DatabaseConnection, request: &Intake) -> AppR
         other => other,
     })?;
     if execution.id != request.upload_id {
-        let old = replay(&tx, &execution.id, request).await?;
+        let old = replay(&tx, &execution.id, request, Some(intent)).await?;
         tx.commit().await?;
         return Ok(old);
     }
-    create_upload_with_decision(
+    create_upload_with_zip_intent(
         &tx,
         &request.upload_id,
         &request.object_id,
@@ -580,8 +666,9 @@ pub async fn create_or_replay(db: &DatabaseConnection, request: &Intake) -> AppR
         request.metadata.clone(),
         &request.tags,
         Some(&request.target_prefix),
-        true,
-        None,
+        intent.controls().result_enabled,
+        Some(intent.source_decision()),
+        Some(intent),
     )
     .await?;
     let now = crate::store::database_clock::database_now(&tx).await?;

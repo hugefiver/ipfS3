@@ -63,23 +63,19 @@ fn parse_path_bucket_key(uri: &Uri) -> S3Result<(String, String)> {
 
 pub(super) fn parse_submit_query(uri: &Uri) -> S3Result<ParsedSubmitQuery> {
     let (bucket, key) = parse_path_bucket_key(uri)?;
+    let query = crate::s3::query::decoded_query_pairs(uri)?;
     let mut import_value = None;
-    let mut decompress_value = None;
-    for (name, value) in crate::s3::query::decoded_query_pairs(uri)? {
+    for (name, value) in &query {
         match name.as_str() {
-            "ipfs3-import" if import_value.is_none() => import_value = Some(value),
-            "decompress-zip" if decompress_value.is_none() => decompress_value = Some(value),
+            "ipfs3-import" if import_value.is_none() => import_value = Some(value.as_str()),
+            "decompress-zip" => {}
             _ => return Err(invalid_import()),
         }
     }
-    if import_value.as_deref() != Some("") {
+    if import_value != Some("") {
         return Err(invalid_import());
     }
-    let decompress_prefix = decompress_value
-        .as_deref()
-        .map(crate::zip::sanitize::normalize_target_prefix)
-        .transpose()
-        .map_err(|_| invalid_import())?;
+    let (decompress_prefix, _, _) = crate::zip::options::parse_authenticated_zip_query(&query)?;
     Ok(ParsedSubmitQuery {
         bucket,
         key,
@@ -202,11 +198,17 @@ pub(super) fn optional_single_header(headers: &HeaderMap, name: &str) -> S3Resul
         .map_err(|_| invalid_import())
 }
 
-pub(super) fn parse_tags(headers: &HeaderMap) -> S3Result<Vec<ObjectTag>> {
+pub(super) fn parse_tags(headers: &HeaderMap, is_zip: bool) -> S3Result<Vec<ObjectTag>> {
     let Some(value) = optional_single_header(headers, "x-amz-tagging")? else {
         return Ok(Vec::new());
     };
-    crate::pinning::tags::parse_tagging_header(&value).map_err(|_| invalid_import())
+    crate::zip::options::parse_authenticated_zip_tagging(&value, is_zip).map_err(|error| {
+        if error.code().as_str() == "InvalidRequest" {
+            error
+        } else {
+            invalid_import()
+        }
+    })
 }
 
 pub(super) fn parse_metadata(headers: &HeaderMap) -> HashMap<String, String> {
@@ -221,36 +223,16 @@ pub(super) fn parse_metadata(headers: &HeaderMap) -> HashMap<String, String> {
         .collect()
 }
 
-/// The ZIP parser verifies its own signed controls. Import adds a second token
-/// and semantic metadata: unsigned values cannot influence durable identity.
+/// s3s has already authenticated this request. The legacy import token is
+/// optional on v2; when both tokens are supplied they identify the same intake.
 pub(super) fn validate_v2_import_headers(
-    headers: &HeaderMap,
     options: &ZipV2Options,
     client_token: Option<&str>,
 ) -> S3Result<()> {
-    if client_token != Some(options.token.as_str()) {
+    if client_token.is_some_and(|token| token != options.token) {
         return Err(s3s::s3_error!(
             InvalidRequest,
             "ZIP v2 token must match import client token"
-        ));
-    }
-    let authorization =
-        optional_single_header(headers, "authorization")?.ok_or_else(invalid_import)?;
-    let signed = authorization
-        .split(", ")
-        .find_map(|part| part.strip_prefix("SignedHeaders="))
-        .ok_or_else(invalid_import)?;
-    let names = signed.split(';').collect::<Vec<_>>();
-    if !names.contains(&"x-ipfs3-client-token")
-        || headers.keys().any(|name| {
-            (name.as_str().starts_with("x-amz-meta-")
-                || name.as_str() == "x-ipfs3-object-content-type")
-                && !names.contains(&name.as_str())
-        })
-    {
-        return Err(s3s::s3_error!(
-            InvalidRequest,
-            "ZIP v2 import metadata and client token must be signed"
         ));
     }
     Ok(())

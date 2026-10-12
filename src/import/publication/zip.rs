@@ -1,11 +1,10 @@
 use std::time::Duration;
 
 use chrono::Utc;
-use sea_orm::{EntityTrait, TransactionTrait};
+use sea_orm::EntityTrait;
 
 use crate::{
     error::AppError,
-    import::publication::{decided_publish, resolved_policy},
     import::{
         ImportClaim, ImportExecutionError, ImportFailureCode,
         execution_error::{ensure_active, map_publication_error, terminal_failure},
@@ -19,14 +18,15 @@ use crate::{
             results::{self, ZipResultRecord},
         },
         pinning::publication::{
-            PinTargetSpec, PublicationObject, PublicationRequest, PublicationResult, ZipBatchEntry,
-            ZipBatchPublication, ZipPublicationRequest,
+            CapturedZipPublication, LegacyZipAuthority, PublicationObject, PublicationResult,
+            ZipPublicationAuthority, publish_captured_zip,
         },
     },
     zip::{batch::FinalZipManifest, response::ExtractedEntry},
 };
 
 use crate::store::zip::{RootClaim, RootOutcome};
+mod prepared;
 
 // An initial failure has no root epoch. Once claim_root succeeds, even a
 // failed directory build must carry its epoch into the publication fence.
@@ -56,6 +56,7 @@ pub(crate) async fn publish_zip_import(
     claim: &ImportClaim,
     artifact: &ImportArtifact,
     data: ZipPublicationData<'_>,
+    guard: ImportPublicationGuard,
     cancellation: &JobCancellation,
 ) -> Result<PublicationResult, ImportExecutionError> {
     let ZipPublicationData {
@@ -64,7 +65,7 @@ pub(crate) async fn publish_zip_import(
         manifest,
     } = data;
     ensure_active(cancellation)?;
-    let (policy, decision) = resolved_policy(state, job, cancellation)?;
+    let capture = crate::import::zip_capture::legacy_capture(job)?;
     let metadata: serde_json::Value = serde_json::from_str(&job.metadata_json).map_err(|_| {
         terminal_failure(
             ImportFailureCode::PublicationFailed,
@@ -77,6 +78,94 @@ pub(crate) async fn publish_zip_import(
             "import archive size is outside the supported range",
         )
     })?;
+    let now = Utc::now();
+    let archive_object = PublicationObject::from_put(
+        uuid::Uuid::new_v4().to_string(),
+        &job.bucket,
+        &job.key,
+        artifact.cid.clone(),
+        archive_size,
+        artifact.object_content_type.clone(),
+        Some(metadata),
+        false,
+        None,
+        None,
+        now,
+    );
+    let successes = entries
+        .iter()
+        .map(|entry| {
+            PublicationObject::from_put(
+                uuid::Uuid::new_v4().to_string(),
+                &job.bucket,
+                &entry.entry.key,
+                entry.entry.cid.clone(),
+                entry.entry.size,
+                None,
+                None,
+                false,
+                None,
+                None,
+                now,
+            )
+        })
+        .collect::<Vec<_>>();
+    let result_rows =
+        results::zip_publication_rows(&job.id, &job.key, &artifact.cid, archive_size, records)
+            .map_err(|error| map_publication_error(error, cancellation))?;
+    let manifest = manifest.ok_or_else(|| {
+        terminal_failure(
+            ImportFailureCode::PublicationFailed,
+            "ZIP manifest needs_attention",
+        )
+    })?;
+    let root_result = prepare_and_build_root(
+        state,
+        job,
+        claim,
+        manifest,
+        capture.controls().root,
+        cancellation,
+    )
+    .await?;
+    let root_outcome = match root_result {
+        RootResult::Unclaimed(outcome) => outcome,
+        RootResult::ClaimedFailure { claim, code } => RootOutcome::ClaimedFailed { claim, code },
+    };
+    let source_tags = serde_json::from_str(&job.tags_json).map_err(|_| {
+        terminal_failure(
+            ImportFailureCode::PublicationFailed,
+            "persisted ZIP tags are invalid",
+        )
+    })?;
+    let root_enabled = capture.controls().root.enabled();
+    let published = publish_captured_zip(state.store.db(), CapturedZipPublication {
+        batch_id: job.id.clone(), source: Some(archive_object), source_tags, successes,
+        manifest: manifest.clone(), capture,
+        authority: ZipPublicationAuthority::Legacy(Box::new(LegacyZipAuthority {
+            standard_guard: None, upload_target: None, import_guard: Some(guard), result_rows, replay: None,
+        })), root_outcome,
+        terminal_result: serde_json::json!({"batch_id": job.id, "archive_cid": artifact.cid, "root_enabled": root_enabled}).to_string(),
+    }).await.map_err(|error| map_publication_error(error, cancellation))?;
+    published
+        .into_iter()
+        .find(|(key, _)| key == &job.key)
+        .map(|(_, result)| result)
+        .ok_or_else(|| {
+            terminal_failure(
+                ImportFailureCode::PublicationFailed,
+                "missing archive publication receipt",
+            )
+        })
+}
+
+async fn publication_guard(
+    state: &AppState,
+    job: &import_job::Model,
+    claim: &ImportClaim,
+    entries: &[ZipPublicationEntry],
+    cancellation: &JobCancellation,
+) -> Result<ImportPublicationGuard, ImportExecutionError> {
     let archive_target = import_job_target::Entity::find_by_id((
         job.id.clone(),
         job.bucket.clone(),
@@ -101,212 +190,135 @@ pub(crate) async fn publish_zip_import(
             .cmp(&right.bucket)
             .then_with(|| left.key.cmp(&right.key))
     });
-    let guard = ImportPublicationGuard {
+    Ok(ImportPublicationGuard {
         job_id: claim.job_id.clone(),
         worker_id: claim.worker_id.clone(),
         claim_epoch: claim.claim_epoch,
         targets,
-    };
-    let now = Utc::now();
-    let archive_object = PublicationObject::from_put(
-        uuid::Uuid::new_v4().to_string(),
-        &job.bucket,
-        &job.key,
-        artifact.cid.clone(),
-        archive_size,
-        artifact.object_content_type.clone(),
-        Some(metadata),
-        false,
-        None,
-        None,
-        now,
-    );
-    let request = ZipPublicationRequest {
-        archive: PublicationRequest {
-            object: archive_object,
-            tags: policy.tags.clone(),
-            policy,
-            object_target: PinTargetSpec {
-                cid: artifact.cid.clone(),
-                logical_size: archive_size,
-            },
-        },
-        entries: entries
-            .iter()
-            .map(|entry| {
-                PublicationObject::from_put(
-                    uuid::Uuid::new_v4().to_string(),
-                    &job.bucket,
-                    &entry.entry.key,
-                    entry.entry.cid.clone(),
-                    entry.entry.size,
-                    None,
-                    None,
-                    false,
-                    None,
-                    None,
-                    now,
+    })
+}
+
+async fn freeze_with_guard(
+    state: &AppState,
+    job: &import_job::Model,
+    artifact: &ImportArtifact,
+    data: &ZipPublicationData<'_>,
+    guard: &ImportPublicationGuard,
+    cancellation: &JobCancellation,
+) -> Result<(), ImportExecutionError> {
+    ensure_active(cancellation)?;
+    let proof =
+        crate::store::pinning::publication::read_legacy_import_input(state.store.db(), &job.id)
+            .await
+            .map_err(|error| map_publication_error(error, cancellation))?
+            .ok_or_else(|| {
+                terminal_failure(
+                    ImportFailureCode::PublicationFailed,
+                    "ZIP input proof needs_attention",
                 )
-            })
-            .collect(),
-    };
-    let result_rows =
-        results::zip_publication_rows(&job.id, &job.key, &artifact.cid, archive_size, records)
-            .map_err(|error| map_publication_error(error, cancellation))?;
-    let batch = if let Some(manifest) = manifest {
-        // A short, fenced read prevents a superseded worker from initiating an
-        // avoidable root side effect. Publication rechecks under its own lock.
-        let tx = state
-            .store
-            .db()
-            .begin()
-            .await
-            .map_err(AppError::from)
-            .map_err(|error| map_publication_error(error, cancellation))?;
-        crate::store::import::ownership::lock_bucket_for_ownership(&tx, &job.bucket)
-            .await
-            .map_err(|error| map_publication_error(error, cancellation))?;
-        let locations = std::iter::once((job.bucket.clone(), job.key.clone()))
-            .chain(
-                entries
-                    .iter()
-                    .map(|entry| (job.bucket.clone(), entry.entry.key.clone())),
-            )
-            .collect::<Vec<_>>();
-        crate::store::import::ownership::verify_publication_guard(
-            &tx,
-            &guard,
-            &job.bucket,
-            &locations,
+            })?;
+    if proof.cid() != artifact.cid || proof.size() as u64 != artifact.logical_size {
+        return Err(terminal_failure(
+            ImportFailureCode::PublicationFailed,
+            "ZIP artifact differs from bound input",
+        ));
+    }
+    let json = prepared::PreparedImport::capture(artifact, guard, data)?.json()?;
+    let manifest = data.manifest.expect("prepared capture requires manifest");
+    let locations = std::iter::once((job.bucket.clone(), job.key.clone()))
+        .chain(
+            data.entries
+                .iter()
+                .map(|e| (job.bucket.clone(), e.entry.key.clone())),
         )
+        .collect::<Vec<_>>();
+    crate::store::zip::import_intake::freeze_legacy_manifest(
+        state.store.db(),
+        guard,
+        &job.bucket,
+        &locations,
+        &manifest.manifest_items(),
+        &json,
+    )
+    .await
+    .map_err(|error| map_publication_error(error, cancellation))?;
+    ensure_active(cancellation)
+}
+
+pub(crate) async fn freeze_zip_import(
+    state: &AppState,
+    job: &import_job::Model,
+    claim: &ImportClaim,
+    artifact: &ImportArtifact,
+    data: ZipPublicationData<'_>,
+    cancellation: &JobCancellation,
+) -> Result<ImportPublicationGuard, ImportExecutionError> {
+    let guard = publication_guard(state, job, claim, data.entries, cancellation).await?;
+    freeze_with_guard(state, job, artifact, &data, &guard, cancellation).await?;
+    Ok(guard)
+}
+
+pub(crate) async fn recover_prepared_zip_import(
+    state: &AppState,
+    job: &import_job::Model,
+    claim: &ImportClaim,
+    cancellation: &JobCancellation,
+    reporter: &crate::import::progress::ProgressReporter,
+    observer: &dyn crate::import::pipeline::ImportExecutionObserver,
+) -> Result<Option<ImportArtifact>, ImportExecutionError> {
+    let batch = crate::store::zip::read(state.store.db(), &job.id)
         .await
         .map_err(|error| map_publication_error(error, cancellation))?;
-        tx.commit()
-            .await
-            .map_err(AppError::from)
-            .map_err(|error| map_publication_error(error, cancellation))?;
-        ensure_active(cancellation)?;
-        let capture: crate::pinning::tags::ZipRootCapture =
-            serde_json::from_str(job.root_capture_json.as_deref().ok_or_else(|| {
-                terminal_failure(
-                    ImportFailureCode::PublicationFailed,
-                    "missing ZIP root admission capture",
-                )
-            })?)
-            .map_err(|_| {
-                terminal_failure(
-                    ImportFailureCode::PublicationFailed,
-                    "invalid ZIP root admission capture",
-                )
-            })?;
-        let captured_tags: Vec<crate::pinning::tags::ObjectTag> =
-            serde_json::from_str(&job.tags_json).map_err(|_| {
-                terminal_failure(
-                    ImportFailureCode::PublicationFailed,
-                    "invalid persisted ZIP tags",
-                )
-            })?;
-        if crate::pinning::tags::resolve_zip_root_option(&captured_tags, capture.enabled()).ok()
-            != Some(capture)
-        {
-            return Err(terminal_failure(
-                ImportFailureCode::PublicationFailed,
-                "ZIP root capture does not match signed tags",
-            ));
-        }
-        let prefix = job.decompress_prefix.as_deref().ok_or_else(|| {
-            terminal_failure(
-                ImportFailureCode::PublicationFailed,
-                "missing ZIP output prefix",
-            )
-        })?;
-        let origin = decision.as_ref().ok_or_else(|| {
-            terminal_failure(
-                ImportFailureCode::PublicationFailed,
-                "ZIP root admission requires a captured pin decision",
-            )
-        })?;
-        if manifest.successful.len() != request.entries.len()
-            || manifest
-                .successful
-                .iter()
-                .zip(&request.entries)
-                .any(|(file, object)| {
-                    file.object_key != object.key
-                        || file.cid != object.cid
-                        || file.size != object.logical_size
-                })
-        {
-            return Err(terminal_failure(
-                ImportFailureCode::PublicationFailed,
-                "ZIP import manifest does not match extracted objects",
-            ));
-        }
-        let root_result = prepare_and_build_root(
-            state,
-            job,
-            claim,
-            &artifact.cid,
-            manifest,
-            prefix,
-            capture,
-            &origin.origin.principal_id,
-            cancellation,
-        )
-        .await?;
-        let outcome = match root_result {
-            RootResult::Unclaimed(outcome) => outcome,
-            RootResult::ClaimedFailure { claim, code } => {
-                RootOutcome::ClaimedFailed { claim, code }
-            }
-        };
-        Some(ZipBatchPublication {
-            batch_id: job.id.clone(),
-            entries: manifest.successful.iter().zip(&request.entries).map(|(file, object)| {
-                ZipBatchEntry { path: file.relative_path.clone(), object_id: object.id.clone() }
-            }).collect(),
-            source_published: true,
-            terminal_result: serde_json::json!({"batch_id": job.id, "archive_cid": artifact.cid, "root_enabled": capture.enabled()}).to_string(),
-            root_outcome: outcome,
-        })
-    } else {
-        None
+    let Some(batch) = batch.filter(|b| b.manifest_prepared) else {
+        return Ok(None);
     };
-    if let Some(decision) = &decision {
-        if let Some(batch) = batch {
-            crate::store::pinning::publication::publish_decided_import_zip_batch(
-                state.store.db(),
-                request,
-                guard,
-                result_rows,
-                now,
-                batch,
-                decided_publish(state, decision),
-            )
-            .await
-        } else {
-            crate::store::pinning::publication::publish_decided_import_zip(
-                state.store.db(),
-                request,
-                guard,
-                result_rows,
-                now,
-                decided_publish(state, decision),
-            )
-            .await
-        }
-    } else {
-        crate::store::pinning::publication::publish_import_zip(
-            state.store.db(),
-            request,
-            guard,
-            result_rows,
-            now,
-            state.pinning.provider_limits(),
+    let missing = || {
+        terminal_failure(
+            ImportFailureCode::PublicationFailed,
+            "prepared ZIP response needs_attention",
         )
-        .await
+    };
+    let options: serde_json::Value =
+        serde_json::from_str(&batch.captured_options).map_err(|_| missing())?;
+    let json = options
+        .get("legacy_prepared_import")
+        .ok_or_else(missing)?
+        .to_string();
+    let recovered = prepared::PreparedImport::decode(&json)?.restore(job, claim)?;
+    let data = ZipPublicationData {
+        entries: &recovered.entries,
+        records: &recovered.records,
+        manifest: Some(&recovered.manifest),
+    };
+    freeze_with_guard(
+        state,
+        job,
+        &recovered.artifact,
+        &data,
+        &recovered.guard,
+        cancellation,
+    )
+    .await?;
+    tokio::select! {
+        biased;
+        _ = cancellation.shutdown.cancelled() => return Err(ImportExecutionError::Interrupted),
+        _ = cancellation.ownership_lost.cancelled() => return Err(ImportExecutionError::Superseded),
+        _ = observer.before_publication(&job.id) => {}
     }
-    .map_err(|error| map_publication_error(error, cancellation))
+    reporter
+        .phase(crate::import::ImportPhase::Publishing, cancellation)
+        .await?;
+    publish_zip_import(
+        state,
+        job,
+        claim,
+        &recovered.artifact,
+        data,
+        recovered.guard,
+        cancellation,
+    )
+    .await?;
+    Ok(Some(recovered.artifact))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -314,58 +326,29 @@ async fn prepare_and_build_root(
     state: &AppState,
     job: &import_job::Model,
     claim: &ImportClaim,
-    archive_cid: &str,
     manifest: &FinalZipManifest,
-    prefix: &str,
     capture: crate::pinning::tags::ZipRootCapture,
-    principal: &str,
     cancellation: &JobCancellation,
 ) -> Result<RootResult, ImportExecutionError> {
-    use crate::store::zip::BatchAdmission;
     ensure_active(cancellation)?;
     let db = state.store.db();
-    let captured_options = serde_json::json!({"root_capture": capture, "target_prefix": prefix, "archive_cid": archive_cid}).to_string();
-    let admitted = crate::store::zip::admit(
-        db,
-        &BatchAdmission {
-            id: job.id.clone(),
-            owner: principal.to_owned(),
-            source: "import".into(),
-            token: job.id.clone(),
-            fingerprint: job.request_fingerprint.clone(),
-            bucket: job.bucket.clone(),
-            archive_key: job.key.clone(),
-            input_identity: job.id.clone(),
-            captured_options: captured_options.clone(),
-        },
-    )
-    .await
-    .map_err(|error| map_publication_error(error, cancellation))?;
-    if admitted.captured_options != captured_options {
-        return Err(terminal_failure(
-            ImportFailureCode::PublicationFailed,
-            "ZIP import archive changed on worker recovery",
-        ));
-    }
-    if admitted.state != "open" {
+    let admitted = crate::store::zip::read(db, &job.id)
+        .await
+        .map_err(|error| map_publication_error(error, cancellation))?
+        .ok_or(ImportExecutionError::Superseded)?;
+    if admitted.state != "open" || !admitted.manifest_prepared {
         return Err(ImportExecutionError::Superseded);
     }
     let items = manifest.manifest_items();
-    if admitted.manifest_prepared {
-        let snapshot = crate::store::zip::snapshot(db, &job.id)
-            .await
-            .map_err(|error| map_publication_error(error, cancellation))?
-            .ok_or(ImportExecutionError::Superseded)?;
-        if !results::matches_zip_manifest(&snapshot.entries, &items) {
-            return Err(terminal_failure(
-                ImportFailureCode::PublicationFailed,
-                "ZIP import manifest changed on worker recovery",
-            ));
-        }
-    } else {
-        crate::store::zip::prepare_manifest(db, &job.id, &items)
-            .await
-            .map_err(|error| map_publication_error(error, cancellation))?;
+    let snapshot = crate::store::zip::snapshot(db, &job.id)
+        .await
+        .map_err(|error| map_publication_error(error, cancellation))?
+        .ok_or(ImportExecutionError::Superseded)?;
+    if !results::matches_zip_manifest(&snapshot.entries, &items) {
+        return Err(terminal_failure(
+            ImportFailureCode::PublicationFailed,
+            "ZIP import manifest changed on worker recovery",
+        ));
     }
     ensure_active(cancellation)?;
     if !capture.enabled() {

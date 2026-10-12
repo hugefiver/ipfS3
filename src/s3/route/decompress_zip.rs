@@ -7,15 +7,20 @@ use s3s::dto::{ETag, ParseETagError};
 use s3s::route::S3Route;
 use s3s::{Body, S3Request, S3Response, S3Result};
 
+#[cfg(test)]
+use crate::pinning::policy::PublicationContext;
+#[cfg(test)]
+use crate::store::pinning::publication::{PinTargetSpec, PublicationRequest};
 use crate::{
-    pinning::{decision::DecisionOrigin, policy::PublicationContext, tags::ObjectTag},
+    pinning::{decision::DecisionOrigin, tags::ObjectTag},
     state::AppState,
     store::pinning::publication::{
-        DecidedPublish, PinTargetSpec, PublicationObject, PublicationRequest, ZipBatchEntry,
-        ZipBatchPublication, ZipPublicationRequest,
+        CapturedZipPublication, LegacyZipAuthority, PublicationObject, ZipPublicationAuthority,
+        decode_zip_capture_json, publish_captured_zip,
     },
 };
 
+pub(crate) mod replay_controls;
 mod v2;
 mod v2_mpu;
 
@@ -61,8 +66,7 @@ fn parse_publication_tags(headers: &HeaderMap) -> S3Result<Vec<ObjectTag>> {
     let value = header
         .to_str()
         .map_err(|_| invalid_pinning_argument("invalid x-amz-tagging header"))?;
-    crate::pinning::tags::parse_tagging_header(value)
-        .map_err(|_| invalid_pinning_argument("invalid x-amz-tagging header"))
+    crate::zip::options::parse_authenticated_zip_tagging(value, true)
 }
 
 fn insert_version_id_header(headers: &mut HeaderMap, version_id: Option<&str>) -> S3Result<()> {
@@ -101,15 +105,26 @@ fn publication_entries(
 }
 
 pub(crate) fn captured_root_enabled(options: &str) -> S3Result<bool> {
-    serde_json::from_str::<serde_json::Value>(options)
-        .ok()
-        .and_then(|options| options.get("root_enabled")?.as_bool())
+    let value: serde_json::Value = serde_json::from_str(options)
+        .map_err(|_| s3s::s3_error!(InternalError, "invalid captured ZIP root option"))?;
+    if let Some(intent) = replay_controls::saved_intent(&value)? {
+        let enabled = intent.controls().root.enabled();
+        if value
+            .get("root_enabled")
+            .is_some_and(|v| v.as_bool() != Some(enabled))
+        {
+            return Err(mpu_zip_conflict());
+        }
+        return Ok(enabled);
+    }
+    value
+        .get("root_enabled")
+        .and_then(serde_json::Value::as_bool)
         .ok_or_else(|| s3s::s3_error!(InternalError, "invalid captured ZIP root option"))
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn admit_zip_batch(
-    state: &AppState,
+pub(crate) fn legacy_batch_admission(
     source: &str,
     id: &str,
     principal: &str,
@@ -117,24 +132,19 @@ pub(crate) async fn admit_zip_batch(
     archive_key: &str,
     prefix: &str,
     enabled: bool,
-) -> S3Result<()> {
-    crate::store::zip::admit(
-        state.store.db(),
-        &crate::store::zip::BatchAdmission {
-            id: id.to_owned(),
-            owner: principal.to_owned(),
-            source: source.to_owned(),
-            token: id.to_owned(),
-            fingerprint: format!("{source}:{id}:{bucket}:{archive_key}:{prefix}:{enabled}"),
-            bucket: bucket.to_owned(),
-            archive_key: archive_key.to_owned(),
-            input_identity: id.to_owned(),
-            captured_options: serde_json::json!({"root_enabled": enabled, "target_prefix": prefix})
-                .to_string(),
-        },
-    )
-    .await?;
-    Ok(())
+) -> crate::store::zip::BatchAdmission {
+    crate::store::zip::BatchAdmission {
+        id: id.to_owned(),
+        owner: principal.to_owned(),
+        source: source.to_owned(),
+        token: id.to_owned(),
+        fingerprint: format!("{source}:{id}:{bucket}:{archive_key}:{prefix}:{enabled}"),
+        bucket: bucket.to_owned(),
+        archive_key: archive_key.to_owned(),
+        input_identity: id.to_owned(),
+        captured_options: serde_json::json!({"root_enabled": enabled, "target_prefix": prefix})
+            .to_string(),
+    }
 }
 
 fn final_entries(
@@ -158,10 +168,10 @@ fn verify_multipart_batch(
     root_enabled: bool,
 ) -> S3Result<()> {
     let batch = &snapshot.batch;
-    let expected_options = serde_json::json!({
-        "root_enabled": root_enabled,
-        "target_prefix": prefix,
-    });
+    let intent = completed
+        .zip_intent
+        .as_ref()
+        .ok_or_else(|| s3s::s3_error!(OperationAborted, "ZIP capture needs_attention"))?;
     if batch.state != "open"
         || batch.source != "mpu"
         || batch.id != completed.upload_id
@@ -181,8 +191,9 @@ fn verify_multipart_batch(
                 "mpu:{}:{}:{}:{}:{}",
                 completed.upload_id, completed.bucket, completed.key, prefix, root_enabled
             )
-        || serde_json::from_str::<serde_json::Value>(&batch.captured_options).ok()
-            != Some(expected_options)
+        || decode_zip_capture_json(&batch.captured_options)? != *intent
+        || intent.target_prefix() != prefix
+        || intent.controls().root.enabled() != root_enabled
     {
         return Err(s3s::s3_error!(InternalError, "stale multipart ZIP batch"));
     }
@@ -241,14 +252,13 @@ fn verify_prepared_manifest(
     Ok(())
 }
 
-fn batch_publication(
+fn batch_terminal_result(
     id: &str,
     archive_cid: &str,
     manifest: &crate::zip::batch::FinalZipManifest,
-    objects: &[PublicationObject],
-    outcome: crate::store::zip::RootOutcome,
-) -> ZipBatchPublication {
-    let (status, warning, root_cid) = match &outcome {
+    outcome: &crate::store::zip::RootOutcome,
+) -> String {
+    let (status, warning, root_cid) = match outcome {
         crate::store::zip::RootOutcome::Disabled => ("disabled", None, None),
         crate::store::zip::RootOutcome::Empty => ("empty", None, None),
         crate::store::zip::RootOutcome::Failed { code } => ("failed", Some(*code), None),
@@ -263,29 +273,14 @@ fn batch_publication(
             Some(cid.as_str()),
         ),
     };
-    let terminal_result = serde_json::json!({
+    serde_json::json!({
         "archive_cid": archive_cid,
         "batch_id": id,
         "root_status": status,
         "root_warning": warning,
         "root_cid": root_cid,
     })
-    .to_string();
-    ZipBatchPublication {
-        batch_id: id.to_owned(),
-        entries: manifest
-            .successful
-            .iter()
-            .zip(objects)
-            .map(|(file, object)| ZipBatchEntry {
-                path: file.relative_path.clone(),
-                object_id: object.id.clone(),
-            })
-            .collect(),
-        source_published: true,
-        root_outcome: outcome,
-        terminal_result,
-    }
+    .to_string()
 }
 
 async fn build_zip_root(
@@ -889,27 +884,24 @@ impl DecompressZipRoute {
         req: S3Request<Body>,
         max_decompressed_bytes: u64,
     ) -> S3Result<S3Response<Body>> {
-        let parsed = parse_decompress_put_uri(&req.uri)?;
-        // Only authenticated S3Request headers reach this parser. In particular,
-        // an unsigned ZIP control must not fall back to the legacy source write.
         let tags = parse_publication_tags(&req.headers)?;
-        let root_capture = crate::pinning::tags::resolve_zip_root_option(
-            &tags,
-            self.state.pinning.zip_root_default(),
-        )
-        .map_err(|_| invalid_pinning_argument("invalid zip-root tag"))?;
-        let root_override = match root_capture {
-            crate::pinning::tags::ZipRootCapture::Tagged(value) => Some(value),
-            crate::pinning::tags::ZipRootCapture::Configured(_) => None,
-        };
-        let options = crate::zip::options::parse_zip_options(
+        let controls = crate::zip::options::parse_authenticated_zip_controls(
             &req.headers,
-            parsed.return_result_xml,
-            root_override,
+            &crate::s3::query::decoded_query_pairs(&req.uri)?,
+            &tags,
+            true,
             self.state.pinning.zip_root_default(),
-        )?;
-        if let crate::zip::options::ZipOptions::V2(options) = options {
-            return v2::put(&self.state, req, parsed, options, max_decompressed_bytes).await;
+        )?
+        .ok_or_else(|| s3s::s3_error!(InternalError, "missing ZIP controls"))?;
+        let (bucket, key) = parse_path_bucket_key(&req.uri)?;
+        let parsed = ParsedDecompressPut {
+            bucket,
+            key,
+            target_prefix: controls.target_prefix.clone().unwrap_or_default(),
+            return_result_xml: controls.result_enabled,
+        };
+        if matches!(&controls.options, crate::zip::options::ZipOptions::V2(_)) {
+            return v2::put(&self.state, req, parsed, controls, max_decompressed_bytes).await;
         }
         crate::s3::http::reject_write_conditions(&req.headers, false)?;
         crate::s3::ops::storage_class::require_standard_write_headers(&req.headers)?;
@@ -927,23 +919,28 @@ impl DecompressZipRoute {
             ));
         }
 
-        let root_enabled = root_capture.enabled();
+        let root_enabled = controls.root.enabled();
         let principal = crate::s3::ops::object::principal_id(&req)?;
         let capture = |mutation_id: &str| {
-            self.state
-                .pinning
-                .policy()
-                .evaluate_publication_decision(
-                    PublicationContext {
-                        bucket: &parsed.bucket,
-                        key: &parsed.key,
-                        tags: &tags,
-                        is_decompress_zip: true,
-                    },
-                    DecisionOrigin::new(&principal, mutation_id),
-                )
-                .map_err(crate::error::AppError::from)
-                .map_err(s3s::S3Error::from)
+            let intent = crate::pinning::zip_policy::capture_zip_intent(
+                self.state.pinning.effective_config(),
+                self.state.pinning.decompress_zip_config(),
+                self.state.pinning.control_mode(),
+                crate::pinning::zip_policy::ZipCaptureContext {
+                    bucket: &parsed.bucket,
+                    source_key: &parsed.key,
+                    target_prefix: &parsed.target_prefix,
+                    tags: &tags,
+                },
+                &controls,
+                DecisionOrigin::new(&principal, mutation_id),
+            )
+            .map_err(|_| invalid_pinning_argument("invalid ZIP intent capture"))?;
+            let decision = intent.source_decision().clone();
+            let policy = decision
+                .replay_policy(tags.clone())
+                .map_err(invalid_pinning_argument)?;
+            Ok::<_, s3s::S3Error>(((policy, decision), intent))
         };
         let preflight = capture(crate::s3::ops::object::PREFLIGHT_MUTATION_ID)?;
 
@@ -963,28 +960,28 @@ impl DecompressZipRoute {
             chrono::Utc::now(),
         )
         .await?;
-        let (policy, decision) = match capture(&mutation_guard.mutation_id).and_then(|captured| {
-            crate::s3::ops::object::verify_publication_preflight(&preflight, &captured)?;
-            Ok(captured)
-        }) {
-            Ok(captured) => captured,
-            Err(error) => {
-                crate::store::import::ownership::release_standard_mutation(
-                    self.state.store.db(),
-                    &mutation_guard,
-                )
-                .await?;
-                return Err(error);
-            }
-        };
+        let ((_, decision), zip_intent) =
+            match capture(&mutation_guard.mutation_id).and_then(|captured| {
+                crate::s3::ops::object::verify_publication_preflight(&preflight.0, &captured.0)?;
+                Ok(captured)
+            }) {
+                Ok(captured) => captured,
+                Err(error) => {
+                    crate::store::import::ownership::release_standard_mutation(
+                        self.state.store.db(),
+                        &mutation_guard,
+                    )
+                    .await?;
+                    return Err(error);
+                }
+            };
 
         crate::store::import::ownership::run_mutation(
             self.state.store.db(),
             &mutation_guard.clone(),
             |lease| async move {
                 let batch_id = mutation_guard.mutation_id.clone();
-                admit_zip_batch(
-                    &self.state,
+                let mut admission = legacy_batch_admission(
                     "direct",
                     &batch_id,
                     &principal,
@@ -992,8 +989,27 @@ impl DecompressZipRoute {
                     &parsed.key,
                     &parsed.target_prefix,
                     root_enabled,
-                )
-                .await?;
+                );
+                admission.captured_options = serde_json::json!({
+                    "root_enabled": root_enabled, "target_prefix": parsed.target_prefix,
+                    "result_enabled": parsed.return_result_xml, "zip_intent": zip_intent,
+                    "tags": tags,
+                })
+                .to_string();
+                let admitted = crate::store::zip::admit(self.state.store.db(), &admission).await?;
+                let zip_intent = decode_zip_capture_json(&admitted.captured_options)?;
+                if zip_intent.origin().request_id != batch_id
+                    || zip_intent.origin().principal_id != principal
+                    || zip_intent.bucket() != parsed.bucket
+                    || zip_intent.source_key() != parsed.key
+                    || zip_intent.target_prefix() != parsed.target_prefix
+                {
+                    return Err(s3s::s3_error!(
+                        OperationAborted,
+                        "ZIP admission capture conflict"
+                    ));
+                }
+                let root_enabled = zip_intent.controls().root.enabled();
                 let (input, progress) = crate::zip::input_budget::ZipInputBudget::new(
                     futures_util::StreamExt::map(req.input, |chunk| {
                         chunk.map_err(std::io::Error::other)
@@ -1065,36 +1081,36 @@ impl DecompressZipRoute {
                     chrono::Utc::now(),
                 );
                 let entries = publication_entries(&parsed.bucket, &published);
-                let batch =
-                    batch_publication(&batch_id, &archive.cid, &manifest, &entries, root_outcome);
-                let request = ZipPublicationRequest {
-                    archive: PublicationRequest {
-                        object: archive_object,
-                        tags: tags.clone(),
-                        policy,
-                        object_target: PinTargetSpec {
-                            cid: archive.cid.clone(),
-                            logical_size: archive.size,
-                        },
-                    },
-                    entries,
+                let source_id = archive_object.id.clone();
+                let terminal_result =
+                    batch_terminal_result(&batch_id, &archive.cid, &manifest, &root_outcome);
+                let request = CapturedZipPublication {
+                    batch_id: batch_id.clone(),
+                    source: Some(archive_object),
+                    source_tags: tags.clone(),
+                    successes: entries,
+                    manifest,
+                    capture: zip_intent,
+                    authority: ZipPublicationAuthority::Legacy(Box::new(LegacyZipAuthority {
+                        standard_guard: Some(mutation_guard),
+                        upload_target: None,
+                        import_guard: None,
+                        result_rows: Vec::new(),
+                        replay: None,
+                    })),
+                    root_outcome,
+                    terminal_result,
                 };
-                let publication_result = lease
-                    .commit(
-                        crate::store::pinning::publication::publish_decided_zip_batch(
-                            self.state.store.db(),
-                            request,
-                            Some(mutation_guard),
-                            batch,
-                            DecidedPublish {
-                                decision: &decision,
-                                config: self.state.pinning.effective_config(),
-                                mode: self.state.pinning.control_mode(),
-                                limits: self.state.pinning.provider_limits(),
-                            },
-                        ),
-                    )
+                let results = lease
+                    .commit(publish_captured_zip(self.state.store.db(), request))
                     .await?;
+                let publication_result = results
+                    .into_iter()
+                    .find(|(_, result)| result.object_id == source_id)
+                    .map(|(_, result)| result)
+                    .ok_or_else(|| {
+                        s3s::s3_error!(InternalError, "missing ZIP source publication")
+                    })?;
 
                 let mut headers = HeaderMap::new();
                 headers.insert(
@@ -1146,6 +1162,68 @@ impl DecompressZipRoute {
         let v2_intake =
             crate::store::multipart::v2_zip::read_by_upload(self.state.store.db(), &upload_id)
                 .await?;
+        if v2_intake.is_none() {
+            let batch = crate::store::zip::read(self.state.store.db(), &upload_id).await?;
+            if let Some(batch) = batch {
+                if batch.source != "mpu"
+                    || batch.owner != principal
+                    || batch.bucket != bucket
+                    || batch.archive_key != key
+                {
+                    return Err(mpu_zip_conflict());
+                }
+                let options: serde_json::Value = serde_json::from_str(&batch.captured_options)
+                    .map_err(|_| mpu_zip_conflict())?;
+                let intent = replay_controls::saved_intent(&options)?;
+                let prefix = options
+                    .get("target_prefix")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(mpu_zip_conflict)?;
+                if let Some(intent) = &intent
+                    && (intent.contract() != crate::pinning::zip_policy::ZipContract::V1
+                        || intent.bucket() != bucket
+                        || intent.source_key() != key
+                        || intent.target_prefix() != prefix
+                        || intent.origin().principal_id != principal
+                        || intent.origin().request_id != upload_id
+                        || options
+                            .get("result_enabled")
+                            .is_some_and(|v| v.as_bool() != Some(intent.controls().result_enabled)))
+                {
+                    return Err(mpu_zip_conflict());
+                }
+                if req.headers.contains_key("x-amz-tagging") {
+                    let mut supplied = parse_publication_tags(&req.headers)?;
+                    let mut original: Vec<ObjectTag> = serde_json::from_value(
+                        options.get("tags").cloned().ok_or_else(mpu_zip_conflict)?,
+                    )
+                    .map_err(|_| mpu_zip_conflict())?;
+                    supplied.sort_by(|a, b| a.key.cmp(&b.key));
+                    original.sort_by(|a, b| a.key.cmp(&b.key));
+                    if supplied != original {
+                        return Err(mpu_zip_conflict());
+                    }
+                }
+                // Historical captures predate result_enabled; the exact frozen
+                // receipt is checked below, rather than using current defaults.
+                replay_controls::verify(
+                    &req.headers,
+                    &crate::s3::query::decoded_query_pairs(&req.uri)?,
+                    &crate::zip::options::ZipOptions::Legacy,
+                    prefix,
+                    options
+                        .get("result_enabled")
+                        .and_then(serde_json::Value::as_bool),
+                    captured_root_enabled(&batch.captured_options)?,
+                )?;
+                if has_sse_header(&req.headers) {
+                    return Err(s3s::s3_error!(
+                        InvalidArgument,
+                        "ZIP multipart cannot use server-side encryption"
+                    ));
+                }
+            }
+        }
         // GatewayRoute is called only after s3s verifies SigV4. Do not require
         // an Authorization *header*: query-presigned SigV4 is authenticated too.
         if v2_intake.is_none() {
@@ -1161,6 +1239,17 @@ impl DecompressZipRoute {
             {
                 Ok(found) => {
                     if let Some(receipt) = found.completed() {
+                        let requested_result = crate::s3::query::decoded_query_pairs(&req.uri)?
+                            .into_iter()
+                            .find_map(|(name, value)| {
+                                (name == "decompress-zip-result").then_some(value)
+                            });
+                        if let Some(requested) = requested_result
+                            && (requested == "true")
+                                != receipt.response_xml.contains("<DecompressZipResult>")
+                        {
+                            return Err(mpu_zip_conflict());
+                        }
                         return response_from_replay(receipt.into_response_parts());
                     }
                 }
@@ -1220,65 +1309,6 @@ impl DecompressZipRoute {
                 }
 
                 if let Some(target_prefix) = completed.decompress_zip_target.clone() {
-                    // Historical uploads without a captured pin decision cannot be
-                    // passed through the decided batch publication helper. Keep
-                    // their preexisting completion path rather than reinterpret
-                    // reserved tags against a newer policy at completion.
-                    if completed.pin_decision.is_none() {
-                        let archive_stream = crate::kubo::cat::stream_cat(
-                            &self.state.kubo,
-                            &completed.root_cid,
-                            None,
-                        )
-                        .await?;
-                        let limits = zip_limits_for_call(
-                            &self.state,
-                            crate::zip::extract::MAX_DECOMPRESSED_ARCHIVE_BYTES,
-                        );
-                        let outcome = crate::zip::extract::extract_zip_stream_with_limits(
-                            &self.state,
-                            &target_prefix,
-                            archive_stream,
-                            limits,
-                        )
-                        .await?;
-                        reject_archive_key_collision(&completed.key, &outcome.entries)?;
-                        let request = ZipPublicationRequest {
-                            archive: crate::s3::ops::multipart::completed_publication_request(
-                                &completed,
-                            ),
-                            entries: publication_entries(&completed.bucket, &outcome.entries),
-                        };
-                        let publication_result =
-                            crate::s3::ops::multipart::finalize_completed_multipart_zip(
-                                &self.state,
-                                &completed,
-                                request,
-                            )
-                            .await?;
-                        insert_version_id_header(
-                            &mut headers,
-                            publication_result.version_id.as_deref(),
-                        )?;
-                        let xml = if completed.decompress_zip_result {
-                            crate::zip::response::decompress_result_xml(
-                                &crate::zip::response::DecompressZipResult {
-                                    archive_key: completed.key.clone(),
-                                    archive_cid: completed.root_cid.clone(),
-                                    archive_size: completed.total_size,
-                                    entries: outcome.entries,
-                                    failures: outcome.failures,
-                                },
-                            )
-                        } else {
-                            crate::zip::response::complete_multipart_result_xml(
-                                &completed.bucket,
-                                &completed.key,
-                                &completed.root_cid,
-                            )
-                        };
-                        return Ok(S3Response::with_headers(Body::from(xml), headers));
-                    }
                     let batch_id = completed.upload_id.clone();
                     let snapshot = crate::store::zip::snapshot(self.state.store.db(), &batch_id)
                         .await?
@@ -1340,19 +1370,12 @@ impl DecompressZipRoute {
                     let published = final_entries(&manifest);
                     let failures = outcome.failures;
                     let entries = publication_entries(&completed.bucket, &published);
-                    let batch = batch_publication(
+                    let terminal_result = batch_terminal_result(
                         &batch_id,
                         &completed.root_cid,
                         &manifest,
-                        &entries,
-                        root_outcome,
+                        &root_outcome,
                     );
-                    let request = ZipPublicationRequest {
-                        archive: crate::s3::ops::multipart::completed_publication_request(
-                            &completed,
-                        ),
-                        entries,
-                    };
                     let xml = if completed.decompress_zip_result {
                         crate::zip::response::decompress_result_xml(
                             &crate::zip::response::DecompressZipResult {
@@ -1384,13 +1407,33 @@ impl DecompressZipRoute {
                             .and_then(|decision| decision.warning)
                             .map(|warning| warning.as_header_code().to_owned()),
                     };
+                    let request = CapturedZipPublication {
+                        batch_id: batch_id.clone(),
+                        source: Some(
+                            crate::s3::ops::multipart::completed_publication_request(&completed)
+                                .object,
+                        ),
+                        source_tags: completed.tags.clone(),
+                        successes: entries,
+                        manifest,
+                        capture: completed.zip_intent.clone().ok_or_else(|| {
+                            s3s::s3_error!(OperationAborted, "ZIP capture needs_attention")
+                        })?,
+                        authority: ZipPublicationAuthority::Legacy(Box::new(LegacyZipAuthority {
+                            standard_guard: Some(completed.mutation_guard.clone()),
+                            upload_target: Some(completed.upload_target.clone()),
+                            import_guard: None,
+                            result_rows: Vec::new(),
+                            replay: Some(replay),
+                        })),
+                        root_outcome,
+                        terminal_result,
+                    };
                     let _publication_result =
                         crate::s3::ops::multipart::finalize_completed_multipart_zip_batch(
                             &self.state,
                             &completed,
                             request,
-                            batch,
-                            replay,
                         )
                         .await?;
                     let receipt = crate::store::zip::BatchAdmission::replay_lookup(
@@ -1465,26 +1508,23 @@ fn parse_path_bucket_key(uri: &Uri) -> S3Result<(String, String)> {
     Ok((bucket, key))
 }
 
+#[cfg(test)]
 fn parse_decompress_put_uri(uri: &Uri) -> S3Result<ParsedDecompressPut> {
     let (bucket, key) = parse_path_bucket_key(uri)?;
-    let mut target = None;
-    let mut return_result_xml = true;
-    for (name, value) in crate::s3::query::decoded_query_pairs(uri)? {
-        if name == "decompress-zip" {
-            target = Some(value);
-        } else if name == "decompress-zip-result" {
-            return_result_xml = value != "false";
-        }
-    }
-    let target_prefix =
-        crate::zip::sanitize::normalize_target_prefix(target.as_deref().unwrap_or(""))
-            .map_err(s3s::S3Error::from)?;
+    let controls = crate::zip::options::parse_authenticated_zip_controls(
+        &HeaderMap::new(),
+        &crate::s3::query::decoded_query_pairs(uri)?,
+        &[],
+        true,
+        false,
+    )?
+    .ok_or_else(|| s3s::s3_error!(InternalError, "missing ZIP controls"))?;
 
     Ok(ParsedDecompressPut {
         bucket,
         key,
-        target_prefix,
-        return_result_xml,
+        target_prefix: controls.target_prefix.unwrap_or_default(),
+        return_result_xml: controls.result_enabled,
     })
 }
 
@@ -1715,6 +1755,14 @@ mod tests {
         trigger: &str,
         provider_mode: &str,
     ) -> Arc<crate::pinning::coordinator::PinningCoordinator> {
+        pinning_coordinator_with_zip_auto(trigger, provider_mode, None)
+    }
+
+    fn pinning_coordinator_with_zip_auto(
+        trigger: &str,
+        provider_mode: &str,
+        auto_pin_outputs: Option<bool>,
+    ) -> Arc<crate::pinning::coordinator::PinningCoordinator> {
         use crate::config::{PinningConfig, PolicyConfig, ProviderConfig};
         use crate::pinning::config::ValidatedPinningConfig;
 
@@ -1752,7 +1800,16 @@ mod tests {
             |_| None,
         )
         .unwrap();
-        crate::pinning::coordinator::PinningCoordinator::build(config).unwrap()
+        crate::pinning::coordinator::PinningCoordinator::build_with_decompress_config(
+            config,
+            None,
+            crate::config::OptionalPinControlMode::Strict,
+            &crate::config::DecompressZipConfig {
+                auto_pin_outputs,
+                ..Default::default()
+            },
+        )
+        .unwrap()
     }
 
     async fn pinning_route_with_mock_kubo(
@@ -1992,8 +2049,86 @@ mod tests {
         return_result_xml: bool,
         part_size: i64,
     ) {
-        crate::store::multipart::create_upload(
-            state.store.db(),
+        seed_plain_multipart_with_tags(state, target, return_result_xml, part_size, &[]).await;
+    }
+
+    async fn seed_plain_multipart_with_tags(
+        state: &Arc<AppState>,
+        target: Option<&str>,
+        return_result_xml: bool,
+        part_size: i64,
+        tags: &[ObjectTag],
+    ) {
+        use sea_orm::TransactionTrait;
+
+        let intent = target.map(|prefix| {
+            let query = vec![
+                ("decompress-zip".to_owned(), prefix.to_owned()),
+                (
+                    "decompress-zip-result".to_owned(),
+                    return_result_xml.to_string(),
+                ),
+            ];
+            let controls = crate::zip::options::parse_authenticated_zip_controls(
+                &HeaderMap::new(),
+                &query,
+                tags,
+                true,
+                state.pinning.zip_root_default(),
+            )
+            .unwrap()
+            .unwrap();
+            crate::pinning::zip_policy::capture_zip_intent(
+                state.pinning.effective_config(),
+                state.pinning.decompress_zip_config(),
+                state.pinning.control_mode(),
+                crate::pinning::zip_policy::ZipCaptureContext {
+                    bucket: "bucket",
+                    source_key: "archive.zip",
+                    target_prefix: prefix,
+                    tags,
+                },
+                &controls,
+                DecisionOrigin::new("test", "upload-1"),
+            )
+            .unwrap()
+        });
+        let txn = state.store.db().begin().await.unwrap();
+        if let Some(intent) = &intent {
+            crate::store::import::ownership::lock_bucket_for_ownership(&txn, "bucket")
+                .await
+                .unwrap();
+            let mut admission = legacy_batch_admission(
+                "mpu",
+                "upload-1",
+                "test",
+                "bucket",
+                "archive.zip",
+                intent.target_prefix(),
+                intent.controls().root.enabled(),
+            );
+            admission.captured_options = serde_json::json!({
+                "root_enabled": intent.controls().root.enabled(),
+                "target_prefix": intent.target_prefix(),
+                "result_enabled": intent.controls().result_enabled,
+                "zip_intent": intent,
+                "tags": tags,
+            })
+            .to_string();
+            let original =
+                crate::store::zip::BatchAdmission::admit_legacy_in_transaction(&txn, &admission)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                crate::store::pinning::publication::decode_zip_capture_json(
+                    &original.captured_options,
+                )
+                .unwrap(),
+                *intent,
+            );
+        }
+        crate::store::multipart::create_upload_with_zip_intent(
+            &txn,
             "upload-1",
             "encryption-object-1",
             "bucket",
@@ -2003,12 +2138,15 @@ mod tests {
             None,
             Some("application/zip"),
             None,
-            &[],
+            tags,
             target,
             return_result_xml,
+            intent.as_ref().map(|intent| intent.source_decision()),
+            intent.as_ref(),
         )
         .await
         .unwrap();
+        txn.commit().await.unwrap();
         crate::store::multipart::upsert_part(
             state.store.db(),
             "upload-1",
@@ -2042,8 +2180,12 @@ mod tests {
         add_bodies: Vec<&'static str>,
     ) -> (DecompressZipRoute, Arc<AppState>, MockServer) {
         let part_size = archive_body.len() as i64;
-        let (route, state, kubo) =
-            pinning_route_with_mock_kubo(add_bodies, archive_body, "always", provider_mode).await;
+        let (route, state, kubo) = route_with_mock_kubo_and_coordinator(
+            add_bodies,
+            archive_body,
+            pinning_coordinator_with_zip_auto("always", provider_mode, Some(true)),
+        )
+        .await;
         crate::store::bucket::create(state.store.db(), "bucket", None)
             .await
             .unwrap();
@@ -2053,47 +2195,7 @@ mod tests {
             ObjectTag::new("ipfs-s3:duration", "1h"),
             ObjectTag::new("ipfs-s3:content", "decompressed"),
         ];
-        let (_, decision) = state
-            .pinning
-            .policy()
-            .evaluate_publication_decision(
-                PublicationContext {
-                    bucket: "bucket",
-                    key: "archive.zip",
-                    tags: &tags,
-                    is_decompress_zip: true,
-                },
-                DecisionOrigin::new("test", "upload-1"),
-            )
-            .unwrap();
-        crate::store::multipart::create_upload_with_decision(
-            state.store.db(),
-            "upload-1",
-            "encryption-object-1",
-            "bucket",
-            "archive.zip",
-            "none",
-            None,
-            None,
-            Some("application/zip"),
-            None,
-            &tags,
-            Some("prefix/"),
-            true,
-            Some(&decision),
-        )
-        .await
-        .unwrap();
-        crate::store::multipart::upsert_part(
-            state.store.db(),
-            "upload-1",
-            1,
-            "QmPart",
-            part_size,
-            "QmPart",
-        )
-        .await
-        .unwrap();
+        seed_plain_multipart_with_tags(&state, Some("prefix/"), true, part_size, &tags).await;
         (route, state, kubo)
     }
 
@@ -2532,9 +2634,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_path_and_query_decodes_once_and_last_values_win() {
+    fn parse_path_and_query_decodes_once_and_rejects_duplicate_controls() {
         let parsed = parse_decompress_put_uri(
-            &"/bucket/folder%20a%252F/archive.zip?decompress-zip=ignored&decompress-zip=prefix%2Fnested%2F&decompress-zip-result=true&decompress-zip-result=false"
+            &"/bucket/folder%20a%252F/archive.zip?decompress-zip=prefix%2Fnested%2F&decompress-zip-result=false"
                 .parse::<Uri>()
                 .unwrap(),
         )
@@ -2544,6 +2646,15 @@ mod tests {
         assert_eq!(parsed.key, "folder a%2F/archive.zip");
         assert_eq!(parsed.target_prefix, "prefix/nested/");
         assert!(!parsed.return_result_xml);
+
+        for uri in [
+            "/bucket/folder%20a%252F/archive.zip?decompress-zip=ignored&decompress-zip=prefix%2Fnested%2F&decompress-zip-result=true&decompress-zip-result=false",
+            "/bucket/archive.zip?decompress-zip=prefix%2F&decompress%2Dzip=prefix%2F",
+            "/bucket/archive.zip?decompress-zip=prefix%2F&decompress-zip-result=false&decompress-zip-result=false",
+        ] {
+            let error = parse_decompress_put_uri(&uri.parse().unwrap()).unwrap_err();
+            assert_eq!(error.code().as_str(), "InvalidRequest", "{uri}");
+        }
     }
 
     #[test]
@@ -2742,225 +2853,283 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pinning_decompressed_targets_successful_entries_not_archive_and_generated_has_no_lease()
-     {
+    async fn pinning_decompressed_preserves_archive_manual_and_output_automatic_ownership() {
         use crate::store::entities::{object_tag, object_version, pin_lease};
 
-        let archive_body = zip(&[ZipEntryFixture {
-            name: b"file.txt",
-            data: HELLO,
-        }]);
-        let (route, state, _kubo) = pinning_route_with_mock_kubo(
-            vec![
-                "{\"Hash\":\"QmArchive\",\"Size\":\"13\"}\n",
-                "{\"Hash\":\"QmEntry\",\"Size\":\"5\"}\n",
-            ],
-            archive_body,
-            "always",
-            "one",
-        )
-        .await;
-        crate::store::bucket::create(state.store.db(), "bucket", None)
-            .await
-            .unwrap();
+        for auto_pin_outputs in [false, true] {
+            let archive_body = zip(&[ZipEntryFixture {
+                name: b"file.txt",
+                data: HELLO,
+            }]);
+            let (route, state, _kubo) = route_with_mock_kubo_and_coordinator(
+                vec![
+                    "{\"Hash\":\"QmArchive\",\"Size\":\"13\"}\n",
+                    "{\"Hash\":\"QmEntry\",\"Size\":\"5\"}\n",
+                ],
+                archive_body,
+                pinning_coordinator_with_zip_auto("always", "one", Some(auto_pin_outputs)),
+            )
+            .await;
+            crate::store::bucket::create(state.store.db(), "bucket", None)
+                .await
+                .unwrap();
 
-        route
-            .call(decompressed_tagging_request(
-                Method::PUT,
-                "/bucket/archive.zip?decompress-zip=prefix/",
-                Body::from("archive bytes".to_owned()),
-            ))
-            .await
-            .unwrap();
+            route
+                .call(decompressed_tagging_request(
+                    Method::PUT,
+                    "/bucket/archive.zip?decompress-zip=prefix/",
+                    Body::from("archive bytes".to_owned()),
+                ))
+                .await
+                .unwrap();
 
-        let leases = archive_leases(&state).await;
-        assert_eq!(leases.len(), 2);
-        let archive = crate::store::object::get_latest(state.store.db(), "bucket", "archive.zip")
-            .await
-            .unwrap();
-        let version = object_version::Entity::find()
-            .filter(object_version::Column::ObjectId.eq(&archive.id))
-            .one(state.store.db())
-            .await
-            .unwrap()
-            .unwrap();
-        let decision =
-            crate::store::pinning::decision::read_for_version(state.store.db(), &version.id)
+            let leases = archive_leases(&state).await;
+            assert_eq!(leases.len(), 1);
+            let archive =
+                crate::store::object::get_latest(state.store.db(), "bucket", "archive.zip")
+                    .await
+                    .unwrap();
+            let version = object_version::Entity::find()
+                .filter(object_version::Column::ObjectId.eq(&archive.id))
+                .one(state.store.db())
                 .await
                 .unwrap()
                 .unwrap();
-        assert_eq!(decision.origin.principal_id, "test");
-        uuid::Uuid::parse_str(&decision.origin.request_id).unwrap();
-        assert_ne!(decision.origin.request_id, "preflight");
-        let automatic = leases
-            .iter()
-            .find(|lease| lease.source == "automatic")
-            .unwrap();
-        let manual = leases
-            .iter()
-            .find(|lease| lease.source == "manual")
-            .unwrap();
-        assert_eq!(
-            lease_target_cids(&state, &automatic.id).await,
-            vec!["QmArchive"]
-        );
-        assert_eq!(lease_target_cids(&state, &manual.id).await, vec!["QmEntry"]);
+            let decision =
+                crate::store::pinning::decision::read_for_version(state.store.db(), &version.id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(decision.origin.principal_id, "test");
+            uuid::Uuid::parse_str(&decision.origin.request_id).unwrap();
+            assert_ne!(decision.origin.request_id, "preflight");
+            let manual = leases
+                .iter()
+                .find(|lease| lease.source == "manual")
+                .unwrap();
+            assert_eq!(manual.owner_object_id, archive.id);
+            assert_eq!(manual.provider_mode, "one");
+            assert_eq!((manual.expires_at - manual.created_at).num_seconds(), 3600);
+            assert_eq!(lease_target_cids(&state, &manual.id).await, vec!["QmEntry"]);
 
-        let entry = crate::store::object::get_latest(state.store.db(), "bucket", "prefix/file.txt")
-            .await
-            .unwrap();
-        assert_eq!(
-            pin_lease::Entity::find()
+            let entry =
+                crate::store::object::get_latest(state.store.db(), "bucket", "prefix/file.txt")
+                    .await
+                    .unwrap();
+            let output_leases = pin_lease::Entity::find()
                 .filter(pin_lease::Column::OwnerObjectId.eq(&entry.id))
-                .count(state.store.db())
+                .all(state.store.db())
                 .await
-                .unwrap(),
-            0
-        );
-        assert_eq!(
-            object_tag::Entity::find()
-                .filter(object_tag::Column::ObjectId.eq(entry.id))
-                .count(state.store.db())
-                .await
-                .unwrap(),
-            0
-        );
+                .unwrap();
+            assert_eq!(output_leases.len(), usize::from(auto_pin_outputs));
+            for automatic in &output_leases {
+                assert_eq!(automatic.source, "automatic");
+                assert_eq!(automatic.owner_object_id, entry.id);
+                assert_eq!(automatic.provider_mode, "one");
+                assert_eq!(
+                    (automatic.expires_at - automatic.created_at).num_seconds(),
+                    3600
+                );
+                assert_eq!(
+                    lease_target_cids(&state, &automatic.id).await,
+                    vec!["QmEntry"]
+                );
+            }
+            assert_eq!(
+                pin_lease::Entity::find()
+                    .count(state.store.db())
+                    .await
+                    .unwrap(),
+                1 + u64::from(auto_pin_outputs),
+            );
+            assert_eq!(
+                object_tag::Entity::find()
+                    .filter(object_tag::Column::ObjectId.eq(entry.id))
+                    .count(state.store.db())
+                    .await
+                    .unwrap(),
+                0
+            );
+        }
     }
 
     #[tokio::test]
     async fn pinning_partial_extraction_targets_only_successfully_staged_entry() {
-        let archive_body = zip(&[
-            ZipEntryFixture {
-                name: b"failed.txt",
-                data: HELLO,
-            },
-            ZipEntryFixture {
-                name: b"published.txt",
-                data: HELLO,
-            },
-        ]);
-        let (route, state, kubo) = route_with_mock_kubo_responses_and_coordinator(
-            vec![
-                ResponseTemplate::new(200)
-                    .set_body_string("{\"Hash\":\"QmArchive\",\"Size\":\"13\"}\n"),
-                ResponseTemplate::new(500).set_body_string("forced entry add failure"),
-                ResponseTemplate::new(200)
-                    .set_body_string("{\"Hash\":\"QmPublished\",\"Size\":\"5\"}\n"),
-            ],
-            archive_body,
-            pinning_coordinator("always", "one"),
-        )
-        .await;
-        crate::store::bucket::create(state.store.db(), "bucket", None)
-            .await
-            .unwrap();
+        use crate::store::entities::pin_lease;
 
-        let response = route
-            .call(decompressed_tagging_request(
-                Method::PUT,
-                "/bucket/archive.zip?decompress-zip=prefix/",
-                Body::from("archive bytes".to_owned()),
-            ))
-            .await
-            .unwrap();
-        let xml = response.output.collect().await.unwrap().to_bytes();
-        let xml = std::str::from_utf8(&xml).unwrap();
-        assert!(xml.contains("<EntryName>failed.txt</EntryName>"));
-        assert!(xml.contains("<Code>EntryUploadFailed</Code>"));
-        assert!(xml.contains("<Key>prefix/published.txt</Key>"));
-
-        assert!(
-            crate::store::object::get_latest(state.store.db(), "bucket", "prefix/failed.txt",)
-                .await
-                .is_err()
-        );
-        let published =
-            crate::store::object::get_latest(state.store.db(), "bucket", "prefix/published.txt")
+        for auto_pin_outputs in [false, true] {
+            let archive_body = zip(&[
+                ZipEntryFixture {
+                    name: b"failed.txt",
+                    data: HELLO,
+                },
+                ZipEntryFixture {
+                    name: b"published.txt",
+                    data: HELLO,
+                },
+            ]);
+            let (route, state, kubo) = route_with_mock_kubo_responses_and_coordinator(
+                vec![
+                    ResponseTemplate::new(200)
+                        .set_body_string("{\"Hash\":\"QmArchive\",\"Size\":\"13\"}\n"),
+                    ResponseTemplate::new(500).set_body_string("forced entry add failure"),
+                    ResponseTemplate::new(200)
+                        .set_body_string("{\"Hash\":\"QmPublished\",\"Size\":\"5\"}\n"),
+                ],
+                archive_body,
+                pinning_coordinator_with_zip_auto("always", "one", Some(auto_pin_outputs)),
+            )
+            .await;
+            crate::store::bucket::create(state.store.db(), "bucket", None)
                 .await
                 .unwrap();
-        assert_eq!(published.cid, "QmPublished");
-        let leases = archive_leases(&state).await;
-        let automatic = leases
-            .iter()
-            .find(|lease| lease.source == "automatic")
+
+            let response = route
+                .call(decompressed_tagging_request(
+                    Method::PUT,
+                    "/bucket/archive.zip?decompress-zip=prefix/",
+                    Body::from("archive bytes".to_owned()),
+                ))
+                .await
+                .unwrap();
+            let xml = response.output.collect().await.unwrap().to_bytes();
+            let xml = std::str::from_utf8(&xml).unwrap();
+            assert!(xml.contains("<EntryName>failed.txt</EntryName>"));
+            assert!(xml.contains("<Code>EntryUploadFailed</Code>"));
+            assert!(xml.contains("<Key>prefix/published.txt</Key>"));
+
+            assert!(
+                crate::store::object::get_latest(state.store.db(), "bucket", "prefix/failed.txt",)
+                    .await
+                    .is_err()
+            );
+            let published = crate::store::object::get_latest(
+                state.store.db(),
+                "bucket",
+                "prefix/published.txt",
+            )
+            .await
             .unwrap();
-        let manual = leases
-            .iter()
-            .find(|lease| lease.source == "manual")
-            .unwrap();
-        assert_eq!(
-            lease_target_cids(&state, &automatic.id).await,
-            vec!["QmArchive"]
-        );
-        assert_eq!(
-            lease_target_cids(&state, &manual.id).await,
-            vec!["QmPublished"]
-        );
-        assert_no_pin_removes(&kubo, &["QmArchive", "QmPublished"]).await;
+            assert_eq!(published.cid, "QmPublished");
+            let leases = archive_leases(&state).await;
+            assert_eq!(leases.len(), 1);
+            let manual = leases
+                .iter()
+                .find(|lease| lease.source == "manual")
+                .unwrap();
+            assert_eq!(
+                lease_target_cids(&state, &manual.id).await,
+                vec!["QmPublished"]
+            );
+            let output_leases = pin_lease::Entity::find()
+                .filter(pin_lease::Column::OwnerObjectId.eq(&published.id))
+                .all(state.store.db())
+                .await
+                .unwrap();
+            assert_eq!(output_leases.len(), usize::from(auto_pin_outputs));
+            for automatic in &output_leases {
+                assert_eq!(automatic.source, "automatic");
+                assert_eq!(automatic.owner_object_id, published.id);
+                assert_eq!(
+                    lease_target_cids(&state, &automatic.id).await,
+                    vec!["QmPublished"]
+                );
+            }
+            assert_eq!(
+                pin_lease::Entity::find()
+                    .count(state.store.db())
+                    .await
+                    .unwrap(),
+                1 + u64::from(auto_pin_outputs)
+            );
+            assert_no_pin_removes(&kubo, &["QmArchive", "QmPublished"]).await;
+        }
     }
 
     #[tokio::test]
     async fn pinning_decompressed_provider_all_mode_targets_each_entry_on_each_provider() {
-        let archive_body = zip(&[ZipEntryFixture {
-            name: b"file.txt",
-            data: HELLO,
-        }]);
-        let (route, state, _kubo) = pinning_route_with_mock_kubo(
-            vec![
-                "{\"Hash\":\"QmArchive\",\"Size\":\"13\"}\n",
-                "{\"Hash\":\"QmEntry\",\"Size\":\"5\"}\n",
-            ],
-            archive_body,
-            "always",
-            "all",
-        )
-        .await;
-        crate::store::bucket::create(state.store.db(), "bucket", None)
-            .await
-            .unwrap();
+        use crate::store::entities::pin_lease;
 
-        route
-            .call(decompressed_tagging_request(
-                Method::PUT,
-                "/bucket/archive.zip?decompress-zip=prefix/",
-                Body::from("archive bytes".to_owned()),
-            ))
-            .await
-            .unwrap();
+        for auto_pin_outputs in [false, true] {
+            let archive_body = zip(&[ZipEntryFixture {
+                name: b"file.txt",
+                data: HELLO,
+            }]);
+            let (route, state, _kubo) = route_with_mock_kubo_and_coordinator(
+                vec![
+                    "{\"Hash\":\"QmArchive\",\"Size\":\"13\"}\n",
+                    "{\"Hash\":\"QmEntry\",\"Size\":\"5\"}\n",
+                ],
+                archive_body,
+                pinning_coordinator_with_zip_auto("always", "all", Some(auto_pin_outputs)),
+            )
+            .await;
+            crate::store::bucket::create(state.store.db(), "bucket", None)
+                .await
+                .unwrap();
 
-        let leases = archive_leases(&state).await;
-        let automatic = leases
-            .iter()
-            .find(|lease| lease.source == "automatic")
-            .unwrap();
-        let manual = leases
-            .iter()
-            .find(|lease| lease.source == "manual")
-            .unwrap();
-        let automatic_pairs = lease_targets(&state, &automatic.id)
-            .await
-            .into_iter()
-            .map(|target| (target.provider, target.cid))
-            .collect::<Vec<_>>();
-        let manual_pairs = lease_targets(&state, &manual.id)
-            .await
-            .into_iter()
-            .map(|target| (target.provider, target.cid))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            automatic_pairs,
-            vec![
-                ("alpha".to_owned(), "QmArchive".to_owned()),
-                ("beta".to_owned(), "QmArchive".to_owned()),
-            ]
-        );
-        assert_eq!(
-            manual_pairs,
-            vec![
-                ("alpha".to_owned(), "QmEntry".to_owned()),
-                ("beta".to_owned(), "QmEntry".to_owned()),
-            ]
-        );
+            route
+                .call(decompressed_tagging_request(
+                    Method::PUT,
+                    "/bucket/archive.zip?decompress-zip=prefix/",
+                    Body::from("archive bytes".to_owned()),
+                ))
+                .await
+                .unwrap();
+
+            let leases = archive_leases(&state).await;
+            assert_eq!(leases.len(), 1);
+            let manual = leases
+                .iter()
+                .find(|lease| lease.source == "manual")
+                .unwrap();
+            let manual_pairs = lease_targets(&state, &manual.id)
+                .await
+                .into_iter()
+                .map(|target| (target.provider, target.cid))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                manual_pairs,
+                vec![
+                    ("alpha".to_owned(), "QmEntry".to_owned()),
+                    ("beta".to_owned(), "QmEntry".to_owned()),
+                ]
+            );
+            let output =
+                crate::store::object::get_latest(state.store.db(), "bucket", "prefix/file.txt")
+                    .await
+                    .unwrap();
+            let output_leases = pin_lease::Entity::find()
+                .filter(pin_lease::Column::OwnerObjectId.eq(&output.id))
+                .all(state.store.db())
+                .await
+                .unwrap();
+            assert_eq!(output_leases.len(), usize::from(auto_pin_outputs));
+            for automatic in &output_leases {
+                assert_eq!(automatic.source, "automatic");
+                assert_eq!(automatic.owner_object_id, output.id);
+                assert_eq!(automatic.provider_mode, "all");
+                let pairs = lease_targets(&state, &automatic.id)
+                    .await
+                    .into_iter()
+                    .map(|target| (target.provider, target.cid))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    pairs,
+                    vec![
+                        ("alpha".to_owned(), "QmEntry".to_owned()),
+                        ("beta".to_owned(), "QmEntry".to_owned())
+                    ]
+                );
+            }
+            assert_eq!(
+                pin_lease::Entity::find()
+                    .count(state.store.db())
+                    .await
+                    .unwrap(),
+                1 + u64::from(auto_pin_outputs)
+            );
+        }
     }
 
     #[tokio::test]
@@ -3459,9 +3628,12 @@ mod tests {
         .await
         .unwrap();
 
-        for control in [
-            "ipfs-s3%3Apin=TRUE",
-            "ipfs-s3%3Apin=true&ipfs-s3%3Aduration=25h",
+        for (control, expected_code) in [
+            ("ipfs-s3%3Apin=TRUE", "InvalidRequest"),
+            (
+                "ipfs-s3%3Apin=true&ipfs-s3%3Aduration=25h",
+                "InvalidArgument",
+            ),
         ] {
             let mut request = signed_route_request(
                 Method::PUT,
@@ -3472,7 +3644,22 @@ mod tests {
                 .headers
                 .insert("x-amz-tagging", control.parse().unwrap());
             let error = route.call(request).await.unwrap_err();
-            assert_eq!(error.code().as_str(), "InvalidArgument");
+            assert_eq!(error.code().as_str(), expected_code, "{control}");
+        }
+        for query in [
+            "decompress-zip=prefix%2F&decompress%2Dzip=prefix%2F",
+            "decompress-zip=ignored&decompress-zip=prefix%2F",
+            "decompress-zip=prefix%2F&decompress-zip-result=false&decompress-zip-result=false",
+        ] {
+            let error = route
+                .call(signed_route_request(
+                    Method::PUT,
+                    &format!("/bucket/archive.zip?{query}"),
+                    Body::from("archive bytes".to_owned()),
+                ))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code().as_str(), "InvalidRequest", "{query}");
         }
         let db = state.store.db();
         assert_eq!(
@@ -3507,6 +3694,14 @@ mod tests {
         );
         assert_eq!(current.generation, writer.expected_generation);
         assert!(kubo.received_requests().await.unwrap().is_empty());
+        assert_no_zip_publication_rows(&state).await;
+        assert_eq!(
+            crate::store::entities::zip_batch::Entity::find()
+                .count(db)
+                .await
+                .unwrap(),
+            0
+        );
         crate::store::import::ownership::release_standard_mutation(db, &writer)
             .await
             .unwrap();
@@ -3733,7 +3928,7 @@ mod tests {
 
         let error = route.call(request).await.unwrap_err();
 
-        assert_eq!(error.code().as_str(), "InvalidArgument");
+        assert_eq!(error.code().as_str(), "InvalidRequest");
         assert!(
             kubo.received_requests()
                 .await
@@ -3742,6 +3937,14 @@ mod tests {
                 .all(|request| request.url.path() != "/api/v0/add")
         );
         assert_no_zip_publication_rows(&state).await;
+        assert!(kubo.received_requests().await.unwrap().is_empty());
+        assert_eq!(
+            crate::store::entities::zip_batch::Entity::find()
+                .count(state.store.db())
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -3944,6 +4147,7 @@ mod tests {
             .unwrap();
         assert_eq!(archive.cid, "QmRoot");
         assert!(archive.multipart);
+        assert_eq!(archive.size, archive_size);
         assert_eq!(
             object_tag::Entity::find()
                 .filter(object_tag::Column::ObjectId.eq(&archive.id))
@@ -3952,13 +4156,14 @@ mod tests {
                 .unwrap(),
             4
         );
-        let entry_ids = object::Entity::find()
+        let entries = object::Entity::find()
             .filter(object::Column::Key.is_in(["prefix/a.txt", "prefix/b.txt"]))
             .all(state.store.db())
             .await
-            .unwrap()
-            .into_iter()
-            .map(|entry| entry.id)
+            .unwrap();
+        let entry_ids = entries
+            .iter()
+            .map(|entry| entry.id.clone())
             .collect::<Vec<_>>();
         assert_eq!(entry_ids.len(), 2);
         assert_eq!(
@@ -3969,29 +4174,40 @@ mod tests {
                 .unwrap(),
             0
         );
-        assert_eq!(
-            pin_lease::Entity::find()
-                .filter(pin_lease::Column::OwnerObjectId.is_in(entry_ids))
-                .count(state.store.db())
+        let output_leases = pin_lease::Entity::find()
+            .filter(pin_lease::Column::OwnerObjectId.is_in(entry_ids))
+            .all(state.store.db())
+            .await
+            .unwrap();
+        assert_eq!(output_leases.len(), 2);
+        for entry in &entries {
+            let automatic = output_leases
+                .iter()
+                .find(|lease| lease.owner_object_id == entry.id)
+                .unwrap();
+            assert_eq!(automatic.source, "automatic");
+            assert_eq!(automatic.provider_mode, "all");
+            let pairs = lease_targets(&state, &automatic.id)
                 .await
-                .unwrap(),
-            0
-        );
+                .into_iter()
+                .map(|target| (target.provider, target.cid))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                pairs,
+                vec![
+                    ("alpha".to_owned(), entry.cid.clone()),
+                    ("beta".to_owned(), entry.cid.clone())
+                ]
+            );
+        }
 
         let leases = archive_leases(&state).await;
-        assert_eq!(leases.len(), 2);
-        let automatic = leases
-            .iter()
-            .find(|lease| lease.source == "automatic")
-            .unwrap();
+        assert_eq!(leases.len(), 1);
         let manual = leases
             .iter()
             .find(|lease| lease.source == "manual")
             .unwrap();
-        assert_eq!(
-            lease_target_cids(&state, &automatic.id).await,
-            vec!["QmRoot", "QmRoot"]
-        );
+        assert_eq!(manual.owner_object_id, archive.id);
         assert_eq!(
             lease_target_cids(&state, &manual.id).await,
             vec!["QmEntryA", "QmEntryA", "QmEntryB", "QmEntryB"]
@@ -4001,14 +4217,14 @@ mod tests {
                 .count(state.store.db())
                 .await
                 .unwrap(),
-            6
+            4
         );
         assert_eq!(
             pin_job::Entity::find()
                 .count(state.store.db())
                 .await
                 .unwrap(),
-            6
+            4
         );
         for provider in ["alpha", "beta"] {
             let usage = pin_provider_usage::Entity::find_by_id(provider)
@@ -4016,9 +4232,16 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(usage.reserved_pins, 3);
-            assert_eq!(usage.reserved_bytes, archive_size + 10);
+            assert_eq!(usage.reserved_pins, 2);
+            assert_eq!(usage.reserved_bytes, 10);
         }
+        assert_eq!(
+            pin_lease::Entity::find()
+                .count(state.store.db())
+                .await
+                .unwrap(),
+            3
+        );
     }
 
     #[tokio::test]

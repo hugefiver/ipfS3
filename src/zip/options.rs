@@ -1,15 +1,10 @@
 //! Versioned ZIP request contract. Pass only headers from an authenticated
 //! `S3Request`; this parser does not authenticate the request itself.
 //!
-//! v2 requires header-SigV4 Authorization signing each of these ASCII headers:
-//! `x-ipfs3-zip-contract: v2`, `x-ipfs3-zip-publish-source: true|false`,
-//! `x-ipfs3-zip-publish-extracted: true|false`,
-//! `x-ipfs3-zip-targets: none|source|extracted|both`, and
-//! `x-ipfs3-zip-token: [A-Za-z0-9._~-]{1,128}`. `x-amz-tagging` must also be
-//! signed if present. The v2 result cannot be disabled. Legacy requests with
-//! none of these headers retain the old contract.
+//! Authentication and bucket authorization remain s3s responsibilities. No
+//! Authorization reparse or additional SignedHeaders contract lives here.
 
-use http::{HeaderMap, header::AUTHORIZATION};
+use http::HeaderMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -26,6 +21,15 @@ const V2_HEADERS: [&str; 5] = [
     ZIP_TARGETS,
     ZIP_TOKEN,
 ];
+
+mod controls;
+pub use controls::{ParsedZipControls, parse_authenticated_zip_controls};
+pub(crate) use controls::{parse_authenticated_zip_query, parse_authenticated_zip_tagging};
+mod historical;
+pub use historical::{HistoricalZipOptions, decode_historical_zip_options};
+#[cfg(test)]
+#[path = "options/tests.rs"]
+mod control_tests;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ZipOptions {
@@ -104,53 +108,15 @@ fn single<'a>(headers: &'a HeaderMap, name: &str) -> s3s::S3Result<&'a str> {
         .map_err(|_| invalid("invalid ZIP v2 control header"))
 }
 
-fn bool_header(headers: &HeaderMap, name: &str) -> s3s::S3Result<bool> {
+fn bool_header(headers: &HeaderMap, name: &str, default: bool) -> s3s::S3Result<bool> {
+    if !headers.contains_key(name) {
+        return Ok(default);
+    }
     match single(headers, name)? {
         "true" => Ok(true),
         "false" => Ok(false),
         _ => Err(invalid("ZIP v2 booleans must be exactly true or false")),
     }
-}
-
-/// Extracts the names that s3s used to validate a header-Authorization SigV4
-/// request. The caller MUST pass the unchanged headers from an authenticated
-/// S3Request, not a raw HTTP request or an unverified Credentials test stub.
-/// Presigned and SigV2 requests have no acceptable Authorization evidence here.
-fn signed_header_names(headers: &HeaderMap) -> s3s::S3Result<Vec<&str>> {
-    let authorization = single(headers, AUTHORIZATION.as_str())?
-        .strip_prefix("AWS4-HMAC-SHA256 Credential=")
-        .ok_or_else(|| invalid("ZIP v2 requires header SigV4 Authorization"))?;
-    let mut fields = authorization.split(", ");
-    let credential = fields.next().unwrap_or_default();
-    let names = fields
-        .next()
-        .unwrap_or_default()
-        .strip_prefix("SignedHeaders=")
-        .ok_or_else(|| invalid("ZIP v2 requires SigV4 SignedHeaders"))?;
-    let signature = fields
-        .next()
-        .unwrap_or_default()
-        .strip_prefix("Signature=")
-        .ok_or_else(|| invalid("invalid ZIP v2 SigV4 Authorization"))?;
-    if fields.next().is_some()
-        || credential.is_empty()
-        || signature.len() != 64
-        || !signature.bytes().all(|b| b.is_ascii_hexdigit())
-    {
-        return Err(invalid("invalid ZIP v2 SigV4 Authorization"));
-    }
-    let names: Vec<_> = names.split(';').collect();
-    if names.iter().any(|name| {
-        name.is_empty()
-            || !name
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-    }) || names.windows(2).any(|pair| pair[0] >= pair[1])
-        || !names.contains(&"host")
-    {
-        return Err(invalid("invalid ZIP v2 SigV4 SignedHeaders"));
-    }
-    Ok(names)
 }
 
 /// For direct PUT, pass `result_enabled` from the already parsed legacy query
@@ -164,33 +130,23 @@ pub fn parse_zip_options(
     root_override: Option<bool>,
     root_default: bool,
 ) -> s3s::S3Result<ZipOptions> {
-    parse_zip_options_impl(headers, result_enabled, root_override, root_default, false)
+    // Compatibility for adapters not yet moved to parse_authenticated_zip_controls.
+    // This cannot infer server authorization: omitted targets are conservatively none.
+    parse_zip_options_impl(headers, result_enabled, root_override, root_default)
 }
 
-/// Import may commit to an immutable URL input before its worker downloads it.
-/// The signed expected digest is a promise, not proof of the actual ZIP bytes.
+/// Temporary adapter compatibility. New requests never accept a client digest;
+/// delete the optional return value when the import adapter uses the common parser.
 pub fn parse_zip_options_for_import(
     headers: &HeaderMap,
     result_enabled: bool,
     root_override: Option<bool>,
     root_default: bool,
 ) -> s3s::S3Result<(ZipOptions, Option<String>)> {
-    let options =
-        parse_zip_options_impl(headers, result_enabled, root_override, root_default, true)?;
-    let expected = if headers.contains_key(ZIP_EXPECTED_SHA256) {
-        let digest = single(headers, ZIP_EXPECTED_SHA256)?;
-        if digest.len() != 64
-            || !digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
-            return Err(invalid("invalid ZIP v2 expected SHA-256"));
-        }
-        Some(digest.to_owned())
-    } else {
-        None
-    };
-    Ok((options, expected))
+    Ok((
+        parse_zip_options(headers, result_enabled, root_override, root_default)?,
+        None,
+    ))
 }
 
 fn parse_zip_options_impl(
@@ -198,7 +154,6 @@ fn parse_zip_options_impl(
     result_enabled: bool,
     root_override: Option<bool>,
     root_default: bool,
-    allow_expected_sha256: bool,
 ) -> s3s::S3Result<ZipOptions> {
     let has_v2_header = headers
         .keys()
@@ -207,40 +162,30 @@ fn parse_zip_options_impl(
         return Ok(ZipOptions::Legacy);
     }
     if headers.keys().any(|name| {
-        name.as_str().starts_with("x-ipfs3-zip-")
-            && !V2_HEADERS.contains(&name.as_str())
-            && !(allow_expected_sha256 && name.as_str() == ZIP_EXPECTED_SHA256)
+        name.as_str().starts_with("x-ipfs3-zip-") && !V2_HEADERS.contains(&name.as_str())
     }) {
         return Err(invalid("unknown ZIP v2 control header"));
     }
     if single(headers, ZIP_CONTRACT)? != "v2" {
         return Err(invalid("unsupported ZIP contract version"));
     }
-    let signed = signed_header_names(headers)?;
-    if V2_HEADERS.iter().any(|name| !signed.contains(name)) {
-        return Err(invalid("ZIP v2 control header must be SigV4-signed"));
-    }
-    if headers.contains_key(ZIP_EXPECTED_SHA256) && !signed.contains(&ZIP_EXPECTED_SHA256) {
-        return Err(invalid("ZIP v2 expected SHA-256 must be SigV4-signed"));
-    }
-    if (root_override.is_some() && !headers.contains_key("x-amz-tagging"))
-        || (headers.contains_key("x-amz-tagging") && !signed.contains(&"x-amz-tagging"))
-    {
-        return Err(invalid("ZIP root override must be SigV4-signed"));
-    }
     if !result_enabled {
         return Err(invalid("ZIP v2 requires a result"));
     }
-    let publish_source = bool_header(headers, PUBLISH_SOURCE)?;
-    let publish_extracted = bool_header(headers, PUBLISH_EXTRACTED)?;
+    let publish_source = bool_header(headers, PUBLISH_SOURCE, true)?;
+    let publish_extracted = bool_header(headers, PUBLISH_EXTRACTED, true)?;
     if !publish_source && !publish_extracted {
         return Err(invalid("ZIP v2 must publish at least one output"));
     }
-    let targets = match single(headers, ZIP_TARGETS)? {
-        "none" => ZipTargets::None,
-        "source" => ZipTargets::Source,
-        "extracted" => ZipTargets::Extracted,
-        "both" => ZipTargets::Both,
+    let targets = match headers
+        .contains_key(ZIP_TARGETS)
+        .then(|| single(headers, ZIP_TARGETS))
+        .transpose()?
+    {
+        None | Some("none") => ZipTargets::None,
+        Some("source") => ZipTargets::Source,
+        Some("extracted") => ZipTargets::Extracted,
+        Some("both") => ZipTargets::Both,
         _ => return Err(invalid("invalid ZIP v2 targets")),
     };
     if (matches!(targets, ZipTargets::Source | ZipTargets::Both) && !publish_source)
@@ -248,7 +193,21 @@ fn parse_zip_options_impl(
     {
         return Err(invalid("ZIP targets must be published outputs"));
     }
-    let token = single(headers, ZIP_TOKEN)?;
+    if root_override == Some(true) && !publish_extracted {
+        return Err(invalid("ZIP root requires published extracted outputs"));
+    }
+    if !publish_source && !headers.contains_key(ZIP_TOKEN) {
+        return Err(invalid(
+            "ZIP source=false requires an explicit idempotency token",
+        ));
+    }
+    let generated_token;
+    let token = if headers.contains_key(ZIP_TOKEN) {
+        single(headers, ZIP_TOKEN)?
+    } else {
+        generated_token = uuid::Uuid::new_v4().to_string();
+        &generated_token
+    };
     if token.is_empty()
         || token.len() > 128
         || !token
@@ -371,6 +330,47 @@ mod tests {
     }
 
     #[test]
+    fn r25_minimal_v2_has_server_defaults_without_authorization_reparse() {
+        let mut request = HeaderMap::new();
+        request.insert(ZIP_CONTRACT, HeaderValue::from_static("v2"));
+        let ZipOptions::V2(first) = parse_zip_options(&request, true, None, true).unwrap() else {
+            panic!("expected v2")
+        };
+        assert!(first.publish_source && first.publish_extracted);
+        assert_eq!(first.targets, ZipTargets::None); // no captured server authorization yet
+        assert!(!first.token.is_empty());
+        let ZipOptions::V2(second) = parse_zip_options(&request, true, None, true).unwrap() else {
+            panic!("expected v2")
+        };
+        assert_ne!(first.token, second.token);
+        request.insert(PUBLISH_SOURCE, HeaderValue::from_static("false"));
+        assert!(parse_zip_options(&request, true, None, true).is_err());
+        request.insert(ZIP_TOKEN, HeaderValue::from_static("explicit-retry"));
+        assert!(parse_zip_options(&request, true, None, true).is_ok());
+    }
+
+    #[test]
+    fn r25_removed_digest_is_rejected_for_every_new_request() {
+        let mut request = headers("true", "true", "none");
+        request.insert(
+            ZIP_EXPECTED_SHA256,
+            HeaderValue::from_static(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+        );
+        let mut names = V2_HEADERS.to_vec();
+        names.push(ZIP_EXPECTED_SHA256);
+        signed(&mut request, &names);
+        assert_eq!(
+            parse_zip_options_for_import(&request, true, None, true)
+                .unwrap_err()
+                .code()
+                .as_str(),
+            "InvalidRequest"
+        );
+    }
+
+    #[test]
     fn legacy_unchanged_and_unsigned_v2_field_cannot_fall_back() {
         assert_eq!(
             parse_zip_options(&HeaderMap::new(), false, None, true).unwrap(),
@@ -388,23 +388,23 @@ mod tests {
     }
 
     #[test]
-    fn all_v2_controls_must_be_signed_and_authorization_must_be_parseable() {
+    fn authenticated_controls_do_not_reparse_authorization_or_require_extra_signed_headers() {
         let mut headers = headers("false", "true", "extracted");
         assert!(matches!(
             parse_zip_options(&headers, true, None, true),
             Ok(ZipOptions::V2(_))
         ));
         headers.remove(http::header::AUTHORIZATION);
-        assert!(parse_zip_options(&headers, true, None, true).is_err());
+        assert!(parse_zip_options(&headers, true, None, true).is_ok());
         signed(&mut headers, &V2_HEADERS[..4]);
-        assert!(parse_zip_options(&headers, true, None, true).is_err());
+        assert!(parse_zip_options(&headers, true, None, true).is_ok());
         signed(&mut headers, &V2_HEADERS);
-        assert!(parse_zip_options(&headers, true, Some(false), true).is_err());
+        assert!(parse_zip_options(&headers, true, Some(false), true).is_ok());
         headers.insert(
             "x-amz-tagging",
             HeaderValue::from_static("ipfs-s3%3Azip-root=false"),
         );
-        assert!(parse_zip_options(&headers, true, None, true).is_err());
+        assert!(parse_zip_options(&headers, true, None, true).is_ok());
         let mut signed_names = V2_HEADERS.to_vec();
         signed_names.push("x-amz-tagging");
         signed(&mut headers, &signed_names);
@@ -415,11 +415,11 @@ mod tests {
                 "AWS4-HMAC-SHA256 Credential=test, SignedHeaders=host, Signature=bad",
             ),
         );
-        assert!(parse_zip_options(&headers, true, Some(false), true).is_err());
+        assert!(parse_zip_options(&headers, true, Some(false), true).is_ok());
     }
 
     #[test]
-    fn import_expected_digest_is_signed_canonical_and_not_a_direct_put_control() {
+    fn import_rejects_new_digest_but_historical_decoder_preserves_it() {
         let mut request = headers("false", "true", "none");
         let digest = "a".repeat(64);
         request.insert(ZIP_EXPECTED_SHA256, HeaderValue::from_str(&digest).unwrap());
@@ -427,11 +427,19 @@ mod tests {
         let mut signed_names = V2_HEADERS.to_vec();
         signed_names.push(ZIP_EXPECTED_SHA256);
         signed(&mut request, &signed_names);
+        assert!(parse_zip_options_for_import(&request, true, None, true).is_err());
+        let ZipOptions::V2(options) =
+            parse_zip_options(&headers("false", "true", "none"), true, None, true).unwrap()
+        else {
+            panic!("v2")
+        };
+        let old = HistoricalZipOptions {
+            options,
+            expected_sha256: Some(digest.clone()),
+        };
         assert_eq!(
-            parse_zip_options_for_import(&request, true, None, true)
-                .unwrap()
-                .1,
-            Some(digest.clone())
+            decode_historical_zip_options(&serde_json::to_string(&old).unwrap(), None).unwrap(),
+            old
         );
         assert!(parse_zip_options(&request, true, None, true).is_err());
         request.append(ZIP_EXPECTED_SHA256, HeaderValue::from_str(&digest).unwrap());

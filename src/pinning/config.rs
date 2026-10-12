@@ -73,7 +73,8 @@ pub struct PinataProviderOptions {
     pub upload_endpoint: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PolicyTrigger {
     Always,
     Request,
@@ -175,7 +176,8 @@ impl fmt::Debug for SecretToken {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderLimits {
     pub priority: u32,
     pub max_bytes: i64,
@@ -218,7 +220,8 @@ impl ValidatedProvider {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ValidatedPolicy {
     pub identity: String,
     pub bucket: String,
@@ -294,14 +297,16 @@ impl ValidatedPinningConfig {
     where
         F: Fn(&str) -> Option<String>,
     {
-        Self::from_parts(
+        let validated = Self::from_parts(
             &config.pinning,
             Some(&config.pinning_identity),
             &config.pinning_rpc.providers,
             Some(&config.kubo.rpc_url),
             config.pinning_control.unavailable,
             get_env,
-        )
+        )?;
+        super::zip_policy::validate_zip_config(&config.decompress_zip, &validated)?;
+        Ok(validated)
     }
 
     fn from_parts<F>(

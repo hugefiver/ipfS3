@@ -565,6 +565,25 @@ pub async fn admit(
 }
 
 impl BatchAdmission {
+    /// Legacy admission inside the caller's ownership/Create transaction.
+    /// Caller holds the bucket ownership lock; upload/capture share this tx.
+    /// Keep the original fingerprint and input identity; never commit on error.
+    /// Token replay returns the first capture without replacing it from config.
+    pub async fn admit_legacy_in_transaction(
+        tx: &DatabaseTransaction,
+        request: &BatchAdmission,
+    ) -> AppResult<zip_batch::Model> {
+        supported(tx)?;
+        validate_admission(request)?;
+        if request.fingerprint == "pending"
+            || request.input_identity == "pending"
+            || request.input_identity.starts_with("zip-v2-source-gen:")
+        {
+            return Err(invalid());
+        }
+        insert_or_find(tx, request, false).await
+    }
+
     /// Caller holds the bucket ownership lock. Never commit on an error: the
     /// v2 guard admission and both manifests share this transaction. The v2
     /// execution alone attests the signed contract and clean input SHA-256.

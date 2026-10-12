@@ -771,19 +771,53 @@ async fn signed_v2_duplicate_token_rejects_before_body_and_without_kubo_add() {
 }
 
 #[tokio::test]
-async fn sigv4_valid_but_unsigned_v2_token_rejects_before_body_and_without_kubo_add() {
+async fn sigv4_valid_unsigned_v2_token_publishes_verified_body_and_replays_without_io() {
     let harness = new_rejection_harness().await;
     let mut missing = controls("unsigned-token");
     missing.remove("x-ipfs3-zip-token");
-    // The helper signs the request without the token. Add that control only on
-    // the wire, outside SignedHeaders: valid SigV4 auth must not allow it.
-    reject_without_sending_body(
+    // R25 accepts controls on an authenticated S3Request without a second
+    // SignedHeaders contract. The complete body is still authenticated/bound.
+    let body = legal_single_entry_zip();
+    let wire = signed_wire_headers(
         &harness,
         "decompress-zip=out%2F",
+        &body,
         missing,
         Some(("x-ipfs3-zip-token", "unsigned-token")),
-    )
-    .await;
+    );
+    let response = send_complete_wire(&harness, &wire, &body).await;
+    let xml = response.split_once("\r\n\r\n").unwrap().1;
+    assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+    assert!(xml.contains("<SourcePublished>false</SourcePublished>"));
+    assert!(xml.contains("<PublishedCount>1</PublishedCount>"));
+    assert!(xml.contains("<FailedCount>0</FailedCount>"));
+    assert!(xml.contains(&format!(
+        "<InputSHA256>{}</InputSHA256>",
+        hex::encode(Sha256::digest(&body))
+    )));
+    let db = harness.state.store.db();
+    assert_eq!(object_version::Entity::find().count(db).await.unwrap(), 1);
+    assert!(
+        store::object::get_latest(db, &harness.bucket, SOURCE)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store::object::get_latest(db, &harness.bucket, OUTPUT)
+            .await
+            .unwrap()
+            .cid,
+        "QmStagedZip"
+    );
+    assert_eq!(harness.captured_add_file_bytes().len(), 2);
+    let io = harness.kubo.received_requests().await.unwrap().len();
+    let replay = send_complete_wire(&harness, &wire, &body).await;
+    assert!(replay.starts_with("HTTP/1.1 200 "), "{replay}");
+    assert_eq!(replay.split_once("\r\n\r\n").unwrap().1, xml);
+    assert_eq!(harness.kubo.received_requests().await.unwrap().len(), io);
+    assert_eq!(object_version::Entity::find().count(db).await.unwrap(), 1);
+    assert_eq!(zip_batch::Entity::find().count(db).await.unwrap(), 1);
+    assert_eq!(remote_counts(&harness).await, (0, 0, 0));
 }
 
 #[tokio::test]
@@ -799,17 +833,48 @@ async fn signed_v2_result_false_rejects_before_body_and_without_kubo_add() {
 }
 
 #[tokio::test]
-async fn unsigned_source_content_type_rejects_before_body_and_without_mutation() {
+async fn authenticated_unsigned_source_content_type_is_published_and_contract_bound() {
     let harness = new_rejection_harness().await;
-    let before = source_snapshot(&harness).await;
-    reject_without_sending_body(
+    let body = legal_single_entry_zip();
+    let wire = signed_wire_headers(
         &harness,
         "decompress-zip=out%2F",
+        &body,
         source_controls("unsigned-content-type", false, "none"),
         Some(("Content-Type", "application/json")),
-    )
-    .await;
+    );
+    let response = send_complete_wire(&harness, &wire, &body).await;
+    assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+    let xml = response.split_once("\r\n\r\n").unwrap().1;
+    assert!(xml.contains("<SourcePublished>true</SourcePublished>"));
+    assert!(xml.contains("<PublishedCount>0</PublishedCount>"));
+    assert!(xml.contains("<ArchiveETag>\"QmStagedZip\"</ArchiveETag>"));
+    assert!(xml.contains(&format!(
+        "<InputSHA256>{}</InputSHA256>",
+        hex::encode(Sha256::digest(&body))
+    )));
+    let source = store::object::get_latest(harness.state.store.db(), &harness.bucket, SOURCE)
+        .await
+        .unwrap();
+    assert_eq!(source.content_type.as_deref(), Some("application/json"));
+    assert_eq!(source.size, body.len() as i64);
+    let before = source_snapshot(&harness).await;
+    let io = harness.kubo.received_requests().await.unwrap().len();
+    let replay = send_complete_wire(&harness, &wire, &body).await;
+    assert!(replay.starts_with("HTTP/1.1 200 "), "{replay}");
+    assert_eq!(replay.split_once("\r\n\r\n").unwrap().1, xml);
+    let changed = signed_wire_headers(
+        &harness,
+        "decompress-zip=out%2F",
+        &body,
+        source_controls("unsigned-content-type", false, "none"),
+        Some(("Content-Type", "text/plain")),
+    );
+    let conflict = send_complete_wire(&harness, &changed, &body).await;
+    assert!(conflict.starts_with("HTTP/1.1 409 "), "{conflict}");
     assert_eq!(source_snapshot(&harness).await, before);
+    assert_eq!(harness.kubo.received_requests().await.unwrap().len(), io);
+    assert_eq!(harness.captured_add_file_bytes(), vec![body]);
     let row = harness
         .state
         .store
@@ -821,8 +886,26 @@ async fn unsigned_source_content_type_rejects_before_body_and_without_mutation()
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(row.try_get::<i64>("", "total").unwrap(), 0);
+    assert_eq!(row.try_get::<i64>("", "total").unwrap(), 1);
+    assert_eq!(
+        object_version::Entity::find()
+            .count(harness.state.store.db())
+            .await
+            .unwrap(),
+        1
+    );
     assert_eq!(remote_counts(&harness).await, (0, 0, 0));
+}
+
+async fn send_complete_wire(harness: &TestHarness, headers: &str, body: &[u8]) -> String {
+    let mut stream = tokio::net::TcpStream::connect(harness.endpoint.trim_start_matches("http://"))
+        .await
+        .unwrap();
+    stream.write_all(headers.as_bytes()).await.unwrap();
+    stream.write_all(body).await.unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    String::from_utf8(response).unwrap()
 }
 
 #[tokio::test]
@@ -1628,6 +1711,7 @@ struct RuleHarness {
     state: std::sync::Arc<ipfs_s3_gateway::state::AppState>,
     _kubo: wiremock::MockServer,
     _server: support::decompress::S3ServerHandle,
+    config: Config,
 }
 
 async fn rule_harness(
@@ -1645,6 +1729,7 @@ async fn rule_harness(
         database_url = "sqlite::memory:"
         [decompress_zip]
         unixfs_directory_root = false
+        auto_pin_outputs = true
         [[pinning.providers]]
         name = "alpha"
         kind = "noop"
@@ -1724,6 +1809,7 @@ async fn rule_harness(
         state,
         _kubo: kubo.server,
         _server: server,
+        config: cfg,
     }
 }
 
@@ -2003,12 +2089,27 @@ async fn stale_captured_remote_rules_reject_a_pending_retry_before_another_kubo_
         .unwrap()
         .unwrap();
     let id: String = row.try_get("", "id").unwrap();
-    let mut captured: serde_json::Value =
-        serde_json::from_str(&row.try_get::<String>("", "captured_options").unwrap()).unwrap();
-    captured["rule_revision"] = serde_json::Value::String("revoked".into());
-    db.execute(Statement::from_sql_and_values(db.get_database_backend(),
-        "UPDATE zip_v2_executions SET captured_options=?,lease_until='2000-01-01T00:00:00Z' WHERE id=?",
-        [captured.to_string().into(), id.into()])).await.unwrap();
+    let captured: String = row.try_get("", "captured_options").unwrap();
+    db.execute(Statement::from_sql_and_values(
+        db.get_database_backend(),
+        "UPDATE zip_v2_executions SET lease_until='2000-01-01T00:00:00Z' WHERE id=?",
+        [id.clone().into()],
+    ))
+    .await
+    .unwrap();
+    let mut cfg = harness.config.clone();
+    cfg.decompress_zip.pin_output_rules[0].effect = ZipRuleEffect::Deny;
+    cfg.decompress_zip.pin_output_rules[0].policy_id = None;
+    let changed = ipfs_s3_gateway::state::AppState::new(&cfg).await.unwrap();
+    let state = std::sync::Arc::new(ipfs_s3_gateway::state::AppState {
+        kubo: harness.state.kubo.clone(),
+        cold_kubo: None,
+        store: harness.state.store.clone(),
+        credentials: harness.state.credentials.clone(),
+        master_key: ipfs_s3_gateway::crypto::key::MasterKey::from_hex(&"0".repeat(64)).unwrap(),
+        pinning: changed.pinning.clone(),
+    });
+    let server = support::decompress::start_s3_server(state, std::sync::Arc::default()).await;
     let add_count = harness
         ._kubo
         .received_requests()
@@ -2017,8 +2118,19 @@ async fn stale_captured_remote_rules_reject_a_pending_retry_before_another_kubo_
         .into_iter()
         .filter(|request| request.url.path() == "/api/v0/add")
         .count();
-    let retry = send().await;
-    assert_eq!(retry.status(), StatusCode::CONFLICT);
+    let retry = support::sigv4::send_sigv4(
+        reqwest::Method::PUT,
+        &server.endpoint,
+        &harness.bucket,
+        SOURCE,
+        QUERY,
+        legal_single_entry_zip(),
+        remote_controls("rule-revision-retry"),
+        "test",
+    )
+    .await;
+    let status = retry.status();
+    let xml = retry.text().await.unwrap();
     let final_count = harness
         ._kubo
         .received_requests()
@@ -2029,16 +2141,25 @@ async fn stale_captured_remote_rules_reject_a_pending_retry_before_another_kubo_
         .count();
     assert_eq!(
         final_count, add_count,
-        "stale policy must be rejected before any second upload"
+        "stale policy must be rejected before any second upload; status={status}; {xml}"
+    );
+    let retained = store::zip::execution::read(db, &id).await.unwrap().unwrap();
+    assert_eq!(retained.captured_options, captured);
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "{xml}; state={}; adds_before={add_count}; adds_after={final_count}",
+        retained.state
     );
 }
 
 #[tokio::test]
 async fn local_only_pending_retry_ignores_unrelated_rule_revision() {
+    let archive = legal_single_entry_zip();
     let harness = start_harness_with_root_default(
         KuboScript {
             add_replies: vec![AddReply::Ok("QmStagedZip"), AddReply::Ok("QmStagedZip")],
-            cat_bodies: HashMap::new(),
+            cat_bodies: HashMap::from([("QmStagedZip".into(), archive.clone())]),
         },
         true,
     )
@@ -2047,7 +2168,6 @@ async fn local_only_pending_retry_ignores_unrelated_rule_revision() {
     db.execute_unprepared("CREATE TRIGGER zip_v2_pending_rollback BEFORE INSERT ON zip_batches BEGIN SELECT RAISE(ABORT, 'force pending retry'); END")
         .await
         .unwrap();
-    let archive = legal_single_entry_zip();
     let send = || {
         signed_zip(
             &harness,

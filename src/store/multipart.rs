@@ -68,6 +68,61 @@ pub async fn create_upload_with_decision<C: ConnectionTrait>(
     decompress_zip_result: bool,
     decision: Option<&ExtensionDecision>,
 ) -> AppResult<()> {
+    create_upload_with_zip_intent(
+        db,
+        upload_id,
+        object_id,
+        bucket,
+        key,
+        encryption_mode,
+        key_wrap,
+        sse_c_key_fingerprint,
+        content_type,
+        metadata,
+        tags,
+        decompress_zip_target,
+        decompress_zip_result,
+        decision,
+        None,
+    )
+    .await
+}
+
+/// Called in the same Create transaction as ownership admission and the decision.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_upload_with_zip_intent<C: ConnectionTrait>(
+    db: &C,
+    upload_id: &str,
+    object_id: &str,
+    bucket: &str,
+    key: &str,
+    encryption_mode: &str,
+    key_wrap: Option<&str>,
+    sse_c_key_fingerprint: Option<&str>,
+    content_type: Option<&str>,
+    metadata: Option<JsonValue>,
+    tags: &[ObjectTag],
+    decompress_zip_target: Option<&str>,
+    decompress_zip_result: bool,
+    decision: Option<&ExtensionDecision>,
+    zip_intent: Option<&crate::pinning::zip_policy::CapturedZipIntent>,
+) -> AppResult<()> {
+    let zip_intent_json = zip_intent
+        .map(|capture| {
+            if capture.bucket() != bucket
+                || capture.source_key() != key
+                || Some(capture.target_prefix()) != decompress_zip_target
+                || capture.origin().request_id != upload_id
+                || capture.controls().result_enabled != decompress_zip_result
+                || decision != Some(capture.source_decision())
+            {
+                return Err(AppError::InvalidZipParameter(
+                    "ZIP upload capture mismatch".into(),
+                ));
+            }
+            crate::store::pinning::publication::serialize_zip_capture(capture)
+        })
+        .transpose()?;
     let pin_decision_json = decision
         .map(|decision| {
             decision
@@ -101,6 +156,7 @@ pub async fn create_upload_with_decision<C: ConnectionTrait>(
         tags_json: Set(crate::store::pinning::tags::tags_to_json(tags)
             .map_err(|_| AppError::Internal("failed to serialize multipart tags".to_owned()))?),
         pin_decision_json: Set(pin_decision_json),
+        zip_intent_json: Set(zip_intent_json),
         decompress_zip_target: Set(decompress_zip_target.map(str::to_owned)),
         decompress_zip_result: Set(decompress_zip_result),
     };
@@ -1041,6 +1097,7 @@ mod tests {
             metadata: None,
             tags_json: serde_json::json!([]),
             pin_decision_json: None,
+            zip_intent_json: None,
             decompress_zip_target: None,
             decompress_zip_result: true,
         };
@@ -1073,6 +1130,7 @@ mod tests {
             metadata: None,
             tags_json: serde_json::json!([]),
             pin_decision_json: None,
+            zip_intent_json: None,
             decompress_zip_target: None,
             decompress_zip_result: true,
         };

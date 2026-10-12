@@ -1,4 +1,4 @@
-//! Source I/O only for a claimed ZIP v2 import. The worker owns authorization,
+//! Verified source I/O for claimed ZIP imports. The worker owns authorization,
 //! claim fencing, durable binding, replay and publication; none occur here.
 
 use std::time::Duration;
@@ -8,11 +8,14 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use url::Url;
+pub(crate) mod bound;
 
 use crate::{
     import::{
+        ImportPhase,
         downloader::DownloadError,
-        pipeline::{AbortOnDropTask, ImportCoordinator},
+        pipeline::{AbortOnDropTask, ImportCoordinator, JobCancellation},
+        progress::ProgressReporter,
     },
     kubo::{KuboProgress, add::StreamAddError},
     state::AppState,
@@ -26,6 +29,7 @@ pub struct VerifiedZipSource {
     pub size: u64,
     /// Lowercase hex digest of the *entire* source, not the CID or ZIP prefix.
     pub sha256: String,
+    pub object_content_type: Option<String>,
 }
 
 /// Static, redacted failure codes. Never attach the URL, Kubo response, token,
@@ -34,8 +38,6 @@ pub struct VerifiedZipSource {
 pub enum V2SourceError {
     #[error("invalid_source_descriptor")]
     InvalidDescriptor,
-    #[error("missing_expected_sha256")]
-    MissingExpectedSha256,
     #[error("sha256_mismatch")]
     Sha256Mismatch { measured_sha256: String },
     #[error("source_denied")]
@@ -79,7 +81,6 @@ impl V2SourceError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::InvalidDescriptor => "invalid_source_descriptor",
-            Self::MissingExpectedSha256 => "missing_expected_sha256",
             Self::Sha256Mismatch { .. } => "sha256_mismatch",
             Self::SourceDenied => "source_denied",
             Self::SourceRedirected => "source_redirected",
@@ -143,12 +144,17 @@ fn kubo_error(error: crate::error::AppError) -> V2SourceError {
     }
 }
 
-fn progress_drain() -> (mpsc::Sender<KuboProgress>, AbortOnDropTask) {
+fn progress_sender(
+    reporter: Option<&ProgressReporter>,
+) -> (mpsc::Sender<KuboProgress>, Option<AbortOnDropTask>) {
+    if let Some(reporter) = reporter {
+        return (reporter.kubo.clone(), None);
+    }
     let (sender, mut receiver) = mpsc::channel(32);
     let drain = AbortOnDropTask::new(tokio::spawn(async move {
         while receiver.recv().await.is_some() {}
     }));
-    (sender, drain)
+    (sender, Some(drain))
 }
 
 /// Call only with the private descriptor retrieved after `execution::claim`.
@@ -161,6 +167,27 @@ pub async fn fetch_v2_zip_source(
     expected_sha256: Option<&str>,
     cancel: CancellationToken,
     limits: &ZipExtractionLimits,
+) -> Result<VerifiedZipSource, V2SourceError> {
+    fetch_zip_source_with_progress(
+        coordinator,
+        state,
+        source_descriptor,
+        expected_sha256,
+        cancel,
+        limits,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn fetch_zip_source_with_progress(
+    coordinator: &ImportCoordinator,
+    state: &AppState,
+    source_descriptor: &str,
+    expected_sha256: Option<&str>,
+    cancel: CancellationToken,
+    limits: &ZipExtractionLimits,
+    legacy_progress: Option<(&ProgressReporter, &JobCancellation)>,
 ) -> Result<VerifiedZipSource, V2SourceError> {
     let (kind, value): (&str, &str) =
         serde_json::from_str(source_descriptor).map_err(|_| V2SourceError::InvalidDescriptor)?;
@@ -179,7 +206,7 @@ pub async fn fetch_v2_zip_source(
     tokio::select! {
         biased;
         _ = cancel.cancelled() => Err(V2SourceError::Canceled),
-        result = tokio::time::timeout(deadline, fetch_inner(coordinator, state, kind, value, expected_sha256, cancel.clone())) => {
+        result = tokio::time::timeout(deadline, fetch_inner(coordinator, state, kind, value, expected_sha256, cancel.clone(), legacy_progress)) => {
             result.map_err(|_| V2SourceError::DeadlineExceeded)?
         }
     }
@@ -192,6 +219,7 @@ async fn fetch_inner(
     value: &str,
     expected_sha256: Option<&str>,
     cancel: CancellationToken,
+    legacy_progress: Option<(&ProgressReporter, &JobCancellation)>,
 ) -> Result<VerifiedZipSource, V2SourceError> {
     let max_bytes = coordinator
         .config()
@@ -201,9 +229,17 @@ async fn fetch_inner(
         .min(i64::MAX as u64);
     match kind {
         "url" => {
-            let expected = expected_sha256.ok_or(V2SourceError::MissingExpectedSha256)?;
             let url = Url::parse(value).map_err(|_| V2SourceError::InvalidDescriptor)?;
             let (progress, _receiver) = tokio::sync::watch::channel(0);
+            let progress = if let Some((reporter, cancellation)) = legacy_progress {
+                reporter
+                    .phase(ImportPhase::Downloading, cancellation)
+                    .await
+                    .map_err(|_| V2SourceError::Canceled)?;
+                reporter.download.clone()
+            } else {
+                progress
+            };
             let download = coordinator
                 .downloader()
                 .open(&url, progress, cancel.clone())
@@ -212,7 +248,14 @@ async fn fetch_inner(
             if download.total.is_some_and(|total| total > max_bytes) {
                 return Err(V2SourceError::SourceTooLarge);
             }
+            if let Some((reporter, cancellation)) = legacy_progress {
+                reporter
+                    .download_total(download.total, cancellation)
+                    .await
+                    .map_err(|_| V2SourceError::Canceled)?;
+            }
             let total = download.total;
+            let object_content_type = download.content_type;
             let (complete, measured) = oneshot::channel();
             let body = async_stream::stream! {
                 let mut source = download.body;
@@ -235,13 +278,18 @@ async fn fetch_inner(
                     return;
                 }
                 let sha256 = hex::encode(hasher.finalize());
-                if sha256 != expected {
-                     yield Err(V2SourceError::Sha256Mismatch { measured_sha256: sha256 });
+                if expected_sha256.is_some_and(|expected| sha256 != expected) {
+                    yield Err(V2SourceError::Sha256Mismatch { measured_sha256: sha256 });
+                    return;
+                }
+                if let Some((reporter, cancellation)) = legacy_progress
+                    && reporter.phase(ImportPhase::AddingToIpfs, cancellation).await.is_err() {
+                    yield Err(V2SourceError::Canceled);
                     return;
                 }
                 let _ = complete.send((size, sha256));
             };
-            let (progress, _drain) = progress_drain();
+            let (progress, _drain) = progress_sender(legacy_progress.map(|(reporter, _)| reporter));
             let added = crate::kubo::add::stream_add_with_progress(
                 &state.kubo,
                 body,
@@ -266,23 +314,49 @@ async fn fetch_inner(
             let cid = cid::Cid::try_from(added.cid.as_str())
                 .map_err(|_| V2SourceError::KuboTransport)?
                 .to_string();
-            let (progress, _drain) = progress_drain();
+            if let Some((reporter, cancellation)) = legacy_progress {
+                reporter
+                    .phase(ImportPhase::PinningLocal, cancellation)
+                    .await
+                    .map_err(|_| V2SourceError::Canceled)?;
+            }
+            let (progress, _drain) = progress_sender(legacy_progress.map(|(reporter, _)| reporter));
             crate::kubo::pin::pin_add_with_progress(&state.kubo, &cid, progress, cancel.clone())
                 .await
                 .map_err(kubo_error)?;
             if cancel.is_cancelled() {
                 return Err(V2SourceError::Canceled);
             }
-            Ok(VerifiedZipSource { cid, size, sha256 })
+            Ok(VerifiedZipSource {
+                cid,
+                size,
+                sha256,
+                object_content_type,
+            })
         }
         "cid" => {
             let cid = cid::Cid::try_from(value)
                 .map_err(|_| V2SourceError::InvalidDescriptor)?
                 .to_string();
-            let (progress, _drain) = progress_drain();
-            crate::kubo::pin::pin_add_with_progress(&state.kubo, &cid, progress, cancel.clone())
+            if let Some((reporter, cancellation)) = legacy_progress {
+                reporter
+                    .phase(ImportPhase::DiscoveringProviders, cancellation)
+                    .await
+                    .map_err(|_| V2SourceError::Canceled)?;
+                crate::kubo::routing::find_providers(
+                    &state.kubo,
+                    &cid,
+                    coordinator.config().raw.max_provider_records,
+                    reporter.kubo.clone(),
+                    cancel.clone(),
+                )
                 .await
                 .map_err(kubo_error)?;
+                reporter
+                    .phase(ImportPhase::Inspecting, cancellation)
+                    .await
+                    .map_err(|_| V2SourceError::Canceled)?;
+            }
             let size = crate::kubo::cat::inspect_file(&state.kubo, &cid, cancel.clone())
                 .await
                 .map_err(kubo_error)?;
@@ -321,7 +395,25 @@ async fn fetch_inner(
             if cancel.is_cancelled() {
                 return Err(V2SourceError::Canceled);
             }
-            Ok(VerifiedZipSource { cid, size, sha256 })
+            if let Some((reporter, cancellation)) = legacy_progress {
+                reporter
+                    .phase(ImportPhase::PinningLocal, cancellation)
+                    .await
+                    .map_err(|_| V2SourceError::Canceled)?;
+            }
+            let (progress, _drain) = progress_sender(legacy_progress.map(|(reporter, _)| reporter));
+            crate::kubo::pin::pin_add_with_progress(&state.kubo, &cid, progress, cancel.clone())
+                .await
+                .map_err(kubo_error)?;
+            if cancel.is_cancelled() {
+                return Err(V2SourceError::Canceled);
+            }
+            Ok(VerifiedZipSource {
+                cid,
+                size,
+                sha256,
+                object_content_type: None,
+            })
         }
         _ => Err(V2SourceError::InvalidDescriptor),
     }

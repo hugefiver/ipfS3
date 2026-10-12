@@ -610,34 +610,110 @@ physical reclaim, even after a later object delete. ZIP extraction doesn't
 support SSE-S3 or SSE-C. Root-only recovery uses the stored manifest and never
 republishes the source or extracted object versions.
 
-ZIP v2 is an explicit extension, not a change to ordinary PUT or Complete.
-It requires header-based SigV4 with every supplied control header in
-`SignedHeaders`: `x-ipfs3-zip-contract: v2`,
-`x-ipfs3-zip-publish-source: true|false`,
-`x-ipfs3-zip-publish-extracted: true|false`,
-`x-ipfs3-zip-targets: none|source|extracted|both`, and a new
-`x-ipfs3-zip-token` (1 to 128 ASCII letters, digits, `.`, `_`, `~`, or `-`).
-Sign `x-amz-tagging` when supplied; v2 URL imports also require a signed
-`x-ipfs3-zip-expected-sha256` with the expected lowercase 64-hex SHA-256 of
-the complete ZIP input. `decompress-zip-result=false` is not allowed in v2.
-When publishing the source, supplied `Content-Type` and custom metadata must
-also be signed; replay cannot change the captured source attributes.
-`source=false` publishes only successful extracted outputs. It neither
-creates nor overwrites or deletes the source key and returns no made-up archive
-ETag or VersionId. The v2 result identifies the batch, whether the source was
-published, the input SHA-256 (not an S3 ETag), the manifest, and root status.
-Remote targets are restricted to published outputs: each output's own policy,
-including private-prefix denial, intersects the signed batch target ceiling.
-An `always` rule cannot add back an excluded source or bypass a private deny.
+### ZIP output pinning and configuration migration (R25)
 
-For URL import, `202 Accepted` means admission only. The worker must fetch and
-verify the committed digest before publishing; a replay of a committed result
-uses the fixed historical input and does not re-fetch a changed URL. A crash
-before the artifact is persisted can still require another fetch. For a
-source=false MPU Complete with zero successful output files, the agreed
-behavior is a durable failed batch and the same 4xx on first completion and
-replay, queryable through the UploadId. Don't treat an open or pending batch as
-a published object or a successful remote pin.
+Legacy direct PUT, MPU Complete and durable ZIP import use one publication
+core: capture authorization at admission, bind the final successful manifest to
+the exact persisted object versions, then publish objects and their pin intents
+atomically. Automatic output pinning selects only those successful extracted
+files, never the archive, UnixFS root, failed entries, empty directories or the
+prefix itself. Ordinary non-ZIP behavior doesn't change. An explicitly requested
+manual `content=decompressed` group remains archive-owned; its existing
+cancellation scope doesn't become a prefix-wide cancellation of automatic
+output leases.
+
+`[decompress_zip].auto_pin_outputs` is the single ZIP automatic-output switch:
+omitted means the safe default, off; explicit `false` disables ZIP automatic
+outputs; explicit `true` enables selection from server-authorized policies.
+It doesn't configure a provider or prove a physical remote pin. No eligible
+provider, or only request-triggered policies, means no automatic remote work.
+Explicit `false` doesn't disable fine-grained manual requests or an explicitly
+authorized v2 target plan.
+
+When `pin_output_rules` is omitted, selection uses ordinary ordered,
+first-match `pinning.policies`. Explicit `pin_output_rules = []` authorizes no
+outputs. With rules supplied, unmatched outputs are excluded and any matching
+ZIP deny vetoes an allow. A globally denied output set creates zero automatic
+jobs. Each selected provider still has its captured TTL limits and byte/pin
+quota boundaries; logical output leases don't remove shared-CID accounting or
+turn queue admission into remote completion.
+
+An old configuration with effective Always remote policies or supplied v2
+`pin_output_rules` must choose `auto_pin_outputs` explicitly. Startup reports a
+migration error if the field is omitted, rather than silently sending newly
+selected outputs to a remote provider. Set `true` to adopt extracted-output
+automatic semantics, or `false` to disable ZIP automatic outputs without
+changing ordinary objects or manual requests. Existing captures and historical
+plans keep their recorded controls, policy, provider routes and limits across
+restart and replay; they aren't reinterpreted using the current configuration.
+Missing or unknown historical evidence requires `needs_attention`, not guessed
+defaults.
+
+### ZIP v2 request and replay contract
+
+ZIP v2 is an explicit extension, not a change to ordinary PUT or Complete.
+The minimum request has an archive key, `decompress-zip=<prefix>` and
+`x-ipfs3-zip-contract: v2` on an authenticated request. For example, these are
+the path and extension header for a direct PUT (send the ZIP body and normal
+S3 authentication through your client):
+
+```http
+PUT /my-bucket/archive.zip?decompress-zip=out%2F HTTP/1.1
+x-ipfs3-zip-contract: v2
+```
+
+Both source and extracted publication default to `true`. The optional
+`x-ipfs3-zip-publish-source` and `x-ipfs3-zip-publish-extracted` accept exactly
+`true` or `false`; both cannot be false. Optional
+`x-ipfs3-zip-targets: none|source|extracted|both` restricts remote selection to
+published kinds under server policy. Omitted targets are captured from server
+authorization, not a demand that the client choose providers or policies.
+The parser receives controls from the authenticated S3 request and doesn't
+reparse Authorization or impose an additional SignedHeaders contract.
+`decompress-zip-result=false` isn't allowed in v2.
+
+For repeatable v2 admission, supply `x-ipfs3-zip-token`, using 1 to 128 ASCII
+letters, digits, `.`, `_`, `~` or `-`. Without it, the server generates a token;
+`publish-source=false` requires an explicit token. For example, add:
+
+```http
+x-ipfs3-zip-publish-source: false
+x-ipfs3-zip-token: explicit-retry
+```
+
+The legacy import `x-ipfs3-client-token` is a separate, optional header. If
+supplied on v2 import, it must match the v2 ZIP token; it isn't a replacement
+name for that token. No client artifact digest is required. New requests reject
+`x-ipfs3-zip-expected-sha256`; decoding a persisted historical digest doesn't
+make that header valid for new admission.
+
+`publish-source=false` publishes only successful extracted outputs. It neither
+creates, overwrites nor deletes the source key, creates no virtual source, and
+returns no made-up archive ETag or VersionId. Successful v1 requests keep
+standard S3 archive `ETag = CID`, VersionId and legacy result behavior. V2 keeps
+its `ZipV2Result` shape, identifying the batch, source publication, measured
+input SHA-256 (not an S3 ETag), manifest and root status. Persisted historical
+options are decoded separately from new-request validation.
+
+Same-token direct PUT and MPU replay must still check the complete raw body or
+part identity, controls, authenticated principal and descriptor before returning
+the original receipt. Terminal URL import replay checks the descriptor and
+returns the original receipt without another source GET. A fully bound source
+survives restart without refetch; a crash before that binding can require a new
+fetch. URL imports retain the exact-origin/public-address SSRF restrictions
+below. The worker measures the whole stream's length and SHA-256, requires clean
+EOF and, for URL-to-Kubo upload, complete upload-body drain. A returned CID alone
+isn't proof that the source body was consumed or verified.
+
+`202 Accepted` still means import admission only. ZIP with SSE-S3 or SSE-C is
+rejected. For source=false MPU Complete with zero successful output files, the
+contract remains a durable failed batch and the same original 4xx failure
+receipt on completion/replay, queryable through the UploadId. Don't treat an open or pending
+batch as a published object or a successful remote pin. **R25 local isolated
+acceptance passed**, including default-concurrency regression, unchanged wire
+goldens and native PostgreSQL transaction checks. Real paid-provider accounts
+and physical remote pins remain **NOT RUN**; see
+[the verification boundaries](docs/testing.md#stage-9-r25-zip-verification).
 
 Legacy jobs, attempts, and progress are persisted. If a process or worker stops, a
 lease can expire so another worker reclaims and retries the job. This recovery

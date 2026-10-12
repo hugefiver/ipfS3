@@ -35,7 +35,7 @@ use crate::{
     zip::{extract::ExtractionObserver, response::ExtractedEntry},
 };
 
-const ARCHIVE_CID: &str = "QmArchive";
+const ARCHIVE_CID: &str = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
 const ENTRY_CID: &str = "QmEntry";
 const HELLO: &[u8] = b"hello";
 
@@ -139,28 +139,27 @@ async fn claimed_job(
     id: &str,
     archive_key: &str,
     prefix: &str,
+    archive: &[u8],
 ) -> (import_job::Model, ImportClaim) {
     let now = Utc::now();
-    ownership::submit(
-        state.store.db(),
-        NewImportJob {
-            id: id.to_owned(),
-            bucket: "bucket".to_owned(),
-            key: archive_key.to_owned(),
-            source: ImportSource::Cid(
-                "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku".to_owned(),
-            ),
-            request_fingerprint: format!("fingerprint-{id}"),
-            client_token: None,
-            object_content_type: Some("application/zip".to_owned()),
-            metadata: HashMap::from([("source".to_owned(), "test".to_owned())]),
-            tags: Vec::new(),
-            decompress_prefix: Some(prefix.to_owned()),
-        },
-        now,
-    )
-    .await
-    .unwrap();
+    let request = NewImportJob {
+        id: id.to_owned(),
+        bucket: "bucket".to_owned(),
+        key: archive_key.to_owned(),
+        source: ImportSource::Cid(
+            "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku".to_owned(),
+        ),
+        request_fingerprint: format!("fingerprint-{id}"),
+        client_token: None,
+        object_content_type: Some("application/zip".to_owned()),
+        metadata: HashMap::from([("source".to_owned(), "test".to_owned())]),
+        tags: Vec::new(),
+        decompress_prefix: Some(prefix.to_owned()),
+    };
+    let capture = crate::import::test_support::capture_legacy(state, &request, false);
+    ownership::submit_captured_zip(state.store.db(), request, capture, now)
+        .await
+        .unwrap();
     let claimed = jobs::claim_due(
         state.store.db(),
         "worker",
@@ -172,6 +171,8 @@ async fn claimed_job(
     .unwrap()
     .pop()
     .unwrap();
+    crate::import::test_support::prove_legacy_input(state, &claimed.job, &claimed.claim, archive)
+        .await;
     (claimed.job, claimed.claim)
 }
 
@@ -179,11 +180,9 @@ async fn claimed_stage4_job(
     state: &AppState,
     id: &str,
     enabled: bool,
+    archive: &[u8],
 ) -> (import_job::Model, ImportClaim) {
-    use crate::{
-        pinning::{decision::DecisionOrigin, policy::PublicationContext, tags::ZipRootCapture},
-        store::import::jobs::NewImportJob,
-    };
+    use crate::store::import::jobs::NewImportJob;
     let now = Utc::now();
     let request = NewImportJob {
         id: id.into(),
@@ -199,34 +198,10 @@ async fn claimed_stage4_job(
         tags: Vec::new(),
         decompress_prefix: Some("out/".into()),
     };
-    let (_, mut decision) = state
-        .pinning
-        .policy()
-        .evaluate_publication_decision(
-            PublicationContext {
-                bucket: "bucket",
-                key: "archive.zip",
-                tags: &[],
-                is_decompress_zip: true,
-            },
-            DecisionOrigin::new("test", id),
-        )
+    let capture = crate::import::test_support::capture_legacy(state, &request, enabled);
+    ownership::submit_captured_zip(state.store.db(), request, capture, now)
+        .await
         .unwrap();
-    decision
-        .capture_durable_revision(
-            state.pinning.effective_config(),
-            state.pinning.control_mode(),
-        )
-        .unwrap();
-    ownership::submit_decided_zip(
-        state.store.db(),
-        request,
-        decision,
-        ZipRootCapture::Configured(enabled),
-        now,
-    )
-    .await
-    .unwrap();
     let claimed = jobs::claim_due(
         state.store.db(),
         "stage4-worker",
@@ -238,7 +213,129 @@ async fn claimed_stage4_job(
     .unwrap()
     .pop()
     .unwrap();
+    crate::import::test_support::prove_legacy_input(state, &claimed.job, &claimed.claim, archive)
+        .await;
     (claimed.job, claimed.claim)
+}
+
+async fn claimed_historical_job(
+    state: &AppState,
+    id: &str,
+    archive: &[u8],
+) -> (import_job::Model, ImportClaim) {
+    use crate::pinning::{
+        config::ValidatedPinningConfig,
+        decision::DecisionOrigin,
+        policy::{PinPolicyEvaluator, PublicationContext},
+    };
+    // Known original empty configuration, not the worker's current settings.
+    let original =
+        ValidatedPinningConfig::from_raw(&crate::config::PinningConfig::default(), |_| None)
+            .unwrap();
+    let request = NewImportJob {
+        id: id.into(),
+        bucket: "bucket".into(),
+        key: "archive.zip".into(),
+        source: ImportSource::Cid(ARCHIVE_CID.into()),
+        request_fingerprint: format!("fingerprint-{id}"),
+        client_token: None,
+        object_content_type: Some("application/zip".into()),
+        metadata: HashMap::from([("source".into(), "test".into())]),
+        tags: vec![],
+        decompress_prefix: Some("out/".into()),
+    };
+    let (_, mut decision) = PinPolicyEvaluator::new(&original)
+        .evaluate_publication_decision(
+            PublicationContext {
+                bucket: &request.bucket,
+                key: &request.key,
+                tags: &request.tags,
+                is_decompress_zip: true,
+            },
+            DecisionOrigin::new("test", id),
+        )
+        .unwrap();
+    decision
+        .capture_durable_revision(&original, crate::config::OptionalPinControlMode::default())
+        .unwrap();
+    let now = Utc::now();
+    ownership::submit_decided(state.store.db(), request, decision, now)
+        .await
+        .unwrap();
+    let claimed = jobs::claim_due(
+        state.store.db(),
+        "historical-worker",
+        now,
+        now + chrono::Duration::seconds(60),
+        1,
+    )
+    .await
+    .unwrap()
+    .pop()
+    .unwrap();
+    assert!(claimed.job.zip_intent_json.is_none());
+    assert!(claimed.job.root_capture_json.is_none());
+    crate::import::test_support::prove_legacy_input(state, &claimed.job, &claimed.claim, archive)
+        .await;
+    (claimed.job, claimed.claim)
+}
+
+#[tokio::test]
+async fn historical_zip_missing_or_unknown_capture_never_inherits_current_authority() {
+    let server = MockServer::start().await;
+    let state = test_state(&server).await;
+    let archive = zip(&[("file.txt", HELLO)]);
+    let (job, claim) = claimed_historical_job(&state, "historical-boundary", &archive).await;
+    assert!(state.pinning.zip_root_default());
+    let original = crate::import::zip_capture::legacy_capture(&job).unwrap();
+    assert!(!original.controls().root.enabled());
+    assert!(original.source_decision().effective_intents.is_empty());
+
+    let config = crate::import::ImportConfig::default().validate().unwrap();
+    let coordinator = crate::import::pipeline::ImportCoordinator::new(
+        config.clone(),
+        crate::import::downloader::SourceDownloader::production(Arc::new(config)),
+    );
+    let mut missing = job.clone();
+    missing.pin_decision_json = None;
+    let mut unknown = job;
+    unknown.zip_intent_json = Some("{\"schema_version\":0}".into());
+    for invalid in [missing, unknown] {
+        let error = crate::import::pipeline::execute_job(
+            coordinator.clone(),
+            state.clone(),
+            invalid,
+            claim.clone(),
+            JobCancellation {
+                shutdown: CancellationToken::new(),
+                ownership_lost: CancellationToken::new(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ImportExecutionError::Terminal(ImportFailure {
+                code: ImportFailureCode::PublicationFailed,
+                ..
+            })
+        ));
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+    assert_eq!(
+        object::Entity::find()
+            .count(state.store.db())
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        import_job_result::Entity::find()
+            .count(state.store.db())
+            .await
+            .unwrap(),
+        0
+    );
 }
 
 #[tokio::test]
@@ -261,7 +358,7 @@ async fn stage4_off_and_zero_files_publish_archive_with_truthful_root_status() {
             mount_entry_success(&server).await;
         }
         let state = test_state(&server).await;
-        let (job, claim) = claimed_stage4_job(&state, id, enabled).await;
+        let (job, claim) = claimed_stage4_job(&state, id, enabled, &archive).await;
         decompress_import(
             &state,
             &job,
@@ -305,7 +402,7 @@ async fn stage4_root_failure_preserves_archive_entries_and_safe_failure_code() {
     mount_archive(&server, archive.clone()).await;
     mount_entry_success(&server).await; // legacy fixture CID is intentionally invalid for a directory.
     let state = test_state(&server).await;
-    let (job, claim) = claimed_stage4_job(&state, "stage4-failed", true).await;
+    let (job, claim) = claimed_stage4_job(&state, "stage4-failed", true, &archive).await;
     decompress_import(
         &state,
         &job,
@@ -418,7 +515,7 @@ async fn stage4_root_post_put_failures_retain_candidate_and_complete_import() {
 
         let state = test_state(&server).await;
         let id = format!("stage4-post-put-{}", failed_rpc.replace('/', "-"));
-        let (job, claim) = claimed_stage4_job(&state, &id, true).await;
+        let (job, claim) = claimed_stage4_job(&state, &id, true, &archive).await;
         decompress_import(
             &state,
             &job,
@@ -532,7 +629,7 @@ async fn stage4_shutdown_during_root_pin_retains_candidate_without_publication()
         .await;
 
     let state = test_state(&server).await;
-    let (job, claim) = claimed_stage4_job(&state, "stage4-shutdown-root", true).await;
+    let (job, claim) = claimed_stage4_job(&state, "stage4-shutdown-root", true, &archive).await;
     let shutdown = CancellationToken::new();
     let execution_state = state.clone();
     let execution_shutdown = shutdown.clone();
@@ -590,32 +687,107 @@ async fn stage4_reclaimed_worker_reuses_exact_prepared_manifest() {
     mount_archive(&server, archive.clone()).await;
     mount_entry_success(&server).await;
     let state = test_state(&server).await;
-    let (job, claim) = claimed_stage4_job(&state, "stage4-resume", true).await;
+    let (job, claim) = claimed_stage4_job(&state, "stage4-resume", true, &archive).await;
     let db = state.store.db();
-    crate::store::zip::admit(db, &crate::store::zip::BatchAdmission {
-        id: job.id.clone(), owner: "test".into(), source: "import".into(), token: job.id.clone(),
-        fingerprint: job.request_fingerprint.clone(), bucket: job.bucket.clone(),
-        archive_key: job.key.clone(), input_identity: job.id.clone(),
-        captured_options: serde_json::json!({"root_capture": {"configured": true}, "target_prefix": "out/", "archive_cid": ARCHIVE_CID}).to_string(),
-    }).await.unwrap();
-    crate::store::zip::prepare_manifest(
+    struct PreparedBoundary(tokio::sync::Notify);
+    #[async_trait::async_trait]
+    impl crate::import::pipeline::ImportExecutionObserver for PreparedBoundary {
+        async fn before_publication(&self, _: &str) {
+            self.0.notify_one();
+            std::future::pending::<()>().await;
+        }
+    }
+    let boundary = Arc::new(PreparedBoundary(tokio::sync::Notify::new()));
+    let cancellation = JobCancellation {
+        shutdown: CancellationToken::new(),
+        ownership_lost: CancellationToken::new(),
+    };
+    let first_state = state.clone();
+    let first_job = job.clone();
+    let first_claim = claim.clone();
+    let first_cancel = cancellation.clone();
+    let first_boundary = boundary.clone();
+    let mut first = tokio::spawn(async move {
+        let reporter = ProgressReporter::start(
+            first_state.clone(),
+            &first_job,
+            first_claim.clone(),
+            first_cancel.clone(),
+            Duration::from_millis(5),
+        );
+        let result = decompress_import_with_context(
+            &first_state,
+            &first_job,
+            artifact(archive.len()),
+            &first_claim,
+            &first_cancel,
+            &reporter,
+            MAX_DECOMPRESSED_ARCHIVE_BYTES,
+            first_boundary.as_ref(),
+        )
+        .await;
+        let _ = reporter.finish(&first_cancel).await;
+        result
+    });
+    tokio::select! {
+        result = &mut first => panic!("valid first attempt did not freeze: {result:?}"),
+        _ = boundary.0.notified() => {}
+    }
+    assert!(
+        crate::store::zip::read(db, &job.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .manifest_prepared
+    );
+    cancellation.shutdown.cancel();
+    assert!(matches!(
+        first.await.unwrap(),
+        Err(ImportExecutionError::Interrupted)
+    ));
+    let now = Utc::now();
+    jobs::retry(
         db,
         &job.id,
-        &[crate::store::zip::ManifestItem::Success {
-            path: "file.txt".into(),
-            object_key: "out/file.txt".into(),
-            cid: ENTRY_CID.into(),
-            size: HELLO.len() as i64,
-        }],
+        &claim.worker_id,
+        claim.claim_epoch,
+        claim.attempt,
+        now,
+        &ImportFailure {
+            code: ImportFailureCode::SourceUnreachable,
+            message: "prior worker stopped".into(),
+            retryable: true,
+        },
+        now,
     )
     .await
     .unwrap();
-    decompress_import(
-        &state,
-        &job,
-        artifact(archive.len()),
-        &claim,
-        CancellationToken::new(),
+    let reclaimed = jobs::claim_due(
+        db,
+        "reclaimed-worker",
+        now,
+        now + chrono::Duration::seconds(60),
+        1,
+    )
+    .await
+    .unwrap()
+    .pop()
+    .unwrap();
+    assert!(reclaimed.claim.claim_epoch > claim.claim_epoch);
+    let config = crate::import::ImportConfig::default().validate().unwrap();
+    let coordinator = crate::import::pipeline::ImportCoordinator::new(
+        config.clone(),
+        crate::import::downloader::SourceDownloader::production(Arc::new(config)),
+    );
+    crate::import::pipeline::execute_job(
+        coordinator,
+        state.clone(),
+        reclaimed.job,
+        reclaimed.claim,
+        JobCancellation {
+            shutdown: CancellationToken::new(),
+            ownership_lost: CancellationToken::new(),
+        },
     )
     .await
     .unwrap();
@@ -631,12 +803,19 @@ async fn stage4_reclaimed_worker_reuses_exact_prepared_manifest() {
 
 #[tokio::test]
 async fn stage4_stale_guard_blocks_root_side_effect_and_all_publication() {
-    struct SupersedingObserver(Arc<AppState>);
+    struct SupersedingObserver<'a> {
+        state: Arc<AppState>,
+        server: &'a MockServer,
+        baseline: tokio::sync::Mutex<Option<(UnpublishedAdmission, usize)>>,
+    }
     #[async_trait::async_trait]
-    impl crate::import::pipeline::ImportExecutionObserver for SupersedingObserver {
-        async fn before_publication(&self, _: &str) {
+    impl crate::import::pipeline::ImportExecutionObserver for SupersedingObserver<'_> {
+        async fn before_publication(&self, id: &str) {
+            let baseline = UnpublishedAdmission::capture(&self.state, id).await;
+            let calls = self.server.received_requests().await.unwrap().len();
+            *self.baseline.lock().await = Some((baseline, calls));
             ownership::admit_content_mutation(
-                self.0.store.db(),
+                self.state.store.db(),
                 "bucket",
                 "out/file.txt",
                 None,
@@ -652,7 +831,14 @@ async fn stage4_stale_guard_blocks_root_side_effect_and_all_publication() {
     mount_archive(&server, archive.clone()).await;
     mount_entry_success(&server).await;
     let state = test_state(&server).await;
-    let (job, claim) = claimed_stage4_job(&state, "stage4-stale", true).await;
+    let (job, claim) = claimed_stage4_job(&state, "stage4-stale", true, &archive).await;
+    let intake = UnpublishedAdmission::capture(&state, &job.id).await;
+    assert!(!intake.snapshot.batch.manifest_prepared);
+    let observer = SupersedingObserver {
+        state: state.clone(),
+        server: &server,
+        baseline: tokio::sync::Mutex::new(None),
+    };
     let cancellation = JobCancellation {
         shutdown: CancellationToken::new(),
         ownership_lost: CancellationToken::new(),
@@ -672,17 +858,40 @@ async fn stage4_stale_guard_blocks_root_side_effect_and_all_publication() {
         &cancellation,
         &reporter,
         MAX_DECOMPRESSED_ARCHIVE_BYTES,
-        &SupersedingObserver(state.clone()),
+        &observer,
     )
     .await;
     let _ = reporter.finish(&cancellation).await;
     assert!(matches!(result, Err(ImportExecutionError::Superseded)));
+    let (baseline, calls) = observer
+        .baseline
+        .lock()
+        .await
+        .take()
+        .expect("stale guard was triggered");
+    assert_eq!(baseline.proof, intake.proof);
+    let mut prepared_options: serde_json::Value =
+        serde_json::from_str(&baseline.snapshot.batch.captured_options).unwrap();
     assert!(
-        crate::store::zip::snapshot(state.store.db(), "stage4-stale")
-            .await
+        prepared_options
+            .as_object_mut()
             .unwrap()
-            .is_none()
+            .remove("legacy_prepared_import")
+            .is_some()
     );
+    assert_eq!(
+        prepared_options,
+        serde_json::from_str::<serde_json::Value>(&intake.snapshot.batch.captured_options).unwrap()
+    );
+    assert!(baseline.snapshot.batch.manifest_prepared);
+    assert_eq!(baseline.snapshot.entries.len(), 1);
+    baseline.assert_unchanged(&state, &job.id).await;
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        calls,
+        "stale guard permits no subsequent local RPC"
+    );
+    server.verify().await;
     assert_eq!(
         object::Entity::find()
             .count(state.store.db())
@@ -701,13 +910,16 @@ async fn stage4_stale_guard_blocks_root_side_effect_and_all_publication() {
 }
 
 #[tokio::test]
-async fn stage4_duplicate_destination_is_terminal_without_a_batch_or_root() {
+async fn stage4_duplicate_destination_retains_only_intake_proof_without_publication_or_root() {
     let server = MockServer::start().await;
     let archive = zip(&[("file.txt", HELLO), ("file.txt", HELLO)]);
     mount_archive(&server, archive.clone()).await;
     mount_entry_success(&server).await;
     let state = test_state(&server).await;
-    let (job, claim) = claimed_stage4_job(&state, "stage4-duplicate", true).await;
+    let (job, claim) = claimed_stage4_job(&state, "stage4-duplicate", true, &archive).await;
+    let baseline = UnpublishedAdmission::capture(&state, &job.id).await;
+    assert!(!baseline.snapshot.batch.manifest_prepared);
+    assert!(baseline.snapshot.entries.is_empty());
     let failure = decompress_import(
         &state,
         &job,
@@ -724,12 +936,8 @@ async fn stage4_duplicate_destination_is_terminal_without_a_batch_or_root() {
             ..
         })
     ));
-    assert!(
-        crate::store::zip::snapshot(state.store.db(), "stage4-duplicate")
-            .await
-            .unwrap()
-            .is_none()
-    );
+    baseline.assert_unchanged(&state, &job.id).await;
+    server.verify().await;
     assert_eq!(
         object::Entity::find()
             .count(state.store.db())
@@ -745,6 +953,110 @@ async fn stage4_duplicate_destination_is_terminal_without_a_batch_or_root() {
             .iter()
             .all(|request| request.url.path() != "/api/v0/dag/put")
     );
+}
+
+struct UnpublishedAdmission {
+    snapshot: crate::store::zip::BatchSnapshot,
+    proof: crate::store::pinning::publication::LegacyZipInputProof,
+}
+
+impl UnpublishedAdmission {
+    async fn capture(state: &AppState, id: &str) -> Self {
+        let snapshot = crate::store::zip::snapshot(state.store.db(), id)
+            .await
+            .unwrap()
+            .unwrap();
+        let proof =
+            crate::store::pinning::publication::read_legacy_import_input(state.store.db(), id)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(snapshot.batch.state, "open");
+        assert!(!snapshot.batch.source_published);
+        assert!(snapshot.batch.terminal_result.is_none());
+        assert_eq!(snapshot.batch.root_status, "pending");
+        assert!(snapshot.batch.root_cid.is_none());
+        assert!(snapshot.batch.root_error_code.is_none());
+        assert_eq!(snapshot.batch.root_epoch, 0);
+        assert_eq!(snapshot.batch.root_revision, 0);
+        assert!(snapshot.builds.is_empty());
+        assert!(snapshot.references.is_empty());
+        assert!(
+            snapshot
+                .entries
+                .iter()
+                .all(|entry| entry.version_row_id.is_none())
+        );
+        use crate::store::entities::{
+            object_version, pin_extension_decision, pin_job, pin_lease_target, pin_provider_usage,
+            remote_pin, remote_pin_ledger,
+        };
+        let counts = [
+            object::Entity::find()
+                .count(state.store.db())
+                .await
+                .unwrap(),
+            object_version::Entity::find()
+                .count(state.store.db())
+                .await
+                .unwrap(),
+            import_job_result::Entity::find()
+                .count(state.store.db())
+                .await
+                .unwrap(),
+            pin_extension_decision::Entity::find()
+                .count(state.store.db())
+                .await
+                .unwrap(),
+            pin_lease::Entity::find()
+                .count(state.store.db())
+                .await
+                .unwrap(),
+            pin_lease_target::Entity::find()
+                .count(state.store.db())
+                .await
+                .unwrap(),
+            pin_job::Entity::find()
+                .count(state.store.db())
+                .await
+                .unwrap(),
+            remote_pin::Entity::find()
+                .count(state.store.db())
+                .await
+                .unwrap(),
+            remote_pin_ledger::Entity::find()
+                .count(state.store.db())
+                .await
+                .unwrap(),
+            pin_provider_usage::Entity::find()
+                .count(state.store.db())
+                .await
+                .unwrap(),
+        ];
+        assert_eq!(
+            counts, [0; 10],
+            "no published objects/versions/results/decisions, leases/targets/jobs, remote or quota rows"
+        );
+        Self { snapshot, proof }
+    }
+
+    async fn assert_unchanged(&self, state: &AppState, id: &str) {
+        let after = Self::capture(state, id).await;
+        assert_eq!(
+            after.proof, self.proof,
+            "native full input proof must survive rejection unchanged"
+        );
+        assert_eq!(
+            after.snapshot.batch, self.snapshot.batch,
+            "reject must not rewrite captured admission or terminal/root state"
+        );
+        assert_eq!(
+            after.snapshot.entries, self.snapshot.entries,
+            "reject must not publish manifest bindings"
+        );
+        assert_eq!(after.snapshot.builds, self.snapshot.builds);
+        assert_eq!(after.snapshot.references, self.snapshot.references);
+    }
 }
 
 fn artifact(size: usize) -> ImportArtifact {
@@ -877,7 +1189,7 @@ async fn stage4_verified_root_is_bound_to_published_version_and_partial_failure_
         .await;
     mount_verified_directory(&server, LEAF, &root).await;
     let state = test_state(&server).await;
-    let (job, claim) = claimed_stage4_job(&state, "stage4-partial", true).await;
+    let (job, claim) = claimed_stage4_job(&state, "stage4-partial", true, &archive).await;
     decompress_import(
         &state,
         &job,
@@ -930,7 +1242,7 @@ async fn successful_import_publishes_archive_entry_results_and_progress_atomical
     mount_archive(&server, archive.clone()).await;
     mount_entry_success(&server).await;
     let state = test_state(&server).await;
-    let (job, claim) = claimed_job(&state, "success", "archive.zip", "out/").await;
+    let (job, claim) = claimed_historical_job(&state, "success", &archive).await;
 
     let published = decompress_import(
         &state,
@@ -970,13 +1282,121 @@ async fn successful_import_publishes_archive_entry_results_and_progress_atomical
     assert_eq!(completed.entries_failed, 0);
     assert_eq!(completed.decompressed_bytes, HELLO.len() as i64);
     assert!(completed.root_capture_json.is_none());
-    assert!(
-        crate::store::zip::snapshot(state.store.db(), "success")
-            .await
-            .unwrap()
-            .is_none(),
+    assert!(completed.zip_intent_json.is_none());
+    assert_eq!(completed.source_type, "cid");
+    assert_eq!(completed.source_value, ARCHIVE_CID);
+    let original: crate::pinning::decision::ExtensionDecision =
+        serde_json::from_str(completed.pin_decision_json.as_deref().unwrap()).unwrap();
+    assert!(original.effective_intents.is_empty());
+    assert_eq!(original.origin.principal_id, "test");
+    assert_eq!(original.origin.request_id, "success");
+    let snapshot = crate::store::zip::snapshot(state.store.db(), "success")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.batch.state, "published");
+    assert_eq!(
+        snapshot.batch.root_status, "disabled",
         "a pre-Stage4 job cannot inherit the new default root"
     );
+    assert!(snapshot.batch.source_published);
+    assert!(snapshot.batch.manifest_prepared);
+    assert!(snapshot.batch.root_cid.is_none());
+    assert_eq!(snapshot.batch.root_epoch, 0);
+    assert_eq!(snapshot.batch.root_revision, 0);
+    assert!(snapshot.builds.is_empty());
+    assert!(snapshot.references.is_empty());
+    assert_eq!(snapshot.entries.len(), 1);
+    assert_eq!(snapshot.entries[0].cid.as_deref(), Some(ENTRY_CID));
+    assert!(snapshot.entries[0].version_row_id.is_some());
+    assert_eq!(
+        objects
+            .iter()
+            .find(|row| row.key == "archive.zip")
+            .unwrap()
+            .cid,
+        ARCHIVE_CID
+    );
+    assert_eq!(
+        objects
+            .iter()
+            .find(|row| row.key == "out/file.txt")
+            .unwrap()
+            .cid,
+        ENTRY_CID
+    );
+    assert_eq!(rows[0].cid.as_deref(), Some(ARCHIVE_CID));
+    assert_eq!(rows[1].cid.as_deref(), Some(ENTRY_CID));
+    use crate::store::entities::{object_version, pin_job, pin_lease_target, pin_provider_usage};
+    let versions = object_version::Entity::find()
+        .all(state.store.db())
+        .await
+        .unwrap();
+    assert_eq!(versions.len(), 2);
+    for object in &objects {
+        let version = versions
+            .iter()
+            .find(|version| version.key == object.key)
+            .unwrap();
+        assert_eq!(version.bucket, object.bucket);
+        assert_eq!(version.object_id.as_deref(), Some(object.id.as_str()));
+        assert!(version.is_latest);
+        if object.key == "archive.zip" {
+            assert_eq!(published.object_id, object.id);
+        } else {
+            assert_eq!(
+                snapshot.entries[0].version_row_id.as_deref(),
+                Some(version.id.as_str())
+            );
+            assert_eq!(
+                snapshot.entries[0].object_key.as_deref(),
+                Some(object.key.as_str())
+            );
+        }
+    }
+    assert_eq!(
+        pin_lease::Entity::find()
+            .count(state.store.db())
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        pin_lease_target::Entity::find()
+            .count(state.store.db())
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        pin_job::Entity::find()
+            .count(state.store.db())
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        pin_provider_usage::Entity::find()
+            .count(state.store.db())
+            .await
+            .unwrap(),
+        0
+    );
+    let requests = server.received_requests().await.unwrap();
+    assert!(requests.iter().all(|request| matches!(
+        request.url.path(),
+        "/api/v0/cat" | "/api/v0/add" | "/api/v0/pin/add"
+    )));
+    assert!(
+        requests
+            .iter()
+            .filter(|request| request.url.path() == "/api/v0/pin/add")
+            .all(|request| request
+                .url
+                .query_pairs()
+                .any(|(name, value)| name == "arg" && value == ENTRY_CID))
+    );
+    server.verify().await;
 }
 
 #[tokio::test]
@@ -999,7 +1419,8 @@ async fn observer_wait_is_shutdown_cancel_safe_and_publishes_nothing() {
     mount_archive(&server, archive.clone()).await;
     mount_entry_success(&server).await;
     let state = test_state(&server).await;
-    let (job, claim) = claimed_job(&state, "observer-cancel", "archive.zip", "out/").await;
+    let (job, claim) =
+        claimed_job(&state, "observer-cancel", "archive.zip", "out/", &archive).await;
     let cancellation = JobCancellation {
         shutdown: CancellationToken::new(),
         ownership_lost: CancellationToken::new(),
@@ -1077,7 +1498,7 @@ async fn archive_key_collision_is_terminal_before_entry_add_or_publication() {
     let archive = zip(&[("file.txt", HELLO)]);
     mount_archive(&server, archive.clone()).await;
     let state = test_state(&server).await;
-    let (job, claim) = claimed_job(&state, "collision", "out/file.txt", "out/").await;
+    let (job, claim) = claimed_job(&state, "collision", "out/file.txt", "out/", &archive).await;
 
     let error = decompress_import(
         &state,
@@ -1132,7 +1553,7 @@ async fn entry_upload_failure_publishes_archive_and_failure_row_without_output()
         .mount(&server)
         .await;
     let state = test_state(&server).await;
-    let (job, claim) = claimed_job(&state, "entry-failure", "archive.zip", "out/").await;
+    let (job, claim) = claimed_job(&state, "entry-failure", "archive.zip", "out/", &archive).await;
 
     decompress_import(
         &state,
@@ -1182,7 +1603,7 @@ async fn parser_and_limit_failures_are_terminal_and_publish_nothing() {
         let server = MockServer::start().await;
         mount_archive(&server, body.clone()).await;
         let state = test_state(&server).await;
-        let (job, claim) = claimed_job(&state, id, "archive.zip", "out/").await;
+        let (job, claim) = claimed_job(&state, id, "archive.zip", "out/", &body).await;
         let cancellation = JobCancellation {
             shutdown: CancellationToken::new(),
             ownership_lost: CancellationToken::new(),
@@ -1237,7 +1658,7 @@ async fn cancellation_and_lost_prefix_claim_preserve_typed_errors() {
     let server = MockServer::start().await;
     let archive = zip(&[("file.txt", HELLO)]);
     let state = test_state(&server).await;
-    let (job, claim) = claimed_job(&state, "canceled", "archive.zip", "out/").await;
+    let (job, claim) = claimed_job(&state, "canceled", "archive.zip", "out/", &archive).await;
     let cancel = CancellationToken::new();
     cancel.cancel();
     let error = decompress_import(&state, &job, artifact(archive.len()), &claim, cancel)
@@ -1249,7 +1670,7 @@ async fn cancellation_and_lost_prefix_claim_preserve_typed_errors() {
     let archive = zip(&[("file.txt", HELLO)]);
     mount_archive(&server, archive.clone()).await;
     let state = test_state(&server).await;
-    let (job, claim) = claimed_job(&state, "prefix-lost", "archive.zip", "out/").await;
+    let (job, claim) = claimed_job(&state, "prefix-lost", "archive.zip", "out/", &archive).await;
     crate::store::entities::import_prefix_claim::Entity::delete_many()
         .filter(crate::store::entities::import_prefix_claim::Column::JobId.eq("prefix-lost"))
         .exec(state.store.db())
@@ -1278,7 +1699,8 @@ async fn cancellation_and_lost_prefix_claim_preserve_typed_errors() {
 async fn observer_captures_the_exact_claimed_generation() {
     let server = MockServer::start().await;
     let state = test_state(&server).await;
-    let (job, claim) = claimed_job(&state, "generation", "archive.zip", "out/").await;
+    let archive = zip(&[("file.txt", HELLO)]);
+    let (job, claim) = claimed_job(&state, "generation", "archive.zip", "out/", &archive).await;
     import_destination::Entity::insert(import_destination::ActiveModel {
         bucket: Set("bucket".to_owned()),
         key: Set("out/file.txt".to_owned()),
@@ -1385,7 +1807,7 @@ async fn superseded_output_prevents_archive_entries_and_result_rows_from_publish
         .mount(&server)
         .await;
     let state = test_state(&server).await;
-    let (job, claim) = claimed_job(&state, "superseded", "archive.zip", "out/").await;
+    let (job, claim) = claimed_job(&state, "superseded", "archive.zip", "out/", &archive).await;
     struct PublicationGate {
         arrived: tokio::sync::Notify,
         resume: tokio::sync::Notify,
@@ -1574,7 +1996,14 @@ async fn midstream_kubo_cat_failure_is_retryable_without_publication() {
         Duration::from_millis(50),
     ))
     .await;
-    let (job, claim) = claimed_job(&state, "cat-stream-failure", "archive.zip", "out/").await;
+    let (job, claim) = claimed_job(
+        &state,
+        "cat-stream-failure",
+        "archive.zip",
+        "out/",
+        &archive,
+    )
+    .await;
     let cancellation = JobCancellation {
         shutdown: CancellationToken::new(),
         ownership_lost: CancellationToken::new(),

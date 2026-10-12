@@ -128,13 +128,7 @@ pub(super) fn validate(images: &[TableImage], ns: &Namespace) -> AppResult<()> {
                 }
             }
             if super::projection::CAPTURES.contains(&image.table.as_str()) {
-                for column in [
-                    "snapshot",
-                    "pin_decision_json",
-                    "captured_options",
-                    "captured_config",
-                    "contract",
-                ] {
+                for column in super::projection::CAPTURE_COLUMNS {
                     if let Some(raw) = field(row, column) {
                         captured(ns, &json(raw)?, false, 0)?;
                     }

@@ -69,6 +69,16 @@ async fn directory_rpc(harness: &TestHarness, fail_first: bool) {
 }
 
 async fn create_and_upload(source: bool, extracted: bool) -> (TestHarness, String) {
+    create_and_upload_with_controls(source, extracted, "none", None, extracted).await
+}
+
+async fn create_and_upload_with_controls(
+    source: bool,
+    extracted: bool,
+    targets: &'static str,
+    root_tag: Option<bool>,
+    fail_first_root: bool,
+) -> (TestHarness, String) {
     let archive = legal_single_entry_zip();
     let mut add_replies = vec![AddReply::Ok("QmPart"), AddReply::Ok("QmArchive")];
     if extracted {
@@ -93,7 +103,7 @@ async fn create_and_upload(source: bool, extracted: bool) -> (TestHarness, Strin
     )
     .await
     .unwrap();
-    directory_rpc(&harness, extracted).await;
+    directory_rpc(&harness, fail_first_root).await;
     let mut controls = HeaderMap::new();
     for (name, value) in [
         ("x-ipfs3-zip-contract", "v2"),
@@ -105,10 +115,20 @@ async fn create_and_upload(source: bool, extracted: bool) -> (TestHarness, Strin
             "x-ipfs3-zip-publish-extracted",
             if extracted { "true" } else { "false" },
         ),
-        ("x-ipfs3-zip-targets", "none"),
+        ("x-ipfs3-zip-targets", targets),
         ("x-ipfs3-zip-token", "mpu-root-recovery"),
     ] {
         controls.insert(name, HeaderValue::from_static(value));
+    }
+    if let Some(enabled) = root_tag {
+        controls.insert(
+            "x-amz-tagging",
+            HeaderValue::from_static(if enabled {
+                "ipfs-s3%3Azip-root=true"
+            } else {
+                "ipfs-s3%3Azip-root=false"
+            }),
+        );
     }
     let create = support::sigv4::send_sigv4(
         reqwest::Method::POST,
@@ -239,9 +259,20 @@ async fn assert_root_recovered(source: bool) {
     assert_eq!(before.entries.len(), 1);
     assert!(before.entries[0].version_row_id.is_some());
     let capture: Value = serde_json::from_str(&before.batch.captured_options).unwrap();
-    assert!(capture.get("options").is_none());
-    assert!(capture.get("target_prefix").is_none());
-    assert_eq!(capture["result_version"], 2);
+    let record = store::multipart::v2_zip::read_by_upload(db, &id)
+        .await
+        .unwrap()
+        .unwrap();
+    let options = record.options().unwrap();
+    let intent = record.zip_intent().unwrap().unwrap();
+    assert_eq!(capture["options"], serde_json::to_value(&options).unwrap());
+    assert_eq!(intent.v2_options(), Some(options.clone()));
+    assert_eq!(capture["schema_version"], 1);
+    assert_eq!(capture["target_prefix"], "out/");
+    assert_eq!(options.result_version, 2);
+    assert_eq!(options.publish_source, source);
+    assert!(options.publish_extracted && options.build_root());
+    assert!(intent.controls().root.enabled());
     let published = rows(&harness).await;
     assert_eq!(published.0.len(), 1 + usize::from(source));
     assert_eq!(published.1.len(), 1 + usize::from(source));
@@ -270,7 +301,7 @@ async fn assert_root_recovered(source: bool) {
     let after = zip::snapshot(db, &id).await.unwrap().unwrap();
     assert_eq!(
         after.batch.root_status, "complete",
-        "worker must recover the flat MPU capture, not quarantine it: {:?}",
+        "worker must recover the original MPU envelope, not quarantine it: {:?}",
         after.batch.root_error_code
     );
     assert_eq!(after.batch.root_cid.as_deref(), Some(ROOT));
@@ -376,7 +407,7 @@ async fn source_and_outputs_mpu_temporary_root_failure_recovers_through_actual_w
 }
 
 #[tokio::test]
-async fn flat_mpu_capture_requires_exact_protocol_flags_token_and_root_identity() {
+async fn persisted_mpu_capture_requires_exact_protocol_flags_token_and_root_identity() {
     let (harness, id) = create_and_upload(false, true).await;
     assert_eq!(complete(&harness, &id).await.status(), StatusCode::OK);
     let db = harness.state.store.db();
@@ -390,31 +421,47 @@ async fn flat_mpu_capture_requires_exact_protocol_flags_token_and_root_identity(
     assert!(zip::recovery::files(&snapshot, &claim).is_ok());
     let captured: Value = serde_json::from_str(&snapshot.batch.captured_options).unwrap();
     for (field, value) in [
-        ("result_version", json!(1)),
-        ("result_version", json!("2")),
-        ("publish_source", json!(true)),
-        ("publish_source", json!("false")),
-        ("publish_extracted", json!(false)),
-        ("publish_extracted", json!(1)),
-        ("targets", json!("source")),
-        ("targets", json!("both")),
-        ("targets", json!("all")),
-        ("token", json!("other")),
-        ("token", json!("")),
-        ("token", json!("bad/token")),
-        ("root_enabled", json!(false)),
-        ("root_override", json!(false)),
-        ("root_override", json!("true")),
-        ("target_prefix", json!("out/")),
+        ("/options/result_version", json!(1)),
+        ("/options/result_version", json!("2")),
+        ("/options/publish_source", json!(true)),
+        ("/options/publish_source", json!("false")),
+        ("/options/publish_extracted", json!(false)),
+        ("/options/publish_extracted", json!(1)),
+        ("/options/targets", json!("source")),
+        ("/options/targets", json!("both")),
+        ("/options/targets", json!("all")),
+        ("/options/token", json!("other")),
+        ("/options/token", json!("")),
+        ("/options/token", json!("bad/token")),
+        ("/options/root_enabled", json!(false)),
+        ("/options/root_override", json!(false)),
+        ("/options/root_override", json!("true")),
+        ("/target_prefix", json!("other/")),
+        ("/schema_version", json!(2)),
+        ("/rule_revision", json!("different")),
+        ("/zip_intent/bucket", json!("another")),
+        ("/zip_intent/source_key", json!("another.zip")),
+        ("/zip_intent/target_prefix", json!("other/")),
         (
-            "options",
+            "/zip_intent/source_decision/origin/principal_id",
+            json!("another"),
+        ),
+        (
+            "/zip_intent/source_decision/origin/request_id",
+            json!("another"),
+        ),
+        ("/zip_intent/controls/admission_token", json!("other")),
+        ("/zip_intent/controls/root", json!({"configured":false})),
+        ("/zip_intent/schema_version", json!(2)),
+        (
+            "/options",
             json!({"root_enabled":true,"publish_extracted":true}),
         ),
-        ("root_capture", json!({"configured":true})),
+        ("/zip_intent", json!({"root_capture":{"configured":true}})),
     ] {
         let mut forged = zip::snapshot(db, &id).await.unwrap().unwrap();
         let mut options = captured.clone();
-        options[field] = value;
+        *options.pointer_mut(field).unwrap() = value;
         forged.batch.captured_options = options.to_string();
         assert!(
             zip::recovery::files(&forged, &claim).is_err(),
@@ -436,7 +483,7 @@ async fn flat_mpu_capture_requires_exact_protocol_flags_token_and_root_identity(
         forged.batch.source = source.into();
         assert!(
             zip::recovery::files(&forged, &claim).is_err(),
-            "wrong flat capture source {source}"
+            "wrong MPU capture source {source}"
         );
     }
     let mut forged = zip::snapshot(db, &id).await.unwrap().unwrap();
@@ -448,7 +495,8 @@ async fn flat_mpu_capture_requires_exact_protocol_flags_token_and_root_identity(
     for token in ["bad/token".to_owned(), "x".repeat(129)] {
         let mut forged = zip::snapshot(db, &id).await.unwrap().unwrap();
         let mut options = captured.clone();
-        options["token"] = token.clone().into();
+        options["options"]["token"] = token.clone().into();
+        options["zip_intent"]["controls"]["admission_token"] = token.clone().into();
         forged.batch.token = token;
         forged.batch.captured_options = options.to_string();
         assert!(
@@ -456,26 +504,77 @@ async fn flat_mpu_capture_requires_exact_protocol_flags_token_and_root_identity(
             "token syntax must be valid even when identities agree"
         );
     }
-    for (source, targets) in [(false, "extracted"), (true, "source"), (true, "both")] {
-        let mut valid = zip::snapshot(db, &id).await.unwrap().unwrap();
-        let mut options = captured.clone();
-        options["root_override"] = true.into();
-        options["publish_source"] = source.into();
-        options["targets"] = targets.into();
-        valid.batch.source_published = source;
-        valid.batch.captured_options = options.to_string();
-        assert!(
-            zip::recovery::files(&valid, &claim).is_ok(),
-            "valid root override/target capture {options}"
-        );
-    }
-    let mut legacy = zip::snapshot(db, &id).await.unwrap().unwrap();
-    legacy.batch.captured_options = json!({"root_enabled":true,"target_prefix":"out/"}).to_string();
-    assert!(zip::recovery::files(&legacy, &claim).is_ok());
-    legacy.entries[0].path = "invalid/0".into();
+    let mut stale = zip::snapshot(db, &id).await.unwrap().unwrap();
+    stale.batch.root_revision += 1;
+    assert!(zip::recovery::files(&stale, &claim).is_err());
+    let mut stale = zip::snapshot(db, &id).await.unwrap().unwrap();
+    stale.batch.root_epoch += 1;
+    assert!(zip::recovery::files(&stale, &claim).is_err());
+    let mut invalid_path = zip::snapshot(db, &id).await.unwrap().unwrap();
+    invalid_path.entries[0].path = "invalid/0".into();
     assert!(
-        zip::recovery::files(&legacy, &claim).is_err(),
-        "legacy prefix remains mandatory"
+        zip::recovery::files(&invalid_path, &claim).is_err(),
+        "original prefix remains mandatory"
+    );
+    let mut legacy = zip::snapshot(db, &id).await.unwrap().unwrap();
+    legacy.batch.captured_options = captured["options"].to_string();
+    assert!(
+        zip::recovery::files(&legacy, &claim).is_ok(),
+        "complete bare options are shape-valid, not original-capture authorization"
+    );
+    let published = rows(&harness).await;
+    let remotes = remote_counts(&harness).await;
+    let execution = zip::execution::read(db, &id).await.unwrap().unwrap();
+    let intake = store::multipart::v2_zip::read_by_upload(db, &id)
+        .await
+        .unwrap()
+        .unwrap();
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "UPDATE zip_batches SET captured_options=? WHERE id=?",
+        vec![
+            legacy.batch.captured_options.clone().into(),
+            id.clone().into(),
+        ],
+    ))
+    .await
+    .unwrap();
+    expire_root_lease(&harness, &id).await;
+    let calls = harness.kubo.received_requests().await.unwrap().len();
+    let additions = harness.captured_add_file_bytes();
+    assert_eq!(
+        run_page(db, &harness.state.kubo, &CancellationToken::new())
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        harness.kubo.received_requests().await.unwrap().len(),
+        calls,
+        "stripping a modern envelope must fail provenance before any Kubo request"
+    );
+    assert_eq!(harness.captured_add_file_bytes(), additions);
+    assert_eq!(rows(&harness).await, published);
+    assert_eq!(remote_counts(&harness).await, remotes);
+    let after = zip::snapshot(db, &id).await.unwrap().unwrap();
+    assert_eq!(after.batch.captured_options, legacy.batch.captured_options);
+    assert_eq!(after.batch.terminal_result, snapshot.batch.terminal_result);
+    assert_eq!(after.entries, snapshot.entries);
+    assert!(!after.batch.source_published);
+    assert_eq!(after.batch.root_status, "failed");
+    assert_eq!(after.batch.root_cid, None);
+    assert_eq!(after.builds.last().unwrap().status, "intent");
+    assert_eq!(
+        zip::execution::read(db, &id).await.unwrap().unwrap(),
+        execution
+    );
+    assert_eq!(
+        store::multipart::v2_zip::read_by_upload(db, &id)
+            .await
+            .unwrap()
+            .unwrap()
+            .captured_options,
+        intake.captured_options
     );
 }
 
@@ -493,10 +592,18 @@ async fn source_only_mpu_does_not_build_or_schedule_a_root() {
     assert!(snapshot.entries.is_empty());
     let capture: Value = serde_json::from_str(&snapshot.batch.captured_options).unwrap();
     assert_eq!(
-        capture["root_enabled"], true,
+        capture["options"]["root_enabled"], true,
         "captured config alone is not root permission"
     );
-    assert_eq!(capture["publish_extracted"], false);
+    assert_eq!(capture["options"]["publish_extracted"], false);
+    assert_eq!(
+        capture["zip_intent"]["controls"]["root"]["configured"],
+        true
+    );
+    assert_eq!(
+        capture["zip_intent"]["controls"]["publish_extracted"],
+        false
+    );
     let calls = harness.kubo.received_requests().await.unwrap();
     assert!(
         !calls
@@ -538,4 +645,105 @@ async fn source_only_mpu_does_not_build_or_schedule_a_root() {
         harness.kubo.received_requests().await.unwrap().len(),
         calls.len()
     );
+}
+
+#[tokio::test]
+async fn root_override_and_targets_are_validated_from_real_original_mpu_admissions() {
+    for (source, targets) in [(false, "extracted"), (true, "source"), (true, "both")] {
+        let (harness, id) =
+            create_and_upload_with_controls(source, true, targets, Some(true), true).await;
+        let response = complete(&harness, &id).await;
+        let status = response.status();
+        let xml = response.text().await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{xml}");
+        let record = store::multipart::v2_zip::read_by_upload(harness.state.store.db(), &id)
+            .await
+            .unwrap()
+            .unwrap();
+        let options = record.options().unwrap();
+        let intent = record.zip_intent().unwrap().unwrap();
+        assert_eq!(options.root_override, Some(true));
+        assert_eq!(options.publish_source, source);
+        assert_eq!(intent.v2_options(), Some(options));
+        let snapshot = zip::snapshot(harness.state.store.db(), &id)
+            .await
+            .unwrap()
+            .unwrap();
+        let claim = zip::RootClaim {
+            batch_id: id,
+            revision: snapshot.batch.root_revision,
+            epoch: snapshot.batch.root_epoch,
+            worker: snapshot.builds.last().unwrap().worker.clone(),
+        };
+        assert_eq!(zip::recovery::files(&snapshot, &claim).unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn paired_original_mpu_envelope_tampering_is_409_before_rpc_or_publication() {
+    let (harness, id) = create_and_upload_with_controls(false, true, "none", None, false).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/dag/put"))
+        .respond_with(ResponseTemplate::new(503))
+        .with_priority(1)
+        .expect(0)
+        .mount(&harness.kubo)
+        .await;
+    let db = harness.state.store.db();
+    let record = store::multipart::v2_zip::read_by_upload(db, &id)
+        .await
+        .unwrap()
+        .unwrap();
+    let original: Value = serde_json::from_str(&record.captured_options).unwrap();
+    let before = harness.kubo.received_requests().await.unwrap().len();
+    for (pointer, value) in [
+        ("/schema_version", json!(2)),
+        ("/options/token", json!("other")),
+        ("/options/publish_source", json!(true)),
+        ("/options/publish_extracted", json!(false)),
+        ("/options/root_enabled", json!(false)),
+        ("/options/root_override", json!(false)),
+        ("/zip_intent/schema_version", json!(2)),
+        (
+            "/zip_intent/source_decision/origin/request_id",
+            json!("other"),
+        ),
+        (
+            "/zip_intent/source_decision/origin/principal_id",
+            json!("other"),
+        ),
+        ("/zip_intent/controls/root", json!({"configured":false})),
+        ("/target_prefix", json!("other/")),
+        ("/rule_revision", json!("other")),
+    ] {
+        let mut tampered = original.clone();
+        *tampered.pointer_mut(pointer).unwrap() = value;
+        let bytes = tampered.to_string();
+        for (table, identity) in [
+            ("zip_v2_mpu_intakes", "original_upload_id"),
+            ("zip_v2_executions", "id"),
+        ] {
+            db.execute(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                format!("UPDATE {table} SET captured_options=? WHERE {identity}=?"),
+                vec![bytes.clone().into(), id.clone().into()],
+            ))
+            .await
+            .unwrap();
+        }
+        let response = complete(&harness, &id).await;
+        let status = response.status();
+        let xml = response.text().await.unwrap();
+        assert_eq!(
+            harness.kubo.received_requests().await.unwrap().len(),
+            before
+        );
+        assert_eq!(rows(&harness).await, (vec![], vec![]));
+        assert_eq!(remote_counts(&harness).await, vec![0; 5]);
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "tamper {pointer}: {xml}; zero extra RPC/publication/remote rows verified"
+        );
+    }
 }

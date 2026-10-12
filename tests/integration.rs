@@ -4115,7 +4115,7 @@ async fn versioning_publication_path_direct_zip() {
         "QmDirectZipSArchive",
         "QmDirectZipSEntry",
     ];
-    let config = matrix_pinning_config(
+    let mut config = matrix_pinning_config(
         add_cids.into_iter().map(AddReply::Ok).collect(),
         HashMap::from([
             ("QmDirectZipUArchive".to_owned(), archive.clone()),
@@ -4123,6 +4123,7 @@ async fn versioning_publication_path_direct_zip() {
             ("QmDirectZipSArchive".to_owned(), archive.clone()),
         ]),
     );
+    config.explicit_identity = true;
     let harness = start_pinning_harness(config).await;
     for (matrix_state, archive_cid, entry_cid) in [
         (
@@ -5762,6 +5763,7 @@ async fn test_pinning_put_tagging_renews_idempotently_and_delete_tagging_cancels
 async fn test_pinning_put_tagging_reactivates_expired_lease_with_unknown_resource_retained() {
     let archive_bytes = legal_single_entry_zip();
     let mut config = PinningHarnessConfig::request_one();
+    config.explicit_identity = true;
     config.kubo_script = KuboScript {
         add_replies: vec![AddReply::Ok("QmArchive"), AddReply::Ok("QmEntry")],
         cat_bodies: HashMap::from([
@@ -5775,6 +5777,7 @@ async fn test_pinning_put_tagging_reactivates_expired_lease_with_unknown_resourc
         "QmEntry",
     )];
     let mut harness = start_pinning_harness(config).await;
+    let pinata_key = harness.provider_key("pinata-primary");
 
     let put = signed_decompress_zip_put(
         &harness,
@@ -5824,7 +5827,7 @@ async fn test_pinning_put_tagging_reactivates_expired_lease_with_unknown_resourc
             .collect::<Vec<_>>(),
         vec![(
             original_targets[0].id.as_str(),
-            "pinata-primary",
+            pinata_key.as_str(),
             "QmEntry",
             "waiting",
         )]
@@ -5885,7 +5888,7 @@ async fn test_pinning_put_tagging_reactivates_expired_lease_with_unknown_resourc
             .collect::<Vec<_>>(),
         vec![(
             original_targets[0].id.as_str(),
-            "pinata-primary",
+            pinata_key.as_str(),
             "QmEntry",
             "released",
         )]
@@ -5902,10 +5905,7 @@ async fn test_pinning_put_tagging_reactivates_expired_lease_with_unknown_resourc
     let requests_after_release = harness.provider_requests().await;
     assert_eq!(requests_after_release.len(), 1);
     assert_unknown_psa_resource(&harness, "pinata-primary", "QmEntry", "retained").await;
-    assert_eq!(
-        harness.provider_usage("pinata-primary").await.reserved_pins,
-        1
-    );
+    assert_eq!(harness.provider_usage(&pinata_key).await.reserved_pins, 1);
     assert_no_psa_delete(&harness).await;
     let target_count_before_renewal = harness.pin_targets().await.len();
     let kubo_requests_before_renewal = harness
@@ -8357,6 +8357,7 @@ async fn test_pinning_expiry_retains_unknown_remote_and_preserves_s3_and_kubo_pi
 async fn test_pinning_zip_decompressed_pins_entries_not_archive() {
     let archive_bytes = legal_two_entry_zip();
     let mut config = PinningHarnessConfig::request_one();
+    config.explicit_identity = true;
     config.kubo_script = KuboScript {
         add_replies: vec![
             AddReply::Ok("QmArchive"),
@@ -8374,6 +8375,7 @@ async fn test_pinning_zip_decompressed_pins_entries_not_archive() {
         PsaReply::pinned_submit("/psa/pins", "pinata-entry-2", "QmEntry2"),
     ];
     let mut harness = start_pinning_harness(config).await;
+    let pinata_key = harness.provider_key("pinata-primary");
 
     let put = signed_decompress_zip_put(
         &harness,
@@ -8446,9 +8448,7 @@ async fn test_pinning_zip_decompressed_pins_entries_not_archive() {
     );
     assert!(!target_cids.contains("QmArchive"));
     assert!(targets.iter().all(|target| {
-        target.provider == "pinata-primary"
-            && target.state == "waiting"
-            && target.lease_id == manual.id
+        target.provider == pinata_key && target.state == "waiting" && target.lease_id == manual.id
     }));
     assert_eq!(
         harness
@@ -8458,7 +8458,7 @@ async fn test_pinning_zip_decompressed_pins_entries_not_archive() {
             .map(|usage| (usage.provider, usage.reserved_bytes, usage.reserved_pins))
             .collect::<Vec<_>>(),
         vec![(
-            "pinata-primary".to_owned(),
+            pinata_key.clone(),
             (FIRST_ENTRY_BYTES.len() + SECOND_ENTRY_BYTES.len()) as i64,
             2,
         )]
@@ -8482,7 +8482,7 @@ async fn test_pinning_zip_decompressed_pins_entries_not_archive() {
         BTreeSet::from([
             (
                 "submit",
-                "pinata-primary",
+                pinata_key.as_str(),
                 "QmEntry1",
                 Some(manual.id.as_str()),
                 Some(1),
@@ -8491,7 +8491,7 @@ async fn test_pinning_zip_decompressed_pins_entries_not_archive() {
             ),
             (
                 "submit",
-                "pinata-primary",
+                pinata_key.as_str(),
                 "QmEntry2",
                 Some(manual.id.as_str()),
                 Some(1),
@@ -8566,6 +8566,7 @@ async fn test_pinning_zip_decompressed_pins_entries_not_archive() {
 async fn test_pinning_zip_partial_success_targets_only_published_entries() {
     let archive_bytes = legal_two_entry_zip();
     let mut config = PinningHarnessConfig::request_one();
+    config.explicit_identity = true;
     config.kubo_script = KuboScript {
         add_replies: vec![
             AddReply::Ok("QmArchive"),
@@ -8583,6 +8584,7 @@ async fn test_pinning_zip_partial_success_targets_only_published_entries() {
         "QmEntry2",
     )];
     let mut harness = start_pinning_harness(config).await;
+    let pinata_key = harness.provider_key("pinata-primary");
 
     let put = signed_decompress_zip_put(
         &harness,
@@ -8635,7 +8637,7 @@ async fn test_pinning_zip_partial_success_targets_only_published_entries() {
                 target.state.as_str()
             ))
             .collect::<Vec<_>>(),
-        vec![("pinata-primary", "QmEntry2", "waiting")]
+        vec![(pinata_key.as_str(), "QmEntry2", "waiting")]
     );
     assert_ne!(targets[0].cid, archive.cid);
     assert_eq!(
@@ -8645,11 +8647,7 @@ async fn test_pinning_zip_partial_success_targets_only_published_entries() {
             .into_iter()
             .map(|usage| (usage.provider, usage.reserved_bytes, usage.reserved_pins))
             .collect::<Vec<_>>(),
-        vec![(
-            "pinata-primary".to_owned(),
-            SECOND_ENTRY_BYTES.len() as i64,
-            1
-        )]
+        vec![(pinata_key.clone(), SECOND_ENTRY_BYTES.len() as i64, 1)]
     );
     let jobs = harness.pin_jobs().await;
     assert_eq!(jobs.len(), 1);
@@ -8666,7 +8664,7 @@ async fn test_pinning_zip_partial_success_targets_only_published_entries() {
         ),
         (
             "submit",
-            "pinata-primary",
+            pinata_key.as_str(),
             "QmEntry2",
             Some(manual.id.as_str()),
             Some(targets[0].id.as_str()),
@@ -8704,6 +8702,7 @@ async fn test_pinning_zip_partial_success_targets_only_published_entries() {
 async fn test_pinning_zip_archive_renewal_updates_all_entry_targets() {
     let archive_bytes = legal_two_entry_zip();
     let mut config = PinningHarnessConfig::request_one();
+    config.explicit_identity = true;
     config.kubo_script = KuboScript {
         add_replies: vec![
             AddReply::Ok("QmArchive"),
@@ -8721,6 +8720,7 @@ async fn test_pinning_zip_archive_renewal_updates_all_entry_targets() {
         PsaReply::pinned_submit("/psa/pins", "pinata-entry-2", "QmEntry2"),
     ];
     let mut harness = start_pinning_harness(config).await;
+    let pinata_key = harness.provider_key("pinata-primary");
 
     let put = signed_decompress_zip_put(
         &harness,
@@ -8851,7 +8851,7 @@ async fn test_pinning_zip_archive_renewal_updates_all_entry_targets() {
             .collect::<BTreeSet<_>>(),
         BTreeSet::from([
             (
-                "pinata-primary",
+                pinata_key.as_str(),
                 "QmEntry1",
                 None,
                 None,
@@ -8860,7 +8860,7 @@ async fn test_pinning_zip_archive_renewal_updates_all_entry_targets() {
                 "pending",
             ),
             (
-                "pinata-primary",
+                pinata_key.as_str(),
                 "QmEntry2",
                 None,
                 None,
@@ -8896,6 +8896,7 @@ async fn test_pinning_zip_archive_renewal_updates_all_entry_targets() {
 async fn test_pinning_zip_global_reject_creates_no_manual_lease() {
     let archive_bytes = archive_key_collision_zip();
     let mut config = PinningHarnessConfig::request_one();
+    config.explicit_identity = true;
     config.kubo_script = KuboScript {
         add_replies: vec![AddReply::Ok("QmArchive"), AddReply::Ok("QmCollisionEntry")],
         cat_bodies: HashMap::from([("QmArchive".to_owned(), archive_bytes.clone())]),

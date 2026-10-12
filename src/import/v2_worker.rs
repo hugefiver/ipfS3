@@ -7,9 +7,7 @@ use std::{
     time::Duration,
 };
 
-use futures_util::{StreamExt, stream::BoxStream};
 use sea_orm::{DatabaseConnection, TransactionTrait};
-use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -21,17 +19,17 @@ use crate::{
     kubo::directory::{
         DirectoryBuildError, DirectoryCandidate, DirectoryFile, build_directory_capturing_candidate,
     },
-    pinning::{policy::PublicationPolicy, zip_policy::ZipPublishedOutput},
     state::AppState,
     store::{
         import::ownership,
         pinning::publication::{
-            PublicationObject, ZipV2Publication, ZipV2PublicationResult, ZipV2Success,
+            CapturedZipPublication, PublicationObject, ZipExecutionSettlement,
+            ZipPublicationAuthority, decode_zip_capture_json, publish_captured_zip,
         },
         zip::{self, execution, import_intake},
     },
     zip::{
-        batch::final_zip_manifest,
+        batch::{FinalZipManifest, ManifestFailure, ManifestFile, final_zip_manifest},
         extract::{
             ExtractionObserver, ObservedExtractionError, extract_zip_stream_observed_with_limits,
         },
@@ -78,16 +76,40 @@ pub(super) async fn execute_with_heartbeat(
                 biased;
                 _ = shutdown.cancelled() => { cancel.cancel(); break; }
                 _ = interval.tick() => {
-                     let renewed = import_intake::renew(state.store.db(), &claim, lease_seconds).await;
-                    if !matches!(renewed, Ok(true)) {
+                    // Work can hold the transaction that renewal needs. Keep
+                    // polling both; awaiting renewal alone strands that lock.
+                    let heartbeat = async {
+                        let renewal = import_intake::renew(state.store.db(), &claim, lease_seconds);
+                        tokio::pin!(renewal);
+                        #[cfg(test)]
+                        let renewal = std::future::poll_fn(|cx| {
+                            let result = std::future::Future::poll(renewal.as_mut(), cx);
+                            if result.is_pending() {
+                                liveness_tests::renewal_pending(&claim.batch_id);
+                            }
+                            result
+                        });
+                        let renewed = renewal.await;
+                        if !matches!(renewed, Ok(true)) {
+                            return false;
+                        }
+                        if let Some(root) = root_claim.lock().await.clone()
+                            && zip::renew_claim(state.store.db(), &root, root_lease).await.is_err() {
+                            return false;
+                        }
+                        true
+                    };
+                    tokio::pin!(heartbeat);
+                    let renewed = tokio::select! {
+                        biased;
+                        _ = shutdown.cancelled() => false,
+                        renewed = &mut heartbeat => renewed,
+                        _ = &mut work => break,
+                    };
+                    if !renewed {
                         cancel.cancel();
                         break;
                     }
-                    if let Some(root) = root_claim.lock().await.clone()
-                        && zip::renew_claim(state.store.db(), &root, root_lease).await.is_err() {
-                            cancel.cancel();
-                            break;
-                        }
                 }
                 _ = &mut work => break,
             }
@@ -169,6 +191,8 @@ enum RunError {
     Retry,
     InvalidZip,
     DigestMismatch(String),
+    BoundArtifactUnavailable,
+    BoundArtifactMismatch,
     Fenced,
 }
 
@@ -221,6 +245,14 @@ pub(super) async fn execute_claim(
                 import_intake::ImportFailure::InvalidZip,
             )
             .await;
+        }
+        Err(error @ (RunError::BoundArtifactUnavailable | RunError::BoundArtifactMismatch)) => {
+            let failure = if matches!(error, RunError::BoundArtifactUnavailable) {
+                import_intake::ImportFailure::BoundArtifactUnavailable
+            } else {
+                import_intake::ImportFailure::BoundArtifactMismatch
+            };
+            let _ = import_intake::fail_if_owned(state.store.db(), claim, failure).await;
         }
         Err(RunError::Retry) => {
             // Epoch is durable across process restarts. A failed claim retains
@@ -279,39 +311,51 @@ async fn execute_inner(
     {
         return Err(RunError::Fenced);
     }
-    let revision = capture
-        .get("rule_revision")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned);
-    if options.targets != ZipTargets::None
-        && revision.as_deref() != Some(state.pinning.zip_output_rules().revision())
+    let intent =
+        decode_zip_capture_json(&snapshot.captured_options).map_err(|_| RunError::Fenced)?;
+    if intent.origin().principal_id != snapshot.owner
+        || intent.origin().request_id != snapshot.id
+        || intent.bucket() != snapshot.bucket
+        || intent.source_key() != snapshot.source_key
+        || intent.target_prefix() != prefix
+        || intent.v2_options().as_ref() != Some(&options)
     {
         return Err(RunError::Fenced);
     }
     let limits = state.pinning.zip_extraction_limits();
     if snapshot.state == "pending" {
-        let (cid, digest, size) = if let (Some(cid), Some(sha), Some(size)) = (
+        let (cid, digest, size, resumed) = match (
             snapshot.input_art_cid.clone(),
             snapshot.input_sha256.clone(),
             snapshot.input_art_size,
         ) {
-            (cid, sha, size)
-        } else {
-            let artifact = fetch_v2_zip_source(
-                coordinator,
-                state,
-                &source.source_descriptor,
-                source.expected_sha256.as_deref(),
-                cancel.clone(),
-                &limits,
-            )
-            .await
-            .map_err(|error| classify_source(&error))?;
-            let size = i64::try_from(artifact.size).map_err(|_| RunError::InvalidZip)?;
-            import_intake::bind_verified_input(db, claim, &artifact.sha256, &artifact.cid, size)
+            (Some(cid), Some(sha), Some(size)) if size >= 0 => (cid, sha, size, true),
+            (None, None, None) => {
+                let artifact = fetch_v2_zip_source(
+                    coordinator,
+                    state,
+                    &source.source_descriptor,
+                    source.expected_sha256.as_deref(),
+                    cancel.clone(),
+                    &limits,
+                )
+                .await
+                .map_err(|error| classify_source(&error))?;
+                let size = i64::try_from(artifact.size).map_err(|_| RunError::InvalidZip)?;
+                import_intake::bind_verified_input(
+                    db,
+                    claim,
+                    &artifact.sha256,
+                    &artifact.cid,
+                    size,
+                )
                 .await
                 .map_err(|_| RunError::Retry)?;
-            (artifact.cid, artifact.sha256, size)
+                (artifact.cid, artifact.sha256, size, false)
+            }
+            // The atomic binder never writes a partial identity. Do not treat
+            // corrupt persisted evidence as permission to replace its bytes.
+            _ => return Err(RunError::BoundArtifactMismatch),
         };
         if cancel.is_cancelled() {
             return Err(RunError::Lost);
@@ -323,6 +367,9 @@ async fn execute_inner(
         } else {
             // Source-only attests the complete input bytes, but never parses
             // entries, uploads children or invents an empty directory root.
+            if resumed {
+                verify_bound_artifact(state, &cid, &digest, size, cancel).await?;
+            }
             (Vec::new(), Vec::new())
         };
         let manifest = final_zip_manifest(&entries, &failures, &prefix);
@@ -420,6 +467,8 @@ async fn execute_inner(
                 .await
                 .map_err(|_| RunError::Retry)?;
         }
+        #[cfg(test)]
+        liveness_tests::pause_before_admission_commit(&claim.batch_id, &tx).await;
         tx.commit().await.map_err(|_| RunError::Retry)?;
     }
     // The first hint predates the clean-input bind. Use the durable admitted
@@ -479,22 +528,19 @@ async fn execute_inner(
     } else {
         None
     };
-    let mut source_policy = if options.publish_source {
-        Some(PublicationPolicy {
-            tags: serde_json::from_value(
-                capture
-                    .get("source_tags")
-                    .cloned()
-                    .ok_or(RunError::Fenced)?,
-            )
-            .map_err(|_| RunError::Fenced)?,
-            // Source tags are metadata, not authority to inherit manual intent.
-            leases: Vec::new(),
-        })
+    let source_tags = if options.publish_source {
+        serde_json::from_value(
+            capture
+                .get("source_tags")
+                .cloned()
+                .ok_or(RunError::Fenced)?,
+        )
+        .map_err(|_| RunError::Fenced)?
     } else {
-        None
+        Vec::new()
     };
     let mut successes = Vec::new();
+    let mut manifest = FinalZipManifest::default();
     let mut files = Vec::new();
     let mut failed = 0_usize;
     let mut root_error = None;
@@ -520,79 +566,41 @@ async fn execute_inner(
                 path: entry.path.clone(),
                 cid: cid.clone(),
             });
-            successes.push(ZipV2Success {
-                object: PublicationObject::from_put(
-                    uuid::Uuid::new_v4().to_string(),
-                    &snapshot.bucket,
-                    key,
-                    cid.clone(),
-                    size,
-                    None,
-                    None,
-                    false,
-                    None,
-                    None,
-                    chrono::Utc::now(),
-                ),
-                path: entry.path.clone(),
+            successes.push(PublicationObject::from_put(
+                uuid::Uuid::new_v4().to_string(),
+                &snapshot.bucket,
+                key,
+                cid.clone(),
+                size,
+                None,
+                None,
+                false,
+                None,
+                None,
+                chrono::Utc::now(),
+            ));
+            manifest.successful.push(ManifestFile {
+                relative_path: entry.path.clone(),
                 object_key: key.clone(),
                 cid: cid.clone(),
                 size,
-                policy: PublicationPolicy {
-                    tags: Vec::new(),
-                    leases: Vec::new(),
+            });
+        } else if let Some(code) = &entry.error_code {
+            failed += 1;
+            manifest.failed.push(ManifestFailure {
+                path: entry.path.clone(),
+                code: match code.as_str() {
+                    "entry_read_failed" => "entry_read_failed",
+                    "entry_upload_failed" => "entry_upload_failed",
+                    "entry_failed" => "entry_failed",
+                    _ => return Err(RunError::Fenced),
                 },
             });
-        } else if entry.error_code.is_some() {
-            failed += 1;
         } else {
             return Err(RunError::Lost);
         }
     }
-    if options.targets != ZipTargets::None {
-        let outputs = successes
-            .iter()
-            .map(|success| ZipPublishedOutput {
-                bucket: snapshot.bucket.clone(),
-                key: success.object_key.clone(),
-                version_id: "not-yet-published".into(),
-                cid: success.cid.clone(),
-            })
-            .collect::<Vec<_>>();
-        let plan = state
-            .pinning
-            .zip_output_rules()
-            .plan(
-                crate::pinning::zip_policy::ZipTargets {
-                    source: matches!(options.targets, ZipTargets::Source | ZipTargets::Both),
-                    extracted: matches!(options.targets, ZipTargets::Extracted | ZipTargets::Both),
-                },
-                source_object.as_ref().map(|object| ZipPublishedOutput {
-                    bucket: object.bucket.clone(),
-                    key: object.key.clone(),
-                    version_id: "not-yet-published".into(),
-                    cid: object.cid.clone(),
-                }),
-                &outputs,
-            )
-            .map_err(|_| RunError::Fenced)?;
-        for decision in plan.outputs {
-            let policy = if decision.kind == crate::pinning::zip_policy::ZipOutputKind::Source {
-                source_policy.as_mut().ok_or(RunError::Lost)?
-            } else {
-                &mut successes
-                    .iter_mut()
-                    .find(|output| output.object_key == decision.output.key)
-                    .ok_or(RunError::Lost)?
-                    .policy
-            };
-            policy.leases = decision
-                .intents
-                .into_iter()
-                .map(|intent| intent.intent)
-                .collect();
-        }
-    }
+    manifest.root_error = root_error;
     if !import_intake::renew(db, claim, 60)
         .await
         .map_err(|_| RunError::Retry)?
@@ -633,28 +641,24 @@ async fn execute_inner(
         "status": if successes.is_empty() && !options.publish_source { "failed" } else { "completed" },
     })
     .to_string();
-    let request = ZipV2Publication {
-        claim: claim.clone(),
+    let request = CapturedZipPublication {
+        batch_id: claim.batch_id.clone(),
         source: source_object,
-        source_policy,
-        source_guard,
+        source_tags,
         successes,
-        targets: options.targets,
-        captured_rule_revision: revision,
+        manifest,
+        capture: intent,
+        authority: ZipPublicationAuthority::Execution {
+            claim: claim.clone(),
+            source_guard,
+            settlement: ZipExecutionSettlement::Import,
+        },
         root_outcome: root,
         terminal_result: terminal,
     };
-    match import_intake::publish_import_zip_v2(
-        db,
-        request,
-        state.pinning.zip_output_rules(),
-        state.pinning.effective_config(),
-        state.pinning.provider_limits(),
-    )
-    .await
-    {
-        Ok(ZipV2PublicationResult::Published(_)) => Ok(()),
-        Ok(ZipV2PublicationResult::Fenced) => Err(RunError::Lost),
+    match publish_captured_zip(db, request).await {
+        Ok(_) => Ok(()),
+        Err(AppError::StaleContentMutation) => Err(RunError::Fenced),
         Err(_) => {
             // An unknown DB commit outcome is not proof of rollback. The next
             // due claim reconciles the committed receipt or retries the exact
@@ -679,6 +683,10 @@ async fn execute_inner(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/support/stage9_zip_import_liveness_review.rs"]
+mod liveness_tests;
 
 fn classify_source(error: &V2SourceError) -> RunError {
     if let Some(measured) = error.measured_sha256() {
@@ -731,29 +739,10 @@ async fn extract_artifact(
     size: i64,
     cancel: &CancellationToken,
 ) -> Result<crate::zip::extract::ExtractOutcome, RunError> {
-    let stream = crate::kubo::cat::stream_cat(&state.kubo, cid, None)
-        .await
-        .map_err(|_| RunError::Retry)?;
-    let shared = Arc::new(tokio::sync::Mutex::new((
-        Box::pin(stream) as BoxStream<'static, Result<bytes::Bytes, std::io::Error>>,
-        Sha256::new(),
-        0_u64,
-    )));
-    let for_extract = shared.clone();
-    let input = async_stream::stream! {
-        loop {
-            let next = {
-                let mut source = for_extract.lock().await;
-                let next = source.0.next().await;
-                if let Some(Ok(bytes)) = &next {
-                    source.1.update(bytes);
-                    source.2 += bytes.len() as u64;
-                }
-                next
-            };
-            match next { Some(frame) => yield frame, None => break }
-        }
-    };
+    let (input, tail) =
+        crate::import::v2_source::bound::open_bound_zip(state, cid, digest, size, cancel.clone())
+            .await
+            .map_err(bound_error)?;
     let mut observer = UniqueOutputs {
         seen: BTreeSet::new(),
         source_key: execution::read(state.store.db(), &claim.batch_id)
@@ -765,12 +754,15 @@ async fn extract_artifact(
     let result = extract_zip_stream_observed_with_limits(
         state,
         prefix,
-        Box::pin(input),
+        input,
         state.pinning.zip_extraction_limits(),
         &mut observer,
     )
-    .await
-    .map_err(|error| match error {
+    .await;
+    if let Some(error) = tail.failure().await {
+        return Err(bound_error(error));
+    }
+    let result = result.map_err(|error| match error {
         ObservedExtractionError::Observer(_) | ObservedExtractionError::Limit(_) => {
             RunError::InvalidZip
         }
@@ -783,22 +775,35 @@ async fn extract_artifact(
     // remaining CAT body to EOF, then verify the complete byte identity
     // against the first bound source read. A bytes_stream is not evidence of
     // HTTP trailer verification; that requires a frame-aware transport.
-    let mut source = shared.lock().await;
-    while let Some(chunk) = source.0.next().await {
-        let chunk = chunk.map_err(|_| RunError::Retry)?;
-        source.1.update(&chunk);
-        source.2 += chunk.len() as u64;
-        if source.2 > size as u64 {
-            return Err(RunError::Retry);
-        }
-    }
-    if source.2 != size as u64 || hex::encode(source.1.clone().finalize()) != digest {
-        return Err(RunError::Retry);
-    }
+    tail.finish().await.map_err(bound_error)?;
     if cancel.is_cancelled() {
         return Err(RunError::Lost);
     }
     Ok(result)
+}
+
+fn bound_error(error: crate::import::v2_source::bound::BoundCatError) -> RunError {
+    use crate::import::v2_source::bound::BoundCatError;
+    match error {
+        BoundCatError::Unavailable => RunError::BoundArtifactUnavailable,
+        BoundCatError::Mismatch => RunError::BoundArtifactMismatch,
+        BoundCatError::Canceled => RunError::Lost,
+        BoundCatError::Transport => RunError::Retry,
+    }
+}
+
+async fn verify_bound_artifact(
+    state: &AppState,
+    cid: &str,
+    digest: &str,
+    size: i64,
+    cancel: &CancellationToken,
+) -> Result<(), RunError> {
+    let (_, tail) =
+        crate::import::v2_source::bound::open_bound_zip(state, cid, digest, size, cancel.clone())
+            .await
+            .map_err(bound_error)?;
+    tail.finish().await.map_err(bound_error)
 }
 
 /// The caller-owned evidence that survives dropping the initial root build.

@@ -12,7 +12,7 @@ use crate::{
             ImportArtifact, ImportExecutionObserver, JobCancellation, NoopImportExecutionObserver,
         },
         progress::ProgressReporter,
-        publication::zip::{ZipPublicationData, publish_zip_import},
+        publication::zip::{ZipPublicationData, freeze_zip_import, publish_zip_import},
     },
     state::AppState,
     store::{entities::import_job, pinning::publication::PublicationResult},
@@ -91,12 +91,24 @@ pub(crate) async fn decompress_import_with_context(
     reporter
         .phase(ImportPhase::Decompressing, cancellation)
         .await?;
-    let stream = tokio::select! {
+    let proof =
+        crate::store::pinning::publication::read_legacy_import_input(state.store.db(), &job.id)
+            .await
+            .map_err(|error| {
+                crate::import::execution_error::map_publication_error(error, cancellation)
+            })?
+            .ok_or_else(|| {
+                terminal_failure(
+                    ImportFailureCode::PublicationFailed,
+                    "ZIP input proof needs_attention",
+                )
+            })?;
+    let (stream, tail) = tokio::select! {
         biased;
         _ = cancellation.shutdown.cancelled() => return Err(ImportExecutionError::Interrupted),
         _ = cancellation.ownership_lost.cancelled() => return Err(ImportExecutionError::Superseded),
-        result = crate::kubo::cat::stream_cat(&state.kubo, &artifact.cid, None) => {
-            result.map_err(|error| map_kubo_error(error, KuboOperation::Cat, cancellation))?
+        result = crate::import::v2_source::bound::open_bound_zip(state, &artifact.cid, proof.sha256(), proof.size(), cancellation.ownership_lost.clone()) => {
+            result.map_err(|error| crate::import::pipeline::zip::bound_error(error, cancellation))?
         }
     };
     let mut observer =
@@ -132,6 +144,7 @@ pub(crate) async fn decompress_import_with_context(
                     ));
                 }
                 Err(ObservedExtractionError::Archive(error)) => {
+                    if let Some(error) = tail.failure().await { return Err(crate::import::pipeline::zip::bound_error(error, cancellation)); }
                     return Err(map_archive_error(error, cancellation));
                 }
             }
@@ -142,9 +155,27 @@ pub(crate) async fn decompress_import_with_context(
         outcome.failures.len() >= observer.records.len().saturating_sub(outcome.entries.len())
     );
 
-    let manifest = job.root_capture_json.as_ref().map(|_| {
-        crate::zip::batch::final_zip_manifest(&outcome.entries, &outcome.failures, &target_prefix)
-    });
+    tokio::select! {
+        biased;
+        _ = cancellation.shutdown.cancelled() => return Err(ImportExecutionError::Interrupted),
+        _ = cancellation.ownership_lost.cancelled() => return Err(ImportExecutionError::Superseded),
+        result = tail.finish() => result.map_err(|error| crate::import::pipeline::zip::bound_error(error, cancellation))?,
+    }
+    let manifest =
+        crate::zip::batch::final_zip_manifest(&outcome.entries, &outcome.failures, &target_prefix);
+    let guard = freeze_zip_import(
+        state,
+        job,
+        claim,
+        &artifact,
+        ZipPublicationData {
+            entries: &observer.successful,
+            records: &observer.records,
+            manifest: Some(&manifest),
+        },
+        cancellation,
+    )
+    .await?;
 
     tokio::select! {
         biased;
@@ -163,8 +194,9 @@ pub(crate) async fn decompress_import_with_context(
         ZipPublicationData {
             entries: &observer.successful,
             records: &observer.records,
-            manifest: manifest.as_ref(),
+            manifest: Some(&manifest),
         },
+        guard,
         cancellation,
     )
     .await

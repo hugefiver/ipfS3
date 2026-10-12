@@ -45,6 +45,7 @@ use crate::{
 };
 
 mod hot_receipt_tests;
+pub(super) mod zip_fixture;
 
 fn limits() -> ProviderLimitMap {
     ProviderLimitMap::from([
@@ -95,7 +96,7 @@ async fn zip_duplicate_entry_location_preserves_last_entry_wins() {
         vec![],
     );
 
-    publish_zip(
+    zip_fixture::publish(
         &db,
         ZipPublicationRequest {
             archive,
@@ -492,6 +493,8 @@ async fn strict_legacy_provider_capture_publishes_automatic_and_manual_intents()
     let db = setup().await;
     let config: Config = toml::from_str(
         r#"
+        [decompress_zip]
+        auto_pin_outputs = false
         [pinning]
         [[pinning.providers]]
         name = "pinata"
@@ -1450,7 +1453,7 @@ async fn lifecycle_timestamp_all_publication_producers_share_the_database_clock(
     .await
     .unwrap();
 
-    publish_zip(
+    zip_fixture::publish(
         &db,
         ZipPublicationRequest {
             archive: request(
@@ -1516,10 +1519,21 @@ async fn lifecycle_timestamp_all_publication_producers_share_the_database_clock(
     .unwrap();
 
     let import_zip_now = Utc::now();
-    let import_zip_claim = claimed_import(
+    let import_zip_archive = request(
+        historical(
+            "timestamp-import-zip",
+            "timestamp-import-zip.zip",
+            "bafy-timestamp-import-zip",
+            7,
+        ),
+        vec![],
+        vec![],
+    );
+    let (import_zip_admission, import_zip_claim) = zip_fixture::claimed_import(
         &db,
         "timestamp-import-zip-job",
-        "timestamp-import-zip.zip",
+        &import_zip_archive,
+        "",
         import_zip_now,
     )
     .await;
@@ -1532,49 +1546,50 @@ async fn lifecycle_timestamp_all_publication_producers_share_the_database_clock(
     )
     .await
     .unwrap();
-    publish_import_zip(
-        &db,
-        ZipPublicationRequest {
-            archive: request(
-                historical(
-                    "timestamp-import-zip",
-                    "timestamp-import-zip.zip",
-                    "bafy-timestamp-import-zip",
-                    7,
+    import_zip_admission
+        .publish_import(
+            &db,
+            ZipPublicationRequest {
+                archive: request(
+                    historical(
+                        "timestamp-import-zip",
+                        "timestamp-import-zip.zip",
+                        "bafy-timestamp-import-zip",
+                        7,
+                    ),
+                    vec![],
+                    vec![],
                 ),
-                vec![],
-                vec![],
-            ),
-            entries: vec![historical(
-                "timestamp-import-zip-entry",
-                "timestamp-import-zip-entry.txt",
-                "bafy-timestamp-import-zip-entry",
-                3,
-            )],
-        },
-        ImportPublicationGuard {
-            job_id: import_zip_claim.job_id,
-            worker_id: import_zip_claim.worker_id,
-            claim_epoch: import_zip_claim.claim_epoch,
-            targets: vec![
-                ExpectedImportTarget {
-                    bucket: "bucket".to_owned(),
-                    key: "timestamp-import-zip.zip".to_owned(),
-                    generation: 1,
-                },
-                ExpectedImportTarget {
-                    bucket: "bucket".to_owned(),
-                    key: "timestamp-import-zip-entry.txt".to_owned(),
-                    generation: entry_generation,
-                },
-            ],
-        },
-        vec![],
-        supplied_historical_time,
-        &limits(),
-    )
-    .await
-    .unwrap();
+                entries: vec![historical(
+                    "timestamp-import-zip-entry",
+                    "timestamp-import-zip-entry.txt",
+                    "bafy-timestamp-import-zip-entry",
+                    3,
+                )],
+            },
+            ImportPublicationGuard {
+                job_id: import_zip_claim.job_id,
+                worker_id: import_zip_claim.worker_id,
+                claim_epoch: import_zip_claim.claim_epoch,
+                targets: vec![
+                    ExpectedImportTarget {
+                        bucket: "bucket".to_owned(),
+                        key: "timestamp-import-zip.zip".to_owned(),
+                        generation: 1,
+                    },
+                    ExpectedImportTarget {
+                        bucket: "bucket".to_owned(),
+                        key: "timestamp-import-zip-entry.txt".to_owned(),
+                        generation: entry_generation,
+                    },
+                ],
+            },
+            vec![],
+            supplied_historical_time,
+            &limits(),
+        )
+        .await
+        .unwrap();
 
     for object_id in [
         "timestamp-put",
@@ -2490,9 +2505,10 @@ async fn zip_archive_and_entries_share_one_atomic_version_transition() {
             object("atomic-entry-b", "out/b.txt", "bafy-b", 4),
         ],
     };
+    let admitted = zip_fixture::direct(&db, &publication.archive, "out/").await;
 
     assert!(matches!(
-        publish_zip(&db, publication.clone(), &limits()).await,
+        admitted.publish(&db, publication.clone(), &limits()).await,
         Err(AppError::Database(_))
     ));
     assert_no_publication_rows(&db).await;
@@ -2500,7 +2516,10 @@ async fn zip_archive_and_entries_share_one_atomic_version_transition() {
     db.execute_unprepared("DROP TRIGGER fail_zip_entry")
         .await
         .unwrap();
-    let result = publish_zip(&db, publication, &limits()).await.unwrap();
+    // The existing standard wrapper releases a failed attempt's guard. This
+    // second producer call owns a fresh native admission, not a stale guard.
+    let admitted = zip_fixture::direct(&db, &publication.archive, "out/").await;
+    let result = admitted.publish(&db, publication, &limits()).await.unwrap();
     let archive_version = result.version_id.unwrap();
     uuid::Uuid::parse_str(&archive_version).unwrap();
     for (key, object_id) in [
@@ -3047,6 +3066,13 @@ async fn newer_exact_import_fences_older_prefix_publication_without_side_effects
     )
     .await
     .unwrap();
+    let admitted = zip_fixture::with_guard(
+        &db,
+        &automatic_and_manual_request("stale-archive", "archive.zip", "bafy-stale-archive"),
+        "literal%_/Case/",
+        &guard,
+    )
+    .await;
     publish_import_winner(
         &db,
         "newer-prefix-winner",
@@ -3057,26 +3083,26 @@ async fn newer_exact_import_fences_older_prefix_publication_without_side_effects
     .await;
     let rows_after_import = publication_row_counts(&db).await;
 
-    let error = publish_standard_zip(
-        &db,
-        ZipPublicationRequest {
-            archive: automatic_and_manual_request(
-                "stale-archive",
-                "archive.zip",
-                "bafy-stale-archive",
-            ),
-            entries: vec![object(
-                "stale-entry",
-                "literal%_/Case/file.txt",
-                "bafy-stale-entry",
-                3,
-            )],
-        },
-        guard,
-        &limits(),
-    )
-    .await
-    .unwrap_err();
+    let error = admitted
+        .publish(
+            &db,
+            ZipPublicationRequest {
+                archive: automatic_and_manual_request(
+                    "stale-archive",
+                    "archive.zip",
+                    "bafy-stale-archive",
+                ),
+                entries: vec![object(
+                    "stale-entry",
+                    "literal%_/Case/file.txt",
+                    "bafy-stale-entry",
+                    3,
+                )],
+            },
+            &limits(),
+        )
+        .await
+        .unwrap_err();
 
     assert!(matches!(error, AppError::StaleContentMutation));
     assert_eq!(publication_row_counts(&db).await, rows_after_import);
@@ -3108,6 +3134,17 @@ async fn unrelated_exact_import_does_not_fence_older_prefix_publication() {
     )
     .await
     .unwrap();
+    let admitted = zip_fixture::with_guard(
+        &db,
+        &request(
+            object("archive", "archive.zip", "bafy-archive", 7),
+            vec![],
+            vec![],
+        ),
+        "outputs/",
+        &guard,
+    )
+    .await;
     publish_import_winner(
         &db,
         "unrelated-winner",
@@ -3117,21 +3154,21 @@ async fn unrelated_exact_import_does_not_fence_older_prefix_publication() {
     )
     .await;
 
-    publish_standard_zip(
-        &db,
-        ZipPublicationRequest {
-            archive: request(
-                object("archive", "archive.zip", "bafy-archive", 7),
-                vec![],
-                vec![],
-            ),
-            entries: vec![object("entry", "outputs/file.txt", "bafy-entry", 3)],
-        },
-        guard,
-        &limits(),
-    )
-    .await
-    .unwrap();
+    admitted
+        .publish(
+            &db,
+            ZipPublicationRequest {
+                archive: request(
+                    object("archive", "archive.zip", "bafy-archive", 7),
+                    vec![],
+                    vec![],
+                ),
+                entries: vec![object("entry", "outputs/file.txt", "bafy-entry", 3)],
+            },
+            &limits(),
+        )
+        .await
+        .unwrap();
 
     assert_eq!(
         crate::store::object::get_latest(&db, "bucket", "outputs/file.txt")
@@ -3205,6 +3242,17 @@ async fn newer_overlapping_prefix_fences_older_prefix_even_if_newer_never_publis
     )
     .await
     .unwrap();
+    let admitted = zip_fixture::with_guard(
+        &db,
+        &request(
+            object("stale-archive", "older.zip", "bafy-stale-archive", 7),
+            vec![],
+            vec![],
+        ),
+        "literal%_/Case/",
+        &old_guard,
+    )
+    .await;
     let _new_guard = crate::store::import::ownership::admit_content_and_prefix_mutation(
         &db,
         "bucket",
@@ -3216,26 +3264,26 @@ async fn newer_overlapping_prefix_fences_older_prefix_even_if_newer_never_publis
     .await
     .unwrap();
 
-    let error = publish_standard_zip(
-        &db,
-        ZipPublicationRequest {
-            archive: request(
-                object("stale-archive", "older.zip", "bafy-stale-archive", 7),
-                vec![],
-                vec![],
-            ),
-            entries: vec![object(
-                "stale-entry",
-                "literal%_/Case/file.txt",
-                "bafy-stale-entry",
-                3,
-            )],
-        },
-        old_guard,
-        &limits(),
-    )
-    .await
-    .unwrap_err();
+    let error = admitted
+        .publish(
+            &db,
+            ZipPublicationRequest {
+                archive: request(
+                    object("stale-archive", "older.zip", "bafy-stale-archive", 7),
+                    vec![],
+                    vec![],
+                ),
+                entries: vec![object(
+                    "stale-entry",
+                    "literal%_/Case/file.txt",
+                    "bafy-stale-entry",
+                    3,
+                )],
+            },
+            &limits(),
+        )
+        .await
+        .unwrap_err();
 
     assert!(matches!(error, AppError::StaleContentMutation));
     assert_no_publication_rows(&db).await;
@@ -3557,7 +3605,9 @@ async fn guarded_import_completion_after_capped_job_deadline_rolls_back() {
 async fn lost_import_zip_target_rolls_back_archive_entries_results_and_leases() {
     let db = setup().await;
     let now = Utc::now();
-    let claim = claimed_import(&db, "zip-job", "archive.zip", now).await;
+    let archive = automatic_and_manual_request("archive-object", "archive.zip", "bafy-archive");
+    let (admitted, claim) =
+        zip_fixture::claimed_import(&db, "zip-job", &archive, "out/", now).await;
     let entry_generation = claim_extracted_target(&db, &claim, "bucket", "out/file.txt", now)
         .await
         .unwrap();
@@ -3586,28 +3636,28 @@ async fn lost_import_zip_target_rolls_back_archive_entries_results_and_leases() 
             },
         ],
     };
-    let archive = automatic_and_manual_request("archive-object", "archive.zip", "bafy-archive");
-    let error = publish_import_zip(
-        &db,
-        ZipPublicationRequest {
-            archive,
-            entries: vec![object("entry-object", "out/file.txt", "bafy-entry", 3)],
-        },
-        guard,
-        vec![import_job_result::ActiveModel {
-            job_id: Set("zip-job".to_owned()),
-            sequence: Set(0),
-            key: Set("out/file.txt".to_owned()),
-            cid: Set(Some("bafy-entry".to_owned())),
-            size: Set(Some(3)),
-            error_code: Set(None),
-            error_message: Set(None),
-        }],
-        now,
-        &limits(),
-    )
-    .await
-    .unwrap_err();
+    let error = admitted
+        .publish_import(
+            &db,
+            ZipPublicationRequest {
+                archive,
+                entries: vec![object("entry-object", "out/file.txt", "bafy-entry", 3)],
+            },
+            guard,
+            vec![import_job_result::ActiveModel {
+                job_id: Set("zip-job".to_owned()),
+                sequence: Set(0),
+                key: Set("out/file.txt".to_owned()),
+                cid: Set(Some("bafy-entry".to_owned())),
+                size: Set(Some(3)),
+                error_code: Set(None),
+                error_message: Set(None),
+            }],
+            now,
+            &limits(),
+        )
+        .await
+        .unwrap_err();
     assert!(matches!(error, AppError::StaleImportOwnership));
     assert_no_publication_rows(&db).await;
     assert_eq!(
@@ -4120,7 +4170,6 @@ async fn completed_publication_after_abort_rolls_back_without_object_version() {
 async fn completed_publication_winner_removes_the_exact_upload() {
     let (_directory, first, second) =
         setup_independent_file_backed("completed-publication-wins.sqlite").await;
-    let upload_target = seed_upload(&first, "completion-wins", "archive.zip").await;
     let retained_target = seed_upload(&first, "retained-upload", "other.bin").await;
     let mut archive = object(
         "completion-winner-archive",
@@ -4129,7 +4178,7 @@ async fn completed_publication_winner_removes_the_exact_upload() {
         7,
     );
     archive.multipart = true;
-    let publication = ZipPublicationRequest {
+    let mut publication = ZipPublicationRequest {
         archive: request(archive, vec![], vec![]),
         entries: vec![object(
             "completion-winner-entry",
@@ -4138,6 +4187,8 @@ async fn completed_publication_winner_removes_the_exact_upload() {
             3,
         )],
     };
+    let (admitted, upload_target) =
+        zip_fixture::upload(&first, "completion-wins", &publication.archive, "out/").await;
 
     let mut stale_created_at = upload_target.clone();
     stale_created_at.initiated_at += chrono::Duration::seconds(1);
@@ -4146,10 +4197,10 @@ async fn completed_publication_winner_removes_the_exact_upload() {
     let mut wrong_key = upload_target.clone();
     wrong_key.key = "other-key".to_owned();
     for stale_target in [stale_created_at, wrong_bucket, wrong_key] {
-        let stale_error =
-            publish_completed_zip(&second, &stale_target, publication.clone(), &limits())
-                .await
-                .unwrap_err();
+        let stale_error = admitted
+            .publish_completed(&second, &stale_target, publication.clone(), &limits())
+            .await
+            .unwrap_err();
         assert!(matches!(
             stale_error,
             CommitCompletedUploadError::RolledBack {
@@ -4165,19 +4216,25 @@ async fn completed_publication_winner_removes_the_exact_upload() {
         );
     }
 
+    let batch = admitted.prepare(&first, &mut publication).await;
+    publication.archive.object.multipart = true;
+    let guard = admitted.completion_guard(&first).await;
+    let replay = zip_fixture::replay();
     let completion_transaction = first.begin().await.unwrap();
-    let publication_result = publish_in_transaction(
+    let publication_result = publish_in_transaction_with_batch(
         &completion_transaction,
         publication.archive,
         publication.entries,
+        Some(&batch),
         Some(&upload_target),
-        None,
+        Some(&guard),
         None,
         Vec::new(),
         None,
         None,
         &limits(),
         None,
+        Some(&replay),
     )
     .await
     .unwrap();
@@ -4267,7 +4324,9 @@ async fn multipart_zip_failure_points_preserve_upload_parts_prior_latest_and_rol
         )
         .await
         .unwrap();
-        let upload_target = seed_upload(&db, "upload-zip", "archive.zip").await;
+        let archive = automatic_and_manual_request("archive-new", "archive.zip", "bafy-archive");
+        let (admitted, upload_target) =
+            zip_fixture::upload(&db, "upload-zip", &archive, "unzipped/").await;
         let trigger = match failure {
             "archive" => {
                 "CREATE TRIGGER fail_publication BEFORE INSERT ON objects WHEN NEW.id = 'archive-new' BEGIN SELECT RAISE(FAIL, 'archive'); END;"
@@ -4284,7 +4343,6 @@ async fn multipart_zip_failure_points_preserve_upload_parts_prior_latest_and_rol
             _ => unreachable!(),
         };
         db.execute_unprepared(trigger).await.unwrap();
-        let archive = automatic_and_manual_request("archive-new", "archive.zip", "bafy-archive");
         let publication = ZipPublicationRequest {
             archive,
             entries: vec![
@@ -4293,10 +4351,21 @@ async fn multipart_zip_failure_points_preserve_upload_parts_prior_latest_and_rol
             ],
         };
 
-        let error = publish_completed_zip(&db, &upload_target, publication, &limits())
+        let error = admitted
+            .publish_completed(&db, &upload_target, publication, &limits())
             .await
             .unwrap_err();
 
+        assert!(
+            matches!(
+                &error,
+                CommitCompletedUploadError::RolledBack {
+                    source: AppError::Database(_),
+                    ..
+                }
+            ),
+            "failure point {failure}: {error:?}"
+        );
         assert!(matches!(
             error,
             CommitCompletedUploadError::RolledBack {
@@ -4400,7 +4469,6 @@ async fn multipart_non_zip_and_zip_success_publish_and_remove_upload_parts_atomi
     );
     assert_eq!(targets_for_object(&db, "complete-object").await.len(), 1);
 
-    let zip_upload_target = seed_upload(&db, "upload-zip", "archive.zip").await;
     let mut archive_object = object("complete-zip", "archive.zip", "bafy-archive", 7);
     archive_object.multipart = true;
     let archive = request(
@@ -4413,20 +4481,23 @@ async fn multipart_non_zip_and_zip_success_publish_and_remove_upload_parts_atomi
             ContentMode::Decompressed,
         )],
     );
-    publish_completed_zip(
-        &db,
-        &zip_upload_target,
-        ZipPublicationRequest {
-            archive,
-            entries: vec![
-                object("zip-entry-a", "out/a", "bafy-a", 3),
-                object("zip-entry-b", "out/b", "bafy-b", 4),
-            ],
-        },
-        &limits(),
-    )
-    .await
-    .unwrap();
+    let (admitted, zip_upload_target) =
+        zip_fixture::upload(&db, "upload-zip", &archive, "out/").await;
+    admitted
+        .publish_completed(
+            &db,
+            &zip_upload_target,
+            ZipPublicationRequest {
+                archive,
+                entries: vec![
+                    object("zip-entry-a", "out/a", "bafy-a", 3),
+                    object("zip-entry-b", "out/b", "bafy-b", 4),
+                ],
+            },
+            &limits(),
+        )
+        .await
+        .unwrap();
     assert!(multipart::get_upload(&db, "upload-zip").await.is_err());
     assert!(
         multipart::list_parts(&db, "upload-zip")
@@ -4985,7 +5056,7 @@ async fn zip_decompressed_manual_targets_only_successful_entries_while_automatic
             ),
         ],
     );
-    publish_zip(
+    zip_fixture::publish(
         &db,
         ZipPublicationRequest {
             archive,

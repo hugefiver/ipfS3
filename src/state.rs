@@ -36,13 +36,11 @@ impl AppState {
             .as_ref()
             .map(|config| KuboClient::new(config.rpc_url.clone()));
         let validated_pinning = ValidatedPinningConfig::from_config(cfg, get_env)?;
-        let pinning = PinningCoordinator::build_with_zip_limits(
+        let pinning = PinningCoordinator::build_with_decompress_config(
             validated_pinning,
             Some(kubo.clone()),
             cfg.pinning_control.unavailable,
-            cfg.decompress_zip.unixfs_directory_root,
-            &cfg.decompress_zip.pin_output_rules,
-            cfg.decompress_zip.limits,
+            &cfg.decompress_zip,
         )?;
 
         let db = crate::store::connect_database(&cfg.storage.database_url).await?;
@@ -351,7 +349,24 @@ mod tests {
             effect = "deny"
         "#,
         );
-        let mut config: Config = toml::from_str(&raw).unwrap();
+        let old_config: Config = toml::from_str(&raw).unwrap();
+        assert_eq!(old_config.decompress_zip.auto_pin_outputs, None);
+        assert_eq!(old_config.decompress_zip.output_rules().unwrap().len(), 3);
+        let migration = match AppState::new_with_env(&old_config, |_| None).await {
+            Ok(_) => panic!("old ZIP-only rules need an explicit automatic-output migration"),
+            Err(error) => error.to_string(),
+        };
+        assert!(migration.contains("ZIP configuration migration required"));
+        assert!(migration.contains("auto_pin_outputs = true"));
+        assert!(migration.contains("or false"));
+
+        let migrated = raw.replacen(
+            "[decompress_zip]",
+            "[decompress_zip]\nauto_pin_outputs = true",
+            1,
+        );
+        let mut config: Config = toml::from_str(&migrated).unwrap();
+        assert_eq!(config.decompress_zip.auto_pin_outputs, Some(true));
         let state = AppState::new_with_env(&config, |_| None).await.unwrap();
         assert!(!state.pinning.zip_root_default());
         let expected_key = &normalized.providers[0].name;
@@ -397,6 +412,27 @@ mod tests {
         assert_eq!(plan.outputs[1].warning, Some(ZipPlanWarning::Denied));
         assert!(plan.outputs[1].intents.is_empty());
 
+        let mut without_auto = config.clone();
+        without_auto.decompress_zip.auto_pin_outputs = Some(false);
+        let explicit_only = AppState::new_with_env(&without_auto, |_| None)
+            .await
+            .unwrap();
+        assert_eq!(
+            explicit_only
+                .pinning
+                .zip_output_rules()
+                .plan(
+                    ZipTargets {
+                        source: false,
+                        extracted: true,
+                    },
+                    None,
+                    &outputs,
+                )
+                .unwrap(),
+            plan
+        );
+
         config.decompress_zip.pin_output_rules.clear();
         assert_eq!(state.pinning.zip_output_rules().revision(), revision);
         assert_eq!(
@@ -431,7 +467,8 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("ZIP rule references unknown policy identity")
+                .contains("ZIP rule references unknown policy identity"),
+            "unexpected startup error: {error:#}"
         );
     }
 }

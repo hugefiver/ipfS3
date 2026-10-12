@@ -152,10 +152,13 @@ pub async fn renew_claim(
 
 pub async fn mark_invoked(db: &DatabaseConnection, claim: &RootClaim) -> AppResult<()> {
     let tx = db.begin().await?;
-    lock_batch(&tx, &claim.batch_id).await?;
+    let batch = lock_batch(&tx, &claim.batch_id).await?;
     let build = current_claim(&tx, claim).await?;
     if !matches!(build.status.as_str(), "intent" | "reconciling") {
         return Err(stale());
+    }
+    if batch.state == "published" && batch.root_status == "failed" {
+        super::publication::verify_root_retry_binding(&tx, &batch).await?;
     }
     zip_root_build::ActiveModel {
         status: Set("invoked".into()),

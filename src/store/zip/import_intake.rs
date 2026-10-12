@@ -27,9 +27,150 @@ pub struct Request {
     pub expected_sha256: Option<String>,
 }
 
+/// Preserve source headers before the proof CAS. A crash before binding may
+/// overwrite this staging value; once proof is bound it becomes immutable.
+pub(crate) async fn stage_legacy_input_metadata(
+    db: &DatabaseConnection,
+    claim: &crate::import::ImportClaim,
+    bucket: &str,
+    metadata: &str,
+) -> AppResult<()> {
+    if metadata.len() > 1_048_576 {
+        return Err(AppError::StaleContentMutation);
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(metadata).map_err(|_| AppError::StaleContentMutation)?;
+    if value.get("kind").and_then(serde_json::Value::as_str) != Some("verified_input") {
+        return Err(AppError::StaleContentMutation);
+    }
+    let tx = db.begin().await?;
+    ownership::lock_bucket_for_ownership(&tx, bucket).await?;
+    ownership::verify_active_claim(&tx, claim, bucket).await?;
+    let batch = super::lock_batch(&tx, &claim.job_id).await?;
+    if batch.source != "import"
+        || batch.token != claim.job_id
+        || batch.bucket != bucket
+        || batch.state != "open"
+        || batch.source_published
+        || batch.manifest_prepared
+    {
+        return Err(AppError::StaleContentMutation);
+    }
+    let mut options: serde_json::Value = serde_json::from_str(&batch.captured_options)
+        .map_err(|_| AppError::StaleContentMutation)?;
+    if crate::store::pinning::publication::read_legacy_import_input(&tx, &claim.job_id)
+        .await?
+        .is_some()
+    {
+        if options.get("legacy_input_metadata") != Some(&value) {
+            return Err(AppError::StaleContentMutation);
+        }
+    } else {
+        options
+            .as_object_mut()
+            .ok_or(AppError::StaleContentMutation)?
+            .insert("legacy_input_metadata".into(), value);
+        tx.execute(sql(
+            &tx,
+            "UPDATE zip_batches SET captured_options=? WHERE id=?",
+            "UPDATE zip_batches SET captured_options=$1 WHERE id=$2",
+            vec![options.to_string().into(), claim.job_id.clone().into()],
+        ))
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Freeze legacy response metadata with the manifest under the original target
+/// generations. Private recovery siblings leave the original ZIP intent intact;
+/// terminal_result remains NULL until the shared publication transaction.
+pub(crate) async fn freeze_legacy_manifest(
+    db: &DatabaseConnection,
+    guard: &ownership::ImportPublicationGuard,
+    bucket: &str,
+    locations: &[(String, String)],
+    items: &[super::ManifestItem],
+    prepared_json: &str,
+) -> AppResult<()> {
+    use crate::store::entities::zip_manifest_entry;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    // This metadata is derived from the extractor's existing entry/metadata
+    // budgets; an extra 1 MiB cap would reject otherwise valid legacy archives.
+    if serde_json::from_str::<serde_json::Value>(prepared_json).is_err() {
+        return Err(AppError::StaleContentMutation);
+    }
+    let tx = db.begin().await?;
+    ownership::lock_bucket_for_ownership(&tx, bucket).await?;
+    ownership::verify_publication_guard(&tx, guard, bucket, locations).await?;
+    let batch = super::lock_batch(&tx, &guard.job_id).await?;
+    if batch.source != "import"
+        || batch.token != guard.job_id
+        || batch.bucket != bucket
+        || batch.state != "open"
+        || batch.source_published
+        || crate::store::pinning::publication::read_legacy_import_input(&tx, &guard.job_id)
+            .await?
+            .is_none()
+    {
+        return Err(AppError::StaleContentMutation);
+    }
+    let mut options: serde_json::Value = serde_json::from_str(&batch.captured_options)
+        .map_err(|_| AppError::StaleContentMutation)?;
+    let prepared: serde_json::Value =
+        serde_json::from_str(prepared_json).map_err(|_| AppError::StaleContentMutation)?;
+    if batch.manifest_prepared {
+        let entries = zip_manifest_entry::Entity::find()
+            .filter(zip_manifest_entry::Column::BatchId.eq(&guard.job_id))
+            .all(&tx)
+            .await?;
+        if options.get("legacy_prepared_import") != Some(&prepared)
+            || !crate::store::import::results::matches_zip_manifest(&entries, items)
+        {
+            return Err(AppError::StaleContentMutation);
+        }
+    } else {
+        if let Some(old) = options.get("legacy_input_metadata") {
+            let proof =
+                crate::store::pinning::publication::read_legacy_import_input(&tx, &guard.job_id)
+                    .await?
+                    .ok_or(AppError::StaleContentMutation)?;
+            if old.get("kind").and_then(serde_json::Value::as_str) != Some("verified_input")
+                || old.get("cid").and_then(serde_json::Value::as_str) != Some(proof.cid())
+                || old.get("sha256").and_then(serde_json::Value::as_str) != Some(proof.sha256())
+                || old.get("size").and_then(serde_json::Value::as_i64) != Some(proof.size())
+                || old.get("content_type") != prepared.get("content_type")
+            {
+                return Err(AppError::StaleContentMutation);
+            }
+        }
+        super::ManifestItem::prepare_manifest_in_transaction(&tx, &guard.job_id, items).await?;
+        options
+            .as_object_mut()
+            .ok_or(AppError::StaleContentMutation)?
+            .insert("legacy_prepared_import".into(), prepared);
+        let changed = tx
+            .execute(sql(
+                &tx,
+                "UPDATE zip_batches SET captured_options=? WHERE id=?",
+                "UPDATE zip_batches SET captured_options=$1 WHERE id=$2",
+                vec![options.to_string().into(), guard.job_id.clone().into()],
+            ))
+            .await?;
+        if changed.rows_affected() != 1 {
+            return Err(AppError::StaleContentMutation);
+        }
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 pub struct Status {
     pub id: String,
     pub state: &'static str,
+    /// Immutable admission response, distinct from current status and the
+    /// publication/failure receipt. POST replays these exact XML bytes.
+    pub accepted_xml: String,
     pub expected_sha256: Option<String>,
     pub measured_sha256: Option<String>,
     /// Authenticated store status; the root may be retried independently of
@@ -107,8 +248,8 @@ pub async fn legacy_token_exists<C: ConnectionTrait>(
 async fn existing<C: ConnectionTrait>(db: &C, req: &Request) -> AppResult<Option<Status>> {
     let a = &req.admission;
     let row = db.query_one(sql(db,
-        "SELECT r.batch_id,r.owner,r.bucket,r.source_key,r.prefix,r.source_descriptor,r.expected_sha256,r.request_contract,e.state,e.input_sha256,r.job_state,r.receipt_metadata,b.root_status FROM zip_v2_import_requests r JOIN zip_v2_executions e ON e.id=r.batch_id LEFT JOIN zip_batches b ON b.id=r.batch_id WHERE r.owner=? AND r.client_token=?",
-        "SELECT r.batch_id,r.owner,r.bucket,r.source_key,r.prefix,r.source_descriptor,r.expected_sha256,r.request_contract,e.state,e.input_sha256,r.job_state,r.receipt_metadata,b.root_status FROM zip_v2_import_requests r JOIN zip_v2_executions e ON e.id=r.batch_id LEFT JOIN zip_batches b ON b.id=r.batch_id WHERE r.owner=$1 AND r.client_token=$2",
+        "SELECT r.batch_id,r.owner,r.bucket,r.source_key,r.prefix,r.source_descriptor,r.expected_sha256,r.request_contract,e.state,e.input_sha256,e.captured_options,e.source,e.owner AS execution_owner,e.token AS execution_token,e.request_contract AS execution_contract,r.job_state,r.receipt_metadata,b.root_status FROM zip_v2_import_requests r JOIN zip_v2_executions e ON e.id=r.batch_id LEFT JOIN zip_batches b ON b.id=r.batch_id WHERE r.owner=? AND r.client_token=?",
+        "SELECT r.batch_id,r.owner,r.bucket,r.source_key,r.prefix,r.source_descriptor,r.expected_sha256,r.request_contract,e.state,e.input_sha256,e.captured_options,e.source,e.owner AS execution_owner,e.token AS execution_token,e.request_contract AS execution_contract,r.job_state,r.receipt_metadata,b.root_status FROM zip_v2_import_requests r JOIN zip_v2_executions e ON e.id=r.batch_id LEFT JOIN zip_batches b ON b.id=r.batch_id WHERE r.owner=$1 AND r.client_token=$2",
         vec![a.owner.clone().into(), a.token.clone().into()])).await?;
     let Some(row) = row else { return Ok(None) };
     let contract: String = row.try_get("", "request_contract")?;
@@ -123,6 +264,11 @@ async fn existing<C: ConnectionTrait>(db: &C, req: &Request) -> AppResult<Option
         || bucket != a.bucket
         || source_key != a.source_key
         || expected != req.expected_sha256
+        || a.source != "import"
+        || row.try_get::<String>("", "source")? != a.source
+        || row.try_get::<String>("", "execution_owner")? != a.owner
+        || row.try_get::<String>("", "execution_token")? != a.token
+        || row.try_get::<String>("", "execution_contract")? != a.request_contract
     {
         return Err(conflict());
     }
@@ -130,6 +276,9 @@ async fn existing<C: ConnectionTrait>(db: &C, req: &Request) -> AppResult<Option
 }
 
 fn status_from_row(row: sea_orm::QueryResult) -> AppResult<Status> {
+    let id: String = row.try_get("", "batch_id")?;
+    let captured: String = row.try_get("", "captured_options")?;
+    let accepted_xml = accepted_receipt(&id, &captured)?;
     let execution_state: String = row.try_get("", "state")?;
     let job_state: String = row.try_get("", "job_state")?;
     let receipt: Option<String> = row.try_get("", "receipt_metadata")?;
@@ -154,13 +303,28 @@ fn status_from_row(row: sea_orm::QueryResult) -> AppResult<Status> {
         None
     };
     Ok(Status {
-        id: row.try_get("", "batch_id")?,
+        id,
         state,
+        accepted_xml,
         expected_sha256: row.try_get("", "expected_sha256")?,
         measured_sha256: measured,
         root_status: row.try_get("", "root_status")?,
         published_source,
     })
+}
+
+fn accepted_receipt(id: &str, captured: &str) -> AppResult<String> {
+    let capture: serde_json::Value = serde_json::from_str(captured).map_err(|_| stale())?;
+    let original = crate::import::response::accepted_xml(id, "pending", "accepted");
+    if let Some(receipt) = capture.get("accepted_response") {
+        if receipt != &serde_json::json!({"version": 1, "xml": original}) {
+            return Err(stale());
+        }
+        return Ok(receipt["xml"].as_str().ok_or_else(stale)?.to_owned());
+    }
+    // Before R25 every v2 intake used this same admission wire. A missing
+    // receipt is decoded as that historical wire, never as its current state.
+    Ok(original)
 }
 
 pub async fn preflight(db: &DatabaseConnection, req: &Request) -> AppResult<Option<Status>> {
@@ -212,6 +376,10 @@ async fn admit_once(db: &DatabaseConnection, req: &Request) -> AppResult<Status>
         return Ok(status);
     }
     let a = &req.admission;
+    if a.source != "import" {
+        return Err(AppError::InvalidImportRequest);
+    }
+    let accepted_xml = accepted_receipt(&a.id, &a.captured_options)?;
     // No standalone execution::admit: its own commit would orphan the batch
     // if the request insert fails.
     execution::admit_in_transaction(&tx, a).await?;
@@ -228,6 +396,7 @@ async fn admit_once(db: &DatabaseConnection, req: &Request) -> AppResult<Status>
     Ok(Status {
         id: a.id.clone(),
         state: "pending",
+        accepted_xml,
         expected_sha256: req.expected_sha256.clone(),
         measured_sha256: None,
         root_status: None,
@@ -244,8 +413,8 @@ pub async fn read_for_path(
     key: &str,
 ) -> AppResult<Option<Status>> {
     let row = db.query_one(sql(db,
-        "SELECT r.batch_id,r.expected_sha256,r.job_state,r.receipt_metadata,e.state,e.input_sha256,b.root_status FROM zip_v2_import_requests r JOIN zip_v2_executions e ON e.id=r.batch_id LEFT JOIN zip_batches b ON b.id=r.batch_id WHERE r.batch_id=? AND r.owner=? AND r.bucket=? AND r.source_key=?",
-        "SELECT r.batch_id,r.expected_sha256,r.job_state,r.receipt_metadata,e.state,e.input_sha256,b.root_status FROM zip_v2_import_requests r JOIN zip_v2_executions e ON e.id=r.batch_id LEFT JOIN zip_batches b ON b.id=r.batch_id WHERE r.batch_id=$1 AND r.owner=$2 AND r.bucket=$3 AND r.source_key=$4",
+        "SELECT r.batch_id,r.expected_sha256,r.job_state,r.receipt_metadata,e.state,e.input_sha256,e.captured_options,b.root_status FROM zip_v2_import_requests r JOIN zip_v2_executions e ON e.id=r.batch_id LEFT JOIN zip_batches b ON b.id=r.batch_id WHERE r.batch_id=? AND r.owner=? AND r.bucket=? AND r.source_key=?",
+        "SELECT r.batch_id,r.expected_sha256,r.job_state,r.receipt_metadata,e.state,e.input_sha256,e.captured_options,b.root_status FROM zip_v2_import_requests r JOIN zip_v2_executions e ON e.id=r.batch_id LEFT JOIN zip_batches b ON b.id=r.batch_id WHERE r.batch_id=$1 AND r.owner=$2 AND r.bucket=$3 AND r.source_key=$4",
         vec![id.into(),owner.into(),bucket.into(),key.into()])).await?;
     row.map(status_from_row).transpose()
 }
@@ -298,8 +467,8 @@ pub async fn claimed_source(
     .transpose()
 }
 
-/// Only after clean ZIP EOF/trailer verification: compare the signed URL
-/// promise before binding measured bytes. CID imports also bind measured SHA;
+/// Only after complete source EOF and Kubo upload drain: compare any historical
+/// expected promise before binding measured bytes. CID imports bind measured SHA;
 /// CID identity alone is not a ZIP digest.
 pub async fn bind_verified_input(
     db: &DatabaseConnection,
@@ -606,8 +775,8 @@ async fn verify_source_receipt(
     {
         return Err(stale());
     }
-    // The publisher inserts this typed policy after validating each exact
-    // output's automatic-rule intersection. It must never contain raw errors.
+    // This compatibility receipt is the original frozen source decision, not
+    // per-output authorization. Manual archive intent must survive unchanged.
     let policy = envelope
         .get("source_policy")
         .and_then(serde_json::Value::as_object)
@@ -623,12 +792,15 @@ async fn verify_source_receipt(
     let captured_tags: Vec<crate::pinning::tags::ObjectTag> =
         serde_json::from_value(capture.get("source_tags").cloned().ok_or_else(stale)?)
             .map_err(|_| stale())?;
+    let intent =
+        crate::store::pinning::publication::decode_zip_capture_json(&snapshot.captured_options)?;
     if policy.len() != 2
         || tags != captured_tags
-        || leases.iter().any(|lease| {
-            lease.source != crate::pinning::policy::LeaseSource::Automatic
-                || lease.content_mode != crate::pinning::tags::ContentMode::Object
-        })
+        || intent
+            .source_decision()
+            .replay_policy(tags.clone())
+            .is_err()
+        || leases != intent.source_decision().effective_intents
     {
         return Err(stale());
     }
@@ -647,6 +819,8 @@ pub enum ImportFailure<'a> {
         measured_sha256: &'a str,
     },
     InvalidZip,
+    BoundArtifactUnavailable,
+    BoundArtifactMismatch,
 }
 
 impl ImportFailure<'_> {
@@ -654,6 +828,8 @@ impl ImportFailure<'_> {
         match self {
             Self::ExpectedSha256Mismatch { .. } => "expected_sha256_mismatch",
             Self::InvalidZip => "invalid_zip",
+            Self::BoundArtifactUnavailable => "bound_artifact_unavailable",
+            Self::BoundArtifactMismatch => "bound_artifact_mismatch",
         }
     }
 }

@@ -23,6 +23,14 @@ pub(super) const CAPTURES: [&str; 7] = [
     "zip_v2_mpu_intakes",
     "pin_lease_requirements",
 ];
+pub(super) const CAPTURE_COLUMNS: [&str; 6] = [
+    "snapshot",
+    "pin_decision_json",
+    "zip_intent_json",
+    "captured_options",
+    "captured_config",
+    "contract",
+];
 
 pub(super) fn bindings(images: &[TableImage], source: &str) -> AppResult<Vec<Binding>> {
     let mut result = vec![];
@@ -49,13 +57,7 @@ pub(super) fn bindings(images: &[TableImage], source: &str) -> AppResult<Vec<Bin
                 });
             }
             if CAPTURES.contains(&image.table.as_str()) {
-                for column in [
-                    "snapshot",
-                    "pin_decision_json",
-                    "captured_options",
-                    "captured_config",
-                    "contract",
-                ] {
+                for column in CAPTURE_COLUMNS {
                     if let Some(raw) = field(row, column) {
                         let value: serde_json::Value = serde_json::from_str(raw)
                             .map_err(|_| refused("captured provider keys cannot be parsed"))?;

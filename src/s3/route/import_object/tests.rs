@@ -857,6 +857,171 @@ async fn signed_import_server_with_root_default(
     (endpoint, server)
 }
 
+async fn assert_prepared_zip_is_unpublished(
+    state: &AppState,
+    admitted: &import_job::Model,
+    entry_cid: &str,
+) {
+    use crate::store::{
+        entities::{object, object_version, pin_job, pin_lease, pin_provider_usage, remote_pin},
+        pinning::publication::decode_zip_capture_json,
+    };
+    let snapshot = crate::store::zip::snapshot(state.store.db(), &admitted.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let job = import_job::Entity::find_by_id(&admitted.id)
+        .one(state.store.db())
+        .await
+        .unwrap()
+        .unwrap();
+    let capture = decode_zip_capture_json(job.zip_intent_json.as_deref().unwrap()).unwrap();
+    assert_eq!(job.zip_intent_json, admitted.zip_intent_json);
+    assert_eq!(job.root_capture_json, admitted.root_capture_json);
+    assert_eq!(job.request_fingerprint, admitted.request_fingerprint);
+    assert_eq!(
+        decode_zip_capture_json(&snapshot.batch.captured_options).unwrap(),
+        capture
+    );
+    assert_eq!(snapshot.batch.owner, capture.origin().principal_id);
+    assert_eq!(snapshot.batch.token, job.id);
+    assert_eq!(snapshot.batch.input_identity, job.id);
+    assert_eq!(snapshot.batch.source, "import");
+    assert_eq!(snapshot.batch.bucket, job.bucket);
+    assert_eq!(snapshot.batch.archive_key, job.key);
+    assert_eq!(snapshot.batch.fingerprint, job.request_fingerprint);
+    assert_eq!(snapshot.batch.state, "open");
+    assert!(snapshot.batch.manifest_prepared);
+    assert!(!snapshot.batch.source_published);
+    assert!(snapshot.batch.terminal_result.is_none());
+    assert_eq!(snapshot.batch.root_status, "pending");
+    assert!(snapshot.batch.root_error_code.is_none());
+    assert!(snapshot.batch.root_cid.is_none());
+    assert_eq!(
+        (snapshot.batch.root_revision, snapshot.batch.root_epoch),
+        (0, 0)
+    );
+    assert!(snapshot.builds.is_empty());
+    assert!(snapshot.references.is_empty());
+    assert_eq!(snapshot.entries.len(), 1);
+    let entry = &snapshot.entries[0];
+    assert_eq!(entry.path, "file.txt");
+    assert_eq!(entry.object_key.as_deref(), Some("out/file.txt"));
+    assert_eq!(entry.cid.as_deref(), Some(entry_cid));
+    assert_eq!(entry.size, Some(5));
+    assert!(entry.version_row_id.is_none());
+    assert!(entry.error_code.is_none());
+    for count in [
+        object::Entity::find()
+            .count(state.store.db())
+            .await
+            .unwrap(),
+        object_version::Entity::find()
+            .count(state.store.db())
+            .await
+            .unwrap(),
+        import_job_result::Entity::find()
+            .count(state.store.db())
+            .await
+            .unwrap(),
+        pin_lease::Entity::find()
+            .count(state.store.db())
+            .await
+            .unwrap(),
+        pin_job::Entity::find()
+            .count(state.store.db())
+            .await
+            .unwrap(),
+        pin_provider_usage::Entity::find()
+            .count(state.store.db())
+            .await
+            .unwrap(),
+        remote_pin::Entity::find()
+            .count(state.store.db())
+            .await
+            .unwrap(),
+    ] {
+        assert_eq!(count, 0);
+    }
+}
+
+async fn assert_bound_zip_source_phases(
+    state: &AppState,
+    id: &str,
+    archive: &[u8],
+    kubo: &wiremock::MockServer,
+) -> crate::store::pinning::publication::LegacyZipInputProof {
+    use sha2::{Digest, Sha256};
+    let job = import_job::Entity::find_by_id(id)
+        .one(state.store.db())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(job.source_type, "cid");
+    assert_eq!(job.source_value, CID);
+    let proof = crate::store::pinning::publication::read_legacy_import_input(state.store.db(), id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(proof.cid(), CID);
+    assert_eq!(proof.size(), archive.len() as i64);
+    assert_eq!(proof.sha256(), hex::encode(Sha256::digest(archive)));
+    let requests = kubo.received_requests().await.unwrap();
+    let prefix = requests
+        .iter()
+        .take(5)
+        .map(|request| (request.method.as_str(), request.url.path()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        prefix,
+        [
+            ("POST", "/api/v0/routing/findprovs"),
+            ("POST", "/api/v0/cat"), // inspection through clean EOF
+            ("POST", "/api/v0/cat"), // complete input SHA-256 attestation
+            ("POST", "/api/v0/pin/add"),
+            ("POST", "/api/v0/cat"), // extraction bound to that proof, including the tail
+        ]
+    );
+    let cats = requests
+        .iter()
+        .filter(|request| request.url.path() == "/api/v0/cat")
+        .collect::<Vec<_>>();
+    assert_eq!(cats.len(), 3);
+    for request in cats {
+        assert_eq!(request.url.query(), Some(format!("arg={CID}").as_str()));
+    }
+    assert_eq!(
+        requests[0].url.query(),
+        Some(format!("arg={CID}&num-providers=20&verbose=true").as_str())
+    );
+    assert_eq!(
+        requests[3].url.query(),
+        Some(format!("arg={CID}&recursive=true&progress=true").as_str())
+    );
+    use crate::store::entities::{pin_job, pin_lease, pin_provider_usage, remote_pin};
+    for count in [
+        pin_lease::Entity::find()
+            .count(state.store.db())
+            .await
+            .unwrap(),
+        pin_job::Entity::find()
+            .count(state.store.db())
+            .await
+            .unwrap(),
+        pin_provider_usage::Entity::find()
+            .count(state.store.db())
+            .await
+            .unwrap(),
+        remote_pin::Entity::find()
+            .count(state.store.db())
+            .await
+            .unwrap(),
+    ] {
+        assert_eq!(count, 0);
+    }
+    proof
+}
+
 #[tokio::test]
 async fn signed_zip_root_is_visible_only_after_restarted_worker_commits_receipt_and_versions() {
     use crate::import::{
@@ -896,13 +1061,13 @@ async fn signed_zip_root_is_visible_only_after_restarted_worker_commits_receipt_
             ResponseTemplate::new(200)
                 .set_body_string("{\"Type\":4,\"Responses\":[{\"ID\":\"provider-a\"}]}\n"),
         )
-        .expect(2)
+        .expect(1) // the prepared restart never rediscovers or refetches the source
         .mount(&kubo)
         .await;
     Mock::given(method("POST"))
         .and(path("/api/v0/cat"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(archive))
-        .expect(4)
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(archive.clone()))
+        .expect(3) // inspection, complete attestation, bound extraction before the pause
         .mount(&kubo)
         .await;
     Mock::given(method("POST"))
@@ -911,7 +1076,7 @@ async fn signed_zip_root_is_visible_only_after_restarted_worker_commits_receipt_
         .respond_with(
             ResponseTemplate::new(200).set_body_string(format!("{{\"Pins\":[\"{CID}\"]}}\n")),
         )
-        .expect(2)
+        .expect(1)
         .mount(&kubo)
         .await;
     Mock::given(method("POST"))
@@ -920,14 +1085,14 @@ async fn signed_zip_root_is_visible_only_after_restarted_worker_commits_receipt_
             ResponseTemplate::new(200)
                 .set_body_string(format!("{{\"Hash\":\"{CID}\",\"Size\":\"5\"}}\n")),
         )
-        .expect(2)
+        .expect(1)
         .mount(&kubo)
         .await;
     Mock::given(method("POST"))
         .and(path("/api/v0/pin/add"))
         .and(query_param("arg", CID))
         .respond_with(ResponseTemplate::new(200))
-        .expect(2)
+        .expect(1)
         .mount(&kubo)
         .await;
     mount_verified_directory(&kubo, CID, &root).await;
@@ -997,6 +1162,18 @@ async fn signed_zip_root_is_visible_only_after_restarted_worker_commits_receipt_
     )
     .await;
     assert!(!before.text().await.unwrap().contains("ZipRoot"));
+    let admitted = import_job::Entity::find_by_id(&id)
+        .one(original.store.db())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(admitted.zip_intent_json.is_some());
+    assert!(
+        crate::store::pinning::publication::read_legacy_import_input(original.store.db(), &id)
+            .await
+            .unwrap()
+            .is_none()
+    );
     let first_worker =
         first_imports.start(original.clone(), tokio_util::sync::CancellationToken::new());
     tokio::time::timeout(std::time::Duration::from_secs(5), pause.0.notified())
@@ -1005,11 +1182,39 @@ async fn signed_zip_root_is_visible_only_after_restarted_worker_commits_receipt_
     first_worker
         .shutdown(std::time::Duration::from_secs(2))
         .await;
+    assert_prepared_zip_is_unpublished(&original, &admitted, CID).await;
+    let first_proof = assert_bound_zip_source_phases(&original, &id, &archive, &kubo).await;
+    let first_job = import_job::Entity::find_by_id(&id)
+        .one(original.store.db())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first_job.attempts, 1);
+    assert_eq!(first_job.state, "running");
+    let paused_status = sigv4::send_sigv4(
+        reqwest::Method::GET,
+        &endpoint,
+        "bucket",
+        "archive.zip",
+        &[("ipfs3-import", &id)],
+        Vec::new(),
+        HeaderMap::new(),
+        "test",
+    )
+    .await;
+    assert_eq!(paused_status.status(), reqwest::StatusCode::OK);
     assert!(
-        crate::store::zip::snapshot(original.store.db(), &id)
+        !paused_status
+            .headers()
+            .contains_key("x-ipfs-s3-zip-root-cid")
+    );
+    assert!(!paused_status.text().await.unwrap().contains("<ZipRoot>"));
+    assert!(
+        kubo.received_requests()
             .await
             .unwrap()
-            .is_none()
+            .iter()
+            .all(|request| request.url.path() != "/api/v0/dag/put")
     );
     server.abort();
     drop(original);
@@ -1092,6 +1297,84 @@ async fn signed_zip_root_is_visible_only_after_restarted_worker_commits_receipt_
         .unwrap();
     assert_eq!(snapshot.batch.root_cid.as_deref(), Some(root.as_str()));
     assert_eq!(snapshot.references[0].state, "adopted");
+    assert_eq!(snapshot.batch.state, "published");
+    assert!(snapshot.batch.source_published);
+    assert!(snapshot.batch.terminal_result.is_some());
+    assert_eq!(snapshot.builds.len(), 1);
+    assert_eq!(snapshot.builds[0].status, "verified");
+    assert_eq!(snapshot.references.len(), 1);
+    let reference = &snapshot.references[0];
+    assert_eq!(reference.cid, root);
+    assert_eq!(
+        (reference.revision, reference.epoch),
+        (snapshot.batch.root_revision, snapshot.batch.root_epoch)
+    );
+    let receipt: crate::kubo::LocalResidencyVerificationReceipt =
+        serde_json::from_str(reference.verification_receipt.as_deref().unwrap()).unwrap();
+    assert_eq!(receipt.cid, root);
+    assert_eq!(receipt.node_identity, reference.node_identity);
+    let objects = crate::store::entities::object::Entity::find()
+        .all(restarted.store.db())
+        .await
+        .unwrap();
+    let versions = crate::store::entities::object_version::Entity::find()
+        .all(restarted.store.db())
+        .await
+        .unwrap();
+    assert_eq!(objects.len(), 2);
+    assert_eq!(versions.len(), 2);
+    assert_eq!(snapshot.entries.len(), 1);
+    let entry = &snapshot.entries[0];
+    let entry_version = versions
+        .iter()
+        .find(|version| Some(version.id.as_str()) == entry.version_row_id.as_deref())
+        .unwrap();
+    let entry_object = objects
+        .iter()
+        .find(|object| Some(object.id.as_str()) == entry_version.object_id.as_deref())
+        .unwrap();
+    assert_eq!(entry_version.key, "out/file.txt");
+    assert_eq!(entry_version.bucket, "bucket");
+    assert_eq!(entry_object.key, "out/file.txt");
+    assert_eq!(entry_object.cid, CID);
+    assert_eq!(entry_object.size, 5);
+    let source_object = objects
+        .iter()
+        .find(|object| object.key == "archive.zip")
+        .unwrap();
+    assert_eq!(source_object.cid, CID);
+    assert_eq!(source_object.size, archive.len() as i64);
+    assert_eq!(
+        versions
+            .iter()
+            .filter(|version| version.object_id.as_deref() == Some(source_object.id.as_str()))
+            .count(),
+        1
+    );
+    let page = crate::store::import::results::page(restarted.store.db(), &id, None, 10)
+        .await
+        .unwrap();
+    assert!(page.next_sequence.is_none());
+    let results = page.rows;
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].key, "archive.zip");
+    assert_eq!(results[0].cid.as_deref(), Some(CID));
+    assert_eq!(results[0].size, Some(archive.len() as i64));
+    assert_eq!(results[1].key, "out/file.txt");
+    assert_eq!(results[1].cid.as_deref(), Some(CID));
+    assert_eq!(results[1].size, Some(5));
+    assert!(results.iter().all(|result| result.error_code.is_none()));
+    assert_eq!(
+        assert_bound_zip_source_phases(&restarted, &id, &archive, &kubo).await,
+        first_proof
+    );
+    let completed = import_job::Entity::find_by_id(&id)
+        .one(restarted.store.db())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed.attempts, 2);
+    assert!(completed.claim_epoch > first_job.claim_epoch);
 
     let mut signed_false = HeaderMap::new();
     signed_false.insert(
@@ -1156,8 +1439,8 @@ async fn signed_zip_config_off_persists_disabled_and_never_builds_a_root() {
         .await;
     Mock::given(method("POST"))
         .and(path("/api/v0/cat"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(archive))
-        .expect(2)
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(archive.clone()))
+        .expect(3) // inspection, complete attestation, bound extraction
         .mount(&kubo)
         .await;
     Mock::given(method("POST"))
@@ -1268,6 +1551,7 @@ async fn signed_zip_config_off_persists_disabled_and_never_builds_a_root() {
             .iter()
             .all(|request| request.url.path() != "/api/v0/dag/put")
     );
+    assert_bound_zip_source_phases(&state, &id, &archive, &kubo).await;
     server.abort();
 }
 
@@ -1310,8 +1594,8 @@ async fn signed_zip_worker_reports_failed_partial_and_zero_file_roots_without_lo
             .await;
         Mock::given(method("POST"))
             .and(path("/api/v0/cat"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(archive))
-            .expect(2)
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(archive.clone()))
+            .expect(3) // inspection, complete attestation, bound extraction
             .mount(&kubo)
             .await;
         let count = Arc::new(AtomicUsize::new(0));
@@ -1445,6 +1729,7 @@ async fn signed_zip_worker_reports_failed_partial_and_zero_file_roots_without_lo
             snapshot.entries.len(),
             if case == "partial" { 2 } else { 1 }
         );
+        assert_bound_zip_source_phases(&state, &id, &archive, &kubo).await;
         server.abort();
     }
 }
@@ -1476,6 +1761,7 @@ async fn signed_zip_stale_worker_cannot_build_or_publish_after_target_supersessi
         }
     }
     let kubo = MockServer::start().await;
+    let archive = zip(&[("file.txt", b"hello")]);
     Mock::given(method("POST"))
         .and(path("/api/v0/routing/findprovs"))
         .respond_with(
@@ -1496,8 +1782,8 @@ async fn signed_zip_stale_worker_cannot_build_or_publish_after_target_supersessi
         .await;
     Mock::given(method("POST"))
         .and(path("/api/v0/cat"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(zip(&[("file.txt", b"hello")])))
-        .expect(2)
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(archive.clone()))
+        .expect(3) // source proof survives supersession; no root work is allowed
         .mount(&kubo)
         .await;
     Mock::given(method("POST"))
@@ -1562,6 +1848,18 @@ async fn signed_zip_stale_worker_cannot_build_or_publish_after_target_supersessi
         .to_str()
         .unwrap()
         .to_owned();
+    let admitted = import_job::Entity::find_by_id(&id)
+        .one(state.store.db())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(admitted.zip_intent_json.is_some());
+    assert!(
+        crate::store::pinning::publication::read_legacy_import_input(state.store.db(), &id)
+            .await
+            .unwrap()
+            .is_none()
+    );
     let worker = imports.start(state.clone(), tokio_util::sync::CancellationToken::new());
     tokio::time::timeout(std::time::Duration::from_secs(8), async {
         loop {
@@ -1584,12 +1882,8 @@ async fn signed_zip_stale_worker_cannot_build_or_publish_after_target_supersessi
     .await
     .unwrap();
     worker.shutdown(std::time::Duration::from_secs(2)).await;
-    assert!(
-        crate::store::zip::snapshot(state.store.db(), &id)
-            .await
-            .unwrap()
-            .is_none()
-    );
+    assert_prepared_zip_is_unpublished(&state, &admitted, "QmEntry").await;
+    assert_bound_zip_source_phases(&state, &id, &archive, &kubo).await;
     assert_eq!(
         crate::store::entities::object::Entity::find()
             .count(state.store.db())

@@ -1,4 +1,9 @@
 //! Real SigV4 intake plus the shared import worker, mock HTTPS source and Kubo.
+#[path = "support/r25_review_wire_fixtures_historical.rs"]
+mod historical;
+#[allow(dead_code)]
+#[path = "support/r25_review_wire_fixtures_import.rs"]
+mod r25_fixture;
 #[allow(dead_code)]
 mod support;
 
@@ -9,14 +14,14 @@ use ipfs_s3_gateway::store::{
     entities::{object, object_version, standard_mutation_lease},
     zip::{self, execution, import_intake},
 };
+use r25_fixture::{
+    ImportHarness, ImportHarnessConfig, ImportPublicationBlockControl, TestHttpsReply,
+    get_import_status, start_import_harness,
+};
 use sea_orm::{ConnectionTrait, EntityTrait, PaginatorTrait, Statement};
 use sha2::{Digest, Sha256};
 use support::{
     decompress::{duplicate_entry_zip, legal_single_entry_zip},
-    import::{
-        ImportHarness, ImportHarnessConfig, ImportPublicationBlockControl, TestHttpsReply,
-        get_import_status, start_import_harness,
-    },
     sigv4::send_sigv4,
 };
 
@@ -56,20 +61,8 @@ fn cid_xml() -> String {
     format!("<IPFS3ImportRequest><CID>{CID}</CID></IPFS3ImportRequest>")
 }
 
-async fn submit(
-    h: &ImportHarness,
-    token: &str,
-    extracted: bool,
-    xml: &str,
-    sha: Option<&str>,
-) -> String {
-    let mut headers = controls(token, extracted);
-    if let Some(sha) = sha {
-        headers.insert(
-            "x-ipfs3-zip-expected-sha256",
-            HeaderValue::from_str(sha).unwrap(),
-        );
-    }
+async fn submit(h: &ImportHarness, token: &str, extracted: bool, xml: &str) -> String {
+    let headers = controls(token, extracted);
     let response = send_sigv4(
         reqwest::Method::POST,
         &h.endpoint,
@@ -81,21 +74,23 @@ async fn submit(
         "test",
     )
     .await;
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
-    assert!(!response.headers().contains_key("etag"));
-    assert!(!response.headers().contains_key("x-amz-version-id"));
-    let id = response.headers()["x-ipfs3-import-job-id"]
+    let status = response.status();
+    let response_headers = response.headers().clone();
+    let accepted = response.text().await.unwrap();
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    assert!(!response_headers.contains_key("etag"));
+    assert!(!response_headers.contains_key("x-amz-version-id"));
+    let id = response_headers["x-ipfs3-import-job-id"]
         .to_str()
         .unwrap()
         .to_owned();
-    let accepted = response.text().await.unwrap();
     assert!(!accepted.contains("<ETag>"));
     assert!(!accepted.contains("<VersionId>"));
     id
 }
 
 async fn wait(h: &ImportHarness, id: &str) -> &'static str {
-    tokio::time::timeout(Duration::from_secs(10), async {
+    let state = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let status = import_intake::read_for_path(
                 h.state.store.db(),
@@ -114,7 +109,11 @@ async fn wait(h: &ImportHarness, id: &str) -> &'static str {
         }
     })
     .await
-    .expect("import reached terminal state")
+    .expect("import reached terminal state");
+    if state == "ready" {
+        r25_fixture::assert_manual_source(h.state.store.db(), id).await;
+    }
+    state
 }
 
 async fn sealed_receipt(h: &ImportHarness, id: &str) -> Option<String> {
@@ -139,7 +138,7 @@ async fn source_only_skips_extraction_and_root_and_reports_only_a_real_version()
     // A duplicate ZIP would be rejected by extraction. Source-only must not parse it.
     let archive = duplicate_entry_zip();
     h.set_cat_body(CID, archive.clone());
-    let id = submit(&h, "source-only", false, &cid_xml(), None).await;
+    let id = submit(&h, "source-only", false, &cid_xml()).await;
     assert_eq!(wait(&h, &id).await, "ready");
     let db = h.state.store.db();
     let source = object::Entity::find().one(db).await.unwrap().unwrap();
@@ -165,7 +164,7 @@ async fn source_only_skips_extraction_and_root_and_reports_only_a_real_version()
     )));
     assert!(!status.contains("<RootCID>"));
     let io = h.kubo_total_call_count().await;
-    assert_eq!(submit(&h, "source-only", false, &cid_xml(), None).await, id);
+    assert_eq!(submit(&h, "source-only", false, &cid_xml()).await, id);
     assert_eq!(h.kubo_total_call_count().await, io);
     assert_eq!(object_version::Entity::find().count(db).await.unwrap(), 1);
     h.shutdown().await;
@@ -181,7 +180,7 @@ async fn source_only_admission_attests_bytes_and_freezes_a_real_guard_without_ex
     .await;
     let archive = duplicate_entry_zip();
     h.set_cat_body(CID, archive.clone());
-    let id = submit(&h, "source-only-admission", false, &cid_xml(), None).await;
+    let id = submit(&h, "source-only-admission", false, &cid_xml()).await;
     gate.wait_until_blocked(&id).await;
     let db = h.state.store.db();
     let snapshot = execution::read(db, &id).await.unwrap().unwrap();
@@ -214,7 +213,7 @@ async fn source_only_admission_attests_bytes_and_freezes_a_real_guard_without_ex
     // 202/replay is still admission only, even after bytes have been attested.
     let io = h.kubo_total_call_count().await;
     assert_eq!(
-        submit(&h, "source-only-admission", false, &cid_xml(), None).await,
+        submit(&h, "source-only-admission", false, &cid_xml()).await,
         id
     );
     assert_eq!(h.kubo_total_call_count().await, io);
@@ -246,7 +245,7 @@ async fn source_and_extracted_url_replay_uses_first_full_snapshot_and_zero_io() 
         "<IPFS3ImportRequest><URL>{}</URL></IPFS3ImportRequest>",
         h.source.url("/archive.zip?secret=private")
     );
-    let id = submit(&h, "source-both", true, &xml, Some(&sha)).await;
+    let id = submit(&h, "source-both", true, &xml).await;
     assert_eq!(wait(&h, &id).await, "ready");
     assert_eq!(
         object::Entity::find()
@@ -260,10 +259,12 @@ async fn source_and_extracted_url_replay_uses_first_full_snapshot_and_zero_io() 
         "/archive.zip?secret=private",
         TestHttpsReply::chunked(b"changed".to_vec()),
     );
-    assert_eq!(submit(&h, "source-both", true, &xml, Some(&sha)).await, id);
+    assert_eq!(submit(&h, "source-both", true, &xml).await, id);
     let status = get_import_status(&h, &h.bucket, "archive.zip", &id, None, None).await;
     let status = String::from_utf8(status.into_body()).unwrap();
     assert!(status.contains("<State>ready</State>"));
+    assert!(status.contains(&format!("<MeasuredSHA256>{sha}</MeasuredSHA256>")));
+    assert!(!status.contains("<ExpectedSHA256>"));
     assert!(!status.contains("private"));
     assert_eq!(h.source.requests().len(), 1);
     assert_eq!(h.kubo_total_call_count().await, before);
@@ -290,7 +291,7 @@ async fn source_only_url_attests_the_signed_snapshot_without_extraction_and_repl
         "<IPFS3ImportRequest><URL>{}</URL></IPFS3ImportRequest>",
         h.source.url("/source-only.zip")
     );
-    let id = submit(&h, "source-only-url-snapshot", false, &xml, Some(&sha)).await;
+    let id = submit(&h, "source-only-url-snapshot", false, &xml).await;
     assert_eq!(wait(&h, &id).await, "ready");
     let db = h.state.store.db();
     let snapshot = execution::read(db, &id).await.unwrap().unwrap();
@@ -326,12 +327,12 @@ async fn source_only_url_attests_the_signed_snapshot_without_extraction_and_repl
         TestHttpsReply::chunked(b"changed source".to_vec()),
     );
     assert_eq!(
-        submit(&h, "source-only-url-snapshot", false, &xml, Some(&sha)).await,
+        submit(&h, "source-only-url-snapshot", false, &xml).await,
         id
     );
     let status = get_import_status(&h, &h.bucket, "archive.zip", &id, None, None).await;
     let status = String::from_utf8(status.into_body()).unwrap();
-    assert!(status.contains(&format!("<ExpectedSHA256>{sha}</ExpectedSHA256>")));
+    assert!(!status.contains("<ExpectedSHA256>"));
     assert!(status.contains(&format!("<MeasuredSHA256>{sha}</MeasuredSHA256>")));
     assert!(status.contains(&format!("<ETag>{CID}</ETag>")));
     assert!(!status.contains("<RootCID>"));
@@ -349,20 +350,69 @@ async fn source_only_url_sha_mismatch_publishes_nothing_and_replays_without_io()
         "/bad.zip",
         TestHttpsReply::chunked(legal_single_entry_zip()),
     );
-    let xml = format!(
-        "<IPFS3ImportRequest><URL>{}</URL></IPFS3ImportRequest>",
-        h.source.url("/bad.zip")
-    );
     let sha = "a".repeat(64);
-    let id = submit(&h, "source-mismatch", false, &xml, Some(&sha)).await;
+    let request = historical::source_only_request(
+        h.state.pinning.effective_config(),
+        &h.bucket,
+        "source-mismatch",
+        ipfs_s3_gateway::import::ImportSource::Url(h.source.url("/bad.zip").parse().unwrap()),
+        &sha,
+    );
+    let id = import_intake::admit(h.state.store.db(), &request)
+        .await
+        .unwrap()
+        .id;
     assert_eq!(wait(&h, &id).await, "failed");
     let io = h.kubo_total_call_count().await;
     assert_eq!(
-        submit(&h, "source-mismatch", false, &xml, Some(&sha)).await,
+        import_intake::admit(h.state.store.db(), &request)
+            .await
+            .unwrap()
+            .id,
         id
     );
     assert_eq!(h.kubo_total_call_count().await, io);
     assert_eq!(h.source.requests().len(), 1);
+    let failed = execution::read(h.state.store.db(), &id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        failed.terminal_result.as_deref(),
+        Some("expected_sha256_mismatch")
+    );
+    assert!(failed.input_art_cid.is_none() && failed.input_sha256.is_none());
+    let original =
+        import_intake::read_for_path(h.state.store.db(), &id, "test", &h.bucket, "archive.zip")
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(original.expected_sha256.as_deref(), Some(sha.as_str()));
+    assert_eq!(failed.captured_options, request.admission.captured_options);
+    assert_eq!(h.kubo_call_count("/api/v0/pin/add").await, 0);
+    for table in [
+        "pin_leases",
+        "pin_lease_targets",
+        "pin_jobs",
+        "object_versions",
+    ] {
+        let row = h
+            .state
+            .store
+            .db()
+            .query_one(Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                format!("SELECT COUNT(*) AS n FROM {table}"),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.try_get::<i64>("", "n").unwrap(),
+            0,
+            "historical mismatch: {table}"
+        );
+    }
     assert_eq!(
         object::Entity::find()
             .count(h.state.store.db())
@@ -381,12 +431,256 @@ async fn source_only_url_sha_mismatch_publishes_nothing_and_replays_without_io()
 }
 
 #[tokio::test]
+async fn removed_expected_sha_header_rejects_without_intake_then_original_url_is_server_attested() {
+    let h = start_import_harness(ImportHarnessConfig::default()).await;
+    let archive = duplicate_entry_zip();
+    let measured = hex::encode(Sha256::digest(&archive));
+    h.source.set_reply(
+        "/removed-control.zip?secret=private",
+        TestHttpsReply::chunked(archive.clone()),
+    );
+    let xml = format!(
+        "<IPFS3ImportRequest><URL>{}</URL></IPFS3ImportRequest>",
+        h.source.url("/removed-control.zip?secret=private")
+    );
+    let mut headers = controls("removed-control", false);
+    headers.insert(
+        "x-ipfs3-zip-expected-sha256",
+        HeaderValue::from_str(&measured).unwrap(),
+    );
+    let rejected = send_sigv4(
+        reqwest::Method::POST,
+        &h.endpoint,
+        &h.bucket,
+        "archive.zip",
+        &[("ipfs3-import", ""), ("decompress-zip", "out/")],
+        xml.as_bytes().to_vec(),
+        headers,
+        "test",
+    )
+    .await;
+    let status = rejected.status();
+    let error = rejected.text().await.unwrap();
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+    assert!(error.contains("<Code>InvalidRequest</Code>"), "{error}");
+    assert!(h.source.requests().is_empty());
+    assert_eq!(h.kubo_total_call_count().await, 0);
+    for table in [
+        "zip_v2_executions",
+        "zip_v2_import_requests",
+        "zip_batches",
+        "objects",
+        "object_versions",
+        "pin_leases",
+        "pin_jobs",
+        "pin_lease_targets",
+        "remote_pins",
+        "pin_provider_usage",
+    ] {
+        let row = h
+            .state
+            .store
+            .db()
+            .query_one(Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                format!("SELECT COUNT(*) AS n FROM {table}"),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.try_get::<i64>("", "n").unwrap(), 0, "{table}");
+    }
+    let id = submit(&h, "removed-control", false, &xml).await;
+    assert_eq!(wait(&h, &id).await, "ready");
+    let snapshot = execution::read(h.state.store.db(), &id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.input_sha256.as_deref(), Some(measured.as_str()));
+    assert_eq!(snapshot.input_art_size, Some(archive.len() as i64));
+    let source = object::Entity::find()
+        .one(h.state.store.db())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(source.key, "archive.zip");
+    assert_eq!(source.cid, CID);
+    assert_eq!(source.metadata.unwrap()["label"], "signed-source");
+    assert_eq!(source.content_type.as_deref(), Some("application/zip"));
+    let batch = zip::snapshot(h.state.store.db(), &id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(batch.batch.source_published && batch.entries.is_empty());
+    assert_eq!(batch.batch.root_status, "disabled");
+    assert!(batch.builds.is_empty() && batch.references.is_empty());
+    assert_eq!(h.source.requests().len(), 1);
+    assert_eq!(h.kubo_call_count("/api/v0/add").await, 1);
+    assert_eq!(
+        object_version::Entity::find()
+            .count(h.state.store.db())
+            .await
+            .unwrap(),
+        1
+    );
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn source_false_with_original_manual_pin_tag_is_400_before_any_effect() {
+    let h = start_import_harness(ImportHarnessConfig::default()).await;
+    let archive = legal_single_entry_zip();
+    h.source
+        .set_reply("/source-false.zip", TestHttpsReply::chunked(archive));
+    let xml = format!(
+        "<IPFS3ImportRequest><URL>{}</URL></IPFS3ImportRequest>",
+        h.source.url("/source-false.zip")
+    );
+    let mut headers = controls("source-false-manual", true);
+    headers.insert(
+        "x-ipfs3-zip-publish-source",
+        HeaderValue::from_static("false"),
+    );
+    let rejected = send_sigv4(
+        reqwest::Method::POST,
+        &h.endpoint,
+        &h.bucket,
+        "archive.zip",
+        &[("ipfs3-import", ""), ("decompress-zip", "out/")],
+        xml.into_bytes(),
+        headers,
+        "test",
+    )
+    .await;
+    let status = rejected.status();
+    let xml = rejected.text().await.unwrap();
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{xml}");
+    assert!(xml.contains("<Code>InvalidRequest</Code>"), "{xml}");
+    assert!(h.source.requests().is_empty());
+    assert_eq!(h.kubo_total_call_count().await, 0);
+    for table in [
+        "zip_v2_executions",
+        "zip_v2_import_requests",
+        "zip_batches",
+        "objects",
+        "object_versions",
+        "pin_leases",
+        "pin_lease_targets",
+        "pin_jobs",
+        "remote_pins",
+    ] {
+        let row = h
+            .state
+            .store
+            .db()
+            .query_one(Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                format!("SELECT COUNT(*) AS n FROM {table}"),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.try_get::<i64>("", "n").unwrap(),
+            0,
+            "source=false manual: {table}"
+        );
+    }
+    for row in h
+        .state
+        .store
+        .db()
+        .query_all(Statement::from_string(
+            sea_orm::DatabaseBackend::Sqlite,
+            "SELECT reserved_bytes,reserved_pins FROM pin_provider_usage".to_owned(),
+        ))
+        .await
+        .unwrap()
+    {
+        assert_eq!(row.try_get::<i64>("", "reserved_bytes").unwrap(), 0);
+        assert_eq!(row.try_get::<i64>("", "reserved_pins").unwrap(), 0);
+    }
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn historical_source_only_expected_promise_is_measured_published_and_replayed_unchanged() {
+    let h = start_import_harness(ImportHarnessConfig::default()).await;
+    let archive = duplicate_entry_zip();
+    let measured = hex::encode(Sha256::digest(&archive));
+    h.source.set_reply(
+        "/historical-source.zip",
+        TestHttpsReply::chunked(archive.clone()),
+    );
+    let request = historical::source_only_request(
+        h.state.pinning.effective_config(),
+        &h.bucket,
+        "historical-source",
+        ipfs_s3_gateway::import::ImportSource::Url(
+            h.source.url("/historical-source.zip").parse().unwrap(),
+        ),
+        &measured,
+    );
+    let id = import_intake::admit(h.state.store.db(), &request)
+        .await
+        .unwrap()
+        .id;
+    assert_eq!(wait(&h, &id).await, "ready");
+    let persisted = execution::read(h.state.store.db(), &id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.input_sha256.as_deref(), Some(measured.as_str()));
+    assert_eq!(persisted.input_art_size, Some(archive.len() as i64));
+    assert_eq!(
+        persisted.captured_options,
+        request.admission.captured_options
+    );
+    let status = get_import_status(&h, &h.bucket, "archive.zip", &id, None, None).await;
+    let status = String::from_utf8(status.into_body()).unwrap();
+    assert!(status.contains(&format!("<ExpectedSHA256>{measured}</ExpectedSHA256>")));
+    assert!(status.contains(&format!("<MeasuredSHA256>{measured}</MeasuredSHA256>")));
+    assert!(status.contains(&format!("<ETag>{CID}</ETag>")));
+    let receipt = sealed_receipt(&h, &id).await;
+    let io = h.kubo_total_call_count().await;
+    h.source.set_reply(
+        "/historical-source.zip",
+        TestHttpsReply::chunked(b"changed".to_vec()),
+    );
+    assert_eq!(
+        import_intake::admit(h.state.store.db(), &request)
+            .await
+            .unwrap()
+            .id,
+        id
+    );
+    assert_eq!(h.kubo_total_call_count().await, io);
+    assert_eq!(h.source.requests().len(), 1);
+    assert_eq!(sealed_receipt(&h, &id).await, receipt);
+    assert_eq!(
+        execution::read(h.state.store.db(), &id)
+            .await
+            .unwrap()
+            .unwrap(),
+        persisted
+    );
+    assert_eq!(
+        object_version::Entity::find()
+            .count(h.state.store.db())
+            .await
+            .unwrap(),
+        1
+    );
+    h.shutdown().await;
+}
+
+#[tokio::test]
 async fn source_and_output_manifest_admission_rolls_back_as_one_transaction() {
     let h = start_import_harness(ImportHarnessConfig::default()).await;
     h.set_cat_body(CID, legal_single_entry_zip());
     let db = h.state.store.db();
     db.execute_unprepared("CREATE TRIGGER reject_source_marker BEFORE UPDATE OF input_identity ON zip_batches WHEN NEW.input_identity LIKE 'zip-v2-source-gen:%' BEGIN SELECT RAISE(ABORT, 'source_marker_failure'); END").await.unwrap();
-    let id = submit(&h, "source-admission-rollback", true, &cid_xml(), None).await;
+    let id = submit(&h, "source-admission-rollback", true, &cid_xml()).await;
     assert_eq!(wait(&h, &id).await, "failed");
     assert!(zip::snapshot(db, &id).await.unwrap().is_none());
     let manifest = db
@@ -408,7 +702,7 @@ async fn source_and_output_manifest_admission_rolls_back_as_one_transaction() {
     assert_eq!(object::Entity::find().count(db).await.unwrap(), 0);
     let io = h.kubo_total_call_count().await;
     assert_eq!(
-        submit(&h, "source-admission-rollback", true, &cid_xml(), None).await,
+        submit(&h, "source-admission-rollback", true, &cid_xml()).await,
         id
     );
     assert_eq!(h.kubo_total_call_count().await, io);
@@ -424,7 +718,7 @@ async fn admitted_source_heartbeat_renews_the_exact_source_guard_with_execution_
     })
     .await;
     h.set_cat_body(CID, legal_single_entry_zip());
-    let id = submit(&h, "source-heartbeat", true, &cid_xml(), None).await;
+    let id = submit(&h, "source-heartbeat", true, &cid_xml()).await;
     gate.wait_until_blocked(&id).await;
     let db = h.state.store.db();
     db.execute_unprepared("UPDATE standard_mutation_leases SET lease_until=datetime('now','+2 seconds') WHERE key='archive.zip'").await.unwrap();
@@ -472,7 +766,7 @@ async fn source_receipt_replays_original_enabled_version_after_a_later_signed_ov
     .await
     .unwrap();
     h.set_cat_body(CID, duplicate_entry_zip());
-    let id = submit(&h, "source-version", false, &cid_xml(), None).await;
+    let id = submit(&h, "source-version", false, &cid_xml()).await;
     assert_eq!(wait(&h, &id).await, "ready");
     let status =
         import_intake::read_for_path(h.state.store.db(), &id, "test", &h.bucket, "archive.zip")
@@ -498,10 +792,7 @@ async fn source_receipt_replays_original_enabled_version_after_a_later_signed_ov
         version
     );
     let io = h.kubo_total_call_count().await;
-    assert_eq!(
-        submit(&h, "source-version", false, &cid_xml(), None).await,
-        id
-    );
+    assert_eq!(submit(&h, "source-version", false, &cid_xml()).await, id);
     let status = get_import_status(&h, &h.bucket, "archive.zip", &id, None, None).await;
     let status = String::from_utf8(status.into_body()).unwrap();
     assert!(status.contains(&format!("<VersionId>{version}</VersionId>")));
@@ -526,7 +817,7 @@ async fn lost_source_guard_never_readmits_or_publishes_either_output() {
     })
     .await;
     h.set_cat_body(CID, legal_single_entry_zip());
-    let id = submit(&h, "source-stolen", true, &cid_xml(), None).await;
+    let id = submit(&h, "source-stolen", true, &cid_xml()).await;
     gate.wait_until_blocked(&id).await;
     let db = h.state.store.db();
     let snapshot = execution::read(db, &id).await.unwrap().unwrap();
@@ -565,7 +856,7 @@ async fn late_receipt_failure_rolls_back_source_versions_and_guards_then_recover
     })
     .await;
     h.set_cat_body(CID, legal_single_entry_zip());
-    let id = submit(&h, "source-late-rollback", true, &cid_xml(), None).await;
+    let id = submit(&h, "source-late-rollback", true, &cid_xml()).await;
     gate.wait_until_blocked(&id).await;
     let db = h.state.store.db();
     db.execute_unprepared("CREATE TRIGGER block_source_import_ready BEFORE UPDATE OF job_state ON zip_v2_import_requests WHEN NEW.job_state='ready' BEGIN SELECT RAISE(ABORT, 'late_receipt_failure'); END").await.unwrap();
@@ -676,6 +967,7 @@ async fn each_target_uses_its_own_automatic_rule_intersection_without_source_man
             database_url = "sqlite::memory:"
             [decompress_zip]
             unixfs_directory_root = false
+            auto_pin_outputs = true
             [[pinning.providers]]
             name = "alpha"
             kind = "noop"
@@ -802,7 +1094,7 @@ async fn each_target_uses_its_own_automatic_rule_intersection_without_source_man
             }
         })
         .await
-        .unwrap();
+        .expect("policy-rich import reached its terminal state");
         assert_eq!(terminal, "ready", "target={target}");
         assert_eq!(
             object::Entity::find()
@@ -815,8 +1107,45 @@ async fn each_target_uses_its_own_automatic_rule_intersection_without_source_man
             .all(state.store.db())
             .await
             .unwrap();
+        let manual = leases
+            .iter()
+            .filter(|lease| lease.source == "manual")
+            .collect::<Vec<_>>();
+        let automatic = leases
+            .iter()
+            .filter(|lease| lease.source == "automatic")
+            .collect::<Vec<_>>();
         assert_eq!(
-            leases.len(),
+            manual.len(),
+            1,
+            "original pin=true must retain its separate manual group"
+        );
+        let source = object::Entity::find()
+            .filter(object::Column::Key.eq("archive.zip"))
+            .one(state.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(manual[0].owner_object_id, source.id);
+        assert_eq!(manual[0].policy_id, normalized.policies[0].identity);
+        assert_eq!(manual[0].content_mode, "full");
+        assert_eq!(
+            (manual[0].expires_at - manual[0].created_at).num_seconds(),
+            3600
+        );
+        let manual_targets = ipfs_s3_gateway::store::entities::pin_lease_target::Entity::find()
+            .filter(
+                ipfs_s3_gateway::store::entities::pin_lease_target::Column::LeaseId
+                    .eq(&manual[0].id),
+            )
+            .all(state.store.db())
+            .await
+            .unwrap();
+        assert_eq!(manual_targets.len(), 1);
+        assert_eq!(manual_targets[0].cid, source.cid);
+        assert_eq!(automatic.len() + manual.len(), leases.len());
+        assert_eq!(
+            automatic.len(),
             usize::from(expected_key.is_some()),
             "target={target}"
         );
@@ -827,8 +1156,8 @@ async fn each_target_uses_its_own_automatic_rule_intersection_without_source_man
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(leases[0].owner_object_id, expected.id, "target={target}");
-            assert_eq!(leases[0].source, "automatic");
+            assert_eq!(automatic[0].owner_object_id, expected.id, "target={target}");
+            assert_eq!(automatic[0].source, "automatic");
         }
         worker.shutdown(Duration::from_secs(2)).await;
         server.shutdown().await;

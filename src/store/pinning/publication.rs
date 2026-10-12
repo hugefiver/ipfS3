@@ -21,7 +21,7 @@ use crate::{
     store::{
         entities::{
             bucket, import_job_result, multipart_upload, object, object_version, pin_lease,
-            pin_lease_target, remote_pin, zip_batch, zip_root_reference,
+            pin_lease_target, remote_pin,
         },
         import::ownership::{
             ImportPublicationGuard, StandardMutationGuard, complete_publication_in_transaction,
@@ -42,9 +42,15 @@ use crate::{
 use super::{jobs, leases, ledger, quota, tags};
 
 mod hot_receipt;
+mod zip;
 mod zip_v2;
 
 pub use crate::store::zip::execution as v2_execution;
+pub use zip::{
+    CapturedZipPublication, LegacyZipAuthority, LegacyZipInputProof, ZipExecutionSettlement,
+    ZipPublicationAuthority, bind_legacy_import_input, decode_zip_capture_json,
+    publish_captured_zip, read_legacy_import_input, serialize_zip_capture,
+};
 pub use zip_v2::{ZipV2Publication, ZipV2PublicationResult, ZipV2Success, publish_zip_v2};
 
 use hot_receipt::HotPublicationReceipt;
@@ -334,6 +340,47 @@ pub async fn preflight_decided_routes(
     ledger::verify_birth_candidate_routes(db, &snapshot.routes, &snapshot.allocatable, false).await
 }
 
+/// Fail fast on an unavailable original transport before ZIP source I/O. Frozen
+/// policy/TTL/limits are not reinterpreted; publication repeats the full route
+/// fence under its existing locks with exact final bindings.
+pub(crate) async fn preflight_captured_zip_routes(
+    db: &DatabaseConnection,
+    capture: &crate::pinning::zip_policy::CapturedZipIntent,
+    current: &crate::pinning::config::ValidatedPinningConfig,
+    manifest: Option<&crate::zip::batch::FinalZipManifest>,
+) -> AppResult<()> {
+    let mut routes = BTreeMap::new();
+    let mut flags = BTreeMap::new();
+    let mut allocatable = BTreeSet::new();
+    for frozen in capture.io_provider_candidates(manifest) {
+        let unavailable =
+            || invalid_publication("captured pinning configuration revision is unavailable");
+        let provider = current
+            .providers
+            .iter()
+            .find(|provider| provider.name == frozen.config_name)
+            .ok_or_else(unavailable)?;
+        if provider.validate_route_snapshot(&frozen.route).is_err()
+            || (frozen.enabled && (!provider.limits.enabled || provider.identity.retired))
+        {
+            return Err(unavailable());
+        }
+        if routes
+            .insert(frozen.config_name.clone(), frozen.route.clone())
+            .is_some_and(|old| old != frozen.route)
+            || flags
+                .insert(frozen.config_name.clone(), frozen.enabled)
+                .is_some_and(|old| old != frozen.enabled)
+        {
+            return Err(invalid_publication("captured provider route is ambiguous"));
+        }
+        if frozen.enabled {
+            allocatable.insert(frozen.config_name.clone());
+        }
+    }
+    ledger::verify_birth_candidate_routes(db, &routes, &allocatable, false).await
+}
+
 pub async fn publish_decided_object(
     db: &DatabaseConnection,
     request: PublicationRequest,
@@ -512,7 +559,10 @@ async fn publish_decided_zip_with_batch(
     batch: Option<ZipBatchPublication>,
     captured: DecidedPublish<'_>,
 ) -> AppResult<PublicationResult> {
-    captured.validate(&request.archive)?;
+    captured
+        .decision
+        .validate_policy(&request.archive.policy)
+        .map_err(invalid_publication)?;
     if let Some(guard) = &guard {
         require_decision_origin(captured.decision, &guard.mutation_id)?;
     }
@@ -531,7 +581,7 @@ async fn publish_decided_zip_with_batch(
         None,
         None,
         captured.limits,
-        Some(captured.snapshot()?),
+        Some(zip_decided_snapshot(captured.decision)?),
     )
     .await
 }
@@ -589,7 +639,9 @@ async fn publish_decided_completed_zip_with_batch(
 ) -> Result<PublicationResult, CommitCompletedUploadError> {
     let completion_attempt_id = request.archive.object.id.clone();
     captured
-        .validate(&request.archive)
+        .decision
+        .validate_policy(&request.archive.policy)
+        .map_err(invalid_publication)
         .and_then(|()| require_decision_origin(captured.decision, &upload_target.upload_id))
         .and_then(|()| {
             if let Some(batch) = &batch {
@@ -601,13 +653,12 @@ async fn publish_decided_completed_zip_with_batch(
             completion_attempt_id: completion_attempt_id.clone(),
             source,
         })?;
-    let snapshot =
-        captured
-            .snapshot()
-            .map_err(|source| CommitCompletedUploadError::RolledBack {
-                completion_attempt_id,
-                source,
-            })?;
+    let snapshot = zip_decided_snapshot(captured.decision).map_err(|source| {
+        CommitCompletedUploadError::RolledBack {
+            completion_attempt_id,
+            source,
+        }
+    })?;
     run_completed_publication_with_retries_and_decision(
         db,
         upload_target,
@@ -665,7 +716,10 @@ async fn publish_decided_import_zip_with_batch(
     batch: Option<ZipBatchPublication>,
     captured: DecidedPublish<'_>,
 ) -> AppResult<PublicationResult> {
-    captured.validate(&request.archive)?;
+    captured
+        .decision
+        .validate_policy(&request.archive.policy)
+        .map_err(invalid_publication)?;
     require_decision_origin(captured.decision, &guard.job_id)?;
     if let Some(batch) = &batch {
         batch.validate(&request.archive.object, &request.entries)?;
@@ -682,7 +736,7 @@ async fn publish_decided_import_zip_with_batch(
         Some(now),
         None,
         captured.limits,
-        Some(captured.snapshot()?),
+        Some(zip_decided_snapshot(captured.decision)?),
     )
     .await
 }
@@ -699,6 +753,15 @@ fn require_decision_origin(
         ));
     }
     Ok(())
+}
+
+fn zip_decided_snapshot(decision: &ExtensionDecision) -> AppResult<DecidedSnapshot> {
+    decision.validate_snapshot().map_err(invalid_publication)?;
+    Ok(DecidedSnapshot {
+        decision: decision.clone(),
+        routes: BTreeMap::new(),
+        allocatable: BTreeSet::new(),
+    })
 }
 
 /// Publishes an admitted standard exact-key mutation only while its durable
@@ -1459,39 +1522,6 @@ async fn acquire_sqlite_publication_write_intent<C: ConnectionTrait>(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[cfg(test)]
-async fn publish_in_transaction(
-    db: &DatabaseTransaction,
-    request: PublicationRequest,
-    entries: Vec<PublicationObject>,
-    upload_target: Option<&MultipartUploadTargetIdentity>,
-    standard_guard: Option<&StandardMutationGuard>,
-    import_guard: Option<&ImportPublicationGuard>,
-    result_rows: Vec<import_job_result::ActiveModel>,
-    import_now: Option<DateTime<Utc>>,
-    hot_receipt: Option<&HotPublicationReceipt>,
-    limits: &ProviderLimitMap,
-    decided: Option<&DecidedSnapshot>,
-) -> AppResult<PublicationResult> {
-    publish_in_transaction_with_batch(
-        db,
-        request,
-        entries,
-        None,
-        upload_target,
-        standard_guard,
-        import_guard,
-        result_rows,
-        import_now,
-        hot_receipt,
-        limits,
-        decided,
-        None,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
 async fn publish_in_transaction_with_batch(
     db: &DatabaseTransaction,
     request: PublicationRequest,
@@ -1510,23 +1540,29 @@ async fn publish_in_transaction_with_batch(
     validate_request(&request)?;
     if let Some(batch) = batch {
         batch.validate(&request.object, &entries)?;
+        return zip::publish_legacy_in_transaction(
+            db,
+            request,
+            entries,
+            batch,
+            upload_target,
+            standard_guard,
+            import_guard,
+            result_rows,
+            decided,
+            replay,
+        )
+        .await;
+    }
+    if !entries.is_empty() {
+        return Err(invalid_publication(
+            "ZIP publication requires its durable captured admission; needs_attention",
+        ));
     }
     if let Some(decision) = decided.map(|snapshot| &snapshot.decision) {
         decision
             .validate_policy(&request.policy)
             .map_err(invalid_publication)?;
-    }
-    for entry in &entries {
-        if entry.logical_size < 0 {
-            return Err(invalid_publication(
-                "logical object size cannot be negative",
-            ));
-        }
-        if entry.bucket != request.object.bucket {
-            return Err(invalid_publication(
-                "ZIP publication entries must use the archive bucket",
-            ));
-        }
     }
     if standard_guard.is_some() && import_guard.is_some() {
         return Err(AppError::Internal(
@@ -1562,37 +1598,12 @@ async fn publish_in_transaction_with_batch(
     } else {
         acquire_sqlite_publication_write_intent(db, &request.object.bucket).await?;
     }
-    if let Some(batch) = batch {
-        verify_zip_batch_identity(
-            db,
-            batch,
-            &request,
-            upload_target,
-            import_guard,
-            decided,
-            false,
-        )
-        .await?;
-    }
     let versioning_state =
         crate::store::bucket::lock_versioning_state(db, &request.object.bucket).await?;
     let object_id = request.object.id.clone();
 
     let previous_owner_ids =
         lock_publication_version_frontier(db, versioning_state, &request.object, &entries).await?;
-    if let Some(batch) = batch {
-        // All ZIP publishers acquire batch locks only after the version frontier.
-        verify_zip_batch_identity(
-            db,
-            batch,
-            &request,
-            upload_target,
-            import_guard,
-            decided,
-            true,
-        )
-        .await?;
-    }
     let attachment_pairs = publication_attachment_pairs(db, &request, &entries, limits).await?;
     leases::lock_publication_lifecycle_frontier(db, &previous_owner_ids, &attachment_pairs).await?;
     let attachment_providers: Vec<_> = attachment_pairs
@@ -1622,19 +1633,13 @@ async fn publish_in_transaction_with_batch(
     }
     let publication_time = crate::store::database_clock::database_now(db).await?;
 
-    let mut publication_result = None;
-    for object in ordered_publication_objects(&request.object, &entries) {
-        let result = write_object_version_and_update_lifecycle(
-            db,
-            object,
-            versioning_state,
-            publication_time,
-        )
-        .await?;
-        if object.id == object_id {
-            publication_result = Some(result);
-        }
-    }
+    let publication_result = write_object_version_and_update_lifecycle(
+        db,
+        &request.object,
+        versioning_state,
+        publication_time,
+    )
+    .await?;
     tags::replace_object_tags(db, &object_id, &request.tags).await?;
 
     if let Some(decision) = decided.map(|snapshot| &snapshot.decision) {
@@ -1656,113 +1661,6 @@ async fn publish_in_transaction_with_batch(
                 return Err(AppError::NoSuchUpload(upload_target.upload_id.clone()));
             }
         }
-    }
-    if let Some(batch) = batch {
-        let mut bindings = Vec::with_capacity(batch.entries.len());
-        for entry in &batch.entries {
-            bindings.push(
-                crate::store::zip::binding_for_published_object(db, &entry.path, &entry.object_id)
-                    .await?,
-            );
-        }
-        match &batch.root_outcome {
-            crate::store::zip::RootOutcome::ClaimedFailed { claim, code } => {
-                claim
-                    .publish_failed(
-                        db,
-                        &bindings,
-                        batch.source_published,
-                        &batch.terminal_result,
-                        code,
-                    )
-                    .await?;
-            }
-            outcome => {
-                crate::store::zip::publish(
-                    db,
-                    &batch.batch_id,
-                    &bindings,
-                    batch.source_published,
-                    &batch.terminal_result,
-                    outcome.clone(),
-                )
-                .await?;
-            }
-        }
-    }
-    if let Some(replay) = replay {
-        let batch_id = batch
-            .ok_or_else(|| invalid_publication("missing ZIP replay batch"))?
-            .batch_id
-            .as_str();
-        let target =
-            upload_target.ok_or_else(|| invalid_publication("missing ZIP replay upload"))?;
-        let result = publication_result
-            .as_ref()
-            .ok_or_else(|| invalid_publication("missing ZIP archive result"))?;
-        let sealed = zip_batch::Entity::find_by_id(batch_id)
-            .one(db)
-            .await?
-            .ok_or_else(|| invalid_publication("missing ZIP replay batch"))?;
-        if sealed.state != "published" || sealed.source != "mpu" || sealed.owner != replay.owner {
-            return Err(invalid_publication(
-                "ZIP replay does not match published batch",
-            ));
-        }
-        let mut headers = BTreeMap::from([
-            ("content-type".to_owned(), "application/xml".to_owned()),
-            ("etag".to_owned(), format!("\"{}\"", request.object.cid)),
-            ("x-ipfs-s3-zip-batch-id".to_owned(), batch_id.to_owned()),
-            (
-                "x-ipfs-s3-zip-root-status".to_owned(),
-                sealed.root_status.clone(),
-            ),
-        ]);
-        if let Some(version_id) = &result.version_id {
-            headers.insert("x-amz-version-id".into(), version_id.clone());
-        }
-        if let Some(sse) = &replay.server_side_encryption {
-            headers.insert("x-amz-server-side-encryption".into(), sse.clone());
-        }
-        if let Some(warning) = &replay.pin_warning {
-            headers.insert("x-ipfs3-pin-warning".into(), warning.clone());
-        }
-        if let Some(warning) = &sealed.root_error_code {
-            headers.insert("x-ipfs-s3-zip-root-warning".into(), warning.clone());
-        }
-        if matches!(sealed.root_status.as_str(), "complete" | "partial") {
-            let cid = sealed
-                .root_cid
-                .as_deref()
-                .ok_or_else(|| invalid_publication("missing verified ZIP root"))?;
-            let adopted = zip_root_reference::Entity::find()
-                .filter(zip_root_reference::Column::BatchId.eq(batch_id))
-                .filter(zip_root_reference::Column::Cid.eq(cid))
-                .filter(zip_root_reference::Column::State.eq("adopted"))
-                .filter(zip_root_reference::Column::VerificationReceipt.is_not_null())
-                .one(db)
-                .await?;
-            if adopted.is_none() {
-                return Err(invalid_publication("ZIP root was not adopted"));
-            }
-            headers.insert("x-ipfs-s3-zip-root-cid".into(), cid.to_owned());
-        }
-        crate::store::zip::BatchAdmission::completed_upload_result(
-            db,
-            &replay.owner,
-            &request.object.bucket,
-            &request.object.key,
-            &target.upload_id,
-            &replay.parts,
-            &request.object.id,
-            &request.object.cid,
-            request.object.logical_size,
-            result.version_id.as_deref(),
-            replay.server_side_encryption.as_deref(),
-            &replay.response_xml,
-            headers,
-        )
-        .await?;
     }
     if let Some(guard) = standard_guard {
         complete_standard_mutation_in_transaction(db, guard, publication_time).await?;
@@ -1787,58 +1685,7 @@ async fn publish_in_transaction_with_batch(
         )
         .await?;
     }
-    publication_result.ok_or_else(|| {
-        AppError::Internal("archive object was not written by publication transaction".to_owned())
-    })
-}
-
-async fn verify_zip_batch_identity(
-    db: &DatabaseTransaction,
-    publication: &ZipBatchPublication,
-    request: &PublicationRequest,
-    upload_target: Option<&MultipartUploadTargetIdentity>,
-    import_guard: Option<&ImportPublicationGuard>,
-    decided: Option<&DecidedSnapshot>,
-    lock: bool,
-) -> AppResult<()> {
-    let query = zip_batch::Entity::find_by_id(&publication.batch_id);
-    let batch = if lock && db.get_database_backend() == DatabaseBackend::Postgres {
-        query.lock_exclusive().one(db).await?
-    } else {
-        query.one(db).await?
-    }
-    .ok_or_else(|| invalid_publication("ZIP publication batch is missing"))?;
-    let expected_source = if upload_target.is_some() {
-        "mpu"
-    } else if import_guard.is_some() {
-        "import"
-    } else {
-        "direct"
-    };
-    if batch.state != "open"
-        || batch.source != expected_source
-        || batch.bucket != request.object.bucket
-        || batch.archive_key != request.object.key
-        || decided.is_some_and(|snapshot| batch.owner != snapshot.decision.origin.principal_id)
-        || upload_target.is_some_and(|target| batch.token != target.upload_id)
-        || import_guard.is_some_and(|guard| batch.token != guard.job_id)
-    {
-        return Err(invalid_publication(
-            "ZIP publication does not match admitted batch",
-        ));
-    }
-    if batch.source == "mpu"
-        && serde_json::from_str::<serde_json::Value>(&publication.terminal_result)
-            .ok()
-            .and_then(|result| result.get("archive_cid")?.as_str().map(str::to_owned))
-            .as_deref()
-            != Some(request.object.cid.as_str())
-    {
-        return Err(invalid_publication(
-            "ZIP publication archive differs from prepared source",
-        ));
-    }
-    Ok(())
+    Ok(publication_result)
 }
 
 #[cfg(test)]
@@ -1871,8 +1718,8 @@ fn ordered_publication_objects<'a>(
     let mut objects = Vec::with_capacity(entries.len() + 1);
     objects.push(archive);
     objects.extend(entries);
-    // Stable location-only ordering closes cross-location lock cycles while preserving the ZIP
-    // contract that a later successful entry wins when duplicate entry keys are present.
+    // ZIP winner orchestration belongs to the captured core; this helper also
+    // provides stable location ordering for ordinary publication frontiers.
     objects.sort_by(|left, right| (&left.bucket, &left.key).cmp(&(&right.bucket, &right.key)));
     objects
 }
@@ -1883,36 +1730,7 @@ async fn lock_publication_version_frontier<C: ConnectionTrait>(
     archive: &PublicationObject,
     entries: &[PublicationObject],
 ) -> AppResult<Vec<String>> {
-    let mut locations = BTreeSet::from([(archive.bucket.clone(), archive.key.clone())]);
-    locations.extend(
-        entries
-            .iter()
-            .map(|entry| (entry.bucket.clone(), entry.key.clone())),
-    );
-
-    let mut owner_ids = Vec::new();
-    for (bucket, key) in locations {
-        let _ = crate::store::object_version::lock_current_row(db, &bucket, &key).await?;
-        let _ = crate::store::object_version::allocate_next_sequence(db, &bucket, &key).await?;
-        let current_object = lock_current_object_projection(db, &bucket, &key).await?;
-        match state {
-            BucketVersioningState::Unversioned => {
-                if let Some(current_object) = current_object {
-                    owner_ids.push(current_object.id);
-                }
-            }
-            BucketVersioningState::Enabled => {}
-            BucketVersioningState::Suspended => {
-                if let Some(null_object_id) = lock_null_object_id(db, &bucket, &key).await? {
-                    lock_object_by_id(db, &null_object_id).await?;
-                    owner_ids.push(null_object_id);
-                }
-            }
-        }
-    }
-    owner_ids.sort();
-    owner_ids.dedup();
-    Ok(owner_ids)
+    zip::lock_version_frontier(db, &ordered_publication_objects(archive, entries), state).await
 }
 
 async fn lock_current_object_projection<C: ConnectionTrait>(
@@ -2519,8 +2337,7 @@ mod zip_batch_publication_tests {
         import::SupersedeReason,
         pinning::{
             config::{LeaseDuration, ProviderLimits, ProviderMode, ValidatedPinningConfig},
-            decision::DecisionOrigin,
-            policy::{LeaseIntent, LeaseSource, PinPolicyEvaluator, PublicationContext},
+            policy::{LeaseIntent, LeaseSource},
         },
         store::{
             entities::{object, object_version, pin_lease, pin_lease_target},
@@ -2558,9 +2375,28 @@ mod zip_batch_publication_tests {
         )
     }
 
-    async fn prepare(db: &DatabaseConnection, items: &[ManifestItem]) {
-        zip::admit(
-            db,
+    async fn prepare(
+        db: &DatabaseConnection,
+        archive: &PublicationRequest,
+        prefix: &str,
+        items: &[ManifestItem],
+    ) -> tests::zip_fixture::AdmittedZip {
+        let tx = db.begin().await.unwrap();
+        lock_bucket_for_ownership(&tx, "bucket").await.unwrap();
+        let guard = admit_content_and_prefix_mutation(
+            &tx,
+            "bucket",
+            "archive.zip",
+            prefix,
+            SupersedeReason::DecompressZip,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        let capture =
+            tests::zip_fixture::original_capture(&tx, archive, prefix, &guard.mutation_id).await;
+        BatchAdmission::admit_legacy_in_transaction(
+            &tx,
             &BatchAdmission {
                 id: "batch".into(),
                 owner: "principal".into(),
@@ -2570,12 +2406,18 @@ mod zip_batch_publication_tests {
                 bucket: "bucket".into(),
                 archive_key: "archive.zip".into(),
                 input_identity: "digest".into(),
-                captured_options: "{}".into(),
+                captured_options: serde_json::json!({"zip_intent": capture}).to_string(),
             },
         )
         .await
         .unwrap();
+        tx.commit().await.unwrap();
         zip::prepare_manifest(db, "batch", items).await.unwrap();
+        tests::zip_fixture::AdmittedZip {
+            capture,
+            guard: Some(guard),
+            id: "batch".into(),
+        }
     }
 
     fn captured_request<'a>(
@@ -2589,21 +2431,6 @@ mod zip_batch_publication_tests {
             mode: OptionalPinControlMode::Warn,
             limits,
         }
-    }
-
-    fn decision(config: &ValidatedPinningConfig) -> ExtensionDecision {
-        PinPolicyEvaluator::with_mode(config, OptionalPinControlMode::Warn)
-            .evaluate_publication_decision(
-                PublicationContext {
-                    bucket: "bucket",
-                    key: "archive.zip",
-                    tags: &[],
-                    is_decompress_zip: true,
-                },
-                DecisionOrigin::new("principal", "request"),
-            )
-            .unwrap()
-            .1
     }
 
     fn request(entries: Vec<PublicationObject>) -> ZipPublicationRequest {
@@ -2628,8 +2455,10 @@ mod zip_batch_publication_tests {
     #[tokio::test]
     async fn zip_publish_failure_rolls_back_object_versions_and_batch() {
         let db = setup().await;
-        prepare(
+        let admitted = prepare(
             &db,
+            &request(vec![]).archive,
+            "out/",
             &[ManifestItem::Success {
                 path: "a.txt".into(),
                 object_key: "out/a.txt".into(),
@@ -2641,12 +2470,12 @@ mod zip_batch_publication_tests {
         let config =
             ValidatedPinningConfig::from_raw(&crate::config::PinningConfig::default(), |_| None)
                 .unwrap();
-        let decision = decision(&config);
+        let decision = admitted.capture.source_decision().clone();
         let limits = ProviderLimitMap::new();
         let result = publish_decided_zip_batch(
             &db,
             request(vec![entry("entry", "out/a.txt", "entry-cid")]),
-            None,
+            admitted.guard,
             ZipBatchPublication {
                 batch_id: "batch".into(),
                 entries: vec![ZipBatchEntry {
@@ -2675,26 +2504,6 @@ mod zip_batch_publication_tests {
     #[tokio::test]
     async fn zip_publish_error_rolls_back_pin_leases_and_guard_settlement() {
         let db = setup().await;
-        prepare(
-            &db,
-            &[ManifestItem::Success {
-                path: "a.txt".into(),
-                object_key: "out/a.txt".into(),
-                cid: "wrong-cid".into(),
-                size: 1,
-            }],
-        )
-        .await;
-        let guard = admit_content_and_prefix_mutation(
-            &db,
-            "bucket",
-            "archive.zip",
-            "out/",
-            SupersedeReason::DecompressZip,
-            Utc::now(),
-        )
-        .await
-        .unwrap();
         let mut zip_request = request(vec![entry("entry", "out/a.txt", "entry-cid")]);
         zip_request.archive.policy.leases.push(LeaseIntent {
             source: LeaseSource::Automatic,
@@ -2704,6 +2513,19 @@ mod zip_batch_publication_tests {
             content_mode: ContentMode::Decompressed,
             duration: LeaseDuration::parse("1h").unwrap(),
         });
+        let admitted = prepare(
+            &db,
+            &zip_request.archive,
+            "out/",
+            &[ManifestItem::Success {
+                path: "a.txt".into(),
+                object_key: "out/a.txt".into(),
+                cid: "wrong-cid".into(),
+                size: 1,
+            }],
+        )
+        .await;
+        let guard = admitted.guard.unwrap();
         let limits = ProviderLimitMap::from([(
             "pinata".into(),
             ProviderLimits {
@@ -2776,6 +2598,8 @@ mod zip_batch_publication_tests {
             .unwrap();
         prepare(
             &db,
+            &request(vec![]).archive,
+            "",
             &[
                 ManifestItem::Success {
                     path: "first".into(),
@@ -2792,38 +2616,64 @@ mod zip_batch_publication_tests {
             ],
         )
         .await;
-        let config =
-            ValidatedPinningConfig::from_raw(&crate::config::PinningConfig::default(), |_| None)
-                .unwrap();
-        let decision = decision(&config);
         let limits = ProviderLimitMap::new();
-        publish_decided_zip_batch(
-            &db,
-            request(vec![
-                entry("first", "same.txt", "first-cid"),
-                entry("second", "same.txt", "second-cid"),
-            ]),
-            None,
-            ZipBatchPublication {
-                batch_id: "batch".into(),
-                entries: vec![
-                    ZipBatchEntry {
-                        path: "first".into(),
-                        object_id: "first".into(),
+        // This is the bottom metadata boundary, not a shared ZIP producer:
+        // both immutable histories are real ordinary publications, and their
+        // exact bindings must survive the current key moving to the second.
+        publish_object(&db, request(vec![]).archive, &limits)
+            .await
+            .unwrap();
+        for written in [
+            entry("first", "same.txt", "first-cid"),
+            entry("second", "same.txt", "second-cid"),
+        ] {
+            publish_object(
+                &db,
+                PublicationRequest {
+                    object_target: PinTargetSpec {
+                        cid: written.cid.clone(),
+                        logical_size: written.logical_size,
                     },
-                    ZipBatchEntry {
-                        path: "second".into(),
-                        object_id: "second".into(),
+                    object: written,
+                    tags: vec![],
+                    policy: PublicationPolicy {
+                        tags: vec![],
+                        leases: vec![],
                     },
-                ],
-                source_published: true,
-                root_outcome: RootOutcome::Disabled,
-                terminal_result: "{\"ok\":true}".into(),
-            },
-            captured_request(&decision, &config, &limits),
+                },
+                &limits,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            crate::store::object::get_latest(&db, "bucket", "same.txt")
+                .await
+                .unwrap()
+                .id,
+            "second"
+        );
+        let tx = db.begin().await.unwrap();
+        lock_bucket_for_ownership(&tx, "bucket").await.unwrap();
+        let bindings = [
+            zip::binding_for_published_object(&tx, "first", "first")
+                .await
+                .unwrap(),
+            zip::binding_for_published_object(&tx, "second", "second")
+                .await
+                .unwrap(),
+        ];
+        zip::publish(
+            &tx,
+            "batch",
+            &bindings,
+            true,
+            "{\"ok\":true}",
+            RootOutcome::Disabled,
         )
         .await
         .unwrap();
+        tx.commit().await.unwrap();
         let snapshot = zip::snapshot(&db, "batch").await.unwrap().unwrap();
         assert_eq!(snapshot.batch.state, "published");
         assert!(snapshot.batch.source_published);
@@ -2843,6 +2693,7 @@ mod zip_batch_publication_tests {
                 manifest.version_row_id.as_deref(),
                 Some(version.id.as_str())
             );
+            assert_eq!(version.is_latest, path == "second");
         }
     }
 }

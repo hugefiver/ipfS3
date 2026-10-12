@@ -835,6 +835,44 @@ mod tests {
             root_enabled: false,
             result_version: 2,
         };
+        let tags = vec![crate::pinning::tags::ObjectTag::new(
+            "ipfs-s3:zip-root",
+            "false",
+        )];
+        let mut headers = http::HeaderMap::new();
+        for (name, value) in [
+            ("x-ipfs3-zip-contract", "v2"),
+            ("x-ipfs3-zip-publish-source", "true"),
+            ("x-ipfs3-zip-publish-extracted", "false"),
+            ("x-ipfs3-zip-targets", "none"),
+            ("x-ipfs3-zip-token", id),
+        ] {
+            headers.insert(name, http::HeaderValue::from_str(value).unwrap());
+        }
+        let controls = crate::zip::options::parse_authenticated_zip_controls(
+            &headers,
+            &[("decompress-zip".into(), "out/".into())],
+            &tags,
+            true,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        let intent = crate::pinning::zip_policy::capture_zip_intent(
+            state.pinning.effective_config(),
+            state.pinning.decompress_zip_config(),
+            state.pinning.control_mode(),
+            crate::pinning::zip_policy::ZipCaptureContext {
+                bucket: "bucket",
+                source_key: id,
+                target_prefix: "out/",
+                tags: &tags,
+            },
+            &controls,
+            crate::pinning::decision::DecisionOrigin::new("test", id),
+        )
+        .unwrap();
+        assert_eq!(intent.v2_options().as_ref(), Some(&options));
         let request_contract = serde_json::to_string(&options).unwrap();
         import_intake::admit(
             state.store.db(),
@@ -848,7 +886,7 @@ mod tests {
                     request_contract,
                     bucket: "bucket".to_owned(),
                     source_key: id.to_owned(),
-                    captured_options: serde_json::json!({"options": options}).to_string(),
+                    captured_options: serde_json::json!({"options": options,"zip_intent":intent,"source_tags":tags}).to_string(),
                 },
                 prefix: "out/".to_owned(),
                 source_descriptor: serde_json::to_string(&("cid", CID)).unwrap(),
@@ -1771,6 +1809,12 @@ mod tests {
     async fn worker_shares_configured_slots_across_legacy_and_v2_queues() {
         for concurrency in [1, 2] {
             let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/api/v0/cat"))
+                .and(wiremock::matchers::query_param("arg", CID))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"".to_vec()))
+                .mount(&server)
+                .await;
             for endpoint in ["/api/v0/routing/findprovs", "/api/v0/pin/add"] {
                 Mock::given(method("POST"))
                     .and(path(endpoint))
@@ -1827,6 +1871,12 @@ mod tests {
     #[tokio::test]
     async fn worker_v2_queue_borrows_idle_legacy_slots() {
         let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/cat"))
+            .and(wiremock::matchers::query_param("arg", CID))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"".to_vec()))
+            .mount(&server)
+            .await;
         Mock::given(method("POST"))
             .and(path("/api/v0/pin/add"))
             .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))

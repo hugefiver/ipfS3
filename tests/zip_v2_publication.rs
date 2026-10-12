@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use chrono::Utc;
 use ipfs_s3_gateway::{
     config::{PinningConfig, PolicyConfig, ProviderConfig},
@@ -7,10 +5,7 @@ use ipfs_s3_gateway::{
     pinning::{
         config::ValidatedPinningConfig,
         policy::PublicationPolicy,
-        zip_policy::{
-            ValidatedZipOutputRules, ZipOutputRuleConfig, ZipPublishedOutput, ZipRuleEffect,
-            ZipTargets as PolicyTargets,
-        },
+        zip_policy::{ValidatedZipOutputRules, ZipOutputRuleConfig, ZipRuleEffect},
     },
     store::{
         self,
@@ -33,6 +28,12 @@ use sha2::{Digest, Sha256};
 
 #[path = "../src/store/migrations/m20260927_000004_zip_v2_execution.rs"]
 mod v2_schema;
+
+#[path = "support/r25_review_publication.rs"]
+mod r25_review_publication;
+
+#[path = "support/r25_review_publication_regressions.rs"]
+mod r25_review_publication_regressions;
 
 async fn setup() -> (tempfile::TempDir, DatabaseConnection, DatabaseConnection) {
     let dir = tempfile::tempdir().unwrap();
@@ -90,7 +91,7 @@ async fn prepared_with_root(
     successes: &[(&str, &str, &str)],
     root_enabled: bool,
 ) -> execution::Claim {
-    prepared_with_controls(db, successes, root_enabled, ZipTargets::None, None).await
+    prepared_with_controls(db, successes, root_enabled, ZipTargets::None).await
 }
 
 async fn prepared_with_controls(
@@ -98,9 +99,8 @@ async fn prepared_with_controls(
     successes: &[(&str, &str, &str)],
     root_enabled: bool,
     targets: ZipTargets,
-    rule_revision: Option<&str>,
 ) -> execution::Claim {
-    prepared_manifest_with_controls(db, successes, &[], root_enabled, targets, rule_revision).await
+    prepared_manifest_with_controls(db, successes, &[], root_enabled, targets).await
 }
 
 async fn prepared_manifest_with_controls(
@@ -109,92 +109,14 @@ async fn prepared_manifest_with_controls(
     failures: &[(&str, &str)],
     root_enabled: bool,
     targets: ZipTargets,
-    rule_revision: Option<&str>,
 ) -> execution::Claim {
-    let contract = "{\"contract\":\"v2\"}";
-    let admission = execution::Admission {
-        id: "v2-execution".into(), owner: "principal".into(), source: "direct".into(), token: "v2-token".into(),
-        request_fingerprint: hex::encode(Sha256::digest(contract.as_bytes())), request_contract: contract.into(),
-        bucket: "bucket".into(), source_key: "source.zip".into(),
-        captured_options: serde_json::json!({"options":{
-            "publish_source":false,"publish_extracted":true,"targets":targets,"token":"v2-token",
-            "root_override":null,"root_enabled":root_enabled,"result_version":2},"rule_revision":rule_revision}).to_string(),
-    };
-    execution::admit(db, &admission).await.unwrap();
-    let claim = execution::claim(db, &admission.id, "worker", 30)
-        .await
-        .unwrap()
-        .unwrap();
-    execution::bind_clean_input(db, &claim, &"a".repeat(64), "input-cid", 99)
-        .await
-        .unwrap();
-    let tx = db.begin().await.unwrap();
-    store::import::ownership::lock_bucket_for_ownership(&tx, "bucket")
-        .await
-        .unwrap();
-    let items = successes
-        .iter()
-        .map(|(path, key, cid)| execution::ManifestItem::Success {
-            path: (*path).into(),
-            object_key: (*key).into(),
-            cid: (*cid).into(),
-            size: 7,
-        })
-        .chain(
-            failures
-                .iter()
-                .map(|(path, code)| execution::ManifestItem::Failure {
-                    path: (*path).into(),
-                    code: (*code).into(),
-                }),
-        )
-        .collect::<Vec<_>>();
-    let mutations = successes
-        .iter()
-        .map(|(_, key, _)| ((*key).into(), format!("guard-{key}")))
-        .collect::<BTreeMap<_, _>>();
-    execution::admit_manifest_in_transaction(&tx, &claim, &items, &mutations)
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
-
-    zip::admit(
-        db,
-        &zip::BatchAdmission {
-            id: admission.id,
-            owner: admission.owner,
-            source: admission.source,
-            token: admission.token,
-            fingerprint: "pending".into(),
-            bucket: "bucket".into(),
-            archive_key: "source.zip".into(),
-            input_identity: "pending".into(),
-            captured_options: admission.captured_options,
-        },
-    )
-    .await
-    .unwrap();
-    let entries = successes
-        .iter()
-        .map(|(path, key, cid)| zip::ManifestItem::Success {
-            path: (*path).into(),
-            object_key: (*key).into(),
-            cid: (*cid).into(),
-            size: 7,
-        })
-        .chain(
-            failures
-                .iter()
-                .map(|(path, code)| zip::ManifestItem::Failure {
-                    path: (*path).into(),
-                    code: (*code).into(),
-                }),
-        )
-        .collect::<Vec<_>>();
-    zip::prepare_manifest(db, &claim.batch_id, &entries)
-        .await
-        .unwrap();
-    claim
+    let capture = r25_review_publication::capture(root_enabled, targets);
+    let captured_options = serde_json::json!({
+        "options": capture.v2_options().unwrap(), "target_prefix": capture.target_prefix(),
+        "rule_revision": capture.policy_revision(), "zip_intent": capture,
+    })
+    .to_string();
+    r25_review_publication::prepare_with_envelope(db, successes, failures, captured_options).await
 }
 
 fn request(claim: execution::Claim, successes: Vec<ZipV2Success>) -> ZipV2Publication {
@@ -268,69 +190,37 @@ fn pin_config() -> ValidatedPinningConfig {
     .unwrap()
 }
 
-fn output_rules(config: &ValidatedPinningConfig) -> ValidatedZipOutputRules {
-    ValidatedZipOutputRules::compile(
-        &[
-            ZipOutputRuleConfig {
-                name: "a".into(),
-                priority: 1,
-                bucket: "bucket".into(),
-                prefix: "out/a/".into(),
-                effect: ZipRuleEffect::Allow,
-                policy_id: Some(config.policies[0].identity.clone()),
-            },
-            ZipOutputRuleConfig {
-                name: "b".into(),
-                priority: 1,
-                bucket: "bucket".into(),
-                prefix: "out/b/".into(),
-                effect: ZipRuleEffect::Allow,
-                policy_id: Some(config.policies[1].identity.clone()),
-            },
-            ZipOutputRuleConfig {
-                name: "private".into(),
-                priority: 0,
-                bucket: "bucket".into(),
-                prefix: "out/private/".into(),
-                effect: ZipRuleEffect::Deny,
-                policy_id: None,
-            },
-        ],
-        config,
-    )
-    .unwrap()
+fn output_rule_config(config: &ValidatedPinningConfig) -> Vec<ZipOutputRuleConfig> {
+    vec![
+        ZipOutputRuleConfig {
+            name: "a".into(),
+            priority: 1,
+            bucket: "bucket".into(),
+            prefix: "out/a/".into(),
+            effect: ZipRuleEffect::Allow,
+            policy_id: Some(config.policies[0].identity.clone()),
+        },
+        ZipOutputRuleConfig {
+            name: "b".into(),
+            priority: 1,
+            bucket: "bucket".into(),
+            prefix: "out/b/".into(),
+            effect: ZipRuleEffect::Allow,
+            policy_id: Some(config.policies[1].identity.clone()),
+        },
+        ZipOutputRuleConfig {
+            name: "private".into(),
+            priority: 0,
+            bucket: "bucket".into(),
+            prefix: "out/private/".into(),
+            effect: ZipRuleEffect::Deny,
+            policy_id: None,
+        },
+    ]
 }
 
-fn planned_success(
-    rules: &ValidatedZipOutputRules,
-    path: &str,
-    key: &str,
-    cid: &str,
-    id: &str,
-) -> ZipV2Success {
-    let mut result = success(path, key, cid, id);
-    let output = ZipPublishedOutput {
-        bucket: "bucket".into(),
-        key: key.into(),
-        version_id: "only-a-fixture-version".into(),
-        cid: cid.into(),
-    };
-    let plan = rules
-        .plan(
-            PolicyTargets {
-                source: false,
-                extracted: true,
-            },
-            None,
-            &[output],
-        )
-        .unwrap();
-    result.policy.leases = plan.outputs[0]
-        .intents
-        .iter()
-        .map(|planned| planned.intent.clone())
-        .collect();
-    result
+fn output_rules(config: &ValidatedPinningConfig) -> ValidatedZipOutputRules {
+    ValidatedZipOutputRules::compile(&output_rule_config(config), config).unwrap()
 }
 
 #[tokio::test]
@@ -354,22 +244,15 @@ async fn each_output_gets_independent_automatic_policy_private_gets_no_lease_and
         ],
         false,
         ZipTargets::Extracted,
-        Some(rules.revision()),
     )
     .await;
     let mut publication = request(
         claim,
         vec![
-            planned_success(&rules, "a-one", "out/a/one", "shared-cid", "one"),
-            planned_success(&rules, "a-two", "out/a/two", "shared-cid", "two"),
-            planned_success(&rules, "b-one", "out/b/one", "shared-cid", "three"),
-            planned_success(
-                &rules,
-                "private",
-                "out/private/secret",
-                "shared-cid",
-                "four",
-            ),
+            success("a-one", "out/a/one", "shared-cid", "one"),
+            success("a-two", "out/a/two", "shared-cid", "two"),
+            success("b-one", "out/b/one", "shared-cid", "three"),
+            success("private", "out/private/secret", "shared-cid", "four"),
         ],
     );
     publication.targets = ZipTargets::Extracted;
@@ -431,33 +314,46 @@ async fn captured_rule_revision_cannot_be_replanned_with_new_permissions() {
     let (_dir, first, second) = setup().await;
     let config = pin_config();
     let rules = output_rules(&config);
-    let claim = prepared_with_controls(
+    let claim = r25_review_publication::historical_revision_only(
         &first,
         &[("one", "out/a/one", "cid-1")],
-        false,
         ZipTargets::Extracted,
         Some(&"0".repeat(64)),
     )
     .await;
-    let mut publication = request(
-        claim,
-        vec![planned_success(&rules, "one", "out/a/one", "cid-1", "one")],
-    );
+    let mut publication = request(claim, vec![success("one", "out/a/one", "cid-1", "one")]);
     publication.targets = ZipTargets::Extracted;
     publication.captured_rule_revision = Some("0".repeat(64));
-    assert!(
-        publication::publish_zip_v2(
-            &second,
-            publication,
-            &rules,
-            &config,
-            &config.provider_limits
-        )
+    let original = execution::read(&first, "v2-execution")
         .await
-        .is_err()
+        .unwrap()
+        .unwrap();
+    let error = publication::publish_zip_v2(
+        &second,
+        publication,
+        &rules,
+        &config,
+        &config.provider_limits,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(error, ipfs_s3_gateway::error::AppError::InvalidPinningRequest(ref message) if message.contains("needs_attention"))
+    );
+    assert_eq!(
+        execution::read(&first, "v2-execution")
+            .await
+            .unwrap()
+            .unwrap(),
+        original
     );
     assert_eq!(object::Entity::find().count(&first).await.unwrap(), 0);
     assert_eq!(pin_lease::Entity::find().count(&first).await.unwrap(), 0);
+    assert_eq!(
+        object_version::Entity::find().count(&first).await.unwrap(),
+        0
+    );
+    assert_eq!(remote_pin::Entity::find().count(&first).await.unwrap(), 0);
 }
 
 #[tokio::test]
@@ -671,7 +567,6 @@ async fn all_failed_manifest_seals_disabled_root_and_execution_without_objects()
         &[("failed/file", "invalid_zip")],
         false,
         ZipTargets::None,
-        None,
     )
     .await;
     let config = ValidatedPinningConfig::from_raw(&Default::default(), |_| None).unwrap();
@@ -742,7 +637,6 @@ async fn all_failed_manifest_with_root_enabled_seals_empty_without_a_cid() {
         &[("failed/file", "invalid_zip")],
         true,
         ZipTargets::None,
-        None,
     )
     .await;
     let config = ValidatedPinningConfig::from_raw(&Default::default(), |_| None).unwrap();
@@ -911,12 +805,11 @@ async fn unverified_root_cid_cannot_commit_written_output_leases_or_guard_comple
         &[("one", "out/a/one", "cid-1")],
         true,
         ZipTargets::Extracted,
-        Some(rules.revision()),
     )
     .await;
     let mut publication = request(
         claim.clone(),
-        vec![planned_success(&rules, "one", "out/a/one", "cid-1", "one")],
+        vec![success("one", "out/a/one", "cid-1", "one")],
     );
     publication.targets = ZipTargets::Extracted;
     publication.captured_rule_revision = Some(rules.revision().into());

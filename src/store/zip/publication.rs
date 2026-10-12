@@ -12,7 +12,7 @@ use super::{
     safe_code, stale,
 };
 use crate::{
-    error::AppResult,
+    error::{AppError, AppResult},
     store::entities::{object, object_version, zip_batch, zip_manifest_entry, zip_root_reference},
 };
 
@@ -248,6 +248,140 @@ fn valid_terminal(result: &str) -> bool {
         && serde_json::from_str::<serde_json::Value>(result).is_ok()
 }
 
+/// Called under the existing batch/claim lock, before a retry is invoked.
+/// Shape-valid bare options alone cannot prove a modern capture's provenance.
+pub(super) async fn verify_root_retry_binding(
+    tx: &DatabaseTransaction,
+    batch: &zip_batch::Model,
+) -> AppResult<()> {
+    let attention = || {
+        AppError::InvalidPinningRequest(
+            "ZIP root retry requires original published capture evidence; needs_attention".into(),
+        )
+    };
+    let terminal = batch.terminal_result.as_deref().ok_or_else(attention)?;
+    let execution = super::execution::read(tx, &batch.id).await?;
+    let intake = crate::store::multipart::v2_zip::read_by_upload(tx, &batch.id).await?;
+    if let Some(execution) = &execution {
+        if execution.state != "completed"
+            || execution.source != batch.source
+            || execution.owner != batch.owner
+            || execution.token != batch.token
+            || execution.bucket != batch.bucket
+            || execution.source_key != batch.archive_key
+            || execution.captured_options != batch.captured_options
+            || (batch.source == "mpu" && intake.is_none())
+            || (batch.source != "mpu" && intake.is_some())
+        {
+            return Err(attention());
+        }
+        let mut original: serde_json::Value =
+            serde_json::from_str(terminal).map_err(|_| attention())?;
+        let mut completed: serde_json::Value =
+            serde_json::from_str(execution.terminal_result.as_deref().ok_or_else(attention)?)
+                .map_err(|_| attention())?;
+        for field in ["root_status", "root_warning", "root_cid"] {
+            original
+                .as_object_mut()
+                .ok_or_else(attention)?
+                .remove(field);
+            completed
+                .as_object_mut()
+                .ok_or_else(attention)?
+                .remove(field);
+        }
+        if original != completed {
+            return Err(attention());
+        }
+    } else {
+        let capture: serde_json::Value =
+            serde_json::from_str(&batch.captured_options).map_err(|_| attention())?;
+        if intake.is_some()
+            || (capture.get("schema_version").is_some()
+                && capture.get("contract").and_then(serde_json::Value::as_str) != Some("v1"))
+            || capture
+                .pointer("/zip_intent/contract")
+                .and_then(serde_json::Value::as_str)
+                == Some("v2")
+            || (batch.source == "mpu"
+                && (batch.token != batch.id || batch.input_identity != batch.id))
+        {
+            return Err(attention());
+        }
+        // Absence is not historical proof. The MPU legacy branch below still
+        // requires its native original Complete/prepared-archive binding.
+    }
+    verify_archive_binding(tx, batch, terminal, batch.source_published).await?;
+    if batch.source == "mpu" && intake.is_some() {
+        let backend = tx.get_database_backend();
+        let sql = if backend == DatabaseBackend::Postgres {
+            "SELECT part_contract,response_xml,response_headers FROM zip_v2_mpu_completions WHERE upload_id=$1"
+        } else {
+            "SELECT part_contract,response_xml,response_headers FROM zip_v2_mpu_completions WHERE upload_id=?"
+        };
+        let receipt = tx
+            .query_one(sea_orm::Statement::from_sql_and_values(
+                backend,
+                sql,
+                [batch.id.clone().into()],
+            ))
+            .await?
+            .ok_or_else(attention)?;
+        let parts: Vec<serde_json::Value> =
+            serde_json::from_str(&receipt.try_get::<String>("", "part_contract")?)
+                .map_err(|_| attention())?;
+        let number =
+            |part: &serde_json::Value| part.get("part_number").and_then(serde_json::Value::as_i64);
+        if parts.is_empty()
+            || parts.len() > 10_000
+            || parts.iter().any(|part| !valid_root_retry_part(part))
+            || parts
+                .windows(2)
+                .any(|pair| number(&pair[0]) >= number(&pair[1]))
+        {
+            return Err(attention());
+        }
+        let xml = receipt
+            .try_get::<Option<String>>("", "response_xml")?
+            .ok_or_else(attention)?;
+        let headers = receipt
+            .try_get::<Option<String>>("", "response_headers")?
+            .ok_or_else(attention)?;
+        let headers: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(&headers).map_err(|_| attention())?;
+        if xml.is_empty() || headers.get("x-ipfs-s3-zip-batch-id") != Some(&batch.id) {
+            return Err(attention());
+        }
+    }
+    Ok(())
+}
+
+fn valid_root_retry_part(part: &serde_json::Value) -> bool {
+    let Some(part) = part.as_object() else {
+        return false;
+    };
+    part.len() == 7
+        && part
+            .get("part_number")
+            .and_then(serde_json::Value::as_i64)
+            .is_some_and(|number| (1..=10_000).contains(&number))
+        && match part.get("etag") {
+            Some(serde_json::Value::Null) => true,
+            Some(serde_json::Value::Array(etag)) => {
+                etag.len() == 2
+                    && matches!(etag[0].as_str(), Some("strong" | "weak"))
+                    && etag[1].is_string()
+            }
+            _ => false,
+        }
+        && ["crc32", "crc32c", "crc64nvme", "sha1", "sha256"]
+            .iter()
+            .all(|field| {
+                part.get(*field)
+                    .is_some_and(|value| value.is_null() || value.is_string())
+            })
+}
+
 async fn verify_archive_binding(
     tx: &DatabaseTransaction,
     batch: &zip_batch::Model,
@@ -265,8 +399,7 @@ async fn verify_archive_binding(
                 .ok_or_else(stale)?;
             let marker: serde_json::Value =
                 serde_json::from_str(terminal_result).map_err(|_| stale())?;
-            let options: crate::zip::options::ZipV2Options =
-                serde_json::from_str(&intake.captured_options).map_err(|_| stale())?;
+            let options = intake.options().map_err(|_| stale())?;
             if (execution.state == "admitted"
                 && (batch.state != "open"
                     || batch.terminal_result.is_some()

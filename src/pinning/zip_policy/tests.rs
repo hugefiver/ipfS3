@@ -1,4 +1,6 @@
 use super::*;
+#[path = "capture_tests.rs"]
+mod captured;
 use crate::{
     config::{PinningConfig, PolicyConfig, ProviderConfig},
     pinning::{
@@ -78,6 +80,34 @@ fn rules(config: &ValidatedPinningConfig) -> Vec<ZipOutputRuleConfig> {
         ),
         rule("private", "exports/private/", ZipRuleEffect::Deny, None),
     ]
+}
+
+#[test]
+fn r25_omitted_switch_with_old_remote_archive_auto_requires_migration() {
+    let raw: crate::config::Config = toml::from_str(
+        r#"
+        [[pinning.providers]]
+        name = "remote"
+        kind = "pinata"
+        token_env = "PINATA_TOKEN"
+        priority = 1
+        max_bytes = 100
+        max_pins = 10
+        [[pinning.policies]]
+        bucket = "photos"
+        trigger = "always"
+        provider_mode = "one"
+        providers = ["remote"]
+        default_duration = "1h"
+        max_duration = "2h"
+        "#,
+    )
+    .unwrap();
+    let error =
+        ValidatedPinningConfig::from_config(&raw, |_| Some("test-token".into())).unwrap_err();
+    assert!(error.to_string().contains("auto_pin_outputs"));
+    assert!(error.to_string().contains("true"));
+    assert!(error.to_string().contains("false"));
 }
 
 #[test]
@@ -349,6 +379,8 @@ fn one_keeps_disabled_fallback_but_all_requires_every_provider_available() {
 fn real_remote_route_needs_explicit_identity_and_captures_safe_revision() {
     let raw: crate::config::Config = toml::from_str(
         r#"
+        [decompress_zip]
+        auto_pin_outputs = true
         [[pinning.providers]]
         name = "remote"
         kind = "pinata"
@@ -473,7 +505,7 @@ fn rejects_unknown_policy_and_never_emits_secret_or_endpoint() {
 fn v2_rules_do_not_change_legacy_first_match_or_inherit_archive_manual_control() {
     let mut config = fixture();
     let mut broad = config.policies[0].clone();
-    broad.trigger = super::PolicyTrigger::Request;
+    broad.trigger = crate::pinning::config::PolicyTrigger::Request;
     broad.refresh_identity(0);
     config.policies.insert(0, broad);
     config.policies[1].refresh_identity(1);

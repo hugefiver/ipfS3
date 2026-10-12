@@ -110,20 +110,48 @@ pub struct CryptoConfig {
 }
 
 /// Default for ZIP decompression requests only; ordinary object operations do not use it.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Clone)]
 pub struct DecompressZipConfig {
-    #[serde(default = "default_zip_root_enabled")]
     pub unixfs_directory_root: bool,
     /// ZIP extraction budgets, declared directly under `[decompress_zip]`.
     /// The request/import entrypoints must pass these limits explicitly; the
     /// extractor's legacy entrypoints intentionally continue using defaults.
-    #[serde(flatten)]
     pub limits: crate::zip::extract::ZipExtractionLimits,
-    /// Optional ZIP v2-only rules ([[decompress_zip.pin_output_rules]]).
-    /// The pure engine must be explicitly compiled/admitted by a v2 caller;
-    /// merely configuring a rule does not authorize or enqueue remote work.
-    #[serde(default)]
+    /// Omission is distinguishable from either explicit migration choice.
+    pub auto_pin_outputs: Option<bool>,
+    /// Common ZIP output restrictions. Vec is retained for old adapter source
+    /// compatibility; rules_provided preserves an explicitly empty TOML list.
     pub pin_output_rules: Vec<ZipOutputRuleConfig>,
+    pub pin_output_rules_provided: bool,
+}
+
+impl<'de> Deserialize<'de> for DecompressZipConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            #[serde(default = "default_zip_root_enabled")]
+            unixfs_directory_root: bool,
+            #[serde(flatten)]
+            limits: crate::zip::extract::ZipExtractionLimits,
+            auto_pin_outputs: Option<bool>,
+            pin_output_rules: Option<Vec<ZipOutputRuleConfig>>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        Ok(Self {
+            unixfs_directory_root: raw.unixfs_directory_root,
+            limits: raw.limits,
+            auto_pin_outputs: raw.auto_pin_outputs,
+            pin_output_rules_provided: raw.pin_output_rules.is_some(),
+            pin_output_rules: raw.pin_output_rules.unwrap_or_default(),
+        })
+    }
+}
+
+impl DecompressZipConfig {
+    pub fn output_rules(&self) -> Option<&[ZipOutputRuleConfig]> {
+        (self.pin_output_rules_provided || !self.pin_output_rules.is_empty())
+            .then_some(self.pin_output_rules.as_slice())
+    }
 }
 
 fn default_zip_root_enabled() -> bool {
@@ -135,7 +163,9 @@ impl Default for DecompressZipConfig {
         Self {
             unixfs_directory_root: default_zip_root_enabled(),
             limits: crate::zip::extract::ZipExtractionLimits::default(),
+            auto_pin_outputs: None,
             pin_output_rules: Vec::new(),
+            pin_output_rules_provided: false,
         }
     }
 }

@@ -8,27 +8,25 @@ use std::{
 use http::{HeaderMap, StatusCode};
 use s3s::{Body, S3Request, S3Response, S3Result, dto::CompleteMultipartUploadInput};
 use sea_orm::TransactionTrait;
+use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     error::AppError,
-    pinning::{
-        policy::PublicationPolicy,
-        zip_policy::{ZipPublishedOutput, ZipTargets as PolicyTargets},
-    },
     state::AppState,
     store::{
         self,
         import::ownership::StandardMutationGuard,
         multipart::v2_zip::{CompleteReceipt, CompleteState, Record},
         pinning::publication::{
-            PublicationObject, ZipV2Publication, ZipV2PublicationResult, ZipV2Success,
+            CapturedZipPublication, PublicationObject, ZipExecutionSettlement,
+            ZipPublicationAuthority, publish_captured_zip,
         },
         zip::{self, execution},
     },
     zip::{
         batch::{FinalZipManifest, ManifestFailure, ManifestFile},
-        options::{ZipTargets, ZipV2Options},
+        options::ZipTargets,
     },
 };
 
@@ -157,8 +155,7 @@ async fn retained_manifest(
     {
         return Err(conflict());
     }
-    let options: ZipV2Options =
-        serde_json::from_str(&intake.captured_options).map_err(|_| conflict())?;
+    let options = intake.options().map_err(|_| conflict())?;
     let source_guard = if options.publish_source {
         let generation = retained
             .batch
@@ -315,11 +312,75 @@ pub(super) async fn complete(
     {
         return Err(conflict());
     }
-    if req
-        .headers
-        .get_all("x-ipfs3-zip-token")
-        .iter()
-        .any(|value| value.to_str().ok() != Some(intake.token.as_str()))
+    let historical =
+        crate::zip::options::decode_historical_zip_options(&intake.captured_options, None)
+            .map_err(|_| conflict())?;
+    let options = intake.options().map_err(|_| conflict())?;
+    if (!options.publish_source && !options.publish_extracted)
+        || options.result_version != 2
+        || options.token != intake.token
+        || (matches!(options.targets, ZipTargets::Source | ZipTargets::Both)
+            && !options.publish_source)
+        || (matches!(options.targets, ZipTargets::Extracted | ZipTargets::Both)
+            && !options.publish_extracted)
+    {
+        return Err(conflict());
+    }
+    super::replay_controls::verify(
+        &req.headers,
+        &crate::s3::query::decoded_query_pairs(&req.uri)?,
+        &crate::zip::options::ZipOptions::V2(options.clone()),
+        &intake.target_prefix,
+        Some(true),
+        options.root_enabled,
+    )?;
+    let admitted = execution::read(state.store.db(), &intake.execution_id)
+        .await
+        .map_err(store_error)?
+        .ok_or_else(conflict)?;
+    if admitted.source != "mpu"
+        || admitted.owner != principal
+        || admitted.bucket != req.input.bucket
+        || admitted.source_key != req.input.key
+        || admitted.token != intake.token
+        || admitted.captured_options != intake.captured_options
+        || admitted.request_fingerprint != intake.request_fingerprint
+        || admitted.request_fingerprint
+            != hex::encode(Sha256::digest(admitted.request_contract.as_bytes()))
+    {
+        return Err(conflict());
+    }
+    if historical.expected_sha256.as_ref().is_some_and(|expected| {
+        admitted
+            .input_sha256
+            .as_ref()
+            .is_some_and(|sha| sha != expected)
+    }) {
+        return Err(conflict());
+    }
+    if req.headers.contains_key("x-amz-tagging") {
+        let mut tags = super::parse_publication_tags(&req.headers)?;
+        tags.sort_by(|left, right| left.key.cmp(&right.key));
+        let contract: serde_json::Value =
+            serde_json::from_str(&admitted.request_contract).map_err(|_| conflict())?;
+        if contract.get("tags") != Some(&serde_json::json!(tags)) {
+            return Err(conflict());
+        }
+    }
+    if super::has_sse_header(&req.headers) {
+        return Err(s3s::s3_error!(
+            InvalidArgument,
+            "ZIP multipart cannot use server-side encryption"
+        ));
+    }
+    let intent = intake.zip_intent().map_err(|_| conflict())?;
+    if let Some(intent) = &intent
+        && (intent.bucket() != intake.bucket
+            || intent.source_key() != intake.archive_key
+            || intent.target_prefix() != intake.target_prefix
+            || intent.origin().principal_id != principal
+            || intent.origin().request_id != *id
+            || intent.v2_options().as_ref() != Some(&options))
     {
         return Err(conflict());
     }
@@ -332,6 +393,17 @@ pub(super) async fn complete(
     let contract =
         store::multipart::v2_zip::complete_request_contract(parts).map_err(store_error)?;
     let db = state.store.db();
+    if admitted.state == "pending"
+        && let Some(intent) = &intent
+    {
+        store::pinning::publication::preflight_captured_zip_routes(
+            db,
+            intent,
+            state.pinning.effective_config(),
+            None,
+        )
+        .await?;
+    }
     match store::multipart::v2_zip::capture_complete(
         db,
         &intake,
@@ -346,18 +418,13 @@ pub(super) async fn complete(
         CompleteState::Completed(receipt) => return receipt_response(receipt),
         CompleteState::Pending => {}
     }
-    let options: ZipV2Options =
-        serde_json::from_str(&intake.captured_options).map_err(|_| conflict())?;
-    if (!options.publish_source && !options.publish_extracted)
-        || options.result_version != 2
-        || options.token != intake.token
-        || (matches!(options.targets, ZipTargets::Source | ZipTargets::Both)
-            && !options.publish_source)
-        || (matches!(options.targets, ZipTargets::Extracted | ZipTargets::Both)
-            && !options.publish_extracted)
-        || (options.targets != ZipTargets::None
-            && state.pinning.zip_output_rules().revision() != intake.rule_revision)
-    {
+    let intent = intent.ok_or_else(|| {
+        s3s::s3_error!(
+            OperationAborted,
+            "ZIP capture needs_attention: missing original multipart intent"
+        )
+    })?;
+    if admitted.state != "admitted" && super::v2::current_io_denied(state, &intent, None) {
         return Err(conflict());
     }
     let claim = execution::claim(db, id, &uuid::Uuid::new_v4().to_string(), LEASE_SECONDS)
@@ -434,54 +501,33 @@ pub(super) async fn complete(
     } else {
         None
     };
-    let rules = state.pinning.zip_output_rules();
-    let source_preview = options.publish_source.then(|| ZipPublishedOutput {
-        bucket: intake.bucket.clone(),
-        key: intake.archive_key.clone(),
-        version_id: "unpublished-preview".into(),
-        cid: source_cid.clone(),
-    });
-    let planned = if options.targets == ZipTargets::None {
-        Vec::new()
-    } else {
-        let outputs = manifest
-            .successful
-            .iter()
-            .map(|file| ZipPublishedOutput {
-                bucket: intake.bucket.clone(),
-                key: file.object_key.clone(),
-                version_id: "unpublished-preview".into(),
-                cid: file.cid.clone(),
-            })
-            .collect::<Vec<_>>();
-        rules
-            .plan(
-                PolicyTargets {
-                    source: matches!(options.targets, ZipTargets::Source | ZipTargets::Both),
-                    extracted: matches!(options.targets, ZipTargets::Extracted | ZipTargets::Both),
-                },
-                source_preview,
-                &outputs,
-            )
-            .map_err(|_| conflict())?
-            .outputs
-    };
-    let intents = planned
-        .into_iter()
-        .map(|decision| {
-            (
-                decision.output.key,
-                decision
-                    .intents
-                    .into_iter()
-                    .map(|intent| intent.intent)
-                    .collect::<Vec<_>>(),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
     if !store::import::ownership::renew_zip_v2_direct_group(db, &claim, LEASE_SECONDS)
         .await
         .map_err(store_error)?
+    {
+        return Err(conflict());
+    }
+    let guards = execution::read_targets(db, &claim)
+        .await
+        .map_err(store_error)?;
+    let keys = manifest
+        .successful
+        .iter()
+        .map(|file| file.object_key.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    if keys.len() != manifest.successful.len()
+        || keys != guards.iter().map(|guard| guard.key.as_str()).collect()
+    {
+        return Err(conflict());
+    }
+    store::pinning::publication::preflight_captured_zip_routes(
+        db,
+        &intent,
+        state.pinning.effective_config(),
+        Some(&manifest),
+    )
+    .await?;
+    if snapshot.state == "admitted" && super::v2::current_io_denied(state, &intent, Some(&manifest))
     {
         return Err(conflict());
     }
@@ -491,8 +537,8 @@ pub(super) async fn complete(
     let successes = manifest
         .successful
         .iter()
-        .map(|file| ZipV2Success {
-            object: PublicationObject::from_put(
+        .map(|file| {
+            PublicationObject::from_put(
                 uuid::Uuid::new_v4().to_string(),
                 &intake.bucket,
                 &file.object_key,
@@ -504,15 +550,7 @@ pub(super) async fn complete(
                 None,
                 None,
                 chrono::Utc::now(),
-            ),
-            path: file.relative_path.clone(),
-            object_key: file.object_key.clone(),
-            cid: file.cid.clone(),
-            size: file.size,
-            policy: PublicationPolicy {
-                tags: Vec::new(),
-                leases: intents.get(&file.object_key).cloned().unwrap_or_default(),
-            },
+            )
         })
         .collect();
     let bound = execution::read(db, id)
@@ -536,8 +574,8 @@ pub(super) async fn complete(
     };
     let terminal = serde_json::json!({"input_sha256": bound.input_sha256.ok_or_else(conflict)?,
         "published_count": manifest.successful.len(), "failed_count": manifest.failed.len(), "status": status}).to_string();
-    let request = ZipV2Publication {
-        claim: claim.clone(),
+    let request = CapturedZipPublication {
+        batch_id: id.clone(),
         source: upload.as_ref().map(|upload| {
             let mut object = PublicationObject::from_put(
                 uuid::Uuid::new_v4().to_string(),
@@ -555,38 +593,38 @@ pub(super) async fn complete(
             object.multipart = true;
             object
         }),
-        source_policy: upload
+        source_tags: upload
             .as_ref()
             .map(|upload| {
-                Ok::<_, s3s::S3Error>(PublicationPolicy {
-                    tags: store::pinning::tags::tags_from_json(&upload.tags_json)
-                        .map_err(|_| conflict())?,
-                    leases: intents
-                        .get(&intake.archive_key)
-                        .cloned()
-                        .unwrap_or_default(),
-                })
+                store::pinning::tags::tags_from_json(&upload.tags_json).map_err(|_| conflict())
             })
-            .transpose()?,
-        source_guard,
+            .transpose()?
+            .unwrap_or_default(),
         successes,
-        targets: options.targets,
-        captured_rule_revision: Some(intake.rule_revision.clone()),
+        manifest,
+        capture: intent,
+        authority: ZipPublicationAuthority::Execution {
+            claim: claim.clone(),
+            source_guard,
+            settlement: ZipExecutionSettlement::Mpu { contract },
+        },
         root_outcome,
         terminal_result: terminal,
     };
     if lease.cancelled.is_cancelled() {
         return Err(conflict());
     }
-    let publication = request
-        .publish_mpu(
-            db,
-            contract,
-            rules,
-            state.pinning.effective_config(),
-            state.pinning.provider_limits(),
-        )
-        .await;
+    let publication = publish_captured_zip(db, request).await;
+    if matches!(publication, Err(AppError::StaleContentMutation)) {
+        let fenced = if options.publish_source {
+            execution::fence(db, &claim).await
+        } else {
+            execution::fence_if_lost(db, &claim).await
+        };
+        if let Err(error) = fenced {
+            tracing::warn!(%error, "ZIP multipart guard reconciliation deferred");
+        }
+    }
     // Read the committed receipt, never infer an unknown commit result from a
     // returned CID or from a later current object projection.
     let parts = req
@@ -609,9 +647,7 @@ pub(super) async fn complete(
         CompleteState::Completed(receipt) => receipt_response(receipt),
         CompleteState::Pending => match publication {
             Err(error) => Err(store_error(error)),
-            Ok(ZipV2PublicationResult::Published(_) | ZipV2PublicationResult::Fenced) => {
-                Err(conflict())
-            }
+            Ok(_) => Err(conflict()),
         },
     }
 }

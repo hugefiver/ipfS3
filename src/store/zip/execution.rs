@@ -158,6 +158,30 @@ pub async fn read<C: ConnectionTrait>(db: &C, id: &str) -> AppResult<Option<Snap
     .transpose()
 }
 
+/// Read the original execution for an authenticated principal and entry kind.
+/// This lookup neither admits work nor authorizes replay. The consumer must
+/// validate destination, captured controls, request semantics and complete raw
+/// input bytes before reusing the stored fingerprint/contract and receipt.
+/// Historical contract/options bytes are returned verbatim, including any old
+/// signed-header or expected-digest fields; they must not be rewritten/logged.
+pub async fn read_by_identity<C: ConnectionTrait>(
+    db: &C,
+    owner: &str,
+    source: &str,
+    token: &str,
+) -> AppResult<Option<Snapshot>> {
+    supported(db)?;
+    db.query_one(statement(
+        db,
+        "SELECT * FROM zip_v2_executions WHERE owner=? AND source=? AND token=?",
+        "SELECT * FROM zip_v2_executions WHERE owner=$1 AND source=$2 AND token=$3",
+        vec![owner.into(), source.into(), token.into()],
+    ))
+    .await?
+    .map(decode)
+    .transpose()
+}
+
 fn same_request(snapshot: &Snapshot, request: &Admission) -> bool {
     snapshot.owner == request.owner
         && snapshot.source == request.source
@@ -212,20 +236,9 @@ pub async fn admit_in_transaction(
              request.token.clone().into(),request.request_fingerprint.clone().into(),request.request_contract.clone().into(),
              request.bucket.clone().into(),request.source_key.clone().into(),request.captured_options.clone().into(),
              now.into(),now.into()])).await?;
-    let row = tx
-        .query_one(statement(
-            tx,
-            "SELECT * FROM zip_v2_executions WHERE owner=? AND source=? AND token=?",
-            "SELECT * FROM zip_v2_executions WHERE owner=$1 AND source=$2 AND token=$3",
-            vec![
-                request.owner.clone().into(),
-                request.source.clone().into(),
-                request.token.clone().into(),
-            ],
-        ))
+    let snapshot = read_by_identity(tx, &request.owner, &request.source, &request.token)
         .await?
         .ok_or_else(stale)?;
-    let snapshot = decode(row)?;
     if !same_request(&snapshot, request) {
         return Err(invalid());
     }
@@ -252,21 +265,23 @@ pub async fn bind_clean_input(
     if batch.state != "pending" {
         return Err(invalid());
     }
-    if let Some(old) = &batch.input_sha256 {
-        if old != sha256
-            || batch.input_art_cid.as_deref() != Some(art_cid)
-            || batch.input_art_size != Some(art_size)
-        {
-            return Err(invalid());
+    match (
+        &batch.input_sha256,
+        &batch.input_art_cid,
+        batch.input_art_size,
+    ) {
+        (Some(old), Some(cid), Some(size))
+            if old == sha256 && cid == art_cid && size == art_size => {}
+        (None, None, None) => {
+            let changed = tx.execute(statement(&tx,
+                "UPDATE zip_v2_executions SET input_sha256=?,input_art_cid=?,input_art_size=?,updated_at=? WHERE id=? AND epoch=? AND input_sha256 IS NULL AND input_art_cid IS NULL AND input_art_size IS NULL AND state='pending'",
+                "UPDATE zip_v2_executions SET input_sha256=$1,input_art_cid=$2,input_art_size=$3,updated_at=$4 WHERE id=$5 AND epoch=$6 AND input_sha256 IS NULL AND input_art_cid IS NULL AND input_art_size IS NULL AND state='pending'",
+                vec![sha256.into(),art_cid.into(),art_size.into(),database_now(&tx).await?.into(),claim.batch_id.clone().into(),claim.epoch.into()])).await?;
+            if changed.rows_affected() != 1 {
+                return Err(stale());
+            }
         }
-    } else {
-        let changed = tx.execute(statement(&tx,
-            "UPDATE zip_v2_executions SET input_sha256=?,input_art_cid=?,input_art_size=?,updated_at=? WHERE id=? AND epoch=? AND input_sha256 IS NULL AND state='pending'",
-            "UPDATE zip_v2_executions SET input_sha256=$1,input_art_cid=$2,input_art_size=$3,updated_at=$4 WHERE id=$5 AND epoch=$6 AND input_sha256 IS NULL AND state='pending'",
-            vec![sha256.into(),art_cid.into(),art_size.into(),database_now(&tx).await?.into(),claim.batch_id.clone().into(),claim.epoch.into()])).await?;
-        if changed.rows_affected() != 1 {
-            return Err(stale());
-        }
+        _ => return Err(invalid()),
     }
     tx.commit().await?;
     Ok(())

@@ -24,6 +24,7 @@ use crate::{
     pinning::{
         decision::{DecisionEffect, DecisionOrigin, ExtensionDecision},
         policy::PublicationContext,
+        zip_policy::{ZipCaptureContext, capture_zip_intent},
     },
     state::AppState,
     store::entities::import_job,
@@ -32,7 +33,7 @@ use crate::{
         ownership, results,
     },
     store::zip::{execution, import_intake},
-    zip::options::{ZipOptions, parse_zip_options_for_import},
+    zip::options::{ZipOptions, parse_authenticated_zip_controls},
 };
 
 pub struct ImportObjectRoute {
@@ -83,24 +84,24 @@ impl ImportObjectRoute {
         let client_token = parse_client_token(&req.headers)?;
         let object_content_type =
             optional_single_header(&req.headers, "x-ipfs3-object-content-type")?;
-        let tags = parse_tags(&req.headers)?;
-        let root_capture = parsed_query
-            .decompress_prefix
-            .as_ref()
-            .map(|_| {
-                crate::pinning::tags::resolve_zip_root_option(&tags, self.root_default)
-                    .map_err(|_| AppError::InvalidPinningRequest("invalid zip-root tag".to_owned()))
-            })
-            .transpose()?;
+        let tags = parse_tags(&req.headers, parsed_query.decompress_prefix.is_some())?;
+        let controls = parse_authenticated_zip_controls(
+            &req.headers,
+            &crate::s3::query::decoded_query_pairs(&req.uri)?,
+            &tags,
+            parsed_query.decompress_prefix.is_some(),
+            self.root_default,
+        )?;
+        let root_capture = controls.as_ref().map(|controls| controls.root);
         let metadata = parse_metadata(&req.headers);
-        let root_override = match root_capture {
-            Some(crate::pinning::tags::ZipRootCapture::Tagged(value)) => Some(value),
-            _ => None,
-        };
-        let (zip_options, expected_sha256) =
-            parse_zip_options_for_import(&req.headers, true, root_override, self.root_default)?;
+        let zip_options = controls
+            .as_ref()
+            .map_or(ZipOptions::Legacy, |controls| controls.options.clone());
+        // New requests have no client digest protocol. Historical jobs retain
+        // their expected digest in the persisted intake and source decoder.
+        let mut expected_sha256 = None;
         if let ZipOptions::V2(options) = &zip_options {
-            validate_v2_import_headers(&req.headers, options, client_token.as_deref())?;
+            validate_v2_import_headers(options, client_token.as_deref())?;
             if parsed_query.decompress_prefix.is_none() {
                 return Err(s3s::s3_error!(
                     InvalidRequest,
@@ -116,18 +117,86 @@ impl ImportObjectRoute {
             ParsedImportSource::Url(url) => ImportSource::Url(url),
         };
         let principal = crate::s3::ops::object::principal_id(&req)?;
-        if let ZipOptions::V2(options) = zip_options {
-            if matches!(source, ImportSource::Url(_)) && expected_sha256.is_none() {
-                return Err(s3s::s3_error!(
-                    InvalidRequest,
-                    "ZIP v2 URL import requires signed expected SHA-256"
-                ));
-            }
+        if let ZipOptions::V2(mut options) = zip_options {
             let prefix = parsed_query
                 .decompress_prefix
                 .as_deref()
                 .expect("v2 prefix validated");
-            let (contract, source_descriptor) = v2_import_contract(&V2ImportContract {
+            let saved = execution::read_by_identity(
+                self.state.store.db(),
+                &principal,
+                "import",
+                &options.token,
+            )
+            .await?;
+            let id = saved
+                .as_ref()
+                .map_or_else(|| uuid::Uuid::new_v4().to_string(), |row| row.id.clone());
+            let zip_intent = if let Some(saved) = &saved {
+                let historical = crate::zip::options::decode_historical_zip_options(
+                    &saved.captured_options,
+                    None,
+                )
+                .map_err(|_| AppError::ImportIdempotencyConflict)?;
+                let parsed = controls.as_ref().expect("v2 controls validated");
+                let old = historical.options;
+                if options.publish_source != old.publish_source
+                    || options.publish_extracted != old.publish_extracted
+                    || options.token != old.token
+                    || options.root_override != old.root_override
+                    || (parsed.targets_explicit && options.targets != old.targets)
+                {
+                    return Err(AppError::ImportIdempotencyConflict.into());
+                }
+                let value: serde_json::Value = serde_json::from_str(&saved.captured_options)
+                    .map_err(|_| AppError::ImportIdempotencyConflict)?;
+                if let Some(intent) = value.get("zip_intent") {
+                    let intent = crate::pinning::zip_policy::CapturedZipIntent::decode_json(
+                        &intent.to_string(),
+                    )
+                    .map_err(|_| AppError::ImportIdempotencyConflict)?;
+                    if intent.origin().principal_id != principal
+                        || intent.origin().request_id != id
+                        || intent.bucket() != parsed_query.bucket
+                        || intent.source_key() != parsed_query.key
+                        || intent.target_prefix() != prefix
+                        || intent.v2_options().as_ref() != Some(&old)
+                        || intent.controls().targets_explicit != parsed.targets_explicit
+                    {
+                        return Err(AppError::ImportIdempotencyConflict.into());
+                    }
+                }
+                let original: serde_json::Value = serde_json::from_str(&saved.request_contract)
+                    .map_err(|_| AppError::ImportIdempotencyConflict)?;
+                let array = original
+                    .as_array()
+                    .filter(|array| array.len() == 16 && array[0] == "import-zip-v2")
+                    .ok_or(AppError::ImportIdempotencyConflict)?;
+                expected_sha256 = serde_json::from_value(array[6].clone())
+                    .map_err(|_| AppError::ImportIdempotencyConflict)?;
+                options = old;
+                None
+            } else {
+                let intent = capture_zip_intent(
+                    self.state.pinning.effective_config(),
+                    self.state.pinning.decompress_zip_config(),
+                    self.state.pinning.control_mode(),
+                    ZipCaptureContext {
+                        bucket: &parsed_query.bucket,
+                        source_key: &parsed_query.key,
+                        target_prefix: prefix,
+                        tags: &tags,
+                    },
+                    controls.as_ref().expect("v2 controls validated"),
+                    DecisionOrigin::new(&principal, &id),
+                )
+                .map_err(|_| {
+                    AppError::InvalidPinningRequest("invalid ZIP intent capture".into())
+                })?;
+                options = intent.v2_options().ok_or(AppError::InvalidImportRequest)?;
+                Some(intent)
+            };
+            let (mut contract, source_descriptor) = v2_import_contract(&V2ImportContract {
                 source: &source,
                 principal: &principal,
                 bucket: &parsed_query.bucket,
@@ -139,18 +208,43 @@ impl ImportObjectRoute {
                 metadata: &metadata,
                 tags: &tags,
             })?;
-            let captured_options = serde_json::json!({
-                "options": &options,
-                "target_prefix": prefix,
-                "rule_revision": self.state.pinning.zip_output_rules().revision(),
-                "source_content_type": object_content_type,
-                "source_metadata": metadata,
-                "source_tags": tags,
-            })
-            .to_string();
+            if let Some(saved) = &saved {
+                if saved.owner != principal
+                    || saved.source != "import"
+                    || saved.token != options.token
+                    || saved.bucket != parsed_query.bucket
+                    || saved.source_key != parsed_query.key
+                    || saved.request_fingerprint
+                        != hex::encode(sha2::Sha256::digest(saved.request_contract.as_bytes()))
+                    || serde_json::from_str::<serde_json::Value>(&contract).ok()
+                        != serde_json::from_str::<serde_json::Value>(&saved.request_contract).ok()
+                {
+                    return Err(AppError::ImportIdempotencyConflict.into());
+                }
+                contract = saved.request_contract.clone();
+            }
+            let captured_options = saved.as_ref().map_or_else(
+                || {
+                    serde_json::json!({
+                        "options": &options,
+                        "target_prefix": prefix,
+                        "rule_revision": zip_intent.as_ref().map(|intent| intent.policy_revision()),
+                        "zip_intent": zip_intent,
+                        "source_content_type": object_content_type,
+                        "source_metadata": metadata,
+                        "source_tags": tags,
+                        "accepted_response": {
+                            "version": 1,
+                            "xml": accepted_xml(&id, "pending", "accepted"),
+                        },
+                    })
+                    .to_string()
+                },
+                |saved| saved.captured_options.clone(),
+            );
             let intake = import_intake::Request {
                 admission: execution::Admission {
-                    id: uuid::Uuid::new_v4().to_string(),
+                    id,
                     owner: principal,
                     source: "import".to_owned(),
                     token: options.token.clone(),
@@ -284,26 +378,56 @@ impl ImportObjectRoute {
         }
 
         let job_id = uuid::Uuid::new_v4().to_string();
-        let (_, mut decision) = self
-            .state
-            .pinning
-            .policy()
-            .evaluate_publication_decision(
-                PublicationContext {
-                    bucket: &parsed_query.bucket,
-                    key: &parsed_query.key,
-                    tags: &tags,
-                    is_decompress_zip: parsed_query.decompress_prefix.is_some(),
-                },
-                DecisionOrigin::new(principal, &job_id),
+        let zip_intent = if let (Some(prefix), Some(controls)) =
+            (parsed_query.decompress_prefix.as_deref(), controls.as_ref())
+        {
+            Some(
+                capture_zip_intent(
+                    self.state.pinning.effective_config(),
+                    self.state.pinning.decompress_zip_config(),
+                    self.state.pinning.control_mode(),
+                    ZipCaptureContext {
+                        bucket: &parsed_query.bucket,
+                        source_key: &parsed_query.key,
+                        target_prefix: prefix,
+                        tags: &tags,
+                    },
+                    controls,
+                    DecisionOrigin::new(&principal, &job_id),
+                )
+                .map_err(|_| {
+                    AppError::InvalidPinningRequest("invalid ZIP intent capture".into())
+                })?,
             )
-            .map_err(AppError::from)?;
-        decision
-            .capture_durable_revision(
-                self.state.pinning.effective_config(),
-                self.state.pinning.control_mode(),
-            )
-            .map_err(|error| AppError::InvalidPinningRequest(error.to_owned()))?;
+        } else {
+            None
+        };
+        let mut decision = if let Some(intent) = &zip_intent {
+            intent.source_decision().clone()
+        } else {
+            self.state
+                .pinning
+                .policy()
+                .evaluate_publication_decision(
+                    PublicationContext {
+                        bucket: &parsed_query.bucket,
+                        key: &parsed_query.key,
+                        tags: &tags,
+                        is_decompress_zip: parsed_query.decompress_prefix.is_some(),
+                    },
+                    DecisionOrigin::new(&principal, &job_id),
+                )
+                .map_err(AppError::from)?
+                .1
+        };
+        if zip_intent.is_none() {
+            decision
+                .capture_durable_revision(
+                    self.state.pinning.effective_config(),
+                    self.state.pinning.control_mode(),
+                )
+                .map_err(|error| AppError::InvalidPinningRequest(error.to_owned()))?;
+        }
         if let ImportSource::Url(url) = &source {
             self.coordinator
                 .authorize_url_for_submission(url)
@@ -322,11 +446,10 @@ impl ImportObjectRoute {
             tags,
             decompress_prefix: parsed_query.decompress_prefix,
         };
-        let submitted = if let Some(capture) = root_capture {
-            ownership::submit_decided_zip(
+        let submitted = if let Some(capture) = zip_intent {
+            ownership::submit_captured_zip(
                 self.state.store.db(),
                 request,
-                decision,
                 capture,
                 chrono::Utc::now(),
             )
@@ -452,8 +575,10 @@ impl ImportObjectRoute {
 }
 
 fn accepted_v2_response(uri: &Uri, status: &import_intake::Status) -> S3Result<S3Response<Body>> {
-    let xml = crate::import::response::accepted_xml(&status.id, status.state, "accepted");
-    let mut response = S3Response::with_status(Body::from(xml), StatusCode::ACCEPTED);
+    let mut response = S3Response::with_status(
+        Body::from(status.accepted_xml.clone()),
+        StatusCode::ACCEPTED,
+    );
     response.headers.insert(
         http::header::CONTENT_TYPE,
         http::HeaderValue::from_static("application/xml"),

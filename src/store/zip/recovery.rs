@@ -11,8 +11,11 @@ use super::{BatchSnapshot, RootClaim, RootOutcome, lock_batch, root, stale};
 use crate::{
     error::{AppError, AppResult},
     store::{database_clock::database_now, entities::zip_root_build},
-    zip::options::{ZipTargets, ZipV2Options},
 };
+
+mod permission;
+#[cfg(test)]
+mod tests;
 
 pub const PAGE_SIZE: usize = 16;
 pub const MAX_REVISIONS: i64 = 5;
@@ -67,73 +70,8 @@ pub fn files(
     let batch = &snapshot.batch;
     let options: serde_json::Value =
         serde_json::from_str(&batch.captured_options).map_err(|_| stale())?;
-    let prefix = options
-        .get("target_prefix")
-        .and_then(serde_json::Value::as_str);
-    let legacy_enabled = options
-        .get("root_enabled")
-        .and_then(serde_json::Value::as_bool)
-        == Some(true)
-        || options
-            .get("root_capture")
-            .and_then(|capture| {
-                serde_json::from_value::<crate::pinning::tags::ZipRootCapture>(capture.clone()).ok()
-            })
-            .is_some_and(crate::pinning::tags::ZipRootCapture::enabled);
-    // v2's separately authenticated execution capture has no legacy prefix.
-    // Trust the immutable path-to-version binding, never infer it from a key.
-    let v2_enabled = options.get("options").is_some_and(|v2| {
-        v2.get("root_enabled").and_then(serde_json::Value::as_bool) == Some(true)
-            && v2
-                .get("publish_extracted")
-                .and_then(serde_json::Value::as_bool)
-                == Some(true)
-    });
-    // MPU v2 persists ZipV2Options itself, unlike the nested direct capture.
-    // Any flat v2 field selects this contract: malformed captures must never
-    // fall back to legacy root_enabled/target_prefix authorization.
-    let flat_v2 = [
-        "publish_source",
-        "publish_extracted",
-        "targets",
-        "token",
-        "root_override",
-        "result_version",
-    ]
-    .iter()
-    .any(|field| options.get(field).is_some());
-    let enabled = if flat_v2 {
-        let captured: ZipV2Options =
-            serde_json::from_value(options.clone()).map_err(|_| stale())?;
-        if batch.source != "mpu"
-            || captured.result_version != 2
-            || captured.token != batch.token
-            || captured.token.is_empty()
-            || captured.token.len() > 128
-            || !captured
-                .token
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"._~-".contains(&byte))
-            || captured.publish_source != batch.source_published
-            || captured
-                .root_override
-                .is_some_and(|value| value != captured.root_enabled)
-            || (matches!(captured.targets, ZipTargets::Source | ZipTargets::Both)
-                && !captured.publish_source)
-            || (matches!(captured.targets, ZipTargets::Extracted | ZipTargets::Both)
-                && !captured.publish_extracted)
-            // Require the complete, unambiguous flat snapshot, including the
-            // nullable root_override; reject legacy/nested fields mixed in.
-            || serde_json::to_value(&captured).map_err(|_| stale())? != options
-        {
-            return Err(stale());
-        }
-        captured.build_root()
-    } else {
-        (prefix.is_some() && legacy_enabled) || v2_enabled
-    };
-    if !enabled
-        || batch.id != claim.batch_id
+    let prefix = permission::root_prefix(batch, &options)?;
+    if batch.id != claim.batch_id
         || batch.state != "published"
         || batch.root_status != "failed"
         || !batch.manifest_prepared
@@ -150,6 +88,7 @@ pub fn files(
             if entry.version_row_id.is_none()
                 || entry.object_key.as_deref().is_none_or(|key| {
                     prefix
+                        .as_deref()
                         .is_some_and(|prefix| key.strip_prefix(prefix) != Some(entry.path.as_str()))
                 })
                 || entry.size.is_none()

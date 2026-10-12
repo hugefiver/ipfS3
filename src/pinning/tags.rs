@@ -165,6 +165,41 @@ impl PinControl {
 }
 
 pub fn parse_tagging_header(header: &str) -> Result<Vec<ObjectTag>> {
+    let tags = decode_tagging_header(header).map_err(|error| error.error)?;
+    validate_tag_set(&tags)?;
+    Ok(tags)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum TagErrorKind {
+    Generic,
+    ReservedControl,
+    ZipControl,
+}
+
+impl TagErrorKind {
+    fn for_key(key: &str) -> Self {
+        if key.starts_with("ipfs-s3:zip-") {
+            Self::ZipControl
+        } else if key.starts_with("ipfs-s3:") {
+            Self::ReservedControl
+        } else {
+            Self::Generic
+        }
+    }
+
+    fn error(self, error: anyhow::Error) -> TagError {
+        TagError { kind: self, error }
+    }
+}
+
+pub(crate) struct TagError {
+    pub kind: TagErrorKind,
+    pub error: anyhow::Error,
+}
+
+/// Decode once without discarding multiplicity or validating reserved controls.
+pub(crate) fn decode_tagging_header(header: &str) -> std::result::Result<Vec<ObjectTag>, TagError> {
     if header.is_empty() {
         return Ok(Vec::new());
     }
@@ -172,41 +207,54 @@ pub fn parse_tagging_header(header: &str) -> Result<Vec<ObjectTag>> {
     let mut tags = Vec::new();
     for pair in header.split('&') {
         let Some((raw_key, raw_value)) = pair.split_once('=') else {
-            bail!("invalid tagging header pair");
+            let kind = decode_form_component(pair)
+                .map(|key| TagErrorKind::for_key(&key))
+                .unwrap_or(TagErrorKind::Generic);
+            return Err(kind.error(anyhow::anyhow!("invalid tagging header pair")));
         };
-        tags.push(ObjectTag::new(
-            decode_form_component(raw_key)?,
-            decode_form_component(raw_value)?,
-        ));
+        let key = decode_form_component(raw_key).map_err(|e| TagErrorKind::Generic.error(e))?;
+        let kind = TagErrorKind::for_key(&key);
+        let value = decode_form_component(raw_value).map_err(|e| kind.error(e))?;
+        tags.push(ObjectTag::new(key, value));
     }
-    validate_tag_set(&tags)?;
     Ok(tags)
 }
 
 pub fn validate_tag_set(tags: &[ObjectTag]) -> Result<()> {
+    validate_tag_set_classified(tags).map_err(|error| error.error)
+}
+
+pub(crate) fn validate_tag_set_classified(tags: &[ObjectTag]) -> std::result::Result<(), TagError> {
     if tags.len() > 10 {
-        bail!("tag set exceeds the maximum of 10 tags");
+        return Err(
+            TagErrorKind::Generic.error(anyhow::anyhow!("tag set exceeds the maximum of 10 tags"))
+        );
     }
 
     let mut keys = BTreeSet::new();
     for tag in tags {
+        let kind = TagErrorKind::for_key(&tag.key);
         if tag.key.is_empty() {
-            bail!("tag key must not be empty");
+            return Err(TagErrorKind::Generic.error(anyhow::anyhow!("tag key must not be empty")));
         }
         if tag.key.chars().count() > 128 {
-            bail!("tag key exceeds the maximum of 128 characters");
+            return Err(kind.error(anyhow::anyhow!(
+                "tag key exceeds the maximum of 128 characters"
+            )));
         }
         if tag.value.chars().count() > 256 {
-            bail!("tag value exceeds the maximum of 256 characters");
+            return Err(kind.error(anyhow::anyhow!(
+                "tag value exceeds the maximum of 256 characters"
+            )));
         }
         if !keys.insert(tag.key.as_str()) {
-            bail!("duplicate tag key");
+            return Err(kind.error(anyhow::anyhow!("duplicate tag key")));
         }
         if tag.key.starts_with("ipfs-s3:") && !RESERVED_KEYS.contains(&tag.key.as_str()) {
-            bail!("unknown ipfs-s3 reserved tag key");
+            return Err(kind.error(anyhow::anyhow!("unknown ipfs-s3 reserved tag key")));
         }
         if tag.key == "ipfs-s3:zip-root" {
-            parse_zip_root_value(&tag.value)?;
+            parse_zip_root_value(&tag.value).map_err(|e| kind.error(e))?;
         }
     }
     Ok(())

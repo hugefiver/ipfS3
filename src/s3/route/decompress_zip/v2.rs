@@ -15,16 +15,14 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     error::AppError,
-    pinning::{
-        policy::PublicationPolicy,
-        zip_policy::{ZipPublishedOutput, ZipTargets as PolicyTargets},
-    },
     state::AppState,
     store::{
-        pinning::publication::{self, ZipV2Publication, ZipV2PublicationResult, ZipV2Success},
+        pinning::publication::{
+            self, CapturedZipPublication, ZipExecutionSettlement, ZipPublicationAuthority,
+        },
         zip::{self, execution},
     },
-    zip::options::{ZipTargets, ZipV2Options},
+    zip::options::ZipV2Options,
 };
 
 use super::{
@@ -209,6 +207,71 @@ fn store_error(error: AppError) -> s3s::S3Error {
     }
 }
 
+/// Only newly applicable explicit safety vetoes block new I/O. An original Deny
+/// already means local-only/skipped for that scope, not a revoked authorization.
+pub(super) fn current_io_denied(
+    state: &AppState,
+    capture: &crate::pinning::zip_policy::CapturedZipIntent,
+    manifest: Option<&crate::zip::batch::FinalZipManifest>,
+) -> bool {
+    use crate::pinning::{
+        tags::ContentMode,
+        zip_policy::{ZipOutputKind, ZipRuleEffect},
+    };
+    let manual = &capture.source_decision().effective_intents;
+    let source = capture.automatic_output_eligible(ZipOutputKind::Source, capture.source_key())
+        || manual
+            .iter()
+            .any(|intent| intent.content_mode == ContentMode::Object);
+    let manual_extracted = manual
+        .iter()
+        .any(|intent| intent.content_mode == ContentMode::Decompressed);
+    state
+        .pinning
+        .decompress_zip_config()
+        .output_rules()
+        .is_some_and(|rules| {
+            rules.iter().any(|rule| {
+                if rule.effect != ZipRuleEffect::Deny
+                    || (rule.bucket != "*" && rule.bucket != capture.bucket())
+                {
+                    return false;
+                }
+                if source
+                    && capture.source_key().starts_with(&rule.prefix)
+                    && !capture.originally_denied_scope(capture.source_key())
+                {
+                    return true;
+                }
+                if let Some(manifest) = manifest {
+                    return manifest.successful.iter().any(|file| {
+                        file.object_key.starts_with(&rule.prefix)
+                            && !capture.originally_denied_scope(&file.object_key)
+                            && (manual_extracted
+                                || capture.automatic_output_eligible(
+                                    ZipOutputKind::Extracted,
+                                    &file.object_key,
+                                ))
+                    });
+                }
+                // Pending has no admitted successes yet. Only the overlapping
+                // scope with frozen remote eligibility can conservatively veto.
+                if !(capture.target_prefix().starts_with(&rule.prefix)
+                    || rule.prefix.starts_with(capture.target_prefix()))
+                {
+                    return false;
+                }
+                let scope = if rule.prefix.len() > capture.target_prefix().len() {
+                    &rule.prefix
+                } else {
+                    capture.target_prefix()
+                };
+                !capture.originally_denied_scope(scope)
+                    && (manual_extracted || capture.automatic_extracted_scope_eligible(scope))
+            })
+        })
+}
+
 async fn admitted_manifest(
     state: &AppState,
     snapshot: &execution::Snapshot,
@@ -297,7 +360,66 @@ fn failure(message: &'static str) -> s3s::S3Error {
     s3s::s3_error!(InvalidRequest, "{message}")
 }
 
-// Hash the immutable *signed semantics*, not the Authorization signature/date or
+fn recovery_attention() -> s3s::S3Error {
+    s3s::s3_error!(
+        OperationAborted,
+        "ZIP recovery needs_attention: original input evidence unavailable or inconsistent"
+    )
+}
+
+async fn recover_pending_manifest(
+    state: &Arc<AppState>,
+    archive: &crate::s3::ops::object::StoredObject,
+    sha: &str,
+    parsed: &ParsedDecompressPut,
+    publish_extracted: bool,
+    max_decompressed_bytes: u64,
+    cancel: &CancellationToken,
+) -> S3Result<crate::zip::batch::FinalZipManifest> {
+    use crate::import::v2_source::bound::{BoundCatError, open_bound_zip};
+    let proof_error = |error| match error {
+        BoundCatError::Canceled => conflict(),
+        _ => recovery_attention(),
+    };
+    let (stream, tail) = open_bound_zip(state, &archive.cid, sha, archive.size, cancel.clone())
+        .await
+        .map_err(proof_error)?;
+    let outcome = if publish_extracted {
+        let outcome = tokio::select! {
+            result = crate::zip::extract::extract_zip_stream_with_limits(
+                state, &parsed.target_prefix, stream,
+                zip_limits_for_call(state, max_decompressed_bytes),
+            ) => result,
+            _ = cancel.cancelled() => return Err(conflict()),
+        };
+        if let Some(error) = tail.failure().await {
+            return Err(proof_error(error));
+        }
+        Some(outcome)
+    } else {
+        None
+    };
+    // Extraction stops at local headers; finish the same measured CAT stream
+    // through clean EOF before any manifest or publication is admitted.
+    tail.finish().await.map_err(proof_error)?;
+    if let Some(outcome) = outcome {
+        let outcome = outcome?;
+        reject_archive_key_collision(&parsed.key, &outcome.entries)?;
+        Ok(crate::zip::batch::final_zip_manifest(
+            &outcome.entries,
+            &outcome.failures,
+            &parsed.target_prefix,
+        ))
+    } else {
+        Ok(crate::zip::batch::final_zip_manifest(
+            &[],
+            &[],
+            &parsed.target_prefix,
+        ))
+    }
+}
+
+// Hash the immutable authenticated business semantics, not the signature/date or
 // claimed HTTP payload hash. A different body has to be independently read and
 // compared to input_sha256 even when its extracted output is identical.
 fn request_contract(
@@ -306,58 +428,24 @@ fn request_contract(
     options: &ZipV2Options,
     principal: &str,
 ) -> S3Result<String> {
-    let authorization = req
+    let mut tags = super::parse_publication_tags(&req.headers)?;
+    tags.sort_by(|left, right| left.key.cmp(&right.key));
+    let content_type = req
         .headers
-        .get(http::header::AUTHORIZATION)
-        .and_then(|header| header.to_str().ok())
-        .ok_or_else(|| failure("ZIP v2 requires SigV4"))?;
-    let signed = authorization
-        .split(", ")
-        .find_map(|field| field.strip_prefix("SignedHeaders="))
-        .ok_or_else(|| failure("ZIP v2 requires signed headers"))?;
-    let mut headers = BTreeMap::new();
-    for name in signed.split(';') {
-        if matches!(
-            name,
-            "authorization" | "x-amz-date" | "x-amz-content-sha256" | "content-length" | "host"
-        ) {
-            continue;
-        }
-        let values = req
-            .headers
-            .get_all(name)
-            .iter()
-            .map(|value| {
-                value
-                    .to_str()
-                    .map(str::to_owned)
-                    .map_err(|_| failure("invalid signed ZIP header"))
-            })
-            .collect::<S3Result<Vec<_>>>()?;
-        headers.insert(name.to_owned(), values);
-    }
-    // An unsigned metadata header cannot modify a v2 source publication later.
-    if req.headers.keys().any(|name| {
-        name.as_str().starts_with("x-amz-meta-")
-            && !signed
-                .split(';')
-                .any(|signed_name| signed_name == name.as_str())
-    }) {
-        return Err(failure("ZIP v2 metadata must be signed"));
-    }
-    if options.publish_source
-        && req.headers.contains_key(http::header::CONTENT_TYPE)
-        && !signed.split(';').any(|name| name == "content-type")
-    {
-        return Err(failure("ZIP v2 source Content-Type must be signed"));
-    }
+        .get(http::header::CONTENT_TYPE)
+        .map(|value| value.to_str().map(str::to_owned))
+        .transpose()
+        .map_err(|_| failure("invalid ZIP Content-Type"))?;
+    let metadata = crate::s3::ops::object::extract_custom_metadata(&req.headers);
     let controls = serde_json::json!({
+        "contract_version": 1, "source": "direct",
         "principal": principal, "bucket": parsed.bucket, "source_key": parsed.key,
         "target_prefix": parsed.target_prefix,
         "publish_source": options.publish_source,
         "publish_extracted": options.publish_extracted, "targets": options.targets,
         "token": options.token, "root_override": options.root_override,
-        "result_version": options.result_version, "signed_headers": headers,
+        "result_version": options.result_version,
+        "tags": tags, "content_type": content_type, "metadata": metadata,
     });
     serde_json::to_string(&controls)
         .map_err(|_| s3s::s3_error!(InternalError, "ZIP v2 contract encoding failed"))
@@ -425,15 +513,34 @@ impl InputDigest {
                 "ZIP v2 input did not reach EOF"
             ));
         }
+        // Signed streaming bodies are decoded by s3s before reaching this seam.
+        // Their decoded length, rather than the encoded transport length, binds
+        // the raw ZIP bytes measured here.
+        if let Some(length) = headers
+            .get("x-amz-decoded-content-length")
+            .or_else(|| headers.get(http::header::CONTENT_LENGTH))
+        {
+            let expected = length
+                .to_str()
+                .ok()
+                .and_then(|value| value.parse::<i64>().ok())
+                .filter(|value| *value >= 0)
+                .ok_or_else(|| failure("invalid ZIP v2 input length"))?;
+            if expected != self.size {
+                return Err(s3s::s3_error!(
+                    IncompleteBody,
+                    "ZIP v2 input byte count differs"
+                ));
+            }
+        }
         let actual = hex::encode(self.hash.clone().finalize());
-        // Header-SigV4 payload digest is also an independent transport check.
-        let signed_hash = headers
+        // s3s owns authentication, including streaming/presigned transports.
+        // A concrete transport hash, when supplied, is still independently checked.
+        if let Some(signed_hash) = headers
             .get("x-amz-content-sha256")
             .and_then(|value| value.to_str().ok())
-            .ok_or_else(|| failure("ZIP v2 requires a signed payload SHA256"))?;
-        if signed_hash.len() != 64
-            || !signed_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
-            || !signed_hash.eq_ignore_ascii_case(&actual)
+            .filter(|value| value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()))
+            && !signed_hash.eq_ignore_ascii_case(&actual)
         {
             return Err(s3s::s3_error!(
                 InvalidRequest,
@@ -684,7 +791,7 @@ pub(super) async fn put(
     state: &Arc<AppState>,
     req: S3Request<Body>,
     parsed: ParsedDecompressPut,
-    options: ZipV2Options,
+    controls: crate::zip::options::ParsedZipControls,
     max_decompressed_bytes: u64,
 ) -> S3Result<S3Response<Body>> {
     crate::s3::http::reject_write_conditions(&req.headers, false)?;
@@ -695,8 +802,113 @@ pub(super) async fn put(
     if !crate::store::bucket::exists(state.store.db(), &parsed.bucket).await? {
         return Err(s3s::s3_error!(NoSuchBucket, "bucket not found"));
     }
+    let tags = super::parse_publication_tags(&req.headers)?;
+    let crate::zip::options::ZipOptions::V2(incoming_options) = &controls.options else {
+        return Err(failure("ZIP v2 requires negotiated controls"));
+    };
+    let principal = crate::s3::ops::object::principal_id(&req)?;
+    let found = execution::read_by_identity(
+        state.store.db(),
+        &principal,
+        "direct",
+        &incoming_options.token,
+    )
+    .await
+    .map_err(store_error)?;
+    let (request, expected_sha256, execution) = if let Some(saved) = found {
+        if saved.owner != principal
+            || saved.source != "direct"
+            || saved.token != incoming_options.token
+            || saved.bucket != parsed.bucket
+            || saved.source_key != parsed.key
+            || saved.request_fingerprint
+                != hex::encode(Sha256::digest(saved.request_contract.as_bytes()))
+        {
+            return Err(conflict());
+        }
+        let historical =
+            crate::zip::options::decode_historical_zip_options(&saved.captured_options, None)
+                .map_err(|_| conflict())?;
+        let options = super::replay_controls::direct_options(&controls, &historical.options)
+            .map_err(|_| conflict())?;
+        let canonical =
+            serde_json::from_str(&request_contract(&req, &parsed, &options, &principal)?)
+                .map_err(|_| conflict())?;
+        let contract_expected = super::replay_controls::verify_direct_contract(
+            &req.headers,
+            &canonical,
+            &saved.request_contract,
+        )
+        .map_err(|_| conflict())?;
+        let historical = crate::zip::options::decode_historical_zip_options(
+            &saved.captured_options,
+            contract_expected.as_deref(),
+        )
+        .map_err(|_| conflict())?;
+        (
+            execution::Admission {
+                id: saved.id.clone(),
+                owner: saved.owner.clone(),
+                source: saved.source.clone(),
+                token: saved.token.clone(),
+                request_fingerprint: saved.request_fingerprint.clone(),
+                request_contract: saved.request_contract.clone(),
+                bucket: saved.bucket.clone(),
+                source_key: saved.source_key.clone(),
+                captured_options: saved.captured_options.clone(),
+            },
+            historical.expected_sha256,
+            saved,
+        )
+    } else {
+        let id = uuid::Uuid::new_v4().to_string();
+        let capture = crate::pinning::zip_policy::capture_zip_intent(
+            state.pinning.effective_config(),
+            state.pinning.decompress_zip_config(),
+            state.pinning.control_mode(),
+            crate::pinning::zip_policy::ZipCaptureContext {
+                bucket: &parsed.bucket,
+                source_key: &parsed.key,
+                target_prefix: &parsed.target_prefix,
+                tags: &tags,
+            },
+            &controls,
+            crate::pinning::decision::DecisionOrigin::new(&principal, &id),
+        )
+        .map_err(|_| super::invalid_pinning_argument("invalid ZIP intent capture"))?;
+        let options = capture.v2_options().ok_or_else(conflict)?;
+        let contract = request_contract(&req, &parsed, &options, &principal)?;
+        let captured =
+            serde_json::json!({"options": options, "target_prefix": parsed.target_prefix,
+            "rule_revision": capture.policy_revision(), "zip_intent": capture})
+            .to_string();
+        let request = execution::Admission {
+            id,
+            owner: principal.clone(),
+            source: "direct".into(),
+            token: options.token,
+            request_fingerprint: hex::encode(Sha256::digest(contract.as_bytes())),
+            request_contract: contract,
+            bucket: parsed.bucket.clone(),
+            source_key: parsed.key.clone(),
+            captured_options: captured,
+        };
+        let execution = execution::admit(state.store.db(), &request)
+            .await
+            .map_err(store_error)?;
+        (request, None, execution)
+    };
+    let snapshot: serde_json::Value =
+        serde_json::from_str(&execution.captured_options).map_err(|_| conflict())?;
+    let historical = crate::zip::options::decode_historical_zip_options(
+        &execution.captured_options,
+        expected_sha256.as_deref(),
+    )
+    .map_err(|_| conflict())?;
+    let options = historical.options;
+    let expected_sha256 = historical.expected_sha256;
     let source_tags = if options.publish_source {
-        super::parse_publication_tags(&req.headers)?
+        tags
     } else {
         Vec::new()
     };
@@ -710,43 +922,8 @@ pub(super) async fn put(
     } else {
         None
     };
-    let principal = crate::s3::ops::object::principal_id(&req)?;
-    let contract = request_contract(&req, &parsed, &options, &principal)?;
-    let fingerprint = hex::encode(Sha256::digest(contract.as_bytes()));
-    let rules = state.pinning.zip_output_rules();
-    let rule_revision = rules.revision().to_owned();
-    let captured = serde_json::json!({"options": options, "target_prefix": parsed.target_prefix, "rule_revision": rule_revision}).to_string();
-    let request = execution::Admission {
-        id: uuid::Uuid::new_v4().to_string(),
-        owner: principal.clone(),
-        source: "direct".into(),
-        token: options.token.clone(),
-        request_fingerprint: fingerprint.clone(),
-        request_contract: contract,
-        bucket: parsed.bucket.clone(),
-        source_key: parsed.key.clone(),
-        captured_options: captured.clone(),
-    };
-    let execution = execution::admit(state.store.db(), &request)
-        .await
-        .map_err(store_error)?;
     let id = execution.id.clone();
-    let snapshot: serde_json::Value =
-        serde_json::from_str(&execution.captured_options).map_err(|_| conflict())?;
-    let saved_options: ZipV2Options =
-        serde_json::from_value(snapshot.get("options").cloned().ok_or_else(conflict)?)
-            .map_err(|_| conflict())?;
-    let captured_rule_revision = snapshot
-        .get("rule_revision")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(conflict)?
-        .to_owned();
-    if saved_options.token != options.token
-        || saved_options.root_override != options.root_override
-        || saved_options.targets != options.targets
-        || saved_options.publish_source != options.publish_source
-        || saved_options.publish_extracted != options.publish_extracted
-        || saved_options.result_version != options.result_version
+    if super::replay_controls::direct_options(&controls, &options).is_err()
         || snapshot
             .get("target_prefix")
             .and_then(serde_json::Value::as_str)
@@ -755,6 +932,36 @@ pub(super) async fn put(
         return Err(conflict());
     }
     let mut input = InputDigest::new(state.pinning.zip_extraction_limits().max_archive_bytes());
+    let finish_input = |input: &InputDigest| {
+        let (sha, size) = input.finish(&req.headers)?;
+        if expected_sha256
+            .as_ref()
+            .is_some_and(|expected| expected != &sha)
+        {
+            return Err(conflict());
+        }
+        Ok((sha, size))
+    };
+    // Use the returned durable capture, including an admission race winner.
+    let intent = match super::replay_controls::saved_intent(&snapshot) {
+        Ok(intent) => intent,
+        Err(error) => {
+            hash_body(req.input, &mut input).await?;
+            finish_input(&input)?;
+            return Err(error);
+        }
+    };
+    if let Some(capture) = &intent
+        && (capture.bucket() != parsed.bucket
+            || capture.source_key() != parsed.key
+            || capture.target_prefix() != parsed.target_prefix
+            || capture.origin().principal_id != principal
+            || (capture.origin().request_id != id
+                && capture.origin().request_id != format!("zip-v2-source:{id}"))
+            || capture.v2_options().as_ref() != Some(&options))
+    {
+        return Err(conflict());
+    }
     // Terminal and concurrently owned attempts must still read their *entire*
     // incoming body before a replay/conflict decision. No Kubo add for replay.
     if execution.state == "completed"
@@ -764,18 +971,56 @@ pub(super) async fn put(
             .is_some_and(|until| until > chrono::Utc::now())
     {
         hash_body(req.input, &mut input).await?;
-        let (sha, _) = input.finish(&req.headers)?;
+        let (sha, size) = finish_input(&input)?;
         let verified = execution::read_for_replay(state.store.db(), &request, &sha)
             .await
             .map_err(store_error)?;
-        if let Some(verified) = verified.filter(|snapshot| snapshot.state == "completed") {
+        if let Some(verified) = verified.filter(|snapshot| {
+            snapshot.state == "completed" && snapshot.input_art_size == Some(size)
+        }) {
             return committed_response(state, &id, &verified).await;
         }
         return Err(conflict());
     }
-    // Never perform Kubo IO against a changed remote authorization snapshot.
-    // Local-only requests have no remote intent, but still retain this revision.
-    if options.targets != ZipTargets::None && captured_rule_revision != rules.revision() {
+    let Some(intent) = intent else {
+        hash_body(req.input, &mut input).await?;
+        finish_input(&input)?;
+        return Err(s3s::s3_error!(
+            OperationAborted,
+            "ZIP capture needs_attention: missing original publication intent"
+        ));
+    };
+    let bound_input = match (
+        &execution.input_sha256,
+        &execution.input_art_cid,
+        execution.input_art_size,
+    ) {
+        (Some(sha), Some(cid), Some(size))
+            if sha.len() == 64
+                && sha
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                && !cid.is_empty()
+                && !cid.chars().any(char::is_control)
+                && size >= 0 =>
+        {
+            Some((sha, cid, size))
+        }
+        (None, None, None) if execution.state == "pending" => None,
+        _ => {
+            hash_body(req.input, &mut input).await?;
+            finish_input(&input)?;
+            return Err(recovery_attention());
+        }
+    };
+    if execution.state != "admitted" && current_io_denied(state, &intent, None) {
+        hash_body(req.input, &mut input).await?;
+        let (sha, size) = finish_input(&input)?;
+        if let Some((original_sha, _, original_size)) = bound_input
+            && (&sha != original_sha || size != original_size)
+        {
+            return Err(conflict());
+        }
         return Err(conflict());
     }
     let worker = uuid::Uuid::new_v4().to_string();
@@ -784,7 +1029,7 @@ pub(super) async fn put(
         .map_err(store_error)?
     else {
         hash_body(req.input, &mut input).await?;
-        input.finish(&req.headers)?;
+        finish_input(&input)?;
         return Err(conflict());
     };
     let lease = Lease::start(state.clone(), claim.clone());
@@ -794,7 +1039,7 @@ pub(super) async fn put(
             result = hash_body(req.input, &mut input) => result?,
             _ = lease.cancelled.cancelled() => return Err(conflict()),
         }
-        let (sha, size) = input.finish(&req.headers)?;
+        let (sha, size) = finish_input(&input)?;
         let recovered = execution::read_for_replay(state.store.db(), &request, &sha)
             .await
             .map_err(store_error)?
@@ -819,6 +1064,47 @@ pub(super) async fn put(
             sha,
             manifest,
         )
+    } else if let Some((original_sha, original_cid, original_size)) = bound_input {
+        tokio::select! {
+            result = hash_body(req.input, &mut input) => result?,
+            _ = lease.cancelled.cancelled() => return Err(conflict()),
+        }
+        let (sha, size) = finish_input(&input)?;
+        if &sha != original_sha || size != original_size {
+            return Err(conflict());
+        }
+        let recovered = execution::read_for_replay(state.store.db(), &request, &sha)
+            .await
+            .map_err(store_error)?
+            .filter(|row| {
+                row.state == "pending"
+                    && row.epoch == claim.epoch
+                    && row.worker.as_deref() == Some(&claim.worker)
+                    && row.captured_options == execution.captured_options
+                    && row.input_art_cid.as_ref() == Some(original_cid)
+                    && row.input_art_size == Some(size)
+            })
+            .ok_or_else(conflict)?;
+        let archive = crate::s3::ops::object::StoredObject {
+            cid: recovered.input_art_cid.ok_or_else(conflict)?,
+            size,
+        };
+        // The native same-binding path validates the live owner/epoch using the
+        // database clock; it neither rewrites input nor admits new upload work.
+        execution::bind_clean_input(state.store.db(), &claim, &sha, &archive.cid, size)
+            .await
+            .map_err(store_error)?;
+        let manifest = recover_pending_manifest(
+            state,
+            &archive,
+            &sha,
+            &parsed,
+            options.publish_extracted,
+            max_decompressed_bytes,
+            &lease.cancelled,
+        )
+        .await?;
+        (archive, sha, manifest)
     } else {
         let digest = Arc::new(Mutex::new(input));
         let stream_digest = digest.clone();
@@ -857,10 +1143,7 @@ pub(super) async fn put(
                 error.into()
             }
         })?;
-        let (sha, bytes) = digest
-            .lock()
-            .expect("ZIP digest mutex")
-            .finish(&req.headers)?;
+        let (sha, bytes) = finish_input(&digest.lock().expect("ZIP digest mutex"))?;
         if archive.size != bytes {
             return Err(s3s::s3_error!(
                 IncompleteBody,
@@ -889,52 +1172,6 @@ pub(super) async fn put(
         };
         (archive, sha, manifest)
     };
-    let source_preview = options.publish_source.then(|| ZipPublishedOutput {
-        bucket: parsed.bucket.clone(),
-        key: parsed.key.clone(),
-        version_id: "unpublished-preview".into(),
-        cid: archive.cid.clone(),
-    });
-    let planned = if options.targets == ZipTargets::None {
-        Vec::new()
-    } else {
-        let outputs = manifest
-            .successful
-            .iter()
-            .map(|file| ZipPublishedOutput {
-                bucket: parsed.bucket.clone(),
-                key: file.object_key.clone(),
-                // Only bucket/key and policy inputs predict intents. Publication
-                // replans with the actual newly inserted private version row.
-                version_id: "unpublished-preview".into(),
-                cid: file.cid.clone(),
-            })
-            .collect::<Vec<_>>();
-        rules
-            .plan(
-                PolicyTargets {
-                    source: matches!(options.targets, ZipTargets::Source | ZipTargets::Both),
-                    extracted: matches!(options.targets, ZipTargets::Extracted | ZipTargets::Both),
-                },
-                source_preview.clone(),
-                &outputs,
-            )
-            .map_err(|_| failure("ZIP v2 output rules rejected the manifest"))?
-            .outputs
-    };
-    let planned = planned
-        .into_iter()
-        .map(|decision| {
-            (
-                decision.output.key,
-                decision
-                    .intents
-                    .into_iter()
-                    .map(|intent| intent.intent)
-                    .collect::<Vec<_>>(),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
     let source_guard = if execution.state == "admitted" {
         recovered_source_guard
     } else {
@@ -1028,19 +1265,22 @@ pub(super) async fn put(
     {
         return Err(conflict());
     }
+    if execution.state == "admitted" && current_io_denied(state, &intent, Some(&manifest)) {
+        return Err(conflict());
+    }
     let root_outcome = build_zip_root(
         state,
         &id,
         &manifest,
-        saved_options.build_root(),
+        options.build_root(),
         &lease.cancelled,
     )
     .await?;
     let successes = manifest
         .successful
         .iter()
-        .map(|file| ZipV2Success {
-            object: publication::PublicationObject::from_put(
+        .map(|file| {
+            publication::PublicationObject::from_put(
                 uuid::Uuid::new_v4().to_string(),
                 &parsed.bucket,
                 &file.object_key,
@@ -1052,20 +1292,12 @@ pub(super) async fn put(
                 None,
                 None,
                 chrono::Utc::now(),
-            ),
-            path: file.relative_path.clone(),
-            object_key: file.object_key.clone(),
-            cid: file.cid.clone(),
-            size: file.size,
-            policy: PublicationPolicy {
-                tags: Vec::new(),
-                leases: planned.get(&file.object_key).cloned().unwrap_or_default(),
-            },
+            )
         })
         .collect::<Vec<_>>();
     let terminal = serde_json::json!({"input_sha256": sha, "published_count": manifest.successful.len(), "failed_count": manifest.failed.len(), "status": if manifest.successful.is_empty() && !options.publish_source { "failed" } else { "completed" }}).to_string();
-    let publication = ZipV2Publication {
-        claim: claim.clone(),
+    let publication = CapturedZipPublication {
+        batch_id: id.clone(),
         source: options.publish_source.then(|| {
             publication::PublicationObject::from_put(
                 uuid::Uuid::new_v4().to_string(),
@@ -1081,32 +1313,33 @@ pub(super) async fn put(
                 chrono::Utc::now(),
             )
         }),
-        source_policy: options.publish_source.then(|| PublicationPolicy {
-            tags: source_tags,
-            leases: planned.get(&parsed.key).cloned().unwrap_or_default(),
-        }),
-        source_guard,
+        source_tags,
         successes,
-        targets: options.targets,
-        captured_rule_revision: Some(captured_rule_revision),
+        manifest,
+        capture: intent,
+        authority: ZipPublicationAuthority::Execution {
+            claim: claim.clone(),
+            source_guard,
+            settlement: ZipExecutionSettlement::Direct,
+        },
         root_outcome,
         terminal_result: terminal,
     };
     if lease.cancelled.is_cancelled() {
         return Err(conflict());
     }
-    match publication::publish_zip_v2(
-        state.store.db(),
-        publication,
-        rules,
-        state.pinning.effective_config(),
-        state.pinning.provider_limits(),
-    )
-    .await
-    .map_err(store_error)?
-    {
-        ZipV2PublicationResult::Published(_) => {}
-        ZipV2PublicationResult::Fenced => return Err(conflict()),
+    if let Err(error) = publication::publish_captured_zip(state.store.db(), publication).await {
+        if matches!(error, AppError::StaleContentMutation) {
+            let fenced = if options.publish_source {
+                execution::fence(state.store.db(), &claim).await
+            } else {
+                execution::fence_if_lost(state.store.db(), &claim).await
+            };
+            if let Err(error) = fenced {
+                tracing::warn!(%error, "ZIP guard reconciliation deferred");
+            }
+        }
+        return Err(store_error(error));
     }
     let completed = execution::read(state.store.db(), &id)
         .await
@@ -1195,8 +1428,7 @@ pub(super) async fn status(state: &AppState, req: S3Request<Body>) -> S3Result<S
             && legacy.entries.iter().all(|entry| entry.cid.is_none())
         {
             let intake = v2_mpu_intake.as_ref().ok_or_else(conflict)?;
-            let options: ZipV2Options =
-                serde_json::from_str(&intake.captured_options).map_err(|_| conflict())?;
+            let options = intake.options().map_err(|_| conflict())?;
             if intake.owner != principal
                 || intake.bucket != bucket
                 || intake.archive_key != key
@@ -1289,6 +1521,7 @@ pub(super) async fn status(state: &AppState, req: S3Request<Body>) -> S3Result<S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::zip::options::ZipTargets;
     use crate::{config::Config, store::entities::zip_batch};
     use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
 
@@ -1305,6 +1538,71 @@ mod tests {
             http::HeaderValue::from_str(&hex::encode(Sha256::digest(bytes))).unwrap(),
         );
         headers
+    }
+
+    #[tokio::test]
+    async fn r25_input_identity_is_server_derived_without_a_client_digest() {
+        let bytes = empty_zip();
+        let mut input = InputDigest::new(bytes.len() as u64);
+        hash_body(Body::from(bytes.clone()), &mut input)
+            .await
+            .unwrap();
+        let expected = (hex::encode(Sha256::digest(&bytes)), bytes.len() as i64);
+        assert_eq!(input.finish(&HeaderMap::new()).unwrap(), expected);
+        let mut unsigned = HeaderMap::new();
+        unsigned.insert("x-amz-content-sha256", "UNSIGNED-PAYLOAD".parse().unwrap());
+        assert_eq!(input.finish(&unsigned).unwrap(), expected);
+    }
+
+    #[test]
+    fn r25_contract_uses_authenticated_business_controls_not_authorization_shape() {
+        let bytes = empty_zip();
+        let mut req = S3Request {
+            input: Body::from(bytes),
+            method: http::Method::PUT,
+            uri: "/bucket/archive.zip?decompress-zip=out/".parse().unwrap(),
+            headers: HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        req.headers.remove(http::header::AUTHORIZATION);
+        req.headers
+            .insert("content-type", "application/zip".parse().unwrap());
+        req.headers
+            .insert("x-amz-meta-team", "blue".parse().unwrap());
+        let options = ZipV2Options {
+            publish_source: true,
+            publish_extracted: true,
+            targets: ZipTargets::None,
+            token: "ordinary-request".into(),
+            root_override: None,
+            root_enabled: false,
+            result_version: 2,
+        };
+        let parsed = ParsedDecompressPut {
+            bucket: "bucket".into(),
+            key: "archive.zip".into(),
+            target_prefix: "out/".into(),
+            return_result_xml: true,
+        };
+        let first = request_contract(&req, &parsed, &options, "test").unwrap();
+        req.headers.insert(
+            http::header::AUTHORIZATION,
+            "not reparsed here".parse().unwrap(),
+        );
+        assert_eq!(
+            request_contract(&req, &parsed, &options, "test").unwrap(),
+            first
+        );
+        req.headers
+            .insert("x-amz-meta-team", "red".parse().unwrap());
+        assert_ne!(
+            request_contract(&req, &parsed, &options, "test").unwrap(),
+            first
+        );
     }
 
     #[tokio::test]
@@ -1344,6 +1642,29 @@ mod tests {
         assert!(input.add(b"x").is_err());
         assert_eq!(input.size, bytes.len() as i64);
         assert!(input.finish(&headers).is_err());
+    }
+
+    #[tokio::test]
+    async fn recovery_digest_checks_decoded_length_payload_hash_and_complete_zip_tail() {
+        let bytes = empty_zip();
+        let mut input = InputDigest::new(bytes.len() as u64);
+        hash_body(Body::from(bytes.clone()), &mut input)
+            .await
+            .unwrap();
+        let mut headers = payload_headers(&bytes);
+        headers.insert(http::header::CONTENT_LENGTH, "23".parse().unwrap());
+        assert!(input.finish(&headers).is_err());
+        headers.insert("x-amz-decoded-content-length", "22".parse().unwrap());
+        assert_eq!(input.finish(&headers).unwrap().1, 22);
+        headers.insert("x-amz-content-sha256", "0".repeat(64).parse().unwrap());
+        assert!(input.finish(&headers).is_err());
+        let mut corrupt = bytes.to_vec();
+        corrupt[20] = 1;
+        let mut input = InputDigest::new(corrupt.len() as u64);
+        hash_body(Body::from(corrupt.clone()), &mut input)
+            .await
+            .unwrap();
+        assert!(input.finish(&payload_headers(&corrupt)).is_err());
     }
 
     #[tokio::test]
