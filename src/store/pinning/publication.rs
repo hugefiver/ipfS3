@@ -44,6 +44,7 @@ use super::{jobs, leases, ledger, quota, tags};
 mod hot_receipt;
 mod zip;
 mod zip_v2;
+pub mod management;
 
 pub use crate::store::zip::execution as v2_execution;
 pub use zip::{
@@ -1921,14 +1922,24 @@ async fn insert_lease<C: ConnectionTrait>(
     let expires_at = now
         .checked_add_signed(TimeDelta::seconds(seconds))
         .ok_or_else(|| invalid_publication("lease expiry is out of range"))?;
+    insert_absolute_lease(db, lease_id, owner_object_id, source_name(intent.source), intent, targets, now, expires_at, now, None).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_absolute_lease<C: ConnectionTrait>(
+    db: &C, lease_id: &str, owner_object_id: &str, source: &str,
+    intent: &LeaseIntent, targets: &[PinTargetSpec], started_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>, now: DateTime<Utc>, requirements: Option<&crate::pinning::management::Requirements>,
+) -> AppResult<()> {
+    if expires_at <= started_at { return Err(invalid_publication("invalid absolute lease interval")); }
     pin_lease::Entity::insert(pin_lease::ActiveModel {
         id: Set(lease_id.to_owned()),
         owner_object_id: Set(owner_object_id.to_owned()),
-        source: Set(source_name(intent.source).to_owned()),
+        source: Set(source.to_owned()),
         policy_id: Set(intent.policy_id.clone()),
         provider_mode: Set(provider_mode_name(intent.provider_mode).to_owned()),
         content_mode: Set(content_mode_name(intent.content_mode).to_owned()),
-        created_at: Set(now),
+        created_at: Set(started_at),
         last_touched_at: Set(now),
         expires_at: Set(expires_at),
         generation: Set(1),
@@ -1936,7 +1947,12 @@ async fn insert_lease<C: ConnectionTrait>(
     })
     .exec(db)
     .await?;
-    crate::store::entities::pin_lease_requirement::contract::insert(
+    if let Some(requirements)=requirements {
+        crate::store::entities::pin_lease_requirement::contract::insert_management(
+            db,lease_id,owner_object_id,provider_mode_name(intent.provider_mode),content_mode_name(intent.content_mode),
+            targets.iter().map(|target|target.cid.clone()),&intent.providers,started_at,requirements,
+        ).await?;
+    } else { crate::store::entities::pin_lease_requirement::contract::insert(
         db,
         lease_id,
         owner_object_id,
@@ -1944,9 +1960,9 @@ async fn insert_lease<C: ConnectionTrait>(
         content_mode_name(intent.content_mode),
         targets.iter().map(|target| target.cid.clone()),
         &intent.providers,
-        now,
+        started_at,
     )
-    .await?;
+    .await?; }
     Ok(())
 }
 

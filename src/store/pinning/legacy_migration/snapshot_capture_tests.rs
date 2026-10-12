@@ -1,6 +1,6 @@
 use super::{migration, native_catalog, store};
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
-use sea_orm_migration::MigratorTrait;
+use sea_orm_migration::{MigrationTrait, SchemaManager};
 
 fn historical_decision(request: &str) -> String {
     use crate::pinning::{
@@ -94,6 +94,26 @@ async fn native_historical_captures_are_not_filled_or_rewritten_by_inventory_or_
     let upgraded_versions = super::super::schema(&db, true).await.unwrap();
     let upgraded = super::super::read(&db, &upgraded_versions).await.unwrap();
     let mut historical_shape = upgraded.clone();
+    let scope = historical_shape
+        .iter()
+        .find(|table| table.table == "pin_management_records")
+        .unwrap();
+    assert_eq!(scope.rows.len(), 1);
+    assert_eq!(scope.rows[0]["kind"].as_deref(), Some("database_scope"));
+    assert!(
+        historical_shape
+            .iter()
+            .find(|table| table.table == "pin_management_retirements")
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    historical_shape.retain(|table| {
+        !matches!(
+            table.table.as_str(),
+            "pin_management_records" | "pin_management_retirements"
+        )
+    });
     for (table, column) in [
         ("multipart_uploads", "zip_intent_json"),
         ("import_jobs", "zip_intent_json"),
@@ -112,7 +132,12 @@ async fn native_historical_captures_are_not_filled_or_rewritten_by_inventory_or_
         "all native historical columns and rows remain unchanged"
     );
     let upgraded_metadata = catalog_metadata(&db).await;
-    assert!(store::migrator::Migrator::down(&db, Some(1)).await.is_err());
+    assert!(
+        store::migrations::m20261008_000001_zip_intent_capture::Migration
+            .down(&SchemaManager::new(&db))
+            .await
+            .is_err()
+    );
     assert_eq!(catalog_metadata(&db).await, upgraded_metadata);
     assert_eq!(
         super::super::schema(&db, true).await.unwrap(),

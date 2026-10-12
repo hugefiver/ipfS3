@@ -380,6 +380,7 @@ async fn admit_once(db: &DatabaseConnection, req: &Request) -> AppResult<Status>
         return Err(AppError::InvalidImportRequest);
     }
     let accepted_xml = accepted_receipt(&a.id, &a.captured_options)?;
+    crate::store::pinning::management::admission::lock_encoded_zip_intake_in_transaction(&tx, &a.captured_options).await?;
     // No standalone execution::admit: its own commit would orphan the batch
     // if the request insert fails.
     execution::admit_in_transaction(&tx, a).await?;

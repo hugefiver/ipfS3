@@ -106,6 +106,9 @@ impl LedgerEffect {
     }
 }
 
+/// Low-level metadata primitive; registration callers own transaction scope.
+/// Gateway startup uses `register_configured_route_in_transaction`, not a bare
+/// connection preflight followed by this upsert.
 pub async fn register_route<C: ConnectionTrait>(
     db: &C,
     key: &str,
@@ -116,6 +119,7 @@ pub async fn register_route<C: ConnectionTrait>(
 
 /// Register the validated execution/confirmation contract, including disabled
 /// birth candidates. Identity-only callers remain compatible for older kinds.
+/// The generic signature does not establish a retirement transaction barrier.
 pub async fn register_configured_route<C: ConnectionTrait>(
     db: &C,
     key: &str,
@@ -133,14 +137,36 @@ pub async fn register_configured_route<C: ConnectionTrait>(
     register_snapshot(db, key, &provider.identity, &snapshot).await
 }
 
+/// Gateway startup owns this short transaction; the generic compatibility API
+/// above does not pretend that an autocommit preflight protects missing rows.
+pub(crate) async fn register_configured_route_in_transaction(
+    tx: &sea_orm::DatabaseTransaction,
+    key: &str,
+    provider: &crate::pinning::config::ValidatedProvider,
+) -> AppResult<()> {
+    super::management::admission::lock_registration_in_transaction(tx, key).await?;
+    register_configured_route(tx, key, provider).await
+}
+
 async fn register_snapshot<C: ConnectionTrait>(
     db: &C,
     key: &str,
     identity: &ProviderIdentity,
     route: &ProviderRouteSnapshot,
 ) -> AppResult<()> {
+    super::legacy_migration::admission_schema(db).await
+        .map_err(|_| super::management::admission::needs_attention())?;
     if super::legacy_migration::source_is_migrated(db, key).await? {
         // Restart must not overwrite, resurrect or reallocate a migrated source.
+        return Ok(());
+    }
+    if super::management::admission::registration_closed(db, route).await? {
+        // Preserve the original route and receipt for read-only history. Neither
+        // a new alias nor today's retired=false can reopen a permanent domain.
+        return Ok(());
+    }
+    if pin_provider_route::Entity::find_by_id(key.to_owned()).one(db).await?
+        .is_some_and(|registered| registered.retired) {
         return Ok(());
     }
     let snapshot = serde_json::to_string(route)
@@ -184,10 +210,18 @@ pub(crate) async fn verify_birth_candidate_routes<C: ConnectionTrait>(
     allocatable: &std::collections::BTreeSet<String>,
     lock: bool,
 ) -> AppResult<()> {
+    let routes = expected.iter().filter(|(key, _)| allocatable.contains(*key))
+        .map(|(_, route)| route.clone()).collect::<Vec<_>>();
+    if lock {
+        // Existing publication/ZIP callers pass their prelocked business tx.
+        super::management::admission::lock_in_caller_transaction(db, &routes).await?;
+    } else {
+        super::management::admission::check_open(db, &routes).await?;
+    }
     for (key, snapshot) in expected {
         let query = pin_provider_route::Entity::find_by_id(key.clone());
         let route = if lock && db.get_database_backend() == DatabaseBackend::Postgres {
-            query.lock_exclusive().one(db).await?
+            query.lock_with_behavior(sea_orm::sea_query::LockType::Update, sea_orm::sea_query::LockBehavior::Nowait).one(db).await?
         } else {
             query.one(db).await?
         };
@@ -226,6 +260,7 @@ pub async fn capture_reservation<C: ConnectionTrait>(
     provider: &str,
     cid: &str,
 ) -> AppResult<()> {
+    super::management::admission::lock_provider_in_caller_transaction(db, provider).await?;
     let Some(route) = pin_provider_route::Entity::find_by_id(provider.to_owned())
         .one(db)
         .await?
@@ -260,6 +295,7 @@ pub async fn capture_reallocation<C: ConnectionTrait>(
     provider: &str,
     cid: &str,
 ) -> AppResult<()> {
+    super::management::admission::lock_provider_in_caller_transaction(db, provider).await?;
     let Some(row) = get(db, provider, cid).await? else {
         return capture_reservation(db, provider, cid).await;
     };
@@ -382,7 +418,7 @@ pub(crate) async fn advance_submit_invocation_epoch<C: ConnectionTrait>(
     // a concurrent confirmed release cannot cross the archive boundary unseen.
     let query = remote_pin::Entity::find_by_id((job.provider.clone(), job.cid.clone()));
     let remote = if db.get_database_backend() == DatabaseBackend::Postgres {
-        query.lock_exclusive().one(db).await?
+        query.lock_with_behavior(sea_orm::sea_query::LockType::Update, sea_orm::sea_query::LockBehavior::Nowait).one(db).await?
     } else {
         query.one(db).await?
     }
@@ -579,6 +615,16 @@ pub(crate) async fn job_route<C: ConnectionTrait>(
         .one(db)
         .await?
         .and_then(|captured| serde_json::from_str(&captured.route).ok()))
+}
+
+/// Last new-POST fence for every provider family. Recovery GETs and callbacks
+/// intentionally do not use this admission check.
+pub(crate) async fn submit_dispatch_open<C: ConnectionTrait>(db: &C, job: &pin_job::Model) -> AppResult<bool> {
+    if job.operation != "submit" { return Ok(false); }
+    let Some(original) = job_route(db, &job.id).await? else {
+        return legacy_unregistered_store(db, &job.provider).await;
+    };
+    Ok(!super::management::admission::registration_closed(db, &original).await?)
 }
 
 /// A cancelled owner's Poll can prove the request's origin, but cannot itself
@@ -822,8 +868,7 @@ pub async fn cleanup_allowed<C: ConnectionTrait>(
 // gateway always registers identities before publication: once initialized,
 // even a missing ledger row for a legacy name is unknown and fails closed.
 async fn legacy_unregistered_store<C: ConnectionTrait>(db: &C, provider: &str) -> AppResult<bool> {
-    Ok(!provider.starts_with("domain:")
-        && pin_provider_route::Entity::find().one(db).await?.is_none())
+    super::management::admission::unregistered_legacy(db, provider).await
 }
 
 #[derive(Debug, Serialize)]

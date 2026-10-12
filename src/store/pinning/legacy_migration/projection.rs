@@ -32,7 +32,8 @@ pub(super) const CAPTURE_COLUMNS: [&str; 6] = [
     "contract",
 ];
 
-pub(super) fn bindings(images: &[TableImage], source: &str) -> AppResult<Vec<Binding>> {
+pub(super) fn bindings(images: &[TableImage], ns: &super::Namespace, management: &super::management_closure::Closure) -> AppResult<Vec<Binding>> {
+    let source = ns.source.as_str();
     let mut result = vec![];
     for image in images {
         for row in &image.rows {
@@ -77,6 +78,7 @@ pub(super) fn bindings(images: &[TableImage], source: &str) -> AppResult<Vec<Bin
             }
         }
     }
+    management.augment(images, ns, &mut result)?;
     Ok(result)
 }
 
@@ -133,10 +135,11 @@ fn validate_provider_key(value: &str) -> AppResult<()> {
 pub(super) fn project(
     before: &[TableImage],
     declaration: &Declaration,
+    management: &super::management_closure::Closure,
 ) -> AppResult<Vec<TableImage>> {
     let mut after = before.to_vec();
     for ns in &declaration.namespaces {
-        let expected = bindings(before, &ns.source)?;
+        let expected = bindings(before, ns, management)?;
         if expected.is_empty()
             || expected.len() != ns.bindings.len()
             || expected
@@ -164,6 +167,7 @@ pub(super) fn project(
             return Err(refused("target route/revision differs from declaration"));
         }
         super::closure_identity::validate(before, ns)?;
+        management.validate_identity(ns)?;
         if ns.binding_only
             && !before
                 .iter()

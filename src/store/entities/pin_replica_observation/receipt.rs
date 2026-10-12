@@ -1,4 +1,5 @@
 //! Historical replica facts. Deserializing these does not create adapter proof.
+//! Retirement closes allocation, not compatible reads or original-lifetime settlement.
 use super::super::pin_lease_requirement::contract::read_route_compatible;
 use super::{ActiveModel, Column, Entity};
 use crate::{
@@ -82,7 +83,6 @@ pub(crate) async fn append<C: ConnectionTrait>(
         registered_query.one(db).await?
     };
     let registered_matches = registered
-        .filter(|row| !row.retired)
         .and_then(|row| serde_json::from_str::<ProviderRouteSnapshot>(&row.snapshot).ok())
         .is_some_and(|current| read_route_compatible(&route, &current));
     let projectable = live
@@ -166,7 +166,6 @@ pub async fn fresh_complete<C: ConnectionTrait>(
         .one(db)
         .await?;
     if !registered
-        .filter(|row| !row.retired)
         .and_then(|row| serde_json::from_str::<ProviderRouteSnapshot>(&row.snapshot).ok())
         .is_some_and(|current| read_route_compatible(route, &current))
     {

@@ -30,3 +30,4 @@ pub mod m20261004_000001_rpc_submission_ledger;
 pub mod m20261004_000002_cluster_replica_contract;
 pub mod m20261007_000001_legacy_pinning_migration;
 pub mod m20261008_000001_zip_intent_capture;
+pub mod m20261012_000001_pinning_management;

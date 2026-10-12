@@ -6,7 +6,7 @@ use std::{
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use sea_orm::sea_query::{Condition, Expr, Func};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
     TransactionTrait, TryInsertResult,
 };
 use sha2::{Digest, Sha256};
@@ -156,6 +156,10 @@ pub async fn record_submit_invocation<C: ConnectionTrait>(
     strategy: &str,
     now: DateTimeUtc,
 ) -> AppResult<()> {
+    super::management::admission::lock_sqlite_writer_in_caller_transaction(db).await?;
+    if !super::ledger::submit_dispatch_open(db, &claimed.model).await? {
+        return Err(invalid_job("retired domain cannot start another invocation"));
+    }
     if !fence_job_claim(db, &claimed.model.id, claimed_lock(&claimed.model)?).await? {
         return Err(stale_claim_error(&claimed.model.id));
     }
@@ -179,6 +183,7 @@ pub async fn record_submit_invocation<C: ConnectionTrait>(
         ));
     }
     super::ledger::advance_submit_invocation_epoch(db, claimed, api, strategy).await?;
+    super::quota::lock_allocation_admission(db, &claimed.model.provider).await?;
     let old = submission_history(db, &claimed.model.id).await?;
     if let Some(old) = old {
         if old.api != api
@@ -816,6 +821,7 @@ pub async fn ensure_or_reactivate_submit_job<C: ConnectionTrait>(
         return Err(invalid_job("submit ensure requires a Submit job"));
     }
     validate_submit_owner(db, &job).await?;
+    super::quota::lock_allocation_admission(db, &job.provider).await?;
     if let Some(blocking) = blocking_live_submit(db, &job.provider, &job.cid, &job.id).await? {
         return match blocking.state.as_str() {
             STATE_PENDING => Ok(EnsureJobOutcome::Pending),
@@ -985,6 +991,35 @@ pub async fn claim_due_jobs<C: ConnectionTrait + TransactionTrait>(
         }
     }
     unreachable!("SQLite claim retry loop always returns or errors")
+}
+
+/// Receipt-owned scope, never a caller-supplied list of queue UUIDs. There is no
+/// global expiry/quota scan here; execution uses the normal claim protocol.
+pub(crate) async fn claim_due_management_jobs(
+    db: &sea_orm::DatabaseConnection,
+    scope: &super::management::admission::ManagementJobScope,
+    now: DateTimeUtc,
+    lock_for: ChronoDuration,
+    limit: u64,
+) -> AppResult<Vec<ClaimedPinJob>> {
+    if limit == 0 { return Ok(Vec::new()); }
+    let tx = db.begin().await?;
+    scope.revalidate(&tx).await?;
+    let candidates = pin_job::Entity::find().filter(due_claim_condition(now))
+        .filter(scope.candidates()).order_by_asc(pin_job::Column::Id).all(&tx).await?;
+    let mut claimed = Vec::new();
+    for candidate in candidates {
+        if claimed.len() as u64 >= limit { break; }
+        if !scope.contains(&tx, &candidate).await? { continue; }
+        if let Some(job) = claim_candidate(&tx, candidate, now, now + lock_for).await? {
+            if !scope.contains(&tx, &job.model).await? {
+                return Err(invalid_job("management claim changed its original applied scope"));
+            }
+            claimed.push(job);
+        }
+    }
+    tx.commit().await?;
+    Ok(claimed)
 }
 
 /// Claims due work using provider occupancy and recent-service tickets for fair scheduling.
@@ -1219,12 +1254,23 @@ async fn claim_candidate<C: ConnectionTrait>(
         .one(db)
         .await?
         .ok_or_else(|| sea_orm::DbErr::RecordNotFound("claimed pin job disappeared".to_owned()))?;
-    Ok(Some(ClaimedPinJob {
+    let claimed = ClaimedPinJob {
         model,
         reclaimed,
         previous_state,
         object_id,
-    }))
+    };
+    match super::management::actions::job_authority::check_before_call(db, &claimed.model).await {
+        Ok(_) => Ok(Some(claimed)),
+        Err(AppError::InvalidPinningRequest(_)) => {
+            // Isolate one invalid/orphaned management row. Do not poison fair
+            // scheduling of unrelated ordinary jobs or allow a None fallback.
+            finish_nonprojecting_job(db, &claimed, true, now).await
+                .map_err(|_| sea_orm::DbErr::Custom("management claim could not be isolated".into()))?;
+            Ok(None)
+        }
+        Err(_) => Err(sea_orm::DbErr::Custom("management claim authority could not be checked".into())),
+    }
 }
 
 /// Extends one exact running claim without changing its operation phase.
@@ -1240,6 +1286,10 @@ pub async fn renew_job_claim<C: ConnectionTrait>(
     if new_locked_until <= expected_locked_until {
         return Err(invalid_job("renewed job lock must advance"));
     }
+    let Some(job) = pin_job::Entity::find_by_id(job_id.to_owned()).one(db).await? else { return Ok(None); };
+    // LedgerOnly may finish gathering an already-started receipt. It does not
+    // grant another call: the worker checks the operation-specific permit there.
+    super::management::actions::job_authority::check_before_call(db, &job).await?;
     let updated = pin_job::Entity::update_many()
         .col_expr(pin_job::Column::LockedUntil, Expr::value(new_locked_until))
         .col_expr(pin_job::Column::UpdatedAt, Expr::value(now))
@@ -1467,6 +1517,7 @@ pub async fn prepare_submit_call<C: ConnectionTrait>(
     claimed: &ClaimedPinJob,
     now: DateTimeUtc,
 ) -> AppResult<SubmitCallDecision> {
+    super::management::admission::lock_sqlite_writer_in_caller_transaction(db).await?;
     let job = &claimed.model;
     let locked_until = claimed_lock(job)?;
     if job.operation != PinJobOperation::Submit.persisted() {
@@ -1489,6 +1540,13 @@ pub async fn prepare_submit_call<C: ConnectionTrait>(
         return Err(invalid_job(
             "submit phase is not eligible to call the provider",
         ));
+    }
+    super::quota::lock_allocation_admission(db, &job.provider).await?;
+    if db.get_database_backend() == DatabaseBackend::Postgres {
+        // This is the new-dispatch tail, not the historical receipt append.
+        // A job-first receipt may be waiting for our earlier remote lock.
+        db.query_one(sea_orm::Statement::from_sql_and_values(DatabaseBackend::Postgres,
+            "SELECT id FROM pin_jobs WHERE id=$1 FOR UPDATE NOWAIT", [job.id.clone().into()])).await?;
     }
 
     let result = pin_job::Entity::update_many()
@@ -1846,6 +1904,24 @@ pub async fn complete_job<C: ConnectionTrait>(
     Ok(())
 }
 
+/// Finalizes only the observation's exact claim, not Submit history, a remote
+/// lifetime, quota or a successor job. Unknown responsibility stays isolated.
+pub(crate) async fn finish_nonprojecting_job<C: ConnectionTrait>(
+    db: &C, claimed: &ClaimedPinJob, attention: bool, now: DateTimeUtc,
+) -> AppResult<()> {
+    let until = claimed_lock(&claimed.model)?;
+    if !fence_job_claim(db, &claimed.model.id, until).await? { return Ok(()); }
+    pin_job::Entity::update_many()
+        .col_expr(pin_job::Column::State, Expr::value(if attention { STATE_RUNNING } else { STATE_DONE }))
+        .col_expr(pin_job::Column::LockedUntil, Expr::value(Option::<DateTimeUtc>::None))
+        .col_expr(pin_job::Column::LastError, Expr::value(if attention { Some("management observation needs_attention") } else { None }))
+        .col_expr(pin_job::Column::UpdatedAt, Expr::value(now))
+        .filter(pin_job::Column::Id.eq(&claimed.model.id))
+        .filter(pin_job::Column::State.eq(STATE_RUNNING))
+        .filter(pin_job::Column::LockedUntil.eq(until)).exec(db).await?;
+    Ok(())
+}
+
 fn new_job_active_model(job: NewPinJob, now: DateTimeUtc) -> pin_job::ActiveModel {
     match job {
         NewPinJob::Target(job) => {
@@ -1903,6 +1979,9 @@ pub(crate) async fn insert_new_job<C: ConnectionTrait>(
     let job_id = model.id.as_ref().to_owned();
     let provider = model.provider.as_ref().to_owned();
     let cid = model.cid.as_ref().to_owned();
+    if model.operation.as_ref() == PinJobOperation::Submit.persisted() {
+        super::quota::lock_allocation_admission(db, &provider).await?;
+    }
     let result = pin_job::Entity::insert(model)
         .on_conflict_do_nothing()
         .exec(db)

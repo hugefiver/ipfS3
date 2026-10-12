@@ -194,3 +194,15 @@ mod capture_tests;
 
 #[path = "zip_capture_binding_tests.rs"]
 mod zip_bindings;
+
+#[path = "snapshot_management_catalog_tests.rs"]
+mod management_catalog_tests;
+
+#[path = "snapshot_management_raw_tests.rs"]
+mod management_raw_tests;
+
+#[path = "snapshot_management_postgres_tests.rs"]
+mod management_postgres_tests;
+
+#[path = "management_typed_tests.rs"]
+mod management_typed_tests;

@@ -37,9 +37,12 @@ use crate::{
                 RemoteStatusOrigin, RemoteStatusUpdate, RemoteWorkSnapshot,
             },
             ledger, quota as store_quota,
+            management::{actions::job_authority::{self, JobPermit}, admission::{self, ManagedCall}},
         },
     },
 };
+
+pub use crate::store::pinning::management::admission::{ManagementJobScope, ManagementJobReport};
 
 const STATE_DONE: &str = "done";
 const STATUS_RESERVED: &str = "reserved";
@@ -487,6 +490,24 @@ async fn run_worker(
     }
 }
 
+/// A bounded pass over the exact durable applied batch and its verified Poll
+/// successors. No global expiry, quota waiter scan or background queue tick.
+pub async fn management_tick(
+    coordinator: &PinningCoordinator, store: &Store, scope: &ManagementJobScope,
+    cancellation: &CancellationToken,
+) -> AppResult<ManagementJobReport> {
+    if !cancellation.is_cancelled() {
+        let claimed = jobs::claim_due_management_jobs(store.db(), scope, Utc::now(),
+            coordinator.settings().lock_for, coordinator.settings().claim_limit).await?;
+        let global = Arc::new(Semaphore::new(coordinator.settings().worker_concurrency));
+        for job in claimed {
+            if cancellation.is_cancelled() { break; }
+            execute_claimed_job_with_cancellation(store, coordinator, &global, job, cancellation).await?;
+        }
+    }
+    scope.report(store.db()).await
+}
+
 async fn scan_and_claim(
     coordinator: &PinningCoordinator,
     store: &Store,
@@ -550,13 +571,22 @@ async fn execute_claimed_job_with_cancellation(
     cancellation: &CancellationToken,
 ) -> AppResult<()> {
     validate_operation_scope(&claimed.model)?;
-    if !crate::store::pinning::legacy_migration::job_io_allowed(store.db(), &claimed.model).await? {
+    let managed = job_authority::check_before_call(store.db(), &claimed.model).await?;
+    if let Some(JobPermit::ReadOnly(authority) | JobPermit::LedgerOnly(authority)) = &managed {
+        return execute_management_observation(store, coordinator, global, claimed, authority.clone(), cancellation).await;
+    }
+    let point_route = if managed.is_none() { verified_job_route(store, &claimed.model).await? } else { None };
+    if managed.is_none() && point_route.is_none() && !crate::store::pinning::legacy_migration::job_io_allowed(store.db(), &claimed.model).await? {
         let txn = store.db().begin().await?;
         jobs::park_identity_job(&txn, &claimed).await?;
         txn.commit().await?;
         return Ok(());
     }
-    let route_valid = if claimed.model.operation == "submit" {
+    let route_valid = if let Some(JobPermit::Submit(authority) | JobPermit::ExistingCleanup(authority)) = &managed {
+        coordinator.historical_runtime_key(&claimed.model.provider, &authority.route).is_some()
+    } else if let Some(route) = &point_route {
+        coordinator.historical_runtime_key(&claimed.model.provider, route).is_some()
+    } else if claimed.model.operation == "submit" {
         crate::store::pinning::ledger::route_matches(
             store.db(),
             &claimed.model.provider,
@@ -572,7 +602,7 @@ async fn execute_claimed_job_with_cancellation(
         )
         .await?
     };
-    if !route_valid || !registered_poll_route_matches(store, &claimed.model).await? {
+    if !route_valid || (managed.is_none() && point_route.is_none() && !registered_poll_route_matches(store, &claimed.model).await?) {
         let txn = store.db().begin().await?;
         jobs::park_identity_job(&txn, &claimed).await?;
         txn.commit().await?;
@@ -623,6 +653,46 @@ async fn execute_claimed_job_with_cancellation(
     }
 }
 
+/// A typed readonly/late directive never enters ordinary reconcile, failover,
+/// no-desired cleanup or target projection. Only its original opaque resource is
+/// read; missing identity is attention, never a CID-search ownership guess.
+async fn execute_management_observation(
+    store: &Store, coordinator: &PinningCoordinator, global: &Arc<Semaphore>,
+    mut claimed: ClaimedPinJob, authority: crate::store::pinning::management::records::JobAuthority,
+    cancellation: &CancellationToken,
+) -> AppResult<()> {
+    if claimed.model.attempts >= coordinator.settings().max_attempts as i32
+        || coordinator.historical_runtime_key(&claimed.model.provider, &authority.route).is_none()
+    {
+        return jobs::finish_nonprojecting_job(store.db(), &claimed, true, Utc::now()).await;
+    }
+    let Some(request_id) = authority.resource_id else {
+        return jobs::finish_nonprojecting_job(store.db(), &claimed, true, Utc::now()).await;
+    };
+    let expected_request_id = request_id.clone();
+    let Some(slot) = acquire_provider_slot(coordinator, store, &mut claimed,
+        coordinator.settings().lock_for, cancellation).await? else { return Ok(()); };
+    let preflight_job = claimed.model.clone();
+    let observation = match provider_call_with_heartbeat(slot, global, store, &mut claimed,
+        coordinator.settings().lock_for, cancellation, ManagedCall::Observe,
+        move || async move { admission::managed_call_allowed(store.db(), &preflight_job, ManagedCall::Observe).await },
+        move |provider| async move { Ok(provider.get_observed(&request_id).await) }).await?
+    {
+        ProviderCallOutcome::Completed(Ok(observation)) => observation,
+        ProviderCallOutcome::Completed(Err(error)) => crate::pinning::provider::PinObservation { result: Err(error), resources: Vec::new() },
+        ProviderCallOutcome::PreflightRejected => return jobs::finish_nonprojecting_job(store.db(), &claimed, true, Utc::now()).await,
+        ProviderCallOutcome::Cancelled | ProviderCallOutcome::StaleClaim => return Ok(()),
+    };
+    let tx = store.db().begin().await?;
+    admission::append_nonprojecting_observation(&tx, &claimed, &observation, Utc::now()).await?;
+    let attention = observation.result.as_ref().is_err()
+        || !observation.result.as_ref().is_ok_and(|remote|
+            valid_remote(remote, &claimed.model.cid, Some(&expected_request_id)) && remote.status != RemotePinStatus::Failed);
+    jobs::finish_nonprojecting_job(&tx, &claimed, attention || claimed.model.operation == "submit", Utc::now()).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 /// The captured route authorizes historical reads, not a new account or
 /// credential revision registered while the worker was waiting to call GET.
 async fn registered_poll_route_matches(store: &Store, job: &pin_job::Model) -> AppResult<bool> {
@@ -641,13 +711,19 @@ async fn registered_poll_route_matches(store: &Store, job: &pin_job::Model) -> A
             ) else {
                 return Ok(false);
             };
-            Ok(!registered.retired
-                && crate::store::entities::pin_lease_requirement::contract::read_route_compatible(
+            Ok(crate::store::entities::pin_lease_requirement::contract::read_route_compatible(
                     &captured, &current,
                 ))
         }
         _ => Ok(false),
     }
+}
+
+async fn worker_job_route_matches(store: &Store, coordinator: &PinningCoordinator, job: &pin_job::Model) -> AppResult<bool> {
+    if let Some(route) = verified_job_route(store, job).await? {
+        return Ok(coordinator.historical_runtime_key(&job.provider, &route).is_some());
+    }
+    ledger::job_route_matches(store.db(), job, coordinator.provider_identity(&job.provider)).await
 }
 
 async fn handle_unavailable_provider(
@@ -754,6 +830,12 @@ async fn execute_submit(
     let context = load_submit_context(store, &claimed.model).await?;
     let now = Utc::now();
     let txn = store.db().begin().await?;
+    leases::lock_submit_admission_frontier(&txn, &claimed.model).await?;
+    if !admission::managed_call_allowed(&txn, &claimed.model, ManagedCall::Submit).await? {
+        jobs::finish_nonprojecting_job(&txn, &claimed, true, now).await?;
+        txn.commit().await?;
+        return Ok(());
+    }
     let decision = jobs::prepare_submit_call(&txn, &claimed, now).await?;
     let mut correlation = None;
     let mut rpc_invocation = None;
@@ -842,7 +924,13 @@ async fn execute_submit(
         &mut claimed,
         coordinator.settings().lock_for,
         cancellation,
+        ManagedCall::Submit,
         move || async move {
+            // Applies to hosted/PSA as well as RPC Submit. History callbacks and
+            // read-only recovery do not pass through this new-dispatch barrier.
+            if !ledger::submit_dispatch_open(store.db(), &preflight_job).await? {
+                return Ok(false);
+            }
             if let Some(id) = preflight_rpc
                 && !ledger::submission::dispatch_allowed(store.db(), &id).await?
             {
@@ -933,6 +1021,14 @@ async fn execute_submit(
         {
             return Ok(());
         }
+    }
+    if !job_authority::projection_allowed(store.db(), &claimed.model).await.unwrap_or(false) {
+        let observation = crate::pinning::provider::PinObservation { result: result.result, resources: result.resources };
+        let tx = store.db().begin().await?;
+        admission::append_nonprojecting_observation(&tx, &claimed, &observation, Utc::now()).await?;
+        jobs::finish_nonprojecting_job(&tx, &claimed, true, Utc::now()).await?;
+        tx.commit().await?;
+        return Ok(());
     }
     let safe_error = result
         .result
@@ -1202,6 +1298,7 @@ async fn recover_submit(
         claimed,
         coordinator.settings().lock_for,
         cancellation,
+        ManagedCall::Observe,
         || async { Ok(true) },
         move |provider| async move {
             provider
@@ -1382,13 +1479,10 @@ async fn execute_poll(
         &mut claimed,
         coordinator.settings().lock_for,
         cancellation,
+        ManagedCall::Observe,
         move || async move {
             Ok(registered_poll_route_matches(store, &preflight_job).await?
-                && crate::store::pinning::ledger::job_route_matches(
-                    store.db(),
-                    &preflight_job,
-                    coordinator.provider_identity(&preflight_job.provider),
-                )
+                && worker_job_route_matches(store, coordinator, &preflight_job)
                 .await?
                 && current_poll_request(store, &preflight_job)
                     .await?
@@ -1770,6 +1864,14 @@ async fn persist_typed_observation_status_phase(
     let observation_request_id = update.request_id;
     let txn = store.db().begin().await?;
     let live = jobs::fence_job_claim(&txn, &claimed.model.id, claimed_lock(claimed)?).await?;
+    if !job_authority::projection_allowed(&txn, &claimed.model).await.unwrap_or(false) {
+        if source == ObservationSource::ProviderObserved && let Some(observation) = typed {
+            admission::append_nonprojecting_observation(&txn, claimed, observation, observation_time).await?;
+        }
+        jobs::finish_nonprojecting_job(&txn, claimed, true, observation_time).await?;
+        txn.commit().await?;
+        return Ok(PersistObservationResult::StaleClaim);
+    }
     let cluster = crate::store::entities::pin_replica_observation::receipt::is_cluster(
         &txn,
         &claimed.model.id,
@@ -1941,12 +2043,9 @@ async fn execute_unpin(
         &mut claimed,
         coordinator.settings().lock_for,
         cancellation,
+        ManagedCall::Cleanup,
         move || async move {
-            Ok(crate::store::pinning::ledger::job_route_matches(
-                store.db(),
-                &preflight_job,
-                coordinator.provider_identity(&preflight_job.provider),
-            )
+            Ok(worker_job_route_matches(store, coordinator, &preflight_job)
             .await?
                 && current_unpin_request(store, &preflight_job)
                     .await?
@@ -1973,6 +2072,31 @@ async fn execute_unpin(
         }) => {
             let now = Utc::now();
             let txn = store.db().begin().await?;
+            let authority = job_authority::lookup(&txn, &claimed.model).await;
+            // A lookup failure must not fall through as ordinary cleanup. Keep
+            // the real response first; only B's cleanup-specific live permit can
+            // settle a managed release under the existing native claim/epoch.
+            let managed = !matches!(&authority, Ok(None));
+            if managed {
+                admission::append_nonprojecting_delete_acknowledgement(&txn, &claimed, now).await?;
+            }
+            // Commit the actual managed response before a mutable claim/lifetime
+            // settlement. A later native CAS/DB error must not erase the ACK.
+            let txn = if managed {
+                txn.commit().await?;
+                store.db().begin().await?
+            } else { txn };
+            let authority = if managed { job_authority::lookup(&txn, &claimed.model).await } else { authority };
+            let settlement = match authority {
+                Ok(None) if !managed => true, // Ordinary cleanup retains its original native fences.
+                Ok(Some(_)) => job_authority::cleanup_settlement_allowed(&txn, &claimed.model).await.unwrap_or(false),
+                _ => false,
+            };
+            if !settlement {
+                jobs::finish_nonprojecting_job(&txn, &claimed, true, now).await?;
+                txn.commit().await?;
+                return Ok(());
+            }
             if !jobs::fence_job_claim(&txn, &claimed.model.id, claimed_lock(&claimed)?).await? {
                 txn.rollback().await?;
                 transition(
@@ -2011,6 +2135,23 @@ async fn execute_unpin(
             Ok(())
         }
         Err(error) => {
+            let txn = store.db().begin().await?;
+            let authority = job_authority::lookup(&txn, &claimed.model).await;
+            if !matches!(&authority, Ok(None)) {
+                admission::append_nonprojecting_delete_error(&txn, &claimed, &error, Utc::now()).await?;
+                txn.commit().await?;
+                let txn = store.db().begin().await?;
+                let settlement = authority.is_ok()
+                    && job_authority::cleanup_settlement_allowed(&txn, &claimed.model).await.unwrap_or(false);
+                if !settlement {
+                    jobs::finish_nonprojecting_job(&txn, &claimed, true, Utc::now()).await?;
+                    txn.commit().await?;
+                    return Ok(());
+                }
+                txn.commit().await?;
+            } else {
+                txn.commit().await?;
+            }
             retry_ordinary_job(store, coordinator, &claimed, &error, Some(&request_id)).await
         }
     }
@@ -2036,6 +2177,11 @@ async fn execute_reconcile(
     claimed: ClaimedPinJob,
     cancellation: &CancellationToken,
 ) -> AppResult<()> {
+    if let Some(JobPermit::ReadOnly(authority) | JobPermit::LedgerOnly(authority)) =
+        job_authority::check_before_call(store.db(), &claimed.model).await?
+    {
+        return execute_management_observation(store, coordinator, global, claimed, authority, cancellation).await;
+    }
     let expected_epoch = claimed
         .model
         .expected_remote_epoch
@@ -2474,12 +2620,9 @@ async fn reconcile_failed(
         &mut claimed,
         coordinator.settings().lock_for,
         cancellation,
+        ManagedCall::Cleanup,
         move || async move {
-            Ok(crate::store::pinning::ledger::job_route_matches(
-                store.db(),
-                &preflight_job,
-                coordinator.provider_identity(&preflight_job.provider),
-            )
+            Ok(worker_job_route_matches(store, coordinator, &preflight_job)
             .await?
                 && failed_delete_is_current(
                     store,
@@ -2558,6 +2701,12 @@ async fn failed_delete_is_current(
     request_id: &str,
     now: DateTime<Utc>,
 ) -> AppResult<bool> {
+    if let Some(original) = ledger::job_route(store.db(), &job.id).await?
+        && crate::store::pinning::management::admission::registration_closed(store.db(), &original).await? {
+        // This DELETE is a prelude to a new Submit, not a pre-existing cleanup
+        // responsibility. Retirement never widens remote deletion authority.
+        return Ok(false);
+    }
     let Some(snapshot) = leases::remote_work_snapshot(store.db(), &job.provider, &job.cid).await?
     else {
         return Ok(false);
@@ -2975,10 +3124,15 @@ async fn acquire_provider_slot(
         return Ok(None);
     }
     let provider_name = &claimed.model.provider;
+    let verified = verified_job_route(store, &claimed.model).await?;
+    let runtime_key = if let Some(route) = &verified {
+        coordinator.historical_runtime_key(provider_name, route)
+            .ok_or_else(|| AppError::InvalidPinningRequest("historical route needs attention".into()))?
+    } else { provider_name.as_str() };
     let mut provider = coordinator
-        .provider(provider_name)
+        .provider(runtime_key)
         .ok_or_else(|| AppError::Internal(format!("unknown pinning provider `{provider_name}`")))?;
-    let route = if claimed.model.operation == "submit" {
+    let route = if verified.is_some() { verified } else if claimed.model.operation == "submit" {
         crate::store::pinning::ledger::get(store.db(), provider_name, &claimed.model.cid)
             .await?
             .as_ref()
@@ -2992,7 +3146,7 @@ async fn acquire_provider_slot(
                 .effective_config()
                 .providers
                 .iter()
-                .find(|provider| provider.name == *provider_name)
+                .find(|provider| provider.name == runtime_key)
                 .cloned()
                 .ok_or_else(|| {
                     AppError::Internal("Cluster historical provider unavailable".into())
@@ -3049,7 +3203,7 @@ async fn acquire_provider_slot(
         });
     }
     let runtime = coordinator
-        .provider_runtime(provider_name)
+        .provider_runtime(runtime_key)
         .cloned()
         .ok_or_else(|| {
             AppError::Internal(format!(
@@ -3071,6 +3225,31 @@ async fn acquire_provider_slot(
         _provider_permit: provider_permit,
         health_observed_by_call: false,
     }))
+}
+
+async fn verified_job_route(store: &Store, job: &pin_job::Model) -> AppResult<Option<crate::pinning::identity::ProviderRouteSnapshot>> {
+    if let Some(authority) = job_authority::lookup(store.db(), job).await
+        .map_err(|_| AppError::InvalidPinningRequest("historical management route needs attention".into()))?
+    { return Ok(Some(authority.route)); }
+    let (Some(lease), Some(target_id)) = (&job.lease_id, &job.target_id) else { return Ok(None); };
+    let Some(birth) = crate::store::entities::pin_lease_requirement::contract::get(store.db(), lease).await? else { return Ok(None); };
+    let candidates = crate::store::pinning::management::actions::points::candidates_for_cid(store.db(), lease, &job.cid, &birth)
+        .await.map_err(|_| AppError::InvalidPinningRequest("invalid exact management invocation point".into()))?;
+    let mut proven = None;
+    for (_, allocation, point) in candidates {
+        let Some(point) = point else { continue; };
+        if point.destination_target_id != *target_id || allocation != job.provider { continue; }
+        let target = pin_lease_target::Entity::find_by_id(target_id.clone()).one(store.db()).await?
+            .ok_or_else(|| AppError::InvalidPinningRequest("management invocation target is missing".into()))?;
+        let captured = ledger::job_route(store.db(), &job.id).await?
+            .ok_or_else(|| AppError::InvalidPinningRequest("management invocation route is missing".into()))?;
+        if target.lease_id != *lease || target.provider != job.provider || target.cid != job.cid
+            || !(captured == point.destination_route || (point.source_allocation == point.destination_allocation && captured == point.source_resource_route))
+            || proven.is_some()
+        { return Err(AppError::InvalidPinningRequest("management invocation point changed".into())); }
+        proven = Some(captured);
+    }
+    Ok(proven)
 }
 
 enum ClaimWait<T> {
@@ -3117,6 +3296,7 @@ async fn provider_call_with_heartbeat<T, P, PFut, F, Fut>(
     claimed: &mut ClaimedPinJob,
     lock_for: ChronoDuration,
     cancellation: &CancellationToken,
+    managed_call: ManagedCall,
     preflight: P,
     call: F,
 ) -> AppResult<ProviderCallOutcome<T>>
@@ -3127,6 +3307,9 @@ where
     Fut: Future<Output = Result<T, ProviderError>>,
 {
     renew_claim_once(store, claimed, lock_for).await?;
+    if !admission::managed_call_allowed(store.db(), &claimed.model, managed_call).await? {
+        return Ok(ProviderCallOutcome::PreflightRejected);
+    }
     let rate_lock = slot.runtime.next_request_at.clone().lock_owned();
     let ClaimWait::Ready(mut rate_gate) =
         wait_with_claim_heartbeat(store, claimed, lock_for, cancellation, rate_lock).await?
@@ -3172,6 +3355,9 @@ where
     // Revalidate the exact durable claim after every wait and the operation preflight,
     // immediately before reserving the rate start and beginning HTTP.
     renew_claim_once(store, claimed, lock_for).await?;
+    if !admission::managed_call_allowed(store.db(), &claimed.model, managed_call).await? {
+        return Ok(ProviderCallOutcome::PreflightRejected);
+    }
     if *slot.runtime.health.read().await == ProviderHealth::Terminal {
         return Ok(ProviderCallOutcome::Completed(Err(terminal_health_error())));
     }
@@ -3186,11 +3372,13 @@ where
     let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + heartbeat, heartbeat);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let provider = slot.provider.clone();
+    let managed_receipt = job_authority::lookup(store.db(), &claimed.model).await
+        .map_err(|_| AppError::InvalidPinningRequest("management invocation authority is invalid; needs attention".into()))?.is_some();
     let mut future = Box::pin(call(provider));
     // A dispatched Submit must finish collecting its structured evidence even
     // when a claim is lost. Its caller appends evidence under the old invocation
     // and independently refuses projection into a new claim/lifetime.
-    let retain_receipt = (claimed.model.operation == "submit"
+    let retain_receipt = managed_receipt || (claimed.model.operation == "submit"
         && ledger::submission::is_rpc_api(slot.provider.invocation_route().0))
         || (claimed.model.operation == "poll"
             && crate::store::entities::pin_replica_observation::receipt::is_cluster(
@@ -3409,9 +3597,7 @@ async fn coordinate_failed_one_outcomes(
         else {
             continue;
         };
-        let Some(providers) = coordinator
-            .ordered_failover_providers(&lease.policy_id, &target.provider)
-            .await
+        let Some(providers) = ordered_target_failover(store, coordinator, &lease, &target.cid, &target.provider).await?
         else {
             tracing::warn!(
                 lease_id = %lease.id,
@@ -3543,9 +3729,7 @@ async fn coordinate_claimed_one_target(
     if lease.provider_mode != "one" {
         return Ok(ClaimedOneCoordination::Current);
     }
-    let Some(providers) = coordinator
-        .ordered_failover_providers(&lease.policy_id, &target.provider)
-        .await
+    let Some(providers) = ordered_target_failover(store, coordinator, &lease, &target.cid, &target.provider).await?
     else {
         return Ok(ClaimedOneCoordination::Current);
     };
@@ -3605,6 +3789,7 @@ async fn wake_provider_waiters_after_release(
     provider: &str,
     now: DateTime<Utc>,
 ) -> AppResult<Vec<String>> {
+    if provider_domain_closed(store, provider).await? { return Ok(Vec::new()); }
     let Some(limits) = coordinator.provider_limits().get(provider) else {
         return Ok(Vec::new());
     };
@@ -3638,6 +3823,9 @@ async fn coordinate_quota_waiters(
         .map(|(provider, limits)| (provider.clone(), limits.clone()))
         .collect::<Vec<_>>();
     for (provider, limits) in providers {
+        // A permanently closed waiter is not capacity pressure or permission to
+        // evict existing references. Do not let it poison unrelated queue scans.
+        if provider_domain_closed(store, &provider).await? { continue; }
         let txn = store.db().begin().await?;
         leases::requeue_released_all_quota_targets(&txn, &provider, retry_delay, now).await?;
         txn.commit().await?;
@@ -3662,6 +3850,14 @@ async fn coordinate_quota_waiters(
         coordinate_quota_evicted_one_targets(store, coordinator, &evicted, now).await?;
     }
     Ok(())
+}
+
+async fn provider_domain_closed(store: &Store, provider: &str) -> AppResult<bool> {
+    let Some(registered) = pin_provider_route::Entity::find_by_id(provider.to_owned()).one(store.db()).await?
+        else { return Ok(false); }; // The final admission path still rejects unproved missing registrations.
+    let original = serde_json::from_str(&registered.snapshot)
+        .map_err(|_| AppError::InvalidPinningRequest("retirement attribution needs attention".into()))?;
+    admission::registration_closed(store.db(), &original).await
 }
 
 async fn recover_quota_evicted_one_targets(
@@ -3712,9 +3908,7 @@ async fn coordinate_quota_evicted_one_targets(
         else {
             continue;
         };
-        let Some(providers) = coordinator
-            .ordered_failover_providers(&lease.policy_id, &target.provider)
-            .await
+        let Some(providers) = ordered_target_failover(store, coordinator, &lease, &target.cid, &target.provider).await?
         else {
             continue;
         };
@@ -3731,6 +3925,23 @@ async fn coordinate_quota_evicted_one_targets(
         txn.commit().await?;
     }
     Ok(())
+}
+
+async fn ordered_target_failover(
+    store: &Store, coordinator: &PinningCoordinator, lease: &pin_lease::Model,
+    cid: &str, failed: &str,
+) -> AppResult<Option<Vec<String>>> {
+    let frozen = crate::store::pinning::management::actions::points::failover_candidates(store.db(), &lease.id, cid, failed)
+        .await.map_err(|_| AppError::InvalidPinningRequest("exact management fallback point needs attention".into()))?;
+    let Some(frozen) = frozen else { return Ok(coordinator.ordered_failover_providers(&lease.policy_id, failed).await); };
+    let mut eligible = vec![failed.to_owned()];
+    for provider in frozen.into_iter().skip(1) {
+        if coordinator.provider_limits().get(&provider).is_some_and(|limits| limits.enabled)
+            && let Some(runtime) = coordinator.provider_runtime(&provider)
+            && *runtime.health.read().await == ProviderHealth::Healthy
+        { eligible.push(provider); }
+    }
+    Ok(Some(eligible))
 }
 
 fn transition(claimed: &ClaimedPinJob, old_state: &str, new_state: &str, request_id: Option<&str>) {

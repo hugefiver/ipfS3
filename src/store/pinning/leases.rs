@@ -974,6 +974,7 @@ async fn project_target_from_remote_inner<C: ConnectionTrait>(
     expected_remote_epoch: Option<i64>,
     now: DateTimeUtc,
 ) -> AppResult<Option<TargetProjection>> {
+    super::management::admission::lock_sqlite_writer_in_caller_transaction(db).await?;
     let Some(target) = pin_lease_target::Entity::find_by_id(target_id.to_owned())
         .one(db)
         .await?
@@ -1178,6 +1179,7 @@ pub async fn project_target_from_remote_with_limits<C: ConnectionTrait>(
     limits: &ProviderLimitMap,
     now: DateTimeUtc,
 ) -> AppResult<LimitsAwareTargetProjection> {
+    super::management::admission::lock_sqlite_writer_in_caller_transaction(db).await?;
     let Some(target) = pin_lease_target::Entity::find_by_id(target_id.to_owned())
         .one(db)
         .await?
@@ -1278,6 +1280,7 @@ pub(crate) async fn wake_quota_waiting_targets<C: ConnectionTrait>(
     limits: &ProviderLimits,
     now: DateTimeUtc,
 ) -> AppResult<Vec<String>> {
+    super::management::admission::lock_sqlite_writer_in_caller_transaction(db).await?;
     let waiting = pin_lease_target::Entity::find()
         .filter(pin_lease_target::Column::Provider.eq(provider))
         .filter(pin_lease_target::Column::State.eq(TARGET_QUOTA_WAITING))
@@ -1589,6 +1592,11 @@ async fn apply_remote_status_inner<C: ConnectionTrait>(
         }
         if let Some(job) = observation_job
             && !super::ledger::submission::projection_allowed(db, job, &snapshot.remote).await?
+        {
+            return Ok(RemoteStatusApplyResult::StaleRequest);
+        }
+        if let Some(job) = observation_job
+            && !super::management::actions::job_authority::projection_allowed(db, job).await?
         {
             return Ok(RemoteStatusApplyResult::StaleRequest);
         }
@@ -2419,6 +2427,7 @@ pub async fn prepare_failed_remote_resubmit<C: ConnectionTrait>(
     expected_request_id: &str,
     now: DateTimeUtc,
 ) -> AppResult<FailedRemoteResubmitDecision> {
+    super::management::admission::lock_sqlite_writer_in_caller_transaction(db).await?;
     let snapshot = match ordered_desired_lifecycle_snapshot(db, provider, cid).await? {
         OrderedDesiredLifecycleSnapshotOutcome::Current(snapshot) => snapshot,
         OrderedDesiredLifecycleSnapshotOutcome::Stale
@@ -2446,6 +2455,7 @@ pub async fn prepare_failed_remote_resubmit<C: ConnectionTrait>(
     }
     // A historical Reconcile may inspect its captured request, but a new
     // Submit needs today's matching allocation route.
+    quota::lock_allocation_admission(db, provider).await?;
     quota::assert_reusable_route(db, provider, cid).await?;
 
     let new_epoch = increment_epoch(remote.epoch)?;
@@ -2538,10 +2548,38 @@ pub async fn prepare_failed_remote_resubmit<C: ConnectionTrait>(
     })
 }
 
+/// Fresh Submit crosses admission before its job/history tail is locked. A
+/// reclaimed invocation instead follows the existing read-only recovery path.
+pub(crate) async fn lock_submit_admission_frontier(
+    tx: &DatabaseTransaction,
+    job: &pin_job::Model,
+) -> AppResult<()> {
+    super::management::admission::lock_sqlite_writer_in_caller_transaction(tx).await?;
+    match ordered_desired_lifecycle_snapshot(tx, &job.provider, &job.cid).await? {
+        OrderedDesiredLifecycleSnapshotOutcome::Current(snapshot) => {
+            if !snapshot.desired.iter().any(|desired|
+                Some(desired.target.id.as_str()) == job.target_id.as_deref()
+                && Some(desired.lease.id.as_str()) == job.lease_id.as_deref()
+                && Some(desired.lease.generation) == job.expected_generation) {
+                // The original prepare path completes/reconciles stale work;
+                // it cannot dispatch without a matching desired generation.
+                return Ok(());
+            }
+            quota::lock_allocation_admission(tx, &job.provider).await
+        }
+        OrderedDesiredLifecycleSnapshotOutcome::Stale => {
+            Err(stale_lifecycle_error("Submit admission frontier"))
+        }
+        OrderedDesiredLifecycleSnapshotOutcome::MissingRemote => Ok(()),
+    }
+}
+
 /// Renews only a manual lease still owned by the supplied immutable latest object.
 ///
 /// The caller must pass its transaction when renewal is coupled with other state changes. This
 /// function deliberately never opens, commits, or rolls back an independent transaction.
+/// The generic compatibility signature cannot retain an admission lock on a bare
+/// connection; gateway tag replacement supplies its existing version transaction.
 pub async fn renew_manual_lease<C: ConnectionTrait>(
     db: &C,
     owner_object_id: &str,
@@ -2664,6 +2702,65 @@ async fn renew_manual_lease_for_owner<C: ConnectionTrait>(
         generation,
         restored_target_ids,
     })
+}
+
+/// Management apply has already locked the complete native renewal frontier in
+/// this transaction. Re-read it without restarting owner → lifecycle lock order.
+/// This extends an exact active source; it is not manual-slot reactivation.
+pub(crate) async fn renew_confirmed_lease_in_transaction(
+    tx: &DatabaseTransaction,
+    lease: &pin_lease::Model,
+    expiry: DateTimeUtc,
+    now: DateTimeUtc,
+) -> AppResult<ManualLeaseRenewalOutcome> {
+    if lease.state != LEASE_ACTIVE || lease.expires_at <= now || expiry < lease.expires_at {
+        return Err(invalid("confirmed renewal requires an unexpired exact active lease"));
+    }
+    let snapshot = renewal_snapshot_inner(
+        tx, &lease.owner_object_id, &lease.id, ManualLeaseOwnerScope::RetainedVersion, true,
+    ).await.map_err(confirmed_renewal_error)?;
+    if snapshot.lease != *lease {
+        return Err(stale_lifecycle_error("confirmed renewal lease tuple"));
+    }
+    revalidate_renewal_snapshot(tx, &snapshot).await.map_err(confirmed_renewal_error)?;
+    // Use the original database text in the full-tuple CAS. In particular, do not
+    // round/re-encode created_at or use a generation/signature as the entire fence.
+    let columns = ["id", "owner_object_id", "source", "policy_id", "provider_mode",
+        "content_mode", "created_at", "last_touched_at", "expires_at", "generation", "state"];
+    let select = columns.iter().map(|column| format!("CAST(\"{column}\" AS TEXT) AS \"{column}\""))
+        .collect::<Vec<_>>().join(",");
+    let original = tx.query_one(sea_orm::Statement::from_sql_and_values(tx.get_database_backend(),
+        format!("SELECT {select} FROM pin_leases WHERE id=$1"), [lease.id.clone().into()]))
+        .await?.ok_or_else(|| stale_lifecycle_error("confirmed renewal native tuple"))?;
+    guard_renewal_owner(tx, &snapshot.owner, ManualLeaseOwnerScope::RetainedVersion)
+        .await.map_err(confirmed_renewal_error)?;
+    let generation = if expiry == lease.expires_at { lease.generation } else { increment_epoch(lease.generation)? };
+    let kept = expiry == lease.expires_at;
+    let mut values: Vec<sea_orm::Value> = if kept { Vec::new() } else {
+        vec![generation.into(), expiry.into(), lease.last_touched_at.max(now).into()]
+    };
+    let mut predicates = Vec::new();
+    for (index, column) in columns.iter().enumerate() {
+        values.push(original.try_get::<String>("", column)?.into());
+        predicates.push(format!("CAST(\"{column}\" AS TEXT)=${}", index + if kept { 1 } else { 4 }));
+    }
+    let assignments = if kept { "state=state" } else { "generation=$1,expires_at=$2,last_touched_at=$3" };
+    let changed = tx.execute(sea_orm::Statement::from_sql_and_values(tx.get_database_backend(),
+        format!("UPDATE pin_leases SET {assignments} WHERE {}", predicates.join(" AND ")), values)).await?;
+    if changed.rows_affected() != 1 { return Err(stale_lifecycle_error("confirmed renewal full tuple CAS")); }
+    if expiry == lease.expires_at { return Ok(ManualLeaseRenewalOutcome::Kept { generation }); }
+    let targets = snapshot.targets.iter().filter(|target| is_desired_target_state(&target.state))
+        .cloned().collect::<Vec<_>>();
+    refresh_renewal_snapshot_targets(tx, &snapshot, generation, &targets, now)
+        .await.map_err(confirmed_renewal_error)?;
+    Ok(ManualLeaseRenewalOutcome::Extended { generation })
+}
+
+fn confirmed_renewal_error(error: RenewManualLeaseError) -> AppError {
+    match error {
+        RenewManualLeaseError::Database(error) => error.into(),
+        _ => invalid("confirmed renewal frontier changed; needs attention"),
+    }
 }
 
 #[derive(Clone)]
@@ -2842,6 +2939,18 @@ async fn renewal_snapshot<C: ConnectionTrait>(
     lease_id: &str,
     owner_scope: ManualLeaseOwnerScope,
 ) -> Result<RenewalSnapshot, RenewManualLeaseError> {
+    renewal_snapshot_inner(db, owner_object_id, lease_id, owner_scope, false).await
+}
+
+async fn renewal_snapshot_inner<C: ConnectionTrait>(
+    db: &C,
+    owner_object_id: &str,
+    lease_id: &str,
+    owner_scope: ManualLeaseOwnerScope,
+    prelocked: bool,
+) -> Result<RenewalSnapshot, RenewManualLeaseError> {
+    super::management::admission::lock_sqlite_writer_in_caller_transaction(db)
+        .await.map_err(app_to_renewal_error)?;
     let Some(owner) = object::Entity::find_by_id(owner_object_id.to_owned())
         .one(db)
         .await?
@@ -2891,15 +3000,15 @@ async fn renewal_snapshot<C: ConnectionTrait>(
     discovered_targets.sort_by(compare_target_order);
 
     // The owner is always the first lifecycle lock. PostgreSQL keeps this exact FOR UPDATE row
-    // lock through the caller-owned transaction; SQLite defers its no-op CAS to the final guard
-    // so unrelated writers can still resolve the snapshot before a renewal mutates anything.
-    let owner = lock_renewal_owner(db, &owner, owner_scope).await?;
+    // lock through the caller-owned transaction; SQLite acquired writer intent
+    // before discovery. The final native owner/lease CAS remains unchanged.
+    let owner = if prelocked { owner } else { lock_renewal_owner(db, &owner, owner_scope).await? };
     let mut lifecycle_leases = BTreeMap::new();
     for (id, expected) in &discovered_leases {
-        let locked = lock_lifecycle_lease(db, expected, false)
-            .await
-            .map_err(RenewManualLeaseError::Database)?
-            .ok_or_else(stale_renewal_error)?;
+        let locked = if prelocked { expected.clone() } else {
+            lock_lifecycle_lease(db, expected, false).await
+                .map_err(RenewManualLeaseError::Database)?.ok_or_else(stale_renewal_error)?
+        };
         if locked.id != *id {
             return Err(stale_renewal_error());
         }
@@ -2910,10 +3019,10 @@ async fn renewal_snapshot<C: ConnectionTrait>(
         let Some(_lease) = lifecycle_leases.get(&expected.lease_id) else {
             return Err(stale_renewal_error());
         };
-        let locked = lock_lifecycle_target(db, expected, false)
-            .await
-            .map_err(RenewManualLeaseError::Database)?
-            .ok_or_else(stale_renewal_error)?;
+        let locked = if prelocked { expected.clone() } else {
+            lock_lifecycle_target(db, expected, false).await
+                .map_err(RenewManualLeaseError::Database)?.ok_or_else(stale_renewal_error)?
+        };
         lifecycle_targets.push(locked);
     }
     lifecycle_targets.sort_by(compare_target_order);
@@ -2939,12 +3048,33 @@ async fn renewal_snapshot<C: ConnectionTrait>(
     let mut usage = std::collections::BTreeMap::new();
     let mut unpin_jobs = Vec::new();
     for (provider, cid) in &pairs {
-        if let Some(remote) = lock_remote_after_lifecycle(db, provider, cid).await? {
+        let remote = if prelocked {
+            remote_pin::Entity::find_by_id((provider.clone(), cid.clone())).one(db).await?
+        } else { lock_remote_after_lifecycle(db, provider, cid).await? };
+        if let Some(remote) = remote {
             remotes.insert((provider.clone(), cid.clone()), remote);
         }
     }
-    // All remotes precede usage and jobs in the renewal lock order. Interleaving an unpin-job
-    // lock with the next remote would otherwise invert two concurrent multi-target renewals.
+    // Usage and permanent admission precede the job/history tail. Never wait on
+    // a job while holding an earlier lifecycle row a job-first worker may need.
+    for provider in &providers {
+        let usage_query = crate::store::entities::pin_provider_usage::Entity::find_by_id(provider.clone());
+        let row = if !prelocked && db.get_database_backend() == DatabaseBackend::Postgres {
+            usage_query.lock_exclusive().one(db).await?
+        } else {
+            usage_query.one(db).await?
+        };
+        usage.insert(provider.clone(), row);
+    }
+    for provider in &providers {
+        if prelocked {
+            super::management::admission::check_provider_open(db, provider)
+                .await.map_err(app_to_renewal_error)?;
+        } else {
+            super::management::admission::lock_provider_in_caller_transaction(db, provider)
+                .await.map_err(app_to_renewal_error)?;
+        }
+    }
     for (provider, cid) in &pairs {
         let jobs_query = pin_job::Entity::find()
             .filter(pin_job::Column::Provider.eq(provider))
@@ -2952,22 +3082,12 @@ async fn renewal_snapshot<C: ConnectionTrait>(
             .filter(pin_job::Column::Operation.eq("unpin"))
             .filter(pin_job::Column::State.is_in([JOB_PENDING, JOB_RUNNING]))
             .order_by_asc(pin_job::Column::Id);
-        let mut jobs = if db.get_database_backend() == DatabaseBackend::Postgres {
-            jobs_query.lock_exclusive().all(db).await?
+        let mut jobs = if !prelocked && db.get_database_backend() == DatabaseBackend::Postgres {
+            jobs_query.lock_with_behavior(sea_orm::sea_query::LockType::Update, sea_orm::sea_query::LockBehavior::Nowait).all(db).await?
         } else {
             jobs_query.all(db).await?
         };
         unpin_jobs.append(&mut jobs);
-    }
-    for provider in providers {
-        let usage_query =
-            crate::store::entities::pin_provider_usage::Entity::find_by_id(provider.clone());
-        let row = if db.get_database_backend() == DatabaseBackend::Postgres {
-            usage_query.lock_exclusive().one(db).await?
-        } else {
-            usage_query.one(db).await?
-        };
-        usage.insert(provider, row);
     }
     Ok(RenewalSnapshot {
         owner,
@@ -3412,12 +3532,23 @@ pub async fn touch_target_reference<C: ConnectionTrait>(
     target_id: &str,
     now: DateTimeUtc,
 ) -> AppResult<GenerationDecision> {
+    super::management::admission::lock_sqlite_writer_in_caller_transaction(db).await?;
     let Some(target) = pin_lease_target::Entity::find_by_id(target_id.to_owned())
         .one(db)
         .await?
     else {
         return Ok(GenerationDecision::Stale);
     };
+    let snapshot = match ordered_desired_lifecycle_snapshot(db, &target.provider, &target.cid).await? {
+        OrderedDesiredLifecycleSnapshotOutcome::Current(snapshot) => snapshot,
+        OrderedDesiredLifecycleSnapshotOutcome::Stale | OrderedDesiredLifecycleSnapshotOutcome::MissingRemote => {
+            return Ok(GenerationDecision::Stale);
+        }
+    };
+    if !snapshot.desired.iter().any(|desired| desired.target.id == target_id) {
+        return Ok(GenerationDecision::NoLongerNeeded);
+    }
+    quota::lock_allocation_admission(db, &target.provider).await?;
     if !matches!(
         check_target_generation(
             db,
@@ -3696,6 +3827,7 @@ pub async fn failover_target_if_feasible<C: ConnectionTrait>(
     replacement_target_id: &str,
     now: DateTimeUtc,
 ) -> AppResult<GenerationDecision> {
+    super::management::admission::lock_sqlite_writer_in_caller_transaction(db).await?;
     let Some(lease) = pin_lease::Entity::find_by_id(lease_id.to_owned())
         .one(db)
         .await?
@@ -3839,6 +3971,7 @@ pub(crate) async fn fail_one_target_for_job<C: ConnectionTrait>(
     limits: &ProviderLimitMap,
     now: DateTimeUtc,
 ) -> AppResult<TargetJobFailoverOutcome> {
+    super::management::admission::lock_sqlite_writer_in_caller_transaction(db).await?;
     let (Some(lease_id), Some(target_id), Some(expected_generation)) = (
         job.lease_id.as_deref(),
         job.target_id.as_deref(),
@@ -3910,6 +4043,7 @@ async fn fail_one_target_at_generation<C: ConnectionTrait>(
     now: DateTimeUtc,
     expected_generation: Option<i64>,
 ) -> AppResult<Option<pin_lease_target::Model>> {
+    super::management::admission::lock_sqlite_writer_in_caller_transaction(db).await?;
     let Some(lease) = pin_lease::Entity::find_by_id(lease_id.to_owned())
         .one(db)
         .await?
@@ -3948,7 +4082,11 @@ async fn fail_one_target_at_generation<C: ConnectionTrait>(
     let birth = crate::store::entities::pin_lease_requirement::contract::get(db, lease_id).await?;
     let mut allowed = BTreeSet::new();
     if let Some(birth) = &birth {
-        for (provider, original) in &birth.candidates {
+        let points = super::management::actions::points::candidates_for_cid(db, lease_id, &failed.cid, birth)
+            .await.map_err(|_| invalid("invalid exact management fallback point"))?;
+        for (slot, provider, point) in &points {
+            let original = point.as_ref().map(|point| &point.destination_route)
+                .or_else(|| birth.candidates.get(slot).and_then(Option::as_ref));
             if let Some(original) = original
                 && pin_provider_route::Entity::find_by_id(provider.clone())
                     .one(db)
@@ -4075,6 +4213,13 @@ async fn fail_one_target_at_generation<C: ConnectionTrait>(
 
     let mut selected = None;
     for provider in candidates {
+        if let Some(route) = crate::store::entities::pin_provider_route::Entity::find_by_id(provider.clone()).one(db).await? {
+            let original = serde_json::from_str::<crate::pinning::identity::ProviderRouteSnapshot>(&route.snapshot)
+                .map_err(|_| invalid("retirement attribution needs attention; fallback denied"))?;
+            if super::management::admission::registration_closed(db, &original).await? {
+                continue;
+            }
+        }
         let cid = &candidate_cids[&provider];
         if candidate_remotes
             .get(&(provider.clone(), cid.clone()))
@@ -4398,6 +4543,7 @@ async fn ordered_desired_lifecycle_snapshot<C: ConnectionTrait>(
     provider: &str,
     cid: &str,
 ) -> AppResult<OrderedDesiredLifecycleSnapshotOutcome> {
+    super::management::admission::lock_sqlite_writer_in_caller_transaction(db).await?;
     let candidates = desired_targets(db, provider, cid).await?;
 
     let mut candidate_leases = BTreeMap::new();
@@ -4704,6 +4850,7 @@ async fn project_prelocked_desired_target<C: ConnectionTrait>(
     // cannot invalidate a captured, already-fenced provider response either.
     let schedule_work = match access {
         ProjectionAccess::Admission => {
+            quota::lock_allocation_admission(db, &desired.target.provider).await?;
             quota::assert_reusable_route(db, &desired.target.provider, &desired.target.cid).await?;
             true
         }
@@ -4920,6 +5067,13 @@ async fn ensure_prelocked_target_job<C: ConnectionTrait>(
         jobs::TargetJobOperation::Submit => Some("ready"),
         jobs::TargetJobOperation::Poll => None,
     };
+    if submit_phase.is_some() {
+        quota::lock_allocation_admission(db, &job.provider).await?;
+    }
+    if db.get_database_backend() == DatabaseBackend::Postgres {
+        db.query_one(sea_orm::Statement::from_sql_and_values(db.get_database_backend(),
+            "SELECT id FROM pin_jobs WHERE id=$1 FOR UPDATE NOWAIT", [job.id.clone().into()])).await?;
+    }
     let Some(existing) = pin_job::Entity::find_by_id(job.id.clone()).one(db).await? else {
         jobs::insert_new_job(db, NewPinJob::Target(job), now).await?;
         return Ok(());

@@ -2,6 +2,7 @@ pub mod add;
 pub mod cat;
 pub mod client;
 pub mod directory;
+mod directoryproof;
 pub mod health;
 pub mod pin;
 pub mod routing;
@@ -10,6 +11,7 @@ pub mod verification;
 
 pub use client::KuboClient;
 pub use verification::LocalResidencyVerificationReceipt;
+pub use directoryproof::{DirectoryProofBudgets, LocalDirectoryRootKind, LocalDirectoryVerificationReceipt};
 
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};

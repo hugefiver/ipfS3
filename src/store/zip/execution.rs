@@ -196,6 +196,7 @@ fn same_request(snapshot: &Snapshot, request: &Admission) -> bool {
 /// the caller must read the complete ZIP then compare its SHA-256 with this row.
 pub async fn admit(db: &DatabaseConnection, request: &Admission) -> AppResult<Snapshot> {
     let tx = db.begin().await?;
+    ownership::lock_bucket_for_ownership(&tx, &request.bucket).await?;
     let snapshot = admit_in_transaction(&tx, request).await?;
     tx.commit().await?;
     Ok(snapshot)
@@ -227,6 +228,9 @@ pub async fn admit_in_transaction(
         || serde_json::from_str::<serde_json::Value>(&request.captured_options).is_err()
     {
         return Err(invalid());
+    }
+    if read_by_identity(tx, &request.owner, &request.source, &request.token).await?.is_none() {
+        crate::store::pinning::management::admission::lock_encoded_zip_intake_in_transaction(tx, &request.captured_options).await?;
     }
     let now = database_now(tx).await?;
     tx.execute(statement(tx,

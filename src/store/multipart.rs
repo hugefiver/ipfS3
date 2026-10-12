@@ -142,6 +142,7 @@ pub async fn create_upload_with_zip_intent<C: ConnectionTrait>(
         })
         .transpose()?;
     let created_at = crate::store::database_clock::database_now(db).await?;
+    crate::store::pinning::management::admission::lock_intake_in_caller_transaction(db, decision, zip_intent).await?;
     let model = multipart_upload::ActiveModel {
         upload_id: Set(upload_id.to_owned()),
         object_id: Set(object_id.to_owned()),

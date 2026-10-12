@@ -559,6 +559,7 @@ pub async fn admit(
     supported(db)?;
     validate_admission(request)?;
     let tx = db.begin().await?;
+    crate::store::import::ownership::lock_bucket_for_ownership(&tx, &request.bucket).await?;
     let found = insert_or_find(&tx, request, false).await?;
     tx.commit().await?;
     Ok(found)
@@ -628,6 +629,14 @@ async fn insert_or_find(
     request: &BatchAdmission,
     exact_mirror: bool,
 ) -> AppResult<zip_batch::Model> {
+    let is_new = zip_batch::Entity::find()
+        .filter(zip_batch::Column::Owner.eq(&request.owner))
+        .filter(zip_batch::Column::Source.eq(&request.source))
+        .filter(zip_batch::Column::Token.eq(&request.token))
+        .one(tx).await?.is_none();
+    if is_new {
+        crate::store::pinning::management::admission::lock_encoded_zip_intake_in_transaction(tx, &request.captured_options).await?;
+    }
     let now = Utc::now();
     zip_batch::Entity::insert(zip_batch::ActiveModel {
         id: Set(request.id.clone()),

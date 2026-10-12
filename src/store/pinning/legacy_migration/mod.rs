@@ -1,9 +1,12 @@
 //! Explicit, offline capacity migration. No provider clients or network authority.
+mod admission_schema;
 mod apply;
 mod closure_identity;
 mod compat;
 mod fence;
 mod inventory;
+mod management_closure;
+mod management_points;
 mod model;
 mod mutation;
 mod projection;
@@ -12,6 +15,7 @@ mod receipt_schema;
 mod resource_lifetime;
 mod snapshot;
 
+pub(crate) use admission_schema::admission_schema;
 pub use apply::{apply, rollback};
 pub use compat::{
     captured_provider, job_io_allowed, original_job_provider, release_history, resource_binding,

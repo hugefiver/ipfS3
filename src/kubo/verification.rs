@@ -55,9 +55,9 @@ impl KuboClient {
             .map_err(|_| AppError::kubo_rpc_detail("invalid CID for local verification"))?;
 
         let node_identity = self.local_node_identity().await?;
-        self.verify_recursive_pin(&expected_cid, cid).await?;
-        self.verify_complete_local_dag(&expected_cid, cid).await?;
-        self.verify_recursive_pin(&expected_cid, cid).await?;
+        self.verify_recursive_pin(&expected_cid, cid, self.http()).await?;
+        self.verify_complete_local_dag(&expected_cid, cid, self.http()).await?;
+        self.verify_recursive_pin(&expected_cid, cid, self.http()).await?;
 
         if self.local_node_identity().await? != node_identity {
             return Err(AppError::kubo_rpc_detail(
@@ -73,10 +73,11 @@ impl KuboClient {
         })
     }
 
-    async fn verify_recursive_pin(
+    pub(super) async fn verify_recursive_pin(
         &self,
         expected_cid: &cid::Cid,
         requested_cid: &str,
+        http: &reqwest::Client,
     ) -> AppResult<()> {
         let mut url = reqwest::Url::parse(&format!("{}/api/v0/pin/ls", self.base_url()))
             .map_err(|_| AppError::kubo_rpc_detail("invalid Kubo RPC URL"))?;
@@ -85,7 +86,7 @@ impl KuboClient {
             .append_pair("type", "recursive")
             .append_pair("offline", "true");
         let response: PinListResponse =
-            bounded_control_json(self.http().post(url), "local verification recursive pin").await?;
+            bounded_control_json(http.post(url), "local verification recursive pin").await?;
 
         if response.keys.len() != 1 {
             return Err(AppError::kubo_rpc_detail(
@@ -107,10 +108,11 @@ impl KuboClient {
         Ok(())
     }
 
-    async fn verify_complete_local_dag(
+    pub(super) async fn verify_complete_local_dag(
         &self,
         expected_cid: &cid::Cid,
         requested_cid: &str,
+        http: &reqwest::Client,
     ) -> AppResult<()> {
         let mut url = reqwest::Url::parse(&format!("{}/api/v0/files/stat", self.base_url()))
             .map_err(|_| AppError::kubo_rpc_detail("invalid Kubo RPC URL"))?;
@@ -120,7 +122,7 @@ impl KuboClient {
             .append_pair("with-local", "true")
             .append_pair("offline", "true");
         let response: LocalStatResponse =
-            bounded_control_json(self.http().post(url), "local verification DAG stat").await?;
+            bounded_control_json(http.post(url), "local verification DAG stat").await?;
 
         let reported_cid = cid::Cid::try_from(response.hash.as_str())
             .map_err(|_| AppError::kubo_rpc_detail("invalid Kubo local DAG response"))?;

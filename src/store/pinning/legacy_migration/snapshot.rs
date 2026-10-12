@@ -11,6 +11,10 @@ use std::collections::BTreeSet;
 const STAGE5: &str = "m20261004_000001_rpc_submission_ledger";
 const STAGE6: &str = "m20261004_000002_cluster_replica_contract";
 const ZIP_CAPTURE: &str = "m20261008_000001_zip_intent_capture";
+const MANAGEMENT: &str = crate::store::pinning::management::schema::VERSION;
+
+#[path = "snapshot_management.rs"]
+mod management_catalog;
 
 fn entity<E: EntityTrait + Default>() -> TableImage {
     let mut columns: Vec<_> = E::Column::iter().map(|c| Iden::to_string(&c)).collect();
@@ -36,8 +40,8 @@ fn raw(table: &str, columns: &str, pk: &str) -> TableImage {
     }
 }
 
-pub(super) fn tables() -> Vec<TableImage> {
-    vec![
+pub(super) fn tables(versions: &[String]) -> Vec<TableImage> {
+    let mut tables = vec![
         entity::<bucket::Entity>(),
         entity::<object::Entity>(),
         entity::<object_version::Entity>(),
@@ -91,7 +95,22 @@ pub(super) fn tables() -> Vec<TableImage> {
             "upload_id,owner,token,execution_id,bucket,archive_key,part_contract,response_xml,response_headers",
             "upload_id",
         ),
-    ]
+    ];
+    if versions.iter().any(|version| version == MANAGEMENT) {
+        tables.extend([
+            raw(
+                "pin_management_records",
+                "database_scope,plan_id,item_id,kind,principal,native_identity,binding,native_before,result,intent_ids,job_ids,state,created_at,expires_at,completed_at",
+                "database_scope,plan_id,item_id,kind",
+            ),
+            raw(
+                "pin_management_retirements",
+                "allocation_domain,database_scope,plan_id,item_id,principal,native_identity,binding,inventory,disposition,unresolved,state,created_at,record_kind",
+                "allocation_domain",
+            ),
+        ]);
+    }
+    tables
 }
 
 pub(super) async fn schema<C: ConnectionTrait>(db: &C, writing: bool) -> AppResult<Vec<String>> {
@@ -112,7 +131,7 @@ pub(super) async fn schema<C: ConnectionTrait>(db: &C, writing: bool) -> AppResu
     // Registered prefixes must end at an explicitly supported catalog shape.
     if !matches!(
         actual.last().map(String::as_str),
-        Some(STAGE5 | STAGE6 | SCHEMA | ZIP_CAPTURE)
+        Some(STAGE5 | STAGE6 | SCHEMA | ZIP_CAPTURE | MANAGEMENT)
     ) || actual != known[..actual.len().min(known.len())]
         || actual.len() > known.len()
     {
@@ -128,6 +147,7 @@ pub(super) async fn schema<C: ConnectionTrait>(db: &C, writing: bool) -> AppResu
     } else {
         super::receipt_schema::absent(db).await?;
     }
+    management_catalog::validate(db, actual.iter().any(|version| version == MANAGEMENT)).await?;
     Ok(actual)
 }
 
@@ -141,7 +161,7 @@ pub(super) async fn read<C: ConnectionTrait>(
     let mut result = Vec::new();
     let mut count = 0;
     let mut bytes = 0;
-    for mut table in tables() {
+    for mut table in tables(versions) {
         match (table.table.as_str(), zip_capture) {
             ("multipart_uploads" | "import_jobs", false) => {
                 table.columns.retain(|c| c != "zip_intent_json");

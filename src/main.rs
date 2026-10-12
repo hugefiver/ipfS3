@@ -37,6 +37,7 @@ enum RunMode {
     ReadyProbe,
     Diagnostics(diagnostics::Command),
     LegacyMigration(diagnostics::legacy_migration::Command),
+    Management(diagnostics::management::Command),
 }
 
 async fn health_check() -> &'static str {
@@ -44,8 +45,15 @@ async fn health_check() -> &'static str {
 }
 
 fn parse_run_mode(args: &[String]) -> anyhow::Result<RunMode> {
-    if let Some(command) = diagnostics::legacy_migration::parse(args)? {
+    let legacy = diagnostics::legacy_migration::parse(args)?;
+    if args.iter().skip(1).any(|argument| argument == "--pinning-manage") {
+        return Err(diagnostic_usage());
+    }
+    if let Some(command) = legacy {
         return Ok(RunMode::LegacyMigration(command));
+    }
+    if let Some(command) = diagnostics::management::parse(args)? {
+        return Ok(RunMode::Management(command));
     }
     if let [flag, bucket, key, rest @ ..] = args
         && flag == "--pinning-status"
@@ -96,7 +104,7 @@ fn parse_run_mode(args: &[String]) -> anyhow::Result<RunMode> {
 
 fn diagnostic_usage() -> anyhow::Error {
     anyhow::anyhow!(
-        "usage: ipfs-s3-gateway [--ready-probe | --pinning-doctor | --config-explain | --pinning-policy-explain BUCKET KEY | --pinning-status BUCKET KEY [--version-id ID] [--cursor OFFSET] | --pinning-migrate-legacy DECLARATION [--apply CONFIRMATION] | --rollback RECEIPT CONFIRMATION]"
+        "usage: ipfs-s3-gateway [--ready-probe | --pinning-doctor | --config-explain | --pinning-policy-explain BUCKET KEY | --pinning-status BUCKET KEY [--version-id ID] [--cursor OFFSET] | --pinning-migrate-legacy DECLARATION [--apply CONFIRMATION] | --rollback RECEIPT CONFIRMATION | --pinning-manage (see --pinning-manage --help)]"
     )
 }
 
@@ -281,6 +289,7 @@ async fn main() -> anyhow::Result<()> {
         RunMode::Gateway => run_gateway().await,
         RunMode::Diagnostics(command) => diagnostics::run(command).await,
         RunMode::LegacyMigration(command) => diagnostics::legacy_migration::run(command).await,
+        RunMode::Management(command) => diagnostics::management::run(command).await,
         RunMode::ReadyProbe => {
             if ready_probe().await {
                 Ok(())

@@ -11,6 +11,9 @@ mod response;
 mod stream;
 mod submit;
 
+// Structural CAR verification only; no Cluster transport or strategy authority.
+pub(crate) use car::{Car as CarValidator, DirectoryCarLimits, DirectoryRootKind};
+
 pub use observation::{
     ClusterFailureCode, ClusterObservedResource, ClusterRemoteRef, ClusterResourceStatus,
     ClusterWriteEffect, ClusterWriteFailure, ClusterWriteObservation, ClusterWriteReceipt,

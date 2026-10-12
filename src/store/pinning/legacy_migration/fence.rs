@@ -1,7 +1,7 @@
 //! Maintenance assertions, DB-native time fence and fixed lock order.
 use super::{Confirmation, Declaration, TableImage, model::field, refused, snapshot};
 use crate::error::AppResult;
-use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseTransaction, Statement};
 
 pub(super) fn maintenance(decl: &Declaration) -> AppResult<()> {
     if !decl.maintenance.all_writers_stopped || !decl.maintenance.all_workers_drained {
@@ -99,7 +99,37 @@ pub(super) async fn validate_plan<C: ConnectionTrait>(
     Ok(())
 }
 
-pub(super) async fn lock<C: ConnectionTrait>(db: &C) -> AppResult<()> {
+pub(super) fn lock_order(versions: &[String]) -> Vec<(String, String)> {
+    let mut order = snapshot::tables(versions)
+        .into_iter()
+        .map(|table| {
+            let key = if table.table == "pin_lease_targets" {
+                "created_at,id".into()
+            } else {
+                table.primary_key.join(",")
+            };
+            (table.table, key)
+        })
+        .collect::<Vec<_>>();
+    if let Some(index) = order
+        .iter()
+        .position(|(table, _)| table == "pin_management_retirements")
+    {
+        let retirement = order.remove(index);
+        let routes = order
+            .iter()
+            .position(|(table, _)| table == "pin_provider_routes")
+            .expect("registered route closure");
+        order.insert(routes, retirement);
+    }
+    order
+}
+
+/// SQLite takes write intent here, before the admission preflight's business reads.
+pub(super) async fn lock_before_routes(
+    db: &DatabaseTransaction,
+    versions: &[String],
+) -> AppResult<()> {
     if db.get_database_backend() == DatabaseBackend::Sqlite {
         // Write intent before any business read; no receipt row is mutated.
         db.execute_unprepared("UPDATE pin_legacy_migrations SET id=id WHERE 1=0")
@@ -107,26 +137,37 @@ pub(super) async fn lock<C: ConnectionTrait>(db: &C) -> AppResult<()> {
         return Ok(());
     }
     db.execute_unprepared("SET LOCAL lock_timeout='1s'").await?;
-    for (table, order) in [
-        ("buckets", "name"),
-        ("objects", "id"),
-        ("object_versions", "id"),
-        ("pin_leases", "id"),
-        ("pin_lease_targets", "created_at,id"),
-        ("remote_pins", "provider,cid"),
-        ("pin_provider_usage", "provider"),
-        ("pin_provider_routes", "provider"),
-    ] {
-        row_lock(db, table, order).await?;
+    let order = lock_order(versions);
+    for (table, key) in order.iter().take_while(|(table, _)| table != "pin_provider_routes") {
+        row_lock(db, table, key).await?;
     }
-    let tables = snapshot::tables();
-    for table in tables.iter().skip(8) {
-        row_lock(db, &table.table, &table.primary_key.join(",")).await?;
+    Ok(())
+}
+
+/// The caller holds the prefix locks. Verified forward routes are admitted before
+/// any route row lock; receipt replay and the exact inverse do not issue admission.
+pub(super) async fn lock_from_routes(
+    db: &DatabaseTransaction,
+    versions: &[String],
+    routes: Option<&[crate::pinning::identity::ProviderRouteSnapshot]>,
+) -> AppResult<()> {
+    if super::management_closure::enabled(versions) {
+        if let Some(routes) = routes {
+            crate::store::pinning::management::admission::lock_open_in_transaction(db, routes)
+                .await?;
+        }
+    }
+    if db.get_database_backend() == DatabaseBackend::Sqlite {
+        return Ok(());
+    }
+    let order = lock_order(versions);
+    for (table, key) in order.iter().skip_while(|(table, _)| table != "pin_provider_routes") {
+        row_lock(db, table, key).await?;
     }
     // Tail write-excluding table locks fence insert phantoms, even empty captures.
-    let names = tables
+    let names = order
         .iter()
-        .map(|t| t.table.as_str())
+        .map(|(table, _)| table.as_str())
         .chain([
             "pin_legacy_migrations",
             "pin_legacy_migration_items",

@@ -308,7 +308,11 @@ async fn record_in_transaction<C: ConnectionTrait>(
     } else {
         true
     };
-    let can_project = live && current_lifetime && !released && matched_context;
+    // Invalid/stale management authority denies projection, never erases the
+    // actual already-started invocation's roots/Unknown response below.
+    let managed_projection = crate::store::pinning::management::actions::job_authority::projection_allowed(db, &claimed.model)
+        .await.unwrap_or(false);
+    let can_project = live && current_lifetime && !released && matched_context && managed_projection;
     let written = evidence::Entity::update_many()
         .col_expr(evidence::Column::Effect, Expr::value(effect))
         .col_expr(evidence::Column::Resources, Expr::value(json))
@@ -465,7 +469,7 @@ async fn receipt_context_valid<C: ConnectionTrait>(
             .one(db)
             .await?;
     if !registered.is_some_and(|registered| {
-        !registered.retired && registered_invocation_matches(&row.route, &registered.snapshot)
+        registered_invocation_matches(&row.route, &registered.snapshot)
     }) || super::get(db, &row.provider, &row.expected_cid)
         .await?
         .is_none_or(|ledger| ledger.route.as_deref() != Some(row.route.as_str()))
@@ -798,7 +802,7 @@ impl AdmissionSnapshot {
             && self
                 .registered
                 .as_ref()
-                .is_some_and(|registered| !registered.retired && registered.snapshot == row.route)
+                .is_some_and(|registered| registered.snapshot == row.route)
             && self
                 .ledgers
                 .get(&row.expected_cid)
@@ -1034,6 +1038,11 @@ pub async fn dispatch_allowed<C: ConnectionTrait>(db: &C, id: &str) -> AppResult
         return Ok(false);
     }
     if row.outcome != "in_flight" || row.observed_at.is_some() {
+        return Ok(false);
+    }
+    let original: ProviderRouteSnapshot = serde_json::from_str(&row.route)
+        .map_err(|_| AppError::InvalidPinningRequest("retirement attribution needs attention; dispatch denied".into()))?;
+    if super::super::management::admission::registration_closed(db, &original).await? {
         return Ok(false);
     }
     let Some(captured) = pin_invocation_route::Entity::find_by_id(row.job_id.clone())

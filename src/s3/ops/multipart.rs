@@ -351,8 +351,8 @@ pub async fn create_multipart_upload(
     };
 
     let txn = db.begin().await.map_err(crate::error::AppError::from)?;
+    crate::store::import::ownership::lock_bucket_for_ownership(&txn, bucket).await?;
     if let Some(intent) = &zip_intent {
-        crate::store::import::ownership::lock_bucket_for_ownership(&txn, bucket).await?;
         let mut admission = crate::s3::route::decompress_zip::legacy_batch_admission(
             "mpu",
             &upload_id,

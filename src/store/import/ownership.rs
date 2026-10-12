@@ -323,6 +323,7 @@ async fn submit_decided_in_transaction<C: ConnectionTrait>(
     if let Some(prefix) = job.decompress_prefix.as_deref() {
         install_prefix_claim(txn, &job.id, &job.bucket, prefix, now).await?;
     }
+    crate::store::pinning::management::admission::lock_intake_in_caller_transaction(txn, decision, zip_intent).await?;
     Ok(SubmitImportOutcome::Created(job))
 }
 

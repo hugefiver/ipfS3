@@ -400,7 +400,7 @@ impl PinningCoordinator {
         }
         self.identities
             .iter()
-            .filter(|(_, identity)| identity.owns_allocation_domain(key))
+            .filter(|(_, identity)| identity.allocation_key() == key)
             .min_by_key(|(_, identity)| &identity.provider_id)
             .map(|(key, _)| key.as_str())
     }
@@ -408,6 +408,7 @@ impl PinningCoordinator {
     /// Register the current allocation routes before accepting publications.
     /// Existing resource snapshots are never overwritten by this operation.
     pub async fn register_identities(&self, store: &Store) -> crate::error::AppResult<()> {
+        use sea_orm::TransactionTrait;
         // Match provider construction: canonical order, first alias per allocation.
         // The validated route also captures its confirmation requirement.
         let mut registered = std::collections::HashSet::new();
@@ -415,12 +416,14 @@ impl PinningCoordinator {
             if !registered.insert(&provider.name) {
                 continue;
             }
-            crate::store::pinning::ledger::register_configured_route(
-                store.db(),
+            let tx = store.db().begin().await?;
+            crate::store::pinning::ledger::register_configured_route_in_transaction(
+                &tx,
                 &provider.name,
                 provider,
             )
             .await?;
+            tx.commit().await?;
         }
         Ok(())
     }
@@ -431,6 +434,32 @@ impl PinningCoordinator {
 
     pub fn provider_runtime(&self, name: &str) -> Option<&ProviderRuntime> {
         self.provider_runtime.get(self.route_key(name)?)
+    }
+
+    /// Only a caller with a verified original job/slot may use this adapter.
+    /// Alias labels can change in a canonical domain; account, resource family,
+    /// credentials, endpoint revision and the frozen reader remain exact.
+    pub(crate) fn historical_runtime_key(
+        &self, key: &str, route: &crate::pinning::identity::ProviderRouteSnapshot,
+    ) -> Option<&str> {
+        let provider = self.effective_config.providers.iter().find(|provider| provider.name == key)?;
+        let current = provider.route_snapshot();
+        if current.resource_type() != route.resource_type() { return None; }
+        let mut original = route.clone();
+        if crate::store::pinning::management::admission::allocation_domain(route).ok().as_deref() == Some(key) {
+            original.provider_id.clone_from(&current.provider_id);
+        }
+        crate::store::entities::pin_lease_requirement::contract::read_route_compatible(&original, &current)
+            .then_some(provider.name.as_str())
+    }
+
+    /// One receipt-scoped pass, with the existing worker's claim/heartbeat/IO
+    /// protocol. Does not start the background worker or expire/scan old queues.
+    pub async fn management_tick(
+        &self, store: &Store, scope: &crate::pinning::worker::ManagementJobScope,
+        cancellation: &CancellationToken,
+    ) -> crate::error::AppResult<crate::pinning::worker::ManagementJobReport> {
+        crate::pinning::worker::management_tick(self, store, scope, cancellation).await
     }
 
     /// Returns the captured policy order anchored at the failed provider, excluding unhealthy

@@ -3,6 +3,7 @@ pub mod jobs;
 pub mod leases;
 pub mod ledger;
 pub mod legacy_migration;
+pub mod management;
 pub mod publication;
 pub mod quota;
 pub mod tags;

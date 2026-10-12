@@ -130,6 +130,7 @@ mod migrator {
                     crate::store::migrations::m20261007_000001_legacy_pinning_migration::Migration,
                 ),
                 Box::new(crate::store::migrations::m20261008_000001_zip_intent_capture::Migration),
+                Box::new(crate::store::migrations::m20261012_000001_pinning_management::Migration),
             ]
         }
     }

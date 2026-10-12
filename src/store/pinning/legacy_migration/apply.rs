@@ -1,7 +1,7 @@
 //! One transaction owns mutations, post-image fence and committed receipt.
 use super::{
     Confirmation, Declaration, Receipt,
-    fence::{drained, lock, maintenance, validate_plan},
+    fence::{drained, lock_before_routes, lock_from_routes, maintenance, validate_plan},
     inventory::validate,
     mutation::write_changes,
     projection, receipt, refused, snapshot,
@@ -29,7 +29,30 @@ pub async fn apply<C: ConnectionTrait + TransactionTrait>(
     // Fresh default READ COMMITTED transaction, never a dry-run RR snapshot.
     let txn = db.begin().await?;
     let schema = snapshot::schema(&txn, true).await?;
-    lock(&txn).await?;
+    lock_before_routes(&txn, &schema).await?;
+    // A trusted committed receipt is replay, not another allocation. Re-read it
+    // below under the complete receipt fence; do not inspect mutable records or
+    // apply a new open-domain admission to its original before image.
+    let admission_routes = if super::management_closure::enabled(&schema)
+        && receipt::lookup(&txn, &plan.operation_id).await?.is_none()
+    {
+        validate_plan(&txn, plan, &schema).await?;
+        drained(&plan.before)?;
+        let current = snapshot::read(&txn, &schema).await?;
+        let management =
+            super::management_closure::collect(&txn, &current, declaration, &schema).await?;
+        let projected = projection::project(&current, declaration, &management)?;
+        if current != plan.before
+            || projected != plan.after
+            || snapshot::frontier(&txn, &schema).await? != plan.receipt_frontier
+        {
+            return Err(refused("complete before/after frontier changed"));
+        }
+        Some(management.routes().to_vec())
+    } else {
+        None
+    };
+    lock_from_routes(&txn, &schema, admission_routes.as_deref()).await?;
     if snapshot::schema(&txn, true).await? != schema {
         return Err(refused("receipt schema changed before maintenance locks"));
     }
@@ -43,6 +66,9 @@ pub async fn apply<C: ConnectionTrait + TransactionTrait>(
         txn.commit().await?;
         return Ok(receipt::public(&existing));
     }
+    if super::management_closure::enabled(&schema) && admission_routes.is_none() {
+        return Err(refused("committed receipt changed before the complete fence"));
+    }
     validate_plan(&txn, plan, &schema).await?;
     for namespace in &declaration.namespaces {
         if receipt::source_has_receipt(&txn, &namespace.source).await? {
@@ -53,7 +79,8 @@ pub async fn apply<C: ConnectionTrait + TransactionTrait>(
     }
     drained(&plan.before)?;
     let current = snapshot::read(&txn, &schema).await?;
-    let projected = projection::project(&current, declaration)?;
+    let management = super::management_closure::collect(&txn, &current, declaration, &schema).await?;
+    let projected = projection::project(&current, declaration, &management)?;
     if current != plan.before
         || projected != plan.after
         || snapshot::frontier(&txn, &schema).await? != plan.receipt_frontier
@@ -78,7 +105,8 @@ pub async fn rollback<C: ConnectionTrait + TransactionTrait>(
     maintenance(&confirmation.declaration)?;
     let txn = db.begin().await?;
     let schema = snapshot::schema(&txn, true).await?;
-    lock(&txn).await?;
+    lock_before_routes(&txn, &schema).await?;
+    lock_from_routes(&txn, &schema, None).await?;
     if snapshot::schema(&txn, true).await? != schema {
         return Err(refused("receipt schema changed before maintenance locks"));
     }

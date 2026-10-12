@@ -500,6 +500,45 @@ Future Stage7/8 files were excluded from this export and do not prove their own
 delivery. No production migration, remote
 account operation, unpin, or GC has been performed.
 
+## Stage 7 local management checks
+
+**Status: source integrated; concentrated acceptance pending.** The first
+concentrated Cargo attempt exited 101 during compilation, with zero tests
+executed. Compiler corrections are source-complete; the concentrated after-run
+is pending. There is no current Stage 7
+acceptance PASS for the nine actions, receipt-scoped runtime or retirement
+barriers; earlier Stage 6, R26 and R25 evidence doesn't establish those results.
+
+With the installed Windows GNU Rust toolchain and cached dependencies, these
+PowerShell commands select the actual local targets. They aren't recorded passes:
+
+```powershell
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test management_plan_wire --test management_db_snapshot
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test 'stage7_management_*'
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage7_retirement_barrier --test stage7_retirement_barrier_consumers --test stage7_retirement_barrier_http
+```
+
+The management targets cover schema/native snapshots, confirmation, file and
+directory evidence, CLI, action replay/chains/lifecycle/migration/provider points
+and retirement. Acceptance must inspect executed results for original
+confirmation/expiry, exact object/version/CID and route binding, ciphertext and
+directory block-byte proof, atomic receipts, scoped execution and canonical
+retirement fencing. Compilation and mock/local evidence aren't physical-provider
+completion or storage reclamation evidence.
+
+`stage7_retirement_barrier_postgres` is separately ignored and requires a
+parent-registered, authorized isolated `stage7_` schema through
+`IPFS_S3_STAGE7_RETIREMENT_DATABASE_URL`. It must not be pointed at production or
+an occupied fixture. Once that environment is explicitly provided, select it with:
+
+```powershell
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage7_retirement_barrier_postgres -- --ignored --nocapture --test-threads=1
+```
+
+An ignored PostgreSQL case is never PASS. Neither these command examples nor an
+exit-101 compile attempt supply runtime or native PostgreSQL acceptance evidence.
+Update this status only after concentrated QA against the finished source.
+
 ## Environment-backed and deep checks
 
 Run the relevant command when its external environment is available:

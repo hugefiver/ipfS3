@@ -1184,6 +1184,110 @@ verifier-only run is not provider CAR acceptance. Anonymous test-node auth
 headers do not prove account authentication, and Filebase/Pinata account writes
 remain **NOT RUN**. Two same-host peers are not multi-host high availability.
 
+### Local pinning management CLI (Stage 7)
+
+**Source integrated; concentrated acceptance pending.** The first concentrated
+Cargo attempt exited 101 during compilation and executed zero tests. This
+section describes the implemented source contract, not verified execution of
+the nine actions, scoped runtime or retirement barriers. See
+[Stage 7 checks](docs/testing.md#stage-7-local-management-checks).
+
+`--pinning-manage REQUEST.json` defaults to a bounded, read-only plan against an
+existing SQLite or PostgreSQL database with the formal management schema. It
+doesn't create a database, initialize AppState, migrate, register identities,
+start workers, or perform source/provider IO. `--output` exports an unconfirmed
+proposal. `--source-node` asserts the expected local peer; it isn't a probe or
+proof that content is readable. There is no management HTTP endpoint.
+
+The input is `PlanRequest` (`plan_id`, `items`) from
+[`model.rs`](src/pinning/management/model.rs). Each item selects an action and
+an exact object/target or provider route. Object binding includes bucket, key,
+explicit public version (including `null`, never “current”), private version ID,
+object ID and canonical CID. Provider selection binds stable identity, backend,
+scope, storage domain, API/strategy and revisions, including the original route;
+it isn't just a config alias. Selection remains subject to local policy and
+stored evidence. Don't infer ZIP ownership from a prefix or old log.
+
+The nine action families are:
+
+| Action | Local management intent |
+| --- | --- |
+| `create` | Create a new explicitly authorized lease/target intent. |
+| `renew` | Extend the selected lease without restarting its original clock. |
+| `cancel` | Cancel logical intent, not delete S3 content or reclaim physical storage. |
+| `reapply` | Explicitly request a new intent rather than silently replay a skipped control. |
+| `backfill` | Add intent for exact selected historical content; legacy ZIP candidates need separate acknowledgement. |
+| `retry` | Retry eligible selected work with effect/route fences; uncertain work requires observation, not blind resubmission. |
+| `migrate` | Add destination execution while preserving source responsibility and the original lease deadline. |
+| `reconcile` | Schedule observation of the captured current/historical resource, not replacement Submit or Unpin authority. |
+| `retire` | Stop new allocations in the canonical allocation domain and retain its responsibilities. |
+
+`--confirm OUTPUT.json` explicitly stages and confirms the reviewed plan in the
+DB. Every candidate requires its own `--ack-item ID`; acknowledgement doesn't
+turn inferred history into ownership proof. Confirmation TTL defaults to 300
+seconds, with `--ttl-seconds` accepting 1 to 900. Requests, plan/item IDs, UUIDs,
+exported files and imported applied claims aren't authorization. The local
+configuration principal (`local_configuration`), DB scope and native physical
+database identity must match the stored complete original bindings and evidence.
+Protect local configuration, database access and artifact directories accordingly.
+
+Exports use exclusive `create_new`, never overwrite and don't create parent
+directories. Confirmation reserves the file before DB staging. A failed confirm
+can leave an empty or incomplete reserved file, and DB confirmation may already
+have committed if export failed. Don't treat that file as usable confirmation or
+retry by overwriting it. Inspect the failure and retained DB state first. Operators
+must protect the files with host permissions/ACLs; Windows ACL hardening isn't
+implemented by this CLI.
+
+`--prepare PREPARE.json` is a separate explicit offline local-source read and DB
+evidence write, with no provider IO. Its input names `record_id`, exact `identity`,
+`expected_node`, `max_stored_bytes`, `ttl_seconds` (1 to 3600) and `directory`.
+File proof requires clean EOF and measures stored bytes, including ciphertext
+for encrypted objects, not plaintext size. Directory proof verifies the complete
+locally reachable directory/HAMT root and counts each unique reachable block's
+raw serialized payload once, excluding CAR header, CID bytes and framing. This
+logical byte hold isn't physical disk usage, global deduplication or provider
+billing. A file-only upload route can't authorize a directory. Evidence retains
+exact object/version tuples, node/read configuration, proof and original expiry;
+old size-less directory evidence doesn't become a byte proof on replay.
+
+`--apply CONFIRMED.json` uses the original exported confirmation and local DB
+records. New business needs fresh native fences and unexpired original authority;
+actions and receipts commit together, not as a successful prefix. Exact committed
+receipt replay doesn't create or charge again, even after confirmation expiry or
+a later legitimate state change. It doesn't renew confirmation. `--status` reads
+stored action evidence without source/provider IO or a fresh TTL grant; it isn't
+a live availability check. Optional `--run` makes one due-job pass scoped to
+verified receipts, never a global queue drain or background worker. Due times and
+claim caps still apply. A failed/interrupted run doesn't undo a committed apply
+or prove that no remote effect occurred; inspect status before further action.
+
+Retirement is canonical and irreversible through this CLI: aliases or restarting
+with `retired = false` don't grant a new allocation domain. Unknown, in-flight,
+retained and cleanup-pending responsibilities remain recorded and can require
+`needs_attention`. The default disposition is retain, with no cleanup grant.
+Explicit `retire_with` can select evidenced prior migrations or exact controlled
+cleanup resources, but cannot invent ownership or erase unknown debt. Controlled
+cleanup still requires independently eligible managed resources and fresh fences.
+Retirement isn't route deletion, quota release, local unpin or GC permission.
+
+These PowerShell examples assume an already-built binary, an explicitly selected
+existing database/configuration, reviewed request files and a protected existing
+artifact directory. Replace `candidate-item-id` with each actual candidate ID;
+omit the flag when there are none. Preparation, if required, comes before review
+and confirmation. Commands are examples, not acceptance results.
+
+```powershell
+$env:IPFS_S3_CONFIG = "gateway.toml"
+.\target\debug\ipfs-s3-gateway.exe --pinning-manage --prepare .\prepare.json
+.\target\debug\ipfs-s3-gateway.exe --pinning-manage .\request.json --output .\private\plan.json
+.\target\debug\ipfs-s3-gateway.exe --pinning-manage .\request.json --confirm .\private\confirmed.json --ack-item candidate-item-id --ttl-seconds 300
+.\target\debug\ipfs-s3-gateway.exe --pinning-manage --apply .\private\confirmed.json
+.\target\debug\ipfs-s3-gateway.exe --pinning-manage --status .\private\confirmed.json
+# Explicit opt-in to one receipt-scoped pass, also valid on exact apply replay:
+.\target\debug\ipfs-s3-gateway.exe --pinning-manage --apply .\private\confirmed.json --run
+```
+
 ### Policies and coordination
 
 Policies use ordered first-match evaluation. A rule matches an exact bucket or

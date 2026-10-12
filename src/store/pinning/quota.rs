@@ -329,6 +329,8 @@ fn ordered_unique_providers(providers: &[String]) -> Vec<String> {
 /// this and insert/touch that target in the same transaction, then call
 /// [`refresh_remote_max_active_touch`]. A capacity-holding reuse is one new desired reference and
 /// therefore advances the remote epoch exactly once per invocation.
+/// Passing a bare connection is low-level compatibility, not a retained admission
+/// fence; production publication/renewal/worker callers pass their business transaction.
 pub async fn reserve_unique<C: ConnectionTrait>(
     db: &C,
     provider: &str,
@@ -362,6 +364,7 @@ async fn reserve_unique_for_intent<C: ConnectionTrait>(
     now: DateTimeUtc,
     waiter: bool,
 ) -> AppResult<ReservationOutcome> {
+    super::management::admission::lock_sqlite_writer_in_caller_transaction(db).await?;
     if super::legacy_migration::source_is_migrated(db, provider).await? {
         return Err(invalid_quota(
             "migrated legacy namespace cannot allocate or revive",
@@ -685,6 +688,17 @@ async fn reserve_unique_attempt<C: ConnectionTrait>(
             "new RPC target must use the canonical allocation CID",
         ));
     }
+    // QuotaWaiting/Blocked can themselves become a newly published target.
+    // Registered admission therefore precedes every outcome, not only capacity
+    // grants. Keep the old pre-registry low-level lock sequence unchanged.
+    let prelocked = if pin_provider_route::Entity::find_by_id(provider.to_owned()).one(db).await?.is_some() {
+        let remote = acquire_existing_remote(db, provider, cid).await?;
+        lock_allocation_admission(db, provider).await?;
+        Some(remote)
+    } else {
+        super::management::admission::check_provider_open(db, provider).await?;
+        None
+    };
     match super::ledger::submission::admission_barrier(db, provider).await? {
         super::ledger::submission::AdmissionBarrier::Temporary => {
             return Ok(ReserveAttempt::Outcome(ReservationOutcome::QuotaWaiting {
@@ -708,7 +722,10 @@ async fn reserve_unique_attempt<C: ConnectionTrait>(
         return Ok(ReserveAttempt::Outcome(ReservationOutcome::QuotaBlocked));
     }
 
-    let existing = acquire_existing_remote(db, provider, cid).await?;
+    let existing = match prelocked {
+        Some(remote) => remote,
+        None => acquire_existing_remote(db, provider, cid).await?,
+    };
     match existing {
         Some(remote) if is_capacity_holding_status(&remote.status) => {
             assert_reusable_route(db, provider, cid).await?;
@@ -736,6 +753,7 @@ pub(crate) async fn assert_reusable_route<C: ConnectionTrait>(
     provider: &str,
     cid: &str,
 ) -> AppResult<()> {
+    super::management::admission::check_provider_open(db, provider).await?;
     if let Some(binding) = super::legacy_migration::resource_binding(db, provider, cid).await?
         && binding.source_retired
     {
@@ -781,6 +799,17 @@ pub(crate) async fn assert_reusable_route<C: ConnectionTrait>(
             "remote allocation lacks a current, matching historical route",
         )),
     }
+}
+
+/// Caller already owns lifecycle/remotes. This adds usage → retirement/routes,
+/// without granting capacity or opening a nested transaction. Pre-registry
+/// standalone compatibility callers retain their old accounting lock behavior.
+pub(crate) async fn lock_allocation_admission<C: ConnectionTrait>(db: &C, provider: &str) -> AppResult<()> {
+    super::management::admission::lock_sqlite_writer_in_caller_transaction(db).await?;
+    if pin_provider_route::Entity::find_by_id(provider.to_owned()).one(db).await?.is_some() {
+        lock_publication_usage_rows(db, &[provider.to_owned()]).await?;
+    }
+    super::management::admission::lock_provider_in_caller_transaction(db, provider).await
 }
 
 /// Prior to Stage 2 the provider column was a user-configurable alias, not an
