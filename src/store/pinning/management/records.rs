@@ -1,27 +1,184 @@
 //! Durable typed record seams for B/C. No business action is implemented here.
+use super::{
+    ManagementError, Result,
+    native::{self, NativeFrame},
+};
+use crate::pinning::management::PlanRequest;
 use chrono::{DateTime, Utc};
 use sea_orm::{ConnectionTrait, DatabaseTransaction, Statement};
 use serde::{Deserialize, Serialize};
-use super::{ManagementError, Result, native::{self, NativeFrame}};
-use crate::pinning::management::{Confirmation, PlanRequest};
-mod confirmation;
-mod imported;
-mod retirement;
-mod results;
+mod archive;
 mod codec;
+mod confirmation;
+mod current;
+pub(crate) mod evidence;
+mod imported;
 mod index;
 mod inspection;
+mod results;
+mod retirement;
+pub(crate) mod roots;
+mod row;
+mod session;
+mod validation;
+mod views;
+pub(crate) use archive::ArchivedRows;
+pub use archive::ConfirmedPlan;
+pub use archive::ConfirmedPlan as ConfirmedBinding;
+pub use archive::ReviewHandle;
+pub(crate) use current::{CurrentRows, current_management_rows, current_model, current_models};
+pub(crate) use index::{bounded_projection, lease_has_selectors};
+pub(crate) use row::{FrozenRows, RowHandle, RowView};
+
+pub(crate) async fn current_row<C: ConnectionTrait>(
+    db: &C,
+    name: &str,
+    key: &[&str],
+    work: DecodeWork<'_>,
+) -> Result<native::NativeRow> {
+    let table = native::current_catalog()
+        .iter()
+        .find(|table| table.table == name)
+        .ok_or(ManagementError::Schema)?;
+    if table.primary_key.len() != key.len() {
+        return Err(ManagementError::Confirmation);
+    }
+    work.copy(&key)?;
+    let predicate = table
+        .primary_key
+        .iter()
+        .enumerate()
+        .map(|(i, column)| format!("CAST(\"{column}\" AS TEXT)=${}", i + 1))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    work.copy(&table.columns)?;
+    let columns = table
+        .columns
+        .iter()
+        .map(|column| (column.as_str(), column.as_str()))
+        .collect::<Vec<_>>();
+    let (rows, bytes) = index::bounded_projection(
+        db,
+        &format!("FROM \"{name}\" WHERE {predicate}"),
+        &columns,
+        &predicate,
+        key.iter().map(|value| (*value).into()).collect(),
+        (1, native::MAX_BYTES),
+        work,
+    )
+    .await?;
+    work.index_cells(table.columns.len(), bytes)?;
+    work.copy(&table.columns)?;
+    let row = rows.first().ok_or(ManagementError::Changed)?;
+    table
+        .columns
+        .iter()
+        .map(|column| {
+            Ok((
+                column.clone(),
+                row.try_get::<Option<String>>("", column)
+                    .map_err(|_| ManagementError::InvalidEvidence)?,
+            ))
+        })
+        .collect()
+}
+
+pub(crate) async fn read_confirmed_plan<C: ConnectionTrait>(
+    db: &C,
+    binding: &ConfirmedBinding,
+    work: SharedDecodeBudget,
+) -> Result<ConfirmedPlan> {
+    let source = evidence::Evidence::load_with_work(
+        db,
+        &binding.database_scope,
+        &binding.database_identity,
+        std::slice::from_ref(&binding.request.plan_id),
+        work,
+    )
+    .await?;
+    let key = evidence::anchor_key(binding)?;
+    let confirmed = source.read_binding(source.row(&key)?)?;
+    if confirmed.view() != binding {
+        return Err(ManagementError::Confirmation);
+    }
+    Ok(confirmed)
+}
+
+pub(crate) fn confirmed_members(
+    binding: &ConfirmedBinding,
+    work: SharedDecodeBudget,
+) -> Result<Vec<std::sync::Arc<native::NativeRow>>> {
+    let mut work = work.lock().map_err(|_| ManagementError::InvalidEvidence)?;
+    let candidates =
+        archive::sql_candidates(&binding.database_scope, &binding.request.plan_id, &mut work)?;
+    work.nodes(1 + binding.request.items.len())?;
+    let mut members = Vec::new();
+    for entry in binding.confirmation.bindings.iter() {
+        let mut matching = candidates.iter().filter(|row| {
+            native::value(row, "item_id") == Some(&entry.request.item_id)
+                && native::value(row, "kind") == Some("action")
+                && native::value(row, "state") == Some("prepared")
+                && native::value(row, "result").is_none()
+                && native::value(row, "binding") == binding.original_binding().ok()
+        });
+        let row = matching.next().ok_or(ManagementError::Confirmation)?;
+        if matching.any(|other| other.as_ref() != row.as_ref()) {
+            return Err(ManagementError::Confirmation);
+        }
+        members.push(row.clone());
+    }
+    Ok(members)
+}
+pub(crate) use evidence::Budget as DecodeBudget;
+pub use session::ReadSession;
+pub(crate) use validation::ValidationContext;
+pub use views::SharedDecodeBudget;
+pub(crate) use views::{BindingView, DecodeWork};
 #[cfg(test)]
 pub(crate) mod fault_injection;
-pub use results::{ActionState, JobDirective, JobAuthority, MigrationPoint, NamespacePlanningProjection, OperatorDecision, CommittedAction, lookup_committed, write_committed_action_in_transaction};
-pub(crate) use results::update_committed_state_in_transaction;
-pub(crate) use results::frame_actions;
+pub(crate) use confirmation::revalidate_with_work;
+pub use confirmation::{
+    PlanLocator, confirm_imported, lookup_applied_from_imported, recheck_confirmed_frame,
+    revalidate_confirmed_in_transaction, stage_confirmation,
+};
+pub use imported::{load_confirmed_from_imported, load_review_from_imported};
+pub(crate) use index::actions_at_keys_with_work;
+#[cfg(test)]
+pub(crate) use index::actions_for_job;
+pub(crate) use index::actions_for_plan_with_work;
+#[cfg(test)]
+pub(crate) use index::poll_discovery_with_work;
+pub(crate) use index::{
+    action_at_key_with_work, actions_for_job_with_work, actions_for_lease_with_work,
+};
+pub(crate) use inspection::{RecordPayload, inspect_original_row, inspect_original_row_with_work};
+pub(crate) use inspection::{inspect_retirement_review_with_work, inspect_review_with_work};
+#[cfg(test)]
 pub(crate) use results::decode_result as decode_action_result;
-pub(crate) use index::{actions_for_job,actions_for_lease,action_at_key,action_from_original_row};
-pub(crate) use inspection::{inspect_original_row,RecordPayload};
-pub use confirmation::{PlanLocator, stage_confirmation, confirm_imported, recheck_confirmed_frame, revalidate_confirmed_in_transaction, lookup_applied_from_imported};
-pub use imported::load_confirmed_from_imported;
-pub use retirement::{RetirementState, read_retirement, write_retirement_in_transaction};
+#[cfg(test)]
+pub(crate) use results::frame_actions;
+pub(crate) use results::frame_actions_with_work;
+pub(crate) use results::frozen_actions_for_leases;
+pub(crate) use results::lookup_trusted_with_work;
+#[cfg(test)]
+pub(crate) use results::private_action;
+pub use results::{
+    ActionState, CommittedAction, JobAuthority, JobDirective, MigrationPoint,
+    NamespacePlanningProjection, OperatorDecision, lookup_committed,
+};
+pub(crate) use results::{
+    TrustedAppliedAction, lookup_trusted_committed, update_executed_state,
+    write_executed_action_in_transaction,
+};
+pub(crate) use results::{
+    frozen_actions_for_lease, private_action_from_rows, private_action_from_rows_with_work,
+};
+pub(crate) use retirement::classify_retirement_root;
+pub(crate) use retirement::retirement_review_from_source;
+pub(crate) use retirement::write_retirement_marker;
+pub use retirement::{
+    RetirementState, read_retirement, read_retirement_with_session, write_retirement_in_transaction,
+};
 
 /// Constructed only after local Config validation and native DB identity checks.
 #[derive(Clone)]
@@ -31,65 +188,177 @@ pub struct LocalAuthorization {
     database_identity: String,
 }
 impl LocalAuthorization {
-    pub fn principal(&self) -> &str { &self.principal }
-    pub fn database_scope(&self) -> &str { &self.database_scope }
-    pub fn database_identity(&self) -> &str { &self.database_identity }
+    pub fn principal(&self) -> &str {
+        &self.principal
+    }
+    pub fn database_scope(&self) -> &str {
+        &self.database_scope
+    }
+    pub fn database_identity(&self) -> &str {
+        &self.database_identity
+    }
     pub async fn check<C: ConnectionTrait>(&self, db: &C) -> Result<()> {
-        if self.database_identity.starts_with("diagnostic:") {return Err(ManagementError::Unauthorized);}
-        if native::database_identity(db).await? != self.database_identity { return Err(ManagementError::Unauthorized); }
-        let row = db.query_one(Statement::from_string(db.get_database_backend(),
-            "SELECT database_scope FROM pin_management_records WHERE kind='database_scope'"))
-            .await.map_err(|_| ManagementError::Database)?.ok_or(ManagementError::Schema)?;
-        if row.try_get::<String>("","database_scope").map_err(|_| ManagementError::Schema)? != self.database_scope { return Err(ManagementError::Unauthorized); }
+        if self.database_identity.starts_with("diagnostic:") {
+            return Err(ManagementError::Unauthorized);
+        }
+        if native::database_identity(db).await? != self.database_identity {
+            return Err(ManagementError::Unauthorized);
+        }
+        let row = db
+            .query_one(Statement::from_string(
+                db.get_database_backend(),
+                "SELECT database_scope FROM pin_management_records WHERE kind='database_scope'",
+            ))
+            .await
+            .map_err(|_| ManagementError::Database)?
+            .ok_or(ManagementError::Schema)?;
+        if row
+            .try_get::<String>("", "database_scope")
+            .map_err(|_| ManagementError::Schema)?
+            != self.database_scope
+        {
+            return Err(ManagementError::Unauthorized);
+        }
         Ok(())
     }
 }
 
-pub async fn authorize_local<C: ConnectionTrait>(config: &crate::config::Config, db: &C) -> Result<LocalAuthorization> {
-    config.validate_kubo().map_err(|_| ManagementError::Unauthorized)?;
-    if config.auth.credentials.is_empty() || config.auth.credentials.iter().any(|c| c.access_key.is_empty() || c.secret_key.is_empty()) { return Err(ManagementError::Unauthorized); }
+pub async fn authorize_local<C: ConnectionTrait>(
+    config: &crate::config::Config,
+    db: &C,
+) -> Result<LocalAuthorization> {
+    config
+        .validate_kubo()
+        .map_err(|_| ManagementError::Unauthorized)?;
+    if config.auth.credentials.is_empty()
+        || config
+            .auth
+            .credentials
+            .iter()
+            .any(|c| c.access_key.is_empty() || c.secret_key.is_empty())
+    {
+        return Err(ManagementError::Unauthorized);
+    }
     super::schema::validate(db).await?;
     let frame = native::capture(db).await?;
-    if frame.database_identity.starts_with("diagnostic:") {return Err(ManagementError::Unauthorized);}
-    Ok(LocalAuthorization { principal: "local_configuration".into(), database_scope: frame.database_scope, database_identity: frame.database_identity })
-}
-
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ConfirmedBinding {
-    pub request: PlanRequest,
-    pub confirmation: Confirmation,
-    pub principal: String,
-    pub database_scope: String,
-    pub database_identity: String,
-    pub confirmed_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
+    if frame.database_identity.starts_with("diagnostic:") {
+        return Err(ManagementError::Unauthorized);
+    }
+    Ok(LocalAuthorization {
+        principal: "local_configuration".into(),
+        database_scope: frame.database_scope,
+        database_identity: frame.database_identity,
+    })
 }
 
 impl ConfirmedBinding {
-    pub async fn check<C: ConnectionTrait>(&self, db: &C, authorization: &LocalAuthorization) -> Result<()> {
+    pub async fn check<C: ConnectionTrait>(
+        &self,
+        db: &C,
+        authorization: &LocalAuthorization,
+    ) -> Result<()> {
+        self.check_with_work(db, authorization, SharedDecodeBudget::default())
+            .await
+    }
+    pub(crate) async fn check_with_work<C: ConnectionTrait>(
+        &self,
+        db: &C,
+        authorization: &LocalAuthorization,
+        work: SharedDecodeBudget,
+    ) -> Result<()> {
+        self.check_deadline(db, authorization).await?;
+        confirmation::stored_binding_with_work(db, authorization, self, work).await?;
+        Ok(())
+    }
+    pub(crate) async fn check_deadline<C: ConnectionTrait>(
+        &self,
+        db: &C,
+        authorization: &LocalAuthorization,
+    ) -> Result<()> {
         authorization.check(db).await?;
-        if self.principal != authorization.principal || self.database_scope != authorization.database_scope || self.database_identity != authorization.database_identity || self.confirmation.plan_id != self.request.plan_id { return Err(ManagementError::Confirmation); }
-        let Some(frame) = &self.confirmation.native_frame else { return Err(ManagementError::Confirmation); };
-        if frame.database_identity != self.database_identity || frame.database_scope != self.database_scope { return Err(ManagementError::Confirmation); }
-        let now = crate::store::database_clock::database_now(db).await.map_err(|_| ManagementError::Database)?;
-        if now < self.confirmed_at || now >= self.expires_at || self.expires_at <= self.confirmed_at { return Err(ManagementError::Expired); }
-        confirmation::stored_binding(db,authorization,self).await?;
+        if self.principal != authorization.principal
+            || self.database_scope != authorization.database_scope
+            || self.database_identity != authorization.database_identity
+            || self.confirmation.plan_id != self.request.plan_id
+        {
+            return Err(ManagementError::Confirmation);
+        }
+        let frame = self.view().frozen_rows()?;
+        if frame.identity() != self.database_identity || frame.scope() != self.database_scope {
+            return Err(ManagementError::Confirmation);
+        }
+        let now = crate::store::database_clock::database_now(db)
+            .await
+            .map_err(|_| ManagementError::Database)?;
+        if now < self.confirmed_at || now >= self.expires_at || self.expires_at <= self.confirmed_at
+        {
+            return Err(ManagementError::Expired);
+        }
         Ok(())
     }
 }
 
 /// Convenience for an in-process plan. File workflows use the explicit stage
 /// and confirm_imported functions; neither an ID nor wire data grants authority.
-pub async fn confirm(db:&sea_orm::DatabaseConnection,config:&crate::pinning::management::local_config::ManagementConfig,authorization:&LocalAuthorization,request:&PlanRequest,snapshot:&crate::pinning::management::Snapshot,plan:&crate::pinning::management::DryRunPlan,candidate_item_ids:Vec<String>,ttl:chrono::Duration)->Result<ConfirmedBinding> {
-    let reviewed=plan.confirmation(candidate_item_ids.clone());
-    let acknowledged=crate::pinning::management::plan::validate_confirmation(plan,&reviewed).map_err(|_|ManagementError::Confirmation)?;
-    if plan.items().iter().any(|entry|matches!(entry.status,crate::pinning::management::PlanStatus::Blocked(_)) || entry.status==crate::pinning::management::PlanStatus::Candidate&&!acknowledged.contains(entry.request.item_id.as_str())) {return Err(ManagementError::Confirmation);}
-    stage_confirmation(db,config,authorization,request,snapshot,plan,ttl).await?;
-    let confirmation=reviewed;
-    let bytes=crate::pinning::management::wire::encode_plan(request,snapshot,plan,Some(&confirmation)).map_err(|_|ManagementError::Confirmation)?;
-    let imported=crate::pinning::management::wire::decode_plan(&bytes).map_err(|_|ManagementError::Confirmation)?;
-    confirm_imported(db,config,authorization,&imported).await
+pub async fn confirm(
+    db: &sea_orm::DatabaseConnection,
+    config: &crate::pinning::management::local_config::ManagementConfig,
+    authorization: &LocalAuthorization,
+    proposal: (
+        &PlanRequest,
+        &crate::pinning::management::Snapshot,
+        &crate::pinning::management::DryRunPlan,
+    ),
+    candidate_item_ids: Vec<String>,
+    ttl: chrono::Duration,
+) -> Result<ConfirmedBinding> {
+    confirm_with_session(
+        db,
+        config,
+        authorization,
+        proposal,
+        &candidate_item_ids,
+        ttl,
+        SharedDecodeBudget::default(),
+    )
+    .await
+}
+pub async fn confirm_with_session(
+    db: &sea_orm::DatabaseConnection,
+    config: &crate::pinning::management::local_config::ManagementConfig,
+    authorization: &LocalAuthorization,
+    proposal: (
+        &PlanRequest,
+        &crate::pinning::management::Snapshot,
+        &crate::pinning::management::DryRunPlan,
+    ),
+    candidate_item_ids: &[String],
+    ttl: chrono::Duration,
+    work: SharedDecodeBudget,
+) -> Result<ConfirmedPlan> {
+    let (request, _, plan) = proposal;
+    let acknowledged = crate::pinning::management::plan::validate_acks(plan, candidate_item_ids)
+        .map_err(|_| ManagementError::Confirmation)?;
+    if plan.items().iter().any(|entry| {
+        matches!(
+            entry.status,
+            crate::pinning::management::PlanStatus::Blocked(_)
+        ) || entry.status == crate::pinning::management::PlanStatus::Candidate
+            && !acknowledged.contains(&entry.request.item_id)
+    }) {
+        return Err(ManagementError::Confirmation);
+    }
+    confirmation::stage_with_work(db, config, authorization, proposal, ttl, work.clone()).await?;
+    confirmation::confirm_staged(
+        db,
+        config,
+        authorization,
+        request,
+        candidate_item_ids,
+        None,
+        work,
+    )
+    .await
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,100 +369,95 @@ pub struct ActionReceipt {
     pub job_ids: Vec<String>,
 }
 
-/// Database record encoding only. The private material is NEVER an export/file
-/// format; public wire encoding deliberately excludes it and grants no authority.
-pub(crate) fn encode_confirmed_binding(binding:&ConfirmedBinding)->Result<String> {
-    let frame=binding.confirmation.native_frame.as_ref().ok_or(ManagementError::Confirmation)?;
-    frame.validate()?;
-    let encoded=serde_json::to_string(&(binding,frame.private_material())).map_err(|_|ManagementError::InvalidEvidence)?;
-    crate::pinning::management::wire::check_structure(encoded.as_bytes()).map_err(|_|ManagementError::Budget)?;
-    codec::pack(&encoded)
-}
-fn decode_confirmed_binding(input:&str)->Result<ConfirmedBinding> {
-    let input=codec::unpack(input)?;
-    crate::pinning::management::wire::check_structure(input.as_bytes()).map_err(|_|ManagementError::Budget)?;
-    let (mut binding,private):(ConfirmedBinding,Vec<(native::NativeKey,native::NativeRow)>)=serde_json::from_str(&input).map_err(|_|ManagementError::InvalidEvidence)?;
-    binding.confirmation.native_frame.as_mut().ok_or(ManagementError::Confirmation)?.restore_private(private)?;
-    Ok(binding)
+fn decode_binding_from_row(
+    source: &evidence::Evidence,
+    row: &native::NativeRow,
+) -> Result<ConfirmedBinding> {
+    source.binding(row, &mut *source.budget()?)
 }
 
-pub async fn write_action_receipt_in_transaction(tx:&DatabaseTransaction,auth:&LocalAuthorization,confirmation:&ConfirmedBinding,receipt:&ActionReceipt,native_before:&NativeFrame)->Result<()> {
-    confirmation.check(tx,auth).await?;
-    if confirmation.confirmation.native_frame.as_ref()!=Some(native_before) || !confirmation.confirmation.bindings.iter().any(|entry|*entry==receipt.binding) {return Err(ManagementError::Confirmation);}
-    validate_result_ids(tx,receipt).await?;
-    let result=serde_json::to_string(receipt).map_err(|_|ManagementError::InvalidEvidence)?;
-    write_result(tx, auth, confirmation, receipt, &result).await
-}
-
-async fn write_result(tx:&DatabaseTransaction,auth:&LocalAuthorization,confirmation:&ConfirmedBinding,receipt:&ActionReceipt,result:&str)->Result<()> {
+async fn write_result_with_work(
+    tx: &DatabaseTransaction,
+    auth: &LocalAuthorization,
+    confirmation: &ConfirmedBinding,
+    receipt: &ActionReceipt,
+    result: &str,
+    work: SharedDecodeBudget,
+) -> Result<DateTime<Utc>> {
     // B owns native locking/recheck and the preceding business mutation. This
     // seam records its result in that SAME transaction, not an apply operation.
-    let now=crate::store::database_clock::database_now(tx).await.map_err(|_|ManagementError::Database)?;
-    let encoded=confirmation::stored_encoding(tx,auth,confirmation).await?;
+    let now = crate::store::database_clock::database_now(tx)
+        .await
+        .map_err(|_| ManagementError::Database)?;
+    let encoded = confirmation.original_binding()?;
+    DecodeWork::shared(&work).copy(encoded)?;
+    DecodeWork::shared(&work).copy(&(
+        result,
+        &receipt.intent_ids,
+        &receipt.job_ids,
+        &auth.database_scope,
+        &confirmation.request.plan_id,
+        &receipt.binding.request.item_id,
+    ))?;
     #[cfg(test)]
-    fault_injection::before_write(tx,auth,confirmation,receipt).await?;
+    fault_injection::before_write(tx, auth, confirmation, receipt, &work).await?;
     let changed=tx.execute(Statement::from_sql_and_values(tx.get_database_backend(),
         "UPDATE pin_management_records SET result=$1,intent_ids=$2,job_ids=$3,state='applied',completed_at=$4 WHERE database_scope=$5 AND plan_id=$6 AND item_id=$7 AND kind='action' AND state='prepared' AND result IS NULL AND binding=$8",
         [result.to_owned().into(),serde_json::to_string(&receipt.intent_ids).map_err(|_|ManagementError::InvalidEvidence)?.into(),serde_json::to_string(&receipt.job_ids).map_err(|_|ManagementError::InvalidEvidence)?.into(),now.into(),auth.database_scope.clone().into(),confirmation.request.plan_id.clone().into(),receipt.binding.request.item_id.clone().into(),encoded.into()])).await.map_err(|_|ManagementError::Database)?;
-    if changed.rows_affected()!=1 {return Err(ManagementError::Confirmation);}
-    native::capture(tx).await?;
-    Ok(())
-}
-
-async fn validate_result_ids<C:ConnectionTrait>(db:&C,receipt:&ActionReceipt)->Result<()> {
-    use crate::pinning::management::{Action,Capture,Subject};
-    let frame=native::capture(db).await?;
-    if receipt.intent_ids.iter().collect::<std::collections::BTreeSet<_>>().len()!=receipt.intent_ids.len() || receipt.job_ids.iter().collect::<std::collections::BTreeSet<_>>().len()!=receipt.job_ids.len() {return Err(ManagementError::InvalidEvidence);}
-    match &receipt.binding.capture {
-        Some(Capture::Object(capture))=>{
-            if matches!(receipt.binding.request.action,Action::Create(_)|Action::Reapply(_)|Action::Backfill(_)) && receipt.intent_ids.is_empty() {return Err(ManagementError::InvalidEvidence);}
-            for id in &receipt.intent_ids {
-                let lease=frame.row("pin_leases",&[id]).ok_or(ManagementError::InvalidEvidence)?;
-                if native::value(lease,"owner_object_id")!=Some(&capture.owner_identity.object_id) {return Err(ManagementError::InvalidEvidence);}
-            }
-            for id in &receipt.job_ids {
-                let job=frame.row("pin_jobs",&[id]).ok_or(ManagementError::InvalidEvidence)?;
-                 if native::value(job,"cid").and_then(|cid|crate::pinning::provider::canonical_resource_cid(cid).ok()).as_deref()!=Some(&capture.object.identity.cid) {return Err(ManagementError::InvalidEvidence);}
-                if let Some(owner)=native::value(job,"lease_id") {
-                    let lease=frame.row("pin_leases",&[owner]).ok_or(ManagementError::InvalidEvidence)?;
-                    if native::value(lease,"owner_object_id")!=Some(&capture.owner_identity.object_id) {return Err(ManagementError::InvalidEvidence);}
-                }
-            }
-        },
-        Some(Capture::Provider(_))=>{
-            if !receipt.intent_ids.is_empty() || (!receipt.job_ids.is_empty()&&!matches!(&receipt.binding.request.action,Action::RetireWith {selection:crate::pinning::management::RetirementSelection::ControlledCleanup {..}})) {return Err(ManagementError::InvalidEvidence);}
-            let Subject::Provider {route}= &receipt.binding.request.subject else{return Err(ManagementError::Confirmation)};
-            let present=frame.table(super::schema::RETIREMENTS).ok_or(ManagementError::Schema)?.rows.iter().any(|row|native::value(row,"plan_id")==Some(receipt.binding.id.as_str().split(':').nth(1).unwrap_or("")) && native::value(row,"item_id")==Some(&receipt.binding.request.item_id) && native::value(row,"native_identity")==Some(&frame.database_identity) && native::value(row,"database_scope")==Some(&frame.database_scope) && frame.table("pin_provider_routes").is_some_and(|table|table.rows.iter().any(|registered|native::value(registered,"provider")==native::value(row,"allocation_domain") && native::value(registered,"snapshot").and_then(|value|serde_json::from_str::<crate::pinning::identity::ProviderRouteSnapshot>(value).ok()).as_ref()==route.original.as_ref())));
-            if !present {return Err(ManagementError::InvalidEvidence);}
-        },
-        None=>return Err(ManagementError::InvalidEvidence),
+    if changed.rows_affected() != 1 {
+        return Err(ManagementError::Confirmation);
     }
-    Ok(())
+    Ok(now)
 }
 
-pub async fn lookup_applied<C:ConnectionTrait>(db:&C,authorization:&LocalAuthorization,confirmation:&ConfirmedBinding,item_id:&str)->Result<Option<ActionReceipt>> {
-    authorization.check(db).await?;
-    if confirmation.principal!=authorization.principal || confirmation.database_scope!=authorization.database_scope || confirmation.database_identity!=authorization.database_identity {return Err(ManagementError::Unauthorized);}
-    let row=db.query_one(Statement::from_sql_and_values(db.get_database_backend(),"SELECT principal,native_identity,binding,result,intent_ids,job_ids FROM pin_management_records WHERE database_scope=$1 AND plan_id=$2 AND item_id=$3 AND kind='action' AND state='applied' AND completed_at IS NOT NULL",[authorization.database_scope.clone().into(),confirmation.request.plan_id.clone().into(),item_id.into()])).await.map_err(|_|ManagementError::Database)?;
-    let Some(row)=row else{return Ok(None)};
-    let binding:String=row.try_get("","binding").map_err(|_|ManagementError::InvalidEvidence)?;
-    let stored=decode_confirmed_binding(&binding)?;
-    if stored!=*confirmation || row.try_get::<String>("","principal").map_err(|_|ManagementError::InvalidEvidence)?!=authorization.principal || row.try_get::<String>("","native_identity").map_err(|_|ManagementError::InvalidEvidence)?!=authorization.database_identity {return Err(ManagementError::Confirmation);}
-    confirmation::stored_binding(db,authorization,confirmation).await?;
-    let (receipt,_)=results::decode_result(&row.try_get::<String>("","result").map_err(|_|ManagementError::InvalidEvidence)?)?;
-    if serde_json::from_str::<Vec<String>>(&row.try_get::<String>("","intent_ids").map_err(|_|ManagementError::InvalidEvidence)?).map_err(|_|ManagementError::InvalidEvidence)?!=receipt.intent_ids || serde_json::from_str::<Vec<String>>(&row.try_get::<String>("","job_ids").map_err(|_|ManagementError::InvalidEvidence)?).map_err(|_|ManagementError::InvalidEvidence)?!=receipt.job_ids {return Err(ManagementError::InvalidEvidence);}
-    if !confirmation.confirmation.bindings.iter().any(|entry|entry.request.item_id==item_id&&*entry==receipt.binding) {return Err(ManagementError::Confirmation);}
-    Ok(Some(receipt))
+pub async fn lookup_applied<C: ConnectionTrait>(
+    db: &C,
+    authorization: &LocalAuthorization,
+    confirmation: &ConfirmedBinding,
+    item_id: &str,
+) -> Result<Option<ActionReceipt>> {
+    lookup_trusted_committed(db, authorization, confirmation, item_id)
+        .await?
+        .map(|trusted| {
+            let receipt = &trusted.action_view().receipt;
+            trusted.binding().copy(receipt)?;
+            Ok(receipt.clone())
+        })
+        .transpose()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all="snake_case")]
-pub enum RecordKind { EvidencePreparation, Action }
-impl RecordKind { fn sql(self) -> &'static str { match self { Self::EvidencePreparation => "evidence_preparation", Self::Action => "action" } } }
+#[serde(rename_all = "snake_case")]
+pub enum RecordKind {
+    EvidencePreparation,
+    Action,
+}
+impl RecordKind {
+    fn sql(self) -> &'static str {
+        match self {
+            Self::EvidencePreparation => "evidence_preparation",
+            Self::Action => "action",
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all="snake_case")]
-pub enum RecordState { Prepared, Applied, Stopped, NeedsAttention }
-impl RecordState { fn sql(self) -> &'static str { match self { Self::Prepared => "prepared",Self::Applied => "applied",Self::Stopped => "stopped",Self::NeedsAttention => "needs_attention" } } }
+#[serde(rename_all = "snake_case")]
+pub enum RecordState {
+    Prepared,
+    Applied,
+    Stopped,
+    NeedsAttention,
+}
+impl RecordState {
+    fn sql(self) -> &'static str {
+        match self {
+            Self::Prepared => "prepared",
+            Self::Applied => "applied",
+            Self::Stopped => "stopped",
+            Self::NeedsAttention => "needs_attention",
+        }
+    }
+}
 
 /// Complete binding and original before/result are retained per item, in the
 /// caller's business transaction. A record ID alone never proves completion.
@@ -210,13 +474,33 @@ pub(crate) struct RecordWrite<'a> {
     pub expires_at: DateTime<Utc>,
 }
 
-pub(crate) async fn insert_in_transaction(tx: &DatabaseTransaction, auth: &LocalAuthorization, record: RecordWrite<'_>) -> Result<()> {
+pub(crate) async fn insert_in_transaction(
+    tx: &DatabaseTransaction,
+    auth: &LocalAuthorization,
+    record: RecordWrite<'_>,
+) -> Result<()> {
     auth.check(tx).await?;
-    if record.plan_id.is_empty() || record.item_id.is_empty() || record.binding.len().checked_add(record.native_before.len()).and_then(|n| n.checked_add(record.result.map_or(0,str::len))).is_none_or(|n| n > 16*1024*1024) { return Err(ManagementError::Budget); }
-    let now = crate::store::database_clock::database_now(tx).await.map_err(|_| ManagementError::Database)?;
-    if now >= record.expires_at { return Err(ManagementError::Expired); }
-    let intent_ids = serde_json::to_string(record.intent_ids).map_err(|_| ManagementError::InvalidEvidence)?;
-    let job_ids = serde_json::to_string(record.job_ids).map_err(|_| ManagementError::InvalidEvidence)?;
+    if record.plan_id.is_empty()
+        || record.item_id.is_empty()
+        || record
+            .binding
+            .len()
+            .checked_add(record.native_before.len())
+            .and_then(|n| n.checked_add(record.result.map_or(0, str::len)))
+            .is_none_or(|n| n > 16 * 1024 * 1024)
+    {
+        return Err(ManagementError::Budget);
+    }
+    let now = crate::store::database_clock::database_now(tx)
+        .await
+        .map_err(|_| ManagementError::Database)?;
+    if now >= record.expires_at {
+        return Err(ManagementError::Expired);
+    }
+    let intent_ids =
+        serde_json::to_string(record.intent_ids).map_err(|_| ManagementError::InvalidEvidence)?;
+    let job_ids =
+        serde_json::to_string(record.job_ids).map_err(|_| ManagementError::InvalidEvidence)?;
     tx.execute(Statement::from_sql_and_values(tx.get_database_backend(),
         "INSERT INTO pin_management_records (database_scope,plan_id,item_id,kind,principal,native_identity,binding,native_before,result,intent_ids,job_ids,state,created_at,expires_at,completed_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",
         [auth.database_scope.clone().into(),record.plan_id.into(),record.item_id.into(),record.kind.sql().into(),auth.principal.clone().into(),auth.database_identity.clone().into(),record.binding.into(),record.native_before.into(),record.result.map(str::to_owned).into(),intent_ids.into(),job_ids.into(),record.state.sql().into(),now.into(),record.expires_at.into(),record.result.map(|_| now).into()]))
@@ -227,17 +511,22 @@ pub(crate) async fn insert_in_transaction(tx: &DatabaseTransaction, auth: &Local
 /// Exact native evidence guard; B must invoke this only after its lock/barrier
 /// protocol and before publication. This does not acquire B's locks itself.
 pub async fn recheck_frame<C: ConnectionTrait>(db: &C, original: &NativeFrame) -> Result<()> {
-    if native::capture(db).await? != *original { return Err(ManagementError::Changed); }
+    if native::capture(db).await? != *original {
+        return Err(ManagementError::Changed);
+    }
     Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all="snake_case")]
-pub enum Disposition { Retain, Migrate, ControlledCleanup }
+#[serde(rename_all = "snake_case")]
+pub enum Disposition {
+    Retain,
+    Migrate,
+    ControlledCleanup,
+}
 
 /// Persistent domain barrier shape; enforcement belongs to wave C.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RetirementRecord {
     pub allocation_domain: String,
     pub database_scope: String,
@@ -246,7 +535,7 @@ pub struct RetirementRecord {
     pub principal: String,
     pub native_identity: String,
     pub binding: ConfirmedBinding,
-    pub inventory: NativeFrame,
+    pub inventory: ReviewHandle,
     pub disposition: Disposition,
     pub unresolved: Vec<String>,
     pub state: RetirementState,

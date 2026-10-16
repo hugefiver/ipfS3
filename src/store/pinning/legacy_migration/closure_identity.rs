@@ -62,7 +62,12 @@ fn route(ns: &Namespace, raw: &str) -> AppResult<()> {
 }
 
 pub(super) fn typed_route(ns: &Namespace, route: &ProviderRouteSnapshot) -> AppResult<()> {
-    facts(ns, &route.backend, &route.scope, Some(profile_type(&route.api_profile)?))
+    facts(
+        ns,
+        &route.backend,
+        &route.scope,
+        Some(profile_type(&route.api_profile)?),
+    )
 }
 
 fn resource(ns: &Namespace, value: &ObservedResource) -> AppResult<()> {

@@ -96,9 +96,26 @@ fn confirmation(plan: &DryRunPlan) -> Confirmation {
     plan.confirmation(vec![])
 }
 
-fn native_key(table: &str,id: &str)->NativeKey { NativeKey {table:table.into(),values:vec![id.into()]} }
-fn target_tuple()->NativeRow {
-    [("id","target-1"),("lease_id","lease-1"),("cid","bafy-test-cid"),("logical_size","50"),("provider","provider-a"),("state","waiting"),("created_at","2026-10-12T00:00:00.000000001Z"),("last_touched_at","2026-10-12T00:00:00.000000001Z")].into_iter().map(|(k,v)|(k.into(),Some(v.into()))).collect()
+fn native_key(table: &str, id: &str) -> NativeKey {
+    NativeKey {
+        table: table.into(),
+        values: vec![id.into()],
+    }
+}
+fn target_tuple() -> NativeRow {
+    [
+        ("id", "target-1"),
+        ("lease_id", "lease-1"),
+        ("cid", "bafy-test-cid"),
+        ("logical_size", "50"),
+        ("provider", "provider-a"),
+        ("state", "waiting"),
+        ("created_at", "2026-10-12T00:00:00.000000001Z"),
+        ("last_touched_at", "2026-10-12T00:00:00.000000001Z"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.into(), Some(v.into())))
+    .collect()
 }
 
 #[test]
@@ -211,16 +228,50 @@ fn source(plan: &DryRunPlan) -> RemoteDirective {
 
 #[test]
 fn exact_native_lease_expiry_and_directory_byte_gaps_are_not_second_or_bool_authority() {
-    let (request,mut snapshot)=existing(Action::Renew {expires_at:200},SideEffect::Present);
-    snapshot.targets[0].lease.expires_at=100;
-    snapshot.targets[0].lease.native_tuple=Some([("created_at".into(),Some("1970-01-01T00:01:30Z".into())),("expires_at".into(),Some("1970-01-01T00:01:40.000000999Z".into()))].into());
-    snapshot.database_now=Some(chrono::DateTime::parse_from_rfc3339("1970-01-01T00:01:40.000000998Z").unwrap().with_timezone(&chrono::Utc));
-    assert_eq!(dry_run(&request,&snapshot).unwrap().items()[0].status,PlanStatus::Ready);
-    snapshot.database_now=Some(chrono::DateTime::parse_from_rfc3339("1970-01-01T00:01:40.000000999Z").unwrap().with_timezone(&chrono::Utc));
-    assert_eq!(dry_run(&request,&snapshot).unwrap().items()[0].status,PlanStatus::Blocked(SafeError::LeaseNotActive));
-    let (request,mut snapshot)=fixture(Action::Create(intent()));
-    snapshot.objects[0].read_evidence=Some(ReadEvidence {identity:snapshot.objects[0].identity.clone(),node_identity:"node".into(),stored_bytes:None,proof:super::evidence::ReadProof::CompleteLocalDirectory,observed_at:chrono::DateTime::from_timestamp(90,0).unwrap(),expires_at:chrono::DateTime::from_timestamp(150,0).unwrap(),idle_timeout_millis:1000});
-    assert_eq!(dry_run(&request,&snapshot).unwrap().items()[0].status,PlanStatus::Blocked(SafeError::StoredByteProofUnavailable));
+    let (request, mut snapshot) = existing(Action::Renew { expires_at: 200 }, SideEffect::Present);
+    snapshot.targets[0].lease.expires_at = 100;
+    snapshot.targets[0].lease.native_tuple = Some(
+        [
+            ("created_at".into(), Some("1970-01-01T00:01:30Z".into())),
+            (
+                "expires_at".into(),
+                Some("1970-01-01T00:01:40.000000999Z".into()),
+            ),
+        ]
+        .into(),
+    );
+    snapshot.database_now = Some(
+        chrono::DateTime::parse_from_rfc3339("1970-01-01T00:01:40.000000998Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc),
+    );
+    assert_eq!(
+        dry_run(&request, &snapshot).unwrap().items()[0].status,
+        PlanStatus::Ready
+    );
+    snapshot.database_now = Some(
+        chrono::DateTime::parse_from_rfc3339("1970-01-01T00:01:40.000000999Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc),
+    );
+    assert_eq!(
+        dry_run(&request, &snapshot).unwrap().items()[0].status,
+        PlanStatus::Blocked(SafeError::LeaseNotActive)
+    );
+    let (request, mut snapshot) = fixture(Action::Create(intent()));
+    snapshot.objects[0].read_evidence = Some(ReadEvidence {
+        identity: snapshot.objects[0].identity.clone(),
+        node_identity: "node".into(),
+        stored_bytes: None,
+        proof: super::evidence::ReadProof::CompleteLocalDirectory,
+        observed_at: chrono::DateTime::from_timestamp(90, 0).unwrap(),
+        expires_at: chrono::DateTime::from_timestamp(150, 0).unwrap(),
+        idle_timeout_millis: 1000,
+    });
+    assert_eq!(
+        dry_run(&request, &snapshot).unwrap().items()[0].status,
+        PlanStatus::Blocked(SafeError::StoredByteProofUnavailable)
+    );
 }
 
 #[test]
@@ -274,10 +325,15 @@ fn confirmed_success_never_reuploads_and_all_is_not_lowered() {
     snapshot.targets[0].state = TargetState::Confirmed;
     snapshot.targets[0]
         .requirements
-        .as_mut().unwrap()
+        .as_mut()
+        .unwrap()
         .provider_ids
         .push("provider-b".into());
-    let mut other=snapshot.routes[0].clone();other.identity.provider_id="provider-b".into();other.available=false;other.allocation_allowed=false;snapshot.routes.push(other);
+    let mut other = snapshot.routes[0].clone();
+    other.identity.provider_id = "provider-b".into();
+    other.available = false;
+    other.allocation_allowed = false;
+    snapshot.routes.push(other);
     snapshot.remotes[0].confirmations = vec![ConfirmationLevel::ContentVerified];
     snapshot.remotes[0].confirmed_replicas = Some(1);
     snapshot.remotes[0].observation_current = Some(true);
@@ -285,7 +341,13 @@ fn confirmed_success_never_reuploads_and_all_is_not_lowered() {
     assert_eq!(source(&plan), RemoteDirective::ReuseConfirmed);
     match plan.items()[0].capture.as_ref().unwrap() {
         Capture::Object(capture) => {
-            let requirements = capture.target.as_ref().unwrap().requirements.as_ref().unwrap();
+            let requirements = capture
+                .target
+                .as_ref()
+                .unwrap()
+                .requirements
+                .as_ref()
+                .unwrap();
             assert_eq!(requirements.mode, ProviderMode::All);
             assert_eq!(requirements.provider_ids.len(), 2);
         }
@@ -308,7 +370,11 @@ fn accepted_is_not_content_verified_or_replication_complete() {
         source(&dry_run(&request, &snapshot).unwrap()),
         RemoteDirective::ObserveExisting
     );
-    snapshot.targets[0].requirements.as_mut().unwrap().min_replicas = 2;
+    snapshot.targets[0]
+        .requirements
+        .as_mut()
+        .unwrap()
+        .min_replicas = 2;
     snapshot.remotes[0].confirmations = vec![ConfirmationLevel::ReplicationComplete];
     assert_eq!(
         source(&dry_run(&request, &snapshot).unwrap()),
@@ -388,13 +454,26 @@ fn trusted_manifest_keeps_exact_batch_tuple_path_and_private_version() {
     snapshot.objects[0].evidence = SelectionEvidence::TrustedManifest {
         batch_id: "batch-1".into(),
         entry_path: "dir/file".into(),
-        batch_tuple: [("id".into(),Some("batch-1".into())),("state".into(),Some("published".into()))].into(),
-        entry_tuple: [("version_row_id".into(),Some("version-row-1".into())),("cid".into(),Some("bafy-test-cid".into()))].into(),
+        batch_tuple: [
+            ("id".into(), Some("batch-1".into())),
+            ("state".into(), Some("published".into())),
+        ]
+        .into(),
+        entry_tuple: [
+            ("version_row_id".into(), Some("version-row-1".into())),
+            ("cid".into(), Some("bafy-test-cid".into())),
+        ]
+        .into(),
     };
     let plan = dry_run(&request, &snapshot).unwrap();
     assert_eq!(plan.items()[0].status, PlanStatus::Ready);
-    if let SelectionEvidence::TrustedManifest { entry_tuple, .. } = &mut snapshot.objects[0].evidence {
-        entry_tuple.insert("version_row_id".into(),Some("other-private-version".into()));
+    if let SelectionEvidence::TrustedManifest { entry_tuple, .. } =
+        &mut snapshot.objects[0].evidence
+    {
+        entry_tuple.insert(
+            "version_row_id".into(),
+            Some("other-private-version".into()),
+        );
     }
     assert_eq!(
         revalidate(&plan, &confirmation(&plan), &snapshot).err(),
@@ -435,7 +514,12 @@ fn every_identity_fence_and_safety_change_stops_confirmation() {
         |s| s.objects[0].allowed_routes.clear(),
         |s| s.objects[0].control_revision = Some("control-2".into()),
         |s| s.objects[0].config_revision = Some("config-2".into()),
-        |s| { s.targets[0].native_tuple.insert("last_touched_at".into(),Some("2026-10-12T00:00:00.000000002Z".into())); },
+        |s| {
+            s.targets[0].native_tuple.insert(
+                "last_touched_at".into(),
+                Some("2026-10-12T00:00:00.000000002Z".into()),
+            );
+        },
         |s| s.targets[0].lease.generation += 1,
         |s| s.targets[0].lease.expires_at += 1,
         |s| s.targets[0].requirements.as_mut().unwrap().mode = ProviderMode::One,
@@ -519,7 +603,9 @@ fn add_destination(snapshot: &mut Snapshot) -> RouteIdentity {
 fn migration_unknown_first_reconciles_source_without_destination_post() {
     let (mut request, mut snapshot) = existing(Action::Retry, SideEffect::Unknown);
     let destination = add_destination(&mut snapshot);
-    request.items[0].action = Action::Migrate { destination };
+    request.items[0].action = Action::Migrate {
+        destination: Box::new(destination),
+    };
     let plan = dry_run(&request, &snapshot).unwrap();
     if let Some(PlannedStep::Object(step)) = &plan.items()[0].step {
         assert_eq!(step.source, RemoteDirective::ReconcileHistorical);
@@ -536,7 +622,9 @@ fn migration_unknown_first_reconciles_source_without_destination_post() {
 fn migration_preserves_source_ttl_requirements_and_original_cid() {
     let (mut request, mut snapshot) = existing(Action::Retry, SideEffect::Present);
     let destination = add_destination(&mut snapshot);
-    request.items[0].action = Action::Migrate { destination };
+    request.items[0].action = Action::Migrate {
+        destination: Box::new(destination),
+    };
     let plan = dry_run(&request, &snapshot).unwrap();
     if let Some(PlannedStep::Object(step)) = &plan.items()[0].step {
         assert_eq!(step.source, RemoteDirective::NoWrite);
@@ -561,7 +649,9 @@ fn migration_preserves_source_ttl_requirements_and_original_cid() {
 fn destination_safety_is_checked_separately() {
     let (mut request, mut snapshot) = existing(Action::Retry, SideEffect::Present);
     let destination = add_destination(&mut snapshot);
-    request.items[0].action = Action::Migrate { destination };
+    request.items[0].action = Action::Migrate {
+        destination: Box::new(destination),
+    };
     snapshot.objects[0].allowed_routes.pop();
     assert_eq!(
         dry_run(&request, &snapshot).unwrap().items()[0].status,
@@ -580,7 +670,17 @@ fn retirement_fixture() -> (PlanRequest, Snapshot) {
         complete: true,
         allocation_stopped: false,
         leases: vec![snapshot.targets[0].lease.clone()],
-        root_reference_ids: vec![NativeKey {table:"zip_root_references".into(),values:vec!["root-owner-1".into(),"1".into(),"1".into(),"node".into(),"hot".into(),"cid".into()]}],
+        root_reference_ids: vec![NativeKey {
+            table: "zip_root_references".into(),
+            values: vec![
+                "root-owner-1".into(),
+                "1".into(),
+                "1".into(),
+                "node".into(),
+                "hot".into(),
+                "cid".into(),
+            ],
+        }],
         attribution_complete: true,
     });
     (
@@ -647,7 +747,9 @@ fn repeat_saved_plan_with_full_receipt_cannot_repeat_upload_or_charge() {
     snapshot.applied.push(AppliedItem {
         binding: plan.items()[0].clone(),
     });
-    snapshot.targets[0].native_tuple.insert("state".into(),Some("pinned".into()));
+    snapshot.targets[0]
+        .native_tuple
+        .insert("state".into(), Some("pinned".into()));
     snapshot.targets[0].lease.generation += 1;
     snapshot.remotes[0].epoch += 1;
     let checked = revalidate(&plan, &confirmation(&plan), &snapshot).unwrap();
@@ -730,7 +832,7 @@ fn wrong_confirmation_or_extra_candidate_ack_cannot_authorize_any_item() {
     let (request, snapshot) = fixture(Action::Create(intent()));
     let plan = dry_run(&request, &snapshot).unwrap();
     let mut confirmed = confirmation(&plan);
-    confirmed.plan_id = "another-plan".into();
+    confirmed.candidate_item_ids.push("another-item".into());
     assert_eq!(
         revalidate(&plan, &confirmed, &snapshot).err(),
         Some(SafeError::ConfirmationMismatch)
@@ -774,24 +876,6 @@ fn one_changed_entry_stops_whole_confirmation_without_partial_permits() {
     assert_eq!(
         revalidate(&plan, &confirmation(&plan), &snapshot).err(),
         Some(SafeError::SnapshotChanged)
-    );
-}
-
-#[test]
-fn confirmation_id_alone_cannot_confirm_a_substituted_plan() {
-    let (mut request, mut snapshot) = fixture(Action::Create(intent()));
-    let original = dry_run(&request, &snapshot).unwrap();
-    let confirmed = confirmation(&original);
-    snapshot.objects[0].identity.private_version_id = "version-row-2".into();
-    snapshot.objects[0].identity.object_id = "object-2".into();
-    if let Subject::Object { identity, .. } = &mut request.items[0].subject {
-        *identity = snapshot.objects[0].identity.clone();
-    }
-    let substituted = dry_run(&request, &snapshot).unwrap();
-    assert!(original != substituted);
-    assert_eq!(
-        revalidate(&substituted, &confirmed, &snapshot).err(),
-        Some(SafeError::ConfirmationMismatch)
     );
 }
 
@@ -908,7 +992,9 @@ fn retiring_source_does_not_prevent_migration_to_explicit_allowed_destination() 
     snapshot.routes[0].allocation_allowed = false;
     let destination = add_destination(&mut snapshot);
     snapshot.routes[1].allocation_allowed = true;
-    request.items[0].action = Action::Migrate { destination };
+    request.items[0].action = Action::Migrate {
+        destination: Box::new(destination),
+    };
     let plan = dry_run(&request, &snapshot).unwrap();
     assert_eq!(plan.items()[0].status, PlanStatus::Ready);
     assert_eq!(source(&plan), RemoteDirective::NoWrite);

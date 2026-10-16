@@ -42,9 +42,9 @@ use crate::{
 use super::{jobs, leases, ledger, quota, tags};
 
 mod hot_receipt;
+pub mod management;
 mod zip;
 mod zip_v2;
-pub mod management;
 
 pub use crate::store::zip::execution as v2_execution;
 pub use zip::{
@@ -1922,16 +1922,67 @@ async fn insert_lease<C: ConnectionTrait>(
     let expires_at = now
         .checked_add_signed(TimeDelta::seconds(seconds))
         .ok_or_else(|| invalid_publication("lease expiry is out of range"))?;
-    insert_absolute_lease(db, lease_id, owner_object_id, source_name(intent.source), intent, targets, now, expires_at, now, None).await
+    insert_absolute_lease(
+        db,
+        lease_id,
+        owner_object_id,
+        source_name(intent.source),
+        intent,
+        targets,
+        now,
+        expires_at,
+        now,
+        None,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn insert_absolute_lease<C: ConnectionTrait>(
-    db: &C, lease_id: &str, owner_object_id: &str, source: &str,
-    intent: &LeaseIntent, targets: &[PinTargetSpec], started_at: DateTime<Utc>,
-    expires_at: DateTime<Utc>, now: DateTime<Utc>, requirements: Option<&crate::pinning::management::Requirements>,
+    db: &C,
+    lease_id: &str,
+    owner_object_id: &str,
+    source: &str,
+    intent: &LeaseIntent,
+    targets: &[PinTargetSpec],
+    started_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+    requirements: Option<&crate::pinning::management::Requirements>,
 ) -> AppResult<()> {
-    if expires_at <= started_at { return Err(invalid_publication("invalid absolute lease interval")); }
+    let work = super::management::records::SharedDecodeBudget::default();
+    insert_absolute_lease_with_work(
+        db,
+        lease_id,
+        owner_object_id,
+        source,
+        intent,
+        targets,
+        started_at,
+        expires_at,
+        now,
+        requirements,
+        super::management::records::DecodeWork::shared(&work),
+    )
+    .await
+}
+#[allow(clippy::too_many_arguments)]
+async fn insert_absolute_lease_with_work<C: ConnectionTrait>(
+    db: &C,
+    lease_id: &str,
+    owner_object_id: &str,
+    source: &str,
+    intent: &LeaseIntent,
+    targets: &[PinTargetSpec],
+    started_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+    requirements: Option<&crate::pinning::management::Requirements>,
+    work: super::management::records::DecodeWork<'_>,
+) -> AppResult<()> {
+    if expires_at <= started_at {
+        return Err(invalid_publication("invalid absolute lease interval"));
+    }
     pin_lease::Entity::insert(pin_lease::ActiveModel {
         id: Set(lease_id.to_owned()),
         owner_object_id: Set(owner_object_id.to_owned()),
@@ -1947,22 +1998,37 @@ async fn insert_absolute_lease<C: ConnectionTrait>(
     })
     .exec(db)
     .await?;
-    if let Some(requirements)=requirements {
-        crate::store::entities::pin_lease_requirement::contract::insert_management(
-            db,lease_id,owner_object_id,provider_mode_name(intent.provider_mode),content_mode_name(intent.content_mode),
-            targets.iter().map(|target|target.cid.clone()),&intent.providers,started_at,requirements,
-        ).await?;
-    } else { crate::store::entities::pin_lease_requirement::contract::insert(
-        db,
-        lease_id,
-        owner_object_id,
-        provider_mode_name(intent.provider_mode),
-        content_mode_name(intent.content_mode),
-        targets.iter().map(|target| target.cid.clone()),
-        &intent.providers,
-        started_at,
-    )
-    .await?; }
+    if let Some(requirements) = requirements {
+        for target in targets {
+            work.copy(&target.cid)
+                .map_err(super::management::admission::work_error)?;
+        }
+        crate::store::entities::pin_lease_requirement::contract::insert_management_with_work(
+            db,
+            lease_id,
+            owner_object_id,
+            provider_mode_name(intent.provider_mode),
+            content_mode_name(intent.content_mode),
+            targets.iter().map(|target| target.cid.clone()),
+            &intent.providers,
+            started_at,
+            requirements,
+            work,
+        )
+        .await?;
+    } else {
+        crate::store::entities::pin_lease_requirement::contract::insert(
+            db,
+            lease_id,
+            owner_object_id,
+            provider_mode_name(intent.provider_mode),
+            content_mode_name(intent.content_mode),
+            targets.iter().map(|target| target.cid.clone()),
+            &intent.providers,
+            started_at,
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -2000,19 +2066,47 @@ async fn assign_target_providers<C: ConnectionTrait>(
     affected_remotes: &mut BTreeSet<(String, String)>,
     failed_user_touches: &mut BTreeSet<(String, String)>,
 ) -> AppResult<()> {
+    let work = super::management::records::SharedDecodeBudget::default();
+    assign_target_providers_with_work(
+        db,
+        lease_id,
+        intent,
+        target,
+        limits,
+        now,
+        assigned_targets,
+        affected_remotes,
+        failed_user_touches,
+        super::management::records::DecodeWork::shared(&work),
+    )
+    .await
+}
+#[allow(clippy::too_many_arguments)]
+async fn assign_target_providers_with_work<C: ConnectionTrait>(
+    db: &C,
+    lease_id: &str,
+    intent: &LeaseIntent,
+    target: &PinTargetSpec,
+    limits: &ProviderLimitMap,
+    now: DateTime<Utc>,
+    assigned_targets: &mut BTreeMap<(String, String), quota::ReservationOutcome>,
+    affected_remotes: &mut BTreeSet<(String, String)>,
+    failed_user_touches: &mut BTreeSet<(String, String)>,
+    work: super::management::records::DecodeWork<'_>,
+) -> AppResult<()> {
     let providers = ordered_enabled_providers(intent, limits)?;
     match intent.provider_mode {
         ProviderMode::All => {
             for provider in providers {
                 let target = PinTargetSpec {
-                    cid: ledger::allocation_cid(db, &provider, &target.cid).await?,
+                    cid: ledger::allocation_cid_with_work(db, &provider, &target.cid, work).await?,
                     logical_size: target.logical_size,
                 };
                 let pair = (provider.clone(), target.cid.clone());
                 if assigned_targets.contains_key(&pair) {
                     continue;
                 }
-                let outcome = reserve_and_insert_target(
+                let outcome = reserve_and_insert_target_with_work(
                     db,
                     lease_id,
                     &provider,
@@ -2021,6 +2115,7 @@ async fn assign_target_providers<C: ConnectionTrait>(
                     now,
                     affected_remotes,
                     failed_user_touches,
+                    work,
                 )
                 .await?;
                 assigned_targets.insert(pair, outcome);
@@ -2030,7 +2125,7 @@ async fn assign_target_providers<C: ConnectionTrait>(
             let mut first_unavailable = None;
             for provider in providers {
                 let target = PinTargetSpec {
-                    cid: ledger::allocation_cid(db, &provider, &target.cid).await?,
+                    cid: ledger::allocation_cid_with_work(db, &provider, &target.cid, work).await?,
                     logical_size: target.logical_size,
                 };
                 let pair = (provider.clone(), target.cid.clone());
@@ -2048,13 +2143,14 @@ async fn assign_target_providers<C: ConnectionTrait>(
                     // non-RPC provider. Preserve that provider's fallback chance.
                     continue;
                 }
-                let outcome = quota::reserve_unique(
+                let outcome = quota::reserve_unique_with_work(
                     db,
                     &provider,
                     &target.cid,
                     target.logical_size,
                     limits,
                     now,
+                    work,
                 )
                 .await?;
                 if matches!(
@@ -2094,7 +2190,7 @@ async fn assign_target_providers<C: ConnectionTrait>(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn reserve_and_insert_target<C: ConnectionTrait>(
+async fn reserve_and_insert_target_with_work<C: ConnectionTrait>(
     db: &C,
     lease_id: &str,
     provider: &str,
@@ -2103,9 +2199,18 @@ async fn reserve_and_insert_target<C: ConnectionTrait>(
     now: DateTime<Utc>,
     affected_remotes: &mut BTreeSet<(String, String)>,
     failed_user_touches: &mut BTreeSet<(String, String)>,
+    work: super::management::records::DecodeWork<'_>,
 ) -> AppResult<quota::ReservationOutcome> {
-    let outcome =
-        quota::reserve_unique(db, provider, &target.cid, target.logical_size, limits, now).await?;
+    let outcome = quota::reserve_unique_with_work(
+        db,
+        provider,
+        &target.cid,
+        target.logical_size,
+        limits,
+        now,
+        work,
+    )
+    .await?;
     insert_target(db, lease_id, provider, target, &outcome, now).await?;
     if matches!(
         outcome,

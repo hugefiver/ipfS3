@@ -10,8 +10,10 @@ pub mod tier_copy;
 pub mod verification;
 
 pub use client::KuboClient;
+pub use directoryproof::{
+    DirectoryProofBudgets, LocalDirectoryRootKind, LocalDirectoryVerificationReceipt,
+};
 pub use verification::LocalResidencyVerificationReceipt;
-pub use directoryproof::{DirectoryProofBudgets, LocalDirectoryRootKind, LocalDirectoryVerificationReceipt};
 
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};

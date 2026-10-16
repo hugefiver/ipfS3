@@ -229,8 +229,15 @@ pub async fn admit_in_transaction(
     {
         return Err(invalid());
     }
-    if read_by_identity(tx, &request.owner, &request.source, &request.token).await?.is_none() {
-        crate::store::pinning::management::admission::lock_encoded_zip_intake_in_transaction(tx, &request.captured_options).await?;
+    if read_by_identity(tx, &request.owner, &request.source, &request.token)
+        .await?
+        .is_none()
+    {
+        crate::store::pinning::management::admission::lock_encoded_zip_intake_in_transaction(
+            tx,
+            &request.captured_options,
+        )
+        .await?;
     }
     let now = database_now(tx).await?;
     tx.execute(statement(tx,

@@ -131,6 +131,9 @@ mod migrator {
                 ),
                 Box::new(crate::store::migrations::m20261008_000001_zip_intent_capture::Migration),
                 Box::new(crate::store::migrations::m20261012_000001_pinning_management::Migration),
+                Box::new(
+                    crate::store::migrations::m20261013_000001_zip_root_logical_release::Migration,
+                ),
             ]
         }
     }

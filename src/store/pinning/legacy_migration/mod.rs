@@ -21,13 +21,26 @@ pub use compat::{
     captured_provider, job_io_allowed, original_job_provider, release_history, resource_binding,
     resource_key,
 };
+pub(crate) use compat::{original_job_provider_with_work, release_history_with_work};
+pub(crate) use compat::{resource_binding_with_work, resource_key_budgeted};
 pub use inventory::inventory;
 pub use inventory::rollback_inventory;
 pub use inventory::validate as validate_declaration;
 pub use model::{
     Binding, Confirmation, Declaration, Maintenance, Namespace, NativeRow, Receipt, TableImage,
 };
+pub(crate) use receipt::resolve_legacy_binding_with_work;
+pub(crate) use receipt::source_is_migrated_with_work;
 pub use receipt::{LegacyBinding, historical_keys, resolve_legacy_binding, source_is_migrated};
+pub(crate) async fn historical_keys_budgeted<C: sea_orm::ConnectionTrait>(
+    db: &C,
+    table: &str,
+    provider: &str,
+    cid: Option<&str>,
+    work: crate::store::pinning::management::records::DecodeWork<'_>,
+) -> crate::store::pinning::management::Result<Vec<String>> {
+    receipt::historical_keys_with_work(db, table, provider, cid, &work).await
+}
 
 use crate::error::AppError;
 

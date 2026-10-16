@@ -2,7 +2,9 @@
 use super::{management_catalog_tests::declaration, migration, store};
 use crate::store::pinning::{management::schema, quota};
 use futures_util::FutureExt;
-use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, Statement, TransactionTrait};
+use sea_orm::{
+    ConnectOptions, ConnectionTrait, Database, DatabaseConnection, Statement, TransactionTrait,
+};
 use sea_orm_migration::MigratorTrait;
 use std::{future::Future, panic::AssertUnwindSafe};
 
@@ -11,37 +13,66 @@ where
     F: FnOnce(DatabaseConnection, DatabaseConnection) -> Fut,
     Fut: Future<Output = ()>,
 {
-    assert_eq!(std::env::var("IPFS_S3_R26_PG_OWNED").as_deref(),
-        Ok("legacy-r26-fixture-only"), "explicit parent-owned fixture marker required");
-    let url = std::env::var("IPFS_S3_TEST_POSTGRES_URL").expect("authorized isolated PG URL required");
+    assert_eq!(
+        std::env::var("IPFS_S3_R26_PG_OWNED").as_deref(),
+        Ok("legacy-r26-fixture-only"),
+        "explicit parent-owned fixture marker required"
+    );
+    let url =
+        std::env::var("IPFS_S3_TEST_POSTGRES_URL").expect("authorized isolated PG URL required");
     let admin = Database::connect(&url).await.unwrap();
     let schema = format!("r26_{}", uuid::Uuid::new_v4().simple());
-    admin.execute_unprepared(&format!("CREATE SCHEMA {schema}")).await.unwrap();
+    admin
+        .execute_unprepared(&format!("CREATE SCHEMA {schema}"))
+        .await
+        .unwrap();
     let result = AssertUnwindSafe(async {
         let mut connections = vec![];
         for _ in 0..2 {
             let mut options = ConnectOptions::new(&url);
             options.max_connections(1).min_connections(1);
             let db = Database::connect(options).await.unwrap();
-            db.execute_unprepared(&format!("SET search_path TO {schema}")).await.unwrap();
+            db.execute_unprepared(&format!("SET search_path TO {schema}"))
+                .await
+                .unwrap();
             db.execute_unprepared("SET TIME ZONE 'UTC'").await.unwrap();
-            db.execute_unprepared("SET statement_timeout='8s'").await.unwrap();
+            db.execute_unprepared("SET statement_timeout='8s'")
+                .await
+                .unwrap();
             connections.push(db);
         }
         let registry = store::migrator::Migrator::migrations();
-        let count = registry.iter().position(|migration| migration.name() == endpoint).unwrap() + 1;
-        store::migrator::Migrator::up(&connections[0], Some(count as u32)).await.unwrap();
+        let count = registry
+            .iter()
+            .position(|migration| migration.name() == endpoint)
+            .unwrap()
+            + 1;
+        store::migrator::Migrator::up(&connections[0], Some(count as u32))
+            .await
+            .unwrap();
         body(connections[0].clone(), connections[1].clone()).await;
-        for db in connections {db.close().await.unwrap();}
-    }).catch_unwind().await;
+        for db in connections {
+            db.close().await.unwrap();
+        }
+    })
+    .catch_unwind()
+    .await;
     assert!(schema.starts_with("r26_") && schema.len() == 36);
     let owned = admin.query_one(Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres,
         "SELECT 1 FROM pg_namespace WHERE nspname=$1 AND nspowner=(SELECT oid FROM pg_roles WHERE rolname=current_user)",
         [schema.clone().into()])).await.unwrap();
-    assert!(owned.is_some(), "cleanup target no longer owned by this fixture");
-    admin.execute_unprepared(&format!("DROP SCHEMA {schema} CASCADE")).await.unwrap();
+    assert!(
+        owned.is_some(),
+        "cleanup target no longer owned by this fixture"
+    );
+    admin
+        .execute_unprepared(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
     admin.close().await.unwrap();
-    if let Err(error) = result {std::panic::resume_unwind(error);}
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
 }
 
 #[tokio::test]
@@ -50,7 +81,14 @@ async fn native_management_record_row_and_empty_retirement_phantom_are_nowait_fe
     isolated(schema::VERSION, |a, b| async move {
         let declaration = declaration(&a).await;
         let plan = migration::inventory(&a, &declaration).await.unwrap();
-        assert!(plan.before.iter().find(|table| table.table == schema::RETIREMENTS).unwrap().rows.is_empty());
+        assert!(
+            plan.before
+                .iter()
+                .find(|table| table.table == schema::RETIREMENTS)
+                .unwrap()
+                .rows
+                .is_empty()
+        );
         for writer_sql in [
             "UPDATE pin_management_records SET binding=binding WHERE kind='database_scope'",
             // Even no rows take the same RowExclusive table lock as a first INSERT.
@@ -58,17 +96,30 @@ async fn native_management_record_row_and_empty_retirement_phantom_are_nowait_fe
         ] {
             let writer = b.begin().await.unwrap();
             writer.execute_unprepared(writer_sql).await.unwrap();
-            assert!(migration::apply(&a, &declaration, &plan).await.is_err(), "{writer_sql}");
+            assert!(
+                migration::apply(&a, &declaration, &plan).await.is_err(),
+                "{writer_sql}"
+            );
             writer.rollback().await.unwrap();
-            assert_eq!(migration::inventory(&a, &declaration).await.unwrap().before, plan.before);
-            assert_eq!(super::super::frontier(&a, &plan.schema).await.unwrap(), plan.receipt_frontier);
+            assert_eq!(
+                migration::inventory(&a, &declaration).await.unwrap().before,
+                plan.before
+            );
+            assert_eq!(
+                super::super::frontier(&a, &plan.schema).await.unwrap(),
+                plan.receipt_frontier
+            );
             let usage = quota::read_usage(&a, "old").await.unwrap().unwrap();
             assert_eq!((usage.reserved_bytes, usage.reserved_pins), (97, 3));
         }
         let receipt = migration::apply(&a, &declaration, &plan).await.unwrap();
-        assert_eq!(migration::apply(&b, &declaration, &plan).await.unwrap(), receipt);
+        assert_eq!(
+            migration::apply(&b, &declaration, &plan).await.unwrap(),
+            receipt
+        );
         migration::rollback(&b, &receipt.id, &plan).await.unwrap();
-    }).await;
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -105,7 +156,8 @@ async fn native_forward_guard_fences_retirement_absence_before_route_row_locks()
 
 #[tokio::test]
 #[ignore = "parent owned PostgreSQL fixture required"]
-async fn native_management_same_count_key_private_text_and_subsecond_time_drift_are_zero_write_rejections() {
+async fn native_management_same_count_key_private_text_and_subsecond_time_drift_are_zero_write_rejections()
+ {
     for damage in [
         "UPDATE pin_management_records SET database_scope=database_scope||'-changed' WHERE kind='database_scope'",
         "UPDATE pin_management_records SET binding=binding||' ' WHERE kind='database_scope'",
@@ -117,40 +169,74 @@ async fn native_management_same_count_key_private_text_and_subsecond_time_drift_
             let plan = migration::inventory(&a, &declaration).await.unwrap();
             b.execute_unprepared(damage).await.unwrap();
             let changed = super::super::read(&a, &plan.schema).await.unwrap();
-            assert_eq!(changed.iter().find(|table| table.table == schema::RECORDS).unwrap().rows.len(), 1);
+            assert_eq!(
+                changed
+                    .iter()
+                    .find(|table| table.table == schema::RECORDS)
+                    .unwrap()
+                    .rows
+                    .len(),
+                1
+            );
             assert_ne!(changed, plan.before);
-            assert!(migration::apply(&a, &declaration, &plan).await.is_err(), "{damage}");
+            assert!(
+                migration::apply(&a, &declaration, &plan).await.is_err(),
+                "{damage}"
+            );
             assert_eq!(super::super::read(&a, &plan.schema).await.unwrap(), changed);
-            assert_eq!(super::super::frontier(&a, &plan.schema).await.unwrap(), plan.receipt_frontier);
+            assert_eq!(
+                super::super::frontier(&a, &plan.schema).await.unwrap(),
+                plan.receipt_frontier
+            );
             let usage = quota::read_usage(&a, "old").await.unwrap().unwrap();
             assert_eq!((usage.reserved_bytes, usage.reserved_pins), (97, 3));
-        }).await;
+        })
+        .await;
     }
 }
 
 #[tokio::test]
 #[ignore = "parent owned PostgreSQL fixture required"]
-async fn native_original_four_prefixes_remain_readable_and_old_writable_prefixes_lock_no_management_table() {
-    for endpoint in ["m20261004_000001_rpc_submission_ledger", "m20261004_000002_cluster_replica_contract",
-        migration::SCHEMA, "m20261008_000001_zip_intent_capture"] {
+async fn native_original_four_prefixes_remain_readable_and_old_writable_prefixes_lock_no_management_table()
+ {
+    for endpoint in [
+        "m20261004_000001_rpc_submission_ledger",
+        "m20261004_000002_cluster_replica_contract",
+        migration::SCHEMA,
+        "m20261008_000001_zip_intent_capture",
+    ] {
         isolated(endpoint, |a, b| async move {
             let declaration = declaration(&a).await;
             let plan = migration::inventory(&a, &declaration).await.unwrap();
             assert_eq!(plan.schema.last().map(String::as_str), Some(endpoint));
-            assert!(plan.before.iter().all(|table| !table.table.starts_with("pin_management_")));
-            if matches!(endpoint, migration::SCHEMA | "m20261008_000001_zip_intent_capture") {
+            assert!(
+                plan.before
+                    .iter()
+                    .all(|table| !table.table.starts_with("pin_management_"))
+            );
+            if matches!(
+                endpoint,
+                migration::SCHEMA | "m20261008_000001_zip_intent_capture"
+            ) {
                 let receipt = migration::apply(&a, &declaration, &plan).await.unwrap();
-                assert_eq!(migration::apply(&b, &declaration, &plan).await.unwrap(), receipt);
+                assert_eq!(
+                    migration::apply(&b, &declaration, &plan).await.unwrap(),
+                    receipt
+                );
                 migration::rollback(&b, &receipt.id, &plan).await.unwrap();
             } else {
                 assert!(migration::apply(&a, &declaration, &plan).await.is_err());
-                assert_eq!(super::super::read(&a, &plan.schema).await.unwrap(), plan.before);
+                assert_eq!(
+                    super::super::read(&a, &plan.schema).await.unwrap(),
+                    plan.before
+                );
                 store::run_migrations(&a).await.unwrap();
                 assert!(migration::apply(&a, &declaration, &plan).await.is_err());
                 let fresh = migration::inventory(&a, &declaration).await.unwrap();
                 migration::apply(&a, &declaration, &fresh).await.unwrap();
             }
-        }).await;
+        })
+        .await;
     }
 }
 

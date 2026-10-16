@@ -28,33 +28,74 @@ No HTTP endpoint is added. Errors omit paths, DB URLs, SQL and secret/provider d
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Help,
-    DryRun { request: String, source_node: Option<String>, output: Option<String> },
-    Confirm { request: String, source_node: Option<String>, output: String, acknowledgements: Vec<String>, ttl_seconds: u32 },
-    Apply { confirmed: String, run: bool },
-    Status { confirmed: String },
-    Prepare { request: String },
+    DryRun {
+        request: String,
+        source_node: Option<String>,
+        output: Option<String>,
+    },
+    Confirm {
+        request: String,
+        source_node: Option<String>,
+        output: String,
+        acknowledgements: Vec<String>,
+        ttl_seconds: u32,
+    },
+    Apply {
+        confirmed: String,
+        run: bool,
+    },
+    Status {
+        confirmed: String,
+    },
+    Prepare {
+        request: String,
+    },
 }
 
-fn usage() -> anyhow::Error { anyhow!(HELP) }
+fn usage() -> anyhow::Error {
+    anyhow!(HELP)
+}
 
 fn operand(value: &str) -> bool {
-    !value.is_empty() && value.len() <= 4096 && !value.starts_with("--") && !value.chars().any(char::is_control)
+    !value.is_empty()
+        && value.len() <= 4096
+        && !value.starts_with("--")
+        && !value.chars().any(char::is_control)
 }
 
 fn acknowledgement(value: &str) -> bool {
-    !value.is_empty() && value.len() <= 256
-        && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    !value.is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
 }
 
 pub fn parse(args: &[String]) -> Result<Option<Command>> {
-    if args.first().is_none_or(|flag| flag != "--pinning-manage") { return Ok(None); }
-    if args.len() > 2 * MAX_ITEMS + 12 { return Err(usage()); }
+    if args.first().is_none_or(|flag| flag != "--pinning-manage") {
+        return Ok(None);
+    }
+    if args.len() > 2 * MAX_ITEMS + 12 {
+        return Err(usage());
+    }
     let command = match &args[1..] {
         [flag] if flag == "--help" => Command::Help,
-        [flag, file] if flag == "--apply" && operand(file) => Command::Apply { confirmed: file.clone(), run: false },
-        [flag, file, run] if flag == "--apply" && operand(file) && run == "--run" => Command::Apply { confirmed: file.clone(), run: true },
-        [flag, file] if flag == "--status" && operand(file) => Command::Status { confirmed: file.clone() },
-        [flag, file] if flag == "--prepare" && operand(file) => Command::Prepare { request: file.clone() },
+        [flag, file] if flag == "--apply" && operand(file) => Command::Apply {
+            confirmed: file.clone(),
+            run: false,
+        },
+        [flag, file, run] if flag == "--apply" && operand(file) && run == "--run" => {
+            Command::Apply {
+                confirmed: file.clone(),
+                run: true,
+            }
+        }
+        [flag, file] if flag == "--status" && operand(file) => Command::Status {
+            confirmed: file.clone(),
+        },
+        [flag, file] if flag == "--prepare" && operand(file) => Command::Prepare {
+            request: file.clone(),
+        },
         [request, rest @ ..] if operand(request) => parse_request(request, rest)?,
         _ => return Err(usage()),
     };
@@ -69,29 +110,56 @@ fn parse_request(request: &str, rest: &[String]) -> Result<Command> {
     let mut acknowledgements = Vec::new();
     let mut options = rest.iter();
     while let Some(flag) = options.next() {
-        let value = options.next().filter(|value| operand(value)).ok_or_else(usage)?;
+        let value = options
+            .next()
+            .filter(|value| operand(value))
+            .ok_or_else(usage)?;
         match flag.as_str() {
-            "--source-node" if source_node.is_none() && value.len() <= 256 => source_node = Some(value.clone()),
+            "--source-node" if source_node.is_none() && value.len() <= 256 => {
+                source_node = Some(value.clone())
+            }
             "--output" if output.is_none() => output = Some(value.clone()),
-            "--confirm" if confirmation_output.is_none() => confirmation_output = Some(value.clone()),
+            "--confirm" if confirmation_output.is_none() => {
+                confirmation_output = Some(value.clone())
+            }
             "--ttl-seconds" if ttl.is_none() => {
-                if !value.bytes().all(|byte| byte.is_ascii_digit()) { return Err(usage()); }
+                if !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return Err(usage());
+                }
                 let seconds = value.parse::<u32>().map_err(|_| usage())?;
-                if !(1..=900).contains(&seconds) { return Err(usage()); }
+                if !(1..=900).contains(&seconds) {
+                    return Err(usage());
+                }
                 ttl = Some(seconds);
             }
             "--ack-item" if acknowledgements.len() < MAX_ITEMS && acknowledgement(value) => {
-                if acknowledgements.contains(value) { return Err(usage()); }
+                if acknowledgements.contains(value) {
+                    return Err(usage());
+                }
                 acknowledgements.push(value.clone());
             }
             _ => return Err(usage()),
         }
     }
     if let Some(output_path) = confirmation_output {
-        if output.is_some() { return Err(usage()); }
-        Ok(Command::Confirm { request: request.into(), source_node, output: output_path, acknowledgements, ttl_seconds: ttl.unwrap_or(300) })
+        if output.is_some() {
+            return Err(usage());
+        }
+        Ok(Command::Confirm {
+            request: request.into(),
+            source_node,
+            output: output_path,
+            acknowledgements,
+            ttl_seconds: ttl.unwrap_or(300),
+        })
     } else {
-        if ttl.is_some() || !acknowledgements.is_empty() { return Err(usage()); }
-        Ok(Command::DryRun { request: request.into(), source_node, output })
+        if ttl.is_some() || !acknowledgements.is_empty() {
+            return Err(usage());
+        }
+        Ok(Command::DryRun {
+            request: request.into(),
+            source_node,
+            output,
+        })
     }
 }

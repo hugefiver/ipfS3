@@ -89,7 +89,7 @@ fn route_evidence(
         .providers
         .iter()
         .find(|provider| provider.route_snapshot() == *raw);
-    let available = !raw.provider_id.starts_with("legacy:") && configured.is_some();
+    let available = super::super::local_config::historical_route_available(raw, config);
     RouteEvidence {
         identity: route(raw),
         available,
@@ -112,6 +112,7 @@ pub(super) fn assemble(
     rows: read::Rows,
     config: &ValidatedPinningConfig,
     request: &PlanRequest,
+    work: &SharedDecodeBudget,
 ) -> Result<DatabaseSnapshot> {
     let mut gaps = BTreeSet::new();
     if !objects.is_empty() {
@@ -145,7 +146,9 @@ pub(super) fn assemble(
                         .find(|lease| lease.id == target.lease_id)
                         .ok_or(SnapshotError::InvalidEvidence)?;
                     if lease.owner_object_id != identity.object_id
-                        || source.as_ref().is_some_and(|source|canonical(&target.cid).ok().as_deref()!=Some(&source.cid))
+                        || source.as_ref().is_some_and(|source| {
+                            canonical(&target.cid).ok().as_deref() != Some(&source.cid)
+                        })
                     {
                         return Err(SnapshotError::MissingTarget);
                     }
@@ -158,7 +161,7 @@ pub(super) fn assemble(
             }
         }
         if let Action::Migrate { destination } = &item.action {
-            selected_routes.push(destination.clone());
+            selected_routes.push(destination.as_ref().clone());
         }
     }
     let selected_ids: BTreeSet<_> = request
@@ -191,7 +194,7 @@ pub(super) fn assemble(
     }
     let mut registered = BTreeMap::new();
     for row in &rows.routes {
-        let raw: ProviderRouteSnapshot = decode(&row.snapshot)?;
+        let raw = decode::<ProviderRouteSnapshot>(&row.snapshot, work)?;
         if selected_domain(&raw) {
             allocations.insert(row.provider.clone());
         }
@@ -199,15 +202,18 @@ pub(super) fn assemble(
     }
     let mut ledger_routes = BTreeMap::new();
     for row in &rows.ledgers {
-        let raw: Option<ProviderRouteSnapshot> = row.route.as_deref().and_then(|json| decode(json).ok());
-        if raw.as_ref().is_some_and(&selected_domain) {
+        let raw = row
+            .route
+            .as_deref()
+            .and_then(|json| decode::<ProviderRouteSnapshot>(json, work).ok());
+        if raw.as_deref().is_some_and(&selected_domain) {
             allocations.insert(row.provider.clone());
         }
         ledger_routes.insert((row.provider.clone(), row.cid.clone()), raw);
     }
     let mut historical = Vec::new();
     for row in &rows.history {
-        let Ok(envelope) = decode::<HistoricalEnvelope>(&row.ledger) else {
+        let Ok(envelope) = decode::<HistoricalEnvelope>(&row.ledger, work) else {
             gaps.insert(EvidenceGap::HistoricalRouteUnavailable);
             continue;
         };
@@ -218,16 +224,19 @@ pub(super) fn assemble(
             gaps.insert(EvidenceGap::HistoricalRouteUnavailable);
             continue;
         }
-        let raw: Option<ProviderRouteSnapshot> =
-            envelope.ledger.route.as_deref().and_then(|json| decode(json).ok());
-        if raw.as_ref().is_some_and(&selected_domain) {
+        let raw = envelope
+            .ledger
+            .route
+            .as_deref()
+            .and_then(|json| decode::<ProviderRouteSnapshot>(json, work).ok());
+        if raw.as_deref().is_some_and(&selected_domain) {
             allocations.insert(row.provider.clone());
         }
         historical.push((row, envelope, raw));
     }
     let mut invocation_routes = BTreeMap::new();
     for row in &rows.invocations {
-        let raw: ProviderRouteSnapshot = decode(&row.route)?;
+        let raw = decode::<ProviderRouteSnapshot>(&row.route, work)?;
         if selected_domain(&raw)
             && let Some(job) = rows.jobs.iter().find(|job| job.id == row.job_id)
         {
@@ -237,7 +246,7 @@ pub(super) fn assemble(
     }
     let mut submission_routes = BTreeMap::new();
     for row in &rows.submissions {
-        let raw: ProviderRouteSnapshot = decode(&row.route)?;
+        let raw = decode::<ProviderRouteSnapshot>(&row.route, work)?;
         if selected_domain(&raw) {
             allocations.insert(row.provider.clone());
         }
@@ -426,10 +435,13 @@ pub(super) fn assemble(
             .get(&row.id)
             .ok_or(SnapshotError::InvalidEvidence)?;
         let route = route(raw);
-        let resources: Vec<ResourceEvidence> = decode(&row.resources)?;
+        let resources = decode::<Vec<ResourceEvidence>>(&row.resources, work)?;
+        DecodeWork::shared(work)
+            .with(|work| work.nodes(1 + resources.len()))
+            .map_err(|_| SnapshotError::LimitExceeded)?;
         let mut projected = Vec::new();
-        for evidence in resources {
-            let resource = evidence.resource;
+        for evidence in resources.iter() {
+            let resource = &evidence.resource;
             let cid = canonical(&resource.cid)?;
             if evidence.key.as_ref().is_some_and(|key| {
                 key.backend != raw.backend
@@ -439,11 +451,14 @@ pub(super) fn assemble(
             }) {
                 return Err(SnapshotError::InvalidEvidence);
             }
+            DecodeWork::shared(work)
+                .copy(&(&resource.cid, &resource.request_id))
+                .map_err(|_| SnapshotError::LimitExceeded)?;
             projected.push(SubmittedResource {
                 resource_type: resource_type(resource.resource_type),
                 cid,
-                original_cid: resource.cid,
-                resource_id: resource.request_id,
+                original_cid: resource.cid.clone(),
+                resource_id: resource.request_id.clone(),
                 ownership: ownership(
                     match resource.ownership {
                         identity::Ownership::ApplicationCreated => "application_created",
@@ -517,7 +532,7 @@ pub(super) fn assemble(
         let route = ledger_routes
             .get(&(allocation.clone(), original_cid.clone()))
             .and_then(|route| route.as_ref())
-            .map(super::route);
+            .map(|raw| super::route(raw));
         if route.is_none() {
             gaps.insert(EvidenceGap::HistoricalRouteUnavailable);
         }
@@ -530,7 +545,8 @@ pub(super) fn assemble(
             .collect();
         let inflight = related
             .iter()
-            .filter(|job| job.state == JobState::Running)
+            // Only the store's complete parked-source proof excludes a Running job.
+            .filter(|job| job.state == JobState::Running && !rows.retryable_parks.contains(&job.id))
             .count() as u32;
         let state = ledger.map_or(LedgerState::Unknown, |row| ledger_state(&row.effect));
         let unsettled = submissions.iter().any(|row| {
@@ -558,7 +574,9 @@ pub(super) fn assemble(
             ),
             // The target/job projection is scoped. An out-of-scope alias still
             // has a real resource row, but that projection cannot prove zero.
-            application_references: allocations.contains(&allocation).then(||references(&allocation, &cid)),
+            application_references: allocations
+                .contains(&allocation)
+                .then(|| references(&allocation, &cid)),
             inflight_jobs: allocations.contains(&allocation).then_some(inflight),
             retained: state == LedgerState::Retained,
             cleanup_pending: state == LedgerState::CleanupPending
@@ -577,7 +595,7 @@ pub(super) fn assemble(
     let mut historical_remotes = Vec::new();
     for (row, envelope, raw) in historical {
         let cid = canonical(&row.cid).unwrap_or_else(|_| row.cid.clone());
-        let route = raw.as_ref().map(super::route);
+        let route = raw.as_ref().map(|raw| super::route(raw));
         if route.is_none() {
             gaps.insert(EvidenceGap::HistoricalRouteUnavailable);
         }
@@ -586,12 +604,15 @@ pub(super) fn assemble(
         // to POST, or borrow today's remote size and scope for an older epoch.
         gaps.insert(EvidenceGap::HistoricalAccountingUnavailable);
         let state = ledger_state(&envelope.ledger.effect);
+        DecodeWork::shared(work)
+            .copy(&envelope.request_id)
+            .map_err(|_| SnapshotError::LimitExceeded)?;
         historical_remotes.push(RemoteEvidence {
             allocation: row.provider.clone(),
             cid,
             original_cid: row.cid.clone(),
             route: route.clone(),
-            resource_id: envelope.request_id,
+            resource_id: envelope.request_id.clone(),
             epoch: Some(row.epoch),
             effect: if envelope.confirmed_absent {
                 SideEffect::Unknown

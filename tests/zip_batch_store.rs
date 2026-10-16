@@ -300,6 +300,7 @@ fn admission(id: &str) -> BatchAdmission {
 #[tokio::test]
 async fn batch_owner_survives_archive_absence_and_token_conflict() {
     let db = setup().await;
+    store::bucket::create(&db, "bucket", None).await.unwrap();
     let batch = zip::admit(&db, &admission("one")).await.unwrap();
     assert_eq!(batch.id, "one");
     assert_eq!(zip::admit(&db, &admission("two")).await.unwrap().id, "one");
@@ -471,6 +472,7 @@ async fn invalid_late_binding_cannot_partially_bind_an_earlier_success() {
 #[tokio::test]
 async fn unknown_external_commit_and_stale_epoch_are_retained_not_adopted() {
     let db = setup().await;
+    store::bucket::create(&db, "bucket", None).await.unwrap();
     zip::admit(&db, &admission("one")).await.unwrap();
     zip::prepare_manifest(
         &db,
@@ -543,6 +545,7 @@ async fn file_backed_restart_recovers_unknown_intent_and_exact_candidate() {
         .await
         .unwrap();
     store::run_migrations(&first).await.unwrap();
+    store::bucket::create(&first, "bucket", None).await.unwrap();
     zip::admit(&first, &admission("one")).await.unwrap();
     zip::prepare_manifest(
         &first,

@@ -8,6 +8,9 @@ mod publication;
 pub mod recovery;
 mod root;
 
+#[cfg(test)]
+mod mirror_tests;
+
 pub use batch::{BatchAdmission, admit, read, snapshot};
 pub use manifest::{ManifestItem, prepare_manifest};
 pub use publication::{

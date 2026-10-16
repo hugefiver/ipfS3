@@ -251,6 +251,7 @@ pub async fn retain_candidate(
         cid: Set(cid.into()),
         state: Set("retained".into()),
         verification_receipt: Set(None),
+        logical_released_at: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
     })
@@ -272,6 +273,7 @@ pub async fn retain_candidate(
     Ok(())
 }
 
+/// Active reference for verification/adoption, not historical response replay.
 pub(super) async fn reference<C: ConnectionTrait>(
     db: &C,
     claim: &RootClaim,
@@ -287,6 +289,7 @@ pub(super) async fn reference<C: ConnectionTrait>(
         tier.to_owned(),
         cid.to_owned(),
     ))
+    .filter(zip_root_reference::Column::LogicalReleasedAt.is_null())
     .one(db)
     .await?
     .ok_or_else(stale)
@@ -347,7 +350,8 @@ pub async fn recovery(db: &DatabaseConnection, id: &str) -> AppResult<Vec<zip_ro
 }
 
 /// Exact owner AND physical node/tier/CID existence; a same-CID different-node
-/// reference does not prove ownership. `absent` is not evidence that Kubo GC ran.
+/// active reference does not prove ownership. Released rows remain in history;
+/// `absent` is not evidence that Kubo GC ran.
 pub async fn root_existence(
     db: &DatabaseConnection,
     id: &str,
@@ -360,6 +364,7 @@ pub async fn root_existence(
         .filter(zip_root_reference::Column::NodeIdentity.eq(node))
         .filter(zip_root_reference::Column::Tier.eq(tier))
         .filter(zip_root_reference::Column::Cid.eq(cid))
+        .filter(zip_root_reference::Column::LogicalReleasedAt.is_null())
         .all(db)
         .await?;
     Ok(if refs.iter().any(|r| r.state == "adopted") {

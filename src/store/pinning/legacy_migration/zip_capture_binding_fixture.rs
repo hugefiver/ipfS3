@@ -80,7 +80,6 @@ pub struct Fixture {
     pub key: BTreeMap<String, String>,
     pub raw: String,
     pub declaration: migration::Declaration,
-    source_config: Config,
 }
 
 impl Fixture {
@@ -148,7 +147,6 @@ impl Fixture {
             key,
             raw: String::new(),
             declaration,
-            source_config,
         };
         fixture.raw = fixture.read_raw().await;
         assert_eq!(
@@ -196,9 +194,15 @@ impl Fixture {
     }
 
     pub async fn later_capture(&self) {
+        let current_config = config(Some(("post-receipt-account", "post-receipt-account")));
+        let current = ValidatedPinningConfig::from_config(&current_config, |_| None).unwrap();
+        let identity = &current.providers[0].identity;
+        ledger::register_route(&self.db, &identity.allocation_key(), identity)
+            .await
+            .unwrap();
         persist(
             &self.db,
-            &self.source_config,
+            &current_config,
             Intake::Mpu,
             "post-receipt",
             "later.zip",

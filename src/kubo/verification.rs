@@ -55,9 +55,12 @@ impl KuboClient {
             .map_err(|_| AppError::kubo_rpc_detail("invalid CID for local verification"))?;
 
         let node_identity = self.local_node_identity().await?;
-        self.verify_recursive_pin(&expected_cid, cid, self.http()).await?;
-        self.verify_complete_local_dag(&expected_cid, cid, self.http()).await?;
-        self.verify_recursive_pin(&expected_cid, cid, self.http()).await?;
+        self.verify_recursive_pin(&expected_cid, cid, self.http())
+            .await?;
+        self.verify_complete_local_dag(&expected_cid, cid, self.http())
+            .await?;
+        self.verify_recursive_pin(&expected_cid, cid, self.http())
+            .await?;
 
         if self.local_node_identity().await? != node_identity {
             return Err(AppError::kubo_rpc_detail(

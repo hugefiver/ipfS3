@@ -31,29 +31,49 @@ pub struct DirectoryProofBudgets {
 }
 impl DirectoryProofBudgets {
     pub fn for_payload(max_payload_bytes: u64) -> AppResult<Self> {
-        if max_payload_bytes == 0 { return Err(invalid()); }
-        let overhead = MAX_BLOCKS.checked_mul(MAX_CID_BYTES + MAX_LENGTH_BYTES)
+        if max_payload_bytes == 0 {
+            return Err(invalid());
+        }
+        let overhead = MAX_BLOCKS
+            .checked_mul(MAX_CID_BYTES + MAX_LENGTH_BYTES)
             .and_then(|bytes| bytes.checked_add(MAX_HEADER_BYTES + MAX_LENGTH_BYTES))
             .ok_or_else(invalid)?;
-        let max_car_bytes = max_payload_bytes.checked_add(overhead).ok_or_else(invalid)?;
+        let max_car_bytes = max_payload_bytes
+            .checked_add(overhead)
+            .ok_or_else(invalid)?;
         Ok(Self {
             max_payload_bytes,
             max_car_bytes,
-            max_block_bytes: usize::try_from(max_payload_bytes.min(MAX_BLOCK_BYTES as u64)).map_err(|_| invalid())?,
+            max_block_bytes: usize::try_from(max_payload_bytes.min(MAX_BLOCK_BYTES as u64))
+                .map_err(|_| invalid())?,
             max_blocks: MAX_BLOCKS,
             max_dag_metadata_bytes: MAX_DAG_METADATA_BYTES,
         })
     }
-    pub fn max_payload_bytes(&self) -> u64 { self.max_payload_bytes }
-    pub fn max_car_bytes(&self) -> u64 { self.max_car_bytes }
-    pub fn max_block_bytes(&self) -> usize { self.max_block_bytes }
-    pub fn max_blocks(&self) -> u64 { self.max_blocks }
-    pub fn max_dag_metadata_bytes(&self) -> usize { self.max_dag_metadata_bytes }
-    fn valid(&self) -> bool { Self::for_payload(self.max_payload_bytes).ok().as_ref() == Some(self) }
+    pub fn max_payload_bytes(&self) -> u64 {
+        self.max_payload_bytes
+    }
+    pub fn max_car_bytes(&self) -> u64 {
+        self.max_car_bytes
+    }
+    pub fn max_block_bytes(&self) -> usize {
+        self.max_block_bytes
+    }
+    pub fn max_blocks(&self) -> u64 {
+        self.max_blocks
+    }
+    pub fn max_dag_metadata_bytes(&self) -> usize {
+        self.max_dag_metadata_bytes
+    }
+    fn valid(&self) -> bool {
+        Self::for_payload(self.max_payload_bytes).ok().as_ref() == Some(self)
+    }
     fn parser_limits(self) -> DirectoryCarLimits {
         DirectoryCarLimits {
-            max_payload_bytes: self.max_payload_bytes, max_car_bytes: self.max_car_bytes,
-            max_block_bytes: self.max_block_bytes, max_blocks: self.max_blocks,
+            max_payload_bytes: self.max_payload_bytes,
+            max_car_bytes: self.max_car_bytes,
+            max_block_bytes: self.max_block_bytes,
+            max_blocks: self.max_blocks,
             max_dag_metadata_bytes: self.max_dag_metadata_bytes,
         }
     }
@@ -61,7 +81,10 @@ impl DirectoryProofBudgets {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum LocalDirectoryRootKind { Directory, HamtShard }
+pub enum LocalDirectoryRootKind {
+    Directory,
+    HamtShard,
+}
 
 /// Constructed by the real offline RPC/clean-body/complete-CAR path only. Counts
 /// are for this root, not a global shared-block ledger or a physical disk bill.
@@ -77,25 +100,47 @@ pub struct LocalDirectoryVerificationReceipt {
     budgets: DirectoryProofBudgets,
 }
 impl LocalDirectoryVerificationReceipt {
-    pub fn node_identity(&self) -> &str { &self.node_identity }
-    pub fn cid(&self) -> &str { &self.cid }
-    pub fn root_kind(&self) -> LocalDirectoryRootKind { self.root_kind }
-    pub fn stored_block_bytes(&self) -> u64 { self.stored_block_bytes }
-    pub fn serialized_car_bytes(&self) -> u64 { self.serialized_car_bytes }
-    pub fn block_count(&self) -> u64 { self.block_count }
-    pub fn budgets(&self) -> DirectoryProofBudgets { self.budgets }
+    pub fn node_identity(&self) -> &str {
+        &self.node_identity
+    }
+    pub fn cid(&self) -> &str {
+        &self.cid
+    }
+    pub fn root_kind(&self) -> LocalDirectoryRootKind {
+        self.root_kind
+    }
+    pub fn stored_block_bytes(&self) -> u64 {
+        self.stored_block_bytes
+    }
+    pub fn serialized_car_bytes(&self) -> u64 {
+        self.serialized_car_bytes
+    }
+    pub fn block_count(&self) -> u64 {
+        self.block_count
+    }
+    pub fn budgets(&self) -> DirectoryProofBudgets {
+        self.budgets
+    }
     pub(crate) fn valid_shape(&self) -> bool {
-        self.budgets.valid() && !self.node_identity.is_empty() && cid::Cid::try_from(self.cid.as_str()).is_ok()
-            && self.stored_block_bytes > 0 && self.stored_block_bytes <= self.budgets.max_payload_bytes
-            && self.serialized_car_bytes > self.stored_block_bytes && self.serialized_car_bytes <= self.budgets.max_car_bytes
-            && self.block_count > 0 && self.block_count <= self.budgets.max_blocks
+        self.budgets.valid()
+            && !self.node_identity.is_empty()
+            && cid::Cid::try_from(self.cid.as_str()).is_ok()
+            && self.stored_block_bytes > 0
+            && self.stored_block_bytes <= self.budgets.max_payload_bytes
+            && self.serialized_car_bytes > self.stored_block_bytes
+            && self.serialized_car_bytes <= self.budgets.max_car_bytes
+            && self.block_count > 0
+            && self.block_count <= self.budgets.max_blocks
     }
 }
 
 impl KuboClient {
     /// Current source fence for replaying a new directory RID; no CAR re-read or
     /// TTL extension. Unlike legacy reads, redirects cannot substitute a peer.
-    pub(crate) async fn directory_proof_node_identity(&self, cancel: &CancellationToken) -> AppResult<String> {
+    pub(crate) async fn directory_proof_node_identity(
+        &self,
+        cancel: &CancellationToken,
+    ) -> AppResult<String> {
         let control = proof_http(self.stream_idle_timeout(), false)?;
         tokio::select! {
             biased;
@@ -107,9 +152,15 @@ impl KuboClient {
     /// files or importing blocks. Pin/locality and node checks bracket the body;
     /// root type comes from the hashed UnixFS block, not Kubo's stat fields.
     pub async fn verify_local_directory(
-        &self, cid: &str, expected_node: &str, budgets: DirectoryProofBudgets, cancel: CancellationToken,
+        &self,
+        cid: &str,
+        expected_node: &str,
+        budgets: DirectoryProofBudgets,
+        cancel: CancellationToken,
     ) -> AppResult<LocalDirectoryVerificationReceipt> {
-        if !budgets.valid() || self.stream_idle_timeout().is_zero() { return Err(invalid()); }
+        if !budgets.valid() || self.stream_idle_timeout().is_zero() {
+            return Err(invalid());
+        }
         let expected = cid::Cid::try_from(cid).map_err(|_| invalid())?;
         let proof = async {
             // Scoped clients deliberately do not follow redirects. Reusing the
@@ -118,44 +169,72 @@ impl KuboClient {
             let control = proof_http(self.stream_idle_timeout(), false)?;
             let download = proof_http(self.stream_idle_timeout(), true)?;
             let node_identity = offline_node_identity(&control, self.base_url()).await?;
-            if node_identity != expected_node { return Err(invalid()); }
+            if node_identity != expected_node {
+                return Err(invalid());
+            }
             self.verify_recursive_pin(&expected, cid, &control).await?;
-            self.verify_complete_local_dag(&expected, cid, &control).await?;
-            let mut url = reqwest::Url::parse(&format!("{}/api/v0/dag/export", self.base_url())).map_err(|_| invalid())?;
-            url.query_pairs_mut().append_pair("arg", cid).append_pair("offline", "true");
-            let response = tokio::time::timeout(self.stream_idle_timeout(), download.post(url).send())
-                .await.map_err(|_| invalid())?.map_err(|_| invalid())?;
-            if !response.status().is_success() { return Err(AppError::kubo_rpc_status(response.status())); }
-            if response.headers().contains_key("x-stream-error") { return Err(invalid()); }
+            self.verify_complete_local_dag(&expected, cid, &control)
+                .await?;
+            let mut url = reqwest::Url::parse(&format!("{}/api/v0/dag/export", self.base_url()))
+                .map_err(|_| invalid())?;
+            url.query_pairs_mut()
+                .append_pair("arg", cid)
+                .append_pair("offline", "true");
+            let response =
+                tokio::time::timeout(self.stream_idle_timeout(), download.post(url).send())
+                    .await
+                    .map_err(|_| invalid())?
+                    .map_err(|_| invalid())?;
+            if !response.status().is_success() {
+                return Err(AppError::kubo_rpc_status(response.status()));
+            }
+            if response.headers().contains_key("x-stream-error") {
+                return Err(invalid());
+            }
             let length = response.content_length();
-            if length.is_some_and(|length| length > budgets.max_car_bytes) { return Err(invalid()); }
-            let mut parser = CarValidator::new_directory(cid, budgets.parser_limits()).map_err(|_| invalid())?;
+            if length.is_some_and(|length| length > budgets.max_car_bytes) {
+                return Err(invalid());
+            }
+            let mut parser =
+                CarValidator::new_directory(cid, budgets.parser_limits()).map_err(|_| invalid())?;
             let mut body: reqwest::Body = response.into();
             loop {
-                let frame = match tokio::time::timeout(self.stream_idle_timeout(), body.frame()).await {
-                    Ok(Some(Ok(frame))) => frame,
-                    Ok(None) => break,
-                    Ok(Some(Err(_))) | Err(_) => return Err(invalid()),
-                };
+                let frame =
+                    match tokio::time::timeout(self.stream_idle_timeout(), body.frame()).await {
+                        Ok(Some(Ok(frame))) => frame,
+                        Ok(None) => break,
+                        Ok(Some(Err(_))) | Err(_) => return Err(invalid()),
+                    };
                 match frame.into_data() {
                     Ok(bytes) => parser.feed(&bytes).map_err(|_| invalid())?,
                     Err(frame) => match frame.into_trailers() {
-                        Ok(trailers) if !trailers.contains_key("x-stream-error") => {},
+                        Ok(trailers) if !trailers.contains_key("x-stream-error") => {}
                         Ok(_) | Err(_) => return Err(invalid()),
                     },
                 }
             }
             // Even a fully parsed CAR is not authoritative before clean HTTP EOF.
             let receipt = parser.finish_directory().map_err(|_| invalid())?;
-            if length.is_some_and(|length| length != receipt.serialized_car_bytes) { return Err(invalid()); }
+            if length.is_some_and(|length| length != receipt.serialized_car_bytes) {
+                return Err(invalid());
+            }
             self.verify_recursive_pin(&expected, cid, &control).await?;
-            if offline_node_identity(&control, self.base_url()).await? != node_identity || cancel.is_cancelled() { return Err(invalid()); }
+            if offline_node_identity(&control, self.base_url()).await? != node_identity
+                || cancel.is_cancelled()
+            {
+                return Err(invalid());
+            }
             Ok(LocalDirectoryVerificationReceipt {
-                node_identity, cid: cid.to_owned(),
-                root_kind: match receipt.root_kind { DirectoryRootKind::Directory => LocalDirectoryRootKind::Directory, DirectoryRootKind::HamtShard => LocalDirectoryRootKind::HamtShard },
+                node_identity,
+                cid: cid.to_owned(),
+                root_kind: match receipt.root_kind {
+                    DirectoryRootKind::Directory => LocalDirectoryRootKind::Directory,
+                    DirectoryRootKind::HamtShard => LocalDirectoryRootKind::HamtShard,
+                },
                 stored_block_bytes: receipt.stored_block_bytes,
                 serialized_car_bytes: receipt.serialized_car_bytes,
-                block_count: receipt.block_count, budgets,
+                block_count: receipt.block_count,
+                budgets,
             })
         };
         tokio::select! {
@@ -166,23 +245,44 @@ impl KuboClient {
     }
 }
 
-fn invalid() -> AppError { AppError::kubo_rpc_detail("incomplete or over-budget offline directory proof") }
+fn invalid() -> AppError {
+    AppError::kubo_rpc_detail("incomplete or over-budget offline directory proof")
+}
 
 fn proof_http(idle: std::time::Duration, download: bool) -> AppResult<reqwest::Client> {
-    if idle.is_zero() { return Err(invalid()); }
-    let builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
+    if idle.is_zero() {
+        return Err(invalid());
+    }
+    let builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(idle.min(std::time::Duration::from_secs(30)));
-    let builder = if download { builder.read_timeout(idle) } else { builder.timeout(idle) };
+    let builder = if download {
+        builder.read_timeout(idle)
+    } else {
+        builder.timeout(idle)
+    };
     builder.build().map_err(|_| invalid())
 }
 
 async fn offline_node_identity(http: &reqwest::Client, endpoint: &str) -> AppResult<String> {
     #[derive(Deserialize)]
-    struct Identity { #[serde(rename = "ID")] id: String }
+    struct Identity {
+        #[serde(rename = "ID")]
+        id: String,
+    }
     let mut url = reqwest::Url::parse(&format!("{endpoint}/api/v0/id")).map_err(|_| invalid())?;
-    url.query_pairs_mut().append_pair("peerid-base", "b58mh").append_pair("offline", "true");
-    let response: Identity = super::verification::bounded_control_json(http.post(url), "offline directory identity").await?;
-    if response.id.is_empty() || response.id.len() > 256 || !response.id.bytes().all(|byte|byte.is_ascii_alphanumeric()) { return Err(invalid()); }
+    url.query_pairs_mut()
+        .append_pair("peerid-base", "b58mh")
+        .append_pair("offline", "true");
+    let response: Identity =
+        super::verification::bounded_control_json(http.post(url), "offline directory identity")
+            .await?;
+    if response.id.is_empty()
+        || response.id.len() > 256
+        || !response.id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    {
+        return Err(invalid());
+    }
     Ok(response.id)
 }
 
@@ -209,27 +309,62 @@ mod tests {
     fn separate_parser_work_limits_and_typed_root_are_fail_closed() {
         let (cid, car) = car(b"\x0a\x02\x08\x01");
         assert_eq!(car.len(), 100);
-        let limits = DirectoryCarLimits {max_payload_bytes:4, max_car_bytes:100, max_block_bytes:4, max_dag_metadata_bytes:512, max_blocks:1};
+        let limits = DirectoryCarLimits {
+            max_payload_bytes: 4,
+            max_car_bytes: 100,
+            max_block_bytes: 4,
+            max_dag_metadata_bytes: 512,
+            max_blocks: 1,
+        };
         let mut parser = CarValidator::new_directory(&cid, limits).unwrap();
-        for byte in &car { parser.feed(&[*byte]).unwrap(); }
+        for byte in &car {
+            parser.feed(&[*byte]).unwrap();
+        }
         let receipt = parser.finish_directory().unwrap();
         assert_eq!(receipt.stored_block_bytes, 4);
         assert_eq!(receipt.serialized_car_bytes, 100);
         assert_eq!(receipt.block_count, 1);
         for limited in [
-            DirectoryCarLimits {max_payload_bytes:3, ..limits},
-            DirectoryCarLimits {max_car_bytes:99, ..limits},
-            DirectoryCarLimits {max_block_bytes:3, ..limits},
-            DirectoryCarLimits {max_dag_metadata_bytes:511, ..limits},
-            DirectoryCarLimits {max_blocks:0, ..limits},
+            DirectoryCarLimits {
+                max_payload_bytes: 3,
+                ..limits
+            },
+            DirectoryCarLimits {
+                max_car_bytes: 99,
+                ..limits
+            },
+            DirectoryCarLimits {
+                max_block_bytes: 3,
+                ..limits
+            },
+            DirectoryCarLimits {
+                max_dag_metadata_bytes: 511,
+                ..limits
+            },
+            DirectoryCarLimits {
+                max_blocks: 0,
+                ..limits
+            },
         ] {
             let mut parser = CarValidator::new_directory(&cid, limited).unwrap();
             assert!(parser.feed(&car).is_err());
             assert!(parser.finish_directory().is_err());
         }
-        for payload in [b"\x0a\x02\x08\x02".as_slice(), b"\x0a\x04\x08\x01\x08\x05".as_slice()] {
+        for payload in [
+            b"\x0a\x02\x08\x02".as_slice(),
+            b"\x0a\x04\x08\x01\x08\x05".as_slice(),
+        ] {
             let (cid, car) = self::car(payload);
-            let mut parser = CarValidator::new_directory(&cid, DirectoryCarLimits {max_payload_bytes:32, max_car_bytes:256, max_block_bytes:32, ..limits}).unwrap();
+            let mut parser = CarValidator::new_directory(
+                &cid,
+                DirectoryCarLimits {
+                    max_payload_bytes: 32,
+                    max_car_bytes: 256,
+                    max_block_bytes: 32,
+                    ..limits
+                },
+            )
+            .unwrap();
             assert!(parser.feed(&car).is_err());
             assert!(parser.finish_directory().is_err());
         }

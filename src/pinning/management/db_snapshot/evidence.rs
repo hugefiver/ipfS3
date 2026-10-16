@@ -50,8 +50,8 @@ pub struct DatabaseSnapshot {
 impl DatabaseSnapshot {
     /// Full native planning capture; unknown item evidence remains nullable and
     /// blocks only its actual scope. This method grants no execution authority.
-    pub fn planning_snapshot(&self) -> Result<Snapshot> {
-        self.planning.clone().ok_or(SnapshotError::UnsupportedEvidence)
+    pub fn planning_snapshot(self) -> Result<Snapshot> {
+        self.planning.ok_or(SnapshotError::UnsupportedEvidence)
     }
 }
 

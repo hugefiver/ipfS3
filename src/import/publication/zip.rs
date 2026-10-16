@@ -27,6 +27,9 @@ use crate::{
 
 use crate::store::zip::{RootClaim, RootOutcome};
 mod prepared;
+#[cfg(test)]
+#[path = "zip/stage7_root_release_tests.rs"]
+mod stage7_root_release_tests;
 
 // An initial failure has no root epoch. Once claim_root succeeds, even a
 // failed directory build must carry its epoch into the publication fence.
@@ -381,6 +384,7 @@ async fn prepare_and_build_root(
                     && reference.epoch == build.epoch
                     && reference.state == "retained"
                     && reference.verification_receipt.is_some()
+                    && reference.logical_released_at.is_none()
             })
         {
             let root_claim = crate::store::zip::RootClaim {

@@ -67,7 +67,9 @@ pub async fn apply<C: ConnectionTrait + TransactionTrait>(
         return Ok(receipt::public(&existing));
     }
     if super::management_closure::enabled(&schema) && admission_routes.is_none() {
-        return Err(refused("committed receipt changed before the complete fence"));
+        return Err(refused(
+            "committed receipt changed before the complete fence",
+        ));
     }
     validate_plan(&txn, plan, &schema).await?;
     for namespace in &declaration.namespaces {
@@ -79,7 +81,8 @@ pub async fn apply<C: ConnectionTrait + TransactionTrait>(
     }
     drained(&plan.before)?;
     let current = snapshot::read(&txn, &schema).await?;
-    let management = super::management_closure::collect(&txn, &current, declaration, &schema).await?;
+    let management =
+        super::management_closure::collect(&txn, &current, declaration, &schema).await?;
     let projected = projection::project(&current, declaration, &management)?;
     if current != plan.before
         || projected != plan.after

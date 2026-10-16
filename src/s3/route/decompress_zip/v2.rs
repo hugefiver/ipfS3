@@ -1670,6 +1670,9 @@ mod tests {
     #[tokio::test]
     async fn legacy_status_headers_and_xml_use_the_authorized_snapshot_despite_later_root_change() {
         let state = AppState::new(&Config::default_for_test()).await.unwrap();
+        crate::store::bucket::create(state.store.db(), "test-bkt", None)
+            .await
+            .unwrap();
         let id = uuid::Uuid::new_v4().to_string();
         let row = zip::admit(
             state.store.db(),

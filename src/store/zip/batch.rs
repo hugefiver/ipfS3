@@ -633,9 +633,15 @@ async fn insert_or_find(
         .filter(zip_batch::Column::Owner.eq(&request.owner))
         .filter(zip_batch::Column::Source.eq(&request.source))
         .filter(zip_batch::Column::Token.eq(&request.token))
-        .one(tx).await?.is_none();
+        .one(tx)
+        .await?
+        .is_none();
     if is_new {
-        crate::store::pinning::management::admission::lock_encoded_zip_intake_in_transaction(tx, &request.captured_options).await?;
+        crate::store::pinning::management::admission::lock_encoded_zip_intake_in_transaction(
+            tx,
+            &request.captured_options,
+        )
+        .await?;
     }
     let now = Utc::now();
     zip_batch::Entity::insert(zip_batch::ActiveModel {

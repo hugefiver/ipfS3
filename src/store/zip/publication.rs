@@ -224,6 +224,8 @@ async fn root_fields(
             if build.status != "verified" {
                 return Err(stale());
             }
+            // Adoption requires a logically active reference, unlike replay of
+            // a terminal result backed by the immutable adoption history.
             let found = root::reference(tx, &claim, &node_identity, &tier, &cid).await?;
             if found.state != "retained" || found.verification_receipt.is_none() {
                 return Err(stale());

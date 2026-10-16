@@ -4,8 +4,18 @@ use ipfs_s3_gateway::pinning::management;
 use management::{wire::*, *};
 use serde_json::{Value, json};
 
-fn root_key(batch:&str)->NativeKey {
-    NativeKey {table:"zip_root_references".into(),values:vec![batch.into(),"1".into(),"1".into(),"node".into(),"hot".into(),"cid".into()]}
+fn root_key(batch: &str) -> NativeKey {
+    NativeKey {
+        table: "zip_root_references".into(),
+        values: vec![
+            batch.into(),
+            "1".into(),
+            "1".into(),
+            "node".into(),
+            "hot".into(),
+            "cid".into(),
+        ],
+    }
 }
 
 fn route(provider: &str) -> RouteIdentity {
@@ -94,8 +104,8 @@ fn fixture(action: Action) -> (PlanRequest, Snapshot) {
             evidence: SelectionEvidence::TrustedManifest {
                 batch_id: "batch-1".into(),
                 entry_path: "目录/文件".into(),
-                batch_tuple: [("id".into(),Some("batch-1".into()))].into(),
-                entry_tuple: [("version_row_id".into(),Some("private-version-1".into()))].into(),
+                batch_tuple: [("id".into(), Some("batch-1".into()))].into(),
+                entry_tuple: [("version_row_id".into(), Some("private-version-1".into()))].into(),
             },
         }],
         routes: [source.clone(), destination.clone()]
@@ -115,7 +125,10 @@ fn fixture(action: Action) -> (PlanRequest, Snapshot) {
                 backend: route.backend,
                 scope: route.scope,
                 resource_type: route.resource_type,
-                frontier: vec![NativeKey {table:"pin_jobs".into(),values:vec!["job-1".into()]}],
+                frontier: vec![NativeKey {
+                    table: "pin_jobs".into(),
+                    values: vec!["job-1".into()],
+                }],
                 complete: true,
             })
             .collect(),
@@ -124,7 +137,7 @@ fn fixture(action: Action) -> (PlanRequest, Snapshot) {
     if existing {
         snapshot.targets.push(TargetSnapshot {
             id: "target-1".into(),
-            native_tuple: [("id".into(),Some("target-1".into()))].into(),
+            native_tuple: [("id".into(), Some("target-1".into()))].into(),
             frozen_contract: None,
             lease: LeaseSnapshot {
                 id: "lease-1".into(),
@@ -146,7 +159,10 @@ fn fixture(action: Action) -> (PlanRequest, Snapshot) {
     if retiring {
         snapshot.inventories.push(ProviderInventory {
             provider_id: source.provider_id,
-            frontier: vec![NativeKey {table:"pin_jobs".into(),values:vec!["job-1".into()]}],
+            frontier: vec![NativeKey {
+                table: "pin_jobs".into(),
+                values: vec!["job-1".into()],
+            }],
             complete: true,
             allocation_stopped: false,
             attribution_complete: true,
@@ -179,6 +195,37 @@ fn load(value: &Value) -> Result<ImportedPlan, SafeError> {
 }
 
 #[test]
+fn escaped_document_keys_are_decoded_inside_the_shared_session() {
+    let (request, snapshot) = fixture(Action::Create(intent()));
+    let plan = dry_run(&request, &snapshot).unwrap();
+    let original = encode_plan(&request, &snapshot, &plan, None).unwrap();
+    let escaped = String::from_utf8(original)
+        .unwrap()
+        .replace("\"schema_version\"", "\"\\u0073chema_version\"");
+    let work = ipfs_s3_gateway::store::pinning::management::records::SharedDecodeBudget::default();
+    let imported =
+        ipfs_s3_gateway::pinning::management::wire::decode_review(escaped.as_bytes(), work.clone())
+            .unwrap();
+    assert!(imported.request() == &request && imported.plan() == &plan);
+    let (nodes, bytes) = work.lock().unwrap().usage();
+    assert!(nodes > 0 && bytes >= escaped.len() + 3 * "\\u0073chema_version".len());
+    loop {
+        match ipfs_s3_gateway::pinning::management::wire::decode_review(
+            escaped.as_bytes(),
+            work.clone(),
+        ) {
+            Ok(_) => {}
+            Err(SafeError::LimitExceeded) => break,
+            Err(error) => panic!("unexpected bounded import failure: {error:?}"),
+        }
+    }
+    assert!(matches!(
+        ipfs_s3_gateway::pinning::management::wire::decode_review(b"{\"\\u0061\":\"\\u0062", work),
+        Err(SafeError::LimitExceeded)
+    ));
+}
+
+#[test]
 fn nine_actions_round_trip_original_inputs_plan_and_full_confirmation() {
     for action in [
         Action::Create(intent()),
@@ -188,7 +235,7 @@ fn nine_actions_round_trip_original_inputs_plan_and_full_confirmation() {
         Action::Backfill(intent()),
         Action::Retry,
         Action::Migrate {
-            destination: route("provider-b"),
+            destination: Box::new(route("provider-b")),
         },
         Action::Reconcile,
         Action::Retire,
@@ -202,9 +249,9 @@ fn nine_actions_round_trip_original_inputs_plan_and_full_confirmation() {
         assert!(imported.request() == &request);
         assert!(imported.snapshot_without_applied() == &snapshot);
         assert!(imported.plan() == &plan);
-        assert!(imported.confirmation() == Some(&confirmation));
+        assert!(imported.confirmation() == Some(confirmation.candidate_item_ids.as_slice()));
         assert!(imported.untrusted_applied_claims().is_empty());
-        assert!(revalidate(imported.plan(), imported.confirmation().unwrap(), &snapshot).is_ok());
+        assert!(revalidate(imported.plan(), &confirmation, &snapshot).is_ok());
         assert_eq!(
             bytes,
             encode_plan(&request, &snapshot, &plan, Some(&confirmation)).unwrap()
@@ -213,22 +260,21 @@ fn nine_actions_round_trip_original_inputs_plan_and_full_confirmation() {
 }
 
 #[test]
-fn same_ids_cannot_replace_full_confirmation_binding() {
+fn confirmation_acks_reject_duplicates_unknown_items_and_wrong_types() {
     let (request, snapshot) = fixture(Action::Create(intent()));
     let original = document(&request, &snapshot);
-    for (field, replacement) in [
-        ("bindings", json!([])),
-        ("plan_id", json!("another-plan")),
-        ("candidate_item_ids", json!(["file-1"])),
+    for replacement in [
+        json!(["file-1"]),
+        json!(["unknown"]),
+        json!(["file-1", "file-1"]),
     ] {
         let mut changed = original.clone();
-        changed["confirmation"][field] = replacement;
+        changed["confirmation"] = replacement;
         assert_eq!(load(&changed).err(), Some(SafeError::ConfirmationMismatch));
     }
     let mut changed = original;
-    changed["confirmation"]["bindings"][0]["capture"]["object"]["object"]["logical_bytes"] =
-        json!(51);
-    assert_eq!(load(&changed).err(), Some(SafeError::ConfirmationMismatch));
+    changed["confirmation"] = json!({"candidate_item_ids":[]});
+    assert_eq!(load(&changed).err(), Some(SafeError::InvalidInput));
 }
 
 #[test]
@@ -325,7 +371,6 @@ fn strict_fields_apply_inside_plan_capture_step_and_confirmation() {
         "/plan/items/0/capture/object",
         "/plan/items/0/step/object",
         "/plan/summary",
-        "/confirmation",
     ] {
         let mut changed = original.clone();
         changed
@@ -452,8 +497,8 @@ fn snapshot_text_budget_is_independent_of_wire_bytes_and_records() {
     object.config_revision = Some("x".repeat(256));
     object.evidence = SelectionEvidence::TrustedManifest {
         batch_id: "b".repeat(256),
-        batch_tuple: [("id".into(),Some("batch-1".into()))].into(),
-        entry_tuple: [("version_row_id".into(),Some("private-version-1".into()))].into(),
+        batch_tuple: [("id".into(), Some("batch-1".into()))].into(),
+        entry_tuple: [("version_row_id".into(), Some("private-version-1".into()))].into(),
         entry_path: "p".repeat(1024),
     };
     let mut long_route = route("provider-a");
@@ -472,6 +517,10 @@ fn snapshot_text_budget_is_independent_of_wire_bytes_and_records() {
         })
         .collect();
     saved["snapshot"] = serde_json::to_value(&snapshot).unwrap();
+    saved["snapshot"]
+        .as_object_mut()
+        .unwrap()
+        .remove("native_frame");
     let bytes = serde_json::to_vec(&saved).unwrap();
     assert!(bytes.len() < MAX_WIRE_BYTES);
     assert_eq!(decode_plan(&bytes).err(), Some(SafeError::LimitExceeded));
@@ -519,7 +568,10 @@ fn complete_snapshot_preserves_unselected_rows_history_and_retirement_inventory(
     snapshot.historical_remotes.push(historical);
     snapshot.inventories.push(ProviderInventory {
         provider_id: "provider-a".into(),
-        frontier: vec![NativeKey {table:"pin_jobs".into(),values:vec!["job-1".into()]}],
+        frontier: vec![NativeKey {
+            table: "pin_jobs".into(),
+            values: vec!["job-1".into()],
+        }],
         complete: true,
         allocation_stopped: true,
         attribution_complete: true,
@@ -537,7 +589,14 @@ fn complete_snapshot_preserves_unselected_rows_history_and_retirement_inventory(
     let mut current = snapshot.clone();
     current.objects[0].identity.private_version_id = "new-current-version".into();
     assert_eq!(
-        revalidate(imported.plan(), imported.confirmation().unwrap(), &current).err(),
+        revalidate(
+            imported.plan(),
+            &imported
+                .plan()
+                .confirmation(imported.confirmation().unwrap().to_vec()),
+            &current
+        )
+        .err(),
         Some(SafeError::SnapshotChanged)
     );
 }
@@ -617,7 +676,7 @@ fn unconfirmed_candidate_and_blocked_plan_remain_non_executable() {
     let imported =
         decode_plan(&encode_plan(&request, &snapshot, &plan, Some(&confirmation)).unwrap())
             .unwrap();
-    assert!(imported.confirmation() == Some(&confirmation));
+    assert!(imported.confirmation() == Some(confirmation.candidate_item_ids.as_slice()));
     snapshot.objects[0].permitted = Some(false);
     let blocked = dry_run(&request, &snapshot).unwrap();
     let imported = decode_plan(&encode_plan(&request, &snapshot, &blocked, None).unwrap()).unwrap();
@@ -633,9 +692,8 @@ fn unconfirmed_candidate_and_blocked_plan_remain_non_executable() {
 }
 
 #[test]
-fn encoder_rejects_substituted_plan_and_confirmation() {
+fn encoder_rejects_substituted_plan() {
     let (request, snapshot) = fixture(Action::Create(intent()));
-    let plan = dry_run(&request, &snapshot).unwrap();
     let mut changed = snapshot.clone();
     changed.objects[0].logical_bytes += 1;
     let replacement = dry_run(&request, &changed).unwrap();
@@ -643,14 +701,229 @@ fn encoder_rejects_substituted_plan_and_confirmation() {
         encode_plan(&request, &snapshot, &replacement, None).err(),
         Some(SafeError::IdempotencyConflict)
     );
-    assert_eq!(
-        encode_plan(
-            &request,
-            &snapshot,
-            &plan,
-            Some(&replacement.confirmation(vec![]))
-        )
-        .err(),
-        Some(SafeError::ConfirmationMismatch)
+}
+
+#[test]
+fn management_summary_quotes_full_all_and_one_candidate_universe() {
+    for mode in [ProviderMode::All, ProviderMode::One] {
+        let mut intent = intent();
+        intent.requirements.mode = mode;
+        intent.requirements.provider_ids.push("provider-b".into());
+        let (mut request, mut snapshot) = fixture(Action::Create(intent));
+        let mut second = snapshot.objects[0].clone();
+        second.identity.object_id = "object-2".into();
+        second.identity.private_version_id = "private-version-2".into();
+        let mut item = request.items[0].clone();
+        item.item_id = "file-2".into();
+        let Subject::Object { identity, .. } = &mut item.subject else {
+            panic!("object");
+        };
+        *identity = second.identity.clone();
+        snapshot.objects.push(second);
+        request.items.push(item);
+        let plan = dry_run(&request, &snapshot).unwrap();
+        assert!(
+            plan.items()
+                .iter()
+                .all(|entry| entry.status == PlanStatus::Ready)
+        );
+        assert_eq!(plan.summary().logical_targets, 4);
+        assert_eq!(plan.summary().logical_intent_bytes, 200);
+        assert_eq!(plan.summary().possible_new_transfers, 2);
+        assert_eq!(plan.summary().unique_resources, 2);
+        let bytes =
+            encode_plan(&request, &snapshot, &plan, Some(&plan.confirmation(vec![]))).unwrap();
+        assert!(decode_plan(&bytes).unwrap().plan() == &plan);
+
+        snapshot.routes[1].available = false;
+        snapshot.routes[1].allocation_allowed = false;
+        let unavailable = dry_run(&request, &snapshot).unwrap();
+        assert_eq!(unavailable.summary().logical_targets, 4);
+        assert_eq!(
+            unavailable.summary().possible_new_transfers,
+            if mode == ProviderMode::One { 1 } else { 0 }
+        );
+        for entry in unavailable.items() {
+            let Some(Capture::Object(capture)) = &entry.capture else {
+                panic!("capture");
+            };
+            assert_eq!(capture.requirement_routes.len(), 2);
+        }
+    }
+}
+
+#[test]
+fn management_root_release_selection_is_additive_and_exact_not_default_retire() {
+    let action = json!({"retire_with": {"selection": {"release_root_references": {"references": [root_key("batch-1")]}}}});
+    let decoded: Action = serde_json::from_value(action.clone()).unwrap();
+    assert_eq!(serde_json::to_value(decoded).unwrap(), action);
+    assert!(serde_json::from_value::<Action>(json!("retire")).unwrap() == Action::Retire);
+}
+
+#[test]
+fn management_legacy_retire_receipts_default_empty_root_selections() {
+    let (request, mut snapshot) = fixture(Action::Retire);
+    let initial = dry_run(&request, &snapshot).unwrap();
+    snapshot.applied.push(AppliedItem {
+        binding: initial.items()[0].clone(),
+    });
+    let plan = dry_run(&request, &snapshot).unwrap();
+    let mut archived: Value = serde_json::from_slice(
+        &encode_plan(&request, &snapshot, &plan, Some(&plan.confirmation(vec![]))).unwrap(),
+    )
+    .unwrap();
+    archived["snapshot"]
+        .as_object_mut()
+        .unwrap()
+        .remove("root_references");
+    for pointer in [
+        "/plan/items/0/capture/provider",
+        "/snapshot/applied/0/binding/capture/provider",
+    ] {
+        archived
+            .pointer_mut(pointer)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("root_references");
+    }
+    let imported = load(&archived).unwrap();
+    assert!(
+        imported
+            .snapshot_without_applied()
+            .root_references
+            .is_empty()
     );
+    assert_eq!(imported.untrusted_applied_claims().len(), 1);
+    let Some(Capture::Provider(capture)) = &imported.plan().items()[0].capture else {
+        panic!("provider")
+    };
+    assert!(capture.root_references.is_empty());
+    assert_eq!(capture.inventory.root_reference_ids.len(), 1);
+    let checked = revalidate(
+        imported.plan(),
+        &imported
+            .plan()
+            .confirmation(imported.confirmation().unwrap().to_vec()),
+        imported.snapshot_without_applied(),
+    )
+    .unwrap();
+    assert!(matches!(
+        checked[0].outcome,
+        RevalidationOutcome::Checked(PlannedStep::Retire(_))
+    ));
+}
+
+#[test]
+fn management_same_resource_migration_preserves_slot_and_ttl_without_old_write_route() {
+    let mut destination = route("provider-a");
+    destination.strategy = "upload".into();
+    let (request, mut snapshot) = fixture(Action::Migrate {
+        destination: Box::new(destination.clone()),
+    });
+    snapshot.objects[0].allowed_routes.push(destination.clone());
+    let mut state = snapshot.routes[0].clone();
+    state.identity = destination;
+    snapshot.routes.push(state);
+    snapshot.routes[0].available = false;
+    snapshot.routes[0].allocation_allowed = false;
+    let plan = dry_run(&request, &snapshot).unwrap();
+    assert_eq!(plan.items()[0].status, PlanStatus::Ready);
+    let Some(PlannedStep::Object(step)) = &plan.items()[0].step else {
+        panic!("migration");
+    };
+    assert_eq!(step.source, RemoteDirective::NoWrite);
+    assert_eq!(step.destination, Some(RemoteDirective::SubmitWithFence));
+    assert!(step.preserve_source_responsibility);
+    assert_eq!(plan.summary().logical_targets, 1);
+    assert_eq!(plan.summary().logical_intent_bytes, 50);
+    assert_eq!(plan.summary().possible_new_transfers, 1);
+    let Some(Capture::Object(capture)) = &plan.items()[0].capture else {
+        panic!("capture");
+    };
+    assert!(capture.target == Some(snapshot.targets[0].clone()));
+}
+
+#[test]
+fn management_migration_cannot_merge_frozen_slots_or_lower_cluster_replication_contract() {
+    let (request, mut snapshot) = fixture(Action::Migrate {
+        destination: Box::new(route("provider-b")),
+    });
+    snapshot.targets[0]
+        .requirements
+        .as_mut()
+        .unwrap()
+        .provider_ids
+        .push("provider-b".into());
+    snapshot.targets[0].frozen_candidates = ["provider-a", "provider-b"]
+        .into_iter()
+        .map(|provider| FrozenCandidate {
+            slot: provider.into(),
+            allocation: provider.into(),
+            route: Some(route(provider)),
+            receipt_id: None,
+        })
+        .collect();
+    assert_eq!(
+        dry_run(&request, &snapshot).unwrap().items()[0].status,
+        PlanStatus::Blocked(SafeError::InvalidActionScope)
+    );
+
+    for (min_replicas, max_age_secs, ready) in [(2, 120, true), (1, 120, false), (2, 121, false)] {
+        let original = |provider: &str, min_replicas, max_age_secs| {
+            ipfs_s3_gateway::pinning::identity::ProviderRouteSnapshot {
+                provider_id: provider.into(),
+                backend: "cluster".into(),
+                scope: provider.into(),
+                storage_domain: provider.into(),
+                credential_revision: 1,
+                endpoint_revision: 1,
+                secret_ref: None,
+                api_profile: "cluster".into(),
+                strategy: "cid".into(),
+                cleanup: ipfs_s3_gateway::pinning::identity::CleanupMode::Retain,
+                confirmation: Some(
+                    ipfs_s3_gateway::pinning::identity::ConfirmationRequirement::ClusterReplicas {
+                        min_replicas,
+                        max_age_secs,
+                    },
+                ),
+            }
+        };
+        let source = RouteIdentity::from_original(original("provider-a", 2, 120));
+        let destination =
+            RouteIdentity::from_original(original("provider-b", min_replicas, max_age_secs));
+        let (request, mut snapshot) = fixture(Action::Migrate {
+            destination: Box::new(destination.clone()),
+        });
+        snapshot.objects[0].allowed_routes = vec![source.clone(), destination.clone()];
+        snapshot.targets[0].route = Some(source.clone());
+        let requirements = snapshot.targets[0].requirements.as_mut().unwrap();
+        requirements.min_replicas = 2;
+        requirements.max_age_secs = Some(120);
+        requirements.levels = vec![ConfirmationLevel::ReplicationComplete];
+        for (state, identity) in snapshot.routes.iter_mut().zip([source, destination]) {
+            state.original = identity.original.clone();
+            state.identity = identity;
+        }
+        snapshot.ledger_domains = snapshot
+            .routes
+            .iter()
+            .map(|route| LedgerDomainSnapshot {
+                backend: route.identity.backend.clone(),
+                scope: route.identity.scope.clone(),
+                resource_type: route.identity.resource_type,
+                frontier: vec![],
+                complete: true,
+            })
+            .collect();
+        assert_eq!(
+            dry_run(&request, &snapshot).unwrap().items()[0].status,
+            if ready {
+                PlanStatus::Ready
+            } else {
+                PlanStatus::Blocked(SafeError::SafetyProhibition)
+            }
+        );
+    }
 }

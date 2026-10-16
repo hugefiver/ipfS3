@@ -2,10 +2,10 @@
 pub mod actions;
 pub(crate) mod admission;
 pub use admission::{ManagementJobReport, ManagementJobScope};
+pub mod catalog;
 pub mod native;
 pub mod records;
 pub mod schema;
-pub mod catalog;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ManagementError {

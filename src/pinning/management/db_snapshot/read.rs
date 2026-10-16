@@ -2,19 +2,29 @@ use super::*;
 use crate::pinning::decision::DecisionEffect;
 use crate::store::{
     entities::*,
-    pinning::{decision, jobs::history},
+    pinning::{
+        decision,
+        jobs::{self, history},
+    },
 };
 use sea_orm::{
     ColumnTrait, DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
 };
 
-#[derive(Default)]
 pub(super) struct Budget {
     rows: u64,
     bytes: u64,
+    work: SharedDecodeBudget,
 }
 
 impl Budget {
+    pub(super) fn new(work: SharedDecodeBudget) -> Self {
+        Self {
+            rows: 0,
+            bytes: 0,
+            work,
+        }
+    }
     /// Counts all text BEFORE ORM/blob allocation; names are static, not user SQL.
     async fn table(
         &mut self,
@@ -57,6 +67,23 @@ impl Budget {
         if self.rows > MAX_RECORDS as u64 || self.bytes > MAX_TEXT_BYTES as u64 {
             return Err(SnapshotError::LimitExceeded);
         }
+        let shape = crate::store::pinning::management::native::current_catalog()
+            .iter()
+            .find(|shape| shape.table == table)
+            .ok_or(SnapshotError::InvalidEvidence)?;
+        let count = number(
+            row.try_get("", "records")
+                .map_err(|_| SnapshotError::InvalidEvidence)?,
+        )? as usize;
+        let bytes = number(
+            row.try_get("", "bytes")
+                .map_err(|_| SnapshotError::InvalidEvidence)?,
+        )? as usize;
+        for _ in 0..2 {
+            DecodeWork::shared(&self.work)
+                .index_cells(count * shape.columns.len(), bytes)
+                .map_err(|_| SnapshotError::LimitExceeded)?;
+        }
         Ok(())
     }
 }
@@ -73,6 +100,7 @@ pub(super) struct Rows {
     pub submissions: Vec<pin_submit_observation::Model>,
     pub submit_history: Vec<history::Model>,
     pub usage: Vec<pin_provider_usage::Model>,
+    pub retryable_parks: std::collections::BTreeSet<String>,
 }
 
 impl Rows {
@@ -83,7 +111,7 @@ impl Rows {
                 $entity::Entity::find().limit(MAX_RECORDS as u64 + 1).all(tx).await.map_err(|_| SnapshotError::DatabaseUnavailable)?
             }};
         }
-        Ok(Self {
+        let mut rows = Self {
             routes: load!(
                 pin_provider_route,
                 "pin_provider_routes",
@@ -188,7 +216,28 @@ impl Rows {
                 ]
             ),
             usage: load!(pin_provider_usage, "pin_provider_usage", ["provider"]),
-        })
+            retryable_parks: Default::default(),
+        };
+        for job in &rows.jobs {
+            if job.operation != "submit"
+                || job.state != "running"
+                || job.submit_phase.as_deref() != Some("recovering")
+                || job.locked_until.is_some()
+            {
+                continue;
+            }
+            let Some(invocation) = rows.invocations.iter().find(|row| row.job_id == job.id) else {
+                continue;
+            };
+            let route = decode::<ProviderRouteSnapshot>(&invocation.route, &budget.work)?;
+            if jobs::management_retryable_park(tx, job, &route)
+                .await
+                .map_err(|_| SnapshotError::InvalidEvidence)?
+            {
+                rows.retryable_parks.insert(job.id.clone());
+            }
+        }
+        Ok(rows)
     }
 }
 
@@ -251,14 +300,21 @@ pub(super) async fn objects(
         )
         .await?;
     let mut result: Vec<ObjectEvidence> = Vec::new();
-    let selected=request.items.iter().flat_map(|item|match &item.subject {
-        super::super::Subject::Object {identity,target}=>{
-            let mut selected=vec![(identity,item)];
-            if let super::super::TargetSelection::Existing {source:Some(source),..}=target {selected.push((source,item));}
+    let selected = request.items.iter().flat_map(|item| match &item.subject {
+        super::super::Subject::Object { identity, target } => {
+            let mut selected = vec![(identity, item)];
+            if let super::super::TargetSelection::Existing {
+                source: Some(source),
+                ..
+            } = target
+            {
+                selected.push((source, item));
+            }
             selected
-        },_=>vec![],
+        }
+        _ => vec![],
     });
-    for (identity,item) in selected {
+    for (identity, item) in selected {
         if result.iter().any(|object| object.identity == *identity) {
             continue;
         }

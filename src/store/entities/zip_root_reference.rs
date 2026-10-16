@@ -17,6 +17,7 @@ pub struct Model {
     pub cid: String,
     pub state: String,
     pub verification_receipt: Option<String>,
+    pub logical_released_at: Option<DateTimeUtc>,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
 }

@@ -451,7 +451,8 @@ The default formal CLI mode is read-only inventory. Apply/rollback require
 explicit declarations, stop/drain assertions, fresh native fences and durable
 DB receipts; no migration command may start AppState/provider workers, contact
 remote storage, release retained usage, infer historical ownership, or repair
-schema automatically. Stage7's unregistered management leaf is not this CLI.
+schema automatically. The separate registered Stage 7 management CLI is not
+this R26 legacy namespace migration CLI.
 
 ```powershell
 cargo test --locked --offline --test legacy_pinning_migration_store
@@ -502,12 +503,18 @@ account operation, unpin, or GC has been performed.
 
 ## Stage 7 local management checks
 
-**Status: source integrated; concentrated acceptance pending.** The first
-concentrated Cargo attempt exited 101 during compilation, with zero tests
-executed. Compiler corrections are source-complete; the concentrated after-run
-is pending. There is no current Stage 7
-acceptance PASS for the nine actions, receipt-scoped runtime or retirement
-barriers; earlier Stage 6, R26 and R25 evidence doesn't establish those results.
+**Status: local runtime validation passed.** The complete ten-apply workflow
+includes real receipt-scoped workers, shared CIDs, retirement, same-file database
+close/reopen, original-document replay and export, with private historical cells
+preserved. The cumulative decode and full-registry SQL limits remain enabled.
+
+Final checks on Rust 1.92 GNU: default-feature lib **1646 passed, 0 failed,
+6 ignored**; integration **165 passed, 0 failed**; all-targets strict Clippy and
+`cargo fmt --all --check` passed. Ignored tests are not counted as passing.
+The four isolated PostgreSQL 17.11 targets for formal apply (including Renew and
+cross-connection replay), managed Submit, retirement concurrency and root-release
+migration were executed separately and passed. These are local/mock-provider and
+isolated-database results, not production migration or external-account evidence.
 
 With the installed Windows GNU Rust toolchain and cached dependencies, these
 PowerShell commands select the actual local targets. They aren't recorded passes:
@@ -518,7 +525,7 @@ cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test 'stage7_manag
 cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage7_retirement_barrier --test stage7_retirement_barrier_consumers --test stage7_retirement_barrier_http
 ```
 
-The management targets cover schema/native snapshots, confirmation, file and
+The management targets check schema/native snapshots, confirmation, file and
 directory evidence, CLI, action replay/chains/lifecycle/migration/provider points
 and retirement. Acceptance must inspect executed results for original
 confirmation/expiry, exact object/version/CID and route binding, ciphertext and
@@ -535,9 +542,25 @@ an occupied fixture. Once that environment is explicitly provided, select it wit
 cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage7_retirement_barrier_postgres -- --ignored --nocapture --test-threads=1
 ```
 
-An ignored PostgreSQL case is never PASS. Neither these command examples nor an
-exit-101 compile attempt supply runtime or native PostgreSQL acceptance evidence.
-Update this status only after concentrated QA against the finished source.
+`stage7_management_apply_postgres` is separately ignored and requires a
+parent-selected, empty, exclusively owned `stage7_` schema through
+`IPFS_S3_STAGE7_APPLY_DATABASE_URL`. Use an authorized disposable PostgreSQL
+17.11 instance with its image already cached; don't pull an image or use a
+production database or occupied fixture. Once that environment is explicitly
+provided, select the target with:
+
+```powershell
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage7_management_apply_postgres -- --ignored --nocapture --test-threads=1
+```
+
+Formal apply, native microsecond timestamp precision, NOWAIT/phantom fences and
+receipt-write fault handling require actual execution of the ignored apply
+target. Target existence isn't evidence that these checks passed.
+
+Ignored PostgreSQL cases and command examples aren't passing evidence. Runtime
+and native PostgreSQL acceptance require executed results against the finished
+source. External account operations, production operations, unpin and GC aren't
+authorized by these checks.
 
 ## Environment-backed and deep checks
 

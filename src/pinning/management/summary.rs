@@ -3,14 +3,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::model::*;
 
 fn current_or_captured<'a>(
-    snapshot: &'a Snapshot,
+    snapshot: &'a super::SnapshotView<'_>,
     captured: &'a RemoteSnapshot,
 ) -> &'a RemoteSnapshot {
     // Missing a ledger row is not proof of release: preserve captured occupancy.
     snapshot
         .remotes
         .iter()
-        .chain(&snapshot.historical_remotes)
+        .chain(snapshot.historical_remotes)
         .find(|remote| remote.key == captured.key && remote.epoch == captured.epoch)
         .or_else(|| {
             if matches!(
@@ -49,13 +49,19 @@ fn add_remote(resources: &mut BTreeMap<QuoteKey, ResourceQuote>, remote: &Remote
     let quote = resources
         .entry((remote.key.clone(), remote.resource_id.clone(), epoch))
         .or_default();
-    if let Some(bytes) = remote.accounted_bytes { quote.bytes = quote.bytes.max(bytes); }
+    if let Some(bytes) = remote.accounted_bytes {
+        quote.bytes = quote.bytes.max(bytes);
+    }
     quote.unknown |= remote.has_unknown_responsibility();
-    quote.inflight |= remote.effect == SideEffect::InFlight || remote.inflight_operations.is_some_and(|n|n > 0);
+    quote.inflight |=
+        remote.effect == SideEffect::InFlight || remote.inflight_operations.is_some_and(|n| n > 0);
     quote.cleanup_pending |= remote.cleanup_pending;
 }
 
-pub(crate) fn summarize(entries: &[PlanEntry], snapshot: &Snapshot) -> Result<Summary, SafeError> {
+pub(crate) fn summarize(
+    entries: &[PlanEntry],
+    snapshot: &super::SnapshotView<'_>,
+) -> Result<Summary, SafeError> {
     let mut summary = Summary {
         items: entries.len(),
         unknown_resources: snapshot.unknown_resources.len(),
@@ -79,23 +85,36 @@ pub(crate) fn summarize(entries: &[PlanEntry], snapshot: &Snapshot) -> Result<Su
         }
         match &entry.capture {
             Some(Capture::Object(capture)) => {
-                summary.logical_targets += 1;
-                cids.insert(&capture.object.identity.cid);
+                let cid = capture
+                    .target
+                    .as_ref()
+                    .map_or(capture.object.identity.cid.as_str(), |target| {
+                        target.cid.as_str()
+                    });
+                cids.insert(cid);
+                let routes = capture
+                    .requirement_routes
+                    .iter()
+                    .chain(std::iter::once(&capture.route))
+                    .chain(capture.destination_route.iter())
+                    .map(|route| (route.identity.remote_key(cid), route))
+                    .collect::<BTreeMap<_, _>>();
+                summary.logical_targets += routes.len();
                 let logical_bytes = capture
                     .target
                     .as_ref()
                     .map_or(capture.object.logical_bytes, |target| target.logical_bytes);
                 summary.logical_intent_bytes = summary
                     .logical_intent_bytes
-                    .checked_add(logical_bytes)
+                    .checked_add(
+                        logical_bytes
+                            .checked_mul(
+                                u64::try_from(routes.len())
+                                    .map_err(|_| SafeError::LimitExceeded)?,
+                            )
+                            .ok_or(SafeError::LimitExceeded)?,
+                    )
                     .ok_or(SafeError::LimitExceeded)?;
-                if capture.destination_route.is_some() {
-                    summary.logical_targets += 1;
-                    summary.logical_intent_bytes = summary
-                        .logical_intent_bytes
-                        .checked_add(logical_bytes)
-                        .ok_or(SafeError::LimitExceeded)?;
-                }
                 for remote in [&capture.remote, &capture.destination_remote]
                     .into_iter()
                     .flatten()
@@ -105,33 +124,60 @@ pub(crate) fn summarize(entries: &[PlanEntry], snapshot: &Snapshot) -> Result<Su
                     add_remote(&mut resources, remote);
                 }
                 // Newly recorded effects after application still appear in the quote.
-                for route in [Some(&capture.route), capture.destination_route.as_ref()]
-                    .into_iter()
-                    .flatten()
-                {
-                    let key = route.identity.remote_key(&capture.object.identity.cid);
+                for key in routes.keys() {
                     for remote in snapshot
                         .remotes
                         .iter()
-                        .chain(&snapshot.historical_remotes)
-                        .filter(|remote| remote.key == key)
+                        .chain(snapshot.historical_remotes)
+                        .filter(|remote| &remote.key == key)
                     {
                         add_remote(&mut resources, remote);
                     }
                 }
                 if !applied && let Some(PlannedStep::Object(step)) = &entry.step {
+                    if let Action::Create(intent)
+                    | Action::Reapply(intent)
+                    | Action::Backfill(intent) = &entry.request.action
+                    {
+                        let now = snapshot.database_now.unwrap_or_else(|| {
+                            chrono::DateTime::from_timestamp(snapshot.observed_at, 0)
+                                .expect("validated database clock")
+                        });
+                        for route in &capture.requirement_routes {
+                            if !route.available
+                                || !route.allocation_allowed
+                                || !capture.object.allowed_routes.contains(&route.identity)
+                            {
+                                continue;
+                            }
+                            let key = route.identity.remote_key(cid);
+                            let remote = snapshot.remotes.iter().find(|remote| remote.key == key);
+                            let historical = remote.and_then(|remote| {
+                                snapshot
+                                    .routes
+                                    .iter()
+                                    .find(|route| route.identity == remote.route)
+                            });
+                            if super::semantics::directive(
+                                capture,
+                                route,
+                                remote,
+                                historical,
+                                &intent.requirements,
+                                now,
+                            ) == Ok(RemoteDirective::SubmitWithFence)
+                            {
+                                transfers.insert(key);
+                            }
+                        }
+                    }
                     if step.source == RemoteDirective::SubmitWithFence {
-                        transfers.insert(
-                            capture
-                                .route
-                                .identity
-                                .remote_key(&capture.object.identity.cid),
-                        );
+                        transfers.insert(capture.route.identity.remote_key(cid));
                     }
                     if step.destination == Some(RemoteDirective::SubmitWithFence)
                         && let Some(route) = &capture.destination_route
                     {
-                        transfers.insert(route.identity.remote_key(&capture.object.identity.cid));
+                        transfers.insert(route.identity.remote_key(cid));
                     }
                 }
             }
@@ -154,7 +200,11 @@ pub(crate) fn summarize(entries: &[PlanEntry], snapshot: &Snapshot) -> Result<Su
         }
     }
     summary.unique_cids = cids.len();
-    summary.unique_resources = resources.len();
+    summary.unique_resources = resources.len()
+        + transfers
+            .iter()
+            .filter(|key| !resources.keys().any(|(captured, _, _)| captured == *key))
+            .count();
     summary.possible_new_transfers = transfers.len();
     for remote in resources.values() {
         summary.accounted_remote_bytes = summary

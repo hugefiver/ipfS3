@@ -915,7 +915,9 @@ trustworthy account/ownership evidence, they are quarantined as unknown, and
 unfinished jobs are made unclaimable (`running`, NULL lock). Existing Stage 1
 protocol history is preserved, but is not sufficient proof of an account scope.
 Do not fill missing history from the current TOML or clear these locks manually.
-Explicit historical migration/reapply/retirement management arrives in Stage 7.
+Historical reapply/retirement management uses the separate registered
+[Stage 7 CLI](#local-pinning-management-cli-stage-7), not the R26 legacy namespace
+migration CLI. Local validation and external-operation limits are documented below.
 This migration deliberately refuses downgrade: stop allocation/workers and
 preserve the ledger rather than dropping it to run old binaries.
 
@@ -1186,10 +1188,9 @@ remain **NOT RUN**. Two same-host peers are not multi-host high availability.
 
 ### Local pinning management CLI (Stage 7)
 
-**Source integrated; concentrated acceptance pending.** The first concentrated
-Cargo attempt exited 101 during compilation and executed zero tests. This
-section describes the implemented source contract, not verified execution of
-the nine actions, scoped runtime or retirement barriers. See
+**Local runtime validation passed.** The management workflow, receipt-scoped
+runtime, retirement barriers and isolated PostgreSQL checks have been exercised.
+This does not authorize production migrations or prove external account capabilities. See
 [Stage 7 checks](docs/testing.md#stage-7-local-management-checks).
 
 `--pinning-manage REQUEST.json` defaults to a bounded, read-only plan against an
@@ -1236,8 +1237,9 @@ directories. Confirmation reserves the file before DB staging. A failed confirm
 can leave an empty or incomplete reserved file, and DB confirmation may already
 have committed if export failed. Don't treat that file as usable confirmation or
 retry by overwriting it. Inspect the failure and retained DB state first. Operators
-must protect the files with host permissions/ACLs; Windows ACL hardening isn't
-implemented by this CLI.
+must protect the artifact directories and local configuration. New Unix files
+use owner-only permissions; Windows files use `CREATE_NEW` with a protected
+owner/SYSTEM-only ACL, verified on the same handle before writing.
 
 `--prepare PREPARE.json` is a separate explicit offline local-source read and DB
 evidence write, with no provider IO. Its input names `record_id`, exact `identity`,
@@ -1270,6 +1272,24 @@ Explicit `retire_with` can select evidenced prior migrations or exact controlled
 cleanup resources, but cannot invent ownership or erase unknown debt. Controlled
 cleanup still requires independently eligible managed resources and fresh fences.
 Retirement isn't route deletion, quota release, local unpin or GC permission.
+
+An explicit `retire_with` selection can release exact ZIP root references using
+`release_root_references { references: [...] }`. Each reference is a `NativeKey`
+with `table = "zip_root_references"` and string `values` in this order:
+`batch_id`, `revision`, `epoch`, `node_identity`, `tier`, `cid`. This isn't a
+prefix selector or a fabricated S3 version/ETag, and doesn't make directory roots
+directly supported by all nine actions. See the
+[root reference contract](src/pinning/management/README.md#精确-root-引用解除).
+
+Confirmation binds the DB-derived batch owner, full reference/build/batch tuples
+and private verification evidence. New release requires fresh confirmation and
+atomic action/receipt publication; UUIDs and imported claims aren't authorization.
+`logical_released_at = NULL` means logically active; a non-NULL timestamp means
+logically released. The original retained/adopted state, verification, manifest,
+root history and legacy ZIP/MPU responses remain intact, as do other shared-CID
+references. Default retire/retain never releases roots. Release doesn't promise
+unpin, GC or physical reclamation. Local tests cover formal apply, root CAS,
+receipt rollback and historical receipt recovery within the verification boundary above.
 
 These PowerShell examples assume an already-built binary, an explicitly selected
 existing database/configuration, reviewed request files and a protected existing

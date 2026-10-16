@@ -1,8 +1,11 @@
-//! Narrow durable domain index: no native::capture or global inventory budget.
+//! Durable domain admission with operation-local original-row validation.
+use super::super::native;
+use crate::pinning::management::{Action, Capture, PlannedStep, RetirementSelection, Subject};
+use crate::{
+    error::AppResult, pinning::identity::ProviderRouteSnapshot, store::entities::pin_provider_route,
+};
+use sea_orm::ConnectionTrait;
 use std::collections::BTreeSet;
-use sea_orm::{ConnectionTrait, DatabaseBackend, EntityTrait, Statement};
-use crate::{error::AppResult, pinning::identity::ProviderRouteSnapshot, store::entities::pin_provider_route};
-use crate::pinning::management::{Action, Capture, PlannedStep, Subject, RetirementSelection};
 
 mod index;
 
@@ -10,143 +13,280 @@ mod index;
 #[path = "../../../../../tests/support/stage7_retirement_barrier_schema.rs"]
 mod schema_tests;
 
-pub(super) async fn closed<C: ConnectionTrait>(db: &C, routes: &[ProviderRouteSnapshot]) -> AppResult<bool> {
-    if routes.is_empty() { return Ok(false); }
+#[cfg(test)]
+mod budget_tests;
+
+pub(super) async fn closed<C: ConnectionTrait>(
+    db: &C,
+    routes: &[ProviderRouteSnapshot],
+    context: super::DecodeWork<'_>,
+) -> AppResult<bool> {
+    if routes.is_empty() {
+        return Ok(false);
+    }
     let schema = super::locks::AdmissionSchema::read(db).await?;
-    let closed = closed_in_schema(db, routes, &schema, false).await?;
+    let closed = closed_in_schema(db, routes, &schema, false, context).await?;
     schema.revalidate(db).await?;
     Ok(closed)
 }
 
-pub(super) async fn closed_in_schema<C: ConnectionTrait>(db: &C, routes: &[ProviderRouteSnapshot], schema: &super::locks::AdmissionSchema, registration: bool) -> AppResult<bool> {
-    let requested = routes.iter().map(super::allocation_domain).collect::<AppResult<BTreeSet<_>>>()?;
+pub(super) async fn closed_in_schema<C: ConnectionTrait>(
+    db: &C,
+    routes: &[ProviderRouteSnapshot],
+    schema: &super::locks::AdmissionSchema,
+    registration: bool,
+    context: super::DecodeWork<'_>,
+) -> AppResult<bool> {
+    context
+        .with(|work| work.nodes(2 + routes.len()))
+        .map_err(super::work_error)?;
+    let requested = routes
+        .iter()
+        .map(|route| super::domains::allocation_domain_with_work(route, context))
+        .collect::<AppResult<BTreeSet<_>>>()?;
     let mut closed = false;
     let mut historical_domains = BTreeSet::new();
     // Registry snapshots, never current config, resolve an old alias. Compare
     // the complete resource family, not owns_allocation_domain's backend/scope.
-    let registered = pin_provider_route::Entity::find().all(db).await.map_err(|_| super::needs_attention())?;
+    let registered = super::super::records::current_models::<pin_provider_route::Entity, _>(
+        db,
+        "FROM pin_provider_routes WHERE TRUE",
+        "provider",
+        vec![],
+        native::MAX_ROWS,
+        context,
+    )
+    .await
+    .map_err(super::work_error)?;
+    context
+        .with(|work| work.nodes(1 + registered.len()))
+        .map_err(super::work_error)?;
+    let mut parsed = Vec::new();
     for row in &registered {
-        let original: ProviderRouteSnapshot = serde_json::from_str(&row.snapshot).map_err(|_| super::needs_attention())?;
-        let domain = super::allocation_domain(&original)?;
-        if row.provider.starts_with("domain:") && row.provider != domain { return Err(super::needs_attention()); }
-        if row.retired && requested.contains(&domain) { closed = true; }
+        let original = context
+            .with(|work| work.typed_shared::<ProviderRouteSnapshot>(&row.snapshot))
+            .map_err(super::work_error)?;
+        let domain = super::domains::allocation_domain_with_work(&original, context)?;
+        if row.provider.starts_with("domain:") && row.provider != domain {
+            return Err(super::needs_attention());
+        }
+        if row.retired && requested.contains(&domain) {
+            closed = true;
+        }
+        parsed.push(original);
     }
     if !schema.management_present() {
         // A closed native domain only tells registration to preserve history;
         // it cannot add the new alias or allocate using its changed transport.
-        if registration && closed { return Ok(true); }
-        validate_legacy_routes(routes, &registered, &historical_domains, registration)?;
+        if registration && closed {
+            return Ok(true);
+        }
+        validate_legacy_routes(
+            routes,
+            &registered,
+            &parsed,
+            &historical_domains,
+            registration,
+            context,
+        )?;
         return Ok(closed);
     }
-    let sql = match db.get_database_backend() {
-        DatabaseBackend::Sqlite => index::SQLITE_ROUTES,
-        DatabaseBackend::Postgres => index::POSTGRES_ROUTES,
-        _ => return Err(super::needs_attention()),
-    };
-    let retirements = db.query_all(Statement::from_string(db.get_database_backend(), sql))
-        .await.map_err(|_| super::needs_attention())?;
+    let retirements = index::rows(db, context).await.map_err(super::work_error)?;
     if retirements.is_empty() {
-        if registration && closed { return Ok(true); }
-        validate_legacy_routes(routes, &registered, &historical_domains, registration)?;
+        if registration && closed {
+            return Ok(true);
+        }
+        validate_legacy_routes(
+            routes,
+            &registered,
+            &parsed,
+            &historical_domains,
+            registration,
+            context,
+        )?;
         return Ok(closed);
     }
-    let identity = super::super::native::database_identity(db).await.map_err(|_| super::needs_attention())?;
-    let scope = db.query_one(Statement::from_string(db.get_database_backend(),
-        "SELECT database_scope FROM pin_management_records WHERE kind='database_scope' AND state='identity' AND plan_id='schema' AND item_id='identity'"))
-        .await.map_err(|_| super::needs_attention())?.ok_or_else(super::needs_attention)?
-        .try_get::<String>("", "database_scope").map_err(|_| super::needs_attention())?;
-    for row in retirements {
-        let text = |column: &str| row.try_get::<String>("", column).map_err(|_| super::needs_attention());
-        if text("database_scope")? != scope || text("native_identity")? != identity || identity.starts_with("diagnostic:")
-            || row.try_get::<i64>("", "sealed").map_err(|_| super::needs_attention())? != 1 {
+    context.index_cells(1, 64).map_err(super::work_error)?;
+    let identity = super::super::native::database_identity(db)
+        .await
+        .map_err(super::work_error)?;
+    let (scopes,bytes)=super::super::records::bounded_projection(db,"FROM pin_management_records WHERE kind='database_scope' AND state='identity' AND plan_id='schema' AND item_id='identity'",&[("database_scope","database_scope")],"database_scope",vec![],(1,native::MAX_BYTES),context).await.map_err(super::work_error)?;
+    context
+        .index_cells(scopes.len(), bytes)
+        .map_err(super::work_error)?;
+    let scope = scopes
+        .first()
+        .ok_or_else(super::needs_attention)?
+        .try_get::<String>("", "database_scope")
+        .map_err(|_| super::needs_attention())?;
+    context
+        .with(|work| work.nodes(1 + retirements.len()))
+        .map_err(super::work_error)?;
+    let plans = retirements
+        .iter()
+        .map(|(row, _)| {
+            let plan = native::value(row, "plan_id").ok_or_else(super::needs_attention)?;
+            context.copy(plan).map_err(super::work_error)?;
+            Ok(plan.to_owned())
+        })
+        .collect::<AppResult<Vec<_>>>()?;
+    let mut source = super::super::records::evidence::Evidence::load_roots_with_work(
+        db,
+        &scope,
+        &identity,
+        &plans,
+        &retirements,
+        context.budget().clone(),
+    )
+    .await
+    .map_err(super::work_error)?;
+    for (row, action) in &retirements {
+        let text = |column: &str| native::value(row, column).ok_or_else(super::needs_attention);
+        if text("database_scope")? != scope
+            || text("native_identity")? != identity
+            || identity.starts_with("diagnostic:")
+        {
             return Err(super::needs_attention());
         }
         let key = text("allocation_domain")?;
-        let (receipt, _) = super::super::records::decode_action_result(&text("receipt")?)
-            .map_err(|_| super::needs_attention())?;
-        let (Subject::Provider { route }, Some(Capture::Provider(capture)), Some(PlannedStep::Retire(step))) =
-            (&receipt.binding.request.subject, &receipt.binding.capture, &receipt.binding.step) else { return Err(super::needs_attention()); };
+        let receipt = super::super::records::classify_retirement_root(&source, row, action)
+            .map_err(super::work_error)?;
+        let (
+            Subject::Provider { route },
+            Some(Capture::Provider(capture)),
+            Some(PlannedStep::Retire(step)),
+        ) = (
+            &receipt.binding.request.subject,
+            &receipt.binding.capture,
+            &receipt.binding.step,
+        )
+        else {
+            return Err(super::needs_attention());
+        };
         let original = route.original.as_ref().ok_or_else(super::needs_attention)?;
         let disposition = text("disposition")?;
         let selected = match &receipt.binding.request.action {
-            Action::Retire | Action::RetireWith { selection: RetirementSelection::Retain } => "retain",
-            Action::RetireWith { selection: RetirementSelection::Migrate { .. } } => "migrate",
-            Action::RetireWith { selection: RetirementSelection::ControlledCleanup { .. } } => "controlled_cleanup",
+            Action::Retire
+            | Action::RetireWith {
+                selection:
+                    RetirementSelection::Retain | RetirementSelection::ReleaseRootReferences { .. },
+            } => "retain",
+            Action::RetireWith {
+                selection: RetirementSelection::Migrate { .. },
+            } => "migrate",
+            Action::RetireWith {
+                selection: RetirementSelection::ControlledCleanup { .. },
+            } => "controlled_cleanup",
             _ => return Err(super::needs_attention()),
         };
-        if disposition != selected || !receipt.intent_ids.is_empty()
-            || (selected != "controlled_cleanup" && !receipt.job_ids.is_empty())
-            || !capture.inventory.complete || !step.stop_new_allocations {
+        if disposition != selected
+            || !receipt.intent_ids.is_empty()
+            || !capture.inventory.complete
+            || !step.stop_new_allocations
+        {
             return Err(super::needs_attention());
         }
-        let domain = super::allocation_domain(original)?;
-        if key.starts_with("domain:") {
-            if !super::domains::canonical_domain(&key) || key != domain { return Err(super::needs_attention()); }
+        let domain = super::domains::allocation_domain_with_work(original, context)?;
+        if key.starts_with("domain:") && key != domain {
+            return Err(super::needs_attention());
         }
         if !key.starts_with("domain:") {
             // Resolve the old alias from its complete, DB-bound original
             // receipt/capture even after R26 moves today's registry row. The
             // key is only a locator; membership plus the full original route
             // supplies the backend/scope/resource-type relation.
-            if !capture.inventory.frontier.iter().any(|point|
-                point.table == "pin_provider_routes" && point.values == [key.clone()])
-                || !capture.routes.iter().any(|captured| captured.original.as_ref() == Some(original)
-                    && captured.identity.original.as_ref() == Some(original)) {
+            if !capture.inventory.frontier.iter().any(|point| {
+                point.table == "pin_provider_routes"
+                    && point.values.iter().map(String::as_str).eq([key])
+            }) || !capture.routes.iter().any(|captured| {
+                captured.original.as_ref() == Some(original)
+                    && captured.identity.original.as_ref() == Some(original)
+            }) {
                 return Err(super::needs_attention());
             }
+            context.copy(&domain).map_err(super::work_error)?;
             historical_domains.insert(domain.clone());
         }
         if requested.contains(&domain) {
             // Only a matching closed-domain point needs the retained full-frame
             // recheck. Open births do not scan each legacy private inventory.
-            validate_original_point(db, &key, original).await?;
+            context.copy(text("plan_id")?).map_err(super::work_error)?;
+            source
+                .load_dependencies(db, &[text("plan_id")?.to_owned()])
+                .await
+                .map_err(super::work_error)?;
+            validate_original_point(&source, key, original, row, action, context)?;
+            context.copy(&domain).map_err(super::work_error)?;
             historical_domains.insert(domain.clone());
         }
         closed |= requested.contains(&domain);
     }
-    validate_legacy_routes(routes, &registered, &historical_domains, false)?;
+    validate_legacy_routes(
+        routes,
+        &registered,
+        &parsed,
+        &historical_domains,
+        false,
+        context,
+    )?;
     Ok(closed)
 }
 
-fn validate_legacy_routes(routes: &[ProviderRouteSnapshot], registered: &[pin_provider_route::Model], historical_domains: &BTreeSet<String>, registration: bool) -> AppResult<()> {
+fn validate_legacy_routes(
+    routes: &[ProviderRouteSnapshot],
+    registered: &[pin_provider_route::Model],
+    parsed: &[std::sync::Arc<ProviderRouteSnapshot>],
+    historical_domains: &BTreeSet<String>,
+    registration: bool,
+    work: super::DecodeWork<'_>,
+) -> AppResult<()> {
     // Removing explicit identity cannot prove a new account. A previously
     // registered original legacy route may still prove a different domain.
-    for route in routes.iter().filter(|route| route.provider_id.starts_with("legacy:")) {
-        if historical_domains.contains(&super::allocation_domain(route)?) { continue; }
-        let key = super::domains::registration_key(route)?;
+    for route in routes
+        .iter()
+        .filter(|route| route.provider_id.starts_with("legacy:"))
+    {
+        if historical_domains.contains(&super::domains::allocation_domain_with_work(route, work)?) {
+            continue;
+        }
+        let key = super::domains::registration_key_with_work(route, work)?;
         // A genuinely new metadata registration is not allocation admission.
         // Never reinterpret an already registered alias as another old account.
-        if registration && !registered.iter().any(|row| row.provider == key) { continue; }
-        if !registered.iter().any(|row| row.provider == key
-            && serde_json::from_str::<ProviderRouteSnapshot>(&row.snapshot).ok().as_ref() == Some(route)) {
+        if registration && !registered.iter().any(|row| row.provider == key) {
+            continue;
+        }
+        if !registered
+            .iter()
+            .zip(parsed)
+            .any(|(row, original)| row.provider == key && original.as_ref() == route)
+        {
             return Err(super::needs_attention());
         }
     }
     Ok(())
 }
 
-async fn validate_original_point<C: ConnectionTrait>(db: &C, key: &str, original: &ProviderRouteSnapshot) -> AppResult<()> {
-    let sql = if db.get_database_backend() == DatabaseBackend::Sqlite { index::SQLITE } else { index::POSTGRES };
-    let proof = db.query_one(Statement::from_sql_and_values(db.get_database_backend(), sql, [key.into()]))
-        .await.map_err(|_| super::needs_attention())?.ok_or_else(super::needs_attention)?;
-    if proof.try_get::<i64>("", "sealed").map_err(|_| super::needs_attention())? != 1 { return Err(super::needs_attention()); }
-    // Matching closed points also use the record owner's lossless strict codec,
-    // including packed snapshot/private strings. No SQL-extracted packed string
-    // is treated as a raw route and no codec or authority is reimplemented.
-    let columns = ["allocation_domain", "database_scope", "plan_id", "item_id", "principal", "native_identity",
-        "binding", "inventory", "disposition", "unresolved", "state", "created_at", "record_kind"];
-    let fields = columns.iter().map(|column| format!("CAST(\"{column}\" AS TEXT) AS \"{column}\""))
-        .collect::<Vec<_>>().join(",");
-    let row = db.query_one(Statement::from_sql_and_values(db.get_database_backend(),
-        format!("SELECT {fields} FROM pin_management_retirements WHERE allocation_domain=$1"), [key.into()]))
-        .await.map_err(|_| super::needs_attention())?.ok_or_else(super::needs_attention)?;
-    let mut native = super::super::native::NativeRow::new();
-    for column in columns { native.insert(column.into(), row.try_get::<Option<String>>("", column).map_err(|_| super::needs_attention())?); }
-    let super::super::records::RecordPayload::Retirement { inventory, .. } =
-        super::super::records::inspect_original_row("pin_management_retirements", &native).map_err(|_| super::needs_attention())?
-        else { return Err(super::needs_attention()); };
-    if inventory.row("pin_provider_routes", &[key]).and_then(|row| super::super::native::value(row, "snapshot"))
-        .and_then(|snapshot| serde_json::from_str::<ProviderRouteSnapshot>(snapshot).ok()).as_ref() != Some(original)
-    { return Err(super::needs_attention()); }
+fn validate_original_point(
+    source: &super::super::records::evidence::Evidence,
+    key: &str,
+    original: &ProviderRouteSnapshot,
+    row: &native::NativeRow,
+    action: &native::NativeRow,
+    work: super::super::records::DecodeWork<'_>,
+) -> AppResult<()> {
+    let review = super::super::records::retirement_review_from_source(source, row, action)
+        .map_err(super::work_error)?;
+    if review
+        .rows()
+        .row("pin_provider_routes", &[key])
+        .and_then(|row| super::super::native::value(row, "snapshot"))
+        .map(|snapshot| work.with(|work| work.typed::<ProviderRouteSnapshot>(snapshot)))
+        .transpose()
+        .map_err(super::work_error)?
+        .as_ref()
+        != Some(original)
+    {
+        return Err(super::needs_attention());
+    }
     Ok(())
 }

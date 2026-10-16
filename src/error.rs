@@ -242,6 +242,8 @@ pub enum AppError {
 
     #[error("internal error: {0}")]
     Internal(String),
+    #[error("management work budget exceeded")]
+    ManagementBudget,
 }
 
 impl From<AppError> for S3Error {

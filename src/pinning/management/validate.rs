@@ -115,15 +115,27 @@ impl Budget {
     }
 
     fn object(&mut self, object: &ObjectSnapshot) -> Result<(), SafeError> {
-        if let Some(proof)=&object.read_evidence {
-            if proof.identity!=object.identity || object.readable!=Some(true) || proof.expires_at<=proof.observed_at || proof.idle_timeout_millis==0 || proof.proof.has_stored_byte_count()!=proof.stored_bytes.is_some()
-                ||proof.proof==super::evidence::ReadProof::CompleteLocalDirectoryDagBlocksV1&&proof.stored_bytes==Some(0) {return Err(SafeError::InconsistentSnapshot);}
+        if let Some(proof) = &object.read_evidence {
+            if proof.identity != object.identity
+                || object.readable != Some(true)
+                || proof.expires_at <= proof.observed_at
+                || proof.idle_timeout_millis == 0
+                || proof.proof.has_stored_byte_count() != proof.stored_bytes.is_some()
+                || proof.proof == super::evidence::ReadProof::CompleteLocalDirectoryDagBlocksV1
+                    && proof.stored_bytes == Some(0)
+            {
+                return Err(SafeError::InconsistentSnapshot);
+            }
             self.id(&proof.node_identity)?;
         }
         self.rows(1)?;
         self.exact(&object.identity)?;
-        if let Some(value) = &object.control_revision { self.id(value)?; }
-        if let Some(value) = &object.config_revision { self.id(value)?; }
+        if let Some(value) = &object.control_revision {
+            self.id(value)?;
+        }
+        if let Some(value) = &object.config_revision {
+            self.id(value)?;
+        }
         if object.allowed_routes.len() > MAX_PROVIDERS {
             return Err(SafeError::LimitExceeded);
         }
@@ -155,11 +167,19 @@ impl Budget {
         self.rows(1)?;
         self.id(&lease.id)?;
         self.id(&lease.object_id)?;
-        let valid_time=if let Some(tuple)=&lease.native_tuple {
-            let start=crate::store::pinning::management::native::value(tuple,"created_at").and_then(|raw|crate::store::pinning::management::native::parse_time(raw).ok()).ok_or(SafeError::UnknownEvidence)?;
-            let expiry=crate::store::pinning::management::native::value(tuple,"expires_at").and_then(|raw|crate::store::pinning::management::native::parse_time(raw).ok()).ok_or(SafeError::UnknownEvidence)?;
-            expiry>start && start.timestamp()==lease.started_at && expiry.timestamp()==lease.expires_at
-        }else{lease.expires_at>lease.started_at};
+        let valid_time = if let Some(tuple) = &lease.native_tuple {
+            let start = crate::store::pinning::management::native::value(tuple, "created_at")
+                .and_then(|raw| crate::store::pinning::management::native::parse_time(raw).ok())
+                .ok_or(SafeError::UnknownEvidence)?;
+            let expiry = crate::store::pinning::management::native::value(tuple, "expires_at")
+                .and_then(|raw| crate::store::pinning::management::native::parse_time(raw).ok())
+                .ok_or(SafeError::UnknownEvidence)?;
+            expiry > start
+                && start.timestamp() == lease.started_at
+                && expiry.timestamp() == lease.expires_at
+        } else {
+            lease.expires_at > lease.started_at
+        };
         if lease.generation <= 0 || lease.started_at < 0 || !valid_time {
             return Err(SafeError::InvalidInput);
         }
@@ -171,15 +191,28 @@ impl Budget {
         self.id(&target.id)?;
         self.lease(&target.lease)?;
         self.cid(&target.cid)?;
-        if let Some(route)=&target.route { self.route(route)?; }
-        unique(target.frozen_candidates.iter().map(|candidate|&candidate.slot))?;
-        for candidate in &target.frozen_candidates {
-            self.text(&candidate.slot,1024)?;
-            self.text(&candidate.allocation,1024)?;
-            if let Some(route)=&candidate.route { self.route(route)?; }
-            if let Some(id)=&candidate.receipt_id { self.id(id)?; }
+        if let Some(route) = &target.route {
+            self.route(route)?;
         }
-        if let Some(requirements) = &target.requirements { self.requirements(requirements)?; }
+        unique(
+            target
+                .frozen_candidates
+                .iter()
+                .map(|candidate| &candidate.slot),
+        )?;
+        for candidate in &target.frozen_candidates {
+            self.text(&candidate.slot, 1024)?;
+            self.text(&candidate.allocation, 1024)?;
+            if let Some(route) = &candidate.route {
+                self.route(route)?;
+            }
+            if let Some(id) = &candidate.receipt_id {
+                self.id(id)?;
+            }
+        }
+        if let Some(requirements) = &target.requirements {
+            self.requirements(requirements)?;
+        }
         if target.native_tuple.is_empty() {
             return Err(SafeError::InconsistentSnapshot);
         }
@@ -204,10 +237,10 @@ impl Budget {
             remote.effect,
             SideEffect::NotSubmitted | SideEffect::Rejected
         ) && (remote.resource_id.is_some()
-            || remote.inflight_operations.is_some_and(|n|n > 0)
+            || remote.inflight_operations.is_some_and(|n| n > 0)
             || remote.retained
             || remote.cleanup_pending
-            || remote.confirmed_replicas.is_some_and(|n|n > 0)
+            || remote.confirmed_replicas.is_some_and(|n| n > 0)
             || remote
                 .confirmations
                 .iter()
@@ -232,8 +265,55 @@ impl Budget {
             self.lease(lease)?;
         }
         for root in &inventory.root_reference_ids {
-            if root.table!="zip_root_references" || root.values.len()!=6 {return Err(SafeError::InconsistentSnapshot);}
-            for value in &root.values {self.text(value,512)?;}
+            if root.table != "zip_root_references" || root.values.len() != 6 {
+                return Err(SafeError::InconsistentSnapshot);
+            }
+            for value in &root.values {
+                self.text(value, 512)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn root_key(&mut self, key: &NativeKey) -> Result<(), SafeError> {
+        self.rows(1)?;
+        if key.table != "zip_root_references" || key.values.len() != 6 {
+            return Err(SafeError::InvalidInput);
+        }
+        for value in &key.values {
+            self.text(value, 512)?;
+        }
+        if key.values[1..3].iter().any(|value| {
+            value
+                .parse::<i64>()
+                .ok()
+                .is_none_or(|n| n <= 0 || n.to_string() != *value)
+        }) {
+            return Err(SafeError::InvalidInput);
+        }
+        crate::pinning::provider::canonical_resource_cid(&key.values[5])
+            .map_err(|_| SafeError::InvalidInput)?;
+        Ok(())
+    }
+
+    fn root_reference(&mut self, proof: &RootReferenceSnapshot) -> Result<(), SafeError> {
+        self.root_key(&proof.key)?;
+        self.text(&proof.owner, 512)?;
+        for row in [
+            &proof.reference_tuple,
+            &proof.build_tuple,
+            &proof.batch_tuple,
+        ] {
+            self.rows(1)?;
+            for value in row.values().flatten() {
+                self.bytes = self
+                    .bytes
+                    .checked_add(value.len())
+                    .ok_or(SafeError::LimitExceeded)?;
+                if self.bytes > MAX_TEXT_BYTES {
+                    return Err(SafeError::LimitExceeded);
+                }
+            }
         }
         Ok(())
     }
@@ -254,7 +334,12 @@ impl Budget {
                 self.exact(identity)?;
                 match target {
                     TargetSelection::New(route) => self.route(route)?,
-                    TargetSelection::Existing { target_id, source } => { self.id(target_id)?; if let Some(source)=source {self.exact(source)?;} },
+                    TargetSelection::Existing { target_id, source } => {
+                        self.id(target_id)?;
+                        if let Some(source) = source {
+                            self.exact(source)?;
+                        }
+                    }
                 }
             }
             Subject::Provider { route } => self.route(route)?,
@@ -270,21 +355,58 @@ impl Budget {
                 return Err(SafeError::InvalidInput);
             }
             Action::Migrate { destination } => self.route(destination)?,
-            Action::RetireWith {selection}=>match selection {
-                RetirementSelection::Retain=>{},
-                RetirementSelection::Migrate {targets}=> {
-                    self.rows(targets.len())?;
-                    if targets.is_empty()||targets.len()>MAX_RECORDS {return Err(SafeError::LimitExceeded);}
-                    unique(targets.iter().map(|target|(&target.lease_id,&target.source_target_id,&target.cid)))?;
-                    for target in targets {label(&target.plan_id)?;label(&target.item_id)?;self.id(&target.lease_id)?;self.id(&target.source_target_id)?;self.cid(&target.cid)?;self.route(&target.destination)?;}
-                },
-                RetirementSelection::ControlledCleanup {resources}=> {
-                    self.rows(resources.len())?;
-                    if resources.len()>MAX_RECORDS {return Err(SafeError::LimitExceeded);}
-                    unique(resources.iter().map(|resource|(&resource.key,resource.epoch)))?;
-                    for resource in resources {self.route(&resource.route)?;self.cid(&resource.key.cid)?;self.id(&resource.resource_id)?;if resource.epoch<1||resource.route.remote_key(&resource.key.cid)!=resource.key {return Err(SafeError::InvalidInput);}}
-                },
-            },
+            Action::RetireWith { selection } => {
+                match selection {
+                    RetirementSelection::Retain => {}
+                    RetirementSelection::ReleaseRootReferences { references } => {
+                        if references.is_empty() || references.len() > MAX_RECORDS {
+                            return Err(SafeError::LimitExceeded);
+                        }
+                        unique(references.iter())?;
+                        for key in references {
+                            self.root_key(key)?;
+                        }
+                    }
+                    RetirementSelection::Migrate { targets } => {
+                        self.rows(targets.len())?;
+                        if targets.is_empty() || targets.len() > MAX_RECORDS {
+                            return Err(SafeError::LimitExceeded);
+                        }
+                        unique(targets.iter().map(|target| {
+                            (&target.lease_id, &target.source_target_id, &target.cid)
+                        }))?;
+                        for target in targets {
+                            label(&target.plan_id)?;
+                            label(&target.item_id)?;
+                            self.id(&target.lease_id)?;
+                            self.id(&target.source_target_id)?;
+                            self.cid(&target.cid)?;
+                            self.route(&target.destination)?;
+                        }
+                    }
+                    RetirementSelection::ControlledCleanup { resources } => {
+                        self.rows(resources.len())?;
+                        if resources.len() > MAX_RECORDS {
+                            return Err(SafeError::LimitExceeded);
+                        }
+                        unique(
+                            resources
+                                .iter()
+                                .map(|resource| (&resource.key, resource.epoch)),
+                        )?;
+                        for resource in resources {
+                            self.route(&resource.route)?;
+                            self.cid(&resource.key.cid)?;
+                            self.id(&resource.resource_id)?;
+                            if resource.epoch < 1
+                                || resource.route.remote_key(&resource.key.cid) != resource.key
+                            {
+                                return Err(SafeError::InvalidInput);
+                            }
+                        }
+                    }
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -324,7 +446,9 @@ impl Budget {
                 for route in &capture.historical_routes {
                     self.route(&route.identity)?;
                 }
-                for route in &capture.requirement_routes {self.route(&route.identity)?;}
+                for route in &capture.requirement_routes {
+                    self.route(&route.identity)?;
+                }
             }
             Capture::Provider(capture) => {
                 self.inventory(&capture.inventory)?;
@@ -339,6 +463,9 @@ impl Budget {
                 }
                 for remote in &capture.historical_remotes {
                     self.remote(remote)?;
+                }
+                for root in &capture.root_references {
+                    self.root_reference(root)?;
                 }
             }
         }
@@ -405,14 +532,97 @@ pub fn validate_request(request: &PlanRequest) -> Result<(), SafeError> {
     Ok(())
 }
 
-pub fn validate_snapshot(snapshot: &Snapshot) -> Result<(), SafeError> {
-    if let Some(frame)=&snapshot.native_frame {frame.validate().map_err(|error|if error==crate::store::pinning::management::ManagementError::Budget {SafeError::LimitExceeded}else{SafeError::InconsistentSnapshot})?;}
-    if let Some(frame)=&snapshot.native_frame&&frame.has_private_material() {
-        for proof in snapshot.objects.iter().filter_map(|object|object.read_evidence.as_ref()).filter(|proof|proof.proof==super::evidence::ReadProof::CompleteLocalDirectoryDagBlocksV1) {
-            crate::store::pinning::management::actions::accounting::trusted_proof(frame,proof).map_err(|_|SafeError::InconsistentSnapshot)?;
+#[derive(Clone, Copy)]
+pub(crate) struct SnapshotView<'a> {
+    pub work: Option<&'a crate::store::pinning::management::records::SharedDecodeBudget>,
+    pub observed_at: i64,
+    pub database_now: Option<chrono::DateTime<chrono::Utc>>,
+    pub configuration: &'a Option<ConfigurationBinding>,
+    pub native_frame: Option<&'a NativeFrame>,
+    pub rows: Option<crate::store::pinning::management::records::FrozenRows<'a>>,
+    pub objects: &'a [ObjectSnapshot],
+    pub routes: &'a [RouteSnapshot],
+    pub targets: &'a [TargetSnapshot],
+    pub remotes: &'a [RemoteSnapshot],
+    pub historical_remotes: &'a [RemoteSnapshot],
+    pub unknown_resources: &'a [NativeKey],
+    pub ledger_domains: &'a [LedgerDomainSnapshot],
+    pub inventories: &'a [ProviderInventory],
+    pub root_references: &'a [RootReferenceSnapshot],
+    pub applied: &'a [AppliedItem],
+}
+impl<'a> From<&'a Snapshot> for SnapshotView<'a> {
+    fn from(snapshot: &'a Snapshot) -> Self {
+        Self {
+            work: None,
+            observed_at: snapshot.observed_at,
+            database_now: snapshot.database_now,
+            configuration: &snapshot.configuration,
+            native_frame: snapshot.native_frame.as_ref(),
+            rows: snapshot.native_frame.as_ref().map(Into::into),
+            objects: &snapshot.objects,
+            routes: &snapshot.routes,
+            targets: &snapshot.targets,
+            remotes: &snapshot.remotes,
+            historical_remotes: &snapshot.historical_remotes,
+            unknown_resources: &snapshot.unknown_resources,
+            ledger_domains: &snapshot.ledger_domains,
+            inventories: &snapshot.inventories,
+            root_references: &snapshot.root_references,
+            applied: &snapshot.applied,
         }
     }
-    if snapshot.observed_at < 0 || chrono::DateTime::from_timestamp(snapshot.observed_at,0).is_none() {
+}
+pub fn validate_snapshot(snapshot: &Snapshot) -> Result<(), SafeError> {
+    validate_snapshot_view(snapshot.into())
+}
+pub(crate) fn validate_snapshot_view(snapshot: SnapshotView<'_>) -> Result<(), SafeError> {
+    validate_snapshot_view_with_work(
+        snapshot,
+        &mut crate::store::pinning::management::records::ReadSession::default(),
+    )
+}
+pub(crate) fn validate_snapshot_view_with_work(
+    snapshot: SnapshotView<'_>,
+    work: &mut crate::store::pinning::management::records::DecodeBudget,
+) -> Result<(), SafeError> {
+    if let Some(frame) = &snapshot.native_frame {
+        frame.validate().map_err(|error| {
+            if error == crate::store::pinning::management::ManagementError::Budget {
+                SafeError::LimitExceeded
+            } else {
+                SafeError::InconsistentSnapshot
+            }
+        })?;
+    }
+    if let Some(rows) = snapshot.rows
+        && snapshot
+            .native_frame
+            .is_none_or(|frame| frame.has_private_material())
+    {
+        for proof in snapshot
+            .objects
+            .iter()
+            .filter_map(|object| object.read_evidence.as_ref())
+            .filter(|proof| {
+                proof.proof == super::evidence::ReadProof::CompleteLocalDirectoryDagBlocksV1
+            })
+        {
+            crate::store::pinning::management::actions::accounting::trusted_proof_with_work(
+                rows, proof, work,
+            )
+            .map_err(|error| {
+                if error == crate::store::pinning::management::ManagementError::Budget {
+                    SafeError::LimitExceeded
+                } else {
+                    SafeError::InconsistentSnapshot
+                }
+            })?;
+        }
+    }
+    if snapshot.observed_at < 0
+        || chrono::DateTime::from_timestamp(snapshot.observed_at, 0).is_none()
+    {
         return Err(SafeError::InvalidInput);
     }
     // Fail before traversing oversized collections or allocating indexes.
@@ -424,6 +634,7 @@ pub fn validate_snapshot(snapshot: &Snapshot) -> Result<(), SafeError> {
     budget.rows(snapshot.historical_remotes.len())?;
     budget.rows(snapshot.ledger_domains.len())?;
     budget.rows(snapshot.inventories.len())?;
+    budget.rows(snapshot.root_references.len())?;
     budget.rows(snapshot.applied.len())?;
     unique(
         snapshot
@@ -439,11 +650,14 @@ pub fn validate_snapshot(snapshot: &Snapshot) -> Result<(), SafeError> {
     )?;
     unique(snapshot.routes.iter().map(|route| &route.identity))?;
     unique(snapshot.targets.iter().map(|target| &target.id))?;
+    unique(snapshot.root_references.iter().map(|root| &root.key))?;
     unique(snapshot.remotes.iter().map(|remote| &remote.key))?;
     unique(snapshot.unknown_resources.iter())?;
-    for key in &snapshot.unknown_resources {
-        let frame=snapshot.native_frame.as_ref().ok_or(SafeError::InconsistentSnapshot)?;
-        if !frame.frontier.contains(key) {return Err(SafeError::InconsistentSnapshot);}
+    for key in snapshot.unknown_resources {
+        let rows = snapshot.rows.ok_or(SafeError::InconsistentSnapshot)?;
+        if rows.row_key(&key.table, &key.values).is_none() {
+            return Err(SafeError::InconsistentSnapshot);
+        }
     }
     unique(
         snapshot
@@ -464,28 +678,31 @@ pub fn validate_snapshot(snapshot: &Snapshot) -> Result<(), SafeError> {
             .map(|inventory| &inventory.provider_id),
     )?;
     unique(snapshot.applied.iter().map(|receipt| &receipt.binding.id))?;
-    for object in &snapshot.objects {
+    for object in snapshot.objects {
         budget.object(object)?;
     }
-    for route in &snapshot.routes {
+    for route in snapshot.routes {
         budget.route(&route.identity)?;
     }
-    for target in &snapshot.targets {
+    for target in snapshot.targets {
         budget.target(target)?;
     }
-    for remote in &snapshot.remotes {
+    for remote in snapshot.remotes {
         budget.remote(remote)?;
     }
-    for remote in &snapshot.historical_remotes {
+    for remote in snapshot.historical_remotes {
         budget.remote(remote)?;
     }
-    for domain in &snapshot.ledger_domains {
+    for domain in snapshot.ledger_domains {
         budget.domain(domain)?;
     }
-    for inventory in &snapshot.inventories {
+    for inventory in snapshot.inventories {
         budget.inventory(inventory)?;
     }
-    for receipt in &snapshot.applied {
+    for root in snapshot.root_references {
+        budget.root_reference(root)?;
+    }
+    for receipt in snapshot.applied {
         budget.entry(&receipt.binding)?;
         if matches!(receipt.binding.status, PlanStatus::Blocked(_))
             || receipt.binding.capture.is_none()
@@ -510,7 +727,7 @@ pub fn validate_snapshot(snapshot: &Snapshot) -> Result<(), SafeError> {
         }
     }
     let mut epochs = std::collections::BTreeMap::new();
-    for remote in snapshot.remotes.iter().chain(&snapshot.historical_remotes) {
+    for remote in snapshot.remotes.iter().chain(snapshot.historical_remotes) {
         if let Some(old) = epochs.insert((&remote.key, remote.epoch), remote) {
             return Err(if old == remote {
                 SafeError::DuplicateIdentity

@@ -1,13 +1,17 @@
 use super::support;
-use ipfs_s3_gateway::store::{entities::{pin_job, pin_lease}, pinning::management::records};
-use sea_orm::{ConnectionTrait, EntityTrait};
+use ipfs_s3_gateway::store::{
+    entities::{pin_job, pin_lease},
+    pinning::management::records,
+};
+use sea_orm::EntityTrait;
 use serde_json::json;
 
 #[path = "stage7_management_cli_directory.rs"]
 mod directory;
 
 #[tokio::test]
-async fn explicit_offline_prepare_confirm_export_apply_restart_and_exact_replay_use_the_same_database() {
+async fn explicit_offline_prepare_confirm_export_apply_restart_and_exact_replay_use_the_same_database()
+ {
     let fixture = support::Fixture::new(false).await;
     let before_proof = fixture.frame().await;
     let prepared = fixture.prepare().await;
@@ -24,14 +28,37 @@ async fn explicit_offline_prepare_confirm_export_apply_restart_and_exact_replay_
     assert!(!String::from_utf8_lossy(&bytes).contains(&fixture.server.uri()));
     let imported = ipfs_s3_gateway::pinning::management::wire::decode_plan(&bytes).unwrap();
     assert!(imported.confirmation().is_some());
-    assert!(!imported.snapshot_without_applied().native_frame.as_ref().unwrap().has_private_material());
+    assert!(
+        !imported
+            .snapshot_without_applied()
+            .native_frame
+            .as_ref()
+            .unwrap()
+            .has_private_material()
+    );
     let result = fixture.import("--apply", &confirmed, false).await;
     let applied = support::report(&result);
     assert_eq!(applied["replayed"], false);
     assert_eq!(applied["run_requested"], false);
-    assert_eq!(applied["items"][0]["receipt"], "verified_original_database_receipt");
-    assert_eq!(pin_lease::Entity::find().all(&fixture.db).await.unwrap().len(), 1);
-    assert!(!pin_job::Entity::find().all(&fixture.db).await.unwrap().is_empty());
+    assert_eq!(
+        applied["items"][0]["receipt"],
+        "verified_original_database_receipt"
+    );
+    assert_eq!(
+        pin_lease::Entity::find()
+            .all(&fixture.db)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        !pin_job::Entity::find()
+            .all(&fixture.db)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     let after_apply = fixture.frame().await;
     // Each import starts the actual binary again, rather than reusing an in-process binding.
     let replay = fixture.import("--apply", &confirmed, false).await;
@@ -42,7 +69,9 @@ async fn explicit_offline_prepare_confirm_export_apply_restart_and_exact_replay_
     assert_eq!(support::report(&status)["items"][0]["state"], "queued");
     assert!(fixture.frame().await == after_apply);
     assert_eq!(fixture.remote_calls().await, calls);
-    for result in [&result, &replay, &status] { fixture.assert_redacted(result); }
+    for result in [&result, &replay, &status] {
+        fixture.assert_redacted(result);
+    }
 }
 
 #[tokio::test]
@@ -68,13 +97,22 @@ async fn candidate_requires_exact_per_item_ack_and_artifact_never_overwrites_or_
     let fresh = fixture.file("acknowledged.json");
     let result = fixture.confirm(&fresh, "300", true).await;
     assert_eq!(support::report(&result)["items"][0]["status"], "candidate");
-    let imported = ipfs_s3_gateway::pinning::management::wire::decode_plan(&std::fs::read(&fresh).unwrap()).unwrap();
-    assert_eq!(imported.confirmation().unwrap().candidate_item_ids, vec!["object"]);
-    assert!(fixture.import("--apply", &fresh, false).await.status.success());
+    let imported =
+        ipfs_s3_gateway::pinning::management::wire::decode_plan(&std::fs::read(&fresh).unwrap())
+            .unwrap();
+    assert_eq!(imported.confirmation().unwrap(), ["object"]);
+    assert!(
+        fixture
+            .import("--apply", &fresh, false)
+            .await
+            .status
+            .success()
+    );
 }
 
 #[tokio::test]
-async fn unapplied_expired_confirmation_rejects_business_but_committed_expired_receipts_remain_readable() {
+async fn unapplied_expired_confirmation_rejects_business_but_committed_expired_receipts_remain_readable()
+ {
     let unapplied = support::Fixture::new(false).await;
     unapplied.prepare().await;
     let file = unapplied.file("expires-without-apply.json");
@@ -104,7 +142,10 @@ async fn unapplied_expired_confirmation_rejects_business_but_committed_expired_r
     let replay = applied.import("--apply", &file, false).await;
     assert_eq!(support::report(&replay)["replayed"], true);
     let status = applied.import("--status", &file, false).await;
-    assert_eq!(support::report(&status)["items"][0]["receipt"], "verified_original_database_receipt");
+    assert_eq!(
+        support::report(&status)["items"][0]["receipt"],
+        "verified_original_database_receipt"
+    );
     assert!(applied.frame().await == before);
 }
 
@@ -114,22 +155,48 @@ async fn exported_proposal_and_a_staged_only_database_record_are_not_confirmatio
     fixture.prepare().await;
     let request = fixture.request_file();
     let proposal = fixture.file("proposal.json");
-    let result = support::output(&mut fixture.command(&["--pinning-manage", request.to_str().unwrap(),
-        "--source-node", support::NODE, "--output", proposal.to_str().unwrap()])).await;
+    let result = support::output(&mut fixture.command(&[
+        "--pinning-manage",
+        request.to_str().unwrap(),
+        "--source-node",
+        support::NODE,
+        "--output",
+        proposal.to_str().unwrap(),
+    ]))
+    .await;
     support::report(&result);
-    let mut document: serde_json::Value = serde_json::from_slice(&std::fs::read(&proposal).unwrap()).unwrap();
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&proposal).unwrap()).unwrap();
     document["confirmation"] = json!({
         "plan_id": fixture.request.plan_id, "bindings": document["plan"]["items"], "candidate_item_ids": [],
         "native_frame": document["snapshot"]["native_frame"], "configuration": document["snapshot"]["configuration"],
     });
     let forged = fixture.file("reviewed-but-not-confirmed.json");
     support::write_json(&forged, &document);
-    let snapshot = ipfs_s3_gateway::pinning::management::db_snapshot::collect_with_config(&fixture.db, &fixture.config, &fixture.request)
-        .await.unwrap().planning_snapshot().unwrap();
+    let snapshot = ipfs_s3_gateway::pinning::management::db_snapshot::collect_with_config(
+        &fixture.db,
+        &fixture.config,
+        &fixture.request,
+    )
+    .await
+    .unwrap()
+    .planning_snapshot()
+    .unwrap();
     let plan = ipfs_s3_gateway::pinning::management::dry_run(&fixture.request, &snapshot).unwrap();
-    let raw: ipfs_s3_gateway::config::Config = toml::from_str(&std::fs::read_to_string(&fixture.config_path).unwrap()).unwrap();
+    let raw: ipfs_s3_gateway::config::Config =
+        toml::from_str(&std::fs::read_to_string(&fixture.config_path).unwrap()).unwrap();
     let auth = records::authorize_local(&raw, &fixture.db).await.unwrap();
-    records::stage_confirmation(&fixture.db, &fixture.config, &auth, &fixture.request, &snapshot, &plan, chrono::Duration::minutes(5)).await.unwrap();
+    records::stage_confirmation(
+        &fixture.db,
+        &fixture.config,
+        &auth,
+        &fixture.request,
+        &snapshot,
+        &plan,
+        chrono::Duration::minutes(5),
+    )
+    .await
+    .unwrap();
     let before = fixture.frame().await;
     for mode in ["--apply", "--status"] {
         let result = fixture.import(mode, &forged, false).await;
@@ -146,14 +213,39 @@ async fn directory_locality_without_a_complete_typed_export_cannot_attest_or_gra
         directory::mount_source(&fixture, &export).await;
         let prepare = directory::prepare_file(&fixture, export.payload_bytes);
         let before = fixture.frame().await;
-        let result = support::output(&mut fixture.command(&["--pinning-manage", "--prepare", prepare.to_str().unwrap()])).await;
+        let result = support::output(&mut fixture.command(&[
+            "--pinning-manage",
+            "--prepare",
+            prepare.to_str().unwrap(),
+        ]))
+        .await;
         assert_eq!(result.status.code(), Some(1), "{}", export.name);
         assert!(result.stdout.is_empty(), "{}", export.name);
-        assert_eq!(String::from_utf8_lossy(&result.stderr).trim(), "Error: management native evidence invalid", "{}", export.name);
-        assert!(fixture.frame().await == before, "failed directory proof changed trusted evidence, leases, jobs or quota: {}", export.name);
+        assert_eq!(
+            String::from_utf8_lossy(&result.stderr).trim(),
+            "Error: management native evidence invalid",
+            "{}",
+            export.name
+        );
+        assert!(
+            fixture.frame().await == before,
+            "failed directory proof changed trusted evidence, leases, jobs or quota: {}",
+            export.name
+        );
         let request = fixture.request_file();
-        let result = support::output(&mut fixture.command(&["--pinning-manage", request.to_str().unwrap(), "--source-node", support::NODE])).await;
-        assert_eq!(support::report(&result)["items"][0]["status"]["blocked"], "unreadable_object", "{}", export.name);
+        let result = support::output(&mut fixture.command(&[
+            "--pinning-manage",
+            request.to_str().unwrap(),
+            "--source-node",
+            support::NODE,
+        ]))
+        .await;
+        assert_eq!(
+            support::report(&result)["items"][0]["status"]["blocked"],
+            "unreadable_object",
+            "{}",
+            export.name
+        );
         assert!(fixture.frame().await == before, "{}", export.name);
         directory::assert_readonly_proof_requests(&fixture, 1, 1).await;
     }
@@ -161,27 +253,53 @@ async fn directory_locality_without_a_complete_typed_export_cannot_attest_or_gra
 
 #[tokio::test]
 async fn explicit_preparation_enforces_real_source_identity_bytes_and_redacted_provider_errors() {
-    use wiremock::{Mock, ResponseTemplate, matchers::{method, path}};
+    use wiremock::{
+        Mock, ResponseTemplate,
+        matchers::{method, path},
+    };
     let fixture = support::Fixture::new(false).await;
     let input = fixture.prepare_file(false);
-    let original: serde_json::Value = serde_json::from_slice(&std::fs::read(&input).unwrap()).unwrap();
+    let original: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&input).unwrap()).unwrap();
     let before = fixture.frame().await;
-    for (field, value) in [("max_stored_bytes", json!(9)), ("expected_node", json!("different-local-peer"))] {
+    for (field, value) in [
+        ("max_stored_bytes", json!(9)),
+        ("expected_node", json!("different-local-peer")),
+    ] {
         let mut request = original.clone();
         request[field] = value;
         support::write_json(&input, &request);
-        let result = support::output(&mut fixture.command(&["--pinning-manage", "--prepare", input.to_str().unwrap()])).await;
+        let result = support::output(&mut fixture.command(&[
+            "--pinning-manage",
+            "--prepare",
+            input.to_str().unwrap(),
+        ]))
+        .await;
         assert!(!result.status.success());
         assert!(fixture.frame().await == before);
         fixture.assert_redacted(&result);
     }
     support::write_json(&input, &original);
-    Mock::given(method("POST")).and(path("/api/v0/cat"))
-        .respond_with(ResponseTemplate::new(500).set_body_string("ORIGINAL_PROVIDER_ERROR_SECRET_DO_NOT_PRINT"))
-        .with_priority(1).mount(&fixture.server).await;
-    let result = support::output(&mut fixture.command(&["--pinning-manage", "--prepare", input.to_str().unwrap()])).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/cat"))
+        .respond_with(
+            ResponseTemplate::new(500)
+                .set_body_string("ORIGINAL_PROVIDER_ERROR_SECRET_DO_NOT_PRINT"),
+        )
+        .with_priority(1)
+        .mount(&fixture.server)
+        .await;
+    let result = support::output(&mut fixture.command(&[
+        "--pinning-manage",
+        "--prepare",
+        input.to_str().unwrap(),
+    ]))
+    .await;
     assert!(!result.status.success());
     assert!(fixture.frame().await == before);
-    assert!(!String::from_utf8_lossy(&result.stderr).contains("ORIGINAL_PROVIDER_ERROR_SECRET_DO_NOT_PRINT"));
+    assert!(
+        !String::from_utf8_lossy(&result.stderr)
+            .contains("ORIGINAL_PROVIDER_ERROR_SECRET_DO_NOT_PRINT")
+    );
     fixture.assert_redacted(&result);
 }

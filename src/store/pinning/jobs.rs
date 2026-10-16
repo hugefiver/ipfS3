@@ -3,11 +3,16 @@ use std::{
     time::Duration,
 };
 
+use super::management::{
+    ManagementError,
+    actions::job_authority::safe as management_error,
+    records::{self, DecodeWork, FrozenRows, RowView, SharedDecodeBudget},
+};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use sea_orm::sea_query::{Condition, Expr, Func};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
-    TransactionTrait, TryInsertResult,
+    ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, QueryFilter, QueryOrder,
+    QuerySelect, Set, TransactionTrait, TryInsertResult,
 };
 use sha2::{Digest, Sha256};
 
@@ -29,7 +34,7 @@ const SUBMIT_PHASE_READY: &str = "ready";
 const SUBMIT_PHASE_CALLING: &str = "calling";
 const SUBMIT_PHASE_RECOVERING: &str = "recovering";
 const SUBMIT_PHASE_RECOVERY_BACKOFF: &str = "recovery_backoff";
-const MAX_SUBMIT_RECOVERY_ATTEMPTS: i32 = 8;
+pub(crate) const MAX_SUBMIT_RECOVERY_ATTEMPTS: i32 = 8;
 const MIN_SUBMIT_RECOVERY_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_SUBMIT_RECOVERY_BACKOFF: Duration = Duration::from_secs(300);
 const MAX_SQLITE_CLAIM_RETRIES: usize = 4;
@@ -69,6 +74,497 @@ pub async fn submission_history<C: ConnectionTrait>(
     Ok(history::Entity::find_by_id(id.to_owned()).one(db).await?)
 }
 
+/// Read-only proof for an explicit management Retry of the exact parked source.
+/// A NULL claim alone never proves a call did not create a resource.
+pub(crate) async fn management_retryable_park<C: ConnectionTrait>(
+    db: &C,
+    job: &pin_job::Model,
+    route: &crate::pinning::identity::ProviderRouteSnapshot,
+) -> AppResult<bool> {
+    let work = SharedDecodeBudget::default();
+    management_retryable_park_with_work(db, job, route, DecodeWork::shared(&work)).await
+}
+pub(crate) async fn management_retryable_park_with_work<C: ConnectionTrait>(
+    db: &C,
+    job: &pin_job::Model,
+    route: &crate::pinning::identity::ProviderRouteSnapshot,
+    work: DecodeWork<'_>,
+) -> AppResult<bool> {
+    management_retryable_park_at_allocation(db, job, route, None, work).await
+}
+
+fn management_decode<T: serde::de::DeserializeOwned>(
+    raw: &str,
+    work: DecodeWork<'_>,
+) -> AppResult<Option<T>> {
+    match work.with(|work| work.typed(raw)) {
+        Ok(value) => Ok(Some(value)),
+        Err(ManagementError::Budget) => Err(management_error(ManagementError::Budget)),
+        Err(_) => Ok(None),
+    }
+}
+
+async fn management_retryable_park_at_allocation<C: ConnectionTrait>(
+    db: &C,
+    job: &pin_job::Model,
+    route: &crate::pinning::identity::ProviderRouteSnapshot,
+    allocation_epoch: Option<i64>,
+    work: DecodeWork<'_>,
+) -> AppResult<bool> {
+    use crate::store::entities::{pin_invocation_route, remote_pin_ledger};
+    if job.operation != "submit"
+        || job.state != STATE_RUNNING
+        || job.submit_phase.as_deref() != Some(SUBMIT_PHASE_RECOVERING)
+        || job.locked_until.is_some()
+        || !check_target_job_generation_with_work(db, job, work)
+            .await
+            .map_err(management_error)?
+    {
+        return Ok(false);
+    }
+    let Some(owner) = canonical_desired_target_with_work(db, &job.provider, &job.cid, work)
+        .await
+        .map_err(management_error)?
+    else {
+        return Ok(false);
+    };
+    let now = crate::store::database_clock::database_now(db).await?;
+    let Some(lease) = records::current_model::<pin_lease::Entity, _>(db, &[&owner.lease_id], work)
+        .await
+        .map_err(management_error)?
+    else {
+        return Ok(false);
+    };
+    if job.target_id.as_deref() != Some(&owner.id) || lease.expires_at <= now {
+        return Ok(false);
+    }
+    let Some(history) = records::current_model::<history::Entity, _>(db, &[&job.id], work)
+        .await
+        .map_err(management_error)?
+    else {
+        return Ok(false);
+    };
+    let Some((api, strategy)) = crate::pinning::worker::invocation_route_for_snapshot(route) else {
+        return Ok(false);
+    };
+    if history.effect != "not_created"
+        || !matches!(history.state.as_str(), "blocked" | "needs_attention")
+        || history.api != api
+        || history.strategy != strategy
+        || history.submit_calls <= 0
+        || history.submit_calls >= MAX_SUBMIT_RECOVERY_ATTEMPTS
+    {
+        return Ok(false);
+    }
+    let Some(invocation) =
+        records::current_model::<pin_invocation_route::Entity, _>(db, &[&job.id], work)
+            .await
+            .map_err(management_error)?
+    else {
+        return Ok(false);
+    };
+    let Some(remote) =
+        records::current_model::<remote_pin::Entity, _>(db, &[&job.provider, &job.cid], work)
+            .await
+            .map_err(management_error)?
+    else {
+        return Ok(false);
+    };
+    let Some(ledger) = records::current_model::<remote_pin_ledger::Entity, _>(
+        db,
+        &[&job.provider, &job.cid],
+        work,
+    )
+    .await
+    .map_err(management_error)?
+    else {
+        return Ok(false);
+    };
+    let original_route = management_decode::<crate::pinning::identity::ProviderRouteSnapshot>(
+        &invocation.route,
+        work,
+    )?;
+    let ledger_route = match ledger.route.as_deref() {
+        Some(raw) => {
+            management_decode::<crate::pinning::identity::ProviderRouteSnapshot>(raw, work)?
+        }
+        None => None,
+    };
+    if remote.status != REMOTE_STATUS_RESERVED
+        || remote.request_id.is_some()
+        || remote.epoch != allocation_epoch.unwrap_or(invocation.remote_epoch)
+        || ledger.effect != "not_created"
+        || ledger_route.as_ref() != Some(route)
+        || original_route.as_ref() != Some(route)
+    {
+        return Ok(false);
+    }
+    work.copy(&(&job.provider, &job.cid))
+        .map_err(management_error)?;
+    work.with(|work| work.nodes(2)).map_err(management_error)?;
+    let released=db.query_one(sea_orm::Statement::from_sql_and_values(db.get_database_backend(),"SELECT EXISTS(SELECT 1 FROM pin_resource_history WHERE provider=$1 AND cid=$2 AND epoch >= $3) AS present",[job.provider.clone().into(),job.cid.clone().into(),invocation.remote_epoch.into()])).await?.ok_or_else(||invalid_job("release history result is missing"))?;
+    if released.try_get::<bool>("", "present")? {
+        return Ok(false);
+    }
+    if let Some(receipt) = super::ledger::submission::latest_rpc_with_work(db, &job.id, work)
+        .await
+        .map_err(management_error)?
+    {
+        let resources = management_decode::<Vec<super::ledger::submission::ResourceEvidence>>(
+            &receipt.resources,
+            work,
+        )?;
+        let receipt_route = management_decode::<crate::pinning::identity::ProviderRouteSnapshot>(
+            &receipt.route,
+            work,
+        )?;
+        if receipt.needs_attention
+            || receipt.outcome != "not_submitted"
+            || receipt.effect != "not_created"
+            || receipt.submit_call != history.submit_calls
+            || receipt.remote_epoch != invocation.remote_epoch
+            || receipt.observed_at.is_none()
+            || resources.is_none_or(|resources| !resources.is_empty())
+            || receipt.expected_cid != job.cid
+            || receipt.provider != job.provider
+            || receipt_route.as_ref() != Some(route)
+        {
+            return Ok(false);
+        }
+    } else if super::ledger::submission::is_rpc(route) {
+        return Ok(false);
+    }
+    work.copy(&(&job.provider, &job.cid, &job.id))
+        .map_err(management_error)?;
+    work.with(|work| work.nodes(2)).map_err(management_error)?;
+    let others=db.query_one(sea_orm::Statement::from_sql_and_values(db.get_database_backend(),"SELECT EXISTS(SELECT 1 FROM pin_jobs WHERE provider=$1 AND cid=$2 AND id<>$3 AND state IN ('pending','running') AND (operation IN ('submit','unpin') OR locked_until IS NOT NULL)) AS present",[job.provider.clone().into(),job.cid.clone().into(),job.id.clone().into()])).await?.ok_or_else(||invalid_job("competing job result is missing"))?;
+    if others.try_get::<bool>("", "present")? {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// Caller holds the native management fence and publishes its receipt in this
+/// transaction. Preserve the old invocation/effect/count and existing reservation.
+pub(crate) async fn resume_management_submit_in_transaction(
+    tx: &sea_orm::DatabaseTransaction,
+    job: &pin_job::Model,
+    route: &crate::pinning::identity::ProviderRouteSnapshot,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+) -> AppResult<bool> {
+    resume_management_submit(tx, job, route, now, None, work).await
+}
+
+/// A newly allocated logical intent may reuse the reservation without replacing
+/// its canonical Submit source. The native fence must prove that exact reuse.
+pub(crate) async fn resume_management_submit_after_allocation(
+    tx: &sea_orm::DatabaseTransaction,
+    job: &pin_job::Model,
+    route: &crate::pinning::identity::ProviderRouteSnapshot,
+    before: FrozenRows<'_>,
+    attached: &pin_lease_target::Model,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+) -> AppResult<bool> {
+    let Some(current) = lock_submit_receipt_with_work(tx, &job.id, work).await? else {
+        return Ok(false);
+    };
+    if current != *job {
+        return Ok(false);
+    }
+    super::quota::lock_allocation_admission_with_work(tx, &job.provider, work).await?;
+    if !management_park_allocation_continuity(tx, job, before, attached, work).await? {
+        return Ok(false);
+    }
+    let remote =
+        records::current_model::<remote_pin::Entity, _>(tx, &[&job.provider, &job.cid], work)
+            .await
+            .map_err(management_error)?
+            .ok_or_else(|| stale_claim_error(&job.id))?;
+    resume_management_submit(tx, job, route, now, Some(remote.epoch), work).await
+}
+
+async fn management_park_allocation_continuity(
+    tx: &sea_orm::DatabaseTransaction,
+    job: &pin_job::Model,
+    before: FrozenRows<'_>,
+    attached: &pin_lease_target::Model,
+    work: DecodeWork<'_>,
+) -> AppResult<bool> {
+    use super::management::native::{self, value};
+    let invalid = |_| invalid_job("management allocation continuity is invalid");
+    before.validate_current().map_err(invalid)?;
+    if attached.provider != job.provider
+        || attached.cid != job.cid
+        || attached.state != "waiting"
+        || before.row("pin_lease_targets", &[&attached.id]).is_some()
+        || before.row("pin_leases", &[&attached.lease_id]).is_some()
+    {
+        return Ok(false);
+    }
+    if records::current_model::<pin_lease_target::Entity, _>(tx, &[&attached.id], work)
+        .await
+        .map_err(management_error)?
+        .as_ref()
+        != Some(attached)
+    {
+        return Ok(false);
+    }
+    let Some(lease) =
+        records::current_model::<pin_lease::Entity, _>(tx, &[&attached.lease_id], work)
+            .await
+            .map_err(management_error)?
+    else {
+        return Ok(false);
+    };
+    if lease.source != lease.id
+        || !lease.id.starts_with("management:")
+        || lease.state != "active"
+        || lease.generation != 1
+        || attached.id != super::leases::target_id(&lease.id, &job.provider, &job.cid)
+        || attached.created_at != attached.last_touched_at
+    {
+        return Ok(false);
+    }
+    let current_rows = records::CurrentRows::capture(tx, work)
+        .await
+        .map_err(management_error)?;
+    let after = FrozenRows::Current(&current_rows);
+    if before.scope() != after.scope() || before.identity() != after.identity() {
+        return Ok(false);
+    }
+    let Some(old) = before.row("remote_pins", &[&job.provider, &job.cid]) else {
+        return Ok(false);
+    };
+    let Some(current) = after.row("remote_pins", &[&job.provider, &job.cid]) else {
+        return Ok(false);
+    };
+    let epoch = value(old, "epoch").and_then(|epoch| epoch.parse::<i64>().ok());
+    let invocation = before.row("pin_invocation_routes", &[&job.id]);
+    if epoch.is_none()
+        || invocation
+            .and_then(|row| value(row, "remote_epoch"))
+            .and_then(|epoch| epoch.parse::<i64>().ok())
+            != epoch
+        || epoch.and_then(|epoch| epoch.checked_add(1))
+            != value(current, "epoch").and_then(|epoch| epoch.parse::<i64>().ok())
+    {
+        return Ok(false);
+    }
+    let targets = before
+        .table("pin_lease_targets")
+        .ok_or_else(|| invalid_job("target fence is missing"))?;
+    let count = targets
+        .rows
+        .iter()
+        .filter(|row| {
+            value(*row, "provider") == Some(&job.provider) && value(*row, "cid") == Some(&job.cid)
+        })
+        .count();
+    work.with(|work| work.nodes(2 + count * 2))
+        .map_err(management_error)?;
+    let old_targets = targets
+        .rows
+        .iter()
+        .filter(|row| {
+            value(row, "provider") == Some(&job.provider) && value(row, "cid") == Some(&job.cid)
+        })
+        .collect::<Vec<_>>();
+    let lease_ids = old_targets
+        .iter()
+        .filter_map(|row| value(row, "lease_id"))
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut touch = None;
+    for target in &old_targets {
+        if value(target, "state").is_some_and(is_desired_target_state)
+            && value(
+                before
+                    .row(
+                        "pin_leases",
+                        &[value(target, "lease_id")
+                            .ok_or_else(|| invalid_job("target owner is missing"))?],
+                    )
+                    .ok_or_else(|| invalid_job("lease fence is missing"))?,
+                "state",
+            ) == Some(LEASE_STATE_ACTIVE)
+        {
+            let time = native::parse_time(
+                value(target, "last_touched_at")
+                    .ok_or_else(|| invalid_job("target touch is missing"))?,
+            )
+            .map_err(invalid)?;
+            touch = Some(touch.map_or(time, |old: DateTimeUtc| old.max(time)));
+        }
+    }
+    let expected_touch = touch
+        .unwrap_or(
+            native::parse_time(
+                value(old, "last_touched_at")
+                    .ok_or_else(|| invalid_job("remote touch is missing"))?,
+            )
+            .map_err(invalid)?,
+        )
+        .max(attached.created_at);
+    if native::parse_time(
+        value(current, "last_touched_at").ok_or_else(|| invalid_job("remote touch is missing"))?,
+    )
+    .map_err(invalid)?
+        != expected_touch
+    {
+        return Ok(false);
+    }
+    if !old
+        .iter()
+        .filter(|(column, _)| column.as_str() != "epoch" && column.as_str() != "last_touched_at")
+        .eq(current.iter().filter(|(column, _)| {
+            column.as_str() != "epoch" && column.as_str() != "last_touched_at"
+        }))
+    {
+        return Ok(false);
+    }
+    work.with(|work| {
+        work.nodes(
+            1 + before
+                .table("pin_jobs")
+                .ok_or(ManagementError::Schema)?
+                .rows
+                .iter()
+                .filter(|row| {
+                    value(*row, "provider") == Some(&job.provider)
+                        && value(*row, "cid") == Some(&job.cid)
+                })
+                .count(),
+        )
+    })
+    .map_err(management_error)?;
+    let job_ids = before
+        .table("pin_jobs")
+        .ok_or_else(|| invalid_job("job fence is missing"))?
+        .rows
+        .iter()
+        .filter(|row| {
+            value(row, "provider") == Some(&job.provider) && value(row, "cid") == Some(&job.cid)
+        })
+        .filter_map(|row| value(row, "id"))
+        .collect::<std::collections::BTreeSet<_>>();
+    for name in [
+        "pin_lease_targets",
+        "pin_leases",
+        "pin_lease_requirements",
+        "pin_jobs",
+        "pin_submit_history",
+        "pin_invocation_routes",
+        "pin_submit_observations",
+        "pin_replica_observations",
+        "pin_resource_history",
+        "remote_pin_ledger",
+        "pin_provider_usage",
+    ] {
+        let table = before
+            .table(name)
+            .ok_or_else(|| invalid_job("allocation fence is missing"))?;
+        let relevant = |row: RowView<'_>| match name {
+            "pin_leases" => value(row, "id").is_some_and(|id| lease_ids.contains(id)),
+            "pin_lease_requirements" => {
+                value(row, "lease_id").is_some_and(|id| lease_ids.contains(id))
+            }
+            "pin_submit_history" | "pin_invocation_routes" => {
+                value(row, "job_id").is_some_and(|id| job_ids.contains(id))
+            }
+            "pin_submit_observations" | "pin_replica_observations" => {
+                value(row, "provider") == Some(&job.provider)
+                    && value(row, "expected_cid") == Some(&job.cid)
+            }
+            "pin_provider_usage" => value(row, "provider") == Some(&job.provider),
+            _ => {
+                value(row, "provider") == Some(&job.provider)
+                    && value(row, "cid") == Some(&job.cid)
+                    && !(name == "pin_lease_targets" && value(row, "id") == Some(&attached.id))
+            }
+        };
+        let current = after
+            .table(name)
+            .ok_or_else(|| invalid_job("allocation fence is missing"))?;
+        if !table
+            .rows
+            .iter()
+            .filter(|row| relevant(*row))
+            .eq(current.rows.iter().filter(|row| relevant(*row)))
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+async fn resume_management_submit(
+    tx: &sea_orm::DatabaseTransaction,
+    job: &pin_job::Model,
+    route: &crate::pinning::identity::ProviderRouteSnapshot,
+    now: DateTimeUtc,
+    allocation_epoch: Option<i64>,
+    work: DecodeWork<'_>,
+) -> AppResult<bool> {
+    let Some(current) = lock_submit_receipt_with_work(tx, &job.id, work).await? else {
+        return Ok(false);
+    };
+    if current != *job
+        || !management_retryable_park_at_allocation(tx, &current, route, allocation_epoch, work)
+            .await?
+    {
+        return Ok(false);
+    }
+    super::quota::lock_allocation_admission_with_work(tx, &job.provider, work).await?;
+    let changed = pin_job::Entity::update_many()
+        .col_expr(pin_job::Column::State, Expr::value(STATE_PENDING))
+        .col_expr(
+            pin_job::Column::SubmitPhase,
+            Expr::value(SUBMIT_PHASE_READY),
+        )
+        .col_expr(pin_job::Column::NextAttemptAt, Expr::value(now))
+        .col_expr(pin_job::Column::UpdatedAt, Expr::value(now))
+        .col_expr(
+            pin_job::Column::LastError,
+            Expr::value(Option::<String>::None),
+        )
+        .filter(pin_job::Column::Id.eq(&job.id))
+        .filter(pin_job::Column::State.eq(STATE_RUNNING))
+        .filter(pin_job::Column::SubmitPhase.eq(SUBMIT_PHASE_RECOVERING))
+        .filter(pin_job::Column::LockedUntil.is_null())
+        .exec(tx)
+        .await?;
+    if changed.rows_affected != 1 {
+        return Err(stale_claim_error(&job.id));
+    }
+    let changed = history::Entity::update_many()
+        .col_expr(history::Column::State, Expr::value("active"))
+        .filter(history::Column::JobId.eq(&job.id))
+        .filter(history::Column::Effect.eq("not_created"))
+        .filter(history::Column::State.is_in(["blocked", "needs_attention"]))
+        .exec(tx)
+        .await?;
+    if changed.rows_affected != 1 {
+        return Err(stale_claim_error(&job.id));
+    }
+    pin_job::Entity::update_many()
+        .col_expr(pin_job::Column::State, Expr::value(STATE_PENDING))
+        .col_expr(pin_job::Column::NextAttemptAt, Expr::value(now))
+        .col_expr(
+            pin_job::Column::LastError,
+            Expr::value(Option::<String>::None),
+        )
+        .filter(pin_job::Column::Provider.eq(&job.provider))
+        .filter(pin_job::Column::Cid.eq(&job.cid))
+        .filter(pin_job::Column::Operation.eq("reconcile"))
+        .filter(pin_job::Column::State.eq(STATE_RUNNING))
+        .filter(pin_job::Column::LockedUntil.is_null())
+        .filter(pin_job::Column::LastError.eq(PARKED_RECONCILE_REASON))
+        .exec(tx)
+        .await?;
+    Ok(true)
+}
+
 /// Explicit operator repair hook, never called by ordinary scheduling or TOML
 /// reload. Only a definitively rejected call on the same historical route can
 /// resume. Unknown effects require reconciliation, not this hook.
@@ -80,7 +576,7 @@ pub async fn resume_rejected_submit_after_repair<C: ConnectionTrait + Transactio
     now: DateTimeUtc,
 ) -> AppResult<bool> {
     let txn = db.begin().await?;
-    if super::ledger::submission::latest(&txn, id)
+    if super::ledger::submission::latest_rpc(&txn, id)
         .await?
         .is_some_and(|row| row.needs_attention)
     {
@@ -156,14 +652,28 @@ pub async fn record_submit_invocation<C: ConnectionTrait>(
     strategy: &str,
     now: DateTimeUtc,
 ) -> AppResult<()> {
+    let work = SharedDecodeBudget::default();
+    record_submit_invocation_with_work(db, claimed, api, strategy, now, DecodeWork::shared(&work))
+        .await
+}
+pub(crate) async fn record_submit_invocation_with_work<C: ConnectionTrait>(
+    db: &C,
+    claimed: &ClaimedPinJob,
+    api: &str,
+    strategy: &str,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+) -> AppResult<()> {
     super::management::admission::lock_sqlite_writer_in_caller_transaction(db).await?;
-    if !super::ledger::submit_dispatch_open(db, &claimed.model).await? {
-        return Err(invalid_job("retired domain cannot start another invocation"));
+    if !super::ledger::submit_dispatch_open_with_work(db, &claimed.model, work).await? {
+        return Err(invalid_job(
+            "retired domain cannot start another invocation",
+        ));
     }
     if !fence_job_claim(db, &claimed.model.id, claimed_lock(&claimed.model)?).await? {
         return Err(stale_claim_error(&claimed.model.id));
     }
-    if super::ledger::submission::latest(db, &claimed.model.id)
+    if super::ledger::submission::latest_rpc(db, &claimed.model.id)
         .await?
         .is_some_and(|row| row.outcome != "not_submitted")
     {
@@ -183,7 +693,7 @@ pub async fn record_submit_invocation<C: ConnectionTrait>(
         ));
     }
     super::ledger::advance_submit_invocation_epoch(db, claimed, api, strategy).await?;
-    super::quota::lock_allocation_admission(db, &claimed.model.provider).await?;
+    super::quota::lock_allocation_admission_with_work(db, &claimed.model.provider, work).await?;
     let old = submission_history(db, &claimed.model.id).await?;
     if let Some(old) = old {
         if old.api != api
@@ -408,6 +918,23 @@ pub(crate) async fn lock_submit_receipt<C: ConnectionTrait>(
     db: &C,
     id: &str,
 ) -> AppResult<Option<pin_job::Model>> {
+    lock_submit_receipt_rows(db, id).await?;
+    Ok(pin_job::Entity::find_by_id(id.to_owned()).one(db).await?)
+}
+
+async fn lock_submit_receipt_with_work<C: ConnectionTrait>(
+    db: &C,
+    id: &str,
+    work: DecodeWork<'_>,
+) -> AppResult<Option<pin_job::Model>> {
+    work.copy(&(id, id)).map_err(management_error)?;
+    lock_submit_receipt_rows(db, id).await?;
+    records::current_model::<pin_job::Entity, _>(db, &[id], work)
+        .await
+        .map_err(management_error)
+}
+
+async fn lock_submit_receipt_rows<C: ConnectionTrait>(db: &C, id: &str) -> AppResult<()> {
     pin_job::Entity::update_many()
         .col_expr(
             pin_job::Column::LockedUntil,
@@ -424,7 +951,7 @@ pub(crate) async fn lock_submit_receipt<C: ConnectionTrait>(
         .filter(history::Column::JobId.eq(id))
         .exec(db)
         .await?;
-    Ok(pin_job::Entity::find_by_id(id.to_owned()).one(db).await?)
+    Ok(())
 }
 
 /// Only the exact RPC attention park can become due local recovery. Never
@@ -786,7 +1313,7 @@ pub fn poll_job(
 
 pub fn unpin_job(provider: &str, cid: &str, remote_epoch: i64, at: DateTimeUtc) -> NewPinJob {
     NewPinJob::Remote(RemotePinJob {
-        id: format!("unpin:{provider}:{cid}:e{remote_epoch}"),
+        id: stable_unpin_id(provider, cid, remote_epoch),
         operation: RemoteJobOperation::Unpin,
         provider: provider.to_owned(),
         cid: cid.to_owned(),
@@ -814,40 +1341,52 @@ pub async fn enqueue_job<C: ConnectionTrait>(db: &C, job: NewPinJob) -> AppResul
 /// Ensures the canonical reserved/no-request owner has exactly one ready Submit job.
 pub async fn ensure_or_reactivate_submit_job<C: ConnectionTrait>(
     db: &C,
+    job: TargetPinJob,
+    now: DateTimeUtc,
+) -> AppResult<EnsureJobOutcome> {
+    let work = SharedDecodeBudget::default();
+    ensure_submit_with_work(db, job, now, DecodeWork::shared(&work)).await
+}
+pub(crate) async fn ensure_submit_with_work<C: ConnectionTrait>(
+    db: &C,
     mut job: TargetPinJob,
     now: DateTimeUtc,
+    work: DecodeWork<'_>,
 ) -> AppResult<EnsureJobOutcome> {
     if job.operation != TargetJobOperation::Submit {
         return Err(invalid_job("submit ensure requires a Submit job"));
     }
-    validate_submit_owner(db, &job).await?;
-    super::quota::lock_allocation_admission(db, &job.provider).await?;
-    if let Some(blocking) = blocking_live_submit(db, &job.provider, &job.cid, &job.id).await? {
-        return match blocking.state.as_str() {
+    validate_submit_owner_with_work(db, &job, work).await?;
+    super::quota::lock_allocation_admission_with_work(db, &job.provider, work).await?;
+    if let Some((_, state)) =
+        blocking_live_submit_with_work(db, &job.provider, &job.cid, &job.id, work).await?
+    {
+        return match state.as_str() {
             STATE_PENDING => Ok(EnsureJobOutcome::Pending),
             STATE_RUNNING => Ok(EnsureJobOutcome::Running),
             _ => Err(invalid_job("blocking Submit job is not live")),
         };
     }
     job.next_attempt_at = now;
-    ensure_target_job(db, job, now, true).await
+    ensure_target_job_with_work(db, job, now, true, work).await
 }
 
-pub(crate) async fn blocking_live_submit<C: ConnectionTrait>(
+pub(crate) async fn blocking_live_submit_with_work<C: ConnectionTrait>(
     db: &C,
     provider: &str,
     cid: &str,
-    canonical_submit_id: &str,
-) -> AppResult<Option<pin_job::Model>> {
-    Ok(pin_job::Entity::find()
-        .filter(pin_job::Column::Provider.eq(provider))
-        .filter(pin_job::Column::Cid.eq(cid))
-        .filter(pin_job::Column::Operation.eq(PinJobOperation::Submit.persisted()))
-        .filter(pin_job::Column::State.is_in([STATE_PENDING, STATE_RUNNING]))
-        .filter(pin_job::Column::Id.ne(canonical_submit_id))
-        .order_by_asc(pin_job::Column::Id)
-        .one(db)
-        .await?)
+    id: &str,
+    work: DecodeWork<'_>,
+) -> AppResult<Option<(String, String)>> {
+    for _ in 0..2 {
+        work.copy(&(provider, cid, id)).map_err(management_error)?;
+    }
+    let (rows,bytes)=records::bounded_projection(db,"FROM (SELECT id,state FROM pin_jobs WHERE provider=$1 AND cid=$2 AND id<>$3 AND operation='submit' AND state IN ('pending','running') ORDER BY id LIMIT 1) AS blocker WHERE TRUE",&[("id","id"),("state","state")],"id",vec![provider.into(),cid.into(),id.into()],(1,super::management::native::MAX_BYTES),work).await.map_err(management_error)?;
+    work.index_cells(rows.len() * 2, bytes)
+        .map_err(management_error)?;
+    rows.first()
+        .map(|row| Ok((row.try_get("", "id")?, row.try_get("", "state")?)))
+        .transpose()
 }
 
 /// Ensures the canonical queued/pinning owner has one bounded-due Poll job.
@@ -876,17 +1415,54 @@ pub async fn ensure_or_reactivate_reconcile_job<C: ConnectionTrait>(
     job: RemotePinJob,
     now: DateTimeUtc,
 ) -> AppResult<EnsureJobOutcome> {
+    let work = SharedDecodeBudget::default();
+    ensure_reconcile_with_work(db, job, now, DecodeWork::shared(&work)).await
+}
+pub(crate) async fn ensure_reconcile_with_work<C: ConnectionTrait>(
+    db: &C,
+    job: RemotePinJob,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+) -> AppResult<EnsureJobOutcome> {
     if job.operation != RemoteJobOperation::Reconcile {
         return Err(invalid_job("reconcile ensure requires a Reconcile job"));
     }
-    validate_remote_epoch(db, &job).await?;
+    let remote =
+        records::current_model::<remote_pin::Entity, _>(db, &[&job.provider, &job.cid], work)
+            .await
+            .map_err(management_error)?
+            .ok_or_else(|| invalid_job("remote job does not name the current epoch"))?;
+    if remote.epoch != job.expected_remote_epoch {
+        return Err(invalid_job("remote job does not name the current epoch"));
+    }
+    let original =
+        super::legacy_migration::original_job_provider_with_work(db, &job.id, &job.provider, work)
+            .await
+            .map_err(management_error)?;
+    if job.id != stable_reconcile_id(&original, &job.cid, job.expected_remote_epoch) {
+        return Err(invalid_job(
+            "Reconcile job ID does not match its remote epoch",
+        ));
+    }
 
+    work.copy(&job.id).map_err(management_error)?;
     let job_id = job.id.clone();
-    let Some(existing) = pin_job::Entity::find_by_id(job_id.clone()).one(db).await? else {
-        return if insert_new_job(db, NewPinJob::Remote(job), now).await? {
+    let Some(existing) = records::current_model::<pin_job::Entity, _>(db, &[&job_id], work)
+        .await
+        .map_err(management_error)?
+    else {
+        return if insert_new_job_with_work(db, NewPinJob::Remote(job), now, work).await? {
             Ok(EnsureJobOutcome::Inserted)
         } else {
-            reconcile_outcome_after_conflict(db, &job_id).await
+            let persisted = records::current_model::<pin_job::Entity, _>(db, &[&job_id], work)
+                .await
+                .map_err(management_error)?
+                .ok_or_else(|| stale_claim_error(&job_id))?;
+            match persisted.state.as_str() {
+                STATE_PENDING => Ok(EnsureJobOutcome::Pending),
+                STATE_RUNNING => Ok(EnsureJobOutcome::Running),
+                _ => Err(stale_claim_error(&job_id)),
+            }
         };
     };
 
@@ -1002,19 +1578,73 @@ pub(crate) async fn claim_due_management_jobs(
     lock_for: ChronoDuration,
     limit: u64,
 ) -> AppResult<Vec<ClaimedPinJob>> {
-    if limit == 0 { return Ok(Vec::new()); }
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
     let tx = db.begin().await?;
-    scope.revalidate(&tx).await?;
-    let candidates = pin_job::Entity::find().filter(due_claim_condition(now))
-        .filter(scope.candidates()).order_by_asc(pin_job::Column::Id).all(&tx).await?;
+    let work = super::management::records::SharedDecodeBudget::default();
+    scope.revalidate_with_work(&tx, work.clone()).await?;
+    use sea_orm::QueryTrait;
+    let context = DecodeWork::shared(&work);
+    context.copy(&[now; 6]).map_err(management_error)?;
+    // Numbered parameters can be reused by the metadata/body guards on both backends.
+    let query = pin_job::Entity::find()
+        .select_only()
+        .column(pin_job::Column::Id)
+        .filter(due_claim_condition(now))
+        .filter(scope.candidates_with_work(context)?)
+        .order_by_asc(pin_job::Column::Id)
+        .build(sea_orm::DatabaseBackend::Postgres);
+    let (candidates, candidate_bytes) = records::bounded_projection(
+        &tx,
+        &format!("FROM ({}) AS candidates WHERE TRUE", query.sql),
+        &[("id", "id")],
+        "id",
+        query.values.map(|values| values.0).unwrap_or_default(),
+        (
+            super::management::native::MAX_ROWS,
+            super::management::native::MAX_BYTES,
+        ),
+        context,
+    )
+    .await
+    .map_err(management_error)?;
+    context
+        .index_cells(candidates.len(), candidate_bytes)
+        .map_err(management_error)?;
+    context
+        .with(|work| work.nodes(1))
+        .map_err(management_error)?;
     let mut claimed = Vec::new();
     for candidate in candidates {
-        if claimed.len() as u64 >= limit { break; }
-        if !scope.contains(&tx, &candidate).await? { continue; }
-        if let Some(job) = claim_candidate(&tx, candidate, now, now + lock_for).await? {
-            if !scope.contains(&tx, &job.model).await? {
-                return Err(invalid_job("management claim changed its original applied scope"));
+        if claimed.len() as u64 >= limit {
+            break;
+        }
+        let id = candidate.try_get::<String>("", "id")?;
+        let candidate = records::current_model::<pin_job::Entity, _>(&tx, &[&id], context)
+            .await
+            .map_err(management_error)?
+            .ok_or_else(|| invalid_job("management candidate disappeared"))?;
+        if !scope
+            .contains_with_work(&tx, &candidate, work.clone())
+            .await?
+        {
+            continue;
+        }
+        if let Some(job) =
+            claim_candidate_with_work(&tx, candidate, now, now + lock_for, work.clone()).await?
+        {
+            if !scope
+                .contains_with_work(&tx, &job.model, work.clone())
+                .await?
+            {
+                return Err(invalid_job(
+                    "management claim changed its original applied scope",
+                ));
             }
+            context
+                .with(|work| work.nodes(1))
+                .map_err(management_error)?;
             claimed.push(job);
         }
     }
@@ -1220,12 +1850,32 @@ async fn claim_candidate<C: ConnectionTrait>(
     now: DateTimeUtc,
     locked_until: DateTimeUtc,
 ) -> Result<Option<ClaimedPinJob>, sea_orm::DbErr> {
+    claim_candidate_with_work(
+        db,
+        candidate,
+        now,
+        locked_until,
+        super::management::records::SharedDecodeBudget::default(),
+    )
+    .await
+}
+async fn claim_candidate_with_work<C: ConnectionTrait>(
+    db: &C,
+    candidate: pin_job::Model,
+    now: DateTimeUtc,
+    locked_until: DateTimeUtc,
+    work: super::management::records::SharedDecodeBudget,
+) -> Result<Option<ClaimedPinJob>, sea_orm::DbErr> {
+    let context = DecodeWork::shared(&work);
+    let budget_error =
+        |_| sea_orm::DbErr::Custom("claim data could not be read within its budget".into());
     let reclaimed = candidate.state == STATE_RUNNING;
+    context.copy(&candidate.state).map_err(budget_error)?;
     let previous_state = candidate.state.clone();
     let object_id = if let Some(lease_id) = candidate.lease_id.as_deref() {
-        pin_lease::Entity::find_by_id(lease_id.to_owned())
-            .one(db)
-            .await?
+        records::current_model::<pin_lease::Entity, _>(db, &[lease_id], context)
+            .await
+            .map_err(budget_error)?
             .map(|lease| lease.owner_object_id)
     } else {
         None
@@ -1250,9 +1900,9 @@ async fn claim_candidate<C: ConnectionTrait>(
     if update.exec(db).await?.rows_affected != 1 {
         return Ok(None);
     }
-    let model = pin_job::Entity::find_by_id(candidate.id)
-        .one(db)
-        .await?
+    let model = records::current_model::<pin_job::Entity, _>(db, &[&candidate.id], context)
+        .await
+        .map_err(budget_error)?
         .ok_or_else(|| sea_orm::DbErr::RecordNotFound("claimed pin job disappeared".to_owned()))?;
     let claimed = ClaimedPinJob {
         model,
@@ -1260,16 +1910,33 @@ async fn claim_candidate<C: ConnectionTrait>(
         previous_state,
         object_id,
     };
-    match super::management::actions::job_authority::check_before_call(db, &claimed.model).await {
+    match super::management::actions::job_authority::check_before_call_with_work(
+        db,
+        &claimed.model,
+        work,
+    )
+    .await
+    {
         Ok(_) => Ok(Some(claimed)),
-        Err(AppError::InvalidPinningRequest(_)) => {
+        Err(
+            super::management::ManagementError::Confirmation
+            | super::management::ManagementError::InvalidEvidence
+            | super::management::ManagementError::Unauthorized
+            | super::management::ManagementError::Changed
+            | super::management::ManagementError::Expired,
+        ) => {
             // Isolate one invalid/orphaned management row. Do not poison fair
             // scheduling of unrelated ordinary jobs or allow a None fallback.
-            finish_nonprojecting_job(db, &claimed, true, now).await
-                .map_err(|_| sea_orm::DbErr::Custom("management claim could not be isolated".into()))?;
+            finish_nonprojecting_job(db, &claimed, true, now)
+                .await
+                .map_err(|_| {
+                    sea_orm::DbErr::Custom("management claim could not be isolated".into())
+                })?;
             Ok(None)
         }
-        Err(_) => Err(sea_orm::DbErr::Custom("management claim authority could not be checked".into())),
+        Err(_) => Err(sea_orm::DbErr::Custom(
+            "management claim authority could not be checked".into(),
+        )),
     }
 }
 
@@ -1286,10 +1953,19 @@ pub async fn renew_job_claim<C: ConnectionTrait>(
     if new_locked_until <= expected_locked_until {
         return Err(invalid_job("renewed job lock must advance"));
     }
-    let Some(job) = pin_job::Entity::find_by_id(job_id.to_owned()).one(db).await? else { return Ok(None); };
+    let work = super::management::records::SharedDecodeBudget::default();
+    let Some(job) =
+        records::current_model::<pin_job::Entity, _>(db, &[job_id], DecodeWork::shared(&work))
+            .await
+            .map_err(management_error)?
+    else {
+        return Ok(None);
+    };
     // LedgerOnly may finish gathering an already-started receipt. It does not
     // grant another call: the worker checks the operation-specific permit there.
-    super::management::actions::job_authority::check_before_call(db, &job).await?;
+    super::management::actions::job_authority::check_before_call_with_work(db, &job, work)
+        .await
+        .map_err(management_error)?;
     let updated = pin_job::Entity::update_many()
         .col_expr(pin_job::Column::LockedUntil, Expr::value(new_locked_until))
         .col_expr(pin_job::Column::UpdatedAt, Expr::value(now))
@@ -1427,6 +2103,36 @@ pub async fn check_target_job_generation<C: ConnectionTrait>(
         && lease.generation == generation)
 }
 
+pub(crate) async fn check_target_job_generation_with_work<C: ConnectionTrait>(
+    db: &C,
+    job: &pin_job::Model,
+    work: DecodeWork<'_>,
+) -> super::management::Result<bool> {
+    if !matches!(job.operation.as_str(), "submit" | "poll") || job.expected_remote_epoch.is_some() {
+        return Ok(false);
+    }
+    let (Some(lease_id), Some(target_id), Some(generation)) =
+        (&job.lease_id, &job.target_id, job.expected_generation)
+    else {
+        return Ok(false);
+    };
+    let Some(target) =
+        records::current_model::<pin_lease_target::Entity, _>(db, &[target_id], work).await?
+    else {
+        return Ok(false);
+    };
+    let Some(lease) = records::current_model::<pin_lease::Entity, _>(db, &[lease_id], work).await?
+    else {
+        return Ok(false);
+    };
+    Ok(target.lease_id == *lease_id
+        && target.provider == job.provider
+        && target.cid == job.cid
+        && is_desired_target_state(&target.state)
+        && lease.state == LEASE_STATE_ACTIVE
+        && lease.generation == generation)
+}
+
 /// A Poll may follow reference-only remote epoch increments, but it must still
 /// name the original request and the current canonical target/generation.
 pub(crate) async fn poll_continuity_owner<C: ConnectionTrait>(
@@ -1441,6 +2147,23 @@ pub(crate) async fn poll_continuity_owner<C: ConnectionTrait>(
         && canonical_desired_target(db, &job.provider, &job.cid)
             .await?
             .is_some_and(|target| Some(target.id.as_str()) == job.target_id.as_deref()))
+}
+
+pub(crate) async fn poll_continuity_owner_with_work<C: ConnectionTrait>(
+    db: &C,
+    job: &pin_job::Model,
+    request_id: &str,
+    work: DecodeWork<'_>,
+) -> super::management::Result<bool> {
+    if job.operation != "poll" || !check_target_job_generation_with_work(db, job, work).await? {
+        return Ok(false);
+    }
+    Ok(
+        poll_names_request_with_work(db, job, request_id, work).await?
+            && canonical_desired_target_with_work(db, &job.provider, &job.cid, work)
+                .await?
+                .is_some_and(|target| Some(target.id.as_str()) == job.target_id.as_deref()),
+    )
 }
 
 /// Durable request evidence only, not authority to execute the historical owner.
@@ -1458,9 +2181,45 @@ pub(crate) async fn poll_names_request<C: ConnectionTrait>(
     };
     let provider =
         super::legacy_migration::original_job_provider(db, &job.id, &job.provider).await?;
-    Ok(job.operation == "poll"
+    Ok(poll_names_request_at_provider(
+        job, request_id, &provider, target_id, generation,
+    ))
+}
+
+pub(crate) async fn poll_names_request_with_work<C: ConnectionTrait>(
+    db: &C,
+    job: &pin_job::Model,
+    request_id: &str,
+    work: super::management::records::DecodeWork<'_>,
+) -> super::management::Result<bool> {
+    let (Some(_), Some(target), Some(generation)) = (
+        job.lease_id.as_deref(),
+        job.target_id.as_deref(),
+        job.expected_generation,
+    ) else {
+        return Ok(false);
+    };
+    let provider =
+        super::legacy_migration::original_job_provider_with_work(db, &job.id, &job.provider, work)
+            .await?;
+    const HASH_SHAPE: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+    work.copy(&(request_id, HASH_SHAPE))?;
+    work.copy(&("poll:", &provider, &job.cid, target, generation, HASH_SHAPE))?;
+    Ok(poll_names_request_at_provider(
+        job, request_id, &provider, target, generation,
+    ))
+}
+
+fn poll_names_request_at_provider(
+    job: &pin_job::Model,
+    request_id: &str,
+    provider: &str,
+    target_id: &str,
+    generation: i64,
+) -> bool {
+    job.operation == "poll"
         && job.expected_remote_epoch.is_none()
-        && job.id == stable_poll_id(&provider, &job.cid, target_id, generation, request_id))
+        && job.id == stable_poll_id(provider, &job.cid, target_id, generation, request_id)
 }
 
 /// The already-claimed Submit's immutable target/generation remains evidence
@@ -1517,6 +2276,15 @@ pub async fn prepare_submit_call<C: ConnectionTrait>(
     claimed: &ClaimedPinJob,
     now: DateTimeUtc,
 ) -> AppResult<SubmitCallDecision> {
+    let work = SharedDecodeBudget::default();
+    prepare_submit_call_with_work(db, claimed, now, DecodeWork::shared(&work)).await
+}
+pub(crate) async fn prepare_submit_call_with_work<C: ConnectionTrait>(
+    db: &C,
+    claimed: &ClaimedPinJob,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+) -> AppResult<SubmitCallDecision> {
     super::management::admission::lock_sqlite_writer_in_caller_transaction(db).await?;
     let job = &claimed.model;
     let locked_until = claimed_lock(job)?;
@@ -1541,12 +2309,16 @@ pub async fn prepare_submit_call<C: ConnectionTrait>(
             "submit phase is not eligible to call the provider",
         ));
     }
-    super::quota::lock_allocation_admission(db, &job.provider).await?;
+    super::quota::lock_allocation_admission_with_work(db, &job.provider, work).await?;
     if db.get_database_backend() == DatabaseBackend::Postgres {
         // This is the new-dispatch tail, not the historical receipt append.
         // A job-first receipt may be waiting for our earlier remote lock.
-        db.query_one(sea_orm::Statement::from_sql_and_values(DatabaseBackend::Postgres,
-            "SELECT id FROM pin_jobs WHERE id=$1 FOR UPDATE NOWAIT", [job.id.clone().into()])).await?;
+        db.query_one(sea_orm::Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT id FROM pin_jobs WHERE id=$1 FOR UPDATE NOWAIT",
+            [job.id.clone().into()],
+        ))
+        .await?;
     }
 
     let result = pin_job::Entity::update_many()
@@ -1616,7 +2388,7 @@ pub async fn record_submit_recovery_no_match<C: ConnectionTrait>(
     let job = &claimed.model;
     let locked_until = claimed_lock(job)?;
     validate_claimed_submit(job)?;
-    if super::ledger::submission::latest(db, &job.id)
+    if super::ledger::submission::latest_rpc(db, &job.id)
         .await?
         .is_some_and(|row| row.outcome != "not_submitted" || row.needs_attention)
     {
@@ -1907,18 +2679,38 @@ pub async fn complete_job<C: ConnectionTrait>(
 /// Finalizes only the observation's exact claim, not Submit history, a remote
 /// lifetime, quota or a successor job. Unknown responsibility stays isolated.
 pub(crate) async fn finish_nonprojecting_job<C: ConnectionTrait>(
-    db: &C, claimed: &ClaimedPinJob, attention: bool, now: DateTimeUtc,
+    db: &C,
+    claimed: &ClaimedPinJob,
+    attention: bool,
+    now: DateTimeUtc,
 ) -> AppResult<()> {
     let until = claimed_lock(&claimed.model)?;
-    if !fence_job_claim(db, &claimed.model.id, until).await? { return Ok(()); }
+    if !fence_job_claim(db, &claimed.model.id, until).await? {
+        return Ok(());
+    }
     pin_job::Entity::update_many()
-        .col_expr(pin_job::Column::State, Expr::value(if attention { STATE_RUNNING } else { STATE_DONE }))
-        .col_expr(pin_job::Column::LockedUntil, Expr::value(Option::<DateTimeUtc>::None))
-        .col_expr(pin_job::Column::LastError, Expr::value(if attention { Some("management observation needs_attention") } else { None }))
+        .col_expr(
+            pin_job::Column::State,
+            Expr::value(if attention { STATE_RUNNING } else { STATE_DONE }),
+        )
+        .col_expr(
+            pin_job::Column::LockedUntil,
+            Expr::value(Option::<DateTimeUtc>::None),
+        )
+        .col_expr(
+            pin_job::Column::LastError,
+            Expr::value(if attention {
+                Some("management observation needs_attention")
+            } else {
+                None
+            }),
+        )
         .col_expr(pin_job::Column::UpdatedAt, Expr::value(now))
         .filter(pin_job::Column::Id.eq(&claimed.model.id))
         .filter(pin_job::Column::State.eq(STATE_RUNNING))
-        .filter(pin_job::Column::LockedUntil.eq(until)).exec(db).await?;
+        .filter(pin_job::Column::LockedUntil.eq(until))
+        .exec(db)
+        .await?;
     Ok(())
 }
 
@@ -1975,12 +2767,38 @@ pub(crate) async fn insert_new_job<C: ConnectionTrait>(
     job: NewPinJob,
     now: DateTimeUtc,
 ) -> AppResult<bool> {
+    let work = SharedDecodeBudget::default();
+    insert_new_job_with_work(db, job, now, DecodeWork::shared(&work)).await
+}
+pub(crate) async fn insert_new_job_with_work<C: ConnectionTrait>(
+    db: &C,
+    job: NewPinJob,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+) -> AppResult<bool> {
+    let operation = match &job {
+        NewPinJob::Target(job) => job.operation.operation(),
+        NewPinJob::Remote(job) => job.operation.operation(),
+    };
+    work.copy(&(
+        operation.persisted(),
+        STATE_PENDING,
+        (operation == PinJobOperation::Submit).then_some(SUBMIT_PHASE_READY),
+    ))
+    .map_err(management_error)?;
     let model = new_job_active_model(job, now);
+    let next_attempt_at = *model.next_attempt_at.as_ref();
+    work.copy(&(
+        model.id.as_ref(),
+        model.provider.as_ref(),
+        model.cid.as_ref(),
+    ))
+    .map_err(management_error)?;
     let job_id = model.id.as_ref().to_owned();
     let provider = model.provider.as_ref().to_owned();
     let cid = model.cid.as_ref().to_owned();
     if model.operation.as_ref() == PinJobOperation::Submit.persisted() {
-        super::quota::lock_allocation_admission(db, &provider).await?;
+        super::quota::lock_allocation_admission_with_work(db, &provider, work).await?;
     }
     let result = pin_job::Entity::insert(model)
         .on_conflict_do_nothing()
@@ -1988,9 +2806,30 @@ pub(crate) async fn insert_new_job<C: ConnectionTrait>(
         .await?;
     let inserted = matches!(result, TryInsertResult::Inserted(_));
     if inserted {
-        super::ledger::capture_invocation(db, &job_id, &provider, &cid).await?;
+        super::ledger::capture_invocation_with_work(db, &job_id, &provider, &cid, work).await?;
+        validate_inserted_job_times(db, &job_id, now, next_attempt_at, work).await?;
     }
     Ok(inserted)
+}
+
+/// Compare against the actual insert inputs before publishing an invocation or receipt.
+/// Historical readers use the frozen facts, not a new wall-clock observation.
+pub(crate) async fn validate_inserted_job_times<C: ConnectionTrait>(
+    db: &C,
+    id: &str,
+    created: DateTimeUtc,
+    next: DateTimeUtc,
+    work: DecodeWork<'_>,
+) -> AppResult<()> {
+    work.copy(id).map_err(management_error)?;
+    work.index_cells(1, 8).map_err(management_error)?;
+    let row=db.query_one(sea_orm::Statement::from_sql_and_values(db.get_database_backend(),
+        "SELECT COUNT(*) AS n FROM pin_jobs WHERE id=$1 AND created_at=$2 AND updated_at=$2 AND next_attempt_at=$3",
+        [id.into(),created.into(),next.into()])).await?.ok_or_else(||management_error(ManagementError::Confirmation))?;
+    if row.try_get::<i64>("", "n")? != 1 {
+        return Err(management_error(ManagementError::Confirmation));
+    }
+    Ok(())
 }
 
 async fn ensure_target_job<C: ConnectionTrait>(
@@ -1999,11 +2838,26 @@ async fn ensure_target_job<C: ConnectionTrait>(
     now: DateTimeUtc,
     submit: bool,
 ) -> AppResult<EnsureJobOutcome> {
-    let Some(existing) = pin_job::Entity::find_by_id(job.id.clone()).one(db).await? else {
-        return if insert_new_job(db, NewPinJob::Target(job.clone()), now).await? {
+    let work = SharedDecodeBudget::default();
+    ensure_target_job_with_work(db, job, now, submit, DecodeWork::shared(&work)).await
+}
+async fn ensure_target_job_with_work<C: ConnectionTrait>(
+    db: &C,
+    job: TargetPinJob,
+    now: DateTimeUtc,
+    submit: bool,
+    work: DecodeWork<'_>,
+) -> AppResult<EnsureJobOutcome> {
+    let Some(existing) = records::current_model::<pin_job::Entity, _>(db, &[&job.id], work)
+        .await
+        .map_err(management_error)?
+    else {
+        work.copy(&job.id).map_err(management_error)?;
+        let id = job.id.clone();
+        return if insert_new_job_with_work(db, NewPinJob::Target(job), now, work).await? {
             Ok(EnsureJobOutcome::Inserted)
         } else {
-            target_outcome_after_conflict(db, &job.id).await
+            target_outcome_after_conflict(db, &id, work).await
         };
     };
     match existing.state.as_str() {
@@ -2021,10 +2875,11 @@ async fn ensure_target_job<C: ConnectionTrait>(
 async fn target_outcome_after_conflict<C: ConnectionTrait>(
     db: &C,
     id: &str,
+    work: DecodeWork<'_>,
 ) -> AppResult<EnsureJobOutcome> {
-    let persisted = pin_job::Entity::find_by_id(id.to_owned())
-        .one(db)
-        .await?
+    let persisted = records::current_model::<pin_job::Entity, _>(db, &[id], work)
+        .await
+        .map_err(management_error)?
         .ok_or_else(|| stale_claim_error(id))?;
     match persisted.state.as_str() {
         STATE_PENDING => Ok(EnsureJobOutcome::Pending),
@@ -2032,13 +2887,6 @@ async fn target_outcome_after_conflict<C: ConnectionTrait>(
         STATE_DONE => Err(stale_claim_error(id)),
         _ => Err(invalid_job("pin job has an invalid persisted state")),
     }
-}
-
-async fn reconcile_outcome_after_conflict<C: ConnectionTrait>(
-    db: &C,
-    id: &str,
-) -> AppResult<EnsureJobOutcome> {
-    target_outcome_after_conflict(db, id).await
 }
 
 async fn remote_job_outcome_after_conflict<C: ConnectionTrait>(
@@ -2096,7 +2944,12 @@ async fn reactivate_job<C: ConnectionTrait>(
     Ok(())
 }
 
-async fn validate_submit_owner<C: ConnectionTrait>(db: &C, job: &TargetPinJob) -> AppResult<()> {
+async fn validate_submit_owner_with_work<C: ConnectionTrait>(
+    db: &C,
+    job: &TargetPinJob,
+    work: DecodeWork<'_>,
+) -> AppResult<()> {
+    work.copy(&job.id).map_err(management_error)?;
     if job.id
         != stable_submit_id(
             &job.provider,
@@ -2107,13 +2960,21 @@ async fn validate_submit_owner<C: ConnectionTrait>(db: &C, job: &TargetPinJob) -
     {
         return Err(invalid_job("Submit job ID does not match its scope"));
     }
-    if !check_target_values_current(db, job).await?
-        || canonical_desired_target(db, &job.provider, &job.cid)
-            .await?
-            .as_ref()
-            .map(|target| target.id.as_str())
-            != Some(job.target_id.as_str())
-        || !remote_is_reserved_without_request(db, &job.provider, &job.cid).await?
+    let canonical = canonical_desired_target_with_work(db, &job.provider, &job.cid, work)
+        .await
+        .map_err(management_error)?;
+    work.copy(&(
+        &job.lease_id,
+        job.expected_generation,
+        &job.provider,
+        &job.cid,
+    ))
+    .map_err(management_error)?;
+    let current=db.query_one(sea_orm::Statement::from_sql_and_values(db.get_database_backend(),"SELECT COUNT(*) AS n FROM pin_leases l WHERE l.id=$1 AND l.generation=$2 AND l.state='active' AND EXISTS (SELECT 1 FROM remote_pins r WHERE r.provider=$3 AND r.cid=$4 AND r.status='reserved' AND r.request_id IS NULL)",[job.lease_id.clone().into(),job.expected_generation.into(),job.provider.clone().into(),job.cid.clone().into()])).await?.ok_or_else(||invalid_job("Submit owner unavailable"))?.try_get::<i64>("","n")?;
+    if canonical
+        .as_ref()
+        .is_none_or(|target| target.id != job.target_id || target.lease_id != job.lease_id)
+        || current != 1
     {
         return Err(invalid_job(
             "Submit job is not the canonical reserved target",
@@ -2267,6 +3128,19 @@ async fn canonical_desired_target<C: ConnectionTrait>(
         .await?)
 }
 
+async fn canonical_desired_target_with_work<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+    cid: &str,
+    work: DecodeWork<'_>,
+) -> super::management::Result<Option<pin_lease_target::Model>> {
+    for _ in 0..2 {
+        work.copy(&(provider, cid))?;
+    }
+    let mut targets=records::current_models::<pin_lease_target::Entity,_>(db,"FROM (SELECT pin_lease_targets.* FROM pin_lease_targets INNER JOIN pin_leases ON pin_lease_targets.lease_id=pin_leases.id WHERE pin_lease_targets.provider=$1 AND pin_lease_targets.cid=$2 AND pin_leases.state='active' AND pin_lease_targets.state IN ('waiting','submitted','pinned','degraded') ORDER BY pin_lease_targets.created_at,pin_lease_targets.id LIMIT 1) AS pin_lease_targets WHERE TRUE","created_at,id",vec![provider.into(),cid.into()],1,work).await?;
+    Ok(targets.pop())
+}
+
 async fn ensure_current_reconcile<C: ConnectionTrait>(
     db: &C,
     provider: &str,
@@ -2330,11 +3204,16 @@ fn checked_next_attempt(now: DateTimeUtc, delay: Duration) -> AppResult<DateTime
         .ok_or_else(|| AppError::Internal("job retry timestamp overflow".to_owned()))
 }
 
-fn stable_submit_id(provider: &str, cid: &str, target_id: &str, generation: i64) -> String {
+pub(crate) fn stable_submit_id(
+    provider: &str,
+    cid: &str,
+    target_id: &str,
+    generation: i64,
+) -> String {
     format!("submit:{provider}:{cid}:{target_id}:g{generation}")
 }
 
-fn stable_poll_id(
+pub(crate) fn stable_poll_id(
     provider: &str,
     cid: &str,
     target_id: &str,
@@ -2345,7 +3224,10 @@ fn stable_poll_id(
     format!("poll:{provider}:{cid}:{target_id}:g{generation}:{request_hash}")
 }
 
-fn stable_reconcile_id(provider: &str, cid: &str, remote_epoch: i64) -> String {
+pub(crate) fn stable_unpin_id(provider: &str, cid: &str, epoch: i64) -> String {
+    format!("unpin:{provider}:{cid}:e{epoch}")
+}
+pub(crate) fn stable_reconcile_id(provider: &str, cid: &str, remote_epoch: i64) -> String {
     format!("reconcile:{provider}:{cid}:e{remote_epoch}")
 }
 

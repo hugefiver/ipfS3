@@ -138,7 +138,10 @@ pub(super) async fn lock_before_routes(
     }
     db.execute_unprepared("SET LOCAL lock_timeout='1s'").await?;
     let order = lock_order(versions);
-    for (table, key) in order.iter().take_while(|(table, _)| table != "pin_provider_routes") {
+    for (table, key) in order
+        .iter()
+        .take_while(|(table, _)| table != "pin_provider_routes")
+    {
         row_lock(db, table, key).await?;
     }
     Ok(())
@@ -151,17 +154,19 @@ pub(super) async fn lock_from_routes(
     versions: &[String],
     routes: Option<&[crate::pinning::identity::ProviderRouteSnapshot]>,
 ) -> AppResult<()> {
-    if super::management_closure::enabled(versions) {
-        if let Some(routes) = routes {
-            crate::store::pinning::management::admission::lock_open_in_transaction(db, routes)
-                .await?;
-        }
+    if super::management_closure::enabled(versions)
+        && let Some(routes) = routes
+    {
+        crate::store::pinning::management::admission::lock_open_in_transaction(db, routes).await?;
     }
     if db.get_database_backend() == DatabaseBackend::Sqlite {
         return Ok(());
     }
     let order = lock_order(versions);
-    for (table, key) in order.iter().skip_while(|(table, _)| table != "pin_provider_routes") {
+    for (table, key) in order
+        .iter()
+        .skip_while(|(table, _)| table != "pin_provider_routes")
+    {
         row_lock(db, table, key).await?;
     }
     // Tail write-excluding table locks fence insert phantoms, even empty captures.

@@ -61,6 +61,7 @@ pub struct WorkerSettings {
 
 pub struct PinningCoordinator {
     effective_config: ValidatedPinningConfig,
+    source_kubo: Option<KuboClient>,
     control_mode: OptionalPinControlMode,
     decompress_zip_config: DecompressZipConfig,
     zip_output_rules: ValidatedZipOutputRules,
@@ -333,6 +334,7 @@ impl PinningCoordinator {
 
         Ok(Arc::new(Self {
             effective_config,
+            source_kubo: kubo,
             control_mode: mode,
             decompress_zip_config: zip.clone(),
             zip_output_rules,
@@ -360,6 +362,10 @@ impl PinningCoordinator {
     /// Internal-only: contains resolved provider tokens; never log or expose over HTTP.
     pub fn effective_config(&self) -> &ValidatedPinningConfig {
         &self.effective_config
+    }
+
+    pub(crate) fn management_source(&self) -> Option<&KuboClient> {
+        self.source_kubo.as_ref()
     }
 
     pub fn control_mode(&self) -> OptionalPinControlMode {
@@ -440,23 +446,39 @@ impl PinningCoordinator {
     /// Alias labels can change in a canonical domain; account, resource family,
     /// credentials, endpoint revision and the frozen reader remain exact.
     pub(crate) fn historical_runtime_key(
-        &self, key: &str, route: &crate::pinning::identity::ProviderRouteSnapshot,
+        &self,
+        key: &str,
+        route: &crate::pinning::identity::ProviderRouteSnapshot,
     ) -> Option<&str> {
-        let provider = self.effective_config.providers.iter().find(|provider| provider.name == key)?;
+        let provider = self
+            .effective_config
+            .providers
+            .iter()
+            .find(|provider| provider.name == key)?;
         let current = provider.route_snapshot();
-        if current.resource_type() != route.resource_type() { return None; }
+        if current.resource_type() != route.resource_type() {
+            return None;
+        }
         let mut original = route.clone();
-        if crate::store::pinning::management::admission::allocation_domain(route).ok().as_deref() == Some(key) {
+        if crate::store::pinning::management::admission::allocation_domain(route)
+            .ok()
+            .as_deref()
+            == Some(key)
+        {
             original.provider_id.clone_from(&current.provider_id);
         }
-        crate::store::entities::pin_lease_requirement::contract::read_route_compatible(&original, &current)
-            .then_some(provider.name.as_str())
+        crate::store::entities::pin_lease_requirement::contract::read_route_compatible(
+            &original, &current,
+        )
+        .then_some(provider.name.as_str())
     }
 
     /// One receipt-scoped pass, with the existing worker's claim/heartbeat/IO
     /// protocol. Does not start the background worker or expire/scan old queues.
     pub async fn management_tick(
-        &self, store: &Store, scope: &crate::pinning::worker::ManagementJobScope,
+        &self,
+        store: &Store,
+        scope: &crate::pinning::worker::ManagementJobScope,
         cancellation: &CancellationToken,
     ) -> crate::error::AppResult<crate::pinning::worker::ManagementJobReport> {
         crate::pinning::worker::management_tick(self, store, scope, cancellation).await

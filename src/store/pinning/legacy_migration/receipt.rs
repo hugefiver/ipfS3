@@ -8,11 +8,10 @@ use crate::{
     pinning::identity::ProviderRouteSnapshot,
     store::entities::{pin_legacy_migration as operation, pin_legacy_migration_item as item},
 };
-use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
-    QuerySelect, Set,
-};
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter, Set};
 use std::collections::{BTreeMap, BTreeSet};
+pub(super) mod work;
+use work::Work;
 
 pub(super) async fn lookup<C: ConnectionTrait>(
     db: &C,
@@ -38,12 +37,21 @@ pub(super) async fn reverse<C: ConnectionTrait>(
     Ok(row)
 }
 async fn complete<C: ConnectionTrait>(db: &C, row: &operation::Model) -> AppResult<()> {
+    complete_with_work(db, row, &()).await
+}
+async fn complete_with_work<C: ConnectionTrait, W: Work>(
+    db: &C,
+    row: &operation::Model,
+    work: &W,
+) -> Result<(), W::Error> {
+    work.copy(&row.id)?;
     let count = item::Entity::find()
         .filter(item::Column::OperationId.eq(&row.id))
         .count(db)
-        .await?;
+        .await
+        .map_err(|error| W::application(error.into()))?;
     if count != row.item_count as u64 {
-        return Err(refused("incomplete database receipt"));
+        return Err(W::application(refused("incomplete database receipt")));
     }
     Ok(())
 }
@@ -242,6 +250,12 @@ pub(super) async fn append<C: ConnectionTrait>(
 }
 
 pub(super) async fn active<C: ConnectionTrait>(db: &C) -> AppResult<Vec<operation::Model>> {
+    active_with_work(db, &()).await
+}
+pub(super) async fn active_with_work<C: ConnectionTrait, W: Work>(
+    db: &C,
+    work: &W,
+) -> Result<Vec<operation::Model>, W::Error> {
     // Old known schema readers do not synthesize mappings where receipt tables are absent.
     let check = if db.get_database_backend() == sea_orm::DatabaseBackend::Sqlite {
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pin_legacy_migrations'"
@@ -253,33 +267,100 @@ pub(super) async fn active<C: ConnectionTrait>(db: &C) -> AppResult<Vec<operatio
             db.get_database_backend(),
             check,
         ))
-        .await?
+        .await
+        .map_err(|error| W::application(error.into()))?
         .is_none()
     {
         return Ok(vec![]);
     }
     // Validate the header's known columns, but do not repeatedly scan an empty
     // frontier. This result is call-local: a later committed receipt is re-read.
-    if operation::Entity::find().limit(1).one(db).await?.is_none() {
+    let table = crate::store::pinning::management::native::current_catalog()
+        .iter()
+        .find(|table| table.table == "pin_legacy_migrations")
+        .ok_or_else(|| W::application(refused("receipt catalog unavailable")))?;
+    work.cells(1, 0)?;
+    let columns = table
+        .columns
+        .iter()
+        .map(|column| format!("\"{column}\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    if db.query_one(sea_orm::Statement::from_string(db.get_database_backend(),format!("SELECT 1 AS present FROM (SELECT {columns} FROM pin_legacy_migrations LIMIT 1) AS header"))).await.map_err(|error|W::application(error.into()))?.is_none() {
         return Ok(vec![]);
     }
-    budget(db, 0).await?;
-    let rows = operation::Entity::find()
-        .order_by_asc(operation::Column::Id)
-        .limit((MAX_ROWS + 1) as u64)
-        .all(db)
-        .await?;
-    if rows.len() > MAX_ROWS {
-        return Err(refused("receipt resolver budget exceeded"));
+    budget(db, 0).await.map_err(W::application)?;
+    let terms = table
+        .columns
+        .iter()
+        .map(|column| {
+            if db.get_database_backend() == sea_orm::DatabaseBackend::Sqlite {
+                format!("length(CAST(COALESCE(CAST(\"{column}\" AS TEXT),'') AS BLOB))")
+            } else {
+                format!("octet_length(COALESCE(CAST(\"{column}\" AS TEXT),''))::bigint")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("+");
+    let sum = format!("CAST(COALESCE(SUM({terms}),0) AS BIGINT)");
+    let measured = db
+        .query_one(sea_orm::Statement::from_string(
+            db.get_database_backend(),
+            format!("SELECT COUNT(*) AS count,{sum} AS bytes FROM pin_legacy_migrations"),
+        ))
+        .await
+        .map_err(|error| W::application(error.into()))?
+        .ok_or_else(|| W::application(refused("receipt budget unavailable")))?;
+    let count = usize::try_from(
+        measured
+            .try_get::<i64>("", "count")
+            .map_err(|error| W::application(error.into()))?,
+    )
+    .map_err(|_| W::application(refused("receipt row count invalid")))?;
+    let bytes = usize::try_from(
+        measured
+            .try_get::<i64>("", "bytes")
+            .map_err(|error| W::application(error.into()))?,
+    )
+    .map_err(|_| W::application(refused("receipt byte count invalid")))?;
+    if count > MAX_ROWS {
+        return Err(W::application(refused("receipt resolver budget exceeded")));
     }
-    let reversed: BTreeSet<_> = rows.iter().filter_map(|r| r.reverses.as_deref()).collect();
-    let active: Vec<_> = rows
+    for _ in 0..2 {
+        work.cells(1 + count * table.columns.len(), bytes)?;
+    }
+    let rows = operation::Entity::find().from_raw_sql(sea_orm::Statement::from_string(db.get_database_backend(),format!("SELECT {columns} FROM pin_legacy_migrations WHERE (SELECT COUNT(*) FROM pin_legacy_migrations)<={count} AND (SELECT {sum} FROM pin_legacy_migrations)<={bytes} ORDER BY id LIMIT {}",MAX_ROWS+1))).all(db).await.map_err(|error|W::application(error.into()))?;
+    if rows.len() != count {
+        return Err(W::application(refused("receipt frontier changed")));
+    }
+    if rows.len() > MAX_ROWS {
+        return Err(W::application(refused("receipt resolver budget exceeded")));
+    }
+    let mut reversed = BTreeSet::new();
+    for id in rows.iter().filter_map(|r| r.reverses.as_deref()) {
+        work.copy(id)?;
+        reversed.insert(id);
+    }
+    let mut active = Vec::new();
+    for row in rows
         .iter()
         .filter(|r| r.direction == "apply" && !reversed.contains(r.id.as_str()))
-        .cloned()
-        .collect();
+    {
+        work.copy(&(
+            &row.id,
+            &row.direction,
+            &row.reverses,
+            &row.database_scope,
+            &row.db_clock,
+            &row.schema_version,
+            &row.declaration,
+            &row.confirmation,
+            row.item_count,
+        ))?;
+        active.push(row.clone());
+    }
     for row in &active {
-        complete(db, row).await?;
+        complete_with_work(db, row, work).await?;
     }
     Ok(active)
 }
@@ -304,34 +385,58 @@ pub async fn resolve_legacy_binding<C: ConnectionTrait>(
     original_key: &BTreeMap<String, String>,
     provider: &str,
 ) -> AppResult<Option<LegacyBinding>> {
+    resolve_with_work(db, table, original_key, provider, &()).await
+}
+
+pub(crate) async fn resolve_legacy_binding_with_work<'a, C: ConnectionTrait>(
+    db: &C,
+    table: &str,
+    original_key: &BTreeMap<String, String>,
+    provider: &str,
+    work: impl Into<crate::store::pinning::management::records::DecodeWork<'a>>,
+) -> crate::store::pinning::management::Result<Option<LegacyBinding>> {
+    resolve_with_work(db, table, original_key, provider, &work.into()).await
+}
+
+pub(super) async fn resolve_with_work<C: ConnectionTrait, W: Work>(
+    db: &C,
+    table: &str,
+    original_key: &BTreeMap<String, String>,
+    provider: &str,
+    work: &W,
+) -> Result<Option<LegacyBinding>, W::Error> {
     let mut found = None;
+    work.copy(original_key)?;
     let encoded = serde_json::to_string(original_key)
-        .map_err(|_| refused("invalid original row identity"))?;
-    for op in active(db).await? {
+        .map_err(|_| W::application(refused("invalid original row identity")))?;
+    for op in active_with_work(db, work).await? {
+        work.copy(&(&op.id, table, &encoded))?;
         let rows = item::Entity::find()
             .filter(item::Column::OperationId.eq(&op.id))
             .filter(item::Column::TableKind.eq(table))
             .filter(item::Column::OriginalKey.eq(&encoded))
             .all(db)
-            .await?;
+            .await
+            .map_err(|error| W::application(error.into()))?;
         for row in rows {
-            let bindings: Vec<Binding> = serde_json::from_str(&row.bindings)
-                .map_err(|_| refused("invalid DB receipt binding"))?;
+            let bindings: Vec<Binding> = work.parse(&row.bindings, "invalid DB receipt binding")?;
             let Some(binding) = bindings.iter().find(|b| b.provider == provider) else {
                 continue;
             };
-            let decl: super::Declaration = serde_json::from_str(&op.declaration)
-                .map_err(|_| refused("invalid DB receipt declaration"))?;
+            let decl: super::Declaration =
+                work.parse(&op.declaration, "invalid DB receipt declaration")?;
             let ns = decl
                 .namespaces
                 .iter()
                 .find(|n| n.source == provider)
-                .ok_or_else(|| refused("receipt namespace missing"))?;
+                .ok_or_else(|| W::application(refused("receipt namespace missing")))?;
             if !ns.bindings.contains(binding) {
-                return Err(refused("item not covered by database declaration"));
+                return Err(W::application(refused(
+                    "item not covered by database declaration",
+                )));
             }
-            let confirmation: Confirmation = serde_json::from_str(&op.confirmation)
-                .map_err(|_| refused("invalid DB receipt images"))?;
+            let confirmation: Confirmation =
+                work.parse(&op.confirmation, "invalid DB receipt images")?;
             let source_retired = confirmation
                 .before
                 .iter()
@@ -364,13 +469,16 @@ pub async fn resolve_legacy_binding<C: ConnectionTrait>(
                             && field(r, "cid") == Some(cid.as_str())
                     })
             });
-            let historical_epoch = remote
-                .and_then(|r| field(r, "epoch"))
-                .and_then(|e| e.parse::<i64>().ok())
-                .filter(|e| *e >= 0);
+            let historical_epoch = if let Some(epoch) = remote.and_then(|r| field(r, "epoch")) {
+                work.copy(epoch)?;
+                epoch.parse::<i64>().ok().filter(|epoch| *epoch >= 0)
+            } else {
+                None
+            };
             let closed_at_migration = remote.is_some_and(|r| field(r, "status") == Some("absent"))
                 && ledger.is_none_or(|r| field(r, "effect") == Some("absent"));
-            let release_epochs_at_migration = confirmation
+            let mut release_epochs_at_migration = Vec::new();
+            for epoch in confirmation
                 .after
                 .iter()
                 .filter(|i| i.table == "pin_resource_history")
@@ -379,8 +487,21 @@ pub async fn resolve_legacy_binding<C: ConnectionTrait>(
                     field(r, "cid") == cid.map(String::as_str)
                         && field(r, "provider").is_some_and(|p| p == ns.source || p == ns.target)
                 })
-                .filter_map(|r| field(r, "epoch").and_then(|e| e.parse().ok()))
-                .collect();
+                .filter_map(|r| field(r, "epoch"))
+            {
+                work.copy(epoch)?;
+                let Ok(epoch) = epoch.parse::<i64>() else {
+                    continue;
+                };
+                work.copy(&epoch)?;
+                release_epochs_at_migration.push(epoch);
+            }
+            work.copy(&(
+                &ns.target,
+                &binding.historical_route,
+                &ns.target_route,
+                &op.id,
+            ))?;
             let value = LegacyBinding {
                 operational_key: ns.target.clone(),
                 historical_route: binding.historical_route.clone(),
@@ -393,7 +514,7 @@ pub async fn resolve_legacy_binding<C: ConnectionTrait>(
                 release_epochs_at_migration,
             };
             if found.is_some() {
-                return Err(refused("ambiguous active receipt mapping"));
+                return Err(W::application(refused("ambiguous active receipt mapping")));
             }
             found = Some(value);
         }
@@ -405,6 +526,25 @@ pub async fn source_is_migrated<C: ConnectionTrait>(db: &C, provider: &str) -> A
     for op in active(db).await? {
         let decl: super::Declaration = serde_json::from_str(&op.declaration)
             .map_err(|_| refused("invalid DB receipt declaration"))?;
+        if decl
+            .namespaces
+            .iter()
+            .any(|n| n.source == provider && n.source != n.target)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+pub(crate) async fn source_is_migrated_with_work<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+    work: crate::store::pinning::management::records::DecodeWork<'_>,
+) -> crate::store::pinning::management::Result<bool> {
+    for op in active_with_work(db, &work).await? {
+        let decl: super::Declaration =
+            work.parse(&op.declaration, "invalid DB receipt declaration")?;
         if decl
             .namespaces
             .iter()
@@ -476,10 +616,20 @@ pub async fn historical_keys<C: ConnectionTrait>(
     provider: &str,
     cid: Option<&str>,
 ) -> AppResult<Vec<String>> {
+    historical_keys_with_work(db, table, provider, cid, &()).await
+}
+pub(super) async fn historical_keys_with_work<C: ConnectionTrait, W: Work>(
+    db: &C,
+    table: &str,
+    provider: &str,
+    cid: Option<&str>,
+    work: &W,
+) -> Result<Vec<String>, W::Error> {
+    work.copy(provider)?;
     let mut result: BTreeSet<String> = [provider.into()].into();
-    for op in active(db).await? {
-        let decl: super::Declaration = serde_json::from_str(&op.declaration)
-            .map_err(|_| refused("invalid DB receipt declaration"))?;
+    for op in active_with_work(db, work).await? {
+        let decl: super::Declaration =
+            work.parse(&op.declaration, "invalid DB receipt declaration")?;
         for ns in &decl.namespaces {
             if ns.target == provider
                 && ns.bindings.iter().any(|b| {
@@ -487,6 +637,7 @@ pub async fn historical_keys<C: ConnectionTrait>(
                         && cid.is_none_or(|cid| b.key.get("cid").is_none_or(|c| c == cid))
                 })
             {
+                work.copy(&ns.source)?;
                 result.insert(ns.source.clone());
             }
         }

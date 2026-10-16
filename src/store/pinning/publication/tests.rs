@@ -3525,25 +3525,55 @@ async fn guarded_import_completion_after_capped_job_deadline_rolls_back() {
     let _test_lock = test_gates::IMPORT_COMPLETION_TEST_LOCK.lock().await;
     let db = setup().await;
     let submitted_at = Utc::now();
-    submit(
+    let claim = claimed_import(
         &db,
-        import_request("completion-deadline-job", "completion-deadline-key", None),
+        "completion-deadline-job",
+        "completion-deadline-key",
         submitted_at,
+    )
+    .await;
+    let original_job = import_job::Entity::find_by_id(&claim.job_id)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    let original_destination = import_destination::Entity::find_by_id((
+        "bucket".to_owned(),
+        "completion-deadline-key".to_owned(),
+    ))
+    .one(&db)
+    .await
+    .unwrap()
+    .unwrap();
+    let original_targets = import_job_target::Entity::find().all(&db).await.unwrap();
+
+    // Expire only after admission and all publication writes, including a result row.
+    db.execute_unprepared(
+        "CREATE TRIGGER cap_import_completion_deadline AFTER INSERT ON import_job_results
+         WHEN NEW.job_id = 'completion-deadline-job'
+         BEGIN
+           SELECT CASE WHEN NOT EXISTS (
+             SELECT 1 FROM import_jobs WHERE id = NEW.job_id
+               AND state = 'running' AND locked_by = 'import-worker'
+               AND julianday(locked_until) > julianday('now')
+           ) THEN RAISE(FAIL, 'claim must remain valid through result insertion') END;
+           SELECT CASE WHEN
+             (SELECT COUNT(*) FROM objects) = 0 OR
+             (SELECT COUNT(*) FROM object_versions) = 0 OR
+             (SELECT COUNT(*) FROM object_tags) = 0 OR
+             (SELECT COUNT(*) FROM pin_leases) = 0 OR
+             (SELECT COUNT(*) FROM pin_lease_targets) = 0 OR
+             (SELECT COUNT(*) FROM remote_pins) = 0 OR
+             (SELECT COUNT(*) FROM pin_provider_usage) = 0 OR
+             (SELECT COUNT(*) FROM pin_jobs) = 0
+           THEN RAISE(FAIL, 'publication writes must precede completion') END;
+           UPDATE import_jobs
+             SET locked_until = strftime('%Y-%m-%d %H:%M:%f+00:00', 'now')
+             WHERE id = NEW.job_id;
+         END;",
     )
     .await
     .unwrap();
-    let claim = claim_due(
-        &db,
-        "import-worker",
-        submitted_at,
-        submitted_at + chrono::Duration::milliseconds(250),
-        1,
-    )
-    .await
-    .unwrap()
-    .pop()
-    .unwrap()
-    .claim;
     let gate = std::sync::Arc::new(test_gates::ImportCompletionGate {
         job_id: "completion-deadline-job".to_owned(),
         arrived: tokio::sync::Notify::new(),
@@ -3551,19 +3581,14 @@ async fn guarded_import_completion_after_capped_job_deadline_rolls_back() {
     });
     *test_gates::IMPORT_BEFORE_COMPLETION.lock().await = Some(gate.clone());
 
-    let worker_db = db.clone();
-    let publication = tokio::spawn(async move {
-        publish_import_object(
-            &worker_db,
-            request(
-                object(
-                    "completion-deadline-object",
-                    "completion-deadline-key",
-                    "bafy-completion-deadline",
-                    7,
-                ),
-                vec![],
-                vec![],
+    let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+        let limits = limits();
+        let publication = publish_import_object(
+            &db,
+            automatic_and_manual_request(
+                "completion-deadline-object",
+                "completion-deadline-key",
+                "bafy-completion-deadline",
             ),
             ImportPublicationGuard {
                 job_id: claim.job_id,
@@ -3575,19 +3600,40 @@ async fn guarded_import_completion_after_capped_job_deadline_rolls_back() {
                     generation: 1,
                 }],
             },
-            vec![],
+            vec![import_job_result::ActiveModel {
+                job_id: Set("completion-deadline-job".to_owned()),
+                sequence: Set(0),
+                key: Set("completion-deadline-key".to_owned()),
+                cid: Set(Some("bafy-completion-deadline".to_owned())),
+                size: Set(Some(7)),
+                error_code: Set(None),
+                error_message: Set(None),
+            }],
             submitted_at,
-            &limits(),
-        )
-        .await
-    });
-    gate.arrived.notified().await;
-    tokio::time::sleep(Duration::from_millis(350)).await;
-    gate.resume.notify_one();
-    let result = publication.await.unwrap();
+            &limits,
+        );
+        tokio::pin!(publication);
+        tokio::select! {
+            result = &mut publication => (false, result),
+            _ = gate.arrived.notified() => {
+                gate.resume.notify_one();
+                (true, publication.await)
+            }
+        }
+    })
+    .await;
     *test_gates::IMPORT_BEFORE_COMPLETION.lock().await = None;
+    let (arrived, result) =
+        outcome.expect("publication must finish without leaving a blocked future");
 
-    assert!(matches!(result, Err(AppError::StaleImportOwnership)));
+    assert!(
+        arrived,
+        "publication exited before completion boundary: {result:?}"
+    );
+    assert!(
+        matches!(result, Err(AppError::StaleImportOwnership)),
+        "{result:?}"
+    );
     assert_no_publication_rows(&db).await;
     assert_eq!(
         import_job_result::Entity::find().count(&db).await.unwrap(),
@@ -3598,7 +3644,22 @@ async fn guarded_import_completion_after_capped_job_deadline_rolls_back() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!((job.state.as_str(), job.final_cid), ("running", None));
+    assert_eq!(job, original_job);
+    assert_eq!(
+        import_destination::Entity::find_by_id((
+            "bucket".to_owned(),
+            "completion-deadline-key".to_owned(),
+        ))
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap(),
+        original_destination
+    );
+    assert_eq!(
+        import_job_target::Entity::find().all(&db).await.unwrap(),
+        original_targets
+    );
 }
 
 #[tokio::test]

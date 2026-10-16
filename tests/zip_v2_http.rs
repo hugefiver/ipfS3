@@ -1258,6 +1258,7 @@ async fn signed_legacy_batch_status_uses_only_current_verified_adopted_root() {
         cid: Set("QmLegacyRoot".into()),
         state: Set("adopted".into()),
         verification_receipt: Set(Some("committed-proof".into())),
+        logical_released_at: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
     }

@@ -24,6 +24,80 @@ pub use crate::pinning::identity::Ownership;
 pub mod submission;
 pub use crate::store::entities::pin_submit_observation as submission_entity;
 
+pub(crate) async fn allocation_cid_with_work<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+    cid: &str,
+    work: super::management::records::DecodeWork<'_>,
+) -> AppResult<String> {
+    use super::management::{admission, records};
+    let route = records::current_model::<pin_provider_route::Entity, _>(db, &[provider], work)
+        .await
+        .map_err(admission::work_error)?;
+    let route = route
+        .map(|row| work.with(|work| work.typed_shared::<ProviderRouteSnapshot>(&row.snapshot)))
+        .transpose()
+        .map_err(admission::work_error)?;
+    if !route.is_some_and(|route| {
+        matches!(
+            route.resource_type(),
+            crate::pinning::identity::RemoteResourceType::RpcPin
+                | crate::pinning::identity::RemoteResourceType::ClusterPin
+        )
+    }) {
+        work.copy(cid).map_err(admission::work_error)?;
+        return Ok(cid.into());
+    }
+    // CID parsing and base conversion use bounded input/output scratch as well
+    // as the returned allocation key.
+    work.index_cells(
+        4,
+        cid.len()
+            .checked_mul(3)
+            .and_then(|bytes| bytes.checked_add(256))
+            .ok_or(AppError::ManagementBudget)?,
+    )
+    .map_err(admission::work_error)?;
+    let canonical = crate::pinning::provider::canonical_resource_cid(cid)
+        .map_err(|_| AppError::InvalidPinningRequest("invalid RPC resource CID".into()))?;
+    work.copy(provider).map_err(admission::work_error)?;
+    let (rows, bytes) = records::bounded_projection(
+        db,
+        "FROM remote_pins WHERE provider=$1",
+        &[("cid", "cid")],
+        "cid",
+        vec![provider.into()],
+        (
+            crate::pinning::management::wire::MAX_WIRE_NODES,
+            crate::pinning::management::wire::MAX_WIRE_BYTES,
+        ),
+        work,
+    )
+    .await
+    .map_err(admission::work_error)?;
+    work.index_cells(rows.len(), bytes)
+        .map_err(admission::work_error)?;
+    for row in rows {
+        let old = row.try_get::<String>("", "cid")?;
+        work.index_cells(
+            3,
+            old.len()
+                .checked_mul(3)
+                .and_then(|bytes| bytes.checked_add(256))
+                .ok_or(AppError::ManagementBudget)?,
+        )
+        .map_err(admission::work_error)?;
+        if old != canonical
+            && crate::pinning::provider::cids_equivalent(&old, &canonical).unwrap_or(false)
+        {
+            return Err(AppError::InvalidPinningRequest(
+                "historical RPC CID alias requires explicit migration".into(),
+            ));
+        }
+    }
+    Ok(canonical)
+}
+
 /// New RPC allocations use CIDv1/base32 keys, never object metadata/ETags.
 /// Existing aliases are not silently rekeyed using today's configuration.
 pub async fn allocation_cid<C: ConnectionTrait>(
@@ -154,7 +228,8 @@ async fn register_snapshot<C: ConnectionTrait>(
     identity: &ProviderIdentity,
     route: &ProviderRouteSnapshot,
 ) -> AppResult<()> {
-    super::legacy_migration::admission_schema(db).await
+    super::legacy_migration::admission_schema(db)
+        .await
         .map_err(|_| super::management::admission::needs_attention())?;
     if super::legacy_migration::source_is_migrated(db, key).await? {
         // Restart must not overwrite, resurrect or reallocate a migrated source.
@@ -165,8 +240,11 @@ async fn register_snapshot<C: ConnectionTrait>(
         // a new alias nor today's retired=false can reopen a permanent domain.
         return Ok(());
     }
-    if pin_provider_route::Entity::find_by_id(key.to_owned()).one(db).await?
-        .is_some_and(|registered| registered.retired) {
+    if pin_provider_route::Entity::find_by_id(key.to_owned())
+        .one(db)
+        .await?
+        .is_some_and(|registered| registered.retired)
+    {
         return Ok(());
     }
     let snapshot = serde_json::to_string(route)
@@ -210,8 +288,11 @@ pub(crate) async fn verify_birth_candidate_routes<C: ConnectionTrait>(
     allocatable: &std::collections::BTreeSet<String>,
     lock: bool,
 ) -> AppResult<()> {
-    let routes = expected.iter().filter(|(key, _)| allocatable.contains(*key))
-        .map(|(_, route)| route.clone()).collect::<Vec<_>>();
+    let routes = expected
+        .iter()
+        .filter(|(key, _)| allocatable.contains(*key))
+        .map(|(_, route)| route.clone())
+        .collect::<Vec<_>>();
     if lock {
         // Existing publication/ZIP callers pass their prelocked business tx.
         super::management::admission::lock_in_caller_transaction(db, &routes).await?;
@@ -221,7 +302,13 @@ pub(crate) async fn verify_birth_candidate_routes<C: ConnectionTrait>(
     for (key, snapshot) in expected {
         let query = pin_provider_route::Entity::find_by_id(key.clone());
         let route = if lock && db.get_database_backend() == DatabaseBackend::Postgres {
-            query.lock_with_behavior(sea_orm::sea_query::LockType::Update, sea_orm::sea_query::LockBehavior::Nowait).one(db).await?
+            query
+                .lock_with_behavior(
+                    sea_orm::sea_query::LockType::Update,
+                    sea_orm::sea_query::LockBehavior::Nowait,
+                )
+                .one(db)
+                .await?
         } else {
             query.one(db).await?
         };
@@ -260,10 +347,29 @@ pub async fn capture_reservation<C: ConnectionTrait>(
     provider: &str,
     cid: &str,
 ) -> AppResult<()> {
-    super::management::admission::lock_provider_in_caller_transaction(db, provider).await?;
-    let Some(route) = pin_provider_route::Entity::find_by_id(provider.to_owned())
-        .one(db)
-        .await?
+    let work = super::management::records::SharedDecodeBudget::default();
+    capture_reservation_with_work(
+        db,
+        provider,
+        cid,
+        super::management::records::DecodeWork::shared(&work),
+    )
+    .await
+}
+pub(crate) async fn capture_reservation_with_work<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+    cid: &str,
+    work: super::management::records::DecodeWork<'_>,
+) -> AppResult<()> {
+    super::management::admission::lock_provider_with_work(db, provider, work).await?;
+    let Some(route) = super::management::records::current_model::<pin_provider_route::Entity, _>(
+        db,
+        &[provider],
+        work,
+    )
+    .await
+    .map_err(super::management::admission::work_error)?
     else {
         // Low-level callers without a configured runtime retain the legacy API.
         // Production registers routes before any request is accepted.
@@ -274,6 +380,8 @@ pub async fn capture_reservation<C: ConnectionTrait>(
             "provider retired before allocation".into(),
         ));
     }
+    work.copy(&(provider, cid))
+        .map_err(super::management::admission::work_error)?;
     remote_pin_ledger::Entity::insert(remote_pin_ledger::ActiveModel {
         provider: Set(provider.into()),
         cid: Set(cid.into()),
@@ -295,19 +403,38 @@ pub async fn capture_reallocation<C: ConnectionTrait>(
     provider: &str,
     cid: &str,
 ) -> AppResult<()> {
-    super::management::admission::lock_provider_in_caller_transaction(db, provider).await?;
-    let Some(row) = get(db, provider, cid).await? else {
-        return capture_reservation(db, provider, cid).await;
+    let work = super::management::records::SharedDecodeBudget::default();
+    capture_reallocation_with_work(
+        db,
+        provider,
+        cid,
+        super::management::records::DecodeWork::shared(&work),
+    )
+    .await
+}
+pub(crate) async fn capture_reallocation_with_work<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+    cid: &str,
+    work: super::management::records::DecodeWork<'_>,
+) -> AppResult<()> {
+    super::management::admission::lock_provider_with_work(db, provider, work).await?;
+    let Some(row) = get_with_work(db, provider, cid, work).await? else {
+        return capture_reservation_with_work(db, provider, cid, work).await;
     };
     if row.effect != "absent" {
         return Err(AppError::Internal(
             "absent resource lacks confirmed release evidence".into(),
         ));
     }
-    let route = pin_provider_route::Entity::find_by_id(provider.to_owned())
-        .one(db)
-        .await?
-        .ok_or_else(|| AppError::Internal("provider route unavailable for reallocation".into()))?;
+    let route = super::management::records::current_model::<pin_provider_route::Entity, _>(
+        db,
+        &[provider],
+        work,
+    )
+    .await
+    .map_err(super::management::admission::work_error)?
+    .ok_or_else(|| AppError::Internal("provider route unavailable for reallocation".into()))?;
     if route.retired {
         return Err(AppError::Internal(
             "retired provider cannot allocate a new resource".into(),
@@ -326,6 +453,24 @@ pub async fn capture_reallocation<C: ConnectionTrait>(
     active.last_error = Set(None);
     active.update(db).await?;
     Ok(())
+}
+
+pub(crate) async fn get_with_work<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+    cid: &str,
+    work: super::management::records::DecodeWork<'_>,
+) -> AppResult<Option<remote_pin_ledger::Model>> {
+    let provider = super::legacy_migration::resource_key_budgeted(db, provider, cid, work)
+        .await
+        .map_err(super::management::admission::work_error)?;
+    super::management::records::current_model::<remote_pin_ledger::Entity, _>(
+        db,
+        &[&provider, cid],
+        work,
+    )
+    .await
+    .map_err(super::management::admission::work_error)
 }
 
 pub async fn archive_confirmed_release<C: ConnectionTrait>(
@@ -354,27 +499,59 @@ pub async fn capture_invocation<C: ConnectionTrait>(
     provider: &str,
     cid: &str,
 ) -> AppResult<()> {
-    use crate::store::entities::{pin_invocation_route, remote_pin};
-    let Some(route) = get(db, provider, cid).await?.and_then(|row| row.route) else {
+    let work = super::management::records::SharedDecodeBudget::default();
+    capture_invocation_with_work(
+        db,
+        job_id,
+        provider,
+        cid,
+        super::management::records::DecodeWork::shared(&work),
+    )
+    .await
+}
+pub(crate) async fn capture_invocation_with_work<C: ConnectionTrait>(
+    db: &C,
+    job_id: &str,
+    provider: &str,
+    cid: &str,
+    work: super::management::records::DecodeWork<'_>,
+) -> AppResult<()> {
+    use crate::store::entities::pin_invocation_route;
+    let Some(route) = get_with_work(db, provider, cid, work)
+        .await?
+        .and_then(|row| row.route)
+    else {
         return Ok(());
     };
-    let remote = remote_pin::Entity::find_by_id((provider.to_owned(), cid.to_owned()))
-        .one(db)
+    work.copy(&(provider, cid))
+        .map_err(super::management::admission::work_error)?;
+    work.with(|work| work.nodes(1))
+        .map_err(super::management::admission::work_error)?;
+    let remote = db
+        .query_one(sea_orm::Statement::from_sql_and_values(
+            db.get_database_backend(),
+            "SELECT epoch FROM remote_pins WHERE provider=$1 AND cid=$2",
+            [provider.into(), cid.into()],
+        ))
         .await?
         .ok_or_else(|| AppError::Internal("invocation remote missing".into()))?;
+    let epoch = remote.try_get::<i64>("", "epoch")?;
+    work.copy(&(job_id, &route))
+        .map_err(super::management::admission::work_error)?;
     pin_invocation_route::Entity::insert(pin_invocation_route::ActiveModel {
         job_id: Set(job_id.into()),
         route: Set(route.clone()),
-        remote_epoch: Set(remote.epoch),
+        remote_epoch: Set(epoch),
     })
     .on_conflict_do_nothing()
     .exec(db)
     .await?;
-    let captured = pin_invocation_route::Entity::find_by_id(job_id.to_owned())
-        .one(db)
-        .await?
-        .ok_or_else(|| AppError::Internal("invocation route missing".into()))?;
-    if captured.route != route || captured.remote_epoch != remote.epoch {
+    work.copy(job_id)
+        .map_err(super::management::admission::work_error)?;
+    work.with(|work| work.nodes(2))
+        .map_err(super::management::admission::work_error)?;
+    let captured=db.query_one(sea_orm::Statement::from_sql_and_values(db.get_database_backend(),"SELECT COUNT(*) AS count FROM pin_invocation_routes WHERE job_id=$1 AND route=$2 AND remote_epoch=$3",[job_id.into(),route.into(),epoch.into()])).await?.ok_or_else(||AppError::Internal("invocation route missing".into()))?;
+    if captured.try_get::<i64>("", "count")? != 1 {
         return Err(AppError::Internal(
             "invocation identity cannot change".into(),
         ));
@@ -418,7 +595,13 @@ pub(crate) async fn advance_submit_invocation_epoch<C: ConnectionTrait>(
     // a concurrent confirmed release cannot cross the archive boundary unseen.
     let query = remote_pin::Entity::find_by_id((job.provider.clone(), job.cid.clone()));
     let remote = if db.get_database_backend() == DatabaseBackend::Postgres {
-        query.lock_with_behavior(sea_orm::sea_query::LockType::Update, sea_orm::sea_query::LockBehavior::Nowait).one(db).await?
+        query
+            .lock_with_behavior(
+                sea_orm::sea_query::LockType::Update,
+                sea_orm::sea_query::LockBehavior::Nowait,
+            )
+            .one(db)
+            .await?
     } else {
         query.one(db).await?
     }
@@ -619,12 +802,39 @@ pub(crate) async fn job_route<C: ConnectionTrait>(
 
 /// Last new-POST fence for every provider family. Recovery GETs and callbacks
 /// intentionally do not use this admission check.
-pub(crate) async fn submit_dispatch_open<C: ConnectionTrait>(db: &C, job: &pin_job::Model) -> AppResult<bool> {
-    if job.operation != "submit" { return Ok(false); }
-    let Some(original) = job_route(db, &job.id).await? else {
+pub(crate) async fn submit_dispatch_open<C: ConnectionTrait>(
+    db: &C,
+    job: &pin_job::Model,
+) -> AppResult<bool> {
+    let work = super::management::records::SharedDecodeBudget::default();
+    submit_dispatch_open_with_work(
+        db,
+        job,
+        super::management::records::DecodeWork::shared(&work),
+    )
+    .await
+}
+pub(crate) async fn submit_dispatch_open_with_work<C: ConnectionTrait>(
+    db: &C,
+    job: &pin_job::Model,
+    work: super::management::records::DecodeWork<'_>,
+) -> AppResult<bool> {
+    if job.operation != "submit" {
+        return Ok(false);
+    }
+    let Some(captured) = super::management::records::current_model::<
+        crate::store::entities::pin_invocation_route::Entity,
+        _,
+    >(db, &[&job.id], work)
+    .await
+    .map_err(super::management::admission::work_error)?
+    else {
         return legacy_unregistered_store(db, &job.provider).await;
     };
-    Ok(!super::management::admission::registration_closed(db, &original).await?)
+    let original = work
+        .with(|work| work.typed::<ProviderRouteSnapshot>(&captured.route))
+        .map_err(super::management::admission::work_error)?;
+    Ok(!super::management::admission::registration_closed_with_work(db, &original, work).await?)
 }
 
 /// A cancelled owner's Poll can prove the request's origin, but cannot itself
@@ -839,19 +1049,41 @@ pub async fn cleanup_allowed<C: ConnectionTrait>(
     provider: &str,
     cid: &str,
 ) -> AppResult<bool> {
-    if super::legacy_migration::resource_binding(db, provider, cid)
-        .await?
+    let work = super::management::records::SharedDecodeBudget::default();
+    cleanup_allowed_with_work(
+        db,
+        provider,
+        cid,
+        super::management::records::DecodeWork::shared(&work),
+    )
+    .await
+}
+pub(crate) async fn cleanup_allowed_with_work<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+    cid: &str,
+    work: super::management::records::DecodeWork<'_>,
+) -> AppResult<bool> {
+    if super::legacy_migration::resource_binding_with_work(db, provider, cid, work)
+        .await
+        .map_err(super::management::admission::work_error)?
         .is_some()
     {
         // A namespace declaration is never new delete/ownership authority.
         return Ok(false);
     }
-    let Some(row) = get(db, provider, cid).await? else {
+    let Some(row) = get_with_work(db, provider, cid, work).await? else {
         return legacy_unregistered_store(db, provider).await;
     };
     // Stage 5 RPC receipts prove pin state, never exclusive creation. In
     // particular an opaque RPC request id must not become CID-based delete authority.
-    if decode_route(&row).is_some_and(|route| {
+    let route = row
+        .route
+        .as_deref()
+        .map(|route| work.with(|work| work.typed::<ProviderRouteSnapshot>(route)))
+        .transpose()
+        .map_err(super::management::admission::work_error)?;
+    if route.as_ref().is_some_and(|route| {
         matches!(
             route.resource_type(),
             crate::pinning::identity::RemoteResourceType::RpcPin
@@ -861,7 +1093,7 @@ pub async fn cleanup_allowed<C: ConnectionTrait>(
         return Ok(false);
     }
     Ok(row.ownership == "application_created"
-        && decode_route(&row).is_some_and(|route| route.cleanup == CleanupMode::Managed))
+        && route.is_some_and(|route| route.cleanup == CleanupMode::Managed))
 }
 
 // Retain the pre-registry low-level store API used by legacy embedders. The

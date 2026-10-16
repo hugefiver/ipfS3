@@ -1,7 +1,7 @@
 //! Owned, non-secret DTOs. No type containing caller text implements Debug.
 
-use serde::{Deserialize, Serialize};
 pub use crate::store::pinning::management::native::{NativeFrame, NativeKey, NativeRow};
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -106,20 +106,53 @@ pub struct ObjectSnapshot {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReadEvidence {
-    pub identity:ExactObject,
-    pub node_identity:String,
-    pub stored_bytes:Option<u64>,
-    pub proof:super::evidence::ReadProof,
-    pub observed_at:chrono::DateTime<chrono::Utc>,
-    pub expires_at:chrono::DateTime<chrono::Utc>,
-    pub idle_timeout_millis:u64,
+    pub identity: ExactObject,
+    pub node_identity: String,
+    pub stored_bytes: Option<u64>,
+    pub proof: super::evidence::ReadProof,
+    pub observed_at: chrono::DateTime<chrono::Utc>,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+    pub idle_timeout_millis: u64,
 }
 impl From<&super::evidence::ReadAttestation> for ReadEvidence {
-    fn from(proof:&super::evidence::ReadAttestation)->Self {
-        let stored_bytes=if proof.proof==super::evidence::ReadProof::CompleteLocalDirectoryDagBlocksV1 {
-            proof.directory_receipt.as_ref().filter(|receipt|receipt.valid_shape()&&receipt.cid()==proof.identity.cid&&receipt.node_identity()==proof.source.node_identity&&Some(receipt.stored_block_bytes())==proof.stored_bytes).map(|receipt|receipt.stored_block_bytes())
-        }else{proof.stored_bytes};
-        Self {identity:proof.identity.clone(),node_identity:proof.source.node_identity.clone(),stored_bytes,proof:proof.proof,observed_at:proof.observed_at,expires_at:proof.expires_at,idle_timeout_millis:proof.source.idle_timeout_millis}
+    fn from(proof: &super::evidence::ReadAttestation) -> Self {
+        let stored_bytes = attested_stored_bytes(proof);
+        Self {
+            identity: proof.identity.clone(),
+            node_identity: proof.source.node_identity.clone(),
+            stored_bytes,
+            proof: proof.proof,
+            observed_at: proof.observed_at,
+            expires_at: proof.expires_at,
+            idle_timeout_millis: proof.source.idle_timeout_millis,
+        }
+    }
+}
+impl ReadEvidence {
+    pub(crate) fn matches_attestation(&self, proof: &super::evidence::ReadAttestation) -> bool {
+        self.identity == proof.identity
+            && self.node_identity == proof.source.node_identity
+            && self.stored_bytes == attested_stored_bytes(proof)
+            && self.proof == proof.proof
+            && self.observed_at == proof.observed_at
+            && self.expires_at == proof.expires_at
+            && self.idle_timeout_millis == proof.source.idle_timeout_millis
+    }
+}
+pub(crate) fn attested_stored_bytes(proof: &super::evidence::ReadAttestation) -> Option<u64> {
+    if proof.proof == super::evidence::ReadProof::CompleteLocalDirectoryDagBlocksV1 {
+        proof
+            .directory_receipt
+            .as_ref()
+            .filter(|receipt| {
+                receipt.valid_shape()
+                    && receipt.cid() == proof.identity.cid
+                    && receipt.node_identity() == proof.source.node_identity
+                    && Some(receipt.stored_block_bytes()) == proof.stored_bytes
+            })
+            .map(|receipt| receipt.stored_block_bytes())
+    } else {
+        proof.stored_bytes
     }
 }
 
@@ -151,13 +184,41 @@ pub struct RouteIdentity {
 }
 
 impl Ord for RouteIdentity {
-    fn cmp(&self,other:&Self)->std::cmp::Ordering {
-        (&self.provider_id,&self.backend,&self.scope,&self.storage_domain,&self.api_profile,&self.strategy,self.resource_type,self.credential_revision,self.endpoint_revision)
-            .cmp(&(&other.provider_id,&other.backend,&other.scope,&other.storage_domain,&other.api_profile,&other.strategy,other.resource_type,other.credential_revision,other.endpoint_revision))
-            .then_with(||serde_json::to_string(&self.original).expect("route serializes").cmp(&serde_json::to_string(&other.original).expect("route serializes")))
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (
+            &self.provider_id,
+            &self.backend,
+            &self.scope,
+            &self.storage_domain,
+            &self.api_profile,
+            &self.strategy,
+            self.resource_type,
+            self.credential_revision,
+            self.endpoint_revision,
+        )
+            .cmp(&(
+                &other.provider_id,
+                &other.backend,
+                &other.scope,
+                &other.storage_domain,
+                &other.api_profile,
+                &other.strategy,
+                other.resource_type,
+                other.credential_revision,
+                other.endpoint_revision,
+            ))
+            .then_with(|| {
+                serde_json::to_string(&self.original)
+                    .expect("route serializes")
+                    .cmp(&serde_json::to_string(&other.original).expect("route serializes"))
+            })
     }
 }
-impl PartialOrd for RouteIdentity {fn partial_cmp(&self,other:&Self)->Option<std::cmp::Ordering>{Some(self.cmp(other))}}
+impl PartialOrd for RouteIdentity {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -189,14 +250,25 @@ pub struct RemoteKey {
 }
 
 impl RouteIdentity {
-    pub fn from_original(original:crate::pinning::identity::ProviderRouteSnapshot)->Self {
-        let resource_type=match original.resource_type() {
-            crate::pinning::identity::RemoteResourceType::PsaRequest=>ResourceType::PsaRequest,
-            crate::pinning::identity::RemoteResourceType::HostedFile=>ResourceType::HostedFile,
-            crate::pinning::identity::RemoteResourceType::RpcPin=>ResourceType::RpcPin,
-            crate::pinning::identity::RemoteResourceType::ClusterPin=>ResourceType::ClusterPin,
+    pub fn from_original(original: crate::pinning::identity::ProviderRouteSnapshot) -> Self {
+        let resource_type = match original.resource_type() {
+            crate::pinning::identity::RemoteResourceType::PsaRequest => ResourceType::PsaRequest,
+            crate::pinning::identity::RemoteResourceType::HostedFile => ResourceType::HostedFile,
+            crate::pinning::identity::RemoteResourceType::RpcPin => ResourceType::RpcPin,
+            crate::pinning::identity::RemoteResourceType::ClusterPin => ResourceType::ClusterPin,
         };
-        Self {provider_id:original.provider_id.clone(),backend:original.backend.clone(),scope:original.scope.clone(),storage_domain:original.storage_domain.clone(),api_profile:original.api_profile.clone(),strategy:original.strategy.clone(),resource_type,credential_revision:original.credential_revision,endpoint_revision:original.endpoint_revision,original:Some(original)}
+        Self {
+            provider_id: original.provider_id.clone(),
+            backend: original.backend.clone(),
+            scope: original.scope.clone(),
+            storage_domain: original.storage_domain.clone(),
+            api_profile: original.api_profile.clone(),
+            strategy: original.strategy.clone(),
+            resource_type,
+            credential_revision: original.credential_revision,
+            endpoint_revision: original.endpoint_revision,
+            original: Some(original),
+        }
     }
     pub fn remote_key(&self, cid: &str) -> RemoteKey {
         RemoteKey {
@@ -260,9 +332,11 @@ pub struct RemoteSnapshot {
 }
 
 impl RemoteSnapshot {
-    pub(crate) fn has_unknown_responsibility(&self)->bool {
-        self.effect==SideEffect::Unknown || self.application_references.is_none()
-            || self.inflight_operations.is_none() || self.accounted_bytes.is_none()
+    pub(crate) fn has_unknown_responsibility(&self) -> bool {
+        self.effect == SideEffect::Unknown
+            || self.application_references.is_none()
+            || self.inflight_operations.is_none()
+            || self.accounted_bytes.is_none()
     }
 }
 
@@ -390,6 +464,10 @@ pub struct Snapshot {
     pub unknown_resources: Vec<NativeKey>,
     pub ledger_domains: Vec<LedgerDomainSnapshot>,
     pub inventories: Vec<ProviderInventory>,
+    /// Public projections of exact durable ZIP root references. Receipt contents
+    /// remain private in native_frame; these projections are not authority.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub root_references: Vec<RootReferenceSnapshot>,
     /// Trusted durable receipts, atomically recorded by the future executor.
     pub applied: Vec<AppliedItem>,
 }
@@ -415,24 +493,49 @@ pub enum Action {
     Retry,
     /// Add destination execution; source responsibility and TTL remain intact.
     Migrate {
-        destination: RouteIdentity,
+        destination: Box<RouteIdentity>,
     },
     Reconcile,
     /// Default retain: only stop allocations; never delete routes or resources.
     Retire,
     /// Additive explicit disposition. Historical `retire` still decodes as
     /// default Retain; an executor parameter cannot select another disposition.
-    RetireWith { selection: RetirementSelection },
+    RetireWith {
+        selection: RetirementSelection,
+    },
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all="snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum RetirementSelection {
     Retain,
     /// Complete exact prior migration results; retirement never implies source
     /// cleanup or invents migration authority for an unselected object.
-    Migrate { targets: Vec<RetirementMigration> },
-    ControlledCleanup { resources: Vec<RetirementResource> },
+    Migrate {
+        targets: Vec<RetirementMigration>,
+    },
+    ControlledCleanup {
+        resources: Vec<RetirementResource>,
+    },
+    /// Logical release of only these exact root references. Never unpin/GC,
+    /// delete root history, or infer provider ownership from an inventory.
+    ReleaseRootReferences {
+        references: Vec<NativeKey>,
+    },
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RootReferenceSnapshot {
+    pub key: NativeKey,
+    /// Exact ZIP batch owner, not the retiring provider's identity.
+    pub owner: String,
+    pub reference_tuple: NativeRow,
+    pub build_tuple: NativeRow,
+    pub batch_tuple: NativeRow,
+    /// Derived from the durable private verification_receipt, never a caller
+    /// claim that substitutes for rechecking the complete native frame.
+    pub verification_recorded: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -580,6 +683,8 @@ pub struct RetirementCapture {
     pub targets: Vec<TargetSnapshot>,
     pub remotes: Vec<RemoteSnapshot>,
     pub historical_remotes: Vec<RemoteSnapshot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub root_references: Vec<RootReferenceSnapshot>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -609,13 +714,8 @@ pub struct AppliedItem {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Confirmation {
-    pub plan_id: String,
-    /// Exact reviewed manifest/action/capture, not merely a plan name or digest.
-    pub bindings: Vec<PlanEntry>,
     /// Exact candidate rows reviewed independently of the inferred old ZIP.
     pub candidate_item_ids: Vec<String>,
-    pub native_frame: Option<NativeFrame>,
-    pub configuration: Option<ConfigurationBinding>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -623,7 +723,7 @@ pub struct Confirmation {
 pub struct ConfigurationBinding {
     pub routes: Vec<crate::pinning::identity::ProviderRouteSnapshot>,
     pub policies: Vec<crate::pinning::config::ValidatedPolicy>,
-    pub limits: std::collections::BTreeMap<String,crate::pinning::config::ProviderLimits>,
+    pub limits: std::collections::BTreeMap<String, crate::pinning::config::ProviderLimits>,
     pub zip_rules: Option<crate::pinning::zip_policy::ValidatedZipOutputRules>,
     pub source_node: Option<String>,
 }

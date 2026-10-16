@@ -32,7 +32,11 @@ pub(super) const CAPTURE_COLUMNS: [&str; 6] = [
     "contract",
 ];
 
-pub(super) fn bindings(images: &[TableImage], ns: &super::Namespace, management: &super::management_closure::Closure) -> AppResult<Vec<Binding>> {
+pub(super) fn bindings(
+    images: &[TableImage],
+    ns: &super::Namespace,
+    management: &super::management_closure::Closure,
+) -> AppResult<Vec<Binding>> {
     let source = ns.source.as_str();
     let mut result = vec![];
     for image in images {

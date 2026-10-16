@@ -27,10 +27,48 @@ use crate::{
     },
 };
 
+#[path = "submission/bounded.rs"]
+mod bounded;
+pub(crate) use bounded::{latest_rpc, latest_rpc_with_work, rejected_non_rpc_call_with_work};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceEvidence {
     pub resource: ObservedResource,
     pub key: Option<CanonicalResourceKey>,
+}
+
+pub(crate) fn resource_evidence_for_route(
+    route: &ProviderRouteSnapshot,
+    resource: ObservedResource,
+) -> ResourceEvidence {
+    let key = canonical_resource_cid(&resource.cid)
+        .ok()
+        .map(|cid| CanonicalResourceKey {
+            backend: route.backend.clone(),
+            scope: route.scope.clone(),
+            resource_type: resource.resource_type,
+            resource_id: cid,
+        });
+    ResourceEvidence { resource, key }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ObservationProtocol {
+    RpcReceipt,
+    NonRpcObservation,
+}
+
+pub(crate) fn observation_protocol(
+    route: &ProviderRouteSnapshot,
+) -> AppResult<ObservationProtocol> {
+    crate::pinning::worker::invocation_route_for_snapshot(route).ok_or_else(|| {
+        AppError::InvalidPinningRequest("unsupported historical observation route".into())
+    })?;
+    Ok(if is_rpc(route) {
+        ObservationProtocol::RpcReceipt
+    } else {
+        ObservationProtocol::NonRpcObservation
+    })
 }
 
 pub fn is_rpc(route: &ProviderRouteSnapshot) -> bool {
@@ -198,15 +236,7 @@ async fn record_in_transaction<C: ConnectionTrait>(
             {
                 resource.ownership = Ownership::Unknown;
             }
-            let key = canonical_resource_cid(&resource.cid)
-                .ok()
-                .map(|cid| CanonicalResourceKey {
-                    backend: route.backend.clone(),
-                    scope: route.scope.clone(),
-                    resource_type: resource.resource_type,
-                    resource_id: cid,
-                });
-            ResourceEvidence { resource, key }
+            resource_evidence_for_route(&route, resource)
         })
         .collect();
     let keys: std::collections::BTreeSet<_> =
@@ -310,9 +340,15 @@ async fn record_in_transaction<C: ConnectionTrait>(
     };
     // Invalid/stale management authority denies projection, never erases the
     // actual already-started invocation's roots/Unknown response below.
-    let managed_projection = crate::store::pinning::management::actions::job_authority::projection_allowed(db, &claimed.model)
-        .await.unwrap_or(false);
-    let can_project = live && current_lifetime && !released && matched_context && managed_projection;
+    let managed_projection =
+        crate::store::pinning::management::actions::job_authority::projection_allowed(
+            db,
+            &claimed.model,
+        )
+        .await
+        .unwrap_or(false);
+    let can_project =
+        live && current_lifetime && !released && matched_context && managed_projection;
     let written = evidence::Entity::update_many()
         .col_expr(evidence::Column::Effect, Expr::value(effect))
         .col_expr(evidence::Column::Resources, Expr::value(json))
@@ -468,11 +504,11 @@ async fn receipt_context_valid<C: ConnectionTrait>(
         crate::store::entities::pin_provider_route::Entity::find_by_id(operational.clone())
             .one(db)
             .await?;
-    if !registered.is_some_and(|registered| {
-        registered_invocation_matches(&row.route, &registered.snapshot)
-    }) || super::get(db, &row.provider, &row.expected_cid)
-        .await?
-        .is_none_or(|ledger| ledger.route.as_deref() != Some(row.route.as_str()))
+    if !registered
+        .is_some_and(|registered| registered_invocation_matches(&row.route, &registered.snapshot))
+        || super::get(db, &row.provider, &row.expected_cid)
+            .await?
+            .is_none_or(|ledger| ledger.route.as_deref() != Some(row.route.as_str()))
     {
         return Ok(false);
     }
@@ -1040,8 +1076,11 @@ pub async fn dispatch_allowed<C: ConnectionTrait>(db: &C, id: &str) -> AppResult
     if row.outcome != "in_flight" || row.observed_at.is_some() {
         return Ok(false);
     }
-    let original: ProviderRouteSnapshot = serde_json::from_str(&row.route)
-        .map_err(|_| AppError::InvalidPinningRequest("retirement attribution needs attention; dispatch denied".into()))?;
+    let original: ProviderRouteSnapshot = serde_json::from_str(&row.route).map_err(|_| {
+        AppError::InvalidPinningRequest(
+            "retirement attribution needs attention; dispatch denied".into(),
+        )
+    })?;
     if super::super::management::admission::registration_closed(db, &original).await? {
         return Ok(false);
     }

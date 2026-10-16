@@ -1,5 +1,12 @@
 //! ipfs-s3-gateway library root.
 
+#[cfg(test)]
+extern crate self as ipfs_s3_gateway;
+
+#[cfg(test)]
+#[path = "../tests/support/stage7_management_actions.rs"]
+pub mod stage7_management_test_support;
+
 pub mod auth;
 pub mod config;
 pub mod cors;

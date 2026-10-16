@@ -46,7 +46,11 @@ async fn health_check() -> &'static str {
 
 fn parse_run_mode(args: &[String]) -> anyhow::Result<RunMode> {
     let legacy = diagnostics::legacy_migration::parse(args)?;
-    if args.iter().skip(1).any(|argument| argument == "--pinning-manage") {
+    if args
+        .iter()
+        .skip(1)
+        .any(|argument| argument == "--pinning-manage")
+    {
         return Err(diagnostic_usage());
     }
     if let Some(command) = legacy {

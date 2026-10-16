@@ -1,12 +1,21 @@
 use anyhow::Result;
-use ipfs_s3_gateway::{kubo::KuboClient, pinning::management::{evidence, local_config::ManagementConfig},
-    store::pinning::management::records::LocalAuthorization};
+use ipfs_s3_gateway::{
+    kubo::KuboClient,
+    pinning::management::{evidence, local_config::ManagementConfig},
+    store::pinning::management::records::LocalAuthorization,
+};
 use sea_orm::DatabaseConnection;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-pub async fn execute(db: &DatabaseConnection, config: &ManagementConfig, auth: &LocalAuthorization,
-    client: &KuboClient, request: &evidence::PrepareRequest, cancellation: CancellationToken) -> Result<Value> {
+pub async fn execute(
+    db: &DatabaseConnection,
+    config: &ManagementConfig,
+    auth: &LocalAuthorization,
+    client: &KuboClient,
+    request: &evidence::PrepareRequest,
+    cancellation: CancellationToken,
+) -> Result<Value> {
     let proof = evidence::prepare(db, config, auth, client, request, cancellation).await?;
     // Never serialize the attestation's tuples, identity or private source config.
     Ok(json!({

@@ -899,7 +899,8 @@ use support::import::{
 };
 use support::lifecycle::{LifecycleHarness, start_lifecycle_harness};
 use support::pinning::{
-    PinningHarness, PinningHarnessConfig, PsaReply, TestProviderConfig, start_pinning_harness,
+    PinningHarness, PinningHarnessConfig, PsaReply, TEST_CID, TestProviderConfig,
+    start_pinning_harness,
 };
 use support::sigv4::{presign_sigv4_query, send_sigv4, send_sigv4_chunked_http1};
 
@@ -4772,11 +4773,28 @@ fn pinning_policy(prefix: &str, provider_mode: &str, providers: &[&str]) -> Poli
     }
 }
 
+const PIN_CID_SHARED: &str = "bafkreicnbjdsp2d4w66acomo6g5hnwgt377rel5ouiyda2b2txtwu6gnam";
+const PIN_CID_PART: &str = "bafkreid7q7afsgkz6piz7vg4jtn7dgnvhmlu4fbwfqcgicwnrsxdviutpm";
+const PIN_CID_ROOT: &str = "bafkreihjxyl3buwip5ndg5r2hxfiti57ktzodculywi5c36lhk7lwq33ou";
+const PIN_CID_ARCHIVE: &str = "bafkreig7dqxut5wscm35mzikko4nwwnmussy3ncbdruvojlan4wey7qzty";
+const PIN_CID_ENTRY: &str = "bafkreielg5kiqkw2y3kio7pw46jc4e2776dlpz4bqmfrks4bszvmrnvkri";
+const PIN_CID_ENTRY1: &str = "bafkreifrzrmgjjyinm4ouxml5agww3xdc3v5hn2rrkbrademswu3t73qay";
+const PIN_CID_ENTRY2: &str = "bafkreicjejslxnsavqzukvy2a2en3wv2kr6sczpojs4glh7fjamktm7454";
+const PIN_CID_COLLISION: &str = "bafkreig6fnztpuezb6nvtcj2bvg2ioumbcgg62mlaoi55iqp2qnlnzes6e";
+const PIN_CID_OLD: &str = "bafkreihs5c77ib3qjathmwp3fr6qtvq5lol3xbqti62ryf2wx3uz4oquvu";
+const PIN_CID_NEW: &str = "bafkreibpf3q4pzl5lmh4huzh3szsdtx62ehcycj3n7yjtrjn63dblu2cby";
+const PIN_CID_NEWER: &str = "bafkreiatkkpbrfldoyhcpm4swyqno2kgksinznqh5y32szq2x2sgme35y4";
+const PIN_CID_DELETE: &str = "bafkreicm2xcpr6kccw5xmuqp27hczaoodfjvs75ixeuitaylp7zqhddl74";
+const PIN_CID_BATCH_A: &str = "bafkreihtbxvbwt2ormagckqbtglq5mx43ezmudkeauo7rwcn6moaq6u2ji";
+const PIN_CID_BATCH_B: &str = "bafkreiaybki67ff7sfeg6kach5drglluljtqw2lwiq2peq23klq3gbmeji";
+const PIN_CID_INCOMING: &str = "bafkreidryatkq2h2wiikzwe4yqufa7w5jid7xlkhu2m3qlarwbbak67dui";
+const PIN_CID_WAIT: &str = "bafkreiaywgrg2wwheiwmrv7xa7ouj6km5l644ydxzzjgzgl4x2jyqn6hka";
+
 fn repeated_shared_kubo(add_calls: usize) -> KuboScript {
     KuboScript::repeated_add(
-        "QmShared",
+        PIN_CID_SHARED,
         add_calls,
-        HashMap::from([("QmShared".to_owned(), b"shared".to_vec())]),
+        HashMap::from([(PIN_CID_SHARED.to_owned(), b"shared".to_vec())]),
     )
 }
 
@@ -4970,7 +4988,7 @@ async fn test_pinning_automatic_put_is_async_and_eventually_pinned() {
 
     let response = signed_put_with_tagging(&harness, "happy.txt", b"happy".to_vec(), "").await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_put_cid_headers(&response, "QmTestCid");
+    assert_put_cid_headers(&response, TEST_CID);
     assert!(
         harness.provider_requests().await.is_empty(),
         "provider traffic must not be on the signed S3 response path"
@@ -4997,8 +5015,8 @@ async fn test_pinning_automatic_put_is_async_and_eventually_pinned() {
             })
             .collect::<Vec<_>>(),
         vec![
-            ("filebase-primary", "QmTestCid", "waiting"),
-            ("pinata-primary", "QmTestCid", "waiting"),
+            ("filebase-primary", TEST_CID, "waiting"),
+            ("pinata-primary", TEST_CID, "waiting"),
         ]
     );
     assert_eq!(
@@ -5038,7 +5056,7 @@ async fn test_pinning_automatic_put_is_async_and_eventually_pinned() {
         ("filebase-primary", "filebase-request-1", "/v1/ipfs/pins"),
         ("pinata-primary", "pinata-request-1", "/psa/pins"),
     ] {
-        let remote = remote_pin(&harness, provider, "QmTestCid").await;
+        let remote = remote_pin(&harness, provider, TEST_CID).await;
         assert_eq!(remote.status, "pinned");
         assert_eq!(remote.request_id.as_deref(), Some(request_id));
         assert_eq!(remote.epoch, 1);
@@ -5048,7 +5066,7 @@ async fn test_pinning_automatic_put_is_async_and_eventually_pinned() {
             .into_iter()
             .find(|request| request.path == path)
             .expect("expected PSA submit request");
-        assert_submit_request(&request, path, "QmTestCid");
+        assert_submit_request(&request, path, TEST_CID);
     }
     assert_signed_body(&harness, "happy.txt", b"happy").await;
     assert_no_kubo_pin_removes(&harness).await;
@@ -5067,7 +5085,7 @@ async fn test_pinning_manual_header_put_and_standard_tag_round_trip() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_put_cid_headers(&response, "QmTestCid");
+    assert_put_cid_headers(&response, TEST_CID);
     assert_tagging(
         &harness,
         "manual.txt",
@@ -5095,9 +5113,9 @@ async fn test_pinning_manual_header_put_and_standard_tag_round_trip() {
             targets[0].cid.as_str(),
             targets[0].state.as_str(),
         ),
-        ("pinata-primary", "QmTestCid", "waiting")
+        ("pinata-primary", TEST_CID, "waiting")
     );
-    let remote_before = remote_pin(&harness, "pinata-primary", "QmTestCid").await;
+    let remote_before = remote_pin(&harness, "pinata-primary", TEST_CID).await;
     assert_eq!(
         (
             remote_before.status.as_str(),
@@ -5145,7 +5163,7 @@ async fn test_pinning_manual_header_put_and_standard_tag_round_trip() {
     assert!(harness.provider_requests().await.is_empty());
 
     harness.run_worker_until_idle().await;
-    let remote_after = remote_pin(&harness, "pinata-primary", "QmTestCid").await;
+    let remote_after = remote_pin(&harness, "pinata-primary", TEST_CID).await;
     assert_eq!(
         (
             remote_after.status.as_str(),
@@ -5157,7 +5175,7 @@ async fn test_pinning_manual_header_put_and_standard_tag_round_trip() {
     assert_eq!(lease_targets(&harness, &manual.id).await[0].state, "pinned");
     let requests = harness.provider_requests().await;
     assert_eq!(requests.len(), 1);
-    assert_submit_request(&requests[0], "/psa/pins", "QmTestCid");
+    assert_submit_request(&requests[0], "/psa/pins", TEST_CID);
     assert_signed_body(&harness, "manual.txt", b"body").await;
     assert_no_kubo_pin_removes(&harness).await;
     harness.shutdown().await;
@@ -5167,13 +5185,13 @@ async fn test_pinning_manual_header_put_and_standard_tag_round_trip() {
 async fn test_pinning_copy_copies_or_replaces_tags_and_reuses_cid_usage() {
     let mut config = PinningHarnessConfig::request_one();
     config.kubo_script = KuboScript {
-        add_replies: vec![AddReply::Ok("QmShared")],
-        cat_bodies: HashMap::from([("QmShared".to_owned(), b"shared".to_vec())]),
+        add_replies: vec![AddReply::Ok(PIN_CID_SHARED)],
+        cat_bodies: HashMap::from([(PIN_CID_SHARED.to_owned(), b"shared".to_vec())]),
     };
     config.pinata_script = vec![PsaReply::pinned_submit(
         "/psa/pins",
         "pinata-shared-request",
-        "QmShared",
+        PIN_CID_SHARED,
     )];
     let mut harness = start_pinning_harness(config).await;
 
@@ -5185,7 +5203,7 @@ async fn test_pinning_copy_copies_or_replaces_tags_and_reuses_cid_usage() {
     )
     .await;
     assert_eq!(put.status(), StatusCode::OK);
-    assert_put_cid_headers(&put, "QmShared");
+    assert_put_cid_headers(&put, PIN_CID_SHARED);
     harness.run_worker_until_idle().await;
 
     let source = latest_pinning_object(&harness, "source.txt").await;
@@ -5215,7 +5233,7 @@ async fn test_pinning_copy_copies_or_replaces_tags_and_reuses_cid_usage() {
     let copied_xml = copied.text().await.expect("CopyObject XML");
     assert_eq!(
         xml_text(&copied_xml, "ETag").as_deref(),
-        Some("\"QmShared\"")
+        Some(format!("\"{PIN_CID_SHARED}\"").as_str())
     );
     assert!(
         xml_text(&copied_xml, "LastModified").is_some(),
@@ -5240,7 +5258,7 @@ async fn test_pinning_copy_copies_or_replaces_tags_and_reuses_cid_usage() {
     let replaced_xml = replaced.text().await.expect("CopyObject replacement XML");
     assert_eq!(
         xml_text(&replaced_xml, "ETag").as_deref(),
-        Some("\"QmShared\"")
+        Some(format!("\"{PIN_CID_SHARED}\"").as_str())
     );
     assert_tagging(
         &harness,
@@ -5253,7 +5271,7 @@ async fn test_pinning_copy_copies_or_replaces_tags_and_reuses_cid_usage() {
     for key in ["copied.txt", "replaced.txt"] {
         let object = latest_pinning_object(&harness, key).await;
         assert_ne!(object.id, source.id, "copy must have a new owner object");
-        assert_eq!(object.cid, "QmShared");
+        assert_eq!(object.cid, PIN_CID_SHARED);
         let lease = owner_leases(&harness, &object.id).await.remove(0);
         assert_eq!(
             (
@@ -5276,7 +5294,7 @@ async fn test_pinning_copy_copies_or_replaces_tags_and_reuses_cid_usage() {
                     )
                 })
                 .collect::<Vec<_>>(),
-            vec![("pinata-primary", "QmShared", "pinned")]
+            vec![("pinata-primary", PIN_CID_SHARED, "pinned")]
         );
     }
     assert_eq!(
@@ -5303,7 +5321,7 @@ async fn test_pinning_copy_copies_or_replaces_tags_and_reuses_cid_usage() {
         jobs_before_copy,
         "pinned CID reuse must not enqueue additional work"
     );
-    let remote = remote_pin(&harness, "pinata-primary", "QmShared").await;
+    let remote = remote_pin(&harness, "pinata-primary", PIN_CID_SHARED).await;
     assert_eq!(
         (
             remote.status.as_str(),
@@ -5314,7 +5332,7 @@ async fn test_pinning_copy_copies_or_replaces_tags_and_reuses_cid_usage() {
     );
     let requests = harness.provider_requests().await;
     assert_eq!(requests.len(), 1, "copies must not submit another PSA pin");
-    assert_submit_request(&requests[0], "/psa/pins", "QmShared");
+    assert_submit_request(&requests[0], "/psa/pins", PIN_CID_SHARED);
     assert_no_kubo_pin_removes(&harness).await;
     harness.shutdown().await;
 }
@@ -5353,16 +5371,16 @@ async fn test_pinning_multipart_create_tags_apply_only_to_completed_root() {
     let mut config = PinningHarnessConfig::request_one();
     config.explicit_identity = true;
     config.kubo_script = KuboScript {
-        add_replies: vec![AddReply::Ok("QmPart"), AddReply::Ok("QmRoot")],
+        add_replies: vec![AddReply::Ok(PIN_CID_PART), AddReply::Ok(PIN_CID_ROOT)],
         cat_bodies: HashMap::from([
-            ("QmPart".to_owned(), b"part-data".to_vec()),
-            ("QmRoot".to_owned(), b"part-data".to_vec()),
+            (PIN_CID_PART.to_owned(), b"part-data".to_vec()),
+            (PIN_CID_ROOT.to_owned(), b"part-data".to_vec()),
         ]),
     };
     config.pinata_script = vec![PsaReply::pinned_submit(
         "/psa/pins",
         "pinata-root-request",
-        "QmRoot",
+        PIN_CID_ROOT,
     )];
     let mut harness = start_pinning_harness(config).await;
 
@@ -5395,7 +5413,7 @@ async fn test_pinning_multipart_create_tags_apply_only_to_completed_root() {
         .expect("UploadPart ETag text")
         .trim_matches('"')
         .to_owned();
-    assert_eq!(part_etag, "QmPart");
+    assert_eq!(part_etag, PIN_CID_PART);
     assert!(
         harness.pin_leases().await.is_empty(),
         "parts have no remote leases"
@@ -5418,7 +5436,7 @@ async fn test_pinning_multipart_create_tags_apply_only_to_completed_root() {
     let complete_xml = complete.text().await.expect("CompleteMultipartUpload XML");
     assert_eq!(
         xml_text(&complete_xml, "ETag").as_deref(),
-        Some("\"QmRoot\"")
+        Some(format!("\"{PIN_CID_ROOT}\"").as_str())
     );
     assert_eq!(xml_text(&complete_xml, "Key").as_deref(), Some("root.bin"));
     assert_tagging(
@@ -5428,7 +5446,7 @@ async fn test_pinning_multipart_create_tags_apply_only_to_completed_root() {
     )
     .await;
     let root = latest_pinning_object(&harness, "root.bin").await;
-    assert_eq!(root.cid, "QmRoot");
+    assert_eq!(root.cid, PIN_CID_ROOT);
     assert!(root.multipart);
     let leases = owner_leases(&harness, &root.id).await;
     assert_eq!(leases.len(), 1);
@@ -5456,7 +5474,7 @@ async fn test_pinning_multipart_create_tags_apply_only_to_completed_root() {
             .collect::<Vec<_>>(),
         vec![(
             harness.provider_key("pinata-primary").as_str(),
-            "QmRoot",
+            PIN_CID_ROOT,
             "waiting"
         )]
     );
@@ -5467,7 +5485,7 @@ async fn test_pinning_multipart_create_tags_apply_only_to_completed_root() {
             .iter()
             .map(|job| (job.operation.as_str(), job.state.as_str(), job.cid.as_str()))
             .collect::<Vec<_>>(),
-        vec![("submit", "pending", "QmRoot")]
+        vec![("submit", "pending", PIN_CID_ROOT)]
     );
     assert_eq!(
         harness
@@ -5484,7 +5502,7 @@ async fn test_pinning_multipart_create_tags_apply_only_to_completed_root() {
     );
 
     harness.run_worker_until_idle().await;
-    let remote = remote_pin(&harness, "pinata-primary", "QmRoot").await;
+    let remote = remote_pin(&harness, "pinata-primary", PIN_CID_ROOT).await;
     assert_eq!(
         (
             remote.status.as_str(),
@@ -5496,7 +5514,7 @@ async fn test_pinning_multipart_create_tags_apply_only_to_completed_root() {
     assert_eq!(lease_targets(&harness, &manual.id).await[0].state, "pinned");
     let requests = harness.provider_requests().await;
     assert_eq!(requests.len(), 1);
-    assert_submit_request(&requests[0], "/psa/pins", "QmRoot");
+    assert_submit_request(&requests[0], "/psa/pins", PIN_CID_ROOT);
     assert_signed_body(&harness, "root.bin", b"part-data").await;
     assert_no_kubo_pin_removes(&harness).await;
     harness.shutdown().await;
@@ -5508,12 +5526,12 @@ async fn test_pinning_put_tagging_renews_idempotently_and_delete_tagging_cancels
     config.pinata_script = vec![PsaReply::pinned_submit(
         "/psa/pins",
         "pinata-renew-request",
-        "QmTestCid",
+        TEST_CID,
     )];
     config.filebase_script = vec![PsaReply::pinned_submit(
         "/v1/ipfs/pins",
         "filebase-renew-request",
-        "QmTestCid",
+        TEST_CID,
     )];
     let mut harness = start_pinning_harness(config).await;
 
@@ -5525,7 +5543,7 @@ async fn test_pinning_put_tagging_renews_idempotently_and_delete_tagging_cancels
     )
     .await;
     assert_eq!(put.status(), StatusCode::OK);
-    assert_put_cid_headers(&put, "QmTestCid");
+    assert_put_cid_headers(&put, TEST_CID);
     harness.run_worker_until_idle().await;
 
     let object = latest_pinning_object(&harness, "renew.txt").await;
@@ -5561,7 +5579,7 @@ async fn test_pinning_put_tagging_renews_idempotently_and_delete_tagging_cancels
     for provider in ["pinata-primary", "filebase-primary"] {
         remote_epochs_before_renewal.insert(
             provider,
-            remote_pin(&harness, provider, "QmTestCid").await.epoch,
+            remote_pin(&harness, provider, TEST_CID).await.epoch,
         );
     }
     assert_eq!(
@@ -5640,19 +5658,19 @@ async fn test_pinning_put_tagging_renews_idempotently_and_delete_tagging_cancels
         job.operation == "reconcile"
             && job.state == "pending"
             && job.provider == "pinata-primary"
-            && job.cid == "QmTestCid"
+            && job.cid == TEST_CID
     }));
     assert!(renewal_jobs.iter().any(|job| {
         job.operation == "reconcile"
             && job.state == "pending"
             && job.provider == "filebase-primary"
-            && job.cid == "QmTestCid"
+            && job.cid == TEST_CID
     }));
     for (provider, request_id) in [
         ("pinata-primary", "pinata-renew-request"),
         ("filebase-primary", "filebase-renew-request"),
     ] {
-        let remote = remote_pin(&harness, provider, "QmTestCid").await;
+        let remote = remote_pin(&harness, provider, TEST_CID).await;
         assert_eq!(
             (
                 remote.status.as_str(),
@@ -5765,16 +5783,16 @@ async fn test_pinning_put_tagging_reactivates_expired_lease_with_unknown_resourc
     let mut config = PinningHarnessConfig::request_one();
     config.explicit_identity = true;
     config.kubo_script = KuboScript {
-        add_replies: vec![AddReply::Ok("QmArchive"), AddReply::Ok("QmEntry")],
+        add_replies: vec![AddReply::Ok(PIN_CID_ARCHIVE), AddReply::Ok(PIN_CID_ENTRY)],
         cat_bodies: HashMap::from([
-            ("QmArchive".to_owned(), archive_bytes.clone()),
-            ("QmEntry".to_owned(), SINGLE_ENTRY_BYTES.to_vec()),
+            (PIN_CID_ARCHIVE.to_owned(), archive_bytes.clone()),
+            (PIN_CID_ENTRY.to_owned(), SINGLE_ENTRY_BYTES.to_vec()),
         ]),
     };
     config.pinata_script = vec![PsaReply::pinned_submit(
         "/psa/pins",
         "pinata-entry-request",
-        "QmEntry",
+        PIN_CID_ENTRY,
     )];
     let mut harness = start_pinning_harness(config).await;
     let pinata_key = harness.provider_key("pinata-primary");
@@ -5795,7 +5813,7 @@ async fn test_pinning_put_tagging_reactivates_expired_lease_with_unknown_resourc
     );
     assert_eq!(
         xml_text(&put_xml, "ArchiveETag").as_deref(),
-        Some("QmArchive")
+        Some(PIN_CID_ARCHIVE)
     );
 
     let archive = latest_pinning_object(&harness, "archive.zip").await;
@@ -5828,7 +5846,7 @@ async fn test_pinning_put_tagging_reactivates_expired_lease_with_unknown_resourc
         vec![(
             original_targets[0].id.as_str(),
             pinata_key.as_str(),
-            "QmEntry",
+            PIN_CID_ENTRY,
             "waiting",
         )]
     );
@@ -5839,11 +5857,11 @@ async fn test_pinning_put_tagging_reactivates_expired_lease_with_unknown_resourc
             .iter()
             .map(|job| (job.operation.as_str(), job.state.as_str(), job.cid.as_str()))
             .collect::<Vec<_>>(),
-        vec![("submit", "pending", "QmEntry")]
+        vec![("submit", "pending", PIN_CID_ENTRY)]
     );
 
     harness.run_worker_until_idle().await;
-    let submitted_remote = remote_pin(&harness, "pinata-primary", "QmEntry").await;
+    let submitted_remote = remote_pin(&harness, "pinata-primary", PIN_CID_ENTRY).await;
     assert_eq!(
         (
             submitted_remote.status.as_str(),
@@ -5855,7 +5873,7 @@ async fn test_pinning_put_tagging_reactivates_expired_lease_with_unknown_resourc
     assert_eq!(lease_targets(&harness, &manual.id).await[0].state, "pinned");
     let submit = harness.provider_requests().await;
     assert_eq!(submit.len(), 1);
-    assert_submit_request(&submit[0], "/psa/pins", "QmEntry");
+    assert_submit_request(&submit[0], "/psa/pins", PIN_CID_ENTRY);
 
     harness.advance_past_lease_expiry("archive.zip").await;
     harness.restart_worker();
@@ -5889,11 +5907,11 @@ async fn test_pinning_put_tagging_reactivates_expired_lease_with_unknown_resourc
         vec![(
             original_targets[0].id.as_str(),
             pinata_key.as_str(),
-            "QmEntry",
+            PIN_CID_ENTRY,
             "released",
         )]
     );
-    let released_remote = remote_pin(&harness, "pinata-primary", "QmEntry").await;
+    let released_remote = remote_pin(&harness, "pinata-primary", PIN_CID_ENTRY).await;
     assert_eq!(
         (
             released_remote.status.as_str(),
@@ -5904,7 +5922,7 @@ async fn test_pinning_put_tagging_reactivates_expired_lease_with_unknown_resourc
     );
     let requests_after_release = harness.provider_requests().await;
     assert_eq!(requests_after_release.len(), 1);
-    assert_unknown_psa_resource(&harness, "pinata-primary", "QmEntry", "retained").await;
+    assert_unknown_psa_resource(&harness, "pinata-primary", PIN_CID_ENTRY, "retained").await;
     assert_eq!(harness.provider_usage(&pinata_key).await.reserved_pins, 1);
     assert_no_psa_delete(&harness).await;
     let target_count_before_renewal = harness.pin_targets().await.len();
@@ -5970,7 +5988,7 @@ async fn test_pinning_put_tagging_reactivates_expired_lease_with_unknown_resourc
         ],
     )
     .await;
-    assert_unknown_psa_resource(&harness, "pinata-primary", "QmEntry", "retained").await;
+    assert_unknown_psa_resource(&harness, "pinata-primary", PIN_CID_ENTRY, "retained").await;
     assert_eq!(
         harness.provider_requests().await.len(),
         1,
@@ -5986,26 +6004,26 @@ async fn test_pinning_overwrite_and_deletes_retain_unknown_remote_leases() {
     let mut config = PinningHarnessConfig::request_one();
     config.kubo_script = KuboScript {
         add_replies: vec![
-            AddReply::Ok("QmOld"),
-            AddReply::Ok("QmNew"),
-            AddReply::Ok("QmDelete"),
-            AddReply::Ok("QmBatchA"),
-            AddReply::Ok("QmBatchB"),
+            AddReply::Ok(PIN_CID_OLD),
+            AddReply::Ok(PIN_CID_NEW),
+            AddReply::Ok(PIN_CID_DELETE),
+            AddReply::Ok(PIN_CID_BATCH_A),
+            AddReply::Ok(PIN_CID_BATCH_B),
         ],
         cat_bodies: HashMap::from([
-            ("QmOld".to_owned(), b"old".to_vec()),
-            ("QmNew".to_owned(), b"new".to_vec()),
-            ("QmDelete".to_owned(), b"delete".to_vec()),
-            ("QmBatchA".to_owned(), b"batch-a".to_vec()),
-            ("QmBatchB".to_owned(), b"batch-b".to_vec()),
+            (PIN_CID_OLD.to_owned(), b"old".to_vec()),
+            (PIN_CID_NEW.to_owned(), b"new".to_vec()),
+            (PIN_CID_DELETE.to_owned(), b"delete".to_vec()),
+            (PIN_CID_BATCH_A.to_owned(), b"batch-a".to_vec()),
+            (PIN_CID_BATCH_B.to_owned(), b"batch-b".to_vec()),
         ]),
     };
     config.pinata_script = vec![
-        PsaReply::pinned_submit("/psa/pins", "pinata-old-request", "QmOld"),
-        PsaReply::pinned_submit("/psa/pins", "pinata-new-request", "QmNew"),
-        PsaReply::pinned_submit("/psa/pins", "pinata-delete-request", "QmDelete"),
-        PsaReply::pinned_submit("/psa/pins", "pinata-batch-a-request", "QmBatchA"),
-        PsaReply::pinned_submit("/psa/pins", "pinata-batch-b-request", "QmBatchB"),
+        PsaReply::pinned_submit("/psa/pins", "pinata-old-request", PIN_CID_OLD),
+        PsaReply::pinned_submit("/psa/pins", "pinata-new-request", PIN_CID_NEW),
+        PsaReply::pinned_submit("/psa/pins", "pinata-delete-request", PIN_CID_DELETE),
+        PsaReply::pinned_submit("/psa/pins", "pinata-batch-a-request", PIN_CID_BATCH_A),
+        PsaReply::pinned_submit("/psa/pins", "pinata-batch-b-request", PIN_CID_BATCH_B),
     ];
     let mut harness = start_pinning_harness(config).await;
 
@@ -6017,7 +6035,7 @@ async fn test_pinning_overwrite_and_deletes_retain_unknown_remote_leases() {
     )
     .await;
     assert_eq!(old_put.status(), StatusCode::OK);
-    assert_put_cid_headers(&old_put, "QmOld");
+    assert_put_cid_headers(&old_put, PIN_CID_OLD);
     harness.run_worker_until_idle().await;
     let old = latest_pinning_object(&harness, "overwrite.txt").await;
     let old_lease = owner_leases(&harness, &old.id).await.remove(0);
@@ -6026,7 +6044,7 @@ async fn test_pinning_overwrite_and_deletes_retain_unknown_remote_leases() {
         "pinned"
     );
     assert_eq!(
-        remote_pin(&harness, "pinata-primary", "QmOld")
+        remote_pin(&harness, "pinata-primary", PIN_CID_OLD)
             .await
             .request_id
             .as_deref(),
@@ -6041,7 +6059,7 @@ async fn test_pinning_overwrite_and_deletes_retain_unknown_remote_leases() {
     )
     .await;
     assert_eq!(overwrite.status(), StatusCode::OK);
-    assert_put_cid_headers(&overwrite, "QmNew");
+    assert_put_cid_headers(&overwrite, PIN_CID_NEW);
     assert_tagging(
         &harness,
         "overwrite.txt",
@@ -6050,7 +6068,7 @@ async fn test_pinning_overwrite_and_deletes_retain_unknown_remote_leases() {
     .await;
     let replacement = latest_pinning_object(&harness, "overwrite.txt").await;
     assert_ne!(replacement.id, old.id);
-    assert_eq!(replacement.cid, "QmNew");
+    assert_eq!(replacement.cid, PIN_CID_NEW);
     let cancelled_old = owner_leases(&harness, &old.id).await.remove(0);
     assert_eq!(
         (
@@ -6071,7 +6089,7 @@ async fn test_pinning_overwrite_and_deletes_retain_unknown_remote_leases() {
         harness.pin_jobs().await.iter().any(|job| {
             job.operation == "unpin"
                 && job.provider == "pinata-primary"
-                && job.cid == "QmOld"
+                && job.cid == PIN_CID_OLD
                 && job.expected_remote_epoch == Some(2)
         }),
         "overwrite must enqueue remote-scoped unpin work"
@@ -6099,28 +6117,28 @@ async fn test_pinning_overwrite_and_deletes_retain_unknown_remote_leases() {
                 )
             })
             .collect::<Vec<_>>(),
-        vec![("pinata-primary", "QmNew", "pinned")]
+        vec![("pinata-primary", PIN_CID_NEW, "pinned")]
     );
     assert_eq!(
         (
-            remote_pin(&harness, "pinata-primary", "QmOld")
+            remote_pin(&harness, "pinata-primary", PIN_CID_OLD)
                 .await
                 .status
                 .as_str(),
-            remote_pin(&harness, "pinata-primary", "QmNew")
+            remote_pin(&harness, "pinata-primary", PIN_CID_NEW)
                 .await
                 .request_id
                 .as_deref(),
         ),
         ("pinned", Some("pinata-new-request"))
     );
-    assert_unknown_psa_resource(&harness, "pinata-primary", "QmOld", "retained").await;
+    assert_unknown_psa_resource(&harness, "pinata-primary", PIN_CID_OLD, "retained").await;
     assert_signed_body(&harness, "overwrite.txt", b"new").await;
 
     for (key, body, cid) in [
-        ("delete.txt", b"delete".as_slice(), "QmDelete"),
-        ("batch-a.txt", b"batch-a".as_slice(), "QmBatchA"),
-        ("batch-b.txt", b"batch-b".as_slice(), "QmBatchB"),
+        ("delete.txt", b"delete".as_slice(), PIN_CID_DELETE),
+        ("batch-a.txt", b"batch-a".as_slice(), PIN_CID_BATCH_A),
+        ("batch-b.txt", b"batch-b".as_slice(), PIN_CID_BATCH_B),
     ] {
         let response = signed_put_with_tagging(
             &harness,
@@ -6182,9 +6200,9 @@ async fn test_pinning_overwrite_and_deletes_retain_unknown_remote_leases() {
         "DeleteObjects XML: {batch_delete_xml}"
     );
     for (key, cid) in [
-        ("delete.txt", "QmDelete"),
-        ("batch-a.txt", "QmBatchA"),
-        ("batch-b.txt", "QmBatchB"),
+        ("delete.txt", PIN_CID_DELETE),
+        ("batch-a.txt", PIN_CID_BATCH_A),
+        ("batch-b.txt", PIN_CID_BATCH_B),
     ] {
         assert!(
             store::object::get_latest(harness.state.store.db(), &harness.bucket, key)
@@ -6203,7 +6221,7 @@ async fn test_pinning_overwrite_and_deletes_retain_unknown_remote_leases() {
         );
     }
     harness.run_worker_until_idle().await;
-    for cid in ["QmDelete", "QmBatchA", "QmBatchB"] {
+    for cid in [PIN_CID_DELETE, PIN_CID_BATCH_A, PIN_CID_BATCH_B] {
         let remote = remote_pin(&harness, "pinata-primary", cid).await;
         assert_eq!(
             (
@@ -6214,8 +6232,8 @@ async fn test_pinning_overwrite_and_deletes_retain_unknown_remote_leases() {
             (
                 "pinned",
                 Some(match cid {
-                    "QmDelete" => "pinata-delete-request",
-                    "QmBatchA" => "pinata-batch-a-request",
+                    PIN_CID_DELETE => "pinata-delete-request",
+                    PIN_CID_BATCH_A => "pinata-batch-a-request",
                     _ => "pinata-batch-b-request",
                 }),
                 2
@@ -6270,12 +6288,12 @@ async fn test_pinning_worker_recovers_expired_claim_and_adopts_ambiguous_submit(
     let mut config = PinningHarnessConfig::request_one();
     config.policies[0].provider_mode = "all".to_owned();
     let mut failed_find =
-        PsaReply::find_for_job("/psa/pins", "accepted-request", "QmTestCid", "pinned");
+        PsaReply::find_for_job("/psa/pins", "accepted-request", TEST_CID, "pinned");
     failed_find.status = StatusCode::INTERNAL_SERVER_ERROR.as_u16();
     config.pinata_script = vec![
-        PsaReply::pinned_submit("/psa/pins", "accepted-request", "QmTestCid"),
+        PsaReply::pinned_submit("/psa/pins", "accepted-request", TEST_CID),
         failed_find,
-        PsaReply::find_for_job("/psa/pins", "accepted-request", "QmTestCid", "pinned"),
+        PsaReply::find_for_job("/psa/pins", "accepted-request", TEST_CID, "pinned"),
     ];
     let mut harness = start_pinning_harness(config).await;
 
@@ -6294,7 +6312,7 @@ async fn test_pinning_worker_recovers_expired_claim_and_adopts_ambiguous_submit(
     let post = harness
         .wait_for_provider_request("pinata-primary", http::Method::POST, "/psa/pins", 1)
         .await;
-    assert_submit_request_for_job(&post, "/psa/pins", "QmTestCid", &submit);
+    assert_submit_request_for_job(&post, "/psa/pins", TEST_CID, &submit);
 
     harness.stop_worker_without_unlocking().await;
     submit_block.release();
@@ -6321,7 +6339,7 @@ async fn test_pinning_worker_recovers_expired_claim_and_adopts_ambiguous_submit(
     assert_find_request_for_job(
         &failed_find,
         "/psa/pins",
-        "QmTestCid",
+        TEST_CID,
         &captured_submit_correlation(&harness, &submit.id).await,
     );
     assert!(
@@ -6345,7 +6363,7 @@ async fn test_pinning_worker_recovers_expired_claim_and_adopts_ambiguous_submit(
     assert_find_request_for_job(
         &adopted_find,
         "/psa/pins",
-        "QmTestCid",
+        TEST_CID,
         &captured_submit_correlation(&harness, &submit.id).await,
     );
     assert!(failed_find.sequence < adopted_find.sequence);
@@ -6353,7 +6371,7 @@ async fn test_pinning_worker_recovers_expired_claim_and_adopts_ambiguous_submit(
     harness.stop_worker_without_unlocking().await;
 
     assert_eq!(recovered.submit_phase.as_deref(), Some("recovering"));
-    let remote = remote_pin(&harness, "pinata-primary", "QmTestCid").await;
+    let remote = remote_pin(&harness, "pinata-primary", TEST_CID).await;
     assert_eq!(
         (
             remote.status.as_str(),
@@ -6388,8 +6406,8 @@ async fn test_pinning_worker_recovers_expired_claim_and_adopts_ambiguous_submit(
 async fn test_pinning_reclaimed_submit_with_cancelled_target_retains_unknown_remote() {
     let mut config = PinningHarnessConfig::request_one();
     config.pinata_script = vec![
-        PsaReply::pinned_submit("/psa/pins", "cancelled-request", "QmTestCid"),
-        PsaReply::find_for_job("/psa/pins", "cancelled-request", "QmTestCid", "pinned"),
+        PsaReply::pinned_submit("/psa/pins", "cancelled-request", TEST_CID),
+        PsaReply::find_for_job("/psa/pins", "cancelled-request", TEST_CID, "pinned"),
     ];
     let mut harness = start_pinning_harness(config).await;
 
@@ -6408,7 +6426,7 @@ async fn test_pinning_reclaimed_submit_with_cancelled_target_retains_unknown_rem
     let post = harness
         .wait_for_provider_request("pinata-primary", http::Method::POST, "/psa/pins", 1)
         .await;
-    assert_submit_request_for_job(&post, "/psa/pins", "QmTestCid", &submit);
+    assert_submit_request_for_job(&post, "/psa/pins", TEST_CID, &submit);
     harness.stop_worker_without_unlocking().await;
     submit_block.release();
 
@@ -6437,7 +6455,7 @@ async fn test_pinning_reclaimed_submit_with_cancelled_target_retains_unknown_rem
     assert_find_request_for_job(
         &find,
         "/psa/pins",
-        "QmTestCid",
+        TEST_CID,
         &captured_submit_correlation(&harness, &submit.id).await,
     );
     assert!(
@@ -6446,14 +6464,14 @@ async fn test_pinning_reclaimed_submit_with_cancelled_target_retains_unknown_rem
     );
     harness.wait_for_job_state(&submit.id, "done").await;
     harness.stop_worker_without_unlocking().await;
-    let adopted = remote_pin(&harness, "pinata-primary", "QmTestCid").await;
+    let adopted = remote_pin(&harness, "pinata-primary", TEST_CID).await;
     assert_eq!(
         (adopted.status.as_str(), adopted.request_id.as_deref()),
         ("pinned", Some("cancelled-request"))
     );
 
     harness
-        .run_current_reconcile("pinata-primary", "QmTestCid")
+        .run_current_reconcile("pinata-primary", TEST_CID)
         .await;
     let unpin = harness
         .pin_jobs()
@@ -6463,12 +6481,12 @@ async fn test_pinning_reclaimed_submit_with_cancelled_target_retains_unknown_rem
         .expect("cancellation publishes a fenced Unpin");
     assert_eq!(unpin.state, "done");
 
-    let retained = remote_pin(&harness, "pinata-primary", "QmTestCid").await;
+    let retained = remote_pin(&harness, "pinata-primary", TEST_CID).await;
     assert_eq!(
         (retained.status.as_str(), retained.request_id.as_deref()),
         ("pinned", Some("cancelled-request"))
     );
-    assert_unknown_psa_resource(&harness, "pinata-primary", "QmTestCid", "retained").await;
+    assert_unknown_psa_resource(&harness, "pinata-primary", TEST_CID, "retained").await;
     assert_eq!(
         harness
             .provider_usages()
@@ -6503,8 +6521,8 @@ async fn test_pinning_reclaimed_submit_with_cancelled_target_retains_unknown_rem
 async fn test_pinning_recovery_find_none_with_no_desired_target_never_posts() {
     let mut config = PinningHarnessConfig::request_one();
     config.pinata_script = vec![
-        PsaReply::pinned_submit("/psa/pins", "lost-request", "QmTestCid"),
-        PsaReply::find_none_for_job("/psa/pins", "QmTestCid"),
+        PsaReply::pinned_submit("/psa/pins", "lost-request", TEST_CID),
+        PsaReply::find_none_for_job("/psa/pins", TEST_CID),
     ];
     let mut harness = start_pinning_harness(config).await;
 
@@ -6523,7 +6541,7 @@ async fn test_pinning_recovery_find_none_with_no_desired_target_never_posts() {
     let post = harness
         .wait_for_provider_request("pinata-primary", http::Method::POST, "/psa/pins", 1)
         .await;
-    assert_submit_request_for_job(&post, "/psa/pins", "QmTestCid", &submit);
+    assert_submit_request_for_job(&post, "/psa/pins", TEST_CID, &submit);
     harness.stop_worker_without_unlocking().await;
     submit_block.release();
 
@@ -6542,7 +6560,7 @@ async fn test_pinning_recovery_find_none_with_no_desired_target_never_posts() {
     assert_find_request_for_job(
         &find,
         "/psa/pins",
-        "QmTestCid",
+        TEST_CID,
         &captured_submit_correlation(&harness, &submit.id).await,
     );
     assert!(
@@ -6558,9 +6576,9 @@ async fn test_pinning_recovery_find_none_with_no_desired_target_never_posts() {
     );
 
     harness
-        .run_current_reconcile("pinata-primary", "QmTestCid")
+        .run_current_reconcile("pinata-primary", TEST_CID)
         .await;
-    let remote = remote_pin(&harness, "pinata-primary", "QmTestCid").await;
+    let remote = remote_pin(&harness, "pinata-primary", TEST_CID).await;
     assert_eq!(
         (remote.status.as_str(), remote.request_id.as_deref()),
         ("absent", None)
@@ -6608,8 +6626,8 @@ async fn test_pinning_recovery_find_none_with_no_desired_target_never_posts() {
 async fn test_pinning_running_submit_blocks_quota_release_then_retains_unknown_remote() {
     let mut config = PinningHarnessConfig::request_one();
     config.pinata_script = vec![
-        PsaReply::pinned_submit("/psa/pins", "live-lock-request", "QmTestCid"),
-        PsaReply::find_for_job("/psa/pins", "live-lock-request", "QmTestCid", "pinned"),
+        PsaReply::pinned_submit("/psa/pins", "live-lock-request", TEST_CID),
+        PsaReply::find_for_job("/psa/pins", "live-lock-request", TEST_CID, "pinned"),
     ];
     let mut harness = start_pinning_harness(config).await;
 
@@ -6628,7 +6646,7 @@ async fn test_pinning_running_submit_blocks_quota_release_then_retains_unknown_r
     let post = harness
         .wait_for_provider_request("pinata-primary", http::Method::POST, "/psa/pins", 1)
         .await;
-    assert_submit_request_for_job(&post, "/psa/pins", "QmTestCid", &submit);
+    assert_submit_request_for_job(&post, "/psa/pins", TEST_CID, &submit);
 
     let cancel = signed_delete_object_tagging(&harness, "live-lock.txt").await;
     assert_eq!(cancel.status(), StatusCode::NO_CONTENT);
@@ -6657,9 +6675,9 @@ async fn test_pinning_running_submit_blocks_quota_release_then_retains_unknown_r
     harness.stop_worker_without_unlocking().await;
 
     harness
-        .run_current_reconcile("pinata-primary", "QmTestCid")
+        .run_current_reconcile("pinata-primary", TEST_CID)
         .await;
-    let retained = remote_pin(&harness, "pinata-primary", "QmTestCid").await;
+    let retained = remote_pin(&harness, "pinata-primary", TEST_CID).await;
     assert_eq!(
         (retained.status.as_str(), retained.request_id.as_deref()),
         ("reserved", None),
@@ -6694,7 +6712,7 @@ async fn test_pinning_running_submit_blocks_quota_release_then_retains_unknown_r
     assert_find_request_for_job(
         &find,
         "/psa/pins",
-        "QmTestCid",
+        TEST_CID,
         &captured_submit_correlation(&harness, &submit.id).await,
     );
     assert!(post.sequence < find.sequence);
@@ -6702,7 +6720,7 @@ async fn test_pinning_running_submit_blocks_quota_release_then_retains_unknown_r
     harness.stop_worker_without_unlocking().await;
 
     harness
-        .run_current_reconcile("pinata-primary", "QmTestCid")
+        .run_current_reconcile("pinata-primary", TEST_CID)
         .await;
     let unpin = harness
         .pin_jobs()
@@ -6712,12 +6730,12 @@ async fn test_pinning_running_submit_blocks_quota_release_then_retains_unknown_r
         .expect("cancelled remote retains a fenced Unpin");
     assert_eq!(unpin.state, "done");
 
-    let retained = remote_pin(&harness, "pinata-primary", "QmTestCid").await;
+    let retained = remote_pin(&harness, "pinata-primary", TEST_CID).await;
     assert_eq!(
         (retained.status.as_str(), retained.request_id.as_deref()),
         ("pinned", Some("live-lock-request"))
     );
-    assert_unknown_psa_resource(&harness, "pinata-primary", "QmTestCid", "retained").await;
+    assert_unknown_psa_resource(&harness, "pinata-primary", TEST_CID, "retained").await;
     assert_eq!(
         harness
             .provider_usages()
@@ -6752,19 +6770,14 @@ async fn test_pinning_running_submit_blocks_quota_release_then_retains_unknown_r
 async fn test_pinning_poll_reschedules_one_stable_job_until_pinned() {
     let mut config = PinningHarnessConfig::request_one();
     config.pinata_script = vec![
-        PsaReply::submit_status("/psa/pins", "poll-request", "QmTestCid", "queued"),
+        PsaReply::submit_status("/psa/pins", "poll-request", TEST_CID, "queued"),
         PsaReply::pin_status(
             "/psa/pins/poll-request",
             "poll-request",
-            "QmTestCid",
+            TEST_CID,
             "pinning",
         ),
-        PsaReply::pin_status(
-            "/psa/pins/poll-request",
-            "poll-request",
-            "QmTestCid",
-            "pinned",
-        ),
+        PsaReply::pin_status("/psa/pins/poll-request", "poll-request", TEST_CID, "pinned"),
     ];
     let mut harness = start_pinning_harness(config).await;
 
@@ -6787,7 +6800,7 @@ async fn test_pinning_poll_reschedules_one_stable_job_until_pinned() {
     assert_submit_request_for_job(
         &harness.provider_requests().await[0],
         "/psa/pins",
-        "QmTestCid",
+        TEST_CID,
         &submit,
     );
 
@@ -6801,7 +6814,7 @@ async fn test_pinning_poll_reschedules_one_stable_job_until_pinned() {
     );
     assert_eq!(after_first_get.id, poll.id);
     assert_eq!(
-        remote_pin(&harness, "pinata-primary", "QmTestCid")
+        remote_pin(&harness, "pinata-primary", TEST_CID)
             .await
             .status,
         "pinning"
@@ -6816,7 +6829,7 @@ async fn test_pinning_poll_reschedules_one_stable_job_until_pinned() {
     );
     assert_eq!(finished_poll.id, poll.id);
     assert_eq!(
-        remote_pin(&harness, "pinata-primary", "QmTestCid")
+        remote_pin(&harness, "pinata-primary", TEST_CID)
             .await
             .status,
         "pinned"
@@ -6858,7 +6871,7 @@ async fn test_pinning_shared_remote_projects_automatic_manual_and_copy_targets()
     config.pinata_script = vec![PsaReply::pinned_submit(
         "/psa/pins",
         "shared-request",
-        "QmShared",
+        PIN_CID_SHARED,
     )];
     config.filebase_script.clear();
     let mut harness = start_pinning_harness(config).await;
@@ -6871,12 +6884,12 @@ async fn test_pinning_shared_remote_projects_automatic_manual_and_copy_targets()
     )
     .await;
     assert_eq!(put.status(), StatusCode::OK);
-    assert_put_cid_headers(&put, "QmShared");
+    assert_put_cid_headers(&put, PIN_CID_SHARED);
     let copied = signed_copy(&harness, "shared.txt", "copy.txt", HeaderMap::new()).await;
     assert_eq!(copied.status(), StatusCode::OK);
     assert_eq!(
         xml_text(&copied.text().await.expect("CopyObject XML"), "ETag").as_deref(),
-        Some("\"QmShared\"")
+        Some(format!("\"{PIN_CID_SHARED}\"").as_str())
     );
     assert!(harness.provider_requests().await.is_empty());
 
@@ -6916,7 +6929,7 @@ async fn test_pinning_shared_remote_projects_automatic_manual_and_copy_targets()
     harness.run_worker_until_idle().await;
     let requests = harness.provider_requests().await;
     assert_eq!(requests.len(), 1, "all shared targets use one PSA Submit");
-    assert_submit_request(&requests[0], "/psa/pins", "QmShared");
+    assert_submit_request(&requests[0], "/psa/pins", PIN_CID_SHARED);
     for key in ["shared.txt", "copy.txt"] {
         assert_eq!(
             harness.target_states(key).await,
@@ -6934,7 +6947,7 @@ async fn test_pinning_shared_remote_projects_automatic_manual_and_copy_targets()
     assert_eq!(later.status(), StatusCode::OK);
     assert_eq!(
         xml_text(&later.text().await.expect("later CopyObject XML"), "ETag").as_deref(),
-        Some("\"QmShared\"")
+        Some(format!("\"{PIN_CID_SHARED}\"").as_str())
     );
     assert_eq!(
         harness.target_states("later-copy.txt").await,
@@ -6970,18 +6983,18 @@ async fn test_pinning_shared_terminal_failure_coordinates_each_lease() {
         3,
     );
     config.pinata_script = vec![
-        PsaReply::submit_status("/psa/pins", "shared-failed", "QmShared", "queued"),
+        PsaReply::submit_status("/psa/pins", "shared-failed", PIN_CID_SHARED, "queued"),
         PsaReply::pin_status(
             "/psa/pins/shared-failed",
             "shared-failed",
-            "QmShared",
+            PIN_CID_SHARED,
             "failed",
         ),
     ];
     config.filebase_script = vec![PsaReply::submit_status(
         "/v1/ipfs/pins",
         "fallback-queued",
-        "QmShared",
+        PIN_CID_SHARED,
         "queued",
     )];
     let mut harness = start_pinning_harness(config).await;
@@ -7005,7 +7018,7 @@ async fn test_pinning_shared_terminal_failure_coordinates_each_lease() {
     harness.stop_worker_without_unlocking().await;
     fallback_block.release();
 
-    let failed = remote_pin(&harness, "pinata-primary", "QmShared").await;
+    let failed = remote_pin(&harness, "pinata-primary", PIN_CID_SHARED).await;
     assert_eq!(
         (
             failed.status.as_str(),
@@ -7094,13 +7107,18 @@ async fn test_pinning_failed_all_unknown_remote_retains_request_without_resubmis
         3,
     );
     config.pinata_script = vec![
-        PsaReply::submit_status("/psa/pins", "failed-all", "QmShared", "queued"),
-        PsaReply::pin_status("/psa/pins/failed-all", "failed-all", "QmShared", "failed"),
+        PsaReply::submit_status("/psa/pins", "failed-all", PIN_CID_SHARED, "queued"),
+        PsaReply::pin_status(
+            "/psa/pins/failed-all",
+            "failed-all",
+            PIN_CID_SHARED,
+            "failed",
+        ),
     ];
     config.filebase_script = vec![PsaReply::pinned_submit(
         "/v1/ipfs/pins",
         "one-fallback",
-        "QmShared",
+        PIN_CID_SHARED,
     )];
     let mut harness = start_pinning_harness(config).await;
 
@@ -7131,7 +7149,7 @@ async fn test_pinning_failed_all_unknown_remote_retains_request_without_resubmis
     harness.wait_for_job_state(&fallback_job_id, "done").await;
     harness.stop_worker_without_unlocking().await;
 
-    let failed = remote_pin(&harness, "pinata-primary", "QmShared").await;
+    let failed = remote_pin(&harness, "pinata-primary", PIN_CID_SHARED).await;
     assert_eq!(
         (failed.status.as_str(), failed.failure_attempts),
         ("failed", 1)
@@ -7145,13 +7163,13 @@ async fn test_pinning_failed_all_unknown_remote_retains_request_without_resubmis
     );
 
     harness
-        .advance_remote_retry_due("pinata-primary", "QmShared")
+        .advance_remote_retry_due("pinata-primary", PIN_CID_SHARED)
         .await;
     harness
-        .run_current_reconcile("pinata-primary", "QmShared")
+        .run_current_reconcile("pinata-primary", PIN_CID_SHARED)
         .await;
 
-    let retained = remote_pin(&harness, "pinata-primary", "QmShared").await;
+    let retained = remote_pin(&harness, "pinata-primary", PIN_CID_SHARED).await;
     assert_eq!(
         (
             retained.status.as_str(),
@@ -7162,7 +7180,7 @@ async fn test_pinning_failed_all_unknown_remote_retains_request_without_resubmis
         "an unowned failed request cannot be deleted to permit a replacement Submit"
     );
     assert_eq!(retained.failure_attempts, 1);
-    assert_unknown_psa_resource(&harness, "pinata-primary", "QmShared", "retained").await;
+    assert_unknown_psa_resource(&harness, "pinata-primary", PIN_CID_SHARED, "retained").await;
     assert_eq!(
         harness.provider_usages().await[0].reserved_pins,
         1,
@@ -7217,11 +7235,11 @@ async fn test_pinning_failed_unknown_remote_stops_without_delete_or_retry_spin()
     config.policies[0].provider_mode = "all".to_owned();
     config.kubo_script = repeated_shared_kubo(1);
     config.pinata_script = vec![
-        PsaReply::submit_status("/psa/pins", "failed-cycle-1", "QmShared", "queued"),
+        PsaReply::submit_status("/psa/pins", "failed-cycle-1", PIN_CID_SHARED, "queued"),
         PsaReply::pin_status(
             "/psa/pins/failed-cycle-1",
             "failed-cycle-1",
-            "QmShared",
+            PIN_CID_SHARED,
             "failed",
         ),
     ];
@@ -7245,7 +7263,7 @@ async fn test_pinning_failed_unknown_remote_stops_without_delete_or_retry_spin()
         .expect("failed request has one pending Poll");
     harness.advance_job_due(&poll.id).await;
     harness.run_worker_until_idle().await;
-    let failed = remote_pin(&harness, "pinata-primary", "QmShared").await;
+    let failed = remote_pin(&harness, "pinata-primary", PIN_CID_SHARED).await;
     assert_eq!(
         (
             failed.status.as_str(),
@@ -7256,20 +7274,20 @@ async fn test_pinning_failed_unknown_remote_stops_without_delete_or_retry_spin()
     );
     assert!(failed.next_retry_at.is_some());
     harness
-        .run_current_reconcile("pinata-primary", "QmShared")
+        .run_current_reconcile("pinata-primary", PIN_CID_SHARED)
         .await;
     harness
-        .advance_remote_retry_due("pinata-primary", "QmShared")
+        .advance_remote_retry_due("pinata-primary", PIN_CID_SHARED)
         .await;
     harness
-        .run_current_reconcile("pinata-primary", "QmShared")
+        .run_current_reconcile("pinata-primary", PIN_CID_SHARED)
         .await;
-    let retained = remote_pin(&harness, "pinata-primary", "QmShared").await;
+    let retained = remote_pin(&harness, "pinata-primary", PIN_CID_SHARED).await;
     assert_eq!(
         (retained.request_id.as_deref(), retained.failure_attempts),
         (Some("failed-cycle-1"), 1)
     );
-    assert_unknown_psa_resource(&harness, "pinata-primary", "QmShared", "retained").await;
+    assert_unknown_psa_resource(&harness, "pinata-primary", PIN_CID_SHARED, "retained").await;
     assert_eq!(
         harness.target_states("eight.txt").await,
         vec![("pinata-primary".to_owned(), "degraded".to_owned())]
@@ -7310,7 +7328,7 @@ async fn test_pinning_failed_unknown_remote_stops_without_delete_or_retry_spin()
     )
     .await;
     assert_eq!(equal.status(), StatusCode::OK);
-    let equal_remote = remote_pin(&harness, "pinata-primary", "QmShared").await;
+    let equal_remote = remote_pin(&harness, "pinata-primary", PIN_CID_SHARED).await;
     assert_eq!(
         (equal_remote.failure_attempts, equal_remote.next_retry_at),
         (1, retained.next_retry_at),
@@ -7328,7 +7346,7 @@ async fn test_pinning_failed_unknown_remote_stops_without_delete_or_retry_spin()
     )
     .await;
     assert_eq!(extended.status(), StatusCode::OK);
-    let reset_by_extension = remote_pin(&harness, "pinata-primary", "QmShared").await;
+    let reset_by_extension = remote_pin(&harness, "pinata-primary", PIN_CID_SHARED).await;
     assert_eq!(
         reset_by_extension.failure_attempts, 0,
         "generation-advancing extension resets failed retry state"
@@ -7345,9 +7363,9 @@ async fn test_pinning_failed_unknown_remote_stops_without_delete_or_retry_spin()
     assert_eq!(copied.status(), StatusCode::OK);
     assert_eq!(
         xml_text(&copied.text().await.expect("CopyObject XML"), "ETag").as_deref(),
-        Some("\"QmShared\"")
+        Some(format!("\"{PIN_CID_SHARED}\"").as_str())
     );
-    let reset_by_target = remote_pin(&harness, "pinata-primary", "QmShared").await;
+    let reset_by_target = remote_pin(&harness, "pinata-primary", PIN_CID_SHARED).await;
     assert_eq!(
         reset_by_target.failure_attempts, 0,
         "a new shared target also keeps the retry reset"
@@ -7372,7 +7390,7 @@ async fn test_pinning_stale_poll_owner_hands_off_without_duplicate_post() {
     config.pinata_script = vec![PsaReply::submit_status(
         "/psa/pins",
         "handoff-request",
-        "QmShared",
+        PIN_CID_SHARED,
         "queued",
     )];
     let mut harness = start_pinning_harness(config).await;
@@ -7408,14 +7426,14 @@ async fn test_pinning_stale_poll_owner_hands_off_without_duplicate_post() {
         lease_targets(&harness, &first_lease.id).await[0].state,
         "released"
     );
-    let remote_after_cancel = remote_pin(&harness, "pinata-primary", "QmShared").await;
+    let remote_after_cancel = remote_pin(&harness, "pinata-primary", PIN_CID_SHARED).await;
     assert_eq!(
         remote_after_cancel.epoch, 3,
         "cancelling the old Poll owner advances its remote epoch"
     );
 
     harness
-        .run_current_reconcile("pinata-primary", "QmShared")
+        .run_current_reconcile("pinata-primary", PIN_CID_SHARED)
         .await;
     let handoff_poll = harness
         .pin_jobs()
@@ -7440,7 +7458,7 @@ async fn test_pinning_stale_poll_owner_hands_off_without_duplicate_post() {
     assert_submit_request(
         &harness.provider_requests().await[0],
         "/psa/pins",
-        "QmShared",
+        PIN_CID_SHARED,
     );
     assert_signed_body(&harness, "first.txt", b"shared").await;
     assert_signed_body(&harness, "second.txt", b"shared").await;
@@ -7455,7 +7473,7 @@ async fn test_pinning_stale_remote_epoch_parks_unowned_unpin_without_delete() {
     config.pinata_script = vec![PsaReply::pinned_submit(
         "/psa/pins",
         "epoch-pinned",
-        "QmShared",
+        PIN_CID_SHARED,
     )];
     let mut harness = start_pinning_harness(config).await;
 
@@ -7494,7 +7512,7 @@ async fn test_pinning_stale_remote_epoch_parks_unowned_unpin_without_delete() {
     .await;
     assert_eq!(second_renewal.status(), StatusCode::OK);
     assert_eq!(
-        remote_pin(&harness, "pinata-primary", "QmShared")
+        remote_pin(&harness, "pinata-primary", PIN_CID_SHARED)
             .await
             .epoch,
         3
@@ -7509,7 +7527,7 @@ async fn test_pinning_stale_remote_epoch_parks_unowned_unpin_without_delete() {
         .find(|job| job.operation == "unpin" && job.expected_remote_epoch == Some(4))
         .expect("cancellation publishes the epoch-four Unpin");
     assert_eq!(
-        remote_pin(&harness, "pinata-primary", "QmShared")
+        remote_pin(&harness, "pinata-primary", PIN_CID_SHARED)
             .await
             .epoch,
         4
@@ -7525,11 +7543,11 @@ async fn test_pinning_stale_remote_epoch_parks_unowned_unpin_without_delete() {
     assert_eq!(copied.status(), StatusCode::OK);
     assert_eq!(
         xml_text(&copied.text().await.expect("CopyObject XML"), "ETag").as_deref(),
-        Some("\"QmShared\"")
+        Some(format!("\"{PIN_CID_SHARED}\"").as_str())
     );
-    let current = remote_pin(&harness, "pinata-primary", "QmShared").await;
+    let current = remote_pin(&harness, "pinata-primary", PIN_CID_SHARED).await;
     assert_eq!((current.epoch, current.status.as_str()), (5, "pinned"));
-    assert_unknown_psa_resource(&harness, "pinata-primary", "QmShared", "confirmed").await;
+    assert_unknown_psa_resource(&harness, "pinata-primary", PIN_CID_SHARED, "confirmed").await;
 
     harness.restart_worker();
     let parked = harness.wait_for_job_attention(&unpin.id).await;
@@ -7540,7 +7558,7 @@ async fn test_pinning_stale_remote_epoch_parks_unowned_unpin_without_delete() {
         "old Unpin is durably parked for attention rather than reaching provider I/O"
     );
     assert_eq!(
-        remote_pin(&harness, "pinata-primary", "QmShared")
+        remote_pin(&harness, "pinata-primary", PIN_CID_SHARED)
             .await
             .epoch,
         5
@@ -7552,7 +7570,7 @@ async fn test_pinning_stale_remote_epoch_parks_unowned_unpin_without_delete() {
     let ledger = store::pinning::ledger::get(
         harness.state.store.db(),
         &harness.provider_key("pinata-primary"),
-        "QmShared",
+        PIN_CID_SHARED,
     )
     .await
     .expect("load parked resource ledger")
@@ -7605,7 +7623,7 @@ async fn test_pinning_one_mode_failover_retains_unknown_primary_without_duplicat
         1,
     );
     config.pinata_script = vec![
-        PsaReply::submit_status("/psa/pins", "sticky-primary", "QmShared", "queued"),
+        PsaReply::submit_status("/psa/pins", "sticky-primary", PIN_CID_SHARED, "queued"),
         PsaReply::empty(
             http::Method::GET,
             "/psa/pins/sticky-primary",
@@ -7614,14 +7632,14 @@ async fn test_pinning_one_mode_failover_retains_unknown_primary_without_duplicat
         PsaReply::pin_status(
             "/psa/pins/sticky-primary",
             "sticky-primary",
-            "QmShared",
+            PIN_CID_SHARED,
             "failed",
         ),
     ];
     config.filebase_script = vec![PsaReply::pinned_submit(
         "/v1/ipfs/pins",
         "sticky-secondary",
-        "QmShared",
+        PIN_CID_SHARED,
     )];
     let mut harness = start_pinning_harness(config).await;
 
@@ -7712,18 +7730,18 @@ async fn test_pinning_one_mode_failover_retains_unknown_primary_without_duplicat
     );
     assert_eq!(
         (
-            remote_pin(&harness, "filebase-primary", "QmShared")
+            remote_pin(&harness, "filebase-primary", PIN_CID_SHARED)
                 .await
                 .status
                 .as_str(),
-            remote_pin(&harness, "pinata-primary", "QmShared")
+            remote_pin(&harness, "pinata-primary", PIN_CID_SHARED)
                 .await
                 .status
                 .as_str()
         ),
         ("pinned", "failed")
     );
-    assert_unknown_psa_resource(&harness, "pinata-primary", "QmShared", "unknown").await;
+    assert_unknown_psa_resource(&harness, "pinata-primary", PIN_CID_SHARED, "unknown").await;
     assert_eq!(
         harness
             .pinata_requests()
@@ -7762,7 +7780,7 @@ async fn test_pinning_all_mode_partial_success_keeps_retrying_degraded_provider(
     config.pinata_script = vec![PsaReply::pinned_submit(
         "/psa/pins",
         "partial-pinata",
-        "QmTestCid",
+        TEST_CID,
     )];
     config.filebase_script = vec![
         PsaReply::empty(
@@ -7770,7 +7788,7 @@ async fn test_pinning_all_mode_partial_success_keeps_retrying_degraded_provider(
             "/v1/ipfs/pins",
             StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
         ),
-        PsaReply::find_none_for_job("/v1/ipfs/pins", "QmTestCid"),
+        PsaReply::find_none_for_job("/v1/ipfs/pins", TEST_CID),
     ];
     let mut harness = start_pinning_harness(config).await;
 
@@ -7786,8 +7804,8 @@ async fn test_pinning_all_mode_partial_success_keeps_retrying_degraded_provider(
         ],
         "all-mode remains available through Pinata while Filebase is visibly degraded"
     );
-    let pinata = remote_pin(&harness, "pinata-primary", "QmTestCid").await;
-    let filebase = remote_pin(&harness, "filebase-primary", "QmTestCid").await;
+    let pinata = remote_pin(&harness, "pinata-primary", TEST_CID).await;
+    let filebase = remote_pin(&harness, "filebase-primary", TEST_CID).await;
     assert_eq!(
         (pinata.status.as_str(), filebase.status.as_str()),
         ("pinned", "reserved")
@@ -7803,12 +7821,12 @@ async fn test_pinning_all_mode_partial_success_keeps_retrying_degraded_provider(
     assert!(retry.next_attempt_at > Utc::now());
     let requests = harness.provider_requests().await;
     assert_eq!(requests.len(), 3);
-    assert_submit_request(&requests[0], "/psa/pins", "QmTestCid");
-    assert_submit_request(&requests[1], "/v1/ipfs/pins", "QmTestCid");
+    assert_submit_request(&requests[0], "/psa/pins", TEST_CID);
+    assert_submit_request(&requests[1], "/v1/ipfs/pins", TEST_CID);
     assert_find_request_for_job(
         &requests[2],
         "/v1/ipfs/pins",
-        "QmTestCid",
+        TEST_CID,
         &captured_submit_correlation(&harness, &retry.id).await,
     );
     assert_signed_body(&harness, "partial.txt", b"happy").await;
@@ -7823,25 +7841,25 @@ async fn test_pinning_quota_keeps_oldest_unknown_cid_reserved_after_eviction() {
     config.providers[0].max_pins = 2;
     config.kubo_script = KuboScript {
         add_replies: vec![
-            AddReply::Ok("QmOld"),
-            AddReply::Ok("QmNewer"),
-            AddReply::Ok("QmIncoming"),
+            AddReply::Ok(PIN_CID_OLD),
+            AddReply::Ok(PIN_CID_NEWER),
+            AddReply::Ok(PIN_CID_INCOMING),
         ],
         cat_bodies: HashMap::from([
-            ("QmOld".to_owned(), b"old".to_vec()),
-            ("QmNewer".to_owned(), b"new".to_vec()),
-            ("QmIncoming".to_owned(), b"in!".to_vec()),
+            (PIN_CID_OLD.to_owned(), b"old".to_vec()),
+            (PIN_CID_NEWER.to_owned(), b"new".to_vec()),
+            (PIN_CID_INCOMING.to_owned(), b"in!".to_vec()),
         ]),
     };
     config.pinata_script = vec![
-        PsaReply::pinned_submit("/psa/pins", "old-request", "QmOld"),
-        PsaReply::pinned_submit("/psa/pins", "newer-request", "QmNewer"),
+        PsaReply::pinned_submit("/psa/pins", "old-request", PIN_CID_OLD),
+        PsaReply::pinned_submit("/psa/pins", "newer-request", PIN_CID_NEWER),
     ];
     let mut harness = start_pinning_harness(config).await;
 
     for (key, body, cid) in [
-        ("old.txt", b"old".as_slice(), "QmOld"),
-        ("newer.txt", b"new".as_slice(), "QmNewer"),
+        ("old.txt", b"old".as_slice(), PIN_CID_OLD),
+        ("newer.txt", b"new".as_slice(), PIN_CID_NEWER),
     ] {
         let put = signed_put_with_tagging(&harness, key, body.to_vec(), "ipfs-s3%3Apin=true").await;
         assert_eq!(put.status(), StatusCode::OK, "PUT {key}");
@@ -7876,7 +7894,7 @@ async fn test_pinning_quota_keeps_oldest_unknown_cid_reserved_after_eviction() {
     )
     .await;
     assert_eq!(incoming.status(), StatusCode::OK);
-    assert_put_cid_headers(&incoming, "QmIncoming");
+    assert_put_cid_headers(&incoming, PIN_CID_INCOMING);
     assert_eq!(
         harness.target_states("incoming.txt").await,
         vec![("pinata-primary".to_owned(), "quota_waiting".to_owned())]
@@ -7911,7 +7929,9 @@ async fn test_pinning_quota_keeps_oldest_unknown_cid_reserved_after_eviction() {
     );
 
     assert_eq!(
-        remote_pin(&harness, "pinata-primary", "QmOld").await.status,
+        remote_pin(&harness, "pinata-primary", PIN_CID_OLD)
+            .await
+            .status,
         "pinned"
     );
     assert_eq!(
@@ -7919,7 +7939,7 @@ async fn test_pinning_quota_keeps_oldest_unknown_cid_reserved_after_eviction() {
         2,
         "no capacity for incoming CID"
     );
-    assert_unknown_psa_resource(&harness, "pinata-primary", "QmOld", "retained").await;
+    assert_unknown_psa_resource(&harness, "pinata-primary", PIN_CID_OLD, "retained").await;
     assert_eq!(
         harness.target_states("incoming.txt").await,
         vec![("pinata-primary".to_owned(), "quota_waiting".to_owned())]
@@ -7937,8 +7957,8 @@ async fn test_pinning_quota_keeps_oldest_unknown_cid_reserved_after_eviction() {
     );
     let requests = harness.provider_requests().await;
     assert_eq!(requests.len(), 2);
-    assert_submit_request(&requests[0], "/psa/pins", "QmOld");
-    assert_submit_request(&requests[1], "/psa/pins", "QmNewer");
+    assert_submit_request(&requests[0], "/psa/pins", PIN_CID_OLD);
+    assert_submit_request(&requests[1], "/psa/pins", PIN_CID_NEWER);
     assert_no_psa_delete(&harness).await;
     assert_signed_body(&harness, "incoming.txt", b"in!").await;
     assert_no_kubo_pin_removes(&harness).await;
@@ -7952,7 +7972,7 @@ async fn test_pinning_shared_cid_counts_once_and_blocks_unsafe_unpin() {
     config.pinata_script = vec![PsaReply::pinned_submit(
         "/psa/pins",
         "shared-request",
-        "QmShared",
+        PIN_CID_SHARED,
     )];
     let mut harness = start_pinning_harness(config).await;
 
@@ -7960,7 +7980,7 @@ async fn test_pinning_shared_cid_counts_once_and_blocks_unsafe_unpin() {
         let put =
             signed_put_with_tagging(&harness, key, b"shared".to_vec(), "ipfs-s3%3Apin=true").await;
         assert_eq!(put.status(), StatusCode::OK, "PUT {key}");
-        assert_put_cid_headers(&put, "QmShared");
+        assert_put_cid_headers(&put, PIN_CID_SHARED);
     }
     harness.run_worker_until_idle().await;
     let first = latest_pinning_object(&harness, "first.txt").await;
@@ -8004,7 +8024,7 @@ async fn test_pinning_shared_cid_counts_once_and_blocks_unsafe_unpin() {
         ),
         (second_lease.id.as_str(), "active", "pinned")
     );
-    let remote = remote_pin(&harness, "pinata-primary", "QmShared").await;
+    let remote = remote_pin(&harness, "pinata-primary", PIN_CID_SHARED).await;
     assert_eq!(
         (remote.status.as_str(), remote.request_id.as_deref()),
         ("pinned", Some("shared-request"))
@@ -8025,7 +8045,7 @@ async fn test_pinning_shared_cid_counts_once_and_blocks_unsafe_unpin() {
         1,
         "the remaining desired target blocks Unpin"
     );
-    assert_submit_request(&requests[0], "/psa/pins", "QmShared");
+    assert_submit_request(&requests[0], "/psa/pins", PIN_CID_SHARED);
     assert_signed_body(&harness, "first.txt", b"shared").await;
     assert_signed_body(&harness, "second.txt", b"shared").await;
     assert_no_kubo_pin_removes(&harness).await;
@@ -8038,7 +8058,7 @@ async fn test_pinning_renewal_generation_reuses_retained_unknown_expiry_pin() {
     config.pinata_script = vec![PsaReply::pinned_submit(
         "/psa/pins",
         "expiry-request",
-        "QmTestCid",
+        TEST_CID,
     )];
     let mut harness = start_pinning_harness(config).await;
 
@@ -8064,7 +8084,7 @@ async fn test_pinning_renewal_generation_reuses_retained_unknown_expiry_pin() {
     harness.wait_for_worker_idle().await;
     harness.stop_worker_without_unlocking().await;
     let expired_lease = owner_leases(&harness, &object.id).await.remove(0);
-    let expired_remote = remote_pin(&harness, "pinata-primary", "QmTestCid").await;
+    let expired_remote = remote_pin(&harness, "pinata-primary", TEST_CID).await;
     assert_eq!(
         (
             expired_lease.id.as_str(),
@@ -8100,7 +8120,7 @@ async fn test_pinning_renewal_generation_reuses_retained_unknown_expiry_pin() {
     assert_eq!(renew.status(), StatusCode::OK);
     let renewed_lease = owner_leases(&harness, &object.id).await.remove(0);
     let renewed_target = lease_targets(&harness, &renewed_lease.id).await.remove(0);
-    let renewed_remote = remote_pin(&harness, "pinata-primary", "QmTestCid").await;
+    let renewed_remote = remote_pin(&harness, "pinata-primary", TEST_CID).await;
     assert_eq!(
         (
             renewed_lease.id.as_str(),
@@ -8146,7 +8166,7 @@ async fn test_pinning_renewal_generation_reuses_retained_unknown_expiry_pin() {
         "retained remote needs no replacement Submit"
     );
 
-    let pinned = remote_pin(&harness, "pinata-primary", "QmTestCid").await;
+    let pinned = remote_pin(&harness, "pinata-primary", TEST_CID).await;
     assert_eq!(
         (pinned.status.as_str(), pinned.request_id.as_deref()),
         ("pinned", Some("expiry-request"))
@@ -8157,9 +8177,9 @@ async fn test_pinning_renewal_generation_reuses_retained_unknown_expiry_pin() {
     );
     let requests = harness.provider_requests().await;
     assert_eq!(requests.len(), 1);
-    assert_submit_request_for_job(&requests[0], "/psa/pins", "QmTestCid", &initial_submit);
+    assert_submit_request_for_job(&requests[0], "/psa/pins", TEST_CID, &initial_submit);
     assert_no_psa_delete(&harness).await;
-    assert_unknown_psa_resource(&harness, "pinata-primary", "QmTestCid", "retained").await;
+    assert_unknown_psa_resource(&harness, "pinata-primary", TEST_CID, "retained").await;
     assert_signed_body(&harness, "expiry-renew.txt", b"body").await;
     assert_no_kubo_pin_removes(&harness).await;
     harness.shutdown().await;
@@ -8172,19 +8192,19 @@ async fn test_pinning_new_shared_target_after_cancel_reuses_unknown_remote_witho
     config.providers[0].max_pins = 1;
     config.kubo_script = KuboScript {
         add_replies: vec![
-            AddReply::Ok("QmShared"),
-            AddReply::Ok("QmWait"),
-            AddReply::Ok("QmShared"),
+            AddReply::Ok(PIN_CID_SHARED),
+            AddReply::Ok(PIN_CID_WAIT),
+            AddReply::Ok(PIN_CID_SHARED),
         ],
         cat_bodies: HashMap::from([
-            ("QmShared".to_owned(), b"shared".to_vec()),
-            ("QmWait".to_owned(), b"wait".to_vec()),
+            (PIN_CID_SHARED.to_owned(), b"shared".to_vec()),
+            (PIN_CID_WAIT.to_owned(), b"wait".to_vec()),
         ]),
     };
     config.pinata_script = vec![PsaReply::pinned_submit(
         "/psa/pins",
         "shared-before-delete",
-        "QmShared",
+        PIN_CID_SHARED,
     )];
     let mut harness = start_pinning_harness(config).await;
 
@@ -8197,7 +8217,7 @@ async fn test_pinning_new_shared_target_after_cancel_reuses_unknown_remote_witho
     .await;
     assert_eq!(first.status(), StatusCode::OK);
     harness.run_worker_until_idle().await;
-    let initial_remote = remote_pin(&harness, "pinata-primary", "QmShared").await;
+    let initial_remote = remote_pin(&harness, "pinata-primary", PIN_CID_SHARED).await;
 
     let wait = signed_put_with_tagging(
         &harness,
@@ -8215,7 +8235,7 @@ async fn test_pinning_new_shared_target_after_cancel_reuses_unknown_remote_witho
     let cancel = signed_delete_object_tagging(&harness, "delete-race-first.txt").await;
     assert_eq!(cancel.status(), StatusCode::NO_CONTENT);
     harness.run_worker_until_idle().await;
-    assert_unknown_psa_resource(&harness, "pinata-primary", "QmShared", "retained").await;
+    assert_unknown_psa_resource(&harness, "pinata-primary", PIN_CID_SHARED, "retained").await;
 
     let shared_new = signed_put_with_tagging(
         &harness,
@@ -8225,11 +8245,11 @@ async fn test_pinning_new_shared_target_after_cancel_reuses_unknown_remote_witho
     )
     .await;
     assert_eq!(shared_new.status(), StatusCode::OK);
-    assert_put_cid_headers(&shared_new, "QmShared");
-    let before_delete_completion = remote_pin(&harness, "pinata-primary", "QmShared").await;
+    assert_put_cid_headers(&shared_new, PIN_CID_SHARED);
+    let before_delete_completion = remote_pin(&harness, "pinata-primary", PIN_CID_SHARED).await;
     assert_eq!(before_delete_completion.epoch, initial_remote.epoch + 2);
 
-    let retained = remote_pin(&harness, "pinata-primary", "QmShared").await;
+    let retained = remote_pin(&harness, "pinata-primary", PIN_CID_SHARED).await;
     assert_eq!(
         (
             retained.status.as_str(),
@@ -8268,7 +8288,7 @@ async fn test_pinning_new_shared_target_after_cancel_reuses_unknown_remote_witho
         1,
         "shared CID must not need a replacement Submit"
     );
-    assert_submit_request(&requests[0], "/psa/pins", "QmShared");
+    assert_submit_request(&requests[0], "/psa/pins", PIN_CID_SHARED);
     assert_no_psa_delete(&harness).await;
     assert_signed_body(&harness, "delete-race-new.txt", b"shared").await;
     assert_no_kubo_pin_removes(&harness).await;
@@ -8281,7 +8301,7 @@ async fn test_pinning_expiry_retains_unknown_remote_and_preserves_s3_and_kubo_pi
     config.pinata_script = vec![PsaReply::pinned_submit(
         "/psa/pins",
         "expiry-delete-request",
-        "QmTestCid",
+        TEST_CID,
     )];
     let mut harness = start_pinning_harness(config).await;
 
@@ -8293,12 +8313,12 @@ async fn test_pinning_expiry_retains_unknown_remote_and_preserves_s3_and_kubo_pi
     )
     .await;
     assert_eq!(put.status(), StatusCode::OK);
-    assert_put_cid_headers(&put, "QmTestCid");
+    assert_put_cid_headers(&put, TEST_CID);
     harness.run_worker_until_idle().await;
     let object = latest_pinning_object(&harness, "expired.txt").await;
     let manual = owner_leases(&harness, &object.id).await.remove(0);
     let target = lease_targets(&harness, &manual.id).await.remove(0);
-    assert_unknown_psa_resource(&harness, "pinata-primary", "QmTestCid", "confirmed").await;
+    assert_unknown_psa_resource(&harness, "pinata-primary", TEST_CID, "confirmed").await;
 
     harness.advance_past_lease_expiry("expired.txt").await;
     harness.restart_worker();
@@ -8308,7 +8328,7 @@ async fn test_pinning_expiry_retains_unknown_remote_and_preserves_s3_and_kubo_pi
 
     let expired = owner_leases(&harness, &object.id).await.remove(0);
     let released_target = lease_targets(&harness, &manual.id).await.remove(0);
-    let remote = remote_pin(&harness, "pinata-primary", "QmTestCid").await;
+    let remote = remote_pin(&harness, "pinata-primary", TEST_CID).await;
     assert_eq!(
         (
             expired.id.as_str(),
@@ -8343,10 +8363,10 @@ async fn test_pinning_expiry_retains_unknown_remote_and_preserves_s3_and_kubo_pi
         ),
         (4, 1)
     );
-    assert_unknown_psa_resource(&harness, "pinata-primary", "QmTestCid", "retained").await;
+    assert_unknown_psa_resource(&harness, "pinata-primary", TEST_CID, "retained").await;
     let requests = harness.provider_requests().await;
     assert_eq!(requests.len(), 1);
-    assert_submit_request(&requests[0], "/psa/pins", "QmTestCid");
+    assert_submit_request(&requests[0], "/psa/pins", TEST_CID);
     assert_no_psa_delete(&harness).await;
     assert_signed_body(&harness, "expired.txt", b"body").await;
     assert_no_kubo_pin_removes(&harness).await;
@@ -8360,19 +8380,19 @@ async fn test_pinning_zip_decompressed_pins_entries_not_archive() {
     config.explicit_identity = true;
     config.kubo_script = KuboScript {
         add_replies: vec![
-            AddReply::Ok("QmArchive"),
-            AddReply::Ok("QmEntry1"),
-            AddReply::Ok("QmEntry2"),
+            AddReply::Ok(PIN_CID_ARCHIVE),
+            AddReply::Ok(PIN_CID_ENTRY1),
+            AddReply::Ok(PIN_CID_ENTRY2),
         ],
         cat_bodies: HashMap::from([
-            ("QmArchive".to_owned(), archive_bytes.clone()),
-            ("QmEntry1".to_owned(), FIRST_ENTRY_BYTES.to_vec()),
-            ("QmEntry2".to_owned(), SECOND_ENTRY_BYTES.to_vec()),
+            (PIN_CID_ARCHIVE.to_owned(), archive_bytes.clone()),
+            (PIN_CID_ENTRY1.to_owned(), FIRST_ENTRY_BYTES.to_vec()),
+            (PIN_CID_ENTRY2.to_owned(), SECOND_ENTRY_BYTES.to_vec()),
         ]),
     };
     config.pinata_script = vec![
-        PsaReply::pinned_submit("/psa/pins", "pinata-entry-1", "QmEntry1"),
-        PsaReply::pinned_submit("/psa/pins", "pinata-entry-2", "QmEntry2"),
+        PsaReply::pinned_submit("/psa/pins", "pinata-entry-1", PIN_CID_ENTRY1),
+        PsaReply::pinned_submit("/psa/pins", "pinata-entry-2", PIN_CID_ENTRY2),
     ];
     let mut harness = start_pinning_harness(config).await;
     let pinata_key = harness.provider_key("pinata-primary");
@@ -8393,7 +8413,7 @@ async fn test_pinning_zip_decompressed_pins_entries_not_archive() {
     );
     assert_eq!(
         xml_text(&put_xml, "ArchiveETag").as_deref(),
-        Some("QmArchive")
+        Some(PIN_CID_ARCHIVE)
     );
     assert_eq!(xml_text(&put_xml, "ExtractedCount").as_deref(), Some("2"));
     assert_tagging(
@@ -8444,9 +8464,9 @@ async fn test_pinning_zip_decompressed_pins_entries_not_archive() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         target_cids,
-        BTreeSet::from(["QmEntry1".to_owned(), "QmEntry2".to_owned()])
+        BTreeSet::from([PIN_CID_ENTRY1.to_owned(), PIN_CID_ENTRY2.to_owned()])
     );
-    assert!(!target_cids.contains("QmArchive"));
+    assert!(!target_cids.contains(PIN_CID_ARCHIVE));
     assert!(targets.iter().all(|target| {
         target.provider == pinata_key && target.state == "waiting" && target.lease_id == manual.id
     }));
@@ -8483,7 +8503,7 @@ async fn test_pinning_zip_decompressed_pins_entries_not_archive() {
             (
                 "submit",
                 pinata_key.as_str(),
-                "QmEntry1",
+                PIN_CID_ENTRY1,
                 Some(manual.id.as_str()),
                 Some(1),
                 None,
@@ -8492,7 +8512,7 @@ async fn test_pinning_zip_decompressed_pins_entries_not_archive() {
             (
                 "submit",
                 pinata_key.as_str(),
-                "QmEntry2",
+                PIN_CID_ENTRY2,
                 Some(manual.id.as_str()),
                 Some(1),
                 None,
@@ -8539,8 +8559,8 @@ async fn test_pinning_zip_decompressed_pins_entries_not_archive() {
         assert_eq!(harness.pin_job(&job.id).await.state, "done");
     }
     for (cid, request_id) in [
-        ("QmEntry1", "pinata-entry-1"),
-        ("QmEntry2", "pinata-entry-2"),
+        (PIN_CID_ENTRY1, "pinata-entry-1"),
+        (PIN_CID_ENTRY2, "pinata-entry-2"),
     ] {
         let remote = remote_pin(&harness, "pinata-primary", cid).await;
         assert_eq!(
@@ -8569,19 +8589,19 @@ async fn test_pinning_zip_partial_success_targets_only_published_entries() {
     config.explicit_identity = true;
     config.kubo_script = KuboScript {
         add_replies: vec![
-            AddReply::Ok("QmArchive"),
+            AddReply::Ok(PIN_CID_ARCHIVE),
             AddReply::Error(StatusCode::INTERNAL_SERVER_ERROR, "entry add failed"),
-            AddReply::Ok("QmEntry2"),
+            AddReply::Ok(PIN_CID_ENTRY2),
         ],
         cat_bodies: HashMap::from([
-            ("QmArchive".to_owned(), archive_bytes.clone()),
-            ("QmEntry2".to_owned(), SECOND_ENTRY_BYTES.to_vec()),
+            (PIN_CID_ARCHIVE.to_owned(), archive_bytes.clone()),
+            (PIN_CID_ENTRY2.to_owned(), SECOND_ENTRY_BYTES.to_vec()),
         ]),
     };
     config.pinata_script = vec![PsaReply::pinned_submit(
         "/psa/pins",
         "pinata-entry-2",
-        "QmEntry2",
+        PIN_CID_ENTRY2,
     )];
     let mut harness = start_pinning_harness(config).await;
     let pinata_key = harness.provider_key("pinata-primary");
@@ -8637,7 +8657,7 @@ async fn test_pinning_zip_partial_success_targets_only_published_entries() {
                 target.state.as_str()
             ))
             .collect::<Vec<_>>(),
-        vec![(pinata_key.as_str(), "QmEntry2", "waiting")]
+        vec![(pinata_key.as_str(), PIN_CID_ENTRY2, "waiting")]
     );
     assert_ne!(targets[0].cid, archive.cid);
     assert_eq!(
@@ -8665,7 +8685,7 @@ async fn test_pinning_zip_partial_success_targets_only_published_entries() {
         (
             "submit",
             pinata_key.as_str(),
-            "QmEntry2",
+            PIN_CID_ENTRY2,
             Some(manual.id.as_str()),
             Some(targets[0].id.as_str()),
             Some(1),
@@ -8677,8 +8697,8 @@ async fn test_pinning_zip_partial_success_targets_only_published_entries() {
     harness.run_worker_until_idle().await;
     let requests = harness.pinata_requests().await;
     assert_eq!(requests.len(), 1);
-    assert_submit_request_for_job(&requests[0], "/psa/pins", "QmEntry2", &jobs[0]);
-    let remote = remote_pin(&harness, "pinata-primary", "QmEntry2").await;
+    assert_submit_request_for_job(&requests[0], "/psa/pins", PIN_CID_ENTRY2, &jobs[0]);
+    let remote = remote_pin(&harness, "pinata-primary", PIN_CID_ENTRY2).await;
     assert_eq!(
         (
             remote.status.as_str(),
@@ -8692,7 +8712,7 @@ async fn test_pinning_zip_partial_success_targets_only_published_entries() {
             .remote_pins()
             .await
             .iter()
-            .all(|remote| remote.cid != "QmArchive")
+            .all(|remote| remote.cid != PIN_CID_ARCHIVE)
     );
     assert_no_kubo_pin_removes(&harness).await;
     harness.shutdown().await;
@@ -8705,19 +8725,19 @@ async fn test_pinning_zip_archive_renewal_updates_all_entry_targets() {
     config.explicit_identity = true;
     config.kubo_script = KuboScript {
         add_replies: vec![
-            AddReply::Ok("QmArchive"),
-            AddReply::Ok("QmEntry1"),
-            AddReply::Ok("QmEntry2"),
+            AddReply::Ok(PIN_CID_ARCHIVE),
+            AddReply::Ok(PIN_CID_ENTRY1),
+            AddReply::Ok(PIN_CID_ENTRY2),
         ],
         cat_bodies: HashMap::from([
-            ("QmArchive".to_owned(), archive_bytes.clone()),
-            ("QmEntry1".to_owned(), FIRST_ENTRY_BYTES.to_vec()),
-            ("QmEntry2".to_owned(), SECOND_ENTRY_BYTES.to_vec()),
+            (PIN_CID_ARCHIVE.to_owned(), archive_bytes.clone()),
+            (PIN_CID_ENTRY1.to_owned(), FIRST_ENTRY_BYTES.to_vec()),
+            (PIN_CID_ENTRY2.to_owned(), SECOND_ENTRY_BYTES.to_vec()),
         ]),
     };
     config.pinata_script = vec![
-        PsaReply::pinned_submit("/psa/pins", "pinata-entry-1", "QmEntry1"),
-        PsaReply::pinned_submit("/psa/pins", "pinata-entry-2", "QmEntry2"),
+        PsaReply::pinned_submit("/psa/pins", "pinata-entry-1", PIN_CID_ENTRY1),
+        PsaReply::pinned_submit("/psa/pins", "pinata-entry-2", PIN_CID_ENTRY2),
     ];
     let mut harness = start_pinning_harness(config).await;
     let pinata_key = harness.provider_key("pinata-primary");
@@ -8753,7 +8773,7 @@ async fn test_pinning_zip_archive_renewal_updates_all_entry_targets() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         target_cids,
-        BTreeSet::from(["QmEntry1".to_owned(), "QmEntry2".to_owned()])
+        BTreeSet::from([PIN_CID_ENTRY1.to_owned(), PIN_CID_ENTRY2.to_owned()])
     );
     let retain_until = (manual_before.expires_at + ChronoDuration::hours(1)).to_rfc3339();
     let renewal = signed_put_object_tagging(
@@ -8852,7 +8872,7 @@ async fn test_pinning_zip_archive_renewal_updates_all_entry_targets() {
         BTreeSet::from([
             (
                 pinata_key.as_str(),
-                "QmEntry1",
+                PIN_CID_ENTRY1,
                 None,
                 None,
                 None,
@@ -8861,7 +8881,7 @@ async fn test_pinning_zip_archive_renewal_updates_all_entry_targets() {
             ),
             (
                 pinata_key.as_str(),
-                "QmEntry2",
+                PIN_CID_ENTRY2,
                 None,
                 None,
                 None,
@@ -8898,8 +8918,11 @@ async fn test_pinning_zip_global_reject_creates_no_manual_lease() {
     let mut config = PinningHarnessConfig::request_one();
     config.explicit_identity = true;
     config.kubo_script = KuboScript {
-        add_replies: vec![AddReply::Ok("QmArchive"), AddReply::Ok("QmCollisionEntry")],
-        cat_bodies: HashMap::from([("QmArchive".to_owned(), archive_bytes.clone())]),
+        add_replies: vec![
+            AddReply::Ok(PIN_CID_ARCHIVE),
+            AddReply::Ok(PIN_CID_COLLISION),
+        ],
+        cat_bodies: HashMap::from([(PIN_CID_ARCHIVE.to_owned(), archive_bytes.clone())]),
     };
     config.pinata_script.clear();
     let harness = start_pinning_harness(config).await;
@@ -8958,21 +8981,21 @@ async fn test_pinning_multipart_zip_complete_commits_entries_and_upload_delete_a
     config.explicit_identity = true;
     config.kubo_script = KuboScript {
         add_replies: vec![
-            AddReply::Ok("QmPart"),
-            AddReply::Ok("QmRoot"),
-            AddReply::Ok("QmEntry1"),
-            AddReply::Ok("QmEntry2"),
+            AddReply::Ok(PIN_CID_PART),
+            AddReply::Ok(PIN_CID_ROOT),
+            AddReply::Ok(PIN_CID_ENTRY1),
+            AddReply::Ok(PIN_CID_ENTRY2),
         ],
         cat_bodies: HashMap::from([
-            ("QmPart".to_owned(), archive_bytes.clone()),
-            ("QmRoot".to_owned(), archive_bytes.clone()),
-            ("QmEntry1".to_owned(), FIRST_ENTRY_BYTES.to_vec()),
-            ("QmEntry2".to_owned(), SECOND_ENTRY_BYTES.to_vec()),
+            (PIN_CID_PART.to_owned(), archive_bytes.clone()),
+            (PIN_CID_ROOT.to_owned(), archive_bytes.clone()),
+            (PIN_CID_ENTRY1.to_owned(), FIRST_ENTRY_BYTES.to_vec()),
+            (PIN_CID_ENTRY2.to_owned(), SECOND_ENTRY_BYTES.to_vec()),
         ]),
     };
     config.pinata_script = vec![
-        PsaReply::pinned_submit("/psa/pins", "pinata-entry-1", "QmEntry1"),
-        PsaReply::pinned_submit("/psa/pins", "pinata-entry-2", "QmEntry2"),
+        PsaReply::pinned_submit("/psa/pins", "pinata-entry-1", PIN_CID_ENTRY1),
+        PsaReply::pinned_submit("/psa/pins", "pinata-entry-2", PIN_CID_ENTRY2),
     ];
     let mut harness = start_pinning_harness(config).await;
 
@@ -9011,7 +9034,7 @@ async fn test_pinning_multipart_zip_complete_commits_entries_and_upload_delete_a
         .expect("UploadPart ETag text")
         .trim_matches('"')
         .to_owned();
-    assert_eq!(part_etag, "QmPart");
+    assert_eq!(part_etag, PIN_CID_PART);
     let parts_before = store::multipart::list_parts(harness.state.store.db(), &upload_id)
         .await
         .expect("multipart part before complete");
@@ -9027,7 +9050,7 @@ async fn test_pinning_multipart_zip_complete_commits_entries_and_upload_delete_a
     );
     assert_eq!(
         xml_text(&complete_xml, "ArchiveETag").as_deref(),
-        Some("QmRoot")
+        Some(PIN_CID_ROOT)
     );
     assert_eq!(
         xml_text(&complete_xml, "ExtractedCount").as_deref(),
@@ -9046,7 +9069,7 @@ async fn test_pinning_multipart_zip_complete_commits_entries_and_upload_delete_a
     );
 
     let archive = latest_pinning_object(&harness, "archive.zip").await;
-    assert_eq!(archive.cid, "QmRoot");
+    assert_eq!(archive.cid, PIN_CID_ROOT);
     assert!(archive.multipart);
     assert_ne!(archive.id, upload_before.object_id);
     uuid::Uuid::parse_str(&archive.id).expect("completion_attempt_id is a UUID");
@@ -9090,9 +9113,9 @@ async fn test_pinning_multipart_zip_complete_commits_entries_and_upload_delete_a
         .collect::<BTreeSet<_>>();
     assert_eq!(
         target_cids,
-        BTreeSet::from(["QmEntry1".to_owned(), "QmEntry2".to_owned()])
+        BTreeSet::from([PIN_CID_ENTRY1.to_owned(), PIN_CID_ENTRY2.to_owned()])
     );
-    assert!(!target_cids.contains("QmRoot"));
+    assert!(!target_cids.contains(PIN_CID_ROOT));
     let pinata_key = harness.provider_key("pinata-primary");
     assert!(targets.iter().all(|target| {
         target.provider == pinata_key && target.state == "waiting" && target.lease_id == manual.id
@@ -9156,8 +9179,8 @@ async fn test_pinning_multipart_zip_complete_commits_entries_and_upload_delete_a
         assert_eq!(harness.pin_job(&job.id).await.state, "done");
     }
     for (cid, request_id) in [
-        ("QmEntry1", "pinata-entry-1"),
-        ("QmEntry2", "pinata-entry-2"),
+        (PIN_CID_ENTRY1, "pinata-entry-1"),
+        (PIN_CID_ENTRY2, "pinata-entry-2"),
     ] {
         let remote = remote_pin(&harness, "pinata-primary", cid).await;
         assert_eq!(
@@ -9180,16 +9203,16 @@ async fn test_pinning_multipart_zip_outbox_failure_preserves_upload_and_parts() 
     config.explicit_identity = true;
     config.kubo_script = KuboScript {
         add_replies: vec![
-            AddReply::Ok("QmPart"),
-            AddReply::Ok("QmRoot"),
-            AddReply::Ok("QmEntry1"),
-            AddReply::Ok("QmEntry2"),
+            AddReply::Ok(PIN_CID_PART),
+            AddReply::Ok(PIN_CID_ROOT),
+            AddReply::Ok(PIN_CID_ENTRY1),
+            AddReply::Ok(PIN_CID_ENTRY2),
         ],
         cat_bodies: HashMap::from([
-            ("QmPart".to_owned(), archive_bytes.clone()),
-            ("QmRoot".to_owned(), archive_bytes.clone()),
-            ("QmEntry1".to_owned(), FIRST_ENTRY_BYTES.to_vec()),
-            ("QmEntry2".to_owned(), SECOND_ENTRY_BYTES.to_vec()),
+            (PIN_CID_PART.to_owned(), archive_bytes.clone()),
+            (PIN_CID_ROOT.to_owned(), archive_bytes.clone()),
+            (PIN_CID_ENTRY1.to_owned(), FIRST_ENTRY_BYTES.to_vec()),
+            (PIN_CID_ENTRY2.to_owned(), SECOND_ENTRY_BYTES.to_vec()),
         ]),
     };
     config.pinata_script.clear();

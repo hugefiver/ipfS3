@@ -18,6 +18,9 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set};
+#[path = "receipt/management.rs"]
+mod management;
+pub(crate) use management::fresh_complete_with_work;
 
 pub(crate) struct ReplicaReceipt {
     pub projectable: bool,

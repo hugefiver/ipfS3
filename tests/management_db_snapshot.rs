@@ -1,5 +1,5 @@
 //! Registered Stage 7 read-only native capture. No CLI or action executor.
-use ipfs_s3_gateway::pinning::management::{self,db_snapshot};
+use ipfs_s3_gateway::pinning::management::{self, db_snapshot};
 
 use chrono::Utc;
 use db_snapshot::{EvidenceGap, SnapshotError, collect};
@@ -203,7 +203,10 @@ fn request(
             subject: Subject::Object {
                 identity,
                 target: target
-                    .map(|target_id| TargetSelection::Existing { target_id,source:None })
+                    .map(|target_id| TargetSelection::Existing {
+                        target_id,
+                        source: None,
+                    })
                     .unwrap_or(TargetSelection::New(route(config))),
             },
         }],
@@ -287,14 +290,18 @@ async fn snapshot_adapter_reads_real_facts_and_refuses_missing_fences_without_db
     assert_eq!(result.objects[0].original_cid, CID);
     assert_eq!(result.leases[0].generation, lease.generation);
     assert_eq!(result.targets[0].id, target.id);
-    let planning=result.planning_snapshot().unwrap();
-    assert_eq!(planning.targets[0].native_tuple.len(),8);
-    assert!(planning.native_frame.is_some());
-    assert!(result.planning_snapshot().is_ok(), "native capture must be plannable, with per-item evidence gaps");
     assert!(result.applied.is_empty());
     let output = serde_json::to_string(&result).unwrap();
     assert!(!output.contains("DO_NOT_OUTPUT_SECRET_REF"));
     assert!(!output.contains("secret_ref"));
+    let planning = result.planning_snapshot();
+    assert!(
+        planning.is_ok(),
+        "native capture must be plannable, with per-item evidence gaps"
+    );
+    let planning = planning.unwrap();
+    assert_eq!(planning.targets[0].native_tuple.len(), 8);
+    assert!(planning.native_frame.is_some());
     assert!(before == contents(&db).await);
     assert!(
         object::Entity::find_by_id(identity.object_id)
@@ -341,13 +348,24 @@ async fn snapshot_adapter_file_two_connections_hold_one_snapshot_across_concurre
     let writer = store::connect_database(&url).await.unwrap();
     let identity = publish(&writer, &config, "entry", CID, true).await;
     let before = contents(&reader).await;
-    let result=collect(&reader,&config,&request(identity,&config,None)).await.unwrap();
-    let tx=reader.begin().await.unwrap();
-    let original_native=store::pinning::management::native::capture(&tx).await.unwrap();
-    let mut changed=config.providers[0].identity.clone();
-    changed.endpoint_revision+=1;
-    ledger::register_route(&writer,&changed.allocation_key(),&changed).await.unwrap();
-    assert!(original_native==store::pinning::management::native::capture(&tx).await.unwrap());
+    let result = collect(&reader, &config, &request(identity, &config, None))
+        .await
+        .unwrap();
+    let tx = reader.begin().await.unwrap();
+    let original_native = store::pinning::management::native::capture(&tx)
+        .await
+        .unwrap();
+    let mut changed = config.providers[0].identity.clone();
+    changed.endpoint_revision += 1;
+    ledger::register_route(&writer, &changed.allocation_key(), &changed)
+        .await
+        .unwrap();
+    assert!(
+        original_native
+            == store::pinning::management::native::capture(&tx)
+                .await
+                .unwrap()
+    );
     tx.rollback().await.unwrap();
     assert!(
         result
@@ -549,7 +567,10 @@ async fn snapshot_adapter_wire_request_does_not_supply_snapshot_authority_or_rec
             backend: selected_route.backend,
             scope: selected_route.scope,
             resource_type: selected_route.resource_type,
-            frontier: vec![NativeKey {table:"pin_jobs".into(),values:vec!["forged".into()]}],
+            frontier: vec![NativeKey {
+                table: "pin_jobs".into(),
+                values: vec!["forged".into()],
+            }],
             complete: true,
         }],
         ..Snapshot::default()
@@ -571,9 +592,9 @@ async fn snapshot_adapter_wire_request_does_not_supply_snapshot_authority_or_rec
     let actual = collect(&db, &config, imported.request()).await.unwrap();
     assert_eq!(actual.objects.len(), 1);
     assert!(actual.applied.is_empty());
-    let native=actual.planning_snapshot().unwrap();
+    let native = actual.planning_snapshot().unwrap();
     assert!(native.applied.is_empty());
-    assert_eq!(native.objects[0].readable,None);
+    assert_eq!(native.objects[0].readable, None);
     assert!(native.native_frame.is_some());
     assert!(before == contents(&db).await);
 }
@@ -714,10 +735,10 @@ async fn snapshot_adapter_rpc_inflight_unknown_resources_and_historical_route_do
     );
     assert_eq!(unknown.usage[0].reserved_bytes, 10);
     assert!(unknown.applied.is_empty());
-    assert!(unknown.planning_snapshot().unwrap().native_frame.is_some());
     let safe_output = serde_json::to_string(&unknown).unwrap();
     assert!(!safe_output.contains("DO_NOT_OUTPUT_PROVIDER_ERROR_OR_TOKEN"));
     assert!(!safe_output.contains("DO_NOT_OUTPUT_SECRET_REF"));
+    assert!(unknown.planning_snapshot().unwrap().native_frame.is_some());
     assert!(before == contents(&db).await);
 }
 
@@ -782,7 +803,9 @@ async fn snapshot_adapter_retained_cleanup_generation_and_historical_epoch_remai
     );
     tx.commit().await.unwrap();
     let before = contents(&db).await;
-    let native_before = store::pinning::management::native::capture(&db).await.unwrap();
+    let native_before = store::pinning::management::native::capture(&db)
+        .await
+        .unwrap();
     let archived = collect(&db, &config, &selected).await.unwrap();
     assert_eq!(archived.historical_remotes.len(), 1);
     assert_eq!(archived.historical_remotes[0].epoch, Some(remote.epoch));
@@ -795,29 +818,61 @@ async fn snapshot_adapter_retained_cleanup_generation_and_historical_epoch_remai
             .needs_attention
             .contains(&EvidenceGap::HistoricalAccountingUnavailable)
     );
-    let native=archived.planning_snapshot().unwrap();
+    let native = archived.planning_snapshot().unwrap();
     // Current and archive share the released epoch. Neither projection is an
     // execution authority; every original PK/private history remains bound.
     assert!(native.remotes.is_empty());
     assert!(native.historical_remotes.is_empty());
-    let frame=native.native_frame.as_ref().unwrap();
-    let epoch=remote.epoch.to_string();
+    let frame = native.native_frame.as_ref().unwrap();
+    let epoch = remote.epoch.to_string();
     for key in [
-        NativeKey {table:"remote_pins".into(),values:vec![remote.provider.clone(),remote.cid.clone()]},
-        NativeKey {table:"remote_pin_ledger".into(),values:vec![remote.provider.clone(),remote.cid.clone()]},
-        NativeKey {table:"pin_resource_history".into(),values:vec![remote.provider.clone(),remote.cid.clone(),epoch.clone()]},
+        NativeKey {
+            table: "remote_pins".into(),
+            values: vec![remote.provider.clone(), remote.cid.clone()],
+        },
+        NativeKey {
+            table: "remote_pin_ledger".into(),
+            values: vec![remote.provider.clone(), remote.cid.clone()],
+        },
+        NativeKey {
+            table: "pin_resource_history".into(),
+            values: vec![remote.provider.clone(), remote.cid.clone(), epoch.clone()],
+        },
     ] {
         assert!(frame.frontier.contains(&key));
         assert!(native.unknown_resources.contains(&key));
-        let values=key.values.iter().map(String::as_str).collect::<Vec<_>>();
-        assert!(frame.row(&key.table,&values).unwrap()==native_before.row(&key.table,&values).unwrap());
+        let values = key.values.iter().map(String::as_str).collect::<Vec<_>>();
+        assert!(
+            frame.row(&key.table, &values).unwrap()
+                == native_before.row(&key.table, &values).unwrap()
+        );
     }
-    let history_key=[remote.provider.as_str(),remote.cid.as_str(),epoch.as_str()];
-    assert!(store::pinning::management::native::value(frame.row("pin_resource_history",&history_key).unwrap(),"ledger").is_none());
-    let original_history=native_before.original_value("pin_resource_history",&history_key,"ledger").unwrap();
-    assert!(frame.original_value("pin_resource_history",&history_key,"ledger")==Some(original_history));
-    assert!(frame==&native_before);
-    assert!(frame==&store::pinning::management::native::capture(&db).await.unwrap());
+    let history_key = [
+        remote.provider.as_str(),
+        remote.cid.as_str(),
+        epoch.as_str(),
+    ];
+    assert!(
+        store::pinning::management::native::value(
+            frame.row("pin_resource_history", &history_key).unwrap(),
+            "ledger"
+        )
+        .is_none()
+    );
+    let original_history = native_before
+        .original_value("pin_resource_history", &history_key, "ledger")
+        .unwrap();
+    assert!(
+        frame.original_value("pin_resource_history", &history_key, "ledger")
+            == Some(original_history)
+    );
+    assert!(frame == &native_before);
+    assert!(
+        frame
+            == &store::pinning::management::native::capture(&db)
+                .await
+                .unwrap()
+    );
     assert!(before == contents(&db).await);
 }
 
@@ -851,7 +906,7 @@ async fn snapshot_adapter_provider_inventory_preserves_real_reservations_but_has
     assert_eq!(inventory.usage[0].reserved_bytes, 10);
     assert_eq!(inventory.usage[0].reserved_pins, 1);
     assert!(!inventory.routes[0].allocation_allowed);
-    let native=inventory.planning_snapshot().unwrap();
+    let native = inventory.planning_snapshot().unwrap();
     assert!(!native.inventories[0].frontier.is_empty());
     assert!(native.native_frame.is_some());
     assert!(before == contents(&db).await);
@@ -884,4 +939,217 @@ async fn snapshot_adapter_inventory_budget_counts_utf8_bytes_without_returning_d
     assert_eq!(error, SnapshotError::LimitExceeded);
     assert!(!error.to_string().contains('界'));
     assert!(before == contents(&db).await);
+}
+
+#[tokio::test]
+async fn management_root_release_binds_exact_reference_owner_build_and_native_history() {
+    use store::pinning::management::native;
+    let db = store::connect_database("sqlite::memory:").await.unwrap();
+    let config = config();
+    setup(&db, &config).await;
+    for batch in ["selected-root", "shared-root"] {
+        db.execute(Statement::from_sql_and_values(db.get_database_backend(),
+            "INSERT INTO zip_batches(id,owner,source,token,fingerprint,bucket,archive_key,input_identity,captured_options,state,manifest_prepared,terminal_result,root_status,root_cid,root_revision,root_epoch,created_at,updated_at) VALUES($1,$2,'direct',$1,'fingerprint','bucket','archive.zip','{}','{}','published',TRUE,'{}','complete',$3,1,2,'2026-10-12T00:00:00Z','2026-10-12T00:00:00Z')",
+            [batch.into(), format!("owner-{batch}").into(), CID.into()])).await.unwrap();
+        db.execute(Statement::from_sql_and_values(db.get_database_backend(),
+            "INSERT INTO zip_root_builds(batch_id,revision,epoch,worker,lease_until,status,created_at,updated_at) VALUES($1,1,2,'root-worker','2026-10-12T00:01:00Z','verified','2026-10-12T00:00:00Z','2026-10-12T00:00:00Z')",
+            [batch.into()])).await.unwrap();
+        db.execute(Statement::from_sql_and_values(db.get_database_backend(),
+            "INSERT INTO zip_root_references(batch_id,revision,epoch,node_identity,tier,cid,state,verification_receipt,created_at,updated_at) VALUES($1,1,2,'node-a','hot',$2,$3,'verified-root-fixture','2026-10-12T00:00:00Z','2026-10-12T00:00:00Z')",
+            [batch.into(), CID.into(), if batch == "selected-root" {"adopted"} else {"retained"}.into()])).await.unwrap();
+    }
+    let key = NativeKey {
+        table: "zip_root_references".into(),
+        values: vec![
+            "selected-root".into(),
+            "1".into(),
+            "2".into(),
+            "node-a".into(),
+            "hot".into(),
+            CID.into(),
+        ],
+    };
+    let action: Action = serde_json::from_value(serde_json::json!({"retire_with":{"selection":{"release_root_references":{"references":[key]}}}})).unwrap();
+    let request = PlanRequest {
+        plan_id: "root-release".into(),
+        items: vec![ItemRequest {
+            item_id: "release".into(),
+            action,
+            subject: Subject::Provider {
+                route: RouteIdentity::from_original(config.providers[0].route_snapshot()),
+            },
+        }],
+    };
+    let before = native::capture(&db).await.unwrap();
+    let snapshot = collect(&db, &config, &request)
+        .await
+        .unwrap()
+        .planning_snapshot()
+        .unwrap();
+    let plan = dry_run(&request, &snapshot).unwrap();
+    assert_eq!(plan.items()[0].status, PlanStatus::Ready);
+    assert_eq!(plan.summary().physical_release_bytes, 0);
+    let confirmation = plan.confirmation(vec![]);
+    assert!(snapshot.native_frame.as_ref() == Some(&before));
+    let capture = serde_json::to_value(plan.items()[0].capture.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        capture["provider"]["root_references"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        capture["provider"]["root_references"][0]["key"],
+        serde_json::to_value(&key).unwrap()
+    );
+    assert_eq!(
+        capture["provider"]["root_references"][0]["owner"],
+        "owner-selected-root"
+    );
+    let bytes = wire::encode_plan(&request, &snapshot, &plan, Some(&confirmation)).unwrap();
+    let imported = wire::decode_plan(&bytes).unwrap();
+    assert!(imported.plan().items() == plan.items());
+    assert!(before == native::capture(&db).await.unwrap());
+
+    let mut duplicate = request.clone();
+    duplicate.items[0].action = serde_json::from_value(serde_json::json!({"retire_with":{"selection":{"release_root_references":{"references":[key,key]}}}})).unwrap();
+    assert_eq!(
+        dry_run(&duplicate, &snapshot).err(),
+        Some(SafeError::DuplicateIdentity)
+    );
+    let mut overlapping = request.clone();
+    let mut other = overlapping.items[0].clone();
+    other.item_id = "other-provider".into();
+    let Subject::Provider { route } = &mut other.subject else {
+        panic!("provider")
+    };
+    route.provider_id = "other-provider".into();
+    overlapping.items.push(other);
+    assert_eq!(
+        dry_run(&overlapping, &snapshot).err(),
+        Some(SafeError::DuplicateIdentity)
+    );
+    let mut unproved = snapshot.clone();
+    unproved.native_frame = None;
+    assert_eq!(
+        dry_run(&request, &unproved).unwrap().items()[0].status,
+        PlanStatus::Blocked(SafeError::UnknownEvidence)
+    );
+    let mut missing_marker = snapshot.clone();
+    missing_marker
+        .root_references
+        .iter_mut()
+        .find(|root| root.key == key)
+        .unwrap()
+        .reference_tuple
+        .remove("logical_released_at");
+    assert_eq!(
+        dry_run(&request, &missing_marker).unwrap().items()[0].status,
+        PlanStatus::Blocked(SafeError::InconsistentSnapshot)
+    );
+    db.execute_unprepared("UPDATE zip_batches SET owner='changed-owner' WHERE id='selected-root'")
+        .await
+        .unwrap();
+    let changed = collect(&db, &config, &request)
+        .await
+        .unwrap()
+        .planning_snapshot()
+        .unwrap();
+    assert_eq!(
+        revalidate(&plan, &confirmation, &changed).err(),
+        Some(SafeError::SnapshotChanged)
+    );
+    let untouched = native::capture(&db).await.unwrap();
+    assert!(
+        untouched.row(
+            "zip_root_references",
+            &["shared-root", "1", "2", "node-a", "hot", CID]
+        ) == before.row(
+            "zip_root_references",
+            &["shared-root", "1", "2", "node-a", "hot", CID]
+        )
+    );
+    db.execute_unprepared("UPDATE zip_root_references SET logical_released_at='2026-10-13T00:00:00Z' WHERE batch_id='selected-root'").await.unwrap();
+    let released = collect(&db, &config, &request)
+        .await
+        .unwrap()
+        .planning_snapshot()
+        .unwrap();
+    assert_eq!(released.root_references.len(), 2);
+    assert_eq!(released.inventories[0].root_reference_ids.len(), 1);
+    assert!(
+        released.inventories[0]
+            .root_reference_ids
+            .iter()
+            .all(|key| key.values[0] == "shared-root")
+    );
+    assert_eq!(
+        dry_run(&request, &released).unwrap().items()[0].status,
+        PlanStatus::Blocked(SafeError::UnknownEvidence)
+    );
+    assert_eq!(
+        revalidate(&plan, &confirmation, &released).err(),
+        Some(SafeError::SnapshotChanged)
+    );
+    let released_frame = released.native_frame.as_ref().unwrap();
+    assert!(released_frame.frontier.contains(&key));
+    let released_row = released_frame
+        .row(
+            "zip_root_references",
+            &["selected-root", "1", "2", "node-a", "hot", CID],
+        )
+        .unwrap();
+    assert_eq!(native::value(released_row, "state"), Some("adopted"));
+    assert_eq!(
+        native::value(released_row, "logical_released_at"),
+        Some("2026-10-13T00:00:00Z")
+    );
+    assert!(
+        released_frame.row("zip_root_builds", &["selected-root", "1", "2"])
+            == untouched.row("zip_root_builds", &["selected-root", "1", "2"])
+    );
+    assert!(
+        released_frame.row("zip_batches", &["selected-root"])
+            == untouched.row("zip_batches", &["selected-root"])
+    );
+    assert!(
+        released_frame.row(
+            "zip_root_references",
+            &["shared-root", "1", "2", "node-a", "hot", CID]
+        ) == untouched.row(
+            "zip_root_references",
+            &["shared-root", "1", "2", "node-a", "hot", CID]
+        )
+    );
+    db.execute_unprepared(
+        "UPDATE zip_root_references SET verification_receipt=NULL WHERE batch_id='shared-root'",
+    )
+    .await
+    .unwrap();
+    let mut unproved_request = request.clone();
+    let mut unproved_key = key.clone();
+    unproved_key.values[0] = "shared-root".into();
+    unproved_request.items[0].action = Action::RetireWith {
+        selection: RetirementSelection::ReleaseRootReferences {
+            references: vec![unproved_key],
+        },
+    };
+    let missing_proof = collect(&db, &config, &unproved_request)
+        .await
+        .unwrap()
+        .planning_snapshot()
+        .unwrap();
+    assert_eq!(
+        dry_run(&unproved_request, &missing_proof).unwrap().items()[0].status,
+        PlanStatus::Blocked(SafeError::UnknownEvidence)
+    );
+    let mut retained = request.clone();
+    retained.items[0].action = Action::Retire;
+    let default_plan = dry_run(&retained, &missing_proof).unwrap();
+    let Some(Capture::Provider(capture)) = &default_plan.items()[0].capture else {
+        panic!("provider");
+    };
+    assert!(capture.root_references.is_empty());
+    assert_eq!(capture.inventory.root_reference_ids.len(), 1);
 }

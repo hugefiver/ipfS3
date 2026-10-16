@@ -2,7 +2,11 @@
 use std::collections::BTreeSet;
 
 use super::{capture, model::*, validate::validate_route_identity};
-use crate::{pinning::identity::ProviderRouteSnapshot, store::pinning::management::native::{NativeFrame, value}};
+use crate::store::pinning::management::records::SharedDecodeBudget;
+use crate::{
+    pinning::identity::ProviderRouteSnapshot,
+    store::pinning::management::native::{NativeFrame, value},
+};
 
 type Domain = (String, String, ResourceType);
 
@@ -11,12 +15,29 @@ fn domain(route: &RouteIdentity) -> Option<Domain> {
     if RouteIdentity::from_original(original.clone()) != *route
         || validate_route_identity(route).is_err()
         || original.provider_id.starts_with("legacy:")
-        || !matches!(original.api_profile.as_str(), "noop" | "psa" | "pinata-v3" | "pinata-legacy"
-            | "rpc" | "kubo" | "filebase-rpc" | "cluster" | "cluster-proxy" | "cluster-rest")
+        || !matches!(
+            original.api_profile.as_str(),
+            "noop"
+                | "psa"
+                | "pinata-psa"
+                | "filebase-psa"
+                | "pinata-v3"
+                | "pinata-legacy"
+                | "rpc"
+                | "kubo"
+                | "filebase-rpc"
+                | "cluster"
+                | "cluster-proxy"
+                | "cluster-rest"
+        )
     {
         return None;
     }
-    Some((route.backend.clone(), route.scope.clone(), route.resource_type))
+    Some((
+        route.backend.clone(),
+        route.scope.clone(),
+        route.resource_type,
+    ))
 }
 
 pub(crate) struct DecisionScope {
@@ -27,7 +48,14 @@ pub(crate) struct DecisionScope {
 
 impl DecisionScope {
     pub(crate) fn for_item(item: &ItemRequest, snapshot: &Snapshot) -> Self {
-        let mut scope = Self { cid: None, domains: BTreeSet::new(), complete: true };
+        Self::for_view(item, &snapshot.into())
+    }
+    pub(crate) fn for_view(item: &ItemRequest, snapshot: &super::SnapshotView<'_>) -> Self {
+        let mut scope = Self {
+            cid: None,
+            domains: BTreeSet::new(),
+            complete: true,
+        };
         let (selected, target) = match &item.subject {
             Subject::Provider { route } => (Some(route), None),
             Subject::Object { identity, target } => {
@@ -35,9 +63,13 @@ impl DecisionScope {
                 match target {
                     TargetSelection::New(route) => (Some(route), None),
                     TargetSelection::Existing { target_id, .. } => {
-                        let target = snapshot.targets.iter().find(|target| target.id == *target_id);
+                        let target = snapshot
+                            .targets
+                            .iter()
+                            .find(|target| target.id == *target_id);
                         if let Some(target) = target {
-                            scope.cid = crate::pinning::provider::canonical_resource_cid(&target.cid).ok();
+                            scope.cid =
+                                crate::pinning::provider::canonical_resource_cid(&target.cid).ok();
                         }
                         (target.and_then(|target| target.route.as_ref()), target)
                     }
@@ -71,75 +103,195 @@ impl DecisionScope {
         scope
     }
 
-    fn add_registered(&mut self, identity: Option<&RouteIdentity>, snapshot: &Snapshot) {
+    fn add_registered(
+        &mut self,
+        identity: Option<&RouteIdentity>,
+        snapshot: &super::SnapshotView<'_>,
+    ) {
         let proved = identity.and_then(|identity| {
-            snapshot.routes.iter().find(|route| route.identity == *identity
-                && route.original.as_ref() == identity.original.as_ref()).and_then(|route| domain(&route.identity))
+            snapshot
+                .routes
+                .iter()
+                .find(|route| {
+                    route.identity == *identity
+                        && route.original.as_ref() == identity.original.as_ref()
+                })
+                .and_then(|route| domain(&route.identity))
         });
-        if let Some(domain) = proved { self.domains.insert(domain); }
-        else { self.complete = false; }
+        if let Some(domain) = proved {
+            self.domains.insert(domain);
+        } else {
+            self.complete = false;
+        }
     }
 
     pub(crate) fn includes(&self, key: &RemoteKey) -> bool {
-        !self.complete || self.domains.contains(&(key.backend.clone(), key.scope.clone(), key.resource_type))
+        !self.complete
+            || self.domains.iter().any(|domain| {
+                domain.0 == key.backend && domain.1 == key.scope && domain.2 == key.resource_type
+            })
     }
 
-    pub(crate) fn proves_disjoint(&self, frame: &NativeFrame, key: &NativeKey) -> bool {
-        let values = key.values.iter().map(String::as_str).collect::<Vec<_>>();
-        let Some(row) = frame.row(&key.table, &values) else { return false; };
-        let Some(cid) = value(row, "cid").and_then(|cid| crate::pinning::provider::canonical_resource_cid(cid).ok()) else { return false; };
-        let Some(selected) = &self.cid else { return false; };
-        if cid != *selected { return true; }
-        resource_route(frame, key).and_then(|original| domain(&RouteIdentity::from_original(original)))
-            .is_some_and(|domain| self.complete && !self.domains.contains(&domain))
+    pub(crate) fn proves_disjoint<'a>(
+        &self,
+        frame: impl Into<crate::store::pinning::management::records::FrozenRows<'a>>,
+        key: &NativeKey,
+        work: &SharedDecodeBudget,
+    ) -> bool {
+        let frame = frame.into();
+        let Some(row) = frame.row_key(&key.table, &key.values) else {
+            return false;
+        };
+        if work
+            .lock()
+            .ok()
+            .and_then(|mut work| work.copy(&value(row, "cid")).ok())
+            .is_none()
+        {
+            return false;
+        }
+        let Some(cid) = value(row, "cid")
+            .and_then(|cid| crate::pinning::provider::canonical_resource_cid(cid).ok())
+        else {
+            return false;
+        };
+        let Some(selected) = &self.cid else {
+            return false;
+        };
+        if cid != *selected {
+            return true;
+        }
+        let Some(original) = resource_route(frame, key, work) else {
+            return false;
+        };
+        let resource = match original.resource_type() {
+            crate::pinning::identity::RemoteResourceType::PsaRequest => ResourceType::PsaRequest,
+            crate::pinning::identity::RemoteResourceType::HostedFile => ResourceType::HostedFile,
+            crate::pinning::identity::RemoteResourceType::RpcPin => ResourceType::RpcPin,
+            crate::pinning::identity::RemoteResourceType::ClusterPin => ResourceType::ClusterPin,
+        };
+        self.complete
+            && !self.domains.iter().any(|domain| {
+                domain.0 == original.backend && domain.1 == original.scope && domain.2 == resource
+            })
     }
 }
 
-fn decode_route(json: &str) -> Option<ProviderRouteSnapshot> {
-    let route: ProviderRouteSnapshot = serde_json::from_str(json).ok()?;
+fn decode_route(json: &str, work: &SharedDecodeBudget) -> Option<ProviderRouteSnapshot> {
+    let mut work = work.lock().ok()?;
+    let parsed = work.typed_shared::<ProviderRouteSnapshot>(json).ok()?;
+    for _ in 0..3 {
+        work.copy(parsed.as_ref()).ok()?;
+    }
+    for _ in 0..2 {
+        work.copy(&(
+            &parsed.provider_id,
+            &parsed.backend,
+            &parsed.scope,
+            &parsed.storage_domain,
+            &parsed.api_profile,
+            &parsed.strategy,
+        ))
+        .ok()?;
+    }
+    work.copy(&(&parsed.backend, &parsed.scope)).ok()?;
+    drop(work);
+    let route = parsed.as_ref().clone();
     domain(&RouteIdentity::from_original(route.clone()))?;
     Some(route)
 }
 
-fn history_route(frame: &NativeFrame, provider: &str, cid: &str, epoch: &str) -> Option<ProviderRouteSnapshot> {
+#[derive(serde::Deserialize)]
+struct HistoryRoute {
+    ledger: HistoryLedger,
+}
+#[derive(serde::Deserialize)]
+struct HistoryLedger {
+    provider: String,
+    cid: String,
+    route: Option<String>,
+}
+fn history_route(
+    frame: crate::store::pinning::management::records::FrozenRows<'_>,
+    provider: &str,
+    cid: &str,
+    epoch: &str,
+    work: &SharedDecodeBudget,
+) -> Option<ProviderRouteSnapshot> {
     let json = frame.original_value("pin_resource_history", &[provider, cid, epoch], "ledger")?;
-    let envelope: serde_json::Value = serde_json::from_str(json).ok()?;
-    let ledger = envelope.get("ledger")?;
-    if ledger.get("provider")?.as_str()? != provider || ledger.get("cid")?.as_str()? != cid { return None; }
-    decode_route(ledger.get("route")?.as_str()?)
+    let envelope = work.lock().ok()?.typed_shared::<HistoryRoute>(json).ok()?;
+    if envelope.ledger.provider != provider || envelope.ledger.cid != cid {
+        return None;
+    }
+    decode_route(envelope.ledger.route.as_deref()?, work)
 }
 
 /// Missing evidence may use an exact trusted R26 point. Malformed or conflicting
 /// declarations must not be repaired by substituting another routing contract.
-pub(crate) fn resource_route_declared(frame: &NativeFrame, key: &NativeKey) -> bool {
-    let [provider, cid, rest @ ..] = key.values.as_slice() else { return true; };
+pub(crate) fn resource_route_declared(
+    frame: &NativeFrame,
+    key: &NativeKey,
+    work: &SharedDecodeBudget,
+) -> bool {
+    let [provider, cid, rest @ ..] = key.values.as_slice() else {
+        return true;
+    };
     if key.table != "pin_resource_history" {
-        return frame.original_value("remote_pin_ledger", &[provider, cid], "route").is_some();
+        return frame
+            .original_value("remote_pin_ledger", &[provider, cid], "route")
+            .is_some();
     }
-    let [epoch] = rest else { return true; };
-    let Some(json) = frame.original_value("pin_resource_history", &[provider, cid, epoch], "ledger") else { return false; };
-    let Ok(envelope) = serde_json::from_str::<serde_json::Value>(json) else { return true; };
-    let Some(ledger) = envelope.get("ledger") else { return true; };
-    if ledger.get("provider").and_then(serde_json::Value::as_str) != Some(provider.as_str())
-        || ledger.get("cid").and_then(serde_json::Value::as_str) != Some(cid.as_str())
-    { return true; }
-    ledger.get("route").is_some_and(|route| !route.is_null())
+    let [epoch] = rest else {
+        return true;
+    };
+    let Some(json) =
+        frame.original_value("pin_resource_history", &[provider, cid, epoch], "ledger")
+    else {
+        return false;
+    };
+    let Some(envelope) = work
+        .lock()
+        .ok()
+        .and_then(|mut work| work.typed_shared::<HistoryRoute>(json).ok())
+    else {
+        return true;
+    };
+    if envelope.ledger.provider != *provider || envelope.ledger.cid != *cid {
+        return true;
+    }
+    envelope.ledger.route.is_some()
 }
 
 /// Only the exact persisted invocation contract proves an allocation domain.
 /// Provider aliases and configuration names are never account evidence.
-pub(crate) fn resource_route(frame: &NativeFrame, key: &NativeKey) -> Option<ProviderRouteSnapshot> {
-    let [provider, cid, rest @ ..] = key.values.as_slice() else { return None; };
+pub(crate) fn resource_route<'a>(
+    frame: impl Into<crate::store::pinning::management::records::FrozenRows<'a>>,
+    key: &NativeKey,
+    work: &SharedDecodeBudget,
+) -> Option<ProviderRouteSnapshot> {
+    let frame = frame.into();
+    let [provider, cid, rest @ ..] = key.values.as_slice() else {
+        return None;
+    };
     if key.table == "pin_resource_history" {
-        let [epoch] = rest else { return None; };
-        return history_route(frame, provider, cid, epoch);
+        let [epoch] = rest else {
+            return None;
+        };
+        return history_route(frame, provider, cid, epoch, work);
     }
-    if !matches!(key.table.as_str(), "remote_pins" | "remote_pin_ledger") || !rest.is_empty() { return None; }
-    let original = decode_route(frame.original_value("remote_pin_ledger", &[provider, cid], "route")?)?;
+    if !matches!(key.table.as_str(), "remote_pins" | "remote_pin_ledger") || !rest.is_empty() {
+        return None;
+    }
+    let original = decode_route(
+        frame.original_value("remote_pin_ledger", &[provider, cid], "route")?,
+        work,
+    )?;
     if let Some(remote) = frame.row("remote_pins", &[provider, cid]) {
         let epoch = value(remote, "epoch")?;
-        if frame.row("pin_resource_history", &[provider, cid, epoch]).is_some()
-            && history_route(frame, provider, cid, epoch).as_ref() != Some(&original)
+        if frame
+            .row("pin_resource_history", &[provider, cid, epoch])
+            .is_some()
+            && history_route(frame, provider, cid, epoch, work).as_ref() != Some(&original)
         {
             return None;
         }

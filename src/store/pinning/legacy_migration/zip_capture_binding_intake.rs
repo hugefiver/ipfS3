@@ -83,7 +83,10 @@ pub(super) async fn persist(
     let selected = select_zip_intents(&capture, &manifest, Some(&source), &[output]).unwrap();
     assert_eq!(selected.leases.len(), 1);
     assert_eq!(selected.leases[0].intent.source, LeaseSource::Automatic);
-    assert_eq!(selected.leases[0].intent.providers, ["old"]);
+    assert_eq!(
+        selected.leases[0].intent.providers,
+        [validated.providers[0].identity.allocation_key()]
+    );
     match kind {
         Intake::Mpu => {
             let transaction = db.begin().await.unwrap();

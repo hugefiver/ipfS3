@@ -15,6 +15,7 @@
 //! This deliberately fails closed on oversized inventories; it does not silently
 //! page/truncate and claim completeness. No prefix/object discovery is performed.
 
+use crate::store::pinning::management::records::{DecodeWork, SharedDecodeBudget};
 use sea_orm::{
     AccessMode, ConnectionTrait, DatabaseBackend, DatabaseConnection, IsolationLevel, Statement,
     TransactionTrait,
@@ -33,12 +34,12 @@ use crate::pinning::{
 
 #[path = "db_snapshot/evidence.rs"]
 mod evidence;
+#[path = "db_snapshot/native_plan.rs"]
+mod native_plan;
 #[path = "db_snapshot/project.rs"]
 mod project;
 #[path = "db_snapshot/read.rs"]
 mod read;
-#[path = "db_snapshot/native_plan.rs"]
-mod native_plan;
 pub use evidence::*;
 
 /// Static errors only. DB/provider/serde text and input are never returned/logged.
@@ -71,12 +72,24 @@ pub async fn collect(
     config: &ValidatedPinningConfig,
     request: &PlanRequest,
 ) -> Result<DatabaseSnapshot> {
-    collect_inner(db, config, None, request).await
+    collect_inner(db, config, None, request, Default::default()).await
 }
 
 /// Production capture with full pure validated configuration; no RPC fallback.
-pub async fn collect_with_config(db: &DatabaseConnection, config: &super::local_config::ManagementConfig, request: &PlanRequest) -> Result<DatabaseSnapshot> {
-    collect_inner(db, &config.pinning, Some(config), request).await
+pub async fn collect_with_config(
+    db: &DatabaseConnection,
+    config: &super::local_config::ManagementConfig,
+    request: &PlanRequest,
+) -> Result<DatabaseSnapshot> {
+    collect_with_session(db, config, request, Default::default()).await
+}
+pub async fn collect_with_session(
+    db: &DatabaseConnection,
+    config: &super::local_config::ManagementConfig,
+    request: &PlanRequest,
+    work: SharedDecodeBudget,
+) -> Result<DatabaseSnapshot> {
+    collect_inner(db, &config.pinning, Some(config), request, work).await
 }
 
 async fn collect_inner(
@@ -84,6 +97,7 @@ async fn collect_inner(
     config: &ValidatedPinningConfig,
     management_config: Option<&super::local_config::ManagementConfig>,
     request: &PlanRequest,
+    work: SharedDecodeBudget,
 ) -> Result<DatabaseSnapshot> {
     validate_request(request).map_err(SnapshotError::Validation)?;
     let backend = db.get_database_backend();
@@ -99,35 +113,101 @@ async fn collect_inner(
         _ => return Err(SnapshotError::UnsupportedBackend),
     }
     .map_err(|_| SnapshotError::DatabaseUnavailable)?;
-    let result = collect_transaction(&tx,config,management_config,request).await;
-    tx.rollback().await.map_err(|_| SnapshotError::DatabaseUnavailable)?;
+    let result = collect_transaction(&tx, config, management_config, request, work).await;
+    tx.rollback()
+        .await
+        .map_err(|_| SnapshotError::DatabaseUnavailable)?;
     result
 }
 
-pub(crate) async fn collect_in_transaction(tx:&sea_orm::DatabaseTransaction,config:&super::local_config::ManagementConfig,request:&PlanRequest)->Result<DatabaseSnapshot> {
+pub(crate) async fn collect_in_transaction_with_session(
+    tx: &sea_orm::DatabaseTransaction,
+    config: &super::local_config::ManagementConfig,
+    request: &PlanRequest,
+    work: SharedDecodeBudget,
+) -> Result<DatabaseSnapshot> {
     validate_request(request).map_err(SnapshotError::Validation)?;
-    collect_transaction(tx,&config.pinning,Some(config),request).await
+    collect_transaction(tx, &config.pinning, Some(config), request, work).await
 }
 
-async fn collect_transaction(tx:&sea_orm::DatabaseTransaction,config:&ValidatedPinningConfig,management_config:Option<&super::local_config::ManagementConfig>,request:&PlanRequest)->Result<DatabaseSnapshot> {
-        let native_frame = crate::store::pinning::management::native::capture(tx).await.map_err(|error| match error {
-            crate::store::pinning::management::ManagementError::Budget => SnapshotError::LimitExceeded,
-            crate::store::pinning::management::ManagementError::Schema => SnapshotError::UnsupportedEvidence,
-            _ => SnapshotError::InvalidEvidence,
-        })?;
-        let observed_at=crate::store::database_clock::database_now(tx).await.map_err(|_|SnapshotError::DatabaseUnavailable)?.timestamp();
-        let mut budget = read::Budget::default();
-        let objects = read::objects(tx, request, &mut budget).await?;
-        let rows = read::Rows::load(tx, &mut budget).await?;
-        let mut result = project::assemble(observed_at, objects, rows, config, request)?;
-        result.planning = Some(native_plan::project(tx, observed_at, &result, native_frame, config, management_config,request).await?);
-        if let Some(planning) = &result.planning {
-            if planning.objects.iter().all(|object|object.readable==Some(true)) { result.needs_attention.retain(|gap|*gap!=EvidenceGap::ReadabilityNotProbed); }
-            if planning.objects.iter().all(|object|object.permitted.is_some()) { result.needs_attention.retain(|gap|*gap!=EvidenceGap::StoredByteSafetyUnavailable); }
-            if planning.targets.iter().any(|target|target.requirements.is_none()) { result.needs_attention.push(EvidenceGap::TargetRequirementsUnavailable); }
-            if planning.inventories.iter().any(|inventory|!inventory.complete) { result.needs_attention.push(EvidenceGap::ProviderRootAttributionUnavailable); }
+async fn collect_transaction(
+    tx: &sea_orm::DatabaseTransaction,
+    config: &ValidatedPinningConfig,
+    management_config: Option<&super::local_config::ManagementConfig>,
+    request: &PlanRequest,
+    work: SharedDecodeBudget,
+) -> Result<DatabaseSnapshot> {
+    let native_frame =
+        crate::store::pinning::management::native::capture_with_work(tx, DecodeWork::shared(&work))
+            .await
+            .map_err(|error| match error {
+                crate::store::pinning::management::ManagementError::Budget => {
+                    SnapshotError::LimitExceeded
+                }
+                crate::store::pinning::management::ManagementError::Schema => {
+                    SnapshotError::UnsupportedEvidence
+                }
+                _ => SnapshotError::InvalidEvidence,
+            })?;
+    let observed_at = crate::store::database_clock::database_now(tx)
+        .await
+        .map_err(|_| SnapshotError::DatabaseUnavailable)?
+        .timestamp();
+    let mut budget = read::Budget::new(work.clone());
+    let objects = read::objects(tx, request, &mut budget).await?;
+    let rows = read::Rows::load(tx, &mut budget).await?;
+    let mut result = project::assemble(observed_at, objects, rows, config, request, &work)?;
+    result.planning = Some(
+        native_plan::project(
+            tx,
+            &result,
+            native_frame,
+            config,
+            management_config,
+            request,
+            &work,
+        )
+        .await?,
+    );
+    if let Some(planning) = &result.planning {
+        if planning
+            .objects
+            .iter()
+            .all(|object| object.readable == Some(true))
+        {
+            result
+                .needs_attention
+                .retain(|gap| *gap != EvidenceGap::ReadabilityNotProbed);
         }
-        Ok(result)
+        if planning
+            .objects
+            .iter()
+            .all(|object| object.permitted.is_some())
+        {
+            result
+                .needs_attention
+                .retain(|gap| *gap != EvidenceGap::StoredByteSafetyUnavailable);
+        }
+        if planning
+            .targets
+            .iter()
+            .any(|target| target.requirements.is_none())
+        {
+            result
+                .needs_attention
+                .push(EvidenceGap::TargetRequirementsUnavailable);
+        }
+        if planning
+            .inventories
+            .iter()
+            .any(|inventory| !inventory.complete)
+        {
+            result
+                .needs_attention
+                .push(EvidenceGap::ProviderRootAttributionUnavailable);
+        }
+    }
+    Ok(result)
 }
 
 fn canonical(cid: &str) -> Result<String> {
@@ -165,9 +245,21 @@ fn number(value: i64) -> Result<u64> {
     u64::try_from(value).map_err(|_| SnapshotError::InvalidEvidence)
 }
 
-fn decode<T: serde::de::DeserializeOwned>(value: &str) -> Result<T> {
+fn decode<T: serde::de::DeserializeOwned + Send + Sync + 'static>(
+    value: &str,
+    work: &SharedDecodeBudget,
+) -> Result<std::sync::Arc<T>> {
     if value.len() > MAX_TEXT_BYTES {
         return Err(SnapshotError::LimitExceeded);
     }
-    serde_json::from_str(value).map_err(|_| SnapshotError::InvalidEvidence)
+    work.lock()
+        .map_err(|_| SnapshotError::InvalidEvidence)?
+        .typed_shared(value)
+        .map_err(|error| {
+            if error == crate::store::pinning::management::ManagementError::Budget {
+                SnapshotError::LimitExceeded
+            } else {
+                SnapshotError::InvalidEvidence
+            }
+        })
 }

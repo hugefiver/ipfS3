@@ -1,88 +1,12 @@
-//! Exercise the crate-private mirror seams until the zip module owner re-exports
-//! them. Keep this as a separate file-backed SQLite test with two connections.
+//! Atomic ZIP manifest mirroring on a file-backed SQLite database with two connections.
 use std::collections::BTreeMap;
 
-use ipfs_s3_gateway::store as gateway_store;
-use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, DatabaseTransaction,
-    EntityTrait, QueryFilter, TransactionTrait, sea_query::Expr,
-};
+use super::{batch, execution, manifest};
+use crate::store;
+use crate::store as gateway_store;
+use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, TransactionTrait};
 use sea_orm_migration::{MigrationTrait, SchemaManager};
 use sha2::{Digest, Sha256};
-
-mod error {
-    pub use ipfs_s3_gateway::error::*;
-}
-mod store {
-    pub use ipfs_s3_gateway::store::{
-        bucket, database_clock, entities, import, object_version, run_migrations, zip,
-    };
-}
-pub use ipfs_s3_gateway::store::zip::BatchSnapshot;
-
-fn stale() -> error::AppError {
-    error::AppError::Internal("stale ZIP batch ownership or root claim".into())
-}
-fn invalid() -> error::AppError {
-    error::AppError::InvalidZipParameter("invalid ZIP batch data".into())
-}
-fn safe_code(code: &str) -> bool {
-    !code.is_empty()
-        && code.len() <= 64
-        && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
-}
-fn required(value: &str) -> bool {
-    !value.is_empty() && value.len() <= 4096
-}
-fn supported(db: &impl ConnectionTrait) -> error::AppResult<()> {
-    if matches!(
-        db.get_database_backend(),
-        DatabaseBackend::Sqlite | DatabaseBackend::Postgres
-    ) {
-        Ok(())
-    } else {
-        Err(error::AppError::Internal(
-            "ZIP batches require SQLite or PostgreSQL".into(),
-        ))
-    }
-}
-async fn lock_batch(
-    tx: &DatabaseTransaction,
-    id: &str,
-) -> error::AppResult<store::entities::zip_batch::Model> {
-    use store::entities::zip_batch;
-    supported(tx)?;
-    if tx.get_database_backend() == DatabaseBackend::Sqlite {
-        let changed = zip_batch::Entity::update_many()
-            .col_expr(
-                zip_batch::Column::UpdatedAt,
-                Expr::col(zip_batch::Column::UpdatedAt).into(),
-            )
-            .filter(zip_batch::Column::Id.eq(id))
-            .exec(tx)
-            .await?;
-        if changed.rows_affected != 1 {
-            return Err(stale());
-        }
-    }
-    let query = zip_batch::Entity::find_by_id(id);
-    let row = if tx.get_database_backend() == DatabaseBackend::Postgres {
-        use sea_orm::QuerySelect;
-        query.lock_exclusive().one(tx).await?
-    } else {
-        query.one(tx).await?
-    };
-    row.ok_or_else(stale)
-}
-
-#[path = "../src/store/zip/batch.rs"]
-#[allow(dead_code)]
-mod batch;
-#[path = "../src/store/zip/execution.rs"]
-#[allow(dead_code)]
-mod execution;
-#[path = "../src/store/zip/manifest.rs"]
-mod manifest;
 
 async fn setup() -> (tempfile::TempDir, DatabaseConnection, DatabaseConnection) {
     let directory = tempfile::tempdir().unwrap();

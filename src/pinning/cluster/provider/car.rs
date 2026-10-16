@@ -15,7 +15,10 @@ pub(crate) struct DirectoryCarLimits {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum DirectoryRootKind { Directory, HamtShard }
+pub(crate) enum DirectoryRootKind {
+    Directory,
+    HamtShard,
+}
 
 pub(crate) struct DirectoryCarReceipt {
     pub stored_block_bytes: u64,
@@ -46,20 +49,32 @@ pub(crate) struct Car {
 }
 impl Car {
     pub fn new(root: &str, limits: ClusterTransferLimits) -> Result<Self, Failure> {
-        Self::with_limits(root, StructuralLimits {
-            max_block_bytes: limits.max_block_bytes,
-            max_car_bytes: limits.max_car_bytes,
-            max_dag_metadata_bytes: limits.max_dag_metadata_bytes,
-        }, None)
+        Self::with_limits(
+            root,
+            StructuralLimits {
+                max_block_bytes: limits.max_block_bytes,
+                max_car_bytes: limits.max_car_bytes,
+                max_dag_metadata_bytes: limits.max_dag_metadata_bytes,
+            },
+            None,
+        )
     }
     pub(crate) fn new_directory(root: &str, limits: DirectoryCarLimits) -> Result<Self, Failure> {
-        Self::with_limits(root, StructuralLimits {
-            max_block_bytes: limits.max_block_bytes,
-            max_car_bytes: limits.max_car_bytes,
-            max_dag_metadata_bytes: limits.max_dag_metadata_bytes,
-        }, Some(limits))
+        Self::with_limits(
+            root,
+            StructuralLimits {
+                max_block_bytes: limits.max_block_bytes,
+                max_car_bytes: limits.max_car_bytes,
+                max_dag_metadata_bytes: limits.max_dag_metadata_bytes,
+            },
+            Some(limits),
+        )
     }
-    fn with_limits(root: &str, limits: StructuralLimits, directory_limits: Option<DirectoryCarLimits>) -> Result<Self, Failure> {
+    fn with_limits(
+        root: &str,
+        limits: StructuralLimits,
+        directory_limits: Option<DirectoryCarLimits>,
+    ) -> Result<Self, Failure> {
         let root = Cid::try_from(root).map_err(|_| cbor::invalid())?;
         Ok(Self {
             root: cbor::canonical(root),
@@ -135,10 +150,13 @@ impl Car {
             return Err(cbor::invalid());
         }
         let block_count = self.block_count.checked_add(1).ok_or_else(cbor::invalid)?;
-        let payload_bytes = self.payload_bytes
+        let payload_bytes = self
+            .payload_bytes
             .checked_add(u64::try_from(payload.len()).map_err(|_| cbor::invalid())?)
             .ok_or_else(cbor::invalid)?;
-        if self.directory_limits.is_some_and(|limits| block_count > limits.max_blocks || payload_bytes > limits.max_payload_bytes) {
+        if self.directory_limits.is_some_and(|limits| {
+            block_count > limits.max_blocks || payload_bytes > limits.max_payload_bytes
+        }) {
             return Err(cbor::invalid());
         }
         let links = match cid.codec() {
@@ -147,15 +165,20 @@ impl Car {
             0x71 => cbor::links(payload)?,
             _ => return Err(cbor::invalid()),
         };
-        let record_metadata = links.len().checked_mul(128)
-            .and_then(|bytes| bytes.checked_add(512)).ok_or_else(cbor::invalid)?;
+        let record_metadata = links
+            .len()
+            .checked_mul(128)
+            .and_then(|bytes| bytes.checked_add(512))
+            .ok_or_else(cbor::invalid)?;
         self.metadata = self
             .metadata
             .checked_add(record_metadata)
             .filter(|n| *n <= self.limits.max_dag_metadata_bytes)
             .ok_or_else(cbor::invalid)?;
         if self.directory_limits.is_some() && cid == self.root {
-            if cid.codec() != 0x70 { return Err(cbor::invalid()); }
+            if cid.codec() != 0x70 {
+                return Err(cbor::invalid());
+            }
             self.root_kind = Some(directory_root_kind(payload)?);
         }
         self.graph.insert(cid, links);
@@ -202,7 +225,9 @@ fn number(bytes: &mut &[u8]) -> Result<u64, Failure> {
 }
 fn data<'a>(bytes: &mut &'a [u8]) -> Result<&'a [u8], Failure> {
     let length = usize::try_from(number(bytes)?).map_err(|_| cbor::invalid())?;
-    if length > bytes.len() { return Err(cbor::invalid()); }
+    if length > bytes.len() {
+        return Err(cbor::invalid());
+    }
     let value = &bytes[..length];
     *bytes = &bytes[length..];
     Ok(value)
@@ -216,7 +241,9 @@ fn directory_root_kind(mut node: &[u8]) -> Result<DirectoryRootKind, Failure> {
     while !node.is_empty() {
         match number(&mut node)? {
             10 if unixfs.is_none() => unixfs = Some(data(&mut node)?),
-            18 => { data(&mut node)?; },
+            18 => {
+                data(&mut node)?;
+            }
             _ => return Err(cbor::invalid()),
         }
     }
@@ -228,21 +255,34 @@ fn directory_root_kind(mut node: &[u8]) -> Result<DirectoryRootKind, Failure> {
     let mut fanout = None;
     while !bytes.is_empty() {
         let tag = number(&mut bytes)?;
-        if !seen.insert(tag) { return Err(cbor::invalid()); }
+        if !seen.insert(tag) {
+            return Err(cbor::invalid());
+        }
         match tag {
             8 => kind = Some(number(&mut bytes)?),
             18 => bitmap = Some(data(&mut bytes)?.len()),
             40 => hash = Some(number(&mut bytes)?),
             48 => fanout = Some(number(&mut bytes)?),
-            56 => { number(&mut bytes)?; }, // mode
-            66 => { validate_mtime(data(&mut bytes)?)?; },
+            56 => {
+                number(&mut bytes)?;
+            } // mode
+            66 => {
+                validate_mtime(data(&mut bytes)?)?;
+            }
             _ => return Err(cbor::invalid()), // file size / file blocks are not directory fields
         }
     }
     match kind {
-        Some(1) if bitmap.unwrap_or(0) == 0 && hash.is_none() && fanout.is_none() => Ok(DirectoryRootKind::Directory),
-        Some(5) if hash == Some(0x22) && fanout.is_some_and(|n| n >= 8 && n.is_power_of_two())
-            && (bitmap.unwrap_or(0) as u64) <= fanout.unwrap_or(0) / 8 => Ok(DirectoryRootKind::HamtShard),
+        Some(1) if bitmap.unwrap_or(0) == 0 && hash.is_none() && fanout.is_none() => {
+            Ok(DirectoryRootKind::Directory)
+        }
+        Some(5)
+            if hash == Some(0x22)
+                && fanout.is_some_and(|n| n >= 8 && n.is_power_of_two())
+                && (bitmap.unwrap_or(0) as u64) <= fanout.unwrap_or(0) / 8 =>
+        {
+            Ok(DirectoryRootKind::HamtShard)
+        }
         _ => Err(cbor::invalid()),
     }
 }
@@ -252,15 +292,23 @@ fn validate_mtime(mut bytes: &[u8]) -> Result<(), Failure> {
     let mut nanos = false;
     while !bytes.is_empty() {
         match number(&mut bytes)? {
-            8 if !seconds => { number(&mut bytes)?; seconds = true; },
+            8 if !seconds => {
+                number(&mut bytes)?;
+                seconds = true;
+            }
             21 if !nanos && bytes.len() >= 4 => {
                 let value = u32::from_le_bytes(bytes[..4].try_into().map_err(|_| cbor::invalid())?);
-                if value >= 1_000_000_000 { return Err(cbor::invalid()); }
-                bytes = &bytes[4..]; nanos = true;
-            },
+                if value >= 1_000_000_000 {
+                    return Err(cbor::invalid());
+                }
+                bytes = &bytes[4..];
+                nanos = true;
+            }
             _ => return Err(cbor::invalid()),
         }
     }
-    if !seconds { return Err(cbor::invalid()); }
+    if !seconds {
+        return Err(cbor::invalid());
+    }
     Ok(())
 }

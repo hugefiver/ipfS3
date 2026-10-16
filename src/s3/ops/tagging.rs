@@ -563,6 +563,7 @@ fn map_renewal_error(error: leases::RenewManualLeaseError) -> AppError {
             invalid_pinning_request(MANUAL_RENEWAL_REJECTED)
         }
         leases::RenewManualLeaseError::Database(error) => AppError::from(error),
+        leases::RenewManualLeaseError::Budget => AppError::ManagementBudget,
     }
 }
 

@@ -45,7 +45,7 @@ const PINATA_TOKEN_ENV: &str = "TEST_PINATA_TOKEN";
 const FILEBASE_TOKEN_ENV: &str = "TEST_FILEBASE_TOKEN";
 const PINATA_TOKEN: &str = "pinata-test-token";
 const FILEBASE_TOKEN: &str = "filebase-test-token";
-const TEST_CID: &str = "QmTestCid";
+pub const TEST_CID: &str = "QmYwAPJzv5CZsnAzt8auVTL7VYhESWDFoCPTqCkiP6fKGE";
 const WORKER_WAIT: Duration = Duration::from_secs(10);
 const WORKER_SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
 

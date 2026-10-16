@@ -1,3 +1,7 @@
+use super::management::{
+    admission,
+    records::{self, DecodeWork, SharedDecodeBudget},
+};
 use std::{cmp, collections::BTreeSet};
 
 use chrono::{DateTime, Utc};
@@ -342,6 +346,19 @@ pub async fn reserve_unique<C: ConnectionTrait>(
     reserve_unique_for_intent(db, provider, cid, cid_size, limits, now, false).await
 }
 
+pub(crate) async fn reserve_unique_with_work<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+    cid: &str,
+    cid_size: i64,
+    limits: &ProviderLimitMap,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+) -> AppResult<ReservationOutcome> {
+    reserve_unique_for_intent_with_work(db, (provider, cid), cid_size, limits, now, false, work)
+        .await
+}
+
 /// An existing waiter retains the *original* admission decision. Operator debt
 /// denies allocation, but cannot permanently erase this already queued target.
 pub(crate) async fn reserve_unique_for_waiter<C: ConnectionTrait>(
@@ -364,14 +381,48 @@ async fn reserve_unique_for_intent<C: ConnectionTrait>(
     now: DateTimeUtc,
     waiter: bool,
 ) -> AppResult<ReservationOutcome> {
+    let work = SharedDecodeBudget::default();
+    reserve_unique_for_intent_with_work(
+        db,
+        (provider, cid),
+        cid_size,
+        limits,
+        now,
+        waiter,
+        DecodeWork::shared(&work),
+    )
+    .await
+}
+async fn reserve_unique_for_intent_with_work<C: ConnectionTrait>(
+    db: &C,
+    (provider, cid): (&str, &str),
+    cid_size: i64,
+    limits: &ProviderLimitMap,
+    now: DateTimeUtc,
+    waiter: bool,
+    work: DecodeWork<'_>,
+) -> AppResult<ReservationOutcome> {
     super::management::admission::lock_sqlite_writer_in_caller_transaction(db).await?;
-    if super::legacy_migration::source_is_migrated(db, provider).await? {
+    if super::legacy_migration::source_is_migrated_with_work(db, provider, work)
+        .await
+        .map_err(admission::work_error)?
+    {
         return Err(invalid_quota(
             "migrated legacy namespace cannot allocate or revive",
         ));
     }
     for attempt in 0..SQLITE_RETRY_LIMIT {
-        match reserve_unique_attempt(db, provider, cid, cid_size, limits, now, waiter).await {
+        match reserve_unique_attempt_with_work(
+            db,
+            (provider, cid),
+            cid_size,
+            limits,
+            now,
+            waiter,
+            work,
+        )
+        .await
+        {
             Ok(ReserveAttempt::Outcome(outcome)) => return Ok(outcome),
             Ok(ReserveAttempt::Retry) => retry_delay(attempt).await,
             Err(AppError::Database(message)) if is_sqlite_contention(&message) => {
@@ -674,6 +725,7 @@ async fn acquire_existing_remote<C: ConnectionTrait>(
     }
 }
 
+#[cfg(test)]
 async fn reserve_unique_attempt<C: ConnectionTrait>(
     db: &C,
     provider: &str,
@@ -683,7 +735,28 @@ async fn reserve_unique_attempt<C: ConnectionTrait>(
     now: DateTimeUtc,
     waiter: bool,
 ) -> AppResult<ReserveAttempt> {
-    if super::ledger::allocation_cid(db, provider, cid).await? != cid {
+    let work = SharedDecodeBudget::default();
+    reserve_unique_attempt_with_work(
+        db,
+        (provider, cid),
+        cid_size,
+        limits,
+        now,
+        waiter,
+        DecodeWork::shared(&work),
+    )
+    .await
+}
+async fn reserve_unique_attempt_with_work<C: ConnectionTrait>(
+    db: &C,
+    (provider, cid): (&str, &str),
+    cid_size: i64,
+    limits: &ProviderLimitMap,
+    now: DateTimeUtc,
+    waiter: bool,
+    work: DecodeWork<'_>,
+) -> AppResult<ReserveAttempt> {
+    if super::ledger::allocation_cid_with_work(db, provider, cid, work).await? != cid {
         return Err(invalid_quota(
             "new RPC target must use the canonical allocation CID",
         ));
@@ -691,12 +764,12 @@ async fn reserve_unique_attempt<C: ConnectionTrait>(
     // QuotaWaiting/Blocked can themselves become a newly published target.
     // Registered admission therefore precedes every outcome, not only capacity
     // grants. Keep the old pre-registry low-level lock sequence unchanged.
-    let prelocked = if pin_provider_route::Entity::find_by_id(provider.to_owned()).one(db).await?.is_some() {
+    let prelocked = if admission::provider_registered_with_work(db, provider, work).await? {
         let remote = acquire_existing_remote(db, provider, cid).await?;
-        lock_allocation_admission(db, provider).await?;
+        lock_allocation_admission_with_work(db, provider, work).await?;
         Some(remote)
     } else {
-        super::management::admission::check_provider_open(db, provider).await?;
+        admission::check_provider_with_work(db, provider, work).await?;
         None
     };
     match super::ledger::submission::admission_barrier(db, provider).await? {
@@ -728,17 +801,27 @@ async fn reserve_unique_attempt<C: ConnectionTrait>(
     };
     match existing {
         Some(remote) if is_capacity_holding_status(&remote.status) => {
-            assert_reusable_route(db, provider, cid).await?;
+            assert_reusable_route_with_work(db, provider, cid, work).await?;
             reuse_capacity_holding_remote(db, provider, cid, remote, now).await
         }
         Some(remote) if remote.status == REMOTE_STATUS_ABSENT => {
             assert_new_allocation_safe(db, provider).await?;
-            reacquire_absent_remote(db, provider, cid, cid_size, provider_limits, remote, now).await
+            reacquire_absent_remote(
+                db,
+                (provider, cid),
+                cid_size,
+                provider_limits,
+                remote,
+                now,
+                work,
+            )
+            .await
         }
         Some(_) => Err(invalid_quota("remote pin has an unknown status")),
         None => {
             assert_new_allocation_safe(db, provider).await?;
-            reserve_new_remote(db, provider, cid, cid_size, provider_limits, now).await
+            reserve_new_remote_with_work(db, provider, cid, cid_size, provider_limits, now, work)
+                .await
         }
     }
 }
@@ -753,31 +836,44 @@ pub(crate) async fn assert_reusable_route<C: ConnectionTrait>(
     provider: &str,
     cid: &str,
 ) -> AppResult<()> {
-    super::management::admission::check_provider_open(db, provider).await?;
-    if let Some(binding) = super::legacy_migration::resource_binding(db, provider, cid).await?
+    let work = SharedDecodeBudget::default();
+    assert_reusable_route_with_work(db, provider, cid, DecodeWork::shared(&work)).await
+}
+pub(crate) async fn assert_reusable_route_with_work<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+    cid: &str,
+    work: DecodeWork<'_>,
+) -> AppResult<()> {
+    admission::check_provider_with_work(db, provider, work).await?;
+    if let Some(binding) =
+        super::legacy_migration::resource_binding_with_work(db, provider, cid, work)
+            .await
+            .map_err(admission::work_error)?
         && binding.source_retired
     {
         return Err(invalid_quota(
             "retired migration source is not allocation authority",
         ));
     }
-    let configured = pin_provider_route::Entity::find_by_id(provider.to_owned())
-        .one(db)
-        .await?;
-    let historical = super::ledger::get(db, provider, cid).await?;
+    let configured = records::current_model::<pin_provider_route::Entity, _>(db, &[provider], work)
+        .await
+        .map_err(admission::work_error)?;
+    let historical = super::ledger::get_with_work(db, provider, cid, work).await?;
     match (configured, historical) {
         (None, None) if !provider.starts_with("domain:") => Ok(()),
         (Some(current), Some(historical)) if !current.retired => {
             use crate::pinning::identity::ProviderRouteSnapshot;
-            let old: ProviderRouteSnapshot = serde_json::from_str(
-                historical
-                    .route
-                    .as_deref()
-                    .ok_or_else(|| invalid_quota("historical remote has no scope evidence"))?,
-            )
-            .map_err(|_| invalid_quota("historical remote route is invalid"))?;
-            let new: ProviderRouteSnapshot = serde_json::from_str(&current.snapshot)
-                .map_err(|_| invalid_quota("current provider route is invalid"))?;
+            let raw = historical
+                .route
+                .as_deref()
+                .ok_or_else(|| invalid_quota("historical remote has no scope evidence"))?;
+            let old: ProviderRouteSnapshot = work
+                .with(|work| work.typed(raw))
+                .map_err(admission::work_error)?;
+            let new: ProviderRouteSnapshot = work
+                .with(|work| work.typed(&current.snapshot))
+                .map_err(admission::work_error)?;
             if old.provider_id == new.provider_id
                 && old.backend == new.backend
                 && old.scope == new.scope
@@ -804,12 +900,27 @@ pub(crate) async fn assert_reusable_route<C: ConnectionTrait>(
 /// Caller already owns lifecycle/remotes. This adds usage → retirement/routes,
 /// without granting capacity or opening a nested transaction. Pre-registry
 /// standalone compatibility callers retain their old accounting lock behavior.
-pub(crate) async fn lock_allocation_admission<C: ConnectionTrait>(db: &C, provider: &str) -> AppResult<()> {
+pub(crate) async fn lock_allocation_admission<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+) -> AppResult<()> {
+    let work = SharedDecodeBudget::default();
+    lock_allocation_admission_with_work(db, provider, DecodeWork::shared(&work)).await
+}
+pub(crate) async fn lock_allocation_admission_with_work<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+    work: DecodeWork<'_>,
+) -> AppResult<()> {
     super::management::admission::lock_sqlite_writer_in_caller_transaction(db).await?;
-    if pin_provider_route::Entity::find_by_id(provider.to_owned()).one(db).await?.is_some() {
+    if admission::provider_registered_with_work(db, provider, work).await? {
+        work.copy(provider).map_err(admission::work_error)?;
+        if db.get_database_backend() == DatabaseBackend::Postgres {
+            work.copy(&[provider]).map_err(admission::work_error)?;
+        }
         lock_publication_usage_rows(db, &[provider.to_owned()]).await?;
     }
-    super::management::admission::lock_provider_in_caller_transaction(db, provider).await
+    admission::lock_provider_with_work(db, provider, work).await
 }
 
 /// Prior to Stage 2 the provider column was a user-configurable alias, not an
@@ -900,6 +1011,7 @@ async fn reuse_capacity_holding_remote<C: ConnectionTrait>(
     })
 }
 
+#[cfg(test)]
 async fn reserve_new_remote<C: ConnectionTrait>(
     db: &C,
     provider: &str,
@@ -907,6 +1019,27 @@ async fn reserve_new_remote<C: ConnectionTrait>(
     cid_size: i64,
     limits: &ProviderLimits,
     now: DateTimeUtc,
+) -> AppResult<ReserveAttempt> {
+    let work = SharedDecodeBudget::default();
+    reserve_new_remote_with_work(
+        db,
+        provider,
+        cid,
+        cid_size,
+        limits,
+        now,
+        DecodeWork::shared(&work),
+    )
+    .await
+}
+async fn reserve_new_remote_with_work<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+    cid: &str,
+    cid_size: i64,
+    limits: &ProviderLimits,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
 ) -> AppResult<ReserveAttempt> {
     match reserve_capacity(db, provider, cid_size, limits).await? {
         CapacityReservation::Reserved(grant) => {
@@ -924,7 +1057,7 @@ async fn reserve_new_remote<C: ConnectionTrait>(
                 }
             };
             if matches!(inserted, TryInsertResult::Inserted(_)) {
-                super::ledger::capture_reservation(db, provider, cid).await?;
+                super::ledger::capture_reservation_with_work(db, provider, cid, work).await?;
                 return Ok(ReserveAttempt::Outcome(ReservationOutcome::Reserved));
             }
             undo_capacity_grant(db, provider, grant).await?;
@@ -942,12 +1075,12 @@ async fn reserve_new_remote<C: ConnectionTrait>(
 
 async fn reacquire_absent_remote<C: ConnectionTrait>(
     db: &C,
-    provider: &str,
-    cid: &str,
+    (provider, cid): (&str, &str),
     cid_size: i64,
     limits: &ProviderLimits,
     remote: remote_pin::Model,
     now: DateTimeUtc,
+    work: DecodeWork<'_>,
 ) -> AppResult<ReserveAttempt> {
     let epoch = next_epoch(remote.epoch)?;
     match reserve_capacity(db, provider, cid_size, limits).await? {
@@ -996,7 +1129,7 @@ async fn reacquire_absent_remote<C: ConnectionTrait>(
                 }
             };
             if activated.rows_affected == 1 {
-                super::ledger::capture_reallocation(db, provider, cid).await?;
+                super::ledger::capture_reallocation_with_work(db, provider, cid, work).await?;
                 Ok(ReserveAttempt::Outcome(ReservationOutcome::Reserved))
             } else {
                 undo_capacity_grant(db, provider, grant).await?;
