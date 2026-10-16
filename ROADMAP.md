@@ -61,6 +61,22 @@ numbered release.
 - [x] Idempotent replay through the optional `x-ipfs3-client-token` header
 - [x] Optional ZIP extraction with ownership-fenced atomic publication
 - [x] Stale-worker and overlapping content-mutation fencing
+- [x] Durable ZIP batches, optional source publication and UnixFS directory/HAMT roots
+- [x] Shared v1/v2 ZIP intent and publication core, with explicitly configured automatic output pinning
+- [x] Scoped Filebase/Kubo RPC and Cluster Proxy/REST providers with strict CID and replica verification
+- [x] Explicit legacy pinning-capacity migration with atomic receipts and guarded rollback
+- [x] Local pinning management: nine action families, exact-version backfill, receipt-scoped workers and canonical retirement barriers
+
+Pinning Stages 1 to 7 and Stage 9 passed local isolated acceptance. Production
+migrations and real paid-provider account operations haven't been run. See the
+[current requirements and status](docs/superpowers/plans/2026-09-20-pinning-zip-unixfs.md)
+and [verification boundaries](docs/testing.md).
+
+- [ ] Stage 8 capacity and cross-process scheduling research with a reproducible baseline
+- [ ] Full-owner GC inventory and isolated writer-barrier/fault-recovery validation
+
+Stage 8 isn't accepted. Draft measurements don't establish production capacity,
+global rate limits or safe physical reclamation; production unpin/GC remains unrun.
 
 ## v0.5 — Multi-node
 

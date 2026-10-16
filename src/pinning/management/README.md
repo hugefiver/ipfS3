@@ -12,8 +12,9 @@
 - CLI/scoped worker：保护计划文件，处理显式确认及 apply；`--run` 只对已核验 receipt
   进行一次 due-job pass，不全局清空队列，也不隐式获得额外 provider 权限。
 
-交付验收须覆盖真实 apply、root CAS、原始 receipt 恢复、worker IO 与 PostgreSQL 并发 fence；
-局部模型或 SQLite 测试不能替代全部运行边界的验收。
+本地运行验收已通过，覆盖九类动作、十次 apply、三次 receipt-scoped worker 执行、
+root CAS、同文件数据库关闭重开、完整私密历史恢复、原确认过期后的精确重放和导出，
+以及隔离 PostgreSQL 的正式 apply、managed Submit、退役并发和 root-release 专项。
 
 ## 规划与 wire 接口
 
@@ -233,10 +234,9 @@ tuples，以及来自持久私有 verification receipt 的验证事实。新解�
 使用 owner-only 模式，Windows 使用 `CREATE_NEW` 并在创建时设置仅 owner 与 SYSTEM 可访问的
 protected ACL，在同一句柄上核验后才写入。仍须保护目录、本地配置与数据库访问。
 
-## 未验证边界
+## 验证范围
 
-Stage 7 runtime acceptance pending，正式 apply、root action CAS、旧 receipt 兼容、
-receipt-scoped worker 和退休屏障仍待验收。检查入口及 PostgreSQL 隔离前提见
+Stage 7 本地验收已完成，检查入口及 PostgreSQL 隔离前提见
 [`docs/testing.md`](../../../docs/testing.md#stage-7-local-management-checks)。
 模型、编译或 mock/local 结果不证明真实 provider 账号权限、物理远端 pin 或存储回收；
 本地管理合同不授权生产操作、unpin 或 GC。

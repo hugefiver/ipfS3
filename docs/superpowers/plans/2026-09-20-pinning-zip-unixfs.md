@@ -1,404 +1,126 @@
-# Pinning、ZIP 产物与 UnixFS 目录根：统一实施计划
+# Pinning、ZIP 产物与 UnixFS 目录根
 
-日期：2026-09-20。状态：计划已通过审查；Stage 1–4 已分别验收并提交，Stage 5 已完成实现及隔离后端验收、随本阶段提交；Stage 6–8 尚未验收。
+本计划定义当前产品要求、验收状态和剩余研究范围。Stage 1 至 7 及 Stage 9 已验收；Stage 8 未完成，不包含生产 GC 或跨进程全局限速上线。
 
-本文件是本轮唯一权威设计/实施/进度计划；不另建 spec，不单独提交计划。需求来源为用户提供的 `ipfs3_review_report.md`（2026-09-17）及最新 R24 确认。本轮基线为 `master@d3bf5cf`；规划时已确认工作区 clean、与 origin/master 一致，本轮不执行 push。
+操作与接口见 [README](../../../README.md)、[测试说明](../../testing.md)、[配置示例](../../../config.example.toml)和[本地管理模块](../../../src/pinning/management/README.md)。文档不授予 Git 写入、生产迁移、真实账号写入或付费操作权限。
 
-## 1. 目标、权限与完成定义
+## 阶段状态
 
-把报告 R01–R23 的缺陷、功能及明确属于后续研究的边界，与 R24 放在同一条可逐阶段交付的路径上：
+阶段编号是稳定需求标识，不代表执行顺序。
 
-- 修复 Pinata 解析、分类、恢复、日志与停滞问题；保留真实副作用证据。
-- 交付可选控制 warn/skipped、可解释配置/策略、稳定身份与安全运维。
-- 三个 ZIP 入口统一产物/批次/幂等契约，增加默认开启且可由签名 tag 覆盖的 UnixFS directory root CID。
-- 增加真正的 Filebase RPC/upload、独立 Kubo provider、Cluster Proxy + REST 副本验证；严格复制原 CID，不混淆副本域和成功证据。
-- 通过明确版本清单补 pin，完成迁移、退役、所有权与 retain 占用闭环。
-- R14 保持专项研究：本轮计划覆盖其研究交付物和实施 gate，不把研究写成生产 GC/全局限速已实现。
-
-**权限：**当前 planner 只创建本文件，不编辑产品、测试或配置，不派生 agent，不执行 Git 写。后续执行者按用户已授权的流程逐阶段实施并在每阶段完成时做 **一个 semantic commit**（标题 + 简短正文，无 footer/trailer/AI 署名）；计划随第一阶段提交，不做独立 plan commit。没有 push、tag、release、rebase 授权。真实 provider 写测试可能公开数据或产生费用，须另行明确授权；不得安装工具、自动拉取镜像或操作生产数据来凑验收。
-
-**完成定义：**阶段结果有可复核的行为、状态及资源证据，而非只有日志、HTTP 200 或命令退出码。mock、真实本地后端、真实账号、真实 SDK 四类证据分开记录；不可执行的环境检查标记未验证，不记 passed。允许将环境受限的代码提交明确标为“实现完成，外部验收待办”，不得据此宣称该 provider/能力已实机可用。
-
-## 2. 基线证据与不可回退的现有行为
-
-报告基于 `c438e3c`，不能直接视为当前实现清单。规划核对了下列当前文件及调用方的定点发现：
-
-| 领域 | 当前事实 / 实施入口 |
-|---|---|
-| Pinata | `src/pinning/pinata.rs`：`PinataQueuePage.jobs` 默认 Vec 不兼容显式 null；分页需 camelCase 别名；`require_success` 把 401/403 都视为 Authentication 且丢失正文；upload `find` 仍走 CID 队列；upload client 只有 connect timeout。 |
-| Worker | `src/pinning/worker.rs`、`src/store/pinning/jobs.rs`：提交错误统一恢复、鉴权/Terminal 恢复等待和 provider Terminal 拦截 IO 存在矛盾；attempts 封顶并不等于停止调度。修复须验证实际 HTTP 次数。 |
-| 日志 | `src/main.rs` 接受 EnvFilter/RUST_LOG；调用方已定位锁定依赖 s3s 0.14.1 `src/service.rs:615` 的 `debug!(?req)`。仅修改自有 tracing 不能消除签名请求泄漏。 |
-| Provider 模型 | `src/pinning/provider.rs` 只有 request-id 风格的 get/find/unpin；find 返回 Vec。`src/pinning/config.rs` 仅有 Pinata/Filebase/Noop，Filebase 工厂仍为 PSA。 |
-| DB | `pin_job` 没有历史 API/strategy 快照；`remote_pin` 以 provider/CID 作为键。现有 generation、claim、remote epoch 必须保留。 |
-| ZIP | `src/zip/extract.rs`、`local_header.rs`、`integrity.rs` 已有 8 GiB 总解压预算、10,000 条目、64 MiB 元数据预算、CRC/截断/路径防护；不是从零补 ZIP bomb 防护。当前限额并未全部配置化。 |
-| 三入口 | `src/s3/route/decompress_zip.rs`、`src/s3/ops/multipart.rs`、`src/import/decompress.rs` / `publication/zip.rs`。直接 PUT 先 add 源包再 cat 解压；MPU 捕获解压选项；import 有 durable claim、结果记录和 fingerprint。 |
-| 发布 | `src/store/pinning/publication.rs::ZipPublicationRequest` 必须有 archive。目前 archive 和 entries 在现有所有权屏障下发布；不能仅把 archive 改为 Option 而忽略租约、版本和结果所有者。 |
-| 重复规则 | 按用户确认保留 direct/MPU 同 key 的 last-wins；import 的 `ImportExtractionObserver::entry_started` 对重复目的地或 archive 冲突拒绝。root 应使用各入口真实最终发布集合，不统一改成新的去重规则。 |
-| 响应 | `src/zip/response.rs` 的旧 XML 以 ArchiveKey/ArchiveETag/ArchiveSize 为主体；结果关闭仍保留空 PUT body / 标准 Complete XML。无源包模式不能沿用其虚构源对象。 |
-| 可复用 CAR | `src/kubo/tier_copy.rs`、`verification.rs` 和 residency 已有 hot/cold CAR 流式复制、终态/trailer 检查和本地完整性 receipt。这不是远程 provider，不能直接套用其身份和删除语义。 |
-| root 归属障碍 | `m20260912_000001_residency_references.rs` 的引用包含 `(object_id,cid) -> objects(id,cid)` 外键。不能把目录 CID 塞到 archive 的 residency reference，更不能为 source=false 伪造 archive 对象。 |
-
-### 外部协议证据
-
-- 报告的 Kubo v0.43.0、Cluster v1.1.6 是固定资料版本，不代表现场部署版本。
-- 本次通过官方仓库 GitHub API 精确读取 Kubo v0.43.0 的 `core/commands/object/object.go`：`object/new` 映射到 RemovedObjectCmd。**禁止把 object/new + patch/add-link 作为当前实现路线。**
-- 同版本 `core/commands/dag/put.go` 支持 input-codec、store-codec、hash、pin，注册 dag-json/dag-pb；它可能先 emit CID 后 batch.Commit，因此收到 CID/200 仍不等于成功。优先验证 bottom-up dag/put 路线，见 §5。
-- 来源：`https://api.github.com/repos/ipfs/kubo/contents/core/commands/object/object.go?ref=v0.43.0`；`https://api.github.com/repos/ipfs/kubo/contents/core/commands/dag/put.go?ref=v0.43.0`。Context7 `/ipfs/kubo` 只作辅助，master 文档不能替代固定版本证据。
-- 尚未执行 Kubo 目录构建、Filebase/Pinata 账号写入或 Cluster 实机测试；本计划不以官方文档替代这些证据。
-
-## 3. 已确认范围与全局安全契约
-
-### 3.1 用户已确认
-
-1. R24 的根表示 ZIP 内**成功最终文件集合**，保留相对 ZIP 路径；不含 S3 目标 prefix，也不含 archive 本身。
-2. config 默认 ON；签名客户端 tag 的精确 `true` / `false` 覆盖默认值。MPU 在初始化、import 在接收时捕获，不能完成时随新配置漂移。
-3. partial 成功根明确标 partial；zero 成功不返回 root。保持各入口原有 duplicate、路径、CRC、整批错误及发布语义。
-4. 不改变对象 ETag/VersionId，不自动给 directory root 创建远程 pin 工作；ZIP + SSE 仍拒绝。
-5. TTL 保持既有意图接受/本地发布起算的语义；不是首次远程成功后重新起算，也不是服务商硬 TTL 保证。
-6. retain 或清理未完成的远端占用继续计账；不靠 lease 过期清零来无限放行新上传。
-7. 不扩 tar、ZIP+SSE、remote-only，也不顺带建设生产本地 GC/整套 HA。
-
-### 3.2 实施约束
-
-- 主体本地发布、可选请求 accepted/skipped/rejected、remote_submitted、remote_pinned、gateway_verified、content_verified、replication_complete 分开。accepted 不等于 pinned，源包成功不等于批次全部备份。
-- 未知副作用保持 unknown；完整、权威、作用域匹配的查询才可能证明 absent。超时、解析失败、查无权限、分页不全不能当空结果或直接重 POST。
-- 远程资源键至少包含稳定 backend/scope/CID/资源类型；配置名不是稳定身份，URL/secret/hash 不是副本身份。与主存储同域不计独立备份；同 Cluster pinset 多入口不重复计数。
-- 默认 cleanup=retain。只有排他管理约定、确定归属、本应用引用为零、无在途操作且 fence 当前时才允许 managed 清理。外部/未知资源不得自动删除；mismatch、退役、迁移也走同一台账。
-- 不调用全局 repo/gc、block/rm 或批量 pin/rm。现有本地 no-pin-rm 行为保持；取消本应用引用不承诺立即回收块。
-- 默认显式 cid/upload/car 策略，不自动切换远程端点、公开性或传输方式。按原 CID 复制实际存储字节，SSE 对象不得被解密后上传 public。
-- 原始合法 tag 可保留，但执行依据是持久 ExtensionDecision，不是再次扫描 tag。普通更新、复制、重启、新增 provider 都不能激活 skipped 旧意图。
-- 仅可选 pin 控制能 warn；鉴权、标签基础结构、完整性、加密、DB/Kubo 主写失败、服务器强制保护不能吞掉。`all` 不偷换成可用 provider 子集。
-- DB 网络操作不放在长事务内；复用 mutation/import ownership、数据库时钟和 heartbeat。迟到结果只能在原身份和 fence 下登记，不覆盖新 generation。
-
-## 4. 共同模型与接口方向
-
-以下内部名称为实施方向，允许等价拆分；对外命名在对应阶段的兼容测试中冻结，不能把草案当作当前已支持配置。
-
-### 4.1 Provider 执行与生命周期
-
-- **ProviderRevision**：稳定 provider id、display name、backend/scope、API/profile、策略、确认要求、endpoint 修订、secret 引用/管理员修订号；不持久化 secret 或 secret 的 hash。换账户/桶不能沿用旧 scope。
-- **InvocationSnapshot**：任务真正使用的历史协议/策略、资源类型、correlation、影响能力、当时保留/清理规则。旧记录没有证据时 unknown/needs_attention，不能用新 TOML 猜历史。
-- **ProviderError**：category、operation、HTTP status、安全 provider code/message、Retry-After、effect certainty、first/last error。建议类别含 authentication、permission_denied、unknown_forbidden、plan_restricted、quota、rate_limited、invalid_input、transport、protocol、cid_mismatch。
-- **Observation / RemoteRef**：类型化 PSA request / hosted file / RPC pin / Cluster pin；CID、opaque id、历史路由、查询完整性/覆盖范围、ownership、确认级别/时间。query 不再以一个 Vec 混淆 absent 与不可查询。
-- **SideEffectLedger**：提交在途/未知、已有/新建资源、共享引用、清理待办/retain、remote epoch；分离重试次数、实际 HTTP 次数、恢复查询次数和时间预算。
-- **容量**：有效租约、在途预留、未知副作用、已确认资源、retain/清理待办分层；同域/CID 实际资源去重，独立意图可取消/续期。late success 登记实际资源，不复活过期 lease。
-- **兼容迁移**：扩展 schema → 读旧新 → 升级所有 worker → 开启新状态/功能 → 显式迁移。不得让旧 worker 认领不理解的新状态。回滚先停新分配/worker，保留台账与旧协议路由，不能靠删表回滚。
-
-### 4.2 ExtensionDecision、诊断与管理
-
-- 决定绑定 principal/request、对象精确版本或 batch、tag/control revision、config revision、effective intent、warnings，并与对应发布/标签写入保持事务一致。
-- warn 的手动控制组整体 skipped：不新增 executable lease/target/job/reservation；服务器独立自动意图仍按其规则执行。cancel/renew 被跳过不能宣称远端已取消/续期。
-- 标准 S3 body/状态不改；增加有限 ASCII warning/status headers。v2 ZIP/import 结果含 Warnings，旧 body 不注入 JSON/元数据/207。CORS 仅在授权规则内 expose 这些 headers。
-- doctor/config explain 必须使用与 worker 相同的有效配置，报告构建版本、配置来源、变量 present/missing、能力操作/作用域/观察时间；read-only 默认，不启动上传测试。真实运行配置与独立 CLI 所加载文件须明确区分，不能把后者冒充前者。
-- 管理写动作优先复用受控进程/管理 CLI 的配置与数据库鉴权，不新增匿名 HTTP 管理面。status/diagnose/explain、create/reapply/backfill、retry/migrate/reconcile/retire 各自有明确身份与作用域。
-- 管理计划保存精确版本清单、预估、未知副作用、确认记录及幂等 id；不需要人为规定 hash 收据。确认后新增/覆盖的 key 不自动进入清单。
-
-### 4.3 ZIP 批次与策略
-
-- 新增独立 **ZipBatch**、**ManifestEntry**、**RootBuild** / **RootReference**。batch 不依赖 archive 是否发布。包含 owner、来源入口、request fingerprint、捕获选项/决定、输入身份、精确成功版本清单、失败记录、终态响应和构建 revision/claim。
-- 发布内容 `publish_source` / `publish_extracted` 与远端集合 `zip_targets` 独立。远端目标必须属于持久发布产物，双方 false 拒绝；source-only 可免解压，R24 此时不生成虚假空根。
-- legacy 未启用新产物规则时保持原策略行为。新模式建议“入口批次允许上限 ∩ 每个输出自身命中规则”，禁止子条目绕过 private prefix，也禁止 always 补回排除的源包。first-match、literal prefix、priority 小值优先/同值名称稳定排序、one 粘性/故障转移、all 要求保持。安全冲突显式拒绝而不是放宽并集；见 §8 待裁定项。
-- source=false 只在显式协商的 v2 扩展中使用；原 key 无新对象，不删除/覆盖旧对象，不返回虚构 ETag/VersionId。响应以 batch id、source_published、输入摘要（不是对象 ETag）、manifest 引用为主体。旧普通 PUT/Complete 不静默变语义。
-- 相同已捕获幂等 token + 相同 fingerprint 重放持久结果；相同 token 不同 fingerprint 冲突。不同 token 不凭字节相同认定同一意图。fingerprint 覆盖输出选择、root override、结果版本、原始语义控制和目的地等；未传 override 的重试使用既有快照，不因 config 改变而冲突或新建。
-- MPU upload_id 映射固定 batch；import 复用既有 token/job 身份；直接 PUT v2 增加签名幂等 token。结果写回断线不重发子版本/整批 pin。
-- manifest 对应本批实际提交的版本/CID，不在构根或重试时读取“当前同 key”替代。条目后来覆盖/删除不篡改历史 root。
-- source=false 的成功输出集合使用 exact-key 写入 guard 与独立 batch execution epoch；在同一个 bucket-first 准入事务内检查所有会被抢占的 ownership，若某个输出的 prefix overlap 会连带失效 source key 的 import job 或 standard mutation，则整批冲突回滚。只有 `source_key ∉ 成功输出集合` 不足以保护 source；准入前并发写按提交顺序决定，准入后任何输出 guard 失效都令整批发布失败，而不是降级为可选 root warning。失去 guard 不得通过重新 admission 抢回覆盖后的 key。代价是 exact guards 只能在成功输出集合确定后取得；不能声称上传开始即锁定目标 prefix。
-- v2 签名 token 的请求语义在入口捕获，完整 ZIP 输入 SHA-256 仅在请求正文 EOF/签名与 trailer 检查成功后绑定；旧 CID 或随机 mutation ID 不作字节摘要。同 token 同请求只重放已提交终态，异内容冲突；提交结果未知须经过相同 bucket serialization lock 判定，不能把暂时读到 open 当作确定回滚。旧 ZIP publication 的首次锁序也须由 bucket/ownership/version frontier 再到 batch，不能与新输出路径形成反向锁序。
-- 批次计数分别表示发布文件、逻辑目标、唯一 CID、目标引用、新传输、skipped/blocked、各 provider 确认、满足全部要求的条目。65 项 × 2 providers 是 130 逻辑目标，不等于 130 次上传。
-
-## 5. R24：UnixFS directory root 设计与验收合同
-
-### 5.1 开关、捕获和返回
-
-建议配置 `[decompress_zip] unixfs_directory_root = true`；建议保留 tag `ipfs-s3:zip-root=true|false`。两者均是新增接口，不是现有配置。tag 优先于默认值；精确布尔、重复 tag 仍按基础标签校验处理，不能把 `False`、未知值默认为 true。root tag 与远程 pin 控制是两个独立组，无 remote provider 不得把本地 root 跳过。
-
-- direct PUT 在 SigV4 后、主体副作用前解析；MPU 初始化持久化，Complete 不接受偷偷覆盖；import submit 持久化并加入 fingerprint。
-- 保留合法原始 tag；CopyObject/PutObjectTagging 继承或回写 tag 不触发历史 ZIP 重新解压/构根。非 ZIP 操作不创造 root 工作。
-- OFF 返回 disabled 且零 root RPC；零个成功最终文件返回 empty/无 CID。全部失败是否保留 archive 沿用入口原语义，不能用空目录 CID伪装成功。
-- success 返回 complete root；部分条目失败但有成功产物返回 partial root。partial 只表示解压/发布成功集合不含失败项，不能掩饰树构建漏链接。
-- 兼容返回优先使用 `x-ipfs3-zip-root-cid`、`x-ipfs3-zip-root-status` 和 batch 句柄；旧 XML、ETag/VersionId、结果关闭的 body 不变。v2 XML/import 状态增加结构化 root（CID/status/count/revision/safe error）。import 202 只是接受，CID 只能在验证及发布后出现。
-- 根构建失败必须返回可查询的 failed/retryable 状态及有限 warning，**不返回不完整/未经验证的 CID**。不把 root failure 计入旧解压 FailedCount 或把已发布对象说成没发布。
-- 用户已确认 enable=true（无论默认或 signed tag）表示尝试构根，不是 required/原子成功保证：失败明确返回 failed/warning、可查状态，不影响原对象发布。不能静默省略失败，也不得发布后以整体失败诱导客户端重复写入；本轮不实现 strict-on。
-
-### 5.2 最终集合与树的确定性
-
-1. 复用现有解压校验和每入口重复策略，形成“规范相对路径 → 最终成功文件 CID/size/精确版本”的稳定清单；不直接使用包含重复项的原始结果 Vec。
-2. 相对路径由解压时持有的可信 entry 路径保存，不能对完整 S3 key 做任意 substring replace。大小写/Unicode 不擅自归一化，不改变旧 S3 key。
-3. 保持 nested path；只创建成功文件必需的父目录，不加入 archive、目标 prefix、失败项或只有 ZIP 空目录项的额外树。目录项不参与成功文件数。
-4. direct/MPU duplicate last-wins 的 CID 与最终发布内容一致；import 保留整批拒绝重复目的地的既有行为。以成功发布决议而不是“最后看到的损坏 entry”覆盖前一成功文件。
-5. `a` 和 `a/b` 可同时为合法 S3 keys，却不能同时放进 UnixFS 同一个名字。检测这种文件/目录冲突后整个 root 标 failed/path_conflict；不重命名、不丢文件、不挑一个子集仍返回 partial CID。默认兼容模式不影响旧对象发布；strict 选择依 §8。
-6. 固定 directory CID codec/hash、链接排序和构建版本；同一最终路径/CID 集合重复构建得到同一个 root。只要求本实现的确定性，不声称等于任意 `ipfs add -r` 配置所得 CID。
-
-### 5.3 Builder：不重读全部文件内容
-
-首选验证 **bottom-up UnixFS directory dag-pb，经 dag/put 写入**，复用已成功条目 CID，目录只含标准 UnixFS Directory Data 和命名 Links。使用合法 CID 解析及规范化；不同 CID 文本表示不等于不同 DAG。不可用自定义 JSON manifest 的 CID 冒充 UnixFS root。
-
-阶段开始做有限协议验证后冻结实现路线：
-
-- 用 Kubo v0.43.0（以及声明支持的现场版本）验证 dag-json → dag-pb、Directory Data、UTF-8 名字、按标准排序、link Tsize、嵌套读取、`ls` 与 `/ipfs/<root>/<relative>` resolve。
-- Tsize 是 DAG 累积尺寸，不是 S3 logical_size；选择官方支持的元数据查询或经测试的尺寸计算，不能猜。可以读取有限 DAG 元数据，不能 cat/re-add 所有文件。
-- dag/put 终态和后续 recursive pin/完整性验证都成功后才拿到可发布 receipt。成功输出后的 trailer/commit 失败仍是失败/未知。
-- 大扇出目录可能超过 DAG block 大小。实测既有最大条目/名称预算；若 flat dag-pb 超界，必须在同阶段支持标准 UnixFS HAMT 或采用已验证、批次隔离的 MFS 构建路线。不能悄悄缩小 ZIP 接受上限来回避。MFS 属备选而非默认：必须证明精确暂存命名空间、跨进程隔离、GC 保护及只删除本批自有路径，不做全局 files/rm；若需扩大节点权限则先授权。
-- 构建 RPC、元数据字节数、树深度、并发和执行期限有界；取消及时释放槽位。调用数量按目录/节点预算，不无限递归或启动每文件 future。记录 10k 条目情况下的调用数、峰值内存及耗时。
-- 不新增网络可控 endpoint，不通过客户端 tag 修改 Kubo 地址，不自动降级到不保 CID 的重新 add。
-
-### 5.4 本地根归属、发布与恢复
-
-新增独立 batch/root 引用表，或等价的有约束 typed owner 模型；**不得放宽现有对象 residency FK 来伪造 root 的对象身份**。Root owner 不依赖 archive 存在；保持物理节点/tier/CID 绑定，可复用 physical residency 的验证结果但使用独立引用关系。
-
-推荐时序（允许等价实现，不变更事务边界）：
-
-1. 接收时分配稳定 batch，持久化捕获配置、构建尝试/fence；沿用 direct/MPU/import 的 mutation/claim heartbeat，读取/解压/构根均可取消。
-2. 提取后保存或准备最终 manifest，在 DB 长事务之外构建、pin、验证目录。预先记下 root build 意图；每个确定 CID/未知副作用可恢复，不在进程内留下唯一记录。
-3. 在已有原子发布事务中提交成功对象及其版本、有效 pin 意图、manifest、root receipt/status、独立 root owner 和终态结果。claim 失效或发布失败不能把已构建目录宣称为成功批次。
-4. DB 提交结果不确定时按 batch/fingerprint 查 durable outcome，不重发对象版本。构建或 pin 响应丢失只对账/重做确定性 root 工作；root-only retry 使用同一 manifest，不重新解压/发布/远传成功文件。
-5. 进程终止、断线、ownership lost、lease 到期、并发 retry 下，旧尝试不能覆盖新 revision。发布前构成的 root 若变成 orphan 也登记为未采用/retain，不能对相同 CID 无所有权地 pin/rm。
-
-root 是该批的持久快照，不随单个输出删除/覆盖自动改写或取消；batch 记录与 root 引用不能因 archive lifecycle 删除而级联丢失。当前本地策略是不自动 unpin/GC：逻辑 retirement 与物理保留分别可见，保护记录参与未来 GC 的安全边界，但本轮不实现自动 GC。构建暂存/未采用根也要有容量、数量与告警预算；若现场已经启用外部 GC，验证构建中间 DAG 的 pin 保护/恢复，不凭 DB 引用声称 Kubo 自己懂该保护。
-
-目录 root 的本地 recursive pin 不建立远程 lease，不计为独立 remote replica。需要未来远传 root 时应使用完整 DAG CAR/目录能力与新显式授权，不能 `cat(root)` 或认为叶文件远端 pinned 等于目录根已远端 pinned。
-
-## 6. 阶段计划与提交边界
-
-推荐顺序 **1 → 2 → 3 → 4 → 5 → 6 → 7 → 8**。Stage 4 的 ZIP/UnixFS 不依赖 Filebase/Cluster，优先交付用户新增需求。Stage 5 只依赖 1–3，Stage 6 依赖 5；Stage 7 的单对象运维可以在 2–3 后推进，批次 backfill 依赖 4。允许按证据调整内部顺序，不牺牲每阶段可用成果或安全前置条件。只有 §8 的相应受影响分支等待裁定，其余已明确工作无需重复审批。
-
-每阶段先用定点 failing regression 锁定旧缺陷/新契约，再最小实现；随功能同步配置示例、用户文档、迁移说明及证据。以下 commit 是后续执行建议，不是 planner 执行的命令。
-
-### Stage 1 — 当前缺陷与安全基线（R01/R02/R03/R04/R07/R13）
-
-**成果：**当前 Pinata 路径可诊断、拒绝不永远恢复、upload 不依赖无关 CID 队列、停滞能退出且所有日志级别不泄密。
-
-- 修改 `pinata.rs`、`provider.rs`、`worker.rs`、`store/pinning/jobs.rs` 及必要增量迁移，保留最小实际协议快照/副作用字段供 Stage 2 扩展；不以临时内存状态取代恢复证据。
-- null/missing/[] 只在列表字段兼容；错误类型/畸形 JSON仍报 protocol。分页 snake/camel 非空 token、字段冲突、token 循环/截断有界失败，不将不完整列表视为 absent。
-- 安全限长读取错误体；确定套餐/权限拒绝与认证错误分开，未知 403 不猜。能力级拒绝不锁死 upload/list/cleanup；真正凭据错误按凭据作用域阻塞并能在显式修复后恢复。
-- 持久化 effect certainty 和初始错误；明确拒绝 blocked/failed，明确未创建的 transient 退避，可能创建先 reconcile。耗尽恢复次数/时间进入 needs_attention，保留引用与容量，不继续高频调度、不盲重传。
-- 新任务按历史实际 strategy/API 查询；旧任务证据未知先隔离，不能因为 TOML 改 upload 就假定过去也 upload。
-- pinning 上传增加无进展期限、源流/响应等待与独立 recovery budget；参考现有 tier_copy 进度机制，不加误杀正常大文件的固定短总超时。超时可能有副作用，取消不等于未创建。
-- R04 覆盖第三方 s3s：优先在 subscriber 对未审计 request-dump target 设**不可由 RUST_LOG 覆盖的独立硬过滤**，同时保留安全白名单业务日志；若选择依赖修补/升级须验证 API 兼容，不只覆盖一行 EnvFilter。检查 response/error/debug dump 及 URL、headers、query、正文、配置 Debug 的全部出口。
-
-**证据：**新 fixture tests + 实际 HTTP 请求计数；403 CID blocked 后 upload/list 可用；超时→重启→find 不重复 POST；达到预算后 worker 不继续 IO；缓慢持续进展不超时、停滞释放槽位。真实 axum+s3s 表面用 Authorization/预签名/Cookie/SSE-C/token 哨兵值在 info/debug/trace、恶意 target RUST_LOG 下捕获输出，断言无泄漏且安全诊断仍存在。
-
-**命令入口：**`cargo test --lib pinning::`，`cargo test --bin ipfs-s3-gateway`，新增进程级日志测试（新增前明确命名，不能把零匹配算通过）。结束执行通用质量门槛。
-
-**提交：**`fix: harden pinning recovery and redact request diagnostics`。停止边界：不新增 RPC provider、不重排生产旧任务、不把 Stage 2 的全部模型重构塞进补丁。
-
-### Stage 2 — 稳定身份、归属与可观察 ledger（R08/R10/R11/R21 基础）
-
-**成果：**现有 PSA/Pinata 就能正确显示历史路由、共享占用、错误/恢复证据，配置改名/策略变化不误操作已有资源。
-
-- 在 `config.rs`、`pinning/config.rs`、`provider.rs`、coordinator/worker 和 `store/pinning/{leases,quota,jobs,publication}.rs` 增量落地 §4.1 模型，使用 `store/entities/remote_pin.rs` 的现有远程记录；可按职责新增 ledger 模块，不重写全部 worker。
-- 正式迁移 entities/schema；旧 request id 类型保留解析及原协议 cleanup 路由，unknown 旧记录进入有解释的隔离状态。schema 保留唯一键、CAS/fence、数据库时钟和共享引用并发保护。
-- 容量纳入 retain/清理失败/未知副作用；TTL 保存原起点和 expires_at，重试/迁移不延长；到期 in-flight 的 late success 仍记资源。配额淘汰沿用已存在 soft lease 规则，不为套餐拒绝淘汰内容。
-- status 提供 local/remote/verification 分层、first/last observed/error、原 CID、strategy、backend/scope；可用性至少一个 provider 与 all completion 分开。观察 stale/unknown 不擦除历史确认。
-- provider retirement 状态至少可停止新分配同时维持旧资源路由；完整管理动作 Stage 7 交付。
-
-**证据：**旧数据库 fixture升级与新库；SQLite + PostgreSQL 并发 attach/cancel/expire/cleanup；两个对象共 CID只占一次实际资源且不互删；外部 pre-existing/主 Kubo 同域不获删除权；改名、换 bucket、credential revision、丢旧配置均 fail-safe；retain 连续过期仍阻止越额；late success 不复活 lease。迁移前后旧 PSA/Pinata 行为及引用可读。
-
-**命令入口：**`cargo test --lib store::pinning::`，`cargo test --test multi_gateway`；新增该阶段 schema/PG 测试需明确执行环境，不能仅用 SQLite 代替 PG。
-
-**提交：**`feat: persist pinning identities and resource ownership ledger`。停止边界：不因新模型启用 managed 清理或扫描生产旧 tag。
-
-### Stage 3 — 可选控制、doctor 与策略解释（R15/R18/R11，R19 基础）
-
-**成果：**无 pin service 时主体操作成功并明确 skipped；raw tag 可读但永不隐式回放；能辨认实际加载配置和逐操作能力。
-
-- 实现共同 ExtensionDecision；覆盖普通 PUT、CopyObject、PutObjectTagging、MPU 初始化/完成、直接 ZIP、durable import。包含 warning 的响应只在主体实际成功后发；import 202 不伪报完成。
-- 本部署显式 warn，新配置样例 warn；旧部署省略兼容选项时保留旧拒绝语义并给迁移说明。无配置/无匹配/格式合法但可选不支持整体 skipped；基础损坏标签及主操作故障保持失败。
-- 持久 skipped 决定与 control revision；普通 tag 更新/复制/inherit 不重放，显式 reapply 的入口/模型留给 Stage 7。MPU 初始 skipped 后配置 provider，Complete 仍 skipped；初始 accepted 遇新的安全禁止不得越过保护。
-- 提供只读 config explain / pinning doctor/status/policy explain，启动安全摘要，能力 supported/denied/unknown 按 operation+scope+revision区分。管理入口明确本进程与文件配置的证据范围。
-- 公共 warning headers、v2 扩展 Warnings、分页安全状态查询及 CORS expose 示例；不把 raw provider body/tag 值写入 headers。对用户对象名和外发 metadata 默认最小化，correlation 使用不透明标识。
-
-**证据：**报告 T-HIST-01–06、T-HIST-09 和 §13.2 全部情景；HTTP 结果 + warnings + DB 无新增 pin工作/占额三重断言。新增 provider、重启、复制、普通标签改动都不激活 skipped；accepted 后实际失败不倒改历史决定。真实 SDK/CLI 至少验证标准 PUT/Complete 响应不损坏，并说明自定义头如何查看。
-
-**命令入口：**`cargo test --lib pinning::`，`cargo test --lib s3::`，`cargo test --test integration`，`cargo test --test cors`；新增 doctor/config CLI 测试确认命令无写副作用。
-
-**提交：**`feat: add persisted pin request decisions and diagnostics`。停止边界：不以警告绕过安全条件，不在 doctor 默认执行写探测。
-
-### Stage 4 — ZIP 批次、产物和 UnixFS 根（R06/R12/R19/R22/R23/R24）
-
-**成果：**三入口一致支持 ZIP 新模式与 root；默认兼容返回，source=false 有独立身份，partial/root失败可解释且不会重写已经成功的对象。
-
-- 先裁定 §8 的 ZIP/root 公共合同并完成 §5.3 有界 builder 验证；只阻塞相关 ZIP 代码，不阻塞其他阶段。
-- 落地 §4.3/§5；建议新模块 `src/zip/{batch,options,directory}.rs`、`src/kubo/directory.rs`、`src/store/zip/`，按责任拆分，不继续把所有逻辑堆入现有巨大 route/publication 文件。
-- migration 增加 batch/manifest/root owner/build snapshot；更新 config、tag 解析、`store/multipart`、import request fingerprint/result，以及 publish_standard_zip / MPU commit / import completion 的原子发布入口。
-- 形成统一最终发布集合再计算远程目标和目录；源可选但不移除既有 key/prefix ownership/fencing；v2 source=false 与旧客户端明确隔离。
-- 参数化既有 ZIP 限额，增加单条目/树/规划/事务目标数/处理期限预算，保留 CRC、安全路径及总量上限；长事务前完成有界规划。后台 fanout 复用 durable worker，per-provider 并发/在途预算、分批 claim 与公平性保证前台普通写及必要恢复/清理不被整批饿死。跨进程全局公平不在此伪实现。
-- root ready 仅在 final set、递归 pin/完整性、DB发布/receipt绑定都成功后返回；root failure 与对象发布边界按冻结合同执行。off、empty、complete、partial、failed、可重试中状态均有可查询语义。
-
-**证据：**
-
-1. direct PUT、MPU、import × config on/off × signed true/false/absent，捕获后配置改变、签名篡改/无效布尔/重复 tag、不支持 SSE；off零构根调用。
-2. simple/nested/Unicode/escaped names、empty file、多块文件、duplicate winner、import重复拒绝、a 与 a/b 冲突；root不含 prefix/archive；失败项不在树内；zero无 CID；partial有且仅有成功最终文件。
-3. 实际 Kubo `ls`/resolve/get及每条路径读取到预期原 CID和字节；确定性重复构建；不允许仅断言 mock Hash字段。构根调用记录证明没有 cat/re-add全部文件。
-4. 10k 条目/深路径/64 MiB元数据边界、flat目录超大/合法 HAMT、预算/取消；没有降低原 ZIP 接受能力来让 root 测试通过，超预算root明确失败而非伪成功。
-5. source=false时原 key 不存在/已有旧对象、versioning Enabled/Suspended/Disabled、结果关闭/旧客户端；源 ETag/VersionId不虚构，旧对象不动；source+extracted远程组合、逐输出 private策略、always不补源、auto/manual去重。
-6. 响应丢失/重启/MPU完成重放/import重试/相同token冲突；manifest、版本、root与pin job不重复。构根每个边界 crash/DB提交未知/lease失效/目录pin响应丢失均可恢复；只重试root不重发对象。
-7. archive不存在或被lifecycle删除时root owner仍正确；output覆盖后root仍表示原快照；不会出现伪FK、孤儿不可观察工作或自动pin/rm。
-8. 65/30条目×多provider，有共享CID、少数失败与quota_blocked：实际工作有界，计数分母准确、定向重试不重传成功项、普通写和recovery仍进展。
-
-**命令入口：**`cargo test --lib zip::`，`cargo test --lib import::`，`cargo test --lib s3::`，`cargo test --lib store::pinning::publication`，`cargo test --test integration`，`cargo test --test postgres_import`，`cargo test --test mutation_ownership_pg`，`cargo test --test residency_publication`。新增 `tests/zip_directory.rs`（拟）覆盖真实协议，现有真实客户端测试按可用已安装工具执行 PUT/MPU/import/GET；不能自动装 SDK或拉镜像。
-
-**提交：**`feat: add durable zip batches and UnixFS directory roots`。停止边界：不远程pin root、不启本地GC、不支持remote-only/tar/SSE、不放宽import重复规则。
-
-### Stage 5 — 公共 RPC、Filebase/Kubo 严格复制（R05/R09/R10/R13/R16/R21）
-
-**成果：**Filebase RPC/upload 和独立 Kubo cid/upload/car 使用同一安全底层但不同配置档；严格 CID 与所有权/恢复/配额随功能同时可用。
-
-- 新 `src/pinning/ipfs_rpc/` 抽 transport/add/observe/profile，复用 `src/kubo` 的 NDJSON、流式/idle/终态与 CAR 经验；主存储和远程实例的 endpoint、auth、scope 隔离。
-- Filebase旧配置无 api仍PSA；新增 kind=filebase/api=rpc/strategy=upload；公共 ipfs_rpc/profile=kubo。能力矩阵前置校验，Filebase PSA/upload拒绝。不把换域名当RPC适配。
-- Filebase仅发送官方及验证支持参数（add 的 cid-version/wrap-with-directory等）；不默认发送raw-leaves/chunker/pin=false/progress=true，不在upload后依赖已被拒绝的独立pin/add。
-- Kubo可固定导入参数，upload返回CID严格规范化比较；CIDv0/v1合法等价与codec/DAG真差异区分。mismatch不修改ETag，记录资源后按所有权决定清理，不能按CID删除外部资源。
-- Kubo CAR复用完整DAG传输，不用允许缺块的local-only导出来宣称完整；单根、Root/PinErrorMsg、末端/trailer、recursive根pin和实际内容验证齐全。目录不可走cat(root) upload。Filebase CAR保持experimental/unknown直到专项授权验证，不自动启用。
-- RPC query必须区别recursive/direct/indirect及完整/未知，不能依赖不存在的gateway metadata；丢响应用类型化observation和历史snapshot恢复。
-- URL无密码、可信管理员endpoint、内网显式授权、TLS/CA/mTLS与Bearer/Basic配置按支持范围验证；不关闭证书验证，不跨域重定向转凭据，status/gateway与RPC凭据隔离。普通S3 tag不能指定endpoint。
-
-**证据：**报告 T-RPC-01–06、11–16、18及R09矩阵；零/小/raw/多块/MPU/SSE stored bytes/ZIP entry/目录CAR；fake 200+Hash后trailer错误不算成功；流停滞与未知副作用；共享/外部pin无误删。双Kubo独立环境验证目标递归pin与隔离源后读回；Filebase真实小文件add→CID→账户pin→网关字节单独授权，未授权只记mock通过。
-
-**命令入口：**`cargo test --lib pinning::`，`cargo test --lib kubo::`，`cargo test --test integration`；新增RPC契约测试文件/受控真实测试，与现有`tests/lifecycle_transition_car_proxy.rs`回归，防止抽底层破坏hot/cold。
-
-**提交：**`feat: add scoped IPFS RPC pinning providers`。停止边界：无自动策略回退、无Filebase付费能力承诺、无未经授权的写探测或managed cleanup。
-
-### Stage 6 — Cluster 真正副本确认与 CAR 扩展（R17/R09/R11/R16）
-
-**成果：**Cluster是独立remote pin service而非替换主Kubo；Proxy接收、节点available、min_replicas完成分开。原生REST路径按独立协议交付，不偷用Proxy透传假装Cluster CAR。
-
-- `ClusterProxyProfile` 必须带 REST status verifier：读取 allocations 和全局 pins，绑定资源/分配revision、观察时间、去重peer；remote/missing/error/stale不算pinned副本。缺status配置不能注册为会伪报完成的完整provider。
-- min_replicas是确认条件，不冒充已改Cluster replication_min/max。provider内部先达标，再按policy one/all聚合；同pinset多地址一个backend，物理故障域未知不猜。
-- 原生 `ClusterRestProvider` 的add/CAR、状态、删除使用REST DTO/路径；不对同任务同时Proxy add和REST add。完整单根CAR、反向代理stream-channels配置及完整性另验；Proxy dag/import透传到配对Kubo不算Cluster登记/副本。
-- allocation变化/人工删除/状态端点掉线使新观察degraded/unknown但不抹历史；是否自动repair由显式配置，不从旧tag产生工作。
-
-**证据：**T-RPC-07–10、13、17–18：1/2与2/2、remote peer、陈旧观察、分配变化、多入口同域、不足副本不宣布all完成。完整/缺块/多根/错误根/重复块/源中断CAR，隔离源和第三方提供者后从确认的目标节点读取。实机使用已存在且授权的Kubo/Cluster镜像/环境；不得自动pull或在生产停止节点。
-
-**命令入口：**`cargo test --lib pinning::`，`cargo test --test cluster`（核对实际测试过滤/环境），新增Proxy+REST contract tests；真实副本验收必须记录具体版本、backend与节点观察，mock不得记为N/N实机通过。
-
-**提交：**`feat: verify Cluster pin replicas across proxy and REST APIs`。停止边界：不推断Filebase内部物理副本，不将两个同宿主peer宣传成灾备。
-
-### Stage 7 — 历史补 pin、迁移、退役与定向恢复（R08/R20/R21/R23）
-
-**成果：**修复旧队列、首次给历史子文件pin和退役源包意图是不同可审计动作，不靠SQL或重传ZIP。
-
-- 管理入口实现create/renew/cancel/reapply/backfill与retry/migrate/reconcile/retire；共享前述snapshot/ledger/claim/容量模型。read-only dry-run默认展示目标范围、精确版本/CID、费用相关数量/逻辑占用、未知副作用及待授权动作。
-- backfill规划→确认→执行，固定版本清单与幂等标识；覆盖/删除/不可读/新安全禁止逐条停止，不换成同key新对象。没有可信旧ZIP manifest时只列候选待明确确认，不能靠prefix或旧日志自动认领。
-- retry/migrate只改变已有目标的执行，不把archive CID变成entries；unknown先查旧协议，明确未发送/拒绝才能安全重新排。旧成功资源保留原管理协议。
-- retire停止新分配、盘点所有租约/retain/unknown/inflight/cleanup，再明确retain/迁移/受控清理；失去旧凭据或adapter时needs_attention，不删配置后无期限静默等待。retirement解除root逻辑引用也不触发本地pin/rm。
-- 多batch共享目标更新进度，定向retry只处理缺少要求的目标；不重复上传已确认内容，不降低all，也不默认取消旧源包意图。
-
-**证据：**报告T-HIST-07–14、16；旧SQLite/PG任务升级→diagnose→计划→确认→执行→重试/退役端到端。skipped需显式reapply；相同计划重放零额外发布/上传/重复计额；unknown残留不丢；到期/late成功/retain/cleanup失败占用准确。生产迁移仍须实际作用域授权，本阶段只在fixtures/隔离测试资源证明。
-
-**命令入口：**`cargo test --lib store::pinning::`，`cargo test --test multi_gateway`，新增管理CLI集成测试（含dry-run零DB业务写/零provider写与确认后并发变化）；PG专项按已授权环境执行。
-
-**提交：**`feat: add audited pinning backfill and provider retirement`。停止边界：不执行用户旧队列的真实迁移/删除，不把运维功能实现授权当生产变更授权。
-
-### Stage 8 — R14 有界研究与整体收尾（R14，R12/R13/R23 的P2边界）
-
-**成果：**在本文件内记录可执行的下一步建议、基准证据及明确的安全gate；不是生产GC/跨进程全局限速上线。
-
-- 对已交付单进程provider限速/并发/在途字节/扇出调度测65/10k条目与多副本混合流量，记录前台延迟、队列积压、恢复与清理进展、容量/暂存上限。未测得瓶颈不乱加索引或重做HA。
-- 研究跨进程backend级预算与公平性所需一致性/租约成本；现有每进程rate limit不能宣称全局保证。给出是否值得实施及具体触发阈值，不假装已部署。
-- 本地GC研究盘点对象版本、delete marker、lifecycle hot/cold、MPU parts、import暂存、ZIP batch/root、中间目录DAG、unknown副作用与共享CID引用；说明root生成默认ON增加保留的实际成本。
-- 提出未来安全GC的dry-run、全owner快照、在途屏障、ownership证明、双后端迁移与故障恢复条件；不得在研究中运行repo/gc、block/rm或解除本地pin。数据库逻辑引用释放不等于块释放。
-- Filebase CAR/删除/较大文件仍按单独授权测试记录supported/denied/unknown；字节备份（允许不同CID）、remote-only、成功后起算TTL仍是另行范围，不借收尾顺带实现。
-- 更新本文件的剩余风险、环境未验矩阵和用户文档边界；不另建独立spec/plan。
-
-**证据：**有界基准、资源归属矩阵、现有no-pin-rm回归和明确go/no-go条件；未得授权的外部实验列未执行。
-
-**提交：**`docs: record pinning capacity and local GC research boundaries`；若同时包含已授权离线性能测试，则可用`test:`标题并在正文明确研究而非生产能力。此提交属于用户要求的阶段提交，不是独立plan提交。
-
-## 7. R01–R24 完整追踪
-
-| ID | 范围与阶段 | 必须看到的结果 |
+| 阶段 | 交付范围 | 当前状态与提交 |
 |---|---|---|
-| R01 | 1：Pinata列表/分页 | null/missing/[]成功，非法/冲突/不全不当absent。 |
-| R02 | 1：结构化错误 | plan_restricted与auth/权限/未知403分离，安全根因保留。 |
-| R03 | 1–2：副作用恢复 | 确定拒绝停止恢复，unknown不盲POST，预算有效。 |
-| R04 | 1：日志 | 第三方s3s与所有RUST_LOG级别不泄露凭据/签名。 |
-| R05 | 5：Filebase RPC | 真upload完整闭环、不依赖被禁pin/add。 |
-| R06 | 4：ZIP产物 | 发布/远传分离，extracted-only不隐含源任务。 |
-| R07 | 1–2：恢复路由 | upload不无条件访问CID队列，历史协议不漂移。 |
-| R08 | 2、7：身份/迁移/退役 | 改配置后旧资源仍正确路由，不靠SQL。 |
-| R09 | 5–6；4目录验证 | 严格原CID、完整CAR，字节相同不冒充DAG相同。 |
-| R10 | 2、5–7：所有权 | 外部/共享/主存储pin不误删，清理有ledger。 |
-| R11 | 2–3、6：分层状态 | 接受、pin、可读、内容、复制各有范围/新鲜度。 |
-| R12 | 4、8：ZIP资源/恢复 | 已有预算不回退，可配置、有界、失败可恢复。 |
-| R13 | 1、5、8：停滞/预算 | 大文件持续进展可完成，stall释放槽位，unknown保留。 |
-| R14 | 8：专项研究 | 单进程与全局边界明确；不伪交付生产GC。 |
-| R15 | 3：warn/skipped | 主体成功+warning+无新增手动pin工作；旧tag不回放。 |
-| R16 | 5–6：公共RPC | Kubo/Filebase/Profile隔离，不替换主Kubo。 |
-| R17 | 6：Cluster | Proxy+REST达标证据，同pinset去重；原生REST/CAR独立协议。 |
-| R18 | 3：doctor | 实际配置/版本/secret来源状态明确，默认零写探测。 |
-| R19 | 3–4：逐目标策略 | 可解释first-match/priority/one/all与输出边界，不越权。 |
-| R20 | 7：历史首次pin | 精确版本清单、显式create/reapply/backfill，不重传ZIP。 |
-| R21 | 2、5、7：TTL/占用 | 原起点不重置；retain/unknown/清理未完持续计账。 |
-| R22 | 4：source=false | 版本化批次响应，无伪源ETag/Version，重试不重复发布。 |
-| R23 | 4、7、8：扇出/进度 | 目标和传输分开计数、有界调度、定向retry、公平性证据。 |
-| R24 | 4：UnixFS root | 默认ON/签名覆盖，真实最终路径树、partial/zero、兼容返回、独立owner。 |
+| 1 | Pinata 解析、错误分类、有界恢复与日志脱敏 | 已验收，`2c948dd` |
+| 2 | 稳定身份、所有权、容量与历史路由台账 | 已验收，`556c8e4` |
+| 3 | 持久可选控制、warn/skipped、只读诊断与策略解释 | 已验收，`ba06d45` |
+| 4 | 三入口 ZIP 批次、产物选择、UnixFS 目录根与恢复 | 已验收，`5d5e5c8` |
+| 5 | Filebase/Kubo RPC、严格原 CID 复制与完整 CAR | 已验收，`8093cbd`；真实付费账号能力未验 |
+| 6 | Cluster Proxy/REST 及真实副本确认 | 已验收，`1515f89`；同宿主测试不证明跨主机 HA |
+| 7 | 九类本地管理动作、持久凭据、受限 worker 与退役屏障 | 已验收，`63ca11f` |
+| 8 | 容量、跨进程公平性及未来本地 GC 的有界研究 | 未完成；草稿与失败基准不计验收通过 |
+| 9 R26 | 遗留未归域容量的显式迁移 | 已验收，`dc51927`；生产迁移未执行 |
+| 9 R25 | ZIP 解压产物自动 pin、共同意图/发布核心与配置分层 | 已验收，`55e06fa` |
 
-## 8. 已确认的公共合同与剩余环境边界
+最终集中验证：默认 feature lib 1646 passed、0 failed、6 ignored；integration 165 passed、0 failed；fmt 与 strict all-targets Clippy 通过。Stage 7 完整九类动作、十次 apply、三次真实 receipt-scoped worker 执行、同文件数据库关闭重开、完整私密历史恢复、精确配置绑定、过期确认的已提交结果重放、逐点导入、退役和导出均通过。隔离 PostgreSQL 的正式 apply（含 Renew/跨连接 replay）、managed Submit、retirement concurrency、root-release migration 四专项通过。阶段审查阻断已闭合。
 
-2026-09-20 用户明确选择以下三项推荐，后续直接据此实施，不重复询问：
+这些结果不证明生产迁移、外部付费账号权限或物理空间回收。Ignored、仅编译和重复 support 测试不计独立运行通过；各类真实节点、mock 和数据库证据的范围见[测试说明](../../testing.md)。
 
-1. **signed root=true 的失败强度。**与 config ON 一致：尝试生成，失败返回可查 warning/status，不影响原发布。文件/目录冲突必须 fail-closed root，不返回伪 root。
-2. **新 ZIP 逐输出 policy 组合。**入口允许上限与逐输出规则取交集，服务器强制约束冲突拒绝；legacy 保留，不以并集扩大外发范围，不把新限制静默套到旧模式。
-3. **source=false 的新协议协商。**只允许显式 v2 扩展和签名幂等 token，拒绝 result=false；响应以 batch 为身份，不伪造源 ETag/VersionId。对外参数名字依现有扩展命名约定实现并文档化。
-4. **v2 URL import 的固定输入快照。**URL 仅用于首次取得已承诺的 ZIP：客户端须提供已签名的预期 SHA-256，worker 完整读取并核验实际 ZIP 输入后保存摘要及 artifact。相同 token/同一承诺重放已提交的历史结果，不重新抓取 URL；签名预期摘要或请求合同变化返回冲突。URL 后来改为别的内容不会被历史重放察觉；首次抓取若已不符则安全失败。CID 输入也必须由 worker 实测完整 ZIP SHA-256，不能把 CID 当字节摘要；旧 XML/job 不回填虚假摘要。此为用户明确确认的重放语义，不承诺重复来源 GET 为零（崩溃发生于持久化前可能重抓）。
-5. **source=false 的 v2 Complete 零输出响应。**当没有任何文件成功发布且没有源对象时，先原子结算可查询的 batch 失败终态，再返回明确的 4xx；初次响应与相同 parts 的完成重放须返回相同错误，不重新执行 Kubo 或创建版本。客户端以创建 MPU 时获得的 UploadId 查询 batch；不能仅返回 HTTP 200 并依赖自定义 XML 中的 `failed` 才识别失败。source=true 且真实源对象已发布的零提取结果不受这条无源规则误伤。这是用户在 Stage 4 实施中单独确认的协议裁定。
-6. **Stage 4 的远端账号验收边界。**用户允许以隔离的真实 Kubo／PostgreSQL、真实 SigV4 请求以及模拟 URL／provider 完成本阶段本地验收；真实 Filebase／Pinata 账号写入或付费操作明确为 **NOT RUN**，不能把 mock 等同于账号权限或远端副本证明，也不要求为 Stage 4 提交而执行未经授权的写入。Stage 5／6 的真实外部能力验证仍须单独取得相应授权和测试环境。
+## 共同安全与兼容合同
 
-实现层的dag/put尺寸/HAMT选择通过有界协议证据解决，不默认上升为用户设计审批；若只能通过新增节点权限、降低原ZIP上限或改变返回承诺实现，再升级该具体问题。真实provider写测试授权、现场后端版本/身份、PG/容器环境是环境与权限gate，不阻塞离线修复或被视为功能已验收。
+- 本地发布、accepted/skipped/rejected、remote_submitted、remote_pinned、gateway_verified、content_verified、replication_complete 分层保存。源包成功或单个 provider 成功不代表整批、全部副本已完成。
+- 未知副作用保持 unknown。超时、解析失败、权限不足、分页不全不证明 absent，也不允许盲目重 POST。明确拒绝停止无效恢复，重试与查询受次数、时间及无进展预算约束；迟到结果仍登记实际资源，不复活过期租约。
+- 资源按稳定 backend/scope/CID/resource type 归域；配置别名、URL、secret 或其 hash 不是副本身份。同域共享 CID 只计一次实际资源，不同 owner 保留各自引用。同一 Cluster pinset 的多个入口不是独立副本。
+- 默认 cleanup=retain。Managed 清理须有排他管理、确定应用归属、零引用、无在途操作和当前 fence；外部/未知资源不能自动删除。retain、unknown、清理失败与在途责任继续计账，TTL 到期不自动释放容量。
+- TTL 从既有意图接受/本地发布起算；远端成功、重试、迁移不重置起点。它是保留请求，不是服务商硬 TTL 保证。
+- 不自动执行本地 `pin/rm`、`repo/gc`、`block/rm` 或批量删除。取消引用、逻辑退役、远端 absent 与物理块/账单释放是不同事实。
+- 显式选择 cid/upload/car，不自动切换端点、策略或公开性。复制原 CID 对应的实际存储字节；加密对象不能解密后上传 public。目录不能通过 `cat(root)` 冒充完整 DAG。
+- 持久 ExtensionDecision 是执行依据。普通 tag 更新、复制、重启或新增 provider 不激活旧 skipped 意图；手动控制整体 skipped 不取消服务器独立自动意图。只有可选控制能 warn，鉴权、基础标签结构、完整性、加密、DB/Kubo 主写及强制保护仍失败。
+- 配置与历史 invocation/route/ownership 分开。当前 TOML 不证明历史账号、协议或副作用；缺历史凭据/adapter 时 needs_attention，不借当前默认路由执行旧工作。
+- 网络操作不进入长数据库事务。发布、任务、凭据和响应恢复沿用数据库时钟、claim、generation/epoch、原生精度 CAS、ownership 和固定锁序；旧尝试不能覆盖新状态。PG 围栏须覆盖空集/插入 phantom，不能只锁现有行。
+- 升级前停止并排空全部旧 writers/workers，备份数据库；不支持混合版本。保留不可变历史、占额及凭据，禁止通过删表、清空旧预留或重写捕获决定绕过拒绝的迁移/回滚。
+- 标准 S3 响应、ETag=CID、VersionId 和既有非 ZIP 行为不变。日志与公开诊断不泄露签名、凭据、URL query 或原始 provider 错误；第三方 request dump 不能由 RUST_LOG 重新开启。Doctor 默认零写探测，其独立 CLI 配置不冒充正在运行的网关配置。
 
-## 9. 统一质量门槛与执行记录
+## ZIP 批次、自动意图与目录根
 
-每阶段只对相关输入变更重跑对应验证，最终执行适用整体验证。使用PowerShell，不用Bash环境变量语法或`&&`；不安装软件。命令成功必须结合测试数量/断言、未ignored/未环境跳过和真实行为证据。
+### 发布与重放
 
-```powershell
-cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test --lib
-cargo test --test integration
-```
+直接 PUT、MPU Complete 和 durable import 共用捕获意图、最终清单、发布/租约及生命周期核心。v1/v2 只保留协议形态与显式细粒度能力差异。客户端不计算预期摘要，也不理解内部 provider/policy/target 身份；未知、重复、畸形或矛盾控制统一拒绝，完整 SigV4 与桶权限验证不削弱。
 
-上列是验收命令而非规划时已执行结果。完整测试若需未安装依赖/未授权下载，先报告阻塞，不自行安装。DB迁移阶段须有SQLite及真正PG并发证据；真实HTTP/SDK、双Kubo/Cluster、provider账号实验分别列出环境/版本/授权范围。长期worker、测试网关和容器仅清理由本轮创建且身份确认的资源，不能使用宽泛`docker compose down -v`删除未知卷。
+发布源包/提取文件与远端目标选择分开。`publish_source=false` 仅允许显式 v2、显式幂等 token 和批次结果，拒绝 `decompress-zip-result=false`。原 source key 的旧对象不被删除或覆盖，不构造虚假 ETag、VersionId 或 archive owner。全部输出 guard 在同一 bucket-first 准入边界核验，不能借 prefix overlap 失效 source 的其他 writer；准入后 guard 丢失令批次失败，不重新抢回 key。
 
-每阶段提交前按仓库规则检查 `git status`、`git diff`、`git log --oneline -10`，仅stage本阶段预期文件、排除secret/临时日志；不改Git配置、不跳hooks。若工作区有其他变更则保留并分离，不能假定规划时clean仍成立。用户已授权每阶段commit，不重复询问；没有任何push授权。
+成功清单固定本批实际发布的精确对象版本/CID，而不是当前同 key。direct/MPU 保持 last-success winner，import 保持重复目的地/源包冲突拒绝；路径、CRC、截断、ZIP+SSE 拒绝及资源限额不降低。默认每操作 8 GiB 展开、16 GiB 压缩、10000 entries、64 MiB metadata，另有有界构建/处理预算；这些不是跨请求磁盘承诺。全局拒绝、失败项、空目录项或零目标不创建空租约。
 
-阶段执行记录：
+相同 token/UploadId 与相同合同只重放持久结果，不重新发布、建租约或计额；不同合同冲突。MPU 核对 parts，直接上传核对完整原始 bytes。URL/CID 输入首次取回并完整校验后绑定 artifact；绑定后恢复只读该 artifact，不重新取源换内容。绑定前崩溃可能再次获取；绑定后缺失/损坏必须显式失败。提交未知先按相同序列化边界查 durable outcome，不把 open 暂态当回滚证明。
 
-| 阶段 | 状态 | 行为/测试证据 | 实机未验或裁定 | Commit |
-|---|---|---|---|---|
-| 1 | 已提交 | lib 1187 passed / 1 ignored；bin 13、integration 164、真实日志 2；PG 并发 3 passed；pinning 定向 352 passed | 未执行真实 Pinata/Filebase 账号写入；完整身份/账户 scope 模型留给 Stage 2 | `2c948dd` |
-| 2 | 已验收 | lib 1196 passed / 1 ignored、integration 164；Stage 2 专项默认测试通过；隔离 PG 17 迁移/并发/交接 9 passed；fmt、clippy `--all-targets -D warnings` 与限定复核通过 | 曾有一次 PG 路由缺失间歇错误，受控提交/回滚可见性实验与后续整合未再现，根因仍未确认；真实 provider 账号写入未执行 | `556c8e4` |
-| 3 | 已验收 | 同一整合命令共 1443 passed / 1 ignored / 0 failed（lib 1250、integration 165），fmt、clippy `--all-targets -D warnings`、diff-check；双进程 SigV4 MPU 1/1；隔离 PG17 schema 5/5、route 交错 2/2；限定复核无剩余 Critical/Important | 新 Noop 改动尚未 PG 实跑；真实 Pinata/Filebase 账号、import 跨进程、全量 F1 未验，Stage 2 PG 旧 route 间歇错误根因仍未确认；import `202` 仅 accepted | `ba06d45` |
-| 4 | 已验收并提交 | 真实 Kubo 0.43.0 目录 4/4、PG17.11 opt-in 15 个独立用例、R23 显式负载 1/1、独立 OS 进程 import artifact 恢复 1/1；选定整合 1852 passed / 4 ignored；最后三项 Important 修复后受影响 targets 198 passed / 1 ignored；当前 fmt、Rust 1.92 MSRV、严格 all-targets clippy 通过，限定复核无剩余 Critical/Important | 首次构根取消只保留原 claim 的候选，不采用或发布；MPU 扁平 capture 恢复与 source CID 统一预锁已闭合。取消测试的并行 gate 排队问题以 fixture 入场隔离修复，未放宽生产限制或断言。测试数字含重复 support 自测；进程恢复是 test-executable、root off，非生产 main。真实 Filebase/Pinata 账号写 NOT RUN；不 push | `5d5e5c8` |
-| 5 | 已验收，随本阶段提交 | 配置 7、CID publication 7、新旧诊断 14、旧 PSA 15、RPC leaf 51、RPC worker 11、SQLite 台账 9、隔离 PG17 台账 1 项与 registered-worker/SigV4 bridge 2 项实际通过。双 Kubo 0.43.0 单次 runner `24c5b32e5a224c1cb57be7784c564cd2` PASS，8 roots 离源后 offline 全块/字节核对、owned cleanup 通过。两并发 Important 及 PG 纳秒/微秒 claim 比较缺陷已最小修复，限定复核无剩余 Critical/Important；最新受影响 targets 28 passed/2 PG ignored，PG17.11 recovery exact 另行实跑 1 passed，涵盖新 UNION/native models 与精确 SQL fence。最新 pinning lib 460、integration 165、fmt、严格 all-targets clippy、Rust 1.92 与 diff-check 通过 | 修正前 full lib 为 1400 passed/1 ignored，不冒充修正后 full lib。临时 PG schemas/container inventory 零残留；未知/多根/mismatch 不重 POST、不清理、不授 AppCreated。双 Kubo 是叶/DAG/stored bytes；匿名 Basic/Bearer 只 header 传输；Filebase/Pinata 真实账号与账号鉴权 NOT RUN，不 push | 随本阶段提交 |
-| 6 | 独立叶已准备，整阶段未验收 | 传输及统一网络策略叶已实现，尚未正式注册。新网络策略下单次 runner `58672868d8ee43baaddd5aa3960881b5` exit 0：默认 34 passed / 1 ignored，真实叶用例 1 passed，四个缺 endpoint 门禁 fail-closed；隔离 Kubo 0.43.0 / Cluster 1.1.6 实际 1/2 → 2/2 → 停分配节点后 fresh observation 非 Complete，旧证明失效，同 pinset 双地址仅一逻辑域，logs-first owned cleanup 及空 inventory 已核对。旧 compile FAIL 与历史运行保留 | 只证明 REST verifier 叶；不代表配置/worker/Proxy/原生 REST CAR 整阶段验收，不包含持续 N/N、账号能力或字节灾难恢复承诺 | — |
-| 7 | 独立叶准备中，未验收 | 纯数据固定计划及完整确认模型已准备；有界 wire v1 定向 54 passed（原 39 + 新 15），导入 applied 仅为未可信声明，完整绑定替换与预算反例通过 | CLI、权威 DB snapshot、确认后的事务执行与 durable receipt 尚未接入；不包含生产迁移授权 | — |
-| 8 | 研究与基准准备中，未验收 | 全 owner / GC NO-GO 报告已准备；双 OS test-executable、共享临时 SQLite、loopback PSA 的一次 60 秒基准实际失败（exit 101），观察到 aggregate HTTP 峰值并发 4、1 次 429、普通/历史查询恢复进展；3 个 Submit 仍 running/ready，正在定点调查 | 失败与部分测量不计 PASS；无单进程 baseline、非 production main、不证明 RPC late receipt；研究不包含生产 GC 授权 | — |
+无源且零成功的 v2 Complete 原子保存可查询失败终态，首次和相同 parts 的重放均返回相同 4xx。import 202 只表示受理。批次、manifest、根引用及恢复身份独立于 archive 生命周期。
 
-执行者可调整模块拆分、测试文件名和内部实施顺序，前提是保持目标、已确认合同、权限、安全及上述证据不变。重大偏离记录决定、依据与错误代价；安全、数据、公共协议或外部副作用变化交回调用方裁定。由调用方组织所需plan-critic；本planner不派生审查或执行agent，也不把计划完成当作审查/实现完成。
+### R25 自动产物与配置
 
-2026-10-03 用户要求的一次计划复核未发现 Stage 4–8 的计划级阻塞；直接继续实施，不追加设计审批或重复计划评审。已知产品缺陷属于阶段收尾，不得因计划通过而视作实现验收。后续仍按每阶段验证后一个 commit、不 push、不使用 deep agent 执行。
+`auto_pin_outputs` 在三入口和 v1/v2 使用同一语义。开启后仅在现有自动 policy 授权内，为成功发布的精确 output object 建立 Automatic lease；默认不为 archive/root/prefix 建远端意图。无 provider/自动授权时无隐式远端工作；关闭自动开关不关闭明确获准的手动控制。非 ZIP 自动行为不变。
 
-### Stage 1 验收补充
+原 `pin=true&content=decompressed` 保持 archive-owned Manual lease，targets 为本批成功输出。自动产物租约则各自 output-owned，删除 archive 不连带取消这些自动租约，删除子对象不改写 archive 的手动归属。v2 显式 source/both 仍须实际发布并获授权；无 source 与 archive-owner 手动意图矛盾时拒绝。版本化覆盖、delete marker、DeleteVersion 按精确 owner 生命周期处理，不用当前版本替代旧版本。
 
-- 新增 `pin_submit_history` 保存实际调用协议/策略、副作用确定性、首末安全错误、恢复预算与隔离原因；旧无证据的未完成提交隔离，不凭新配置推断旧策略。升级须停止旧 worker，保留占额与恢复责任；本阶段不提供更换账户/endpoint 的透明迁移。
-- Pinata/PSA 禁止自动跟随重定向，3xx 不作为未创建证明；合法重新提交重新激活恢复状态但不清空累计预算。明确拒绝与未知副作用分流；upload 查询不进入无关 CID 队列。
-- Submit 停放及 history 更新在同一带 fence 事务中完成。无 request 的 Reconcile 在锁 remote/Reconcile 之前按 ID 获取 Submit fence、锁后复查。显式 repair 使用 Submit → history → Reconcile wake 顺序，覆盖两个竞争顺序，避免丢失唤醒。
-- `tests/postgres_pinning_stage1.rs` 在专用 PostgreSQL 17 中实际执行 3 项：takeover 阻塞、最终 CAS 失败回滚、repair/park 双向交错；fixture schema 清理确认剩余为零。检查精确 stale 错误，避免较早 SQL 错误造成假通过。
-- `tests/request_logging.rs` 驱动实际 binary 和已认证的 DeleteObjects，注入正文 key/自由 DB error 哨兵，在 info/debug/trace 和恶意 target filter 下验证硬过滤。安全 request ID、状态和有限 failure class 保留；第三方 dump 和敏感字段事件不可由 RUST_LOG 开启。
-- 最后整合命令：`cargo test --locked --offline --lib --bin ipfs-s3-gateway --test integration --test request_logging --quiet` 全部通过；未将 ignored PG snapshot 或真实远端未执行项计作通过。Stage 1 限定复核无剩余 Critical/Important。
+普通 policy 保持 ordered first-match、literal prefix、one 粘性/故障转移和完整 all；ZIP 输出规则与入口允许上限取交集，deny 优先否决，显式空规则/未匹配不授权。配置引用可读 policy，旧不透明引用仅按原值精确兼容解析。旧 Always/ZIP rules 配置须显式选择新自动语义或关闭，不能静默改变外发范围。历史 capture 按原合同解码，不用当前默认值补授权。
 
-### Stage 2 验收补充
+### UnixFS 根
 
-- 新的显式 provider 路由以 backend/scope/resource type 作为容量域，别名共用一份占额；历史快照分别绑定资源和实际调用。旧库占额缺少作用域证明时保留且阻止新显式分配，已确认 absent 则允许；不能凭当前 TOML 把旧 pinned CID 或其 owned 状态移交新账户。
-- 同 CID 附加时，Submit/Poll 的 epoch 可在请求、原 target/generation 与路由仍属同一资源生命周期、且无归档释放的条件下接续；历史请求在退役或策略变动后只可只读 Poll，不新建 Submit。A 取消后 B 的读追踪和首个 POST 响应在同一受 fence 的事务内交接，账户/凭据/endpoint 变化仍阻断 IO。
-- PSA 的成功请求 ID 不证明排他创建；缺证明时 ownership 保持 unknown、禁止 managed DELETE。retained 的实际 pinned 资源重新附加活跃引用后只恢复有效性，不重新计额、重置 TTL 或伪造观测时间；仅真实 provider 返回更新 `last_observed_at`。
-- SQLite 及真实隔离 PostgreSQL 17 专项覆盖旧库升级、shared CID、retain/cleanup、迟到响应、两个 PG ledger INSERT 可见性顺序（commit/rollback）、Poll/cancel 的两个锁序；测试仅在各自 UUID schema 内写入，均已清理。真实 Kubo/Pinata/Filebase 账户以及生产数据迁移未执行。
-- PostgreSQL 综合测试曾间歇出现一次 `remote allocation lacks a current, matching historical route`；后续受控双连接 PG 插入、提交/回滚与多次整合均通过，但原始间歇根因未被证实。测试保留失败时的脱敏路由状态诊断，不得宣称已针对该异常修复。
+默认开启，精确 `ipfs-s3:zip-root=true|false` 覆盖；MPU 初始化、import 接收时持久捕获，后续配置变化不漂移。开关与 remote pin 控制独立。根包含成功最终文件的 ZIP 相对路径，不含 S3 prefix、archive、失败项或额外空目录；保留大小写、Unicode 与嵌套路径。
 
-### Stage 3 验收补充与证据边界
+OFF 零构根调用；零成功无 CID；部分成功返回 partial，完整成功返回 complete。文件/目录同名冲突或构树失败须 failed/warning，不返回漏链接或未经验证的根。启用表示尝试，不是 strict 原子成功承诺：根失败不撤销已成功对象，也不改旧 FailedCount 或诱导整体重复写入。
 
-- `src/config.rs` 的 `[pinning_control] unavailable = "warn"` 为显式选择，省略时仍为 strict。`config.example.toml` 展示 warn，但保留原有 `always`/`all` 自动策略；可选手动控制被 skipped 不等于服务器自动意图被放宽。`src/pinning/decision.rs` 的决定保存 effect、受限 warning、control/config revision 和有效意图，不以原始 tag 重扫旧 skipped 或 legacy-unknown 控制。
-- 普通 PUT、Copy、tagging 与直接 ZIP 的成功响应、MPU 初始化/完成和 import 接收/状态路径在代码中接入 `x-ipfs3-pin-warning`；MPU 初始化持久捕获，完成复用而不重新评估；import `202` 仅 accepted，不是对象或远端 pin 完成。警告头只有固定 ASCII 类别，CORS 必须按桶内授权规则显式 expose，不能自动向任意 origin 暴露。
-- 新受理的 MPU/import 若有可执行非 Noop 远端意图，每个可执行的已配置非 Noop provider 均须显式配置 `[pinning_identity.providers]` 及运营指定的 `credential_revision` / `endpoint_revision`；拒绝新 legacy async，不重写旧 job。Noop 或无可执行意图允许。同配置真实双进程 SigV4 MPU 完成 1/1；两种 revision 变动均在副作用前拒绝。新远端提交使用 opaque UUID correlation，旧 job 原结构化 ID 仍用于 Find。0003/0004/0005/0006 仅追加迁移，不修改历史 production up/down；PG17 schema 5/5、route 交错 2/2，新 Noop 改动尚未 PG 实跑。
-- `src/diagnostics.rs` 的 doctor/config/policy 是独立 CLI 的局部有效配置证据，不是运行网关配置或真实账户权限探测；`src/diagnostics/status.rs` 只读查询已配置 DB 的单页快照，不启动迁移/远端探测。SQLite 不创建缺失文件，PG 使用只读事务；分页间并发变动可能改变 offset 结果。
-- 升级 0003/0004/0005/0006 前停净所有旧 writer/worker 并备份；禁止旧新混跑或通过删除 decision 数据回滚，下滚 fail-closed。发布事务在 usage 锁后验证并锁住捕获的 provider route；MPU/import 在源 I/O 前做额外预检。Noop 同名改成真实 provider 也不能让旧决定外发。SQLite 的 Noop 反例与 PostgreSQL 的真实 route 交错分开验收，新 Noop 改动未在 PG 实跑。PSA request ID 不构成独占创建证明，integration 的旧 DELETE 假设调整为 Unknown ownership 禁 DELETE、保留占额；有证明的 managed cleanup 和八次失败预算仍由 store/ledger 回归覆盖。整合命令 `cargo test --locked --offline --lib --test integration --test cors --test multipart_pin_decision --test stage3_migrations --test stage3_route_fence --test stage3_restart --test diagnostics --test import_legacy_replay --quiet` 为 1443 passed、1 ignored、0 failed；这不等同全量 F1 或真实 provider 账号验收。测试入口及未验范围见 `docs/testing.md`。
+使用标准 UnixFS Directory/HAMT、规范 CID、固定 codec/hash/链接排序与构建 revision，bottom-up `dag/put` 复用叶 CID，不 cat/re-add 全文件。Tsize 使用 DAG 累积尺寸；支持既有最大条目/名称预算，不通过缩小 ZIP 上限回避大扇出。构建 RPC、元数据、深度、并发、时限和取消有界。终态/trailer、recursive pin、完整 DAG 与路径读取验证及 DB receipt 绑定完成后才发布 root CID。
+
+独立 root owner 绑定 batch/revision/epoch/node/tier/CID，不伪造 object FK。历史根是持久快照，输出覆盖/删除不改树；root-only retry 不重新解压、发布或远传成功文件。未采用候选、中间节点与未知副作用保留可观察责任。根本地 pin 不建立远程租约，也不计独立副本；远传根需显式完整 DAG 能力与授权。
+
+## Provider、遗留迁移与管理
+
+Pinata 列表兼容 missing/null/[]，分页兼容已支持的 snake/camel 字段；非法类型、字段冲突、token 循环或截断必须有界失败，不当 absent。套餐拒绝、权限拒绝、鉴权和未知 403 分开，错误体安全限长；能力级拒绝不误封其他操作。Upload 查询不依赖无关 CID 队列，恢复遵从真实历史 API/strategy，无进展超时不误杀持续传输的大文件。默认只读的 config/policy/doctor/status 提供当前有效配置来源、安全能力与分层状态，不自动写探测；warning/status headers 有界 ASCII，CORS 只在桶规则授权范围 expose，旧 S3 body 不注入新格式。
+
+Filebase 旧 PSA 配置保持兼容，RPC upload 只发送支持的参数，不依赖被拒绝的独立 `pin/add`。Kubo cid/upload/car 严格比较 codec/multihash 与完整 DAG；HTTP 200、Hash 或匹配 CID 不替代 EOF/trailer、recursive pin、内容验证或排他创建证明。CAR 检查单根、缺块、错误根与终态。Filebase CAR 不默认为已验能力。
+
+Cluster 是独立 provider，不替换主 Kubo。Proxy 和原生 REST 使用各自协议，均需 REST verifier；Proxy `dag/import` 透传不算 Cluster CAR 登记。fresh、去重的 allocated peers 满足冻结 min_replicas/max_age 后才参加 one/all 聚合；queued/remote/missing/error/stale 不算副本。min_replicas 不修改 Cluster replication_min/max；分配变化使新观察 degraded/unknown，不抹历史。
+
+### R26 遗留容量迁移
+
+正式 CLI 默认只读 dry-run，不创建库、自动升级、注册 provider、启动 worker 或访问远端。操作员逐类声明真实精确 namespace、账号域和历史路由配对；当前配置不是历史归属证明。完整闭包覆盖 usage/remotes/ledger、所有 lease/target/job、全部历史 epoch/observations、捕获 JSON、冻结副本要求和管理职责；缺证、冲突、超预算或集合漂移整体拒绝。
+
+确认后在完整原生围栏下原子 re-key 可变业务行、逐值转移占额并保存 durable receipt；不可变历史及原 payload 不改写。定点 receipt 只解析其确切历史到 operational 关系，不是全局 alias、账号成功证明或 Stage 7 授权。unknown/retain/在途/cleanup 责任及原 TTL 不变，不为解封清空台账、不新提交或 unpin。旧资源仍可查，新分配只有在所有实际 blocker 正确闭合后恢复。
+
+Apply/replay 与精确 rollback 双向幂等。Rollback 只在原 after-state 未被后续业务改变时允许，追加反向凭据、不删除旧凭据；失败全事务回滚。生产库迁移仍须单独取得实际作用域授权。
+
+### Stage 7 九类管理动作
+
+正式本地 CLI 默认有界只读计划，无管理 HTTP 面。确认绑定完整 request/plan/逐项 ACK、精确对象版本/CID、完整历史 route、原生数据库身份、主体及 DB-clock TTL。导入文件、UUID、applied claims、自洽 snapshot 或 R26 receipt 都不授写权限。新 apply 重读原生围栏并原子提交业务与逐项 receipt；提交结果未知和已过期确认的精确已提交重放只恢复原结果，不重授权限或延长 TTL。
+
+| 动作 | 必须保持的行为 |
+|---|---|
+| create | 为明确精确版本创建新意图/完整 BirthContract，不重发布内容，不碰撞覆盖旧 slot。 |
+| renew | 明确续期现有合法 lease，保留原 created_at/source/owner；不复活取消或退役责任。 |
+| cancel | 仅结束选定逻辑意图/引用，不清债、不授 unpin。 |
+| reapply | 显式为 skipped 建新 operator intent，原决定、capture 与合同不变。 |
+| backfill | 可信 committed manifest 固定成功版本；无 manifest 的候选须逐项确认，不靠 prefix/日志认领。 |
+| retry | 只重排可证明未发送/拒绝且未满足要求的工作；已确认内容复用，unknown 先观察。 |
+| migrate | 增加明确目的执行，保留源责任、原 TTL 和完整 one/all；逐点绑定真实用于历史读取、dispatch 与 completion，不重写历史 JSON。 |
+| reconcile | 按原 route/epoch 只读观察，不隐式转 Submit/Unpin。 |
+| retire | 在 canonical domain 建持久屏障并盘点所有责任，默认 retain；别名、新 ID 或重启不能复活分配。 |
+
+`RetireWith` 的迁移、受控 cleanup、精确 root 逻辑引用解除分别确认。解除根引用与 receipt 原子提交，不删除 manifest/verification/history，不改变旧响应，不影响共享引用，不触本地 pin/GC。退役不能通过此 CLI 撤销，阻断 publication/tagging/MPU/import/startup/worker 的新建、续期、reactivate/failover 和 dispatch；已有合法历史观察及迟到事实仍可登记，不能借域关闭抹责任。
+
+显式 evidence preparation 才允许 offline 本地源读取和证明写入。文件量实际 stored ciphertext/payload bytes，目录量完整 offline CAR 验证后根可达去重块的原始序列化 payload bytes（不计 CAR header/CID/framing）；旧无尺寸证明不升级、旧占额不重算、不因数字相同兼容不同 basis。目录尺寸不使 file-only upload 获得资格，也不建立全局块账本。
+
+每外层操作共享 ReadSession：解析、索引、scratch、复制、存储 source、predecessor、same-plan 和输出累计限 131072 nodes / 16777216 bytes，内部调用不复位。全 registry 全列 SQL 原始 UTF-8 限 4096 rows / 4194304 bytes；保留 foreign/private/NULL 和完整历史。公开 wire v2 单份脱敏 native review，单文档 16 MiB、131072 nodes、depth 64；authority predecessor depth 32 不限制普通数据叶。原始私密 cells 逐行恢复，不能靠删除历史或增加预算过关。
+
+计划/确认文件是私密材料，exclusive create、不覆盖、不建父目录；Unix owner-only，Windows protected owner/SYSTEM ACL 且同句柄核验。`--run` 仅一次 receipt-scoped due-job pass，不清空全站旧队列。运行失败不撤销已提交 apply，也不证明无远端副作用。
+
+## Stage 8 待完成研究与验收条件
+
+本阶段只交付有界测量、建议和明确安全条件，不实施生产 GC、shared limiter、remote-only、允许不同 CID 的字节备份或成功后重起 TTL。
+
+1. **容量测量。**固定源码及输入，对 65 项与 10k 项扇出、重复/唯一叶、多 provider、ordinary/recovery 混合负载建立 baseline。分别测操作前后、运行高水位、重启恢复后的 repo bytes、文件系统分配量、RSS/peak、暂存/缓冲、独立 pin 数及逻辑占额。S3 logical_size、账本 hold、单 DAG unique-block bytes、实际磁盘和服务商费用不能互换；每操作 ZIP 预算不是全局容量承诺。
+2. **跨进程调度。**对单 gateway baseline 与两个独立 OS gateway 进程、共享 DB/同 backend-scope 做相同工作量对照。由受控 endpoint 同一时钟记录每种 Submit/poll/find/recovery/cleanup 的真实 HTTP starts、并发/active bytes、固定及滑动窗口 RPS、429/Retry-After、前台延迟、队列最老等待、逐进程进展、claim/heartbeat 和占额。覆盖共享 CID、丢响应、迟到成功、进程死亡/重启；实例内 permit 不证明全局预算。是否建设 shared limiter 及触发阈值须来自账号限制、部署 SLO 与测量，不能虚构生产 RPS。
+3. **未完成基准。**跨进程 Submit 收敛问题尚未闭合，完整生产负载的单进程 baseline 和故障对照仍待验证。现有基准工具不代表 Stage 8 验收通过，不通过加时限或弱化完成条件取得通过。单进程负载与 10k HAMT 证据不证明跨进程公平、repo 增量或可回收空间。
+4. **全 owner 盘点。**未来 collector 须覆盖全部 data versions/null/noncurrent、delete marker 后的历史内容、hot/cold/lifecycle 在途、MPU parts/替换/Complete、import artifacts、ZIP input/source=false、manifest/历史根引用、所有 build revision/epoch/candidate、中间 flat/HAMT 节点、未提交或迟到 writer、remote leases/jobs/全部历史债务，以及 MFS/其他应用/外部未知 owner。物理身份必须含 node/repo/tier，远端含 backend/scope/resource type；无 CID 的未知写入按受影响节点/操作窗口保守阻断，不伪造 absent。
+5. **未来 GC 安全条件。**默认生产物理 GC NO-GO。只读 dry-run 须有完整 owner 快照、schema/节点身份、跨 DAG 可达性与保留理由，区分保护/候选/unknown，不把候选 DAG 大小相加为回收量。任何身份缺失、漏 owner、未知中间 pin 或快照漂移均停止。全部 gateway/import/MPU/root/lifecycle 及外部 writer 必须共享 node/repo 屏障并排空；执行前重验零 owner/在途、排他归属与当前 fence。DB reference 不替代 Kubo pin。双后端迁移须完整目标验证、DB residency 提交和旧 reader/writer 退出。破坏性边界的丢响应、进程死亡、迟到写、失 fence、重复执行及重启先恢复保护均须隔离实测；DB 回滚不能恢复已删块。
+6. **外部能力。**Filebase CAR、较大文件、账号鉴权、删除释放与费用变化仍未验，需独立账号/费用/作用域授权。Mock DELETE、anonymous Kubo auth headers、逻辑释放或单 DAG bytes 不证明服务商权限、账单下降或物理回收。
+
+上述研究和 GC 故障恢复实验尚未验收。生产迁移、外部付费账号操作、本地 unpin/GC 均未执行；测试通过不替代生产部署与外部服务能力验证。

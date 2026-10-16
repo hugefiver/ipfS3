@@ -1,10 +1,9 @@
 # Client Compatibility v0.2 设计规格
 
 - 日期：2026-07-19
-- 状态：Ready for implementation
+- 状态：兼容性要求
 - 范围：`ROADMAP.md` 的 v0.2 全部 10 项
-- 基线：`5e854e4`
-- 关联：`docs/superpowers/plans/2026-07-07-rclone-compatibility-fixes.md`、`docs/superpowers/specs/2026-07-07-decompress-zip-upload-design.md`
+- 关联：`docs/superpowers/specs/2026-07-07-decompress-zip-upload-design.md`
 
 ## 1. 目标、范围和非目标
 
@@ -221,14 +220,14 @@ rclone smoke 仅依次运行 `mkdir`、`copy`、`ls`、`cat`、`deletefile`、`r
 
 AWS CLI smoke 是基线回归：`s3 mb`、`s3 cp`、`s3 ls`、`s3api head-object`、`s3 rm`、`s3 rb`，并用 `s3api list-objects` 和 `s3api delete-objects` 覆盖 v1 和批量删除。AWS CLI 的 `s3api get-bucket-location` 必须验证空 LocationConstraint 的 `us-east-1` 语义。
 
-本机已知 rclone 为 1.74.4，Docker 可用，AWS CLI 与 `mc` 缺失。文档和 CI 记录必须区分以下状态：
+文档和 CI 记录必须区分以下状态：
 
 - `PASSED`：命令实际执行且所有断言成功。
 - `FAILED`：前置条件满足、命令执行，但断言或退出码失败。
 - `SKIPPED`：本机命令或本地 Docker image 缺失，且未获安装或拉取批准。记录准确缺失项和可直接执行的命令。
 
 不得把 `SKIPPED` 表述为 `PASSED`，也不得因本机 `aws` 或 `mc` 缺失而伪报已运行。
-任何实际执行得到的 `FAILED` 都阻止对应客户端 ROADMAP 项勾选和最终提交，直到缺陷修复并重跑为 `PASSED`。仅因未获执行授权或本地 image 缺失而得到的准确 `SKIPPED`，可在 smoke 工件、命令和结果跟踪均已交付时把对应客户端 smoke 项视为“测试能力已完成但本机未执行”；矩阵必须继续显示 `SKIPPED`，不能写成客户端已兼容。第 9 项“双路径 HeadObject”不是 artifact-only：Task 6 提交前必须实际运行 MinIO `mc` 的 real-stack smoke。AWS CLI 可因本地 image 缺失而 `SKIPPED`，而 Rclone 的 `PASSED dual_head=NOT_RUN` 合法但不能单独满足 item 9。只有实际 `mc` 对同一对象在 localhost 和 Compose 网络端点都完成自己的签名 `stat`，并在受版本控制日志中留下 `client=Mc verifier=Mc` 的 `RESULT status=PASSED dual_head=PASSED` 与匹配 `EVIDENCE dual_head=PASSED` 时，item 9 才完成。
+实际执行得到的 `FAILED` 不支持兼容性通过声明。缺少执行授权或本地 image 时可准确记录 `SKIPPED`，但不能写成客户端已兼容。“双路径 HeadObject”要求实际 MinIO `mc` real-stack smoke：同一对象在 localhost 和 Compose 网络端点都完成自身签名 `stat`，并留下 `client=Mc verifier=Mc` 的 `RESULT status=PASSED dual_head=PASSED` 与匹配 `EVIDENCE dual_head=PASSED`。AWS CLI 的 `SKIPPED/NOT_RUN` 或 Rclone 的 `PASSED/NOT_RUN` 不能替代此证据。
 
 ### 6.4 兼容矩阵
 
@@ -237,13 +236,13 @@ AWS CLI smoke 是基线回归：`s3 mb`、`s3 cp`、`s3 ls`、`s3api head-object
 | Client | Version | Transport | Endpoint path | Auth/region | Operations | Recommended options | Result | Evidence date | Evidence command or log | Known limitation |
 |---|---|---|---|---|---|---|---|---|---|---|
 
-`Result` 只允许 `PASSED`、`FAILED`、`SKIPPED`。每行都要写操作集合和证据命令或日志位置，不能只写“compatible”。初始记录需明确 rclone 1.74.4、Docker 可用、AWS CLI 与 mc 缺失的事实，不杜撰测试结果。
+`Result` 只允许 `PASSED`、`FAILED`、`SKIPPED`。每行都要写操作集合和证据命令或日志位置，不能只写“compatible”。版本和可用性以实际执行环境为准，不杜撰测试结果。
 
 ### 6.5 受跟踪的真实 dual-head 证据
 
-唯一批准的真实 smoke 收据是 `docs/client-smoke-evidence-2026-07-19.log`。它只能由 Task 6 的 mandatory `-Run` real-stack smoke 从捕获的 stdout/stderr 以 UTF-8 写入；预检、Rust 测试、静态 writer 数量和临时 transcript 都不能创建或替代它。执行只使用 `test`/`test` 测试场景，且日志不得包含 ignored `config.toml`、本地凭证、master key 或其他本地敏感配置。
+2026-07-19 的真实 smoke 收据是 `docs/client-smoke-evidence-2026-07-19.log`。它保留 `-Run` real-stack smoke 捕获的 UTF-8 stdout/stderr；预检、Rust 测试、静态 writer 数量和临时 transcript 不能替代实际客户端执行。该收据只使用 `test`/`test` 测试场景，不得包含 ignored `config.toml`、本地凭证、master key 或其他本地敏感配置。
 
-写入后，Task 6 必须直接读取此日志，精确解析三个 `RESULT` 行：Rclone `PASSED/NOT_RUN`、Mc `PASSED/PASSED`、Aws `SKIPPED/NOT_RUN`。runtime parser 必须捕获 `verifier` 并强制 `verifier == client`，而非捕获后丢弃；本次日志只允许 `client=Mc verifier=Mc` 的 runtime `EVIDENCE`。Rclone matrix 行只能引用其 `RESULT dual_head=NOT_RUN`，而 item 9 只由 Mc same-client evidence 支撑。对应 Mc 矩阵行必须为 `PASSED`，其证据列引用该日志和 `dual_head=PASSED`；ROADMAP item 9 必须是唯一的 `[x]` 项并含 `Mc same-client dual endpoint smoke PASSED`。任何解析、交叉匹配、矩阵或 item 9 检查失败都阻止 staging 和提交。
+该收据记录的三个 `RESULT` 为 Rclone `PASSED/NOT_RUN`、Mc `PASSED/PASSED`、Aws `SKIPPED/NOT_RUN`，runtime `EVIDENCE` 为 `client=Mc verifier=Mc`。解析器必须强制 `verifier == client`。矩阵只能引用各客户端实际结果：Rclone 的 `dual_head=NOT_RUN` 不证明双端点 HeadObject，Mc 的 same-client evidence 才支撑该项。后续收据独立记录其真实客户端结果，不改写此历史输入和执行身份。
 
 ## 7. 错误、安全和数据一致性
 
@@ -305,7 +304,7 @@ AWS CLI smoke 是基线回归：`s3 mb`、`s3 cp`、`s3 ls`、`s3api head-object
 
 ### 8.3 Docker smoke
 
-Docker smoke 是真实 Kubo 和 gateway 的端到端验证，与 wiremock TCP integration 分开报告。脚本按 6.1 到 6.3 节运行，写出 stdout/stderr、client version、image digest 或 image ID、Compose service 状态和矩阵行。提交前的 Task 6 real-stack run 必须把捕获的 stdout/stderr 无论退出码为何都以 UTF-8 写入 `docs/client-smoke-evidence-2026-07-19.log`，然后从该文件而非脚本静态形状读取 dual-head 事实。
+Docker smoke 是真实 Kubo 和 gateway 的端到端验证，与 wiremock TCP integration 分开报告。脚本按 6.1 到 6.3 节运行，记录 stdout/stderr、client version、image digest 或 image ID、Compose service 状态和矩阵行。无论退出码为何都保留 UTF-8 输出，从实际日志而非脚本静态形状读取 dual-head 事实；每份收据只证明其记录的输入和执行。
 
 若需要的 Docker image 不存在于本机且没有拉取批准，测试工件必须输出可执行命令，例如：
 
@@ -334,49 +333,8 @@ cargo test --lib
 cargo test --test integration
 ```
 
-Docker 与客户端命令只在前置条件和授权满足时执行。`aws`、`mc` 在当前本机缺失，不能作为本次设计写入时已经运行的验证。rclone 1.74.4 的本机存在也不意味着 Docker stack 或 rclone smoke 已运行。若要最终提交，获授权后必须执行 Task 6 的 real-stack run；AWS image 仍缺失时可准确 `SKIPPED`，Rclone 可真实 `PASSED dual_head=NOT_RUN`，但只有 Mc 的 `PASSED dual_head=PASSED` same-client evidence 能打开 item 9。旧 `tests/e2e.rs` real-stack suite 仍是可选补充，不能代替此门禁。
+Docker 与客户端命令只在前置条件和授权满足时执行。客户端或镜像存在不等于 smoke 已运行。AWS image 缺失时可准确 `SKIPPED`，Rclone 可真实 `PASSED dual_head=NOT_RUN`，但只有 Mc 的 `PASSED dual_head=PASSED` same-client evidence 能证明双端点 HeadObject。`tests/e2e.rs` real-stack suite 是补充，不能代替此证据。
 
-## 9. 实施顺序
+## 9. 执行环境限制
 
-1. 为 `get_bucket_location`、`list_objects`、`delete_objects` 增加 handler trait 桩和失败测试，确认 `s3s 0.14` DTO 细节。
-2. 抽取 shared listing page/folding helper，并先锁住 v2 全部现有语义。
-3. 在 store 增加幂等 latest-row delete helper，再实现 List v1 和 DeleteObjects DTO 映射。
-4. 增加 GetBucketLocation、v1、DeleteObjects 与 URL projection 的 TCP SigV4 integration 覆盖，以及 localhost nested HeadObject 回归。
-5. 修正 SQLite URL 和非空 master-key 覆盖逻辑，添加 config/startup 测试。
-6. 创建 Docker smoke 脚本、rclone 文档和兼容矩阵。脚本实现前置检查和 `PASSED`/`FAILED`/`SKIPPED` 报告。
-7. 运行 Rust 验证；提交前在获得 image/安装授权且本地前置条件具备时强制运行 Docker smoke，将捕获 stdout/stderr 写入受跟踪日志，并按第 6.5 节解析真实证据。
-8. 仅当以上 10 项均完成、证据已写入矩阵、没有实际 `FAILED`，且第 9 项已有来自 `docs/client-smoke-evidence-2026-07-19.log` 的真实 `Mc/Mc` 双端点 stat `PASSED` 时，更新 `ROADMAP.md` 的 v0.2 十个 checkbox。未授权或缺 image 的客户端 smoke `SKIPPED` 必须按第 6.3 节保留原样；Rclone `PASSED/NOT_RUN` 不会满足 item 9。任何 `FAILED`、缺失日志或缺失 Mc same-client 双端点证据都阻止对应 checkbox 和最终提交。不得提前勾选，不得改动 v0.3+ 项。
-
-## 10. 实施文件和环境限制
-
-### 10.1 File Structure
-
-`docs/client-smoke-evidence-2026-07-19.log` 是唯一允许受版本控制的实际 smoke 日志。它不在 Task 5 预检、静态检查或临时脚本 transcript 阶段生成；只在 Task 6 mandatory real smoke 运行时，以捕获的 stdout/stderr UTF-8 生成。内容只允许 `test`/`test` 测试场景，绝不包含本地敏感配置。
-
-预期变更文件：
-
-```text
-src/s3/handler.rs
-src/s3/ops/bucket.rs
-src/s3/ops/object.rs
-src/store/object.rs
-src/config.rs
-docker-compose.yml
-config.example.toml
-config.docker.toml
-tests/integration.rs
-tests/support/decompress.rs              (仅在 harness 需要能力时)
-scripts/<client-smoke>.ps1               (或项目现有脚本目录的等价位置)
-docs/client-compatibility.md
-docs/client-smoke-evidence-2026-07-19.log  (仅 Task 6 mandatory real smoke 的受跟踪 stdout/stderr)
-ROADMAP.md                               (仅在全部 10 项完成后)
-```
-
-当前环境限制：Docker 可用，rclone 为 1.74.4；AWS CLI 与 `mc` 本机命令缺失；`rclone/rclone:1.74.4` 与 `minio/mc:latest` 镜像已在本地，AWS CLI 镜像缺失；Context7 quota 已耗尽；`s3s 0.14` DTO 已通过 docs.rs 核实。实施不得安装软件、拉取 image、修改未列文件或添加 v0.3 功能，除非用户另行授权。Docker image 是否本地存在必须在实际 smoke 前检查，不能根据 Docker 可用性推断。
-
-## 11. 规格自审
-
-- **占位符检查**：没有未决占位符或待定语义。缺失客户端或镜像的行为定义为明确的 `SKIPPED`，不是未说明的例外；全 `SKIPPED` 的 item 9 明确为 `[ ]`、19 项且不可提交。
-- **一致性检查**：List v1/v2 均使用同一个 shared page；`encoding-type=url` 只投影 wire DTO，v1 marker 与 v2 token 仍是 raw 边界，且 v2 tokens 保持 opaque。批量删除的幂等性不改变单删除语义。Docker 空 master key 规则与 config precedence 一致。Task 6 的实际输出、受跟踪日志、矩阵和 ROADMAP item 9 使用 Mc same-client `client=Mc verifier=Mc`/`dual_head=PASSED` 事实，Rclone 则准确为 `PASSED/NOT_RUN`。
-- **范围检查**：覆盖 ROADMAP v0.2 的 10 项，没有引入 v0.3 功能、pin 引用计数或客户端插件；新增日志仅为唯一受跟踪的真实 smoke 证据。
-- **歧义检查**：明确了 `us-east-1` 的空 LocationConstraint、v1 marker exclusive、delimiter 情况的 NextMarker、`encoding-type=url` 的 DTO-only RFC3986 projection 与 raw cursor/token 身份、DeleteObjects quiet/missing key/no-pin-rm、ROADMAP 更新时机、未获安装授权时的 Docker smoke 行为，以及提交前仅 Mc/Mc 的真实 dual-head 日志门禁。
+Docker image 是否可用必须在实际 smoke 前检查，不能根据 Docker 可用性推断。缺少依赖时如实报告 `SKIPPED`；安装软件或拉取镜像须遵守执行环境的授权要求。

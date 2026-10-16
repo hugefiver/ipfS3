@@ -70,18 +70,16 @@ There is no official Kubo/Cluster compatibility matrix. The selected Kubo
 v0.43.0 and the repository's exact add, pin, and cat request shapes must pass a
 real compatibility test before this profile is documented as supported.
 
-### Runtime revision: Cluster version representation
+### Cluster version representation
 
-The first live topology gate observed the official v1.1.6 image reporting its
-version as `1.1.6+git<commit>`. This is SemVer build metadata, not a different
-release. Version validation therefore requires the exact `1.1.6` core and accepts
+The official v1.1.6 image may report `1.1.6+git<commit>`. This is SemVer build
+metadata, not a different release. Version validation requires the exact `1.1.6` core and accepts
 only an optional nonempty, syntactically valid `+build.metadata` suffix. Other
 patch versions and all pre-release forms remain terminal contract errors. Logs
 and test output report only the normalized core, never the commit metadata.
 
-### Runtime revision: proxy Kubo endpoint
+### Proxy Kubo endpoint
 
-The first post-version-fix proxy compatibility run proved that
 `CLUSTER_IPFSHTTP_NODEMULTIADDRESS` configures the Cluster IPFS connector but not
 the Kubo-compatible proxy's forwarding target. The v1.1.6 proxy has a separate
 `api.ipfsproxy.node_multiaddress` setting whose default is
@@ -160,8 +158,6 @@ non-wildcard host bind and required port.
 - `tests/cluster.rs` — real S3, Cluster REST, and Kubo replication checks.
 - `tests/support/cluster.rs` only if the live target would otherwise mix HTTP
   parsing, polling, and scenario logic in one oversized file.
-- `docs/superpowers/plans/2026-08-24-ipfs-cluster-pinset-replication.md` — the
-  reviewed implementation plan.
 
 ### Modified files
 
@@ -340,9 +336,8 @@ environment, ports, commands, health checks, failure/restart scenario, logging,
 and cleanup. Existing release jobs remain behaviorally unchanged except for the
 shared job count and infrastructure static-command list.
 
-On the initial local implementation, the hosted job is reported honestly as
-`NOT RUN`. A hosted PASS is required after push or pull request and before merge
-or release, but this session has no push authorization.
+Local evidence doesn't establish a hosted result. A hosted PASS is required
+before merge or release; a hosted job not executed is reported as `NOT RUN`.
 
 README and ROADMAP updates occur only after the local workflow-parity run, static
 contracts, and full regressions pass. README states the exact supported topology,
@@ -363,7 +358,6 @@ Required final checks include:
 - `cargo fmt --all -- --check`;
 - `cargo clippy --all-targets -- -D warnings`;
 - LSP diagnostics on changed Rust files;
-- `git diff --check` and exact changed-path audit.
 
 ## Non-goals
 
@@ -402,16 +396,3 @@ The roadmap item is complete only when all of the following are true:
 10. Static contracts and full Rust quality gates pass.
 11. README describes only the evidence-backed bounded profile, and ROADMAP changes
     only the Cluster item.
-12. The current working-tree artifact receives the required identity-bound final
-    review receipts before the authorized commit, unless the user explicitly
-    overrides a disclosed review-system blocker. No push or tag occurs.
-
-## Git Boundary
-
-The implementation may change only the files listed in **Files and
-Responsibilities**, plus this specification. Any proxy incompatibility or need
-for application source changes stops execution and requires a design revision.
-Implementation subagents do not stage, commit, push, or tag. The orchestrator may
-commit the integrated task only under the user's existing per-task commit
-authorization after the applicable acceptance gate; push and tag are not
-authorized.

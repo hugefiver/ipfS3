@@ -1,15 +1,15 @@
-# Lifecycle transition F1 — authoritative single-run receipt
+# Lifecycle transition F1: single-run receipt (2026-09-13)
 
 **PASS — full runner exit 0.** The sole authoritative run is
 [`20260913T011934Z-091eb31c/summary.json`](20260913T011934Z-091eb31c/summary.json).
 No successful steps from previous partial/failed runs are used for this conclusion.
-Historical receipts remain retained and superseded.
+This receipt describes the frozen inputs below, not verification of later source changes.
 
 ```powershell
 pwsh -NoProfile -File tests/run-lifecycle-transition-validation.ps1
 ```
 
-Executed without phase/resume arguments, 2026-09-13 01:19:34–01:25:55 UTC.
+Executed without phase/resume arguments, 2026-09-13 01:19:34 to 01:25:55 UTC.
 Every required step passed; `remaining_gates` is empty. All native step exit codes
 are 0. Cleanup and input-identity checks are included in the final PASS decision.
 
@@ -143,9 +143,7 @@ their test gateway and isolated schema were cleaned. Both copied executable path
 are absent. A final additional Docker/process inventory found **zero** F1-owned
 containers, volumes, networks or processes. No existing resources were removed.
 
-No production code, F2/public README/config/deployment Compose/ROADMAP, Git state,
-software installation or image acquisition was changed. Historical failures and
-partials remain. Remaining scope limits: this certifies the tested PG17/Kubo43/
+Remaining scope limits: this certifies the tested PG17/Kubo43/
 Windows-native topology, not other platforms, registry reproducibility or combined
 client/proxy/Kubo memory. The existing `proc-macro-error2` future-incompatibility
 notice remains; current clippy and Rust 1.92 checks pass.

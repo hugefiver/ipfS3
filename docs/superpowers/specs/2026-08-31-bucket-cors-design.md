@@ -4,12 +4,9 @@
 **Date:** 2026-08-31
 **Audience:** Implementers and operators
 
-**Runtime revision (2026-08-31):** The pinned real-client lane proved that
-current AWS CLI v2 sends its default `CRC64NVME` request checksum on
-`PutBucketCors` and omits `Content-MD5`. The original MD5-only design therefore
-could not satisfy its own AWS CLI acceptance criterion. This revision adds a
-strict, dependency-free `CRC64NVME` validation path while retaining the existing
-MD5 path and rejecting every other SDK checksum algorithm.
+**Request integrity:** `PutBucketCors` accepts validated `Content-MD5` or
+`CRC64NVME`, including AWS CLI v2 requests that send `CRC64NVME` without
+`Content-MD5`. Every other SDK checksum algorithm is rejected.
 
 ## Summary
 
@@ -277,47 +274,6 @@ gateway versions, redacted assertions, and a truthful result. README promotion
 and only the Bucket CORS item in `ROADMAP.md` may occur after evidence is PASS.
 The existing Lifecycle roadmap item remains unchecked.
 
-## Likely Changed Paths
-
-The future implementation plan should keep edits to paths justified by this
-design, expected to include:
-
-```text
-src/store/migrations/m20260831_000001_bucket_cors.rs
-src/store/entities/bucket_cors_config.rs
-src/store/entities/mod.rs
-src/store/cors_config.rs
-src/store/mod.rs
-src/cors/mod.rs
-src/cors/model.rs
-src/cors/config.rs
-src/cors/matcher.rs
-src/cors/checksum.rs
-src/cors/http.rs
-src/s3/ops/cors.rs
-src/s3/ops/mod.rs
-src/s3/handler.rs
-src/s3/http.rs
-src/main.rs
-src/lib.rs
-tests/support/cors.rs
-tests/fixtures/cors/
-tests/cors.rs
-tests/postgres_cors.rs
-tests/compose.cors-validation.yml
-scripts/bucket-cors-smoke.ps1
-docs/bucket-cors-evidence-2026-08-31.log
-README.md
-ROADMAP.md
-```
-
-The exact migration timestamp and generated-entity registration follow the
-repository convention. Cargo dependency versions remain unchanged. The existing
-default, single-PostgreSQL, multi-gateway, Cluster, Lifecycle Compose, and
-release workflow remain unchanged unless a concrete implementation necessity is
-found. That discovery requires an orchestrator-approved design revision before
-the implementation changes those boundaries.
-
 ## Non-goals
 
 - Virtual-hosted-style Bucket CORS.
@@ -351,17 +307,12 @@ the implementation changes those boundaries.
 7. SQLite, fresh PostgreSQL 17, signed API, unsigned browser HTTP, migration,
    concurrency, import/decompress, and live-client evidence all pass before
    README and the Bucket CORS roadmap item are promoted.
-8. Implementation receives identity-bound Oracle and Reviewer final acceptance.
-   Existing user authorization permits a commit only after that approval. It
-   must never push or tag as part of this feature.
 
 ## Risks
 
-The main compatibility risk is the locked s3s 0.14 DTO and trait shape,
-especially the exact `get_bucket_cors`, `put_bucket_cors`, and
-`delete_bucket_cors` signatures and XML fields. The implementation must verify
-them before coding and stop for an orchestrator design revision if they conflict
-with this contract.
+Compatibility depends on the locked s3s 0.14 `get_bucket_cors`,
+`put_bucket_cors` and `delete_bucket_cors` DTO/XML boundary. Signed API tests
+must exercise that boundary rather than a parallel handwritten serializer.
 
 The integrity middleware can accidentally change signed bytes if it rebuilds a
 body incorrectly. Exact-body reconstruction and SigV4 tests are mandatory.
@@ -369,14 +320,3 @@ Concurrent SQLite behavior also needs explicit coverage because its row-lock
 mechanics differ from PostgreSQL. Finally, invalid stored configuration must
 remain a closed failure path: returning permissive CORS headers after corruption
 would expose browser clients beyond the saved policy.
-
-## Git and Review Boundary
-
-This approved design authorizes no implementation, test, README, ROADMAP, plan,
-configuration, staging, commit, push, tag, or other Git-history change. Future
-implementation requires an approved implementation plan and the identity-bound
-Oracle and Reviewer final acceptance named above. It must stay inside the
-approved changed-path boundary and stop for an orchestrator design revision when
-the locked API or live evidence contradicts this design.
-
-*Author's note: Written for the engineer and operator who need one auditable Bucket CORS feature, with browser behavior that stays bounded by the saved bucket policy.*

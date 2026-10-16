@@ -30,7 +30,7 @@
 - 解压炸弹配额、entry 数量上限、总解压字节上限；这些作为后续配置项。
 - 对 `decompress-zip` 请求支持 SSE-S3 或 SSE-C。MVP 遇到任何 server-side-encryption 相关 header 都返回 400；非 `decompress-zip` 请求的现有 SSE 行为不变。
 - 在全局拒绝后恢复被本次请求覆盖的旧对象版本。MVP 的保证是“不发布本次请求新创建的 latest 对象记录”；目标前缀已有对象时，调用方应避免在恶意 archive 上复用生产前缀。
-- CID 引用计数、独占 pin 租约和安全 GC。本次保守 pin 修订覆盖 archive、entry、Multipart root 以及所有 Multipart part CID，但不新增引用计数 migration 或引用跟踪；Task 1 已规划的 decompress metadata migration 保持不变。替换、失败、Complete 或 Abort 遗留的冗余 pin 交由后续具备全局可达性判断的 GC/引用计数工作处理。
+- CID 引用计数、独占 pin 租约和安全 GC。保守 pin 策略覆盖 archive、entry、Multipart root 及所有 Multipart part CID，不提供引用计数或物理回收。替换、失败、Complete 或 Abort 遗留的冗余 pin 需要单独的全局可达性与安全回收设计。
 
 ### 1.4 验收标准
 

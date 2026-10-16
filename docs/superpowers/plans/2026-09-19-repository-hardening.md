@@ -1,19 +1,16 @@
 # 全库加固与测试去冗余执行计划
 
-## 实施状态（2026-09-20）
+## 交付要求
 
-- 本计划列出的应用加固和测试精简已完成。验证失败已修正并针对性复验：最终 lib 1164 passed、integration 164 passed、真实 PostgreSQL 44 passed；这是组合验证而非单次 all-targets 全绿。完整边界与依赖残余项见[验证记录](../../repository-hardening-validation-2026-09-20.md)，历史 F1 不作为当前源码的实机证据。
+- 本计划列出的应用加固和测试精简已完成。2026-09-20 的组合验证范围与限制见[验证记录](../../repository-hardening-validation-2026-09-20.md)；这些结果和历史 F1 均不作为后续源码的实机证据。
 - 普通 content mutation 现使用数据库时钟的 120 秒 lease，并以 30 秒间隔续租。升级 `standard_mutation_leases` 迁移前必须停止并排空全部旧 writer；旧、新二进制不得与升级后的数据库混跑，因为旧 writer 会绕过新 fence。续租失败或进程崩溃后的恢复依赖 lease 到期和 fenced reclaim，不承诺即时接管。
 - `POST multipart/form-data` 在 s3s 读取正文前拒绝；`PutObject` 和 `CompleteMultipartUpload` 的 `If-Match`/`If-None-Match` 明确拒绝，不是 CAS 支持。共享 ZIP 提取器已采用 10,000 条目、64 MiB 保守 metadata 账本、最终 1024 UTF-8 字节 key 限制，以及 CRC/尺寸和 Deflate descriptor 校验，细节以 [`src/zip/README.md`](../../../src/zip/README.md) 为准。
 - Unix 的 `SIGTERM`/`SIGINT` 共用 30 秒 HTTP/worker drain 总预算，Compose 为 gateway 保留 40 秒；多 gateway Nginx 仅为 `GET`/`HEAD` failover，写请求的上游故障不重放。验证命令与外部环境边界见 [testing](../../testing.md)，依赖公告核对范围和遗留项见 [dependency audit](../../dependency-audit-2026-09-19.md)。
 
 ## 目标与边界
 
-- 基线：v0.6 收尾已由 `2e8882e`、`ea4cf55` 推送至 `origin/master`，交接时工作树干净。此前提交/推送授权不外延到本轮；本计划不包含 Git 写操作。
-- 已完成的审查结论作为定位依据，不重做全库审查。下列 confirmed 指代码路径已确认，**不代表已运行漏洞复现**；执行时先以行为测试取得 RED，再最小修复、定向 GREEN。
 - 理想终态：未承诺请求在副作用前拒绝；持久化发布、读取与 ownership 在并发/取消/崩溃下保持一致；下载及解压资源有界且完整性可证；正常退出可收敛；测试保留真实风险覆盖而不重复运行无意义断言。
 - 不实现浏览器表单上传、不扩展条件写 CAS、不更改 CID/ETag、加密及流式存储基本契约，不趁机重构无关模块。不得整包收集请求或解压内容。
-- 仅使用可用的 normal/planner 配置，不派生 agent。以下 ownership 是代码责任分区，不是派发要求；单执行者可顺序完成。可作等价局部调整，记录重要偏离及理由，不加额外审批仪式。新增外部副作用、安装软件或扩大协议/安全边界不在本授权内。
 
 ## 波次与 ownership
 

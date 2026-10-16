@@ -273,6 +273,15 @@ An action whose desired state was already reached by a competing exact delete
 is `succeeded` idempotently. A worker whose claim epoch is stale cannot update
 the record after a new owner claims it.
 
+Lifecycle mutation-admission tokens are deterministic for their action and
+claim epoch. After a crash, a reclaimed claim may replace or clear only that
+same action's token at an epoch no newer than its own; it must preserve standard
+user mutations and newer owners' tokens. An expired `claimed` action at its
+attempt limit is reclaimed once to settle its orphaned admission. An exhausted
+ordinary `pending` action instead fails safe without being claimed. Terminal
+cleanup fences the action before acquiring the bucket lock and clears only
+the token it owns.
+
 ### Current Expiration
 
 Current `Expiration` normally acts on a current content version. If the current
@@ -383,45 +392,9 @@ Implementation is test-driven. The test suite must cover:
     gateway revision, redacted XML assertions, and an honest `NOT RUN` result
     until that environment is actually used.
 
-The design task does not run Docker or live services. A completed phase may add
-an accurate README statement that the expiration subset is supported after all
-listed evidence passes. `ROADMAP.md:77` remains unchecked because transition
-and the remaining lifecycle program phases are not complete.
-
-## Likely Changed Paths
-
-The future implementation plan should limit changes to paths justified by the
-work, expected to include:
-
-```text
-src/s3/handler.rs
-src/s3/ops/mod.rs
-src/s3/ops/lifecycle.rs
-src/store/entities/bucket_lifecycle_config.rs
-src/store/entities/lifecycle_action.rs
-src/store/entities/object_version.rs
-src/store/migrations/m20260826_000001_lifecycle_expiration.rs
-src/store/pinning/publication.rs
-src/store/object_version.rs
-src/store/mod.rs
-src/lifecycle/mod.rs
-src/lifecycle/config.rs
-src/lifecycle/evaluator.rs
-src/lifecycle/worker.rs
-src/lifecycle/actions.rs
-src/main.rs
-src/config.rs
-tests/integration.rs
-tests/postgres_versioning.rs
-tests/multi_gateway.rs
-tests/e2e.rs
-tests/compose.lifecycle-expiration-validation.yml
-README.md
-```
-
-The exact migration timestamp, test paths, and generated entity registration
-must follow repository conventions. `ROADMAP.md` is not changed by this phase.
-No source or test edit is authorized by this design document alone.
+An expiration-subset support claim requires all listed evidence. Expiration
+acceptance alone doesn't establish transition or complete lifecycle-program
+acceptance.
 
 ## Non-goals
 
@@ -465,14 +438,3 @@ No source or test edit is authorized by this design document alone.
 - [DeleteBucketLifecycle](https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteBucketLifecycle.html)
 - [Lifecycle configuration elements and filters](https://docs.aws.amazon.com/AmazonS3/latest/userguide/intro-lifecycle-rules.html)
 - [Lifecycle expiration considerations and conflicts](https://docs.aws.amazon.com/AmazonS3/latest/userguide/lifecycle-expire-general-considerations.html)
-
-## Git and Review Boundary
-
-This approved design authorizes no implementation, README, ROADMAP, test, plan,
-configuration, or Git-history change. A future implementation requires an
-approved plan, must remain inside that plan's changed-path boundary, and must
-stop for a design revision if the locked s3s 0.14 API or live-client evidence
-contradicts this contract. It must not stage, commit, push, tag, or otherwise
-write Git history without explicit user authorization.
-
-*Author's note: Written for the engineer implementing the first lifecycle delivery, so expiration is safe to ship without pretending transition support exists.*

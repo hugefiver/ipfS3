@@ -1141,7 +1141,7 @@ mix versions, infer old scope from current TOML, clear evidence, or switch an ol
 PSA job to RPC. The down migration explicitly refuses an unsafe downgrade;
 preserve the upgraded ledger and historical routes instead of dropping tables.
 
-**Acceptance is pending:** Stage 5 verification is currently running, not PASS.
+**Local isolated acceptance passed.**
 The [test commands and evidence boundaries](docs/testing.md#stage-5-rpc-verification)
 separate config/worker/publication/diagnostic checks from real leaf RPC testing.
 Basic/Bearer headers sent to anonymous Kubo don't prove authentication enforcement
@@ -1181,8 +1181,8 @@ and retained effects continue to occupy the logical ledger.
 
 **Local isolated acceptance passed:** configuration, registered-worker, native
 PostgreSQL and real provider transport results are recorded separately in
-[Stage 6 acceptance](docs/testing.md#stage-6-cluster-acceptance). The earlier
-verifier-only run is not provider CAR acceptance. Anonymous test-node auth
+[Stage 6 acceptance](docs/testing.md#stage-6-cluster-acceptance). Verifier-only
+results aren't provider CAR acceptance. Anonymous test-node auth
 headers do not prove account authentication, and Filebase/Pinata account writes
 remain **NOT RUN**. Two same-host peers are not multi-host high availability.
 
@@ -1291,7 +1291,7 @@ references. Default retire/retain never releases roots. Release doesn't promise
 unpin, GC or physical reclamation. Local tests cover formal apply, root CAS,
 receipt rollback and historical receipt recovery within the verification boundary above.
 
-These PowerShell examples assume an already-built binary, an explicitly selected
+These PowerShell examples assume `ipfs-s3-gateway` is available on PATH, an explicitly selected
 existing database/configuration, reviewed request files and a protected existing
 artifact directory. Replace `candidate-item-id` with each actual candidate ID;
 omit the flag when there are none. Preparation, if required, comes before review
@@ -1299,13 +1299,13 @@ and confirmation. Commands are examples, not acceptance results.
 
 ```powershell
 $env:IPFS_S3_CONFIG = "gateway.toml"
-.\target\debug\ipfs-s3-gateway.exe --pinning-manage --prepare .\prepare.json
-.\target\debug\ipfs-s3-gateway.exe --pinning-manage .\request.json --output .\private\plan.json
-.\target\debug\ipfs-s3-gateway.exe --pinning-manage .\request.json --confirm .\private\confirmed.json --ack-item candidate-item-id --ttl-seconds 300
-.\target\debug\ipfs-s3-gateway.exe --pinning-manage --apply .\private\confirmed.json
-.\target\debug\ipfs-s3-gateway.exe --pinning-manage --status .\private\confirmed.json
+ipfs-s3-gateway --pinning-manage --prepare ./prepare.json
+ipfs-s3-gateway --pinning-manage ./request.json --output ./private/plan.json
+ipfs-s3-gateway --pinning-manage ./request.json --confirm ./private/confirmed.json --ack-item candidate-item-id --ttl-seconds 300
+ipfs-s3-gateway --pinning-manage --apply ./private/confirmed.json
+ipfs-s3-gateway --pinning-manage --status ./private/confirmed.json
 # Explicit opt-in to one receipt-scoped pass, also valid on exact apply replay:
-.\target\debug\ipfs-s3-gateway.exe --pinning-manage --apply .\private\confirmed.json --run
+ipfs-s3-gateway --pinning-manage --apply ./private/confirmed.json --run
 ```
 
 ### Policies and coordination

@@ -15,10 +15,8 @@ database, S3, and master-key inputs have no fallback. The default
 `docker-compose.yml` remains the SQLite development topology.
 
 `AppState::new` connects to the configured database and calls
-`store::run_migrations` before the listener binds. `run_migrations` currently
-calls `Migrator::up(db, None)` directly. The lockfile resolves SeaORM and
-SeaORM migration to 1.1.20. This is safe for one gateway but has no ownership
-protocol when two instances start against an empty PostgreSQL database.
+`store::run_migrations` before the listener binds. Concurrent PostgreSQL
+startup serializes migration execution with a transaction-scoped advisory lock.
 
 Every normal gateway process starts both the existing pinning worker and the
 existing durable import worker after binding. Import jobs are already durable:
@@ -28,11 +26,10 @@ tokens such as `locked_until`. These properties are the basis for this limited
 shared-database topology; they do not turn provider scheduling into a
 cluster-wide service.
 
-The current serial `tests/e2e.rs` target contains 11 tests and can point at a
+The serial `tests/e2e.rs` target can point at a
 gateway and Kubo endpoint using environment variables. The production baseline
 already has a disposable, loopback-only validation override and a blocking
-release-validation job with owned-project cleanup. v0.5's line 68 is still the
-unchecked `Multiple gateway instances (horizontal scaling)` item.
+release-validation job with owned-project cleanup.
 
 The Nginx image selected for the new load balancer is Docker Hub's active exact
 tag `nginx:1.28.0-alpine`. The observed OCI index digest is
@@ -40,26 +37,14 @@ tag `nginx:1.28.0-alpine`. The observed OCI index digest is
 The Compose file may use that exact tag. The digest is recorded as selection
 evidence, not as a promise about a platform-specific child manifest digest.
 
-### Runtime-driven PostgreSQL lease revision
+### PostgreSQL lease SQL
 
-The first disposable five-service live run proved concurrent migration startup,
-both direct readiness endpoints, load-balancer readiness, and all eight migration
-markers. The direct cross-replica target then reached CID import and timed out.
-PostgreSQL recorded the causal statement as an `UPDATE import_jobs` renewal with
-the predicate `(? > clock_timestamp())`, followed by a syntax error at `>`.
-
-`src/store/import/lease_clock.rs` generated that predicate with
-`Expr::cust_with_values("? > clock_timestamp()", ...)`. SeaQuery 0.32.7 retained
-the question mark inside this PostgreSQL custom expression instead of numbering
-it as a PostgreSQL bind. This prevents a claimed import worker from renewing its
-lease and therefore blocks the required A-submit/B-observe acceptance path.
-
-The implementation boundary now includes one focused compatibility correction:
-construct the proposed lease timestamp as a SeaQuery value expression and compare
-it to `clock_timestamp()` structurally. A builder-level RED must show the literal
-question mark; GREEN must produce a numbered PostgreSQL bind, retain one bound
-value, and contain no question mark. SQLite and MySQL lease-clock expressions stay
-unchanged. The real five-service CID import is the surface-level toggle proof.
+`src/store/import/lease_clock.rs` compares the bound proposed lease timestamp
+with `clock_timestamp()` through a structural SeaQuery expression. PostgreSQL
+SQL must retain one bound value and use a numbered bind, not a literal `?`.
+SQLite and MySQL retain their backend-specific lease-clock expressions.
+Acceptance includes generated-SQL validation and a real completed cross-replica
+CID import whose worker renews its lease.
 
 ## Supported declaration
 
@@ -277,11 +262,10 @@ The production Compose file must never recommend direct gateway, PostgreSQL, or
 Kubo host ports. Direct ports exist only in the disposable validation override
 for test observation. They bind only to loopback and are not an operator API.
 
-## TDD and real acceptance
+## Acceptance
 
-Tests are written red before their implementation and made green with the
-smallest change that satisfies the stated contract. Static tests never start
-Docker. Live tests use a unique disposable Compose project and real containers.
+Static tests don't start Docker. Live tests use a unique disposable Compose
+project and real containers.
 
 ### Static contracts
 
@@ -340,7 +324,7 @@ following in order:
    concurrently against an empty PostgreSQL database. Require both direct
    `/ready` endpoints to return `200 READY`.
 4. Query `seaql_migrations` through the loopback PostgreSQL mapping. Require
-   exactly eight expected migration markers, each occurring exactly once:
+   every registered migration marker exactly once, including:
    `m20250701_000001_init`, `m20260707_000001_decompress_zip`,
    `m20260720_000001_sse_c_key_fingerprint`,
    `m20260721_000001_multi_provider_pinning`,
@@ -357,7 +341,7 @@ following in order:
    B reads must return identical body, CID, and ETag for that final state.
 8. Run the existing serial `cargo test --test e2e -- --nocapture
    --test-threads=1` target with its gateway endpoint set to loopback port 59000
-   and its Kubo endpoint set to port 55002. It must pass all 11 tests through
+   and its Kubo endpoint set to port 55002. Every selected E2E case must pass through
    the load balancer.
 9. Submit a CID import through A, observe its persisted status through B, and
    require the job to reach its completed result through B.
@@ -379,12 +363,10 @@ only for disposable verification. `tests/multi-gateway.Tests.ps1` runs in the
 existing infrastructure job. Existing PostgreSQL single-baseline and SQLite E2E
 job meaning must not change.
 
-The first implementation submission must report hosted evidence honestly as
-`NOT RUN`, because the new workflow cannot run until that submission exists in
-GitHub. README and ROADMAP may change only after the full local workflow-parity
-sequence passes, including static contracts, all live cases, diagnostics, and
-zero-residual cleanup. A later hosted job pass is required before merge or
-release, but must not be claimed before it occurs.
+Support claims require the full local workflow-parity sequence, including
+static contracts, live cases, diagnostics and zero-residual cleanup. Hosted
+execution is reported separately: a job not executed is `NOT RUN`, and an
+actual hosted pass is required before merge or release.
 
 ## Documentation contract
 
@@ -395,10 +377,7 @@ restrictions, and the remaining single points of failure. ROADMAP changes only
 the current unchecked horizontal-scaling line. It does not check IPFS Cluster
 or private swarm.
 
-## File and Git boundaries
-
-Implementation may change only the following paths, plus focused tests that are
-strictly required by these boundaries:
+## Component responsibilities
 
 | Path | Responsibility |
 | --- | --- |
@@ -414,34 +393,22 @@ strictly required by these boundaries:
 | `tests/release-validation.Tests.ps1` | Exact workflow-job and blocking-contract expectation updates. |
 | `README.md` | Supported deployment description, only after local parity passes. |
 | `ROADMAP.md` | One horizontal-scaling checkbox, only after local parity passes. |
-| `docs/superpowers/specs/2026-08-24-multi-gateway-horizontal-scaling-design.md` | Approved design included in the final task manifest. |
-| `docs/superpowers/plans/2026-08-24-multi-gateway-horizontal-scaling.md` | Reviewed implementation plan included in the final task manifest. |
 
 Do not modify `docker-compose.yml`, `docker-compose.postgres.yml`, existing
 SQLite E2E semantics, existing single-PostgreSQL validation semantics, provider
 implementations, import or pinning ownership semantics, Kubernetes or cloud
-files, or unrelated planning documents. Implementation agents must not edit the
-approved design or implementation plan; only the orchestrator may update plan
-checkboxes without changing task semantics.
-
-No Git write happens as part of implementation validation. Only after the
-implementation is complete and identity-bound Oracle and Reviewer approvals are
-both recorded may the orchestrator use the user's existing authorization to
-commit the approved changes. It must not push or tag.
+files. The default and single-gateway profiles retain their separate behavior.
 
 ## Acceptance criteria
 
 The implementation is accepted only when the supported declaration is true in
 the committed artifacts and the full static and live sequence above passes. In
 particular, it must prove concurrent empty-database startup, one occurrence of
-each of the eight migration markers, cross-replica CRUD and multipart behavior,
-whole-payload concurrent-write convergence, 11 of 11 existing E2E tests through
+each registered migration marker, cross-replica CRUD and multipart behavior,
+whole-payload concurrent-write convergence, the complete E2E suite through
 Nginx, cross-replica import observation, bounded one-replica failover, safe
 diagnostics, exact environment restoration, and zero residual disposable
 resources. The result report separates local evidence from hosted evidence and
 does not claim HA or a capability outside this document's support statement.
-Cross-replica import acceptance additionally requires builder-level RED-to-GREEN
-evidence for the PostgreSQL renewal bind and a real completed CID import after
-that correction; a queued or running timeout is not acceptable.
-
-*Author's note: I wrote this for the implementation engineer and operator who need to build and run the narrow two-replica topology without mistaking it for a highly available cluster.*
+Cross-replica import acceptance requires backend-valid PostgreSQL renewal SQL
+and a real completed CID import; a queued or running timeout isn't acceptance.

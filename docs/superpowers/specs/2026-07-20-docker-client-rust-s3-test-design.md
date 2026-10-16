@@ -1,54 +1,26 @@
-# Docker Client Test Runner Safety Remediation Design
-
-**Status:** Ready for remediation planning
+# Docker Client Test Runner Safety Requirements
 
 ## 1. Goal
 
-Close the final runtime-safety and repeatability findings in `scripts/client-smoke.ps1` without changing gateway product behavior or the completed Rust Docker suite. The repaired runner must be safe to execute from the current dirty tree, must always use a local-only archive build when `-Run` is present, must prevent every client `docker run` from falling back to Docker's default pull policy, must bound every native child process, and must leave only its evidence log and small diagnostic inputs in its unique run directory.
+`scripts/client-smoke.ps1` must safely build the working tree with a local-only archive build when `-Run` is present. Every client container must have an explicit no-pull policy, every native child process must be bounded, and cleanup must leave only the evidence log and small diagnostic inputs in the unique run directory. Gateway protocol behavior and the Rust Docker suite retain their separate contracts.
 
-## 2. Frozen starting point
+## 2. Verification boundary
 
-- Repository HEAD remains `a3158cf17a89dab054a45bd6ac2be0af1254a00a` on `master`.
-- The intended dirty tree is:
-
-  ```text
-   M scripts/client-smoke.ps1
-   M tests/e2e.rs
-  ?? docs/superpowers/plans/2026-07-20-docker-client-rust-s3-tests.md
-  ?? docs/superpowers/specs/2026-07-20-docker-client-rust-s3-test-design.md
-  ```
-
-- `tests/e2e.rs` is complete, has 11 `#[tokio::test]` cases, passed 11/11 serially, and has Git blob hash `6756f469a5d23f3f6ac5722e3112f548d401e302`. This remediation must not modify it.
-- The current runner already proved the archive transport with real Rclone and MinIO `mc`, but that evidence predates the safety remediation and must be regenerated after the runner changes.
-- The current runner blob hash is `0ac8e3c88bde617df60b018c0b4988a810055ac8`; it is the dirty-tree input to the remediation, not an accepted final state.
+Runner safety evidence must exercise the implemented archive transport, process deadlines and owned cleanup. Earlier smoke runs don't prove later changes. Gateway protocol behavior and the Rust Docker suite remain outside this runner-safety scope.
 
 ## 3. Non-goals and constraints
 
-- No gateway production code, `tests/e2e.rs`, Compose file, Cargo manifest/lockfile, or integration-test behavior changes.
-- No dependency upgrade, installation, image pull, Git staging, commit, push, tag, or other Git write.
-- No Docker execution while revising this design and its plan.
+- The runner never installs dependencies or pulls images.
 - No `docker compose down -v`, service stop, or volume removal in the runner or verification flow.
 - No deletion of the evidence log.
 - No reuse of a pre-existing run directory or archive context.
 - No `Start-Job`, background-job timeout wrapper, shell command-string construction, or timeout implementation that cannot terminate descendants.
 
-## 4. Considered approaches
+## 4. Runner and test boundary
 
-### 4.1 Recommended: focused runner hardening plus a self-contained PowerShell test
-
-Keep the client operations in `scripts/client-smoke.ps1`, introduce small testable helpers for identity, native process execution, exit classification, and owned-artifact cleanup, and add `tests/client-smoke.Tests.ps1`. The test reads the runner through the PowerShell AST and imports only named helper definitions, so it can exercise process and filesystem behavior without starting Docker.
+Client operations live in `scripts/client-smoke.ps1`, with testable helpers for identity, native process execution, exit classification and owned-artifact cleanup. `tests/client-smoke.Tests.ps1` imports only named helper definitions, so it can exercise process and filesystem behavior without starting Docker.
 
 This approach directly tests the dangerous boundaries, preserves the established Rclone/`mc` workflow, and adds no third-party test dependency.
-
-### 4.2 Split the runner into a module and thin entry point
-
-This would make imports conventional, but it expands the change into an additional production script/module and increases review surface for a focused remediation.
-
-### 4.3 Source guards only
-
-AST and text guards can prove branch shape, but cannot prove timeout behavior, descendant termination, collision handling, or containment-safe cleanup. This is insufficient for the reported runtime risks.
-
-The implementation uses approach 4.1.
 
 ## 5. Unique run identity
 
@@ -66,7 +38,7 @@ The canonical regular expression is:
 
 Example: `20260720t143012417z-24816-a1b2c3d4`.
 
-The timestamp is UTC with milliseconds. The PID and GUID suffix prevent same-millisecond collisions. The same `RunId` is used by the run-directory name, fixture text, evidence placeholder, bucket names, and cleanup diagnostics; the old `Stamp` variable is removed.
+The timestamp is UTC with milliseconds. The PID and GUID suffix prevent same-millisecond collisions. The same `RunId` is used by the run-directory name, fixture text, evidence placeholder, bucket names and cleanup diagnostics.
 
 `RunRoot` is the direct child `<temp>/ipfs-s3-client-smoke-$RunId`. The temporary root must already exist. Creation is two-part guarded: fail if the path already exists, then call `New-Item -ItemType Directory` without `-Force`. A race that creates the path between the check and creation therefore also fails. The runner never adopts or pre-cleans a colliding directory.
 
@@ -122,9 +94,9 @@ When `-Run` is present and at least one selected client is runnable, the runner 
 6. run the offline Docker build with `--pull=false --network none` and `vendor-archive=<context>`;
 7. start only `kubo` and `gateway` with Compose `up -d --pull never --no-build`.
 
-`StandardBuildImages`, `$missingStandardBuild`, `$useOfflineGatewayBuild`, and the ordinary Compose `--build` branch are removed. Cached standard images can no longer change the selected path. The runner never pulls.
+Cached standard images don't change the selected build path. The runner never pulls.
 
-The runner has exactly six source-level `docker run` entry points: the Rclone, MinIO `mc`, and AWS wrappers, plus one version probe for each client. Every entry point uses the exact argument prefix `"run", "--rm", "--pull=never"`; `--pull=never` is one argument and immediately follows `--rm`. This closes the preflight race in which a locally inspected client image disappears before `docker run`, whose default `missing` policy could otherwise contact a registry. No `docker run` entry point may rely on Docker's default pull policy.
+All Rclone, MinIO `mc` and AWS client operations and version probes use `docker run --rm --pull=never`. The pull policy is one literal argument, including when a locally inspected image disappears before execution. No client container may rely on Docker's default pull policy.
 
 The archive context is checked before creation. If it already exists, the runner throws. It never uses `Remove-Item` to make the context appear fresh.
 
@@ -154,48 +126,42 @@ The runner does not print or execute a pull command as a fallback. Missing local
 
 ## 10. Executable PowerShell tests
 
-Create `tests/client-smoke.Tests.ps1` as a dependency-free PowerShell 7 executable test. It parses the runner once and evaluates only named function definitions. Native helpers are imported in dependency order—`Convert-NativeTextToLines`, then `Get-NativeDiagnostic`, then `Invoke-NativeCommand`—before the first child process is launched; the test supplies only the minimal variables required by an imported helper and does not dot-source or execute runner top-level code. It must prove:
+`tests/client-smoke.Tests.ps1` is a dependency-free PowerShell 7 executable test. It imports named helpers in dependency order without executing runner top-level code. It must prove:
 
 1. `Invoke-NativeCommand` preserves an argument containing spaces and shell metacharacters as one literal argument.
 2. A fake native parent that records its own PID and launches a sleeping child times out within a bounded wall-clock interval and reports its label. After timeout, both recorded tree PIDs are absent, while a control sleeper launched independently by the test process remains alive; the outer test `finally` cleans only that independent control sleeper and the unique test temporary directory.
 3. Eight concurrent attempts to create the same valid `RunRoot` yield exactly one success and seven collision failures.
 4. Generated RunIds match the canonical regex, remain unique, and produce bucket-safe names no longer than 63 characters.
-5. Source guards find exactly six `"run", "--rm", "--pull=never"` prefixes and prove there is no `"run", "--rm"` occurrence whose next argument is not the single argument `"--pull=never"`.
-6. Forced-offline source/AST guards find one archive build path, Compose `--pull never --no-build`, and the exact `-Timeout $OfflineBuildTimeout` override inside `Invoke-OfflineGatewayBuild`; they reject `StandardBuildImages`, conditional build selection, ordinary Compose `--build`, `docker pull`, and `down -v`.
+5. Captured native arguments prove all selected client operations and version probes use the explicit no-pull policy, including an image disappearing after preflight.
+6. Captured execution proves archive-only offline building, the 30-minute build deadline, Compose `--pull never --no-build`, and no image pull, ordinary Compose build or volume deletion.
 7. The archive function fails on an existing context and contains no pre-delete of that context.
 8. Cleanup removes only the three owned artifacts, retains the evidence log and unrelated files, and rejects an out-of-root cleanup attempt without deleting its sentinel.
-9. AST inspection finds no direct `docker`, `cargo`, or `tar.exe` command invocation and no `Start-Job`; all such native paths are routed through `Invoke-NativeCommand` directly or through `Invoke-Docker`.
+9. Native execution paths enforce argument isolation, concurrent output draining, deadlines and process-tree termination, including failure paths.
 10. Exit-classification tests cover no-`-Run` skip/zero, `-Run` unavailable/nonzero, all-clients-missing/nonzero, and partial-client availability without a preflight failure.
 11. Launching the runner with an empty child `PATH` proves unavailable Docker is `SKIPPED`+exit 0 without `-Run` and `SKIPPED`+nonzero with `-Run`.
 
-## 11. Real verification and review evidence
+## 11. Real verification evidence
 
-After the six-entry pull lock and offline-build timeout guard are implemented and the non-Docker tests/static guards pass, rerun Rclone and MinIO `mc` separately from fresh RunRoots. Evidence from before this fix is not acceptance. Each full runner process has a 45-minute outer timeout, while all child processes retain their fixed internal bounds.
+Rclone and MinIO `mc` verification uses separate fresh RunRoots and records the tested input identity. Each full runner process has a 45-minute outer timeout, while all child processes retain their fixed internal bounds. Evidence certifies only the inputs and operations actually executed.
 
 Each run must prove:
 
 - a RunId matching the canonical pattern;
 - exactly one archive creation and one `vendor-archive` offline build;
 - Compose `--pull never --no-build` and no ordinary Compose build;
-- no legacy `vendor=$vendorPath` context;
 - every emitted Rclone/`mc` `docker run` command begins `docker run --rm --pull=never`, with no unlocked client run;
 - owned build artifacts absent after process exit while `client-smoke.log` remains;
 - one exact successful client `RESULT` line;
 - for `mc`, one exact same-client dual-endpoint `EVIDENCE` line;
 - no `-CleanupVolumes`, `down -v`, pull, service stop, or volume deletion.
 
-The final review package sent by the orchestrator to Oracle and reviewer contains the complete current spec and plan, complete runner/test diffs, PowerShell test output, AST/source-guard output, both fresh live-run outputs, cleanup checks, final status, and whitespace checks. The historical pre-remediation client passes are context only and cannot satisfy this acceptance gate.
-
 ## 12. Acceptance criteria
 
-- Only `scripts/client-smoke.ps1`, new `tests/client-smoke.Tests.ps1`, and the two requested documents are changed by the remediation; the existing `tests/e2e.rs` blob remains `6756f469a5d23f3f6ac5722e3112f548d401e302`.
 - The unique identity, no-adoption collision behavior, bucket grammar, and evidence regex use one frozen RunId contract.
 - Every runner-owned native process is injection-safe, asynchronously drained, time-bounded, and tree-killed on timeout.
 - Every `-Run` uses the archive-only offline build and Compose `--pull never --no-build` with local images only.
-- All six client `docker run` source entry points place the single argument `--pull=never` immediately after `run --rm`, and the offline build passes the 30-minute `$OfflineBuildTimeout` override explicitly.
+- Every client operation and version probe uses `--pull=never`, and the offline build has a 30-minute deadline.
 - Cleanup is containment-checked, exact, unconditional, post-transcript, and preserves evidence, services, and volumes.
 - Exit codes distinguish dry preflight skips, unexecutable requested runs, all-missing requested runs, and successful partial `All` runs.
 - `pwsh -NoProfile -File tests/client-smoke.Tests.ps1` passes.
 - Fresh Rclone and `mc` runs pass and retain their required `RESULT`/`EVIDENCE` semantics.
-- `git diff --check` and no-index whitespace checks for both untracked documents and the new untracked test pass.
-- No Git write is performed. Final plan receipt status remains `waiting for receipt` until the orchestrator reviews the current revision.

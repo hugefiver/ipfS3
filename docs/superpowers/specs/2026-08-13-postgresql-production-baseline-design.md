@@ -6,42 +6,6 @@
 
 **Scope:** Add an opt-in PostgreSQL Docker Compose deployment baseline, database-backed readiness, an in-image readiness probe, and shared local-live and hosted-CI validation. The existing SQLite development Compose stack remains unchanged.
 
-## Runtime-driven revision, 2026-08-24
-
-This approved design is revised after Task 4 live evidence exposed a PostgreSQL
-JSON model and schema incompatibility inside the same v0.5-A boundary. The
-original design did not claim to anticipate this problem. This revision records
-the observed evidence, the migration candidate, and the proof required before
-that candidate can be called the root cause.
-
-The production PostgreSQL 17 Compose stack passed health, readiness, migration,
-and application-role checks. The full end-to-end target passed 10 of 11 tests.
-Its only failure was `test_10_multipart_upload`: a 6 MiB `UploadPart` returned
-`500 internal database error`. A fresh, isolated Compose project with a unique
-name reproduced the exact test in a stable 1 of 1 failure.
-
-In the gateway log, a successful `SELECT multipart_uploads ...` returned one
-row and was followed immediately by the 500 response. PostgreSQL verbose logs
-contained no `ERROR`, `STATEMENT`, or SQLSTATE, and no `multipart_parts` INSERT
-was issued. That rules out an upsert statement failure, part-width issue, and
-test-order leakage for this observation.
-
-The inspected live schema was fully current through
-`m20260730_000001_standard_mutation_fence`; the role ownership and privileges,
-multipart primary key and foreign key, `INTEGER` and `BIGINT` widths, and
-`TIMESTAMPTZ` columns were correct. The failed upload row existed with zero part
-rows. Its selected values were `metadata = NULL` and `tags_json = []`, but both
-PostgreSQL columns are `TEXT`. The entity models decode
-`multipart_upload::Model.metadata` as `Option<Json>` and
-`multipart_upload::Model.tags_json` as `Json`; `object::Model.metadata` also
-decodes `TEXT` as `Option<Json>`.
-
-These facts make a PostgreSQL JSON decode mismatch the leading candidate, not a
-confirmed root cause. Confirmation requires a direct PostgreSQL store test that
-shows the unredacted decode error in the pre-migration state, followed by the
-same test passing when the new migration is applied. The S3 handler's redacted
-error is not sufficient evidence on its own.
-
 ## Background
 
 The repository's default `docker-compose.yml` and `config.docker.toml` are a
@@ -49,14 +13,13 @@ development stack: they use a file-backed SQLite database, mount that config,
 publish Kubo ports, include Cloudflared, and retain gateway data. That is useful
 for local work, but it is not a production deployment contract.
 
-The gateway already supports PostgreSQL through SeaORM. `AppState::new` connects
+The gateway supports PostgreSQL through SeaORM. `AppState::new` connects
 to the configured database and runs all migrations before binding the listener.
 `Store::db()` exposes the `DatabaseConnection`, and SeaORM 1.1.14 provides
-`DatabaseConnection::ping`. The current `/health` handler always returns `200 OK`.
+`DatabaseConnection::ping`. The `/health` handler always returns `200 OK`.
 The runtime image intentionally contains neither `curl` nor `wget`, so a Compose
-healthcheck cannot depend on either tool. Existing release validation runs live
-PostgreSQL store tests and SQLite-based Compose E2E, but does not prove the
-production PostgreSQL topology.
+healthcheck cannot depend on either tool. PostgreSQL store tests and SQLite
+Compose E2E don't by themselves prove the production PostgreSQL topology.
 
 ## Goals
 
@@ -71,10 +34,9 @@ production PostgreSQL topology.
 5. Verify the deployment locally with live Docker in one unique disposable
    Compose project, then run the same validation as a blocking hosted CI
    regression using only disposable resources.
-6. Update README production instructions and mark only the PostgreSQL production
-   deployment roadmap item after the local live evidence and the static workflow
-   contract test have passed. A GitHub-hosted job pass is required before merge or
-   release, not before the initial implementation commit.
+6. Production support claims require live topology evidence. Local and
+   GitHub-hosted results are reported separately; the blocking hosted job must
+   pass before merge or release.
 
 ## Non-goals
 
@@ -88,9 +50,7 @@ production PostgreSQL topology.
 - Cloudflared, `container_name`, `config.docker.toml` bind mounts, or a
   `gateway_data` volume in the production Compose file.
 
-## Approaches considered
-
-### Recommended: separate PostgreSQL Compose file
+## Deployment structure
 
 Create `docker-compose.postgres.yml` beside the default Compose file. It owns a
 single PostgreSQL service, Kubo service, gateway service, named PostgreSQL data
@@ -100,45 +60,6 @@ configuration and is selected explicitly with `-f docker-compose.postgres.yml`.
 This keeps SQLite quick-start behavior stable, gives production operators a
 small topology to inspect, and prevents local Cloudflared or development config
 from becoming an accidental production dependency.
-
-### Replace the default Compose file
-
-Make PostgreSQL the default and move SQLite into a development override. This
-would reduce the number of Compose files, but it breaks the established local
-workflow, changes current E2E assumptions, and makes a production deployment
-decision affect every contributor.
-
-### One parameterized Compose file with profiles
-
-Use profiles and conditional environment variables to select SQLite or
-PostgreSQL. This keeps one YAML file, but it mixes incompatible storage,
-secrets, port, and volume contracts. A profile mistake can silently select the
-wrong backend. Separate files make the operational choice visible.
-
-### Runtime revision: PostgreSQL JSON compatibility options
-
-#### Recommended: a forward PostgreSQL-only compatibility migration
-
-Add `m20260813_000001_postgres_json_columns`. Its PostgreSQL `up` path converts
-`objects.metadata`, `multipart_uploads.metadata`, and
-`multipart_uploads.tags_json` from `TEXT` to `JSONB`. It keeps the SQLite path
-as a no-op. This matches the existing entity semantics, upgrades existing
-databases instead of only fresh ones, and repairs the same latent metadata
-mapping in the object path. The cost is one new latest migration, a PostgreSQL
-table lock during type changes, and a fail-closed migration for any legacy text
-that is not valid JSON. This is the selected approach.
-
-#### Change entity fields to `String` and parse at every store boundary
-
-This avoids a schema migration, but it spreads parsing and serialization across
-the object and multipart stores. It can alter comparison and publication paths,
-and a missed boundary would retain the failure. It is not selected.
-
-#### Special-case only `multipart_uploads.tags_json`
-
-This is smaller, but leaves both `metadata` columns with the same model-to-column
-mismatch. It would treat the observed multipart path without correcting the
-documented latent object path. It is not selected.
 
 ## Architecture and topology
 
@@ -255,12 +176,9 @@ job.
 ## PostgreSQL JSON compatibility migration
 
 `m20260813_000001_postgres_json_columns` is a forward compatibility migration,
-registered in `src/store/migrations/mod.rs` and appended to the `Migrator` in
-the existing registration order. It becomes the latest required marker:
-`m20260813_000001_postgres_json_columns`. Every production-validation query,
-workflow and static-contract expectation, and the next authorised revision of
-the implementation plan must use that marker. This revision changes only the
-spec, so it does not edit the plan or mark any plan checkbox.
+registered in `src/store/migrations/mod.rs` in the existing `Migrator` order.
+Validation requires its marker in `seaql_migrations` alongside all later
+registered migrations and verifies the resulting JSONB column types.
 
 The PostgreSQL `up` path must validate every non-null source value before any
 type conversion. It must reject invalid JSON with a generic migration failure
@@ -295,23 +213,10 @@ success. Rollback is limited to the normal migration `down` operation after a
 successful `up`; it serializes JSONB canonically as text and does not promise to
 restore formatting or key order from pre-migration JSON text.
 
-## TDD proof and regression coverage
+## Regression coverage
 
-Use the existing PostgreSQL-only `tests/postgres_import.rs` target rather than
-adding a second PostgreSQL harness. It already serializes shared PostgreSQL
-migrations and has four tests, so the final target must contain five tests.
-
-Before adding the new migration, write one direct-store compatibility test and
-run it against a fresh PostgreSQL database migrated only through
-`m20260730_000001_standard_mutation_fence`. It creates a multipart upload with
-the representative nullable metadata and empty tags values, then reads that
-upload through the store. The expected RED result is the unredacted SeaORM/
-PostgreSQL decode error at the direct store boundary. It must not assert through
-the S3 handler, whose error mapping intentionally hides database detail.
-
-After adding and registering the migration, the same isolated setup applies the
-new migration and becomes GREEN. The lasting fifth test must assert all of the
-following:
+The PostgreSQL store tests exercise an upgrade from the pre-compatibility
+schema as well as a fresh full migration. They assert:
 
 1. PostgreSQL reports `jsonb` for `objects.metadata`,
    `multipart_uploads.metadata`, and `multipart_uploads.tags_json`.
@@ -320,12 +225,9 @@ following:
 3. Multipart-part upsert succeeds after that read and creates the expected part
    row.
 
-The final test may construct the old schema from the known pre-revision
-migration chain before applying the new migration, so it preserves the direct
-RED-to-GREEN proof after fresh full migrations naturally start at the new
-latest marker. It must use a unique fixture namespace and retain the target's
-existing serialization. The direct error output may identify a decoder or
-database type mismatch but must not print stored JSON.
+Fixtures use a unique namespace and serialize shared migrations. Invalid legacy
+JSON must fail without changing columns or recording a successful migration
+marker. Diagnostics must not print stored JSON.
 
 ## Data and failure flow
 
@@ -367,8 +269,7 @@ manager integration to a separate design.
 
 ## CI and live validation
 
-Before updating README or ROADMAP for the initial implementation, the implementer
-must run the complete validation sequence below locally. Every Compose command
+The complete local validation sequence uses disposable resources. Every Compose command
 uses one unique, disposable Compose project name, the committed disposable
 validation override, the same disposable URL-safe credentials and test-only
 S3/master-key environment values, the same fixed loopback validation ports, and
@@ -377,8 +278,7 @@ the same PostgreSQL-stop failure scenario as the
 against real local Docker containers. This is local live evidence, not
 GitHub-hosted evidence, and it must never be reported as a hosted workflow pass.
 
-The static PowerShell workflow contract test must also pass locally before those
-documentation updates. It verifies that the committed workflow retains the
+The PowerShell workflow checks verify that the committed workflow retains the
 required blocking job and validation sequence, but it does not replace the live
 Docker run.
 
@@ -405,13 +305,12 @@ the same order:
 4. Request `/health` and `/ready` through the loopback gateway mapping and
     require `200 OK` bodies `OK` and `READY`.
 5. Query PostgreSQL inside its container and require the latest registered
-    migration, `m20260813_000001_postgres_json_columns`, in
+    migration chain, including `m20260813_000001_postgres_json_columns`, in
     `seaql_migrations`. Also require `jsonb` for the three compatibility
     columns before running E2E.
 6. Run the existing serial `cargo test --test e2e -- --nocapture
     --test-threads=1` target against the validation loopback endpoints. It must
-    pass all 11 tests, including the 6 MiB multipart `UploadPart` case that
-    previously returned 500.
+    pass every selected case, including the 6 MiB multipart `UploadPart` case.
 7. Stop only the validation project's PostgreSQL service. Require `/health` to
    remain `200 OK`, then poll `/ready` for no more than ten seconds until it
    returns `503 NOT READY`.
@@ -423,25 +322,18 @@ networks, or volumes with that Compose project label remain. Cleanup and the
 zero-residual assertion belong only to this disposable CI stack. Failure of
 diagnostics or cleanup must not hide the primary command's result.
 
-The static PowerShell contract test runs locally before README or ROADMAP changes
-and in the existing release-validation infrastructure job before hosted live
+The PowerShell checks run in the release-validation infrastructure job before hosted live
 deployment validation. It checks the job is blocking, has the unique project
 name, includes all checks above in order, uses the disposable override, prints
 logs and cleans up on `always()`, and does not weaken the default SQLite Compose
-E2E job. Its migration marker and schema assertions must change to
-`m20260813_000001_postgres_json_columns` and `jsonb` for the three columns.
+E2E job. Migration checks require the registered chain and `jsonb` for the three
+compatibility columns.
 
-The new workflow job is a blocking regression for future pushes and pull
-requests. Its actual GitHub-hosted pass is required before merge or release, but
-cannot be an initial-commit prerequisite because the workflow does not exist on
-GitHub until that change is submitted. The initial implementation report must
-state the separate local live-evidence result and explicitly state that the
-hosted `postgres-production-deployment` job has not yet run.
+The `postgres-production-deployment` job is a blocking regression for pushes
+and pull requests. A GitHub-hosted pass is required before merge or release.
+Local live results don't establish a hosted pass.
 
-## File boundaries
-
-Implementation may change only these boundaries, plus focused unit or contract
-tests that directly cover them:
+## Component responsibilities
 
 | Path | Responsibility |
 | --- | --- |
@@ -454,20 +346,10 @@ tests that directly cover them:
 | `tests/postgres-production-baseline.Tests.ps1` | Static Compose and workflow contract checks. |
 | `src/store/migrations/m20260813_000001_postgres_json_columns.rs` | PostgreSQL-only, fail-closed JSON compatibility migration and reversible down path. |
 | `src/store/migrations/mod.rs` | Declare the new migration module. |
-| `tests/postgres_import.rs` | Direct PostgreSQL store RED-to-GREEN proof and final JSONB multipart compatibility regression, increasing the target from four tests to five. |
+| `tests/postgres_import.rs` | Direct PostgreSQL JSONB upgrade and multipart compatibility regressions. |
 | `tests/release-validation.Tests.ps1` | Static latest-migration expectation used by the production validation workflow. |
 | `README.md` | Production invocation and secret-handling guidance, only after local live Docker evidence and the static workflow contract test pass. |
 | `ROADMAP.md` | Check only `PostgreSQL production deployment`, only after local live Docker evidence and the static workflow contract test pass. |
-
-The work does not modify `docker-compose.yml`, `config.docker.toml`, database
-migration files other than the named compatibility migration and its required
-module and Migrator registration, credential semantics, Kubo behavior,
-Cloudflared behavior, or the roadmap entries for multiple gateways, Cluster,
-and private swarm. It does not modify `Dockerfile`, `tests/e2e.rs`, default
-Compose behavior, or entity definitions as a broad `Json`-to-`String` rewrite.
-Existing Task 1 to Task 3 boundaries remain intact. Any future plan revision
-updates its marker expectation only; it must not broaden this scope or mark a
-checkbox before its own work is performed.
 
 ## Acceptance criteria
 
@@ -504,11 +386,9 @@ The implementation is accepted when all of the following are true:
     workflow contract test has passed. The roadmap change checks PostgreSQL
     production deployment only; it does not check multiple gateway instances,
     IPFS Cluster, or private swarm.
-11. `postgres-production-deployment` is a blocking regression on future pushes
-    and pull requests. Its actual GitHub-hosted pass is required before merge or
-    release, not before the initial implementation commit. The initial report
-    distinguishes local live evidence from hosted evidence and states that the
-    hosted job has not yet run.
+11. `postgres-production-deployment` is a blocking regression on pushes and pull
+    requests. Its GitHub-hosted pass is required before merge or release;
+    reports distinguish local live evidence from hosted evidence.
 12. The compatibility migration validates all non-null legacy JSON text before
     conversion. Invalid text fails migration and gateway startup without logging
     or replacing the stored JSON value.
@@ -516,35 +396,13 @@ The implementation is accepted when all of the following are true:
     `multipart_uploads.tags_json` are `JSONB`; nullable metadata remains
     nullable, and `tags_json` remains `NOT NULL` with a logically empty-array
     default. SQLite has no change in either schema or behavior.
-14. The direct PostgreSQL store test first demonstrates an unredacted pre-
-    migration decode failure, then passes after the migration. The final
-    `postgres_import` target contains its four existing tests plus this one
-    compatibility test, which verifies the three `jsonb` types, multipart
-    create/get metadata and tags round-trip, and successful part upsert.
+14. Direct PostgreSQL store tests verify the three `jsonb` types, multipart
+    create/get metadata and tags round-trip, successful part upsert, and
+    preservation of existing data through upgrade.
 15. The migration's PostgreSQL `down` path returns the three columns to `TEXT`
     with the original nullability and logical defaults. It is not a guarantee of
     preserving JSON whitespace or object key order. SQLite `up` and `down` are
     no-ops.
-16. The complete validation sequence is rerun from a clean, unique disposable
-    Compose project and passes all 11 E2E tests, PostgreSQL stop and readiness
-    behavior, diagnostics, and scoped cleanup. The previous 10 of 11 result
-    cannot gate README or ROADMAP changes.
-
-The `postgres-import` target, its four existing tests plus the new fifth
-compatibility test, and relevant unit/regression targets must pass after the
-migration is implemented. The prior 10 of 11 local E2E result is diagnostic
-evidence only. README and ROADMAP remain unchanged until the complete
-from-scratch local sequence, including the direct store proof, PostgreSQL test
-target, full 11 of 11 E2E, PostgreSQL-stop readiness check, diagnostics, and
-scoped cleanup, passes again. The hosted blocking job is still initially not
-run, and must not be reported as passing until GitHub executes it.
-
-## Git boundary
-
-This design authorizes no version-control write. Implementation should stage no
-unrelated files and must not create a commit, tag, or push without the user's
-explicit permission. The implementation change set is limited to the file
-boundaries above and direct tests. No test or deployment command is run as part
-of writing this design. This runtime-driven revision modifies only this spec; it
-does not modify the implementation plan, change plan checkboxes, or perform a
-Git write.
+16. The complete validation sequence passes from a unique disposable Compose
+    project, including E2E, PostgreSQL-stop readiness behavior, diagnostics and
+    scoped cleanup. Partial results don't satisfy deployment acceptance.

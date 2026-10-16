@@ -3,7 +3,6 @@
 **Status:** Approved design
 **Date:** 2026-09-01
 **Roadmap scope:** Lifecycle program phase B, abort incomplete multipart uploads
-**Baseline:** `91e164d9c91b325f9df059cf90bdf5024f675922` (`91e164d`, clean); Phase A is `ff96b3f`; the current bucket CORS commit is unrelated.
 
 ## Summary
 
@@ -398,41 +397,10 @@ Implementation is test-driven. The acceptance matrix must cover:
     deployment profiles, and unrelated service configuration unless runtime
     evidence demonstrates a necessary change.
 
-The design task itself runs neither Docker nor a live gateway. `ROADMAP.md`
-remains unchecked even after this phase passes because transition and the later
-lifecycle program phases remain unfinished.
+Multipart-abort acceptance alone doesn't establish transition or complete
+lifecycle-program acceptance.
 
-## Likely Changed Paths
-
-The implementation plan should keep its boundary small and justify every path.
-Expected paths are:
-
-```text
-src/lifecycle/model.rs
-src/lifecycle/config.rs
-src/lifecycle/evaluator.rs
-src/lifecycle/actions.rs
-src/store/lifecycle_scan.rs
-src/store/lifecycle_action.rs
-src/store/multipart.rs
-src/store/entities/lifecycle_action.rs
-src/store/migrations/mod.rs
-src/store/migrations/m20260901_000001_lifecycle_abort_multipart.rs
-src/s3/ops/lifecycle.rs
-src/s3/ops/multipart.rs
-src/store/pinning/publication.rs
-tests/integration.rs
-tests/postgres_lifecycle.rs
-tests/multi_gateway.rs
-README.md
-```
-
-The exact test files may follow repository conventions, but no README update is
-permitted until the stated live evidence exists. `ROADMAP.md`, CORS code,
-transition code, residency code, Cargo configuration, and default deployment
-profiles are outside the expected boundary.
-
-## Security, Operations, and Git Boundary
+## Security and Operations
 
 Lifecycle remains database-authoritative metadata work. It does not alter
 SigV4, bucket authorization, CID-as-ETag, SSE-S3, SSE-C, object metadata, or
@@ -441,11 +409,6 @@ errors; asynchronous action failures are kept in redacted durable diagnostics.
 SQLite's transactional writer serialization and PostgreSQL row locks are both
 part of the correctness contract, not implementation details to bypass with
 read-then-delete logic.
-
-Before delivery, run the identity-bound Oracle and Reviewer checks against the
-final changed paths, then make one final semantic commit. Do not push or tag.
-This approved design authorizes no implementation, staging, commit, push, tag,
-Docker run, live service run, README update, or ROADMAP change by itself.
 
 ## Official AWS References
 
@@ -456,5 +419,3 @@ Docker run, live service run, README update, or ROADMAP change by itself.
 - [AbortMultipartUpload API](https://docs.aws.amazon.com/AmazonS3/latest/API/API_AbortMultipartUpload.html)
 - [CompleteMultipartUpload API](https://docs.aws.amazon.com/AmazonS3/latest/API/API_CompleteMultipartUpload.html)
 - [ListMultipartUploads API](https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListMultipartUploads.html)
-
-*Author's note: Written for the Rust engineer implementing Phase B, so they can add lifecycle cleanup without turning an unfinished upload into a published object or a pin-reclamation claim.*

@@ -2,30 +2,18 @@
 
 **Date:** 2026-08-13
 **Status:** Approved design
-**Scope:** Add secret-free, blocking automation for the live PostgreSQL, Docker Compose end-to-end, and client-smoke infrastructure surfaces that the existing CI does not execute.
+**Scope:** Secret-free, blocking automation for live PostgreSQL, Docker Compose end-to-end and client-smoke infrastructure checks.
 
-## Problem
+## Evidence boundary
 
-The existing `CI` workflow checks, lints, formats, and runs the library and
-in-process integration suites. It compiles all test targets, but it does not
-execute `tests/postgres_import.rs` or `tests/e2e.rs`.
-
-This creates two release-evidence gaps:
-
-1. `postgres_import` exits successfully without exercising PostgreSQL when
-   `IPFS_S3_TEST_POSTGRES_URL` is absent.
-2. `e2e` requires a running Kubo and gateway stack, so it is never exercised by
-   the existing workflow.
-
-The repository also has a PowerShell client-smoke runner and infrastructure
-tests. Real rclone and mc evidence is currently manual, and AWS CLI is recorded
-as skipped. Moving all three real clients into blocking CI now would require a
-separate cross-platform rewrite because the runner intentionally assumes local
-images and contains Docker Desktop path handling.
+Compiling PostgreSQL or E2E targets doesn't prove live behavior. PostgreSQL
+validation requires a configured disposable database, and E2E requires running
+Kubo and gateway services. Client-smoke infrastructure tests don't prove real
+rclone, mc or AWS CLI compatibility; those need separate execution receipts.
 
 ## Goals
 
-1. Run all four live PostgreSQL import/concurrency tests against PostgreSQL 17.
+1. Run the live PostgreSQL import/concurrency target against PostgreSQL 17.
 2. Build and start the repository's Kubo and gateway Compose services, wait for
    health, and run the real `e2e` target serially.
 3. Run the client-smoke infrastructure contract on Ubuntu without claiming that
@@ -37,7 +25,7 @@ images and contains Docker Desktop path handling.
 6. Ensure local verification owns only uniquely named Compose projects, refuses
    pre-existing fixed gateway/Kubo container names, and cannot inherit endpoint
    or port overrides from the operator's environment.
-7. Keep the four live PostgreSQL tests isolated when they share one disposable
+7. Keep live PostgreSQL tests isolated when they share one disposable
    database by terminally superseding only active jobs intentionally left queued
    by an earlier test before that test releases the serial guard.
 
@@ -49,8 +37,7 @@ images and contains Docker Desktop path handling.
   Cluster, or private swarm networking.
 - Do not connect to Pinata, Filebase, Cloudflare, or any other credentialed
   provider.
-- Do not report AWS CLI, mc, or rclone as passing. Their real smoke execution is
-  the next independent roadmap task.
+- Don't report AWS CLI, mc or rclone as passing based on infrastructure-only tests.
 - Do not replace or duplicate the existing check, Clippy, unit, integration, or
   formatting jobs.
 - Do not change production Rust behavior, database schema, Compose topology, or
@@ -147,10 +134,10 @@ pwsh -NoProfile -File tests/release-validation.Tests.ps1
 pwsh -NoProfile -File tests/client-smoke.Tests.ps1
 ```
 
-The first script parses the workflow as text and fails unless the required
-triggers, PostgreSQL URL and target, explicit Compose file and services, serial
-E2E target, diagnostics, cleanup, and timeouts remain present. It also rejects
-real client execution and `cloudflared` in this workflow. The existing script
+Workflow verification covers triggers, the PostgreSQL URL and target, explicit
+Compose file and services, serial E2E execution, diagnostics, cleanup and
+timeouts. The infrastructure-only client job doesn't launch real clients or
+`cloudflared`. The client-smoke test
 continues to test command argument boundaries, timeout tree cleanup, temporary
 path ownership, offline-build invariants, and requested-unavailable exit
 classification without launching real clients.
@@ -175,8 +162,7 @@ has no skip gate, and the infrastructure scripts throw on violated contracts.
 
 The implementation is accepted only when:
 
-1. `tests/release-validation.Tests.ps1` first fails because the workflow is
-   absent, then passes after the workflow is written.
+1. `tests/release-validation.Tests.ps1` verifies executable workflow behavior.
 2. `tests/client-smoke.Tests.ps1` passes locally.
 3. The workflow contract proves that PostgreSQL cannot use its missing-URL skip
    path and that E2E starts only Kubo and gateway from the base Compose file.
@@ -187,8 +173,7 @@ The implementation is accepted only when:
 7. Local verification audits prove unique project names, fixed-container
    preflight, forced PostgreSQL port/URL, forced E2E endpoints, and restoration
    of every overridden environment variable.
-8. The four PostgreSQL tests pass in one fresh serial target invocation, and a
-   second fresh-fixture invocation also passes all four. Each invocation proves
+8. The PostgreSQL target passes in fresh serial invocations. Each invocation proves
    that no earlier test in that target leaves claimable work for a later test;
    using a fresh fixture avoids conflating this isolation check with unrelated
    fixed job IDs that are intentionally retained as terminal history.
@@ -197,11 +182,3 @@ Local execution of the full live matrix is required when available. If a local
 Docker daemon or required image/build network is unavailable, that is reported
 as unverified evidence rather than converted into a passing result; the workflow
 definition and its contract tests must still pass.
-
-## Repository Boundary
-
-This task may create the workflow, its PowerShell contract test, this design,
-and its implementation plan, and may add test-only active-job teardown to
-`tests/postgres_import.rs`. It may not modify production source, PostgreSQL
-behavioral assertions, Compose files, client-smoke behavior, version metadata,
-or compatibility claims.

@@ -137,13 +137,13 @@ cargo test --test import_zip_v2_acceptance -- --ignored --test-threads=1
 
 ## Stage 9 R25 ZIP verification
 
-**Status: local isolated R25 acceptance passed.** The final revision3 source is
-the `dc519271` archive plus 135 exact overlay paths, independently built with
-installed Windows GNU Rust 1.92.0, locked/offline, standard profiles and default
-test concurrency. Earlier revision2 failures, cancelled builds and QA-wrapper
-errors are retained as historical evidence, not relabelled as successful runs.
+**Status: local isolated R25 acceptance passed**, committed as `55e06fa`.
+Coverage preserves v1 ETag/CID, VersionId, legacy result bytes and v2
+`ZipV2Result`, exact successful output owners, manual archive-owned cancellation,
+non-ZIP behavior, frozen configuration, recovery provenance, complete input proof
+and quota fences.
 
-| Current revision3 check | Actual result |
+| R25 acceptance check | Actual result |
 |---|---|
 | `fmt --all -- --check` | exit 0 |
 | all-targets `check` and Clippy `-D warnings` | both exit 0 |
@@ -157,32 +157,19 @@ The affected binaries include real production SigV4 HTTP (16), replay (13),
 unchanged literal wire goldens (5), direct capture/route fences (11), control
 review (16), recovery (49), complete MPU and R26 store/CLI/surface targets. Their
 shared support tests are not accumulated as unique scenarios. Compile-only and
-ignored cases are not counted as runtime passes. Other previously verified
-revision2 protocol targets are reused only where substantive dependencies are
-unchanged; they are not reported as new revision3 executions.
+ignored cases are not counted as runtime passes.
 
-Evidence lives under
-`target/stage9-r25-integrate-20261008-dc51927-a718e92c/`:
-`qa-r3-6b9e/report.md`, `r3protocol-6b9e21d4/report.md`, and the PG report below.
-All lanes verified the 135 receipts and unchanged source identities. Coverage
-preserves v1 ETag/CID, VersionId, legacy result bytes and v2 `ZipV2Result`, exact
-successful output owners, manual archive-owned cancellation, non-ZIP behavior,
-frozen configuration, recovery provenance, complete input proof and quota fences.
-
-The Import heartbeat/publication deadlock has an observed same-deadline
-failure/fix/revert proof. Historical Windows Code 32 and other unreproduced
-timing symptoms are not claimed fixed by passing current suites. Stage7/8,
-real paid-provider accounts, physical remote pins and production GC remain
-**NOT RUN**. Local Noop/mock durable jobs do not prove physical pin completion.
+Unreproduced file-close and timing symptoms aren't claimed fixed by passing
+current suites. Stage 8 remains incomplete; real paid-provider accounts and
+production GC remain **NOT RUN**. Local Noop/mock durable jobs don't prove physical
+pin completion. Stage 7 acceptance is recorded separately below.
 
 The current local targets are `tests/stage9_zip_*.rs` (support directories aren't
-test targets). With Rust 1.92 and already cached dependencies, use these bounded
-PowerShell commands with the already installed Windows GNU toolchain, without
-installing dependencies or adding persistent environment settings:
+test targets). With Rust 1.92 or later and cached dependencies, use:
 
 ```powershell
-cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test 'stage9_zip_*' -- --test-threads=1
-cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --lib zip::options:: -- --test-threads=1
+cargo test --locked --offline --test 'stage9_zip_*' -- --test-threads=1
+cargo test --locked --offline --lib zip::options:: -- --test-threads=1
 ```
 
 The glob includes capture/config, direct capture, HTTP, replay, wire, store,
@@ -195,18 +182,10 @@ The current-source native PG run executes four existing
 historical identity/new lifetime, damaged receipt catalog, committed route
 drift), plus
 `stage9_zip_postgres::r25_pg_tail_rollback_then_exact_shared_cid_publication`.
-All five ran with their original 8-second SQL deadline and passed on a fresh
-loopback/tmpfs PostgreSQL 17.11 instance. The tail case proves zero publication
+All five ran with their original 8-second SQL deadline and passed on isolated
+PostgreSQL 17.11. The tail case proves zero publication
 and quota writes after the injected fault, then same-capture retry with three
 versions, two leases and shared-CID usage of 5 bytes/1 pin.
-
-The separately authorized official `postgres:17.11` image pull fixed the missing
-local cache; subsequent runs used the fixed image with `--pull=never`. Raw native
-logs, server version, ten schema create/drop pairs, current nullable ALTERs,
-case results and logs-first exact resource cleanup are recorded in
-`qa-pg-rev3-f9768f2e-c2f0-4d29-af86-d8d77f77b63d/evidence.md` under the same parent
-root. Schemas/other clients were zero before stopping the owned container;
-owned run-label containers/volumes/networks were zero afterward.
 
 Non-NULL ZIP capture pointer/identity closure and seeded-history no-fill/down
 tests have SQLite native evidence and use the shared Rust TEXT/JSON scanner;
@@ -217,21 +196,19 @@ Run that case only with an explicitly authorized disposable PostgreSQL 17 test
 database already configured through `IPFS_S3_TEST_POSTGRES_URL`:
 
 ```powershell
-cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage9_zip_postgres r25_pg_tail_rollback_then_exact_shared_cid_publication -- --ignored --exact --nocapture --test-threads=1
+cargo test --locked --offline --test stage9_zip_postgres r25_pg_tail_rollback_then_exact_shared_cid_publication -- --ignored --exact --nocapture --test-threads=1
 ```
 
-The case owns a fresh UUID schema and removes only that exact schema. Keep the
-owned-run marker and evidence path with the result; `a718e92c` identifies the
-recorded source/root run, not permission to clean up another run's resources.
+The case owns a fresh UUID schema and removes only that exact schema.
 Don't substitute a production database, a paid account, unpin/GC operations or
 an unowned test instance for this fixture.
 
 ## Stage 5 RPC verification
 
 **Status: Stage 5 implementation and isolated-backend acceptance passed.**
-The approved Stage 5 section of
+The provider requirements in
 [`2026-09-20-pinning-zip-unixfs.md`](superpowers/plans/2026-09-20-pinning-zip-unixfs.md)
-is the acceptance authority. The commands below are entry points, not results.
+define the contract. The commands below are entry points, not results.
 Don't count an ignored test, compilation-only run or mock response as live
 provider evidence. Real Filebase/Pinata account tests remain **NOT RUN**.
 
@@ -330,23 +307,12 @@ The implementation uses only Filebase's supported upload parameters and doesn't
 follow add with `pin/add`; mock coverage can't establish the account's plan or
 paid capabilities. No Filebase CAR acceptance is claimed.
 
-The isolated two-node runner completed with exit 0 in run
-`24c5b32e5a224c1cb57be7784c564cd2`: the real matrix passed once, all eight roots
-remained readable offline after source shutdown, and exact owned-resource cleanup
-passed. The separate registered-worker/SigV4 target passed both tests.
-
-The concurrent admission and late-receipt findings were fixed and accepted in
-focused review. Latest affected targets passed 28 executions, with two PostgreSQL
-cases ignored by default; recovery PostgreSQL was separately executed on 17.11
-and passed, including the new single-statement snapshot and exact SQL timestamp
-fence. The prior nanosecond-versus-microsecond failure was reproduced by restoring
-the Rust comparison, not addressed with tolerance or longer waits. Latest pinning
-library coverage passed 460 tests and integration passed 165; fmt, strict
-all-targets Clippy, Rust 1.92 check and diff-check passed. The earlier complete
-library run passed 1400 tests with one ignored before these focused corrections;
-it is not presented as a post-correction full-library run. Disposable databases
-and exact owned container inventories were cleaned. These are test execution
-counts and bounded evidence, not account authorization or continuous availability.
+The isolated two-node matrix passed: all eight roots remained readable offline
+after source shutdown. The separate registered-worker/SigV4 target passed both
+tests. Affected targets passed 28 executions, with two PostgreSQL cases ignored
+by default; recovery PostgreSQL was separately executed on 17.11 and passed,
+including the single-statement snapshot and exact SQL timestamp fence. These
+results don't establish account authorization or continuous availability.
 
 Across these checks, HTTP 200 plus Hash must not hide EOF/trailer or stream
 failures. Strict comparison includes codec and multihash, not textual equality
@@ -385,21 +351,14 @@ cargo test --locked --offline --test cluster_provider_real --no-run
 pwsh -NoProfile -File tests/run-cluster-pinning-real.ps1 -ProviderPhase
 ```
 
-The earlier verifier-only run `58672868d8ee43baaddd5aa3960881b5` established
-1/2, 2/2 and loss of a fresh replica in its bounded topology. It does not establish
-provider CAR transport, registered-worker persistence or continuous availability.
-The initial provider-phase run `278435a7f9744af48d3d56a5a53eafd9` stopped at a
-compile failure; its real transmission assertions were NOT RUN. Later acceptance
-must record its own run, offline target DAG/byte checks and owned cleanup evidence.
-Real Filebase/Pinata account writes and account authentication remain NOT RUN.
-
-The later provider-phase run `a5d0e44ad9a44c3e8e7c8deee1d48a4d` passed its
-isolated transport target. Its wire audit recorded 26 POSTs: each transport used
+**Local isolated acceptance passed.** Verifier coverage established 1/2, 2/2
+and loss of a fresh replica in its bounded topology. The separate provider
+transport target passed. Its wire audit recorded 26 POSTs: each transport used
 six adds and seven CID submissions, with zero `dag/import` or DELETE calls.
 Proxy's `Name/Hash/Bytes/Size` and REST's `name/cid/bytes/size/allocations` were
 captured separately. Both target nodes passed complete offline DAG and stored-byte
 checks after the independent source stopped, including ciphertext. Fresh 2/2
-verification and owned logs-first cleanup passed. This bounded same-host run is
+verification passed. This bounded same-host run is
 not an account-authentication, billing or multi-host availability result.
 
 PostgreSQL worker/replica-contract coverage is separately opt-in through
@@ -407,43 +366,36 @@ PostgreSQL worker/replica-contract coverage is separately opt-in through
 an explicitly selected test without its environment must fail, not silently skip.
 Neither SQLite nor an ignored PostgreSQL test is PostgreSQL fence evidence.
 
-The isolated PostgreSQL 17.11 run `4caf2cc3831f456bb92f6dca15b2188d` passed
-`stage6_cluster_postgres_registered_claim_and_replica_contract` (1/1). It used
+Isolated PostgreSQL 17.11 validation passed
+`stage6_cluster_postgres_registered_claim_and_replica_contract` (1/1), using
 actual AppState route registration, signed PUT/tagging/delete and the registered
 worker. Native SQL accepted the original nanosecond caller token despite PG's
 microsecond readback, rejected the previous token, and rolled back the claim
 exactly. Both history tables rejected UPDATE/DELETE, downgrade was refused, and
 deletion retained Unknown ownership and the reservation. Its provider mock is
-not physical replica evidence. The owned container was logs-first removed; no
-owned containers, volumes or networks remained.
+not physical replica evidence.
 
 `stage6_cluster_auth` passed 3/3: REST 401 at each verifier read remains
 Authentication; a registered worker becomes Terminal and later due Polls issue
 no HTTP while preserving Unknown history and quota. This target calls the S3
 handler directly; signed HTTP evidence comes from the separate PG target.
-The final updated-core PostgreSQL run `1a2319d11ef24384b4537865d56660cb`
-passed all five exact tests, each in a distinct fresh PG17.11 database: the basic
+The final isolated PostgreSQL 17.11 validation passed all five exact tests: the basic
 contract above, late Poll/new-lifetime fencing, owner handoff with a fresh
 successor, typed receipt/projection rollback and recovery, and actual lease-first
 writer locking. The last case used `pg_blocking_pids` plus successful downstream
-`FOR UPDATE NOWAIT` acquisitions, not a sleep-based ordering assumption. Logs and
-SQL were captured before exact owned cleanup; remaining clients and owned
-containers/volumes/networks were zero. An `unexpected EOF ... open transaction`
+`FOR UPDATE NOWAIT` acquisitions, not a sleep-based ordering assumption.
+An `unexpected EOF ... open transaction`
 diagnostic after the injected rollback remains unassigned; rollback/recovery
 assertions passed, and it is not reported as a fixed defect.
 
-Final stable-tree checks passed: Rust 1.92 GNU `fmt --all -- --check`,
+Stage 6 quality checks passed: Rust 1.92 `fmt --all -- --check`,
 `check --locked --offline --all-targets`, and strict all-targets Clippy with
 `-D warnings`; library tests **1438 passed / 0 failed / 1 ignored** and the
 integration target **165 passed / 0 failed**. The eight focused targets above
 recorded 171 target PASS results, including reused embedded leaf tests, and
 7 ignored tests; ignored is not PASS. Five of those ignored PG cases were then
-executed explicitly as described above. Quality runs used a run-owned writable
-project-target TEMP/TMP/TMPDIR because this machine's system TEMP rejected file
-creation; no global permissions, dependency versions or lint allowances changed.
-Focused review closed the min/RF, retired-candidate and authentication defects
-and the remaining PG/quality evidence gaps. **Stage 6 local isolated acceptance
-passed**, within the topology and real-account limitations stated above.
+executed explicitly as described above. Real Filebase/Pinata account writes and
+account authentication remain NOT RUN.
 
 ## R26 legacy namespace migration acceptance
 
@@ -463,20 +415,11 @@ cargo test --locked --offline --test legacy_pinning_migration_postgres -- --igno
 
 The PG target requires an explicitly run-owned disposable database and
 `IPFS_S3_R26_PG_OWNED=legacy-r26-fixture-only`; do not supply a production URL.
-Each case creates an isolated schema. Final run on 2026-10-08,
-`b3a3aabdd2fb4ce88f7b4657126601e8`, used the R26-only export over committed
-Stage6 `1515f89`, including the final concurrency fixes. All four R26 PG cases
-and both Stage2 PG cases passed. Coverage includes native NOWAIT/phantom fences,
+Each case creates an isolated schema. All four R26 PG cases and both Stage 2 PG
+cases passed on isolated PostgreSQL 17.11. Coverage includes native NOWAIT/phantom fences,
 receipt-write fault and atomic rollback, route lock/committed drift,
 contradictory historical account identity, the old-resource/new-allocation
-boundary and damaged registered receipt catalogs. PostgreSQL 17.11 was cached,
-pull disabled, data in tmpfs and access loopback-only. Schemas and client
-sessions were zero before logs-first ID/name/label-verified container cleanup;
-owned containers/volumes/networks were zero afterwards. Evidence and an explicitly
-abbreviated diagnostic log excerpt remain at
-`target/stage9-r26-pg-b3a3aabdd2fb4ce88f7b4657126601e8/`.
-Earlier runs `64a9c2878fb5427ab0a013e0197a6b88` and
-`d264f0d36b2d4df19d1773cf62708896` are retained as intermediate evidence only.
+boundary and damaged registered receipt catalogs.
 
 **Local isolated acceptance passed.** The formal
 CLI target passed 7/7, including cross-process receipt replay/rollback,
@@ -493,13 +436,7 @@ export passed Rust 1.92 fmt check and strict all-targets Clippy, full lib
 1442 passed/0 failed/1 ignored under default parallelism, integration 165,
 store 33, CLI 7 and Stage2 SQLite 2. The two Stage2 PG cases ignored in the
 ordinary command were actually exercised in the final PG run above.
-The empty-receipt hot path and duplicate failed-observation CAS regressions
-were fixed with controlled and deterministic reproductions; no internal
-timeouts, retries, worker counts, default parallelism or original assertions
-were weakened. Implementation review accepted the final fixes and evidence.
-Future Stage7/8 files were excluded from this export and do not prove their own
-delivery. No production migration, remote
-account operation, unpin, or GC has been performed.
+No production migration, remote account operation, unpin, or GC has been performed.
 
 ## Stage 7 local management checks
 
@@ -508,21 +445,21 @@ includes real receipt-scoped workers, shared CIDs, retirement, same-file databas
 close/reopen, original-document replay and export, with private historical cells
 preserved. The cumulative decode and full-registry SQL limits remain enabled.
 
-Final checks on Rust 1.92 GNU: default-feature lib **1646 passed, 0 failed,
+Final checks on Rust 1.92: default-feature lib **1646 passed, 0 failed,
 6 ignored**; integration **165 passed, 0 failed**; all-targets strict Clippy and
-`cargo fmt --all --check` passed. Ignored tests are not counted as passing.
+`cargo fmt --all -- --check` passed. Ignored tests are not counted as passing.
 The four isolated PostgreSQL 17.11 targets for formal apply (including Renew and
 cross-connection replay), managed Submit, retirement concurrency and root-release
 migration were executed separately and passed. These are local/mock-provider and
 isolated-database results, not production migration or external-account evidence.
 
-With the installed Windows GNU Rust toolchain and cached dependencies, these
-PowerShell commands select the actual local targets. They aren't recorded passes:
+With Rust 1.92 or later and cached dependencies, these commands select the local
+targets. Commands alone aren't recorded passes:
 
 ```powershell
-cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test management_plan_wire --test management_db_snapshot
-cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test 'stage7_management_*'
-cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage7_retirement_barrier --test stage7_retirement_barrier_consumers --test stage7_retirement_barrier_http
+cargo test --locked --offline --test management_plan_wire --test management_db_snapshot
+cargo test --locked --offline --test 'stage7_management_*'
+cargo test --locked --offline --test stage7_retirement_barrier --test stage7_retirement_barrier_consumers --test stage7_retirement_barrier_http
 ```
 
 The management targets check schema/native snapshots, confirmation, file and
@@ -534,23 +471,23 @@ retirement fencing. Compilation and mock/local evidence aren't physical-provider
 completion or storage reclamation evidence.
 
 `stage7_retirement_barrier_postgres` is separately ignored and requires a
-parent-registered, authorized isolated `stage7_` schema through
+explicitly authorized isolated `stage7_` schema through
 `IPFS_S3_STAGE7_RETIREMENT_DATABASE_URL`. It must not be pointed at production or
 an occupied fixture. Once that environment is explicitly provided, select it with:
 
 ```powershell
-cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage7_retirement_barrier_postgres -- --ignored --nocapture --test-threads=1
+cargo test --locked --offline --test stage7_retirement_barrier_postgres -- --ignored --nocapture --test-threads=1
 ```
 
 `stage7_management_apply_postgres` is separately ignored and requires a
-parent-selected, empty, exclusively owned `stage7_` schema through
+explicitly selected, empty, exclusively owned `stage7_` schema through
 `IPFS_S3_STAGE7_APPLY_DATABASE_URL`. Use an authorized disposable PostgreSQL
-17.11 instance with its image already cached; don't pull an image or use a
+17.11 instance; don't use a
 production database or occupied fixture. Once that environment is explicitly
 provided, select the target with:
 
 ```powershell
-cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage7_management_apply_postgres -- --ignored --nocapture --test-threads=1
+cargo test --locked --offline --test stage7_management_apply_postgres -- --ignored --nocapture --test-threads=1
 ```
 
 Formal apply, native microsecond timestamp precision, NOWAIT/phantom fences and
@@ -561,6 +498,32 @@ Ignored PostgreSQL cases and command examples aren't passing evidence. Runtime
 and native PostgreSQL acceptance require executed results against the finished
 source. External account operations, production operations, unpin and GC aren't
 authorized by these checks.
+
+## Opt-in multi-process capacity measurements
+
+`pinning_multi_process_benchmark` provides bounded, isolated SQLite and loopback
+provider scenarios. Its default test run checks workload construction and metrics:
+
+```powershell
+cargo test --locked --offline --test pinning_multi_process_benchmark
+```
+
+These checks passed **14 tests**, with **4 runtime entrypoints ignored**. They do
+not establish benchmark completion or Stage 8 acceptance. Cross-process Submit
+convergence, production-workload baselines and fault comparisons remain unverified.
+
+To select the bounded runtime scenario explicitly:
+
+```powershell
+$env:IPFS_S3_PINNING_BENCHMARK = "offline-sqlite"
+$env:IPFS_S3_PINNING_BENCHMARK_SECONDS = "60"
+cargo test --locked --offline --test pinning_multi_process_benchmark pinning_multi_process_offline_benchmark -- --ignored --exact --nocapture --test-threads=1
+```
+
+The internal child entrypoint is started only by the harness. Do not use
+`--include-ignored` to run all entrypoints together. The harness does not authorize
+production traffic, physical GC or external account operations; its measurements
+are not proof of a cross-process global limiter or physical storage reclamation.
 
 ## Environment-backed and deep checks
 

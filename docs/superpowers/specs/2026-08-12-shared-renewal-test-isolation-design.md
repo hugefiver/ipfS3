@@ -4,21 +4,12 @@
 **Status:** Approved design
 **Scope:** Remove lifecycle-recorder cross-test contamination from one pinning renewal-order test without changing production behavior.
 
-## Problem
+## Isolation requirement
 
-`cargo test --lib --test integration` produced one intermittent failure in
-`store::pinning::leases::tests::renewal_projects_only_its_locked_targets_but_uses_shared_oldest_canonical_target`.
-The recorded event list contained an unexpected second `OwnerLock("object-1")`.
-The target test passed in ten isolated repetitions, the integration suite passed
-124/124, and a later full library run passed 705/705. This is evidence of a
-parallel test-fixture collision rather than a production renewal failure.
-
-The lifecycle recorder intentionally filters events by IDs, but this test adds
-the shared fixture ID `object-1` to its owner filter. Other parallel tests also
-operate on `object-1`, so their owner events can enter this test's global
-recorder while it is active. The existing `LIFECYCLE_ORDER_TEST_LOCK` protects
-tests that explicitly acquire it; it cannot exclude unrelated tests that use
-the same fixture ID without using the recorder.
+The process-global lifecycle recorder filters events by IDs. Renewal-order
+fixtures must use owner identities not shared by unrelated parallel tests.
+`LIFECYCLE_ORDER_TEST_LOCK` only serializes tests that acquire it; it doesn't
+exclude unrelated operations using the same ID.
 
 ## Goals
 
@@ -33,7 +24,6 @@ the same fixture ID without using the recorder.
 - Do not redesign the global lifecycle recorder or add recorder session tokens.
 - Do not serialize the complete library test suite.
 - Do not change database migrations, public APIs, dependencies, or timeouts.
-- Do not include the next roadmap item, the release validation matrix, in this change.
 
 ## Design
 
@@ -53,10 +43,6 @@ The lifecycle recorder owner filter, `renew_manual_lease` call, and expected
 `OwnerLock`/`OwnerGuard` events will all use
 `object-shared-renewal-order`. Because no unrelated parallel test uses this ID,
 their owner events cannot satisfy the recorder filter.
-
-This follows the established repository fix in commit `cd88a17`, which isolated
-the adjacent `manual_renewal_orders_owner_then_lease_target_and_remote_work`
-test with its own owner fixture.
 
 ## Data and Error Flow
 
@@ -88,9 +74,3 @@ The change is accepted only when all of the following pass:
 Source audit must confirm that the affected test no longer records, renews, or
 expects owner events for `object-1`, while its shared remote CID and two-target
 canonical selection remain intact.
-
-## Repository Boundary
-
-The specification, implementation plan, and test edit may be written to the
-working tree. No Git commit, push, tag, or other Git write operation is
-authorized by this design.

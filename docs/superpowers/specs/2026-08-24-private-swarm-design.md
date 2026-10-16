@@ -95,8 +95,7 @@ default. Compose secrets take precedence over any raw environment mechanism.
 
 `ipfs/cluster.Dockerfile` remains based on `ipfs/kubo:v0.43.0`, but copies and
 executes `ipfs/private-swarm-entrypoint.sh`. It no longer selects
-`ipfs/entrypoint.sh`. The shared `ipfs/entrypoint.sh` remains byte-for-byte
-unchanged for this work.
+`ipfs/entrypoint.sh`. Other profiles retain the shared entrypoint's behavior.
 
 ### Cluster-only private entrypoint
 
@@ -273,28 +272,12 @@ regression gates pass. README describes the bounded same-host support and its
 limits. ROADMAP checks only the private-swarm item. The initial hosted result
 must be reported as `NOT RUN`; it is not inferred from local success.
 
-## Expected File Boundary
+## Profile isolation
 
-Implementation may modify only the following paths, plus a future implementation
-plan and this specification:
-
-- `.github/workflows/release-validation.yml`
-- `README.md`
-- `ROADMAP.md`
-- `docker-compose.cluster.yml`
-- `ipfs/cluster.Dockerfile`
-- `ipfs/private-swarm-entrypoint.sh` (new)
-- `tests/compose.cluster-validation.yml`
-- `tests/cluster.Tests.ps1`
-- `tests/cluster.rs`
-- `tests/support/cluster.rs`
-- shared static tests when necessary to lock the workflow contract
-
-Protected paths include all Cargo and application sources, the default Compose
-profile, the single-PG profile, the multi-gateway profile, and
-`ipfs/entrypoint.sh`. Any need to change a protected path, weaken a fail-closed
-condition, or expose a production internal endpoint stops implementation for a
-design revision.
+Private-swarm behavior belongs to the Cluster profile and its dedicated
+entrypoint. The default, single-PG and multi-gateway profiles retain their own
+startup behavior. This profile doesn't change gateway application semantics
+or expose production internal endpoints.
 
 ## Non-goals
 
@@ -333,10 +316,8 @@ The v0.5-D item is complete only when:
    outage, and recovery scenarios remain green.
 7. The existing blocking Cluster job enforces the ordered contract, generated
    secrets and cleanup are fail-closed, and static tests prevent profile drift.
-8. README and ROADMAP change only after the complete local evidence set passes;
-   the first hosted result is honestly `NOT RUN`.
-9. `git diff --check` passes and the final changed-path audit contains only the
-   approved implementation boundary.
+8. Capability claims require the complete local evidence set. A hosted run not
+   executed is `NOT RUN`; local success doesn't establish a hosted pass.
 
 ## Official Sources
 
@@ -360,10 +341,3 @@ The v0.5-D item is complete only when:
   <https://ipfscluster.io/documentation/deployment/architecture/>
 - IPFS Cluster replication factors and pinning:
   <https://ipfscluster.io/documentation/guides/pinning/>
-
-## Git Boundary
-
-This specification authorizes no implementation itself. A future implementation
-must stay within **Expected File Boundary**, must not stage, commit, push, or
-tag without separate explicit authorization, and must stop for a design revision
-if runtime evidence contradicts this contract.

@@ -279,8 +279,8 @@ ordinary lists.
 
 ListObjectVersions is implemented through the s3s 0.14 `S3` trait and its
 `ListObjectVersionsInput` and `ListObjectVersionsOutput` DTOs, with the handler
-delegating to a dedicated versioning operation module. Before implementation,
-the plan must compile against the locked s3s 0.14 API and use its exact field
+delegating to a dedicated versioning operation module. It uses the locked
+s3s 0.14 API and its exact field
 names for `Version`, `DeleteMarker`, `key_marker`, `version_id_marker`, and
 their next-marker fields. No handwritten route or XML serializer may bypass
 s3s SigV4 routing and DTO serialization.
@@ -380,19 +380,17 @@ Implementation is test-driven. Unit and integration coverage must prove:
    and no deadlock with pinning lifecycle work.
 
 Real-client evidence is required after automated tests, using the existing
-Docker-based validation environment only in the implementation task. It must
+Docker-based validation environment. It must
 record AWS CLI or a supported SDK performing enable, two writes, simple delete,
 ListObjectVersions, explicit historical get, marker 404/405 behavior, exact
 marker delete, suspended null overwrite, and version-aware bucket cleanup.
 Evidence must include commands, redacted output assertions, versions of the
-client and gateway, and an honest `NOT RUN` state until executed. This design
-task does not run Docker or live tests.
+client and gateway, and an honest `NOT RUN` state until executed.
 
 README and ROADMAP may be updated only after all static, unit, integration,
 database, and required real-client evidence gates pass. The roadmap boxes are
 checked together in the same reviewed change because the three public behaviors
-are one atomic feature. No README, ROADMAP, implementation plan, source, or
-test file changes are authorized by this specification task.
+are one atomic feature.
 
 ## Non-goals
 
@@ -428,9 +426,6 @@ test file changes are authorized by this specification task.
    content object, tag set, or lease.
 7. Automated tests and the real-client evidence gate pass before README and
    ROADMAP are changed, and the roadmap boxes change together.
-8. `git diff --check` passes and the implementation changed-path audit is
-   limited to the approved plan boundary. This design document itself authorizes
-   no implementation or version-control write.
 
 ## Official Sources
 
@@ -443,15 +438,3 @@ test file changes are authorized by this specification task.
 - AWS S3 versioning behavior and suspended buckets: <https://docs.aws.amazon.com/AmazonS3/latest/userguide/Versioning.html>
 - AWS S3 working with delete markers: <https://docs.aws.amazon.com/AmazonS3/latest/userguide/DeleteMarker.html>
 - AWS S3 MFA Delete: <https://docs.aws.amazon.com/AmazonS3/latest/userguide/MultiFactorAuthenticationDelete.html>
-
-## Git and Review Boundary
-
-This specification authorizes no production, test, documentation-state,
-roadmap, plan, or configuration edit. A future implementation must start from
-an approved implementation plan, remain within that plan's explicit changed
-path boundary, preserve the security and versioning boundaries above, and stop
-for a design revision if s3s 0.14 or client evidence contradicts this contract.
-It must not stage, commit, push, tag, or otherwise write Git history without
-separate explicit user authorization.
-
-*Author's note: Written for the engineer planning v0.6, so they can implement one coherent S3 versioning contract without exposing legacy rows or breaking pin leases.*
