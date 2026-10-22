@@ -90,6 +90,9 @@ base_backoff_secs = 1
 max_backoff_secs = 60
 
 [pinning]
+# Override scheduling without changing provider limits or policies:
+# IPFS_S3_PINNING_WORKER_INTERVAL (e.g. "15s")
+# IPFS_S3_PINNING_WORKER_CONCURRENCY (positive integer, e.g. "1")
 worker_interval = "5s"
 worker_concurrency = 4
 

@@ -451,6 +451,8 @@ impl Config {
     ///    - `IPFS_S3_ACCESS_KEY_ID` + `IPFS_S3_SECRET_ACCESS_KEY` (together
     ///      replace the credentials list).
     ///    - `IPFS_S3_MASTER_KEY` (non-empty values only).
+    ///    - `IPFS_S3_PINNING_WORKER_CONCURRENCY`
+    ///    - `IPFS_S3_PINNING_WORKER_INTERVAL`
     pub fn load() -> anyhow::Result<Self> {
         let config_path =
             std::env::var("IPFS_S3_CONFIG").unwrap_or_else(|_| "config.toml".to_string());
@@ -497,6 +499,12 @@ impl Config {
         }
         if let Some(master_key) = get_env("IPFS_S3_MASTER_KEY").filter(|value| !value.is_empty()) {
             self.crypto.master_key = master_key;
+        }
+        if let Some(worker_concurrency) = get_env("IPFS_S3_PINNING_WORKER_CONCURRENCY") {
+            self.pinning.worker_concurrency = worker_concurrency.parse()?;
+        }
+        if let Some(worker_interval) = get_env("IPFS_S3_PINNING_WORKER_INTERVAL") {
+            self.pinning.worker_interval = worker_interval;
         }
         if let Some(poll_interval_ms) = get_env("IPFS_S3_LIFECYCLE_POLL_INTERVAL_MS") {
             self.lifecycle.poll_interval_ms = poll_interval_ms.parse()?;
@@ -705,6 +713,63 @@ mod tests {
                 .all(|provider| provider.identity.cleanup
                     == crate::pinning::identity::CleanupMode::Retain)
         );
+    }
+
+    #[test]
+    fn pinning_worker_environment_overrides_scheduling() {
+        let mut config = Config::build_default();
+        config
+            .apply_env_overrides(|name| match name {
+                "IPFS_S3_PINNING_WORKER_CONCURRENCY" => Some("1".into()),
+                "IPFS_S3_PINNING_WORKER_INTERVAL" => Some("15s".into()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(config.pinning.worker_concurrency, 1);
+        assert_eq!(config.pinning.worker_interval, "15s");
+        assert!(
+            crate::pinning::config::ValidatedPinningConfig::from_raw(&config.pinning, |_| None)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn pinning_worker_environment_preserves_configured_scheduling_when_unset() {
+        let mut config = Config::build_default();
+        config.pinning.worker_concurrency = 3;
+        config.pinning.worker_interval = "7s".into();
+        config.apply_env_overrides(|_| None).unwrap();
+        assert_eq!(config.pinning.worker_concurrency, 3);
+        assert_eq!(config.pinning.worker_interval, "7s");
+    }
+
+    #[test]
+    fn pinning_worker_environment_rejects_invalid_scheduling() {
+        for value in ["not-a-number", "-1", "18446744073709551616"] {
+            let mut config = Config::build_default();
+            assert!(
+                config
+                    .apply_env_overrides(|name| {
+                        (name == "IPFS_S3_PINNING_WORKER_CONCURRENCY").then(|| value.to_owned())
+                    })
+                    .is_err()
+            );
+        }
+        for (name, value) in [
+            ("IPFS_S3_PINNING_WORKER_CONCURRENCY", "0"),
+            ("IPFS_S3_PINNING_WORKER_INTERVAL", "0s"),
+            ("IPFS_S3_PINNING_WORKER_INTERVAL", ""),
+            ("IPFS_S3_PINNING_WORKER_INTERVAL", "not-a-duration"),
+        ] {
+            let mut config = Config::build_default();
+            config
+                .apply_env_overrides(|key| (key == name).then(|| value.to_owned()))
+                .unwrap();
+            assert!(
+                crate::pinning::config::ValidatedPinningConfig::from_raw(&config.pinning, |_| None)
+                    .is_err()
+            );
+        }
     }
 
     #[test]

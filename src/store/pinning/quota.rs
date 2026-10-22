@@ -412,7 +412,7 @@ async fn reserve_unique_for_intent_with_work<C: ConnectionTrait>(
         ));
     }
     for attempt in 0..SQLITE_RETRY_LIMIT {
-        match reserve_unique_attempt_with_work(
+        let outcome = match reserve_unique_attempt_with_work(
             db,
             (provider, cid),
             cid_size,
@@ -423,8 +423,28 @@ async fn reserve_unique_for_intent_with_work<C: ConnectionTrait>(
         )
         .await
         {
-            Ok(ReserveAttempt::Outcome(outcome)) => return Ok(outcome),
-            Ok(ReserveAttempt::Retry) => retry_delay(attempt).await,
+            Ok(ReserveAttempt::Outcome(outcome)) => Ok(Some(outcome)),
+            Ok(ReserveAttempt::Waiting(usage)) => {
+                let evict = if waiter {
+                    Ok(Vec::new())
+                } else {
+                    eviction_candidates(
+                        db,
+                        provider,
+                        cid_size,
+                        usage,
+                        provider_limits(limits, provider)?,
+                    )
+                    .await
+                };
+                evict.map(|evict| Some(ReservationOutcome::QuotaWaiting { evict }))
+            }
+            Ok(ReserveAttempt::Retry) => Ok(None),
+            Err(error) => Err(error),
+        };
+        match outcome {
+            Ok(Some(outcome)) => return Ok(outcome),
+            Ok(None) => retry_delay(attempt).await,
             Err(AppError::Database(message)) if is_sqlite_contention(&message) => {
                 retry_delay(attempt).await;
             }
@@ -692,6 +712,7 @@ pub(crate) async fn evict_for_provider_quota(
 
 enum ReserveAttempt {
     Outcome(ReservationOutcome),
+    Waiting(pin_provider_usage::Model),
     Retry,
 }
 
@@ -1063,12 +1084,7 @@ async fn reserve_new_remote_with_work<C: ConnectionTrait>(
             undo_capacity_grant(db, provider, grant).await?;
             Ok(ReserveAttempt::Retry)
         }
-        CapacityReservation::Waiting(usage) => {
-            let evict = eviction_candidates(db, provider, cid_size, usage, limits).await?;
-            Ok(ReserveAttempt::Outcome(ReservationOutcome::QuotaWaiting {
-                evict,
-            }))
-        }
+        CapacityReservation::Waiting(usage) => Ok(ReserveAttempt::Waiting(usage)),
         CapacityReservation::Retry => Ok(ReserveAttempt::Retry),
     }
 }
@@ -1136,12 +1152,7 @@ async fn reacquire_absent_remote<C: ConnectionTrait>(
                 Ok(ReserveAttempt::Retry)
             }
         }
-        CapacityReservation::Waiting(usage) => {
-            let evict = eviction_candidates(db, provider, cid_size, usage, limits).await?;
-            Ok(ReserveAttempt::Outcome(ReservationOutcome::QuotaWaiting {
-                evict,
-            }))
-        }
+        CapacityReservation::Waiting(usage) => Ok(ReserveAttempt::Waiting(usage)),
         CapacityReservation::Retry => Ok(ReserveAttempt::Retry),
     }
 }
@@ -1280,6 +1291,7 @@ async fn eviction_candidates<C: ConnectionTrait>(
     usage: pin_provider_usage::Model,
     limits: &ProviderLimits,
 ) -> AppResult<Vec<(String, String)>> {
+    record_order_event("eviction_candidates");
     let remotes = remote_pin::Entity::find()
         .filter(remote_pin::Column::Provider.eq(provider))
         .filter(remote_pin::Column::Status.is_in(capacity_holding_statuses()))
@@ -1688,8 +1700,8 @@ mod tests {
     use chrono::{Duration, TimeZone, Utc};
     use sea_orm::{
         ColumnTrait, ConnectOptions, ConnectionTrait, Database, DatabaseBackend,
-        DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter, QueryTrait, TransactionTrait,
-        sea_query::Expr,
+        DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QueryTrait,
+        TransactionTrait, sea_query::Expr,
     };
     use tokio::sync::Barrier;
 
@@ -1699,7 +1711,7 @@ mod tests {
         evict_for_provider_quota, evict_for_provider_waiter, existing_remote_lock_query,
         order_events, ordered_unique_providers, read_usage, refresh_remote_max_active_touch,
         reserve_capacity, reserve_new_remote, reserve_unique, reserve_unique_attempt,
-        undo_capacity_grant, wake_provider_waiters,
+        reserve_unique_for_waiter, undo_capacity_grant, wake_provider_waiters,
     };
     use crate::{
         pinning::{
@@ -2134,6 +2146,126 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    async fn assert_waiter_waits_without_eviction_scan(absent: bool) {
+        let db = setup().await;
+        let limits = limits(100, 1);
+        let cid = "bafy-waiter";
+        if absent {
+            reserve_unique(&db, "pinata", cid, 30, &limits, time(0))
+                .await
+                .unwrap();
+            confirmed_release(&db, "pinata", cid, 1, time(1))
+                .await
+                .unwrap();
+        }
+        reserve_unique(&db, "pinata", "bafy-held", 80, &limits, time(2))
+            .await
+            .unwrap();
+        seed_active_target(&db, "bafy-held", "held", time(2)).await;
+        seed_quota_waiter(&db, cid, "head", 30, time(3)).await;
+        seed_quota_waiter(&db, "bafy-held", "reusable-tail", 80, time(4)).await;
+        let before_usage = read_usage(&db, "pinata").await.unwrap();
+        let before_targets = pin_lease_target::Entity::find()
+            .order_by_asc(pin_lease_target::Column::Id)
+            .all(&db)
+            .await
+            .unwrap();
+        let before_remotes = remote_pin::Entity::find()
+            .order_by_asc(remote_pin::Column::Cid)
+            .all(&db)
+            .await
+            .unwrap();
+        let before_jobs = pin_job::Entity::find()
+            .order_by_asc(pin_job::Column::Id)
+            .all(&db)
+            .await
+            .unwrap();
+
+        order_events::clear();
+        let txn = db.begin().await.unwrap();
+        assert_eq!(
+            reserve_unique(&txn, "pinata", cid, 30, &limits, time(5))
+                .await
+                .unwrap(),
+            ReservationOutcome::QuotaWaiting {
+                evict: vec![("pinata".to_owned(), "bafy-held".to_owned())],
+            }
+        );
+        txn.commit().await.unwrap();
+        assert_eq!(
+            order_events::take()
+                .iter()
+                .filter(|event| **event == "eviction_candidates")
+                .count(),
+            1
+        );
+
+        order_events::clear();
+        let txn = db.begin().await.unwrap();
+        let outcome = reserve_unique_for_waiter(&txn, "pinata", cid, 30, &limits, time(5))
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        assert!(
+            !order_events::take().contains(&"eviction_candidates"),
+            "waiter reservation must not scan eviction candidates"
+        );
+        assert_eq!(
+            outcome,
+            ReservationOutcome::QuotaWaiting { evict: Vec::new() }
+        );
+
+        order_events::clear();
+        let txn = db.begin().await.unwrap();
+        let woken = wake_provider_waiters(&txn, "pinata", &limits["pinata"], time(5))
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        assert!(
+            woken.is_empty(),
+            "a reusable tail must not bypass the FIFO head"
+        );
+        assert!(
+            !order_events::take().contains(&"eviction_candidates"),
+            "a no-headroom wake must not scan eviction candidates"
+        );
+        assert_eq!(read_usage(&db, "pinata").await.unwrap(), before_usage);
+        assert_eq!(
+            pin_lease_target::Entity::find()
+                .order_by_asc(pin_lease_target::Column::Id)
+                .all(&db)
+                .await
+                .unwrap(),
+            before_targets
+        );
+        assert_eq!(
+            remote_pin::Entity::find()
+                .order_by_asc(remote_pin::Column::Cid)
+                .all(&db)
+                .await
+                .unwrap(),
+            before_remotes
+        );
+        assert_eq!(
+            pin_job::Entity::find()
+                .order_by_asc(pin_job::Column::Id)
+                .all(&db)
+                .await
+                .unwrap(),
+            before_jobs
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn new_waiter_waits_without_eviction_scan() {
+        assert_waiter_waits_without_eviction_scan(false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn absent_waiter_waits_without_eviction_scan() {
+        assert_waiter_waits_without_eviction_scan(true).await;
     }
 
     #[tokio::test]

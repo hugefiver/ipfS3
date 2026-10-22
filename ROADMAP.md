@@ -72,7 +72,14 @@ migrations and real paid-provider account operations haven't been run. See the
 [current requirements and status](docs/superpowers/plans/2026-09-20-pinning-zip-unixfs.md)
 and [verification boundaries](docs/testing.md).
 
-- [ ] Stage 8 capacity and cross-process scheduling research with a reproducible baseline
+- **Current hotfix scope: production database liveness (partial mitigation).** Bound quota wake batches, keep SQLite text-key lookups indexable and avoid unused eviction proposals for existing waiters. Use a deployment-scoped pinning scheduling override (one in-flight job, fifteen-second scan interval) to reduce contention; preserve the existing database connection count, timeouts, quota, authorization, fencing, atomic publication and receipt requirements. Acceptance requires sustained readiness and observable background progress under the actual SQLite runtime and no-headroom workload; this does not complete ZIP/MPU incident recovery.
+- [ ] **Next after the hotfix, before Stage 8: database control-plane liveness and recovery refactor.** Coordinate this with the Stage 7.5 management scalability work; replace internal execution paths incrementally while preserving existing data and external contracts.
+  - [ ] Separate quota reservation, advisory candidate discovery and fenced eviction execution; remove repeated provider-wide work from ordinary waiter paths.
+  - [ ] Make transaction ownership and completed rollback explicit, bound discovery and processing cost, and apply fair scheduling/backpressure between business requests, claim/renewal and background maintenance. Retain complete required lock frontiers, fresh admission checks and queue-head ordering. Validate connection-local schema/shadow checks and DDL/rollback visibility before enabling multiple SQLite connections.
+  - [ ] Reduce N+1 reads with indexable, set-oriented queries without caching authorization or debt decisions; instrument connection waits, lock waits, transaction duration, renewal and unknown commit results.
+  - [ ] Provide controlled recovery of prepared open MPU batches using proven original inputs and frozen contracts, with atomic publication/receipts and idempotent replay; missing inputs remain explicitly blocked.
+  - [ ] Validate no-headroom and growing queues, shared CIDs, provider debt, cancellation/restart and unknown commits at representative scale, with sustained production observation beyond the prior recurrence window.
+- [ ] Stage 8 capacity and cross-process scheduling research with a reproducible baseline, after the control-plane refactor
 - [ ] Full-owner GC inventory and isolated writer-barrier/fault-recovery validation
 
 Stage 8 isn't accepted. Draft measurements don't establish production capacity,
