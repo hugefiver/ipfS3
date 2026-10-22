@@ -1,6 +1,9 @@
 //! Metered current registry rows; private cells are never projected or duplicated.
 use super::*;
-use sea_orm::{EntityTrait, FromQueryResult};
+use sea_orm::{
+    ColumnTrait, EntityTrait, FromQueryResult, Iterable,
+    sea_query::{ColumnType, Iden},
+};
 use std::sync::Arc;
 
 pub(crate) async fn current_management_rows<C: ConnectionTrait>(
@@ -150,12 +153,27 @@ where
     for _ in 0..2 {
         work.copy(key)?;
     }
+    let backend = db.get_database_backend();
     let predicate = table
         .primary_key
         .iter()
         .enumerate()
-        .map(|(index, column)| format!("CAST(\"{column}\" AS TEXT)=${}", index + 1))
-        .collect::<Vec<_>>()
+        .map(|(index, column)| {
+            let entity_column = E::Column::iter()
+                .find(|candidate| Iden::to_string(candidate) == *column)
+                .ok_or(ManagementError::Schema)?;
+            let expression = if backend == sea_orm::DatabaseBackend::Sqlite
+                && matches!(
+                    entity_column.def().get_column_type(),
+                    ColumnType::String(_) | ColumnType::Text
+                ) {
+                format!("\"{column}\"")
+            } else {
+                format!("CAST(\"{column}\" AS TEXT)")
+            };
+            Ok(format!("{expression}=${}", index + 1))
+        })
+        .collect::<Result<Vec<_>>>()?
         .join(" AND ");
     let source = format!("FROM \"{name}\" WHERE {predicate}");
     let values = key
@@ -387,6 +405,10 @@ impl CurrentRows {
         Ok(result)
     }
 }
+
+#[cfg(test)]
+#[path = "current_tests.rs"]
+mod model_tests;
 
 #[cfg(test)]
 mod tests {

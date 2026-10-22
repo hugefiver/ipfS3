@@ -2137,6 +2137,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_waiter_batches_commit_and_advance_eligible_fifo_without_repeats() {
+        let db = setup().await;
+        let limits = limits(100, 10);
+        seed_quota_waiter(&db, "bafy-inactive", "inactive", 1, time(0)).await;
+        seed_quota_waiter(&db, "bafy-cooldown", "cooldown", 1, time(0)).await;
+        db.execute_unprepared(&format!(
+            "UPDATE pin_leases SET state='cancelled' WHERE id='lease-inactive'; \
+             UPDATE pin_lease_targets SET last_touched_at='{}' WHERE id='cooldown'",
+            time(100).to_rfc3339(),
+        ))
+        .await
+        .unwrap();
+        let expected: Vec<_> = (1..=6).map(|index| format!("batch-{index}")).collect();
+        for target_id in expected.iter().rev() {
+            seed_quota_waiter(&db, &format!("bafy-{target_id}"), target_id, 1, time(1)).await;
+        }
+
+        let mut all_woken = Vec::new();
+        for expected_batch in [&expected[..4], &expected[4..]] {
+            let txn = db.begin().await.unwrap();
+            let woken = wake_provider_waiters(&txn, "pinata", &limits["pinata"], time(10))
+                .await
+                .unwrap();
+            assert_eq!(woken, expected_batch);
+            txn.commit().await.unwrap();
+            all_woken.extend(woken);
+            assert_eq!(
+                usage(&db).await,
+                (all_woken.len() as i64, all_woken.len() as i64)
+            );
+            assert_eq!(
+                pin_job::Entity::find()
+                    .filter(pin_job::Column::Operation.eq("submit"))
+                    .count(&db)
+                    .await
+                    .unwrap(),
+                all_woken.len() as u64,
+            );
+            for target_id in &expected {
+                let target = pin_lease_target::Entity::find_by_id(target_id.clone())
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    target.state,
+                    if all_woken.contains(target_id) {
+                        "waiting"
+                    } else {
+                        "quota_waiting"
+                    },
+                );
+            }
+        }
+        assert_eq!(all_woken, expected);
+        let txn = db.begin().await.unwrap();
+        assert!(
+            wake_provider_waiters(&txn, "pinata", &limits["pinata"], time(10))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        txn.commit().await.unwrap();
+        assert_eq!(usage(&db).await, (6, 6));
+        assert_eq!(remote_pin::Entity::find().count(&db).await.unwrap(), 6);
+        for target_id in ["inactive", "cooldown"] {
+            let target = pin_lease_target::Entity::find_by_id(target_id.to_owned())
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(target.state, "quota_waiting");
+        }
+    }
+
+    #[tokio::test]
     async fn eviction_marks_oldest_then_confirmed_release_wakes_and_projects_fifo_waiter() {
         let db = setup().await;
         let limits = limits(100, 2);

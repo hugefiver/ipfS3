@@ -516,6 +516,7 @@ const TARGET_SUBMITTED: &str = "submitted";
 const TARGET_PINNED: &str = "pinned";
 const TARGET_DEGRADED: &str = "degraded";
 const TARGET_QUOTA_WAITING: &str = "quota_waiting";
+const QUOTA_WAKE_BATCH_SIZE: u64 = 4;
 const TARGET_QUOTA_BLOCKED: &str = "quota_blocked";
 const TARGET_EVICTED: &str = "evicted";
 const TARGET_RELEASED: &str = "released";
@@ -1305,7 +1306,7 @@ pub async fn project_target_from_remote_with_limits<C: ConnectionTrait>(
     })
 }
 
-/// Reserves and projects active provider waiters in durable FIFO order.
+/// Reserves and projects at most four eligible provider waiters per call in durable FIFO order.
 ///
 /// The caller must own transaction scope. This function acquires every candidate lease and target
 /// before remote/usage work so multiple grants share the normal lifecycle lock order.
@@ -1320,8 +1321,18 @@ pub(crate) async fn wake_quota_waiting_targets<C: ConnectionTrait>(
         .filter(pin_lease_target::Column::Provider.eq(provider))
         .filter(pin_lease_target::Column::State.eq(TARGET_QUOTA_WAITING))
         .filter(pin_lease_target::Column::LastTouchedAt.lte(now))
+        .filter(
+            pin_lease_target::Column::LeaseId.in_subquery(
+                pin_lease::Entity::find()
+                    .select_only()
+                    .column(pin_lease::Column::Id)
+                    .filter(pin_lease::Column::State.eq(LEASE_ACTIVE))
+                    .into_query(),
+            ),
+        )
         .order_by_asc(pin_lease_target::Column::CreatedAt)
         .order_by_asc(pin_lease_target::Column::Id)
+        .limit(QUOTA_WAKE_BATCH_SIZE)
         .all(db)
         .await?;
     let mut candidates = Vec::with_capacity(waiting.len());
