@@ -3,6 +3,7 @@ pub mod cors_config;
 pub mod database_clock;
 pub mod entities;
 pub mod import;
+pub mod initialization;
 pub mod lifecycle_action;
 pub mod lifecycle_config;
 pub mod lifecycle_scan;
@@ -134,79 +135,14 @@ mod migrator {
                 Box::new(
                     crate::store::migrations::m20261013_000001_zip_root_logical_release::Migration,
                 ),
+                Box::new(crate::store::migrations::m20261017_000001_management_storage::Migration),
             ]
         }
     }
 }
 
-fn postgres_migration_failure(category: &'static str) -> sea_orm::DbErr {
-    tracing::error!(migration_lock = "failure", category);
-    sea_orm::DbErr::Custom(format!("PostgreSQL migration {category} failed"))
-}
-
-async fn run_postgres_migrations(db: &sea_orm::DatabaseConnection) -> Result<(), sea_orm::DbErr> {
-    use sea_orm::{ConnectionTrait, TransactionTrait};
-    use sea_orm_migration::MigratorTrait;
-
-    let txn = db
-        .begin()
-        .await
-        .map_err(|_| postgres_migration_failure("setup"))?;
-    txn.execute_unprepared("SET LOCAL lock_timeout = '60s'")
-        .await
-        .map_err(|_| postgres_migration_failure("setup"))?;
-    tracing::info!(migration_lock = "waiting");
-    txn.execute_unprepared("SELECT pg_advisory_xact_lock(1229997651, 1395879239)")
-        .await
-        .map_err(|_| postgres_migration_failure("timeout"))?;
-    tracing::info!(migration_lock = "acquired");
-    migrator::Migrator::up(&txn, None)
-        .await
-        .map_err(|_| postgres_migration_failure("migration"))?;
-    txn.commit()
-        .await
-        .map_err(|_| postgres_migration_failure("commit"))
-}
-
-async fn run_sqlite_migrations(db: &sea_orm::DatabaseConnection) -> Result<(), sea_orm::DbErr> {
-    use sea_orm::{ConnectionTrait, TransactionTrait};
-    use sea_orm_migration::MigratorTrait;
-
-    // SeaORM's migration-table check and marker insert are otherwise separate across
-    // DatabaseConnections. Claim a fixed SQLite write row before either operation so a second
-    // gateway rechecks the migration table only after the first gateway commits.
-    db.execute_unprepared(
-        "CREATE TABLE IF NOT EXISTS _ipfs_s3_migration_lock (\
-             id INTEGER PRIMARY KEY NOT NULL CHECK (id = 1))",
-    )
-    .await?;
-    db.execute_unprepared("INSERT OR IGNORE INTO _ipfs_s3_migration_lock (id) VALUES (1)")
-        .await?;
-    let txn = db.begin().await?;
-    let result = async {
-        txn.execute_unprepared("UPDATE _ipfs_s3_migration_lock SET id = id WHERE id = 1")
-            .await?;
-        migrator::Migrator::up(&txn, None).await
-    }
-    .await;
-    match result {
-        Ok(()) => txn.commit().await,
-        Err(error) => {
-            let _ = txn.rollback().await;
-            Err(error)
-        }
-    }
-}
-
 pub async fn run_migrations(db: &sea_orm::DatabaseConnection) -> Result<(), sea_orm::DbErr> {
-    use sea_orm::ConnectionTrait;
-    use sea_orm_migration::MigratorTrait;
-
-    match db.get_database_backend() {
-        sea_orm::DatabaseBackend::Postgres => run_postgres_migrations(db).await,
-        sea_orm::DatabaseBackend::Sqlite => run_sqlite_migrations(db).await,
-        sea_orm::DatabaseBackend::MySql => migrator::Migrator::up(db, None).await,
-    }
+    initialization::open(db).await
 }
 
 #[cfg(test)]

@@ -82,6 +82,7 @@ pub(crate) struct Evidence {
     reserved_rows: usize,
     locators: BTreeSet<native::NativeKey>,
     pub(super) work: SharedDecodeBudget,
+    scoped_reads: Vec<native::scope::ScopedRead>,
 }
 /// Raw member data only. Every reuse checks the complete member set and cells.
 pub(super) struct FrozenSourceIndex {
@@ -118,6 +119,7 @@ impl Evidence {
         };
         budget.copy(&(rows.scope(), rows.identity()))?;
         Ok(Some(Self {
+            scoped_reads: Vec::new(),
             scope: rows.scope().into(),
             identity: rows.identity().into(),
             rows: index,
@@ -151,6 +153,7 @@ impl Evidence {
         }
         DecodeWork::shared(&work).copy(&(rows.scope(), rows.identity()))?;
         let mut result = Self {
+            scoped_reads: Vec::new(),
             scope: rows.scope().into(),
             identity: rows.identity().into(),
             rows: Arc::default(),
@@ -229,6 +232,7 @@ impl Evidence {
             .map_err(|_| ManagementError::InvalidEvidence)?
             .copy(&(&frame.database_scope, &frame.database_identity))?;
         let mut result = Self {
+            scoped_reads: Vec::new(),
             scope: frame.database_scope.clone(),
             identity: frame.database_identity.clone(),
             rows: Arc::default(),

@@ -1,4 +1,5 @@
 use super::support;
+use ipfs_s3_gateway::pinning::management::wire::v3::{Event, Frame, Section};
 use ipfs_s3_gateway::{
     pinning::management::*,
     store::{self, entities::pin_job},
@@ -12,7 +13,6 @@ async fn full_document_scope_object_cid_ack_and_provider_field_tampering_never_w
     fixture.prepare().await;
     let original = fixture.file("original-confirmed.json");
     support::report(&fixture.confirm(&original, "300", true).await);
-    let document: Value = serde_json::from_slice(&std::fs::read(&original).unwrap()).unwrap();
     let pointers = [
         ("/request/plan_id", json!("another-plan")),
         (
@@ -31,19 +31,52 @@ async fn full_document_scope_object_cid_ack_and_provider_field_tampering_never_w
             "/request/items/0/subject/object/target/new/original/cleanup",
             json!("managed"),
         ),
-        ("/confirmation", json!([])),
+        ("/confirmation", json!(null)),
         ("/native/database_scope", json!("foreign-scope")),
         ("/native/database_identity", json!("foreign-native-db")),
     ];
     let before = fixture.frame().await;
     let calls = fixture.remote_calls().await;
     for (index, (pointer, replacement)) in pointers.into_iter().enumerate() {
-        let mut forged = document.clone();
-        *forged
-            .pointer_mut(pointer)
-            .expect("fixture wire field must actually exist") = replacement;
         let file = fixture.file(&format!("tampered-{index}.json"));
-        support::write_json(&file, &forged);
+        let mut changed = false;
+        support::rewrite(
+            &original,
+            &file,
+            |event, _| match event {
+                Event::Frame(Frame::Request {
+                    request: Some(request),
+                }) if pointer.starts_with("/request/") => {
+                    let mut value = serde_json::to_value(&*request).unwrap();
+                    *value
+                        .pointer_mut(&pointer[8..])
+                        .expect("actual request field") = replacement.clone();
+                    *request = serde_json::from_value(value).unwrap();
+                    changed = true;
+                }
+                Event::Frame(Frame::Acknowledgements { item_ids })
+                    if pointer == "/confirmation" =>
+                {
+                    *item_ids = None;
+                    changed = true;
+                }
+                Event::Frame(Frame::Header { database_scope, .. })
+                    if pointer == "/native/database_scope" =>
+                {
+                    *database_scope = replacement.as_str().unwrap().into();
+                    changed = true;
+                }
+                Event::Frame(Frame::Header {
+                    database_identity, ..
+                }) if pointer == "/native/database_identity" => {
+                    *database_identity = replacement.as_str().unwrap().into();
+                    changed = true;
+                }
+                _ => {}
+            },
+            |_| {},
+        );
+        assert!(changed);
         for mode in ["--apply", "--status"] {
             let result = fixture.import(mode, &file, false).await;
             assert!(
@@ -73,15 +106,51 @@ async fn untrusted_applied_claims_and_derived_points_do_not_authorize_business_o
     fixture.prepare().await;
     let original = fixture.file("confirmed.json");
     support::report(&fixture.confirm(&original, "300", false).await);
-    let document: Value = serde_json::from_slice(&std::fs::read(&original).unwrap()).unwrap();
-    let mut claims = document.clone();
-    claims["snapshot"]["applied"] = json!([{"binding": document["plan"]["items"][0]}]);
-    let mut points = document.clone();
-    points["migration_points"] = json!([{"plan_id":fixture.request.plan_id,"item_id":"object","job_id":"untrusted-queue-id"}]);
     let before = fixture.frame().await;
-    for (index, document) in [claims, points].into_iter().enumerate() {
+    for index in 0..2 {
         let file = fixture.file(&format!("untrusted-{index}.json"));
-        support::write_json(&file, &document);
+        let claim = json!({"plan_id":fixture.request.plan_id,"item_id":"object","job_id":"untrusted-queue-id"});
+        let mut injected = false;
+        support::rewrite(
+            &original,
+            &file,
+            |event, writer| {
+                if index == 1
+                    && !injected
+                    && matches!(
+                        event,
+                        Event::Frame(Frame::Row {
+                            section: Section::Result,
+                            ..
+                        })
+                    )
+                {
+                    wire::v3::planning::fact(
+                        writer,
+                        Section::Inventory,
+                        "zz_untrusted_point",
+                        0,
+                        &claim,
+                    )
+                    .unwrap();
+                    injected = true;
+                }
+            },
+            |writer| {
+                if index == 0 {
+                    wire::v3::planning::fact(
+                        writer,
+                        Section::AppliedClaim,
+                        "untrusted_applied",
+                        0,
+                        &claim,
+                    )
+                    .unwrap();
+                }
+            },
+        );
+        assert!(index == 0 || injected);
+        support::document(&file);
         assert!(
             !fixture
                 .import("--apply", &file, true)
@@ -106,18 +175,33 @@ async fn a_consistently_reencoded_public_plan_still_cannot_replace_the_trusted_p
     fixture.prepare().await;
     let original = fixture.file("confirmed.json");
     support::report(&fixture.confirm(&original, "300", false).await);
-    let imported = wire::decode_plan(&std::fs::read(&original).unwrap()).unwrap();
-    let mut snapshot = imported.snapshot_without_applied().clone();
-    snapshot.objects[0].logical_bytes += 1;
-    let plan = dry_run(imported.request(), &snapshot).unwrap();
-    let reviewed = plan.confirmation(Vec::new());
-    let bytes = wire::encode_plan(imported.request(), &snapshot, &plan, Some(&reviewed)).unwrap();
-    assert!(
-        wire::decode_plan(&bytes).is_ok(),
-        "attack must pass the unauthenticated wire-consistency boundary"
-    );
     let forged = fixture.file("consistent-but-unauthorized.json");
-    std::fs::write(&forged, bytes).unwrap();
+    let (mut object, mut size) = (false, false);
+    let mut changed = false;
+    support::rewrite(
+        &original,
+        &forged,
+        |event, _| match event {
+            Event::Frame(Frame::Row { section, key, .. }) => {
+                object = *section == Section::Native && key.table == "objects"
+            }
+            Event::Frame(Frame::Cell { column }) => size = object && column == "size",
+            Event::Chunk(bytes) if size => {
+                let original: u64 = std::str::from_utf8(bytes).unwrap().parse().unwrap();
+                *bytes = (original + 1).to_string().into_bytes();
+                changed = true;
+            }
+            Event::Frame(Frame::RowEnd) => {
+                object = false;
+                size = false;
+            }
+            Event::Frame(Frame::Summary { summary }) => summary.logical_intent_bytes += 1,
+            _ => {}
+        },
+        |_| {},
+    );
+    assert!(changed);
+    support::document(&forged);
     let before = fixture.frame().await;
     for mode in ["--apply", "--status"] {
         assert!(!fixture.import(mode, &forged, false).await.status.success());
@@ -189,38 +273,9 @@ async fn local_authorization_failure_and_private_principal_drift_do_not_touch_ex
 }
 
 #[tokio::test]
-async fn replacement_private_native_and_real_multipart_part_drift_refuse_the_entire_apply() {
-    for drift in ["replacement", "metadata", "part"] {
+async fn replacement_and_private_native_drift_refuse_the_entire_apply() {
+    for drift in ["replacement", "metadata"] {
         let fixture = support::Fixture::new(false).await;
-        if drift == "part" {
-            store::multipart::create_upload(
-                &fixture.db,
-                "existing-upload",
-                "pending-object",
-                "bucket",
-                "pending-key",
-                "none",
-                None,
-                None,
-                None,
-                None,
-                &[],
-                None,
-                false,
-            )
-            .await
-            .unwrap();
-            store::multipart::upsert_part(
-                &fixture.db,
-                "existing-upload",
-                1,
-                support::NODE,
-                10,
-                "old-part-etag",
-            )
-            .await
-            .unwrap();
-        }
         fixture.prepare().await;
         let original = fixture.file("confirmed.json");
         support::report(&fixture.confirm(&original, "300", false).await);
@@ -228,18 +283,6 @@ async fn replacement_private_native_and_real_multipart_part_drift_refuse_the_ent
             "replacement" => fixture.replace_object().await,
             "metadata" => {
                 fixture.db.execute_unprepared("UPDATE objects SET metadata='{\"private\":\"changed_after_confirmation\"}'").await.unwrap();
-            }
-            "part" => {
-                store::multipart::upsert_part(
-                    &fixture.db,
-                    "existing-upload",
-                    1,
-                    support::NODE,
-                    11,
-                    "replaced-part-etag",
-                )
-                .await
-                .unwrap();
             }
             _ => unreachable!(),
         }
@@ -265,6 +308,67 @@ async fn replacement_private_native_and_real_multipart_part_drift_refuse_the_ent
         assert_eq!(fixture.remote_calls().await, calls);
         fixture.assert_redacted(&result);
     }
+}
+
+#[tokio::test]
+async fn unrelated_multipart_part_changes_do_not_invalidate_a_local_confirmation() {
+    let fixture = support::Fixture::new(false).await;
+    store::multipart::create_upload(
+        &fixture.db,
+        "existing-upload",
+        "pending-object",
+        "bucket",
+        "pending-key",
+        "none",
+        None,
+        None,
+        None,
+        None,
+        &[],
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+    store::multipart::upsert_part(
+        &fixture.db,
+        "existing-upload",
+        1,
+        support::NODE,
+        10,
+        "old-part-etag",
+    )
+    .await
+    .unwrap();
+    fixture.prepare().await;
+    let original = fixture.file("confirmed.json");
+    support::report(&fixture.confirm(&original, "300", false).await);
+    store::multipart::upsert_part(
+        &fixture.db,
+        "existing-upload",
+        1,
+        support::NODE,
+        11,
+        "replaced-part-etag",
+    )
+    .await
+    .unwrap();
+    let parts = store::multipart::list_parts(&fixture.db, "existing-upload")
+        .await
+        .unwrap();
+    let calls = fixture.remote_calls().await;
+    let applied = support::report(&fixture.import("--apply", &original, false).await);
+    assert_eq!(applied["replayed"], false);
+    let replay = support::report(&fixture.import("--apply", &original, false).await);
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(replay["items"], applied["items"]);
+    assert_eq!(
+        store::multipart::list_parts(&fixture.db, "existing-upload")
+            .await
+            .unwrap(),
+        parts
+    );
+    assert_eq!(fixture.remote_calls().await, calls);
 }
 
 #[tokio::test]

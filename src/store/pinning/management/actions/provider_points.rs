@@ -554,7 +554,7 @@ fn snapshot_points(
                 }
             }
             Some(Capture::Provider(capture)) => {
-                for (index, route) in capture.routes.iter().enumerate() {
+                for (index, route) in capture.mutation_scope.routes.iter().enumerate() {
                     routes.push((format!("provider/{index}"), route));
                 }
             }

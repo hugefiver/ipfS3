@@ -32,10 +32,23 @@ async fn close(fixture: &mut cluster::Fixture, plan: &str) -> ProviderRouteSnaps
     // Exercise the real startup transaction and retired metadata; no fake
     // invocation, replica row, release or ownership fact is inserted.
     fixture
-        .reconfigure(|config| config.pinning_identity.providers[0].retired = true)
+        .reconfigure(|config| {
+            config.pinning_identity.providers[0].retired = true;
+            config.pinning.policies.clear();
+        })
         .await;
     let config = retirement::foundation::management_config(&fixture.config);
-    retirement::retire(fixture.state.store.db(), &fixture.config, &config, plan).await;
+    let (auth, binding, _) =
+        retirement::confirmed_retirement(fixture.state.store.db(), &fixture.config, &config, plan)
+            .await;
+    ipfs_s3_gateway::store::pinning::management::actions::apply(
+        fixture.state.store.db(),
+        &config,
+        &auth,
+        &binding,
+    )
+    .await
+    .unwrap();
     let registered = pin_provider_route::Entity::find()
         .one(fixture.state.store.db())
         .await

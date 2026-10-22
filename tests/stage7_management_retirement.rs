@@ -384,24 +384,26 @@ async fn retirement_private_material_survives_db_roundtrip_but_never_ordinary_wi
             }
         });
     assert_eq!(originals, 2);
-    let current = db_snapshot::collect_with_config(&db, &config, &request)
-        .await
-        .unwrap()
-        .planning_snapshot()
-        .unwrap();
-    let current_plan = dry_run(&request, &current).unwrap();
-    let bytes = wire::encode_plan(
-        &request,
-        &current,
-        &current_plan,
-        Some(&current_plan.confirmation(vec![])),
+    let mut writer = wire::v3::Writer::new(
+        Vec::new(),
+        wire::v3::Projection::Review,
+        wire::v3::files::stream::budget(),
     )
     .unwrap();
+    wire::v3::planning::confirmed(&db, &mut writer, &binding, wire::v3::Projection::Review)
+        .await
+        .unwrap();
+    let bytes = writer.finish().unwrap();
     let text = String::from_utf8_lossy(&bytes);
     assert!(!text.contains("RETIREMENT_METADATA_MARKER"));
     assert!(!text.contains("RETIREMENT_KEYWRAP_MARKER"));
     assert!(!text.contains(&server.uri()));
-    wire::decode_plan(&bytes).unwrap();
+    wire::v3::document::inspect(
+        std::io::Cursor::new(bytes),
+        wire::v3::Projection::Review,
+        wire::v3::files::stream::budget(),
+    )
+    .unwrap();
     db.execute_unprepared("UPDATE pin_management_retirements SET inventory=inventory||' '")
         .await
         .unwrap();

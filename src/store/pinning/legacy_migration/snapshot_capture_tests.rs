@@ -1,4 +1,4 @@
-use super::{migration, native_catalog, store};
+use super::{file_catalog, migration, store};
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 use sea_orm_migration::{MigrationTrait, SchemaManager};
 
@@ -46,7 +46,7 @@ async fn catalog_metadata(db: &DatabaseConnection) -> Vec<(String, String, Optio
 
 #[tokio::test]
 async fn native_historical_captures_are_not_filled_or_rewritten_by_inventory_or_real_upgrade() {
-    let db = native_catalog(migration::SCHEMA).await;
+    let (_directory, db) = file_catalog(migration::SCHEMA).await;
     let mpu_decision = historical_decision("historical-mpu");
     let import_decision = historical_decision("historical-job");
     let root_capture =
@@ -90,7 +90,7 @@ async fn native_historical_captures_are_not_filled_or_rewritten_by_inventory_or_
         );
     }
 
-    store::run_migrations(&db).await.unwrap();
+    super::upgrade(&db).await;
     let upgraded_versions = super::super::schema(&db, true).await.unwrap();
     let upgraded = super::super::read(&db, &upgraded_versions).await.unwrap();
     let mut historical_shape = upgraded.clone();

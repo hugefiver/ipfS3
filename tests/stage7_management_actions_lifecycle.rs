@@ -1,3 +1,5 @@
+#[path = "support/management_wire_v3.rs"]
+mod archive;
 #[path = "support/stage7_management_actions.rs"]
 pub mod support;
 use ipfs_s3_gateway::{
@@ -375,15 +377,8 @@ async fn encrypted_cid_and_attested_ciphertext_bytes_are_not_plaintext_metadata_
     .unwrap();
     let request = fixture.create_request("ciphertext-budget", identity, false);
     let binding = fixture.confirm(&request).await;
-    let snapshot = db_snapshot::collect_with_config(&fixture.db, &fixture.config, &request)
-        .await
-        .unwrap()
-        .planning_snapshot()
-        .unwrap();
-    let plan = dry_run(&request, &snapshot).unwrap();
-    let wire = wire::encode_plan(&request, &snapshot, &plan, None);
-    assert!(wire.is_ok());
-    assert!(!String::from_utf8(wire.unwrap()).unwrap().contains(&wrapped));
+    let document = archive::export(&binding);
+    assert!(!String::from_utf8_lossy(&document).contains(&wrapped));
     let applied = actions::apply(&fixture.db, &fixture.config, &fixture.auth, &binding)
         .await
         .unwrap();
@@ -641,18 +636,18 @@ async fn same_file_restart_lost_response_replays_exact_receipt_without_expanding
             .len(),
         1
     );
-    let review = confirmed.review();
-    let mut bytes = Vec::new();
-    wire::encode_review(
-        &mut records::ReadSession::default(),
-        &review,
-        review.candidate_item_ids(),
-        &mut bytes,
-    )
+    let bytes = archive::export(&confirmed);
+    let forged = archive::rewrite(&bytes, |frame| {
+        if let wire::v3::Frame::Header { principal, .. } = frame {
+            *principal = "forged".into();
+        }
+    })
     .unwrap();
-    let mut forged: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    forged["request"]["items"][0]["item_id"] = serde_json::json!("forged");
-    assert!(wire::decode_plan(&serde_json::to_vec(&forged).unwrap()).is_err());
+    assert!(
+        archive::restore(&fixture.db, &fixture.auth, &confirmed.request, &forged)
+            .await
+            .is_err()
+    );
     let now = store::database_clock::database_now(&fixture.db)
         .await
         .unwrap();

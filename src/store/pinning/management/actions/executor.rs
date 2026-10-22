@@ -71,6 +71,9 @@ pub(super) async fn execute_with_jobs(
         }
         _ => return Err(ManagementError::Confirmation),
     }
+    if matches!(entry.request.action, Action::Reconcile) {
+        result.state = records::ActionState::ReadOnly;
+    }
     let mut models = Vec::new();
     view.with_decode_work(|work| work.nodes(1 + result.targets.len()))?;
     for id in &result.targets {

@@ -44,7 +44,7 @@ impl AppState {
         )?;
 
         let db = crate::store::connect_database(&cfg.storage.database_url).await?;
-        crate::store::run_migrations(&db).await?;
+        crate::store::initialization::open(&db).await?;
         let store = Store::new(db);
         pinning.register_identities(&store).await?;
 

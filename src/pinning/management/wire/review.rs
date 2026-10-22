@@ -100,13 +100,6 @@ impl<'a> NativeProjection<'a> {
             catalog: rows.catalog(),
         }
     }
-    pub(super) fn frame(frame: &'a NativeFrame) -> Self {
-        Self {
-            source: FrozenRows::Frame(frame),
-            versions: &frame.schema_versions,
-            catalog: &frame.tables,
-        }
-    }
 }
 impl Serialize for NativeProjection<'_> {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {

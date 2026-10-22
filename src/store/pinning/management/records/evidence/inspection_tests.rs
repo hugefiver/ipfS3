@@ -84,17 +84,25 @@ async fn typed_retirement_inspection_preserves_all_original_cells_and_rejects_wr
         .unwrap()
         .planning_snapshot()
         .unwrap();
-    let plan = management::dry_run(&request, &snapshot).unwrap();
+    let prepared = management::retirement::PreparedPlanning::collect(
+        &fixture.db,
+        &request,
+        &snapshot,
+        SharedDecodeBudget::default(),
+    )
+    .await
+    .unwrap();
     let binding = super::super::confirm(
         &fixture.db,
         &fixture.config,
         &fixture.auth,
-        (&request, &snapshot, &plan),
+        (&request, &snapshot, &prepared.plan),
         vec![],
         chrono::Duration::minutes(5),
     )
     .await
     .unwrap();
+    prepared.close().await.unwrap();
     actions::apply(&fixture.db, &fixture.config, &fixture.auth, &binding)
         .await
         .unwrap();
@@ -111,19 +119,16 @@ async fn typed_retirement_inspection_preserves_all_original_cells_and_rejects_wr
     .await
     .unwrap();
     let expected = binding.review();
-    for (table, original) in inspected.rows().all_rows() {
-        let keys = table
-            .primary_key
-            .iter()
-            .map(|column| original.cell(column).unwrap())
-            .collect::<Vec<_>>();
-        for (column, value) in original.iter() {
-            assert_eq!(
-                value.as_deref(),
-                expected.original_value(&table.table, &keys, column)
-            );
-        }
-    }
+    assert!(
+        inspected
+            .rows()
+            .all_rows()
+            .map(|(table, row)| (&table.table, row))
+            .eq(expected
+                .rows()
+                .all_rows()
+                .map(|(table, row)| (&table.table, row)))
+    );
     let mut changed = row;
     changed.insert("disposition".into(), Some("migrate".into()));
     assert!(matches!(

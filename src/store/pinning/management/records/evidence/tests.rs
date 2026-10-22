@@ -161,16 +161,12 @@ async fn multiple_items_share_one_immutable_proposal_and_frozen_history_retains_
         .planning_snapshot()
         .unwrap();
     let plan = management::dry_run(&request, &snapshot).unwrap();
-    let ack = plan
+    let ack: Vec<_> = plan
         .items()
         .iter()
         .filter(|entry| entry.status == management::PlanStatus::Candidate)
         .map(|entry| entry.request.item_id.clone())
         .collect();
-    let imported = wire::decode_plan(
-        &wire::encode_plan(&request, &snapshot, &plan, Some(&plan.confirmation(ack))).unwrap(),
-    )
-    .unwrap();
     let before_stage = native::capture(&fixture.db).await.unwrap();
     for body in [
         "SELECT RAISE(ABORT,'last item fault');",
@@ -209,16 +205,24 @@ async fn multiple_items_share_one_immutable_proposal_and_frozen_history_retains_
     .await
     .unwrap();
     assert!(
-        load_confirmed_from_imported(&fixture.db, &fixture.auth, &imported)
+        load_confirmed_authority(&fixture.db, &fixture.auth, &request, Default::default())
             .await
             .is_err()
     );
     let staged = native::capture(&fixture.db).await.unwrap();
     fixture.db.execute_unprepared("CREATE TRIGGER private_confirmation_failure BEFORE UPDATE OF binding ON pin_management_records WHEN NEW.plan_id='private-multi' AND NEW.item_id='z' BEGIN SELECT RAISE(ABORT,'confirmation fault'); END").await.unwrap();
     assert!(
-        confirm_imported(&fixture.db, &fixture.config, &fixture.auth, &imported)
-            .await
-            .is_err()
+        confirmation::confirm_staged(
+            &fixture.db,
+            &fixture.config,
+            &fixture.auth,
+            &request,
+            &ack,
+            None,
+            Default::default(),
+        )
+        .await
+        .is_err()
     );
     fixture
         .db
@@ -226,9 +230,17 @@ async fn multiple_items_share_one_immutable_proposal_and_frozen_history_retains_
         .await
         .unwrap();
     assert!(native::capture(&fixture.db).await.unwrap() == staged);
-    let binding = confirm_imported(&fixture.db, &fixture.config, &fixture.auth, &imported)
-        .await
-        .unwrap();
+    let binding = confirmation::confirm_staged(
+        &fixture.db,
+        &fixture.config,
+        &fixture.auth,
+        &request,
+        &ack,
+        None,
+        Default::default(),
+    )
+    .await
+    .unwrap();
     let confirmed = native::capture(&fixture.db).await.unwrap();
     for item in ["a", "z"] {
         let key = [
@@ -243,9 +255,17 @@ async fn multiple_items_share_one_immutable_proposal_and_frozen_history_retains_
         );
     }
     assert!(
-        confirm_imported(&fixture.db, &fixture.config, &fixture.auth, &imported)
-            .await
-            .unwrap()
+        confirmation::confirm_staged(
+            &fixture.db,
+            &fixture.config,
+            &fixture.auth,
+            &request,
+            &ack,
+            None,
+            Default::default(),
+        )
+        .await
+        .unwrap()
             == binding
     );
     let source = Evidence::from_frame(&confirmed).unwrap();
@@ -349,6 +369,7 @@ async fn multiple_items_share_one_immutable_proposal_and_frozen_history_retains_
 #[tokio::test]
 async fn retirement_roots_classify_before_authority_and_fail_closed() {
     use crate::store::pinning::management::admission;
+    use sea_orm::{DbErr, RuntimeErr, TransactionTrait};
     let fixture = actions::tests::fixture("retirement-shared-history").await;
     let route = fixture.config.pinning.providers[0].route_snapshot();
     let request = management::PlanRequest {
@@ -366,17 +387,25 @@ async fn retirement_roots_classify_before_authority_and_fail_closed() {
         .unwrap()
         .planning_snapshot()
         .unwrap();
-    let plan = management::dry_run(&request, &snapshot).unwrap();
+    let prepared = management::retirement::PreparedPlanning::collect(
+        &fixture.db,
+        &request,
+        &snapshot,
+        SharedDecodeBudget::default(),
+    )
+    .await
+    .unwrap();
     let binding = super::super::confirm(
         &fixture.db,
         &fixture.config,
         &fixture.auth,
-        (&request, &snapshot, &plan),
+        (&request, &snapshot, &prepared.plan),
         vec![],
         chrono::Duration::minutes(5),
     )
     .await
     .unwrap();
+    prepared.close().await.unwrap();
     actions::apply(&fixture.db, &fixture.config, &fixture.auth, &binding)
         .await
         .unwrap();
@@ -395,7 +424,7 @@ async fn retirement_roots_classify_before_authority_and_fail_closed() {
     let frame = native::capture(&fixture.db).await.unwrap();
     let source = Evidence::from_frame(&frame).unwrap();
     let key = anchor_key(&binding).unwrap();
-    let action = source.row(&key).unwrap();
+    let action = source.row(&key).unwrap().clone();
     let retirement = frame
         .table("pin_management_retirements")
         .unwrap()
@@ -406,112 +435,121 @@ async fn retirement_roots_classify_before_authority_and_fail_closed() {
     let retirement = frame
         .original_row("pin_management_retirements", &[domain])
         .unwrap();
-    // A different domain may skip private authority only after root integrity.
-    for defect in 0..6 {
-        use sea_orm::TransactionTrait;
+    let selectors = [
+        locator::AuthoritySelector::RecordMembers(
+            binding.database_scope.clone(),
+            request.plan_id.clone(),
+        ),
+        locator::AuthoritySelector::RetirementDomain(domain.into()),
+    ];
+    let authority = locator::load_authority(
+        &fixture.db,
+        &selectors,
+        &mut native::meter::Budget::default(),
+    )
+    .await
+    .unwrap();
+    for column in [Some("native_before"), Some("binding"), Some("result"), None] {
         let tx = fixture.db.begin().await.unwrap();
-        if defect == 0 {
-            tx.execute(Statement::from_sql_and_values(tx.get_database_backend(),"UPDATE pin_management_records SET native_before=$1 WHERE plan_id=$2 AND kind='action'",["{malformed".into(),request.plan_id.clone().into()])).await.unwrap();
-        } else if defect == 1 {
-            tx.execute_unprepared("PRAGMA defer_foreign_keys=ON")
-                .await
-                .unwrap();
-            tx.execute(Statement::from_sql_and_values(
+        let statement = if let Some(column) = column {
+            Statement::from_sql_and_values(
+                tx.get_database_backend(),
+                format!(
+                    "UPDATE pin_management_records SET {column}=$1 WHERE plan_id=$2 AND kind='action'"
+                ),
+                ["{malformed".into(), request.plan_id.clone().into()],
+            )
+        } else {
+            Statement::from_sql_and_values(
                 tx.get_database_backend(),
                 "DELETE FROM pin_management_records WHERE plan_id=$1 AND kind='action'",
                 [request.plan_id.clone().into()],
-            ))
-            .await
-            .unwrap();
-        } else if defect < 4 {
-            let mut changed: serde_json::Value = serde_json::from_str(
-                native::value(action, "binding")
-                    .unwrap()
-                    .strip_prefix("S7B1\n")
-                    .unwrap(),
             )
-            .unwrap();
-            if defect == 2 {
-                changed[1][1][2] = serde_json::json!("wrong-owner");
-            } else {
-                changed[2] = serde_json::json!("0".repeat(64));
-            }
-            let changed = format!("S7B1\n{changed}");
-            tx.execute(Statement::from_sql_and_values(
-                tx.get_database_backend(),
-                "UPDATE pin_management_records SET binding=$1 WHERE plan_id=$2 AND kind='action'",
-                [changed.clone().into(), request.plan_id.clone().into()],
-            ))
-            .await
-            .unwrap();
-            tx.execute(Statement::from_sql_and_values(
-                tx.get_database_backend(),
-                "UPDATE pin_management_retirements SET binding=$1 WHERE plan_id=$2",
-                [changed.into(), request.plan_id.clone().into()],
-            ))
-            .await
-            .unwrap();
-        } else {
-            let mut changed: serde_json::Value = serde_json::from_str(
-                native::value(&retirement, "inventory")
-                    .unwrap()
-                    .strip_prefix("S7I1\n")
-                    .unwrap(),
-            )
-            .unwrap();
-            if defect == 4 {
-                changed[1] = serde_json::json!("0".repeat(64));
-            } else {
-                changed[0][1][2] = serde_json::json!("wrong-owner");
-            }
-            tx.execute(Statement::from_sql_and_values(
-                tx.get_database_backend(),
-                "UPDATE pin_management_retirements SET inventory=$1 WHERE plan_id=$2",
-                [
-                    format!("S7I1\n{changed}").into(),
-                    request.plan_id.clone().into(),
-                ],
-            ))
-            .await
-            .unwrap();
-        }
-        assert!(
-            admission::registration_closed(&tx, &other).await.is_err(),
-            "root defect {defect}"
+        };
+        let error = tx.execute(statement).await.unwrap_err();
+        let DbErr::Exec(RuntimeErr::SqlxError(error)) = error else {
+            panic!("expected SQLite immutable rejection: {error:?}");
+        };
+        assert_eq!(
+            error.as_database_error().unwrap().code().unwrap().as_ref(),
+            "1811"
         );
-        assert!(
-            admission::lock_open_in_transaction(&tx, &[other.clone()])
+        let unchanged =
+            locator::load_authority(&tx, &selectors, &mut native::meter::Budget::default())
                 .await
-                .is_err(),
-            "root defect {defect} must block an open birth"
+                .unwrap();
+        assert_eq!(unchanged.originals, authority.originals);
+        assert_eq!(unchanged.proof, authority.proof);
+        assert!(admission::registration_closed(&tx, &route).await.unwrap());
+        assert!(!admission::registration_closed(&tx, &other).await.unwrap());
+        admission::lock_open_in_transaction(&tx, std::slice::from_ref(&other))
+            .await
+            .unwrap();
+        tx.rollback().await.unwrap();
+    }
+    for (column, value) in [
+        (
+            "binding",
+            native::value(&action, "binding")
+                .unwrap()
+                .replace(&request.plan_id, "wrong-owner"),
+        ),
+        (
+            "inventory",
+            native::value(&retirement, "inventory")
+                .unwrap()
+                .replace(&request.plan_id, "wrong-owner"),
+        ),
+        ("disposition", "migrate".into()),
+    ] {
+        assert_ne!(native::value(&retirement, column), Some(value.as_str()));
+        let mut changed = retirement.clone();
+        changed.insert(column.into(), Some(value));
+        assert!(matches!(
+            super::super::inspection::inspect_retirement_review_with_work(
+                &fixture.db,
+                &changed,
+                SharedDecodeBudget::default(),
+            )
+            .await,
+            Err(ManagementError::Confirmation)
+        ));
+    }
+    for column in ["binding", "inventory", "principal", "unresolved"] {
+        let mut changed = retirement.clone();
+        changed.insert(column.into(), None);
+        assert!(matches!(
+            super::super::inspection::inspect_retirement_review_with_work(
+                &fixture.db,
+                &changed,
+                SharedDecodeBudget::default(),
+            )
+            .await,
+            Err(ManagementError::InvalidEvidence | ManagementError::Confirmation)
+        ));
+    }
+    for (column, expected) in [
+        ("native_before", ManagementError::InvalidEvidence),
+        ("binding", ManagementError::Confirmation),
+        ("result", ManagementError::InvalidEvidence),
+    ] {
+        let mut source = Evidence::from_frame(&frame).unwrap();
+        let mut changed = action.clone();
+        changed.insert(column.into(), Some("{malformed".into()));
+        Arc::make_mut(&mut source.rows).insert(key.clone(), Arc::new(changed.clone()));
+        assert_eq!(
+            super::super::retirement::retirement_review_from_source(&source, &retirement, &changed)
+                .err(),
+            Some(expected),
+            "malformed action {column}"
         );
-        assert!(admission::registration_closed(&tx, &route).await.is_err());
-        tx.rollback().await.unwrap();
     }
-    assert!(
-        admission::registration_closed(&fixture.db, &route)
-            .await
-            .unwrap()
-    );
-    assert!(
-        !admission::registration_closed(&fixture.db, &other)
-            .await
-            .unwrap()
-    );
-    for corrupt in ["stage7/lz1:8:AQAAAQA=", "{malformed"] {
-        use sea_orm::TransactionTrait;
-        let tx = fixture.db.begin().await.unwrap();
-        tx.execute(Statement::from_sql_and_values(
-            tx.get_database_backend(),
-            "UPDATE pin_management_records SET result=$1 WHERE plan_id=$2 AND kind='action'",
-            [corrupt.into(), request.plan_id.clone().into()],
-        ))
-        .await
-        .unwrap();
-        assert!(admission::registration_closed(&tx, &route).await.is_err());
-        assert!(admission::registration_closed(&tx, &other).await.is_err());
-        tx.rollback().await.unwrap();
-    }
+    let mut source = Evidence::from_frame(&frame).unwrap();
+    Arc::make_mut(&mut source.rows).remove(&key);
+    assert!(matches!(
+        source.retirement_action(&retirement),
+        Err(ManagementError::InvalidEvidence)
+    ));
 }
 
 #[test]

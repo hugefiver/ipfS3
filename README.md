@@ -916,7 +916,7 @@ unfinished jobs are made unclaimable (`running`, NULL lock). Existing Stage 1
 protocol history is preserved, but is not sufficient proof of an account scope.
 Do not fill missing history from the current TOML or clear these locks manually.
 Historical reapply/retirement management uses the separate registered
-[Stage 7 CLI](#local-pinning-management-cli-stage-7), not the R26 legacy namespace
+[management CLI](#local-pinning-management-cli-stage-75), not the R26 legacy namespace
 migration CLI. Local validation and external-operation limits are documented below.
 This migration deliberately refuses downgrade: stop allocation/workers and
 preserve the ledger rather than dropping it to run old binaries.
@@ -1186,12 +1186,12 @@ results aren't provider CAR acceptance. Anonymous test-node auth
 headers do not prove account authentication, and Filebase/Pinata account writes
 remain **NOT RUN**. Two same-host peers are not multi-host high availability.
 
-### Local pinning management CLI (Stage 7)
+### Local pinning management CLI (Stage 7.5)
 
-**Local runtime validation passed.** The management workflow, receipt-scoped
-runtime, retirement barriers and isolated PostgreSQL checks have been exercised.
-This does not authorize production migrations or prove external account capabilities. See
-[Stage 7 checks](docs/testing.md#stage-7-local-management-checks).
+**Stage 7.5 acceptance is not complete.** Earlier Stage 7 results don't establish
+large-registry usability, complete history conversion or the current v3 workflow.
+See [Stage 7.5 acceptance](docs/testing.md#stage-75-management-scale-acceptance).
+These interfaces don't authorize production upgrades or prove external account capabilities.
 
 `--pinning-manage REQUEST.json` defaults to a bounded, read-only plan against an
 existing SQLite or PostgreSQL database with the formal management schema. It
@@ -1199,6 +1199,19 @@ doesn't create a database, initialize AppState, migrate, register identities,
 start workers, or perform source/provider IO. `--output` exports an unconfirmed
 proposal. `--source-node` asserts the expected local peer; it isn't a probe or
 proof that content is readable. There is no management HTTP endpoint.
+
+Local actions read the complete dependency closure for their exact selectors,
+including shared resources, historical epochs, source evidence and empty membership
+sets. Scoped budgets apply to that related work, not to every unrelated row in the
+database. The old all-registry 4096-row/4 MiB gate isn't a database capacity limit.
+Relevant fan-out can still exceed a scoped budget and must fail, not truncate.
+Retirement uses a bounded, keyset-paged domain inventory with revision checks and
+a final seal, followed by a short atomic publication transaction. A changed scan
+isn't a complete inventory. Continuous writes can require a new scan and review.
+`retire_with` migration must cover all active targets; controlled cleanup must
+cover all eligible current resources. An actual mutation set above the request
+budget is rejected, never split into successful prefixes. There are at most 128
+explicit items per request; this isn't an inventory or database row limit.
 
 The input is `PlanRequest` (`plan_id`, `items`) from
 [`model.rs`](src/pinning/management/model.rs). Each item selects an action and
@@ -1223,7 +1236,7 @@ The nine action families are:
 | `reconcile` | Schedule observation of the captured current/historical resource, not replacement Submit or Unpin authority. |
 | `retire` | Stop new allocations in the canonical allocation domain and retain its responsibilities. |
 
-`--confirm OUTPUT.json` explicitly stages and confirms the reviewed plan in the
+`--confirm OUTPUT.v3` explicitly stages and confirms the reviewed plan in the
 DB. Every candidate requires its own `--ack-item ID`; acknowledgement doesn't
 turn inferred history into ownership proof. Confirmation TTL defaults to 300
 seconds, with `--ttl-seconds` accepting 1 to 900. Requests, plan/item IDs, UUIDs,
@@ -1231,6 +1244,9 @@ exported files and imported applied claims aren't authorization. The local
 configuration principal (`local_configuration`), DB scope and native physical
 database identity must match the stored complete original bindings and evidence.
 Protect local configuration, database access and artifact directories accordingly.
+Read-only authority never becomes Submit, upload or cleanup permission through
+confirmation, import, retry or worker execution. Same-plan successors must follow
+the original reviewed order and exact predecessor bindings.
 
 Exports use exclusive `create_new`, never overwrite and don't create parent
 directories. Confirmation reserves the file before DB staging. A failed confirm
@@ -1253,13 +1269,19 @@ billing. A file-only upload route can't authorize a directory. Evidence retains
 exact object/version tuples, node/read configuration, proof and original expiry;
 old size-less directory evidence doesn't become a byte proof on replay.
 
-`--apply CONFIRMED.json` uses the original exported confirmation and local DB
+`--apply CONFIRMED.v3` uses the original exported confirmation and local DB
 records. New business needs fresh native fences and unexpired original authority;
 actions and receipts commit together, not as a successful prefix. Exact committed
 receipt replay doesn't create or charge again, even after confirmation expiry or
-a later legitimate state change. It doesn't renew confirmation. `--status` reads
-stored action evidence without source/provider IO or a fresh TTL grant; it isn't
-a live availability check. Optional `--run` makes one due-job pass scoped to
+a later legitimate state change or configuration drift. Replay is checked before
+new-business TTL/configuration checks and doesn't renew confirmation. `--status`
+validates the committed action and computes current lease/job, expiry, observation
+freshness and unresolved responsibility from the DB clock and current facts. It
+doesn't rewrite the frozen receipt, perform source/provider IO or grant a fresh
+TTL. An incomplete, changed or over-budget current scan isn't historical success.
+This also applies to explicitly converted committed history: status reads current
+responsibility, while review and committed replay preserve the original result.
+Optional `--run` makes one due-job pass scoped to
 verified receipts, never a global queue drain or background worker. Due times and
 claim caps still apply. A failed/interrupted run doesn't undo a committed apply
 or prove that no remote effect occurred; inspect status before further action.
@@ -1288,8 +1310,120 @@ atomic action/receipt publication; UUIDs and imported claims aren't authorizatio
 logically released. The original retained/adopted state, verification, manifest,
 root history and legacy ZIP/MPU responses remain intact, as do other shared-CID
 references. Default retire/retain never releases roots. Release doesn't promise
-unpin, GC or physical reclamation. Local tests cover formal apply, root CAS,
-receipt rollback and historical receipt recovery within the verification boundary above.
+unpin, GC or physical reclamation.
+
+#### Management wire v3 and private history
+
+Request and preparation inputs remain JSON. Plan/confirmation artifacts are
+sequential management wire v3 files, not JSON documents: a versioned header,
+length-bounded frames, segmented cells and a verified terminal trailer. Frames
+are bounded to 1 MiB and cell slices to 64 KiB. Unknown/duplicate fields, invalid
+structure and incomplete files are rejected. File claims, including applied
+results, remain untrusted until matched to locally authorized originals.
+
+`--review`, `--export` and `--import` work on frozen v3 files without loading
+configuration or opening the business DB. Import validates and freezes data; it
+doesn't restore a confirmation, receipt or write permission. Default output is a
+redacted review. `--private-input` explicitly accepts a private artifact but still
+exports a redacted review. `--private-recovery` explicitly accepts and preserves
+private originals in a new protected file. It can't recover secrets missing from
+a redacted source. Private recovery is archive-only, not a restore into current
+business tables or a transfer of physical database identity.
+
+The history contract preserves complete original reviews and dependencies,
+foreign/private cells, SQL NULL distinct from empty text, original UTF-8 text,
+TTL/created_at and BirthContract, plus committed idempotency bindings/results.
+It doesn't rebuild an old review from today's object or reset its deadline.
+Normal file input rejects v2. The separate file-only conversion command accepts
+supported Stage 7 v2 JSON and preserves the original document in an archive-only
+v3 file:
+
+```powershell
+ipfs-s3-gateway --pinning-manage --convert-v2 INPUT.json --output NEW.v3 --private-recovery
+```
+
+Conversion doesn't load gateway configuration, open the business DB or perform
+RPC. The output has no execution request, ACK or confirmation deadline; preserved
+applied claims remain untrusted. It is not a confirmation that can be applied.
+The explicit database upgrade is the conversion path for supported stored history; old unexecuted
+prepared/confirmed records don't become new write authority and need a new plan
+ID, review and confirmation. Converted committed records retain original replay
+identity and results without execution or charging again.
+
+The file commands don't directly export the DB's full private history. The
+public `pinning::management::wire::v3::history` API provides bounded DB history
+export through `Export::start`, `advance`, `suspend`/`resume` and `write_private`.
+It includes management records, retirement originals and archive segments,
+including unreferenced segments. Source changes invalidate an unfinished scan;
+sealed exports remain frozen. Resume retains cumulative work and the original
+deadline rather than starting a new allowance. `restore_private` returns a
+read-only recovery archive with cell, original-review and archive-part readers;
+it never writes recovered rows, receipts or identity into a target database.
+
+Streaming CLI file work has limits of 4 GiB input work, 10 million rows, 32 MiB
+accounted resident memory and 30 seconds per operation, not the old whole-file
+16 MiB v2 ceiling. DB-backed management work has a 30-second work window followed
+by cancellation and at most 5 seconds of owned-work drain. These limits aren't
+proof of acceptance-scale capacity. The current CLI exposes no budget override
+for cumulative task work; don't treat partial files or scan pages as success.
+
+Provider-wide dry-run and confirmation support an explicit protected checkpoint
+directory. `--checkpoint` creates a new directory; `--resume` reopens that same
+directory with the original request, principal, configuration and database binding.
+The options are mutually exclusive. `--scan-pages 1..512` limits this invocation
+only (default 64), not the task's cumulative allowance:
+
+```powershell
+ipfs-s3-gateway --pinning-manage REQUEST.json --source-node PEER --checkpoint NEW_CHECKPOINT --scan-pages 1 --output NEW_REVIEW.v3
+# Only when the result is incomplete, continue the retained checkpoint:
+ipfs-s3-gateway --pinning-manage REQUEST.json --source-node PEER --resume NEW_CHECKPOINT --scan-pages 64 --output NEW_REVIEW.v3
+```
+
+An incomplete result is not a plan or confirmation and does not reserve the output
+file. Dry-run writes only its protected local workspace, never the target database.
+Explicit confirmation may commit non-executable archive pages while verifying live
+originals and canonical results. Its report includes the current phase and actual
+database effects, including committed staging pages; staging is not authority or
+an applied business prefix. Complete confirmation still requires
+`--confirm NEW_CONFIRMED.v3`, the original item ACKs and the normal TTL checks.
+The confirmation TTL starts only at the first atomic publication, not at planning.
+Source drift rejects the old pass and requires a fresh scan; it never mixes pages
+or renews an existing grant. A failed output or confirmation retains the checkpoint;
+retry with a new exclusive-create output, not by appending to or overwriting a
+partial file. If confirmation committed before output failed, recovery exports that
+exact original confirmation without publishing it again or changing its ACKs or
+deadline, and retains the checkpoint. Normal successful completion removes only
+its owned checkpoint workspace.
+
+Management wire v3 is unrelated to ZIP v2. Pixivbot's signed ZIP v1 direct PUT
+keeps `decompress-zip=<prefix>/`; MPU captures that query at Create and continues
+with the original UploadPart/Complete protocol. Its tag remains
+`ipfs-s3%3Apin=true&ipfs-s3%3Aduration=1d&ipfs-s3%3Acontent=decompressed`.
+No ZIP v2 or expected-sha256-specific header is required by management.
+
+#### Explicit existing-database upgrade
+
+Ordinary startup classifies an existing schema read-only before migrations,
+identity registration or workers. Unsupported, partial, backfill or non-ready
+schemas are refused with upgrade-required, without automatic migration or resume.
+Only a genuinely empty application schema may initialize the current schema;
+missing migration metadata alone doesn't establish emptiness. A ready current
+schema is validated before normal startup proceeds.
+
+The separate `--pinning-manage-upgrade` command requires the exact existing DB
+URL, native physical identity, database scope, source version and target version.
+It doesn't load gateway config, construct AppState, register identities, start
+workers or perform source/provider RPC. The supported source is
+`m20261013_000001_zip_root_logical_release`; the target is
+`m20261017_000001_management_storage`. Obtain the actual identity/scope from
+authorized database records, not a guessed UUID or a file claim. No identity
+discovery CLI is provided here.
+
+An upgrade requires separate authorization for that database, stopped/drained old
+writers and workers, and a verified recoverable backup. Don't mix binary versions.
+Failure keeps the database unavailable until an explicitly identity-bound upgrade
+can complete. There is no automatic down migration: once new-format business or
+confirmation records exist, don't drop them or resume traffic on an old backup.
 
 These PowerShell examples assume `ipfs-s3-gateway` is available on PATH, an explicitly selected
 existing database/configuration, reviewed request files and a protected existing
@@ -1300,12 +1434,37 @@ and confirmation. Commands are examples, not acceptance results.
 ```powershell
 $env:IPFS_S3_CONFIG = "gateway.toml"
 ipfs-s3-gateway --pinning-manage --prepare ./prepare.json
-ipfs-s3-gateway --pinning-manage ./request.json --output ./private/plan.json
-ipfs-s3-gateway --pinning-manage ./request.json --confirm ./private/confirmed.json --ack-item candidate-item-id --ttl-seconds 300
-ipfs-s3-gateway --pinning-manage --apply ./private/confirmed.json
-ipfs-s3-gateway --pinning-manage --status ./private/confirmed.json
+ipfs-s3-gateway --pinning-manage ./request.json --output ./private/plan.v3
+ipfs-s3-gateway --pinning-manage --review ./private/plan.v3
+ipfs-s3-gateway --pinning-manage ./request.json --confirm ./private/confirmed.v3 --ack-item candidate-item-id --ttl-seconds 300
+ipfs-s3-gateway --pinning-manage --apply ./private/confirmed.v3
+ipfs-s3-gateway --pinning-manage --status ./private/confirmed.v3
 # Explicit opt-in to one receipt-scoped pass, also valid on exact apply replay:
-ipfs-s3-gateway --pinning-manage --apply ./private/confirmed.json --run
+ipfs-s3-gateway --pinning-manage --apply ./private/confirmed.v3 --run
+ipfs-s3-gateway --pinning-manage --export ./private/confirmed.v3 --output ./private/review-copy.v3
+ipfs-s3-gateway --pinning-manage --import ./private/review-copy.v3 --output ./private/validated-copy.v3
+```
+
+For an already available complete private v3 artifact, explicit private handling
+uses these file-only commands. Each output name must be new:
+
+```powershell
+ipfs-s3-gateway --pinning-manage --review ./private/history.v3 --private-input
+ipfs-s3-gateway --pinning-manage --export ./private/history.v3 --output ./private/history-redacted.v3 --private-input
+ipfs-s3-gateway --pinning-manage --export ./private/history.v3 --output ./private/history-recovery.v3 --private-recovery
+```
+
+Only after separately authorizing maintenance of the exact target, the upgrade
+command shape is as follows. Set these variables to verified local values first;
+the example isn't permission to run an upgrade:
+
+```powershell
+ipfs-s3-gateway --pinning-manage-upgrade `
+  --database-url $upgradeDatabaseUrl `
+  --native-identity $upgradeNativeIdentity `
+  --database-scope $upgradeDatabaseScope `
+  --source-version m20261013_000001_zip_root_logical_release `
+  --target-version m20261017_000001_management_storage
 ```
 
 ### Policies and coordination

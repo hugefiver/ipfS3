@@ -6,6 +6,7 @@ pub mod catalog;
 pub mod native;
 pub mod records;
 pub mod schema;
+pub mod transaction;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ManagementError {
@@ -28,3 +29,24 @@ pub enum ManagementError {
 }
 
 pub type Result<T> = std::result::Result<T, ManagementError>;
+
+/// A PostgreSQL NOWAIT refusal invalidates this attempt's fence, not the
+/// connection. Other SQL and transport failures keep their database category.
+pub(crate) fn nowait_error(error: sea_orm::DbErr) -> ManagementError {
+    use sea_orm::{DbErr, RuntimeErr};
+    if let DbErr::Exec(RuntimeErr::SqlxError(error)) | DbErr::Query(RuntimeErr::SqlxError(error)) =
+        &error
+        && error
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref()
+            == Some("55P03")
+    {
+        ManagementError::Changed
+    } else {
+        ManagementError::Database
+    }
+}
+
+#[cfg(test)]
+mod nowait_tests;

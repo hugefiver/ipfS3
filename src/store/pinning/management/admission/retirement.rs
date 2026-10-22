@@ -7,7 +7,7 @@ use crate::{
 use sea_orm::ConnectionTrait;
 use std::collections::BTreeSet;
 
-mod index;
+mod candidates;
 
 #[cfg(test)]
 #[path = "../../../../../tests/support/stage7_retirement_barrier_schema.rs"]
@@ -37,6 +37,36 @@ pub(super) async fn closed_in_schema<C: ConnectionTrait>(
     registration: bool,
     context: super::DecodeWork<'_>,
 ) -> AppResult<bool> {
+    closed_with_role(db, routes, schema, registration, None, context).await
+}
+
+pub(super) async fn closed_r26<C: ConnectionTrait>(
+    db: &C,
+    admission: &crate::store::pinning::legacy_migration::R26Admission<'_>,
+    context: super::DecodeWork<'_>,
+) -> AppResult<bool> {
+    let schema = super::locks::AdmissionSchema::read(db).await?;
+    let closed = closed_with_role(
+        db,
+        admission.routes(),
+        &schema,
+        false,
+        Some(admission),
+        context,
+    )
+    .await?;
+    schema.revalidate(db).await?;
+    Ok(closed)
+}
+
+async fn closed_with_role<C: ConnectionTrait>(
+    db: &C,
+    routes: &[ProviderRouteSnapshot],
+    schema: &super::locks::AdmissionSchema,
+    registration: bool,
+    preservation: Option<&crate::store::pinning::legacy_migration::R26Admission<'_>>,
+    context: super::DecodeWork<'_>,
+) -> AppResult<bool> {
     context
         .with(|work| work.nodes(2 + routes.len()))
         .map_err(super::work_error)?;
@@ -46,18 +76,43 @@ pub(super) async fn closed_in_schema<C: ConnectionTrait>(
         .collect::<AppResult<BTreeSet<_>>>()?;
     let mut closed = false;
     let mut historical_domains = BTreeSet::new();
-    // Registry snapshots, never current config, resolve an old alias. Compare
-    // the complete resource family, not owns_allocation_domain's backend/scope.
-    let registered = super::super::records::current_models::<pin_provider_route::Entity, _>(
-        db,
-        "FROM pin_provider_routes WHERE TRUE",
-        "provider",
-        vec![],
-        native::MAX_ROWS,
-        context,
-    )
-    .await
-    .map_err(super::work_error)?;
+    if !schema.management_present() {
+        return Err(super::needs_attention());
+    }
+    use super::super::records::locator::AuthoritySelector;
+    let mut selectors = requested
+        .iter()
+        .cloned()
+        .flat_map(|domain| {
+            [
+                AuthoritySelector::RegisteredDomain(domain.clone()),
+                AuthoritySelector::RetirementDomain(domain),
+            ]
+        })
+        .collect::<BTreeSet<_>>();
+    if let Some(admission) = preservation {
+        for source in admission.sources() {
+            context.copy(source).map_err(super::work_error)?;
+            selectors.insert(AuthoritySelector::RegisteredRoute(source.into()));
+            selectors.insert(AuthoritySelector::RetirementDomain(source.into()));
+        }
+    }
+    for route in routes {
+        for name in [
+            route.provider_id.clone(),
+            super::domains::registration_key_with_work(route, context)?,
+        ] {
+            selectors.insert(AuthoritySelector::RegisteredRoute(name.clone()));
+            selectors.insert(AuthoritySelector::RetirementDomain(name));
+        }
+        if let Some(alias) = route.provider_id.strip_prefix("legacy:") {
+            selectors.insert(AuthoritySelector::RetirementDomain(alias.into()));
+        }
+    }
+    let selected = super::authority::load(db, &selectors.into_iter().collect::<Vec<_>>(), context)
+        .await
+        .map_err(super::work_error)?;
+    let registered = candidates::routes(&selected, context).map_err(super::work_error)?;
     context
         .with(|work| work.nodes(1 + registered.len()))
         .map_err(super::work_error)?;
@@ -70,28 +125,17 @@ pub(super) async fn closed_in_schema<C: ConnectionTrait>(
         if row.provider.starts_with("domain:") && row.provider != domain {
             return Err(super::needs_attention());
         }
-        if row.retired && requested.contains(&domain) {
+        if row.retired
+            && (requested.contains(&domain)
+                || preservation.is_some_and(|admission| admission.references(&row.provider)))
+        {
             closed = true;
         }
         parsed.push(original);
     }
-    if !schema.management_present() {
-        // A closed native domain only tells registration to preserve history;
-        // it cannot add the new alias or allocate using its changed transport.
-        if registration && closed {
-            return Ok(true);
-        }
-        validate_legacy_routes(
-            routes,
-            &registered,
-            &parsed,
-            &historical_domains,
-            registration,
-            context,
-        )?;
-        return Ok(closed);
-    }
-    let retirements = index::rows(db, context).await.map_err(super::work_error)?;
+    let retirements = candidates::rows(db, &selected, context)
+        .await
+        .map_err(super::work_error)?;
     if retirements.is_empty() {
         if registration && closed {
             return Ok(true);
@@ -102,6 +146,7 @@ pub(super) async fn closed_in_schema<C: ConnectionTrait>(
             &parsed,
             &historical_domains,
             registration,
+            preservation,
             context,
         )?;
         return Ok(closed);
@@ -179,26 +224,28 @@ pub(super) async fn closed_in_schema<C: ConnectionTrait>(
             } => "controlled_cleanup",
             _ => return Err(super::needs_attention()),
         };
-        if disposition != selected
-            || !receipt.intent_ids.is_empty()
-            || !capture.inventory.complete
-            || !step.stop_new_allocations
-        {
+        if disposition != selected || !receipt.intent_ids.is_empty() || !step.stop_new_allocations {
             return Err(super::needs_attention());
         }
         let domain = super::domains::allocation_domain_with_work(original, context)?;
         if key.starts_with("domain:") && key != domain {
             return Err(super::needs_attention());
         }
+        // Classification is a locator only. The records review must validate
+        // the sealed inventory and its totals before this marker closes a
+        // domain; mutation_scope is not the complete responsibility set.
+        context.copy(text("plan_id")?).map_err(super::work_error)?;
+        source
+            .load_dependencies(db, &[text("plan_id")?.to_owned()])
+            .await
+            .map_err(super::work_error)?;
+        validate_original_point(&source, key, original, row, action, context)?;
         if !key.starts_with("domain:") {
             // Resolve the old alias from its complete, DB-bound original
             // receipt/capture even after R26 moves today's registry row. The
             // key is only a locator; membership plus the full original route
             // supplies the backend/scope/resource-type relation.
-            if !capture.inventory.frontier.iter().any(|point| {
-                point.table == "pin_provider_routes"
-                    && point.values.iter().map(String::as_str).eq([key])
-            }) || !capture.routes.iter().any(|captured| {
+            if !capture.mutation_scope.routes.iter().any(|captured| {
                 captured.original.as_ref() == Some(original)
                     && captured.identity.original.as_ref() == Some(original)
             }) {
@@ -208,18 +255,11 @@ pub(super) async fn closed_in_schema<C: ConnectionTrait>(
             historical_domains.insert(domain.clone());
         }
         if requested.contains(&domain) {
-            // Only a matching closed-domain point needs the retained full-frame
-            // recheck. Open births do not scan each legacy private inventory.
-            context.copy(text("plan_id")?).map_err(super::work_error)?;
-            source
-                .load_dependencies(db, &[text("plan_id")?.to_owned()])
-                .await
-                .map_err(super::work_error)?;
-            validate_original_point(&source, key, original, row, action, context)?;
             context.copy(&domain).map_err(super::work_error)?;
             historical_domains.insert(domain.clone());
         }
-        closed |= requested.contains(&domain);
+        closed |= requested.contains(&domain)
+            || preservation.is_some_and(|admission| admission.references(key));
     }
     validate_legacy_routes(
         routes,
@@ -227,6 +267,7 @@ pub(super) async fn closed_in_schema<C: ConnectionTrait>(
         &parsed,
         &historical_domains,
         false,
+        preservation,
         context,
     )?;
     Ok(closed)
@@ -238,6 +279,7 @@ fn validate_legacy_routes(
     parsed: &[std::sync::Arc<ProviderRouteSnapshot>],
     historical_domains: &BTreeSet<String>,
     registration: bool,
+    preservation: Option<&crate::store::pinning::legacy_migration::R26Admission<'_>>,
     work: super::DecodeWork<'_>,
 ) -> AppResult<()> {
     // Removing explicit identity cannot prove a new account. A previously
@@ -250,6 +292,13 @@ fn validate_legacy_routes(
             continue;
         }
         let key = super::domains::registration_key_with_work(route, work)?;
+        // Only the exact validated R26 original may remain unknown. A conflicting
+        // registered alias is still ambiguous and cannot be reinterpreted.
+        if preservation.is_some_and(|admission| admission.preserves(route))
+            && !registered.iter().any(|row| row.provider == key)
+        {
+            continue;
+        }
         // A genuinely new metadata registration is not allocation admission.
         // Never reinterpret an already registered alias as another old account.
         if registration && !registered.iter().any(|row| row.provider == key) {

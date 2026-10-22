@@ -158,6 +158,8 @@ pub async fn publish_cid_with_tags(
     .await
     .unwrap();
     let row = object_version::Entity::find()
+        .filter(object_version::Column::Bucket.eq("bucket"))
+        .filter(object_version::Column::Key.eq(key))
         .filter(object_version::Column::ObjectId.eq(&id))
         .one(db)
         .await

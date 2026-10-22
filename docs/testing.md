@@ -421,6 +421,10 @@ receipt-write fault and atomic rollback, route lock/committed drift,
 contradictory historical account identity, the old-resource/new-allocation
 boundary and damaged registered receipt catalogs.
 
+The management-catalog lib cases in `snapshot_management_postgres_tests` use the
+same explicit fixture marker and PostgreSQL URL. They create fresh `stage7_r26_`
+schemas and retain them, including on failure, for operator inspection.
+
 **Local isolated acceptance passed.** The formal
 CLI target passed 7/7, including cross-process receipt replay/rollback,
 97-byte/3-pin conservation, fresh read-only rollback preview, missing/corrupt
@@ -498,6 +502,163 @@ Ignored PostgreSQL cases and command examples aren't passing evidence. Runtime
 and native PostgreSQL acceptance require executed results against the finished
 source. External account operations, production operations, unpin and GC aren't
 authorized by these checks.
+
+## Stage 7.5 management scale acceptance
+
+Stage 7 results do not establish large-registry management usability. Stage 7.5
+requires both bounded local-operation measurements and complete global inventory,
+retirement, history recovery and export checks. Use isolated databases and
+loopback provider fixtures; these tests do not authorize production upgrades or
+external provider writes.
+
+The commands below are an index by affected behavior, not unconditional gates for
+every edit or release. Reuse passing evidence when later changes don't affect the
+covered behavior or interfaces. Full Stage 7.5 acceptance still requires all
+conditions in the [Stage 7.5 plan](superpowers/plans/2026-09-20-pinning-zip-unixfs.md#必要验收).
+
+```powershell
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_storage
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_storage_guards
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --lib conversion_read_capability_is_exact_and_does_not_escape_its_task
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --lib final_attestation_fence_rolls_back_mutation_or_cancellation
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage7_management_evidence --test stage7_management_directory_evidence
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_management_scale -- --nocapture --test-threads=1
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_retirement_scale -- --nocapture --test-threads=1
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_management_workflow --test stage75_history_conversion
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_consumers
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_transaction_lifetime --test stage75_transaction_postgres
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_management_wire --test stage75_management_upgrade_cli
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_initialization
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_management_history_export
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_management_checkpoint_cli
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_checkpoint_integrity
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_retirement_status
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_locator_meet
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_pixivbot
+```
+
+The scale target compares the same selected Create, Renew and Retry planning
+scope at 1,000, 10,000 and 100,000 unrelated current objects, with current versions
+and additional noncurrent history. It also measures ordinary publication and
+ordinary worker completion with an applied management receipt present. Run this target serially: its allocation and
+process-memory measurements are process-wide. Fixture construction is outside
+the measured operation. Planning labels fresh single-connection and warm repeat
+measurements separately; neither claims an evicted OS or PostgreSQL server cache.
+Report SQL count and elapsed time, query plans, cumulative decode work, storage
+returned rows/cells, raw/copied/output bytes, reservation peak, Rust peak/total
+allocation and sampled process RSS separately. Storage meters count work charged
+by the scoped reader, not the database engine's total scanned rows. Rust
+allocation counters exclude native driver memory; RSS includes driver caches and
+is sampled, not an exact allocation trace. SQLite query-plan output is not an
+actual scanned-row counter. These measurements alone do not prove global-task
+memory bounds, lock duration, all worker recovery/cancellation cases or all action branches.
+
+The retirement scale target uses 100,000 current objects with leases and targets
+in the selected domain, not just unrelated background objects. It checks disk
+scan close/resume, cancellation and restart, a competing writer between pages,
+complete responsibility totals, and private streaming export. Keep its memory
+measurements serial as well. The workflow and history targets separately cover
+the action chain, shared-CID allocation, frozen review recovery and original
+committed facts; scale measurements do not replace those contracts.
+
+Checkpoint CLI and integrity targets cover process exit/resume, source drift,
+confirmation staging/publication, preservation of existing operator files,
+corrupted originals or membership/totals, cumulative budgets and read-only recovery
+after publication without output. Retirement status compares current responsibility
+with frozen replay. Locator completeness checks fail-closed behavior for a missing
+shared-job locator before and after owner cancellation; equal allocated authorities
+don't prove the differing-authority case. `stage75_retirement_branches_scale`
+separately covers large `RetireWith` selections and over-budget rollback.
+
+Use only the locally cached `postgres:17.11` image with `--pull=never`, loopback
+binding and an explicitly authorized task-owned instance. Don't pull images, touch
+existing instances or production databases, or delete databases/volumes. Stop only
+the task-owned instance and report retained resources.
+
+Each ignored entrypoint below requires a fresh, empty, exclusively owned `stage7_`
+schema, except the initialized storage-fixture checks described below. Never reuse
+another test's occupied schema or clear it to make a rerun pass.
+
+| Target | Environment variable |
+|---|---|
+| `stage75_management_scale` | `IPFS_S3_STAGE7_APPLY_DATABASE_URL` |
+| `stage75_storage_postgres` | `IPFS_S3_STAGE75_STORAGE_DATABASE_URL` |
+| `stage75_storage_constraints_postgres` (initialized storage fixture) | `IPFS_S3_STAGE75_STORAGE_DATABASE_URL` |
+| `stage75_history_conversion` | `IPFS_S3_STAGE75_HISTORY_DATABASE_URL` |
+| `stage75_initialization` (each entrypoint needs its own fresh schema) | `IPFS_S3_STAGE75_HISTORY_DATABASE_URL` |
+| `stage75_history_export_postgres` | `IPFS_S3_STAGE75_HISTORY_DATABASE_URL` |
+| `stage75_recorded_status_postgres` | `IPFS_S3_STAGE75_RECORDED_STATUS_DATABASE_URL` |
+| `stage75_confirmation_postgres` | `IPFS_S3_STAGE75_CONFIRMATION_DATABASE_URL` |
+| `stage75_locator_meet` | `IPFS_S3_STAGE7_APPLY_DATABASE_URL` |
+| `stage75_transaction_postgres` | `IPFS_S3_STAGE75_TRANSACTION_DATABASE_URL` |
+| `stage75_transaction_lifetime` | `IPFS_S3_STAGE75_TRANSACTION_LIFETIME_DATABASE_URL` |
+| `stage75_consumers_completion_postgres` | `IPFS_S3_STAGE7_APPLY_DATABASE_URL` |
+
+```powershell
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_management_scale -- --ignored --nocapture --test-threads=1
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_storage_postgres postgres_scoped_storage_fences_chunks_and_revision -- --ignored --nocapture --test-threads=1
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_storage_postgres postgres_immutable_guards_are_validated -- --ignored --nocapture --test-threads=1
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_storage_constraints_postgres -- --ignored --nocapture --test-threads=1
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_history_conversion postgres_nonempty_upgrade -- --ignored --nocapture --test-threads=1
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_initialization postgres_concurrent_appstate_initializes_once_and_refuses_backfill -- --exact --ignored
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_initialization postgres_appstate_does_not_initialize_partial_schema_without_migration_metadata -- --exact --ignored
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_history_export_postgres -- --ignored
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_recorded_status_postgres postgres_converted_status_uses_a_read_only_repeatable_snapshot_and_keeps_replay_original -- --exact --ignored
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_recorded_status_postgres postgres_historical_provider_status_rechecks_current_responsibility_without_rewriting_replay -- --exact --ignored
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_confirmation_postgres -- --ignored --nocapture
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_locator_meet -- --ignored
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_transaction_postgres -- --ignored --nocapture --test-threads=1
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_transaction_lifetime -- --ignored --nocapture --test-threads=1
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_consumers_completion_postgres -- --ignored --nocapture --test-threads=1
+```
+
+The PostgreSQL storage checks cover empty-membership locks, revision drift,
+rollback, exact private UTF-8 streaming, immutable chunks and write cancellation.
+Immutable-guard and constraint checks require the initialized storage fixture and
+the same storage URL; run them serially after the scoped-storage entrypoint.
+Missing or weakened protections must reject authority, and sealed archives must
+survive refused TRUNCATE operations. Conversion checks cover runtime refusal during
+backfill, task/transaction/database isolation even after failure, and AppState
+refusal before explicit nonempty upgrade. Recovery must preserve private originals
+and NULL cells without rewriting source rows. Formal apply, Submit, retirement
+concurrency and root-release checks remain required.
+
+The initialization target checks the real AppState startup path for concurrent
+empty-database initialization and zero-write refusal of partial or backfill schemas.
+The history-export targets exercise complete private history recovery without
+target-database writes, including unreferenced archive segments. The PostgreSQL
+case also checks transactional collection revisions, committed drift refusal and
+schema rejection when archive revision maintenance is missing.
+The recorded-status PostgreSQL target checks converted object and historical
+provider history against current database facts in a read-only consistent snapshot
+while preserving the original committed replay result. The historical provider
+case also checks unresolved resource identity, cancellation and missing
+original-authority locators.
+
+`stage75_consumers_authority_postgres` instead uses an already initialized,
+parent-owned fixture through `IPFS_S3_STAGE7_APPLY_DATABASE_URL`, with a formally
+registered route and clean source/locator seals. Do not use a fixture left dirty
+by an intentional phantom or corruption test. It checks read-only authority
+discovery and NOWAIT refusal under a maintenance-compatible lock, followed by
+successful acquisition after rollback, without business writes.
+
+```powershell
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_consumers_authority_postgres -- --ignored --nocapture --test-threads=1
+```
+
+Pixivbot compatibility uses signed v1 ZIP PUT and MPU Create with
+`decompress-zip=<prefix>/` and
+`ipfs-s3%3Apin=true&ipfs-s3%3Aduration=1d&ipfs-s3%3Acontent=decompressed` tagging.
+Neither `x-ipfs3-zip-contract: v2` nor `x-ipfs3-zip-expected-sha256` is sent.
+Acceptance checks XML `Entry.ETag` CIDs, decompressed-object pin intent and actual
+loopback worker calls/completion, including nonempty management, retirement and
+legacy history. Management wire v3 and ZIP v2 are separate protocols.
+
+Commands and ignored entrypoints are not passing evidence. Stage 7.5 acceptance
+also requires the complete nine-action/ten-apply workflow, original-plan replay,
+same-file restart, private history and large export, all RetireWith branches,
+SQLite/PostgreSQL failure and concurrency fences, full lib/integration with default
+concurrency, fmt and strict all-targets Clippy against the integrated source.
 
 ## Opt-in multi-process capacity measurements
 

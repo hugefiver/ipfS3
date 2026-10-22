@@ -1,4 +1,4 @@
-//! Source-only additions for the parent's existing owned R26 PostgreSQL lane.
+//! Isolated PostgreSQL migration fixtures retain their schemas for inspection.
 use super::{management_catalog_tests::declaration, migration, store};
 use crate::store::pinning::{management::schema, quota};
 use futures_util::FutureExt;
@@ -21,11 +21,12 @@ where
     let url =
         std::env::var("IPFS_S3_TEST_POSTGRES_URL").expect("authorized isolated PG URL required");
     let admin = Database::connect(&url).await.unwrap();
-    let schema = format!("r26_{}", uuid::Uuid::new_v4().simple());
+    let schema = format!("stage7_r26_{}", uuid::Uuid::new_v4().simple());
     admin
         .execute_unprepared(&format!("CREATE SCHEMA {schema}"))
         .await
         .unwrap();
+    eprintln!("retained PostgreSQL migration fixture: {schema}");
     let result = AssertUnwindSafe(async {
         let mut connections = vec![];
         for _ in 0..2 {
@@ -57,18 +58,6 @@ where
     })
     .catch_unwind()
     .await;
-    assert!(schema.starts_with("r26_") && schema.len() == 36);
-    let owned = admin.query_one(Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres,
-        "SELECT 1 FROM pg_namespace WHERE nspname=$1 AND nspowner=(SELECT oid FROM pg_roles WHERE rolname=current_user)",
-        [schema.clone().into()])).await.unwrap();
-    assert!(
-        owned.is_some(),
-        "cleanup target no longer owned by this fixture"
-    );
-    admin
-        .execute_unprepared(&format!("DROP SCHEMA {schema} CASCADE"))
-        .await
-        .unwrap();
     admin.close().await.unwrap();
     if let Err(error) = result {
         std::panic::resume_unwind(error);
@@ -145,13 +134,76 @@ async fn native_forward_guard_fences_retirement_absence_before_route_row_locks()
             "SELECT COUNT(*) AS n FROM pg_locks WHERE pid=pg_backend_pid() AND relation='pin_provider_routes'::regclass AND mode='RowShareLock' AND granted",
         )).await.unwrap().unwrap().try_get("", "n").unwrap();
         assert_eq!(route_row_fence, 0);
-        assert!(migration::fence::lock_from_routes(&caller, &plan.schema,
-            Some(std::slice::from_ref(&route))).await.is_err());
+        assert!(migration::fence::lock_from_routes(&caller, &plan.schema).await.is_err());
         caller.rollback().await.unwrap();
         writer.rollback().await.unwrap();
         assert_eq!(super::super::read(&a, &plan.schema).await.unwrap(), plan.before);
         assert_eq!(super::super::frontier(&a, &plan.schema).await.unwrap(), plan.receipt_frontier);
     }).await;
+}
+
+#[tokio::test]
+#[ignore = "parent owned PostgreSQL fixture required"]
+async fn current_r26_readiness_commit_and_final_authority_fence_are_zero_write_barriers() {
+    isolated(schema::VERSION, |a, b| async move {
+        let declaration = declaration(&a).await;
+        let plan = migration::inventory(&a, &declaration).await.unwrap();
+        b.execute_unprepared("UPDATE pin_management_readiness SET state='backfill' WHERE id=1")
+            .await
+            .unwrap();
+        assert!(migration::apply(&a, &declaration, &plan).await.is_err());
+        // Read the unchanged native image without requiring runtime readiness.
+        assert_eq!(
+            super::super::read(&a, &plan.schema).await.unwrap(),
+            plan.before
+        );
+        assert_eq!(
+            super::super::frontier(&a, &plan.schema).await.unwrap(),
+            plan.receipt_frontier
+        );
+        b.execute_unprepared("UPDATE pin_management_readiness SET state='ready' WHERE id=1")
+            .await
+            .unwrap();
+
+        let caller = a.begin().await.unwrap();
+        migration::fence::lock_before_routes(&caller, &plan.schema)
+            .await
+            .unwrap();
+        migration::fence::lock_from_routes(&caller, &plan.schema)
+            .await
+            .unwrap();
+        migration::fence::final_authority(&caller).await.unwrap();
+        let fresh = super::super::read(&caller, &plan.schema).await.unwrap();
+        let closure =
+            migration::management_closure::collect(&caller, &fresh, &declaration, &plan.schema)
+                .await
+                .unwrap();
+        let projected = migration::projection::project(&fresh, &declaration, &closure).unwrap();
+        assert_eq!(fresh, plan.before);
+        assert_eq!(projected.after, plan.after);
+        crate::store::pinning::management::admission::check_r26_open(&caller, &projected.admission)
+            .await
+            .unwrap();
+        let writer = b.begin().await.unwrap();
+        assert!(
+            writer
+                .execute_unprepared(
+                    "LOCK TABLE pin_management_readiness IN ROW EXCLUSIVE MODE NOWAIT"
+                )
+                .await
+                .is_err(),
+            "a readiness UPDATE must not acquire its write lock before R26 commits"
+        );
+        writer.rollback().await.unwrap();
+        caller.commit().await.unwrap();
+        let receipt = migration::apply(&a, &declaration, &plan).await.unwrap();
+        assert_eq!(
+            migration::apply(&b, &declaration, &plan).await.unwrap(),
+            receipt
+        );
+        migration::rollback(&b, &receipt.id, &plan).await.unwrap();
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -188,8 +240,16 @@ async fn native_management_same_count_key_private_text_and_subsecond_time_drift_
                 super::super::frontier(&a, &plan.schema).await.unwrap(),
                 plan.receipt_frontier
             );
-            let usage = quota::read_usage(&a, "old").await.unwrap().unwrap();
-            assert_eq!((usage.reserved_bytes, usage.reserved_pins), (97, 3));
+            let usage = a.query_one(Statement::from_string(a.get_database_backend(),
+                "SELECT reserved_bytes,reserved_pins FROM pin_provider_usage WHERE provider='old'"))
+                .await.unwrap().unwrap();
+            assert_eq!(
+                (
+                    usage.try_get::<i64>("", "reserved_bytes").unwrap(),
+                    usage.try_get::<i64>("", "reserved_pins").unwrap()
+                ),
+                (97, 3)
+            );
         })
         .await;
     }
@@ -230,7 +290,7 @@ async fn native_original_four_prefixes_remain_readable_and_old_writable_prefixes
                     super::super::read(&a, &plan.schema).await.unwrap(),
                     plan.before
                 );
-                store::run_migrations(&a).await.unwrap();
+                super::upgrade(&a).await;
                 assert!(migration::apply(&a, &declaration, &plan).await.is_err());
                 let fresh = migration::inventory(&a, &declaration).await.unwrap();
                 migration::apply(&a, &declaration, &fresh).await.unwrap();
@@ -266,8 +326,11 @@ async fn native_management_partial_columns_primary_keys_constraints_and_temp_sha
             }
             assert!(migration::inventory(&a, &declaration).await.is_err(), "{damage}");
             assert!(migration::apply(&a, &declaration, &plan).await.is_err(), "{damage}");
-            let usage = quota::read_usage(&a, "old").await.unwrap().unwrap();
-            assert_eq!((usage.reserved_bytes, usage.reserved_pins), (97, 3));
+            let usage = a.query_one(Statement::from_string(a.get_database_backend(),
+                "SELECT reserved_bytes,reserved_pins FROM pin_provider_usage WHERE provider='old'"))
+                .await.unwrap().unwrap();
+            assert_eq!((usage.try_get::<i64>("", "reserved_bytes").unwrap(),
+                usage.try_get::<i64>("", "reserved_pins").unwrap()), (97, 3));
             let count: i64 = a.query_one(Statement::from_string(a.get_database_backend(),
                 "SELECT COUNT(*) AS n FROM pin_legacy_migrations")).await.unwrap().unwrap().try_get("", "n").unwrap();
             assert_eq!(count, 0);

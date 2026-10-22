@@ -167,11 +167,9 @@ pub(super) fn outputs(
             }
             "pin_provider_routes" => {
                 if !matches!(request, Action::Retire | Action::RetireWith { .. })
-                    || key
-                        != &capture::key(
-                            "pin_provider_routes",
-                            &super::closure::retirement_key(binding, &action.receipt.binding)?.1[0],
-                        )
+                    || !super::super::retirement::route_keys(binding, &action.receipt.binding)?
+                        .iter()
+                        .any(|route| key == &capture::key("pin_provider_routes", route))
                     || !matches!(native::value(new, "retired"), Some("1" | "true"))
                 {
                     return Err(ManagementError::Confirmation);

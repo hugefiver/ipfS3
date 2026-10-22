@@ -887,12 +887,21 @@ pub(crate) async fn assert_reusable_route_with_work<C: ConnectionTrait>(
     work: DecodeWork<'_>,
 ) -> AppResult<()> {
     admission::check_provider_with_work(db, provider, work).await?;
-    if let Some(binding) =
-        super::legacy_migration::resource_binding_with_work(db, provider, cid, work)
+    let candidates =
+        super::legacy_migration::resource_receipt_candidates_with_work(db, provider, cid, work)
             .await
-            .map_err(admission::work_error)?
-        && binding.source_retired
-    {
+            .map_err(admission::work_error)?;
+    let binding = match &candidates {
+        Some(candidates) => {
+            super::legacy_migration::resource_binding_from_loaded(
+                db, provider, cid, candidates, work,
+            )
+            .await
+        }
+        None => super::legacy_migration::resource_binding_with_work(db, provider, cid, work).await,
+    }
+    .map_err(admission::work_error)?;
+    if binding.is_some_and(|binding| binding.source_retired) {
         return Err(invalid_quota(
             "retired migration source is not allocation authority",
         ));
@@ -900,7 +909,12 @@ pub(crate) async fn assert_reusable_route_with_work<C: ConnectionTrait>(
     let configured = records::current_model::<pin_provider_route::Entity, _>(db, &[provider], work)
         .await
         .map_err(admission::work_error)?;
-    let historical = super::ledger::get_with_work(db, provider, cid, work).await?;
+    let historical = match &candidates {
+        Some(candidates) => {
+            super::ledger::get_from_loaded(db, provider, cid, candidates, work).await?
+        }
+        None => super::ledger::get_with_work(db, provider, cid, work).await?,
+    };
     match (configured, historical) {
         (None, None) if !provider.starts_with("domain:") => Ok(()),
         (Some(current), Some(historical)) if !current.retired => {

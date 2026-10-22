@@ -27,7 +27,7 @@ pub(crate) fn validate_rows(
     if selected.is_empty()
         || selected.windows(2).any(|keys| keys[0] == keys[1])
         || action.root_releases != selected
-        || capture.root_references.len() != selected.len()
+        || capture.mutation_scope.root_references.len() != selected.len()
         || !action.receipt.intent_ids.is_empty()
         || !action.jobs.is_empty()
         || !action.receipt.job_ids.is_empty()
@@ -45,6 +45,7 @@ pub(crate) fn validate_rows(
             return Err(ManagementError::InvalidEvidence);
         }
         let mut proofs = capture
+            .mutation_scope
             .root_references
             .iter()
             .filter(|proof| proof.key == *key);
@@ -106,7 +107,3 @@ pub(super) async fn validate_effect<C: ConnectionTrait>(
     }
     Ok(())
 }
-
-#[cfg(test)]
-#[path = "roots/tests.rs"]
-mod tests;

@@ -1,27 +1,8 @@
-use std::{fmt, io};
+use std::fmt;
 
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 
 use super::{MAX_WIRE_BYTES, MAX_WIRE_DEPTH, MAX_WIRE_NODES, SafeError};
-
-#[derive(Default)]
-pub(super) struct BoundedOutput {
-    pub(super) bytes: Vec<u8>,
-}
-
-impl io::Write for BoundedOutput {
-    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
-        if input.len() > MAX_WIRE_BYTES.saturating_sub(self.bytes.len()) {
-            return Err(io::Error::other("management wire limit"));
-        }
-        self.bytes.extend_from_slice(input);
-        Ok(input.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
 
 #[derive(Default)]
 struct Budget {

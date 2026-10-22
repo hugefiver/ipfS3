@@ -206,21 +206,6 @@ impl Serialize for WithoutState<'_> {
         s.end()
     }
 }
-pub(crate) fn with_state(
-    action: &records::CommittedAction,
-    state: records::ActionState,
-) -> impl Serialize + '_ {
-    #[derive(Serialize)]
-    struct WithState<'a> {
-        #[serde(flatten)]
-        action: WithoutState<'a>,
-        state: records::ActionState,
-    }
-    WithState {
-        action: WithoutState(action),
-        state,
-    }
-}
 pub(crate) fn identity(
     binding: records::BindingView<'_>,
     action: &records::CommittedAction,

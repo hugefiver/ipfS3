@@ -147,18 +147,11 @@ pub(super) async fn lock_before_routes(
     Ok(())
 }
 
-/// The caller holds the prefix locks. Verified forward routes are admitted before
-/// any route row lock; receipt replay and the exact inverse do not issue admission.
+/// The caller holds the prefix locks; final admission follows all maintenance locks.
 pub(super) async fn lock_from_routes(
     db: &DatabaseTransaction,
     versions: &[String],
-    routes: Option<&[crate::pinning::identity::ProviderRouteSnapshot]>,
 ) -> AppResult<()> {
-    if super::management_closure::enabled(versions)
-        && let Some(routes) = routes
-    {
-        crate::store::pinning::management::admission::lock_open_in_transaction(db, routes).await?;
-    }
     if db.get_database_backend() == DatabaseBackend::Sqlite {
         return Ok(());
     }
@@ -182,6 +175,23 @@ pub(super) async fn lock_from_routes(
         .join(",");
     db.execute_unprepared(&format!("LOCK TABLE {names} IN EXCLUSIVE MODE NOWAIT"))
         .await?;
+    Ok(())
+}
+
+/// `versions` is the strict, supported prefix returned by snapshot::schema.
+/// Historical prefixes never acquire or read Stage7.5 authority tables.
+pub(super) fn current(versions: &[String]) -> bool {
+    versions.last().map(String::as_str) == Some(crate::store::pinning::management::schema::VERSION)
+}
+
+pub(super) async fn final_authority(db: &DatabaseTransaction) -> AppResult<()> {
+    crate::store::pinning::management::records::locator::fence_authority(db)
+        .await
+        .map_err(crate::store::pinning::management::admission::work_error)?;
+    if db.get_database_backend() == DatabaseBackend::Postgres {
+        db.execute_unprepared("LOCK TABLE pin_management_readiness IN SHARE MODE NOWAIT")
+            .await?;
+    }
     Ok(())
 }
 

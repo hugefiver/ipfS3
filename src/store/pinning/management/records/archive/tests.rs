@@ -340,76 +340,56 @@ async fn draft_and_empty_ack_confirmation_are_distinct_and_public_copies_are_pre
 
 #[tokio::test]
 async fn foreign_history_is_preserved_without_borrowing_foreign_authority() {
-    use crate::pinning::management::{self as management, db_snapshot};
+    use crate::pinning::management::db_snapshot;
     let fixture = super::super::super::actions::tests::fixture("archive-foreign-source").await;
-    fixture.db.execute(Statement::from_sql_and_values(fixture.db.get_database_backend(),"UPDATE pin_management_records SET principal='foreign' WHERE plan_id=$1 AND kind='action'",[fixture.binding.request.plan_id.clone().into()])).await.unwrap();
-    let mut request = (*fixture.binding.request).clone();
-    request.plan_id = "archive-foreign-consumer".into();
-    let snapshot = db_snapshot::collect_with_config(&fixture.db, &fixture.config, &request)
-        .await
-        .unwrap()
-        .planning_snapshot()
-        .unwrap();
-    let original = snapshot.native_frame.as_ref().unwrap();
-    let plan = management::dry_run(&request, &snapshot).unwrap();
-    let ack = plan
-        .items()
-        .iter()
-        .filter(|entry| entry.status == management::PlanStatus::Candidate)
-        .map(|entry| entry.request.item_id.clone())
-        .collect();
-    let confirmed = super::super::confirm(
-        &fixture.db,
-        &fixture.config,
-        &fixture.auth,
-        (&request, &snapshot, &plan),
-        ack,
-        chrono::Duration::minutes(5),
-    )
-    .await
-    .unwrap();
-    assert!(
-        confirmed
-            .view()
-            .frozen_rows()
-            .unwrap()
-            .all_rows()
-            .map(|(table, row)| (&table.table, row))
-            .eq(FrozenRows::Frame(original)
-                .all_rows()
-                .map(|(table, row)| (&table.table, row)))
-    );
     let foreign = evidence::anchor_key(&fixture.binding).unwrap();
     let refs = foreign
         .values
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>();
-    assert_eq!(
-        confirmed
-            .review()
-            .original_value(&foreign.table, &refs, "native_before"),
-        original.original_value(&foreign.table, &refs, "native_before")
-    );
-}
-
-#[tokio::test]
-async fn selective_load_enforces_full_registry_raw_budget_including_foreign_records() {
-    let fixture = super::super::super::actions::tests::fixture("archive-global-raw").await;
-    let binding = &fixture.binding;
+    let work = SharedDecodeBudget::default();
+    let mut expected = super::super::current_row(
+        &fixture.db,
+        &foreign.table,
+        &refs,
+        DecodeWork::shared(&work),
+    )
+    .await
+    .unwrap();
+    expected.insert("principal".into(), Some("foreign".into()));
     fixture.db.execute(Statement::from_sql_and_values(fixture.db.get_database_backend(),
-        "INSERT INTO pin_management_records (database_scope,plan_id,item_id,kind,native_identity,principal,binding,native_before,result,intent_ids,job_ids,state,created_at,expires_at,completed_at) SELECT 'foreign',plan_id,item_id,kind,native_identity,principal,$1,native_before,result,intent_ids,job_ids,state,created_at,expires_at,completed_at FROM pin_management_records WHERE plan_id=$2 AND kind='action'",
-        ["x".repeat(native::MAX_BYTES).into(),binding.request.plan_id.clone().into()])).await.unwrap();
+        "UPDATE pin_management_records SET principal='foreign' WHERE database_scope=$1 AND plan_id=$2 AND item_id=$3 AND kind=$4",
+        foreign.values.iter().cloned().map(Into::into).collect::<Vec<sea_orm::Value>>(),
+    )).await.unwrap();
+    let mut request = (*fixture.binding.request).clone();
+    request.plan_id = "archive-foreign-consumer".into();
+    // A late principal change is unsealed data, never replacement authority.
     assert!(matches!(
-        evidence::Evidence::load(
-            &fixture.db,
-            &binding.database_scope,
-            &binding.database_identity,
-            std::slice::from_ref(&binding.request.plan_id)
-        )
-        .await,
-        Err(ManagementError::Budget)
+        db_snapshot::collect_with_config(&fixture.db, &fixture.config, &request).await,
+        Err(db_snapshot::SnapshotError::Changed)
     ));
+    assert!(
+        super::super::load_confirmed_authority(
+            &fixture.db,
+            &fixture.auth,
+            &fixture.binding.request,
+            work.clone()
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        super::super::current_row(
+            &fixture.db,
+            &foreign.table,
+            &refs,
+            DecodeWork::shared(&work)
+        )
+        .await
+        .unwrap(),
+        expected
+    );
 }
 
 #[tokio::test]

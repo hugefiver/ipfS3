@@ -680,17 +680,32 @@ async fn root_release_real_receipt_fault_rolls_back_marker_and_all_retirement_wr
         .unwrap()
         .planning_snapshot()
         .unwrap();
-    let plan = dry_run(&request, &snapshot).unwrap();
+    let prepared = crate::pinning::management::retirement::PreparedPlanning::collect(
+        &fixture.db,
+        &request,
+        &snapshot,
+        records::SharedDecodeBudget::default(),
+    )
+    .await
+    .unwrap();
+    let plan = &prepared.plan;
+    let acknowledgements = plan
+        .items()
+        .iter()
+        .filter(|item| item.status == PlanStatus::Candidate)
+        .map(|item| item.request.item_id.clone())
+        .collect();
     let binding = records::confirm(
         &fixture.db,
         &fixture.config,
         &fixture.auth,
-        (&request, &snapshot, &plan),
-        vec![],
+        (&request, &snapshot, plan),
+        acknowledgements,
         chrono::Duration::minutes(5),
     )
     .await
     .unwrap();
+    prepared.close().await.unwrap();
     let before = zip::snapshot(&fixture.db, "root").await.unwrap().unwrap();
     records::fault_injection::install(
         &fixture.auth,

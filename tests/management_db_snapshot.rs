@@ -581,15 +581,53 @@ async fn snapshot_adapter_wire_request_does_not_supply_snapshot_authority_or_rec
         binding: plan.items()[0].clone(),
     });
     let plan = dry_run(&selected, &untrusted).unwrap();
-    let bytes = management::wire::encode_plan(&selected, &untrusted, &plan, None).unwrap();
-    let imported = management::wire::decode_plan(&bytes).unwrap();
-    assert_eq!(imported.plan().plan_id(), selected.plan_id);
-    assert!(imported.snapshot_without_applied().applied.is_empty());
-    assert_eq!(imported.untrusted_applied_claims().len(), 1);
-    assert!(imported.confirmation().is_none());
+    use management::wire::v3;
+    let mut writer = v3::Writer::new(
+        Vec::new(),
+        v3::Projection::Review,
+        v3::files::stream::budget(),
+    )
+    .unwrap();
+    v3::planning::prefix(
+        &mut writer,
+        v3::planning::Header {
+            projection: v3::Projection::Review,
+            database_scope: "client-scope",
+            database_identity: "client-identity",
+            principal: "client-principal",
+            catalog: &["client-catalog".into()],
+            created_at: "client-time".into(),
+            expires_at: None,
+        },
+        &selected,
+        &untrusted.configuration,
+        plan.items(),
+        *plan.summary(),
+        None,
+    )
+    .unwrap();
+    v3::planning::fact(
+        &mut writer,
+        v3::Section::AppliedClaim,
+        "management_applied",
+        0,
+        &untrusted.applied[0],
+    )
+    .unwrap();
+    let bytes = writer.finish().unwrap();
+    let (imported, _, _) = v3::document::inspect(
+        std::io::Cursor::new(bytes),
+        v3::Projection::Review,
+        v3::files::stream::budget(),
+    )
+    .unwrap();
+    assert!(imported.applied_claims);
+    assert!(imported.acknowledgements.is_none());
     let before = contents(&db).await;
     // The only accepted wire input is its request, never its supplied Snapshot.
-    let actual = collect(&db, &config, imported.request()).await.unwrap();
+    let actual = collect(&db, &config, imported.request.as_ref().unwrap())
+        .await
+        .unwrap();
     assert_eq!(actual.objects.len(), 1);
     assert!(actual.applied.is_empty());
     let native = actual.planning_snapshot().unwrap();
@@ -943,7 +981,6 @@ async fn snapshot_adapter_inventory_budget_counts_utf8_bytes_without_returning_d
 
 #[tokio::test]
 async fn management_root_release_binds_exact_reference_owner_build_and_native_history() {
-    use store::pinning::management::native;
     let db = store::connect_database("sqlite::memory:").await.unwrap();
     let config = config();
     setup(&db, &config).await;
@@ -980,176 +1017,317 @@ async fn management_root_release_binds_exact_reference_owner_build_and_native_hi
             },
         }],
     };
-    let before = native::capture(&db).await.unwrap();
-    let snapshot = collect(&db, &config, &request)
+    use retirement::{InventoryMembership, MembershipCursor, RetirementMutationScope};
+    let directory = tempfile::tempdir().unwrap();
+    let spool = root_inventory(&db, &config, directory.path()).await;
+    let review = spool.frozen_review().await.unwrap();
+    let mut shared = key.clone();
+    shared.values[0] = "shared-root".into();
+    assert_eq!(review.totals().roots, 2);
+    assert!(review.contains_root_responsibility(&key).await.unwrap());
+    assert!(review.contains_root_responsibility(&shared).await.unwrap());
+    let mut cursor = MembershipCursor::default();
+    let mut roots = Vec::new();
+    let mut root_eof = false;
+    while let Some(member) = spool.read_membership(&mut cursor).await.unwrap() {
+        match member {
+            InventoryMembership::Member(key) if key.table == "zip_root_references" => {
+                roots.push(key)
+            }
+            InventoryMembership::End { table } if table == "zip_root_references" => root_eof = true,
+            _ => {}
+        }
+    }
+    assert_eq!(roots, vec![key.clone(), shared.clone()]);
+    assert!(root_eof);
+    let snapshot = selected_root_snapshot(&db, &config, &key).await;
+    let plan = root_plan(&request, &snapshot, &spool, directory.path())
         .await
-        .unwrap()
-        .planning_snapshot()
         .unwrap();
-    let plan = dry_run(&request, &snapshot).unwrap();
     assert_eq!(plan.items()[0].status, PlanStatus::Ready);
     assert_eq!(plan.summary().physical_release_bytes, 0);
-    let confirmation = plan.confirmation(vec![]);
-    assert!(snapshot.native_frame.as_ref() == Some(&before));
-    let capture = serde_json::to_value(plan.items()[0].capture.as_ref().unwrap()).unwrap();
+    let Some(Capture::Provider(capture)) = &plan.items()[0].capture else {
+        panic!("provider")
+    };
+    assert_eq!(capture.totals.roots, 2);
+    assert_eq!(capture.mutation_scope.root_references.len(), 1);
+    assert!(capture.mutation_scope.root_references[0].key == key);
     assert_eq!(
-        capture["provider"]["root_references"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
-    assert_eq!(
-        capture["provider"]["root_references"][0]["key"],
-        serde_json::to_value(&key).unwrap()
-    );
-    assert_eq!(
-        capture["provider"]["root_references"][0]["owner"],
+        capture.mutation_scope.root_references[0].owner,
         "owner-selected-root"
     );
-    let bytes = wire::encode_plan(&request, &snapshot, &plan, Some(&confirmation)).unwrap();
-    let imported = wire::decode_plan(&bytes).unwrap();
-    assert!(imported.plan().items() == plan.items());
-    assert!(before == native::capture(&db).await.unwrap());
+    assert_eq!(review.step().root_references, 2);
 
     let mut duplicate = request.clone();
-    duplicate.items[0].action = serde_json::from_value(serde_json::json!({"retire_with":{"selection":{"release_root_references":{"references":[key,key]}}}})).unwrap();
-    assert_eq!(
-        dry_run(&duplicate, &snapshot).err(),
-        Some(SafeError::DuplicateIdentity)
-    );
+    duplicate.items[0].action = Action::RetireWith {
+        selection: RetirementSelection::ReleaseRootReferences {
+            references: vec![key.clone(), key.clone()],
+        },
+    };
+    assert!(matches!(
+        root_plan(&duplicate, &snapshot, &spool, directory.path()).await,
+        Err(SafeError::DuplicateIdentity)
+    ));
     let mut overlapping = request.clone();
     let mut other = overlapping.items[0].clone();
     other.item_id = "other-provider".into();
-    let Subject::Provider { route } = &mut other.subject else {
-        panic!("provider")
-    };
-    route.provider_id = "other-provider".into();
     overlapping.items.push(other);
-    assert_eq!(
-        dry_run(&overlapping, &snapshot).err(),
-        Some(SafeError::DuplicateIdentity)
-    );
+    assert!(matches!(
+        root_plan(&overlapping, &snapshot, &spool, directory.path()).await,
+        Err(SafeError::DuplicateIdentity)
+    ));
     let mut unproved = snapshot.clone();
     unproved.native_frame = None;
-    assert_eq!(
-        dry_run(&request, &unproved).unwrap().items()[0].status,
-        PlanStatus::Blocked(SafeError::UnknownEvidence)
+    assert!(
+        root_plan(&request, &unproved, &spool, directory.path())
+            .await
+            .is_err()
     );
     let mut missing_marker = snapshot.clone();
-    missing_marker
-        .root_references
-        .iter_mut()
-        .find(|root| root.key == key)
-        .unwrap()
+    missing_marker.root_references[0]
         .reference_tuple
         .remove("logical_released_at");
-    assert_eq!(
-        dry_run(&request, &missing_marker).unwrap().items()[0].status,
-        PlanStatus::Blocked(SafeError::InconsistentSnapshot)
+    assert!(
+        root_plan(&request, &missing_marker, &spool, directory.path())
+            .await
+            .is_err()
     );
+
     db.execute_unprepared("UPDATE zip_batches SET owner='changed-owner' WHERE id='selected-root'")
         .await
         .unwrap();
-    let changed = collect(&db, &config, &request)
+    let tx = db.begin().await.unwrap();
+    assert!(matches!(
+        review.seal(&tx, &root_limits()).await,
+        Err(store::pinning::management::ManagementError::Changed)
+    ));
+    tx.rollback().await.unwrap();
+    let changed = root_inventory(&db, &config, directory.path()).await;
+    let changed_capture = changed
+        .frozen_review()
         .await
         .unwrap()
-        .planning_snapshot()
+        .capture(&request.items[0], RetirementMutationScope::default())
+        .await
         .unwrap();
     assert_eq!(
-        revalidate(&plan, &confirmation, &changed).err(),
-        Some(SafeError::SnapshotChanged)
+        changed_capture.mutation_scope.root_references[0].owner,
+        "changed-owner"
     );
-    let untouched = native::capture(&db).await.unwrap();
-    assert!(
-        untouched.row(
-            "zip_root_references",
-            &["shared-root", "1", "2", "node-a", "hot", CID]
-        ) == before.row(
-            "zip_root_references",
-            &["shared-root", "1", "2", "node-a", "hot", CID]
-        )
-    );
+    assert!(changed_capture != **capture);
+
     db.execute_unprepared("UPDATE zip_root_references SET logical_released_at='2026-10-13T00:00:00Z' WHERE batch_id='selected-root'").await.unwrap();
-    let released = collect(&db, &config, &request)
-        .await
-        .unwrap()
-        .planning_snapshot()
-        .unwrap();
-    assert_eq!(released.root_references.len(), 2);
-    assert_eq!(released.inventories[0].root_reference_ids.len(), 1);
+    let released = root_inventory(&db, &config, directory.path()).await;
+    let released_review = released.frozen_review().await.unwrap();
+    assert_eq!(released_review.totals().roots, 1);
     assert!(
-        released.inventories[0]
-            .root_reference_ids
-            .iter()
-            .all(|key| key.values[0] == "shared-root")
-    );
-    assert_eq!(
-        dry_run(&request, &released).unwrap().items()[0].status,
-        PlanStatus::Blocked(SafeError::UnknownEvidence)
-    );
-    assert_eq!(
-        revalidate(&plan, &confirmation, &released).err(),
-        Some(SafeError::SnapshotChanged)
-    );
-    let released_frame = released.native_frame.as_ref().unwrap();
-    assert!(released_frame.frontier.contains(&key));
-    let released_row = released_frame
-        .row(
-            "zip_root_references",
-            &["selected-root", "1", "2", "node-a", "hot", CID],
-        )
-        .unwrap();
-    assert_eq!(native::value(released_row, "state"), Some("adopted"));
-    assert_eq!(
-        native::value(released_row, "logical_released_at"),
-        Some("2026-10-13T00:00:00Z")
+        !released_review
+            .contains_root_responsibility(&key)
+            .await
+            .unwrap()
     );
     assert!(
-        released_frame.row("zip_root_builds", &["selected-root", "1", "2"])
-            == untouched.row("zip_root_builds", &["selected-root", "1", "2"])
+        released_review
+            .contains_root_responsibility(&shared)
+            .await
+            .unwrap()
     );
     assert!(
-        released_frame.row("zip_batches", &["selected-root"])
-            == untouched.row("zip_batches", &["selected-root"])
+        released_review
+            .capture(&request.items[0], RetirementMutationScope::default())
+            .await
+            .is_err()
     );
-    assert!(
-        released_frame.row(
-            "zip_root_references",
-            &["shared-root", "1", "2", "node-a", "hot", CID]
-        ) == untouched.row(
-            "zip_root_references",
-            &["shared-root", "1", "2", "node-a", "hot", CID]
-        )
-    );
+    let mut cursor = retirement::ArchiveCursor::default();
+    let mut release = Vec::new();
+    let mut original_shared = Vec::new();
+    while let Some(part) = released.read_part(&mut cursor).await.unwrap() {
+        if part.key == key && part.column == "logical_released_at" {
+            release.extend(part.bytes);
+        } else if part.key == shared {
+            original_shared.push(part);
+        }
+    }
+    assert_eq!(release, b"2026-10-13T00:00:00Z");
+    let mut cursor = retirement::ArchiveCursor::default();
+    let mut frozen_shared = Vec::new();
+    while let Some(part) = spool.read_part(&mut cursor).await.unwrap() {
+        if part.key == shared {
+            frozen_shared.push(part);
+        }
+    }
+    assert!(frozen_shared == original_shared);
+
     db.execute_unprepared(
         "UPDATE zip_root_references SET verification_receipt=NULL WHERE batch_id='shared-root'",
     )
     .await
     .unwrap();
-    let mut unproved_request = request.clone();
-    let mut unproved_key = key.clone();
-    unproved_key.values[0] = "shared-root".into();
-    unproved_request.items[0].action = Action::RetireWith {
+    let missing_proof = root_inventory(&db, &config, directory.path()).await;
+    let missing_review = missing_proof.frozen_review().await.unwrap();
+    let mut unproved_request = request.items[0].clone();
+    unproved_request.action = Action::RetireWith {
         selection: RetirementSelection::ReleaseRootReferences {
-            references: vec![unproved_key],
+            references: vec![shared.clone()],
         },
     };
-    let missing_proof = collect(&db, &config, &unproved_request)
-        .await
-        .unwrap()
-        .planning_snapshot()
-        .unwrap();
-    assert_eq!(
-        dry_run(&unproved_request, &missing_proof).unwrap().items()[0].status,
-        PlanStatus::Blocked(SafeError::UnknownEvidence)
+    assert!(
+        missing_review
+            .capture(&unproved_request, RetirementMutationScope::default())
+            .await
+            .is_err()
     );
     let mut retained = request.clone();
     retained.items[0].action = Action::Retire;
-    let default_plan = dry_run(&retained, &missing_proof).unwrap();
+    let default_plan = root_plan(&retained, &snapshot, &missing_proof, directory.path())
+        .await
+        .unwrap();
     let Some(Capture::Provider(capture)) = &default_plan.items()[0].capture else {
-        panic!("provider");
+        panic!("provider")
     };
-    assert!(capture.root_references.is_empty());
-    assert_eq!(capture.inventory.root_reference_ids.len(), 1);
+    assert!(capture.mutation_scope.root_references.is_empty());
+    assert_eq!(capture.totals.roots, 1);
+    assert!(
+        missing_review
+            .contains_root_responsibility(&shared)
+            .await
+            .unwrap()
+    );
+    assert_eq!(missing_review.step().root_references, 1);
+}
+
+fn root_limits() -> retirement::RunLimits {
+    let mut limits = retirement::RunLimits::default();
+    limits.pages = 512;
+    limits
+}
+fn root_reserve(path: &std::path::Path) -> std::fs::File {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path).unwrap()
+}
+async fn root_inventory(
+    db: &DatabaseConnection,
+    config: &ValidatedPinningConfig,
+    directory: &std::path::Path,
+) -> retirement::InventorySpool {
+    let tx = db.begin().await.unwrap();
+    let cp = retirement::SourceCheckpoint::start(
+        &tx,
+        RouteIdentity::from_original(config.providers[0].route_snapshot()),
+    )
+    .await
+    .unwrap();
+    tx.rollback().await.unwrap();
+    let path = directory.join(format!("{}.sqlite", uuid::Uuid::new_v4()));
+    let spool = retirement::InventorySpool::create(&path, root_reserve(&path), &cp)
+        .await
+        .unwrap();
+    while spool.scan(db, &root_limits()).await.unwrap() == retirement::Progress::Pending {}
+    while spool
+        .reduce(&root_configuration(config), &root_limits())
+        .await
+        .unwrap()
+        == retirement::Progress::Pending
+    {}
+    spool
+}
+fn root_configuration(config: &ValidatedPinningConfig) -> ConfigurationBinding {
+    ConfigurationBinding {
+        routes: config
+            .providers
+            .iter()
+            .map(|p| p.route_snapshot())
+            .collect(),
+        policies: config.policies.clone(),
+        limits: config.provider_limits.clone(),
+        zip_rules: None,
+        source_node: None,
+    }
+}
+async fn selected_root_snapshot(
+    db: &DatabaseConnection,
+    config: &ValidatedPinningConfig,
+    key: &NativeKey,
+) -> Snapshot {
+    use store::pinning::management::native::{
+        self,
+        meter::Budget,
+        scope::{ScopeSpec, Selector, collect_scope},
+    };
+    let tx = db.begin().await.unwrap();
+    let mut budget = Budget::default();
+    let reads = collect_scope(
+        &tx,
+        &ScopeSpec::new(vec![
+            Selector::Exact(key.clone()),
+            Selector::Exact(NativeKey {
+                table: "zip_root_builds".into(),
+                values: key.values[..3].to_vec(),
+            }),
+            Selector::Exact(NativeKey {
+                table: "zip_batches".into(),
+                values: key.values[..1].to_vec(),
+            }),
+        ])
+        .unwrap(),
+        &mut budget,
+    )
+    .await
+    .unwrap();
+    let frame = native::NativeFrame::from_scoped_reads(&[reads], &[], &mut budget).unwrap();
+    tx.rollback().await.unwrap();
+    let values = key.values.iter().map(String::as_str).collect::<Vec<_>>();
+    let reference_tuple = frame.row(&key.table, &values).unwrap().clone();
+    let build_tuple = frame.row("zip_root_builds", &values[..3]).unwrap().clone();
+    let batch_tuple = frame.row("zip_batches", &values[..1]).unwrap().clone();
+    let root = RootReferenceSnapshot {
+        key: key.clone(),
+        owner: native::value(&batch_tuple, "owner").unwrap().into(),
+        verification_recorded: frame
+            .original_value(&key.table, &values, "verification_receipt")
+            .is_some_and(|v| !v.is_empty()),
+        reference_tuple,
+        build_tuple,
+        batch_tuple,
+    };
+    let now = Utc::now();
+    Snapshot {
+        observed_at: now.timestamp(),
+        database_now: Some(now),
+        configuration: Some(root_configuration(config)),
+        root_references: vec![root],
+        native_frame: Some(frame),
+        ..Default::default()
+    }
+}
+async fn root_plan(
+    request: &PlanRequest,
+    local: &Snapshot,
+    spool: &retirement::InventorySpool,
+    directory: &std::path::Path,
+) -> Result<DryRunPlan, SafeError> {
+    let path = directory.join(format!("{}.sqlite", uuid::Uuid::new_v4()));
+    let union = retirement::PlanUnion::create(&path, root_reserve(&path))
+        .await
+        .unwrap();
+    loop {
+        if let Some(plan) = dry_run_retirement(
+            request,
+            local,
+            &[spool.frozen_review().await.unwrap()],
+            &[],
+            &union,
+            &root_limits(),
+        )
+        .await?
+        {
+            return Ok(plan);
+        }
+    }
 }

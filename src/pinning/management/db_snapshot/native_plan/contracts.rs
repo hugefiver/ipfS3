@@ -1,8 +1,6 @@
 use super::*;
-use crate::store::pinning::legacy_migration;
 
-pub(super) async fn target(
-    tx: &DatabaseTransaction,
+pub(super) fn target(
     frame: &NativeFrame,
     target: &TargetEvidence,
     lease: &LeaseEvidence,
@@ -17,15 +15,13 @@ pub(super) async fn target(
         // A ledger's original route can support explicit observation, but does
         // not invent a pre-birth lease's frozen requirements.
         let key = [("id".into(), target.id.clone())].into();
-        let point = legacy_migration::resolve_legacy_binding_with_work(
-            tx,
+        let point = super::super::legacy::resolve(
+            frame,
             "pin_lease_targets",
             &key,
             &target.allocation,
-            DecodeWork::shared(work),
-        )
-        .await
-        .map_err(|_| SnapshotError::InvalidEvidence)?;
+            work,
+        )?;
         let decoded = if point.is_none() {
             frame
                 .original_value(
@@ -77,15 +73,8 @@ pub(super) async fn target(
             .get(slot)
             .ok_or(SnapshotError::InvalidEvidence)?
             .as_ref();
-        let point = legacy_migration::resolve_legacy_binding_with_work(
-            tx,
-            "pin_lease_requirements",
-            &key,
-            slot,
-            DecodeWork::shared(work),
-        )
-        .await
-        .map_err(|_| SnapshotError::InvalidEvidence)?;
+        let point =
+            super::super::legacy::resolve(frame, "pin_lease_requirements", &key, slot, work)?;
         let (allocation, original, receipt_id) = if let Some(point) = point {
             // A declaration route alone is not historical account capability.
             let captured = point

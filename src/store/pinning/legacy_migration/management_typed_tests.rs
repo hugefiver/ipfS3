@@ -10,6 +10,8 @@ mod fixture;
 use super::management_raw_tests::fixture as retired_fixture;
 #[path = "live_budget_tests.rs"]
 mod live_budget_tests;
+#[path = "loaded_job_receipt_tests.rs"]
+mod loaded_job_receipt_tests;
 
 async fn complete(
     db: &sea_orm::DatabaseConnection,
@@ -309,6 +311,14 @@ async fn unrelated_valid_retirement_is_preserved_but_same_canonical_target_canno
         server: _server,
         declaration,
     } = retired_fixture::fixture().await;
+    let mut unknown = declaration.namespaces[0].target_route.clone();
+    unknown.provider_id = "legacy:old".into();
+    unknown.scope = "legacy:old".into();
+    unknown.storage_domain = "legacy:old".into();
+    db.execute(Statement::from_sql_and_values(db.get_database_backend(),
+        "INSERT INTO remote_pin_ledger(provider,cid,route,ownership,effect) VALUES ('old','historical',$1,'unknown','unknown')",
+        [serde_json::to_string(&unknown).unwrap().into()])).await.unwrap();
+    let declaration = complete(&db, declaration).await;
     let open = migration::inventory(&db, &declaration).await.unwrap();
     let retired = open
         .before
@@ -344,14 +354,19 @@ async fn unrelated_valid_retirement_is_preserved_but_same_canonical_target_canno
     migration::fence::lock_before_routes(&tx, &open.schema)
         .await
         .unwrap();
-    assert!(
-        migration::fence::lock_from_routes(
-            &tx,
-            &open.schema,
-            Some(std::slice::from_ref(&original))
-        )
+    migration::fence::lock_from_routes(&tx, &open.schema)
         .await
-        .is_err()
+        .unwrap();
+    migration::fence::final_authority(&tx).await.unwrap();
+    let management =
+        migration::management_closure::collect(&tx, &open.before, &closed, &open.schema)
+            .await
+            .unwrap();
+    let projected = migration::projection::project(&open.before, &closed, &management).unwrap();
+    assert!(
+        crate::store::pinning::management::admission::check_r26_open(&tx, &projected.admission)
+            .await
+            .is_err()
     );
     tx.rollback().await.unwrap();
     let mut other_type = original.clone();

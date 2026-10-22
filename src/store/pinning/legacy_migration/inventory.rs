@@ -21,7 +21,7 @@ pub async fn inventory<C: ConnectionTrait + TransactionTrait>(
         .await?;
     let schema = snapshot::schema(&txn, false).await?;
     for namespace in &declaration.namespaces {
-        if super::receipt::source_has_receipt(&txn, &namespace.source).await? {
+        if super::receipt::source_has_receipt(&txn, &namespace.source, &schema).await? {
             return Err(refused(
                 "source already has an active receipt; replay original apply or explicitly rollback",
             ));
@@ -30,10 +30,12 @@ pub async fn inventory<C: ConnectionTrait + TransactionTrait>(
     let before = snapshot::read(&txn, &schema).await?;
     let management =
         super::management_closure::collect(&txn, &before, declaration, &schema).await?;
-    let after = projection::project(&before, declaration, &management)?;
-    if super::management_closure::enabled(&schema) {
-        crate::store::pinning::management::admission::check_open(&txn, management.routes()).await?;
+    let projected = projection::project(&before, declaration, &management)?;
+    if super::fence::current(&schema) {
+        crate::store::pinning::management::admission::check_r26_open(&txn, &projected.admission)
+            .await?;
     }
+    let after = projected.after;
     let sql = if pg {
         "WITH clock AS MATERIALIZED (SELECT clock_timestamp() AS now) SELECT now::text AS now, (now+($1::bigint * interval '1 second'))::text AS expires FROM clock"
     } else {

@@ -18,6 +18,26 @@ mod validate;
 use facts::{Birth, Cursor, ItemFacts, JobLink, OperationRead, Outcome, RowRef};
 use rows::RowSet;
 
+#[cfg(test)]
+async fn publish_executed(
+    auth: &records::LocalAuthorization,
+    binding: &records::ConfirmedBinding,
+    executed: &ExecutedAction<'_>,
+    before: records::FrozenRows<'_>,
+) -> Result<String> {
+    let encoded =
+        records::write_executed_action_in_transaction(auth, binding, executed, before).await?;
+    super::seal::executed(
+        executed.transaction(),
+        auth,
+        binding,
+        executed,
+        executed.work(),
+    )
+    .await?;
+    Ok(encoded)
+}
+
 #[derive(PartialEq, Eq)]
 pub(crate) struct Resource<'a> {
     pub(super) key: std::sync::Arc<native::NativeKey>,
@@ -49,13 +69,11 @@ pub(crate) struct ExecutedAction<'tx> {
     identity: String,
     work: records::SharedDecodeBudget,
     completed: std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>>,
+    record_writes: std::sync::atomic::AtomicU64,
 }
 impl ExecutedAction<'_> {
     pub(crate) fn action_view(&self) -> &records::CommittedAction {
         &self.action
-    }
-    pub(super) fn set_state(&mut self, state: records::ActionState) {
-        self.action.state = state;
     }
     pub(super) fn into_action(self) -> records::CommittedAction {
         self.action
@@ -73,11 +91,16 @@ impl ExecutedAction<'_> {
         records::DecodeWork::shared(&self.work)
     }
     pub(crate) fn published_at(&self, now: chrono::DateTime<chrono::Utc>) -> Result<()> {
+        self.record_written();
         *self
             .completed
             .lock()
             .map_err(|_| ManagementError::Confirmation)? = Some(now);
         Ok(())
+    }
+    pub(crate) fn record_written(&self) {
+        self.record_writes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     pub(crate) async fn validate_effect(&self, binding: records::BindingView<'_>) -> Result<()> {
         let binding = binding.with_work(&self.work);
@@ -120,6 +143,7 @@ pub(super) struct ExecutionBatch<'tx> {
     work: records::SharedDecodeBudget,
     review: Option<records::ConfirmedPlan>,
     self_records: Vec<Arc<native::NativeRow>>,
+    scope: Option<Arc<crate::pinning::management::db_snapshot::PlanningScope>>,
 }
 impl<'tx> ExecutionBatch<'tx> {
     #[cfg(test)]
@@ -166,6 +190,7 @@ impl<'tx> ExecutionBatch<'tx> {
             work,
             review: None,
             self_records: Vec::new(),
+            scope: None,
         })
     }
     pub(super) fn use_review(&mut self, review: records::ConfirmedPlan) -> Result<()> {
@@ -175,9 +200,26 @@ impl<'tx> ExecutionBatch<'tx> {
         self.review = Some(review);
         Ok(())
     }
+    pub(super) fn use_scope(
+        &mut self,
+        scope: Arc<crate::pinning::management::db_snapshot::PlanningScope>,
+    ) -> Result<()> {
+        if scope.database_scope != self.binding.database_scope
+            || scope.database_identity != self.binding.database_identity
+        {
+            return Err(ManagementError::Confirmation);
+        }
+        self.scope = Some(scope);
+        Ok(())
+    }
     pub(super) async fn execute_entry(&mut self, entry: &PlanEntry) -> Result<ExecutedAction<'tx>> {
         if self.binding.confirmation.bindings.get(self.ordinal) != Some(entry) {
             return Err(ManagementError::Confirmation);
+        }
+        if self.scope.is_none() {
+            let scope =
+                local_scope::capture(self.tx, self.config, self.binding, self.work.clone()).await?;
+            self.use_scope(scope)?;
         }
         if self.review.is_none() {
             self.review =
@@ -206,15 +248,36 @@ impl<'tx> ExecutionBatch<'tx> {
             .filter(|(key, _)| key.table() == "pin_jobs")
             .map(|(key, _)| key.value(0))
             .collect::<BTreeSet<_>>();
-        // The locked registry fence and verified producer cursor supply inputs;
-        // only semantic effects are captured and the full registry is fenced at
-        // publication, including dependencies that remain unchanged.
+        // The locked dependency memberships and verified producer cursor supply
+        // inputs; publication rechecks the complete original and produced scope,
+        // including dependencies that remain unchanged.
+        let boundary = if self.ordinal > 0 {
+            binding.with_decode_work(|work| work.nodes(before.iter().count()))?;
+            Some(records::ExecutionRows {
+                scope: binding.database_scope,
+                identity: binding.database_identity,
+                rows: before
+                    .iter()
+                    .map(|(key, row)| {
+                        native::current_catalog()
+                            .iter()
+                            .find(|table| table.table == key.table())
+                            .map(|table| (table, row))
+                            .ok_or(ManagementError::Schema)
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            })
+        } else {
+            None
+        };
         let (action, renewal) = executor::execute_with_jobs(
             self.tx,
             self.config,
             self.auth,
             entry,
-            self.before,
+            boundary
+                .as_ref()
+                .map_or(self.before, records::FrozenRows::Execution),
             &existing,
             binding,
         )
@@ -294,6 +357,7 @@ impl<'tx> ExecutionBatch<'tx> {
             identity,
             work: self.work.clone(),
             completed: std::sync::Mutex::new(None),
+            record_writes: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -302,80 +366,159 @@ impl<'tx> ExecutionBatch<'tx> {
         written: &[(ExecutedAction<'tx>, String)],
     ) -> Result<()> {
         let binding = self.binding.view().with_work(&self.work);
-        let expected = rows::LatestRows::before(binding, &self.cursor)?;
-        for table in native::current_catalog() {
-            let mut count = 0usize;
-            for (_, row) in expected
-                .iter()
-                .filter(|(key, _)| key.table() == table.table)
-            {
-                capture::matches(
-                    self.tx,
-                    binding,
-                    table,
-                    row.iter()
-                        .map(|(column, value)| (column.as_str(), value.as_deref())),
-                    None,
-                )
-                .await?;
-                count += 1;
-            }
-            if table.table == "pin_management_records" {
-                for original in &self.self_records {
-                    let (executed, encoded) = written
-                        .iter()
-                        .find(|(e, _)| {
-                            Some(e.action.receipt.binding.request.item_id.as_str())
-                                == native::value(original, "item_id")
-                        })
-                        .ok_or(ManagementError::Changed)?;
-                    let action = &executed.action;
-                    binding.copy(&(&action.receipt.intent_ids, &action.receipt.job_ids))?;
-                    let intents = serde_json::to_string(&action.receipt.intent_ids)
-                        .map_err(|_| ManagementError::Confirmation)?;
-                    let jobs = serde_json::to_string(&action.receipt.job_ids)
-                        .map_err(|_| ManagementError::Confirmation)?;
-                    let cells = original
-                        .iter()
-                        .filter(|(c, _)| c.as_str() != "completed_at")
-                        .map(|(column, value)| {
-                            (
-                                column.as_str(),
-                                match column.as_str() {
-                                    "result" => Some(encoded.as_str()),
-                                    "intent_ids" => Some(intents.as_str()),
-                                    "job_ids" => Some(jobs.as_str()),
-                                    "state" => Some("applied"),
-                                    _ => value.as_deref(),
-                                },
-                            )
-                        });
-                    let completed = executed
-                        .completed
-                        .lock()
-                        .map_err(|_| ManagementError::Confirmation)?
-                        .ok_or(ManagementError::Confirmation)?;
-                    capture::matches(self.tx, binding, table, cells, Some(completed)).await?;
-                    count += 1;
+        let scope = self.scope.as_ref().ok_or(ManagementError::Confirmation)?;
+        for key in scope.originals().keys() {
+            binding.copy(key)?;
+        }
+        let mut expected = scope
+            .originals()
+            .iter()
+            .map(|(key, row)| (key.clone(), std::borrow::Cow::Borrowed(row)))
+            .collect::<local_scope::ExpectedRows<'_>>();
+        let mut owned_sources = BTreeSet::new();
+        for (executed, _) in written {
+            for output in &executed.operation.facts.2 {
+                let key = native::NativeKey {
+                    table: output.0.0.clone(),
+                    values: output.0.1.clone(),
+                };
+                if matches!(
+                    key.table.as_str(),
+                    "pin_provider_routes" | "pin_management_retirements"
+                ) {
+                    owned_sources.insert(key.clone());
+                }
+                if let Some(row) = executed.operation.after(&output.0)? {
+                    let row = binding
+                        .decode_work()
+                        .copy_out(records::RowView::Handle(row))?;
+                    expected.insert(key, std::borrow::Cow::Owned(row));
+                } else {
+                    expected.remove(&key);
                 }
             }
-            let actual = self
-                .tx
-                .query_one(sea_orm::Statement::from_string(
-                    self.tx.get_database_backend(),
-                    format!("SELECT COUNT(*) AS n FROM \"{}\"", table.table),
-                ))
-                .await
-                .map_err(|_| ManagementError::Database)?
-                .ok_or(ManagementError::Database)?
-                .try_get::<i64>("", "n")
-                .map_err(|_| ManagementError::Database)?;
-            if usize::try_from(actual).ok() != Some(count) {
-                return Err(ManagementError::Changed);
+        }
+        let table = native::current_catalog()
+            .iter()
+            .find(|table| table.table == "pin_management_records")
+            .ok_or(ManagementError::Schema)?;
+        for original in &self.self_records {
+            let (executed, encoded) = written
+                .iter()
+                .find(|(e, _)| {
+                    Some(e.action.receipt.binding.request.item_id.as_str())
+                        == native::value(original, "item_id")
+                })
+                .ok_or(ManagementError::Changed)?;
+            let action = &executed.action;
+            let key = native::NativeKey {
+                table: table.table.clone(),
+                values: table
+                    .primary_key
+                    .iter()
+                    .map(|column| {
+                        native::value(original.as_ref(), column)
+                            .map(str::to_owned)
+                            .ok_or(ManagementError::Confirmation)
+                    })
+                    .collect::<Result<_>>()?,
+            };
+            if scope.originals().get(&key) != Some(original.as_ref()) {
+                return Err(ManagementError::Confirmation);
             }
+            binding.copy(&(&action.receipt.intent_ids, &action.receipt.job_ids))?;
+            let intents = serde_json::to_string(&action.receipt.intent_ids)
+                .map_err(|_| ManagementError::Confirmation)?;
+            let jobs = serde_json::to_string(&action.receipt.job_ids)
+                .map_err(|_| ManagementError::Confirmation)?;
+            let cells = original
+                .iter()
+                .filter(|(c, _)| c.as_str() != "completed_at")
+                .map(|(column, value)| {
+                    (
+                        column.as_str(),
+                        match column.as_str() {
+                            "result" => Some(encoded.as_str()),
+                            "intent_ids" => Some(intents.as_str()),
+                            "job_ids" => Some(jobs.as_str()),
+                            "state" => Some("applied"),
+                            _ => value.as_deref(),
+                        },
+                    )
+                });
+            let completed = executed
+                .completed
+                .lock()
+                .map_err(|_| ManagementError::Confirmation)?
+                .ok_or(ManagementError::Confirmation)?;
+            capture::matches(self.tx, binding, table, cells, Some(completed)).await?;
+            let current = capture::row(
+                self.tx,
+                binding,
+                &facts::Key(key.table.clone(), key.values.clone()),
+            )
+            .await?
+            .ok_or(ManagementError::Changed)?;
+            expected.insert(key.clone(), std::borrow::Cow::Owned(current));
+            owned_sources.insert(key);
         }
         if self.self_records.len() != written.len() {
             return Err(ManagementError::Changed);
+        }
+        local_scope::validate_final(
+            self.tx,
+            self.config,
+            self.binding,
+            scope,
+            &expected,
+            &owned_sources,
+            self.work.clone(),
+        )
+        .await?;
+        if self
+            .binding
+            .confirmation
+            .bindings
+            .iter()
+            .any(|entry| matches!(entry.capture, Some(Capture::Provider(_))))
+        {
+            let mut counts = std::collections::BTreeMap::<native::NativeKey, u64>::new();
+            for (executed, _) in written {
+                for output in &executed.operation.facts.2 {
+                    *counts
+                        .entry(native::NativeKey {
+                            table: output.0.0.clone(),
+                            values: output.0.1.clone(),
+                        })
+                        .or_default() += 1;
+                }
+                counts.insert(
+                    native::NativeKey {
+                        table: "pin_management_records".into(),
+                        values: vec![
+                            self.binding.database_scope.clone(),
+                            self.binding.request.plan_id.clone(),
+                            executed.action.receipt.binding.request.item_id.clone(),
+                            "action".into(),
+                        ],
+                    },
+                    executed
+                        .record_writes
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                );
+            }
+            let changes = counts
+                .into_iter()
+                .map(
+                    |(key, writes)| crate::pinning::management::retirement::SourceTransition {
+                        before: scope.originals().get(&key).cloned(),
+                        after: expected.get(&key).map(|row| row.as_ref().clone()),
+                        key,
+                        writes,
+                    },
+                )
+                .collect();
+            records::finish_retirement_apply(self.tx, self.binding, changes).await?;
         }
         Ok(())
     }

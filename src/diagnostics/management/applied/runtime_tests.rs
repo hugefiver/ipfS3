@@ -1,6 +1,6 @@
 use super::*;
 use ipfs_s3_gateway::{
-    pinning::management::{db_snapshot, dry_run, evidence, local_config, wire},
+    pinning::management::{db_snapshot, dry_run, evidence, local_config},
     store::{
         self,
         entities::{
@@ -173,7 +173,7 @@ struct Fixture {
     raw: Config,
     config: ManagementConfig,
     auth: LocalAuthorization,
-    imported: ImportedPlan,
+    binding: records::ConfirmedBinding,
     job: pin_job::Model,
     outside_job: pin_job::Model,
     outside_lease: pin_lease::Model,
@@ -279,16 +279,6 @@ impl Fixture {
         )
         .await
         .unwrap();
-        let work = records::SharedDecodeBudget::default();
-        let mut document = Vec::new();
-        wire::encode_review(
-            &mut work.lock().unwrap(),
-            &binding.review(),
-            Some(&binding.confirmation.candidate_item_ids),
-            &mut document,
-        )
-        .unwrap();
-        let imported = wire::decode_review(&document, work).unwrap();
         let applied = actions::apply(&db, &config, &auth, &binding).await.unwrap();
         let job = pin_job::Entity::find_by_id(applied.items[0].jobs[0].job_id.clone())
             .one(&db)
@@ -301,7 +291,7 @@ impl Fixture {
             raw,
             config,
             auth,
-            imported,
+            binding,
             job,
             outside_job,
             outside_lease,
@@ -355,13 +345,14 @@ async fn token_drain_after_claim_loss_keeps_dispatched_submit_receipt_without_pr
         confirmed: "in-process-confirmed-document".into(),
         run: true,
     };
-    let mut work = Box::pin(execute(
+    let mut work = Box::pin(execute_bound(
         &fixture.db,
         &fixture.raw,
         &fixture.config,
         &fixture.auth,
         &command,
-        &fixture.imported,
+        &fixture.binding,
+        records::SharedDecodeBudget::default(),
         cancellation.clone(),
     ));
     tokio::select! {
@@ -401,7 +392,7 @@ async fn token_drain_after_claim_loss_keeps_dispatched_submit_receipt_without_pr
     // claim fence, not token cancellation alone, forbids live projection.
     cancellation.cancel();
     fixture.server.boundary.submit.release.add_permits(1);
-    let (result, _) = super::super::drain(&mut work, &cancellation, "signal").await;
+    let (result, _) = super::super::drain(&mut work, &cancellation, "signal", false).await;
     assert!(cancellation.is_cancelled());
     if let Err(error) = result {
         let failure = error
@@ -490,14 +481,11 @@ async fn token_drain_after_claim_loss_keeps_dispatched_submit_receipt_without_pr
             .locked_until,
         Some(replacement_claim)
     );
-    let binding =
-        records::load_confirmed_from_imported(&fixture.db, &fixture.auth, &fixture.imported)
+    let committed =
+        records::lookup_committed(&fixture.db, &fixture.auth, &fixture.binding, "object")
             .await
+            .unwrap()
             .unwrap();
-    let committed = records::lookup_committed(&fixture.db, &fixture.auth, &binding, "object")
-        .await
-        .unwrap()
-        .unwrap();
     assert_eq!(committed.receipt.job_ids, vec![fixture.job.id.clone()]);
     fixture.assert_outside_unchanged().await;
     let remote =
@@ -553,13 +541,14 @@ async fn dropping_apply_run_during_source_io_releases_owned_work_without_a_new_p
         confirmed: "in-process-confirmed-document".into(),
         run: true,
     };
-    let mut work = Box::pin(execute(
+    let mut work = Box::pin(execute_bound(
         &fixture.db,
         &fixture.raw,
         &fixture.config,
         &fixture.auth,
         &command,
-        &fixture.imported,
+        &fixture.binding,
+        records::SharedDecodeBudget::default(),
         cancellation.clone(),
     ));
     tokio::select! {
@@ -596,7 +585,23 @@ async fn dropping_apply_run_during_source_io_releases_owned_work_without_a_new_p
 struct ObservedTransaction {
     tx: DatabaseTransaction,
     calls: Arc<AtomicUsize>,
-    decode_ready: AtomicBool,
+    active: AtomicUsize,
+}
+struct ActiveSql<'a>(&'a AtomicUsize);
+impl Drop for ActiveSql<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+impl ObservedTransaction {
+    fn entered(&self) -> ActiveSql<'_> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.active.fetch_add(1, Ordering::SeqCst);
+        ActiveSql(&self.active)
+    }
+    fn awaiting_decode(&self) -> bool {
+        self.calls.load(Ordering::SeqCst) > 0 && self.active.load(Ordering::SeqCst) == 0
+    }
 }
 
 #[async_trait::async_trait]
@@ -605,35 +610,26 @@ impl ConnectionTrait for ObservedTransaction {
         self.tx.get_database_backend()
     }
     async fn execute(&self, statement: Statement) -> std::result::Result<ExecResult, DbErr> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
+        let _active = self.entered();
         self.tx.execute(statement).await
     }
     async fn execute_unprepared(&self, sql: &str) -> std::result::Result<ExecResult, DbErr> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
+        let _active = self.entered();
         self.tx.execute_unprepared(sql).await
     }
     async fn query_one(
         &self,
         statement: Statement,
     ) -> std::result::Result<Option<QueryResult>, DbErr> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
+        let _active = self.entered();
         self.tx.query_one(statement).await
     }
     async fn query_all(
         &self,
         statement: Statement,
     ) -> std::result::Result<Vec<QueryResult>, DbErr> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        let rows = self.tx.query_all(statement).await?;
-        if rows.iter().any(|row| {
-            row.try_get::<String>("", "binding").is_ok()
-                && row.try_get::<String>("", "result").is_ok()
-        }) {
-            // Complete private source delivery precedes the awaited decoder;
-            // the connection itself remains owned by the async caller.
-            self.decode_ready.store(true, Ordering::SeqCst);
-        }
-        Ok(rows)
+        let _active = self.entered();
+        self.tx.query_all(statement).await
     }
 }
 
@@ -689,7 +685,7 @@ fn cancelled_private_decode_waiter_rolls_back_and_default_runtime_has_a_finite_t
                 let observed = ObservedTransaction {
                     tx,
                     calls: calls.clone(),
-                    decode_ready: AtomicBool::new(false),
+                    active: AtomicUsize::new(0),
                 };
                 let (release_tx, release_rx) = std::sync::mpsc::channel();
                 let release = ReleaseBlocking(Some(release_tx));
@@ -704,9 +700,7 @@ fn cancelled_private_decode_waiter_rolls_back_and_default_runtime_has_a_finite_t
                     Poll::Ready(_) => {
                         panic!("authority completed before the controlled CPU boundary")
                     }
-                    Poll::Pending if observed.decode_ready.load(Ordering::SeqCst) => {
-                        Poll::Ready(())
-                    }
+                    Poll::Pending if observed.awaiting_decode() => Poll::Ready(()),
                     Poll::Pending => Poll::Pending,
                 })
                 .await;
@@ -761,7 +755,7 @@ fn cancelled_private_decode_waiter_rolls_back_and_default_runtime_has_a_finite_t
             let observed = ObservedTransaction {
                 tx,
                 calls: calls.clone(),
-                decode_ready: AtomicBool::new(false),
+                active: AtomicUsize::new(0),
             };
             let (release_tx, release_rx) = std::sync::mpsc::channel();
             let release = ReleaseBlocking(Some(release_tx));
@@ -774,7 +768,7 @@ fn cancelled_private_decode_waiter_rolls_back_and_default_runtime_has_a_finite_t
             let mut lookup = Box::pin(job_authority::lookup(&observed, &fixture.job));
             poll_fn(|context| match lookup.as_mut().poll(context) {
                 Poll::Ready(_) => panic!("authority completed before the controlled CPU boundary"),
-                Poll::Pending if observed.decode_ready.load(Ordering::SeqCst) => Poll::Ready(()),
+                Poll::Pending if observed.awaiting_decode() => Poll::Ready(()),
                 Poll::Pending => Poll::Pending,
             })
             .await;

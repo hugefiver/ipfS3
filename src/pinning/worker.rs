@@ -2,13 +2,15 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
     hash::{Hash, Hasher},
+    pin::Pin,
     sync::{Arc, Mutex as StdMutex},
     time::Duration,
 };
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use sea_orm::{
-    ColumnTrait, EntityTrait, QueryFilter, QueryOrder, TransactionTrait, sea_query::Expr,
+    ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, QueryFilter, QueryOrder,
+    TransactionTrait, sea_query::Expr,
 };
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
@@ -421,18 +423,50 @@ async fn run_worker(
     let provider_occupancy = ProviderOccupancy::default();
 
     loop {
-        tokio::select! {
+        let maintenance_due = tokio::select! {
             biased;
             _ = cancellation.cancelled() => break,
+            _ = interval.tick() => true,
             completed = in_flight.join_next_with_id(), if !in_flight.is_empty() => {
                 if let Some(completed) = completed {
                     handle_join_result(completed, &mut job_contexts, "pinning worker task failed");
                     #[cfg(test)]
                     completion.send_modify(|completed| *completed += 1);
                 }
+                false
             }
-            _ = interval.tick() => {
-                if cancellation.is_cancelled() {
+        };
+        if cancellation.is_cancelled() {
+            break;
+        }
+        while let Some(completed) = in_flight.try_join_next_with_id() {
+            handle_join_result(completed, &mut job_contexts, "pinning worker task failed");
+            #[cfg(test)]
+            completion.send_modify(|completed| *completed += 1);
+        }
+        if maintenance_due {
+            let expiry = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => break,
+                result = expire_worker_leases(&store, Utc::now()) => result,
+            };
+            if let Err(error) = expiry {
+                tracing::error!(error = %error, "pinning worker expiry failed");
+                continue;
+            }
+        }
+        for after_maintenance in [false, true] {
+            if after_maintenance {
+                if !maintenance_due {
+                    break;
+                }
+                let maintenance = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => break,
+                    result = coordinate_quota_waiters(&coordinator, &store, Utc::now()) => result,
+                };
+                if let Err(error) = maintenance {
+                    tracing::error!(error = %error, "pinning worker quota maintenance failed");
                     break;
                 }
                 while let Some(completed) = in_flight.try_join_next_with_id() {
@@ -440,60 +474,72 @@ async fn run_worker(
                     #[cfg(test)]
                     completion.send_modify(|completed| *completed += 1);
                 }
-                let available = settings.worker_concurrency.saturating_sub(in_flight.len());
-                let scan = scan_and_claim(
+            }
+            let active_job_ids = job_contexts
+                .values()
+                .map(|context| context.job_id.clone())
+                .collect::<BTreeSet<_>>();
+            let available = settings.worker_concurrency.saturating_sub(in_flight.len());
+            let scan = async {
+                let now = Utc::now();
+                let limit = u64::try_from(available).unwrap_or(u64::MAX);
+                claim_ready_jobs(
                     &coordinator,
                     &store,
                     &cancellation,
                     &provider_occupancy,
-                    Utc::now(),
-                    u64::try_from(available).unwrap_or(u64::MAX),
-                );
-                let scan_result = tokio::select! {
-                    biased;
-                    _ = cancellation.cancelled() => break,
-                    result = scan => result,
-                };
-                match scan_result {
-                    Ok(claimed) => {
-                        for job in claimed {
-                            if cancellation.is_cancelled() {
-                                break;
-                            }
-                            let coordinator = coordinator.clone();
-                            let store = store.clone();
-                            let global = global.clone();
-                            let cancellation = cancellation.clone();
-                            let context = JobLogContext::from_model(&job.model);
-                            let task_context = context.clone();
-                            let occupancy =
-                                provider_occupancy.enter(job.model.provider.clone());
-                            let handle = in_flight.spawn(async move {
-                                let _occupancy = occupancy;
-                                if let Err(error) = execute_claimed_job_with_cancellation(
-                                    &store,
-                                    &coordinator,
-                                    &global,
-                                    job,
-                                    &cancellation,
-                                )
-                                .await
-                                {
-                                    tracing::error!(
-                                        job_id = %task_context.job_id,
-                                        provider = %task_context.provider,
-                                        cid = %task_context.cid,
-                                        lease_id = ?task_context.lease_id,
-                                        target_id = ?task_context.target_id,
-                                        error = %error,
-                                        "pinning job execution failed"
-                                    );
-                                }
-                            });
-                            job_contexts.insert(handle.id(), context);
+                    &active_job_ids,
+                    now,
+                    limit,
+                )
+                .await
+            };
+            let scan_result = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => break,
+                result = scan => result,
+            };
+            match scan_result {
+                Ok(claimed) => {
+                    for job in claimed {
+                        if cancellation.is_cancelled() {
+                            break;
                         }
+                        let coordinator = coordinator.clone();
+                        let store = store.clone();
+                        let global = global.clone();
+                        let cancellation = cancellation.clone();
+                        let context = JobLogContext::from_model(&job.model);
+                        let task_context = context.clone();
+                        let occupancy = provider_occupancy.enter(job.model.provider.clone());
+                        let execution = async move {
+                            let _occupancy = occupancy;
+                            if let Err(error) = execute_claimed_job_with_cancellation(
+                                &store,
+                                &coordinator,
+                                &global,
+                                job,
+                                &cancellation,
+                            )
+                            .await
+                            {
+                                tracing::error!(
+                                    job_id = %task_context.job_id,
+                                    provider = %task_context.provider,
+                                    cid = %task_context.cid,
+                                    lease_id = ?task_context.lease_id,
+                                    target_id = ?task_context.target_id,
+                                    error = %error,
+                                    "pinning job execution failed"
+                                );
+                            }
+                        };
+                        let handle = in_flight.spawn(execution);
+                        job_contexts.insert(handle.id(), context);
                     }
-                    Err(error) => tracing::error!(error = %error, "pinning worker scan failed"),
+                }
+                Err(error) => {
+                    tracing::error!(error = %error, "pinning worker scan failed");
                 }
             }
         }
@@ -546,14 +592,7 @@ pub async fn management_tick(
     scope.report(store.db()).await
 }
 
-async fn scan_and_claim(
-    coordinator: &PinningCoordinator,
-    store: &Store,
-    cancellation: &CancellationToken,
-    provider_occupancy: &ProviderOccupancy,
-    now: DateTime<Utc>,
-    claim_limit: u64,
-) -> AppResult<Vec<ClaimedPinJob>> {
+async fn expire_worker_leases(store: &Store, now: DateTime<Utc>) -> AppResult<()> {
     let txn = store.db().begin().await?;
     let expired = leases::expire_due_leases(&txn, now).await?;
     txn.commit().await?;
@@ -563,27 +602,45 @@ async fn scan_and_claim(
             "pinning leases expired"
         );
     }
-    coordinate_quota_waiters(coordinator, store, now).await?;
+    Ok(())
+}
+
+// A completion releases capacity and can publish due failover work. Refill it
+// without waiting for the maintenance interval or rerunning global maintenance.
+async fn claim_ready_jobs(
+    coordinator: &PinningCoordinator,
+    store: &Store,
+    cancellation: &CancellationToken,
+    provider_occupancy: &ProviderOccupancy,
+    active_job_ids: &BTreeSet<String>,
+    now: DateTime<Utc>,
+    claim_limit: u64,
+) -> AppResult<Vec<ClaimedPinJob>> {
     if cancellation.is_cancelled() {
         return Ok(Vec::new());
     }
     if claim_limit == 0 {
         return Ok(Vec::new());
     }
+    #[cfg(test)]
+    tests::fail_tick_claim_once()?;
     let configured_priorities = coordinator
         .provider_limits()
         .iter()
         .map(|(provider, limits)| (provider.clone(), limits.priority))
         .collect();
     let occupancy = provider_occupancy.snapshot();
-    let claimed = jobs::claim_due_jobs_fair(
+    let claimed = jobs::claim_due_worker_jobs_fair(
         store.db(),
         now,
         coordinator.settings().lock_for,
         claim_limit,
-        &occupancy.in_flight,
-        &occupancy.last_served_ticket,
-        &configured_priorities,
+        jobs::WorkerClaimSchedule {
+            in_flight_by_provider: &occupancy.in_flight,
+            last_served_ticket_by_provider: &occupancy.last_served_ticket,
+            configured_priorities: &configured_priorities,
+            active_job_ids,
+        },
     )
     .await?;
     provider_occupancy.record_selected(claimed.iter().map(|job| job.model.provider.as_str()))?;
@@ -609,7 +666,14 @@ async fn execute_claimed_job_with_cancellation(
     cancellation: &CancellationToken,
 ) -> AppResult<()> {
     validate_operation_scope(&claimed.model)?;
-    let managed = job_authority::check_before_call(store.db(), &claimed.model).await?;
+    let admission_work = SharedDecodeBudget::default();
+    let managed = job_authority::check_before_call_with_work(
+        store.db(),
+        &claimed.model,
+        admission_work.clone(),
+    )
+    .await
+    .map_err(job_authority::safe)?;
     if let Some(JobPermit::ReadOnly(authority) | JobPermit::LedgerOnly(authority)) = &managed {
         return execute_management_observation(
             store,
@@ -626,10 +690,32 @@ async fn execute_claimed_job_with_cancellation(
     } else {
         None
     };
+    let legacy_admission =
+        if managed.is_none() && point_route.is_none() && claimed.model.operation != "submit" {
+            let result = crate::store::pinning::ledger::job_io_and_route_with_work(
+                store.db(),
+                &claimed.model,
+                coordinator.provider_identity(&claimed.model.provider),
+                crate::store::pinning::management::records::DecodeWork::shared(&admission_work),
+            )
+            .await?;
+            Some(result)
+        } else {
+            None
+        };
     if managed.is_none()
         && point_route.is_none()
-        && !crate::store::pinning::legacy_migration::job_io_allowed(store.db(), &claimed.model)
-            .await?
+        && !if let Some(result) = legacy_admission {
+            result != crate::store::pinning::ledger::JobAdmission::IoDenied
+        } else {
+            crate::store::pinning::legacy_migration::job_io_allowed_with_work(
+                store.db(),
+                &claimed.model,
+                crate::store::pinning::management::records::DecodeWork::shared(&admission_work),
+            )
+            .await
+            .map_err(admission::work_error)?
+        }
     {
         let txn = store.db().begin().await?;
         jobs::park_identity_job(&txn, &claimed).await?;
@@ -656,12 +742,10 @@ async fn execute_claimed_job_with_cancellation(
         )
         .await?
     } else {
-        crate::store::pinning::ledger::job_route_matches(
-            store.db(),
-            &claimed.model,
-            coordinator.provider_identity(&claimed.model.provider),
+        matches!(
+            legacy_admission,
+            Some(crate::store::pinning::ledger::JobAdmission::Allowed)
         )
-        .await?
     };
     if !route_valid
         || (managed.is_none()
@@ -707,14 +791,52 @@ async fn execute_claimed_job_with_cancellation(
     {
         return handle_unavailable_provider(store, coordinator, &claimed).await;
     }
+    operation_future(store, coordinator, global, claimed, cancellation).await
+}
+
+// Construct each operation outside the admission poll frame.
+fn operation_future<'a>(
+    store: &'a Store,
+    coordinator: &'a PinningCoordinator,
+    global: &'a Arc<Semaphore>,
+    claimed: ClaimedPinJob,
+    cancellation: &'a CancellationToken,
+) -> Pin<Box<dyn Future<Output = AppResult<()>> + Send + 'a>> {
     match claimed.model.operation.as_str() {
-        "submit" => execute_submit(store, coordinator, global, claimed, cancellation).await,
-        "poll" => execute_poll(store, coordinator, global, claimed, cancellation).await,
-        "unpin" => execute_unpin(store, coordinator, global, claimed, cancellation).await,
-        "reconcile" => execute_reconcile(store, coordinator, global, claimed, cancellation).await,
-        operation => Err(AppError::Internal(format!(
-            "unknown pin job operation: {operation}"
-        ))),
+        "submit" => Box::pin(execute_submit(
+            store,
+            coordinator,
+            global,
+            claimed,
+            cancellation,
+        )),
+        "poll" => Box::pin(execute_poll(
+            store,
+            coordinator,
+            global,
+            claimed,
+            cancellation,
+        )),
+        "unpin" => Box::pin(execute_unpin(
+            store,
+            coordinator,
+            global,
+            claimed,
+            cancellation,
+        )),
+        "reconcile" => Box::pin(execute_reconcile(
+            store,
+            coordinator,
+            global,
+            claimed,
+            cancellation,
+        )),
+        _ => Box::pin(async move {
+            Err(AppError::Internal(format!(
+                "unknown pin job operation: {}",
+                claimed.model.operation
+            )))
+        }),
     }
 }
 
@@ -880,6 +1002,9 @@ async fn read_context_for_job_with_work<'a>(
     job: &pin_job::Model,
     work: crate::store::pinning::management::records::SharedDecodeBudget,
 ) -> AppResult<Option<CurrentReadContext<'a>>> {
+    if coordinator.management_source().is_none() {
+        return Ok(None);
+    }
     if job_authority::lookup_with_work(store.db(), job, work.clone())
         .await
         .map_err(job_authority::safe)?
@@ -1025,26 +1150,42 @@ async fn execute_submit(
     claimed: ClaimedPinJob,
     cancellation: &CancellationToken,
 ) -> AppResult<()> {
-    let Some(observed) = Box::pin(dispatch_submit(
+    // Recovery runs after either submission phase has relinquished its async state.
+    let mut claimed =
+        if claimed.reclaimed || claimed.model.submit_phase.as_deref() == Some("recovering") {
+            claimed
+        } else {
+            let Some(observed) = Box::pin(dispatch_submit(
+                store,
+                coordinator,
+                global,
+                claimed,
+                cancellation,
+            ))
+            .await?
+            else {
+                return Ok(());
+            };
+            let Some(claimed) = Box::pin(finish_submit_observation(
+                store,
+                coordinator,
+                observed.claimed,
+                observed.observation,
+                observed.capture,
+                observed.rpc_invocation,
+            ))
+            .await?
+            else {
+                return Ok(());
+            };
+            claimed
+        };
+    Box::pin(recover_submit(
         store,
         coordinator,
         global,
-        claimed,
+        &mut claimed,
         cancellation,
-    ))
-    .await?
-    else {
-        return Ok(());
-    };
-    Box::pin(finish_submit_observation(
-        store,
-        coordinator,
-        global,
-        observed.claimed,
-        cancellation,
-        observed.observation,
-        observed.capture,
-        observed.rpc_invocation,
     ))
     .await
 }
@@ -1063,12 +1204,6 @@ async fn dispatch_submit(
     mut claimed: ClaimedPinJob,
     cancellation: &CancellationToken,
 ) -> AppResult<Option<SubmitDispatch>> {
-    if claimed.reclaimed || claimed.model.submit_phase.as_deref() == Some("recovering") {
-        return recover_submit(store, coordinator, global, &mut claimed, cancellation)
-            .await
-            .map(|_| None);
-    }
-
     if let Some(history) = jobs::submission_history(store.db(), &claimed.model.id).await? {
         let route = coordinator
             .provider(&claimed.model.provider)
@@ -1123,6 +1258,7 @@ async fn dispatch_submit(
     let txn = store.db().begin().await?;
     job_authority::lock_source_in_transaction_with_work(&txn, &claimed.model, work.clone()).await?;
     leases::lock_submit_admission_frontier(&txn, &claimed.model).await?;
+    job_authority::fence_worker_authority_with_work(&txn, &claimed.model, work.clone()).await?;
     if !admission::managed_call_allowed_with_work(
         &txn,
         &claimed.model,
@@ -1148,8 +1284,7 @@ async fn dispatch_submit(
     let mut rpc_invocation = None;
     if decision == SubmitCallDecision::ReadyToCall {
         let (api, strategy) = slot.provider.invocation_route();
-        let history = jobs::submission_history(&txn, &claimed.model.id).await?;
-        jobs::record_submit_invocation_with_work(
+        let history = jobs::record_submit_invocation_with_work(
             &txn,
             &claimed,
             api,
@@ -1295,17 +1430,30 @@ async fn dispatch_submit(
     }))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static RPC_RECEIPT_COMMITTED: (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
+}
+
+#[cfg(test)]
+pub(crate) async fn finish_rpc_observation_for_test(
+    store: &Store,
+    coordinator: &PinningCoordinator,
+    claimed: ClaimedPinJob,
+    result: crate::pinning::provider::SubmitObservation,
+    id: String,
+) -> AppResult<Option<ClaimedPinJob>> {
+    finish_submit_observation(store, coordinator, claimed, result, None, Some(id)).await
+}
+
 async fn finish_submit_observation(
     store: &Store,
     coordinator: &PinningCoordinator,
-    global: &Arc<Semaphore>,
-    mut claimed: ClaimedPinJob,
-    cancellation: &CancellationToken,
+    claimed: ClaimedPinJob,
     result: crate::pinning::provider::SubmitObservation,
     capture: Option<job_authority::InvocationCapture>,
     rpc_invocation: Option<String>,
-) -> AppResult<()> {
+) -> AppResult<Option<ClaimedPinJob>> {
     if let Some(capture) = &capture {
         let tx = store.db().begin().await?;
         capture.append_submit(&tx, &result, Utc::now()).await?;
@@ -1331,10 +1479,19 @@ async fn finish_submit_observation(
             && !definitely_not_submitted
             && !matches!(evidence.outcome.as_str(), "matched" | "accepted")
         {
+            #[cfg(test)]
+            if let Ok((committed, resume)) = RPC_RECEIPT_COMMITTED.try_with(Clone::clone) {
+                committed.notify_one();
+                resume.notified().await;
+            }
             let txn = store.db().begin().await?;
-            if !jobs::fence_job_claim(&txn, &claimed.model.id, claimed_lock(&claimed)?).await? {
+            // The receipt commit releases its lifecycle locks. Projection needs
+            // its own lease → target fence before the job/history/ledger tail.
+            if !ledger::submission::lock_receipt_lifecycle(&txn, &claimed.model, Utc::now()).await?
+                || !jobs::fence_job_claim(&txn, &claimed.model.id, claimed_lock(&claimed)?).await?
+            {
                 txn.rollback().await?;
-                return Ok(());
+                return Ok(None);
             }
             leases::mark_all_mode_target_degraded_for_retry(&txn, &claimed.model, Utc::now())
                 .await?;
@@ -1364,11 +1521,13 @@ async fn finish_submit_observation(
             || (!definitely_not_submitted
                 && !matches!(evidence.outcome.as_str(), "matched" | "accepted"))
         {
-            return Ok(());
+            return Ok(None);
         }
     }
     if !can_project_source {
-        return jobs::finish_nonprojecting_job(store.db(), &claimed, true, Utc::now()).await;
+        return jobs::finish_nonprojecting_job(store.db(), &claimed, true, Utc::now())
+            .await
+            .map(|_| None);
     }
     let safe_error = result
         .result
@@ -1392,14 +1551,15 @@ async fn finish_submit_observation(
                 Some(&typed),
             )
             .await
+            .map(|_| None)
         }
         Ok(_) => {
             mark_runtime_degraded(coordinator, &claimed.model.provider).await;
             let error = protocol_error();
             if !mark_submit_recovering(store, &claimed, &error).await? {
-                return Ok(());
+                return Ok(None);
             }
-            recover_submit(store, coordinator, global, &mut claimed, cancellation).await
+            Ok(Some(claimed))
         }
         Err(error) => {
             if definitely_not_submitted {
@@ -1449,10 +1609,10 @@ async fn finish_submit_observation(
                 if !evicted.is_empty() {
                     coordinate_quota_evicted_one_targets(store, coordinator, &evicted, now).await?;
                 }
-                return Ok(());
+                return Ok(None);
             }
             if !mark_submit_recovering(store, &claimed, &error).await? {
-                return Ok(());
+                return Ok(None);
             }
             if matches!(
                 error.class,
@@ -1460,9 +1620,11 @@ async fn finish_submit_observation(
                     | ProviderErrorClass::Transient
                     | ProviderErrorClass::Protocol
             ) {
-                recover_submit(store, coordinator, global, &mut claimed, cancellation).await
+                Ok(Some(claimed))
             } else {
-                retry_submit_recovery(store, coordinator, &claimed, &error).await
+                retry_submit_recovery(store, coordinator, &claimed, &error)
+                    .await
+                    .map(|_| None)
             }
         }
     }
@@ -2239,19 +2401,6 @@ async fn persist_typed_observation_status_phase(
         job_authority::lock_source_in_transaction_with_work(&txn, &claimed.model, work.clone())
             .await?;
     }
-    if !job_authority::projection_allowed_with_work(&txn, &claimed.model, work.clone()).await?
-        || !fresh_source_allowed_with_work(
-            &txn,
-            &claimed.model,
-            source_context.as_ref(),
-            work.clone(),
-        )
-        .await?
-    {
-        jobs::finish_nonprojecting_job(&txn, claimed, true, observation_time).await?;
-        txn.commit().await?;
-        return Ok(PersistObservationResult::StaleClaim);
-    }
     let cluster = crate::store::entities::pin_replica_observation::receipt::is_cluster(
         &txn,
         &claimed.model.id,
@@ -2265,14 +2414,26 @@ async fn persist_typed_observation_status_phase(
         // A failed PG predicate does not lock the newer job. Always serialize
         // receipt appends job -> history -> lifecycle frontier -> remote.
         jobs::lock_submit_receipt(&txn, &claimed.model.id).await?;
-        // Acquire the established lease -> complete target frontier -> remote
-        // order before appending facts and projecting in this same claim txn.
-        leases::lock_replica_observation_lifecycle(
-            &txn,
-            &claimed.model.provider,
-            &claimed.model.cid,
+    }
+    // Job/source -> history -> lease/complete target frontier/remote -> authority
+    // tail fence. The same snapshot covers readonly and projecting completions.
+    let lifecycle = leases::lock_worker_observation_lifecycle(&txn, &claimed.model).await?;
+    let authority =
+        job_authority::fence_worker_authority_with_work(&txn, &claimed.model, work).await?;
+    if !authority
+        .projection_and_source_allowed(
+            source_context.as_ref().map(CurrentReadContext::config),
+            source_context
+                .as_ref()
+                .map(|context| context.idle_timeout_millis),
         )
-        .await?;
+        .await?
+    {
+        jobs::finish_nonprojecting_job(&txn, claimed, true, observation_time).await?;
+        txn.commit().await?;
+        return Ok(PersistObservationResult::StaleClaim);
+    }
+    if cluster {
         let complete = if let Some(typed) = typed {
             let receipt = crate::store::entities::pin_replica_observation::receipt::append(
                 &txn,
@@ -2302,11 +2463,7 @@ async fn persist_typed_observation_status_phase(
         };
         observation_status = update.status;
     }
-    let result = if claimed.model.operation == "reconcile" {
-        leases::apply_claimed_reconcile_remote_status(&txn, update, &claimed.model).await?
-    } else {
-        leases::apply_claimed_worker_remote_status(&txn, update, &claimed.model).await?
-    };
+    let result = lifecycle.apply(update, &authority).await?;
     if source == ObservationSource::ProviderObserved
         && let RemoteStatusApplyResult::Applied { ref affected, .. } = result
     {
@@ -2325,7 +2482,15 @@ async fn persist_typed_observation_status_phase(
         .await?;
         ledger::submission::settle_matching(&txn, &claimed.model).await?;
     }
-    if !fresh_source_allowed_with_work(&txn, &claimed.model, source_context.as_ref(), work).await? {
+    if !authority
+        .fresh_source_allowed(
+            source_context.as_ref().map(CurrentReadContext::config),
+            source_context
+                .as_ref()
+                .map(|context| context.idle_timeout_millis),
+        )
+        .await?
+    {
         txn.rollback().await?;
         jobs::finish_nonprojecting_job(store.db(), claimed, true, Utc::now()).await?;
         return Ok(PersistObservationResult::StaleClaim);
@@ -2594,9 +2759,8 @@ async fn execute_reconcile(
     claimed: ClaimedPinJob,
     cancellation: &CancellationToken,
 ) -> AppResult<()> {
-    if let Some(JobPermit::ReadOnly(authority) | JobPermit::LedgerOnly(authority)) =
-        job_authority::check_before_call(store.db(), &claimed.model).await?
-    {
+    let managed = job_authority::check_before_call(store.db(), &claimed.model).await?;
+    if let Some(JobPermit::ReadOnly(authority) | JobPermit::LedgerOnly(authority)) = managed {
         return execute_management_observation(
             store,
             coordinator,
@@ -2611,10 +2775,10 @@ async fn execute_reconcile(
         .model
         .expected_remote_epoch
         .expect("validated scope");
-    let Some(snapshot) =
+    let snapshot =
         leases::remote_work_snapshot(store.db(), &claimed.model.provider, &claimed.model.cid)
-            .await?
-    else {
+            .await?;
+    let Some(snapshot) = snapshot else {
         complete_claimed_if_live(store.db(), &claimed, Utc::now()).await?;
         return Ok(());
     };
@@ -2833,13 +2997,13 @@ async fn reconcile_failed(
     mut claimed: ClaimedPinJob,
     cancellation: &CancellationToken,
 ) -> AppResult<()> {
-    if !crate::store::pinning::ledger::cleanup_allowed(
+    let cleanup = crate::store::pinning::ledger::cleanup_allowed(
         store.db(),
         &claimed.model.provider,
         &claimed.model.cid,
     )
-    .await?
-    {
+    .await?;
+    if !cleanup {
         let txn = store.db().begin().await?;
         if jobs::fence_job_claim(&txn, &claimed.model.id, claimed_lock(&claimed)?).await? {
             crate::store::pinning::ledger::mark_effect(
@@ -2869,7 +3033,7 @@ async fn reconcile_failed(
         .as_deref()
         .unwrap_or("remote pin failed");
 
-    let applied = match persist_observation_status_phase(
+    let status_phase = persist_observation_status_phase(
         store,
         coordinator,
         &claimed,
@@ -2885,8 +3049,8 @@ async fn reconcile_failed(
         },
         ObservationSource::PersistedReplay,
     )
-    .await?
-    {
+    .await?;
+    let applied = match status_phase {
         PersistObservationResult::Applied(applied) => applied,
         PersistObservationResult::StaleClaim => {
             transition(
@@ -3783,6 +3947,7 @@ async fn capture_managed_invocation(
             .await?;
         leases::lock_submit_admission_frontier(&tx, &claimed.model).await?;
     }
+    job_authority::fence_worker_authority_with_work(&tx, &claimed.model, work.clone()).await?;
     if !admission::managed_call_allowed_with_work(&tx, &claimed.model, managed_call, work.clone())
         .await?
         || matches!(managed_call, ManagedCall::Submit)
@@ -3851,7 +4016,8 @@ where
     Fut: Future<Output = Result<T, ProviderError>>,
 {
     renew_claim_once(store, claimed, lock_for).await?;
-    if !admission::managed_call_allowed(store.db(), &claimed.model, managed_call).await? {
+    let allowed = admission::managed_call_allowed(store.db(), &claimed.model, managed_call).await?;
+    if !allowed {
         return Ok(ProviderCallOutcome::PreflightRejected);
     }
     let rate_lock = slot.runtime.next_request_at.clone().lock_owned();
@@ -4409,6 +4575,8 @@ async fn coordinate_quota_waiters(
     store: &Store,
     now: DateTime<Utc>,
 ) -> AppResult<()> {
+    #[cfg(test)]
+    tests::pause_tick_quota_maintenance().await;
     recover_quota_evicted_one_targets(store, coordinator, now).await?;
     let retry_delay = chrono_duration(coordinator.settings().interval)?;
     let providers = coordinator
@@ -4417,6 +4585,19 @@ async fn coordinate_quota_waiters(
         .map(|(provider, limits)| (provider.clone(), limits.clone()))
         .collect::<Vec<_>>();
     for (provider, limits) in providers {
+        let target_table = if store.db().get_database_backend() == DatabaseBackend::Sqlite {
+            "main.pin_lease_targets"
+        } else {
+            "pin_lease_targets"
+        };
+        if store.db().query_one(sea_orm::Statement::from_sql_and_values(
+            store.db().get_database_backend(),
+            format!("SELECT 1 FROM {target_table} WHERE provider=$1 AND state IN ('quota_waiting','evicted') LIMIT 1"),
+            [provider.clone().into()],
+        )).await?.is_none()
+        {
+            continue;
+        }
         // A permanently closed waiter is not capacity pressure or permission to
         // evict existing references. Do not let it poison unrelated queue scans.
         if provider_domain_closed(store, &provider).await? {
@@ -4445,6 +4626,8 @@ async fn coordinate_quota_waiters(
         txn.commit().await?;
         coordinate_quota_evicted_one_targets(store, coordinator, &evicted, now).await?;
     }
+    #[cfg(test)]
+    tests::notify_tick_quota_completed();
     Ok(())
 }
 
@@ -4628,6 +4811,141 @@ fn audit_follow_up_failure(claimed: &ClaimedPinJob, phase: &str, error: &AppErro
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
+mod completion_postgres_fixture {
+    use crate::stage7_management_test_support::base as foundation;
+
+    include!("../../tests/support/stage7_management_apply_postgres_body.rs");
+}
+
+#[cfg(test)]
+#[tokio::test]
+#[ignore = "requires parent-selected empty exclusive Stage7 PostgreSQL schema"]
+async fn postgres_completion_rejects_an_interleaved_authority_mutation() {
+    use futures_util::FutureExt;
+    use sea_orm::{ConnectionTrait, EntityTrait, Statement};
+    let fixture = Box::pin(completion_postgres_fixture::Fixture::new()).await;
+    let result = std::panic::AssertUnwindSafe(Box::pin(async {
+        let identity = Box::pin(fixture.prepared_object("completion-authority")).await;
+        let request = fixture.create_request(identity);
+        let binding = Box::pin(fixture.confirm(&request)).await;
+        let applied = Box::pin(crate::store::pinning::management::actions::apply(
+            &fixture.db,
+            &fixture.config,
+            &fixture.auth,
+            &binding,
+        ))
+        .await
+        .unwrap();
+        let seed = &applied.items[0].jobs[0];
+        let now = crate::store::database_clock::database_now(&fixture.db)
+            .await
+            .unwrap();
+        let claimed = jobs::claim_due_jobs(&fixture.db, now, chrono::Duration::minutes(1), 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(claimed.model.id, seed.job_id);
+        let before = crate::store::entities::remote_pin::Entity::find_by_id((
+            seed.provider.clone(),
+            seed.cid.clone(),
+        ))
+        .one(&fixture.db)
+        .await
+        .unwrap()
+        .unwrap();
+        let coordinator = PinningCoordinator::build_with_kubo(
+            fixture.config.pinning.clone(),
+            Some(crate::kubo::KuboClient::new(fixture.server.uri())),
+        )
+        .unwrap();
+        let store = Store::new(fixture.db.clone());
+        let work = SharedDecodeBudget::default();
+        let context =
+            read_context_for_job_with_work(&store, &coordinator, &claimed.model, work.clone())
+                .await
+                .unwrap();
+        assert!(
+            job_authority::projection_allowed_with_work(&fixture.db, &claimed.model, work.clone())
+                .await
+                .unwrap()
+        );
+        assert!(
+            fresh_source_allowed_with_work(&fixture.db, &claimed.model, context.as_ref(), work)
+                .await
+                .unwrap()
+        );
+        let key = crate::store::pinning::management::native::NativeKey {
+            table: "pin_management_records".into(),
+            values: vec![
+                fixture.auth.database_scope().into(),
+                request.plan_id.clone(),
+                request.items[0].item_id.clone(),
+                "action".into(),
+            ],
+        };
+        let writer = fixture.writer.begin().await.unwrap();
+        writer
+            .execute(Statement::from_sql_and_values(
+                writer.get_database_backend(),
+                "DELETE FROM pin_management_locator WHERE source_key=$1 AND selector_kind='job'",
+                [
+                    crate::store::pinning::management::records::locator::source_key(&key)
+                        .unwrap()
+                        .into(),
+                ],
+            ))
+            .await
+            .unwrap();
+        let result = Box::pin(persist_typed_observation_status_phase(
+            &store,
+            &coordinator,
+            &claimed,
+            RemoteStatusUpdate {
+                provider: &seed.provider,
+                cid: &seed.cid,
+                request_id: "completion-request",
+                origin: RemoteStatusOrigin::ExistingRequest,
+                status: RemotePinStatus::Pinned,
+                error_class: None,
+                error_text: None,
+                now,
+            },
+            ObservationSource::PersistedReplay,
+            None,
+        ))
+        .await;
+        assert!(
+            result.is_err(),
+            "uncommitted authority mutation must prevent completion, not project from an older meet"
+        );
+        writer.rollback().await.unwrap();
+        let after = crate::store::entities::remote_pin::Entity::find_by_id((
+            seed.provider.clone(),
+            seed.cid.clone(),
+        ))
+        .one(&fixture.db)
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(before, after);
+        assert!(
+            job_authority::lookup(&fixture.db, &claimed.model)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }))
+    .catch_unwind()
+    .await;
+    fixture.close().await;
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::{
         collections::{BTreeSet, HashMap, VecDeque},
@@ -4661,6 +4979,32 @@ mod tests {
             pinning::{jobs, leases},
         },
     };
+
+    // A live blocking task inhibits auto-advance. The sole sender also releases
+    // it on test unwind, without requiring the async finish path to run.
+    struct PausedClockHold {
+        release: std::sync::mpsc::Sender<()>,
+        join: tokio::task::JoinHandle<()>,
+    }
+
+    impl PausedClockHold {
+        async fn start() -> Self {
+            let (release, receiver) = std::sync::mpsc::channel::<()>();
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let join = tokio::task::spawn_blocking(move || {
+                let _ = started.send(());
+                let _ = receiver.recv();
+            });
+            let hold = Self { release, join };
+            ready.await.expect("paused clock holder did not start");
+            hold
+        }
+
+        async fn finish(self) {
+            drop(self.release);
+            self.join.await.expect("paused clock holder panicked");
+        }
+    }
 
     enum Script {
         Submit(Result<RemotePin, ProviderError>),
@@ -4886,23 +5230,32 @@ mod tests {
     static SHUTDOWN_PAUSED_CLOCK_TEST_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
-    // Keep SQLite reply waits runnable without auto-advancing paused Tokio timers.
-    // Progress remains bounded by the real wall clock, not the paused clock.
+    // A blocking deadline inhibits paused-clock auto-advance without polling
+    // pending SQLite replies. Dropping the sender also releases it on unwind.
     async fn before_wall_deadline<F: std::future::Future>(
         deadline: std::time::Instant,
         future: F,
     ) -> Option<F::Output> {
-        tokio::pin!(future);
-        loop {
-            tokio::select! {
-                biased;
-                output = &mut future => return Some(output),
-                _ = tokio::task::yield_now() => {},
-            }
-            if std::time::Instant::now() >= deadline {
-                return None;
-            }
+        if std::time::Instant::now() >= deadline {
+            return None;
         }
+        let (release, receiver) = std::sync::mpsc::channel::<()>();
+        let mut wait = tokio::task::spawn_blocking(move || {
+            let _ = receiver
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
+        });
+        let output = tokio::select! {
+            biased;
+            output = future => Some(output),
+            result = &mut wait => {
+                result.expect("wall-clock deadline task panicked");
+                return None;
+            },
+        };
+        let completed_in_time = std::time::Instant::now() < deadline;
+        drop(release);
+        wait.await.expect("wall-clock deadline task panicked");
+        output.filter(|_| completed_in_time)
     }
 
     async fn fixture(scripts: impl IntoIterator<Item = Script>) -> Fixture {
@@ -4914,7 +5267,9 @@ mod tests {
         max_bytes: u64,
         max_pins: u64,
     ) -> Fixture {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let mut options = sea_orm::ConnectOptions::new("sqlite::memory:");
+        options.test_before_acquire(false);
+        let db = Database::connect(options).await.unwrap();
         fixture_with_database(scripts, db, max_bytes, max_pins, None, "1s").await
     }
 
@@ -5381,46 +5736,53 @@ mod tests {
             .unwrap();
         }
 
-        async fn run_one_due(&self) {
-            let due = pin_job::Entity::find()
-                .filter(pin_job::Column::State.eq("pending"))
-                .order_by_asc(pin_job::Column::NextAttemptAt)
-                .one(self.store.db())
-                .await
-                .unwrap()
-                .expect("expected pending job")
-                .next_attempt_at;
-            let claimed =
-                jobs::claim_due_jobs(self.store.db(), due, chrono::Duration::seconds(30), 1)
+        fn run_one_due(&self) -> impl std::future::Future<Output = ()> + '_ {
+            Box::pin(async move {
+                let due = pin_job::Entity::find()
+                    .filter(pin_job::Column::State.eq("pending"))
+                    .order_by_asc(pin_job::Column::NextAttemptAt)
+                    .one(self.store.db())
                     .await
                     .unwrap()
-                    .pop()
-                    .expect("expected claimed job");
-            super::execute_claimed_job(
-                &self.store,
-                &self.coordinator,
-                &Arc::new(Semaphore::new(2)),
-                claimed,
-            )
-            .await
-            .unwrap();
+                    .expect("expected pending job")
+                    .next_attempt_at;
+                let claimed =
+                    jobs::claim_due_jobs(self.store.db(), due, chrono::Duration::seconds(30), 1)
+                        .await
+                        .unwrap()
+                        .pop()
+                        .expect("expected claimed job");
+                super::execute_claimed_job(
+                    &self.store,
+                    &self.coordinator,
+                    &Arc::new(Semaphore::new(2)),
+                    claimed,
+                )
+                .await
+                .unwrap();
+            })
         }
 
-        async fn run_claim_at(&self, now: chrono::DateTime<Utc>) {
-            let claimed =
-                jobs::claim_due_jobs(self.store.db(), now, chrono::Duration::seconds(30), 1)
-                    .await
-                    .unwrap()
-                    .pop()
-                    .expect("expected claimed job");
-            super::execute_claimed_job(
-                &self.store,
-                &self.coordinator,
-                &Arc::new(Semaphore::new(2)),
-                claimed,
-            )
-            .await
-            .unwrap();
+        fn run_claim_at(
+            &self,
+            now: chrono::DateTime<Utc>,
+        ) -> impl std::future::Future<Output = ()> + '_ {
+            Box::pin(async move {
+                let claimed =
+                    jobs::claim_due_jobs(self.store.db(), now, chrono::Duration::seconds(30), 1)
+                        .await
+                        .unwrap()
+                        .pop()
+                        .expect("expected claimed job");
+                super::execute_claimed_job(
+                    &self.store,
+                    &self.coordinator,
+                    &Arc::new(Semaphore::new(2)),
+                    claimed,
+                )
+                .await
+                .unwrap();
+            })
         }
 
         async fn seed_poll(&self, suffix: &str, due: chrono::DateTime<Utc>) -> String {
@@ -5469,6 +5831,280 @@ mod tests {
                 .unwrap();
             id
         }
+    }
+
+    struct TickQuotaGate {
+        pause_on_call: usize,
+        quota_calls: AtomicUsize,
+        arrived: Notify,
+        resume: Notify,
+        completed: Notify,
+        fail_claim_once: std::sync::atomic::AtomicBool,
+        claim_failures: AtomicUsize,
+    }
+
+    tokio::task_local! {
+        static TICK_QUOTA_GATE: Arc<TickQuotaGate>;
+    }
+
+    impl TickQuotaGate {
+        fn new(pause_on_call: usize, fail_claim_once: bool) -> Arc<Self> {
+            Arc::new(Self {
+                pause_on_call,
+                quota_calls: AtomicUsize::new(0),
+                arrived: Notify::new(),
+                resume: Notify::new(),
+                completed: Notify::new(),
+                fail_claim_once: std::sync::atomic::AtomicBool::new(fail_claim_once),
+                claim_failures: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    pub(super) async fn pause_tick_quota_maintenance() {
+        let Ok(gate) = TICK_QUOTA_GATE.try_with(Arc::clone) else {
+            return;
+        };
+        if gate.quota_calls.fetch_add(1, Ordering::SeqCst) + 1 == gate.pause_on_call {
+            gate.arrived.notify_one();
+            gate.resume.notified().await;
+        }
+    }
+
+    pub(super) fn notify_tick_quota_completed() {
+        let _ = TICK_QUOTA_GATE.try_with(|gate| gate.completed.notify_one());
+    }
+
+    pub(super) fn fail_tick_claim_once() -> crate::error::AppResult<()> {
+        if TICK_QUOTA_GATE
+            .try_with(|gate| {
+                if gate.fail_claim_once.swap(false, Ordering::SeqCst) {
+                    gate.claim_failures.fetch_add(1, Ordering::SeqCst);
+                    true
+                } else {
+                    false
+                }
+            })
+            .unwrap_or(false)
+        {
+            return Err(crate::error::AppError::Database(
+                "test tick claim failure".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn start_tick_gated_worker(
+        fixture: &Fixture,
+        gate: Arc<TickQuotaGate>,
+    ) -> super::PinningWorkerHandle {
+        let cancellation = CancellationToken::new();
+        let (completion, completed) = tokio::sync::watch::channel(0);
+        let execution = super::run_worker(
+            fixture.coordinator.clone(),
+            Arc::new(fixture.store.clone()),
+            cancellation.clone(),
+            completion,
+        );
+        let join = tokio::spawn(TICK_QUOTA_GATE.scope(gate, execution));
+        super::PinningWorkerHandle {
+            cancellation,
+            join,
+            completed,
+        }
+    }
+
+    async fn tick_progress(future: impl std::future::Future<Output = ()>, message: &str) {
+        before_wall_deadline(
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+            future,
+        )
+        .await
+        .expect(message);
+    }
+
+    async fn tick_waiter_state(fixture: &Fixture, suffix: &str) -> String {
+        pin_lease_target::Entity::find_by_id(format!("target-{suffix}"))
+            .one(fixture.store.db())
+            .await
+            .unwrap()
+            .unwrap()
+            .state
+    }
+
+    #[tokio::test]
+    async fn tick_dispatches_due_work_after_expiry_commit_before_blocked_quota_maintenance() {
+        let blocker = Arc::new(GetBlocker {
+            entered: Notify::new(),
+            release: Notify::new(),
+            result: remote_for(
+                "bafy-tick-valid",
+                "request-tick-valid",
+                RemotePinStatus::Queued,
+            ),
+        });
+        let mut fixture = fixture([Script::BlockGet(blocker.clone())]).await;
+        PinningCoordinator::configure_worker_for_test(&mut fixture.coordinator, |settings| {
+            settings.interval = std::time::Duration::from_secs(3600);
+        });
+        let due = Utc::now() - chrono::Duration::seconds(1);
+        let expired_job = fixture.seed_poll("tick-expired", due).await;
+        fixture.seed_poll("tick-valid", due).await;
+        fixture
+            .seed_quota_waiter("bafy-tick-waiter", "tick-waiter", 100)
+            .await;
+        fixture
+            .store
+            .db()
+            .execute_unprepared(&format!(
+                "UPDATE pin_leases SET expires_at='{}' WHERE id='lease-tick-expired'",
+                due.to_rfc3339(),
+            ))
+            .await
+            .unwrap();
+        let gate = TickQuotaGate::new(1, false);
+        let handle = start_tick_gated_worker(&fixture, gate.clone());
+        tick_progress(gate.arrived.notified(), "quota maintenance did not arrive").await;
+
+        // Reading and committing a write while the gate is held proves expiry
+        // committed and maintenance is not holding the SQLite transaction lock.
+        let txn = fixture.store.db().begin().await.unwrap();
+        let expired = pin_lease::Entity::find_by_id("lease-tick-expired")
+            .one(&txn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(expired.state, "expired");
+        txn.execute_unprepared(
+            "UPDATE pin_leases SET last_touched_at=last_touched_at WHERE id='lease-1'",
+        )
+        .await
+        .unwrap();
+        txn.commit().await.unwrap();
+        assert_eq!(
+            tick_waiter_state(&fixture, "tick-waiter").await,
+            "quota_waiting"
+        );
+        tick_progress(
+            blocker.entered.notified(),
+            "due job waited for blocked quota maintenance",
+        )
+        .await;
+        let expired = pin_job::Entity::find_by_id(expired_job)
+            .one(fixture.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(expired.state, "running");
+        assert!(fixture.provider.submitted.lock().await.is_empty());
+        assert_eq!(fixture.provider.gets.load(Ordering::SeqCst), 1);
+
+        gate.resume.notify_one();
+        tick_progress(
+            gate.completed.notified(),
+            "quota maintenance did not finish",
+        )
+        .await;
+        assert_eq!(tick_waiter_state(&fixture, "tick-waiter").await, "waiting");
+        handle.shutdown(std::time::Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn tick_first_claim_failure_still_runs_quota_maintenance() {
+        let mut fixture = fixture([]).await;
+        PinningCoordinator::configure_worker_for_test(&mut fixture.coordinator, |settings| {
+            settings.interval = std::time::Duration::from_secs(3600);
+        });
+        fixture
+            .seed_quota_waiter("bafy-tick-failed-claim", "tick-failed-claim", 100)
+            .await;
+        let gate = TickQuotaGate::new(1, true);
+        let handle = start_tick_gated_worker(&fixture, gate.clone());
+        tick_progress(
+            gate.arrived.notified(),
+            "failed claim starved quota maintenance",
+        )
+        .await;
+        assert_eq!(gate.claim_failures.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            tick_waiter_state(&fixture, "tick-failed-claim").await,
+            "quota_waiting"
+        );
+        gate.resume.notify_one();
+        tick_progress(
+            gate.completed.notified(),
+            "failed claim prevented quota maintenance",
+        )
+        .await;
+        assert_eq!(
+            tick_waiter_state(&fixture, "tick-failed-claim").await,
+            "waiting"
+        );
+        handle.shutdown(std::time::Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn tick_full_capacity_still_runs_quota_maintenance() {
+        let blocker = Arc::new(GetBlocker {
+            entered: Notify::new(),
+            release: Notify::new(),
+            result: remote_for(
+                "bafy-tick-full",
+                "request-tick-full",
+                RemotePinStatus::Queued,
+            ),
+        });
+        let mut fixture = fixture([Script::BlockGet(blocker.clone())]).await;
+        PinningCoordinator::configure_worker_for_test(&mut fixture.coordinator, |settings| {
+            settings.interval = std::time::Duration::from_secs(1);
+            settings.worker_concurrency = 1;
+        });
+        let job_id = fixture.seed_poll("tick-full", Utc::now()).await;
+        tokio::time::pause();
+        let clock = PausedClockHold::start().await;
+        let gate = TickQuotaGate::new(2, false);
+        let handle = start_tick_gated_worker(&fixture, gate.clone());
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        tick_progress(gate.completed.notified(), "first quota pass did not finish").await;
+        tick_progress(
+            blocker.entered.notified(),
+            "provider did not fill worker capacity",
+        )
+        .await;
+        fixture
+            .seed_quota_waiter("bafy-tick-full-waiter", "tick-full-waiter", 100)
+            .await;
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tick_progress(
+            gate.arrived.notified(),
+            "full capacity starved quota maintenance",
+        )
+        .await;
+        let job = pin_job::Entity::find_by_id(job_id)
+            .one(fixture.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.state, "running");
+        assert_eq!(fixture.provider.gets.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            tick_waiter_state(&fixture, "tick-full-waiter").await,
+            "quota_waiting"
+        );
+        gate.resume.notify_one();
+        tick_progress(
+            gate.completed.notified(),
+            "full worker did not maintain quota waiter",
+        )
+        .await;
+        assert_eq!(
+            tick_waiter_state(&fixture, "tick-full-waiter").await,
+            "waiting"
+        );
+        clock.finish().await;
+        tokio::time::resume();
+        handle.shutdown(std::time::Duration::from_secs(1)).await;
     }
 
     fn job(operation: &str) -> pin_job::Model {
@@ -5762,6 +6398,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ordinary_job_route_still_requires_identity_epoch_and_original_capture() {
+        use crate::store::entities::pin_invocation_route;
+        use crate::store::pinning::{
+            legacy_migration,
+            management::{admission::authority, records},
+        };
+        use sea_orm::{ActiveModelTrait, IntoActiveModel, Set};
+
+        let fixture = fixture([]).await;
+        let db = fixture.store.db();
+        let identity = fixture.coordinator.provider_identity("noop").unwrap();
+        super::ledger::register_route(db, "noop", identity)
+            .await
+            .unwrap();
+        super::ledger::capture_reservation(db, "noop", "bafy-worker")
+            .await
+            .unwrap();
+        fixture.enqueue_poll("ordinary-route").await;
+        let job = pin_job::Entity::find().one(db).await.unwrap().unwrap();
+        let session = records::SharedDecodeBudget::default();
+        let candidates = authority::load(
+            db,
+            &legacy_migration::job_receipt_selectors(&job),
+            records::DecodeWork::shared(&session),
+        )
+        .await
+        .unwrap();
+        assert!(candidates.originals.is_empty());
+        drop(candidates);
+        assert!(
+            super::ledger::job_route_matches(db, &job, Some(identity))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !super::ledger::job_route_matches(db, &job, None)
+                .await
+                .unwrap()
+        );
+        let mut drifted = identity.clone();
+        drifted.credential_revision += 1;
+        assert!(
+            !super::ledger::job_route_matches(db, &job, Some(&drifted))
+                .await
+                .unwrap()
+        );
+        let captured = pin_invocation_route::Entity::find_by_id(job.id.clone())
+            .one(db)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut wrong_epoch = job.clone();
+        wrong_epoch.expected_remote_epoch = Some(captured.remote_epoch + 1);
+        assert!(
+            !super::ledger::job_route_matches(db, &wrong_epoch, Some(identity))
+                .await
+                .unwrap()
+        );
+        let mut wrong_route = captured.clone().into_active_model();
+        wrong_route.route = Set(serde_json::to_string(&drifted.route_snapshot()).unwrap());
+        wrong_route.update(db).await.unwrap();
+        assert!(
+            !super::ledger::job_route_matches(db, &job, Some(identity))
+                .await
+                .unwrap()
+        );
+        let mut restored = captured.clone().into_active_model();
+        restored.route = Set(captured.route);
+        restored.update(db).await.unwrap();
+        assert!(
+            super::ledger::job_route_matches(db, &job, Some(identity))
+                .await
+                .unwrap()
+        );
+        pin_invocation_route::Entity::delete_by_id(job.id.clone())
+            .exec(db)
+            .await
+            .unwrap();
+        assert!(
+            !super::ledger::job_route_matches(db, &job, Some(identity))
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn missing_provider_worker_converges_all_ordinary_operations_without_lock_cycle() {
         let fixture = fixture([]).await;
         fixture.enqueue_poll("missing-worker-request").await;
@@ -5790,23 +6512,27 @@ mod tests {
         });
         let db = fixture.store.db().clone();
         tokio::time::pause();
-        let clock_keepalive = tokio::spawn(async {
-            loop {
-                tokio::task::yield_now().await;
-            }
-        });
+        let clock_keepalive = PausedClockHold::start().await;
         let handle = missing.start(Store::new(db.clone()), CancellationToken::new());
         tokio::task::yield_now().await;
         tokio::time::advance(std::time::Duration::from_millis(1)).await;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        let mut settled_attempt = 1;
+        let (deadline_release, deadline_receiver) = std::sync::mpsc::channel::<()>();
+        let mut deadline_wait = tokio::task::spawn_blocking(move || {
+            let _ = deadline_receiver
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
+        });
+        let mut completed = handle.completed.clone();
         loop {
             assert!(
                 std::time::Instant::now() < deadline,
                 "missing-provider worker did not durably park ordinary work"
             );
-            if *handle.completed.borrow() < settled_attempt * 3 {
-                tokio::task::yield_now().await;
+            if *completed.borrow_and_update() < 3 {
+                tokio::select! {
+                    result = completed.changed() => result.expect("worker completion channel closed"),
+                    _ = &mut deadline_wait => {},
+                }
                 continue;
             }
             let rows = pin_job::Entity::find()
@@ -5817,24 +6543,43 @@ mod tests {
             if rows.len() == 3 && rows.iter().all(|row| row.state == "done") {
                 break;
             }
-            // A retry tick follows durable settlement of the previous claims,
-            // not host scheduling delays while their SQL is still in flight.
             assert_eq!(rows.len(), 3);
             for row in &rows {
-                assert_eq!(row.state, "pending");
-                assert_eq!(u64::try_from(row.attempts).unwrap(), settled_attempt);
+                match row.state.as_str() {
+                    "pending" => assert!((1..=2).contains(&row.attempts), "{row:?}"),
+                    "running" => {
+                        assert!((0..=2).contains(&row.attempts), "{row:?}");
+                        assert!(row.locked_until.is_some());
+                    }
+                    "done" => assert_eq!(row.attempts, 2),
+                    state => panic!("unexpected missing-provider job state: {state}"),
+                }
             }
-            let due = rows.iter().map(|row| row.next_attempt_at).max().unwrap();
+            // Completed jobs can refill already-due retries while their peers
+            // are still settling. Only advance a tick when no claim is active.
+            if rows.iter().any(|row| row.state == "running") {
+                tokio::select! {
+                    result = completed.changed() => result.expect("worker completion channel closed"),
+                    _ = &mut deadline_wait => {},
+                }
+                continue;
+            }
+            let due = rows
+                .iter()
+                .filter(|row| row.state == "pending")
+                .map(|row| row.next_attempt_at)
+                .max()
+                .unwrap();
             while Utc::now() < due {
                 assert!(std::time::Instant::now() < deadline);
                 tokio::task::yield_now().await;
             }
             tokio::time::advance(std::time::Duration::from_millis(5)).await;
-            settled_attempt += 1;
             tokio::task::yield_now().await;
         }
-        clock_keepalive.abort();
-        assert!(clock_keepalive.await.unwrap_err().is_cancelled());
+        drop(deadline_release);
+        deadline_wait.await.unwrap();
+        clock_keepalive.finish().await;
         tokio::time::resume();
         handle.shutdown(std::time::Duration::from_millis(50)).await;
 
@@ -5999,13 +6744,8 @@ mod tests {
         ])
         .await;
         tokio::time::pause();
-        // SQLx completes SQLite work on helper threads. Keep the current-thread runtime runnable
-        // so paused Tokio time cannot auto-advance to the pool timeout before those replies arrive.
-        let paused_runtime_keepalive = tokio::spawn(async {
-            loop {
-                tokio::task::yield_now().await;
-            }
-        });
+        // Inhibit auto-advance while SQLite helper threads complete their replies.
+        let paused_runtime_keepalive = PausedClockHold::start().await;
         fixture.enqueue_submit().await;
 
         fixture.run_one_due().await;
@@ -6075,7 +6815,7 @@ mod tests {
                 ("gateway_target_id".to_owned(), "target-1".to_owned()),
             ])
         );
-        paused_runtime_keepalive.abort();
+        paused_runtime_keepalive.finish().await;
     }
 
     fn provider_error(
@@ -6991,12 +7731,20 @@ mod tests {
             }
             let mut rounds = Vec::new();
             for tick in 0..5 {
-                let claims = super::scan_and_claim(
+                let now = Utc::now() + chrono::Duration::seconds(tick * 60);
+                super::expire_worker_leases(&fixture.store, now)
+                    .await
+                    .unwrap();
+                super::coordinate_quota_waiters(&fixture.coordinator, &fixture.store, now)
+                    .await
+                    .unwrap();
+                let claims = super::claim_ready_jobs(
                     &fixture.coordinator,
                     &fixture.store,
                     &CancellationToken::new(),
                     &super::ProviderOccupancy::default(),
-                    Utc::now() + chrono::Duration::seconds(tick * 60),
+                    &Default::default(),
+                    now,
                     10,
                 )
                 .await
@@ -8931,9 +9679,15 @@ mod tests {
             )
             .await
         });
-        tokio::time::timeout(std::time::Duration::from_secs(2), entered)
+        if tokio::time::timeout(std::time::Duration::from_secs(2), entered)
             .await
-            .expect("failed request DELETE did not enter provider");
+            .is_err()
+        {
+            if task.is_finished() {
+                let _ = task.await;
+            }
+            panic!("failed request DELETE did not enter provider");
+        }
         fixture
             .store
             .db()
@@ -9790,18 +10544,19 @@ mod tests {
         let handle = coordinator.start(fixture.store, CancellationToken::new());
         tokio::task::yield_now().await;
         tokio::time::advance(std::time::Duration::from_millis(1)).await;
-        before_wall_deadline(
+        let slow_progress = before_wall_deadline(
             std::time::Instant::now() + std::time::Duration::from_secs(2),
             slow_entered,
         )
-        .await
-        .expect("slow provider did not enter its first GET");
-        before_wall_deadline(
+        .await;
+        slow_progress.expect("slow provider did not enter its first GET");
+        let fast_progress = before_wall_deadline(
             std::time::Instant::now() + std::time::Duration::from_millis(250),
             fast_entered,
         )
-        .await
-        .expect("fast provider was starved behind the second earlier slow-provider job");
+        .await;
+        fast_progress
+            .expect("fast provider was starved behind the second earlier slow-provider job");
         tokio::time::resume();
 
         let running = pin_job::Entity::find()
@@ -9829,7 +10584,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn three_provider_uneven_backlog_refills_with_an_unoccupied_provider() {
+    async fn three_provider_uneven_backlog_refills_without_waiting_for_periodic_scan() {
         let slow = Arc::new(GetBlocker {
             entered: Notify::new(),
             release: Notify::new(),
@@ -9919,18 +10674,18 @@ mod tests {
         let handle = coordinator.start(fixture.store, CancellationToken::new());
         tokio::task::yield_now().await;
         tokio::time::advance(std::time::Duration::from_millis(1)).await;
-        before_wall_deadline(
+        let slow_progress = before_wall_deadline(
             std::time::Instant::now() + std::time::Duration::from_secs(2),
             slow_entered,
         )
-        .await
-        .expect("slow provider did not receive the first fair slot");
-        before_wall_deadline(
+        .await;
+        slow_progress.expect("slow provider did not receive the first fair slot");
+        let middle_progress = before_wall_deadline(
             std::time::Instant::now() + std::time::Duration::from_secs(2),
             middle_entered,
         )
-        .await
-        .expect("middle provider did not receive the second fair slot");
+        .await;
+        middle_progress.expect("middle provider did not receive the second fair slot");
         assert_eq!(third_provider.gets.load(Ordering::SeqCst), 0);
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -9940,7 +10695,6 @@ mod tests {
             .await
             .expect("middle-provider work did not complete within the refill budget")
             .expect("worker exited before completing middle-provider work");
-        tokio::time::advance(std::time::Duration::from_millis(10)).await;
         before_wall_deadline(deadline, third_entered)
             .await
             .expect("completed middle-provider work did not admit the third provider");
@@ -9990,12 +10744,20 @@ mod tests {
         let cancellation = CancellationToken::new();
         let mut served = Vec::new();
         for _ in 0..6 {
-            let claimed = super::scan_and_claim(
+            let now = Utc::now();
+            super::expire_worker_leases(&fixture.store, now)
+                .await
+                .unwrap();
+            super::coordinate_quota_waiters(&fixture.coordinator, &fixture.store, now)
+                .await
+                .unwrap();
+            let claimed = super::claim_ready_jobs(
                 &fixture.coordinator,
                 &fixture.store,
                 &cancellation,
                 &occupancy,
-                Utc::now(),
+                &Default::default(),
+                now,
                 1,
             )
             .await
@@ -10139,12 +10901,13 @@ mod tests {
         let handle = coordinator.start(fixture.store, CancellationToken::new());
         tokio::task::yield_now().await;
         tokio::time::advance(std::time::Duration::from_millis(1)).await;
-        before_wall_deadline(
+        let healthy_progress = before_wall_deadline(
             std::time::Instant::now() + std::time::Duration::from_secs(2),
             fast_entered,
         )
-        .await
-        .expect("unknown-provider backlog squeezed out the configured healthy provider");
+        .await;
+        healthy_progress
+            .expect("unknown-provider backlog squeezed out the configured healthy provider");
         let unknown = before_wall_deadline(
             std::time::Instant::now() + std::time::Duration::from_secs(1),
             async {
@@ -10206,11 +10969,7 @@ mod tests {
             .await;
 
         tokio::time::pause();
-        let clock_keepalive = tokio::spawn(async {
-            loop {
-                tokio::task::yield_now().await;
-            }
-        });
+        let clock_keepalive = PausedClockHold::start().await;
         let db = fixture.store.db().clone();
         let provider = fixture.provider.clone();
         let coordinator = fixture.coordinator.clone();
@@ -10268,8 +11027,7 @@ mod tests {
                 .is_empty(),
             "a second claimant reclaimed a live provider-permit waiter"
         );
-        clock_keepalive.abort();
-        assert!(clock_keepalive.await.unwrap_err().is_cancelled());
+        clock_keepalive.finish().await;
         tokio::time::resume();
         handle.shutdown(std::time::Duration::from_millis(40)).await;
         assert_eq!(provider.gets.load(Ordering::SeqCst), 1);
@@ -10308,14 +11066,9 @@ mod tests {
             .seed_poll_for("fast", "rate-fast", due + chrono::Duration::milliseconds(1))
             .await;
 
-        // SQLite replies run on helper threads: keep Tokio runnable so only our explicit
-        // advances, not DB latency or automatic advancement, can expire the rate deadline.
+        // Inhibit auto-advance so only our explicit advances can expire the rate deadline.
         tokio::time::pause();
-        let paused_runtime_keepalive = tokio::spawn(async {
-            loop {
-                tokio::task::yield_now().await;
-            }
-        });
+        let paused_runtime_keepalive = PausedClockHold::start().await;
         let slow_runtime = fixture
             .coordinator
             .provider_runtime("noop")
@@ -10386,8 +11139,7 @@ mod tests {
         assert!(tokio::time::Instant::now() > rate_deadline);
         assert_eq!(slow_provider.gets.load(Ordering::SeqCst), 0);
         assert_eq!(fast_provider.gets.load(Ordering::SeqCst), 1);
-        paused_runtime_keepalive.abort();
-        assert!(paused_runtime_keepalive.await.unwrap_err().is_cancelled());
+        paused_runtime_keepalive.finish().await;
         tokio::time::resume();
     }
 
@@ -10418,6 +11170,7 @@ mod tests {
         .await;
         PinningCoordinator::configure_worker_for_test(&mut fixture.coordinator, |settings| {
             settings.lock_for = chrono::Duration::seconds(15);
+            settings.interval = std::time::Duration::from_millis(1);
         });
         fixture.enqueue_submit().await;
         let entered = blocker.entered.notified();
@@ -10425,12 +11178,28 @@ mod tests {
         let coordinator = fixture.coordinator.clone();
         let provider = fixture.provider.clone();
         let handle = coordinator.start(fixture.store, CancellationToken::new());
-        tokio::time::timeout(std::time::Duration::from_secs(2), entered)
+        if tokio::time::timeout(std::time::Duration::from_secs(2), entered)
             .await
-            .expect("worker did not enter blocked Submit");
-        leases::cancel_lease(&db, "lease-1", Utc::now())
+            .is_err()
+        {
+            let finished = handle.join.is_finished();
+            let join_error = if finished {
+                handle.join.await.err()
+            } else {
+                None
+            };
+            if let Some(error) = join_error
+                && error.is_panic()
+            {
+                std::panic::resume_unwind(error.into_panic());
+            }
+            panic!("worker did not enter blocked Submit");
+        }
+        let cancellation = db.begin().await.unwrap();
+        leases::cancel_lease(&cancellation, "lease-1", Utc::now())
             .await
             .unwrap();
+        cancellation.commit().await.unwrap();
         let held = pin_provider_usage::Entity::find_by_id("noop".to_owned())
             .one(&db)
             .await
@@ -11267,9 +12036,19 @@ mod tests {
             )
             .await
         });
-        tokio::time::timeout(std::time::Duration::from_secs(2), entered)
+        if tokio::time::timeout(std::time::Duration::from_secs(2), entered)
             .await
-            .expect("exhausted Poll did not pause after coordination commit");
+            .is_err()
+        {
+            let finished = task.is_finished();
+            let join_error = if finished { task.await.err() } else { None };
+            if let Some(error) = join_error
+                && error.is_panic()
+            {
+                std::panic::resume_unwind(error.into_panic());
+            }
+            panic!("exhausted Poll did not pause after coordination commit");
+        }
         let paused = pin_job::Entity::find_by_id(job.id.clone())
             .one(fixture.store.db())
             .await
@@ -12114,9 +12893,19 @@ mod tests {
             )
             .await
         });
-        tokio::time::timeout(std::time::Duration::from_secs(2), entered)
+        if tokio::time::timeout(std::time::Duration::from_secs(2), entered)
             .await
-            .expect("worker A did not enter the blocked provider Submit");
+            .is_err()
+        {
+            let finished = worker_a.is_finished();
+            let join_error = if finished { worker_a.await.err() } else { None };
+            if let Some(error) = join_error
+                && error.is_panic()
+            {
+                std::panic::resume_unwind(error.into_panic());
+            }
+            panic!("worker A did not enter the blocked provider Submit");
+        }
 
         let reclaim_at = Utc::now();
         fixture

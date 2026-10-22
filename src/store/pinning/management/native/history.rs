@@ -28,14 +28,14 @@ pub(crate) fn archived_catalog(versions: &[String]) -> Result<&'static [NativeTa
         return Ok(current_catalog());
     }
     let known = &*VERSIONS;
-    if known.last().map(String::as_str) != Some("m20261013_000001_zip_root_logical_release")
-        || versions.last().map(String::as_str) != Some("m20261012_000001_pinning_management")
-        || versions.len() + 1 != known.len()
-        || versions != &known[..known.len() - 1]
-    {
+    if versions.len() >= known.len() || versions != &known[..versions.len()] {
         return Err(ManagementError::InvalidEvidence);
     }
-    Ok(&HISTORICAL)
+    match versions.last().map(String::as_str) {
+        Some("m20261013_000001_zip_root_logical_release") => Ok(current_catalog()),
+        Some("m20261012_000001_pinning_management") => Ok(&HISTORICAL),
+        _ => Err(ManagementError::InvalidEvidence),
+    }
 }
 
 pub(crate) fn current_catalog() -> &'static [NativeTable] {

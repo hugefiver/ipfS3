@@ -36,7 +36,9 @@ fn admission(capture: &CapturedZipIntent, source: &str) -> BatchAdmission {
     }
 }
 
-pub(in crate::store::pinning::publication) async fn original_capture<C: ConnectionTrait>(
+pub(in crate::store::pinning::publication) async fn original_capture<
+    C: ConnectionTrait + sea_orm::TransactionTrait,
+>(
     db: &C,
     archive: &PublicationRequest,
     prefix: &str,

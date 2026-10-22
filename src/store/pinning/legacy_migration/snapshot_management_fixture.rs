@@ -186,14 +186,28 @@ pub(in super::super) async fn fixture() -> Fixture {
         .unwrap()
         .planning_snapshot()
         .unwrap();
-    let plan = management::dry_run(&request, &snapshot).unwrap();
-    assert_eq!(plan.items()[0].status, PlanStatus::Ready);
+    let prepared = management::retirement::PreparedPlanning::collect(
+        &db,
+        &request,
+        &snapshot,
+        records::SharedDecodeBudget::default(),
+    )
+    .await
+    .unwrap();
+    let plan = &prepared.plan;
+    assert!(!matches!(plan.items()[0].status, PlanStatus::Blocked(_)));
+    let acknowledgements = plan
+        .items()
+        .iter()
+        .filter(|entry| entry.status == PlanStatus::Candidate)
+        .map(|entry| entry.request.item_id.clone())
+        .collect();
     let binding = records::confirm(
         &db,
         &config,
         &auth,
-        (&request, &snapshot, &plan),
-        vec![],
+        (&request, &snapshot, plan),
+        acknowledgements,
         chrono::Duration::minutes(2),
     )
     .await
@@ -201,6 +215,7 @@ pub(in super::super) async fn fixture() -> Fixture {
     let applied = crate::store::pinning::management::actions::apply(&db, &config, &auth, &binding)
         .await
         .unwrap();
+    prepared.close().await.unwrap();
     assert!(
         records::lookup_applied(&db, &auth, &binding, "provider")
             .await

@@ -401,6 +401,25 @@ pub(crate) async fn target_confirmed_with_work<C: ConnectionTrait>(
     now: DateTime<Utc>,
     work: SharedDecodeBudget,
 ) -> management::Result<bool> {
+    let managed = native_completion::management_participates(db, lease_id, work.clone()).await?;
+    let confirmed =
+        target_confirmed_inner_with_work(db, lease_id, provider, cid, now, work.clone(), managed)
+            .await?;
+    if !managed && native_completion::management_participates(db, lease_id, work).await? {
+        return Err(management::ManagementError::Changed);
+    }
+    Ok(confirmed)
+}
+
+async fn target_confirmed_inner_with_work<C: ConnectionTrait>(
+    db: &C,
+    lease_id: &str,
+    provider: &str,
+    cid: &str,
+    now: DateTime<Utc>,
+    work: SharedDecodeBudget,
+    managed: bool,
+) -> management::Result<bool> {
     let context = DecodeWork::shared(&work);
     let birth = get_with_work(db, lease_id, context).await?;
     let resolved = if let Some(birth) = &birth {
@@ -507,9 +526,13 @@ pub(crate) async fn target_confirmed_with_work<C: ConnectionTrait>(
     if route.resource_type() == crate::pinning::identity::RemoteResourceType::ClusterPin {
         context.copy(&route)?;
         let mut required = route.clone();
-        // Evaluate destination observations using at least the original slot's
-        // Cluster min/age, plus the complete explicit management requirements.
-        let Some(confirmation) = replica_requirement(original, &route, full.as_ref()) else {
+        // Native leases retain their own birth threshold. Management destinations
+        // must also meet their route threshold and the complete explicit requirements.
+        let Some(confirmation) = replica_requirement(
+            original,
+            if managed { &route } else { original },
+            full.as_ref(),
+        ) else {
             return Ok(false);
         };
         required.confirmation = Some(confirmation);

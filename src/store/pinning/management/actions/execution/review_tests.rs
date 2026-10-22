@@ -115,14 +115,9 @@ async fn explicit_reapply_grants_new_source_permission_without_rewriting_skipped
         .await
         .is_err()
     );
-    records::write_executed_action_in_transaction(
-        &fixture.auth,
-        &fixture.binding,
-        &executed,
-        before,
-    )
-    .await
-    .unwrap();
+    publish_executed(&fixture.auth, &fixture.binding, &executed, before)
+        .await
+        .unwrap();
     let seed = executed
         .action_view()
         .jobs
@@ -278,21 +273,16 @@ async fn native_rejected_retry_prefix_preserves_resource_and_independent_renewal
             .iter()
             .any(|job| job.directive == records::JobDirective::Submit && job.job_id == original.id)
     );
-    records::write_executed_action_in_transaction(&fixture.auth, &fixture.binding, &retry, before)
+    publish_executed(&fixture.auth, &fixture.binding, &retry, before)
         .await
         .unwrap();
     let renewal = batch
         .execute_entry(&fixture.binding.confirmation.bindings[1])
         .await
         .unwrap();
-    records::write_executed_action_in_transaction(
-        &fixture.auth,
-        &fixture.binding,
-        &renewal,
-        before,
-    )
-    .await
-    .unwrap();
+    publish_executed(&fixture.auth, &fixture.binding, &renewal, before)
+        .await
+        .unwrap();
     let mut invalid = renewal.operation.facts.as_ref().clone();
     let table = before.table("remote_pins").unwrap();
     let column = table.columns.iter().position(|c| c == "cid_size").unwrap();
@@ -343,14 +333,9 @@ async fn real_cancel_prefix_preserves_independent_renewal_and_rejects_extra_reso
             .execute_entry(entry)
             .await
             .unwrap_or_else(|error| panic!("{} execution: {error:?}", entry.request.item_id));
-        records::write_executed_action_in_transaction(
-            &fixture.auth,
-            &fixture.binding,
-            &executed,
-            before,
-        )
-        .await
-        .unwrap();
+        publish_executed(&fixture.auth, &fixture.binding, &executed, before)
+            .await
+            .unwrap();
     }
     tx.rollback().await.unwrap();
     let applied = super::super::apply(
@@ -372,12 +357,23 @@ async fn real_cancel_prefix_preserves_independent_renewal_and_rejects_extra_reso
         );
     }
     super::proof_tests::assert_restored(&fixture, &fixture.binding, &applied).await;
-    let before = fixture.binding.view().frozen_rows().unwrap();
+
+    let tamper_binding = records::load_confirmed_authority(
+        &fixture.db,
+        &fixture.auth,
+        &request,
+        records::SharedDecodeBudget::default(),
+    )
+    .await
+    .unwrap();
+    assert!(tamper_binding.view() == fixture.binding.view());
+    let before = tamper_binding.view().frozen_rows().unwrap();
     let restored =
-        records::lookup_trusted_committed(&fixture.db, &fixture.auth, &fixture.binding, "b-renew")
+        records::lookup_trusted_committed(&fixture.db, &fixture.auth, &tamper_binding, "b-renew")
             .await
             .unwrap()
             .unwrap();
+    assert!(restored.action_view() == &applied.items[1]);
     let row = super::super::provider_points::original_record(&fixture.db, restored.record_key())
         .await
         .unwrap()
@@ -407,18 +403,24 @@ async fn real_cancel_prefix_preserves_independent_renewal_and_rejects_extra_reso
     for output in invalid.2.iter_mut().filter(|o| o.0.0 == "remote_pins") {
         output.2.as_mut().unwrap()[column] = Some("99".into());
     }
-    let hash = facts::identity((&fixture.binding).into(), &applied.items[1], &invalid).unwrap();
+    let hash = facts::identity((&tamper_binding).into(), &applied.items[1], &invalid).unwrap();
     let result = format!(
         "S7R1\n{}",
         serde_json::to_string(&(&applied.items[1], invalid, hash)).unwrap()
     );
     let tx = fixture.db.begin().await.unwrap();
-    tx.execute(Statement::from_sql_and_values(tx.get_database_backend(),"UPDATE pin_management_records SET result=$1 WHERE plan_id=$2 AND item_id=$3 AND kind='action'",[result.into(),fixture.binding.request.plan_id.clone().into(),"b-renew".into()])).await.unwrap();
-    assert!(
-        records::lookup_trusted_committed(&tx, &fixture.auth, &fixture.binding, "b-renew")
-            .await
-            .is_err()
-    );
+    // Simulate out-of-band corruption; the guard and row are restored together.
+    tx.execute_unprepared("DROP TRIGGER s75_applied_no_update")
+        .await
+        .unwrap();
+    tx.execute(Statement::from_sql_and_values(tx.get_database_backend(),"UPDATE pin_management_records SET result=$1 WHERE plan_id=$2 AND item_id=$3 AND kind='action'",[result.into(),tamper_binding.request.plan_id.clone().into(),"b-renew".into()])).await.unwrap();
+    let rejected =
+        records::lookup_trusted_committed(&tx, &fixture.auth, &tamper_binding, "b-renew").await;
+    assert!(rejected.is_err());
+    assert!(!matches!(
+        rejected,
+        Err(crate::store::pinning::management::ManagementError::Budget)
+    ));
     tx.rollback().await.unwrap();
 }
 
@@ -530,6 +532,23 @@ async fn shared_submit_retains_actual_source_distinct_from_owner_capture() {
     .unwrap();
     reconfirm(&mut fixture, &request).await;
     let before = fixture.binding.view().frozen_rows().unwrap();
+    let source_lease = before
+        .row("pin_leases", &[original.lease_id.as_ref().unwrap()])
+        .unwrap();
+    let source_owner = source_lease.cell("owner_object_id").unwrap();
+    assert!(
+        before.row("objects", &[source_owner]).is_some(),
+        "shared Submit needs its actual source object"
+    );
+    assert!(
+        before
+            .table("object_versions")
+            .unwrap()
+            .rows
+            .iter()
+            .any(|row| row.cell("object_id") == Some(source_owner)),
+        "shared Submit needs its actual source version"
+    );
     let tx = fixture.db.begin().await.unwrap();
     let mut batch = ExecutionBatch::new(
         &tx,
@@ -553,14 +572,9 @@ async fn shared_submit_retains_actual_source_distinct_from_owner_capture() {
         unreachable!()
     };
     assert!(shared.source.as_ref() != Some(&capture.object.identity));
-    records::write_executed_action_in_transaction(
-        &fixture.auth,
-        &fixture.binding,
-        &executed,
-        before,
-    )
-    .await
-    .unwrap();
+    publish_executed(&fixture.auth, &fixture.binding, &executed, before)
+        .await
+        .unwrap();
     assert!(
         records::lookup_trusted_committed(&tx, &fixture.auth, &fixture.binding, "object")
             .await
@@ -570,6 +584,38 @@ async fn shared_submit_retains_actual_source_distinct_from_owner_capture() {
             == action
     );
     tx.rollback().await.unwrap();
+    let applied = super::super::apply(
+        &fixture.db,
+        &fixture.config,
+        &fixture.auth,
+        &fixture.binding,
+    )
+    .await
+    .unwrap();
+    let shared = applied.items[0]
+        .jobs
+        .iter()
+        .find(|authority| authority.job_id == original.id)
+        .unwrap();
+    assert_eq!(shared.source.as_ref().unwrap().object_id, source_owner);
+    assert_eq!(
+        pin_job::Entity::find()
+            .filter(pin_job::Column::Operation.eq("submit"))
+            .all(&fixture.db)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let replay = super::super::apply(
+        &fixture.db,
+        &fixture.config,
+        &fixture.auth,
+        &fixture.binding,
+    )
+    .await
+    .unwrap();
+    assert!(replay.replayed && replay.items == applied.items);
 }
 
 #[tokio::test]
@@ -588,7 +634,7 @@ async fn executed_submit_rejects_birth_after_read_attestation_expiry() {
             identity: identity.clone(),
             expected_node: fixture.config.source_node().unwrap().into(),
             max_stored_bytes: 10,
-            ttl: chrono::Duration::seconds(10),
+            ttl: chrono::Duration::minutes(1),
             directory: false,
         },
         CancellationToken::new(),
@@ -653,14 +699,9 @@ async fn executed_submit_rejects_birth_after_read_attestation_expiry() {
     .await;
     fixture.binding.check(&tx, &fixture.auth).await.unwrap();
     assert!(
-        records::write_executed_action_in_transaction(
-            &fixture.auth,
-            &fixture.binding,
-            &executed,
-            before
-        )
-        .await
-        .is_err()
+        publish_executed(&fixture.auth, &fixture.binding, &executed, before)
+            .await
+            .is_err()
     );
     assert!(
         records::lookup_committed(&tx, &fixture.auth, &fixture.binding, "object")
@@ -731,6 +772,10 @@ async fn readonly_prefix_rejects_consistent_epoch_chain_forgery_from_real_row() 
         serde_json::to_string(&(action, facts, hash)).unwrap()
     );
     let tx = fixture.db.begin().await.unwrap();
+    // Simulate out-of-band corruption; the guard and row are restored together.
+    tx.execute_unprepared("DROP TRIGGER s75_applied_no_update")
+        .await
+        .unwrap();
     tx.execute(Statement::from_sql_and_values(tx.get_database_backend(),"UPDATE pin_management_records SET result=$1 WHERE database_scope=$2 AND plan_id=$3 AND item_id=$4 AND kind='action'",[result.into(),key.values[0].clone().into(),key.values[1].clone().into(),key.values[2].clone().into()])).await.unwrap();
     assert!(
         records::lookup_trusted_committed(&tx, &fixture.auth, &fixture.binding, &key.values[2])

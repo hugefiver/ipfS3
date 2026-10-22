@@ -6,7 +6,6 @@ use crate::pinning::{
 };
 use crate::store::pinning::management::actions::accounting;
 use crate::store::pinning::management::native::{NativeFrame, NativeRow, value};
-use sea_orm::DatabaseTransaction;
 use std::collections::BTreeSet;
 #[path = "native_plan/contracts.rs"]
 mod contracts;
@@ -39,6 +38,8 @@ fn original_routes(
 ) -> Result<Vec<RouteSnapshot>> {
     let mut result = Vec::new();
     for row in table(frame, "pin_provider_routes")? {
+        let original = super::read::original_row(frame, "pin_provider_routes", row, work)?;
+        let row = &original;
         let Some(json) = value(row, "snapshot") else {
             continue;
         };
@@ -81,6 +82,8 @@ fn original_routes(
         ("pin_replica_observations", "route"),
     ] {
         for row in table(frame, name)? {
+            let original = super::read::original_row(frame, name, row, work)?;
+            let row = &original;
             let Some(json) = value(row, column) else {
                 continue;
             };
@@ -114,6 +117,8 @@ fn original_routes(
         }
     }
     for row in table(frame, "pin_lease_requirements")? {
+        let original = super::read::original_row(frame, "pin_lease_requirements", row, work)?;
+        let row = &original;
         let birth = decode::<crate::store::entities::pin_lease_requirement::contract::BirthContract>(
             value(row, "contract").ok_or(SnapshotError::InvalidEvidence)?,
             work,
@@ -160,21 +165,58 @@ fn original_routes(
             exclusive_management: false,
         });
     }
+    // Logical-slot migrations preserve their original source/destination routes
+    // independently of current registration and subsequent R26 movement.
+    for point in crate::store::pinning::management::actions::points::planning_points_with_work(
+        frame,
+        work.clone(),
+    )
+    .map_err(super::scoped::map_error)?
+    {
+        for raw in [
+            &point.source_route,
+            &point.source_resource_route,
+            &point.destination_route,
+        ]
+        .into_iter()
+        .chain(
+            point
+                .planning_projection
+                .as_ref()
+                .map(|projection| &projection.execution_route),
+        ) {
+            if result
+                .iter()
+                .any(|entry| entry.original.as_ref() == Some(raw))
+            {
+                continue;
+            }
+            let available = local_config::historical_route_available(raw, config);
+            result.push(RouteSnapshot {
+                identity: route(raw),
+                original: Some(raw.clone()),
+                available,
+                allocation_allowed: false,
+                cleanup: match raw.cleanup {
+                    crate::pinning::identity::CleanupMode::Retain => CleanupMode::Retain,
+                    crate::pinning::identity::CleanupMode::Managed => CleanupMode::Managed,
+                },
+                exclusive_management: false,
+            });
+        }
+    }
     result.sort_by(|a, b| a.identity.cmp(&b.identity));
     Ok(result)
 }
 
-async fn objects(
-    tx: &DatabaseTransaction,
+fn objects(
+    now: chrono::DateTime<chrono::Utc>,
     diagnostic: &DatabaseSnapshot,
     frame: &NativeFrame,
     config: Option<&local_config::ManagementConfig>,
     request: &PlanRequest,
     work: &SharedDecodeBudget,
 ) -> Result<Vec<ObjectSnapshot>> {
-    let now = crate::store::database_clock::database_now(tx)
-        .await
-        .map_err(|_| SnapshotError::DatabaseUnavailable)?;
     let mut result = Vec::new();
     for evidence in &diagnostic.objects {
         frame
@@ -453,8 +495,8 @@ fn safety(
     ))
 }
 
-pub(super) async fn project(
-    tx: &DatabaseTransaction,
+pub(super) fn project(
+    now: chrono::DateTime<chrono::Utc>,
     diagnostic: &DatabaseSnapshot,
     frame: NativeFrame,
     config: &ValidatedPinningConfig,
@@ -463,7 +505,7 @@ pub(super) async fn project(
     work: &SharedDecodeBudget,
 ) -> Result<Snapshot> {
     let routes = original_routes(&frame, config, work)?;
-    let objects = objects(tx, diagnostic, &frame, management_config, request, work).await?;
+    let objects = objects(now, diagnostic, &frame, management_config, request, work)?;
     let mut targets = Vec::new();
     for evidence in &diagnostic.targets {
         let lease = diagnostic
@@ -473,9 +515,12 @@ pub(super) async fn project(
             .ok_or(SnapshotError::InvalidEvidence)?;
         // Registration is not a historical execution contract. A missing route
         // remains an owned unknown target, not an error for the entire plan.
-        let contract = frame.row("pin_lease_requirements", &[&lease.id]).cloned();
+        let contract = frame
+            .row("pin_lease_requirements", &[&lease.id])
+            .map(|row| super::read::original_row(&frame, "pin_lease_requirements", row, work))
+            .transpose()?;
         let (registered, requirements, frozen_candidates) =
-            contracts::target(tx, &frame, evidence, lease, contract.as_ref(), work).await?;
+            contracts::target(&frame, evidence, lease, contract.as_ref(), work)?;
         targets.push(TargetSnapshot {
             id: evidence.id.clone(),
             native_tuple: frame
@@ -533,12 +578,9 @@ pub(super) async fn project(
         ..Snapshot::default()
     };
     let (mut remotes, historical_remotes, unknown_resources) =
-        resources::project(tx, &frame, diagnostic, request, &snapshot, work).await?;
-    let now = crate::store::database_clock::database_now(tx)
-        .await
-        .map_err(|_| SnapshotError::DatabaseUnavailable)?;
+        resources::project(&frame, diagnostic, request, &snapshot, work)?;
     for remote in &mut remotes {
-        replicas::project(tx, &frame, remote, now, work).await?;
+        replicas::project(&frame, remote, now, work)?;
     }
     let mut ledger_domains = Vec::new();
     let mut domains = BTreeSet::new();
@@ -634,18 +676,14 @@ pub(super) async fn project(
         inventories.push(ProviderInventory {
             provider_id: route.identity.provider_id.clone(),
             frontier: frame.frontier.clone(),
-            complete: true,
+            complete: false,
             attribution_complete: !unattributed && root_reference_ids.is_empty(),
             allocation_stopped: !route.allocation_allowed,
             leases,
             root_reference_ids,
         });
     }
-    snapshot.database_now = Some(
-        crate::store::database_clock::database_now(tx)
-            .await
-            .map_err(|_| SnapshotError::DatabaseUnavailable)?,
-    );
+    snapshot.database_now = Some(now);
     snapshot.remotes = remotes;
     snapshot.historical_remotes = historical_remotes;
     snapshot.unknown_resources = unknown_resources;

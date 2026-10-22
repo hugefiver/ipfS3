@@ -76,6 +76,43 @@ async fn assert_management_absent(db: &DatabaseConnection) {
     assert!(row.is_none());
 }
 
+async fn upgrade(db: &DatabaseConnection) {
+    let source = "m20261013_000001_zip_root_logical_release";
+    let registry = store::migrator::Migrator::migrations();
+    let source_count = registry
+        .iter()
+        .position(|migration| migration.name() == source)
+        .unwrap()
+        + 1;
+    let applied = db
+        .query_all(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "SELECT version FROM seaql_migrations",
+        ))
+        .await
+        .unwrap()
+        .len();
+    if applied < source_count {
+        store::migrator::Migrator::up(db, Some((source_count - applied) as u32))
+            .await
+            .unwrap();
+    }
+    let (scope, identity) = store::pinning::management::native::scope::binding(db)
+        .await
+        .unwrap();
+    store::initialization::upgrade_existing(
+        db,
+        store::initialization::UpgradeRequest {
+            database_scope: &scope,
+            native_identity: &identity,
+            source_version: source,
+            target_version: schema::VERSION,
+        },
+    )
+    .await
+    .unwrap();
+}
+
 fn coordinator() -> std::sync::Arc<PinningCoordinator> {
     let raw: crate::config::Config = toml::from_str(
         r#"
@@ -106,7 +143,7 @@ fn coordinator() -> std::sync::Arc<PinningCoordinator> {
 }
 
 #[tokio::test]
-async fn registered_historical_prefixes_keep_generic_route_and_owned_startup_compatibility() {
+async fn historical_prefixes_require_explicit_upgrade_before_registration_and_admission() {
     for last in PREFIXES {
         let (_directory, db) = prefix(last).await;
         assert!(
@@ -116,7 +153,18 @@ async fn registered_historical_prefixes_keep_generic_route_and_owned_startup_com
         );
         let coordinator = coordinator();
         let provider = &coordinator.effective_config().providers[0];
-        // This is explicitly metadata compatibility, not an autocommit barrier.
+        assert!(
+            ledger::register_route(&db, &provider.name, &provider.identity)
+                .await
+                .is_err()
+        );
+        assert!(
+            admission::check_open(&db, &[provider.route_snapshot()])
+                .await
+                .is_err()
+        );
+        assert_management_absent(&db).await;
+        upgrade(&db).await;
         ledger::register_route(&db, &provider.name, &provider.identity)
             .await
             .unwrap();
@@ -140,7 +188,6 @@ async fn registered_historical_prefixes_keep_generic_route_and_owned_startup_com
                 .await
                 .unwrap()
         );
-        assert_management_absent(&db).await;
         // The caller owns this transaction and its existing usage frontier.
         let tx = db.begin().await.unwrap();
         admission::locks::lock_existing_usage(&tx, std::slice::from_ref(&provider.name))
@@ -154,14 +201,10 @@ async fn registered_historical_prefixes_keep_generic_route_and_owned_startup_com
         admission::locks::lock_existing_usage(&tx, std::slice::from_ref(&provider.name))
             .await
             .unwrap();
-        assert!(
-            admission::lock_retirement_write_in_transaction(&tx)
-                .await
-                .is_err(),
-            "native registration compatibility is not retirement-write authority"
-        );
+        admission::lock_retirement_write_in_transaction(&tx)
+            .await
+            .unwrap();
         tx.rollback().await.unwrap();
-        assert_management_absent(&db).await;
     }
 }
 
@@ -173,9 +216,12 @@ async fn old_schema_retired_native_domain_stays_closed_across_restart_and_alias(
         let provider = &coordinator.effective_config().providers[0];
         let mut retired = provider.identity.clone();
         retired.retired = true;
-        ledger::register_route(&db, &provider.name, &retired)
-            .await
-            .unwrap();
+        // Historical denial data is retained by the explicit upgrade; it grants no IO.
+        db.execute(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
+            "INSERT INTO pin_provider_routes(provider,snapshot,display_name,retired) VALUES($1,$2,$3,1)",
+            [provider.name.clone().into(),serde_json::to_string(&retired.route_snapshot()).unwrap().into(),retired.display_name.clone().into()]
+        )).await.unwrap();
+        upgrade(&db).await;
         let original = pin_provider_route::Entity::find().all(&db).await.unwrap();
         coordinator
             .register_identities(&store::Store::new(db.clone()))
@@ -191,8 +237,9 @@ async fn old_schema_retired_native_domain_stays_closed_across_restart_and_alias(
             original
         );
         assert!(
-            matches!(admission::check_open(&db, &[provider.route_snapshot()]).await,
-            Err(crate::error::AppError::InvalidPinningRequest(message)) if message == "allocation domain is permanently retired")
+            admission::check_open(&db, &[provider.route_snapshot()])
+                .await
+                .is_err()
         );
         let tx = db.begin().await.unwrap();
         admission::locks::lock_existing_usage(&tx, std::slice::from_ref(&provider.name))
@@ -215,13 +262,13 @@ async fn old_schema_retired_native_domain_stays_closed_across_restart_and_alias(
         admission::check_open(&db, &[distinct.route_snapshot()])
             .await
             .unwrap();
-        assert_management_absent(&db).await;
     }
 }
 
 #[tokio::test]
-async fn historical_fallback_requires_registered_original_legacy_and_full_declared_tuple() {
+async fn upgraded_historical_routes_require_registered_original_legacy_and_full_declared_tuple() {
     let (_directory, db) = prefix(PREFIXES[0]).await;
+    upgrade(&db).await;
     let coordinator = coordinator();
     let provider = &coordinator.effective_config().providers[0];
     let mut legacy = provider.identity.clone();
@@ -242,6 +289,9 @@ async fn historical_fallback_requires_registered_original_legacy_and_full_declar
             .is_err()
     );
     ledger::register_route(&db, &provider.name, &provider.identity)
+        .await
+        .unwrap();
+    admission::check_provider_open(&db, &provider.name)
         .await
         .unwrap();
     let mut mismatched = provider.route_snapshot();
@@ -285,12 +335,19 @@ async fn partial_version_mismatch_and_unknown_registry_are_not_historical_availa
         let (_directory, db) = prefix(PREFIXES[3]).await;
         let coordinator = coordinator();
         let provider = &coordinator.effective_config().providers[0];
-        coordinator
-            .register_identities(&store::Store::new(db.clone()))
-            .await
-            .unwrap();
+        assert!(
+            coordinator
+                .register_identities(&store::Store::new(db.clone()))
+                .await
+                .is_err()
+        );
         let before = pin_provider_route::Entity::find().all(&db).await.unwrap();
         db.execute_unprepared(&alteration).await.unwrap();
+        assert!(
+            admission::check_provider_open(&db, "unknown-alias")
+                .await
+                .is_err()
+        );
         assert!(
             admission::check_open(&db, &[provider.route_snapshot()])
                 .await
@@ -343,10 +400,19 @@ async fn historical_and_current_shadow_catalogs_fail_closed_on_the_same_connecti
             let (_directory, db) = prefix(last).await;
             let coordinator = coordinator();
             let provider = &coordinator.effective_config().providers[0];
-            coordinator
-                .register_identities(&store::Store::new(db.clone()))
-                .await
-                .unwrap();
+            if last == schema::VERSION {
+                coordinator
+                    .register_identities(&store::Store::new(db.clone()))
+                    .await
+                    .unwrap();
+            } else {
+                assert!(
+                    coordinator
+                        .register_identities(&store::Store::new(db.clone()))
+                        .await
+                        .is_err()
+                );
+            }
             // TEMP objects are connection-local; use one owned transaction for
             // creation, fail-fast, and the final admission/startup-lock probes.
             let tx = db.begin().await.unwrap();
@@ -380,18 +446,27 @@ async fn historical_and_current_shadow_catalogs_fail_closed_on_the_same_connecti
 }
 
 #[tokio::test]
-async fn historical_absence_is_not_cached_after_normal_upgrade_or_current_catalog_damage() {
+async fn historical_refusal_is_not_cached_after_explicit_upgrade_or_current_catalog_damage() {
     let (_directory, db) = prefix(PREFIXES[3]).await;
     let coordinator = coordinator();
     let provider = &coordinator.effective_config().providers[0];
+    assert!(
+        coordinator
+            .register_identities(&store::Store::new(db.clone()))
+            .await
+            .is_err()
+    );
+    assert!(
+        admission::check_open(&db, &[provider.route_snapshot()])
+            .await
+            .is_err()
+    );
+    assert_management_absent(&db).await;
+    upgrade(&db).await;
     coordinator
         .register_identities(&store::Store::new(db.clone()))
         .await
         .unwrap();
-    admission::check_open(&db, &[provider.route_snapshot()])
-        .await
-        .unwrap();
-    store::run_migrations(&db).await.unwrap();
     admission::check_open(&db, &[provider.route_snapshot()])
         .await
         .unwrap();

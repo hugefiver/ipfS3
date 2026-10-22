@@ -1,9 +1,6 @@
 //! Metered current registry rows; private cells are never projected or duplicated.
 use super::*;
-use sea_orm::{
-    ColumnTrait, EntityTrait, FromQueryResult, Iterable,
-    sea_query::{ColumnType, Iden},
-};
+use sea_orm::{EntityTrait, FromQueryResult};
 use std::sync::Arc;
 
 pub(crate) async fn current_management_rows<C: ConnectionTrait>(
@@ -153,34 +150,27 @@ where
     for _ in 0..2 {
         work.copy(key)?;
     }
-    let backend = db.get_database_backend();
     let predicate = table
         .primary_key
         .iter()
         .enumerate()
-        .map(|(index, column)| {
-            let entity_column = E::Column::iter()
-                .find(|candidate| Iden::to_string(candidate) == *column)
-                .ok_or(ManagementError::Schema)?;
-            let expression = if backend == sea_orm::DatabaseBackend::Sqlite
-                && matches!(
-                    entity_column.def().get_column_type(),
-                    ColumnType::String(_) | ColumnType::Text
-                ) {
-                format!("\"{column}\"")
-            } else {
-                format!("CAST(\"{column}\" AS TEXT)")
-            };
-            Ok(format!("{expression}=${}", index + 1))
-        })
-        .collect::<Result<Vec<_>>>()?
+        .map(|(index, column)| format!("\"{column}\"=${}", index + 1))
+        .collect::<Vec<_>>()
         .join(" AND ");
     let source = format!("FROM \"{name}\" WHERE {predicate}");
-    let values = key
+    let values = table
+        .primary_key
         .iter()
-        .copied()
-        .map(Into::into)
-        .collect::<Vec<sea_orm::Value>>();
+        .zip(key)
+        .map(|(column, value)| native::scope::bound_value(table, column, value))
+        .collect::<Result<Vec<_>>>()?;
+    if values.iter().zip(key).any(|(value, original)| match value {
+        sea_orm::Value::BigInt(Some(value)) => value.to_string() != *original,
+        sea_orm::Value::Int(Some(value)) => value.to_string() != *original,
+        _ => false,
+    }) {
+        return Ok(None);
+    }
     let mut rows = current_models::<E, _>(
         db,
         &source,
@@ -276,136 +266,6 @@ where
         .collect()
 }
 
-pub(crate) struct CurrentRows {
-    scope: String,
-    identity: String,
-    tables: Vec<Vec<Arc<RowHandle>>>,
-}
-impl CurrentRows {
-    pub(crate) fn scope(&self) -> &str {
-        &self.scope
-    }
-    pub(crate) fn identity(&self) -> &str {
-        &self.identity
-    }
-    pub(crate) fn rows(&self) -> impl Iterator<Item = (&native::NativeTable, RowView<'_>)> {
-        native::current_catalog()
-            .iter()
-            .zip(&self.tables)
-            .flat_map(|(table, rows)| rows.iter().map(move |row| (table, RowView::Handle(row))))
-    }
-    pub(crate) async fn capture<C: ConnectionTrait>(db: &C, work: DecodeWork<'_>) -> Result<Self> {
-        super::super::schema::validate(db).await?;
-        let catalog = native::current_catalog();
-        super::super::catalog::validate(db, catalog).await?;
-        native::check_raw_inventory(db).await?;
-        work.with(|work| work.nodes(1 + catalog.len()))?;
-        let mut tables = Vec::with_capacity(catalog.len());
-        let mut total_rows = 0usize;
-        let mut total_bytes = 0usize;
-        for table in catalog {
-            if table.table == super::super::schema::RECORDS {
-                let rows = current_management_rows(db, work).await?;
-                total_rows += rows.len();
-                for row in &rows {
-                    for value in row.values().flatten() {
-                        total_bytes = total_bytes
-                            .checked_add(value.len())
-                            .ok_or(ManagementError::Budget)?;
-                    }
-                }
-                if total_rows > native::MAX_ROWS || total_bytes > native::MAX_BYTES {
-                    return Err(ManagementError::Budget);
-                }
-                work.with(|work| work.nodes(1 + rows.len() * 2))?;
-                tables.push(
-                    rows.into_iter()
-                        .map(|row| Arc::new(RowHandle::Sql(row)))
-                        .collect(),
-                );
-                continue;
-            }
-            work.with(|work| work.nodes(1 + table.columns.len()))?;
-            let columns = table
-                .columns
-                .iter()
-                .map(|column| (column.as_str(), column.as_str()))
-                .collect::<Vec<_>>();
-            let order = table
-                .primary_key
-                .iter()
-                .map(|column| format!("\"{column}\""))
-                .collect::<Vec<_>>()
-                .join(",");
-            let (rows, bytes) = index::bounded_projection(
-                db,
-                &format!("FROM \"{}\" WHERE TRUE", table.table),
-                &columns,
-                &order,
-                vec![],
-                (
-                    native::MAX_ROWS - total_rows,
-                    native::MAX_BYTES - total_bytes,
-                ),
-                work,
-            )
-            .await?;
-            total_rows += rows.len();
-            total_bytes += bytes;
-            work.index_cells(
-                rows.len()
-                    .checked_mul(table.columns.len())
-                    .ok_or(ManagementError::Budget)?,
-                bytes,
-            )?;
-            work.with(|work| work.nodes(1 + rows.len() * 2))?;
-            for _ in &rows {
-                work.copy(&table.columns)?;
-            }
-            let mut members = Vec::with_capacity(rows.len());
-            for row in rows {
-                let original = table
-                    .columns
-                    .iter()
-                    .map(|column| {
-                        Ok((
-                            column.clone(),
-                            row.try_get::<Option<String>>("", column)
-                                .map_err(|_| ManagementError::InvalidEvidence)?,
-                        ))
-                    })
-                    .collect::<Result<native::NativeRow>>()?;
-                members.push(Arc::new(RowHandle::Sql(Arc::new(original))));
-            }
-            tables.push(members);
-        }
-        let mut result = Self {
-            scope: String::new(),
-            identity: String::new(),
-            tables,
-        };
-        let mut scopes = result.rows().filter(|(table, row)| {
-            table.table == super::super::schema::RECORDS
-                && row.cell("kind") == Some("database_scope")
-        });
-        let scope = scopes
-            .next()
-            .and_then(|(_, row)| row.cell("database_scope"))
-            .ok_or(ManagementError::Schema)?;
-        if scopes.next().is_some() {
-            return Err(ManagementError::Schema);
-        }
-        work.copy(scope)?;
-        let scope = scope.to_owned();
-        drop(scopes);
-        result.scope = scope;
-        result.identity = native::database_identity(db).await?;
-        work.copy(&result.identity)?;
-        native::check_raw_inventory(db).await?;
-        Ok(result)
-    }
-}
-
 #[cfg(test)]
 #[path = "current_tests.rs"]
 mod model_tests;
@@ -414,7 +274,10 @@ mod model_tests;
 mod tests {
     use super::*;
     #[tokio::test]
-    async fn current_registry_preserves_private_and_null_cells_under_the_shared_budget() {
+    async fn current_model_preserves_private_and_null_cells_under_the_shared_budget() {
+        use crate::store::entities::object;
+        use native::scope::{ScopeSpec, Selector, collect_scope};
+
         let fixture =
             crate::store::pinning::management::actions::tests::fixture("current-originals").await;
         fixture
@@ -422,42 +285,40 @@ mod tests {
             .execute_unprepared("UPDATE objects SET metadata='{\"raw\":\"é\"}',key_wrap='' ")
             .await
             .unwrap();
-        let expected = native::capture(&fixture.db).await.unwrap();
-        let work = SharedDecodeBudget::default();
-        let current = CurrentRows::capture(&fixture.db, DecodeWork::shared(&work))
-            .await
-            .unwrap();
-        for (table, row) in current.rows() {
-            let key = table
-                .primary_key
-                .iter()
-                .map(|column| row.cell(column).unwrap())
-                .collect::<Vec<_>>();
-            for (column, value) in row.iter() {
-                assert_eq!(
-                    value.as_deref(),
-                    expected.original_value(&table.table, &key, column)
-                );
-            }
-        }
-        let id = native::value(&expected.table("objects").unwrap().rows[0], "id").unwrap();
-        let before_model = work.lock().unwrap().usage();
-        let model = current_model::<crate::store::entities::object::Entity, _>(
-            &fixture.db,
-            &[id],
-            DecodeWork::shared(&work),
-        )
-        .await
-        .unwrap();
-        let expected_model = crate::store::entities::object::Entity::find_by_id(id.to_owned())
+        let expected_model = object::Entity::find()
             .one(&fixture.db)
             .await
+            .unwrap()
             .unwrap();
+        let id = expected_model.id.as_str();
+        let spec = ScopeSpec::new(vec![Selector::Exact(native::NativeKey {
+            table: "objects".into(),
+            values: vec![id.into()],
+        })])
+        .unwrap();
+        let mut budget = native::meter::Budget::default();
+        let frame = collect_scope(&fixture.db, &spec, &mut budget)
+            .await
+            .unwrap()
+            .into_native_frame(&mut budget)
+            .unwrap();
+        let original = FrozenRows::Frame(&frame).row("objects", &[id]).unwrap();
+        assert_eq!(original.cell("metadata"), Some("{\"raw\":\"é\"}"));
+        assert_eq!(original.cell("key_wrap"), Some(""));
+        assert_eq!(original.get("sse_c_key_fingerprint"), Some(&None));
+        let work = SharedDecodeBudget::default();
+        let before_model = work.lock().unwrap().usage();
+        let model =
+            current_model::<object::Entity, _>(&fixture.db, &[id], DecodeWork::shared(&work))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(model.metadata, Some(serde_json::json!({"raw": "é"})));
+        assert_eq!(model.key_wrap.as_deref(), Some(""));
+        assert_eq!(model.sse_c_key_fingerprint, None);
         assert_eq!(model, expected_model);
         let after_model = work.lock().unwrap().usage();
         assert!(after_model.0 > before_model.0 && after_model.1 > before_model.1);
-        let usage = work.lock().unwrap().usage();
-        assert!(usage.0 > 0 && usage.1 > 0);
         let exhausted = SharedDecodeBudget::default();
         exhausted
             .lock()
@@ -465,18 +326,15 @@ mod tests {
             .consume(0, crate::pinning::management::wire::MAX_WIRE_BYTES - 1)
             .unwrap();
         assert!(matches!(
-            CurrentRows::capture(&fixture.db, DecodeWork::shared(&exhausted)).await,
+            current_model::<object::Entity, _>(&fixture.db, &[id], DecodeWork::shared(&exhausted))
+                .await,
             Err(ManagementError::Budget)
         ));
-        assert!(matches!(
-            current_model::<crate::store::entities::object::Entity, _>(
-                &fixture.db,
-                &[id],
-                DecodeWork::shared(&exhausted)
-            )
-            .await,
-            Err(ManagementError::Budget)
-        ));
-        assert!(expected == native::capture(&fixture.db).await.unwrap());
+        let unchanged = collect_scope(&fixture.db, &spec, &mut budget)
+            .await
+            .unwrap()
+            .into_native_frame(&mut budget)
+            .unwrap();
+        assert!(frame == unchanged);
     }
 }

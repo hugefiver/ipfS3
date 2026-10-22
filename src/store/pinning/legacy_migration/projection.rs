@@ -14,6 +14,49 @@ const MOVABLE: [&str; 5] = [
     "pin_lease_targets",
     "pin_jobs",
 ];
+
+/// Operation-local proof of the complete R26 projection, never wire authority.
+pub(in crate::store::pinning) struct R26Admission<'a> {
+    management: &'a super::management_closure::Closure,
+    declaration: &'a Declaration,
+}
+
+impl R26Admission<'_> {
+    pub(in crate::store::pinning) fn routes(&self) -> &[ProviderRouteSnapshot] {
+        self.management.routes()
+    }
+
+    pub(in crate::store::pinning) fn sources(&self) -> impl Iterator<Item = &str> {
+        self.declaration
+            .namespaces
+            .iter()
+            .map(|ns| ns.source.as_str())
+    }
+
+    pub(in crate::store::pinning) fn preserves(&self, route: &ProviderRouteSnapshot) -> bool {
+        route.provider_id.starts_with("legacy:")
+            && route.scope.starts_with("legacy:")
+            && self.routes().contains(route)
+            && !self
+                .declaration
+                .namespaces
+                .iter()
+                .any(|ns| ns.target_route == *route)
+    }
+
+    pub(in crate::store::pinning) fn references(&self, alias: &str) -> bool {
+        self.sources().any(|source| source == alias)
+            || self.routes().iter().any(|route| {
+                route.provider_id == alias
+                    || route.provider_id.strip_prefix("legacy:") == Some(alias)
+            })
+    }
+}
+
+pub(super) struct Projection<'a> {
+    pub(super) after: Vec<TableImage>,
+    pub(super) admission: R26Admission<'a>,
+}
 pub(super) const CAPTURES: [&str; 7] = [
     "pin_extension_decisions",
     "multipart_uploads",
@@ -136,11 +179,11 @@ fn validate_provider_key(value: &str) -> AppResult<()> {
     Ok(())
 }
 
-pub(super) fn project(
+pub(super) fn project<'a>(
     before: &[TableImage],
-    declaration: &Declaration,
-    management: &super::management_closure::Closure,
-) -> AppResult<Vec<TableImage>> {
+    declaration: &'a Declaration,
+    management: &'a super::management_closure::Closure,
+) -> AppResult<Projection<'a>> {
     let mut after = before.to_vec();
     for ns in &declaration.namespaces {
         let expected = bindings(before, ns, management)?;
@@ -243,7 +286,13 @@ pub(super) fn project(
     if before == after {
         return Err(refused("no operational change"));
     }
-    Ok(after)
+    Ok(Projection {
+        after,
+        admission: R26Admission {
+            management,
+            declaration,
+        },
+    })
 }
 
 fn number(row: &NativeRow, column: &str) -> AppResult<i64> {

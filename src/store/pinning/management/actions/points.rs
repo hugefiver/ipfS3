@@ -51,7 +51,12 @@ pub(crate) async fn resolved_slot_with_work<C: ConnectionTrait>(
 ) -> Result<Option<ResolvedSlot>> {
     records::DecodeWork::shared(&work).copy(cid)?;
     let cid = canonical_resource_cid(cid).map_err(|_| ManagementError::InvalidEvidence)?;
-    let actions = records::actions_for_lease_with_work(db, lease_id, work.clone()).await?;
+    let actions = crate::store::pinning::management::admission::authority::actions_for_lease(
+        db,
+        lease_id,
+        work.clone(),
+    )
+    .await?;
     resolved_from_actions(
         db,
         lease_id,
@@ -182,7 +187,12 @@ pub(crate) async fn candidates_for_cid_with_work<C: ConnectionTrait>(
     let context = records::DecodeWork::shared(&work);
     context.copy(cid)?;
     let cid = canonical_resource_cid(cid).map_err(|_| ManagementError::InvalidEvidence)?;
-    let actions = records::actions_for_lease_with_work(db, lease_id, work.clone()).await?;
+    let actions = crate::store::pinning::management::admission::authority::actions_for_lease(
+        db,
+        lease_id,
+        work.clone(),
+    )
+    .await?;
     context.copy(&("lease_id", lease_id))?;
     let key = [("lease_id".into(), lease_id.to_owned())].into();
     let mut result = Vec::new();
@@ -272,11 +282,20 @@ pub(crate) fn project_target_rows(
         if point.lease_id != target.lease.id || point.cid != target.cid {
             continue;
         }
-        if !frame.projected_row_matches(
-            "pin_lease_requirements",
-            &[&point.lease_id],
-            &point.original_contract,
-        ) {
+        let contract_matches = if private {
+            frame.original_row_matches(
+                "pin_lease_requirements",
+                &[&point.lease_id],
+                &point.original_contract,
+            )
+        } else {
+            frame.projected_row_matches(
+                "pin_lease_requirements",
+                &[&point.lease_id],
+                &point.original_contract,
+            )
+        };
+        if !contract_matches {
             return Err(ManagementError::Changed);
         }
         let destination = frame
@@ -315,6 +334,13 @@ pub(crate) fn project_target_rows(
             || point.destination_allocation.clone(),
             |projection| projection.allocation.clone(),
         );
+        let receipt = movement
+            .as_ref()
+            .map(|projection| &projection.legacy_record.values[0]);
+        work.lock()
+            .map_err(|_| ManagementError::InvalidEvidence)?
+            .copy(&receipt)?;
+        let receipt = receipt.cloned();
         let execution_route = movement.map_or_else(
             || point.destination_route.clone(),
             |projection| projection.execution_route,
@@ -334,7 +360,7 @@ pub(crate) fn project_target_rows(
             .find(|candidate| candidate.slot == point.slot)
             .ok_or(ManagementError::InvalidEvidence)?;
         candidate.allocation = allocation;
-        candidate.receipt_id = Some(format!("management-point:{}", point.source_target_id));
+        candidate.receipt_id = receipt;
         if target.id == point.destination_target_id {
             target.route = Some(crate::pinning::management::RouteIdentity::from_original(
                 execution_route,

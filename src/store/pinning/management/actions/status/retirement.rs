@@ -2,205 +2,238 @@
 use super::*;
 use crate::pinning::{
     identity::ProviderRouteSnapshot,
-    management::{RetirementSelection, Subject},
+    management::{
+        RetirementSelection, Subject,
+        retirement::{CurrentRetirementScan, RunLimits},
+    },
 };
+use std::{fs::File, path::Path};
 
-pub(super) async fn current_state<C: ConnectionTrait>(
+/// Owns one verified action and its task-local scan. Progress is not a status
+/// result, and a completed scan cannot be reused for a later current lookup.
+pub struct RetirementStatusLookup {
+    scan: CurrentRetirementScan,
+    original: Option<records::TrustedAppliedAction>,
+    work: records::SharedDecodeBudget,
+}
+
+/// Verifies the original committed action before starting a fresh current scan.
+/// The local artifact adapter owns the protected path/reservation and cleanup;
+/// neither may be taken from an imported plan. No confirmation TTL is renewed.
+#[allow(clippy::too_many_arguments)]
+pub async fn lookup_with_work(
+    db: &DatabaseConnection,
+    auth: &records::LocalAuthorization,
+    binding: &records::ConfirmedBinding,
+    item_id: &str,
+    path: &Path,
+    reservation: File,
+    limits: &RunLimits,
+    work: records::SharedDecodeBudget,
+) -> Result<Option<RetirementStatusLookup>> {
+    let mut tx = ManagementTransaction::begin(
+        db,
+        transaction::FINAL_WRITE_LIMIT.min(limits.elapsed),
+        limits.cancellation.clone(),
+    )
+    .await
+    .map_err(TransactionFailure::management_error)?;
+    let original = tx
+        .run_with(
+            (auth, binding, item_id, work.clone()),
+            |tx, _, (auth, binding, item_id, work)| {
+                Box::pin(async move {
+                    let Some(trusted) =
+                        records::lookup_trusted_with_work(tx, auth, binding, item_id, work.clone())
+                            .await?
+                    else {
+                        return Ok(None);
+                    };
+                    let action = trusted.action_view();
+                    if !is_retirement(action) {
+                        return Err(ManagementError::InvalidEvidence);
+                    }
+                    let Subject::Provider { route } = &action.receipt.binding.request.subject
+                    else {
+                        return Err(ManagementError::InvalidEvidence);
+                    };
+                    let configuration = trusted
+                        .binding()
+                        .confirmation
+                        .configuration
+                        .as_ref()
+                        .ok_or(ManagementError::InvalidEvidence)?;
+                    let context = records::DecodeWork::shared(work);
+                    context.copy(&(route, configuration))?;
+                    let (route, configuration) = (route.clone(), configuration.clone());
+                    Ok(Some((trusted, route, configuration)))
+                })
+            },
+        )
+        .await
+        .map_err(TransactionFailure::management_error)?;
+    tx.rollback()
+        .await
+        .map_err(TransactionFailure::management_error)?;
+    let Some((original, route, configuration)) = original else {
+        return Ok(None);
+    };
+    let scan =
+        CurrentRetirementScan::start(db, route, configuration, path, reservation, limits).await?;
+    Ok(Some(RetirementStatusLookup {
+        scan,
+        original: Some(original),
+        work,
+    }))
+}
+
+impl RetirementStatusLookup {
+    pub async fn close(&self) -> Result<()> {
+        self.scan.close().await
+    }
+    /// None is bounded, resumable progress. Resume with fresh invocation limits;
+    /// source drift, cancellation and budget errors do not authorize a write.
+    pub async fn advance(
+        &mut self,
+        db: &DatabaseConnection,
+        limits: &RunLimits,
+    ) -> Result<Option<records::CommittedAction>> {
+        let Some((fence, state)) = self.scan.prepare_action_status(db, limits).await? else {
+            return Ok(None);
+        };
+        let original = self
+            .original
+            .take()
+            .ok_or(ManagementError::InvalidEvidence)?;
+        let mut tx = ManagementTransaction::begin(
+            db,
+            transaction::FINAL_WRITE_LIMIT.min(limits.elapsed),
+            limits.cancellation.clone(),
+        )
+        .await
+        .map_err(TransactionFailure::management_error)?;
+        let result = tx
+            .run_with((limits, self.work.clone()), move |tx, _, (limits, work)| {
+                Box::pin(async move {
+                    fence.current_status(tx, limits).await?;
+                    let context = records::DecodeWork::shared(work);
+                    context.copy(original.record_key())?;
+                    let keys = [original.record_key().clone()];
+                    let current =
+                        records::actions_at_keys_with_work(tx, &keys, work.clone()).await?;
+                    let current = current.first().ok_or(ManagementError::Changed)?;
+                    if current.facts_identity()? != original.facts_identity()?
+                        || current.action_view() != original.action_view()
+                        || current.binding().principal != original.binding().principal
+                        || current.binding().database_identity
+                            != original.binding().database_identity
+                    {
+                        return Err(ManagementError::Changed);
+                    }
+                    context.copy(current.action_view())?;
+                    let mut action = current.action_view().clone();
+                    action.state = if state == records::ActionState::NeedsAttention
+                        || observations::needs_attention(tx, &action.jobs, work.clone()).await?
+                    {
+                        records::ActionState::NeedsAttention
+                    } else {
+                        destinations(
+                            tx,
+                            &action.receipt.binding.request.action,
+                            &action.targets,
+                            state,
+                            work.clone(),
+                        )
+                        .await?
+                    };
+                    fence.current_status(tx, limits).await?;
+                    Ok(action)
+                })
+            })
+            .await
+            .map_err(TransactionFailure::management_error)?;
+        tx.rollback()
+            .await
+            .map_err(TransactionFailure::management_error)?;
+        Ok(Some(result))
+    }
+}
+
+pub(super) async fn destinations<C: ConnectionTrait>(
     db: &C,
-    action: &records::CommittedAction,
+    action: &Action,
+    targets: &[String],
+    state: records::ActionState,
     work: records::SharedDecodeBudget,
 ) -> Result<records::ActionState> {
-    use records::ActionState::*;
-    let Subject::Provider { route } = &action.receipt.binding.request.subject else {
-        return Err(ManagementError::InvalidEvidence);
-    };
-    let original = route
-        .original
-        .as_ref()
-        .ok_or(ManagementError::InvalidEvidence)?;
+    use records::ActionState::NeedsAttention;
+    if !matches!(
+        action,
+        Action::RetireWith {
+            selection: RetirementSelection::Migrate { .. },
+        }
+    ) {
+        return Ok(state);
+    }
     let context = records::DecodeWork::shared(&work);
-    let current = records::CurrentRows::capture(db, context).await?;
-    let frame = records::FrozenRows::Current(&current);
-    let registry = frame
-        .table("pin_provider_routes")
-        .ok_or(ManagementError::Schema)?;
-    context.with(|work| work.nodes(1 + registry.rows.iter().count()))?;
-    let mut domains = Vec::new();
-    for row in registry.rows.iter() {
+    let now = crate::store::database_clock::database_now(db)
+        .await
+        .map_err(|_| ManagementError::Database)?;
+    for id in targets {
+        let Some(target) =
+            records::current_model::<pin_lease_target::Entity, _>(db, &[id], context).await?
+        else {
+            return Ok(NeedsAttention);
+        };
+        let Some(lease) =
+            records::current_model::<pin_lease::Entity, _>(db, &[&target.lease_id], context)
+                .await?
+        else {
+            return Ok(NeedsAttention);
+        };
+        if target.state != "pinned" || lease.state != "active" || lease.expires_at <= now {
+            return Ok(NeedsAttention);
+        }
+        let key = [target.provider.as_str(), target.cid.as_str()];
+        let Some(remote) =
+            records::current_model::<remote_pin::Entity, _>(db, &key, context).await?
+        else {
+            return Ok(NeedsAttention);
+        };
+        let Some(ledger) = records::current_model::<
+            crate::store::entities::remote_pin_ledger::Entity,
+            _,
+        >(db, &key, context)
+        .await?
+        else {
+            return Ok(NeedsAttention);
+        };
         let route: ProviderRouteSnapshot = context.with(|work| {
             work.typed(
-                row.cell("snapshot")
+                ledger
+                    .route
+                    .as_deref()
                     .ok_or(ManagementError::InvalidEvidence)?,
             )
         })?;
-        if same_domain(&route, original) {
-            domains.push(row);
-        }
-    }
-    if domains.is_empty()
-        || domains
-            .iter()
-            .any(|row| !matches!(row.cell("retired"), Some("1" | "true")))
-    {
-        return Ok(NeedsAttention);
-    }
-    if frame
-        .table("zip_root_references")
-        .ok_or(ManagementError::Schema)?
-        .rows
-        .iter()
-        .any(|row| row.cell("logical_released_at").is_none())
-    {
-        return Ok(NeedsAttention);
-    }
-    let mut queued = false;
-    for table in ["remote_pin_ledger", "pin_resource_history"] {
-        for row in frame
-            .table(table)
-            .ok_or(ManagementError::Schema)?
-            .rows
-            .iter()
-        {
-            let (resource_route, effect, error, absent) = if table == "remote_pin_ledger" {
-                context.copy(&row.cell("effect"))?;
-                (
-                    row.cell("route")
-                        .map(|text| context.with(|work| work.typed::<ProviderRouteSnapshot>(text)))
-                        .transpose()?,
-                    row.cell("effect").map(str::to_owned),
-                    row.cell("last_error").is_some(),
-                    row.cell("effect") == Some("absent"),
-                )
-            } else {
-                let envelope: History = context.with(|work| {
-                    work.typed(row.cell("ledger").ok_or(ManagementError::InvalidEvidence)?)
-                })?;
-                (
-                    envelope
-                        .ledger
-                        .route
-                        .as_deref()
-                        .map(|text| context.with(|work| work.typed::<ProviderRouteSnapshot>(text)))
-                        .transpose()?,
-                    envelope.ledger.effect,
-                    envelope.ledger.last_error.is_some(),
-                    envelope.confirmed_absent,
-                )
-            };
-            let Some(resource_route) = resource_route else {
-                return Ok(NeedsAttention);
-            };
-            if !same_domain(&resource_route, original) || absent {
-                continue;
-            }
-            if error
-                || matches!(
-                    effect.as_deref(),
-                    None | Some("reserved" | "unknown" | "reported_unknown" | "cleanup_pending")
-                )
-                || table == "pin_resource_history"
-            {
-                return Ok(NeedsAttention);
-            }
-        }
-    }
-    for job in frame
-        .table("pin_jobs")
-        .ok_or(ManagementError::Schema)?
-        .rows
-        .iter()
-    {
-        if !domains
-            .iter()
-            .any(|row| row.cell("provider") == job.cell("provider"))
-            || job.cell("state") == Some("done")
-        {
-            continue;
-        }
-        if job.cell("last_error").is_some()
-            || job.cell("state") == Some("running") && job.cell("locked_until").is_none()
+        if remote.status != "pinned"
+            && !(route.resource_type() == RemoteResourceType::ClusterPin
+                && remote.status == "pinning")
         {
             return Ok(NeedsAttention);
         }
-        if job.cell("operation") == Some("unpin") || job.cell("state") == Some("running") {
-            queued = true;
+        if !pin_lease_requirement::contract::target_confirmed_with_work(
+            db,
+            &target.lease_id,
+            &target.provider,
+            &target.cid,
+            now,
+            work.clone(),
+        )
+        .await?
+        {
+            return Ok(NeedsAttention);
         }
     }
-    if let Action::RetireWith {
-        selection: RetirementSelection::Migrate { .. },
-    } = &action.receipt.binding.request.action
-    {
-        let now = crate::store::database_clock::database_now(db)
-            .await
-            .map_err(|_| ManagementError::Database)?;
-        for id in &action.targets {
-            let Some(target) = frame.row("pin_lease_targets", &[id]) else {
-                return Ok(NeedsAttention);
-            };
-            let text = |column| target.cell(column).ok_or(ManagementError::InvalidEvidence);
-            let Some(lease) = frame.row("pin_leases", &[text("lease_id")?]) else {
-                return Ok(NeedsAttention);
-            };
-            if target.cell("state") != Some("pinned")
-                || lease.cell("state") != Some("active")
-                || native::parse_time(
-                    lease
-                        .cell("expires_at")
-                        .ok_or(ManagementError::InvalidEvidence)?,
-                )? <= now
-            {
-                return Ok(NeedsAttention);
-            }
-            let Some(remote) = frame.row("remote_pins", &[text("provider")?, text("cid")?]) else {
-                return Ok(NeedsAttention);
-            };
-            let Some(ledger) = frame.row("remote_pin_ledger", &[text("provider")?, text("cid")?])
-            else {
-                return Ok(NeedsAttention);
-            };
-            let route: ProviderRouteSnapshot = context.with(|work| {
-                work.typed(
-                    ledger
-                        .cell("route")
-                        .ok_or(ManagementError::InvalidEvidence)?,
-                )
-            })?;
-            if remote.cell("status") != Some("pinned")
-                && !(route.resource_type() == RemoteResourceType::ClusterPin
-                    && remote.cell("status") == Some("pinning"))
-            {
-                return Ok(NeedsAttention);
-            }
-            if !pin_lease_requirement::contract::target_confirmed_with_work(
-                db,
-                text("lease_id")?,
-                text("provider")?,
-                text("cid")?,
-                now,
-                work.clone(),
-            )
-            .await?
-            {
-                return Ok(NeedsAttention);
-            }
-        }
-    }
-    Ok(if queued { Queued } else { Accepted })
-}
-#[derive(serde::Deserialize)]
-struct History {
-    ledger: Ledger,
-    #[serde(default)]
-    confirmed_absent: bool,
-}
-#[derive(serde::Deserialize)]
-struct Ledger {
-    route: Option<String>,
-    effect: Option<String>,
-    last_error: Option<String>,
-}
-fn same_domain(left: &ProviderRouteSnapshot, right: &ProviderRouteSnapshot) -> bool {
-    left.backend == right.backend
-        && left.scope == right.scope
-        && left.resource_type() == right.resource_type()
+    Ok(state)
 }

@@ -1,9 +1,10 @@
-use super::{migration, native_catalog, store};
+use super::{file_catalog, migration, native_catalog};
 use crate::store::pinning::{ledger, management::schema as management_schema, quota};
 use sea_orm::{
     ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait, Statement, TransactionTrait,
 };
 use sea_orm_migration::{MigrationTrait, SchemaManager};
+use std::collections::BTreeSet;
 
 const ENDPOINTS: [&str; 4] = [
     "m20261004_000001_rpc_submission_ledger",
@@ -27,9 +28,15 @@ pub(super) async fn declaration(db: &DatabaseConnection) -> migration::Declarati
         retired: false,
         cleanup: crate::pinning::identity::CleanupMode::Retain,
     };
-    ledger::register_route(db, &identity.allocation_key(), &identity)
-        .await
-        .unwrap();
+    if crate::store::initialization::classify(db).await.unwrap()
+        == crate::store::initialization::SchemaState::Current
+    {
+        ledger::register_route(db, &identity.allocation_key(), &identity)
+            .await
+            .unwrap();
+    } else {
+        super::seed_historical_route(db, &identity).await;
+    }
     db.execute_unprepared(
         "INSERT INTO pin_provider_usage(provider,reserved_bytes,reserved_pins) VALUES ('old',97,3)",
     )
@@ -68,7 +75,7 @@ pub(super) async fn receipt_rows(db: &DatabaseConnection) -> Vec<migration::Nati
 #[tokio::test]
 async fn all_four_historical_endpoints_keep_absent_management_and_original_authority() {
     for endpoint in ENDPOINTS {
-        let db = native_catalog(endpoint).await;
+        let (_directory, db) = file_catalog(endpoint).await;
         let declaration = declaration(&db).await;
         let plan = migration::inventory(&db, &declaration).await.unwrap();
         assert_eq!(plan.schema.last().map(String::as_str), Some(endpoint));
@@ -89,6 +96,34 @@ async fn all_four_historical_endpoints_keep_absent_management_and_original_autho
             .unwrap()
             .is_none()
         );
+        let reader = db.begin().await.unwrap();
+        reader
+            .execute_unprepared("PRAGMA query_only=ON")
+            .await
+            .unwrap();
+        assert_eq!(
+            migration::resource_key(&reader, "old", "unmapped-cid")
+                .await
+                .unwrap(),
+            "old"
+        );
+        assert!(
+            migration::resource_binding(&reader, "old", "unmapped-cid")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            migration::release_history(&reader, "old", "unmapped-cid")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        reader
+            .execute_unprepared("PRAGMA query_only=OFF")
+            .await
+            .unwrap();
+        reader.rollback().await.unwrap();
         for table in ["pin_replica_observations", "pin_lease_requirements"] {
             assert_eq!(
                 plan.before
@@ -109,10 +144,65 @@ async fn all_four_historical_endpoints_keep_absent_management_and_original_autho
                 migration::apply(&db, &declaration, &plan).await.unwrap(),
                 receipt
             );
+            assert!(migration::source_is_migrated(&db, "old").await.unwrap());
+            let resolved = migration::resolve_legacy_binding(
+                &db,
+                "pin_provider_usage",
+                &[("provider".into(), "old".into())].into(),
+                "old",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(resolved.operational_key, declaration.namespaces[0].target);
+            assert_eq!(resolved.receipt_id, receipt.id);
+            let exhausted =
+                crate::store::pinning::management::records::SharedDecodeBudget::default();
+            exhausted
+                .lock()
+                .unwrap()
+                .consume(crate::pinning::management::wire::MAX_WIRE_NODES, 0)
+                .unwrap();
+            assert!(matches!(
+                migration::source_is_migrated_with_work(
+                    &db,
+                    "old",
+                    crate::store::pinning::management::records::DecodeWork::shared(&exhausted),
+                )
+                .await,
+                Err(crate::store::pinning::management::ManagementError::Budget)
+            ));
+            assert_eq!(
+                migration::historical_keys(
+                    &db,
+                    "pin_provider_usage",
+                    &declaration.namespaces[0].target,
+                    None,
+                )
+                .await
+                .unwrap(),
+                [declaration.namespaces[0].target.clone(), "old".into()]
+                    .into_iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            );
             let reverse = migration::rollback(&db, &receipt.id, &plan).await.unwrap();
             assert_eq!(
                 migration::rollback(&db, &receipt.id, &plan).await.unwrap(),
                 reverse
+            );
+            assert!(!migration::source_is_migrated(&db, "old").await.unwrap());
+            assert!(
+                migration::resolve_legacy_binding(
+                    &db,
+                    "pin_provider_usage",
+                    &[("provider".into(), "old".into())].into(),
+                    "old",
+                )
+                .await
+                .unwrap()
+                .is_none()
             );
         } else {
             assert!(migration::apply(&db, &declaration, &plan).await.is_err());
@@ -120,7 +210,7 @@ async fn all_four_historical_endpoints_keep_absent_management_and_original_autho
                 super::super::read(&db, &plan.schema).await.unwrap(),
                 plan.before
             );
-            store::run_migrations(&db).await.unwrap();
+            super::upgrade(&db).await;
             assert!(migration::apply(&db, &declaration, &plan).await.is_err());
             let fresh = migration::inventory(&db, &declaration).await.unwrap();
             migration::apply(&db, &declaration, &fresh).await.unwrap();
@@ -140,6 +230,7 @@ async fn all_four_historical_endpoints_keep_absent_management_and_original_autho
                 None
             }
         );
+        super::upgrade(&db).await;
         assert_eq!(
             quota::read_usage(&db, "old")
                 .await
@@ -151,9 +242,333 @@ async fn all_four_historical_endpoints_keep_absent_management_and_original_autho
 }
 
 #[tokio::test]
+async fn historical_resource_identity_reads_preserve_mapping_reversal_and_shared_budget() {
+    use crate::store::pinning::management::{ManagementError, records};
+    for endpoint in &ENDPOINTS[2..] {
+        let (_directory, db) = file_catalog(endpoint).await;
+        let mut declaration = declaration(&db).await;
+        db.execute_unprepared("INSERT INTO remote_pins(provider,cid,cid_size,status,epoch,failure_attempts,last_touched_at) VALUES ('old','historical-resource',1,'reserved',1,0,CURRENT_TIMESTAMP)")
+            .await.unwrap();
+        let release_image =
+            r#"{"confirmed_absent":true,"ledger":{"provider":"old","cid":"historical-resource"}}"#;
+        db.execute(Statement::from_sql_and_values(db.get_database_backend(),
+            "INSERT INTO pin_resource_history(provider,cid,epoch,ledger) VALUES ('old','historical-resource',0,$1)",
+            [release_image.into()])).await.unwrap();
+        for (table, epoch) in [("remote_pins", None), ("pin_resource_history", Some("0"))] {
+            let mut key = std::collections::BTreeMap::from([
+                ("provider".into(), "old".into()),
+                ("cid".into(), "historical-resource".into()),
+            ]);
+            if let Some(epoch) = epoch {
+                key.insert("epoch".into(), epoch.into());
+            }
+            declaration.namespaces[0].bindings.push(migration::Binding {
+                table: table.into(),
+                key,
+                provider: "old".into(),
+                pointer: None,
+                historical_route: None,
+            });
+        }
+        let target = &declaration.namespaces[0].target;
+        let plan = migration::inventory(&db, &declaration).await.unwrap();
+        let applied = migration::apply(&db, &declaration, &plan).await.unwrap();
+        let reader = db.begin().await.unwrap();
+        reader
+            .execute_unprepared("PRAGMA query_only=ON")
+            .await
+            .unwrap();
+        assert_eq!(
+            migration::admission_historical_keys(&reader, target, &())
+                .await
+                .unwrap()
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            BTreeSet::from([target.clone(), "old".into()])
+        );
+        for provider in ["old", target.as_str()] {
+            let budget = records::SharedDecodeBudget::default();
+            assert_eq!(
+                migration::resource_key_budgeted(
+                    &reader,
+                    provider,
+                    "historical-resource",
+                    records::DecodeWork::shared(&budget)
+                )
+                .await
+                .unwrap(),
+                *target
+            );
+            let binding = migration::resource_binding(&reader, provider, "historical-resource")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(binding.operational_key, *target);
+            assert_eq!(binding.receipt_id, applied.id);
+            assert_eq!(binding.historical_epoch, Some(1));
+            let releases = migration::release_history(&reader, provider, "historical-resource")
+                .await
+                .unwrap();
+            assert_eq!(releases.len(), 1);
+            assert_eq!(releases[0].provider, "old");
+            assert_eq!(releases[0].cid, "historical-resource");
+            assert_eq!(releases[0].epoch, 0);
+            assert_eq!(releases[0].ledger, release_image);
+        }
+        let exhausted = records::SharedDecodeBudget::default();
+        exhausted
+            .lock()
+            .unwrap()
+            .consume(crate::pinning::management::wire::MAX_WIRE_NODES, 0)
+            .unwrap();
+        let work = records::DecodeWork::shared(&exhausted);
+        assert!(matches!(
+            migration::resource_key_budgeted(&reader, "old", "historical-resource", work).await,
+            Err(ManagementError::Budget)
+        ));
+        assert!(matches!(
+            migration::resource_binding_with_work(&reader, "old", "historical-resource", work)
+                .await,
+            Err(ManagementError::Budget)
+        ));
+        assert!(matches!(
+            migration::release_history_with_work(&reader, "old", "historical-resource", work).await,
+            Err(ManagementError::Budget)
+        ));
+        reader
+            .execute_unprepared("PRAGMA query_only=OFF")
+            .await
+            .unwrap();
+        reader.rollback().await.unwrap();
+        migration::rollback(&db, &applied.id, &plan).await.unwrap();
+        let reader = db.begin().await.unwrap();
+        reader
+            .execute_unprepared("PRAGMA query_only=ON")
+            .await
+            .unwrap();
+        assert_eq!(
+            migration::admission_historical_keys(&reader, target, &())
+                .await
+                .unwrap()
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            BTreeSet::from([target.clone()])
+        );
+        assert_eq!(
+            migration::resource_key(&reader, "old", "historical-resource")
+                .await
+                .unwrap(),
+            "old"
+        );
+        assert!(
+            migration::resource_binding(&reader, "old", "historical-resource")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let releases = migration::release_history(&reader, "old", "historical-resource")
+            .await
+            .unwrap();
+        assert_eq!(releases.len(), 1);
+        assert_eq!(releases[0].ledger, release_image);
+        reader
+            .execute_unprepared("PRAGMA query_only=OFF")
+            .await
+            .unwrap();
+        reader.rollback().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn admission_receipt_keys_preserve_each_table_alias_and_shared_receipt_freshness() {
+    use crate::store::pinning::management::{ManagementError, native, records};
+    for endpoint in [ENDPOINTS[3], management_schema::VERSION] {
+        let (_directory, db) = file_catalog(endpoint).await;
+        let mut declaration = declaration(&db).await;
+        if endpoint == management_schema::VERSION {
+            declaration.database_scope = native::scope::binding(&db).await.unwrap().0;
+        }
+        let template = declaration.namespaces[0].clone();
+        for source in ["old", "submit-only", "history-only"] {
+            let mut ns = template.clone();
+            ns.source = source.into();
+            if source != "old" {
+                ns.bindings.clear();
+            }
+            if source != "history-only" {
+                let id = format!("admission-{source}");
+                db.execute(Statement::from_sql_and_values(
+                    db.get_database_backend(),
+                    "INSERT INTO pin_submit_observations(id,job_id,submit_call,provider,expected_cid,route,remote_epoch,claim_until,effect,resources,outcome,needs_attention,started_at) VALUES ($1,$1,1,$2,'admission-cid',$3,1,CURRENT_TIMESTAMP,'unknown','[]','in_flight',1,CURRENT_TIMESTAMP)",
+                    [
+                        id.clone().into(),
+                        source.into(),
+                        serde_json::to_string(&ns.target_route).unwrap().into(),
+                    ],
+                ))
+                .await
+                .unwrap();
+                ns.bindings.push(migration::Binding {
+                    table: "pin_submit_observations".into(),
+                    key: [("id".into(), id)].into(),
+                    provider: source.into(),
+                    pointer: None,
+                    historical_route: Some(ns.target_route.clone()),
+                });
+            }
+            if source != "submit-only" {
+                let image = serde_json::json!({
+                    "confirmed_absent": true,
+                    "ledger": {"provider": source, "cid": "admission-cid"}
+                })
+                .to_string();
+                db.execute(Statement::from_sql_and_values(
+                    db.get_database_backend(),
+                    "INSERT INTO pin_resource_history(provider,cid,epoch,ledger) VALUES ($1,'admission-cid',0,$2)",
+                    [source.into(), image.into()],
+                ))
+                .await
+                .unwrap();
+                ns.bindings.push(migration::Binding {
+                    table: "pin_resource_history".into(),
+                    key: [
+                        ("provider".into(), source.into()),
+                        ("cid".into(), "admission-cid".into()),
+                        ("epoch".into(), "0".into()),
+                    ]
+                    .into(),
+                    provider: source.into(),
+                    pointer: None,
+                    historical_route: None,
+                });
+            }
+            if source == "old" {
+                declaration.namespaces[0] = ns;
+            } else {
+                declaration.namespaces.push(ns);
+            }
+        }
+        let target = &template.target;
+        assert_eq!(
+            migration::admission_historical_keys(&db, target, &())
+                .await
+                .unwrap()
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([target.clone()])
+        );
+        let plan = migration::inventory(&db, &declaration).await.unwrap();
+        let applied = migration::apply(&db, &declaration, &plan).await.unwrap();
+        let budget = records::SharedDecodeBudget::default();
+        let context = records::DecodeWork::shared(&budget);
+        let expected = BTreeSet::from([
+            target.clone(),
+            "old".into(),
+            "submit-only".into(),
+            "history-only".into(),
+        ]);
+        assert_eq!(
+            migration::admission_historical_keys(&db, target, &context)
+                .await
+                .unwrap()
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            expected
+        );
+        let nodes = budget.lock().unwrap().usage().0;
+        let limited = records::SharedDecodeBudget::default();
+        let prior = crate::pinning::management::wire::MAX_WIRE_NODES - nodes + 1;
+        limited.lock().unwrap().consume(prior, 0).unwrap();
+        let work = records::DecodeWork::shared(&limited);
+        assert!(matches!(
+            migration::admission_historical_keys(&db, target, &work).await,
+            Err(ManagementError::Budget)
+        ));
+        assert!(limited.lock().unwrap().usage().0 > prior);
+        assert!(matches!(
+            migration::admission_historical_keys(&db, target, &work).await,
+            Err(ManagementError::Budget)
+        ));
+        let fault = db.begin().await.unwrap();
+        assert!(
+            fault
+                .execute(Statement::from_sql_and_values(
+                    fault.get_database_backend(),
+                    "DELETE FROM pin_legacy_migration_items WHERE operation_id=$1 AND ordinal=0",
+                    [applied.id.clone().into()],
+                ))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            migration::admission_historical_keys(&fault, target, &())
+                .await
+                .unwrap()
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            expected
+        );
+        fault.rollback().await.unwrap();
+        assert_eq!(
+            migration::admission_historical_keys(&db, target, &())
+                .await
+                .unwrap()
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            expected
+        );
+        migration::rollback(&db, &applied.id, &plan).await.unwrap();
+        assert_eq!(
+            migration::admission_historical_keys(&db, target, &())
+                .await
+                .unwrap()
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([target.clone()])
+        );
+    }
+}
+
+#[tokio::test]
+async fn historical_receipt_reads_require_the_complete_active_frontier() {
+    let (_directory, db) = file_catalog(ENDPOINTS[3]).await;
+    let declaration = declaration(&db).await;
+    let plan = migration::inventory(&db, &declaration).await.unwrap();
+    migration::apply(&db, &declaration, &plan).await.unwrap();
+    let tx = db.begin().await.unwrap();
+    tx.execute_unprepared(
+        "INSERT INTO pin_legacy_migrations SELECT id||'-incomplete',direction,reverses,database_scope,db_clock,schema_version,declaration,confirmation,item_count FROM pin_legacy_migrations",
+    )
+    .await
+    .unwrap();
+    assert!(migration::source_is_migrated(&tx, "old").await.is_err());
+    assert!(
+        migration::resource_key(&tx, "old", "unmapped-cid")
+            .await
+            .is_err()
+    );
+    assert!(
+        migration::resource_binding(&tx, "old", "unmapped-cid")
+            .await
+            .is_err()
+    );
+    assert!(
+        migration::resolve_legacy_binding(
+            &tx,
+            "pin_provider_usage",
+            &[("provider".into(), "old".into())].into(),
+            "old",
+        )
+        .await
+        .is_err()
+    );
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
 async fn old_committed_receipt_replays_after_upgrade_without_new_table_items_or_history_changes() {
     for endpoint in &ENDPOINTS[2..] {
-        let db = native_catalog(endpoint).await;
+        let (_directory, db) = file_catalog(endpoint).await;
         let declaration = declaration(&db).await;
         let plan = migration::inventory(&db, &declaration).await.unwrap();
         let receipt = migration::apply(&db, &declaration, &plan).await.unwrap();
@@ -168,7 +583,7 @@ async fn old_committed_receipt_replays_after_upgrade_without_new_table_items_or_
                 .unwrap()
                 .starts_with("pin_management_")
         }));
-        store::run_migrations(&db).await.unwrap();
+        super::upgrade(&db).await;
         assert_eq!(
             migration::apply(&db, &declaration, &plan).await.unwrap(),
             receipt
@@ -212,10 +627,85 @@ async fn historical_prefix_rejects_unregistered_management_tables_without_repair
             .await
             .unwrap();
         assert!(super::super::schema(&db, false).await.is_err());
+        assert!(migration::source_is_migrated(&db, "old").await.is_err());
         let registered: i64 = db.query_one(Statement::from_string(DatabaseBackend::Sqlite,
             "SELECT COUNT(*) AS n FROM seaql_migrations WHERE version='m20261012_000001_pinning_management'"))
             .await.unwrap().unwrap().try_get("", "n").unwrap();
         assert_eq!(registered, 0);
+    }
+}
+
+#[tokio::test]
+async fn receipt_reads_recheck_prefix_integrity_and_never_fall_back_from_current_damage() {
+    for endpoint in [ENDPOINTS[3], management_schema::VERSION] {
+        for damage in [
+            "CREATE TEMP VIEW pin_legacy_migrations AS SELECT * FROM main.pin_legacy_migrations",
+            "CREATE TEMP VIEW pin_legacy_migration_items AS SELECT * FROM main.pin_legacy_migration_items",
+            "CREATE TEMP VIEW seaql_migrations AS SELECT * FROM main.seaql_migrations",
+            "ALTER TABLE pin_provider_routes ADD COLUMN unknown_authority TEXT",
+            "DELETE FROM seaql_migrations WHERE version='m20261004_000002_cluster_replica_contract'",
+            "INSERT INTO seaql_migrations(version,applied_at) VALUES ('m99999999_000001_unknown',0)",
+            if endpoint == management_schema::VERSION {
+                "UPDATE pin_management_readiness SET state='backfill' WHERE id=1"
+            } else {
+                "CREATE TABLE pin_management_readiness (id INTEGER PRIMARY KEY)"
+            },
+            if endpoint == management_schema::VERSION {
+                "INSERT INTO pin_management_pending_scope VALUES ('unknown','*','unsealed',1,0)"
+            } else {
+                "CREATE TEMP TABLE pin_management_pending_scope (shadow TEXT)"
+            },
+            if endpoint == management_schema::VERSION {
+                "DROP TABLE pin_management_locator"
+            } else {
+                "CREATE INDEX s75_partial ON pin_legacy_migrations(id)"
+            },
+        ] {
+            let db = native_catalog(endpoint).await;
+            assert!(!migration::source_is_migrated(&db, "old").await.unwrap());
+            let tx = db.begin().await.unwrap();
+            tx.execute_unprepared(damage).await.unwrap();
+            assert!(
+                migration::source_is_migrated(&tx, "old").await.is_err(),
+                "{endpoint}: {damage}"
+            );
+            assert!(
+                migration::resolve_legacy_binding(
+                    &tx,
+                    "pin_provider_usage",
+                    &[("provider".into(), "old".into())].into(),
+                    "old",
+                )
+                .await
+                .is_err(),
+                "{endpoint}: {damage}"
+            );
+            assert!(
+                migration::resource_key(&tx, "old", "unmapped-cid")
+                    .await
+                    .is_err(),
+                "{endpoint}: {damage}"
+            );
+            assert!(
+                migration::resource_binding(&tx, "old", "unmapped-cid")
+                    .await
+                    .is_err(),
+                "{endpoint}: {damage}"
+            );
+            assert!(
+                migration::release_history(&tx, "old", "unmapped-cid")
+                    .await
+                    .is_err(),
+                "{endpoint}: {damage}"
+            );
+            assert!(
+                migration::admission_historical_keys(&tx, "old", &())
+                    .await
+                    .is_err(),
+                "{endpoint}: {damage}"
+            );
+            tx.rollback().await.unwrap();
+        }
     }
 }
 
@@ -340,9 +830,9 @@ async fn admission_schema_returns_exact_prefixes_and_does_not_cache_historical_a
                 .await.unwrap().is_none());
         }
     }
-    let db = native_catalog(ENDPOINTS[3]).await;
+    let (_directory, db) = file_catalog(ENDPOINTS[3]).await;
     let old = migration::admission_schema(&db).await.unwrap();
-    store::run_migrations(&db).await.unwrap();
+    super::upgrade(&db).await;
     let current = migration::admission_schema(&db).await.unwrap();
     assert_eq!(&current[..old.len()], old.as_slice());
     assert_eq!(
@@ -364,6 +854,7 @@ async fn admission_schema_rejects_migration_and_route_shadows_and_native_route_d
             "CREATE TEMP TABLE pin_provider_routes (shadow TEXT)",
             "ALTER TABLE pin_provider_routes ADD COLUMN unknown_authority TEXT",
             "DROP TABLE pin_provider_routes",
+            "ATTACH DATABASE ':memory:' AS attached; CREATE TABLE attached.pin_provider_routes (provider TEXT NOT NULL PRIMARY KEY,snapshot TEXT NOT NULL,display_name TEXT NOT NULL,retired BOOLEAN NOT NULL); DROP TABLE main.pin_provider_routes",
             "DROP TABLE pin_provider_routes; CREATE VIEW pin_provider_routes AS SELECT '' AS provider,'' AS snapshot,'' AS display_name,0 AS retired",
             "DROP TABLE pin_provider_routes; CREATE TABLE pin_provider_routes (provider TEXT NOT NULL,snapshot TEXT NOT NULL,display_name TEXT NOT NULL,retired BOOLEAN NOT NULL)",
             "DROP TABLE pin_provider_routes; CREATE TABLE pin_provider_routes (provider TEXT NOT NULL PRIMARY KEY,snapshot BLOB NOT NULL,display_name TEXT NOT NULL,retired BOOLEAN NOT NULL)",

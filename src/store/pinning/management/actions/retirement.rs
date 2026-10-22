@@ -4,7 +4,7 @@ use crate::{
         Action, PlanEntry, RetirementCapture, RetirementSelection, RouteIdentity,
     },
     store::{
-        entities::{pin_provider_route, remote_pin},
+        entities::remote_pin,
         pinning::{
             jobs::{self, NewPinJob},
             ledger,
@@ -12,6 +12,48 @@ use crate::{
     },
 };
 use sea_orm::{DatabaseTransaction, Statement};
+
+pub(super) fn route_keys(
+    binding: records::BindingView<'_>,
+    entry: &PlanEntry,
+) -> Result<Vec<String>> {
+    let crate::pinning::management::Subject::Provider { route } = &entry.request.subject else {
+        return Err(ManagementError::Confirmation);
+    };
+    let original = route
+        .original
+        .as_ref()
+        .ok_or(ManagementError::Confirmation)?;
+    let domain = super::super::admission::allocation_domain(original).map_err(database)?;
+    binding.copy(&domain)?;
+    let frame = binding.frozen_rows()?;
+    let mut keys = Vec::new();
+    for row in frame
+        .table("pin_provider_routes")
+        .ok_or(ManagementError::Schema)?
+        .rows
+        .iter()
+    {
+        let captured = binding.decode_route(
+            row.cell("snapshot")
+                .ok_or(ManagementError::InvalidEvidence)?,
+        )?;
+        let captured_domain =
+            super::super::admission::allocation_domain(&captured).map_err(database)?;
+        binding.copy(&captured_domain)?;
+        if captured_domain == domain {
+            let key = row
+                .cell("provider")
+                .ok_or(ManagementError::InvalidEvidence)?;
+            binding.copy(key)?;
+            keys.push(key.to_owned());
+        }
+    }
+    if keys.is_empty() {
+        return Err(ManagementError::Confirmation);
+    }
+    Ok(keys)
+}
 
 pub(super) async fn execute(
     tx: &DatabaseTransaction,
@@ -57,6 +99,7 @@ pub(super) async fn execute(
         }
         RetirementSelection::Migrate { targets } => {
             let active = capture
+                .mutation_scope
                 .targets
                 .iter()
                 .filter(|target| {
@@ -64,7 +107,11 @@ pub(super) async fn execute(
                         && target.lease.state == crate::pinning::management::LeaseState::Active
                 })
                 .collect::<Vec<_>>();
-            if active.len() != targets.len() {
+            if !capture.totals.attribution_complete
+                || capture.totals.roots != 0
+                || targets.len() != capture.totals.active_targets
+                || active.len() != targets.len()
+            {
                 return Err(ManagementError::Confirmation);
             }
             binding.with_decode_work(|work| work.nodes(1 + targets.len()))?;
@@ -257,20 +304,47 @@ pub(super) async fn execute(
             records::Disposition::ControlledCleanup
         }
     };
+    if matches!(selection, RetirementSelection::Migrate { .. }) {
+        // Resolve the existing destination receipts before dirtying this
+        // retirement's source locator. Retirement never births a Submit.
+        for target_id in &result.targets {
+            let jobs = records::current_models::<crate::store::entities::pin_job::Entity, _>(
+                tx,
+                "FROM pin_jobs WHERE state IN ('pending','retry','running','blocked') AND operation IN ('submit','poll') AND EXISTS (SELECT 1 FROM pin_lease_targets t WHERE t.id=$1 AND t.provider=pin_jobs.provider AND t.cid=pin_jobs.cid)",
+                "pin_jobs.id", vec![target_id.clone().into()], native::MAX_ROWS, binding.decode_work(),
+            ).await?;
+            for job in jobs {
+                if result
+                    .jobs
+                    .iter()
+                    .any(|authority| authority.job_id == job.id)
+                {
+                    continue;
+                }
+                if frame.row("pin_jobs", &[&job.id]).is_none() {
+                    return Err(ManagementError::Confirmation);
+                }
+                if !crate::store::pinning::jobs::check_target_job_generation_with_work(
+                    tx,
+                    &job,
+                    binding.decode_work(),
+                )
+                .await?
+                {
+                    continue;
+                }
+                let authority = job_authority::lookup_with_work(
+                    tx,
+                    &job,
+                    binding.decode_work().budget().clone(),
+                )
+                .await?
+                .ok_or(ManagementError::Confirmation)?;
+                result.jobs.push(authority);
+            }
+        }
+    }
     // Stable domain barrier and actual route stop, not just an advisory record.
-    tx.execute(Statement::from_sql_and_values(
-        tx.get_database_backend(),
-        "UPDATE pin_provider_routes SET retired=$1 WHERE provider=$2 AND snapshot=$3",
-        [
-            true.into(),
-            domain.into(),
-            native::value(registered[0], "snapshot")
-                .ok_or(ManagementError::InvalidEvidence)?
-                .into(),
-        ],
-    ))
-    .await
-    .map_err(|_| ManagementError::Database)?;
     let record = records::write_retirement_marker(
         tx,
         auth,
@@ -281,6 +355,24 @@ pub(super) async fn execute(
         vec![],
     )
     .await?;
+    for key in route_keys(binding, entry)? {
+        let row = frame
+            .row("pin_provider_routes", &[&key])
+            .ok_or(ManagementError::Confirmation)?;
+        match row.cell("retired") {
+            Some("1" | "true") => continue,
+            Some("0" | "false") => {}
+            _ => return Err(ManagementError::InvalidEvidence),
+        }
+        let changed = tx.execute(Statement::from_sql_and_values(
+            tx.get_database_backend(),
+            "UPDATE pin_provider_routes SET retired=$1 WHERE provider=$2 AND snapshot=$3 AND retired=$4",
+            [true.into(), key.into(), row.cell("snapshot").ok_or(ManagementError::InvalidEvidence)?.into(), false.into()],
+        )).await.map_err(|_| ManagementError::Database)?;
+        if changed.rows_affected() != 1 {
+            return Err(ManagementError::Changed);
+        }
+    }
     result.state = if record.state == records::RetirementState::NeedsAttention {
         records::ActionState::NeedsAttention
     } else if result.jobs.is_empty() {
@@ -288,15 +380,5 @@ pub(super) async fn execute(
     } else {
         records::ActionState::Queued
     };
-    let current = records::current_model::<pin_provider_route::Entity, _>(
-        tx,
-        &[domain],
-        binding.decode_work(),
-    )
-    .await?
-    .ok_or(ManagementError::Changed)?;
-    if !current.retired {
-        return Err(ManagementError::Changed);
-    }
     Ok(())
 }

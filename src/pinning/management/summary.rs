@@ -182,19 +182,10 @@ pub(crate) fn summarize(
                 }
             }
             Some(Capture::Provider(capture)) => {
-                summary.logical_targets += capture.targets.len();
-                for target in &capture.targets {
-                    cids.insert(&target.cid);
-                    summary.logical_intent_bytes = summary
-                        .logical_intent_bytes
-                        .checked_add(target.logical_bytes)
-                        .ok_or(SafeError::LimitExceeded)?;
-                }
-                for remote in capture.remotes.iter().chain(&capture.historical_remotes) {
-                    let remote = current_or_captured(snapshot, remote);
-                    add_remote(&mut resources, remote);
-                    cids.insert(&remote.key.cid);
-                }
+                let _ = capture;
+                // Plan-wide union is performed by the disk reducer, including
+                // local captures. Per-provider totals cannot safely be summed.
+                return Err(SafeError::InvalidActionScope);
             }
             None => {}
         }

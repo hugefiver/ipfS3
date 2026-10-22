@@ -1,5 +1,7 @@
 use super::*;
 
+mod retirement_inventory;
+
 fn route() -> RouteIdentity {
     RouteIdentity {
         provider_id: "provider-a".into(),
@@ -659,47 +661,15 @@ fn destination_safety_is_checked_separately() {
     );
 }
 
-fn retirement_fixture() -> (PlanRequest, Snapshot) {
-    let (_, mut snapshot) = existing(Action::Cancel, SideEffect::Unknown);
-    snapshot.routes[0].available = false;
-    snapshot.remotes[0].cleanup_pending = true;
-    snapshot.remotes[0].inflight_operations = Some(1);
-    snapshot.inventories.push(ProviderInventory {
-        provider_id: route().provider_id,
-        frontier: vec![native_key("pin_jobs", "job-1")],
-        complete: true,
-        allocation_stopped: false,
-        leases: vec![snapshot.targets[0].lease.clone()],
-        root_reference_ids: vec![NativeKey {
-            table: "zip_root_references".into(),
-            values: vec![
-                "root-owner-1".into(),
-                "1".into(),
-                "1".into(),
-                "node".into(),
-                "hot".into(),
-                "cid".into(),
-            ],
-        }],
-        attribution_complete: true,
-    });
-    (
-        PlanRequest {
-            plan_id: "maintenance-1".into(),
-            items: vec![ItemRequest {
-                item_id: "file-1".into(),
-                action: Action::Retire,
-                subject: Subject::Provider { route: route() },
-            }],
-        },
-        snapshot,
-    )
-}
-
-#[test]
-fn retirement_keeps_every_responsibility_and_surfaces_missing_credentials() {
-    let (request, snapshot) = retirement_fixture();
-    let plan = dry_run(&request, &snapshot).unwrap();
+#[tokio::test]
+async fn retirement_keeps_every_responsibility_and_surfaces_missing_credentials() {
+    let mut fixture = retirement_inventory::Fixture::new().await;
+    let spool = fixture.inventory().await;
+    fixture.reduce(&spool).await;
+    let review = spool.frozen_review().await.unwrap();
+    assert!(!review.totals().routes_available);
+    fixture.seal(&review).await.unwrap();
+    let plan = fixture.plan(&spool).await;
     if let Some(PlannedStep::Retire(step)) = &plan.items()[0].step {
         assert!(step.stop_new_allocations && step.needs_attention);
         assert_eq!(
@@ -718,25 +688,55 @@ fn retirement_keeps_every_responsibility_and_surfaces_missing_credentials() {
     }
     assert_eq!(plan.summary().accounted_remote_bytes, 50);
     assert_eq!(plan.summary().physical_release_bytes, 0);
-    assert!(revalidate(&plan, &confirmation(&plan), &snapshot).is_ok());
+    spool.close().await.unwrap();
+    fixture.close().await;
 }
 
-#[test]
-fn retirement_requires_complete_inventory_and_detects_new_orphan_resources() {
-    let (request, mut snapshot) = retirement_fixture();
-    let plan = dry_run(&request, &snapshot).unwrap();
-    let mut extra = snapshot.remotes[0].clone();
-    extra.key.cid = "bafy-orphan".into();
-    snapshot.remotes.push(extra);
+#[tokio::test]
+async fn retirement_requires_complete_inventory_and_detects_new_orphan_resources() {
+    use crate::store::pinning::management::ManagementError;
+    let mut fixture = retirement_inventory::Fixture::new().await;
+    let spool = fixture.inventory().await;
+    assert!(matches!(
+        spool.frozen_review().await,
+        Err(ManagementError::InvalidEvidence)
+    ));
+    fixture.scan(&spool).await;
+    assert!(matches!(
+        spool.frozen_review().await,
+        Err(ManagementError::InvalidEvidence)
+    ));
+    fixture.reduce(&spool).await;
+    let review = spool.frozen_review().await.unwrap();
+    fixture.seal(&review).await.unwrap();
+    let original = fixture.plan(&spool).await;
+    fixture
+        .remote(
+            "selected",
+            "QmYwAPJzv5CZsnAzt8auVTL7VYhESWDFoCPTqCkiP6fKGE",
+            "orphan",
+            &fixture.route,
+        )
+        .await;
+    assert!(matches!(
+        fixture.seal(&review).await,
+        Err(ManagementError::Changed)
+    ));
+    let fresh = fixture.inventory().await;
+    fixture.reduce(&fresh).await;
+    let changed = fixture.plan(&fresh).await;
     assert_eq!(
-        revalidate(&plan, &confirmation(&plan), &snapshot).err(),
-        Some(SafeError::SnapshotChanged)
+        changed.summary().unique_resources,
+        original.summary().unique_resources + 1
     );
-    snapshot.inventories[0].complete = false;
     assert_eq!(
-        dry_run(&request, &snapshot).unwrap().items()[0].status,
-        PlanStatus::Blocked(SafeError::IncompleteInventory)
+        changed.summary().accounted_remote_bytes,
+        original.summary().accounted_remote_bytes + 50
     );
+    assert_eq!(changed.summary().physical_release_bytes, 0);
+    fresh.close().await.unwrap();
+    spool.close().await.unwrap();
+    fixture.close().await;
 }
 
 #[test]
@@ -959,16 +959,19 @@ fn history_observations_of_same_resource_deduplicate_but_distinct_resources_do_n
     assert_eq!(plan.summary().accounted_remote_bytes, 100);
 }
 
-#[test]
-fn retirement_captures_history_even_without_live_target_or_route() {
-    let (request, mut snapshot) = retirement_fixture();
-    let mut history = snapshot.remotes[0].clone();
-    history.epoch = 10;
-    history.resource_id = Some("older-resource".into());
-    history.route.credential_revision = 99;
-    snapshot.historical_remotes.push(history);
-    snapshot.targets.clear();
-    let plan = dry_run(&request, &snapshot).unwrap();
+#[tokio::test]
+async fn retirement_captures_history_even_without_live_target_or_route() {
+    let mut fixture = retirement_inventory::Fixture::new().await;
+    fixture.history_without_live_target_or_route().await;
+    let spool = fixture.inventory().await;
+    fixture.reduce(&spool).await;
+    let review = spool.frozen_review().await.unwrap();
+    assert_eq!(review.totals().targets, 0);
+    assert_eq!(review.totals().historical_resources, 2);
+    assert_eq!(review.totals().unique_resources, 2);
+    assert!(!review.totals().routes_available);
+    fixture.seal(&review).await.unwrap();
+    let plan = fixture.plan(&spool).await;
     assert_eq!(plan.summary().accounted_remote_bytes, 100);
     if let Some(PlannedStep::Retire(step)) = &plan.items()[0].step {
         assert!(step.needs_attention);
@@ -984,6 +987,9 @@ fn retirement_captures_history_even_without_live_target_or_route() {
     } else {
         panic!("missing retirement");
     }
+    assert_eq!(plan.summary().physical_release_bytes, 0);
+    spool.close().await.unwrap();
+    fixture.close().await;
 }
 
 #[test]

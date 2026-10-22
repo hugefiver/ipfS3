@@ -6,7 +6,7 @@ use crate::store::pinning::{
     management::{native, records, schema},
     quota,
 };
-use sea_orm::{ConnectionTrait, Statement};
+use sea_orm::{ConnectionTrait, Statement, TransactionTrait};
 
 #[path = "snapshot_management_fixture.rs"]
 pub(super) mod fixture;
@@ -97,11 +97,14 @@ async fn full_management_originals_are_raw_fenced_receipted_and_not_rekeyed_or_s
     )
     .await
     .unwrap();
+    let provider = retirement["allocation_domain"].as_deref().unwrap();
+    let original_route = native.original_value("pin_provider_routes", &[provider], "snapshot");
+    assert!(original_route.is_some());
     assert_eq!(
         review
             .rows()
-            .original_value("objects", &["private-object"], "metadata"),
-        native.original_value("objects", &["private-object"], "metadata")
+            .original_value("pin_provider_routes", &[provider], "snapshot"),
+        original_route
     );
     assert_eq!(
         plan.declaration.namespaces[0].bindings.len(),
@@ -192,6 +195,9 @@ async fn management_private_cells_and_same_count_membership_invalidate_old_confi
         declaration,
     } = fixture::fixture().await;
     let versions = super::super::schema(&db, false).await.unwrap();
+    let immutable = db.query_one(Statement::from_string(db.get_database_backend(),
+        "SELECT sql FROM main.sqlite_schema WHERE type='trigger' AND name='s75_applied_no_update'"))
+        .await.unwrap().unwrap().try_get::<String>("", "sql").unwrap();
     for (table, selector, columns) in [
         (
             schema::RECORDS,
@@ -206,43 +212,43 @@ async fn management_private_cells_and_same_count_membership_invalidate_old_confi
     ] {
         for column in columns {
             let plan = migration::inventory(&db, &declaration).await.unwrap();
-            let original = image(&plan.before, table)
-                .rows
-                .iter()
-                .find(|row| {
-                    row.get("kind").and_then(Option::as_deref) == Some("action")
-                        || table == schema::RETIREMENTS
-                })
-                .unwrap()[*column]
-                .clone();
-            db.execute_unprepared(&format!(
-                "UPDATE {table} SET {column}={column}||' ' WHERE {selector}"
-            ))
-            .await
-            .unwrap();
-            let changed = super::super::read(&db, &versions).await.unwrap();
+            let fault = db.begin().await.unwrap();
+            fault
+                .execute_unprepared("DROP TRIGGER s75_applied_no_update")
+                .await
+                .unwrap();
+            fault
+                .execute_unprepared(&format!(
+                    "UPDATE {table} SET {column}={column}||' ' WHERE {selector}"
+                ))
+                .await
+                .unwrap();
+            fault.execute_unprepared(&immutable).await.unwrap();
+            let changed = super::super::read(&fault, &versions).await.unwrap();
             assert_ne!(changed, plan.before);
             assert!(
-                migration::apply(&db, &declaration, &plan).await.is_err(),
+                migration::apply(&fault, &declaration, &plan).await.is_err(),
                 "{table}.{column}"
             );
-            assert_eq!(super::super::read(&db, &versions).await.unwrap(), changed);
             assert_eq!(
-                super::super::frontier(&db, &versions).await.unwrap(),
+                super::super::read(&fault, &versions).await.unwrap(),
+                changed
+            );
+            assert_eq!(
+                super::super::frontier(&fault, &versions).await.unwrap(),
                 plan.receipt_frontier
             );
-            db.execute(Statement::from_sql_and_values(
-                db.get_database_backend(),
-                format!("UPDATE {table} SET {column}=$1 WHERE {selector}"),
-                [original.into()],
-            ))
-            .await
-            .unwrap();
+            fault.rollback().await.unwrap();
+            assert_eq!(
+                super::super::read(&db, &versions).await.unwrap(),
+                plan.before
+            );
         }
     }
     let plan = migration::inventory(&db, &declaration).await.unwrap();
-    db.execute_unprepared("UPDATE pin_management_records SET plan_id='same-count-different-member' WHERE kind='evidence_preparation'").await.unwrap();
-    let changed = super::super::read(&db, &versions).await.unwrap();
+    let fault = db.begin().await.unwrap();
+    fault.execute_unprepared("UPDATE pin_management_records SET plan_id='same-count-different-member' WHERE kind='evidence_preparation'").await.unwrap();
+    let changed = super::super::read(&fault, &versions).await.unwrap();
     assert_eq!(
         image(&changed, schema::RECORDS).rows.len(),
         image(&plan.before, schema::RECORDS).rows.len()
@@ -251,11 +257,19 @@ async fn management_private_cells_and_same_count_membership_invalidate_old_confi
         image(&changed, schema::RECORDS),
         image(&plan.before, schema::RECORDS)
     );
-    assert!(migration::apply(&db, &declaration, &plan).await.is_err());
-    assert_eq!(super::super::read(&db, &versions).await.unwrap(), changed);
+    assert!(migration::apply(&fault, &declaration, &plan).await.is_err());
     assert_eq!(
-        super::super::frontier(&db, &versions).await.unwrap(),
+        super::super::read(&fault, &versions).await.unwrap(),
+        changed
+    );
+    assert_eq!(
+        super::super::frontier(&fault, &versions).await.unwrap(),
         plan.receipt_frontier
+    );
+    fault.rollback().await.unwrap();
+    assert_eq!(
+        super::super::read(&db, &versions).await.unwrap(),
+        plan.before
     );
     let usage = quota::read_usage(&db, "old").await.unwrap().unwrap();
     assert_eq!((usage.reserved_bytes, usage.reserved_pins), (97, 3));

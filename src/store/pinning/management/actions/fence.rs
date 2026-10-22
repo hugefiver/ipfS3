@@ -2,17 +2,21 @@ use super::*;
 use sea_orm::{DatabaseTransaction, Statement};
 
 pub(super) async fn write_intent(tx: &DatabaseTransaction) -> Result<()> {
-    if tx.get_database_backend() == DatabaseBackend::Sqlite {
-        tx.execute_unprepared("UPDATE pin_management_records SET database_scope=database_scope WHERE kind='database_scope'").await.map_err(|_|ManagementError::Database)?;
-    }
-    Ok(())
+    crate::store::pinning::management::admission::lock_sqlite_writer_in_caller_transaction(tx)
+        .await
+        .map_err(database)
 }
+
+#[cfg(test)]
+#[path = "fence_tests.rs"]
+mod tests;
 
 pub(super) async fn lock(
     tx: &DatabaseTransaction,
     before: records::FrozenRows<'_>,
     _config: &ManagementConfig,
     binding: &records::ConfirmedBinding,
+    scope: &crate::pinning::management::db_snapshot::PlanningScope,
     work: records::DecodeWork<'_>,
 ) -> Result<()> {
     before.validate_current()?;
@@ -24,10 +28,11 @@ pub(super) async fn lock(
         )
         .await
         .map_err(database)?;
+        revalidate(tx, scope, work).await?;
         return Ok(());
     }
-    // Full frozen membership, not a growing CID-local lock set. This preserves
-    // the global native fence while refusing scope expansion after any lock.
+    // The request-derived current closure fixes the row lock set before any
+    // lock; record revalidation still proves the original reviewed authority.
     for name in [
         "buckets",
         "objects",
@@ -41,7 +46,7 @@ pub(super) async fn lock(
         "remote_pin_ledger",
         "pin_provider_usage",
     ] {
-        lock_rows(tx, before, name, work).await?;
+        lock_rows(tx, scope, name, work).await?;
     }
     crate::store::pinning::management::admission::lock_open_with_work(
         tx,
@@ -51,21 +56,24 @@ pub(super) async fn lock(
     .await
     .map_err(database)?;
     for name in ["pin_management_retirements", "pin_provider_routes"] {
-        lock_rows(tx, before, name, work).await?;
+        lock_rows(tx, scope, name, work).await?;
     }
-    // Tail NOWAIT barriers include empty tables and insert phantoms. Callback
-    // job→remote locks cannot make us wait while holding lifecycle rows.
-    for table in native::registry() {
-        tx.execute_unprepared(&format!(
-            "LOCK TABLE \"{}\" IN SHARE ROW EXCLUSIVE MODE NOWAIT",
-            table.table
-        ))
-        .await
-        .map_err(|_| ManagementError::Changed)?;
-    }
-    // The final record-layer revalidator removes only validated exact self keys
-    // and rereads every row/private tuple/frontier after these barriers.
+    // Tail NOWAIT barriers cover the complete selected memberships, including
+    // empty sets. No unrelated registry rows are enumerated or locked.
+    records::locator::fence_authority(tx).await?;
+    revalidate(tx, scope, work).await?;
     Ok(())
+}
+
+async fn revalidate(
+    tx: &DatabaseTransaction,
+    scope: &crate::pinning::management::db_snapshot::PlanningScope,
+    work: records::DecodeWork<'_>,
+) -> Result<()> {
+    let mut budget = native::meter::Budget::default();
+    let result = scope.revalidate(tx, &mut budget).await;
+    super::super::admission::authority::charge(&budget, work)?;
+    result.map_err(local_scope::snapshot_error)
 }
 
 fn allocation_routes(
@@ -119,30 +127,39 @@ fn allocation_routes(
 
 async fn lock_rows(
     tx: &DatabaseTransaction,
-    frame: records::FrozenRows<'_>,
+    scope: &crate::pinning::management::db_snapshot::PlanningScope,
     name: &str,
     work: records::DecodeWork<'_>,
 ) -> Result<()> {
-    let table = frame.table(name).ok_or(ManagementError::Schema)?;
-    work.with(|work| work.nodes(1 + table.rows.iter().count()))?;
-    let mut rows = table.rows.iter().collect::<Vec<_>>();
+    let table = native::current_catalog()
+        .iter()
+        .find(|table| table.table == name)
+        .ok_or(ManagementError::Schema)?;
+    let mut rows = scope
+        .originals()
+        .iter()
+        .filter(|(key, _)| key.table == name)
+        .map(|(_, row)| row)
+        .collect::<Vec<_>>();
+    work.with(|work| work.nodes(1 + rows.len()))?;
     if name == "pin_lease_targets" {
         rows.sort_by_key(|row| (native::value(*row, "created_at"), native::value(*row, "id")));
     }
     for row in rows {
         work.with(|work| work.nodes(2 + table.primary_key.len() * 2))?;
-        let mut clauses = Vec::new();
-        let mut values = Vec::<sea_orm::Value>::new();
-        for (index, column) in table.primary_key.iter().enumerate() {
+        let mut key = Vec::with_capacity(table.primary_key.len());
+        for column in &table.primary_key {
             let value = native::value(row, column).ok_or(ManagementError::InvalidEvidence)?;
             work.copy(value)?;
-            clauses.push(format!("CAST(\"{column}\" AS TEXT)=${}", index + 1));
-            values.push(value.to_owned().into());
+            key.push(value);
         }
-        let sql = format!(
-            "SELECT 1 AS present FROM \"{name}\" WHERE {} FOR UPDATE NOWAIT",
-            clauses.join(" AND ")
-        );
+        let layout = native::current_catalog()
+            .iter()
+            .find(|layout| layout.table == name)
+            .ok_or(ManagementError::Schema)?;
+        let (predicate, values) = sql::exact_key(layout, &key)?;
+        let sql =
+            format!("SELECT 1 AS present FROM \"{name}\" WHERE {predicate} FOR UPDATE NOWAIT");
         if tx
             .query_one(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
@@ -150,7 +167,7 @@ async fn lock_rows(
                 values,
             ))
             .await
-            .map_err(|_| ManagementError::Changed)?
+            .map_err(super::super::nowait_error)?
             .is_none()
         {
             return Err(ManagementError::Changed);

@@ -12,7 +12,7 @@ use ipfs_s3_gateway::{
         },
     },
 };
-use sea_orm::{ConnectionTrait, EntityTrait, TransactionTrait};
+use sea_orm::{ConnectionTrait, DbErr, EntityTrait, RuntimeErr, TransactionTrait};
 
 #[tokio::test]
 async fn retain_metadata_blocks_first_birth_shared_cid_reuse_and_does_not_release_capacity() {
@@ -45,13 +45,12 @@ async fn retain_metadata_blocks_first_birth_shared_cid_reuse_and_does_not_releas
     let record = support::retire(&db, &raw, &config, "retire-held-domain").await;
     assert_eq!(record.state, records::RetirementState::NeedsAttention);
     assert!(
-        !pin_provider_route::Entity::find_by_id(allocation.clone())
+        pin_provider_route::Entity::find_by_id(allocation.clone())
             .one(&db)
             .await
             .unwrap()
             .unwrap()
-            .retired,
-        "exercise the permanent record, not only the old registration boolean"
+            .retired
     );
     for requested in [
         &cid,
@@ -193,12 +192,13 @@ async fn aliases_cannot_reopen_but_a_proven_distinct_full_domain_is_not_globally
     support::foundation::setup(&db, &config).await;
     let original = config.pinning.providers[0].identity.clone();
     let key = original.allocation_key();
-    let old = pin_provider_route::Entity::find_by_id(key.clone())
+    let mut expected = pin_provider_route::Entity::find_by_id(key.clone())
         .one(&db)
         .await
         .unwrap()
         .unwrap();
     support::retire(&db, &raw, &config, "retire-alias-domain").await;
+    expected.retired = true;
     let mut alias = original.clone();
     alias.provider_id = "new-alias".into();
     ledger::register_route(&db, &key, &alias).await.unwrap();
@@ -208,7 +208,7 @@ async fn aliases_cannot_reopen_but_a_proven_distinct_full_domain_is_not_globally
             .await
             .unwrap()
             .unwrap(),
-        old
+        expected
     );
     for family in [false, true] {
         let mut other = original.clone();
@@ -250,18 +250,26 @@ async fn aliases_cannot_reopen_but_a_proven_distinct_full_domain_is_not_globally
 }
 
 #[tokio::test]
-async fn an_incomplete_actual_receipt_is_needs_attention_not_a_reopened_domain() {
+async fn applied_retirement_receipt_is_immutable_and_cannot_reopen_domain() {
     let raw = support::foundation::config("http://127.0.0.1:1");
     let config = support::foundation::management_config(&raw);
     let (_directory, db) = support::foundation::database().await;
     support::foundation::setup(&db, &config).await;
     support::retire(&db, &raw, &config, "retire-corrupt-receipt").await;
-    db.execute_unprepared(
-        "UPDATE pin_management_records SET result='{}' WHERE kind='action' AND state='applied'",
-    )
-    .await
-    .unwrap();
     let before = native::capture(&db).await.unwrap();
+    let error = db
+        .execute_unprepared(
+            "UPDATE pin_management_records SET result='{}' WHERE kind='action' AND state='applied'",
+        )
+        .await
+        .unwrap_err();
+    let DbErr::Exec(RuntimeErr::SqlxError(error)) = error else {
+        panic!("expected SQLite immutable rejection: {error:?}");
+    };
+    assert_eq!(
+        error.as_database_error().unwrap().code().unwrap().as_ref(),
+        "1811"
+    );
     let tx = db.begin().await.unwrap();
     let now = ipfs_s3_gateway::store::database_clock::database_now(&tx)
         .await
@@ -276,7 +284,10 @@ async fn an_incomplete_actual_receipt_is_needs_attention_not_a_reopened_domain()
     )
     .await
     .unwrap_err();
-    assert!(error.to_string().contains("needs attention"));
+    assert!(matches!(
+        error,
+        ipfs_s3_gateway::error::AppError::InvalidPinningRequest(_)
+    ));
     tx.rollback().await.unwrap();
     assert!(before == native::capture(&db).await.unwrap());
 }
@@ -297,7 +308,7 @@ async fn ordinary_admission_does_not_inherit_the_full_native_inventory_budget() 
     db.execute_unprepared("UPDATE objects SET metadata=json_object('large',printf('%.*c',4194305,'x')) WHERE key='large-metadata'").await.unwrap();
     assert!(
         native::capture(&db).await.is_err(),
-        "management capture is still complete and budgeted"
+        "explicit diagnostic capture remains bounded"
     );
     let mut limits = config.pinning.provider_limits.clone();
     limits.insert(
@@ -332,12 +343,12 @@ async fn same_count_route_phantom_invalidates_confirmation_instead_of_authorizin
     support::foundation::setup(&db, &config).await;
     let (auth, binding, _) =
         support::confirmed_retirement(&db, &raw, &config, "retire-phantom").await;
-    let tx = db.begin().await.unwrap();
     db.execute_unprepared(
         "UPDATE pin_provider_routes SET display_name='same-count-replaced-tuple'",
     )
     .await
     .unwrap();
+    let tx = db.begin().await.unwrap();
     assert!(
         records::revalidate_confirmed_in_transaction(&tx, &config, &auth, &binding)
             .await

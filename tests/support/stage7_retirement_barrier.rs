@@ -14,15 +14,15 @@ use ipfs_s3_gateway::{
     store::{
         entities::pin_lease,
         pinning::{
-            management::records,
+            management::{
+                records,
+                transaction::{CancellationToken, FINAL_WRITE_LIMIT, ManagementTransaction},
+            },
             publication::{self, PinTargetSpec, PublicationObject, PublicationRequest},
         },
     },
 };
-use sea_orm::{
-    ConnectionTrait, DatabaseBackend, DatabaseConnection, DatabaseTransaction, EntityTrait,
-    TransactionTrait,
-};
+use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait};
 
 pub async fn confirmed_retirement(
     db: &DatabaseConnection,
@@ -50,7 +50,15 @@ pub async fn confirmed_retirement(
         .unwrap()
         .planning_snapshot()
         .unwrap();
-    let plan = dry_run(&request, &snapshot).unwrap();
+    let prepared = retirement::PreparedPlanning::collect(
+        db,
+        &request,
+        &snapshot,
+        records::SharedDecodeBudget::default(),
+    )
+    .await
+    .unwrap();
+    let plan = prepared.plan.clone();
     let auth = records::authorize_local(raw, db).await.unwrap();
     let confirmed = records::confirm(
         db,
@@ -62,17 +70,18 @@ pub async fn confirmed_retirement(
     )
     .await
     .unwrap();
+    prepared.close().await.unwrap();
     (auth, confirmed, plan)
 }
 
 pub async fn write_retirement(
-    tx: &DatabaseTransaction,
+    tx: &mut ManagementTransaction,
     config: &ManagementConfig,
     auth: &records::LocalAuthorization,
     binding: &records::ConfirmedBinding,
     _plan: &DryRunPlan,
 ) -> records::RetirementRecord {
-    match tx.get_database_backend() {
+    tx.run(|tx, _| Box::pin(async move { match tx.get_database_backend() {
         DatabaseBackend::Postgres => {
             tx.execute_unprepared("LOCK TABLE pin_management_retirements IN EXCLUSIVE MODE NOWAIT")
                 .await
@@ -82,17 +91,20 @@ pub async fn write_retirement(
             tx.execute_unprepared("UPDATE pin_management_retirements SET allocation_domain=allocation_domain WHERE 1=0").await.unwrap();
         }
         _ => panic!("unsupported fixture database"),
-    }
+    } Ok(()) })).await.unwrap();
     let allocation = config.pinning.providers[0].identity.allocation_key();
     ipfs_s3_gateway::store::pinning::management::actions::apply_in_transaction(
         tx, config, auth, binding,
     )
     .await
     .unwrap();
-    records::read_retirement(tx, auth, &allocation)
-        .await
-        .unwrap()
-        .unwrap()
+    let auth = auth.clone();
+    tx.run(move |tx, _| {
+        Box::pin(async move { records::read_retirement(tx, &auth, &allocation).await })
+    })
+    .await
+    .unwrap()
+    .unwrap()
 }
 
 pub async fn retire(
@@ -102,8 +114,10 @@ pub async fn retire(
     plan_id: &str,
 ) -> records::RetirementRecord {
     let (auth, binding, plan) = confirmed_retirement(db, raw, config, plan_id).await;
-    let tx = db.begin().await.unwrap();
-    let record = write_retirement(&tx, config, &auth, &binding, &plan).await;
+    let mut tx = ManagementTransaction::begin(db, FINAL_WRITE_LIMIT, CancellationToken::new())
+        .await
+        .unwrap();
+    let record = write_retirement(&mut tx, config, &auth, &binding, &plan).await;
     tx.commit().await.unwrap();
     record
 }

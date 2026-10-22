@@ -1,4 +1,4 @@
-//! Exercise B's real packed business result and C's narrow reader. No second codec.
+//! Exercise the formal retirement receipt and allocation reader without a second codec.
 use super::support;
 use ipfs_s3_gateway::{
     error::AppError,
@@ -12,18 +12,17 @@ use ipfs_s3_gateway::{
         entities::{object, pin_lease},
         pinning::{
             ledger,
-            management::actions,
+            management::{actions, records},
             publication::{self, PinTargetSpec, PublicationObject, PublicationRequest},
         },
     },
 };
-use sea_orm::{ConnectionTrait, EntityTrait, Statement};
+use sea_orm::EntityTrait;
 
 #[tokio::test]
-async fn packed_retirement_result_restores_original_route_instead_of_becoming_unknown_attribution()
-{
+async fn retirement_receipt_restores_original_route_instead_of_becoming_unknown_attribution() {
     let mut fixture = support::Fixture::new().await;
-    let storage = "retained-storage-domain-".repeat(2048);
+    let storage = "retained-storage-domain-".repeat(10);
     fixture.raw.pinning_identity.providers[0].storage_domain = storage.clone();
     fixture.config = management::local_config::compile(&fixture.raw, |_| None)
         .unwrap()
@@ -40,7 +39,7 @@ async fn packed_retirement_result_restores_original_route_instead_of_becoming_un
             item_id: "retire-provider".into(),
             action: Action::Retire,
             subject: Subject::Provider {
-                route: RouteIdentity::from_original(route),
+                route: RouteIdentity::from_original(route.clone()),
             },
         }],
     };
@@ -48,20 +47,15 @@ async fn packed_retirement_result_restores_original_route_instead_of_becoming_un
     actions::apply(&fixture.db, &fixture.config, &fixture.auth, &binding)
         .await
         .unwrap();
-    let encoded = fixture.db.query_one(Statement::from_sql_and_values(fixture.db.get_database_backend(),
-        "SELECT result FROM pin_management_records WHERE database_scope=$1 AND plan_id=$2 AND item_id='retire-provider' AND kind='action'",
-        [fixture.auth.database_scope().into(), request.plan_id.into()])).await.unwrap().unwrap()
-        .try_get::<String>("", "result").unwrap();
-    let stored: serde_json::Value = serde_json::from_str(&encoded).unwrap();
-    let packed_storage = stored
-        .pointer("/receipt/binding/request/subject/provider/route/original/storage_domain")
-        .and_then(serde_json::Value::as_str)
-        .expect("real stored business receipt original route");
-    assert_ne!(
-        packed_storage,
-        storage.as_str(),
-        "fixture must exercise B's actual packing"
-    );
+    let stored = records::lookup_committed(&fixture.db, &fixture.auth, &binding, "retire-provider")
+        .await
+        .unwrap()
+        .unwrap();
+    let Subject::Provider { route: restored } = &stored.receipt.binding.request.subject else {
+        panic!("retirement receipt lost its provider subject");
+    };
+    assert_eq!(restored.original.as_ref(), Some(&route));
+    assert_eq!(restored.storage_domain, storage);
     let result = publication::publish_object(
         &fixture.db,
         PublicationRequest {
@@ -104,7 +98,7 @@ async fn packed_retirement_result_restores_original_route_instead_of_becoming_un
     };
     assert!(
         matches!(error, AppError::InvalidPinningRequest(message) if message == "allocation domain is permanently retired"),
-        "a complete packed receipt must be understood as retired, not corrupted/unknown attribution"
+        "a complete formal receipt must be understood as retired, not corrupted/unknown attribution"
     );
     assert!(
         object::Entity::find()

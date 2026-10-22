@@ -320,9 +320,6 @@ async fn latest_call_requires_unique_same_append_replica_and_current_native_clai
         "UPDATE pin_leases SET generation=generation+1",
         "UPDATE pin_leases SET expires_at='2000-01-01T00:00:00Z'",
         "UPDATE objects SET size=size+1",
-        "DELETE FROM pin_management_records WHERE kind='action'",
-        "UPDATE pin_management_records SET binding='{}' WHERE kind='action'",
-        "UPDATE pin_management_records SET result='{}' WHERE kind='action'",
         "INSERT INTO pin_resource_history(provider,cid,epoch,ledger) SELECT provider,cid,epoch,'{\"confirmed_absent\":true}' FROM remote_pins",
     ] {
         let tx = fixture.db.begin().await.unwrap();
@@ -331,6 +328,29 @@ async fn latest_call_requires_unique_same_append_replica_and_current_native_clai
         }
         tx.execute_unprepared(mutation).await.unwrap();
         denied(&tx, &claimed.model, mutation).await;
+        tx.rollback().await.unwrap();
+    }
+    async fn original_actions<C: ConnectionTrait>(db: &C) -> Vec<String> {
+        db.query_all(Statement::from_string(
+            db.get_database_backend(),
+            "SELECT json_array(database_scope,plan_id,item_id,binding,result) AS original FROM pin_management_records WHERE kind='action' ORDER BY database_scope,plan_id,item_id",
+        ))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.try_get("", "original").unwrap())
+        .collect()
+    }
+    let originals = original_actions(&fixture.db).await;
+    assert!(!originals.is_empty());
+    for mutation in [
+        "DELETE FROM pin_management_records WHERE kind='action'",
+        "UPDATE pin_management_records SET binding='{}' WHERE kind='action'",
+        "UPDATE pin_management_records SET result='{}' WHERE kind='action'",
+    ] {
+        let tx = fixture.db.begin().await.unwrap();
+        assert!(tx.execute_unprepared(mutation).await.is_err());
+        assert_eq!(original_actions(&tx).await, originals);
         tx.rollback().await.unwrap();
     }
     let duplicate = "INSERT INTO pin_replica_observations(job_id,provider,expected_cid,route,remote_epoch,claim_until,lease_id,target_id,expected_generation,phase,resources,outcome,safe_error,projectable,observed_at) SELECT job_id,provider,expected_cid,route,remote_epoch,claim_until,lease_id,target_id,expected_generation,phase,resources,outcome,safe_error,projectable,observed_at FROM pin_replica_observations";

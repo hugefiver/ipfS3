@@ -1,5 +1,7 @@
 //! C consumer regressions. Controlled Noop/Kubo fixtures are protocol fixtures,
 //! never physical remote PIN, directory bytes, replica or cleanup proof.
+#[path = "support/management_wire_v3.rs"]
+mod archive;
 #[path = "support/stage7_retirement_barrier_packed_result.rs"]
 mod packed_result;
 #[path = "support/stage7_retirement_barrier_replicas.rs"]
@@ -144,22 +146,13 @@ async fn execution_scope_requires_applied_private_receipt_not_a_confirmation_or_
             .await
             .is_ok()
     );
-    let review = binding.review();
-    let mut bytes = Vec::new();
-    ipfs_s3_gateway::pinning::management::wire::encode_review(
-        &mut records::ReadSession::default(),
-        &review,
-        review.candidate_item_ids(),
-        &mut bytes,
-    )
-    .unwrap();
-    let mut forged: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    forged["request"]["items"][0]["item_id"] = serde_json::json!("caller-chosen-job-id");
+    let bytes = archive::export(&binding);
+    let mut forged = (*binding.request).clone();
+    forged.items[0].item_id = "caller-chosen-job-id".into();
     assert!(
-        ipfs_s3_gateway::pinning::management::wire::decode_plan(
-            &serde_json::to_vec(&forged).unwrap()
-        )
-        .is_err()
+        archive::restore(&fixture.db, &fixture.auth, &forged, &bytes)
+            .await
+            .is_err()
     );
     let other = support::Fixture::new().await;
     assert!(
@@ -192,7 +185,11 @@ async fn readonly_missing_original_resource_stays_attention_and_never_ticks_the_
     let original_jobs = pin_job::Entity::find().all(&fixture.db).await.unwrap();
     let before = native::capture(&fixture.db).await.unwrap();
     let calls = fixture.server.received_requests().await.unwrap().len();
-    let coordinator = PinningCoordinator::build(fixture.config.pinning.clone()).unwrap();
+    let coordinator = PinningCoordinator::build_with_kubo(
+        fixture.config.pinning.clone(),
+        Some(ipfs_s3_gateway::kubo::KuboClient::new(fixture.server.uri())),
+    )
+    .unwrap();
     let report = coordinator
         .management_tick(
             &Store::new(fixture.db.clone()),
@@ -258,8 +255,8 @@ async fn receipt_scoped_readonly_psa_get_preserves_actual_report_with_zero_new_p
     let mut fixture = support::Fixture::new().await;
     let provider = &mut fixture.raw.pinning.providers[0];
     provider.kind = "pinata".into();
-    provider.api = Some("psa".into());
-    provider.endpoint = Some(fixture.server.uri());
+    provider.api = None;
+    provider.endpoint = Some(format!("{}/psa", fixture.server.uri()));
     provider.token_env = Some("STAGE7_C_CONTROLLED_TOKEN".into());
     let identity = &mut fixture.raw.pinning_identity.providers[0];
     identity.provider_id = "controlled-psa".into();
@@ -279,13 +276,13 @@ async fn receipt_scoped_readonly_psa_get_preserves_actual_report_with_zero_new_p
     let response = serde_json::json!({"requestid":"controlled-existing-request","status":"queued",
         "created":"2026-01-01T00:00:00Z","pin":{"cid":support::CID,"name":"controlled"},"delegates":[],"info":{}});
     Mock::given(method("POST"))
-        .and(path("/pins"))
+        .and(path("/psa/pins"))
         .respond_with(ResponseTemplate::new(202).set_body_json(response.clone()))
         .expect(1)
         .mount(&fixture.server)
         .await;
     Mock::given(method("GET"))
-        .and(path("/pins/controlled-existing-request"))
+        .and(path("/psa/pins/controlled-existing-request"))
         .respond_with(ResponseTemplate::new(200).set_body_json(response))
         .expect(1)
         .mount(&fixture.server)
@@ -297,7 +294,11 @@ async fn receipt_scoped_readonly_psa_get_preserves_actual_report_with_zero_new_p
     actions::apply(&fixture.db, &fixture.config, &fixture.auth, &create)
         .await
         .unwrap();
-    let coordinator = PinningCoordinator::build(fixture.config.pinning.clone()).unwrap();
+    let coordinator = PinningCoordinator::build_with_kubo(
+        fixture.config.pinning.clone(),
+        Some(ipfs_s3_gateway::kubo::KuboClient::new(fixture.server.uri())),
+    )
+    .unwrap();
     let store = Store::new(fixture.db.clone());
     let create_scope = ManagementJobScope::from_applied(&fixture.db, &fixture.auth, &create)
         .await

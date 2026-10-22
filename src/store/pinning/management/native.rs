@@ -7,8 +7,12 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 mod catalog_list;
+pub mod cells;
 mod history;
 mod identity;
+pub mod meter;
+pub mod scan;
+pub mod scope;
 pub use catalog_list::CatalogList;
 pub(crate) use history::{archived_catalog, current_catalog};
 
@@ -16,7 +20,7 @@ pub const MAX_ROWS: usize = 4096;
 pub const MAX_BYTES: usize = 4 * 1024 * 1024;
 pub type NativeRow = BTreeMap<String, Option<String>>;
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeKey {
     pub table: String,
@@ -33,7 +37,7 @@ pub struct NativeTable {
     pub definitions: CatalogList<super::catalog::NativeColumn>,
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeFrame {
     pub schema_versions: Vec<String>,
@@ -46,10 +50,42 @@ pub struct NativeFrame {
     /// Imported frames missing it cannot equal a fresh in-process frame.
     #[serde(skip)]
     private: Vec<(NativeKey, std::sync::Arc<NativeRow>)>,
+    /// A scoped frame is explicitly distinguished from a registry inventory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scoped: Option<scope::ScopeEvidence>,
+    #[serde(skip)]
+    _resident: Vec<std::sync::Arc<meter::ResidentGuard>>,
 }
 
+impl PartialEq for NativeFrame {
+    fn eq(&self, other: &Self) -> bool {
+        self.schema_versions == other.schema_versions
+            && self.database_scope == other.database_scope
+            && self.database_identity == other.database_identity
+            && self.tables == other.tables
+            && self.frontier == other.frontier
+            && self.private == other.private
+            && self.scoped == other.scoped
+    }
+}
+impl Eq for NativeFrame {}
+
 impl NativeFrame {
+    /// Complete scoped projection assembled only from store-produced reads.
+    pub fn from_scoped_reads(
+        reads: &[scope::ScopedRead],
+        authorities: &[super::records::locator::AuthorityView],
+        budget: &mut meter::Budget,
+    ) -> Result<Self> {
+        scope::merge_reads(reads, authorities, budget)
+    }
+    pub fn scope_evidence(&self) -> Option<&scope::ScopeEvidence> {
+        self.scoped.as_ref()
+    }
     pub fn validate(&self) -> Result<()> {
+        if let Some(scope) = &self.scoped {
+            scope.validate(&self.frontier, &self.schema_versions)?;
+        }
         let registry = history::archived_catalog(&self.schema_versions)?;
         if self.database_scope.is_empty()
             || self.database_identity.is_empty()
@@ -314,6 +350,20 @@ impl NativeFrame {
         }
         frame.frontier.retain(|key| !keys.contains(key));
         frame.private.retain(|(key, _)| !keys.contains(key));
+        if let Some(scope) = &mut frame.scoped {
+            for membership in &mut scope.memberships {
+                membership.keys.retain(|key| !keys.contains(key));
+            }
+            for proof in &mut scope.authority {
+                for membership in &mut proof.memberships {
+                    membership.sources.retain(|key| !keys.contains(key));
+                }
+                proof.seals.retain(|seal| !keys.contains(&seal.source));
+            }
+            // The original complete read remains the caller's fresh fence.
+            // This view is only the semantic comparison excluding verified self writes.
+            scope.projection_only = true;
+        }
         self
     }
 }
@@ -484,6 +534,15 @@ pub(crate) fn confidential(table: &str, column: &str) -> bool {
             "pin_decision_json" | "zip_intent_json" | "root_capture_json"
         )
         || table == "pin_extension_decisions" && column == "snapshot"
+        || table == "pin_provider_routes" && column == "snapshot"
+        || matches!(
+            table,
+            "pin_invocation_routes"
+                | "remote_pin_ledger"
+                | "pin_submit_observations"
+                | "pin_replica_observations"
+        ) && column == "route"
+        || table == "pin_lease_requirements" && column == "contract"
         || table == "pin_resource_history" && column == "ledger"
 }
 
@@ -773,14 +832,13 @@ pub(crate) async fn capture_with_work<C: ConnectionTrait>(
         tables,
         frontier,
         private,
+        scoped: None,
+        _resident: Vec::new(),
     })
 }
 
-/// Complete raw registry guard; selective readers must not substitute the size
-/// of their selected management rows for the database-wide SQL inventory.
-pub(crate) async fn check_raw_inventory<C: ConnectionTrait>(db: &C) -> Result<()> {
-    raw_inventory_usage(db).await.map(|_| ())
-}
+/// Whole-registry budget for explicit inventory callers. Point consumers use
+/// typed scoped memberships and source-locator integrity evidence instead.
 pub async fn raw_inventory_usage<C: ConnectionTrait>(db: &C) -> Result<(usize, usize)> {
     let backend = db.get_database_backend();
     let mut rows = 0usize;

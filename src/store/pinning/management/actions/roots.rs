@@ -67,8 +67,14 @@ pub(super) async fn release(
             .ok_or(ManagementError::InvalidEvidence)?;
         binding.with_decode_work(|work| work.nodes(2 + table.columns.len() * 2))?;
         binding.copy(&proof)?;
-        let mut predicates = vec!["logical_released_at IS NULL".to_owned()];
-        let mut parameters = vec![sea_orm::Value::from(now)];
+        let layout = native::current_catalog()
+            .iter()
+            .find(|layout| layout.table == key.table)
+            .ok_or(ManagementError::Schema)?;
+        let refs = key.values.iter().map(String::as_str).collect::<Vec<_>>();
+        binding.copy(&refs)?;
+        let (predicate, mut parameters) = sql::exact_key(layout, &refs)?;
+        let mut predicates = vec![predicate, "logical_released_at IS NULL".to_owned()];
         for column in table
             .columns
             .iter()
@@ -82,11 +88,13 @@ pub(super) async fn release(
                 None => predicates.push(format!("\"{column}\" IS NULL")),
             }
         }
+        parameters.push(now.into());
+        let deadline_parameter = parameters.len();
         let changed = tx
             .execute(Statement::from_sql_and_values(
                 tx.get_database_backend(),
                 format!(
-                    "UPDATE zip_root_references SET logical_released_at=$1 WHERE {}",
+                    "UPDATE zip_root_references SET logical_released_at=${deadline_parameter} WHERE {}",
                     predicates.join(" AND ")
                 ),
                 parameters,

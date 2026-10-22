@@ -287,16 +287,10 @@ async fn stored_ciphertext_count_rid_immutability_expiry_and_config_claims_are_n
         None
     );
     db.execute_unprepared("UPDATE pin_management_records SET result=json_set(result,'$[0].expires_at','2000-01-01T00:00:00Z') WHERE kind='evidence_preparation'").await.unwrap();
-    assert_eq!(
-        db_snapshot::collect_with_config(&db, &config, &plan_request)
-            .await
-            .unwrap()
-            .planning_snapshot()
-            .unwrap()
-            .objects[0]
-            .readable,
-        None
-    );
+    assert!(matches!(
+        db_snapshot::collect_with_config(&db, &config, &plan_request).await,
+        Err(db_snapshot::SnapshotError::Changed)
+    ));
     assert!(
         evidence::prepare(
             &db,
@@ -351,4 +345,81 @@ async fn stored_ciphertext_count_rid_immutability_expiry_and_config_claims_are_n
     ));
     assert!(before_rebind == native::capture(&db).await.unwrap());
     assert_eq!(server.received_requests().await.unwrap().len(), rpc_before);
+
+    // Expiry uses an intact, officially prepared record in an independent scope.
+    let (_expiry_directory, expiry_db) = support::database().await;
+    support::setup(&expiry_db, &config).await;
+    let expiry_identity = support::publish(&expiry_db, &config, "expiring", false).await;
+    expiry_db
+        .execute_unprepared("UPDATE objects SET encrypted=TRUE")
+        .await
+        .unwrap();
+    let expiry_auth = records::authorize_local(&raw, &expiry_db).await.unwrap();
+    let expiry_request = evidence::PrepareRequest {
+        record_id: "short-lived".into(),
+        identity: expiry_identity.clone(),
+        expected_node: support::NODE.into(),
+        max_stored_bytes: 17,
+        ttl: chrono::Duration::seconds(2),
+        directory: false,
+    };
+    let expiring_proof = evidence::prepare(
+        &expiry_db,
+        &config,
+        &expiry_auth,
+        &client,
+        &expiry_request,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let expiry_plan = support::request(expiry_identity, &config, true);
+    let before_expiry = native::capture(&expiry_db).await.unwrap();
+    let rpc_before_expiry = server.received_requests().await.unwrap().len();
+    assert_eq!(
+        db_snapshot::collect_with_config(&expiry_db, &config, &expiry_plan)
+            .await
+            .unwrap()
+            .planning_snapshot()
+            .unwrap()
+            .objects[0]
+            .readable,
+        Some(true)
+    );
+    loop {
+        let now = ipfs_s3_gateway::store::database_clock::database_now(&expiry_db)
+            .await
+            .unwrap();
+        if now >= expiring_proof.expires_at {
+            break;
+        }
+        tokio::time::sleep((expiring_proof.expires_at - now).to_std().unwrap()).await;
+    }
+    assert_eq!(
+        db_snapshot::collect_with_config(&expiry_db, &config, &expiry_plan)
+            .await
+            .unwrap()
+            .planning_snapshot()
+            .unwrap()
+            .objects[0]
+            .readable,
+        None
+    );
+    assert!(matches!(
+        evidence::prepare(
+            &expiry_db,
+            &config,
+            &expiry_auth,
+            &client,
+            &expiry_request,
+            CancellationToken::new()
+        )
+        .await,
+        Err(ipfs_s3_gateway::store::pinning::management::ManagementError::Expired)
+    ));
+    assert!(before_expiry == native::capture(&expiry_db).await.unwrap());
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        rpc_before_expiry
+    );
 }

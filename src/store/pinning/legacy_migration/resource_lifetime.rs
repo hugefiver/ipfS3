@@ -173,16 +173,17 @@ pub(super) async fn fresh_with_work<C: ConnectionTrait, W: Work>(
     }))
 }
 
-pub(super) async fn capture_is_fresh<C: ConnectionTrait>(
+pub(super) async fn capture_is_fresh_with_work<C: ConnectionTrait>(
     db: &C,
     job_id: &str,
     fresh: &FreshLifetime,
-) -> AppResult<bool> {
-    use sea_orm::EntityTrait;
-    let capture =
-        crate::store::entities::pin_invocation_route::Entity::find_by_id(job_id.to_owned())
-            .one(db)
-            .await?;
+    work: crate::store::pinning::management::records::DecodeWork<'_>,
+) -> crate::store::pinning::management::Result<bool> {
+    let capture = crate::store::pinning::management::records::current_model::<
+        crate::store::entities::pin_invocation_route::Entity,
+        _,
+    >(db, &[job_id], work)
+    .await?;
     Ok(capture.is_some_and(|c| {
         c.remote_epoch > fresh.boundary && c.remote_epoch <= fresh.epoch && c.route == fresh.route
     }))

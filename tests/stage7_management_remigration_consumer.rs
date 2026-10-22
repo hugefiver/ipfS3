@@ -1,3 +1,5 @@
+#[path = "support/management_wire_v3.rs"]
+mod archive;
 #[path = "support/stage7_management_remigration.rs"]
 mod slot_cases;
 #[path = "support/stage7_management_actions.rs"]
@@ -159,14 +161,6 @@ async fn remigration_consumes_current_slot_after_native_prefix() {
         .filter(|entry| entry.status == PlanStatus::Candidate)
         .map(|entry| entry.request.item_id.clone())
         .collect::<Vec<_>>();
-    let archive = wire::encode_plan(
-        &request,
-        &snapshot,
-        &plan,
-        Some(&plan.confirmation(acknowledged.clone())),
-    )
-    .unwrap();
-    let imported = wire::decode_plan(&archive).unwrap();
     let confirmed = records::confirm(
         &fixture.db,
         &fixture.config,
@@ -245,7 +239,8 @@ async fn remigration_consumes_current_slot_after_native_prefix() {
         .unwrap()
         .unwrap();
     assert!(receipt == second.items[0].receipt);
-    let restored = records::load_confirmed_from_imported(&fixture.db, &fixture.auth, &imported)
+    let bytes = archive::export(&confirmed);
+    let restored = archive::restore(&fixture.db, &fixture.auth, &request, &bytes)
         .await
         .unwrap();
     assert!(restored == confirmed);

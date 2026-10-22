@@ -1,11 +1,12 @@
 use anyhow::{Result, anyhow};
 use ipfs_s3_gateway::pinning::management::{
-    self, ExactObject, PlanRequest, PublicVersionId, evidence, wire,
+    self, ExactObject, PlanRequest, PublicVersionId, evidence,
+    wire::v3::{self, Projection, document::DocumentHead},
 };
 use serde::{Deserialize, de::DeserializeOwned};
-use tokio::io::AsyncReadExt;
+use std::io::{self, Read};
 
-use super::{Command, json_bounds};
+use super::{Command, files};
 
 pub fn invalid() -> anyhow::Error {
     anyhow!("management input invalid (details withheld)")
@@ -13,8 +14,13 @@ pub fn invalid() -> anyhow::Error {
 
 pub enum Input {
     Request(PlanRequest),
-    Imported(Box<wire::ImportedPlan>),
+    Imported(Box<ImportedFile>),
     Prepare(evidence::PrepareRequest),
+}
+/// Claims and protected original bytes only. It cannot manufacture a DB binding.
+pub struct ImportedFile {
+    pub head: DocumentHead,
+    pub staged: files::stream::StagedInput,
 }
 
 impl Input {
@@ -27,7 +33,7 @@ impl Input {
                 _ => None,
             },
             Self::Imported(imported) => imported
-                .snapshot_without_applied()
+                .head
                 .configuration
                 .as_ref()
                 .and_then(|configuration| configuration.source_node.as_deref()),
@@ -36,47 +42,80 @@ impl Input {
     }
 }
 
-async fn bytes(path: &str) -> Result<Vec<u8>> {
-    let file = tokio::fs::File::open(path).await.map_err(|_| invalid())?;
-    let metadata = file.metadata().await.map_err(|_| invalid())?;
-    if !metadata.is_file() || metadata.len() > wire::MAX_WIRE_BYTES as u64 {
-        return Err(invalid());
-    }
-    let mut bytes = Vec::new();
-    file.take((wire::MAX_WIRE_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .await
-        .map_err(|_| invalid())?;
-    if bytes.len() > wire::MAX_WIRE_BYTES {
-        return Err(invalid());
-    }
-    Ok(bytes)
+struct Bounded<R> {
+    source: R,
+    left: usize,
 }
-
-async fn document<T: DeserializeOwned>(path: &str) -> Result<T> {
-    let bytes = bytes(path).await?;
-    json_bounds::check(&bytes)?;
-    // Deserialize directly: a Value intermediary would discard duplicate fields.
-    serde_json::from_slice(&bytes).map_err(|_| invalid())
+impl<R: Read> Read for Bounded<R> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        let limit = bytes.len().min(self.left.saturating_add(1));
+        let n = self.source.read(&mut bytes[..limit])?;
+        self.left = self
+            .left
+            .checked_sub(n)
+            .ok_or_else(|| io::Error::other("management input limit"))?;
+        Ok(n)
+    }
+}
+fn document<T: DeserializeOwned>(path: &str) -> Result<T> {
+    let file = std::fs::File::open(path).map_err(|_| invalid())?;
+    let metadata = file.metadata().map_err(|_| invalid())?;
+    if !metadata.is_file() || metadata.len() > v3::FRAME_BYTES as u64 {
+        return Err(invalid());
+    }
+    let source = std::io::BufReader::new(Bounded {
+        source: file,
+        left: v3::FRAME_BYTES,
+    });
+    let mut parser = serde_json::Deserializer::from_reader(source);
+    let result = T::deserialize(&mut parser).map_err(|_| invalid())?;
+    parser.end().map_err(|_| invalid())?;
+    Ok(result)
 }
 
 pub async fn load(command: &Command) -> Result<Input> {
+    let command = command.clone();
+    tokio::task::spawn_blocking(move || load_blocking(&command))
+        .await
+        .map_err(|_| invalid())?
+}
+fn load_blocking(command: &Command) -> Result<Input> {
     match command {
         Command::DryRun { request, .. } | Command::Confirm { request, .. } => {
-            let request: PlanRequest = document(request).await?;
-            management::validate_request(&request).map_err(|_| invalid())?;
-            Ok(Input::Request(request))
-        }
-        Command::Apply { confirmed, .. } | Command::Status { confirmed } => {
-            let imported = wire::decode_plan(&bytes(confirmed).await?).map_err(|_| invalid())?;
-            if imported.confirmation().is_none() || !imported.untrusted_applied_claims().is_empty()
+            let request: PlanRequest = document(request)?;
+            if matches!(command, Command::Confirm { .. }) || command.checkpoint().is_some() {
+                management::validate_request(&request).map_err(|_| invalid())?;
+            }
+            if command.checkpoint().is_some()
+                && !request
+                    .items
+                    .iter()
+                    .any(|item| matches!(item.subject, management::Subject::Provider { .. }))
             {
                 return Err(invalid());
             }
-            Ok(Input::Imported(Box::new(imported)))
+            // Deserialization checks historical data bounds. Unrecorded requests
+            // still pass the fresh planner's current execution limits.
+            Ok(Input::Request(request))
+        }
+        Command::Apply { confirmed, .. } | Command::Status { confirmed } => {
+            let (head, staged) = files::stream::stage_temporary(
+                confirmed,
+                Projection::Review,
+                files::stream::budget(),
+            )?
+            .inspect()?;
+            if head.request.is_none()
+                || head.acknowledgements.is_none()
+                || head.expires_at.is_none()
+                || head.applied_claims
+            {
+                return Err(invalid());
+            }
+            Ok(Input::Imported(Box::new(ImportedFile { head, staged })))
         }
         Command::Prepare { request } => {
-            let input: Preparation = document(request).await?;
+            let input: Preparation = document(request)?;
             input.validate()?;
             Ok(Input::Prepare(evidence::PrepareRequest {
                 record_id: input.record_id,
@@ -87,7 +126,11 @@ pub async fn load(command: &Command) -> Result<Input> {
                 directory: input.directory,
             }))
         }
-        Command::Help => Err(invalid()),
+        Command::Help
+        | Command::Review { .. }
+        | Command::Export { .. }
+        | Command::ConvertV2 { .. }
+        | Command::Import { .. } => Err(invalid()),
     }
 }
 

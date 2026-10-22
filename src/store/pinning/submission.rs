@@ -35,6 +35,10 @@ pub(crate) use bounded::{latest_rpc, latest_rpc_with_work, rejected_non_rpc_call
 #[path = "submission_context_tests.rs"]
 mod context_tests;
 
+#[cfg(test)]
+#[path = "submission/late_tests.rs"]
+mod late_tests;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceEvidence {
     pub resource: ObservedResource,
@@ -206,6 +210,7 @@ async fn record_in_transaction<C: ConnectionTrait>(
         .model
         .locked_until
         .ok_or_else(|| AppError::Internal("RPC claim missing".into()))?;
+    let desired = lock_receipt_lifecycle(db, &claimed.model, now).await?;
     // Compare the claim in the database's native timestamp representation.
     // PG persists microseconds while a renewed caller token can have nanoseconds.
     // This is the same exact fence used by every other worker mutation, not a
@@ -352,7 +357,7 @@ async fn record_in_transaction<C: ConnectionTrait>(
         .await
         .unwrap_or(false);
     let can_project =
-        live && current_lifetime && !released && matched_context && managed_projection;
+        desired && live && current_lifetime && !released && matched_context && managed_projection;
     let written = evidence::Entity::update_many()
         .col_expr(evidence::Column::Effect, Expr::value(effect))
         .col_expr(evidence::Column::Resources, Expr::value(json))
@@ -376,6 +381,57 @@ async fn record_in_transaction<C: ConnectionTrait>(
         wake_matching_parked(db, &claimed.model.id, now).await?;
     }
     Ok(can_project)
+}
+
+/// Lock the original lease → target before the job/remote receipt tail. Failed
+/// lifecycle fences deny projection without discarding an already-dispatched fact.
+pub(crate) async fn lock_receipt_lifecycle<C: ConnectionTrait>(
+    db: &C,
+    job: &pin_job::Model,
+    now: DateTime<Utc>,
+) -> AppResult<bool> {
+    let (Some(lease), Some(target), Some(generation)) = (
+        job.lease_id.as_deref(),
+        job.target_id.as_deref(),
+        job.expected_generation,
+    ) else {
+        return Ok(false);
+    };
+    if job.operation != "submit" || job.expected_remote_epoch.is_some() {
+        return Ok(false);
+    }
+    let locked_lease = pin_lease::Entity::update_many()
+        .col_expr(
+            pin_lease::Column::Generation,
+            Expr::col(pin_lease::Column::Generation).into(),
+        )
+        .filter(pin_lease::Column::Id.eq(lease))
+        .filter(pin_lease::Column::State.eq("active"))
+        .filter(pin_lease::Column::Generation.eq(generation))
+        .filter(pin_lease::Column::ExpiresAt.gt(now))
+        .exec(db)
+        .await?;
+    if locked_lease.rows_affected != 1 {
+        return Ok(false);
+    }
+    let target = pin_lease_target::Entity::update_many()
+        .col_expr(
+            pin_lease_target::Column::State,
+            Expr::col(pin_lease_target::Column::State).into(),
+        )
+        .filter(pin_lease_target::Column::Id.eq(target))
+        .filter(pin_lease_target::Column::LeaseId.eq(lease))
+        .filter(pin_lease_target::Column::Provider.eq(&job.provider))
+        .filter(pin_lease_target::Column::Cid.eq(&job.cid))
+        .filter(pin_lease_target::Column::State.is_in([
+            "waiting",
+            "submitted",
+            "pinned",
+            "degraded",
+        ]))
+        .exec(db)
+        .await?;
+    Ok(target.rows_affected == 1)
 }
 
 async fn lock_receipt_remote<C: ConnectionTrait>(
@@ -603,22 +659,9 @@ fn admission_table<E: EntityTrait + Default>(kind: &'static str, filter: &str) -
 
 impl AdmissionSnapshot {
     async fn read<C: ConnectionTrait>(db: &C, provider: &str) -> AppResult<Self> {
-        let mut keys = crate::store::pinning::legacy_migration::historical_keys(
-            db,
-            "pin_submit_observations",
-            provider,
-            None,
-        )
-        .await?;
-        keys.extend(
-            crate::store::pinning::legacy_migration::historical_keys(
-                db,
-                "pin_resource_history",
-                provider,
-                None,
-            )
-            .await?,
-        );
+        let mut keys =
+            crate::store::pinning::legacy_migration::admission_historical_keys(db, provider, &())
+                .await?;
         keys.retain(|key| key != provider);
         keys.sort();
         keys.dedup();

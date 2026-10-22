@@ -9,7 +9,12 @@ use crate::{
 };
 use sea_orm::{ConnectionTrait, DatabaseTransaction};
 mod observations;
+mod recorded;
 mod retirement;
+pub use recorded::{RecordedItemStatus, RecordedRetirementStatus, recorded_with_work};
+pub use retirement::{RetirementStatusLookup, lookup_with_work as lookup_retirement_with_work};
+#[cfg(test)]
+mod retirement_tests;
 
 #[derive(serde::Deserialize)]
 struct StatusContract {
@@ -81,6 +86,8 @@ pub(super) async fn fence_business_expiry<'a>(
     Ok(())
 }
 
+/// Current non-retirement status. Use `lookup_retirement_with_work` for a
+/// retirement action's bounded, connection-level responsibility scan.
 pub async fn lookup<C: ConnectionTrait>(
     db: &C,
     auth: &records::LocalAuthorization,
@@ -108,12 +115,19 @@ pub async fn lookup_with_work<C: ConnectionTrait>(
     else {
         return Ok(None);
     };
+    // Current retirement responsibility requires an outer connection scan, not
+    // a transaction-local or frozen-state fallback.
+    if is_retirement(trusted.action_view()) {
+        return Err(ManagementError::InvalidEvidence);
+    }
     trusted.binding().copy(trusted.action_view())?;
     let mut action = trusted.action_view().clone();
     action.state = current_state_with_work(db, &action, work).await?;
     Ok(Some(action))
 }
 
+/// Evaluates only bounded current rows. Retirement executors already assign a
+/// committed state; dynamic responsibility belongs to the outer status scan.
 pub(crate) async fn current_state_with_work<C: ConnectionTrait>(
     db: &C,
     action: &records::CommittedAction,
@@ -124,14 +138,11 @@ pub(crate) async fn current_state_with_work<C: ConnectionTrait>(
     if matches!(action.receipt.binding.request.action, Action::Cancel) {
         return Ok(Accepted);
     }
-    if observations::needs_attention(db, action, work.clone()).await? {
-        return Ok(NeedsAttention);
+    if is_retirement(action) {
+        return Ok(action.state);
     }
-    if matches!(
-        action.receipt.binding.request.action,
-        Action::Retire | Action::RetireWith { .. }
-    ) {
-        return retirement::current_state(db, action, work).await;
+    if observations::needs_attention(db, &action.jobs, work.clone()).await? {
+        return Ok(NeedsAttention);
     }
     let now = crate::store::database_clock::database_now(db)
         .await
@@ -226,4 +237,11 @@ pub(crate) async fn current_state_with_work<C: ConnectionTrait>(
         }
     }
     Ok(Accepted)
+}
+
+fn is_retirement(action: &records::CommittedAction) -> bool {
+    matches!(
+        action.receipt.binding.request.action,
+        Action::Retire | Action::RetireWith { .. }
+    )
 }

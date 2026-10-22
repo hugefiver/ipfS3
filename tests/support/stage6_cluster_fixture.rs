@@ -214,6 +214,8 @@ rpc_url = "{}"
 database_url = "{}"
 [crypto]
 master_key = "{}"
+[decompress_zip]
+auto_pin_outputs = false
 [pinning]
 worker_interval = "1s"
 worker_concurrency = 1

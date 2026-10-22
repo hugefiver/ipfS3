@@ -389,16 +389,21 @@ async fn noncluster_poll_keeps_actual_typed_resources_and_error_facts_after_clai
             ))
             .await
             .unwrap();
-        let task = tokio::spawn(async move {
+        let mut task = tokio::spawn(async move {
             coordinator
                 .management_tick(&store, &scope, &CancellationToken::new())
                 .await
         });
         let mut original_claim = None;
         if late {
-            tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
-                .await
-                .unwrap();
+            tokio::select! {
+                () = entered.notified() => {},
+                result = &mut task => match result {
+                    Ok(Ok(_)) => panic!("worker completed without invoking the captured Poll"),
+                    Ok(Err(error)) => panic!("worker rejected the captured Poll: {error:?}"),
+                    Err(error) => panic!("worker failed before the captured Poll: {error}"),
+                },
+            }
             let job = pin_job::Entity::find_by_id(poll.id.clone())
                 .one(&fixture.db)
                 .await
@@ -419,7 +424,12 @@ async fn noncluster_poll_keeps_actual_typed_resources_and_error_facts_after_clai
                 .unwrap();
             resume.notify_one();
         }
-        let _result = task.await.unwrap();
+        let result = task.await.unwrap();
+        if late {
+            assert!(matches!(result, Err(crate::error::AppError::Internal(_))));
+        } else {
+            result.unwrap();
+        }
         assert_eq!(provider.get_count.load(Ordering::SeqCst), 1);
         let fact = pin_replica_observation::Entity::find()
             .filter(pin_replica_observation::Column::JobId.eq(&poll.id))

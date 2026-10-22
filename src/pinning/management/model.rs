@@ -449,7 +449,7 @@ pub struct Snapshot {
     /// Database-clock seconds. Advancing time alone does not change identity.
     pub observed_at: i64,
     pub database_now: Option<chrono::DateTime<chrono::Utc>>,
-    /// Full global bounded image, original precision, membership and PK frontier.
+    /// Bounded local originals, original precision, membership and PK frontier.
     /// None is allowed only for IO-free prototype/unit fixtures, never DB apply.
     pub native_frame: Option<NativeFrame>,
     pub configuration: Option<ConfigurationBinding>,
@@ -590,12 +590,29 @@ pub struct ItemRequest {
     pub subject: Subject,
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct PlanRequest {
     /// Non-secret operator namespace. Uniqueness is not a safety proof.
     pub plan_id: String,
     pub items: Vec<ItemRequest>,
+}
+
+impl<'de> Deserialize<'de> for PlanRequest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Fields {
+            plan_id: String,
+            items: Vec<ItemRequest>,
+        }
+        let fields = Fields::deserialize(deserializer)?;
+        let request = Self {
+            plan_id: fields.plan_id,
+            items: fields.items,
+        };
+        super::validate::validate_historical_request(&request).map_err(serde::de::Error::custom)?;
+        Ok(request)
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -678,13 +695,9 @@ pub struct ObjectCapture {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RetirementCapture {
-    pub inventory: ProviderInventory,
-    pub routes: Vec<RouteSnapshot>,
-    pub targets: Vec<TargetSnapshot>,
-    pub remotes: Vec<RemoteSnapshot>,
-    pub historical_remotes: Vec<RemoteSnapshot>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub root_references: Vec<RootReferenceSnapshot>,
+    pub inventory: super::retirement::RetirementInventoryRef,
+    pub mutation_scope: super::retirement::RetirementMutationScope,
+    pub totals: super::retirement::InventoryTotals,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]

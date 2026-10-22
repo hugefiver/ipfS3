@@ -259,11 +259,20 @@ async fn renew_mixed_migration_tracks_destination_delta_and_untouched_source_pai
     let committed_before = native::capture(&fixture.db).await.unwrap();
     let tx = fixture.db.begin().await.unwrap();
     super::super::super::fence::write_intent(&tx).await.unwrap();
+    let scope = super::super::super::local_scope::capture(
+        &tx,
+        &fixture.config,
+        &binding,
+        records::SharedDecodeBudget::default(),
+    )
+    .await
+    .unwrap();
     super::super::super::fence::lock(
         &tx,
         before,
         &fixture.config,
         &binding,
+        &scope,
         records::DecodeWork::shared(&records::SharedDecodeBudget::default()),
     )
     .await
@@ -511,6 +520,15 @@ async fn renew_mixed_migration_tracks_destination_delta_and_untouched_source_pai
         records::write_executed_action_in_transaction(&fixture.auth, &binding, &migrated, before)
             .await
             .unwrap();
+    super::super::super::seal::executed(
+        &tx,
+        &fixture.auth,
+        &binding,
+        &migrated,
+        records::DecodeWork::shared(&records::SharedDecodeBudget::default()),
+    )
+    .await
+    .unwrap();
     let prior_jobs = pin_job::Entity::find()
         .order_by_asc(pin_job::Column::Id)
         .all(&tx)
@@ -560,6 +578,15 @@ async fn renew_mixed_migration_tracks_destination_delta_and_untouched_source_pai
         records::write_executed_action_in_transaction(&fixture.auth, &binding, &renewed, before)
             .await
             .unwrap();
+    super::super::super::seal::executed(
+        &tx,
+        &fixture.auth,
+        &binding,
+        &renewed,
+        records::DecodeWork::shared(&records::SharedDecodeBudget::default()),
+    )
+    .await
+    .unwrap();
     for job in &prior_jobs {
         assert_eq!(
             pin_job::Entity::find_by_id(job.id.clone())
@@ -615,10 +642,14 @@ async fn renew_mixed_migration_tracks_destination_delta_and_untouched_source_pai
             ))
             .await
             .unwrap();
-        assert!(matches!(
-            batch.validate_final(&written).await,
-            Err(crate::store::pinning::management::ManagementError::Changed)
-        ));
+        let validation = batch.validate_final(&written).await;
+        assert!(
+            matches!(
+                validation,
+                Err(crate::store::pinning::management::ManagementError::InvalidEvidence)
+            ),
+            "{validation:?}"
+        );
         check.rollback().await.unwrap();
         assert!(native::capture(&tx).await.unwrap() == expected);
     }

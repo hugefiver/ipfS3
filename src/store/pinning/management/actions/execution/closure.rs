@@ -192,7 +192,9 @@ pub(super) fn keys(
         Action::Retire | Action::RetireWith { .. }
     ) {
         let retirement = retirement_key(binding, &action.receipt.binding)?;
-        add(keys, key("pin_provider_routes", &retirement.1[0]), binding)?;
+        for route in super::super::retirement::route_keys(binding, &action.receipt.binding)? {
+            add(keys, key("pin_provider_routes", &route), binding)?;
+        }
         add(keys, retirement, binding)?;
     }
     Ok(())

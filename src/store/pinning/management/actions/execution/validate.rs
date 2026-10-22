@@ -587,7 +587,7 @@ fn birth(
         }
         Some(Capture::Provider(capture)) => {
             cell(j, "operation")? == "unpin"
-                && capture.remotes.iter().any(|r| {
+                && capture.mutation_scope.remotes.iter().any(|r| {
                     r.epoch.to_string() == cell(i, "remote_epoch").unwrap_or("")
                         && r.route.original.as_ref() == Some(route.as_ref())
                         && crate::pinning::provider::canonical_resource_cid(cid)
@@ -835,6 +835,47 @@ pub(super) fn job(
 ) -> Result<()> {
     if !action.jobs.contains(authority) {
         return Err(ManagementError::Confirmation);
+    }
+    let job_key = key("pin_jobs", &authority.job_id);
+    if authority.directive == records::JobDirective::Submit
+        && op
+            .facts
+            .1
+            .iter()
+            .any(|read| read.0 == job_key && matches!(read.1, facts::Input::Output(..)))
+    {
+        let original = binding.frozen_rows()?;
+        binding
+            .with_decode_work(|work| work.nodes(original.all_rows().count() + op.facts.1.len()))?;
+        let mut rows = original.all_rows().collect::<Vec<_>>();
+        for read in &op.facts.1 {
+            let table = native::current_catalog()
+                .iter()
+                .find(|table| table.table == read.0.0)
+                .ok_or(ManagementError::Schema)?;
+            rows.retain(|(old_table, row)| {
+                old_table.table != table.table
+                    || !table
+                        .primary_key
+                        .iter()
+                        .zip(&read.0.1)
+                        .all(|(column, value)| native::value(*row, column) == Some(value))
+            });
+            if let Some(row) = op.before(&read.0)? {
+                rows.push((table, records::RowView::Handle(row)));
+            }
+        }
+        let boundary = records::ExecutionRows {
+            scope: binding.database_scope,
+            identity: binding.database_identity,
+            rows,
+        };
+        return job_authority::validate_authority_at_boundary(
+            binding,
+            action,
+            authority,
+            records::FrozenRows::Execution(&boundary),
+        );
     }
     if matches!(action.receipt.binding.request.action, Action::Renew { .. }) {
         let step = view(binding, action, op)?;

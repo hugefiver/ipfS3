@@ -154,7 +154,11 @@ pub(super) async fn schedule_target(
             native::value(row, "provider") == Some(&target.provider)
                 && native::value(row, "cid") == Some(&target.cid)
         });
-    let safe_new = old.is_none() && !history;
+    let safe_new = !history
+        && (old.is_none()
+            || matches!(before, records::FrozenRows::Execution(_))
+                && capture.remote.is_none()
+                && row.effect == "reserved");
     let safe_rejected = captured.is_some_and(|remote| {
         matches!(
             remote.effect,
@@ -224,13 +228,21 @@ pub(super) async fn schedule_target(
             result.state = records::ActionState::Queued;
             return Ok(());
         }
-        work.copy(&(&target.provider, &target.cid, &desired.id, &target.id))?;
+        let owner =
+            jobs::canonical_desired_target_with_work(tx, &target.provider, &target.cid, work)
+                .await?
+                .ok_or(ManagementError::Changed)?;
+        let owner_lease =
+            records::current_model::<pin_lease::Entity, _>(tx, &[&owner.lease_id], work)
+                .await?
+                .ok_or(ManagementError::Changed)?;
+        work.copy(&(&target.provider, &target.cid, &owner_lease.id, &owner.id))?;
         let NewPinJob::Target(job) = jobs::submit_job(
             &target.provider,
             &target.cid,
-            &desired.id,
-            &target.id,
-            desired.generation,
+            &owner_lease.id,
+            &owner.id,
+            owner_lease.generation,
             now,
         ) else {
             unreachable!()

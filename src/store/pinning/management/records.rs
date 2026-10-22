@@ -8,6 +8,10 @@ use chrono::{DateTime, Utc};
 use sea_orm::{ConnectionTrait, DatabaseTransaction, Statement};
 use serde::{Deserialize, Serialize};
 mod archive;
+mod authority;
+mod recorded;
+pub use authority::{CheckpointEvidence, load_checkpoint_confirmation, load_confirmed_authority};
+pub use recorded::{RecordedPlan, RecordedResult, load_recorded_plan};
 mod codec;
 mod confirmation;
 mod current;
@@ -15,6 +19,8 @@ pub(crate) mod evidence;
 mod imported;
 mod index;
 mod inspection;
+mod inventory_review;
+pub mod locator;
 mod results;
 mod retirement;
 pub(crate) mod roots;
@@ -22,13 +28,25 @@ mod row;
 mod session;
 mod validation;
 mod views;
+pub use inventory_review::bind_sealed_retirement_review;
+pub use inventory_review::copy_original_inventory;
+pub(crate) use inventory_review::copy_original_inventory_document;
+pub(crate) use inventory_review::copy_prepared_output_document;
+pub(crate) use inventory_review::finish_apply as finish_retirement_apply;
+pub use inventory_review::load_original_inventory;
+pub(crate) use inventory_review::prepare_apply as prepare_retirement_apply;
+pub(crate) use inventory_review::validate_entry as validate_retirement_entry;
+pub mod segmented;
 pub(crate) use archive::ArchivedRows;
 pub use archive::ConfirmedPlan;
 pub use archive::ConfirmedPlan as ConfirmedBinding;
 pub use archive::ReviewHandle;
-pub(crate) use current::{CurrentRows, current_management_rows, current_model, current_models};
-pub(crate) use index::{bounded_projection, lease_has_selectors};
-pub(crate) use row::{FrozenRows, RowHandle, RowView};
+pub(crate) use current::{current_management_rows, current_model, current_models};
+pub(crate) use index::bounded_projection;
+pub(crate) use inventory_review::prepared_output_reference;
+pub(crate) use inventory_review::stage_canonical_inventory;
+pub(crate) use inventory_review::stage_canonical_output;
+pub(crate) use row::{ExecutionRows, FrozenRows, RowHandle, RowView};
 
 pub(crate) async fn current_row<C: ConnectionTrait>(
     db: &C,
@@ -48,7 +66,7 @@ pub(crate) async fn current_row<C: ConnectionTrait>(
         .primary_key
         .iter()
         .enumerate()
-        .map(|(i, column)| format!("CAST(\"{column}\" AS TEXT)=${}", i + 1))
+        .map(|(i, column)| format!("\"{column}\"=${}", i + 1))
         .collect::<Vec<_>>()
         .join(" AND ");
     work.copy(&table.columns)?;
@@ -62,7 +80,12 @@ pub(crate) async fn current_row<C: ConnectionTrait>(
         &format!("FROM \"{name}\" WHERE {predicate}"),
         &columns,
         &predicate,
-        key.iter().map(|value| (*value).into()).collect(),
+        table
+            .primary_key
+            .iter()
+            .zip(key)
+            .map(|(column, value)| native::scope::bound_value(table, column, value))
+            .collect::<Result<Vec<_>>>()?,
         (1, native::MAX_BYTES),
         work,
     )
@@ -136,21 +159,15 @@ pub use views::SharedDecodeBudget;
 pub(crate) use views::{BindingView, DecodeWork};
 #[cfg(test)]
 pub(crate) mod fault_injection;
-pub(crate) use confirmation::revalidate_with_work;
+pub(crate) use confirmation::revalidate_scoped_with_work;
 pub use confirmation::{
-    PlanLocator, confirm_imported, lookup_applied_from_imported, recheck_confirmed_frame,
+    PlanLocator, ReadyPublication, confirm_imported, confirm_ready, lookup_applied_from_imported,
     revalidate_confirmed_in_transaction, stage_confirmation,
 };
 pub use imported::{load_confirmed_from_imported, load_review_from_imported};
+pub(crate) use index::action_at_key_with_work;
 pub(crate) use index::actions_at_keys_with_work;
-#[cfg(test)]
-pub(crate) use index::actions_for_job;
 pub(crate) use index::actions_for_plan_with_work;
-#[cfg(test)]
-pub(crate) use index::poll_discovery_with_work;
-pub(crate) use index::{
-    action_at_key_with_work, actions_for_job_with_work, actions_for_lease_with_work,
-};
 pub(crate) use inspection::{RecordPayload, inspect_original_row, inspect_original_row_with_work};
 pub(crate) use inspection::{inspect_retirement_review_with_work, inspect_review_with_work};
 #[cfg(test)]
@@ -167,8 +184,7 @@ pub use results::{
     NamespacePlanningProjection, OperatorDecision, lookup_committed,
 };
 pub(crate) use results::{
-    TrustedAppliedAction, lookup_trusted_committed, update_executed_state,
-    write_executed_action_in_transaction,
+    TrustedAppliedAction, lookup_trusted_committed, write_executed_action_in_transaction,
 };
 pub(crate) use results::{
     frozen_actions_for_lease, private_action_from_rows, private_action_from_rows_with_work,
@@ -240,14 +256,15 @@ pub async fn authorize_local<C: ConnectionTrait>(
         return Err(ManagementError::Unauthorized);
     }
     super::schema::validate(db).await?;
-    let frame = native::capture(db).await?;
-    if frame.database_identity.starts_with("diagnostic:") {
+    super::catalog::validate(db, native::current_catalog()).await?;
+    let (database_scope, database_identity) = native::scope::binding(db).await?;
+    if database_identity.starts_with("diagnostic:") {
         return Err(ManagementError::Unauthorized);
     }
     Ok(LocalAuthorization {
         principal: "local_configuration".into(),
-        database_scope: frame.database_scope,
-        database_identity: frame.database_identity,
+        database_scope,
+        database_identity,
     })
 }
 
@@ -347,6 +364,23 @@ pub async fn confirm_with_session(
             && !acknowledged.contains(&entry.request.item_id)
     }) {
         return Err(ManagementError::Confirmation);
+    }
+    if request.items.iter().any(|item| {
+        matches!(
+            item.subject,
+            crate::pinning::management::Subject::Provider { .. }
+        )
+    }) {
+        return confirmation::confirm_global(
+            db,
+            config,
+            authorization,
+            proposal,
+            candidate_item_ids,
+            ttl,
+            work,
+        )
+        .await;
     }
     confirmation::stage_with_work(db, config, authorization, proposal, ttl, work.clone()).await?;
     confirmation::confirm_staged(
@@ -505,15 +539,53 @@ pub(crate) async fn insert_in_transaction(
         "INSERT INTO pin_management_records (database_scope,plan_id,item_id,kind,principal,native_identity,binding,native_before,result,intent_ids,job_ids,state,created_at,expires_at,completed_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",
         [auth.database_scope.clone().into(),record.plan_id.into(),record.item_id.into(),record.kind.sql().into(),auth.principal.clone().into(),auth.database_identity.clone().into(),record.binding.into(),record.native_before.into(),record.result.map(str::to_owned).into(),intent_ids.into(),job_ids.into(),record.state.sql().into(),now.into(),record.expires_at.into(),record.result.map(|_| now).into()]))
         .await.map_err(|_| ManagementError::Database)?;
+    if record.kind == RecordKind::EvidencePreparation {
+        let key = native::NativeKey {
+            table: super::schema::RECORDS.into(),
+            values: vec![
+                auth.database_scope.clone(),
+                record.plan_id.into(),
+                record.item_id.into(),
+                record.kind.sql().into(),
+            ],
+        };
+        seal_originals(
+            tx,
+            &[key],
+            DecodeWork::shared(&SharedDecodeBudget::default()),
+        )
+        .await?;
+    }
     Ok(())
+}
+
+/// Call only after the complete same-plan member set and bindings are written.
+/// Action-result publication and route/legacy sources are sealed by their writers.
+pub(crate) async fn seal_originals(
+    tx: &DatabaseTransaction,
+    keys: &[native::NativeKey],
+    work: DecodeWork<'_>,
+) -> Result<()> {
+    let mut budget = native::meter::Budget::default();
+    let result = async {
+        for key in keys {
+            locator::rebuild_source(tx, key, &mut budget).await?;
+        }
+        Ok(())
+    }
+    .await;
+    charge_storage_work(&budget, work)?;
+    result
+}
+
+fn charge_storage_work(budget: &native::meter::Budget, work: DecodeWork<'_>) -> Result<()> {
+    work.with(|work| work.finish_storage(budget))
 }
 
 /// Exact native evidence guard; B must invoke this only after its lock/barrier
 /// protocol and before publication. This does not acquire B's locks itself.
 pub async fn recheck_frame<C: ConnectionTrait>(db: &C, original: &NativeFrame) -> Result<()> {
-    if native::capture(db).await? != *original {
-        return Err(ManagementError::Changed);
-    }
+    native::scope::check_frame_scope(db, original, &mut native::meter::Budget::default()).await?;
     Ok(())
 }
 

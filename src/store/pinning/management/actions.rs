@@ -1,10 +1,12 @@
 //! Formal Stage 7 Store apply. Provider IO is deliberately outside this module.
-use super::{ManagementError, Result, native, records};
-use crate::pinning::management::{RevalidationOutcome, local_config::ManagementConfig};
-use sea_orm::{
-    AccessMode, ConnectionTrait, DatabaseBackend, DatabaseConnection, IsolationLevel,
-    TransactionTrait,
+use super::{
+    ManagementError, Result, native, records,
+    transaction::{self, CancellationToken, ManagementTransaction, TransactionFailure},
 };
+use crate::pinning::management::{RevalidationOutcome, local_config::ManagementConfig};
+#[cfg(test)]
+use sea_orm::TransactionTrait;
+use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection};
 
 pub(crate) mod accounting;
 pub(crate) mod execution;
@@ -14,12 +16,17 @@ mod fault_injection;
 mod fence;
 mod intents;
 pub mod job_authority;
+mod local_scope;
 mod migration;
 pub mod points;
 pub mod provider_points;
 mod recovery;
 mod retirement;
 mod roots;
+mod seal;
+mod sql;
+#[cfg(test)]
+mod sql_tests;
 pub mod status;
 #[cfg(test)]
 pub(crate) mod tests;
@@ -48,22 +55,30 @@ async fn apply_attempt(
     config: &ManagementConfig,
     auth: &records::LocalAuthorization,
     binding: &records::ConfirmedBinding,
-    failure_state: &mut records::ActionState,
+    (failure_state, transaction_failure): (
+        &mut records::ActionState,
+        &mut Option<TransactionFailure>,
+    ),
     work: records::SharedDecodeBudget,
+    cancel: CancellationToken,
 ) -> Result<ApplyResult> {
-    let tx = if db.get_database_backend() == DatabaseBackend::Postgres {
-        db.begin_with_config(
-            Some(IsolationLevel::ReadCommitted),
-            Some(AccessMode::ReadWrite),
-        )
-        .await
-    } else {
-        db.begin().await
+    if let Some(items) = recover_receipts(db, auth, binding, work.clone()).await? {
+        return Ok(ApplyResult {
+            replayed: true,
+            items,
+        });
     }
-    .map_err(|_| ManagementError::Database)?;
-    let result = apply_in_transaction_with_work(&tx, config, auth, binding, work.clone()).await?;
+    records::prepare_retirement_apply(db, binding).await?;
+    let mut tx = ManagementTransaction::begin(db, transaction::FINAL_WRITE_LIMIT, cancel)
+        .await
+        .map_err(|failure| failed_transaction(failure, failure_state, transaction_failure))?;
+    let result = apply_bounded_with_work(&mut tx, config, auth, binding, work.clone())
+        .await
+        .map_err(|failure| failed_transaction(failure, failure_state, transaction_failure))?;
     if result.replayed {
-        tx.rollback().await.map_err(|_| ManagementError::Database)?;
+        tx.rollback()
+            .await
+            .map_err(|failure| failed_transaction(failure, failure_state, transaction_failure))?;
         return Ok(result);
     }
     *failure_state = records::ActionState::NeedsAttention;
@@ -74,58 +89,68 @@ async fn apply_attempt(
             .close()
             .await
             .map_err(|_| ManagementError::Database)?;
-        Err(sea_orm::DbErr::Custom("commit response unavailable".into()))
+        Err(TransactionFailure {
+            cause: transaction::StopCause::Database,
+            rollback_confirmed: false,
+        })
     } else {
         committed
     };
     match committed {
         Ok(()) => Ok(result),
-        Err(_) => match replay(db, auth, binding, work).await? {
-            Some(items) => Ok(ApplyResult {
-                replayed: true,
-                items,
-            }),
-            None => {
-                *failure_state = records::ActionState::Stopped;
-                Err(ManagementError::Database)
+        Err(failure) if failure.rollback_confirmed => Err(failed_transaction(
+            failure,
+            failure_state,
+            transaction_failure,
+        )),
+        Err(failure) => {
+            *transaction_failure = Some(failure);
+            match recover_receipts(db, auth, binding, work).await? {
+                Some(items) => Ok(ApplyResult {
+                    replayed: true,
+                    items,
+                }),
+                None => Err(ManagementError::Database),
             }
-        },
+        }
     }
 }
 
-/// Execute and verify the complete confirmed batch in the caller's transaction.
-/// The caller owns commit/rollback; durable receipts cannot be supplied by callers.
+/// Execute in a bounded management transaction. On error the entire transaction
+/// is rolled back and acknowledged, not merely a nested savepoint.
 pub async fn apply_in_transaction(
-    tx: &sea_orm::DatabaseTransaction,
+    tx: &mut ManagementTransaction,
     config: &ManagementConfig,
     auth: &records::LocalAuthorization,
     binding: &records::ConfirmedBinding,
-) -> Result<ApplyResult> {
-    let batch = tx.begin().await.map_err(|_| ManagementError::Database)?;
-    match apply_in_transaction_with_work(
-        &batch,
+) -> std::result::Result<ApplyResult, TransactionFailure> {
+    apply_bounded_with_work(
+        tx,
         config,
         auth,
         binding,
         records::SharedDecodeBudget::default(),
     )
     .await
-    {
-        Ok(result) => {
-            batch
-                .commit()
-                .await
-                .map_err(|_| ManagementError::Database)?;
-            Ok(result)
-        }
-        Err(error) => {
-            batch
-                .rollback()
-                .await
-                .map_err(|_| ManagementError::Database)?;
-            Err(error)
-        }
-    }
+}
+
+async fn apply_bounded_with_work(
+    tx: &mut ManagementTransaction,
+    config: &ManagementConfig,
+    auth: &records::LocalAuthorization,
+    binding: &records::ConfirmedBinding,
+    work: records::SharedDecodeBudget,
+) -> std::result::Result<ApplyResult, TransactionFailure> {
+    tx.run_with(
+        (config, auth, binding, work),
+        |tx, deadline, (config, auth, binding, work)| {
+            Box::pin(async move {
+                apply_in_transaction_with_work(tx, config, auth, binding, work.clone(), deadline)
+                    .await
+            })
+        },
+    )
+    .await
 }
 async fn apply_in_transaction_with_work(
     tx: &sea_orm::DatabaseTransaction,
@@ -133,6 +158,7 @@ async fn apply_in_transaction_with_work(
     auth: &records::LocalAuthorization,
     binding: &records::ConfirmedBinding,
     work: records::SharedDecodeBudget,
+    deadline: transaction::Deadline,
 ) -> Result<ApplyResult> {
     fence::write_intent(tx).await?;
     // TTL/current config only govern new business. A committed exact result is
@@ -143,19 +169,24 @@ async fn apply_in_transaction_with_work(
             items,
         });
     }
+    deadline.business_expiry(tx, binding.expires_at).await?;
     let before = binding.view().frozen_rows()?;
     if binding.archived_rows().catalog() != native::current_catalog() {
         return Err(ManagementError::Changed);
     }
+    let scope = local_scope::capture(tx, config, binding, work.clone()).await?;
     fence::lock(
         tx,
         before,
         config,
         binding,
+        &scope,
         records::DecodeWork::shared(&work),
     )
     .await?;
-    let checked = records::revalidate_with_work(tx, config, auth, binding, work.clone()).await?;
+    let checked =
+        records::revalidate_scoped_with_work(tx, config, auth, binding, Some(&scope), work.clone())
+            .await?;
     if checked.len() != binding.confirmation.bindings.len()
         || checked
             .iter()
@@ -168,10 +199,19 @@ async fn apply_in_transaction_with_work(
     let mut execution =
         execution::ExecutionBatch::with_work(tx, config, auth, binding, before, work.clone())?;
     execution.use_review(binding.clone())?;
+    execution.use_scope(scope)?;
     for entry in &binding.confirmation.bindings {
-        let executed = execution.execute_entry(entry).await?;
+        let executed = Box::pin(execution.execute_entry(entry)).await?;
         let encoded =
             records::write_executed_action_in_transaction(auth, binding, &executed, before).await?;
+        seal::executed(
+            tx,
+            auth,
+            binding,
+            &executed,
+            records::DecodeWork::shared(&work),
+        )
+        .await?;
         written.push((executed, encoded));
     }
     // Check DB-clock deadline at the publication boundary too. Business time
@@ -184,19 +224,8 @@ async fn apply_in_transaction_with_work(
         records::DecodeWork::shared(&work),
     )
     .await?;
-    for (executed, original) in &mut written {
-        let state =
-            status::current_state_with_work(tx, executed.action_view(), work.clone()).await?;
-        if let Some(updated) =
-            records::update_executed_state(auth, binding, executed, original, state).await?
-        {
-            *original = updated;
-        }
-        executed.set_state(state);
-    }
     super::schema::validate(tx).await?;
     super::catalog::validate(tx, native::current_catalog()).await?;
-    native::check_raw_inventory(tx).await?;
     execution.validate_final(&written).await?;
     binding.check_deadline(tx, auth).await?;
     status::fence_business_expiry(
@@ -216,8 +245,9 @@ async fn apply_in_transaction_with_work(
     })
 }
 
-/// Stopped denotes a known rollback/no committed receipt. NeedsAttention denotes
-/// an unresolved commit response: requery exact receipts, never auto-execute.
+/// Stopped denotes acknowledged rollback or no business SQL started.
+/// NeedsAttention denotes unresolved cleanup or commit: requery exact receipts,
+/// never auto-execute based only on their momentary absence.
 pub struct ApplyFailure {
     pub cause: ManagementError,
     pub items: Vec<StoppedItem>,
@@ -248,10 +278,59 @@ pub async fn apply_detailed_with_session(
     binding: &records::ConfirmedPlan,
     work: records::SharedDecodeBudget,
 ) -> std::result::Result<ApplyResult, ApplyFailure> {
-    let mut state = records::ActionState::Stopped;
-    apply_attempt(db, config, auth, binding, &mut state, work)
+    apply_cancellable_with_session(db, config, auth, binding, work, CancellationToken::new())
         .await
-        .map_err(|cause| ApplyFailure {
+        .map_err(|failure| failure.failure)
+}
+
+/// The transaction failure retains deadline/cancel/database distinctions and
+/// whether rollback actually completed. Await this result after cancelling.
+pub struct CancellableApplyFailure {
+    pub failure: ApplyFailure,
+    pub transaction: Option<TransactionFailure>,
+}
+
+pub async fn apply_cancellable(
+    db: &DatabaseConnection,
+    config: &ManagementConfig,
+    auth: &records::LocalAuthorization,
+    binding: &records::ConfirmedPlan,
+    cancel: CancellationToken,
+) -> std::result::Result<ApplyResult, CancellableApplyFailure> {
+    apply_cancellable_with_session(
+        db,
+        config,
+        auth,
+        binding,
+        records::SharedDecodeBudget::default(),
+        cancel,
+    )
+    .await
+}
+
+pub async fn apply_cancellable_with_session(
+    db: &DatabaseConnection,
+    config: &ManagementConfig,
+    auth: &records::LocalAuthorization,
+    binding: &records::ConfirmedPlan,
+    work: records::SharedDecodeBudget,
+    cancel: CancellationToken,
+) -> std::result::Result<ApplyResult, CancellableApplyFailure> {
+    let mut state = records::ActionState::Stopped;
+    let mut transaction_failure = None;
+    apply_attempt(
+        db,
+        config,
+        auth,
+        binding,
+        (&mut state, &mut transaction_failure),
+        work,
+        cancel,
+    )
+    .await
+    .map_err(|cause| CancellableApplyFailure {
+        transaction: transaction_failure,
+        failure: ApplyFailure {
             cause,
             items: binding
                 .request
@@ -262,7 +341,46 @@ pub async fn apply_detailed_with_session(
                     state,
                 })
                 .collect(),
-        })
+        },
+    })
+}
+
+fn failed_transaction(
+    failure: TransactionFailure,
+    state: &mut records::ActionState,
+    detail: &mut Option<TransactionFailure>,
+) -> ManagementError {
+    *state = if failure.rollback_confirmed {
+        records::ActionState::Stopped
+    } else {
+        records::ActionState::NeedsAttention
+    };
+    *detail = Some(failure);
+    failure.management_error()
+}
+
+async fn recover_receipts(
+    db: &DatabaseConnection,
+    auth: &records::LocalAuthorization,
+    binding: &records::ConfirmedBinding,
+    work: records::SharedDecodeBudget,
+) -> Result<Option<Vec<records::CommittedAction>>> {
+    // Receipt recovery has a separate read-only budget, never authority to retry
+    // business writes after the final-write deadline.
+    let mut recovery =
+        ManagementTransaction::begin(db, transaction::FINAL_WRITE_LIMIT, CancellationToken::new())
+            .await
+            .map_err(TransactionFailure::management_error)?;
+    let (auth, binding) = (auth.clone(), binding.clone());
+    let result = recovery
+        .run(move |tx, _| Box::pin(async move { replay(tx, &auth, &binding, work).await }))
+        .await
+        .map_err(TransactionFailure::management_error)?;
+    recovery
+        .rollback()
+        .await
+        .map_err(TransactionFailure::management_error)?;
+    Ok(result)
 }
 
 async fn replay<C: ConnectionTrait>(

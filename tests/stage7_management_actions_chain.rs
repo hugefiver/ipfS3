@@ -1,3 +1,5 @@
+#[path = "support/management_wire_v3.rs"]
+mod archive;
 #[path = "support/stage7_management_actions.rs"]
 pub mod support;
 use ipfs_s3_gateway::{
@@ -123,20 +125,7 @@ async fn complete_same_file_business_chain_keeps_all_foreign_records_under_origi
     )
     .await
     .unwrap();
-    let create_review = create.review();
-    let mut create_document = Vec::new();
-    let mut export_session = records::ReadSession::default();
-    wire::encode_review(
-        &mut export_session,
-        &create_review,
-        create_review.candidate_item_ids(),
-        &mut create_document,
-    )
-    .unwrap();
-    eprintln!(
-        "chain create borrowed export session={:?}",
-        export_session.usage()
-    );
+    let create_document = archive::export(&create);
     let created = apply_counted(&fixture, &create).await.unwrap();
     let lease_id = created.items[0].receipt.intent_ids[0].clone();
     fixture.settle_with_worker(&lease_id).await;
@@ -262,14 +251,6 @@ async fn complete_same_file_business_chain_keeps_all_foreign_records_under_origi
         .filter(|entry| entry.status == PlanStatus::Candidate)
         .map(|entry| entry.request.item_id.clone())
         .collect::<Vec<_>>();
-    let archive = wire::encode_plan(
-        &remigration,
-        &remigration_snapshot,
-        &remigration_plan,
-        Some(&remigration_plan.confirmation(remigration_ack.clone())),
-    )
-    .unwrap();
-    let imported_remigration = wire::decode_plan(&archive).unwrap();
     let migrate_again = records::confirm(
         &fixture.db,
         &fixture.config,
@@ -280,6 +261,7 @@ async fn complete_same_file_business_chain_keeps_all_foreign_records_under_origi
     )
     .await
     .unwrap();
+    let remigration_document = archive::export(&migrate_again);
     let second = apply_counted(&fixture, &migrate_again).await.unwrap();
     fixture.settle_with_worker(&lease_id).await;
     assert!(second.items[0].migration_points[0].predecessor.is_some());
@@ -442,11 +424,14 @@ async fn complete_same_file_business_chain_keeps_all_foreign_records_under_origi
             .await
             .is_err()
     );
-    let imported_create = wire::decode_plan(&create_document).unwrap();
-    let restored_create =
-        records::load_confirmed_from_imported(&fixture.db, &fixture.auth, &imported_create)
-            .await
-            .unwrap();
+    let restored_create = archive::restore(
+        &fixture.db,
+        &fixture.auth,
+        &create_request,
+        &create_document,
+    )
+    .await
+    .unwrap();
     assert!(restored_create == create);
     // Exact durable replay survives the changed config, cancelled lease and
     // retired domain without authorizing any new object/pin or recapturing IDs.
@@ -455,24 +440,24 @@ async fn complete_same_file_business_chain_keeps_all_foreign_records_under_origi
         &fixture.config,
         &fixture.auth,
         &restored_create,
-        imported_create.session(),
+        Default::default(),
     )
     .await
     .map_err(|failure| failure.cause)
     .unwrap();
     assert!(replay.replayed);
     assert!(replay.items == created.items);
-    eprintln!(
-        "chain original create decode/import/replay session={:?}",
-        imported_create.session().lock().unwrap().usage()
-    );
     // The original imported document contains the prior derived slot proof.
     // Later remigration, cancellation and retirement cannot replace that proof
     // with today's route/configuration or turn public points into authority.
-    let restored =
-        records::load_confirmed_from_imported(&fixture.db, &fixture.auth, &imported_remigration)
-            .await
-            .unwrap();
+    let restored = archive::restore(
+        &fixture.db,
+        &fixture.auth,
+        &remigration,
+        &remigration_document,
+    )
+    .await
+    .unwrap();
     assert!(restored == migrate_again);
     assert!(
         actions::apply_detailed_with_session(
@@ -480,16 +465,12 @@ async fn complete_same_file_business_chain_keeps_all_foreign_records_under_origi
             &fixture.config,
             &fixture.auth,
             &restored,
-            imported_remigration.session()
+            Default::default()
         )
         .await
         .map_err(|failure| failure.cause)
         .unwrap()
         .replayed
-    );
-    eprintln!(
-        "chain original remigration decode/import/replay session={:?}",
-        imported_remigration.session().lock().unwrap().usage()
     );
     let read_session = records::SharedDecodeBudget::default();
     let inventory = records::read_retirement_with_session(
@@ -539,24 +520,20 @@ async fn complete_same_file_business_chain_keeps_all_foreign_records_under_origi
     )
     .unwrap();
     assert!(!String::from_utf8_lossy(&bytes).contains("链_PRIVATE_METADATA"));
-    let session = std::sync::Arc::new(std::sync::Mutex::new(session));
-    wire::decode_review(&bytes, session.clone()).unwrap();
-    eprintln!(
-        "chain retirement borrowed export/decode session={:?},cells={original_cells}",
-        session.lock().unwrap().usage()
+    let changed = archive::rewrite(&remigration_document, |frame| {
+        if let wire::v3::Frame::Header {
+            database_identity, ..
+        } = frame
+        {
+            *database_identity = "forged-database".into();
+        }
+    })
+    .unwrap();
+    assert!(
+        archive::restore(&fixture.db, &fixture.auth, &remigration, &changed)
+            .await
+            .is_err()
     );
-    let mut changed: serde_json::Value = serde_json::from_slice(&archive).unwrap();
-    let points = changed["migration_points"].as_array_mut().unwrap();
-    assert!(!points.is_empty());
-    let epoch = points[0]["destination_epoch"].as_i64().unwrap();
-    points[0]["destination_epoch"] = serde_json::json!(epoch + 1);
-    if let Ok(forged) = wire::decode_plan(&serde_json::to_vec(&changed).unwrap()) {
-        assert!(
-            records::load_confirmed_from_imported(&fixture.db, &fixture.auth, &forged)
-                .await
-                .is_err()
-        );
-    }
     assert!(frame == native::capture(&fixture.db).await.unwrap());
 }
 

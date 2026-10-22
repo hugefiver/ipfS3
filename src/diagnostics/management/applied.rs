@@ -2,10 +2,7 @@ use anyhow::Result;
 use ipfs_s3_gateway::{
     config::Config,
     kubo::KuboClient,
-    pinning::{
-        coordinator::PinningCoordinator,
-        management::{local_config::ManagementConfig, wire::ImportedPlan},
-    },
+    pinning::{coordinator::PinningCoordinator, management::local_config::ManagementConfig},
     store::{
         Store,
         pinning::management::{
@@ -33,6 +30,8 @@ enum FailureReason {
     Runtime,
     #[error("management scoped execution stopped or needs attention (details withheld)")]
     Run,
+    #[error("historical committed result is reply-only; scoped execution is unavailable")]
+    HistoricalRun,
 }
 
 #[derive(thiserror::Error)]
@@ -96,7 +95,15 @@ async fn run_failure(
 ) -> anyhow::Error {
     let mut states = Vec::new();
     for (index, entry) in binding.confirmation.bindings.iter().enumerate() {
-        let status = actions::status::lookup(db, auth, binding, &entry.request.item_id).await;
+        let status = current_status(
+            db,
+            auth,
+            binding,
+            entry,
+            records::SharedDecodeBudget::default(),
+            cancellation.clone(),
+        )
+        .await;
         states.push(match status {
             Ok(Some(action)) => item(index, &action),
             Ok(None) => json!({"item_index": index, "item_id": entry.request.item_id, "receipt": "not_applied", "state": "not_applied"}),
@@ -122,47 +129,113 @@ pub async fn execute(
     config: &ManagementConfig,
     auth: &LocalAuthorization,
     command: &Command,
-    imported: &ImportedPlan,
+    imported: input::ImportedFile,
+    cancellation: CancellationToken,
+) -> Result<Value> {
+    match super::binding::restore(db, auth, imported).await? {
+        super::binding::Restored::Current(binding, work) => {
+            execute_bound(db, raw, config, auth, command, &binding, work, cancellation).await
+        }
+        super::binding::Restored::Recorded(plan) => {
+            let mut report = recorded(command, &plan)?;
+            if matches!(command, Command::Status { .. }) {
+                let work = records::SharedDecodeBudget::default();
+                let mut limits =
+                    ipfs_s3_gateway::pinning::management::retirement::RunLimits::default();
+                limits.cancellation = cancellation;
+                for (index, action) in plan.actions().iter().enumerate() {
+                    let item_id = match action {
+                        records::RecordedResult::Current(action) => {
+                            &action.receipt.binding.request.item_id
+                        }
+                        records::RecordedResult::Historical(action) => {
+                            &action.receipt.binding.request.item_id
+                        }
+                    };
+                    let current = actions::status::recorded_with_work(
+                        db,
+                        config,
+                        auth,
+                        &plan,
+                        item_id,
+                        &limits,
+                        work.clone(),
+                    )
+                    .await?;
+                    report["items"][index]["state"] = json!(current.state);
+                    report["items"][index]["retirement"] = json!(current.retirement);
+                }
+                report["state_evidence"] = json!("read_only_current_action_lookup");
+                report["observation"] =
+                    json!("current_database_facts_not_live_provider_observation");
+            }
+            Ok(report)
+        }
+    }
+}
+
+pub(super) fn recorded(command: &Command, plan: &records::RecordedPlan) -> Result<Value> {
+    let result = plan.actions().iter().enumerate().map(|(index, action)| match action {
+        records::RecordedResult::Current(action) => item(index, action),
+        records::RecordedResult::Historical(action) => json!({
+            "item_index": index, "item_id": action.receipt.binding.request.item_id,
+            "receipt": "verified_original_database_receipt", "state": action.state,
+            "intent_count": action.receipt.intent_ids.len(), "target_count": action.targets.len(),
+            "job_directives": action.jobs.iter().map(|job| job.directive).collect::<Vec<_>>(),
+            "physical_release_bytes": 0,
+        }),
+    }).collect::<Vec<_>>();
+    let mut report = json!({
+        "database_writes": false, "source_rpc": "not_performed", "provider_rpc": "not_performed",
+        "state_evidence": "verified_frozen_historical_result", "items": result, "physical_release_bytes": 0,
+        "observation": "historical_committed_state_not_current_responsibility",
+    });
+    match command {
+        Command::DryRun { .. } => report["mode"] = json!("dry_run"),
+        Command::Status { .. } => report["mode"] = json!("status"),
+        Command::Apply { run, .. } => {
+            report["mode"] = json!("apply");
+            report["replayed"] = json!(true);
+            report["business_commit"] = json!("exact_replay_no_new_business");
+            report["run_requested"] = json!(run);
+            report["run_started"] = json!(false);
+            if *run {
+                return Err(anyhow::Error::new(FailureReport {
+                    report,
+                    reason: FailureReason::HistoricalRun,
+                }));
+            }
+        }
+        _ => return Err(input::invalid()),
+    }
+    Ok(report)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_bound(
+    db: &DatabaseConnection,
+    raw: &Config,
+    config: &ManagementConfig,
+    auth: &LocalAuthorization,
+    command: &Command,
+    binding: &records::ConfirmedBinding,
+    work: records::SharedDecodeBudget,
     cancellation: CancellationToken,
 ) -> Result<Value> {
     match command {
         Command::Status { .. } => {
-            let tx = db
-                .begin_with_config(
-                    if db.get_database_backend() == DatabaseBackend::Postgres {
-                        Some(IsolationLevel::RepeatableRead)
-                    } else {
-                        None
-                    },
-                    if db.get_database_backend() == DatabaseBackend::Postgres {
-                        Some(AccessMode::ReadOnly)
-                    } else {
-                        None
-                    },
-                )
-                .await
-                .map_err(|_| super::database::unavailable())?;
-            // B's read-only loader restores original private authority;
+            // The read-only loader restores original private authority;
             // no fresh confirmation/TTL gate precedes receipt/status lookup.
-            let binding = records::load_confirmed_from_imported(&tx, auth, imported).await?;
             let mut result = Vec::new();
             for (index, entry) in binding.confirmation.bindings.iter().enumerate() {
-                let action = actions::status::lookup_with_work(
-                    &tx,
-                    auth,
-                    &binding,
-                    &entry.request.item_id,
-                    imported.session(),
-                )
-                .await?;
+                let action =
+                    current_status(db, auth, binding, entry, work.clone(), cancellation.clone())
+                        .await?;
                 result.push(match action {
                     Some(action) => item(index, &action),
                     None => json!({"item_index": index, "item_id": entry.request.item_id, "receipt": "not_applied", "state": "not_applied"}),
                 });
             }
-            tx.rollback()
-                .await
-                .map_err(|_| super::database::unavailable())?;
             Ok(
                 json!({"mode": "status", "database_writes": false, "source_rpc": "not_performed", "provider_rpc": "not_performed",
                 "observation": "action_layer_stored_database_evidence_not_live", "state_evidence": "read_only_current_action_lookup",
@@ -170,16 +243,16 @@ pub async fn execute(
             )
         }
         Command::Apply { run, .. } => {
-            let binding = records::load_confirmed_from_imported(db, auth, imported).await?;
-            let applied = actions::apply_detailed_with_session(
+            let applied = actions::apply_cancellable_with_session(
                 db,
                 config,
                 auth,
-                &binding,
-                imported.session(),
+                binding,
+                work.clone(),
+                cancellation.clone(),
             )
             .await
-            .map_err(|failure| apply_failure(failure, *run))?;
+            .map_err(|failure| apply_failure(failure.failure, *run))?;
             let mut report = json!({"mode": "apply", "replayed": applied.replayed, "run_requested": run,
                 "business_commit": if applied.replayed { "exact_replay_no_new_business" } else { "committed" },
                 "state_evidence": "committed_action_result", "items": items(&applied.items),
@@ -188,8 +261,8 @@ pub async fn execute(
                 let scope = match ManagementJobScope::from_applied_with_work(
                     db,
                     auth,
-                    &binding,
-                    imported.session(),
+                    binding,
+                    work.clone(),
                 )
                 .await
                 {
@@ -198,7 +271,7 @@ pub async fn execute(
                         return Err(run_failure(
                             db,
                             auth,
-                            &binding,
+                            binding,
                             report,
                             FailureReason::Scope,
                             false,
@@ -218,7 +291,7 @@ pub async fn execute(
                         return Err(run_failure(
                             db,
                             auth,
-                            &binding,
+                            binding,
                             report,
                             FailureReason::Runtime,
                             false,
@@ -241,7 +314,7 @@ pub async fn execute(
                         return Err(run_failure(
                             db,
                             auth,
-                            &binding,
+                            binding,
                             report,
                             FailureReason::Run,
                             true,
@@ -267,6 +340,64 @@ pub async fn execute(
         }
         _ => Err(input::invalid()),
     }
+}
+
+async fn current_status(
+    db: &DatabaseConnection,
+    auth: &LocalAuthorization,
+    binding: &records::ConfirmedBinding,
+    entry: &ipfs_s3_gateway::pinning::management::PlanEntry,
+    work: records::SharedDecodeBudget,
+    cancellation: CancellationToken,
+) -> Result<Option<CommittedAction>> {
+    use ipfs_s3_gateway::pinning::management::{
+        Subject,
+        retirement::{RunLimits, Workspace},
+    };
+    if matches!(entry.request.subject, Subject::Provider { .. }) {
+        let mut workspace = Workspace::create()?;
+        let result = async {
+            let (path, file) = workspace.reserve().await?;
+            let mut limits = RunLimits::default();
+            limits.cancellation = cancellation;
+            let lookup = actions::status::lookup_retirement_with_work(
+                db,
+                auth,
+                binding,
+                &entry.request.item_id,
+                &path,
+                file,
+                &limits,
+                work,
+            )
+            .await?;
+            let result = if let Some(mut lookup) = lookup {
+                let result = lookup.advance(db, &limits).await;
+                lookup.close().await?;
+                Some(result?.ok_or(ManagementError::Budget)?)
+            } else {
+                None
+            };
+            Ok::<_, anyhow::Error>(result)
+        }
+        .await;
+        workspace.cleanup()?;
+        return result;
+    }
+    let postgres = db.get_database_backend() == DatabaseBackend::Postgres;
+    let tx = db
+        .begin_with_config(
+            postgres.then_some(IsolationLevel::RepeatableRead),
+            postgres.then_some(AccessMode::ReadOnly),
+        )
+        .await
+        .map_err(|_| super::database::unavailable())?;
+    let result =
+        actions::status::lookup_with_work(&tx, auth, binding, &entry.request.item_id, work).await;
+    tx.rollback()
+        .await
+        .map_err(|_| super::database::unavailable())?;
+    Ok(result?)
 }
 
 #[cfg(test)]

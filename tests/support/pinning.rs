@@ -47,6 +47,7 @@ const PINATA_TOKEN: &str = "pinata-test-token";
 const FILEBASE_TOKEN: &str = "filebase-test-token";
 pub const TEST_CID: &str = "QmYwAPJzv5CZsnAzt8auVTL7VYhESWDFoCPTqCkiP6fKGE";
 const WORKER_WAIT: Duration = Duration::from_secs(10);
+
 const WORKER_SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
 
 pub struct PinningHarness {
@@ -538,7 +539,9 @@ pub async fn start_pinning_harness(config: PinningHarnessConfig) -> PinningHarne
     let pinning = PinningCoordinator::build(validated).expect("build test pinning coordinator");
 
     let KuboHarness { server: kubo, .. } = start_kubo_harness(config.kubo_script).await;
-    let db = sea_orm::Database::connect("sqlite::memory:")
+    let mut options = sea_orm::ConnectOptions::new("sqlite::memory:");
+    options.test_before_acquire(false);
+    let db = sea_orm::Database::connect(options)
         .await
         .expect("in-memory SQLite database");
     ipfs_s3_gateway::store::run_migrations(&db)
@@ -1656,5 +1659,41 @@ mod tests {
             2,
             "an ambiguous request consumed a scripted reply"
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_idle_acquisition_preserves_gateway_metadata() {
+        use std::{future::Future, task::Poll};
+
+        let mut config = PinningHarnessConfig::request_one();
+        config.pinata_script.clear();
+        config.filebase_script.clear();
+        let harness = start_pinning_harness(config).await;
+        let pool = harness.state.store.db().get_sqlite_connection_pool();
+        tokio::time::timeout(WORKER_WAIT, async {
+            while pool.num_idle() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut acquiring = Box::pin(pool.acquire());
+        std::future::poll_fn(|cx| {
+            if let Poll::Ready(result) = acquiring.as_mut().poll(cx) {
+                drop(result.unwrap());
+            }
+            Poll::Ready(())
+        })
+        .await;
+        drop(acquiring);
+        assert!(harness.pin_jobs().await.is_empty());
+        assert!(
+            ipfs_s3_gateway::store::entities::bucket::Entity::find_by_id(harness.bucket.clone())
+                .one(harness.state.store.db())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        harness.shutdown().await;
     }
 }

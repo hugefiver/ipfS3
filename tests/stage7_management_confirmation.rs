@@ -1,3 +1,5 @@
+#[path = "support/management_wire_v3.rs"]
+mod archive;
 #[path = "support/stage7_management.rs"]
 pub mod support;
 
@@ -5,10 +7,13 @@ use ipfs_s3_gateway::{
     pinning::management::{self as management, db_snapshot, evidence, wire, *},
     store::{
         self,
-        pinning::management::{actions, native, records},
+        pinning::management::{
+            actions, native, records,
+            transaction::{FINAL_WRITE_LIMIT, ManagementTransaction},
+        },
     },
 };
-use sea_orm::{ConnectionTrait, TransactionTrait};
+use sea_orm::ConnectionTrait;
 use tokio_util::sync::CancellationToken;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
@@ -68,38 +73,25 @@ async fn file_confirmation_uses_trusted_original_and_applied_receipt_not_client_
     let plan = dry_run(&request, &snapshot).unwrap();
     assert_eq!(plan.items()[0].status, PlanStatus::Candidate);
     let acknowledgement = plan.confirmation(vec!["object".into()]);
-    let bytes = wire::encode_plan(&request, &snapshot, &plan, Some(&acknowledgement)).unwrap();
-    assert!(!String::from_utf8_lossy(&bytes).contains("DO_NOT_EXPORT_NATIVE_METADATA"));
-    assert!(!String::from_utf8_lossy(&bytes).contains(&server.uri()));
-    let imported = wire::decode_plan(&bytes).unwrap();
     assert!(
-        !imported
-            .snapshot_without_applied()
-            .native_frame
-            .as_ref()
-            .unwrap()
-            .has_private_material()
-    );
-    assert!(
-        records::confirm_imported(&db, &config, &auth, &imported)
+        records::load_confirmed_authority(&db, &auth, &request, Default::default())
             .await
             .is_err()
     );
 
-    records::stage_confirmation(
+    let binding = records::confirm(
         &db,
         &config,
         &auth,
-        &request,
-        &snapshot,
-        &plan,
+        (&request, &snapshot, &plan),
+        acknowledgement.candidate_item_ids,
         chrono::Duration::minutes(2),
     )
     .await
     .unwrap();
-    let binding = records::confirm_imported(&db, &config, &auth, &imported)
-        .await
-        .unwrap();
+    let bytes = archive::export(&binding);
+    assert!(!String::from_utf8_lossy(&bytes).contains("DO_NOT_EXPORT_NATIVE_METADATA"));
+    assert!(!String::from_utf8_lossy(&bytes).contains(&server.uri()));
     let mut private = false;
     binding
         .review()
@@ -107,19 +99,31 @@ async fn file_confirmation_uses_trusted_original_and_applied_receipt_not_client_
             private |= table == "objects" && column == "metadata" && value.is_some();
         });
     assert!(private);
-    let resolved =
-        records::confirm_imported(&db, &config, &auth, &wire::decode_plan(&bytes).unwrap())
-            .await
-            .unwrap();
+    let resolved = archive::restore(&db, &auth, &request, &bytes)
+        .await
+        .unwrap();
     assert!(resolved == binding);
-    let tx = db.begin().await.unwrap();
-    records::recheck_confirmed_frame(&tx, &auth, &binding)
+    let mut tx = ManagementTransaction::begin(&db, FINAL_WRITE_LIMIT, CancellationToken::new())
         .await
         .unwrap();
-    records::revalidate_confirmed_in_transaction(&tx, &config, &auth, &binding)
-        .await
-        .unwrap();
-    let applied = actions::apply_in_transaction(&tx, &config, &auth, &binding)
+    tx.run_with(
+        (&auth, &binding, &config),
+        |tx, _, (checked_auth, checked_binding, checked_config)| {
+            Box::pin(async move {
+                records::revalidate_confirmed_in_transaction(
+                    tx,
+                    checked_config,
+                    checked_auth,
+                    checked_binding,
+                )
+                .await?;
+                Ok(())
+            })
+        },
+    )
+    .await
+    .unwrap();
+    let applied = actions::apply_in_transaction(&mut tx, &config, &auth, &binding)
         .await
         .unwrap();
     let receipt = applied.items[0].receipt.clone();
@@ -130,20 +134,18 @@ async fn file_confirmation_uses_trusted_original_and_applied_receipt_not_client_
         .unwrap();
     assert!(stored == receipt);
     assert!(
-        records::lookup_applied_from_imported(&db, &auth, &imported, "object")
+        records::lookup_applied(&db, &auth, &resolved, "object")
             .await
             .unwrap()
             .unwrap()
             == receipt
     );
-    let mut forged: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    forged["confirmation"] = serde_json::json!([]);
-    let forged = wire::decode_plan(&serde_json::to_vec(&forged).unwrap()).unwrap();
-    assert!(
-        records::load_confirmed_from_imported(&db, &auth, &forged)
-            .await
-            .is_err()
-    );
+    let forged = archive::rewrite(&bytes, |frame| {
+        if let wire::v3::Frame::Acknowledgements { item_ids } = frame {
+            *item_ids = Some(vec![]);
+        }
+    });
+    assert!(matches!(forged, Err(SafeError::ConfirmationMismatch)));
 
     let (_other_directory, other) = support::database().await;
     support::setup(&other, &config).await;

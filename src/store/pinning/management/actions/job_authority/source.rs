@@ -6,7 +6,7 @@ use crate::pinning::{
     policy::PublicationContext,
     tags::ObjectTag,
 };
-use sea_orm::QuerySelect;
+use sea_orm::Statement;
 
 pub(super) async fn historical_fresh<C: ConnectionTrait>(
     db: &C,
@@ -15,7 +15,10 @@ pub(super) async fn historical_fresh<C: ConnectionTrait>(
     now: DateTime<Utc>,
     work: records::SharedDecodeBudget,
 ) -> Result<bool> {
-    for trusted in records::actions_for_job_with_work(db, job, work).await? {
+    for trusted in
+        crate::store::pinning::management::admission::authority::actions_for_job(db, job, work)
+            .await?
+    {
         let action = trusted.action_view();
         for seed in &action.jobs {
             trusted.binding().copy(&(seed, &authority.job_id))?;
@@ -166,7 +169,10 @@ async fn denied<C: ConnectionTrait>(
         .await
         .map_err(|_| ManagementError::Database)?
         .ok_or(ManagementError::Confirmation)?;
-    for trusted in records::actions_for_job_with_work(db, &job, work).await? {
+    for trusted in
+        crate::store::pinning::management::admission::authority::actions_for_job(db, &job, work)
+            .await?
+    {
         for seed in &trusted.action_view().jobs {
             trusted.binding().copy(&(seed, &authority.job_id))?;
             let mut derived = seed.clone();
@@ -192,8 +198,8 @@ pub(super) async fn current<C: ConnectionTrait>(
     let Some(identity) = &authority.source else {
         return Ok(false);
     };
-    let frame = records::CurrentRows::capture(db, records::DecodeWork::shared(&work)).await?;
-    let rows = records::FrozenRows::Current(&frame);
+    let frame = super::current_scope::capture(db, authority, work.clone()).await?;
+    let rows = records::FrozenRows::Frame(&frame);
     let Some(proof) = records::DecodeWork::shared(&work).with(|work| {
         accounting::current_proof_from_source(
             rows,
@@ -303,25 +309,40 @@ pub(super) async fn lock(
     if tx.get_database_backend() != sea_orm::DatabaseBackend::Postgres {
         return Ok(());
     }
+    let mut buckets = std::collections::BTreeSet::new();
     let mut owners = std::collections::BTreeSet::new();
     let mut versions = std::collections::BTreeSet::new();
     for identity in authority.owner.iter().chain(authority.source.iter()) {
+        buckets.insert(identity.bucket.as_str());
         owners.insert(identity.object_id.clone());
         versions.insert(identity.private_version_id.clone());
     }
+    for name in buckets {
+        tx.query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT name FROM buckets WHERE name=$1 FOR UPDATE NOWAIT",
+            [name.into()],
+        ))
+        .await
+        .map_err(|_| ManagementError::Database)?;
+    }
     for id in owners {
-        crate::store::entities::object::Entity::find_by_id(id)
-            .lock_exclusive()
-            .one(tx)
-            .await
-            .map_err(|_| ManagementError::Database)?;
+        tx.query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT id FROM objects WHERE id=$1 FOR UPDATE NOWAIT",
+            [id.into()],
+        ))
+        .await
+        .map_err(|_| ManagementError::Database)?;
     }
     for id in versions {
-        object_version::Entity::find_by_id(id)
-            .lock_exclusive()
-            .one(tx)
-            .await
-            .map_err(|_| ManagementError::Database)?;
+        tx.query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT id FROM object_versions WHERE id=$1 FOR UPDATE NOWAIT",
+            [id.into()],
+        ))
+        .await
+        .map_err(|_| ManagementError::Database)?;
     }
     Ok(())
 }

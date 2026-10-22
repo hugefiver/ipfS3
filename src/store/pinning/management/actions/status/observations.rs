@@ -10,14 +10,13 @@ use crate::store::{
 
 pub(super) async fn needs_attention<C: ConnectionTrait>(
     db: &C,
-    action: &records::CommittedAction,
+    jobs: &[records::JobAuthority],
     work: records::SharedDecodeBudget,
 ) -> Result<bool> {
     let context = records::DecodeWork::shared(&work);
     context.with(|work| work.nodes(1))?;
     let mut authorities = Vec::new();
-    for seed in action
-        .jobs
+    for seed in jobs
         .iter()
         .filter(|seed| seed.directive == records::JobDirective::Submit)
     {
@@ -41,8 +40,7 @@ pub(super) async fn needs_attention<C: ConnectionTrait>(
             {
                 return Ok(true);
             }
-            if !action
-                .jobs
+            if !jobs
                 .iter()
                 .chain(&authorities)
                 .any(|authority| authority.job_id == expected.job_id)
@@ -52,7 +50,7 @@ pub(super) async fn needs_attention<C: ConnectionTrait>(
             }
         }
     }
-    for authority in action.jobs.iter().chain(&authorities) {
+    for authority in jobs.iter().chain(&authorities) {
         let Some(job) =
             records::current_model::<pin_job::Entity, _>(db, &[&authority.job_id], context).await?
         else {
@@ -138,8 +136,7 @@ pub(super) async fn needs_attention<C: ConnectionTrait>(
             return Ok(true);
         }
     }
-    for authority in action
-        .jobs
+    for authority in jobs
         .iter()
         .filter(|authority| authority.directive == records::JobDirective::ReadOnlyObserve)
     {

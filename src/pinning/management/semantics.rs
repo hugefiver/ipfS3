@@ -446,48 +446,21 @@ fn object_step(
 }
 
 fn retirement(capture: &RetirementCapture) -> Result<RetirementStep, SafeError> {
-    if !capture.inventory.complete {
+    if capture.inventory.reducer_version != super::retirement::REDUCER_VERSION {
         return Err(SafeError::IncompleteInventory);
     }
-    for target in &capture.targets {
-        if !capture.inventory.leases.contains(&target.lease) {
-            return Err(SafeError::IncompleteInventory);
-        }
-    }
-    let resources: Vec<_> = capture
-        .remotes
-        .iter()
-        .chain(&capture.historical_remotes)
-        .collect();
+    let totals = &capture.totals;
     Ok(RetirementStep {
         stop_new_allocations: true,
-        needs_attention: !capture.inventory.attribution_complete
-            || capture.routes.iter().any(|route| !route.available)
-            || resources.iter().any(|remote| {
-                remote.has_unknown_responsibility()
-                    || !capture
-                        .routes
-                        .iter()
-                        .any(|route| route.identity == remote.route && route.available)
-            }),
-        leases: capture.inventory.leases.len(),
-        retained: resources.iter().filter(|remote| remote.retained).count(),
-        unknown: resources
-            .iter()
-            .filter(|remote| remote.has_unknown_responsibility())
-            .count(),
-        inflight: resources
-            .iter()
-            .filter(|remote| {
-                remote.effect == SideEffect::InFlight
-                    || remote.inflight_operations.is_some_and(|n| n > 0)
-            })
-            .count(),
-        cleanup_pending: resources
-            .iter()
-            .filter(|remote| remote.cleanup_pending)
-            .count(),
-        root_references: capture.inventory.root_reference_ids.len(),
+        needs_attention: !totals.attribution_complete
+            || !totals.routes_available
+            || totals.unknown != 0,
+        leases: totals.leases,
+        retained: totals.retained,
+        unknown: totals.unknown,
+        inflight: totals.inflight,
+        cleanup_pending: totals.cleanup_pending,
+        root_references: totals.roots,
     })
 }
 
@@ -520,9 +493,10 @@ fn validate_disposition(
     match selection {
         RetirementSelection::Retain => Ok(()),
         RetirementSelection::ReleaseRootReferences { references } => {
-            if references.len() != capture.root_references.len()
+            if references.len() != capture.mutation_scope.root_references.len()
                 || references.iter().any(|key| {
                     !capture
+                        .mutation_scope
                         .root_references
                         .iter()
                         .any(|proof| proof.key == *key)
@@ -533,14 +507,14 @@ fn validate_disposition(
             Ok(())
         }
         RetirementSelection::Migrate { targets } => {
-            if !capture.inventory.attribution_complete
-                || !capture.inventory.root_reference_ids.is_empty()
+            if !capture.totals.attribution_complete
+                || capture.totals.roots != 0
                 || targets.is_empty()
             {
                 return Err(SafeError::IncompleteInventory);
             }
             for selected in targets {
-                if !capture.targets.iter().any(|target| {
+                if !capture.mutation_scope.targets.iter().any(|target| {
                     target.id == selected.source_target_id
                         && target.lease.id == selected.lease_id
                         && target.cid == selected.cid
@@ -551,14 +525,14 @@ fn validate_disposition(
             Ok(())
         }
         RetirementSelection::ControlledCleanup { resources } => {
-            if !capture.inventory.attribution_complete
-                || !capture.inventory.root_reference_ids.is_empty()
-                || !capture.historical_remotes.is_empty()
-                || resources.len() != capture.remotes.len()
+            if !capture.totals.attribution_complete
+                || capture.totals.roots != 0
+                || capture.totals.historical_resources != 0
+                || resources.len() != capture.totals.current_resources
             {
                 return Err(SafeError::IncompleteInventory);
             }
-            for remote in &capture.remotes {
+            for remote in &capture.mutation_scope.remotes {
                 if remote.ownership != Ownership::ApplicationCreated
                     || remote.application_references != Some(0)
                     || remote.inflight_operations != Some(0)
@@ -570,7 +544,7 @@ fn validate_disposition(
                         remote.route.resource_type,
                         ResourceType::RpcPin | ResourceType::ClusterPin
                     )
-                    || !capture.routes.iter().any(|route| {
+                    || !capture.mutation_scope.routes.iter().any(|route| {
                         route.identity == remote.route
                             && route.available
                             && route.cleanup == CleanupMode::Managed

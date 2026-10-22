@@ -14,7 +14,7 @@ use ipfs_s3_gateway::{
         pinning::{jobs, ledger, management::native},
     },
 };
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, TransactionTrait};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, TransactionTrait};
 use support::stage7_retirement_barrier_http::{Fixture, xml_value};
 
 #[tokio::test]
@@ -29,7 +29,13 @@ async fn signed_put_copy_tag_renew_and_normal_restart_cannot_reopen_retired_doma
             Fixture::pin_headers(),
         )
         .await;
-    assert_eq!(put.status(), reqwest::StatusCode::OK);
+    let status = put.status();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "{}",
+        put.text().await.unwrap()
+    );
     fixture.retire().await;
     let before = native::capture(fixture.state.store.db()).await.unwrap();
     let put = fixture
@@ -131,8 +137,11 @@ async fn captured_multipart_complete_and_new_multipart_intake_both_recheck_retir
             http::HeaderMap::new(),
         )
         .await;
-    assert!(response.status().is_success());
-    let etag = response.headers()["etag"].to_str().unwrap().to_owned();
+    let status = response.status();
+    let etag = response.headers().get("etag").cloned();
+    let body = response.text().await.unwrap();
+    assert!(status.is_success(), "UploadPart {status}: {body}");
+    let etag = etag.unwrap().to_str().unwrap().to_owned();
     fixture.retire().await;
     let complete = format!("<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>").into_bytes();
     let response = fixture
@@ -178,7 +187,13 @@ async fn a_durable_started_rpc_invocation_is_not_a_new_dispatch_after_retirement
             Fixture::pin_headers(),
         )
         .await;
-    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let status = response.status();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "{}",
+        response.text().await.unwrap()
+    );
     let now = ipfs_s3_gateway::store::database_clock::database_now(fixture.state.store.db())
         .await
         .unwrap();
@@ -248,7 +263,13 @@ async fn actually_dispatched_unknown_callback_is_retained_at_live_and_late_old_e
                 Fixture::pin_headers(),
             )
             .await;
-        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let status = response.status();
+        assert_eq!(
+            status,
+            reqwest::StatusCode::OK,
+            "{}",
+            response.text().await.unwrap()
+        );
         let now = ipfs_s3_gateway::store::database_clock::database_now(fixture.state.store.db())
             .await
             .unwrap();
@@ -298,14 +319,12 @@ async fn actually_dispatched_unknown_callback_is_retained_at_live_and_late_old_e
             .unwrap();
         // The real HTTP operation has started, but its result has not been
         // persisted. Retirement must keep this responsibility, not erase it.
-        fixture.retire().await;
-        fixture
-            .state
-            .store
-            .db()
-            .execute_unprepared("UPDATE pin_provider_routes SET retired=TRUE")
+        let mut retired = fixture.config.pinning.providers[0].clone();
+        retired.identity.retired = true;
+        ledger::register_configured_route(fixture.state.store.db(), &retired.name, &retired)
             .await
             .unwrap();
+        fixture.retire().await;
         if late {
             let tx = fixture.state.store.db().begin().await.unwrap();
             leases::cancel_lease(&tx, claimed.model.lease_id.as_deref().unwrap(), now)

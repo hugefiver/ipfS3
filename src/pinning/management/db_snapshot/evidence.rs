@@ -45,6 +45,8 @@ pub struct DatabaseSnapshot {
     pub needs_attention: Vec<EvidenceGap>,
     #[serde(skip)]
     pub(super) planning: Option<Snapshot>,
+    #[serde(skip)]
+    pub(super) scope: Option<std::sync::Arc<super::PlanningScope>>,
 }
 
 impl DatabaseSnapshot {
@@ -52,6 +54,26 @@ impl DatabaseSnapshot {
     /// blocks only its actual scope. This method grants no execution authority.
     pub fn planning_snapshot(self) -> Result<Snapshot> {
         self.planning.ok_or(SnapshotError::UnsupportedEvidence)
+    }
+    /// Exact memberships (including empty results) for B2's fresh scope fence.
+    /// A scoped NativeFrame alone does not prove membership completeness.
+    pub fn planning_with_scope(self) -> Result<(Snapshot, std::sync::Arc<super::PlanningScope>)> {
+        Ok((
+            self.planning.ok_or(SnapshotError::UnsupportedEvidence)?,
+            self.scope.ok_or(SnapshotError::UnsupportedEvidence)?,
+        ))
+    }
+    pub fn scope(&self) -> Option<&super::PlanningScope> {
+        self.scope.as_deref()
+    }
+    /// Snapshot of the cumulative storage collection budget. These counters do
+    /// not claim database-engine scan work or the separate semantic decode work.
+    pub fn work(&self) -> Option<crate::store::pinning::management::native::meter::WorkMeter> {
+        self.scope().map(super::PlanningScope::work)
+    }
+    /// Storage-budget reservation peak for the collection, not process RSS.
+    pub fn peak_resident(&self) -> Option<usize> {
+        self.scope().map(super::PlanningScope::peak_resident)
     }
 }
 

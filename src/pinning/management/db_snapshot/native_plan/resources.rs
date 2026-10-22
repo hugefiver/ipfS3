@@ -38,8 +38,7 @@ fn keys(frame: &NativeFrame, evidence: &RemoteEvidence, history: bool) -> Vec<Na
         .collect()
 }
 
-async fn one(
-    tx: &DatabaseTransaction,
+fn one(
     frame: &NativeFrame,
     evidence: &RemoteEvidence,
     history: bool,
@@ -72,14 +71,12 @@ async fn one(
     let raw_contract_exists = resource_route_declared(frame, &binding_key, work);
     let mut point_only = false;
     if original.is_none() && !raw_contract_exists {
-        let point = crate::store::pinning::legacy_migration::resource_binding_with_work(
-            tx,
+        let point = super::super::legacy::resource(
+            frame,
             &evidence.allocation,
             &evidence.original_cid,
-            DecodeWork::shared(work),
-        )
-        .await
-        .map_err(|_| SnapshotError::InvalidEvidence)?;
+            work,
+        )?;
         original = point
             .filter(|point| !history || point.historical_epoch == Some(epoch))
             .and_then(|point| point.historical_route);
@@ -159,8 +156,7 @@ fn decision_projection(
         .collect()
 }
 
-pub(super) async fn project(
-    tx: &DatabaseTransaction,
+pub(super) fn project(
     frame: &NativeFrame,
     diagnostic: &DatabaseSnapshot,
     request: &PlanRequest,
@@ -183,7 +179,7 @@ pub(super) async fn project(
         (&diagnostic.historical_remotes, true),
     ] {
         for evidence in rows {
-            if let Some(row) = one(tx, frame, evidence, history, work).await? {
+            if let Some(row) = one(frame, evidence, history, work)? {
                 if history {
                     historical.push(row);
                 } else {

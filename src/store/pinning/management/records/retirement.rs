@@ -88,22 +88,6 @@ fn classify_retirement_binding(
     Ok(receipt)
 }
 
-#[cfg(test)]
-pub(crate) async fn verify_retirement<C: ConnectionTrait>(
-    db: &C,
-    row: &native::NativeRow,
-    action: &native::NativeRow,
-    candidates: &[(native::NativeRow, native::NativeRow)],
-) -> Result<ReviewHandle> {
-    let scope = native::value(row, "database_scope").ok_or(ManagementError::InvalidEvidence)?;
-    let identity = native::value(row, "native_identity").ok_or(ManagementError::InvalidEvidence)?;
-    let plan = native::value(row, "plan_id").ok_or(ManagementError::InvalidEvidence)?;
-    let mut source =
-        evidence::Evidence::load_roots(db, scope, identity, &[plan.into()], candidates).await?;
-    classify_retirement_root(&source, row, action)?;
-    source.load_dependencies(db, &[plan.into()]).await?;
-    retirement_review_from_source(&source, row, action)
-}
 pub(crate) fn retirement_review_from_source(
     source: &evidence::Evidence,
     row: &native::NativeRow,
@@ -135,16 +119,24 @@ pub(crate) fn retirement_review_from_source(
     let unresolved: Vec<String> = source
         .budget()?
         .typed(native::value(row, "unresolved").ok_or(ManagementError::InvalidEvidence)?)?;
+    inventory_review::require(
+        DecodeWork::shared(&source.work),
+        native::value(row, "database_scope").ok_or(ManagementError::InvalidEvidence)?,
+        native::value(row, "native_identity").ok_or(ManagementError::InvalidEvidence)?,
+        native::value(row, "principal").ok_or(ManagementError::InvalidEvidence)?,
+        native::value(row, "plan_id").ok_or(ManagementError::InvalidEvidence)?,
+        entry,
+    )?;
     if !step.stop_new_allocations
-        || !capture.inventory.complete
         || unresolved.len() > native::MAX_ROWS
         || native::value(row, "state") == Some("retired")
             && (capture
+                .mutation_scope
                 .remotes
                 .iter()
-                .chain(&capture.historical_remotes)
+                .chain(&capture.mutation_scope.historical_remotes)
                 .any(|remote| remote.has_unknown_responsibility())
-                || !capture.inventory.attribution_complete
+                || !capture.totals.attribution_complete
                 || step.needs_attention
                 || step.unknown > 0
                 || step.inflight > 0
@@ -179,6 +171,15 @@ pub async fn write_retirement_in_transaction(
         unresolved,
     )
     .await?;
+    seal_originals(
+        tx,
+        &[native::NativeKey {
+            table: "pin_management_retirements".into(),
+            values: vec![allocation_domain.into()],
+        }],
+        review.view().decode_work(),
+    )
+    .await?;
     let inventory = review.review();
     review.view().copy(&(
         allocation_domain,
@@ -188,7 +189,22 @@ pub async fn write_retirement_in_transaction(
         auth.principal(),
         auth.database_identity(),
     ))?;
-    native::check_raw_inventory(tx).await?;
+    let mut storage_work = native::meter::Budget::default();
+    let published = locator::load_authority(
+        tx,
+        &[locator::AuthoritySelector::RetirementDomain(
+            allocation_domain.into(),
+        )],
+        &mut storage_work,
+    )
+    .await;
+    charge_storage_work(&storage_work, review.view().decode_work())?;
+    if !published?.originals.contains_key(&native::NativeKey {
+        table: super::super::schema::RETIREMENTS.into(),
+        values: vec![allocation_domain.into()],
+    }) {
+        return Err(ManagementError::Changed);
+    }
     Ok(RetirementRecord {
         allocation_domain: allocation_domain.into(),
         database_scope: auth.database_scope.clone(),
@@ -264,8 +280,15 @@ pub(crate) async fn write_retirement_marker(
         .transpose()?
         .as_deref()
         == Some(original);
+    inventory_review::require(
+        confirmation.decode_work(),
+        auth.database_scope(),
+        auth.database_identity(),
+        auth.principal(),
+        &confirmation.request.plan_id,
+        entry,
+    )?;
     if !registered
-        || !capture.inventory.complete
         || !step.stop_new_allocations
         || unresolved.len() > native::MAX_ROWS
         || unresolved
@@ -276,9 +299,10 @@ pub(crate) async fn write_retirement_marker(
     }
     let mut unresolved = unresolved;
     for remote in capture
+        .mutation_scope
         .remotes
         .iter()
-        .chain(&capture.historical_remotes)
+        .chain(&capture.mutation_scope.historical_remotes)
         .filter(|remote| remote.has_unknown_responsibility())
     {
         // Exact captured coordinates, not an invented UUID/hash/count proof.
@@ -368,35 +392,28 @@ pub async fn read_retirement_with_session<C: ConnectionTrait>(
     auth.check(db).await?;
     super::super::schema::validate(db).await?;
     super::super::catalog::validate(db, native::current_catalog()).await?;
-    native::check_raw_inventory(db).await?;
     let context = DecodeWork::shared(&work);
     context.copy(allocation_domain)?;
-    let count = db
-        .query_one(Statement::from_sql_and_values(
-            db.get_database_backend(),
-            "SELECT COUNT(*) AS count FROM pin_management_retirements WHERE allocation_domain=$1",
-            [allocation_domain.into()],
-        ))
-        .await
-        .map_err(|_| ManagementError::Database)?
-        .ok_or(ManagementError::Database)?
-        .try_get::<i64>("", "count")
-        .map_err(|_| ManagementError::InvalidEvidence)?;
-    if count == 0 {
-        return Ok(None);
-    }
-    if count != 1 {
-        return Err(ManagementError::InvalidEvidence);
-    }
-    let native_row = super::current_row(
+    let mut storage_work = native::meter::Budget::default();
+    let selected = locator::load_authority(
         db,
-        super::super::schema::RETIREMENTS,
-        &[allocation_domain],
-        context,
+        &[locator::AuthoritySelector::RetirementDomain(
+            allocation_domain.into(),
+        )],
+        &mut storage_work,
     )
-    .await?;
+    .await;
+    charge_storage_work(&storage_work, context)?;
+    let selected = selected?;
+    let key = native::NativeKey {
+        table: super::super::schema::RETIREMENTS.into(),
+        values: vec![allocation_domain.into()],
+    };
+    let Some(native_row) = selected.originals.get(&key) else {
+        return Ok(None);
+    };
     let text =
-        |column: &str| native::value(&native_row, column).ok_or(ManagementError::InvalidEvidence);
+        |column: &str| native::value(native_row, column).ok_or(ManagementError::InvalidEvidence);
     if text("database_scope")? != auth.database_scope
         || text("principal")? != auth.principal
         || text("native_identity")? != auth.database_identity
@@ -432,7 +449,7 @@ pub async fn read_retirement_with_session<C: ConnectionTrait>(
     if binding.request.plan_id != plan_id {
         return Err(ManagementError::InvalidEvidence);
     }
-    let inventory = retirement_review_from_source(&source, &native_row, action)?;
+    let inventory = retirement_review_from_source(&source, native_row, action)?;
     let disposition = match text("disposition")? {
         "retain" => Disposition::Retain,
         "migrate" => Disposition::Migrate,
@@ -460,13 +477,14 @@ pub async fn read_retirement_with_session<C: ConnectionTrait>(
         return Err(ManagementError::InvalidEvidence);
     };
     let unknown = capture
+        .mutation_scope
         .remotes
         .iter()
-        .chain(&capture.historical_remotes)
+        .chain(&capture.mutation_scope.historical_remotes)
         .any(|remote| remote.has_unknown_responsibility());
     if state == RetirementState::Retired
         && (unknown
-            || !capture.inventory.attribution_complete
+            || !capture.totals.attribution_complete
             || step.needs_attention
             || step.unknown > 0
             || step.inflight > 0
@@ -475,7 +493,10 @@ pub async fn read_retirement_with_session<C: ConnectionTrait>(
     {
         return Err(ManagementError::InvalidEvidence);
     }
-    native::check_raw_inventory(db).await?;
+    let mut storage_work = native::meter::Budget::default();
+    let checked = locator::check_authority(db, &selected, &mut storage_work).await;
+    charge_storage_work(&storage_work, context)?;
+    checked?;
     context.copy(&(
         allocation_domain,
         &auth.database_scope,

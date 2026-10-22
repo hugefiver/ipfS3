@@ -10,7 +10,10 @@ use ipfs_s3_gateway::{
         entities::{pin_provider_usage, remote_pin},
         pinning::{
             ledger,
-            management::records,
+            management::{
+                records,
+                transaction::{CancellationToken, FINAL_WRITE_LIMIT, ManagementTransaction},
+            },
             quota::{self, ReservationOutcome},
         },
     },
@@ -151,22 +154,32 @@ async fn retirement_barrier() {
         .unwrap();
     let (auth, binding, plan) =
         support::confirmed_retirement(&db, &other_raw, &other, "pg-retire-first").await;
-    let retire = db.begin().await.unwrap();
-    support::write_retirement(&retire, &other, &auth, &binding, &plan).await;
-    let usage_before = pin_provider_usage::Entity::find()
-        .order_by_asc(pin_provider_usage::Column::Provider)
-        .all(&retire)
+    let mut retire = ManagementTransaction::begin(&db, FINAL_WRITE_LIMIT, CancellationToken::new())
         .await
         .unwrap();
-    let remotes_before = remote_pin::Entity::find()
-        .order_by_asc(remote_pin::Column::Provider)
-        .order_by_asc(remote_pin::Column::Cid)
-        .all(&retire)
+    support::write_retirement(&mut retire, &other, &auth, &binding, &plan).await;
+    let (usage_before, remotes_before, retire_pid) = retire
+        .run(|tx, _| {
+            Box::pin(async move {
+                let usage_before = pin_provider_usage::Entity::find()
+                    .order_by_asc(pin_provider_usage::Column::Provider)
+                    .all(tx)
+                    .await
+                    .unwrap();
+                let remotes_before = remote_pin::Entity::find()
+                    .order_by_asc(remote_pin::Column::Provider)
+                    .order_by_asc(remote_pin::Column::Cid)
+                    .all(tx)
+                    .await
+                    .unwrap();
+                let retire_pid = backend_pid(tx).await;
+                Ok((usage_before, remotes_before, retire_pid))
+            })
+        })
         .await
         .unwrap();
     assert!(!usage_before.iter().any(|row| row.provider == key));
     assert!(!remotes_before.iter().any(|row| row.provider == key));
-    let retire_pid = backend_pid(&retire).await;
     let birth = db.begin().await.unwrap();
     let birth_pid = backend_pid(&birth).await;
     assert_ne!(birth_pid, retire_pid);

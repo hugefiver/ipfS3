@@ -169,13 +169,8 @@ pub(super) async fn collect<C: ConnectionTrait>(
 }
 
 fn add_route(routes: &mut Vec<ProviderRouteSnapshot>, route: &ProviderRouteSnapshot) {
-    // Admission is domain-only. Prefer the already collected complete current
-    // registry/declaration route; old credential revisions remain in bindings.
-    if !routes.iter().any(|existing| {
-        existing.backend == route.backend
-            && existing.scope == route.scope
-            && existing.resource_type() == route.resource_type()
-    }) {
+    // Preserve every original alias/revision as well as its allocation domain.
+    if !routes.contains(route) {
         routes.push(route.clone());
     }
 }

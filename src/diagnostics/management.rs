@@ -1,5 +1,5 @@
-//! Formal local management CLI. No HTTP route, AppState, migrations, startup
-//! identity registration, background worker or implicit source/provider probe.
+//! Formal local management CLI. Ordinary commands never migrate. Explicit
+//! upgrade is isolated from AppState, registration, workers and provider/source IO.
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
@@ -14,20 +14,25 @@ use tokio_util::sync::CancellationToken;
 mod applied;
 #[path = "management/args.rs"]
 mod args;
+#[path = "management/artifacts.rs"]
+mod artifacts;
+#[path = "management/binding.rs"]
+mod binding;
 #[path = "management/database.rs"]
 mod database;
 #[path = "management/files.rs"]
 mod files;
 #[path = "management/input.rs"]
 mod input;
-#[path = "management/json_bounds.rs"]
-mod json_bounds;
 #[path = "management/planning.rs"]
 mod planning;
 #[path = "management/preparation.rs"]
 mod preparation;
+#[path = "management/upgrade.rs"]
+mod upgrade;
 
-pub use args::{Command, parse};
+pub use args::{Command, UpgradeCommand, parse, parse_upgrade};
+pub use upgrade::run as run_upgrade;
 
 const WORK_BUDGET: Duration = Duration::from_secs(30);
 const DRAIN_BUDGET: Duration = Duration::from_secs(5);
@@ -36,6 +41,18 @@ pub async fn run(command: Command) -> Result<()> {
     if command == Command::Help {
         println!("{}", args::HELP);
         return Ok(());
+    }
+    if matches!(
+        command,
+        Command::Review { .. }
+            | Command::Export { .. }
+            | Command::Import { .. }
+            | Command::ConvertV2 { .. }
+    ) {
+        let report = tokio::task::spawn_blocking(move || artifacts::execute(&command))
+            .await
+            .map_err(|_| input::invalid())??;
+        return files::print(&report).await;
     }
     // All document bounds/DTO validation precede Config, DB and client factories.
     let input = tokio::time::timeout(WORK_BUDGET, input::load(&command))
@@ -54,12 +71,22 @@ pub async fn run(command: Command) -> Result<()> {
         .map_err(|_| anyhow!("management cancellation handler unavailable"))?;
     let db = database::connect(&raw.storage.database_url, readonly).await?;
     let cancellation = CancellationToken::new();
+    let work_deadline = std::time::Instant::now() + WORK_BUDGET;
     let (result, close_deadline) = {
         let work = async {
             let auth = records::authorize_local(&raw, &db).await?;
-            match &input {
+            match input {
                 input::Input::Request(request) => {
-                    planning::execute(&db, &config, &auth, &command, request).await
+                    planning::execute(
+                        &db,
+                        &config,
+                        &auth,
+                        &command,
+                        &request,
+                        cancellation.clone(),
+                        work_deadline,
+                    )
+                    .await
                 }
                 input::Input::Imported(imported) => {
                     applied::execute(
@@ -68,7 +95,7 @@ pub async fn run(command: Command) -> Result<()> {
                         &config,
                         &auth,
                         &command,
-                        imported,
+                        *imported,
                         cancellation.clone(),
                     )
                     .await
@@ -79,7 +106,7 @@ pub async fn run(command: Command) -> Result<()> {
                         &config,
                         &auth,
                         &KuboClient::new(raw.kubo.rpc_url.clone()),
-                        request,
+                        &request,
                         cancellation.clone(),
                     )
                     .await
@@ -89,19 +116,32 @@ pub async fn run(command: Command) -> Result<()> {
         tokio::pin!(work);
         tokio::select! {
             result = &mut work => (result, tokio::time::Instant::now() + DRAIN_BUDGET),
-            _ = signal.wait() => drain(&mut work, &cancellation, "signal").await,
-            _ = tokio::time::sleep(WORK_BUDGET) => drain(&mut work, &cancellation, "work_budget").await,
+            _ = signal.wait() => drain(&mut work, &cancellation, "signal", matches!(command, Command::Confirm { .. })).await,
+            _ = tokio::time::sleep_until(work_deadline.into()) => drain(&mut work, &cancellation, "work_budget", matches!(command, Command::Confirm { .. })).await,
         }
     };
     cancellation.cancel();
     let closed = tokio::time::timeout_at(close_deadline, db.close()).await;
-    if !matches!(closed, Ok(Ok(()))) {
-        return Err(database::unavailable());
-    }
+    let result = if matches!(closed, Ok(Ok(()))) {
+        result
+    } else {
+        match result {
+            Ok(report) if report.get("effects").is_some() => {
+                Err(planning::close_failure(report, database::unavailable()))
+            }
+            Err(error) if error.downcast_ref::<planning::FailureReport>().is_some() => {
+                Err(error.context("management database close failed"))
+            }
+            _ => Err(database::unavailable()),
+        }
+    };
     match result {
         Ok(report) => files::print(&report).await,
         Err(error) => {
             if let Some(failure) = error.downcast_ref::<applied::FailureReport>() {
+                files::print(&failure.report).await?;
+            }
+            if let Some(failure) = error.downcast_ref::<planning::FailureReport>() {
                 files::print(&failure.report).await?;
             }
             Err(error)
@@ -113,6 +153,7 @@ async fn drain<F>(
     work: F,
     cancellation: &CancellationToken,
     reason: &'static str,
+    confirming: bool,
 ) -> (Result<Value>, tokio::time::Instant)
 where
     F: std::future::Future<Output = Result<Value>>,
@@ -125,9 +166,54 @@ where
             Ok(report)
         }
         Ok(Err(error)) => Err(error),
-        Err(_) => Err(anyhow!(
-            "management work stopped; inspect the original confirmed document with --status (details withheld)"
-        )),
+        Err(_) => {
+            let error = anyhow!(
+                "management work stopped; inspect the original confirmed document with --status (details withheld)"
+            );
+            Err(if confirming {
+                planning::close_failure(
+                    serde_json::json!({
+                        "mode": "confirm", "outcome": "needs_attention", "phase": "unknown",
+                        "interrupted": reason, "effects_scope": "invocation",
+                        "effects": { "database_commits": null, "commit_unknown": true },
+                        "database_writes": true, "confirmation_committed": null,
+                        "artifact_exported": null,
+                        "source_rpc": "not_performed", "provider_rpc": "not_performed",
+                    }),
+                    error,
+                )
+            } else {
+                error
+            })
+        }
     };
     (result, deadline)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn confirmation_drain_expiry_reports_unknown_effects_not_zero_writes() {
+        let cancellation = CancellationToken::new();
+        let (result, _) = drain(
+            std::future::pending::<Result<Value>>(),
+            &cancellation,
+            "signal",
+            true,
+        )
+        .await;
+        assert!(cancellation.is_cancelled());
+        let error = result.unwrap_err();
+        let report = &error
+            .downcast_ref::<planning::FailureReport>()
+            .unwrap()
+            .report;
+        assert_eq!(report["effects"]["commit_unknown"], true);
+        assert!(report["effects"]["database_commits"].is_null());
+        assert_eq!(report["database_writes"], true);
+        assert!(report["confirmation_committed"].is_null());
+        assert!(report["artifact_exported"].is_null());
+    }
 }

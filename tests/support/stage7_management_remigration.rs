@@ -1,4 +1,4 @@
-use super::{provider_route, selected, support};
+use super::{archive, provider_route, selected, support};
 use ipfs_s3_gateway::{
     pinning::management::*,
     store::{
@@ -187,36 +187,6 @@ pub async fn two_slot_planning(one: bool) {
         .filter(|entry| entry.status == PlanStatus::Candidate)
         .map(|entry| entry.request.item_id.clone())
         .collect::<Vec<_>>();
-    let archive = wire::encode_plan(
-        &next,
-        &snapshot,
-        &plan,
-        Some(&plan.confirmation(acknowledged.clone())),
-    )
-    .unwrap();
-    assert!(wire::decode_plan(&archive).is_ok());
-    let document: serde_json::Value = serde_json::from_slice(&archive).unwrap();
-    let mut missing = document.clone();
-    missing["migration_points"].as_array_mut().unwrap().clear();
-    assert!(wire::decode_plan(&serde_json::to_vec(&missing).unwrap()).is_err());
-    for (field, replacement) in [
-        ("lease_id", "different-lease"),
-        (
-            "cid",
-            "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku",
-        ),
-        ("destination_target_id", source.id.as_str()),
-        ("slot", "different-slot"),
-    ] {
-        let mut changed = document.clone();
-        changed["migration_points"][0][field] = serde_json::json!(replacement);
-        assert!(wire::decode_plan(&serde_json::to_vec(&changed).unwrap()).is_err());
-    }
-    let mut wrong_contract = document.clone();
-    wrong_contract["migration_points"][0]["original_contract"]["contract"] =
-        serde_json::json!("{}");
-    assert!(wire::decode_plan(&serde_json::to_vec(&wrong_contract).unwrap()).is_err());
-
     // Public applied claims cannot supply the private confirmation or suppress
     // the independent review required by the actual native plan.
     let mut claimed = snapshot.clone();
@@ -239,7 +209,7 @@ pub async fn two_slot_planning(one: bool) {
         .is_err()
     );
 
-    records::confirm(
+    let binding = records::confirm(
         &fixture.db,
         &fixture.config,
         &fixture.auth,
@@ -249,16 +219,24 @@ pub async fn two_slot_planning(one: bool) {
     )
     .await
     .unwrap();
-    let mut forged = document;
-    let epoch = forged["migration_points"][0]["destination_epoch"]
-        .as_i64()
-        .unwrap();
-    forged["migration_points"][0]["destination_epoch"] = serde_json::json!(epoch + 1);
-    if let Ok(imported) = wire::decode_plan(&serde_json::to_vec(&forged).unwrap()) {
-        assert!(
-            records::load_confirmed_from_imported(&fixture.db, &fixture.auth, &imported)
+    let bytes = archive::export(&binding);
+    assert!(
+        archive::restore(&fixture.db, &fixture.auth, &next, &bytes)
+            .await
+            .unwrap()
+            == binding
+    );
+    let forged = archive::rewrite(&bytes, |frame| {
+        if let wire::v3::Frame::Acknowledgements { item_ids } = frame {
+            *item_ids = None;
+        }
+    });
+    match forged {
+        Ok(bytes) => assert!(
+            archive::restore(&fixture.db, &fixture.auth, &next, &bytes)
                 .await
                 .is_err()
-        );
+        ),
+        Err(error) => assert_eq!(error, SafeError::ConfirmationMismatch),
     }
 }

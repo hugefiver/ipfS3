@@ -41,6 +41,14 @@ impl Fixture {
             .mount(&source)
             .await;
         Mock::given(method("POST"))
+            .and(path("/api/v0/pin/add"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"Pins": [foundation::CID]})),
+            )
+            .mount(&source)
+            .await;
+        Mock::given(method("POST"))
             .and(path("/api/v0/id"))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -175,13 +183,21 @@ impl Fixture {
     }
 
     pub async fn retire(&self) {
-        barrier::retire(
+        let (auth, binding, _) = barrier::confirmed_retirement(
             self.state.store.db(),
             &self.raw,
             &self.config,
             "http-retirement",
         )
         .await;
+        ipfs_s3_gateway::store::pinning::management::actions::apply(
+            self.state.store.db(),
+            &self.config,
+            &auth,
+            &binding,
+        )
+        .await
+        .unwrap();
     }
 
     pub async fn assert_no_remote_mutation(&self) {

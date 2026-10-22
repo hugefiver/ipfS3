@@ -6,6 +6,9 @@ use crate::pinning::management::{
     wire::ImportedPlan,
 };
 use sea_orm::{DatabaseBackend, DatabaseConnection, IsolationLevel, TransactionTrait};
+mod global;
+pub(super) use global::confirm as confirm_global;
+pub use global::{ReadyPublication, confirm_ready};
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -15,10 +18,10 @@ pub struct PlanLocator {
 
 pub(super) async fn lock(tx: &DatabaseTransaction) -> Result<()> {
     if tx.get_database_backend() == DatabaseBackend::Sqlite {
-        tx.execute_unprepared("UPDATE pin_management_records SET database_scope=database_scope WHERE kind='database_scope'").await.map_err(|_|ManagementError::Database)?;
+        super::native::scope::writer_boundary(tx).await?;
     } else {
         // This protects only foundation records. B/C still own business locks.
-        tx.execute_unprepared("LOCK TABLE pin_management_records,pin_management_retirements IN SHARE ROW EXCLUSIVE MODE NOWAIT").await.map_err(|_|ManagementError::Database)?;
+        tx.execute_unprepared("LOCK TABLE pin_management_records,pin_management_retirements IN SHARE ROW EXCLUSIVE MODE NOWAIT").await.map_err(super::super::nowait_error)?;
     }
     Ok(())
 }
@@ -52,6 +55,7 @@ pub(super) async fn stage_with_work(
 ) -> Result<PlanLocator> {
     auth.check(db).await?;
     management::validate_request(request).map_err(|_| ManagementError::Confirmation)?;
+    reject_converted_unexecuted(db, auth, request).await?;
     if ttl <= chrono::Duration::zero()
         || ttl > chrono::Duration::minutes(15)
         || plan
@@ -170,7 +174,20 @@ pub(super) async fn stage_with_work(
         )
         .await?;
     }
-    native::check_raw_inventory(&tx).await?;
+    let source_keys = request
+        .items
+        .iter()
+        .map(|item| native::NativeKey {
+            table: super::super::schema::RECORDS.into(),
+            values: vec![
+                auth.database_scope.clone(),
+                request.plan_id.clone(),
+                item.item_id.clone(),
+                "action".into(),
+            ],
+        })
+        .collect::<Vec<_>>();
+    seal_originals(&tx, &source_keys, DecodeWork::shared(&work)).await?;
     tx.commit().await.map_err(|_| ManagementError::Database)?;
     Ok(PlanLocator {
         plan_id: request.plan_id.clone(),
@@ -183,6 +200,40 @@ fn snapshot_error(error: management::db_snapshot::SnapshotError) -> ManagementEr
     } else {
         ManagementError::Changed
     }
+}
+
+async fn reject_converted_unexecuted<C: ConnectionTrait>(
+    db: &C,
+    auth: &LocalAuthorization,
+    request: &PlanRequest,
+) -> Result<()> {
+    let mut budget = native::meter::Budget::default();
+    for item in &request.items {
+        let key = native::NativeKey {
+            table: super::super::schema::RECORDS.into(),
+            values: vec![
+                auth.database_scope.clone(),
+                request.plan_id.clone(),
+                item.item_id.clone(),
+                "action".into(),
+            ],
+        };
+        // An unused plan ID has no source generation to recover. Check the
+        // persistent control too: deletion/tombstone cannot become fresh absence.
+        let source_key = locator::source_key(&key)?;
+        if db.query_one(Statement::from_sql_and_values(db.get_database_backend(),
+            "SELECT 1 FROM pin_management_source_control WHERE source_key=$1 UNION ALL SELECT 1 FROM pin_management_records WHERE database_scope=$2 AND plan_id=$3 AND item_id=$4 AND kind='action'",
+            [source_key.into(), auth.database_scope.clone().into(), request.plan_id.clone().into(), item.item_id.clone().into()]))
+            .await.map_err(|_| ManagementError::Database)?.is_none() {
+            continue;
+        }
+        if crate::store::initialization::history::requires_new_confirmation(db, &key, &mut budget)
+            .await?
+        {
+            return Err(ManagementError::Confirmation);
+        }
+    }
+    Ok(())
 }
 
 pub async fn confirm_imported(
@@ -218,6 +269,8 @@ pub(super) async fn confirm_staged(
     work: SharedDecodeBudget,
 ) -> Result<ConfirmedBinding> {
     auth.check(db).await?;
+    management::validate_request(request).map_err(|_| ManagementError::Confirmation)?;
+    reject_converted_unexecuted(db, auth, request).await?;
     let tx = db
         .begin_with_config(Some(IsolationLevel::RepeatableRead), None)
         .await
@@ -328,8 +381,8 @@ pub(super) async fn confirm_staged(
                 return Err(ManagementError::Confirmation);
             }
         }
+        seal_originals(&tx, &keys, DecodeWork::shared(&work)).await?;
     }
-    native::check_raw_inventory(&tx).await?;
     tx.commit().await.map_err(|_| ManagementError::Database)?;
     let source = evidence::Evidence::load_with_work(
         db,
@@ -375,42 +428,6 @@ pub(super) async fn stored_binding_with_work<C: ConnectionTrait>(
     Ok(keys)
 }
 
-/// Not a business lock or apply permission. B must call this under its own
-/// publication/barrier protocol and independently revalidate current semantics.
-pub async fn recheck_confirmed_frame<C: ConnectionTrait>(
-    db: &C,
-    auth: &LocalAuthorization,
-    binding: &ConfirmedBinding,
-) -> Result<()> {
-    let work = SharedDecodeBudget::default();
-    binding.check_deadline(db, auth).await?;
-    let keys = stored_binding_with_work(db, auth, binding, work.clone()).await?;
-    let current = CurrentRows::capture(db, DecodeWork::shared(&work)).await?;
-    let current = FrozenRows::Current(&current)
-        .all_rows()
-        .filter(|(table, row)| {
-            !keys.iter().any(|key| {
-                key.table == table.table
-                    && table.primary_key.len() == key.values.len()
-                    && table
-                        .primary_key
-                        .iter()
-                        .zip(&key.values)
-                        .all(|(column, value)| row.cell(column) == Some(value))
-            })
-        });
-    if !binding
-        .view()
-        .frozen_rows()?
-        .all_rows()
-        .map(|(table, row)| (&table.table, row))
-        .eq(current.map(|(table, row)| (&table.table, row)))
-    {
-        return Err(ManagementError::Changed);
-    }
-    Ok(())
-}
-
 /// Fresh pure semantics and exact original fences in B's transaction. The
 /// caller, not this function, owns publication locks/CAS and retirement admission.
 pub async fn revalidate_confirmed_in_transaction(
@@ -426,6 +443,17 @@ pub(crate) async fn revalidate_with_work(
     config: &ManagementConfig,
     auth: &LocalAuthorization,
     binding: &ConfirmedBinding,
+    work: SharedDecodeBudget,
+) -> Result<Vec<management::CheckedItem>> {
+    revalidate_scoped_with_work(tx, config, auth, binding, None, work).await
+}
+
+pub(crate) async fn revalidate_scoped_with_work(
+    tx: &DatabaseTransaction,
+    config: &ManagementConfig,
+    auth: &LocalAuthorization,
+    binding: &ConfirmedBinding,
+    scope: Option<&management::db_snapshot::PlanningScope>,
     work: SharedDecodeBudget,
 ) -> Result<Vec<management::CheckedItem>> {
     binding.check_deadline(tx, auth).await?;
@@ -445,20 +473,31 @@ pub(crate) async fn revalidate_with_work(
     if confirmed.view() != binding {
         return Err(ManagementError::Confirmation);
     }
+    inventory_review::hydrate(tx, &confirmed.review(), &work).await?;
+    inventory_review::seal_confirmed(tx, binding).await?;
     let keys = source
         .archive_members(&auth.database_scope, &binding.request.plan_id)
         .map(|row| source.budget()?.key(row))
         .collect::<Result<Vec<_>>>()?;
-    let mut current = management::db_snapshot::collect_in_transaction_with_session(
-        tx,
-        config,
-        &binding.request,
-        work,
-    )
-    .await
-    .map_err(snapshot_error)?
-    .planning_snapshot()
-    .map_err(|_| ManagementError::Changed)?;
+    let mut current = if let Some(scope) = scope {
+        let now = crate::store::database_clock::database_now(tx)
+            .await
+            .map_err(|_| ManagementError::Database)?;
+        scope
+            .planning_snapshot(config, &binding.request, now, &work)
+            .map_err(snapshot_error)?
+    } else {
+        management::db_snapshot::collect_in_transaction_with_session(
+            tx,
+            config,
+            &binding.request,
+            work,
+        )
+        .await
+        .map_err(snapshot_error)?
+        .planning_snapshot()
+        .map_err(|_| ManagementError::Changed)?
+    };
     let frame = current
         .native_frame
         .take()

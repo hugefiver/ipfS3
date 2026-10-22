@@ -162,7 +162,14 @@ impl PartialEq<RowView<'_>> for native::NativeRow {
 pub(crate) enum FrozenRows<'a> {
     Archive(&'a ArchivedRows),
     Frame(&'a NativeFrame),
-    Current(&'a CurrentRows),
+    Execution(&'a ExecutionRows<'a>),
+}
+/// Actual per-item boundary produced by the validated same-plan cursor. It is
+/// never serialized and never substitutes for the original confirmation.
+pub(crate) struct ExecutionRows<'a> {
+    pub scope: &'a str,
+    pub identity: &'a str,
+    pub rows: Vec<(&'a native::NativeTable, RowView<'a>)>,
 }
 pub(crate) struct FrozenTable<'a> {
     pub table: &'a String,
@@ -198,10 +205,10 @@ fn original_view<'a>(
 }
 impl<'a> FrozenTableRows<'a> {
     pub(crate) fn iter(&self) -> impl Iterator<Item = RowView<'a>> + use<'a> {
-        let (archive, frame, current) = match self.source {
+        let (archive, frame, execution) = match self.source {
             FrozenRows::Archive(rows) => (Some(rows), None, None),
             FrozenRows::Frame(frame) => (None, Some(frame), None),
-            FrozenRows::Current(rows) => (None, None, Some(rows)),
+            FrozenRows::Execution(rows) => (None, None, Some(rows)),
         };
         let table = self.table;
         archive
@@ -217,13 +224,12 @@ impl<'a> FrozenTableRows<'a> {
                         .map(move |row| original_view(frame, table, row))
                 })
             }))
-            .chain(
-                current
-                    .into_iter()
-                    .flat_map(|rows| rows.rows())
+            .chain(execution.into_iter().flat_map(move |rows| {
+                rows.rows
+                    .iter()
                     .filter(move |(layout, _)| layout.table == table)
-                    .map(|(_, row)| row),
-            )
+                    .map(|(_, row)| *row)
+            }))
     }
 }
 impl<'a> FrozenRows<'a> {
@@ -242,8 +248,8 @@ impl<'a> FrozenRows<'a> {
     }
     pub(crate) fn validate_current(self) -> Result<()> {
         match self {
-            Self::Current(_) => Ok(()),
             Self::Frame(frame) => frame.validate_current(),
+            Self::Execution(_) => Ok(()),
             Self::Archive(rows) => {
                 if rows.catalog() == native::current_catalog() {
                     Ok(())
@@ -254,10 +260,10 @@ impl<'a> FrozenRows<'a> {
         }
     }
     pub(crate) fn all_rows(self) -> impl Iterator<Item = (&'a native::NativeTable, RowView<'a>)> {
-        let (archive, frame, current) = match self {
+        let (archive, frame, execution) = match self {
             Self::Archive(rows) => (Some(rows), None, None),
             Self::Frame(frame) => (None, Some(frame), None),
-            Self::Current(rows) => (None, None, Some(rows)),
+            Self::Execution(rows) => (None, None, Some(rows)),
         };
         archive
             .into_iter()
@@ -271,20 +277,24 @@ impl<'a> FrozenRows<'a> {
                         .map(move |row| (table, original_view(frame, &table.table, row)))
                 })
             }))
-            .chain(current.into_iter().flat_map(|rows| rows.rows()))
+            .chain(
+                execution
+                    .into_iter()
+                    .flat_map(|rows| rows.rows.iter().copied()),
+            )
     }
     pub(crate) fn scope(self) -> &'a str {
         match self {
             Self::Archive(rows) => rows.scope(),
             Self::Frame(frame) => &frame.database_scope,
-            Self::Current(rows) => rows.scope(),
+            Self::Execution(rows) => rows.scope,
         }
     }
     pub(crate) fn identity(self) -> &'a str {
         match self {
             Self::Archive(rows) => rows.identity(),
             Self::Frame(frame) => &frame.database_identity,
-            Self::Current(rows) => rows.identity(),
+            Self::Execution(rows) => rows.identity,
         }
     }
     pub(crate) fn original_row_matches(
@@ -294,7 +304,7 @@ impl<'a> FrozenRows<'a> {
         row: &native::NativeRow,
     ) -> bool {
         match self {
-            Self::Archive(_) | Self::Current(_) => self
+            Self::Archive(_) | Self::Execution(_) => self
                 .row(table, key)
                 .is_some_and(|original| original == *row),
             Self::Frame(frame) => frame.original_row_matches(table, key, row),
@@ -320,12 +330,9 @@ impl<'a> FrozenRows<'a> {
     }
     pub(crate) fn row(self, table: &str, key: &[&str]) -> Option<RowView<'a>> {
         match self {
-            Self::Archive(rows) => rows.row_ref(table, key).map(|row| RowView::Handle(row)),
-            Self::Frame(frame) => frame
-                .row(table, key)
-                .map(|row| original_view(frame, table, row)),
-            Self::Current(rows) => rows
-                .rows()
+            Self::Execution(rows) => rows
+                .rows
+                .iter()
                 .find(|(layout, row)| {
                     layout.table == table
                         && layout.primary_key.len() == key.len()
@@ -335,12 +342,16 @@ impl<'a> FrozenRows<'a> {
                             .zip(key)
                             .all(|(column, value)| row.cell(column) == Some(*value))
                 })
-                .map(|(_, row)| row),
+                .map(|(_, row)| *row),
+            Self::Archive(rows) => rows.row_ref(table, key).map(|row| RowView::Handle(row)),
+            Self::Frame(frame) => frame
+                .row(table, key)
+                .map(|row| original_view(frame, table, row)),
         }
     }
     pub(crate) fn original_value(self, table: &str, key: &[&str], column: &str) -> Option<&'a str> {
         match self {
-            Self::Archive(_) | Self::Current(_) => self.row(table, key)?.cell(column),
+            Self::Archive(_) | Self::Execution(_) => self.row(table, key)?.cell(column),
             Self::Frame(frame) => frame.original_value(table, key, column),
         }
     }
@@ -348,7 +359,7 @@ impl<'a> FrozenRows<'a> {
         let layout = match self {
             Self::Archive(rows) => rows.catalog().iter().find(|table| table.table == name)?,
             Self::Frame(frame) => frame.table(name)?,
-            Self::Current(_) => native::current_catalog()
+            Self::Execution(_) => native::current_catalog()
                 .iter()
                 .find(|table| table.table == name)?,
         };

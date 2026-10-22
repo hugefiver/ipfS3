@@ -98,7 +98,7 @@ mod tests {
         )
         .await
         .unwrap();
-        crate::store::run_migrations(&db).await.unwrap();
+        Migration.up(&SchemaManager::new(&db)).await.unwrap();
         let row = db
             .query_one(Statement::from_string(
                 db.get_database_backend(),

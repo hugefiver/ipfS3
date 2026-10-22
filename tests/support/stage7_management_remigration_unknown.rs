@@ -191,20 +191,6 @@ pub async fn native_unknown_birth(one: bool) {
     assert!(projected.frozen_candidates[1] == before.frozen_candidates[1]);
     assert!(projected.frozen_candidates[0].route == before.frozen_candidates[0].route);
     assert_eq!(projected.frozen_candidates[0].allocation, moved.provider);
-    let acknowledged = next_plan
-        .items()
-        .iter()
-        .filter(|entry| entry.status == PlanStatus::Candidate)
-        .map(|entry| entry.request.item_id.clone())
-        .collect();
-    let archive = wire::encode_plan(
-        &next,
-        &next_snapshot,
-        &next_plan,
-        Some(&next_plan.confirmation(acknowledged)),
-    )
-    .unwrap();
-    assert!(wire::decode_plan(&archive).unwrap().plan().items() == next_plan.items());
     assert_eq!(
         pin_lease_requirement::Entity::find_by_id(lease_id)
             .one(&fixture.db)

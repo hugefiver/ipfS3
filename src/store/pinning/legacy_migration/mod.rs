@@ -21,6 +21,11 @@ pub use compat::{
     captured_provider, job_io_allowed, original_job_provider, release_history, resource_binding,
     resource_key,
 };
+pub(crate) use compat::{
+    identity_binding_from_loaded, job_io_allowed_from_loaded, resource_binding_from_loaded,
+    resource_receipt_candidates_with_work,
+};
+pub(crate) use compat::{job_io_allowed_with_work, job_receipt_selectors};
 pub(crate) use compat::{original_job_provider_with_work, release_history_with_work};
 pub(crate) use compat::{resource_binding_with_work, resource_key_budgeted};
 pub use inventory::inventory;
@@ -29,9 +34,12 @@ pub use inventory::validate as validate_declaration;
 pub use model::{
     Binding, Confirmation, Declaration, Maintenance, Namespace, NativeRow, Receipt, TableImage,
 };
+pub(in crate::store::pinning) use projection::R26Admission;
+pub(crate) use receipt::admission_historical_keys;
 pub(crate) use receipt::resolve_legacy_binding_with_work;
 pub(crate) use receipt::source_is_migrated_with_work;
 pub use receipt::{LegacyBinding, historical_keys, resolve_legacy_binding, source_is_migrated};
+pub(crate) use receipt::{historical_job_keys, historical_job_keys_from_loaded};
 pub(crate) async fn historical_keys_budgeted<C: sea_orm::ConnectionTrait>(
     db: &C,
     table: &str,

@@ -1024,7 +1024,8 @@ async fn registered_r26_missing_either_receipt_table_is_not_a_known_old_schema()
                 .is_err()
         );
         assert_eq!(
-            quota::read_usage(&db, "old")
+            ipfs_s3_gateway::store::entities::pin_provider_usage::Entity::find_by_id("old")
+                .one(&db)
                 .await
                 .unwrap()
                 .unwrap()
@@ -1059,7 +1060,8 @@ async fn registered_r26_receipt_pk_and_constraints_are_verified_not_only_column_
             "same column names must not hide damaged guarantee: {old}"
         );
         assert_eq!(
-            quota::read_usage(&db, "old")
+            ipfs_s3_gateway::store::entities::pin_provider_usage::Entity::find_by_id("old")
+                .one(&db)
                 .await
                 .unwrap()
                 .unwrap()
@@ -1067,7 +1069,8 @@ async fn registered_r26_receipt_pk_and_constraints_are_verified_not_only_column_
             97
         );
         assert_eq!(
-            quota::read_usage(&db, "old")
+            ipfs_s3_gateway::store::entities::pin_provider_usage::Entity::find_by_id("old")
+                .one(&db)
                 .await
                 .unwrap()
                 .unwrap()
@@ -1109,7 +1112,8 @@ async fn registered_r26_operation_receipt_constraints_are_verified_read_only() {
             "damaged operation receipt guarantee: {old}"
         );
         assert_eq!(
-            quota::read_usage(&db, "old")
+            ipfs_s3_gateway::store::entities::pin_provider_usage::Entity::find_by_id("old")
+                .one(&db)
                 .await
                 .unwrap()
                 .unwrap()
@@ -1263,8 +1267,12 @@ mod review_regressions {
         }
     }
 
-    #[tokio::test]
-    async fn legacy_scope_is_unknown_not_a_false_account_conflict() {
+    async fn unknown_fixture() -> (
+        DatabaseConnection,
+        ProviderIdentity,
+        legacy_migration::Declaration,
+        ProviderRouteSnapshot,
+    ) {
         let (db, identity) = fixture().await;
         seed_usage(&db).await;
         let mut old = identity.route_snapshot();
@@ -1280,6 +1288,12 @@ mod review_regressions {
             Some(old.clone()),
             None,
         );
+        (db, identity, declaration, old)
+    }
+
+    #[tokio::test]
+    async fn legacy_scope_is_unknown_not_a_false_account_conflict() {
+        let (db, identity, declaration, old) = unknown_fixture().await;
         let plan = legacy_migration::inventory(&db, &declaration)
             .await
             .unwrap();
@@ -1300,6 +1314,226 @@ mod review_regressions {
                 .await
                 .unwrap()
         );
+        let moved = ledger::get(&db, &identity.allocation_key(), "cid")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (moved.ownership.as_str(), moved.effect.as_str()),
+            ("unknown", "unknown")
+        );
+        let usage = quota::read_usage(&db, &identity.allocation_key())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((usage.reserved_bytes, usage.reserved_pins), (97, 3));
+        assert!(
+            !ledger::cleanup_allowed(&db, &identity.allocation_key(), "cid")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_preservation_requires_complete_bindings_and_unambiguous_original_alias() {
+        let (db, identity, mut declaration, old) = unknown_fixture().await;
+        let complete = declaration.clone();
+        declaration.namespaces[0].bindings.pop();
+        assert!(
+            legacy_migration::inventory(&db, &declaration)
+                .await
+                .is_err()
+        );
+        // The complete declaration qualifies before any conflicting registry fact.
+        legacy_migration::inventory(&db, &complete).await.unwrap();
+        ledger::register_route(&db, "old", &identity).await.unwrap();
+        let mut complete = complete;
+        add_binding(
+            &mut complete,
+            "pin_provider_routes",
+            json!({"provider":"old"}),
+            Some(identity.route_snapshot()),
+            None,
+        );
+        assert!(legacy_migration::inventory(&db, &complete).await.is_err());
+        assert_eq!(
+            ledger::get(&db, "old", "cid")
+                .await
+                .unwrap()
+                .unwrap()
+                .route
+                .unwrap(),
+            serde_json::to_string(&old).unwrap()
+        );
+        let usage = ipfs_s3_gateway::store::entities::pin_provider_usage::Entity::find_by_id("old")
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((usage.reserved_bytes, usage.reserved_pins), (97, 3));
+    }
+
+    #[tokio::test]
+    async fn unknown_preservation_does_not_bypass_current_authority_failures() {
+        for fault in [
+            "readiness",
+            "global_unknown",
+            "pending",
+            "seal",
+            "membership",
+            "original",
+        ] {
+            let (db, identity, declaration, old) = unknown_fixture().await;
+            let plan = legacy_migration::inventory(&db, &declaration)
+                .await
+                .unwrap();
+            let source = ipfs_s3_gateway::store::pinning::management::records::locator::source_key(
+                &ipfs_s3_gateway::store::pinning::management::native::NativeKey {
+                    table: "pin_provider_routes".into(),
+                    values: vec![identity.allocation_key()],
+                },
+            )
+            .unwrap();
+            match fault {
+                "readiness" => {
+                    db.execute_unprepared(
+                        "UPDATE pin_management_readiness SET state='backfill' WHERE id=1",
+                    )
+                    .await
+                    .unwrap();
+                }
+                "global_unknown" | "pending" => {
+                    let (kind, key) = if fault == "global_unknown" {
+                        ("unknown", "*".to_owned())
+                    } else {
+                        (
+                            "registered_route",
+                            serde_json::to_string(&identity.allocation_key()).unwrap(),
+                        )
+                    };
+                    db.execute(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
+                        "INSERT INTO pin_management_pending_scope(selector_kind,selector_key,source_key,source_generation,locator_generation) SELECT $1,$2,source_key,source_generation,locator_generation FROM pin_management_source_control WHERE source_key=$3",
+                        [kind.into(), key.into(), source.clone().into()])).await.unwrap();
+                }
+                "seal" => {
+                    db.execute(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
+                    "UPDATE pin_management_source_control SET sealed_source=NULL WHERE source_key=$1", [source.clone().into()])).await.unwrap();
+                }
+                "membership" => {
+                    db.execute(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
+                    "INSERT INTO pin_management_locator(selector_kind,selector_key,source_key) VALUES ('registered_route','\"unrecorded-alias\"',$1)", [source.into()])).await.unwrap();
+                }
+                _ => {
+                    db.execute_unprepared("UPDATE pin_management_records SET binding='{invalid' WHERE kind='database_scope'").await.unwrap();
+                }
+            }
+            if fault != "readiness" {
+                ipfs_s3_gateway::store::pinning::management::schema::validate(&db)
+                    .await
+                    .unwrap();
+            }
+            assert!(
+                legacy_migration::inventory(&db, &declaration)
+                    .await
+                    .is_err(),
+                "{fault}"
+            );
+            assert!(
+                legacy_migration::apply(&db, &declaration, &plan)
+                    .await
+                    .is_err(),
+                "{fault}"
+            );
+            let usage =
+                ipfs_s3_gateway::store::entities::pin_provider_usage::Entity::find_by_id("old")
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!((usage.reserved_bytes, usage.reserved_pins), (97, 3));
+            let ledger = ipfs_s3_gateway::store::entities::remote_pin_ledger::Entity::find_by_id((
+                "old".to_owned(),
+                "cid".to_owned(),
+            ))
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                (ledger.ownership.as_str(), ledger.effect.as_str()),
+                ("unknown", "unknown")
+            );
+            assert_eq!(ledger.route.unwrap(), serde_json::to_string(&old).unwrap());
+            assert!(
+                ipfs_s3_gateway::store::entities::pin_legacy_migration::Entity::find()
+                    .all(&db)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_preservation_keeps_source_alias_and_destination_retirement_checks() {
+        for source_alias in [true, false] {
+            let (db, identity, mut declaration, old) = unknown_fixture().await;
+            if source_alias {
+                let mut registered = identity.clone();
+                registered.provider_id = old.provider_id.clone();
+                registered.scope = old.scope.clone();
+                registered.storage_domain = old.storage_domain.clone();
+                ledger::register_route(&db, "old", &registered)
+                    .await
+                    .unwrap();
+                add_binding(
+                    &mut declaration,
+                    "pin_provider_routes",
+                    json!({"provider":"old"}),
+                    Some(old),
+                    None,
+                );
+            }
+            let plan = legacy_migration::inventory(&db, &declaration)
+                .await
+                .unwrap();
+            let key = if source_alias {
+                "old".to_owned()
+            } else {
+                identity.allocation_key()
+            };
+            db.execute(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "UPDATE pin_provider_routes SET retired=1 WHERE provider=$1",
+                [key.into()],
+            ))
+            .await
+            .unwrap();
+            assert!(
+                legacy_migration::inventory(&db, &declaration)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                legacy_migration::apply(&db, &declaration, &plan)
+                    .await
+                    .is_err()
+            );
+            let usage =
+                ipfs_s3_gateway::store::entities::pin_provider_usage::Entity::find_by_id("old")
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!((usage.reserved_bytes, usage.reserved_pins), (97, 3));
+            assert!(
+                ipfs_s3_gateway::store::entities::pin_legacy_migration::Entity::find()
+                    .all(&db)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 
     #[tokio::test]
@@ -1713,7 +1947,8 @@ async fn registered_r26_missing_immutable_or_item_bound_trigger_is_refused_read_
             "missing receipt protection: {trigger}"
         );
         assert_eq!(
-            quota::read_usage(&db, "old")
+            ipfs_s3_gateway::store::entities::pin_provider_usage::Entity::find_by_id("old")
+                .one(&db)
                 .await
                 .unwrap()
                 .unwrap()
@@ -1738,7 +1973,8 @@ async fn unregistered_receipt_tables_are_not_a_known_stage6_schema() {
             .is_err()
     );
     assert_eq!(
-        quota::read_usage(&db, "old")
+        ipfs_s3_gateway::store::entities::pin_provider_usage::Entity::find_by_id("old")
+            .one(&db)
             .await
             .unwrap()
             .unwrap()

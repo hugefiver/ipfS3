@@ -296,40 +296,6 @@ pub(crate) async fn write_executed_action_in_transaction(
     Ok(encoded)
 }
 
-pub(crate) async fn update_executed_state(
-    auth: &LocalAuthorization,
-    binding: &ConfirmedPlan,
-    executed: &ExecutedAction<'_>,
-    original: &str,
-    state: ActionState,
-) -> Result<Option<String>> {
-    let action = executed.action_view();
-    if state == action.state {
-        return Ok(None);
-    }
-    let work = executed.work();
-    let updated = super::super::actions::execution::facts::with_state(action, state);
-    let encoded = encode_facts(
-        &updated,
-        &executed.operation().facts,
-        executed.identity(),
-        work,
-    )?;
-    work.copy(&(
-        original,
-        &auth.database_scope,
-        &binding.request.plan_id,
-        &action.receipt.binding.request.item_id,
-    ))?;
-    let tx = executed.transaction();
-    work.copy(&encoded)?;
-    let changed=tx.execute(Statement::from_sql_and_values(tx.get_database_backend(),"UPDATE pin_management_records SET result=$1 WHERE database_scope=$2 AND plan_id=$3 AND item_id=$4 AND kind='action' AND state='applied' AND result=$5",[encoded.clone().into(),auth.database_scope.clone().into(),binding.request.plan_id.clone().into(),action.receipt.binding.request.item_id.clone().into(),original.into()])).await.map_err(|_|ManagementError::Database)?;
-    if changed.rows_affected() != 1 {
-        return Err(ManagementError::Confirmation);
-    }
-    Ok(Some(encoded))
-}
-
 /// Static trust/binding validation only. Completion and worker consumers perform
 /// their own current target/lease/epoch fences; a historical receipt is not live.
 pub async fn lookup_committed<C: ConnectionTrait>(

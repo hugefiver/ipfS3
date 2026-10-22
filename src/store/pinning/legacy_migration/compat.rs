@@ -1,7 +1,10 @@
 //! Point projections. Original models/payloads remain the historical evidence.
-use super::receipt::{active_with_work, historical_keys_with_work, resolve_with_work, work::Work};
-use super::{LegacyBinding, historical_keys, resolve_legacy_binding};
-use crate::store::pinning::management::{self, records::DecodeWork};
+use super::receipt::{historical_keys_with_work, resolve_with_work, work::Work};
+use super::{LegacyBinding, resolve_legacy_binding};
+use crate::store::pinning::management::{
+    self,
+    records::{DecodeWork, locator::AuthorityView},
+};
 use crate::{error::AppResult, store::entities::pin_resource_history};
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter};
 use std::collections::{BTreeMap, BTreeSet};
@@ -53,8 +56,20 @@ async fn identity_binding_with_work<C: ConnectionTrait, W: Work>(
     cid: &str,
     work: &W,
 ) -> Result<Option<LegacyBinding>, W::Error> {
-    if active_with_work(db, work).await?.is_empty() {
-        return Ok(None);
+    let versions = super::admission_schema::receipt_schema(db)
+        .await
+        .map_err(W::application)?;
+    if versions.last().map(String::as_str) == Some(management::schema::VERSION) {
+        let session = management::records::SharedDecodeBudget::default();
+        let context = work.decode().unwrap_or(DecodeWork::shared(&session));
+        let candidates = management::admission::authority::load(
+            db,
+            &resource_receipt_selectors(provider, cid),
+            context,
+        )
+        .await
+        .map_err(|error| W::application(management::admission::work_error(error)))?;
+        return identity_binding_from_loaded(db, provider, cid, &candidates, work, context).await;
     }
     for table in ["remote_pin_ledger", "remote_pins"] {
         for original in historical_keys_with_work(db, table, provider, Some(cid), work).await? {
@@ -70,6 +85,104 @@ async fn identity_binding_with_work<C: ConnectionTrait, W: Work>(
         }
     }
     Ok(None)
+}
+
+pub(crate) fn resource_receipt_selectors(
+    provider: &str,
+    cid: &str,
+) -> [management::records::locator::AuthoritySelector; 4] {
+    use management::records::locator::AuthoritySelector;
+    let resource = |table: &str| {
+        AuthoritySelector::LegacyResource(table.into(), provider.into(), Some(cid.into()))
+    };
+    let point = |table: &str| {
+        AuthoritySelector::LegacyPoint(
+            table.into(),
+            vec![provider.into(), cid.into()],
+            provider.into(),
+        )
+    };
+    [
+        resource("remote_pin_ledger"),
+        point("remote_pin_ledger"),
+        resource("remote_pins"),
+        point("remote_pins"),
+    ]
+}
+
+pub(crate) async fn resource_receipt_candidates_with_work<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+    cid: &str,
+    work: DecodeWork<'_>,
+) -> management::Result<Option<AuthorityView>> {
+    let versions = super::admission_schema::receipt_schema(db)
+        .await
+        .map_err(<DecodeWork<'_> as Work>::application)?;
+    if versions.last().map(String::as_str) != Some(management::schema::VERSION) {
+        return Ok(None);
+    }
+    management::admission::authority::load(db, &resource_receipt_selectors(provider, cid), work)
+        .await
+        .map(Some)
+}
+
+pub(crate) async fn identity_binding_from_loaded<C: ConnectionTrait, W: Work>(
+    db: &C,
+    provider: &str,
+    cid: &str,
+    candidates: &AuthorityView,
+    work: &W,
+    context: DecodeWork<'_>,
+) -> Result<Option<LegacyBinding>, W::Error> {
+    if candidates.originals.is_empty() {
+        return Ok(None);
+    }
+    for table in ["remote_pin_ledger", "remote_pins"] {
+        for original in super::receipt::historical_keys_from_loaded(
+            db,
+            table,
+            provider,
+            Some(cid),
+            candidates,
+            work,
+            context,
+        )
+        .await?
+        {
+            work.copy(&[("provider", original.as_str()), ("cid", cid)])?;
+            let key = [
+                ("provider".into(), original.clone()),
+                ("cid".into(), cid.into()),
+            ]
+            .into();
+            if let Some(binding) = resolve_with_work(db, table, &key, &original, work).await? {
+                return Ok(Some(binding));
+            }
+        }
+    }
+    Ok(None)
+}
+
+pub(crate) async fn resource_binding_from_loaded<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+    cid: &str,
+    candidates: &AuthorityView,
+    work: DecodeWork<'_>,
+) -> management::Result<Option<LegacyBinding>> {
+    let Some(binding) =
+        identity_binding_from_loaded(db, provider, cid, candidates, &work, work).await?
+    else {
+        return Ok(None);
+    };
+    if super::resource_lifetime::fresh_with_work(db, &binding, cid, &work)
+        .await?
+        .is_some()
+    {
+        return Ok(None);
+    }
+    Ok(Some(binding))
 }
 
 pub async fn resource_key<C: ConnectionTrait>(
@@ -132,13 +245,9 @@ async fn original_job_provider_core<C: ConnectionTrait, W: Work>(
     provider: &str,
     work: &W,
 ) -> Result<String, W::Error> {
-    if active_with_work(db, work).await?.is_empty() {
-        work.copy(provider)?;
-        return Ok(provider.into());
-    }
     work.copy(&[("id", id)])?;
     let pk = [("id".into(), id.into())].into();
-    for original in historical_keys_with_work(db, "pin_jobs", provider, None, work).await? {
+    for original in super::historical_job_keys(db, provider, id, work).await? {
         if resolve_with_work(db, "pin_jobs", &pk, &original, work)
             .await?
             .is_some()
@@ -154,30 +263,66 @@ pub async fn job_io_allowed<C: ConnectionTrait>(
     db: &C,
     job: &crate::store::entities::pin_job::Model,
 ) -> AppResult<bool> {
-    if super::receipt::active(db).await?.is_empty() {
+    let session = management::records::SharedDecodeBudget::default();
+    job_io_allowed_with_work(db, job, DecodeWork::shared(&session))
+        .await
+        .map_err(management::admission::work_error)
+}
+
+pub(crate) async fn job_io_allowed_with_work<C: ConnectionTrait>(
+    db: &C,
+    job: &crate::store::entities::pin_job::Model,
+    work: DecodeWork<'_>,
+) -> management::Result<bool> {
+    work.copy(&(&job.id, &job.operation, &job.provider, &job.cid))?;
+    let candidates =
+        management::admission::authority::load(db, &job_receipt_selectors(job), work).await?;
+    job_io_allowed_from_loaded(db, job, &candidates, work).await
+}
+
+pub(crate) async fn job_io_allowed_from_loaded<C: ConnectionTrait>(
+    db: &C,
+    job: &crate::store::entities::pin_job::Model,
+    candidates: &AuthorityView,
+    work: DecodeWork<'_>,
+) -> management::Result<bool> {
+    // Only the complete six-root union proves ordinary IO has no receipt restriction.
+    if candidates.originals.is_empty() {
         return Ok(true);
     }
     if matches!(job.operation.as_str(), "submit" | "unpin")
-        && super::receipt::job_was_present(db, job).await?
+        && super::receipt::job_was_present_from_loaded(db, job, candidates, work).await?
     {
         return Ok(false);
     }
     // A new allocation cannot resurrect an original job ID or recapture its
     // original call. Check the point-scoped job receipt before the resource mask.
     let pk = [("id".into(), job.id.clone())].into();
-    for original in historical_keys(db, "pin_jobs", &job.provider, None).await? {
-        if let Some(binding) = resolve_legacy_binding(db, "pin_jobs", &pk, &original).await?
+    for original in super::receipt::historical_job_keys_from_loaded(
+        db,
+        &job.provider,
+        &job.id,
+        candidates,
+        work,
+    )
+    .await?
+    {
+        if let Some(binding) = resolve_with_work(db, "pin_jobs", &pk, &original, &work).await?
             && (binding.source_retired || !matches!(job.operation.as_str(), "poll" | "reconcile"))
         {
             return Ok(false);
         }
     }
-    if let Some(binding) = identity_binding(db, &job.provider, &job.cid).await?
-        && let Some(fresh) = super::resource_lifetime::fresh(db, &binding, &job.cid).await?
+    if let Some(binding) =
+        identity_binding_from_loaded(db, &job.provider, &job.cid, candidates, &work, work).await?
+        && let Some(fresh) =
+            super::resource_lifetime::fresh_with_work(db, &binding, &job.cid, &work).await?
     {
-        return super::resource_lifetime::capture_is_fresh(db, &job.id, &fresh).await;
+        return super::resource_lifetime::capture_is_fresh_with_work(db, &job.id, &fresh, work)
+            .await;
     }
-    let resource = resource_binding(db, &job.provider, &job.cid).await?;
+    let resource =
+        resource_binding_from_loaded(db, &job.provider, &job.cid, candidates, work).await?;
     if resource.as_ref().is_some_and(|binding| {
         binding.source_retired
             || binding.historical_route.is_none()
@@ -186,15 +331,21 @@ pub async fn job_io_allowed<C: ConnectionTrait>(
         return Ok(false);
     }
     if let Some(binding) = resource {
-        let registered =
-            crate::store::entities::pin_provider_route::Entity::find_by_id(job.provider.clone())
-                .one(db)
-                .await?;
+        let registered = management::records::current_model::<
+            crate::store::entities::pin_provider_route::Entity,
+            _,
+        >(db, &[&job.provider], work)
+        .await?;
         let original = binding.historical_route.as_ref();
-        let current = registered.as_ref().and_then(|r| {
-            serde_json::from_str::<crate::pinning::identity::ProviderRouteSnapshot>(&r.snapshot)
-                .ok()
-        });
+        let current = registered
+            .as_ref()
+            .map(|r| {
+                work.parse::<crate::pinning::identity::ProviderRouteSnapshot>(
+                    &r.snapshot,
+                    "invalid registered route",
+                )
+            })
+            .transpose()?;
         let compatible = original.zip(current.as_ref()).is_some_and(|(old,current)| {
             old.api_profile == current.api_profile && old.strategy == current.strategy
                 && crate::store::entities::pin_lease_requirement::contract::read_route_compatible(old,current)
@@ -204,14 +355,56 @@ pub async fn job_io_allowed<C: ConnectionTrait>(
         }
     }
     let pk = [("id".into(), job.id.clone())].into();
-    for original in historical_keys(db, "pin_jobs", &job.provider, None).await? {
-        if let Some(binding) = resolve_legacy_binding(db, "pin_jobs", &pk, &original).await? {
+    for original in super::receipt::historical_job_keys_from_loaded(
+        db,
+        &job.provider,
+        &job.id,
+        candidates,
+        work,
+    )
+    .await?
+    {
+        if let Some(binding) = resolve_with_work(db, "pin_jobs", &pk, &original, &work).await? {
             return Ok(
                 !binding.source_retired && matches!(job.operation.as_str(), "poll" | "reconcile")
             );
         }
     }
     Ok(true)
+}
+
+pub(crate) fn job_receipt_selectors(
+    job: &crate::store::entities::pin_job::Model,
+) -> [management::records::locator::AuthoritySelector; 6] {
+    use management::records::locator::AuthoritySelector;
+    [
+        AuthoritySelector::LegacyJob(job.provider.clone(), job.id.clone()),
+        AuthoritySelector::LegacyPoint(
+            "pin_jobs".into(),
+            vec![job.id.clone()],
+            job.provider.clone(),
+        ),
+        AuthoritySelector::LegacyPoint(
+            "remote_pin_ledger".into(),
+            vec![job.provider.clone(), job.cid.clone()],
+            job.provider.clone(),
+        ),
+        AuthoritySelector::LegacyPoint(
+            "remote_pins".into(),
+            vec![job.provider.clone(), job.cid.clone()],
+            job.provider.clone(),
+        ),
+        AuthoritySelector::LegacyResource(
+            "remote_pin_ledger".into(),
+            job.provider.clone(),
+            Some(job.cid.clone()),
+        ),
+        AuthoritySelector::LegacyResource(
+            "remote_pins".into(),
+            job.provider.clone(),
+            Some(job.cid.clone()),
+        ),
+    ]
 }
 
 pub async fn release_history<C: ConnectionTrait>(
@@ -235,15 +428,6 @@ async fn release_history_core<C: ConnectionTrait, W: Work>(
     cid: &str,
     work: &W,
 ) -> Result<Vec<pin_resource_history::Model>, W::Error> {
-    if active_with_work(db, work).await?.is_empty() {
-        work.copy(&(provider, cid))?;
-        return pin_resource_history::Entity::find()
-            .filter(pin_resource_history::Column::Provider.eq(provider))
-            .filter(pin_resource_history::Column::Cid.eq(cid))
-            .all(db)
-            .await
-            .map_err(|error| W::application(error.into()));
-    }
     let operational = resource_key_with_work(db, provider, cid, work).await?;
     let keys = historical_keys_with_work(db, "pin_resource_history", &operational, Some(cid), work)
         .await?;

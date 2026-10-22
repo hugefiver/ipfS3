@@ -2,14 +2,32 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::{capture::capture, model::*, semantics::evaluate, summary::summarize, validate::*};
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct DryRunPlan {
     plan_id: String,
     items: Vec<PlanEntry>,
     summary: Summary,
+    pub(crate) retirement_sources: Vec<std::sync::Arc<super::retirement::InventorySpool>>,
+    pub(crate) retirement_union: Option<std::sync::Arc<super::retirement::PlanUnion>>,
 }
 
+impl PartialEq for DryRunPlan {
+    fn eq(&self, other: &Self) -> bool {
+        self.plan_id == other.plan_id && self.items == other.items && self.summary == other.summary
+    }
+}
+impl Eq for DryRunPlan {}
+
 impl DryRunPlan {
+    pub(crate) fn from_canonical(plan_id: String, items: Vec<PlanEntry>, summary: Summary) -> Self {
+        Self {
+            plan_id,
+            items,
+            summary,
+            retirement_sources: Vec::new(),
+            retirement_union: None,
+        }
+    }
     pub fn plan_id(&self) -> &str {
         &self.plan_id
     }
@@ -23,6 +41,131 @@ impl DryRunPlan {
     pub fn confirmation(&self, candidate_item_ids: Vec<String>) -> Confirmation {
         Confirmation { candidate_item_ids }
     }
+}
+
+/// Provider and mixed plans consume sealed retirement evidence independently of
+/// the bounded local Snapshot. `None` is resumable work, never an executable plan.
+/// Confirmation requires the shared task retained by `PreparedPlanning`; standalone
+/// inventories remain usable for review without acquiring confirmation authority.
+pub async fn dry_run_retirement(
+    request: &PlanRequest,
+    local: &Snapshot,
+    inventories: &[super::retirement::RetirementReview<'_>],
+    mutations: &[(String, super::retirement::RetirementMutationScope)],
+    union: &super::retirement::PlanUnion,
+    limits: &super::retirement::RunLimits,
+) -> Result<Option<DryRunPlan>, SafeError> {
+    use crate::store::pinning::management::ManagementError;
+    let map = |error| match error {
+        ManagementError::Budget => SafeError::LimitExceeded,
+        ManagementError::Changed => SafeError::SnapshotChanged,
+        _ => SafeError::UnknownEvidence,
+    };
+    validate_request(request)?;
+    validate_snapshot(local)?;
+    let work: crate::store::pinning::management::records::SharedDecodeBudget = Default::default();
+    let points = planning_points_with_work(local, work.clone())?;
+    let view = SnapshotView {
+        work: Some(&work),
+        ..SnapshotView::from(local)
+    };
+    let mut items = Vec::with_capacity(request.items.len());
+    let mut budget = Budget::default();
+    for item in &request.items {
+        let id = IdempotencyId(format!(
+            "management-v1:{}:{}",
+            request.plan_id, item.item_id
+        ));
+        let entry = if let Some(applied) = local.applied.iter().find(|a| a.binding.id == id) {
+            if applied.binding.request != *item {
+                return Err(SafeError::IdempotencyConflict);
+            }
+            applied.binding.clone()
+        } else if let Subject::Provider { route } = &item.subject {
+            let review = inventories
+                .iter()
+                .find(|r| &r.checkpoint().route == route)
+                .ok_or(SafeError::IncompleteInventory)?;
+            let mutation = mutations
+                .iter()
+                .find(|(id, _)| id == &item.item_id)
+                .map(|(_, m)| m.clone())
+                .unwrap_or_default();
+            let captured = review.capture(item, mutation).await.map_err(map)?;
+            if matches!(
+                item.action,
+                Action::RetireWith {
+                    selection: RetirementSelection::ReleaseRootReferences { .. }
+                }
+            ) && super::root_references::selected(item, &view)?
+                != captured.mutation_scope.root_references
+            {
+                return Err(SafeError::UnknownEvidence);
+            }
+            super::capture::validate_retirement_selection(item, &captured, &view, &points)?;
+            PlanEntry {
+                id,
+                request: item.clone(),
+                status: PlanStatus::Ready,
+                step: Some(PlannedStep::Retire(review.step())),
+                capture: Some(Capture::Provider(Box::new(captured))),
+            }
+        } else {
+            build_entry(&request.plan_id, item, &view, &points)
+        };
+        budget.entry(&entry)?;
+        items.push(entry);
+    }
+    items.sort_by(|a, b| a.request.item_id.cmp(&b.request.item_id));
+    check_overlaps(&items)?;
+    union.bind(&items).await.map_err(map)?;
+    for review in inventories {
+        if union.merge_inventory(review, limits).await.map_err(map)?
+            == super::retirement::Progress::Pending
+        {
+            return Ok(None);
+        }
+    }
+    let local_entries = items
+        .iter()
+        .filter(|entry| !matches!(entry.request.subject, Subject::Provider { .. }))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut base = summarize(&local_entries, &view)?;
+    base.items = items.len();
+    base.unique_cids = 0;
+    base.unique_resources = 0;
+    base.possible_new_transfers = 0;
+    base.accounted_remote_bytes = 0;
+    base.unknown_resources = 0;
+    base.inflight_resources = 0;
+    base.cleanup_pending_resources = 0;
+    for entry in &items {
+        if let Some(Capture::Provider(c)) = &entry.capture {
+            base.logical_targets += c.totals.targets;
+            base.logical_intent_bytes = base
+                .logical_intent_bytes
+                .checked_add(c.totals.logical_bytes)
+                .ok_or(SafeError::LimitExceeded)?;
+            if local.applied.iter().any(|a| a.binding == *entry) {
+                base.already_applied += 1;
+            }
+        }
+    }
+    union.merge_local(&items, local).await.map_err(map)?;
+    let Some(summary) = union.finish(base, limits).await.map_err(map)? else {
+        return Ok(None);
+    };
+    Ok(Some(DryRunPlan {
+        plan_id: request.plan_id.clone(),
+        items,
+        summary,
+        retirement_sources: inventories
+            .iter()
+            .map(|review| std::sync::Arc::new(review.retain_source()))
+            .collect(),
+        retirement_union: Some(union.retain()),
+    }))
 }
 
 fn build_entry(
@@ -76,6 +219,40 @@ fn build_entry(
     entry
 }
 
+/// Rebuilds a frozen provider/mixed review from its original bounded local
+/// closure and disk inventories. No current DB clock, configuration or status
+/// is consulted, and the returned plan is not an execution capability.
+pub struct FrozenRetirementPlan<'a> {
+    pub request: &'a PlanRequest,
+    pub local: &'a Snapshot,
+    pub mutations: &'a [(String, super::retirement::RetirementMutationScope)],
+    pub entries: &'a [PlanEntry],
+    pub summary: Summary,
+}
+pub async fn restore_retirement_review(
+    frozen: FrozenRetirementPlan<'_>,
+    inventories: &[super::retirement::RetirementReview<'_>],
+    union: &super::retirement::PlanUnion,
+    limits: &super::retirement::RunLimits,
+) -> Result<Option<DryRunPlan>, SafeError> {
+    let Some(plan) = dry_run_retirement(
+        frozen.request,
+        frozen.local,
+        inventories,
+        frozen.mutations,
+        union,
+        limits,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    if plan.items != frozen.entries || plan.summary != frozen.summary {
+        return Err(SafeError::ConfirmationMismatch);
+    }
+    Ok(Some(plan))
+}
+
 fn check_overlaps(entries: &[PlanEntry]) -> Result<(), SafeError> {
     let mut subjects = BTreeSet::new();
     let mut leases = BTreeMap::new();
@@ -83,6 +260,15 @@ fn check_overlaps(entries: &[PlanEntry]) -> Result<(), SafeError> {
         .iter()
         .filter_map(|entry| match &entry.request.subject {
             Subject::Provider { route } => Some(&route.provider_id),
+            _ => None,
+        })
+        .collect();
+    let retired_domains: BTreeSet<_> = entries
+        .iter()
+        .filter_map(|entry| match &entry.request.subject {
+            Subject::Provider { route } => {
+                Some((&route.backend, &route.scope, route.resource_type))
+            }
             _ => None,
         })
         .collect();
@@ -121,6 +307,15 @@ fn check_overlaps(entries: &[PlanEntry]) -> Result<(), SafeError> {
         }
         if let Some(Capture::Object(capture)) = &entry.capture {
             if retired.contains(&capture.route.identity.provider_id)
+                || std::iter::once(&capture.route)
+                    .chain(capture.destination_route.iter())
+                    .any(|route| {
+                        retired_domains.contains(&(
+                            &route.identity.backend,
+                            &route.identity.scope,
+                            route.identity.resource_type,
+                        ))
+                    })
                 || capture
                     .destination_route
                     .as_ref()
@@ -223,6 +418,8 @@ pub(crate) fn dry_run_view_with_work(
         plan_id: request.plan_id.clone(),
         items,
         summary,
+        retirement_sources: Vec::new(),
+        retirement_union: None,
     })
 }
 
@@ -258,72 +455,6 @@ fn validate_planning_inputs(
         ))?;
     }
     Ok(())
-}
-
-pub(crate) fn restore_reviewed_plan(
-    request: &PlanRequest,
-    snapshot: SnapshotView<'_>,
-    points: &[crate::store::pinning::management::records::MigrationPoint],
-    items: Vec<PlanEntry>,
-    summary: Summary,
-    work: crate::store::pinning::management::records::SharedDecodeBudget,
-) -> Result<DryRunPlan, SafeError> {
-    let snapshot = SnapshotView {
-        work: Some(&work),
-        ..snapshot
-    };
-    validate_planning_inputs(request, snapshot, points, &work)?;
-    if items.len() != request.items.len()
-        || items
-            .windows(2)
-            .any(|pair| pair[0].request.item_id >= pair[1].request.item_id)
-    {
-        return Err(SafeError::IdempotencyConflict);
-    }
-    let mut output_budget = Budget::default();
-    for entry in &items {
-        let original = request
-            .items
-            .iter()
-            .find(|item| item.item_id == entry.request.item_id)
-            .ok_or(SafeError::IdempotencyConflict)?;
-        if original != &entry.request
-            || entry
-                .id
-                .as_str()
-                .strip_prefix("management-v1:")
-                .and_then(|id| id.strip_prefix(&request.plan_id))
-                .and_then(|id| id.strip_prefix(':'))
-                != Some(original.item_id.as_str())
-        {
-            return Err(SafeError::IdempotencyConflict);
-        }
-        if let Some(receipt) = snapshot
-            .applied
-            .iter()
-            .find(|receipt| receipt.binding.id == entry.id)
-        {
-            if receipt.binding != *entry {
-                return Err(SafeError::IdempotencyConflict);
-            }
-        } else if build_entry(&request.plan_id, original, &snapshot, points) != *entry {
-            return Err(SafeError::IdempotencyConflict);
-        }
-        output_budget.entry(entry)?;
-    }
-    check_overlaps(&items)?;
-    if summarize(&items, &snapshot)? != summary {
-        return Err(SafeError::IdempotencyConflict);
-    }
-    work.lock()
-        .map_err(|_| SafeError::InvalidInput)?
-        .copy(&request.plan_id)
-        .map_err(|_| SafeError::LimitExceeded)?;
-    Ok(DryRunPlan {
-        plan_id: request.plan_id.clone(),
-        items,
-        summary,
-    })
 }
 
 /// Binding validation alone grants no permission and does not check current state.
@@ -457,7 +588,24 @@ fn revalidate_entries(
         if entry.status == PlanStatus::Candidate && !acknowledged.contains(&entry.request.item_id) {
             return Err(SafeError::CandidateConfirmationRequired);
         }
-        let fresh = build_entry(plan_id, &entry.request, &view, &points);
+        let fresh = if let Some(Capture::Provider(capture)) = &entry.capture {
+            let frame = current
+                .native_frame
+                .as_ref()
+                .ok_or(SafeError::SnapshotChanged)?;
+            crate::store::pinning::management::records::validate_retirement_entry(
+                &work,
+                &frame.database_scope,
+                &frame.database_identity,
+                plan_id,
+                entry,
+            )
+            .map_err(|_| SafeError::IncompleteInventory)?;
+            super::capture::validate_retirement_selection(&entry.request, capture, &view, &points)?;
+            entry.clone()
+        } else {
+            build_entry(plan_id, &entry.request, &view, &points)
+        };
         if fresh != *entry {
             return Err(SafeError::SnapshotChanged);
         }

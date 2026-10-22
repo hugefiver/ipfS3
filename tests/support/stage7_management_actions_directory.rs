@@ -1,4 +1,6 @@
 use super::base;
+#[path = "management_wire_v3.rs"]
+pub mod archive;
 #[path = "cluster_provider_real_car.rs"]
 mod car;
 use ipfs_s3_gateway::{
@@ -258,18 +260,10 @@ impl Fixture {
             .planning_snapshot()
             .unwrap()
     }
-    pub async fn confirm(
-        &self,
-        request: &PlanRequest,
-    ) -> (records::ConfirmedBinding, wire::ImportedPlan) {
+    pub async fn confirm(&self, request: &PlanRequest) -> (records::ConfirmedBinding, Vec<u8>) {
         let snapshot = self.snapshot(request).await;
         let plan = dry_run(request, &snapshot).unwrap();
         assert_eq!(plan.items()[0].status, PlanStatus::Ready);
-        let imported = wire::decode_plan(
-            &wire::encode_plan(request, &snapshot, &plan, Some(&plan.confirmation(vec![])))
-                .unwrap(),
-        )
-        .unwrap();
         let binding = records::confirm(
             &self.db,
             &self.config,
@@ -280,7 +274,8 @@ impl Fixture {
         )
         .await
         .unwrap();
-        (binding, imported)
+        let bytes = archive::export(&binding);
+        (binding, bytes)
     }
 }
 fn rpc(raw: &mut Config, index: usize, strategy: &str, endpoint: &str) {

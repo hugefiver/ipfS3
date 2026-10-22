@@ -8,6 +8,7 @@ use crate::store::{
         management::{
             ManagementError,
             actions::{self, job_authority, points},
+            admission::authority,
             native, records,
         },
         publication::{self, PinTargetSpec, PublicationObject, PublicationRequest},
@@ -17,7 +18,55 @@ use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set, TransactionTr
 use std::sync::{Arc, Mutex};
 
 #[tokio::test]
-async fn poll_discovery_and_selected_roots_keep_one_remaining_work_budget() {
+async fn ordinary_job_io_keeps_its_resolver_budget_exhausted() {
+    let fixture = support::Fixture::new().await;
+    let now = chrono::Utc::now();
+    let job = pin_job::Model {
+        id: "ordinary-budget".into(),
+        operation: "poll".into(),
+        provider: "ordinary".into(),
+        cid: "cid".into(),
+        lease_id: None,
+        target_id: None,
+        expected_generation: None,
+        expected_remote_epoch: None,
+        state: "pending".into(),
+        attempts: 0,
+        next_attempt_at: now,
+        locked_until: None,
+        submit_phase: None,
+        last_error: None,
+        created_at: now,
+        updated_at: now,
+    };
+    let full = records::SharedDecodeBudget::default();
+    assert!(
+        migration::job_io_allowed_with_work(&fixture.db, &job, records::DecodeWork::shared(&full))
+            .await
+            .unwrap()
+    );
+    let used = full.lock().unwrap().usage();
+    assert!(used.0 > 0 && used.1 > 0);
+    let mut limited = records::DecodeBudget::default();
+    limited
+        .consume(wire::MAX_WIRE_NODES - used.0 + 1, 0)
+        .unwrap();
+    let limited = Arc::new(Mutex::new(limited));
+    for _ in 0..2 {
+        assert!(matches!(
+            migration::job_io_allowed_with_work(
+                &fixture.db,
+                &job,
+                records::DecodeWork::shared(&limited)
+            )
+            .await,
+            Err(ManagementError::Budget)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn indexed_authority_and_poll_lineage_share_the_remaining_work_budget() {
     use crate::pinning::management::*;
     use crate::store::entities::pin_lease_target;
     use sea_orm::{ColumnTrait, ConnectionTrait, QueryFilter, Statement};
@@ -35,7 +84,44 @@ async fn poll_discovery_and_selected_roots_keep_one_remaining_work_budget() {
     .await
     .unwrap();
     let lease_id = &applied.items[0].receipt.intent_ids[0];
-    fixture.settle_applied_with_worker(&create, lease_id).await;
+    let coordinator = crate::pinning::coordinator::PinningCoordinator::build_with_kubo(
+        fixture.config.pinning.clone(),
+        Some(crate::kubo::KuboClient::new(fixture.server.uri())),
+    )
+    .unwrap();
+    let scope = crate::pinning::worker::ManagementJobScope::from_applied(
+        &fixture.db,
+        &fixture.auth,
+        &create,
+    )
+    .await
+    .unwrap();
+    let store = crate::store::Store::new(fixture.db.clone());
+    // Poll the worker independently of the receipt-decoding fixture's poll stack.
+    tokio::spawn(async move {
+        Box::pin(coordinator.management_tick(
+            &store,
+            &scope,
+            &tokio_util::sync::CancellationToken::new(),
+        ))
+        .await
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let now = crate::store::database_clock::database_now(&fixture.db)
+        .await
+        .unwrap();
+    assert!(
+        crate::store::entities::pin_lease_requirement::contract::completion(
+            &fixture.db,
+            lease_id,
+            now,
+        )
+        .await
+        .unwrap()
+        .is_some_and(|(_, complete, _)| complete)
+    );
     let lease = pin_lease::Entity::find_by_id(lease_id.clone())
         .one(&fixture.db)
         .await
@@ -137,30 +223,28 @@ async fn poll_discovery_and_selected_roots_keep_one_remaining_work_budget() {
     migration::apply(&fixture.db, &declaration, &confirmation)
         .await
         .unwrap();
-    let discovery = Arc::new(Mutex::new(records::DecodeBudget::default()));
-    let ids = records::poll_discovery_with_work(&fixture.db, &poll, discovery.clone())
-        .await
-        .unwrap();
-    assert!(
-        ids.contains(
-            &applied.items[0]
-                .jobs
-                .iter()
-                .find(|job| job.directive == records::JobDirective::Submit)
-                .unwrap()
-                .job_id
-        )
-    );
-    let discovery_usage = discovery.lock().unwrap().usage();
-    assert!(discovery_usage.0 > 0 && discovery_usage.1 > 0);
-    let public = records::actions_for_job(&fixture.db, &poll).await.unwrap();
+    let public =
+        authority::actions_for_job(&fixture.db, &poll, records::SharedDecodeBudget::default())
+            .await
+            .unwrap();
     assert!(public.len() >= 2);
     let work = Arc::new(Mutex::new(records::DecodeBudget::default()));
     work.lock().unwrap().consume(3, 7).unwrap();
-    let roots = records::actions_for_job_with_work(&fixture.db, &poll, work.clone())
+    let roots = authority::actions_for_job(&fixture.db, &poll, work.clone())
         .await
         .unwrap();
     assert_eq!(roots.len(), public.len());
+    let seed = applied.items[0]
+        .jobs
+        .iter()
+        .find(|job| job.directive == records::JobDirective::Submit)
+        .unwrap();
+    assert!(roots.iter().any(|root| {
+        root.action_view()
+            .jobs
+            .iter()
+            .any(|job| job.job_id == seed.job_id)
+    }));
     let root_usage = work.lock().unwrap().usage();
     assert!(
         job_authority::lookup_with_work(&fixture.db, &poll, work.clone())
@@ -172,17 +256,9 @@ async fn poll_discovery_and_selected_roots_keep_one_remaining_work_budget() {
     assert!(total.1 >= serde_json::to_string(&confirmation).unwrap().len());
     assert!(
         total.0 > 3 && total.1 > 7,
-        "indexed loading must retain the discovery's original budget"
+        "indexed loading and lineage validation must retain the caller's budget"
     );
-    assert!(total.0 - 3 > discovery_usage.0 && total.1 - 7 > discovery_usage.1);
-    eprintln!(
-        "poll discovery nodes={} bytes={}; discovery + {} selected roots nodes={} bytes={}",
-        discovery_usage.0,
-        discovery_usage.1,
-        roots.len(),
-        total.0 - 3,
-        total.1 - 7
-    );
+    assert!(total.0 > root_usage.0 && total.1 > root_usage.1);
     for root in &roots {
         let before = work.lock().unwrap().usage();
         root.binding().copy(root.record_key()).unwrap();
@@ -193,26 +269,6 @@ async fn poll_discovery_and_selected_roots_keep_one_remaining_work_budget() {
         }
     }
     for node_limit in [true, false] {
-        let mut limited = records::DecodeBudget::default();
-        limited
-            .consume(
-                if node_limit {
-                    wire::MAX_WIRE_NODES - discovery_usage.0 + 1
-                } else {
-                    0
-                },
-                if node_limit {
-                    0
-                } else {
-                    wire::MAX_WIRE_BYTES - discovery_usage.1 + 1
-                },
-            )
-            .unwrap();
-        let limited = Arc::new(Mutex::new(limited));
-        assert!(matches!(
-            records::poll_discovery_with_work(&fixture.db, &poll, limited.clone()).await,
-            Err(ManagementError::Budget)
-        ));
         let mut limited = records::DecodeBudget::default();
         limited
             .consume(
@@ -229,8 +285,7 @@ async fn poll_discovery_and_selected_roots_keep_one_remaining_work_budget() {
             )
             .unwrap();
         assert!(matches!(
-            records::actions_for_job_with_work(&fixture.db, &poll, Arc::new(Mutex::new(limited)))
-                .await,
+            authority::actions_for_job(&fixture.db, &poll, Arc::new(Mutex::new(limited))).await,
             Err(ManagementError::Budget)
         ));
         let mut limited = records::DecodeBudget::default();
@@ -249,7 +304,7 @@ async fn poll_discovery_and_selected_roots_keep_one_remaining_work_budget() {
             )
             .unwrap();
         let limited = Arc::new(Mutex::new(limited));
-        let result = records::actions_for_job_with_work(&fixture.db, &poll, limited.clone()).await;
+        let result = authority::actions_for_job(&fixture.db, &poll, limited.clone()).await;
         if let Err(error) = result {
             assert_eq!(error, ManagementError::Budget);
         } else {
@@ -647,7 +702,6 @@ async fn live_legacy_points_jobs_and_poll_share_remaining_receipt_work() {
             bytes >= op.confirmation.len(),
             "live resolution must account the full original confirmation before parsing"
         );
-        eprintln!("legacy live operation={operation}: nodes={nodes} bytes={bytes}");
         for node_limit in [true, false] {
             for deficit in [0, 1] {
                 let mut limited = records::DecodeBudget::default();
@@ -713,7 +767,9 @@ async fn live_legacy_points_jobs_and_poll_share_remaining_receipt_work() {
     for reversed in [false, true] {
         let tx = fixture.db.begin().await.unwrap();
         let mut other = confirmation.clone();
-        other.operation_id = uuid::Uuid::new_v4().to_string();
+        if !reversed {
+            other.operation_id = uuid::Uuid::new_v4().to_string();
+        }
         migration::receipt::append(&tx, &other, reversed.then_some(receipt.id.as_str()))
             .await
             .unwrap();

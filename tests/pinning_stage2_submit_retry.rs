@@ -26,7 +26,7 @@ use wiremock::{
     matchers::{method, path},
 };
 
-const CID: &str = "bafy-stage2-submit-retry";
+const CID: &str = "bafybeib4r26s6xrk5uqyy6k5lkwxmrsfecmfxluvlz44b2qnt3rottiw3u";
 
 async fn setup(server: &MockServer) -> (Store, Arc<PinningCoordinator>, String) {
     let config: Config = toml::from_str(&format!(

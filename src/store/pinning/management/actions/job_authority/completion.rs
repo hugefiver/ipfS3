@@ -1,0 +1,165 @@
+//! Immutable action bodies under the caller's authority fence. Native state is
+//! resolved again for every predicate, including original Submit/history lineage.
+use super::*;
+
+pub(crate) struct CompletionReader<'a> {
+    tx: &'a DatabaseTransaction,
+    job: &'a pin_job::Model,
+    actions: Vec<records::TrustedAppliedAction>,
+    work: records::SharedDecodeBudget,
+}
+
+impl<'a> CompletionReader<'a> {
+    pub(super) fn new(
+        tx: &'a DatabaseTransaction,
+        job: &'a pin_job::Model,
+        actions: Vec<records::TrustedAppliedAction>,
+        work: records::SharedDecodeBudget,
+    ) -> Self {
+        Self {
+            tx,
+            job,
+            actions,
+            work,
+        }
+    }
+
+    pub(crate) fn is_bound(&self, tx: &DatabaseTransaction, job: &pin_job::Model) -> bool {
+        std::ptr::eq(self.tx, tx) && std::ptr::eq(self.job, job)
+    }
+
+    pub(crate) async fn projection_allowed(&self) -> AppResult<bool> {
+        crate::store::pinning::management::schema::validate(self.tx)
+            .await
+            .map_err(safe)?;
+        self.current_projection_allowed().await
+    }
+
+    async fn current_projection_allowed(&self) -> AppResult<bool> {
+        let authority = lookup_from_actions(self.tx, self.job, &self.actions, self.work.clone())
+            .await
+            .map_err(safe)?;
+        let permit = check_with_authority(self.tx, self.job, authority, self.work.clone())
+            .await
+            .map_err(safe)?;
+        Ok(matches!(
+            permit,
+            None | Some(JobPermit::Submit(_) | JobPermit::ExistingCleanup(_))
+        ))
+    }
+
+    pub(crate) async fn fresh_source_allowed(
+        &self,
+        config: Option<crate::pinning::management::local_config::ManagementConfigView<'_>>,
+        idle_timeout_millis: Option<u64>,
+    ) -> AppResult<bool> {
+        crate::store::pinning::management::schema::validate(self.tx)
+            .await
+            .map_err(safe)?;
+        self.current_source_allowed(config, idle_timeout_millis)
+            .await
+    }
+
+    /// One continuous read phase under the existing authority/lifecycle fences.
+    /// Each native predicate is resolved independently; no permit is retained.
+    pub(crate) async fn projection_and_source_allowed(
+        &self,
+        config: Option<crate::pinning::management::local_config::ManagementConfigView<'_>>,
+        idle_timeout_millis: Option<u64>,
+    ) -> AppResult<bool> {
+        crate::store::pinning::management::schema::validate(self.tx)
+            .await
+            .map_err(safe)?;
+        if !self.current_projection_allowed().await? {
+            return Ok(false);
+        }
+        self.current_source_allowed(config, idle_timeout_millis)
+            .await
+    }
+
+    async fn current_source_allowed(
+        &self,
+        config: Option<crate::pinning::management::local_config::ManagementConfigView<'_>>,
+        idle_timeout_millis: Option<u64>,
+    ) -> AppResult<bool> {
+        let authority = lookup_from_actions(self.tx, self.job, &self.actions, self.work.clone())
+            .await
+            .map_err(safe)?;
+        fresh_source_from_authority(
+            self.tx,
+            authority.as_ref(),
+            config,
+            idle_timeout_millis,
+            self.work.clone(),
+        )
+        .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sea_orm::TransactionTrait;
+
+    #[tokio::test]
+    async fn ordinary_remote_completion_keeps_readiness_live() {
+        let fixture =
+            super::super::super::tests::fixture_with_automatic("completion-readiness", true).await;
+        let remote = remote_pin::Entity::find()
+            .one(&fixture.db)
+            .await
+            .unwrap()
+            .unwrap();
+        let now = crate::store::database_clock::database_now(&fixture.db)
+            .await
+            .unwrap();
+        let new_job = crate::store::pinning::jobs::reconcile_job(
+            &remote.provider,
+            &remote.cid,
+            remote.epoch,
+            now,
+        );
+        let crate::store::pinning::jobs::NewPinJob::Remote(job) = &new_job else {
+            unreachable!()
+        };
+        let id = job.id.clone();
+        crate::store::pinning::jobs::enqueue_job(&fixture.db, new_job)
+            .await
+            .unwrap();
+        let job = pin_job::Entity::find_by_id(id)
+            .one(&fixture.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(lookup(&fixture.db, &job).await.unwrap().is_none());
+        let tx = fixture.db.begin().await.unwrap();
+        let _lifecycle =
+            crate::store::pinning::leases::lock_worker_observation_lifecycle(&tx, &job)
+                .await
+                .unwrap();
+        let reader =
+            fence_worker_authority_with_work(&tx, &job, records::SharedDecodeBudget::default())
+                .await
+                .unwrap();
+        assert!(reader.projection_allowed().await.unwrap());
+        assert!(reader.fresh_source_allowed(None, None).await.unwrap());
+        assert!(
+            reader
+                .projection_and_source_allowed(None, None)
+                .await
+                .unwrap()
+        );
+        tx.execute_unprepared("UPDATE pin_management_readiness SET state='backfill' WHERE id=1")
+            .await
+            .unwrap();
+        assert!(reader.projection_allowed().await.is_err());
+        assert!(reader.fresh_source_allowed(None, None).await.is_err());
+        assert!(
+            reader
+                .projection_and_source_allowed(None, None)
+                .await
+                .is_err()
+        );
+        tx.rollback().await.unwrap();
+    }
+}

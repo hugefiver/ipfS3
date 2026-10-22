@@ -2,7 +2,9 @@
 //! before and after the read, never cached as an execution permission.
 use super::*;
 use crate::store::pinning::legacy_migration as legacy;
-use sea_orm::{ColumnTrait, DatabaseBackend, QueryFilter, Statement};
+#[cfg(test)]
+use sea_orm::Statement;
+use sea_orm::{ColumnTrait, QueryFilter};
 
 pub(super) async fn management_participates<C: ConnectionTrait>(
     db: &C,
@@ -10,6 +12,9 @@ pub(super) async fn management_participates<C: ConnectionTrait>(
     work: SharedDecodeBudget,
 ) -> management::Result<bool> {
     let context = DecodeWork::shared(&work);
+    if management::admission::authority::lease_participates(db, lease_id, context).await? {
+        return Ok(true);
+    }
     if management::records::current_model::<super::super::super::pin_lease::Entity, _>(
         db,
         &[lease_id],
@@ -20,27 +25,7 @@ pub(super) async fn management_participates<C: ConnectionTrait>(
     {
         return Ok(true);
     }
-    context.with(|work| work.nodes(1))?;
-    let sql = match db.get_database_backend() {
-        DatabaseBackend::Sqlite => {
-            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='pin_management_records') AS present"
-        }
-        DatabaseBackend::Postgres => {
-            "SELECT to_regclass('pin_management_records') IS NOT NULL AS present"
-        }
-        _ => return Err(ManagementError::Schema),
-    };
-    let present = db
-        .query_one(Statement::from_string(db.get_database_backend(), sql))
-        .await
-        .map_err(|_| ManagementError::Database)?
-        .ok_or(ManagementError::Database)?
-        .try_get::<bool>("", "present")
-        .map_err(|_| ManagementError::Schema)?;
-    if !present {
-        return Ok(false);
-    }
-    management::records::lease_has_selectors(db, lease_id, context).await
+    Ok(false)
 }
 
 async fn candidates<C: ConnectionTrait>(
@@ -78,6 +63,18 @@ pub(super) async fn target_confirmed<C: ConnectionTrait>(
     } else {
         vec![]
     };
+    target_confirmed_for_birth(db, lease_id, provider, cid, now, birth.as_ref(), &resolved).await
+}
+
+async fn target_confirmed_for_birth<C: ConnectionTrait>(
+    db: &C,
+    lease_id: &str,
+    provider: &str,
+    cid: &str,
+    now: DateTime<Utc>,
+    birth: Option<&BirthContract>,
+    resolved: &[(String, String)],
+) -> AppResult<bool> {
     let selected = resolved
         .iter()
         .filter(|(slot, allocation)| slot == provider || allocation == provider)
@@ -155,7 +152,7 @@ pub(super) async fn target_confirmed<C: ConnectionTrait>(
     }
     if route.resource_type() == crate::pinning::identity::RemoteResourceType::ClusterPin {
         let mut required = route.clone();
-        let Some(confirmation) = replica_requirement(original, &route, full.as_ref()) else {
+        let Some(confirmation) = replica_requirement(original, original, full.as_ref()) else {
             return Ok(false);
         };
         required.confirmation = Some(confirmation);
@@ -184,9 +181,9 @@ pub(super) async fn completion<C: ConnectionTrait>(
     let mut any = !birth.content_cids.is_empty() && !birth.candidates.is_empty();
     let mut all = any;
     let mut pinned = 0;
+    let resolved = candidates(db, lease_id, &birth).await?;
     for object_cid in &birth.content_cids {
         let mut available = false;
-        let resolved = candidates(db, lease_id, &birth).await?;
         for (slot, allocation) in &resolved {
             let route = birth.candidates.get(slot).and_then(Option::as_ref);
             let cid = if route.is_some_and(|route| {
@@ -218,7 +215,16 @@ pub(super) async fn completion<C: ConnectionTrait>(
                 && remote.is_some_and(|row| {
                     row.status == "pinned" || cluster && row.status == "pinning"
                 })
-                && target_confirmed(db, lease_id, slot, &cid, now).await?;
+                && target_confirmed_for_birth(
+                    db,
+                    lease_id,
+                    slot,
+                    &cid,
+                    now,
+                    Some(&birth),
+                    &resolved,
+                )
+                .await?;
             available |= confirmed;
             all &= confirmed;
             pinned += usize::from(confirmed);

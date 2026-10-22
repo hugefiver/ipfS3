@@ -4,7 +4,6 @@ use ipfs_s3_gateway::store::{
     pinning::management::records,
 };
 use sea_orm::EntityTrait;
-use serde_json::json;
 
 #[path = "stage7_management_cli_directory.rs"]
 mod directory;
@@ -26,16 +25,9 @@ async fn explicit_offline_prepare_confirm_export_apply_restart_and_exact_replay_
     let bytes = std::fs::read(&confirmed).unwrap();
     assert!(!String::from_utf8_lossy(&bytes).contains(support::PRIVATE_METADATA));
     assert!(!String::from_utf8_lossy(&bytes).contains(&fixture.server.uri()));
-    let imported = ipfs_s3_gateway::pinning::management::wire::decode_plan(&bytes).unwrap();
-    assert!(imported.confirmation().is_some());
-    assert!(
-        !imported
-            .snapshot_without_applied()
-            .native_frame
-            .as_ref()
-            .unwrap()
-            .has_private_material()
-    );
+    let imported = support::document(&confirmed);
+    assert!(imported.acknowledgements.is_some());
+    assert!(!imported.applied_claims);
     let result = fixture.import("--apply", &confirmed, false).await;
     let applied = support::report(&result);
     assert_eq!(applied["replayed"], false);
@@ -97,10 +89,8 @@ async fn candidate_requires_exact_per_item_ack_and_artifact_never_overwrites_or_
     let fresh = fixture.file("acknowledged.json");
     let result = fixture.confirm(&fresh, "300", true).await;
     assert_eq!(support::report(&result)["items"][0]["status"], "candidate");
-    let imported =
-        ipfs_s3_gateway::pinning::management::wire::decode_plan(&std::fs::read(&fresh).unwrap())
-            .unwrap();
-    assert_eq!(imported.confirmation().unwrap(), ["object"]);
+    let imported = support::document(&fresh);
+    assert_eq!(imported.acknowledgements.unwrap(), ["object"]);
     assert!(
         fixture
             .import("--apply", &fresh, false)
@@ -165,14 +155,22 @@ async fn exported_proposal_and_a_staged_only_database_record_are_not_confirmatio
     ]))
     .await;
     support::report(&result);
-    let mut document: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&proposal).unwrap()).unwrap();
-    document["confirmation"] = json!({
-        "plan_id": fixture.request.plan_id, "bindings": document["plan"]["items"], "candidate_item_ids": [],
-        "native_frame": document["snapshot"]["native_frame"], "configuration": document["snapshot"]["configuration"],
-    });
     let forged = fixture.file("reviewed-but-not-confirmed.json");
-    support::write_json(&forged, &document);
+    support::rewrite(
+        &proposal,
+        &forged,
+        |event, _| {
+            use ipfs_s3_gateway::pinning::management::wire::v3::{Event, Frame};
+            match event {
+                Event::Frame(Frame::Acknowledgements { item_ids }) => *item_ids = Some(vec![]),
+                Event::Frame(Frame::Header { expires_at, .. }) => {
+                    *expires_at = Some("2099-01-01T00:00:00Z".into())
+                }
+                _ => {}
+            }
+        },
+        |_| {},
+    );
     let snapshot = ipfs_s3_gateway::pinning::management::db_snapshot::collect_with_config(
         &fixture.db,
         &fixture.config,
@@ -253,6 +251,7 @@ async fn directory_locality_without_a_complete_typed_export_cannot_attest_or_gra
 
 #[tokio::test]
 async fn explicit_preparation_enforces_real_source_identity_bytes_and_redacted_provider_errors() {
+    use serde_json::json;
     use wiremock::{
         Mock, ResponseTemplate,
         matchers::{method, path},

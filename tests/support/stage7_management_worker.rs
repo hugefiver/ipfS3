@@ -64,6 +64,15 @@ pub async fn confirm_with_ttl(
             .planning_snapshot()
             .unwrap();
     let plan = management::dry_run(request, &snapshot).unwrap();
+    for entry in plan.items() {
+        assert!(
+            !matches!(entry.status, management::PlanStatus::Blocked(_)),
+            "plan {} item {}: {:?}",
+            request.plan_id,
+            entry.request.item_id,
+            entry.status
+        );
+    }
     let ack = plan
         .items()
         .iter()
@@ -79,7 +88,7 @@ pub async fn confirm_with_ttl(
         ttl,
     )
     .await
-    .unwrap()
+    .unwrap_or_else(|error| panic!("confirmation {}: {error:?}", request.plan_id))
 }
 
 pub fn response(request: &str, status: &str) -> serde_json::Value {

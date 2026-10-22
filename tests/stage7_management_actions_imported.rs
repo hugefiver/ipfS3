@@ -1,3 +1,5 @@
+#[path = "support/management_wire_v3.rs"]
+mod archive;
 #[path = "support/stage7_management_actions.rs"]
 pub mod support;
 
@@ -11,17 +13,11 @@ use ipfs_s3_gateway::{
 };
 use sea_orm::{ConnectionTrait, EntityTrait, Statement};
 
-fn archive(request: &PlanRequest, snapshot: &Snapshot, ack: Vec<String>) -> wire::ImportedPlan {
-    let plan = dry_run(request, snapshot).unwrap();
-    let bytes = wire::encode_plan(request, snapshot, &plan, Some(&plan.confirmation(ack))).unwrap();
-    wire::decode_plan(&bytes).unwrap()
-}
-
 async fn confirmed_archive(
     fixture: &support::Fixture,
     request: &PlanRequest,
     ttl: chrono::Duration,
-) -> (wire::ImportedPlan, records::ConfirmedBinding, Snapshot) {
+) -> (Vec<u8>, records::ConfirmedBinding, Snapshot) {
     let snapshot = db_snapshot::collect_with_config(&fixture.db, &fixture.config, request)
         .await
         .unwrap()
@@ -34,27 +30,17 @@ async fn confirmed_archive(
         .filter(|entry| entry.status == PlanStatus::Candidate)
         .map(|entry| entry.request.item_id.clone())
         .collect();
-    let imported = archive(request, &snapshot, ack);
-    records::stage_confirmation(
+    let binding = records::confirm(
         &fixture.db,
         &fixture.config,
         &fixture.auth,
-        request,
-        &snapshot,
-        &plan,
+        (request, &snapshot, &plan),
+        ack,
         ttl,
     )
     .await
     .unwrap();
-    assert!(
-        records::load_confirmed_from_imported(&fixture.db, &fixture.auth, &imported)
-            .await
-            .is_err(),
-        "a prepared draft is not a persisted confirmation"
-    );
-    let binding = records::confirm_imported(&fixture.db, &fixture.config, &fixture.auth, &imported)
-        .await
-        .unwrap();
+    let imported = archive::export(&binding);
     (imported, binding, snapshot)
 }
 
@@ -106,7 +92,7 @@ async fn expired_committed_archive_restores_private_original_for_replay_status_a
         .await
         .unwrap();
     let before = native::capture(&fixture.db).await.unwrap();
-    let restored = records::load_confirmed_from_imported(&fixture.db, &fixture.auth, &imported)
+    let restored = archive::restore(&fixture.db, &fixture.auth, &request, &imported)
         .await
         .unwrap();
     assert!(restored == binding);
@@ -117,21 +103,9 @@ async fn expired_committed_archive_restores_private_original_for_replay_status_a
             private |= table == "pin_management_records" && column == "result" && value.is_some();
         });
     assert!(private);
-    assert!(
-        !imported
-            .snapshot_without_applied()
-            .native_frame
-            .as_ref()
-            .unwrap()
-            .has_private_material()
-    );
     assert!(native::capture(&fixture.db).await.unwrap() == before);
     assert!(matches!(
         restored.check(&fixture.db, &fixture.auth).await,
-        Err(ManagementError::Expired)
-    ));
-    assert!(matches!(
-        records::confirm_imported(&fixture.db, &fixture.config, &fixture.auth, &imported).await,
         Err(ManagementError::Expired)
     ));
     let replay = actions::apply(&fixture.db, &fixture.config, &fixture.auth, &restored)
@@ -148,7 +122,7 @@ async fn expired_committed_archive_restores_private_original_for_replay_status_a
             == committed.items[0].receipt
     );
     assert!(
-        records::lookup_applied_from_imported(&fixture.db, &fixture.auth, &imported, "object")
+        records::lookup_applied(&fixture.db, &fixture.auth, &restored, "object")
             .await
             .unwrap()
             .unwrap()
@@ -171,7 +145,7 @@ async fn expired_unapplied_archive_is_readable_but_cannot_grant_apply_or_worker_
         confirmed_archive(&fixture, &request, chrono::Duration::seconds(5)).await;
     wait_for_real_confirmation_expiry(&fixture, &binding).await;
     let before = native::capture(&fixture.db).await.unwrap();
-    let restored = records::load_confirmed_from_imported(&fixture.db, &fixture.auth, &imported)
+    let restored = archive::restore(&fixture.db, &fixture.auth, &request, &imported)
         .await
         .unwrap();
     assert!(restored == binding);
@@ -185,15 +159,11 @@ async fn expired_unapplied_archive_is_readable_but_cannot_grant_apply_or_worker_
             .is_err()
     );
     assert!(
-        records::lookup_applied_from_imported(&fixture.db, &fixture.auth, &imported, "object")
+        records::lookup_applied(&fixture.db, &fixture.auth, &restored, "object")
             .await
             .unwrap()
             .is_none()
     );
-    assert!(matches!(
-        records::confirm_imported(&fixture.db, &fixture.config, &fixture.auth, &imported).await,
-        Err(ManagementError::Expired)
-    ));
     assert!(
         pin_lease::Entity::find()
             .all(&fixture.db)
@@ -205,60 +175,73 @@ async fn expired_unapplied_archive_is_readable_but_cannot_grant_apply_or_worker_
 }
 
 #[tokio::test]
-async fn loader_rejects_changed_public_fields_candidate_ack_and_applied_claims() {
+async fn v3_loader_rejects_changed_public_fields_candidate_ack_and_applied_claims() {
+    use wire::v3;
     let fixture = support::Fixture::new().await;
     let identity = fixture.publish("historical-candidate", false).await;
     let request = fixture.create_request("historical-candidate", identity, true);
-    let (imported, binding, snapshot) =
+    let (bytes, binding, _) =
         confirmed_archive(&fixture, &request, chrono::Duration::minutes(5)).await;
     let before = native::capture(&fixture.db).await.unwrap();
     assert!(
-        records::load_confirmed_from_imported(&fixture.db, &fixture.auth, &imported)
+        archive::restore(&fixture.db, &fixture.auth, &request, &bytes)
             .await
             .unwrap()
             == binding
     );
-    let missing_ack = archive(&request, &snapshot, vec![]);
+    for field in ["ack", "locator", "request", "summary"] {
+        let forged = archive::rewrite(&bytes, |frame| match (field, frame) {
+            ("ack", v3::Frame::Acknowledgements { item_ids }) => *item_ids = None,
+            (
+                "locator",
+                v3::Frame::Request {
+                    request: Some(request),
+                },
+            ) => {
+                request.plan_id = "other-locator".into();
+            }
+            (
+                "request",
+                v3::Frame::Request {
+                    request: Some(request),
+                },
+            ) => {
+                let Action::Backfill(intent) = &mut request.items[0].action else {
+                    unreachable!()
+                };
+                intent.expires_at += 1;
+            }
+            ("summary", v3::Frame::Summary { summary }) => summary.logical_intent_bytes += 1,
+            _ => {}
+        })
+        .unwrap();
+        assert!(
+            archive::restore(&fixture.db, &fixture.auth, &request, &forged)
+                .await
+                .is_err()
+        );
+    }
+    let mut writer = v3::Writer::new(
+        Vec::new(),
+        v3::Projection::Review,
+        v3::files::stream::budget(),
+    )
+    .unwrap();
+    v3::planning::local_confirmed(&mut writer, &binding, v3::Projection::Review).unwrap();
+    writer
+        .frame(&v3::Frame::Row {
+            section: v3::Section::AppliedClaim,
+            key: NativeKey {
+                table: "management_applied".into(),
+                values: vec!["client-claim".into()],
+            },
+            cells: 0,
+        })
+        .unwrap();
+    writer.frame(&v3::Frame::RowEnd).unwrap();
+    let claims = writer.finish().unwrap();
     assert!(
-        records::load_confirmed_from_imported(&fixture.db, &fixture.auth, &missing_ack)
-            .await
-            .is_err()
-    );
-    let mut changed = request.clone();
-    changed.plan_id = "other-locator".into();
-    let locator = archive(&changed, &snapshot, vec!["object".into()]);
-    assert!(
-        records::load_confirmed_from_imported(&fixture.db, &fixture.auth, &locator)
-            .await
-            .is_err()
-    );
-    changed = request.clone();
-    let Action::Backfill(intent) = &mut changed.items[0].action else {
-        unreachable!()
-    };
-    intent.expires_at += 1;
-    let request_change = archive(&changed, &snapshot, vec!["object".into()]);
-    assert!(
-        records::load_confirmed_from_imported(&fixture.db, &fixture.auth, &request_change)
-            .await
-            .is_err()
-    );
-    let mut changed_snapshot = snapshot.clone();
-    changed_snapshot.observed_at += 1;
-    let snapshot_change = archive(&request, &changed_snapshot, vec!["object".into()]);
-    assert!(
-        records::load_confirmed_from_imported(&fixture.db, &fixture.auth, &snapshot_change)
-            .await
-            .is_err()
-    );
-    let mut claimed = snapshot.clone();
-    claimed.applied = vec![AppliedItem {
-        binding: binding.confirmation.bindings[0].clone(),
-    }];
-    let claims = archive(&request, &claimed, vec!["object".into()]);
-    assert_eq!(claims.untrusted_applied_claims().len(), 1);
-    assert!(
-        records::load_confirmed_from_imported(&fixture.db, &fixture.auth, &claims)
+        archive::restore(&fixture.db, &fixture.auth, &request, &claims)
             .await
             .is_err()
     );
@@ -283,25 +266,25 @@ async fn copied_original_private_frame_and_forged_row_headers_do_not_authenticat
     // Adversarial fixture: copy the complete original blobs and forge only their
     // indexed scalar headers. The private original still belongs to the first DB.
     other.db.execute(Statement::from_sql_and_values(other.db.get_database_backend(),"INSERT INTO pin_management_records (database_scope,plan_id,item_id,kind,principal,native_identity,binding,native_before,result,intent_ids,job_ids,state,created_at,expires_at,completed_at) VALUES ($1,$2,'object','action',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",[
-        other.auth.database_scope().into(),request.plan_id.into(),other.auth.principal().into(),other.auth.database_identity().into(),
+        other.auth.database_scope().into(),request.plan_id.clone().into(),other.auth.principal().into(),other.auth.database_identity().into(),
         row.try_get::<String>("","binding").unwrap().into(),row.try_get::<String>("","native_before").unwrap().into(),row.try_get::<Option<String>>("","result").unwrap().into(),
         row.try_get::<String>("","intent_ids").unwrap().into(),row.try_get::<String>("","job_ids").unwrap().into(),row.try_get::<String>("","state").unwrap().into(),
         row.try_get::<chrono::DateTime<chrono::Utc>>("","created_at").unwrap().into(),row.try_get::<chrono::DateTime<chrono::Utc>>("","expires_at").unwrap().into(),row.try_get::<Option<chrono::DateTime<chrono::Utc>>>("","completed_at").unwrap().into(),
     ])).await.unwrap();
     let before = native::capture(&other.db).await.unwrap();
     assert!(matches!(
-        records::load_confirmed_from_imported(&other.db, &other.auth, &imported).await,
+        archive::restore(&other.db, &other.auth, &request, &imported).await,
         Err(ManagementError::Unauthorized)
     ));
     assert!(
-        records::load_confirmed_from_imported(&other.db, &fixture.auth, &imported)
+        archive::restore(&other.db, &fixture.auth, &request, &imported)
             .await
             .is_err()
     );
     assert!(native::capture(&other.db).await.unwrap() == before);
     fixture.db.execute(Statement::from_sql_and_values(fixture.db.get_database_backend(),"UPDATE pin_management_records SET principal='different-principal' WHERE plan_id=$1 AND kind='action'",["copy-original".into()])).await.unwrap();
     assert!(matches!(
-        records::load_confirmed_from_imported(&fixture.db, &fixture.auth, &imported).await,
+        archive::restore(&fixture.db, &fixture.auth, &request, &imported).await,
         Err(ManagementError::Unauthorized)
     ));
 }

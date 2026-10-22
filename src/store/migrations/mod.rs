@@ -32,3 +32,4 @@ pub mod m20261007_000001_legacy_pinning_migration;
 pub mod m20261008_000001_zip_intent_capture;
 pub mod m20261012_000001_pinning_management;
 pub mod m20261013_000001_zip_root_logical_release;
+pub mod m20261017_000001_management_storage;

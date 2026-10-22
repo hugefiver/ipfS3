@@ -120,7 +120,7 @@ async fn sqlite_text_composite_key_searches_cover_budget_read_and_guards() {
 }
 
 #[tokio::test]
-async fn postgres_keys_keep_cast_text_predicates_and_bound_values() {
+async fn postgres_keys_use_native_predicates_and_typed_bound_values() {
     let db = Database::connect("sqlite::memory:").await.unwrap();
     let recording = RecordingConnection::new(&db, DatabaseBackend::Postgres);
     assert!(matches!(
@@ -140,19 +140,15 @@ async fn postgres_keys_keep_cast_text_predicates_and_bound_values() {
     for (statement, predicate, values) in [
         (
             &statements[0],
-            "CAST(\"provider\" AS TEXT)=$1 AND CAST(\"cid\" AS TEXT)=$2",
+            "\"provider\"=$1 AND \"cid\"=$2",
             vec!["01".into(), "1".into()],
         ),
         (
             &statements[1],
-            "CAST(\"upload_id\" AS TEXT)=$1 AND CAST(\"part_number\" AS TEXT)=$2",
-            vec!["01".into(), "1".into()],
+            "\"upload_id\"=$1 AND \"part_number\"=$2",
+            vec!["01".into(), 1_i32.into()],
         ),
-        (
-            &statements[2],
-            "CAST(\"sequence\" AS TEXT)=$1",
-            vec!["1".into()],
-        ),
+        (&statements[2], "\"sequence\"=$1", vec![1_i64.into()]),
     ] {
         assert_eq!(statement.sql.split_once(" WHERE ").unwrap().1, predicate);
         assert_eq!(statement.values.as_ref().unwrap().0, values);
@@ -197,7 +193,7 @@ async fn sqlite_native_keys_preserve_text_and_integer_string_identity() {
         .unwrap()
         .unwrap();
     assert_eq!((part.upload_id.as_str(), part.part_number), ("01", 1));
-    for number in ["01", "+1", "1.0", "2"] {
+    for number in ["01", "+1", "2"] {
         assert!(
             lookup::<pin_replica_observation::Entity, _>(&db, &[number])
                 .await
@@ -211,6 +207,14 @@ async fn sqlite_native_keys_preserve_text_and_integer_string_identity() {
                 .is_none()
         );
     }
+    assert!(matches!(
+        lookup::<pin_replica_observation::Entity, _>(&db, &["1.0"]).await,
+        Err(ManagementError::InvalidEvidence)
+    ));
+    assert!(matches!(
+        lookup::<multipart_part::Entity, _>(&db, &["01", "1.0"]).await,
+        Err(ManagementError::InvalidEvidence)
+    ));
     assert!(
         lookup::<multipart_part::Entity, _>(&db, &["1", "1"])
             .await

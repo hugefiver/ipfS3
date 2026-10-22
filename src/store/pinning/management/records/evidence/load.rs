@@ -60,11 +60,11 @@ impl Evidence {
         bytes: usize,
         work: SharedDecodeBudget,
     ) -> Result<Self> {
-        native::check_raw_inventory(db).await?;
         work.lock()
             .map_err(|_| ManagementError::InvalidEvidence)?
             .index_copy(&(scope, identity, keys))?;
         let mut evidence = Self {
+            scoped_reads: Vec::new(),
             scope: scope.into(),
             identity: identity.into(),
             rows: Arc::default(),
@@ -108,11 +108,11 @@ impl Evidence {
         candidates: &[(native::NativeRow, native::NativeRow)],
         work: SharedDecodeBudget,
     ) -> Result<Self> {
-        native::check_raw_inventory(db).await?;
         work.lock()
             .map_err(|_| ManagementError::InvalidEvidence)?
             .index_copy(&(scope, identity))?;
         let mut evidence = Self {
+            scoped_reads: Vec::new(),
             scope: scope.into(),
             identity: identity.into(),
             rows: Arc::default(),
@@ -146,21 +146,84 @@ impl Evidence {
         Ok(evidence)
     }
     async fn read_plans<C: ConnectionTrait>(&mut self, db: &C, plans: &[String]) -> Result<()> {
-        for plan in plans.iter().collect::<BTreeSet<_>>() {
-            self.reuse_exact(db, plan).await?;
-            let rows = self
-                .read(
-                    db,
-                    "database_scope=$1 AND plan_id=$2 AND kind='action'",
-                    vec![self.scope.clone().into(), plan.clone().into()],
-                )
-                .await?;
-            for row in rows {
-                let key = self.budget()?.key(&row)?;
-                self.insert(key, row)?;
+        use native::scope::{self, ScopeSpec, Selector};
+        let mut selectors = self
+            .rows
+            .keys()
+            .cloned()
+            .map(Selector::Exact)
+            .collect::<Vec<_>>();
+        selectors.extend(
+            plans
+                .iter()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .map(|plan| Selector::RecordMembers {
+                    database_scope: self.scope.clone(),
+                    plan_id: plan.clone(),
+                }),
+        );
+        let upgrading = crate::store::initialization::read_context::active(db).await?;
+        let mut budget = if upgrading {
+            native::meter::Budget::new(native::meter::Limits {
+                resident: 32 * 1024 * 1024,
+                ..native::meter::Limits::default()
+            })
+        } else {
+            self.budget()?.storage_budget()?
+        };
+        let result = async {
+            // Even an empty root selection validates the exact schema and DB binding.
+            let batches = if selectors.is_empty() {
+                vec![&selectors[..]]
+            } else {
+                selectors.chunks(128).collect()
+            };
+            for batch in batches {
+                let spec = ScopeSpec::new(batch.to_vec())?;
+                if !upgrading {
+                    budget = self.budget()?.storage_budget()?;
+                }
+                let read = scope::collect_scope(db, &spec, &mut budget).await;
+                if !upgrading {
+                    charge_storage_work(&budget, DecodeWork::shared(&self.work))?;
+                }
+                let read = read?;
+                if !upgrading
+                    && (read.database_scope != self.scope
+                        || read.database_identity != self.identity)
+                {
+                    return Err(ManagementError::Unauthorized);
+                }
+                for selector in spec.selectors() {
+                    if let Selector::Exact(key) = selector
+                        && !read.rows().contains_key(key)
+                    {
+                        return Err(ManagementError::Changed);
+                    }
+                }
+                for (key, row) in read.rows() {
+                    if let Some(previous) = self.rows.get(key) {
+                        if previous.as_ref() != row {
+                            return Err(ManagementError::Changed);
+                        }
+                        continue;
+                    }
+                    if native::value(row, "kind") != Some("action") {
+                        continue;
+                    }
+                    self.budget()?.copy(&(key, row))?;
+                    self.insert(key.clone(), row.clone())?;
+                }
+                self.scoped_reads.push(read);
             }
+            Ok(())
         }
-        Ok(())
+        .await;
+        if upgrading {
+            charge_storage_work(&budget, DecodeWork::shared(&self.work))?;
+        }
+        result
     }
     async fn reuse_exact<C: ConnectionTrait>(&mut self, db: &C, plan: &str) -> Result<()> {
         let candidates = archive::sql_candidates(&self.scope, plan, &mut *self.budget()?)?;
@@ -183,16 +246,23 @@ impl Evidence {
                     .ok_or(ManagementError::Budget)
             })?;
             self.budget()?.index_cells(row.len(), bytes)?;
-            let predicate = row
+            let mut predicate = row
                 .keys()
                 .enumerate()
                 .map(|(i, column)| format!("CAST(\"{column}\" AS TEXT) {equal} ${}", i + 1))
                 .collect::<Vec<_>>()
                 .join(" AND ");
-            let values = row
+            let mut values = row
                 .values()
                 .map(|value| value.clone().into())
                 .collect::<Vec<SqlValue>>();
+            for (column, value) in ["database_scope", "plan_id", "item_id", "kind"]
+                .iter()
+                .zip(&key.values)
+            {
+                values.push(value.clone().into());
+                predicate.push_str(&format!(" AND \"{column}\"=${}", values.len()));
+            }
             let matched = db
                 .query_one(Statement::from_sql_and_values(
                     backend,
@@ -219,6 +289,9 @@ impl Evidence {
         db: &C,
         plans: &[String],
     ) -> Result<()> {
+        if crate::store::initialization::read_context::active(db).await? {
+            return self.load_upgrade_dependencies(db, plans).await;
+        }
         let original = self.rows.clone();
         self.budget()?.index_copy(&(plans, &self.scope))?;
         let plans = plans.to_vec();
@@ -253,6 +326,69 @@ impl Evidence {
                 return Err(ManagementError::InvalidEvidence);
             }
             self.insert(key, rows.remove(0))?;
+        }
+        let plans = self
+            .rows
+            .keys()
+            .filter(|key| {
+                key.table == super::super::super::schema::RECORDS
+                    && key.values.len() == 4
+                    && key.values[0] == self.scope
+                    && key.values[3] == "action"
+            })
+            .map(|key| key.values[1].clone())
+            .collect::<BTreeSet<_>>();
+        for plan in plans {
+            if let Some(root) = self.archive_members(&self.scope, &plan).next() {
+                let review = archive::provider_review(self, root, &mut *self.budget()?)?;
+                if let Some(review) = review {
+                    super::super::inventory_review::hydrate(db, &review, &self.work).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+    /// Upgrade-only original supplier: complete same-plan membership and the
+    /// transitive source closure are fetched through length-first sliced reads.
+    /// The archive decoder still verifies coordinates, subjects, bytes and cycles.
+    async fn load_upgrade_dependencies<C: ConnectionTrait>(
+        &mut self,
+        db: &C,
+        plans: &[String],
+    ) -> Result<()> {
+        let mut pending = plans.iter().cloned().collect::<BTreeSet<_>>();
+        let mut visited = BTreeSet::new();
+        while let Some(plan) = pending.pop_first() {
+            if !visited.insert(plan.clone()) {
+                continue;
+            }
+            self.budget()?.copy(&plan)?;
+            let keys = dependencies(
+                &self.rows,
+                std::slice::from_ref(&plan),
+                &self.scope,
+                &mut *self.budget()?,
+            )?;
+            for key in keys {
+                if key.table != super::super::super::schema::RECORDS
+                    || key.values.len() != 4
+                    || key.values[0] != self.scope
+                    || key.values[3] != "action"
+                {
+                    return Err(ManagementError::InvalidEvidence);
+                }
+                let target_plan = &key.values[1];
+                if !self.rows.contains_key(&key) {
+                    self.read_plans(db, std::slice::from_ref(target_plan))
+                        .await?;
+                }
+                if !self.rows.contains_key(&key) {
+                    return Err(ManagementError::InvalidEvidence);
+                }
+                if !visited.contains(target_plan) {
+                    pending.insert(target_plan.clone());
+                }
+            }
         }
         Ok(())
     }

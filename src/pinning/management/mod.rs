@@ -9,10 +9,12 @@ mod semantics;
 mod summary;
 mod validate;
 pub(crate) use validate::SnapshotView;
+pub(crate) use validate::validate_historical_request;
 pub(crate) use validate::validate_snapshot_view_with_work;
 pub mod db_snapshot;
 pub mod evidence;
 pub mod local_config;
+pub mod retirement;
 pub mod wire;
 
 pub use model::*;

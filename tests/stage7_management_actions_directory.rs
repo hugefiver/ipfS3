@@ -81,7 +81,7 @@ async fn real_directory_and_hamt_proofs_allocate_cid_and_car_with_original_bound
         ))
         .await
         .unwrap();
-        let restored = records::load_confirmed_from_imported(&fixture.db, &fixture.auth, &imported)
+        let restored = support::archive::restore(&fixture.db, &fixture.auth, &request, &imported)
             .await
             .unwrap();
         assert!(restored == binding);

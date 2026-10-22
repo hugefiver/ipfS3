@@ -11,6 +11,38 @@ pub(super) const LOCATOR: &str = "S7L1\n";
 pub(super) const BINDING: &str = "S7B1\n";
 pub(super) const INVENTORY: &str = "S7I1\n";
 
+pub(super) fn provider_review(
+    source: &evidence::Evidence,
+    root: &native::NativeRow,
+    work: &mut DecodeBudget,
+) -> Result<Option<ReviewHandle>> {
+    let owner = read::owner(source, root, work)?;
+    let core = read::core(&owner, work)?;
+    if core.1.iter().any(|entry| {
+        matches!(
+            entry.capture,
+            Some(crate::pinning::management::Capture::Provider(_))
+        )
+    }) {
+        load_review(source, root, work).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+pub(super) fn encode_confirmed_proposal(
+    raw: &str,
+    now: DateTime<Utc>,
+    acks: &[String],
+    work: &mut DecodeBudget,
+) -> Result<String> {
+    let sections = Sections::parse(raw, work)?;
+    let head: Head = work.typed(&raw[sections.head])?;
+    let body = encoded(&(1, &head.3, &head.5, now, acks), work)?;
+    work.bytes(BINDING.len() + body.len())?;
+    Ok(format!("{BINDING}{body}"))
+}
+
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct Key(pub String, pub Vec<String>);
 impl Key {

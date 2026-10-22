@@ -1,9 +1,6 @@
 use crate::{
     pinning::identity::{CleanupMode, ProviderIdentity},
-    store::{
-        self,
-        pinning::{ledger, legacy_migration as migration},
-    },
+    store::{self, pinning::legacy_migration as migration},
 };
 use sea_orm::ConnectionTrait;
 use sea_orm_migration::{MigrationTrait, MigratorTrait};
@@ -21,7 +18,7 @@ impl MigratorTrait for Stage5 {
 
 #[tokio::test]
 async fn known_stage5_inventory_recognizes_missing_stage6_but_apply_requires_formal_upgrade() {
-    let db = store::connect_database("sqlite::memory:").await.unwrap();
+    let (_directory, db) = file_database().await;
     Stage5::up(&db, None).await.unwrap();
     let identity = ProviderIdentity {
         provider_id: "account".into(),
@@ -37,9 +34,7 @@ async fn known_stage5_inventory_recognizes_missing_stage6_but_apply_requires_for
         retired: false,
         cleanup: CleanupMode::Retain,
     };
-    ledger::register_route(&db, &identity.allocation_key(), &identity)
-        .await
-        .unwrap();
+    seed_historical_route(&db, &identity).await;
     db.execute_unprepared(
         "INSERT INTO pin_provider_usage(provider,reserved_bytes,reserved_pins) VALUES ('old',97,3)",
     )
@@ -56,7 +51,7 @@ async fn known_stage5_inventory_recognizes_missing_stage6_but_apply_requires_for
             .is_empty()
     );
     assert!(migration::apply(&db, &declaration, &old).await.is_err());
-    store::run_migrations(&db).await.unwrap();
+    upgrade(&db).await;
     assert!(
         migration::apply(&db, &declaration, &old).await.is_err(),
         "schema upgrade requires a new confirmation"
@@ -78,9 +73,34 @@ async fn unknown_columns_are_not_an_empty_inventory() {
 
 async fn native_catalog(last: &str) -> sea_orm::DatabaseConnection {
     let db = store::connect_database("sqlite::memory:").await.unwrap();
+    initialize_catalog(&db, last).await;
+    db
+}
+
+async fn file_database() -> (tempfile::TempDir, sea_orm::DatabaseConnection) {
+    let directory = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        directory
+            .path()
+            .join("legacy.sqlite")
+            .to_string_lossy()
+            .replace('\\', "/")
+    );
+    let db = store::connect_database(&url).await.unwrap();
+    (directory, db)
+}
+
+async fn file_catalog(last: &str) -> (tempfile::TempDir, sea_orm::DatabaseConnection) {
+    let (directory, db) = file_database().await;
+    initialize_catalog(&db, last).await;
+    (directory, db)
+}
+
+async fn initialize_catalog(db: &sea_orm::DatabaseConnection, last: &str) {
     let registry = store::migrator::Migrator::migrations();
     let count = registry.iter().position(|m| m.name() == last).unwrap() + 1;
-    store::migrator::Migrator::up(&db, Some(count as u32))
+    store::migrator::Migrator::up(db, Some(count as u32))
         .await
         .unwrap();
     let actual: Vec<String> = db
@@ -100,7 +120,55 @@ async fn native_catalog(last: &str) -> sea_orm::DatabaseConnection {
             .map(|m| m.name().to_owned())
             .collect::<Vec<_>>()
     );
-    db
+}
+
+async fn seed_historical_route(db: &sea_orm::DatabaseConnection, identity: &ProviderIdentity) {
+    db.execute(sea_orm::Statement::from_sql_and_values(db.get_database_backend(),
+        "INSERT INTO pin_provider_routes(provider,snapshot,display_name,retired) VALUES($1,$2,$3,$4)",
+        [identity.allocation_key().into(),serde_json::to_string(&identity.route_snapshot()).unwrap().into(),identity.display_name.clone().into(),identity.retired.into()]
+    )).await.unwrap();
+}
+
+async fn upgrade(db: &sea_orm::DatabaseConnection) {
+    if store::initialization::classify(db).await.unwrap()
+        == store::initialization::SchemaState::Current
+    {
+        return;
+    }
+    let source = "m20261013_000001_zip_root_logical_release";
+    let registry = store::migrator::Migrator::migrations();
+    let source_count = registry
+        .iter()
+        .position(|migration| migration.name() == source)
+        .unwrap()
+        + 1;
+    let applied = db
+        .query_all(sea_orm::Statement::from_string(
+            db.get_database_backend(),
+            "SELECT version FROM seaql_migrations",
+        ))
+        .await
+        .unwrap()
+        .len();
+    if applied < source_count {
+        store::migrator::Migrator::up(db, Some((source_count - applied) as u32))
+            .await
+            .unwrap();
+    }
+    let (scope, identity) = store::pinning::management::native::scope::binding(db)
+        .await
+        .unwrap();
+    store::initialization::upgrade_existing(
+        db,
+        store::initialization::UpgradeRequest {
+            database_scope: &scope,
+            native_identity: &identity,
+            source_version: source,
+            target_version: store::pinning::management::schema::VERSION,
+        },
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

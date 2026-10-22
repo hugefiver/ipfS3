@@ -329,131 +329,13 @@ pub(crate) fn capture(
                 requirement_routes,
             })))
         }
-        Subject::Provider { route: identity } => {
-            route(snapshot, identity)?;
-            let mut inventory = snapshot
-                .inventories
-                .iter()
-                .find(|inventory| inventory.provider_id == identity.provider_id)
-                .cloned()
-                .ok_or(SafeError::IncompleteInventory)?;
-            inventory.leases.sort_by(|a, b| a.id.cmp(&b.id));
-            inventory.root_reference_ids.sort();
-            let owns_domain = |remote: &RemoteSnapshot| {
-                snapshot.routes.iter().any(|route| {
-                    route.identity.provider_id == identity.provider_id
-                        && route.identity.remote_key(&remote.key.cid) == remote.key
-                })
-            };
-            let mut remotes: Vec<_> = snapshot
-                .remotes
-                .iter()
-                .filter(|remote| {
-                    remote.route.provider_id == identity.provider_id || owns_domain(remote)
-                })
-                .cloned()
-                .collect();
-            let mut historical_remotes: Vec<_> = snapshot
-                .historical_remotes
-                .iter()
-                .filter(|remote| {
-                    remote.route.provider_id == identity.provider_id || owns_domain(remote)
-                })
-                .cloned()
-                .collect();
-            let mut projected = snapshot.targets.to_vec();
-            if let Some(frame) = snapshot.rows {
-                for target in &mut projected {
-                    crate::store::pinning::management::actions::points::project_target_rows(
-                        frame,
-                        snapshot
-                            .native_frame
-                            .is_none_or(|frame| frame.has_private_material()),
-                        target,
-                        points,
-                        snapshot.work.ok_or(SafeError::InvalidInput)?,
-                    )
-                    .map_err(|_| SafeError::UnknownEvidence)?;
-                }
-                // Only exact committed points can resolve the old projection's
-                // missing destination route. Other orphan/private/unknown debt
-                // remains incomplete; no receipt means no attribution upgrade.
-                let point_resolved = snapshot
-                    .targets
-                    .iter()
-                    .zip(&projected)
-                    .any(|(before, after)| before.route.is_none() && after.route.is_some());
-                if point_resolved
-                    && projected.iter().all(|target| target.route.is_some())
-                    && inventory
-                        .leases
-                        .iter()
-                        .all(|lease| projected.iter().any(|target| target.lease.id == lease.id))
-                    && inventory.root_reference_ids.is_empty()
-                    && snapshot.unknown_resources.is_empty()
-                    && frame.table("remote_pin_ledger").is_some_and(|table| {
-                        table.rows.iter().all(|row| {
-                            crate::store::pinning::management::native::value(row, "route")
-                                .and_then(|route| {
-                                    serde_json::from_str::<
-                                        crate::pinning::identity::ProviderRouteSnapshot,
-                                    >(route)
-                                    .ok()
-                                })
-                                .is_some()
-                        })
-                    })
-                {
-                    inventory.attribution_complete = true;
-                }
-            }
-            let mut targets: Vec<_> = projected
-                .iter()
-                .filter(|target| {
-                    target
-                        .route
-                        .as_ref()
-                        .is_none_or(|route| route.provider_id == identity.provider_id)
-                        || target.frozen_candidates.iter().any(|candidate| {
-                            candidate
-                                .route
-                                .as_ref()
-                                .is_some_and(|route| route.provider_id == identity.provider_id)
-                        })
-                })
-                .cloned()
-                .collect();
-            let mut routes: Vec<_> = snapshot
-                .routes
-                .iter()
-                .filter(|route| {
-                    route.identity.provider_id == identity.provider_id
-                        || remotes
-                            .iter()
-                            .chain(&historical_remotes)
-                            .any(|remote| remote.route == route.identity)
-                })
-                .cloned()
-                .collect();
-            routes.sort_by(|a, b| a.identity.cmp(&b.identity));
-            targets.sort_by(|a, b| a.id.cmp(&b.id));
-            remotes.sort_by(|a, b| a.key.cmp(&b.key));
-            historical_remotes.sort_by(|a, b| (&a.key, a.epoch).cmp(&(&b.key, b.epoch)));
-            let capture = RetirementCapture {
-                inventory,
-                routes,
-                targets,
-                remotes,
-                historical_remotes,
-                root_references: super::root_references::selected(request, snapshot)?,
-            };
-            validate_retirement_selection(request, &capture, snapshot, points)?;
-            Ok(Capture::Provider(Box::new(capture)))
-        }
+        // Provider planning consumes a sealed disk inventory through
+        // dry_run_retirement; a local Snapshot cannot prove global membership.
+        Subject::Provider { .. } => Err(SafeError::InvalidActionScope),
     }
 }
 
-fn validate_retirement_selection(
+pub(crate) fn validate_retirement_selection(
     request: &ItemRequest,
     capture: &RetirementCapture,
     snapshot: &SnapshotView<'_>,
@@ -486,6 +368,7 @@ fn validate_retirement_selection(
         .and_then(|row| crate::store::pinning::management::native::value(row, "provider"))
         .ok_or(SafeError::UnknownEvidence)?;
     let active = capture
+        .mutation_scope
         .targets
         .iter()
         .filter(|target| {

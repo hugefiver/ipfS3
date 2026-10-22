@@ -219,14 +219,9 @@ async fn actual_grant_prefix_and_entry_local_job_birth_restore_across_consumers(
         .unwrap()
         .unwrap();
     assert_eq!(advanced.epoch, initial.epoch + 1);
-    records::write_executed_action_in_transaction(
-        &fixture.auth,
-        &fixture.binding,
-        &creation,
-        before,
-    )
-    .await
-    .unwrap();
+    publish_executed(&fixture.auth, &fixture.binding, &creation, before)
+        .await
+        .unwrap();
     let prior = pin_job::Entity::find().all(&tx).await.unwrap();
     let renewal = batch
         .execute_entry(&fixture.binding.confirmation.bindings[1])
@@ -267,14 +262,9 @@ async fn actual_grant_prefix_and_entry_local_job_birth_restore_across_consumers(
             Some(job)
         );
     }
-    records::write_executed_action_in_transaction(
-        &fixture.auth,
-        &fixture.binding,
-        &renewal,
-        before,
-    )
-    .await
-    .unwrap();
+    publish_executed(&fixture.auth, &fixture.binding, &renewal, before)
+        .await
+        .unwrap();
     tx.rollback().await.unwrap();
     let applied = super::super::apply(
         &fixture.db,
@@ -456,14 +446,9 @@ async fn preceding_entry_observation_keeps_its_original_authority_at_renewal() {
         .await
         .unwrap()
         .unwrap();
-    records::write_executed_action_in_transaction(
-        &fixture.auth,
-        &fixture.binding,
-        &creation,
-        before,
-    )
-    .await
-    .unwrap();
+    publish_executed(&fixture.auth, &fixture.binding, &creation, before)
+        .await
+        .unwrap();
     let renewal = batch
         .execute_entry(&fixture.binding.confirmation.bindings[1])
         .await
@@ -490,14 +475,9 @@ async fn preceding_entry_observation_keeps_its_original_authority_at_renewal() {
             .as_ref(),
         Some(&native)
     );
-    records::write_executed_action_in_transaction(
-        &fixture.auth,
-        &fixture.binding,
-        &renewal,
-        before,
-    )
-    .await
-    .unwrap();
+    publish_executed(&fixture.auth, &fixture.binding, &renewal, before)
+        .await
+        .unwrap();
     assert!(
         super::super::job_authority::lookup(&tx, &native)
             .await
@@ -719,6 +699,10 @@ async fn reject_stored_result(
     result: &str,
 ) {
     let tx = fixture.db.begin().await.unwrap();
+    // Simulate out-of-band corruption; the guard and row are restored together.
+    tx.execute_unprepared("DROP TRIGGER s75_applied_no_update")
+        .await
+        .unwrap();
     tx.execute(Statement::from_sql_and_values(tx.get_database_backend(),"UPDATE pin_management_records SET result=$1 WHERE database_scope=$2 AND plan_id=$3 AND item_id=$4 AND kind='action'",[result.into(),key.values[0].clone().into(),key.values[1].clone().into(),key.values[2].clone().into()])).await.unwrap();
     assert!(
         records::lookup_trusted_committed(&tx, &fixture.auth, &fixture.binding, &key.values[2])
@@ -781,14 +765,9 @@ async fn executed_writer_rejects_native_birth_drift() {
         .await
         .unwrap();
         assert!(
-            records::write_executed_action_in_transaction(
-                &fixture.auth,
-                &fixture.binding,
-                &executed,
-                before
-            )
-            .await
-            .is_err()
+            publish_executed(&fixture.auth, &fixture.binding, &executed, before)
+                .await
+                .is_err()
         );
         tx.execute(Statement::from_sql_and_values(
             tx.get_database_backend(),
@@ -807,14 +786,9 @@ async fn executed_writer_rejects_native_birth_drift() {
     .await
     .unwrap();
     assert!(
-        records::write_executed_action_in_transaction(
-            &fixture.auth,
-            &fixture.binding,
-            &executed,
-            before
-        )
-        .await
-        .is_err()
+        publish_executed(&fixture.auth, &fixture.binding, &executed, before)
+            .await
+            .is_err()
     );
     tx.execute(Statement::from_sql_and_values(
         tx.get_database_backend(),
@@ -823,14 +797,9 @@ async fn executed_writer_rejects_native_birth_drift() {
     ))
     .await
     .unwrap();
-    records::write_executed_action_in_transaction(
-        &fixture.auth,
-        &fixture.binding,
-        &executed,
-        before,
-    )
-    .await
-    .unwrap();
+    publish_executed(&fixture.auth, &fixture.binding, &executed, before)
+        .await
+        .unwrap();
     assert!(
         records::lookup_trusted_committed(&tx, &fixture.auth, &fixture.binding, "b-renew")
             .await
@@ -865,26 +834,16 @@ async fn quota_blocked_prefix_preserves_exact_renewal_facts() {
         .execute_entry(&fixture.binding.confirmation.bindings[0])
         .await
         .unwrap();
-    records::write_executed_action_in_transaction(
-        &fixture.auth,
-        &fixture.binding,
-        &creation,
-        before,
-    )
-    .await
-    .unwrap();
+    publish_executed(&fixture.auth, &fixture.binding, &creation, before)
+        .await
+        .unwrap();
     let renewal = batch
         .execute_entry(&fixture.binding.confirmation.bindings[1])
         .await
         .unwrap();
-    records::write_executed_action_in_transaction(
-        &fixture.auth,
-        &fixture.binding,
-        &renewal,
-        before,
-    )
-    .await
-    .unwrap();
+    publish_executed(&fixture.auth, &fixture.binding, &renewal, before)
+        .await
+        .unwrap();
     let applied = ApplyResult {
         replayed: true,
         items: vec![
@@ -914,7 +873,7 @@ async fn kept_without_jobs_restores_exact_receipt() {
         .await
         .unwrap();
     assert!(kept.action_view().jobs.is_empty());
-    records::write_executed_action_in_transaction(&fixture.auth, &fixture.binding, &kept, before)
+    publish_executed(&fixture.auth, &fixture.binding, &kept, before)
         .await
         .unwrap();
     let action = kept.action_view().clone();

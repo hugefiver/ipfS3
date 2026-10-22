@@ -180,16 +180,19 @@ async fn help_and_errors_never_open_a_missing_database_or_contact_remote_service
 
 #[tokio::test]
 async fn invalid_bounded_json_is_rejected_before_config_loading() {
+    let fixture = support::Fixture::new(false).await;
+    let before = fixture.frame().await;
     let directory = tempfile::tempdir().unwrap();
     let config = directory.path().join("invalid.toml");
     std::fs::write(&config, "invalid SECRET_CONFIGURATION").unwrap();
     let input = directory.path().join("input.json");
-    let oversized = vec![b' '; ipfs_s3_gateway::pinning::management::wire::MAX_WIRE_BYTES + 1];
+    let oversized = vec![b' '; ipfs_s3_gateway::pinning::management::wire::v3::FRAME_BYTES + 1];
     let deep = format!("{}0{}", "[".repeat(66), "]".repeat(66));
     for bytes in [
         b"{".to_vec(),
         oversized,
         deep.into_bytes(),
+        br#"{"plan_id":"one","items":[]}"#.to_vec(),
         br#"{"plan_id":"one","plan_id":"two","items":[]}"#.to_vec(),
         br#"{"plan_id":"one","items":[],"authority":true}"#.to_vec(),
     ] {
@@ -201,13 +204,17 @@ async fn invalid_bounded_json_is_rejected_before_config_loading() {
             }
             args.push(input.to_str().unwrap());
             let result = support::output(&mut support::command(&config, &args)).await;
+            let valid_config_result = support::output(&mut fixture.command(&args)).await;
             assert!(!result.status.success());
+            assert_eq!(result.status.code(), valid_config_result.status.code());
+            assert_eq!(result.stdout, valid_config_result.stdout);
+            assert_eq!(result.stderr, valid_config_result.stderr);
             let error = String::from_utf8_lossy(&result.stderr);
-            assert!(error.contains("management input invalid"));
             assert!(!error.contains("SECRET_CONFIGURATION"));
-            assert!(!error.contains("local configuration load failed"));
         }
     }
+    assert!(fixture.frame().await == before);
+    assert_eq!(fixture.remote_calls().await, 0);
 }
 
 #[tokio::test]
@@ -279,10 +286,16 @@ async fn dry_run_and_public_export_leave_database_bytes_and_native_frame_unchang
     assert_eq!(fixture.remote_calls().await, 0);
     fixture.assert_redacted(&result);
     let wire = std::fs::read(&artifact).unwrap();
-    assert!(ipfs_s3_gateway::pinning::management::wire::decode_plan(&wire).is_ok());
+    let (head, _, _) = ipfs_s3_gateway::pinning::management::wire::v3::document::inspect(
+        std::io::Cursor::new(wire.as_slice()),
+        ipfs_s3_gateway::pinning::management::wire::v3::Projection::Review,
+        support::wire_budget(),
+    )
+    .unwrap();
     assert!(!String::from_utf8_lossy(&wire).contains(support::PRIVATE_METADATA));
     assert!(!String::from_utf8_lossy(&wire).contains(&fixture.server.uri()));
-    assert!(serde_json::from_slice::<serde_json::Value>(&wire).unwrap()["confirmation"].is_null());
+    assert!(head.acknowledgements.is_none());
+    assert!(head.expires_at.is_none());
 
     let result = support::output(&mut fixture.command(&[
         "--pinning-manage",

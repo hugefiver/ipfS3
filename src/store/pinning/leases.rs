@@ -1606,7 +1606,7 @@ pub async fn apply_remote_status<C: ConnectionTrait>(
     db: &C,
     update: RemoteStatusUpdate<'_>,
 ) -> AppResult<RemoteStatusApplyResult> {
-    apply_remote_status_inner(db, update, false, None, None).await
+    apply_remote_status_inner(db, update, false, None, None, None, None).await
 }
 
 /// Applies a live worker observation with monotonic status protection for one request identity.
@@ -1614,17 +1614,7 @@ pub async fn apply_worker_remote_status<C: ConnectionTrait>(
     db: &C,
     update: RemoteStatusUpdate<'_>,
 ) -> AppResult<RemoteStatusApplyResult> {
-    apply_remote_status_inner(db, update, true, None, None).await
-}
-
-/// A claimed Submit can follow its own queued response even when the allocation
-/// route has since retired or changed strategy. This does not grant admission.
-pub(crate) async fn apply_claimed_worker_remote_status<C: ConnectionTrait>(
-    db: &C,
-    update: RemoteStatusUpdate<'_>,
-    job: &pin_job::Model,
-) -> AppResult<RemoteStatusApplyResult> {
-    apply_remote_status_inner(db, update, true, None, Some(job)).await
+    apply_remote_status_inner(db, update, true, None, None, None, None).await
 }
 
 /// Applies a remote-scoped Reconcile observation only at the job's exact remote epoch.
@@ -1635,20 +1625,16 @@ pub async fn apply_reconcile_remote_status<C: ConnectionTrait>(
     expected_remote_epoch: i64,
     update: RemoteStatusUpdate<'_>,
 ) -> AppResult<RemoteStatusApplyResult> {
-    apply_remote_status_inner(db, update, true, Some(expected_remote_epoch), None).await
-}
-
-/// Internal worker path: the caller fences the claim in the same transaction.
-/// Reconcile can transfer only an existing request's read-only follow-up.
-pub(crate) async fn apply_claimed_reconcile_remote_status<C: ConnectionTrait>(
-    db: &C,
-    update: RemoteStatusUpdate<'_>,
-    job: &pin_job::Model,
-) -> AppResult<RemoteStatusApplyResult> {
-    let Some(epoch) = job.expected_remote_epoch else {
-        return Ok(RemoteStatusApplyResult::StaleRequest);
-    };
-    apply_remote_status_inner(db, update, true, Some(epoch), Some(job)).await
+    apply_remote_status_inner(
+        db,
+        update,
+        true,
+        Some(expected_remote_epoch),
+        None,
+        None,
+        None,
+    )
+    .await
 }
 
 async fn apply_remote_status_inner<C: ConnectionTrait>(
@@ -1657,31 +1643,36 @@ async fn apply_remote_status_inner<C: ConnectionTrait>(
     enforce_monotonic_status: bool,
     expected_remote_epoch: Option<i64>,
     observation_job: Option<&pin_job::Model>,
+    mut prelocked: Option<OrderedDesiredLifecycleSnapshotOutcome>,
+    authority: Option<&super::management::actions::job_authority::CompletionReader<'_>>,
 ) -> AppResult<RemoteStatusApplyResult> {
+    let holds_snapshot = prelocked.is_some();
     for attempt in 0..REMOTE_STATUS_WRITE_RETRY_LIMIT {
-        let snapshot =
-            match ordered_desired_lifecycle_snapshot(db, update.provider, update.cid).await {
-                Ok(OrderedDesiredLifecycleSnapshotOutcome::Current(snapshot)) => snapshot,
-                Ok(OrderedDesiredLifecycleSnapshotOutcome::MissingRemote) => {
-                    return Ok(RemoteStatusApplyResult::StaleRequest);
-                }
-                Ok(OrderedDesiredLifecycleSnapshotOutcome::Stale) => {
-                    retry_ordered_lifecycle_or_rollback(
-                        db.get_database_backend(),
-                        "remote status ordered lifecycle snapshot",
-                    )?;
-                    remote_status_retry_delay(attempt).await;
-                    continue;
-                }
-                Err(error)
-                    if db.get_database_backend() == DatabaseBackend::Sqlite
-                        && is_sqlite_contention(&error.to_string()) =>
-                {
-                    remote_status_retry_delay(attempt).await;
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
+        let snapshot = match match prelocked.take() {
+            Some(snapshot) => Ok(snapshot),
+            None => ordered_desired_lifecycle_snapshot(db, update.provider, update.cid).await,
+        } {
+            Ok(OrderedDesiredLifecycleSnapshotOutcome::Current(snapshot)) => snapshot,
+            Ok(OrderedDesiredLifecycleSnapshotOutcome::MissingRemote) => {
+                return Ok(RemoteStatusApplyResult::StaleRequest);
+            }
+            Ok(OrderedDesiredLifecycleSnapshotOutcome::Stale) => {
+                retry_ordered_lifecycle_or_rollback(
+                    db.get_database_backend(),
+                    "remote status ordered lifecycle snapshot",
+                )?;
+                remote_status_retry_delay(attempt).await;
+                continue;
+            }
+            Err(error)
+                if db.get_database_backend() == DatabaseBackend::Sqlite
+                    && is_sqlite_contention(&error.to_string()) =>
+            {
+                remote_status_retry_delay(attempt).await;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
 
         if expected_remote_epoch.is_some_and(|expected| snapshot.remote.epoch != expected) {
             return Ok(RemoteStatusApplyResult::StaleRequest);
@@ -1695,10 +1686,16 @@ async fn apply_remote_status_inner<C: ConnectionTrait>(
         {
             return Ok(RemoteStatusApplyResult::StaleRequest);
         }
-        if let Some(job) = observation_job
-            && !super::management::actions::job_authority::projection_allowed(db, job).await?
-        {
-            return Ok(RemoteStatusApplyResult::StaleRequest);
+        if let Some(job) = observation_job {
+            let allowed = match authority {
+                Some(reader) => reader.projection_allowed().await?,
+                None => {
+                    super::management::actions::job_authority::projection_allowed(db, job).await?
+                }
+            };
+            if !allowed {
+                return Ok(RemoteStatusApplyResult::StaleRequest);
+            }
         }
 
         #[cfg(test)]
@@ -1706,29 +1703,38 @@ async fn apply_remote_status_inner<C: ConnectionTrait>(
             pause_after_remote_status_read(update.provider, update.cid).await;
         }
 
-        let (failure, remote) = match apply_remote_status_write(
+        let write_outcome = apply_remote_status_write(
             db,
             &update,
             &snapshot.remote,
             enforce_monotonic_status
-                && !crate::store::entities::pin_replica_observation::receipt::retained_cluster(
-                    db,
-                    update.provider,
-                    update.cid,
-                )
-                .await?,
-            snapshot
-                .desired
-                .iter()
-                .any(|desired| desired.lease.provider_mode == "all"),
+                && !{
+                    crate::store::entities::pin_replica_observation::receipt::retained_cluster(
+                        db,
+                        update.provider,
+                        update.cid,
+                    )
+                    .await?
+                },
+            {
+                snapshot
+                    .desired
+                    .iter()
+                    .any(|desired| desired.lease.provider_mode == "all")
+            },
         )
-        .await?
-        {
+        .await?;
+        let (failure, remote) = match write_outcome {
             RemoteStatusWriteOutcome::Applied { failure, remote } => (failure, remote),
             RemoteStatusWriteOutcome::StaleRequest => {
                 return Ok(RemoteStatusApplyResult::StaleRequest);
             }
             RemoteStatusWriteOutcome::Retry => {
+                if holds_snapshot {
+                    return Err(stale_lifecycle_error(
+                        "locked worker status compare-and-set",
+                    ));
+                }
                 retry_ordered_lifecycle_or_rollback(
                     db.get_database_backend(),
                     "remote status compare-and-set",
@@ -1737,7 +1743,6 @@ async fn apply_remote_status_inner<C: ConnectionTrait>(
                 continue;
             }
         };
-
         let historical_poll = if matches!(remote.status.as_str(), REMOTE_QUEUED | REMOTE_PINNING)
             && remote.request_id.as_deref() == Some(update.request_id)
         {
@@ -4035,6 +4040,7 @@ pub async fn begin_remote_unpin<C: ConnectionTrait>(
 }
 
 /// Cancels one active lease, preserves its rows, and only starts epoch-bound remote cleanup.
+/// The caller's lifecycle transaction publishes cleanup jobs and their invocation evidence together.
 pub async fn cancel_lease<C: ConnectionTrait>(
     db: &C,
     lease_id: &str,
@@ -5486,7 +5492,7 @@ async fn project_prelocked_desired_target_with_work<C: ConnectionTrait>(
                 ) else {
                     unreachable!()
                 };
-                ensure_prelocked_target_job_with_work(db, job, now, work).await?;
+                ensure_prelocked_target_job_with_work(db, job, access, now, work).await?;
             }
             Ok(TargetProjection::Pinned)
         }
@@ -5537,7 +5543,7 @@ async fn project_prelocked_desired_target_with_work<C: ConnectionTrait>(
             work.copy(&job.id).map_err(work_error)?;
             let poll_job_id = job.id.clone();
             if schedule_work {
-                ensure_prelocked_target_job_with_work(db, job, now, work).await?;
+                ensure_prelocked_target_job_with_work(db, job, access, now, work).await?;
             }
             Ok(TargetProjection::Submitted { poll_job_id })
         }
@@ -5588,7 +5594,7 @@ async fn project_prelocked_desired_target_with_work<C: ConnectionTrait>(
                     submit_job_id: blocking,
                 });
             }
-            ensure_prelocked_target_job_with_work(db, job, now, work).await?;
+            ensure_prelocked_target_job_with_work(db, job, access, now, work).await?;
             Ok(TargetProjection::Waiting { submit_job_id })
         }
         REMOTE_FAILED => {
@@ -5627,27 +5633,63 @@ async fn project_prelocked_desired_target_with_work<C: ConnectionTrait>(
     }
 }
 
-/// Persists work for a canonical target that was selected from the caller's complete lifecycle
-/// snapshot. Unlike the generic job helpers, this intentionally does not re-query canonical
-/// siblings after the lease → target → remote frontier has been acquired.
-/// Prelock the same frontier used for status application before replica append.
-pub(crate) async fn lock_replica_observation_lifecycle<C: ConnectionTrait>(
-    db: &C,
-    provider: &str,
-    cid: &str,
-) -> AppResult<()> {
-    if matches!(
-        ordered_desired_lifecycle_snapshot(db, provider, cid).await?,
-        OrderedDesiredLifecycleSnapshotOutcome::Stale
-    ) {
-        return Err(stale_lifecycle_error("replica lifecycle frontier"));
-    }
-    Ok(())
+/// One claimed observation's complete lifecycle frontier, bound to its caller's transaction.
+pub(crate) struct LockedWorkerObservation<'a> {
+    db: &'a sea_orm::DatabaseTransaction,
+    job: &'a pin_job::Model,
+    snapshot: OrderedDesiredLifecycleSnapshotOutcome,
 }
 
+impl LockedWorkerObservation<'_> {
+    pub(crate) async fn apply(
+        self,
+        update: RemoteStatusUpdate<'_>,
+        authority: &super::management::actions::job_authority::CompletionReader<'_>,
+    ) -> AppResult<RemoteStatusApplyResult> {
+        if !authority.is_bound(self.db, self.job)
+            || self.job.provider != update.provider
+            || self.job.cid != update.cid
+        {
+            return Err(invalid("locked observation resource mismatch"));
+        }
+        let epoch = if self.job.operation == "reconcile" {
+            let Some(epoch) = self.job.expected_remote_epoch else {
+                return Ok(RemoteStatusApplyResult::StaleRequest);
+            };
+            Some(epoch)
+        } else {
+            None
+        };
+        apply_remote_status_inner(
+            self.db,
+            update,
+            true,
+            epoch,
+            Some(self.job),
+            Some(self.snapshot),
+            Some(authority),
+        )
+        .await
+    }
+}
+
+pub(crate) async fn lock_worker_observation_lifecycle<'a>(
+    db: &'a sea_orm::DatabaseTransaction,
+    job: &'a pin_job::Model,
+) -> AppResult<LockedWorkerObservation<'a>> {
+    let snapshot = ordered_desired_lifecycle_snapshot(db, &job.provider, &job.cid).await?;
+    if matches!(snapshot, OrderedDesiredLifecycleSnapshotOutcome::Stale) {
+        return Err(stale_lifecycle_error("replica lifecycle frontier"));
+    }
+    Ok(LockedWorkerObservation { db, job, snapshot })
+}
+
+/// Persists work from a complete lifecycle snapshot without re-querying canonical siblings
+/// after the lease → target → remote frontier has been acquired.
 async fn ensure_prelocked_target_job_with_work<C: ConnectionTrait>(
     db: &C,
     job: jobs::TargetPinJob,
+    access: ProjectionAccess,
     now: DateTimeUtc,
     work: super::management::records::DecodeWork<'_>,
 ) -> AppResult<()> {
@@ -5655,7 +5697,7 @@ async fn ensure_prelocked_target_job_with_work<C: ConnectionTrait>(
         jobs::TargetJobOperation::Submit => Some("ready"),
         jobs::TargetJobOperation::Poll => None,
     };
-    if submit_phase.is_some() {
+    if submit_phase.is_some() && matches!(access, ProjectionAccess::Observation { .. }) {
         quota::lock_allocation_admission_with_work(db, &job.provider, work).await?;
     }
     if db.get_database_backend() == DatabaseBackend::Postgres {
@@ -5676,6 +5718,9 @@ async fn ensure_prelocked_target_job_with_work<C: ConnectionTrait>(
         jobs::insert_new_job_with_work(db, NewPinJob::Target(job), now, work).await?;
         return Ok(());
     };
+    if submit_phase.is_some() && matches!(access, ProjectionAccess::Admission) {
+        quota::lock_allocation_admission_with_work(db, &job.provider, work).await?;
+    }
     match existing.state.as_str() {
         JOB_PENDING | JOB_RUNNING => Ok(()),
         JOB_DONE => {

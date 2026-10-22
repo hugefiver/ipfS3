@@ -7,15 +7,20 @@ use crate::{
     },
     store::pinning::management::{
         ManagementError, Result,
-        native::{self, NativeRow},
+        native::{
+            self, NativeRow,
+            meter::{Budget, Limits},
+        },
         records::{self, LocalAuthorization, RecordKind, RecordState, RecordWrite},
     },
 };
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
-use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement, TransactionTrait};
+use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
+
+mod scope;
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -226,9 +231,17 @@ pub async fn prepare(
     } else {
         Some(legacy_binding.clone())
     };
+    let content_scope = scope::content(&request.identity)?;
+    let mut budget = Budget::new(Limits {
+        elapsed: request
+            .ttl
+            .to_std()
+            .map_err(|_| ManagementError::InvalidEvidence)?,
+        ..Limits::default()
+    });
     authorization.check(db).await?;
-    let tx = db.begin().await.map_err(|_| ManagementError::Database)?;
-    let frame = native::capture(&tx).await?;
+    let tx = scope::read_transaction(db).await?;
+    let frame = scope::capture(&tx, &content_scope, &mut budget).await?;
     let (object_tuple, version_tuple) = safe_object(&frame, &request.identity)?;
     let full_before = (
         frame
@@ -286,10 +299,10 @@ pub async fn prepare(
         if node != old.source.node_identity {
             return Err(ManagementError::Changed);
         }
-        let tx = db.begin().await.map_err(|_| ManagementError::Database)?;
+        let tx = scope::read_transaction(db).await?;
         authorization.check(&tx).await?;
-        let fresh = native::capture(&tx).await?;
-        if fresh.evidence_inventory() != frame.evidence_inventory()
+        let fresh = scope::capture(&tx, &content_scope, &mut budget).await?;
+        if fresh != frame
             || safe_object(&fresh, &request.identity)?
                 != (old.object_tuple.clone(), old.version_tuple.clone())
         {
@@ -386,13 +399,13 @@ pub async fn prepare(
     }
     let tx = db.begin().await.map_err(|_| ManagementError::Database)?;
     if tx.get_database_backend() == DatabaseBackend::Sqlite {
-        tx.execute_unprepared("UPDATE pin_management_records SET database_scope=database_scope WHERE kind='database_scope'").await.map_err(|_| ManagementError::Database)?;
+        native::scope::writer_boundary(&tx).await?;
     } else {
         tx.execute_unprepared("LOCK TABLE objects,object_versions,pin_management_records IN SHARE ROW EXCLUSIVE MODE NOWAIT").await.map_err(|_| ManagementError::Database)?;
     }
     authorization.check(&tx).await?;
-    let fresh = native::capture(&tx).await?;
-    if fresh.evidence_inventory() != frame.evidence_inventory()
+    let fresh = scope::capture(&tx, &content_scope, &mut budget).await?;
+    if fresh != frame
         || safe_object(&fresh, &request.identity)? != (object_tuple.clone(), version_tuple.clone())
     {
         return Err(ManagementError::Changed);
@@ -445,7 +458,11 @@ pub async fn prepare(
         },
     )
     .await?;
-    native::capture(&tx).await?;
+    #[cfg(test)]
+    tests::after_attestation_insert(&tx).await;
+    if scope::capture(&tx, &content_scope, &mut budget).await? != frame {
+        return Err(ManagementError::Changed);
+    }
     let commit_now = crate::store::database_clock::database_now(&tx)
         .await
         .map_err(|_| ManagementError::Database)?;
@@ -456,6 +473,9 @@ pub async fn prepare(
     Ok(attestation)
 }
 
+#[cfg(test)]
+mod tests;
+
 async fn load<C: ConnectionTrait>(
     db: &C,
     auth: &LocalAuthorization,
@@ -465,10 +485,16 @@ async fn load<C: ConnectionTrait>(
     expected_before: &(NativeRow, NativeRow),
     directory: bool,
 ) -> Result<Option<ReadAttestation>> {
-    let rows=db.query_all(Statement::from_sql_and_values(db.get_database_backend(),"SELECT principal,native_identity,binding,native_before,result FROM pin_management_records WHERE database_scope=$1 AND plan_id=$2 AND kind='evidence_preparation'",[auth.database_scope().into(),id.into()])).await.map_err(|_| ManagementError::Database)?;
-    if rows.len() > 1 {
-        return Err(ManagementError::InvalidEvidence);
-    }
+    let work = records::SharedDecodeBudget::default();
+    let (rows, _) = records::bounded_projection(
+        db,
+        "FROM pin_management_records WHERE database_scope=$1 AND plan_id=$2 AND kind='evidence_preparation'",
+        &[("principal", "principal"), ("native_identity", "native_identity"), ("binding", "binding"), ("native_before", "native_before"), ("result", "result")],
+        "item_id",
+        vec![auth.database_scope().into(), id.into()],
+        (1, native::MAX_BYTES),
+        records::DecodeWork::shared(&work),
+    ).await?;
     let row = rows.into_iter().next();
     let Some(row) = row else { return Ok(None) };
     if row
@@ -491,16 +517,20 @@ async fn load<C: ConnectionTrait>(
     let before: String = row
         .try_get("", "native_before")
         .map_err(|_| ManagementError::InvalidEvidence)?;
-    let original: (NativeRow, NativeRow) =
-        serde_json::from_str(&before).map_err(|_| ManagementError::InvalidEvidence)?;
+    let original: (NativeRow, NativeRow) = work
+        .lock()
+        .map_err(|_| ManagementError::InvalidEvidence)?
+        .typed(&before)?;
     if &original != expected_before {
         return Err(ManagementError::Changed);
     }
     let result: String = row
         .try_get("", "result")
         .map_err(|_| ManagementError::InvalidEvidence)?;
-    let (mut attestation, endpoint): (ReadAttestation, String) =
-        serde_json::from_str(&result).map_err(|_| ManagementError::InvalidEvidence)?;
+    let (mut attestation, endpoint): (ReadAttestation, String) = work
+        .lock()
+        .map_err(|_| ManagementError::InvalidEvidence)?
+        .typed(&result)?;
     // A legacy RID can only replay its legacy proof; today's configuration must
     // never reinterpret it as a new DAG-byte reservation or recapture its body.
     let expected = if directory && stored_binding == legacy_binding {

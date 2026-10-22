@@ -1,30 +1,16 @@
-//! Stage 7 read-only native database reader, NOT the management executor.
-//!
-//! The caller supplies an existing connection, effective validated configuration,
-//! and an explicit, authorized manifest. This leaf opens no connections, performs
-//! no migrations, changes no pool/session settings and issues no business writes.
-//! SQLite uses BEGIN + SELECT; PostgreSQL uses REPEATABLE READ READ ONLY. Owned
-//! evidence leaves the transaction before any future planning or network work.
-//!
-//! Original target tuples and global PK frontiers fence planning. Readability
-//! comes only from explicit trusted local preparation, never a dry-run probe,
-//! metadata-size substitution, imported bool or aggregate revision counter.
-//!
-//! Internal pin inventories are bounded globally (4096 rows / 4 MiB text across
-//! tables), then filtered to the explicit objects and requested provider domains.
-//! This deliberately fails closed on oversized inventories; it does not silently
-//! page/truncate and claim completeness. No prefix/object discovery is performed.
+//! Read-only request-scoped native evidence and its semantic projection.
+//! Readability comes only from explicit trusted preparation. Collection performs
+//! no provider calls, migrations, business writes or full-registry capture.
 
 use crate::store::pinning::management::records::{DecodeWork, SharedDecodeBudget};
 use sea_orm::{
-    AccessMode, ConnectionTrait, DatabaseBackend, DatabaseConnection, IsolationLevel, Statement,
+    AccessMode, ConnectionTrait, DatabaseBackend, DatabaseConnection, IsolationLevel,
     TransactionTrait,
 };
 
 use super::{
-    Action, AppliedItem, DecisionState, ExactObject, MAX_RECORDS, MAX_TEXT_BYTES, PlanRequest,
-    PublicVersionId, ResourceType, RouteIdentity, SafeError, SelectionEvidence, Snapshot,
-    validate_request,
+    Action, AppliedItem, DecisionState, ExactObject, MAX_TEXT_BYTES, PlanRequest, PublicVersionId,
+    ResourceType, RouteIdentity, SafeError, SelectionEvidence, Snapshot, validate_request,
 };
 use crate::pinning::{
     config::ValidatedPinningConfig,
@@ -34,13 +20,20 @@ use crate::pinning::{
 
 #[path = "db_snapshot/evidence.rs"]
 mod evidence;
+#[path = "db_snapshot/legacy.rs"]
+mod legacy;
 #[path = "db_snapshot/native_plan.rs"]
 mod native_plan;
+#[path = "db_snapshot/park.rs"]
+mod park;
 #[path = "db_snapshot/project.rs"]
 mod project;
 #[path = "db_snapshot/read.rs"]
 mod read;
+#[path = "db_snapshot/scoped.rs"]
+mod scoped;
 pub use evidence::*;
+pub use scoped::PlanningScope;
 
 /// Static errors only. DB/provider/serde text and input are never returned/logged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -63,6 +56,10 @@ pub enum SnapshotError {
     LimitExceeded,
     #[error("snapshot lacks authoritative management evidence; needs attention")]
     UnsupportedEvidence,
+    #[error("snapshot scoped evidence changed")]
+    Changed,
+    #[error("snapshot requires a sealed global inventory")]
+    GlobalInventoryRequired,
 }
 
 type Result<T> = std::result::Result<T, SnapshotError>;
@@ -90,6 +87,70 @@ pub async fn collect_with_session(
     work: SharedDecodeBudget,
 ) -> Result<DatabaseSnapshot> {
     collect_inner(db, &config.pinning, Some(config), request, work).await
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ControlledCaptureError {
+    #[error(transparent)]
+    Snapshot(#[from] SnapshotError),
+    #[error("snapshot transaction stopped (details withheld)")]
+    Stopped(crate::store::pinning::management::transaction::TransactionFailure),
+}
+
+/// Read-only capture under the invocation's absolute hard deadline. Engine
+/// interruption is drained and rollback acknowledged before returning a stop.
+pub async fn collect_with_control(
+    db: &DatabaseConnection,
+    config: &super::local_config::ManagementConfig,
+    request: &PlanRequest,
+    deadline: std::time::Instant,
+    cancellation: crate::store::pinning::management::transaction::CancellationToken,
+    work: SharedDecodeBudget,
+) -> std::result::Result<DatabaseSnapshot, ControlledCaptureError> {
+    use crate::store::pinning::management::transaction::ManagementTransaction;
+    validate_request(request).map_err(SnapshotError::Validation)?;
+    let mut tx = ManagementTransaction::begin_read_only(
+        db,
+        deadline.saturating_duration_since(std::time::Instant::now()),
+        cancellation.clone(),
+    )
+    .await
+    .map_err(ControlledCaptureError::Stopped)?;
+    let result = tx
+        .run_with((config, request, work), |tx, control, context| {
+            Box::pin(async move {
+                control.shorten(deadline.saturating_duration_since(std::time::Instant::now()));
+                Ok(
+                    collect_in_transaction_with_session(
+                        tx,
+                        context.0,
+                        context.1,
+                        context.2.clone(),
+                    )
+                    .await,
+                )
+            })
+        })
+        .await
+        .map_err(ControlledCaptureError::Stopped)?;
+    tx.rollback()
+        .await
+        .map_err(ControlledCaptureError::Stopped)?;
+    use crate::store::pinning::management::transaction::{StopCause, TransactionFailure};
+    let stopped = if cancellation.is_cancelled() {
+        Some(StopCause::Cancelled)
+    } else if std::time::Instant::now() >= deadline {
+        Some(StopCause::Deadline)
+    } else {
+        None
+    };
+    if let Some(cause) = stopped {
+        return Err(ControlledCaptureError::Stopped(TransactionFailure {
+            cause,
+            rollback_confirmed: true,
+        }));
+    }
+    result.map_err(ControlledCaptureError::Snapshot)
 }
 
 async fn collect_inner(
@@ -137,38 +198,24 @@ async fn collect_transaction(
     request: &PlanRequest,
     work: SharedDecodeBudget,
 ) -> Result<DatabaseSnapshot> {
-    let native_frame =
-        crate::store::pinning::management::native::capture_with_work(tx, DecodeWork::shared(&work))
-            .await
-            .map_err(|error| match error {
-                crate::store::pinning::management::ManagementError::Budget => {
-                    SnapshotError::LimitExceeded
-                }
-                crate::store::pinning::management::ManagementError::Schema => {
-                    SnapshotError::UnsupportedEvidence
-                }
-                _ => SnapshotError::InvalidEvidence,
-            })?;
-    let observed_at = crate::store::database_clock::database_now(tx)
+    let mut budget = crate::store::pinning::management::native::meter::Budget::default();
+    let (native_frame, mut scope) =
+        scoped::collect(tx, config, request, &work, &mut budget).await?;
+    let now = crate::store::database_clock::database_now(tx)
         .await
-        .map_err(|_| SnapshotError::DatabaseUnavailable)?
-        .timestamp();
-    let mut budget = read::Budget::new(work.clone());
-    let objects = read::objects(tx, request, &mut budget).await?;
-    let rows = read::Rows::load(tx, &mut budget).await?;
-    let mut result = project::assemble(observed_at, objects, rows, config, request, &work)?;
-    result.planning = Some(
-        native_plan::project(
-            tx,
-            &result,
-            native_frame,
-            config,
-            management_config,
-            request,
-            &work,
-        )
-        .await?,
-    );
+        .map_err(|_| SnapshotError::DatabaseUnavailable)?;
+    let objects = read::objects(&native_frame, request, &work)?;
+    let rows = read::Rows::project(&native_frame, now, &work)?;
+    let mut result = project::assemble(now.timestamp(), objects, rows, config, request, &work)?;
+    result.planning = Some(native_plan::project(
+        now,
+        &result,
+        native_frame,
+        config,
+        management_config,
+        request,
+        &work,
+    )?);
     if let Some(planning) = &result.planning {
         if planning
             .objects
@@ -207,6 +254,9 @@ async fn collect_transaction(
                 .push(EvidenceGap::ProviderRootAttributionUnavailable);
         }
     }
+    budget.check().map_err(scoped::map_error)?;
+    scope.record_measurements(&budget);
+    result.scope = Some(std::sync::Arc::new(scope));
     Ok(result)
 }
 

@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, QueryFilter,
-    QuerySelect, Set, sea_query::OnConflict,
+    QuerySelect, Set, TransactionTrait, sea_query::OnConflict,
 };
 use serde::{Deserialize, Serialize};
 
@@ -180,21 +180,23 @@ impl LedgerEffect {
     }
 }
 
-/// Low-level metadata primitive; registration callers own transaction scope.
-/// Gateway startup uses `register_configured_route_in_transaction`, not a bare
-/// connection preflight followed by this upsert.
-pub async fn register_route<C: ConnectionTrait>(
+/// Route publication and locator sealing share a transaction. A caller-owned
+/// transaction retains the surrounding boundary through its nested savepoint.
+pub async fn register_route<C: ConnectionTrait + TransactionTrait>(
     db: &C,
     key: &str,
     identity: &ProviderIdentity,
 ) -> AppResult<()> {
-    register_snapshot(db, key, identity, &identity.route_snapshot()).await
+    let tx = db.begin().await?;
+    super::management::admission::lock_registration_in_transaction(&tx, key).await?;
+    register_snapshot(&tx, key, identity, &identity.route_snapshot()).await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 /// Register the validated execution/confirmation contract, including disabled
 /// birth candidates. Identity-only callers remain compatible for older kinds.
-/// The generic signature does not establish a retirement transaction barrier.
-pub async fn register_configured_route<C: ConnectionTrait>(
+pub async fn register_configured_route<C: ConnectionTrait + TransactionTrait>(
     db: &C,
     key: &str,
     provider: &crate::pinning::config::ValidatedProvider,
@@ -208,22 +210,35 @@ pub async fn register_configured_route<C: ConnectionTrait>(
             "configured provider allocation key changed".into(),
         ));
     }
-    register_snapshot(db, key, &provider.identity, &snapshot).await
+    let tx = db.begin().await?;
+    super::management::admission::lock_registration_in_transaction(&tx, key).await?;
+    register_snapshot(&tx, key, &provider.identity, &snapshot).await?;
+    tx.commit().await?;
+    Ok(())
 }
 
-/// Gateway startup owns this short transaction; the generic compatibility API
-/// above does not pretend that an autocommit preflight protects missing rows.
+/// Gateway startup publishes the route and locator seal in its existing
+/// initialization transaction, without committing an independent registration.
 pub(crate) async fn register_configured_route_in_transaction(
     tx: &sea_orm::DatabaseTransaction,
     key: &str,
     provider: &crate::pinning::config::ValidatedProvider,
 ) -> AppResult<()> {
     super::management::admission::lock_registration_in_transaction(tx, key).await?;
-    register_configured_route(tx, key, provider).await
+    let snapshot = provider.route_snapshot();
+    provider
+        .validate_route_snapshot(&snapshot)
+        .map_err(|_| AppError::InvalidPinningRequest("invalid configured provider route".into()))?;
+    if key != provider.identity.allocation_key() {
+        return Err(AppError::InvalidPinningRequest(
+            "configured provider allocation key changed".into(),
+        ));
+    }
+    register_snapshot(tx, key, &provider.identity, &snapshot).await
 }
 
-async fn register_snapshot<C: ConnectionTrait>(
-    db: &C,
+async fn register_snapshot(
+    db: &sea_orm::DatabaseTransaction,
     key: &str,
     identity: &ProviderIdentity,
     route: &ProviderRouteSnapshot,
@@ -266,6 +281,16 @@ async fn register_snapshot<C: ConnectionTrait>(
     )
     .exec(db)
     .await?;
+    super::management::records::locator::rebuild_source(
+        db,
+        &super::management::native::NativeKey {
+            table: "pin_provider_routes".into(),
+            values: vec![key.into()],
+        },
+        &mut super::management::native::meter::Budget::default(),
+    )
+    .await
+    .map_err(super::management::admission::work_error)?;
     Ok(())
 }
 
@@ -467,6 +492,30 @@ pub(crate) async fn get_with_work<C: ConnectionTrait>(
     super::management::records::current_model::<remote_pin_ledger::Entity, _>(
         db,
         &[&provider, cid],
+        work,
+    )
+    .await
+    .map_err(super::management::admission::work_error)
+}
+
+pub(crate) async fn get_from_loaded<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+    cid: &str,
+    candidates: &super::management::records::locator::AuthorityView,
+    work: super::management::records::DecodeWork<'_>,
+) -> AppResult<Option<remote_pin_ledger::Model>> {
+    let binding = super::legacy_migration::identity_binding_from_loaded(
+        db, provider, cid, candidates, &work, work,
+    )
+    .await
+    .map_err(super::management::admission::work_error)?;
+    let provider = binding
+        .as_ref()
+        .map_or(provider, |binding| binding.operational_key.as_str());
+    super::management::records::current_model::<remote_pin_ledger::Entity, _>(
+        db,
+        &[provider, cid],
         work,
     )
     .await
@@ -711,32 +760,109 @@ pub(crate) async fn job_route_matches<C: ConnectionTrait>(
     job: &crate::store::entities::pin_job::Model,
     identity: Option<&ProviderIdentity>,
 ) -> AppResult<bool> {
-    let key = [("id".to_owned(), job.id.clone())].into();
-    let migrated =
-        super::legacy_migration::historical_keys(db, "pin_jobs", &job.provider, Some(&job.cid))
-            .await?;
-    for provider in migrated {
-        if let Some(binding) =
-            super::legacy_migration::resolve_legacy_binding(db, "pin_jobs", &key, &provider).await?
-            && (binding.source_retired || !matches!(job.operation.as_str(), "poll" | "reconcile"))
-        {
-            return Ok(false);
+    let session = super::management::records::SharedDecodeBudget::default();
+    let work = super::management::records::DecodeWork::shared(&session);
+    let candidates = super::management::admission::authority::load(
+        db,
+        &super::legacy_migration::job_receipt_selectors(job),
+        work,
+    )
+    .await
+    .map_err(super::management::admission::work_error)?;
+    job_route_matches_from_loaded(db, job, identity, &candidates, work).await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JobAdmission {
+    IoDenied,
+    RouteDenied,
+    Allowed,
+}
+
+/// One read-only claimed-job admission. No authority view survives this call.
+pub(crate) async fn job_io_and_route_with_work<C: ConnectionTrait>(
+    db: &C,
+    job: &pin_job::Model,
+    identity: Option<&ProviderIdentity>,
+    work: super::management::records::DecodeWork<'_>,
+) -> AppResult<JobAdmission> {
+    work.copy(&(&job.id, &job.operation, &job.provider, &job.cid))
+        .map_err(super::management::admission::work_error)?;
+    let candidates = super::management::admission::authority::load(
+        db,
+        &super::legacy_migration::job_receipt_selectors(job),
+        work,
+    )
+    .await
+    .map_err(super::management::admission::work_error)?;
+    if !super::legacy_migration::job_io_allowed_from_loaded(db, job, &candidates, work)
+        .await
+        .map_err(super::management::admission::work_error)?
+    {
+        return Ok(JobAdmission::IoDenied);
+    }
+    if !job_route_matches_from_loaded(db, job, identity, &candidates, work).await? {
+        return Ok(JobAdmission::RouteDenied);
+    }
+    Ok(JobAdmission::Allowed)
+}
+
+async fn job_route_matches_from_loaded<C: ConnectionTrait>(
+    db: &C,
+    job: &pin_job::Model,
+    identity: Option<&ProviderIdentity>,
+    candidates: &super::management::records::locator::AuthorityView,
+    work: super::management::records::DecodeWork<'_>,
+) -> AppResult<bool> {
+    use crate::store::entities::{pin_invocation_route, remote_pin};
+    if !candidates.originals.is_empty() {
+        let migrated = super::legacy_migration::historical_job_keys_from_loaded(
+            db,
+            &job.provider,
+            &job.id,
+            candidates,
+            work,
+        )
+        .await
+        .map_err(super::management::admission::work_error)?;
+        let key = [("id".to_owned(), job.id.clone())].into();
+        for provider in migrated {
+            if let Some(binding) = super::legacy_migration::resolve_legacy_binding_with_work(
+                db, "pin_jobs", &key, &provider, work,
+            )
+            .await
+            .map_err(super::management::admission::work_error)?
+                && (binding.source_retired
+                    || !matches!(job.operation.as_str(), "poll" | "reconcile"))
+            {
+                return Ok(false);
+            }
         }
     }
-    use crate::store::entities::{pin_invocation_route, remote_pin};
-    let row = get(db, &job.provider, &job.cid).await?;
+    let row = get_from_loaded(db, &job.provider, &job.cid, candidates, work).await?;
     let Some(row) = row else {
         return legacy_unregistered_store(db, &job.provider).await;
     };
-    let Some(captured) = pin_invocation_route::Entity::find_by_id(job.id.clone())
-        .one(db)
-        .await?
+    let Some(captured) =
+        super::management::records::current_model::<pin_invocation_route::Entity, _>(
+            db,
+            &[&job.id],
+            work,
+        )
+        .await
+        .map_err(super::management::admission::work_error)?
     else {
         return Ok(false);
     };
-    let remote = remote_pin::Entity::find_by_id((job.provider.clone(), job.cid.clone()))
-        .one(db)
-        .await?;
+    let remote = super::management::records::current_model::<remote_pin::Entity, _>(
+        db,
+        &[&job.provider, &job.cid],
+        work,
+    )
+    .await
+    .map_err(super::management::admission::work_error)?;
+    work.copy(&captured.route)
+        .map_err(super::management::admission::work_error)?;
     let route = serde_json::from_str::<ProviderRouteSnapshot>(&captured.route).ok();
     let Some(remote) = remote else {
         return Ok(false);
@@ -772,13 +898,18 @@ pub(crate) async fn job_route_matches<C: ConnectionTrait>(
     let Some(request_id) = remote.request_id.as_deref() else {
         return Ok(false);
     };
-    if !super::jobs::poll_continuity_owner(db, job, request_id).await? {
+    if !super::jobs::poll_continuity_owner_with_work(db, job, request_id, work)
+        .await
+        .map_err(super::management::admission::work_error)?
+    {
         return Ok(false);
     }
-    let released = super::legacy_migration::release_history(db, &job.provider, &job.cid)
-        .await?
-        .iter()
-        .any(|row| row.epoch >= captured.remote_epoch && row.epoch < remote.epoch);
+    let released =
+        super::legacy_migration::release_history_with_work(db, &job.provider, &job.cid, work)
+            .await
+            .map_err(super::management::admission::work_error)?
+            .iter()
+            .any(|row| row.epoch >= captured.remote_epoch && row.epoch < remote.epoch);
     if released {
         return Ok(false);
     }
@@ -1064,15 +1195,38 @@ pub(crate) async fn cleanup_allowed_with_work<C: ConnectionTrait>(
     cid: &str,
     work: super::management::records::DecodeWork<'_>,
 ) -> AppResult<bool> {
-    if super::legacy_migration::resource_binding_with_work(db, provider, cid, work)
-        .await
-        .map_err(super::management::admission::work_error)?
-        .is_some()
-    {
-        // A namespace declaration is never new delete/ownership authority.
-        return Ok(false);
-    }
-    let Some(row) = get_with_work(db, provider, cid, work).await? else {
+    let candidates =
+        super::legacy_migration::resource_receipt_candidates_with_work(db, provider, cid, work)
+            .await
+            .map_err(super::management::admission::work_error)?;
+    let row = if let Some(candidates) = candidates {
+        if !candidates.originals.is_empty()
+            && super::legacy_migration::resource_binding_from_loaded(
+                db,
+                provider,
+                cid,
+                &candidates,
+                work,
+            )
+            .await
+            .map_err(super::management::admission::work_error)?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        // A fresh lifetime may mask a binding without removing its identity alias.
+        get_from_loaded(db, provider, cid, &candidates, work).await?
+    } else {
+        if super::legacy_migration::resource_binding_with_work(db, provider, cid, work)
+            .await
+            .map_err(super::management::admission::work_error)?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        get_with_work(db, provider, cid, work).await?
+    };
+    let Some(row) = row else {
         return legacy_unregistered_store(db, provider).await;
     };
     // Stage 5 RPC receipts prove pin state, never exclusive creation. In

@@ -1,3 +1,5 @@
+#[path = "support/management_wire_v3.rs"]
+mod archive;
 #[path = "support/stage7_management_actions.rs"]
 pub mod support;
 use ipfs_s3_gateway::{
@@ -9,13 +11,6 @@ use ipfs_s3_gateway::{
     },
 };
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, TransactionTrait};
-
-fn assert_public_equal<T: serde::Serialize + ?Sized>(original: &T, imported: &T) {
-    assert_eq!(
-        serde_json::to_value(original).unwrap(),
-        serde_json::to_value(imported).unwrap()
-    );
-}
 
 #[tokio::test]
 async fn retire_migrate_keeps_pending_destination_authority_without_granting_a_new_submit() {
@@ -503,44 +498,8 @@ async fn migration_point_is_consumed_by_one_and_all_completion_without_resetting
             .map(|entry| entry.request.item_id.clone())
             .collect();
         let confirmation = plan.confirmation(candidates);
-        let encoded = wire::encode_plan(&followup, &snapshot, &plan, Some(&confirmation)).unwrap();
-        let imported = wire::decode_plan(&encoded).unwrap();
-        assert!(imported.request() == &followup);
-        let mut public_snapshot = serde_json::to_value(&snapshot).unwrap();
-        public_snapshot["applied"] = serde_json::json!([]);
-        assert_eq!(
-            public_snapshot,
-            serde_json::to_value(imported.snapshot_without_applied()).unwrap()
-        );
-        assert_public_equal(
-            snapshot.applied.as_slice(),
-            imported.untrusted_applied_claims(),
-        );
-        assert_eq!(imported.plan().plan_id(), plan.plan_id());
-        assert_eq!(imported.plan().summary(), plan.summary());
-        assert_public_equal(plan.items(), imported.plan().items());
-        assert_eq!(imported.plan().items().len(), followup.items.len());
-        for (original, entry) in plan.items().iter().zip(imported.plan().items()) {
-            assert!(entry.id == original.id);
-            assert_eq!(entry.status, original.status);
-            assert!(entry.request == original.request);
-            assert!(entry.request.action == Action::Retry);
-        }
-        let imported_confirmation = imported.confirmation().unwrap();
-        assert_public_equal(
-            confirmation.candidate_item_ids.as_slice(),
-            imported_confirmation,
-        );
         assert!(
             snapshot
-                .native_frame
-                .as_ref()
-                .unwrap()
-                .has_private_material()
-        );
-        assert!(
-            !imported
-                .snapshot_without_applied()
                 .native_frame
                 .as_ref()
                 .unwrap()
@@ -550,24 +509,24 @@ async fn migration_point_is_consumed_by_one_and_all_completion_without_resetting
         assert_eq!(checked.len(), plan.items().len());
         assert!(checked[0].id == plan.items()[0].id);
         assert!(
-            records::load_confirmed_from_imported(&fixture.db, &fixture.auth, &imported)
-                .await
-                .is_err()
+            records::load_confirmed_authority(
+                &fixture.db,
+                &fixture.auth,
+                &followup,
+                Default::default()
+            )
+            .await
+            .is_err()
         );
-        let work = records::SharedDecodeBudget::default();
-        let mut original_document = Vec::new();
-        wire::encode_review(
-            &mut work.lock().unwrap(),
-            &confirmed.review(),
-            Some(&confirmed.confirmation.candidate_item_ids),
-            &mut original_document,
+        let original_document = archive::export(&confirmed);
+        let restored = archive::restore(
+            &fixture.db,
+            &fixture.auth,
+            &confirmed.request,
+            &original_document,
         )
+        .await
         .unwrap();
-        let original_import = wire::decode_review(&original_document, work).unwrap();
-        let restored =
-            records::load_confirmed_from_imported(&fixture.db, &fixture.auth, &original_import)
-                .await
-                .unwrap();
         let restored_review = restored.review();
         confirmed
             .review()

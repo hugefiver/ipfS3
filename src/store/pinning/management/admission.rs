@@ -34,6 +34,7 @@ pub(crate) async fn provider_registered_with_work<C: ConnectionTrait>(
     Ok(row.try_get::<bool>("", "present")?)
 }
 
+pub(crate) mod authority;
 mod domains;
 mod intake;
 mod locks;
@@ -88,12 +89,26 @@ pub(crate) async fn check_open_with_work<C: ConnectionTrait>(
     Ok(())
 }
 
+/// R26 preservation is available only after a complete native projection.
+/// The caller retains the final maintenance/authority fences for fresh apply.
+pub(in crate::store::pinning) async fn check_r26_open<C: ConnectionTrait>(
+    db: &C,
+    admission: &crate::store::pinning::legacy_migration::R26Admission<'_>,
+) -> AppResult<()> {
+    let work = SharedDecodeBudget::default();
+    if retirement::closed_r26(db, admission, DecodeWork::shared(&work)).await? {
+        return Err(retired());
+    }
+    Ok(())
+}
+
 /// Call after bucket/owner/exact versions → leases → targets(created_at,id) →
 /// remotes → usage, before taking any route row lock. Short shared retirement
 /// and route table fences protect absence; ordinary births remain compatible.
 /// Routes may come from verified R26 original points, never an opaque alias or
 /// a new TOML interpretation. Complete historical prefixes retain only native
 /// retired/domain protection, never a missing Stage7 retirement-write authority.
+#[cfg(test)]
 pub(crate) async fn lock_open_in_transaction(
     tx: &DatabaseTransaction,
     routes: &[ProviderRouteSnapshot],
@@ -152,14 +167,20 @@ pub(crate) async fn check_provider_with_work<C: ConnectionTrait>(
 ) -> AppResult<()> {
     let schema = locks::AdmissionSchema::read(db).await?;
     let routes = domains::registered_routes_in_schema_with_work(db, provider, work).await?;
-    schema.revalidate(db).await?;
     if routes.is_empty() {
-        if domains::unregistered_legacy(db, provider).await? {
+        let unregistered = domains::unregistered_legacy_in_schema(db, provider, &schema).await?;
+        schema.revalidate(db).await?;
+        if unregistered {
             return Ok(());
         }
         return Err(needs_attention());
     }
-    check_open_with_work(db, &routes, work).await
+    let closed = retirement::closed_in_schema(db, &routes, &schema, false, work).await?;
+    schema.revalidate(db).await?;
+    if closed {
+        return Err(retired());
+    }
+    Ok(())
 }
 
 /// Startup may preserve a closed route for historical GETs, but may not overwrite

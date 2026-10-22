@@ -1627,25 +1627,25 @@ async fn sqlite_parallel_publish_delete_tag_has_one_latest_and_no_null_leak() {
             .await
         })
     };
-    let first_publish = publish(
+    let mut first_publish = publish(
         first.clone(),
         start.clone(),
         "enabled-first",
         "bafy-enabled-first",
     );
-    let second_publish = publish(
+    let mut second_publish = publish(
         second.clone(),
         start.clone(),
         "enabled-second",
         "bafy-enabled-second",
     );
     start.wait().await;
-    tokio::time::timeout(Duration::from_secs(10), async {
-        first_publish.await.unwrap().unwrap();
-        second_publish.await.unwrap().unwrap();
+    let completed = tokio::time::timeout(Duration::from_secs(10), async {
+        (&mut first_publish).await.unwrap().unwrap();
+        (&mut second_publish).await.unwrap().unwrap();
     })
-    .await
-    .expect("parallel Enabled publications must finish within the retry bound");
+    .await;
+    completed.expect("parallel Enabled publications must finish within the retry bound");
 
     let enabled = versions_for(&first, "enabled-race").await;
     assert_eq!(enabled.len(), 2);

@@ -63,7 +63,7 @@ pub(super) async fn validate<C: ConnectionTrait>(db: &C) -> Result<()> {
         if row
             .try_get::<i64>("", "count")
             .map_err(|_| ManagementError::Schema)?
-            != 0
+            != if table == RECORDS { 6 } else { 4 }
         {
             return Err(ManagementError::Schema);
         }

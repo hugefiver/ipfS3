@@ -138,7 +138,15 @@ impl Fixture {
             .unwrap()
             .planning_snapshot()
             .unwrap();
-        let plan = dry_run(request, &snapshot).unwrap();
+        let prepared = retirement::PreparedPlanning::collect(
+            &self.db,
+            request,
+            &snapshot,
+            records::SharedDecodeBudget::default(),
+        )
+        .await
+        .unwrap();
+        let plan = &prepared.plan;
         assert!(
             plan.items()
                 .iter()
@@ -155,7 +163,7 @@ impl Fixture {
             &self.db,
             &self.config,
             &self.auth,
-            (request, &snapshot, &plan),
+            (request, &snapshot, plan),
             &ack,
             chrono::Duration::minutes(5),
             work.clone(),
@@ -166,6 +174,7 @@ impl Fixture {
             request.plan_id,
             work.lock().unwrap().usage()
         );
+        prepared.close().await.unwrap();
         result.unwrap_or_else(|error| {
             panic!("confirmation for {} failed: {error:?}", request.plan_id)
         })

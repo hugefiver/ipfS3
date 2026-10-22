@@ -3,7 +3,8 @@ use super::{ManagementError, Result};
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 use sea_orm_migration::MigratorTrait;
 
-pub const VERSION: &str = "m20261013_000001_zip_root_logical_release";
+pub const VERSION: &str = "m20261017_000001_management_storage";
+pub mod storage;
 pub const RECORDS: &str = "pin_management_records";
 pub const RETIREMENTS: &str = "pin_management_retirements";
 
@@ -60,14 +61,36 @@ fn normalized(sql: &str) -> String {
 }
 
 pub async fn validate<C: ConnectionTrait>(db: &C) -> Result<Vec<String>> {
+    validate_state(db, false).await
+}
+
+/// Validates the complete installed layout without publishing it for runtime use.
+/// Only explicit, identity-bound conversion can read a backfill database.
+pub(crate) async fn validate_for_upgrade<C: ConnectionTrait>(db: &C) -> Result<Vec<String>> {
+    let versions = validate_state(db, true).await?;
+    super::catalog::validate(db, super::native::current_catalog()).await?;
+    Ok(versions)
+}
+
+async fn validate_state<C: ConnectionTrait>(db: &C, backfill: bool) -> Result<Vec<String>> {
     let backend = db.get_database_backend();
     if !matches!(backend, DatabaseBackend::Sqlite | DatabaseBackend::Postgres) {
         return Err(ManagementError::Schema);
     }
+    let known: Vec<String> = crate::store::migrator::Migrator::migrations()
+        .iter()
+        .map(|m| m.name().to_owned())
+        .collect();
+    let version_bytes = known.iter().map(String::len).max().unwrap_or(0);
+    let length = if backend == DatabaseBackend::Sqlite {
+        "length(CAST(version AS BLOB))"
+    } else {
+        "octet_length(version)"
+    };
     let rows = db
         .query_all(Statement::from_string(
             backend,
-            "SELECT version FROM seaql_migrations ORDER BY version LIMIT 65",
+            format!("SELECT CASE WHEN {length}<={version_bytes} THEN version ELSE NULL END AS version FROM seaql_migrations ORDER BY seaql_migrations.version LIMIT 65"),
         ))
         .await
         .map_err(|_| ManagementError::Schema)?;
@@ -76,53 +99,12 @@ pub async fn validate<C: ConnectionTrait>(db: &C) -> Result<Vec<String>> {
         .map(|r| r.try_get("", "version"))
         .collect::<std::result::Result<_, _>>()
         .map_err(|_| ManagementError::Schema)?;
-    let known: Vec<String> = crate::store::migrator::Migrator::migrations()
-        .iter()
-        .map(|m| m.name().to_owned())
-        .collect();
     if versions != known || versions.last().map(String::as_str) != Some(VERSION) {
         return Err(ManagementError::Schema);
     }
-    match backend {
-        DatabaseBackend::Sqlite => {
-            for (name, ddl) in [
-                (RECORDS, records_ddl(backend)),
-                (RETIREMENTS, retirements_ddl(backend)),
-            ] {
-                let rows = db
-                    .query_all(Statement::from_sql_and_values(
-                        backend,
-                        "SELECT type,sql FROM sqlite_schema WHERE tbl_name=$1 ORDER BY type,name",
-                        [name.into()],
-                    ))
-                    .await
-                    .map_err(|_| ManagementError::Schema)?;
-                let mut found = false;
-                for row in rows {
-                    let kind: String = row
-                        .try_get("", "type")
-                        .map_err(|_| ManagementError::Schema)?;
-                    let sql: Option<String> = row
-                        .try_get("", "sql")
-                        .map_err(|_| ManagementError::Schema)?;
-                    if kind == "table"
-                        && sql
-                            .as_deref()
-                            .is_some_and(|sql| normalized(sql) == normalized(&ddl))
-                        && !found
-                    {
-                        found = true;
-                    } else if kind != "index" || sql.is_some() {
-                        return Err(ManagementError::Schema);
-                    }
-                }
-                if !found {
-                    return Err(ManagementError::Schema);
-                }
-            }
-        }
-        DatabaseBackend::Postgres => postgres::validate(db).await?,
-        _ => return Err(ManagementError::Schema),
+    storage::validate_schema(db, backfill).await?;
+    if backend == DatabaseBackend::Postgres {
+        postgres::validate(db).await?;
     }
     Ok(versions)
 }

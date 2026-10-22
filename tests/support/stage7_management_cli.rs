@@ -1,11 +1,71 @@
 #[path = "stage7_management.rs"]
-mod publication;
+pub(super) mod publication;
 
 use std::{
+    io::Write,
     path::{Path, PathBuf},
     process::Output,
     time::Duration,
 };
+
+pub fn wire_budget() -> ipfs_s3_gateway::store::pinning::management::native::meter::Budget {
+    use ipfs_s3_gateway::store::pinning::management::native::meter::{Budget, Limits};
+    Budget::new(Limits {
+        bytes: 512 * 1024 * 1024,
+        rows: 100_000,
+        resident: 32 * 1024 * 1024,
+        ..Default::default()
+    })
+}
+pub fn document(
+    path: &Path,
+) -> ipfs_s3_gateway::pinning::management::wire::v3::document::DocumentHead {
+    use ipfs_s3_gateway::pinning::management::wire::v3::{self, Projection};
+    v3::document::inspect(
+        std::fs::File::open(path).unwrap(),
+        Projection::Review,
+        wire_budget(),
+    )
+    .unwrap()
+    .0
+}
+pub fn rewrite(
+    source: &Path,
+    target: &Path,
+    mut edit: impl FnMut(
+        &mut ipfs_s3_gateway::pinning::management::wire::v3::Event,
+        &mut ipfs_s3_gateway::pinning::management::wire::v3::Writer<std::fs::File>,
+    ),
+    tail: impl FnOnce(&mut ipfs_s3_gateway::pinning::management::wire::v3::Writer<std::fs::File>),
+) {
+    use ipfs_s3_gateway::pinning::management::wire::v3::*;
+    let mut reader = Reader::new(
+        std::fs::File::open(source).unwrap(),
+        Projection::Review,
+        wire_budget(),
+    )
+    .unwrap();
+    let mut writer = Writer::new(
+        std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(target)
+            .unwrap(),
+        Projection::Review,
+        wire_budget(),
+    )
+    .unwrap();
+    while let Some(mut event) = reader.next_frame().unwrap() {
+        edit(&mut event, &mut writer);
+        match event {
+            Event::Frame(frame) => writer.frame(&frame).unwrap(),
+            Event::Chunk(bytes) => writer.cell_output().write_all(&bytes).unwrap(),
+        }
+    }
+    assert!(reader.verified());
+    tail(&mut writer);
+    writer.finish().unwrap().sync_all().unwrap();
+}
 
 use ipfs_s3_gateway::{
     pinning::management::{ExactObject, PlanRequest, local_config},
@@ -39,6 +99,8 @@ pub fn command(config: &Path, args: &[&str]) -> Command {
         .args(args)
         .env_clear()
         .env("IPFS_S3_CONFIG", config)
+        .env("TMP", config.parent().unwrap())
+        .env("TEMP", config.parent().unwrap())
         .kill_on_drop(true);
     #[cfg(windows)]
     if let Some(system_root) = std::env::var_os("SystemRoot") {

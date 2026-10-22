@@ -13,7 +13,7 @@ pub(crate) use proofs::{fresh_original_proof_with_work, trusted_proof_with_work}
 pub(crate) use reservations::check_rows_with_work;
 
 pub(crate) async fn check_current_with_work(
-    rows: records::CurrentRows,
+    rows: native::NativeFrame,
     provider: String,
     cid: String,
     expected: Count,
@@ -21,7 +21,7 @@ pub(crate) async fn check_current_with_work(
 ) -> Result<()> {
     tokio::task::spawn_blocking(move || {
         reservations::check_rows_with_work(
-            records::FrozenRows::Current(&rows),
+            records::FrozenRows::Frame(&rows),
             &provider,
             &cid,
             expected,

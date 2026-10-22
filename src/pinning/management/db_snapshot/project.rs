@@ -670,6 +670,7 @@ pub(super) fn assemble(
         applied: vec![],
         needs_attention: gaps.into_iter().collect(),
         planning: None,
+        scope: None,
     })
 }
 

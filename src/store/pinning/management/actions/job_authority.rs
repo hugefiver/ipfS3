@@ -18,6 +18,10 @@ use chrono::{DateTime, Utc};
 #[cfg(test)]
 use sea_orm::{ColumnTrait, QueryFilter};
 use sea_orm::{ConnectionTrait, DatabaseTransaction, EntityTrait, Set};
+mod completion;
+mod current_scope;
+pub(crate) use completion::CompletionReader;
+pub(crate) mod park_scope;
 #[cfg(test)]
 #[path = "job_authority/renew_tests.rs"]
 mod renew_tests;
@@ -137,7 +141,17 @@ pub(crate) async fn check_before_call_with_work<C: ConnectionTrait>(
     job: &pin_job::Model,
     work: records::SharedDecodeBudget,
 ) -> Result<Option<JobPermit>> {
-    let Some(authority) = lookup_with_work(db, job, work.clone()).await? else {
+    let authority = lookup_with_work(db, job, work.clone()).await?;
+    check_with_authority(db, job, authority, work).await
+}
+
+async fn check_with_authority<C: ConnectionTrait>(
+    db: &C,
+    job: &pin_job::Model,
+    authority: Option<records::JobAuthority>,
+    work: records::SharedDecodeBudget,
+) -> Result<Option<JobPermit>> {
+    let Some(authority) = authority else {
         return Ok(None);
     };
     if authority.directive == records::JobDirective::ReadOnlyObserve {
@@ -235,10 +249,20 @@ pub(crate) async fn fresh_source_allowed_view_with_work<C: ConnectionTrait>(
     idle_timeout_millis: Option<u64>,
     work: records::SharedDecodeBudget,
 ) -> AppResult<bool> {
-    let Some(authority) = lookup_with_work(db, job, work.clone())
+    let authority = lookup_with_work(db, job, work.clone())
         .await
-        .map_err(safe)?
-    else {
+        .map_err(safe)?;
+    fresh_source_from_authority(db, authority.as_ref(), config, idle_timeout_millis, work).await
+}
+
+async fn fresh_source_from_authority<C: ConnectionTrait>(
+    db: &C,
+    authority: Option<&records::JobAuthority>,
+    config: Option<crate::pinning::management::local_config::ManagementConfigView<'_>>,
+    idle_timeout_millis: Option<u64>,
+    work: records::SharedDecodeBudget,
+) -> AppResult<bool> {
+    let Some(authority) = authority else {
         return Ok(true);
     };
     if authority.directive != records::JobDirective::Submit {
@@ -248,7 +272,7 @@ pub(crate) async fn fresh_source_allowed_view_with_work<C: ConnectionTrait>(
         return Ok(false);
     };
     let now = crate::store::database_clock::database_now(db).await?;
-    source::current(db, &authority, config, idle_timeout_millis, now, work)
+    source::current(db, authority, config, idle_timeout_millis, now, work)
         .await
         .map_err(safe)
 }
@@ -258,12 +282,45 @@ pub(crate) async fn lock_source_in_transaction_with_work(
     job: &pin_job::Model,
     work: records::SharedDecodeBudget,
 ) -> AppResult<()> {
+    crate::store::pinning::management::admission::lock_sqlite_writer_in_caller_transaction(tx)
+        .await?;
     if let Some(authority) = lookup_with_work(tx, job, work).await.map_err(safe)?
         && authority.directive == records::JobDirective::Submit
     {
         source::lock(tx, &authority).await.map_err(safe)?;
     }
     Ok(())
+}
+
+/// Acquire only at the tail, after the caller's ordered lifecycle/remote locks.
+/// Same-CID proof owners and empty manifest sets must stay
+/// stable through final projection, not just the selected source's row.
+pub(crate) async fn fence_worker_authority_with_work<'a>(
+    tx: &'a DatabaseTransaction,
+    job: &'a pin_job::Model,
+    work: records::SharedDecodeBudget,
+) -> AppResult<CompletionReader<'a>> {
+    records::locator::fence_authority(tx).await.map_err(safe)?;
+    records::DecodeWork::shared(&work)
+        .copy(&(&job.provider, &job.cid))
+        .map_err(safe)?;
+    let actions = crate::store::pinning::management::admission::authority::actions_for_job(
+        tx,
+        job,
+        work.clone(),
+    )
+    .await
+    .map_err(safe)?;
+    if let Some(authority) = lookup_from_actions(tx, job, &actions, work.clone())
+        .await
+        .map_err(safe)?
+        && authority.directive == records::JobDirective::Submit
+    {
+        current_scope::fence(tx, job, &authority)
+            .await
+            .map_err(safe)?;
+    }
+    Ok(CompletionReader::new(tx, job, actions, work))
 }
 
 /// Call on result publication too. Management readonly/expired/stale work may
@@ -315,16 +372,37 @@ pub async fn lookup<C: ConnectionTrait>(
     db: &C,
     job: &pin_job::Model,
 ) -> Result<Option<records::JobAuthority>> {
-    lookup_with_work(db, job, records::SharedDecodeBudget::default()).await
+    Box::pin(lookup_with_work(
+        db,
+        job,
+        records::SharedDecodeBudget::default(),
+    ))
+    .await
 }
 pub(crate) async fn lookup_with_work<C: ConnectionTrait>(
     db: &C,
     job: &pin_job::Model,
     work: records::SharedDecodeBudget,
 ) -> Result<Option<records::JobAuthority>> {
+    let actions = Box::pin(
+        crate::store::pinning::management::admission::authority::actions_for_job(
+            db,
+            job,
+            work.clone(),
+        ),
+    )
+    .await?;
+    lookup_from_actions(db, job, &actions, work).await
+}
+
+async fn lookup_from_actions<C: ConnectionTrait>(
+    db: &C,
+    job: &pin_job::Model,
+    actions: &[records::TrustedAppliedAction],
+    work: records::SharedDecodeBudget,
+) -> Result<Option<records::JobAuthority>> {
     let mut found = None;
-    let actions = records::actions_for_job_with_work(db, job, work.clone()).await?;
-    for trusted in &actions {
+    for trusted in actions {
         let action = trusted.action_view();
         for authority in &action.jobs {
             if authority.job_id != job.id {
@@ -352,7 +430,7 @@ pub(crate) async fn lookup_with_work<C: ConnectionTrait>(
     // Poll successors must carry the exact original target/source/generation
     // and invocation. There is no global alias or job-ID-prefix admission.
     if job.operation == "poll" {
-        for trusted in &actions {
+        for trusted in actions {
             let action = trusted.action_view();
             for original in &action.jobs {
                 if original.job_id == job.id
@@ -387,7 +465,7 @@ pub(crate) async fn lookup_with_work<C: ConnectionTrait>(
                 )
                 .await?
                 {
-                    continue;
+                    return Err(ManagementError::Confirmation);
                 }
                 trusted.binding().copy(&(original, &job.id))?;
                 let mut successor = original.clone();
@@ -706,6 +784,15 @@ pub(crate) fn validate_frozen_authority<'a>(
     authority: &records::JobAuthority,
 ) -> Result<()> {
     let binding = binding.into();
+    validate_authority_at_boundary(binding, action, authority, binding.frozen_rows()?)
+}
+
+pub(super) fn validate_authority_at_boundary(
+    binding: records::BindingView<'_>,
+    action: &records::CommittedAction,
+    authority: &records::JobAuthority,
+    before: records::FrozenRows<'_>,
+) -> Result<()> {
     if !binding
         .confirmation
         .bindings
@@ -750,8 +837,8 @@ pub(crate) fn validate_frozen_authority<'a>(
                     .as_ref()
                     .is_none_or(|id| !action.receipt.intent_ids.contains(id));
             if shared {
-                validate_shared_source(binding, action, authority)?;
-                return validate_resource_proof(binding, action, authority);
+                validate_shared_source(binding, action, authority, before)?;
+                return validate_resource_proof_at(binding, authority, before);
             }
             if authority.owner.as_ref() != Some(&capture.owner_identity)
                 || authority.source.as_ref() != Some(&capture.object.identity)
@@ -791,7 +878,7 @@ pub(crate) fn validate_frozen_authority<'a>(
                 return super::execution::validate_retirement_job(binding, action, authority);
             }
             if authority.directive != records::JobDirective::ExistingCleanup
-                || !capture.remotes.iter().any(|remote| {
+                || !capture.mutation_scope.remotes.iter().any(|remote| {
                     remote.epoch == authority.remote_epoch
                         && crate::pinning::provider::canonical_resource_cid(&authority.cid)
                             .ok()
@@ -1013,6 +1100,7 @@ fn validate_shared_source(
     binding: records::BindingView<'_>,
     action: &records::CommittedAction,
     authority: &records::JobAuthority,
+    before: records::FrozenRows<'_>,
 ) -> Result<()> {
     if authority.directive != records::JobDirective::Submit
         || !matches!(
@@ -1024,7 +1112,6 @@ fn validate_shared_source(
     {
         return Err(ManagementError::Confirmation);
     }
-    let before = binding.frozen_rows()?;
     let Some(Capture::Object(capture)) = &action.receipt.binding.capture else {
         return Err(ManagementError::Confirmation);
     };
@@ -1163,6 +1250,14 @@ fn validate_resource_proof(
     authority: &records::JobAuthority,
 ) -> Result<()> {
     let frame = binding.frozen_rows()?;
+    validate_resource_proof_at(binding, authority, frame)
+}
+
+fn validate_resource_proof_at(
+    binding: records::BindingView<'_>,
+    authority: &records::JobAuthority,
+    frame: records::FrozenRows<'_>,
+) -> Result<()> {
     if authority.resource_key.table == "remote_pins" {
         let remote = frame
             .row("remote_pins", &[&authority.provider, &authority.cid])
@@ -1480,6 +1575,15 @@ mod tests {
     #[tokio::test]
     async fn shared_native_submit_indexes_only_its_request_bound_poll_and_preserves_all_seed_fields()
      {
+        shared_poll_seed_integrity(true).await;
+    }
+
+    #[tokio::test]
+    async fn shared_native_poll_missing_original_submit_or_history_fails_closed() {
+        shared_poll_seed_integrity(false).await;
+    }
+
+    async fn shared_poll_seed_integrity(include_unrelated_action: bool) {
         use sea_orm::{ActiveModelTrait, IntoActiveModel, TransactionTrait};
         let mut fixture =
             super::super::tests::fixture_with_automatic("shared-poll-index", true).await;
@@ -1567,62 +1671,74 @@ mod tests {
         assert_eq!(seed.lease_id, native_source.lease_id);
         assert_eq!(seed.target_id, native_source.target_id);
         assert_eq!(seed.lease_generation, native_source.expected_generation);
-        let mut unrelated_request = (*fixture.binding.request).clone();
-        unrelated_request.plan_id = "poll-unrelated".into();
-        unrelated_request.items[0].item_id = "foreign".into();
-        unrelated_request.items[0].action = crate::pinning::management::Action::Reconcile;
-        let crate::pinning::management::Subject::Object {
-            target: selection, ..
-        } = &mut unrelated_request.items[0].subject
-        else {
-            unreachable!()
+        let unrelated = if include_unrelated_action {
+            let mut unrelated_request = (*fixture.binding.request).clone();
+            unrelated_request.plan_id = "poll-unrelated".into();
+            unrelated_request.items[0].item_id = "foreign".into();
+            unrelated_request.items[0].action = crate::pinning::management::Action::Reconcile;
+            let crate::pinning::management::Subject::Object {
+                target: selection, ..
+            } = &mut unrelated_request.items[0].subject
+            else {
+                unreachable!()
+            };
+            *selection = crate::pinning::management::TargetSelection::Existing {
+                target_id: action.targets[0].clone(),
+                source: None,
+            };
+            let unrelated_snapshot = crate::pinning::management::db_snapshot::collect_with_config(
+                &fixture.db,
+                &fixture.config,
+                &unrelated_request,
+            )
+            .await
+            .unwrap()
+            .planning_snapshot()
+            .unwrap();
+            let unrelated_plan =
+                crate::pinning::management::dry_run(&unrelated_request, &unrelated_snapshot)
+                    .unwrap();
+            let unrelated_ack = unrelated_plan
+                .items()
+                .iter()
+                .filter(|entry| entry.status == crate::pinning::management::PlanStatus::Candidate)
+                .map(|entry| entry.request.item_id.clone())
+                .collect();
+            let unrelated_binding = records::confirm(
+                &fixture.db,
+                &fixture.config,
+                &fixture.auth,
+                (&unrelated_request, &unrelated_snapshot, &unrelated_plan),
+                unrelated_ack,
+                chrono::Duration::minutes(5),
+            )
+            .await
+            .unwrap();
+            let unrelated = super::super::apply_cancellable(
+                &fixture.db,
+                &fixture.config,
+                &fixture.auth,
+                &unrelated_binding,
+                crate::store::pinning::management::transaction::CancellationToken::new(),
+            )
+            .await
+            .unwrap_or_else(|failure| {
+                panic!(
+                    "unrelated formal action failed: {:?}, transaction={:?}",
+                    failure.failure.cause, failure.transaction
+                )
+            });
+            assert!(
+                !unrelated.items[0]
+                    .receipt
+                    .intent_ids
+                    .contains(seed.lease_id.as_ref().unwrap())
+            );
+            assert!(!unrelated.items[0].receipt.job_ids.contains(&seed.job_id));
+            Some((unrelated_binding, unrelated))
+        } else {
+            None
         };
-        *selection = crate::pinning::management::TargetSelection::Existing {
-            target_id: action.targets[0].clone(),
-            source: None,
-        };
-        let unrelated_snapshot = crate::pinning::management::db_snapshot::collect_with_config(
-            &fixture.db,
-            &fixture.config,
-            &unrelated_request,
-        )
-        .await
-        .unwrap()
-        .planning_snapshot()
-        .unwrap();
-        let unrelated_plan =
-            crate::pinning::management::dry_run(&unrelated_request, &unrelated_snapshot).unwrap();
-        let unrelated_ack = unrelated_plan
-            .items()
-            .iter()
-            .filter(|entry| entry.status == crate::pinning::management::PlanStatus::Candidate)
-            .map(|entry| entry.request.item_id.clone())
-            .collect();
-        let unrelated_binding = records::confirm(
-            &fixture.db,
-            &fixture.config,
-            &fixture.auth,
-            (&unrelated_request, &unrelated_snapshot, &unrelated_plan),
-            unrelated_ack,
-            chrono::Duration::minutes(5),
-        )
-        .await
-        .unwrap();
-        let unrelated = super::super::apply(
-            &fixture.db,
-            &fixture.config,
-            &fixture.auth,
-            &unrelated_binding,
-        )
-        .await
-        .unwrap();
-        assert!(
-            !unrelated.items[0]
-                .receipt
-                .intent_ids
-                .contains(seed.lease_id.as_ref().unwrap())
-        );
-        assert!(!unrelated.items[0].receipt.job_ids.contains(&seed.job_id));
         let tx = fixture.db.begin().await.unwrap();
         let now = crate::store::database_clock::database_now(&tx)
             .await
@@ -1703,23 +1819,44 @@ mod tests {
         assert!(
             matches!(check_before_call(&tx,&poll).await.unwrap(),Some(JobPermit::Submit(authority)) if authority==expected)
         );
-        // A real unrelated action retains its full private native document, but
-        // its distinct lease/job memberships cannot admit this request-bound Poll.
-        let unrelated_record =
-            records::lookup_committed(&tx, &fixture.auth, &unrelated_binding, "foreign")
+        let reader =
+            fence_worker_authority_with_work(&tx, &poll, records::SharedDecodeBudget::default())
                 .await
-                .unwrap()
                 .unwrap();
-        assert!(unrelated_record == unrelated.items[0]);
-        assert!(!unrelated_record.receipt.job_ids.contains(&poll.id));
-        let indexed = records::actions_for_job(&tx, &poll).await.unwrap();
-        assert!(
-            !indexed
-                .iter()
-                .any(|candidate| candidate.action_view().receipt.binding.id
-                    == unrelated_record.receipt.binding.id)
-        );
-        assert!(lookup(&tx, &poll).await.unwrap().as_ref() == Some(&expected));
+        assert!(reader.projection_allowed().await.unwrap());
+        let backfill = tx.begin().await.unwrap();
+        backfill
+            .execute_unprepared("UPDATE pin_management_readiness SET state='backfill' WHERE id=1")
+            .await
+            .unwrap();
+        assert!(reader.projection_allowed().await.is_err());
+        assert!(reader.fresh_source_allowed(None, None).await.is_err());
+        backfill.rollback().await.unwrap();
+        if let Some((unrelated_binding, unrelated)) = &unrelated {
+            // A real unrelated action retains its full private native document, but
+            // its distinct lease/job memberships cannot admit this request-bound Poll.
+            let unrelated_record =
+                records::lookup_committed(&tx, &fixture.auth, unrelated_binding, "foreign")
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert!(unrelated_record == unrelated.items[0]);
+            assert!(!unrelated_record.receipt.job_ids.contains(&poll.id));
+            let indexed = crate::store::pinning::management::admission::authority::actions_for_job(
+                &tx,
+                &poll,
+                records::SharedDecodeBudget::default(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                !indexed
+                    .iter()
+                    .any(|candidate| candidate.action_view().receipt.binding.id
+                        == unrelated_record.receipt.binding.id)
+            );
+            assert!(lookup(&tx, &poll).await.unwrap().as_ref() == Some(&expected));
+        }
         let mut wrong_generation = poll.clone();
         wrong_generation.expected_generation = Some(seed.lease_generation.unwrap() + 1);
         assert!(matches!(
@@ -1737,6 +1874,7 @@ mod tests {
         changed.route = Set(serde_json::to_string(&wrong_route).unwrap());
         changed.update(&tx).await.unwrap();
         assert!(lookup(&tx, &poll).await.is_err());
+        assert!(reader.projection_allowed().await.is_err());
         let mut restored = invocation.into_active_model();
         restored.route = Set(serde_json::to_string(&seed.route).unwrap());
         restored.update(&tx).await.unwrap();
@@ -1755,6 +1893,7 @@ mod tests {
         assert!(
             matches!(check_before_call(&tx,&poll).await.unwrap(),Some(JobPermit::LedgerOnly(authority)) if authority==expected)
         );
+        assert!(!reader.projection_allowed().await.unwrap());
         let mut restored = invocation.clone().into_active_model();
         restored.remote_epoch = Set(invocation.remote_epoch);
         restored.update(&tx).await.unwrap();
@@ -1788,6 +1927,7 @@ mod tests {
         assert!(
             matches!(check_before_call(&tx,&poll).await.unwrap(),Some(JobPermit::LedgerOnly(authority)) if authority==expected)
         );
+        assert!(!reader.projection_allowed().await.unwrap());
         let original_source = lease.source.clone();
         let mut restored = lease.into_active_model();
         restored.source = Set(original_source);
@@ -1803,14 +1943,39 @@ mod tests {
         let mut restored = source.into_active_model();
         restored.lease_id = Set(original_lease);
         restored.update(&tx).await.unwrap();
+        assert!(reader.projection_allowed().await.unwrap());
+        let missing_history = tx.begin().await.unwrap();
+        crate::store::pinning::jobs::history::Entity::delete_by_id(seed.job_id.clone())
+            .exec(&missing_history)
+            .await
+            .unwrap();
+        assert!(lookup(&missing_history, &poll).await.is_err());
+        assert!(check_before_call(&missing_history, &poll).await.is_err());
+        assert!(projection_allowed(&missing_history, &poll).await.is_err());
+        assert!(reader.projection_allowed().await.is_err());
+        assert!(reader.fresh_source_allowed(None, None).await.is_err());
+        assert!(
+            reader
+                .projection_and_source_allowed(None, None)
+                .await
+                .is_err()
+        );
+        missing_history.rollback().await.unwrap();
         pin_job::Entity::delete_by_id(seed.job_id.clone())
             .exec(&tx)
             .await
             .unwrap();
-        assert!(matches!(
-            lookup(&tx, &poll).await,
-            Ok(None) | Err(ManagementError::Confirmation | ManagementError::InvalidEvidence)
-        ));
+        assert!(lookup(&tx, &poll).await.is_err());
+        assert!(check_before_call(&tx, &poll).await.is_err());
+        assert!(projection_allowed(&tx, &poll).await.is_err());
+        assert!(reader.projection_allowed().await.is_err());
+        assert!(reader.fresh_source_allowed(None, None).await.is_err());
+        assert!(
+            reader
+                .projection_and_source_allowed(None, None)
+                .await
+                .is_err()
+        );
         tx.rollback().await.unwrap();
     }
 }

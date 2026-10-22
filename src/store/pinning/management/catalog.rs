@@ -151,6 +151,30 @@ pub async fn validate<C: ConnectionTrait>(db: &C, tables: &[NativeTable]) -> Res
 }
 /// Single-table catalog only: no current-schema constraints or history probes.
 pub(crate) async fn validate_table<C: ConnectionTrait>(db: &C, table: &NativeTable) -> Result<()> {
+    if db.get_database_backend() == DatabaseBackend::Sqlite && table.table == "pin_provider_routes"
+    {
+        let shape = db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "SELECT EXISTS(SELECT 1 FROM sqlite_temp_schema WHERE name IN ('seaql_migrations',$1) AND type IN ('table','view')) AS shadow,EXISTS(SELECT 1 FROM pragma_table_list WHERE schema='main' AND name=$1 AND type='table') AS main_table",
+                [table.table.clone().into()],
+            ))
+            .await
+            .map_err(|_| ManagementError::Schema)?
+            .ok_or(ManagementError::Schema)?;
+        if shape
+            .try_get::<i32>("", "shadow")
+            .map_err(|_| ManagementError::Schema)?
+            != 0
+            || shape
+                .try_get::<i32>("", "main_table")
+                .map_err(|_| ManagementError::Schema)?
+                != 1
+        {
+            return Err(ManagementError::Schema);
+        }
+        return sqlite_columns(db, table).await;
+    }
     reject_shadow(db, "seaql_migrations").await?;
     reject_shadow(db, &table.table).await?;
     match db.get_database_backend() {
@@ -178,6 +202,9 @@ async fn sqlite<C: ConnectionTrait>(db: &C, table: &NativeTable) -> Result<()> {
             return Err(ManagementError::Schema);
         }
     }
+    sqlite_columns(db, table).await
+}
+async fn sqlite_columns<C: ConnectionTrait>(db: &C, table: &NativeTable) -> Result<()> {
     let rows=db.query_all(Statement::from_sql_and_values(DatabaseBackend::Sqlite,"SELECT name,type,\"notnull\" AS required,pk,hidden FROM pragma_table_xinfo($1) ORDER BY name",[table.table.clone().into()])).await.map_err(|_|ManagementError::Schema)?;
     if rows.len() != table.definitions.len() {
         return Err(ManagementError::Schema);

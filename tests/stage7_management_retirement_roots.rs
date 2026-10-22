@@ -135,6 +135,38 @@ fn request(
     }
 }
 
+async fn current_status(
+    fixture: &support::Fixture,
+    binding: &records::ConfirmedBinding,
+) -> records::ActionState {
+    let mut workspace = retirement::Workspace::create().unwrap();
+    let (path, file) = workspace.reserve().await.unwrap();
+    let mut limits = retirement::RunLimits::default();
+    limits.pages = 512;
+    let mut lookup = actions::status::lookup_retirement_with_work(
+        &fixture.db,
+        &fixture.auth,
+        binding,
+        "provider",
+        &path,
+        file,
+        &limits,
+        records::SharedDecodeBudget::default(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let state = lookup
+        .advance(&fixture.db, &limits)
+        .await
+        .unwrap()
+        .unwrap()
+        .state;
+    lookup.close().await.unwrap();
+    workspace.cleanup().unwrap();
+    state
+}
+
 #[tokio::test]
 async fn exact_root_release_preserves_shared_history_and_replays_without_business_writes() {
     let fixture = support::Fixture::new().await;
@@ -172,20 +204,25 @@ async fn exact_root_release_preserves_shared_history_and_replays_without_busines
     assert!(result.items[0].root_releases == vec![selected.clone()]);
     assert!(!result.items[0].root_releases.contains(&shared));
     assert_eq!(
-        actions::status::lookup(&fixture.db, &fixture.auth, &binding, "provider")
-            .await
-            .unwrap()
-            .unwrap()
-            .state,
+        current_status(&fixture, &binding).await,
         records::ActionState::NeedsAttention
     );
-    let before_replay = native::capture(&fixture.db).await.unwrap();
+    let before_replay = zip_root_reference::Entity::find()
+        .all(&fixture.db)
+        .await
+        .unwrap();
     let replay = actions::apply(&fixture.db, &fixture.config, &fixture.auth, &binding)
         .await
         .unwrap();
     assert!(replay.replayed);
     assert!(replay.items == result.items);
-    assert!(native::capture(&fixture.db).await.unwrap() == before_replay);
+    assert_eq!(
+        zip_root_reference::Entity::find()
+            .all(&fixture.db)
+            .await
+            .unwrap(),
+        before_replay
+    );
     assert_eq!(
         records::read_retirement(
             &fixture.db,
@@ -260,11 +297,7 @@ async fn root_marker_cas_fault_rolls_back_the_retirement_and_receipt() {
         .await
         .unwrap();
     assert_eq!(
-        actions::status::lookup(&fixture.db, &fixture.auth, &binding, "provider")
-            .await
-            .unwrap()
-            .unwrap()
-            .state,
+        current_status(&fixture, &binding).await,
         records::ActionState::Accepted
     );
 }

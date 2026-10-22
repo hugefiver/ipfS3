@@ -2,6 +2,10 @@ use std::collections::BTreeSet;
 
 use super::model::*;
 
+#[cfg(test)]
+#[path = "validate_history_tests.rs"]
+mod history_tests;
+
 pub const MAX_ITEMS: usize = 128;
 pub const MAX_RECORDS: usize = 4096;
 pub const MAX_TEXT_BYTES: usize = 4 * 1024 * 1024;
@@ -326,6 +330,14 @@ impl Budget {
     }
 
     fn request(&mut self, request: &ItemRequest) -> Result<(), SafeError> {
+        self.request_with_selection_limit(request, MAX_ITEMS)
+    }
+
+    fn request_with_selection_limit(
+        &mut self,
+        request: &ItemRequest,
+        selection_limit: usize,
+    ) -> Result<(), SafeError> {
         self.rows(1)?;
         label(&request.item_id)?;
         self.id(&request.item_id)?;
@@ -359,7 +371,7 @@ impl Budget {
                 match selection {
                     RetirementSelection::Retain => {}
                     RetirementSelection::ReleaseRootReferences { references } => {
-                        if references.is_empty() || references.len() > MAX_RECORDS {
+                        if references.is_empty() || references.len() > selection_limit {
                             return Err(SafeError::LimitExceeded);
                         }
                         unique(references.iter())?;
@@ -369,7 +381,7 @@ impl Budget {
                     }
                     RetirementSelection::Migrate { targets } => {
                         self.rows(targets.len())?;
-                        if targets.is_empty() || targets.len() > MAX_RECORDS {
+                        if targets.is_empty() || targets.len() > selection_limit {
                             return Err(SafeError::LimitExceeded);
                         }
                         unique(targets.iter().map(|target| {
@@ -386,7 +398,7 @@ impl Budget {
                     }
                     RetirementSelection::ControlledCleanup { resources } => {
                         self.rows(resources.len())?;
-                        if resources.len() > MAX_RECORDS {
+                        if resources.len() > selection_limit {
                             return Err(SafeError::LimitExceeded);
                         }
                         unique(
@@ -451,20 +463,24 @@ impl Budget {
                 }
             }
             Capture::Provider(capture) => {
-                self.inventory(&capture.inventory)?;
-                for route in &capture.routes {
+                self.id(&capture.inventory.archive_id)?;
+                self.id(&capture.inventory.inventory_id)?;
+                if capture.inventory.reducer_version != super::retirement::REDUCER_VERSION {
+                    return Err(SafeError::UnknownEvidence);
+                }
+                for route in &capture.mutation_scope.routes {
                     self.route(&route.identity)?;
                 }
-                for target in &capture.targets {
+                for target in &capture.mutation_scope.targets {
                     self.target(target)?;
                 }
-                for remote in &capture.remotes {
+                for remote in &capture.mutation_scope.remotes {
                     self.remote(remote)?;
                 }
-                for remote in &capture.historical_remotes {
+                for remote in &capture.mutation_scope.historical_remotes {
                     self.remote(remote)?;
                 }
-                for root in &capture.root_references {
+                for root in &capture.mutation_scope.root_references {
                     self.root_reference(root)?;
                 }
             }
@@ -520,6 +536,19 @@ pub(crate) fn label(value: &str) -> Result<(), SafeError> {
 }
 
 pub fn validate_request(request: &PlanRequest) -> Result<(), SafeError> {
+    validate_request_with_selection_limit(request, MAX_ITEMS)
+}
+
+/// Pure validation of frozen request data under its original selection bounds.
+/// This does not authorize planning, confirmation, or execution of a new action.
+pub(crate) fn validate_historical_request(request: &PlanRequest) -> Result<(), SafeError> {
+    validate_request_with_selection_limit(request, MAX_RECORDS)
+}
+
+fn validate_request_with_selection_limit(
+    request: &PlanRequest,
+    selection_limit: usize,
+) -> Result<(), SafeError> {
     label(&request.plan_id)?;
     if request.items.is_empty() || request.items.len() > MAX_ITEMS {
         return Err(SafeError::LimitExceeded);
@@ -527,7 +556,7 @@ pub fn validate_request(request: &PlanRequest) -> Result<(), SafeError> {
     unique(request.items.iter().map(|item| &item.item_id))?;
     let mut budget = Budget::default();
     for item in &request.items {
-        budget.request(item)?;
+        budget.request_with_selection_limit(item, selection_limit)?;
     }
     Ok(())
 }

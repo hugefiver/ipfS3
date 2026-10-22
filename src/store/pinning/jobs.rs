@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     time::Duration,
 };
 
@@ -76,21 +76,14 @@ pub async fn submission_history<C: ConnectionTrait>(
 
 /// Read-only proof for an explicit management Retry of the exact parked source.
 /// A NULL claim alone never proves a call did not create a resource.
+#[cfg(test)]
 pub(crate) async fn management_retryable_park<C: ConnectionTrait>(
     db: &C,
     job: &pin_job::Model,
     route: &crate::pinning::identity::ProviderRouteSnapshot,
 ) -> AppResult<bool> {
     let work = SharedDecodeBudget::default();
-    management_retryable_park_with_work(db, job, route, DecodeWork::shared(&work)).await
-}
-pub(crate) async fn management_retryable_park_with_work<C: ConnectionTrait>(
-    db: &C,
-    job: &pin_job::Model,
-    route: &crate::pinning::identity::ProviderRouteSnapshot,
-    work: DecodeWork<'_>,
-) -> AppResult<bool> {
-    management_retryable_park_at_allocation(db, job, route, None, work).await
+    management_retryable_park_at_allocation(db, job, route, None, DecodeWork::shared(&work)).await
 }
 
 fn management_decode<T: serde::de::DeserializeOwned>(
@@ -327,10 +320,11 @@ async fn management_park_allocation_continuity(
     {
         return Ok(false);
     }
-    let current_rows = records::CurrentRows::capture(tx, work)
-        .await
-        .map_err(management_error)?;
-    let after = FrozenRows::Current(&current_rows);
+    let current_rows =
+        super::management::actions::job_authority::park_scope::capture(tx, job, before, work)
+            .await
+            .map_err(management_error)?;
+    let after = FrozenRows::Frame(&current_rows);
     if before.scope() != after.scope() || before.identity() != after.identity() {
         return Ok(false);
     }
@@ -655,6 +649,7 @@ pub async fn record_submit_invocation<C: ConnectionTrait>(
     let work = SharedDecodeBudget::default();
     record_submit_invocation_with_work(db, claimed, api, strategy, now, DecodeWork::shared(&work))
         .await
+        .map(|_| ())
 }
 pub(crate) async fn record_submit_invocation_with_work<C: ConnectionTrait>(
     db: &C,
@@ -663,7 +658,7 @@ pub(crate) async fn record_submit_invocation_with_work<C: ConnectionTrait>(
     strategy: &str,
     now: DateTimeUtc,
     work: DecodeWork<'_>,
-) -> AppResult<()> {
+) -> AppResult<Option<history::Model>> {
     super::management::admission::lock_sqlite_writer_in_caller_transaction(db).await?;
     if !super::ledger::submit_dispatch_open_with_work(db, &claimed.model, work).await? {
         return Err(invalid_job(
@@ -695,7 +690,7 @@ pub(crate) async fn record_submit_invocation_with_work<C: ConnectionTrait>(
     super::ledger::advance_submit_invocation_epoch(db, claimed, api, strategy).await?;
     super::quota::lock_allocation_admission_with_work(db, &claimed.model.provider, work).await?;
     let old = submission_history(db, &claimed.model.id).await?;
-    if let Some(old) = old {
+    if let Some(old) = &old {
         if old.api != api
             || old.strategy != strategy
             || old.submit_calls >= MAX_SUBMIT_RECOVERY_ATTEMPTS
@@ -739,7 +734,7 @@ pub(crate) async fn record_submit_invocation_with_work<C: ConnectionTrait>(
         &claimed.model.cid,
     )
     .await?;
-    Ok(())
+    Ok(old)
 }
 
 pub async fn record_submit_error<C: ConnectionTrait>(
@@ -1523,6 +1518,18 @@ pub async fn ensure_or_reactivate_unpin_job<C: ConnectionTrait>(
     }
 }
 
+/// Reserve SQLite's writer before the claim transaction establishes a read snapshot.
+async fn lock_sqlite_claim_writer<C: ConnectionTrait>(db: &C) -> Result<(), sea_orm::DbErr> {
+    if db.get_database_backend() == sea_orm::DatabaseBackend::Sqlite {
+        db.execute(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Sqlite,
+            "UPDATE main.pin_jobs SET id=id WHERE 1=0",
+        ))
+        .await?;
+    }
+    Ok(())
+}
+
 /// Claims due unlocked work. Expired Submit locks are reclaimed in `recovering` before return.
 pub async fn claim_due_jobs<C: ConnectionTrait + TransactionTrait>(
     db: &C,
@@ -1535,6 +1542,7 @@ pub async fn claim_due_jobs<C: ConnectionTrait + TransactionTrait>(
         let result = db
             .transaction(|txn| {
                 Box::pin(async move {
+                    lock_sqlite_claim_writer(txn).await?;
                     let candidates = pin_job::Entity::find()
                         .filter(due_claim_condition(now))
                         .order_by_asc(pin_job::Column::NextAttemptAt)
@@ -1652,9 +1660,16 @@ pub(crate) async fn claim_due_management_jobs(
     Ok(claimed)
 }
 
+pub(crate) struct WorkerClaimSchedule<'a> {
+    pub in_flight_by_provider: &'a BTreeMap<String, usize>,
+    pub last_served_ticket_by_provider: &'a BTreeMap<String, u64>,
+    pub configured_priorities: &'a BTreeMap<String, u32>,
+    pub active_job_ids: &'a BTreeSet<String>,
+}
+
 /// Claims due work using provider occupancy and recent-service tickets for fair scheduling.
 ///
-/// Candidate selection performs no writes. The selected rows are then claimed in globally stable
+/// SQLite reserves its writer before candidate reads. The selected rows are then claimed in globally stable
 /// job-id order so concurrent PostgreSQL claimants cannot acquire overlapping row locks in
 /// opposite provider-local orders. Successful claims are returned in their original fair order.
 pub async fn claim_due_jobs_fair<C: ConnectionTrait + TransactionTrait>(
@@ -1666,21 +1681,50 @@ pub async fn claim_due_jobs_fair<C: ConnectionTrait + TransactionTrait>(
     last_served_ticket_by_provider: &BTreeMap<String, u64>,
     configured_priorities: &BTreeMap<String, u32>,
 ) -> AppResult<Vec<ClaimedPinJob>> {
+    claim_due_worker_jobs_fair(
+        db,
+        now,
+        lock_for,
+        limit,
+        WorkerClaimSchedule {
+            in_flight_by_provider,
+            last_served_ticket_by_provider,
+            configured_priorities,
+            active_job_ids: &BTreeSet::new(),
+        },
+    )
+    .await
+}
+
+/// Excludes this worker's live tasks before candidate limits and claim writes.
+pub(crate) async fn claim_due_worker_jobs_fair<C: ConnectionTrait + TransactionTrait>(
+    db: &C,
+    now: DateTimeUtc,
+    lock_for: ChronoDuration,
+    limit: u64,
+    schedule: WorkerClaimSchedule<'_>,
+) -> AppResult<Vec<ClaimedPinJob>> {
     if limit == 0 {
         return Ok(Vec::new());
     }
     let locked_until = now + lock_for;
     for attempt in 0..=MAX_SQLITE_CLAIM_RETRIES {
-        let in_flight_by_provider = in_flight_by_provider.clone();
-        let last_served_ticket_by_provider = last_served_ticket_by_provider.clone();
-        let configured_priorities = configured_priorities.clone();
+        let in_flight_by_provider = schedule.in_flight_by_provider.clone();
+        let last_served_ticket_by_provider = schedule.last_served_ticket_by_provider.clone();
+        let configured_priorities = schedule.configured_priorities.clone();
+        let active_job_ids = schedule.active_job_ids.clone();
         let result = db
             .transaction(|txn| {
                 Box::pin(async move {
+                    lock_sqlite_claim_writer(txn).await?;
+                    let mut due = Condition::all().add(due_claim_condition(now));
+                    if !active_job_ids.is_empty() {
+                        due = due.add(pin_job::Column::Id.is_not_in(active_job_ids));
+                    }
                     let due_providers: Vec<String> = pin_job::Entity::find()
                         .select_only()
                         .column(pin_job::Column::Provider)
-                        .filter(due_claim_condition(now))
+                        .filter(due.clone())
                         .group_by(pin_job::Column::Provider)
                         .into_tuple()
                         .all(txn)
@@ -1689,7 +1733,7 @@ pub async fn claim_due_jobs_fair<C: ConnectionTrait + TransactionTrait>(
                     let mut candidates_by_provider = BTreeMap::new();
                     for provider in due_providers {
                         let candidates = pin_job::Entity::find()
-                            .filter(due_claim_condition(now))
+                            .filter(due.clone())
                             .filter(pin_job::Column::Provider.eq(provider.clone()))
                             .order_by_asc(pin_job::Column::NextAttemptAt)
                             .order_by_asc(pin_job::Column::Id)
@@ -2135,20 +2179,6 @@ pub(crate) async fn check_target_job_generation_with_work<C: ConnectionTrait>(
 
 /// A Poll may follow reference-only remote epoch increments, but it must still
 /// name the original request and the current canonical target/generation.
-pub(crate) async fn poll_continuity_owner<C: ConnectionTrait>(
-    db: &C,
-    job: &pin_job::Model,
-    request_id: &str,
-) -> AppResult<bool> {
-    if job.operation != "poll" || !check_target_job_generation(db, job).await? {
-        return Ok(false);
-    }
-    Ok(poll_names_request(db, job, request_id).await?
-        && canonical_desired_target(db, &job.provider, &job.cid)
-            .await?
-            .is_some_and(|target| Some(target.id.as_str()) == job.target_id.as_deref()))
-}
-
 pub(crate) async fn poll_continuity_owner_with_work<C: ConnectionTrait>(
     db: &C,
     job: &pin_job::Model,
@@ -3128,7 +3158,7 @@ async fn canonical_desired_target<C: ConnectionTrait>(
         .await?)
 }
 
-async fn canonical_desired_target_with_work<C: ConnectionTrait>(
+pub(crate) async fn canonical_desired_target_with_work<C: ConnectionTrait>(
     db: &C,
     provider: &str,
     cid: &str,
@@ -3734,6 +3764,99 @@ mod tests {
         .unwrap();
         assert_eq!(refill.len(), 1);
         assert_eq!(refill[0].model.provider, "third");
+    }
+
+    #[tokio::test]
+    async fn fair_claim_excludes_locally_active_expired_jobs_without_starving_the_next_candidate() {
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            directory
+                .path()
+                .join("fair-active.db")
+                .display()
+                .to_string()
+                .replace('\\', "/")
+        );
+        let db = Database::connect(&url).await.unwrap();
+        crate::store::run_migrations(&db).await.unwrap();
+        let other_worker = Database::connect(&url).await.unwrap();
+        enqueue_job(&db, unpin_job("provider", "active", 1, time(0)))
+            .await
+            .unwrap();
+        let active = claim_due_jobs_fair(
+            &db,
+            time(1),
+            Duration::seconds(30),
+            1,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+        enqueue_job(&db, unpin_job("provider", "next", 1, time(2)))
+            .await
+            .unwrap();
+        let active_job_ids = BTreeSet::from([active.model.id.clone()]);
+        let occupancy = BTreeMap::from([("provider".to_owned(), 1)]);
+        let refill = claim_due_worker_jobs_fair(
+            &db,
+            time(60),
+            Duration::seconds(30),
+            1,
+            WorkerClaimSchedule {
+                in_flight_by_provider: &occupancy,
+                last_served_ticket_by_provider: &BTreeMap::new(),
+                configured_priorities: &BTreeMap::new(),
+                active_job_ids: &active_job_ids,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(refill.len(), 1);
+        assert_eq!(refill[0].model.cid, "next");
+        assert!(!refill[0].reclaimed);
+        assert_eq!(job(&db, &active.model.id).await, active.model);
+        complete_job(
+            &db,
+            &refill[0].model.id,
+            refill[0].model.locked_until.unwrap(),
+            time(60),
+        )
+        .await
+        .unwrap();
+
+        // Local activity is not a durable lock against another worker's recovery.
+        let reclaimed = claim_due_jobs_fair(
+            &other_worker,
+            time(60),
+            Duration::seconds(30),
+            1,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+        assert_eq!(reclaimed.model.id, active.model.id);
+        assert!(reclaimed.reclaimed);
+        assert_ne!(reclaimed.model.locked_until, active.model.locked_until);
+        assert!(
+            complete_job(
+                &db,
+                &active.model.id,
+                active.model.locked_until.unwrap(),
+                time(60),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(job(&db, &active.model.id).await, reclaimed.model);
     }
 
     #[tokio::test]

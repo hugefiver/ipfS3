@@ -161,11 +161,11 @@ async fn migration_roundtrip(db: &DatabaseConnection) {
     let manager = SchemaManager::new(db);
     Migration.down(&manager).await.unwrap();
     assert_eq!(native_root_rows(db).await, before);
-    db.execute_unprepared(
-        "DELETE FROM seaql_migrations WHERE version='m20261013_000001_zip_root_logical_release'",
-    )
-    .await
-    .unwrap();
+    assert!(matches!(
+        store::run_migrations(db).await,
+        Err(sea_orm::DbErr::Migration(_))
+    ));
+    Migration.up(&manager).await.unwrap();
     store::run_migrations(db).await.unwrap();
     assert_eq!(native_root_rows(db).await, before);
     let frame = store::pinning::management::native::capture(db)
