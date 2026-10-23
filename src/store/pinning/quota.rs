@@ -346,6 +346,13 @@ pub async fn reserve_unique<C: ConnectionTrait>(
     reserve_unique_for_intent(db, provider, cid, cid_size, limits, now, false).await
 }
 
+#[derive(Clone, Copy)]
+enum ReservationIntent {
+    Admission,
+    Publication,
+    Waiter,
+}
+
 pub(crate) async fn reserve_unique_with_work<C: ConnectionTrait>(
     db: &C,
     provider: &str,
@@ -355,8 +362,16 @@ pub(crate) async fn reserve_unique_with_work<C: ConnectionTrait>(
     now: DateTimeUtc,
     work: DecodeWork<'_>,
 ) -> AppResult<ReservationOutcome> {
-    reserve_unique_for_intent_with_work(db, (provider, cid), cid_size, limits, now, false, work)
-        .await
+    reserve_unique_for_intent_with_work(
+        db,
+        (provider, cid),
+        cid_size,
+        limits,
+        now,
+        ReservationIntent::Publication,
+        work,
+    )
+    .await
 }
 
 /// An existing waiter retains the *original* admission decision. Operator debt
@@ -388,7 +403,11 @@ async fn reserve_unique_for_intent<C: ConnectionTrait>(
         cid_size,
         limits,
         now,
-        waiter,
+        if waiter {
+            ReservationIntent::Waiter
+        } else {
+            ReservationIntent::Admission
+        },
         DecodeWork::shared(&work),
     )
     .await
@@ -399,9 +418,10 @@ async fn reserve_unique_for_intent_with_work<C: ConnectionTrait>(
     cid_size: i64,
     limits: &ProviderLimitMap,
     now: DateTimeUtc,
-    waiter: bool,
+    intent: ReservationIntent,
     work: DecodeWork<'_>,
 ) -> AppResult<ReservationOutcome> {
+    let waiter = matches!(intent, ReservationIntent::Waiter);
     super::management::admission::lock_sqlite_writer_in_caller_transaction(db).await?;
     if super::legacy_migration::source_is_migrated_with_work(db, provider, work)
         .await
@@ -425,9 +445,7 @@ async fn reserve_unique_for_intent_with_work<C: ConnectionTrait>(
         {
             Ok(ReserveAttempt::Outcome(outcome)) => Ok(Some(outcome)),
             Ok(ReserveAttempt::Waiting(usage)) => {
-                let evict = if waiter {
-                    Ok(Vec::new())
-                } else {
+                let evict = if matches!(intent, ReservationIntent::Admission) {
                     eviction_candidates(
                         db,
                         provider,
@@ -436,6 +454,8 @@ async fn reserve_unique_for_intent_with_work<C: ConnectionTrait>(
                         provider_limits(limits, provider)?,
                     )
                     .await
+                } else {
+                    Ok(Vec::new())
                 };
                 evict.map(|evict| Some(ReservationOutcome::QuotaWaiting { evict }))
             }
@@ -1825,6 +1845,55 @@ mod tests {
         ))
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn publication_admission_omits_unused_advice_but_public_reserve_keeps_it() {
+        let db = setup().await;
+        let limits = limits(100, 1);
+        reserve_unique(&db, "pinata", "bafy-holder", 40, &limits, time(0))
+            .await
+            .unwrap();
+        seed_active_target(&db, "bafy-holder", "holder", time(0)).await;
+        for (cid, absent) in [("bafy-new", false), ("bafy-absent", true)] {
+            if absent {
+                db.execute_unprepared(&format!(
+                    "INSERT INTO remote_pins(provider,cid,cid_size,status,epoch,failure_attempts,last_touched_at) \
+                     VALUES('pinata','{cid}',30,'absent',1,0,'{}')", time(0).to_rfc3339(),
+                )).await.unwrap();
+            }
+            let tx = db.begin().await.unwrap();
+            let work = super::SharedDecodeBudget::default();
+            super::order_events::clear();
+            let outcome = super::reserve_unique_with_work(
+                &tx,
+                "pinata",
+                cid,
+                30,
+                &limits,
+                time(1),
+                super::DecodeWork::shared(&work),
+            )
+            .await
+            .unwrap();
+            let events = super::order_events::take();
+            assert_eq!(
+                outcome,
+                ReservationOutcome::QuotaWaiting { evict: Vec::new() }
+            );
+            assert!(!events.contains(&"eviction_candidates"));
+            tx.commit().await.unwrap();
+            let outcome = reserve_unique(&db, "pinata", cid, 30, &limits, time(1))
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome,
+                ReservationOutcome::QuotaWaiting {
+                    evict: vec![("pinata".into(), "bafy-holder".into())]
+                }
+            );
+            assert_eq!(usage(&db).await, (40, 1));
+        }
     }
 
     #[test]

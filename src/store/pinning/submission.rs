@@ -31,6 +31,10 @@ use crate::{
 mod bounded;
 pub(crate) use bounded::{latest_rpc, latest_rpc_with_work, rejected_non_rpc_call_with_work};
 
+#[cfg(test)]
+#[path = "submission_context_tests.rs"]
+mod context_tests;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceEvidence {
     pub resource: ObservedResource,
@@ -624,25 +628,32 @@ impl AdmissionSnapshot {
             .collect::<Vec<_>>()
             .join(",");
         let scope = format!("\"provider\" IN ({slots})");
-        let invocation_scope = format!(
-            "\"job_id\" IN (SELECT \"job_id\" FROM \"pin_submit_observations\" WHERE {scope})"
+        let evidence_jobs =
+            format!("SELECT \"job_id\" FROM \"pin_submit_observations\" WHERE {scope}");
+        let invocation_scope = format!("\"job_id\" IN ({evidence_jobs})");
+        let job_scope = format!("{scope} AND \"id\" IN ({evidence_jobs})");
+        let remote_scope = format!(
+            "{scope} AND \"cid\" IN (SELECT \"expected_cid\" FROM \"pin_submit_observations\" WHERE {scope})"
+        );
+        let target_scope = format!(
+            "{scope} AND \"id\" IN (SELECT \"target_id\" FROM \"pin_jobs\" WHERE {job_scope})"
+        );
+        let lease_scope = format!(
+            "\"id\" IN (SELECT \"lease_id\" FROM \"pin_lease_targets\" WHERE {scope}) \
+             AND \"id\" IN (SELECT \"lease_id\" FROM \"pin_jobs\" WHERE {job_scope} \
+             UNION SELECT \"lease_id\" FROM \"pin_lease_targets\" WHERE {target_scope})"
         );
         let tables = [
             admission_table::<evidence::Entity>("evidence", &scope),
-            admission_table::<pin_job::Entity>("job", &scope),
+            admission_table::<pin_job::Entity>("job", &job_scope),
             admission_table::<jobs::history::Entity>("history", &invocation_scope),
-            admission_table::<remote_pin::Entity>("remote", &scope),
+            admission_table::<remote_pin::Entity>("remote", &remote_scope),
             admission_table::<pin_invocation_route::Entity>("capture", &invocation_scope),
             admission_table::<remote_pin_ledger::Entity>("ledger", &scope),
             admission_table::<pin_provider_route::Entity>("registered", "\"provider\" = $1"),
             admission_table::<pin_resource_history::Entity>("archive", &scope),
-            admission_table::<pin_lease_target::Entity>("target", &scope),
-            admission_table::<pin_lease::Entity>(
-                "lease",
-                &format!(
-                    "\"id\" IN (SELECT \"lease_id\" FROM \"pin_lease_targets\" WHERE {scope})"
-                ),
-            ),
+            admission_table::<pin_lease_target::Entity>("target", &target_scope),
+            admission_table::<pin_lease::Entity>("lease", &lease_scope),
         ];
         let mut columns = BTreeMap::new();
         for table in &tables {
