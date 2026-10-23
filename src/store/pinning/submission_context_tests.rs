@@ -94,15 +94,9 @@ async fn database() -> (DatabaseConnection, String) {
         cleanup: CleanupMode::Managed,
     };
     let provider = identity.allocation_key();
-    pin_provider_route::Entity::insert(pin_provider_route::ActiveModel {
-        provider: Set(provider.clone()),
-        snapshot: Set(serde_json::to_string(&identity.route_snapshot()).unwrap()),
-        display_name: Set(identity.display_name.clone()),
-        retired: Set(false),
-    })
-    .exec(&db)
-    .await
-    .unwrap();
+    crate::store::pinning::ledger::register_route(&db, &provider, &identity)
+        .await
+        .unwrap();
     (db, provider)
 }
 

@@ -4,6 +4,7 @@ use sea_orm::TransactionTrait;
 use sha2::digest::common::hazmat::{SerializableState, SerializedState};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Seek, SeekFrom};
+mod transfer;
 
 const OUTPUT: &str = "planning-review-output";
 
@@ -361,12 +362,12 @@ impl PreparedPlanning {
                 budget = returned;
                 async {
                     checked.map_err(planning::safe)?;
-                    let returned = if projection == Projection::Review {
+                    if projection == Projection::Review {
                         let mut output = PageOutput::new(&mut file, limits, pages.clone());
                         tokio::select! {
                             biased;
                             _ = limits.cancellation.cancelled() => return Err(ManagementError::Budget),
-                            result = segmented::read_archive_raw(&primary.db, &reference, &mut output, &mut budget) => result?,
+                            result = transfer::copy(&primary.db, &reference, &raw, &mut output, &mut budget) => result?,
                         }
                     } else {
                         let mut output = CheckedOutput {
@@ -376,12 +377,9 @@ impl PreparedPlanning {
                         tokio::select! {
                             biased;
                             _ = limits.cancellation.cancelled() => return Err(ManagementError::Budget),
-                            result = segmented::read_archive_raw(&primary.db, &reference, &mut output, &mut budget) => result?,
+                            result = transfer::copy(&primary.db, &reference, &raw, &mut output, &mut budget) => result?,
                         }
                     };
-                    if returned != raw {
-                        return Err(ManagementError::Changed);
-                    }
                     limits.check()?;
                     file.sync_all().map_err(|_| ManagementError::Database)?;
                     file.seek(SeekFrom::Start(0))

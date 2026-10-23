@@ -4,7 +4,7 @@ mod support;
 use ipfs_s3_gateway::{
     pinning::management::{
         Capture, PlanStatus, db_snapshot,
-        retirement::{ConfirmationProgress, PlanningCheckpoint, PlanningProgress, RunLimits},
+        retirement::{ConfirmationProgress, PlanningCheckpoint, PlanningProgress},
         wire::v3,
     },
     store::pinning::management::records,
@@ -111,8 +111,7 @@ async fn real_100k_two_provider_cli_output_and_original_confirmation_recovery() 
         .unwrap()
         .planning_snapshot()
         .unwrap();
-    let mut limits = RunLimits::default();
-    limits.pages = 512;
+    let limits = support::cli_limits();
     let mut task = PlanningCheckpoint::resume(
         &checkpoint,
         &fixture.db,
@@ -125,8 +124,7 @@ async fn real_100k_two_provider_cli_output_and_original_confirmation_recovery() 
     .unwrap();
     let frozen = task.snapshot().clone();
     let prepared = loop {
-        let mut limits = RunLimits::default();
-        limits.pages = 512;
+        let limits = support::cli_limits();
         let previous = task.total_work().await.unwrap();
         match task.advance(&fixture.db, &limits).await.unwrap() {
             PlanningProgress::Complete(prepared) => break prepared,
@@ -140,8 +138,7 @@ async fn real_100k_two_provider_cli_output_and_original_confirmation_recovery() 
     let staging_started = Instant::now();
     let mut previous_total = prepared.task_work().await.unwrap();
     let ready = loop {
-        let mut limits = RunLimits::default();
-        limits.pages = 512;
+        let limits = support::cli_limits();
         let advanced = prepared
             .advance_confirmation(
                 &fixture.db,
@@ -154,6 +151,7 @@ async fn real_100k_two_provider_cli_output_and_original_confirmation_recovery() 
             .await;
         assert!(!advanced.effects.commit_unknown);
         let current = prepared.task_work().await.unwrap();
+        assert!(current.rows <= limits.total_rows && current.bytes <= limits.total_bytes);
         eprintln!(
             "confirmation staging phase={:?} wall={:?} cumulative_task_work={current:?}",
             advanced.phase,
@@ -188,7 +186,7 @@ async fn real_100k_two_provider_cli_output_and_original_confirmation_recovery() 
             ttl: chrono::Duration::seconds(30),
         },
         Default::default(),
-        &RunLimits::default(),
+        &support::cli_limits(),
     )
     .await;
     assert!(!published.effects.commit_unknown);
@@ -218,7 +216,10 @@ async fn real_100k_two_provider_cli_output_and_original_confirmation_recovery() 
         // Confirmation publishes its record and original archive, not business state.
         if !matches!(
             table.as_str(),
-            "pin_management_records" | "pin_management_archive" | "pin_management_archive_chunks"
+            "pin_management_records"
+                | "pin_management_archive"
+                | "pin_management_inline_archive"
+                | "pin_management_archive_chunks"
         ) {
             assert_eq!(
                 committed_revisions.get(table),
@@ -238,7 +239,6 @@ async fn real_100k_two_provider_cli_output_and_original_confirmation_recovery() 
             &fixture.db,
             &binding,
             entry,
-            tempfile::tempfile_in(fixture.directory.path()).unwrap(),
             v3::files::stream::budget(),
         )
         .await
@@ -322,13 +322,15 @@ async fn real_100k_two_provider_cli_output_and_original_confirmation_recovery() 
             &auth,
             &fixture.request,
             &local,
-            &RunLimits::default(),
+            &support::cli_limits(),
             &mut budget,
         )
         .await
         .unwrap()
         .unwrap();
         let work = retained.task_work().await.unwrap();
+        let hard = v3::files::stream::limits();
+        assert!(work.rows <= hard.rows && work.bytes <= hard.bytes);
         if let Some(previous) = previous {
             support::advanced(previous, work);
         }

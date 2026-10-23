@@ -4,6 +4,8 @@ use sea_orm::{
 };
 use serde::{Deserialize, Serialize};
 
+mod page_facts;
+
 use crate::{
     error::{AppError, AppResult},
     lifecycle::model::{
@@ -231,15 +233,16 @@ pub(crate) async fn version_evaluation_facts<C: ConnectionTrait>(
     ))
 }
 
-async fn candidate_from_row<C: ConnectionTrait>(
-    db: &C,
+fn candidate_from_row(
+    facts: &page_facts::PageFacts,
+    bucket_versioning_state: crate::store::object_version::BucketVersioningState,
     row: object_version::Model,
     joined_object: Option<object::Model>,
 ) -> AppResult<LifecycleCandidate> {
     let kind = version_kind(&row)?;
     let public_version_id = public_version_id(&row)?;
-    let (bucket_versioning_state, primary_storage_class, hot_residency_verified) =
-        version_evaluation_facts(db, &row, joined_object.as_ref()).await?;
+    let (primary_storage_class, hot_residency_verified) =
+        facts.evaluate(&row, joined_object.as_ref())?;
     let (object_id, size) = match &kind {
         crate::store::object_version::VersionKind::Object => {
             let object_id = row.object_id.as_ref().ok_or_else(invalid_cursor)?;
@@ -288,6 +291,7 @@ async fn source_page<C: ConnectionTrait>(
     source: LifecycleScanSource,
     cursor: Option<&LifecycleScanCursor>,
     limit: u64,
+    bucket_state: &mut Option<crate::store::object_version::BucketVersioningState>,
 ) -> AppResult<Vec<LifecycleCandidate>> {
     match source {
         LifecycleScanSource::Current | LifecycleScanSource::Noncurrent => {
@@ -306,9 +310,24 @@ async fn source_page<C: ConnectionTrait>(
                 .limit(limit)
                 .all(db)
                 .await?;
+            if rows.is_empty() {
+                return Ok(Vec::new());
+            }
+            // Keep first-row identity errors ahead of bucket/facts evaluation.
+            version_kind(&rows[0].0)?;
+            public_version_id(&rows[0].0)?;
+            let state = match *bucket_state {
+                Some(state) => state,
+                None => {
+                    let state = crate::store::bucket::get_versioning_state(db, bucket).await?;
+                    *bucket_state = Some(state);
+                    state
+                }
+            };
+            let facts = page_facts::PageFacts::load(db, &rows).await?;
             let mut candidates = Vec::with_capacity(rows.len());
             for (row, joined_object) in rows {
-                candidates.push(candidate_from_row(db, row, joined_object).await?);
+                candidates.push(candidate_from_row(&facts, state, row, joined_object)?);
             }
             Ok(candidates)
         }
@@ -402,6 +421,7 @@ pub async fn scan_candidate_page<C: ConnectionTrait>(
     let mut candidates = Vec::with_capacity(limit as usize);
     let mut last_source = None;
     let mut cycle_complete = false;
+    let mut bucket_state = None;
 
     let sources = [
         LifecycleScanSource::Current,
@@ -429,7 +449,15 @@ pub async fn scan_candidate_page<C: ConnectionTrait>(
         }
 
         let source_cursor = cursor.filter(|cursor| cursor.source == *source);
-        let page = source_page(db, bucket, source.clone(), source_cursor, remaining).await?;
+        let page = source_page(
+            db,
+            bucket,
+            source.clone(),
+            source_cursor,
+            remaining,
+            &mut bucket_state,
+        )
+        .await?;
         let exhausted =
             source_exhausted_after(db, bucket, source.clone(), &page, remaining).await?;
         if !page.is_empty() {
@@ -459,6 +487,8 @@ pub async fn scan_candidate_page<C: ConnectionTrait>(
 
 #[cfg(test)]
 mod tests {
+    mod page_facts;
+
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use chrono::{TimeZone, Utc};
     use sea_orm::{

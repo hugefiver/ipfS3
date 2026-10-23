@@ -1,5 +1,5 @@
 //! Upgrade actual Stage 2 data: reserved raw tags are not decision evidence.
-use ipfs_s3_gateway::store::{self, migrations as m};
+use crate::store::{self, migrations as m};
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::{MigrationTrait, MigratorTrait};
 
@@ -73,7 +73,8 @@ pub(crate) async fn upgrade_with_historical_raw_tags(db: &DatabaseConnection) {
         "INSERT INTO import_jobs (id,bucket,key,source_type,source_value,request_fingerprint,metadata_json,tags_json,state,phase,attempts,next_attempt_at,claim_epoch,providers_observed,pin_nodes_processed,pin_bytes_processed,downloaded_bytes,ipfs_add_bytes,entries_processed,entries_succeeded,entries_failed,decompressed_bytes,created_at,updated_at) VALUES ('historical-job','stage3-history','old-import','cid','bafy-old','old-request','{}','[{\"key\":\"ipfs-s3:pin\",\"value\":\"true\"}]','queued','queued',0,CURRENT_TIMESTAMP,0,0,0,0,0,0,0,0,0,0,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
     ).await.unwrap();
 
-    store::run_migrations(db).await.unwrap();
+    assert!(store::run_migrations(db).await.is_err());
+    store::migrator::Migrator::up(db, None).await.unwrap();
     // The idempotent startup path must not backfill decisions on a second run.
     store::run_migrations(db).await.unwrap();
     assert_eq!(count(db, "pin_extension_decisions").await, 0);
@@ -105,7 +106,7 @@ pub(crate) async fn upgrade_with_historical_raw_tags(db: &DatabaseConnection) {
     let job = db
         .query_one(Statement::from_string(
             db.get_database_backend(),
-            "SELECT tags_json, pin_decision_json FROM import_jobs WHERE id='historical-job'",
+            "SELECT tags_json, pin_decision_json FROM import_job_requests WHERE job_id='historical-job'",
         ))
         .await
         .unwrap()

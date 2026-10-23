@@ -1987,6 +1987,8 @@ async fn claim_candidate_with_work<C: ConnectionTrait>(
 /// Extends one exact running claim without changing its operation phase.
 ///
 /// A missing row means the caller no longer owns the claim and must not begin a provider call.
+/// This processing lock grants no provider or projection permission. Those checks
+/// remain at dispatch/completion; an in-flight receipt may outlive its authority.
 pub async fn renew_job_claim<C: ConnectionTrait>(
     db: &C,
     job_id: &str,
@@ -1997,19 +1999,6 @@ pub async fn renew_job_claim<C: ConnectionTrait>(
     if new_locked_until <= expected_locked_until {
         return Err(invalid_job("renewed job lock must advance"));
     }
-    let work = super::management::records::SharedDecodeBudget::default();
-    let Some(job) =
-        records::current_model::<pin_job::Entity, _>(db, &[job_id], DecodeWork::shared(&work))
-            .await
-            .map_err(management_error)?
-    else {
-        return Ok(None);
-    };
-    // LedgerOnly may finish gathering an already-started receipt. It does not
-    // grant another call: the worker checks the operation-specific permit there.
-    super::management::actions::job_authority::check_before_call_with_work(db, &job, work)
-        .await
-        .map_err(management_error)?;
     let updated = pin_job::Entity::update_many()
         .col_expr(pin_job::Column::LockedUntil, Expr::value(new_locked_until))
         .col_expr(pin_job::Column::UpdatedAt, Expr::value(now))
@@ -3540,6 +3529,65 @@ mod tests {
             .await
             .unwrap()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn heartbeat_retains_exact_claim_during_authority_outage_without_granting_a_call() {
+        let db = setup().await;
+        seed_target_and_remote(
+            &db,
+            "lease",
+            "target",
+            "pinata",
+            "cid",
+            1,
+            "waiting",
+            "reserved",
+            None,
+            1,
+            time(0),
+        )
+        .await;
+        enqueue_job(
+            &db,
+            submit_job("pinata", "cid", "lease", "target", 1, time(0)),
+        )
+        .await
+        .unwrap();
+        let claimed = claim_due_jobs(&db, time(1), Duration::seconds(30), 1)
+            .await
+            .unwrap()
+            .remove(0);
+        db.execute_unprepared("UPDATE pin_management_readiness SET state='backfill' WHERE id=1")
+            .await
+            .unwrap();
+        assert!(
+            super::super::management::actions::job_authority::check_before_call(
+                &db,
+                &claimed.model
+            )
+            .await
+            .is_err()
+        );
+        let renewal = renew_job_claim(&db, &claimed.model.id, time(31), time(61), time(2))
+            .await
+            .unwrap();
+        assert_eq!(renewal, Some(time(61)));
+        assert_eq!(
+            renew_job_claim(&db, &claimed.model.id, time(31), time(62), time(3))
+                .await
+                .unwrap(),
+            None
+        );
+        let mut expected = claimed.model;
+        expected.locked_until = Some(time(61));
+        expected.updated_at = time(2);
+        assert_eq!(job(&db, &expected.id).await, expected);
+        assert!(
+            super::super::management::actions::job_authority::check_before_call(&db, &expected)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

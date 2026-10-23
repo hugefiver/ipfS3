@@ -73,6 +73,18 @@ impl PartialEq for ReviewHandle {
 }
 impl Eq for ReviewHandle {}
 impl ReviewHandle {
+    /// Coordinates of the verified original core, not a reconstructed identity.
+    pub(crate) fn original_core(&self) -> Result<(native::NativeKey, String)> {
+        let mut work = self
+            .work
+            .lock()
+            .map_err(|_| ManagementError::InvalidEvidence)?;
+        let head = &self.review.owner.head;
+        let key = head.3.native(&mut work)?;
+        work.copy(&head.5)?;
+        Ok((key, head.5.clone()))
+    }
+
     pub(crate) fn rows(&self) -> FrozenRows<'_> {
         FrozenRows::Archive(&self.review.rows)
     }
@@ -92,6 +104,12 @@ impl ReviewHandle {
         match self.binding.as_ref() {
             batch::Binding::Draft(..) => None,
             batch::Binding::Confirmed(_, _, _, acks) => Some(acks),
+        }
+    }
+    pub(crate) fn confirmed_at(&self) -> Option<DateTime<Utc>> {
+        match self.binding.as_ref() {
+            batch::Binding::Draft(..) => None,
+            batch::Binding::Confirmed(_, _, at, _) => Some(*at),
         }
     }
     pub(crate) fn snapshot(&self) -> &impl Serialize {

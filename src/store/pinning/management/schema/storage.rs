@@ -1,6 +1,7 @@
 //! Durable locators are an index, never an authorization source.
 use super::*;
 use crate::store::pinning::management::native;
+mod archive_identity;
 mod batch;
 mod postgres_constraints;
 mod postgres_guards;
@@ -35,13 +36,18 @@ pub const SOURCE_TABLES: &[&str] = &[
 ];
 /// Export-only collections. They are deliberately outside the native authority
 /// catalog: capturing an archive must never recursively capture its own storage.
-pub const EXPORT_TABLES: &[&str] = &["pin_management_archive", "pin_management_archive_chunks"];
+pub const EXPORT_TABLES: &[&str] = &[
+    "pin_management_archive",
+    "pin_management_archive_chunks",
+    "pin_management_inline_archive",
+];
+const INLINE: &str = "pin_management_inline_archive";
 const APPLIED_NO_DELETE: &str = "CREATE TRIGGER s75_applied_no_delete BEFORE DELETE ON pin_management_records WHEN OLD.state='applied' BEGIN SELECT RAISE(ABORT,'immutable applied record'); END";
 const APPLIED_NO_UPDATE: &str = "CREATE TRIGGER s75_applied_no_update BEFORE UPDATE ON pin_management_records WHEN OLD.state='applied' BEGIN SELECT RAISE(ABORT,'immutable applied record'); END";
 const ARCHIVE_GUARD_BODY: &str = " BEGIN IF OLD.state='sealed' OR NEW.archive_id IS DISTINCT FROM OLD.archive_id OR NEW.format IS DISTINCT FROM OLD.format OR NEW.database_scope IS DISTINCT FROM OLD.database_scope OR NEW.native_identity IS DISTINCT FROM OLD.native_identity OR NEW.header IS DISTINCT FROM OLD.header THEN RAISE EXCEPTION 'immutable archive'; END IF; RETURN NEW; END ";
 
 fn sqlite_protections() -> Vec<(&'static str, &'static str)> {
-    vec![
+    let mut guards = vec![
         ("s75_applied_no_delete", APPLIED_NO_DELETE),
         ("s75_applied_no_update", APPLIED_NO_UPDATE),
         (
@@ -64,7 +70,17 @@ fn sqlite_protections() -> Vec<(&'static str, &'static str)> {
             "s75_chunk_sealed",
             "CREATE TRIGGER s75_chunk_sealed BEFORE INSERT ON pin_management_archive_chunks WHEN (SELECT state FROM pin_management_archive WHERE archive_id=NEW.archive_id)='sealed' BEGIN SELECT RAISE(ABORT,'immutable archive'); END",
         ),
-    ]
+        (
+            "s75_inline_no_update",
+            "CREATE TRIGGER s75_inline_no_update BEFORE UPDATE ON pin_management_inline_archive BEGIN SELECT RAISE(ABORT,'immutable archive'); END",
+        ),
+        (
+            "s75_inline_no_delete",
+            "CREATE TRIGGER s75_inline_no_delete BEFORE DELETE ON pin_management_inline_archive BEGIN SELECT RAISE(ABORT,'immutable archive'); END",
+        ),
+    ];
+    guards.extend(archive_identity::sqlite_guards());
+    guards
 }
 
 pub fn tables(backend: DatabaseBackend) -> Vec<(&'static str, String)> {
@@ -74,6 +90,7 @@ pub fn tables(backend: DatabaseBackend) -> Vec<(&'static str, String)> {
         "BLOB"
     };
     vec![
+        (archive_identity::TABLE, "CREATE TABLE pin_management_archive_identity (archive_id TEXT NOT NULL PRIMARY KEY)".into()),
         ("pin_management_readiness", "CREATE TABLE pin_management_readiness (id INTEGER NOT NULL PRIMARY KEY CHECK(id=1), format TEXT NOT NULL CHECK(format='S75A1'), state TEXT NOT NULL CHECK(state IN ('backfill','ready')))".into()),
         ("pin_management_source_control", "CREATE TABLE pin_management_source_control (source_key TEXT NOT NULL PRIMARY KEY, source_generation BIGINT NOT NULL DEFAULT 0 CHECK(source_generation>=0 AND source_generation<9223372036854775807), locator_generation BIGINT NOT NULL DEFAULT 0 CHECK(locator_generation>=0 AND locator_generation<9223372036854775807), sealed_source BIGINT, sealed_locator BIGINT)".into()),
         ("pin_management_locator", "CREATE TABLE pin_management_locator (selector_kind TEXT NOT NULL, selector_key TEXT NOT NULL, source_key TEXT NOT NULL, PRIMARY KEY(selector_kind,selector_key,source_key), FOREIGN KEY(source_key) REFERENCES pin_management_source_control(source_key))".into()),
@@ -81,6 +98,7 @@ pub fn tables(backend: DatabaseBackend) -> Vec<(&'static str, String)> {
         ("pin_management_revision", "CREATE TABLE pin_management_revision (source_table TEXT NOT NULL PRIMARY KEY, revision BIGINT NOT NULL CHECK(revision>=0 AND revision<9223372036854775807))".into()),
         ("pin_management_archive", "CREATE TABLE pin_management_archive (archive_id TEXT NOT NULL PRIMARY KEY, format TEXT NOT NULL CHECK(format='S75A1'), database_scope TEXT NOT NULL, native_identity TEXT NOT NULL, header TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('staging','sealed')), chunks BIGINT NOT NULL DEFAULT 0, bytes BIGINT NOT NULL DEFAULT 0, digest TEXT)".into()),
         ("pin_management_archive_chunks", format!("CREATE TABLE pin_management_archive_chunks (archive_id TEXT NOT NULL, ordinal BIGINT NOT NULL CHECK(ordinal>=0), payload {blob} NOT NULL CHECK(length(payload)<=65536), PRIMARY KEY(archive_id,ordinal), FOREIGN KEY(archive_id) REFERENCES pin_management_archive(archive_id))")),
+        (INLINE, format!("CREATE TABLE pin_management_inline_archive (archive_id TEXT NOT NULL PRIMARY KEY, format TEXT NOT NULL CHECK(format='S75I2'), database_scope TEXT NOT NULL, native_identity TEXT NOT NULL, header TEXT NOT NULL, bytes BIGINT NOT NULL CHECK(bytes>=0 AND bytes<=65536), digest TEXT NOT NULL, payload {blob} NOT NULL CHECK(length(payload)=bytes))")),
     ]
 }
 
@@ -268,13 +286,19 @@ pub fn known_object(sql: Option<&str>, backend: DatabaseBackend) -> bool {
 
 pub async fn install<C: ConnectionTrait>(db: &C) -> std::result::Result<(), sea_orm::DbErr> {
     let backend = db.get_database_backend();
-    for (_, ddl) in tables(backend) {
+    for (_, ddl) in tables(backend)
+        .into_iter()
+        .filter(|(name, _)| *name != INLINE && *name != archive_identity::TABLE)
+    {
         db.execute_unprepared(&ddl).await?;
     }
     for (_, ddl) in indexes() {
         db.execute_unprepared(ddl).await?;
     }
-    for table in native::registry() {
+    for table in native::registry()
+        .into_iter()
+        .filter(|table| table.table != "import_job_requests")
+    {
         db.execute(Statement::from_sql_and_values(
             backend,
             "INSERT INTO pin_management_revision VALUES ($1,0)",
@@ -282,7 +306,7 @@ pub async fn install<C: ConnectionTrait>(db: &C) -> std::result::Result<(), sea_
         ))
         .await?;
     }
-    for table in EXPORT_TABLES {
+    for table in EXPORT_TABLES.iter().filter(|table| **table != INLINE) {
         db.execute(Statement::from_sql_and_values(
             backend,
             "INSERT INTO pin_management_revision VALUES ($1,0)",
@@ -291,13 +315,19 @@ pub async fn install<C: ConnectionTrait>(db: &C) -> std::result::Result<(), sea_
         .await?;
     }
     for (name, table, event, body) in triggers(backend) {
+        if table == INLINE || table == "import_job_requests" {
+            continue;
+        }
         for ddl in trigger_ddl(backend, &name, &table, event, &body) {
             db.execute_unprepared(&ddl).await?;
         }
     }
     if backend == DatabaseBackend::Postgres {
         db.execute_unprepared("CREATE FUNCTION s75_no_truncate() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'controlled migration required'; END $$").await?;
-        for table in native::registry() {
+        for table in native::registry()
+            .into_iter()
+            .filter(|table| table.table != "import_job_requests")
+        {
             db.execute_unprepared(&format!("CREATE TRIGGER s75_{}_truncate BEFORE TRUNCATE ON \"{}\" FOR EACH STATEMENT EXECUTE FUNCTION s75_no_truncate()",table.table,table.table)).await?;
         }
         for table in ["pin_management_archive", "pin_management_archive_chunks"] {
@@ -306,7 +336,12 @@ pub async fn install<C: ConnectionTrait>(db: &C) -> std::result::Result<(), sea_
     }
     // Original applied facts cannot disappear, even when there are no locators.
     if backend == DatabaseBackend::Sqlite {
-        for (_, ddl) in sqlite_protections() {
+        for (name, ddl) in sqlite_protections() {
+            if ddl.contains(" ON pin_management_inline_archive ")
+                || name.starts_with("s75_archive_id_")
+            {
+                continue;
+            }
             db.execute_unprepared(ddl).await?;
         }
     } else {
@@ -329,6 +364,41 @@ pub async fn install<C: ConnectionTrait>(db: &C) -> std::result::Result<(), sea_
             .await?;
     }
     Ok(())
+}
+
+/// Additive, lossless migration: existing S75A1 roots and chunks stay immutable.
+pub async fn install_inline<C: ConnectionTrait>(db: &C) -> std::result::Result<(), sea_orm::DbErr> {
+    let backend = db.get_database_backend();
+    for (_, ddl) in tables(backend)
+        .into_iter()
+        .filter(|(name, _)| *name == INLINE || *name == archive_identity::TABLE)
+    {
+        db.execute_unprepared(&ddl).await?;
+    }
+    db.execute_unprepared(
+        "INSERT INTO pin_management_revision VALUES ('pin_management_inline_archive',0)",
+    )
+    .await?;
+    for (name, table, event, body) in triggers(backend)
+        .into_iter()
+        .filter(|(_, table, _, _)| table == INLINE)
+    {
+        for ddl in trigger_ddl(backend, &name, &table, event, &body) {
+            db.execute_unprepared(&ddl).await?;
+        }
+    }
+    if backend == DatabaseBackend::Sqlite {
+        for (_, ddl) in sqlite_protections().into_iter().filter(|(name, ddl)| {
+            ddl.contains(" ON pin_management_inline_archive ")
+                && !name.starts_with("s75_archive_id_")
+        }) {
+            db.execute_unprepared(ddl).await?;
+        }
+    } else {
+        db.execute_unprepared("CREATE TRIGGER s75_inline_immutable BEFORE UPDATE OR DELETE ON pin_management_inline_archive FOR EACH ROW EXECUTE FUNCTION s75_immutable()").await?;
+        db.execute_unprepared("CREATE TRIGGER s75_pin_management_inline_archive_truncate BEFORE TRUNCATE ON pin_management_inline_archive FOR EACH STATEMENT EXECUTE FUNCTION s75_no_truncate()").await?;
+    }
+    archive_identity::install(db).await
 }
 
 pub async fn validate<C: ConnectionTrait>(db: &C) -> Result<()> {
@@ -379,6 +449,11 @@ async fn postgres_catalog<C: ConnectionTrait>(db: &C) -> Result<()> {
     use crate::store::pinning::management::catalog::NativeColumn;
     let mut expected = Vec::new();
     for (name, columns, pk) in [
+        (
+            "pin_management_archive_identity",
+            "archive_id:t",
+            "archive_id",
+        ),
         ("pin_management_readiness", "id:i,format:t,state:t", "id"),
         (
             "pin_management_source_control",
@@ -409,6 +484,11 @@ async fn postgres_catalog<C: ConnectionTrait>(db: &C) -> Result<()> {
             "pin_management_archive_chunks",
             "archive_id:t,ordinal:b,payload:x",
             "archive_id,ordinal",
+        ),
+        (
+            "pin_management_inline_archive",
+            "archive_id:t,format:t,database_scope:t,native_identity:t,header:t,bytes:b,digest:t,payload:x",
+            "archive_id",
         ),
     ] {
         let mut definitions = columns

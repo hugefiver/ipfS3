@@ -2,7 +2,9 @@
 use super::*;
 use crate::pinning::management;
 use crate::store::initialization::history::{self, legacy};
+mod entry;
 mod integrity;
+use entry::RecordedEntry;
 
 #[derive(Serialize)]
 #[serde(untagged)]
@@ -14,9 +16,9 @@ pub enum RecordedResult {
 pub struct RecordedPlan {
     pub(crate) index: history::ReviewIndex,
     pub(crate) request: PlanRequest,
-    pub(crate) entries: Vec<legacy::PlanEntry>,
+    pub(crate) entries: Vec<RecordedEntry>,
     pub(crate) summary: management::Summary,
-    pub(crate) snapshot: legacy::Snapshot,
+    pub(crate) snapshot: legacy::SnapshotData<RecordedEntry>,
     pub(crate) migration_points: Vec<MigrationPoint>,
     pub(crate) originals: Vec<(native::NativeKey, segmented::ArchiveRef)>,
     actions: Vec<RecordedResult>,
@@ -94,7 +96,7 @@ pub async fn load_recorded_plan<C: ConnectionTrait>(
     if original_request != *request {
         return Err(ManagementError::Confirmation);
     }
-    let entries: Vec<legacy::PlanEntry> = history::read_part(db, &index.entries, budget).await?;
+    let entries: Vec<RecordedEntry> = history::read_part(db, &index.entries, budget).await?;
     if entries.len() != request.items.len() {
         return Err(ManagementError::Confirmation);
     }
@@ -104,12 +106,12 @@ pub async fn load_recorded_plan<C: ConnectionTrait>(
     let mut decode = ReadSession::default();
     let mut seen = std::collections::BTreeSet::new();
     for entry in &entries {
-        if !seen.insert(&entry.request.item_id)
-            || !request.items.iter().any(|item| item == &entry.request)
+        if !seen.insert(&entry.request().item_id)
+            || !request.items.iter().any(|item| item == entry.request())
         {
             return Err(ManagementError::Confirmation);
         }
-        let key = key(&entry.request.item_id);
+        let key = key(&entry.request().item_id);
         let source = history::recover_source(db, &key, budget)
             .await?
             .ok_or(ManagementError::Confirmation)?;
@@ -117,7 +119,8 @@ pub async fn load_recorded_plan<C: ConnectionTrait>(
             .review
             .as_ref()
             .ok_or(ManagementError::Confirmation)?;
-        if review.core_identity != index.core_identity
+        if review.anchor != index.anchor
+            || review.core_identity != index.core_identity
             || review.confirmed_at != index.confirmed_at
             || review.staged_at != index.staged_at
             || review.expires_at != index.expires_at
@@ -128,37 +131,25 @@ pub async fn load_recorded_plan<C: ConnectionTrait>(
         let original: native::NativeRow = history::read_part(db, &source.original, budget).await?;
         let original_binding =
             native::value(&original, "binding").ok_or(ManagementError::Confirmation)?;
-        let action = if matches!(entry.capture, Some(legacy::Capture::Provider(_))) {
-            let action = history::recover_recorded(db, &key, original_binding, budget)
-                .await?
-                .ok_or(ManagementError::Confirmation)?;
-            if action.receipt.binding != *entry {
-                return Err(ManagementError::Confirmation);
-            }
-            RecordedResult::Historical(action)
-        } else {
-            let action = history::recover_committed(db, &key, original_binding, budget)
-                .await?
-                .ok_or(ManagementError::Confirmation)?;
-            if action.receipt.binding.request != entry.request
-                || action.receipt.binding.id != entry.id
-            {
-                return Err(ManagementError::Confirmation);
-            }
-            if action.receipt.binding.status != entry.status
-                || action.receipt.binding.step != entry.step
-                || !match (&entry.capture, &action.receipt.binding.capture) {
-                    (
-                        Some(legacy::Capture::Object(before)),
-                        Some(management::Capture::Object(current)),
-                    ) => before == current,
-                    (None, None) => true,
-                    _ => false,
+        let action = match entry {
+            RecordedEntry::Historical(entry) => {
+                let action = history::recover_recorded(db, &key, original_binding, budget)
+                    .await?
+                    .ok_or(ManagementError::Confirmation)?;
+                if action.receipt.binding != *entry {
+                    return Err(ManagementError::Confirmation);
                 }
-            {
-                return Err(ManagementError::Confirmation);
+                RecordedResult::Historical(action)
             }
-            RecordedResult::Current(action)
+            RecordedEntry::Current(entry) => {
+                let action = history::recover_committed(db, &key, original_binding, budget)
+                    .await?
+                    .ok_or(ManagementError::Confirmation)?;
+                if action.receipt.binding != *entry {
+                    return Err(ManagementError::Confirmation);
+                }
+                RecordedResult::Current(action)
+            }
         };
         actions.push(action);
         originals.push((key, source.original.clone()));

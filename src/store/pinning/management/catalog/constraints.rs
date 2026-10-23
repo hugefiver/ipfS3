@@ -11,6 +11,7 @@ type ForeignKey = (
 );
 fn foreign_keys(table: &str) -> Option<Vec<ForeignKey>> {
     Some(match table {
+        "import_job_requests" => vec![("import_jobs", &["job_id"], &["id"], "CASCADE")],
         "objects" | "multipart_uploads" => vec![("buckets", &["bucket"], &["name"], "CASCADE")],
         "multipart_parts" => vec![(
             "multipart_uploads",
@@ -91,8 +92,8 @@ fn foreign_keys(table: &str) -> Option<Vec<ForeignKey>> {
         _ => return None,
     })
 }
-pub(super) async fn validate<C: ConnectionTrait>(db: &C) -> Result<()> {
-    for table in super::super::native::registry() {
+pub(super) async fn validate<C: ConnectionTrait>(db: &C, tables: &[NativeTable]) -> Result<()> {
+    for table in tables {
         if let Some(expected) = foreign_keys(&table.table) {
             if db.get_database_backend() == DatabaseBackend::Sqlite {
                 sqlite_foreign_keys(db, &table.table, &expected).await?;

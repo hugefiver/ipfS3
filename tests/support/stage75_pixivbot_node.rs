@@ -91,7 +91,7 @@ pub fn content_cid(codec: u64, bytes: &[u8]) -> String {
 }
 
 fn multipart(request: &Request, filename: &str) -> Vec<u8> {
-    assert!(request.body.len() <= 8192);
+    assert!(request.body.len() <= 9 * 1024 * 1024);
     let content_type = request.headers["content-type"].to_str().unwrap();
     let boundary = content_type
         .strip_prefix("multipart/form-data; boundary=")
@@ -139,7 +139,9 @@ impl HttpNode {
                 let mut blocks = blocks.lock().unwrap();
                 let json = match request.url.path() {
                     "/api/v0/add" => {
-                        let mut expected = vec![("cid-version","1"),("pin","false"),("wrap-with-directory","false"),("progress","true")];
+                        let progress = args["progress"].as_str();
+                        assert!(matches!(progress, "true" | "false"));
+                        let mut expected = vec![("cid-version","1"),("pin","false"),("wrap-with-directory","false"),("progress",progress)];
                         if target { expected.extend([("raw-leaves","true"),("chunker","size-262144"),("hash","sha2-256")]); }
                         expect_query(&args, &expected);
                         assert_eq!(request.headers["transfer-encoding"], "chunked");

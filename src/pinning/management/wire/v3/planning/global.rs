@@ -1,9 +1,8 @@
-use super::super::codec::Record;
+use super::super::codec::physical::{CheckedRecord, Decoder, Sink, Value};
 use super::*;
 use crate::pinning::management::retirement::PageMeter;
 use crate::store::pinning::management::{ManagementError, records};
 use sea_orm::DatabaseConnection;
-use std::io::{Seek, SeekFrom};
 use std::sync::Arc;
 
 fn storage(error: ManagementError) -> SafeError {
@@ -132,100 +131,67 @@ async fn copy_sections<W: Write>(
         Arc<PageMeter>,
     )>,
 ) -> Result<()> {
-    let mut file = files::stream::temporary().map_err(|_| SafeError::UnknownEvidence)?;
     let prepared = projection == Projection::Review;
-    let mut output: Box<dyn Write + '_> = match limits {
-        Some((limits, pages)) => Box::new(crate::pinning::management::retirement::PageOutput::new(
-            &mut file, limits, pages,
-        )),
-        None => Box::new(&mut file),
-    };
-    let document = if prepared {
-        records::copy_prepared_output_document(db, binding, entry, &mut output, writer.budget_mut())
-            .await
-    } else {
-        records::copy_original_inventory_document(
-            db,
-            binding,
-            entry,
-            &mut output,
-            writer.budget_mut(),
-        )
-        .await
+    let (document, mut pages) = records::open_original_inventory_document(
+        db, binding, entry, writer.budget_mut(), prepared,
+    ).await.map_err(storage)?;
+    let mut decoder = Decoder::new(projection, writer.budget_mut())?;
+    let mut input_pages = limits.map(|(limits, pages)| {
+        crate::pinning::management::retirement::PageOutput::new(std::io::sink(), limits, pages)
+    });
+    let mut sink = Sections { writer, binding, document, prepared, include: false, facts_written: false };
+    while let Some(page) = pages.next(db, sink.writer.budget_mut()).await.map_err(storage)? {
+        for chunk in &page.chunks {
+            if let Some(pages) = &mut input_pages {
+                pages.write_all(chunk).map_err(|_| SafeError::LimitExceeded)?;
+            }
+            decoder.feed(chunk, &mut sink)?;
+        }
     }
-    .map_err(storage)?;
-    drop(output);
-    file.seek(SeekFrom::Start(0))
-        .map_err(|_| SafeError::UnknownEvidence)?;
-    let mut reader = match Reader::new_metered(file, projection, writer.take_budget()) {
-        Ok(reader) => reader,
-        Err((error, budget)) => {
-            writer.restore_budget(*budget);
-            return Err(error);
+    decoder.finish(sink.writer.budget())?;
+    if !sink.facts_written { return Err(SafeError::UnknownEvidence); }
+    Ok(())
+}
+
+struct Sections<'a, W> {
+    writer: &'a mut Writer<W>,
+    binding: &'a ConfirmedBinding,
+    document: records::OriginalInventoryDocument,
+    prepared: bool,
+    include: bool,
+    facts_written: bool,
+}
+impl<W: Write> Sink for Sections<'_, W> {
+    fn budget(&mut self) -> &mut crate::store::pinning::management::native::meter::Budget {
+        self.writer.budget_mut()
+    }
+    fn record(&mut self, record: CheckedRecord<'_>) -> Result<()> {
+        let Self { writer, binding, document, prepared, include, facts_written } = self;
+        if let Value::Frame(frame) = &record.value {
+            document.check_frame(frame, writer.budget_mut()).map_err(storage)?;
         }
-    };
-    let enabled = reader.enable_buffering();
-    writer.restore_budget(reader.take_budget());
-    enabled?;
-    let mut include = false;
-    let mut facts_written = false;
-    loop {
-        reader.restore_budget(writer.take_budget());
-        let event = reader.next_record();
-        writer.restore_budget(reader.take_budget());
-        let Some(event) = event? else { break };
-        let _event_resident = match &event {
-            Record::Event(_) => Some(
-                writer
-                    .budget_mut()
-                    .reserve(reader.last_frame_resident())
-                    .map_err(storage)?,
-            ),
-            Record::ShortCell(_) => None,
-        };
-        if let Record::Event(Event::Frame(frame)) = &event {
-            document
-                .check_frame(frame, writer.budget_mut())
-                .map_err(storage)?;
-        }
-        if let Record::Event(Event::Frame(Frame::Row { section, key, .. })) = &event {
+        if let Value::Frame(Frame::Row { section, key, .. }) = &record.value {
             if *section == Section::Inventory
-                && !facts_written
-                && (!prepared || key.table.starts_with("retirement_"))
+                && !*facts_written
+                && (!*prepared || key.table.starts_with("retirement_"))
             {
-                if prepared {
+                if *prepared {
                     confirmation_facts(writer, binding)?;
                 } else {
                     confirmed_facts(writer, binding)?;
                 }
-                facts_written = true;
+                *facts_written = true;
             }
-            include = (prepared && *section == Section::Result)
+            *include = (*prepared && *section == Section::Result)
                 || matches!(
                     section,
                     Section::Native | Section::Membership | Section::Inventory
                 );
         }
-        if include {
-            match event {
-                Record::Event(Event::Frame(frame)) => {
-                    writer.frame(&frame)?;
-                    if matches!(frame, Frame::RowEnd) {
-                        include = false;
-                    }
-                }
-                Record::Event(Event::Chunk(bytes)) => writer
-                    .cell_output()
-                    .write_all(&bytes)
-                    .map_err(|_| SafeError::UnknownEvidence)?,
-                Record::ShortCell(held) => {
-                    writer.complete_cell(&held.cell.column, &held.cell.bytes, held.cell.value)?
-                }
-            }
+        if *include && !record.terminal() {
+            writer.checked_record(&record)?;
+            if matches!(record.value, Value::Frame(Frame::RowEnd)) { *include = false; }
         }
+        Ok(())
     }
-    if !reader.verified() || !facts_written {
-        return Err(SafeError::UnknownEvidence);
-    }
-    Ok(())
 }

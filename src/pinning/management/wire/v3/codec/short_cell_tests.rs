@@ -1,6 +1,10 @@
 use super::*;
 use crate::store::pinning::management::native::meter::Limits;
 use std::{cell::Cell, io::Cursor, rc::Rc, sync::atomic::Ordering};
+#[path = "physical_tests.rs"]
+mod physical_tests;
+#[path = "owned_tests.rs"]
+mod owned_tests;
 
 fn prefix(projection: Projection) -> Vec<Frame> {
     vec![

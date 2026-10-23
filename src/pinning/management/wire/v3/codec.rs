@@ -13,6 +13,8 @@ mod continuation_tests;
 mod native_source;
 mod read_buffer;
 mod short_cell;
+pub(crate) mod physical;
+pub(crate) mod owned;
 use short_cell::PendingCell;
 pub(super) use short_cell::Record;
 #[cfg(test)]
@@ -426,6 +428,7 @@ pub struct Reader<R> {
     started: bool,
     last_frame_resident: usize,
     pending: Option<PendingCell>,
+    replay: Option<owned::Index>,
 }
 impl<R: Read> Reader<R> {
     pub fn new(input: R, projection: Projection, budget: Budget) -> Result<Self> {
@@ -463,6 +466,7 @@ impl<R: Read> Reader<R> {
             started: false,
             last_frame_resident: 0,
             pending: None,
+            replay: None,
         })
     }
     pub fn verified(&self) -> bool {
@@ -612,7 +616,7 @@ impl<R: Read> Reader<R> {
         } {
             return Err(SafeError::InvalidInput);
         }
-        if kind == 7 {
+        if kind == 7 && self.replay.is_none() {
             return self.read_short_cell(length).map(Some);
         }
         // Prepay work and peak parsing/key state before requesting the payload.
@@ -620,7 +624,7 @@ impl<R: Read> Reader<R> {
             self.prepay_read(length - 1)?;
         }
         let resident = match kind {
-            0 => 5 * FRAME_BYTES,
+            0 => if self.replay.is_some() { 5 * FRAME_BYTES } else { length - 1 },
             1 => length - 1 + 4,
             _ => 2 * (length - 1) + std::mem::size_of::<Frame>(),
         };
@@ -629,61 +633,24 @@ impl<R: Read> Reader<R> {
         if !payload.is_empty() {
             self.read_prepaid_exact(&mut payload)?;
         }
-        if kind == 1 {
-            if self.state.redacting() {
-                return Err(SafeError::InvalidInput);
-            }
-            self.state.chunk(&payload, false)?;
-            self.integrity.add(1, &payload)?;
+        if let Some(index) = &mut self.replay {
+            let record = index.record(kind, &payload, &mut self.budget)?;
             self.last_frame_resident = resident;
-            return Ok(Some(Record::Event(Event::Chunk(payload))));
-        }
-        if kind != 0 {
-            self.last_frame_resident = resident;
-            // Integrity uses the physical payload before its allocation becomes
-            // the column String. State retains its own independently billed copy.
-            self.integrity.add(kind, &payload)?;
-            let frame = match kind {
-                2 => Frame::Cell {
-                    column: String::from_utf8(payload).map_err(|_| SafeError::InvalidInput)?,
-                },
-                3 => Frame::CellEnd {
-                    value: CellValue::Null,
-                },
-                4 => Frame::CellEnd {
-                    value: CellValue::Text,
-                },
-                5 => Frame::CellEnd {
-                    value: CellValue::Redacted,
-                },
-                6 => Frame::RowEnd,
-                _ => unreachable!(),
-            };
-            if let Frame::Cell { column } = &frame {
-                column_copy(&mut self.budget, column)?;
+            if record.is_none() {
+                if self.buffer.as_ref().is_some_and(|buffer| buffer.available() != 0) {
+                    return Err(SafeError::InvalidInput);
+                }
+                self.prepay_read(1)?;
+                probe_eof(&mut self.input, &self.budget)?;
+                self.verified = true;
             }
-            self.state.frame(&frame)?;
-            return Ok(Some(Record::Event(Event::Frame(frame))));
+            return Ok(record);
         }
-        self.last_frame_resident = strict::resident_cost(&payload)?;
-        let frame: Frame = serde_json::from_slice(&payload).map_err(|_| SafeError::InvalidInput)?;
-        if matches!(
-            frame,
-            Frame::Cell { .. } | Frame::CellEnd { .. } | Frame::RowEnd
-        ) {
-            return Err(SafeError::InvalidInput);
-        }
-        self.state.frame(&frame)?;
-        if matches!(&frame, Frame::Row { .. }) {
-            limit(self.budget.charge(0, 1, 0, 0))?;
-        }
-        if let Frame::Trailer {
-            frames,
-            bytes,
-            sha256,
-        } = &frame
-        {
-            self.integrity.verify(*frames, *bytes, sha256)?;
+        let checked = physical::decode(
+            &mut self.state, &mut self.integrity, kind, &payload, &mut self.budget,
+        )?;
+        self.last_frame_resident = checked.resident;
+        if checked.terminal() {
             if self
                 .buffer
                 .as_ref()
@@ -696,8 +663,7 @@ impl<R: Read> Reader<R> {
             self.verified = true;
             return Ok(None);
         }
-        self.integrity.add(0, &payload)?;
-        Ok(Some(Record::Event(Event::Frame(frame))))
+        Ok(Some(checked.into_record(&mut self.budget)?))
     }
 }
 

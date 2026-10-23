@@ -1103,12 +1103,13 @@ mod tests {
         let (mut job, claim) =
             submit_and_claim(&state, "corrupt-cid", ImportSource::Cid(CID.to_owned())).await;
         job.source_value = "not-a-cid-and-must-not-be-logged".to_owned();
-        import_job::Entity::update_many()
+        use crate::store::entities::import_job_request;
+        import_job_request::Entity::update_many()
             .col_expr(
-                import_job::Column::SourceValue,
+                import_job_request::Column::SourceValue,
                 sea_orm::sea_query::Expr::value(job.source_value.clone()),
             )
-            .filter(import_job::Column::Id.eq(&job.id))
+            .filter(import_job_request::Column::JobId.eq(&job.id))
             .exec(state.store.db())
             .await
             .unwrap();
@@ -1143,12 +1144,13 @@ mod tests {
         let (mut job, claim) =
             submit_and_claim(&state, "legacy-intent", ImportSource::Cid(CID.into())).await;
         job.tags_json = r#"[{"key":"ipfs-s3:pin","value":"true"}]"#.into();
-        import_job::Entity::update_many()
+        use crate::store::entities::import_job_request;
+        import_job_request::Entity::update_many()
             .col_expr(
-                import_job::Column::TagsJson,
+                import_job_request::Column::TagsJson,
                 sea_orm::sea_query::Expr::value(&job.tags_json),
             )
-            .filter(import_job::Column::Id.eq(&job.id))
+            .filter(import_job_request::Column::JobId.eq(&job.id))
             .exec(state.store.db())
             .await
             .unwrap();

@@ -3,7 +3,7 @@ use super::{ManagementError, Result};
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 use sea_orm_migration::MigratorTrait;
 
-pub const VERSION: &str = "m20261017_000001_management_storage";
+pub const VERSION: &str = "m20261023_000001_inline_documents";
 pub mod storage;
 pub const RECORDS: &str = "pin_management_records";
 pub const RETIREMENTS: &str = "pin_management_retirements";
@@ -62,6 +62,25 @@ fn normalized(sql: &str) -> String {
 
 pub async fn validate<C: ConnectionTrait>(db: &C) -> Result<Vec<String>> {
     validate_state(db, false).await
+}
+
+/// Reuse versions from the same SQLite classification read, not a prior call.
+/// This still reads the complete current storage catalog, guards and readiness.
+pub(in crate::store::pinning) async fn validate_sqlite_with_versions<C: ConnectionTrait>(
+    db: &C,
+    versions: &[String],
+) -> Result<()> {
+    let known: Vec<String> = crate::store::migrator::Migrator::migrations()
+        .iter()
+        .map(|migration| migration.name().to_owned())
+        .collect();
+    if db.get_database_backend() != DatabaseBackend::Sqlite
+        || versions != known.as_slice()
+        || versions.last().map(String::as_str) != Some(VERSION)
+    {
+        return Err(ManagementError::Schema);
+    }
+    storage::validate_schema(db, false).await
 }
 
 /// Validates the complete installed layout without publishing it for runtime use.

@@ -32,10 +32,15 @@ use ipfs_s3_gateway::{
 };
 use sea_orm::{
     ColumnTrait, ConnectOptions, ConnectionTrait, Database, DatabaseBackend, DatabaseConnection,
-    DbErr, EntityTrait, PaginatorTrait, QueryFilter, Statement, TransactionError, TransactionTrait,
+    DbErr, EntityTrait, FromQueryResult, PaginatorTrait, QueryFilter, Statement, TransactionError,
+    TransactionTrait,
 };
 use sea_orm_migration::{MigrationTrait, MigratorTrait};
 use tokio::{sync::oneshot, task::JoinHandle};
+
+#[allow(dead_code)]
+#[path = "support/pg_residency.rs"]
+mod ownership_pg;
 
 use ipfs_s3_gateway::store::migrations::{
     m20250701_000001_init, m20260707_000001_decompress_zip, m20260720_000001_sse_c_key_fingerprint,
@@ -92,6 +97,26 @@ impl MigratorTrait for PreJsonCompatibilityMigrator {
 }
 
 struct CurrentJsonCompatibilityMigrator;
+
+#[derive(Debug, FromQueryResult)]
+struct CompatibilityUploadJson {
+    metadata: Option<serde_json::Value>,
+    tags_json: serde_json::Value,
+}
+
+async fn compatibility_upload_json(
+    db: &DatabaseConnection,
+    upload_id: &str,
+) -> Result<Option<CompatibilityUploadJson>, DbErr> {
+    // Decode this migration's columns without depending on later MPU fields.
+    CompatibilityUploadJson::find_by_statement(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "SELECT metadata, tags_json FROM multipart_uploads WHERE upload_id = $1",
+        [upload_id.to_owned().into()],
+    ))
+    .one(db)
+    .await
+}
 
 impl MigratorTrait for CurrentJsonCompatibilityMigrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
@@ -234,6 +259,18 @@ async fn connect_triplet(
     crate_bucket(&holder, bucket_name).await;
     let contender = connect_single(url).await;
     let observer = connect_single(url).await;
+    (holder, contender, observer)
+}
+
+async fn connect_ownership_triplet(
+    fixture: &ownership_pg::PgResidencyFixture,
+    bucket_name: &str,
+) -> (DatabaseConnection, DatabaseConnection, DatabaseConnection) {
+    let holder = fixture.connection().await;
+    assert_postgres_utc_timestamp_columns(&holder).await;
+    crate_bucket(&holder, bucket_name).await;
+    let contender = fixture.connection().await;
+    let observer = fixture.connection().await;
     (holder, contender, observer)
 }
 
@@ -1125,16 +1162,17 @@ async fn postgres_claim_due_contends_with_prefix_and_bucket_supersession_without
 
 #[tokio::test]
 async fn postgres_bucket_first_ownership_serializes_all_task_four_races() {
-    let Ok(url) = std::env::var("IPFS_S3_TEST_POSTGRES_URL") else {
+    let Ok(_) = std::env::var("IPFS_S3_TEST_POSTGRES_URL") else {
         eprintln!("skipping PostgreSQL import ownership test: IPFS_S3_TEST_POSTGRES_URL is unset");
         return;
     };
     let _serial = POSTGRES_TEST_SERIAL.lock().await;
+    let fixture = ownership_pg::PgResidencyFixture::new().await;
     let now = Utc::now();
 
     let bucket_exact_submit = format!("pg-import-exact-submit-{}", uuid::Uuid::new_v4());
     let (exact_holder, exact_contender, exact_observer) =
-        connect_triplet(&url, &bucket_exact_submit).await;
+        connect_ownership_triplet(&fixture, &bucket_exact_submit).await;
     submit(
         &exact_holder,
         request("exact-old", &bucket_exact_submit, "key", None),
@@ -1189,7 +1227,7 @@ async fn postgres_bucket_first_ownership_serializes_all_task_four_races() {
 
     let bucket_exact_admit = format!("pg-import-exact-admit-{}", uuid::Uuid::new_v4());
     let (exact_holder, exact_contender, exact_observer) =
-        connect_triplet(&url, &bucket_exact_admit).await;
+        connect_ownership_triplet(&fixture, &bucket_exact_admit).await;
     submit(
         &exact_holder,
         request("exact-admit-old", &bucket_exact_admit, "key", None),
@@ -1257,7 +1295,7 @@ async fn postgres_bucket_first_ownership_serializes_all_task_four_races() {
 
     let bucket_prefix_submit = format!("pg-import-prefix-submit-{}", uuid::Uuid::new_v4());
     let (prefix_holder, prefix_contender, prefix_observer) =
-        connect_triplet(&url, &bucket_prefix_submit).await;
+        connect_ownership_triplet(&fixture, &bucket_prefix_submit).await;
     submit(
         &prefix_holder,
         request(
@@ -1319,7 +1357,7 @@ async fn postgres_bucket_first_ownership_serializes_all_task_four_races() {
 
     let bucket_prefix_admit = format!("pg-import-prefix-admit-{}", uuid::Uuid::new_v4());
     let (prefix_holder, prefix_contender, prefix_observer) =
-        connect_triplet(&url, &bucket_prefix_admit).await;
+        connect_ownership_triplet(&fixture, &bucket_prefix_admit).await;
     submit(
         &prefix_holder,
         request(
@@ -1397,7 +1435,7 @@ async fn postgres_bucket_first_ownership_serializes_all_task_four_races() {
 
     let bucket_empty_admit = format!("pg-import-empty-admit-{}", uuid::Uuid::new_v4());
     let (empty_holder, empty_contender, empty_observer) =
-        connect_triplet(&url, &bucket_empty_admit).await;
+        connect_ownership_triplet(&fixture, &bucket_empty_admit).await;
     submit(
         &empty_holder,
         request("empty-old", &bucket_empty_admit, "archive", Some("")),
@@ -1454,7 +1492,7 @@ async fn postgres_bucket_first_ownership_serializes_all_task_four_races() {
 
     let bucket_empty_submit = format!("pg-import-empty-submit-{}", uuid::Uuid::new_v4());
     let (empty_holder, empty_contender, empty_observer) =
-        connect_triplet(&url, &bucket_empty_submit).await;
+        connect_ownership_triplet(&fixture, &bucket_empty_submit).await;
     submit(
         &empty_holder,
         request(
@@ -1513,7 +1551,7 @@ async fn postgres_bucket_first_ownership_serializes_all_task_four_races() {
 
     let bucket_extracted_claim = format!("pg-import-extracted-claim-{}", uuid::Uuid::new_v4());
     let (extracted_holder, extracted_contender, extracted_observer) =
-        connect_triplet(&url, &bucket_extracted_claim).await;
+        connect_ownership_triplet(&fixture, &bucket_extracted_claim).await;
     submit(
         &extracted_holder,
         request(
@@ -1588,7 +1626,7 @@ async fn postgres_bucket_first_ownership_serializes_all_task_four_races() {
 
     let bucket_extracted_admit = format!("pg-import-extracted-admit-{}", uuid::Uuid::new_v4());
     let (extracted_holder, extracted_contender, extracted_observer) =
-        connect_triplet(&url, &bucket_extracted_admit).await;
+        connect_ownership_triplet(&fixture, &bucket_extracted_admit).await;
     submit(
         &extracted_holder,
         request(
@@ -1660,7 +1698,7 @@ async fn postgres_bucket_first_ownership_serializes_all_task_four_races() {
 
     let bucket_delete_submit = format!("pg-import-delete-submit-{}", uuid::Uuid::new_v4());
     let (delete_holder, delete_contender, delete_observer) =
-        connect_triplet(&url, &bucket_delete_submit).await;
+        connect_ownership_triplet(&fixture, &bucket_delete_submit).await;
     submit(
         &delete_holder,
         request("delete-old", &bucket_delete_submit, "old", None),
@@ -1721,7 +1759,7 @@ async fn postgres_bucket_first_ownership_serializes_all_task_four_races() {
 
     let bucket_delete_first = format!("pg-import-delete-first-{}", uuid::Uuid::new_v4());
     let (delete_holder, delete_contender, delete_observer) =
-        connect_triplet(&url, &bucket_delete_first).await;
+        connect_ownership_triplet(&fixture, &bucket_delete_first).await;
     submit(
         &delete_holder,
         request("delete-first-old", &bucket_delete_first, "old", None),
@@ -1789,6 +1827,7 @@ async fn postgres_bucket_first_ownership_serializes_all_task_four_races() {
     ] {
         supersede_active_test_jobs(&delete_holder, bucket_name, Utc::now()).await;
     }
+    fixture.cleanup().await;
 }
 
 #[tokio::test]
@@ -1805,6 +1844,11 @@ async fn postgres_json_columns_require_compatibility_migration() {
     let bucket_name = format!("json-bucket-{suffix}");
     let upload_id = format!("json-upload-{suffix}");
     let upload_object_id = format!("json-upload-object-{suffix}");
+    let payload_upload_id = format!("json-payload-upload-{suffix}");
+    let payload_object_id = format!("json-payload-object-{suffix}");
+    let payload_metadata =
+        serde_json::json!({"caption": "写真", "labels": ["猫"], "nested": {"private": true}});
+    let payload_tags = serde_json::to_value([ObjectTag::new("fixture", "写真")]).unwrap();
     let invalid_object_id = format!("json-invalid-object-{suffix}");
     let invalid_key = format!("json-invalid-key-{suffix}");
     let fixture = connect_single(&url).await;
@@ -1821,28 +1865,38 @@ async fn postgres_json_columns_require_compatibility_migration() {
         .await
         .unwrap();
     create_pre_json_bucket(&fixture, &bucket_name).await;
-    multipart::create_upload(
-        &fixture,
-        &upload_id,
-        &upload_object_id,
-        &bucket_name,
-        "object",
-        "none",
-        None,
-        None,
-        None,
-        None,
-        &[],
-        None,
-        false,
-    )
-    .await
-    .unwrap();
+    for (id, object_id, key, metadata, tags) in [
+        (
+            &upload_id,
+            &upload_object_id,
+            "object",
+            None,
+            serde_json::json!([]),
+        ),
+        (
+            &payload_upload_id,
+            &payload_object_id,
+            "payload",
+            Some(payload_metadata.to_string()),
+            payload_tags.clone(),
+        ),
+    ] {
+        fixture
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "INSERT INTO multipart_uploads \
+                 (upload_id, object_id, bucket, key, encryption_mode, metadata, tags_json, decompress_zip_result) \
+                 VALUES ($1, $2, $3, $4, 'none', $5, $6, FALSE)",
+                [id.clone().into(), object_id.clone().into(), bucket_name.clone().into(), key.into(), metadata.into(), tags.to_string().into()],
+            ))
+            .await
+            .unwrap();
+    }
 
-    let decode_error = multipart::get_upload(&fixture, &upload_id)
+    let decode_error = compatibility_upload_json(&fixture, &upload_id)
         .await
         .unwrap_err();
-    let decode_diagnostic = format!("{decode_error:?}").to_lowercase();
+    let decode_diagnostic = decode_error.to_string().to_lowercase();
     for expected in [
         "error occurred while decoding column",
         "mismatched types",
@@ -2017,9 +2071,18 @@ async fn postgres_json_columns_require_compatibility_migration() {
         .execute_unprepared(&format!("SET search_path TO {schema}"))
         .await
         .unwrap();
-    let upload = multipart::get_upload(&fixture, &upload_id).await.unwrap();
+    let upload = compatibility_upload_json(&fixture, &upload_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(upload.metadata.is_none());
     assert_eq!(upload.tags_json, serde_json::json!([]));
+    let payload = compatibility_upload_json(&fixture, &payload_upload_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(payload.metadata, Some(payload_metadata));
+    assert_eq!(payload.tags_json, payload_tags);
     multipart::upsert_part(
         &fixture,
         &upload_id,

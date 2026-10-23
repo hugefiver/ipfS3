@@ -1,6 +1,6 @@
 use super::{
     Binding, Confirmation, Receipt, SCHEMA,
-    model::{field, key},
+    model::{field, index_rows, key},
     refused,
 };
 use crate::{
@@ -176,8 +176,9 @@ pub(super) async fn append(
             .map_err(|_| refused("receipt item budget exceeded"))?,
     };
     budget(db, model.confirmation.len() + model.declaration.len()).await?;
+    let result = public(&model);
     use sea_orm::IntoActiveModel;
-    operation::Entity::insert(model.clone().into_active_model())
+    operation::Entity::insert(model.into_active_model())
         .exec(db)
         .await?;
     use crate::store::pinning::management::{admission, native, records};
@@ -185,6 +186,19 @@ pub(super) async fn append(
         table: "pin_legacy_migrations".into(),
         values: vec![id.clone()],
     }]);
+    let mut bindings_by_row: BTreeMap<(&str, &BTreeMap<String, String>), Vec<&Binding>> =
+        BTreeMap::new();
+    for binding in confirmation
+        .declaration
+        .namespaces
+        .iter()
+        .flat_map(|n| &n.bindings)
+    {
+        bindings_by_row
+            .entry((&binding.table, &binding.key))
+            .or_default()
+            .push(binding);
+    }
     let mut ordinal = 0;
     for image in &confirmation.before {
         let after = confirmation
@@ -192,22 +206,19 @@ pub(super) async fn append(
             .iter()
             .find(|i| i.table == image.table)
             .ok_or_else(|| refused("receipt post-image incomplete"))?;
+        let after_rows = index_rows(after);
         // Empty tables have a sentinel item: their absence is explicit evidence.
-        let original_rows: Vec<Option<&super::NativeRow>> = if image.rows.is_empty() {
-            vec![None]
-        } else {
-            image.rows.iter().map(Some).collect()
-        };
+        let original_rows = image
+            .rows
+            .iter()
+            .map(Some)
+            .chain(image.rows.is_empty().then_some(None));
         for row in original_rows {
             let row_key = row.map(|r| key(image, r)).unwrap_or_default();
-            let bindings: Vec<_> = confirmation
-                .declaration
-                .namespaces
-                .iter()
-                .flat_map(|n| &n.bindings)
-                .filter(|b| b.table == image.table && b.key == row_key)
-                .cloned()
-                .collect();
+            let bindings = bindings_by_row
+                .get(&(image.table.as_str(), &row_key))
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
             let before_image =
                 serde_json::to_string(&row).map_err(|_| refused("receipt image invalid"))?;
             let mut after_key = row_key.clone();
@@ -225,9 +236,14 @@ pub(super) async fn append(
             {
                 after_key.insert("provider".into(), ns.target.clone());
             }
-            let after_row = after.rows.iter().find(|r| key(after, r) == after_key);
+            let after_row = after_rows.get(&after_key).copied();
             let after_image =
                 serde_json::to_string(&after_row).map_err(|_| refused("receipt image invalid"))?;
+            let (before_image, after_image) = if reverses.is_some() {
+                (after_image, before_image)
+            } else {
+                (before_image, after_image)
+            };
             item::Entity::insert(item::ActiveModel {
                 operation_id: Set(id.clone()),
                 ordinal: Set(ordinal),
@@ -235,16 +251,8 @@ pub(super) async fn append(
                 original_key: Set(
                     serde_json::to_string(&row_key).map_err(|_| refused("receipt key invalid"))?
                 ),
-                before_image: Set(if reverses.is_some() {
-                    after_image.clone()
-                } else {
-                    before_image.clone()
-                }),
-                after_image: Set(if reverses.is_some() {
-                    before_image
-                } else {
-                    after_image
-                }),
+                before_image: Set(before_image),
+                after_image: Set(after_image),
                 bindings: Set(serde_json::to_string(&bindings)
                     .map_err(|_| refused("receipt bindings invalid"))?),
             })
@@ -287,7 +295,7 @@ pub(super) async fn append(
             .await
             .map_err(admission::work_error)?;
     }
-    Ok(public(&model))
+    Ok(result)
 }
 
 #[derive(Clone, Debug)]

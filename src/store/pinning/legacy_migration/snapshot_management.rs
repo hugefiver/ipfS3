@@ -2,6 +2,29 @@
 use crate::{error::AppResult, store::pinning::management::schema};
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 
+/// Facts and versions come from this SQLite classification's metadata statement.
+/// Current storage guards and readiness are still validated against the database.
+pub(in crate::store::pinning::legacy_migration) async fn validate_sqlite_metadata<
+    C: ConnectionTrait,
+>(
+    db: &C,
+    versions: &[String],
+    shadowed: bool,
+    objects_present: bool,
+) -> AppResult<()> {
+    if shadowed {
+        return Err(invalid());
+    }
+    if versions.iter().any(|version| version == schema::VERSION) {
+        schema::validate_sqlite_with_versions(db, versions)
+            .await
+            .map_err(|_| invalid())?;
+    } else if objects_present {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 pub(super) async fn validate<C: ConnectionTrait>(db: &C, present: bool) -> AppResult<()> {
     let backend = db.get_database_backend();
     let shadow = match backend {

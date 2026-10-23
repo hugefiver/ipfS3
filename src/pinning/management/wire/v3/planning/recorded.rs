@@ -35,10 +35,10 @@ pub async fn recorded<W: Write>(
     for entry in &plan.entries {
         writer.frame(&Frame::Item {
             entry: Box::new(ItemFact {
-                id: entry.id.clone(),
-                request: entry.request.clone(),
-                status: entry.status,
-                step: entry.step.clone(),
+                id: entry.id().clone(),
+                request: entry.request().clone(),
+                status: entry.status(),
+                step: entry.step().clone(),
             }),
         })?;
     }
@@ -133,7 +133,7 @@ pub async fn recorded<W: Write>(
             Section::Result,
             "management_capture",
             i,
-            &entry.capture,
+            &entry.capture(),
         )?;
     }
     Ok(())

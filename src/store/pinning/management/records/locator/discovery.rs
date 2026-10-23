@@ -437,7 +437,10 @@ fn validate_graph(
                 return Err(ManagementError::InvalidEvidence);
             }
             for (position, member) in class.ordered_plan_members.iter().enumerate() {
-                if rows[member].get("binding") != rows[key].get("binding") {
+                if !archive::binding_matches(
+                    required(&rows[member], "binding")?,
+                    required(&rows[key], "binding")?,
+                ) {
                     return Err(ManagementError::InvalidEvidence);
                 }
                 let current = classes

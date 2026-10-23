@@ -39,13 +39,12 @@ pub(crate) fn resolved_policy(
             "persisted import tags are invalid",
         )
     })?;
-    if let Some(json) = &job.pin_decision_json {
-        let decision: ExtensionDecision = serde_json::from_str(json).map_err(|_| {
-            terminal_failure(
-                ImportFailureCode::PublicationFailed,
-                "persisted import pin decision is invalid",
-            )
-        })?;
+    if let Some(decision) = crate::store::import::jobs::decision_from_job(job).map_err(|_| {
+        terminal_failure(
+            ImportFailureCode::PublicationFailed,
+            "persisted import pin decision is invalid",
+        )
+    })? {
         if decision.origin.request_id != job.id {
             return Err(terminal_failure(
                 ImportFailureCode::PublicationFailed,

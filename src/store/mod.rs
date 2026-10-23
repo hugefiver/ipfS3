@@ -136,6 +136,7 @@ mod migrator {
                     crate::store::migrations::m20261013_000001_zip_root_logical_release::Migration,
                 ),
                 Box::new(crate::store::migrations::m20261017_000001_management_storage::Migration),
+                Box::new(crate::store::migrations::m20261023_000001_inline_documents::Migration),
             ]
         }
     }

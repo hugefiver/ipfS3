@@ -1,4 +1,4 @@
-//! Explicit conversion output. Recovery reads typed S75A1 references, not S7 text.
+//! Explicit conversion output. Recovery reads verified archive references, not S7 text.
 use crate::store::pinning::management::{self, ManagementError, Result, native, records};
 use native::{NativeKey, NativeRow, meter::Budget};
 use records::segmented::{ArchiveHeader, ArchiveRef, read_archive, write_archive};
@@ -32,7 +32,8 @@ pub(crate) async fn upgrade_stamp(
         target: request.target_version.into(),
     };
     let mut work = Budget::default();
-    if let Some(reference) = reference(tx, "history:upgrade").await? {
+    let id = format!("history:upgrade:{}", request.target_version);
+    if let Some(reference) = reference(tx, &id).await? {
         if preparing || read_part::<_, UpgradeStamp>(tx, &reference, &mut work).await? != stamp {
             return Err(ManagementError::Confirmation);
         }
@@ -51,7 +52,7 @@ pub(crate) async fn upgrade_stamp(
             created_at: String::new(),
             expires_at: None,
         };
-        store_json(tx, "history:upgrade", &header, &stamp, &mut work).await?;
+        store_json(tx, &id, &header, &stamp, &mut work).await?;
     }
     Ok(())
 }
@@ -127,7 +128,9 @@ pub(crate) fn archive_id(
     generation: i64,
 ) -> Result<String> {
     let mut hash = Sha256::new();
-    hash.update(b"stage75/history/1\0");
+    // Conversion semantics have their own namespace; original archives and
+    // previously published indices remain immutable and independently readable.
+    hash.update(b"stage75/history/2\0");
     hash.update(
         serde_json::to_vec(&(scope, identity, key, generation))
             .map_err(|_| ManagementError::InvalidEvidence)?,
@@ -136,14 +139,7 @@ pub(crate) fn archive_id(
 }
 
 async fn reference<C: ConnectionTrait>(db: &C, id: &str) -> Result<Option<ArchiveRef>> {
-    db.query_one(Statement::from_sql_and_values(db.get_database_backend(),
-        "SELECT digest,bytes,chunks FROM pin_management_archive WHERE archive_id=$1 AND state='sealed'", [id.into()]))
-        .await.map_err(|_| ManagementError::Database)?.map(|row| Ok(ArchiveRef {
-            archive_id: id.into(),
-            digest: row.try_get("", "digest").map_err(|_| ManagementError::InvalidEvidence)?,
-            bytes: row.try_get("", "bytes").map_err(|_| ManagementError::InvalidEvidence)?,
-            chunks: row.try_get("", "chunks").map_err(|_| ManagementError::InvalidEvidence)?,
-        })).transpose()
+    records::segmented::reference(db, id).await
 }
 
 async fn store_json<T: Serialize + ?Sized>(
@@ -554,9 +550,10 @@ pub(crate) async fn convert_source(
                 recorded: None,
             });
         }
+        let (anchor, core_identity) = review.original_core()?;
         Some(ReviewIndex {
-            anchor: None,
-            core_identity: None,
+            anchor: Some(anchor),
+            core_identity: Some(core_identity),
             catalog: review.archive().schema_versions().to_vec(),
             database_scope: review.scope().into(),
             database_identity: review.identity().into(),
@@ -604,7 +601,7 @@ pub(crate) async fn convert_source(
             rows,
             staged_at: review.staged_at(),
             expires_at: review.expires_at(),
-            confirmed_at: legacy::confirmation_time(native::value(&row, "binding"))?,
+            confirmed_at: review.confirmed_at(),
             acknowledgements: review.candidate_item_ids().map(<[String]>::to_vec),
         })
     } else {

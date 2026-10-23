@@ -1,5 +1,8 @@
 use sea_orm::entity::prelude::*;
+use sea_orm::{Iterable, JoinType, QueryFilter, QuerySelect, sea_query::Expr};
 
+/// Joined execution projection. Request columns belong to import_job_requests;
+/// intake writes are coordinated by the import store, not full-model updates.
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
 #[sea_orm(table_name = "import_jobs")]
 pub struct Model {
@@ -14,11 +17,11 @@ pub struct Model {
     pub object_content_type: Option<String>,
     pub metadata_json: String,
     pub tags_json: String,
-    /// Captured at authenticated submission; NULL only for pre-migration jobs.
+    /// Standalone decision; ZIP captures own their source decision.
     pub pin_decision_json: Option<String>,
     pub zip_intent_json: Option<String>,
     pub decompress_prefix: Option<String>,
-    /// Signed admission option; NULL for jobs created before Stage4.
+    /// Legacy standalone root option. New ZIP captures own this option.
     pub root_capture_json: Option<String>,
     pub state: String,
     pub phase: String,
@@ -48,6 +51,8 @@ pub struct Model {
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
+    #[sea_orm(has_one = "super::import_job_request::Entity")]
+    Request,
     #[sea_orm(
         belongs_to = "super::bucket::Entity",
         from = "Column::Bucket",
@@ -63,3 +68,52 @@ impl Related<super::bucket::Entity> for Entity {
 }
 
 impl ActiveModelBehavior for ActiveModel {}
+
+impl Related<super::import_job_request::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Request.def()
+    }
+}
+
+impl Column {
+    pub fn is_request(&self) -> bool {
+        matches!(
+            self,
+            Self::SourceValue
+                | Self::ObjectContentType
+                | Self::MetadataJson
+                | Self::TagsJson
+                | Self::PinDecisionJson
+                | Self::ZipIntentJson
+                | Self::DecompressPrefix
+                | Self::RootCaptureJson
+        )
+    }
+}
+
+impl Entity {
+    /// Full execution/response projection. Hot-only callers select their own
+    /// columns from find_state and never join or read the frozen request.
+    pub fn find() -> sea_orm::Select<Self> {
+        let mut query = Self::find_state().select_only();
+        for column in Column::iter() {
+            query = if column.is_request() {
+                query.column_as(
+                    Expr::col((super::import_job_request::Entity, column)),
+                    column,
+                )
+            } else {
+                query.column(column)
+            };
+        }
+        query.join(JoinType::InnerJoin, Relation::Request.def())
+    }
+
+    pub fn find_state() -> sea_orm::Select<Self> {
+        <Self as EntityTrait>::find()
+    }
+
+    pub fn find_by_id(id: impl Into<String>) -> sea_orm::Select<Self> {
+        Self::find().filter(Column::Id.eq(id.into()))
+    }
+}

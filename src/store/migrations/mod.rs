@@ -33,3 +33,6 @@ pub mod m20261008_000001_zip_intent_capture;
 pub mod m20261012_000001_pinning_management;
 pub mod m20261013_000001_zip_root_logical_release;
 pub mod m20261017_000001_management_storage;
+pub mod m20261023_000001_inline_documents;
+#[cfg(test)]
+mod stage3_tests;

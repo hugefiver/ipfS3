@@ -48,6 +48,14 @@ impl Harness {
     }
 
     pub async fn start_with_history(root: bool, auto: bool, history: bool) -> Self {
+        Self::start_with_capacity(root, auto, history, 8192).await
+    }
+
+    pub async fn start_for_client_multipart() -> Self {
+        Self::start_with_capacity(false, false, false, 32 * 1024 * 1024).await
+    }
+
+    async fn start_with_capacity(root: bool, auto: bool, history: bool, max_bytes: u64) -> Self {
         let source = HttpNode::start(false).await;
         let target = HttpNode::start(true).await;
         // Synthetic test-only configuration; no files/environment credentials read.
@@ -71,7 +79,7 @@ impl Harness {
             strategy = 'upload'
             endpoint = '{}'
             priority = 1
-            max_bytes = 8192
+            max_bytes = {max_bytes}
             max_pins = 8
             requests_per_second = 100
             [[pinning.policies]]

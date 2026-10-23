@@ -42,6 +42,7 @@ impl InventorySpool {
             let read = tx
                 .run(move |tx, _| {
                     Box::pin(async move {
+                        let mut clock_bytes = 0;
                         if first {
                             let sql = if tx.get_database_backend() == DatabaseBackend::Sqlite {
                                 "SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now') AS now"
@@ -53,13 +54,15 @@ impl InventorySpool {
                                 .await
                                 .map_err(|_| ManagementError::Database)?
                                 .ok_or(ManagementError::Database)?;
-                            if checkpoint.observed_at
-                                > native::parse_time(&get::<String>(&now, "now")?)?
-                            {
+                            let now = get::<String>(&now, "now")?;
+                            clock_bytes = now.len() as u64;
+                            if checkpoint.observed_at > native::parse_time(&now)? {
                                 return Err(ManagementError::InvalidEvidence);
                             }
                         }
-                        page::read(tx, checkpoint, 0, 0, control).await
+                        let mut read = page::read(tx, checkpoint, 0, 0, control).await?;
+                        read.work.returned(clock_bytes)?;
+                        Ok(read)
                     })
                 })
                 .await
@@ -74,7 +77,7 @@ impl InventorySpool {
                 &metering,
                 &run,
                 read.rows,
-                read.work.keyset.bytes + read.work.cells.bytes,
+                read.work.total_bytes()?,
             )
             .await?;
             super::super::spool::budget::record_queries(
@@ -105,7 +108,7 @@ impl InventorySpool {
                 ordinal += 1;
                 if get::<i64>(&row, "ordinal")? != ordinal
                     || get::<String>(&row, "table_name")? != part.table
-                    || get::<String>(&row, "row_key")? != encode(&part.key)?
+                    || get::<String>(&row, "row_key")? != encode(part.key.as_ref())?
                     || get::<String>(&row, "column_name")? != part.column
                     || get::<i64>(&row, "offset")? != part.offset as i64
                     || get::<Option<i64>>(&row, "length")? != part.length.map(|n| n as i64)

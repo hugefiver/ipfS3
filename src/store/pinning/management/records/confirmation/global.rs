@@ -197,18 +197,20 @@ async fn final_transaction(
         let (reference,binding)={let mut budget=work.lock().map_err(|_|ManagementError::InvalidEvidence)?;
             (archive::encode_locator(&before,&mut budget)?,archive::encode_confirmed_proposal(&before,now,acks,&mut budget)?)};
         let anchor=&plan.items().first().ok_or(ManagementError::Confirmation)?.request.item_id;
+        let shared_binding=archive::shared_binding(&binding);
         let mut changes=Vec::new();
         for item in &request.items {
             let key=native::NativeKey {table:super::super::super::schema::RECORDS.into(),values:vec![auth.database_scope.clone(),request.plan_id.clone(),item.item_id.clone(),"action".into()]};
             let empty=native::scope::collect_scope(tx,&native::scope::ScopeSpec::new(vec![native::scope::Selector::Exact(key.clone())])?,&mut native::meter::Budget::default()).await?;
             if !empty.rows().is_empty() {return Err(ManagementError::Confirmation)}
             let original=if &item.item_id==anchor {&before}else{&reference};
+            let item_binding=if &item.item_id==anchor {&binding}else{&shared_binding};
             tx.execute(Statement::from_sql_and_values(tx.get_database_backend(),
                 "INSERT INTO pin_management_records(database_scope,plan_id,item_id,kind,native_identity,principal,binding,native_before,result,intent_ids,job_ids,state,created_at,expires_at,completed_at) VALUES($1,$2,$3,'action',$4,$5,$6,$7,NULL,'[]','[]','prepared',$8,$9,NULL)",
-                [auth.database_scope.clone().into(),request.plan_id.clone().into(),item.item_id.clone().into(),auth.database_identity.clone().into(),auth.principal.clone().into(),binding.clone().into(),original.clone().into(),now.into(),expires_at.into()])).await.map_err(|_|ManagementError::Database)?;
+                [auth.database_scope.clone().into(),request.plan_id.clone().into(),item.item_id.clone().into(),auth.database_identity.clone().into(),auth.principal.clone().into(),item_binding.clone().into(),original.clone().into(),now.into(),expires_at.into()])).await.map_err(|_|ManagementError::Database)?;
             let values=key.values.iter().map(String::as_str).collect::<Vec<_>>();
             let row=current_row(tx,&key.table,&values,DecodeWork::shared(work)).await?;
-            for (column,expected) in [("database_scope",auth.database_scope.as_str()),("plan_id",request.plan_id.as_str()),("item_id",item.item_id.as_str()),("kind","action"),("native_identity",auth.database_identity.as_str()),("principal",auth.principal.as_str()),("binding",binding.as_str()),("native_before",original.as_str()),("intent_ids","[]"),("job_ids","[]"),("state","prepared")] {
+            for (column,expected) in [("database_scope",auth.database_scope.as_str()),("plan_id",request.plan_id.as_str()),("item_id",item.item_id.as_str()),("kind","action"),("native_identity",auth.database_identity.as_str()),("principal",auth.principal.as_str()),("binding",item_binding.as_str()),("native_before",original.as_str()),("intent_ids","[]"),("job_ids","[]"),("state","prepared")] {
                 if native::value(&row,column)!=Some(expected) {return Err(ManagementError::Changed)}
             }
             if ["result","completed_at"].iter().any(|column|row.get(*column)!=Some(&None))||native::parse_time(native::value(&row,"created_at").ok_or(ManagementError::InvalidEvidence)?)?!=now||native::parse_time(native::value(&row,"expires_at").ok_or(ManagementError::InvalidEvidence)?)?!=expires_at {return Err(ManagementError::Changed)}

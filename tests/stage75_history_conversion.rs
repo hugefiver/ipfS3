@@ -1,3 +1,7 @@
+#[path = "support/stage75_legacy_import.rs"]
+mod legacy_import;
+#[path = "support/stage75_source_catalog.rs"]
+mod source_catalog;
 use ipfs_s3_gateway::store::{
     initialization::{self, SchemaState, UpgradeRequest},
     pinning::management::{native, schema},
@@ -714,9 +718,10 @@ async fn remove_fixture_storage(db: &sea_orm::DatabaseConnection) {
             .await
             .unwrap();
     }
+    legacy_import::restore(db).await;
     db.execute(Statement::from_sql_and_values(
         backend,
-        "DELETE FROM seaql_migrations WHERE version=$1",
+        "DELETE FROM seaql_migrations WHERE version IN ($1,'m20261017_000001_management_storage')",
         [schema::VERSION.into()],
     ))
     .await
@@ -736,6 +741,10 @@ async fn enlarge_confirmed_original(db: &sea_orm::DatabaseConnection, plan: &str
     let start = 39 + count * 8;
     let mut head: serde_json::Value = serde_json::from_str(&raw[start..start + head_len]).unwrap();
     let mut core = raw[start + head_len..start + head_len + core_len].to_owned();
+    let core_fields: serde_json::Value = serde_json::from_str(&core).unwrap();
+    let proposed: chrono::DateTime<chrono::Utc> =
+        serde_json::from_value(core_fields[4].clone()).unwrap();
+    let later = proposed + chrono::Duration::nanoseconds(1);
     core.push_str(&" ".repeat(1024 * 1024));
     let mut digest = Sha256::new();
     digest.update(b"stage7/core/1\0");
@@ -756,6 +765,9 @@ async fn enlarge_confirmed_original(db: &sea_orm::DatabaseConnection, plan: &str
     let mut binding: serde_json::Value =
         serde_json::from_str(binding.strip_prefix("S7B1\n").unwrap()).unwrap();
     binding[2] = hash.clone().into();
+    let confirmed: chrono::DateTime<chrono::Utc> =
+        serde_json::from_value(binding[3].clone()).unwrap();
+    binding[3] = serde_json::to_value(confirmed.max(later)).unwrap();
     let binding = format!("S7B1\n{}", serde_json::to_string(&binding).unwrap());
     let locator: String = db
         .query_one(Statement::from_sql_and_values(
@@ -771,7 +783,7 @@ async fn enlarge_confirmed_original(db: &sea_orm::DatabaseConnection, plan: &str
     let mut locator: serde_json::Value =
         serde_json::from_str(locator.strip_prefix("S7L1\n").unwrap()).unwrap();
     locator[1] = hash.into();
-    db.execute(Statement::from_sql_and_values(db.get_database_backend(),"UPDATE pin_management_records SET binding=$1,native_before=CASE WHEN item_id='a' THEN $2 ELSE $3 END WHERE plan_id=$4 AND state='prepared'",[binding.into(),enlarged.clone().into(),format!("S7L1\n{}",serde_json::to_string(&locator).unwrap()).into(),plan.into()])).await.unwrap();
+    db.execute(Statement::from_sql_and_values(db.get_database_backend(),"UPDATE pin_management_records SET binding=$1,native_before=CASE WHEN item_id='a' THEN $2 ELSE $3 END,created_at=CASE WHEN item_id='b' THEN $5 ELSE created_at END WHERE plan_id=$4 AND state='prepared'",[binding.into(),enlarged.clone().into(),format!("S7L1\n{}",serde_json::to_string(&locator).unwrap()).into(),plan.into(),later.to_rfc3339_opts(chrono::SecondsFormat::Nanos,true).into()])).await.unwrap();
     enlarged
 }
 
@@ -935,10 +947,15 @@ async fn verify_real_history_conversion(shared_dependency: bool) {
             .starts_with("S7L1\n")
     }));
     assert!(originals.iter().all(|row| {
-        row.try_get::<String>("", "binding")
-            .unwrap()
-            .starts_with("S7B1\n")
+        let binding = row.try_get::<String>("", "binding").unwrap();
+        binding.starts_with("S7B1\n") || binding.starts_with("S7R2\n")
     }));
+    let pending_times = originals
+        .iter()
+        .filter(|row| row.try_get::<String>("", "plan_id").unwrap() == pending_request.plan_id)
+        .map(|row| row.try_get::<String>("", "created_at").unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(pending_times.len(), 2);
     assert!(originals.iter().any(|row| {
         row.try_get::<Option<String>>("", "result")
             .unwrap()
@@ -976,7 +993,10 @@ async fn verify_real_history_conversion(shared_dependency: bool) {
     };
     let original_binding = originals
         .iter()
-        .find(|row| row.try_get::<String>("", "plan_id").unwrap() == request.plan_id)
+        .find(|row| {
+            row.try_get::<String>("", "plan_id").unwrap() == key.values[1]
+                && row.try_get::<String>("", "item_id").unwrap() == key.values[2]
+        })
         .unwrap()
         .try_get::<String>("", "binding")
         .unwrap();
@@ -1019,8 +1039,17 @@ async fn verify_real_history_conversion(shared_dependency: bool) {
     let mut second_key = key.clone();
     second_key.values[2] = request.items[dependent_index].item_id.clone();
     if shared_dependency {
+        let second_binding = originals
+            .iter()
+            .find(|row| {
+                row.try_get::<String>("", "plan_id").unwrap() == second_key.values[1]
+                    && row.try_get::<String>("", "item_id").unwrap() == second_key.values[2]
+            })
+            .unwrap()
+            .try_get::<String>("", "binding")
+            .unwrap();
         assert!(
-            history::recover_committed(&fixture.db, &second_key, &original_binding, &mut budget)
+            history::recover_committed(&fixture.db, &second_key, &second_binding, &mut budget)
                 .await
                 .unwrap()
                 .unwrap()
@@ -1059,14 +1088,29 @@ async fn verify_real_history_conversion(shared_dependency: bool) {
             );
         }
         let review = index.review.unwrap();
-        let binding: serde_json::Value = serde_json::from_str(
-            restored["binding"]
-                .as_deref()
+        let full_binding = if restored["binding"]
+            .as_deref()
+            .unwrap()
+            .starts_with("S7R2\n")
+        {
+            let plan_id: String = row.try_get("", "plan_id").unwrap();
+            originals
+                .iter()
+                .find(|candidate| {
+                    candidate.try_get::<String>("", "plan_id").unwrap() == plan_id
+                        && candidate
+                            .try_get::<String>("", "binding")
+                            .unwrap()
+                            .starts_with("S7B1\n")
+                })
                 .unwrap()
-                .strip_prefix("S7B1\n")
-                .unwrap(),
-        )
-        .unwrap();
+                .try_get::<String>("", "binding")
+                .unwrap()
+        } else {
+            restored["binding"].clone().unwrap()
+        };
+        let binding: serde_json::Value =
+            serde_json::from_str(full_binding.strip_prefix("S7B1\n").unwrap()).unwrap();
         let acknowledgements: Vec<String> = serde_json::from_value(binding[4].clone()).unwrap();
         assert_eq!(review.acknowledgements, Some(acknowledgements));
         assert_eq!(
@@ -1225,8 +1269,24 @@ async fn old_provider_committed_sql_history_restores_receipt_and_inventory() {
 async fn history_business_rows(
     db: &sea_orm::DatabaseConnection,
 ) -> std::collections::BTreeMap<native::NativeKey, native::NativeRow> {
+    let versions = db
+        .query_all(Statement::from_string(
+            db.get_database_backend(),
+            "SELECT version FROM seaql_migrations ORDER BY version",
+        ))
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.try_get::<String>("", "version").unwrap())
+        .collect::<Vec<_>>();
+    let current = versions.last().map(String::as_str) == Some(schema::VERSION);
+    let tables = if current {
+        native::registry()
+    } else {
+        source_catalog::tables(&versions)
+    };
     let mut originals = std::collections::BTreeMap::new();
-    for table in native::registry() {
+    for table in tables {
         let columns = table
             .columns
             .iter()
@@ -1265,6 +1325,26 @@ async fn history_business_rows(
                     .collect(),
             };
             assert!(originals.insert(key, row).is_none());
+        }
+    }
+    if current {
+        let requests = originals
+            .keys()
+            .filter(|key| key.table == "import_job_requests")
+            .cloned()
+            .collect::<Vec<_>>();
+        for request in requests {
+            let mut cold = originals.remove(&request).unwrap();
+            assert_eq!(cold.remove("job_id"), Some(Some(request.values[0].clone())));
+            let job = originals
+                .get_mut(&native::NativeKey {
+                    table: "import_jobs".into(),
+                    values: request.values,
+                })
+                .unwrap();
+            for (column, value) in cold {
+                assert_eq!(job.insert(column, value), None);
+            }
         }
     }
     originals
@@ -1613,27 +1693,7 @@ async fn write_old_provider_original(
         .iter()
         .map(|row| row.try_get::<String>("", "version").unwrap())
         .collect::<Vec<_>>();
-    let mut tables = native::registry();
-    if catalog.last().unwrap() == "m20261012_000001_pinning_management" {
-        let root = tables
-            .iter_mut()
-            .find(|table| table.table == "zip_root_references")
-            .unwrap();
-        root.columns = root
-            .columns
-            .iter()
-            .filter(|column| *column != "logical_released_at")
-            .cloned()
-            .collect::<Vec<_>>()
-            .into();
-        root.definitions = root
-            .definitions
-            .iter()
-            .filter(|column| column.name != "logical_released_at")
-            .cloned()
-            .collect::<Vec<_>>()
-            .into();
-    }
+    let tables = source_catalog::tables(&catalog);
     let digest = |domain: &[u8], raw: &str| {
         let mut hash = Sha256::new();
         hash.update(domain);

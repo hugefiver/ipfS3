@@ -451,28 +451,45 @@ pub(super) fn classify_archive(
     historical: Option<&crate::store::initialization::history::legacy::Review>,
 ) -> Result<()> {
     let mut work = DecodeBudget::default();
-    let binding: archive::StoredBinding = work.typed(
-        required(row, "binding")?
-            .strip_prefix(archive::BINDING)
-            .ok_or(ManagementError::InvalidEvidence)?,
-    )?;
-    let (anchor, binding_hash, confirmed) = match binding {
-        archive::StoredBinding::Draft(key, hash) => (
+    let raw_binding = required(row, "binding")?;
+    let (anchor, binding_hash, confirmed) = if archive::is_shared_binding(raw_binding) {
+        let (anchor, hash, _): (archive::Key, String, String) = work.typed(
+            required(row, "native_before")?
+                .strip_prefix(archive::LOCATOR)
+                .ok_or(ManagementError::InvalidEvidence)?,
+        )?;
+        (
             NativeKey {
-                table: key.0,
-                values: key.1,
-            },
-            hash,
-            false,
-        ),
-        archive::StoredBinding::Confirmed(key, hash, _, _) => (
-            NativeKey {
-                table: key.0,
-                values: key.1,
+                table: anchor.0,
+                values: anchor.1,
             },
             hash,
             true,
-        ),
+        )
+    } else {
+        let binding: archive::StoredBinding = work.typed(
+            raw_binding
+                .strip_prefix(archive::BINDING)
+                .ok_or(ManagementError::InvalidEvidence)?,
+        )?;
+        match binding {
+            archive::StoredBinding::Draft(key, hash) => (
+                NativeKey {
+                    table: key.0,
+                    values: key.1,
+                },
+                hash,
+                false,
+            ),
+            archive::StoredBinding::Confirmed(key, hash, _, _) => (
+                NativeKey {
+                    table: key.0,
+                    values: key.1,
+                },
+                hash,
+                true,
+            ),
+        }
     };
     if required(row, "state")? == "applied" && !confirmed {
         return Err(ManagementError::InvalidEvidence);

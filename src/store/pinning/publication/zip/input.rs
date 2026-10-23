@@ -9,8 +9,8 @@ use crate::{
     },
 };
 use sea_orm::{
-    ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait, QuerySelect, Statement,
-    TransactionTrait,
+    ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait,
+    FromQueryResult, QueryFilter, QuerySelect, Statement, TransactionTrait, sea_query::Expr,
 };
 use serde::{Deserialize, Serialize};
 
@@ -71,7 +71,7 @@ pub async fn read_legacy_import_input<C: ConnectionTrait>(
         "?"
     };
     let row = db.query_one(Statement::from_sql_and_values(db.get_database_backend(),
-        format!("SELECT b.legacy_input_proof_json,b.source,b.token,b.bucket,b.archive_key,j.bucket AS job_bucket,j.key AS job_key,j.decompress_prefix FROM zip_batches b LEFT JOIN import_jobs j ON j.id=b.id WHERE b.id={placeholder}"),
+        format!("SELECT b.legacy_input_proof_json,b.source,b.token,b.bucket,b.archive_key,j.bucket AS job_bucket,j.key AS job_key,r.decompress_prefix IS NOT NULL AS decompression FROM zip_batches b LEFT JOIN import_jobs j ON j.id=b.id LEFT JOIN import_job_requests r ON r.job_id=j.id WHERE b.id={placeholder}"),
         [job_id.into()])).await?;
     let Some(row) = row else { return Ok(None) };
     if row.try_get::<String>("", "source")? != "import"
@@ -80,9 +80,7 @@ pub async fn read_legacy_import_input<C: ConnectionTrait>(
             != row.try_get::<Option<String>>("", "job_bucket")?
         || Some(row.try_get::<String>("", "archive_key")?)
             != row.try_get::<Option<String>>("", "job_key")?
-        || row
-            .try_get::<Option<String>>("", "decompress_prefix")?
-            .is_none()
+        || !row.try_get::<bool>("", "decompression")?
     {
         return Err(invalid());
     }
@@ -108,11 +106,29 @@ pub async fn bind_legacy_import_input(
         size,
     };
     proof.validate()?;
-    let job = import_job::Entity::find_by_id(&claim.job_id)
+    #[derive(FromQueryResult)]
+    struct Location {
+        bucket: String,
+        key: String,
+        decompression: bool,
+    }
+    let bytes = |name: &str| {
+        if db.get_database_backend() == DatabaseBackend::Sqlite {
+            format!("length(CAST(\"{name}\" AS BLOB))")
+        } else {
+            format!("octet_length(\"{name}\")")
+        }
+    };
+    let job = import_job::Entity::find_state().select_only()
+        .column_as(Expr::cust(format!("CASE WHEN {}<=65536 THEN bucket END", bytes("bucket"))), "bucket")
+        .column_as(Expr::cust(format!("CASE WHEN {}<=65536 THEN key END", bytes("key"))), "key")
+        .column_as(Expr::cust("EXISTS(SELECT 1 FROM import_job_requests WHERE job_id=import_jobs.id AND decompress_prefix IS NOT NULL)"), "decompression")
+        .filter(import_job::Column::Id.eq(&claim.job_id))
+        .into_model::<Location>()
         .one(db)
         .await?
         .ok_or_else(invalid)?;
-    if job.decompress_prefix.is_none() {
+    if !job.decompression {
         return Err(invalid());
     }
     let tx = db.begin().await?;
@@ -126,7 +142,7 @@ pub async fn bind_legacy_import_input(
     }
     .ok_or_else(invalid)?;
     if batch.source != "import"
-        || batch.token != job.id
+        || batch.token != claim.job_id
         || batch.bucket != job.bucket
         || batch.archive_key != job.key
         || batch.state != "open"

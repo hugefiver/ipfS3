@@ -78,7 +78,6 @@ async fn confirmed_copy_sections_preserves_short_records_and_validates_excluded_
         &fixture.db,
         &binding,
         entry,
-        tempfile::tempfile().unwrap(),
         v3::files::stream::budget(),
     )
     .await

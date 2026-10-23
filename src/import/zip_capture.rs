@@ -2,11 +2,13 @@
 use crate::{
     import::{ImportExecutionError, ImportFailureCode, execution_error::terminal_failure},
     pinning::{
-        decision::ExtensionDecision,
         tags::{ObjectTag, ZipRootCapture},
         zip_policy::CapturedZipIntent,
     },
-    store::{entities::import_job, pinning::publication::decode_zip_capture_json},
+    store::{
+        entities::import_job, import::jobs::decision_from_job,
+        pinning::publication::decode_zip_capture_json,
+    },
 };
 
 pub(crate) fn legacy_capture(
@@ -20,14 +22,13 @@ pub(crate) fn legacy_capture(
     };
     let prefix = job.decompress_prefix.as_deref().ok_or_else(invalid)?;
     let tags: Vec<ObjectTag> = serde_json::from_str(&job.tags_json).map_err(|_| invalid())?;
+    let decision = decision_from_job(job).map_err(|_| invalid())?;
     let capture = if let Some(json) = &job.zip_intent_json {
         decode_zip_capture_json(json).map_err(|_| invalid())?
     } else {
         // The known old empty decision has no provider authority to recover.
         // Nonempty/revision-only decisions lack frozen routes and fail closed.
-        let decision: ExtensionDecision =
-            serde_json::from_str(job.pin_decision_json.as_deref().ok_or_else(invalid)?)
-                .map_err(|_| invalid())?;
+        let decision = decision.ok_or_else(invalid)?;
         if !decision.effective_intents.is_empty() {
             return Err(invalid());
         }

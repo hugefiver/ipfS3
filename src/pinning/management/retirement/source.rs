@@ -14,8 +14,11 @@ use std::collections::BTreeMap;
 pub(super) mod attest;
 mod batch;
 mod cells;
+mod check_read;
 mod fence;
 mod page;
+mod part;
+pub(super) use part::Part;
 mod stage;
 mod verify;
 
@@ -23,6 +26,37 @@ mod verify;
 pub(super) struct ReadWork {
     keyset: QueryWork,
     cells: QueryWork,
+    returned_bytes: u64,
+    copied_bytes: u64,
+}
+
+impl ReadWork {
+    // SQL values use their returned UTF-8/BLOB length; nullable BIGINT metadata
+    // reserves an eight-byte slot. Explicit original-projection copies and
+    // temporary key JSON are separate from reads and from archive serialization.
+    fn returned(&mut self, bytes: u64) -> Result<()> {
+        self.returned_bytes = self
+            .returned_bytes
+            .checked_add(bytes)
+            .ok_or(ManagementError::Budget)?;
+        Ok(())
+    }
+    fn copied(&mut self, bytes: u64) -> Result<()> {
+        self.copied_bytes = self
+            .copied_bytes
+            .checked_add(bytes)
+            .ok_or(ManagementError::Budget)?;
+        Ok(())
+    }
+    fn total_bytes(&self) -> Result<u64> {
+        self.returned_bytes
+            .checked_add(self.copied_bytes)
+            .ok_or(ManagementError::Budget)
+    }
+}
+
+fn key_owned_bytes(key: &NativeKey) -> u64 {
+    (key.table.len() + key.values.iter().map(String::len).sum::<usize>()) as u64
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,6 +135,9 @@ impl SourceCheckpoint {
         checkpoint
     }
     pub async fn check(&self, tx: &DatabaseTransaction) -> Result<()> {
+        self.check_counted(tx).await.map(|_| ())
+    }
+    pub(super) async fn check_counted(&self, tx: &DatabaseTransaction) -> Result<u64> {
         let catalog = native::current_catalog();
         if self.table > catalog.len()
             || self.row.is_none() && (self.column != 0 || self.offset != 0)
@@ -120,14 +157,18 @@ impl SourceCheckpoint {
                 return Err(ManagementError::InvalidEvidence);
             }
         }
-        if self.catalog_revision != crate::store::pinning::management::schema::VERSION
-            || native::scope::binding(tx).await?
-                != (self.database_scope.clone(), self.database_identity.clone())
-            || vector(tx).await? != self.revisions
+        if self.catalog_revision != crate::store::pinning::management::schema::VERSION {
+            return Err(ManagementError::Changed);
+        }
+        let read = check_read::CheckRead::new(tx);
+        let binding = native::scope::binding(&read).await?;
+        if binding.0 != self.database_scope
+            || binding.1 != self.database_identity
+            || vector(&read).await? != self.revisions
         {
             return Err(ManagementError::Changed);
         }
-        Ok(())
+        Ok(read.bytes())
     }
     pub fn complete(&self) -> bool {
         self.table == native::current_catalog().len() && self.row.is_none()
@@ -146,7 +187,7 @@ impl SourceCheckpoint {
         self.check(tx).await
     }
 }
-async fn vector(tx: &DatabaseTransaction) -> Result<BTreeMap<String, i64>> {
+async fn vector(tx: &impl ConnectionTrait) -> Result<BTreeMap<String, i64>> {
     let catalog = native::current_catalog();
     let parameters = (1..=catalog.len())
         .map(|i| format!("${i}"))
@@ -209,7 +250,7 @@ async fn next_key(
     tx: &DatabaseTransaction,
     table: &NativeTable,
     after: Option<&NativeKey>,
-    work: &mut QueryWork,
+    work: &mut ReadWork,
 ) -> Result<Option<NativeKey>> {
     let mut values = Vec::new();
     let order = table
@@ -259,7 +300,7 @@ async fn next_key(
         ))
         .await
         .map_err(|_| ManagementError::Database)?;
-    work.observe(
+    work.keyset.observe(
         u64::from(row.is_some()),
         u64::from(row.is_some()) * table.primary_key.len() as u64,
         0,
@@ -274,7 +315,10 @@ async fn next_key(
             .map(|i| get::<Option<String>>(&row, &format!("k{i}"))?.ok_or(ManagementError::Budget))
             .collect::<Result<_>>()?,
     };
-    work.bytes += key.values.iter().map(|v| v.len() as u64).sum::<u64>();
+    let returned = key.values.iter().map(|v| v.len() as u64).sum::<u64>();
+    work.keyset.bytes += returned;
+    work.returned(returned)?;
+    work.copied(table.table.len() as u64)?;
     Ok(Some(key))
 }
 impl InventorySpool {
@@ -353,7 +397,7 @@ impl InventorySpool {
                 &self.db,
                 &run,
                 page.rows - rows,
-                page.work.keyset.bytes + page.work.cells.bytes,
+                page.work.total_bytes()?,
             )
             .await?;
             super::spool::budget::timed(&self.db, "source_read", read_elapsed).await?;

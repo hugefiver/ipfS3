@@ -1,4 +1,5 @@
 use super::*;
+mod sealed;
 
 enum FailedWrite {
     Error,

@@ -116,7 +116,7 @@ async fn native_historical_captures_are_not_filled_or_rewritten_by_inventory_or_
     });
     for (table, column) in [
         ("multipart_uploads", "zip_intent_json"),
-        ("import_jobs", "zip_intent_json"),
+        ("import_job_requests", "zip_intent_json"),
         ("zip_batches", "legacy_input_proof_json"),
     ] {
         let image = historical_shape
@@ -127,6 +127,38 @@ async fn native_historical_captures_are_not_filled_or_rewritten_by_inventory_or_
         assert_eq!(image.rows[0].remove(column), Some(None));
         image.columns.retain(|c| c != column);
     }
+    let request_index = historical_shape
+        .iter()
+        .position(|table| table.table == "import_job_requests")
+        .unwrap();
+    let requests = historical_shape.remove(request_index);
+    assert_eq!(requests.primary_key, ["job_id"]);
+    let jobs = historical_shape
+        .iter_mut()
+        .find(|table| table.table == "import_jobs")
+        .unwrap();
+    assert_eq!(requests.rows.len(), jobs.rows.len());
+    // Rejoin the raw cold cells by their preserved owner key for comparison with
+    // the historical physical layout; neither JSON nor SQL NULL is normalized.
+    for request in requests.rows {
+        let job = jobs
+            .rows
+            .iter_mut()
+            .find(|job| job["id"] == request["job_id"])
+            .unwrap();
+        for (column, value) in request {
+            if column != "job_id" {
+                assert_eq!(job.insert(column, value), None);
+            }
+        }
+    }
+    jobs.columns.extend(
+        requests
+            .columns
+            .into_iter()
+            .filter(|column| column != "job_id"),
+    );
+    jobs.columns.sort();
     assert_eq!(
         historical_shape, before,
         "all native historical columns and rows remain unchanged"

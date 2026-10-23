@@ -71,7 +71,7 @@ impl PendingCell {
     }
 }
 
-fn shape(column: &str, bytes: &[u8], value: CellValue) -> Result<()> {
+pub(super) fn shape(column: &str, bytes: &[u8], value: CellValue) -> Result<()> {
     if column.is_empty()
         || column.len() > 256
         || bytes.len() > CELL_BYTES
@@ -82,7 +82,7 @@ fn shape(column: &str, bytes: &[u8], value: CellValue) -> Result<()> {
     Ok(())
 }
 
-fn validate(
+pub(super) fn validate(
     state: &mut State,
     budget: &mut Budget,
     column: &str,
@@ -174,27 +174,11 @@ impl<R: Read> Reader<R> {
         let mut payload = vec![0; remaining + 3];
         payload[..3].copy_from_slice(&prefix);
         self.read_prepaid_exact(&mut payload[3..])?;
-        let column = std::str::from_utf8(&payload[3..3 + column_len])
-            .map_err(|_| SafeError::InvalidInput)?;
-        if self.state.redacts_column(column) {
-            return Err(SafeError::InvalidInput);
-        }
-        validate(
-            &mut self.state,
-            &mut self.budget,
-            column,
-            &payload[3 + column_len..],
-            value,
+        let checked = physical::decode(
+            &mut self.state, &mut self.integrity, 7, &payload, &mut self.budget,
         )?;
-        self.integrity.add(7, &payload)?;
-        let cell = ShortCell {
-            column: column.into(),
-            bytes: payload.split_off(3 + column_len),
-            value,
-        };
-        Ok(Record::ShortCell(HeldCell {
-            cell,
-            _resident: resident,
-        }))
+        let record = checked.into_record(&mut self.budget)?;
+        drop(resident);
+        Ok(record)
     }
 }

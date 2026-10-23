@@ -616,19 +616,9 @@ async fn persist_archive(
 }
 
 async fn reference<C: ConnectionTrait>(db: &C, id: String) -> Result<segmented::ArchiveRef> {
-    let row=db.query_one(Statement::from_sql_and_values(db.get_database_backend(),"SELECT digest,bytes,chunks FROM pin_management_archive WHERE archive_id=$1 AND state='sealed' AND format='S75A1'",[id.clone().into()])).await.map_err(|_|ManagementError::Database)?.ok_or(ManagementError::Confirmation)?;
-    Ok(segmented::ArchiveRef {
-        archive_id: id,
-        digest: row
-            .try_get("", "digest")
-            .map_err(|_| ManagementError::InvalidEvidence)?,
-        bytes: row
-            .try_get("", "bytes")
-            .map_err(|_| ManagementError::InvalidEvidence)?,
-        chunks: row
-            .try_get("", "chunks")
-            .map_err(|_| ManagementError::InvalidEvidence)?,
-    })
+    segmented::reference(db, &id)
+        .await?
+        .ok_or(ManagementError::Confirmation)
 }
 
 pub(crate) async fn prepared_output_reference<C: ConnectionTrait>(
@@ -664,6 +654,7 @@ pub(crate) struct OriginalInventoryDocument {
 }
 
 impl OriginalInventoryDocument {
+    pub(crate) fn reference(&self) -> &segmented::ArchiveRef { &self.reference }
     pub(crate) fn check_frame(&self, frame: &Frame, budget: &mut Budget) -> Result<()> {
         budget.check()?;
         let header = &self.header;
@@ -743,16 +734,6 @@ pub(crate) async fn copy_original_inventory_document<C: ConnectionTrait, W: std:
     copy_document(db, binding, entry, output, budget, false).await
 }
 
-pub(crate) async fn copy_prepared_output_document<C: ConnectionTrait, W: std::io::Write>(
-    db: &C,
-    binding: &ConfirmedBinding,
-    entry: &PlanEntry,
-    output: &mut W,
-    budget: &mut Budget,
-) -> Result<OriginalInventoryDocument> {
-    copy_document(db, binding, entry, output, budget, true).await
-}
-
 async fn copy_document<C: ConnectionTrait, W: std::io::Write>(
     db: &C,
     binding: &ConfirmedBinding,
@@ -761,6 +742,23 @@ async fn copy_document<C: ConnectionTrait, W: std::io::Write>(
     budget: &mut Budget,
     prepared: bool,
 ) -> Result<OriginalInventoryDocument> {
+    let reference = document_reference(db, binding, entry, budget, prepared).await?;
+    let header = segmented::read_archive(db, &reference, output, budget).await?;
+    check_document(binding, entry, budget, prepared, reference, header)
+}
+
+pub(crate) async fn open_original_inventory_document<C: ConnectionTrait>(
+    db: &C, binding: &ConfirmedBinding, entry: &PlanEntry, budget: &mut Budget, prepared: bool,
+) -> Result<(OriginalInventoryDocument, segmented::pages::Pages)> {
+    let reference = document_reference(db, binding, entry, budget, prepared).await?;
+    let pages = segmented::pages::Pages::open(db, &reference, budget).await?;
+    let document = check_document(binding, entry, budget, prepared, reference, pages.header.clone())?;
+    Ok((document, pages))
+}
+
+async fn document_reference<C: ConnectionTrait>(
+    db: &C, binding: &ConfirmedBinding, entry: &PlanEntry, budget: &mut Budget, prepared: bool,
+) -> Result<segmented::ArchiveRef> {
     if !binding.confirmation.bindings.contains(entry) {
         return Err(ManagementError::Confirmation);
     }
@@ -773,8 +771,13 @@ async fn copy_document<C: ConnectionTrait, W: std::io::Write>(
     if prepared {
         id.push_str(":review");
     }
-    let reference = reference(db, id).await?;
-    let header = segmented::read_archive(db, &reference, output, budget).await?;
+    reference(db, id).await
+}
+
+fn check_document(
+    binding: &ConfirmedBinding, entry: &PlanEntry, budget: &mut Budget, prepared: bool,
+    reference: segmented::ArchiveRef, header: segmented::ArchiveHeader,
+) -> Result<OriginalInventoryDocument> {
     budget.charge(
         0,
         0,
@@ -840,45 +843,13 @@ async fn copy_document<C: ConnectionTrait, W: std::io::Write>(
 
 /// The publication envelope is not an ordinary v3 Request. Only this loader
 /// accepts that envelope, with the selected item bound to the local original.
-pub async fn load_original_inventory<C: ConnectionTrait, S: Read + std::io::Write + Seek>(
+pub async fn load_original_inventory<C: ConnectionTrait>(
     db: &C,
     binding: &ConfirmedBinding,
     entry: &PlanEntry,
-    mut file: S,
-    mut budget: Budget,
-) -> Result<v3::archive_cursor::ReviewCursor<S>> {
-    if file
-        .seek(SeekFrom::End(0))
-        .map_err(|_| ManagementError::Database)?
-        != 0
-    {
-        return Err(ManagementError::InvalidEvidence);
-    }
-    let document =
-        copy_original_inventory_document(db, binding, entry, &mut file, &mut budget).await?;
-    let reference = document.reference.clone();
-    budget.work.copied_bytes = budget
-        .work
-        .copied_bytes
-        .checked_add(u64::try_from(reference.bytes).map_err(|_| ManagementError::InvalidEvidence)?)
-        .ok_or(ManagementError::Budget)?;
-    let cursor = v3::archive_cursor::stage_checked(
-        file,
-        Projection::PrivateRecovery,
-        budget,
-        Some(reference),
-        |frame, budget| {
-            document.check_frame(frame, budget).map_err(|error| {
-                if error == ManagementError::Budget {
-                    crate::pinning::management::SafeError::LimitExceeded
-                } else {
-                    crate::pinning::management::SafeError::UnknownEvidence
-                }
-            })
-        },
-    )
-    .map_err(wire_error)?;
-    Ok(cursor.into_cursor())
+    budget: Budget,
+) -> Result<v3::archive_cursor::ReviewCursor<v3::archive_cursor::OwnedSource>> {
+    v3::archive_cursor::load_owned_original(db, binding, entry, budget).await.map_err(wire_error)
 }
 
 pub(crate) async fn prepare_apply(
@@ -907,7 +878,7 @@ async fn load_publication<C: ConnectionTrait>(
     let id = archive_id(scope, plan, entries)?;
     let (rows, _) = bounded_projection(
         db,
-        "FROM pin_management_archive WHERE archive_id=$1 AND state='sealed' AND format='S75A1'",
+        "FROM (SELECT archive_id,header FROM pin_management_archive WHERE state='sealed' AND format='S75A1' UNION ALL SELECT archive_id,header FROM pin_management_inline_archive WHERE format='S75I2') AS archives WHERE archive_id=$1",
         &[("header", "header")],
         "archive_id",
         vec![id.into()],

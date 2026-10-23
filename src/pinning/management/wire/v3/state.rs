@@ -299,7 +299,9 @@ pub(super) fn private_cell(section: Section, table: &str, column: &str) -> bool 
         }
         || matches!(
             table,
-            "pin_management_archive" | "pin_management_archive_chunks"
+            "pin_management_archive"
+                | "pin_management_archive_chunks"
+                | "pin_management_inline_archive"
         )
         || native::confidential(table, column)
 }

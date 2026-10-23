@@ -153,6 +153,7 @@ async fn db() -> DatabaseConnection {
     let db = Database::connect("sqlite::memory:").await.unwrap();
     db.execute_unprepared("CREATE TABLE pin_management_archive(archive_id TEXT PRIMARY KEY,format TEXT,database_scope TEXT,native_identity TEXT,header TEXT,state TEXT,chunks INTEGER DEFAULT 0,bytes INTEGER DEFAULT 0,digest TEXT DEFAULT '')").await.unwrap();
     db.execute_unprepared("CREATE TABLE pin_management_archive_chunks(archive_id TEXT,ordinal INTEGER,payload BLOB,PRIMARY KEY(archive_id,ordinal))").await.unwrap();
+    db.execute_unprepared("CREATE TABLE pin_management_inline_archive(archive_id TEXT PRIMARY KEY,format TEXT,database_scope TEXT,native_identity TEXT,header TEXT,bytes INTEGER,digest TEXT,payload BLOB)").await.unwrap();
     db
 }
 
@@ -193,6 +194,101 @@ async fn store(db: &DatabaseConnection, id: &str, raw: Vec<u8>) -> ArchiveRef {
             .unwrap();
     tx.commit().await.unwrap();
     reference
+}
+
+#[tokio::test]
+async fn small_private_archive_seals_loads_exports_and_checks_representation_and_binding() {
+    let db = Database::connect("sqlite::memory:").await.unwrap();
+    ipfs_s3_gateway::store::run_migrations(&db).await.unwrap();
+    let (raw, work) = bytes(0);
+    assert!(raw.len() < CELL_BYTES);
+    let staged =
+        archive_cursor::stage_import(Cursor::new(raw.clone()), Projection::PrivateRecovery, work)
+            .unwrap();
+    let tx = db.begin().await.unwrap();
+    let (reference, work) = archive_cursor::seal_private(&tx, "small-v3", &header(), staged)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(reference.chunks, 0);
+    let cursor = archive_cursor::load(
+        &db,
+        &reference,
+        Spool::empty(),
+        Projection::PrivateRecovery,
+        work,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        cursor
+            .export(Vec::new(), Projection::PrivateRecovery)
+            .unwrap()
+            .0,
+        raw
+    );
+    let mut wrong_representation = reference.clone();
+    wrong_representation.chunks = 1;
+    let mut wrong_length = reference.clone();
+    wrong_length.bytes += 1;
+    let mut wrong_digest = reference.clone();
+    wrong_digest.digest = "0".repeat(64);
+    for wrong in [wrong_representation, wrong_length, wrong_digest] {
+        assert!(
+            archive_cursor::load(
+                &db,
+                &wrong,
+                Spool::empty(),
+                Projection::PrivateRecovery,
+                budget()
+            )
+            .await
+            .is_err()
+        );
+    }
+    let mut wrong_header = header();
+    wrong_header.principal = "not the body principal".into();
+    let tx = db.begin().await.unwrap();
+    let wrong = segmented::write_archive(
+        &tx,
+        "wrong-header",
+        &wrong_header,
+        &mut raw.as_slice(),
+        &mut budget(),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    assert!(
+        archive_cursor::load(
+            &db,
+            &wrong,
+            Spool::empty(),
+            Projection::PrivateRecovery,
+            budget()
+        )
+        .await
+        .is_err()
+    );
+    let mut corrupt = raw.clone();
+    let at = corrupt
+        .windows(13)
+        .position(|part| part == b"do not export")
+        .unwrap();
+    corrupt[at] = b'x';
+    let wrong = store(&db, "wrong-body", corrupt).await;
+    assert_eq!(wrong.chunks, 0);
+    assert!(
+        archive_cursor::load(
+            &db,
+            &wrong,
+            Spool::empty(),
+            Projection::PrivateRecovery,
+            budget()
+        )
+        .await
+        .is_err()
+    );
 }
 
 #[tokio::test]

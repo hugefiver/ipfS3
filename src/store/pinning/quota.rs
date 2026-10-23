@@ -842,7 +842,8 @@ async fn reserve_unique_attempt_with_work<C: ConnectionTrait>(
     };
     match existing {
         Some(remote) if is_capacity_holding_status(&remote.status) => {
-            assert_reusable_route_with_work(db, provider, cid, work).await?;
+            // This attempt already checked admission before every quota outcome.
+            assert_reusable_route_after_admission(db, provider, cid, work).await?;
             reuse_capacity_holding_remote(db, provider, cid, remote, now).await
         }
         Some(remote) if remote.status == REMOTE_STATUS_ABSENT => {
@@ -887,6 +888,15 @@ pub(crate) async fn assert_reusable_route_with_work<C: ConnectionTrait>(
     work: DecodeWork<'_>,
 ) -> AppResult<()> {
     admission::check_provider_with_work(db, provider, work).await?;
+    assert_reusable_route_after_admission(db, provider, cid, work).await
+}
+
+async fn assert_reusable_route_after_admission<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+    cid: &str,
+    work: DecodeWork<'_>,
+) -> AppResult<()> {
     let candidates =
         super::legacy_migration::resource_receipt_candidates_with_work(db, provider, cid, work)
             .await

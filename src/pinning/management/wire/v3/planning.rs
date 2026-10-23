@@ -436,7 +436,7 @@ pub(crate) fn verify_output<R: std::io::Read>(
                     if limits.cancellation.is_cancelled() {
                         return Err(SafeError::LimitExceeded);
                     }
-                    if reader.next_frame()?.is_none() {
+                    if reader.next_record()?.is_none() {
                         break;
                     }
                 }

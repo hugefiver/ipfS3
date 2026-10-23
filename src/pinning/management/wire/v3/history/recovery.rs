@@ -5,6 +5,7 @@ use sea_orm::TransactionTrait;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use std::io::{Seek, SeekFrom};
+mod confirmation;
 
 /// All identities and applied results here remain untrusted historical claims.
 /// There is no method to bind this task DB as a local execution database.
@@ -155,14 +156,25 @@ impl ArchiveCells<'_> {
             .await?
             .ok_or(SafeError::InvalidInput)
     }
-    pub async fn archive(&mut self, id: &str) -> Result<ArchiveRef> {
-        let key = NativeKey {
-            table: "pin_management_archive".into(),
+    async fn archive_key(&mut self, id: &str) -> Result<NativeKey> {
+        let row = one(&self.spool.db, "SELECT MIN(table_name) AS table_name,COUNT(*) AS roots FROM rows WHERE table_name IN ('pin_management_archive','pin_management_inline_archive') AND archive_id=$1", vec![id.into()], self.budget).await?.ok_or(SafeError::InvalidInput)?;
+        if row.try_get::<i64>("", "roots").map_err(invalid)? != 1 {
+            return Err(SafeError::InvalidInput);
+        }
+        Ok(NativeKey {
+            table: row.try_get("", "table_name").map_err(invalid)?,
             values: vec![id.into()],
-        };
-        if self.required(&key, "state", 16).await? != "sealed"
-            || self.required(&key, "format", 16).await? != "S75A1"
+        })
+    }
+    pub async fn archive(&mut self, id: &str) -> Result<ArchiveRef> {
+        let key = self.archive_key(id).await?;
+        let inline = key.table == "pin_management_inline_archive";
+        if self.required(&key, "format", 16).await? != if inline { "S75I2" } else { "S75A1" }
+            || !inline && self.required(&key, "state", 16).await? != "sealed"
         {
+            return Err(SafeError::UnknownEvidence);
+        }
+        if !inline && confirmation::declared(self, &key).await? {
             return Err(SafeError::UnknownEvidence);
         }
         Ok(ArchiveRef {
@@ -173,11 +185,14 @@ impl ArchiveCells<'_> {
                 .await?
                 .parse()
                 .map_err(invalid)?,
-            chunks: self
-                .required(&key, "chunks", 32)
-                .await?
-                .parse()
-                .map_err(invalid)?,
+            chunks: if inline {
+                0
+            } else {
+                self.required(&key, "chunks", 32)
+                    .await?
+                    .parse()
+                    .map_err(invalid)?
+            },
         })
     }
     /// Verifies exact stored header text, all chunk coordinates, lengths and
@@ -194,10 +209,7 @@ impl ArchiveCells<'_> {
         {
             return Err(SafeError::InvalidInput);
         }
-        let key = NativeKey {
-            table: "pin_management_archive".into(),
-            values: vec![reference.archive_id.clone()],
-        };
+        let key = self.archive_key(&reference.archive_id).await?;
         let raw = self
             .required(&key, "header", super::super::FRAME_BYTES)
             .await?;
@@ -210,6 +222,30 @@ impl ArchiveCells<'_> {
             || self.required(&key, "native_identity", 4096).await? != header.database_identity
         {
             return Err(SafeError::InvalidInput);
+        }
+        if key.table == "pin_management_inline_archive" {
+            let encoded = self
+                .required(&key, "payload", 2 * super::super::CELL_BYTES)
+                .await?;
+            if !encoded
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(SafeError::InvalidInput);
+            }
+            let payload = hex::decode(encoded).map_err(invalid)?;
+            if payload.len() as i64 != reference.bytes
+                || crate::store::pinning::management::records::segmented::inline_digest(
+                    &raw, &payload,
+                ) != reference.digest
+            {
+                return Err(SafeError::InvalidInput);
+            }
+            self.budget
+                .charge(0, 0, 0, payload.len() as u64)
+                .map_err(storage)?;
+            super::super::codec::write_counted(output, &mut self.budget.work, &payload)?;
+            return Ok(header);
         }
         let mut digest = Sha256::new_with_prefix(b"S75A1\0");
         digest.update((raw.len() as u64).to_be_bytes());
@@ -253,10 +289,22 @@ impl ArchiveCells<'_> {
             .next_key("pin_management_archive", after.as_ref(), self.budget)
             .await?
         {
-            if self.required(&key, "state", 16).await? == "sealed" {
+            if confirmation::declared(self, &key).await? {
+                confirmation::verify(self, &key).await?;
+            } else if self.required(&key, "state", 16).await? == "sealed" {
                 let reference = self.archive(&key.values[0]).await?;
                 self.read_archive(&reference, &mut std::io::sink()).await?;
             }
+            after = Some(key);
+        }
+        let mut after = None;
+        while let Some(key) = self
+            .spool
+            .next_key("pin_management_inline_archive", after.as_ref(), self.budget)
+            .await?
+        {
+            let reference = self.archive(&key.values[0]).await?;
+            self.read_archive(&reference, &mut std::io::sink()).await?;
             after = Some(key);
         }
         Ok(())

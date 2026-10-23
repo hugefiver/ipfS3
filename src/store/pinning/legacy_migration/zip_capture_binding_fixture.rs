@@ -114,11 +114,11 @@ impl Fixture {
         let capture = persist(&db, &source_config, kind, "original", "archive.zip").await;
         let table = match kind {
             Intake::Mpu => "multipart_uploads",
-            Intake::Import => "import_jobs",
+            Intake::Import => "import_job_requests",
         };
         let pk = match kind {
             Intake::Mpu => "upload_id",
-            Intake::Import => "id",
+            Intake::Import => "job_id",
         };
         let key: BTreeMap<String, String> = [(pk.into(), "original".into())].into();
         let mut declaration: migration::Declaration = serde_json::from_value(serde_json::json!({

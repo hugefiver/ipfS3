@@ -15,7 +15,8 @@ pub struct Model {
     pub content_type: Option<String>,
     pub metadata: Option<Json>,
     pub tags_json: Json,
-    /// NULL for pre-capture uploads. Never infer executable pin intent from tags_json.
+    /// Standalone pin capture; ZIP authority is in zip_intent_json. If both are
+    /// absent, never infer executable pin intent from tags_json.
     pub pin_decision_json: Option<Json>,
     pub zip_intent_json: Option<String>,
     pub decompress_zip_target: Option<String>,

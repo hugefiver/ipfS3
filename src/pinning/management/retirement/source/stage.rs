@@ -3,14 +3,16 @@ use super::*;
 
 pub(super) async fn parts(
     tx: &DatabaseTransaction,
-    parts: &[ArchivePart],
+    parts: &[Part],
     run: &Run<'_>,
     work: &mut QueryWork,
 ) -> Result<()> {
     let mut identities = std::collections::BTreeMap::new();
     for part in parts {
         if let std::collections::btree_map::Entry::Vacant(entry) = identities.entry(&part.key) {
-            entry.insert(encode(&part.key)?);
+            let encoded = encode(part.key.as_ref())?;
+            work.bytes += encoded.len() as u64;
+            entry.insert(encoded);
         }
     }
     let mut after = 0;
@@ -46,13 +48,13 @@ pub(super) async fn parts(
                     .join(",")
             ));
             values.extend([
-                Value::from(part.table.clone()),
+                Value::from(part.table),
                 key.as_str().into(),
-                part.column.clone().into(),
+                part.column.into(),
                 (part.offset as i64).into(),
                 part.length.map(|length| length as i64).into(),
                 part.bytes.clone().into(),
-                part.checksum()?.into(),
+                part.checksum_with_key(key).into(),
             ]);
         }
         let inserted = insert(tx,&format!("INSERT INTO parts(table_name,row_key,column_name,offset,length,bytes,checksum) VALUES {} ON CONFLICT(table_name,row_key,column_name,offset) DO NOTHING", tuples.join(",")), values,work).await?;
@@ -71,9 +73,9 @@ pub(super) async fn parts(
                 first + 3
             ));
             values.extend([
-                Value::from(part.table.clone()),
+                Value::from(part.table),
                 key.as_str().into(),
-                part.column.clone().into(),
+                part.column.into(),
                 (part.offset as i64).into(),
             ]);
         }
@@ -96,7 +98,7 @@ pub(super) async fn parts(
             let key: String = get(&row, "row_key")?;
             let column: String = get(&row, "column_name")?;
             let bytes: Vec<u8> = get(&row, "bytes")?;
-            work.bytes += (table.len() + key.len() + column.len() + bytes.len()) as u64;
+            work.bytes += (table.len() + key.len() + column.len() + bytes.len() + 2 * 8) as u64;
             let offset: i64 = get(&row, "offset")?;
             let (part, _) = batch
                 .iter()
@@ -208,6 +210,7 @@ async fn insert(
         .map(|value| match value {
             Value::String(Some(text)) => text.len() as u64,
             Value::Bytes(Some(bytes)) => bytes.len() as u64,
+            Value::BigInt(_) => 8,
             _ => 0,
         })
         .sum();

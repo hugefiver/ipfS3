@@ -20,7 +20,9 @@ use sea_orm::{ColumnTrait, QueryFilter};
 use sea_orm::{ConnectionTrait, DatabaseTransaction, EntityTrait, Set};
 mod completion;
 mod current_scope;
+mod route;
 pub(crate) use completion::CompletionReader;
+pub(crate) use route::{admission_with_route, historical_route};
 pub(crate) mod park_scope;
 #[cfg(test)]
 #[path = "job_authority/renew_tests.rs"]
@@ -242,6 +244,7 @@ pub(crate) async fn fresh_source_allowed_with_work<C: ConnectionTrait>(
     )
     .await
 }
+#[cfg(test)]
 pub(crate) async fn fresh_source_allowed_view_with_work<C: ConnectionTrait>(
     db: &C,
     job: &pin_job::Model,
@@ -347,6 +350,41 @@ pub(crate) async fn projection_allowed_with_work<C: ConnectionTrait>(
             Some(JobPermit::ReadOnly(_) | JobPermit::LedgerOnly(_)) => false,
         },
     )
+}
+
+pub(crate) async fn projection_and_source_allowed_with_work<C: ConnectionTrait>(
+    db: &C,
+    job: &pin_job::Model,
+    config: Option<crate::pinning::management::local_config::ManagementConfigView<'_>>,
+    idle_timeout_millis: Option<u64>,
+    work: records::SharedDecodeBudget,
+) -> AppResult<bool> {
+    let authority = lookup_with_work(db, job, work.clone())
+        .await
+        .map_err(safe)?;
+    projection_and_source_from_authority(db, job, authority, config, idle_timeout_millis, work)
+        .await
+}
+
+async fn projection_and_source_from_authority<C: ConnectionTrait>(
+    db: &C,
+    job: &pin_job::Model,
+    authority: Option<records::JobAuthority>,
+    config: Option<crate::pinning::management::local_config::ManagementConfigView<'_>>,
+    idle_timeout_millis: Option<u64>,
+    work: records::SharedDecodeBudget,
+) -> AppResult<bool> {
+    let authority = match check_with_authority(db, job, authority, work.clone())
+        .await
+        .map_err(safe)?
+    {
+        None => None,
+        Some(JobPermit::Submit(authority) | JobPermit::ExistingCleanup(authority)) => {
+            Some(authority)
+        }
+        Some(JobPermit::ReadOnly(_) | JobPermit::LedgerOnly(_)) => return Ok(false),
+    };
+    fresh_source_from_authority(db, authority.as_ref(), config, idle_timeout_millis, work).await
 }
 
 pub async fn cleanup_settlement_allowed<C: ConnectionTrait>(
@@ -1005,12 +1043,12 @@ async fn identity_present<C: ConnectionTrait>(
 }
 
 pub(crate) fn safe(error: ManagementError) -> AppError {
-    if error == ManagementError::Budget {
-        AppError::ManagementBudget
-    } else {
-        AppError::InvalidPinningRequest(
+    match error {
+        ManagementError::Budget => AppError::ManagementBudget,
+        ManagementError::Database => AppError::Database(error.to_string()),
+        _ => AppError::InvalidPinningRequest(
             "management job authority is missing, stale, or invalid".into(),
-        )
+        ),
     }
 }
 
@@ -1584,9 +1622,15 @@ mod tests {
     }
 
     async fn shared_poll_seed_integrity(include_unrelated_action: bool) {
+        let fixture = super::super::tests::fixture_with_automatic("shared-poll-index", true).await;
+        assert_shared_poll_seed_integrity(fixture, include_unrelated_action).await;
+    }
+
+    async fn assert_shared_poll_seed_integrity(
+        mut fixture: super::super::tests::Fixture,
+        include_unrelated_action: bool,
+    ) {
         use sea_orm::{ActiveModelTrait, IntoActiveModel, TransactionTrait};
-        let mut fixture =
-            super::super::tests::fixture_with_automatic("shared-poll-index", true).await;
         let native_source = pin_job::Entity::find()
             .one(&fixture.db)
             .await
@@ -1819,11 +1863,30 @@ mod tests {
         assert!(
             matches!(check_before_call(&tx,&poll).await.unwrap(),Some(JobPermit::Submit(authority)) if authority==expected)
         );
+        let (permit, route) = Box::pin(admission_with_route(
+            &tx,
+            &poll,
+            records::SharedDecodeBudget::default(),
+        ))
+        .await
+        .unwrap();
+        assert!(matches!(permit, Some(JobPermit::Submit(authority)) if authority == expected));
+        assert!(route.is_none());
         let reader =
             fence_worker_authority_with_work(&tx, &poll, records::SharedDecodeBudget::default())
                 .await
                 .unwrap();
         assert!(reader.projection_allowed().await.unwrap());
+        assert!(
+            Box::pin(reader.call_and_source_allowed(ManagedCall::Observe, None, None))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !Box::pin(reader.call_and_source_allowed(ManagedCall::Submit, None, None))
+                .await
+                .unwrap()
+        );
         let backfill = tx.begin().await.unwrap();
         backfill
             .execute_unprepared("UPDATE pin_management_readiness SET state='backfill' WHERE id=1")
@@ -1831,6 +1894,11 @@ mod tests {
             .unwrap();
         assert!(reader.projection_allowed().await.is_err());
         assert!(reader.fresh_source_allowed(None, None).await.is_err());
+        assert!(
+            Box::pin(reader.call_and_source_allowed(ManagedCall::Observe, None, None))
+                .await
+                .is_err()
+        );
         backfill.rollback().await.unwrap();
         if let Some((unrelated_binding, unrelated)) = &unrelated {
             // A real unrelated action retains its full private native document, but

@@ -38,6 +38,11 @@ pub fn tables() -> &'static [Table] {
                 "archive_id,ordinal,payload",
                 "archive_id,ordinal",
             ),
+            (
+                "pin_management_inline_archive",
+                "archive_id,bytes,database_scope,digest,format,header,native_identity,payload",
+                "archive_id",
+            ),
         ] {
             tables.push(Table {
                 name: name.into(),
@@ -279,7 +284,10 @@ pub async fn page(
             .columns
             .get(cp.column)
             .ok_or(ManagementError::InvalidEvidence)?;
-        let binary = table.name == "pin_management_archive_chunks" && column == "payload";
+        let binary = matches!(
+            table.name.as_str(),
+            "pin_management_archive_chunks" | "pin_management_inline_archive"
+        ) && column == "payload";
         let factor = if binary { 2 } else { 1 };
         let capacity = ((PAGE_BYTES - bytes) / factor).min(CELL_SLICE / factor);
         if capacity == 0 {

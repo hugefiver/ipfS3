@@ -322,7 +322,10 @@ impl ImportObjectRoute {
                         )
                         .await
                         {
-                            Ok(Some(existing)) if existing.root_capture_json.is_none() => {
+                            Ok(Some(existing))
+                                if existing.root_capture_json.is_none()
+                                    && existing.zip_intent_json.is_none() =>
+                            {
                                 return accepted_response(&req.uri, &existing);
                             }
                             Ok(Some(_)) | Err(AppError::ImportIdempotencyConflict) => {}
@@ -348,6 +351,7 @@ impl ImportObjectRoute {
                     {
                         Ok(Some(existing))
                             if existing.pin_decision_json.is_none()
+                                && existing.zip_intent_json.is_none()
                                 && existing.root_capture_json.is_none() =>
                         {
                             // Stage2 did not persist a principal. Preserve the existing
@@ -508,7 +512,9 @@ impl ImportObjectRoute {
             .as_ref()
             .and_then(|page| page.next_sequence)
             .map(|sequence| encode_continuation_token(&job.id, sequence));
-        let snapshot = if job.state == "completed" && job.root_capture_json.is_some() {
+        let snapshot = if job.state == "completed"
+            && (job.root_capture_json.is_some() || job.zip_intent_json.is_some())
+        {
             crate::store::zip::snapshot(self.state.store.db(), &job.id).await?
         } else {
             None
@@ -563,7 +569,10 @@ impl ImportObjectRoute {
             root,
         );
         let mut response = S3Response::new(Body::from(xml));
-        if let Some(decision) = stored_decision(&job)? {
+        if let Some(decision) = job
+            .decision()
+            .map_err(|_| AppError::Internal("invalid persisted import pin decision".to_owned()))?
+        {
             pin_decision_headers(&mut response.headers, &decision, true);
         }
         response.headers.insert(
@@ -662,23 +671,8 @@ fn accepted_response(uri: &Uri, job: &import_job::Model) -> S3Result<S3Response<
 }
 
 fn stored_decision(job: &import_job::Model) -> S3Result<Option<ExtensionDecision>> {
-    job.pin_decision_json
-        .as_deref()
-        .map(|json| {
-            let decision: ExtensionDecision = serde_json::from_str(json).map_err(|_| {
-                AppError::Internal("invalid persisted import pin decision".to_owned())
-            })?;
-            decision.validate_snapshot().map_err(|_| {
-                AppError::Internal("invalid persisted import pin decision".to_owned())
-            })?;
-            if decision.origin.request_id != job.id {
-                return Err(
-                    AppError::Internal("invalid persisted import pin decision".to_owned()).into(),
-                );
-            }
-            Ok(decision)
-        })
-        .transpose()
+    crate::store::import::jobs::decision_from_job(job)
+        .map_err(|_| AppError::Internal("invalid persisted import pin decision".to_owned()).into())
 }
 
 fn pin_decision_headers(headers: &mut HeaderMap, decision: &ExtensionDecision, status: bool) {

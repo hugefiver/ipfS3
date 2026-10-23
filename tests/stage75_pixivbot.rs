@@ -9,6 +9,8 @@ mod support {
 }
 #[path = "support/stage75_pixivbot_assert.rs"]
 mod checks;
+#[path = "support/stage75_pixivbot_client.rs"]
+mod client;
 #[path = "support/stage75_pixivbot_fixture.rs"]
 mod fixture;
 #[path = "support/stage75_pixivbot_history.rs"]

@@ -6,8 +6,9 @@ use std::{
 use chrono::{DateTime, Utc};
 use sea_orm::sea_query::{Condition, Expr};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set, TransactionTrait,
+    ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait,
+    FromQueryResult, Iterable, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
+    TransactionTrait,
 };
 
 use crate::{
@@ -15,7 +16,10 @@ use crate::{
     import::{ImportClaim, ImportFailure, ImportPhase, ImportProgress, ImportSource, ImportState},
     pinning::decision::ExtensionDecision,
     pinning::tags::{ObjectTag, ZipRootCapture, validate_tag_set},
-    store::{entities::import_job, import::lease_clock},
+    store::{
+        entities::{import_job, import_job_request},
+        import::lease_clock,
+    },
 };
 
 const STATE_QUEUED: &str = "queued";
@@ -50,6 +54,76 @@ pub struct ClaimedImportJob {
     pub claim: ImportClaim,
 }
 
+/// ZIP captures own their source decision. Standalone decisions remain explicit
+/// for ordinary and historical jobs; absence never reconstructs pin authority.
+pub fn decision_from_job(job: &import_job::Model) -> AppResult<Option<ExtensionDecision>> {
+    decode_decision(
+        (&job.id, &job.bucket, &job.key),
+        DecisionFields {
+            pin: job.pin_decision_json.as_deref(),
+            zip: job.zip_intent_json.as_deref(),
+            prefix: job.decompress_prefix.as_deref(),
+            root: job.root_capture_json.as_deref(),
+        },
+    )
+}
+
+pub(super) struct DecisionFields<'a> {
+    pub pin: Option<&'a str>,
+    pub zip: Option<&'a str>,
+    pub prefix: Option<&'a str>,
+    pub root: Option<&'a str>,
+}
+
+pub(super) fn decode_decision(
+    (id, bucket, key): (&str, &str, &str),
+    fields: DecisionFields<'_>,
+) -> AppResult<Option<ExtensionDecision>> {
+    let original = fields
+        .pin
+        .map(serde_json::from_str::<ExtensionDecision>)
+        .transpose()
+        .map_err(|_| AppError::InvalidImportRequest)?;
+    let decision = if let Some(raw) = fields.zip {
+        let capture = crate::store::pinning::publication::decode_zip_capture_json(raw)?;
+        if capture.bucket() != bucket
+            || capture.source_key() != key
+            || Some(capture.target_prefix()) != fields.prefix
+            || capture.origin().request_id != id
+            || original
+                .as_ref()
+                .is_some_and(|decision| decision != capture.source_decision())
+        {
+            return Err(AppError::InvalidImportRequest);
+        }
+        if let Some(raw) = fields.root {
+            let root: ZipRootCapture =
+                serde_json::from_str(raw).map_err(|_| AppError::InvalidImportRequest)?;
+            if root != capture.controls().root {
+                return Err(AppError::InvalidImportRequest);
+            }
+        }
+        Some(capture.source_decision().clone())
+    } else {
+        original
+    };
+    if let Some(decision) = &decision {
+        decision
+            .validate_snapshot()
+            .map_err(|_| AppError::InvalidImportRequest)?;
+        if decision.origin.request_id != id {
+            return Err(AppError::InvalidImportRequest);
+        }
+    }
+    Ok(decision)
+}
+
+#[derive(FromQueryResult)]
+struct ClaimCandidate {
+    id: String,
+    source_type: String,
+}
+
 #[allow(dead_code)]
 pub(crate) async fn find_idempotent<C: ConnectionTrait>(
     txn: &C,
@@ -57,12 +131,27 @@ pub(crate) async fn find_idempotent<C: ConnectionTrait>(
     key: &str,
     client_token: &str,
 ) -> AppResult<Option<import_job::Model>> {
-    Ok(import_job::Entity::find()
+    let bytes = if txn.get_database_backend() == DatabaseBackend::Sqlite {
+        "length(CAST(id AS BLOB))"
+    } else {
+        "octet_length(id)"
+    };
+    let mut query = import_job::Entity::find_state()
+        .select_only()
+        .column_as(
+            Expr::cust(format!("CASE WHEN {bytes}<=65536 THEN id END")),
+            "id",
+        )
         .filter(import_job::Column::Bucket.eq(bucket))
         .filter(import_job::Column::Key.eq(key))
-        .filter(import_job::Column::ClientToken.eq(client_token))
-        .one(txn)
-        .await?)
+        .filter(import_job::Column::ClientToken.eq(client_token));
+    if txn.get_database_backend() == DatabaseBackend::Postgres {
+        query = query.lock_shared();
+    }
+    let Some(id) = query.into_tuple::<String>().one(txn).await? else {
+        return Ok(None);
+    };
+    Ok(load_payloads(txn, &[(0, id.clone())]).await?.remove(&id))
 }
 
 #[allow(dead_code)]
@@ -117,33 +206,43 @@ pub(crate) async fn insert_queued_with_zip_intent<C: ConnectionTrait>(
             if decision.origin.request_id != request.id {
                 return Err(AppError::InvalidImportRequest);
             }
-            serde_json::to_string(decision).map_err(|_| {
-                AppError::Internal("failed to serialize import pin decision".to_owned())
-            })
+            if zip_intent.is_some() {
+                return Ok(None);
+            }
+            serde_json::to_string(decision)
+                .map_err(|_| {
+                    AppError::Internal("failed to serialize import pin decision".to_owned())
+                })
+                .map(Some)
         })
-        .transpose()?;
+        .transpose()?
+        .flatten();
     let (source_type, source_value) = canonical_source(request.source)?;
     let metadata_json = deterministic_metadata_json(&request.metadata)?;
     let tags_json = deterministic_tags_json(request.tags)?;
     let id = request.id.clone();
-
-    import_job::Entity::insert(import_job::ActiveModel {
-        id: Set(request.id),
-        bucket: Set(request.bucket),
-        key: Set(request.key),
-        source_type: Set(source_type),
+    let frozen = import_job_request::ActiveModel {
+        job_id: Set(id.clone()),
         source_value: Set(source_value),
-        request_fingerprint: Set(request.request_fingerprint),
-        client_token: Set(request.client_token),
         object_content_type: Set(request.object_content_type),
         metadata_json: Set(metadata_json),
         tags_json: Set(tags_json),
         pin_decision_json: Set(pin_decision_json),
         zip_intent_json: Set(zip_intent_json),
         decompress_prefix: Set(request.decompress_prefix),
-        root_capture_json: Set(root_capture.map(|capture| {
-            serde_json::to_string(&capture).expect("ZIP root capture is serializable")
-        })),
+        root_capture_json: Set(root_capture
+            .filter(|_| zip_intent.is_none())
+            .map(|capture| {
+                serde_json::to_string(&capture).expect("ZIP root capture is serializable")
+            })),
+    };
+    import_job::Entity::insert(import_job::ActiveModel {
+        id: Set(request.id),
+        bucket: Set(request.bucket),
+        key: Set(request.key),
+        source_type: Set(source_type),
+        request_fingerprint: Set(request.request_fingerprint),
+        client_token: Set(request.client_token),
         state: Set(STATE_QUEUED.to_owned()),
         phase: Set(PHASE_QUEUED.to_owned()),
         attempts: Set(0),
@@ -168,13 +267,15 @@ pub(crate) async fn insert_queued_with_zip_intent<C: ConnectionTrait>(
         created_at: Set(now),
         updated_at: Set(now),
         completed_at: Set(None),
+        ..Default::default()
     })
     .exec(txn)
     .await?;
+    import_job_request::Entity::insert(frozen).exec(txn).await?;
 
-    import_job::Entity::find_by_id(id)
-        .one(txn)
+    load_payloads(txn, &[(0, id.clone())])
         .await?
+        .remove(&id)
         .ok_or_else(|| AppError::Internal("inserted import job disappeared".to_owned()))
 }
 
@@ -229,32 +330,197 @@ async fn claim_due_in_transaction<C: ConnectionTrait>(
     lease_until: DateTime<Utc>,
     limit: u64,
 ) -> Result<Vec<ClaimedImportJob>, sea_orm::DbErr> {
-    let candidates = import_job::Entity::find()
+    let id_bytes = if db.get_database_backend() == DatabaseBackend::Sqlite {
+        "length(CAST(id AS BLOB))"
+    } else {
+        "octet_length(id)"
+    };
+    let candidates = import_job::Entity::find_state()
+        .select_only()
+        .column_as(
+            Expr::cust(format!("CASE WHEN {id_bytes}<=1024 THEN id END")),
+            import_job::Column::Id,
+        )
+        .column_as(
+            Expr::cust("CASE WHEN source_type IN ('cid','url') THEN source_type END"),
+            import_job::Column::SourceType,
+        )
         .filter(due_claim_condition(now))
         .order_by_asc(import_job::Column::NextAttemptAt)
         .order_by_asc(import_job::Column::CreatedAt)
         .order_by_asc(import_job::Column::Id)
-        .limit(limit)
+        .limit(limit.min(256))
+        .into_model::<ClaimCandidate>()
         .all(db)
         .await?;
     let mut claimed = Vec::with_capacity(candidates.len());
     for (due_rank, candidate) in candidates_in_lock_order(candidates) {
-        if let Some(claimed_job) =
-            claim_candidate(db, candidate, worker_id, now, lease_until).await?
-        {
-            claimed.push((due_rank, claimed_job));
+        if claim_candidate(db, &candidate, worker_id, now, lease_until).await? {
+            claimed.push((due_rank, candidate.id));
         }
     }
     claimed.sort_by_key(|(due_rank, _)| *due_rank);
-    Ok(claimed
-        .into_iter()
-        .map(|(_, claimed_job)| claimed_job)
-        .collect())
+    let mut jobs = load_payloads(db, &claimed).await?;
+    let mut result = Vec::with_capacity(claimed.len());
+    for (_, id) in &claimed {
+        let job = jobs.remove(id).ok_or_else(|| {
+            sea_orm::DbErr::RecordNotFound("claimed import job disappeared".to_owned())
+        })?;
+        let attempt = u32::try_from(job.attempts).map_err(|_| {
+            sea_orm::DbErr::Custom("persisted import attempt is outside range".to_owned())
+        })?;
+        result.push(ClaimedImportJob {
+            claim: ImportClaim {
+                job_id: job.id.clone(),
+                worker_id: worker_id.to_owned(),
+                attempt,
+                claim_epoch: job.claim_epoch,
+                locked_until: lease_until,
+            },
+            job,
+        });
+    }
+    Ok(result)
+}
+
+async fn load_payloads<C: ConnectionTrait>(
+    db: &C,
+    ids: &[(usize, String)],
+) -> Result<HashMap<String, import_job::Model>, sea_orm::DbErr> {
+    let pages = payload_pages(db, ids).await?;
+    let mut jobs = HashMap::with_capacity(ids.len());
+    for page in pages.small {
+        jobs.extend(
+            import_job::Entity::find()
+                .filter(import_job::Column::Id.is_in(page.iter().map(|(_, id)| id.clone())))
+                .all(db)
+                .await?
+                .into_iter()
+                .map(|job| (job.id.clone(), job)),
+        );
+    }
+    if !pages.large.is_empty() {
+        jobs.extend(
+            super::requests::load_large(db, &pages.large)
+                .await?
+                .into_iter()
+                .map(|job| (job.id.clone(), job)),
+        );
+    }
+    Ok(jobs)
+}
+
+/// Measure in SQL while the hot rows remain locked. No cold value is
+/// returned until its page is known to fit the payload budget.
+#[derive(Default)]
+struct PayloadPages {
+    small: Vec<Vec<(usize, String)>>,
+    large: Vec<String>,
+}
+
+async fn payload_pages<C: ConnectionTrait>(
+    db: &C,
+    claimed: &[(usize, String)],
+) -> Result<PayloadPages, sea_orm::DbErr> {
+    use sea_orm::sea_query::Iden;
+    const PAGE_BYTES: i64 = 1024 * 1024;
+    let measures = import_job::Column::iter()
+        .map(|column| {
+            let name = column.to_string();
+            let table = if column.is_request() { "r" } else { "j" };
+            let bytes = if db.get_database_backend() == DatabaseBackend::Sqlite {
+                format!("length(CAST({table}.\"{name}\" AS BLOB))")
+            } else {
+                format!("octet_length(CAST({table}.\"{name}\" AS TEXT))")
+            };
+            (column.is_request(), format!("COALESCE({bytes},0)"))
+        })
+        .collect::<Vec<_>>();
+    let lengths = measures
+        .iter()
+        .map(|(_, expression)| expression.clone())
+        .collect::<Vec<_>>()
+        .join("+");
+    let hot_lengths = measures
+        .iter()
+        .filter(|(cold, _)| !cold)
+        .map(|(_, expression)| expression.clone())
+        .collect::<Vec<_>>()
+        .join("+");
+    let lock = if db.get_database_backend() == DatabaseBackend::Postgres {
+        " FOR SHARE OF r"
+    } else {
+        ""
+    };
+    let mut pages = PayloadPages::default();
+    let mut resident = 0_i64;
+    for group in claimed.chunks(256) {
+        if group.iter().map(|(_, id)| id.len() + 128).sum::<usize>() > PAGE_BYTES as usize {
+            return Err(sea_orm::DbErr::Custom(
+                "import identity page exceeds budget".into(),
+            ));
+        }
+        let slots = (1..=group.len())
+            .map(|n| format!("${n}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let id_bytes = if db.get_database_backend() == DatabaseBackend::Sqlite {
+            "length(CAST(j.id AS BLOB))"
+        } else {
+            "octet_length(j.id)"
+        };
+        let rows = db.query_all(Statement::from_sql_and_values(db.get_database_backend(),
+            format!("SELECT CASE WHEN {id_bytes}<=65536 THEN j.id END AS id,CAST(({lengths}) AS BIGINT) AS bytes,CAST(({hot_lengths}) AS BIGINT) AS hot_bytes FROM import_jobs j JOIN import_job_requests r ON r.job_id=j.id WHERE j.id IN ({slots}){lock}"),
+            group.iter().map(|(_, id)| sea_orm::Value::from(id.clone())))).await?;
+        let sizes = rows
+            .into_iter()
+            .map(|row| {
+                Ok((
+                    row.try_get::<String>("", "id")?,
+                    (
+                        row.try_get::<i64>("", "bytes")?,
+                        row.try_get::<i64>("", "hot_bytes")?,
+                    ),
+                ))
+            })
+            .collect::<Result<HashMap<_, _>, sea_orm::DbErr>>()?;
+        let mut page = Vec::new();
+        let mut bytes = 0;
+        for item in group {
+            let (size, hot_size) = *sizes.get(&item.1).ok_or_else(|| {
+                sea_orm::DbErr::RecordNotFound("claimed import job disappeared".into())
+            })?;
+            resident = resident.saturating_add(
+                size.saturating_mul(2)
+                    .saturating_add((item.1.len() as i64).saturating_mul(8))
+                    .saturating_add(16384),
+            );
+            if size < 0 || !(0..=65536).contains(&hot_size) || resident > 32 * 1024 * 1024 {
+                return Err(sea_orm::DbErr::Custom(
+                    "import request exceeds the resident budget".into(),
+                ));
+            }
+            if size > 65536 {
+                pages.large.push(item.1.clone());
+                continue;
+            }
+            if bytes + size + 1024 > PAGE_BYTES {
+                pages.small.push(std::mem::take(&mut page));
+                bytes = 0;
+            }
+            page.push(item.clone());
+            bytes += size + 1024;
+        }
+        if !page.is_empty() {
+            pages.small.push(page);
+        }
+    }
+    Ok(pages)
 }
 
 /// Every transaction that can update more than one import job does so by ascending job ID.
 /// The rank preserves the independently defined due-time ordering for the caller's result.
-fn candidates_in_lock_order(candidates: Vec<import_job::Model>) -> Vec<(usize, import_job::Model)> {
+fn candidates_in_lock_order(candidates: Vec<ClaimCandidate>) -> Vec<(usize, ClaimCandidate)> {
     let mut ranked = candidates.into_iter().enumerate().collect::<Vec<_>>();
     ranked.sort_by(|(_, left), (_, right)| left.id.cmp(&right.id));
     ranked
@@ -262,11 +528,11 @@ fn candidates_in_lock_order(candidates: Vec<import_job::Model>) -> Vec<(usize, i
 
 async fn claim_candidate<C: ConnectionTrait>(
     db: &C,
-    candidate: import_job::Model,
+    candidate: &ClaimCandidate,
     worker_id: &str,
     now: DateTime<Utc>,
     lease_until: DateTime<Utc>,
-) -> Result<Option<ClaimedImportJob>, sea_orm::DbErr> {
+) -> Result<bool, sea_orm::DbErr> {
     let mut claim_update = import_job::Entity::update_many()
         .col_expr(import_job::Column::State, Expr::value(STATE_RUNNING))
         .col_expr(
@@ -305,29 +571,7 @@ async fn claim_candidate<C: ConnectionTrait>(
         .filter(import_job::Column::ClaimEpoch.lt(i64::MAX))
         .exec(db)
         .await?;
-    if updated.rows_affected != 1 {
-        return Ok(None);
-    }
-
-    let job = import_job::Entity::find_by_id(candidate.id)
-        .one(db)
-        .await?
-        .ok_or_else(|| {
-            sea_orm::DbErr::RecordNotFound("claimed import job disappeared".to_owned())
-        })?;
-    let attempt = u32::try_from(job.attempts).map_err(|_| {
-        sea_orm::DbErr::Custom("persisted import attempt is outside range".to_owned())
-    })?;
-    Ok(Some(ClaimedImportJob {
-        claim: ImportClaim {
-            job_id: job.id.clone(),
-            worker_id: worker_id.to_owned(),
-            attempt,
-            claim_epoch: job.claim_epoch,
-            locked_until: lease_until,
-        },
-        job,
-    }))
+    Ok(updated.rows_affected == 1)
 }
 
 pub async fn renew_claim<C: ConnectionTrait>(
@@ -529,18 +773,13 @@ pub async fn retry<C: ConnectionTrait>(
     require_active_claim(updated.rows_affected)
 }
 
-pub async fn get_for_path<C: ConnectionTrait>(
-    db: &C,
+pub async fn get_for_path(
+    db: &DatabaseConnection,
     job_id: &str,
     bucket: &str,
     key: &str,
-) -> AppResult<Option<import_job::Model>> {
-    Ok(import_job::Entity::find()
-        .filter(import_job::Column::Id.eq(job_id))
-        .filter(import_job::Column::Bucket.eq(bucket))
-        .filter(import_job::Column::Key.eq(key))
-        .one(db)
-        .await?)
+) -> AppResult<Option<super::status::JobStatus>> {
+    super::status::get_for_path(db, job_id, bucket, key).await
 }
 
 /// Removes only terminal jobs whose durable completion timestamp predates `cutoff`.
@@ -928,11 +1167,14 @@ mod tests {
             .unwrap();
 
         let candidates = import_job::Entity::find()
+            .select_only()
+            .columns([import_job::Column::Id, import_job::Column::SourceType])
             .filter(due_claim_condition(now))
             .order_by_asc(import_job::Column::NextAttemptAt)
             .order_by_asc(import_job::Column::CreatedAt)
             .order_by_asc(import_job::Column::Id)
             .limit(2)
+            .into_model::<ClaimCandidate>()
             .all(&db)
             .await
             .unwrap();
@@ -949,6 +1191,112 @@ mod tests {
                 .map(|claim| claim.job.id.as_str())
                 .collect::<Vec<_>>(),
             ["job-z", "job-a"],
+        );
+    }
+
+    #[tokio::test]
+    async fn status_does_not_decode_unneeded_request_cells() {
+        use crate::{
+            config::PinningConfig,
+            pinning::{
+                config::ValidatedPinningConfig,
+                decision::DecisionOrigin,
+                policy::{PinPolicyEvaluator, PublicationContext},
+            },
+        };
+        let db = setup().await;
+        insert_queued(&db, request("status-job", "key"), time(0))
+            .await
+            .unwrap();
+        db.execute_unprepared("UPDATE import_job_requests SET source_value=X'FF',metadata_json=X'FF',tags_json=X'FF' WHERE job_id='status-job'").await.unwrap();
+        let status = get_for_path(&db, "status-job", "bucket", "key")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.id, "status-job");
+        assert_eq!(status.state, STATE_QUEUED);
+        assert_eq!(status.attempts, 0);
+        assert!(status.decision().unwrap().is_none());
+        let config = ValidatedPinningConfig::from_raw(&PinningConfig::default(), |_| None).unwrap();
+        let (_, decision) = PinPolicyEvaluator::new(&config)
+            .evaluate_publication_decision(
+                PublicationContext {
+                    bucket: "bucket",
+                    key: "key",
+                    tags: &[],
+                    is_decompress_zip: false,
+                },
+                DecisionOrigin::new("test", "status-job"),
+            )
+            .unwrap();
+        let original = format!(
+            "{}{}",
+            serde_json::to_string(&decision).unwrap(),
+            " ".repeat(65537)
+        );
+        import_job_request::Entity::update_many()
+            .col_expr(
+                import_job_request::Column::PinDecisionJson,
+                Expr::value(original.clone()),
+            )
+            .filter(import_job_request::Column::JobId.eq("status-job"))
+            .exec(&db)
+            .await
+            .unwrap();
+        let status = get_for_path(&db, "status-job", "bucket", "key")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.pin_decision_json.as_deref(), Some(original.as_str()));
+        assert_eq!(status.decision().unwrap(), Some(decision.clone()));
+        let tx = db.begin().await.unwrap();
+        let captured = crate::store::import::capture::load(&tx, "status-job")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            captured.pin_decision_json.as_deref(),
+            Some(original.as_str())
+        );
+        assert_eq!(captured.decision().unwrap(), Some(decision));
+        tx.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn successful_claim_payloads_are_paged_before_materialization() {
+        let db = setup().await;
+        let metadata =
+            serde_json::to_string(&HashMap::from([("large", "界".repeat(400_000))])).unwrap();
+        for id in ["job-z", "job-a"] {
+            let mut intake = request(id, id);
+            intake.client_token = Some(id.into());
+            intake.metadata = HashMap::from([("large".into(), "界".repeat(400_000))]);
+            let inserted = insert_queued(&db, intake, time(0)).await.unwrap();
+            assert_eq!(inserted.metadata_json, metadata);
+            let tx = db.begin().await.unwrap();
+            let replay = find_idempotent(&tx, "bucket", id, id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(replay.metadata_json, metadata);
+            tx.rollback().await.unwrap();
+        }
+        let keys = vec![(0, "job-a".to_owned()), (1, "job-z".to_owned())];
+        let pages = payload_pages(&db, &keys).await.unwrap();
+        assert!(pages.small.is_empty());
+        assert_eq!(pages.large, ["job-a", "job-z"]);
+        let jobs = claim_due(&db, "worker", time(0), time(30), 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            jobs.iter()
+                .map(|job| job.job.id.as_str())
+                .collect::<Vec<_>>(),
+            ["job-a", "job-z"]
+        );
+        assert!(
+            jobs.iter()
+                .all(|job| job.job.metadata_json == metadata && job.claim.claim_epoch == 1)
         );
     }
 

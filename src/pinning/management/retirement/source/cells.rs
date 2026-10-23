@@ -10,13 +10,13 @@ struct Slice {
 
 pub(super) async fn read(
     tx: &DatabaseTransaction,
-    table: &NativeTable,
+    table: &'static NativeTable,
     key: &NativeKey,
     position: (usize, u64),
     max_parts: usize,
     max_bytes: u64,
-    work: &mut QueryWork,
-) -> Result<Vec<ArchivePart>> {
+    work: &mut ReadWork,
+) -> Result<Vec<Part>> {
     let (first_column, first_offset) = position;
     let mut values = Vec::new();
     let predicate = table
@@ -54,12 +54,13 @@ pub(super) async fn read(
         .await
         .map_err(|_| ManagementError::Database)?
         .ok_or(ManagementError::Changed)?;
-    work.observe(
+    work.cells.observe(
         1,
         (table.columns.len().min(first_column + max_parts) - first_column) as u64,
         0,
         started.elapsed(),
     );
+    work.returned((table.columns.len().min(first_column + max_parts) - first_column) as u64 * 8)?;
     let mut remaining = max_bytes;
     let mut slices = Vec::new();
     for column in columns {
@@ -123,20 +124,25 @@ pub(super) async fn read(
         .await
         .map_err(|_| ManagementError::Database)?
         .ok_or(ManagementError::Changed)?;
-    work.observe(1, slices.len() as u64, 0, started.elapsed());
+    work.cells
+        .observe(1, slices.len() as u64, 0, started.elapsed());
+    work.copied(key_owned_bytes(key))?;
+    let shared_key = std::sync::Arc::new(key.clone());
     let mut parts = Vec::with_capacity(slices.len());
     for (i, slice) in slices.into_iter().enumerate() {
         let bytes = get::<Option<Vec<u8>>>(&row, &format!("c{i}"))?;
-        work.bytes += bytes.as_ref().map_or(0, Vec::len) as u64;
+        let returned = bytes.as_ref().map_or(0, Vec::len) as u64;
+        work.cells.bytes += returned;
+        work.returned(returned)?;
         // SQLite may return NULL for a zero-length BLOB slice; the separate
         // original length preserves SQL NULL versus an empty original value.
         if bytes.as_ref().map_or(0, Vec::len) != slice.bytes {
             return Err(ManagementError::Changed);
         }
-        parts.push(ArchivePart {
-            table: table.table.clone(),
-            key: key.clone(),
-            column: table.columns[slice.column].clone(),
+        parts.push(Part {
+            table: table.table.as_str(),
+            key: shared_key.clone(),
+            column: table.columns[slice.column].as_str(),
             offset: slice.offset,
             length: slice.length,
             bytes: bytes.unwrap_or_default(),

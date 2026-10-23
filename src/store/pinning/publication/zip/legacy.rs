@@ -6,7 +6,7 @@ use crate::{
     error::{AppError, AppResult},
     lifecycle::model::MultipartUploadTargetIdentity,
     store::{
-        entities::{import_job, import_job_result, multipart_upload, zip_batch},
+        entities::{import_job_result, multipart_upload, zip_batch},
         import::ownership::{self, ImportPublicationGuard, StandardMutationGuard},
         multipart::AbortExactIncompleteUploadResult,
         object_version::PublicationResult,
@@ -80,6 +80,13 @@ pub(super) async fn verify_ownership(
         {
             return Err(AppError::NoSuchUpload(target.upload_id.clone()));
         }
+        if crate::store::multipart::decision_from_upload(&upload)
+            .map_err(|_| invalid())?
+            .as_ref()
+            != Some(request.capture.source_decision())
+        {
+            return Err(invalid());
+        }
         if let Some(json) = upload.zip_intent_json {
             if read_capture(&json)? != request.capture {
                 return Err(invalid());
@@ -103,10 +110,14 @@ pub(super) async fn verify_ownership(
             .map(|o| (o.bucket.clone(), o.key.clone()))
             .collect::<Vec<_>>();
         ownership::verify_publication_guard(tx, guard, &source.bucket, &locations).await?;
-        let job = import_job::Entity::find_by_id(&guard.job_id)
-            .one(tx)
+        let job = crate::store::import::capture::load(tx, &guard.job_id)
             .await?
             .ok_or_else(invalid)?;
+        if job.decision().map_err(|_| invalid())?.as_ref()
+            != Some(request.capture.source_decision())
+        {
+            return Err(invalid());
+        }
         if let Some(json) = job.zip_intent_json {
             if read_capture(&json)? != request.capture {
                 return Err(invalid());

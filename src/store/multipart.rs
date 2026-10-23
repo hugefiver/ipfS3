@@ -136,11 +136,17 @@ pub async fn create_upload_with_zip_intent<C: ConnectionTrait>(
                     "multipart pin decision upload mismatch".to_owned(),
                 ));
             }
-            serde_json::to_value(decision).map_err(|_| {
-                AppError::Internal("failed to serialize multipart pin decision".to_owned())
-            })
+            if zip_intent.is_some() {
+                return Ok(None);
+            }
+            serde_json::to_value(decision)
+                .map_err(|_| {
+                    AppError::Internal("failed to serialize multipart pin decision".to_owned())
+                })
+                .map(Some)
         })
-        .transpose()?;
+        .transpose()?
+        .flatten();
     let created_at = crate::store::database_clock::database_now(db).await?;
     crate::store::pinning::management::admission::lock_intake_in_caller_transaction(
         db, decision, zip_intent,
@@ -172,6 +178,27 @@ pub async fn create_upload_with_zip_intent<C: ConnectionTrait>(
 pub fn decision_from_upload(
     upload: &multipart_upload::Model,
 ) -> AppResult<Option<ExtensionDecision>> {
+    if let Some(raw) = &upload.zip_intent_json {
+        let capture = crate::store::pinning::publication::decode_zip_capture_json(raw)?;
+        if capture.origin().request_id != upload.upload_id
+            || capture.bucket() != upload.bucket
+            || capture.source_key() != upload.key
+            || Some(capture.target_prefix()) != upload.decompress_zip_target.as_deref()
+            || capture.controls().result_enabled != upload.decompress_zip_result
+        {
+            return Err(AppError::Internal("multipart ZIP capture mismatch".into()));
+        }
+        if let Some(snapshot) = &upload.pin_decision_json {
+            let original: ExtensionDecision =
+                serde_json::from_value(snapshot.clone()).map_err(|_| {
+                    AppError::Internal("invalid persisted multipart pin decision".into())
+                })?;
+            if &original != capture.source_decision() {
+                return Err(AppError::Internal("multipart ZIP decision mismatch".into()));
+            }
+        }
+        return Ok(Some(capture.source_decision().clone()));
+    }
     let Some(snapshot) = &upload.pin_decision_json else {
         return Ok(None);
     };
@@ -369,6 +396,41 @@ pub async fn get_part<C: ConnectionTrait>(
         .ok_or_else(|| AppError::InvalidPart(format!("{upload_id}/{part_number}")))
 }
 
+#[derive(Debug, sea_orm::FromQueryResult)]
+pub(crate) struct SelectedPart {
+    pub part_number: i32,
+    pub cid: String,
+    pub size: i64,
+    pub etag: String,
+}
+
+/// Loads only the parts selected by Complete, leaving request-order validation
+/// and missing-part/ETag errors to the caller. Chunking bounds SQL parameters.
+pub(crate) async fn get_selected_parts<C: ConnectionTrait>(
+    db: &C,
+    upload_id: &str,
+    part_numbers: &[i32],
+) -> AppResult<std::collections::HashMap<i32, SelectedPart>> {
+    let mut parts = std::collections::HashMap::with_capacity(part_numbers.len());
+    for chunk in part_numbers.chunks(400) {
+        let rows = multipart_part::Entity::find()
+            .select_only()
+            .columns([
+                multipart_part::Column::PartNumber,
+                multipart_part::Column::Cid,
+                multipart_part::Column::Size,
+                multipart_part::Column::Etag,
+            ])
+            .filter(multipart_part::Column::UploadId.eq(upload_id))
+            .filter(multipart_part::Column::PartNumber.is_in(chunk.iter().copied()))
+            .into_model::<SelectedPart>()
+            .all(db)
+            .await?;
+        parts.extend(rows.into_iter().map(|part| (part.part_number, part)));
+    }
+    Ok(parts)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CommitCompletedUploadError {
     #[error("completion attempt {completion_attempt_id} transaction rolled back: {source}")]
@@ -522,6 +584,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn selected_parts_are_batched_and_scoped_to_the_requested_upload() {
+        let db = setup().await;
+        for upload_id in ["selected", "other"] {
+            create_upload(
+                &db,
+                upload_id,
+                upload_id,
+                "test-bucket",
+                "file",
+                "none",
+                None,
+                None,
+                None,
+                None,
+                &[],
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        }
+        let txn = db.begin().await.unwrap();
+        for part_number in 1..=405 {
+            upsert_part(
+                &txn,
+                "selected",
+                part_number,
+                &format!("cid-{part_number}"),
+                i64::from(part_number),
+                &format!("etag-{part_number}"),
+            )
+            .await
+            .unwrap();
+        }
+        upsert_part(&txn, "other", 1, "other-cid", 99, "other-etag")
+            .await
+            .unwrap();
+        upsert_part(&txn, "selected", 3, "replacement", 17, "replacement-etag")
+            .await
+            .unwrap();
+        let meter = crate::store::object::query_meter::QueryMeter::new(&txn);
+        let mut selected = vec![3, 1, 9000];
+        selected.extend(5..=405);
+        let parts = get_selected_parts(&meter, "selected", &selected)
+            .await
+            .unwrap();
+        assert_eq!(parts.len(), 403);
+        assert_eq!(parts[&1].cid, "cid-1");
+        assert_eq!(parts[&3].cid, "replacement");
+        assert_eq!(parts[&3].size, 17);
+        assert_eq!(parts[&3].etag, "replacement-etag");
+        assert!(!parts.contains_key(&2));
+        assert!(!parts.contains_key(&9000));
+        assert_eq!(meter.counts(), (2, 403));
+        let empty = get_selected_parts(&meter, "selected", &[]).await.unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(meter.counts(), (2, 403));
+        txn.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn captured_decision_round_trips_with_upload_and_legacy_remains_unknown() {
         use crate::config::{OptionalPinControlMode, PinningConfig};
         use crate::pinning::config::ValidatedPinningConfig;
@@ -599,6 +722,43 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        let mut zip_decision = decision.clone();
+        zip_decision.origin = DecisionOrigin::new("test", "zip-captured");
+        let capture = crate::store::pinning::publication::decode_zip_capture_json(
+            &serde_json::json!({"bucket":"test-bucket","source_key":"archive.zip","target_prefix":"expanded/",
+                "root_capture":crate::pinning::tags::ZipRootCapture::Configured(false),"result_enabled":true,
+                "decision":zip_decision,"providers":[]}).to_string()
+        ).unwrap();
+        let tx = db.begin().await.unwrap();
+        create_upload_with_zip_intent(
+            &tx,
+            "zip-captured",
+            "zip-object",
+            "test-bucket",
+            "archive.zip",
+            "none",
+            None,
+            None,
+            None,
+            None,
+            &tags,
+            Some("expanded/"),
+            true,
+            Some(capture.source_decision()),
+            Some(&capture),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let row = get_upload(&db, "zip-captured").await.unwrap();
+        assert!(row.pin_decision_json.is_none());
+        assert_eq!(
+            decision_from_upload(&row).unwrap().as_ref(),
+            Some(capture.source_decision())
+        );
+        let mut inconsistent = row;
+        inconsistent.pin_decision_json = Some(serde_json::to_value(&decision).unwrap());
+        assert!(decision_from_upload(&inconsistent).is_err());
     }
 
     async fn abort_with_bucket_lock(

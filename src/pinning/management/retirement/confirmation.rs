@@ -1,4 +1,5 @@
 //! Resumable confirmation staging. Only the target archive supplies accepted cursors.
+use super::spool::budget::settle_local_read;
 use super::{
     spool::{Run, exec, get, one},
     *,
@@ -10,6 +11,8 @@ use crate::store::pinning::management::{
     transaction::{ConfirmationEngine, ConfirmationTransaction, TransactionFailure},
 };
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement, TransactionTrait};
+
+pub(crate) mod evidence;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -416,8 +419,9 @@ async fn advance_inner(
         if state.stage == Stage::Wire {
             state.metered_before = Some(coordinates(primary).await?);
             spool::budget::charge(&primary.db, &run, 512, 2 * 1024 * 1024).await?;
-            let (after, count, payload, done) =
+            let (after, count, payload, done, used) =
                 source::attest::wire(primary, state.wire_after.as_ref()).await?;
+            settle_local_read(primary, 512, 2 * 1024 * 1024, used).await?;
             spool::budget::copy_work(&primary.db, &run, payload.len()).await?;
             state.wire_count = state
                 .wire_count
@@ -508,8 +512,7 @@ async fn advance_inner(
                     {
                         return Err(ManagementError::Changed);
                     }
-                    before.source.source.check(tx).await?;
-                    let local_bytes = local.bytes;
+                    let checked_before = before.source.source.check_counted(tx).await?;
                     let accepted =
                         source::attest::compare(tx, before.source.clone(), local, cancel).await?;
                     let payload = serde_json::to_vec(&accepted)
@@ -520,13 +523,7 @@ async fn advance_inner(
                         next_state.stage = Stage::Wire;
                     }
                     next_state.metered_before = Some(metered_before.clone());
-                    next_state.metered_after = Some(TaskCoordinates {
-                        rows: metered_before.rows + accepted.members.len() as i64 + 1,
-                        bytes: metered_before.bytes
-                            + i64::try_from(local_bytes + payload.len() as u64 * 2)
-                                .map_err(|_| ManagementError::Budget)?,
-                        pages: metered_before.pages + 1,
-                    });
+                    next_state.metered_after = None;
                     let next = progress::append(
                         tx,
                         &id_copy,
@@ -537,7 +534,32 @@ async fn advance_inner(
                         false,
                     )
                     .await?;
-                    next_state.source.source.check(tx).await?;
+                    let checked_after = next_state.source.source.check_counted(tx).await?;
+                    next_state.metered_after = Some(TaskCoordinates {
+                        rows: metered_before.rows + accepted.members.len() as i64 + 1,
+                        bytes: metered_before.bytes
+                            + i64::try_from(
+                                accepted.read_bytes
+                                    + checked_before
+                                    + checked_after
+                                    + payload.len() as u64 * 2,
+                            )
+                            .map_err(|_| ManagementError::Budget)?,
+                        pages: metered_before.pages + 1,
+                    });
+                    // The final fence cost and accepted proof share this same
+                    // transaction. A lost response reconciles the exact durable
+                    // counters; no authority or sealing is published here.
+                    let next = progress::append(
+                        tx,
+                        &id_copy,
+                        &header_copy,
+                        &next,
+                        &encode(&next_state)?,
+                        &[],
+                        false,
+                    )
+                    .await?;
                     Ok((next, payload, next_state))
                 })
             })
@@ -602,6 +624,7 @@ async fn coordinates(spool: &InventorySpool) -> Result<TaskCoordinates> {
         pages: get(&row, "pages_used")?,
     })
 }
+
 async fn reconcile(spool: &InventorySpool, state: &State) -> Result<()> {
     reconcile_coordinates(
         spool,

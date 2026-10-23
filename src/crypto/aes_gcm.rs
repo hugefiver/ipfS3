@@ -1,5 +1,5 @@
-use aes_gcm::aead::Aead;
-use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+use aes_gcm::aead::AeadInOut;
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce, Tag};
 use bytes::Bytes;
 
 use crate::error::{AppError, AppResult};
@@ -7,31 +7,54 @@ use crate::error::{AppError, AppResult};
 use super::key::ObjectKey;
 
 pub fn encrypt_chunk(ok: &ObjectKey, nonce: &[u8; 12], plaintext: &[u8]) -> AppResult<Bytes> {
-    let cipher = Aes256Gcm::new_from_slice(&ok.bytes)
-        .map_err(|e| AppError::Crypto(format!("aes init: {e}")))?;
-    #[allow(deprecated)]
-    let nonce = Nonce::from_slice(nonce);
-    let ciphertext = cipher
-        .encrypt(nonce, plaintext)
-        .map_err(|_| AppError::Crypto("aes-gcm encrypt failed".into()))?;
-    let mut out = Vec::with_capacity(12 + ciphertext.len());
-    out.extend_from_slice(nonce);
-    out.extend_from_slice(&ciphertext);
-    Ok(Bytes::from(out))
+    ChunkCipher::new(ok).encrypt(nonce, plaintext)
 }
 
 pub fn decrypt_chunk(ok: &ObjectKey, encrypted: &[u8]) -> AppResult<Bytes> {
-    if encrypted.len() < 12 + 16 {
-        return Err(AppError::Crypto("encrypted chunk too short".into()));
+    ChunkCipher::new(ok).decrypt(encrypted)
+}
+
+pub(super) const CHUNK_OVERHEAD: usize = 12 + 16;
+
+pub(super) struct ChunkCipher(Aes256Gcm);
+
+impl ChunkCipher {
+    pub(super) fn new(ok: &ObjectKey) -> Self {
+        Self(Aes256Gcm::new((&ok.bytes).into()))
     }
-    let cipher = Aes256Gcm::new_from_slice(&ok.bytes)
-        .map_err(|e| AppError::Crypto(format!("aes init: {e}")))?;
-    #[allow(deprecated)]
-    let nonce = Nonce::from_slice(&encrypted[..12]);
-    let plaintext = cipher.decrypt(nonce, &encrypted[12..]).map_err(|_| {
-        AppError::Crypto("aes-gcm decrypt failed — wrong key or corrupted data".into())
-    })?;
-    Ok(Bytes::from(plaintext))
+
+    pub(super) fn encrypt(&self, nonce: &[u8; 12], plaintext: &[u8]) -> AppResult<Bytes> {
+        let mut out = Vec::with_capacity(plaintext.len() + CHUNK_OVERHEAD);
+        out.extend_from_slice(nonce);
+        out.extend_from_slice(plaintext);
+        #[allow(deprecated)]
+        let tag = self
+            .0
+            .encrypt_inout_detached(Nonce::from_slice(nonce), b"", (&mut out[12..]).into())
+            .map_err(|_| AppError::Crypto("aes-gcm encrypt failed".into()))?;
+        out.extend_from_slice(&tag);
+        Ok(Bytes::from(out))
+    }
+
+    pub(super) fn decrypt(&self, encrypted: &[u8]) -> AppResult<Bytes> {
+        if encrypted.len() < CHUNK_OVERHEAD {
+            return Err(AppError::Crypto("encrypted chunk too short".into()));
+        }
+        let tag_start = encrypted.len() - 16;
+        let mut plaintext = encrypted[12..tag_start].to_vec();
+        #[allow(deprecated)]
+        self.0
+            .decrypt_inout_detached(
+                Nonce::from_slice(&encrypted[..12]),
+                b"",
+                plaintext.as_mut_slice().into(),
+                Tag::from_slice(&encrypted[tag_start..]),
+            )
+            .map_err(|_| {
+                AppError::Crypto("aes-gcm decrypt failed — wrong key or corrupted data".into())
+            })?;
+        Ok(Bytes::from(plaintext))
+    }
 }
 
 #[cfg(test)]
@@ -75,5 +98,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(decrypt_chunk(&key, &legacy).unwrap().as_ref(), [0; 16]);
+        assert_eq!(
+            encrypt_chunk(&key, &[0; 12], &[0; 16]).unwrap().as_ref(),
+            legacy.as_slice()
+        );
     }
 }

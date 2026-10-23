@@ -30,7 +30,7 @@ pub(super) async fn absent<C: ConnectionTrait>(db: &C) -> AppResult<()> {
     Ok(())
 }
 
-fn invalid() -> crate::error::AppError {
+pub(super) fn invalid() -> crate::error::AppError {
     super::refused(
         "unknown or damaged R26 receipt schema; formal schema integrity must be restored outside CLI",
     )

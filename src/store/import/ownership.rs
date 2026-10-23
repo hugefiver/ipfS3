@@ -43,7 +43,9 @@ mod mutation_tests;
 #[cfg(test)]
 mod zip_output_tests;
 
+mod job_queries;
 mod mutation_lease;
+use job_queries::find_job_for_update;
 pub use mutation_lease::{MutationLease, run_mutation};
 use mutation_lease::{
     mutation_lease_identity, recover_expired_mutations_in_transaction, verify_mutation_lease,
@@ -1269,12 +1271,8 @@ async fn zip_v2_mpu_publish_source<C: ConnectionTrait>(
         .ok_or(AppError::StaleContentMutation)?;
     let original = crate::pinning::zip_policy::CapturedZipIntent::decode_json(original_json)
         .map_err(|_| AppError::StaleContentMutation)?;
-    let decision: ExtensionDecision = serde_json::from_value(
-        upload
-            .pin_decision_json
-            .ok_or(AppError::StaleContentMutation)?,
-    )
-    .map_err(|_| AppError::StaleContentMutation)?;
+    let decision =
+        multipart::decision_from_upload(&upload)?.ok_or(AppError::StaleContentMutation)?;
     if upload.bucket != record.bucket
         || upload.key != record.archive_key
         || upload.decompress_zip_target.as_deref() != Some(record.target_prefix.as_str())
@@ -1579,25 +1577,13 @@ pub async fn supersede_bucket<C: ConnectionTrait>(
     let mut after_job_id: Option<String> = None;
     let mut count = 0_u64;
     loop {
-        let mut query = import_job::Entity::find()
-            .filter(import_job::Column::Bucket.eq(bucket_name))
-            .filter(import_job::Column::State.is_in([STATE_QUEUED, STATE_RUNNING]))
-            .order_by_asc(import_job::Column::Id)
-            .limit(OWNERSHIP_BATCH_SIZE);
-        if let Some(after_job_id) = after_job_id.as_deref() {
-            query = query.filter(import_job::Column::Id.gt(after_job_id));
-        }
-        let jobs = if txn.get_database_backend() == DatabaseBackend::Postgres {
-            query.lock_exclusive().all(txn).await?
-        } else {
-            query.all(txn).await?
-        };
-        let Some(last_job_id) = jobs.last().map(|job| job.id.clone()) else {
+        let jobs = job_queries::active_ids(txn, bucket_name, after_job_id.as_deref()).await?;
+        let Some(last_job_id) = jobs.last().cloned() else {
             break;
         };
         count = count.saturating_add(jobs.len() as u64);
         for job in jobs {
-            supersede_job_in_transaction(txn, &job.id, SupersedeReason::DeleteBucket, now).await?;
+            supersede_job_in_transaction(txn, &job, SupersedeReason::DeleteBucket, now).await?;
         }
         after_job_id = Some(last_job_id);
     }
@@ -1741,19 +1727,12 @@ pub(crate) async fn verify_publication_guard<C: ConnectionTrait>(
         }
     }
 
-    let query =
-        import_job::Entity::find().filter(active_guard_filter(guard, txn.get_database_backend()));
-    let job = if txn.get_database_backend() == DatabaseBackend::Postgres {
-        query.lock_exclusive().one(txn).await?
-    } else {
-        query.one(txn).await?
-    };
-    let Some(job) = job else {
-        return Err(AppError::StaleImportOwnership);
-    };
-    if job.bucket != archive_bucket {
-        return Err(AppError::StaleImportOwnership);
-    }
+    job_queries::active(
+        txn,
+        active_guard_filter(guard, txn.get_database_backend()),
+        archive_bucket,
+    )
+    .await?;
     let query = import_job_target::Entity::find()
         .filter(import_job_target::Column::JobId.eq(&guard.job_id))
         .order_by_asc(import_job_target::Column::Bucket)
@@ -2086,20 +2065,12 @@ pub(crate) async fn verify_active_claim<C: ConnectionTrait>(
     claim: &ImportClaim,
     bucket_name: &str,
 ) -> AppResult<()> {
-    let query =
-        import_job::Entity::find().filter(active_claim_filter(claim, txn.get_database_backend()));
-    let job = if txn.get_database_backend() == DatabaseBackend::Postgres {
-        query.lock_exclusive().one(txn).await?
-    } else {
-        query.one(txn).await?
-    };
-    let Some(job) = job else {
-        return Err(AppError::StaleImportOwnership);
-    };
-    if job.bucket != bucket_name {
-        return Err(AppError::StaleImportOwnership);
-    }
-    Ok(())
+    job_queries::active(
+        txn,
+        active_claim_filter(claim, txn.get_database_backend()),
+        bucket_name,
+    )
+    .await
 }
 
 async fn verify_extraction_claim<C: ConnectionTrait>(
@@ -2109,10 +2080,7 @@ async fn verify_extraction_claim<C: ConnectionTrait>(
     key: &str,
 ) -> AppResult<()> {
     verify_active_claim(txn, claim, bucket_name).await?;
-    let job = find_job_for_update(txn, &claim.job_id)
-        .await?
-        .ok_or(AppError::StaleImportOwnership)?;
-    let Some(prefix) = job.decompress_prefix else {
+    let Some(prefix) = job_queries::prefix(txn, &claim.job_id).await? else {
         return Ok(());
     };
     if !key.starts_with(&prefix) {
@@ -2140,11 +2108,8 @@ async fn verify_decompression_attempt<C: ConnectionTrait>(
     bucket_name: &str,
 ) -> AppResult<()> {
     verify_active_claim(txn, claim, bucket_name).await?;
-    let job = find_job_for_update(txn, &claim.job_id)
+    let prefix = job_queries::prefix(txn, &claim.job_id)
         .await?
-        .ok_or(AppError::StaleImportOwnership)?;
-    let prefix = job
-        .decompress_prefix
         .ok_or(AppError::StaleImportOwnership)?;
     let prefix_claim = import_prefix_claim::Entity::find_by_id((
         claim.job_id.clone(),
@@ -2749,19 +2714,6 @@ async fn next_prefix_claim_order<C: ConnectionTrait>(txn: &C, bucket_name: &str)
     Ok(maximum.map_or(0, |maximum| maximum.saturating_add(1)))
 }
 
-async fn find_job_for_update<C: ConnectionTrait>(
-    txn: &C,
-    job_id: &str,
-) -> AppResult<Option<import_job::Model>> {
-    let query = import_job::Entity::find_by_id(job_id.to_owned());
-    let job = if txn.get_database_backend() == DatabaseBackend::Postgres {
-        query.lock_exclusive().one(txn).await?
-    } else {
-        query.one(txn).await?
-    };
-    Ok(job)
-}
-
 fn prefixes_overlap(left: &str, right: &str) -> bool {
     left.starts_with(right) || right.starts_with(left)
 }
@@ -2975,6 +2927,65 @@ mod tests {
             .pop()
             .unwrap()
             .claim
+    }
+
+    #[tokio::test]
+    async fn ownership_fences_and_supersede_do_not_materialize_unneeded_requests() {
+        let db = setup().await;
+        submit(
+            &db,
+            request("hot-fence", "archive", None, Some("out/")),
+            time(0),
+        )
+        .await
+        .unwrap();
+        let claim = claim_one(&db, "worker", time(1)).await;
+        let generation = destination(&db, "archive").await.generation;
+        db.execute_unprepared("UPDATE import_job_requests SET source_value=X'FF',metadata_json=X'FF',tags_json=X'FF',pin_decision_json=X'FF',zip_intent_json=X'FF',root_capture_json=X'FF' WHERE job_id='hot-fence'").await.unwrap();
+        let tx = db.begin().await.unwrap();
+        lock_bucket_for_ownership(&tx, "bucket").await.unwrap();
+        verify_active_claim(&tx, &claim, "bucket").await.unwrap();
+        verify_extraction_claim(&tx, &claim, "bucket", "out/entry")
+            .await
+            .unwrap();
+        verify_decompression_attempt(&tx, &claim, "bucket")
+            .await
+            .unwrap();
+        assert!(matches!(
+            verify_extraction_claim(&tx, &claim, "bucket", "outside").await,
+            Err(AppError::StaleImportOwnership)
+        ));
+        let mut stale = claim.clone();
+        stale.claim_epoch += 1;
+        assert!(matches!(
+            verify_active_claim(&tx, &stale, "bucket").await,
+            Err(AppError::StaleImportOwnership)
+        ));
+        let guard = ImportPublicationGuard {
+            job_id: claim.job_id.clone(),
+            worker_id: claim.worker_id.clone(),
+            claim_epoch: claim.claim_epoch,
+            targets: vec![ExpectedImportTarget {
+                bucket: "bucket".into(),
+                key: "archive".into(),
+                generation,
+            }],
+        };
+        verify_publication_guard(
+            &tx,
+            &guard,
+            "bucket",
+            &[("bucket".into(), "archive".into())],
+        )
+        .await
+        .unwrap();
+        assert_eq!(supersede_bucket(&tx, "bucket", time(2)).await.unwrap(), 1);
+        assert!(matches!(
+            verify_active_claim(&tx, &claim, "bucket").await,
+            Err(AppError::StaleImportOwnership)
+        ));
+        tx.commit().await.unwrap();
+        assert!(destination(&db, "archive").await.owner_job_id.is_none());
     }
 
     #[tokio::test]

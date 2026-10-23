@@ -156,7 +156,7 @@ pub(super) fn members(
     let expected_raw = native::value(source.archive_row_ref(key)?, "binding")
         .ok_or(ManagementError::Confirmation)?;
     if native::value(root, "plan_id") != Some(&core.0.plan_id)
-        || native::value(root, "binding") != Some(expected_raw)
+        || !native::value(root, "binding").is_some_and(|raw| binding_matches(raw, expected_raw))
     {
         return Err(ManagementError::Confirmation);
     }
@@ -176,7 +176,7 @@ pub(super) fn members(
             .items
             .iter()
             .any(|item| item.item_id == key.values[2])
-            || native::value(row, "binding") != Some(expected_raw)
+            || !native::value(row, "binding").is_some_and(|raw| binding_matches(raw, expected_raw))
             || native::parse_time(
                 native::value(row, "expires_at").ok_or(ManagementError::Confirmation)?,
             )? != core.5

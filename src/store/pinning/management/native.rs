@@ -389,6 +389,30 @@ fn entity<E: EntityTrait + Default>() -> NativeTable {
         definitions: definitions.into(),
     }
 }
+
+fn import_job_table() -> NativeTable {
+    use crate::store::entities::import_job;
+    let mut table = entity::<import_job::Entity>();
+    let cold = import_job::Column::iter()
+        .filter(|column| column.is_request())
+        .map(|column| Iden::to_string(&column))
+        .collect::<std::collections::BTreeSet<_>>();
+    table.columns = table
+        .columns
+        .iter()
+        .filter(|name| !cold.contains(*name))
+        .cloned()
+        .collect::<Vec<_>>()
+        .into();
+    table.definitions = table
+        .definitions
+        .iter()
+        .filter(|column| !cold.contains(&column.name))
+        .cloned()
+        .collect::<Vec<_>>()
+        .into();
+    table
+}
 fn raw(table: &str, columns: &str, pk: &str) -> NativeTable {
     let mut columns: Vec<_> = columns.split(',').map(str::to_owned).collect();
     columns.sort();
@@ -429,7 +453,8 @@ pub fn registry() -> Vec<NativeTable> {
         entity::<pin_legacy_migration_item::Entity>(),
         entity::<multipart_upload::Entity>(),
         entity::<multipart_part::Entity>(),
-        entity::<import_job::Entity>(),
+        import_job_table(),
+        entity::<import_job_request::Entity>(),
         entity::<import_job_target::Entity>(),
         entity::<import_job_result::Entity>(),
         entity::<import_destination::Entity>(),

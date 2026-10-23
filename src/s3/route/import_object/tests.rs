@@ -8,7 +8,7 @@ use std::{
 };
 
 use http_body_util::BodyExt as _;
-use sea_orm::{ActiveModelTrait, Database, EntityTrait, PaginatorTrait, Set, TransactionTrait};
+use sea_orm::{ColumnTrait, Database, EntityTrait, PaginatorTrait, QueryFilter, Set, TransactionTrait};
 
 use super::request::*;
 use super::*;
@@ -28,6 +28,15 @@ use crate::{
 };
 
 const CID: &str = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
+
+fn captured_root(job: &import_job::Model) -> crate::pinning::tags::ZipRootCapture {
+    crate::store::pinning::publication::decode_zip_capture_json(
+        job.zip_intent_json.as_deref().unwrap(),
+    )
+    .unwrap()
+    .controls()
+    .root
+}
 
 #[tokio::test]
 async fn signed_zip_submission_captures_root_option_and_replay_preserves_it() {
@@ -50,8 +59,15 @@ async fn signed_zip_submission_captures_root_option_and_replay_preserves_it() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        stored.root_capture_json.as_deref(),
-        Some("{\"tagged\":false}")
+        captured_root(&stored),
+        crate::pinning::tags::ZipRootCapture::Tagged(false)
+    );
+    assert!(stored.pin_decision_json.is_none());
+    assert!(stored.root_capture_json.is_none());
+    assert!(
+        crate::store::import::jobs::decision_from_job(&stored)
+            .unwrap()
+            .is_some()
     );
 
     let mut replay = request(Method::POST, uri, Body::from(cid_xml()));
@@ -92,8 +108,8 @@ async fn configured_root_default_is_not_a_signed_request_fingerprint_field() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        initial.root_capture_json.as_deref(),
-        Some("{\"configured\":true}")
+        captured_root(&initial),
+        crate::pinning::tags::ZipRootCapture::Configured(true)
     );
     let changed = ImportObjectRoute::with_root_default(
         state.clone(),
@@ -1242,8 +1258,8 @@ async fn signed_zip_root_is_visible_only_after_restarted_worker_commits_receipt_
         .unwrap()
         .unwrap();
     assert_eq!(
-        stored.root_capture_json.as_deref(),
-        Some("{\"tagged\":true}")
+        captured_root(&stored),
+        crate::pinning::tags::ZipRootCapture::Tagged(true)
     );
 
     tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
@@ -1398,14 +1414,14 @@ async fn signed_zip_root_is_visible_only_after_restarted_worker_commits_receipt_
         .to_str()
         .unwrap();
     assert_eq!(
-        import_job::Entity::find_by_id(false_id)
-            .one(restarted.store.db())
-            .await
-            .unwrap()
-            .unwrap()
-            .root_capture_json
-            .as_deref(),
-        Some("{\"tagged\":false}")
+        captured_root(
+            &import_job::Entity::find_by_id(false_id)
+                .one(restarted.store.db())
+                .await
+                .unwrap()
+                .unwrap()
+        ),
+        crate::pinning::tags::ZipRootCapture::Tagged(false)
     );
     server.abort();
 }
@@ -1498,14 +1514,14 @@ async fn signed_zip_config_off_persists_disabled_and_never_builds_a_root() {
         .unwrap()
         .to_owned();
     assert_eq!(
-        import_job::Entity::find_by_id(&id)
-            .one(state.store.db())
-            .await
-            .unwrap()
-            .unwrap()
-            .root_capture_json
-            .as_deref(),
-        Some("{\"configured\":false}")
+        captured_root(
+            &import_job::Entity::find_by_id(&id)
+                .one(state.store.db())
+                .await
+                .unwrap()
+                .unwrap()
+        ),
+        crate::pinning::tags::ZipRootCapture::Configured(false)
     );
     let worker = imports.start(state.clone(), tokio_util::sync::CancellationToken::new());
     tokio::time::timeout(std::time::Duration::from_secs(8), async {
@@ -2343,7 +2359,12 @@ async fn completed_decompression_results_page_and_continue_with_job_bound_token(
     active.state = Set("completed".to_owned());
     active.final_cid = Set(Some(CID.to_owned()));
     active.logical_size = Set(Some(12));
-    active.update(state.store.db()).await.unwrap();
+    import_job::Entity::update_many()
+        .set(active)
+        .filter(import_job::Column::Id.eq(&job_id))
+        .exec(state.store.db())
+        .await
+        .unwrap();
     for sequence in 0..3 {
         import_job_result::Entity::insert(import_job_result::ActiveModel {
             job_id: Set(job_id.clone()),

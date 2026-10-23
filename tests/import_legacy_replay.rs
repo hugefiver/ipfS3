@@ -19,7 +19,7 @@ use ipfs_s3_gateway::{
 };
 use s3s::route::S3Route;
 use s3s::{Body, S3Request};
-use sea_orm::{ActiveModelTrait, Database, EntityTrait, Set};
+use sea_orm::{ColumnTrait, Database, EntityTrait, QueryFilter, Set};
 
 const CID: &str = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
 // Stage2 canonical JSON: ["cid",CID,"application/octet-stream",{"owner":"alice"},{"project":"alpha"},"prefix/"]
@@ -142,7 +142,12 @@ async fn stage2_token_replay_is_read_only_and_cannot_be_used_by_another_principa
 
     let mut completed: import_job::ActiveModel = before.into();
     completed.state = Set("completed".into());
-    completed.update(state.store.db()).await.unwrap();
+    import_job::Entity::update_many()
+        .set(completed)
+        .filter(import_job::Column::Id.eq(&id))
+        .exec(state.store.db())
+        .await
+        .unwrap();
     let replay = route.call(submit_request("test", "alice")).await.unwrap();
     assert_eq!(replay.headers["x-ipfs3-import-job-id"], id);
     let xml =

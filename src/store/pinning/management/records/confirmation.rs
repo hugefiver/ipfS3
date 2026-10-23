@@ -331,6 +331,7 @@ pub(super) async fn confirm_staged(
         return Err(ManagementError::Confirmation);
     }
     let encoded = review.confirmation_encoding(now, reviewed)?;
+    let shared = archive::shared_binding(&encoded);
     if !already_confirmed {
         for row in &rows {
             let raw = native::value(row, "binding").ok_or(ManagementError::InvalidEvidence)?;
@@ -376,7 +377,14 @@ pub(super) async fn confirm_staged(
         for key in &keys {
             let old = native::value(source.row(key)?, "binding")
                 .ok_or(ManagementError::InvalidEvidence)?;
-            let changed=tx.execute(Statement::from_sql_and_values(tx.get_database_backend(),"UPDATE pin_management_records SET binding=$1 WHERE database_scope=$2 AND plan_id=$3 AND item_id=$4 AND kind='action' AND state='prepared' AND binding=$5",[encoded.clone().into(),auth.database_scope.clone().into(),review.request().plan_id.clone().into(),key.values[2].clone().into(),old.into()])).await.map_err(|_|ManagementError::Database)?;
+            let item_binding = if native::value(source.row(key)?, "native_before")
+                .is_some_and(|raw| raw.starts_with(archive::FRAME))
+            {
+                &encoded
+            } else {
+                &shared
+            };
+            let changed=tx.execute(Statement::from_sql_and_values(tx.get_database_backend(),"UPDATE pin_management_records SET binding=$1 WHERE database_scope=$2 AND plan_id=$3 AND item_id=$4 AND kind='action' AND state='prepared' AND binding=$5",[item_binding.clone().into(),auth.database_scope.clone().into(),review.request().plan_id.clone().into(),key.values[2].clone().into(),old.into()])).await.map_err(|_|ManagementError::Database)?;
             if changed.rows_affected() != 1 {
                 return Err(ManagementError::Confirmation);
             }

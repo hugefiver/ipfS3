@@ -100,3 +100,11 @@ pub(super) fn key(image: &TableImage, row: &NativeRow) -> BTreeMap<String, Strin
         .filter_map(|column| field(row, column).map(|value| (column.clone(), value.to_owned())))
         .collect()
 }
+
+pub(super) fn index_rows(image: &TableImage) -> BTreeMap<BTreeMap<String, String>, &NativeRow> {
+    let mut rows = BTreeMap::new();
+    for row in &image.rows {
+        rows.entry(key(image, row)).or_insert(row);
+    }
+    rows
+}

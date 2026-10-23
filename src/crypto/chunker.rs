@@ -3,6 +3,8 @@ use futures_util::{Stream, StreamExt};
 
 use crate::error::AppError;
 
+use super::aes_gcm::{CHUNK_OVERHEAD, ChunkCipher};
+
 pub const CHUNK_SIZE: usize = 256 * 1024;
 
 /// Collect a byte stream into chunks of CHUNK_SIZE.
@@ -10,17 +12,34 @@ pub fn chunk_stream<S, E>(stream: S) -> impl Stream<Item = Result<Bytes, E>>
 where
     S: Stream<Item = Result<Bytes, E>> + Unpin,
 {
-    let mut buf = Vec::with_capacity(CHUNK_SIZE);
+    frame_stream(stream, CHUNK_SIZE)
+}
+
+// Complete frames borrow their input storage; only a frame spanning input items
+// needs a buffer. Never copy the unconsumed suffix of a large input item.
+fn frame_stream<S, E>(stream: S, frame_size: usize) -> impl Stream<Item = Result<Bytes, E>>
+where
+    S: Stream<Item = Result<Bytes, E>> + Unpin,
+{
     async_stream::stream! {
-        let mut stream = Box::pin(stream);
+        let mut stream = stream;
+        let mut buf = Vec::new();
         while let Some(chunk) = stream.next().await {
             match chunk {
-                Ok(bytes) => {
-                    buf.extend_from_slice(&bytes);
-                    while buf.len() >= CHUNK_SIZE {
-                        let split = buf.split_off(CHUNK_SIZE);
-                        yield Ok(Bytes::from(std::mem::take(&mut buf)));
-                        buf = split;
+                Ok(mut bytes) => {
+                    while !bytes.is_empty() {
+                        if buf.is_empty() && bytes.len() >= frame_size {
+                            yield Ok(bytes.split_to(frame_size));
+                        } else {
+                            if buf.is_empty() {
+                                buf.reserve(frame_size);
+                            }
+                            let len = (frame_size - buf.len()).min(bytes.len());
+                            buf.extend_from_slice(&bytes.split_to(len));
+                            if buf.len() == frame_size {
+                                yield Ok(Bytes::from(std::mem::take(&mut buf)));
+                            }
+                        }
                     }
                 }
                 Err(e) => yield Err(e),
@@ -40,17 +59,17 @@ where
     S: Stream<Item = Result<Bytes, E>> + Unpin,
     E: Into<Box<dyn std::error::Error + Send + Sync>> + Send + 'static,
 {
-    use super::aes_gcm::encrypt_chunk;
     use rand::Rng;
 
     async_stream::stream! {
-        let mut chunked = Box::pin(chunk_stream::<_, E>(stream));
+        let cipher = ChunkCipher::new(&ok);
+        let mut chunked = std::pin::pin!(chunk_stream::<_, E>(stream));
         while let Some(chunk) = chunked.next().await {
             match chunk {
                 Ok(bytes) => {
                     let mut nonce = [0u8; 12];
                     rand::rng().fill_bytes(&mut nonce);
-                    let encrypted = encrypt_chunk(&ok, &nonce, &bytes)?;
+                    let encrypted = cipher.encrypt(&nonce, &bytes)?;
                     yield Ok(encrypted);
                 }
                 Err(e) => {
@@ -69,30 +88,17 @@ where
     S: Stream<Item = Result<Bytes, E>> + Unpin,
     E: Into<Box<dyn std::error::Error + Send + Sync>> + Send + 'static,
 {
-    use super::aes_gcm::decrypt_chunk;
     // Each encrypted chunk on the wire is: nonce(12) + ciphertext + tag(16) =
     // CHUNK_SIZE + 28 bytes (for full chunks). The last chunk may be smaller.
     // HTTP/TCP packet boundaries do NOT align with chunk boundaries, so we must
     // buffer and split at CIPHER_CHUNK boundaries before decrypting.
-    const OVERHEAD: usize = 12 + 16; // nonce + GCM tag
-    const CIPHER_CHUNK: usize = CHUNK_SIZE + OVERHEAD;
-    let mut buf = Vec::with_capacity(CIPHER_CHUNK * 2);
+    const CIPHER_CHUNK: usize = CHUNK_SIZE + CHUNK_OVERHEAD;
     async_stream::stream! {
-        let mut stream = Box::pin(stream);
-        while let Some(chunk) = stream.next().await {
+        let cipher = ChunkCipher::new(&ok);
+        let mut framed = std::pin::pin!(frame_stream(stream, CIPHER_CHUNK));
+        while let Some(chunk) = framed.next().await {
             match chunk {
-                Ok(bytes) => {
-                    buf.extend_from_slice(&bytes);
-                    // Decrypt all complete cipher chunks currently in the buffer.
-                    while buf.len() >= CIPHER_CHUNK {
-                        let rest = buf.split_off(CIPHER_CHUNK);
-                        let cipher_chunk = std::mem::replace(&mut buf, rest);
-                        match decrypt_chunk(&ok, &cipher_chunk) {
-                            Ok(pt) => yield Ok(pt),
-                            Err(e) => yield Err(e),
-                        }
-                    }
-                }
+                Ok(bytes) => yield cipher.decrypt(&bytes),
                 Err(e) => {
                     let error: Box<dyn std::error::Error + Send + Sync> = e.into();
                     if crate::error::has_kubo_stream_provenance(error.as_ref()) {
@@ -103,67 +109,8 @@ where
                 }
             }
         }
-        // Decrypt any remaining bytes (the final, possibly smaller chunk).
-        if !buf.is_empty() {
-            match decrypt_chunk(&ok, &buf) {
-                Ok(pt) => yield Ok(pt),
-                Err(e) => yield Err(e),
-            }
-        }
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::HashSet;
-    use std::sync::Arc;
-
-    use bytes::Bytes;
-    use futures_util::TryStreamExt;
-
-    use super::*;
-    use crate::crypto::ObjectKey;
-
-    #[tokio::test]
-    async fn encrypt_chunk_stream_uses_distinct_random_nonces_for_equal_inputs() {
-        let key = Arc::new(ObjectKey { bytes: [7; 32] });
-        let input = || {
-            Box::pin(futures_util::stream::iter(vec![Ok::<_, std::io::Error>(
-                Bytes::from_static(b"same part"),
-            )]))
-        };
-
-        let one = encrypt_chunk_stream(input(), key.clone())
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-        let two = encrypt_chunk_stream(input(), key)
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-
-        assert_ne!(&one[0][..12], &two[0][..12]);
-        assert_ne!(one, two);
-    }
-
-    #[tokio::test]
-    async fn encrypt_chunk_stream_assigns_a_unique_nonce_to_each_chunk() {
-        let input = Bytes::from(vec![0x55; CHUNK_SIZE * 3 + 1]);
-        let encrypted = encrypt_chunk_stream(
-            Box::pin(futures_util::stream::iter(vec![Ok::<_, std::io::Error>(
-                input,
-            )])),
-            Arc::new(ObjectKey { bytes: [9; 32] }),
-        )
-        .try_collect::<Vec<_>>()
-        .await
-        .unwrap();
-        let nonces: HashSet<[u8; 12]> = encrypted
-            .iter()
-            .map(|chunk| chunk[..12].try_into().unwrap())
-            .collect();
-
-        assert_eq!(encrypted.len(), 4);
-        assert_eq!(nonces.len(), encrypted.len());
-    }
-}
+mod tests;

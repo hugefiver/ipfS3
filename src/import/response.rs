@@ -1,4 +1,6 @@
-use crate::store::entities::{import_job, import_job_result};
+#[cfg(test)]
+use crate::store::entities::import_job;
+use crate::store::{entities::import_job_result, import::status::JobStatus};
 
 const XML_DECLARATION: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>";
 
@@ -41,12 +43,12 @@ pub fn accepted_xml(job_id: &str, state: &str, phase: &str) -> String {
     xml
 }
 
-pub fn status_xml(job: &import_job::Model, page: Option<StatusResultPage<'_>>) -> String {
+pub fn status_xml(job: &JobStatus, page: Option<StatusResultPage<'_>>) -> String {
     status_xml_with_root(job, page, None)
 }
 
 pub fn status_xml_with_root(
-    job: &import_job::Model,
+    job: &JobStatus,
     page: Option<StatusResultPage<'_>>,
     root: Option<ZipRootStatus<'_>>,
 ) -> String {
@@ -233,7 +235,7 @@ mod tests {
 
     #[test]
     fn cid_status_reports_truthful_counters_without_url_replica_or_percentage_claims() {
-        let xml = status_xml(&job("cid"), None);
+        let xml = status_xml(&job("cid").into(), None);
 
         assert!(xml.contains("<ProvidersObserved>3</ProvidersObserved>"));
         assert!(xml.contains("<PinNodesProcessed>4</PinNodesProcessed>"));
@@ -270,7 +272,7 @@ mod tests {
             },
         ];
         let xml = status_xml(
-            &job,
+            &job.into(),
             Some(StatusResultPage {
                 rows: &rows,
                 next_continuation_token: Some("token<&"),

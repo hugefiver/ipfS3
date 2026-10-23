@@ -875,8 +875,8 @@ use s3::bucket::Bucket;
 use s3::creds::Credentials;
 use s3::region::Region;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, IntoActiveModel,
-    PaginatorTrait, QueryFilter, QueryOrder, Set, Statement, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, PaginatorTrait,
+    QueryFilter, QueryOrder, Set, Statement, TransactionTrait,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -16270,19 +16270,24 @@ async fn test_import_worker_restart_reclaims_without_double_publication() {
     wait_for_import_pin_progress(&harness, &job_id).await;
 
     let second_worker = harness.start_additional_worker();
-    let job = store::entities::import_job::Entity::find_by_id(&job_id)
-        .one(harness.state.store.db())
-        .await
-        .expect("query epoch-one import")
-        .expect("epoch-one import exists");
-    let mut active = job.into_active_model();
-    active.locked_until = Set(Some(Utc::now() - ChronoDuration::seconds(1)));
-    active.next_attempt_at = Set(Utc::now() - ChronoDuration::seconds(1));
-    active.updated_at = Set(Utc::now());
-    active
-        .update(harness.state.store.db())
+    use sea_orm::sea_query::Expr;
+    use store::entities::import_job;
+    let now = Utc::now();
+    let expired = import_job::Entity::update_many()
+        .col_expr(
+            import_job::Column::LockedUntil,
+            Expr::value(Some(now - ChronoDuration::seconds(1))),
+        )
+        .col_expr(
+            import_job::Column::NextAttemptAt,
+            Expr::value(now - ChronoDuration::seconds(1)),
+        )
+        .col_expr(import_job::Column::UpdatedAt, Expr::value(now))
+        .filter(import_job::Column::Id.eq(&job_id))
+        .exec(harness.state.store.db())
         .await
         .expect("expire epoch-one worker lease");
+    assert_eq!(expired.rows_affected, 1);
 
     let completed = wait_for_import_state(&harness, &job_id, &["completed"]).await;
     assert_eq!(completed.attempts, 2);

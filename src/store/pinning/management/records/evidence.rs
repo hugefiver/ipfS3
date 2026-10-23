@@ -67,6 +67,9 @@ pub(super) fn view_anchor_key(binding: BindingView<'_>) -> Result<native::Native
     })
 }
 pub(super) fn is_draft(raw: &str, work: &mut Budget) -> Result<bool> {
+    if archive::is_shared_binding(raw) {
+        return Ok(false);
+    }
     let binding: archive::StoredBinding = work.typed(
         raw.strip_prefix(archive::BINDING)
             .ok_or(ManagementError::InvalidEvidence)?,

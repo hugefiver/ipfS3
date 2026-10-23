@@ -44,31 +44,28 @@ pub struct FrozenRetirementImport<S> {
     reduced: bool,
     failed: bool,
 }
-impl<S: Read + Seek> FrozenRetirementImport<S> {
+impl FrozenRetirementImport<v3::archive_cursor::OwnedSource> {
     /// Resolve the common publication through its typed local binding. Generic
     /// archive loading below retains the ordinary Request envelope contract.
     pub async fn load_original<C: ConnectionTrait>(
         db: &C,
         binding: &crate::store::pinning::management::records::ConfirmedBinding,
         entry: &PlanEntry,
-        canonical: S,
         path: &Path,
         reservation: std::fs::File,
         budget: Budget,
-    ) -> Result<Self>
-    where
-        S: Write,
-    {
+    ) -> Result<Self> {
         let Some(Capture::Provider(capture)) = &entry.capture else {
             return Err(ManagementError::Confirmation);
         };
         let cursor = crate::store::pinning::management::records::load_original_inventory(
-            db, binding, entry, canonical, budget,
+            db, binding, entry, budget,
         )
         .await?;
         Self::create(cursor, path, reservation, capture.inventory.clone()).await
     }
-
+}
+impl<S: Read + Seek> FrozenRetirementImport<S> {
     /// Normal stored-archive entry point. Both file reservations are supplied by
     /// the protected local artifact adapter, not by coordinates inside the file.
     pub async fn load<C: ConnectionTrait>(

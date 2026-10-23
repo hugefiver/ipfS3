@@ -125,20 +125,22 @@ fn catalog_query(
         .map(|name| literal(name))
         .collect::<Vec<_>>()
         .join(",");
-    // Exact matches are checked inside this fresh catalog statement, not returned
-    // as owned SQLite rows. Only differences need Rust's layout normalization.
+    // Keep DDL out of the materialized catalog and its automatic indexes. Read
+    // definitions by rowid in this same statement; only differences cross into Rust.
     format!(
         "WITH expected(name,kind,table_name,sql) AS (VALUES {expected}),\
         actual AS MATERIALIZED (\
-            SELECT substr(name,1,{NAME_BYTES}) AS name,substr(type,1,16) AS type,substr(tbl_name,1,{NAME_BYTES}) AS tbl_name,\
-            CASE WHEN length(CAST(sql AS BLOB))<={SQL_BYTES} THEN sql ELSE NULL END AS sql,\
+            SELECT rowid AS catalog_row,substr(name,1,{NAME_BYTES}) AS name,substr(type,1,16) AS type,substr(tbl_name,1,{NAME_BYTES}) AS tbl_name,sql IS NULL AS sql_null,\
             length(CAST(name AS BLOB))<={NAME_BYTES} AND length(CAST(tbl_name AS BLOB))<={NAME_BYTES} AND length(type)<=16 AND (sql IS NULL OR length(CAST(sql AS BLOB))<={SQL_BYTES}) AS bounded \
             FROM main.sqlite_schema WHERE name IN (SELECT name FROM expected) OR tbl_name IN ({tables}) LIMIT {limit}\
         ), catalog AS (\
-        SELECT a.name,a.type,a.tbl_name,a.sql,a.bounded FROM actual a LEFT JOIN expected e ON e.name=a.name \
+        SELECT a.name,a.type,a.tbl_name,CASE WHEN a.bounded=1 THEN s.sql ELSE NULL END AS sql,a.bounded \
+        FROM expected e LEFT JOIN actual a ON a.name=e.name LEFT JOIN main.sqlite_schema s ON s.rowid=a.catalog_row \
         WHERE a.bounded IS NOT 1 \
-            OR (e.name IS NULL AND NOT (a.type='index' AND a.sql IS NULL AND a.tbl_name IN ({tables}))) \
-            OR (e.name IS NOT NULL AND (a.type IS NOT e.kind OR a.tbl_name IS NOT e.table_name OR a.sql IS NOT e.sql)) \
+            OR a.type IS NOT e.kind OR a.tbl_name IS NOT e.table_name OR s.sql IS NOT e.sql \
+        UNION ALL SELECT a.name,a.type,a.tbl_name,NULL,a.bounded FROM actual a \
+        WHERE a.name NOT IN (SELECT name FROM expected) \
+            AND (a.bounded IS NOT 1 OR NOT (a.type='index' AND a.sql_null AND a.tbl_name IN ({tables}))) \
         UNION ALL SELECT e.name,NULL,NULL,NULL,0 FROM expected e WHERE (SELECT COUNT(*) FROM actual a WHERE a.name=e.name)<>1 \
         UNION ALL SELECT '',NULL,NULL,NULL,0 WHERE (SELECT COUNT(*) FROM actual)>{cap} LIMIT {limit}\
         ), shadow AS MATERIALIZED (\
@@ -150,6 +152,10 @@ fn catalog_query(
         limit = cap + 1
     )
 }
+
+#[cfg(test)]
+#[path = "sqlite_expected_tests.rs"]
+mod catalog_tests;
 
 #[cfg(test)]
 mod tests {

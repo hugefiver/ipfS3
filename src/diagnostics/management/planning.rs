@@ -34,6 +34,9 @@ pub async fn execute(
 ) -> Result<Value> {
     let mut budget = files::stream::budget();
     let mut limits = management::retirement::RunLimits::default();
+    let hard = files::stream::limits();
+    limits.total_rows = hard.rows;
+    limits.total_bytes = hard.bytes;
     limits.cancellation = cancellation;
     limits.constrain_deadline(deadline, &mut budget)?;
     if let Some(options) = command.checkpoint() {

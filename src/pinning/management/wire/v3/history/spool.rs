@@ -167,7 +167,11 @@ impl Spool {
         } else {
             None
         };
-        let parent = if chunk || part.key.table == "pin_management_archive" {
+        let parent = if chunk
+            || matches!(
+                part.key.table.as_str(),
+                "pin_management_archive" | "pin_management_inline_archive"
+            ) {
             part.key.values.first().cloned()
         } else {
             None

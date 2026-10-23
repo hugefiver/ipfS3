@@ -6,6 +6,9 @@ use sea_orm_migration::MigratorTrait;
 pub mod history;
 pub(crate) mod read_context;
 mod upgrade;
+#[cfg(test)]
+#[path = "initialization/document_tests.rs"]
+mod document_tests;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SchemaState {
@@ -55,9 +58,15 @@ pub async fn validate_existing<C: ConnectionTrait>(db: &C) -> Result<(), DbErr> 
     if classify(db).await? != SchemaState::Current {
         return Err(required());
     }
+    validate_catalog(db).await
+}
+
+// Called immediately after this operation validates the current storage schema.
+// No installed-schema result is retained across operations or a DDL boundary.
+async fn validate_catalog<C: ConnectionTrait>(db: &C) -> Result<(), DbErr> {
     super::pinning::management::catalog::validate(
         db,
-        &super::pinning::management::native::registry(),
+        super::pinning::management::native::current_catalog(),
     )
     .await
     .map_err(|_| required())
@@ -66,14 +75,14 @@ pub async fn validate_existing<C: ConnectionTrait>(db: &C) -> Result<(), DbErr> 
 pub async fn open(db: &DatabaseConnection) -> Result<(), DbErr> {
     match classify(db).await? {
         SchemaState::Empty => initialize_empty(db).await,
-        SchemaState::Current => validate_existing(db).await,
+        SchemaState::Current => validate_catalog(db).await,
         SchemaState::UpgradeRequired => Err(required()),
     }
 }
 
 pub async fn initialize_empty(db: &DatabaseConnection) -> Result<(), DbErr> {
     match classify(db).await? {
-        SchemaState::Current => return validate_existing(db).await,
+        SchemaState::Current => return validate_catalog(db).await,
         SchemaState::UpgradeRequired => return Err(required()),
         SchemaState::Empty => {}
     }
@@ -118,8 +127,10 @@ pub async fn upgrade_existing(
     request: UpgradeRequest<'_>,
 ) -> Result<(), DbErr> {
     use super::pinning::management::{catalog, native, schema};
-    if request.source_version != "m20261013_000001_zip_root_logical_release"
-        || request.target_version != schema::VERSION
+    if !matches!(
+        request.source_version,
+        "m20261013_000001_zip_root_logical_release" | "m20261017_000001_management_storage"
+    ) || request.target_version != schema::VERSION
     {
         return Err(required());
     }
@@ -185,6 +196,8 @@ pub async fn upgrade_existing(
             return Err(required());
         }
         super::migrator::Migrator::up(&tx, None).await?;
+        tx.execute_unprepared("UPDATE pin_management_readiness SET state='backfill' WHERE id=1")
+            .await?;
     }
     history::upgrade_stamp(&tx, &request, preparing)
         .await
@@ -211,11 +224,51 @@ pub async fn upgrade_existing(
 #[cfg(test)]
 mod stage75_storage_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn ordinary_open_rechecks_schema_after_ddl_without_writing() {
+        let db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+        initialize_empty(&db).await.unwrap();
+        let changes =
+            || Statement::from_string(db.get_database_backend(), "SELECT total_changes() AS n");
+        let before: i64 = db
+            .query_one(changes())
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "n")
+            .unwrap();
+        open(&db).await.unwrap();
+        let after: i64 = db
+            .query_one(changes())
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "n")
+            .unwrap();
+        assert_eq!(before, after);
+        db.execute_unprepared("DROP TRIGGER s75_inline_no_update")
+            .await
+            .unwrap();
+        assert!(open(&db).await.is_err());
+        let refused: i64 = db
+            .query_one(changes())
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "n")
+            .unwrap();
+        assert_eq!(refused, before);
+    }
+
     #[tokio::test]
     async fn stage7_startup_does_not_write_migration_lock_or_identity() {
         let db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
-        let count = crate::store::migrator::Migrator::migrations().len() as u32;
-        crate::store::migrator::Migrator::up(&db, Some(count - 1))
+        let count = crate::store::migrator::Migrator::migrations()
+            .iter()
+            .position(|migration| migration.name() == "m20261017_000001_management_storage")
+            .unwrap() as u32;
+        crate::store::migrator::Migrator::up(&db, Some(count))
             .await
             .unwrap();
         let before = crate::store::pinning::management::native::scope::binding(&db)

@@ -1,8 +1,8 @@
 use crate::error::{AppError, AppResult};
 use chrono::Utc;
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
-    Set, TransactionError, TransactionTrait, sea_query::Expr,
+    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect, Set,
+    TransactionError, TransactionTrait, sea_query::Expr,
 };
 
 use super::{
@@ -44,11 +44,14 @@ pub async fn create<C: ConnectionTrait>(db: &C, name: &str, owner: Option<&str>)
 }
 
 pub async fn exists<C: ConnectionTrait>(db: &C, name: &str) -> AppResult<bool> {
-    let count = bucket::Entity::find()
+    Ok(bucket::Entity::find()
+        .select_only()
+        .column(bucket::Column::Name)
         .filter(bucket::Column::Name.eq(name))
-        .count(db)
-        .await?;
-    Ok(count > 0)
+        .into_tuple::<String>()
+        .one(db)
+        .await?
+        .is_some())
 }
 
 pub async fn delete<C: ConnectionTrait + TransactionTrait>(db: &C, name: &str) -> AppResult<()> {
@@ -60,39 +63,55 @@ pub async fn delete<C: ConnectionTrait + TransactionTrait>(db: &C, name: &str) -
             super::import::ownership::lock_bucket_for_ownership(txn, &name).await?;
 
             let has_multipart_uploads = multipart_upload::Entity::find()
+                .select_only()
+                .column(multipart_upload::Column::UploadId)
                 .filter(multipart_upload::Column::Bucket.eq(&name))
-                .count(txn)
+                .limit(1)
+                .into_tuple::<String>()
+                .one(txn)
                 .await?
-                > 0;
+                .is_some();
             if has_multipart_uploads {
                 return Err(AppError::BucketNotEmpty(name));
             }
 
-            let has_active_imports = import_job::Entity::find()
+            let has_active_imports = import_job::Entity::find_state()
+                .select_only()
+                .column(import_job::Column::Id)
                 .filter(import_job::Column::Bucket.eq(&name))
                 .filter(import_job::Column::State.is_in(["queued", "running"]))
-                .count(txn)
+                .limit(1)
+                .into_tuple::<String>()
+                .one(txn)
                 .await?
-                > 0;
+                .is_some();
             if has_active_imports {
                 return Err(AppError::BucketNotEmpty(name));
             }
 
             let has_objects = object::Entity::find()
+                .select_only()
+                .column(object::Column::Id)
                 .filter(object::Column::Bucket.eq(&name))
                 .filter(object::Column::IsLatest.eq(true))
-                .count(txn)
+                .limit(1)
+                .into_tuple::<String>()
+                .one(txn)
                 .await?
-                > 0;
+                .is_some();
             if has_objects {
                 return Err(AppError::BucketNotEmpty(name));
             }
 
             let has_versions = object_version::Entity::find()
+                .select_only()
+                .column(object_version::Column::Id)
                 .filter(object_version::Column::Bucket.eq(&name))
-                .count(txn)
+                .limit(1)
+                .into_tuple::<String>()
+                .one(txn)
                 .await?
-                > 0;
+                .is_some();
             if has_versions {
                 return Err(AppError::BucketNotEmpty(name));
             }
@@ -209,7 +228,9 @@ mod tests {
             run_migrations,
         },
     };
-    use sea_orm::{ColumnTrait, ConnectionTrait, Database, EntityTrait, QueryFilter, Set};
+    use sea_orm::{
+        ColumnTrait, ConnectionTrait, Database, EntityTrait, PaginatorTrait, QueryFilter, Set,
+    };
 
     async fn setup() -> sea_orm::DatabaseConnection {
         let db = Database::connect("sqlite::memory:").await.unwrap();

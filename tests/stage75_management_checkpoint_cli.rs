@@ -123,6 +123,34 @@ async fn checkpoint_exits_incomplete_then_resumes_into_complete_review_without_b
             .unwrap();
     let capture_work = capture.work().unwrap();
     assert!(capture_work.rows > 0 && capture_work.raw_bytes > 0);
+    let raw = toml::from_str(&std::fs::read_to_string(&fixture.config_path).unwrap()).unwrap();
+    let auth = records::authorize_local(&raw, &fixture.db).await.unwrap();
+    let hard = ipfs_s3_gateway::pinning::management::wire::v3::files::stream::limits();
+    let mut generous = RunLimits::default();
+    generous.total_rows = hard.rows + 1;
+    generous.total_bytes = hard.bytes + 1;
+    let task = PlanningCheckpoint::resume(
+        &checkpoint,
+        &fixture.db,
+        auth.principal(),
+        &fixture.request,
+        &capture.planning_snapshot().unwrap(),
+        &generous,
+    )
+    .await
+    .unwrap();
+    let retained_work = task.total_work().await.unwrap();
+    let mut capture_budget =
+        ipfs_s3_gateway::store::pinning::management::native::meter::Budget::default();
+    let caps = task.reserve_capture(&capture_budget, &generous).unwrap();
+    assert_eq!((caps.total_rows, caps.total_bytes), (hard.rows, hard.bytes));
+    capture_budget.work.raw_bytes = hard.bytes + 1;
+    assert!(task.reserve_capture(&capture_budget, &generous).is_err());
+    capture_budget.work.raw_bytes = 0;
+    capture_budget.work.rows = hard.rows + 1;
+    assert!(task.reserve_capture(&capture_budget, &generous).is_err());
+    assert_eq!(task.total_work().await.unwrap(), retained_work);
+    task.close().await.unwrap();
     let before_retry = source_work(&checkpoint).await;
     assert!(
         !run(

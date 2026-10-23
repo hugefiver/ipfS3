@@ -3,8 +3,6 @@ use futures_util::{Stream, StreamExt};
 use reqwest::Body as ReqwestBody;
 use reqwest::multipart;
 use serde::Deserialize;
-use tokio::io::AsyncWriteExt;
-use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -38,7 +36,7 @@ pub enum StreamAddError<E: std::error::Error + Send + Sync + 'static> {
     Canceled,
 }
 
-const ADD_DUPLEX_CAPACITY: usize = 64 * 1024;
+const ADD_CHUNK_BYTES: usize = 64 * 1024;
 
 enum ProducerOutcome<E> {
     Complete,
@@ -49,7 +47,7 @@ enum ProducerOutcome<E> {
 
 async fn pump_source<S, E>(
     stream: S,
-    mut writer: tokio::io::DuplexStream,
+    sender: tokio::sync::mpsc::Sender<Bytes>,
     cancel: CancellationToken,
 ) -> ProducerOutcome<E>
 where
@@ -63,23 +61,20 @@ where
             item = stream.next() => item,
         };
         match item {
-            Some(Ok(bytes)) => {
-                let write_result = tokio::select! {
-                    _ = cancel.cancelled() => return ProducerOutcome::Canceled,
-                    result = writer.write_all(&bytes) => result,
-                };
-                if write_result.is_err() {
-                    return ProducerOutcome::ReceiverClosed;
+            Some(Ok(mut bytes)) => {
+                while !bytes.is_empty() {
+                    let chunk = bytes.split_to(bytes.len().min(ADD_CHUNK_BYTES));
+                    let sent = tokio::select! {
+                        _ = cancel.cancelled() => return ProducerOutcome::Canceled,
+                        result = sender.send(chunk) => result,
+                    };
+                    if sent.is_err() {
+                        return ProducerOutcome::ReceiverClosed;
+                    }
                 }
             }
             Some(Err(error)) => return ProducerOutcome::Source(error),
-            None => {
-                let _ = tokio::select! {
-                    _ = cancel.cancelled() => return ProducerOutcome::Canceled,
-                    result = writer.shutdown() => result,
-                };
-                return ProducerOutcome::Complete;
-            }
+            None => return ProducerOutcome::Complete,
         }
     }
 }
@@ -95,17 +90,43 @@ where
     S: Stream<Item = Result<Bytes, E>> + Send,
     E: std::error::Error + Send + Sync + 'static,
 {
-    let (reader, writer) = tokio::io::duplex(ADD_DUPLEX_CAPACITY);
-    let mut producer = Box::pin(pump_source(stream, writer, cancel.clone()));
-    let body = ReqwestBody::wrap_stream(ReaderStream::new(reader));
+    stream_add_inner(kubo, stream, cid_version, Some(progress), cancel).await
+}
+
+async fn stream_add_inner<S, E>(
+    kubo: &KuboClient,
+    stream: S,
+    cid_version: u8,
+    progress: Option<ProgressSender>,
+    cancel: CancellationToken,
+) -> Result<AddResult, StreamAddError<E>>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    // The producer can borrow its source. Only owned Bytes cross into the HTTP
+    // body, one bounded slice at a time, without copying through a byte ring.
+    // Producer EOF and a complete valid response remain separate requirements.
+    let (sender, receiver) = tokio::sync::mpsc::channel(1);
+    let mut producer = Box::pin(pump_source(stream, sender, cancel.clone()));
+    let body = ReqwestBody::wrap_stream(futures_util::stream::unfold(
+        receiver,
+        |mut receiver| async move {
+            receiver
+                .recv()
+                .await
+                .map(|bytes| (Ok::<_, std::io::Error>(bytes), receiver))
+        },
+    ));
     let part = multipart::Part::stream(body)
         .file_name("object")
         .mime_str("application/octet-stream")
         .expect("application/octet-stream is a valid MIME type");
     let form = multipart::Form::new().part("file", part);
     let url = format!(
-        "{}/api/v0/add?cid-version={cid_version}&pin=false&wrap-with-directory=false&progress=true",
-        kubo.base_url()
+        "{}/api/v0/add?cid-version={cid_version}&pin=false&wrap-with-directory=false&progress={}",
+        kubo.base_url(),
+        progress.is_some(),
     );
     let mut request = Box::pin(kubo.upload_http().post(url).multipart(form).send());
 
@@ -146,7 +167,12 @@ where
         return Err(StreamAddError::Kubo(AppError::kubo_rpc_status(status)));
     }
 
-    let mut parser = Box::pin(parse_add_response(response, kubo, &progress, &cancel));
+    let mut parser = Box::pin(parse_add_response(
+        response,
+        kubo,
+        progress.as_ref(),
+        &cancel,
+    ));
     if source_completed_before_headers {
         return tokio::select! {
             _ = cancel.cancelled() => Err(StreamAddError::Canceled),
@@ -188,7 +214,7 @@ where
 async fn parse_add_response<E>(
     response: reqwest::Response,
     kubo: &KuboClient,
-    progress: &ProgressSender,
+    progress: Option<&ProgressSender>,
     cancel: &CancellationToken,
 ) -> Result<AddResult, StreamAddError<E>>
 where
@@ -230,7 +256,7 @@ async fn process_add_record<E>(
     record: &[u8],
     last_bytes: &mut u64,
     result: &mut Option<AddResult>,
-    progress: &ProgressSender,
+    progress: Option<&ProgressSender>,
     cancel: &CancellationToken,
 ) -> Result<bool, StreamAddError<E>>
 where
@@ -246,10 +272,12 @@ where
             )));
         }
         *last_bytes = bytes;
-        match send_progress(progress, KuboProgress::AddBytes { bytes }, cancel).await {
-            Ok(()) => {}
-            Err(_error) if cancel.is_cancelled() => return Err(StreamAddError::Canceled),
-            Err(error) => return Err(StreamAddError::Kubo(error)),
+        if let Some(progress) = progress {
+            match send_progress(progress, KuboProgress::AddBytes { bytes }, cancel).await {
+                Ok(()) => {}
+                Err(_error) if cancel.is_cancelled() => return Err(StreamAddError::Canceled),
+                Err(error) => return Err(StreamAddError::Kubo(error)),
+            }
         }
     }
     let is_root = if let Some(hash) = response.hash {
@@ -298,17 +326,7 @@ where
     E: Into<Box<dyn std::error::Error + Send + Sync>> + Send + 'static,
 {
     let mapped = stream.map(|item| item.map_err(|error| BoxedSourceError(error.into())));
-    let (progress, mut progress_receiver) = tokio::sync::mpsc::channel(32);
-    let drain = tokio::spawn(async move { while progress_receiver.recv().await.is_some() {} });
-    let outcome = stream_add_with_progress(
-        kubo,
-        mapped,
-        cid_version,
-        progress,
-        CancellationToken::new(),
-    )
-    .await;
-    let _ = drain.await;
+    let outcome = stream_add_inner(kubo, mapped, cid_version, None, CancellationToken::new()).await;
 
     match outcome {
         Ok(result) => Ok(result.cid),
@@ -319,6 +337,10 @@ where
         Err(StreamAddError::Canceled) => Err(super::canceled_rpc_error()),
     }
 }
+
+#[cfg(test)]
+#[path = "add_transfer_tests.rs"]
+mod transfer_tests;
 
 #[cfg(test)]
 mod tests {
@@ -678,7 +700,7 @@ mod tests {
                 stream_add_with_progress(
                     &KuboClient::new(endpoint),
                     stream::iter(vec![
-                        Ok(Bytes::from(vec![b'x'; ADD_DUPLEX_CAPACITY])),
+                        Ok(Bytes::from(vec![b'x'; ADD_CHUNK_BYTES])),
                         Ok(Bytes::from_static(b"second")),
                         Err(expected),
                     ]),

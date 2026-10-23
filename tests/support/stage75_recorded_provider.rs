@@ -1,4 +1,8 @@
 //! A committed Stage 7 Retain original, using its historical storage protocol.
+#[path = "stage75_legacy_import.rs"]
+mod legacy_import;
+#[path = "stage75_source_catalog.rs"]
+mod source_catalog;
 use ipfs_s3_gateway::{
     pinning::management as model,
     store::{
@@ -70,15 +74,17 @@ pub async fn install(
             "s75_immutable",
             "s75_archive_guard",
             "s75_chunk_guard",
+            "s75_archive_id_claim",
         ] {
             db.execute_unprepared(&format!("DROP FUNCTION {name}()"))
                 .await
                 .unwrap();
         }
     }
+    legacy_import::restore(db).await;
     db.execute(Statement::from_sql_and_values(
         backend,
-        "DELETE FROM seaql_migrations WHERE version=$1",
+        "DELETE FROM seaql_migrations WHERE version IN ($1,'m20261017_000001_management_storage')",
         [schema::VERSION.into()],
     ))
     .await
@@ -102,7 +108,7 @@ pub async fn install(
     let mut leaves = Vec::new();
     let mut tables = Vec::new();
     let mut frontier = Vec::new();
-    for (ordinal, table) in native::registry().iter().enumerate() {
+    for (ordinal, table) in source_catalog::tables(&catalog).iter().enumerate() {
         let projection = table
             .columns
             .iter()

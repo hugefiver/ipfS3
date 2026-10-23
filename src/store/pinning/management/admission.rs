@@ -9,10 +9,10 @@ use crate::{
 };
 
 pub(crate) fn work_error(error: super::ManagementError) -> AppError {
-    if error == super::ManagementError::Budget {
-        AppError::ManagementBudget
-    } else {
-        needs_attention()
+    match error {
+        super::ManagementError::Budget => AppError::ManagementBudget,
+        super::ManagementError::Database => AppError::Database(error.to_string()),
+        _ => needs_attention(),
     }
 }
 
@@ -42,7 +42,7 @@ mod managed_jobs;
 mod observations;
 mod retirement;
 
-pub(crate) use managed_jobs::{ManagedCall, managed_call_allowed, managed_call_allowed_with_work};
+pub(crate) use managed_jobs::{ManagedCall, managed_call_allowed};
 pub use managed_jobs::{ManagementJobReport, ManagementJobScope};
 pub(crate) use observations::{
     append_nonprojecting_delete_acknowledgement, append_nonprojecting_delete_error,
@@ -65,9 +65,9 @@ pub(crate) async fn lock_registration_in_transaction(
     provider: &str,
 ) -> AppResult<()> {
     locks::lock_existing_usage(tx, &[provider.to_owned()]).await?;
-    let schema = locks::serialize(tx, locks::RetirementAccess::Admission).await?;
+    locks::serialize(tx, locks::RetirementAccess::Admission).await?;
     locks::serialize_routes(tx, true).await?;
-    schema.revalidate(tx).await
+    locks::AdmissionSchema::read(tx).await.map(|_| ())
 }
 
 /// Read-only fail-fast hint. Only the final caller transaction proves admission.
@@ -137,7 +137,6 @@ pub(crate) async fn lock_provider_with_work<C: ConnectionTrait>(
         // Preserve the pre-registry low-level store API only on a genuinely empty
         // registry with no retirement. Missing current TOML identity is not proof.
         let unregistered = domains::unregistered_legacy_in_schema(db, provider, &schema).await?;
-        schema.revalidate(db).await?;
         if unregistered {
             return Ok(());
         }
@@ -145,7 +144,6 @@ pub(crate) async fn lock_provider_with_work<C: ConnectionTrait>(
     }
     locks::lock_route_rows_with_work(db, &routes, work).await?;
     let closed = retirement::closed_in_schema(db, &routes, &schema, false, work).await?;
-    schema.revalidate(db).await?;
     if closed {
         return Err(retired());
     }

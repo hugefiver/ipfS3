@@ -14,8 +14,15 @@ pub(super) fn current_versions() -> Vec<String> {
 pub(crate) fn archived_catalog(versions: &[String]) -> Result<&'static [NativeTable]> {
     use std::sync::LazyLock;
     static VERSIONS: LazyLock<Vec<String>> = LazyLock::new(current_versions);
-    static HISTORICAL: LazyLock<Vec<NativeTable>> = LazyLock::new(|| {
+    static PRE_DOCUMENTS: LazyLock<Vec<NativeTable>> = LazyLock::new(|| {
         let mut tables = registry();
+        tables.retain(|table| table.table != "import_job_requests");
+        *tables.iter_mut().find(|table| table.table == "import_jobs").expect("import jobs catalog") =
+            super::entity::<crate::store::entities::import_job::Entity>();
+        tables
+    });
+    static HISTORICAL: LazyLock<Vec<NativeTable>> = LazyLock::new(|| {
+        let mut tables = PRE_DOCUMENTS.clone();
         if let Some(root) = tables
             .iter_mut()
             .find(|table| table.table == "zip_root_references")
@@ -32,7 +39,8 @@ pub(crate) fn archived_catalog(versions: &[String]) -> Result<&'static [NativeTa
         return Err(ManagementError::InvalidEvidence);
     }
     match versions.last().map(String::as_str) {
-        Some("m20261013_000001_zip_root_logical_release") => Ok(current_catalog()),
+        Some("m20261013_000001_zip_root_logical_release") => Ok(&PRE_DOCUMENTS),
+        Some("m20261017_000001_management_storage") => Ok(&PRE_DOCUMENTS),
         Some("m20261012_000001_pinning_management") => Ok(&HISTORICAL),
         _ => Err(ManagementError::InvalidEvidence),
     }

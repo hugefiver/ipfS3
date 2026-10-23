@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use sea_orm::{ConnectionTrait, DatabaseTransaction, Statement};
 use serde::{Deserialize, Serialize};
 mod archive;
+pub(crate) use archive::binding_matches;
 mod authority;
 mod recorded;
 pub use authority::{CheckpointEvidence, load_checkpoint_confirmation, load_confirmed_authority};
@@ -30,10 +31,9 @@ mod validation;
 mod views;
 pub use inventory_review::bind_sealed_retirement_review;
 pub use inventory_review::copy_original_inventory;
-pub(crate) use inventory_review::copy_original_inventory_document;
-pub(crate) use inventory_review::copy_prepared_output_document;
 pub(crate) use inventory_review::finish_apply as finish_retirement_apply;
 pub use inventory_review::load_original_inventory;
+pub(crate) use inventory_review::{open_original_inventory_document, OriginalInventoryDocument};
 pub(crate) use inventory_review::prepare_apply as prepare_retirement_apply;
 pub(crate) use inventory_review::validate_entry as validate_retirement_entry;
 pub mod segmented;
@@ -142,7 +142,9 @@ pub(crate) fn confirmed_members(
                 && native::value(row, "kind") == Some("action")
                 && native::value(row, "state") == Some("prepared")
                 && native::value(row, "result").is_none()
-                && native::value(row, "binding") == binding.original_binding().ok()
+                && native::value(row, "binding")
+                    .zip(binding.original_binding().ok())
+                    .is_some_and(|(left, right)| archive::binding_matches(left, right))
         });
         let row = matching.next().ok_or(ManagementError::Confirmation)?;
         if matching.any(|other| other.as_ref() != row.as_ref()) {
@@ -423,7 +425,25 @@ async fn write_result_with_work(
     let now = crate::store::database_clock::database_now(tx)
         .await
         .map_err(|_| ManagementError::Database)?;
-    let encoded = confirmation.original_binding()?;
+    let candidates = {
+        let mut budget = work.lock().map_err(|_| ManagementError::InvalidEvidence)?;
+        archive::sql_candidates(
+            &auth.database_scope,
+            &confirmation.request.plan_id,
+            &mut budget,
+        )?
+    };
+    let row = candidates
+        .iter()
+        .find(|row| {
+            native::value(row, "item_id") == Some(receipt.binding.request.item_id.as_str())
+                && native::value(row, "kind") == Some("action")
+        })
+        .ok_or(ManagementError::Confirmation)?;
+    let encoded = native::value(row, "binding").ok_or(ManagementError::Confirmation)?;
+    if !archive::binding_matches(encoded, confirmation.original_binding()?) {
+        return Err(ManagementError::Confirmation);
+    }
     DecodeWork::shared(&work).copy(encoded)?;
     DecodeWork::shared(&work).copy(&(
         result,

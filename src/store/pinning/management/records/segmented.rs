@@ -3,7 +3,11 @@ use super::*;
 use native::meter::{Budget, CELL_SLICE, PAGE_BYTES};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
+mod inline;
+pub(crate) mod pages;
 pub(crate) mod progress;
+pub(crate) use inline::digest as inline_digest;
+pub(crate) use inline::reference;
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -32,6 +36,26 @@ pub struct ArchiveRef {
 /// Staging and sealing occur in the caller transaction. A failed write must be
 /// rolled back, not committed as an applied prefix. Chunks are always <=64 KiB.
 pub async fn write_archive<R: Read>(
+    tx: &DatabaseTransaction,
+    id: &str,
+    header: &ArchiveHeader,
+    input: &mut R,
+    budget: &mut Budget,
+) -> Result<ArchiveRef> {
+    let _resident = budget.reserve(CELL_SLICE + 1)?;
+    let mut prefix = Vec::with_capacity(CELL_SLICE + 1);
+    input
+        .take((CELL_SLICE + 1) as u64)
+        .read_to_end(&mut prefix)
+        .map_err(|_| ManagementError::InvalidEvidence)?;
+    let raw = serde_json::to_string(header).map_err(|_| ManagementError::InvalidEvidence)?;
+    if prefix.len() <= CELL_SLICE && raw.len() + prefix.len() <= PAGE_BYTES {
+        return inline::write(tx, id, header, raw, prefix, budget).await;
+    }
+    write_segmented(tx, id, header, &mut prefix.as_slice().chain(input), budget).await
+}
+
+async fn write_segmented<R: Read>(
     tx: &DatabaseTransaction,
     id: &str,
     header: &ArchiveHeader,
@@ -107,6 +131,9 @@ pub(crate) async fn read_archive_raw<C: ConnectionTrait, W: Write>(
     output: &mut W,
     budget: &mut Budget,
 ) -> Result<String> {
+    if let Some(raw) = inline::read(db, reference, output, budget).await? {
+        return Ok(raw);
+    }
     budget.charge(1, 1, 0, 0)?;
     let length = if db.get_database_backend() == sea_orm::DatabaseBackend::Sqlite {
         "length(CAST(header AS BLOB))"

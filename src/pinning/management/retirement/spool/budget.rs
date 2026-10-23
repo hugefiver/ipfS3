@@ -103,6 +103,30 @@ pub struct TaskWork {
     pub pages: u64,
 }
 
+/// Only a completed local read returns its unperformed allowance. A dropped or
+/// rejected read retains prepayment; later archive CAS failure keeps measured IO.
+pub(in crate::pinning::management::retirement) async fn settle_local_read(
+    spool: &InventorySpool,
+    rows: u64,
+    bytes: u64,
+    used: TaskWork,
+) -> Result<()> {
+    let unused_rows = rows.checked_sub(used.rows).ok_or(ManagementError::Budget)?;
+    let unused_bytes = bytes
+        .checked_sub(used.bytes)
+        .ok_or(ManagementError::Budget)?;
+    let changed = spool.db.execute(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
+        "UPDATE task_budget SET rows_used=rows_used-$1,bytes_used=bytes_used-$2 WHERE id=1 AND rows_used>=$3 AND bytes_used>=$4",
+        [unused_rows, unused_bytes, rows, bytes].into_iter()
+            .map(|n| i64::try_from(n).map(Into::into).map_err(|_| ManagementError::Budget))
+            .collect::<Result<Vec<sea_orm::Value>>>()?,
+    )).await.map_err(|_| ManagementError::Database)?;
+    if changed.rows_affected() != 1 {
+        return Err(ManagementError::InvalidEvidence);
+    }
+    Ok(())
+}
+
 pub(in crate::pinning::management::retirement) async fn copy_work(
     db: &impl ConnectionTrait,
     run: &Run<'_>,

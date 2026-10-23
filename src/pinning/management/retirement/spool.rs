@@ -235,20 +235,39 @@ pub struct ArchivePart {
 }
 impl ArchivePart {
     pub(super) fn checksum(&self) -> Result<String> {
+        Ok(self.checksum_with_key(&encode(&self.key)?))
+    }
+    pub(super) fn checksum_with_key(&self, key: &str) -> String {
+        Self::checksum_parts(
+            &self.table,
+            key,
+            &self.column,
+            self.offset,
+            self.length,
+            &self.bytes,
+        )
+    }
+    pub(super) fn checksum_parts(
+        table: &str,
+        key: &str,
+        column: &str,
+        offset: u64,
+        length: Option<u64>,
+        bytes: &[u8],
+    ) -> String {
         use sha2::{Digest, Sha256};
         let mut hash = Sha256::new();
         hash.update(b"retirement-original-cell-1\0");
-        let key = encode(&self.key)?;
-        for value in [self.table.as_str(), key.as_str(), self.column.as_str()] {
+        for value in [table, key, column] {
             hash.update((value.len() as u64).to_be_bytes());
             hash.update(value.as_bytes());
         }
-        hash.update(self.offset.to_be_bytes());
-        hash.update([u8::from(self.length.is_some())]);
-        hash.update(self.length.unwrap_or(0).to_be_bytes());
-        hash.update((self.bytes.len() as u64).to_be_bytes());
-        hash.update(&self.bytes);
-        Ok(hex::encode(hash.finalize()))
+        hash.update(offset.to_be_bytes());
+        hash.update([u8::from(length.is_some())]);
+        hash.update(length.unwrap_or(0).to_be_bytes());
+        hash.update((bytes.len() as u64).to_be_bytes());
+        hash.update(bytes);
+        hex::encode(hash.finalize())
     }
     pub(super) fn check_checksum(&self, expected: &str) -> Result<()> {
         if self.checksum()? != expected {

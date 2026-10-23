@@ -667,13 +667,9 @@ async fn execute_claimed_job_with_cancellation(
 ) -> AppResult<()> {
     validate_operation_scope(&claimed.model)?;
     let admission_work = SharedDecodeBudget::default();
-    let managed = job_authority::check_before_call_with_work(
-        store.db(),
-        &claimed.model,
-        admission_work.clone(),
-    )
-    .await
-    .map_err(job_authority::safe)?;
+    let (managed, point_route) =
+        job_authority::admission_with_route(store.db(), &claimed.model, admission_work.clone())
+            .await?;
     if let Some(JobPermit::ReadOnly(authority) | JobPermit::LedgerOnly(authority)) = &managed {
         return execute_management_observation(
             store,
@@ -685,11 +681,6 @@ async fn execute_claimed_job_with_cancellation(
         )
         .await;
     }
-    let point_route = if managed.is_none() {
-        verified_job_route(store, &claimed.model).await?
-    } else {
-        None
-    };
     let legacy_admission =
         if managed.is_none() && point_route.is_none() && claimed.model.operation != "submit" {
             let result = crate::store::pinning::ledger::job_io_and_route_with_work(
@@ -1022,22 +1013,6 @@ async fn read_context_for_job_with_work<'a>(
     }
 }
 
-async fn fresh_source_allowed_with_work<C: sea_orm::ConnectionTrait>(
-    db: &C,
-    job: &pin_job::Model,
-    context: Option<&CurrentReadContext<'_>>,
-    work: crate::store::pinning::management::records::SharedDecodeBudget,
-) -> AppResult<bool> {
-    job_authority::fresh_source_allowed_view_with_work(
-        db,
-        job,
-        context.map(CurrentReadContext::config),
-        context.map(|context| context.idle_timeout_millis),
-        work,
-    )
-    .await
-}
-
 async fn current_projection_allowed(
     store: &Store,
     coordinator: &PinningCoordinator,
@@ -1045,10 +1020,14 @@ async fn current_projection_allowed(
 ) -> AppResult<bool> {
     let work = crate::store::pinning::management::records::SharedDecodeBudget::default();
     let context = read_context_for_job_with_work(store, coordinator, job, work.clone()).await?;
-    Ok(
-        job_authority::projection_allowed_with_work(store.db(), job, work.clone()).await?
-            && fresh_source_allowed_with_work(store.db(), job, context.as_ref(), work).await?,
+    job_authority::projection_and_source_allowed_with_work(
+        store.db(),
+        job,
+        context.as_ref().map(CurrentReadContext::config),
+        context.as_ref().map(|context| context.idle_timeout_millis),
+        work,
     )
+    .await
 }
 
 /// The captured route authorizes historical reads, not a new account or
@@ -1084,7 +1063,7 @@ async fn worker_job_route_matches(
     coordinator: &PinningCoordinator,
     job: &pin_job::Model,
 ) -> AppResult<bool> {
-    if let Some(route) = verified_job_route(store, job).await? {
+    if let Some(route) = job_authority::historical_route(store.db(), job).await? {
         return Ok(coordinator
             .historical_runtime_key(&job.provider, &route)
             .is_some());
@@ -1258,19 +1237,15 @@ async fn dispatch_submit(
     let txn = store.db().begin().await?;
     job_authority::lock_source_in_transaction_with_work(&txn, &claimed.model, work.clone()).await?;
     leases::lock_submit_admission_frontier(&txn, &claimed.model).await?;
-    job_authority::fence_worker_authority_with_work(&txn, &claimed.model, work.clone()).await?;
-    if !admission::managed_call_allowed_with_work(
-        &txn,
-        &claimed.model,
-        ManagedCall::Submit,
-        work.clone(),
-    )
-    .await?
-        || !fresh_source_allowed_with_work(
-            &txn,
-            &claimed.model,
-            source_context.as_ref(),
-            work.clone(),
+    let authority =
+        job_authority::fence_worker_authority_with_work(&txn, &claimed.model, work.clone()).await?;
+    if !authority
+        .call_and_source_allowed(
+            ManagedCall::Submit,
+            source_context.as_ref().map(CurrentReadContext::config),
+            source_context
+                .as_ref()
+                .map(|context| context.idle_timeout_millis),
         )
         .await?
     {
@@ -3724,7 +3699,7 @@ async fn acquire_provider_slot(
         return Ok(None);
     }
     let provider_name = &claimed.model.provider;
-    let verified = verified_job_route(store, &claimed.model).await?;
+    let verified = job_authority::historical_route(store.db(), &claimed.model).await?;
     let runtime_key = if let Some(route) = &verified {
         coordinator
             .historical_runtime_key(provider_name, route)
@@ -3845,69 +3820,6 @@ pub(crate) fn invocation_route_for_snapshot(
     Some((api, strategy))
 }
 
-async fn verified_job_route(
-    store: &Store,
-    job: &pin_job::Model,
-) -> AppResult<Option<crate::pinning::identity::ProviderRouteSnapshot>> {
-    if let Some(authority) = job_authority::lookup(store.db(), job).await.map_err(|_| {
-        AppError::InvalidPinningRequest("historical management route needs attention".into())
-    })? {
-        return Ok(Some(authority.route));
-    }
-    let (Some(lease), Some(target_id)) = (&job.lease_id, &job.target_id) else {
-        return Ok(None);
-    };
-    let Some(birth) =
-        crate::store::entities::pin_lease_requirement::contract::get(store.db(), lease).await?
-    else {
-        return Ok(None);
-    };
-    let candidates = crate::store::pinning::management::actions::points::candidates_for_cid(
-        store.db(),
-        lease,
-        &job.cid,
-        &birth,
-    )
-    .await
-    .map_err(|_| {
-        AppError::InvalidPinningRequest("invalid exact management invocation point".into())
-    })?;
-    let mut proven = None;
-    for (_, allocation, point) in candidates {
-        let Some(point) = point else {
-            continue;
-        };
-        if point.destination_target_id != *target_id || allocation != job.provider {
-            continue;
-        }
-        let target = pin_lease_target::Entity::find_by_id(target_id.clone())
-            .one(store.db())
-            .await?
-            .ok_or_else(|| {
-                AppError::InvalidPinningRequest("management invocation target is missing".into())
-            })?;
-        let captured = ledger::job_route(store.db(), &job.id)
-            .await?
-            .ok_or_else(|| {
-                AppError::InvalidPinningRequest("management invocation route is missing".into())
-            })?;
-        if target.lease_id != *lease
-            || target.provider != job.provider
-            || target.cid != job.cid
-            || !(captured == point.destination_route
-                || (point.source_allocation == point.destination_allocation
-                    && captured == point.source_resource_route))
-            || proven.is_some()
-        {
-            return Err(AppError::InvalidPinningRequest(
-                "management invocation point changed".into(),
-            ));
-        }
-        proven = Some(captured);
-    }
-    Ok(proven)
-}
-
 enum ClaimWait<T> {
     Ready(T),
     Cancelled,
@@ -3947,12 +3859,15 @@ async fn capture_managed_invocation(
             .await?;
         leases::lock_submit_admission_frontier(&tx, &claimed.model).await?;
     }
-    job_authority::fence_worker_authority_with_work(&tx, &claimed.model, work.clone()).await?;
-    if !admission::managed_call_allowed_with_work(&tx, &claimed.model, managed_call, work.clone())
+    let authority =
+        job_authority::fence_worker_authority_with_work(&tx, &claimed.model, work.clone()).await?;
+    if !authority
+        .call_and_source_allowed(
+            managed_call,
+            source_context.map(CurrentReadContext::config),
+            source_context.map(|context| context.idle_timeout_millis),
+        )
         .await?
-        || matches!(managed_call, ManagedCall::Submit)
-            && !fresh_source_allowed_with_work(&tx, &claimed.model, source_context, work.clone())
-                .await?
     {
         tx.rollback().await?;
         return Ok(InvocationPreflight::Rejected);
@@ -4081,9 +3996,6 @@ where
     // Revalidate the exact durable claim after every wait and the operation preflight,
     // immediately before reserving the rate start and beginning HTTP.
     renew_claim_once(store, claimed, lock_for).await?;
-    if !admission::managed_call_allowed(store.db(), &claimed.model, managed_call).await? {
-        return Ok(ProviderCallOutcome::PreflightRejected);
-    }
     if *slot.runtime.health.read().await == ProviderHealth::Terminal {
         return Ok(ProviderCallOutcome::Completed(
             Err(terminal_health_error()),
@@ -4093,6 +4005,12 @@ where
     if cancellation.is_cancelled() {
         return Ok(ProviderCallOutcome::Cancelled);
     }
+    let permit = job_authority::check_before_call(store.db(), &claimed.model).await?;
+    if !managed_call.allows(&claimed.model.operation, permit.as_ref()) {
+        return Ok(ProviderCallOutcome::PreflightRejected);
+    }
+    let managed_receipt = permit.is_some();
+    drop(permit);
     if !slot.runtime.min_request_interval.is_zero() {
         *rate_gate = Some(tokio::time::Instant::now() + slot.runtime.min_request_interval);
     }
@@ -4101,14 +4019,6 @@ where
     let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + heartbeat, heartbeat);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let provider = slot.provider.clone();
-    let managed_receipt = job_authority::lookup(store.db(), &claimed.model)
-        .await
-        .map_err(|_| {
-            AppError::InvalidPinningRequest(
-                "management invocation authority is invalid; needs attention".into(),
-            )
-        })?
-        .is_some();
     let capture = if managed_receipt {
         // Isolate the large source revalidation future while keeping all claim,
         // frontier, authority and route checks in the same dispatch transaction.
@@ -4867,14 +4777,15 @@ async fn postgres_completion_rejects_an_interleaved_authority_mutation() {
                 .await
                 .unwrap();
         assert!(
-            job_authority::projection_allowed_with_work(&fixture.db, &claimed.model, work.clone())
-                .await
-                .unwrap()
-        );
-        assert!(
-            fresh_source_allowed_with_work(&fixture.db, &claimed.model, context.as_ref(), work)
-                .await
-                .unwrap()
+            job_authority::projection_and_source_allowed_with_work(
+                &fixture.db,
+                &claimed.model,
+                context.as_ref().map(CurrentReadContext::config),
+                context.as_ref().map(|context| context.idle_timeout_millis),
+                work,
+            )
+            .await
+            .unwrap()
         );
         let key = crate::store::pinning::management::native::NativeKey {
             table: "pin_management_records".into(),
@@ -6427,6 +6338,21 @@ mod tests {
         .unwrap();
         assert!(candidates.originals.is_empty());
         drop(candidates);
+        assert!(
+            super::job_authority::historical_route(db, &job)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let (permit, route) = Box::pin(super::job_authority::admission_with_route(
+            db,
+            &job,
+            records::SharedDecodeBudget::default(),
+        ))
+        .await
+        .unwrap();
+        assert!(permit.is_none());
+        assert!(route.is_none());
         assert!(
             super::ledger::job_route_matches(db, &job, Some(identity))
                 .await

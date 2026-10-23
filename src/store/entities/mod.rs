@@ -3,6 +3,7 @@ pub mod bucket_cors_config;
 pub mod bucket_lifecycle_config;
 pub mod import_destination;
 pub mod import_job;
+pub mod import_job_request;
 pub mod import_job_result;
 pub mod import_job_target;
 pub mod import_prefix_claim;
@@ -391,40 +392,42 @@ mod tests {
 
         db.execute_unprepared(
             "INSERT INTO import_jobs \
-             (id, bucket, key, source_type, source_value, request_fingerprint, metadata_json, \
-              tags_json, state, phase, attempts, next_attempt_at, claim_epoch, providers_observed, \
+             (id, bucket, key, source_type, request_fingerprint, \
+              state, phase, attempts, next_attempt_at, claim_epoch, providers_observed, \
               pin_nodes_processed, pin_bytes_processed, downloaded_bytes, ipfs_add_bytes, \
               entries_processed, entries_succeeded, entries_failed, decompressed_bytes, created_at, updated_at) \
-             VALUES ('job-1', 'bucket', 'key', 'cid', 'QmSource', 'fingerprint-1', '{}', '[]', \
+             VALUES ('job-1', 'bucket', 'key', 'cid', 'fingerprint-1', \
                      'queued', 'queued', 0, CURRENT_TIMESTAMP, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
                      CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
         )
         .await
         .unwrap();
 
+        db.execute_unprepared("INSERT INTO import_job_requests(job_id,source_value,metadata_json,tags_json) VALUES ('job-1','QmSource','{}','[]')").await.unwrap();
+
         for statement in [
             "INSERT INTO import_jobs \
-             (id, bucket, key, source_type, source_value, request_fingerprint, metadata_json, tags_json, \
+             (id, bucket, key, source_type, request_fingerprint, \
               state, phase, attempts, next_attempt_at, claim_epoch, providers_observed, pin_nodes_processed, \
               pin_bytes_processed, downloaded_bytes, ipfs_add_bytes, entries_processed, entries_succeeded, \
               entries_failed, decompressed_bytes, created_at, updated_at) \
-             VALUES ('invalid-source', 'bucket', 'key-2', 'invalid', 'source', 'fingerprint-2', '{}', '[]', \
+             VALUES ('invalid-source', 'bucket', 'key-2', 'invalid', 'fingerprint-2', \
                      'queued', 'queued', 0, CURRENT_TIMESTAMP, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
                      CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
             "INSERT INTO import_jobs \
-             (id, bucket, key, source_type, source_value, request_fingerprint, metadata_json, tags_json, \
+             (id, bucket, key, source_type, request_fingerprint, \
               state, phase, attempts, next_attempt_at, claim_epoch, providers_observed, pin_nodes_processed, \
               pin_bytes_processed, downloaded_bytes, ipfs_add_bytes, entries_processed, entries_succeeded, \
               entries_failed, decompressed_bytes, created_at, updated_at) \
-             VALUES ('invalid-state', 'bucket', 'key-3', 'cid', 'source', 'fingerprint-3', '{}', '[]', \
+             VALUES ('invalid-state', 'bucket', 'key-3', 'cid', 'fingerprint-3', \
                      'invalid', 'queued', 0, CURRENT_TIMESTAMP, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
                      CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
             "INSERT INTO import_jobs \
-             (id, bucket, key, source_type, source_value, request_fingerprint, metadata_json, tags_json, \
+             (id, bucket, key, source_type, request_fingerprint, \
               state, phase, attempts, next_attempt_at, claim_epoch, providers_observed, pin_nodes_processed, \
               pin_bytes_processed, downloaded_bytes, ipfs_add_bytes, entries_processed, entries_succeeded, \
               entries_failed, decompressed_bytes, created_at, updated_at) \
-             VALUES ('invalid-phase', 'bucket', 'key-4', 'cid', 'source', 'fingerprint-4', '{}', '[]', \
+             VALUES ('invalid-phase', 'bucket', 'key-4', 'cid', 'fingerprint-4', \
                      'queued', 'invalid', 0, CURRENT_TIMESTAMP, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
                      CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
         ] {
@@ -454,11 +457,11 @@ mod tests {
 
         db.execute_unprepared(
             "INSERT INTO import_jobs \
-             (id, bucket, key, source_type, source_value, request_fingerprint, metadata_json, \
-              tags_json, state, phase, attempts, next_attempt_at, claim_epoch, providers_observed, \
+             (id, bucket, key, source_type, request_fingerprint, \
+              state, phase, attempts, next_attempt_at, claim_epoch, providers_observed, \
               pin_nodes_processed, pin_bytes_processed, downloaded_bytes, ipfs_add_bytes, \
               entries_processed, entries_succeeded, entries_failed, decompressed_bytes, created_at, updated_at) \
-             VALUES ('job-null-token', 'bucket', 'key', 'cid', 'QmSource', 'fingerprint-null-token', '{}', '[]', \
+             VALUES ('job-null-token', 'bucket', 'key', 'cid', 'fingerprint-null-token', \
                      'queued', 'queued', 0, CURRENT_TIMESTAMP, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
                      CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
         )
@@ -467,12 +470,12 @@ mod tests {
 
         db.execute_unprepared(
             "INSERT INTO import_jobs \
-             (id, bucket, key, source_type, source_value, request_fingerprint, client_token, metadata_json, \
-              tags_json, state, phase, attempts, next_attempt_at, claim_epoch, providers_observed, \
+             (id, bucket, key, source_type, request_fingerprint, client_token, \
+              state, phase, attempts, next_attempt_at, claim_epoch, providers_observed, \
               pin_nodes_processed, pin_bytes_processed, downloaded_bytes, ipfs_add_bytes, entries_processed, \
               entries_succeeded, entries_failed, decompressed_bytes, created_at, updated_at) \
-             VALUES ('job-token', 'bucket', 'token-key', 'url', 'https://example.test/object', 'fingerprint-token', \
-                     'token-1', '{}', '[]', 'queued', 'queued', 0, CURRENT_TIMESTAMP, 0, 0, 0, 0, 0, 0, 0, \
+             VALUES ('job-token', 'bucket', 'token-key', 'url', 'fingerprint-token', \
+                     'token-1', 'queued', 'queued', 0, CURRENT_TIMESTAMP, 0, 0, 0, 0, 0, 0, 0, \
                      0, 0, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
         )
         .await
@@ -480,12 +483,12 @@ mod tests {
         assert_rejected(
             &db,
             "INSERT INTO import_jobs \
-             (id, bucket, key, source_type, source_value, request_fingerprint, client_token, metadata_json, \
-              tags_json, state, phase, attempts, next_attempt_at, claim_epoch, providers_observed, \
+             (id, bucket, key, source_type, request_fingerprint, client_token, \
+              state, phase, attempts, next_attempt_at, claim_epoch, providers_observed, \
               pin_nodes_processed, pin_bytes_processed, downloaded_bytes, ipfs_add_bytes, entries_processed, \
               entries_succeeded, entries_failed, decompressed_bytes, created_at, updated_at) \
-             VALUES ('job-token-duplicate', 'bucket', 'token-key', 'url', 'https://example.test/object', \
-                     'fingerprint-token-duplicate', 'token-1', '{}', '[]', 'queued', 'queued', 0, \
+             VALUES ('job-token-duplicate', 'bucket', 'token-key', 'url', \
+                     'fingerprint-token-duplicate', 'token-1', 'queued', 'queued', 0, \
                      CURRENT_TIMESTAMP, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
         )
         .await;
@@ -582,6 +585,7 @@ mod tests {
             .unwrap();
         for table in [
             "import_prefix_claims",
+            "import_job_requests",
             "import_job_targets",
             "import_job_results",
         ] {
@@ -627,13 +631,13 @@ mod tests {
 
         db.execute_unprepared(
             "INSERT INTO import_jobs \
-             (id, bucket, key, source_type, source_value, request_fingerprint, metadata_json, \
-              tags_json, state, phase, attempts, next_attempt_at, claim_epoch, providers_observed, \
+             (id, bucket, key, source_type, request_fingerprint, \
+              state, phase, attempts, next_attempt_at, claim_epoch, providers_observed, \
               pin_nodes_processed, pin_bytes_processed, downloaded_bytes, ipfs_add_bytes, \
               entries_processed, entries_succeeded, entries_failed, decompressed_bytes, created_at, updated_at, \
               completed_at) \
-             VALUES ('job-retained', 'bucket', 'retained-key', 'cid', 'QmRetained', 'fingerprint-retained', \
-                     '{}', '[]', 'completed', 'publishing', 0, CURRENT_TIMESTAMP, 0, 0, 0, 0, 0, 0, 0, 0, \
+             VALUES ('job-retained', 'bucket', 'retained-key', 'cid', 'fingerprint-retained', \
+                     'completed', 'publishing', 0, CURRENT_TIMESTAMP, 0, 0, 0, 0, 0, 0, 0, 0, \
                      0, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
         )
         .await

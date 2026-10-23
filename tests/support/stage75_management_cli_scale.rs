@@ -264,7 +264,7 @@ pub async fn task_work(fixture: &cli::Fixture, checkpoint: &Path) -> (TaskWork, 
         auth.principal(),
         &fixture.request,
         &local,
-        &RunLimits::default(),
+        &cli_limits(),
     )
     .await
     .unwrap();
@@ -279,6 +279,15 @@ pub async fn task_work(fixture: &cli::Fixture, checkpoint: &Path) -> (TaskWork, 
     (total, export_steps)
 }
 
+pub fn cli_limits() -> RunLimits {
+    let hard = v3::files::stream::limits();
+    let mut limits = RunLimits::default();
+    limits.pages = 512;
+    limits.total_rows = hard.rows;
+    limits.total_bytes = hard.bytes;
+    limits
+}
+
 pub fn advanced(before: TaskWork, after: TaskWork) {
     assert!(
         after.rows >= before.rows && after.bytes >= before.bytes && after.pages >= before.pages
@@ -287,7 +296,7 @@ pub fn advanced(before: TaskWork, after: TaskWork) {
         after.rows > before.rows || after.bytes > before.bytes,
         "no cumulative task work advanced"
     );
-    let limits = RunLimits::default();
+    let limits = cli_limits();
     assert!(after.rows <= limits.total_rows && after.bytes <= limits.total_bytes);
     // TaskWork.pages includes accounting operations, not unique accepted pages.
 }

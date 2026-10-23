@@ -8,6 +8,9 @@ use serde_json::Value as JsonValue;
 
 use super::entities::object;
 
+#[cfg(test)]
+pub(crate) mod query_meter;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct LatestObjectRow {
     pub id: String,
@@ -301,14 +304,35 @@ pub async fn delete_latest<C: ConnectionTrait>(db: &C, bucket: &str, key: &str) 
     Ok(())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, sea_orm::FromQueryResult)]
+pub struct ListingObject {
+    pub id: String,
+    pub bucket: String,
+    pub key: String,
+    pub cid: String,
+    pub size: i64,
+    pub etag: String,
+    pub created_at: chrono::DateTime<Utc>,
+}
+
 pub async fn list<C: ConnectionTrait>(
     db: &C,
     bucket: &str,
     prefix: Option<&str>,
     continuation_token: Option<&str>,
     max_keys: u64,
-) -> AppResult<Vec<object::Model>> {
+) -> AppResult<Vec<ListingObject>> {
     let mut query = object::Entity::find()
+        .select_only()
+        .columns([
+            object::Column::Id,
+            object::Column::Bucket,
+            object::Column::Key,
+            object::Column::Cid,
+            object::Column::Size,
+            object::Column::Etag,
+            object::Column::CreatedAt,
+        ])
         .filter(object::Column::Bucket.eq(bucket))
         .filter(object::Column::IsLatest.eq(true));
 
@@ -325,6 +349,7 @@ pub async fn list<C: ConnectionTrait>(
     let objects = query
         .order_by_asc(object::Column::Key)
         .limit(max_keys)
+        .into_model::<ListingObject>()
         .all(db)
         .await?;
 

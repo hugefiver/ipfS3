@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 
 fn definitions(table: &str, source_control: &str, archive: &str) -> BTreeSet<String> {
     let definitions = match table {
+        "pin_management_archive_identity" => vec!["PRIMARY KEY (archive_id)".into()],
         "pin_management_readiness" => vec![
             "PRIMARY KEY (id)".into(),
             "CHECK ((id = 1))".into(),
@@ -36,6 +37,12 @@ fn definitions(table: &str, source_control: &str, archive: &str) -> BTreeSet<Str
             "CHECK ((ordinal >= 0))".into(),
             "CHECK ((length(payload) <= 65536))".into(),
             format!("FOREIGN KEY (archive_id) REFERENCES {archive}(archive_id)"),
+        ],
+        "pin_management_inline_archive" => vec![
+            "PRIMARY KEY (archive_id)".into(),
+            "CHECK ((format = 'S75I2'::text))".into(),
+            "CHECK (((bytes >= 0) AND (bytes <= 65536)))".into(),
+            "CHECK ((length(payload) = bytes))".into(),
         ],
         _ => vec![],
     };

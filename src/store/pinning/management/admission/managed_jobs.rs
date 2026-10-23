@@ -21,6 +21,21 @@ pub(crate) enum ManagedCall {
     Cleanup,
 }
 
+impl ManagedCall {
+    pub(crate) fn allows(self, operation: &str, permit: Option<&JobPermit>) -> bool {
+        match (permit, self) {
+            (None, _) => true,
+            (Some(JobPermit::Submit(_)), Self::Submit) => operation == "submit",
+            (
+                Some(JobPermit::Submit(_) | JobPermit::ReadOnly(_) | JobPermit::LedgerOnly(_)),
+                Self::Observe,
+            ) => true,
+            (Some(JobPermit::ExistingCleanup(_)), Self::Cleanup) => operation == "unpin",
+            _ => false,
+        }
+    }
+}
+
 pub(crate) async fn managed_call_allowed<C: ConnectionTrait>(
     db: &C,
     job: &pin_job::Model,
@@ -34,27 +49,16 @@ pub(crate) async fn managed_call_allowed_with_work<C: ConnectionTrait>(
     call: ManagedCall,
     work: records::SharedDecodeBudget,
 ) -> AppResult<bool> {
-    Ok(
-        match (
-            job_authority::check_before_call_with_work(db, job, work)
-                .await
-                .map_err(job_authority::safe)?,
-            call,
-        ) {
-            (None, _) => true, // Ordinary jobs still pass their original operation/retirement fences.
-            (Some(JobPermit::Submit(_)), ManagedCall::Submit) => job.operation == "submit",
-            (
-                Some(JobPermit::Submit(_) | JobPermit::ReadOnly(_) | JobPermit::LedgerOnly(_)),
-                ManagedCall::Observe,
-            ) => true,
-            (Some(JobPermit::ExistingCleanup(_)), ManagedCall::Cleanup) => job.operation == "unpin",
-            _ => false,
-        },
-    )
+    let permit = job_authority::check_before_call_with_work(db, job, work)
+        .await
+        .map_err(job_authority::safe)?;
+    // Ordinary jobs still pass their original operation/retirement fences.
+    Ok(call.allows(&job.operation, permit.as_ref()))
 }
 
 /// Constructible only through the record layer's complete original applied
-/// receipt validation. Its authority is re-read at every claim/heartbeat/call.
+/// receipt validation. Authority is re-read at claim, dispatch and completion;
+/// heartbeat renewal only retains the exact processing lock.
 pub struct ManagementJobScope {
     auth: records::LocalAuthorization,
     review: records::ConfirmedPlan,

@@ -14,17 +14,6 @@ mod result;
 pub(super) use archive::convert;
 use protocol::{Binding, Key, Source};
 
-pub(super) fn confirmation_time(raw: Option<&str>) -> Result<Option<DateTime<Utc>>> {
-    let Some(raw) = raw.and_then(|value| value.strip_prefix("S7B1\n")) else {
-        return Ok(None);
-    };
-    let binding: Binding = records::ReadSession::default().typed(raw)?;
-    match binding {
-        Binding::Draft((0, _, _)) => Ok(None),
-        Binding::Confirmed((1, _, _, time, _)) => Ok(Some(time)),
-        _ => Err(ManagementError::Confirmation),
-    }
-}
 pub use result::{Receipt, RecordedAction};
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,13 +47,13 @@ pub struct PlanEntry {
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct AppliedItem {
-    pub binding: PlanEntry,
+pub struct AppliedItem<E = PlanEntry> {
+    pub binding: E,
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Snapshot {
+pub struct SnapshotData<E> {
     pub observed_at: i64,
     pub database_now: Option<DateTime<Utc>>,
     pub configuration: Option<model::ConfigurationBinding>,
@@ -78,8 +67,10 @@ pub struct Snapshot {
     pub inventories: Vec<model::ProviderInventory>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub root_references: Vec<model::RootReferenceSnapshot>,
-    pub applied: Vec<AppliedItem>,
+    pub applied: Vec<AppliedItem<E>>,
 }
+
+pub type Snapshot = SnapshotData<PlanEntry>;
 
 #[derive(Serialize, Deserialize)]
 struct Core(
@@ -324,8 +315,18 @@ fn check_core(
     {
         return Err(ManagementError::Confirmation);
     }
+    let anchor = originals
+        .get(&NativeKey {
+            table: owner.head.3.0.clone(),
+            values: owner.head.3.1.clone(),
+        })
+        .ok_or(ManagementError::InvalidEvidence)?;
+    let anchor_binding = protocol::cell(anchor, "binding")?;
+    if !records::binding_matches(protocol::cell(root, "binding")?, anchor_binding) {
+        return Err(ManagementError::Confirmation);
+    }
     let binding: Binding = decode.typed(
-        protocol::cell(root, "binding")?
+        anchor_binding
             .strip_prefix("S7B1\n")
             .ok_or(ManagementError::InvalidEvidence)?,
     )?;
@@ -342,7 +343,7 @@ fn check_core(
             .items
             .iter()
             .any(|item| item.item_id == member.values[2])
-            || protocol::cell(row, "binding")? != protocol::cell(root, "binding")?
+            || !records::binding_matches(protocol::cell(row, "binding")?, anchor_binding)
             || protocol::cell(row, "native_identity")? != owner.head.1
             || protocol::cell(row, "principal")? != owner.head.2
             || native::parse_time(protocol::cell(row, "expires_at")?)? != core.5

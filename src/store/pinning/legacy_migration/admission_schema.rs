@@ -6,13 +6,19 @@ use crate::{
 };
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 
+#[path = "admission_schema_sqlite.rs"]
+mod sqlite;
+
 pub(crate) async fn admission_schema<C: ConnectionTrait>(db: &C) -> AppResult<Vec<String>> {
+    if db.get_database_backend() == DatabaseBackend::Sqlite {
+        return sqlite::classify(db, false).await;
+    }
     let versions = snapshot::schema(db, false).await?;
-    let route = native::registry()
-        .into_iter()
+    let route = native::current_catalog()
+        .iter()
         .find(|table| table.table == "pin_provider_routes")
         .expect("registered provider route catalog");
-    catalog::validate_table(db, &route)
+    catalog::validate_table(db, route)
         .await
         .map_err(|_| refused("unknown, shadowed or incomplete provider route catalog"))?;
     Ok(versions)
@@ -21,12 +27,12 @@ pub(crate) async fn admission_schema<C: ConnectionTrait>(db: &C) -> AppResult<Ve
 /// Receipt-only historical reads require a complete registered prefix, never a
 /// failed current authority load. No management history is made executable.
 pub(super) async fn receipt_schema<C: ConnectionTrait>(db: &C) -> AppResult<Vec<String>> {
+    if db.get_database_backend() == DatabaseBackend::Sqlite {
+        return sqlite::classify(db, true).await;
+    }
     let versions = admission_schema(db).await?;
     let backend = db.get_database_backend();
     let shadow = match backend {
-        DatabaseBackend::Sqlite => {
-            "SELECT 1 FROM sqlite_temp_schema WHERE name IN ('pin_legacy_migrations','pin_legacy_migration_items') OR name GLOB 'pin_management_*' OR tbl_name GLOB 'pin_management_*' LIMIT 1"
-        }
         DatabaseBackend::Postgres => {
             "SELECT 1 FROM pg_class WHERE relnamespace=pg_my_temp_schema() AND (relname IN ('pin_legacy_migrations','pin_legacy_migration_items') OR starts_with(relname,'pin_management_')) LIMIT 1"
         }
@@ -42,11 +48,7 @@ pub(super) async fn receipt_schema<C: ConnectionTrait>(db: &C) -> AppResult<Vec<
     if versions.last().map(String::as_str)
         != Some(crate::store::pinning::management::schema::VERSION)
     {
-        let partial = if backend == DatabaseBackend::Sqlite {
-            "SELECT 1 FROM sqlite_schema WHERE name GLOB 'pin_management_*' OR tbl_name GLOB 'pin_management_*' OR name GLOB 's75_*' LIMIT 1"
-        } else {
-            "SELECT 1 WHERE EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=current_schema() AND (starts_with(c.relname,'pin_management_') OR starts_with(c.relname,'s75_'))) OR EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname=current_schema() AND starts_with(p.proname,'s75_')) OR EXISTS (SELECT 1 FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=current_schema() AND starts_with(t.tgname,'s75_'))"
-        };
+        let partial = "SELECT 1 WHERE EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=current_schema() AND (starts_with(c.relname,'pin_management_') OR starts_with(c.relname,'s75_'))) OR EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname=current_schema() AND starts_with(p.proname,'s75_')) OR EXISTS (SELECT 1 FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=current_schema() AND starts_with(t.tgname,'s75_'))";
         if db
             .query_one(Statement::from_string(backend, partial))
             .await?

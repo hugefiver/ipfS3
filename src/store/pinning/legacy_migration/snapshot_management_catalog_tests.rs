@@ -875,3 +875,47 @@ async fn admission_schema_rejects_migration_and_route_shadows_and_native_route_d
         }
     }
 }
+
+#[tokio::test]
+async fn sqlite_classification_reuses_metadata_without_extra_receipt_queries() {
+    use crate::store::pinning::management::{catalog, native};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    for endpoint in ENDPOINTS.into_iter().chain([management_schema::VERSION]) {
+        let mut db = native_catalog(endpoint).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        db.set_metric_callback(move |_| {
+            observed.fetch_add(1, Ordering::Relaxed);
+        });
+        let route = native::current_catalog()
+            .iter()
+            .find(|table| table.table == "pin_provider_routes")
+            .unwrap();
+
+        let versions = super::super::schema(&db, false).await.unwrap();
+        catalog::validate_table(&db, route).await.unwrap();
+        let standalone_queries = calls.swap(0, Ordering::Relaxed);
+
+        assert_eq!(migration::admission_schema(&db).await.unwrap(), versions);
+        let admission_queries = calls.swap(0, Ordering::Relaxed);
+        assert!(
+            admission_queries < standalone_queries,
+            "{endpoint}: classification={admission_queries}, standalone={standalone_queries}"
+        );
+        assert_eq!(
+            migration::admission_schema::receipt_schema(&db)
+                .await
+                .unwrap(),
+            versions
+        );
+        assert_eq!(
+            calls.swap(0, Ordering::Relaxed),
+            admission_queries,
+            "{endpoint}"
+        );
+    }
+}

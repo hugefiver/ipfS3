@@ -313,15 +313,15 @@ async fn copy_with_budget<R, W, O>(
     remaining: &mut u64,
     entry_remaining: &mut u64,
     observer: &mut O,
+    buffer: &mut [u8],
 ) -> Result<(), CopyFailure<O::Error>>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
     O: ExtractionObserver,
 {
-    let mut buffer = vec![0u8; 64 * 1024];
     loop {
-        let read = reader.read(&mut buffer).await.map_err(CopyFailure::Io)?;
+        let read = reader.read(buffer).await.map_err(CopyFailure::Io)?;
         if read == 0 {
             return Ok(());
         }
@@ -354,6 +354,7 @@ async fn upload_entry_to_kubo<R, O>(
     remaining: &mut u64,
     entry_remaining: &mut u64,
     observer: &mut O,
+    buffer: &mut [u8],
 ) -> Result<StoredObject, EntryTransferError<O::Error>>
 where
     R: futures_io::AsyncRead + Unpin + Send,
@@ -373,6 +374,7 @@ where
             remaining,
             entry_remaining,
             observer,
+            buffer,
         )
         .await
     });
@@ -729,6 +731,7 @@ where
     let mut zip = async_zip::base::read::stream::ZipFileReader::with_tokio(source);
     let mut entries = Vec::new();
     let mut failures = Vec::new();
+    let mut copy_buffer = vec![0_u8; 64 * 1024];
 
     loop {
         // Empty entries can complete without awaiting transport or writes.
@@ -831,6 +834,7 @@ where
                         &mut remaining,
                         &mut entry_remaining,
                         observer,
+                        &mut copy_buffer,
                     )
                     .await
                 };
@@ -915,6 +919,7 @@ where
             &mut remaining,
             &mut entry_remaining,
             observer,
+            &mut copy_buffer,
         )
         .await
         {
@@ -936,6 +941,7 @@ where
                         &mut remaining,
                         &mut entry_remaining,
                         observer,
+                        &mut copy_buffer,
                     )
                     .await
                 };

@@ -16,6 +16,7 @@ use crate::pinning::decision::{
 use crate::pinning::policy::{PublicationContext, PublicationPolicy};
 use crate::pinning::tags::{ObjectTag, PinControl};
 use crate::state::AppState;
+use crate::store::entities::object;
 use crate::store::object_version::{
     BucketVersioningState, PublicVersionId, VersionKind, VersionSelector,
 };
@@ -1715,7 +1716,7 @@ pub async fn copy_object(
     .await
 }
 
-use crate::store::entities::object;
+use crate::store::object::ListingObject;
 
 struct ListingRequest<'a> {
     bucket: &'a str,
@@ -1727,7 +1728,7 @@ struct ListingRequest<'a> {
 
 #[derive(Clone, Debug)]
 enum ListingEntry {
-    Object(object::Model),
+    Object(ListingObject),
     CommonPrefix {
         prefix: String,
         continuation_key: String,
@@ -1745,11 +1746,10 @@ pub(crate) fn normalized_max_keys(value: Option<i32>) -> usize {
     value.unwrap_or(1000).clamp(1, 1000) as usize
 }
 
-async fn build_listing_page(
-    state: &Arc<AppState>,
+async fn build_listing_page<C: sea_orm::ConnectionTrait>(
+    db: &C,
     request: ListingRequest<'_>,
 ) -> S3Result<ListingPage> {
-    let db = state.store.db();
     if !crate::store::bucket::exists(db, request.bucket).await? {
         return Err(s3s::s3_error!(
             NoSuchBucket,
@@ -1764,7 +1764,13 @@ async fn build_listing_page(
         .map(str::to_owned);
     let prefix_filter = (!request.prefix.is_empty()).then_some(request.prefix);
     let delimiter = request.delimiter.filter(|value| !value.is_empty());
-    let batch_limit = (request.max_keys as u64 + 1).max(1000);
+    // Flat pages need only one lookahead row. Delimiter pages can consume many
+    // rows into one prefix, so retain larger batches for those scans.
+    let batch_limit = if delimiter.is_some() {
+        (request.max_keys as u64 + 1).max(1000)
+    } else {
+        request.max_keys as u64 + 1
+    };
     let mut builder = ListingPageBuilder::new(request.prefix, delimiter, request.max_keys);
 
     'paging: loop {
@@ -1829,19 +1835,34 @@ pub(crate) fn project_optional_listing_field(
     value.map(|value| project_listing_field(&value, url_encode))
 }
 
-async fn listing_dtos(
-    state: &Arc<AppState>,
+async fn listing_page_in_snapshot<C: sea_orm::ConnectionTrait>(
+    db: &C,
+    request: ListingRequest<'_>,
+    url_encode: bool,
+) -> S3Result<(ListingPage, Vec<Object>, Vec<CommonPrefix>)> {
+    let page = build_listing_page(db, request).await?;
+    let (contents, prefixes) = listing_dtos(db, &page.entries, url_encode).await?;
+    Ok((page, contents, prefixes))
+}
+
+async fn listing_dtos<C: sea_orm::ConnectionTrait>(
+    db: &C,
     entries: &[ListingEntry],
     url_encode: bool,
 ) -> S3Result<(Vec<Object>, Vec<CommonPrefix>)> {
     let objects = entries
         .iter()
         .filter_map(|entry| match entry {
-            ListingEntry::Object(model) => Some(model),
+            ListingEntry::Object(model) => Some(super::storage_class::ObjectIdentity {
+                id: &model.id,
+                bucket: &model.bucket,
+                key: &model.key,
+                cid: &model.cid,
+            }),
             ListingEntry::CommonPrefix { .. } => None,
         })
         .collect::<Vec<_>>();
-    let classes = super::storage_class::classes_for_objects(state.store.db(), &objects).await?;
+    let classes = super::storage_class::classes_in_snapshot(db, &objects).await?;
     let mut contents = Vec::new();
     let mut common_prefixes = Vec::new();
 
@@ -1877,8 +1898,9 @@ pub async fn list_objects(
     let encoding_type = req.input.encoding_type.clone();
     let url_encode = url_encoding_requested(encoding_type.as_ref());
     let max_keys = normalized_max_keys(req.input.max_keys);
-    let page = build_listing_page(
-        state,
+    let txn = super::storage_class::begin_read_snapshot(state.store.db()).await?;
+    let (page, contents, common_prefixes) = listing_page_in_snapshot(
+        &txn,
         ListingRequest {
             bucket: &bucket,
             prefix: prefix.as_deref().unwrap_or(""),
@@ -1886,13 +1908,14 @@ pub async fn list_objects(
             cursor: marker.as_deref(),
             max_keys,
         },
+        url_encode,
     )
     .await?;
+    txn.commit().await.map_err(crate::error::AppError::from)?;
     let next_marker = page
         .is_truncated
         .then(|| page.next_cursor.clone())
         .flatten();
-    let (contents, common_prefixes) = listing_dtos(state, &page.entries, url_encode).await?;
 
     Ok(S3Response::new(ListObjectsOutput {
         name: Some(bucket),
@@ -1928,8 +1951,9 @@ pub async fn list_objects_v2(
         .as_deref()
         .filter(|value| !value.is_empty())
         .or_else(|| start_after.as_deref().filter(|value| !value.is_empty()));
-    let page = build_listing_page(
-        state,
+    let txn = super::storage_class::begin_read_snapshot(state.store.db()).await?;
+    let (page, contents, common_prefixes) = listing_page_in_snapshot(
+        &txn,
         ListingRequest {
             bucket: &bucket,
             prefix: prefix.as_deref().unwrap_or(""),
@@ -1937,9 +1961,10 @@ pub async fn list_objects_v2(
             cursor,
             max_keys,
         },
+        url_encode,
     )
     .await?;
-    let (contents, common_prefixes) = listing_dtos(state, &page.entries, url_encode).await?;
+    txn.commit().await.map_err(crate::error::AppError::from)?;
 
     Ok(S3Response::new(ListObjectsV2Output {
         contents: Some(contents),
@@ -2004,7 +2029,7 @@ impl ListingPageBuilder {
         }
     }
 
-    fn push_row(&mut self, row: object::Model) -> PushListEntryResult {
+    fn push_row(&mut self, row: ListingObject) -> PushListEntryResult {
         let key = row.key.clone();
 
         if let Some(common_prefix) =
@@ -2063,7 +2088,7 @@ impl ListingPageBuilder {
 
 #[cfg(test)]
 fn fold_listing_rows(
-    rows: Vec<object::Model>,
+    rows: Vec<ListingObject>,
     prefix: &str,
     delimiter: Option<&str>,
     max_keys: usize,
@@ -2114,6 +2139,7 @@ mod tests {
     };
 
     mod copy_hot_receipt_tests;
+    mod metadata_listing_tests;
     mod optional_pinning_tests;
 
     async fn test_state(kubo_uri: String) -> Arc<AppState> {
@@ -4075,21 +4101,14 @@ mod tests {
         assert_eq!(destination.cid, source.cid);
     }
 
-    fn object_model(key: &str) -> object::Model {
-        object::Model {
+    fn object_model(key: &str) -> ListingObject {
+        ListingObject {
             id: "id".to_string(),
             bucket: "bucket".to_string(),
             key: key.to_string(),
             cid: "QmTest".to_string(),
             size: 0,
-            content_type: None,
             etag: "etag".to_string(),
-            metadata: None,
-            encrypted: false,
-            key_wrap: None,
-            sse_c_key_fingerprint: None,
-            multipart: false,
-            is_latest: true,
             created_at: Utc::now(),
         }
     }

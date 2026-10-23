@@ -78,7 +78,7 @@ mod tests {
     use axum::error_handling::HandleError;
     use http::StatusCode;
     use s3s::service::S3ServiceBuilder;
-    use sea_orm::{Database, EntityTrait, PaginatorTrait};
+    use sea_orm::{Database, PaginatorTrait};
 
     use super::*;
     use crate::{

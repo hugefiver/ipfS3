@@ -8,8 +8,10 @@ pub(super) async fn validate<C: ConnectionTrait>(db: &C) -> Result<()> {
         ("pin_management_locator", 3),
         ("pin_management_pending_scope", 0),
         ("pin_management_revision", 0),
-        ("pin_management_archive", 6),
+        ("pin_management_archive", 7),
         ("pin_management_archive_chunks", 6),
+        ("pin_management_inline_archive", 6),
+        ("pin_management_archive_identity", 2),
     ] {
         let count: i64 = db.query_one(Statement::from_sql_and_values(DatabaseBackend::Postgres,
             "SELECT COUNT(*) AS count FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=current_schema() AND c.relname=$1 AND NOT t.tgisinternal",
@@ -30,6 +32,54 @@ pub(super) async fn validate<C: ConnectionTrait>(db: &C) -> Result<()> {
         .try_get("", "name")
         .map_err(|_| ManagementError::Schema)?;
     for (name, table, event, condition, function, body) in [
+        (
+            "s75_archive_id_segmented",
+            "pin_management_archive",
+            "INSERT",
+            "",
+            "s75_archive_id_claim",
+            archive_identity::PG_BODY,
+        ),
+        (
+            "s75_archive_id_inline",
+            "pin_management_inline_archive",
+            "INSERT",
+            "",
+            "s75_archive_id_claim",
+            archive_identity::PG_BODY,
+        ),
+        (
+            "s75_archive_id_immutable",
+            "pin_management_archive_identity",
+            "DELETE OR UPDATE",
+            "",
+            "s75_immutable",
+            " BEGIN RAISE EXCEPTION 'immutable archive'; END ",
+        ),
+        (
+            "s75_archive_id_truncate",
+            "pin_management_archive_identity",
+            "TRUNCATE",
+            "",
+            "s75_no_truncate",
+            " BEGIN RAISE EXCEPTION 'controlled migration required'; END ",
+        ),
+        (
+            "s75_pin_management_inline_archive_truncate",
+            "pin_management_inline_archive",
+            "TRUNCATE",
+            "",
+            "s75_no_truncate",
+            " BEGIN RAISE EXCEPTION 'controlled migration required'; END ",
+        ),
+        (
+            "s75_inline_immutable",
+            "pin_management_inline_archive",
+            "DELETE OR UPDATE",
+            "",
+            "s75_immutable",
+            " BEGIN RAISE EXCEPTION 'immutable archive'; END ",
+        ),
         (
             "s75_pin_management_archive_truncate",
             "pin_management_archive",

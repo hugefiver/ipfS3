@@ -504,7 +504,15 @@ async fn same_plan_uses_approved_owner_order_and_rechecks_every_members_binding_
     .unwrap();
     let mut key = evidence::anchor_key(&confirmed).unwrap();
     assert_eq!(key.values[2], "a");
+    let shared_confirmation = native::value(source.row(&key).unwrap(), "binding").unwrap();
     key.values[2] = "z".into();
+    let item_reference = native::value(source.row(&key).unwrap(), "binding").unwrap();
+    assert!(item_reference.len() < shared_confirmation.len());
+    assert!(binding_matches(item_reference, shared_confirmation));
+    assert!(!binding_matches(
+        item_reference,
+        &format!("{shared_confirmation} ")
+    ));
     assert!(
         read_binding(
             &source,

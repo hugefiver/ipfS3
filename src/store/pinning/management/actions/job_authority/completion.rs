@@ -28,6 +28,41 @@ impl<'a> CompletionReader<'a> {
         std::ptr::eq(self.tx, tx) && std::ptr::eq(self.job, job)
     }
 
+    /// Dispatch uses this reader's complete immutable action set under the same
+    /// authority fence, while resolving the permit and source from fresh state.
+    pub(crate) async fn call_and_source_allowed(
+        &self,
+        call: ManagedCall,
+        config: Option<crate::pinning::management::local_config::ManagementConfigView<'_>>,
+        idle_timeout_millis: Option<u64>,
+    ) -> AppResult<bool> {
+        crate::store::pinning::management::schema::validate(self.tx)
+            .await
+            .map_err(safe)?;
+        let authority = lookup_from_actions(self.tx, self.job, &self.actions, self.work.clone())
+            .await
+            .map_err(safe)?;
+        let permit = check_with_authority(self.tx, self.job, authority, self.work.clone())
+            .await
+            .map_err(safe)?;
+        if !call.allows(&self.job.operation, permit.as_ref()) {
+            return Ok(false);
+        }
+        if matches!(call, ManagedCall::Submit)
+            && let Some(JobPermit::Submit(authority)) = &permit
+        {
+            return fresh_source_from_authority(
+                self.tx,
+                Some(authority),
+                config,
+                idle_timeout_millis,
+                self.work.clone(),
+            )
+            .await;
+        }
+        Ok(true)
+    }
+
     pub(crate) async fn projection_allowed(&self) -> AppResult<bool> {
         crate::store::pinning::management::schema::validate(self.tx)
             .await
@@ -61,7 +96,8 @@ impl<'a> CompletionReader<'a> {
     }
 
     /// One continuous read phase under the existing authority/lifecycle fences.
-    /// Each native predicate is resolved independently; no permit is retained.
+    /// Resolve current native authority once for this predicate; no permit is
+    /// retained between calls or across a mutation boundary.
     pub(crate) async fn projection_and_source_allowed(
         &self,
         config: Option<crate::pinning::management::local_config::ManagementConfigView<'_>>,
@@ -70,11 +106,18 @@ impl<'a> CompletionReader<'a> {
         crate::store::pinning::management::schema::validate(self.tx)
             .await
             .map_err(safe)?;
-        if !self.current_projection_allowed().await? {
-            return Ok(false);
-        }
-        self.current_source_allowed(config, idle_timeout_millis)
+        let authority = lookup_from_actions(self.tx, self.job, &self.actions, self.work.clone())
             .await
+            .map_err(safe)?;
+        projection_and_source_from_authority(
+            self.tx,
+            self.job,
+            authority,
+            config,
+            idle_timeout_millis,
+            self.work.clone(),
+        )
+        .await
     }
 
     async fn current_source_allowed(
@@ -142,6 +185,12 @@ mod tests {
                 .await
                 .unwrap();
         assert!(reader.projection_allowed().await.unwrap());
+        assert!(
+            reader
+                .call_and_source_allowed(ManagedCall::Observe, None, None)
+                .await
+                .unwrap()
+        );
         assert!(reader.fresh_source_allowed(None, None).await.unwrap());
         assert!(
             reader
@@ -153,6 +202,12 @@ mod tests {
             .await
             .unwrap();
         assert!(reader.projection_allowed().await.is_err());
+        assert!(
+            reader
+                .call_and_source_allowed(ManagedCall::Observe, None, None)
+                .await
+                .is_err()
+        );
         assert!(reader.fresh_source_allowed(None, None).await.is_err());
         assert!(
             reader

@@ -899,6 +899,7 @@ async fn worker_hash_then_actual_http_error_trailer_persists_reported_root_not_s
     source_file(&source).await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let fixture = fixture(endpoint, &source, RpcProfile::Filebase, RpcStrategy::Upload).await;
     let server = tokio::spawn(async move {
         let interaction = async move {
             let (socket, _) = listener.accept().await.unwrap();
@@ -954,7 +955,6 @@ async fn worker_hash_then_actual_http_error_trailer_persists_reported_root_not_s
             .await
             .expect("RPC trailer fixture did not receive and finish a request");
     });
-    let fixture = fixture(endpoint, &source, RpcProfile::Filebase, RpcStrategy::Upload).await;
     fixture.drain().await;
     server.await.unwrap();
     let evidence = fixture.evidence().await;

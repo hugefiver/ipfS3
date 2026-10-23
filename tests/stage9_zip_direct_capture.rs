@@ -597,6 +597,33 @@ async fn r25_p2_interrupted_mpu() -> (
         default_duration='1h'
         max_duration='30d'
         allow_decompressed=true
+
+        [pinning_identity]
+        primary_storage_domain='r25-p2-kubo'
+        [[pinning_identity.providers]]
+        config_name='alpha'
+        provider_id='r25-p2-alpha'
+        display_name='Alpha'
+        backend='noop'
+        scope='r25-p2-alpha-account'
+        storage_domain='r25-p2-alpha-storage'
+        credential_revision=1
+        endpoint_revision=1
+        api_profile='noop'
+        strategy='cid'
+        cleanup='retain'
+        [[pinning_identity.providers]]
+        config_name='beta'
+        provider_id='r25-p2-beta'
+        display_name='Beta'
+        backend='noop'
+        scope='r25-p2-beta-account'
+        storage_domain='r25-p2-beta-storage'
+        credential_revision=1
+        endpoint_revision=1
+        api_profile='noop'
+        strategy='cid'
+        cleanup='retain'
     "#,
     )
     .unwrap();
@@ -669,6 +696,7 @@ async fn r25_p2_admitted_mpu_unmatched_provider_drift() {
         .unwrap();
     current.providers[1].identity.endpoint_revision += 1;
     current.providers[1].identity.credential_revision += 1;
+    let beta = current.providers[1].name.clone();
     let io = h.kubo.received_requests().await.unwrap().len();
     let server = r25_server_with_frozen_store(&h.state, current, &zip_config).await;
     let checked = AssertUnwindSafe(async {
@@ -685,8 +713,9 @@ async fn r25_p2_admitted_mpu_unmatched_provider_drift() {
         assert_eq!(zip::read(h.state.store.db(), &id).await.unwrap().unwrap().captured_options, capture);
         assert_eq!(ipfs_s3_gateway::store::object::get_latest(h.state.store.db(), &h.bucket, "out/a/file.txt").await.unwrap().cid, "QmOutput");
         assert!(ipfs_s3_gateway::store::object::get_latest(h.state.store.db(), &h.bucket, "archive.zip").await.is_err());
-        let effect = h.state.store.db().query_one(Statement::from_string(DatabaseBackend::Sqlite,
-            "SELECT (SELECT COUNT(*) FROM pin_leases WHERE source='automatic') AS leases, (SELECT COUNT(*) FROM remote_pins WHERE provider='beta') AS beta, (SELECT COUNT(*) FROM pin_jobs WHERE provider='beta') AS jobs, (SELECT COUNT(*) FROM objects) AS objects".to_owned(),
+        let effect = h.state.store.db().query_one(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
+            "SELECT (SELECT COUNT(*) FROM pin_leases WHERE source='automatic') AS leases, (SELECT COUNT(*) FROM remote_pins WHERE provider=$1) AS beta, (SELECT COUNT(*) FROM pin_jobs WHERE provider=$1) AS jobs, (SELECT COUNT(*) FROM objects) AS objects",
+            [beta.into()],
         )).await.unwrap().unwrap();
         assert_eq!(effect.try_get::<i64>("", "leases").unwrap(), 1);
         for field in ["beta", "jobs"] { assert_eq!(effect.try_get::<i64>("", field).unwrap(), 0); }
@@ -731,12 +760,17 @@ async fn r25_p2_admitted_mpu_exact_provider_drift_preserves_capture_and_blocks_b
             if drift == "registered" {
                 let mut route = current.providers[0].route_snapshot();
                 route.credential_revision += 1;
-                h.state.store.db().execute(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
-                    "UPDATE pin_provider_routes SET snapshot=? WHERE provider='alpha'",
-                    vec![serde_json::to_string(&route).unwrap().into()],
+                let changed = h.state.store.db().execute(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
+                    "UPDATE pin_provider_routes SET snapshot=? WHERE provider=?",
+                    vec![serde_json::to_string(&route).unwrap().into(), current.providers[0].name.clone().into()],
                 )).await.unwrap();
+                assert_eq!(changed.rows_affected(), 1);
             } else if drift == "retired" {
-                h.state.store.db().execute_unprepared("UPDATE pin_provider_routes SET retired=TRUE WHERE provider='alpha'").await.unwrap();
+                let changed = h.state.store.db().execute(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
+                    "UPDATE pin_provider_routes SET retired=TRUE WHERE provider=?",
+                    [current.providers[0].name.clone().into()],
+                )).await.unwrap();
+                assert_eq!(changed.rows_affected(), 1);
             }
             let io = h.kubo.received_requests().await.unwrap().len();
             let response = request::Receipt::read(send_sigv4(reqwest::Method::POST, &server.endpoint, &h.bucket, "archive.zip",

@@ -3,11 +3,11 @@ use super::*;
 
 pub(super) async fn read(
     tx: &DatabaseTransaction,
-    table: &NativeTable,
+    table: &'static NativeTable,
     after: Option<&NativeKey>,
     part_cap: Option<usize>,
     work: &mut ReadWork,
-) -> Result<Vec<(NativeKey, Vec<ArchivePart>)>> {
+) -> Result<Vec<(NativeKey, Vec<Part>)>> {
     let metadata_rows =
         256.min(1024 * 1024 / (table.primary_key.len() * 1024 + table.columns.len() * 8));
     let metadata_rows = part_cap.map_or(metadata_rows, |cap| {
@@ -79,6 +79,7 @@ pub(super) async fn read(
         0,
         started.elapsed(),
     );
+    work.returned(metadata.len() as u64 * table.columns.len() as u64 * 8)?;
     let mut selected = Vec::new();
     let mut bytes = 0u64;
     let mut resident = 0usize;
@@ -94,6 +95,8 @@ pub(super) async fn read(
         };
         let key_bytes = key.values.iter().map(|v| v.len() as u64).sum::<u64>();
         work.keyset.bytes += key_bytes;
+        work.returned(key_bytes)?;
+        work.copied(table.table.len() as u64)?;
         if !accepting {
             continue;
         }
@@ -106,7 +109,9 @@ pub(super) async fn read(
             })
             .collect::<Result<Vec<_>>>()?;
         let size: u64 = sizes.iter().flatten().sum();
-        let footprint = encode(&key)?
+        let encoded_key = encode(&key)?;
+        work.copied(encoded_key.len() as u64)?;
+        let footprint = encoded_key
             .len()
             .checked_add(256)
             .and_then(|n| n.checked_mul(table.columns.len()))
@@ -159,6 +164,7 @@ pub(super) async fn read(
         bytes,
         started.elapsed(),
     );
+    work.returned(bytes)?;
     if rows.len() != selected.len() {
         return Err(ManagementError::Changed);
     }
@@ -170,6 +176,8 @@ pub(super) async fn read(
                     return Err(ManagementError::Changed);
                 }
             }
+            work.copied(key_owned_bytes(&key))?;
+            let shared_key = std::sync::Arc::new(key.clone());
             let parts = sizes
                 .into_iter()
                 .enumerate()
@@ -178,10 +186,10 @@ pub(super) async fn read(
                     if bytes.len() as u64 != length.unwrap_or(0) {
                         return Err(ManagementError::Changed);
                     }
-                    Ok(ArchivePart {
-                        table: table.table.clone(),
-                        key: key.clone(),
-                        column: table.columns[i].clone(),
+                    Ok(Part {
+                        table: table.table.as_str(),
+                        key: shared_key.clone(),
+                        column: table.columns[i].as_str(),
                         offset: 0,
                         length,
                         bytes,

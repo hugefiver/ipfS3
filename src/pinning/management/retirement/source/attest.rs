@@ -1,5 +1,6 @@
 //! Exact source comparison. The caller's archive CAS owns these coordinates.
 use super::*;
+mod proof;
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -29,6 +30,25 @@ pub(in crate::pinning::management::retirement) struct LocalPage {
     pub bytes: u64,
 }
 
+fn member_limit(parts: &[ArchivePart]) -> Result<usize> {
+    let catalog = native::current_catalog();
+    let mut completed = 0usize;
+    for part in parts {
+        let table = catalog
+            .binary_search_by(|table| table.table.cmp(&part.table))
+            .map(|index| &catalog[index])
+            .map_err(|_| ManagementError::InvalidEvidence)?;
+        if table.columns.last() == Some(&part.column)
+            && part.offset.checked_add(part.bytes.len() as u64) == Some(part.length.unwrap_or(0))
+        {
+            completed += 1;
+        }
+    }
+    // Keep the contiguous member prefix, including one unseen tail sentinel.
+    // A partial row contributes only when its final column is fully present.
+    Ok((completed + 1).min(257))
+}
+
 /// Bounded local IO finishes before the source writer boundary is acquired.
 pub(in crate::pinning::management::retirement) async fn local(
     spool: &InventorySpool,
@@ -52,15 +72,19 @@ pub(in crate::pinning::management::retirement) async fn local(
         u64::try_from(measured).map_err(|_| ManagementError::InvalidEvidence)?,
     )
     .await?;
-    let mut parts = Vec::new();
-    let mut bytes = 0u64;
+    let mut parts = Vec::<ArchivePart>::new();
+    let mut part_bytes = 0u64;
+    let mut checksum_key = String::new();
+    let mut checksum_key_bytes = 0u64;
     for (offset, row) in rows.into_iter().enumerate() {
         if get::<i64>(&row, "ordinal")? != cursor.ordinal + offset as i64 + 1 {
             return Err(ManagementError::Changed);
         }
+        let raw_key = get::<String>(&row, "row_key")?;
+        let checksum = get::<String>(&row, "checksum")?;
         let part = ArchivePart {
             table: get(&row, "table_name")?,
-            key: decode(&get::<String>(&row, "row_key")?)?,
+            key: decode(&raw_key)?,
             column: get(&row, "column_name")?,
             offset: u64::try_from(get::<i64>(&row, "offset")?)
                 .map_err(|_| ManagementError::InvalidEvidence)?,
@@ -70,29 +94,50 @@ pub(in crate::pinning::management::retirement) async fn local(
                 .map_err(|_| ManagementError::InvalidEvidence)?,
             bytes: get(&row, "bytes")?,
         };
-        part.check_checksum(&get::<String>(&row, "checksum")?)?;
-        bytes = bytes
-            .checked_add(encode(&part)?.len() as u64)
-            .ok_or(ManagementError::Budget)?;
-        if bytes > 8 * 1024 * 1024 {
-            return Err(ManagementError::Budget);
+        if parts.last().is_none_or(|previous| previous.key != part.key) {
+            checksum_key = encode(&part.key)?;
+            checksum_key_bytes = checksum_key_bytes
+                .checked_add(checksum_key.len() as u64)
+                .ok_or(ManagementError::Budget)?;
         }
+        if part.checksum_with_key(&checksum_key) != checksum {
+            return Err(ManagementError::Changed);
+        }
+        // The four returned integer coordinates occupy at most eight bytes
+        // each. The 8 MiB query footprint remains a resident/prepayment bound,
+        // not a claim that its padding was read or serialized.
+        part_bytes = part_bytes
+            .checked_add(
+                (part.table.len()
+                    + raw_key.len()
+                    + part.column.len()
+                    + checksum.len()
+                    + part.bytes.len()
+                    + 4 * 8) as u64,
+            )
+            .ok_or(ManagementError::Budget)?;
         parts.push(part);
     }
+    let member_limit = member_limit(&parts)?;
     let rows = spool.db.query_all(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
-        "SELECT m.table_name,CASE WHEN length(m.row_key)<=65536 THEN m.row_key END AS row_key,m.position,k.sort_key FROM members m LEFT JOIN wire_keys k ON k.table_name=m.table_name AND k.row_key=m.row_key WHERE position>$1 ORDER BY position LIMIT 257",
-        [cursor.position.into()])).await.map_err(|_|ManagementError::Database)?;
+        "SELECT m.table_name,CASE WHEN length(m.row_key)<=65536 THEN m.row_key END AS row_key,m.position,k.sort_key FROM members m LEFT JOIN wire_keys k ON k.table_name=m.table_name AND k.row_key=m.row_key WHERE position>$1 ORDER BY position LIMIT $2",
+        [cursor.position.into(), (member_limit as i64).into()])).await.map_err(|_|ManagementError::Database)?;
     let mut members = Vec::new();
+    let mut member_bytes = 0u64;
     for (offset, row) in rows.into_iter().enumerate() {
-        let key: NativeKey = decode(&get::<String>(&row, "row_key")?)?;
+        let raw_key = get::<String>(&row, "row_key")?;
+        let table = get::<String>(&row, "table_name")?;
+        let order = get::<Vec<u8>>(&row, "sort_key")?;
+        let key: NativeKey = decode(&raw_key)?;
         if get::<i64>(&row, "position")? != cursor.position + offset as i64 + 1
-            || get::<String>(&row, "table_name")? != key.table
-            || get::<Vec<u8>>(&row, "sort_key")? != super::super::spool::wire_key(&key)
+            || table != key.table
+            || order != super::super::spool::wire_key(&key)
         {
             return Err(ManagementError::Changed);
         }
-        bytes = bytes
-            .checked_add(encode(&key)?.len() as u64)
+        // Include both returned fields and the decoded membership projection.
+        member_bytes = member_bytes
+            .checked_add((2 * (table.len() + order.len() + raw_key.len()) + 8) as u64)
             .ok_or(ManagementError::Budget)?;
         members.push(key);
     }
@@ -111,6 +156,12 @@ pub(in crate::pinning::management::retirement) async fn local(
         .iter()
         .map(|row| get::<String>(row, "table_name"))
         .collect::<Result<Vec<_>>>()?;
+    let eof_bytes = eof.iter().try_fold(0usize, |bytes, table| {
+        bytes
+            .checked_add(table.len())
+            .ok_or(ManagementError::Budget)
+    })?;
+    super::super::spool::budget::copy_work(&spool.db, run, eof_bytes).await?;
     let mut expected = native::current_catalog()
         .iter()
         .map(|t| t.table.clone())
@@ -143,27 +194,53 @@ pub(in crate::pinning::management::retirement) async fn local(
     {
         return Err(ManagementError::Changed);
     }
+    super::super::spool::budget::copy_work(
+        &spool.db,
+        run,
+        usize::try_from(
+            member_bytes
+                .checked_add(checksum_key_bytes)
+                .ok_or(ManagementError::Budget)?,
+        )
+        .map_err(|_| ManagementError::Budget)?,
+    )
+    .await?;
+    super::super::spool::budget::settle_local_read(
+        spool,
+        parts.len() as u64,
+        u64::try_from(measured).map_err(|_| ManagementError::InvalidEvidence)?,
+        TaskWork {
+            rows: parts.len() as u64,
+            bytes: part_bytes,
+            pages: 0,
+        },
+    )
+    .await?;
     Ok(LocalPage {
         parts,
         members,
         eof,
-        bytes,
+        bytes: u64::try_from(measured).map_err(|_| ManagementError::InvalidEvidence)?,
     })
 }
 
 #[derive(Serialize)]
 pub(in crate::pinning::management::retirement) struct AcceptedPage {
+    format: &'static str,
     pub before: Cursor,
     pub after: Cursor,
-    pub parts: Vec<ArchivePart>,
+    #[serde(serialize_with = "proof::serialize_parts")]
+    pub parts: Vec<Part>,
     pub members: Vec<NativeKey>,
     pub eof: Vec<String>,
+    #[serde(skip)]
+    pub read_bytes: u64,
 }
 
 pub(in crate::pinning::management::retirement) async fn wire(
     spool: &InventorySpool,
     after: Option<&(String, Vec<u8>)>,
-) -> Result<(Option<(String, Vec<u8>)>, i64, Vec<u8>, bool)> {
+) -> Result<(Option<(String, Vec<u8>)>, i64, Vec<u8>, bool, TaskWork)> {
     let (predicate, values) = match after {
         Some((table, key)) => (
             "WHERE (k.table_name,k.sort_key)>($1,$2)",
@@ -177,6 +254,7 @@ pub(in crate::pinning::management::retirement) async fn wire(
     let mut next = after.cloned();
     let mut payload = Vec::new();
     let mut keys = Vec::new();
+    let mut bytes = 0u64;
     for row in &rows {
         let raw = get::<String>(row, "row_key")?;
         let key: NativeKey = decode(&raw)?;
@@ -188,11 +266,20 @@ pub(in crate::pinning::management::retirement) async fn wire(
         {
             return Err(ManagementError::Changed);
         }
+        // The joined membership copy and decoded key fit a second projection.
+        bytes = bytes
+            .checked_add(2 * (table.len() + order.len() + raw.len()) as u64)
+            .ok_or(ManagementError::Budget)?;
         next = Some((table, order));
         keys.push(key);
     }
     serde_json::to_writer(&mut payload, &keys).map_err(|_| ManagementError::InvalidEvidence)?;
-    Ok((next, rows.len() as i64, payload, rows.is_empty()))
+    let work = TaskWork {
+        rows: 2 * rows.len() as u64,
+        bytes,
+        pages: 0,
+    };
+    Ok((next, rows.len() as i64, payload, rows.is_empty(), work))
 }
 
 pub(in crate::pinning::management::retirement) async fn compare(
@@ -223,7 +310,7 @@ pub(in crate::pinning::management::retirement) async fn compare(
             let offset =
                 usize::try_from(after.partial).map_err(|_| ManagementError::InvalidEvidence)?;
             if stored.table != live.table
-                || stored.key != live.key
+                || stored.key != *live.key
                 || stored.column != live.column
                 || stored.length != live.length
                 || stored.offset.checked_add(after.partial) != Some(live.offset + consumed as u64)
@@ -273,14 +360,20 @@ pub(in crate::pinning::management::retirement) async fn compare(
         return Err(ManagementError::Changed);
     }
     Ok(AcceptedPage {
+        format: "S75-source-rows-1",
         before,
         after,
         parts: read.parts,
         members,
         eof: read.eof,
+        read_bytes: read.work.total_bytes()?,
     })
 }
 
+#[cfg(test)]
+mod accounting_tests;
+#[cfg(test)]
+mod prefetch_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,7 +409,7 @@ mod tests {
         let mut cursor = Cursor::new(checkpoint);
         let first = local(&spool, &cursor, &run).await.unwrap();
         assert_eq!(first.parts.len(), 256);
-        assert_eq!(first.members.len(), 257);
+        assert!(first.members.len() < 257);
         let mut partial = cursor.clone();
         partial.ordinal = first
             .parts
@@ -329,13 +422,82 @@ mod tests {
             512
         );
         let mut members = Vec::new();
+        let mut checked_prefetch = false;
         while !cursor.source.complete() {
             let stored = local(&spool, &cursor, &run).await.unwrap();
+            if !checked_prefetch
+                && stored
+                    .parts
+                    .first()
+                    .is_some_and(|part| part.table == "pin_resource_history")
+            {
+                let rows = spool
+                    .db
+                    .query_all(Statement::from_sql_and_values(
+                        DatabaseBackend::Sqlite,
+                        "SELECT row_key FROM members WHERE position>$1 ORDER BY position LIMIT 257",
+                        [cursor.position.into()],
+                    ))
+                    .await
+                    .unwrap();
+                let all_members = rows
+                    .iter()
+                    .map(|row| {
+                        decode::<NativeKey>(&get::<String>(row, "row_key").unwrap()).unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(all_members.len(), 257);
+                assert!(stored.members.len() < all_members.len());
+                assert!(&all_members[..stored.members.len()] == stored.members.as_slice());
+                let fetched_members = stored.members.len();
+                let saved_bytes = all_members[stored.members.len()..]
+                    .iter()
+                    .map(|key| encode(key).unwrap().len() as u64)
+                    .sum::<u64>();
+                assert!(saved_bytes > 0);
+                let original = LocalPage {
+                    parts: stored.parts.clone(),
+                    members: all_members,
+                    eof: stored.eof.clone(),
+                    bytes: stored.bytes + saved_bytes,
+                };
+                let tx = fixture.db.begin().await.unwrap();
+                let baseline = compare(&tx, cursor.clone(), original, Default::default())
+                    .await
+                    .unwrap();
+                tx.rollback().await.unwrap();
+                let tx = fixture.db.begin().await.unwrap();
+                let bounded = compare(&tx, cursor.clone(), stored, Default::default())
+                    .await
+                    .unwrap();
+                tx.rollback().await.unwrap();
+                assert!(baseline.before == bounded.before && baseline.after == bounded.after);
+                proof::assert_round_trip(&bounded);
+                assert!(
+                    baseline.parts == bounded.parts
+                        && baseline.members == bounded.members
+                        && baseline.eof == bounded.eof
+                );
+                eprintln!(
+                    "source member prefetch accepted={} fetched={fetched_members} saved_serialized_key_bytes={saved_bytes}",
+                    bounded.members.len()
+                );
+                members.extend(
+                    bounded
+                        .members
+                        .into_iter()
+                        .filter(|key| key.table == "pin_resource_history"),
+                );
+                cursor = bounded.after;
+                checked_prefetch = true;
+                continue;
+            }
             let tx = fixture.db.begin().await.unwrap();
             let accepted = compare(&tx, cursor, stored, Default::default())
                 .await
                 .unwrap();
             tx.rollback().await.unwrap();
+            proof::assert_round_trip(&accepted);
             assert_eq!(accepted.after.partial, 0);
             members.extend(
                 accepted
@@ -346,6 +508,7 @@ mod tests {
             cursor = accepted.after;
         }
         assert_eq!(members.len(), 300);
+        assert!(checked_prefetch);
         assert!(
             members
                 .iter()

@@ -14,7 +14,7 @@ use sea_orm::{ConnectionTrait, Database, EntityTrait, Set};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
-    sync::mpsc,
+    sync::{mpsc, oneshot},
 };
 
 use super::{BUCKET, seed_physical, signed_get, start_s3_server};
@@ -50,17 +50,32 @@ struct CatEvent {
 
 struct RawKuboFixture {
     endpoint: String,
+    start: Option<oneshot::Sender<()>>,
     events: mpsc::Receiver<CatEvent>,
     releases: mpsc::Sender<()>,
     task: Option<tokio::task::JoinHandle<Result<(), String>>>,
 }
 
 impl RawKuboFixture {
+    fn start_requests(&mut self) {
+        self.start
+            .take()
+            .expect("start raw Kubo requests once")
+            .send(())
+            .expect("raw Kubo task awaits completed fixture setup");
+    }
+
     async fn next_event(&mut self) -> CatEvent {
-        tokio::time::timeout(TEST_TIMEOUT, self.events.recv())
+        let event = tokio::time::timeout(TEST_TIMEOUT, self.events.recv())
             .await
-            .expect("raw Kubo must transmit the scripted data without hanging")
-            .expect("raw Kubo event channel must remain open")
+            .expect("raw Kubo must transmit the scripted data without hanging");
+        match event {
+            Some(event) => event,
+            None => {
+                self.finish().await;
+                panic!("raw Kubo script completed before its expected event");
+            }
+        }
     }
 
     async fn release_terminal(&self) {
@@ -238,6 +253,7 @@ pub(super) async fn assert_fixed_length_gets_wait_for_kubo_eof() {
     )
     .await;
 
+    raw.start_requests();
     run_clean_control(&mut raw, &server.endpoint).await;
 
     let mut plain_range = HeaderMap::new();
@@ -474,8 +490,12 @@ async fn start_raw_kubo(replies: Vec<CatReply>) -> RawKuboFixture {
     );
     let (event_tx, events) = mpsc::channel(replies.len());
     let (releases, mut release_rx) = mpsc::channel(replies.len());
+    let (start, ready) = oneshot::channel();
     let mut replies = VecDeque::from(replies);
     let task = tokio::spawn(async move {
+        ready
+            .await
+            .map_err(|_| "raw Kubo fixture setup was cancelled".to_owned())?;
         while let Some(reply) = replies.pop_front() {
             let (mut socket, _) = tokio::time::timeout(TEST_TIMEOUT, listener.accept())
                 .await
@@ -539,6 +559,7 @@ async fn start_raw_kubo(replies: Vec<CatReply>) -> RawKuboFixture {
     });
     RawKuboFixture {
         endpoint,
+        start: Some(start),
         events,
         releases,
         task: Some(task),

@@ -454,20 +454,25 @@ pub(crate) async fn lock_indexed_version<C: ConnectionTrait>(
     Ok(Some((row, resolved)))
 }
 
+/// The caller must hold the bucket ownership fence in the surrounding write
+/// transaction. That fence serializes allocation even when this key has no
+/// versions; locking historical rows cannot protect an empty key.
 pub(crate) async fn allocate_next_sequence<C: ConnectionTrait>(
     db: &C,
     bucket_name: &str,
     key: &str,
 ) -> AppResult<i64> {
-    let query = object_version::Entity::find()
+    let current_max = object_version::Entity::find()
+        .select_only()
+        .column(object_version::Column::Sequence)
         .filter(object_version::Column::Bucket.eq(bucket_name))
-        .filter(object_version::Column::Key.eq(key));
-    let rows = if db.get_database_backend() == DatabaseBackend::Postgres {
-        query.lock_exclusive().all(db).await?
-    } else {
-        query.all(db).await?
-    };
-    let current_max = rows.into_iter().map(|row| row.sequence).max().unwrap_or(0);
+        .filter(object_version::Column::Key.eq(key))
+        .order_by_desc(object_version::Column::Sequence)
+        .limit(1)
+        .into_tuple::<i64>()
+        .one(db)
+        .await?
+        .unwrap_or(0);
     current_max
         .checked_add(1)
         .ok_or_else(|| AppError::Internal("object version sequence overflow".to_owned()))
@@ -1118,6 +1123,62 @@ mod tests {
             .await,
             Err(AppError::NoSuchVersion { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn next_sequence_reads_only_the_highest_sequence_including_noncurrent_versions() {
+        let db = setup().await;
+        for sequence in [7, 3, 11] {
+            db.execute_unprepared(&format!(
+                "INSERT INTO object_versions \
+                 (id, bucket, key, version_id, kind, sequence, is_latest, created_at, updated_at, lifecycle_age_started_at) \
+                 VALUES ('seq-{sequence}', 'versioned', 'key', '{}', 'delete_marker', {sequence}, FALSE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+                Uuid::new_v4(),
+            ))
+            .await
+            .unwrap();
+        }
+        let txn = db.begin().await.unwrap();
+        bucket::lock_versioning_state(&txn, "versioned")
+            .await
+            .unwrap();
+        let meter = crate::store::object::query_meter::QueryMeter::new(&txn);
+        assert_eq!(
+            allocate_next_sequence(&meter, "versioned", "key")
+                .await
+                .unwrap(),
+            12
+        );
+        assert_eq!(meter.counts(), (1, 1));
+        assert_eq!(
+            allocate_next_sequence(&meter, "versioned", "empty")
+                .await
+                .unwrap(),
+            1
+        );
+        txn.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn next_sequence_rejects_overflow() {
+        let db = setup().await;
+        db.execute_unprepared(&format!(
+            "INSERT INTO object_versions \
+             (id, bucket, key, version_id, kind, sequence, is_latest, created_at, updated_at, lifecycle_age_started_at) \
+             VALUES ('max-sequence', 'versioned', 'key', '{}', 'delete_marker', {}, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+            Uuid::new_v4(), i64::MAX,
+        ))
+        .await
+        .unwrap();
+        let txn = db.begin().await.unwrap();
+        bucket::lock_versioning_state(&txn, "versioned")
+            .await
+            .unwrap();
+        assert!(matches!(
+            allocate_next_sequence(&txn, "versioned", "key").await,
+            Err(AppError::Internal(_))
+        ));
+        txn.rollback().await.unwrap();
     }
 
     #[tokio::test]

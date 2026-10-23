@@ -290,42 +290,43 @@ impl Evidence {
         plans: &[String],
     ) -> Result<()> {
         if crate::store::initialization::read_context::active(db).await? {
-            return self.load_upgrade_dependencies(db, plans).await;
-        }
-        let original = self.rows.clone();
-        self.budget()?.index_copy(&(plans, &self.scope))?;
-        let plans = plans.to_vec();
-        let owned_scope = self.scope.clone();
-        let work = self.work.clone();
-        let dependencies = tokio::task::spawn_blocking(move || {
-            dependencies(
-                &original,
-                &plans,
-                &owned_scope,
-                &mut *work.lock().map_err(|_| ManagementError::InvalidEvidence)?,
-            )
-        })
-        .await
-        .map_err(|_| ManagementError::InvalidEvidence)??;
-        for key in dependencies {
-            if self.rows.contains_key(&key) {
-                continue;
-            }
-            self.reuse_exact(db, &key.values[1]).await?;
-            if self.rows.contains_key(&key) {
-                continue;
-            }
-            let mut rows = self
-                .read(
-                    db,
-                    "database_scope=$1 AND plan_id=$2 AND item_id=$3 AND kind=$4",
-                    key.values.iter().cloned().map(Into::into).collect(),
+            self.load_upgrade_dependencies(db, plans).await?;
+        } else {
+            let original = self.rows.clone();
+            self.budget()?.index_copy(&(plans, &self.scope))?;
+            let plans = plans.to_vec();
+            let owned_scope = self.scope.clone();
+            let work = self.work.clone();
+            let dependencies = tokio::task::spawn_blocking(move || {
+                dependencies(
+                    &original,
+                    &plans,
+                    &owned_scope,
+                    &mut *work.lock().map_err(|_| ManagementError::InvalidEvidence)?,
                 )
-                .await?;
-            if rows.len() != 1 {
-                return Err(ManagementError::InvalidEvidence);
+            })
+            .await
+            .map_err(|_| ManagementError::InvalidEvidence)??;
+            for key in dependencies {
+                if self.rows.contains_key(&key) {
+                    continue;
+                }
+                self.reuse_exact(db, &key.values[1]).await?;
+                if self.rows.contains_key(&key) {
+                    continue;
+                }
+                let mut rows = self
+                    .read(
+                        db,
+                        "database_scope=$1 AND plan_id=$2 AND item_id=$3 AND kind=$4",
+                        key.values.iter().cloned().map(Into::into).collect(),
+                    )
+                    .await?;
+                if rows.len() != 1 {
+                    return Err(ManagementError::InvalidEvidence);
+                }
+                self.insert(key, rows.remove(0))?;
             }
-            self.insert(key, rows.remove(0))?;
         }
         let plans = self
             .rows

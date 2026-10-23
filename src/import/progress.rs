@@ -8,7 +8,7 @@ use crate::{
     error::AppResult,
     import::{
         ImportClaim, ImportExecutionError, ImportPhase, ImportProgress, ImportState,
-        execution_error::cancellation_error,
+        execution_error::{cancellation_error, ensure_active},
         pipeline::{AbortOnDropTask, JobCancellation},
     },
     kubo::KuboProgress,
@@ -20,7 +20,6 @@ enum ProgressCommand {
     Phase(ImportPhase, oneshot::Sender<Result<(), ()>>),
     DownloadTotal(Option<u64>),
     LogicalSize(u64),
-    Extraction(ExtractionProgress),
     Finish(oneshot::Sender<Result<(), ()>>),
 }
 
@@ -36,6 +35,7 @@ pub(crate) struct ProgressReporter {
     commands: mpsc::Sender<ProgressCommand>,
     pub(crate) kubo: mpsc::Sender<KuboProgress>,
     pub(crate) download: watch::Sender<u64>,
+    extraction: watch::Sender<ExtractionProgress>,
     task: AbortOnDropTask,
 }
 
@@ -50,6 +50,7 @@ impl ProgressReporter {
         let (commands, command_rx) = mpsc::channel(8);
         let (kubo, kubo_rx) = mpsc::channel(32);
         let (download, download_rx) = watch::channel(nonnegative_i64(job.downloaded_bytes));
+        let (extraction, extraction_rx) = watch::channel(ExtractionProgress::default());
         let progress = progress_from_job(job);
         let task = AbortOnDropTask::new(tokio::spawn(run_progress_consumer(
             state,
@@ -60,11 +61,13 @@ impl ProgressReporter {
             command_rx,
             kubo_rx,
             download_rx,
+            extraction_rx,
         )));
         Self {
             commands,
             kubo,
             download,
+            extraction,
             task,
         }
     }
@@ -115,12 +118,15 @@ impl ProgressReporter {
         extraction: ExtractionProgress,
         cancellation: &JobCancellation,
     ) -> Result<(), ImportExecutionError> {
-        send_progress_command(
-            &self.commands,
-            ProgressCommand::Extraction(extraction),
-            cancellation,
-        )
-        .await
+        ensure_active(cancellation)?;
+        if self.commands.is_closed() {
+            return Err(cancellation_error(cancellation));
+        }
+        // Extraction counters are cumulative. The consumer samples this slot
+        // only at flush boundaries, so byte reads do not enqueue commands or
+        // wake the DB consumer on each decompressed chunk.
+        self.extraction.send_replace(extraction);
+        Ok(())
     }
 
     pub(crate) async fn finish(
@@ -184,6 +190,7 @@ async fn run_progress_consumer(
     mut commands: mpsc::Receiver<ProgressCommand>,
     mut kubo: mpsc::Receiver<KuboProgress>,
     mut download: watch::Receiver<u64>,
+    extraction: watch::Receiver<ExtractionProgress>,
 ) {
     let mut dirty = false;
     let mut providers_this_attempt = 0_u32;
@@ -203,6 +210,7 @@ async fn run_progress_consumer(
                         drain_progress(
                             &mut kubo,
                             &download,
+                            &extraction,
                             &mut progress,
                             &mut providers_this_attempt,
                             &mut dirty,
@@ -228,25 +236,11 @@ async fn run_progress_consumer(
                         progress.logical_size = Some(progress.logical_size.unwrap_or(0).max(size));
                         dirty = true;
                     }
-                    ProgressCommand::Extraction(extraction) => {
-                        progress.entries_processed = progress
-                            .entries_processed
-                            .max(extraction.entries_processed);
-                        progress.entries_succeeded = progress
-                            .entries_succeeded
-                            .max(extraction.entries_succeeded);
-                        progress.entries_failed = progress
-                            .entries_failed
-                            .max(extraction.entries_failed);
-                        progress.decompressed_bytes = progress
-                            .decompressed_bytes
-                            .max(extraction.decompressed_bytes);
-                        dirty = true;
-                    }
                     ProgressCommand::Finish(ack) => {
                         drain_progress(
                             &mut kubo,
                             &download,
+                            &extraction,
                             &mut progress,
                             &mut providers_this_attempt,
                             &mut dirty,
@@ -276,6 +270,7 @@ async fn run_progress_consumer(
                 drain_progress(
                     &mut kubo,
                     &download,
+                    &extraction,
                     &mut progress,
                     &mut providers_this_attempt,
                     &mut dirty,
@@ -347,6 +342,7 @@ async fn flush_progress(
 fn drain_progress(
     kubo: &mut mpsc::Receiver<KuboProgress>,
     download: &watch::Receiver<u64>,
+    extraction: &watch::Receiver<ExtractionProgress>,
     progress: &mut ImportProgress,
     providers_this_attempt: &mut u32,
     dirty: &mut bool,
@@ -359,6 +355,27 @@ fn drain_progress(
     if downloaded > progress.downloaded_bytes {
         progress.downloaded_bytes = downloaded;
         *dirty = true;
+    }
+    let extraction = *extraction.borrow();
+    for (counter, latest) in [
+        (
+            &mut progress.entries_processed,
+            extraction.entries_processed,
+        ),
+        (
+            &mut progress.entries_succeeded,
+            extraction.entries_succeeded,
+        ),
+        (&mut progress.entries_failed, extraction.entries_failed),
+        (
+            &mut progress.decompressed_bytes,
+            extraction.decompressed_bytes,
+        ),
+    ] {
+        if latest > *counter {
+            *counter = latest;
+            *dirty = true;
+        }
     }
 }
 
@@ -401,3 +418,7 @@ fn progress_from_job(job: &import_job::Model) -> ImportProgress {
 fn nonnegative_i64(value: i64) -> u64 {
     u64::try_from(value).unwrap_or(0)
 }
+
+#[cfg(test)]
+#[path = "progress_tests.rs"]
+mod tests;

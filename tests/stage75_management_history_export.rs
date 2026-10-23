@@ -1,3 +1,5 @@
+#[path = "support/stage75_legacy_import.rs"]
+mod legacy_import;
 use ipfs_s3_gateway::store::{self, pinning::management::schema};
 use ipfs_s3_gateway::{
     pinning::management::{
@@ -129,9 +131,10 @@ async fn remove_storage(db: &DatabaseConnection) {
             .await
             .unwrap();
     }
+    legacy_import::restore(db).await;
     db.execute(Statement::from_sql_and_values(
         backend,
-        "DELETE FROM seaql_migrations WHERE version=$1",
+        "DELETE FROM seaql_migrations WHERE version IN ($1,'m20261017_000001_management_storage')",
         [schema::VERSION.into()],
     ))
     .await
@@ -332,7 +335,7 @@ async fn mixed_db_history_restores_original_cells_and_archive_parts_without_targ
     );
     // Check every original archive body, including normal review/membership/
     // result archives and conversion parts, at a bounded raw-byte seam.
-    let references=fixture.db.query_all(Statement::from_string(fixture.db.get_database_backend(),"SELECT archive_id,digest,bytes,chunks FROM pin_management_archive WHERE state='sealed' ORDER BY archive_id")).await.unwrap();
+    let references=fixture.db.query_all(Statement::from_string(fixture.db.get_database_backend(),"SELECT archive_id,digest,bytes,chunks FROM pin_management_archive WHERE state='sealed' UNION ALL SELECT archive_id,digest,bytes,CAST(0 AS BIGINT) AS chunks FROM pin_management_inline_archive ORDER BY archive_id")).await.unwrap();
     let mut reviews = 0;
     for (number, row) in references.into_iter().enumerate() {
         let reference = ArchiveRef {
@@ -577,6 +580,7 @@ async fn history_collection_drift_cancellation_and_truncation_never_publish_a_re
 
 #[tokio::test]
 async fn full_history_streams_more_than_old_row_and_byte_limits_with_one_budget() {
+    const ARCHIVE_BYTES: usize = 4200 * 1100;
     let db = database().await;
     let header = ArchiveHeader {
         database_scope: "original".into(),
@@ -598,9 +602,9 @@ async fn full_history_streams_more_than_old_row_and_byte_limits_with_one_budget(
             if self.remaining == 0 {
                 return Ok(0);
             }
-            let n = buf.len().min(1100);
+            let n = buf.len().min(1100).min(self.remaining);
             buf[..n].fill(0xff);
-            self.remaining -= 1;
+            self.remaining -= n;
             Ok(n)
         }
     }
@@ -609,11 +613,14 @@ async fn full_history_streams_more_than_old_row_and_byte_limits_with_one_budget(
         &tx,
         "unreferenced-history",
         &header,
-        &mut Chunks { remaining: 4097 },
+        &mut Chunks {
+            remaining: ARCHIVE_BYTES,
+        },
         &mut budget(),
     )
     .await
     .unwrap();
+    assert!(reference.chunks > 4096);
     tx.commit().await.unwrap();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("large.v3");
@@ -678,7 +685,7 @@ async fn full_history_streams_more_than_old_row_and_byte_limits_with_one_budget(
     }
     let mut sink = Sink(0);
     assert!(recovered.read_archive(&reference, &mut sink).await.unwrap() == header);
-    assert_eq!(sink.0, 4097 * 1100);
+    assert_eq!(sink.0, ARCHIVE_BYTES as u64);
     assert!(recovered.budget().peak_resident() <= 32 * 1024 * 1024);
     recovered.close().await.unwrap();
     export.close().await.unwrap();

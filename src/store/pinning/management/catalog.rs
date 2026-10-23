@@ -146,7 +146,7 @@ pub async fn validate<C: ConnectionTrait>(db: &C, tables: &[NativeTable]) -> Res
         }
     }
     reject_shadow(db, "seaql_migrations").await?;
-    constraints::validate(db).await?;
+    constraints::validate(db, tables).await?;
     immutable_history(db).await
 }
 /// Single-table catalog only: no current-schema constraints or history probes.
@@ -204,7 +204,11 @@ async fn sqlite<C: ConnectionTrait>(db: &C, table: &NativeTable) -> Result<()> {
     }
     sqlite_columns(db, table).await
 }
-async fn sqlite_columns<C: ConnectionTrait>(db: &C, table: &NativeTable) -> Result<()> {
+/// Column/PK proof only; the caller separately proves table kind and no shadow.
+pub(in crate::store::pinning) async fn sqlite_columns<C: ConnectionTrait>(
+    db: &C,
+    table: &NativeTable,
+) -> Result<()> {
     let rows=db.query_all(Statement::from_sql_and_values(DatabaseBackend::Sqlite,"SELECT name,type,\"notnull\" AS required,pk,hidden FROM pragma_table_xinfo($1) ORDER BY name",[table.table.clone().into()])).await.map_err(|_|ManagementError::Schema)?;
     if rows.len() != table.definitions.len() {
         return Err(ManagementError::Schema);

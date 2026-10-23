@@ -14,7 +14,7 @@ pub(super) struct Page {
     pub checkpoint: SourceCheckpoint,
     pub rows: u64,
     pub bytes: u64,
-    pub parts: Vec<ArchivePart>,
+    pub parts: Vec<Part>,
     pub members: Vec<(NativeKey, u64)>,
     pub eof: Vec<String>,
     pub work: ReadWork,
@@ -44,7 +44,9 @@ pub(super) async fn read(
     bytes: u64,
     control: Control,
 ) -> Result<Page> {
-    checkpoint.check(tx).await?;
+    let checked_bytes = checkpoint.check_counted(tx).await?;
+    let mut work = ReadWork::default();
+    work.returned(checked_bytes)?;
     let mut page = Page {
         checkpoint,
         rows,
@@ -52,7 +54,7 @@ pub(super) async fn read(
         parts: Vec::new(),
         members: Vec::new(),
         eof: Vec::new(),
-        work: ReadWork::default(),
+        work,
     };
     let initial_bytes = bytes;
     while page.parts.len() < 256 {
@@ -80,6 +82,7 @@ pub(super) async fn read(
                                 .ok_or(ManagementError::Budget)?;
                             page.parts.push(part);
                         }
+                        page.work.copied(key_owned_bytes(&key))?;
                         page.members.push((key.clone(), page.rows));
                         cp.after = Some(key);
                     }
@@ -90,7 +93,7 @@ pub(super) async fn read(
                 }
             }
             if cp.row.is_none() {
-                cp.row = next_key(tx, table, cp.after.as_ref(), &mut page.work.keyset).await?;
+                cp.row = next_key(tx, table, cp.after.as_ref(), &mut page.work).await?;
             }
             if let Some(key) = cp.row.as_ref() {
                 let values = cells::read(
@@ -100,7 +103,7 @@ pub(super) async fn read(
                     (cp.column, cp.offset),
                     256 - page.parts.len(),
                     1024 * 1024 - (page.bytes - initial_bytes),
-                    &mut page.work.cells,
+                    &mut page.work,
                 )
                 .await?;
                 if values.is_empty() {
@@ -126,6 +129,7 @@ pub(super) async fn read(
                     if page.rows > control.total_rows {
                         return Err(ManagementError::Budget);
                     }
+                    page.work.copied(key_owned_bytes(key))?;
                     page.members.push((key.clone(), page.rows));
                     cp.after = cp.row.take();
                     cp.column = 0;
@@ -140,7 +144,8 @@ pub(super) async fn read(
             break;
         }
     }
-    page.checkpoint.check(tx).await?;
+    let checked_bytes = page.checkpoint.check_counted(tx).await?;
+    page.work.returned(checked_bytes)?;
     Ok(page)
 }
 

@@ -57,10 +57,11 @@ pub(super) struct Projection<'a> {
     pub(super) after: Vec<TableImage>,
     pub(super) admission: R26Admission<'a>,
 }
-pub(super) const CAPTURES: [&str; 7] = [
+pub(super) const CAPTURES: [&str; 8] = [
     "pin_extension_decisions",
     "multipart_uploads",
     "import_jobs",
+    "import_job_requests",
     "zip_batches",
     "zip_v2_executions",
     "zip_v2_mpu_intakes",

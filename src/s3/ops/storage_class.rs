@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use s3s::S3Result;
 use sea_orm::{
-    AccessMode, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait,
-    IsolationLevel, QueryFilter, TransactionTrait,
+    AccessMode, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection,
+    DatabaseTransaction, EntityTrait, IsolationLevel, QueryFilter, TransactionTrait,
 };
 
 use crate::{
@@ -13,6 +13,14 @@ use crate::{
 };
 
 const LOOKUP_CHUNK_SIZE: usize = 250;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ObjectIdentity<'a> {
+    pub id: &'a str,
+    pub bucket: &'a str,
+    pub key: &'a str,
+    pub cid: &'a str,
+}
 
 pub(crate) fn require_standard_write_headers(headers: &http::HeaderMap) -> S3Result<()> {
     for value in headers.get_all("x-amz-storage-class") {
@@ -46,10 +54,26 @@ pub(super) async fn classes_for_objects(
     if objects.is_empty() {
         return Ok(HashMap::new());
     }
-    // All batched owner/residency/physical reads must see one publication
-    // snapshot. PostgreSQL's default READ COMMITTED is not sufficient here;
-    // SQLite BEGIN already retains the snapshot established by its first read.
-    let txn = if db.get_database_backend() == DatabaseBackend::Sqlite {
+    let identities = objects
+        .iter()
+        .map(|object| ObjectIdentity {
+            id: &object.id,
+            bucket: &object.bucket,
+            key: &object.key,
+            cid: &object.cid,
+        })
+        .collect::<Vec<_>>();
+    let txn = begin_read_snapshot(db).await?;
+    let classes = classes_in_snapshot(&txn, &identities).await?;
+    txn.commit().await?;
+    Ok(classes)
+}
+
+/// Listing rows and all batched owner/residency/physical reads share this
+/// snapshot. SQLite BEGIN retains its first read; PostgreSQL needs explicit
+/// REPEATABLE READ instead of its default READ COMMITTED.
+pub(super) async fn begin_read_snapshot(db: &DatabaseConnection) -> AppResult<DatabaseTransaction> {
+    Ok(if db.get_database_backend() == DatabaseBackend::Sqlite {
         db.begin().await?
     } else {
         db.begin_with_config(
@@ -57,19 +81,17 @@ pub(super) async fn classes_for_objects(
             Some(AccessMode::ReadOnly),
         )
         .await?
-    };
-    let classes = classes_in_snapshot(&txn, objects).await?;
-    txn.commit().await?;
-    Ok(classes)
+    })
 }
 
-async fn classes_in_snapshot<C: ConnectionTrait>(
+/// The caller owns the read snapshot, including the selected listing rows.
+pub(super) async fn classes_in_snapshot<C: ConnectionTrait>(
     db: &C,
-    objects: &[&object::Model],
+    objects: &[ObjectIdentity<'_>],
 ) -> AppResult<HashMap<String, ResidencyStorageClass>> {
     let mut selected = HashMap::with_capacity(objects.len());
     for &object in objects {
-        if let Some(existing) = selected.insert(object.id.clone(), object)
+        if let Some(existing) = selected.insert(object.id.to_owned(), object)
             && existing != object
         {
             return Err(corrupt("conflicting selected immutable objects"));
@@ -182,7 +204,7 @@ async fn classes_in_snapshot<C: ConnectionTrait>(
         let object = selected[&object_id];
         if residency.version_row_id != version.id
             || residency.object_id != object.id
-            || version.object_id.as_deref() != Some(object.id.as_str())
+            || version.object_id.as_deref() != Some(object.id)
             || residency.cid != object.cid
             || version.bucket != object.bucket
             || version.key != object.key
@@ -547,15 +569,33 @@ mod tests {
             )
             .await;
         }
-        let objects = object::Entity::find().all(&db).await.unwrap();
-        let refs = objects.iter().collect::<Vec<_>>();
-        let classes = classes_for_objects(&db, &refs).await.unwrap();
+        let txn = begin_read_snapshot(&db).await.unwrap();
+        let objects = store::object::list(&txn, "bucket", None, None, 300)
+            .await
+            .unwrap();
+        let identities = objects
+            .iter()
+            .map(|object| ObjectIdentity {
+                id: &object.id,
+                bucket: &object.bucket,
+                key: &object.key,
+                cid: &object.cid,
+            })
+            .collect::<Vec<_>>();
+        let meter = store::object::query_meter::QueryMeter::new(&txn);
+        let classes = classes_in_snapshot(&meter, &identities).await.unwrap();
         assert_eq!(classes.len(), 251);
+        assert!(
+            meter.counts().0 <= 6,
+            "owner/residency reads must stay batched"
+        );
+        assert_eq!(meter.counts().1, 251);
         assert!(
             classes
                 .values()
                 .all(|class| *class == ResidencyStorageClass::Standard)
         );
+        txn.commit().await.unwrap();
     }
 
     #[tokio::test]

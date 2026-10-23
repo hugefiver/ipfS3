@@ -1764,10 +1764,17 @@ pub async fn complete_multipart_upload_inner(
     } else {
         None
     };
+    let persisted_decision = crate::store::multipart::decision_from_upload(&upload)?;
     let pin_decision = if let Some(intent) = &zip_intent {
+        if persisted_decision.as_ref() != Some(intent.source_decision()) {
+            return Err(s3s::s3_error!(
+                OperationAborted,
+                "ZIP multipart capture conflict"
+            ));
+        }
         Some(intent.source_decision().clone())
     } else {
-        crate::store::multipart::decision_from_upload(&upload)?
+        persisted_decision
     };
     if zip_intent.is_none()
         && let Some(decision) = &pin_decision
@@ -1831,12 +1838,17 @@ pub async fn complete_multipart_upload_inner(
     // Resolve each client-declared part to its stored record, verifying the
     // ETag matches. Collect the (cid, size) pairs needed to build the concat
     // stream.
+    let part_numbers = completed
+        .iter()
+        .map(|part| part.part_number.expect("part_number validated above"))
+        .collect::<Vec<_>>();
+    let mut selected_parts =
+        crate::store::multipart::get_selected_parts(db, upload_id, &part_numbers).await?;
     let mut parts_to_concat: Vec<(String, i64)> = Vec::with_capacity(completed.len());
-    for cp in completed.iter() {
-        let pn = cp.part_number.ok_or_else(|| {
-            s3s::s3_error!(InvalidArgument, "part_number is required for each part")
-        })?;
-        let part = crate::store::multipart::get_part(db, upload_id, pn).await?;
+    for (cp, pn) in completed.iter().zip(part_numbers) {
+        let part = selected_parts
+            .remove(&pn)
+            .ok_or_else(|| crate::error::AppError::InvalidPart(format!("{upload_id}/{pn}")))?;
 
         if let Some(ref client_etag) = cp.e_tag
             && client_etag.value() != part.etag
@@ -1844,7 +1856,7 @@ pub async fn complete_multipart_upload_inner(
             return Err(s3s::s3_error!(InvalidPart, "etag mismatch for part {pn}"));
         }
 
-        parts_to_concat.push((part.cid.clone(), part.size));
+        parts_to_concat.push((part.cid, part.size));
     }
 
     if enc_mode == EncryptionMode::SseC {
@@ -2210,6 +2222,7 @@ pub async fn list_parts(
 
 #[cfg(test)]
 mod tests {
+    mod metadata_complete_tests;
     use super::*;
     use bytes::Bytes;
     use sea_orm::{

@@ -79,6 +79,177 @@ fn declaration(identity: &ProviderIdentity, source: &str) -> legacy_migration::D
 }
 
 #[tokio::test]
+async fn multirow_apply_and_reverse_preserve_every_native_receipt_image_and_binding() {
+    use ipfs_s3_gateway::store::entities::{
+        pin_legacy_migration as operation, pin_legacy_migration_item as item,
+    };
+    use sea_orm::{ColumnTrait, QueryFilter, QueryOrder};
+    let (db, identity) = fixture().await;
+    const ROWS: i64 = 48;
+    db.execute(Statement::from_sql_and_values(db.get_database_backend(),
+        "INSERT INTO pin_provider_usage(provider,reserved_bytes,reserved_pins) VALUES ('old',$1,$2)",
+        [(ROWS * 7).into(), ROWS.into()],
+    )).await.unwrap();
+    let mut decl = declaration(&identity, "old");
+    for index in (0..ROWS).rev() {
+        let cid = format!("cid-{index}");
+        db.execute(Statement::from_sql_and_values(db.get_database_backend(),
+            "INSERT INTO remote_pins(provider,cid,cid_size,status,epoch,last_touched_at) VALUES ('old',$1,7,'pinned',$2,'2026-10-07T00:00:00.123456789Z')",
+            [cid.clone().into(), (index + 1).into()],
+        )).await.unwrap();
+        db.execute(Statement::from_sql_and_values(db.get_database_backend(),
+            "INSERT INTO remote_pin_ledger(provider,cid,ownership,effect) VALUES ('old',$1,'application_created','unknown')",
+            [cid.clone().into()],
+        )).await.unwrap();
+        for table in ["remote_pins", "remote_pin_ledger"] {
+            add_binding(
+                &mut decl,
+                table,
+                json!({"provider":"old", "cid":cid}),
+                None,
+                None,
+            );
+        }
+    }
+    let plan = legacy_migration::inventory(&db, &decl).await.unwrap();
+    let receipt = legacy_migration::apply(&db, &decl, &plan).await.unwrap();
+    assert_eq!(receipt.id, plan.operation_id);
+    assert_eq!(
+        legacy_migration::apply(&db, &decl, &plan).await.unwrap(),
+        receipt
+    );
+    let items = item::Entity::find()
+        .filter(item::Column::OperationId.eq(&receipt.id))
+        .order_by_asc(item::Column::Ordinal)
+        .all(&db)
+        .await
+        .unwrap();
+    let committed = operation::Entity::find_by_id(receipt.id.clone())
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<legacy_migration::Confirmation>(&committed.confirmation).unwrap(),
+        plan
+    );
+    assert_eq!(
+        items.len(),
+        plan.before
+            .iter()
+            .map(|image| image.rows.len().max(1))
+            .sum::<usize>()
+    );
+    let mut ordinal = 0;
+    for image in &plan.before {
+        let after = plan
+            .after
+            .iter()
+            .find(|after| after.table == image.table)
+            .unwrap();
+        let original_rows = if image.rows.is_empty() {
+            vec![None]
+        } else {
+            image.rows.iter().map(Some).collect()
+        };
+        for row in original_rows {
+            let stored = &items[ordinal];
+            assert_eq!(stored.table_kind, image.table);
+            assert_eq!(
+                serde_json::from_str::<Option<legacy_migration::NativeRow>>(&stored.before_image)
+                    .unwrap()
+                    .as_ref(),
+                row
+            );
+            let key: std::collections::BTreeMap<String, String> = row
+                .into_iter()
+                .flat_map(|row| {
+                    image.primary_key.iter().filter_map(move |column| {
+                        row.get(column)
+                            .and_then(|v| v.as_ref())
+                            .map(|v| (column.clone(), v.clone()))
+                    })
+                })
+                .collect();
+            assert_eq!(
+                serde_json::from_str::<std::collections::BTreeMap<String, String>>(
+                    &stored.original_key
+                )
+                .unwrap(),
+                key
+            );
+            let expected_bindings: Vec<_> = decl
+                .namespaces
+                .iter()
+                .flat_map(|ns| &ns.bindings)
+                .filter(|binding| binding.table == image.table && binding.key == key)
+                .cloned()
+                .collect();
+            assert_eq!(
+                serde_json::from_str::<Vec<legacy_migration::Binding>>(&stored.bindings).unwrap(),
+                expected_bindings
+            );
+            let mut after_key = key;
+            if matches!(
+                image.table.as_str(),
+                "remote_pins" | "remote_pin_ledger" | "pin_provider_usage"
+            ) {
+                after_key.insert("provider".into(), identity.allocation_key());
+            }
+            let expected_after = after.rows.iter().find(|row| {
+                after_key
+                    .iter()
+                    .all(|(column, value)| row.get(column).and_then(|v| v.as_ref()) == Some(value))
+            });
+            assert_eq!(
+                serde_json::from_str::<Option<legacy_migration::NativeRow>>(&stored.after_image)
+                    .unwrap()
+                    .as_ref(),
+                expected_after
+            );
+            ordinal += 1;
+        }
+    }
+    let reverse = legacy_migration::rollback(&db, &receipt.id, &plan)
+        .await
+        .unwrap();
+    assert_eq!(reverse.reverses.as_deref(), Some(receipt.id.as_str()));
+    let reverse_items = item::Entity::find()
+        .filter(item::Column::OperationId.eq(&reverse.id))
+        .order_by_asc(item::Column::Ordinal)
+        .all(&db)
+        .await
+        .unwrap();
+    assert_eq!(reverse_items.len(), items.len());
+    for (original, reverse) in items.iter().zip(&reverse_items) {
+        assert_eq!(reverse.original_key, original.original_key);
+        assert_eq!(reverse.bindings, original.bindings);
+        assert_eq!(reverse.before_image, original.after_image);
+        assert_eq!(reverse.after_image, original.before_image);
+    }
+    assert_eq!(
+        legacy_migration::rollback(&db, &receipt.id, &plan)
+            .await
+            .unwrap(),
+        reverse
+    );
+    assert_eq!(
+        quota::read_usage(&db, "old")
+            .await
+            .unwrap()
+            .unwrap()
+            .reserved_bytes,
+        ROWS * 7
+    );
+    let remotes = ipfs_s3_gateway::store::entities::remote_pin::Entity::find()
+        .all(&db)
+        .await
+        .unwrap();
+    assert_eq!(remotes.len(), ROWS as usize);
+    assert!(remotes.iter().all(|row| row.provider == "old"));
+}
+
+#[tokio::test]
 async fn usage_debt_moves_once_and_rollback_is_db_receipted() {
     let (db, identity) = fixture().await;
     db.execute_unprepared(
@@ -428,6 +599,41 @@ async fn receipt_insert_failure_rolls_back_every_business_image() {
         .await
         .unwrap();
     legacy_migration::apply(&db, &decl, &plan).await.unwrap();
+}
+
+#[tokio::test]
+async fn final_native_image_drift_rolls_back_apply_and_reverse_without_receipts() {
+    let (db, identity) = fixture().await;
+    seed_usage(&db).await;
+    let decl = declaration(&identity, "old");
+    let plan = legacy_migration::inventory(&db, &decl).await.unwrap();
+    db.execute_unprepared("CREATE TRIGGER r26_native_drift AFTER INSERT ON pin_provider_usage BEGIN INSERT INTO pin_resource_history(provider,cid,epoch,ledger) VALUES ('unrelated','trigger',1,'{}'); END").await.unwrap();
+    assert!(legacy_migration::apply(&db, &decl, &plan).await.is_err());
+    let current = legacy_migration::inventory(&db, &decl).await.unwrap();
+    assert_eq!(current.before, plan.before);
+    assert_eq!(current.receipt_frontier, plan.receipt_frontier);
+    db.execute_unprepared("DROP TRIGGER r26_native_drift")
+        .await
+        .unwrap();
+    let receipt = legacy_migration::apply(&db, &decl, &plan).await.unwrap();
+    db.execute_unprepared("CREATE TRIGGER r26_native_drift AFTER INSERT ON pin_provider_usage BEGIN INSERT INTO pin_resource_history(provider,cid,epoch,ledger) VALUES ('unrelated','trigger',1,'{}'); END").await.unwrap();
+    assert!(
+        legacy_migration::rollback(&db, &receipt.id, &plan)
+            .await
+            .is_err()
+    );
+    let rollback_plan = legacy_migration::rollback_inventory(&db, &receipt.id, &decl)
+        .await
+        .unwrap();
+    assert_eq!(rollback_plan.after, plan.after);
+    assert_eq!(rollback_plan.before, plan.before);
+    assert!(old_usage_is_absent(&db).await);
+    db.execute_unprepared("DROP TRIGGER r26_native_drift")
+        .await
+        .unwrap();
+    legacy_migration::rollback(&db, &receipt.id, &plan)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

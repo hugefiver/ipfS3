@@ -11,7 +11,7 @@ use rcgen::{
     KeyUsagePurpose,
 };
 use rustls::pki_types::PrivateKeyDer;
-use sea_orm::{Database, EntityTrait};
+use sea_orm::Database;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;

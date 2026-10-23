@@ -177,7 +177,7 @@ impl PgFixture {
     }
 }
 
-async fn legacy_fixture() -> Option<PgFixture> {
+async fn empty_fixture() -> Option<PgFixture> {
     let Ok(url) = std::env::var("IPFS_S3_TEST_POSTGRES_URL") else {
         eprintln!("skipping PostgreSQL object-versioning test: IPFS_S3_TEST_POSTGRES_URL is unset");
         return None;
@@ -193,7 +193,19 @@ async fn legacy_fixture() -> Option<PgFixture> {
     db.execute_unprepared(&format!("SET search_path TO {schema}"))
         .await
         .unwrap();
-    PreObjectVersioningMigrator::up(&db, None).await.unwrap();
+
+    Some(PgFixture {
+        db,
+        schema,
+        url,
+        cleanup_guard,
+    })
+}
+
+async fn legacy_fixture() -> Option<PgFixture> {
+    let fixture = empty_fixture().await?;
+    let db = &fixture.db;
+    PreObjectVersioningMigrator::up(db, None).await.unwrap();
     db.execute_unprepared("INSERT INTO buckets (name) VALUES ('versioning-bucket')")
         .await
         .unwrap();
@@ -210,25 +222,34 @@ async fn legacy_fixture() -> Option<PgFixture> {
     ] {
         db.execute_unprepared(statement).await.unwrap();
     }
-    Some(PgFixture {
-        db,
-        schema,
-        url,
-        cleanup_guard,
-    })
-}
-
-async fn migrated_fixture() -> Option<PgFixture> {
-    let fixture = legacy_fixture().await?;
-    store::run_migrations(&fixture.db).await.unwrap();
     Some(fixture)
 }
 
-async fn assert_rejected(db: &DatabaseConnection, statement: &str) {
-    assert!(
-        db.execute_unprepared(statement).await.is_err(),
-        "PostgreSQL accepted invalid object-versioning input: {statement}"
-    );
+async fn versioning_migration_fixture() -> Option<PgFixture> {
+    let fixture = legacy_fixture().await?;
+    m20260825_000001_object_versioning::Migration
+        .up(&SchemaManager::new(&fixture.db))
+        .await
+        .unwrap();
+    Some(fixture)
+}
+
+async fn current_fixture() -> Option<PgFixture> {
+    let fixture = empty_fixture().await?;
+    store::run_migrations(&fixture.db).await.unwrap();
+    store::bucket::create(&fixture.db, "versioning-bucket", None)
+        .await
+        .unwrap();
+    Some(fixture)
+}
+
+async fn assert_check_rejected(db: &DatabaseConnection, statement: &str, constraint: &str) {
+    let error = db.execute_unprepared(statement).await.unwrap_err();
+    let DbErr::Exec(sea_orm::RuntimeErr::SqlxError(sqlx::Error::Database(error))) = error else {
+        panic!("expected a PostgreSQL check-constraint violation");
+    };
+    assert_eq!(error.code().as_deref(), Some("23514"));
+    assert_eq!(error.constraint(), Some(constraint));
 }
 
 async fn table_exists(db: &DatabaseConnection, table: &str) -> bool {
@@ -449,7 +470,10 @@ fn exact_put_object_tagging_request(
         uri: format!("/{bucket}/{key}?tagging").parse().unwrap(),
         headers: HeaderMap::new(),
         extensions: http::Extensions::new(),
-        credentials: None,
+        credentials: Some(s3s::auth::Credentials {
+            access_key: "test".to_owned(),
+            secret_key: s3s::auth::SecretKey::from("test"),
+        }),
         region: None,
         service: None,
         trailing_headers: None,
@@ -495,7 +519,7 @@ async fn parallel_publish(
 
 #[tokio::test]
 async fn postgres_object_versioning_migration_adds_status_table_indexes_and_checks() {
-    let Some(fixture) = migrated_fixture().await else {
+    let Some(fixture) = versioning_migration_fixture().await else {
         return;
     };
     let columns = fixture
@@ -505,9 +529,8 @@ async fn postgres_object_versioning_migration_adds_status_table_indexes_and_chec
             "SELECT table_name, column_name, data_type \
              FROM information_schema.columns \
              WHERE table_schema = current_schema() \
-                AND (table_name = 'buckets' AND column_name = 'versioning_status' \
-                     OR (table_name = 'object_versions' \
-                         AND column_name NOT IN ('lifecycle_age_started_at', 'became_noncurrent_at'))) \
+                 AND (table_name = 'buckets' AND column_name = 'versioning_status' \
+                      OR table_name = 'object_versions') \
              ORDER BY table_name, ordinal_position",
         ))
         .await
@@ -607,17 +630,19 @@ async fn postgres_object_versioning_migration_adds_status_table_indexes_and_chec
             "missing PostgreSQL index {index}"
         );
     }
-    assert_rejected(
+    assert_check_rejected(
         &fixture.db,
         "UPDATE buckets SET versioning_status = 'enabled' WHERE name = 'versioning-bucket'",
+        "ck_buckets_versioning_status",
     )
     .await;
-    assert_rejected(
+    assert_check_rejected(
         &fixture.db,
         "INSERT INTO object_versions \
-         (id, bucket, key, version_id, kind, object_id, sequence, is_latest, created_at, updated_at, lifecycle_age_started_at) \
+         (id, bucket, key, version_id, kind, object_id, sequence, is_latest, created_at, updated_at) \
          VALUES ('invalid-marker', 'versioning-bucket', 'invalid', NULL, 'delete_marker', \
-                 'current-a', 1, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+                 'current-a', 1, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        "ck_object_versions_kind_object",
     )
     .await;
     fixture.cleanup().await;
@@ -625,7 +650,7 @@ async fn postgres_object_versioning_migration_adds_status_table_indexes_and_chec
 
 #[tokio::test]
 async fn postgres_object_versioning_backfills_only_legacy_latest_as_hidden_null() {
-    let Some(fixture) = migrated_fixture().await else {
+    let Some(fixture) = versioning_migration_fixture().await else {
         return;
     };
     let rows = fixture
@@ -675,7 +700,7 @@ async fn postgres_object_versioning_backfills_only_legacy_latest_as_hidden_null(
 
 #[tokio::test]
 async fn postgres_object_versioning_backfill_count_must_match() {
-    let Some(fixture) = migrated_fixture().await else {
+    let Some(fixture) = versioning_migration_fixture().await else {
         return;
     };
     let selected: i64 = fixture
@@ -740,15 +765,15 @@ async fn postgres_object_versioning_down_refuses_public_state_versions_and_marke
     for public_state_statement in [
         "UPDATE buckets SET versioning_status = 'Enabled' WHERE name = 'versioning-bucket'",
         "INSERT INTO object_versions \
-         (id, bucket, key, version_id, kind, object_id, sequence, is_latest, created_at, updated_at, lifecycle_age_started_at) \
+         (id, bucket, key, version_id, kind, object_id, sequence, is_latest, created_at, updated_at) \
          VALUES ('public-version', 'versioning-bucket', 'public', 'opaque-version', 'object', \
-                 'current-a', 1, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+                  'current-a', 1, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
         "INSERT INTO object_versions \
-         (id, bucket, key, version_id, kind, object_id, sequence, is_latest, created_at, updated_at, lifecycle_age_started_at) \
-         VALUES ('public-marker', 'versioning-bucket', 'marker', NULL, 'delete_marker', NULL, \
-                 1, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+         (id, bucket, key, version_id, kind, object_id, sequence, is_latest, created_at, updated_at) \
+          VALUES ('public-marker', 'versioning-bucket', 'marker', NULL, 'delete_marker', NULL, \
+                  1, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
     ] {
-        let Some(fixture) = migrated_fixture().await else {
+        let Some(fixture) = versioning_migration_fixture().await else {
             return;
         };
         fixture
@@ -770,7 +795,7 @@ async fn postgres_object_versioning_down_refuses_public_state_versions_and_marke
 
 #[tokio::test]
 async fn postgres_parallel_publish_delete_tag_serializes_without_deadlock() {
-    let Some(fixture) = migrated_fixture().await else {
+    let Some(fixture) = current_fixture().await else {
         return;
     };
     let second = fixture.independent_connection().await;
@@ -1024,7 +1049,7 @@ async fn postgres_parallel_publish_delete_tag_serializes_without_deadlock() {
 
 #[tokio::test]
 async fn postgres_synchronized_publish_exact_delete_tag_serializes_without_deadlock() {
-    let Some(fixture) = migrated_fixture().await else {
+    let Some(fixture) = current_fixture().await else {
         return;
     };
     let publisher = fixture.independent_connection().await;
@@ -1165,7 +1190,11 @@ async fn postgres_synchronized_publish_exact_delete_tag_serializes_without_deadl
         .as_ref()
         .err()
         .is_some_and(|error| error.code().as_str() == "NoSuchVersion");
-    assert!(tag_succeeded || tag_no_such_version);
+    assert!(
+        tag_succeeded || tag_no_such_version,
+        "unexpected tagging error: {:?}",
+        tag_result.as_ref().err()
+    );
     assert!(!tag_no_such_version || deletion_succeeded);
     if let Ok(response) = &tag_result {
         assert_eq!(
@@ -1311,7 +1340,7 @@ async fn postgres_synchronized_publish_exact_delete_tag_serializes_without_deadl
 
 #[tokio::test]
 async fn postgres_suspended_null_replacement_preserves_opaque_versions() {
-    let Some(fixture) = migrated_fixture().await else {
+    let Some(fixture) = current_fixture().await else {
         return;
     };
     let key = "suspended-aws-parity";
@@ -1571,7 +1600,7 @@ async fn postgres_http_marker_restore_then_suspended_replacement_preserves_all_v
     const CID_TWO: &str = "QmPgHttpMarkerRestoreTwo";
     const CID_THREE: &str = "QmPgHttpMarkerRestoreThree";
 
-    let Some(fixture) = migrated_fixture().await else {
+    let Some(fixture) = current_fixture().await else {
         return;
     };
     let kubo = start_kubo_harness(KuboScript {

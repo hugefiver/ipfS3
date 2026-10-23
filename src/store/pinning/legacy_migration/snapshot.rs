@@ -2,11 +2,11 @@
 use super::{MAX_BYTES, MAX_ROWS, SCHEMA, TableImage, refused};
 use crate::{error::AppResult, store::entities::*};
 use sea_orm::{
-    ConnectionTrait, DatabaseBackend, EntityTrait, Iterable, PrimaryKeyToColumn, Statement,
-    sea_query::Iden,
+    ConnectionTrait, DatabaseBackend, EntityTrait, Iterable, PrimaryKeyToColumn, QueryResult,
+    Statement, sea_query::Iden,
 };
 use sea_orm_migration::MigratorTrait;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 const STAGE5: &str = "m20261004_000001_rpc_submission_ledger";
 const STAGE6: &str = "m20261004_000002_cluster_replica_contract";
@@ -14,7 +14,7 @@ const ZIP_CAPTURE: &str = "m20261008_000001_zip_intent_capture";
 const MANAGEMENT: &str = crate::store::pinning::management::schema::VERSION;
 
 #[path = "snapshot_management.rs"]
-mod management_catalog;
+pub(super) mod management_catalog;
 
 fn entity<E: EntityTrait + Default>() -> TableImage {
     let mut columns: Vec<_> = E::Column::iter().map(|c| Iden::to_string(&c)).collect();
@@ -97,6 +97,11 @@ pub(super) fn tables(versions: &[String]) -> Vec<TableImage> {
         ),
     ];
     if versions.iter().any(|version| version == MANAGEMENT) {
+        let cold = import_job::Column::iter().filter(|column| column.is_request())
+            .map(|column| Iden::to_string(&column)).collect::<BTreeSet<_>>();
+        tables.iter_mut().find(|table| table.table == "import_jobs").expect("import jobs snapshot")
+            .columns.retain(|name| !cold.contains(name));
+        tables.push(entity::<import_job_request::Entity>());
         tables.extend([
             raw(
                 "pin_management_records",
@@ -124,24 +129,7 @@ pub(super) async fn schema<C: ConnectionTrait>(db: &C, writing: bool) -> AppResu
         .iter()
         .map(|r| r.try_get("", "version"))
         .collect::<Result<_, _>>()?;
-    let known: Vec<String> = crate::store::migrator::Migrator::migrations()
-        .iter()
-        .map(|m| m.name().to_owned())
-        .collect();
-    // Registered prefixes must end at an explicitly supported catalog shape.
-    if !matches!(
-        actual.last().map(String::as_str),
-        Some(STAGE5 | STAGE6 | SCHEMA | ZIP_CAPTURE | MANAGEMENT)
-    ) || actual != known[..actual.len().min(known.len())]
-        || actual.len() > known.len()
-    {
-        return Err(refused("unknown or incomplete schema"));
-    }
-    if writing && !actual.iter().any(|v| v == SCHEMA) {
-        return Err(refused(
-            "upgrade schema through normal gateway migration before apply",
-        ));
-    }
+    validate_versions(&actual, writing)?;
     if actual.iter().any(|v| v == SCHEMA) {
         super::receipt_schema::validate(db).await?;
     } else {
@@ -151,17 +139,41 @@ pub(super) async fn schema<C: ConnectionTrait>(db: &C, writing: bool) -> AppResu
     Ok(actual)
 }
 
+pub(super) fn validate_versions(actual: &[String], writing: bool) -> AppResult<()> {
+    let known: Vec<String> = crate::store::migrator::Migrator::migrations()
+        .iter()
+        .map(|m| m.name().to_owned())
+        .collect();
+    // Registered prefixes must end at an explicitly supported catalog shape.
+    if !matches!(
+        actual.last().map(String::as_str),
+        Some(STAGE5 | STAGE6 | SCHEMA | ZIP_CAPTURE | MANAGEMENT)
+    ) || actual != &known[..actual.len().min(known.len())]
+        || actual.len() > known.len()
+    {
+        return Err(refused("unknown or incomplete schema"));
+    }
+    if writing && !actual.iter().any(|v| v == SCHEMA) {
+        return Err(refused(
+            "upgrade schema through normal gateway migration before apply",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) async fn read<C: ConnectionTrait>(
     db: &C,
     versions: &[String],
 ) -> AppResult<Vec<TableImage>> {
-    let backend = db.get_database_backend();
+    check_encoding(db).await?;
     let stage6 = versions.iter().any(|v| v == STAGE6);
     let zip_capture = versions.iter().any(|v| v == ZIP_CAPTURE);
-    let mut result = Vec::new();
+    let shapes = tables(versions);
+    let mut catalog = columns(db, &shapes).await?;
+    let mut result = Vec::with_capacity(shapes.len());
     let mut count = 0;
     let mut bytes = 0;
-    for mut table in tables(versions) {
+    for mut table in shapes {
         match (table.table.as_str(), zip_capture) {
             ("multipart_uploads" | "import_jobs", false) => {
                 table.columns.retain(|c| c != "zip_intent_json");
@@ -177,21 +189,7 @@ pub(super) async fn read<C: ConnectionTrait>(
                 table.table.as_str(),
                 "pin_replica_observations" | "pin_lease_requirements"
             );
-        let sql = if backend == DatabaseBackend::Sqlite {
-            "SELECT name AS column_name FROM pragma_table_info($1) ORDER BY name"
-        } else {
-            "SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name=$1 ORDER BY column_name"
-        };
-        let columns: Vec<String> = db
-            .query_all(Statement::from_sql_and_values(
-                backend,
-                sql,
-                [table.table.clone().into()],
-            ))
-            .await?
-            .iter()
-            .map(|r| r.try_get("", "column_name"))
-            .collect::<Result<_, _>>()?;
+        let columns = catalog.remove(&table.table).unwrap_or_default();
         if expected_missing {
             if !columns.is_empty() {
                 return Err(refused("unexpected closure table for historical schema"));
@@ -203,39 +201,14 @@ pub(super) async fn read<C: ConnectionTrait>(
         if columns != table.columns {
             return Err(refused("unknown columns or missing closure table"));
         }
-        let fields = columns
-            .iter()
-            .map(|c| format!("CAST(\"{c}\" AS TEXT) AS \"{c}\""))
-            .collect::<Vec<_>>()
-            .join(",");
-        let order = table
-            .primary_key
-            .iter()
-            .map(|c| format!("\"{c}\""))
-            .collect::<Vec<_>>()
-            .join(",");
-        let rows = db
-            .query_all(Statement::from_string(
-                backend,
-                format!(
-                    "SELECT {fields} FROM \"{}\" ORDER BY {order} LIMIT {}",
-                    table.table,
-                    MAX_ROWS + 1
-                ),
-            ))
-            .await?;
+        let (rows, table_bytes) =
+            read_rows(db, &table, MAX_ROWS - count, MAX_BYTES - bytes).await?;
         count += rows.len();
-        if count > MAX_ROWS {
-            return Err(refused("complete inventory exceeds row budget"));
-        }
+        bytes += table_bytes;
         for row in rows {
             let mut native = super::NativeRow::new();
-            for column in &columns {
+            for column in &table.columns {
                 let value: Option<String> = row.try_get("", column)?;
-                bytes += value.as_ref().map_or(0, String::len) + column.len();
-                if bytes > MAX_BYTES {
-                    return Err(refused("complete inventory exceeds byte budget"));
-                }
                 native.insert(column.clone(), value);
             }
             table.rows.push(native);
@@ -244,6 +217,137 @@ pub(super) async fn read<C: ConnectionTrait>(
     }
     normalize(&mut result);
     Ok(result)
+}
+
+async fn check_encoding<C: ConnectionTrait>(db: &C) -> AppResult<()> {
+    if db.get_database_backend() == DatabaseBackend::Sqlite {
+        let encoding: String = db
+            .query_one(Statement::from_string(
+                db.get_database_backend(),
+                "PRAGMA encoding",
+            ))
+            .await?
+            .ok_or_else(|| refused("database encoding unavailable"))?
+            .try_get("", "encoding")?;
+        if encoding != "UTF-8" {
+            return Err(refused("SQLite UTF-8 database encoding required"));
+        }
+    }
+    Ok(())
+}
+
+/// The size scan and budgeted payload read share one statement snapshot.
+/// Rejected tables return one metadata row with NULL payload cells. Accepted
+/// payload bytes plus column-name bytes fit the caller's remaining budget.
+/// SQLite callers must first validate the database's UTF-8 encoding.
+/// The payload limit is the complete proven row count or zero, never a prefix.
+async fn read_rows<C: ConnectionTrait>(
+    db: &C,
+    table: &TableImage,
+    remaining_rows: usize,
+    remaining_bytes: usize,
+) -> AppResult<(Vec<QueryResult>, usize)> {
+    let row_bytes = table
+        .columns
+        .iter()
+        .map(|column| {
+            let text = format!("CAST(\"{column}\" AS TEXT)");
+            let length = if db.get_database_backend() == DatabaseBackend::Postgres {
+                format!("octet_length(convert_to({text},'UTF8'))")
+            } else {
+                format!("length(CAST({text} AS BLOB))")
+            };
+            format!("CAST(COALESCE({length},0) AS BIGINT)+{}", column.len())
+        })
+        .collect::<Vec<_>>()
+        .join("+");
+    let order = table
+        .primary_key
+        .iter()
+        .map(|c| format!("\"{c}\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    let fits = format!("b.__r26_rows<={remaining_rows} AND b.__r26_bytes<={remaining_bytes}");
+    let fields = table
+        .columns
+        .iter()
+        .map(|c| format!("CAST(p.\"{c}\" AS TEXT) AS \"{c}\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    let payload_order = table
+        .primary_key
+        .iter()
+        .map(|c| format!("p.\"{c}\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "WITH sizes AS MATERIALIZED (SELECT {row_bytes} AS row_bytes FROM \"{}\" ORDER BY {order} LIMIT {}), budget AS MATERIALIZED (SELECT COUNT(*) AS __r26_rows, CAST(COALESCE(SUM(row_bytes),0) AS BIGINT) AS __r26_bytes FROM sizes), payload AS MATERIALIZED (SELECT {fields} FROM \"{}\" AS p ORDER BY {payload_order} LIMIT (SELECT CASE WHEN {fits} THEN b.__r26_rows ELSE 0 END FROM budget AS b)) SELECT b.__r26_rows,b.__r26_bytes,p.* FROM budget AS b LEFT JOIN payload AS p ON TRUE ORDER BY {payload_order}",
+        table.table,
+        remaining_rows + 1,
+        table.table,
+    );
+    let rows = db
+        .query_all(Statement::from_string(db.get_database_backend(), sql))
+        .await?;
+    let budget = rows
+        .first()
+        .ok_or_else(|| refused("native inventory budget unavailable"))?;
+    let count = usize::try_from(budget.try_get::<i64>("", "__r26_rows")?)
+        .map_err(|_| refused("invalid native row budget"))?;
+    let bytes = usize::try_from(budget.try_get::<i64>("", "__r26_bytes")?)
+        .map_err(|_| refused("invalid native byte budget"))?;
+    if count > remaining_rows {
+        return Err(refused("complete inventory exceeds row budget"));
+    }
+    if bytes > remaining_bytes {
+        return Err(refused("complete inventory exceeds byte budget"));
+    }
+    if count == 0 {
+        return Ok((Vec::new(), 0));
+    }
+    if rows.len() != count {
+        return Err(refused("incomplete native inventory"));
+    }
+    Ok((rows, bytes))
+}
+
+/// Read the complete column catalog together, including missing-table evidence.
+/// Every native image rechecks the current catalog.
+async fn columns<C: ConnectionTrait>(
+    db: &C,
+    tables: &[TableImage],
+) -> AppResult<BTreeMap<String, Vec<String>>> {
+    let parameters: Vec<_> = (1..=tables.len()).map(|i| format!("${i}")).collect();
+    let sql = if db.get_database_backend() == DatabaseBackend::Sqlite {
+        let values = parameters
+            .iter()
+            .map(|p| format!("({p})"))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "WITH closure(table_name) AS (VALUES {values}) SELECT closure.table_name,p.name AS column_name FROM closure CROSS JOIN pragma_table_info(closure.table_name) AS p ORDER BY closure.table_name,p.name"
+        )
+    } else {
+        format!(
+            "SELECT table_name,column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name IN ({}) ORDER BY table_name,column_name",
+            parameters.join(",")
+        )
+    };
+    let rows = db
+        .query_all(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            sql,
+            tables.iter().map(|table| table.table.clone().into()),
+        ))
+        .await?;
+    let mut columns: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for row in rows {
+        columns
+            .entry(row.try_get("", "table_name")?)
+            .or_default()
+            .push(row.try_get("", "column_name")?);
+    }
+    Ok(columns)
 }
 
 pub(super) async fn identity<C: ConnectionTrait>(db: &C) -> AppResult<String> {
@@ -283,10 +387,12 @@ pub(super) async fn frontier<C: ConnectionTrait>(
 
 pub(super) fn normalize(images: &mut [TableImage]) {
     for image in images {
-        let pk = image.primary_key.clone();
-        image
-            .rows
-            .sort_by_key(|r| pk.iter().map(|k| r.get(k).cloned()).collect::<Vec<_>>());
+        let pk = &image.primary_key;
+        image.rows.sort_by(|left, right| {
+            pk.iter()
+                .map(|k| left.get(k))
+                .cmp(pk.iter().map(|k| right.get(k)))
+        });
     }
 }
 
@@ -302,3 +408,7 @@ pub(super) fn distinct_keys(image: &TableImage) -> bool {
 #[cfg(test)]
 #[path = "snapshot_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "snapshot_cost_tests.rs"]
+mod cost_tests;

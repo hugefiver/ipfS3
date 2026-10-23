@@ -56,13 +56,13 @@ async fn ordered_batches_page_native_composite_keys_and_keep_null_and_empty_cell
             assert!(
                 parts
                     .iter()
-                    .map(|part| &part.column)
-                    .eq(table.columns.iter())
+                    .map(|part| part.column)
+                    .eq(table.columns.iter().map(String::as_str))
             );
             assert!(
                 parts
                     .iter()
-                    .all(|part| part.key == *key && part.offset == 0)
+                    .all(|part| part.key.as_ref() == key && part.offset == 0)
             );
             let error = parts
                 .iter()

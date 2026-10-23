@@ -343,7 +343,11 @@ pub(crate) async fn write_retirement_marker(
     if stored.view() != confirmation {
         return Err(ManagementError::Confirmation);
     }
-    let binding = native::value(root, "binding").ok_or(ManagementError::InvalidEvidence)?;
+    let item = source
+        .archive_members(auth.database_scope(), &confirmation.request.plan_id)
+        .find(|row| native::value(row, "item_id") == Some(item_id))
+        .ok_or(ManagementError::Confirmation)?;
+    let binding = native::value(item, "binding").ok_or(ManagementError::InvalidEvidence)?;
     confirmation.copy(binding)?;
     let binding = binding.to_owned();
     let anchor = native::value(

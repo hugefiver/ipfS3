@@ -1,11 +1,12 @@
 //! Only provider keys, declared missing route, source retirement and usage move.
 use super::{
     Declaration, TableImage,
-    model::{field, key},
+    model::{field, index_rows, key},
     refused,
 };
 use crate::error::AppResult;
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+use std::collections::BTreeSet;
 
 pub(super) async fn write_changes<C: ConnectionTrait>(
     db: &C,
@@ -34,6 +35,7 @@ pub(super) async fn write_changes<C: ConnectionTrait>(
             usage_changes(db, image, destination).await?;
             continue;
         }
+        let destination_rows = index_rows(destination);
         for row in &image.rows {
             let old_key = key(image, row);
             let mut new_key = old_key.clone();
@@ -60,10 +62,9 @@ pub(super) async fn write_changes<C: ConnectionTrait>(
                     }
                 }
             }
-            let target = destination
-                .rows
-                .iter()
-                .find(|r| key(destination, r) == new_key)
+            let target = destination_rows
+                .get(&new_key)
+                .copied()
                 .ok_or_else(|| refused("operational row correspondence missing"))?;
             let changed: Vec<_> = image
                 .columns
@@ -121,13 +122,15 @@ async fn usage_changes<C: ConnectionTrait>(
     before: &TableImage,
     after: &TableImage,
 ) -> AppResult<()> {
+    let after_providers: BTreeSet<_> = after
+        .rows
+        .iter()
+        .filter_map(|r| field(r, "provider"))
+        .collect();
+    let before_rows: BTreeSet<_> = before.rows.iter().collect();
     for row in &before.rows {
         let provider = field(row, "provider").ok_or_else(|| refused("usage identity missing"))?;
-        if !after
-            .rows
-            .iter()
-            .any(|r| field(r, "provider") == Some(provider))
-        {
+        if !after_providers.contains(provider) {
             let result = db
                 .execute(Statement::from_sql_and_values(
                     db.get_database_backend(),
@@ -141,7 +144,7 @@ async fn usage_changes<C: ConnectionTrait>(
         }
     }
     for row in &after.rows {
-        if before.rows.contains(row) {
+        if before_rows.contains(row) {
             continue;
         }
         let columns = &after.columns;

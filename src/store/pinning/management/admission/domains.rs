@@ -145,7 +145,6 @@ pub(super) async fn unregistered_legacy_in_schema<C: ConnectionTrait>(
     };
     let row = db
         .query_one(Statement::from_string(db.get_database_backend(), sql))
-        .await
-        .map_err(|_| super::needs_attention())?;
+        .await?;
     Ok(row.is_none())
 }

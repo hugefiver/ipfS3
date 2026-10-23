@@ -10,6 +10,35 @@ pub(super) const FRAME: &str = "S7F1\n";
 pub(super) const LOCATOR: &str = "S7L1\n";
 pub(super) const BINDING: &str = "S7B1\n";
 pub(super) const INVENTORY: &str = "S7I1\n";
+const SHARED_BINDING: &str = "S7R2\n";
+
+/// Non-anchor items bind the exact confirmed bytes stored once at the proposal
+/// anchor. The existing native_before locator supplies its relational identity.
+pub(super) fn shared_binding(raw: &str) -> String {
+    format!(
+        "{SHARED_BINDING}{}",
+        identity(b"stage7/shared-confirmation/2\0", raw.as_bytes())
+    )
+}
+
+pub(super) fn is_shared_binding(raw: &str) -> bool {
+    raw.strip_prefix(SHARED_BINDING).is_some_and(|hash| {
+        hash.len() == 64
+            && hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+pub(crate) fn binding_matches(left: &str, right: &str) -> bool {
+    left == right
+        || is_shared_binding(left)
+            && right.starts_with("S7B1\n[1,")
+            && left == shared_binding(right)
+        || is_shared_binding(right)
+            && left.starts_with("S7B1\n[1,")
+            && right == shared_binding(left)
+}
 
 pub(super) fn provider_review(
     source: &evidence::Evidence,
