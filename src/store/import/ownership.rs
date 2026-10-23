@@ -44,12 +44,14 @@ mod mutation_tests;
 mod zip_output_tests;
 
 mod mutation_lease;
-pub(crate) use mutation_lease::renew_lifecycle_mutation_in_transaction;
 pub use mutation_lease::{MutationLease, run_mutation};
 use mutation_lease::{
     mutation_lease_identity, recover_expired_mutations_in_transaction, verify_mutation_lease,
 };
 pub use mutation_lease::{release_standard_mutation, renew_standard_mutation};
+pub(crate) use mutation_lease::{
+    renew_lifecycle_mutation_in_transaction, renew_standard_mutation_in_transaction,
+};
 
 /// Long streaming requests renew every 30 seconds; a vanished process cannot
 /// block lifecycle for more than this database-clock lease interval.
@@ -1170,27 +1172,7 @@ pub async fn renew_zip_v2_source_in_transaction<C: ConnectionTrait>(
     txn: &C,
     guard: &StandardMutationGuard,
 ) -> AppResult<()> {
-    verify_standard_mutation_guard(txn, guard, &guard.bucket, &guard.key, &[]).await?;
-    let until = crate::store::database_clock::database_now(txn).await?
-        + chrono::Duration::seconds(STANDARD_MUTATION_LEASE_SECONDS);
-    let active = match txn.get_database_backend() {
-        DatabaseBackend::Postgres => Expr::cust("lease_until > clock_timestamp()"),
-        DatabaseBackend::Sqlite => Expr::cust("julianday(lease_until) > julianday('now')"),
-        DatabaseBackend::MySql => Expr::cust("FALSE"),
-    };
-    let updated = standard_mutation_lease::Entity::update_many()
-        .col_expr(
-            standard_mutation_lease::Column::LeaseUntil,
-            Expr::value(until),
-        )
-        .filter(mutation_lease_identity(guard))
-        .filter(active)
-        .exec(txn)
-        .await?;
-    if updated.rows_affected != 1 {
-        return Err(AppError::StaleContentMutation);
-    }
-    Ok(())
+    renew_standard_mutation_in_transaction(txn, guard).await
 }
 
 /// Durable exact source guard, written only after the v2 execution and legacy

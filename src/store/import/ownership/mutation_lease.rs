@@ -72,26 +72,35 @@ pub async fn renew_standard_mutation(
     db.transaction(move |txn| {
         Box::pin(async move {
             lock_bucket_for_ownership(txn, &guard.bucket).await?;
-            verify_standard_mutation_guard(txn, &guard, &guard.bucket, &guard.key, &[]).await?;
-            let until = crate::store::database_clock::database_now(txn).await?
-                + chrono::Duration::seconds(STANDARD_MUTATION_LEASE_SECONDS);
-            let updated = standard_mutation_lease::Entity::update_many()
-                .col_expr(
-                    standard_mutation_lease::Column::LeaseUntil,
-                    Expr::value(until),
-                )
-                .filter(mutation_lease_identity(&guard))
-                .filter(active_lease(txn.get_database_backend()))
-                .exec(txn)
-                .await?;
-            if updated.rows_affected != 1 {
-                return Err(AppError::StaleContentMutation);
-            }
-            Ok(())
+            renew_standard_mutation_in_transaction(txn, &guard).await
         })
     })
     .await
     .map_err(transaction_error_into_app)
+}
+
+/// Caller holds the bucket fence and has locked this destination before any
+/// later publication frontier. Renewal never restores expired ownership.
+pub(crate) async fn renew_standard_mutation_in_transaction<C: ConnectionTrait>(
+    txn: &C,
+    guard: &StandardMutationGuard,
+) -> AppResult<()> {
+    verify_standard_mutation_guard(txn, guard, &guard.bucket, &guard.key, &[]).await?;
+    let until = crate::store::database_clock::database_now(txn).await?
+        + chrono::Duration::seconds(STANDARD_MUTATION_LEASE_SECONDS);
+    let updated = standard_mutation_lease::Entity::update_many()
+        .col_expr(
+            standard_mutation_lease::Column::LeaseUntil,
+            Expr::value(until),
+        )
+        .filter(mutation_lease_identity(guard))
+        .filter(active_lease(txn.get_database_backend()))
+        .exec(txn)
+        .await?;
+    if updated.rows_affected != 1 {
+        return Err(AppError::StaleContentMutation);
+    }
+    Ok(())
 }
 
 pub async fn release_standard_mutation(

@@ -38,12 +38,23 @@ const ACTIVE_TARGET_STATES: [&str; 6] = [
 /// unseen CIDs, which a SELECT FOR UPDATE on missing rows cannot protect.
 pub(crate) async fn prepare_hot_publication_frontier<C: ConnectionTrait>(
     txn: &C,
+    cids: Vec<String>,
+) -> AppResult<()> {
+    prepare_hot_publication_frontier_with_maintenance(txn, cids, None).await
+}
+
+pub(crate) async fn prepare_hot_publication_frontier_with_maintenance<C: ConnectionTrait>(
+    txn: &C,
     mut cids: Vec<String>,
+    mut maintenance: Option<&mut crate::store::zip::publication_lease::PublicationLease<'_>>,
 ) -> AppResult<()> {
     cids.sort();
     cids.dedup();
     let now = database_now(txn).await?;
     for cid in cids {
+        if let Some(lease) = maintenance.as_deref_mut() {
+            lease.checkpoint(txn).await?;
+        }
         attach_physical_hot(txn, &cid, &PhysicalVerification::Pending, now).await?;
         if txn.get_database_backend() == DatabaseBackend::Postgres {
             physical_residency::Entity::find_by_id(("hot".to_owned(), cid))

@@ -14,7 +14,7 @@ use crate::{
     },
     store::{
         object_version::{BucketVersioningState, PublicationResult},
-        zip::{self as storage, VersionBinding},
+        zip::{self as storage, VersionBinding, publication_lease::PublicationLease},
     },
     zip::batch::FinalZipManifest,
 };
@@ -177,6 +177,7 @@ pub(super) async fn lock_version_frontier<C: ConnectionTrait>(
     tx: &C,
     objects: &[&PublicationObject],
     state: BucketVersioningState,
+    mut maintenance: Option<&mut PublicationLease<'_>>,
 ) -> AppResult<Vec<String>> {
     let locations = objects
         .iter()
@@ -184,8 +185,17 @@ pub(super) async fn lock_version_frontier<C: ConnectionTrait>(
         .collect::<BTreeSet<_>>();
     let mut owners = BTreeSet::new();
     for (bucket, key) in locations {
+        if let Some(lease) = maintenance.as_deref_mut() {
+            lease.checkpoint(tx).await?;
+        }
         crate::store::object_version::lock_current_row(tx, bucket, key).await?;
+        if let Some(lease) = maintenance.as_deref_mut() {
+            lease.checkpoint(tx).await?;
+        }
         crate::store::object_version::allocate_next_sequence(tx, bucket, key).await?;
+        if let Some(lease) = maintenance.as_deref_mut() {
+            lease.checkpoint(tx).await?;
+        }
         let current = super::lock_current_object_projection(tx, bucket, key).await?;
         match state {
             BucketVersioningState::Unversioned => {
@@ -249,10 +259,24 @@ pub(super) async fn publish_in_transaction(
                 .await?,
         ),
     };
+    let maintained_guard = match &request.authority {
+        ZipPublicationAuthority::Legacy(authority) if authority.upload_target.is_some() => {
+            authority.standard_guard.as_ref()
+        }
+        _ => None,
+    };
+    let mut maintenance = PublicationLease::start(tx, maintained_guard, &request.batch_id).await?;
     let ordered = objects(request);
     let state = crate::store::bucket::lock_versioning_state(tx, request.capture.bucket()).await?;
-    let owners = lock_version_frontier(tx, &ordered, state).await?;
+    let owners = lock_version_frontier(tx, &ordered, state, Some(&mut maintenance)).await?;
+    maintenance.checkpoint(tx).await?;
     capture::verify_batch(tx, request).await?;
+    if let storage::RootOutcome::Verified { claim, .. } = &request.root_outcome {
+        maintenance
+            .root_locked(tx, &request.batch_id, claim)
+            .await?;
+    }
+    maintenance.checkpoint(tx).await?;
     input::verify_publication(tx, request).await?;
     if let Some(snapshot) = &admission {
         execution::verify_manifest(tx, request, snapshot).await?;
@@ -276,31 +300,45 @@ pub(super) async fn publish_in_transaction(
     .map_err(|_| invalid())?;
     let (limits, routes, allocatable) =
         allocation::frozen_allocation(&request.capture, &candidate)?;
-    let pairs = allocation::attachment_pairs(tx, &candidate, &limits).await?;
-    leases::lock_publication_lifecycle_frontier(tx, &owners, &pairs).await?;
+    let pairs = allocation::attachment_pairs(tx, &candidate, &limits, &mut maintenance).await?;
+    maintenance.checkpoint(tx).await?;
+    leases::lock_publication_lifecycle_frontier_with_maintenance(
+        tx,
+        &owners,
+        &pairs,
+        Some(&mut maintenance),
+    )
+    .await?;
+    maintenance.checkpoint(tx).await?;
     quota::lock_publication_usage_rows(
         tx,
         &pairs.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
     )
     .await?;
+    maintenance.checkpoint(tx).await?;
     if allocatable.len() == routes.len() {
         ledger::verify_selected_routes(tx, &routes, true).await?;
     } else {
         ledger::verify_birth_candidate_routes(tx, &routes, &allocatable, true).await?;
     }
-    crate::store::residency::prepare_hot_publication_frontier(
+    maintenance.checkpoint(tx).await?;
+    crate::store::residency::prepare_hot_publication_frontier_with_maintenance(
         tx,
         ordered.iter().map(|o| o.cid.clone()).collect(),
+        Some(&mut maintenance),
     )
     .await?;
+    maintenance.checkpoint(tx).await?;
     let now = crate::store::database_clock::database_now(tx).await?;
     let mut results = Vec::with_capacity(ordered.len());
     for object in ordered {
+        maintenance.checkpoint(tx).await?;
         results.push((
             object.key.clone(),
             super::write_object_version_and_update_lifecycle(tx, object, state, now).await?,
         ));
     }
+    maintenance.checkpoint(tx).await?;
     let source_bound = request.source.as_ref().map(|o| bound(tx, o, "source"));
     let source_bound = match source_bound {
         Some(future) => Some(future.await?.0),
@@ -314,6 +352,7 @@ pub(super) async fn publish_in_transaction(
     let mut successful = Vec::new();
     let mut bindings = Vec::new();
     for file in &request.manifest.successful {
+        maintenance.checkpoint(tx).await?;
         let (output, binding) = bound(tx, by_key[&file.object_key], &file.relative_path).await?;
         successful.push(output);
         bindings.push(binding);
@@ -332,6 +371,7 @@ pub(super) async fn publish_in_transaction(
             .await?;
     }
     for (output, decision) in &selected.output_decisions {
+        maintenance.checkpoint(tx).await?;
         // Each real output is a new control/version owner, not a reuse of the
         // source's unique control revision. Authorization remains frozen.
         let mut decision = decision.clone();
@@ -343,26 +383,39 @@ pub(super) async fn publish_in_transaction(
         )
         .await?;
     }
-    allocation::create_leases(tx, &selected, &limits, now).await?;
+    maintenance.checkpoint(tx).await?;
+    allocation::create_leases(tx, &selected, &limits, now, &mut maintenance).await?;
+    maintenance.checkpoint(tx).await?;
     let terminal = execution::terminal_result(tx, request, &results).await?;
     match &request.root_outcome {
         storage::RootOutcome::ClaimedFailed { claim, code } => {
-            claim
-                .publish_failed(tx, &bindings, request.source.is_some(), &terminal, code)
-                .await?
+            storage::publish_with_maintenance(
+                tx,
+                &claim.batch_id,
+                &bindings,
+                request.source.is_some(),
+                &terminal,
+                storage::RootOutcome::Failed { code },
+                Some(claim),
+                Some(&mut maintenance),
+            )
+            .await?
         }
         outcome => {
-            storage::publish(
+            storage::publish_with_maintenance(
                 tx,
                 &request.batch_id,
                 &bindings,
                 request.source.is_some(),
                 &terminal,
                 outcome.clone(),
+                None,
+                Some(&mut maintenance),
             )
             .await?
         }
     }
+    maintenance.checkpoint(tx).await?;
     match &request.authority {
         ZipPublicationAuthority::Legacy(authority) => {
             legacy::settle(tx, request, authority, &results, now).await?

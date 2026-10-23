@@ -97,6 +97,7 @@ async fn bind_versions(
     tx: &DatabaseTransaction,
     batch: &zip_batch::Model,
     bindings: &[VersionBinding],
+    mut maintenance: Option<&mut super::publication_lease::PublicationLease<'_>>,
 ) -> AppResult<(usize, usize)> {
     let entries = manifest::entries(tx, &batch.id).await?;
     let successes = entries.iter().filter(|e| e.cid.is_some()).count();
@@ -111,6 +112,9 @@ async fn bind_versions(
     let mut seen = HashSet::new();
     let mut resolved = Vec::with_capacity(successes);
     for binding in bindings {
+        if let Some(lease) = maintenance.as_deref_mut() {
+            lease.checkpoint(tx).await?;
+        }
         if !seen.insert(&binding.path) {
             return Err(invalid());
         }
@@ -137,6 +141,9 @@ async fn bind_versions(
     }
     // Complete exact-version validation before writing any manifest binding.
     for (entry, version_row_id) in resolved {
+        if let Some(lease) = maintenance.as_deref_mut() {
+            lease.checkpoint(tx).await?;
+        }
         zip_manifest_entry::ActiveModel {
             version_row_id: Set(Some(version_row_id)),
             ..entry.into()
@@ -576,7 +583,7 @@ pub async fn publish(
     terminal_result: &str,
     outcome: RootOutcome,
 ) -> AppResult<()> {
-    publish_with_failed_claim(
+    publish_with_maintenance(
         tx,
         id,
         bindings,
@@ -584,11 +591,13 @@ pub async fn publish(
         terminal_result,
         outcome,
         None,
+        None,
     )
     .await
 }
 
-async fn publish_with_failed_claim(
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn publish_with_maintenance(
     tx: &DatabaseTransaction,
     id: &str,
     bindings: &[VersionBinding],
@@ -596,6 +605,7 @@ async fn publish_with_failed_claim(
     terminal_result: &str,
     outcome: RootOutcome,
     failed_claim: Option<&RootClaim>,
+    mut maintenance: Option<&mut super::publication_lease::PublicationLease<'_>>,
 ) -> AppResult<()> {
     if !valid_terminal(terminal_result) {
         return Err(invalid());
@@ -605,7 +615,11 @@ async fn publish_with_failed_claim(
         return Err(stale());
     }
     verify_archive_binding(tx, &batch, terminal_result, source_published).await?;
-    let (successes, failures) = bind_versions(tx, &batch, bindings).await?;
+    let (successes, failures) =
+        bind_versions(tx, &batch, bindings, maintenance.as_deref_mut()).await?;
+    if let Some(lease) = maintenance {
+        lease.checkpoint(tx).await?;
+    }
     let (status, error, cid) =
         root_fields(tx, &batch, outcome, successes, failures, failed_claim).await?;
     zip_batch::ActiveModel {
@@ -687,7 +701,7 @@ impl RootClaim {
         terminal_result: &str,
         code: &'static str,
     ) -> AppResult<()> {
-        publish_with_failed_claim(
+        publish_with_maintenance(
             tx,
             &self.batch_id,
             bindings,
@@ -695,6 +709,7 @@ impl RootClaim {
             terminal_result,
             RootOutcome::Failed { code },
             Some(self),
+            None,
         )
         .await
     }

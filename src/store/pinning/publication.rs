@@ -1731,7 +1731,13 @@ async fn lock_publication_version_frontier<C: ConnectionTrait>(
     archive: &PublicationObject,
     entries: &[PublicationObject],
 ) -> AppResult<Vec<String>> {
-    zip::lock_version_frontier(db, &ordered_publication_objects(archive, entries), state).await
+    zip::lock_version_frontier(
+        db,
+        &ordered_publication_objects(archive, entries),
+        state,
+        None,
+    )
+    .await
 }
 
 async fn lock_current_object_projection<C: ConnectionTrait>(
@@ -2308,6 +2314,16 @@ async fn project_desired_remote_targets<C: ConnectionTrait>(
     cid: &str,
     now: DateTime<Utc>,
 ) -> AppResult<()> {
+    project_desired_remote_targets_with_maintenance(db, provider, cid, now, None).await
+}
+
+async fn project_desired_remote_targets_with_maintenance<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+    cid: &str,
+    now: DateTime<Utc>,
+    mut maintenance: Option<&mut crate::store::zip::publication_lease::PublicationLease<'_>>,
+) -> AppResult<()> {
     let target_ids = pin_lease_target::Entity::find()
         .inner_join(pin_lease::Entity)
         .filter(pin_lease_target::Column::Provider.eq(provider))
@@ -2327,7 +2343,16 @@ async fn project_desired_remote_targets<C: ConnectionTrait>(
         .map(|target| target.id)
         .collect::<Vec<_>>();
     for target_id in target_ids {
-        leases::project_target_from_remote(db, &target_id, now).await?;
+        if let Some(lease) = maintenance.as_deref_mut() {
+            lease.checkpoint(db).await?;
+        }
+        leases::project_target_from_remote_with_maintenance(
+            db,
+            &target_id,
+            now,
+            maintenance.as_deref_mut(),
+        )
+        .await?;
     }
     Ok(())
 }

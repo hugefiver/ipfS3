@@ -227,6 +227,116 @@ async fn expired_guard_cannot_renew_publish_or_complete() {
 }
 
 #[tokio::test]
+async fn transaction_renewal_preserves_prefix_identity_and_rolls_back_deadline() {
+    let db = setup().await;
+    let txn = db.begin().await.unwrap();
+    lock_bucket_for_ownership(&txn, "bucket").await.unwrap();
+    let guard = admit_content_and_prefix_mutation(
+        &txn,
+        "bucket",
+        "key",
+        "out/",
+        SupersedeReason::DecompressZip,
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+    txn.commit().await.unwrap();
+    db.execute_unprepared("UPDATE standard_mutation_leases SET lease_until = strftime('%Y-%m-%dT%H:%M:%fZ','now','+10 seconds')").await.unwrap();
+    let before = standard_mutation_lease::Entity::find()
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    let txn = db.begin().await.unwrap();
+    lock_bucket_for_ownership(&txn, "bucket").await.unwrap();
+    verify_standard_mutation_guard(&txn, &guard, "bucket", "key", &["out/a".into()])
+        .await
+        .unwrap();
+    renew_standard_mutation_in_transaction(&txn, &guard)
+        .await
+        .unwrap();
+    let renewed = standard_mutation_lease::Entity::find()
+        .one(&txn)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(renewed.mutation_id, guard.mutation_id);
+    assert_eq!(renewed.generation, guard.expected_generation);
+    assert_eq!(renewed.bucket, guard.bucket);
+    assert_eq!(renewed.key, guard.key);
+    let now = crate::store::database_clock::database_now(&txn)
+        .await
+        .unwrap();
+    assert!(renewed.lease_until > now + chrono::Duration::seconds(119));
+    assert!(renewed.lease_until <= now + chrono::Duration::seconds(120));
+    verify_standard_mutation_guard(&txn, &guard, "bucket", "key", &["out/b".into()])
+        .await
+        .unwrap();
+    txn.rollback().await.unwrap();
+    assert_eq!(
+        standard_mutation_lease::Entity::find()
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap(),
+        before
+    );
+}
+
+#[tokio::test]
+async fn transaction_renewal_rejects_stale_identity_without_overwriting_owner() {
+    for invalid in [
+        "expired",
+        "missing",
+        "superseded",
+        "destination",
+        "generation",
+        "prefix",
+    ] {
+        let db = setup().await;
+        let mut guard = admit(&db).await;
+        match invalid {
+            "expired" => expire(&db).await,
+            "missing" => {
+                standard_mutation_lease::Entity::delete_many()
+                    .exec(&db)
+                    .await
+                    .unwrap();
+            }
+            "superseded" => {
+                admit(&db).await;
+            }
+            "destination" => guard.key = "other".into(),
+            "generation" => guard.expected_generation += 1,
+            _ => guard.mutation_prefix = Some("wrong/".into()),
+        }
+        let before = standard_mutation_lease::Entity::find()
+            .all(&db)
+            .await
+            .unwrap();
+        let txn = db.begin().await.unwrap();
+        lock_bucket_for_ownership(&txn, "bucket").await.unwrap();
+        assert!(
+            matches!(
+                renew_standard_mutation_in_transaction(&txn, &guard).await,
+                Err(AppError::StaleContentMutation)
+            ),
+            "{invalid}"
+        );
+        txn.rollback().await.unwrap();
+        assert_eq!(
+            standard_mutation_lease::Entity::find()
+                .all(&db)
+                .await
+                .unwrap(),
+            before,
+            "{invalid}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn completion_rechecks_lease_after_initial_verification() {
     let db = setup().await;
     let guard = admit(&db).await;

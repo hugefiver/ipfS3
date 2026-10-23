@@ -45,6 +45,7 @@ use crate::{
 };
 
 mod hot_receipt_tests;
+mod publication_lease_tests;
 pub(super) mod zip_fixture;
 
 fn limits() -> ProviderLimitMap {

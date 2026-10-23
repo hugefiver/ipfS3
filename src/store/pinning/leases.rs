@@ -35,6 +35,8 @@ use crate::{
     },
 };
 
+use crate::store::zip::publication_lease::PublicationLease;
+
 pub use super::jobs::DateTimeUtc;
 pub use super::quota::ReservationOutcome;
 
@@ -961,7 +963,16 @@ pub async fn project_target_from_remote<C: ConnectionTrait>(
     target_id: &str,
     now: DateTimeUtc,
 ) -> AppResult<TargetProjection> {
-    project_target_from_remote_inner(db, target_id, None, now)
+    project_target_from_remote_with_maintenance(db, target_id, now, None).await
+}
+
+pub(crate) async fn project_target_from_remote_with_maintenance<C: ConnectionTrait>(
+    db: &C,
+    target_id: &str,
+    now: DateTimeUtc,
+    maintenance: Option<&mut PublicationLease<'_>>,
+) -> AppResult<TargetProjection> {
+    project_target_from_remote_inner(db, target_id, None, now, maintenance)
         .await?
         .ok_or_else(|| invalid("unscoped target projection unexpectedly failed an epoch guard"))
 }
@@ -973,7 +984,7 @@ pub async fn project_reconcile_target_from_remote<C: ConnectionTrait>(
     expected_remote_epoch: i64,
     now: DateTimeUtc,
 ) -> AppResult<Option<TargetProjection>> {
-    project_target_from_remote_inner(db, target_id, Some(expected_remote_epoch), now).await
+    project_target_from_remote_inner(db, target_id, Some(expected_remote_epoch), now, None).await
 }
 
 /// Management holds the complete registry frontier before reading these models.
@@ -1009,6 +1020,7 @@ async fn project_target_from_remote_inner<C: ConnectionTrait>(
     target_id: &str,
     expected_remote_epoch: Option<i64>,
     now: DateTimeUtc,
+    mut maintenance: Option<&mut PublicationLease<'_>>,
 ) -> AppResult<Option<TargetProjection>> {
     super::management::admission::lock_sqlite_writer_in_caller_transaction(db).await?;
     let Some(target) = pin_lease_target::Entity::find_by_id(target_id.to_owned())
@@ -1025,16 +1037,22 @@ async fn project_target_from_remote_inner<C: ConnectionTrait>(
     if !is_desired_target_state(&target.state) {
         return Err(invalid("target is not an active desired target"));
     }
-    let snapshot =
-        match ordered_desired_lifecycle_snapshot(db, &target.provider, &target.cid).await? {
-            OrderedDesiredLifecycleSnapshotOutcome::Current(snapshot) => snapshot,
-            OrderedDesiredLifecycleSnapshotOutcome::Stale => {
-                return Err(stale_lifecycle_error("target projection"));
-            }
-            OrderedDesiredLifecycleSnapshotOutcome::MissingRemote => {
-                return Err(invalid("target remote pin does not exist"));
-            }
-        };
+    let snapshot = match ordered_desired_lifecycle_snapshot_with_maintenance(
+        db,
+        &target.provider,
+        &target.cid,
+        maintenance.as_deref_mut(),
+    )
+    .await?
+    {
+        OrderedDesiredLifecycleSnapshotOutcome::Current(snapshot) => snapshot,
+        OrderedDesiredLifecycleSnapshotOutcome::Stale => {
+            return Err(stale_lifecycle_error("target projection"));
+        }
+        OrderedDesiredLifecycleSnapshotOutcome::MissingRemote => {
+            return Err(invalid("target remote pin does not exist"));
+        }
+    };
     let desired = snapshot
         .desired
         .iter()
@@ -1042,6 +1060,9 @@ async fn project_target_from_remote_inner<C: ConnectionTrait>(
         .ok_or_else(|| stale_lifecycle_error("target projection"))?;
     if expected_remote_epoch.is_some_and(|expected| snapshot.remote.epoch != expected) {
         return Ok(None);
+    }
+    if let Some(lease) = maintenance {
+        lease.checkpoint(db).await?;
     }
     Ok(Some(
         project_prelocked_desired_target(
@@ -1099,6 +1120,21 @@ pub async fn lock_publication_lifecycle_frontier<C: ConnectionTrait>(
     previous_owner_ids: &[String],
     attachment_pairs: &[(String, String)],
 ) -> AppResult<()> {
+    lock_publication_lifecycle_frontier_with_maintenance(
+        db,
+        previous_owner_ids,
+        attachment_pairs,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn lock_publication_lifecycle_frontier_with_maintenance<C: ConnectionTrait>(
+    db: &C,
+    previous_owner_ids: &[String],
+    attachment_pairs: &[(String, String)],
+    mut maintenance: Option<&mut crate::store::zip::publication_lease::PublicationLease<'_>>,
+) -> AppResult<()> {
     let mut previous_owner_ids = previous_owner_ids.to_vec();
     previous_owner_ids.sort();
     previous_owner_ids.dedup();
@@ -1125,7 +1161,11 @@ pub async fn lock_publication_lifecycle_frontier<C: ConnectionTrait>(
         .map(|lease| (lease.id.clone(), lease))
         .collect();
     for (provider, cid) in &attachment_pairs {
-        let desired = desired_targets(db, provider, cid).await?;
+        if let Some(lease) = maintenance.as_deref_mut() {
+            lease.checkpoint(db).await?;
+        }
+        let desired =
+            desired_targets_with_maintenance(db, provider, cid, maintenance.as_deref_mut()).await?;
         for target in &desired {
             lease_by_id
                 .entry(target.lease.id.clone())
@@ -1155,11 +1195,17 @@ pub async fn lock_publication_lifecycle_frontier<C: ConnectionTrait>(
     }
 
     for lease in lease_by_id.values() {
+        if let Some(maintenance) = maintenance.as_deref_mut() {
+            maintenance.checkpoint(db).await?;
+        }
         if lock_lifecycle_lease(db, lease, true).await?.is_none() {
             return Err(stale_lifecycle_error("publication lifecycle lease prelock"));
         }
     }
     for target in &target_frontier {
+        if let Some(lease) = maintenance.as_deref_mut() {
+            lease.checkpoint(db).await?;
+        }
         if lock_lifecycle_target(db, target, true).await?.is_none() {
             return Err(stale_lifecycle_error(
                 "publication lifecycle target prelock",
@@ -1167,6 +1213,9 @@ pub async fn lock_publication_lifecycle_frontier<C: ConnectionTrait>(
         }
     }
     for (provider, cid) in &remote_pairs {
+        if let Some(lease) = maintenance.as_deref_mut() {
+            lease.checkpoint(db).await?;
+        }
         lock_remote_after_lifecycle(db, provider, cid).await?;
     }
 
@@ -1199,7 +1248,12 @@ pub async fn lock_publication_lifecycle_frontier<C: ConnectionTrait>(
     }
 
     for ((provider, cid), expected) in attachment_snapshots {
-        let current = desired_targets(db, &provider, &cid).await?;
+        if let Some(lease) = maintenance.as_deref_mut() {
+            lease.checkpoint(db).await?;
+        }
+        let current =
+            desired_targets_with_maintenance(db, &provider, &cid, maintenance.as_deref_mut())
+                .await?;
         if !same_desired_lifecycle_snapshot(&expected, &current) {
             return Err(stale_lifecycle_error("publication attachment prelock"));
         }
@@ -2399,7 +2453,17 @@ pub async fn ensure_failed_remote_retry<C: ConnectionTrait>(
     db: &C,
     provider: &str,
     cid: &str,
+    now: DateTimeUtc,
+) -> AppResult<FailedRemoteRetryDecision> {
+    ensure_failed_remote_retry_with_maintenance(db, provider, cid, now, None).await
+}
+
+async fn ensure_failed_remote_retry_with_maintenance<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+    cid: &str,
     _now: DateTimeUtc,
+    maintenance: Option<&mut PublicationLease<'_>>,
 ) -> AppResult<FailedRemoteRetryDecision> {
     let Some(remote) = remote_pin::Entity::find_by_id((provider.to_owned(), cid.to_owned()))
         .one(db)
@@ -2407,7 +2471,9 @@ pub async fn ensure_failed_remote_retry<C: ConnectionTrait>(
     else {
         return Ok(FailedRemoteRetryDecision::NotNeeded);
     };
-    if remote.status != REMOTE_FAILED || !has_all_mode_target(db, provider, cid).await? {
+    if remote.status != REMOTE_FAILED
+        || !has_all_mode_target(db, provider, cid, maintenance).await?
+    {
         return Ok(FailedRemoteRetryDecision::NotNeeded);
     }
     if remote.failure_attempts >= MAX_FAILED_REQUEST_ATTEMPTS {
@@ -2439,6 +2505,16 @@ pub async fn reset_failed_remote_retry_on_user_touch<C: ConnectionTrait>(
     cid: &str,
     now: DateTimeUtc,
 ) -> AppResult<FailedRemoteRetryDecision> {
+    reset_failed_remote_retry_on_user_touch_with_maintenance(db, provider, cid, now, None).await
+}
+
+pub(crate) async fn reset_failed_remote_retry_on_user_touch_with_maintenance<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+    cid: &str,
+    now: DateTimeUtc,
+    maintenance: Option<&mut PublicationLease<'_>>,
+) -> AppResult<FailedRemoteRetryDecision> {
     let Some(remote) = remote_pin::Entity::find_by_id((provider.to_owned(), cid.to_owned()))
         .one(db)
         .await?
@@ -2462,7 +2538,7 @@ pub async fn reset_failed_remote_retry_on_user_touch<C: ConnectionTrait>(
         .filter(remote_pin::Column::Status.eq(REMOTE_FAILED))
         .exec(db)
         .await?;
-    ensure_failed_remote_retry(db, provider, cid, now).await
+    ensure_failed_remote_retry_with_maintenance(db, provider, cid, now, maintenance).await
 }
 
 /// Converts one due, current failed request into a fresh canonical Submit without releasing quota.
@@ -4854,6 +4930,15 @@ async fn desired_targets<C: ConnectionTrait>(
     provider: &str,
     cid: &str,
 ) -> AppResult<Vec<DesiredTarget>> {
+    desired_targets_with_maintenance(db, provider, cid, None).await
+}
+
+async fn desired_targets_with_maintenance<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+    cid: &str,
+    mut maintenance: Option<&mut PublicationLease<'_>>,
+) -> AppResult<Vec<DesiredTarget>> {
     #[cfg(test)]
     record_desired_targets_read(provider, cid).await;
 
@@ -4867,6 +4952,9 @@ async fn desired_targets<C: ConnectionTrait>(
         .await?;
     let mut desired = Vec::with_capacity(targets.len());
     for target in targets {
+        if let Some(lease) = maintenance.as_deref_mut() {
+            lease.checkpoint(db).await?;
+        }
         let Some(lease) = pin_lease::Entity::find_by_id(target.lease_id.clone())
             .one(db)
             .await?
@@ -4969,8 +5057,18 @@ async fn ordered_desired_lifecycle_snapshot<C: ConnectionTrait>(
     provider: &str,
     cid: &str,
 ) -> AppResult<OrderedDesiredLifecycleSnapshotOutcome> {
+    ordered_desired_lifecycle_snapshot_with_maintenance(db, provider, cid, None).await
+}
+
+async fn ordered_desired_lifecycle_snapshot_with_maintenance<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+    cid: &str,
+    mut maintenance: Option<&mut PublicationLease<'_>>,
+) -> AppResult<OrderedDesiredLifecycleSnapshotOutcome> {
     super::management::admission::lock_sqlite_writer_in_caller_transaction(db).await?;
-    let candidates = desired_targets(db, provider, cid).await?;
+    let candidates =
+        desired_targets_with_maintenance(db, provider, cid, maintenance.as_deref_mut()).await?;
 
     let mut candidate_leases = BTreeMap::new();
     for desired in &candidates {
@@ -4991,6 +5089,9 @@ async fn ordered_desired_lifecycle_snapshot<C: ConnectionTrait>(
 
     let mut locked_leases = BTreeMap::new();
     for (lease_id, expected) in &candidate_leases {
+        if let Some(lease) = maintenance.as_deref_mut() {
+            lease.checkpoint(db).await?;
+        }
         let lease = match lock_lifecycle_lease(db, expected, true).await {
             Ok(Some(lease)) => lease,
             Ok(None) => return Ok(OrderedDesiredLifecycleSnapshotOutcome::Stale),
@@ -5007,6 +5108,9 @@ async fn ordered_desired_lifecycle_snapshot<C: ConnectionTrait>(
 
     let mut frontier = Vec::with_capacity(expected_frontier.len());
     for expected in &expected_frontier {
+        if let Some(lease) = maintenance.as_deref_mut() {
+            lease.checkpoint(db).await?;
+        }
         let target = match lock_lifecycle_target(db, expected, true).await {
             Ok(Some(target)) => target,
             Ok(None) => return Ok(OrderedDesiredLifecycleSnapshotOutcome::Stale),
@@ -5035,6 +5139,9 @@ async fn ordered_desired_lifecycle_snapshot<C: ConnectionTrait>(
         .cloned()
         .collect();
 
+    if let Some(lease) = maintenance {
+        lease.checkpoint(db).await?;
+    }
     let remote = match lock_remote_after_lifecycle(db, provider, cid).await {
         Ok(Some(remote)) => remote,
         Ok(None) => return Ok(OrderedDesiredLifecycleSnapshotOutcome::MissingRemote),
@@ -5755,11 +5862,14 @@ async fn has_all_mode_target<C: ConnectionTrait>(
     db: &C,
     provider: &str,
     cid: &str,
+    maintenance: Option<&mut PublicationLease<'_>>,
 ) -> AppResult<bool> {
-    Ok(desired_targets(db, provider, cid)
-        .await?
-        .iter()
-        .any(|desired| desired.lease.provider_mode == "all"))
+    Ok(
+        desired_targets_with_maintenance(db, provider, cid, maintenance)
+            .await?
+            .iter()
+            .any(|desired| desired.lease.provider_mode == "all"),
+    )
 }
 
 async fn mark_terminal_targets_released<C: ConnectionTrait>(

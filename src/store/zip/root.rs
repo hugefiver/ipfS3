@@ -1,7 +1,8 @@
 use chrono::{Duration, Utc};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DatabaseTransaction,
-    EntityTrait, QueryFilter, Set, TransactionTrait, sea_query::OnConflict,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection,
+    EntityTrait, QueryFilter, Set, TransactionTrait,
+    sea_query::{Expr, OnConflict},
 };
 
 use super::{invalid, lock_batch, manifest, required, stale};
@@ -100,8 +101,8 @@ pub async fn claim_root(
     })
 }
 
-pub(super) async fn current_claim(
-    tx: &DatabaseTransaction,
+pub(super) async fn current_claim<C: ConnectionTrait>(
+    tx: &C,
     claim: &RootClaim,
 ) -> AppResult<zip_root_build::Model> {
     // Call only AFTER acquiring the batch row lock.
@@ -134,19 +135,45 @@ pub async fn renew_claim(
     }
     let tx = db.begin().await?;
     lock_batch(&tx, &claim.batch_id).await?;
-    let build = current_claim(&tx, claim).await?;
+    renew_claim_in_transaction(&tx, claim, seconds).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Caller already holds this claim's original batch lock. Seconds retain the
+/// caller's existing renewal contract; publication uses the original 600s.
+pub(crate) async fn renew_claim_in_transaction<C: ConnectionTrait>(
+    tx: &C,
+    claim: &RootClaim,
+    seconds: i64,
+) -> AppResult<()> {
+    let build = current_claim(tx, claim).await?;
     if build.status == "unknown" || build.status == "failed" {
         return Err(stale());
     }
-    let now = database_now(&tx).await?;
-    zip_root_build::ActiveModel {
-        lease_until: Set(now + Duration::seconds(seconds)),
-        updated_at: Set(now),
-        ..build.into()
+    let now = database_now(tx).await?;
+    let active = match tx.get_database_backend() {
+        DatabaseBackend::Postgres => Expr::cust("lease_until > clock_timestamp()"),
+        DatabaseBackend::Sqlite => Expr::cust("julianday(lease_until) > julianday('now')"),
+        DatabaseBackend::MySql => Expr::cust("FALSE"),
+    };
+    let updated = zip_root_build::Entity::update_many()
+        .col_expr(
+            zip_root_build::Column::LeaseUntil,
+            Expr::value(now + Duration::seconds(seconds)),
+        )
+        .col_expr(zip_root_build::Column::UpdatedAt, Expr::value(now))
+        .filter(zip_root_build::Column::BatchId.eq(&claim.batch_id))
+        .filter(zip_root_build::Column::Revision.eq(claim.revision))
+        .filter(zip_root_build::Column::Epoch.eq(claim.epoch))
+        .filter(zip_root_build::Column::Worker.eq(&claim.worker))
+        .filter(zip_root_build::Column::Status.eq(build.status))
+        .filter(active)
+        .exec(tx)
+        .await?;
+    if updated.rows_affected != 1 {
+        return Err(stale());
     }
-    .update(&tx)
-    .await?;
-    tx.commit().await?;
     Ok(())
 }
 

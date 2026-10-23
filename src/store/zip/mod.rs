@@ -5,6 +5,8 @@ pub mod execution;
 pub mod import_intake;
 mod manifest;
 mod publication;
+pub(crate) mod publication_lease;
+pub(crate) use publication::publish_with_maintenance;
 pub mod recovery;
 mod root;
 

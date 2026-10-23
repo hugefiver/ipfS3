@@ -1,4 +1,4 @@
-use super::{invalid, ledger};
+use super::{PublicationLease, invalid, ledger};
 use crate::store::pinning::publication::{self as publication, PinTargetSpec};
 use crate::{
     error::AppResult,
@@ -62,11 +62,13 @@ pub(super) async fn attachment_pairs<C: ConnectionTrait>(
     db: &C,
     selected: &ZipIntentSelection,
     limits: &ProviderLimitMap,
+    maintenance: &mut PublicationLease<'_>,
 ) -> AppResult<Vec<(String, String)>> {
     let mut pairs = BTreeSet::new();
     for lease in &selected.leases {
         for provider in publication::ordered_enabled_providers(&lease.intent, limits)? {
             for target in &lease.targets {
+                maintenance.checkpoint(db).await?;
                 pairs.insert((
                     provider.clone(),
                     ledger::allocation_cid(db, &provider, &target.cid).await?,
@@ -108,10 +110,12 @@ pub(super) async fn create_leases<C: ConnectionTrait>(
     selected: &ZipIntentSelection,
     limits: &ProviderLimitMap,
     now: DateTime<Utc>,
+    maintenance: &mut PublicationLease<'_>,
 ) -> AppResult<()> {
     let mut affected = BTreeSet::new();
     let mut failed = BTreeSet::new();
     for lease in &selected.leases {
+        maintenance.checkpoint(db).await?;
         let targets = lease
             .targets
             .iter()
@@ -135,6 +139,7 @@ pub(super) async fn create_leases<C: ConnectionTrait>(
         .await?;
         let mut assigned = BTreeMap::new();
         for target in targets {
+            maintenance.checkpoint(db).await?;
             publication::assign_target_providers(
                 db,
                 &id,
@@ -150,12 +155,27 @@ pub(super) async fn create_leases<C: ConnectionTrait>(
         }
     }
     for (provider, cid) in failed {
-        publication::leases::reset_failed_remote_retry_on_user_touch(db, &provider, &cid, now)
-            .await?;
+        maintenance.checkpoint(db).await?;
+        publication::leases::reset_failed_remote_retry_on_user_touch_with_maintenance(
+            db,
+            &provider,
+            &cid,
+            now,
+            Some(maintenance),
+        )
+        .await?;
         publication::ensure_failed_attachment_reconcile(db, &provider, &cid, now).await?;
     }
     for (provider, cid) in affected {
-        publication::project_desired_remote_targets(db, &provider, &cid, now).await?;
+        maintenance.checkpoint(db).await?;
+        publication::project_desired_remote_targets_with_maintenance(
+            db,
+            &provider,
+            &cid,
+            now,
+            Some(maintenance),
+        )
+        .await?;
     }
     Ok(())
 }
