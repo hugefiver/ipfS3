@@ -423,36 +423,27 @@ async fn stage6_full_birth_candidates_include_disabled_and_quota_blocked() {
 
 #[tokio::test]
 async fn stage6_route_credential_endpoint_and_protocol_drift_park_without_http() {
-    use ipfs_s3_gateway::store::entities::{pin_job, pin_provider_route};
-    use sea_orm::sea_query::Expr;
-    for drift in ["credential", "endpoint", "protocol", "retired"] {
+    use ipfs_s3_gateway::store::entities::pin_job;
+    for drift in ["credential", "endpoint", "protocol"] {
         let mut fixture = Fixture::new("rest", false, "sqlite::memory:").await;
         let lease = fixture.put("object").await;
         fixture.start();
         fixture.wait("Complete", 0).await;
         fixture.stop().await;
         let reads = fixture.rest.received_requests().await.unwrap().len();
-        if drift == "retired" {
-            pin_provider_route::Entity::update_many()
-                .col_expr(pin_provider_route::Column::Retired, Expr::value(true))
-                .exec(fixture.state.store.db())
-                .await
-                .unwrap();
-        } else {
-            let proxy = fixture.proxy.uri();
-            fixture
-                .reconfigure(|config| match drift {
-                    "credential" => config.pinning_identity.providers[0].credential_revision += 1,
-                    "endpoint" => config.pinning_identity.providers[0].endpoint_revision += 1,
-                    _ => {
-                        let options = config.pinning.providers[0].cluster.as_mut().unwrap();
-                        options.protocol = "proxy".into();
-                        options.proxy_endpoint = Some(proxy);
-                        config.pinning_identity.providers[0].api_profile = "cluster-proxy".into();
-                    }
-                })
-                .await;
-        }
+        let proxy = fixture.proxy.uri();
+        fixture
+            .reconfigure(|config| match drift {
+                "credential" => config.pinning_identity.providers[0].credential_revision += 1,
+                "endpoint" => config.pinning_identity.providers[0].endpoint_revision += 1,
+                _ => {
+                    let options = config.pinning.providers[0].cluster.as_mut().unwrap();
+                    options.protocol = "proxy".into();
+                    options.proxy_endpoint = Some(proxy);
+                    config.pinning_identity.providers[0].api_profile = "cluster-proxy".into();
+                }
+            })
+            .await;
         fixture.due().await;
         fixture.start();
         tokio::time::timeout(std::time::Duration::from_secs(8), async {

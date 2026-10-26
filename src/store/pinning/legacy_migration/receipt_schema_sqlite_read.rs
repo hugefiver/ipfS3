@@ -3,31 +3,9 @@ use crate::error::AppResult;
 use sea_orm::{DatabaseBackend, QueryResult, Statement, Value};
 use std::sync::OnceLock;
 
-// Separate slots keep each active value's original String/i32/Option<String>
-// decoding semantics, even when another branch supplies NULL in that slot.
-pub(super) const SLOTS: &[&str] = &[
-    "table_sql",
-    "column_cid",
-    "column_name",
-    "column_type",
-    "column_notnull",
-    "column_default",
-    "column_pk",
-    "column_hidden",
-    "index_name",
-    "index_unique",
-    "index_origin",
-    "index_partial",
-    "fk_table",
-    "fk_from",
-    "fk_to",
-    "fk_update",
-    "fk_delete",
-    "fk_match",
-    "trigger_name",
-    "trigger_sql",
-    "special_sql",
-];
+// Row kind maps logical fields onto type-specific physical slots. In particular,
+// t2 is nullable for column defaults but mandatory for a foreign key's target.
+pub(super) const SLOTS: &[&str] = &["t0", "t1", "t2", "t3", "t4", "t5", "i0", "i1", "i2", "i3"];
 
 fn branch(kind: &str, owner: &str, source: &str, fields: &[(&str, &str)]) -> String {
     let mut projection = format!("SELECT '{kind}' AS kind,{owner} AS owner");
@@ -52,13 +30,13 @@ pub(super) fn metadata_statement(backend: DatabaseBackend) -> Statement {
                 "table",
                 &owner,
                 &format!("SELECT sql FROM sqlite_schema WHERE type='table' AND name={owner} LIMIT 2"),
-                &[("table_sql", "sql")],
+                &[("t0", "sql")],
             ));
             branches.push(branch("column", &owner,
                 &format!("SELECT cid,name,type,\"notnull\",dflt_value,pk,hidden FROM pragma_table_xinfo({owner}) ORDER BY cid LIMIT 12"),
-                &[("column_cid", "cid"), ("column_name", "name"), ("column_type", "type"),
-                  ("column_notnull", "\"notnull\""), ("column_default", "dflt_value"),
-                  ("column_pk", "pk"), ("column_hidden", "hidden")]));
+                &[("i0", "cid"), ("t0", "name"), ("t1", "type"),
+                  ("i1", "\"notnull\""), ("t2", "dflt_value"),
+                  ("i2", "pk"), ("i3", "hidden")]));
             branches.push(branch(
                 "index",
                 &owner,
@@ -66,16 +44,16 @@ pub(super) fn metadata_statement(backend: DatabaseBackend) -> Statement {
                     "SELECT name,\"unique\",origin,partial FROM pragma_index_list({owner}) LIMIT 4"
                 ),
                 &[
-                    ("index_name", "name"),
-                    ("index_unique", "\"unique\""),
-                    ("index_origin", "origin"),
-                    ("index_partial", "partial"),
+                    ("t0", "name"),
+                    ("i0", "\"unique\""),
+                    ("t1", "origin"),
+                    ("i1", "partial"),
                 ],
             ));
             branches.push(branch("fk", &owner,
                 &format!("SELECT \"table\",\"from\",\"to\",on_update,on_delete,\"match\" FROM pragma_foreign_key_list({owner}) LIMIT 2"),
-                &[("fk_table", "\"table\""), ("fk_from", "\"from\""), ("fk_to", "\"to\""),
-                  ("fk_update", "on_update"), ("fk_delete", "on_delete"), ("fk_match", "\"match\"")]));
+                &[("t0", "\"table\""), ("t1", "\"from\""), ("t2", "\"to\""),
+                  ("t3", "on_update"), ("t4", "on_delete"), ("t5", "\"match\"")]));
         }
         for (index, table) in [expected::OPERATIONS, expected::ITEMS]
             .into_iter()
@@ -90,7 +68,7 @@ pub(super) fn metadata_statement(backend: DatabaseBackend) -> Statement {
                 values.push(name.into());
                 branches.push(branch("trigger", &owner,
                     &format!("SELECT name,sql FROM sqlite_schema WHERE type='trigger' AND name=${} AND tbl_name={owner} LIMIT 2", values.len()),
-                    &[("trigger_name", "name"), ("trigger_sql", "sql")]));
+                    &[("t0", "name"), ("t1", "sql")]));
             }
         }
         values.push("s75_legacy_reverses".into());
@@ -101,7 +79,7 @@ pub(super) fn metadata_statement(backend: DatabaseBackend) -> Statement {
                 "SELECT sql FROM sqlite_schema WHERE type='index' AND tbl_name=$1 AND name=${} LIMIT 2",
                 values.len()
             ),
-            &[("special_sql", "sql")],
+            &[("t0", "sql")],
         ));
         (branches.join(" UNION ALL "), values)
     });
@@ -154,35 +132,34 @@ impl Table {
     pub(super) fn push(&mut self, row: &QueryResult) -> AppResult<()> {
         let kind: String = row.try_get("", "kind")?;
         match kind.as_str() {
-            "table" => self.ddl.push(row.try_get("", "table_sql")?),
+            "table" => self.ddl.push(row.try_get("", "t0")?),
             "column" => self.columns.push(Column {
-                cid: row.try_get("", "column_cid")?,
-                name: row.try_get("", "column_name")?,
-                ty: row.try_get("", "column_type")?,
-                nonnull: row.try_get("", "column_notnull")?,
-                default: row.try_get("", "column_default")?,
-                pk: row.try_get("", "column_pk")?,
-                hidden: row.try_get("", "column_hidden")?,
+                cid: row.try_get("", "i0")?,
+                name: row.try_get("", "t0")?,
+                ty: row.try_get("", "t1")?,
+                nonnull: row.try_get("", "i1")?,
+                default: row.try_get("", "t2")?,
+                pk: row.try_get("", "i2")?,
+                hidden: row.try_get("", "i3")?,
             }),
             "index" => self.indexes.push(Index {
-                name: row.try_get("", "index_name")?,
-                unique: row.try_get("", "index_unique")?,
-                origin: row.try_get("", "index_origin")?,
-                partial: row.try_get("", "index_partial")?,
+                name: row.try_get("", "t0")?,
+                unique: row.try_get("", "i0")?,
+                origin: row.try_get("", "t1")?,
+                partial: row.try_get("", "i1")?,
             }),
             "fk" => self.foreign_keys.push([
-                row.try_get("", "fk_table")?,
-                row.try_get("", "fk_from")?,
-                row.try_get("", "fk_to")?,
-                row.try_get("", "fk_update")?,
-                row.try_get("", "fk_delete")?,
-                row.try_get("", "fk_match")?,
+                row.try_get("", "t0")?,
+                row.try_get("", "t1")?,
+                row.try_get("", "t2")?,
+                row.try_get("", "t3")?,
+                row.try_get("", "t4")?,
+                row.try_get("", "t5")?,
             ]),
-            "trigger" => self.triggers.push((
-                row.try_get("", "trigger_name")?,
-                row.try_get("", "trigger_sql")?,
-            )),
-            "special" => self.special.push(row.try_get("", "special_sql")?),
+            "trigger" => self
+                .triggers
+                .push((row.try_get("", "t0")?, row.try_get("", "t1")?)),
+            "special" => self.special.push(row.try_get("", "t0")?),
             _ => return Err(invalid()),
         }
         Ok(())

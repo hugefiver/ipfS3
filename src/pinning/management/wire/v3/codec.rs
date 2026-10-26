@@ -11,10 +11,9 @@ use std::io::{self, Read, Write};
 #[cfg(test)]
 mod continuation_tests;
 mod native_source;
+pub(crate) mod physical;
 mod read_buffer;
 mod short_cell;
-pub(crate) mod physical;
-pub(crate) mod owned;
 use short_cell::PendingCell;
 pub(super) use short_cell::Record;
 #[cfg(test)]
@@ -261,6 +260,9 @@ impl<W: Write> Writer<W> {
     pub fn budget_mut(&mut self) -> &mut Budget {
         &mut self.budget
     }
+    pub(crate) fn invalidate(&mut self) {
+        self.failed = true;
+    }
     pub(super) fn take_budget(&mut self) -> Budget {
         self.budget.take()
     }
@@ -428,7 +430,6 @@ pub struct Reader<R> {
     started: bool,
     last_frame_resident: usize,
     pending: Option<PendingCell>,
-    replay: Option<owned::Index>,
 }
 impl<R: Read> Reader<R> {
     pub fn new(input: R, projection: Projection, budget: Budget) -> Result<Self> {
@@ -466,7 +467,6 @@ impl<R: Read> Reader<R> {
             started: false,
             last_frame_resident: 0,
             pending: None,
-            replay: None,
         })
     }
     pub fn verified(&self) -> bool {
@@ -606,48 +606,26 @@ impl<R: Read> Reader<R> {
             self.read_prepaid_exact(&mut header[4..])?;
         }
         let kind = header[4];
-        if !match kind {
-            0 => true,
-            1 => (2..=CELL_BYTES + 1).contains(&length),
-            2 => (2..=257).contains(&length),
-            3..=6 => length == 1,
-            7 => (5..=4 + 256 + CELL_BYTES).contains(&length),
-            _ => false,
-        } {
-            return Err(SafeError::InvalidInput);
-        }
-        if kind == 7 && self.replay.is_none() {
+        physical::shape(kind, length)?;
+        if kind == 7 {
             return self.read_short_cell(length).map(Some);
         }
         // Prepay work and peak parsing/key state before requesting the payload.
         if length > 1 {
             self.prepay_read(length - 1)?;
         }
-        let resident = match kind {
-            0 => if self.replay.is_some() { 5 * FRAME_BYTES } else { length - 1 },
-            1 => length - 1 + 4,
-            _ => 2 * (length - 1) + std::mem::size_of::<Frame>(),
-        };
-        let _resident = limit(self.budget.reserve(resident))?;
+        let memory = limit(self.budget.reserve(physical::resident(kind, length - 1)))?;
         let mut payload = vec![0; length - 1];
         if !payload.is_empty() {
             self.read_prepaid_exact(&mut payload)?;
         }
-        if let Some(index) = &mut self.replay {
-            let record = index.record(kind, &payload, &mut self.budget)?;
-            self.last_frame_resident = resident;
-            if record.is_none() {
-                if self.buffer.as_ref().is_some_and(|buffer| buffer.available() != 0) {
-                    return Err(SafeError::InvalidInput);
-                }
-                self.prepay_read(1)?;
-                probe_eof(&mut self.input, &self.budget)?;
-                self.verified = true;
-            }
-            return Ok(record);
-        }
-        let checked = physical::decode(
-            &mut self.state, &mut self.integrity, kind, &payload, &mut self.budget,
+        let checked = physical::decode_reserved(
+            &mut self.state,
+            &mut self.integrity,
+            kind,
+            &payload,
+            &mut self.budget,
+            memory,
         )?;
         self.last_frame_resident = checked.resident;
         if checked.terminal() {
@@ -663,7 +641,14 @@ impl<R: Read> Reader<R> {
             self.verified = true;
             return Ok(None);
         }
-        Ok(Some(checked.into_record(&mut self.budget)?))
+        let record = match checked.value {
+            physical::Value::Chunk(_) => {
+                drop(checked);
+                Record::Event(Event::Chunk(payload))
+            }
+            _ => checked.into_record(&mut self.budget)?,
+        };
+        Ok(Some(record))
     }
 }
 

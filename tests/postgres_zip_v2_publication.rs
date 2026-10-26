@@ -6,15 +6,18 @@ use std::{collections::BTreeMap, future::Future, panic::AssertUnwindSafe, time::
 use chrono::Utc;
 use futures_util::FutureExt;
 use ipfs_s3_gateway::{
-    config::{PinningConfig, PolicyConfig, ProviderConfig},
+    config::{
+        DecompressZipConfig, OptionalPinControlMode, PinningConfig, PolicyConfig, ProviderConfig,
+    },
     error::AppError,
     import::{ImportSource, SupersedeReason},
     pinning::{
         config::ValidatedPinningConfig,
+        decision::DecisionOrigin,
         policy::PublicationPolicy,
         zip_policy::{
-            ValidatedZipOutputRules, ZipOutputRuleConfig, ZipPublishedOutput, ZipRuleEffect,
-            ZipTargets as PolicyTargets,
+            ValidatedZipOutputRules, ZipCaptureContext, ZipOutputRuleConfig, ZipPublishedOutput,
+            ZipRuleEffect, ZipTargets as PolicyTargets, capture_zip_intent,
         },
     },
     store::{
@@ -30,7 +33,7 @@ use ipfs_s3_gateway::{
         },
         zip,
     },
-    zip::options::ZipTargets,
+    zip::options::{self, ZipTargets, parse_authenticated_zip_controls},
 };
 use sea_orm::{
     ConnectOptions, ConnectionTrait, Database, DatabaseBackend, DatabaseConnection, EntityTrait,
@@ -253,6 +256,7 @@ async fn count(db: &DatabaseConnection, table: &str) -> i64 {
 struct Policy {
     config: ValidatedPinningConfig,
     rules: ValidatedZipOutputRules,
+    zip_config: DecompressZipConfig,
 }
 
 impl Policy {
@@ -289,8 +293,9 @@ impl Policy {
             |_| None,
         )
         .unwrap();
-        let rules = ValidatedZipOutputRules::compile(
-            &[ZipOutputRuleConfig {
+        let zip_config = DecompressZipConfig {
+            auto_pin_outputs: Some(true),
+            pin_output_rules: vec![ZipOutputRuleConfig {
                 name: "outputs".into(),
                 priority: 1,
                 bucket: "bucket".into(),
@@ -298,13 +303,17 @@ impl Policy {
                 effect: ZipRuleEffect::Allow,
                 policy_id: Some(config.policies[0].identity.clone()),
             }],
-            &config,
-        )
-        .unwrap();
+            ..Default::default()
+        };
+        let rules = ValidatedZipOutputRules::from_config(&zip_config, &config).unwrap();
         ledger::register_route(db, "remote", &config.providers[0].identity)
             .await
             .unwrap();
-        Self { config, rules }
+        Self {
+            config,
+            rules,
+            zip_config,
+        }
     }
 
     async fn publish(
@@ -324,6 +333,53 @@ impl Policy {
 
     fn admission(&self, id: &str, source_key: &str, root: bool) -> execution::Admission {
         let contract = "{\"contract\":\"v2\"}";
+        let zip_config = DecompressZipConfig {
+            unixfs_directory_root: root,
+            ..self.zip_config.clone()
+        };
+        let mut headers = http::HeaderMap::new();
+        headers.insert(options::ZIP_CONTRACT, "v2".parse().unwrap());
+        headers.insert(options::ZIP_TOKEN, "same-token".parse().unwrap());
+        headers.insert(options::PUBLISH_SOURCE, "false".parse().unwrap());
+        headers.insert(options::PUBLISH_EXTRACTED, "true".parse().unwrap());
+        headers.insert(options::ZIP_TARGETS, "extracted".parse().unwrap());
+        let controls = parse_authenticated_zip_controls(
+            &headers,
+            &[("decompress-zip".into(), "out/".into())],
+            &[],
+            true,
+            zip_config.unixfs_directory_root,
+        )
+        .unwrap()
+        .unwrap();
+        let capture = capture_zip_intent(
+            &self.config,
+            &zip_config,
+            OptionalPinControlMode::Warn,
+            ZipCaptureContext {
+                bucket: "bucket",
+                source_key,
+                target_prefix: "out/",
+                tags: &[],
+            },
+            &controls,
+            DecisionOrigin::new("principal", id),
+        )
+        .unwrap();
+        let options = capture.v2_options().unwrap();
+        assert_eq!(
+            options,
+            options::ZipV2Options {
+                publish_source: false,
+                publish_extracted: true,
+                targets: ZipTargets::Extracted,
+                token: "same-token".into(),
+                root_override: None,
+                root_enabled: root,
+                result_version: 2,
+            }
+        );
+        assert_eq!(capture.policy_revision(), self.rules.revision());
         execution::Admission {
             id: id.into(),
             owner: "principal".into(),
@@ -333,10 +389,12 @@ impl Policy {
             request_contract: contract.into(),
             bucket: "bucket".into(),
             source_key: source_key.into(),
-            captured_options: serde_json::json!({"options":{
-                "publish_source":false,"publish_extracted":true,"targets":ZipTargets::Extracted,
-                "token":"same-token","root_override":null,"root_enabled":root,"result_version":2},
-                "rule_revision":self.rules.revision()})
+            captured_options: serde_json::json!({
+                "options": options,
+                "target_prefix": capture.target_prefix(),
+                "rule_revision": capture.policy_revision(),
+                "zip_intent": capture,
+            })
             .to_string(),
         }
     }
@@ -593,6 +651,7 @@ async fn same_token_same_input_two_connections_commit_one_version_targets_and_qu
         );
         assert_eq!(first.id, second.id);
         a.id = first.id;
+        a.captured_options = first.captured_options;
         let outputs = [("one", "out/one", "cid-one")];
         let claim = prepare(&pg.a, &a, &outputs).await;
         assert!(

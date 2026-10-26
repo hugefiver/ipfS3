@@ -8,6 +8,7 @@ use serde::{Serialize, de::DeserializeOwned};
 pub(crate) trait Work {
     type Error;
     fn application(error: AppError) -> Self::Error;
+    fn into_app(error: Self::Error) -> AppError;
     fn decode(&self) -> Option<DecodeWork<'_>>;
     fn copy<T: Serialize + ?Sized>(&self, value: &T) -> std::result::Result<(), Self::Error>;
     fn cells(&self, count: usize, bytes: usize) -> std::result::Result<(), Self::Error>;
@@ -19,6 +20,9 @@ pub(crate) trait Work {
 }
 impl Work for () {
     type Error = AppError;
+    fn into_app(error: AppError) -> AppError {
+        error
+    }
     fn application(error: AppError) -> AppError {
         error
     }
@@ -37,6 +41,9 @@ impl Work for () {
 }
 impl Work for DecodeWork<'_> {
     type Error = ManagementError;
+    fn into_app(error: ManagementError) -> AppError {
+        management::admission::work_error(error)
+    }
     fn decode(&self) -> Option<DecodeWork<'_>> {
         Some(*self)
     }

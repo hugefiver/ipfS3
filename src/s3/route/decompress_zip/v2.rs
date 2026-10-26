@@ -1328,7 +1328,9 @@ pub(super) async fn put(
     if lease.cancelled.is_cancelled() {
         return Err(conflict());
     }
-    if let Err(error) = publication::publish_captured_zip(state.store.db(), publication).await {
+    if let Err(error) =
+        publication::application::publish_captured_zip(&state.store, publication).await
+    {
         if matches!(error, AppError::StaleContentMutation) {
             let fenced = if options.publish_source {
                 execution::fence(state.store.db(), &claim).await

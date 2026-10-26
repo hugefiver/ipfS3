@@ -29,6 +29,11 @@ use crate::{
 };
 
 pub type DateTimeUtc = DateTime<Utc>;
+pub(in crate::store::pinning) mod production;
+#[cfg(test)]
+mod runtime_release_tests;
+#[cfg(test)]
+mod runtime_wake_tests;
 
 const REMOTE_STATUS_RESERVED: &str = "reserved";
 const REMOTE_STATUS_QUEUED: &str = "queued";
@@ -263,6 +268,30 @@ pub async fn read_usage<C: ConnectionTrait>(
         .await?)
 }
 
+async fn read_runtime_usage(
+    tx: &crate::store::RuntimeTransaction,
+    provider: &str,
+    work: DecodeWork<'_>,
+) -> AppResult<Option<pin_provider_usage::Model>> {
+    let key = [("provider".into(), provider.to_owned())].into();
+    let catalog = tx.catalog(work);
+    let binding = super::legacy_migration::resolve_with_catalog(
+        "pin_provider_usage",
+        &key,
+        provider,
+        &work,
+        catalog,
+    )
+    .await
+    .map_err(admission::work_error)?;
+    let operational = binding
+        .as_ref()
+        .map_or(provider, |binding| binding.operational_key.as_str());
+    records::current_model::<pin_provider_usage::Entity, _>(&catalog, &[operational], work)
+        .await
+        .map_err(admission::work_error)
+}
+
 /// Ensures the provider has a zero-initialized usage row and returns its current values.
 ///
 /// This never opens a transaction. Callers that combine it with remote/target state changes must
@@ -364,12 +393,12 @@ pub(crate) async fn reserve_unique_with_work<C: ConnectionTrait>(
 ) -> AppResult<ReservationOutcome> {
     reserve_unique_for_intent_with_work(
         db,
-        (provider, cid),
-        cid_size,
+        (provider, cid, cid_size),
         limits,
         now,
         ReservationIntent::Publication,
         work,
+        None,
     )
     .await
 }
@@ -399,8 +428,7 @@ async fn reserve_unique_for_intent<C: ConnectionTrait>(
     let work = SharedDecodeBudget::default();
     reserve_unique_for_intent_with_work(
         db,
-        (provider, cid),
-        cid_size,
+        (provider, cid, cid_size),
         limits,
         now,
         if waiter {
@@ -409,24 +437,30 @@ async fn reserve_unique_for_intent<C: ConnectionTrait>(
             ReservationIntent::Admission
         },
         DecodeWork::shared(&work),
+        None,
     )
     .await
 }
 async fn reserve_unique_for_intent_with_work<C: ConnectionTrait>(
     db: &C,
-    (provider, cid): (&str, &str),
-    cid_size: i64,
+    (provider, cid, cid_size): (&str, &str, i64),
     limits: &ProviderLimitMap,
     now: DateTimeUtc,
     intent: ReservationIntent,
     work: DecodeWork<'_>,
+    runtime: Option<&crate::store::RuntimeTransaction>,
 ) -> AppResult<ReservationOutcome> {
     let waiter = matches!(intent, ReservationIntent::Waiter);
     super::management::admission::lock_sqlite_writer_in_caller_transaction(db).await?;
-    if super::legacy_migration::source_is_migrated_with_work(db, provider, work)
-        .await
-        .map_err(admission::work_error)?
-    {
+    let migrated = match runtime {
+        Some(tx) => {
+            super::legacy_migration::source_is_migrated_catalog(tx.catalog(work), provider, work)
+                .await
+        }
+        None => super::legacy_migration::source_is_migrated_with_work(db, provider, work).await,
+    }
+    .map_err(admission::work_error)?;
+    if migrated {
         return Err(invalid_quota(
             "migrated legacy namespace cannot allocate or revive",
         ));
@@ -434,12 +468,12 @@ async fn reserve_unique_for_intent_with_work<C: ConnectionTrait>(
     for attempt in 0..SQLITE_RETRY_LIMIT {
         let outcome = match reserve_unique_attempt_with_work(
             db,
-            (provider, cid),
-            cid_size,
+            (provider, cid, cid_size),
             limits,
             now,
             waiter,
             work,
+            runtime,
         )
         .await
         {
@@ -474,6 +508,72 @@ async fn reserve_unique_for_intent_with_work<C: ConnectionTrait>(
     Err(AppError::Database(
         "quota reservation exhausted retrying a concurrent SQLite write".to_owned(),
     ))
+}
+
+pub(in crate::store::pinning) async fn reserve_runtime_unique(
+    tx: &crate::store::RuntimeTransaction,
+    provider: &str,
+    cid: &str,
+    cid_size: i64,
+    limits: &ProviderLimitMap,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+) -> AppResult<ReservationOutcome> {
+    if tx.db().get_database_backend() != DatabaseBackend::Sqlite {
+        return reserve_unique(tx.db(), provider, cid, cid_size, limits, now).await;
+    }
+    reserve_unique_for_intent_with_work(
+        tx.db(),
+        (provider, cid, cid_size),
+        limits,
+        now,
+        ReservationIntent::Admission,
+        work,
+        Some(tx),
+    )
+    .await
+}
+
+pub(in crate::store::pinning) async fn reserve_runtime_publication(
+    tx: &crate::store::RuntimeTransaction,
+    provider: &str,
+    cid: &str,
+    cid_size: i64,
+    limits: &ProviderLimitMap,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+) -> AppResult<ReservationOutcome> {
+    reserve_unique_for_intent_with_work(
+        tx.db(),
+        (provider, cid, cid_size),
+        limits,
+        now,
+        ReservationIntent::Publication,
+        work,
+        Some(tx),
+    )
+    .await
+}
+
+pub(in crate::store::pinning) async fn reserve_runtime_waiter(
+    tx: &crate::store::RuntimeTransaction,
+    provider: &str,
+    cid: &str,
+    cid_size: i64,
+    limits: &ProviderLimitMap,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+) -> AppResult<ReservationOutcome> {
+    reserve_unique_for_intent_with_work(
+        tx.db(),
+        (provider, cid, cid_size),
+        limits,
+        now,
+        ReservationIntent::Waiter,
+        work,
+        Some(tx),
+    )
+    .await
 }
 
 /// Recomputes and persists a remote pin's newest active desired-target touch.
@@ -520,6 +620,7 @@ pub async fn confirmed_release<C: ConnectionTrait>(
         expected_remote_epoch,
         RequestIdentityGuard::Any,
         now,
+        None,
     )
     .await
 }
@@ -539,6 +640,28 @@ pub(crate) async fn confirmed_release_for_request<C: ConnectionTrait>(
         expected_remote_epoch,
         RequestIdentityGuard::Exact(expected_request_id),
         now,
+        None,
+    )
+    .await
+}
+
+pub(in crate::store::pinning) async fn confirmed_runtime_release_for_request(
+    tx: &crate::store::RuntimeTransaction,
+    provider: &str,
+    cid: &str,
+    epoch: i64,
+    request: Option<&str>,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+) -> AppResult<ConfirmedReleaseOutcome> {
+    confirmed_release_inner(
+        tx.db(),
+        provider,
+        cid,
+        epoch,
+        RequestIdentityGuard::Exact(request),
+        now,
+        Some((tx, work)),
     )
     .await
 }
@@ -555,15 +678,45 @@ async fn confirmed_release_inner<C: ConnectionTrait>(
     expected_remote_epoch: i64,
     request_guard: RequestIdentityGuard<'_>,
     now: DateTimeUtc,
+    runtime: Option<(&crate::store::RuntimeTransaction, DecodeWork<'_>)>,
 ) -> AppResult<ConfirmedReleaseOutcome> {
-    if super::ledger::submission::has_debt(db, provider).await? {
+    let debt = match runtime {
+        Some((tx, work)) => {
+            super::ledger::submission::admission_barrier_with_catalog(
+                provider,
+                tx.catalog(work),
+                work,
+            )
+            .await?
+                != super::ledger::submission::AdmissionBarrier::Clear
+        }
+        None => super::ledger::submission::has_debt(db, provider).await?,
+    };
+    if debt {
         return Ok(ConfirmedReleaseOutcome::Stale);
     }
-    if let Some(row) = super::ledger::get(db, provider, cid).await?
+    let ledger = match runtime {
+        Some((tx, work)) => {
+            super::ledger::get_catalog(tx.catalog(work), provider, cid, work).await?
+        }
+        None => super::ledger::get(db, provider, cid).await?,
+    };
+    if let Some(row) = ledger
         && super::ledger::decode_route(&row)
             .is_some_and(|route| super::ledger::submission::is_rpc(&route))
         && (row.effect != "not_created"
-            || super::ledger::submission::matching_pin_held(db, provider, cid).await?)
+            || match runtime {
+                Some((tx, work)) => {
+                    super::ledger::submission::matching_pin_held_catalog(
+                        tx.catalog(work),
+                        provider,
+                        cid,
+                        work,
+                    )
+                    .await?
+                }
+                None => super::ledger::submission::matching_pin_held(db, provider, cid).await?,
+            })
     {
         return Ok(ConfirmedReleaseOutcome::Stale);
     }
@@ -593,9 +746,11 @@ async fn confirmed_release_inner<C: ConnectionTrait>(
         return Err(invalid_quota("remote CID size cannot be negative"));
     }
 
-    let usage = read_usage(db, provider)
-        .await?
-        .ok_or_else(|| AppError::Internal(format!("missing provider usage row for {provider}")))?;
+    let usage = match runtime {
+        Some((tx, work)) => read_runtime_usage(tx, provider, work).await?,
+        None => read_usage(db, provider).await?,
+    }
+    .ok_or_else(|| AppError::Internal(format!("missing provider usage row for {provider}")))?;
     let next_bytes = usage
         .reserved_bytes
         .checked_sub(remote.cid_size)
@@ -669,8 +824,16 @@ async fn confirmed_release_inner<C: ConnectionTrait>(
                 .to_owned(),
         ));
     }
-    super::ledger::archive_confirmed_release(db, &remote).await?;
-    super::ledger::mark_effect(db, provider, cid, "absent").await?;
+    match runtime {
+        Some((tx, work)) => {
+            super::ledger::archive_runtime_confirmed_release(tx, &remote, work).await?;
+            super::ledger::mark_runtime_effect(tx, provider, cid, "absent", work).await?;
+        }
+        None => {
+            super::ledger::archive_confirmed_release(db, &remote).await?;
+            super::ledger::mark_effect(db, provider, cid, "absent").await?;
+        }
+    }
     Ok(ConfirmedReleaseOutcome::Released)
 }
 
@@ -685,6 +848,16 @@ pub async fn wake_provider_waiters<C: ConnectionTrait>(
     now: DateTimeUtc,
 ) -> AppResult<Vec<String>> {
     leases::wake_quota_waiting_targets(db, provider, limits, now).await
+}
+
+pub(crate) async fn wake_runtime_provider_waiters(
+    tx: &crate::store::RuntimeTransaction,
+    provider: &str,
+    limits: &ProviderLimits,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+) -> AppResult<Vec<String>> {
+    leases::wake_runtime_quota_waiting_targets(tx, provider, limits, now, work).await
 }
 
 /// Marks enough oldest reservations to satisfy the oldest active FIFO waiter after confirmation.
@@ -779,25 +952,29 @@ async fn reserve_unique_attempt<C: ConnectionTrait>(
     let work = SharedDecodeBudget::default();
     reserve_unique_attempt_with_work(
         db,
-        (provider, cid),
-        cid_size,
+        (provider, cid, cid_size),
         limits,
         now,
         waiter,
         DecodeWork::shared(&work),
+        None,
     )
     .await
 }
 async fn reserve_unique_attempt_with_work<C: ConnectionTrait>(
     db: &C,
-    (provider, cid): (&str, &str),
-    cid_size: i64,
+    (provider, cid, cid_size): (&str, &str, i64),
     limits: &ProviderLimitMap,
     now: DateTimeUtc,
     waiter: bool,
     work: DecodeWork<'_>,
+    runtime: Option<&crate::store::RuntimeTransaction>,
 ) -> AppResult<ReserveAttempt> {
-    if super::ledger::allocation_cid_with_work(db, provider, cid, work).await? != cid {
+    let catalog = runtime.map_or_else(
+        || super::legacy_migration::ReceiptCatalog::full(db),
+        |tx| tx.catalog(work),
+    );
+    if super::ledger::allocation_cid_with_work(&catalog, provider, cid, work).await? != cid {
         return Err(invalid_quota(
             "new RPC target must use the canonical allocation CID",
         ));
@@ -805,15 +982,32 @@ async fn reserve_unique_attempt_with_work<C: ConnectionTrait>(
     // QuotaWaiting/Blocked can themselves become a newly published target.
     // Registered admission therefore precedes every outcome, not only capacity
     // grants. Keep the old pre-registry low-level lock sequence unchanged.
-    let prelocked = if admission::provider_registered_with_work(db, provider, work).await? {
+    let prelocked = if admission::provider_registered_with_work(&catalog, provider, work).await? {
         let remote = acquire_existing_remote(db, provider, cid).await?;
-        lock_allocation_admission_with_work(db, provider, work).await?;
+        match runtime {
+            Some(tx) => lock_runtime_allocation_admission(tx, provider, work).await?,
+            None => lock_allocation_admission_with_work(db, provider, work).await?,
+        }
         Some(remote)
     } else {
-        admission::check_provider_with_work(db, provider, work).await?;
+        match runtime {
+            Some(tx) => admission::check_provider_catalog(tx.catalog(work), provider, work).await?,
+            None => admission::check_provider_with_work(db, provider, work).await?,
+        }
         None
     };
-    match super::ledger::submission::admission_barrier(db, provider).await? {
+    let barrier = match runtime {
+        Some(tx) => {
+            super::ledger::submission::admission_barrier_with_catalog(
+                provider,
+                tx.catalog(work),
+                work,
+            )
+            .await?
+        }
+        None => super::ledger::submission::admission_barrier(db, provider).await?,
+    };
+    match barrier {
         super::ledger::submission::AdmissionBarrier::Temporary => {
             return Ok(ReserveAttempt::Outcome(ReservationOutcome::QuotaWaiting {
                 evict: Vec::new(),
@@ -843,27 +1037,54 @@ async fn reserve_unique_attempt_with_work<C: ConnectionTrait>(
     match existing {
         Some(remote) if is_capacity_holding_status(&remote.status) => {
             // This attempt already checked admission before every quota outcome.
-            assert_reusable_route_after_admission(db, provider, cid, work).await?;
-            reuse_capacity_holding_remote(db, provider, cid, remote, now).await
+            match runtime {
+                Some(tx) => {
+                    let catalog = tx.catalog(work);
+                    let candidates = catalog
+                        .load(
+                            &super::legacy_migration::resource_receipt_selectors(provider, cid),
+                            work,
+                        )
+                        .await
+                        .map_err(admission::work_error)?;
+                    assert_reusable_route_from_candidates(
+                        provider,
+                        cid,
+                        work,
+                        Some(candidates),
+                        catalog,
+                    )
+                    .await?;
+                }
+                None => assert_reusable_route_after_admission(db, provider, cid, work).await?,
+            }
+            reuse_capacity_holding_remote(db, provider, cid, remote, now, work, runtime).await
         }
         Some(remote) if remote.status == REMOTE_STATUS_ABSENT => {
             assert_new_allocation_safe(db, provider).await?;
             reacquire_absent_remote(
                 db,
-                (provider, cid),
-                cid_size,
+                (provider, cid, cid_size),
                 provider_limits,
                 remote,
                 now,
                 work,
+                runtime,
             )
             .await
         }
         Some(_) => Err(invalid_quota("remote pin has an unknown status")),
         None => {
             assert_new_allocation_safe(db, provider).await?;
-            reserve_new_remote_with_work(db, provider, cid, cid_size, provider_limits, now, work)
-                .await
+            reserve_new_remote_with_work(
+                db,
+                (provider, cid, cid_size),
+                provider_limits,
+                now,
+                work,
+                runtime,
+            )
+            .await
         }
     }
 }
@@ -891,6 +1112,30 @@ pub(crate) async fn assert_reusable_route_with_work<C: ConnectionTrait>(
     assert_reusable_route_after_admission(db, provider, cid, work).await
 }
 
+pub(in crate::store::pinning) fn assert_reusable_route_catalog<'a>(
+    catalog: super::legacy_migration::ReceiptCatalog<'a>,
+    provider: &'a str,
+    cid: &'a str,
+    work: DecodeWork<'a>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = AppResult<()>> + Send + 'a>> {
+    if matches!(catalog, super::legacy_migration::ReceiptCatalog::Full(_)) {
+        return Box::pin(async move {
+            assert_reusable_route_with_work(&catalog, provider, cid, work).await
+        });
+    }
+    Box::pin(async move {
+        admission::check_provider_catalog(catalog, provider, work).await?;
+        let candidates = catalog
+            .load(
+                &super::legacy_migration::resource_receipt_selectors(provider, cid),
+                work,
+            )
+            .await
+            .map_err(admission::work_error)?;
+        assert_reusable_route_from_candidates(provider, cid, work, Some(candidates), catalog).await
+    })
+}
+
 async fn assert_reusable_route_after_admission<C: ConnectionTrait>(
     db: &C,
     provider: &str,
@@ -901,14 +1146,33 @@ async fn assert_reusable_route_after_admission<C: ConnectionTrait>(
         super::legacy_migration::resource_receipt_candidates_with_work(db, provider, cid, work)
             .await
             .map_err(admission::work_error)?;
+    assert_reusable_route_from_candidates(
+        provider,
+        cid,
+        work,
+        candidates,
+        super::legacy_migration::ReceiptCatalog::full(db),
+    )
+    .await
+}
+
+async fn assert_reusable_route_from_candidates(
+    provider: &str,
+    cid: &str,
+    work: DecodeWork<'_>,
+    candidates: Option<records::locator::AuthorityView>,
+    catalog: super::legacy_migration::ReceiptCatalog<'_>,
+) -> AppResult<()> {
     let binding = match &candidates {
         Some(candidates) => {
-            super::legacy_migration::resource_binding_from_loaded(
-                db, provider, cid, candidates, work,
+            super::legacy_migration::resource_binding_from_catalog(
+                provider, cid, candidates, work, catalog,
             )
             .await
         }
-        None => super::legacy_migration::resource_binding_with_work(db, provider, cid, work).await,
+        None => {
+            super::legacy_migration::resource_binding_with_work(&catalog, provider, cid, work).await
+        }
     }
     .map_err(admission::work_error)?;
     if binding.is_some_and(|binding| binding.source_retired) {
@@ -916,14 +1180,15 @@ async fn assert_reusable_route_after_admission<C: ConnectionTrait>(
             "retired migration source is not allocation authority",
         ));
     }
-    let configured = records::current_model::<pin_provider_route::Entity, _>(db, &[provider], work)
-        .await
-        .map_err(admission::work_error)?;
+    let configured =
+        records::current_model::<pin_provider_route::Entity, _>(&catalog, &[provider], work)
+            .await
+            .map_err(admission::work_error)?;
     let historical = match &candidates {
         Some(candidates) => {
-            super::ledger::get_from_loaded(db, provider, cid, candidates, work).await?
+            super::ledger::get_from_catalog(provider, cid, candidates, work, catalog).await?
         }
-        None => super::ledger::get_with_work(db, provider, cid, work).await?,
+        None => super::ledger::get_with_work(&catalog, provider, cid, work).await?,
     };
     match (configured, historical) {
         (None, None) if !provider.starts_with("domain:") => Ok(()),
@@ -988,6 +1253,22 @@ pub(crate) async fn lock_allocation_admission_with_work<C: ConnectionTrait>(
     admission::lock_provider_with_work(db, provider, work).await
 }
 
+pub(in crate::store::pinning) async fn lock_runtime_allocation_admission(
+    tx: &crate::store::RuntimeTransaction,
+    provider: &str,
+    work: DecodeWork<'_>,
+) -> AppResult<()> {
+    if tx.db().get_database_backend() != DatabaseBackend::Sqlite {
+        return lock_allocation_admission_with_work(tx.db(), provider, work).await;
+    }
+    admission::lock_sqlite_writer_in_caller_transaction(tx.db()).await?;
+    if admission::provider_registered_with_work(tx.db(), provider, work).await? {
+        work.copy(provider).map_err(admission::work_error)?;
+        lock_publication_usage_rows(tx.db(), &[provider.to_owned()]).await?;
+    }
+    admission::lock_runtime_provider(tx, provider, work).await
+}
+
 /// Prior to Stage 2 the provider column was a user-configurable alias, not an
 /// account identifier. No TOML scope can prove that a newly named domain does not
 /// share that historical account. Quarantine only new explicit allocations while
@@ -1032,6 +1313,8 @@ async fn reuse_capacity_holding_remote<C: ConnectionTrait>(
     cid: &str,
     remote: remote_pin::Model,
     now: DateTimeUtc,
+    work: DecodeWork<'_>,
+    runtime: Option<&crate::store::RuntimeTransaction>,
 ) -> AppResult<ReserveAttempt> {
     let epoch = next_epoch(remote.epoch)?;
     let last_touched_at = newest_active_target_touch(db, provider, cid)
@@ -1056,11 +1339,34 @@ async fn reuse_capacity_holding_remote<C: ConnectionTrait>(
         // already-pinned retained resource restores availability, not a new pin lifetime:
         // leave its observation, ownership and capacity evidence untouched. A queued or
         // unknown remote cannot turn retained history into fresh confirmation.
-        if remote.status == REMOTE_STATUS_PINNED
-            && super::legacy_migration::resource_binding(db, provider, cid)
-                .await?
-                .is_none_or(|binding| binding.historical_route.is_some())
-        {
+        let can_confirm = if remote.status == REMOTE_STATUS_PINNED {
+            let binding = match runtime {
+                Some(tx) => {
+                    let catalog = tx.catalog(work);
+                    let candidates = catalog
+                        .load(
+                            &super::legacy_migration::resource_receipt_selectors(provider, cid),
+                            work,
+                        )
+                        .await
+                        .map_err(admission::work_error)?;
+                    super::legacy_migration::resource_binding_from_catalog(
+                        provider,
+                        cid,
+                        &candidates,
+                        work,
+                        catalog,
+                    )
+                    .await
+                    .map_err(admission::work_error)?
+                }
+                None => super::legacy_migration::resource_binding(db, provider, cid).await?,
+            };
+            binding.is_none_or(|binding| binding.historical_route.is_some())
+        } else {
+            false
+        };
+        if can_confirm {
             remote_pin_ledger::Entity::update_many()
                 .col_expr(remote_pin_ledger::Column::Effect, Expr::value("confirmed"))
                 .filter(remote_pin_ledger::Column::Provider.eq(provider))
@@ -1088,25 +1394,36 @@ async fn reserve_new_remote<C: ConnectionTrait>(
     let work = SharedDecodeBudget::default();
     reserve_new_remote_with_work(
         db,
-        provider,
-        cid,
-        cid_size,
+        (provider, cid, cid_size),
         limits,
         now,
         DecodeWork::shared(&work),
+        None,
     )
     .await
 }
 async fn reserve_new_remote_with_work<C: ConnectionTrait>(
     db: &C,
-    provider: &str,
-    cid: &str,
-    cid_size: i64,
+    (provider, cid, cid_size): (&str, &str, i64),
     limits: &ProviderLimits,
     now: DateTimeUtc,
     work: DecodeWork<'_>,
+    runtime: Option<&crate::store::RuntimeTransaction>,
 ) -> AppResult<ReserveAttempt> {
-    match reserve_capacity(db, provider, cid_size, limits).await? {
+    let capacity = reserve_capacity(db, provider, cid_size, limits).await?;
+    reserve_new_remote_with_capacity(db, (provider, cid, cid_size), now, work, capacity, runtime)
+        .await
+}
+
+async fn reserve_new_remote_with_capacity<C: ConnectionTrait>(
+    db: &C,
+    (provider, cid, cid_size): (&str, &str, i64),
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+    capacity: CapacityReservation,
+    runtime: Option<&crate::store::RuntimeTransaction>,
+) -> AppResult<ReserveAttempt> {
+    match capacity {
         CapacityReservation::Reserved(grant) => {
             let inserted = match remote_pin::Entity::insert(reserved_remote_model(
                 provider, cid, cid_size, 1, now,
@@ -1117,15 +1434,24 @@ async fn reserve_new_remote_with_work<C: ConnectionTrait>(
             {
                 Ok(inserted) => inserted,
                 Err(error) => {
-                    undo_capacity_grant(db, provider, grant).await?;
+                    undo_capacity_grant_core(db, provider, grant, runtime.map(|tx| (tx, work)))
+                        .await?;
                     return Err(error.into());
                 }
             };
             if matches!(inserted, TryInsertResult::Inserted(_)) {
-                super::ledger::capture_reservation_with_work(db, provider, cid, work).await?;
+                match runtime {
+                    Some(tx) => {
+                        super::ledger::capture_runtime_reservation(tx, provider, cid, work).await?
+                    }
+                    None => {
+                        super::ledger::capture_reservation_with_work(db, provider, cid, work)
+                            .await?
+                    }
+                }
                 return Ok(ReserveAttempt::Outcome(ReservationOutcome::Reserved));
             }
-            undo_capacity_grant(db, provider, grant).await?;
+            undo_capacity_grant_core(db, provider, grant, runtime.map(|tx| (tx, work))).await?;
             Ok(ReserveAttempt::Retry)
         }
         CapacityReservation::Waiting(usage) => Ok(ReserveAttempt::Waiting(usage)),
@@ -1135,15 +1461,42 @@ async fn reserve_new_remote_with_work<C: ConnectionTrait>(
 
 async fn reacquire_absent_remote<C: ConnectionTrait>(
     db: &C,
-    (provider, cid): (&str, &str),
-    cid_size: i64,
+    (provider, cid, cid_size): (&str, &str, i64),
     limits: &ProviderLimits,
     remote: remote_pin::Model,
     now: DateTimeUtc,
     work: DecodeWork<'_>,
+    runtime: Option<&crate::store::RuntimeTransaction>,
 ) -> AppResult<ReserveAttempt> {
     let epoch = next_epoch(remote.epoch)?;
-    match reserve_capacity(db, provider, cid_size, limits).await? {
+    let capacity = reserve_capacity(db, provider, cid_size, limits).await?;
+    reacquire_absent_with_capacity(
+        db,
+        (provider, cid),
+        cid_size,
+        remote,
+        epoch,
+        now,
+        work,
+        capacity,
+        runtime,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reacquire_absent_with_capacity<C: ConnectionTrait>(
+    db: &C,
+    (provider, cid): (&str, &str),
+    cid_size: i64,
+    remote: remote_pin::Model,
+    epoch: i64,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+    capacity: CapacityReservation,
+    runtime: Option<&crate::store::RuntimeTransaction>,
+) -> AppResult<ReserveAttempt> {
+    match capacity {
         CapacityReservation::Reserved(grant) => {
             record_order_event("remote_absent_cas");
             let activated = match remote_pin::Entity::update_many()
@@ -1184,15 +1537,24 @@ async fn reacquire_absent_remote<C: ConnectionTrait>(
             {
                 Ok(activated) => activated,
                 Err(error) => {
-                    undo_capacity_grant(db, provider, grant).await?;
+                    undo_capacity_grant_core(db, provider, grant, runtime.map(|tx| (tx, work)))
+                        .await?;
                     return Err(error.into());
                 }
             };
             if activated.rows_affected == 1 {
-                super::ledger::capture_reallocation_with_work(db, provider, cid, work).await?;
+                match runtime {
+                    Some(tx) => {
+                        super::ledger::capture_runtime_reallocation(tx, provider, cid, work).await?
+                    }
+                    None => {
+                        super::ledger::capture_reallocation_with_work(db, provider, cid, work)
+                            .await?
+                    }
+                }
                 Ok(ReserveAttempt::Outcome(ReservationOutcome::Reserved))
             } else {
-                undo_capacity_grant(db, provider, grant).await?;
+                undo_capacity_grant_core(db, provider, grant, runtime.map(|tx| (tx, work))).await?;
                 Ok(ReserveAttempt::Retry)
             }
         }
@@ -1219,6 +1581,16 @@ async fn reserve_capacity<C: ConnectionTrait>(
     limits: &ProviderLimits,
 ) -> AppResult<CapacityReservation> {
     let usage = ensure_usage_row(db, provider).await?;
+    reserve_capacity_from_usage(db, provider, cid_size, limits, usage).await
+}
+
+async fn reserve_capacity_from_usage<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+    cid_size: i64,
+    limits: &ProviderLimits,
+    usage: pin_provider_usage::Model,
+) -> AppResult<CapacityReservation> {
     match reservation_decision(
         ProviderUsage {
             reserved_bytes: usage.reserved_bytes,
@@ -1266,13 +1638,26 @@ async fn reserve_capacity<C: ConnectionTrait>(
 ///
 /// A failed cleanup is an error, never a retry: retrying would let a later observation treat the
 /// unpaired counter increment as a real reservation.
+#[cfg(test)]
 async fn undo_capacity_grant<C: ConnectionTrait>(
     db: &C,
     provider: &str,
     grant: CapacityGrant,
 ) -> AppResult<()> {
+    undo_capacity_grant_core(db, provider, grant, None).await
+}
+
+async fn undo_capacity_grant_core<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+    grant: CapacityGrant,
+    runtime: Option<(&crate::store::RuntimeTransaction, DecodeWork<'_>)>,
+) -> AppResult<()> {
     for attempt in 0..SQLITE_RETRY_LIMIT {
-        let usage = match read_usage(db, provider).await {
+        let usage = match match runtime {
+            Some((tx, work)) => read_runtime_usage(tx, provider, work).await,
+            None => read_usage(db, provider).await,
+        } {
             Ok(Some(usage)) => usage,
             Ok(None) => {
                 return Err(AppError::Internal(format!(

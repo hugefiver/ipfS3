@@ -659,8 +659,42 @@ pub(crate) async fn record_submit_invocation_with_work<C: ConnectionTrait>(
     now: DateTimeUtc,
     work: DecodeWork<'_>,
 ) -> AppResult<Option<history::Model>> {
+    record_invocation_core(db, claimed, api, strategy, now, work, None).await
+}
+
+pub(crate) async fn record_runtime_submit_invocation(
+    tx: &crate::store::RuntimeTransaction,
+    claimed: &ClaimedPinJob,
+    api: &str,
+    strategy: &str,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+) -> AppResult<Option<history::Model>> {
+    if tx.db().get_database_backend() != DatabaseBackend::Sqlite {
+        return record_submit_invocation_with_work(tx.db(), claimed, api, strategy, now, work)
+            .await;
+    }
+    record_invocation_core(tx.db(), claimed, api, strategy, now, work, Some(tx)).await
+}
+
+async fn record_invocation_core<C: ConnectionTrait>(
+    db: &C,
+    claimed: &ClaimedPinJob,
+    api: &str,
+    strategy: &str,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+    runtime: Option<&crate::store::RuntimeTransaction>,
+) -> AppResult<Option<history::Model>> {
     super::management::admission::lock_sqlite_writer_in_caller_transaction(db).await?;
-    if !super::ledger::submit_dispatch_open_with_work(db, &claimed.model, work).await? {
+    let dispatch_open = match runtime {
+        Some(tx) => {
+            super::ledger::submit_dispatch_open_catalog(tx.catalog(work), &claimed.model, work)
+                .await?
+        }
+        None => super::ledger::submit_dispatch_open_with_work(db, &claimed.model, work).await?,
+    };
+    if !dispatch_open {
         return Err(invalid_job(
             "retired domain cannot start another invocation",
         ));
@@ -679,16 +713,38 @@ pub(crate) async fn record_submit_invocation_with_work<C: ConnectionTrait>(
     // Preserve the previous Submit effect for the lifetime fence. A retry's
     // `not_created` evidence is lost as soon as history becomes `unknown`.
     if super::ledger::submission::is_rpc_api(api)
-        && let Some(row) =
-            super::ledger::get(db, &claimed.model.provider, &claimed.model.cid).await?
-        && !super::ledger::submission::held_evidence_known(db, &row).await?
+        && let Some(row) = match runtime {
+            Some(tx) => {
+                super::ledger::get_catalog(
+                    tx.catalog(work),
+                    &claimed.model.provider,
+                    &claimed.model.cid,
+                    work,
+                )
+                .await?
+            }
+            None => super::ledger::get(db, &claimed.model.provider, &claimed.model.cid).await?,
+        }
+        && !match runtime {
+            Some(tx) => {
+                super::ledger::submission::held_evidence_known_catalog(tx.catalog(work), &row, work)
+                    .await?
+            }
+            None => super::ledger::submission::held_evidence_known(db, &row).await?,
+        }
     {
         return Err(invalid_job(
             "historical RPC resource lacks fenced submission evidence",
         ));
     }
-    super::ledger::advance_submit_invocation_epoch(db, claimed, api, strategy).await?;
-    super::quota::lock_allocation_admission_with_work(db, &claimed.model.provider, work).await?;
+    if let Some(tx) = runtime {
+        super::ledger::advance_runtime_submit_epoch(tx, claimed, api, strategy, work).await?;
+        super::quota::lock_runtime_allocation_admission(tx, &claimed.model.provider, work).await?;
+    } else {
+        super::ledger::advance_submit_invocation_epoch(db, claimed, api, strategy).await?;
+        super::quota::lock_allocation_admission_with_work(db, &claimed.model.provider, work)
+            .await?;
+    }
     let old = submission_history(db, &claimed.model.id).await?;
     if let Some(old) = &old {
         if old.api != api
@@ -726,14 +782,34 @@ pub(crate) async fn record_submit_invocation_with_work<C: ConnectionTrait>(
         .exec(db)
         .await?;
     }
-    super::ledger::mark_effect(db, &claimed.model.provider, &claimed.model.cid, "unknown").await?;
-    super::ledger::capture_invocation(
-        db,
-        &claimed.model.id,
-        &claimed.model.provider,
-        &claimed.model.cid,
-    )
-    .await?;
+    if let Some(tx) = runtime {
+        super::ledger::mark_runtime_effect(
+            tx,
+            &claimed.model.provider,
+            &claimed.model.cid,
+            "unknown",
+            work,
+        )
+        .await?;
+        super::ledger::capture_runtime_invocation(
+            tx,
+            &claimed.model.id,
+            &claimed.model.provider,
+            &claimed.model.cid,
+            work,
+        )
+        .await?;
+    } else {
+        super::ledger::mark_effect(db, &claimed.model.provider, &claimed.model.cid, "unknown")
+            .await?;
+        super::ledger::capture_invocation(
+            db,
+            &claimed.model.id,
+            &claimed.model.provider,
+            &claimed.model.cid,
+        )
+        .await?;
+    }
     Ok(old)
 }
 
@@ -1344,15 +1420,42 @@ pub async fn ensure_or_reactivate_submit_job<C: ConnectionTrait>(
 }
 pub(crate) async fn ensure_submit_with_work<C: ConnectionTrait>(
     db: &C,
+    job: TargetPinJob,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+) -> AppResult<EnsureJobOutcome> {
+    ensure_submit_core(db, job, now, work, None).await
+}
+
+pub(crate) async fn ensure_runtime_submit(
+    tx: &crate::store::RuntimeTransaction,
+    job: TargetPinJob,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+) -> AppResult<EnsureJobOutcome> {
+    if tx.get_database_backend() != DatabaseBackend::Sqlite {
+        return ensure_or_reactivate_submit_job(tx.db(), job, now).await;
+    }
+    ensure_submit_core(tx.db(), job, now, work, Some(tx)).await
+}
+
+async fn ensure_submit_core<C: ConnectionTrait>(
+    db: &C,
     mut job: TargetPinJob,
     now: DateTimeUtc,
     work: DecodeWork<'_>,
+    runtime: Option<&crate::store::RuntimeTransaction>,
 ) -> AppResult<EnsureJobOutcome> {
     if job.operation != TargetJobOperation::Submit {
         return Err(invalid_job("submit ensure requires a Submit job"));
     }
     validate_submit_owner_with_work(db, &job, work).await?;
-    super::quota::lock_allocation_admission_with_work(db, &job.provider, work).await?;
+    match runtime {
+        Some(tx) => {
+            super::quota::lock_runtime_allocation_admission(tx, &job.provider, work).await?
+        }
+        None => super::quota::lock_allocation_admission_with_work(db, &job.provider, work).await?,
+    }
     if let Some((_, state)) =
         blocking_live_submit_with_work(db, &job.provider, &job.cid, &job.id, work).await?
     {
@@ -1363,7 +1466,7 @@ pub(crate) async fn ensure_submit_with_work<C: ConnectionTrait>(
         };
     }
     job.next_attempt_at = now;
-    ensure_target_job_with_work(db, job, now, true, work).await
+    ensure_target_job_core(db, job, now, true, work, runtime).await
 }
 
 pub(crate) async fn blocking_live_submit_with_work<C: ConnectionTrait>(
@@ -1419,6 +1522,28 @@ pub(crate) async fn ensure_reconcile_with_work<C: ConnectionTrait>(
     now: DateTimeUtc,
     work: DecodeWork<'_>,
 ) -> AppResult<EnsureJobOutcome> {
+    ensure_reconcile_core(db, job, now, work, None).await
+}
+
+pub(crate) async fn ensure_runtime_reconcile(
+    tx: &crate::store::RuntimeTransaction,
+    job: RemotePinJob,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+) -> AppResult<EnsureJobOutcome> {
+    if tx.db().get_database_backend() != DatabaseBackend::Sqlite {
+        return ensure_reconcile_with_work(tx.db(), job, now, work).await;
+    }
+    ensure_reconcile_core(tx.db(), job, now, work, Some(tx)).await
+}
+
+async fn ensure_reconcile_core<C: ConnectionTrait>(
+    db: &C,
+    job: RemotePinJob,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+    runtime: Option<&crate::store::RuntimeTransaction>,
+) -> AppResult<EnsureJobOutcome> {
     if job.operation != RemoteJobOperation::Reconcile {
         return Err(invalid_job("reconcile ensure requires a Reconcile job"));
     }
@@ -1430,10 +1555,27 @@ pub(crate) async fn ensure_reconcile_with_work<C: ConnectionTrait>(
     if remote.epoch != job.expected_remote_epoch {
         return Err(invalid_job("remote job does not name the current epoch"));
     }
-    let original =
-        super::legacy_migration::original_job_provider_with_work(db, &job.id, &job.provider, work)
+    let original = match runtime {
+        Some(tx) => {
+            super::legacy_migration::original_job_provider_catalog(
+                tx.catalog(work),
+                &job.id,
+                &job.provider,
+                work,
+            )
             .await
-            .map_err(management_error)?;
+        }
+        None => {
+            super::legacy_migration::original_job_provider_with_work(
+                db,
+                &job.id,
+                &job.provider,
+                work,
+            )
+            .await
+        }
+    }
+    .map_err(management_error)?;
     if job.id != stable_reconcile_id(&original, &job.cid, job.expected_remote_epoch) {
         return Err(invalid_job(
             "Reconcile job ID does not match its remote epoch",
@@ -1446,7 +1588,11 @@ pub(crate) async fn ensure_reconcile_with_work<C: ConnectionTrait>(
         .await
         .map_err(management_error)?
     else {
-        return if insert_new_job_with_work(db, NewPinJob::Remote(job), now, work).await? {
+        let inserted = match runtime {
+            Some(tx) => insert_runtime_job(tx, NewPinJob::Remote(job), now, work).await?,
+            None => insert_new_job_with_work(db, NewPinJob::Remote(job), now, work).await?,
+        };
+        return if inserted {
             Ok(EnsureJobOutcome::Inserted)
         } else {
             let persisted = records::current_model::<pin_job::Entity, _>(db, &[&job_id], work)
@@ -1492,6 +1638,27 @@ pub async fn ensure_or_reactivate_unpin_job<C: ConnectionTrait>(
     job: RemotePinJob,
     now: DateTimeUtc,
 ) -> AppResult<EnsureJobOutcome> {
+    ensure_unpin_core(db, job, now, None).await
+}
+
+pub(crate) async fn ensure_runtime_unpin(
+    tx: &crate::store::RuntimeTransaction,
+    job: RemotePinJob,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+) -> AppResult<EnsureJobOutcome> {
+    if tx.get_database_backend() != DatabaseBackend::Sqlite {
+        return ensure_or_reactivate_unpin_job(tx.db(), job, now).await;
+    }
+    ensure_unpin_core(tx.db(), job, now, Some((tx, work))).await
+}
+
+async fn ensure_unpin_core<C: ConnectionTrait>(
+    db: &C,
+    job: RemotePinJob,
+    now: DateTimeUtc,
+    runtime: Option<(&crate::store::RuntimeTransaction, DecodeWork<'_>)>,
+) -> AppResult<EnsureJobOutcome> {
     if job.operation != RemoteJobOperation::Unpin {
         return Err(invalid_job("unpin ensure requires an Unpin job"));
     }
@@ -1500,7 +1667,11 @@ pub async fn ensure_or_reactivate_unpin_job<C: ConnectionTrait>(
     let job_id = job.id.clone();
     let next_attempt_at = job.next_attempt_at;
     let Some(existing) = pin_job::Entity::find_by_id(job_id.clone()).one(db).await? else {
-        return if insert_new_job(db, NewPinJob::Remote(job), now).await? {
+        let inserted = match runtime {
+            Some((tx, work)) => insert_runtime_job(tx, NewPinJob::Remote(job), now, work).await?,
+            None => insert_new_job(db, NewPinJob::Remote(job), now).await?,
+        };
+        return if inserted {
             Ok(EnsureJobOutcome::Inserted)
         } else {
             remote_job_outcome_after_conflict(db, &job_id, next_attempt_at, now).await
@@ -1717,56 +1888,20 @@ pub(crate) async fn claim_due_worker_jobs_fair<C: ConnectionTrait + TransactionT
             .transaction(|txn| {
                 Box::pin(async move {
                     lock_sqlite_claim_writer(txn).await?;
-                    let mut due = Condition::all().add(due_claim_condition(now));
-                    if !active_job_ids.is_empty() {
-                        due = due.add(pin_job::Column::Id.is_not_in(active_job_ids));
-                    }
-                    let due_providers: Vec<String> = pin_job::Entity::find()
-                        .select_only()
-                        .column(pin_job::Column::Provider)
-                        .filter(due.clone())
-                        .group_by(pin_job::Column::Provider)
-                        .into_tuple()
-                        .all(txn)
-                        .await?;
-                    let capacity = usize::try_from(limit).unwrap_or(usize::MAX);
-                    let mut candidates_by_provider = BTreeMap::new();
-                    for provider in due_providers {
-                        let candidates = pin_job::Entity::find()
-                            .filter(due.clone())
-                            .filter(pin_job::Column::Provider.eq(provider.clone()))
-                            .order_by_asc(pin_job::Column::NextAttemptAt)
-                            .order_by_asc(pin_job::Column::Id)
-                            .limit(limit)
-                            .all(txn)
-                            .await?;
-                        if !candidates.is_empty() {
-                            candidates_by_provider.insert(provider, VecDeque::from(candidates));
-                        }
-                    }
-
-                    let fair_plan = select_fair_candidates(
-                        candidates_by_provider,
-                        capacity,
-                        &in_flight_by_provider,
-                        &last_served_ticket_by_provider,
-                        &configured_priorities,
-                    );
-                    let mut update_plan = fair_plan.clone();
-                    update_plan.sort_by(|left, right| left.candidate.id.cmp(&right.candidate.id));
-
-                    let mut claimed = Vec::with_capacity(update_plan.len());
-                    for ranked in update_plan {
-                        if let Some(job) =
-                            claim_candidate(txn, ranked.candidate, now, locked_until).await?
-                        {
-                            claimed.push((ranked.fair_rank, job));
-                        }
-                    }
-                    claimed.sort_by_key(|(fair_rank, _)| *fair_rank);
-                    Ok::<_, sea_orm::DbErr>(
-                        claimed.into_iter().map(|(_, job)| job).collect::<Vec<_>>(),
+                    claim_worker_batch(
+                        txn,
+                        now,
+                        locked_until,
+                        limit,
+                        WorkerClaimSchedule {
+                            in_flight_by_provider: &in_flight_by_provider,
+                            last_served_ticket_by_provider: &last_served_ticket_by_provider,
+                            configured_priorities: &configured_priorities,
+                            active_job_ids: &active_job_ids,
+                        },
+                        None,
                     )
+                    .await
                 })
             })
             .await;
@@ -1782,6 +1917,124 @@ pub(crate) async fn claim_due_worker_jobs_fair<C: ConnectionTrait + TransactionT
         }
     }
     unreachable!("SQLite claim retry loop always returns or errors")
+}
+
+pub(crate) async fn claim_due_worker_jobs_store(
+    store: &crate::store::Store,
+    now: DateTimeUtc,
+    lock_for: ChronoDuration,
+    limit: u64,
+    schedule: WorkerClaimSchedule<'_>,
+) -> AppResult<Vec<ClaimedPinJob>> {
+    if store.db().get_database_backend() != DatabaseBackend::Sqlite {
+        return claim_due_worker_jobs_fair(store.db(), now, lock_for, limit, schedule).await;
+    }
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let work = SharedDecodeBudget::default();
+    for attempt in 0..=MAX_SQLITE_CLAIM_RETRIES {
+        let tx = store.begin_runtime(DecodeWork::shared(&work)).await?;
+        let result = async {
+            lock_sqlite_claim_writer(tx.db()).await?;
+            claim_worker_batch(
+                tx.db(),
+                now,
+                now + lock_for,
+                limit,
+                WorkerClaimSchedule {
+                    in_flight_by_provider: schedule.in_flight_by_provider,
+                    last_served_ticket_by_provider: schedule.last_served_ticket_by_provider,
+                    configured_priorities: schedule.configured_priorities,
+                    active_job_ids: schedule.active_job_ids,
+                },
+                Some(&tx),
+            )
+            .await
+        }
+        .await;
+        match result {
+            Ok(claimed) => {
+                tx.commit().await?;
+                return Ok(claimed);
+            }
+            Err(error) => {
+                tx.rollback().await?;
+                if is_sqlite_contention(&error.to_string()) && attempt < MAX_SQLITE_CLAIM_RETRIES {
+                    sqlite_claim_retry_delay(attempt).await;
+                } else {
+                    return Err(AppError::Database(error.to_string()));
+                }
+            }
+        }
+    }
+    unreachable!("SQLite claim retry loop always returns or errors")
+}
+
+async fn claim_worker_batch(
+    tx: &sea_orm::DatabaseTransaction,
+    now: DateTimeUtc,
+    locked_until: DateTimeUtc,
+    limit: u64,
+    schedule: WorkerClaimSchedule<'_>,
+    runtime: Option<&crate::store::RuntimeTransaction>,
+) -> Result<Vec<ClaimedPinJob>, sea_orm::DbErr> {
+    let mut due = Condition::all().add(due_claim_condition(now));
+    if !schedule.active_job_ids.is_empty() {
+        due = due.add(pin_job::Column::Id.is_not_in(schedule.active_job_ids.clone()));
+    }
+    let providers: Vec<String> = pin_job::Entity::find()
+        .select_only()
+        .column(pin_job::Column::Provider)
+        .filter(due.clone())
+        .group_by(pin_job::Column::Provider)
+        .into_tuple()
+        .all(tx)
+        .await?;
+    let mut candidates_by_provider = BTreeMap::new();
+    for provider in providers {
+        let candidates = pin_job::Entity::find()
+            .filter(due.clone())
+            .filter(pin_job::Column::Provider.eq(provider.clone()))
+            .order_by_asc(pin_job::Column::NextAttemptAt)
+            .order_by_asc(pin_job::Column::Id)
+            .limit(limit)
+            .all(tx)
+            .await?;
+        if !candidates.is_empty() {
+            candidates_by_provider.insert(provider, VecDeque::from(candidates));
+        }
+    }
+    let fair_plan = select_fair_candidates(
+        candidates_by_provider,
+        usize::try_from(limit).unwrap_or(usize::MAX),
+        schedule.in_flight_by_provider,
+        schedule.last_served_ticket_by_provider,
+        schedule.configured_priorities,
+    );
+    let mut update_plan = fair_plan.clone();
+    update_plan.sort_by(|left, right| left.candidate.id.cmp(&right.candidate.id));
+    let mut claimed = Vec::with_capacity(update_plan.len());
+    for ranked in update_plan {
+        let result = if let Some(owner) = runtime {
+            claim_candidate_core(
+                tx,
+                ranked.candidate,
+                now,
+                locked_until,
+                SharedDecodeBudget::default(),
+                Some(owner),
+            )
+            .await?
+        } else {
+            claim_candidate(tx, ranked.candidate, now, locked_until).await?
+        };
+        if let Some(job) = result {
+            claimed.push((ranked.fair_rank, job));
+        }
+    }
+    claimed.sort_by_key(|(rank, _)| *rank);
+    Ok(claimed.into_iter().map(|(_, job)| job).collect())
 }
 
 #[derive(Clone)]
@@ -1910,6 +2163,17 @@ async fn claim_candidate_with_work<C: ConnectionTrait>(
     locked_until: DateTimeUtc,
     work: super::management::records::SharedDecodeBudget,
 ) -> Result<Option<ClaimedPinJob>, sea_orm::DbErr> {
+    claim_candidate_core(db, candidate, now, locked_until, work, None).await
+}
+
+async fn claim_candidate_core<C: ConnectionTrait>(
+    db: &C,
+    candidate: pin_job::Model,
+    now: DateTimeUtc,
+    locked_until: DateTimeUtc,
+    work: SharedDecodeBudget,
+    runtime: Option<&crate::store::RuntimeTransaction>,
+) -> Result<Option<ClaimedPinJob>, sea_orm::DbErr> {
     let context = DecodeWork::shared(&work);
     let budget_error =
         |_| sea_orm::DbErr::Custom("claim data could not be read within its budget".into());
@@ -1954,13 +2218,22 @@ async fn claim_candidate_with_work<C: ConnectionTrait>(
         previous_state,
         object_id,
     };
-    match super::management::actions::job_authority::check_before_call_with_work(
-        db,
-        &claimed.model,
-        work,
-    )
-    .await
-    {
+    let authority = if let Some(tx) = runtime {
+        super::management::actions::job_authority::check_before_call_catalog(
+            tx.catalog(DecodeWork::shared(&work)),
+            &claimed.model,
+            work.clone(),
+        )
+        .await
+    } else {
+        super::management::actions::job_authority::check_before_call_with_work(
+            db,
+            &claimed.model,
+            work,
+        )
+        .await
+    };
+    match authority {
         Ok(_) => Ok(Some(claimed)),
         Err(
             super::management::ManagementError::Confirmation
@@ -2174,11 +2447,27 @@ pub(crate) async fn poll_continuity_owner_with_work<C: ConnectionTrait>(
     request_id: &str,
     work: DecodeWork<'_>,
 ) -> super::management::Result<bool> {
+    poll_continuity_catalog(
+        super::legacy_migration::ReceiptCatalog::full(db),
+        job,
+        request_id,
+        work,
+    )
+    .await
+}
+
+pub(in crate::store::pinning) async fn poll_continuity_catalog(
+    catalog: super::legacy_migration::ReceiptCatalog<'_>,
+    job: &pin_job::Model,
+    request_id: &str,
+    work: DecodeWork<'_>,
+) -> super::management::Result<bool> {
+    let db = &catalog;
     if job.operation != "poll" || !check_target_job_generation_with_work(db, job, work).await? {
         return Ok(false);
     }
     Ok(
-        poll_names_request_with_work(db, job, request_id, work).await?
+        poll_names_request_catalog(catalog, job, request_id, work).await?
             && canonical_desired_target_with_work(db, &job.provider, &job.cid, work)
                 .await?
                 .is_some_and(|target| Some(target.id.as_str()) == job.target_id.as_deref()),
@@ -2205,11 +2494,11 @@ pub(crate) async fn poll_names_request<C: ConnectionTrait>(
     ))
 }
 
-pub(crate) async fn poll_names_request_with_work<C: ConnectionTrait>(
-    db: &C,
+pub(in crate::store::pinning) async fn poll_names_request_catalog(
+    catalog: super::legacy_migration::ReceiptCatalog<'_>,
     job: &pin_job::Model,
     request_id: &str,
-    work: super::management::records::DecodeWork<'_>,
+    work: DecodeWork<'_>,
 ) -> super::management::Result<bool> {
     let (Some(_), Some(target), Some(generation)) = (
         job.lease_id.as_deref(),
@@ -2218,9 +2507,13 @@ pub(crate) async fn poll_names_request_with_work<C: ConnectionTrait>(
     ) else {
         return Ok(false);
     };
-    let provider =
-        super::legacy_migration::original_job_provider_with_work(db, &job.id, &job.provider, work)
-            .await?;
+    let provider = super::legacy_migration::original_job_provider_catalog(
+        catalog,
+        &job.id,
+        &job.provider,
+        work,
+    )
+    .await?;
     const HASH_SHAPE: &str = "0000000000000000000000000000000000000000000000000000000000000000";
     work.copy(&(request_id, HASH_SHAPE))?;
     work.copy(&("poll:", &provider, &job.cid, target, generation, HASH_SHAPE))?;
@@ -2304,6 +2597,28 @@ pub(crate) async fn prepare_submit_call_with_work<C: ConnectionTrait>(
     now: DateTimeUtc,
     work: DecodeWork<'_>,
 ) -> AppResult<SubmitCallDecision> {
+    prepare_submit_core(db, claimed, now, work, None).await
+}
+
+pub(crate) async fn prepare_runtime_submit_call(
+    tx: &crate::store::RuntimeTransaction,
+    claimed: &ClaimedPinJob,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+) -> AppResult<SubmitCallDecision> {
+    if tx.db().get_database_backend() != DatabaseBackend::Sqlite {
+        return prepare_submit_call_with_work(tx.db(), claimed, now, work).await;
+    }
+    prepare_submit_core(tx.db(), claimed, now, work, Some(tx)).await
+}
+
+async fn prepare_submit_core<C: ConnectionTrait>(
+    db: &C,
+    claimed: &ClaimedPinJob,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+    runtime: Option<&crate::store::RuntimeTransaction>,
+) -> AppResult<SubmitCallDecision> {
     super::management::admission::lock_sqlite_writer_in_caller_transaction(db).await?;
     let job = &claimed.model;
     let locked_until = claimed_lock(job)?;
@@ -2328,7 +2643,12 @@ pub(crate) async fn prepare_submit_call_with_work<C: ConnectionTrait>(
             "submit phase is not eligible to call the provider",
         ));
     }
-    super::quota::lock_allocation_admission_with_work(db, &job.provider, work).await?;
+    match runtime {
+        Some(tx) => {
+            super::quota::lock_runtime_allocation_admission(tx, &job.provider, work).await?
+        }
+        None => super::quota::lock_allocation_admission_with_work(db, &job.provider, work).await?,
+    };
     if db.get_database_backend() == DatabaseBackend::Postgres {
         // This is the new-dispatch tail, not the historical receipt append.
         // A job-first receipt may be waiting for our earlier remote lock.
@@ -2795,6 +3115,28 @@ pub(crate) async fn insert_new_job_with_work<C: ConnectionTrait>(
     now: DateTimeUtc,
     work: DecodeWork<'_>,
 ) -> AppResult<bool> {
+    insert_job_core(db, job, now, work, None).await
+}
+
+pub(crate) async fn insert_runtime_job(
+    tx: &crate::store::RuntimeTransaction,
+    job: NewPinJob,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+) -> AppResult<bool> {
+    if tx.db().get_database_backend() != DatabaseBackend::Sqlite {
+        return insert_new_job_with_work(tx.db(), job, now, work).await;
+    }
+    insert_job_core(tx.db(), job, now, work, Some(tx)).await
+}
+
+async fn insert_job_core<C: ConnectionTrait>(
+    db: &C,
+    job: NewPinJob,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+    runtime: Option<&crate::store::RuntimeTransaction>,
+) -> AppResult<bool> {
     let operation = match &job {
         NewPinJob::Target(job) => job.operation.operation(),
         NewPinJob::Remote(job) => job.operation.operation(),
@@ -2817,7 +3159,12 @@ pub(crate) async fn insert_new_job_with_work<C: ConnectionTrait>(
     let provider = model.provider.as_ref().to_owned();
     let cid = model.cid.as_ref().to_owned();
     if model.operation.as_ref() == PinJobOperation::Submit.persisted() {
-        super::quota::lock_allocation_admission_with_work(db, &provider, work).await?;
+        match runtime {
+            Some(tx) => {
+                super::quota::lock_runtime_allocation_admission(tx, &provider, work).await?
+            }
+            None => super::quota::lock_allocation_admission_with_work(db, &provider, work).await?,
+        };
     }
     let result = pin_job::Entity::insert(model)
         .on_conflict_do_nothing()
@@ -2825,7 +3172,16 @@ pub(crate) async fn insert_new_job_with_work<C: ConnectionTrait>(
         .await?;
     let inserted = matches!(result, TryInsertResult::Inserted(_));
     if inserted {
-        super::ledger::capture_invocation_with_work(db, &job_id, &provider, &cid, work).await?;
+        match runtime {
+            Some(tx) => {
+                super::ledger::capture_runtime_invocation(tx, &job_id, &provider, &cid, work)
+                    .await?
+            }
+            None => {
+                super::ledger::capture_invocation_with_work(db, &job_id, &provider, &cid, work)
+                    .await?
+            }
+        };
         validate_inserted_job_times(db, &job_id, now, next_attempt_at, work).await?;
     }
     Ok(inserted)
@@ -2867,13 +3223,28 @@ async fn ensure_target_job_with_work<C: ConnectionTrait>(
     submit: bool,
     work: DecodeWork<'_>,
 ) -> AppResult<EnsureJobOutcome> {
+    ensure_target_job_core(db, job, now, submit, work, None).await
+}
+
+async fn ensure_target_job_core<C: ConnectionTrait>(
+    db: &C,
+    job: TargetPinJob,
+    now: DateTimeUtc,
+    submit: bool,
+    work: DecodeWork<'_>,
+    runtime: Option<&crate::store::RuntimeTransaction>,
+) -> AppResult<EnsureJobOutcome> {
     let Some(existing) = records::current_model::<pin_job::Entity, _>(db, &[&job.id], work)
         .await
         .map_err(management_error)?
     else {
         work.copy(&job.id).map_err(management_error)?;
         let id = job.id.clone();
-        return if insert_new_job_with_work(db, NewPinJob::Target(job), now, work).await? {
+        let inserted = match runtime {
+            Some(tx) => insert_runtime_job(tx, NewPinJob::Target(job), now, work).await?,
+            None => insert_new_job_with_work(db, NewPinJob::Target(job), now, work).await?,
+        };
+        return if inserted {
             Ok(EnsureJobOutcome::Inserted)
         } else {
             target_outcome_after_conflict(db, &id, work).await

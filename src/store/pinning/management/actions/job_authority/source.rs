@@ -8,16 +8,18 @@ use crate::pinning::{
 };
 use sea_orm::Statement;
 
-pub(super) async fn historical_fresh<C: ConnectionTrait>(
-    db: &C,
+pub(super) async fn historical_fresh_catalog(
+    catalog: ReceiptCatalog<'_>,
     job: &pin_job::Model,
     authority: &records::JobAuthority,
     now: DateTime<Utc>,
     work: records::SharedDecodeBudget,
 ) -> Result<bool> {
-    for trusted in
-        crate::store::pinning::management::admission::authority::actions_for_job(db, job, work)
-            .await?
+    let db = &catalog;
+    for trusted in crate::store::pinning::management::admission::authority::actions_for_job_catalog(
+        catalog, job, work,
+    )
+    .await?
     {
         let action = trusted.action_view();
         for seed in &action.jobs {
@@ -156,11 +158,12 @@ fn explicit_reapply<'a>(
             .is_some_and(|target| action.targets.contains(target))
 }
 
-async fn denied<C: ConnectionTrait>(
-    db: &C,
+async fn denied_catalog(
+    catalog: ReceiptCatalog<'_>,
     authority: &records::JobAuthority,
     work: records::SharedDecodeBudget,
 ) -> Result<bool> {
+    let db = &catalog;
     if !skipped(db, authority).await? {
         return Ok(false);
     }
@@ -169,9 +172,10 @@ async fn denied<C: ConnectionTrait>(
         .await
         .map_err(|_| ManagementError::Database)?
         .ok_or(ManagementError::Confirmation)?;
-    for trusted in
-        crate::store::pinning::management::admission::authority::actions_for_job(db, &job, work)
-            .await?
+    for trusted in crate::store::pinning::management::admission::authority::actions_for_job_catalog(
+        catalog, &job, work,
+    )
+    .await?
     {
         for seed in &trusted.action_view().jobs {
             trusted.binding().copy(&(seed, &authority.job_id))?;
@@ -187,6 +191,7 @@ async fn denied<C: ConnectionTrait>(
     Ok(true)
 }
 
+#[cfg(test)]
 pub(super) async fn current<C: ConnectionTrait>(
     db: &C,
     authority: &records::JobAuthority,
@@ -195,10 +200,30 @@ pub(super) async fn current<C: ConnectionTrait>(
     now: DateTime<Utc>,
     work: records::SharedDecodeBudget,
 ) -> Result<bool> {
+    current_catalog(
+        ReceiptCatalog::full(db),
+        authority,
+        config,
+        idle_timeout_millis,
+        now,
+        work,
+    )
+    .await
+}
+
+pub(super) async fn current_catalog(
+    catalog: ReceiptCatalog<'_>,
+    authority: &records::JobAuthority,
+    config: crate::pinning::management::local_config::ManagementConfigView<'_>,
+    idle_timeout_millis: Option<u64>,
+    now: DateTime<Utc>,
+    work: records::SharedDecodeBudget,
+) -> Result<bool> {
+    let db = &catalog;
     let Some(identity) = &authority.source else {
         return Ok(false);
     };
-    let frame = super::current_scope::capture(db, authority, work.clone()).await?;
+    let frame = super::current_scope::capture_catalog(catalog, authority, work.clone()).await?;
     let rows = records::FrozenRows::Frame(&frame);
     let Some(proof) = records::DecodeWork::shared(&work).with(|work| {
         accounting::current_proof_from_source(
@@ -215,7 +240,7 @@ pub(super) async fn current<C: ConnectionTrait>(
     };
     if idle_timeout_millis != Some(proof.source.idle_timeout_millis)
         || !proof.proof.has_stored_byte_count()
-        || denied(db, authority, work.clone()).await?
+        || denied_catalog(catalog, authority, work.clone()).await?
     {
         return Ok(false);
     }
@@ -280,7 +305,8 @@ pub(super) async fn current<C: ConnectionTrait>(
         return Ok(false);
     }
     let provider =
-        operational_resource_with_work(db, authority, records::DecodeWork::shared(&work)).await?;
+        operational_resource_catalog(catalog, authority, records::DecodeWork::shared(&work))
+            .await?;
     let count = accounting::count(&ReadEvidence::from(proof.as_ref()))?;
     records::DecodeWork::shared(&work).copy(&authority.cid)?;
     match accounting::check_current_with_work(frame, provider, authority.cid.clone(), count, work)

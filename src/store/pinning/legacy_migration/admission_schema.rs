@@ -26,7 +26,9 @@ pub(crate) async fn admission_schema<C: ConnectionTrait>(db: &C) -> AppResult<Ve
 
 /// Receipt-only historical reads require a complete registered prefix, never a
 /// failed current authority load. No management history is made executable.
-pub(super) async fn receipt_schema<C: ConnectionTrait>(db: &C) -> AppResult<Vec<String>> {
+pub(in crate::store::pinning) async fn receipt_schema<C: ConnectionTrait>(
+    db: &C,
+) -> AppResult<Vec<String>> {
     if db.get_database_backend() == DatabaseBackend::Sqlite {
         return sqlite::classify(db, true).await;
     }

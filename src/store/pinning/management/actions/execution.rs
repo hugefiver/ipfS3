@@ -123,12 +123,24 @@ impl ExecutedAction<'_> {
         Ok(())
     }
     #[cfg(test)]
+    pub(crate) fn binding_for_test<'a>(
+        &'a self,
+        binding: &'a records::ConfirmedBinding,
+    ) -> records::BindingView<'a> {
+        records::BindingView::from(binding).with_work(&self.work)
+    }
+    #[cfg(test)]
     pub(crate) fn validate_job(
         &self,
         binding: &records::ConfirmedBinding,
         job: &records::JobAuthority,
     ) -> Result<()> {
-        validate::job(binding.into(), &self.action, &self.operation, job)
+        validate::job(
+            self.binding_for_test(binding),
+            &self.action,
+            &self.operation,
+            job,
+        )
     }
 }
 

@@ -10,6 +10,42 @@ mod tests;
 pub(super) struct AdmissionSchema(Vec<String>);
 
 impl AdmissionSchema {
+    pub(super) async fn catalog(
+        catalog: crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
+    ) -> AppResult<Self> {
+        match catalog {
+            crate::store::pinning::legacy_migration::ReceiptCatalog::Full(_) => {
+                Self::read(&catalog).await
+            }
+            _ => catalog.classify().await.map(Self),
+        }
+    }
+
+    pub(super) async fn revalidate_catalog(
+        &self,
+        catalog: crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
+    ) -> AppResult<()> {
+        if Self::catalog(catalog).await?.0 != self.0 {
+            return Err(super::needs_attention());
+        }
+        Ok(())
+    }
+    pub(super) async fn quota(
+        window: &crate::store::pinning::quota::production::QuotaReadWindow<'_>,
+    ) -> AppResult<Self> {
+        super::super::schema::validate_quota(window)
+            .await
+            .map(Self)
+            .map_err(super::work_error)
+    }
+    pub(super) async fn observed(
+        window: &super::worker_observation::WorkerReadWindow,
+    ) -> AppResult<Self> {
+        super::super::schema::validate_observed(window)
+            .await
+            .map(Self)
+            .map_err(super::work_error)
+    }
     pub(super) async fn read<C: ConnectionTrait>(db: &C) -> AppResult<Self> {
         crate::store::pinning::legacy_migration::admission_schema(db)
             .await

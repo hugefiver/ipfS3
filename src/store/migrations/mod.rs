@@ -1,3 +1,4 @@
+pub(crate) mod bridge;
 pub mod m20250701_000001_init;
 pub mod m20260707_000001_decompress_zip;
 pub mod m20260720_000001_sse_c_key_fingerprint;
@@ -34,5 +35,6 @@ pub mod m20261012_000001_pinning_management;
 pub mod m20261013_000001_zip_root_logical_release;
 pub mod m20261017_000001_management_storage;
 pub mod m20261023_000001_inline_documents;
+pub(crate) mod registry;
 #[cfg(test)]
 mod stage3_tests;

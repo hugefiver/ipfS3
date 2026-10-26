@@ -1,10 +1,9 @@
+use crate::legacy_import;
 use ipfs_s3_gateway::store::{
     initialization::{self, UpgradeRequest},
     pinning::management::{records, schema},
 };
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
-#[path = "stage75_legacy_import.rs"]
-mod legacy_import;
 
 pub async fn convert_current(db: &DatabaseConnection, auth: &records::LocalAuthorization) {
     let backend = db.get_database_backend();

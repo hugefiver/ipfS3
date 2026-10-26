@@ -74,7 +74,10 @@ async fn confirmed_inner<W: Write>(
         *review.summary(),
         review.candidate_item_ids(),
     )?;
-    copy_sections(db, writer, binding, provider, projection, limits).await?;
+    if let Err(error) = copy_sections(db, writer, binding, provider, projection, limits).await {
+        writer.invalidate();
+        return Err(error);
+    }
     for (i, entry) in review
         .entries()
         .iter()
@@ -133,23 +136,44 @@ async fn copy_sections<W: Write>(
 ) -> Result<()> {
     let prepared = projection == Projection::Review;
     let (document, mut pages) = records::open_original_inventory_document(
-        db, binding, entry, writer.budget_mut(), prepared,
-    ).await.map_err(storage)?;
+        db,
+        binding,
+        entry,
+        writer.budget_mut(),
+        prepared,
+    )
+    .await
+    .map_err(storage)?;
     let mut decoder = Decoder::new(projection, writer.budget_mut())?;
     let mut input_pages = limits.map(|(limits, pages)| {
         crate::pinning::management::retirement::PageOutput::new(std::io::sink(), limits, pages)
     });
-    let mut sink = Sections { writer, binding, document, prepared, include: false, facts_written: false };
-    while let Some(page) = pages.next(db, sink.writer.budget_mut()).await.map_err(storage)? {
+    let mut sink = Sections {
+        writer,
+        binding,
+        document,
+        prepared,
+        include: false,
+        facts_written: false,
+    };
+    while let Some(page) = pages
+        .next(db, sink.writer.budget_mut())
+        .await
+        .map_err(storage)?
+    {
         for chunk in &page.chunks {
             if let Some(pages) = &mut input_pages {
-                pages.write_all(chunk).map_err(|_| SafeError::LimitExceeded)?;
+                pages
+                    .write_all(chunk)
+                    .map_err(|_| SafeError::LimitExceeded)?;
             }
             decoder.feed(chunk, &mut sink)?;
         }
     }
     decoder.finish(sink.writer.budget())?;
-    if !sink.facts_written { return Err(SafeError::UnknownEvidence); }
+    if !sink.facts_written {
+        return Err(SafeError::UnknownEvidence);
+    }
     Ok(())
 }
 
@@ -166,9 +190,18 @@ impl<W: Write> Sink for Sections<'_, W> {
         self.writer.budget_mut()
     }
     fn record(&mut self, record: CheckedRecord<'_>) -> Result<()> {
-        let Self { writer, binding, document, prepared, include, facts_written } = self;
+        let Self {
+            writer,
+            binding,
+            document,
+            prepared,
+            include,
+            facts_written,
+        } = self;
         if let Value::Frame(frame) = &record.value {
-            document.check_frame(frame, writer.budget_mut()).map_err(storage)?;
+            document
+                .check_frame(frame, writer.budget_mut())
+                .map_err(storage)?;
         }
         if let Value::Frame(Frame::Row { section, key, .. }) = &record.value {
             if *section == Section::Inventory
@@ -190,7 +223,9 @@ impl<W: Write> Sink for Sections<'_, W> {
         }
         if *include && !record.terminal() {
             writer.checked_record(&record)?;
-            if matches!(record.value, Value::Frame(Frame::RowEnd)) { *include = false; }
+            if matches!(record.value, Value::Frame(Frame::RowEnd)) {
+                *include = false;
+            }
         }
         Ok(())
     }

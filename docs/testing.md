@@ -47,7 +47,7 @@ cargo test --test integration
 cargo test --test cors
 cargo test --test multipart_pin_decision
 cargo test --test diagnostics
-cargo test --test stage3_migrations
+cargo test --lib store::migrations::stage3_tests
 cargo test --test stage3_restart
 cargo test --test stage3_route_fence
 cargo test --test import_legacy_replay
@@ -72,6 +72,7 @@ distinct from SQLite checks. Recorded focused results are 5 schema tests and
 
 ```powershell
 cargo test --test postgres_pinning_stage3 -- --include-ignored --test-threads=1
+cargo test --lib store::migrations::stage3_tests::pg17_stage2_upgrade_retains_raw_tags_without_backfilling_decisions -- --ignored --exact
 cargo test --test postgres_stage3_route_fence -- --include-ignored --test-threads=1
 ```
 
@@ -531,6 +532,7 @@ cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_manag
 cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_initialization
 cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_management_history_export
 cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_management_checkpoint_cli
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_management_cli_scale real_100k_two_provider_cli_output_and_original_confirmation_recovery -- --exact --nocapture --test-threads=1
 cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_checkpoint_integrity
 cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_retirement_status
 cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_locator_meet
@@ -569,6 +571,17 @@ with frozen replay. Locator completeness checks fail-closed behavior for a missi
 shared-job locator before and after owner cancellation; equal allocated authorities
 don't prove the differing-authority case. `stage75_retirement_branches_scale`
 separately covers large `RetireWith` selections and over-budget rollback.
+
+The CLI scale target exercises a fresh 100,000-object task through proposal,
+confirmation publication, complete original-inventory traversal, and two real CLI
+recovery exports to distinct paths. Each output passes independent integrity checks;
+a bounded streaming comparison checks all semantic content, including public cell
+payloads, while allowing different JSON encoding and chunk boundaries. Original
+confirmation times, ACKs and bindings remain unchanged, and recovery performs no
+additional publication or remote calls. Persisted task work remains cumulative and
+within the task's saved caps. Use the effective limits documented in the
+[management guide](../src/pinning/management/README.md); a retained archive probe
+without the original checkpoint cannot replace this end-to-end acceptance.
 
 Use only the locally cached `postgres:17.11` image with `--pull=never`, loopback
 binding and an explicitly authorized task-owned instance. Don't pull images, touch

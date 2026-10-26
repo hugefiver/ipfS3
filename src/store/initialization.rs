@@ -3,12 +3,13 @@ use sea_orm::{
     ConnectionTrait, DatabaseBackend, DatabaseConnection, DbErr, Statement, TransactionTrait,
 };
 use sea_orm_migration::MigratorTrait;
-pub mod history;
-pub(crate) mod read_context;
-mod upgrade;
 #[cfg(test)]
 #[path = "initialization/document_tests.rs"]
 mod document_tests;
+pub mod history;
+pub(crate) mod postgres;
+pub(crate) mod read_context;
+mod upgrade;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SchemaState {
@@ -73,6 +74,9 @@ async fn validate_catalog<C: ConnectionTrait>(db: &C) -> Result<(), DbErr> {
 }
 
 pub async fn open(db: &DatabaseConnection) -> Result<(), DbErr> {
+    if db.get_database_backend() == DatabaseBackend::Postgres {
+        return postgres::open(db).await;
+    }
     match classify(db).await? {
         SchemaState::Empty => initialize_empty(db).await,
         SchemaState::Current => validate_catalog(db).await,
@@ -81,23 +85,21 @@ pub async fn open(db: &DatabaseConnection) -> Result<(), DbErr> {
 }
 
 pub async fn initialize_empty(db: &DatabaseConnection) -> Result<(), DbErr> {
+    if db.get_database_backend() == DatabaseBackend::Postgres {
+        return postgres::open(db).await;
+    }
     match classify(db).await? {
         SchemaState::Current => return validate_catalog(db).await,
         SchemaState::UpgradeRequired => return Err(required()),
         SchemaState::Empty => {}
     }
     let tx = db.begin().await?;
-    if tx.get_database_backend() == DatabaseBackend::Postgres {
-        tx.execute_unprepared("SELECT pg_advisory_xact_lock(1229997651,1395879239)")
-            .await?;
-    } else {
-        // DDL obtains the caller-owned writer boundary; no read snapshot precedes it.
-        tx.execute_unprepared("CREATE TABLE IF NOT EXISTS _ipfs_s3_migration_lock (id INTEGER PRIMARY KEY NOT NULL CHECK(id=1))").await?;
-        tx.execute_unprepared("INSERT OR IGNORE INTO _ipfs_s3_migration_lock VALUES(1)")
-            .await?;
-        tx.execute_unprepared("UPDATE _ipfs_s3_migration_lock SET id=id WHERE 1=0")
-            .await?;
-    }
+    // DDL obtains the caller-owned writer boundary; no read snapshot precedes it.
+    tx.execute_unprepared("CREATE TABLE IF NOT EXISTS _ipfs_s3_migration_lock (id INTEGER PRIMARY KEY NOT NULL CHECK(id=1))").await?;
+    tx.execute_unprepared("INSERT OR IGNORE INTO _ipfs_s3_migration_lock VALUES(1)")
+        .await?;
+    tx.execute_unprepared("UPDATE _ipfs_s3_migration_lock SET id=id WHERE 1=0")
+        .await?;
     let remaining = names(&tx)
         .await?
         .into_iter()

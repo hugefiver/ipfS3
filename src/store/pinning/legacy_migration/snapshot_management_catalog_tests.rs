@@ -847,6 +847,11 @@ async fn admission_schema_returns_exact_prefixes_and_does_not_cache_historical_a
 
 #[tokio::test]
 async fn admission_schema_rejects_migration_and_route_shadows_and_native_route_damage() {
+    use crate::store::pinning::management::{catalog, native};
+    let route = native::current_catalog()
+        .iter()
+        .find(|table| table.table == "pin_provider_routes")
+        .unwrap();
     for endpoint in [ENDPOINTS[0], management_schema::VERSION] {
         for damage in [
             "CREATE TEMP VIEW seaql_migrations AS SELECT * FROM main.seaql_migrations",
@@ -856,6 +861,7 @@ async fn admission_schema_rejects_migration_and_route_shadows_and_native_route_d
             "DROP TABLE pin_provider_routes",
             "ATTACH DATABASE ':memory:' AS attached; CREATE TABLE attached.pin_provider_routes (provider TEXT NOT NULL PRIMARY KEY,snapshot TEXT NOT NULL,display_name TEXT NOT NULL,retired BOOLEAN NOT NULL); DROP TABLE main.pin_provider_routes",
             "DROP TABLE pin_provider_routes; CREATE VIEW pin_provider_routes AS SELECT '' AS provider,'' AS snapshot,'' AS display_name,0 AS retired",
+            "DROP TABLE pin_provider_routes; CREATE TABLE Pin_Provider_Routes (provider TEXT NOT NULL PRIMARY KEY,snapshot TEXT NOT NULL,display_name TEXT NOT NULL,retired BOOLEAN NOT NULL)",
             "DROP TABLE pin_provider_routes; CREATE TABLE pin_provider_routes (provider TEXT NOT NULL,snapshot TEXT NOT NULL,display_name TEXT NOT NULL,retired BOOLEAN NOT NULL)",
             "DROP TABLE pin_provider_routes; CREATE TABLE pin_provider_routes (provider TEXT NOT NULL PRIMARY KEY,snapshot BLOB NOT NULL,display_name TEXT NOT NULL,retired BOOLEAN NOT NULL)",
             "DROP TABLE pin_provider_routes; CREATE TABLE pin_provider_routes (provider TEXT NOT NULL PRIMARY KEY,snapshot TEXT NOT NULL,display_name TEXT NOT NULL,retired INTEGER NOT NULL)",
@@ -870,10 +876,83 @@ async fn admission_schema_rejects_migration_and_route_shadows_and_native_route_d
                 migration::admission_schema(&tx).await.is_err(),
                 "{endpoint}: {damage}"
             );
+            assert!(
+                catalog::validate_table(&tx, route).await.is_err(),
+                "{endpoint}: {damage}"
+            );
+            assert!(
+                catalog::validate(&tx, std::slice::from_ref(route))
+                    .await
+                    .is_err(),
+                "{endpoint}: {damage}"
+            );
             tx.rollback().await.unwrap();
             assert_eq!(migration::admission_schema(&db).await.unwrap(), original);
         }
     }
+}
+
+#[tokio::test]
+async fn sqlite_route_type_checks_preserve_virtual_and_shadow_classification() {
+    use crate::store::pinning::management::{catalog, native};
+    let db = native_catalog(management_schema::VERSION).await;
+    let fts5 = db
+        .query_one(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "SELECT 1 FROM pragma_module_list WHERE name='fts5'",
+        ))
+        .await
+        .unwrap()
+        .is_some();
+    if !fts5 {
+        eprintln!(
+            "installed SQLite has no FTS5 module; virtual/shadow classification not exercised"
+        );
+        return;
+    }
+    let route = native::current_catalog()
+        .iter()
+        .find(|table| table.table == "pin_provider_routes")
+        .unwrap();
+    let original = migration::admission_schema(&db).await.unwrap();
+    let tx = db.begin().await.unwrap();
+    tx.execute_unprepared("DROP TABLE pin_provider_routes; CREATE VIRTUAL TABLE pin_provider_routes USING fts5(provider,snapshot,display_name,retired)")
+        .await.unwrap();
+    let kind: String = tx
+        .query_one(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "SELECT type FROM pragma_table_list($1) WHERE schema='main' AND name=$1",
+            ["pin_provider_routes".into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "type")
+        .unwrap();
+    assert_eq!(kind, "virtual");
+    assert!(migration::admission_schema(&tx).await.is_err());
+    assert!(catalog::validate_table(&tx, route).await.is_err());
+    assert!(
+        catalog::validate(&tx, std::slice::from_ref(route))
+            .await
+            .is_err()
+    );
+
+    // A real module-owned shadow exercises the pragma argument's type boundary.
+    // FTS5 cannot create a shadow whose suffix is exactly `routes`.
+    let row = tx.query_one(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
+        "SELECT name,type,type='table' AS ordinary FROM pragma_table_list($1) WHERE schema='main' AND name='pin_provider_routes_data'",
+        ["PIN_PROVIDER_ROUTES_DATA".into()]))
+        .await.unwrap().unwrap();
+    assert_eq!(
+        row.try_get::<String>("", "name").unwrap(),
+        "pin_provider_routes_data"
+    );
+    assert_eq!(row.try_get::<String>("", "type").unwrap(), "shadow");
+    assert_eq!(row.try_get::<i32>("", "ordinary").unwrap(), 0);
+    tx.rollback().await.unwrap();
+    assert_eq!(migration::admission_schema(&db).await.unwrap(), original);
+    catalog::validate_table(&db, route).await.unwrap();
 }
 
 #[tokio::test]

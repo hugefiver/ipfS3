@@ -59,10 +59,10 @@ pub fn budget() -> Budget {
 pub fn limits() -> Limits {
     Limits {
         rows: 10_000_000,
-        bytes: 4 * 1024 * 1024 * 1024,
+        bytes: 8 * 1024 * 1024 * 1024,
         sql: 1_000_000,
         resident: 32 * 1024 * 1024,
-        elapsed: std::time::Duration::from_secs(30),
+        elapsed: std::time::Duration::from_secs(120),
     }
 }
 pub(crate) fn temporary() -> Result<File> {

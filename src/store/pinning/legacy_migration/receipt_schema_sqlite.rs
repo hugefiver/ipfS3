@@ -22,6 +22,7 @@ pub(super) async fn validate<C: ConnectionTrait>(db: &C) -> AppResult<()> {
         .query_all(read::metadata_statement(db.get_database_backend()))
         .await?;
     let indexes = validate_metadata(&rows)?;
+    drop(rows);
     let rows = db
         .query_all(read::keys_statement(db.get_database_backend(), &indexes))
         .await?;

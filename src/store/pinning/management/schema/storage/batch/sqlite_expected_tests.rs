@@ -39,6 +39,7 @@ async fn fixture() -> (DatabaseConnection, SqliteCatalog) {
             objects,
             query,
             cap,
+            control_query: format!("WITH {} {}", shadow_query(&["sample"]), CONTROL),
         },
     )
 }
@@ -84,7 +85,21 @@ async fn sqlite_catalog_rowid_reads_preserve_identity_and_normalization() {
 
 #[tokio::test]
 async fn sqlite_catalog_rejects_duplicate_exact_definitions() {
-    let (db, catalog) = fixture().await;
+    let (db, mut catalog) = fixture().await;
+    let ddl = "CREATE TABLE headroom (value TEXT)";
+    db.execute_unprepared(ddl).await.unwrap();
+    catalog.objects.insert(
+        "headroom".into(),
+        SqliteObject::new("table", "headroom", ddl.into(), false),
+    );
+    // Each scoped table permits an implicit index; headroom needs none itself.
+    catalog.cap = catalog.objects.len() + 2;
+    catalog.query = catalog_query(
+        &catalog.objects,
+        &["sample", "headroom"],
+        &["sample", "headroom"],
+        catalog.cap,
+    );
     validate(&db, &catalog).await.unwrap();
     let tx = db.begin().await.unwrap();
     tx.execute_unprepared(
@@ -92,6 +107,53 @@ async fn sqlite_catalog_rejects_duplicate_exact_definitions() {
          INSERT INTO sqlite_schema(type,name,tbl_name,rootpage,sql) \
          SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema WHERE name='sample_index';\
          PRAGMA writable_schema=OFF",
+    )
+    .await
+    .unwrap();
+    let actual: i64 = tx
+        .query_one(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "SELECT COUNT(*) AS n FROM sqlite_schema WHERE tbl_name IN ('sample','headroom')",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "n")
+        .unwrap();
+    assert!(actual <= catalog.cap as i64);
+    assert!(validate(&tx, &catalog).await.is_err());
+    tx.rollback().await.unwrap();
+    validate(&db, &catalog).await.unwrap();
+}
+
+#[tokio::test]
+async fn sqlite_catalog_binds_distinct_trigger_definitions_to_names() {
+    let (db, mut catalog) = fixture().await;
+    for (name, ddl) in [
+        (
+            "sample_guard",
+            "CREATE TRIGGER sample_guard BEFORE INSERT ON sample WHEN NEW.value='first''s value' BEGIN SELECT RAISE(ABORT,'cannot insert'); END",
+        ),
+        (
+            "sample_guard_other",
+            "CREATE TRIGGER sample_guard_other BEFORE INSERT ON sample WHEN NEW.value='other''s value' BEGIN SELECT RAISE(ABORT,'cannot insert'); END",
+        ),
+    ] {
+        db.execute_unprepared(&format!("DROP TRIGGER IF EXISTS {name}; {ddl}"))
+            .await
+            .unwrap();
+        catalog.objects.insert(
+            name.into(),
+            SqliteObject::new("trigger", "sample", ddl.into(), false),
+        );
+    }
+    catalog.cap = catalog.objects.len() + 1;
+    catalog.query = catalog_query(&catalog.objects, &["sample"], &["sample"], catalog.cap);
+    validate(&db, &catalog).await.unwrap();
+    let tx = db.begin().await.unwrap();
+    tx.execute_unprepared(
+        "DROP TRIGGER sample_guard_other; \
+         CREATE TRIGGER sample_guard_other BEFORE INSERT ON sample WHEN NEW.value='first''s value' BEGIN SELECT RAISE(ABORT,'cannot insert'); END",
     )
     .await
     .unwrap();

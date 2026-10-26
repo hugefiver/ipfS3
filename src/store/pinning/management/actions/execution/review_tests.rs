@@ -723,6 +723,55 @@ async fn readonly_prefix_rejects_consistent_epoch_chain_forgery_from_real_row() 
     )
     .await
     .unwrap();
+    // Receipt reconstruction owns one work session, independent of live apply.
+    let work = records::SharedDecodeBudget::default();
+    let view = fixture.binding.view().with_work(&work);
+    assert!(!Arc::ptr_eq(
+        view.decode_work().budget(),
+        fixture.binding.view().decode_work().budget()
+    ));
+    let mut cursor = Cursor::default();
+    let preceding = &applied.items[0];
+    let preceding_key = native::NativeKey {
+        table: "pin_management_records".into(),
+        values: vec![
+            view.database_scope.clone(),
+            view.request.plan_id.clone(),
+            preceding.receipt.binding.request.item_id.clone(),
+            "action".into(),
+        ],
+    };
+    let preceding_row = super::super::provider_points::original_record(&fixture.db, &preceding_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let (preceding, preceding_facts, preceding_hash): (
+        records::CommittedAction,
+        ItemFacts,
+        String,
+    ) = view
+        .decode(
+            native::value(&preceding_row, "result")
+                .unwrap()
+                .strip_prefix("S7R1\n")
+                .unwrap(),
+        )
+        .unwrap();
+    assert!(preceding == applied.items[0]);
+    assert!(matches!(
+        preceding.receipt.binding.request.action,
+        Action::Reconcile
+    ));
+    assert_eq!(
+        facts::identity(view, &preceding, &preceding_facts).unwrap(),
+        preceding_hash
+    );
+    let preceding_operation =
+        OperationRead::resolve(view, Arc::new(preceding_facts), &cursor).unwrap();
+    validate_operation_with_cursor(view, &preceding, &preceding_operation, &cursor).unwrap();
+    cursor
+        .publish(&preceding_operation, &preceding_hash, view)
+        .unwrap();
     let action = &applied.items[1];
     let key = native::NativeKey {
         table: "pin_management_records".into(),
@@ -737,14 +786,28 @@ async fn readonly_prefix_rejects_consistent_epoch_chain_forgery_from_real_row() 
         .await
         .unwrap()
         .unwrap();
-    let (mut action, mut facts, _): (records::CommittedAction, ItemFacts, String) =
-        serde_json::from_str(
+    let (mut action, mut facts, original_hash): (records::CommittedAction, ItemFacts, String) =
+        view.decode(
             native::value(&row, "result")
                 .unwrap()
                 .strip_prefix("S7R1\n")
                 .unwrap(),
         )
         .unwrap();
+    assert!(action == applied.items[1]);
+    assert_eq!(
+        facts::identity(view, &action, &facts).unwrap(),
+        original_hash
+    );
+    let original = OperationRead::resolve(view, Arc::new(facts.clone()), &cursor).unwrap();
+    validate_operation_with_cursor(view, &action, &original, &cursor).unwrap();
+    assert_eq!(action.jobs.len(), 1);
+    assert_eq!(
+        action.jobs[0].directive,
+        records::JobDirective::ReadOnlyObserve
+    );
+    validate_job(view, &action, &original, &action.jobs[0]).unwrap();
+    let mut forged_tables = BTreeSet::new();
     for output in &mut facts.2 {
         let column = match output.0.0.as_str() {
             "remote_pins" => "epoch",
@@ -752,9 +815,7 @@ async fn readonly_prefix_rejects_consistent_epoch_chain_forgery_from_real_row() 
             "pin_invocation_routes" => "remote_epoch",
             _ => continue,
         };
-        let position = fixture
-            .binding
-            .view()
+        let position = view
             .frozen_rows()
             .unwrap()
             .table(&output.0.0)
@@ -764,24 +825,42 @@ async fn readonly_prefix_rejects_consistent_epoch_chain_forgery_from_real_row() 
             .position(|c| c == column)
             .unwrap();
         output.2.as_mut().unwrap()[position] = Some("100".into());
+        forged_tables.insert(output.0.0.as_str());
     }
+    assert_eq!(
+        forged_tables,
+        BTreeSet::from(["remote_pins", "pin_jobs", "pin_invocation_routes"])
+    );
     action.jobs[0].remote_epoch = 100;
-    let hash = facts::identity((&fixture.binding).into(), &action, &facts).unwrap();
+    let hash = facts::identity(view, &action, &facts).unwrap();
     let result = format!(
         "S7R1\n{}",
         serde_json::to_string(&(action, facts, hash)).unwrap()
     );
-    let tx = fixture.db.begin().await.unwrap();
-    // Simulate out-of-band corruption; the guard and row are restored together.
-    tx.execute_unprepared("DROP TRIGGER s75_applied_no_update")
-        .await
-        .unwrap();
-    tx.execute(Statement::from_sql_and_values(tx.get_database_backend(),"UPDATE pin_management_records SET result=$1 WHERE database_scope=$2 AND plan_id=$3 AND item_id=$4 AND kind='action'",[result.into(),key.values[0].clone().into(),key.values[1].clone().into(),key.values[2].clone().into()])).await.unwrap();
-    assert!(
-        records::lookup_trusted_committed(&tx, &fixture.auth, &fixture.binding, &key.values[2])
-            .await
-            .is_err(),
+    let (action, facts, hash): (records::CommittedAction, ItemFacts, String) =
+        view.decode(result.strip_prefix("S7R1\n").unwrap()).unwrap();
+    assert_eq!(facts::identity(view, &action, &facts).unwrap(), hash);
+    let forged = OperationRead::resolve(view, Arc::new(facts), &cursor).unwrap();
+    let resource = facts::Key(
+        action.jobs[0].resource_key.table.clone(),
+        action.jobs[0].resource_key.values.clone(),
+    );
+    assert_ne!(
+        epoch(forged.before(&resource).unwrap().unwrap()).unwrap() + 1,
+        action.jobs[0].remote_epoch
+    );
+    assert_eq!(
+        epoch(forged.after(&resource).unwrap().unwrap()).unwrap(),
+        action.jobs[0].remote_epoch
+    );
+    assert_eq!(
+        validate_job(view, &action, &forged, &action.jobs[0]),
+        Err(ManagementError::Confirmation),
+        "readonly renewal authority must follow the preceding resource epoch"
+    );
+    assert_eq!(
+        validate_operation_with_cursor(view, &action, &forged, &cursor),
+        Err(ManagementError::Confirmation),
         "a readonly entry cannot supply a self-consistent arbitrary epoch advance"
     );
-    tx.rollback().await.unwrap();
 }

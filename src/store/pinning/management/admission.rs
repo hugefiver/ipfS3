@@ -41,8 +41,10 @@ mod locks;
 mod managed_jobs;
 mod observations;
 mod retirement;
+pub(crate) mod worker_observation;
 
-pub(crate) use managed_jobs::{ManagedCall, managed_call_allowed};
+pub(crate) use managed_jobs::ManagedCall;
+pub(crate) use managed_jobs::managed_call_allowed_store;
 pub use managed_jobs::{ManagementJobReport, ManagementJobScope};
 pub(crate) use observations::{
     append_nonprojecting_delete_acknowledgement, append_nonprojecting_delete_error,
@@ -150,6 +152,52 @@ pub(crate) async fn lock_provider_with_work<C: ConnectionTrait>(
     Ok(())
 }
 
+pub(in crate::store::pinning) async fn lock_runtime_provider(
+    tx: &crate::store::RuntimeTransaction,
+    provider: &str,
+    work: DecodeWork<'_>,
+) -> AppResult<()> {
+    if tx.db().get_database_backend() != sea_orm::DatabaseBackend::Sqlite {
+        return lock_provider_with_work(tx.db(), provider, work).await;
+    }
+    locks::serialize(tx.db(), locks::RetirementAccess::Admission).await?;
+    locks::serialize_routes(tx.db(), false).await?;
+    let catalog = tx.catalog(work);
+    let schema = locks::AdmissionSchema::catalog(catalog).await?;
+    let routes = domains::registered_routes_in_schema_with_work(tx.db(), provider, work).await?;
+    if routes.is_empty() {
+        return if domains::unregistered_legacy_in_schema(tx.db(), provider, &schema).await? {
+            Ok(())
+        } else {
+            Err(needs_attention())
+        };
+    }
+    locks::lock_route_rows_with_work(tx.db(), &routes, work).await?;
+    if retirement::closed_with_role(&routes, &schema, false, None, work, catalog).await? {
+        return Err(retired());
+    }
+    Ok(())
+}
+
+pub(in crate::store::pinning) async fn lock_runtime_routes(
+    tx: &crate::store::RuntimeTransaction,
+    routes: &[ProviderRouteSnapshot],
+    work: DecodeWork<'_>,
+) -> AppResult<()> {
+    if routes.is_empty() {
+        return Ok(());
+    }
+    locks::serialize(tx.db(), locks::RetirementAccess::Admission).await?;
+    locks::serialize_routes(tx.db(), false).await?;
+    let catalog = tx.catalog(work);
+    let schema = locks::AdmissionSchema::catalog(catalog).await?;
+    locks::lock_route_rows_with_work(tx.db(), routes, work).await?;
+    if retirement::closed_with_role(routes, &schema, false, None, work, catalog).await? {
+        return Err(retired());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) async fn check_provider_open<C: ConnectionTrait>(
     db: &C,
@@ -163,18 +211,73 @@ pub(crate) async fn check_provider_with_work<C: ConnectionTrait>(
     provider: &str,
     work: DecodeWork<'_>,
 ) -> AppResult<()> {
-    let schema = locks::AdmissionSchema::read(db).await?;
+    check_provider_catalog(
+        crate::store::pinning::legacy_migration::ReceiptCatalog::full(db),
+        provider,
+        work,
+    )
+    .await
+}
+
+pub(crate) async fn check_provider_catalog(
+    catalog: crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
+    provider: &str,
+    work: DecodeWork<'_>,
+) -> AppResult<()> {
+    let db = &catalog;
+    let schema = locks::AdmissionSchema::catalog(catalog).await?;
     let routes = domains::registered_routes_in_schema_with_work(db, provider, work).await?;
     if routes.is_empty() {
         let unregistered = domains::unregistered_legacy_in_schema(db, provider, &schema).await?;
-        schema.revalidate(db).await?;
+        schema.revalidate_catalog(catalog).await?;
         if unregistered {
             return Ok(());
         }
         return Err(needs_attention());
     }
-    let closed = retirement::closed_in_schema(db, &routes, &schema, false, work).await?;
-    schema.revalidate(db).await?;
+    let closed = retirement::closed_with_role(&routes, &schema, false, None, work, catalog).await?;
+    schema.revalidate_catalog(catalog).await?;
+    if closed {
+        return Err(retired());
+    }
+    Ok(())
+}
+
+pub(in crate::store::pinning) async fn lock_quota_tables(
+    db: &DatabaseTransaction,
+) -> AppResult<()> {
+    locks::serialize(db, locks::RetirementAccess::Admission).await?;
+    locks::serialize_routes(db, false).await
+}
+
+pub(in crate::store::pinning) async fn check_quota_provider(
+    window: &crate::store::pinning::quota::production::QuotaReadWindow<'_>,
+    provider: &str,
+    registered: bool,
+    work: DecodeWork<'_>,
+) -> AppResult<()> {
+    let schema = locks::AdmissionSchema::quota(window).await?;
+    let routes =
+        domains::registered_routes_in_schema_with_work(window.db(), provider, work).await?;
+    if routes.is_empty() {
+        let unregistered =
+            domains::unregistered_legacy_in_schema(window.db(), provider, &schema).await?;
+        super::schema::validate_quota(window)
+            .await
+            .map_err(work_error)?;
+        return if unregistered {
+            Ok(())
+        } else {
+            Err(needs_attention())
+        };
+    }
+    if registered {
+        locks::lock_route_rows_with_work(window.db(), &routes, work).await?;
+    }
+    let closed = retirement::closed_quota(window, &routes, &schema, work).await?;
+    super::schema::validate_quota(window)
+        .await
+        .map_err(work_error)?;
     if closed {
         return Err(retired());
     }
@@ -195,11 +298,41 @@ pub(crate) async fn registration_closed_with_work<C: ConnectionTrait>(
     route: &ProviderRouteSnapshot,
     work: DecodeWork<'_>,
 ) -> AppResult<bool> {
-    let schema = locks::AdmissionSchema::read(db).await?;
-    let closed =
-        retirement::closed_in_schema(db, std::slice::from_ref(route), &schema, true, work).await?;
-    schema.revalidate(db).await?;
+    registration_closed_catalog(
+        crate::store::pinning::legacy_migration::ReceiptCatalog::full(db),
+        route,
+        work,
+    )
+    .await
+}
+
+pub(crate) async fn registration_closed_catalog(
+    catalog: crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
+    route: &ProviderRouteSnapshot,
+    work: DecodeWork<'_>,
+) -> AppResult<bool> {
+    let schema = locks::AdmissionSchema::catalog(catalog).await?;
+    let closed = retirement::closed_with_role(
+        std::slice::from_ref(route),
+        &schema,
+        true,
+        None,
+        work,
+        catalog,
+    )
+    .await?;
+    schema.revalidate_catalog(catalog).await?;
     Ok(closed)
+}
+
+pub(in crate::store::pinning) async fn unregistered_catalog(
+    catalog: crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
+    provider: &str,
+) -> AppResult<bool> {
+    let schema = locks::AdmissionSchema::catalog(catalog).await?;
+    let result = domains::unregistered_legacy_in_schema(&catalog, provider, &schema).await?;
+    schema.revalidate_catalog(catalog).await?;
+    Ok(result)
 }
 
 fn retired() -> AppError {

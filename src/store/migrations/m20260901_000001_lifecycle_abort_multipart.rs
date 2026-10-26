@@ -31,8 +31,8 @@ const MULTIPART_INDEX_STATEMENT: &str = "CREATE INDEX idx_lifecycle_actions_mult
 pub struct Migration;
 
 #[async_trait::async_trait]
-impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+impl super::bridge::SharedMigration for Migration {
+    async fn up_body(&self, manager: &super::bridge::Manager<'_>) -> Result<(), DbErr> {
         let connection = manager.get_connection();
         if matches!(
             connection.get_database_backend(),
@@ -46,7 +46,13 @@ impl MigrationTrait for Migration {
             "lifecycle abort migration supports only SQLite and PostgreSQL".to_owned(),
         ))
     }
-
+}
+#[async_trait::async_trait]
+impl MigrationTrait for Migration {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        super::bridge::SharedMigration::up_body(self, &super::bridge::Manager::native(manager))
+            .await
+    }
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let connection = manager.get_connection();
         if matches!(
@@ -64,9 +70,10 @@ impl MigrationTrait for Migration {
 }
 
 async fn finish_transaction(
-    transaction: sea_orm::DatabaseTransaction,
+    transaction: impl Into<super::bridge::Transaction>,
     result: Result<(), DbErr>,
 ) -> Result<(), DbErr> {
+    let transaction = transaction.into();
     match result {
         Ok(()) => transaction.commit().await,
         Err(error) => {

@@ -3,6 +3,7 @@ use super::*;
 use native::meter::{Budget, CELL_SLICE, PAGE_BYTES};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
+pub(crate) mod header;
 mod inline;
 pub(crate) mod pages;
 pub(crate) mod progress;
@@ -183,44 +184,38 @@ pub(crate) async fn read_archive_raw<C: ConnectionTrait, W: Write>(
     digest.update((raw.len() as u64).to_be_bytes());
     digest.update(raw.as_bytes());
     let mut bytes = 0i64;
-    budget.charge(
-        0,
-        0,
-        0,
-        u64::try_from(reference.bytes).map_err(|_| ManagementError::InvalidEvidence)?,
-    )?;
+    let output_bytes =
+        u64::try_from(reference.bytes).map_err(|_| ManagementError::InvalidEvidence)?;
+    if reference.chunks < 0 {
+        return Err(ManagementError::InvalidEvidence);
+    }
     budget.work.output_bytes = budget
         .work
         .output_bytes
-        .checked_add(reference.bytes as u64)
+        .checked_add(output_bytes)
         .ok_or(ManagementError::Budget)?;
     budget.check()?;
-    for ordinal in 0..reference.chunks {
-        budget.charge(1, 1, 1, 0)?;
-        let row = db.query_one(Statement::from_sql_and_values(db.get_database_backend(),"SELECT CASE WHEN length(payload)<=65536 AND length(payload)<=$3 THEN payload END AS payload FROM pin_management_archive_chunks WHERE archive_id=$1 AND ordinal=$2",[reference.archive_id.clone().into(),ordinal.into(),(reference.bytes-bytes).into()])).await.map_err(|_|ManagementError::Database)?.ok_or(ManagementError::InvalidEvidence)?;
-        let chunk: Vec<u8> = row
-            .try_get("", "payload")
-            .map_err(|_| ManagementError::InvalidEvidence)?;
-        if chunk.is_empty() || chunk.len() > CELL_SLICE {
-            return Err(ManagementError::InvalidEvidence);
+    let mut ordinal = 0;
+    while ordinal < reference.chunks {
+        let count = (reference.chunks - ordinal).min((PAGE_BYTES / CELL_SLICE) as i64);
+        let page = pages::read_page(db, &reference.archive_id, ordinal, count, budget).await?;
+        for chunk in &page.chunks {
+            bytes = bytes
+                .checked_add(chunk.len() as i64)
+                .filter(|used| *used <= reference.bytes)
+                .ok_or(ManagementError::InvalidEvidence)?;
+            digest.update((ordinal as u64).to_be_bytes());
+            digest.update((chunk.len() as u64).to_be_bytes());
+            digest.update(chunk);
+            output
+                .write_all(chunk)
+                .map_err(|_| ManagementError::Database)?;
+            ordinal += 1;
         }
-        if bytes
-            .checked_add(chunk.len() as i64)
-            .is_none_or(|used| used > reference.bytes)
-        {
-            return Err(ManagementError::InvalidEvidence);
-        }
-        digest.update((ordinal as u64).to_be_bytes());
-        digest.update((chunk.len() as u64).to_be_bytes());
-        digest.update(&chunk);
-        output
-            .write_all(&chunk)
-            .map_err(|_| ManagementError::Database)?;
-        bytes = bytes
-            .checked_add(chunk.len() as i64)
-            .ok_or(ManagementError::Budget)?;
     }
-    budget.charge(1, 0, 0, 0)?;
-    if db.query_one(Statement::from_sql_and_values(db.get_database_backend(),"SELECT 1 FROM pin_management_archive_chunks WHERE archive_id=$1 AND ordinal>=$2 LIMIT 1",[reference.archive_id.clone().into(),reference.chunks.into()])).await.map_err(|_|ManagementError::Database)?.is_some() || bytes != reference.bytes || hex::encode(digest.finalize()) != reference.digest { return Err(ManagementError::InvalidEvidence); }
+    pages::check_end(db, reference, budget).await?;
+    if bytes != reference.bytes || hex::encode(digest.finalize()) != reference.digest {
+        return Err(ManagementError::InvalidEvidence);
+    }
     Ok(raw)
 }

@@ -32,12 +32,18 @@ fn drop_object_fingerprint_column() -> TableAlterStatement {
 }
 
 #[async_trait::async_trait]
-impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+impl super::bridge::SharedMigration for Migration {
+    async fn up_body(&self, manager: &super::bridge::Manager<'_>) -> Result<(), DbErr> {
         manager.alter_table(add_object_fingerprint_column()).await?;
         manager.alter_table(add_upload_fingerprint_column()).await
     }
-
+}
+#[async_trait::async_trait]
+impl MigrationTrait for Migration {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        super::bridge::SharedMigration::up_body(self, &super::bridge::Manager::native(manager))
+            .await
+    }
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
             .alter_table(drop_upload_fingerprint_column())

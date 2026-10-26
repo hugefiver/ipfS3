@@ -257,405 +257,428 @@ async fn renew_mixed_migration_tracks_destination_delta_and_untouched_source_pai
         .await
         .unwrap();
     let committed_before = native::capture(&fixture.db).await.unwrap();
-    let tx = fixture.db.begin().await.unwrap();
-    super::super::super::fence::write_intent(&tx).await.unwrap();
-    let scope = super::super::super::local_scope::capture(
-        &tx,
-        &fixture.config,
-        &binding,
-        records::SharedDecodeBudget::default(),
-    )
-    .await
-    .unwrap();
-    super::super::super::fence::lock(
-        &tx,
-        before,
-        &fixture.config,
-        &binding,
-        &scope,
-        records::DecodeWork::shared(&records::SharedDecodeBudget::default()),
-    )
-    .await
-    .unwrap();
-    let checked =
-        records::revalidate_confirmed_in_transaction(&tx, &fixture.config, &fixture.auth, &binding)
-            .await
-            .unwrap();
-    assert_eq!(checked.len(), 2);
-    assert!(
-        checked
-            .iter()
-            .all(|item| matches!(item.outcome, RevalidationOutcome::Checked(_)))
-    );
-    let mut batch = super::super::super::execution::ExecutionBatch::new(
-        &tx,
-        &fixture.config,
-        &fixture.auth,
-        &binding,
-        before,
-    )
-    .unwrap();
-    let migrated = match batch.execute_entry(&binding.confirmation.bindings[0]).await {
-        Ok(migrated) => migrated,
-        Err(error) => {
-            let actual_source = remote_pin::Entity::find_by_id(source_key.clone())
-                .one(&tx)
-                .await
-                .unwrap()
-                .unwrap();
-            let actual_destination = remote_pin::Entity::find_by_id(destination_key.clone())
-                .one(&tx)
-                .await
-                .unwrap()
-                .unwrap();
-            let actual_ledger = remote_pin_ledger::Entity::find_by_id(destination_key.clone())
-                .one(&tx)
-                .await
-                .unwrap()
-                .unwrap();
-            let attached_id = crate::store::pinning::leases::target_id(
-                &source.lease_id,
-                &destination_provider,
-                &source.cid,
-            );
-            let actual_target = pin_lease_target::Entity::find_by_id(attached_id)
-                .one(&tx)
-                .await
-                .unwrap();
-            tx.rollback().await.unwrap();
-            let failure = super::super::super::apply_detailed(
-                &fixture.db,
-                &fixture.config,
-                &fixture.auth,
-                &binding,
-            )
-            .await
-            .err()
-            .expect("formal apply must expose the same rejected mixed migration");
-            panic!(
-                "SOURCESTOP: confirmed Migrate -> Renew; Migrate step={:?}; execute_entry={error:?}; source epoch {} -> {}; destination epoch {} -> {}; destination ledger unchanged={}; actual destination={actual_target:?}; formal apply={:?}, items={:?}",
-                serde_json::to_value(&binding.confirmation.bindings[0].step).unwrap(),
-                source_remote.epoch,
-                actual_source.epoch,
-                destination_remote.epoch,
-                actual_destination.epoch,
-                destination_ledger == actual_ledger,
-                failure.cause,
-                failure
-                    .items
-                    .iter()
-                    .map(|item| (&item.item_id, item.state))
-                    .collect::<Vec<_>>()
-            );
-        }
-    };
-    let migration = migrated.action_view();
-    assert_eq!(migration.receipt.intent_ids, vec![source.lease_id.clone()]);
-    assert_eq!(migration.migration_points.len(), 1);
-    let point = &migration.migration_points[0];
-    let attached = pin_lease_target::Entity::find_by_id(point.destination_target_id.clone())
-        .one(&tx)
+    // Each invocation executes the full prefix and validates its final state once.
+    for corrupt_ledger in [None, Some(&source_key), Some(&destination_key)] {
+        let tx = fixture.db.begin().await.unwrap();
+        super::super::super::fence::write_intent(&tx).await.unwrap();
+        let scope = super::super::super::local_scope::capture(
+            &tx,
+            &fixture.config,
+            &binding,
+            records::SharedDecodeBudget::default(),
+        )
         .await
-        .unwrap()
         .unwrap();
-    let expected_id = crate::store::pinning::leases::target_id(
-        &source.lease_id,
-        &destination_provider,
-        &source.cid,
-    );
-    assert_ne!(source.id, expected_id);
-    let mut expected_targets = vec![source.id.clone(), expected_id.clone()];
-    expected_targets.sort();
-    assert_eq!(migration.targets.len(), 2);
-    assert_eq!(migration.targets, expected_targets);
-    assert_eq!(
-        (
-            &attached.id,
-            &attached.lease_id,
-            &attached.provider,
-            &attached.cid,
-            attached.logical_size,
-            attached.state.as_str()
-        ),
-        (
-            &expected_id,
+        super::super::super::fence::lock(
+            &tx,
+            before,
+            &fixture.config,
+            &binding,
+            &scope,
+            records::DecodeWork::shared(&records::SharedDecodeBudget::default()),
+        )
+        .await
+        .unwrap();
+        let checked = records::revalidate_confirmed_in_transaction(
+            &tx,
+            &fixture.config,
+            &fixture.auth,
+            &binding,
+        )
+        .await
+        .unwrap();
+        assert_eq!(checked.len(), 2);
+        assert!(
+            checked
+                .iter()
+                .all(|item| matches!(item.outcome, RevalidationOutcome::Checked(_)))
+        );
+        let mut batch = super::super::super::execution::ExecutionBatch::new(
+            &tx,
+            &fixture.config,
+            &fixture.auth,
+            &binding,
+            before,
+        )
+        .unwrap();
+        let migrated = match batch.execute_entry(&binding.confirmation.bindings[0]).await {
+            Ok(migrated) => migrated,
+            Err(error) => {
+                let actual_source = remote_pin::Entity::find_by_id(source_key.clone())
+                    .one(&tx)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let actual_destination = remote_pin::Entity::find_by_id(destination_key.clone())
+                    .one(&tx)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let actual_ledger = remote_pin_ledger::Entity::find_by_id(destination_key.clone())
+                    .one(&tx)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let attached_id = crate::store::pinning::leases::target_id(
+                    &source.lease_id,
+                    &destination_provider,
+                    &source.cid,
+                );
+                let actual_target = pin_lease_target::Entity::find_by_id(attached_id)
+                    .one(&tx)
+                    .await
+                    .unwrap();
+                tx.rollback().await.unwrap();
+                let failure = super::super::super::apply_detailed(
+                    &fixture.db,
+                    &fixture.config,
+                    &fixture.auth,
+                    &binding,
+                )
+                .await
+                .err()
+                .expect("formal apply must expose the same rejected mixed migration");
+                panic!(
+                    "mixed migration must execute: Migrate -> Renew; Migrate step={:?}; execute_entry={error:?}; source epoch {} -> {}; destination epoch {} -> {}; destination ledger unchanged={}; actual destination={actual_target:?}; formal apply={:?}, items={:?}",
+                    serde_json::to_value(&binding.confirmation.bindings[0].step).unwrap(),
+                    source_remote.epoch,
+                    actual_source.epoch,
+                    destination_remote.epoch,
+                    actual_destination.epoch,
+                    destination_ledger == actual_ledger,
+                    failure.cause,
+                    failure
+                        .items
+                        .iter()
+                        .map(|item| (&item.item_id, item.state))
+                        .collect::<Vec<_>>()
+                );
+            }
+        };
+        let migration = migrated.action_view();
+        assert_eq!(migration.receipt.intent_ids, vec![source.lease_id.clone()]);
+        assert_eq!(migration.migration_points.len(), 1);
+        let point = &migration.migration_points[0];
+        let attached = pin_lease_target::Entity::find_by_id(point.destination_target_id.clone())
+            .one(&tx)
+            .await
+            .unwrap()
+            .unwrap();
+        let expected_id = crate::store::pinning::leases::target_id(
             &source.lease_id,
             &destination_provider,
             &source.cid,
-            source.logical_size,
-            "waiting"
-        )
-    );
-    assert_eq!(point.source_target_id, source.id);
-    assert_eq!(point.destination_route, destination_route);
-    assert_eq!(point.destination_epoch, destination_remote.epoch + 1);
-    assert_eq!(
-        pin_lease::Entity::find_by_id(source.lease_id.clone())
-            .one(&tx)
-            .await
-            .unwrap()
-            .unwrap(),
-        source_lease
-    );
-    assert_eq!(
-        pin_lease_requirement::Entity::find_by_id(source.lease_id.clone())
-            .one(&tx)
-            .await
-            .unwrap()
-            .unwrap(),
-        source_contract
-    );
-    assert_eq!(
-        pin_lease_target::Entity::find_by_id(source.id.clone())
-            .one(&tx)
-            .await
-            .unwrap()
-            .unwrap(),
-        source
-    );
-    assert_eq!(
-        remote_pin::Entity::find_by_id(source_key.clone())
-            .one(&tx)
-            .await
-            .unwrap()
-            .unwrap(),
-        source_remote
-    );
-    let after_migrate = remote_pin::Entity::find_by_id(destination_key.clone())
-        .one(&tx)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(after_migrate.epoch, destination_remote.epoch + 1);
-    let mut unchanged = after_migrate.clone();
-    unchanged.epoch = destination_remote.epoch;
-    unchanged.last_touched_at = destination_remote.last_touched_at;
-    assert_eq!(unchanged, destination_remote);
-    assert_eq!(
-        remote_pin_ledger::Entity::find_by_id(source_key.clone())
-            .one(&tx)
-            .await
-            .unwrap()
-            .unwrap(),
-        source_ledger
-    );
-    assert_eq!(
-        remote_pin_ledger::Entity::find_by_id(destination_key.clone())
-            .one(&tx)
-            .await
-            .unwrap()
-            .unwrap(),
-        destination_ledger
-    );
-    use super::super::super::execution::{
-        self,
-        facts::{Cursor, Key, OperationRead},
-    };
-    let operation = migrated.operation();
-    let destination = Key(
-        "remote_pins".into(),
-        vec![destination_key.0.clone(), destination_key.1.clone()],
-    );
-    assert_eq!(
-        native::value(operation.before(&destination).unwrap().unwrap(), "epoch"),
-        Some(destination_remote.epoch.to_string().as_str())
-    );
-    assert_eq!(
-        native::value(operation.after(&destination).unwrap().unwrap(), "epoch"),
-        Some(after_migrate.epoch.to_string().as_str())
-    );
-    for authority in &migration.jobs {
-        migrated.validate_job(&binding, authority).unwrap();
-        assert_eq!(authority.directive, records::JobDirective::ReadOnlyObserve);
-    }
-    for (table, column, replacement) in [
-        ("remote_pins", "epoch", "999"),
-        ("pin_jobs", "operation", "submit"),
-        ("pin_invocation_routes", "remote_epoch", "999"),
-        ("pin_invocation_routes", "route", "{}"),
-    ] {
-        let mut invalid = operation.facts.as_ref().clone();
-        let output = invalid
-            .2
-            .iter_mut()
-            .find(|output| output.0.0 == table)
-            .unwrap();
-        let column = before
-            .table(table)
-            .unwrap()
-            .columns
-            .iter()
-            .position(|c| c == column)
-            .unwrap();
-        output.2.as_mut().unwrap()[column] = Some(replacement.into());
-        let cursor = Cursor::default();
-        let invalid =
-            OperationRead::resolve((&binding).into(), std::sync::Arc::new(invalid), &cursor)
-                .unwrap();
-        assert!(
-            execution::validate_operation_with_cursor(
-                (&binding).into(),
-                migration,
-                &invalid,
-                &cursor
-            )
-            .is_err()
         );
-    }
-    for change in 0..5 {
-        let mut invalid = migration.clone();
-        match change {
-            0 => invalid.jobs[0].directive = records::JobDirective::Submit,
-            1 => invalid.jobs[0].remote_epoch += 1,
-            2 => invalid.jobs[0].resource_id = Some("foreign-resource".into()),
-            3 => invalid.jobs[0].route.scope = "foreign-account".into(),
-            _ => {
-                invalid.jobs[0].source.as_mut().unwrap().private_version_id =
-                    "foreign-source".into()
-            }
-        }
-        assert!(execution::validate_operation((&binding).into(), &invalid, operation).is_err());
-    }
-    let migration_result =
-        records::write_executed_action_in_transaction(&fixture.auth, &binding, &migrated, before)
-            .await
-            .unwrap();
-    super::super::super::seal::executed(
-        &tx,
-        &fixture.auth,
-        &binding,
-        &migrated,
-        records::DecodeWork::shared(&records::SharedDecodeBudget::default()),
-    )
-    .await
-    .unwrap();
-    let prior_jobs = pin_job::Entity::find()
-        .order_by_asc(pin_job::Column::Id)
-        .all(&tx)
-        .await
-        .unwrap();
-    let renewed = batch
-        .execute_entry(&binding.confirmation.bindings[1])
-        .await
-        .unwrap();
-    let renewal = renewed.action_view();
-    assert_eq!(renewal.jobs.len(), 2);
-    for (key, initial, ledger) in [
-        (&source_key, &source_remote, &source_ledger),
-        (&destination_key, &after_migrate, &destination_ledger),
-    ] {
-        let after = remote_pin::Entity::find_by_id(key.clone())
-            .one(&tx)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(after.epoch, initial.epoch + 1);
-        let mut unchanged = after.clone();
-        unchanged.epoch = initial.epoch;
-        unchanged.last_touched_at = initial.last_touched_at;
-        assert_eq!(&unchanged, initial);
+        assert_ne!(source.id, expected_id);
+        let mut expected_targets = vec![source.id.clone(), expected_id.clone()];
+        expected_targets.sort();
+        assert_eq!(migration.targets.len(), 2);
+        assert_eq!(migration.targets, expected_targets);
         assert_eq!(
-            &remote_pin_ledger::Entity::find_by_id(key.clone())
+            (
+                &attached.id,
+                &attached.lease_id,
+                &attached.provider,
+                &attached.cid,
+                attached.logical_size,
+                attached.state.as_str()
+            ),
+            (
+                &expected_id,
+                &source.lease_id,
+                &destination_provider,
+                &source.cid,
+                source.logical_size,
+                "waiting"
+            )
+        );
+        assert_eq!(point.source_target_id, source.id);
+        assert_eq!(point.destination_route, destination_route);
+        assert_eq!(point.destination_epoch, destination_remote.epoch + 1);
+        assert_eq!(
+            pin_lease::Entity::find_by_id(source.lease_id.clone())
                 .one(&tx)
                 .await
                 .unwrap()
                 .unwrap(),
-            ledger
+            source_lease
         );
-        let authority = renewal
-            .jobs
-            .iter()
-            .find(|authority| authority.provider == key.0 && authority.cid == key.1)
-            .unwrap();
-        assert_eq!(authority.remote_epoch, after.epoch);
-        assert_eq!(authority.lease_id.as_deref(), Some(renewable.id.as_str()));
-        assert_eq!(authority.lease_generation, Some(renewable.generation + 1));
-        assert_eq!(authority.directive, records::JobDirective::ReadOnlyObserve);
-        assert!(!prior_jobs.iter().any(|job| job.id == authority.job_id));
-        renewed.validate_job(&binding, authority).unwrap();
-    }
-    let renewal_result =
-        records::write_executed_action_in_transaction(&fixture.auth, &binding, &renewed, before)
-            .await
-            .unwrap();
-    super::super::super::seal::executed(
-        &tx,
-        &fixture.auth,
-        &binding,
-        &renewed,
-        records::DecodeWork::shared(&records::SharedDecodeBudget::default()),
-    )
-    .await
-    .unwrap();
-    for job in &prior_jobs {
         assert_eq!(
-            pin_job::Entity::find_by_id(job.id.clone())
+            pin_lease_requirement::Entity::find_by_id(source.lease_id.clone())
                 .one(&tx)
                 .await
                 .unwrap()
-                .as_ref(),
-            Some(job)
+                .unwrap(),
+            source_contract
         );
-    }
-    let renewed_lease = pin_lease::Entity::find_by_id(renewable.id.clone())
-        .one(&tx)
-        .await
-        .unwrap()
-        .unwrap();
-    let renewal_now = renewed_lease.last_touched_at;
-    assert!(renewable.last_touched_at < renewal_now);
-    let mut expected_renewed_targets = renewable_targets.clone();
-    for target in &mut expected_renewed_targets {
-        let snapshot_remote = if target.provider == source_key.0 && target.cid == source_key.1 {
-            &source_remote
-        } else {
-            assert_eq!(
-                (&target.provider, &target.cid),
-                (&destination_key.0, &destination_key.1)
-            );
-            &after_migrate
+        assert_eq!(
+            pin_lease_target::Entity::find_by_id(source.id.clone())
+                .one(&tx)
+                .await
+                .unwrap()
+                .unwrap(),
+            source
+        );
+        assert_eq!(
+            remote_pin::Entity::find_by_id(source_key.clone())
+                .one(&tx)
+                .await
+                .unwrap()
+                .unwrap(),
+            source_remote
+        );
+        let after_migrate = remote_pin::Entity::find_by_id(destination_key.clone())
+            .one(&tx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_migrate.epoch, destination_remote.epoch + 1);
+        let mut unchanged = after_migrate.clone();
+        unchanged.epoch = destination_remote.epoch;
+        unchanged.last_touched_at = destination_remote.last_touched_at;
+        assert_eq!(unchanged, destination_remote);
+        assert_eq!(
+            remote_pin_ledger::Entity::find_by_id(source_key.clone())
+                .one(&tx)
+                .await
+                .unwrap()
+                .unwrap(),
+            source_ledger
+        );
+        assert_eq!(
+            remote_pin_ledger::Entity::find_by_id(destination_key.clone())
+                .one(&tx)
+                .await
+                .unwrap()
+                .unwrap(),
+            destination_ledger
+        );
+        use super::super::super::execution::{
+            self,
+            facts::{Cursor, Key, OperationRead},
         };
-        target.last_touched_at = target
-            .last_touched_at
-            .max(renewal_now)
-            .max(snapshot_remote.last_touched_at);
-    }
-    assert_eq!(
-        pin_lease_target::Entity::find()
-            .filter(pin_lease_target::Column::LeaseId.eq(renewable.id.clone()))
-            .order_by_asc(pin_lease_target::Column::Id)
+        let operation = migrated.operation();
+        let destination = Key(
+            "remote_pins".into(),
+            vec![destination_key.0.clone(), destination_key.1.clone()],
+        );
+        assert_eq!(
+            native::value(operation.before(&destination).unwrap().unwrap(), "epoch"),
+            Some(destination_remote.epoch.to_string().as_str())
+        );
+        assert_eq!(
+            native::value(operation.after(&destination).unwrap().unwrap(), "epoch"),
+            Some(after_migrate.epoch.to_string().as_str())
+        );
+        for authority in &migration.jobs {
+            migrated.validate_job(&binding, authority).unwrap();
+            assert_eq!(authority.directive, records::JobDirective::ReadOnlyObserve);
+        }
+        for (table, column, replacement) in [
+            ("remote_pins", "epoch", "999"),
+            ("pin_jobs", "operation", "submit"),
+            ("pin_invocation_routes", "remote_epoch", "999"),
+            ("pin_invocation_routes", "route", "{}"),
+        ] {
+            let mut invalid = operation.facts.as_ref().clone();
+            let output = invalid
+                .2
+                .iter_mut()
+                .find(|output| output.0.0 == table)
+                .unwrap();
+            let column = before
+                .table(table)
+                .unwrap()
+                .columns
+                .iter()
+                .position(|c| c == column)
+                .unwrap();
+            output.2.as_mut().unwrap()[column] = Some(replacement.into());
+            let cursor = Cursor::default();
+            let invalid = OperationRead::resolve(
+                migrated.binding_for_test(&binding),
+                std::sync::Arc::new(invalid),
+                &cursor,
+            )
+            .unwrap();
+            let rejection = execution::validate_operation_with_cursor(
+                migrated.binding_for_test(&binding),
+                migration,
+                &invalid,
+                &cursor,
+            )
+            .unwrap_err();
+            assert_ne!(rejection, ManagementError::Budget);
+        }
+        for change in 0..5 {
+            let mut invalid = migration.clone();
+            match change {
+                0 => invalid.jobs[0].directive = records::JobDirective::Submit,
+                1 => invalid.jobs[0].remote_epoch += 1,
+                2 => invalid.jobs[0].resource_id = Some("foreign-resource".into()),
+                3 => invalid.jobs[0].route.scope = "foreign-account".into(),
+                _ => {
+                    invalid.jobs[0].source.as_mut().unwrap().private_version_id =
+                        "foreign-source".into()
+                }
+            }
+            let rejection = execution::validate_operation(
+                migrated.binding_for_test(&binding),
+                &invalid,
+                operation,
+            )
+            .unwrap_err();
+            assert_ne!(rejection, ManagementError::Budget);
+        }
+        let migration_result = records::write_executed_action_in_transaction(
+            &fixture.auth,
+            &binding,
+            &migrated,
+            before,
+        )
+        .await
+        .unwrap();
+        super::super::super::seal::executed(
+            &tx,
+            &fixture.auth,
+            &binding,
+            &migrated,
+            records::DecodeWork::shared(&records::SharedDecodeBudget::default()),
+        )
+        .await
+        .unwrap();
+        let prior_jobs = pin_job::Entity::find()
+            .order_by_asc(pin_job::Column::Id)
             .all(&tx)
             .await
-            .unwrap(),
-        expected_renewed_targets
-    );
-    let written = vec![(migrated, migration_result), (renewed, renewal_result)];
-    batch.validate_final(&written).await.unwrap();
-    for key in [&source_key, &destination_key] {
-        let expected = native::capture(&tx).await.unwrap();
-        let check = tx.begin().await.unwrap();
-        check
-            .execute(sea_orm::Statement::from_sql_and_values(
-                check.get_database_backend(),
-                "UPDATE remote_pin_ledger SET route='{}' WHERE provider=$1 AND cid=$2",
-                [key.0.clone().into(), key.1.clone().into()],
-            ))
+            .unwrap();
+        let renewed = batch
+            .execute_entry(&binding.confirmation.bindings[1])
             .await
             .unwrap();
-        let validation = batch.validate_final(&written).await;
-        assert!(
-            matches!(
-                validation,
-                Err(crate::store::pinning::management::ManagementError::InvalidEvidence)
-            ),
-            "{validation:?}"
+        let renewal = renewed.action_view();
+        assert_eq!(renewal.jobs.len(), 2);
+        for (key, initial, ledger) in [
+            (&source_key, &source_remote, &source_ledger),
+            (&destination_key, &after_migrate, &destination_ledger),
+        ] {
+            let after = remote_pin::Entity::find_by_id(key.clone())
+                .one(&tx)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.epoch, initial.epoch + 1);
+            let mut unchanged = after.clone();
+            unchanged.epoch = initial.epoch;
+            unchanged.last_touched_at = initial.last_touched_at;
+            assert_eq!(&unchanged, initial);
+            assert_eq!(
+                &remote_pin_ledger::Entity::find_by_id(key.clone())
+                    .one(&tx)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                ledger
+            );
+            let authority = renewal
+                .jobs
+                .iter()
+                .find(|authority| authority.provider == key.0 && authority.cid == key.1)
+                .unwrap();
+            assert_eq!(authority.remote_epoch, after.epoch);
+            assert_eq!(authority.lease_id.as_deref(), Some(renewable.id.as_str()));
+            assert_eq!(authority.lease_generation, Some(renewable.generation + 1));
+            assert_eq!(authority.directive, records::JobDirective::ReadOnlyObserve);
+            assert!(!prior_jobs.iter().any(|job| job.id == authority.job_id));
+            renewed.validate_job(&binding, authority).unwrap();
+        }
+        let renewal_result = records::write_executed_action_in_transaction(
+            &fixture.auth,
+            &binding,
+            &renewed,
+            before,
+        )
+        .await
+        .unwrap();
+        super::super::super::seal::executed(
+            &tx,
+            &fixture.auth,
+            &binding,
+            &renewed,
+            records::DecodeWork::shared(&records::SharedDecodeBudget::default()),
+        )
+        .await
+        .unwrap();
+        for job in &prior_jobs {
+            assert_eq!(
+                pin_job::Entity::find_by_id(job.id.clone())
+                    .one(&tx)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                Some(job)
+            );
+        }
+        let renewed_lease = pin_lease::Entity::find_by_id(renewable.id.clone())
+            .one(&tx)
+            .await
+            .unwrap()
+            .unwrap();
+        let renewal_now = renewed_lease.last_touched_at;
+        assert!(renewable.last_touched_at < renewal_now);
+        let mut expected_renewed_targets = renewable_targets.clone();
+        for target in &mut expected_renewed_targets {
+            let snapshot_remote = if target.provider == source_key.0 && target.cid == source_key.1 {
+                &source_remote
+            } else {
+                assert_eq!(
+                    (&target.provider, &target.cid),
+                    (&destination_key.0, &destination_key.1)
+                );
+                &after_migrate
+            };
+            target.last_touched_at = target
+                .last_touched_at
+                .max(renewal_now)
+                .max(snapshot_remote.last_touched_at);
+        }
+        assert_eq!(
+            pin_lease_target::Entity::find()
+                .filter(pin_lease_target::Column::LeaseId.eq(renewable.id.clone()))
+                .order_by_asc(pin_lease_target::Column::Id)
+                .all(&tx)
+                .await
+                .unwrap(),
+            expected_renewed_targets
         );
-        check.rollback().await.unwrap();
-        assert!(native::capture(&tx).await.unwrap() == expected);
+        let written = vec![(migrated, migration_result), (renewed, renewal_result)];
+        if let Some(key) = corrupt_ledger {
+            let expected = native::capture(&tx).await.unwrap();
+            let check = tx.begin().await.unwrap();
+            check
+                .execute(sea_orm::Statement::from_sql_and_values(
+                    check.get_database_backend(),
+                    "UPDATE remote_pin_ledger SET route='{}' WHERE provider=$1 AND cid=$2",
+                    [key.0.clone().into(), key.1.clone().into()],
+                ))
+                .await
+                .unwrap();
+            let validation = batch.validate_final(&written).await;
+            assert!(
+                matches!(
+                    validation,
+                    Err(crate::store::pinning::management::ManagementError::InvalidEvidence)
+                ),
+                "{validation:?}"
+            );
+            check.rollback().await.unwrap();
+            assert!(native::capture(&tx).await.unwrap() == expected);
+        } else {
+            batch.validate_final(&written).await.unwrap();
+        }
+        tx.rollback().await.unwrap();
+        assert!(native::capture(&fixture.db).await.unwrap() == committed_before);
     }
-    batch.validate_final(&written).await.unwrap();
-    tx.rollback().await.unwrap();
-    assert!(native::capture(&fixture.db).await.unwrap() == committed_before);
 
     let applied = super::super::super::apply(&fixture.db, &fixture.config, &fixture.auth, &binding)
         .await

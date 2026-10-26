@@ -110,8 +110,8 @@ pub async fn publish_plain_object(
         chrono::Utc::now(),
     );
     object.multipart = multipart;
-    crate::store::pinning::publication::publish_object(
-        state.store.db(),
+    crate::store::pinning::publication::application::publish_object(
+        &state.store,
         PublicationRequest {
             object,
             tags: policy.tags.clone(),
@@ -998,8 +998,8 @@ pub async fn put_object(
         };
         let publication_result = lease
             .commit(
-                crate::store::pinning::publication::publish_decided_standard_object(
-                    db,
+                crate::store::pinning::publication::application::publish_decided_standard_object(
+                    &state.store,
                     publication,
                     mutation_guard,
                     decided_publish(state, &decision),
@@ -1681,8 +1681,8 @@ pub async fn copy_object(
         let publication_result = match hot_receipt {
             Some(receipt) => lease
                 .commit(
-                    crate::store::pinning::publication::publish_decided_standard_object_with_hot_receipt(
-                        db,
+                    crate::store::pinning::publication::application::publish_decided_standard_object_with_hot_receipt(
+                        &state.store,
                         publication,
                         mutation_guard,
                         receipt,
@@ -1692,8 +1692,8 @@ pub async fn copy_object(
                 .await?,
             None => {
                 lease
-                    .commit(crate::store::pinning::publication::publish_decided_standard_object(
-                        db,
+                    .commit(crate::store::pinning::publication::application::publish_decided_standard_object(
+                        &state.store,
                         publication,
                         mutation_guard,
                         decided_publish(state, &decision),
@@ -2139,6 +2139,7 @@ mod tests {
     };
 
     mod copy_hot_receipt_tests;
+    mod encrypted_range_cost_tests;
     mod metadata_listing_tests;
     mod optional_pinning_tests;
 
@@ -4434,7 +4435,10 @@ mod tests {
         state
             .store
             .db()
-            .execute_unprepared("DROP TABLE objects")
+            .execute_unprepared(
+                "CREATE TRIGGER fail_object_publication BEFORE INSERT ON objects \
+                 BEGIN SELECT RAISE(ABORT, 'publication write rejected'); END",
+            )
             .await
             .unwrap();
 

@@ -20,15 +20,21 @@ const ACTION_INDEX_STATEMENTS: [&str; 5] = [
 pub struct Migration;
 
 #[async_trait::async_trait]
-impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+impl super::bridge::SharedMigration for Migration {
+    async fn up_body(&self, manager: &super::bridge::Manager<'_>) -> Result<(), DbErr> {
         let connection = manager.get_connection();
         ensure_supported(connection.get_database_backend())?;
         let transaction = connection.begin().await?;
         let result = apply_up(&transaction).await;
         finish_transaction(transaction, result).await
     }
-
+}
+#[async_trait::async_trait]
+impl MigrationTrait for Migration {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        super::bridge::SharedMigration::up_body(self, &super::bridge::Manager::native(manager))
+            .await
+    }
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let connection = manager.get_connection();
         ensure_supported(connection.get_database_backend())?;
@@ -49,9 +55,10 @@ fn ensure_supported(backend: DatabaseBackend) -> Result<(), DbErr> {
 }
 
 async fn finish_transaction(
-    transaction: sea_orm::DatabaseTransaction,
+    transaction: impl Into<super::bridge::Transaction>,
     result: Result<(), DbErr>,
 ) -> Result<(), DbErr> {
+    let transaction = transaction.into();
     match result {
         Ok(()) => transaction.commit().await,
         Err(error) => {

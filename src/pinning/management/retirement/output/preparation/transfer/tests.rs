@@ -78,12 +78,19 @@ async fn oversized_text_payload_is_not_returned_by_the_bounded_query() {
         .query_all(Statement::from_sql_and_values(
             DatabaseBackend::Sqlite,
             BATCH_SQL,
-            [reference.archive_id.clone().into(), 0i64.into(), 16i64.into()],
+            [
+                reference.archive_id.clone().into(),
+                0i64.into(),
+                16i64.into(),
+            ],
         ))
         .await
         .unwrap();
     assert_eq!(rows.len(), 16);
-    assert_eq!(rows[0].try_get::<Option<String>>("", "payload").unwrap(), None);
+    assert_eq!(
+        rows[0].try_get::<Option<String>>("", "payload").unwrap(),
+        None
+    );
     let mut budget = v3::files::stream::budget();
     assert!(
         copy(&db, &reference, "header", &mut std::io::sink(), &mut budget)

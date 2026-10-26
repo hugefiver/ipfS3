@@ -41,6 +41,7 @@ pub(super) struct SqliteCatalog {
     pub objects: BTreeMap<String, SqliteObject>,
     pub query: String,
     pub cap: usize,
+    pub control_query: String,
 }
 
 pub(super) fn expected(records: bool) -> &'static SqliteCatalog {
@@ -85,15 +86,30 @@ fn build(records: bool) -> SqliteCatalog {
     }
     let cap = expected.len() + scoped_tables.len();
     let query = catalog_query(&expected, &scoped_tables, &shadow_names, cap);
+    let control_query = format!("WITH {} {}", shadow_query(&shadow_names), CONTROL);
     SqliteCatalog {
         objects: expected,
         query,
         cap,
+        control_query,
     }
 }
 
 fn literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+const CONTROL: &str = "SELECT 'control' AS row_kind,NULL AS name,NULL AS type,NULL AS tbl_name,NULL AS sql,NULL AS bounded,present AS shadow,CASE WHEN present=1 THEN 0 ELSE EXISTS(SELECT 1 FROM pin_management_readiness WHERE id=1 AND format='S75A1' AND state=$1) END AS ready FROM shadow";
+
+fn shadow_query(names: &[&str]) -> String {
+    let names = names
+        .iter()
+        .map(|name| literal(name))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "shadow AS MATERIALIZED (SELECT EXISTS(SELECT 1 FROM sqlite_temp_schema WHERE type IN ('table','view') AND name IN ({names})) AS present)"
+    )
 }
 
 fn catalog_query(
@@ -120,11 +136,7 @@ fn catalog_query(
         .map(|name| literal(name))
         .collect::<Vec<_>>()
         .join(",");
-    let shadow_names = shadow_names
-        .iter()
-        .map(|name| literal(name))
-        .collect::<Vec<_>>()
-        .join(",");
+    let shadow = shadow_query(shadow_names);
     // Keep DDL out of the materialized catalog and its automatic indexes. Read
     // definitions by rowid in this same statement; only differences cross into Rust.
     format!(
@@ -143,12 +155,9 @@ fn catalog_query(
             AND (a.bounded IS NOT 1 OR NOT (a.type='index' AND a.sql_null AND a.tbl_name IN ({tables}))) \
         UNION ALL SELECT e.name,NULL,NULL,NULL,0 FROM expected e WHERE (SELECT COUNT(*) FROM actual a WHERE a.name=e.name)<>1 \
         UNION ALL SELECT '',NULL,NULL,NULL,0 WHERE (SELECT COUNT(*) FROM actual)>{cap} LIMIT {limit}\
-        ), shadow AS MATERIALIZED (\
-            SELECT EXISTS(SELECT 1 FROM sqlite_temp_schema WHERE type IN ('table','view') AND name IN ({shadow_names})) AS present\
-        ) \
+        ), {shadow} \
         SELECT 'catalog' AS row_kind,name,type,tbl_name,sql,bounded,NULL AS shadow,NULL AS ready FROM catalog \
-        UNION ALL SELECT 'control',NULL,NULL,NULL,NULL,NULL,present,\
-            CASE WHEN present=1 THEN 0 ELSE EXISTS(SELECT 1 FROM pin_management_readiness WHERE id=1 AND format='S75A1' AND state=$1) END FROM shadow",
+        UNION ALL {CONTROL}",
         limit = cap + 1
     )
 }
@@ -188,6 +197,7 @@ mod tests {
             )]),
             query: String::new(),
             cap: 1,
+            control_query: String::new(),
         };
         catalog.query = catalog_query(&catalog.objects, &["sample"], &["sample"], catalog.cap);
         let read = || {

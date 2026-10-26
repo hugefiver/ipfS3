@@ -2,7 +2,7 @@ use super::*;
 use crate::pinning::management::wire::v3::{self, Projection};
 use std::{
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 struct StopAfterChunk {
@@ -37,7 +37,7 @@ async fn planning_soft_stop_pauses_after_complete_chunk_and_reopens_without_gaps
     let sink = StopAfterChunk {
         bytes: Vec::new(),
         clock,
-        end: Instant::now() + Duration::from_secs(30),
+        end: Instant::now() + limits.elapsed,
     };
     let mut writer = Writer::new(sink, Projection::Review, Budget::default()).unwrap();
     writer

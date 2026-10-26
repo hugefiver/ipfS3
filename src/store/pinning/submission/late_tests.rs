@@ -25,6 +25,10 @@ struct Invocation {
 impl Invocation {
     async fn new(api: &str) -> Self {
         let db = store::connect_database("sqlite::memory:").await.unwrap();
+        Self::with_database(db, api).await
+    }
+
+    async fn with_database(db: DatabaseConnection, api: &str) -> Self {
         store::run_migrations(&db).await.unwrap();
         let now = store::database_clock::database_now(&db).await.unwrap();
         let identity = ProviderIdentity::legacy(PROVIDER, "kubo", None, api, "cid");
@@ -83,15 +87,17 @@ impl Invocation {
         ))
         .await
         .unwrap();
-        ledger::capture_reservation(&db, PROVIDER, CID)
+        let preparation = db.begin().await.unwrap();
+        ledger::capture_reservation(&preparation, PROVIDER, CID)
             .await
             .unwrap();
         jobs::enqueue_job(
-            &db,
+            &preparation,
             jobs::submit_job(PROVIDER, CID, "lease", "target", 1, now),
         )
         .await
         .unwrap();
+        preparation.commit().await.unwrap();
         let claimed = jobs::claim_due_jobs(&db, now, Duration::minutes(1), 1)
             .await
             .unwrap()
@@ -688,4 +694,435 @@ async fn changed_generation_after_receipt_commit_blocks_unknown_worker_projectio
 #[tokio::test]
 async fn live_after_receipt_commit_keeps_unknown_worker_projection() {
     check_unknown_projection_after_receipt_commit(Lifetime::Live).await;
+}
+
+#[tokio::test]
+async fn fact_completion_uses_original_identity_and_duplicate_callback_cannot_overwrite() {
+    let invocation = Invocation::new("kubo").await;
+    let original = capture_fact(&invocation.db, &invocation.claimed, &invocation.id)
+        .await
+        .unwrap();
+    let mut wrong = invocation.claimed.clone();
+    wrong.model.locked_until = Some(invocation.now + Duration::hours(2));
+    assert!(
+        capture_fact(&invocation.db, &wrong, &invocation.id)
+            .await
+            .is_err()
+    );
+    wrong = invocation.claimed.clone();
+    wrong.model.provider = "another-provider".into();
+    assert!(
+        capture_fact(&invocation.db, &wrong, &invocation.id)
+            .await
+            .is_err()
+    );
+    let store = store::Store::new(invocation.db);
+    let first = complete_fact(&store, &original, &observed("kubo", true), invocation.now)
+        .await
+        .unwrap();
+    assert!(
+        complete_fact(
+            &store,
+            &original,
+            &unknown(),
+            invocation.now + Duration::seconds(1)
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        latest(store.db(), &invocation.claimed.model.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        first
+    );
+    assert!(
+        first.needs_attention,
+        "a fact alone cannot settle business authority"
+    );
+}
+
+#[tokio::test]
+async fn fact_completion_cas_rejects_changed_invocation_identity() {
+    for assignment in [
+        "id='different-invocation'",
+        "job_id='different-job'",
+        "submit_call=2",
+        "provider='different-provider'",
+        "expected_cid='different-cid'",
+        "route='{}'",
+        "remote_epoch=2",
+        "claim_until='2099-01-01T00:00:00Z'",
+    ] {
+        let invocation = Invocation::new("kubo").await;
+        let original = capture_fact(&invocation.db, &invocation.claimed, &invocation.id)
+            .await
+            .unwrap();
+        invocation
+            .db
+            .execute_unprepared(&format!(
+                "UPDATE main.pin_submit_observations SET {assignment}"
+            ))
+            .await
+            .unwrap();
+        let store = store::Store::new(invocation.db);
+        assert!(
+            complete_fact(&store, &original, &observed("kubo", true), invocation.now)
+                .await
+                .is_err(),
+            "{assignment}"
+        );
+        let row = store
+            .db()
+            .query_one(Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT observed_at FROM main.pin_submit_observations",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            row.try_get::<Option<DateTime<Utc>>>("", "observed_at")
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn fact_completion_is_main_qualified_and_independent_of_readiness() {
+    let invocation = Invocation::new("kubo").await;
+    let original = capture_fact(&invocation.db, &invocation.claimed, &invocation.id)
+        .await
+        .unwrap();
+    invocation
+        .db
+        .execute_unprepared("UPDATE pin_management_readiness SET state='backfill' WHERE id=1")
+        .await
+        .unwrap();
+    invocation.db.execute_unprepared("CREATE TEMP TABLE pin_submit_observations AS SELECT * FROM main.pin_submit_observations").await.unwrap();
+    let store = store::Store::new(invocation.db);
+    let first = complete_fact(&store, &original, &observed("kubo", true), invocation.now)
+        .await
+        .unwrap();
+    assert_eq!(
+        latest(store.db(), &invocation.claimed.model.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        first
+    );
+    let shadow = store
+        .db()
+        .query_one(Statement::from_string(
+            sea_orm::DatabaseBackend::Sqlite,
+            "SELECT observed_at FROM temp.pin_submit_observations",
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        shadow
+            .try_get::<Option<DateTime<Utc>>>("", "observed_at")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(first.outcome, "matched");
+    assert!(first.needs_attention);
+}
+
+#[tokio::test]
+async fn generic_record_remains_atomic_with_its_callers_transaction() {
+    let invocation = Invocation::new("kubo").await;
+    let tx = invocation.db.begin().await.unwrap();
+    assert!(
+        record(
+            &tx,
+            &invocation.claimed,
+            &invocation.id,
+            &observed("kubo", true),
+            invocation.now
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        latest(&tx, &invocation.claimed.model.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .observed_at
+            .is_some()
+    );
+    tx.rollback().await.unwrap();
+    assert!(
+        latest(&invocation.db, &invocation.claimed.model.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .observed_at
+            .is_none()
+    );
+}
+
+async fn postgres_invocation() -> (Invocation, DatabaseConnection, String) {
+    use futures_util::FutureExt;
+    let url = std::env::var("IPFS_S3_TEST_RPC_RECOVERY_POSTGRES_URL")
+        .expect("explicit authorized isolated PostgreSQL endpoint required");
+    let parsed = url::Url::parse(&url).unwrap();
+    assert!(matches!(parsed.scheme(), "postgres" | "postgresql"));
+    assert!(matches!(
+        parsed.host_str(),
+        Some("127.0.0.1" | "localhost" | "::1")
+    ));
+    assert_ne!(parsed.port(), Some(55467));
+    let admin = store::connect_database(&url).await.unwrap();
+    let schema = format!("rpc_fact_{}", uuid::Uuid::new_v4().simple());
+    admin
+        .execute_unprepared(&format!("CREATE SCHEMA \"{schema}\""))
+        .await
+        .unwrap();
+    let mut options = sea_orm::ConnectOptions::new(url);
+    options.set_schema_search_path(schema.clone());
+    // TEMP objects and capture/completion must exercise the same connection.
+    options.max_connections(1);
+    let db = match sea_orm::Database::connect(options).await {
+        Ok(db) => db,
+        Err(error) => {
+            drop_postgres_invocation_schema(&admin, &schema).await;
+            admin.close().await.unwrap();
+            panic!("isolated receipt fixture connection failed: {error}");
+        }
+    };
+    match std::panic::AssertUnwindSafe(Invocation::with_database(db.clone(), "kubo"))
+        .catch_unwind()
+        .await
+    {
+        Ok(invocation) => (invocation, admin, schema),
+        Err(panic) => {
+            db.close().await.unwrap();
+            drop_postgres_invocation_schema(&admin, &schema).await;
+            admin.close().await.unwrap();
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
+
+#[tokio::test]
+async fn bounded_candidate_pages_progress_past_inflight_and_unwakeable_history() {
+    use sea_orm::IntoActiveModel;
+    let invocation = Invocation::new("kubo").await;
+    let captured = capture_fact(&invocation.db, &invocation.claimed, &invocation.id)
+        .await
+        .unwrap();
+    let tx = invocation.db.begin().await.unwrap();
+    jobs::park_submit(
+        &tx,
+        &invocation.claimed,
+        "needs_attention",
+        jobs::RPC_RECOVERY_PARK_REASON,
+        invocation.now,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let store = store::Store::new(invocation.db);
+    let receipt = complete_fact(&store, &captured, &observed("kubo", true), invocation.now)
+        .await
+        .unwrap();
+    // Retained observation history can outlive its job. Such rows, including
+    // incomplete invocations, must not prevent later pages from making progress.
+    for (id, completed) in [("!first-inflight", false), ("!second-orphan", true)] {
+        let mut history = receipt.clone().into_active_model();
+        history.id = Set(id.into());
+        history.job_id = Set(id.into());
+        if !completed {
+            history.effect = Set("unknown".into());
+            history.outcome = Set("in_flight".into());
+            history.observed_at = Set(None);
+            history.resources = Set("[]".into());
+        }
+        evidence::Entity::insert(history)
+            .exec(store.db())
+            .await
+            .unwrap();
+    }
+    let mut cursor = String::new();
+    let mut found = Vec::new();
+    for _ in 0..3 {
+        let (next, candidates) = parked_receipt_candidates(store.db(), &cursor, 1)
+            .await
+            .unwrap();
+        let next = next.expect("each page must advance past one persisted identity");
+        assert!(next > cursor);
+        cursor = next;
+        found.extend(candidates);
+    }
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].id, invocation.claimed.model.id);
+    let work = crate::store::pinning::management::records::SharedDecodeBudget::default();
+    let tx = store
+        .begin_runtime(crate::store::pinning::management::records::DecodeWork::shared(&work))
+        .await
+        .unwrap();
+    assert!(
+        wake_runtime_parked(
+            &tx,
+            &found[0].id,
+            invocation.now,
+            crate::store::pinning::management::records::DecodeWork::shared(&work)
+        )
+        .await
+        .unwrap()
+    );
+    tx.commit().await.unwrap();
+    let awakened = pin_job::Entity::find_by_id(&found[0].id)
+        .one(store.db())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(awakened.state, "pending");
+    assert_eq!(awakened.submit_phase.as_deref(), Some("recovering"));
+    assert_eq!(
+        latest(store.db(), &awakened.id).await.unwrap().unwrap(),
+        receipt
+    );
+    assert!(
+        parked_receipt_candidates(store.db(), &cursor, 1)
+            .await
+            .unwrap()
+            .0
+            .is_none()
+    );
+}
+
+async fn finish_postgres_invocation(
+    db: &DatabaseConnection,
+    admin: DatabaseConnection,
+    schema: &str,
+    result: Result<(), Box<dyn std::any::Any + Send>>,
+) {
+    db.clone().close().await.unwrap();
+    drop_postgres_invocation_schema(&admin, schema).await;
+    admin.close().await.unwrap();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn drop_postgres_invocation_schema(admin: &DatabaseConnection, schema: &str) {
+    let suffix = schema
+        .strip_prefix("rpc_fact_")
+        .expect("task-owned schema required");
+    assert!(suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    admin
+        .execute_unprepared(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "opt-in: requires a new authorized isolated IPFS_S3_TEST_RPC_RECOVERY_POSTGRES_URL"]
+async fn postgres_fact_capture_and_completion_bind_persistent_custom_schema_not_temp() {
+    use futures_util::FutureExt;
+    let (invocation, admin, schema) = postgres_invocation().await;
+    let result = std::panic::AssertUnwindSafe(async {
+        invocation.db.execute_unprepared(&format!("CREATE TEMP TABLE pin_submit_observations AS SELECT * FROM \"{schema}\".pin_submit_observations")).await.unwrap();
+        invocation.db.execute_unprepared("UPDATE pg_temp.pin_submit_observations SET route='{}'").await.unwrap();
+        let captured = capture_fact(&invocation.db, &invocation.claimed, &invocation.id).await.unwrap();
+        assert_eq!(captured.relation.postgres_identity.as_ref().unwrap().0, schema);
+        invocation.db.execute_unprepared("SET search_path=pg_temp,public").await.unwrap();
+        let receipt = complete_fact(&store::Store::new(invocation.db.clone()), &captured, &observed("kubo", true), invocation.now).await.unwrap();
+        let persistent = invocation.db.query_one(Statement::from_string(sea_orm::DatabaseBackend::Postgres, format!("SELECT * FROM \"{schema}\".pin_submit_observations"))).await.unwrap().unwrap();
+        assert_eq!(evidence::Model::from_query_result(&persistent, "").unwrap(), receipt);
+        let shadow = invocation.db.query_one(Statement::from_string(sea_orm::DatabaseBackend::Postgres, "SELECT observed_at FROM pg_temp.pin_submit_observations")).await.unwrap().unwrap();
+        assert!(shadow.try_get::<Option<DateTime<Utc>>>("", "observed_at").unwrap().is_none());
+
+        // A replacement relation with copied invocation fields is not the
+        // persistent relation captured before dispatch.
+        invocation.db.execute_unprepared(&format!("ALTER TABLE \"{schema}\".pin_submit_observations RENAME TO saved_receipts; CREATE TABLE \"{schema}\".pin_submit_observations AS SELECT * FROM \"{schema}\".saved_receipts; UPDATE \"{schema}\".pin_submit_observations SET observed_at=NULL")).await.unwrap();
+        assert!(complete_fact(&store::Store::new(invocation.db.clone()), &captured, &unknown(), invocation.now).await.is_err());
+        let replacement = invocation.db.query_one(Statement::from_string(sea_orm::DatabaseBackend::Postgres, format!("SELECT observed_at FROM \"{schema}\".pin_submit_observations"))).await.unwrap().unwrap();
+        assert!(replacement.try_get::<Option<DateTime<Utc>>>("", "observed_at").unwrap().is_none());
+    }).catch_unwind().await;
+    finish_postgres_invocation(&invocation.db, admin, &schema, result).await;
+}
+
+#[tokio::test]
+#[ignore = "opt-in: requires a new authorized isolated IPFS_S3_TEST_RPC_RECOVERY_POSTGRES_URL"]
+async fn postgres_generic_record_authority_sql_error_is_error_and_rolls_back_receipt() {
+    use futures_util::FutureExt;
+    let (invocation, admin, schema) = postgres_invocation().await;
+    let result = std::panic::AssertUnwindSafe(async {
+        let direct = RPC_AUTHORITY_SQL_FAILURE
+            .scope(
+                (),
+                record(
+                    &invocation.db,
+                    &invocation.claimed,
+                    &invocation.id,
+                    &unknown(),
+                    invocation.now,
+                ),
+            )
+            .await
+            .expect_err(
+                "top-level record must not accept PostgreSQL COMMIT-as-ROLLBACK as Ok(false)",
+            );
+        assert!(
+            direct
+                .to_string()
+                .contains("rpc_receipt_missing_authority_relation"),
+            "the injected authority relation must cause the error: {direct}"
+        );
+        let receipt = latest(&invocation.db, &invocation.claimed.model.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.outcome, "in_flight");
+        assert!(receipt.observed_at.is_none() && receipt.needs_attention);
+
+        let tx = invocation.db.begin().await.unwrap();
+        let result = RPC_AUTHORITY_SQL_FAILURE
+            .scope(
+                (),
+                record(
+                    &tx,
+                    &invocation.claimed,
+                    &invocation.id,
+                    &unknown(),
+                    invocation.now,
+                ),
+            )
+            .await;
+        let error =
+            result.expect_err("an aborted PostgreSQL transaction is not a projection denial");
+        assert!(
+            error
+                .to_string()
+                .contains("rpc_receipt_missing_authority_relation"),
+            "the injected authority relation must cause the error: {error}"
+        );
+        // The generic call's savepoint rollback keeps its caller usable and
+        // atomic, rather than accepting PostgreSQL's COMMIT-as-ROLLBACK reply.
+        assert!(
+            latest(&tx, &invocation.claimed.model.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .observed_at
+                .is_none()
+        );
+        tx.commit().await.unwrap();
+        let receipt = latest(&invocation.db, &invocation.claimed.model.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.outcome, "in_flight");
+        assert!(receipt.observed_at.is_none() && receipt.needs_attention);
+    })
+    .catch_unwind()
+    .await;
+    finish_postgres_invocation(&invocation.db, admin, &schema, result).await;
 }

@@ -39,13 +39,19 @@ fn drop_target_column() -> TableAlterStatement {
 }
 
 #[async_trait::async_trait]
-impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+impl super::bridge::SharedMigration for Migration {
+    async fn up_body(&self, manager: &super::bridge::Manager<'_>) -> Result<(), DbErr> {
         manager.alter_table(add_target_column()).await?;
         manager.alter_table(add_result_column()).await?;
         Ok(())
     }
-
+}
+#[async_trait::async_trait]
+impl MigrationTrait for Migration {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        super::bridge::SharedMigration::up_body(self, &super::bridge::Manager::native(manager))
+            .await
+    }
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager.alter_table(drop_result_column()).await?;
         manager.alter_table(drop_target_column()).await?;

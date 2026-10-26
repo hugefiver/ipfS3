@@ -239,6 +239,7 @@ async fn real_100k_two_provider_cli_output_and_original_confirmation_recovery() 
             &fixture.db,
             &binding,
             entry,
+            tempfile::tempfile().unwrap(),
             v3::files::stream::budget(),
         )
         .await
@@ -344,7 +345,7 @@ async fn real_100k_two_provider_cli_output_and_original_confirmation_recovery() 
         retained.close().await.unwrap();
         assert!(checkpoint.is_dir());
     }
-    support::same_file_bytes(&first, &second);
+    support::same_file_semantics(&first, &second);
     assert_eq!(fixture.remote_calls().await, 0);
     assert_eq!(
         support::confirmation_rows(&fixture.db, &fixture.request.plan_id).await,

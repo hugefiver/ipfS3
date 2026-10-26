@@ -7,9 +7,12 @@ use std::{collections::BTreeMap, future::Future, panic::AssertUnwindSafe, time::
 use chrono::Utc;
 use futures_util::FutureExt;
 use ipfs_s3_gateway::{
+    config::{DecompressZipConfig, OptionalPinControlMode},
     pinning::{
-        config::ValidatedPinningConfig, policy::PublicationPolicy,
-        zip_policy::ValidatedZipOutputRules,
+        config::ValidatedPinningConfig,
+        decision::DecisionOrigin,
+        policy::PublicationPolicy,
+        zip_policy::{ValidatedZipOutputRules, ZipCaptureContext, capture_zip_intent},
     },
     residency::{KuboTier, VerificationState},
     store::{
@@ -22,7 +25,7 @@ use ipfs_s3_gateway::{
         },
         zip,
     },
-    zip::options::ZipTargets,
+    zip::options::{self, ZipTargets, parse_authenticated_zip_controls},
 };
 use sea_orm::{
     ConnectOptions, ConnectionTrait, Database, DatabaseBackend, DatabaseConnection, EntityTrait,
@@ -171,16 +174,77 @@ async fn prepared(
     bucket: &str,
     source_cid: Option<&str>,
     outputs: &[(&str, &str)],
+    config: &ValidatedPinningConfig,
+    zip_config: &DecompressZipConfig,
 ) -> ZipV2Publication {
     let contract = "{\"contract\":\"v2-residency-lock-order\"}";
+    let mut headers = http::HeaderMap::new();
+    headers.insert(options::ZIP_CONTRACT, "v2".parse().unwrap());
+    headers.insert(options::ZIP_TOKEN, id.parse().unwrap());
+    headers.insert(
+        options::PUBLISH_SOURCE,
+        if source_cid.is_some() {
+            "true"
+        } else {
+            "false"
+        }
+        .parse()
+        .unwrap(),
+    );
+    headers.insert(options::PUBLISH_EXTRACTED, "true".parse().unwrap());
+    headers.insert(options::ZIP_TARGETS, "none".parse().unwrap());
+    let controls = parse_authenticated_zip_controls(
+        &headers,
+        &[("decompress-zip".into(), String::new())],
+        &[],
+        true,
+        zip_config.unixfs_directory_root,
+    )
+    .unwrap()
+    .unwrap();
+    let capture = capture_zip_intent(
+        config,
+        zip_config,
+        OptionalPinControlMode::Warn,
+        ZipCaptureContext {
+            bucket,
+            source_key: "source.zip",
+            target_prefix: "",
+            tags: &[],
+        },
+        &controls,
+        DecisionOrigin::new("principal", id),
+    )
+    .unwrap();
+    let options = capture.v2_options().unwrap();
+    assert_eq!(
+        options,
+        options::ZipV2Options {
+            publish_source: source_cid.is_some(),
+            publish_extracted: true,
+            targets: ZipTargets::None,
+            token: id.into(),
+            root_override: None,
+            root_enabled: false,
+            result_version: 2,
+        }
+    );
     let admission = execution::Admission {
-        id: id.into(), owner: "principal".into(), source: "direct".into(), token: id.into(),
+        id: id.into(),
+        owner: "principal".into(),
+        source: "direct".into(),
+        token: id.into(),
         request_fingerprint: hex::encode(Sha256::digest(contract.as_bytes())),
-        request_contract: contract.into(), bucket: bucket.into(), source_key: "source.zip".into(),
-        captured_options: serde_json::json!({"options":{
-            "publish_source":source_cid.is_some(),"publish_extracted":true,"targets":ZipTargets::None,
-            "token":id,"root_override":null,"root_enabled":false,"result_version":2},
-            "rule_revision":null}).to_string(),
+        request_contract: contract.into(),
+        bucket: bucket.into(),
+        source_key: "source.zip".into(),
+        captured_options: serde_json::json!({
+            "options": options,
+            "target_prefix": capture.target_prefix(),
+            "rule_revision": capture.policy_revision(),
+            "zip_intent": capture,
+        })
+        .to_string(),
     };
     execution::admit(db, &admission).await.unwrap();
     let claim = execution::claim(db, id, "worker", 60)
@@ -281,7 +345,7 @@ async fn prepared(
             })
             .collect(),
         targets: ZipTargets::None,
-        captured_rule_revision: None,
+        captured_rule_revision: Some(capture.policy_revision().into()),
         root_outcome: zip::RootOutcome::Disabled,
         terminal_result: "{\"result_version\":2}".into(),
     }
@@ -517,14 +581,21 @@ async fn source_and_outputs_prelock_new_residencies_in_one_order_without_retry()
         cids.sort();
         let [x, y] = cids;
         assert!(x < y);
-        let a = prepared(&pg.a, "execution-a", "bucket-a", Some(&x), &[("output-y", &y)]).await;
+        let config = ValidatedPinningConfig::from_raw(&Default::default(), |_| None).unwrap();
+        let zip_config = DecompressZipConfig {
+            unixfs_directory_root: false,
+            auto_pin_outputs: Some(false),
+            ..Default::default()
+        };
+        let rules = ValidatedZipOutputRules::from_config(&zip_config, &config).unwrap();
+        let a = prepared(&pg.a, "execution-a", "bucket-a", Some(&x), &[("output-y", &y)], &config, &zip_config).await;
         // Reverse the output input order as well: the frontier must sort it.
-        let b = prepared(&pg.b, "execution-b", "bucket-b", None, &[("output-y", &y), ("output-x", &x)]).await;
+        let b = prepared(&pg.b, "execution-b", "bucket-b", None, &[("output-y", &y), ("output-x", &x)], &config, &zip_config).await;
+        assert_eq!(a.captured_rule_revision.as_deref(), Some(rules.revision()));
+        assert_eq!(b.captured_rule_revision.as_deref(), Some(rules.revision()));
         let count: i64 = pg.gate.query_one(sql("SELECT count(*) AS n FROM physical_residencies"))
             .await.unwrap().unwrap().try_get("", "n").unwrap();
         assert_eq!(count, 0, "X and Y must both be previously unseen CIDs");
-        let config = ValidatedPinningConfig::from_raw(&Default::default(), |_| None).unwrap();
-        let rules = ValidatedZipOutputRules::compile(&[], &config).unwrap();
         pg.a.execute_unprepared("SET application_name TO 'zip-lock-a'").await.unwrap();
         pg.b.execute_unprepared("SET application_name TO 'zip-lock-b'").await.unwrap();
         let (a_pid, b_pid, gate_pid) = (pid(&pg.a).await, pid(&pg.b).await, pid(&pg.gate).await);

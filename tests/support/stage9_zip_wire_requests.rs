@@ -3,7 +3,6 @@ use std::time::Duration;
 
 use http::{HeaderMap, HeaderValue, StatusCode};
 use ipfs_s3_gateway::store::entities::import_job;
-use sea_orm::EntityTrait;
 
 use crate::support::{
     decompress::S3TestEndpoint,

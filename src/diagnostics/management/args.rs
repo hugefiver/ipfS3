@@ -34,14 +34,14 @@ Legacy JSON is limited to 16 MiB, 131072 nodes, depth 64 and the bounded typed d
 Converted files preserve the complete original review and claims, never a local receipt or write permission.
 Old unexecuted plans require a new plan ID and fresh planning/confirmation; cross-DB files are review-only.
 Missing v2 identity/time metadata is marked not-recorded-in-wire-v2, never inferred or renewed.
-Streaming file work is bounded by 4 GiB, 10 million rows, 32 MiB accounted resident memory and 30 seconds per operation.
+Streaming file work is bounded by 8 GiB, 10 million rows, 32 MiB accounted resident memory and 120 seconds per operation.
 Checkpoint/resume require Provider planning and an explicitly selected owner-private local workspace, never an imported artifact path.
 --scan-pages limits pages per invocation (default 64 with checkpoint/resume), not cumulative task budgets.
 Incomplete exits normally, retains the workspace and exports no plan or confirmation; resume requires the same request and current local authorization/configuration.
 Resume revalidates the source DB identity/vector and retains original clocks and cumulative work; source changes require a fresh scan.
 Complete uses the original export/confirmation rules and cleans up only its owned workspace files.
 --run is opt-in: one receipt-scoped due-job pass, never a background/global worker or queue drain.
-Work budget: 30 seconds, then cancellation and at most 5 seconds of owned-work drain.
+Planning/archive work budget: 120 seconds; other commands: 30 seconds, then cancellation and at most 5 seconds of owned-work drain.
 Not-yet-due, claim-cap or interrupted work remains queued/waiting/needs_attention as reported by the action layer;
 job counts and directory residency never imply remote completion or physical space release.
 PREPARE.json: record_id, identity (ExactObject), expected_node, max_stored_bytes,

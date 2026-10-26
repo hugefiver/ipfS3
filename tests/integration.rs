@@ -4616,7 +4616,16 @@ async fn assert_unknown_psa_resource(
         ledger.ownership, "unknown",
         "PSA response is not creation proof"
     );
-    assert_eq!(ledger.effect, effect);
+    assert_eq!(
+        ledger.effect,
+        effect,
+        "pinning jobs: {:?}; targets: {:?}",
+        harness.pin_jobs().await,
+        store::entities::pin_lease_target::Entity::find()
+            .all(harness.state.store.db())
+            .await
+            .expect("load targets after effect mismatch"),
+    );
     assert_eq!(
         store::pinning::ledger::decode_route(&ledger)
             .expect("registered PSA route")
@@ -7911,7 +7920,9 @@ async fn test_pinning_quota_keeps_oldest_unknown_cid_reserved_after_eviction() {
         "the incoming CID cannot reserve until a remote DELETE is confirmed"
     );
 
-    harness.run_worker_until_idle().await;
+    harness
+        .run_worker_until_remote_effect("pinata-primary", PIN_CID_OLD, "retained")
+        .await;
     assert_eq!(
         (
             harness

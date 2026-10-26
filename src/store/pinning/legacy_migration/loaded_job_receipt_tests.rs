@@ -410,6 +410,7 @@ async fn cleanup_compound_keeps_fresh_alias_identity_and_ordinary_ownership_rule
     use crate::pinning::identity::{CleanupMode, ProviderIdentity};
     let (_directory, db) = file_database().await;
     store::run_migrations(&db).await.unwrap();
+    let runtime = crate::store::Store::new(db.clone());
     let mut declaration = management_catalog_tests::declaration(&db).await;
     let mut route = declaration.namespaces[0].target_route.clone();
     route.cleanup = CleanupMode::Managed;
@@ -442,6 +443,21 @@ async fn cleanup_compound_keeps_fresh_alias_identity_and_ordinary_ownership_rule
             .await
             .unwrap()
     );
+    let work = records::SharedDecodeBudget::default();
+    let tx = runtime
+        .begin_runtime(records::DecodeWork::shared(&work))
+        .await
+        .unwrap();
+    let (tx, cleanup) = ledger::prepare_runtime_unpin_effect(
+        tx,
+        "old",
+        "cleanup-alias",
+        records::DecodeWork::shared(&work),
+    )
+    .await
+    .unwrap();
+    assert!(!cleanup);
+    tx.rollback().await.unwrap();
 
     let snapshot = serde_json::to_string(&route).unwrap();
     db.execute(Statement::from_sql_and_values(db.get_database_backend(),
@@ -474,6 +490,31 @@ async fn cleanup_compound_keeps_fresh_alias_identity_and_ordinary_ownership_rule
             .await
             .unwrap()
     );
+    for provider in ["old", target.as_str()] {
+        let work = records::SharedDecodeBudget::default();
+        let tx = runtime
+            .begin_runtime(records::DecodeWork::shared(&work))
+            .await
+            .unwrap();
+        let (tx, cleanup) = ledger::prepare_runtime_unpin_effect(
+            tx,
+            provider,
+            "cleanup-alias",
+            records::DecodeWork::shared(&work),
+        )
+        .await
+        .unwrap();
+        assert!(cleanup);
+        assert_eq!(
+            ledger::get(&tx, provider, "cleanup-alias")
+                .await
+                .unwrap()
+                .unwrap()
+                .effect,
+            "cleanup_pending"
+        );
+        tx.rollback().await.unwrap();
+    }
 
     let tx = db.begin().await.unwrap();
     tx.execute(Statement::from_sql_and_values(tx.get_database_backend(),
@@ -506,7 +547,11 @@ async fn cleanup_compound_keeps_fresh_alias_identity_and_ordinary_ownership_rule
     ] {
         route.api_profile = profile.into();
         route.cleanup = cleanup;
-        let tx = db.begin().await.unwrap();
+        let work = records::SharedDecodeBudget::default();
+        let tx = runtime
+            .begin_runtime(records::DecodeWork::shared(&work))
+            .await
+            .unwrap();
         tx.execute(Statement::from_sql_and_values(
             tx.get_database_backend(),
             "UPDATE remote_pin_ledger SET route=$1,ownership=$2 WHERE provider=$3",
@@ -528,6 +573,15 @@ async fn cleanup_compound_keeps_fresh_alias_identity_and_ordinary_ownership_rule
                 .await
                 .unwrap()
         );
+        let (tx, cleanup) = ledger::prepare_runtime_unpin_effect(
+            tx,
+            "old",
+            "cleanup-alias",
+            records::DecodeWork::shared(&work),
+        )
+        .await
+        .unwrap();
+        assert!(!cleanup);
         tx.rollback().await.unwrap();
     }
     let tx = db.begin().await.unwrap();

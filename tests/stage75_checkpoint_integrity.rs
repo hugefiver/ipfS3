@@ -200,6 +200,7 @@ async fn confirmed_provider_items_share_one_complete_original_document() {
             &fixture.db,
             &binding,
             entry,
+            tempfile::tempfile().unwrap(),
             v3::files::stream::budget(),
         )
         .await

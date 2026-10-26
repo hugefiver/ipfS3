@@ -19,7 +19,7 @@ use crate::{
     zip::batch::FinalZipManifest,
 };
 
-mod allocation;
+pub(super) mod allocation;
 mod capture;
 mod execution;
 mod input;
@@ -85,6 +85,46 @@ pub async fn publish_captured_zip(
             }
             // Connection/commit errors never qualify as known rollback retries.
             Err(error) => return Err(super::transaction_error_into_app(error)),
+        }
+    }
+    unreachable!("ZIP retry loop always returns")
+}
+
+pub(crate) async fn publish_captured_zip_store(
+    store: &crate::store::Store,
+    request: CapturedZipPublication,
+) -> AppResult<Vec<(String, PublicationResult)>> {
+    if store.db().get_database_backend() != sea_orm::DatabaseBackend::Sqlite {
+        return publish_captured_zip(store.db(), request).await;
+    }
+    let session = super::super::management::records::SharedDecodeBudget::default();
+    for retry in 0..=super::MAX_TRANSACTION_RETRIES {
+        let tx = store
+            .begin_publication_runtime(super::super::management::records::DecodeWork::shared(
+                &session,
+            ))
+            .await
+            .map_err(super::transaction_error_into_app)?;
+        let mut owner = super::PublicationTransaction::Runtime(tx, session.clone());
+        let result = Box::pin(publish_with_reservations(&mut owner, &request)).await;
+        let result = match result {
+            Ok(result) => {
+                owner.into_db().commit().await.map_err(|error| {
+                    super::transaction_error_into_app(TransactionError::Connection(error))
+                })?;
+                return Ok(result);
+            }
+            Err(error) => {
+                owner.into_db().rollback().await?;
+                error
+            }
+        };
+        if super::is_retryable_transaction_conflict(&result)
+            && retry < super::MAX_TRANSACTION_RETRIES
+        {
+            super::publication_retry_delay(retry).await;
+        } else {
+            return Err(result);
         }
     }
     unreachable!("ZIP retry loop always returns")
@@ -241,9 +281,24 @@ pub(super) async fn publish_in_transaction(
     tx: &DatabaseTransaction,
     request: &CapturedZipPublication,
 ) -> AppResult<Vec<(String, PublicationResult)>> {
+    publish_with_reservations(&mut super::reservations::Borrowed(tx), request).await
+}
+
+async fn publish_with_reservations<
+    R: super::reservations::Reservations<Connection = DatabaseTransaction>,
+>(
+    reservations: &mut R,
+    request: &CapturedZipPublication,
+) -> AppResult<Vec<(String, PublicationResult)>> {
+    let tx = reservations.db();
     validate(request)?;
     crate::store::import::ownership::lock_bucket_for_ownership(tx, request.capture.bucket())
         .await?;
+    let session = reservations.runtime_work().cloned().unwrap_or_default();
+    let work = super::super::management::records::DecodeWork::shared(&session);
+    if let Some(owner) = reservations.runtime() {
+        owner.check_schema(work).await?;
+    }
     // Admission readers below run only after the bucket write/fence, before any frontier locks.
     let admission = match &request.authority {
         ZipPublicationAuthority::Legacy(authority) => {
@@ -300,7 +355,9 @@ pub(super) async fn publish_in_transaction(
     .map_err(|_| invalid())?;
     let (limits, routes, allocatable) =
         allocation::frozen_allocation(&request.capture, &candidate)?;
-    let pairs = allocation::attachment_pairs(tx, &candidate, &limits, &mut maintenance).await?;
+    let pairs =
+        allocation::attachment_pairs(reservations, &candidate, &limits, &mut maintenance, work)
+            .await?;
     maintenance.checkpoint(tx).await?;
     leases::lock_publication_lifecycle_frontier_with_maintenance(
         tx,
@@ -316,7 +373,9 @@ pub(super) async fn publish_in_transaction(
     )
     .await?;
     maintenance.checkpoint(tx).await?;
-    if allocatable.len() == routes.len() {
+    if let Some(owner) = reservations.runtime() {
+        ledger::verify_runtime_birth_routes(owner, &routes, &allocatable, work).await?;
+    } else if allocatable.len() == routes.len() {
         ledger::verify_selected_routes(tx, &routes, true).await?;
     } else {
         ledger::verify_birth_candidate_routes(tx, &routes, &allocatable, true).await?;
@@ -339,9 +398,8 @@ pub(super) async fn publish_in_transaction(
         ));
     }
     maintenance.checkpoint(tx).await?;
-    let source_bound = request.source.as_ref().map(|o| bound(tx, o, "source"));
-    let source_bound = match source_bound {
-        Some(future) => Some(future.await?.0),
+    let source_bound = match request.source.as_ref() {
+        Some(object) => Some(bound(tx, object, "source").await?.0),
         None => None,
     };
     let by_key = request
@@ -384,7 +442,8 @@ pub(super) async fn publish_in_transaction(
         .await?;
     }
     maintenance.checkpoint(tx).await?;
-    allocation::create_leases(tx, &selected, &limits, now, &mut maintenance).await?;
+    allocation::create_leases(reservations, &selected, &limits, now, &mut maintenance).await?;
+    let tx = reservations.db();
     maintenance.checkpoint(tx).await?;
     let terminal = execution::terminal_result(tx, request, &results).await?;
     match &request.root_outcome {
@@ -438,6 +497,9 @@ pub(super) async fn publish_in_transaction(
             )
             .await?
         }
+    }
+    if let Some(owner) = reservations.runtime() {
+        owner.check_schema(work).await?;
     }
     Ok(results)
 }

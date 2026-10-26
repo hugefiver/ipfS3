@@ -37,7 +37,15 @@ pub(super) async fn closed_in_schema<C: ConnectionTrait>(
     registration: bool,
     context: super::DecodeWork<'_>,
 ) -> AppResult<bool> {
-    closed_with_role(db, routes, schema, registration, None, context).await
+    closed_with_role(
+        routes,
+        schema,
+        registration,
+        None,
+        context,
+        crate::store::pinning::legacy_migration::ReceiptCatalog::full(db),
+    )
+    .await
 }
 
 pub(super) async fn closed_r26<C: ConnectionTrait>(
@@ -47,25 +55,42 @@ pub(super) async fn closed_r26<C: ConnectionTrait>(
 ) -> AppResult<bool> {
     let schema = super::locks::AdmissionSchema::read(db).await?;
     let closed = closed_with_role(
-        db,
         admission.routes(),
         &schema,
         false,
         Some(admission),
         context,
+        crate::store::pinning::legacy_migration::ReceiptCatalog::full(db),
     )
     .await?;
     schema.revalidate(db).await?;
     Ok(closed)
 }
 
-async fn closed_with_role<C: ConnectionTrait>(
-    db: &C,
+pub(super) async fn closed_quota(
+    window: &crate::store::pinning::quota::production::QuotaReadWindow<'_>,
+    routes: &[ProviderRouteSnapshot],
+    schema: &super::locks::AdmissionSchema,
+    context: super::DecodeWork<'_>,
+) -> AppResult<bool> {
+    closed_with_role(
+        routes,
+        schema,
+        false,
+        None,
+        context,
+        crate::store::pinning::legacy_migration::ReceiptCatalog::Quota(window),
+    )
+    .await
+}
+
+pub(super) async fn closed_with_role(
     routes: &[ProviderRouteSnapshot],
     schema: &super::locks::AdmissionSchema,
     registration: bool,
     preservation: Option<&crate::store::pinning::legacy_migration::R26Admission<'_>>,
     context: super::DecodeWork<'_>,
+    catalog: crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
 ) -> AppResult<bool> {
     context
         .with(|work| work.nodes(2 + routes.len()))
@@ -109,7 +134,8 @@ async fn closed_with_role<C: ConnectionTrait>(
             selectors.insert(AuthoritySelector::RetirementDomain(alias.into()));
         }
     }
-    let selected = super::authority::load(db, &selectors.into_iter().collect::<Vec<_>>(), context)
+    let selected = catalog
+        .load(&selectors.into_iter().collect::<Vec<_>>(), context)
         .await
         .map_err(super::work_error)?;
     let registered = candidates::routes(&selected, context).map_err(super::work_error)?;
@@ -133,7 +159,7 @@ async fn closed_with_role<C: ConnectionTrait>(
         }
         parsed.push(original);
     }
-    let retirements = candidates::rows(db, &selected, context)
+    let retirements = candidates::rows(&catalog, &selected, context)
         .await
         .map_err(super::work_error)?;
     if retirements.is_empty() {
@@ -152,10 +178,10 @@ async fn closed_with_role<C: ConnectionTrait>(
         return Ok(closed);
     }
     context.index_cells(1, 64).map_err(super::work_error)?;
-    let identity = super::super::native::database_identity(db)
+    let identity = super::super::native::database_identity(&catalog)
         .await
         .map_err(super::work_error)?;
-    let (scopes,bytes)=super::super::records::bounded_projection(db,"FROM pin_management_records WHERE kind='database_scope' AND state='identity' AND plan_id='schema' AND item_id='identity'",&[("database_scope","database_scope")],"database_scope",vec![],(1,native::MAX_BYTES),context).await.map_err(super::work_error)?;
+    let (scopes,bytes)=super::super::records::bounded_projection(&catalog,"FROM pin_management_records WHERE kind='database_scope' AND state='identity' AND plan_id='schema' AND item_id='identity'",&[("database_scope","database_scope")],"database_scope",vec![],(1,native::MAX_BYTES),context).await.map_err(super::work_error)?;
     context
         .index_cells(scopes.len(), bytes)
         .map_err(super::work_error)?;
@@ -176,7 +202,7 @@ async fn closed_with_role<C: ConnectionTrait>(
         })
         .collect::<AppResult<Vec<_>>>()?;
     let mut source = super::super::records::evidence::Evidence::load_roots_with_work(
-        db,
+        &catalog,
         &scope,
         &identity,
         &plans,
@@ -236,7 +262,7 @@ async fn closed_with_role<C: ConnectionTrait>(
         // domain; mutation_scope is not the complete responsibility set.
         context.copy(text("plan_id")?).map_err(super::work_error)?;
         source
-            .load_dependencies(db, &[text("plan_id")?.to_owned()])
+            .load_dependencies(&catalog, &[text("plan_id")?.to_owned()])
             .await
             .map_err(super::work_error)?;
         validate_original_point(&source, key, original, row, action, context)?;

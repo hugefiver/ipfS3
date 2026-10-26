@@ -1,6 +1,35 @@
 //! Read-only PostgreSQL constraints and defaults for `storage::tables`.
 use super::*;
-use std::collections::BTreeSet;
+use batch::SQL_BYTES;
+use sea_orm::QueryResult;
+use std::collections::{BTreeMap, BTreeSet};
+
+const TABLES: &str = "(VALUES ('pin_management_archive_identity'),('pin_management_readiness'),('pin_management_source_control'),('pin_management_locator'),('pin_management_pending_scope'),('pin_management_revision'),('pin_management_archive'),('pin_management_archive_chunks'),('pin_management_inline_archive')) AS wanted(table_name)";
+
+fn grouped(
+    rows: Vec<QueryResult>,
+    names: &[&str],
+    per_table_cap: usize,
+) -> Result<BTreeMap<String, Vec<QueryResult>>> {
+    if rows.len() > names.len() * per_table_cap {
+        return Err(ManagementError::Schema);
+    }
+    let mut groups: BTreeMap<String, Vec<QueryResult>> = names
+        .iter()
+        .map(|name| ((*name).to_owned(), Vec::new()))
+        .collect();
+    for row in rows {
+        let name: String = row
+            .try_get("", "table_name")
+            .map_err(|_| ManagementError::Schema)?;
+        let group = groups.get_mut(&name).ok_or(ManagementError::Schema)?;
+        group.push(row);
+        if group.len() > per_table_cap {
+            return Err(ManagementError::Schema);
+        }
+    }
+    Ok(groups)
+}
 
 fn definitions(table: &str, source_control: &str, archive: &str) -> BTreeSet<String> {
     let definitions = match table {
@@ -62,14 +91,22 @@ pub(super) async fn validate<C: ConnectionTrait>(db: &C) -> Result<()> {
     let archive: String = targets
         .try_get("", "archive")
         .map_err(|_| ManagementError::Schema)?;
-    for (table, _) in tables(DatabaseBackend::Postgres) {
+    let tables = tables(DatabaseBackend::Postgres);
+    let names = tables.iter().map(|(name, _)| *name).collect::<Vec<_>>();
+    let rows = db.query_all(Statement::from_string(DatabaseBackend::Postgres, format!(
+        "SELECT wanted.table_name, checks.* FROM {TABLES} CROSS JOIN LATERAL (\
+         SELECT CASE WHEN octet_length(pg_get_constraintdef(k.oid,false))<={SQL_BYTES} THEN pg_get_constraintdef(k.oid,false) ELSE NULL END AS definition, \
+         k.convalidated AND NOT k.condeferrable AND NOT k.condeferred AND k.conislocal AND k.coninhcount=0 AND k.conparentid=0 AND k.contypid=0 AND k.connamespace=n.oid AND k.connoinherit=(k.contype<>'c') AS ordinary \
+         FROM pg_constraint k JOIN pg_class c ON c.oid=k.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace \
+         WHERE n.nspname=current_schema() AND c.relname=wanted.table_name LIMIT 32) checks")))
+        .await.map_err(|_| ManagementError::Schema)?;
+    let groups = grouped(rows, &names, 32)?;
+    for table in names.iter().copied() {
         let expected = definitions(table, &source_control, &archive);
         if expected.is_empty() {
             return Err(ManagementError::Schema);
         }
-        let rows = db.query_all(Statement::from_sql_and_values(DatabaseBackend::Postgres,
-            "SELECT pg_get_constraintdef(k.oid,false) AS definition, k.convalidated AND NOT k.condeferrable AND NOT k.condeferred AND k.conislocal AND k.coninhcount=0 AND k.conparentid=0 AND k.contypid=0 AND k.connamespace=n.oid AND k.connoinherit=(k.contype<>'c') AS ordinary FROM pg_constraint k JOIN pg_class c ON c.oid=k.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=current_schema() AND c.relname=$1 LIMIT 32",
-            [table.into()])).await.map_err(|_| ManagementError::Schema)?;
+        let rows = groups.get(table).ok_or(ManagementError::Schema)?;
         if rows.len() != expected.len() {
             return Err(ManagementError::Schema);
         }
@@ -82,30 +119,29 @@ pub(super) async fn validate<C: ConnectionTrait>(db: &C) -> Result<()> {
                 return Err(ManagementError::Schema);
             }
             // Compare the complete deparsed SQL, preserving quoted literals.
-            actual.insert(
+            if !actual.insert(
                 row.try_get::<String>("", "definition")
                     .map_err(|_| ManagementError::Schema)?,
-            );
+            ) {
+                return Err(ManagementError::Schema);
+            }
         }
         if actual != expected {
             return Err(ManagementError::Schema);
         }
-        if matches!(
-            table,
-            "pin_management_locator" | "pin_management_archive_chunks"
-        ) {
-            foreign_key_triggers(db, table).await?;
-        }
-        defaults(db, table).await?;
     }
+    foreign_key_triggers(db).await?;
+    defaults(db, &names).await?;
     Ok(())
 }
 
-async fn foreign_key_triggers<C: ConnectionTrait>(db: &C, table: &str) -> Result<()> {
+async fn foreign_key_triggers<C: ConnectionTrait>(db: &C) -> Result<()> {
     let rows = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all(Statement::from_string(
             DatabaseBackend::Postgres,
-            r#"SELECT
+            r#"SELECT wanted.table_name, checks.* FROM
+            (VALUES ('pin_management_locator'),('pin_management_archive_chunks')) AS wanted(table_name)
+            CROSS JOIN LATERAL (SELECT
                 CASE
                     WHEN t.tgrelid=k.conrelid AND t.tgconstrrelid=k.confrelid
                         AND t.tgtype=5 AND t.tgfoid='pg_catalog."RI_FKey_check_ins"()'::regprocedure THEN 1
@@ -126,58 +162,78 @@ async fn foreign_key_triggers<C: ConnectionTrait>(db: &C, table: &str) -> Result
             JOIN pg_class c ON c.oid=k.conrelid
             JOIN pg_namespace n ON n.oid=c.relnamespace
             JOIN pg_trigger t ON t.tgconstraint=k.oid
-            WHERE n.nspname=current_schema() AND c.relname=$1 AND k.contype='f'
-            LIMIT 8"#,
-            [table.into()],
+            WHERE n.nspname=current_schema() AND c.relname=wanted.table_name AND k.contype='f'
+            LIMIT 8) checks"#,
         ))
         .await
         .map_err(|_| ManagementError::Schema)?;
-    if rows.len() != 4 {
-        return Err(ManagementError::Schema);
-    }
-    let mut roles = BTreeSet::new();
-    for row in rows {
-        let role: i32 = row
-            .try_get("", "enforcement")
-            .map_err(|_| ManagementError::Schema)?;
-        if !row
-            .try_get::<bool>("", "ordinary")
-            .map_err(|_| ManagementError::Schema)?
-            || !(1..=4).contains(&role)
-            || !roles.insert(role)
-        {
+    let groups = grouped(
+        rows,
+        &["pin_management_locator", "pin_management_archive_chunks"],
+        8,
+    )?;
+    for rows in groups.values() {
+        if rows.len() != 4 {
             return Err(ManagementError::Schema);
+        }
+        let mut roles = BTreeSet::new();
+        for row in rows {
+            let role: i32 = row
+                .try_get("", "enforcement")
+                .map_err(|_| ManagementError::Schema)?;
+            if !row
+                .try_get::<bool>("", "ordinary")
+                .map_err(|_| ManagementError::Schema)?
+                || !(1..=4).contains(&role)
+                || !roles.insert(role)
+            {
+                return Err(ManagementError::Schema);
+            }
         }
     }
     Ok(())
 }
 
-async fn defaults<C: ConnectionTrait>(db: &C, table: &str) -> Result<()> {
-    let expected: &[&str] = match table {
-        "pin_management_source_control" => &["locator_generation", "source_generation"],
-        "pin_management_archive" => &["bytes", "chunks"],
-        _ => &[],
-    };
-    let rows = db.query_all(Statement::from_sql_and_values(DatabaseBackend::Postgres,
-        "SELECT a.attname::text AS name, pg_get_expr(d.adbin,d.adrelid,false) AS definition, a.attidentity='' AND a.attgenerated='' AS ordinary FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid JOIN pg_namespace n ON n.oid=c.relnamespace LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE n.nspname=current_schema() AND c.relname=$1 AND a.attnum>0 AND NOT a.attisdropped AND (a.atthasdef OR a.attidentity<>'') ORDER BY a.attname LIMIT 32",
-        [table.into()])).await.map_err(|_| ManagementError::Schema)?;
-    if rows.len() != expected.len() {
-        return Err(ManagementError::Schema);
-    }
-    for (row, name) in rows.into_iter().zip(expected) {
-        if row
-            .try_get::<String>("", "name")
-            .map_err(|_| ManagementError::Schema)?
-            != *name
-            || row
-                .try_get::<String>("", "definition")
-                .map_err(|_| ManagementError::Schema)?
-                != "0"
-            || !row
-                .try_get::<bool>("", "ordinary")
-                .map_err(|_| ManagementError::Schema)?
-        {
+async fn defaults<C: ConnectionTrait>(db: &C, names: &[&str]) -> Result<()> {
+    let rows = db.query_all(Statement::from_string(DatabaseBackend::Postgres, format!(
+        "SELECT wanted.table_name, defaults.* FROM {TABLES} CROSS JOIN LATERAL (\
+         SELECT a.attname::text AS name, CASE WHEN octet_length(pg_get_expr(d.adbin,d.adrelid,false))<={SQL_BYTES} THEN pg_get_expr(d.adbin,d.adrelid,false) ELSE NULL END AS definition, a.attidentity='' AND a.attgenerated='' AS ordinary \
+         FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid JOIN pg_namespace n ON n.oid=c.relnamespace LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum \
+         WHERE n.nspname=current_schema() AND c.relname=wanted.table_name AND a.attnum>0 AND NOT a.attisdropped AND (a.atthasdef OR a.attidentity<>'') ORDER BY a.attname LIMIT 32) defaults ORDER BY wanted.table_name,defaults.name")))
+        .await.map_err(|_| ManagementError::Schema)?;
+    let groups = grouped(rows, names, 32)?;
+    for table in names.iter().copied() {
+        let expected: &[&str] = match table {
+            "pin_management_source_control" => &["locator_generation", "source_generation"],
+            "pin_management_archive" => &["bytes", "chunks"],
+            _ => &[],
+        };
+        let rows = groups.get(table).ok_or(ManagementError::Schema)?;
+        if rows.len() != expected.len() {
             return Err(ManagementError::Schema);
+        }
+        let mut seen = BTreeSet::new();
+        for (row, name) in rows.iter().zip(expected) {
+            if !seen.insert(
+                row.try_get::<String>("", "name")
+                    .map_err(|_| ManagementError::Schema)?,
+            ) {
+                return Err(ManagementError::Schema);
+            }
+            if row
+                .try_get::<String>("", "name")
+                .map_err(|_| ManagementError::Schema)?
+                != *name
+                || row
+                    .try_get::<String>("", "definition")
+                    .map_err(|_| ManagementError::Schema)?
+                    != "0"
+                || !row
+                    .try_get::<bool>("", "ordinary")
+                    .map_err(|_| ManagementError::Schema)?
+            {
+                return Err(ManagementError::Schema);
+            }
         }
     }
     Ok(())

@@ -1,6 +1,9 @@
 //! Upgrade actual Stage 2 data: reserved raw tags are not decision evidence.
+#[path = "../../../tests/support/postgres_pinning_stage3.rs"]
+mod postgres;
+
 use crate::store::{self, migrations as m};
-use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
+use sea_orm::{ConnectionTrait, Database, DatabaseBackend, DatabaseConnection, Statement};
 use sea_orm_migration::{MigrationTrait, MigratorTrait};
 
 pub(crate) struct Stage2;
@@ -124,4 +127,17 @@ async fn sqlite_stage2_upgrade_does_not_promote_historical_control_tags() {
         .await
         .unwrap();
     upgrade_with_historical_raw_tags(&db).await;
+}
+
+#[tokio::test]
+#[ignore = "requires IPFS_S3_TEST_POSTGRES_URL to an isolated PostgreSQL 17 test container"]
+async fn pg17_stage2_upgrade_retains_raw_tags_without_backfilling_decisions() {
+    postgres::isolated(false, |db| async move {
+        upgrade_with_historical_raw_tags(&db).await;
+        let columns = db.query_all(Statement::from_string(DatabaseBackend::Postgres,
+            "SELECT table_name, data_type FROM information_schema.columns WHERE table_schema=current_schema() AND column_name='pin_decision_json' ORDER BY table_name"
+        )).await.unwrap();
+        let shape: Vec<(String, String)> = columns.iter().map(|r| (r.try_get("", "table_name").unwrap(), r.try_get("", "data_type").unwrap())).collect();
+        assert_eq!(shape, [("import_job_requests".into(), "text".into()), ("multipart_uploads".into(), "jsonb".into())]);
+    }).await;
 }

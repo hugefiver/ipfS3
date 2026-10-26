@@ -101,6 +101,14 @@ async fn postgres_storage_constraints_are_required_and_exact() {
         "ALTER TABLE pin_management_pending_scope ADD CHECK(source_generation>=0) NOT VALID".into(),
         "ALTER TABLE pin_management_archive ALTER COLUMN chunks SET DEFAULT 1".into(),
         "ALTER TABLE pin_management_readiness ALTER COLUMN format SET DEFAULT 'S75A1'".into(),
+        // Equal totals must not hide a missing constraint or default in one group.
+        "ALTER TABLE pin_management_readiness DROP CONSTRAINT pin_management_readiness_format_check; ALTER TABLE pin_management_pending_scope ADD CHECK(source_generation>=0)".into(),
+        "ALTER TABLE pin_management_archive ALTER COLUMN bytes DROP DEFAULT; ALTER TABLE pin_management_pending_scope ALTER COLUMN source_generation SET DEFAULT 0".into(),
+        "ALTER TABLE pin_management_archive ADD CONSTRAINT duplicate_format CHECK(format='S75A1')".into(),
+        // Replacing a different definition with a duplicate preserves the count.
+        "ALTER TABLE pin_management_readiness DROP CONSTRAINT pin_management_readiness_format_check; ALTER TABLE pin_management_readiness ADD CONSTRAINT duplicate_state CHECK(state IN ('backfill','ready'))".into(),
+        format!("{drop_payload} {chunks} ADD CHECK(length(payload)<length('{}'))", "x".repeat(65537)),
+        format!("ALTER TABLE pin_management_archive ALTER COLUMN bytes SET DEFAULT length('{}')", "x".repeat(65537)),
     ]);
     for (table, column) in [
         ("pin_management_source_control", "source_generation"),
@@ -120,7 +128,7 @@ async fn postgres_storage_constraints_are_required_and_exact() {
         tx.execute_unprepared(&sql).await.unwrap();
         let rejected = schema::validate(&tx).await.is_err();
         tx.rollback().await.unwrap();
-        assert!(rejected, "damaged storage contract must be rejected: {sql}");
+        assert!(rejected, "damaged storage contract must be rejected");
         schema::validate(&db).await.unwrap();
     }
     db.close().await.unwrap();

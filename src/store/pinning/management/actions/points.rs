@@ -181,18 +181,37 @@ pub(crate) async fn candidates_for_cid_with_work<C: ConnectionTrait>(
     birth: &pin_lease_requirement::contract::BirthContract,
     work: records::SharedDecodeBudget,
 ) -> Result<Vec<(String, String, Option<records::MigrationPoint>)>> {
+    candidates_for_cid_catalog(
+        crate::store::pinning::legacy_migration::ReceiptCatalog::full(db),
+        lease_id,
+        cid,
+        birth,
+        work,
+    )
+    .await
+}
+
+pub(in crate::store::pinning) async fn candidates_for_cid_catalog(
+    catalog: crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
+    lease_id: &str,
+    cid: &str,
+    birth: &pin_lease_requirement::contract::BirthContract,
+    work: records::SharedDecodeBudget,
+) -> Result<Vec<(String, String, Option<records::MigrationPoint>)>> {
+    let db = &catalog;
     if birth.candidate_order.is_empty() {
         return Ok(vec![]);
     }
     let context = records::DecodeWork::shared(&work);
     context.copy(cid)?;
     let cid = canonical_resource_cid(cid).map_err(|_| ManagementError::InvalidEvidence)?;
-    let actions = crate::store::pinning::management::admission::authority::actions_for_lease(
-        db,
-        lease_id,
-        work.clone(),
-    )
-    .await?;
+    let actions =
+        crate::store::pinning::management::admission::authority::actions_for_lease_catalog(
+            catalog,
+            lease_id,
+            work.clone(),
+        )
+        .await?;
     context.copy(&("lease_id", lease_id))?;
     let key = [("lease_id".into(), lease_id.to_owned())].into();
     let mut result = Vec::new();
@@ -205,15 +224,14 @@ pub(crate) async fn candidates_for_cid_with_work<C: ConnectionTrait>(
         }
         let allocation = if let Some(point) = &resolved {
             point.allocation.clone()
-        } else if let Some(binding) =
-            crate::store::pinning::legacy_migration::resolve_legacy_binding_with_work(
-                db,
-                "pin_lease_requirements",
-                &key,
-                slot,
-                context,
-            )
-            .await?
+        } else if let Some(binding) = crate::store::pinning::legacy_migration::resolve_with_catalog(
+            "pin_lease_requirements",
+            &key,
+            slot,
+            &context,
+            catalog,
+        )
+        .await?
         {
             binding.operational_key
         } else {
@@ -1154,5 +1172,34 @@ pub async fn failover_candidates<C: ConnectionTrait>(
         .iter()
         .position(|candidate| candidate == failed)
         .ok_or(ManagementError::Changed)?;
+    Ok(Some(candidates[start..].to_vec()))
+}
+
+pub(crate) async fn failover_candidates_runtime(
+    tx: &crate::store::RuntimeTransaction,
+    lease: &str,
+    cid: &str,
+    failed: &str,
+    work: records::DecodeWork<'_>,
+) -> crate::error::AppResult<Option<Vec<String>>> {
+    let Some(birth) = pin_lease_requirement::contract::get_with_work(tx.db(), lease, work)
+        .await
+        .map_err(crate::store::pinning::management::admission::work_error)?
+    else {
+        return Ok(None);
+    };
+    let candidates =
+        candidates_for_cid_catalog(tx.catalog(work), lease, cid, &birth, work.budget().clone())
+            .await
+            .map_err(crate::store::pinning::management::admission::work_error)?
+            .into_iter()
+            .map(|(_, allocation, _)| allocation)
+            .collect::<Vec<_>>();
+    let start = candidates
+        .iter()
+        .position(|candidate| candidate == failed)
+        .ok_or_else(|| {
+            crate::store::pinning::management::admission::work_error(ManagementError::Changed)
+        })?;
     Ok(Some(candidates[start..].to_vec()))
 }

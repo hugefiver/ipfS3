@@ -10,6 +10,14 @@ pub(crate) async fn admission_historical_keys<C: ConnectionTrait, W: Work>(
     provider: &str,
     work: &W,
 ) -> Result<Vec<String>, W::Error> {
+    admission_historical_keys_with_catalog(provider, work, ReceiptCatalog::full(db)).await
+}
+
+pub(in crate::store::pinning) async fn admission_historical_keys_with_catalog<W: Work>(
+    provider: &str,
+    work: &W,
+    catalog: ReceiptCatalog<'_>,
+) -> Result<Vec<String>, W::Error> {
     let selectors = [
         AuthoritySelector::LegacyResource("pin_submit_observations".into(), provider.into(), None),
         AuthoritySelector::LegacyResource("pin_resource_history".into(), provider.into(), None),
@@ -25,23 +33,22 @@ pub(crate) async fn admission_historical_keys<C: ConnectionTrait, W: Work>(
         .zip(&selectors)
     {
         work.copy(provider)?;
-        let versions = super::super::admission_schema::receipt_schema(db)
-            .await
-            .map_err(W::application)?;
+        let versions = catalog.classify().await.map_err(W::application)?;
         let active = if versions.last().map(String::as_str)
             == Some(crate::store::pinning::management::schema::VERSION)
         {
             let view = match &mut candidates {
                 Some(view) => view,
                 slot @ None => slot.insert(
-                    admission::authority::load(db, &selectors, context)
+                    catalog
+                        .load(&selectors, context)
                         .await
                         .map_err(|e| W::application(admission::work_error(e)))?,
                 ),
             };
-            active_for_loaded(db, selector, view, work, context).await?
+            active_for_loaded_catalog(selector, view, work, context, catalog).await?
         } else {
-            historical::active_with_work(db, &versions, work).await?
+            historical::active_with_work(&catalog, &versions, work).await?
         };
         keys.extend(resource_keys_from_active(
             table, provider, None, active, work,
@@ -55,22 +62,34 @@ pub(super) async fn active_for<C: ConnectionTrait, W: Work>(
     selector: AuthoritySelector,
     work: &W,
 ) -> Result<Vec<operation::Model>, W::Error> {
-    let versions = super::super::admission_schema::receipt_schema(db)
-        .await
-        .map_err(W::application)?;
+    active_for_catalog(selector, work, ReceiptCatalog::full(db)).await
+}
+
+pub(super) async fn active_for_catalog<W: Work>(
+    selector: AuthoritySelector,
+    work: &W,
+    catalog: ReceiptCatalog<'_>,
+) -> Result<Vec<operation::Model>, W::Error> {
+    let versions = catalog.classify().await.map_err(W::application)?;
     if versions.last().map(String::as_str)
         != Some(crate::store::pinning::management::schema::VERSION)
     {
-        return historical::active_with_work(db, &versions, work).await;
+        return historical::active_with_work(&catalog, &versions, work).await;
     }
     let session = records::SharedDecodeBudget::default();
     let context = work
         .decode()
         .unwrap_or(records::DecodeWork::shared(&session));
-    let candidates = admission::authority::load(db, std::slice::from_ref(&selector), context)
+    let candidates = catalog
+        .load(std::slice::from_ref(&selector), context)
         .await
         .map_err(|e| W::application(admission::work_error(e)))?;
-    active_for_loaded(db, &selector, &candidates, work, context).await
+    match catalog {
+        ReceiptCatalog::Full(_) => {
+            active_for_loaded(&catalog, &selector, &candidates, work, context).await
+        }
+        _ => active_for_loaded_catalog(&selector, &candidates, work, context, catalog).await,
+    }
 }
 
 pub(super) async fn active_for_loaded<C: ConnectionTrait, W: Work>(
@@ -79,6 +98,23 @@ pub(super) async fn active_for_loaded<C: ConnectionTrait, W: Work>(
     candidates: &AuthorityView,
     work: &W,
     context: records::DecodeWork<'_>,
+) -> Result<Vec<operation::Model>, W::Error> {
+    active_for_loaded_catalog(
+        selector,
+        candidates,
+        work,
+        context,
+        ReceiptCatalog::full(db),
+    )
+    .await
+}
+
+pub(super) async fn active_for_loaded_catalog<W: Work>(
+    selector: &AuthoritySelector,
+    candidates: &AuthorityView,
+    work: &W,
+    context: records::DecodeWork<'_>,
+    catalog: ReceiptCatalog<'_>,
 ) -> Result<Vec<operation::Model>, W::Error> {
     let ids = operation_ids(candidates, selector, work)?;
     if ids.is_empty() {
@@ -89,7 +125,8 @@ pub(super) async fn active_for_loaded<C: ConnectionTrait, W: Work>(
         .iter()
         .map(|id| AuthoritySelector::LegacyOperation(id.clone()))
         .collect::<Vec<_>>();
-    let members = admission::authority::load(db, &roots, context)
+    let members = catalog
+        .load(&roots, context)
         .await
         .map_err(|e| W::application(admission::work_error(e)))?;
     let mut active = Vec::new();
@@ -122,7 +159,7 @@ pub(super) async fn active_for_loaded<C: ConnectionTrait, W: Work>(
                     .parse()
                     .map_err(|_| W::application(refused("invalid item count")))?,
             };
-            complete_with_work(db, &op, work).await?;
+            complete_with_work(&catalog, &op, work).await?;
             if op.id == id {
                 if original.replace(op).is_some() {
                     return Err(W::application(refused("duplicate operation")));

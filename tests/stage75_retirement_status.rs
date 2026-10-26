@@ -1,5 +1,7 @@
 #[path = "support/stage75_recorded_provider.rs"]
 mod historical;
+#[path = "support/stage75_legacy_import.rs"]
+mod legacy_import;
 #[path = "support/stage7_management_actions.rs"]
 #[allow(dead_code, unused_imports)]
 mod support;

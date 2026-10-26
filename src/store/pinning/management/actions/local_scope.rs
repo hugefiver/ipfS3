@@ -50,45 +50,49 @@ pub(super) async fn validate_final(
     let mut budget = Budget::default();
     // The union keeps every original predicate, including empty memberships,
     // and expands new identities under their post-image predicate fences.
-    let fresh = Box::pin(PlanningScope::capture_fenced(
-        tx,
-        &config.pinning,
-        &binding.request,
-        initial,
-        &work,
-        &mut budget,
-    ))
-    .await
-    .map_err(snapshot_error)?;
-    if fresh.database_scope != initial.database_scope
-        || fresh.database_identity != initial.database_identity
-    {
-        return Err(ManagementError::Changed);
+    let result = async {
+        let fresh = Box::pin(PlanningScope::capture_fenced(
+            tx,
+            &config.pinning,
+            &binding.request,
+            initial,
+            &work,
+            &mut budget,
+        ))
+        .await
+        .map_err(snapshot_error)?;
+        if fresh.database_scope != initial.database_scope
+            || fresh.database_identity != initial.database_identity
+        {
+            return Err(ManagementError::Changed);
+        }
+        if fresh.originals().len() != expected.len()
+            || fresh.originals().iter().any(|(key, row)| {
+                expected
+                    .get(key)
+                    .is_none_or(|expected| expected.as_ref() != row)
+            })
+        {
+            return Err(ManagementError::Changed);
+        }
+        let before = initial.authority_reads().iter().map(|r| &r.proof).chain(
+            initial
+                .business_reads()
+                .iter()
+                .flat_map(|r| r.authority_proofs()),
+        );
+        let after = fresh.authority_reads().iter().map(|r| &r.proof).chain(
+            fresh
+                .business_reads()
+                .iter()
+                .flat_map(|r| r.authority_proofs()),
+        );
+        validate_proofs(before, after, owned_sources)?;
+        budget.check()
     }
-    if fresh.originals().len() != expected.len()
-        || fresh.originals().iter().any(|(key, row)| {
-            expected
-                .get(key)
-                .is_none_or(|expected| expected.as_ref() != row)
-        })
-    {
-        return Err(ManagementError::Changed);
-    }
-    let before = initial.authority_reads().iter().map(|r| &r.proof).chain(
-        initial
-            .business_reads()
-            .iter()
-            .flat_map(|r| r.authority_proofs()),
-    );
-    let after = fresh.authority_reads().iter().map(|r| &r.proof).chain(
-        fresh
-            .business_reads()
-            .iter()
-            .flat_map(|r| r.authority_proofs()),
-    );
-    validate_proofs(before, after, owned_sources)?;
-    budget.check()?;
-    super::super::admission::authority::charge(&budget, context)
+    .await;
+    super::super::admission::authority::charge(&budget, context)?;
+    result
 }
 
 fn validate_proofs<'a>(
@@ -215,5 +219,140 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn final_scope_changed_attempts_charge_storage_into_the_same_session() {
+        use sea_orm::TransactionTrait;
+
+        let fixture = super::super::tests::fixture("final-scope-debt").await;
+        let tx = fixture.db.begin().await.unwrap();
+        let initial = capture(
+            &tx,
+            &fixture.config,
+            &fixture.binding,
+            records::SharedDecodeBudget::default(),
+        )
+        .await
+        .unwrap();
+        assert!(!initial.originals().is_empty());
+        let work = records::SharedDecodeBudget::default();
+        for _ in 0..2 {
+            let before = work.lock().unwrap().storage_usage();
+            assert_eq!(
+                validate_final(
+                    &tx,
+                    &fixture.config,
+                    &fixture.binding,
+                    &initial,
+                    &ExpectedRows::new(),
+                    &BTreeSet::new(),
+                    work.clone(),
+                )
+                .await,
+                Err(ManagementError::Changed)
+            );
+            let after = work.lock().unwrap().storage_usage();
+            assert!(after.sql > before.sql);
+            assert!(after.rows > before.rows);
+            assert!(after.raw_bytes > before.raw_bytes);
+        }
+        tx.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn final_scope_capture_failure_preserves_error_and_settles_storage() {
+        use sea_orm::{ConnectionTrait, TransactionTrait};
+
+        let fixture =
+            super::super::tests::fixture_with_automatic("final-scope-capture-error", true).await;
+        let tx = fixture.db.begin().await.unwrap();
+        let initial = capture(
+            &tx,
+            &fixture.config,
+            &fixture.binding,
+            records::SharedDecodeBudget::default(),
+        )
+        .await
+        .unwrap();
+        let changed = tx
+            .execute_unprepared("UPDATE remote_pin_ledger SET route='{}'")
+            .await
+            .unwrap();
+        assert_eq!(changed.rows_affected(), 1);
+        let mut measured = Budget::default();
+        let original = PlanningScope::capture_fenced(
+            &tx,
+            &fixture.config.pinning,
+            &fixture.binding.request,
+            &initial,
+            &records::SharedDecodeBudget::default(),
+            &mut measured,
+        )
+        .await
+        .err()
+        .map(snapshot_error)
+        .unwrap();
+        assert_ne!(original, ManagementError::Budget);
+        assert!(measured.work.sql > 0);
+        let work = records::SharedDecodeBudget::default();
+        let result = validate_final(
+            &tx,
+            &fixture.config,
+            &fixture.binding,
+            &initial,
+            &ExpectedRows::new(),
+            &BTreeSet::new(),
+            work.clone(),
+        )
+        .await;
+        assert_eq!(result, Err(original));
+        assert_eq!(work.lock().unwrap().storage_usage().sql, measured.work.sql);
+        tx.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn final_scope_budget_exhaustion_precedes_changed_and_retains_debt() {
+        use native::meter::{Limits, WorkMeter};
+        use sea_orm::TransactionTrait;
+
+        let fixture = super::super::tests::fixture("final-scope-budget-error").await;
+        let tx = fixture.db.begin().await.unwrap();
+        let initial = capture(
+            &tx,
+            &fixture.config,
+            &fixture.binding,
+            records::SharedDecodeBudget::default(),
+        )
+        .await
+        .unwrap();
+        let work = records::SharedDecodeBudget::default();
+        work.lock()
+            .unwrap()
+            .charge_storage(WorkMeter {
+                rows: Limits::default().rows - 1,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            validate_final(
+                &tx,
+                &fixture.config,
+                &fixture.binding,
+                &initial,
+                &ExpectedRows::new(),
+                &BTreeSet::new(),
+                work.clone(),
+            )
+            .await,
+            Err(ManagementError::Budget)
+        );
+        {
+            let session = work.lock().unwrap();
+            assert!(session.storage_usage().rows > Limits::default().rows);
+            assert!(session.storage_usage().sql > 0);
+            assert!(session.check().is_err());
+        }
+        tx.rollback().await.unwrap();
     }
 }

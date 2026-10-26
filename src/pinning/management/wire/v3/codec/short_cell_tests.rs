@@ -3,8 +3,6 @@ use crate::store::pinning::management::native::meter::Limits;
 use std::{cell::Cell, io::Cursor, rc::Rc, sync::atomic::Ordering};
 #[path = "physical_tests.rs"]
 mod physical_tests;
-#[path = "owned_tests.rs"]
-mod owned_tests;
 
 fn prefix(projection: Projection) -> Vec<Frame> {
     vec![
@@ -241,6 +239,10 @@ fn short_record_expansion_prepays_once_keeps_resident_costs_and_never_reads_ahea
     let prepaid = reader.budget().work;
     assert_eq!(prepaid.cells, before.cells + 1);
     assert_eq!(
+        prepaid.copied_bytes - before.copied_bytes,
+        (2 * column.len() + "原文-é\0尾".len()) as u64
+    );
+    assert_eq!(
         prepaid.raw_bytes - before.raw_bytes,
         (8 + column.len() + "原文-é\0尾".len()) as u64
     );
@@ -375,8 +377,74 @@ fn record_handoff_preserves_kind7_and_counts_source_and_output_independently() {
     assert_eq!(budget.work.raw_bytes, 2 * output.len() as u64 + 1);
     assert_eq!(
         budget.work.copied_bytes,
-        2 * ("cid".len() + "metadata".len() + "size".len()) as u64
+        (3 * ("cid".len() + "metadata".len() + "size".len()) + "原文-é\0尾".len()) as u64
     );
+}
+
+#[test]
+fn owned_short_cell_prepays_copies_before_handoff_and_keeps_failed_debt() {
+    let mut reader = at_cell(archive(true));
+    let before = reader.budget().work;
+    let text = "原文-é\0尾".len() as u64;
+    let physical = 8 + 3 + text;
+    let validation_copy = 3;
+    let owned_copy = 3 + text;
+    reader
+        .budget_mut()
+        .restrict_transfer_bytes(physical + validation_copy + owned_copy - 1)
+        .unwrap();
+    assert!(matches!(
+        reader.next_record(),
+        Err(SafeError::LimitExceeded)
+    ));
+    assert!(reader.pending.is_none());
+    assert_eq!(reader.budget().work.raw_bytes - before.raw_bytes, physical);
+    assert_eq!(
+        reader.budget().work.copied_bytes - before.copied_bytes,
+        validation_copy + owned_copy
+    );
+    let debt = reader.budget().work.copied_bytes;
+    let Err((SafeError::LimitExceeded, budget)) = Writer::new_metered(
+        Vec::new(),
+        Projection::PrivateRecovery,
+        reader.take_budget(),
+    ) else {
+        panic!("failed debt must survive the handoff");
+    };
+    assert_eq!(budget.work.copied_bytes, debt);
+    reader.restore_budget(*budget);
+    assert!(reader.budget().check().is_err());
+    assert!(reader.next_frame().is_err());
+    assert_eq!(reader.budget().work.copied_bytes, debt);
+}
+
+#[test]
+fn owned_short_cell_copy_work_survives_budget_handoff_and_checkpoint() {
+    let mut reader = at_cell(archive(true));
+    let before = reader.budget().work.copied_bytes;
+    let held = match reader.next_record().unwrap().unwrap() {
+        Record::ShortCell(held) => held,
+        _ => panic!("short record"),
+    };
+    let copied = reader.budget().work.copied_bytes;
+    assert_eq!(
+        copied - before,
+        (2 * "cid".len() + held.cell.bytes.len()) as u64
+    );
+    let mut writer = Writer::new(
+        Vec::new(),
+        Projection::PrivateRecovery,
+        reader.take_budget(),
+    )
+    .unwrap();
+    reader.restore_budget(writer.take_budget());
+    assert_eq!(reader.budget().work.copied_bytes, copied);
+    let saved = reader.budget().checkpoint().unwrap();
+    let mut resumed = Budget::resume(saved, Limits::default()).unwrap();
+    assert_eq!(resumed.work.copied_bytes, copied);
+    let used = resumed.work.raw_bytes + copied + resumed.work.output_bytes;
+    assert!(resumed.restrict_work_bytes(used - 1).is_err());
+    drop(held);
 }
 
 #[test]

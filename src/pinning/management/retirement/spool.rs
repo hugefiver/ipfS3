@@ -33,9 +33,9 @@ impl Default for RunLimits {
     fn default() -> Self {
         Self {
             pages: 64,
-            total_bytes: 16 * 1024 * 1024 * 1024,
+            total_bytes: 8 * 1024 * 1024 * 1024,
             total_rows: 10_000_000,
-            elapsed: Duration::from_secs(30),
+            elapsed: Duration::from_secs(120),
             cancellation: Default::default(),
             started: Default::default(),
             consumed_pages: Default::default(),

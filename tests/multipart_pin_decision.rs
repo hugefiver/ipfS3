@@ -26,8 +26,7 @@ use wiremock::{
     matchers::{method, path},
 };
 
-#[path = "../src/store/migrations/m20260920_000004_multipart_pin_decision.rs"]
-mod pending_migration;
+use ipfs_s3_gateway::store::migrations::m20260920_000004_multipart_pin_decision as pending_migration;
 #[path = "support/sigv4.rs"]
 #[allow(dead_code)]
 mod sigv4;

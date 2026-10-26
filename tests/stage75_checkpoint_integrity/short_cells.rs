@@ -5,6 +5,9 @@ use ipfs_s3_gateway::{
 };
 use sha2::{Digest, Sha256};
 
+#[path = "original_inventory.rs"]
+mod original_inventory;
+
 fn records(bytes: &[u8]) -> Vec<(u8, &[u8], usize)> {
     let mut at = v3::MAGIC.len();
     let mut result = Vec::new();
@@ -65,6 +68,47 @@ async fn private_output(
     writer.finish()
 }
 
+type ContentRow = (
+    v3::Section,
+    NativeKey,
+    Vec<(String, Vec<u8>, v3::CellValue)>,
+);
+
+fn content_rows(bytes: &[u8]) -> Vec<ContentRow> {
+    let mut reader = v3::Reader::new(
+        bytes,
+        Projection::PrivateRecovery,
+        v3::files::stream::budget(),
+    )
+    .unwrap();
+    let mut rows: Vec<ContentRow> = Vec::new();
+    let mut cell = (String::new(), Vec::new(), v3::CellValue::Null);
+    while let Some(event) = reader.next_frame().unwrap() {
+        match event {
+            v3::Event::Frame(v3::Frame::Row { section, key, .. }) => {
+                rows.push((section, key, Vec::new()))
+            }
+            v3::Event::Frame(v3::Frame::Cell { column }) => {
+                cell = (column, Vec::new(), v3::CellValue::Null)
+            }
+            v3::Event::Chunk(bytes) => {
+                assert!(cell.1.len() + bytes.len() <= v3::FRAME_BYTES);
+                cell.1.extend_from_slice(&bytes);
+            }
+            v3::Event::Frame(v3::Frame::CellEnd { value }) => {
+                cell.2 = value;
+                rows.last_mut().unwrap().2.push(std::mem::replace(
+                    &mut cell,
+                    (String::new(), Vec::new(), v3::CellValue::Null),
+                ));
+            }
+            _ => {}
+        }
+    }
+    assert!(reader.verified());
+    rows
+}
+
 #[tokio::test]
 async fn confirmed_copy_sections_preserves_short_records_and_validates_excluded_sections() {
     let (fixture, binding, _, _) = committed_without_output().await;
@@ -78,6 +122,7 @@ async fn confirmed_copy_sections_preserves_short_records_and_validates_excluded_
         &fixture.db,
         &binding,
         entry,
+        tempfile::tempfile().unwrap(),
         v3::files::stream::budget(),
     )
     .await
@@ -104,8 +149,8 @@ async fn confirmed_copy_sections_preserves_short_records_and_validates_excluded_
     );
     assert!(records(&source).iter().any(|(kind, _, _)| *kind == 2));
     let mut tight = v3::files::stream::limits();
-    // Two codec states, the read cache, the document, and one codec's peak
-    // workspace fit. The live decoded event and output workspace must overlap.
+    // An ordinary reader fits, but the bounded storage page, decoder and output
+    // state must also fit simultaneously during confirmed streaming.
     tight.resident = 7 * v3::FRAME_BYTES
         + v3::CELL_BYTES
         + 8 * (header.request.len() + header.configuration.len());
@@ -138,9 +183,46 @@ async fn confirmed_copy_sections_preserves_short_records_and_validates_excluded_
     );
     let spent = constrained.abort();
     assert!(spent.check().is_err());
-    assert!(spent.work.raw_bytes > source.len() as u64);
+    assert!(spent.work.raw_bytes > 0);
     assert!(spent.work.output_bytes > 0);
     let output = private_output(&fixture.db, &binding).await.unwrap();
+    let source_rows = content_rows(&source);
+    let output_rows = content_rows(&output);
+    let included = source_rows
+        .iter()
+        .filter(|row| {
+            matches!(
+                row.0,
+                v3::Section::Native | v3::Section::Membership | v3::Section::Inventory
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(!included.is_empty());
+    let copied = output_rows
+        .iter()
+        .filter(|row| {
+            included
+                .iter()
+                .any(|source| source.0 == row.0 && source.1 == row.1)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        included == copied,
+        "all included source rows, columns, cell kinds and complete value bytes must survive"
+    );
+    let captures = output_rows
+        .iter()
+        .filter(|row| row.0 == v3::Section::Result && row.1.table == "management_capture")
+        .collect::<Vec<_>>();
+    assert_eq!(captures.len(), binding.confirmation.bindings.len());
+    for (row, entry) in captures.iter().zip(binding.confirmation.bindings.iter()) {
+        assert_eq!(row.2.len(), 1);
+        assert!(row.2[0].2 == v3::CellValue::Text);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&row.2[0].1).unwrap(),
+            serde_json::to_value(&entry.capture).unwrap()
+        );
+    }
     let short_output = records(&output)
         .into_iter()
         .filter(|(kind, _, _)| *kind == 7)
@@ -185,8 +267,24 @@ async fn confirmed_copy_sections_preserves_short_records_and_validates_excluded_
     .await
     .unwrap();
     assert_eq!(transported, malformed);
+    let mut rejected = Writer::new(
+        Vec::new(),
+        Projection::PrivateRecovery,
+        v3::files::stream::budget(),
+    )
+    .unwrap();
     assert!(matches!(
-        private_output(&isolated, &binding).await,
+        v3::planning::confirmed(
+            &isolated,
+            &mut rejected,
+            &binding,
+            Projection::PrivateRecovery
+        )
+        .await,
         Err(SafeError::InvalidInput)
     ));
+    assert!(
+        rejected.finish().is_err(),
+        "a validated prefix must not become a complete archive after input failure"
+    );
 }

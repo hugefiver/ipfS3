@@ -64,23 +64,46 @@ pub async fn validate<C: ConnectionTrait>(db: &C) -> Result<Vec<String>> {
     validate_state(db, false).await
 }
 
+pub(in crate::store::pinning) async fn validate_observed(
+    window: &super::admission::worker_observation::WorkerReadWindow,
+) -> Result<Vec<String>> {
+    if let Some(versions) = window.runtime_versions().await {
+        return versions.map_err(|error| match error {
+            crate::error::AppError::ManagementBudget => ManagementError::Budget,
+            _ => ManagementError::Schema,
+        });
+    }
+    storage::observed_control(window).await
+}
+
+pub(in crate::store::pinning) async fn validate_quota(
+    window: &crate::store::pinning::quota::production::QuotaReadWindow<'_>,
+) -> Result<Vec<String>> {
+    storage::quota_control(window).await
+}
+
 /// Reuse versions from the same SQLite classification read, not a prior call.
 /// This still reads the complete current storage catalog, guards and readiness.
 pub(in crate::store::pinning) async fn validate_sqlite_with_versions<C: ConnectionTrait>(
     db: &C,
     versions: &[String],
 ) -> Result<()> {
+    if db.get_database_backend() != DatabaseBackend::Sqlite {
+        return Err(ManagementError::Schema);
+    }
+    validate_current_versions(versions)?;
+    storage::validate_schema(db, false).await
+}
+
+fn validate_current_versions(versions: &[String]) -> Result<()> {
     let known: Vec<String> = crate::store::migrator::Migrator::migrations()
         .iter()
         .map(|migration| migration.name().to_owned())
         .collect();
-    if db.get_database_backend() != DatabaseBackend::Sqlite
-        || versions != known.as_slice()
-        || versions.last().map(String::as_str) != Some(VERSION)
-    {
+    if versions != known.as_slice() || versions.last().map(String::as_str) != Some(VERSION) {
         return Err(ManagementError::Schema);
     }
-    storage::validate_schema(db, false).await
+    Ok(())
 }
 
 /// Validates the complete installed layout without publishing it for runtime use.
@@ -92,6 +115,17 @@ pub(crate) async fn validate_for_upgrade<C: ConnectionTrait>(db: &C) -> Result<V
 }
 
 async fn validate_state<C: ConnectionTrait>(db: &C, backfill: bool) -> Result<Vec<String>> {
+    let versions = read_versions(db).await?;
+    storage::validate_schema(db, backfill).await?;
+    if db.get_database_backend() == DatabaseBackend::Postgres {
+        postgres::validate(db).await?;
+    }
+    Ok(versions)
+}
+
+pub(in crate::store::pinning) async fn read_versions<C: ConnectionTrait>(
+    db: &C,
+) -> Result<Vec<String>> {
     let backend = db.get_database_backend();
     if !matches!(backend, DatabaseBackend::Sqlite | DatabaseBackend::Postgres) {
         return Err(ManagementError::Schema);
@@ -120,10 +154,6 @@ async fn validate_state<C: ConnectionTrait>(db: &C, backfill: bool) -> Result<Ve
         .map_err(|_| ManagementError::Schema)?;
     if versions != known || versions.last().map(String::as_str) != Some(VERSION) {
         return Err(ManagementError::Schema);
-    }
-    storage::validate_schema(db, backfill).await?;
-    if backend == DatabaseBackend::Postgres {
-        postgres::validate(db).await?;
     }
     Ok(versions)
 }

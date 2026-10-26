@@ -38,10 +38,18 @@ pub(super) async fn copy<W: Write>(
     while ordinal < reference.chunks {
         let end = ordinal.saturating_add(16).min(reference.chunks);
         budget.charge(1, (end - ordinal) as u64, 2 * (end - ordinal) as u64, 0)?;
-        let rows = db.query_all(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
-            BATCH_SQL,
-            [reference.archive_id.clone().into(), ordinal.into(), end.into()],
-        )).await.map_err(|_| ManagementError::Database)?;
+        let rows = db
+            .query_all(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                BATCH_SQL,
+                [
+                    reference.archive_id.clone().into(),
+                    ordinal.into(),
+                    end.into(),
+                ],
+            ))
+            .await
+            .map_err(|_| ManagementError::Database)?;
         if rows.len() != (end - ordinal) as usize {
             return Err(ManagementError::InvalidEvidence);
         }

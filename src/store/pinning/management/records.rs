@@ -33,9 +33,9 @@ pub use inventory_review::bind_sealed_retirement_review;
 pub use inventory_review::copy_original_inventory;
 pub(crate) use inventory_review::finish_apply as finish_retirement_apply;
 pub use inventory_review::load_original_inventory;
-pub(crate) use inventory_review::{open_original_inventory_document, OriginalInventoryDocument};
 pub(crate) use inventory_review::prepare_apply as prepare_retirement_apply;
 pub(crate) use inventory_review::validate_entry as validate_retirement_entry;
+pub(crate) use inventory_review::{OriginalInventoryDocument, open_original_inventory_document};
 pub mod segmented;
 pub(crate) use archive::ArchivedRows;
 pub use archive::ConfirmedPlan;
@@ -168,6 +168,7 @@ pub use confirmation::{
 };
 pub use imported::{load_confirmed_from_imported, load_review_from_imported};
 pub(crate) use index::action_at_key_with_work;
+pub(crate) use index::actions_at_keys_catalog;
 pub(crate) use index::actions_at_keys_with_work;
 pub(crate) use index::actions_for_plan_with_work;
 pub(crate) use inspection::{RecordPayload, inspect_original_row, inspect_original_row_with_work};

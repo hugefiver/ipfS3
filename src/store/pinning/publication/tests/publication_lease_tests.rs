@@ -99,7 +99,7 @@ async fn publish(
     target: MultipartUploadTargetIdentity,
 ) -> Result<PublicationResult, TransactionError<AppError>> {
     publication_attempt(
-        db,
+        db.into(),
         request.archive,
         request.entries,
         Some(batch),
@@ -112,6 +112,7 @@ async fn publish(
         limits(),
         None,
         Some(zip_fixture::replay()),
+        &Default::default(),
     )
     .await
 }

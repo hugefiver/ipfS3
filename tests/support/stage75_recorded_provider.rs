@@ -1,6 +1,5 @@
 //! A committed Stage 7 Retain original, using its historical storage protocol.
-#[path = "stage75_legacy_import.rs"]
-mod legacy_import;
+use crate::legacy_import;
 #[path = "stage75_source_catalog.rs"]
 mod source_catalog;
 use ipfs_s3_gateway::{

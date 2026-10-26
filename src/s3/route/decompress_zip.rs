@@ -16,7 +16,7 @@ use crate::{
     state::AppState,
     store::pinning::publication::{
         CapturedZipPublication, LegacyZipAuthority, PublicationObject, ZipPublicationAuthority,
-        decode_zip_capture_json, publish_captured_zip,
+        application::publish_captured_zip, decode_zip_capture_json,
     },
 };
 
@@ -1102,7 +1102,7 @@ impl DecompressZipRoute {
                     terminal_result,
                 };
                 let results = lease
-                    .commit(publish_captured_zip(self.state.store.db(), request))
+                    .commit(publish_captured_zip(&self.state.store, request))
                     .await?;
                 let publication_result = results
                     .into_iter()

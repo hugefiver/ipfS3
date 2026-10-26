@@ -190,7 +190,13 @@ pub async fn run(
         args.extend(["--ttl-seconds", "30"]);
     }
     let started = Instant::now();
-    let output = cli::output(&mut fixture.command(&args)).await;
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(150),
+        fixture.command(&args).output(),
+    )
+    .await
+    .expect("scale CLI exceeded its process budget")
+    .unwrap();
     fixture.assert_redacted(&output);
     eprintln!(
         "CLI resume={resume} confirm={confirm} scan_pages={pages} wall={:?} status={}",
@@ -285,6 +291,7 @@ pub fn cli_limits() -> RunLimits {
     limits.pages = 512;
     limits.total_rows = hard.rows;
     limits.total_bytes = hard.bytes;
+    limits.elapsed = hard.elapsed;
     limits
 }
 
@@ -693,22 +700,153 @@ pub struct FileClaims {
     pub membership_ids: BTreeSet<String>,
 }
 
-pub fn same_file_bytes(first: &Path, second: &Path) {
-    let mut first = BufReader::new(File::open(first).unwrap());
-    let mut second = BufReader::new(File::open(second).unwrap());
-    let mut left = [0; 64 * 1024];
-    let mut right = [0; 64 * 1024];
+pub fn same_file_semantics(first: &Path, second: &Path) {
+    let mut first = Reader::new(
+        File::open(first).unwrap(),
+        Projection::Review,
+        v3::files::stream::budget(),
+    )
+    .unwrap();
+    let mut second = Reader::new(
+        File::open(second).unwrap(),
+        Projection::Review,
+        v3::files::stream::budget(),
+    )
+    .unwrap();
+    first.enable_buffering().unwrap();
+    second.enable_buffering().unwrap();
+    same_semantics(&mut first, &mut second);
+}
+
+fn same_semantics<L: Read, R: Read>(first: &mut Reader<L>, second: &mut Reader<R>) {
+    let mut left = first.next_frame().unwrap();
+    let mut right = second.next_frame().unwrap();
+    let (mut left_offset, mut right_offset) = (0, 0);
     loop {
-        let n = first.read(&mut left).unwrap();
-        second.read_exact(&mut right[..n]).unwrap();
-        assert_eq!(
-            &left[..n],
-            &right[..n],
-            "recovery must reproduce the original document"
-        );
-        if n == 0 {
-            assert_eq!(second.read(&mut right[..1]).unwrap(), 0);
-            break;
+        match (&left, &right) {
+            (Some(Event::Chunk(a)), Some(Event::Chunk(b))) => {
+                let n = (a.len() - left_offset).min(b.len() - right_offset);
+                assert_eq!(
+                    &a[left_offset..left_offset + n],
+                    &b[right_offset..right_offset + n]
+                );
+                left_offset += n;
+                right_offset += n;
+                if left_offset == a.len() {
+                    left_offset = 0;
+                    left = first.next_frame().unwrap();
+                }
+                if right_offset == b.len() {
+                    right_offset = 0;
+                    right = second.next_frame().unwrap();
+                }
+            }
+            (Some(Event::Frame(a)), Some(Event::Frame(b))) => {
+                assert!(
+                    a == b,
+                    "archive control facts or ordered cell/row values differ"
+                );
+                left = first.next_frame().unwrap();
+                right = second.next_frame().unwrap();
+            }
+            (None, None) => {
+                assert!(first.verified() && second.verified());
+                break;
+            }
+            _ => panic!("archive semantic event sequences differ"),
         }
+    }
+}
+
+#[cfg(test)]
+mod semantic_tests {
+    use super::*;
+
+    fn archive(compact: bool, text: &[u8], created: &str) -> Vec<u8> {
+        let mut writer =
+            v3::Writer::new(Vec::new(), Projection::Review, v3::files::stream::budget()).unwrap();
+        for frame in [
+            Frame::Header {
+                schema_version: v3::SCHEMA_VERSION,
+                projection: Projection::Review,
+                database_scope: "scope".into(),
+                database_identity: "identity".into(),
+                principal: "principal".into(),
+                applied_trust: v3::AppliedTrust::UntrustedClaimsOnly,
+                catalog: vec!["catalog".into()],
+                created_at: created.into(),
+                expires_at: None,
+            },
+            Frame::Request { request: None },
+            Frame::Configuration {
+                configuration: None,
+            },
+            Frame::Acknowledgements { item_ids: None },
+            Frame::Summary {
+                summary: Default::default(),
+            },
+            Frame::Row {
+                section: Section::Native,
+                key: NativeKey {
+                    table: "objects".into(),
+                    values: vec!["a".into()],
+                },
+                cells: 3,
+            },
+        ] {
+            writer.frame(&frame).unwrap();
+        }
+        if compact {
+            writer.complete_cell("cid", text, CellValue::Text).unwrap();
+        } else {
+            writer
+                .frame(&Frame::Cell {
+                    column: "cid".into(),
+                })
+                .unwrap();
+            for byte in text.chunks(1) {
+                writer.cell_output().write_all(byte).unwrap();
+            }
+            writer
+                .frame(&Frame::CellEnd {
+                    value: CellValue::Text,
+                })
+                .unwrap();
+        }
+        writer
+            .complete_cell("metadata", b"secret", CellValue::Text)
+            .unwrap();
+        writer.complete_cell("size", b"", CellValue::Null).unwrap();
+        writer.frame(&Frame::RowEnd).unwrap();
+        writer.finish().unwrap()
+    }
+    fn compare(left: &[u8], right: &[u8]) {
+        let mut left = Reader::new(left, Projection::Review, v3::files::stream::budget()).unwrap();
+        let mut right =
+            Reader::new(right, Projection::Review, v3::files::stream::budget()).unwrap();
+        same_semantics(&mut left, &mut right);
+    }
+    #[test]
+    fn complete_content_is_equal_despite_physical_chunk_and_frame_differences() {
+        compare(
+            &archive(true, "原文-é\0尾".as_bytes(), "original"),
+            &archive(false, "原文-é\0尾".as_bytes(), "original"),
+        );
+    }
+    #[test]
+    #[should_panic]
+    fn changed_public_value_is_not_semantically_equal() {
+        compare(
+            &archive(true, b"original", "time"),
+            &archive(false, b"changed!", "time"),
+        );
+    }
+    #[test]
+    #[should_panic]
+    fn changed_control_fact_is_not_semantically_equal() {
+        compare(
+            &archive(true, b"original", "time"),
+            &archive(false, b"original", "different"),
+        );
     }
 }

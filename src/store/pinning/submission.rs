@@ -2,11 +2,14 @@
 use chrono::{DateTime, Utc};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, Iterable, QueryFilter, QueryOrder,
-    Set, Statement, TransactionTrait,
+    Statement, TransactionTrait,
     sea_query::{Expr, Iden},
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+
+#[cfg(test)]
+use sea_orm::Set;
 
 use super::{
     super::jobs::{self, ClaimedPinJob},
@@ -109,11 +112,18 @@ pub async fn latest<C: ConnectionTrait>(
     db: &C,
     job_id: &str,
 ) -> AppResult<Option<evidence::Model>> {
-    Ok(evidence::Entity::find()
-        .filter(evidence::Column::JobId.eq(job_id))
-        .order_by_desc(evidence::Column::SubmitCall)
-        .one(db)
-        .await?)
+    let relation = fact_relation(db).await?;
+    db.query_one(Statement::from_sql_and_values(
+        db.get_database_backend(),
+        format!(
+            "SELECT * FROM {} WHERE job_id=$1 ORDER BY submit_call DESC LIMIT 1",
+            relation.table
+        ),
+        [job_id.into()],
+    ))
+    .await?
+    .map(|row| evidence::Model::from_query_result(&row, "").map_err(Into::into))
+    .transpose()
 }
 
 /// Must share the exact claim/invocation transaction before provider I/O.
@@ -133,12 +143,12 @@ pub async fn begin<C: ConnectionTrait>(
     if !is_rpc(&route) {
         return Ok(None);
     }
-    if evidence::Entity::find()
-        .filter(evidence::Column::Provider.eq(&claimed.model.provider))
-        .filter(evidence::Column::ExpectedCid.eq(&claimed.model.cid))
-        .filter(evidence::Column::NeedsAttention.eq(true))
-        .one(db)
-        .await?
+    let relation = fact_relation(db).await?;
+    if db.query_one(Statement::from_sql_and_values(
+        db.get_database_backend(),
+        format!("SELECT id FROM {} WHERE provider=$1 AND expected_cid=$2 AND needs_attention=$3 LIMIT 1", relation.table),
+        [claimed.model.provider.clone().into(), claimed.model.cid.clone().into(), true.into()],
+    )).await?
         .is_some()
     {
         return Err(AppError::InvalidPinningRequest(
@@ -153,31 +163,19 @@ pub async fn begin<C: ConnectionTrait>(
         .locked_until
         .ok_or_else(|| AppError::Internal("RPC invocation has no claim".into()))?;
     let id = format!("{}:call:{}", claimed.model.id, history.submit_calls);
-    evidence::Entity::insert(evidence::ActiveModel {
-        id: Set(id.clone()),
-        job_id: Set(claimed.model.id.clone()),
-        submit_call: Set(history.submit_calls),
-        provider: Set(claimed.model.provider.clone()),
-        expected_cid: Set(claimed.model.cid.clone()),
-        route: Set(captured.route),
-        remote_epoch: Set(captured.remote_epoch),
-        claim_until: Set(claim_until),
-        effect: Set("unknown".into()),
-        resources: Set("[]".into()),
-        outcome: Set("in_flight".into()),
-        safe_error: Set(None),
-        needs_attention: Set(true),
-        started_at: Set(now),
-        observed_at: Set(None),
-    })
-    .exec(db)
-    .await?;
+    db.execute(Statement::from_sql_and_values(
+        db.get_database_backend(),
+        format!("INSERT INTO {} (id,job_id,submit_call,provider,expected_cid,route,remote_epoch,claim_until,effect,resources,outcome,safe_error,needs_attention,started_at,observed_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'unknown','[]','in_flight',NULL,$9,$10,NULL)", relation.table),
+        vec![id.clone().into(), claimed.model.id.clone().into(), history.submit_calls.into(), claimed.model.provider.clone().into(), claimed.model.cid.clone().into(), captured.route.into(), captured.remote_epoch.into(), claim_until.into(), true.into(), now.into()],
+    )).await?;
     Ok(Some(id))
 }
 
 /// No quota admission here: evidence for already dispatched effects cannot be
 /// rejected because capacity is full. The original logical reservation remains.
 /// A stale claim/lifetime may append its own evidence, but cannot project status.
+/// Atomic with the caller's transaction; a nested savepoint is not a durable
+/// receipt commit. Worker completion uses the Store-owned fact transaction.
 pub async fn record<C: ConnectionTrait + TransactionTrait>(
     db: &C,
     claimed: &ClaimedPinJob,
@@ -199,6 +197,98 @@ pub async fn record<C: ConnectionTrait + TransactionTrait>(
     }
 }
 
+/// An immutable invocation identity captured before dispatch. It conveys no
+/// current business authority and cannot be constructed from a provider response.
+#[derive(Clone)]
+pub(crate) struct InvocationFact {
+    row: evidence::Model,
+    relation: FactRelation,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static RPC_AUTHORITY_SQL_FAILURE: ();
+}
+
+#[derive(Clone)]
+struct FactRelation {
+    table: String,
+    postgres_identity: Option<(String, i64)>,
+}
+
+async fn fact_relation<C: ConnectionTrait>(db: &C) -> AppResult<FactRelation> {
+    if db.get_database_backend() == sea_orm::DatabaseBackend::Sqlite {
+        return Ok(FactRelation {
+            table: "\"main\".\"pin_submit_observations\"".into(),
+            postgres_identity: None,
+        });
+    }
+    // Resolve only a permanent application relation, in the configured schema
+    // path. A connection-local TEMP copy must never capture or receive facts.
+    let row = db
+        .query_one(Statement::from_string(
+            db.get_database_backend(),
+            "SELECT n.nspname::text AS schema_name, c.oid::bigint AS relation_oid \
+         FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace \
+         WHERE c.relname='pin_submit_observations' AND c.relpersistence='p' \
+         AND c.relkind IN ('r','p') AND n.nspname=ANY(pg_catalog.current_schemas(false)) \
+         ORDER BY pg_catalog.array_position(pg_catalog.current_schemas(false),n.nspname) LIMIT 1",
+        ))
+        .await?
+        .ok_or_else(|| AppError::Internal("persistent RPC receipt relation missing".into()))?;
+    let schema: String = row.try_get("", "schema_name")?;
+    let oid: i64 = row.try_get("", "relation_oid")?;
+    Ok(FactRelation {
+        table: format!(
+            "\"{}\".\"pin_submit_observations\"",
+            schema.replace('"', "\"\"")
+        ),
+        postgres_identity: Some((schema, oid)),
+    })
+}
+
+pub(crate) async fn capture_fact<C: ConnectionTrait>(
+    db: &C,
+    claimed: &ClaimedPinJob,
+    id: &str,
+) -> AppResult<InvocationFact> {
+    let claim = claimed
+        .model
+        .locked_until
+        .ok_or_else(|| AppError::Internal("RPC claim missing".into()))?;
+    let relation = fact_relation(db).await?;
+    // Compare timestamps in the database's native representation, including PG
+    // microsecond precision. Never substitute a later worker's claim.
+    let row = db.query_one(Statement::from_sql_and_values(
+        db.get_database_backend(),
+        format!("SELECT * FROM {} WHERE id=$1 AND job_id=$2 AND provider=$3 AND expected_cid=$4 AND claim_until=$5", relation.table),
+        [id.into(), claimed.model.id.clone().into(), claimed.model.provider.clone().into(), claimed.model.cid.clone().into(), claim.into()],
+    )).await?.ok_or_else(|| AppError::Internal("RPC observation invocation identity mismatch".into()))?;
+    let row = evidence::Model::from_query_result(&row, "")?;
+    let route: ProviderRouteSnapshot = serde_json::from_str(&row.route)
+        .map_err(|_| AppError::Internal("RPC observation historical route invalid".into()))?;
+    if row.id != format!("{}:call:{}", row.job_id, row.submit_call) || !is_rpc(&route) {
+        return Err(AppError::Internal(
+            "RPC observation invocation identity mismatch".into(),
+        ));
+    }
+    Ok(InvocationFact { row, relation })
+}
+
+/// Owns and commits the outermost transaction. No runtime catalog, management
+/// admission, lifecycle, release-context read or wake is part of this fact write.
+pub(crate) async fn complete_fact(
+    store: &crate::store::Store,
+    invocation: &InvocationFact,
+    observation: &SubmitObservation,
+    now: DateTime<Utc>,
+) -> AppResult<evidence::Model> {
+    let tx = store.db().begin().await?;
+    let row = write_fact(&tx, invocation, observation, now).await?;
+    tx.commit().await?;
+    Ok(row)
+}
+
 async fn record_in_transaction<C: ConnectionTrait>(
     db: &C,
     claimed: &ClaimedPinJob,
@@ -206,30 +296,34 @@ async fn record_in_transaction<C: ConnectionTrait>(
     observation: &SubmitObservation,
     now: DateTime<Utc>,
 ) -> AppResult<bool> {
-    let claim = claimed
-        .model
-        .locked_until
-        .ok_or_else(|| AppError::Internal("RPC claim missing".into()))?;
-    let desired = lock_receipt_lifecycle(db, &claimed.model, now).await?;
-    // Compare the claim in the database's native timestamp representation.
-    // PG persists microseconds while a renewed caller token can have nanoseconds.
-    // This is the same exact fence used by every other worker mutation, not a
-    // time tolerance; stale receipts still lock unconditionally below to append.
-    let live = jobs::fence_job_claim(db, &claimed.model.id, claim).await?;
-    let current_job = jobs::lock_submit_receipt(db, &claimed.model.id).await?;
-    let remote = lock_receipt_remote(db, &claimed.model.provider, &claimed.model.cid).await?;
-    let row = evidence::Entity::find_by_id(id.to_owned())
-        .one(db)
-        .await?
-        .ok_or_else(|| AppError::Internal("RPC invocation footprint missing".into()))?;
-    if row.job_id != claimed.model.id
-        || row.provider != claimed.model.provider
-        || row.expected_cid != claimed.model.cid
-    {
-        return Err(AppError::Internal(
-            "RPC observation invocation identity mismatch".into(),
-        ));
+    let invocation = capture_fact(db, claimed, id).await?;
+    let row = write_fact(db, &invocation, observation, now).await?;
+    let can_project = project_receipt(db, claimed, &row, now, None, true).await?;
+    if matches!(row.outcome.as_str(), "matched" | "accepted") {
+        if can_project {
+            db.execute(Statement::from_sql_and_values(
+                db.get_database_backend(),
+                format!(
+                    "UPDATE {} SET needs_attention=$1 WHERE id=$2",
+                    invocation.relation.table
+                ),
+                [false.into(), id.into()],
+            ))
+            .await?;
+        } else {
+            wake_matching_parked(db, &claimed.model.id, now).await?;
+        }
     }
+    Ok(can_project)
+}
+
+async fn write_fact<C: ConnectionTrait>(
+    db: &C,
+    invocation: &InvocationFact,
+    observation: &SubmitObservation,
+    now: DateTime<Utc>,
+) -> AppResult<evidence::Model> {
+    let row = &invocation.row;
     let route: ProviderRouteSnapshot = serde_json::from_str(&row.route)
         .map_err(|_| AppError::Internal("RPC observation historical route invalid".into()))?;
     let resources: Vec<_> = observation
@@ -312,74 +406,169 @@ async fn record_in_transaction<C: ConnectionTrait>(
         .map(|error| typed_error(error, effective));
     let json = serde_json::to_string(&resources)
         .map_err(|_| AppError::Internal("RPC evidence serialization failed".into()))?;
-    let captured = pin_invocation_route::Entity::find_by_id(claimed.model.id.clone())
-        .one(db)
+    let mut sql = format!(
+        "UPDATE {} SET effect=$1, resources=$2, outcome=$3, safe_error=$4, needs_attention=$5, observed_at=$6 WHERE id=$7 AND job_id=$8 AND submit_call=$9 AND provider=$10 AND expected_cid=$11 AND route=$12 AND remote_epoch=$13 AND claim_until=$14 AND started_at=$15 AND observed_at IS NULL",
+        invocation.relation.table
+    );
+    let mut values = vec![
+        effect.into(),
+        json.clone().into(),
+        outcome.into(),
+        safe_error.clone().into(),
+        (!safe_not_submitted).into(),
+        now.into(),
+        row.id.clone().into(),
+        row.job_id.clone().into(),
+        row.submit_call.into(),
+        row.provider.clone().into(),
+        row.expected_cid.clone().into(),
+        row.route.clone().into(),
+        row.remote_epoch.into(),
+        row.claim_until.into(),
+        row.started_at.into(),
+    ];
+    if let Some((schema, oid)) = &invocation.relation.postgres_identity {
+        sql.push_str(" AND EXISTS (SELECT 1 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE c.oid::bigint=$16 AND n.nspname::text=$17 AND c.relname='pin_submit_observations' AND c.relpersistence='p')");
+        values.push((*oid).into());
+        values.push(schema.clone().into());
+    }
+    let written = db
+        .execute(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            sql,
+            values,
+        ))
         .await?;
-    let current_lifetime = captured
-        .zip(remote.as_ref())
-        .is_some_and(|(capture, remote)| {
-            capture.route == row.route
-                && capture.remote_epoch == row.remote_epoch
-                && remote.epoch >= row.remote_epoch
-        });
-    let released = crate::store::pinning::legacy_migration::release_history(
-        db,
-        &row.provider,
-        &row.expected_cid,
-    )
-    .await?
-    .iter()
-    .any(|history| history.epoch >= row.remote_epoch);
-    let matched_context = if successful {
-        match (current_job.as_ref(), remote.as_ref()) {
-            (Some(job), Some(remote)) => {
-                receipt_context_valid(
-                    db,
-                    &row,
-                    job,
-                    remote,
-                    resources.first().map(|r| r.resource.request_id.as_str()),
-                )
-                .await?
-            }
-            _ => false,
-        }
-    } else {
-        true
-    };
-    // Invalid/stale management authority denies projection, never erases the
-    // actual already-started invocation's roots/Unknown response below.
-    let managed_projection =
-        crate::store::pinning::management::actions::job_authority::projection_allowed(
-            db,
-            &claimed.model,
-        )
-        .await
-        .unwrap_or(false);
-    let can_project =
-        desired && live && current_lifetime && !released && matched_context && managed_projection;
-    let written = evidence::Entity::update_many()
-        .col_expr(evidence::Column::Effect, Expr::value(effect))
-        .col_expr(evidence::Column::Resources, Expr::value(json))
-        .col_expr(evidence::Column::Outcome, Expr::value(outcome))
-        .col_expr(evidence::Column::SafeError, Expr::value(safe_error))
-        .col_expr(
-            evidence::Column::NeedsAttention,
-            Expr::value(!safe_not_submitted && (!successful || !can_project)),
-        )
-        .col_expr(evidence::Column::ObservedAt, Expr::value(Some(now)))
-        .filter(evidence::Column::Id.eq(id))
-        .filter(evidence::Column::ObservedAt.is_null())
-        .exec(db)
-        .await?;
-    if written.rows_affected != 1 {
+    if written.rows_affected() != 1 {
         return Err(AppError::Internal(
-            "RPC invocation observation already recorded".into(),
+            "RPC invocation observation already recorded or identity changed".into(),
         ));
     }
-    if successful && !can_project {
-        wake_matching_parked(db, &claimed.model.id, now).await?;
+    let mut completed = row.clone();
+    completed.effect = effect.into();
+    completed.resources = json;
+    completed.outcome = outcome.into();
+    completed.safe_error = safe_error;
+    completed.needs_attention = !safe_not_submitted;
+    completed.observed_at = Some(now);
+    Ok(completed)
+}
+
+pub(crate) async fn project_runtime_receipt(
+    tx: &crate::store::RuntimeTransaction,
+    claimed: &ClaimedPinJob,
+    row: &evidence::Model,
+    now: DateTime<Utc>,
+    work: crate::store::pinning::management::records::DecodeWork<'_>,
+) -> AppResult<bool> {
+    project_receipt(
+        tx.db(),
+        claimed,
+        row,
+        now,
+        Some((tx.catalog(work), work)),
+        true,
+    )
+    .await
+}
+
+/// The worker retains this complete ordered frontier for the ensuing status
+/// projection. Do not reacquire a partial lease frontier after its remote lock.
+pub(crate) async fn project_runtime_observation_receipt(
+    tx: &crate::store::RuntimeTransaction,
+    claimed: &ClaimedPinJob,
+    row: &evidence::Model,
+    now: DateTime<Utc>,
+    work: crate::store::pinning::management::records::DecodeWork<'_>,
+    _frontier: &crate::store::pinning::leases::LockedWorkerObservation<'_>,
+) -> AppResult<bool> {
+    project_receipt(
+        tx.db(),
+        claimed,
+        row,
+        now,
+        Some((tx.catalog(work), work)),
+        false,
+    )
+    .await
+}
+
+async fn project_receipt<C: ConnectionTrait>(
+    db: &C,
+    claimed: &ClaimedPinJob,
+    row: &evidence::Model,
+    now: DateTime<Utc>,
+    runtime: Option<(
+        crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
+        crate::store::pinning::management::records::DecodeWork<'_>,
+    )>,
+    lock_lifecycle: bool,
+) -> AppResult<bool> {
+    let claim = claimed
+        .model
+        .locked_until
+        .ok_or_else(|| AppError::Internal("RPC claim missing".into()))?;
+    let desired = if lock_lifecycle {
+        lock_receipt_lifecycle(db, &claimed.model, now).await?
+    } else if claimed.model.operation == "submit"
+        && jobs::check_target_job_generation(db, &claimed.model).await?
+    {
+        // The complete frontier already holds every desired lease and target.
+        // Read the original TTL without acquiring a new lock after the remote.
+        match claimed.model.lease_id.as_ref() {
+            Some(id) => pin_lease::Entity::find_by_id(id.clone())
+                .one(db)
+                .await?
+                .is_some_and(|lease| lease.expires_at > now),
+            None => false,
+        }
+    } else {
+        false
+    };
+    let live = jobs::fence_job_claim(db, &claimed.model.id, claim).await?;
+    let current_job = jobs::lock_submit_receipt(db, &claimed.model.id).await?;
+    let remote = lock_receipt_remote(db, &claimed.model.provider, &claimed.model.cid).await?;
+    let matched_context = match (current_job.as_ref(), remote.as_ref()) {
+        (Some(job), Some(remote)) => {
+            receipt_context_core(
+                db,
+                row,
+                job,
+                remote,
+                matching_request(row).as_deref(),
+                runtime,
+            )
+            .await?
+        }
+        _ => false,
+    };
+    // Current authority can deny projection, never erase the invocation fact.
+    let managed_projection = async {
+        #[cfg(test)]
+        if RPC_AUTHORITY_SQL_FAILURE.try_with(|()| ()).is_ok() {
+            db.execute_unprepared("SELECT * FROM rpc_receipt_missing_authority_relation")
+                .await?;
+        }
+        match runtime {
+        Some((catalog, work)) => {
+            crate::store::pinning::management::actions::job_authority::projection_allowed_catalog(
+                catalog,
+                &claimed.model,
+                work.budget().clone(),
+            )
+            .await
+        }
+        None => {
+            crate::store::pinning::management::actions::job_authority::projection_allowed(
+                db,
+                &claimed.model,
+            )
+            .await
+        }
+        }
     }
+    .await?;
+    let can_project = desired && live && matched_context && managed_projection;
     Ok(can_project)
 }
 
@@ -501,21 +690,39 @@ fn matching_request(row: &evidence::Model) -> Option<String> {
         .then(|| request.clone())
 }
 
-async fn receipt_context_valid<C: ConnectionTrait>(
+async fn receipt_context_core<C: ConnectionTrait>(
     db: &C,
     row: &evidence::Model,
     job: &crate::store::entities::pin_job::Model,
     remote: &remote_pin::Model,
     request: Option<&str>,
+    runtime: Option<(
+        crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
+        crate::store::pinning::management::records::DecodeWork<'_>,
+    )>,
 ) -> AppResult<bool> {
     let pk = [("id".into(), row.id.clone())].into();
-    let operational = crate::store::pinning::legacy_migration::captured_provider(
-        db,
-        "pin_submit_observations",
-        &pk,
-        &row.provider,
-    )
-    .await?;
+    let operational = match runtime {
+        Some((catalog, work)) => crate::store::pinning::legacy_migration::resolve_with_catalog(
+            "pin_submit_observations",
+            &pk,
+            &row.provider,
+            &work,
+            catalog,
+        )
+        .await
+        .map_err(crate::store::pinning::management::admission::work_error)?
+        .map_or_else(|| row.provider.clone(), |binding| binding.operational_key),
+        None => {
+            crate::store::pinning::legacy_migration::captured_provider(
+                db,
+                "pin_submit_observations",
+                &pk,
+                &row.provider,
+            )
+            .await?
+        }
+    };
     if job.id != row.job_id
         || job.operation != "submit"
         || job.provider != operational
@@ -564,22 +771,39 @@ async fn receipt_context_valid<C: ConnectionTrait>(
         crate::store::entities::pin_provider_route::Entity::find_by_id(operational.clone())
             .one(db)
             .await?;
-    if !registered
-        .is_some_and(|registered| registered_invocation_matches(&row.route, &registered.snapshot))
-        || super::get(db, &row.provider, &row.expected_cid)
-            .await?
-            .is_none_or(|ledger| ledger.route.as_deref() != Some(row.route.as_str()))
+    if !registered.is_some_and(|registered| {
+        !registered.retired && registered_invocation_matches(&row.route, &registered.snapshot)
+    }) || match runtime {
+        Some((catalog, work)) => {
+            super::get_catalog(catalog, &row.provider, &row.expected_cid, work).await?
+        }
+        None => super::get(db, &row.provider, &row.expected_cid).await?,
+    }
+    .is_none_or(|ledger| ledger.route.as_deref() != Some(row.route.as_str()))
     {
         return Ok(false);
     }
-    Ok(!crate::store::pinning::legacy_migration::release_history(
-        db,
-        &operational,
-        &row.expected_cid,
-    )
-    .await?
-    .iter()
-    .any(|history| history.epoch >= row.remote_epoch))
+    let releases = match runtime {
+        Some((catalog, work)) => crate::store::pinning::legacy_migration::release_history_catalog(
+            catalog,
+            &operational,
+            &row.expected_cid,
+            work,
+        )
+        .await
+        .map_err(crate::store::pinning::management::admission::work_error)?,
+        None => {
+            crate::store::pinning::legacy_migration::release_history(
+                db,
+                &operational,
+                &row.expected_cid,
+            )
+            .await?
+        }
+    };
+    Ok(!releases
+        .iter()
+        .any(|history| history.epoch >= row.remote_epoch))
 }
 
 /// Both receipt-arrival and parking call this inside their existing transaction.
@@ -589,9 +813,47 @@ pub(crate) async fn wake_matching_parked<C: ConnectionTrait>(
     id: &str,
     now: DateTime<Utc>,
 ) -> AppResult<bool> {
+    wake_parked_core(db, id, now, None).await
+}
+
+pub(crate) async fn wake_runtime_parked(
+    tx: &crate::store::RuntimeTransaction,
+    id: &str,
+    now: DateTime<Utc>,
+    work: crate::store::pinning::management::records::DecodeWork<'_>,
+) -> AppResult<bool> {
+    wake_parked_core(tx.db(), id, now, Some((tx.catalog(work), work))).await
+}
+
+async fn wake_parked_core<C: ConnectionTrait>(
+    db: &C,
+    id: &str,
+    now: DateTime<Utc>,
+    runtime: Option<(
+        crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
+        crate::store::pinning::management::records::DecodeWork<'_>,
+    )>,
+) -> AppResult<bool> {
+    // Unlocked lookup discovers the lifecycle frontier, never authorization.
+    let Some(snapshot) = pin_job::Entity::find_by_id(id.to_owned()).one(db).await? else {
+        return Ok(false);
+    };
+    // The generic park caller already owns the job lock. Only the fresh runtime
+    // wake takes lifecycle writer locks here, in lease → target → job order.
+    if runtime.is_some() && !lock_receipt_lifecycle(db, &snapshot, now).await? {
+        return Ok(false);
+    }
     let Some(job) = jobs::lock_submit_receipt(db, id).await? else {
         return Ok(false);
     };
+    if job.lease_id != snapshot.lease_id
+        || job.target_id != snapshot.target_id
+        || job.expected_generation != snapshot.expected_generation
+        || job.provider != snapshot.provider
+        || job.cid != snapshot.cid
+    {
+        return Ok(false);
+    }
     let Some(remote) = lock_receipt_remote(db, &job.provider, &job.cid).await? else {
         return Ok(false);
     };
@@ -608,11 +870,73 @@ pub(crate) async fn wake_matching_parked<C: ConnectionTrait>(
         || jobs::submission_history(db, id)
             .await?
             .is_none_or(|history| history.state != "needs_attention")
-        || !receipt_context_valid(db, &row, &job, &remote, Some(&request)).await?
+        || !receipt_context_core(db, &row, &job, &remote, Some(&request), runtime).await?
     {
         return Ok(false);
     }
+    let authority = match runtime {
+        Some((catalog, work)) => {
+            crate::store::pinning::management::actions::job_authority::projection_allowed_catalog(
+                catalog,
+                &job,
+                work.budget().clone(),
+            )
+            .await?
+        }
+        None => {
+            crate::store::pinning::management::actions::job_authority::projection_allowed(db, &job)
+                .await?
+        }
+    };
+    if !authority {
+        return Ok(false);
+    }
     jobs::wake_rpc_receipt(db, &job, row.submit_call, now).await
+}
+
+/// Primary-key keyset paging bounds the rows examined, not merely the number
+/// of matches returned. Cursor wrap revisits transiently unavailable receipts;
+/// no restart depends on an in-memory notification or a persisted cursor.
+pub(crate) async fn parked_receipt_candidates<C: ConnectionTrait>(
+    db: &C,
+    after: &str,
+    limit: u64,
+) -> AppResult<(Option<String>, Vec<pin_job::Model>)> {
+    let relation = fact_relation(db).await?;
+    let jobs_table = if db.get_database_backend() == sea_orm::DatabaseBackend::Sqlite {
+        "\"main\".\"pin_jobs\""
+    } else {
+        "\"pin_jobs\""
+    };
+    let rows = db.query_all(Statement::from_sql_and_values(
+        db.get_database_backend(),
+        format!("SELECT id, job_id, outcome, observed_at, needs_attention FROM {} WHERE id > $1 ORDER BY id LIMIT $2", relation.table),
+        [after.into(), i64::try_from(limit).unwrap_or(i64::MAX).into()],
+    )).await?;
+    let mut cursor = None;
+    let mut candidates = Vec::new();
+    for row in rows {
+        cursor = Some(row.try_get::<String>("", "id")?);
+        if !row.try_get::<bool>("", "needs_attention")?
+            || row
+                .try_get::<Option<DateTime<Utc>>>("", "observed_at")?
+                .is_none()
+            || !matches!(
+                row.try_get::<String>("", "outcome")?.as_str(),
+                "matched" | "accepted"
+            )
+        {
+            continue;
+        }
+        if let Some(job) = db.query_one(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            format!("SELECT * FROM {jobs_table} WHERE id=$1 AND operation='submit' AND state='running' AND locked_until IS NULL AND submit_phase='recovering' AND last_error=$2"),
+            [row.try_get::<String>("", "job_id")?.into(), jobs::RPC_RECOVERY_PARK_REASON.into()],
+        )).await? {
+            candidates.push(pin_job::Model::from_query_result(&job, "")?);
+        }
+    }
+    Ok((cursor, candidates))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -659,9 +983,34 @@ fn admission_table<E: EntityTrait + Default>(kind: &'static str, filter: &str) -
 
 impl AdmissionSnapshot {
     async fn read<C: ConnectionTrait>(db: &C, provider: &str) -> AppResult<Self> {
-        let mut keys =
-            crate::store::pinning::legacy_migration::admission_historical_keys(db, provider, &())
-                .await?;
+        Self::read_with_catalog(
+            provider,
+            crate::store::pinning::legacy_migration::ReceiptCatalog::full(db),
+            &(),
+        )
+        .await
+    }
+
+    async fn read_with_catalog<W: crate::store::pinning::legacy_migration::ReceiptWork>(
+        provider: &str,
+        catalog: crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
+        work: &W,
+    ) -> AppResult<Self> {
+        let mut keys = match catalog {
+            crate::store::pinning::legacy_migration::ReceiptCatalog::Full(_) => {
+                crate::store::pinning::legacy_migration::admission_historical_keys(
+                    &catalog, provider, work,
+                )
+                .await
+            }
+            _ => {
+                crate::store::pinning::legacy_migration::admission_historical_keys_with_catalog(
+                    provider, work, catalog,
+                )
+                .await
+            }
+        }
+        .map_err(W::into_app)?;
         keys.retain(|key| key != provider);
         keys.sort();
         keys.dedup();
@@ -734,9 +1083,9 @@ impl AdmissionSnapshot {
             ));
         }
         let mut snapshot = Self::default();
-        for row in db
+        for row in catalog
             .query_all(Statement::from_sql_and_values(
-                db.get_database_backend(),
+                catalog.get_database_backend(),
                 sql,
                 keys.into_iter()
                     .map(sea_orm::Value::from)
@@ -750,13 +1099,15 @@ impl AdmissionSnapshot {
                     if model.provider != provider {
                         let pk = [("id".into(), model.id.clone())].into();
                         let Some(binding) =
-                            crate::store::pinning::legacy_migration::resolve_legacy_binding(
-                                db,
+                            crate::store::pinning::legacy_migration::resolve_with_catalog(
                                 "pin_submit_observations",
                                 &pk,
                                 &model.provider,
+                                work,
+                                catalog,
                             )
-                            .await?
+                            .await
+                            .map_err(W::into_app)?
                         else {
                             continue;
                         };
@@ -801,13 +1152,15 @@ impl AdmissionSnapshot {
                         ]
                         .into();
                         let Some(binding) =
-                            crate::store::pinning::legacy_migration::resolve_legacy_binding(
-                                db,
+                            crate::store::pinning::legacy_migration::resolve_with_catalog(
                                 "pin_resource_history",
                                 &pk,
                                 &model.provider,
+                                work,
+                                catalog,
                             )
-                            .await?
+                            .await
+                            .map_err(W::into_app)?
                         else {
                             continue;
                         };
@@ -892,7 +1245,7 @@ impl AdmissionSnapshot {
             && self
                 .registered
                 .as_ref()
-                .is_some_and(|registered| registered.snapshot == row.route)
+                .is_some_and(|registered| !registered.retired && registered.snapshot == row.route)
             && self
                 .ledgers
                 .get(&row.expected_cid)
@@ -967,6 +1320,28 @@ pub async fn settle_matching<C: ConnectionTrait>(
     db: &C,
     job: &crate::store::entities::pin_job::Model,
 ) -> AppResult<()> {
+    settle_matching_core(db, job, None).await
+}
+
+pub(crate) async fn settle_runtime_matching(
+    tx: &crate::store::RuntimeTransaction,
+    job: &crate::store::entities::pin_job::Model,
+    work: crate::store::pinning::management::records::DecodeWork<'_>,
+) -> AppResult<()> {
+    if tx.db().get_database_backend() != sea_orm::DatabaseBackend::Sqlite {
+        return settle_matching(tx.db(), job).await;
+    }
+    settle_matching_core(tx.db(), job, Some((tx.catalog(work), work))).await
+}
+
+async fn settle_matching_core<C: ConnectionTrait>(
+    db: &C,
+    job: &crate::store::entities::pin_job::Model,
+    runtime: Option<(
+        crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
+        crate::store::pinning::management::records::DecodeWork<'_>,
+    )>,
+) -> AppResult<()> {
     if job.operation != "submit" {
         return Ok(());
     }
@@ -982,7 +1357,7 @@ pub async fn settle_matching<C: ConnectionTrait>(
     else {
         return Ok(());
     };
-    if projection_allowed(db, job, &remote).await? {
+    if projection_core(db, job, &remote, runtime).await? {
         evidence::Entity::update_many()
             .col_expr(evidence::Column::NeedsAttention, Expr::value(false))
             .filter(evidence::Column::Id.eq(row.id))
@@ -1002,6 +1377,23 @@ pub async fn admission_barrier<C: ConnectionTrait>(
 ) -> AppResult<AdmissionBarrier> {
     let now = Utc::now();
     let snapshot = AdmissionSnapshot::read(db, provider).await?;
+    admission_barrier_from_snapshot(snapshot, now)
+}
+
+pub(in crate::store::pinning) async fn admission_barrier_with_catalog(
+    provider: &str,
+    catalog: crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
+    work: crate::store::pinning::management::records::DecodeWork<'_>,
+) -> AppResult<AdmissionBarrier> {
+    let now = Utc::now();
+    let snapshot = AdmissionSnapshot::read_with_catalog(provider, catalog, &work).await?;
+    admission_barrier_from_snapshot(snapshot, now)
+}
+
+fn admission_barrier_from_snapshot(
+    snapshot: AdmissionSnapshot,
+    now: DateTime<Utc>,
+) -> AppResult<AdmissionBarrier> {
     let mut temporary = false;
     let mut temporary_cids = std::collections::BTreeSet::new();
     for row in snapshot.evidence.iter().filter(|row| row.needs_attention) {
@@ -1045,14 +1437,35 @@ pub async fn held_evidence_known<C: ConnectionTrait>(
     db: &C,
     ledger: &crate::store::entities::remote_pin_ledger::Model,
 ) -> AppResult<bool> {
+    held_evidence_core(db, ledger, None).await
+}
+
+pub(in crate::store::pinning) async fn held_evidence_known_catalog(
+    catalog: crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
+    ledger: &crate::store::entities::remote_pin_ledger::Model,
+    work: crate::store::pinning::management::records::DecodeWork<'_>,
+) -> AppResult<bool> {
+    held_evidence_core(&catalog, ledger, Some((catalog, work))).await
+}
+
+async fn held_evidence_core<C: ConnectionTrait>(
+    db: &C,
+    ledger: &crate::store::entities::remote_pin_ledger::Model,
+    runtime: Option<(
+        crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
+        crate::store::pinning::management::records::DecodeWork<'_>,
+    )>,
+) -> AppResult<bool> {
     if ledger.effect == "reserved" {
         return Ok(super::decode_route(ledger).is_some_and(|route| is_rpc(&route)));
     }
-    let rows = observations(db, &ledger.provider)
-        .await?
-        .into_iter()
-        .filter(|row| row.expected_cid == ledger.cid)
-        .collect::<Vec<_>>();
+    let rows = match runtime {
+        Some((catalog, work)) => observations_catalog(catalog, &ledger.provider, work).await?,
+        None => observations(db, &ledger.provider).await?,
+    }
+    .into_iter()
+    .filter(|row| row.expected_cid == ledger.cid)
+    .collect::<Vec<_>>();
     if ledger.effect == "absent" {
         return Ok(!rows.is_empty()
             && rows.iter().all(|row| {
@@ -1074,14 +1487,29 @@ pub async fn held_evidence_known<C: ConnectionTrait>(
         if ledger.effect == "not_created" && row.outcome != "not_submitted" {
             continue;
         }
-        if !crate::store::pinning::legacy_migration::release_history(
-            db,
-            &ledger.provider,
-            &ledger.cid,
-        )
-        .await?
-        .iter()
-        .any(|history| history.epoch >= row.remote_epoch)
+        let released = match runtime {
+            Some((catalog, work)) => {
+                crate::store::pinning::legacy_migration::release_history_catalog(
+                    catalog,
+                    &ledger.provider,
+                    &ledger.cid,
+                    work,
+                )
+                .await
+                .map_err(crate::store::pinning::management::admission::work_error)?
+            }
+            None => {
+                crate::store::pinning::legacy_migration::release_history(
+                    db,
+                    &ledger.provider,
+                    &ledger.cid,
+                )
+                .await?
+            }
+        };
+        if !released
+            .iter()
+            .any(|history| history.epoch >= row.remote_epoch)
         {
             return Ok(true);
         }
@@ -1109,22 +1537,75 @@ pub async fn matching_pin_held<C: ConnectionTrait>(
     Ok(false)
 }
 
+pub(in crate::store::pinning) async fn matching_pin_held_catalog(
+    catalog: crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
+    provider: &str,
+    cid: &str,
+    work: crate::store::pinning::management::records::DecodeWork<'_>,
+) -> AppResult<bool> {
+    let rows = observations_catalog(catalog, provider, work).await?;
+    for row in rows.into_iter().filter(|row| {
+        row.expected_cid == cid && matches!(row.outcome.as_str(), "matched" | "accepted")
+    }) {
+        if !crate::store::pinning::legacy_migration::release_history_catalog(
+            catalog, provider, cid, work,
+        )
+        .await
+        .map_err(crate::store::pinning::management::admission::work_error)?
+        .iter()
+        .any(|history| history.epoch >= row.remote_epoch)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Last pre-dispatch fence: a fresh claim alone cannot authorize an archived
 /// resource lifetime or today's different endpoint/account/strategy.
 pub async fn dispatch_allowed<C: ConnectionTrait>(db: &C, id: &str) -> AppResult<bool> {
+    let session = crate::store::pinning::management::records::SharedDecodeBudget::default();
+    dispatch_allowed_catalog(
+        crate::store::pinning::legacy_migration::ReceiptCatalog::full(db),
+        id,
+        crate::store::pinning::management::records::DecodeWork::shared(&session),
+    )
+    .await
+}
+
+async fn dispatch_allowed_catalog(
+    catalog: crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
+    id: &str,
+    work: crate::store::pinning::management::records::DecodeWork<'_>,
+) -> AppResult<bool> {
+    let db = &catalog;
     let Some(row) = evidence::Entity::find_by_id(id.to_owned()).one(db).await? else {
         return Ok(false);
     };
     let pk = [("id".into(), row.id.clone())].into();
-    if crate::store::pinning::legacy_migration::resolve_legacy_binding(
-        db,
-        "pin_submit_observations",
-        &pk,
-        &row.provider,
-    )
-    .await?
-    .is_some()
-    {
+    let migrated = if matches!(
+        catalog,
+        crate::store::pinning::legacy_migration::ReceiptCatalog::Full(_)
+    ) {
+        crate::store::pinning::legacy_migration::resolve_legacy_binding(
+            db,
+            "pin_submit_observations",
+            &pk,
+            &row.provider,
+        )
+        .await?
+    } else {
+        crate::store::pinning::legacy_migration::resolve_with_catalog(
+            "pin_submit_observations",
+            &pk,
+            &row.provider,
+            &work,
+            catalog,
+        )
+        .await
+        .map_err(crate::store::pinning::management::admission::work_error)?
+    };
+    if migrated.is_some() {
         return Ok(false);
     }
     if row.outcome != "in_flight" || row.observed_at.is_some() {
@@ -1135,7 +1616,18 @@ pub async fn dispatch_allowed<C: ConnectionTrait>(db: &C, id: &str) -> AppResult
             "retirement attribution needs attention; dispatch denied".into(),
         )
     })?;
-    if super::super::management::admission::registration_closed(db, &original).await? {
+    let closed = match catalog {
+        crate::store::pinning::legacy_migration::ReceiptCatalog::Full(_) => {
+            super::super::management::admission::registration_closed(db, &original).await?
+        }
+        _ => {
+            super::super::management::admission::registration_closed_catalog(
+                catalog, &original, work,
+            )
+            .await?
+        }
+    };
+    if closed {
         return Ok(false);
     }
     let Some(captured) = pin_invocation_route::Entity::find_by_id(row.job_id.clone())
@@ -1182,6 +1674,21 @@ pub async fn dispatch_allowed<C: ConnectionTrait>(db: &C, id: &str) -> AppResult
         .is_none())
 }
 
+pub(crate) async fn dispatch_allowed_store(
+    store: &crate::store::Store,
+    id: &str,
+) -> AppResult<bool> {
+    if store.db().get_database_backend() != sea_orm::DatabaseBackend::Sqlite {
+        return dispatch_allowed(store.db(), id).await;
+    }
+    let session = crate::store::pinning::management::records::SharedDecodeBudget::default();
+    let work = crate::store::pinning::management::records::DecodeWork::shared(&session);
+    let tx = store.begin_runtime(work).await?;
+    let result = dispatch_allowed_catalog(tx.catalog(work), id, work).await;
+    tx.rollback().await?;
+    result
+}
+
 fn registered_invocation_matches(original: &str, current: &str) -> bool {
     if original == current {
         return true;
@@ -1205,14 +1712,45 @@ pub async fn projection_allowed<C: ConnectionTrait>(
     job: &crate::store::entities::pin_job::Model,
     remote: &remote_pin::Model,
 ) -> AppResult<bool> {
+    projection_core(db, job, remote, None).await
+}
+
+pub(in crate::store::pinning) async fn projection_allowed_catalog(
+    catalog: crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
+    job: &crate::store::entities::pin_job::Model,
+    remote: &remote_pin::Model,
+    work: crate::store::pinning::management::records::DecodeWork<'_>,
+) -> AppResult<bool> {
+    if matches!(
+        catalog,
+        crate::store::pinning::legacy_migration::ReceiptCatalog::Full(_)
+    ) {
+        return projection_allowed(&catalog, job, remote).await;
+    }
+    projection_core(&catalog, job, remote, Some((catalog, work))).await
+}
+
+async fn projection_core<C: ConnectionTrait>(
+    db: &C,
+    job: &crate::store::entities::pin_job::Model,
+    remote: &remote_pin::Model,
+    runtime: Option<(
+        crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
+        crate::store::pinning::management::records::DecodeWork<'_>,
+    )>,
+) -> AppResult<bool> {
     let Some(captured) = pin_invocation_route::Entity::find_by_id(job.id.clone())
         .one(db)
         .await?
     else {
-        return Ok(!super::get(db, &job.provider, &job.cid)
-            .await?
-            .and_then(|row| super::decode_route(&row))
-            .is_some_and(|route| is_rpc(&route)));
+        return Ok(!match runtime {
+            Some((catalog, work)) => {
+                super::get_catalog(catalog, &job.provider, &job.cid, work).await?
+            }
+            None => super::get(db, &job.provider, &job.cid).await?,
+        }
+        .and_then(|row| super::decode_route(&row))
+        .is_some_and(|route| is_rpc(&route)));
     };
     let route: ProviderRouteSnapshot = serde_json::from_str(&captured.route)
         .map_err(|_| AppError::Internal("invalid historical projection route".into()))?;
@@ -1225,15 +1763,30 @@ pub async fn projection_allowed<C: ConnectionTrait>(
     {
         return Ok(false);
     }
-    let same_route = super::get(db, &job.provider, &job.cid)
-        .await?
-        .and_then(|row| super::decode_route(&row))
-        .is_some_and(|current| current == route);
+    let same_route = match runtime {
+        Some((catalog, work)) => super::get_catalog(catalog, &job.provider, &job.cid, work).await?,
+        None => super::get(db, &job.provider, &job.cid).await?,
+    }
+    .and_then(|row| super::decode_route(&row))
+    .is_some_and(|current| current == route);
     if !same_route {
         return Ok(false);
     }
-    if crate::store::pinning::legacy_migration::release_history(db, &job.provider, &job.cid)
-        .await?
+    let releases = match runtime {
+        Some((catalog, work)) => crate::store::pinning::legacy_migration::release_history_catalog(
+            catalog,
+            &job.provider,
+            &job.cid,
+            work,
+        )
+        .await
+        .map_err(crate::store::pinning::management::admission::work_error)?,
+        None => {
+            crate::store::pinning::legacy_migration::release_history(db, &job.provider, &job.cid)
+                .await?
+        }
+    };
+    if releases
         .iter()
         .any(|history| history.epoch >= captured.remote_epoch)
     {
@@ -1246,7 +1799,7 @@ pub async fn projection_allowed<C: ConnectionTrait>(
         let Some(request) = matching_request(&row) else {
             return Ok(false);
         };
-        return receipt_context_valid(db, &row, job, remote, Some(&request)).await;
+        return receipt_context_core(db, &row, job, remote, Some(&request), runtime).await;
     }
     Ok(true)
 }
@@ -1278,6 +1831,50 @@ pub async fn observations<C: ConnectionTrait>(
             &row.provider,
         )
         .await?;
+        if row.provider == provider || mapped.is_some_and(|m| m.operational_key == provider) {
+            result.push(row);
+        }
+    }
+    Ok(result)
+}
+
+async fn observations_catalog(
+    catalog: crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
+    provider: &str,
+    work: crate::store::pinning::management::records::DecodeWork<'_>,
+) -> AppResult<Vec<evidence::Model>> {
+    if matches!(
+        catalog,
+        crate::store::pinning::legacy_migration::ReceiptCatalog::Full(_)
+    ) {
+        return observations(&catalog, provider).await;
+    }
+    let keys = crate::store::pinning::legacy_migration::historical_keys_with_catalog(
+        "pin_submit_observations",
+        provider,
+        None,
+        work,
+        catalog,
+    )
+    .await
+    .map_err(crate::store::pinning::management::admission::work_error)?;
+    let rows = evidence::Entity::find()
+        .filter(evidence::Column::Provider.is_in(keys))
+        .order_by_asc(evidence::Column::StartedAt)
+        .all(&catalog)
+        .await?;
+    let mut result = Vec::new();
+    for row in rows {
+        let pk = [("id".into(), row.id.clone())].into();
+        let mapped = crate::store::pinning::legacy_migration::resolve_with_catalog(
+            "pin_submit_observations",
+            &pk,
+            &row.provider,
+            &work,
+            catalog,
+        )
+        .await
+        .map_err(crate::store::pinning::management::admission::work_error)?;
         if row.provider == provider || mapped.is_some_and(|m| m.operational_key == provider) {
             result.push(row);
         }

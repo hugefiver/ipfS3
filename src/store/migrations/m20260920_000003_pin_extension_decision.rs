@@ -4,8 +4,8 @@ use sea_orm_migration::prelude::*;
 pub struct Migration;
 
 #[async_trait::async_trait]
-impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+impl super::bridge::SharedMigration for Migration {
+    async fn up_body(&self, manager: &super::bridge::Manager<'_>) -> Result<(), DbErr> {
         // No backfill: historical raw tags are not executable evidence. A foreign
         // key to the *internal* version row survives ambiguous public null IDs.
         manager.get_connection().execute_unprepared(
@@ -26,7 +26,13 @@ impl MigrationTrait for Migration {
         ).await?;
         Ok(())
     }
-
+}
+#[async_trait::async_trait]
+impl MigrationTrait for Migration {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        super::bridge::SharedMigration::up_body(self, &super::bridge::Manager::native(manager))
+            .await
+    }
     async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
         Err(DbErr::Custom(
             "extension decisions cannot be downgraded without losing historical intent evidence"

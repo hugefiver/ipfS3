@@ -156,7 +156,7 @@ pub(crate) async fn validate_table<C: ConnectionTrait>(db: &C, table: &NativeTab
         let shape = db
             .query_one(Statement::from_sql_and_values(
                 DatabaseBackend::Sqlite,
-                "SELECT EXISTS(SELECT 1 FROM sqlite_temp_schema WHERE name IN ('seaql_migrations',$1) AND type IN ('table','view')) AS shadow,EXISTS(SELECT 1 FROM pragma_table_list WHERE schema='main' AND name=$1 AND type='table') AS main_table",
+                "SELECT EXISTS(SELECT 1 FROM sqlite_temp_schema WHERE name IN ('seaql_migrations',$1) AND type IN ('table','view')) AS shadow,EXISTS(SELECT 1 FROM pragma_table_list($1) WHERE schema='main' AND name=$1 AND type='table') AS main_table",
                 [table.table.clone().into()],
             ))
             .await
@@ -188,7 +188,7 @@ async fn sqlite<C: ConnectionTrait>(db: &C, table: &NativeTable) -> Result<()> {
         let shape = db
             .query_one(Statement::from_sql_and_values(
                 DatabaseBackend::Sqlite,
-                "SELECT type FROM pragma_table_list WHERE schema='main' AND name=$1",
+                "SELECT type FROM pragma_table_list($1) WHERE schema='main' AND name=$1",
                 [table.table.clone().into()],
             ))
             .await

@@ -934,7 +934,42 @@ pub async fn remote_work_snapshot<C: ConnectionTrait>(
     cid: &str,
 ) -> AppResult<Option<RemoteWorkSnapshot>> {
     let operational = super::legacy_migration::resource_key(db, provider, cid).await?;
-    let provider = operational.as_str();
+    remote_work_snapshot_at_key(db, &operational, cid).await
+}
+
+pub(crate) async fn remote_work_snapshot_catalog(
+    catalog: super::legacy_migration::ReceiptCatalog<'_>,
+    provider: &str,
+    cid: &str,
+    work: super::management::records::DecodeWork<'_>,
+) -> AppResult<Option<RemoteWorkSnapshot>> {
+    if matches!(catalog, super::legacy_migration::ReceiptCatalog::Full(_)) {
+        return remote_work_snapshot(&catalog, provider, cid).await;
+    }
+    let candidates = catalog
+        .load(
+            &super::legacy_migration::resource_receipt_selectors(provider, cid),
+            work,
+        )
+        .await
+        .map_err(work_error)?;
+    let key = super::legacy_migration::resource_key_from_loaded(
+        provider,
+        cid,
+        &candidates,
+        work,
+        catalog,
+    )
+    .await
+    .map_err(work_error)?;
+    remote_work_snapshot_at_key(&catalog, &key, cid).await
+}
+
+pub(in crate::store::pinning) async fn remote_work_snapshot_at_key<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+    cid: &str,
+) -> AppResult<Option<RemoteWorkSnapshot>> {
     let Some(remote) = remote_pin::Entity::find_by_id((provider.to_owned(), cid.to_owned()))
         .one(db)
         .await?
@@ -1020,7 +1055,31 @@ async fn project_target_from_remote_inner<C: ConnectionTrait>(
     target_id: &str,
     expected_remote_epoch: Option<i64>,
     now: DateTimeUtc,
+    maintenance: Option<&mut PublicationLease<'_>>,
+) -> AppResult<Option<TargetProjection>> {
+    project_target_from_remote_core(db, target_id, expected_remote_epoch, now, maintenance, None)
+        .await
+}
+
+pub(in crate::store::pinning) async fn project_runtime_publication_target(
+    tx: &crate::store::RuntimeTransaction,
+    target_id: &str,
+    now: DateTimeUtc,
+    maintenance: Option<&mut PublicationLease<'_>>,
+    work: DecodeWork<'_>,
+) -> AppResult<TargetProjection> {
+    project_target_from_remote_core(tx.db(), target_id, None, now, maintenance, Some((tx, work)))
+        .await?
+        .ok_or_else(|| invalid("unscoped target projection unexpectedly failed an epoch guard"))
+}
+
+async fn project_target_from_remote_core<C: ConnectionTrait>(
+    db: &C,
+    target_id: &str,
+    expected_remote_epoch: Option<i64>,
+    now: DateTimeUtc,
     mut maintenance: Option<&mut PublicationLease<'_>>,
+    runtime: Option<(&crate::store::RuntimeTransaction, DecodeWork<'_>)>,
 ) -> AppResult<Option<TargetProjection>> {
     super::management::admission::lock_sqlite_writer_in_caller_transaction(db).await?;
     let Some(target) = pin_lease_target::Entity::find_by_id(target_id.to_owned())
@@ -1064,6 +1123,22 @@ async fn project_target_from_remote_inner<C: ConnectionTrait>(
     if let Some(lease) = maintenance {
         lease.checkpoint(db).await?;
     }
+    if let Some((tx, work)) = runtime {
+        return project_prelocked_target_core(
+            db,
+            PrelockedProjection {
+                desired,
+                all_desired: &snapshot.desired,
+                remote: &snapshot.remote,
+            },
+            ProjectionAccess::Admission,
+            now,
+            work,
+            Some(tx),
+        )
+        .await
+        .map(Some);
+    }
     Ok(Some(
         project_prelocked_desired_target(
             db,
@@ -1089,6 +1164,7 @@ async fn project_inserted_target_from_prelocked_remote<C: ConnectionTrait>(
     provider: &str,
     cid: &str,
     now: DateTimeUtc,
+    runtime: Option<(&crate::store::RuntimeTransaction, DecodeWork<'_>)>,
 ) -> AppResult<TargetProjection> {
     let remote = remote_pin::Entity::find_by_id((provider.to_owned(), cid.to_owned()))
         .one(db)
@@ -1099,6 +1175,21 @@ async fn project_inserted_target_from_prelocked_remote<C: ConnectionTrait>(
         .iter()
         .find(|desired| desired.target.id == target_id)
         .ok_or_else(|| stale_lifecycle_error("inserted target projection"))?;
+    if let Some((tx, work)) = runtime {
+        return project_prelocked_target_core(
+            db,
+            PrelockedProjection {
+                desired: inserted,
+                all_desired: &desired,
+                remote: &remote,
+            },
+            ProjectionAccess::Admission,
+            now,
+            work,
+            Some(tx),
+        )
+        .await;
+    }
     project_prelocked_desired_target(
         db,
         inserted,
@@ -1370,7 +1461,30 @@ pub(crate) async fn wake_quota_waiting_targets<C: ConnectionTrait>(
     limits: &ProviderLimits,
     now: DateTimeUtc,
 ) -> AppResult<Vec<String>> {
+    wake_quota_waiting_targets_impl(db, provider, limits, now, None).await
+}
+
+pub(crate) async fn wake_runtime_quota_waiting_targets(
+    tx: &crate::store::RuntimeTransaction,
+    provider: &str,
+    limits: &ProviderLimits,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+) -> AppResult<Vec<String>> {
+    wake_quota_waiting_targets_impl(tx.db(), provider, limits, now, Some((tx, work))).await
+}
+
+async fn wake_quota_waiting_targets_impl<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+    limits: &ProviderLimits,
+    now: DateTimeUtc,
+    runtime: Option<(&crate::store::RuntimeTransaction, DecodeWork<'_>)>,
+) -> AppResult<Vec<String>> {
     super::management::admission::lock_sqlite_writer_in_caller_transaction(db).await?;
+    if let Some((tx, work)) = runtime {
+        tx.check_schema(work).await?;
+    }
     let waiting = pin_lease_target::Entity::find()
         .filter(pin_lease_target::Column::Provider.eq(provider))
         .filter(pin_lease_target::Column::State.eq(TARGET_QUOTA_WAITING))
@@ -1449,15 +1563,31 @@ pub(crate) async fn wake_quota_waiting_targets<C: ConnectionTrait>(
     let limit_map = ProviderLimitMap::from([(provider.to_owned(), limits.clone())]);
     let mut woken = Vec::new();
     for (target, _) in candidates {
-        let reservation = quota::reserve_unique_for_waiter(
-            db,
-            provider,
-            &target.cid,
-            target.logical_size,
-            &limit_map,
-            now,
-        )
-        .await?;
+        let reservation = match runtime {
+            Some((tx, work)) => {
+                quota::reserve_runtime_waiter(
+                    tx,
+                    provider,
+                    &target.cid,
+                    target.logical_size,
+                    &limit_map,
+                    now,
+                    work,
+                )
+                .await?
+            }
+            None => {
+                quota::reserve_unique_for_waiter(
+                    db,
+                    provider,
+                    &target.cid,
+                    target.logical_size,
+                    &limit_map,
+                    now,
+                )
+                .await?
+            }
+        };
         match reservation {
             ReservationOutcome::QuotaWaiting { .. } => break,
             ReservationOutcome::QuotaBlocked => {
@@ -1474,6 +1604,7 @@ pub(crate) async fn wake_quota_waiting_targets<C: ConnectionTrait>(
                     provider,
                     &target.cid,
                     now,
+                    runtime,
                 )
                 .await?;
                 woken.push(target.id);
@@ -1681,10 +1812,20 @@ async fn apply_remote_status_inner<C: ConnectionTrait>(
         if snapshot.remote.status == REMOTE_FAILED {
             pause_duplicate_projection(update.cid, true).await;
         }
-        if let Some(job) = observation_job
-            && !super::ledger::submission::projection_allowed(db, job, &snapshot.remote).await?
-        {
-            return Ok(RemoteStatusApplyResult::StaleRequest);
+        if let Some(job) = observation_job {
+            let allowed = match authority {
+                Some(reader) => {
+                    reader
+                        .submission_projection_allowed(&snapshot.remote)
+                        .await?
+                }
+                None => {
+                    super::ledger::submission::projection_allowed(db, job, &snapshot.remote).await?
+                }
+            };
+            if !allowed {
+                return Ok(RemoteStatusApplyResult::StaleRequest);
+            }
         }
         if let Some(job) = observation_job {
             let allowed = match authority {
@@ -1768,15 +1909,31 @@ async fn apply_remote_status_inner<C: ConnectionTrait>(
         // The snapshot was locked in lease → target → remote order. Projection deliberately uses
         // only those rows, so it never reacquires a target after the remote status CAS.
         for desired in &snapshot.desired {
-            project_prelocked_desired_target(
-                db,
-                desired,
-                &snapshot.desired,
-                &remote,
-                ProjectionAccess::Observation { historical_poll },
-                update.now,
-            )
-            .await?;
+            if let Some((owner, work)) = authority.and_then(|reader| reader.runtime_context()) {
+                project_prelocked_target_core(
+                    owner.db(),
+                    PrelockedProjection {
+                        desired,
+                        all_desired: &snapshot.desired,
+                        remote: &remote,
+                    },
+                    ProjectionAccess::Observation { historical_poll },
+                    update.now,
+                    work,
+                    Some(owner),
+                )
+                .await?;
+            } else {
+                project_prelocked_desired_target(
+                    db,
+                    desired,
+                    &snapshot.desired,
+                    &remote,
+                    ProjectionAccess::Observation { historical_poll },
+                    update.now,
+                )
+                .await?;
+            }
         }
 
         let projected_target_state = target_state_from_remote(&remote.status)
@@ -2142,6 +2299,31 @@ pub async fn complete_remote_delete<C: ConnectionTrait>(
     expected_remote_epoch: i64,
     now: DateTimeUtc,
 ) -> AppResult<RemoteDeleteCompletion> {
+    complete_remote_delete_core(db, provider, cid, expected_remote_epoch, now, None).await
+}
+
+pub(crate) async fn complete_runtime_remote_delete(
+    tx: &crate::store::RuntimeTransaction,
+    provider: &str,
+    cid: &str,
+    epoch: i64,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+) -> AppResult<RemoteDeleteCompletion> {
+    if tx.get_database_backend() != DatabaseBackend::Sqlite {
+        return complete_remote_delete(tx.db(), provider, cid, epoch, now).await;
+    }
+    complete_remote_delete_core(tx.db(), provider, cid, epoch, now, Some((tx, work))).await
+}
+
+async fn complete_remote_delete_core<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+    cid: &str,
+    expected_remote_epoch: i64,
+    now: DateTimeUtc,
+    runtime: Option<(&crate::store::RuntimeTransaction, DecodeWork<'_>)>,
+) -> AppResult<RemoteDeleteCompletion> {
     super::management::admission::lock_sqlite_writer_in_caller_transaction(db).await?;
     let Some(remote) = remote_pin::Entity::find_by_id((provider.to_owned(), cid.to_owned()))
         .one(db)
@@ -2160,12 +2342,12 @@ pub async fn complete_remote_delete<C: ConnectionTrait>(
             jobs::resolve_no_request_submit_ambiguity(db, provider, cid, now).await?
             && let Some(completion) = defer_delete_for_submit_ambiguity(
                 db,
-                provider,
-                cid,
+                (provider, cid),
                 expected_remote_epoch,
                 deleted_request_id,
                 next_check_at,
                 now,
+                runtime,
             )
             .await?
         {
@@ -2184,12 +2366,12 @@ pub async fn complete_remote_delete<C: ConnectionTrait>(
                 jobs::resolve_no_request_submit_ambiguity(db, provider, cid, now).await?
             && let Some(completion) = defer_delete_for_submit_ambiguity(
                 db,
-                provider,
-                cid,
+                (provider, cid),
                 expected_remote_epoch,
                 deleted_request_id,
                 next_check_at,
                 now,
+                runtime,
             )
             .await?
         {
@@ -2205,16 +2387,32 @@ pub async fn complete_remote_delete<C: ConnectionTrait>(
             && guarded_remote.epoch == expected_remote_epoch
             && guarded_remote.request_id.as_deref() == deleted_request_id
         {
-            match quota::confirmed_release_for_request(
-                db,
-                provider,
-                cid,
-                expected_remote_epoch,
-                deleted_request_id,
-                now,
-            )
-            .await?
-            {
+            let outcome = match runtime {
+                Some((tx, work)) => {
+                    quota::confirmed_runtime_release_for_request(
+                        tx,
+                        provider,
+                        cid,
+                        expected_remote_epoch,
+                        deleted_request_id,
+                        now,
+                        work,
+                    )
+                    .await?
+                }
+                None => {
+                    quota::confirmed_release_for_request(
+                        db,
+                        provider,
+                        cid,
+                        expected_remote_epoch,
+                        deleted_request_id,
+                        now,
+                    )
+                    .await?
+                }
+            };
+            match outcome {
                 ConfirmedReleaseOutcome::Released | ConfirmedReleaseOutcome::AlreadyAbsent => {
                     mark_terminal_targets_released(db, provider, cid).await?;
                     return Ok(RemoteDeleteCompletion::Released);
@@ -2231,7 +2429,8 @@ pub async fn complete_remote_delete<C: ConnectionTrait>(
             .one(db)
             .await?
             .ok_or_else(|| invalid("remote disappeared during delete completion"))?;
-        let reconcile_job_id = ensure_reconcile(db, provider, cid, remote.epoch, now).await?;
+        let reconcile_job_id =
+            delete_reconcile(db, provider, cid, remote.epoch, now, runtime).await?;
         return Ok(RemoteDeleteCompletion::ReconcileRequired { reconcile_job_id });
     }
 
@@ -2255,7 +2454,7 @@ pub async fn complete_remote_delete<C: ConnectionTrait>(
         };
         if snapshot.desired.is_empty() {
             let reconcile_job_id =
-                ensure_reconcile(db, provider, cid, snapshot.remote.epoch, now).await?;
+                delete_reconcile(db, provider, cid, snapshot.remote.epoch, now, runtime).await?;
             return Ok(RemoteDeleteCompletion::ReconcileRequired { reconcile_job_id });
         }
 
@@ -2319,7 +2518,10 @@ pub async fn complete_remote_delete<C: ConnectionTrait>(
             unreachable!("submit constructor is target scoped")
         };
         let submit_job_id = job.id.clone();
-        jobs::ensure_or_reactivate_submit_job(db, job, now).await?;
+        match runtime {
+            Some((tx, work)) => jobs::ensure_runtime_submit(tx, job, now, work).await?,
+            None => jobs::ensure_or_reactivate_submit_job(db, job, now).await?,
+        };
         return Ok(RemoteDeleteCompletion::Compensated { submit_job_id });
     }
     Err(AppError::Database(
@@ -2327,14 +2529,30 @@ pub async fn complete_remote_delete<C: ConnectionTrait>(
     ))
 }
 
-async fn defer_delete_for_submit_ambiguity<C: ConnectionTrait>(
+async fn delete_reconcile<C: ConnectionTrait>(
     db: &C,
     provider: &str,
     cid: &str,
+    epoch: i64,
+    at: DateTimeUtc,
+    runtime: Option<(&crate::store::RuntimeTransaction, DecodeWork<'_>)>,
+) -> AppResult<String> {
+    match runtime {
+        Some((tx, work)) => {
+            ensure_reconcile_core(db, provider, cid, epoch, at, work, Some(tx)).await
+        }
+        None => ensure_reconcile(db, provider, cid, epoch, at).await,
+    }
+}
+
+async fn defer_delete_for_submit_ambiguity<C: ConnectionTrait>(
+    db: &C,
+    (provider, cid): (&str, &str),
     expected_remote_epoch: i64,
     deleted_request_id: Option<&str>,
     next_check_at: DateTimeUtc,
     now: DateTimeUtc,
+    runtime: Option<(&crate::store::RuntimeTransaction, DecodeWork<'_>)>,
 ) -> AppResult<Option<RemoteDeleteCompletion>> {
     if !desired_targets(db, provider, cid).await?.is_empty() {
         return Ok(None);
@@ -2345,7 +2563,8 @@ async fn defer_delete_for_submit_ambiguity<C: ConnectionTrait>(
         .ok_or_else(|| invalid("remote disappeared during delete ambiguity guard"))?;
     if current.epoch != expected_remote_epoch || current.request_id.as_deref() != deleted_request_id
     {
-        let reconcile_job_id = ensure_reconcile(db, provider, cid, current.epoch, now).await?;
+        let reconcile_job_id =
+            delete_reconcile(db, provider, cid, current.epoch, now, runtime).await?;
         return Ok(Some(RemoteDeleteCompletion::ReconcileRequired {
             reconcile_job_id,
         }));
@@ -2379,14 +2598,22 @@ async fn defer_delete_for_submit_ambiguity<C: ConnectionTrait>(
             .one(db)
             .await?
             .ok_or_else(|| invalid("remote disappeared during delete ambiguity retry"))?;
-        let reconcile_job_id = ensure_reconcile(db, provider, cid, current.epoch, now).await?;
+        let reconcile_job_id =
+            delete_reconcile(db, provider, cid, current.epoch, now, runtime).await?;
         return Ok(Some(RemoteDeleteCompletion::ReconcileRequired {
             reconcile_job_id,
         }));
     }
 
-    let reconcile_job_id =
-        ensure_reconcile(db, provider, cid, next_epoch, next_check_at.max(now)).await?;
+    let reconcile_job_id = delete_reconcile(
+        db,
+        provider,
+        cid,
+        next_epoch,
+        next_check_at.max(now),
+        runtime,
+    )
+    .await?;
     Ok(Some(RemoteDeleteCompletion::ReconcileRequired {
         reconcile_job_id,
     }))
@@ -2399,6 +2626,33 @@ pub async fn complete_no_request_remote_absence<C: ConnectionTrait>(
     cid: &str,
     expected_remote_epoch: i64,
     now: DateTimeUtc,
+) -> AppResult<NoRequestRemoteCompletion> {
+    complete_no_request_remote_absence_core(db, provider, cid, expected_remote_epoch, now, None)
+        .await
+}
+
+pub(crate) async fn complete_runtime_no_request_remote_absence(
+    tx: &crate::store::RuntimeTransaction,
+    provider: &str,
+    cid: &str,
+    epoch: i64,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+) -> AppResult<NoRequestRemoteCompletion> {
+    if tx.get_database_backend() != DatabaseBackend::Sqlite {
+        return complete_no_request_remote_absence(tx.db(), provider, cid, epoch, now).await;
+    }
+    complete_no_request_remote_absence_core(tx.db(), provider, cid, epoch, now, Some((tx, work)))
+        .await
+}
+
+async fn complete_no_request_remote_absence_core<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+    cid: &str,
+    expected_remote_epoch: i64,
+    now: DateTimeUtc,
+    runtime: Option<(&crate::store::RuntimeTransaction, DecodeWork<'_>)>,
 ) -> AppResult<NoRequestRemoteCompletion> {
     if !guard_reconcile_remote_epoch(db, provider, cid, expected_remote_epoch).await?
         || !matches!(
@@ -2443,9 +2697,32 @@ pub async fn complete_no_request_remote_absence<C: ConnectionTrait>(
         return Ok(NoRequestRemoteCompletion::Wait { next_check_at });
     }
 
-    match quota::confirmed_release_for_request(db, provider, cid, expected_remote_epoch, None, now)
-        .await?
-    {
+    let outcome = match runtime {
+        Some((tx, work)) => {
+            quota::confirmed_runtime_release_for_request(
+                tx,
+                provider,
+                cid,
+                expected_remote_epoch,
+                None,
+                now,
+                work,
+            )
+            .await?
+        }
+        None => {
+            quota::confirmed_release_for_request(
+                db,
+                provider,
+                cid,
+                expected_remote_epoch,
+                None,
+                now,
+            )
+            .await?
+        }
+    };
+    match outcome {
         ConfirmedReleaseOutcome::Released | ConfirmedReleaseOutcome::AlreadyAbsent => {
             Ok(NoRequestRemoteCompletion::Released)
         }
@@ -2460,7 +2737,22 @@ pub async fn ensure_failed_remote_retry<C: ConnectionTrait>(
     cid: &str,
     now: DateTimeUtc,
 ) -> AppResult<FailedRemoteRetryDecision> {
-    ensure_failed_remote_retry_with_maintenance(db, provider, cid, now, None).await
+    ensure_failed_remote_retry_with_maintenance(db, provider, cid, now, None, None).await
+}
+
+pub(crate) async fn ensure_runtime_failed_remote_retry(
+    tx: &crate::store::RuntimeTransaction,
+    provider: &str,
+    cid: &str,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+) -> AppResult<FailedRemoteRetryDecision> {
+    if tx.db().get_database_backend() != DatabaseBackend::Sqlite {
+        return ensure_failed_remote_retry(tx.db(), provider, cid, now).await;
+    }
+    super::management::admission::lock_sqlite_writer_in_caller_transaction(tx.db()).await?;
+    ensure_failed_remote_retry_with_maintenance(tx.db(), provider, cid, now, None, Some((tx, work)))
+        .await
 }
 
 async fn ensure_failed_remote_retry_with_maintenance<C: ConnectionTrait>(
@@ -2469,6 +2761,7 @@ async fn ensure_failed_remote_retry_with_maintenance<C: ConnectionTrait>(
     cid: &str,
     _now: DateTimeUtc,
     maintenance: Option<&mut PublicationLease<'_>>,
+    runtime: Option<(&crate::store::RuntimeTransaction, DecodeWork<'_>)>,
 ) -> AppResult<FailedRemoteRetryDecision> {
     let Some(remote) = remote_pin::Entity::find_by_id((provider.to_owned(), cid.to_owned()))
         .one(db)
@@ -2489,14 +2782,25 @@ async fn ensure_failed_remote_retry_with_maintenance<C: ConnectionTrait>(
     };
     // An old request may still report failure after its route is retired or changed.
     // Record that observation, but do not schedule a fresh attempt on its behalf.
-    match quota::assert_reusable_route(db, provider, cid).await {
+    let reusable = match runtime {
+        Some((tx, work)) => {
+            quota::assert_reusable_route_catalog(tx.catalog(work), provider, cid, work).await
+        }
+        None => quota::assert_reusable_route(db, provider, cid).await,
+    };
+    match reusable {
         Ok(()) => {}
         Err(AppError::InvalidPinningRequest(_)) => {
             return Ok(FailedRemoteRetryDecision::NotNeeded);
         }
         Err(error) => return Err(error),
     }
-    let reconcile_job_id = ensure_reconcile(db, provider, cid, remote.epoch, at).await?;
+    let reconcile_job_id = match runtime {
+        Some((tx, work)) => {
+            ensure_reconcile_core(db, provider, cid, remote.epoch, at, work, Some(tx)).await?
+        }
+        None => ensure_reconcile(db, provider, cid, remote.epoch, at).await?,
+    };
     Ok(FailedRemoteRetryDecision::Scheduled {
         reconcile_job_id,
         at,
@@ -2519,6 +2823,17 @@ pub(crate) async fn reset_failed_remote_retry_on_user_touch_with_maintenance<C: 
     cid: &str,
     now: DateTimeUtc,
     maintenance: Option<&mut PublicationLease<'_>>,
+) -> AppResult<FailedRemoteRetryDecision> {
+    reset_failed_publication_retry(db, provider, cid, now, maintenance, None).await
+}
+
+pub(in crate::store::pinning) async fn reset_failed_publication_retry<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+    cid: &str,
+    now: DateTimeUtc,
+    maintenance: Option<&mut PublicationLease<'_>>,
+    runtime: Option<(&crate::store::RuntimeTransaction, DecodeWork<'_>)>,
 ) -> AppResult<FailedRemoteRetryDecision> {
     let Some(remote) = remote_pin::Entity::find_by_id((provider.to_owned(), cid.to_owned()))
         .one(db)
@@ -2543,7 +2858,7 @@ pub(crate) async fn reset_failed_remote_retry_on_user_touch_with_maintenance<C: 
         .filter(remote_pin::Column::Status.eq(REMOTE_FAILED))
         .exec(db)
         .await?;
-    ensure_failed_remote_retry_with_maintenance(db, provider, cid, now, maintenance).await
+    ensure_failed_remote_retry_with_maintenance(db, provider, cid, now, maintenance, runtime).await
 }
 
 /// Converts one due, current failed request into a fresh canonical Submit without releasing quota.
@@ -4261,6 +4576,7 @@ pub async fn evict_provider_cids<C: ConnectionTrait>(
             &target.provider,
             &target.cid,
             now,
+            None,
         )
         .await?;
     }
@@ -4413,11 +4729,11 @@ pub async fn fail_one_target<C: ConnectionTrait>(
 ) -> AppResult<Option<pin_lease_target::Model>> {
     fail_one_target_at_generation(
         db,
-        lease_id,
-        failed_target_id,
+        (lease_id, failed_target_id),
         ordered_providers,
         limits,
         now,
+        None,
         None,
     )
     .await
@@ -4436,6 +4752,63 @@ pub(crate) async fn fail_one_target_for_job<C: ConnectionTrait>(
     ordered_providers: &[String],
     limits: &ProviderLimitMap,
     now: DateTimeUtc,
+) -> AppResult<TargetJobFailoverOutcome> {
+    fail_one_target_for_job_core(db, job, ordered_providers, limits, now, None).await
+}
+
+pub(crate) async fn fail_runtime_one_target_for_job(
+    tx: &crate::store::RuntimeTransaction,
+    job: &pin_job::Model,
+    ordered_providers: &[String],
+    limits: &ProviderLimitMap,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+) -> AppResult<TargetJobFailoverOutcome> {
+    if tx.db().get_database_backend() != DatabaseBackend::Sqlite {
+        return fail_one_target_for_job(tx.db(), job, ordered_providers, limits, now).await;
+    }
+    fail_one_target_for_job_core(
+        tx.db(),
+        job,
+        ordered_providers,
+        limits,
+        now,
+        Some((tx, work)),
+    )
+    .await
+}
+
+pub(crate) async fn fail_runtime_one_target(
+    tx: &crate::store::RuntimeTransaction,
+    lease_id: &str,
+    target_id: &str,
+    ordered_providers: &[String],
+    limits: &ProviderLimitMap,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+) -> AppResult<Option<pin_lease_target::Model>> {
+    if tx.db().get_database_backend() != DatabaseBackend::Sqlite {
+        return fail_one_target(tx.db(), lease_id, target_id, ordered_providers, limits, now).await;
+    }
+    fail_one_target_at_generation(
+        tx.db(),
+        (lease_id, target_id),
+        ordered_providers,
+        limits,
+        now,
+        None,
+        Some((tx, work)),
+    )
+    .await
+}
+
+async fn fail_one_target_for_job_core<C: ConnectionTrait>(
+    db: &C,
+    job: &pin_job::Model,
+    ordered_providers: &[String],
+    limits: &ProviderLimitMap,
+    now: DateTimeUtc,
+    runtime: Option<(&crate::store::RuntimeTransaction, DecodeWork<'_>)>,
 ) -> AppResult<TargetJobFailoverOutcome> {
     super::management::admission::lock_sqlite_writer_in_caller_transaction(db).await?;
     let (Some(lease_id), Some(target_id), Some(expected_generation)) = (
@@ -4486,12 +4859,12 @@ pub(crate) async fn fail_one_target_for_job<C: ConnectionTrait>(
 
     let replacement = fail_one_target_at_generation(
         db,
-        lease_id,
-        target_id,
+        (lease_id, target_id),
         ordered_providers,
         limits,
         now,
         Some(expected_generation),
+        runtime,
     )
     .await?;
     if replacement.is_none() && !jobs::check_target_job_generation(db, job).await? {
@@ -4502,12 +4875,12 @@ pub(crate) async fn fail_one_target_for_job<C: ConnectionTrait>(
 
 async fn fail_one_target_at_generation<C: ConnectionTrait>(
     db: &C,
-    lease_id: &str,
-    failed_target_id: &str,
+    (lease_id, failed_target_id): (&str, &str),
     ordered_providers: &[String],
     limits: &ProviderLimitMap,
     now: DateTimeUtc,
     expected_generation: Option<i64>,
+    runtime: Option<(&crate::store::RuntimeTransaction, DecodeWork<'_>)>,
 ) -> AppResult<Option<pin_lease_target::Model>> {
     super::management::admission::lock_sqlite_writer_in_caller_transaction(db).await?;
     let Some(lease) = pin_lease::Entity::find_by_id(lease_id.to_owned())
@@ -4545,16 +4918,37 @@ async fn fail_one_target_at_generation<C: ConnectionTrait>(
 
     // Caller health ordering may shrink the birth set, never add a later policy
     // provider or issue a write under a reduced/changed original contract.
-    let birth = crate::store::entities::pin_lease_requirement::contract::get(db, lease_id).await?;
-    let mut allowed = BTreeSet::new();
-    if let Some(birth) = &birth {
-        let points = super::management::actions::points::candidates_for_cid(
-            db,
-            lease_id,
-            &failed.cid,
-            birth,
+    let birth = match runtime {
+        Some((_, work)) => crate::store::entities::pin_lease_requirement::contract::get_with_work(
+            db, lease_id, work,
         )
         .await
+        .map_err(super::management::admission::work_error)?,
+        None => crate::store::entities::pin_lease_requirement::contract::get(db, lease_id).await?,
+    };
+    let mut allowed = BTreeSet::new();
+    if let Some(birth) = &birth {
+        let points = match runtime {
+            Some((tx, work)) => {
+                super::management::actions::points::candidates_for_cid_catalog(
+                    tx.catalog(work),
+                    lease_id,
+                    &failed.cid,
+                    birth,
+                    work.budget().clone(),
+                )
+                .await
+            }
+            None => {
+                super::management::actions::points::candidates_for_cid(
+                    db,
+                    lease_id,
+                    &failed.cid,
+                    birth,
+                )
+                .await
+            }
+        }
         .map_err(|_| invalid("invalid exact management fallback point"))?;
         for (slot, provider, point) in &points {
             let original = point
@@ -4674,10 +5068,22 @@ async fn fail_one_target_at_generation<C: ConnectionTrait>(
 
     if let Some(existing) = existing {
         if existing.state == TARGET_PINNED {
-            let cleanup =
-                converge_one_after_replacement_inner(db, lease_id, &existing.id, now, true).await?;
+            let cleanup = converge_one_after_replacement_inner(
+                db,
+                lease_id,
+                &existing.id,
+                now,
+                true,
+                runtime,
+            )
+            .await?;
             for job in cleanup {
-                jobs::enqueue_job(db, job).await?;
+                match runtime {
+                    Some((tx, work)) => {
+                        jobs::insert_runtime_job(tx, job, Utc::now(), work).await?;
+                    }
+                    None => jobs::enqueue_job(db, job).await?,
+                };
             }
         }
         return Ok(pin_lease_target::Entity::find_by_id(existing.id)
@@ -4696,7 +5102,18 @@ async fn fail_one_target_at_generation<C: ConnectionTrait>(
                 &route.snapshot,
             )
             .map_err(|_| invalid("retirement attribution needs attention; fallback denied"))?;
-            if super::management::admission::registration_closed(db, &original).await? {
+            let closed = match runtime {
+                Some((tx, work)) => {
+                    super::management::admission::registration_closed_catalog(
+                        tx.catalog(work),
+                        &original,
+                        work,
+                    )
+                    .await?
+                }
+                None => super::management::admission::registration_closed(db, &original).await?,
+            };
+            if closed {
                 continue;
             }
         }
@@ -4708,8 +5125,23 @@ async fn fail_one_target_at_generation<C: ConnectionTrait>(
         {
             continue;
         }
-        let reservation =
-            quota::reserve_unique(db, &provider, cid, failed.logical_size, limits, now).await?;
+        let reservation = match runtime {
+            Some((tx, work)) => {
+                quota::reserve_runtime_unique(
+                    tx,
+                    &provider,
+                    cid,
+                    failed.logical_size,
+                    limits,
+                    now,
+                    work,
+                )
+                .await?
+            }
+            None => {
+                quota::reserve_unique(db, &provider, cid, failed.logical_size, limits, now).await?
+            }
+        };
         if matches!(
             reservation,
             ReservationOutcome::Reserved | ReservationOutcome::Reused
@@ -4762,8 +5194,15 @@ async fn fail_one_target_at_generation<C: ConnectionTrait>(
     .exec(db)
     .await?;
     quota::refresh_remote_max_active_touch(db, &provider, &cid).await?;
-    project_inserted_target_from_prelocked_remote(db, &replacement_id, &provider, &cid, now)
-        .await?;
+    project_inserted_target_from_prelocked_remote(
+        db,
+        &replacement_id,
+        &provider,
+        &cid,
+        now,
+        runtime,
+    )
+    .await?;
     let replacement = pin_lease_target::Entity::find_by_id(replacement_id)
         .one(db)
         .await?;
@@ -4771,9 +5210,15 @@ async fn fail_one_target_at_generation<C: ConnectionTrait>(
         && replacement.state == TARGET_PINNED
     {
         let cleanup =
-            converge_one_after_replacement_inner(db, lease_id, &replacement.id, now, true).await?;
+            converge_one_after_replacement_inner(db, lease_id, &replacement.id, now, true, runtime)
+                .await?;
         for job in cleanup {
-            jobs::enqueue_job(db, job).await?;
+            match runtime {
+                Some((tx, work)) => {
+                    jobs::insert_runtime_job(tx, job, Utc::now(), work).await?;
+                }
+                None => jobs::enqueue_job(db, job).await?,
+            };
         }
     }
     Ok(replacement)
@@ -4787,7 +5232,29 @@ pub async fn converge_one_after_replacement<C: ConnectionTrait>(
     winning_target_id: &str,
     now: DateTimeUtc,
 ) -> AppResult<Vec<NewPinJob>> {
-    converge_one_after_replacement_inner(db, lease_id, winning_target_id, now, false).await
+    converge_one_after_replacement_inner(db, lease_id, winning_target_id, now, false, None).await
+}
+
+pub(crate) async fn converge_runtime_one_after_replacement(
+    tx: &crate::store::RuntimeTransaction,
+    lease_id: &str,
+    winning_target_id: &str,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+) -> AppResult<Vec<NewPinJob>> {
+    if tx.db().get_database_backend() != DatabaseBackend::Sqlite {
+        return converge_one_after_replacement(tx.db(), lease_id, winning_target_id, now).await;
+    }
+    super::management::admission::lock_sqlite_writer_in_caller_transaction(tx.db()).await?;
+    converge_one_after_replacement_inner(
+        tx.db(),
+        lease_id,
+        winning_target_id,
+        now,
+        false,
+        Some((tx, work)),
+    )
+    .await
 }
 
 async fn converge_one_after_replacement_inner<C: ConnectionTrait>(
@@ -4796,6 +5263,7 @@ async fn converge_one_after_replacement_inner<C: ConnectionTrait>(
     winning_target_id: &str,
     now: DateTimeUtc,
     lifecycle_prelocked: bool,
+    runtime: Option<(&crate::store::RuntimeTransaction, DecodeWork<'_>)>,
 ) -> AppResult<Vec<NewPinJob>> {
     let Some(lease) = pin_lease::Entity::find_by_id(lease_id.to_owned())
         .one(db)
@@ -4818,21 +5286,48 @@ async fn converge_one_after_replacement_inner<C: ConnectionTrait>(
     if winner.state != TARGET_PINNED {
         return Ok(Vec::new());
     }
-    if crate::store::entities::pin_replica_observation::receipt::retained_cluster(
-        db,
-        &winner.provider,
-        &winner.cid,
-    )
-    .await?
-        && !crate::store::entities::pin_lease_requirement::contract::target_confirmed(
-            db,
-            lease_id,
-            &winner.provider,
-            &winner.cid,
-            now,
-        )
-        .await?
-    {
+    let cluster = match runtime {
+        Some((tx, work)) => {
+            retained_cluster_with_work(db, &winner.provider, &winner.cid, work, Some(tx)).await?
+        }
+        None => {
+            crate::store::entities::pin_replica_observation::receipt::retained_cluster(
+                db,
+                &winner.provider,
+                &winner.cid,
+            )
+            .await?
+        }
+    };
+    let confirmed = if cluster {
+        match runtime {
+            Some((_, work)) => {
+                crate::store::entities::pin_lease_requirement::contract::target_confirmed_with_work(
+                    db,
+                    lease_id,
+                    &winner.provider,
+                    &winner.cid,
+                    now,
+                    work.budget().clone(),
+                )
+                .await
+                .map_err(super::management::admission::work_error)?
+            }
+            None => {
+                crate::store::entities::pin_lease_requirement::contract::target_confirmed(
+                    db,
+                    lease_id,
+                    &winner.provider,
+                    &winner.cid,
+                    now,
+                )
+                .await?
+            }
+        }
+    } else {
+        true
+    };
+    if !confirmed {
         return Ok(Vec::new());
     }
     let current_assignment = targets.iter().rfind(|target| {
@@ -5376,6 +5871,13 @@ enum ProjectionAccess {
     Observation { historical_poll: bool },
 }
 
+#[derive(Clone, Copy)]
+struct PrelockedProjection<'a> {
+    desired: &'a DesiredTarget,
+    all_desired: &'a [DesiredTarget],
+    remote: &'a remote_pin::Model,
+}
+
 async fn project_prelocked_desired_target<C: ConnectionTrait>(
     db: &C,
     desired: &DesiredTarget,
@@ -5405,31 +5907,96 @@ async fn project_prelocked_desired_target_with_work<C: ConnectionTrait>(
     now: DateTimeUtc,
     work: super::management::records::DecodeWork<'_>,
 ) -> AppResult<TargetProjection> {
+    project_prelocked_target_core(
+        db,
+        PrelockedProjection {
+            desired,
+            all_desired,
+            remote,
+        },
+        access,
+        now,
+        work,
+        None,
+    )
+    .await
+}
+
+async fn project_prelocked_target_core<C: ConnectionTrait>(
+    db: &C,
+    projection: PrelockedProjection<'_>,
+    access: ProjectionAccess,
+    now: DateTimeUtc,
+    work: super::management::records::DecodeWork<'_>,
+    runtime: Option<&crate::store::RuntimeTransaction>,
+) -> AppResult<TargetProjection> {
+    let PrelockedProjection {
+        desired, remote, ..
+    } = projection;
+    let admission: std::pin::Pin<
+        Box<dyn std::future::Future<Output = AppResult<bool>> + Send + '_>,
+    > = Box::pin(projection_schedule_work(
+        db, desired, remote, access, work, runtime,
+    ));
+    let schedule_work = admission.await?;
+    #[cfg(test)]
+    record_target_projection(&desired.target.id).await;
+    let projection: std::pin::Pin<
+        Box<dyn std::future::Future<Output = AppResult<TargetProjection>> + Send + '_>,
+    > = if remote.status == REMOTE_FAILED {
+        Box::pin(project_failed_target(
+            db,
+            projection,
+            access,
+            now,
+            work,
+            runtime,
+            schedule_work,
+        ))
+    } else {
+        Box::pin(project_prelocked_target_state(
+            db,
+            projection,
+            access,
+            now,
+            work,
+            runtime,
+            schedule_work,
+        ))
+    };
+    projection.await
+}
+
+async fn projection_schedule_work<C: ConnectionTrait>(
+    db: &C,
+    desired: &DesiredTarget,
+    remote: &remote_pin::Model,
+    access: ProjectionAccess,
+    work: super::management::records::DecodeWork<'_>,
+    runtime: Option<&crate::store::RuntimeTransaction>,
+) -> AppResult<bool> {
     // Admission may create/attach work; an observation only updates an existing
     // desired target. A retired/changed route cannot authorize new jobs, but it
     // cannot invalidate a captured, already-fenced provider response either.
-    let schedule_work = match access {
+    Ok(match access {
         ProjectionAccess::Admission => {
-            quota::lock_allocation_admission_with_work(db, &desired.target.provider, work).await?;
-            quota::assert_reusable_route_with_work(
-                db,
-                &desired.target.provider,
-                &desired.target.cid,
-                work,
-            )
-            .await?;
+            match runtime {
+                Some(tx) => {
+                    quota::lock_runtime_allocation_admission(tx, &desired.target.provider, work)
+                        .await?
+                }
+                None => {
+                    quota::lock_allocation_admission_with_work(db, &desired.target.provider, work)
+                        .await?
+                }
+            };
+            projection_reusable(db, desired, work, runtime).await?;
             true
         }
         ProjectionAccess::Observation { .. } if remote.status == REMOTE_PINNED => false,
         ProjectionAccess::Observation { historical_poll } => {
-            match quota::assert_reusable_route_with_work(
-                db,
-                &desired.target.provider,
-                &desired.target.cid,
-                work,
-            )
-            .await
-            {
+            let reusable = projection_reusable(db, desired, work, runtime).await;
+            match reusable {
                 Ok(()) => true,
                 Err(AppError::InvalidPinningRequest(_)) => {
                     historical_poll
@@ -5438,10 +6005,45 @@ async fn project_prelocked_desired_target_with_work<C: ConnectionTrait>(
                 Err(error) => return Err(error),
             }
         }
-    };
-    #[cfg(test)]
-    record_target_projection(&desired.target.id).await;
+    })
+}
 
+fn projection_reusable<'a, C: ConnectionTrait>(
+    db: &'a C,
+    desired: &'a DesiredTarget,
+    work: super::management::records::DecodeWork<'a>,
+    runtime: Option<&'a crate::store::RuntimeTransaction>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = AppResult<()>> + Send + 'a>> {
+    match runtime {
+        Some(tx) => quota::assert_reusable_route_catalog(
+            tx.catalog(work),
+            &desired.target.provider,
+            &desired.target.cid,
+            work,
+        ),
+        None => Box::pin(quota::assert_reusable_route_with_work(
+            db,
+            &desired.target.provider,
+            &desired.target.cid,
+            work,
+        )),
+    }
+}
+
+async fn project_prelocked_target_state<C: ConnectionTrait>(
+    db: &C,
+    projection: PrelockedProjection<'_>,
+    access: ProjectionAccess,
+    now: DateTimeUtc,
+    work: super::management::records::DecodeWork<'_>,
+    runtime: Option<&crate::store::RuntimeTransaction>,
+    schedule_work: bool,
+) -> AppResult<TargetProjection> {
+    let PrelockedProjection {
+        desired,
+        all_desired,
+        remote,
+    } = projection;
     let canonical = || {
         all_desired
             .first()
@@ -5450,7 +6052,8 @@ async fn project_prelocked_desired_target_with_work<C: ConnectionTrait>(
     match remote.status.as_str() {
         REMOTE_PINNED => {
             let cluster =
-                retained_cluster_with_work(db, &remote.provider, &remote.cid, work).await?;
+                retained_cluster_with_work(db, &remote.provider, &remote.cid, work, runtime)
+                    .await?;
             let confirmed = !cluster
                 || crate::store::entities::pin_lease_requirement::contract::target_confirmed_with_work(
                     db,
@@ -5492,13 +6095,14 @@ async fn project_prelocked_desired_target_with_work<C: ConnectionTrait>(
                 ) else {
                     unreachable!()
                 };
-                ensure_prelocked_target_job_with_work(db, job, access, now, work).await?;
+                ensure_prelocked_target_job_with_work(db, job, access, now, work, runtime).await?;
             }
             Ok(TargetProjection::Pinned)
         }
         REMOTE_QUEUED | REMOTE_PINNING if remote.request_id.is_some() => {
             let cluster =
-                retained_cluster_with_work(db, &remote.provider, &remote.cid, work).await?;
+                retained_cluster_with_work(db, &remote.provider, &remote.cid, work, runtime)
+                    .await?;
             let confirmed = cluster
                 && crate::store::entities::pin_lease_requirement::contract::target_confirmed_with_work(
                     db,
@@ -5543,7 +6147,7 @@ async fn project_prelocked_desired_target_with_work<C: ConnectionTrait>(
             work.copy(&job.id).map_err(work_error)?;
             let poll_job_id = job.id.clone();
             if schedule_work {
-                ensure_prelocked_target_job_with_work(db, job, access, now, work).await?;
+                ensure_prelocked_target_job_with_work(db, job, access, now, work, runtime).await?;
             }
             Ok(TargetProjection::Submitted { poll_job_id })
         }
@@ -5581,56 +6185,74 @@ async fn project_prelocked_desired_target_with_work<C: ConnectionTrait>(
             )
             .await?
             {
-                ensure_reconcile_with_work(
+                ensure_reconcile_core(
                     db,
                     &desired.target.provider,
                     &desired.target.cid,
                     remote.epoch,
                     now,
                     work,
+                    runtime,
                 )
                 .await?;
                 return Ok(TargetProjection::Waiting {
                     submit_job_id: blocking,
                 });
             }
-            ensure_prelocked_target_job_with_work(db, job, access, now, work).await?;
+            ensure_prelocked_target_job_with_work(db, job, access, now, work, runtime).await?;
             Ok(TargetProjection::Waiting { submit_job_id })
-        }
-        REMOTE_FAILED => {
-            if matches!(access, ProjectionAccess::Observation { .. }) {
-                set_failed_observation_target(db, desired, remote, now).await?;
-            } else {
-                set_prelocked_target_state(db, &desired.target, TARGET_DEGRADED).await?;
-            }
-            work.copy(&(&desired.target.provider, &desired.target.cid, remote.epoch))
-                .map_err(work_error)?;
-            let NewPinJob::Remote(job) = jobs::reconcile_job(
-                &desired.target.provider,
-                &desired.target.cid,
-                remote.epoch,
-                remote.next_retry_at.unwrap_or(now),
-            ) else {
-                unreachable!("reconcile constructor is remote scoped")
-            };
-            work.copy(&job.id).map_err(work_error)?;
-            let reconcile_job_id = job.id.clone();
-            if schedule_work
-                && remote.failure_attempts < MAX_FAILED_REQUEST_ATTEMPTS
-                && remote.next_retry_at.is_some()
-                && all_desired
-                    .iter()
-                    .any(|target| target.lease.provider_mode == "all")
-            {
-                jobs::ensure_reconcile_with_work(db, job, now, work).await?;
-            }
-            Ok(TargetProjection::Degraded { reconcile_job_id })
         }
         REMOTE_ABSENT => Err(invalid(
             "remote absent projection requires explicit provider limits",
         )),
         _ => Err(invalid("remote request and status are inconsistent")),
     }
+}
+
+async fn project_failed_target<C: ConnectionTrait>(
+    db: &C,
+    projection: PrelockedProjection<'_>,
+    access: ProjectionAccess,
+    now: DateTimeUtc,
+    work: super::management::records::DecodeWork<'_>,
+    runtime: Option<&crate::store::RuntimeTransaction>,
+    schedule_work: bool,
+) -> AppResult<TargetProjection> {
+    let PrelockedProjection {
+        desired,
+        all_desired,
+        remote,
+    } = projection;
+    if matches!(access, ProjectionAccess::Observation { .. }) {
+        set_failed_observation_target(db, desired, remote, now).await?;
+    } else {
+        set_prelocked_target_state(db, &desired.target, TARGET_DEGRADED).await?;
+    }
+    work.copy(&(&desired.target.provider, &desired.target.cid, remote.epoch))
+        .map_err(work_error)?;
+    let NewPinJob::Remote(job) = jobs::reconcile_job(
+        &desired.target.provider,
+        &desired.target.cid,
+        remote.epoch,
+        remote.next_retry_at.unwrap_or(now),
+    ) else {
+        unreachable!("reconcile constructor is remote scoped")
+    };
+    work.copy(&job.id).map_err(work_error)?;
+    let reconcile_job_id = job.id.clone();
+    if schedule_work
+        && remote.failure_attempts < MAX_FAILED_REQUEST_ATTEMPTS
+        && remote.next_retry_at.is_some()
+        && all_desired
+            .iter()
+            .any(|target| target.lease.provider_mode == "all")
+    {
+        match runtime {
+            Some(tx) => jobs::ensure_runtime_reconcile(tx, job, now, work).await?,
+            None => jobs::ensure_reconcile_with_work(db, job, now, work).await?,
+        };
+    }
+    Ok(TargetProjection::Degraded { reconcile_job_id })
 }
 
 /// One claimed observation's complete lifecycle frontier, bound to its caller's transaction.
@@ -5692,13 +6314,17 @@ async fn ensure_prelocked_target_job_with_work<C: ConnectionTrait>(
     access: ProjectionAccess,
     now: DateTimeUtc,
     work: super::management::records::DecodeWork<'_>,
+    runtime: Option<&crate::store::RuntimeTransaction>,
 ) -> AppResult<()> {
     let submit_phase = match job.operation {
         jobs::TargetJobOperation::Submit => Some("ready"),
         jobs::TargetJobOperation::Poll => None,
     };
     if submit_phase.is_some() && matches!(access, ProjectionAccess::Observation { .. }) {
-        quota::lock_allocation_admission_with_work(db, &job.provider, work).await?;
+        match runtime {
+            Some(tx) => quota::lock_runtime_allocation_admission(tx, &job.provider, work).await?,
+            None => quota::lock_allocation_admission_with_work(db, &job.provider, work).await?,
+        };
     }
     if db.get_database_backend() == DatabaseBackend::Postgres {
         work.copy(&job.id)
@@ -5715,18 +6341,30 @@ async fn ensure_prelocked_target_job_with_work<C: ConnectionTrait>(
             .await
             .map_err(super::management::admission::work_error)?
     else {
-        jobs::insert_new_job_with_work(db, NewPinJob::Target(job), now, work).await?;
+        match runtime {
+            Some(tx) => jobs::insert_runtime_job(tx, NewPinJob::Target(job), now, work).await?,
+            None => jobs::insert_new_job_with_work(db, NewPinJob::Target(job), now, work).await?,
+        };
         return Ok(());
     };
     if submit_phase.is_some() && matches!(access, ProjectionAccess::Admission) {
-        quota::lock_allocation_admission_with_work(db, &job.provider, work).await?;
+        match runtime {
+            Some(tx) => quota::lock_runtime_allocation_admission(tx, &job.provider, work).await?,
+            None => quota::lock_allocation_admission_with_work(db, &job.provider, work).await?,
+        };
     }
     match existing.state.as_str() {
         JOB_PENDING | JOB_RUNNING => Ok(()),
         JOB_DONE => {
             // A stable target job ID can survive a released/reallocated remote. Never
             // borrow today's route/epoch for a historical or uncaptured done row.
-            if let Some(row) = ledger::get_with_work(db, &job.provider, &job.cid, work).await? {
+            let row = match runtime {
+                Some(tx) => {
+                    ledger::get_catalog(tx.catalog(work), &job.provider, &job.cid, work).await?
+                }
+                None => ledger::get_with_work(db, &job.provider, &job.cid, work).await?,
+            };
+            if let Some(row) = row {
                 let route = row.route.ok_or_else(|| {
                     invalid("prelocked target job has no current invocation identity")
                 })?;
@@ -5789,11 +6427,13 @@ async fn retained_cluster_with_work<C: ConnectionTrait>(
     provider: &str,
     cid: &str,
     work: super::management::records::DecodeWork<'_>,
+    runtime: Option<&crate::store::RuntimeTransaction>,
 ) -> AppResult<bool> {
-    let Some(raw) = ledger::get_with_work(db, provider, cid, work)
-        .await?
-        .and_then(|row| row.route)
-    else {
+    let row = match runtime {
+        Some(tx) => ledger::get_catalog(tx.catalog(work), provider, cid, work).await?,
+        None => ledger::get_with_work(db, provider, cid, work).await?,
+    };
+    let Some(raw) = row.and_then(|row| row.route) else {
         return Ok(false);
     };
     match work.with(|work| work.typed::<crate::pinning::identity::ProviderRouteSnapshot>(&raw)) {
@@ -5973,13 +6613,28 @@ async fn ensure_reconcile_with_work<C: ConnectionTrait>(
     at: DateTimeUtc,
     work: DecodeWork<'_>,
 ) -> AppResult<String> {
+    ensure_reconcile_core(db, provider, cid, epoch, at, work, None).await
+}
+
+async fn ensure_reconcile_core<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+    cid: &str,
+    epoch: i64,
+    at: DateTimeUtc,
+    work: DecodeWork<'_>,
+    runtime: Option<&crate::store::RuntimeTransaction>,
+) -> AppResult<String> {
     work.copy(&(provider, cid, epoch)).map_err(work_error)?;
     let NewPinJob::Remote(job) = jobs::reconcile_job(provider, cid, epoch, at) else {
         unreachable!("reconcile constructor is remote scoped")
     };
     work.copy(&job.id).map_err(work_error)?;
     let id = job.id.clone();
-    jobs::ensure_reconcile_with_work(db, job, at, work).await?;
+    match runtime {
+        Some(tx) => jobs::ensure_runtime_reconcile(tx, job, at, work).await?,
+        None => jobs::ensure_reconcile_with_work(db, job, at, work).await?,
+    };
     Ok(id)
 }
 

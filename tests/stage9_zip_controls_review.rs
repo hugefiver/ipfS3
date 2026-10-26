@@ -584,7 +584,6 @@ async fn import_zip_query_ordinary_whitelist_path_and_xml_errors_remain_invalid_
 
 #[tokio::test]
 async fn import_zip_query_valid_encoded_name_and_once_decoded_prefix_keep_literal_accepted_wire() {
-    use sea_orm::EntityTrait;
     use store::entities::import_job;
     use support::{
         stage9_zip_controls_review_sigv4::send_encoded_zip_query, stage9_zip_wire_golden::check,

@@ -51,7 +51,13 @@ async fn postgres_immutable_guards_are_validated() {
         .await.unwrap().unwrap().try_get("", "claimed").unwrap();
     assert!(claimed);
     schema::validate(&db).await.unwrap();
-    for damage in [
+    // A repeated name on a different table is not one of the fourteen guard pairs.
+    let tx = db.begin().await.unwrap();
+    tx.execute_unprepared("CREATE TRIGGER s75_inline_immutable BEFORE UPDATE ON pin_management_records FOR EACH ROW EXECUTE FUNCTION s75_immutable()")
+        .await.unwrap();
+    schema::storage::validate(&tx).await.unwrap();
+    tx.rollback().await.unwrap();
+    let mut damages = [
         "DROP TRIGGER s75_chunk_sealed ON pin_management_archive_chunks",
         "ALTER TABLE pin_management_archive DISABLE TRIGGER s75_archive_no_update",
         "CREATE OR REPLACE FUNCTION s75_immutable() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN OLD; END $$",
@@ -61,14 +67,25 @@ async fn postgres_immutable_guards_are_validated() {
         "DROP TRIGGER s75_pin_provider_routes_update ON pin_provider_routes; CREATE TRIGGER s75_pin_provider_routes_update AFTER UPDATE ON pin_provider_routes FOR EACH ROW WHEN (false) EXECUTE FUNCTION s75_pin_provider_routes_update()",
         "DROP TRIGGER s75_pin_provider_routes_update ON pin_provider_routes; CREATE TRIGGER s75_pin_provider_routes_update AFTER UPDATE OF display_name ON pin_provider_routes FOR EACH ROW EXECUTE FUNCTION s75_pin_provider_routes_update()",
         "CREATE TRIGGER unexpected_archive_guard BEFORE UPDATE ON pin_management_archive FOR EACH ROW EXECUTE FUNCTION s75_immutable()",
-    ] {
+        "DROP TRIGGER s75_applied_no_delete ON pin_management_records",
+        "ALTER TABLE pin_management_records DISABLE TRIGGER s75_applied_no_update",
+        "DROP TRIGGER s75_archive_no_delete ON pin_management_archive; CREATE TRIGGER s75_archive_no_delete BEFORE DELETE ON pin_management_pending_scope FOR EACH ROW EXECUTE FUNCTION s75_immutable()",
+        "ALTER FUNCTION s75_immutable() SECURITY DEFINER",
+        "ALTER FUNCTION s75_immutable() SET search_path TO public",
+        "ALTER TABLE pin_management_archive ENABLE ALWAYS TRIGGER s75_archive_no_update",
+    ].map(str::to_owned).to_vec();
+    damages.extend([
+        format!("CREATE OR REPLACE FUNCTION s75_immutable() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN /*{}*/ RAISE EXCEPTION 'immutable archive'; END $$", "x".repeat(65537)),
+        format!("DROP TRIGGER s75_applied_no_update ON pin_management_records; CREATE TRIGGER s75_applied_no_update BEFORE UPDATE ON pin_management_records FOR EACH ROW WHEN (OLD.state='{}') EXECUTE FUNCTION s75_immutable()", "x".repeat(65537)),
+    ]);
+    for damage in damages {
         let tx = db.begin().await.unwrap();
-        tx.execute_unprepared(damage).await.unwrap();
+        tx.execute_unprepared(&damage).await.unwrap();
         let rejected = schema::validate(&tx).await.is_err();
         tx.rollback().await.unwrap();
         assert!(
             rejected,
-            "damaged immutable storage guard must reject authority: {damage}"
+            "damaged immutable storage guard must reject authority"
         );
         schema::validate(&db).await.unwrap();
     }

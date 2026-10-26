@@ -12,6 +12,9 @@ mod discovery;
 mod narrow;
 mod upgrade;
 pub use classify::{DependencyKind, SourceClassification};
+pub(in crate::store::pinning) use discovery::discover_observed_authority;
+pub(in crate::store::pinning) use discovery::discover_quota_authority;
+pub(in crate::store::pinning) use discovery::discover_runtime_authority;
 pub use discovery::{
     AuthorityMembership, AuthorityProof, AuthorityView, SourceSeal, discover_authority,
     fence_authority, load_authority, revalidate_authority,

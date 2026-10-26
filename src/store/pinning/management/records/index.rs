@@ -12,7 +12,7 @@ pub(crate) async fn actions_for_plan_with_work<C: ConnectionTrait>(
     auth.check(db).await?;
     DecodeWork::shared(&work).copy(&(auth.database_scope(), plan))?;
     let actions = select(
-        db,
+        crate::store::pinning::legacy_migration::ReceiptCatalog::full(db),
         "database_scope=$1 AND plan_id=$2",
         vec![auth.database_scope().into(), plan.into()],
         0,
@@ -41,7 +41,7 @@ pub(crate) async fn action_at_key_with_work<C: ConnectionTrait>(
     }
     DecodeWork::shared(&work).index_copy(&(&key.values[..3], &key.values[..3]))?;
     let mut actions = select(
-        db,
+        crate::store::pinning::legacy_migration::ReceiptCatalog::full(db),
         "database_scope=$1 AND plan_id=$2 AND item_id=$3",
         key.values[..3].iter().cloned().map(Into::into).collect(),
         0,
@@ -56,6 +56,19 @@ pub(crate) async fn action_at_key_with_work<C: ConnectionTrait>(
 }
 pub(crate) async fn actions_at_keys_with_work<C: ConnectionTrait>(
     db: &C,
+    keys: &[native::NativeKey],
+    work: SharedDecodeBudget,
+) -> Result<Vec<TrustedAppliedAction>> {
+    actions_at_keys_catalog(
+        crate::store::pinning::legacy_migration::ReceiptCatalog::full(db),
+        keys,
+        work,
+    )
+    .await
+}
+
+pub(crate) async fn actions_at_keys_catalog(
+    catalog: crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
     keys: &[native::NativeKey],
     work: SharedDecodeBudget,
 ) -> Result<Vec<TrustedAppliedAction>> {
@@ -87,7 +100,7 @@ pub(crate) async fn actions_at_keys_with_work<C: ConnectionTrait>(
         values.push(key.values[2].clone().into());
     }
     select(
-        db,
+        catalog,
         &format!(
             "database_scope=$1 AND (plan_id,item_id) IN ({})",
             tuples.join(",")
@@ -99,14 +112,15 @@ pub(crate) async fn actions_at_keys_with_work<C: ConnectionTrait>(
     )
     .await
 }
-async fn select<C: ConnectionTrait>(
-    db: &C,
+async fn select(
+    catalog: crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
     predicate: &str,
     values: Vec<Value>,
     candidate_rows: usize,
     candidate_bytes: usize,
     work: SharedDecodeBudget,
 ) -> Result<Vec<TrustedAppliedAction>> {
+    let db = &catalog;
     let context = DecodeWork::shared(&work);
     let remaining = native::MAX_ROWS
         .checked_sub(candidate_rows)
@@ -161,8 +175,8 @@ async fn select<C: ConnectionTrait>(
         })
         .collect::<Result<Vec<_>>>()?;
     let source = std::sync::Arc::new(
-        evidence::Evidence::load_indexed(
-            db,
+        evidence::Evidence::load_indexed_catalog(
+            catalog,
             &scope,
             &identity,
             &keys,

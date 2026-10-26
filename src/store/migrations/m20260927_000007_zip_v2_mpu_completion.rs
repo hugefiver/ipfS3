@@ -5,8 +5,8 @@ use sea_orm_migration::prelude::*;
 pub struct Migration;
 
 #[async_trait::async_trait]
-impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+impl super::bridge::SharedMigration for Migration {
+    async fn up_body(&self, manager: &super::bridge::Manager<'_>) -> Result<(), DbErr> {
         if !matches!(
             manager.get_database_backend(),
             DatabaseBackend::Sqlite | DatabaseBackend::Postgres
@@ -30,7 +30,13 @@ impl MigrationTrait for Migration {
         ).await?;
         Ok(())
     }
-
+}
+#[async_trait::async_trait]
+impl MigrationTrait for Migration {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        super::bridge::SharedMigration::up_body(self, &super::bridge::Manager::native(manager))
+            .await
+    }
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
         let tx = db.begin().await?;

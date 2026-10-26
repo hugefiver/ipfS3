@@ -483,6 +483,37 @@ pub async fn collect_scope<C: ConnectionTrait>(
         super::super::schema::validate(tx).await?;
     }
     super::super::catalog::validate(tx, super::current_catalog()).await?;
+    collect_validated(tx, spec, budget, None).await
+}
+
+pub(in crate::store::pinning) async fn collect_runtime_scope(
+    tx: &crate::store::RuntimeTransaction,
+    spec: &ScopeSpec,
+    budget: &mut Budget,
+    work: super::super::records::DecodeWork<'_>,
+) -> Result<ScopedRead> {
+    if tx.db().get_database_backend() != DatabaseBackend::Sqlite {
+        return collect_scope(tx.db(), spec, budget).await;
+    }
+    if spec.catalog_revision != super::super::schema::VERSION {
+        return Err(ManagementError::Schema);
+    }
+    tx.check_schema(work).await.map_err(|error| match error {
+        crate::error::AppError::ManagementBudget => ManagementError::Budget,
+        _ => ManagementError::Schema,
+    })?;
+    collect_validated(tx.db(), spec, budget, Some((tx, work))).await
+}
+
+async fn collect_validated<C: ConnectionTrait>(
+    tx: &C,
+    spec: &ScopeSpec,
+    budget: &mut Budget,
+    runtime: Option<(
+        &crate::store::RuntimeTransaction,
+        super::super::records::DecodeWork<'_>,
+    )>,
+) -> Result<ScopedRead> {
     let (database_scope, database_identity) = binding(tx).await?;
     let mut read = ScopedRead {
         spec: spec.clone(),
@@ -499,9 +530,18 @@ pub async fn collect_scope<C: ConnectionTrait>(
         let mut members = Vec::new();
         let selected_queries = match selector {
             Selector::AuthoritySet { selectors } => {
-                let view =
-                    super::super::records::locator::discover_authority(tx, selectors, budget)
-                        .await?;
+                let view = match runtime {
+                    Some((owner, work)) => {
+                        super::super::records::locator::discover_runtime_authority(
+                            owner, selectors, budget, work,
+                        )
+                        .await?
+                    }
+                    None => {
+                        super::super::records::locator::discover_authority(tx, selectors, budget)
+                            .await?
+                    }
+                };
                 for selector in selectors {
                     if let super::super::records::locator::AuthoritySelector::Domain(domain)
                     | super::super::records::locator::AuthoritySelector::RouteDomain(domain) =
@@ -528,12 +568,16 @@ pub async fn collect_scope<C: ConnectionTrait>(
                 if let Some(keys) = domain_sources.get(allocation_domain) {
                     members.extend(keys.iter().cloned());
                 } else {
-                    let view = discover_authority(
-                        tx,
-                        &[AuthoritySelector::RouteDomain(allocation_domain.clone())],
-                        budget,
-                    )
-                    .await?;
+                    let selectors = [AuthoritySelector::RouteDomain(allocation_domain.clone())];
+                    let view = match runtime {
+                        Some((owner, work)) => {
+                            super::super::records::locator::discover_runtime_authority(
+                                owner, &selectors, budget, work,
+                            )
+                            .await?
+                        }
+                        None => discover_authority(tx, &selectors, budget).await?,
+                    };
                     let mut operational = view.operational_keys(allocation_domain);
                     operational.insert(allocation_domain.clone());
                     read.operational_keys

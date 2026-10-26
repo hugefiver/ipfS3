@@ -39,13 +39,13 @@ pub(super) async fn fence(
     native::scope::fence_memberships(tx, &spec).await
 }
 
-pub(super) async fn capture<C: ConnectionTrait>(
-    db: &C,
+pub(super) async fn capture_catalog(
+    catalog: ReceiptCatalog<'_>,
     authority: &records::JobAuthority,
     work: records::SharedDecodeBudget,
 ) -> Result<native::NativeFrame> {
     let mut budget = Budget::default();
-    let result = capture_inner(db, authority, &work, &mut budget).await;
+    let result = capture_inner(catalog, authority, &work, &mut budget).await;
     crate::store::pinning::management::admission::authority::charge(
         &budget,
         records::DecodeWork::shared(&work),
@@ -53,12 +53,22 @@ pub(super) async fn capture<C: ConnectionTrait>(
     result
 }
 
-async fn capture_inner<C: ConnectionTrait>(
+#[cfg(test)]
+async fn capture<C: ConnectionTrait>(
     db: &C,
+    authority: &records::JobAuthority,
+    work: records::SharedDecodeBudget,
+) -> Result<native::NativeFrame> {
+    capture_catalog(ReceiptCatalog::full(db), authority, work).await
+}
+
+async fn capture_inner(
+    catalog: ReceiptCatalog<'_>,
     authority: &records::JobAuthority,
     work: &records::SharedDecodeBudget,
     budget: &mut Budget,
 ) -> Result<native::NativeFrame> {
+    let db = &catalog;
     let context = records::DecodeWork::shared(work);
     let identity = authority
         .source
@@ -67,7 +77,7 @@ async fn capture_inner<C: ConnectionTrait>(
     let cid = crate::pinning::provider::canonical_resource_cid(&authority.cid)
         .map_err(|_| ManagementError::InvalidEvidence)?;
     let domain = locator::canonical_domain(&authority.route)?;
-    let provider = operational_resource_with_work(db, authority, context).await?;
+    let provider = operational_resource_catalog(catalog, authority, context).await?;
     let mut predicates = BTreeSet::from([
         Selector::Exact(NativeKey {
             table: "objects".into(),
@@ -93,9 +103,13 @@ async fn capture_inner<C: ConnectionTrait>(
         }
         if let Some(predicate) = predicates.iter().find(|p| !reads.contains_key(*p)).cloned() {
             context.copy(&predicate)?;
-            let read =
-                native::scope::collect_scope(db, &ScopeSpec::new(vec![predicate.clone()])?, budget)
-                    .await?;
+            let spec = ScopeSpec::new(vec![predicate.clone()])?;
+            let read = match catalog {
+                ReceiptCatalog::Runtime(tx, _) => {
+                    native::scope::collect_runtime_scope(tx, &spec, budget, context).await?
+                }
+                _ => native::scope::collect_scope(db, &spec, budget).await?,
+            };
             for (key, row) in read.rows() {
                 if key.table == "pin_lease_targets" {
                     let lease =
@@ -114,7 +128,18 @@ async fn capture_inner<C: ConnectionTrait>(
             break;
         };
         context.copy(&selector)?;
-        let view = locator::discover_authority(db, std::slice::from_ref(&selector), budget).await?;
+        let view = match catalog {
+            ReceiptCatalog::Runtime(tx, _) => {
+                locator::discover_runtime_authority(
+                    tx,
+                    std::slice::from_ref(&selector),
+                    budget,
+                    context,
+                )
+                .await?
+            }
+            _ => locator::discover_authority(db, std::slice::from_ref(&selector), budget).await?,
+        };
         providers.extend(view.operational_keys(&domain));
         for (key, row) in &view.originals {
             if key.table == "pin_management_records"

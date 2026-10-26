@@ -17,7 +17,10 @@ pub(crate) fn archived_catalog(versions: &[String]) -> Result<&'static [NativeTa
     static PRE_DOCUMENTS: LazyLock<Vec<NativeTable>> = LazyLock::new(|| {
         let mut tables = registry();
         tables.retain(|table| table.table != "import_job_requests");
-        *tables.iter_mut().find(|table| table.table == "import_jobs").expect("import jobs catalog") =
+        *tables
+            .iter_mut()
+            .find(|table| table.table == "import_jobs")
+            .expect("import jobs catalog") =
             super::entity::<crate::store::entities::import_job::Entity>();
         tables
     });

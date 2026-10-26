@@ -173,8 +173,8 @@ pub(crate) async fn publish_direct(
         error_message: Set(None),
     }];
     if let Some(decision) = &decision {
-        crate::store::pinning::publication::publish_decided_import_object(
-            state.store.db(),
+        crate::store::pinning::publication::application::publish_decided_import_object(
+            &state.store,
             request,
             guard,
             result_rows,

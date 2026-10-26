@@ -9,7 +9,6 @@ use crate::{
     },
 };
 use chrono::{DateTime, Utc};
-use sea_orm::ConnectionTrait;
 use std::collections::{BTreeMap, BTreeSet};
 
 type FrozenAllocation = (
@@ -58,12 +57,16 @@ pub(super) fn frozen_allocation(
     Ok((limits, routes, enabled))
 }
 
-pub(super) async fn attachment_pairs<C: ConnectionTrait>(
-    db: &C,
+pub(in crate::store::pinning::publication) async fn attachment_pairs<
+    R: publication::reservations::Reservations,
+>(
+    reservations: &R,
     selected: &ZipIntentSelection,
     limits: &ProviderLimitMap,
     maintenance: &mut PublicationLease<'_>,
+    work: crate::store::pinning::management::records::DecodeWork<'_>,
 ) -> AppResult<Vec<(String, String)>> {
+    let db = reservations.db();
     let mut pairs = BTreeSet::new();
     for lease in &selected.leases {
         for provider in publication::ordered_enabled_providers(&lease.intent, limits)? {
@@ -71,7 +74,17 @@ pub(super) async fn attachment_pairs<C: ConnectionTrait>(
                 maintenance.checkpoint(db).await?;
                 pairs.insert((
                     provider.clone(),
-                    ledger::allocation_cid(db, &provider, &target.cid).await?,
+                    if reservations.runtime().is_some() {
+                        ledger::allocation_cid_with_work(
+                            &reservations.catalog(work),
+                            &provider,
+                            &target.cid,
+                            work,
+                        )
+                        .await?
+                    } else {
+                        ledger::allocation_cid(db, &provider, &target.cid).await?
+                    },
                 ));
             }
         }
@@ -105,8 +118,8 @@ pub(super) fn verify_candidate(
     Ok(())
 }
 
-pub(super) async fn create_leases<C: ConnectionTrait>(
-    db: &C,
+pub(super) async fn create_leases<R: publication::reservations::Reservations>(
+    reservations: &mut R,
     selected: &ZipIntentSelection,
     limits: &ProviderLimitMap,
     now: DateTime<Utc>,
@@ -115,6 +128,7 @@ pub(super) async fn create_leases<C: ConnectionTrait>(
     let mut affected = BTreeSet::new();
     let mut failed = BTreeSet::new();
     for lease in &selected.leases {
+        let db = reservations.db();
         maintenance.checkpoint(db).await?;
         let targets = lease
             .targets
@@ -139,9 +153,10 @@ pub(super) async fn create_leases<C: ConnectionTrait>(
         .await?;
         let mut assigned = BTreeMap::new();
         for target in targets {
-            maintenance.checkpoint(db).await?;
-            publication::assign_target_providers(
-                db,
+            maintenance.checkpoint(reservations.db()).await?;
+            let session = reservations.runtime_work().cloned().unwrap_or_default();
+            publication::assign_target_providers_core(
+                reservations,
                 &id,
                 &lease.intent,
                 &target,
@@ -150,32 +165,11 @@ pub(super) async fn create_leases<C: ConnectionTrait>(
                 &mut assigned,
                 &mut affected,
                 &mut failed,
+                crate::store::pinning::management::records::DecodeWork::shared(&session),
             )
             .await?;
         }
     }
-    for (provider, cid) in failed {
-        maintenance.checkpoint(db).await?;
-        publication::leases::reset_failed_remote_retry_on_user_touch_with_maintenance(
-            db,
-            &provider,
-            &cid,
-            now,
-            Some(maintenance),
-        )
-        .await?;
-        publication::ensure_failed_attachment_reconcile(db, &provider, &cid, now).await?;
-    }
-    for (provider, cid) in affected {
-        maintenance.checkpoint(db).await?;
-        publication::project_desired_remote_targets_with_maintenance(
-            db,
-            &provider,
-            &cid,
-            now,
-            Some(maintenance),
-        )
-        .await?;
-    }
-    Ok(())
+    publication::settle_publication_remotes(reservations, affected, failed, now, Some(maintenance))
+        .await
 }

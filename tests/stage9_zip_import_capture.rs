@@ -12,7 +12,6 @@ mod support {
 use futures_util::FutureExt;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use ipfs_s3_gateway::{pinning::zip_policy::CapturedZipIntent, store::entities::import_job};
-use sea_orm::EntityTrait;
 use std::panic::AssertUnwindSafe;
 use support::{
     decompress::S3TestEndpoint,

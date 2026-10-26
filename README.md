@@ -1360,12 +1360,14 @@ deadline rather than starting a new allowance. `restore_private` returns a
 read-only recovery archive with cell, original-review and archive-part readers;
 it never writes recovered rows, receipts or identity into a target database.
 
-Streaming CLI file work has limits of 4 GiB input work, 10 million rows, 32 MiB
-accounted resident memory and 30 seconds per operation, not the old whole-file
-16 MiB v2 ceiling. DB-backed management work has a 30-second work window followed
-by cancellation and at most 5 seconds of owned-work drain. These limits aren't
-proof of acceptance-scale capacity. The current CLI exposes no budget override
-for cumulative task work; don't treat partial files or scan pages as success.
+Streaming CLI file work has an 8 GiB work-byte ceiling, 10 million rows, 32 MiB
+accounted resident memory and a 120-second operation budget. Dry-run and confirmation
+use a 120-second work window; other ordinary DB-backed management commands retain
+their 30-second window. Cancellation allows at most 5 seconds of owned-work drain.
+Existing checkpoints retain their original cumulative caps and spent work: newer
+defaults never enlarge a retained task's allowance. The CLI exposes no cumulative
+task budget override. These limits aren't proof of acceptance-scale capacity;
+don't treat partial files or scan pages as success.
 
 Provider-wide dry-run and confirmation support an explicit protected checkpoint
 directory. `--checkpoint` creates a new directory; `--resume` reopens that same
@@ -1395,6 +1397,11 @@ exact original confirmation without publishing it again or changing its ACKs or
 deadline, and retains the checkpoint. Normal successful completion removes only
 its owned checkpoint workspace.
 
+Recovered exports preserve complete content and confirmation semantics, but need
+not use identical JSON encoding or physical chunk boundaries. Every file must
+independently pass its integrity and EOF checks. Stored original archive bytes and
+their integrity references remain exact.
+
 Management wire v3 is unrelated to ZIP v2. Pixivbot's signed ZIP v1 direct PUT
 keeps `decompress-zip=<prefix>/`; MPU captures that query at Create and continues
 with the original UploadPart/Complete protocol. Its tag remains
@@ -1409,6 +1416,24 @@ schemas are refused with upgrade-required, without automatic migration or resume
 Only a genuinely empty application schema may initialize the current schema;
 missing migration metadata alone doesn't establish emptiness. A ready current
 schema is validated before normal startup proceeds.
+
+SQLite runtime `Store` instances may reuse a successfully verified static layout
+instead of repeating full table, trigger and index validation for every operation.
+Qualification requires complete validation of the native, management, receipt and
+route layouts. Clones share their Store's qualification; a newly constructed
+Store must qualify independently. Failed or cancelled qualification is not reusable.
+Runtime checks still read the known migration versions, readiness and applicable
+TEMP shadows on the operation's connection. Permissions, original bindings,
+retirement, quota, claims, epochs, TTL and acknowledgements remain live checks;
+schema qualification does not cache business authorization. Bare-database,
+historical, maintenance and PostgreSQL paths retain full validation.
+
+Direct schema changes outside the application while a SQLite Store is running
+are unsupported. Immediate detection is not guaranteed, especially if migration
+versions are also forged. Stop and drain users of the database before schema
+maintenance, discard all old Store instances and their clones, perform the
+explicit full validation or upgrade, then restart with newly qualified instances.
+Do not resume an old Store after a failed or completed schema upgrade.
 
 The separate `--pinning-manage-upgrade` command requires the exact existing DB
 URL, native physical identity, database scope, source version and target version.

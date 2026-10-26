@@ -7,20 +7,49 @@ pub(crate) async fn historical_route<C: ConnectionTrait>(
     job: &pin_job::Model,
 ) -> AppResult<Option<ProviderRouteSnapshot>> {
     let work = records::SharedDecodeBudget::default();
-    let actions = crate::store::pinning::management::admission::authority::actions_for_job(
-        db,
+    historical_route_catalog(ReceiptCatalog::full(db), job, work).await
+}
+
+async fn historical_route_catalog(
+    catalog: ReceiptCatalog<'_>,
+    job: &pin_job::Model,
+    work: records::SharedDecodeBudget,
+) -> AppResult<Option<ProviderRouteSnapshot>> {
+    let actions = crate::store::pinning::management::admission::authority::actions_for_job_catalog(
+        catalog,
         job,
         work.clone(),
     )
     .await
     .map_err(safe)?;
-    if let Some(authority) = lookup_from_actions(db, job, &actions, work.clone())
+    if let Some(authority) = lookup_from_catalog_actions(catalog, job, &actions, work.clone())
         .await
         .map_err(safe)?
     {
         return Ok(Some(authority.route));
     }
-    migration_route(db, job, &actions, work).await
+    migration_route_catalog(catalog, job, &actions, work).await
+}
+
+pub(crate) async fn historical_route_store(
+    store: &crate::store::Store,
+    job: &pin_job::Model,
+) -> AppResult<Option<ProviderRouteSnapshot>> {
+    if store.db().get_database_backend() != sea_orm::DatabaseBackend::Sqlite {
+        return historical_route(store.db(), job).await;
+    }
+    let work = records::SharedDecodeBudget::default();
+    let tx = store
+        .begin_runtime(records::DecodeWork::shared(&work))
+        .await?;
+    let result = historical_route_catalog(
+        tx.catalog(records::DecodeWork::shared(&work)),
+        job,
+        work.clone(),
+    )
+    .await;
+    tx.rollback().await?;
+    result
 }
 
 /// Resolve the permit and any management migration fallback from one complete
@@ -37,26 +66,45 @@ pub(crate) async fn admission_with_route<C: ConnectionTrait>(
     )
     .await
     .map_err(safe)?;
-    let authority = lookup_from_actions(db, job, &actions, work.clone())
+    admission_from_actions(db, job, &actions, work).await
+}
+
+pub(in crate::store::pinning) async fn admission_from_actions<C: ConnectionTrait>(
+    db: &C,
+    job: &pin_job::Model,
+    actions: &[records::TrustedAppliedAction],
+    work: records::SharedDecodeBudget,
+) -> AppResult<(Option<JobPermit>, Option<ProviderRouteSnapshot>)> {
+    admission_from_catalog(ReceiptCatalog::full(db), job, actions, work).await
+}
+
+pub(in crate::store::pinning) async fn admission_from_catalog(
+    catalog: ReceiptCatalog<'_>,
+    job: &pin_job::Model,
+    actions: &[records::TrustedAppliedAction],
+    work: records::SharedDecodeBudget,
+) -> AppResult<(Option<JobPermit>, Option<ProviderRouteSnapshot>)> {
+    let authority = lookup_from_catalog_actions(catalog, job, actions, work.clone())
         .await
         .map_err(safe)?;
-    let permit = check_with_authority(db, job, authority, work.clone())
+    let permit = check_with_authority_catalog(catalog, job, authority, work.clone())
         .await
         .map_err(safe)?;
     let route = if permit.is_none() {
-        migration_route(db, job, &actions, work).await?
+        migration_route_catalog(catalog, job, actions, work).await?
     } else {
         None
     };
     Ok((permit, route))
 }
 
-async fn migration_route<C: ConnectionTrait>(
-    db: &C,
+async fn migration_route_catalog(
+    catalog: ReceiptCatalog<'_>,
     job: &pin_job::Model,
     actions: &[records::TrustedAppliedAction],
     work: records::SharedDecodeBudget,
 ) -> AppResult<Option<ProviderRouteSnapshot>> {
+    let db = &catalog;
     // This is complete, sealed lease/job membership, not a current-provider hint.
     // Without any migration points there is no management route to resolve;
     // ordinary callers still validate their legacy route and retirement fences.
@@ -75,7 +123,7 @@ async fn migration_route<C: ConnectionTrait>(
         return Ok(None);
     };
     let candidates =
-        super::super::points::candidates_for_cid_with_work(db, lease, &job.cid, &birth, work)
+        super::super::points::candidates_for_cid_catalog(catalog, lease, &job.cid, &birth, work)
             .await
             .map_err(safe)?;
     let mut proven = None;

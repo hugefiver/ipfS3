@@ -174,11 +174,14 @@ impl<R: Read> Reader<R> {
         let mut payload = vec![0; remaining + 3];
         payload[..3].copy_from_slice(&prefix);
         self.read_prepaid_exact(&mut payload[3..])?;
-        let checked = physical::decode(
-            &mut self.state, &mut self.integrity, 7, &payload, &mut self.budget,
+        let checked = physical::decode_reserved(
+            &mut self.state,
+            &mut self.integrity,
+            7,
+            &payload,
+            &mut self.budget,
+            resident,
         )?;
-        let record = checked.into_record(&mut self.budget)?;
-        drop(resident);
-        Ok(record)
+        checked.into_record(&mut self.budget)
     }
 }

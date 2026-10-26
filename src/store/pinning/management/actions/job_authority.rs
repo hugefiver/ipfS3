@@ -2,6 +2,7 @@
 //! route, lease generation and remote epoch. No queue-wide confirmation permit.
 use super::execution::cell;
 use super::*;
+use crate::store::pinning::legacy_migration::ReceiptCatalog;
 use crate::store::pinning::management::admission::ManagedCall;
 use crate::{
     error::{AppError, AppResult},
@@ -22,6 +23,8 @@ mod completion;
 mod current_scope;
 mod route;
 pub(crate) use completion::CompletionReader;
+pub(in crate::store::pinning) use route::admission_from_catalog;
+pub(crate) use route::historical_route_store;
 pub(crate) use route::{admission_with_route, historical_route};
 pub(crate) mod park_scope;
 #[cfg(test)]
@@ -147,12 +150,55 @@ pub(crate) async fn check_before_call_with_work<C: ConnectionTrait>(
     check_with_authority(db, job, authority, work).await
 }
 
+pub(crate) async fn check_before_call_catalog(
+    catalog: ReceiptCatalog<'_>,
+    job: &pin_job::Model,
+    work: records::SharedDecodeBudget,
+) -> Result<Option<JobPermit>> {
+    let authority = lookup_catalog(catalog, job, work.clone()).await?;
+    check_with_authority_catalog(catalog, job, authority, work).await
+}
+
+pub(crate) async fn check_before_call_store(
+    store: &crate::store::Store,
+    job: &pin_job::Model,
+    work: records::SharedDecodeBudget,
+) -> AppResult<Option<JobPermit>> {
+    if store.db().get_database_backend() != sea_orm::DatabaseBackend::Sqlite {
+        return check_before_call_with_work(store.db(), job, work)
+            .await
+            .map_err(safe);
+    }
+    let tx = store
+        .begin_runtime(records::DecodeWork::shared(&work))
+        .await?;
+    let result = check_before_call_catalog(
+        tx.catalog(records::DecodeWork::shared(&work)),
+        job,
+        work.clone(),
+    )
+    .await
+    .map_err(safe);
+    tx.rollback().await?;
+    result
+}
+
 async fn check_with_authority<C: ConnectionTrait>(
     db: &C,
     job: &pin_job::Model,
     authority: Option<records::JobAuthority>,
     work: records::SharedDecodeBudget,
 ) -> Result<Option<JobPermit>> {
+    check_with_authority_catalog(ReceiptCatalog::full(db), job, authority, work).await
+}
+
+async fn check_with_authority_catalog(
+    catalog: ReceiptCatalog<'_>,
+    job: &pin_job::Model,
+    authority: Option<records::JobAuthority>,
+    work: records::SharedDecodeBudget,
+) -> Result<Option<JobPermit>> {
+    let db = &catalog;
     let Some(authority) = authority else {
         return Ok(None);
     };
@@ -164,8 +210,8 @@ async fn check_with_authority<C: ConnectionTrait>(
     let now = crate::store::database_clock::database_now(db)
         .await
         .map_err(database)?;
-    if !successor::current_resource_with_work(
-        db,
+    if !successor::current_resource_catalog(
+        catalog,
         job,
         &authority,
         records::DecodeWork::shared(&work),
@@ -173,7 +219,8 @@ async fn check_with_authority<C: ConnectionTrait>(
     .await?
         || !current_lease(db, &authority, now, records::DecodeWork::shared(&work)).await?
         || authority.directive == records::JobDirective::Submit
-            && !source::historical_fresh(db, job, &authority, now, work.clone()).await?
+            && !source::historical_fresh_catalog(catalog, job, &authority, now, work.clone())
+                .await?
     {
         return Ok(Some(JobPermit::LedgerOnly(authority)));
     }
@@ -192,8 +239,8 @@ async fn check_with_authority<C: ConnectionTrait>(
         }
         records::JobDirective::ExistingCleanup => {
             if job.operation != "unpin"
-                || !ledger::cleanup_allowed_with_work(
-                    db,
+                || !ledger::cleanup_allowed_catalog(
+                    catalog,
                     &job.provider,
                     &job.cid,
                     records::DecodeWork::shared(&work),
@@ -265,6 +312,24 @@ async fn fresh_source_from_authority<C: ConnectionTrait>(
     idle_timeout_millis: Option<u64>,
     work: records::SharedDecodeBudget,
 ) -> AppResult<bool> {
+    fresh_source_catalog(
+        ReceiptCatalog::full(db),
+        authority,
+        config,
+        idle_timeout_millis,
+        work,
+    )
+    .await
+}
+
+async fn fresh_source_catalog(
+    catalog: ReceiptCatalog<'_>,
+    authority: Option<&records::JobAuthority>,
+    config: Option<crate::pinning::management::local_config::ManagementConfigView<'_>>,
+    idle_timeout_millis: Option<u64>,
+    work: records::SharedDecodeBudget,
+) -> AppResult<bool> {
+    let db = &catalog;
     let Some(authority) = authority else {
         return Ok(true);
     };
@@ -275,11 +340,12 @@ async fn fresh_source_from_authority<C: ConnectionTrait>(
         return Ok(false);
     };
     let now = crate::store::database_clock::database_now(db).await?;
-    source::current(db, authority, config, idle_timeout_millis, now, work)
+    source::current_catalog(catalog, authority, config, idle_timeout_millis, now, work)
         .await
         .map_err(safe)
 }
 
+#[cfg(test)]
 pub(crate) async fn lock_source_in_transaction_with_work(
     tx: &DatabaseTransaction,
     job: &pin_job::Model,
@@ -340,8 +406,16 @@ pub(crate) async fn projection_allowed_with_work<C: ConnectionTrait>(
     job: &pin_job::Model,
     work: records::SharedDecodeBudget,
 ) -> AppResult<bool> {
+    projection_allowed_catalog(ReceiptCatalog::full(db), job, work).await
+}
+
+pub(crate) async fn projection_allowed_catalog(
+    catalog: ReceiptCatalog<'_>,
+    job: &pin_job::Model,
+    work: records::SharedDecodeBudget,
+) -> AppResult<bool> {
     Ok(
-        match check_before_call_with_work(db, job, work)
+        match check_before_call_catalog(catalog, job, work)
             .await
             .map_err(safe)?
         {
@@ -352,6 +426,7 @@ pub(crate) async fn projection_allowed_with_work<C: ConnectionTrait>(
     )
 }
 
+#[cfg(test)]
 pub(crate) async fn projection_and_source_allowed_with_work<C: ConnectionTrait>(
     db: &C,
     job: &pin_job::Model,
@@ -359,10 +434,27 @@ pub(crate) async fn projection_and_source_allowed_with_work<C: ConnectionTrait>(
     idle_timeout_millis: Option<u64>,
     work: records::SharedDecodeBudget,
 ) -> AppResult<bool> {
-    let authority = lookup_with_work(db, job, work.clone())
+    projection_and_source_catalog(
+        ReceiptCatalog::full(db),
+        job,
+        config,
+        idle_timeout_millis,
+        work,
+    )
+    .await
+}
+
+pub(crate) async fn projection_and_source_catalog(
+    catalog: ReceiptCatalog<'_>,
+    job: &pin_job::Model,
+    config: Option<crate::pinning::management::local_config::ManagementConfigView<'_>>,
+    idle_timeout_millis: Option<u64>,
+    work: records::SharedDecodeBudget,
+) -> AppResult<bool> {
+    let authority = lookup_catalog(catalog, job, work.clone())
         .await
         .map_err(safe)?;
-    projection_and_source_from_authority(db, job, authority, config, idle_timeout_millis, work)
+    projection_and_source_from_catalog(catalog, job, authority, config, idle_timeout_millis, work)
         .await
 }
 
@@ -374,7 +466,26 @@ async fn projection_and_source_from_authority<C: ConnectionTrait>(
     idle_timeout_millis: Option<u64>,
     work: records::SharedDecodeBudget,
 ) -> AppResult<bool> {
-    let authority = match check_with_authority(db, job, authority, work.clone())
+    projection_and_source_from_catalog(
+        ReceiptCatalog::full(db),
+        job,
+        authority,
+        config,
+        idle_timeout_millis,
+        work,
+    )
+    .await
+}
+
+async fn projection_and_source_from_catalog(
+    catalog: ReceiptCatalog<'_>,
+    job: &pin_job::Model,
+    authority: Option<records::JobAuthority>,
+    config: Option<crate::pinning::management::local_config::ManagementConfigView<'_>>,
+    idle_timeout_millis: Option<u64>,
+    work: records::SharedDecodeBudget,
+) -> AppResult<bool> {
+    let authority = match check_with_authority_catalog(catalog, job, authority, work.clone())
         .await
         .map_err(safe)?
     {
@@ -384,7 +495,14 @@ async fn projection_and_source_from_authority<C: ConnectionTrait>(
         }
         Some(JobPermit::ReadOnly(_) | JobPermit::LedgerOnly(_)) => return Ok(false),
     };
-    fresh_source_from_authority(db, authority.as_ref(), config, idle_timeout_millis, work).await
+    fresh_source_catalog(
+        catalog,
+        authority.as_ref(),
+        config,
+        idle_timeout_millis,
+        work,
+    )
+    .await
 }
 
 pub async fn cleanup_settlement_allowed<C: ConnectionTrait>(
@@ -398,8 +516,16 @@ pub(crate) async fn cleanup_settlement_allowed_with_work<C: ConnectionTrait>(
     job: &pin_job::Model,
     work: records::SharedDecodeBudget,
 ) -> AppResult<bool> {
+    cleanup_settlement_allowed_catalog(ReceiptCatalog::full(db), job, work).await
+}
+
+pub(crate) async fn cleanup_settlement_allowed_catalog(
+    catalog: ReceiptCatalog<'_>,
+    job: &pin_job::Model,
+    work: records::SharedDecodeBudget,
+) -> AppResult<bool> {
     Ok(matches!(
-        check_before_call_with_work(db, job, work)
+        check_before_call_catalog(catalog, job, work)
             .await
             .map_err(safe)?,
         Some(JobPermit::ExistingCleanup(_))
@@ -422,15 +548,75 @@ pub(crate) async fn lookup_with_work<C: ConnectionTrait>(
     job: &pin_job::Model,
     work: records::SharedDecodeBudget,
 ) -> Result<Option<records::JobAuthority>> {
+    lookup_catalog(ReceiptCatalog::full(db), job, work).await
+}
+
+pub(crate) async fn lookup_catalog(
+    catalog: ReceiptCatalog<'_>,
+    job: &pin_job::Model,
+    work: records::SharedDecodeBudget,
+) -> Result<Option<records::JobAuthority>> {
     let actions = Box::pin(
-        crate::store::pinning::management::admission::authority::actions_for_job(
-            db,
+        crate::store::pinning::management::admission::authority::actions_for_job_catalog(
+            catalog,
             job,
             work.clone(),
         ),
     )
     .await?;
-    lookup_from_actions(db, job, &actions, work).await
+    lookup_from_catalog_actions(catalog, job, &actions, work).await
+}
+
+pub(crate) async fn fence_runtime_authority<'a>(
+    tx: &'a crate::store::RuntimeTransaction,
+    job: &'a pin_job::Model,
+    work: records::SharedDecodeBudget,
+) -> AppResult<CompletionReader<'a>> {
+    if tx.db().get_database_backend() != sea_orm::DatabaseBackend::Sqlite {
+        return fence_worker_authority_with_work(tx.db(), job, work).await;
+    }
+    records::locator::fence_authority(tx.db())
+        .await
+        .map_err(safe)?;
+    records::DecodeWork::shared(&work)
+        .copy(&(&job.provider, &job.cid))
+        .map_err(safe)?;
+    let catalog = tx.catalog(records::DecodeWork::shared(&work));
+    let actions = crate::store::pinning::management::admission::authority::actions_for_job_catalog(
+        catalog,
+        job,
+        work.clone(),
+    )
+    .await
+    .map_err(safe)?;
+    if let Some(authority) = lookup_from_catalog_actions(catalog, job, &actions, work.clone())
+        .await
+        .map_err(safe)?
+        && authority.directive == records::JobDirective::Submit
+    {
+        current_scope::fence(tx.db(), job, &authority)
+            .await
+            .map_err(safe)?;
+    }
+    Ok(CompletionReader::runtime(tx, job, actions, work))
+}
+
+pub(crate) async fn lock_runtime_source(
+    tx: &crate::store::RuntimeTransaction,
+    job: &pin_job::Model,
+    work: records::SharedDecodeBudget,
+) -> AppResult<()> {
+    crate::store::pinning::management::admission::lock_sqlite_writer_in_caller_transaction(tx.db())
+        .await?;
+    let catalog = tx.catalog(records::DecodeWork::shared(&work));
+    if let Some(authority) = lookup_catalog(catalog, job, work.clone())
+        .await
+        .map_err(safe)?
+        && authority.directive == records::JobDirective::Submit
+    {
+        source::lock(tx.db(), &authority).await.map_err(safe)?;
+    }
+    Ok(())
 }
 
 async fn lookup_from_actions<C: ConnectionTrait>(
@@ -439,6 +625,16 @@ async fn lookup_from_actions<C: ConnectionTrait>(
     actions: &[records::TrustedAppliedAction],
     work: records::SharedDecodeBudget,
 ) -> Result<Option<records::JobAuthority>> {
+    lookup_from_catalog_actions(ReceiptCatalog::full(db), job, actions, work).await
+}
+
+async fn lookup_from_catalog_actions(
+    catalog: ReceiptCatalog<'_>,
+    job: &pin_job::Model,
+    actions: &[records::TrustedAppliedAction],
+    work: records::SharedDecodeBudget,
+) -> Result<Option<records::JobAuthority>> {
+    let db = &catalog;
     let mut found = None;
     for trusted in actions {
         let action = trusted.action_view();
@@ -447,7 +643,7 @@ async fn lookup_from_actions<C: ConnectionTrait>(
                 continue;
             }
             trusted.validate_job(authority)?;
-            validate_job_resolved_with_work(db, job, authority, trusted.binding().decode_work())
+            validate_job_resolved_catalog(catalog, job, authority, trusted.binding().decode_work())
                 .await?;
             let invocation = records::current_model::<pin_invocation_route::Entity, _>(
                 db,
@@ -494,8 +690,8 @@ async fn lookup_from_actions<C: ConnectionTrait>(
                 {
                     return Err(ManagementError::Confirmation);
                 }
-                if !successor::original_submit_for_poll(
-                    db,
+                if !successor::original_submit_for_poll_catalog(
+                    catalog,
                     job,
                     original,
                     &invocation,
@@ -511,8 +707,8 @@ async fn lookup_from_actions<C: ConnectionTrait>(
                 // Stable seed equality is preserved for C's execution scope.
                 // Invocation/reference progression is a derived live permit,
                 // not a rewrite of the immutable applied authority.
-                validate_job_resolved_with_work(
-                    db,
+                validate_job_resolved_catalog(
+                    catalog,
                     job,
                     &successor,
                     trusted.binding().decode_work(),
@@ -1076,8 +1272,18 @@ async fn validate_job_resolved<C: ConnectionTrait>(
     )
     .await
 }
+#[cfg(test)]
 pub(crate) async fn validate_job_resolved_with_work<C: ConnectionTrait>(
     db: &C,
+    job: &pin_job::Model,
+    authority: &records::JobAuthority,
+    work: records::DecodeWork<'_>,
+) -> Result<()> {
+    validate_job_resolved_catalog(ReceiptCatalog::full(db), job, authority, work).await
+}
+
+async fn validate_job_resolved_catalog(
+    catalog: ReceiptCatalog<'_>,
     job: &pin_job::Model,
     authority: &records::JobAuthority,
     work: records::DecodeWork<'_>,
@@ -1085,12 +1291,12 @@ pub(crate) async fn validate_job_resolved_with_work<C: ConnectionTrait>(
     if job.provider != authority.provider {
         work.copy(&[("id", &job.id)])?;
         let key = [("id".into(), job.id.clone())].into();
-        let binding = crate::store::pinning::legacy_migration::resolve_legacy_binding_with_work(
-            db,
+        let binding = crate::store::pinning::legacy_migration::resolve_with_catalog(
             "pin_jobs",
             &key,
             &authority.provider,
-            work,
+            &work,
+            catalog,
         )
         .await?
         .ok_or(ManagementError::Confirmation)?;
@@ -1103,8 +1309,8 @@ pub(crate) async fn validate_job_resolved_with_work<C: ConnectionTrait>(
     }
     validate_job(job, authority)
 }
-async fn operational_resource_with_work<C: ConnectionTrait>(
-    db: &C,
+async fn operational_resource_catalog(
+    catalog: ReceiptCatalog<'_>,
     authority: &records::JobAuthority,
     work: records::DecodeWork<'_>,
 ) -> Result<String> {
@@ -1117,12 +1323,12 @@ async fn operational_resource_with_work<C: ConnectionTrait>(
         work.copy(&("epoch", authority.remote_epoch))?;
         key.insert("epoch".into(), authority.remote_epoch.to_string());
     }
-    let binding = crate::store::pinning::legacy_migration::resolve_legacy_binding_with_work(
-        db,
+    let binding = crate::store::pinning::legacy_migration::resolve_with_catalog(
         &authority.resource_key.table,
         &key,
         &authority.provider,
-        work,
+        &work,
+        catalog,
     )
     .await?;
     if let Some(binding) = binding {

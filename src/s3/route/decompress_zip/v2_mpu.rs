@@ -20,7 +20,7 @@ use crate::{
         multipart::v2_zip::{CompleteReceipt, CompleteState, Record},
         pinning::publication::{
             CapturedZipPublication, PublicationObject, ZipExecutionSettlement,
-            ZipPublicationAuthority, publish_captured_zip,
+            ZipPublicationAuthority, application::publish_captured_zip,
         },
         zip::{self, execution},
     },
@@ -614,7 +614,7 @@ pub(super) async fn complete(
     if lease.cancelled.is_cancelled() {
         return Err(conflict());
     }
-    let publication = publish_captured_zip(db, request).await;
+    let publication = publish_captured_zip(&state.store, request).await;
     if matches!(publication, Err(AppError::StaleContentMutation)) {
         let fenced = if options.publish_source {
             execution::fence(db, &claim).await

@@ -12,8 +12,11 @@ use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFi
 use std::collections::{BTreeMap, BTreeSet};
 pub(super) mod work;
 use work::Work;
+mod catalog;
 mod indexed;
+pub(crate) use catalog::ReceiptCatalog;
 pub(crate) use indexed::admission_historical_keys;
+pub(in crate::store::pinning) use indexed::admission_historical_keys_with_catalog;
 mod maintenance;
 use crate::store::pinning::management::records::locator::AuthoritySelector;
 
@@ -338,6 +341,23 @@ pub(super) async fn resolve_with_work<C: ConnectionTrait, W: Work>(
     provider: &str,
     work: &W,
 ) -> Result<Option<LegacyBinding>, W::Error> {
+    resolve_with_catalog(
+        table,
+        original_key,
+        provider,
+        work,
+        ReceiptCatalog::full(db),
+    )
+    .await
+}
+
+pub(in crate::store::pinning) async fn resolve_with_catalog<W: Work>(
+    table: &str,
+    original_key: &BTreeMap<String, String>,
+    provider: &str,
+    work: &W,
+    catalog: ReceiptCatalog<'_>,
+) -> Result<Option<LegacyBinding>, W::Error> {
     let mut found = None;
     work.copy(original_key)?;
     let encoded = serde_json::to_string(original_key)
@@ -359,10 +379,10 @@ pub(super) async fn resolve_with_work<C: ConnectionTrait, W: Work>(
     if values.len() != original_key.len() {
         return Err(W::application(refused("original key invalid")));
     }
-    for op in indexed::active_for(
-        db,
+    for op in indexed::active_for_catalog(
         AuthoritySelector::LegacyPoint(table.into(), values, provider.into()),
         work,
+        catalog,
     )
     .await?
     {
@@ -371,7 +391,7 @@ pub(super) async fn resolve_with_work<C: ConnectionTrait, W: Work>(
             .filter(item::Column::OperationId.eq(&op.id))
             .filter(item::Column::TableKind.eq(table))
             .filter(item::Column::OriginalKey.eq(&encoded))
-            .all(db)
+            .all(&catalog)
             .await
             .map_err(|error| W::application(error.into()))?;
         for row in rows {
@@ -500,10 +520,18 @@ pub(crate) async fn source_is_migrated_with_work<C: ConnectionTrait>(
     provider: &str,
     work: crate::store::pinning::management::records::DecodeWork<'_>,
 ) -> crate::store::pinning::management::Result<bool> {
-    for op in indexed::active_for(
-        db,
+    source_is_migrated_catalog(ReceiptCatalog::full(db), provider, work).await
+}
+
+pub(crate) async fn source_is_migrated_catalog(
+    catalog: ReceiptCatalog<'_>,
+    provider: &str,
+    work: crate::store::pinning::management::records::DecodeWork<'_>,
+) -> crate::store::pinning::management::Result<bool> {
+    for op in indexed::active_for_catalog(
         AuthoritySelector::LegacyNamespace(provider.into()),
         &work,
+        catalog,
     )
     .await?
     {
@@ -544,18 +572,18 @@ pub(super) async fn source_has_receipt<C: ConnectionTrait>(
     Ok(false)
 }
 
-pub(super) async fn job_was_present_from_loaded<C: ConnectionTrait>(
-    db: &C,
+pub(super) async fn job_was_present_from_loaded(
     job: &crate::store::entities::pin_job::Model,
     candidates: &crate::store::pinning::management::records::locator::AuthorityView,
     work: crate::store::pinning::management::records::DecodeWork<'_>,
+    catalog: ReceiptCatalog<'_>,
 ) -> crate::store::pinning::management::Result<bool> {
-    for operation in indexed::active_for_loaded(
-        db,
+    for operation in indexed::active_for_loaded_catalog(
         &AuthoritySelector::LegacyJob(job.provider.clone(), job.id.clone()),
         candidates,
         &work,
         work,
+        catalog,
     )
     .await?
     {
@@ -615,22 +643,23 @@ pub(super) async fn historical_keys_with_work<C: ConnectionTrait, W: Work>(
     resource_keys_from_active(table, provider, cid, active, work)
 }
 
-pub(super) async fn historical_keys_from_loaded<C: ConnectionTrait, W: Work>(
-    db: &C,
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn historical_keys_from_catalog<W: Work>(
     table: &str,
     provider: &str,
     cid: Option<&str>,
     candidates: &crate::store::pinning::management::records::locator::AuthorityView,
     work: &W,
     context: crate::store::pinning::management::records::DecodeWork<'_>,
+    catalog: ReceiptCatalog<'_>,
 ) -> Result<Vec<String>, W::Error> {
     work.copy(provider)?;
-    let active = indexed::active_for_loaded(
-        db,
+    let active = indexed::active_for_loaded_catalog(
         &AuthoritySelector::LegacyResource(table.into(), provider.into(), cid.map(str::to_owned)),
         candidates,
         work,
         context,
+        catalog,
     )
     .await?;
     resource_keys_from_active(table, provider, cid, active, work)
@@ -678,6 +707,7 @@ pub(crate) async fn historical_job_keys<C: ConnectionTrait, W: Work>(
     job_keys_from_active(provider, active, work)
 }
 
+#[cfg(test)]
 pub(crate) async fn historical_job_keys_from_loaded<C: ConnectionTrait>(
     db: &C,
     provider: &str,
@@ -685,13 +715,23 @@ pub(crate) async fn historical_job_keys_from_loaded<C: ConnectionTrait>(
     candidates: &crate::store::pinning::management::records::locator::AuthorityView,
     work: crate::store::pinning::management::records::DecodeWork<'_>,
 ) -> crate::store::pinning::management::Result<Vec<String>> {
+    historical_job_keys_from_catalog(provider, id, candidates, work, ReceiptCatalog::full(db)).await
+}
+
+pub(in crate::store::pinning) async fn historical_job_keys_from_catalog(
+    provider: &str,
+    id: &str,
+    candidates: &crate::store::pinning::management::records::locator::AuthorityView,
+    work: crate::store::pinning::management::records::DecodeWork<'_>,
+    catalog: ReceiptCatalog<'_>,
+) -> crate::store::pinning::management::Result<Vec<String>> {
     work.copy(&(provider, id))?;
-    let active = indexed::active_for_loaded(
-        db,
+    let active = indexed::active_for_loaded_catalog(
         &AuthoritySelector::LegacyJob(provider.into(), id.into()),
         candidates,
         &work,
         work,
+        catalog,
     )
     .await?;
     job_keys_from_active(provider, active, &work)

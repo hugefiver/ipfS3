@@ -19,7 +19,7 @@ use crate::{
         },
         pinning::publication::{
             CapturedZipPublication, LegacyZipAuthority, PublicationObject, PublicationResult,
-            ZipPublicationAuthority, publish_captured_zip,
+            ZipPublicationAuthority, application::publish_captured_zip,
         },
     },
     zip::{batch::FinalZipManifest, response::ExtractedEntry},
@@ -142,7 +142,7 @@ pub(crate) async fn publish_zip_import(
         )
     })?;
     let root_enabled = capture.controls().root.enabled();
-    let published = publish_captured_zip(state.store.db(), CapturedZipPublication {
+    let published = publish_captured_zip(&state.store, CapturedZipPublication {
         batch_id: job.id.clone(), source: Some(archive_object), source_tags, successes,
         manifest: manifest.clone(), capture,
         authority: ZipPublicationAuthority::Legacy(Box::new(LegacyZipAuthority {

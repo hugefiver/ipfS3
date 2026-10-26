@@ -46,9 +46,10 @@ resident 预算追踪同时存活的内存，释放页后可归还；work 累计
 输出、页及重试成本，子调用和恢复不能重置累计额度。authority predecessor depth 最多 32，
 普通数据叶不计为 predecessor 深度。
 
-当前 CLI 流式文件预算为 4 GiB 输入工作量、1000 万 rows、32 MiB accounted resident 和
-每次操作 30 秒，不沿用 v2 单文件 16 MiB 总量上限。DB-backed 管理操作有 30 秒工作窗口，
-随后取消并最多等待 5 秒 owned-work drain。这些数值不等于已经证明的业务容量。
+当前 CLI 流式文件预算为 8 GiB 工作字节、1000 万 rows、32 MiB accounted resident 和
+每次操作 120 秒。dry-run/confirm 使用 120 秒工作窗口，其他普通 DB-backed 管理操作
+保留 30 秒工作窗口；取消后最多等待 5 秒 owned-work drain。已有 checkpoint 保留原来的
+累计上限和已花费工作量，新默认值不扩大旧任务额度。这些数值不等于已经证明的业务容量。
 CLI 不提供累计任务预算调整。含 Provider 全域规划的 dry-run/confirm 可用互斥的
 `--checkpoint NEWDIR` / `--resume EXISTINGDIR` 显式保留、跨进程继续受保护的工作区；
 `--scan-pages 1..512` 只限制本轮页数，默认 64，不重置累计工作额度。恢复须匹配原请求、
@@ -60,6 +61,9 @@ ACK 规则原子发布确认，并在首次发布时建立 DB-clock TTL，不从
 输出或确认失败保留 checkpoint；确认已提交但输出失败时，只读恢复原确认，不重发确认或
 改变原 ACK/期限，并保留工作区。普通成功完成才清理本任务工作区。输出始终使用新
 exclusive-create 文件，不覆盖或追加原 partial 文件，也不因恢复而延长已有授权。
+
+恢复导出必须保留完整内容和确认语义，但不要求 JSON 编码或物理 chunk 划分逐字节相同。
+每份文件独立验证完整性和 EOF；持久保存的原始归档字节及其完整性引用仍须精确保持。
 
 `RetireWith::Migrate` 必须覆盖全部 active targets，`ControlledCleanup` 必须覆盖全部符合
 安全条件的 current resources。实际显式选择/写集超单次请求预算时整次拒绝，不能为了分页
@@ -202,6 +206,17 @@ pass，不全局清队列；claim cap、due time 和 readonly 限制仍有效。
 已有旧库、partial、backfill、未知版本或维护机制不完整时拒绝启动，要求显式升级；
 在此之前不迁移、不写 migration-lock、不注册身份或启动 worker。缺 migration metadata
 不是空库证明，普通 management CLI 也不自动建表或迁移。
+
+SQLite runtime 可在同一 Store 实例内复用完整校验后的静态 schema 资格；校验覆盖
+native、management、receipt 和 route 的表、trigger、index 等结构。Store 的克隆共享资格，
+重新构造的 Store 必须独立校验，失败或取消不能留下可复用的成功标记。运行期仍实时读取
+版本、readiness 和实际连接上的相关 TEMP shadow；权限、原始绑定、retirement、quota、
+claim、epoch、TTL 与 ACK 不作为 schema 资格的一部分缓存。裸 DB、历史、维护和 PostgreSQL
+路径继续完整校验。
+
+不支持绕过应用直接在线修改 SQLite schema，也不保证立即发现此类变更，尤其是同时伪造
+migration version 的情况。schema 维护前必须停服并排空操作，废弃全部旧 Store 及其克隆；
+显式校验或升级后，重新启动并取得新资格。不能在升级失败或完成后继续使用旧 Store。
 
 独立升级入口不加载 gateway config、不构造 AppState、不注册 provider、不启动 worker，
 不做 source/provider RPC。五个参数均必填，identity/scope 必须是授权原库的真实绑定。

@@ -18,10 +18,10 @@ enum ConversionDirection {
 pub struct Migration;
 
 #[async_trait::async_trait]
-impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+impl super::bridge::SharedMigration for Migration {
+    async fn up_body(&self, manager: &super::bridge::Manager<'_>) -> Result<(), DbErr> {
         execute_statements(
-            manager,
+            manager.get_connection(),
             timestamp_statements_for_backend(
                 manager.get_connection().get_database_backend(),
                 ConversionDirection::Up,
@@ -29,10 +29,16 @@ impl MigrationTrait for Migration {
         )
         .await
     }
-
+}
+#[async_trait::async_trait]
+impl MigrationTrait for Migration {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        super::bridge::SharedMigration::up_body(self, &super::bridge::Manager::native(manager))
+            .await
+    }
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         execute_statements(
-            manager,
+            manager.get_connection(),
             timestamp_statements_for_backend(
                 manager.get_connection().get_database_backend(),
                 ConversionDirection::Down,
@@ -42,15 +48,12 @@ impl MigrationTrait for Migration {
     }
 }
 
-async fn execute_statements(
-    manager: &SchemaManager<'_>,
+async fn execute_statements<C: ConnectionTrait>(
+    connection: &C,
     statements: Vec<String>,
 ) -> Result<(), DbErr> {
     for statement in statements {
-        manager
-            .get_connection()
-            .execute_unprepared(&statement)
-            .await?;
+        connection.execute_unprepared(&statement).await?;
     }
     Ok(())
 }

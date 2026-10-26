@@ -3,7 +3,10 @@ use crate::store::pinning::management::native::meter::Budget;
 
 #[test]
 fn production_stop_leaves_hard_settlement_and_final_transfer_available() {
-    let limits = RunLimits::default();
+    let limits = RunLimits {
+        elapsed: Duration::from_secs(30),
+        ..Default::default()
+    };
     let mut production = limits.for_production();
     let start = *limits.started.get().unwrap();
     assert_eq!(production.production_end(), start + Duration::from_secs(25));
@@ -55,4 +58,44 @@ fn caps_and_capture_share_fixed_start_pages_and_never_extend_deadlines() {
     limits.cancellation.cancel();
     assert_eq!(caps.check(), Err(ManagementError::Budget));
     drop(resident);
+}
+
+#[tokio::test]
+async fn higher_invocation_limits_cannot_refill_a_persisted_small_task() {
+    let db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+    db.execute_unprepared(budget::SCHEMA).await.unwrap();
+    let original = RunLimits {
+        total_rows: 8,
+        total_bytes: 48,
+        ..Default::default()
+    };
+    let run = task_run(&db, &original).await.unwrap();
+    budget::charge(&db, &run, 2, 40).await.unwrap();
+    let higher = RunLimits::default();
+    let resumed = task_run(&db, &higher).await.unwrap();
+    assert_eq!((resumed.total_rows, resumed.total_bytes), (8, 48));
+    budget::charge(&db, &resumed, 1, 8).await.unwrap();
+    assert_eq!(
+        budget::charge(&db, &resumed, 0, 1).await,
+        Err(ManagementError::Budget)
+    );
+    let another = RunLimits::default();
+    let reopened = task_run(&db, &another).await.unwrap();
+    assert_eq!(
+        budget::charge(&db, &reopened, 0, 1).await,
+        Err(ManagementError::Budget)
+    );
+    let row = one(
+        &db,
+        "SELECT rows_limit,bytes_limit,rows_used,bytes_used,pages_used FROM task_budget",
+        vec![],
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(get::<i64>(&row, "rows_limit").unwrap(), 8);
+    assert_eq!(get::<i64>(&row, "bytes_limit").unwrap(), 48);
+    assert_eq!(get::<i64>(&row, "rows_used").unwrap(), 3);
+    assert_eq!(get::<i64>(&row, "bytes_used").unwrap(), 48);
+    assert_eq!(get::<i64>(&row, "pages_used").unwrap(), 2);
 }

@@ -40,14 +40,20 @@ fn mutation_prefix_index() -> IndexCreateStatement {
 }
 
 #[async_trait::async_trait]
-impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+impl super::bridge::SharedMigration for Migration {
+    async fn up_body(&self, manager: &super::bridge::Manager<'_>) -> Result<(), DbErr> {
         manager.alter_table(add_mutation_id_column()).await?;
         manager.alter_table(add_mutation_prefix_column()).await?;
         manager.create_index(active_mutation_index()).await?;
         manager.create_index(mutation_prefix_index()).await
     }
-
+}
+#[async_trait::async_trait]
+impl MigrationTrait for Migration {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        super::bridge::SharedMigration::up_body(self, &super::bridge::Manager::native(manager))
+            .await
+    }
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
             .drop_index(

@@ -1,19 +1,17 @@
 use super::*;
 use crate::pinning::management::wire::v3::{self, Projection};
-use std::{
-    sync::Mutex,
-    time::{Duration, Instant},
-};
+use std::{sync::Mutex, time::Instant};
 
 struct StopAtNativeChunk {
     bytes: Vec<u8>,
     clock: Arc<Mutex<Instant>>,
+    end: Instant,
 }
 impl Write for StopAtNativeChunk {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         self.bytes.extend_from_slice(bytes);
         if bytes.len() == CELL_SLICE {
-            *self.clock.lock().unwrap() = Instant::now() + Duration::from_secs(30);
+            *self.clock.lock().unwrap() = self.end;
         }
         Ok(bytes.len())
     }
@@ -264,6 +262,7 @@ async fn native_roundtrip(projection: Projection, reopen: bool) -> (Vec<u8>, u64
         StopAtNativeChunk {
             bytes: Vec::new(),
             clock,
+            end: Instant::now() + limits.elapsed,
         },
         projection,
         Budget::default(),
@@ -507,6 +506,7 @@ async fn native_batch_checksum_error_settles_prepaid_debt_before_return() {
         StopAtNativeChunk {
             bytes: Vec::new(),
             clock: Arc::new(Mutex::new(Instant::now())),
+            end: Instant::now() + RunLimits::default().elapsed,
         },
         Projection::PrivateRecovery,
         Budget::default(),

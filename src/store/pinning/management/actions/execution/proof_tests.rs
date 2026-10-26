@@ -190,6 +190,214 @@ pub(crate) async fn assert_restored(
     assert!(replay.replayed && replay.items == applied.items);
 }
 
+async fn assert_executed_job_work_owner(exhaust_binding: bool) {
+    let fixture = fixture("proof-job-work", false, false, false).await;
+    let binding = &fixture.binding;
+    let before = binding.view().frozen_rows().unwrap();
+    let tx = fixture.db.begin().await.unwrap();
+    let mut batch =
+        ExecutionBatch::new(&tx, &fixture.config, &fixture.auth, binding, before).unwrap();
+    let executed = batch
+        .execute_entry(&binding.confirmation.bindings[0])
+        .await
+        .unwrap();
+    let authority = executed.action_view().jobs.first().unwrap();
+    let binding_work = binding.view().decode_work();
+    let action_work = executed.work();
+    assert!(!Arc::ptr_eq(binding_work.budget(), action_work.budget()));
+    for work in [binding_work, action_work] {
+        work.with(|session| {
+            session.check()?;
+            assert!(session.usage().0 > 0);
+            Ok(())
+        })
+        .unwrap();
+    }
+    let mut invalid = authority.clone();
+    invalid.remote_epoch += 1;
+    assert_eq!(
+        executed.validate_job(binding, &invalid),
+        Err(ManagementError::Confirmation)
+    );
+    let exhausted = if exhaust_binding {
+        binding_work
+    } else {
+        action_work
+    };
+    assert_eq!(
+        exhausted
+            .with(|session| session.nodes(crate::pinning::management::wire::MAX_WIRE_NODES + 1)),
+        Err(ManagementError::Budget)
+    );
+    let expected = if exhaust_binding {
+        Ok(())
+    } else {
+        Err(ManagementError::Budget)
+    };
+    assert_eq!(
+        super::validate_job(
+            binding.view().with_work(action_work.budget()),
+            executed.action_view(),
+            executed.operation(),
+            authority,
+        ),
+        expected
+    );
+    let binding_debt = binding_work.with(|session| Ok(session.usage())).unwrap();
+    let action_debt = action_work.with(|session| Ok(session.usage())).unwrap();
+    assert_eq!(executed.validate_job(binding, authority), expected);
+    assert_eq!(
+        binding_work.with(|session| Ok(session.usage())).unwrap(),
+        binding_debt
+    );
+    let action_after = action_work.with(|session| Ok(session.usage())).unwrap();
+    if exhaust_binding {
+        assert!(action_after.0 > action_debt.0);
+        assert!(action_after.1 >= action_debt.1);
+        action_work.with(|session| session.check()).unwrap();
+    } else {
+        assert_eq!(action_after, action_debt);
+        binding_work.with(|session| session.check()).unwrap();
+    }
+    assert_eq!(
+        exhausted.with(|session| session.check()),
+        Err(ManagementError::Budget)
+    );
+    assert_eq!(
+        executed.validate_job(binding, &invalid),
+        Err(ManagementError::Confirmation)
+    );
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn executed_job_validation_uses_action_work_after_binding_exhaustion() {
+    assert_executed_job_work_owner(true).await;
+}
+
+#[tokio::test]
+async fn executed_job_validation_preserves_exhausted_action_work() {
+    assert_executed_job_work_owner(false).await;
+}
+
+async fn assert_executed_negative_proof_work_owner(exhaust_binding: bool) {
+    let fixture = fixture("proof-negative-work", false, false, false).await;
+    let binding = &fixture.binding;
+    let before = binding.view().frozen_rows().unwrap();
+    let tx = fixture.db.begin().await.unwrap();
+    let mut batch =
+        ExecutionBatch::new(&tx, &fixture.config, &fixture.auth, binding, before).unwrap();
+    let executed = batch
+        .execute_entry(&binding.confirmation.bindings[0])
+        .await
+        .unwrap();
+    let binding_work = binding.view().decode_work();
+    let action_work = executed.work();
+    assert!(!Arc::ptr_eq(binding_work.budget(), action_work.budget()));
+    let mut corrupt_facts = executed.operation().facts.as_ref().clone();
+    let output = corrupt_facts
+        .2
+        .iter_mut()
+        .find(|output| output.0.0 == "remote_pins")
+        .unwrap();
+    let epoch = before
+        .table("remote_pins")
+        .unwrap()
+        .columns
+        .iter()
+        .position(|column| column == "epoch")
+        .unwrap();
+    output.2.as_mut().unwrap()[epoch] = Some("999".into());
+    let corrupt_facts = Arc::new(corrupt_facts);
+    let cursor = Cursor::default();
+    let corrupt_operation = OperationRead::resolve(
+        binding.view().with_work(action_work.budget()),
+        corrupt_facts.clone(),
+        &cursor,
+    )
+    .unwrap();
+    let mut corrupt_action = executed.action_view().clone();
+    corrupt_action.jobs[0].remote_epoch += 1;
+    let exhausted = if exhaust_binding {
+        binding_work
+    } else {
+        action_work
+    };
+    assert_eq!(
+        exhausted
+            .with(|session| session.nodes(crate::pinning::management::wire::MAX_WIRE_NODES + 1)),
+        Err(ManagementError::Budget)
+    );
+    let binding_debt = binding_work.with(|session| Ok(session.usage())).unwrap();
+    let action_debt = action_work.with(|session| Ok(session.usage())).unwrap();
+    let owned_binding = executed.binding_for_test(binding);
+    let resolved =
+        OperationRead::resolve(owned_binding, executed.operation().facts.clone(), &cursor);
+    if exhaust_binding {
+        let resolved = resolved.unwrap();
+        validate_operation_with_cursor(owned_binding, executed.action_view(), &resolved, &cursor)
+            .unwrap();
+        let invalid = OperationRead::resolve(owned_binding, corrupt_facts, &cursor).unwrap();
+        let rejection = validate_operation_with_cursor(
+            owned_binding,
+            executed.action_view(),
+            &invalid,
+            &cursor,
+        )
+        .unwrap_err();
+        assert_ne!(rejection, ManagementError::Budget);
+        let rejection = validate_operation(owned_binding, &corrupt_action, &resolved).unwrap_err();
+        assert_ne!(rejection, ManagementError::Budget);
+    } else {
+        assert_eq!(resolved.err(), Some(ManagementError::Budget));
+        assert_eq!(
+            validate_operation_with_cursor(
+                owned_binding,
+                executed.action_view(),
+                &corrupt_operation,
+                &cursor,
+            ),
+            Err(ManagementError::Budget)
+        );
+        assert_eq!(
+            validate_operation(owned_binding, &corrupt_action, executed.operation()),
+            Err(ManagementError::Budget)
+        );
+    }
+    assert!(Arc::ptr_eq(
+        owned_binding.decode_work().budget(),
+        action_work.budget()
+    ));
+    assert_eq!(
+        binding_work.with(|session| Ok(session.usage())).unwrap(),
+        binding_debt
+    );
+    let action_after = action_work.with(|session| Ok(session.usage())).unwrap();
+    if exhaust_binding {
+        assert!(action_after.0 > action_debt.0);
+        assert!(action_after.1 >= action_debt.1);
+        action_work.with(|session| session.check()).unwrap();
+    } else {
+        assert_eq!(action_after, action_debt);
+        binding_work.with(|session| session.check()).unwrap();
+    }
+    assert_eq!(
+        exhausted.with(|session| session.check()),
+        Err(ManagementError::Budget)
+    );
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn executed_negative_proofs_use_action_work_after_binding_exhaustion() {
+    assert_executed_negative_proof_work_owner(true).await;
+}
+
+#[tokio::test]
+async fn executed_negative_proofs_preserve_exhausted_action_work() {
+    assert_executed_negative_proof_work_owner(false).await;
+}
+
 #[tokio::test]
 async fn actual_grant_prefix_and_entry_local_job_birth_restore_across_consumers() {
     let fixture = fixture("proof-grant", true, false, false).await;

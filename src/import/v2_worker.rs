@@ -24,7 +24,7 @@ use crate::{
         import::ownership,
         pinning::publication::{
             CapturedZipPublication, PublicationObject, ZipExecutionSettlement,
-            ZipPublicationAuthority, decode_zip_capture_json, publish_captured_zip,
+            ZipPublicationAuthority, application::publish_captured_zip, decode_zip_capture_json,
         },
         zip::{self, execution, import_intake},
     },
@@ -656,7 +656,7 @@ async fn execute_inner(
         root_outcome: root,
         terminal_result: terminal,
     };
-    match publish_captured_zip(db, request).await {
+    match publish_captured_zip(&state.store, request).await {
         Ok(_) => Ok(()),
         Err(AppError::StaleContentMutation) => Err(RunError::Fenced),
         Err(_) => {

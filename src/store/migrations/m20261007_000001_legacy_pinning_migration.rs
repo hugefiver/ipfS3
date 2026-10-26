@@ -6,8 +6,8 @@ pub(crate) mod schema;
 pub struct Migration;
 
 #[async_trait::async_trait]
-impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+impl super::bridge::SharedMigration for Migration {
+    async fn up_body(&self, manager: &super::bridge::Manager<'_>) -> Result<(), DbErr> {
         let db = manager.get_connection();
         db.execute_unprepared(schema::OPERATIONS_SQL).await?;
         db.execute_unprepared(schema::ITEMS_SQL).await?;
@@ -37,7 +37,13 @@ impl MigrationTrait for Migration {
         }
         Ok(())
     }
-
+}
+#[async_trait::async_trait]
+impl MigrationTrait for Migration {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        super::bridge::SharedMigration::up_body(self, &super::bridge::Manager::native(manager))
+            .await
+    }
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
         if manager.get_database_backend() == sea_orm::DatabaseBackend::Postgres {

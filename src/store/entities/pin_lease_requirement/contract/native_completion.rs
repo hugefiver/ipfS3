@@ -4,7 +4,12 @@ use super::*;
 use crate::store::pinning::legacy_migration as legacy;
 #[cfg(test)]
 use sea_orm::Statement;
-use sea_orm::{ColumnTrait, QueryFilter};
+
+#[path = "native_completion/batch.rs"]
+mod batch;
+#[cfg(test)]
+#[path = "native_completion/tests/behavior.rs"]
+mod behavior;
 
 pub(super) async fn management_participates<C: ConnectionTrait>(
     db: &C,
@@ -182,44 +187,32 @@ pub(super) async fn completion<C: ConnectionTrait>(
     let mut all = any;
     let mut pinned = 0;
     let resolved = candidates(db, lease_id, &birth).await?;
-    for object_cid in &birth.content_cids {
-        let mut available = false;
-        for (slot, allocation) in &resolved {
-            let route = birth.candidates.get(slot).and_then(Option::as_ref);
-            let cid = if route.is_some_and(|route| {
-                matches!(
-                    route.resource_type(),
-                    crate::pinning::identity::RemoteResourceType::ClusterPin
-                        | crate::pinning::identity::RemoteResourceType::RpcPin
-                )
-            }) {
-                canonical_resource_cid(object_cid).unwrap_or_else(|_| object_cid.clone())
-            } else {
-                object_cid.clone()
-            };
-            let remote = remote_pin::Entity::find_by_id((allocation.clone(), cid.clone()))
-                .one(db)
-                .await?;
-            let attached = pin_lease_target::Entity::find()
-                .filter(pin_lease_target::Column::LeaseId.eq(lease_id))
-                .filter(pin_lease_target::Column::Provider.eq(allocation))
-                .filter(pin_lease_target::Column::Cid.eq(&cid))
-                .filter(pin_lease_target::Column::State.eq("pinned"))
-                .one(db)
-                .await?
-                .is_some();
-            let cluster = route.is_some_and(|route| {
-                route.resource_type() == crate::pinning::identity::RemoteResourceType::ClusterPin
-            });
-            let confirmed = attached
-                && remote.is_some_and(|row| {
-                    row.status == "pinned" || cluster && row.status == "pinning"
-                })
+    let mut combinations = batch::combinations(&birth, &resolved);
+    let mut current_cid = None;
+    let mut available = false;
+    loop {
+        let combinations = combinations
+            .by_ref()
+            .take(batch::PAGE_SIZE)
+            .collect::<Vec<_>>();
+        if combinations.is_empty() {
+            break;
+        }
+        let page = batch::Page::load(db, lease_id, &combinations).await?;
+        for combination in &combinations {
+            if current_cid != Some(combination.object_cid) {
+                if current_cid.is_some() {
+                    any &= available;
+                }
+                current_cid = Some(combination.object_cid);
+                available = false;
+            }
+            let confirmed = page.eligible(combination)
                 && target_confirmed_for_birth(
                     db,
                     lease_id,
-                    slot,
-                    &cid,
+                    combination.slot,
+                    &combination.query_cid,
                     now,
                     Some(&birth),
                     &resolved,
@@ -229,6 +222,8 @@ pub(super) async fn completion<C: ConnectionTrait>(
             all &= confirmed;
             pinned += usize::from(confirmed);
         }
+    }
+    if !birth.content_cids.is_empty() {
         any &= available;
     }
     Ok(Some((
@@ -247,7 +242,7 @@ mod tests {
     use super::*;
     #[tokio::test]
     async fn native_decompressed_content_reports_incomplete_without_management_authority() {
-        let fixture =
+        let mut fixture =
             crate::store::pinning::management::actions::tests::fixture("native-content-completion")
                 .await;
         let owner = match &fixture.binding.request.items[0].subject {
@@ -280,11 +275,26 @@ mod tests {
         )
         .await
         .unwrap();
+        let queries = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = queries.clone();
+        fixture.db.set_metric_callback(move |_| {
+            observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        let started = std::time::Instant::now();
         assert_eq!(
             super::super::completion(&fixture.db, "native-content", now)
                 .await
                 .unwrap(),
             Some((false, false, 0))
+        );
+        let queries = queries.load(std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "native 5000 CIDs: {queries} SQL statements, {:?}",
+            started.elapsed()
+        );
+        assert!(
+            queries <= 2 * 5000_usize.div_ceil(256) + 64,
+            "empty confirmation reads must scale with bounded pages, got {queries}"
         );
     }
 }

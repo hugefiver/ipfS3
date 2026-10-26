@@ -1194,7 +1194,7 @@ pub(crate) trait CompletedUploadFinalizerStore: Send + Sync {
 }
 
 struct DatabaseCompletedUploadFinalizer<'a> {
-    db: &'a sea_orm::DatabaseConnection,
+    store: &'a crate::store::Store,
     pinning: &'a crate::pinning::coordinator::PinningCoordinator,
 }
 
@@ -1208,8 +1208,8 @@ impl CompletedUploadFinalizerStore for DatabaseCompletedUploadFinalizer<'_> {
         _limits: &ProviderLimitMap,
         decision: &ExtensionDecision,
     ) -> Result<PublicationResult, crate::store::multipart::CommitCompletedUploadError> {
-        crate::store::pinning::publication::publish_decided_completed_upload(
-            self.db,
+        crate::store::pinning::publication::application::publish_decided_completed_upload(
+            self.store,
             upload_target,
             request,
             Some(guard),
@@ -1231,8 +1231,8 @@ impl CompletedUploadFinalizerStore for DatabaseCompletedUploadFinalizer<'_> {
         _limits: &ProviderLimitMap,
         decision: &ExtensionDecision,
     ) -> Result<PublicationResult, crate::store::multipart::CommitCompletedUploadError> {
-        crate::store::pinning::publication::publish_decided_completed_zip(
-            self.db,
+        crate::store::pinning::publication::application::publish_decided_completed_zip(
+            self.store,
             upload_target,
             request,
             Some(guard),
@@ -1253,8 +1253,8 @@ impl CompletedUploadFinalizerStore for DatabaseCompletedUploadFinalizer<'_> {
         guard: crate::store::import::ownership::StandardMutationGuard,
         limits: &ProviderLimitMap,
     ) -> Result<PublicationResult, crate::store::multipart::CommitCompletedUploadError> {
-        crate::store::pinning::publication::publish_standard_completed_upload(
-            self.db,
+        crate::store::pinning::publication::application::publish_standard_completed_upload(
+            self.store,
             upload_target,
             request,
             guard,
@@ -1270,8 +1270,8 @@ impl CompletedUploadFinalizerStore for DatabaseCompletedUploadFinalizer<'_> {
         guard: crate::store::import::ownership::StandardMutationGuard,
         limits: &ProviderLimitMap,
     ) -> Result<PublicationResult, crate::store::multipart::CommitCompletedUploadError> {
-        crate::store::pinning::publication::publish_standard_completed_zip(
-            self.db,
+        crate::store::pinning::publication::application::publish_standard_completed_zip(
+            self.store,
             upload_target,
             request,
             guard,
@@ -1286,7 +1286,7 @@ impl CompletedUploadFinalizerStore for DatabaseCompletedUploadFinalizer<'_> {
         expected_archive: &PublicationObject,
     ) -> crate::store::pinning::publication::ReconciledPublicationOutcome {
         crate::store::pinning::publication::reconcile_completed_publication(
-            self.db,
+            self.store.db(),
             upload_id,
             expected_archive,
         )
@@ -1328,7 +1328,7 @@ pub async fn finalize_completed_multipart_zip(
     request: ZipPublicationRequest,
 ) -> S3Result<PublicationResult> {
     let store = DatabaseCompletedUploadFinalizer {
-        db: state.store.db(),
+        store: &state.store,
         pinning: &state.pinning,
     };
     let work = finalize_completed_multipart_zip_with_store(
@@ -1366,8 +1366,11 @@ pub async fn finalize_completed_multipart_zip_batch(
     }
     let work = async {
         Ok::<_, s3s::S3Error>(
-            crate::store::pinning::publication::publish_captured_zip(state.store.db(), request)
-                .await,
+            crate::store::pinning::publication::application::publish_captured_zip(
+                &state.store,
+                request,
+            )
+            .await,
         )
     };
     let commit = match &completed.mutation_lease {
@@ -1507,7 +1510,7 @@ pub async fn finalize_completed_multipart_archive(
     completed: &CompletedMultipartArchive,
 ) -> S3Result<PublicationResult> {
     let store = DatabaseCompletedUploadFinalizer {
-        db: state.store.db(),
+        store: &state.store,
         pinning: &state.pinning,
     };
     let work = finalize_completed_multipart_archive_with_store(
@@ -2222,6 +2225,8 @@ pub async fn list_parts(
 
 #[cfg(test)]
 mod tests {
+    mod concat_stream_tests;
+    mod measurement_complete_tests;
     mod metadata_complete_tests;
     use super::*;
     use bytes::Bytes;

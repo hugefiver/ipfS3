@@ -51,8 +51,8 @@ impl Evidence {
     ) -> Result<Self> {
         Self::load_roots_reserved(db, scope, identity, plans, candidates, work).await
     }
-    pub(in crate::store::pinning::management::records) async fn load_indexed<C: ConnectionTrait>(
-        db: &C,
+    pub(in crate::store::pinning::management::records) async fn load_indexed_catalog(
+        catalog: crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
         scope: &str,
         identity: &str,
         keys: &[native::NativeKey],
@@ -60,6 +60,7 @@ impl Evidence {
         bytes: usize,
         work: SharedDecodeBudget,
     ) -> Result<Self> {
+        let db = &catalog;
         work.lock()
             .map_err(|_| ManagementError::InvalidEvidence)?
             .index_copy(&(scope, identity, keys))?;
@@ -93,7 +94,7 @@ impl Evidence {
             evidence.budget()?.index_copy(&key.values[1])?;
             plans.push(key.values[1].clone());
         }
-        evidence.read_plans(db, &plans).await?;
+        evidence.read_plans_catalog(catalog, &plans).await?;
         if !evidence.locators.is_empty() {
             return Err(ManagementError::Changed);
         }
@@ -146,7 +147,20 @@ impl Evidence {
         Ok(evidence)
     }
     async fn read_plans<C: ConnectionTrait>(&mut self, db: &C, plans: &[String]) -> Result<()> {
-        use native::scope::{self, ScopeSpec, Selector};
+        self.read_plans_catalog(
+            crate::store::pinning::legacy_migration::ReceiptCatalog::full(db),
+            plans,
+        )
+        .await
+    }
+
+    async fn read_plans_catalog(
+        &mut self,
+        catalog: crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
+        plans: &[String],
+    ) -> Result<()> {
+        let db = &catalog;
+        use native::scope::{ScopeSpec, Selector};
         let mut selectors = self
             .rows
             .keys()
@@ -184,7 +198,9 @@ impl Evidence {
                 if !upgrading {
                     budget = self.budget()?.storage_budget()?;
                 }
-                let read = scope::collect_scope(db, &spec, &mut budget).await;
+                let read = catalog
+                    .collect_scope(&spec, &mut budget, DecodeWork::shared(&self.work))
+                    .await;
                 if !upgrading {
                     charge_storage_work(&budget, DecodeWork::shared(&self.work))?;
                 }

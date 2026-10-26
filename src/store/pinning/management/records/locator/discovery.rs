@@ -2,6 +2,7 @@
 use super::*;
 use native::meter::{PAGE_ROWS, ResidentGuard};
 use sea_orm::DatabaseBackend;
+mod classification;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -146,6 +147,14 @@ pub async fn discover_authority<C: ConnectionTrait>(
     budget: &mut Budget,
 ) -> Result<AuthorityView> {
     crate::store::pinning::management::schema::validate(tx).await?;
+    discover_validated(tx, selectors, budget).await
+}
+
+async fn discover_validated<C: ConnectionTrait>(
+    tx: &C,
+    selectors: &[AuthoritySelector],
+    budget: &mut Budget,
+) -> Result<AuthorityView> {
     if selectors.is_empty() || selectors.len() > 128 {
         return Err(ManagementError::InvalidEvidence);
     }
@@ -187,7 +196,8 @@ pub async fn discover_authority<C: ConnectionTrait>(
             break;
         };
         let (row, resident) = scope::read_exact(tx, &key, budget).await?;
-        let mut classification = classify::classify_source(&key, &row)?;
+        let (key, row, resident, mut classification) =
+            classification::classify_row(key, row, resident, budget).await?;
         narrow::bind_retirement_domain(tx, &key, &row, &mut classification, budget).await?;
         validate_locator_set(tx, &key, &classification, budget).await?;
         for lookup in &classification.membership_lookups {
@@ -215,6 +225,37 @@ pub async fn discover_authority<C: ConnectionTrait>(
     view.proof.seals = sources.into_values().collect();
     budget.check()?;
     Ok(view)
+}
+
+pub(in crate::store::pinning) async fn discover_observed_authority(
+    window: &crate::store::pinning::management::admission::worker_observation::WorkerReadWindow,
+    selectors: &[AuthoritySelector],
+    budget: &mut Budget,
+) -> Result<AuthorityView> {
+    crate::store::pinning::management::schema::validate_observed(window).await?;
+    discover_validated(window.db(), selectors, budget).await
+}
+
+pub(in crate::store::pinning) async fn discover_quota_authority(
+    window: &crate::store::pinning::quota::production::QuotaReadWindow<'_>,
+    selectors: &[AuthoritySelector],
+    budget: &mut Budget,
+) -> Result<AuthorityView> {
+    crate::store::pinning::management::schema::validate_quota(window).await?;
+    discover_validated(window.db(), selectors, budget).await
+}
+
+pub(in crate::store::pinning) async fn discover_runtime_authority(
+    tx: &crate::store::RuntimeTransaction,
+    selectors: &[AuthoritySelector],
+    budget: &mut Budget,
+    work: super::super::DecodeWork<'_>,
+) -> Result<AuthorityView> {
+    tx.check_schema(work).await.map_err(|error| match error {
+        crate::error::AppError::ManagementBudget => ManagementError::Budget,
+        _ => ManagementError::Schema,
+    })?;
+    discover_validated(tx.db(), selectors, budget).await
 }
 
 async fn validate_locator_set<C: ConnectionTrait>(

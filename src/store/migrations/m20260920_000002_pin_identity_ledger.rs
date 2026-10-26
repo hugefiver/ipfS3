@@ -4,8 +4,8 @@ use sea_orm_migration::prelude::*;
 pub struct Migration;
 
 #[async_trait::async_trait]
-impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+impl super::bridge::SharedMigration for Migration {
+    async fn up_body(&self, manager: &super::bridge::Manager<'_>) -> Result<(), DbErr> {
         manager
             .create_table(
                 Table::create()
@@ -97,7 +97,13 @@ impl MigrationTrait for Migration {
         manager.get_connection().execute_unprepared("UPDATE pin_jobs SET state='running', locked_until=NULL, last_error='historical identity unavailable; needs_attention' WHERE state<>'done' AND EXISTS (SELECT 1 FROM remote_pin_ledger l WHERE l.provider=pin_jobs.provider AND l.cid=pin_jobs.cid)").await?;
         Ok(())
     }
-
+}
+#[async_trait::async_trait]
+impl MigrationTrait for Migration {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        super::bridge::SharedMigration::up_body(self, &super::bridge::Manager::native(manager))
+            .await
+    }
     async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
         Err(DbErr::Custom(
             "pinning ledger downgrade is unsafe; preserve resource evidence and stop workers"

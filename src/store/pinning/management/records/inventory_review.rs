@@ -21,11 +21,11 @@ pub(super) use persistence::check_checkpoint_confirmation;
 pub use persistence::copy_original_inventory;
 pub(crate) use persistence::finish_apply;
 pub use persistence::load_original_inventory;
-pub(crate) use persistence::{open_original_inventory_document, OriginalInventoryDocument};
 pub(crate) use persistence::prepare_apply;
 pub(crate) use persistence::prepared_output_reference;
 pub(crate) use persistence::publish as stage_canonical_inventory;
 pub(crate) use persistence::publish_output as stage_canonical_output;
+pub(crate) use persistence::{OriginalInventoryDocument, open_original_inventory_document};
 pub(super) use persistence::{hydrate, publish_transition, seal_confirmed};
 
 /// Prepared from full original inventory outside the final-write transaction.

@@ -11,7 +11,7 @@ pub(super) use postgres_tables::validate as postgres_tables;
 
 // Bounds apply before catalog text crosses the database connection. Neither is
 // derived from a data decode budget or retained beyond this validation.
-const SQL_BYTES: usize = 64 * 1024;
+pub(super) const SQL_BYTES: usize = 64 * 1024;
 const NAME_BYTES: usize = 256;
 
 fn parameters(count: usize) -> String {
@@ -143,6 +143,63 @@ fn sqlite_rows(
     Ok(())
 }
 
+pub(in crate::store::pinning) async fn observed_control(
+    window: &crate::store::pinning::management::admission::worker_observation::WorkerReadWindow,
+) -> Result<Vec<String>> {
+    window_state(window.db(), window.versions()).await
+}
+
+pub(in crate::store::pinning) async fn quota_control(
+    window: &crate::store::pinning::quota::production::QuotaReadWindow<'_>,
+) -> Result<Vec<String>> {
+    window_state(window.db(), window.versions()).await
+}
+
+async fn window_state<C: ConnectionTrait>(
+    db: &C,
+    qualified_versions: &[String],
+) -> Result<Vec<String>> {
+    let catalog = sqlite_expected::expected(true);
+    let bound = qualified_versions
+        .iter()
+        .map(String::len)
+        .max()
+        .unwrap_or(0);
+    let sql = format!(
+        "{} UNION ALL SELECT 'version',CASE WHEN length(CAST(version AS BLOB))<={bound} THEN version END,NULL,NULL,NULL,NULL,NULL,NULL FROM (SELECT version FROM seaql_migrations ORDER BY version LIMIT 65) ORDER BY row_kind,name",
+        catalog.control_query
+    );
+    let rows = db
+        .query_all(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            sql,
+            ["ready".into()],
+        ))
+        .await
+        .map_err(|_| ManagementError::Schema)?;
+    let mut versions = Vec::new();
+    let mut controls = Vec::new();
+    for row in rows {
+        if row
+            .try_get::<String>("", "row_kind")
+            .map_err(|_| ManagementError::Schema)?
+            == "version"
+        {
+            versions.push(
+                row.try_get::<String>("", "name")
+                    .map_err(|_| ManagementError::Schema)?,
+            );
+        } else {
+            controls.push(row);
+        }
+    }
+    if versions != qualified_versions {
+        return Err(ManagementError::Schema);
+    }
+    sqlite_rows(&controls, catalog)?;
+    Ok(versions)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::store::{self, pinning::management::schema};
@@ -160,21 +217,23 @@ mod tests {
             "SELECT 1 FROM pin_management_readiness WHERE id=1 AND format='S75A1' AND state='ready'"))
             .await.is_err());
         let catalog = super::sqlite_expected::expected(false);
-        let rows = tx
-            .query_all(sea_orm::Statement::from_sql_and_values(
-                backend,
-                catalog.query.clone(),
-                ["ready".into()],
-            ))
-            .await
-            .expect("shadow must short-circuit the runtime-failing readiness view");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].try_get::<String>("", "row_kind").unwrap(),
-            "control"
-        );
-        assert_eq!(rows[0].try_get::<i64>("", "shadow").unwrap(), 1);
-        assert_eq!(rows[0].try_get::<i64>("", "ready").unwrap(), 0);
+        for query in [&catalog.query, &catalog.control_query] {
+            let rows = tx
+                .query_all(sea_orm::Statement::from_sql_and_values(
+                    backend,
+                    query.clone(),
+                    ["ready".into()],
+                ))
+                .await
+                .expect("shadow must short-circuit the runtime-failing readiness view");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].try_get::<String>("", "row_kind").unwrap(),
+                "control"
+            );
+            assert_eq!(rows[0].try_get::<i64>("", "shadow").unwrap(), 1);
+            assert_eq!(rows[0].try_get::<i64>("", "ready").unwrap(), 0);
+        }
         assert!(matches!(
             schema::storage::validate(&tx).await,
             Err(crate::store::pinning::management::ManagementError::Schema)

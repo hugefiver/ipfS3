@@ -46,6 +46,13 @@ impl AppState {
         let db = crate::store::connect_database(&cfg.storage.database_url).await?;
         crate::store::initialization::open(&db).await?;
         let store = Store::new(db);
+        let startup_work =
+            crate::store::pinning::management::records::SharedDecodeBudget::default();
+        store
+            .qualify_runtime_schema(
+                crate::store::pinning::management::records::DecodeWork::shared(&startup_work),
+            )
+            .await?;
         pinning.register_identities(&store).await?;
 
         let credentials: HashMap<String, SecretKey> = cfg

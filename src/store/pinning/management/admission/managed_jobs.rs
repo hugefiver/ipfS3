@@ -43,6 +43,20 @@ pub(crate) async fn managed_call_allowed<C: ConnectionTrait>(
 ) -> AppResult<bool> {
     managed_call_allowed_with_work(db, job, call, records::SharedDecodeBudget::default()).await
 }
+
+pub(crate) async fn managed_call_allowed_store(
+    store: &crate::store::Store,
+    job: &pin_job::Model,
+    call: ManagedCall,
+) -> AppResult<bool> {
+    if store.db().get_database_backend() != sea_orm::DatabaseBackend::Sqlite {
+        return managed_call_allowed(store.db(), job, call).await;
+    }
+    let permit =
+        job_authority::check_before_call_store(store, job, records::SharedDecodeBudget::default())
+            .await?;
+    Ok(call.allows(&job.operation, permit.as_ref()))
+}
 pub(crate) async fn managed_call_allowed_with_work<C: ConnectionTrait>(
     db: &C,
     job: &pin_job::Model,

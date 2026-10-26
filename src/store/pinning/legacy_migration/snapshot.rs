@@ -97,10 +97,16 @@ pub(super) fn tables(versions: &[String]) -> Vec<TableImage> {
         ),
     ];
     if versions.iter().any(|version| version == MANAGEMENT) {
-        let cold = import_job::Column::iter().filter(|column| column.is_request())
-            .map(|column| Iden::to_string(&column)).collect::<BTreeSet<_>>();
-        tables.iter_mut().find(|table| table.table == "import_jobs").expect("import jobs snapshot")
-            .columns.retain(|name| !cold.contains(name));
+        let cold = import_job::Column::iter()
+            .filter(|column| column.is_request())
+            .map(|column| Iden::to_string(&column))
+            .collect::<BTreeSet<_>>();
+        tables
+            .iter_mut()
+            .find(|table| table.table == "import_jobs")
+            .expect("import jobs snapshot")
+            .columns
+            .retain(|name| !cold.contains(name));
         tables.push(entity::<import_job_request::Entity>());
         tables.extend([
             raw(

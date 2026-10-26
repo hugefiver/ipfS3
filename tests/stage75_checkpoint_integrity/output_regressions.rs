@@ -665,7 +665,33 @@ async fn rejected_output_accounting_remains_payable_once_after_spool_recovery() 
 #[tokio::test]
 async fn prepared_output_copy_stops_at_cancellation_and_keeps_paid_partial() {
     for projection in [Projection::Review, Projection::PrivateRecovery] {
-        let (fixture, auth, local, prepared) = planning_fixture("cancelled-output-copy", 256).await;
+        let (fixture, auth) = fixture(false).await;
+        // A public cell keeps both projections larger than one bounded storage
+        // fetch, so cancellation observes a genuine partially copied file.
+        let public_text = format!(
+            "application/octet-stream; note=\"{}\"",
+            "x".repeat(native::meter::PAGE_BYTES + native::meter::CELL_SLICE)
+        );
+        let changed = fixture
+            .db
+            .execute(Statement::from_sql_and_values(
+                fixture.db.get_database_backend(),
+                "UPDATE objects SET content_type=$1 WHERE id=$2",
+                [
+                    public_text.into(),
+                    fixture.identity.object_id.clone().into(),
+                ],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(changed.rows_affected(), 1);
+        let (local, prepared) = complete(
+            &fixture,
+            &auth,
+            "cancelled-output-copy",
+            RunLimits::default().total_rows,
+        )
+        .await;
         let budget = prepare_output(&fixture, &auth, &local, &prepared, projection).await;
         let initial = budget.work;
         let before = prepared.task_work().await.unwrap();
@@ -682,7 +708,11 @@ async fn prepared_output_copy_stops_at_cancellation_and_keeps_paid_partial() {
         "SELECT bytes,chunks FROM pin_management_archive WHERE archive_id='planning-review-output' AND state='sealed'"))
         .await.unwrap().unwrap();
         let complete_bytes = row.try_get::<i64>("", "bytes").unwrap() as u64;
-        assert!(row.try_get::<i64>("", "chunks").unwrap() > 2);
+        assert!(complete_bytes > native::meter::PAGE_BYTES as u64);
+        assert!(
+            row.try_get::<i64>("", "chunks").unwrap()
+                > (native::meter::PAGE_BYTES / native::meter::CELL_SLICE) as i64
+        );
         spool.close().await.unwrap();
         let partial = fixture.file("cancelled-review.v3");
         let file = reserved(&partial).await;
@@ -751,8 +781,8 @@ async fn prepared_output_copy_stops_at_cancellation_and_keeps_paid_partial() {
         assert_eq!(archive_storage(&fixture).await, storage);
         prepared.cleanup().await.unwrap();
 
-        let stopped_at = stopped_at.expect("copy must expose an awaited chunk boundary before EOF");
-        assert!(result.is_err());
+        let stopped_at = stopped_at.expect("copy must expose an awaited page boundary before EOF");
+        assert!(matches!(result, Err(ManagementError::Budget)));
         assert_eq!(
             written, stopped_at,
             "cancellation must stop subsequent archive chunks"

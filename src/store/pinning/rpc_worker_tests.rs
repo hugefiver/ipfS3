@@ -64,6 +64,17 @@ async fn fixture(
     profile: RpcProfile,
     strategy: RpcStrategy,
 ) -> RpcFixture {
+    let db = store::connect_database("sqlite::memory:").await.unwrap();
+    fixture_on_database(endpoint, source, profile, strategy, db).await
+}
+
+async fn fixture_on_database(
+    endpoint: String,
+    source: &MockServer,
+    profile: RpcProfile,
+    strategy: RpcStrategy,
+    db: sea_orm::DatabaseConnection,
+) -> RpcFixture {
     let (kind, profile_name) = match profile {
         RpcProfile::Filebase => ("filebase", "filebase"),
         RpcProfile::Kubo => ("ipfs_rpc", "kubo"),
@@ -122,7 +133,6 @@ async fn fixture(
     let coordinator =
         PinningCoordinator::build_with_kubo(validated, Some(KuboClient::new(source.uri())))
             .unwrap();
-    let db = store::connect_database("sqlite::memory:").await.unwrap();
     store::run_migrations(&db).await.unwrap();
     let manager = SchemaManager::new(&db);
     assert!(
@@ -812,6 +822,420 @@ async fn worker_projection_failure_cannot_rollback_actual_mismatch_resources() {
     assert_eq!(fixture.evidence().await[0].outcome, "cid_mismatch");
     fixture.assert_held().await;
     no_delete(&target).await;
+}
+
+#[tokio::test]
+async fn worker_release_context_read_failure_cannot_erase_completed_rpc_response() {
+    let source = MockServer::start().await;
+    let target = MockServer::start().await;
+    source_file(&source).await;
+    recursive(&target).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/add"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(format!("{{\"Hash\":\"{CID}\"}}\n")),
+        )
+        .expect(1)
+        .mount(&target)
+        .await;
+    let fixture = fixture(
+        target.uri(),
+        &source,
+        RpcProfile::Filebase,
+        RpcStrategy::Upload,
+    )
+    .await;
+    let claim = fixture.claim().await.unwrap();
+    let dispatched = dispatch_submit(
+        &fixture.store,
+        &fixture.coordinator,
+        &Arc::new(Semaphore::new(2)),
+        claim,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let job_id = dispatched.claimed.model.id.clone();
+    // A malformed persisted epoch makes release-context decoding fail, without
+    // changing the invocation, the receipt table, or the current lifecycle.
+    fixture.store.db().execute( sea_orm::Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "INSERT INTO pin_resource_history (provider,cid,epoch,ledger) VALUES ($1,$2,'invalid-epoch','{}')",
+        [fixture.provider.clone().into(), CID.into()],
+    )).await.unwrap();
+    assert!(
+        finish_submit_observation(
+            &fixture.store,
+            &fixture.coordinator,
+            dispatched.claimed,
+            dispatched.observation,
+            dispatched.capture,
+            dispatched.rpc_invocation
+        )
+        .await
+        .is_err()
+    );
+    let evidence = ledger::submission::latest(fixture.store.db(), &job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(evidence.outcome, "matched");
+    assert!(evidence.observed_at.is_some() && evidence.needs_attention);
+    let resources: Vec<ledger::submission::ResourceEvidence> =
+        serde_json::from_str(&evidence.resources).unwrap();
+    assert_eq!(resources[0].resource.cid, CID);
+    assert_ne!(
+        remote_pin::Entity::find_by_id((fixture.provider.clone(), CID.into()))
+            .one(fixture.store.db())
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "pinned"
+    );
+    fixture.assert_held().await;
+    no_delete(&target).await;
+}
+
+#[tokio::test]
+async fn scheduler_receipt_candidates_cannot_authorize_stale_lifetime_retired_provider_or_live_claim()
+ {
+    for boundary in ["generation", "retired", "live_claim"] {
+        let source = MockServer::start().await;
+        let target = MockServer::start().await;
+        source_file(&source).await;
+        recursive(&target).await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/add"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(format!("{{\"Hash\":\"{CID}\"}}\n")),
+            )
+            .expect(1)
+            .mount(&target)
+            .await;
+        let fixture = fixture(
+            target.uri(),
+            &source,
+            RpcProfile::Filebase,
+            RpcStrategy::Upload,
+        )
+        .await;
+        let claim = fixture.claim().await.unwrap();
+        let dispatched = dispatch_submit(
+            &fixture.store,
+            &fixture.coordinator,
+            &Arc::new(Semaphore::new(2)),
+            claim,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let job_id = dispatched.claimed.model.id.clone();
+        let tx = fixture.store.db().begin().await.unwrap();
+        jobs::park_submit(
+            &tx,
+            &dispatched.claimed,
+            "needs_attention",
+            jobs::RPC_RECOVERY_PARK_REASON,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let evidence = ledger::submission::complete_fact(
+            &fixture.store,
+            dispatched.rpc_invocation.as_ref().unwrap(),
+            &dispatched.observation,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        match boundary {
+            "generation" => {
+                pin_lease::Entity::update_many()
+                    .col_expr(
+                        pin_lease::Column::Generation,
+                        Expr::value(dispatched.claimed.model.expected_generation.unwrap() + 1),
+                    )
+                    .filter(
+                        pin_lease::Column::Id.eq(dispatched
+                            .claimed
+                            .model
+                            .lease_id
+                            .clone()
+                            .unwrap()),
+                    )
+                    .exec(fixture.store.db())
+                    .await
+                    .unwrap();
+            }
+            "retired" => {
+                let tx = fixture.store.db().begin().await.unwrap();
+                pin_provider_route::Entity::update_many()
+                    .col_expr(pin_provider_route::Column::Retired, Expr::value(true))
+                    .filter(pin_provider_route::Column::Provider.eq(&fixture.provider))
+                    .exec(&tx)
+                    .await
+                    .unwrap();
+                crate::store::pinning::management::records::locator::rebuild_source(
+                    &tx,
+                    &crate::store::pinning::management::native::NativeKey {
+                        table: "pin_provider_routes".into(),
+                        values: vec![fixture.provider.clone()],
+                    },
+                    &mut crate::store::pinning::management::native::meter::Budget::default(),
+                )
+                .await
+                .unwrap();
+                tx.commit().await.unwrap();
+            }
+            "live_claim" => {
+                pin_job::Entity::update_many()
+                    .col_expr(
+                        pin_job::Column::LockedUntil,
+                        Expr::value(Some(Utc::now() + ChronoDuration::minutes(5))),
+                    )
+                    .filter(pin_job::Column::Id.eq(&job_id))
+                    .exec(fixture.store.db())
+                    .await
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let before = pin_job::Entity::find_by_id(&job_id)
+            .one(fixture.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        recover_parked_receipts(&fixture.coordinator, &fixture.store, &mut String::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            pin_job::Entity::find_by_id(&job_id)
+                .one(fixture.store.db())
+                .await
+                .unwrap()
+                .unwrap(),
+            before,
+            "{boundary}"
+        );
+        assert_eq!(fixture.evidence().await, vec![evidence]);
+        assert_ne!(
+            remote_pin::Entity::find_by_id((fixture.provider.clone(), CID.into()))
+                .one(fixture.store.db())
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "pinned"
+        );
+        fixture.assert_held().await;
+        no_delete(&target).await;
+    }
+}
+
+#[tokio::test]
+async fn scheduler_revisits_completed_park_after_transient_readiness_failure() {
+    let source = MockServer::start().await;
+    let target = MockServer::start().await;
+    source_file(&source).await;
+    recursive(&target).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/add"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(format!("{{\"Hash\":\"{CID}\"}}\n")),
+        )
+        .expect(1)
+        .mount(&target)
+        .await;
+    let fixture = fixture(
+        target.uri(),
+        &source,
+        RpcProfile::Filebase,
+        RpcStrategy::Upload,
+    )
+    .await;
+    let claim = fixture.claim().await.unwrap();
+    let dispatched = dispatch_submit(
+        &fixture.store,
+        &fixture.coordinator,
+        &Arc::new(Semaphore::new(2)),
+        claim,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let job_id = dispatched.claimed.model.id.clone();
+    let tx = fixture.store.db().begin().await.unwrap();
+    jobs::park_submit(
+        &tx,
+        &dispatched.claimed,
+        "needs_attention",
+        jobs::RPC_RECOVERY_PARK_REASON,
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let receipt = ledger::submission::complete_fact(
+        &fixture.store,
+        dispatched.rpc_invocation.as_ref().unwrap(),
+        &dispatched.observation,
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+    fixture
+        .store
+        .db()
+        .execute_unprepared("UPDATE pin_management_readiness SET state='backfill' WHERE id=1")
+        .await
+        .unwrap();
+    let mut cursor = String::new();
+    recover_parked_receipts(&fixture.coordinator, &fixture.store, &mut cursor)
+        .await
+        .unwrap();
+    let parked = pin_job::Entity::find_by_id(&job_id)
+        .one(fixture.store.db())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(parked.state, "running");
+    assert!(parked.locked_until.is_none());
+    assert_eq!(
+        ledger::submission::latest(fixture.store.db(), &job_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        receipt
+    );
+    fixture
+        .store
+        .db()
+        .execute_unprepared("UPDATE pin_management_readiness SET state='ready' WHERE id=1")
+        .await
+        .unwrap();
+    // The exhausted keyset wraps and the following pass rediscovers the park.
+    recover_parked_receipts(&fixture.coordinator, &fixture.store, &mut cursor)
+        .await
+        .unwrap();
+    recover_parked_receipts(&fixture.coordinator, &fixture.store, &mut cursor)
+        .await
+        .unwrap();
+    let due = pin_job::Entity::find_by_id(&job_id)
+        .one(fixture.store.db())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(due.state, "pending");
+    assert_eq!(due.submit_phase.as_deref(), Some("recovering"));
+    fixture.drain().await;
+    let settled = fixture.evidence().await;
+    assert_eq!(settled[0].resources, receipt.resources);
+    assert_eq!(settled[0].observed_at, receipt.observed_at);
+    assert!(!settled[0].needs_attention);
+    fixture.assert_held().await;
+    no_delete(&target).await;
+}
+
+#[tokio::test]
+#[ignore = "opt-in: requires a new authorized isolated IPFS_S3_TEST_RPC_RECOVERY_POSTGRES_URL"]
+async fn postgres_shared_cid_receipt_projection_orders_all_leases_before_remote() {
+    use futures_util::FutureExt;
+    let url = std::env::var("IPFS_S3_TEST_RPC_RECOVERY_POSTGRES_URL")
+        .expect("authorized isolated PostgreSQL endpoint required");
+    let parsed = url::Url::parse(&url).unwrap();
+    assert!(matches!(parsed.scheme(), "postgres" | "postgresql"));
+    assert!(matches!(
+        parsed.host_str(),
+        Some("127.0.0.1" | "localhost" | "::1")
+    ));
+    assert_ne!(parsed.port(), Some(55467));
+    let admin = store::connect_database(&url).await.unwrap();
+    let schema = format!("rpc_frontier_{}", uuid::Uuid::new_v4().simple());
+    admin
+        .execute_unprepared(&format!("CREATE SCHEMA \"{schema}\""))
+        .await
+        .unwrap();
+    let mut options = sea_orm::ConnectOptions::new(url);
+    options.set_schema_search_path(schema.clone());
+    let db = sea_orm::Database::connect(options.clone()).await.unwrap();
+    let peer = sea_orm::Database::connect(options).await.unwrap();
+    let source = MockServer::start().await;
+    let target = MockServer::start().await;
+    source_file(&source).await;
+    recursive(&target).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/add"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(format!("{{\"Hash\":\"{CID}\"}}\n")),
+        )
+        .expect(1)
+        .mount(&target)
+        .await;
+    let mut completion = None;
+    let result = std::panic::AssertUnwindSafe(async {
+        let fixture = Arc::new(fixture_on_database(target.uri(), &source, RpcProfile::Filebase, RpcStrategy::Upload, db.clone()).await);
+        fixture.publish("shared", CID).await;
+        let claimed = fixture.claim().await.unwrap();
+        let original_lease = claimed.model.lease_id.clone().unwrap();
+        let other = pin_lease_target::Entity::find()
+            .filter(pin_lease_target::Column::Cid.eq(CID))
+            .filter(pin_lease_target::Column::LeaseId.ne(original_lease))
+            .one(fixture.store.db()).await.unwrap().unwrap();
+        assert_eq!(other.state, "waiting");
+        let dispatched = dispatch_submit(&fixture.store, &fixture.coordinator, &Arc::new(Semaphore::new(2)), claimed, &CancellationToken::new()).await.unwrap().unwrap();
+        let peer_tx = peer.begin().await.unwrap();
+        let peer_pid = peer_tx.query_one(sea_orm::Statement::from_string(DatabaseBackend::Postgres, "SELECT pg_backend_pid() AS pid")).await.unwrap().unwrap().try_get::<i32>("", "pid").unwrap();
+        peer_tx.query_one(sea_orm::Statement::from_sql_and_values(DatabaseBackend::Postgres,
+            "SELECT id FROM pin_leases WHERE id=$1 FOR UPDATE", [other.lease_id.clone().into()])).await.unwrap();
+        let task_fixture = fixture.clone();
+        completion = Some(tokio::spawn(async move {
+            finish_submit_observation(&task_fixture.store, &task_fixture.coordinator, dispatched.claimed, dispatched.observation, dispatched.capture, dispatched.rpc_invocation).await
+        }));
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let waiting = db.query_one(sea_orm::Statement::from_sql_and_values(DatabaseBackend::Postgres,
+                    "SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_stat_activity a WHERE $1=ANY(pg_catalog.pg_blocking_pids(a.pid))) AS waiting", [peer_pid.into()])).await.unwrap().unwrap().try_get::<bool>("", "waiting").unwrap();
+                if waiting { break; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("receipt projection must reach the other lease's lock");
+        peer_tx.query_one(sea_orm::Statement::from_sql_and_values(DatabaseBackend::Postgres,
+            "SELECT cid FROM remote_pins WHERE provider=$1 AND cid=$2 FOR UPDATE NOWAIT", [fixture.provider.clone().into(), CID.into()])).await.expect("receipt replay must not hold the remote while waiting for another lease");
+        // Ending the other lease must still acquire the remote. A projection
+        // that holds that remote while waiting for this lease forms a cycle.
+        assert_eq!(tokio::time::timeout(Duration::from_secs(15), leases::cancel_lease(&peer_tx, &other.lease_id, Utc::now())).await.expect("shared CID lifecycle lock cycle").unwrap(), leases::GenerationDecision::Current);
+        peer_tx.commit().await.unwrap();
+        let completed = tokio::time::timeout(Duration::from_secs(15), completion.take().unwrap()).await.unwrap().unwrap();
+        let receipt = fixture.evidence().await;
+        assert_eq!(receipt[0].outcome, "matched");
+        if completed.is_err() {
+            assert!(receipt[0].needs_attention, "a stale lifecycle snapshot must retain attention");
+            assert_ne!(remote_pin::Entity::find_by_id((fixture.provider.clone(), CID.into())).one(fixture.store.db()).await.unwrap().unwrap().status, "pinned");
+        }
+        fixture.assert_held().await;
+        no_delete(&target).await;
+    }).catch_unwind().await;
+    if let Some(task) = completion {
+        task.abort();
+        let _ = task.await;
+    }
+    peer.close().await.unwrap();
+    db.close().await.unwrap();
+    let suffix = schema.strip_prefix("rpc_frontier_").unwrap();
+    assert!(suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    admin
+        .execute_unprepared(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
+        .await
+        .unwrap();
+    admin.close().await.unwrap();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
 }
 
 #[tokio::test]

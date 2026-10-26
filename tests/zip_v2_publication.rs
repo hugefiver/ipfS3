@@ -26,8 +26,7 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, EntityTrait, PaginatorTrait, 
 use sea_orm_migration::{MigrationTrait, SchemaManager};
 use sha2::{Digest, Sha256};
 
-#[path = "../src/store/migrations/m20260927_000004_zip_v2_execution.rs"]
-mod v2_schema;
+use ipfs_s3_gateway::store::migrations::m20260927_000004_zip_v2_execution as v2_schema;
 
 #[path = "support/r25_review_publication.rs"]
 mod r25_review_publication;

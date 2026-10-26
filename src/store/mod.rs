@@ -17,6 +17,9 @@ pub mod residency;
 pub mod zip;
 
 use sea_orm::DatabaseConnection;
+use std::sync::Arc;
+
+pub(crate) use pinning::runtime_schema::RuntimeTransaction;
 
 /// Busy timeout applied to every SQLite connection. Without it, a concurrent
 /// writer fails immediately with `database is locked (code 5)` instead of
@@ -47,97 +50,36 @@ pub async fn connect_database(database_url: &str) -> Result<DatabaseConnection, 
 
 #[derive(Clone)]
 pub struct Store {
+    inner: Arc<StoreInner>,
+}
+
+struct StoreInner {
     db: DatabaseConnection,
+    qualification: tokio::sync::OnceCell<pinning::runtime_schema::StaticQualification>,
 }
 
 impl Store {
     pub fn new(db: DatabaseConnection) -> Self {
-        Self { db }
+        Self {
+            inner: Arc::new(StoreInner {
+                db,
+                qualification: tokio::sync::OnceCell::new(),
+            }),
+        }
     }
 
     pub fn db(&self) -> &DatabaseConnection {
-        &self.db
+        &self.inner.db
     }
 }
 
 mod migrator {
-    use crate::store::migrations::m20250701_000001_init::Migration as InitMigration;
-    use crate::store::migrations::m20260707_000001_decompress_zip::Migration as DecompressZipMigration;
-    use crate::store::migrations::m20260720_000001_sse_c_key_fingerprint::Migration as SseCKeyFingerprintMigration;
-    use crate::store::migrations::m20260721_000001_multi_provider_pinning::Migration as MultiProviderPinningMigration;
-    use crate::store::migrations::m20260729_000001_ipfs3_import::Migration as Ipfs3ImportMigration;
-    use crate::store::migrations::m20260729_000002_postgres_utc_timestamps::Migration as PostgresUtcTimestampsMigration;
-    use crate::store::migrations::m20260730_000001_standard_mutation_fence::Migration as StandardMutationFenceMigration;
-    use crate::store::migrations::m20260813_000001_postgres_json_columns::Migration as PostgresJsonColumnsMigration;
-    use crate::store::migrations::m20260825_000001_object_versioning::Migration as ObjectVersioningMigration;
-    use crate::store::migrations::m20260826_000001_lifecycle_expiration::Migration as LifecycleExpirationMigration;
-    use crate::store::migrations::m20260831_000001_bucket_cors::Migration as BucketCorsMigration;
-    use crate::store::migrations::m20260901_000001_lifecycle_abort_multipart::Migration as LifecycleAbortMultipartMigration;
-    use crate::store::migrations::m20260912_000001_residency_references::Migration as ResidencyReferencesMigration;
-    use crate::store::migrations::m20260912_000002_lifecycle_transition::Migration as LifecycleTransitionMigration;
     use sea_orm_migration::prelude::*;
 
     pub struct Migrator;
     impl MigratorTrait for Migrator {
         fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-            vec![
-                Box::new(InitMigration),
-                Box::new(DecompressZipMigration),
-                Box::new(SseCKeyFingerprintMigration),
-                Box::new(MultiProviderPinningMigration),
-                Box::new(Ipfs3ImportMigration),
-                Box::new(PostgresUtcTimestampsMigration),
-                Box::new(StandardMutationFenceMigration),
-                Box::new(PostgresJsonColumnsMigration),
-                Box::new(ObjectVersioningMigration),
-                Box::new(LifecycleExpirationMigration),
-                Box::new(BucketCorsMigration),
-                Box::new(LifecycleAbortMultipartMigration),
-                Box::new(ResidencyReferencesMigration),
-                Box::new(LifecycleTransitionMigration),
-                Box::new(
-                    crate::store::migrations::m20260919_000001_standard_mutation_lease::Migration,
-                ),
-                Box::new(crate::store::migrations::m20260920_000001_pin_submit_history::Migration),
-                Box::new(crate::store::migrations::m20260920_000002_pin_identity_ledger::Migration),
-                Box::new(
-                    crate::store::migrations::m20260920_000003_pin_extension_decision::Migration,
-                ),
-                Box::new(
-                    crate::store::migrations::m20260920_000004_multipart_pin_decision::Migration,
-                ),
-                Box::new(crate::store::migrations::m20260920_000005_import_pin_decision::Migration),
-                Box::new(
-                    crate::store::migrations::m20260920_000006_pin_submit_correlation::Migration,
-                ),
-                Box::new(crate::store::migrations::m20260927_000001_zip_batches::Migration),
-                Box::new(
-                    crate::store::migrations::m20260927_000002_import_zip_root_capture::Migration,
-                ),
-                Box::new(crate::store::migrations::m20260927_000003_zip_mpu_replay::Migration),
-                Box::new(crate::store::migrations::m20260927_000004_zip_v2_execution::Migration),
-                Box::new(crate::store::migrations::m20260927_000005_zip_v2_import::Migration),
-                Box::new(crate::store::migrations::m20260927_000006_zip_v2_mpu_intake::Migration),
-                Box::new(
-                    crate::store::migrations::m20260927_000007_zip_v2_mpu_completion::Migration,
-                ),
-                Box::new(
-                    crate::store::migrations::m20261004_000001_rpc_submission_ledger::Migration,
-                ),
-                Box::new(
-                    crate::store::migrations::m20261004_000002_cluster_replica_contract::Migration,
-                ),
-                Box::new(
-                    crate::store::migrations::m20261007_000001_legacy_pinning_migration::Migration,
-                ),
-                Box::new(crate::store::migrations::m20261008_000001_zip_intent_capture::Migration),
-                Box::new(crate::store::migrations::m20261012_000001_pinning_management::Migration),
-                Box::new(
-                    crate::store::migrations::m20261013_000001_zip_root_logical_release::Migration,
-                ),
-                Box::new(crate::store::migrations::m20261017_000001_management_storage::Migration),
-                Box::new(crate::store::migrations::m20261023_000001_inline_documents::Migration),
-            ]
+            super::migrations::registry::native()
         }
     }
 }

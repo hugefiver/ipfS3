@@ -8,7 +8,9 @@ use std::{
 };
 
 use http_body_util::BodyExt as _;
-use sea_orm::{ColumnTrait, Database, EntityTrait, PaginatorTrait, QueryFilter, Set, TransactionTrait};
+use sea_orm::{
+    ColumnTrait, Database, EntityTrait, PaginatorTrait, QueryFilter, Set, TransactionTrait,
+};
 
 use super::request::*;
 use super::*;

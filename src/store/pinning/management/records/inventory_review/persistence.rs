@@ -649,12 +649,12 @@ pub(crate) struct OriginalInventoryDocument {
     header: segmented::ArchiveHeader,
     reference: segmented::ArchiveRef,
     _resident: native::meter::ResidentGuard,
+    _header_resident: native::meter::ResidentGuard,
     request: PlanRequest,
     output: Option<OutputPlan>,
 }
 
 impl OriginalInventoryDocument {
-    pub(crate) fn reference(&self) -> &segmented::ArchiveRef { &self.reference }
     pub(crate) fn check_frame(&self, frame: &Frame, budget: &mut Budget) -> Result<()> {
         budget.check()?;
         let header = &self.header;
@@ -743,21 +743,31 @@ async fn copy_document<C: ConnectionTrait, W: std::io::Write>(
     prepared: bool,
 ) -> Result<OriginalInventoryDocument> {
     let reference = document_reference(db, binding, entry, budget, prepared).await?;
-    let header = segmented::read_archive(db, &reference, output, budget).await?;
+    let _raw_memory = budget.reserve(native::meter::PAGE_BYTES)?;
+    let raw = segmented::read_archive_raw(db, &reference, output, budget).await?;
+    let header = segmented::header::DecodedHeader::decode(&raw, budget)?;
     check_document(binding, entry, budget, prepared, reference, header)
 }
 
 pub(crate) async fn open_original_inventory_document<C: ConnectionTrait>(
-    db: &C, binding: &ConfirmedBinding, entry: &PlanEntry, budget: &mut Budget, prepared: bool,
+    db: &C,
+    binding: &ConfirmedBinding,
+    entry: &PlanEntry,
+    budget: &mut Budget,
+    prepared: bool,
 ) -> Result<(OriginalInventoryDocument, segmented::pages::Pages)> {
     let reference = document_reference(db, binding, entry, budget, prepared).await?;
-    let pages = segmented::pages::Pages::open(db, &reference, budget).await?;
-    let document = check_document(binding, entry, budget, prepared, reference, pages.header.clone())?;
+    let (header, pages) = segmented::pages::Pages::open(db, &reference, budget).await?;
+    let document = check_document(binding, entry, budget, prepared, reference, header)?;
     Ok((document, pages))
 }
 
 async fn document_reference<C: ConnectionTrait>(
-    db: &C, binding: &ConfirmedBinding, entry: &PlanEntry, budget: &mut Budget, prepared: bool,
+    db: &C,
+    binding: &ConfirmedBinding,
+    entry: &PlanEntry,
+    budget: &mut Budget,
+    prepared: bool,
 ) -> Result<segmented::ArchiveRef> {
     if !binding.confirmation.bindings.contains(entry) {
         return Err(ManagementError::Confirmation);
@@ -775,9 +785,17 @@ async fn document_reference<C: ConnectionTrait>(
 }
 
 fn check_document(
-    binding: &ConfirmedBinding, entry: &PlanEntry, budget: &mut Budget, prepared: bool,
-    reference: segmented::ArchiveRef, header: segmented::ArchiveHeader,
+    binding: &ConfirmedBinding,
+    entry: &PlanEntry,
+    budget: &mut Budget,
+    prepared: bool,
+    reference: segmented::ArchiveRef,
+    header: segmented::header::DecodedHeader,
 ) -> Result<OriginalInventoryDocument> {
+    let segmented::header::DecodedHeader {
+        value: header,
+        memory: header_resident,
+    } = header;
     budget.charge(
         0,
         0,
@@ -836,6 +854,7 @@ fn check_document(
         header,
         reference,
         _resident: resident,
+        _header_resident: header_resident,
         request: common.request,
         output: common.output,
     })
@@ -843,13 +862,45 @@ fn check_document(
 
 /// The publication envelope is not an ordinary v3 Request. Only this loader
 /// accepts that envelope, with the selected item bound to the local original.
-pub async fn load_original_inventory<C: ConnectionTrait>(
+pub async fn load_original_inventory<C: ConnectionTrait, S: Read + std::io::Write + Seek>(
     db: &C,
     binding: &ConfirmedBinding,
     entry: &PlanEntry,
-    budget: Budget,
-) -> Result<v3::archive_cursor::ReviewCursor<v3::archive_cursor::OwnedSource>> {
-    v3::archive_cursor::load_owned_original(db, binding, entry, budget).await.map_err(wire_error)
+    mut file: S,
+    mut budget: Budget,
+) -> Result<v3::archive_cursor::ReviewCursor<S>> {
+    if file
+        .seek(SeekFrom::End(0))
+        .map_err(|_| ManagementError::Database)?
+        != 0
+    {
+        return Err(ManagementError::InvalidEvidence);
+    }
+    let document =
+        copy_original_inventory_document(db, binding, entry, &mut file, &mut budget).await?;
+    let reference = document.reference.clone();
+    budget.work.copied_bytes = budget
+        .work
+        .copied_bytes
+        .checked_add(u64::try_from(reference.bytes).map_err(|_| ManagementError::InvalidEvidence)?)
+        .ok_or(ManagementError::Budget)?;
+    let staged = v3::archive_cursor::stage_checked(
+        file,
+        Projection::PrivateRecovery,
+        budget,
+        Some(reference),
+        |frame, budget| {
+            document.check_frame(frame, budget).map_err(|error| {
+                if error == ManagementError::Budget {
+                    crate::pinning::management::SafeError::LimitExceeded
+                } else {
+                    crate::pinning::management::SafeError::UnknownEvidence
+                }
+            })
+        },
+    )
+    .map_err(wire_error)?;
+    Ok(staged.into_cursor())
 }
 
 pub(crate) async fn prepare_apply(

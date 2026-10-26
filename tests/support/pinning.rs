@@ -47,6 +47,7 @@ const PINATA_TOKEN: &str = "pinata-test-token";
 const FILEBASE_TOKEN: &str = "filebase-test-token";
 pub const TEST_CID: &str = "QmYwAPJzv5CZsnAzt8auVTL7VYhESWDFoCPTqCkiP6fKGE";
 const WORKER_WAIT: Duration = Duration::from_secs(10);
+const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 const WORKER_SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
 
@@ -654,6 +655,36 @@ impl PinningHarness {
         self.stop_worker_without_unlocking().await;
     }
 
+    pub async fn run_worker_until_remote_effect(
+        &mut self,
+        provider: &str,
+        cid: &str,
+        effect: &str,
+    ) {
+        let key = self.provider_key(provider);
+        self.restart_worker();
+        tokio::time::timeout(WORKER_WAIT, async {
+            loop {
+                let ledger =
+                    ipfs_s3_gateway::store::entities::remote_pin_ledger::Entity::find_by_id((
+                        key.clone(),
+                        cid.to_owned(),
+                    ))
+                    .one(self.state.store.db())
+                    .await
+                    .expect("load remote effect while waiting for maintenance");
+                if ledger.is_some_and(|ledger| ledger.effect == effect) {
+                    self.wait_for_worker_idle().await;
+                    break;
+                }
+                tokio::time::sleep(WORKER_POLL_INTERVAL).await;
+            }
+        })
+        .await
+        .expect("pinning maintenance did not reach the required remote effect");
+        self.stop_worker_without_unlocking().await;
+    }
+
     pub async fn wait_for_worker_idle(&self) {
         assert!(
             self.worker.is_some(),
@@ -677,7 +708,7 @@ impl PinningHarness {
                         break;
                     }
                 }
-                tokio::task::yield_now().await;
+                tokio::time::sleep(WORKER_POLL_INTERVAL).await;
             }
         };
         tokio::time::timeout(WORKER_WAIT, wait_for_idle)
@@ -878,7 +909,7 @@ impl PinningHarness {
                 if !still_running {
                     break;
                 }
-                tokio::task::yield_now().await;
+                tokio::time::sleep(WORKER_POLL_INTERVAL).await;
             }
         };
         if tokio::time::timeout(WORKER_WAIT, wait_for_reconcile)

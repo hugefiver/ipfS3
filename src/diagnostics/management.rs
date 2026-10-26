@@ -55,7 +55,12 @@ pub async fn run(command: Command) -> Result<()> {
         return files::print(&report).await;
     }
     // All document bounds/DTO validation precede Config, DB and client factories.
-    let input = tokio::time::timeout(WORK_BUDGET, input::load(&command))
+    let work_budget = if matches!(command, Command::DryRun { .. } | Command::Confirm { .. }) {
+        ipfs_s3_gateway::pinning::management::wire::v3::files::stream::limits().elapsed
+    } else {
+        WORK_BUDGET
+    };
+    let input = tokio::time::timeout(work_budget, input::load(&command))
         .await
         .map_err(|_| input::invalid())??;
     let raw = Config::load()
@@ -71,7 +76,7 @@ pub async fn run(command: Command) -> Result<()> {
         .map_err(|_| anyhow!("management cancellation handler unavailable"))?;
     let db = database::connect(&raw.storage.database_url, readonly).await?;
     let cancellation = CancellationToken::new();
-    let work_deadline = std::time::Instant::now() + WORK_BUDGET;
+    let work_deadline = std::time::Instant::now() + work_budget;
     let (result, close_deadline) = {
         let work = async {
             let auth = records::authorize_local(&raw, &db).await?;

@@ -15,9 +15,6 @@ use sea_orm::{ConnectionTrait, DatabaseTransaction};
 use std::io::{Read, Seek, SeekFrom, Write};
 mod binding;
 mod projection;
-mod original;
-pub use super::codec::owned::OwnedSource;
-pub(crate) use original::load as load_owned_original;
 
 pub type ArchiveEvent = Event;
 type Result<T> = std::result::Result<T, SafeError>;

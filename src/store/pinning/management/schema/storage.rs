@@ -3,6 +3,8 @@ use super::*;
 use crate::store::pinning::management::native;
 mod archive_identity;
 mod batch;
+pub(in crate::store::pinning) use batch::observed_control;
+pub(in crate::store::pinning) use batch::quota_control;
 mod postgres_constraints;
 mod postgres_guards;
 

@@ -36,6 +36,10 @@ use ipfs_s3_gateway::{
         },
         pinning::{
             jobs, leases, ledger,
+            management::{
+                native::{NativeKey, meter::Budget},
+                records::locator,
+            },
             publication::{self, PinTargetSpec, PublicationObject, PublicationRequest},
             quota,
         },
@@ -333,6 +337,9 @@ impl Fixture {
             .await
             .unwrap();
         assert_eq!(expired.rows_affected, 1);
+        let recovery_worker = self
+            .coordinator
+            .start(self.store.clone(), CancellationToken::new());
         wait_for_stage("takeover parked recovery", || async {
             let job = self.submit().await;
             job.state == "running"
@@ -340,6 +347,7 @@ impl Fixture {
                 && job.submit_phase.as_deref() == Some("recovering")
         })
         .await;
+        recovery_worker.shutdown(Duration::from_secs(2)).await;
         assert_eq!(self.receipt().await.outcome, "in_flight");
         original
     }
@@ -392,7 +400,7 @@ impl ConnectionTrait for AdmissionReadGate {
         self.inner.query_one(statement).await
     }
     async fn query_all(&self, statement: Statement) -> Result<Vec<QueryResult>, DbErr> {
-        let pause = statement.sql.contains("pin_submit_observations")
+        let pause = statement.sql.contains("__admission_kind")
             && self.reads.fetch_add(1, Ordering::SeqCst) + 1 == self.pause_on;
         if pause && !self.after_read {
             self.entered.notify_one();
@@ -758,8 +766,9 @@ async fn late_matched_receipt_cannot_wake_changed_history_identity_or_zero_desir
         let receipt = fixture.receipt().await;
         match boundary {
             "credential" | "endpoint" => {
+                let txn = fixture.store.db().begin().await.unwrap();
                 let row = pin_provider_route::Entity::find_by_id(fixture.provider.clone())
-                    .one(fixture.store.db())
+                    .one(&txn)
                     .await
                     .unwrap()
                     .unwrap();
@@ -771,9 +780,20 @@ async fn late_matched_receipt_cannot_wake_changed_history_identity_or_zero_desir
                         Expr::value(route.to_string()),
                     )
                     .filter(pin_provider_route::Column::Provider.eq(&fixture.provider))
-                    .exec(fixture.store.db())
+                    .exec(&txn)
                     .await
                     .unwrap();
+                locator::rebuild_source(
+                    &txn,
+                    &NativeKey {
+                        table: "pin_provider_routes".into(),
+                        values: vec![fixture.provider.clone()],
+                    },
+                    &mut Budget::default(),
+                )
+                .await
+                .unwrap();
+                txn.commit().await.unwrap();
             }
             "capture_epoch" => {
                 pin_invocation_route::Entity::update_many()
@@ -988,7 +1008,7 @@ async fn late_mismatch_and_extra_root_never_recover_from_expected_pin() {
 }
 
 #[tokio::test]
-async fn receipt_and_recovery_wakeup_roll_back_together_without_new_post_or_release() {
+async fn durable_receipt_survives_failed_wake_and_restart_recovers_without_new_post_or_release() {
     let fixture = Fixture::new((StatusCode::OK, format!("{{\"Hash\":\"{CID}\"}}\n"))).await;
     let target = fixture.publish("a", CID).await;
     let worker = fixture
@@ -1000,15 +1020,15 @@ async fn receipt_and_recovery_wakeup_roll_back_together_without_new_post_or_rele
         WHEN OLD.state='running' AND OLD.locked_until IS NULL AND NEW.state='pending' AND NEW.submit_phase='recovering'
         BEGIN SELECT RAISE(ABORT,'injected recovery CAS failure'); END;").await.unwrap();
     fixture.target.release.add_permits(1);
-    wait_for(|| async { fixture.target.reads.load(Ordering::SeqCst) == 1 }).await;
+    wait_for(|| async { fixture.receipt().await.observed_at.is_some() }).await;
     worker.shutdown(Duration::from_secs(2)).await;
     let receipt = fixture.receipt().await;
-    assert_eq!(receipt.outcome, "in_flight");
-    assert!(receipt.observed_at.is_none());
-    assert_eq!(
-        receipt.resources, "[]",
-        "failed wakeup must roll back the receipt transaction too"
-    );
+    assert_eq!(receipt.outcome, "matched");
+    assert!(receipt.observed_at.is_some());
+    let resources: Vec<ledger::submission::ResourceEvidence> =
+        serde_json::from_str(&receipt.resources).unwrap();
+    assert_eq!(resources.len(), 1);
+    assert_eq!(resources[0].resource.cid, CID);
     assert!(receipt.needs_attention);
     assert_eq!(fixture.submit().await.state, "running");
     assert!(fixture.submit().await.locked_until.is_none());
@@ -1024,6 +1044,63 @@ async fn receipt_and_recovery_wakeup_roll_back_together_without_new_post_or_rele
             .await
             .unwrap()
     );
+    fixture.held(100, 1).await;
+    fixture.assert_posts(1);
+    let restarted = fixture
+        .coordinator
+        .start(fixture.store.clone(), CancellationToken::new());
+    wait_for(|| async {
+        fixture.target_state(&target).await == "pinned" && !fixture.receipt().await.needs_attention
+    })
+    .await;
+    restarted.shutdown(Duration::from_secs(2)).await;
+    let settled = fixture.receipt().await;
+    assert_eq!(settled.resources, receipt.resources);
+    assert_eq!(settled.observed_at, receipt.observed_at);
+    fixture.held(100, 1).await;
+    fixture.assert_posts(1);
+}
+
+#[tokio::test]
+async fn completed_receipt_survives_unready_projection_and_recovers_after_restart() {
+    let fixture = Fixture::new((StatusCode::OK, format!("{{\"Hash\":\"{CID}\"}}\n"))).await;
+    let target = fixture.publish("a", CID).await;
+    let worker = fixture
+        .coordinator
+        .start(fixture.store.clone(), CancellationToken::new());
+    held_start(&fixture).await;
+    fixture.takeover_park().await;
+    fixture
+        .store
+        .db()
+        .execute_unprepared("UPDATE pin_management_readiness SET state='backfill' WHERE id=1")
+        .await
+        .unwrap();
+    fixture.target.release.add_permits(1);
+    wait_for(|| async { fixture.receipt().await.observed_at.is_some() }).await;
+    worker.shutdown(Duration::from_secs(2)).await;
+    let receipt = fixture.receipt().await;
+    assert_eq!(receipt.outcome, "matched");
+    assert!(receipt.needs_attention);
+    assert!(fixture.submit().await.locked_until.is_none());
+    assert_ne!(fixture.target_state(&target).await, "pinned");
+    fixture.held(100, 1).await;
+    fixture.assert_posts(1);
+    fixture
+        .store
+        .db()
+        .execute_unprepared("UPDATE pin_management_readiness SET state='ready' WHERE id=1")
+        .await
+        .unwrap();
+    let restarted = fixture
+        .coordinator
+        .start(fixture.store.clone(), CancellationToken::new());
+    wait_for(|| async {
+        fixture.target_state(&target).await == "pinned" && !fixture.receipt().await.needs_attention
+    })
+    .await;
+    restarted.shutdown(Duration::from_secs(2)).await;
+    assert_eq!(fixture.receipt().await.observed_at, receipt.observed_at);
     fixture.held(100, 1).await;
     fixture.assert_posts(1);
 }
@@ -1154,6 +1231,82 @@ async fn postgres_actual_worker_receipt_lock_order_and_recoverable_waiters() {
     })
     .catch_unwind()
     .await;
+    cancellation.cancel();
+    close_db.close().await.unwrap();
+    drop_owned_recovery_schema(&admin, &schema).await;
+    admin.close().await.unwrap();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
+#[ignore = "opt-in: requires IPFS_S3_TEST_RPC_RECOVERY_POSTGRES_URL to a NEW authorized isolated loopback PostgreSQL node"]
+async fn postgres_post_receipt_commit_sql_failure_keeps_fact_and_restart_replays() {
+    let url = std::env::var("IPFS_S3_TEST_RPC_RECOVERY_POSTGRES_URL")
+        .expect("explicit authorized isolated PostgreSQL endpoint required");
+    let parsed = url::Url::parse(&url).unwrap();
+    assert!(matches!(parsed.scheme(), "postgres" | "postgresql"));
+    assert!(matches!(
+        parsed.host_str(),
+        Some("127.0.0.1" | "localhost" | "::1")
+    ));
+    assert_ne!(parsed.port(), Some(55467));
+    let admin = store::connect_database(&url).await.unwrap();
+    let schema = format!("rpc_recovery_{}", uuid::Uuid::new_v4().simple());
+    admin
+        .execute_unprepared(&format!("CREATE SCHEMA \"{schema}\""))
+        .await
+        .unwrap();
+    let mut options = ConnectOptions::new(url);
+    options.set_schema_search_path(schema.clone());
+    let db = match Database::connect(options).await {
+        Ok(db) => db,
+        Err(error) => {
+            drop_owned_recovery_schema(&admin, &schema).await;
+            admin.close().await.unwrap();
+            panic!("isolated recovery schema connection failed: {error}");
+        }
+    };
+    let close_db = db.clone();
+    let cancellation = CancellationToken::new();
+    let result = std::panic::AssertUnwindSafe(async {
+        let fixture = Fixture::with_database((StatusCode::OK, format!("{{\"Hash\":\"{CID}\"}}\n")), db).await;
+        let target = fixture.publish("a", CID).await;
+        let worker = fixture.coordinator.start(fixture.store.clone(), cancellation.clone());
+        held_start(&fixture).await;
+        fixture.takeover_park().await;
+        // A real dynamic-SQL error aborts only the fresh business transaction.
+        // It must never execute inside the already committed fact transaction.
+        fixture.store.db().execute_unprepared("CREATE SEQUENCE receipt_projection_failures").await.unwrap();
+        fixture.store.db().execute_unprepared(
+            "CREATE FUNCTION reject_receipt_projection() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM nextval('receipt_projection_failures'); EXECUTE 'SELECT * FROM rpc_receipt_missing_relation'; RETURN NEW; END $$"
+        ).await.unwrap();
+        fixture.store.db().execute_unprepared(
+            "CREATE TRIGGER reject_receipt_projection BEFORE UPDATE OF generation ON pin_leases FOR EACH ROW EXECUTE FUNCTION reject_receipt_projection()"
+        ).await.unwrap();
+        fixture.target.release.add_permits(1);
+        wait_for_stage("PG completed fact after failed business SQL", || async { fixture.receipt().await.observed_at.is_some() }).await;
+        worker.shutdown(Duration::from_secs(2)).await;
+        assert!(fixture.store.db().query_one(Statement::from_string(DatabaseBackend::Postgres, "SELECT is_called FROM receipt_projection_failures")).await.unwrap().unwrap().try_get::<bool>("", "is_called").unwrap(), "the injected SQL failure must actually execute");
+        let receipt = fixture.receipt().await;
+        assert_eq!(receipt.outcome, "matched");
+        assert!(receipt.needs_attention);
+        assert_eq!(fixture.submit().await.state, "running");
+        assert!(fixture.submit().await.locked_until.is_none());
+        assert_ne!(fixture.target_state(&target).await, "pinned");
+        fixture.held(100, 1).await;
+        fixture.assert_posts(1);
+        fixture.store.db().execute_unprepared("DROP TRIGGER reject_receipt_projection ON pin_leases").await.unwrap();
+        fixture.store.db().execute_unprepared("DROP FUNCTION reject_receipt_projection()").await.unwrap();
+        let restarted = fixture.coordinator.start(fixture.store.clone(), cancellation.clone());
+        wait_for_stage("PG restart receipt replay", || async { fixture.target_state(&target).await == "pinned" && !fixture.receipt().await.needs_attention }).await;
+        restarted.shutdown(Duration::from_secs(2)).await;
+        assert_eq!(fixture.receipt().await.observed_at, receipt.observed_at);
+        assert_eq!(fixture.receipt().await.resources, receipt.resources);
+        fixture.held(100, 1).await;
+        fixture.assert_posts(1);
+    }).catch_unwind().await;
     cancellation.cancel();
     close_db.close().await.unwrap();
     drop_owned_recovery_schema(&admin, &schema).await;

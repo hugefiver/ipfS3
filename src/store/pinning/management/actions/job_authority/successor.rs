@@ -6,6 +6,7 @@ use crate::store::pinning::jobs;
 /// A receipt candidate is not a parent grant. Require the actual original
 /// Submit plus both immutable invocation locators and the native request-bound
 /// Poll. Live lease/resource/release fences remain in `current_resource`.
+#[cfg(test)]
 pub(crate) async fn original_submit_for_poll<C: ConnectionTrait>(
     db: &C,
     poll: &pin_job::Model,
@@ -13,6 +14,17 @@ pub(crate) async fn original_submit_for_poll<C: ConnectionTrait>(
     invocation: &pin_invocation_route::Model,
     view: records::BindingView<'_>,
 ) -> Result<bool> {
+    original_submit_for_poll_catalog(ReceiptCatalog::full(db), poll, seed, invocation, view).await
+}
+
+pub(super) async fn original_submit_for_poll_catalog(
+    catalog: ReceiptCatalog<'_>,
+    poll: &pin_job::Model,
+    seed: &records::JobAuthority,
+    invocation: &pin_invocation_route::Model,
+    view: records::BindingView<'_>,
+) -> Result<bool> {
+    let db = &catalog;
     let work = view.decode_work();
     let Some(original) =
         records::current_model::<pin_job::Entity, _>(db, &[&seed.job_id], work).await?
@@ -22,11 +34,11 @@ pub(crate) async fn original_submit_for_poll<C: ConnectionTrait>(
     if original.operation != "submit" {
         return Ok(false);
     }
-    validate_job_resolved_with_work(db, &original, seed, view.decode_work()).await?;
+    validate_job_resolved_catalog(catalog, &original, seed, view.decode_work()).await?;
     let current = records::current_model::<pin_job::Entity, _>(db, &[&poll.id], work)
         .await?
         .ok_or(ManagementError::Confirmation)?;
-    validate_job_resolved_with_work(db, &current, seed, view.decode_work()).await?;
+    validate_job_resolved_catalog(catalog, &current, seed, view.decode_work()).await?;
     let source =
         records::current_model::<pin_invocation_route::Entity, _>(db, &[&original.id], work)
             .await?
@@ -45,7 +57,7 @@ pub(crate) async fn original_submit_for_poll<C: ConnectionTrait>(
     if history.submit_calls <= 0 || !history_route_matches(&history, &seed.route) {
         return Ok(false);
     }
-    let provider = operational_resource_with_work(db, seed, view.decode_work()).await?;
+    let provider = operational_resource_catalog(catalog, seed, view.decode_work()).await?;
     let Some(remote) =
         records::current_model::<remote_pin::Entity, _>(db, &[&provider, &seed.cid], work).await?
     else {
@@ -54,16 +66,17 @@ pub(crate) async fn original_submit_for_poll<C: ConnectionTrait>(
     let Some(request) = remote.request_id.as_deref() else {
         return Ok(false);
     };
-    jobs::poll_names_request_with_work(db, poll, request, view.decode_work()).await
+    jobs::poll_names_request_catalog(catalog, poll, request, view.decode_work()).await
 }
 
-pub(super) async fn current_resource_with_work<C: ConnectionTrait>(
-    db: &C,
+pub(super) async fn current_resource_catalog(
+    catalog: ReceiptCatalog<'_>,
     job: &pin_job::Model,
     authority: &records::JobAuthority,
     work: records::DecodeWork<'_>,
 ) -> Result<bool> {
-    let provider = operational_resource_with_work(db, authority, work).await?;
+    let db = &catalog;
+    let provider = operational_resource_catalog(catalog, authority, work).await?;
     let Some(remote) =
         records::current_model::<remote_pin::Entity, _>(db, &[&provider, &authority.cid], work)
             .await?
@@ -100,8 +113,8 @@ pub(super) async fn current_resource_with_work<C: ConnectionTrait>(
         return Ok(remote.epoch == authority.remote_epoch
             && invocation.remote_epoch == authority.remote_epoch);
     }
-    let releases = crate::store::pinning::legacy_migration::release_history_with_work(
-        db,
+    let releases = crate::store::pinning::legacy_migration::release_history_catalog(
+        catalog,
         &provider,
         &authority.cid,
         work,
@@ -122,7 +135,7 @@ pub(super) async fn current_resource_with_work<C: ConnectionTrait>(
         let Some(request) = remote.request_id.as_deref() else {
             return Ok(false);
         };
-        return jobs::poll_continuity_owner_with_work(db, job, request, work).await;
+        return jobs::poll_continuity_catalog(catalog, job, request, work).await;
     }
     let current = records::current_model::<pin_job::Entity, _>(db, &[&job.id], work)
         .await?

@@ -14,7 +14,6 @@ use ipfs_s3_gateway::{
     state::AppState,
     store::{self, entities::import_job},
 };
-use sea_orm::EntityTrait;
 use tokio_util::sync::CancellationToken;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,

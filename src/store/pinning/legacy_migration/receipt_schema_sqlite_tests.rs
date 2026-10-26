@@ -60,6 +60,48 @@ async fn metadata(
     expression: &str,
     suffix: &str,
 ) -> Vec<QueryResult> {
+    let fields = [
+        ("table_sql", "table", "t0"),
+        ("column_cid", "column", "i0"),
+        ("column_name", "column", "t0"),
+        ("column_type", "column", "t1"),
+        ("column_notnull", "column", "i1"),
+        ("column_default", "column", "t2"),
+        ("column_pk", "column", "i2"),
+        ("column_hidden", "column", "i3"),
+        ("index_name", "index", "t0"),
+        ("index_unique", "index", "i0"),
+        ("index_origin", "index", "t1"),
+        ("index_partial", "index", "i1"),
+        ("fk_table", "fk", "t0"),
+        ("fk_from", "fk", "t1"),
+        ("fk_to", "fk", "t2"),
+        ("fk_update", "fk", "t3"),
+        ("fk_delete", "fk", "t4"),
+        ("fk_match", "fk", "t5"),
+        ("trigger_name", "trigger", "t0"),
+        ("trigger_sql", "trigger", "t1"),
+        ("special_sql", "special", "t0"),
+    ];
+    let rewrite = |text: &str| {
+        fields
+            .iter()
+            .fold(text.to_owned(), |text, (logical, _, slot)| {
+                text.replace(logical, slot)
+            })
+    };
+    let (field, expression) =
+        if let Some((_, kind, slot)) = fields.iter().find(|(logical, _, _)| *logical == field) {
+            (
+                *slot,
+                format!(
+                    "CASE WHEN kind='{kind}' THEN {} ELSE {slot} END",
+                    rewrite(expression)
+                ),
+            )
+        } else {
+            (field, expression.to_owned())
+        };
     let slots: Vec<_> = ["kind", "owner"]
         .into_iter()
         .chain(read::SLOTS.iter().copied())
@@ -69,8 +111,8 @@ async fn metadata(
         read::metadata_statement(DatabaseBackend::Sqlite),
         &slots,
         field,
-        expression,
-        suffix,
+        &expression,
+        &rewrite(suffix),
     )
     .await
 }
@@ -174,6 +216,22 @@ async fn metadata_requires_each_group_and_rejects_duplicates_and_sentinels() {
         assert!(validate_metadata(&rows).is_err(), "duplicate {predicate}");
     }
     let rows = metadata(&db, "trigger_name", "'unknown'", "").await;
+    for row in &rows {
+        let kind: String = row.try_get("", "kind").unwrap();
+        if kind != "trigger" {
+            let mut table = read::Table::default();
+            table.push(row).unwrap();
+            if kind == "table" {
+                let owner: String = row.try_get("", "owner").unwrap();
+                let ddl = if owner == expected::OPERATIONS {
+                    expected::OPERATIONS_SQL
+                } else {
+                    expected::ITEMS_SQL
+                };
+                assert_eq!(normalize(&table.ddl[0]), normalize(ddl));
+            }
+        }
+    }
     assert!(validate_metadata(&rows).is_err());
     let rows = metadata(&db, "owner", "'pin_legacy_migration_items'", "").await;
     assert!(validate_metadata(&rows).is_err());

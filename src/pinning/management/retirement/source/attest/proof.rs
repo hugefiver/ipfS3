@@ -40,12 +40,14 @@ impl Serialize for Cells<'_> {
 
 #[cfg(test)]
 pub(super) fn assert_round_trip(accepted: &AcceptedPage) {
+    type ProofCell = (String, u64, Option<u64>, Vec<u8>);
+
     #[derive(Deserialize)]
     struct Proof {
         format: String,
         before: Cursor,
         after: Cursor,
-        parts: Vec<(String, NativeKey, Vec<(String, u64, Option<u64>, Vec<u8>)>)>,
+        parts: Vec<(String, NativeKey, Vec<ProofCell>)>,
         members: Vec<NativeKey>,
         eof: Vec<String>,
     }
