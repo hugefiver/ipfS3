@@ -78,23 +78,6 @@ pub(super) fn registration_key_with_work(
     }
 }
 
-pub(super) async fn registered_routes<C: ConnectionTrait>(
-    db: &C,
-    provider: &str,
-) -> AppResult<Vec<ProviderRouteSnapshot>> {
-    let schema = super::locks::AdmissionSchema::read(db).await?;
-    let routes = registered_routes_in_schema(db, provider).await?;
-    schema.revalidate(db).await?;
-    Ok(routes)
-}
-
-pub(super) async fn registered_routes_in_schema<C: ConnectionTrait>(
-    db: &C,
-    provider: &str,
-) -> AppResult<Vec<ProviderRouteSnapshot>> {
-    let work = super::SharedDecodeBudget::default();
-    registered_routes_in_schema_with_work(db, provider, super::DecodeWork::shared(&work)).await
-}
 pub(super) async fn registered_routes_in_schema_with_work<C: ConnectionTrait>(
     db: &C,
     provider: &str,

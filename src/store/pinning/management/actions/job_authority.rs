@@ -25,6 +25,7 @@ mod route;
 pub(crate) use completion::CompletionReader;
 pub(in crate::store::pinning) use route::admission_from_catalog;
 pub(crate) use route::historical_route_store;
+#[cfg(test)]
 pub(crate) use route::{admission_with_route, historical_route};
 pub(crate) mod park_scope;
 #[cfg(test)]
@@ -164,11 +165,6 @@ pub(crate) async fn check_before_call_store(
     job: &pin_job::Model,
     work: records::SharedDecodeBudget,
 ) -> AppResult<Option<JobPermit>> {
-    if store.db().get_database_backend() != sea_orm::DatabaseBackend::Sqlite {
-        return check_before_call_with_work(store.db(), job, work)
-            .await
-            .map_err(safe);
-    }
     let tx = store
         .begin_runtime(records::DecodeWork::shared(&work))
         .await?;
@@ -364,6 +360,7 @@ pub(crate) async fn lock_source_in_transaction_with_work(
 /// Acquire only at the tail, after the caller's ordered lifecycle/remote locks.
 /// Same-CID proof owners and empty manifest sets must stay
 /// stable through final projection, not just the selected source's row.
+#[cfg(test)]
 pub(crate) async fn fence_worker_authority_with_work<'a>(
     tx: &'a DatabaseTransaction,
     job: &'a pin_job::Model,
@@ -572,9 +569,6 @@ pub(crate) async fn fence_runtime_authority<'a>(
     job: &'a pin_job::Model,
     work: records::SharedDecodeBudget,
 ) -> AppResult<CompletionReader<'a>> {
-    if tx.db().get_database_backend() != sea_orm::DatabaseBackend::Sqlite {
-        return fence_worker_authority_with_work(tx.db(), job, work).await;
-    }
     records::locator::fence_authority(tx.db())
         .await
         .map_err(safe)?;

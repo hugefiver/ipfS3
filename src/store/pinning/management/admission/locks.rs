@@ -25,6 +25,11 @@ impl AdmissionSchema {
         &self,
         catalog: crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
     ) -> AppResult<()> {
+        if let crate::store::pinning::legacy_migration::ReceiptCatalog::Runtime(_, work) = catalog {
+            return work
+                .with(|session| session.check())
+                .map_err(super::work_error);
+        }
         if Self::catalog(catalog).await?.0 != self.0 {
             return Err(super::needs_attention());
         }

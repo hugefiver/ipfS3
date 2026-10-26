@@ -492,16 +492,10 @@ pub(in crate::store::pinning) async fn collect_runtime_scope(
     budget: &mut Budget,
     work: super::super::records::DecodeWork<'_>,
 ) -> Result<ScopedRead> {
-    if tx.db().get_database_backend() != DatabaseBackend::Sqlite {
-        return collect_scope(tx.db(), spec, budget).await;
-    }
     if spec.catalog_revision != super::super::schema::VERSION {
         return Err(ManagementError::Schema);
     }
-    tx.check_schema(work).await.map_err(|error| match error {
-        crate::error::AppError::ManagementBudget => ManagementError::Budget,
-        _ => ManagementError::Schema,
-    })?;
+    work.with(|session| session.check())?;
     collect_validated(tx.db(), spec, budget, Some((tx, work))).await
 }
 
@@ -653,8 +647,33 @@ pub(crate) async fn revalidate_scope_originals(
     originals: &BTreeMap<NativeKey, NativeRow>,
     budget: &mut Budget,
 ) -> Result<ScopedRead> {
+    revalidate_scope_core(tx, reviewed, originals, budget, None).await
+}
+
+pub(in crate::store::pinning) async fn revalidate_runtime_scope(
+    tx: &crate::store::RuntimeTransaction,
+    reviewed: &ScopedRead,
+    budget: &mut Budget,
+    work: super::super::records::DecodeWork<'_>,
+) -> Result<ScopedRead> {
+    revalidate_scope_core(tx.db(), reviewed, &reviewed.rows, budget, Some((tx, work))).await
+}
+
+async fn revalidate_scope_core(
+    tx: &DatabaseTransaction,
+    reviewed: &ScopedRead,
+    originals: &BTreeMap<NativeKey, NativeRow>,
+    budget: &mut Budget,
+    runtime: Option<(
+        &crate::store::RuntimeTransaction,
+        super::super::records::DecodeWork<'_>,
+    )>,
+) -> Result<ScopedRead> {
     fence_memberships(tx, &reviewed.spec).await?;
-    let fresh = collect_scope(tx, &reviewed.spec, budget).await?;
+    let fresh = match runtime {
+        Some((owner, work)) => collect_runtime_scope(owner, &reviewed.spec, budget, work).await?,
+        None => collect_scope(tx, &reviewed.spec, budget).await?,
+    };
     if fresh
         .rows
         .iter()
@@ -691,15 +710,38 @@ pub(crate) async fn check_frame_scope<C: ConnectionTrait>(
     reviewed: &super::NativeFrame,
     budget: &mut Budget,
 ) -> Result<super::NativeFrame> {
+    check_frame_scope_core(tx, reviewed, budget, None).await
+}
+
+pub(in crate::store::pinning) async fn check_runtime_frame_scope(
+    tx: &crate::store::RuntimeTransaction,
+    reviewed: &super::NativeFrame,
+    budget: &mut Budget,
+    work: super::super::records::DecodeWork<'_>,
+) -> Result<super::NativeFrame> {
+    check_frame_scope_core(tx.db(), reviewed, budget, Some((tx, work))).await
+}
+
+async fn check_frame_scope_core<C: ConnectionTrait>(
+    tx: &C,
+    reviewed: &super::NativeFrame,
+    budget: &mut Budget,
+    runtime: Option<(
+        &crate::store::RuntimeTransaction,
+        super::super::records::DecodeWork<'_>,
+    )>,
+) -> Result<super::NativeFrame> {
     let evidence = reviewed
         .scope_evidence()
         .ok_or(ManagementError::InvalidEvidence)?;
     if evidence.projection_only {
         return Err(ManagementError::InvalidEvidence);
     }
-    let fresh = collect_scope(tx, &evidence.spec, budget)
-        .await?
-        .into_native_frame(budget)?;
+    let fresh = match runtime {
+        Some((owner, work)) => collect_runtime_scope(owner, &evidence.spec, budget, work).await?,
+        None => collect_scope(tx, &evidence.spec, budget).await?,
+    }
+    .into_native_frame(budget)?;
     if fresh != *reviewed {
         return Err(ManagementError::Changed);
     }

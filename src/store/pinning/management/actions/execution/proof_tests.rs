@@ -106,7 +106,10 @@ pub(crate) async fn assert_restored(
     .await
     .unwrap();
     scope.revalidate(&fixture.db).await.unwrap();
-    let report = scope.report(&fixture.db).await.unwrap();
+    let report = scope
+        .report(&crate::store::Store::new(fixture.db.clone()))
+        .await
+        .unwrap();
     assert_eq!(report.items.len(), applied.items.len());
     let history = native::capture(&fixture.db).await.unwrap();
     let actions = records::frame_actions(&history).unwrap();
@@ -1100,6 +1103,54 @@ async fn kept_without_jobs_restores_exact_receipt() {
 #[tokio::test]
 async fn executed_create_retains_real_worker_submit_and_completion_with_source_context() {
     let fixture = super::super::tests::fixture("proof-worker-create").await;
+    assert_worker_submit_and_completion(fixture).await;
+}
+
+#[tokio::test]
+#[ignore = "requires an authorized isolated IPFS_S3_TEST_POSTGRES_URL"]
+async fn postgres_managed_worker_claim_submit_completion_and_report_avoid_structure_reads() {
+    use futures_util::FutureExt;
+    use sea_orm::{ConnectOptions, Database};
+    let url = std::env::var("IPFS_S3_TEST_POSTGRES_URL").expect("explicit test PostgreSQL URL");
+    let admin = Database::connect(&url).await.unwrap();
+    let schema = format!("managed_warm_{}", uuid::Uuid::new_v4().simple());
+    admin
+        .execute_unprepared(&format!("CREATE SCHEMA \"{schema}\""))
+        .await
+        .unwrap();
+    // Management's guarded engine clones SQLx startup options for its isolated
+    // connection, so bind the fixture schema there as well as the worker pool.
+    let mut scoped_url = url::Url::parse(&url).unwrap();
+    scoped_url
+        .query_pairs_mut()
+        .append_pair("options", &format!("-csearch_path={schema}"));
+    let mut options = ConnectOptions::new(scoped_url.to_string());
+    options.max_connections(4);
+    let db = Database::connect(options).await.unwrap();
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let fixture = super::super::tests::fixture_with_database(
+            "proof-worker-create",
+            false,
+            db.clone(),
+            tempfile::tempdir().unwrap(),
+        )
+        .await;
+        assert_worker_submit_and_completion(fixture).await;
+    })
+    .catch_unwind()
+    .await;
+    db.close().await.unwrap();
+    admin
+        .execute_unprepared(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
+        .await
+        .unwrap();
+    admin.close().await.unwrap();
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn assert_worker_submit_and_completion(fixture: super::super::tests::Fixture) {
     let applied = super::super::apply(
         &fixture.db,
         &fixture.config,
@@ -1140,13 +1191,20 @@ async fn executed_create_retains_real_worker_submit_and_completion_with_source_c
     )
     .await
     .unwrap();
-    Box::pin(coordinator.management_tick(
-        &crate::store::Store::new(fixture.db.clone()),
-        &scope,
-        &cancel,
-    ))
-    .await
-    .unwrap();
+    let trace = crate::sql_trace::SqlTrace::default();
+    let mut db = fixture.db.clone();
+    trace.attach(&mut db);
+    let store = crate::store::Store::new(db);
+    let work = records::SharedDecodeBudget::default();
+    store
+        .qualify_runtime_schema(records::DecodeWork::shared(&work))
+        .await
+        .unwrap();
+    trace.take("managed worker cold qualification", false);
+    Box::pin(coordinator.management_tick(&store, &scope, &cancel))
+        .await
+        .unwrap();
+    trace.take("managed worker claim/submit/completion/report", true);
     let now = crate::store::database_clock::database_now(&fixture.db)
         .await
         .unwrap();

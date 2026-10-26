@@ -358,8 +358,42 @@ async fn preflight_locked(tx: &DatabaseTransaction, req: &Request) -> AppResult<
 }
 
 pub async fn admit(db: &DatabaseConnection, req: &Request) -> AppResult<Status> {
+    admit_core(db, req, None).await
+}
+
+pub(crate) async fn admit_store(store: &crate::store::Store, req: &Request) -> AppResult<Status> {
+    admit_core(store.db(), req, Some(store)).await
+}
+
+async fn admit_core(
+    db: &DatabaseConnection,
+    req: &Request,
+    store: Option<&crate::store::Store>,
+) -> AppResult<Status> {
     for attempt in 0..=3 {
-        let outcome = admit_once(db, req).await;
+        let outcome = match store {
+            Some(store) => {
+                async {
+                    use crate::store::pinning::management::records::{
+                        DecodeWork, SharedDecodeBudget,
+                    };
+                    let work = SharedDecodeBudget::default();
+                    let tx = store.begin_runtime(DecodeWork::shared(&work)).await?;
+                    match admit_in_transaction(tx.db(), req, Some(&tx)).await {
+                        Ok(status) => {
+                            tx.commit().await?;
+                            Ok(status)
+                        }
+                        Err(error) => {
+                            tx.rollback().await?;
+                            Err(error)
+                        }
+                    }
+                }
+                .await
+            }
+            None => admit_once(db, req).await,
+        };
         if !outcome.as_ref().is_err_and(transient) || attempt == 3 {
             return outcome;
         }
@@ -370,9 +404,18 @@ pub async fn admit(db: &DatabaseConnection, req: &Request) -> AppResult<Status> 
 
 async fn admit_once(db: &DatabaseConnection, req: &Request) -> AppResult<Status> {
     let tx = db.begin().await?;
-    ownership::lock_bucket_for_ownership(&tx, &req.admission.bucket).await?;
-    if let Some(status) = preflight_locked(&tx, req).await? {
-        tx.commit().await?;
+    let status = admit_in_transaction(&tx, req, None).await?;
+    tx.commit().await?;
+    Ok(status)
+}
+
+async fn admit_in_transaction(
+    tx: &DatabaseTransaction,
+    req: &Request,
+    runtime: Option<&crate::store::RuntimeTransaction>,
+) -> AppResult<Status> {
+    ownership::lock_bucket_for_ownership(tx, &req.admission.bucket).await?;
+    if let Some(status) = preflight_locked(tx, req).await? {
         return Ok(status);
     }
     let a = &req.admission;
@@ -380,15 +423,26 @@ async fn admit_once(db: &DatabaseConnection, req: &Request) -> AppResult<Status>
         return Err(AppError::InvalidImportRequest);
     }
     let accepted_xml = accepted_receipt(&a.id, &a.captured_options)?;
-    crate::store::pinning::management::admission::lock_encoded_zip_intake_in_transaction(
-        &tx,
-        &a.captured_options,
-    )
-    .await?;
+    match runtime {
+        Some(owner) => {
+            crate::store::pinning::management::admission::lock_runtime_encoded_zip_intake(
+                owner,
+                &a.captured_options,
+            )
+            .await?
+        }
+        None => {
+            crate::store::pinning::management::admission::lock_encoded_zip_intake_in_transaction(
+                tx,
+                &a.captured_options,
+            )
+            .await?
+        }
+    }
     // No standalone execution::admit: its own commit would orphan the batch
     // if the request insert fails.
-    execution::admit_in_transaction(&tx, a).await?;
-    let inserted = tx.execute(sql(&tx,
+    execution::admit_in_transaction_core(tx, a, runtime).await?;
+    let inserted = tx.execute(sql(tx,
         "INSERT INTO zip_v2_import_requests (batch_id,owner,bucket,source_key,client_token,prefix,source_descriptor,expected_sha256,request_contract) VALUES (?,?,?,?,?,?,?,?,?)",
         "INSERT INTO zip_v2_import_requests (batch_id,owner,bucket,source_key,client_token,prefix,source_descriptor,expected_sha256,request_contract) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
         vec![a.id.clone().into(),a.owner.clone().into(),a.bucket.clone().into(),a.source_key.clone().into(),
@@ -397,7 +451,6 @@ async fn admit_once(db: &DatabaseConnection, req: &Request) -> AppResult<Status>
     if inserted.rows_affected() != 1 {
         return Err(conflict());
     }
-    tx.commit().await?;
     Ok(Status {
         id: a.id.clone(),
         state: "pending",

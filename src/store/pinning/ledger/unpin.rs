@@ -19,11 +19,6 @@ pub(crate) async fn prepare_runtime_unpin_effect(
     cid: &str,
     work: DecodeWork<'_>,
 ) -> AppResult<(crate::store::RuntimeTransaction, bool)> {
-    if tx.db().get_database_backend() != DatabaseBackend::Sqlite {
-        let cleanup = cleanup_allowed(tx.db(), provider, cid).await?;
-        mark_effect(tx.db(), provider, cid, effect(cleanup)).await?;
-        return Ok((tx, cleanup));
-    }
     let catalog = tx.catalog(work);
     let cleanup = cleanup_allowed_catalog(catalog, provider, cid, work).await?;
     // Effect publication reads its own fresh binding and ledger row.

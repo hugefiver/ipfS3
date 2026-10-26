@@ -1,4 +1,4 @@
-//! SQLite worker hints from a closed, operation-owned read transaction.
+//! Worker hints from a closed, operation-owned read transaction.
 use super::{authority, work_error};
 use crate::{
     error::AppResult,
@@ -14,9 +14,9 @@ use crate::{
         },
     },
 };
-use sea_orm::{
-    ConnectionTrait, DatabaseBackend, DatabaseConnection, DatabaseTransaction, TransactionTrait,
-};
+use sea_orm::DatabaseTransaction;
+#[cfg(test)]
+use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, TransactionTrait};
 
 /// Only this module constructs and ends the transaction. No caller can retain
 /// a catalog qualification across a write, provider call, or another phase.
@@ -26,6 +26,7 @@ pub(crate) struct WorkerReadWindow {
 }
 
 enum WindowOwner {
+    #[cfg(test)]
     Full(DatabaseTransaction),
     Runtime(
         crate::store::RuntimeTransaction,
@@ -46,6 +47,7 @@ impl WorkerReadWindow {
     }
     pub(in crate::store::pinning) fn db(&self) -> &DatabaseTransaction {
         match &self.tx {
+            #[cfg(test)]
             WindowOwner::Full(tx) => tx,
             WindowOwner::Runtime(tx, _) => tx.db(),
         }
@@ -57,6 +59,7 @@ impl WorkerReadWindow {
     ) -> legacy_migration::ReceiptCatalog<'a> {
         match &self.tx {
             WindowOwner::Runtime(tx, _) => tx.catalog(work),
+            #[cfg(test)]
             WindowOwner::Full(_) => legacy_migration::ReceiptCatalog::Observed(self),
         }
     }
@@ -68,6 +71,7 @@ impl WorkerReadWindow {
             WindowOwner::Runtime(tx, work) => {
                 Some(tx.schema_versions(records::DecodeWork::shared(work)).await)
             }
+            #[cfg(test)]
             WindowOwner::Full(_) => None,
         }
     }
@@ -94,6 +98,7 @@ impl WorkerReadWindow {
 
     async fn close(self) -> AppResult<()> {
         match self.tx {
+            #[cfg(test)]
             WindowOwner::Full(tx) => {
                 tx.rollback().await?;
                 Ok(())
@@ -102,6 +107,7 @@ impl WorkerReadWindow {
         }
     }
 
+    #[cfg(test)]
     async fn begin(db: &DatabaseConnection) -> AppResult<Self> {
         let tx = db.begin().await?;
         let versions = match legacy_migration::receipt_schema(&tx).await {
@@ -129,6 +135,7 @@ pub(crate) struct ClaimedObservation {
     pub ordinary: ledger::JobAdmission,
 }
 
+#[cfg(test)]
 pub(crate) async fn observe_claimed_job(
     db: &DatabaseConnection,
     job: &pin_job::Model,
@@ -165,9 +172,6 @@ pub(crate) async fn claimed_runtime(
     identity: Option<&ProviderIdentity>,
     work: records::SharedDecodeBudget,
 ) -> AppResult<ClaimedObservation> {
-    if tx.db().get_database_backend() != DatabaseBackend::Sqlite {
-        return claimed_generic(tx.db(), job, identity, work).await;
-    }
     claimed_catalog(
         tx.catalog(records::DecodeWork::shared(&work)),
         job,
@@ -239,6 +243,7 @@ async fn claimed_catalog(
     })
 }
 
+#[cfg(test)]
 pub(crate) async fn claimed_generic<C: ConnectionTrait>(
     db: &C,
     job: &pin_job::Model,
@@ -282,6 +287,7 @@ fn managed_hint(
     }
 }
 
+#[cfg(test)]
 async fn ordinary_submit<C: ConnectionTrait>(
     db: &C,
     job: &pin_job::Model,
@@ -308,6 +314,7 @@ pub(crate) struct ReconcileObservation {
     pub snapshot: Option<leases::RemoteWorkSnapshot>,
 }
 
+#[cfg(test)]
 pub(crate) async fn observe_reconcile(
     db: &DatabaseConnection,
     job: &pin_job::Model,
@@ -401,21 +408,7 @@ async fn snapshot(
     leases::remote_work_snapshot_at_key(window.db(), &key, cid).await
 }
 
-pub(crate) async fn observe_snapshot(
-    db: &DatabaseConnection,
-    provider: &str,
-    cid: &str,
-    work: records::SharedDecodeBudget,
-) -> AppResult<Option<leases::RemoteWorkSnapshot>> {
-    if db.get_database_backend() != DatabaseBackend::Sqlite {
-        return leases::remote_work_snapshot(db, provider, cid).await;
-    }
-    let window = WorkerReadWindow::begin(db).await?;
-    let result = snapshot(&window, provider, cid, records::DecodeWork::shared(&work)).await;
-    window.close().await?;
-    result
-}
-
+#[cfg(test)]
 pub(crate) async fn observe_failed_cleanup(
     db: &DatabaseConnection,
     provider: &str,
@@ -480,9 +473,6 @@ pub(crate) async fn observe_claimed_job_store(
     identity: Option<&ProviderIdentity>,
     work: records::SharedDecodeBudget,
 ) -> AppResult<ClaimedObservation> {
-    if store.db().get_database_backend() != DatabaseBackend::Sqlite {
-        return observe_claimed_job(store.db(), job, identity, work).await;
-    }
     let window = WorkerReadWindow::begin_store(store, work.clone()).await?;
     let result = Box::pin(claimed(&window, job, identity, work)).await;
     window.close().await?;
@@ -494,9 +484,6 @@ pub(crate) async fn observe_reconcile_store(
     job: &pin_job::Model,
     work: records::SharedDecodeBudget,
 ) -> AppResult<ReconcileObservation> {
-    if store.db().get_database_backend() != DatabaseBackend::Sqlite {
-        return observe_reconcile(store.db(), job, work).await;
-    }
     let window = WorkerReadWindow::begin_store(store, work.clone()).await?;
     let result = Box::pin(reconcile(&window, job, work)).await;
     window.close().await?;
@@ -509,9 +496,6 @@ pub(crate) async fn observe_snapshot_store(
     cid: &str,
     work: records::SharedDecodeBudget,
 ) -> AppResult<Option<leases::RemoteWorkSnapshot>> {
-    if store.db().get_database_backend() != DatabaseBackend::Sqlite {
-        return observe_snapshot(store.db(), provider, cid, work).await;
-    }
     let window = WorkerReadWindow::begin_store(store, work.clone()).await?;
     let result = snapshot(&window, provider, cid, records::DecodeWork::shared(&work)).await;
     window.close().await?;
@@ -524,9 +508,6 @@ pub(crate) async fn observe_failed_cleanup_store(
     cid: &str,
     work: records::SharedDecodeBudget,
 ) -> AppResult<(bool, Option<leases::RemoteWorkSnapshot>)> {
-    if store.db().get_database_backend() != DatabaseBackend::Sqlite {
-        return observe_failed_cleanup(store.db(), provider, cid, work).await;
-    }
     let window = WorkerReadWindow::begin_store(store, work.clone()).await?;
     let result = Box::pin(failed_cleanup(
         &window,

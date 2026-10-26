@@ -7,7 +7,6 @@ use std::{
 
 use http::{HeaderMap, StatusCode};
 use s3s::{Body, S3Request, S3Response, S3Result, dto::CompleteMultipartUploadInput};
-use sea_orm::TransactionTrait;
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
@@ -219,8 +218,13 @@ async fn admit_manifest(
     manifest: &FinalZipManifest,
     publish_source: bool,
 ) -> S3Result<Option<StandardMutationGuard>> {
-    let db = state.store.db();
-    let tx = db.begin().await.map_err(AppError::from)?;
+    let work = store::pinning::management::records::SharedDecodeBudget::default();
+    let tx = state
+        .store
+        .begin_runtime(store::pinning::management::records::DecodeWork::shared(
+            &work,
+        ))
+        .await?;
     store::import::ownership::lock_bucket_for_ownership(&tx, &intake.bucket).await?;
     let items = manifest
         .successful
@@ -265,7 +269,7 @@ async fn admit_manifest(
     execution::admit_manifest_in_transaction(&tx, claim, &items, &ids)
         .await
         .map_err(store_error)?;
-    zip::BatchAdmission::admit_in_transaction(
+    zip::BatchAdmission::admit_runtime_mirror(
         &tx,
         &zip::BatchAdmission {
             id: claim.batch_id.clone(),
@@ -293,7 +297,7 @@ async fn admit_manifest(
             .await
             .map_err(store_error)?;
     }
-    tx.commit().await.map_err(AppError::from)?;
+    tx.commit().await?;
     Ok(source_guard)
 }
 
@@ -397,7 +401,7 @@ pub(super) async fn complete(
         && let Some(intent) = &intent
     {
         store::pinning::publication::preflight_captured_zip_routes(
-            db,
+            &state.store,
             intent,
             state.pinning.effective_config(),
             None,
@@ -521,7 +525,7 @@ pub(super) async fn complete(
         return Err(conflict());
     }
     store::pinning::publication::preflight_captured_zip_routes(
-        db,
+        &state.store,
         &intent,
         state.pinning.effective_config(),
         Some(&manifest),

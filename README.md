@@ -1417,23 +1417,36 @@ Only a genuinely empty application schema may initialize the current schema;
 missing migration metadata alone doesn't establish emptiness. A ready current
 schema is validated before normal startup proceeds.
 
-SQLite runtime `Store` instances may reuse a successfully verified static layout
-instead of repeating full table, trigger and index validation for every operation.
-Qualification requires complete validation of the native, management, receipt and
-route layouts. Clones share their Store's qualification; a newly constructed
-Store must qualify independently. Failed or cancelled qualification is not reusable.
-Runtime checks still read the known migration versions, readiness and applicable
-TEMP shadows on the operation's connection. Permissions, original bindings,
-retirement, quota, claims, epochs, TTL and acknowledgements remain live checks;
-schema qualification does not cache business authorization. Bare-database,
-historical, maintenance and PostgreSQL paths retain full validation.
+SQLite and PostgreSQL validate database structure once per `Store` lifecycle.
+Startup validates the complete native, management, receipt and route layouts,
+constraints, indexes, triggers, migration versions, readiness and applicable
+TEMP shadows, then reuses that qualification for runtime operations. Clones
+share the qualification; a new Store qualifies independently. A Store built
+directly from a trusted pool qualifies on its first runtime operation. Failure,
+cancellation or incomplete transaction cleanup cannot publish qualification.
 
-Direct schema changes outside the application while a SQLite Store is running
-are unsupported. Immediate detection is not guaranteed, especially if migration
-versions are also forged. Stop and drain users of the database before schema
-maintenance, discard all old Store instances and their clones, perform the
-explicit full validation or upgrade, then restart with newly qualified instances.
-Do not resume an old Store after a failed or completed schema upgrade.
+Warm S3 and worker operations do not repeat structural catalog, version,
+readiness or TEMP checks. Permissions, source/locator seals and membership,
+original bindings, retirement, quota, claims, epochs, generations, TTL and
+acknowledgements remain live checks. PostgreSQL permanent RPC fact-relation
+OID/schema binding also remains enforced: fact capture is independent of
+runtime qualification and admission. Bare-database management, historical
+readers, explicit upgrades and management-file imports retain full validation.
+
+The pool is trusted to keep every connection on the same database/schema.
+PostgreSQL startup options and database/role `search_path` defaults must remain
+fixed and identical across connections, including replacement connections.
+Custom pools must initialize that path for every connection, not just issue
+`SET search_path` on one checkout. Do not inject connection-local TEMP objects
+or change the path after qualification.
+
+Schema, migration-version, readiness and TEMP changes are offline maintenance,
+not an online tamper-detection contract. Readiness is written by installation,
+explicit upgrade and backfill, not used as a live runtime switch. Stop all
+related gateways, workers and management processes, drain operations and release
+their Stores, clones and pools before maintenance. Perform explicit full
+validation or upgrade, then restart with newly qualified Stores. Never resume
+an old Store after failed or completed maintenance.
 
 The separate `--pinning-manage-upgrade` command requires the exact existing DB
 URL, native physical identity, database scope, source version and target version.

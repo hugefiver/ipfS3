@@ -670,10 +670,6 @@ pub(crate) async fn record_runtime_submit_invocation(
     now: DateTimeUtc,
     work: DecodeWork<'_>,
 ) -> AppResult<Option<history::Model>> {
-    if tx.db().get_database_backend() != DatabaseBackend::Sqlite {
-        return record_submit_invocation_with_work(tx.db(), claimed, api, strategy, now, work)
-            .await;
-    }
     record_invocation_core(tx.db(), claimed, api, strategy, now, work, Some(tx)).await
 }
 
@@ -895,7 +891,7 @@ pub async fn park_submit<C: ConnectionTrait + TransactionTrait>(
     now: DateTimeUtc,
 ) -> AppResult<()> {
     let txn = db.begin().await?;
-    match park_submit_in_transaction(&txn, claimed, state, safe_error, now).await {
+    match park_submit_in_transaction(&txn, claimed, state, safe_error, now, None).await {
         Ok(()) => {
             txn.commit().await?;
             Ok(())
@@ -907,12 +903,40 @@ pub async fn park_submit<C: ConnectionTrait + TransactionTrait>(
     }
 }
 
+pub(crate) async fn park_submit_store(
+    store: &crate::store::Store,
+    claimed: &ClaimedPinJob,
+    state: &str,
+    safe_error: &str,
+    now: DateTimeUtc,
+) -> AppResult<()> {
+    let work = SharedDecodeBudget::default();
+    let tx = store.begin_runtime(DecodeWork::shared(&work)).await?;
+    let result = park_submit_in_transaction(
+        tx.db(),
+        claimed,
+        state,
+        safe_error,
+        now,
+        Some((&tx, DecodeWork::shared(&work))),
+    )
+    .await;
+    match result {
+        Ok(()) => tx.commit().await,
+        Err(error) => {
+            tx.rollback().await?;
+            Err(error)
+        }
+    }
+}
+
 async fn park_submit_in_transaction(
     db: &sea_orm::DatabaseTransaction,
     claimed: &ClaimedPinJob,
     state: &str,
     safe_error: &str,
     now: DateTimeUtc,
+    runtime: Option<(&crate::store::RuntimeTransaction, DecodeWork<'_>)>,
 ) -> AppResult<()> {
     if !fence_job_claim(db, &claimed.model.id, claimed_lock(&claimed.model)?).await? {
         return Err(stale_claim_error(&claimed.model.id));
@@ -978,7 +1002,20 @@ async fn park_submit_in_transaction(
     // A late receipt may have committed after recovery read `in_flight` but
     // before this exact claim parked. Serialize both orders on the job first.
     if state == "needs_attention" && safe_error == RPC_RECOVERY_PARK_REASON {
-        super::ledger::submission::wake_matching_parked(db, &claimed.model.id, now).await?;
+        match runtime {
+            Some((tx, work)) => {
+                super::ledger::submission::wake_runtime_matching_parked(
+                    tx,
+                    &claimed.model.id,
+                    now,
+                    work,
+                )
+                .await?
+            }
+            None => {
+                super::ledger::submission::wake_matching_parked(db, &claimed.model.id, now).await?
+            }
+        };
     }
     Ok(())
 }
@@ -1433,9 +1470,6 @@ pub(crate) async fn ensure_runtime_submit(
     now: DateTimeUtc,
     work: DecodeWork<'_>,
 ) -> AppResult<EnsureJobOutcome> {
-    if tx.get_database_backend() != DatabaseBackend::Sqlite {
-        return ensure_or_reactivate_submit_job(tx.db(), job, now).await;
-    }
     ensure_submit_core(tx.db(), job, now, work, Some(tx)).await
 }
 
@@ -1531,9 +1565,6 @@ pub(crate) async fn ensure_runtime_reconcile(
     now: DateTimeUtc,
     work: DecodeWork<'_>,
 ) -> AppResult<EnsureJobOutcome> {
-    if tx.db().get_database_backend() != DatabaseBackend::Sqlite {
-        return ensure_reconcile_with_work(tx.db(), job, now, work).await;
-    }
     ensure_reconcile_core(tx.db(), job, now, work, Some(tx)).await
 }
 
@@ -1647,9 +1678,6 @@ pub(crate) async fn ensure_runtime_unpin(
     now: DateTimeUtc,
     work: DecodeWork<'_>,
 ) -> AppResult<EnsureJobOutcome> {
-    if tx.get_database_backend() != DatabaseBackend::Sqlite {
-        return ensure_or_reactivate_unpin_job(tx.db(), job, now).await;
-    }
     ensure_unpin_core(tx.db(), job, now, Some((tx, work))).await
 }
 
@@ -1751,7 +1779,7 @@ pub async fn claim_due_jobs<C: ConnectionTrait + TransactionTrait>(
 /// Receipt-owned scope, never a caller-supplied list of queue UUIDs. There is no
 /// global expiry/quota scan here; execution uses the normal claim protocol.
 pub(crate) async fn claim_due_management_jobs(
-    db: &sea_orm::DatabaseConnection,
+    store: &crate::store::Store,
     scope: &super::management::admission::ManagementJobScope,
     now: DateTimeUtc,
     lock_for: ChronoDuration,
@@ -1760,9 +1788,12 @@ pub(crate) async fn claim_due_management_jobs(
     if limit == 0 {
         return Ok(Vec::new());
     }
-    let tx = db.begin().await?;
     let work = super::management::records::SharedDecodeBudget::default();
-    scope.revalidate_with_work(&tx, work.clone()).await?;
+    let tx = store.begin_runtime(DecodeWork::shared(&work)).await?;
+    lock_sqlite_claim_writer(tx.db()).await?;
+    scope
+        .revalidate_catalog(tx.catalog(DecodeWork::shared(&work)), work.clone())
+        .await?;
     use sea_orm::QueryTrait;
     let context = DecodeWork::shared(&work);
     context.copy(&[now; 6]).map_err(management_error)?;
@@ -1805,16 +1836,23 @@ pub(crate) async fn claim_due_management_jobs(
             .map_err(management_error)?
             .ok_or_else(|| invalid_job("management candidate disappeared"))?;
         if !scope
-            .contains_with_work(&tx, &candidate, work.clone())
+            .contains_catalog(tx.catalog(context), &candidate, work.clone())
             .await?
         {
             continue;
         }
-        if let Some(job) =
-            claim_candidate_with_work(&tx, candidate, now, now + lock_for, work.clone()).await?
+        if let Some(job) = claim_candidate_core(
+            tx.db(),
+            candidate,
+            now,
+            now + lock_for,
+            work.clone(),
+            Some(&tx),
+        )
+        .await?
         {
             if !scope
-                .contains_with_work(&tx, &job.model, work.clone())
+                .contains_catalog(tx.catalog(context), &job.model, work.clone())
                 .await?
             {
                 return Err(invalid_job(
@@ -1926,9 +1964,6 @@ pub(crate) async fn claim_due_worker_jobs_store(
     limit: u64,
     schedule: WorkerClaimSchedule<'_>,
 ) -> AppResult<Vec<ClaimedPinJob>> {
-    if store.db().get_database_backend() != DatabaseBackend::Sqlite {
-        return claim_due_worker_jobs_fair(store.db(), now, lock_for, limit, schedule).await;
-    }
     if limit == 0 {
         return Ok(Vec::new());
     }
@@ -2606,9 +2641,6 @@ pub(crate) async fn prepare_runtime_submit_call(
     now: DateTimeUtc,
     work: DecodeWork<'_>,
 ) -> AppResult<SubmitCallDecision> {
-    if tx.db().get_database_backend() != DatabaseBackend::Sqlite {
-        return prepare_submit_call_with_work(tx.db(), claimed, now, work).await;
-    }
     prepare_submit_core(tx.db(), claimed, now, work, Some(tx)).await
 }
 
@@ -2632,7 +2664,7 @@ async fn prepare_submit_core<C: ConnectionTrait>(
         && remote_is_reserved_without_request(db, &job.provider, &job.cid).await?;
     if !current {
         complete_job(db, &job.id, locked_until, now).await?;
-        ensure_current_reconcile(db, &job.provider, &job.cid, now).await?;
+        ensure_current_reconcile(db, &job.provider, &job.cid, now, runtime).await?;
         return Ok(SubmitCallDecision::NoLongerDesired);
     }
     if !matches!(
@@ -2724,6 +2756,25 @@ pub async fn record_submit_recovery_no_match<C: ConnectionTrait>(
     now: DateTimeUtc,
     backoff: Duration,
 ) -> AppResult<SubmitRecoveryDecision> {
+    record_submit_recovery_no_match_core(db, claimed, now, backoff, None).await
+}
+
+pub(crate) async fn record_runtime_submit_recovery_no_match(
+    tx: &crate::store::RuntimeTransaction,
+    claimed: &ClaimedPinJob,
+    now: DateTimeUtc,
+    backoff: Duration,
+) -> AppResult<SubmitRecoveryDecision> {
+    record_submit_recovery_no_match_core(tx.db(), claimed, now, backoff, Some(tx)).await
+}
+
+async fn record_submit_recovery_no_match_core<C: ConnectionTrait>(
+    db: &C,
+    claimed: &ClaimedPinJob,
+    now: DateTimeUtc,
+    backoff: Duration,
+    runtime: Option<&crate::store::RuntimeTransaction>,
+) -> AppResult<SubmitRecoveryDecision> {
     let job = &claimed.model;
     let locked_until = claimed_lock(job)?;
     validate_claimed_submit(job)?;
@@ -2740,7 +2791,7 @@ pub async fn record_submit_recovery_no_match<C: ConnectionTrait>(
         .is_none()
     {
         complete_job(db, &job.id, locked_until, now).await?;
-        let reconcile_job_id = ensure_current_reconcile(db, &job.provider, &job.cid, now)
+        let reconcile_job_id = ensure_current_reconcile(db, &job.provider, &job.cid, now, runtime)
             .await?
             .ok_or_else(|| invalid_job("remote pin is missing during Submit recovery"))?;
         return Ok(SubmitRecoveryDecision::NoLongerDesired { reconcile_job_id });
@@ -3124,9 +3175,6 @@ pub(crate) async fn insert_runtime_job(
     now: DateTimeUtc,
     work: DecodeWork<'_>,
 ) -> AppResult<bool> {
-    if tx.db().get_database_backend() != DatabaseBackend::Sqlite {
-        return insert_new_job_with_work(tx.db(), job, now, work).await;
-    }
     insert_job_core(tx.db(), job, now, work, Some(tx)).await
 }
 
@@ -3536,6 +3584,7 @@ async fn ensure_current_reconcile<C: ConnectionTrait>(
     provider: &str,
     cid: &str,
     now: DateTimeUtc,
+    runtime: Option<&crate::store::RuntimeTransaction>,
 ) -> AppResult<Option<String>> {
     let Some(remote) = remote_pin::Entity::find_by_id((provider.to_owned(), cid.to_owned()))
         .one(db)
@@ -3547,7 +3596,11 @@ async fn ensure_current_reconcile<C: ConnectionTrait>(
         unreachable!("reconcile_job is always remote-scoped")
     };
     let id = job.id.clone();
-    ensure_or_reactivate_reconcile_job(db, job, now).await?;
+    let work = SharedDecodeBudget::default();
+    match runtime {
+        Some(tx) => ensure_runtime_reconcile(tx, job, now, DecodeWork::shared(&work)).await?,
+        None => ensure_or_reactivate_reconcile_job(db, job, now).await?,
+    };
     Ok(Some(id))
 }
 

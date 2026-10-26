@@ -59,7 +59,7 @@ async fn assert_missing(store: &Store, id: &str) {
 }
 
 #[tokio::test]
-async fn warm_store_publication_rechecks_live_controls_and_transaction_temp() {
+async fn rebuilt_store_publication_rejects_invalid_controls_and_shadows() {
     let store = fixture().await;
     publish(&store, "cold", ProviderMode::All).await.unwrap();
     publish(&store.clone(), "warm", ProviderMode::All)
@@ -80,8 +80,9 @@ async fn warm_store_publication_rechecks_live_controls_and_transaction_temp() {
         ),
     ] {
         store.db().execute_unprepared(alter).await.unwrap();
+        let rebuilt = Store::new(store.db().clone());
         assert!(
-            publish(&store, "rejected", ProviderMode::All)
+            publish(&rebuilt, "rejected", ProviderMode::All)
                 .await
                 .is_err()
         );
@@ -141,28 +142,6 @@ async fn warm_store_publication_preserves_quota_and_fresh_route_authority() {
             .unwrap();
         assert!(publish(&store, "dirty-original", mode).await.is_err());
         assert_missing(&store, "dirty-original").await;
-    }
-}
-
-#[tokio::test]
-async fn warm_store_reservation_mutation_cannot_authorize_target_or_commit() {
-    for mode in [ProviderMode::All, ProviderMode::One] {
-        let store = fixture().await;
-        publish(&store, "cold", mode).await.unwrap();
-        store.db().execute_unprepared("CREATE TRIGGER runtime_quota_readiness AFTER INSERT ON remote_pins BEGIN UPDATE pin_management_readiness SET state='backfill' WHERE id=1; END").await.unwrap();
-        assert!(publish(&store, "changed", mode).await.is_err());
-        assert_missing(&store, "changed").await;
-        assert!(
-            remote_pin::Entity::find()
-                .filter(remote_pin::Column::Cid.eq("bafy-changed"))
-                .one(store.db())
-                .await
-                .unwrap()
-                .is_none()
-        );
-        crate::store::pinning::management::schema::validate(store.db())
-            .await
-            .unwrap();
     }
 }
 

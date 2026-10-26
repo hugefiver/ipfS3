@@ -23,7 +23,7 @@ generation/epoch、配额及 source。锁/CAS/phantom fence 不能用 COUNT、�
 延长授权或发送请求。只有完整 binding 相同才能返回 `AlreadyApplied`；UUID、幂等 ID
 存在或文件自报 applied 都不够。
 
-普通 consumer 通过关系定位索引读取完整原件，核验 readiness、source/locator seal 和
+普通 consumer 通过关系定位索引读取完整原件，核验 source/locator seal 和
 本 scope/global-unknown pending。定位索引不是权限证据；缺证或 dirty 必须 fail-closed，
 不能扫描全部 records 补洞、取剩余许可项，或当成普通无 management 权限的 job。
 ReadOnly/LedgerOnly 等限制参与 authority meet，readonly 永不升级为远端写权限。
@@ -207,16 +207,22 @@ pass，不全局清队列；claim cap、due time 和 readonly 限制仍有效。
 在此之前不迁移、不写 migration-lock、不注册身份或启动 worker。缺 migration metadata
 不是空库证明，普通 management CLI 也不自动建表或迁移。
 
-SQLite runtime 可在同一 Store 实例内复用完整校验后的静态 schema 资格；校验覆盖
-native、management、receipt 和 route 的表、trigger、index 等结构。Store 的克隆共享资格，
-重新构造的 Store 必须独立校验，失败或取消不能留下可复用的成功标记。运行期仍实时读取
-版本、readiness 和实际连接上的相关 TEMP shadow；权限、原始绑定、retirement、quota、
-claim、epoch、TTL 与 ACK 不作为 schema 资格的一部分缓存。裸 DB、历史、维护和 PostgreSQL
-路径继续完整校验。
+SQLite 与 PostgreSQL 均在 Store 生命周期内完成一次完整 schema 资格校验，覆盖 native、
+management、receipt、route 的表、约束、trigger、index、完整版本序列、readiness 与
+TEMP shadow。启动复用已成功完成且清理完毕的校验；直接从可信池构造的 Store 在首次
+runtime 操作时校验。clone 共享资格，新 Store 独立校验，失败或取消不发布成功资格。
+warm S3/worker 不再查询结构、版本、readiness 或 TEMP。权限、原始绑定、retirement、
+quota、claim、epoch、generation、TTL、ACK、source/locator seal 与完整 membership 仍
+实时核验。裸 DB 管理、历史读取、维护、管理文件导入继续完整校验。RPC complete_fact
+独立持久化已捕获事实，PG 永久 relation 的 OID/schema 绑定仍保留，不加 runtime 准入门禁。
 
-不支持绕过应用直接在线修改 SQLite schema，也不保证立即发现此类变更，尤其是同时伪造
-migration version 的情况。schema 维护前必须停服并排空操作，废弃全部旧 Store 及其克隆；
-显式校验或升级后，重新启动并取得新资格。不能在升级失败或完成后继续使用旧 Store。
+连接池须保证所有连接（含重建的连接）使用同一固定 database/schema/search_path；PG
+自定义池须逐连接初始化，不能把某次 checkout 的 SET 当作全池保证。应用池统一使用
+URL startup options 与固定的数据库/角色默认设置。生命周期内不得注入 TEMP 或改 path。
+结构、迁移版本、readiness、TEMP 的外部在线修改不在逐操作检测保证内。readiness 的
+install、upgrade_existing、backfill 写入均属维护，不是业务实时开关。维护前必须停止
+全部相关服务、worker、管理进程并排空操作，释放旧 Store、clone 和连接池；显式校验或
+升级后重新启动。维护失败或完成后均不能继续复用旧 Store。
 
 独立升级入口不加载 gateway config、不构造 AppState、不注册 provider、不启动 worker，
 不做 source/provider RPC。五个参数均必填，identity/scope 必须是授权原库的真实绑定。

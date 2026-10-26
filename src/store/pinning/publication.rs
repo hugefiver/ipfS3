@@ -349,7 +349,7 @@ pub async fn preflight_decided_routes(
 /// policy/TTL/limits are not reinterpreted; publication repeats the full route
 /// fence under its existing locks with exact final bindings.
 pub(crate) async fn preflight_captured_zip_routes(
-    db: &DatabaseConnection,
+    store: &crate::store::Store,
     capture: &crate::pinning::zip_policy::CapturedZipIntent,
     current: &crate::pinning::config::ValidatedPinningConfig,
     manifest: Option<&crate::zip::batch::FinalZipManifest>,
@@ -383,7 +383,12 @@ pub(crate) async fn preflight_captured_zip_routes(
             allocatable.insert(frozen.config_name.clone());
         }
     }
-    ledger::verify_birth_candidate_routes(db, &routes, &allocatable, false).await
+    let budget = super::management::records::SharedDecodeBudget::default();
+    let work = super::management::records::DecodeWork::shared(&budget);
+    let tx = store.begin_runtime(work).await?;
+    let result = ledger::verify_runtime_birth_routes(&tx, &routes, &allocatable, false, work).await;
+    tx.rollback().await?;
+    result
 }
 
 pub async fn publish_decided_object(
@@ -1053,6 +1058,36 @@ pub async fn delete_version_with_leases_guarded(
     guard: StandardMutationGuard,
     now: DateTime<Utc>,
 ) -> AppResult<DeleteVersionResult> {
+    delete_version_with_database(db.into(), bucket, key, selector, guard, now).await
+}
+
+pub(crate) async fn delete_runtime_version_with_leases_guarded(
+    store: &crate::store::Store,
+    bucket: &str,
+    key: &str,
+    selector: VersionSelector,
+    guard: StandardMutationGuard,
+    now: DateTime<Utc>,
+) -> AppResult<DeleteVersionResult> {
+    delete_version_with_database(
+        reservations::PublicationDatabase::Store(store),
+        bucket,
+        key,
+        selector,
+        guard,
+        now,
+    )
+    .await
+}
+
+async fn delete_version_with_database(
+    db: reservations::PublicationDatabase<'_>,
+    bucket: &str,
+    key: &str,
+    selector: VersionSelector,
+    guard: StandardMutationGuard,
+    now: DateTime<Utc>,
+) -> AppResult<DeleteVersionResult> {
     let result = async {
         for retry in 0..=MAX_TRANSACTION_RETRIES {
             match delete_version_attempt(db, bucket, key, selector.clone(), guard.clone(), now)
@@ -1071,7 +1106,7 @@ pub async fn delete_version_with_leases_guarded(
         unreachable!("guarded version delete retry loop exhausted without returning")
     }
     .await;
-    release_failed_mutation(db, Some(&guard), result.is_err()).await;
+    release_failed_mutation(&db, Some(&guard), result.is_err()).await;
     result
 }
 
@@ -1097,50 +1132,79 @@ async fn release_failed_mutation(
 }
 
 async fn delete_version_attempt(
-    db: &DatabaseConnection,
+    db: reservations::PublicationDatabase<'_>,
     bucket: &str,
     key: &str,
     selector: VersionSelector,
     guard: StandardMutationGuard,
     now: DateTime<Utc>,
 ) -> Result<DeleteVersionResult, TransactionError<AppError>> {
-    let bucket = bucket.to_owned();
-    let key = key.to_owned();
-    db.transaction(move |txn| {
-        Box::pin(async move {
-            lock_bucket_for_ownership(txn, &bucket).await?;
-            verify_standard_mutation_guard(txn, &guard, &bucket, &key, &[]).await?;
-            let state = crate::store::bucket::get_versioning_state(txn, &bucket).await?;
-            if state == BucketVersioningState::Unversioned
-                && matches!(&selector, VersionSelector::Exact(_))
-            {
-                return Err(AppError::InvalidArgument(
-                    "version IDs are unavailable for an unversioned bucket".to_owned(),
-                ));
-            }
+    use reservations::{PublicationTransaction, Reservations};
+    let transaction = match db {
+        reservations::PublicationDatabase::Full(db) => {
+            PublicationTransaction::Full(db.begin().await.map_err(TransactionError::Connection)?)
+        }
+        reservations::PublicationDatabase::Store(store) => {
+            let work = super::management::records::SharedDecodeBudget::default();
+            let tx = store
+                .begin_publication_runtime(super::management::records::DecodeWork::shared(&work))
+                .await?;
+            PublicationTransaction::Runtime(tx, work)
+        }
+    };
+    let txn = transaction.db();
+    let runtime = transaction.runtime();
+    let result = async {
+        lock_bucket_for_ownership(txn, bucket).await?;
+        verify_standard_mutation_guard(txn, &guard, bucket, key, &[]).await?;
+        let state = crate::store::bucket::get_versioning_state(txn, bucket).await?;
+        if state == BucketVersioningState::Unversioned
+            && matches!(&selector, VersionSelector::Exact(_))
+        {
+            return Err(AppError::InvalidArgument(
+                "version IDs are unavailable for an unversioned bucket".to_owned(),
+            ));
+        }
 
-            let _ = crate::store::object_version::lock_current_row(txn, &bucket, &key).await?;
-            let result = match selector {
-                VersionSelector::Current => match state {
-                    BucketVersioningState::Unversioned => {
-                        delete_unversioned_current_in_transaction(txn, &bucket, &key, now).await?
-                    }
-                    BucketVersioningState::Enabled => {
-                        delete_enabled_current_in_transaction(txn, &bucket, &key, now).await?
-                    }
-                    BucketVersioningState::Suspended => {
-                        delete_suspended_current_in_transaction(txn, &bucket, &key, now).await?
-                    }
-                },
-                VersionSelector::Exact(version_id) => {
-                    delete_exact_in_transaction(txn, &bucket, &key, version_id, now).await?
+        let _ = crate::store::object_version::lock_current_row(txn, bucket, key).await?;
+        let result = match selector {
+            VersionSelector::Current => match state {
+                BucketVersioningState::Unversioned => {
+                    delete_unversioned_current_core(txn, bucket, key, now, runtime).await?
                 }
-            };
-            complete_standard_mutation_in_transaction(txn, &guard, now).await?;
+                BucketVersioningState::Enabled => {
+                    delete_enabled_current_in_transaction(txn, bucket, key, now).await?
+                }
+                BucketVersioningState::Suspended => {
+                    delete_suspended_current_core(txn, bucket, key, now, runtime).await?
+                }
+            },
+            VersionSelector::Exact(version_id) => {
+                delete_exact_core(txn, bucket, key, version_id, now, runtime).await?
+            }
+        };
+        complete_standard_mutation_in_transaction(txn, &guard, now).await?;
+        Ok(result)
+    }
+    .await;
+    match result {
+        Ok(result) => {
+            transaction
+                .into_db()
+                .commit()
+                .await
+                .map_err(TransactionError::Connection)?;
             Ok(result)
-        })
-    })
-    .await
+        }
+        Err(error) => {
+            transaction
+                .into_db()
+                .rollback()
+                .await
+                .map_err(TransactionError::Connection)?;
+            Err(TransactionError::Transaction(error))
+        }
+    }
 }
 
 pub(crate) async fn delete_unversioned_current_in_transaction<C: ConnectionTrait>(
@@ -1148,6 +1212,16 @@ pub(crate) async fn delete_unversioned_current_in_transaction<C: ConnectionTrait
     bucket: &str,
     key: &str,
     now: DateTime<Utc>,
+) -> AppResult<DeleteVersionResult> {
+    delete_unversioned_current_core(db, bucket, key, now, None).await
+}
+
+async fn delete_unversioned_current_core<C: ConnectionTrait>(
+    db: &C,
+    bucket: &str,
+    key: &str,
+    now: DateTime<Utc>,
+    runtime: Option<&crate::store::RuntimeTransaction>,
 ) -> AppResult<DeleteVersionResult> {
     let null_slot =
         crate::store::object_version::lock_indexed_version(db, bucket, key, &PublicVersionId::Null)
@@ -1164,7 +1238,7 @@ pub(crate) async fn delete_unversioned_current_in_transaction<C: ConnectionTrait
         leases::lock_publication_lifecycle_frontier(db, std::slice::from_ref(&current.id), &[])
             .await?;
         crate::store::object::set_only_latest(db, bucket, key, None).await?;
-        leases::end_active_leases_for_object(db, &current.id, now).await?;
+        leases::end_active_leases_for_object_core(db, &current.id, now, runtime).await?;
         tags::replace_object_tags(db, &current.id, &[]).await?;
     }
     crate::store::object_version::remove_null_slot(db, bucket, key).await?;
@@ -1202,6 +1276,16 @@ pub(crate) async fn delete_suspended_current_in_transaction<C: ConnectionTrait>(
     key: &str,
     now: DateTime<Utc>,
 ) -> AppResult<DeleteVersionResult> {
+    delete_suspended_current_core(db, bucket, key, now, None).await
+}
+
+async fn delete_suspended_current_core<C: ConnectionTrait>(
+    db: &C,
+    bucket: &str,
+    key: &str,
+    now: DateTime<Utc>,
+    runtime: Option<&crate::store::RuntimeTransaction>,
+) -> AppResult<DeleteVersionResult> {
     let null_slot =
         crate::store::object_version::lock_indexed_version(db, bucket, key, &PublicVersionId::Null)
             .await?;
@@ -1218,7 +1302,7 @@ pub(crate) async fn delete_suspended_current_in_transaction<C: ConnectionTrait>(
         }
         leases::lock_publication_lifecycle_frontier(db, std::slice::from_ref(&object.id), &[])
             .await?;
-        leases::end_active_leases_for_object(db, &object.id, now).await?;
+        leases::end_active_leases_for_object_core(db, &object.id, now, runtime).await?;
         tags::replace_object_tags(db, &object.id, &[]).await?;
     }
     let version_id = crate::store::object_version::install_delete_marker(
@@ -1248,6 +1332,17 @@ pub(crate) async fn delete_exact_in_transaction<C: ConnectionTrait>(
     version_id: PublicVersionId,
     now: DateTime<Utc>,
 ) -> AppResult<DeleteVersionResult> {
+    delete_exact_core(db, bucket, key, version_id, now, None).await
+}
+
+async fn delete_exact_core<C: ConnectionTrait>(
+    db: &C,
+    bucket: &str,
+    key: &str,
+    version_id: PublicVersionId,
+    now: DateTime<Utc>,
+    runtime: Option<&crate::store::RuntimeTransaction>,
+) -> AppResult<DeleteVersionResult> {
     let requested_version_id = version_id.as_s3_str().to_owned();
     let (selected, resolved) =
         crate::store::object_version::lock_indexed_version(db, bucket, key, &version_id)
@@ -1267,7 +1362,7 @@ pub(crate) async fn delete_exact_in_transaction<C: ConnectionTrait>(
         }
         leases::lock_publication_lifecycle_frontier(db, std::slice::from_ref(&object.id), &[])
             .await?;
-        leases::end_active_leases_for_object(db, &object.id, now).await?;
+        leases::end_active_leases_for_object_core(db, &object.id, now, runtime).await?;
         tags::replace_object_tags(db, &object.id, &[]).await?;
     }
     let deleted_delete_marker = resolved.kind == VersionKind::DeleteMarker;
@@ -1489,7 +1584,9 @@ async fn publication_attempt(
     replay: Option<ZipCompletedReplay>,
     session: &super::management::records::SharedDecodeBudget,
 ) -> Result<PublicationResult, TransactionError<AppError>> {
-    if db.get_database_backend() == DatabaseBackend::Sqlite {
+    if matches!(db, PublicationDatabase::Store(_))
+        || db.get_database_backend() == DatabaseBackend::Sqlite
+    {
         return Box::pin(reservations::attempt(
             db,
             request,
@@ -1666,9 +1763,8 @@ async fn publish_with_reservations<
     }
     let session = reservations.runtime_work().cloned().unwrap_or_default();
     let work = super::management::records::DecodeWork::shared(&session);
-    if let Some(tx) = reservations.runtime() {
-        tx.check_schema(work).await?;
-    }
+    work.with(|session| session.check())
+        .map_err(super::management::admission::work_error)?;
     let versioning_state =
         crate::store::bucket::lock_versioning_state(db, &request.object.bucket).await?;
     let object_id = request.object.id.clone();
@@ -1690,6 +1786,7 @@ async fn publish_with_reservations<
                     tx,
                     &snapshot.routes,
                     &snapshot.allocatable,
+                    true,
                     work,
                 )
                 .await?
@@ -1728,6 +1825,7 @@ async fn publish_with_reservations<
         &request.object,
         versioning_state,
         publication_time,
+        reservations.runtime(),
     )
     .await?;
     tags::replace_object_tags(db, &object_id, &request.tags).await?;
@@ -1776,9 +1874,8 @@ async fn publish_with_reservations<
         )
         .await?;
     }
-    if let Some(tx) = reservations.runtime() {
-        tx.check_schema(work).await?;
-    }
+    work.with(|session| session.check())
+        .map_err(super::management::admission::work_error)?;
     Ok(publication_result)
 }
 
@@ -1938,6 +2035,7 @@ async fn write_object_version_and_update_lifecycle<C: ConnectionTrait>(
     object: &PublicationObject,
     state: BucketVersioningState,
     now: DateTime<Utc>,
+    runtime: Option<&crate::store::RuntimeTransaction>,
 ) -> AppResult<PublicationResult> {
     if object.logical_size < 0 {
         return Err(invalid_publication(
@@ -1961,7 +2059,7 @@ async fn write_object_version_and_update_lifecycle<C: ConnectionTrait>(
     let inserted =
         crate::store::object::insert_immutable_in_transaction(db, immutable_object).await?;
     if let Some(displaced_object_id) = displaced_object_id {
-        leases::end_active_leases_for_object(db, &displaced_object_id, now).await?;
+        leases::end_active_leases_for_object_core(db, &displaced_object_id, now, runtime).await?;
         tags::replace_object_tags(db, &displaced_object_id, &[]).await?;
     }
     let public_version_id =

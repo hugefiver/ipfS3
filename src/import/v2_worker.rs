@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use sea_orm::{DatabaseConnection, TransactionTrait};
+use sea_orm::DatabaseConnection;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -409,7 +409,12 @@ async fn execute_inner(
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        let tx = db.begin().await.map_err(|_| RunError::Retry)?;
+        let work = crate::store::pinning::management::records::SharedDecodeBudget::default();
+        let tx = state
+            .store
+            .begin_runtime(crate::store::pinning::management::records::DecodeWork::shared(&work))
+            .await
+            .map_err(|_| RunError::Retry)?;
         ownership::lock_bucket_for_ownership(&tx, &snapshot.bucket)
             .await
             .map_err(|_| RunError::Retry)?;
@@ -449,7 +454,7 @@ async fn execute_inner(
             input_identity: "pending".into(),
             captured_options: snapshot.captured_options.clone(),
         };
-        zip::BatchAdmission::admit_in_transaction(&tx, &mirror)
+        zip::BatchAdmission::admit_runtime_mirror(&tx, &mirror)
             .await
             .map_err(|_| RunError::Retry)?;
         execution::admit_manifest_in_transaction(&tx, claim, &v2_items, &mutation_ids)

@@ -586,7 +586,7 @@ pub async fn management_tick(
 ) -> AppResult<ManagementJobReport> {
     if !cancellation.is_cancelled() {
         let claimed = jobs::claim_due_management_jobs(
-            store.db(),
+            store,
             scope,
             Utc::now(),
             coordinator.settings().lock_for,
@@ -602,12 +602,15 @@ pub async fn management_tick(
                 .await?;
         }
     }
-    scope.report(store.db()).await
+    scope.report(store).await
 }
 
 async fn expire_worker_leases(store: &Store, now: DateTime<Utc>) -> AppResult<()> {
-    let txn = store.db().begin().await?;
-    let expired = leases::expire_due_leases(&txn, now).await?;
+    let session = crate::store::pinning::management::records::SharedDecodeBudget::default();
+    let txn = store
+        .begin_runtime(crate::store::pinning::management::records::DecodeWork::shared(&session))
+        .await?;
+    let expired = leases::expire_runtime_due_leases(&txn, now).await?;
     txn.commit().await?;
     if !expired.is_empty() {
         tracing::info!(
@@ -1199,19 +1202,6 @@ async fn worker_job_route_matches(
     coordinator: &PinningCoordinator,
     job: &pin_job::Model,
 ) -> AppResult<bool> {
-    if store.db().get_database_backend() != sea_orm::DatabaseBackend::Sqlite {
-        if let Some(route) = job_authority::historical_route(store.db(), job).await? {
-            return Ok(coordinator
-                .historical_runtime_key(&job.provider, &route)
-                .is_some());
-        }
-        return ledger::job_route_matches(
-            store.db(),
-            job,
-            coordinator.provider_identity(&job.provider),
-        )
-        .await;
-    }
     let observation = admission::worker_observation::observe_claimed_job_store(
         store,
         job,
@@ -1809,7 +1799,7 @@ async fn record_submit_phase(
                         | ProviderErrorClass::NotSubmitted
                         | ProviderErrorClass::Quota
                 ) {
-                    jobs::record_submit_recovery_no_match(
+                    jobs::record_runtime_submit_recovery_no_match(
                         &txn,
                         &claimed,
                         now,
@@ -1965,7 +1955,8 @@ async fn recover_submit(
             )));
         }
         if evidence.outcome == "not_submitted" {
-            let txn = store.db().begin().await?;
+            let work = SharedDecodeBudget::default();
+            let txn = store.begin_runtime(DecodeWork::shared(&work)).await?;
             if jobs::fence_job_claim(&txn, &claimed.model.id, claimed_lock(&claimed)?).await? {
                 jobs::record_submit_error(
                     &txn,
@@ -1977,7 +1968,7 @@ async fn recover_submit(
                         .unwrap_or("{\"operation\":\"submit\",\"effect\":\"not_created\"}"),
                 )
                 .await?;
-                jobs::record_submit_recovery_no_match(
+                jobs::record_runtime_submit_recovery_no_match(
                     &txn,
                     &claimed,
                     Utc::now(),
@@ -1988,8 +1979,8 @@ async fn recover_submit(
             txn.commit().await?;
             return Ok(WorkerContinuation::Done);
         }
-        return jobs::park_submit(
-            store.db(),
+        return jobs::park_submit_store(
+            store,
             &claimed,
             "needs_attention",
             jobs::RPC_RECOVERY_PARK_REASON,
@@ -2091,7 +2082,8 @@ async fn recover_submit(
                     },
                 ))),
                 [] => {
-                    let txn = store.db().begin().await?;
+                    let work = SharedDecodeBudget::default();
+                    let txn = store.begin_runtime(DecodeWork::shared(&work)).await?;
                     if !jobs::fence_job_claim(&txn, &claimed.model.id, claimed_lock(&claimed)?)
                         .await?
                     {
@@ -2105,7 +2097,7 @@ async fn recover_submit(
                         Utc::now(),
                     )
                     .await?;
-                    let decision = jobs::record_submit_recovery_no_match(
+                    let decision = jobs::record_runtime_submit_recovery_no_match(
                         &txn,
                         &claimed,
                         Utc::now(),
@@ -2157,7 +2149,8 @@ async fn retry_submit_recovery(
         coordinator.settings().max_backoff,
     );
     let now = Utc::now();
-    let txn = store.db().begin().await?;
+    let work = SharedDecodeBudget::default();
+    let txn = store.begin_runtime(DecodeWork::shared(&work)).await?;
     if !jobs::fence_job_claim(&txn, &claimed.model.id, claimed_lock(claimed)?).await? {
         txn.rollback().await?;
         transition(claimed, "recovering", "stale_claim_discarded", None);
@@ -2170,8 +2163,14 @@ async fn retry_submit_recovery(
         Vec::new()
     };
     jobs::record_submit_error(&txn, claimed, "unknown", &error.safe_evidence("find")).await?;
-    jobs::retry_submit_recovery(&txn, claimed, now, delay, provider_error_label(error.class))
-        .await?;
+    jobs::retry_submit_recovery(
+        txn.db(),
+        claimed,
+        now,
+        delay,
+        provider_error_label(error.class),
+    )
+    .await?;
     txn.commit().await?;
     if !evicted.is_empty() {
         coordinate_quota_evicted_one_targets(store, coordinator, &evicted, now).await?;
@@ -2501,7 +2500,8 @@ async fn coordinate_observation_phase(
     match result {
         RemoteStatusApplyResult::StaleRequest => {
             let finalized: AppResult<()> = async {
-                let txn = store.db().begin().await?;
+                let work = SharedDecodeBudget::default();
+                let txn = store.begin_runtime(DecodeWork::shared(&work)).await?;
                 complete_claimed_if_live(&txn, claimed, now).await?;
                 ensure_current_reconcile(&txn, &claimed.model.provider, &claimed.model.cid, now)
                     .await?;
@@ -2550,16 +2550,18 @@ async fn coordinate_observation_phase(
             }
 
             let finalized: AppResult<&'static str> = async {
-                let txn = store.db().begin().await?;
+                let work = SharedDecodeBudget::default();
+                let txn = store.begin_runtime(DecodeWork::shared(&work)).await?;
                 let outcome = if claimed.model.operation == "poll"
                     && (cluster || matches!(
                         remote.status,
                         RemotePinStatus::Queued | RemotePinStatus::Pinning
                     )) {
-                    let snapshot = leases::remote_work_snapshot(
-                        &txn,
+                    let snapshot = leases::remote_work_snapshot_catalog(
+                        txn.catalog(DecodeWork::shared(&work)),
                         &claimed.model.provider,
                         &claimed.model.cid,
+                        DecodeWork::shared(&work),
                     )
                     .await?;
                     let same_owner = snapshot
@@ -2743,6 +2745,7 @@ async fn persist_typed_observation_status_phase(
                 observation_request_id,
                 &claimed.model.operation,
                 observation_time,
+                DecodeWork::shared(&work),
             )
             .await?;
             if !receipt.projectable {
@@ -3173,12 +3176,14 @@ async fn execute_reconcile(
     ) {
         (STATUS_RESERVED, None) => {
             let now = Utc::now();
-            let txn = store.db().begin().await?;
-            let projected = leases::project_reconcile_target_from_remote(
+            let work = SharedDecodeBudget::default();
+            let txn = store.begin_runtime(DecodeWork::shared(&work)).await?;
+            let projected = leases::project_runtime_reconcile_target(
                 &txn,
                 &snapshot.desired[0].target_id,
                 expected_epoch,
                 now,
+                DecodeWork::shared(&work),
             )
             .await?;
             complete_claimed_if_live(&txn, &claimed, now).await?;
@@ -3519,7 +3524,8 @@ async fn reconcile_failed(
     };
     match applied {
         RemoteStatusApplyResult::StaleRequest => {
-            let txn = store.db().begin().await?;
+            let work = SharedDecodeBudget::default();
+            let txn = store.begin_runtime(DecodeWork::shared(&work)).await?;
             complete_claimed_if_live(&txn, &claimed, now).await?;
             ensure_current_reconcile(&txn, &claimed.model.provider, &claimed.model.cid, now)
                 .await?;
@@ -3704,7 +3710,8 @@ async fn reconcile_failed(
             ..
         }) => {
             let now = Utc::now();
-            let txn = store.db().begin().await?;
+            let work = SharedDecodeBudget::default();
+            let txn = store.begin_runtime(DecodeWork::shared(&work)).await?;
             if !jobs::fence_job_claim(&txn, &claimed.model.id, claimed_lock(&claimed)?).await? {
                 txn.rollback().await?;
                 transition(
@@ -3715,7 +3722,7 @@ async fn reconcile_failed(
                 );
                 return Ok(());
             }
-            let decision = leases::prepare_failed_remote_resubmit(
+            let decision = leases::prepare_runtime_failed_remote_resubmit(
                 &txn,
                 &claimed.model.provider,
                 &claimed.model.cid,
@@ -3755,16 +3762,6 @@ async fn failed_delete_is_current(
     now: DateTime<Utc>,
 ) -> AppResult<bool> {
     let work = SharedDecodeBudget::default();
-    if store.db().get_database_backend() != sea_orm::DatabaseBackend::Sqlite {
-        return failed_delete_current_catalog(
-            crate::store::pinning::legacy_migration::ReceiptCatalog::full(store.db()),
-            job,
-            request_id,
-            now,
-            DecodeWork::shared(&work),
-        )
-        .await;
-    }
     let tx = store.begin_runtime(DecodeWork::shared(&work)).await?;
     let result = failed_delete_current_catalog(
         tx.catalog(DecodeWork::shared(&work)),
@@ -3825,7 +3822,8 @@ async fn retry_ordinary_job(
     );
     let now = Utc::now();
     let current = if claimed.model.operation == "reconcile" {
-        let txn = store.db().begin().await?;
+        let work = SharedDecodeBudget::default();
+        let txn = store.begin_runtime(DecodeWork::shared(&work)).await?;
         let current = leases::guard_reconcile_remote_epoch(
             &txn,
             &claimed.model.provider,
@@ -4091,7 +4089,8 @@ async fn complete_reconcile_at_expected_epoch(
     claimed: &ClaimedPinJob,
     now: DateTime<Utc>,
 ) -> AppResult<bool> {
-    let txn = store.db().begin().await?;
+    let work = SharedDecodeBudget::default();
+    let txn = store.begin_runtime(DecodeWork::shared(&work)).await?;
     let current = leases::guard_reconcile_remote_epoch(
         &txn,
         &claimed.model.provider,
@@ -4116,7 +4115,8 @@ async fn reschedule_reconcile_at_expected_epoch(
     due: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> AppResult<bool> {
-    let txn = store.db().begin().await?;
+    let work = SharedDecodeBudget::default();
+    let txn = store.begin_runtime(DecodeWork::shared(&work)).await?;
     let current = leases::guard_reconcile_remote_epoch(
         &txn,
         &claimed.model.provider,
@@ -4155,8 +4155,8 @@ async fn complete_claimed_if_live<C: sea_orm::ConnectionTrait>(
     jobs::complete_job(db, &claimed.model.id, claimed_lock(claimed)?, now).await
 }
 
-async fn ensure_current_reconcile<C: sea_orm::ConnectionTrait>(
-    db: &C,
+async fn ensure_current_reconcile(
+    db: &crate::store::RuntimeTransaction,
     provider: &str,
     cid: &str,
     now: DateTime<Utc>,
@@ -4170,7 +4170,8 @@ async fn ensure_current_reconcile<C: sea_orm::ConnectionTrait>(
     let NewPinJob::Remote(job) = jobs::reconcile_job(provider, cid, remote.epoch, now) else {
         unreachable!("reconcile is remote scoped")
     };
-    jobs::ensure_or_reactivate_reconcile_job(db, job, now).await?;
+    let work = SharedDecodeBudget::default();
+    jobs::ensure_runtime_reconcile(db, job, now, DecodeWork::shared(&work)).await?;
     Ok(())
 }
 
@@ -4914,7 +4915,12 @@ async fn recover_durable_observation_coordination(
     if !matches!(remote.status.as_str(), STATUS_FAILED | STATUS_PINNED) {
         return Ok(());
     }
-    let affected = leases::current_remote_outcomes(store.db(), provider, cid).await?;
+    let work = crate::store::pinning::management::records::SharedDecodeBudget::default();
+    let context = DecodeWork::shared(&work);
+    let read = store.begin_runtime(context).await?;
+    let affected = leases::current_remote_outcomes(&read, provider, cid, context).await;
+    read.rollback().await?;
+    let affected = affected?;
     if remote.status == STATUS_FAILED {
         coordinate_failed_one_outcomes(store, coordinator, &affected, now).await?;
         let work = SharedDecodeBudget::default();
@@ -5033,7 +5039,7 @@ async fn coordinate_claimed_one_target(
 }
 
 async fn quota_coordination_hook(
-    db: &sea_orm::DatabaseTransaction,
+    db: &crate::store::RuntimeTransaction,
     coordinator: &PinningCoordinator,
     job: &pin_job::Model,
     now: DateTime<Utc>,
@@ -5051,7 +5057,7 @@ async fn quota_coordination_hook(
     ) else {
         return Ok(Vec::new());
     };
-    store_quota::evict_for_provider_quota(
+    store_quota::evict_runtime_provider_quota(
         db,
         &job.provider,
         store_quota::ProviderQuotaWork {
@@ -5078,8 +5084,11 @@ async fn wake_provider_waiters_after_release(
     let Some(limits) = coordinator.provider_limits().get(provider) else {
         return Ok(Vec::new());
     };
-    let txn = store.db().begin().await?;
-    let woken = store_quota::wake_provider_waiters(&txn, provider, limits, now).await?;
+    let session = SharedDecodeBudget::default();
+    let work = DecodeWork::shared(&session);
+    let txn = store.begin_runtime(work).await?;
+    let woken =
+        store_quota::wake_runtime_provider_waiters(&txn, provider, limits, now, work).await?;
     txn.commit().await?;
     let retry_delay = chrono_duration(coordinator.settings().interval)?;
     let txn = store.db().begin().await?;
@@ -5132,7 +5141,7 @@ async fn coordinate_quota_waiters(
         leases::requeue_released_all_quota_targets(&txn, &provider, retry_delay, now).await?;
         txn.commit().await?;
 
-        let woken = if store.db().get_database_backend() == DatabaseBackend::Sqlite {
+        let woken = {
             let budget = SharedDecodeBudget::default();
             let work = DecodeWork::shared(&budget);
             let txn = store.begin_runtime(work).await?;
@@ -5154,11 +5163,6 @@ async fn coordinate_quota_waiters(
                     return Err(error);
                 }
             }
-        } else {
-            let txn = store.db().begin().await?;
-            let woken = store_quota::wake_provider_waiters(&txn, &provider, &limits, now).await?;
-            txn.commit().await?;
-            woken
         };
         if !woken.is_empty() {
             tracing::debug!(
@@ -5171,8 +5175,10 @@ async fn coordinate_quota_waiters(
             continue;
         }
 
-        let txn = store.db().begin().await?;
-        let evicted = store_quota::evict_for_provider_waiter(&txn, &provider, &limits, now).await?;
+        let session = SharedDecodeBudget::default();
+        let txn = store.begin_runtime(DecodeWork::shared(&session)).await?;
+        let evicted =
+            store_quota::evict_runtime_provider_waiter(&txn, &provider, &limits, now).await?;
         txn.commit().await?;
         coordinate_quota_evicted_one_targets(store, coordinator, &evicted, now).await?;
     }
@@ -5191,7 +5197,12 @@ async fn provider_domain_closed(store: &Store, provider: &str) -> AppResult<bool
     let original = serde_json::from_str(&registered.snapshot).map_err(|_| {
         AppError::InvalidPinningRequest("retirement attribution needs attention".into())
     })?;
-    admission::registration_closed(store.db(), &original).await
+    let session = SharedDecodeBudget::default();
+    let work = DecodeWork::shared(&session);
+    let tx = store.begin_runtime(work).await?;
+    let result = admission::registration_closed_catalog(tx.catalog(work), &original, work).await;
+    tx.rollback().await?;
+    result
 }
 
 async fn recover_quota_evicted_one_targets(
@@ -5248,14 +5259,17 @@ async fn coordinate_quota_evicted_one_targets(
         else {
             continue;
         };
-        let txn = store.db().begin().await?;
-        leases::fail_one_target(
+        let session = SharedDecodeBudget::default();
+        let work = DecodeWork::shared(&session);
+        let txn = store.begin_runtime(work).await?;
+        leases::fail_runtime_one_target(
             &txn,
             &target.lease_id,
             &target.target_id,
             &providers,
             coordinator.provider_limits(),
             now,
+            work,
         )
         .await?;
         txn.commit().await?;
@@ -5270,7 +5284,7 @@ async fn ordered_target_failover(
     cid: &str,
     failed: &str,
 ) -> AppResult<Option<Vec<String>>> {
-    let frozen = if store.db().get_database_backend() == DatabaseBackend::Sqlite {
+    let frozen = {
         let work = SharedDecodeBudget::default();
         let tx = store.begin_runtime(DecodeWork::shared(&work)).await?;
         let result =
@@ -5284,15 +5298,6 @@ async fn ordered_target_failover(
             .await;
         tx.rollback().await?;
         result
-    } else {
-        crate::store::pinning::management::actions::points::failover_candidates(
-            store.db(),
-            &lease.id,
-            cid,
-            failed,
-        )
-        .await
-        .map_err(admission::work_error)
     }
     .map_err(|_| {
         AppError::InvalidPinningRequest("exact management fallback point needs attention".into())
@@ -11764,8 +11769,9 @@ mod tests {
     #[tokio::test]
     async fn rate_wait_heartbeats_without_using_fast_provider_capacity_and_cancels_cleanly() {
         let mut fixture = fixture([]).await;
-        let fast_provider = ScriptProvider::new([Script::Get(Ok(remote(
-            "unused-fast-rate",
+        let fast_provider = ScriptProvider::new([Script::Get(Ok(remote_for(
+            "bafy-rate-fast",
+            "request-rate-fast",
             RemotePinStatus::Queued,
         )))]);
         PinningCoordinator::replace_provider_for_test(
@@ -11788,7 +11794,7 @@ mod tests {
         );
         let due = Utc::now() - chrono::Duration::seconds(1);
         let slow_job = fixture.seed_poll("rate-wait", due).await;
-        fixture
+        let fast_job = fixture
             .seed_poll_for("fast", "rate-fast", due + chrono::Duration::milliseconds(1))
             .await;
 
@@ -11812,15 +11818,29 @@ mod tests {
         tokio::time::advance(std::time::Duration::from_millis(1)).await;
         // The Tokio clock is frozen; bound progress with the original wall-clock budget.
         let progress_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while fast_provider.gets.load(Ordering::SeqCst) == 0
-            || slow_runtime.next_request_at.try_lock().is_ok()
-        {
+        let fast_completed = loop {
+            let fast = pin_job::Entity::find_by_id(fast_job.clone())
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+            // Provider entry precedes the transaction that durably schedules the next poll.
+            if fast.state == "pending"
+                && fast.locked_until.is_none()
+                && fast.next_attempt_at > due + chrono::Duration::milliseconds(1)
+                && slow_runtime.next_request_at.try_lock().is_err()
+            {
+                break fast;
+            }
             assert!(
                 std::time::Instant::now() < progress_deadline,
                 "fast provider did not progress alongside the slow provider's rate wait"
             );
             tokio::task::yield_now().await;
-        }
+        };
+        assert_eq!(fast_provider.gets.load(Ordering::SeqCst), 1);
+        assert_eq!(fast_completed.attempts, 0);
+        assert_eq!(fast_completed.last_error, None);
         let before_heartbeat = pin_job::Entity::find_by_id(slow_job.clone())
             .one(&db)
             .await
@@ -11852,11 +11872,16 @@ mod tests {
         let old_lock = before_heartbeat.locked_until.unwrap();
         let reclaim_at = old_lock + (waiting.locked_until.unwrap() - old_lock) / 2;
         assert!(reclaim_at > old_lock);
-        assert!(
-            jobs::claim_due_jobs(&db, reclaim_at, chrono::Duration::milliseconds(120), 2,)
+        let reclaimed =
+            jobs::claim_due_jobs(&db, reclaim_at, chrono::Duration::milliseconds(120), 2)
                 .await
-                .unwrap()
-                .is_empty()
+                .unwrap();
+        // UTC can make the completed fast poll due while the Tokio rate clock is frozen.
+        assert!(
+            reclaimed.iter().all(|job| job.model.id == fast_job
+                && job.previous_state == "pending"
+                && !job.reclaimed),
+            "a second claimant reclaimed a live rate waiter: {reclaimed:?}"
         );
         handle.shutdown(std::time::Duration::from_millis(40)).await;
         assert_eq!(slow_provider.gets.load(Ordering::SeqCst), 0);
@@ -11865,6 +11890,11 @@ mod tests {
         assert!(tokio::time::Instant::now() > rate_deadline);
         assert_eq!(slow_provider.gets.load(Ordering::SeqCst), 0);
         assert_eq!(fast_provider.gets.load(Ordering::SeqCst), 1);
+        for provider in [&slow_provider, &fast_provider] {
+            assert_eq!(provider.submits.load(Ordering::SeqCst), 0);
+            assert_eq!(provider.finds.load(Ordering::SeqCst), 0);
+            assert_eq!(provider.unpins.load(Ordering::SeqCst), 0);
+        }
         paused_runtime_keepalive.finish().await;
         tokio::time::resume();
     }

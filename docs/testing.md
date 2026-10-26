@@ -34,6 +34,52 @@ The native runner isolation fixture is also directly runnable and is part of CI 
 pwsh -NoProfile -File tests/native-runner.Tests.ps1
 ```
 
+## Store lifecycle integrity
+
+The SQL observer records SeaORM metric-callback executions, including nested generic
+readers. Counts exclude raw/unprepared commands and transaction control. PostgreSQL
+guarded startup has its own SQLx executor and is not counted by this observer;
+its qualification reuse and cleanup are tested separately. Lazy cold validation
+must produce structural reads; qualified S3, provider
+registration and worker operations must produce business SQL but no structural
+reads. Total SQL counts are reported, not fixed as a performance contract.
+PostgreSQL permanent RPC fact-relation OID/schema binding is intentionally
+excluded from structural validation counts and remains enforced. Fresh physical
+database/scope identity and identity-access privilege queries are also business
+authority inputs, not structural scans.
+
+```powershell
+cargo test --lib runtime
+cargo test --lib scheduler_recovers_completed_park
+cargo test --lib executed_create_retains_real_worker_submit_and_completion_with_source_context
+cargo test --test integration optimistic_integrity::sqlite
+cargo test --test optimistic_cluster_integrity sqlite_cluster -- --nocapture
+```
+
+The PostgreSQL counterparts require an explicitly authorized disposable endpoint
+in `IPFS_S3_TEST_POSTGRES_URL`. Each creates its own UUID schema and initializes
+every pool connection with that schema's search path; it drops only that schema.
+The managed-worker fixture binds the schema in URL startup options so the guarded
+management engine's independent connections use the same schema as the worker pool.
+Do not point these tests at production or an unknown service.
+
+```powershell
+cargo test --lib postgres_lifecycle_qualification_and_cold_rejection -- --ignored --nocapture
+cargo test --lib postgres_warm_rpc_fact_park_and_recovery -- --ignored --nocapture
+cargo test --lib postgres_managed_worker_claim_submit_completion_and_report_avoid_structure_reads -- --ignored --nocapture
+cargo test --test integration optimistic_integrity::postgres -- --ignored --nocapture
+cargo test --test optimistic_cluster_integrity postgres_cluster -- --ignored --nocapture
+```
+
+Cold/new-Store tests retain damaged-layout, version/readiness, shadow,
+cancellation and cleanup rejection. Warm tests retain fresh quota, retirement,
+source/locator authority, claim/epoch/generation, TTL, rollback and RPC recovery
+checks. Online external schema/readiness/TEMP tampering is not a warm-runtime
+contract; maintenance requires draining processes and rebuilding Stores/pools.
+The Cluster observer drives signed publication and the real worker with mocked HTTP
+leaves. It covers insufficient-to-complete replica projection, One convergence and
+reclaimed jobs with an active desired lease; it is not physical replica evidence.
+
 ## Stage 3 pin-control checks
 
 Run these focused tests against the new optional-control and read-only CLI

@@ -42,6 +42,9 @@ pub fn apply_sqlite_busy_timeout(options: &mut sea_orm::ConnectOptions) {
 }
 
 /// Connect to the configured database, applying the SQLite busy timeout.
+/// PostgreSQL connections share the URL's startup options and database/role
+/// defaults. Those search-path settings must remain fixed for this pool's
+/// lifetime; application operations never change them on individual checkouts.
 pub async fn connect_database(database_url: &str) -> Result<DatabaseConnection, sea_orm::DbErr> {
     let mut options = sea_orm::ConnectOptions::new(database_url.to_owned());
     apply_sqlite_busy_timeout(&mut options);
@@ -59,6 +62,9 @@ struct StoreInner {
 }
 
 impl Store {
+    /// Own a trusted pool. All connections must use the same fixed PostgreSQL
+    /// search_path (or SQLite database), with no connection-local schema shadows.
+    /// Structural maintenance requires draining operations and rebuilding Store.
     pub fn new(db: DatabaseConnection) -> Self {
         Self {
             inner: Arc::new(StoreInner {

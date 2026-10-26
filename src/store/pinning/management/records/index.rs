@@ -9,10 +9,25 @@ pub(crate) async fn actions_for_plan_with_work<C: ConnectionTrait>(
     plan: &str,
     work: SharedDecodeBudget,
 ) -> Result<Vec<TrustedAppliedAction>> {
-    auth.check(db).await?;
+    actions_for_plan_catalog(
+        crate::store::pinning::legacy_migration::ReceiptCatalog::full(db),
+        auth,
+        plan,
+        work,
+    )
+    .await
+}
+
+pub(crate) async fn actions_for_plan_catalog(
+    catalog: crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
+    auth: &LocalAuthorization,
+    plan: &str,
+    work: SharedDecodeBudget,
+) -> Result<Vec<TrustedAppliedAction>> {
+    auth.check(&catalog).await?;
     DecodeWork::shared(&work).copy(&(auth.database_scope(), plan))?;
     let actions = select(
-        crate::store::pinning::legacy_migration::ReceiptCatalog::full(db),
+        catalog,
         "database_scope=$1 AND plan_id=$2",
         vec![auth.database_scope().into(), plan.into()],
         0,

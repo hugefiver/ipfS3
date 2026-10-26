@@ -133,6 +133,20 @@ pub(crate) async fn current_state_with_work<C: ConnectionTrait>(
     action: &records::CommittedAction,
     work: records::SharedDecodeBudget,
 ) -> Result<records::ActionState> {
+    current_state_catalog(
+        crate::store::pinning::legacy_migration::ReceiptCatalog::full(db),
+        action,
+        work,
+    )
+    .await
+}
+
+pub(crate) async fn current_state_catalog(
+    catalog: crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
+    action: &records::CommittedAction,
+    work: records::SharedDecodeBudget,
+) -> Result<records::ActionState> {
+    let db = &catalog;
     use records::ActionState::*;
     let context = records::DecodeWork::shared(&work);
     if matches!(action.receipt.binding.request.action, Action::Cancel) {
@@ -176,7 +190,7 @@ pub(crate) async fn current_state_with_work<C: ConnectionTrait>(
                     })
                 });
         let Some((any, all, _)) =
-            pin_lease_requirement::contract::completion_with_work(db, id, now, work.clone())
+            pin_lease_requirement::contract::completion_catalog(catalog, id, now, work.clone())
                 .await?
         else {
             return Err(ManagementError::InvalidEvidence);

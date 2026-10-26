@@ -197,6 +197,7 @@ pub(super) async fn validate<C: ConnectionTrait>(db: &C, tables: &[NativeTable])
         }
     } else {
         pg_checks(db).await?;
+        pg_unique_indexes(db).await?;
         let row=db.query_one(Statement::from_string(DatabaseBackend::Postgres,"SELECT t.tgtype::integer AS flags,t.tgenabled::text AS enabled,t.tgqual IS NULL AS unconditional,t.tgattr::text AS columns,encode(t.tgargs,'hex') AS args,p.prosrc AS body,p.prosecdef,p.proconfig IS NULL AS default_config,pn.nspname=current_schema() AS local_function FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid=t.tgrelid JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace JOIN pg_catalog.pg_proc p ON p.oid=t.tgfoid JOIN pg_catalog.pg_namespace pn ON pn.oid=p.pronamespace WHERE n.nspname=current_schema() AND c.relname='pin_legacy_migration_items' AND t.tgname='pin_legacy_item_bound' AND NOT t.tgisinternal")).await.map_err(|_|ManagementError::Schema)?.ok_or(ManagementError::Schema)?;
         if row
             .try_get::<i32>("", "flags")
@@ -235,6 +236,61 @@ pub(super) async fn validate<C: ConnectionTrait>(db: &C, tables: &[NativeTable])
     }
     Ok(())
 }
+
+async fn pg_unique_indexes<C: ConnectionTrait>(db: &C) -> Result<()> {
+    for (table, name, columns, predicate) in [
+        (
+            "pin_leases",
+            "uq_pin_leases_owner_object_source",
+            "owner_object_id,source",
+            "",
+        ),
+        (
+            "pin_lease_targets",
+            "uq_pin_lease_targets_lease_cid_provider",
+            "lease_id,cid,provider",
+            "",
+        ),
+        (
+            "object_versions",
+            "uq_object_versions_null_slot",
+            "bucket,key",
+            "(version_id IS NULL)",
+        ),
+        (
+            "object_versions",
+            "uq_object_versions_public_id",
+            "bucket,key,version_id",
+            "(version_id IS NOT NULL)",
+        ),
+    ] {
+        let row = db.query_one(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT i.indisunique AND i.indisvalid AND i.indisready AND i.indislive AND i.indimmediate AND i.indexprs IS NULL AND i.indnkeyatts=i.indnatts AS valid, \
+             array_to_string(ARRAY(SELECT a.attname::text FROM unnest(i.indkey) WITH ORDINALITY AS k(attnum,ordinal) JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum=k.attnum ORDER BY k.ordinal),',') AS columns, \
+             COALESCE(pg_get_expr(i.indpred,t.oid),'') AS predicate \
+             FROM pg_index i JOIN pg_class t ON t.oid=i.indrelid JOIN pg_namespace n ON n.oid=t.relnamespace JOIN pg_class x ON x.oid=i.indexrelid \
+             WHERE n.nspname=current_schema() AND t.relname=$1 AND x.relname=$2",
+            [table.into(), name.into()],
+        )).await.map_err(|_| ManagementError::Schema)?.ok_or(ManagementError::Schema)?;
+        if !row
+            .try_get::<bool>("", "valid")
+            .map_err(|_| ManagementError::Schema)?
+            || row
+                .try_get::<String>("", "columns")
+                .map_err(|_| ManagementError::Schema)?
+                != columns
+            || compact(
+                &row.try_get::<String>("", "predicate")
+                    .map_err(|_| ManagementError::Schema)?,
+            ) != compact(predicate)
+        {
+            return Err(ManagementError::Schema);
+        }
+    }
+    Ok(())
+}
+
 async fn sql<C: ConnectionTrait>(db: &C, table: &str) -> Result<String> {
     db.query_one(Statement::from_sql_and_values(
         DatabaseBackend::Sqlite,

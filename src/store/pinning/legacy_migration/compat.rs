@@ -15,10 +15,18 @@ pub async fn resource_binding<C: ConnectionTrait>(
     provider: &str,
     cid: &str,
 ) -> AppResult<Option<LegacyBinding>> {
-    let Some(binding) = identity_binding(db, provider, cid).await? else {
+    resource_binding_current_catalog(ReceiptCatalog::full(db), provider, cid).await
+}
+
+pub(crate) async fn resource_binding_current_catalog(
+    catalog: ReceiptCatalog<'_>,
+    provider: &str,
+    cid: &str,
+) -> AppResult<Option<LegacyBinding>> {
+    let Some(binding) = identity_binding_catalog(catalog, provider, cid, &()).await? else {
         return Ok(None);
     };
-    if super::resource_lifetime::fresh(db, &binding, cid)
+    if super::resource_lifetime::fresh(&catalog, &binding, cid)
         .await?
         .is_some()
     {
@@ -26,16 +34,26 @@ pub async fn resource_binding<C: ConnectionTrait>(
     }
     Ok(Some(binding))
 }
+#[cfg(test)]
 pub(crate) async fn resource_binding_with_work<C: ConnectionTrait>(
     db: &C,
     provider: &str,
     cid: &str,
     work: DecodeWork<'_>,
 ) -> management::Result<Option<LegacyBinding>> {
-    let Some(binding) = identity_binding_with_work(db, provider, cid, &work).await? else {
+    resource_binding_catalog(ReceiptCatalog::full(db), provider, cid, work).await
+}
+
+pub(crate) async fn resource_binding_catalog(
+    catalog: ReceiptCatalog<'_>,
+    provider: &str,
+    cid: &str,
+    work: DecodeWork<'_>,
+) -> management::Result<Option<LegacyBinding>> {
+    let Some(binding) = identity_binding_catalog(catalog, provider, cid, &work).await? else {
         return Ok(None);
     };
-    if super::resource_lifetime::fresh_with_work(db, &binding, cid, &work)
+    if super::resource_lifetime::fresh_with_work(&catalog, &binding, cid, &work)
         .await?
         .is_some()
     {
@@ -44,33 +62,23 @@ pub(crate) async fn resource_binding_with_work<C: ConnectionTrait>(
     Ok(Some(binding))
 }
 
-async fn identity_binding<C: ConnectionTrait>(
-    db: &C,
-    provider: &str,
-    cid: &str,
-) -> AppResult<Option<LegacyBinding>> {
-    identity_binding_with_work(db, provider, cid, &()).await
-}
-async fn identity_binding_with_work<C: ConnectionTrait, W: Work>(
-    db: &C,
+async fn identity_binding_catalog<W: Work>(
+    catalog: ReceiptCatalog<'_>,
     provider: &str,
     cid: &str,
     work: &W,
 ) -> Result<Option<LegacyBinding>, W::Error> {
-    let versions = super::admission_schema::receipt_schema(db)
-        .await
-        .map_err(W::application)?;
+    let db = &catalog;
+    let versions = catalog.classify().await.map_err(W::application)?;
     if versions.last().map(String::as_str) == Some(management::schema::VERSION) {
         let session = management::records::SharedDecodeBudget::default();
         let context = work.decode().unwrap_or(DecodeWork::shared(&session));
-        let candidates = management::admission::authority::load(
-            db,
-            &resource_receipt_selectors(provider, cid),
-            context,
-        )
-        .await
-        .map_err(|error| W::application(management::admission::work_error(error)))?;
-        return identity_binding_from_loaded(db, provider, cid, &candidates, work, context).await;
+        let candidates = catalog
+            .load(&resource_receipt_selectors(provider, cid), context)
+            .await
+            .map_err(|error| W::application(management::admission::work_error(error)))?;
+        return identity_binding_from_catalog(provider, cid, &candidates, work, context, catalog)
+            .await;
     }
     for table in ["remote_pin_ledger", "remote_pins"] {
         for original in historical_keys_with_work(db, table, provider, Some(cid), work).await? {
@@ -126,25 +134,6 @@ pub(crate) async fn resource_receipt_candidates_with_work<C: ConnectionTrait>(
     management::admission::authority::load(db, &resource_receipt_selectors(provider, cid), work)
         .await
         .map(Some)
-}
-
-pub(crate) async fn identity_binding_from_loaded<C: ConnectionTrait, W: Work>(
-    db: &C,
-    provider: &str,
-    cid: &str,
-    candidates: &AuthorityView,
-    work: &W,
-    context: DecodeWork<'_>,
-) -> Result<Option<LegacyBinding>, W::Error> {
-    identity_binding_from_catalog(
-        provider,
-        cid,
-        candidates,
-        work,
-        context,
-        ReceiptCatalog::full(db),
-    )
-    .await
 }
 
 pub(in crate::store::pinning) async fn identity_binding_from_catalog<W: Work>(
@@ -221,7 +210,16 @@ async fn resource_key_with_work<C: ConnectionTrait, W: Work>(
     cid: &str,
     work: &W,
 ) -> Result<String, W::Error> {
-    if let Some(binding) = identity_binding_with_work(db, provider, cid, work).await? {
+    resource_key_catalog(ReceiptCatalog::full(db), provider, cid, work).await
+}
+
+pub(crate) async fn resource_key_catalog<W: Work>(
+    catalog: ReceiptCatalog<'_>,
+    provider: &str,
+    cid: &str,
+    work: &W,
+) -> Result<String, W::Error> {
+    if let Some(binding) = identity_binding_catalog(catalog, provider, cid, work).await? {
         return Ok(binding.operational_key);
     }
     work.copy(provider)?;
@@ -519,9 +517,25 @@ async fn release_history_core<C: ConnectionTrait, W: Work>(
     cid: &str,
     work: &W,
 ) -> Result<Vec<pin_resource_history::Model>, W::Error> {
-    let operational = resource_key_with_work(db, provider, cid, work).await?;
-    let keys = historical_keys_with_work(db, "pin_resource_history", &operational, Some(cid), work)
-        .await?;
+    release_history_current_catalog(ReceiptCatalog::full(db), provider, cid, work).await
+}
+
+pub(crate) async fn release_history_current_catalog<W: Work>(
+    catalog: ReceiptCatalog<'_>,
+    provider: &str,
+    cid: &str,
+    work: &W,
+) -> Result<Vec<pin_resource_history::Model>, W::Error> {
+    let db = &catalog;
+    let operational = resource_key_catalog(catalog, provider, cid, work).await?;
+    let keys = super::receipt::historical_keys_catalog(
+        catalog,
+        "pin_resource_history",
+        &operational,
+        Some(cid),
+        work,
+    )
+    .await?;
     work.copy(cid)?;
     let rows = pin_resource_history::Entity::find()
         .filter(pin_resource_history::Column::Provider.is_in(keys))
@@ -543,8 +557,14 @@ async fn release_history_core<C: ConnectionTrait, W: Work>(
             ("epoch".into(), row.epoch.to_string()),
         ]
         .into();
-        let mapped =
-            resolve_with_work(db, "pin_resource_history", &pk, &row.provider, work).await?;
+        let mapped = super::receipt::resolve_with_catalog(
+            "pin_resource_history",
+            &pk,
+            &row.provider,
+            work,
+            catalog,
+        )
+        .await?;
         if row.provider == operational || mapped.is_some_and(|m| m.operational_key == operational) {
             work.copy(&(&row.provider, &row.cid, row.epoch))?;
             if !seen.insert((row.provider.clone(), row.cid.clone(), row.epoch)) {

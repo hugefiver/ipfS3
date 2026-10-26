@@ -202,11 +202,32 @@ pub async fn admit(db: &DatabaseConnection, request: &Admission) -> AppResult<Sn
     Ok(snapshot)
 }
 
+pub(crate) async fn admit_store(
+    store: &crate::store::Store,
+    request: &Admission,
+) -> AppResult<Snapshot> {
+    use crate::store::pinning::management::records::{DecodeWork, SharedDecodeBudget};
+    let work = SharedDecodeBudget::default();
+    let tx = store.begin_runtime(DecodeWork::shared(&work)).await?;
+    ownership::lock_bucket_for_ownership(tx.db(), &request.bucket).await?;
+    let snapshot = admit_in_transaction_core(tx.db(), request, Some(&tx)).await?;
+    tx.commit().await?;
+    Ok(snapshot)
+}
+
 /// Restricted intake entry: caller holds the bucket ownership lock and must
 /// commit the execution and its request identity row together in this txn.
 pub async fn admit_in_transaction(
     tx: &DatabaseTransaction,
     request: &Admission,
+) -> AppResult<Snapshot> {
+    admit_in_transaction_core(tx, request, None).await
+}
+
+pub(crate) async fn admit_in_transaction_core(
+    tx: &DatabaseTransaction,
+    request: &Admission,
+    runtime: Option<&crate::store::RuntimeTransaction>,
 ) -> AppResult<Snapshot> {
     supported(tx)?;
     if ![
@@ -233,11 +254,10 @@ pub async fn admit_in_transaction(
         .await?
         .is_none()
     {
-        crate::store::pinning::management::admission::lock_encoded_zip_intake_in_transaction(
-            tx,
-            &request.captured_options,
-        )
-        .await?;
+        match runtime {
+            Some(owner) => crate::store::pinning::management::admission::lock_runtime_encoded_zip_intake(owner, &request.captured_options).await?,
+            None => crate::store::pinning::management::admission::lock_encoded_zip_intake_in_transaction(tx, &request.captured_options).await?,
+        }
     }
     let now = database_now(tx).await?;
     tx.execute(statement(tx,

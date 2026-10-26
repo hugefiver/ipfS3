@@ -72,6 +72,7 @@ pub(in crate::store::pinning) async fn load_quota(
     result
 }
 
+#[cfg(test)]
 pub(crate) async fn actions_for_job<C: ConnectionTrait>(
     db: &C,
     job: &crate::store::entities::pin_job::Model,
@@ -127,12 +128,14 @@ pub(in crate::store::pinning) async fn actions_for_lease_catalog(
     actions_from_catalog_candidates(catalog, &candidates, work).await
 }
 
-pub(crate) async fn lease_participates<C: ConnectionTrait>(
-    db: &C,
+pub(crate) async fn lease_participates_catalog(
+    catalog: crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
     lease: &str,
     work: records::DecodeWork<'_>,
 ) -> Result<bool> {
-    let candidates = load(db, &[AuthoritySelector::Lease(lease.into())], work).await?;
+    let candidates = catalog
+        .load(&[AuthoritySelector::Lease(lease.into())], work)
+        .await?;
     Ok(candidates.originals.iter().any(|(key, row)| {
         key.table == "pin_management_records"
             && native::value(row, "kind") == Some("action")

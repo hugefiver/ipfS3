@@ -191,7 +191,7 @@ pub(crate) async fn candidates_for_cid_with_work<C: ConnectionTrait>(
     .await
 }
 
-pub(in crate::store::pinning) async fn candidates_for_cid_catalog(
+pub(crate) async fn candidates_for_cid_catalog(
     catalog: crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
     lease_id: &str,
     cid: &str,

@@ -401,18 +401,47 @@ pub(crate) async fn target_confirmed_with_work<C: ConnectionTrait>(
     now: DateTime<Utc>,
     work: SharedDecodeBudget,
 ) -> management::Result<bool> {
-    let managed = native_completion::management_participates(db, lease_id, work.clone()).await?;
-    let confirmed =
-        target_confirmed_inner_with_work(db, lease_id, provider, cid, now, work.clone(), managed)
-            .await?;
-    if !managed && native_completion::management_participates(db, lease_id, work).await? {
+    target_confirmed_catalog(
+        crate::store::pinning::legacy_migration::ReceiptCatalog::full(db),
+        lease_id,
+        provider,
+        cid,
+        now,
+        work,
+    )
+    .await
+}
+
+pub(crate) async fn target_confirmed_catalog(
+    catalog: crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
+    lease_id: &str,
+    provider: &str,
+    cid: &str,
+    now: DateTime<Utc>,
+    work: SharedDecodeBudget,
+) -> management::Result<bool> {
+    let managed =
+        native_completion::management_participates_catalog(catalog, lease_id, work.clone()).await?;
+    let confirmed = target_confirmed_inner_with_work(
+        catalog,
+        lease_id,
+        provider,
+        cid,
+        now,
+        work.clone(),
+        managed,
+    )
+    .await?;
+    if !managed
+        && native_completion::management_participates_catalog(catalog, lease_id, work).await?
+    {
         return Err(management::ManagementError::Changed);
     }
     Ok(confirmed)
 }
 
-async fn target_confirmed_inner_with_work<C: ConnectionTrait>(
-    db: &C,
+async fn target_confirmed_inner_with_work(
+    catalog: crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
     lease_id: &str,
     provider: &str,
     cid: &str,
@@ -420,11 +449,12 @@ async fn target_confirmed_inner_with_work<C: ConnectionTrait>(
     work: SharedDecodeBudget,
     managed: bool,
 ) -> management::Result<bool> {
+    let db = &catalog;
     let context = DecodeWork::shared(&work);
     let birth = get_with_work(db, lease_id, context).await?;
     let resolved = if let Some(birth) = &birth {
-        crate::store::pinning::management::actions::points::candidates_for_cid_with_work(
-            db,
+        crate::store::pinning::management::actions::points::candidates_for_cid_catalog(
+            catalog,
             lease_id,
             cid,
             birth,
@@ -445,8 +475,8 @@ async fn target_confirmed_inner_with_work<C: ConnectionTrait>(
     let allocation = selected
         .first()
         .map_or(provider, |(_, allocation, _)| allocation.as_str());
-    if crate::store::pinning::legacy_migration::resource_binding_with_work(
-        db, allocation, cid, context,
+    if crate::store::pinning::legacy_migration::resource_binding_catalog(
+        catalog, allocation, cid, context,
     )
     .await?
     .is_some_and(|binding| binding.historical_route.is_none())
@@ -536,8 +566,8 @@ async fn target_confirmed_inner_with_work<C: ConnectionTrait>(
             return Ok(false);
         };
         required.confirmation = Some(confirmation);
-        return super::super::pin_replica_observation::receipt::fresh_complete_with_work(
-            db, allocation, cid, &required, now, context,
+        return super::super::pin_replica_observation::receipt::fresh_complete_catalog(
+            catalog, allocation, cid, &required, now, context,
         )
         .await;
     }
@@ -637,16 +667,36 @@ pub async fn completion<C: ConnectionTrait>(
     now: DateTime<Utc>,
 ) -> AppResult<Option<(bool, bool, usize)>> {
     let work = SharedDecodeBudget::default();
-    let managed = native_completion::management_participates(db, lease_id, work.clone())
-        .await
-        .map_err(|_| AppError::InvalidPinningRequest("invalid exact management point".into()))?;
+    completion_current_catalog(
+        crate::store::pinning::legacy_migration::ReceiptCatalog::full(db),
+        lease_id,
+        now,
+        work,
+    )
+    .await
+}
+
+/// Preserve native batched completion when no management supplier participates.
+/// Participation is checked on both sides of the native read, never cached.
+pub(crate) async fn completion_current_catalog(
+    catalog: crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
+    lease_id: &str,
+    now: DateTime<Utc>,
+    work: SharedDecodeBudget,
+) -> AppResult<Option<(bool, bool, usize)>> {
+    let managed =
+        native_completion::management_participates_catalog(catalog, lease_id, work.clone())
+            .await
+            .map_err(|_| {
+                AppError::InvalidPinningRequest("invalid exact management point".into())
+            })?;
     if managed {
-        return completion_with_work(db, lease_id, now, work)
+        return completion_catalog(catalog, lease_id, now, work)
             .await
             .map_err(|_| AppError::InvalidPinningRequest("invalid exact management point".into()));
     }
-    let complete = native_completion::completion(db, lease_id, now).await?;
-    if native_completion::management_participates(db, lease_id, work)
+    let complete = native_completion::completion_catalog(catalog, lease_id, now).await?;
+    if native_completion::management_participates_catalog(catalog, lease_id, work)
         .await
         .map_err(|_| AppError::InvalidPinningRequest("invalid exact management point".into()))?
     {
@@ -658,12 +708,13 @@ pub async fn completion<C: ConnectionTrait>(
 }
 #[path = "contract/native_completion.rs"]
 mod native_completion;
-pub(crate) async fn completion_with_work<C: ConnectionTrait>(
-    db: &C,
+pub(crate) async fn completion_catalog(
+    catalog: crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
     lease_id: &str,
     now: DateTime<Utc>,
     work: SharedDecodeBudget,
 ) -> management::Result<Option<(bool, bool, usize)>> {
+    let db = &catalog;
     let context = DecodeWork::shared(&work);
     let Some(birth) = get_with_work(db, lease_id, context).await? else {
         return Ok(None);
@@ -684,8 +735,8 @@ pub(crate) async fn completion_with_work<C: ConnectionTrait>(
     for object_cid in &birth.content_cids {
         let mut available = false;
         let resolved =
-            crate::store::pinning::management::actions::points::candidates_for_cid_with_work(
-                db,
+            crate::store::pinning::management::actions::points::candidates_for_cid_catalog(
+                catalog,
                 lease_id,
                 object_cid,
                 &birth,
@@ -726,7 +777,7 @@ pub(crate) async fn completion_with_work<C: ConnectionTrait>(
                 && remote.is_some_and(|row| {
                     row.status == "pinned" || (cluster && row.status == "pinning")
                 })
-                && target_confirmed_with_work(db, lease_id, provider, &cid, now, work.clone())
+                && target_confirmed_catalog(catalog, lease_id, provider, &cid, now, work.clone())
                     .await?;
             available |= confirmed;
             all &= confirmed;

@@ -251,10 +251,7 @@ pub(in crate::store::pinning) async fn discover_runtime_authority(
     budget: &mut Budget,
     work: super::super::DecodeWork<'_>,
 ) -> Result<AuthorityView> {
-    tx.check_schema(work).await.map_err(|error| match error {
-        crate::error::AppError::ManagementBudget => ManagementError::Budget,
-        _ => ManagementError::Schema,
-    })?;
+    work.with(|session| session.check())?;
     discover_validated(tx.db(), selectors, budget).await
 }
 

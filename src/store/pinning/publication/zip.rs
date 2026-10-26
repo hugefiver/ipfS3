@@ -94,9 +94,6 @@ pub(crate) async fn publish_captured_zip_store(
     store: &crate::store::Store,
     request: CapturedZipPublication,
 ) -> AppResult<Vec<(String, PublicationResult)>> {
-    if store.db().get_database_backend() != sea_orm::DatabaseBackend::Sqlite {
-        return publish_captured_zip(store.db(), request).await;
-    }
     let session = super::super::management::records::SharedDecodeBudget::default();
     for retry in 0..=super::MAX_TRANSACTION_RETRIES {
         let tx = store
@@ -296,9 +293,8 @@ async fn publish_with_reservations<
         .await?;
     let session = reservations.runtime_work().cloned().unwrap_or_default();
     let work = super::super::management::records::DecodeWork::shared(&session);
-    if let Some(owner) = reservations.runtime() {
-        owner.check_schema(work).await?;
-    }
+    work.with(|session| session.check())
+        .map_err(super::super::management::admission::work_error)?;
     // Admission readers below run only after the bucket write/fence, before any frontier locks.
     let admission = match &request.authority {
         ZipPublicationAuthority::Legacy(authority) => {
@@ -374,7 +370,7 @@ async fn publish_with_reservations<
     .await?;
     maintenance.checkpoint(tx).await?;
     if let Some(owner) = reservations.runtime() {
-        ledger::verify_runtime_birth_routes(owner, &routes, &allocatable, work).await?;
+        ledger::verify_runtime_birth_routes(owner, &routes, &allocatable, true, work).await?;
     } else if allocatable.len() == routes.len() {
         ledger::verify_selected_routes(tx, &routes, true).await?;
     } else {
@@ -394,7 +390,14 @@ async fn publish_with_reservations<
         maintenance.checkpoint(tx).await?;
         results.push((
             object.key.clone(),
-            super::write_object_version_and_update_lifecycle(tx, object, state, now).await?,
+            super::write_object_version_and_update_lifecycle(
+                tx,
+                object,
+                state,
+                now,
+                reservations.runtime(),
+            )
+            .await?,
         ));
     }
     maintenance.checkpoint(tx).await?;
@@ -498,9 +501,8 @@ async fn publish_with_reservations<
             .await?
         }
     }
-    if let Some(owner) = reservations.runtime() {
-        owner.check_schema(work).await?;
-    }
+    work.with(|session| session.check())
+        .map_err(super::super::management::admission::work_error)?;
     Ok(results)
 }
 

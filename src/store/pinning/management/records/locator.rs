@@ -322,7 +322,25 @@ pub async fn rebuild_source(
     if crate::store::initialization::read_context::active(tx).await? {
         return Err(ManagementError::Unauthorized);
     }
-    rebuild_classified_sources(tx, &BTreeSet::from([key.clone()]), budget).await
+    rebuild_classified_sources(tx, &BTreeSet::from([key.clone()]), budget, None).await
+}
+
+pub(crate) async fn rebuild_runtime_source(
+    tx: &crate::store::RuntimeTransaction,
+    key: &NativeKey,
+    budget: &mut Budget,
+    work: DecodeWork<'_>,
+) -> Result<()> {
+    if crate::store::initialization::read_context::active(tx.db()).await? {
+        return Err(ManagementError::Unauthorized);
+    }
+    rebuild_classified_sources(
+        tx.db(),
+        &BTreeSet::from([key.clone()]),
+        budget,
+        Some((tx, work)),
+    )
+    .await
 }
 
 /// Backfill requires initialization's validated capability for this exact
@@ -335,7 +353,7 @@ pub(crate) async fn rebuild_source_for_upgrade(
     if !crate::store::initialization::read_context::active(tx).await? {
         return Err(ManagementError::Unauthorized);
     }
-    rebuild_classified_sources(tx, &BTreeSet::from([key.clone()]), budget).await
+    rebuild_classified_sources(tx, &BTreeSet::from([key.clone()]), budget, None).await
 }
 
 /// One atomic writer validates each shared receipt dependency group once.
@@ -347,13 +365,14 @@ pub(crate) async fn rebuild_sources(
     if crate::store::initialization::read_context::active(tx).await? {
         return Err(ManagementError::Unauthorized);
     }
-    rebuild_classified_sources(tx, keys, budget).await
+    rebuild_classified_sources(tx, keys, budget, None).await
 }
 
 async fn rebuild_classified_sources(
     tx: &DatabaseTransaction,
     keys: &BTreeSet<NativeKey>,
     budget: &mut Budget,
+    runtime: Option<(&crate::store::RuntimeTransaction, DecodeWork<'_>)>,
 ) -> Result<()> {
     if keys.is_empty() {
         return budget.check();
@@ -361,7 +380,10 @@ async fn rebuild_classified_sources(
     discovery::fence_authority(tx).await?;
     let spec = ScopeSpec::new(keys.iter().cloned().map(Selector::Exact).collect())?;
     scope::fence_memberships(tx, &spec).await?;
-    let read = scope::collect_scope(tx, &spec, budget).await?;
+    let read = match runtime {
+        Some((owner, work)) => scope::collect_runtime_scope(owner, &spec, budget, work).await?,
+        None => scope::collect_scope(tx, &spec, budget).await?,
+    };
     if !read.rows().keys().eq(keys.iter()) {
         return Err(ManagementError::InvalidEvidence);
     }
@@ -374,7 +396,10 @@ async fn rebuild_classified_sources(
     for (key, classification) in classifications {
         replace_source_locators(tx, &key, classification.selectors, budget).await?;
     }
-    scope::revalidate_scope(tx, &read, budget).await?;
+    match runtime {
+        Some((owner, work)) => scope::revalidate_runtime_scope(owner, &read, budget, work).await?,
+        None => scope::revalidate_scope(tx, &read, budget).await?,
+    };
     for key in keys {
         seal_source(tx, key, budget).await?;
     }

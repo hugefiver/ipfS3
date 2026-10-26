@@ -1,3 +1,5 @@
+#[path = "support/optimistic_integrity.rs"]
+mod optimistic_integrity;
 mod support;
 
 #[tokio::test]

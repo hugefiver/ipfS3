@@ -433,6 +433,22 @@ pub async fn completed_upload_result(
 // `zip::BatchAdmission` is already publicly re-exported; these associated
 // functions expose the store seam without editing the concurrently-owned mod.rs.
 impl BatchAdmission {
+    pub(crate) async fn admit_store(
+        store: &crate::store::Store,
+        request: &BatchAdmission,
+    ) -> AppResult<zip_batch::Model> {
+        use crate::store::pinning::management::records::{DecodeWork, SharedDecodeBudget};
+        supported(store.db())?;
+        validate_admission(request)?;
+        let work = SharedDecodeBudget::default();
+        let tx = store.begin_runtime(DecodeWork::shared(&work)).await?;
+        crate::store::import::ownership::lock_bucket_for_ownership(tx.db(), &request.bucket)
+            .await?;
+        let found = insert_or_find(tx.db(), request, false, Some(&tx)).await?;
+        tx.commit().await?;
+        Ok(found)
+    }
+
     pub async fn capture_prepared_archive(
         db: &DatabaseConnection,
         owner: &str,
@@ -560,7 +576,7 @@ pub async fn admit(
     validate_admission(request)?;
     let tx = db.begin().await?;
     crate::store::import::ownership::lock_bucket_for_ownership(&tx, &request.bucket).await?;
-    let found = insert_or_find(&tx, request, false).await?;
+    let found = insert_or_find(&tx, request, false, None).await?;
     tx.commit().await?;
     Ok(found)
 }
@@ -574,6 +590,21 @@ impl BatchAdmission {
         tx: &DatabaseTransaction,
         request: &BatchAdmission,
     ) -> AppResult<zip_batch::Model> {
+        Self::admit_legacy_core(tx, request, None).await
+    }
+
+    pub(crate) async fn admit_legacy_runtime(
+        tx: &crate::store::RuntimeTransaction,
+        request: &BatchAdmission,
+    ) -> AppResult<zip_batch::Model> {
+        Self::admit_legacy_core(tx.db(), request, Some(tx)).await
+    }
+
+    async fn admit_legacy_core(
+        tx: &DatabaseTransaction,
+        request: &BatchAdmission,
+        runtime: Option<&crate::store::RuntimeTransaction>,
+    ) -> AppResult<zip_batch::Model> {
         supported(tx)?;
         validate_admission(request)?;
         if request.fingerprint == "pending"
@@ -582,23 +613,39 @@ impl BatchAdmission {
         {
             return Err(invalid());
         }
-        insert_or_find(tx, request, false).await
+        insert_or_find(tx, request, false, runtime).await
     }
 
     /// Caller holds the bucket ownership lock. Never commit on an error: the
     /// v2 guard admission and both manifests share this transaction. The v2
     /// execution alone attests the signed contract and clean input SHA-256.
     /// Associated with the re-exported type so callers need no new mod.rs API.
+    #[cfg(test)]
     pub(crate) async fn admit_in_transaction(
         tx: &DatabaseTransaction,
         request: &BatchAdmission,
+    ) -> AppResult<zip_batch::Model> {
+        Self::admit_mirror_core(tx, request, None).await
+    }
+
+    pub(crate) async fn admit_runtime_mirror(
+        tx: &crate::store::RuntimeTransaction,
+        request: &BatchAdmission,
+    ) -> AppResult<zip_batch::Model> {
+        Self::admit_mirror_core(tx.db(), request, Some(tx)).await
+    }
+
+    async fn admit_mirror_core(
+        tx: &DatabaseTransaction,
+        request: &BatchAdmission,
+        runtime: Option<&crate::store::RuntimeTransaction>,
     ) -> AppResult<zip_batch::Model> {
         supported(tx)?;
         validate_admission(request)?;
         if request.fingerprint != "pending" || request.input_identity != "pending" {
             return Err(invalid());
         }
-        insert_or_find(tx, request, true).await
+        insert_or_find(tx, request, true, runtime).await
     }
 }
 
@@ -628,6 +675,7 @@ async fn insert_or_find(
     tx: &DatabaseTransaction,
     request: &BatchAdmission,
     exact_mirror: bool,
+    runtime: Option<&crate::store::RuntimeTransaction>,
 ) -> AppResult<zip_batch::Model> {
     let is_new = zip_batch::Entity::find()
         .filter(zip_batch::Column::Owner.eq(&request.owner))
@@ -637,11 +685,10 @@ async fn insert_or_find(
         .await?
         .is_none();
     if is_new {
-        crate::store::pinning::management::admission::lock_encoded_zip_intake_in_transaction(
-            tx,
-            &request.captured_options,
-        )
-        .await?;
+        match runtime {
+            Some(owner) => crate::store::pinning::management::admission::lock_runtime_encoded_zip_intake(owner, &request.captured_options).await?,
+            None => crate::store::pinning::management::admission::lock_encoded_zip_intake_in_transaction(tx, &request.captured_options).await?,
+        }
     }
     let now = Utc::now();
     zip_batch::Entity::insert(zip_batch::ActiveModel {

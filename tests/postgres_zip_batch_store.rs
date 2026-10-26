@@ -57,10 +57,8 @@ where
         for _ in 0..2 {
             let mut opts = ConnectOptions::new(&url);
             opts.min_connections(1).max_connections(1);
+            opts.set_schema_search_path(schema.clone());
             let db = Database::connect(opts).await.unwrap();
-            db.execute_unprepared(&format!("SET search_path TO {schema}"))
-                .await
-                .unwrap();
             db.execute_unprepared("SET statement_timeout TO '8s'")
                 .await
                 .unwrap();

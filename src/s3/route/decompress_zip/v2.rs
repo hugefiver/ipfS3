@@ -9,7 +9,6 @@ use bytes::{Buf as _, Bytes};
 use http::{HeaderMap, StatusCode};
 use http_body_util::BodyExt as _;
 use s3s::{Body, S3Request, S3Response, S3Result};
-use sea_orm::TransactionTrait;
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
@@ -893,7 +892,7 @@ pub(super) async fn put(
             source_key: parsed.key.clone(),
             captured_options: captured,
         };
-        let execution = execution::admit(state.store.db(), &request)
+        let execution = execution::admit_store(&state.store, &request)
             .await
             .map_err(store_error)?;
         (request, None, execution)
@@ -1186,7 +1185,11 @@ pub(super) async fn put(
             input_identity: "pending".into(),
             captured_options: execution.captured_options.clone(),
         };
-        let tx = state.store.db().begin().await.map_err(AppError::from)?;
+        let work = crate::store::pinning::management::records::SharedDecodeBudget::default();
+        let tx = state
+            .store
+            .begin_runtime(crate::store::pinning::management::records::DecodeWork::shared(&work))
+            .await?;
         crate::store::import::ownership::lock_bucket_for_ownership(&tx, &parsed.bucket).await?;
         let items = manifest
             .successful
@@ -1229,7 +1232,7 @@ pub(super) async fn put(
                 None
             };
             execution::admit_manifest_in_transaction(&tx, &claim, &items, &ids).await?;
-            zip::BatchAdmission::admit_in_transaction(&tx, &batch).await?;
+            zip::BatchAdmission::admit_runtime_mirror(&tx, &batch).await?;
             zip::ManifestItem::prepare_manifest_in_transaction(
                 &tx,
                 &id,
@@ -1248,11 +1251,11 @@ pub(super) async fn put(
         let source_guard = match admission {
             Ok(guard) => guard,
             Err(error) => {
-                tx.rollback().await.map_err(AppError::from)?;
+                tx.rollback().await?;
                 return Err(store_error(error));
             }
         };
-        tx.commit().await.map_err(AppError::from)?;
+        tx.commit().await?;
         source_guard
     };
     if !crate::store::import::ownership::renew_zip_v2_direct_group(

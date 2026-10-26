@@ -3,7 +3,7 @@ use crate::store::pinning::management::{records, transaction};
 use records::DecodeWork;
 
 #[tokio::test]
-async fn warm_unpin_writer_rejects_live_readiness_versions_and_temp_changes() {
+async fn rebuilt_store_unpin_writer_rejects_invalid_structure() {
     for (change, repair) in [
         (
             "UPDATE pin_management_readiness SET state='backfill' WHERE id=1",
@@ -25,8 +25,8 @@ async fn warm_unpin_writer_rejects_live_readiness_versions_and_temp_changes() {
         let (fixture, claimed) =
             fixture::ordinary_with_database(fixture::single_connection().await).await;
         fixture::warm(&fixture.store).await;
-        let clone = fixture.store.clone();
-        clone.db().execute_unprepared(change).await.unwrap();
+        fixture.store.db().execute_unprepared(change).await.unwrap();
+        let clone = Store::new(fixture.store.db().clone());
         let before = NativeEffects::read(&fixture.store, &claimed.model.id).await;
         assert!(
             prepare_unpin_writer(&clone, &claimed, 1).await.is_err(),
@@ -36,80 +36,6 @@ async fn warm_unpin_writer_rejects_live_readiness_versions_and_temp_changes() {
         clone.db().execute_unprepared(repair).await.unwrap();
         assert!(!prepare_unpin_writer(&clone, &claimed, 1).await.unwrap());
     }
-}
-
-#[tokio::test]
-async fn epoch_fence_trigger_changes_are_seen_before_unpin_effect() {
-    let (fixture, claimed) =
-        fixture::ordinary_with_database(fixture::single_connection().await).await;
-    fixture::warm(&fixture.store).await;
-    fixture
-        .store
-        .db()
-        .execute_unprepared(
-            "CREATE TRIGGER fence_changes_readiness AFTER UPDATE OF epoch ON remote_pins \
-         BEGIN UPDATE pin_management_readiness SET state='backfill' WHERE id=1; END",
-        )
-        .await
-        .unwrap();
-    let before = NativeEffects::read(&fixture.store, &claimed.model.id).await;
-    assert!(
-        prepare_unpin_writer(&fixture.store, &claimed, 1)
-            .await
-            .is_err()
-    );
-    fixture::assert_unchanged_and_released(&fixture, &claimed, &before).await;
-    fixture
-        .store
-        .db()
-        .execute_unprepared("DROP TRIGGER fence_changes_readiness")
-        .await
-        .unwrap();
-    assert!(
-        !prepare_unpin_writer(&fixture.store, &claimed, 1)
-            .await
-            .unwrap()
-    );
-}
-
-#[tokio::test]
-async fn ledger_trigger_changes_are_revalidated_by_the_next_unpin_writer() {
-    let (fixture, claimed) =
-        fixture::ordinary_with_database(fixture::single_connection().await).await;
-    fixture::warm(&fixture.store).await;
-    fixture
-        .store
-        .db()
-        .execute_unprepared(
-            "CREATE TRIGGER effect_changes_readiness AFTER UPDATE ON remote_pin_ledger \
-         BEGIN UPDATE pin_management_readiness SET state='backfill' WHERE id=1; END",
-        )
-        .await
-        .unwrap();
-    assert!(
-        !prepare_unpin_writer(&fixture.store, &claimed, 1)
-            .await
-            .unwrap()
-    );
-    let current = pin_job::Entity::find_by_id(claimed.model.id.clone())
-        .one(fixture.store.db())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(current.state, "done");
-    let mut active = current.into_active_model();
-    active.state = Set("running".into());
-    active.locked_until = Set(claimed.model.locked_until);
-    let restored = active.update(fixture.store.db()).await.unwrap();
-    let mut next = claimed.clone();
-    next.model = restored;
-    let before = NativeEffects::read(&fixture.store, &next.model.id).await;
-    assert!(
-        prepare_unpin_writer(&fixture.store, &next, 1)
-            .await
-            .is_err()
-    );
-    fixture::assert_unchanged_and_released(&fixture, &next, &before).await;
 }
 
 #[tokio::test]
@@ -255,7 +181,6 @@ async fn sqlite_interrupt_after_epoch_fence_rolls_back_unpin_and_releases_transa
         .begin_runtime(DecodeWork::shared(&work))
         .await
         .unwrap();
-    tx.check_schema(DecodeWork::shared(&work)).await.unwrap();
     tx.rollback().await.unwrap();
     assert!(
         !prepare_unpin_writer(&fixture.store, &claimed, 1)

@@ -2,9 +2,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use s3s::{S3Request, S3Response, S3Result, dto::*};
-use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, TransactionError, TransactionTrait,
-};
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter};
 
 use crate::{
     error::{AppError, AppResult},
@@ -355,139 +353,122 @@ async fn replace_tag_set(
     let selector_for_recheck = selector.clone();
     let bucket_for_recheck = bucket.clone();
     let key_for_recheck = key.clone();
-    let result = state
+    let session = crate::store::pinning::management::records::SharedDecodeBudget::default();
+    let runtime = state
         .store
-        .db()
-        .transaction(move |txn| {
-            Box::pin(async move {
-                let selected = crate::store::object_version::lock_resolved_version(
-                    txn, &bucket, &key, &selector,
-                )
+        .begin_runtime(crate::store::pinning::management::records::DecodeWork::shared(&session))
+        .await?;
+    let txn = runtime.db();
+    let result = async {
+        let selected =
+            crate::store::object_version::lock_resolved_version(txn, &bucket, &key, &selector)
                 .await?;
-                let owner_id = selected_content_owner(
-                    &selected,
-                    matches!(&selector, VersionSelector::Current),
-                )?
+        let owner_id =
+            selected_content_owner(&selected, matches!(&selector, VersionSelector::Current))?
                 .id
                 .clone();
-                let version_id = response_version_id(txn, &bucket, &selected).await?;
-                let previous =
-                    crate::store::pinning::decision::read_for_version(txn, &selected.id).await?;
-                let current_tags = tags::list_object_tags(txn, &owner_id).await?;
-                if let Some(previous) = &previous {
-                    previous.replay_policy(current_tags.clone()).map_err(|_| {
-                        AppError::Internal("stored pin decision does not match version tags".into())
-                    })?;
-                }
-                let manual = load_manual_lease(txn, &owner_id).await?;
-                let existing = manual.as_ref().map(existing_manual_lease).transpose()?;
-                let attempted = operation_state
-                    .pinning
-                    .policy()
-                    .evaluate_tag_replacement(existing.as_ref(), &replacement, now)
-                    .map_err(AppError::from);
-                let decision = capture_tag_decision(
-                    &operation_state,
-                    (&bucket, &key),
-                    &replacement,
-                    &current_tags,
-                    previous.as_ref(),
-                    manual.is_some(),
-                    &principal,
-                )?;
-                let mutation = match attempted {
-                    Ok(mutation) => mutation,
-                    Err(_)
-                        if manual.is_none()
-                            && (decision.effect == DecisionEffect::Skipped
-                                || decision.legacy_unknown) =>
-                    {
-                        ManualLeaseMutation::Keep
-                    }
-                    Err(error) => return Err(error),
-                };
+        let version_id = response_version_id(txn, &bucket, &selected).await?;
+        let previous = crate::store::pinning::decision::read_for_version(txn, &selected.id).await?;
+        let current_tags = tags::list_object_tags(txn, &owner_id).await?;
+        if let Some(previous) = &previous {
+            previous.replay_policy(current_tags.clone()).map_err(|_| {
+                AppError::Internal("stored pin decision does not match version tags".into())
+            })?;
+        }
+        let manual = load_manual_lease(txn, &owner_id).await?;
+        let existing = manual.as_ref().map(existing_manual_lease).transpose()?;
+        let attempted = operation_state
+            .pinning
+            .policy()
+            .evaluate_tag_replacement(existing.as_ref(), &replacement, now)
+            .map_err(AppError::from);
+        let decision = capture_tag_decision(
+            &operation_state,
+            (&bucket, &key),
+            &replacement,
+            &current_tags,
+            previous.as_ref(),
+            manual.is_some(),
+            &principal,
+        )?;
+        let mutation = match attempted {
+            Ok(mutation) => mutation,
+            Err(_)
+                if manual.is_none()
+                    && (decision.effect == DecisionEffect::Skipped || decision.legacy_unknown) =>
+            {
+                ManualLeaseMutation::Keep
+            }
+            Err(error) => return Err(error),
+        };
 
-                #[cfg(test)]
-                pause_after_policy_evaluation(manual.as_ref().map(|lease| lease.id.as_str())).await;
+        #[cfg(test)]
+        pause_after_policy_evaluation(manual.as_ref().map(|lease| lease.id.as_str())).await;
 
-                let revalidated = crate::store::object_version::lock_resolved_version(
-                    txn, &bucket, &key, &selector,
-                )
+        let revalidated =
+            crate::store::object_version::lock_resolved_version(txn, &bucket, &key, &selector)
                 .await?;
-                let revalidated_owner_id = selected_content_owner(
-                    &revalidated,
-                    matches!(&selector, VersionSelector::Current),
-                )?
+        let revalidated_owner_id =
+            selected_content_owner(&revalidated, matches!(&selector, VersionSelector::Current))?
                 .id
                 .clone();
-                if revalidated_owner_id != owner_id {
-                    return Err(AppError::StaleContentMutation);
-                }
+        if revalidated_owner_id != owner_id {
+            return Err(AppError::StaleContentMutation);
+        }
 
-                match mutation {
-                    ManualLeaseMutation::Keep => {
-                        if let Some(manual) = &manual
-                            && !leases::guard_manual_lease_snapshot(txn, manual).await?
-                        {
-                            return Err(AppError::Database(MANUAL_LEASE_CHANGED.to_owned()));
-                        }
-                    }
-                    ManualLeaseMutation::Renew { retain_until } => {
-                        let lease_id = manual
-                            .as_ref()
-                            .expect("renewal policy requires an existing manual lease")
-                            .id
-                            .as_str();
-                        match &selector {
-                            VersionSelector::Current => {
-                                leases::renew_manual_lease(
-                                    txn,
-                                    &owner_id,
-                                    lease_id,
-                                    retain_until,
-                                    now,
-                                )
-                                .await
-                            }
-                            VersionSelector::Exact(_) => {
-                                leases::renew_retained_version_manual_lease(
-                                    txn,
-                                    &owner_id,
-                                    lease_id,
-                                    retain_until,
-                                    now,
-                                )
-                                .await
-                            }
-                        }
-                        .map_err(map_renewal_error)?;
-                    }
-                    ManualLeaseMutation::Cancel => {
-                        let lease_id = manual
-                            .as_ref()
-                            .expect("cancellation policy requires an existing manual lease")
-                            .id
-                            .as_str();
-                        leases::cancel_lease(txn, lease_id, now).await?;
-                    }
+        match mutation {
+            ManualLeaseMutation::Keep => {
+                if let Some(manual) = &manual
+                    && !leases::guard_manual_lease_snapshot(txn, manual).await?
+                {
+                    return Err(AppError::Database(MANUAL_LEASE_CHANGED.to_owned()));
                 }
-                tags::replace_object_tags(txn, &owner_id, &replacement).await?;
-                crate::store::pinning::decision::replace_for_version_in_transaction(
-                    txn,
-                    &selected.id,
+            }
+            ManualLeaseMutation::Renew { retain_until } => {
+                let lease_id = manual
+                    .as_ref()
+                    .expect("renewal policy requires an existing manual lease")
+                    .id
+                    .as_str();
+                leases::renew_runtime_manual_lease(
+                    &runtime,
                     &owner_id,
-                    &decision,
+                    lease_id,
+                    retain_until,
+                    now,
+                    matches!(&selector, VersionSelector::Exact(_)),
                 )
-                .await?;
-                Ok((version_id, decision.warning))
-            })
-        })
-        .await;
+                .await
+                .map_err(map_renewal_error)?;
+            }
+            ManualLeaseMutation::Cancel => {
+                let lease_id = manual
+                    .as_ref()
+                    .expect("cancellation policy requires an existing manual lease")
+                    .id
+                    .as_str();
+                leases::cancel_runtime_lease(&runtime, lease_id, now).await?;
+            }
+        }
+        tags::replace_object_tags(txn, &owner_id, &replacement).await?;
+        crate::store::pinning::decision::replace_for_version_in_transaction(
+            txn,
+            &selected.id,
+            &owner_id,
+            &decision,
+        )
+        .await?;
+        Ok((version_id, decision.warning))
+    }
+    .await;
 
     match result {
-        Ok(result) => Ok(result),
+        Ok(result) => {
+            runtime.commit().await?;
+            Ok(result)
+        }
         Err(error) => {
-            let error = transaction_error_into_app(error);
+            runtime.rollback().await?;
             // SQLite retains the transaction's read snapshot across the test
             // seam. A concurrent exact delete can therefore surface as a
             // write-upgrade conflict even though the in-transaction
@@ -567,19 +548,13 @@ fn map_renewal_error(error: leases::RenewManualLeaseError) -> AppError {
     }
 }
 
-fn transaction_error_into_app(error: TransactionError<AppError>) -> AppError {
-    match error {
-        TransactionError::Transaction(error) => error,
-        TransactionError::Connection(error) => AppError::from(error),
-    }
-}
-
 fn invalid_pinning_request(message: &str) -> AppError {
     AppError::InvalidPinningRequest(message.to_owned())
 }
 
 #[cfg(test)]
 mod tests {
+    use sea_orm::TransactionTrait;
     use std::{
         collections::{BTreeSet, HashMap},
         sync::Arc,

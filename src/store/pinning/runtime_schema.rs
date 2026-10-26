@@ -1,5 +1,5 @@
-//! Store-owned SQLite layout qualification. External DDL requires stop/restart.
-//! Versions, readiness, TEMP shadows and business authority are never cached.
+//! Store-owned layout qualification. Structural maintenance requires stop/restart.
+//! Business authority is always read in the operation's transaction.
 use super::management::{self, admission::work_error, native, records::DecodeWork};
 use crate::{
     error::{AppError, AppResult},
@@ -7,15 +7,14 @@ use crate::{
 };
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseTransaction, Statement, TransactionTrait};
 
-mod control;
 mod meter;
 #[cfg(test)]
 mod tests;
 
 /// Only a completed validation on the enclosing Store's own connection can
-/// construct this proof. Retained controls contain compiled expectations only.
+/// construct this proof. It contains no business authority.
 pub(in crate::store) struct StaticQualification {
-    control: control::Compiled,
+    versions: Vec<String>,
 }
 
 /// Owns both the transaction and its Store identity; no bare connection can be
@@ -75,6 +74,24 @@ async fn rollback(tx: DatabaseTransaction, work: DecodeWork<'_>) -> AppResult<()
 }
 
 impl Store {
+    /// Initialize and qualify the owned pool before exposing it to runtime work.
+    /// `open` returns only after startup validation and connection cleanup succeed.
+    pub(crate) async fn open(db: sea_orm::DatabaseConnection) -> Result<Self, sea_orm::DbErr> {
+        crate::store::initialization::open(&db).await?;
+        let store = Self::new(db);
+        use sea_orm_migration::MigratorTrait;
+        let versions = crate::store::migrator::Migrator::migrations()
+            .iter()
+            .map(|migration| migration.name().to_owned())
+            .collect();
+        store
+            .inner
+            .qualification
+            .set(StaticQualification { versions })
+            .map_err(|_| sea_orm::DbErr::Custom("Store already initialized".into()))?;
+        Ok(store)
+    }
+
     pub(crate) async fn begin_publication_runtime(
         &self,
         work: DecodeWork<'_>,
@@ -105,14 +122,14 @@ impl Store {
         })
     }
 
-    /// Qualify SQLite once per Store identity, before checking out any business
-    /// transaction. PostgreSQL deliberately receives no reusable layout proof.
+    /// Qualify the trusted, fixed-schema pool once per Store identity, before
+    /// checking out any business transaction.
     pub(crate) async fn qualify_runtime_schema(&self, work: DecodeWork<'_>) -> AppResult<()> {
         check(work)?;
-        if self.db().get_database_backend() == DatabaseBackend::Postgres {
-            return Ok(());
-        }
-        if self.db().get_database_backend() != DatabaseBackend::Sqlite {
+        if !matches!(
+            self.db().get_database_backend(),
+            DatabaseBackend::Sqlite | DatabaseBackend::Postgres
+        ) {
             return Err(invalid());
         }
         self.inner
@@ -128,28 +145,24 @@ impl Store {
                         return Err(error.into());
                     }
                 };
-                let control = control::Compiled::new();
                 let validation = async {
                     check(work)?;
-                    let db = meter::SqliteRead::new(&tx, work);
-                    // Reject shadows before any validator resolves control names.
-                    control::validate(&db, &control).await?;
-                    let versions = super::legacy_migration::receipt_schema(&db).await?;
-                    if versions.last().map(String::as_str) != Some(management::schema::VERSION) {
-                        return Err(invalid());
-                    }
-                    management::catalog::validate(&db, native::current_catalog())
-                        .await
-                        .map_err(work_error)?;
-                    check(work)
+                    let versions = if tx.get_database_backend() == DatabaseBackend::Sqlite {
+                        let db = meter::SqliteRead::new(&tx, work);
+                        validate(&db).await?
+                    } else {
+                        validate(&tx).await?
+                    };
+                    check(work)?;
+                    Ok::<_, AppError>(versions)
                 }
                 .await;
                 rollback(tx, work).await?;
-                validation?;
+                let versions = validation?;
                 // The initializer's cancellation/deadline is checked after the
                 // normal rollback and before OnceCell can publish the proof.
                 check(work)?;
-                Ok::<StaticQualification, AppError>(StaticQualification { control })
+                Ok::<StaticQualification, AppError>(StaticQualification { versions })
             })
             .await?;
         // Waiters use their own remaining allowance, never the initializer's SQL debt.
@@ -193,58 +206,16 @@ impl RuntimeTransaction {
         &'a self,
         work: DecodeWork<'a>,
     ) -> super::legacy_migration::ReceiptCatalog<'a> {
-        if self.tx.get_database_backend() == DatabaseBackend::Sqlite {
-            super::legacy_migration::ReceiptCatalog::Runtime(self, work)
-        } else {
-            super::legacy_migration::ReceiptCatalog::full(&self.tx)
-        }
+        super::legacy_migration::ReceiptCatalog::Runtime(self, work)
     }
     pub(crate) fn db(&self) -> &DatabaseTransaction {
         &self.tx
     }
 
-    /// Invoke after the caller's writer fence. Only static SQLite definitions
-    /// are reused; control values and connection-local TEMP objects stay live.
-    pub(crate) async fn check_schema(&self, work: DecodeWork<'_>) -> AppResult<()> {
-        self.validate(work).await
-    }
-
-    async fn validate(&self, work: DecodeWork<'_>) -> AppResult<()> {
-        check(work)?;
-        let result = if self.tx.get_database_backend() == DatabaseBackend::Sqlite {
-            let proof = self.owner.inner.qualification.get().ok_or_else(invalid)?;
-            let db = meter::SqliteRead::new(&self.tx, work);
-            control::validate(&db, &proof.control).await
-        } else {
-            self.postgres_versions().await.map(|_| ())
-        };
-        check(work)?;
-        result
-    }
-
     pub(crate) async fn schema_versions(&self, work: DecodeWork<'_>) -> AppResult<Vec<String>> {
-        if self.tx.get_database_backend() == DatabaseBackend::Sqlite {
-            self.validate(work).await?;
-            let proof = self.owner.inner.qualification.get().ok_or_else(invalid)?;
-            Ok(proof.control.known.clone())
-        } else {
-            check(work)?;
-            let result = self.postgres_versions().await;
-            check(work)?;
-            result
-        }
-    }
-
-    async fn postgres_versions(&self) -> AppResult<Vec<String>> {
-        // PostgreSQL has no qualification shortcut: retain the full validators.
-        let versions = super::legacy_migration::receipt_schema(&self.tx).await?;
-        management::schema::validate(&self.tx)
-            .await
-            .map_err(work_error)?;
-        management::catalog::validate(&self.tx, native::current_catalog())
-            .await
-            .map_err(work_error)?;
-        Ok(versions)
+        check(work)?;
+        let proof = self.owner.inner.qualification.get().ok_or_else(invalid)?;
+        Ok(proof.versions.clone())
     }
 
     pub(crate) async fn commit(self) -> AppResult<()> {
@@ -256,4 +227,12 @@ impl RuntimeTransaction {
         self.tx.rollback().await?;
         Ok(())
     }
+}
+
+async fn validate<C: ConnectionTrait>(db: &C) -> AppResult<Vec<String>> {
+    let versions = management::schema::validate(db).await.map_err(work_error)?;
+    management::catalog::validate(db, native::current_catalog())
+        .await
+        .map_err(work_error)?;
+    Ok(versions)
 }

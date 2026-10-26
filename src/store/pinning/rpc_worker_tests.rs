@@ -153,8 +153,8 @@ async fn fixture_on_database(
 
 impl RpcFixture {
     async fn publish(&self, key: &str, cid: &str) {
-        publication::publish_object(
-            self.store.db(),
+        publication::application::publish_object(
+            &self.store,
             PublicationRequest {
                 object: PublicationObject::from_put(
                     uuid::Uuid::new_v4().to_string(),
@@ -199,11 +199,17 @@ impl RpcFixture {
             .one(self.store.db())
             .await
             .unwrap()?;
-        jobs::claim_due_jobs(
-            self.store.db(),
+        jobs::claim_due_worker_jobs_store(
+            &self.store,
             pending.next_attempt_at,
             ChronoDuration::seconds(30),
             1,
+            jobs::WorkerClaimSchedule {
+                in_flight_by_provider: &Default::default(),
+                last_served_ticket_by_provider: &Default::default(),
+                configured_priorities: &Default::default(),
+                active_job_ids: &Default::default(),
+            },
         )
         .await
         .unwrap()
@@ -1037,7 +1043,44 @@ async fn scheduler_receipt_candidates_cannot_authorize_stale_lifetime_retired_pr
 }
 
 #[tokio::test]
-async fn scheduler_revisits_completed_park_after_transient_readiness_failure() {
+async fn scheduler_recovers_completed_park_without_repeating_provider_post() {
+    let db = store::connect_database("sqlite::memory:").await.unwrap();
+    observed_parked_recovery(db).await;
+}
+
+#[tokio::test]
+#[ignore = "requires an authorized isolated IPFS_S3_TEST_POSTGRES_URL"]
+async fn postgres_warm_rpc_fact_park_and_recovery_do_not_revalidate_structure() {
+    use futures_util::FutureExt;
+    let url = std::env::var("IPFS_S3_TEST_POSTGRES_URL").expect("explicit test PostgreSQL URL");
+    let admin = sea_orm::Database::connect(&url).await.unwrap();
+    let schema = format!("rpc_warm_{}", uuid::Uuid::new_v4().simple());
+    admin
+        .execute_unprepared(&format!("CREATE SCHEMA \"{schema}\""))
+        .await
+        .unwrap();
+    let mut options = sea_orm::ConnectOptions::new(url);
+    options
+        .max_connections(4)
+        .set_schema_search_path(schema.clone());
+    let db = sea_orm::Database::connect(options).await.unwrap();
+    let outcome = std::panic::AssertUnwindSafe(observed_parked_recovery(db.clone()))
+        .catch_unwind()
+        .await;
+    db.close().await.unwrap();
+    admin
+        .execute_unprepared(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
+        .await
+        .unwrap();
+    admin.close().await.unwrap();
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn observed_parked_recovery(mut db: sea_orm::DatabaseConnection) {
+    let trace = crate::sql_trace::SqlTrace::default();
+    trace.attach(&mut db);
     let source = MockServer::start().await;
     let target = MockServer::start().await;
     source_file(&source).await;
@@ -1050,13 +1093,15 @@ async fn scheduler_revisits_completed_park_after_transient_readiness_failure() {
         .expect(1)
         .mount(&target)
         .await;
-    let fixture = fixture(
+    let fixture = fixture_on_database(
         target.uri(),
         &source,
         RpcProfile::Filebase,
         RpcStrategy::Upload,
+        db,
     )
     .await;
+    trace.take("RPC cold fixture", false);
     let claim = fixture.claim().await.unwrap();
     let dispatched = dispatch_submit(
         &fixture.store,
@@ -1069,9 +1114,8 @@ async fn scheduler_revisits_completed_park_after_transient_readiness_failure() {
     .unwrap()
     .unwrap();
     let job_id = dispatched.claimed.model.id.clone();
-    let tx = fixture.store.db().begin().await.unwrap();
-    jobs::park_submit(
-        &tx,
+    jobs::park_submit_store(
+        &fixture.store,
         &dispatched.claimed,
         "needs_attention",
         jobs::RPC_RECOVERY_PARK_REASON,
@@ -1079,25 +1123,15 @@ async fn scheduler_revisits_completed_park_after_transient_readiness_failure() {
     )
     .await
     .unwrap();
-    tx.commit().await.unwrap();
     let receipt = ledger::submission::complete_fact(
         &fixture.store,
         dispatched.rpc_invocation.as_ref().unwrap(),
         &dispatched.observation,
-        Utc::now(),
+        chrono::DateTime::from_timestamp_micros(Utc::now().timestamp_micros()).unwrap(),
     )
     .await
     .unwrap();
-    fixture
-        .store
-        .db()
-        .execute_unprepared("UPDATE pin_management_readiness SET state='backfill' WHERE id=1")
-        .await
-        .unwrap();
     let mut cursor = String::new();
-    recover_parked_receipts(&fixture.coordinator, &fixture.store, &mut cursor)
-        .await
-        .unwrap();
     let parked = pin_job::Entity::find_by_id(&job_id)
         .one(fixture.store.db())
         .await
@@ -1112,16 +1146,6 @@ async fn scheduler_revisits_completed_park_after_transient_readiness_failure() {
             .unwrap(),
         receipt
     );
-    fixture
-        .store
-        .db()
-        .execute_unprepared("UPDATE pin_management_readiness SET state='ready' WHERE id=1")
-        .await
-        .unwrap();
-    // The exhausted keyset wraps and the following pass rediscovers the park.
-    recover_parked_receipts(&fixture.coordinator, &fixture.store, &mut cursor)
-        .await
-        .unwrap();
     recover_parked_receipts(&fixture.coordinator, &fixture.store, &mut cursor)
         .await
         .unwrap();
@@ -1133,6 +1157,7 @@ async fn scheduler_revisits_completed_park_after_transient_readiness_failure() {
     assert_eq!(due.state, "pending");
     assert_eq!(due.submit_phase.as_deref(), Some("recovering"));
     fixture.drain().await;
+    trace.take("RPC warm claim/fact/park/recovery", true);
     let settled = fixture.evidence().await;
     assert_eq!(settled[0].resources, receipt.resources);
     assert_eq!(settled[0].observed_at, receipt.observed_at);

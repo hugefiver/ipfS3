@@ -351,7 +351,7 @@ pub(super) async fn resolve_with_work<C: ConnectionTrait, W: Work>(
     .await
 }
 
-pub(in crate::store::pinning) async fn resolve_with_catalog<W: Work>(
+pub(crate) async fn resolve_with_catalog<W: Work>(
     table: &str,
     original_key: &BTreeMap<String, String>,
     provider: &str,
@@ -633,11 +633,21 @@ pub(super) async fn historical_keys_with_work<C: ConnectionTrait, W: Work>(
     cid: Option<&str>,
     work: &W,
 ) -> Result<Vec<String>, W::Error> {
+    historical_keys_catalog(ReceiptCatalog::full(db), table, provider, cid, work).await
+}
+
+pub(crate) async fn historical_keys_catalog<W: Work>(
+    catalog: ReceiptCatalog<'_>,
+    table: &str,
+    provider: &str,
+    cid: Option<&str>,
+    work: &W,
+) -> Result<Vec<String>, W::Error> {
     work.copy(provider)?;
-    let active = indexed::active_for(
-        db,
+    let active = indexed::active_for_catalog(
         AuthoritySelector::LegacyResource(table.into(), provider.into(), cid.map(str::to_owned)),
         work,
+        catalog,
     )
     .await?;
     resource_keys_from_active(table, provider, cid, active, work)

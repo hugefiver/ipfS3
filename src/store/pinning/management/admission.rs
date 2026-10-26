@@ -53,6 +53,7 @@ pub(crate) use observations::{
 
 pub(crate) use intake::{
     lock_encoded_zip_intake_in_transaction, lock_intake_in_caller_transaction,
+    lock_runtime_encoded_zip_intake, lock_runtime_intake,
 };
 
 pub(crate) use domains::allocation_domain;
@@ -72,6 +73,19 @@ pub(crate) async fn lock_registration_in_transaction(
     locks::AdmissionSchema::read(tx).await.map(|_| ())
 }
 
+pub(crate) async fn lock_runtime_registration(
+    tx: &crate::store::RuntimeTransaction,
+    provider: &str,
+    work: DecodeWork<'_>,
+) -> AppResult<()> {
+    locks::lock_existing_usage(tx.db(), &[provider.to_owned()]).await?;
+    locks::serialize(tx.db(), locks::RetirementAccess::Admission).await?;
+    locks::serialize_routes(tx.db(), true).await?;
+    locks::AdmissionSchema::catalog(tx.catalog(work))
+        .await
+        .map(|_| ())
+}
+
 /// Read-only fail-fast hint. Only the final caller transaction proves admission.
 pub(crate) async fn check_open<C: ConnectionTrait>(
     db: &C,
@@ -86,6 +100,22 @@ pub(crate) async fn check_open_with_work<C: ConnectionTrait>(
     work: DecodeWork<'_>,
 ) -> AppResult<()> {
     if retirement::closed(db, routes, work).await? {
+        return Err(retired());
+    }
+    Ok(())
+}
+
+pub(in crate::store::pinning) async fn check_runtime_open(
+    tx: &crate::store::RuntimeTransaction,
+    routes: &[ProviderRouteSnapshot],
+    work: DecodeWork<'_>,
+) -> AppResult<()> {
+    if routes.is_empty() {
+        return Ok(());
+    }
+    let catalog = tx.catalog(work);
+    let schema = locks::AdmissionSchema::catalog(catalog).await?;
+    if retirement::closed_with_role(routes, &schema, false, None, work, catalog).await? {
         return Err(retired());
     }
     Ok(())
@@ -157,9 +187,6 @@ pub(in crate::store::pinning) async fn lock_runtime_provider(
     provider: &str,
     work: DecodeWork<'_>,
 ) -> AppResult<()> {
-    if tx.db().get_database_backend() != sea_orm::DatabaseBackend::Sqlite {
-        return lock_provider_with_work(tx.db(), provider, work).await;
-    }
     locks::serialize(tx.db(), locks::RetirementAccess::Admission).await?;
     locks::serialize_routes(tx.db(), false).await?;
     let catalog = tx.catalog(work);

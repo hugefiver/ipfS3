@@ -3,6 +3,7 @@ use std::{
     time::Duration,
 };
 
+use super::legacy_migration::ReceiptCatalog;
 use super::management::{
     admission::work_error,
     native,
@@ -1022,6 +1023,24 @@ pub async fn project_reconcile_target_from_remote<C: ConnectionTrait>(
     project_target_from_remote_inner(db, target_id, Some(expected_remote_epoch), now, None).await
 }
 
+pub(crate) async fn project_runtime_reconcile_target(
+    tx: &crate::store::RuntimeTransaction,
+    target_id: &str,
+    expected_remote_epoch: i64,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+) -> AppResult<Option<TargetProjection>> {
+    project_target_from_remote_core(
+        tx.db(),
+        target_id,
+        Some(expected_remote_epoch),
+        now,
+        None,
+        Some((tx, work)),
+    )
+    .await
+}
+
 /// Management holds the complete registry frontier before reading these models.
 pub(crate) async fn project_confirmed_target_from_remote<C: ConnectionTrait>(
     db: &C,
@@ -1482,8 +1501,9 @@ async fn wake_quota_waiting_targets_impl<C: ConnectionTrait>(
     runtime: Option<(&crate::store::RuntimeTransaction, DecodeWork<'_>)>,
 ) -> AppResult<Vec<String>> {
     super::management::admission::lock_sqlite_writer_in_caller_transaction(db).await?;
-    if let Some((tx, work)) = runtime {
-        tx.check_schema(work).await?;
+    if let Some((_, work)) = runtime {
+        work.with(|session| session.check())
+            .map_err(super::management::admission::work_error)?;
     }
     let waiting = pin_lease_target::Entity::find()
         .filter(pin_lease_target::Column::Provider.eq(provider))
@@ -1778,6 +1798,9 @@ async fn apply_remote_status_inner<C: ConnectionTrait>(
     authority: Option<&super::management::actions::job_authority::CompletionReader<'_>>,
 ) -> AppResult<RemoteStatusApplyResult> {
     let holds_snapshot = prelocked.is_some();
+    let session = SharedDecodeBudget::default();
+    let runtime = authority.and_then(|authority| authority.runtime_context());
+    let work = runtime.map_or(DecodeWork::shared(&session), |(_, work)| work);
     for attempt in 0..REMOTE_STATUS_WRITE_RETRY_LIMIT {
         let snapshot = match match prelocked.take() {
             Some(snapshot) => Ok(snapshot),
@@ -1850,10 +1873,12 @@ async fn apply_remote_status_inner<C: ConnectionTrait>(
             &snapshot.remote,
             enforce_monotonic_status
                 && !{
-                    crate::store::entities::pin_replica_observation::receipt::retained_cluster(
+                    retained_cluster_with_work(
                         db,
                         update.provider,
                         update.cid,
+                        work,
+                        runtime.map(|(tx, _)| tx),
                     )
                     .await?
                 },
@@ -1891,7 +1916,14 @@ async fn apply_remote_status_inner<C: ConnectionTrait>(
                 Some(job)
                     if job.operation != "submit" || update.origin == RemoteStatusOrigin::Adopt =>
                 {
-                    historical_poll_followup_allowed(db, job, &snapshot.desired, &remote).await?
+                    historical_poll_followup_allowed(
+                        db,
+                        job,
+                        &snapshot.desired,
+                        &remote,
+                        authority.and_then(|reader| reader.runtime_context()),
+                    )
+                    .await?
                 }
                 _ => false,
             }
@@ -1962,23 +1994,25 @@ async fn apply_remote_status_inner<C: ConnectionTrait>(
 
         let mut affected = Vec::with_capacity(snapshot.desired.len());
         for desired in snapshot.desired {
-            let birth =
-                if crate::store::entities::pin_replica_observation::receipt::retained_cluster(
-                    db,
-                    update.provider,
-                    update.cid,
+            let birth = if retained_cluster_with_work(
+                db,
+                update.provider,
+                update.cid,
+                work,
+                runtime.map(|(tx, _)| tx),
+            )
+            .await?
+            {
+                crate::store::entities::pin_lease_requirement::contract::completion_current_catalog(
+                    runtime.map_or_else(|| ReceiptCatalog::full(db), |(tx, _)| tx.catalog(work)),
+                    &desired.lease.id,
+                    update.now,
+                    work.budget().clone(),
                 )
                 .await?
-                {
-                    crate::store::entities::pin_lease_requirement::contract::completion(
-                        db,
-                        &desired.lease.id,
-                        update.now,
-                    )
-                    .await?
-                } else {
-                    None
-                };
+            } else {
+                None
+            };
             affected.push(AffectedLeaseOutcome {
                 lease_id: desired.lease.id.clone(),
                 target_id: desired.target.id,
@@ -2012,6 +2046,7 @@ async fn historical_poll_followup_allowed<C: ConnectionTrait>(
     job: &pin_job::Model,
     desired: &[DesiredTarget],
     remote: &remote_pin::Model,
+    runtime: Option<(&crate::store::RuntimeTransaction, DecodeWork<'_>)>,
 ) -> AppResult<bool> {
     if job.provider != remote.provider
         || job.cid != remote.cid
@@ -2032,7 +2067,12 @@ async fn historical_poll_followup_allowed<C: ConnectionTrait>(
     let captured = pin_invocation_route::Entity::find_by_id(job.id.clone())
         .one(db)
         .await?;
-    let ledger_route = ledger::get(db, &job.provider, &job.cid).await?;
+    let ledger_route = match runtime {
+        Some((tx, work)) => {
+            ledger::get_catalog(tx.catalog(work), &job.provider, &job.cid, work).await?
+        }
+        None => ledger::get(db, &job.provider, &job.cid).await?,
+    };
     let configured = pin_provider_route::Entity::find_by_id(job.provider.clone())
         .one(db)
         .await?;
@@ -2310,9 +2350,6 @@ pub(crate) async fn complete_runtime_remote_delete(
     now: DateTimeUtc,
     work: DecodeWork<'_>,
 ) -> AppResult<RemoteDeleteCompletion> {
-    if tx.get_database_backend() != DatabaseBackend::Sqlite {
-        return complete_remote_delete(tx.db(), provider, cid, epoch, now).await;
-    }
     complete_remote_delete_core(tx.db(), provider, cid, epoch, now, Some((tx, work))).await
 }
 
@@ -2639,9 +2676,6 @@ pub(crate) async fn complete_runtime_no_request_remote_absence(
     now: DateTimeUtc,
     work: DecodeWork<'_>,
 ) -> AppResult<NoRequestRemoteCompletion> {
-    if tx.get_database_backend() != DatabaseBackend::Sqlite {
-        return complete_no_request_remote_absence(tx.db(), provider, cid, epoch, now).await;
-    }
     complete_no_request_remote_absence_core(tx.db(), provider, cid, epoch, now, Some((tx, work)))
         .await
 }
@@ -2747,9 +2781,6 @@ pub(crate) async fn ensure_runtime_failed_remote_retry(
     now: DateTimeUtc,
     work: DecodeWork<'_>,
 ) -> AppResult<FailedRemoteRetryDecision> {
-    if tx.db().get_database_backend() != DatabaseBackend::Sqlite {
-        return ensure_failed_remote_retry(tx.db(), provider, cid, now).await;
-    }
     super::management::admission::lock_sqlite_writer_in_caller_transaction(tx.db()).await?;
     ensure_failed_remote_retry_with_maintenance(tx.db(), provider, cid, now, None, Some((tx, work)))
         .await
@@ -2870,6 +2901,38 @@ pub async fn prepare_failed_remote_resubmit<C: ConnectionTrait>(
     expected_request_id: &str,
     now: DateTimeUtc,
 ) -> AppResult<FailedRemoteResubmitDecision> {
+    prepare_failed_remote_resubmit_core(
+        db,
+        provider,
+        cid,
+        expected_remote_epoch,
+        expected_request_id,
+        now,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn prepare_runtime_failed_remote_resubmit(
+    tx: &crate::store::RuntimeTransaction,
+    provider: &str,
+    cid: &str,
+    epoch: i64,
+    request: &str,
+    now: DateTimeUtc,
+) -> AppResult<FailedRemoteResubmitDecision> {
+    prepare_failed_remote_resubmit_core(tx.db(), provider, cid, epoch, request, now, Some(tx)).await
+}
+
+async fn prepare_failed_remote_resubmit_core<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+    cid: &str,
+    expected_remote_epoch: i64,
+    expected_request_id: &str,
+    now: DateTimeUtc,
+    runtime: Option<&crate::store::RuntimeTransaction>,
+) -> AppResult<FailedRemoteResubmitDecision> {
     super::management::admission::lock_sqlite_writer_in_caller_transaction(db).await?;
     let snapshot = match ordered_desired_lifecycle_snapshot(db, provider, cid).await? {
         OrderedDesiredLifecycleSnapshotOutcome::Current(snapshot) => snapshot,
@@ -2883,10 +2946,10 @@ pub async fn prepare_failed_remote_resubmit<C: ConnectionTrait>(
         db,
         &snapshot.remote,
         &snapshot.desired,
-        expected_remote_epoch,
-        expected_request_id,
+        (expected_remote_epoch, expected_request_id),
         now,
         DecodeWork::shared(&work),
+        runtime,
     )
     .await
 }
@@ -2899,18 +2962,26 @@ pub(crate) async fn prepare_confirmed_failed_remote_resubmit<C: ConnectionTrait>
     work: DecodeWork<'_>,
 ) -> AppResult<FailedRemoteResubmitDecision> {
     let desired = desired_targets_with_work(db, &remote.provider, &remote.cid, work).await?;
-    prepare_failed_remote_resubmit_prelocked(db, remote, &desired, remote.epoch, request, now, work)
-        .await
+    prepare_failed_remote_resubmit_prelocked(
+        db,
+        remote,
+        &desired,
+        (remote.epoch, request),
+        now,
+        work,
+        None,
+    )
+    .await
 }
 
 async fn prepare_failed_remote_resubmit_prelocked<C: ConnectionTrait>(
     db: &C,
     remote: &remote_pin::Model,
     desired: &[DesiredTarget],
-    expected_remote_epoch: i64,
-    expected_request_id: &str,
+    (expected_remote_epoch, expected_request_id): (i64, &str),
     now: DateTimeUtc,
     work: DecodeWork<'_>,
+    runtime: Option<&crate::store::RuntimeTransaction>,
 ) -> AppResult<FailedRemoteResubmitDecision> {
     let provider = remote.provider.as_str();
     let cid = remote.cid.as_str();
@@ -2932,8 +3003,16 @@ async fn prepare_failed_remote_resubmit_prelocked<C: ConnectionTrait>(
     }
     // A historical Reconcile may inspect its captured request, but a new
     // Submit needs today's matching allocation route.
-    quota::lock_allocation_admission_with_work(db, provider, work).await?;
-    quota::assert_reusable_route_with_work(db, provider, cid, work).await?;
+    match runtime {
+        Some(tx) => {
+            quota::lock_runtime_allocation_admission(tx, provider, work).await?;
+            quota::assert_reusable_route_catalog(tx.catalog(work), provider, cid, work).await?;
+        }
+        None => {
+            quota::lock_allocation_admission_with_work(db, provider, work).await?;
+            quota::assert_reusable_route_with_work(db, provider, cid, work).await?;
+        }
+    }
 
     let new_epoch = increment_epoch(remote.epoch)?;
 
@@ -3019,7 +3098,10 @@ async fn prepare_failed_remote_resubmit_prelocked<C: ConnectionTrait>(
     };
     work.copy(&job.id).map_err(work_error)?;
     let submit_job_id = job.id.clone();
-    jobs::ensure_submit_with_work(db, job, now, work).await?;
+    match runtime {
+        Some(tx) => jobs::ensure_runtime_submit(tx, job, now, work).await?,
+        None => jobs::ensure_submit_with_work(db, job, now, work).await?,
+    };
     Ok(FailedRemoteResubmitDecision::Prepared {
         new_epoch,
         submit_job_id,
@@ -3029,9 +3111,10 @@ async fn prepare_failed_remote_resubmit_prelocked<C: ConnectionTrait>(
 /// Fresh Submit crosses admission before its job/history tail is locked. A
 /// reclaimed invocation instead follows the existing read-only recovery path.
 pub(crate) async fn lock_submit_admission_frontier(
-    tx: &DatabaseTransaction,
+    runtime: &crate::store::RuntimeTransaction,
     job: &pin_job::Model,
 ) -> AppResult<()> {
+    let tx = runtime.db();
     super::management::admission::lock_sqlite_writer_in_caller_transaction(tx).await?;
     match ordered_desired_lifecycle_snapshot(tx, &job.provider, &job.cid).await? {
         OrderedDesiredLifecycleSnapshotOutcome::Current(snapshot) => {
@@ -3044,7 +3127,13 @@ pub(crate) async fn lock_submit_admission_frontier(
                 // it cannot dispatch without a matching desired generation.
                 return Ok(());
             }
-            quota::lock_allocation_admission(tx, &job.provider).await
+            let session = SharedDecodeBudget::default();
+            quota::lock_runtime_allocation_admission(
+                runtime,
+                &job.provider,
+                DecodeWork::shared(&session),
+            )
+            .await
         }
         OrderedDesiredLifecycleSnapshotOutcome::Stale => {
             Err(stale_lifecycle_error("Submit admission frontier"))
@@ -3073,27 +3162,7 @@ pub async fn renew_manual_lease<C: ConnectionTrait>(
         retain_until,
         now,
         ManualLeaseOwnerScope::Latest,
-    )
-    .await
-}
-
-/// Renews a manual lease owned by an exact retained version.
-///
-/// The caller must lock and revalidate the exact public version identity in the same transaction.
-pub(crate) async fn renew_retained_version_manual_lease<C: ConnectionTrait>(
-    db: &C,
-    owner_object_id: &str,
-    lease_id: &str,
-    retain_until: DateTimeUtc,
-    now: DateTimeUtc,
-) -> Result<ManualLeaseRenewalOutcome, RenewManualLeaseError> {
-    renew_manual_lease_for_owner(
-        db,
-        owner_object_id,
-        lease_id,
-        retain_until,
-        now,
-        ManualLeaseOwnerScope::RetainedVersion,
+        None,
     )
     .await
 }
@@ -3105,11 +3174,20 @@ async fn renew_manual_lease_for_owner<C: ConnectionTrait>(
     retain_until: DateTimeUtc,
     now: DateTimeUtc,
     owner_scope: ManualLeaseOwnerScope,
+    runtime: Option<&crate::store::RuntimeTransaction>,
 ) -> Result<ManualLeaseRenewalOutcome, RenewManualLeaseError> {
     let budget = super::management::records::SharedDecodeBudget::default();
     let work = DecodeWork::shared(&budget);
-    let snapshot =
-        renewal_snapshot_inner(db, owner_object_id, lease_id, owner_scope, false, work).await?;
+    let snapshot = renewal_snapshot_inner(
+        db,
+        owner_object_id,
+        lease_id,
+        owner_scope,
+        false,
+        work,
+        runtime,
+    )
+    .await?;
 
     #[cfg(test)]
     pause_after_renewal_snapshot(lease_id).await;
@@ -3152,7 +3230,7 @@ async fn renew_manual_lease_for_owner<C: ConnectionTrait>(
                 .cloned()
                 .collect();
             refresh_renewal_snapshot_targets_with_work(
-                db, &snapshot, generation, &targets, now, work,
+                db, &snapshot, generation, &targets, now, work, runtime,
             )
             .await?;
             return Ok(ManualLeaseRenewalOutcome::Extended { generation });
@@ -3182,8 +3260,16 @@ async fn renew_manual_lease_for_owner<C: ConnectionTrait>(
     if restored_target_ids.is_empty() {
         return Err(RenewManualLeaseError::NoRecoverableReservation);
     }
-    refresh_renewal_snapshot_targets_with_work(db, &snapshot, generation, &recoverable, now, work)
-        .await?;
+    refresh_renewal_snapshot_targets_with_work(
+        db,
+        &snapshot,
+        generation,
+        &recoverable,
+        now,
+        work,
+        runtime,
+    )
+    .await?;
     Ok(ManualLeaseRenewalOutcome::Reactivated {
         generation,
         restored_target_ids,
@@ -3212,6 +3298,7 @@ pub(crate) async fn renew_confirmed_lease_in_transaction(
         ManualLeaseOwnerScope::RetainedVersion,
         true,
         work,
+        None,
     )
     .await
     .map_err(confirmed_renewal_error)?;
@@ -3322,9 +3409,11 @@ pub(crate) async fn renew_confirmed_lease_in_transaction(
         .filter(|target| is_desired_target_state(&target.state))
         .cloned()
         .collect::<Vec<_>>();
-    refresh_renewal_snapshot_targets_with_work(tx, &snapshot, generation, &targets, now, work)
-        .await
-        .map_err(confirmed_renewal_error)?;
+    refresh_renewal_snapshot_targets_with_work(
+        tx, &snapshot, generation, &targets, now, work, None,
+    )
+    .await
+    .map_err(confirmed_renewal_error)?;
     Ok(ManualLeaseRenewalOutcome::Extended { generation })
 }
 
@@ -3506,6 +3595,30 @@ async fn reactivate_expired_manual_lease<C: ConnectionTrait>(
     Ok(generation)
 }
 
+pub(crate) async fn renew_runtime_manual_lease(
+    tx: &crate::store::RuntimeTransaction,
+    owner_object_id: &str,
+    lease_id: &str,
+    retain_until: DateTimeUtc,
+    now: DateTimeUtc,
+    retained: bool,
+) -> Result<ManualLeaseRenewalOutcome, RenewManualLeaseError> {
+    renew_manual_lease_for_owner(
+        tx.db(),
+        owner_object_id,
+        lease_id,
+        retain_until,
+        now,
+        if retained {
+            ManualLeaseOwnerScope::RetainedVersion
+        } else {
+            ManualLeaseOwnerScope::Latest
+        },
+        Some(tx),
+    )
+    .await
+}
+
 async fn renewal_snapshot_inner<C: ConnectionTrait>(
     db: &C,
     owner_object_id: &str,
@@ -3513,6 +3626,7 @@ async fn renewal_snapshot_inner<C: ConnectionTrait>(
     owner_scope: ManualLeaseOwnerScope,
     prelocked: bool,
     work: super::management::records::DecodeWork<'_>,
+    runtime: Option<&crate::store::RuntimeTransaction>,
 ) -> Result<RenewalSnapshot, RenewManualLeaseError> {
     super::management::admission::lock_sqlite_writer_in_caller_transaction(db)
         .await
@@ -3705,7 +3819,11 @@ async fn renewal_snapshot_inner<C: ConnectionTrait>(
         usage.insert((*provider).to_owned(), row);
     }
     for provider in &providers {
-        if prelocked {
+        if let Some(tx) = runtime {
+            super::management::admission::lock_runtime_provider(tx, provider, work)
+                .await
+                .map_err(app_to_renewal_error)?;
+        } else if prelocked {
             super::management::admission::check_provider_with_work(db, provider, work)
                 .await
                 .map_err(app_to_renewal_error)?;
@@ -3953,6 +4071,7 @@ async fn refresh_renewal_snapshot_targets_with_work<C: ConnectionTrait>(
     targets: &[pin_lease_target::Model],
     now: DateTimeUtc,
     work: super::management::records::DecodeWork<'_>,
+    runtime: Option<&crate::store::RuntimeTransaction>,
 ) -> Result<(), RenewManualLeaseError> {
     work.with(|work| work.nodes(1 + targets.len()))
         .map_err(renewal_work_error)?;
@@ -4084,14 +4203,17 @@ async fn refresh_renewal_snapshot_targets_with_work<C: ConnectionTrait>(
             .iter()
             .filter(|target| renewed_target_ids.contains(target.target.id.as_str()))
         {
-            project_prelocked_desired_target_with_work(
+            project_prelocked_target_core(
                 db,
-                target,
-                desired,
-                &remote,
+                PrelockedProjection {
+                    desired: target,
+                    all_desired: desired,
+                    remote: &remote,
+                },
                 ProjectionAccess::Admission,
                 now,
                 work,
+                runtime,
             )
             .await
             .map_err(app_to_renewal_error)?;
@@ -4106,7 +4228,7 @@ async fn refresh_renewal_snapshot_targets_with_work<C: ConnectionTrait>(
         } else {
             now
         };
-        ensure_reconcile_with_work(db, provider, cid, remote.epoch, reconcile_at, work)
+        ensure_reconcile_core(db, provider, cid, remote.epoch, reconcile_at, work, runtime)
             .await
             .map_err(app_to_renewal_error)?;
     }
@@ -4361,6 +4483,23 @@ pub async fn cancel_lease<C: ConnectionTrait>(
     lease_id: &str,
     now: DateTimeUtc,
 ) -> AppResult<GenerationDecision> {
+    cancel_lease_core(db, lease_id, now, None).await
+}
+
+pub(crate) async fn cancel_runtime_lease(
+    tx: &crate::store::RuntimeTransaction,
+    lease_id: &str,
+    now: DateTimeUtc,
+) -> AppResult<GenerationDecision> {
+    cancel_lease_core(tx.db(), lease_id, now, Some(tx)).await
+}
+
+async fn cancel_lease_core<C: ConnectionTrait>(
+    db: &C,
+    lease_id: &str,
+    now: DateTimeUtc,
+    runtime: Option<&crate::store::RuntimeTransaction>,
+) -> AppResult<GenerationDecision> {
     let Some(lease) = pin_lease::Entity::find_by_id(lease_id.to_owned())
         .one(db)
         .await?
@@ -4370,7 +4509,17 @@ pub async fn cancel_lease<C: ConnectionTrait>(
     if lease.state != LEASE_ACTIVE {
         return Ok(GenerationDecision::NoLongerNeeded);
     }
-    end_leases(db, &[lease], LEASE_CANCELLED, TARGET_RELEASED, now).await?;
+    let session = SharedDecodeBudget::default();
+    end_leases_core(
+        db,
+        &[lease],
+        LEASE_CANCELLED,
+        TARGET_RELEASED,
+        now,
+        DecodeWork::shared(&session),
+        runtime,
+    )
+    .await?;
     Ok(GenerationDecision::Current)
 }
 
@@ -4403,6 +4552,15 @@ pub async fn end_active_leases_for_object<C: ConnectionTrait>(
     owner_object_id: &str,
     now: DateTimeUtc,
 ) -> AppResult<Vec<String>> {
+    end_active_leases_for_object_core(db, owner_object_id, now, None).await
+}
+
+pub(in crate::store::pinning) async fn end_active_leases_for_object_core<C: ConnectionTrait>(
+    db: &C,
+    owner_object_id: &str,
+    now: DateTimeUtc,
+    runtime: Option<&crate::store::RuntimeTransaction>,
+) -> AppResult<Vec<String>> {
     let leases = pin_lease::Entity::find()
         .filter(pin_lease::Column::OwnerObjectId.eq(owner_object_id))
         .filter(pin_lease::Column::State.eq(LEASE_ACTIVE))
@@ -4410,7 +4568,17 @@ pub async fn end_active_leases_for_object<C: ConnectionTrait>(
         .all(db)
         .await?;
     let ended = leases.iter().map(|lease| lease.id.clone()).collect();
-    end_leases(db, &leases, LEASE_CANCELLED, TARGET_RELEASED, now).await?;
+    let session = SharedDecodeBudget::default();
+    end_leases_core(
+        db,
+        &leases,
+        LEASE_CANCELLED,
+        TARGET_RELEASED,
+        now,
+        DecodeWork::shared(&session),
+        runtime,
+    )
+    .await?;
     Ok(ended)
 }
 
@@ -4418,6 +4586,22 @@ pub async fn end_active_leases_for_object<C: ConnectionTrait>(
 pub async fn expire_due_leases<C: ConnectionTrait>(
     db: &C,
     now: DateTimeUtc,
+) -> AppResult<Vec<String>> {
+    expire_due_leases_core(db, now, None).await
+}
+
+pub(crate) async fn expire_runtime_due_leases(
+    tx: &crate::store::RuntimeTransaction,
+    now: DateTimeUtc,
+) -> AppResult<Vec<String>> {
+    super::management::admission::lock_sqlite_writer_in_caller_transaction(tx.db()).await?;
+    expire_due_leases_core(tx.db(), now, Some(tx)).await
+}
+
+async fn expire_due_leases_core<C: ConnectionTrait>(
+    db: &C,
+    now: DateTimeUtc,
+    runtime: Option<&crate::store::RuntimeTransaction>,
 ) -> AppResult<Vec<String>> {
     let leases = pin_lease::Entity::find()
         .filter(pin_lease::Column::State.eq(LEASE_ACTIVE))
@@ -4427,7 +4611,17 @@ pub async fn expire_due_leases<C: ConnectionTrait>(
         .all(db)
         .await?;
     let ids = leases.iter().map(|lease| lease.id.clone()).collect();
-    end_leases(db, &leases, LEASE_EXPIRED, TARGET_RELEASED, now).await?;
+    let session = SharedDecodeBudget::default();
+    end_leases_core(
+        db,
+        &leases,
+        LEASE_EXPIRED,
+        TARGET_RELEASED,
+        now,
+        DecodeWork::shared(&session),
+        runtime,
+    )
+    .await?;
     Ok(ids)
 }
 
@@ -4453,6 +4647,15 @@ pub async fn evict_provider_cids<C: ConnectionTrait>(
     db: &C,
     pairs: &[(String, String)],
     now: DateTimeUtc,
+) -> AppResult<Vec<QuotaEvictedTarget>> {
+    evict_provider_cids_core(db, pairs, now, None).await
+}
+
+pub(in crate::store::pinning) async fn evict_provider_cids_core<C: ConnectionTrait>(
+    db: &C,
+    pairs: &[(String, String)],
+    now: DateTimeUtc,
+    runtime: Option<&crate::store::RuntimeTransaction>,
 ) -> AppResult<Vec<QuotaEvictedTarget>> {
     let mut pairs = pairs.to_vec();
     pairs.sort();
@@ -4582,7 +4785,17 @@ pub async fn evict_provider_cids<C: ConnectionTrait>(
     }
     for (provider, cid) in &pairs {
         if let Some(epoch) = bump_remote_epoch(db, provider, cid, now).await? {
-            schedule_after_desired_change(db, provider, cid, epoch, now).await?;
+            let session = SharedDecodeBudget::default();
+            schedule_after_desired_change_core(
+                db,
+                provider,
+                cid,
+                epoch,
+                now,
+                DecodeWork::shared(&session),
+                runtime,
+            )
+            .await?;
         }
     }
 
@@ -4746,16 +4959,6 @@ pub(crate) enum TargetJobFailoverOutcome {
 }
 
 /// Validates one exact target-scoped job and performs failover in the caller's transaction.
-pub(crate) async fn fail_one_target_for_job<C: ConnectionTrait>(
-    db: &C,
-    job: &pin_job::Model,
-    ordered_providers: &[String],
-    limits: &ProviderLimitMap,
-    now: DateTimeUtc,
-) -> AppResult<TargetJobFailoverOutcome> {
-    fail_one_target_for_job_core(db, job, ordered_providers, limits, now, None).await
-}
-
 pub(crate) async fn fail_runtime_one_target_for_job(
     tx: &crate::store::RuntimeTransaction,
     job: &pin_job::Model,
@@ -4764,9 +4967,6 @@ pub(crate) async fn fail_runtime_one_target_for_job(
     now: DateTimeUtc,
     work: DecodeWork<'_>,
 ) -> AppResult<TargetJobFailoverOutcome> {
-    if tx.db().get_database_backend() != DatabaseBackend::Sqlite {
-        return fail_one_target_for_job(tx.db(), job, ordered_providers, limits, now).await;
-    }
     fail_one_target_for_job_core(
         tx.db(),
         job,
@@ -4787,9 +4987,6 @@ pub(crate) async fn fail_runtime_one_target(
     now: DateTimeUtc,
     work: DecodeWork<'_>,
 ) -> AppResult<Option<pin_lease_target::Model>> {
-    if tx.db().get_database_backend() != DatabaseBackend::Sqlite {
-        return fail_one_target(tx.db(), lease_id, target_id, ordered_providers, limits, now).await;
-    }
     fail_one_target_at_generation(
         tx.db(),
         (lease_id, target_id),
@@ -5242,9 +5439,6 @@ pub(crate) async fn converge_runtime_one_after_replacement(
     now: DateTimeUtc,
     work: DecodeWork<'_>,
 ) -> AppResult<Vec<NewPinJob>> {
-    if tx.db().get_database_backend() != DatabaseBackend::Sqlite {
-        return converge_one_after_replacement(tx.db(), lease_id, winning_target_id, now).await;
-    }
     super::management::admission::lock_sqlite_writer_in_caller_transaction(tx.db()).await?;
     converge_one_after_replacement_inner(
         tx.db(),
@@ -5301,9 +5495,9 @@ async fn converge_one_after_replacement_inner<C: ConnectionTrait>(
     };
     let confirmed = if cluster {
         match runtime {
-            Some((_, work)) => {
-                crate::store::entities::pin_lease_requirement::contract::target_confirmed_with_work(
-                    db,
+            Some((tx, work)) => {
+                crate::store::entities::pin_lease_requirement::contract::target_confirmed_catalog(
+                    tx.catalog(work),
                     lease_id,
                     &winner.provider,
                     &winner.cid,
@@ -5499,11 +5693,13 @@ async fn desired_targets_with_work<C: ConnectionTrait>(
 
 /// Reconstructs current projection outcomes for worker crash recovery without acquiring locks.
 /// Mutating consumers must revalidate every row in a new canonical lifecycle transaction.
-pub(crate) async fn current_remote_outcomes<C: ConnectionTrait>(
-    db: &C,
+pub(crate) async fn current_remote_outcomes(
+    tx: &crate::store::RuntimeTransaction,
     provider: &str,
     cid: &str,
+    work: DecodeWork<'_>,
 ) -> AppResult<Vec<AffectedLeaseOutcome>> {
+    let db = tx.db();
     let desired = desired_targets(db, provider, cid).await?;
     if desired.is_empty() {
         return Ok(Vec::new());
@@ -5527,12 +5723,14 @@ pub(crate) async fn current_remote_outcomes<C: ConnectionTrait>(
         });
     let mut outcomes = Vec::new();
     for desired in desired {
-        let birth = crate::store::entities::pin_lease_requirement::contract::completion(
-            db,
-            &desired.lease.id,
-            Utc::now(),
-        )
-        .await?;
+        let birth =
+            crate::store::entities::pin_lease_requirement::contract::completion_current_catalog(
+                tx.catalog(work),
+                &desired.lease.id,
+                Utc::now(),
+                work.budget().clone(),
+            )
+            .await?;
         outcomes.push(AffectedLeaseOutcome {
             lease_id: desired.lease.id.clone(),
             target_id: desired.target.id,
@@ -6039,6 +6237,7 @@ async fn project_prelocked_target_state<C: ConnectionTrait>(
     runtime: Option<&crate::store::RuntimeTransaction>,
     schedule_work: bool,
 ) -> AppResult<TargetProjection> {
+    let catalog = runtime.map_or_else(|| ReceiptCatalog::full(db), |tx| tx.catalog(work));
     let PrelockedProjection {
         desired,
         all_desired,
@@ -6055,8 +6254,8 @@ async fn project_prelocked_target_state<C: ConnectionTrait>(
                 retained_cluster_with_work(db, &remote.provider, &remote.cid, work, runtime)
                     .await?;
             let confirmed = !cluster
-                || crate::store::entities::pin_lease_requirement::contract::target_confirmed_with_work(
-                    db,
+                || crate::store::entities::pin_lease_requirement::contract::target_confirmed_catalog(
+                    catalog,
                     &desired.lease.id,
                     &remote.provider,
                     &remote.cid,
@@ -6104,8 +6303,8 @@ async fn project_prelocked_target_state<C: ConnectionTrait>(
                 retained_cluster_with_work(db, &remote.provider, &remote.cid, work, runtime)
                     .await?;
             let confirmed = cluster
-                && crate::store::entities::pin_lease_requirement::contract::target_confirmed_with_work(
-                    db,
+                && crate::store::entities::pin_lease_requirement::contract::target_confirmed_catalog(
+                    catalog,
                     &desired.lease.id,
                     &remote.provider,
                     &remote.cid,
@@ -6690,6 +6889,7 @@ async fn bump_remote_epoch<C: ConnectionTrait>(
     Ok((updated.rows_affected == 1).then_some(epoch))
 }
 
+#[cfg(test)]
 async fn end_leases<C: ConnectionTrait>(
     db: &C,
     leases: &[pin_lease::Model],
@@ -6715,6 +6915,18 @@ async fn end_leases_with_work<C: ConnectionTrait>(
     target_state: &str,
     now: DateTimeUtc,
     work: DecodeWork<'_>,
+) -> AppResult<()> {
+    end_leases_core(db, leases, state, target_state, now, work, None).await
+}
+
+async fn end_leases_core<C: ConnectionTrait>(
+    db: &C,
+    leases: &[pin_lease::Model],
+    state: &str,
+    target_state: &str,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+    runtime: Option<&crate::store::RuntimeTransaction>,
 ) -> AppResult<()> {
     work.with(|work| work.nodes(2 + leases.len()))
         .map_err(work_error)?;
@@ -6807,7 +7019,8 @@ async fn end_leases_with_work<C: ConnectionTrait>(
             let epoch = bump_snapshotted_remote_epoch(db, &remote, now)
                 .await
                 .map_err(confirmed_renewal_error)?;
-            schedule_after_desired_change_with_work(db, &provider, &cid, epoch, now, work).await?;
+            schedule_after_desired_change_core(db, &provider, &cid, epoch, now, work, runtime)
+                .await?;
         }
     }
     Ok(())
@@ -6839,6 +7052,18 @@ async fn schedule_after_desired_change_with_work<C: ConnectionTrait>(
     now: DateTimeUtc,
     work: DecodeWork<'_>,
 ) -> AppResult<()> {
+    schedule_after_desired_change_core(db, provider, cid, epoch, now, work, None).await
+}
+
+async fn schedule_after_desired_change_core<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+    cid: &str,
+    epoch: i64,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+    runtime: Option<&crate::store::RuntimeTransaction>,
+) -> AppResult<()> {
     let remote = records::current_model::<remote_pin::Entity, _>(db, &[provider, cid], work)
         .await
         .map_err(work_error)?;
@@ -6851,13 +7076,16 @@ async fn schedule_after_desired_change_with_work<C: ConnectionTrait>(
     let desired=db.query_one(sea_orm::Statement::from_sql_and_values(db.get_database_backend(),"SELECT COUNT(*) AS n FROM pin_lease_targets t JOIN pin_leases l ON l.id=t.lease_id WHERE t.provider=$1 AND t.cid=$2 AND t.state IN ('waiting','submitted','pinned','degraded') AND l.state='active'",[provider.into(),cid.into()])).await?.ok_or_else(||invalid("desired membership unavailable"))?.try_get::<i64>("","n")?;
     if desired != 0 {
         if remote.status != REMOTE_ABSENT {
-            ensure_reconcile_with_work(db, provider, cid, epoch, now, work).await?;
+            ensure_reconcile_core(db, provider, cid, epoch, now, work, runtime).await?;
         }
     } else if remote.status != REMOTE_ABSENT || remote.request_id.is_some() {
         let NewPinJob::Remote(job) = jobs::unpin_job(provider, cid, epoch, now) else {
             unreachable!("unpin constructor is remote scoped")
         };
-        jobs::insert_new_job_with_work(db, NewPinJob::Remote(job), now, work).await?;
+        match runtime {
+            Some(tx) => jobs::insert_runtime_job(tx, NewPinJob::Remote(job), now, work).await?,
+            None => jobs::insert_new_job_with_work(db, NewPinJob::Remote(job), now, work).await?,
+        };
     }
     Ok(())
 }
@@ -7047,6 +7275,7 @@ mod tests {
             ManualLeaseOwnerScope::RetainedVersion,
             true,
             DecodeWork::shared(&budget),
+            None,
         )
         .await;
         assert!(
@@ -7078,6 +7307,7 @@ mod tests {
             ManualLeaseOwnerScope::RetainedVersion,
             true,
             work,
+            None,
         )
         .await
         .unwrap();

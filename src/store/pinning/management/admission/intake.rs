@@ -1,5 +1,9 @@
 //! Admission at the existing MPU/import/ZIP transaction boundary. This is not
 //! another policy decider, publication executor, or source-content proof.
+use crate::store::pinning::{
+    legacy_migration::ReceiptCatalog,
+    management::records::{DecodeWork, SharedDecodeBudget},
+};
 use crate::{
     error::AppResult,
     pinning::{
@@ -14,8 +18,28 @@ pub(crate) async fn lock_intake_in_caller_transaction<C: ConnectionTrait>(
     decision: Option<&ExtensionDecision>,
     zip: Option<&CapturedZipIntent>,
 ) -> AppResult<()> {
+    lock_intake_core(db, decision, zip, None).await
+}
+
+pub(crate) async fn lock_runtime_intake(
+    tx: &crate::store::RuntimeTransaction,
+    decision: Option<&ExtensionDecision>,
+    zip: Option<&CapturedZipIntent>,
+) -> AppResult<()> {
+    lock_intake_core(tx.db(), decision, zip, Some(tx)).await
+}
+
+async fn lock_intake_core<C: ConnectionTrait>(
+    db: &C,
+    decision: Option<&ExtensionDecision>,
+    zip: Option<&CapturedZipIntent>,
+    runtime: Option<&crate::store::RuntimeTransaction>,
+) -> AppResult<()> {
     super::lock_sqlite_writer_in_caller_transaction(db).await?;
-    let schema = super::locks::AdmissionSchema::read(db).await?;
+    let budget = SharedDecodeBudget::default();
+    let work = DecodeWork::shared(&budget);
+    let catalog = runtime.map_or_else(|| ReceiptCatalog::full(db), |tx| tx.catalog(work));
+    let schema = super::locks::AdmissionSchema::catalog(catalog).await?;
     let mut routes = BTreeMap::<String, ProviderRouteSnapshot>::new();
     if let Some(zip) = zip {
         // The frozen selector already accounts for source=false, output rules
@@ -41,9 +65,10 @@ pub(crate) async fn lock_intake_in_caller_transaction<C: ConnectionTrait>(
             if routes.contains_key(key) {
                 continue;
             }
-            let selected = super::domains::registered_routes(db, key).await?;
+            let selected =
+                super::domains::registered_routes_in_schema_with_work(db, key, work).await?;
             if selected.is_empty() {
-                if super::domains::unregistered_legacy(db, key).await? {
+                if super::domains::unregistered_legacy_in_schema(db, key, &schema).await? {
                     continue;
                 }
                 return Err(super::needs_attention());
@@ -54,18 +79,37 @@ pub(crate) async fn lock_intake_in_caller_transaction<C: ConnectionTrait>(
         }
     }
     if routes.is_empty() {
-        return schema.revalidate(db).await;
+        return schema.revalidate_catalog(catalog).await;
     }
     // No accounting sentinel or grant: absent rows are covered by the following
     // table fences, existing usage precedes retirement and route locks.
     super::locks::lock_existing_usage(db, &routes.keys().cloned().collect::<Vec<_>>()).await?;
-    super::lock_in_caller_transaction(db, &routes.into_values().collect::<Vec<_>>()).await?;
-    schema.revalidate(db).await
+    let routes = routes.into_values().collect::<Vec<_>>();
+    match runtime {
+        Some(tx) => super::lock_runtime_routes(tx, &routes, work).await?,
+        None => super::lock_in_caller_transaction(db, &routes).await?,
+    }
+    schema.revalidate_catalog(catalog).await
 }
 
 pub(crate) async fn lock_encoded_zip_intake_in_transaction(
     tx: &DatabaseTransaction,
     encoded: &str,
+) -> AppResult<()> {
+    lock_encoded_zip_intake_core(tx, encoded, None).await
+}
+
+pub(crate) async fn lock_runtime_encoded_zip_intake(
+    tx: &crate::store::RuntimeTransaction,
+    encoded: &str,
+) -> AppResult<()> {
+    lock_encoded_zip_intake_core(tx.db(), encoded, Some(tx)).await
+}
+
+async fn lock_encoded_zip_intake_core(
+    tx: &DatabaseTransaction,
+    encoded: &str,
+    runtime: Option<&crate::store::RuntimeTransaction>,
 ) -> AppResult<()> {
     super::lock_sqlite_writer_in_caller_transaction(tx).await?;
     let value: serde_json::Value =
@@ -73,11 +117,18 @@ pub(crate) async fn lock_encoded_zip_intake_in_transaction(
     if value.get("zip_intent").is_none() && value.get("legacy_zip_intent").is_none() {
         // Retain only pre-registry metadata fixtures, not a production fallback
         // from missing original capture to today's executable policy/account.
-        if super::domains::unregistered_legacy(tx, "zip-metadata-only").await? {
+        let budget = SharedDecodeBudget::default();
+        let work = DecodeWork::shared(&budget);
+        let catalog = runtime.map_or_else(|| ReceiptCatalog::full(tx), |owner| owner.catalog(work));
+        let schema = super::locks::AdmissionSchema::catalog(catalog).await?;
+        let unregistered =
+            super::domains::unregistered_legacy_in_schema(tx, "zip-metadata-only", &schema).await?;
+        schema.revalidate_catalog(catalog).await?;
+        if unregistered {
             return Ok(());
         }
         return Err(super::needs_attention());
     }
     let zip = crate::store::pinning::publication::decode_zip_capture_json(encoded)?;
-    lock_intake_in_caller_transaction(tx, Some(zip.source_decision()), Some(&zip)).await
+    lock_intake_core(tx, Some(zip.source_decision()), Some(&zip), runtime).await
 }

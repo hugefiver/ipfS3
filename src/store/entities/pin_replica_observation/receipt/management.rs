@@ -17,15 +17,16 @@ fn parsed<T: serde::de::DeserializeOwned>(raw: &str, work: DecodeWork<'_>) -> Re
     }
 }
 
-pub(crate) async fn fresh_complete_with_work<C: ConnectionTrait>(
-    db: &C,
+pub(crate) async fn fresh_complete_catalog(
+    catalog: legacy::ReceiptCatalog<'_>,
     provider: &str,
     cid: &str,
     route: &ProviderRouteSnapshot,
     now: DateTime<Utc>,
     work: DecodeWork<'_>,
 ) -> Result<bool> {
-    let provider = legacy::resource_key_budgeted(db, provider, cid, work).await?;
+    let db = &catalog;
+    let provider = legacy::resource_key_catalog(catalog, provider, cid, &work).await?;
     let Some(registered) =
         records::current_model::<pin_provider_route::Entity, _>(db, &[&provider], work).await?
     else {
@@ -38,12 +39,12 @@ pub(crate) async fn fresh_complete_with_work<C: ConnectionTrait>(
     if !read_route_compatible(route, &current) {
         return Ok(false);
     }
-    let keys = legacy::historical_keys_budgeted(
-        db,
+    let keys = legacy::historical_keys_catalog(
+        catalog,
         "pin_replica_observations",
         &provider,
         Some(cid),
-        work,
+        &work,
     )
     .await?;
     if keys.is_empty() {
@@ -74,12 +75,12 @@ pub(crate) async fn fresh_complete_with_work<C: ConnectionTrait>(
             .map_err(|_| ManagementError::InvalidEvidence)?;
         work.copy(&[("sequence", &sequence)])?;
         let key = [("sequence".into(), sequence.clone())].into();
-        let mapped = legacy::resolve_legacy_binding_with_work(
-            db,
+        let mapped = legacy::resolve_with_catalog(
             "pin_replica_observations",
             &key,
             &original,
-            work,
+            &work,
+            catalog,
         )
         .await?;
         if original == provider || mapped.is_some_and(|binding| binding.operational_key == provider)
@@ -104,7 +105,7 @@ pub(crate) async fn fresh_complete_with_work<C: ConnectionTrait>(
     if row.phase != "poll"
         || !matches!(row.outcome.as_str(), "Complete" | "Insufficient")
         || !read_route_compatible(route, &recorded)
-        || legacy::release_history_with_work(db, &provider, cid, work)
+        || legacy::release_history_current_catalog(catalog, &provider, cid, &work)
             .await?
             .iter()
             .any(|release| release.epoch >= row.remote_epoch)

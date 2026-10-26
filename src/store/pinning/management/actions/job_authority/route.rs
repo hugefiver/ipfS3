@@ -2,6 +2,7 @@
 use super::*;
 use crate::store::entities::pin_lease_target;
 
+#[cfg(test)]
 pub(crate) async fn historical_route<C: ConnectionTrait>(
     db: &C,
     job: &pin_job::Model,
@@ -35,9 +36,6 @@ pub(crate) async fn historical_route_store(
     store: &crate::store::Store,
     job: &pin_job::Model,
 ) -> AppResult<Option<ProviderRouteSnapshot>> {
-    if store.db().get_database_backend() != sea_orm::DatabaseBackend::Sqlite {
-        return historical_route(store.db(), job).await;
-    }
     let work = records::SharedDecodeBudget::default();
     let tx = store
         .begin_runtime(records::DecodeWork::shared(&work))
@@ -54,6 +52,7 @@ pub(crate) async fn historical_route_store(
 
 /// Resolve the permit and any management migration fallback from one complete
 /// action closure in a continuous admission read. Permits are freshly derived.
+#[cfg(test)]
 pub(crate) async fn admission_with_route<C: ConnectionTrait>(
     db: &C,
     job: &pin_job::Model,
@@ -69,6 +68,7 @@ pub(crate) async fn admission_with_route<C: ConnectionTrait>(
     admission_from_actions(db, job, &actions, work).await
 }
 
+#[cfg(test)]
 pub(in crate::store::pinning) async fn admission_from_actions<C: ConnectionTrait>(
     db: &C,
     job: &pin_job::Model,

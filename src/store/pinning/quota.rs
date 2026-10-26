@@ -519,9 +519,6 @@ pub(in crate::store::pinning) async fn reserve_runtime_unique(
     now: DateTimeUtc,
     work: DecodeWork<'_>,
 ) -> AppResult<ReservationOutcome> {
-    if tx.db().get_database_backend() != DatabaseBackend::Sqlite {
-        return reserve_unique(tx.db(), provider, cid, cid_size, limits, now).await;
-    }
     reserve_unique_for_intent_with_work(
         tx.db(),
         (provider, cid, cid_size),
@@ -861,6 +858,7 @@ pub(crate) async fn wake_runtime_provider_waiters(
 }
 
 /// Marks enough oldest reservations to satisfy the oldest active FIFO waiter after confirmation.
+#[cfg(test)]
 pub(crate) async fn evict_for_provider_waiter(
     db: &DatabaseTransaction,
     provider: &str,
@@ -870,7 +868,27 @@ pub(crate) async fn evict_for_provider_waiter(
     if super::ledger::submission::has_debt(db, provider).await? {
         return Ok(Vec::new());
     }
-    evict_for_required_headroom(db, provider, EvictionRequest::Waiter, limits, now).await
+    evict_for_required_headroom(db, provider, EvictionRequest::Waiter, limits, now, None).await
+}
+
+pub(crate) async fn evict_runtime_provider_waiter(
+    tx: &crate::store::RuntimeTransaction,
+    provider: &str,
+    limits: &ProviderLimits,
+    now: DateTimeUtc,
+) -> AppResult<Vec<leases::QuotaEvictedTarget>> {
+    if super::ledger::submission::has_debt(tx.db(), provider).await? {
+        return Ok(Vec::new());
+    }
+    evict_for_required_headroom(
+        tx.db(),
+        provider,
+        EvictionRequest::Waiter,
+        limits,
+        now,
+        Some(tx),
+    )
+    .await
 }
 
 /// Applies one bounded provider-quota response eviction while protecting the errored CID.
@@ -886,6 +904,7 @@ pub(crate) struct ProviderQuotaWork<'a> {
     pub expected_generation: i64,
 }
 
+#[cfg(test)]
 pub(crate) async fn evict_for_provider_quota(
     db: &DatabaseTransaction,
     provider: &str,
@@ -899,6 +918,25 @@ pub(crate) async fn evict_for_provider_quota(
         EvictionRequest::ProviderQuota(work),
         limits,
         now,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn evict_runtime_provider_quota(
+    tx: &crate::store::RuntimeTransaction,
+    provider: &str,
+    work: ProviderQuotaWork<'_>,
+    limits: &ProviderLimits,
+    now: DateTimeUtc,
+) -> AppResult<Vec<leases::QuotaEvictedTarget>> {
+    evict_for_required_headroom(
+        tx.db(),
+        provider,
+        EvictionRequest::ProviderQuota(work),
+        limits,
+        now,
+        Some(tx),
     )
     .await
 }
@@ -1171,7 +1209,7 @@ async fn assert_reusable_route_from_candidates(
             .await
         }
         None => {
-            super::legacy_migration::resource_binding_with_work(&catalog, provider, cid, work).await
+            super::legacy_migration::resource_binding_catalog(catalog, provider, cid, work).await
         }
     }
     .map_err(admission::work_error)?;
@@ -1258,12 +1296,12 @@ pub(in crate::store::pinning) async fn lock_runtime_allocation_admission(
     provider: &str,
     work: DecodeWork<'_>,
 ) -> AppResult<()> {
-    if tx.db().get_database_backend() != DatabaseBackend::Sqlite {
-        return lock_allocation_admission_with_work(tx.db(), provider, work).await;
-    }
     admission::lock_sqlite_writer_in_caller_transaction(tx.db()).await?;
     if admission::provider_registered_with_work(tx.db(), provider, work).await? {
         work.copy(provider).map_err(admission::work_error)?;
+        if tx.get_database_backend() == DatabaseBackend::Postgres {
+            work.copy(&[provider]).map_err(admission::work_error)?;
+        }
         lock_publication_usage_rows(tx.db(), &[provider.to_owned()]).await?;
     }
     admission::lock_runtime_provider(tx, provider, work).await
@@ -1776,6 +1814,7 @@ async fn evict_for_required_headroom(
     request: EvictionRequest<'_>,
     limits: &ProviderLimits,
     now: DateTimeUtc,
+    runtime: Option<&crate::store::RuntimeTransaction>,
 ) -> AppResult<Vec<leases::QuotaEvictedTarget>> {
     let initial = eviction_snapshot(db, provider, request, limits, now).await?;
     if initial.selected.is_empty() {
@@ -1804,7 +1843,7 @@ async fn evict_for_required_headroom(
         // the durable waiter scan or the next exact provider response will build a fresh frontier.
         return Ok(Vec::new());
     }
-    leases::evict_provider_cids(db, &revalidated.selected, now).await
+    leases::evict_provider_cids_core(db, &revalidated.selected, now, runtime).await
 }
 
 /// Builds a deterministic eviction decision without mutating state.

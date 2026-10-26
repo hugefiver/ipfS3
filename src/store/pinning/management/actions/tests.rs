@@ -37,6 +37,15 @@ pub(crate) async fn fixture_with_automatic(plan: &str, automatic: bool) -> Fixtu
             .replace('\\', "/")
     );
     let db = store::connect_database(&url).await.unwrap();
+    fixture_with_database(plan, automatic, db, directory).await
+}
+
+pub(crate) async fn fixture_with_database(
+    plan: &str,
+    automatic: bool,
+    db: DatabaseConnection,
+    directory: tempfile::TempDir,
+) -> Fixture {
     store::run_migrations(&db).await.unwrap();
     store::bucket::create(&db, "bucket", None).await.unwrap();
     let server = MockServer::start().await;

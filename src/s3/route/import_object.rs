@@ -264,7 +264,7 @@ impl ImportObjectRoute {
             if let ImportSource::Url(url) = &source {
                 self.coordinator.authorize_url_for_submission(url).await?;
             }
-            let status = import_intake::admit(self.state.store.db(), &intake).await?;
+            let status = import_intake::admit_store(&self.state.store, &intake).await?;
             return accepted_v2_response(&req.uri, &status);
         }
         if let Some(token) = client_token.as_deref()
@@ -450,18 +450,14 @@ impl ImportObjectRoute {
             tags,
             decompress_prefix: parsed_query.decompress_prefix,
         };
-        let submitted = if let Some(capture) = zip_intent {
-            ownership::submit_captured_zip(
-                self.state.store.db(),
-                request,
-                capture,
-                chrono::Utc::now(),
-            )
-            .await
-        } else {
-            ownership::submit_decided(self.state.store.db(), request, decision, chrono::Utc::now())
-                .await
-        };
+        let submitted = ownership::submit_store(
+            &self.state.store,
+            request,
+            Some(decision),
+            zip_intent,
+            chrono::Utc::now(),
+        )
+        .await;
         let job = match submitted.map_err(import_intake::map_token_conflict)? {
             SubmitImportOutcome::Created(job) | SubmitImportOutcome::Replayed(job) => job,
         };

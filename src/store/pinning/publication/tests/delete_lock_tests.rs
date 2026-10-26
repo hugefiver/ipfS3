@@ -78,9 +78,16 @@ async fn delete_attempt_uses_one_bucket_fence_and_rejects_stale_guard() {
     let fence_sql = ownership_fence_sql(&db, &meter).await;
 
     meter.begin();
-    let error = delete_version_attempt(&db, "bucket", "key", VersionSelector::Current, stale, now)
-        .await
-        .unwrap_err();
+    let error = delete_version_attempt(
+        (&db).into(),
+        "bucket",
+        "key",
+        VersionSelector::Current,
+        stale,
+        now,
+    )
+    .await
+    .unwrap_err();
     let stale_work = meter.finish();
     assert!(matches!(
         error,
@@ -90,10 +97,16 @@ async fn delete_attempt_uses_one_bucket_fence_and_rejects_stale_guard() {
     assert!(versions_for(&db, "key").await.is_empty());
 
     meter.begin();
-    let deleted =
-        delete_version_attempt(&db, "bucket", "key", VersionSelector::Current, winner, now)
-            .await
-            .unwrap();
+    let deleted = delete_version_attempt(
+        (&db).into(),
+        "bucket",
+        "key",
+        VersionSelector::Current,
+        winner,
+        now,
+    )
+    .await
+    .unwrap();
     let work = meter.finish();
     assert_eq!(work.statements.get(&fence_sql), Some(&1));
     assert!(deleted.created_delete_marker);
@@ -137,7 +150,7 @@ async fn delete_attempt_waits_for_versioning_update_and_reads_committed_state() 
     let mut deleting = tokio::spawn(async move {
         started.send(()).unwrap();
         delete_version_attempt(
-            &second,
+            (&second).into(),
             "bucket",
             "key",
             VersionSelector::Current,
@@ -212,9 +225,16 @@ async fn delete_attempt_file_sqlite_cost() {
                 .unwrap();
                 meter.begin();
                 let started = Instant::now();
-                delete_version_attempt(&db, "bucket", &key, VersionSelector::Current, guard, now)
-                    .await
-                    .unwrap();
+                delete_version_attempt(
+                    (&db).into(),
+                    "bucket",
+                    &key,
+                    VersionSelector::Current,
+                    guard,
+                    now,
+                )
+                .await
+                .unwrap();
                 wall += started.elapsed();
                 let item = meter.finish();
                 work.count += item.count;

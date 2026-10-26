@@ -4684,8 +4684,11 @@ async fn repeated_cid_reuse_keeps_unique_usage_and_advances_epoch_per_new_target
 }
 
 #[tokio::test]
-async fn concurrent_different_keys_sharing_a_remote_retry_rolled_back_sqlite_conflicts() {
-    let (_directory, db) = setup_file_backed("publication-shared-cid.sqlite").await;
+async fn independent_stores_sharing_a_remote_retry_rolled_back_sqlite_conflicts() {
+    let (_directory, db, peer) =
+        setup_independent_file_backed("publication-shared-cid.sqlite").await;
+    let first_store = crate::store::Store::new(db.clone());
+    let second_store = crate::store::Store::new(peer);
     let publication = |id: &str, key: &str| {
         request(
             object(id, key, "bafy-concurrent-shared", 7),
@@ -4701,8 +4704,16 @@ async fn concurrent_different_keys_sharing_a_remote_retry_rolled_back_sqlite_con
 
     let provider_limits = limits();
     let (first, second) = tokio::join!(
-        publish_object(&db, publication("concurrent-a", "key-a"), &provider_limits,),
-        publish_object(&db, publication("concurrent-b", "key-b"), &provider_limits,),
+        application::publish_object(
+            &first_store,
+            publication("concurrent-a", "key-a"),
+            &provider_limits,
+        ),
+        application::publish_object(
+            &second_store,
+            publication("concurrent-b", "key-b"),
+            &provider_limits,
+        ),
     );
     assert!(first.is_ok(), "first publication failed: {first:?}");
     assert!(second.is_ok(), "second publication failed: {second:?}");

@@ -107,6 +107,46 @@ pub async fn create_upload_with_zip_intent<C: ConnectionTrait>(
     decision: Option<&ExtensionDecision>,
     zip_intent: Option<&crate::pinning::zip_policy::CapturedZipIntent>,
 ) -> AppResult<()> {
+    create_upload_with_zip_intent_core(
+        db,
+        upload_id,
+        object_id,
+        bucket,
+        key,
+        encryption_mode,
+        key_wrap,
+        sse_c_key_fingerprint,
+        content_type,
+        metadata,
+        tags,
+        decompress_zip_target,
+        decompress_zip_result,
+        decision,
+        zip_intent,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn create_upload_with_zip_intent_core<C: ConnectionTrait>(
+    db: &C,
+    upload_id: &str,
+    object_id: &str,
+    bucket: &str,
+    key: &str,
+    encryption_mode: &str,
+    key_wrap: Option<&str>,
+    sse_c_key_fingerprint: Option<&str>,
+    content_type: Option<&str>,
+    metadata: Option<JsonValue>,
+    tags: &[ObjectTag],
+    decompress_zip_target: Option<&str>,
+    decompress_zip_result: bool,
+    decision: Option<&ExtensionDecision>,
+    zip_intent: Option<&crate::pinning::zip_policy::CapturedZipIntent>,
+    runtime: Option<&crate::store::RuntimeTransaction>,
+) -> AppResult<()> {
     let zip_intent_json = zip_intent
         .map(|capture| {
             if capture.bucket() != bucket
@@ -148,10 +188,20 @@ pub async fn create_upload_with_zip_intent<C: ConnectionTrait>(
         .transpose()?
         .flatten();
     let created_at = crate::store::database_clock::database_now(db).await?;
-    crate::store::pinning::management::admission::lock_intake_in_caller_transaction(
-        db, decision, zip_intent,
-    )
-    .await?;
+    match runtime {
+        Some(tx) => {
+            crate::store::pinning::management::admission::lock_runtime_intake(
+                tx, decision, zip_intent,
+            )
+            .await?
+        }
+        None => {
+            crate::store::pinning::management::admission::lock_intake_in_caller_transaction(
+                db, decision, zip_intent,
+            )
+            .await?
+        }
+    }
     let model = multipart_upload::ActiveModel {
         upload_id: Set(upload_id.to_owned()),
         object_id: Set(object_id.to_owned()),

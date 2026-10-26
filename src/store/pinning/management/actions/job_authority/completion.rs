@@ -17,6 +17,7 @@ impl<'a> CompletionReader<'a> {
         self.runtime
             .map(|tx| (tx, records::DecodeWork::shared(&self.work)))
     }
+    #[cfg(test)]
     pub(super) fn new(
         tx: &'a DatabaseTransaction,
         job: &'a pin_job::Model,
@@ -48,9 +49,10 @@ impl<'a> CompletionReader<'a> {
     }
 
     async fn validate(&self) -> AppResult<()> {
-        if let Some(tx) = self.runtime {
-            tx.check_schema(records::DecodeWork::shared(&self.work))
-                .await
+        if self.runtime.is_some() {
+            records::DecodeWork::shared(&self.work)
+                .with(|session| session.check())
+                .map_err(safe)
         } else {
             crate::store::pinning::management::schema::validate(self.tx)
                 .await

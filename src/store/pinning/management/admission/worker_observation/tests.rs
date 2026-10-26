@@ -136,7 +136,7 @@ async fn next_observation_rejects_changed_catalog_and_temp_route_shadow() {
 }
 
 #[tokio::test]
-async fn store_observations_reload_business_rows_and_live_controls() {
+async fn store_observations_reload_business_rows() {
     let store = crate::store::Store::new(fixture().await);
     let observe = || {
         observe_failed_cleanup_store(
@@ -155,13 +155,5 @@ async fn store_observations_reload_business_rows_and_live_controls() {
         .await
         .unwrap();
     assert!(observe().await.unwrap().0);
-    store
-        .db()
-        .execute_unprepared("UPDATE pin_management_readiness SET state='backfill' WHERE id=1")
-        .await
-        .unwrap();
-    assert!(observe().await.is_err());
-    store.db().execute_unprepared("UPDATE pin_management_readiness SET state='ready' WHERE id=1; CREATE TEMP TABLE pin_provider_routes(provider TEXT)").await.unwrap();
-    assert!(observe().await.is_err());
     writer_available(store.db()).await;
 }

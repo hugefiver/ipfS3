@@ -228,11 +228,13 @@ pub async fn register_configured_route<C: ConnectionTrait + TransactionTrait>(
 /// Gateway startup publishes the route and locator seal in its existing
 /// initialization transaction, without committing an independent registration.
 pub(crate) async fn register_configured_route_in_transaction(
-    tx: &sea_orm::DatabaseTransaction,
+    tx: &crate::store::RuntimeTransaction,
     key: &str,
     provider: &crate::pinning::config::ValidatedProvider,
 ) -> AppResult<()> {
-    super::management::admission::lock_registration_in_transaction(tx, key).await?;
+    let budget = super::management::records::SharedDecodeBudget::default();
+    let work = super::management::records::DecodeWork::shared(&budget);
+    super::management::admission::lock_runtime_registration(tx, key, work).await?;
     let snapshot = provider.route_snapshot();
     provider
         .validate_route_snapshot(&snapshot)
@@ -242,7 +244,14 @@ pub(crate) async fn register_configured_route_in_transaction(
             "configured provider allocation key changed".into(),
         ));
     }
-    register_snapshot(tx, key, &provider.identity, &snapshot).await
+    register_snapshot_core(
+        tx.db(),
+        key,
+        &provider.identity,
+        &snapshot,
+        Some((tx, work)),
+    )
+    .await
 }
 
 async fn register_snapshot(
@@ -251,14 +260,44 @@ async fn register_snapshot(
     identity: &ProviderIdentity,
     route: &ProviderRouteSnapshot,
 ) -> AppResult<()> {
-    super::legacy_migration::admission_schema(db)
-        .await
-        .map_err(|_| super::management::admission::needs_attention())?;
-    if super::legacy_migration::source_is_migrated(db, key).await? {
+    register_snapshot_core(db, key, identity, route, None).await
+}
+
+async fn register_snapshot_core(
+    db: &sea_orm::DatabaseTransaction,
+    key: &str,
+    identity: &ProviderIdentity,
+    route: &ProviderRouteSnapshot,
+    runtime: Option<(
+        &crate::store::RuntimeTransaction,
+        super::management::records::DecodeWork<'_>,
+    )>,
+) -> AppResult<()> {
+    let migrated = match runtime {
+        Some((tx, work)) => {
+            super::legacy_migration::source_is_migrated_catalog(tx.catalog(work), key, work)
+                .await
+                .map_err(super::management::admission::work_error)?
+        }
+        None => {
+            super::legacy_migration::admission_schema(db)
+                .await
+                .map_err(|_| super::management::admission::needs_attention())?;
+            super::legacy_migration::source_is_migrated(db, key).await?
+        }
+    };
+    if migrated {
         // Restart must not overwrite, resurrect or reallocate a migrated source.
         return Ok(());
     }
-    if super::management::admission::registration_closed(db, route).await? {
+    let closed = match runtime {
+        Some((tx, work)) => {
+            super::management::admission::registration_closed_catalog(tx.catalog(work), route, work)
+                .await?
+        }
+        None => super::management::admission::registration_closed(db, route).await?,
+    };
+    if closed {
         // Preserve the original route and receipt for read-only history. Neither
         // a new alias nor today's retired=false can reopen a permanent domain.
         return Ok(());
@@ -289,15 +328,18 @@ async fn register_snapshot(
     )
     .exec(db)
     .await?;
-    super::management::records::locator::rebuild_source(
-        db,
-        &super::management::native::NativeKey {
-            table: "pin_provider_routes".into(),
-            values: vec![key.into()],
-        },
-        &mut super::management::native::meter::Budget::default(),
-    )
-    .await
+    let key = super::management::native::NativeKey {
+        table: "pin_provider_routes".into(),
+        values: vec![key.into()],
+    };
+    let mut budget = super::management::native::meter::Budget::default();
+    match runtime {
+        Some((tx, work)) => {
+            super::management::records::locator::rebuild_runtime_source(tx, &key, &mut budget, work)
+                .await
+        }
+        None => super::management::records::locator::rebuild_source(db, &key, &mut budget).await,
+    }
     .map_err(super::management::admission::work_error)?;
     Ok(())
 }
@@ -328,9 +370,10 @@ pub(in crate::store::pinning) async fn verify_runtime_birth_routes(
     tx: &crate::store::RuntimeTransaction,
     expected: &BTreeMap<String, ProviderRouteSnapshot>,
     allocatable: &std::collections::BTreeSet<String>,
+    lock: bool,
     work: super::management::records::DecodeWork<'_>,
 ) -> AppResult<()> {
-    verify_birth_routes_core(tx.db(), expected, allocatable, true, Some((tx, work))).await
+    verify_birth_routes_core(tx.db(), expected, allocatable, lock, Some((tx, work))).await
 }
 
 async fn verify_birth_routes_core<C: ConnectionTrait>(
@@ -349,7 +392,11 @@ async fn verify_birth_routes_core<C: ConnectionTrait>(
         .map(|(_, route)| route.clone())
         .collect::<Vec<_>>();
     if let Some((tx, work)) = runtime {
-        super::management::admission::lock_runtime_routes(tx, &routes, work).await?;
+        if lock {
+            super::management::admission::lock_runtime_routes(tx, &routes, work).await?;
+        } else {
+            super::management::admission::check_runtime_open(tx, &routes, work).await?;
+        }
     } else if lock {
         // Existing publication/ZIP callers pass their prelocked business tx.
         super::management::admission::lock_in_caller_transaction(db, &routes).await?;
@@ -403,9 +450,6 @@ pub(crate) async fn get_store(
     provider: &str,
     cid: &str,
 ) -> AppResult<Option<remote_pin_ledger::Model>> {
-    if store.db().get_database_backend() != DatabaseBackend::Sqlite {
-        return get(store.db(), provider, cid).await;
-    }
     let session = super::management::records::SharedDecodeBudget::default();
     let work = super::management::records::DecodeWork::shared(&session);
     let tx = store.begin_runtime(work).await?;
@@ -618,7 +662,7 @@ pub(in crate::store::pinning) async fn get_from_catalog(
     .map_err(super::management::admission::work_error)
 }
 
-pub(in crate::store::pinning) async fn get_catalog(
+pub(crate) async fn get_catalog(
     catalog: super::legacy_migration::ReceiptCatalog<'_>,
     provider: &str,
     cid: &str,
@@ -954,6 +998,7 @@ fn route_compatible(mut route: ProviderRouteSnapshot, identity: &ProviderIdentit
 
 /// Every IO-capable non-Submit job uses the route captured on creation. Legacy
 /// jobs without a capture cannot borrow a later lifetime's allocation route.
+#[cfg(test)]
 pub(crate) async fn job_route_matches<C: ConnectionTrait>(
     db: &C,
     job: &crate::store::entities::pin_job::Model,
@@ -986,6 +1031,7 @@ pub(crate) enum JobAdmission {
 }
 
 /// One read-only claimed-job admission. No authority view survives this call.
+#[cfg(test)]
 pub(crate) async fn job_io_and_route_with_work<C: ConnectionTrait>(
     db: &C,
     job: &pin_job::Model,
@@ -1189,18 +1235,6 @@ pub(crate) async fn job_route<C: ConnectionTrait>(
 
 /// Last new-POST fence for every provider family. Recovery GETs and callbacks
 /// intentionally do not use this admission check.
-pub(crate) async fn submit_dispatch_open<C: ConnectionTrait>(
-    db: &C,
-    job: &pin_job::Model,
-) -> AppResult<bool> {
-    let work = super::management::records::SharedDecodeBudget::default();
-    submit_dispatch_open_with_work(
-        db,
-        job,
-        super::management::records::DecodeWork::shared(&work),
-    )
-    .await
-}
 pub(crate) async fn submit_dispatch_open_with_work<C: ConnectionTrait>(
     db: &C,
     job: &pin_job::Model,
@@ -1240,9 +1274,6 @@ pub(crate) async fn submit_dispatch_open_store(
     store: &crate::store::Store,
     job: &pin_job::Model,
 ) -> AppResult<bool> {
-    if store.db().get_database_backend() != DatabaseBackend::Sqlite {
-        return submit_dispatch_open(store.db(), job).await;
-    }
     let session = super::management::records::SharedDecodeBudget::default();
     let work = super::management::records::DecodeWork::shared(&session);
     let tx = store.begin_runtime(work).await?;
@@ -1379,18 +1410,6 @@ pub(crate) async fn observe_runtime_claimed(
     now: DateTime<Utc>,
     work: super::management::records::DecodeWork<'_>,
 ) -> AppResult<()> {
-    if tx.db().get_database_backend() != DatabaseBackend::Sqlite {
-        return observe_core(
-            tx.db(),
-            &job.provider,
-            &job.cid,
-            observed,
-            now,
-            Some((job, request_id, has_desired_refs)),
-            None,
-        )
-        .await;
-    }
     observe_core(
         tx.db(),
         &job.provider,
@@ -1633,7 +1652,7 @@ async fn cleanup_from_candidates_core(
         // A fresh lifetime may mask a binding without removing its identity alias.
         get_from_catalog(provider, cid, &candidates, work, catalog).await?
     } else {
-        if super::legacy_migration::resource_binding_with_work(&catalog, provider, cid, work)
+        if super::legacy_migration::resource_binding_catalog(catalog, provider, cid, work)
             .await
             .map_err(super::management::admission::work_error)?
             .is_some()

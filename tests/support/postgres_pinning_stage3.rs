@@ -44,10 +44,8 @@ where
     let result = AssertUnwindSafe(async {
         let mut options = ConnectOptions::new(url);
         options.min_connections(1).max_connections(1);
+        options.set_schema_search_path(schema.clone());
         let db = Database::connect(options).await.unwrap();
-        db.execute_unprepared(&format!("SET search_path TO {schema}"))
-            .await
-            .unwrap();
         db.execute_unprepared("SET statement_timeout TO '15s'")
             .await
             .unwrap();

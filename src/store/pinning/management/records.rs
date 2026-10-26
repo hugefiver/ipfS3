@@ -170,7 +170,7 @@ pub use imported::{load_confirmed_from_imported, load_review_from_imported};
 pub(crate) use index::action_at_key_with_work;
 pub(crate) use index::actions_at_keys_catalog;
 pub(crate) use index::actions_at_keys_with_work;
-pub(crate) use index::actions_for_plan_with_work;
+pub(crate) use index::{actions_for_plan_catalog, actions_for_plan_with_work};
 pub(crate) use inspection::{RecordPayload, inspect_original_row, inspect_original_row_with_work};
 pub(crate) use inspection::{inspect_retirement_review_with_work, inspect_review_with_work};
 #[cfg(test)]

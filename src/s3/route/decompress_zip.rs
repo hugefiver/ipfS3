@@ -996,7 +996,9 @@ impl DecompressZipRoute {
                     "tags": tags,
                 })
                 .to_string();
-                let admitted = crate::store::zip::admit(self.state.store.db(), &admission).await?;
+                let admitted =
+                    crate::store::zip::BatchAdmission::admit_store(&self.state.store, &admission)
+                        .await?;
                 let zip_intent = decode_zip_capture_json(&admitted.captured_options)?;
                 if zip_intent.origin().request_id != batch_id
                     || zip_intent.origin().principal_id != principal

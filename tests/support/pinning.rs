@@ -464,6 +464,18 @@ impl ProviderRequestBlock {
 }
 
 pub async fn start_pinning_harness(config: PinningHarnessConfig) -> PinningHarness {
+    let mut options = sea_orm::ConnectOptions::new("sqlite::memory:");
+    options.test_before_acquire(false);
+    let db = sea_orm::Database::connect(options)
+        .await
+        .expect("in-memory SQLite database");
+    start_pinning_harness_with_database(config, db).await
+}
+
+pub async fn start_pinning_harness_with_database(
+    config: PinningHarnessConfig,
+    db: sea_orm::DatabaseConnection,
+) -> PinningHarness {
     let pinata = MockServer::start().await;
     let filebase = MockServer::start().await;
     let pinata_script = Arc::new(PsaScriptState::new(config.pinata_script, PINATA_TOKEN));
@@ -540,11 +552,6 @@ pub async fn start_pinning_harness(config: PinningHarnessConfig) -> PinningHarne
     let pinning = PinningCoordinator::build(validated).expect("build test pinning coordinator");
 
     let KuboHarness { server: kubo, .. } = start_kubo_harness(config.kubo_script).await;
-    let mut options = sea_orm::ConnectOptions::new("sqlite::memory:");
-    options.test_before_acquire(false);
-    let db = sea_orm::Database::connect(options)
-        .await
-        .expect("in-memory SQLite database");
     ipfs_s3_gateway::store::run_migrations(&db)
         .await
         .expect("run test migrations");

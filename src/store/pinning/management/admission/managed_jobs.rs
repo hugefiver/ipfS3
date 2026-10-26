@@ -1,4 +1,5 @@
 //! Exact applied-batch execution scope. Neither caller IDs nor confirm TTL grant IO.
+use crate::store::pinning::legacy_migration::ReceiptCatalog;
 use crate::{
     error::{AppError, AppResult},
     store::{
@@ -36,40 +37,16 @@ impl ManagedCall {
     }
 }
 
-pub(crate) async fn managed_call_allowed<C: ConnectionTrait>(
-    db: &C,
-    job: &pin_job::Model,
-    call: ManagedCall,
-) -> AppResult<bool> {
-    managed_call_allowed_with_work(db, job, call, records::SharedDecodeBudget::default()).await
-}
-
 pub(crate) async fn managed_call_allowed_store(
     store: &crate::store::Store,
     job: &pin_job::Model,
     call: ManagedCall,
 ) -> AppResult<bool> {
-    if store.db().get_database_backend() != sea_orm::DatabaseBackend::Sqlite {
-        return managed_call_allowed(store.db(), job, call).await;
-    }
     let permit =
         job_authority::check_before_call_store(store, job, records::SharedDecodeBudget::default())
             .await?;
     Ok(call.allows(&job.operation, permit.as_ref()))
 }
-pub(crate) async fn managed_call_allowed_with_work<C: ConnectionTrait>(
-    db: &C,
-    job: &pin_job::Model,
-    call: ManagedCall,
-    work: records::SharedDecodeBudget,
-) -> AppResult<bool> {
-    let permit = job_authority::check_before_call_with_work(db, job, work)
-        .await
-        .map_err(job_authority::safe)?;
-    // Ordinary jobs still pass their original operation/retirement fences.
-    Ok(call.allows(&job.operation, permit.as_ref()))
-}
-
 /// Constructible only through the record layer's complete original applied
 /// receipt validation. Authority is re-read at claim, dispatch and completion;
 /// heartbeat renewal only retains the exact processing lock.
@@ -204,19 +181,22 @@ impl ManagementJobScope {
 
     #[cfg(test)]
     pub(crate) async fn revalidate<C: ConnectionTrait>(&self, db: &C) -> AppResult<()> {
-        self.revalidate_with_work(db, records::SharedDecodeBudget::default())
-            .await
+        self.revalidate_catalog(
+            ReceiptCatalog::full(db),
+            records::SharedDecodeBudget::default(),
+        )
+        .await
     }
-    pub(crate) async fn revalidate_with_work<C: ConnectionTrait>(
+    pub(crate) async fn revalidate_catalog(
         &self,
-        db: &C,
+        catalog: ReceiptCatalog<'_>,
         work: records::SharedDecodeBudget,
     ) -> AppResult<()> {
-        self.auth.check(db).await.map_err(|_| invalid())?;
+        self.auth.check(&catalog).await.map_err(|_| invalid())?;
         // lookup_committed validates the original private binding without
         // treating an already committed confirmation TTL as a job deadline.
-        let current = records::actions_for_plan_with_work(
-            db,
+        let current = records::actions_for_plan_catalog(
+            catalog,
             &self.auth,
             &self.review.view().request.plan_id,
             work,
@@ -288,13 +268,13 @@ impl ManagementJobScope {
         Ok(selected)
     }
 
-    pub(crate) async fn contains_with_work<C: ConnectionTrait>(
+    pub(crate) async fn contains_catalog(
         &self,
-        db: &C,
+        catalog: ReceiptCatalog<'_>,
         job: &pin_job::Model,
         work: records::SharedDecodeBudget,
     ) -> AppResult<bool> {
-        let Some(authority) = job_authority::lookup_with_work(db, job, work.clone())
+        let Some(authority) = job_authority::lookup_catalog(catalog, job, work.clone())
             .await
             .map_err(|_| invalid())?
         else {
@@ -317,12 +297,28 @@ impl ManagementJobScope {
         Ok(false)
     }
 
-    pub(crate) async fn report<C: ConnectionTrait>(
+    pub(crate) async fn report(
         &self,
-        db: &C,
+        store: &crate::store::Store,
     ) -> AppResult<ManagementJobReport> {
         let work = records::SharedDecodeBudget::default();
-        self.revalidate_with_work(db, work.clone()).await?;
+        let tx = store
+            .begin_runtime(records::DecodeWork::shared(&work))
+            .await?;
+        let result = self
+            .report_catalog(tx.catalog(records::DecodeWork::shared(&work)), work.clone())
+            .await;
+        tx.rollback().await?;
+        result
+    }
+
+    async fn report_catalog(
+        &self,
+        catalog: ReceiptCatalog<'_>,
+        work: records::SharedDecodeBudget,
+    ) -> AppResult<ManagementJobReport> {
+        let db = &catalog;
+        self.revalidate_catalog(catalog, work.clone()).await?;
         let mut ids = self
             .seeds
             .iter()
@@ -333,7 +329,7 @@ impl ManagementJobScope {
             .all(db)
             .await?
         {
-            if self.contains_with_work(db, &job, work.clone()).await? {
+            if self.contains_catalog(catalog, &job, work.clone()).await? {
                 ids.push(job.id);
             }
         }
@@ -341,10 +337,14 @@ impl ManagementJobScope {
         ids.dedup();
         let mut items = Vec::new();
         let view = self.review.view();
-        for trusted in
-            records::actions_for_plan_with_work(db, &self.auth, &view.request.plan_id, work.clone())
-                .await
-                .map_err(|_| invalid())?
+        for trusted in records::actions_for_plan_catalog(
+            catalog,
+            &self.auth,
+            &view.request.plan_id,
+            work.clone(),
+        )
+        .await
+        .map_err(|_| invalid())?
         {
             if trusted.binding() != view {
                 return Err(invalid());
@@ -353,7 +353,7 @@ impl ManagementJobScope {
                 .copy(trusted.action_view())
                 .map_err(|_| invalid())?;
             let mut action = trusted.action_view().clone();
-            action.state = status::current_state_with_work(db, &action, work.clone())
+            action.state = status::current_state_catalog(catalog, &action, work.clone())
                 .await
                 .map_err(|_| invalid())?;
             items.push(action);

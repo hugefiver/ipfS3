@@ -168,7 +168,14 @@ async fn capture_inner(
     )?;
     // Includes empty memberships, private NULL cells and every exact authority
     // generation. Worker write callers retain the ordered tail fences.
-    native::scope::check_frame_scope(db, &frame, budget).await?;
+    match catalog {
+        ReceiptCatalog::Runtime(tx, _) => {
+            native::scope::check_runtime_frame_scope(tx, &frame, budget, context).await?;
+        }
+        _ => {
+            native::scope::check_frame_scope(db, &frame, budget).await?;
+        }
+    }
     Ok(frame)
 }
 

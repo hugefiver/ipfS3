@@ -115,12 +115,41 @@ pub(crate) async fn validate_for_upgrade<C: ConnectionTrait>(db: &C) -> Result<V
 }
 
 async fn validate_state<C: ConnectionTrait>(db: &C, backfill: bool) -> Result<Vec<String>> {
+    reject_sqlite_shadows(db).await?;
     let versions = read_versions(db).await?;
     storage::validate_schema(db, backfill).await?;
     if db.get_database_backend() == DatabaseBackend::Postgres {
         postgres::validate(db).await?;
     }
     Ok(versions)
+}
+
+// Identifier folding is ASCII; BLOB equality cannot invoke overridden collations.
+async fn reject_sqlite_shadows<C: ConnectionTrait>(db: &C) -> Result<()> {
+    if db.get_database_backend() != DatabaseBackend::Sqlite {
+        return Ok(());
+    }
+    let mut names = std::collections::BTreeSet::new();
+    names.extend(
+        super::native::current_catalog()
+            .iter()
+            .map(|table| table.table.as_str()),
+    );
+    let tables = storage::tables(DatabaseBackend::Sqlite);
+    names.extend(tables.iter().map(|(name, _)| *name));
+    names.extend(storage::SOURCE_TABLES.iter().copied());
+    names.extend([RECORDS, RETIREMENTS, "seaql_migrations"]);
+    let names = names
+        .into_iter()
+        .map(|name| format!("X'{}'", hex::encode(name.to_ascii_lowercase().as_bytes())))
+        .collect::<Vec<_>>()
+        .join(",");
+    if db.query_one(Statement::from_string(DatabaseBackend::Sqlite, format!(
+        "SELECT 1 FROM sqlite_temp_schema WHERE type IN ('table','view') AND CAST(lower(name) AS BLOB) IN ({names}) LIMIT 1"
+    ))).await.map_err(|_| ManagementError::Schema)?.is_some() {
+        return Err(ManagementError::Schema);
+    }
+    Ok(())
 }
 
 pub(in crate::store::pinning) async fn read_versions<C: ConnectionTrait>(

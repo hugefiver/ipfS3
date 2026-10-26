@@ -414,7 +414,7 @@ impl PinningCoordinator {
     /// Register the current allocation routes before accepting publications.
     /// Existing resource snapshots are never overwritten by this operation.
     pub async fn register_identities(&self, store: &Store) -> crate::error::AppResult<()> {
-        use sea_orm::TransactionTrait;
+        use crate::store::pinning::management::records::{DecodeWork, SharedDecodeBudget};
         // Match provider construction: canonical order, first alias per allocation.
         // The validated route also captures its confirmation requirement.
         let mut registered = std::collections::HashSet::new();
@@ -422,7 +422,8 @@ impl PinningCoordinator {
             if !registered.insert(&provider.name) {
                 continue;
             }
-            let tx = store.db().begin().await?;
+            let work = SharedDecodeBudget::default();
+            let tx = store.begin_runtime(DecodeWork::shared(&work)).await?;
             crate::store::pinning::ledger::register_configured_route_in_transaction(
                 &tx,
                 &provider.name,

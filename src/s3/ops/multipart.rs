@@ -238,8 +238,8 @@ pub async fn create_multipart_upload(
                 "ZIP multipart Create request conflict"
             ));
         }
-        let original_id = crate::store::multipart::v2_zip::create_or_replay_with_zip_intent(
-            db,
+        let original_id = crate::store::multipart::v2_zip::create_or_replay_store(
+            &state.store,
             &crate::store::multipart::v2_zip::Intake {
                 upload_id,
                 object_id,
@@ -350,7 +350,11 @@ pub async fn create_multipart_upload(
         EncryptionMode::None => (None, None),
     };
 
-    let txn = db.begin().await.map_err(crate::error::AppError::from)?;
+    let work = crate::store::pinning::management::records::SharedDecodeBudget::default();
+    let txn = state
+        .store
+        .begin_runtime(crate::store::pinning::management::records::DecodeWork::shared(&work))
+        .await?;
     crate::store::import::ownership::lock_bucket_for_ownership(&txn, bucket).await?;
     if let Some(intent) = &zip_intent {
         let mut admission = crate::s3::route::decompress_zip::legacy_batch_admission(
@@ -371,8 +375,7 @@ pub async fn create_multipart_upload(
         })
         .to_string();
         let original =
-            crate::store::zip::BatchAdmission::admit_legacy_in_transaction(&txn, &admission)
-                .await?;
+            crate::store::zip::BatchAdmission::admit_legacy_runtime(&txn, &admission).await?;
         if crate::store::pinning::publication::decode_zip_capture_json(&original.captured_options)?
             != *intent
         {
@@ -382,7 +385,7 @@ pub async fn create_multipart_upload(
             ));
         }
     }
-    crate::store::multipart::create_upload_with_zip_intent(
+    crate::store::multipart::create_upload_with_zip_intent_core(
         &txn,
         &upload_id,
         &object_id,
@@ -398,9 +401,10 @@ pub async fn create_multipart_upload(
         decompress_zip_result,
         Some(&decision),
         zip_intent.as_ref(),
+        Some(&txn),
     )
     .await?;
-    txn.commit().await.map_err(crate::error::AppError::from)?;
+    txn.commit().await?;
 
     let server_side_encryption = if enc_mode == EncryptionMode::SseS3 {
         Some(ServerSideEncryption::from_static("AES256"))
@@ -1805,7 +1809,7 @@ pub async fn complete_multipart_upload_inner(
     // Publication will lock and recheck the same route after the usage frontier.
     if let Some(intent) = &zip_intent {
         crate::store::pinning::publication::preflight_captured_zip_routes(
-            db,
+            &state.store,
             intent,
             state.pinning.effective_config(),
             None,

@@ -339,12 +339,8 @@ async fn runtime_wake_operator_debt_preserves_the_queued_admission() {
 }
 
 #[tokio::test]
-async fn runtime_wake_rechecks_live_readiness_before_even_an_empty_candidate_scan() {
+async fn cold_runtime_rejects_unready_database_before_a_candidate_scan() {
     let store = fixture().await;
-    store
-        .qualify_runtime_schema(DecodeWork::shared(&SharedDecodeBudget::default()))
-        .await
-        .unwrap();
     store
         .db()
         .execute_unprepared("UPDATE pin_management_readiness SET state='backfill' WHERE id=1")
@@ -352,12 +348,6 @@ async fn runtime_wake_rechecks_live_readiness_before_even_an_empty_candidate_sca
         .unwrap();
     let session = SharedDecodeBudget::default();
     let work = DecodeWork::shared(&session);
-    let tx = store.begin_runtime(work).await.unwrap();
-    assert!(
-        wake_runtime_provider_waiters(&tx, "pinata", &limits(), Utc::now(), work)
-            .await
-            .is_err()
-    );
-    tx.rollback().await.unwrap();
+    assert!(store.begin_runtime(work).await.is_err());
     assert_eq!(pin_job::Entity::find().count(store.db()).await.unwrap(), 0);
 }

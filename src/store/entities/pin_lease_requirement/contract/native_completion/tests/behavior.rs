@@ -280,7 +280,9 @@ async fn canonical_aliases_count_logical_combinations_but_non_rpc_keys_stay_raw(
         completion(&db, "one-lease", now).await.unwrap(),
         Some((true, true, 3))
     );
-    let resolved = candidates(&db, "native-lease", &birth).await.unwrap();
+    let resolved = candidates(ReceiptCatalog::full(&db), "native-lease", &birth)
+        .await
+        .unwrap();
     let combinations = batch::combinations(&birth, &resolved).collect::<Vec<_>>();
     assert_eq!(combinations.len(), 4);
     let page = batch::Page::load(&db, "native-lease", &combinations)
@@ -316,7 +318,9 @@ async fn cluster_pinning_and_invalid_cid_fallback_keep_original_query_semantics(
         remote(&db, slot, "invalid-cid", "pinning", &route("rpc"), now).await;
         target(&db, "native-lease", slot, "invalid-cid", now).await;
     }
-    let resolved = candidates(&db, "native-lease", &birth).await.unwrap();
+    let resolved = candidates(ReceiptCatalog::full(&db), "native-lease", &birth)
+        .await
+        .unwrap();
     let combinations = batch::combinations(&birth, &resolved).collect::<Vec<_>>();
     assert!(
         combinations

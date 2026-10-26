@@ -1270,8 +1270,8 @@ pub async fn delete_object(
     crate::store::import::ownership::run_mutation(db, &mutation_guard.clone(), |lease| async move {
         let result = lease
             .commit(
-                crate::store::pinning::publication::delete_version_with_leases_guarded(
-                    db,
+                crate::store::pinning::publication::delete_runtime_version_with_leases_guarded(
+                    &state.store,
                     bucket,
                     key,
                     selector,
@@ -1419,8 +1419,8 @@ pub async fn delete_objects(
             async move {
                 lease
                     .commit(
-                        crate::store::pinning::publication::delete_version_with_leases_guarded(
-                            db,
+                        crate::store::pinning::publication::delete_runtime_version_with_leases_guarded(
+                            &state.store,
                             bucket,
                             key,
                             selector,

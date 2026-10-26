@@ -12,8 +12,6 @@ use crate::pinning::tags::ObjectTag;
 use crate::pinning::zip_policy::CapturedZipIntent;
 use crate::zip::options::ZipV2Options;
 
-use super::create_upload_with_zip_intent;
-
 mod capture;
 
 #[derive(Clone, Debug)]
@@ -598,10 +596,35 @@ pub async fn create_or_replay_with_zip_intent(
     create(db, request, Some(intent)).await
 }
 
+pub(crate) async fn create_or_replay_store(
+    store: &crate::store::Store,
+    request: &Intake,
+    intent: &CapturedZipIntent,
+) -> AppResult<String> {
+    use crate::store::pinning::management::records::{DecodeWork, SharedDecodeBudget};
+    let work = SharedDecodeBudget::default();
+    let tx = store.begin_runtime(DecodeWork::shared(&work)).await?;
+    let id = create_in_transaction(tx.db(), request, Some(intent), Some(&tx)).await?;
+    tx.commit().await?;
+    Ok(id)
+}
+
 async fn create(
     db: &DatabaseConnection,
     request: &Intake,
     intent: Option<&CapturedZipIntent>,
+) -> AppResult<String> {
+    let tx = db.begin().await?;
+    let id = create_in_transaction(&tx, request, intent, None).await?;
+    tx.commit().await?;
+    Ok(id)
+}
+
+async fn create_in_transaction(
+    tx: &DatabaseTransaction,
+    request: &Intake,
+    intent: Option<&CapturedZipIntent>,
+    runtime: Option<&crate::store::RuntimeTransaction>,
 ) -> AppResult<String> {
     if (!request.options.publish_extracted && !request.options.publish_source)
         || request.options.token != request.token
@@ -612,25 +635,23 @@ async fn create(
         ));
     }
     let request_fingerprint = hex::encode(Sha256::digest(request.request_contract.as_bytes()));
-    let tx = db.begin().await?;
-    crate::store::import::ownership::lock_bucket_for_ownership(&tx, &request.bucket).await?;
+    crate::store::import::ownership::lock_bucket_for_ownership(tx, &request.bucket).await?;
     if let Some(original) = tx
         .query_one(query(
-            &tx,
+            tx,
             "SELECT id FROM zip_v2_executions WHERE owner=? AND source='mpu' AND token=?",
             "SELECT id FROM zip_v2_executions WHERE owner=$1 AND source='mpu' AND token=$2",
             vec![request.owner.clone().into(), request.token.clone().into()],
         ))
         .await?
     {
-        let id = replay(&tx, &original.try_get::<String>("", "id")?, request, intent).await?;
-        tx.commit().await?;
+        let id = replay(tx, &original.try_get::<String>("", "id")?, request, intent).await?;
         return Ok(id);
     }
     let intent = intent.ok_or_else(capture::attention)?;
     let captured_options = capture::envelope(request, intent)?;
-    let execution = crate::store::zip::execution::admit_in_transaction(
-        &tx,
+    let execution = crate::store::zip::execution::admit_in_transaction_core(
+        tx,
         &crate::store::zip::execution::Admission {
             id: request.upload_id.clone(),
             owner: request.owner.clone(),
@@ -642,6 +663,7 @@ async fn create(
             source_key: request.key.clone(),
             captured_options: captured_options.clone(),
         },
+        runtime,
     )
     .await
     .map_err(|error| match error {
@@ -649,12 +671,11 @@ async fn create(
         other => other,
     })?;
     if execution.id != request.upload_id {
-        let old = replay(&tx, &execution.id, request, Some(intent)).await?;
-        tx.commit().await?;
+        let old = replay(tx, &execution.id, request, Some(intent)).await?;
         return Ok(old);
     }
-    create_upload_with_zip_intent(
-        &tx,
+    super::create_upload_with_zip_intent_core(
+        tx,
         &request.upload_id,
         &request.object_id,
         &request.bucket,
@@ -669,10 +690,11 @@ async fn create(
         intent.controls().result_enabled,
         Some(intent.source_decision()),
         Some(intent),
+        runtime,
     )
     .await?;
-    let now = crate::store::database_clock::database_now(&tx).await?;
-    tx.execute(query(&tx,
+    let now = crate::store::database_clock::database_now(tx).await?;
+    tx.execute(query(tx,
         "INSERT INTO zip_v2_mpu_intakes (original_upload_id,active_upload_id,execution_id,owner,token,bucket,archive_key,target_prefix,request_fingerprint,captured_options,captured_config,rule_revision,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
         "INSERT INTO zip_v2_mpu_intakes (original_upload_id,active_upload_id,execution_id,owner,token,bucket,archive_key,target_prefix,request_fingerprint,captured_options,captured_config,rule_revision,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
         vec![request.upload_id.clone().into(),request.upload_id.clone().into(),execution.id.into(),
@@ -680,6 +702,5 @@ async fn create(
              request.key.clone().into(),request.target_prefix.clone().into(),request_fingerprint.into(),
              captured_options.into(),request.captured_config.clone().into(),request.rule_revision.clone().into(),now.into()]
     )).await?;
-    tx.commit().await?;
     Ok(request.upload_id.clone())
 }

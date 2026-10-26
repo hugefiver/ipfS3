@@ -2,6 +2,7 @@
 //! before and after the read, never cached as an execution permission.
 use super::*;
 use crate::store::pinning::legacy_migration as legacy;
+use legacy::ReceiptCatalog;
 #[cfg(test)]
 use sea_orm::Statement;
 
@@ -16,8 +17,24 @@ pub(super) async fn management_participates<C: ConnectionTrait>(
     lease_id: &str,
     work: SharedDecodeBudget,
 ) -> management::Result<bool> {
+    management_participates_catalog(
+        crate::store::pinning::legacy_migration::ReceiptCatalog::full(db),
+        lease_id,
+        work,
+    )
+    .await
+}
+
+pub(super) async fn management_participates_catalog(
+    catalog: crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
+    lease_id: &str,
+    work: SharedDecodeBudget,
+) -> management::Result<bool> {
+    let db = &catalog;
     let context = DecodeWork::shared(&work);
-    if management::admission::authority::lease_participates(db, lease_id, context).await? {
+    if management::admission::authority::lease_participates_catalog(catalog, lease_id, context)
+        .await?
+    {
         return Ok(true);
     }
     if management::records::current_model::<super::super::super::pin_lease::Entity, _>(
@@ -33,8 +50,8 @@ pub(super) async fn management_participates<C: ConnectionTrait>(
     Ok(false)
 }
 
-async fn candidates<C: ConnectionTrait>(
-    db: &C,
+async fn candidates(
+    catalog: ReceiptCatalog<'_>,
     lease_id: &str,
     birth: &BirthContract,
 ) -> AppResult<Vec<(String, String)>> {
@@ -42,9 +59,10 @@ async fn candidates<C: ConnectionTrait>(
     let mut seen = std::collections::BTreeSet::new();
     let mut result = Vec::new();
     for slot in &birth.candidate_order {
-        let allocation = legacy::resolve_legacy_binding(db, "pin_lease_requirements", &key, slot)
-            .await?
-            .map_or_else(|| slot.clone(), |binding| binding.operational_key);
+        let allocation =
+            legacy::resolve_with_catalog("pin_lease_requirements", &key, slot, &(), catalog)
+                .await?
+                .map_or_else(|| slot.clone(), |binding| binding.operational_key);
         if !seen.insert(allocation.clone()) {
             return Err(AppError::InvalidPinningRequest(
                 "duplicate native candidate allocation".into(),
@@ -62,17 +80,27 @@ pub(super) async fn target_confirmed<C: ConnectionTrait>(
     cid: &str,
     now: DateTime<Utc>,
 ) -> AppResult<bool> {
+    let catalog = ReceiptCatalog::full(db);
     let birth = get(db, lease_id).await?;
     let resolved = if let Some(birth) = &birth {
-        candidates(db, lease_id, birth).await?
+        candidates(catalog, lease_id, birth).await?
     } else {
         vec![]
     };
-    target_confirmed_for_birth(db, lease_id, provider, cid, now, birth.as_ref(), &resolved).await
+    target_confirmed_for_birth(
+        catalog,
+        lease_id,
+        provider,
+        cid,
+        now,
+        birth.as_ref(),
+        &resolved,
+    )
+    .await
 }
 
-async fn target_confirmed_for_birth<C: ConnectionTrait>(
-    db: &C,
+async fn target_confirmed_for_birth(
+    catalog: ReceiptCatalog<'_>,
     lease_id: &str,
     provider: &str,
     cid: &str,
@@ -80,6 +108,7 @@ async fn target_confirmed_for_birth<C: ConnectionTrait>(
     birth: Option<&BirthContract>,
     resolved: &[(String, String)],
 ) -> AppResult<bool> {
+    let db = &catalog;
     let selected = resolved
         .iter()
         .filter(|(slot, allocation)| slot == provider || allocation == provider)
@@ -90,13 +119,20 @@ async fn target_confirmed_for_birth<C: ConnectionTrait>(
     let allocation = selected
         .first()
         .map_or(provider, |(_, allocation)| allocation.as_str());
-    if legacy::resource_binding(db, allocation, cid)
+    if legacy::resource_binding_current_catalog(catalog, allocation, cid)
         .await?
         .is_some_and(|binding| binding.historical_route.is_none())
     {
         return Ok(false);
     }
-    let ledger = crate::store::pinning::ledger::get(db, allocation, cid).await?;
+    let work = SharedDecodeBudget::default();
+    let ledger = crate::store::pinning::ledger::get_catalog(
+        catalog,
+        allocation,
+        cid,
+        DecodeWork::shared(&work),
+    )
+    .await?;
     let Some(route) = ledger
         .as_ref()
         .and_then(|row| row.route.as_deref())
@@ -161,19 +197,29 @@ async fn target_confirmed_for_birth<C: ConnectionTrait>(
             return Ok(false);
         };
         required.confirmation = Some(confirmation);
-        return super::super::super::pin_replica_observation::receipt::fresh_complete(
-            db, allocation, cid, &required, now,
+        return super::super::super::pin_replica_observation::receipt::fresh_complete_current_catalog(
+            catalog, allocation, cid, &required, now,
         )
         .await;
     }
     Ok(ledger.is_some_and(|row| row.effect == "confirmed"))
 }
 
-pub(super) async fn completion<C: ConnectionTrait>(
+#[cfg(test)]
+async fn completion<C: ConnectionTrait>(
     db: &C,
     lease_id: &str,
     now: DateTime<Utc>,
 ) -> AppResult<Option<(bool, bool, usize)>> {
+    completion_catalog(ReceiptCatalog::full(db), lease_id, now).await
+}
+
+pub(super) async fn completion_catalog(
+    catalog: ReceiptCatalog<'_>,
+    lease_id: &str,
+    now: DateTime<Utc>,
+) -> AppResult<Option<(bool, bool, usize)>> {
+    let db = &catalog;
     let Some(birth) = get(db, lease_id).await? else {
         return Ok(None);
     };
@@ -186,7 +232,7 @@ pub(super) async fn completion<C: ConnectionTrait>(
     let mut any = !birth.content_cids.is_empty() && !birth.candidates.is_empty();
     let mut all = any;
     let mut pinned = 0;
-    let resolved = candidates(db, lease_id, &birth).await?;
+    let resolved = candidates(catalog, lease_id, &birth).await?;
     let mut combinations = batch::combinations(&birth, &resolved);
     let mut current_cid = None;
     let mut available = false;
@@ -209,7 +255,7 @@ pub(super) async fn completion<C: ConnectionTrait>(
             }
             let confirmed = page.eligible(combination)
                 && target_confirmed_for_birth(
-                    db,
+                    catalog,
                     lease_id,
                     combination.slot,
                     &combination.query_cid,

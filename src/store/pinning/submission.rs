@@ -813,7 +813,7 @@ pub(crate) async fn wake_matching_parked<C: ConnectionTrait>(
     id: &str,
     now: DateTime<Utc>,
 ) -> AppResult<bool> {
-    wake_parked_core(db, id, now, None).await
+    wake_parked_core(db, id, now, None, false).await
 }
 
 pub(crate) async fn wake_runtime_parked(
@@ -822,7 +822,17 @@ pub(crate) async fn wake_runtime_parked(
     now: DateTime<Utc>,
     work: crate::store::pinning::management::records::DecodeWork<'_>,
 ) -> AppResult<bool> {
-    wake_parked_core(tx.db(), id, now, Some((tx.catalog(work), work))).await
+    wake_parked_core(tx.db(), id, now, Some((tx.catalog(work), work)), true).await
+}
+
+pub(in crate::store::pinning) async fn wake_runtime_matching_parked(
+    tx: &crate::store::RuntimeTransaction,
+    id: &str,
+    now: DateTime<Utc>,
+    work: crate::store::pinning::management::records::DecodeWork<'_>,
+) -> AppResult<bool> {
+    // Parking already owns the job fence; preserve its job-first protocol.
+    wake_parked_core(tx.db(), id, now, Some((tx.catalog(work), work)), false).await
 }
 
 async fn wake_parked_core<C: ConnectionTrait>(
@@ -833,6 +843,7 @@ async fn wake_parked_core<C: ConnectionTrait>(
         crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
         crate::store::pinning::management::records::DecodeWork<'_>,
     )>,
+    lifecycle_first: bool,
 ) -> AppResult<bool> {
     // Unlocked lookup discovers the lifecycle frontier, never authorization.
     let Some(snapshot) = pin_job::Entity::find_by_id(id.to_owned()).one(db).await? else {
@@ -840,7 +851,7 @@ async fn wake_parked_core<C: ConnectionTrait>(
     };
     // The generic park caller already owns the job lock. Only the fresh runtime
     // wake takes lifecycle writer locks here, in lease → target → job order.
-    if runtime.is_some() && !lock_receipt_lifecycle(db, &snapshot, now).await? {
+    if lifecycle_first && !lock_receipt_lifecycle(db, &snapshot, now).await? {
         return Ok(false);
     }
     let Some(job) = jobs::lock_submit_receipt(db, id).await? else {
@@ -1328,9 +1339,6 @@ pub(crate) async fn settle_runtime_matching(
     job: &crate::store::entities::pin_job::Model,
     work: crate::store::pinning::management::records::DecodeWork<'_>,
 ) -> AppResult<()> {
-    if tx.db().get_database_backend() != sea_orm::DatabaseBackend::Sqlite {
-        return settle_matching(tx.db(), job).await;
-    }
     settle_matching_core(tx.db(), job, Some((tx.catalog(work), work))).await
 }
 
@@ -1659,7 +1667,7 @@ async fn dispatch_allowed_catalog(
     if registered.retired || !registered_invocation_matches(&row.route, &registered.snapshot) {
         return Ok(false);
     }
-    let same_route = super::get(db, &row.provider, &row.expected_cid)
+    let same_route = super::get_catalog(catalog, &row.provider, &row.expected_cid, work)
         .await?
         .is_some_and(|ledger| ledger.route.as_deref() == Some(row.route.as_str()));
     if !same_route {
@@ -1678,9 +1686,6 @@ pub(crate) async fn dispatch_allowed_store(
     store: &crate::store::Store,
     id: &str,
 ) -> AppResult<bool> {
-    if store.db().get_database_backend() != sea_orm::DatabaseBackend::Sqlite {
-        return dispatch_allowed(store.db(), id).await;
-    }
     let session = crate::store::pinning::management::records::SharedDecodeBudget::default();
     let work = crate::store::pinning::management::records::DecodeWork::shared(&session);
     let tx = store.begin_runtime(work).await?;
@@ -1715,7 +1720,7 @@ pub async fn projection_allowed<C: ConnectionTrait>(
     projection_core(db, job, remote, None).await
 }
 
-pub(in crate::store::pinning) async fn projection_allowed_catalog(
+pub(crate) async fn projection_allowed_catalog(
     catalog: crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
     job: &crate::store::entities::pin_job::Model,
     remote: &remote_pin::Model,

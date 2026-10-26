@@ -281,10 +281,15 @@ pub(super) async fn confirmed_cleanup() -> Fixture {
     let scope = ManagementJobScope::from_applied(&db, &auth, &binding)
         .await
         .unwrap();
-    let mut claims =
-        jobs::claim_due_management_jobs(&db, &scope, Utc::now(), chrono::Duration::seconds(30), 1)
-            .await
-            .unwrap();
+    let mut claims = jobs::claim_due_management_jobs(
+        &Store::new(db.clone()),
+        &scope,
+        Utc::now(),
+        chrono::Duration::seconds(30),
+        1,
+    )
+    .await
+    .unwrap();
     assert_eq!(claims.len(), 1);
     let claimed = claims.pop().unwrap();
     assert_eq!(claimed.model.id, authority.job_id);

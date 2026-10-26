@@ -20,7 +20,9 @@ use chrono::{DateTime, Utc};
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set};
 #[path = "receipt/management.rs"]
 mod management;
-pub(crate) use management::fresh_complete_with_work;
+use crate::store::pinning::legacy_migration::{self as legacy, ReceiptCatalog};
+use crate::store::pinning::management::records::DecodeWork;
+pub(crate) use management::fresh_complete_catalog;
 
 pub(crate) struct ReplicaReceipt {
     pub projectable: bool,
@@ -45,14 +47,16 @@ pub async fn retained_cluster<C: ConnectionTrait>(
         .is_some_and(|route| route.resource_type() == RemoteResourceType::ClusterPin))
 }
 
-pub(crate) async fn append<C: ConnectionTrait>(
-    db: &C,
+pub(crate) async fn append(
+    tx: &crate::store::RuntimeTransaction,
     claimed: &ClaimedPinJob,
     observation: &PinObservation,
     request: &str,
     phase: &str,
     now: DateTime<Utc>,
+    work: DecodeWork<'_>,
 ) -> AppResult<ReplicaReceipt> {
+    let db = tx.db();
     let job = &claimed.model;
     let Some(capture) = pin_invocation_route::Entity::find_by_id(job.id.clone())
         .one(db)
@@ -96,15 +100,22 @@ pub(crate) async fn append<C: ConnectionTrait>(
             .is_some_and(|remote| remote.epoch >= capture.remote_epoch)
         && (phase != "poll"
             || remote.as_ref().and_then(|row| row.request_id.as_deref()) == Some(request))
-        && ledger::submission::projection_allowed(
-            db,
+        && ledger::submission::projection_allowed_catalog(
+            tx.catalog(work),
             job,
             remote
                 .as_ref()
                 .ok_or_else(|| AppError::Internal("replica remote missing".into()))?,
+            work,
         )
         .await?
-        && unreleased(db, &job.provider, &job.cid, capture.remote_epoch).await?;
+        && unreleased(
+            tx.catalog(work),
+            &job.provider,
+            &job.cid,
+            capture.remote_epoch,
+        )
+        .await?;
     let outcome = if phase == "poll" {
         super::validation::outcome(observation, &route, &job.cid, request, now)
     } else {
@@ -141,14 +152,14 @@ pub(crate) async fn append<C: ConnectionTrait>(
     })
 }
 
-async fn unreleased<C: ConnectionTrait>(
-    db: &C,
+async fn unreleased(
+    catalog: ReceiptCatalog<'_>,
     provider: &str,
     cid: &str,
     epoch: i64,
 ) -> AppResult<bool> {
     Ok(
-        !crate::store::pinning::legacy_migration::release_history(db, provider, cid)
+        !legacy::release_history_current_catalog(catalog, provider, cid, &())
             .await?
             .iter()
             .any(|row| row.epoch >= epoch),
@@ -162,8 +173,18 @@ pub async fn fresh_complete<C: ConnectionTrait>(
     route: &ProviderRouteSnapshot,
     now: DateTime<Utc>,
 ) -> AppResult<bool> {
-    let operational =
-        crate::store::pinning::legacy_migration::resource_key(db, provider, cid).await?;
+    fresh_complete_current_catalog(ReceiptCatalog::full(db), provider, cid, route, now).await
+}
+
+pub(crate) async fn fresh_complete_current_catalog(
+    catalog: ReceiptCatalog<'_>,
+    provider: &str,
+    cid: &str,
+    route: &ProviderRouteSnapshot,
+    now: DateTime<Utc>,
+) -> AppResult<bool> {
+    let db = &catalog;
+    let operational = legacy::resource_key_catalog(catalog, provider, cid, &()).await?;
     let provider = operational.as_str();
     let registered = pin_provider_route::Entity::find_by_id(provider.to_owned())
         .one(db)
@@ -174,11 +195,12 @@ pub async fn fresh_complete<C: ConnectionTrait>(
     {
         return Ok(false);
     }
-    let keys = crate::store::pinning::legacy_migration::historical_keys(
-        db,
+    let keys = legacy::historical_keys_catalog(
+        catalog,
         "pin_replica_observations",
         provider,
         Some(cid),
+        &(),
     )
     .await?;
     let rows = Entity::find()
@@ -191,11 +213,12 @@ pub async fn fresh_complete<C: ConnectionTrait>(
     let mut row = None;
     for candidate in rows {
         let pk = [("sequence".into(), candidate.sequence.to_string())].into();
-        let mapped = crate::store::pinning::legacy_migration::resolve_legacy_binding(
-            db,
+        let mapped = legacy::resolve_with_catalog(
             "pin_replica_observations",
             &pk,
             &candidate.provider,
+            &(),
+            catalog,
         )
         .await?;
         if candidate.provider == provider || mapped.is_some_and(|m| m.operational_key == provider) {
@@ -210,7 +233,7 @@ pub async fn fresh_complete<C: ConnectionTrait>(
     if row.phase != "poll"
         || !matches!(row.outcome.as_str(), "Complete" | "Insufficient")
         || !read_route_compatible(route, &recorded)
-        || !unreleased(db, provider, cid, row.remote_epoch).await?
+        || !unreleased(catalog, provider, cid, row.remote_epoch).await?
     {
         return Ok(false);
     }

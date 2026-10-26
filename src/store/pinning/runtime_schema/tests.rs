@@ -2,7 +2,6 @@ use super::*;
 use crate::store::{self, pinning::management::records::SharedDecodeBudget};
 use sea_orm::{ConnectOptions, Database};
 
-mod compact;
 mod shadows;
 
 async fn custom_collation(
@@ -49,12 +48,6 @@ async fn guard(db: &impl ConnectionTrait) -> String {
 async fn clones_reuse_qualification_but_new_stores_validate_their_own_database() {
     let store = fixture().await;
     qualify(&store).await.unwrap();
-    store
-        .db()
-        .execute_unprepared("DROP TRIGGER s75_applied_no_delete")
-        .await
-        .unwrap();
-
     let clone = store.clone();
     let warm_work = SharedDecodeBudget::default();
     clone
@@ -62,6 +55,11 @@ async fn clones_reuse_qualification_but_new_stores_validate_their_own_database()
         .await
         .unwrap();
     assert_eq!(warm_work.lock().unwrap().storage_usage().sql, 0);
+    store
+        .db()
+        .execute_unprepared("DROP TRIGGER s75_applied_no_delete")
+        .await
+        .unwrap();
     assert!(qualify(&Store::new(store.db().clone())).await.is_err());
     assert!(management::schema::validate(store.db()).await.is_err());
 
@@ -72,6 +70,95 @@ async fn clones_reuse_qualification_but_new_stores_validate_their_own_database()
         .await
         .unwrap();
     assert!(qualify(&other).await.is_err());
+}
+
+#[tokio::test]
+async fn startup_qualification_is_reused_by_the_first_runtime_transaction() {
+    let mut db = store::connect_database("sqlite::memory:").await.unwrap();
+    let trace = crate::sql_trace::SqlTrace::default();
+    trace.attach(&mut db);
+    let store = Store::open(db).await.unwrap();
+    trace.take("SQLite startup", false);
+    let work = SharedDecodeBudget::default();
+    let tx = store
+        .begin_runtime(DecodeWork::shared(&work))
+        .await
+        .unwrap();
+    tx.query_one(Statement::from_string(DatabaseBackend::Sqlite, "SELECT 1"))
+        .await
+        .unwrap();
+    tx.rollback().await.unwrap();
+    trace.take("SQLite first transaction after startup", true);
+}
+
+#[tokio::test]
+#[ignore = "requires an authorized isolated IPFS_S3_TEST_POSTGRES_URL"]
+async fn postgres_lifecycle_qualification_and_cold_rejection() {
+    use futures_util::FutureExt;
+    let url = std::env::var("IPFS_S3_TEST_POSTGRES_URL").expect("explicit test PostgreSQL URL");
+    let admin = Database::connect(&url).await.unwrap();
+    let schema = format!("qualification_{}", uuid::Uuid::new_v4().simple());
+    admin
+        .execute_unprepared(&format!("CREATE SCHEMA \"{schema}\""))
+        .await
+        .unwrap();
+    let mut options = ConnectOptions::new(url);
+    options
+        .max_connections(1)
+        .set_schema_search_path(schema.clone());
+    let mut db = Database::connect(options).await.unwrap();
+    let trace = crate::sql_trace::SqlTrace::default();
+    trace.attach(&mut db);
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let opened = Store::open(db.clone()).await.unwrap();
+        // Guarded startup uses its own SQLx executor, outside SeaORM metrics.
+        // Observe lazy cold validation below, not a fictitious startup count.
+        assert!(opened.inner.qualification.get().is_some());
+        let work = SharedDecodeBudget::default();
+        let first = opened.clone().begin_runtime(DecodeWork::shared(&work)).await.unwrap();
+        first.query_one(Statement::from_string(DatabaseBackend::Postgres, "SELECT 1")).await.unwrap();
+        first.rollback().await.unwrap();
+        trace.take("PG startup reuse", true);
+
+        let cold = Store::new(db.clone());
+        assert_cancelled_checkout_releases_without_qualification(&cold).await;
+        let clone = cold.clone();
+        let (left, right) = tokio::join!(qualify(&cold), qualify(&clone));
+        left.unwrap(); right.unwrap();
+        let concurrent = trace.take("PG concurrent cold qualification", false);
+        qualify(&Store::new(db.clone())).await.unwrap();
+        let single = trace.take("PG independent Store qualification", false);
+        assert_eq!(concurrent.1, single.1, "concurrent callers share one validation");
+
+        for (damage, repair) in [
+            ("INSERT INTO seaql_migrations(version,applied_at) VALUES('unknown',0)", Some("DELETE FROM seaql_migrations WHERE version='unknown'")),
+            ("UPDATE seaql_migrations SET version='missing' WHERE version=(SELECT min(version) FROM seaql_migrations)", None),
+            ("UPDATE pin_management_readiness SET state='backfill' WHERE id=1", Some("UPDATE pin_management_readiness SET state='ready' WHERE id=1")),
+        ] {
+            // Preserve the original migration name rather than relying on a test-only list.
+            let first: String = db.query_one(Statement::from_string(DatabaseBackend::Postgres, "SELECT min(version) AS version FROM seaql_migrations")).await.unwrap().unwrap().try_get("", "version").unwrap();
+            db.execute_unprepared(damage).await.unwrap();
+            let broken = Store::new(db.clone());
+            assert!(qualify(&broken).await.is_err());
+            assert!(broken.inner.qualification.get().is_none());
+            if let Some(repair) = repair { db.execute_unprepared(repair).await.unwrap(); }
+            else {
+                db.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres, "UPDATE seaql_migrations SET version=$1 WHERE version='missing'", [first.into()])).await.unwrap();
+            }
+            qualify(&broken).await.unwrap();
+        }
+        db.execute_unprepared("DROP INDEX uq_pin_leases_owner_object_source").await.unwrap();
+        assert!(qualify(&Store::new(db.clone())).await.is_err());
+    }).catch_unwind().await;
+    db.close().await.unwrap();
+    admin
+        .execute_unprepared(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
+        .await
+        .unwrap();
+    admin.close().await.unwrap();
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
 }
 
 #[tokio::test]
@@ -115,58 +202,28 @@ async fn one_connection_begin_runtime_leaves_the_first_business_statement_to_the
         .await
         .unwrap();
     tx.db()
-        .execute_unprepared("UPDATE pin_management_readiness SET state='backfill' WHERE id=1")
+        .execute_unprepared("UPDATE pin_provider_routes SET provider=provider WHERE 1=0")
         .await
         .unwrap();
-    assert!(tx.check_schema(DecodeWork::shared(&work)).await.is_err());
     tx.rollback().await.unwrap();
-
-    store
-        .db()
-        .execute_unprepared("UPDATE pin_management_readiness SET state='backfill' WHERE id=1")
-        .await
-        .unwrap();
-    let work = SharedDecodeBudget::default();
-    let tx = store
-        .begin_runtime(DecodeWork::shared(&work))
-        .await
-        .unwrap();
-    tx.db()
-        .execute_unprepared("UPDATE pin_management_readiness SET state='ready' WHERE id=1")
-        .await
-        .unwrap();
-    tx.check_schema(DecodeWork::shared(&work)).await.unwrap();
-    tx.commit().await.unwrap();
 }
 
 #[tokio::test]
-async fn warm_checks_read_live_versions_and_readiness() {
-    let store = fixture().await;
-    qualify(&store).await.unwrap();
+async fn cold_store_rejects_incomplete_versions_and_readiness() {
     for sql in [
         "DELETE FROM seaql_migrations WHERE version=(SELECT max(version) FROM seaql_migrations)",
+        "INSERT INTO seaql_migrations(version,applied_at) VALUES('unknown',0)",
         "UPDATE pin_management_readiness SET state='backfill' WHERE id=1",
     ] {
-        let work = SharedDecodeBudget::default();
-        let tx = store
-            .begin_runtime(DecodeWork::shared(&work))
-            .await
-            .unwrap();
-        tx.db().execute_unprepared(sql).await.unwrap();
-        assert!(tx.check_schema(DecodeWork::shared(&work)).await.is_err());
-        tx.rollback().await.unwrap();
+        let store = fixture().await;
+        store.db().execute_unprepared(sql).await.unwrap();
+        assert!(qualify(&store).await.is_err());
+        assert!(store.inner.qualification.get().is_none());
     }
-    let work = SharedDecodeBudget::default();
-    let tx = store
-        .begin_runtime(DecodeWork::shared(&work))
-        .await
-        .unwrap();
-    tx.check_schema(DecodeWork::shared(&work)).await.unwrap();
-    tx.rollback().await.unwrap();
 }
 
 #[tokio::test]
-async fn warm_guard_charges_two_actual_integer_results_and_returns_known_versions() {
+async fn warm_versions_use_qualification_without_storage_work() {
     let store = fixture().await;
     qualify(&store).await.unwrap();
     let work = SharedDecodeBudget::default();
@@ -181,44 +238,11 @@ async fn warm_guard_charges_two_actual_integer_results_and_returns_known_version
         management::schema::read_versions(tx.db()).await.unwrap()
     );
     let after = work.lock().unwrap().storage_usage();
-    assert_eq!(after.sql - before.sql, 2);
-    assert_eq!(after.rows - before.rows, 2);
-    assert_eq!(after.cells - before.cells, 4);
-    assert_eq!(after.raw_bytes - before.raw_bytes, 32);
+    assert_eq!(after.sql - before.sql, 0);
+    assert_eq!(after.rows - before.rows, 0);
+    assert_eq!(after.cells - before.cells, 0);
+    assert_eq!(after.raw_bytes - before.raw_bytes, 0);
     tx.rollback().await.unwrap();
-}
-
-#[tokio::test]
-async fn warm_checks_reject_actual_transaction_temp_shadows_before_reading_them() {
-    let store = fixture().await;
-    qualify(&store).await.unwrap();
-    for name in [
-        "seaql_migrations",
-        "pin_management_readiness",
-        "pin_management_archive_identity",
-        "pin_legacy_migrations",
-        "pin_legacy_migration_items",
-        "pin_provider_routes",
-        "objects",
-        "OBJECTS",
-    ] {
-        let work = SharedDecodeBudget::default();
-        let tx = store
-            .begin_runtime(DecodeWork::shared(&work))
-            .await
-            .unwrap();
-        tx.db()
-            .execute_unprepared(&format!(
-                "CREATE TEMP VIEW {name} AS SELECT json_extract('not json','$') AS invalid"
-            ))
-            .await
-            .unwrap();
-        assert!(matches!(
-            tx.check_schema(DecodeWork::shared(&work)).await,
-            Err(AppError::InvalidPinningRequest(_))
-        ));
-        tx.rollback().await.unwrap();
-    }
 }
 
 #[tokio::test]
@@ -261,6 +285,21 @@ async fn failed_budget_is_charged_without_publishing_and_releases_the_connection
 #[tokio::test]
 async fn cancelled_initializer_waiting_for_checkout_rolls_back_without_publication() {
     let store = fixture().await;
+    assert_cancelled_checkout_releases_without_qualification(&store).await;
+    let next = SharedDecodeBudget::default();
+    let tx = store
+        .begin_runtime(DecodeWork::shared(&next))
+        .await
+        .unwrap();
+    tx.db()
+        .execute_unprepared("UPDATE pin_management_readiness SET state='ready' WHERE id=1")
+        .await
+        .unwrap();
+    tx.rollback().await.unwrap();
+    assert!(next.lock().unwrap().storage_usage().rows > 0);
+}
+
+async fn assert_cancelled_checkout_releases_without_qualification(store: &Store) {
     let checkout = store.db().begin().await.unwrap();
     let budget = native::meter::Budget::default();
     let cancel = budget.cancellation();
@@ -293,17 +332,7 @@ async fn cancelled_initializer_waiting_for_checkout_rolls_back_without_publicati
         task.await.unwrap(),
         Err(AppError::ManagementBudget)
     ));
-    let next = SharedDecodeBudget::default();
-    let tx = store
-        .begin_runtime(DecodeWork::shared(&next))
-        .await
-        .unwrap();
-    tx.db()
-        .execute_unprepared("UPDATE pin_management_readiness SET state='ready' WHERE id=1")
-        .await
-        .unwrap();
-    tx.rollback().await.unwrap();
-    assert!(next.lock().unwrap().storage_usage().rows > 0);
+    assert!(store.inner.qualification.get().is_none());
 }
 
 #[tokio::test]
