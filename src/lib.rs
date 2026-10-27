@@ -1,5 +1,7 @@
 //! ipfs-s3-gateway library root.
 
+#![recursion_limit = "256"]
+
 #[cfg(test)]
 extern crate self as ipfs_s3_gateway;
 
