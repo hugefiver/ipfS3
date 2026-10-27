@@ -922,6 +922,7 @@ mod tests {
     async fn source_server(
         chunks: usize,
         complete: bool,
+        chunk_delay: Option<Duration>,
     ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -988,6 +989,9 @@ mod tests {
                         return;
                     }
                     sent_by_server.fetch_add(1, Ordering::Relaxed);
+                    if let Some(delay) = chunk_delay {
+                        tokio::time::sleep(delay).await;
+                    }
                 }
                 if complete {
                     socket.write_all(b"0\r\n\r\n").await.unwrap();
@@ -1002,13 +1006,14 @@ mod tests {
     async fn stalling_source_server(
         chunks: usize,
     ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
-        source_server(chunks, false).await
+        source_server(chunks, false, None).await
     }
 
     async fn complete_source_server(
         chunks: usize,
+        chunk_delay: Duration,
     ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
-        source_server(chunks, true).await
+        source_server(chunks, true, Some(chunk_delay)).await
     }
 
     async fn destination_server(
@@ -1103,11 +1108,7 @@ mod tests {
         }
     }
 
-    async fn read_chunked_body_slowly(
-        socket: &mut tokio::net::TcpStream,
-        car_bytes: &AtomicUsize,
-        delay: Duration,
-    ) {
+    async fn read_chunked_body(socket: &mut tokio::net::TcpStream, car_bytes: &AtomicUsize) {
         loop {
             let line = read_crlf_line(socket).await;
             let size = usize::from_str_radix(
@@ -1130,8 +1131,6 @@ mod tests {
                 let observed = buffer[..count].iter().filter(|byte| **byte == 0xa5).count();
                 if observed != 0 {
                     car_bytes.fetch_add(observed, Ordering::Release);
-                    tokio::time::advance(delay).await;
-                    tokio::task::yield_now().await;
                 }
                 remaining -= count;
             }
@@ -1139,9 +1138,8 @@ mod tests {
         }
     }
 
-    async fn slow_complete_destination_server(
-        delay: Duration,
-    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    async fn complete_destination_server() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>)
+    {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let received = Arc::new(AtomicUsize::new(0));
@@ -1164,7 +1162,7 @@ mod tests {
                             .to_ascii_lowercase()
                             .contains("transfer-encoding: chunked")
                     );
-                    read_chunked_body_slowly(&mut socket, &received_by_server, delay).await;
+                    read_chunked_body(&mut socket, &received_by_server).await;
                     successful_import(CID)
                 };
                 socket
@@ -1412,18 +1410,14 @@ mod tests {
         let _ = destination_task.await;
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn active_upload_longer_than_idle_timeout_succeeds() {
         const CHUNKS: usize = 64;
-        let (source, sent, source_task) = complete_source_server(CHUNKS).await;
+        // Pace new upload bytes, not consumption of bytes already buffered by TCP.
+        let (source, sent, source_task) =
+            complete_source_server(CHUNKS, Duration::from_millis(10)).await;
         let idle_timeout = Duration::from_millis(500);
-        let (destination, received, destination_task) =
-            slow_complete_destination_server(Duration::from_millis(10)).await;
-        let clock_guard = tokio::spawn(async {
-            loop {
-                tokio::task::yield_now().await;
-            }
-        });
+        let (destination, received, destination_task) = complete_destination_server().await;
         let source_client = KuboClient::new(source);
         let destination_client =
             KuboClient::new_with_timeouts(destination, Duration::from_secs(5), idle_timeout);
@@ -1459,10 +1453,8 @@ mod tests {
 
         source_task.abort();
         destination_task.abort();
-        clock_guard.abort();
         let _ = source_task.await;
         let _ = destination_task.await;
-        let _ = clock_guard.await;
     }
 
     #[tokio::test]
