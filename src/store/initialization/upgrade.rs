@@ -7,7 +7,7 @@ use crate::store::pinning::management::{
     },
     records, schema,
 };
-use sea_orm::{DatabaseTransaction, Value};
+use sea_orm::Value;
 use std::collections::BTreeMap;
 
 fn failure(_: impl std::fmt::Display) -> DbErr {
@@ -117,8 +117,10 @@ async fn revisions<C: ConnectionTrait>(db: &C) -> Result<BTreeMap<String, i64>, 
     .collect()
 }
 
-async fn fence(tx: &DatabaseTransaction) -> Result<(), DbErr> {
-    native::scope::writer_boundary(tx).await.map_err(failure)?;
+async fn fence(tx: &impl TransactionConnection) -> Result<(), DbErr> {
+    native::scope::writer_boundary_in(tx)
+        .await
+        .map_err(failure)?;
     if tx.get_database_backend() == DatabaseBackend::Postgres {
         let tables = native::registry()
             .iter()
@@ -139,46 +141,58 @@ pub(super) async fn backfill(
     db: &DatabaseConnection,
     request: &UpgradeRequest<'_>,
 ) -> Result<(), DbErr> {
+    let request = maintenance::Request::from(request);
     for table in native::registry()
         .iter()
         .filter(|t| schema::storage::SOURCE_TABLES.contains(&t.table.as_str()))
     {
         let mut after = None;
-        while let Some(key) = next_key(db, table, after.as_ref()).await? {
-            let tx = db.begin().await?;
-            fence(&tx).await?;
-            check_binding(&tx, request).await?;
-            let source = records::locator::source_key(&key).map_err(failure)?;
-            tx.execute(Statement::from_sql_and_values(tx.get_database_backend(),
-                "INSERT INTO pin_management_source_control(source_key) VALUES ($1) ON CONFLICT(source_key) DO NOTHING",[source.into()])).await?;
-            let mut work = budget();
-            super::read_context::run(
-                &tx,
-                request.database_scope,
-                request.native_identity,
-                async {
-                    history::convert_source(
-                        &tx,
-                        &key,
+        loop {
+            let table = table.clone();
+            let cursor = after.clone();
+            let request = request.clone();
+            let key = maintenance::run(db, move |tx| {
+                Box::pin(async move {
+                    let request = request.borrowed();
+                    fence(tx).await?;
+                    check_binding(tx, &request).await?;
+                    let Some(key) = next_key(tx, &table, cursor.as_ref()).await? else {
+                        return Ok(None);
+                    };
+                    let source = records::locator::source_key(&key).map_err(failure)?;
+                    tx.execute(Statement::from_sql_and_values(tx.get_database_backend(),
+                        "INSERT INTO pin_management_source_control(source_key) VALUES ($1) ON CONFLICT(source_key) DO NOTHING",[source.into()])).await?;
+                    let mut work = budget();
+                    super::read_context::run(
+                        tx,
                         request.database_scope,
                         request.native_identity,
-                        &mut work,
+                        async {
+                            history::convert_source(
+                                tx,
+                                &key,
+                                request.database_scope,
+                                request.native_identity,
+                                &mut work,
+                            )
+                            .await?;
+                            records::locator::rebuild_source_for_upgrade(tx, &key, &mut work).await
+                        },
                     )
-                    .await?;
-                    records::locator::rebuild_source_for_upgrade(&tx, &key, &mut work).await
-                },
-            )
-            .await
-            .map_err(|error| {
-                DbErr::Migration(format!("management history conversion failed: {error}"))
-            })?;
-            tx.commit().await?;
+                    .await
+                    .map_err(|error| {
+                        DbErr::Migration(format!("management history conversion failed: {error}"))
+                    })?;
+                    Ok(Some(key))
+                })
+            }).await?;
+            let Some(key) = key else { break };
             after = Some(key);
         }
     }
     // Coverage is checked without a long transaction. The small final transaction
     // proves no business row changed while this bounded metadata scan ran.
-    let vector = revisions(db).await?;
+    let vector = maintenance::run(db, |tx| Box::pin(revisions(tx))).await?;
     let expected = native::registry()
         .into_iter()
         .map(|table| table.table)
@@ -201,40 +215,58 @@ pub(super) async fn backfill(
         .filter(|t| schema::storage::SOURCE_TABLES.contains(&t.table.as_str()))
     {
         let mut after = None;
-        while let Some(key) = next_key(db, table, after.as_ref()).await? {
-            let generation = history::generation(db, &key).await.map_err(failure)?;
-            if history::recover_at(
-                db,
-                request.database_scope,
-                request.native_identity,
-                &key,
-                generation,
-                &mut budget(),
-            )
-            .await
-            .map_err(failure)?
-            .is_none()
-            {
-                return Err(required());
-            }
+        loop {
+            let table = table.clone();
+            let cursor = after.clone();
+            let request = request.clone();
+            let key = maintenance::run(db, move |tx| {
+                Box::pin(async move {
+                    let request = request.borrowed();
+                    let Some(key) = next_key(tx, &table, cursor.as_ref()).await? else {
+                        return Ok(None);
+                    };
+                    let generation = history::generation(tx, &key).await.map_err(failure)?;
+                    if history::recover_at(
+                        tx,
+                        request.database_scope,
+                        request.native_identity,
+                        &key,
+                        generation,
+                        &mut budget(),
+                    )
+                    .await
+                    .map_err(failure)?
+                    .is_none()
+                    {
+                        return Err(required());
+                    }
+                    Ok(Some(key))
+                })
+            })
+            .await?;
+            let Some(key) = key else { break };
             after = Some(key);
         }
     }
-    let tx = db.begin().await?;
-    fence(&tx).await?;
-    check_binding(&tx, request).await?;
-    if revisions(&tx).await? != vector {
-        return Err(required());
-    }
-    let dirty = tx.query_one(Statement::from_string(tx.get_database_backend(),
-        "SELECT 1 WHERE EXISTS (SELECT 1 FROM pin_management_source_control WHERE sealed_source IS NULL OR sealed_locator IS NULL OR source_generation<>sealed_source OR locator_generation<>sealed_locator) OR EXISTS (SELECT 1 FROM pin_management_pending_scope) OR EXISTS (SELECT 1 FROM pin_management_archive WHERE state<>'sealed')")).await?;
-    if dirty.is_some() {
-        return Err(required());
-    }
-    let updated = tx.execute_unprepared("UPDATE pin_management_readiness SET state='ready' WHERE id=1 AND format='S75A1' AND state='backfill'").await?;
-    if updated.rows_affected() != 1 {
-        return Err(required());
-    }
-    validate_existing(&tx).await?;
-    tx.commit().await
+    maintenance::run(db, move |tx| {
+        Box::pin(async move {
+            let request = request.borrowed();
+            fence(tx).await?;
+            check_binding(tx, &request).await?;
+            if revisions(tx).await? != vector {
+                return Err(required());
+            }
+            let dirty = tx.query_one(Statement::from_string(tx.get_database_backend(),
+                "SELECT 1 WHERE EXISTS (SELECT 1 FROM pin_management_source_control WHERE sealed_source IS NULL OR sealed_locator IS NULL OR source_generation<>sealed_source OR locator_generation<>sealed_locator) OR EXISTS (SELECT 1 FROM pin_management_pending_scope) OR EXISTS (SELECT 1 FROM pin_management_archive WHERE state<>'sealed')")).await?;
+            if dirty.is_some() {
+                return Err(required());
+            }
+            let updated = tx.execute_unprepared("UPDATE pin_management_readiness SET state='ready' WHERE id=1 AND format='S75A1' AND state='backfill'").await?;
+            if updated.rows_affected() != 1 {
+                return Err(required());
+            }
+            validate_existing(tx).await?;
+            Ok(())
+        })
+    }).await
 }

@@ -1,6 +1,5 @@
+pub(crate) use super::legacy_receipts::schema;
 use sea_orm_migration::prelude::*;
-#[path = "m20261007_000001_legacy_pinning_migration/schema.rs"]
-pub(crate) mod schema;
 
 #[derive(DeriveMigrationName)]
 pub struct Migration;

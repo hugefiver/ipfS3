@@ -2,7 +2,7 @@ use sea_orm_migration::prelude::*;
 
 #[derive(DeriveMigrationName)]
 pub struct Migration;
-mod import_requests;
+use crate::store::initialization::import_requests;
 
 #[async_trait::async_trait]
 impl super::bridge::SharedMigration for Migration {

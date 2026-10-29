@@ -1849,6 +1849,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "ipfs-s3-gateway",
  "md5",
  "percent-encoding",
  "quick-xml 0.41.0",

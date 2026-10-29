@@ -1,6 +1,6 @@
 //! Store-owned layout qualification. Structural maintenance requires stop/restart.
 //! Business authority is always read in the operation's transaction.
-use super::management::{self, admission::work_error, native, records::DecodeWork};
+use super::management::{self, admission::work_error, records::DecodeWork};
 use crate::{
     error::{AppError, AppResult},
     store::Store,
@@ -231,7 +231,7 @@ impl RuntimeTransaction {
 
 async fn validate<C: ConnectionTrait>(db: &C) -> AppResult<Vec<String>> {
     let versions = management::schema::validate(db).await.map_err(work_error)?;
-    management::catalog::validate(db, native::current_catalog())
+    management::schema::validate_installation_catalog(db)
         .await
         .map_err(work_error)?;
     Ok(versions)

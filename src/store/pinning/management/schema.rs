@@ -3,7 +3,8 @@ use super::{ManagementError, Result};
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 use sea_orm_migration::MigratorTrait;
 
-pub const VERSION: &str = "m20261023_000001_inline_documents";
+pub const VERSION: &str = crate::store::migrations::baseline::VERSION;
+mod installation;
 pub mod storage;
 pub const RECORDS: &str = "pin_management_records";
 pub const RETIREMENTS: &str = "pin_management_retirements";
@@ -110,8 +111,44 @@ fn validate_current_versions(versions: &[String]) -> Result<()> {
 /// Only explicit, identity-bound conversion can read a backfill database.
 pub(crate) async fn validate_for_upgrade<C: ConnectionTrait>(db: &C) -> Result<Vec<String>> {
     let versions = validate_state(db, true).await?;
-    super::catalog::validate(db, super::native::current_catalog()).await?;
+    validate_installation_catalog(db).await?;
     Ok(versions)
+}
+
+/// Historical layout validation does not qualify a Store or authorize execution.
+pub(crate) async fn validate_m23_layout<C: ConnectionTrait>(db: &C, backfill: bool) -> Result<()> {
+    reject_sqlite_shadows(db).await?;
+    storage::validate_schema(db, backfill).await?;
+    if db.get_database_backend() == DatabaseBackend::Postgres {
+        postgres::validate(db).await?;
+    }
+    validate_installation_catalog(db).await
+}
+
+/// Cold installation qualification includes tables outside the management
+/// evidence projection. They must not become archive members or revision inputs.
+pub(crate) async fn validate_installation_catalog<C: ConnectionTrait>(db: &C) -> Result<()> {
+    super::catalog::validate(db, installation_catalog()).await?;
+    installation::validate(db).await
+}
+
+fn installation_catalog() -> &'static [super::native::NativeTable] {
+    use super::native::{entity, raw};
+    use crate::store::entities::*;
+    static CATALOG: std::sync::LazyLock<Vec<super::native::NativeTable>> = std::sync::LazyLock::new(
+        || {
+            let mut tables = super::native::current_catalog().to_vec();
+            tables.extend([
+                entity::<bucket_cors_config::Entity>(),
+                entity::<bucket_lifecycle_config::Entity>(),
+                entity::<object_tag::Entity>(),
+                entity::<residency_backfill::Entity>(),
+                raw("zip_mpu_replays", "batch_id,request_fingerprint,request_contract,prepared_archive_cid,archive_cid,archive_size,public_version_id,server_side_encryption,response_xml,response_headers_json", "batch_id"),
+            ]);
+            tables
+        },
+    );
+    &CATALOG
 }
 
 async fn validate_state<C: ConnectionTrait>(db: &C, backfill: bool) -> Result<Vec<String>> {
@@ -131,7 +168,7 @@ async fn reject_sqlite_shadows<C: ConnectionTrait>(db: &C) -> Result<()> {
     }
     let mut names = std::collections::BTreeSet::new();
     names.extend(
-        super::native::current_catalog()
+        installation_catalog()
             .iter()
             .map(|table| table.table.as_str()),
     );

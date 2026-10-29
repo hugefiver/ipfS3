@@ -1,11 +1,11 @@
 //! SQL-native text images: no chrono round trip or timestamp tolerance.
 use super::{MAX_BYTES, MAX_ROWS, SCHEMA, TableImage, refused};
+use crate::store::migrations::history;
 use crate::{error::AppResult, store::entities::*};
 use sea_orm::{
     ConnectionTrait, DatabaseBackend, EntityTrait, Iterable, PrimaryKeyToColumn, QueryResult,
     Statement, sea_query::Iden,
 };
-use sea_orm_migration::MigratorTrait;
 use std::collections::{BTreeMap, BTreeSet};
 
 const STAGE5: &str = "m20261004_000001_rpc_submission_ledger";
@@ -96,7 +96,7 @@ pub(super) fn tables(versions: &[String]) -> Vec<TableImage> {
             "upload_id",
         ),
     ];
-    if versions.iter().any(|version| version == MANAGEMENT) {
+    if history::has_final_layout(versions) {
         let cold = import_job::Column::iter()
             .filter(|column| column.is_request())
             .map(|column| Iden::to_string(&column))
@@ -136,30 +136,25 @@ pub(super) async fn schema<C: ConnectionTrait>(db: &C, writing: bool) -> AppResu
         .map(|r| r.try_get("", "version"))
         .collect::<Result<_, _>>()?;
     validate_versions(&actual, writing)?;
-    if actual.iter().any(|v| v == SCHEMA) {
+    if history::has_stage(&actual, SCHEMA) {
         super::receipt_schema::validate(db).await?;
     } else {
         super::receipt_schema::absent(db).await?;
     }
-    management_catalog::validate(db, actual.iter().any(|version| version == MANAGEMENT)).await?;
+    management_catalog::validate_versions(db, &actual).await?;
     Ok(actual)
 }
 
 pub(super) fn validate_versions(actual: &[String], writing: bool) -> AppResult<()> {
-    let known: Vec<String> = crate::store::migrator::Migrator::migrations()
-        .iter()
-        .map(|m| m.name().to_owned())
-        .collect();
     // Registered prefixes must end at an explicitly supported catalog shape.
     if !matches!(
         actual.last().map(String::as_str),
-        Some(STAGE5 | STAGE6 | SCHEMA | ZIP_CAPTURE | MANAGEMENT)
-    ) || actual != &known[..actual.len().min(known.len())]
-        || actual.len() > known.len()
+        Some(STAGE5 | STAGE6 | SCHEMA | ZIP_CAPTURE | MANAGEMENT | history::M23)
+    ) || !(history::is_prefix(actual) || actual == [MANAGEMENT])
     {
         return Err(refused("unknown or incomplete schema"));
     }
-    if writing && !actual.iter().any(|v| v == SCHEMA) {
+    if writing && !history::has_stage(actual, SCHEMA) {
         return Err(refused(
             "upgrade schema through normal gateway migration before apply",
         ));
@@ -172,8 +167,8 @@ pub(super) async fn read<C: ConnectionTrait>(
     versions: &[String],
 ) -> AppResult<Vec<TableImage>> {
     check_encoding(db).await?;
-    let stage6 = versions.iter().any(|v| v == STAGE6);
-    let zip_capture = versions.iter().any(|v| v == ZIP_CAPTURE);
+    let stage6 = history::has_stage(versions, STAGE6);
+    let zip_capture = history::has_stage(versions, ZIP_CAPTURE);
     let shapes = tables(versions);
     let mut catalog = columns(db, &shapes).await?;
     let mut result = Vec::with_capacity(shapes.len());
@@ -373,7 +368,7 @@ pub(super) async fn frontier<C: ConnectionTrait>(
     db: &C,
     versions: &[String],
 ) -> AppResult<Vec<String>> {
-    if !versions.iter().any(|v| v == SCHEMA) {
+    if !history::has_stage(versions, SCHEMA) {
         return Ok(vec![]);
     }
     let frontier = db

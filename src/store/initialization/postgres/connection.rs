@@ -8,6 +8,7 @@ pub(super) enum Command {
     Query(Statement),
     Begin,
     Commit(u64),
+    #[cfg(any(test, feature = "historical-fixtures"))]
     Rollback(u64),
 }
 pub(super) enum Response {
@@ -58,6 +59,7 @@ pub(crate) struct GuardedTransaction {
     finished: bool,
 }
 impl GuardedTransaction {
+    #[cfg(any(test, feature = "historical-fixtures"))]
     pub(crate) fn connection(&self) -> &Guarded {
         &self.connection
     }
@@ -66,6 +68,7 @@ impl GuardedTransaction {
         self.finished = true;
         Ok(())
     }
+    #[cfg(any(test, feature = "historical-fixtures"))]
     pub(crate) async fn rollback(mut self) -> Result<(), DbErr> {
         self.connection.request(Command::Rollback(self.id)).await?;
         self.finished = true;

@@ -19,12 +19,12 @@ async fn old_layout_upgrade_preserves_frozen_import_bytes_and_hot_state() {
     options.max_connections(1).min_connections(1);
     let db = sea_orm::Database::connect(options).await.unwrap();
     let old = "m20261017_000001_management_storage";
-    let count = store::migrator::Migrator::migrations()
+    let count = store::migrations::Historical::migrations()
         .iter()
         .position(|migration| migration.name() == old)
         .unwrap() as u32
         + 1;
-    store::migrator::Migrator::up(&db, Some(count))
+    store::migrations::Historical::up(&db, Some(count))
         .await
         .unwrap();
     let (scope, identity) = native::scope::binding(&db).await.unwrap();

@@ -719,13 +719,32 @@ async fn remove_fixture_storage(db: &sea_orm::DatabaseConnection) {
             .unwrap();
     }
     legacy_import::restore(db).await;
-    db.execute(Statement::from_sql_and_values(
-        backend,
-        "DELETE FROM seaql_migrations WHERE version IN ($1,'m20261017_000001_management_storage')",
-        [schema::VERSION.into()],
-    ))
-    .await
-    .unwrap();
+    if backend == sea_orm::DatabaseBackend::Sqlite {
+        let tx = db.begin().await.unwrap();
+        ipfs_s3_gateway::store::migrations::replace_sqlite_layout(
+            &tx,
+            ipfs_s3_gateway::store::migrations::history::M13,
+        )
+        .await;
+        tx.commit().await.unwrap();
+    } else {
+        db.execute_unprepared("DELETE FROM seaql_migrations")
+            .await
+            .unwrap();
+        for version in ipfs_s3_gateway::store::migrations::history::prefix(
+            "m20261013_000001_zip_root_logical_release",
+        )
+        .unwrap()
+        {
+            db.execute(Statement::from_sql_and_values(
+                backend,
+                "INSERT INTO seaql_migrations(version,applied_at) VALUES($1,0)",
+                [(*version).into()],
+            ))
+            .await
+            .unwrap();
+        }
+    }
 }
 
 // Preserve the real writer's complete semantic review and add legal JSON
@@ -1283,7 +1302,7 @@ async fn history_business_rows(
     let tables = if current {
         native::registry()
     } else {
-        source_catalog::tables(&versions)
+        source_catalog::tables(&versions).await
     };
     let mut originals = std::collections::BTreeMap::new();
     for table in tables {
@@ -1693,7 +1712,7 @@ async fn write_old_provider_original(
         .iter()
         .map(|row| row.try_get::<String>("", "version").unwrap())
         .collect::<Vec<_>>();
-    let tables = source_catalog::tables(&catalog);
+    let tables = source_catalog::tables(&catalog).await;
     let digest = |domain: &[u8], raw: &str| {
         let mut hash = Sha256::new();
         hash.update(domain);

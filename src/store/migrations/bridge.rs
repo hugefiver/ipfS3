@@ -1,10 +1,12 @@
 //! The native migrator and guarded empty startup execute the same migration bodies.
-use crate::store::initialization::postgres::{Guarded, GuardedTransaction};
+use crate::store::initialization::postgres::Guarded;
+#[cfg(any(test, feature = "historical-fixtures"))]
+use crate::store::initialization::postgres::GuardedTransaction;
+#[cfg(any(test, feature = "historical-fixtures"))]
 use sea_orm::sea_query::{IndexCreateStatement, TableAlterStatement, TableCreateStatement};
-use sea_orm::{
-    ConnectionTrait, DatabaseBackend, DatabaseTransaction, DbErr, ExecResult, QueryResult,
-    Statement, StatementBuilder, TransactionTrait,
-};
+use sea_orm::{ConnectionTrait, DatabaseBackend, DbErr, ExecResult, QueryResult, Statement};
+#[cfg(any(test, feature = "historical-fixtures"))]
+use sea_orm::{DatabaseTransaction, StatementBuilder, TransactionTrait};
 use sea_orm_migration::{MigrationTrait, SchemaManager, SchemaManagerConnection};
 
 #[async_trait::async_trait]
@@ -13,18 +15,21 @@ pub(crate) trait SharedMigration: MigrationTrait {
 }
 
 pub(crate) struct Manager<'a> {
+    #[cfg(any(test, feature = "historical-fixtures"))]
     native: Option<&'a SchemaManager<'a>>,
     connection: Connection<'a>,
 }
 impl<'a> Manager<'a> {
     pub(crate) fn native(manager: &'a SchemaManager<'a>) -> Self {
         Self {
+            #[cfg(any(test, feature = "historical-fixtures"))]
             native: Some(manager),
             connection: Connection::Native(manager.get_connection()),
         }
     }
     pub(crate) fn guarded(db: Guarded) -> Self {
         Self {
+            #[cfg(any(test, feature = "historical-fixtures"))]
             native: None,
             connection: Connection::Guarded(db),
         }
@@ -32,6 +37,10 @@ impl<'a> Manager<'a> {
     pub(crate) fn get_connection(&self) -> &Connection<'a> {
         &self.connection
     }
+}
+
+#[cfg(any(test, feature = "historical-fixtures"))]
+impl Manager<'_> {
     pub(crate) fn get_database_backend(&self) -> DatabaseBackend {
         self.connection.get_database_backend()
     }
@@ -97,6 +106,7 @@ impl Connection<'_> {
             Self::Guarded(db) => db,
         }
     }
+    #[cfg(any(test, feature = "historical-fixtures"))]
     pub(crate) async fn begin(&self) -> Result<Transaction, DbErr> {
         match self {
             Self::Native(db) => Ok(Transaction::Native(db.begin().await?)),
@@ -104,15 +114,18 @@ impl Connection<'_> {
         }
     }
 }
+#[cfg(any(test, feature = "historical-fixtures"))]
 pub(crate) enum Transaction {
     Native(DatabaseTransaction),
     Guarded(GuardedTransaction),
 }
+#[cfg(any(test, feature = "historical-fixtures"))]
 impl From<DatabaseTransaction> for Transaction {
     fn from(db: DatabaseTransaction) -> Self {
         Self::Native(db)
     }
 }
+#[cfg(any(test, feature = "historical-fixtures"))]
 impl Transaction {
     fn inner(&self) -> &dyn ConnectionTrait {
         match self {
@@ -157,6 +170,7 @@ macro_rules! delegate_connection {
     };
 }
 delegate_connection!(Connection<'_>);
+#[cfg(any(test, feature = "historical-fixtures"))]
 delegate_connection!(Transaction);
 
 pub(crate) async fn initialize(db: &Guarded) -> Result<(), DbErr> {

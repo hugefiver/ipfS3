@@ -643,7 +643,11 @@ async fn receipt_reads_recheck_prefix_integrity_and_never_fall_back_from_current
             "CREATE TEMP VIEW pin_legacy_migration_items AS SELECT * FROM main.pin_legacy_migration_items",
             "CREATE TEMP VIEW seaql_migrations AS SELECT * FROM main.seaql_migrations",
             "ALTER TABLE pin_provider_routes ADD COLUMN unknown_authority TEXT",
-            "DELETE FROM seaql_migrations WHERE version='m20261004_000002_cluster_replica_contract'",
+            if endpoint == management_schema::VERSION {
+                "DELETE FROM seaql_migrations WHERE version='m20261027_000001_schema_baseline'"
+            } else {
+                "DELETE FROM seaql_migrations WHERE version='m20261004_000002_cluster_replica_contract'"
+            },
             "INSERT INTO seaql_migrations(version,applied_at) VALUES ('m99999999_000001_unknown',0)",
             if endpoint == management_schema::VERSION {
                 "UPDATE pin_management_readiness SET state='backfill' WHERE id=1"
@@ -664,7 +668,10 @@ async fn receipt_reads_recheck_prefix_integrity_and_never_fall_back_from_current
             let db = native_catalog(endpoint).await;
             assert!(!migration::source_is_migrated(&db, "old").await.unwrap());
             let tx = db.begin().await.unwrap();
-            tx.execute_unprepared(damage).await.unwrap();
+            let changed = tx.execute_unprepared(damage).await.unwrap();
+            if damage.starts_with("DELETE FROM seaql_migrations") {
+                assert_eq!(changed.rows_affected(), 1, "{endpoint}: {damage}");
+            }
             assert!(
                 migration::source_is_migrated(&tx, "old").await.is_err(),
                 "{endpoint}: {damage}"
@@ -739,11 +746,16 @@ async fn registered_management_requires_exact_columns_keys_constraints_and_no_sh
         "CREATE TEMP VIEW pin_management_retirements AS SELECT 'shadow' AS allocation_domain",
         "CREATE TEMP TABLE seaql_migrations (version TEXT NOT NULL PRIMARY KEY)",
         "CREATE UNIQUE INDEX shadow_management_key ON pin_management_records(plan_id,item_id,kind)",
-        "UPDATE seaql_migrations SET version='m20261012_000002_unknown' WHERE version='m20261012_000001_pinning_management'",
-        "DELETE FROM seaql_migrations WHERE version='m20261004_000002_cluster_replica_contract'",
+        "UPDATE seaql_migrations SET version='m20261027_000002_unknown' WHERE version='m20261027_000001_schema_baseline'",
+        "DELETE FROM seaql_migrations WHERE version='m20261027_000001_schema_baseline'",
     ] {
         let db = native_catalog(management_schema::VERSION).await;
-        db.execute_unprepared(damage).await.unwrap();
+        let changed = db.execute_unprepared(damage).await.unwrap();
+        if damage.starts_with("UPDATE seaql_migrations")
+            || damage.starts_with("DELETE FROM seaql_migrations")
+        {
+            assert_eq!(changed.rows_affected(), 1, "{damage}");
+        }
         assert!(super::super::schema(&db, false).await.is_err(), "{damage}");
     }
     for replacement in [
@@ -834,7 +846,15 @@ async fn admission_schema_returns_exact_prefixes_and_does_not_cache_historical_a
     let old = migration::admission_schema(&db).await.unwrap();
     super::upgrade(&db).await;
     let current = migration::admission_schema(&db).await.unwrap();
-    assert_eq!(&current[..old.len()], old.as_slice());
+    assert!(
+        old.iter()
+            .map(String::as_str)
+            .eq(crate::store::migrations::history::prefix(ENDPOINTS[3])
+                .unwrap()
+                .iter()
+                .copied())
+    );
+    assert_eq!(current, [management_schema::VERSION]);
     assert_eq!(
         current.last().map(String::as_str),
         Some(management_schema::VERSION)

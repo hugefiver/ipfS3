@@ -81,13 +81,32 @@ pub async fn install(
         }
     }
     legacy_import::restore(db).await;
-    db.execute(Statement::from_sql_and_values(
-        backend,
-        "DELETE FROM seaql_migrations WHERE version IN ($1,'m20261017_000001_management_storage')",
-        [schema::VERSION.into()],
-    ))
-    .await
-    .unwrap();
+    if backend == DatabaseBackend::Sqlite {
+        let tx = db.begin().await.unwrap();
+        ipfs_s3_gateway::store::migrations::replace_sqlite_layout(
+            &tx,
+            ipfs_s3_gateway::store::migrations::history::M13,
+        )
+        .await;
+        tx.commit().await.unwrap();
+    } else {
+        db.execute_unprepared("DELETE FROM seaql_migrations")
+            .await
+            .unwrap();
+        for version in ipfs_s3_gateway::store::migrations::history::prefix(
+            "m20261013_000001_zip_root_logical_release",
+        )
+        .unwrap()
+        {
+            db.execute(Statement::from_sql_and_values(
+                backend,
+                "INSERT INTO seaql_migrations(version,applied_at) VALUES($1,0)",
+                [(*version).into()],
+            ))
+            .await
+            .unwrap();
+        }
+    }
     let (scope, identity) = native::scope::binding(db).await.unwrap();
     let plan = "recorded-provider";
     let owner = (
@@ -107,7 +126,7 @@ pub async fn install(
     let mut leaves = Vec::new();
     let mut tables = Vec::new();
     let mut frontier = Vec::new();
-    for (ordinal, table) in source_catalog::tables(&catalog).iter().enumerate() {
+    for (ordinal, table) in source_catalog::tables(&catalog).await.iter().enumerate() {
         let projection = table
             .columns
             .iter()

@@ -1,5 +1,4 @@
-//! Unit regressions use the actual registered migrator, not copied old DDL or
-//! deleted Stage7 markers. Noop is a metadata fixture, never physical PIN proof.
+//! Historical source fixtures execute real predecessor DDL. Noop is metadata only.
 use crate::{
     pinning::{config::ValidatedPinningConfig, coordinator::PinningCoordinator},
     store::{
@@ -37,13 +36,17 @@ async fn prefix(last: &str) -> (tempfile::TempDir, DatabaseConnection) {
             .replace('\\', "/")
     );
     let db = store::connect_database(&url).await.unwrap();
-    let registry = store::migrator::Migrator::migrations();
+    if last == schema::VERSION {
+        store::run_migrations(&db).await.unwrap();
+        return (directory, db);
+    }
+    let registry = store::migrations::Historical::migrations();
     let count = registry
         .iter()
         .position(|migration| migration.name() == last)
         .unwrap()
         + 1;
-    store::migrator::Migrator::up(&db, Some(count as u32))
+    store::migrations::Historical::up(&db, Some(count as u32))
         .await
         .unwrap();
     let versions: Vec<String> = db
@@ -78,7 +81,7 @@ async fn assert_management_absent(db: &DatabaseConnection) {
 
 async fn upgrade(db: &DatabaseConnection) {
     let source = "m20261013_000001_zip_root_logical_release";
-    let registry = store::migrator::Migrator::migrations();
+    let registry = store::migrations::Historical::migrations();
     let source_count = registry
         .iter()
         .position(|migration| migration.name() == source)
@@ -93,7 +96,7 @@ async fn upgrade(db: &DatabaseConnection) {
         .unwrap()
         .len();
     if applied < source_count {
-        store::migrator::Migrator::up(db, Some((source_count - applied) as u32))
+        store::migrations::Historical::up(db, Some((source_count - applied) as u32))
             .await
             .unwrap();
     }
@@ -329,7 +332,8 @@ async fn partial_version_mismatch_and_unknown_registry_are_not_historical_availa
         ),
         "INSERT INTO seaql_migrations(version,applied_at) VALUES ('unknown_retirement_schema',0)"
             .into(),
-        "DELETE FROM seaql_migrations WHERE version='m20250701_000001_init'".into(),
+        "DELETE FROM seaql_migrations WHERE version='m20261004_000002_cluster_replica_contract'"
+            .into(),
         "ALTER TABLE pin_provider_routes ADD COLUMN unknown_authority TEXT".into(),
     ] {
         let (_directory, db) = prefix(PREFIXES[3]).await;
@@ -342,7 +346,10 @@ async fn partial_version_mismatch_and_unknown_registry_are_not_historical_availa
                 .is_err()
         );
         let before = pin_provider_route::Entity::find().all(&db).await.unwrap();
-        db.execute_unprepared(&alteration).await.unwrap();
+        let changed = db.execute_unprepared(&alteration).await.unwrap();
+        if alteration.starts_with("DELETE FROM seaql_migrations") {
+            assert_eq!(changed.rows_affected(), 1, "{alteration}");
+        }
         assert!(
             admission::check_provider_open(&db, "unknown-alias")
                 .await

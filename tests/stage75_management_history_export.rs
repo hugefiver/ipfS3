@@ -132,13 +132,22 @@ async fn remove_storage(db: &DatabaseConnection) {
             .unwrap();
     }
     legacy_import::restore(db).await;
-    db.execute(Statement::from_sql_and_values(
-        backend,
-        "DELETE FROM seaql_migrations WHERE version IN ($1,'m20261017_000001_management_storage')",
-        [schema::VERSION.into()],
-    ))
-    .await
-    .unwrap();
+    db.execute_unprepared("DELETE FROM seaql_migrations")
+        .await
+        .unwrap();
+    for version in ipfs_s3_gateway::store::migrations::history::prefix(
+        "m20261013_000001_zip_root_logical_release",
+    )
+    .unwrap()
+    {
+        db.execute(Statement::from_sql_and_values(
+            backend,
+            "INSERT INTO seaql_migrations(version,applied_at) VALUES($1,0)",
+            [(*version).into()],
+        ))
+        .await
+        .unwrap();
+    }
 }
 
 async fn revision(db: &impl ConnectionTrait, table: &str) -> i64 {

@@ -8,7 +8,9 @@ mod binding;
 mod connection;
 mod executor;
 
-pub(crate) use connection::{Guarded, GuardedTransaction};
+pub(crate) use connection::Guarded;
+#[cfg(any(test, feature = "historical-fixtures"))]
+pub(crate) use connection::GuardedTransaction;
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbErr};
 use std::sync::{
     Arc,
@@ -29,14 +31,19 @@ pub(crate) fn failed() -> DbErr {
 struct Stop(Arc<StopState>);
 struct StopState {
     deadline: Instant,
+    retain_sql_errors: bool,
     reason: AtomicU8,
     wake: CancellationToken,
     stopped_at: std::sync::OnceLock<Instant>,
 }
 impl Stop {
     fn new(deadline: Instant) -> Self {
+        Self::with_error_policy(deadline, false)
+    }
+    fn with_error_policy(deadline: Instant, retain_sql_errors: bool) -> Self {
         Self(Arc::new(StopState {
             deadline,
+            retain_sql_errors,
             reason: AtomicU8::new(0),
             wake: CancellationToken::new(),
             stopped_at: std::sync::OnceLock::new(),
@@ -89,6 +96,21 @@ pub(super) async fn open(db: &DatabaseConnection) -> Result<(), DbErr> {
     let caller = Caller(stop.clone());
     let pool = db.get_postgres_connection_pool().clone();
     let task = tokio::spawn(executor::own(pool, stop).with_current_subscriber());
+    let result = task.await.map_err(|_| failed())?;
+    drop(caller);
+    result
+}
+
+pub(super) async fn maintenance<T, F, W>(db: &DatabaseConnection, work: F) -> Result<T, DbErr>
+where
+    T: Send + 'static,
+    F: FnOnce(Guarded) -> W + Send + 'static,
+    W: std::future::Future<Output = Result<T, DbErr>> + Send + 'static,
+{
+    let stop = Stop::with_error_policy(Instant::now() + BUDGET, true);
+    let caller = Caller(stop.clone());
+    let pool = db.get_postgres_connection_pool().clone();
+    let task = tokio::spawn(executor::own_work(pool, stop, work).with_current_subscriber());
     let result = task.await.map_err(|_| failed())?;
     drop(caller);
     result

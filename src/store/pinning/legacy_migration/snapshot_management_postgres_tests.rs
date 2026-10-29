@@ -42,15 +42,25 @@ where
                 .unwrap();
             connections.push(db);
         }
-        let registry = store::migrator::Migrator::migrations();
+        let registry = if endpoint == schema::VERSION {
+            store::migrator::Migrator::migrations()
+        } else {
+            store::migrations::Historical::migrations()
+        };
         let count = registry
             .iter()
             .position(|migration| migration.name() == endpoint)
             .unwrap()
             + 1;
-        store::migrator::Migrator::up(&connections[0], Some(count as u32))
-            .await
-            .unwrap();
+        if endpoint == schema::VERSION {
+            store::migrator::Migrator::up(&connections[0], Some(count as u32))
+                .await
+                .unwrap();
+        } else {
+            store::migrations::Historical::up(&connections[0], Some(count as u32))
+                .await
+                .unwrap();
+        }
         body(connections[0].clone(), connections[1].clone()).await;
         for db in connections {
             db.close().await.unwrap();

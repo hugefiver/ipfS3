@@ -1,0 +1,18 @@
+CREATE TABLE buckets (name TEXT PRIMARY KEY NOT NULL, created_at @TIME@ NOT NULL DEFAULT CURRENT_TIMESTAMP, owner TEXT, versioning_status TEXT CHECK (versioning_status IS NULL OR versioning_status IN ('Enabled', 'Suspended')));
+CREATE TABLE objects (id TEXT PRIMARY KEY NOT NULL, bucket TEXT NOT NULL REFERENCES buckets(name) ON DELETE CASCADE, key TEXT NOT NULL, cid TEXT NOT NULL, size BIGINT NOT NULL, content_type TEXT, etag TEXT NOT NULL, metadata @JSON@, encrypted BOOLEAN NOT NULL DEFAULT FALSE, key_wrap TEXT, multipart BOOLEAN NOT NULL DEFAULT FALSE, is_latest BOOLEAN NOT NULL DEFAULT TRUE, created_at @TIME@ NOT NULL DEFAULT CURRENT_TIMESTAMP, sse_c_key_fingerprint TEXT, UNIQUE(bucket, key, id));
+CREATE UNIQUE INDEX idx_objects_latest ON objects(bucket,key) WHERE is_latest=TRUE;
+CREATE TABLE multipart_uploads (upload_id TEXT PRIMARY KEY NOT NULL, object_id TEXT NOT NULL, bucket TEXT NOT NULL REFERENCES buckets(name) ON DELETE CASCADE, key TEXT NOT NULL, created_at @TIME@ NOT NULL DEFAULT CURRENT_TIMESTAMP, encryption_mode TEXT NOT NULL DEFAULT 'none', key_wrap TEXT, content_type TEXT, metadata @JSON@, decompress_zip_target TEXT, decompress_zip_result BOOLEAN NOT NULL DEFAULT TRUE, sse_c_key_fingerprint TEXT, tags_json @JSON@ NOT NULL DEFAULT '[]', pin_decision_json @JSON@, zip_intent_json TEXT);
+CREATE TABLE multipart_parts (upload_id TEXT NOT NULL REFERENCES multipart_uploads(upload_id) ON DELETE CASCADE, part_number INTEGER NOT NULL, cid TEXT NOT NULL, size BIGINT NOT NULL, etag TEXT NOT NULL, uploaded_at @TIME@ NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(upload_id,part_number));
+CREATE TABLE object_tags (object_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, CONSTRAINT pk_object_tags PRIMARY KEY(object_id,key), FOREIGN KEY(object_id) REFERENCES objects(id) ON DELETE CASCADE);
+CREATE TABLE object_versions (id TEXT PRIMARY KEY NOT NULL, bucket TEXT NOT NULL REFERENCES buckets(name) ON DELETE CASCADE, key TEXT NOT NULL, version_id TEXT, kind TEXT NOT NULL, object_id TEXT REFERENCES objects(id) ON DELETE CASCADE, sequence BIGINT NOT NULL, is_latest BOOLEAN NOT NULL, lifecycle_age_started_at @TIME@ NOT NULL, became_noncurrent_at @TIME@, created_at @TIME@ NOT NULL, updated_at @TIME@ NOT NULL, CONSTRAINT ck_object_versions_kind CHECK(kind IN ('object','delete_marker')), CONSTRAINT ck_object_versions_kind_object CHECK((kind='object' AND object_id IS NOT NULL) OR (kind='delete_marker' AND object_id IS NULL)));
+CREATE UNIQUE INDEX uq_object_versions_latest ON object_versions(bucket,key) WHERE is_latest=TRUE;
+CREATE UNIQUE INDEX uq_object_versions_sequence ON object_versions(bucket,key,sequence);
+CREATE UNIQUE INDEX uq_object_versions_null_slot ON object_versions(bucket,key) WHERE version_id IS NULL;
+CREATE UNIQUE INDEX uq_object_versions_public_id ON object_versions(bucket,key,version_id) WHERE version_id IS NOT NULL;
+CREATE INDEX idx_object_versions_exact ON object_versions(bucket,key,version_id);
+CREATE INDEX idx_object_versions_key_order ON object_versions(bucket,key,sequence DESC);
+CREATE INDEX idx_object_versions_bucket_order ON object_versions(bucket,key ASC,sequence DESC,version_id);
+CREATE UNIQUE INDEX uq_object_versions_residency_owner ON object_versions(id,object_id);
+CREATE UNIQUE INDEX uq_objects_residency_content ON objects(id,cid);
+CREATE UNIQUE INDEX uq_object_versions_decision_owner ON object_versions(id,object_id);
+CREATE TABLE bucket_cors_configs (bucket TEXT PRIMARY KEY NOT NULL REFERENCES buckets(name) ON DELETE CASCADE, canonical_json TEXT NOT NULL, created_at @TIME@ NOT NULL, updated_at @TIME@ NOT NULL);

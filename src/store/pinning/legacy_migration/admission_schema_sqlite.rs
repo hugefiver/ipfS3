@@ -81,10 +81,7 @@ pub(super) async fn classify<C: ConnectionTrait>(db: &C, receipt: bool) -> AppRe
     let Metadata { versions, facts } = decode(rows)?;
     snapshot::validate_versions(&versions, false)?;
 
-    if versions
-        .iter()
-        .any(|version| version == super::super::SCHEMA)
-    {
+    if crate::store::migrations::history::has_stage(&versions, super::super::SCHEMA) {
         super::super::receipt_schema::validate(db).await?;
     } else if facts.receipt_objects {
         return Err(super::super::receipt_schema::invalid());
@@ -114,9 +111,7 @@ pub(super) async fn classify<C: ConnectionTrait>(db: &C, receipt: bool) -> AppRe
         if facts.receipt_shadow {
             return Err(refused("shadowed receipt catalog"));
         }
-        if versions.last().map(String::as_str)
-            != Some(crate::store::pinning::management::schema::VERSION)
-            && facts.receipt_partial
+        if !crate::store::migrations::history::has_final_layout(&versions) && facts.receipt_partial
         {
             return Err(refused("partial management catalog"));
         }

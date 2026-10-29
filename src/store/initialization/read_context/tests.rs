@@ -1,4 +1,5 @@
 use super::*;
+use crate::store::pinning::legacy_migration::ReceiptCatalog;
 use sea_orm::{ConnectOptions, Database, DatabaseConnection, TransactionTrait};
 use std::sync::Arc;
 
@@ -26,10 +27,19 @@ async fn conversion_read_capability_is_exact_and_does_not_escape_its_task() {
     let foreign_tx = foreign.begin().await.unwrap();
     let (scope, identity) = native::scope::binding(tx.as_ref()).await.unwrap();
     assert!(!active(tx.as_ref()).await.unwrap());
+    assert!(
+        !ReceiptCatalog::full(tx.as_ref())
+            .upgrade_read()
+            .await
+            .unwrap()
+    );
     run(tx.as_ref(), &scope, &identity, async {
         assert!(active(tx.as_ref()).await?);
         assert!(!active(&another).await?);
         assert!(!active(&foreign_tx).await?);
+        assert!(ReceiptCatalog::full(tx.as_ref()).upgrade_read().await?);
+        assert!(!ReceiptCatalog::full(&another).upgrade_read().await?);
+        assert!(!ReceiptCatalog::full(&foreign_tx).upgrade_read().await?);
         assert!(schema::validate(tx.as_ref()).await.is_err());
         let same_transaction = tx.clone();
         assert!(
@@ -43,6 +53,12 @@ async fn conversion_read_capability_is_exact_and_does_not_escape_its_task() {
     .await
     .unwrap();
     assert!(!active(tx.as_ref()).await.unwrap());
+    assert!(
+        !ReceiptCatalog::full(tx.as_ref())
+            .upgrade_read()
+            .await
+            .unwrap()
+    );
     let failed: Result<()> = run(tx.as_ref(), &scope, &identity, async {
         assert!(active(tx.as_ref()).await?);
         Err(ManagementError::InvalidEvidence)

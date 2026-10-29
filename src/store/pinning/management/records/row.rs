@@ -1,6 +1,7 @@
 //! Stable row owners; views borrow original cells, including SQL NULL.
 use super::*;
 use crate::store::pinning::management::actions::execution::facts::ItemFacts;
+use crate::store::pinning::management::schema;
 use std::sync::Arc;
 
 pub(crate) enum RowHandle {
@@ -251,12 +252,29 @@ impl<'a> FrozenRows<'a> {
             Self::Frame(frame) => frame.validate_current(),
             Self::Execution(_) => Ok(()),
             Self::Archive(rows) => {
-                if rows.catalog() == native::current_catalog() {
+                if rows.schema_versions() == [schema::VERSION]
+                    && rows.catalog() == native::current_catalog()
+                {
                     Ok(())
                 } else {
                     Err(ManagementError::Schema)
                 }
             }
+        }
+    }
+    pub(crate) fn validate_final_layout(self) -> Result<()> {
+        let versions = match self {
+            Self::Frame(frame) => {
+                frame.validate()?;
+                frame.schema_versions.as_slice()
+            }
+            Self::Archive(rows) => rows.schema_versions(),
+            Self::Execution(_) => return Ok(()),
+        };
+        if crate::store::migrations::history::has_final_layout(versions) {
+            Ok(())
+        } else {
+            Err(ManagementError::Schema)
         }
     }
     pub(crate) fn all_rows(self) -> impl Iterator<Item = (&'a native::NativeTable, RowView<'a>)> {

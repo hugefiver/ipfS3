@@ -291,7 +291,13 @@ async fn validate_locator_set<C: ConnectionTrait>(
 }
 
 pub async fn fence_authority(tx: &DatabaseTransaction) -> Result<()> {
-    scope::writer_boundary(tx).await?;
+    fence_authority_in(tx).await
+}
+
+pub(crate) async fn fence_authority_in(
+    tx: &impl crate::store::initialization::TransactionConnection,
+) -> Result<()> {
+    scope::writer_boundary_in(tx).await?;
     if tx.get_database_backend() == DatabaseBackend::Postgres {
         let mut tables = crate::store::pinning::management::schema::storage::SOURCE_TABLES.to_vec();
         tables.extend([
@@ -624,7 +630,7 @@ fn validate_legacy_item(row: &NativeRow, rows: &BTreeMap<NativeKey, NativeRow>) 
 }
 
 pub(super) async fn validate_sources_dependencies(
-    tx: &DatabaseTransaction,
+    tx: &impl crate::store::initialization::TransactionConnection,
     source_rows: &BTreeMap<NativeKey, NativeRow>,
     source_classes: &BTreeMap<NativeKey, SourceClassification>,
     budget: &mut Budget,

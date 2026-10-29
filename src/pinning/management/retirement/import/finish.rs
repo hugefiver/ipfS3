@@ -12,7 +12,10 @@ impl<S: Read + Seek> FrozenRetirementImport<S> {
         if reference != self.expected
             || membership.reducer_version != REDUCER_VERSION
             || !checkpoint.complete()
-            || checkpoint.catalog_revision != crate::store::pinning::management::schema::VERSION
+            || !crate::store::migrations::history::final_checkpoint(
+                &checkpoint.catalog_revision,
+                &checkpoint.catalog,
+            )
             || &checkpoint.database_scope != scope
             || &checkpoint.database_identity != identity
             || &checkpoint.catalog != catalog

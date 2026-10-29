@@ -1,7 +1,7 @@
 use super::*;
 
 pub(in crate::store::initialization::history) async fn convert(
-    tx: &DatabaseTransaction,
+    tx: &impl TransactionConnection,
     (key, row, generation): (&NativeKey, &NativeRow, i64),
     (scope, identity): (&str, &str),
     review: Review,
@@ -71,7 +71,7 @@ pub(in crate::store::initialization::history) async fn convert(
 }
 
 pub(super) async fn store_review(
-    tx: &DatabaseTransaction,
+    tx: &impl TransactionConnection,
     id: &str,
     header: &ArchiveHeader,
     review: &Review,

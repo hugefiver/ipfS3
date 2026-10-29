@@ -4,6 +4,7 @@ use super::{
     ManagementError, NativeKey, NativeRow, NativeTable, Result,
     meter::{Budget, CELL_SLICE, PAGE_BYTES, PAGE_ROWS, ResidentGuard},
 };
+use crate::store::initialization::TransactionConnection;
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseTransaction, Statement, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -417,6 +418,10 @@ pub(super) fn queries(selector: &Selector) -> Result<Vec<Query>> {
 }
 
 pub async fn writer_boundary(tx: &DatabaseTransaction) -> Result<()> {
+    writer_boundary_in(tx).await
+}
+
+pub(crate) async fn writer_boundary_in(tx: &impl TransactionConnection) -> Result<()> {
     super::super::admission::lock_sqlite_writer_in_caller_transaction(tx)
         .await
         .map_err(|_| ManagementError::Database)
@@ -424,7 +429,14 @@ pub async fn writer_boundary(tx: &DatabaseTransaction) -> Result<()> {
 
 /// B's ordered business row locks must precede this tail phantom fence on PG.
 pub async fn fence_memberships(tx: &DatabaseTransaction, spec: &ScopeSpec) -> Result<()> {
-    writer_boundary(tx).await?;
+    fence_memberships_in(tx, spec).await
+}
+
+pub(crate) async fn fence_memberships_in(
+    tx: &impl TransactionConnection,
+    spec: &ScopeSpec,
+) -> Result<()> {
+    writer_boundary_in(tx).await?;
     if tx.get_database_backend() == DatabaseBackend::Postgres {
         let mut tables = BTreeSet::<String>::new();
         for selector in &spec.selectors {
@@ -641,8 +653,16 @@ pub async fn revalidate_scope(
     revalidate_scope_originals(tx, reviewed, &reviewed.rows, budget).await
 }
 
+pub(crate) async fn revalidate_scope_in(
+    tx: &impl TransactionConnection,
+    reviewed: &ScopedRead,
+    budget: &mut Budget,
+) -> Result<ScopedRead> {
+    revalidate_scope_originals(tx, reviewed, &reviewed.rows, budget).await
+}
+
 pub(crate) async fn revalidate_scope_originals(
-    tx: &DatabaseTransaction,
+    tx: &impl TransactionConnection,
     reviewed: &ScopedRead,
     originals: &BTreeMap<NativeKey, NativeRow>,
     budget: &mut Budget,
@@ -660,7 +680,7 @@ pub(in crate::store::pinning) async fn revalidate_runtime_scope(
 }
 
 async fn revalidate_scope_core(
-    tx: &DatabaseTransaction,
+    tx: &impl TransactionConnection,
     reviewed: &ScopedRead,
     originals: &BTreeMap<NativeKey, NativeRow>,
     budget: &mut Budget,
@@ -669,7 +689,7 @@ async fn revalidate_scope_core(
         super::super::records::DecodeWork<'_>,
     )>,
 ) -> Result<ScopedRead> {
-    fence_memberships(tx, &reviewed.spec).await?;
+    fence_memberships_in(tx, &reviewed.spec).await?;
     let fresh = match runtime {
         Some((owner, work)) => collect_runtime_scope(owner, &reviewed.spec, budget, work).await?,
         None => collect_scope(tx, &reviewed.spec, budget).await?,

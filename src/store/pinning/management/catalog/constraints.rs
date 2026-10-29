@@ -1,6 +1,6 @@
 //! Constraints used to authorize exact owner/version/lease/resource selections.
 use super::*;
-use crate::store::migrations::m20261007_000001_legacy_pinning_migration::schema as r26;
+use crate::store::migrations::legacy_receipts::schema as r26;
 use std::collections::BTreeMap;
 
 type ForeignKey = (
@@ -13,6 +13,10 @@ fn foreign_keys(table: &str) -> Option<Vec<ForeignKey>> {
     Some(match table {
         "import_job_requests" => vec![("import_jobs", &["job_id"], &["id"], "CASCADE")],
         "objects" | "multipart_uploads" => vec![("buckets", &["bucket"], &["name"], "CASCADE")],
+        "bucket_cors_configs" | "bucket_lifecycle_configs" => {
+            vec![("buckets", &["bucket"], &["name"], "CASCADE")]
+        }
+        "object_tags" => vec![("objects", &["object_id"], &["id"], "CASCADE")],
         "multipart_parts" => vec![(
             "multipart_uploads",
             &["upload_id"],
@@ -34,7 +38,7 @@ fn foreign_keys(table: &str) -> Option<Vec<ForeignKey>> {
                 "CASCADE",
             ),
         ],
-        "zip_manifest_entries" | "zip_root_builds" => {
+        "zip_manifest_entries" | "zip_root_builds" | "zip_mpu_replays" => {
             vec![("zip_batches", &["batch_id"], &["id"], "RESTRICT")]
         }
         "zip_root_references" => vec![(
@@ -78,7 +82,8 @@ fn foreign_keys(table: &str) -> Option<Vec<ForeignKey>> {
             &["id"],
             "RESTRICT",
         )],
-        "pin_lease_requirements"
+        "residency_backfill"
+        | "pin_lease_requirements"
         | "pin_replica_observations"
         | "remote_pins"
         | "remote_pin_ledger"

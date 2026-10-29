@@ -7,9 +7,12 @@ use sea_orm_migration::MigratorTrait;
 #[path = "initialization/document_tests.rs"]
 mod document_tests;
 pub mod history;
+mod maintenance;
 pub(crate) mod postgres;
 pub(crate) mod read_context;
 mod upgrade;
+pub(crate) use maintenance::TransactionConnection;
+pub(crate) mod import_requests;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SchemaState {
@@ -65,12 +68,9 @@ pub async fn validate_existing<C: ConnectionTrait>(db: &C) -> Result<(), DbErr> 
 // Called immediately after this operation validates the current storage schema.
 // No installed-schema result is retained across operations or a DDL boundary.
 async fn validate_catalog<C: ConnectionTrait>(db: &C) -> Result<(), DbErr> {
-    super::pinning::management::catalog::validate(
-        db,
-        super::pinning::management::native::current_catalog(),
-    )
-    .await
-    .map_err(|_| required())
+    super::pinning::management::schema::validate_installation_catalog(db)
+        .await
+        .map_err(|_| required())
 }
 
 pub async fn open(db: &DatabaseConnection) -> Result<(), DbErr> {
@@ -128,23 +128,40 @@ pub async fn upgrade_existing(
     db: &DatabaseConnection,
     request: UpgradeRequest<'_>,
 ) -> Result<(), DbErr> {
-    use super::pinning::management::{catalog, native, schema};
+    use super::migrations::history as legacy;
+    use super::pinning::management::schema;
     if !matches!(
         request.source_version,
-        "m20261013_000001_zip_root_logical_release" | "m20261017_000001_management_storage"
+        legacy::M13 | legacy::M17 | legacy::M23
     ) || request.target_version != schema::VERSION
     {
         return Err(required());
     }
-    let tx = db.begin().await?;
-    native::scope::writer_boundary(&tx)
+    let owned = maintenance::Request::from(&request);
+    let backfill = maintenance::run(db, move |tx| {
+        Box::pin(async move { prepare_upgrade(tx, owned.borrowed()).await })
+    })
+    .await?;
+    if backfill {
+        upgrade::backfill(db, &request).await?;
+    }
+    Ok(())
+}
+
+async fn prepare_upgrade(
+    tx: &impl TransactionConnection,
+    request: UpgradeRequest<'_>,
+) -> Result<bool, DbErr> {
+    use super::migrations::history as legacy;
+    use super::pinning::management::{catalog, native, schema};
+    native::scope::writer_boundary_in(tx)
         .await
         .map_err(|_| required())?;
     if tx.get_database_backend() == DatabaseBackend::Postgres {
         tx.execute_unprepared("SELECT pg_advisory_xact_lock(1229997651,1395879239)")
             .await?;
     }
-    let (scope, identity) = native::scope::binding(&tx).await.map_err(|_| required())?;
+    let (scope, identity) = native::scope::binding(tx).await.map_err(|_| required())?;
     if scope != request.database_scope
         || identity != request.native_identity
         || identity.starts_with("diagnostic:")
@@ -154,7 +171,7 @@ pub async fn upgrade_existing(
     let versions: Vec<String> = tx
         .query_all(Statement::from_string(
             tx.get_database_backend(),
-            "SELECT version FROM seaql_migrations ORDER BY version",
+            "SELECT CASE WHEN length(version)<=128 THEN version END AS version FROM seaql_migrations ORDER BY version LIMIT 65",
         ))
         .await?
         .iter()
@@ -165,17 +182,20 @@ pub async fn upgrade_existing(
         .map(|m| m.name().to_owned())
         .collect::<Vec<_>>();
     let preparing = versions != known;
+    let mut needs_backfill = false;
     if preparing {
-        let end = known
-            .iter()
-            .position(|v| v == request.source_version)
-            .ok_or_else(required)?
-            + 1;
-        if versions != known[..end] {
+        let old_final = legacy::is_m23(&versions);
+        let source = legacy::prefix(request.source_version).ok_or_else(required)?;
+        if !old_final
+            && !versions
+                .iter()
+                .map(String::as_str)
+                .eq(source.iter().copied())
+        {
             return Err(required());
         }
         let old_catalog = native::archived_catalog(&versions).map_err(|_| required())?;
-        catalog::validate(&tx, old_catalog)
+        catalog::validate(tx, old_catalog)
             .await
             .map_err(|_| required())?;
         if tx.get_database_backend() == DatabaseBackend::Postgres {
@@ -189,19 +209,72 @@ pub async fn upgrade_existing(
                 "LOCK TABLE {tables},seaql_migrations IN ACCESS EXCLUSIVE MODE NOWAIT"
             ))
             .await?;
-            catalog::validate(&tx, old_catalog)
+            catalog::validate(tx, old_catalog)
                 .await
                 .map_err(|_| required())?;
         }
-        let (scope, identity) = native::scope::binding(&tx).await.map_err(|_| required())?;
+        let (scope, identity) = native::scope::binding(tx).await.map_err(|_| required())?;
         if scope != request.database_scope || identity != request.native_identity {
             return Err(required());
         }
-        super::migrator::Migrator::up(&tx, None).await?;
-        tx.execute_unprepared("UPDATE pin_management_readiness SET state='backfill' WHERE id=1")
+        if old_final {
+            let state: String = tx
+                .query_one(Statement::from_string(
+                    tx.get_database_backend(),
+                    "SELECT state FROM pin_management_readiness WHERE id=1 AND format='S75A1'",
+                ))
+                .await?
+                .ok_or_else(required)?
+                .try_get("", "state")?;
+            if !matches!(state.as_str(), "ready" | "backfill") {
+                return Err(required());
+            }
+            needs_backfill = state == "backfill";
+            schema::validate_m23_layout(tx, needs_backfill)
+                .await
+                .map_err(|_| required())?;
+            if request.source_version == legacy::M23 {
+                if needs_backfill {
+                    return Err(required());
+                }
+            } else {
+                // The old target is immutable evidence, not an alias of the new one.
+                history::upgrade_stamp(
+                    tx,
+                    &UpgradeRequest {
+                        target_version: legacy::M23,
+                        ..request
+                    },
+                    false,
+                )
+                .await
+                .map_err(|_| required())?;
+            }
+        } else {
+            if request.source_version == legacy::M13 {
+                schema::storage::install(tx).await?;
+            }
+            import_requests::migrate(tx).await?;
+            schema::storage::install_inline(tx).await?;
+            tx.execute_unprepared(
+                "UPDATE pin_management_readiness SET state='backfill' WHERE id=1",
+            )
             .await?;
+            needs_backfill = true;
+        }
+        tx.execute_unprepared("DELETE FROM seaql_migrations")
+            .await?;
+        tx.execute(Statement::from_sql_and_values(
+            tx.get_database_backend(),
+            "INSERT INTO seaql_migrations(version,applied_at) VALUES ($1,$2)",
+            [
+                schema::VERSION.into(),
+                chrono::Utc::now().timestamp().into(),
+            ],
+        ))
+        .await?;
     }
-    history::upgrade_stamp(&tx, &request, preparing)
+    history::upgrade_stamp(tx, &request, preparing)
         .await
         .map_err(|_| required())?;
     let state: String = tx
@@ -213,14 +286,22 @@ pub async fn upgrade_existing(
         .ok_or_else(required)?
         .try_get("", "state")?;
     if state == "ready" {
-        validate_existing(&tx).await?;
-        return tx.commit().await;
+        validate_existing(tx).await?;
+        return Ok(false);
     }
     if state != "backfill" {
         return Err(required());
     }
-    tx.commit().await?;
-    upgrade::backfill(db, &request).await
+    if preparing && !needs_backfill {
+        return Err(required());
+    }
+    // Inline installation does not replace existing storage guards. Validate
+    // both retained source storage and the complete prepared layout before any
+    // preparation writes (including the ledger and stamp) can commit.
+    schema::validate_for_upgrade(tx)
+        .await
+        .map_err(|_| required())?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -266,11 +347,11 @@ mod stage75_storage_tests {
     #[tokio::test]
     async fn stage7_startup_does_not_write_migration_lock_or_identity() {
         let db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
-        let count = crate::store::migrator::Migrator::migrations()
+        let count = crate::store::migrations::Historical::migrations()
             .iter()
             .position(|migration| migration.name() == "m20261017_000001_management_storage")
             .unwrap() as u32;
-        crate::store::migrator::Migrator::up(&db, Some(count))
+        crate::store::migrations::Historical::up(&db, Some(count))
             .await
             .unwrap();
         let before = crate::store::pinning::management::native::scope::binding(&db)

@@ -226,8 +226,17 @@ install、upgrade_existing、backfill 写入均属维护，不是业务实时开
 
 独立升级入口不加载 gateway config、不构造 AppState、不注册 provider、不启动 worker，
 不做 source/provider RPC。五个参数均必填，identity/scope 必须是授权原库的真实绑定。
-当前支持源版本 `m20261013_000001_zip_root_logical_release`，目标版本
-`m20261017_000001_management_storage`。CLI 未提供 identity discovery 命令。
+当前支持完整旧账本的 m13 `m20261013_000001_zip_root_logical_release`、
+m17 `m20261017_000001_management_storage` 和 m23 `m20261023_000001_inline_documents`，
+目标版本为 `m20261027_000001_schema_baseline`。CLI 未提供 identity discovery 命令。
+新库直接安装最终布局；ready m23 只转换活库账本并新增独立绑定证明，不重跑历史回填。
+旧 target 的不可变 stamp、archive 与 receipt 保持原字节。历史目录映射仅供读取，
+不把旧 confirmation/checkpoint 变为新版本执行授权。
+PG 显式升级的准备、每个历史 original、覆盖检查和最终 ready 发布分别使用受控连接；
+每个有界工作单元有 60 秒预算，整库历史回填没有共用的 60 秒总时限。取消或失败后先完成
+回滚、响应排空和会话设置恢复；无法确认清理成功的连接不返回池。不确定 COMMIT 不自动
+重试，调用者需重新连接并以原绑定显式恢复。损坏来源的准备写入在提交前完整校验并回滚，
+不会把缺失的原存储 guard 当作需要自动修复的迁移内容。
 只有对确切数据库另获升级授权、停止并排空旧 writers/workers、备份且验证可恢复后才可运行：
 
 ```powershell
@@ -236,7 +245,7 @@ ipfs-s3-gateway --pinning-manage-upgrade `
   --native-identity $upgradeNativeIdentity `
   --database-scope $upgradeDatabaseScope `
   --source-version m20261013_000001_zip_root_logical_release `
-  --target-version m20261017_000001_management_storage
+  --target-version m20261027_000001_schema_baseline
 ```
 
 先将三个变量设为核验过的本地值。参数形状不是生产维护授权。升级失败/backfill 未 ready

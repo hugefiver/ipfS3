@@ -346,7 +346,7 @@ pub(crate) async fn rebuild_runtime_source(
 /// Backfill requires initialization's validated capability for this exact
 /// transaction and database identity. It does not make ordinary reads ready.
 pub(crate) async fn rebuild_source_for_upgrade(
-    tx: &DatabaseTransaction,
+    tx: &impl crate::store::initialization::TransactionConnection,
     key: &NativeKey,
     budget: &mut Budget,
 ) -> Result<()> {
@@ -369,7 +369,7 @@ pub(crate) async fn rebuild_sources(
 }
 
 async fn rebuild_classified_sources(
-    tx: &DatabaseTransaction,
+    tx: &impl crate::store::initialization::TransactionConnection,
     keys: &BTreeSet<NativeKey>,
     budget: &mut Budget,
     runtime: Option<(&crate::store::RuntimeTransaction, DecodeWork<'_>)>,
@@ -377,9 +377,9 @@ async fn rebuild_classified_sources(
     if keys.is_empty() {
         return budget.check();
     }
-    discovery::fence_authority(tx).await?;
+    discovery::fence_authority_in(tx).await?;
     let spec = ScopeSpec::new(keys.iter().cloned().map(Selector::Exact).collect())?;
-    scope::fence_memberships(tx, &spec).await?;
+    scope::fence_memberships_in(tx, &spec).await?;
     let read = match runtime {
         Some((owner, work)) => scope::collect_runtime_scope(owner, &spec, budget, work).await?,
         None => scope::collect_scope(tx, &spec, budget).await?,
@@ -398,7 +398,7 @@ async fn rebuild_classified_sources(
     }
     match runtime {
         Some((owner, work)) => scope::revalidate_runtime_scope(owner, &read, budget, work).await?,
-        None => scope::revalidate_scope(tx, &read, budget).await?,
+        None => scope::revalidate_scope_in(tx, &read, budget).await?,
     };
     for key in keys {
         seal_source(tx, key, budget).await?;
@@ -407,7 +407,7 @@ async fn rebuild_classified_sources(
 }
 
 async fn replace_source_locators(
-    tx: &DatabaseTransaction,
+    tx: &impl crate::store::initialization::TransactionConnection,
     key: &NativeKey,
     selectors: BTreeSet<AuthoritySelector>,
     budget: &mut Budget,
@@ -446,7 +446,11 @@ async fn replace_source_locators(
     Ok(())
 }
 
-async fn seal_source(tx: &DatabaseTransaction, key: &NativeKey, budget: &mut Budget) -> Result<()> {
+async fn seal_source(
+    tx: &impl crate::store::initialization::TransactionConnection,
+    key: &NativeKey,
+    budget: &mut Budget,
+) -> Result<()> {
     let source = source_key(key)?;
     budget.charge(3, 1, 2, 0)?;
     let control=tx.query_one(Statement::from_sql_and_values(tx.get_database_backend(),"SELECT source_generation,locator_generation FROM pin_management_source_control WHERE source_key=$1",[source.clone().into()])).await.map_err(|_|ManagementError::Database)?.ok_or(ManagementError::InvalidEvidence)?;

@@ -28,7 +28,7 @@ pub(in crate::store::initialization::history) fn validate_frozen_binding(
 }
 
 pub(super) async fn store(
-    tx: &DatabaseTransaction,
+    tx: &impl TransactionConnection,
     id: &str,
     header: &ArchiveHeader,
     (key, row): (&NativeKey, &NativeRow),

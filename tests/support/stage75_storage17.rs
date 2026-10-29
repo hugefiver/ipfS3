@@ -2,7 +2,7 @@
 //! Archive bodies and action originals are retained, not reconstructed as legacy DTOs.
 #[path = "stage75_legacy_import.rs"]
 mod legacy_import;
-use ipfs_s3_gateway::store::pinning::management::{records::segmented::ArchiveHeader, schema};
+use ipfs_s3_gateway::store::pinning::management::records::segmented::ArchiveHeader;
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement, TransactionTrait};
 use sha2::{Digest, Sha256};
 
@@ -46,12 +46,10 @@ pub async fn restore(db: &DatabaseConnection) {
         .unwrap();
     legacy_import::restore(&tx).await;
     tx.execute_unprepared("DELETE FROM pin_management_revision WHERE source_table IN ('import_job_requests','pin_management_inline_archive')").await.unwrap();
-    tx.execute(Statement::from_sql_and_values(
-        DatabaseBackend::Sqlite,
-        "DELETE FROM seaql_migrations WHERE version=$1",
-        [schema::VERSION.into()],
-    ))
-    .await
-    .unwrap();
+    ipfs_s3_gateway::store::migrations::replace_sqlite_layout(
+        &tx,
+        ipfs_s3_gateway::store::migrations::history::M17,
+    )
+    .await;
     tx.commit().await.unwrap();
 }

@@ -3,7 +3,7 @@
 mod postgres;
 
 use crate::store::{self, migrations as m};
-use sea_orm::{ConnectionTrait, Database, DatabaseBackend, DatabaseConnection, Statement};
+use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 use sea_orm_migration::{MigrationTrait, MigratorTrait};
 
 pub(crate) struct Stage2;
@@ -77,7 +77,23 @@ pub(crate) async fn upgrade_with_historical_raw_tags(db: &DatabaseConnection) {
     ).await.unwrap();
 
     assert!(store::run_migrations(db).await.is_err());
-    store::migrator::Migrator::up(db, None).await.unwrap();
+    // Model the real old program finishing its historical migrations, then use
+    // the explicitly supported m23 maintenance entry into the new installation.
+    m::Historical::up(db, None).await.unwrap();
+    let (scope, identity) = store::pinning::management::native::scope::binding(db)
+        .await
+        .unwrap();
+    store::initialization::upgrade_existing(
+        db,
+        store::initialization::UpgradeRequest {
+            database_scope: &scope,
+            native_identity: &identity,
+            source_version: m::history::M23,
+            target_version: m::baseline::VERSION,
+        },
+    )
+    .await
+    .unwrap();
     // The idempotent startup path must not backfill decisions on a second run.
     store::run_migrations(db).await.unwrap();
     assert_eq!(count(db, "pin_extension_decisions").await, 0);
@@ -122,11 +138,21 @@ pub(crate) async fn upgrade_with_historical_raw_tags(db: &DatabaseConnection) {
 
 #[tokio::test]
 async fn sqlite_stage2_upgrade_does_not_promote_historical_control_tags() {
-    let db = Database::connect("sqlite::memory:").await.unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        directory
+            .path()
+            .join("stage2.sqlite")
+            .to_string_lossy()
+            .replace('\\', "/")
+    );
+    let db = store::connect_database(&url).await.unwrap();
     db.execute_unprepared("PRAGMA foreign_keys = ON")
         .await
         .unwrap();
     upgrade_with_historical_raw_tags(&db).await;
+    db.close().await.unwrap();
 }
 
 #[tokio::test]

@@ -32,10 +32,10 @@ pub(super) async fn own(pool: PgPool, stop: Stop) -> Result<(), DbErr> {
     .await
 }
 
-async fn own_work<F, W>(pool: PgPool, stop: Stop, work: F) -> Result<(), DbErr>
+pub(super) async fn own_work<T, F, W>(pool: PgPool, stop: Stop, work: F) -> Result<T, DbErr>
 where
     F: FnOnce(Guarded) -> W,
-    W: Future<Output = Result<(), DbErr>>,
+    W: Future<Output = Result<T, DbErr>>,
 {
     let main = tokio::select! {
         biased;
@@ -102,9 +102,13 @@ where
         ));
     }
     cleanup?;
+    // An unfinished root cancels its owner on Drop. After successful cleanup,
+    // preserve the operation's original error rather than replacing it with
+    // that secondary cancellation (maintenance callers retain SQLSTATE).
+    let output = work?;
     stop.check()?;
     served?;
-    work
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -188,8 +192,10 @@ impl Startup {
     async fn dispatch(&mut self, command: Command) -> Result<Response, DbErr> {
         self.stop.check()?;
         // An aborted transaction must be rolled back directly, without SET first.
-        if !matches!(command, Command::Rollback(_)) {
-            self.configure().await?;
+        match &command {
+            #[cfg(any(test, feature = "historical-fixtures"))]
+            Command::Rollback(_) => {}
+            _ => self.configure().await?,
         }
         self.stop.check()?;
         match command {
@@ -215,7 +221,11 @@ impl Startup {
                     &self.stop,
                     &mut self.poisoned,
                 )
-                .await?;
+                .await
+                .map_err(|error| match error {
+                    DbErr::Exec(source) => DbErr::Query(source),
+                    other => other,
+                })?;
                 Ok(Response::Rows(rows.into_iter().map(Into::into).collect()))
             }
             Command::Begin => {
@@ -255,6 +265,7 @@ impl Startup {
                 self.stack.pop();
                 Ok(Response::Done)
             }
+            #[cfg(any(test, feature = "historical-fixtures"))]
             Command::Rollback(id) => {
                 if self.stack.last() != Some(&id) {
                     return Err(failed());
@@ -329,7 +340,13 @@ where
     tokio::select! {
         biased;
         result = &mut future => {
-            let result = result.map_err(|_| failed());
+            let result = result.map_err(|error| {
+                if stop.0.retain_sql_errors {
+                    DbErr::Exec(sea_orm::RuntimeErr::SqlxError(error))
+                } else {
+                    failed()
+                }
+            });
             stop.check()?;
             return result;
         }

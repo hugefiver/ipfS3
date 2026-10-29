@@ -287,6 +287,18 @@ pub fn known_object(sql: Option<&str>, backend: DatabaseBackend) -> bool {
 }
 
 pub async fn install<C: ConnectionTrait>(db: &C) -> std::result::Result<(), sea_orm::DbErr> {
+    install_base(db, false).await
+}
+
+pub async fn install_fresh<C: ConnectionTrait>(db: &C) -> std::result::Result<(), sea_orm::DbErr> {
+    install_base(db, true).await?;
+    install_inline_state(db, true).await
+}
+
+async fn install_base<C: ConnectionTrait>(
+    db: &C,
+    fresh: bool,
+) -> std::result::Result<(), sea_orm::DbErr> {
     let backend = db.get_database_backend();
     for (_, ddl) in tables(backend)
         .into_iter()
@@ -299,7 +311,7 @@ pub async fn install<C: ConnectionTrait>(db: &C) -> std::result::Result<(), sea_
     }
     for table in native::registry()
         .into_iter()
-        .filter(|table| table.table != "import_job_requests")
+        .filter(|table| fresh || table.table != "import_job_requests")
     {
         db.execute(Statement::from_sql_and_values(
             backend,
@@ -317,7 +329,7 @@ pub async fn install<C: ConnectionTrait>(db: &C) -> std::result::Result<(), sea_
         .await?;
     }
     for (name, table, event, body) in triggers(backend) {
-        if table == INLINE || table == "import_job_requests" {
+        if table == INLINE || (!fresh && table == "import_job_requests") {
             continue;
         }
         for ddl in trigger_ddl(backend, &name, &table, event, &body) {
@@ -328,7 +340,7 @@ pub async fn install<C: ConnectionTrait>(db: &C) -> std::result::Result<(), sea_
         db.execute_unprepared("CREATE FUNCTION s75_no_truncate() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'controlled migration required'; END $$").await?;
         for table in native::registry()
             .into_iter()
-            .filter(|table| table.table != "import_job_requests")
+            .filter(|table| fresh || table.table != "import_job_requests")
         {
             db.execute_unprepared(&format!("CREATE TRIGGER s75_{}_truncate BEFORE TRUNCATE ON \"{}\" FOR EACH STATEMENT EXECUTE FUNCTION s75_no_truncate()",table.table,table.table)).await?;
         }
@@ -357,6 +369,11 @@ pub async fn install<C: ConnectionTrait>(db: &C) -> std::result::Result<(), sea_
         db.execute_unprepared("CREATE FUNCTION s75_chunk_guard() RETURNS trigger LANGUAGE plpgsql AS $$ DECLARE status TEXT; BEGIN SELECT state INTO STRICT status FROM pin_management_archive WHERE archive_id=NEW.archive_id FOR SHARE NOWAIT; IF status='sealed' THEN RAISE EXCEPTION 'immutable archive'; END IF; RETURN NEW; END $$").await?;
         db.execute_unprepared("CREATE TRIGGER s75_chunk_sealed BEFORE INSERT ON pin_management_archive_chunks FOR EACH ROW EXECUTE FUNCTION s75_chunk_guard()").await?;
     }
+    if fresh {
+        db.execute_unprepared("INSERT INTO pin_management_readiness VALUES (1,'S75A1','ready')")
+            .await?;
+        return Ok(());
+    }
     db.execute_unprepared("INSERT INTO pin_management_readiness VALUES (1,'S75A1','backfill')")
         .await?;
     // Migration publication is allowed only for a fresh management inventory.
@@ -370,6 +387,13 @@ pub async fn install<C: ConnectionTrait>(db: &C) -> std::result::Result<(), sea_
 
 /// Additive, lossless migration: existing S75A1 roots and chunks stay immutable.
 pub async fn install_inline<C: ConnectionTrait>(db: &C) -> std::result::Result<(), sea_orm::DbErr> {
+    install_inline_state(db, false).await
+}
+
+async fn install_inline_state<C: ConnectionTrait>(
+    db: &C,
+    fresh: bool,
+) -> std::result::Result<(), sea_orm::DbErr> {
     let backend = db.get_database_backend();
     for (_, ddl) in tables(backend)
         .into_iter()
@@ -400,7 +424,7 @@ pub async fn install_inline<C: ConnectionTrait>(db: &C) -> std::result::Result<(
         db.execute_unprepared("CREATE TRIGGER s75_inline_immutable BEFORE UPDATE OR DELETE ON pin_management_inline_archive FOR EACH ROW EXECUTE FUNCTION s75_immutable()").await?;
         db.execute_unprepared("CREATE TRIGGER s75_pin_management_inline_archive_truncate BEFORE TRUNCATE ON pin_management_inline_archive FOR EACH STATEMENT EXECUTE FUNCTION s75_no_truncate()").await?;
     }
-    archive_identity::install(db).await
+    archive_identity::install(db, fresh).await
 }
 
 pub async fn validate<C: ConnectionTrait>(db: &C) -> Result<()> {

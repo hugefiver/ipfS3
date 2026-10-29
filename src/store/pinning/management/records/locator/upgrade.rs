@@ -3,7 +3,7 @@ use super::*;
 use crate::store::initialization::{history::legacy, read_context};
 
 pub(super) async fn classify_for_write(
-    tx: &DatabaseTransaction,
+    tx: &impl crate::store::initialization::TransactionConnection,
     key: &NativeKey,
     row: &NativeRow,
     budget: &mut Budget,

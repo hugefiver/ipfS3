@@ -1,6 +1,6 @@
 //! Transaction-bound read capability for explicit history conversion only.
 use crate::store::pinning::management::{ManagementError, Result, native, schema};
-use sea_orm::{ConnectionTrait, DatabaseTransaction, Statement};
+use sea_orm::{ConnectionTrait, Statement};
 use std::future::Future;
 
 struct Context {
@@ -16,7 +16,7 @@ mod tests;
 /// No caller outside initialization can create this capability. It neither
 /// changes readiness nor propagates into spawned tasks or other transactions.
 pub(super) async fn run<T>(
-    tx: &DatabaseTransaction,
+    tx: &impl super::TransactionConnection,
     scope: &str,
     identity: &str,
     body: impl Future<Output = Result<T>>,

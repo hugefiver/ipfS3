@@ -368,7 +368,7 @@ impl NativeFrame {
     }
 }
 
-fn entity<E: EntityTrait + Default>() -> NativeTable {
+pub(super) fn entity<E: EntityTrait + Default>() -> NativeTable {
     let mut columns: Vec<_> = E::Column::iter().map(|c| Iden::to_string(&c)).collect();
     columns.sort();
     let table = E::default().table_name().to_owned();
@@ -413,7 +413,7 @@ fn import_job_table() -> NativeTable {
         .into();
     table
 }
-fn raw(table: &str, columns: &str, pk: &str) -> NativeTable {
+pub(super) fn raw(table: &str, columns: &str, pk: &str) -> NativeTable {
     let mut columns: Vec<_> = columns.split(',').map(str::to_owned).collect();
     columns.sort();
     let definitions = columns

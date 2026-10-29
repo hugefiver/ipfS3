@@ -60,7 +60,6 @@ impl Evidence {
         bytes: usize,
         work: SharedDecodeBudget,
     ) -> Result<Self> {
-        let db = &catalog;
         work.lock()
             .map_err(|_| ManagementError::InvalidEvidence)?
             .index_copy(&(scope, identity, keys))?;
@@ -98,7 +97,7 @@ impl Evidence {
         if !evidence.locators.is_empty() {
             return Err(ManagementError::Changed);
         }
-        evidence.load_dependencies(db, &plans).await?;
+        evidence.load_dependencies_catalog(catalog, &plans).await?;
         Ok(evidence)
     }
     async fn load_roots_reserved<C: ConnectionTrait>(
@@ -305,8 +304,21 @@ impl Evidence {
         db: &C,
         plans: &[String],
     ) -> Result<()> {
-        if crate::store::initialization::read_context::active(db).await? {
-            self.load_upgrade_dependencies(db, plans).await?;
+        self.load_dependencies_catalog(
+            crate::store::pinning::legacy_migration::ReceiptCatalog::full(db),
+            plans,
+        )
+        .await
+    }
+
+    async fn load_dependencies_catalog(
+        &mut self,
+        catalog: crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
+        plans: &[String],
+    ) -> Result<()> {
+        let db = &catalog;
+        if catalog.upgrade_read().await? {
+            self.load_upgrade_dependencies(catalog, plans).await?;
         } else {
             let original = self.rows.clone();
             self.budget()?.index_copy(&(plans, &self.scope))?;
@@ -368,9 +380,9 @@ impl Evidence {
     /// Upgrade-only original supplier: complete same-plan membership and the
     /// transitive source closure are fetched through length-first sliced reads.
     /// The archive decoder still verifies coordinates, subjects, bytes and cycles.
-    async fn load_upgrade_dependencies<C: ConnectionTrait>(
+    async fn load_upgrade_dependencies(
         &mut self,
-        db: &C,
+        catalog: crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
         plans: &[String],
     ) -> Result<()> {
         let mut pending = plans.iter().cloned().collect::<BTreeSet<_>>();
@@ -396,7 +408,7 @@ impl Evidence {
                 }
                 let target_plan = &key.values[1];
                 if !self.rows.contains_key(&key) {
-                    self.read_plans(db, std::slice::from_ref(target_plan))
+                    self.read_plans_catalog(catalog, std::slice::from_ref(target_plan))
                         .await?;
                 }
                 if !self.rows.contains_key(&key) {

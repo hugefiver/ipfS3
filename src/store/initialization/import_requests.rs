@@ -21,13 +21,28 @@ async fn source_page<C: ConnectionTrait>(
     rows.into_iter().map(|row| row.try_get("", "id")).collect()
 }
 
-pub(super) async fn migrate<C: ConnectionTrait>(db: &C) -> Result<(), DbErr> {
-    db.execute_unprepared("CREATE TABLE import_job_requests (job_id TEXT NOT NULL PRIMARY KEY, source_value TEXT NOT NULL, object_content_type TEXT, metadata_json TEXT NOT NULL, tags_json TEXT NOT NULL, pin_decision_json TEXT, zip_intent_json TEXT, decompress_prefix TEXT, root_capture_json TEXT, FOREIGN KEY(job_id) REFERENCES import_jobs(id) ON DELETE CASCADE)").await?;
+pub(crate) async fn migrate<C: ConnectionTrait>(db: &C) -> Result<(), DbErr> {
     let columns = import_job::Column::iter()
         .filter(|column| column.is_request())
         .map(|column| Iden::to_string(&column))
         .collect::<Vec<_>>();
     let names = columns.join(",");
+    if db.get_database_backend() == DatabaseBackend::Postgres {
+        let conflicts = db.query_all(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+            "SELECT DISTINCT i.relname AS name FROM pg_index x JOIN pg_class i ON i.oid=x.indexrelid JOIN pg_depend d ON d.classid='pg_class'::regclass AND d.objid=i.oid JOIN pg_attribute a ON a.attrelid=d.refobjid AND a.attnum=d.refobjsubid WHERE x.indrelid='import_jobs'::regclass AND a.attrelid=x.indrelid AND a.attname=ANY(string_to_array($1,',')) ORDER BY i.relname",
+            [names.clone().into()])).await?;
+        if !conflicts.is_empty() {
+            let names = conflicts
+                .into_iter()
+                .map(|r| r.try_get::<String>("", "name"))
+                .collect::<Result<Vec<_>, _>>()?;
+            return Err(DbErr::Migration(format!(
+                "import request columns have dependent indexes: {}",
+                names.join(", ")
+            )));
+        }
+    }
+    db.execute_unprepared("CREATE TABLE import_job_requests (job_id TEXT NOT NULL PRIMARY KEY, source_value TEXT NOT NULL, object_content_type TEXT, metadata_json TEXT NOT NULL, tags_json TEXT NOT NULL, pin_decision_json TEXT, zip_intent_json TEXT, decompress_prefix TEXT, root_capture_json TEXT, FOREIGN KEY(job_id) REFERENCES import_jobs(id) ON DELETE CASCADE)").await?;
     let mut after: Option<String> = None;
     loop {
         let ids = source_page(db, after.as_deref()).await?;

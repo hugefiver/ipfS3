@@ -47,9 +47,7 @@ pub(in crate::store::pinning) async fn receipt_schema<C: ConnectionTrait>(
     {
         return Err(refused("shadowed receipt catalog"));
     }
-    if versions.last().map(String::as_str)
-        != Some(crate::store::pinning::management::schema::VERSION)
-    {
+    if !crate::store::migrations::history::has_final_layout(&versions) {
         let partial = "SELECT 1 WHERE EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=current_schema() AND (starts_with(c.relname,'pin_management_') OR starts_with(c.relname,'s75_'))) OR EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname=current_schema() AND starts_with(p.proname,'s75_')) OR EXISTS (SELECT 1 FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=current_schema() AND starts_with(t.tgname,'s75_'))";
         if db
             .query_one(Statement::from_string(backend, partial))

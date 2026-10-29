@@ -34,11 +34,10 @@ pub(crate) fn archived_catalog(versions: &[String]) -> Result<&'static [NativeTa
         }
         tables
     });
-    if versions == *VERSIONS {
+    if versions == *VERSIONS || crate::store::migrations::history::is_m23(versions) {
         return Ok(current_catalog());
     }
-    let known = &*VERSIONS;
-    if versions.len() >= known.len() || versions != &known[..versions.len()] {
+    if !crate::store::migrations::history::is_prefix(versions) {
         return Err(ManagementError::InvalidEvidence);
     }
     match versions.last().map(String::as_str) {

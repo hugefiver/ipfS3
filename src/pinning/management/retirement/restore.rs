@@ -29,7 +29,10 @@ impl InventorySpool {
         self.source_scanned = false;
         let checkpoint = original.checkpoint().await?;
         if !checkpoint.complete()
-            || checkpoint.catalog_revision != crate::store::pinning::management::schema::VERSION
+            || !crate::store::migrations::history::final_checkpoint(
+                &checkpoint.catalog_revision,
+                &checkpoint.catalog,
+            )
         {
             return Err(ManagementError::InvalidEvidence);
         }

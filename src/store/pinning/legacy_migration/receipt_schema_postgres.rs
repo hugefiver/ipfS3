@@ -1,9 +1,6 @@
 //! Native catalogs prove receipt integrity without creating probe tables or rows.
 use super::invalid;
-use crate::{
-    error::AppResult,
-    store::migrations::m20261007_000001_legacy_pinning_migration::schema as expected,
-};
+use crate::{error::AppResult, store::migrations::legacy_receipts::schema as expected};
 use sea_orm::{ConnectionTrait, Statement};
 use std::collections::BTreeSet;
 

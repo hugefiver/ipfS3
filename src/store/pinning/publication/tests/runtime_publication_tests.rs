@@ -71,8 +71,8 @@ async fn rebuilt_store_publication_rejects_invalid_controls_and_shadows() {
             "UPDATE pin_management_readiness SET state='ready' WHERE id=1",
         ),
         (
-            "UPDATE seaql_migrations SET version='bad-runtime-version' WHERE version='m20261023_000001_inline_documents'",
-            "UPDATE seaql_migrations SET version='m20261023_000001_inline_documents' WHERE version='bad-runtime-version'",
+            "UPDATE seaql_migrations SET version='bad-runtime-version' WHERE version='m20261027_000001_schema_baseline'",
+            "UPDATE seaql_migrations SET version='m20261027_000001_schema_baseline' WHERE version='bad-runtime-version'",
         ),
         (
             "CREATE TEMP TABLE pin_management_records (state TEXT)",

@@ -5,7 +5,7 @@ use sea_orm::{ConnectionTrait, DatabaseBackend, DbErr, ExecResult, QueryResult, 
 
 #[derive(Clone, Copy)]
 pub(crate) enum ReceiptCatalog<'a> {
-    Full(&'a dyn ConnectionTrait),
+    Full(&'a dyn FullReceiptConnection),
     Runtime(
         &'a crate::store::RuntimeTransaction,
         records::DecodeWork<'a>,
@@ -14,9 +14,42 @@ pub(crate) enum ReceiptCatalog<'a> {
     Quota(&'a crate::store::pinning::quota::production::QuotaReadWindow<'a>),
 }
 
+/// Full reads retain the concrete connection owner, including transaction-bound
+/// maintenance read capabilities. The receipt wrapper itself remains read-only.
+#[async_trait::async_trait]
+pub(crate) trait FullReceiptConnection: ConnectionTrait {
+    async fn upgrade_read(&self) -> management::Result<bool>;
+    async fn scope(
+        &self,
+        spec: &management::native::scope::ScopeSpec,
+        budget: &mut management::native::meter::Budget,
+    ) -> management::Result<management::native::scope::ScopedRead>;
+}
+
+#[async_trait::async_trait]
+impl<C: ConnectionTrait> FullReceiptConnection for C {
+    async fn upgrade_read(&self) -> management::Result<bool> {
+        crate::store::initialization::read_context::active(self).await
+    }
+    async fn scope(
+        &self,
+        spec: &management::native::scope::ScopeSpec,
+        budget: &mut management::native::meter::Budget,
+    ) -> management::Result<management::native::scope::ScopedRead> {
+        management::native::scope::collect_scope(self, spec, budget).await
+    }
+}
+
 impl<'a> ReceiptCatalog<'a> {
     pub(crate) fn full<C: ConnectionTrait>(db: &'a C) -> Self {
         Self::Full(db)
+    }
+
+    pub(crate) async fn upgrade_read(self) -> management::Result<bool> {
+        match self {
+            Self::Full(db) => db.upgrade_read().await,
+            _ => Ok(false),
+        }
     }
 
     fn connection(&self) -> &dyn ConnectionTrait {
@@ -74,6 +107,7 @@ impl<'a> ReceiptCatalog<'a> {
         'a: 'b,
     {
         match self {
+            Self::Full(db) => Box::pin(db.scope(spec, budget)),
             Self::Runtime(tx, _) => Box::pin(management::native::scope::collect_runtime_scope(
                 tx, spec, budget, work,
             )),

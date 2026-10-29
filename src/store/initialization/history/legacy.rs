@@ -141,7 +141,7 @@ impl Review {
 /// Available only inside initialization's identity-bound upgrade transaction.
 /// The selected record's own scope/identity may be foreign; it remains data.
 pub(crate) async fn read(
-    tx: &DatabaseTransaction,
+    tx: &impl TransactionConnection,
     key: &NativeKey,
     budget: &mut Budget,
 ) -> Result<Review> {
@@ -149,7 +149,7 @@ pub(crate) async fn read(
 }
 
 async fn read_from(
-    tx: &DatabaseTransaction,
+    tx: &impl TransactionConnection,
     key: &NativeKey,
     frozen: Option<&BTreeMap<NativeKey, NativeRow>>,
     budget: &mut Budget,
@@ -384,7 +384,7 @@ fn check_core(
 /// Discriminates the incompatible provider shape before a current-DTO reader is
 /// used. Both branches still perform their complete strict decoding afterwards.
 pub(crate) async fn encoding(
-    tx: &DatabaseTransaction,
+    tx: &impl TransactionConnection,
     key: &NativeKey,
     budget: &mut Budget,
 ) -> Result<Option<bool>> {
@@ -433,7 +433,7 @@ pub(crate) async fn encoding(
 }
 
 pub(crate) async fn retirement(
-    tx: &DatabaseTransaction,
+    tx: &impl TransactionConnection,
     row: &NativeRow,
     budget: &mut Budget,
 ) -> Result<Review> {

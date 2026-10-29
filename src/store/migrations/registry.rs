@@ -3,13 +3,17 @@ use sea_orm_migration::MigrationTrait;
 
 macro_rules! migrations {
     ($($module:ident),+ $(,)?) => {
-        pub(crate) fn native() -> Vec<Box<dyn MigrationTrait>> {
-            vec![$(Box::new($module::Migration)),+]
-        }
-        pub(super) fn shared() -> Vec<Box<dyn bridge::SharedMigration>> {
+        #[cfg(any(test, feature = "historical-fixtures"))]
+        pub(crate) fn historical() -> Vec<Box<dyn MigrationTrait>> {
             vec![$(Box::new($module::Migration)),+]
         }
     }
+}
+pub(crate) fn native() -> Vec<Box<dyn MigrationTrait>> {
+    vec![Box::new(m20261027_000001_schema_baseline::Migration)]
+}
+pub(super) fn shared() -> Vec<Box<dyn bridge::SharedMigration>> {
+    vec![Box::new(m20261027_000001_schema_baseline::Migration)]
 }
 migrations!(
     m20250701_000001_init,

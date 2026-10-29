@@ -7,7 +7,7 @@ pub(super) async fn active_with_work<C: ConnectionTrait, W: Work>(
     versions: &[String],
     work: &W,
 ) -> Result<Vec<operation::Model>, W::Error> {
-    if !versions.iter().any(|version| version == SCHEMA) {
+    if !crate::store::migrations::history::has_stage(versions, SCHEMA) {
         return Ok(vec![]);
     }
     let table = crate::store::pinning::management::native::current_catalog()

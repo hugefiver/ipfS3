@@ -9,7 +9,7 @@ struct Stage5;
 #[async_trait::async_trait]
 impl MigratorTrait for Stage5 {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-        crate::store::migrator::Migrator::migrations()
+        crate::store::migrations::Historical::migrations()
             .into_iter()
             .take_while(|m| m.name() != "m20261004_000002_cluster_replica_contract")
             .collect()
@@ -98,9 +98,13 @@ async fn file_catalog(last: &str) -> (tempfile::TempDir, sea_orm::DatabaseConnec
 }
 
 async fn initialize_catalog(db: &sea_orm::DatabaseConnection, last: &str) {
-    let registry = store::migrator::Migrator::migrations();
+    if last == crate::store::pinning::management::schema::VERSION {
+        store::run_migrations(db).await.unwrap();
+        return;
+    }
+    let registry = store::migrations::Historical::migrations();
     let count = registry.iter().position(|m| m.name() == last).unwrap() + 1;
-    store::migrator::Migrator::up(db, Some(count as u32))
+    store::migrations::Historical::up(db, Some(count as u32))
         .await
         .unwrap();
     let actual: Vec<String> = db
@@ -136,7 +140,7 @@ async fn upgrade(db: &sea_orm::DatabaseConnection) {
         return;
     }
     let source = "m20261013_000001_zip_root_logical_release";
-    let registry = store::migrator::Migrator::migrations();
+    let registry = store::migrations::Historical::migrations();
     let source_count = registry
         .iter()
         .position(|migration| migration.name() == source)
@@ -151,7 +155,7 @@ async fn upgrade(db: &sea_orm::DatabaseConnection) {
         .unwrap()
         .len();
     if applied < source_count {
-        store::migrator::Migrator::up(db, Some((source_count - applied) as u32))
+        store::migrations::Historical::up(db, Some((source_count - applied) as u32))
             .await
             .unwrap();
     }

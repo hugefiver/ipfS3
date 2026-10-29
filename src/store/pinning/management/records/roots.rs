@@ -17,7 +17,9 @@ pub(crate) fn validate_rows(
             Err(ManagementError::Confirmation)
         };
     };
-    before.validate_current()?;
+    // Receipt validation also reads committed historical releases; execution
+    // separately requires the current schema at the action fence.
+    before.validate_final_layout()?;
     let Some(Capture::Provider(capture)) = &action.receipt.binding.capture else {
         return Err(ManagementError::Confirmation);
     };

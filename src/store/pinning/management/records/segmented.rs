@@ -1,5 +1,6 @@
 //! Immutable byte archives. Header and body are not, by themselves, authority.
 use super::*;
+use crate::store::initialization::TransactionConnection;
 use native::meter::{Budget, CELL_SLICE, PAGE_BYTES};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
@@ -43,6 +44,16 @@ pub async fn write_archive<R: Read>(
     input: &mut R,
     budget: &mut Budget,
 ) -> Result<ArchiveRef> {
+    write_archive_in(tx, id, header, input, budget).await
+}
+
+pub(crate) async fn write_archive_in<R: Read>(
+    tx: &impl TransactionConnection,
+    id: &str,
+    header: &ArchiveHeader,
+    input: &mut R,
+    budget: &mut Budget,
+) -> Result<ArchiveRef> {
     let _resident = budget.reserve(CELL_SLICE + 1)?;
     let mut prefix = Vec::with_capacity(CELL_SLICE + 1);
     input
@@ -57,7 +68,7 @@ pub async fn write_archive<R: Read>(
 }
 
 async fn write_segmented<R: Read>(
-    tx: &DatabaseTransaction,
+    tx: &impl TransactionConnection,
     id: &str,
     header: &ArchiveHeader,
     input: &mut R,

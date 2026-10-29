@@ -8,6 +8,7 @@ pub(crate) struct ArchivedRows {
     catalog: &'static [native::NativeTable],
     rows: Vec<Vec<Arc<RowHandle>>>,
 }
+
 impl ArchivedRows {
     pub(super) fn recheck(
         &self,
@@ -212,4 +213,43 @@ pub(super) fn load(
         catalog,
         rows,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn archived_execution_requires_current_schema_identity_not_only_layout() {
+        let fixture =
+            crate::store::pinning::management::actions::tests::fixture("archive-schema-authority")
+                .await;
+        let review = fixture.binding.review();
+        let original = review.archive();
+        FrozenRows::Archive(original).validate_current().unwrap();
+
+        let mut manifest: Manifest =
+            serde_json::from_str(&serde_json::to_string(&*original.manifest).unwrap()).unwrap();
+        manifest.0 =
+            crate::store::migrations::history::prefix(crate::store::migrations::history::M23)
+                .unwrap()
+                .iter()
+                .map(|version| (*version).to_owned())
+                .collect();
+        let catalog = native::archived_catalog(&manifest.0).unwrap();
+        assert!(catalog == original.catalog());
+        let historical = ArchivedRows {
+            owner: original.owner.clone(),
+            manifest: Arc::new(manifest),
+            catalog,
+            rows: original.rows.clone(),
+        };
+        FrozenRows::Archive(&historical)
+            .validate_final_layout()
+            .unwrap();
+        assert!(matches!(
+            FrozenRows::Archive(&historical).validate_current(),
+            Err(ManagementError::Schema)
+        ));
+    }
 }

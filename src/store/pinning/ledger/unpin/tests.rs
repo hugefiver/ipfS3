@@ -4,12 +4,12 @@ use sea_orm_migration::MigratorTrait;
 #[tokio::test]
 async fn historical_cleanup_uses_the_full_receipt_catalog() {
     let db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
-    let count = crate::store::migrator::Migrator::migrations()
+    let count = crate::store::migrations::Historical::migrations()
         .iter()
         .position(|migration| migration.name() == legacy_migration::SCHEMA)
         .unwrap()
         + 1;
-    crate::store::migrator::Migrator::up(&db, Some(count as u32))
+    crate::store::migrations::Historical::up(&db, Some(count as u32))
         .await
         .unwrap();
     let tx = db.begin().await.unwrap();

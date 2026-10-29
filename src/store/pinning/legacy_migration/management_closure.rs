@@ -24,7 +24,7 @@ pub(super) struct Closure {
 }
 
 pub(super) fn enabled(versions: &[String]) -> bool {
-    versions.iter().any(|version| version == schema::VERSION)
+    crate::store::migrations::history::has_final_layout(versions)
 }
 
 pub(super) async fn collect<C: ConnectionTrait>(

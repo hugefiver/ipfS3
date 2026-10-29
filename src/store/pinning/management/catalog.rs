@@ -104,7 +104,7 @@ pub(crate) fn entity_column(
 pub(crate) fn raw_column(table: &str, name: &str) -> NativeColumn {
     let kind = if matches!(
         name,
-        "epoch" | "expected_generation" | "input_art_size" | "size"
+        "epoch" | "expected_generation" | "input_art_size" | "size" | "archive_size"
     ) {
         "BIGINT"
     } else if matches!(
@@ -116,6 +116,10 @@ pub(crate) fn raw_column(table: &str, name: &str) -> NativeColumn {
         "TEXT"
     };
     let nullable = match table {
+        "zip_mpu_replays" => !matches!(
+            name,
+            "batch_id" | "request_fingerprint" | "request_contract"
+        ),
         "zip_v2_executions" => matches!(
             name,
             "input_sha256"

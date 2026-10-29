@@ -15,7 +15,7 @@ An S3-compatible gateway backed by IPFS (Kubo). Translates S3 API calls into Kub
 - **Object Versioning** — Unversioned, Enabled, and Suspended bucket states with S3-style version IDs, delete markers, and `ListObjectVersions`
 - **Lifecycle Rules** — Expiration, incomplete multipart abort, and current/noncurrent `STANDARD -> STANDARD_IA` transitions to an optional independent cold Kubo
 - **Streaming** — Request and response bodies stream end to end; the documented exception is a Range read of an encrypted object, which decrypts the full object before slicing; chunk-level encrypted Range reads are planned for v0.8
-- **Dual Backend** — SQLite (dev) or PostgreSQL (prod) via sea-orm, with sequential schema migrations
+- **Dual Backend** — SQLite (dev) or PostgreSQL (prod) via sea-orm, with a final-layout schema baseline and explicit historical upgrades
 - **Remote Pinning:** Asynchronous Pinata, Filebase PSA/RPC upload, and independent Kubo RPC pinning with ordered policies, durable work, leases, and local soft quotas
 - **Durable Import** — SigV4-authenticated CID or allowlisted HTTPS import with persisted progress, lease-based recovery, optional idempotency, optional ZIP extraction, and stale-publication fencing
 
@@ -1451,11 +1451,24 @@ an old Store after failed or completed maintenance.
 The separate `--pinning-manage-upgrade` command requires the exact existing DB
 URL, native physical identity, database scope, source version and target version.
 It doesn't load gateway config, construct AppState, register identities, start
-workers or perform source/provider RPC. The supported source is
-`m20261013_000001_zip_root_logical_release`; the target is
-`m20261017_000001_management_storage`. Obtain the actual identity/scope from
+workers or perform source/provider RPC. Supported sources are the exact historical
+ledgers ending at `m20261013_000001_zip_root_logical_release`,
+`m20261017_000001_management_storage`, or `m20261023_000001_inline_documents`.
+The target is `m20261027_000001_schema_baseline`. Obtain the actual identity/scope from
 authorized database records, not a guessed UUID or a file claim. No identity
 discovery CLI is provided here.
+
+Empty databases install the final layout directly with one baseline ledger entry.
+A ready m23 database retains its tables, indexes, identity, scope and historical
+archives; maintenance normalizes the live migration ledger and adds a separately
+bound conversion stamp without rerunning history backfill. m13/m17 conversions
+prepare the final layout atomically, convert each historical original in a separate
+transaction, then publish readiness behind the revision fence. Existing immutable
+stamps keep their original targets and bytes, including recoverable m13/m17-to-m23
+backfill interruptions. Repeating an upgrade requires its matching persisted stamp;
+a baseline ledger alone cannot prove an arbitrary source conversion. Historical
+catalog compatibility permits reading old evidence, not renewing old execution
+confirmations or checkpoints.
 
 An upgrade requires separate authorization for that database, stopped/drained old
 writers and workers, and a verified recoverable backup. Don't mix binary versions.
@@ -1502,7 +1515,7 @@ ipfs-s3-gateway --pinning-manage-upgrade `
   --native-identity $upgradeNativeIdentity `
   --database-scope $upgradeDatabaseScope `
   --source-version m20261013_000001_zip_root_logical_release `
-  --target-version m20261017_000001_management_storage
+  --target-version m20261027_000001_schema_baseline
 ```
 
 ### Policies and coordination

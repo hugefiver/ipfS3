@@ -2165,11 +2165,11 @@ async fn registered_r26_missing_immutable_or_item_bound_trigger_is_refused_read_
 }
 
 #[tokio::test]
-async fn unregistered_receipt_tables_are_not_a_known_stage6_schema() {
+async fn unregistered_receipt_tables_are_not_a_known_schema() {
     let (db, identity) = fixture().await;
     seed_usage(&db).await;
     db.execute_unprepared(
-        "DELETE FROM seaql_migrations WHERE version='m20261007_000001_legacy_pinning_migration'",
+        "DELETE FROM seaql_migrations WHERE version='m20261027_000001_schema_baseline'",
     )
     .await
     .unwrap();

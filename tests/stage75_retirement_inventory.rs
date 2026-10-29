@@ -1025,6 +1025,138 @@ fn archive_budget() -> store::pinning::management::native::meter::Budget {
         elapsed: Duration::from_secs(120),
     })
 }
+
+#[tokio::test]
+async fn frozen_m23_inventory_import_and_reconstruction_do_not_renew_checkpoint() {
+    use management::wire::v3::{self, Projection};
+    use store::migrations::history;
+    let directory = tempfile::tempdir().unwrap();
+    let db = Database::connect("sqlite::memory:").await.unwrap();
+    store::run_migrations(&db).await.unwrap();
+    let selected = route("selected", "selected");
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "INSERT INTO pin_provider_routes VALUES('selected',$1,'selected',0)",
+        [serde_json::to_string(&selected).unwrap().into()],
+    ))
+    .await
+    .unwrap();
+    let tx = db.begin().await.unwrap();
+    let checkpoint = SourceCheckpoint::start(
+        &tx,
+        management::RouteIdentity::from_original(selected.clone()),
+    )
+    .await
+    .unwrap();
+    tx.rollback().await.unwrap();
+    let path = directory.path().join("m23.sqlite");
+    let spool = InventorySpool::create(&path, reserve(&path), &checkpoint)
+        .await
+        .unwrap();
+    while spool.scan(&db, &limits()).await.unwrap() == Progress::Pending {}
+    // Construct a historical-layout fixture before producing any archive. Cells
+    // are unchanged: old m23 and baseline share this complete physical catalog.
+    let mut old = spool.checkpoint().await.unwrap();
+    old.catalog_revision = history::M23.into();
+    old.catalog = history::VERSIONS.iter().map(|s| (*s).into()).collect();
+    let editing = Database::connect(format!(
+        "sqlite://{}?mode=rw",
+        path.to_string_lossy().replace('\\', "/")
+    ))
+    .await
+    .unwrap();
+    editing
+        .execute(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE state SET checkpoint=$1 WHERE id=1",
+            [serde_json::to_string(&old).unwrap().into()],
+        ))
+        .await
+        .unwrap();
+    editing.close().await.unwrap();
+    while spool
+        .reduce(&config(selected.clone()), &limits())
+        .await
+        .unwrap()
+        == Progress::Pending
+    {}
+    let rebuilt_path = directory.path().join("rebuilt.sqlite");
+    let mut rebuilt = InventorySpool::create(&rebuilt_path, reserve(&rebuilt_path), &old.rewind())
+        .await
+        .unwrap();
+    while rebuilt.reconstruct(&spool, &limits()).await.unwrap() == Progress::Pending {}
+    assert!(rebuilt.checkpoint().await.unwrap() == old);
+    let request = checkpoint_request(&selected);
+    let local = management::Snapshot {
+        observed_at: old.observed_at.timestamp(),
+        database_now: Some(old.observed_at),
+        configuration: Some(config(selected)),
+        ..Default::default()
+    };
+    let union_path = directory.path().join("union.sqlite");
+    let union = management::retirement::PlanUnion::create(&union_path, reserve(&union_path))
+        .await
+        .unwrap();
+    let plan = loop {
+        if let Some(plan) = management::dry_run_retirement(
+            &request,
+            &local,
+            &[spool.frozen_review().await.unwrap()],
+            &[],
+            &union,
+            &limits(),
+        )
+        .await
+        .unwrap()
+        {
+            break plan;
+        }
+    };
+    let archive = directory.path().join("historical.v3");
+    write_canonical(
+        &spool,
+        &old,
+        reserve(&archive),
+        Projection::PrivateRecovery,
+        &plan,
+    )
+    .await;
+    let cursor = v3::archive_cursor::stage_import(
+        std::fs::File::open(&archive).unwrap(),
+        Projection::PrivateRecovery,
+        archive_budget(),
+    )
+    .unwrap()
+    .into_cursor();
+    let imported_path = directory.path().join("imported.sqlite");
+    let mut importer = management::retirement::FrozenRetirementImport::create(
+        cursor,
+        &imported_path,
+        reserve(&imported_path),
+        spool.reference().clone(),
+    )
+    .await
+    .unwrap();
+    while importer.advance(&limits()).await.unwrap() == Progress::Pending {}
+    let (imported, _, _) = importer.into_parts().unwrap();
+    assert!(imported.checkpoint().await.unwrap() == old);
+    let tx = db.begin().await.unwrap();
+    assert_eq!(old.check(&tx).await, Err(ManagementError::Changed));
+    assert!(
+        imported
+            .frozen_review()
+            .await
+            .unwrap()
+            .seal(&tx, &limits())
+            .await
+            .is_err()
+    );
+    tx.rollback().await.unwrap();
+    imported.close().await.unwrap();
+    rebuilt.close().await.unwrap();
+    spool.close().await.unwrap();
+    union.close().await.unwrap();
+}
 async fn write_canonical(
     spool: &InventorySpool,
     checkpoint: &SourceCheckpoint,

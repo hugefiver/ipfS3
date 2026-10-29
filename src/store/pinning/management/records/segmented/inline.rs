@@ -12,7 +12,7 @@ pub(crate) fn digest(header: &str, payload: &[u8]) -> String {
 }
 
 pub(super) async fn write(
-    tx: &DatabaseTransaction,
+    tx: &impl TransactionConnection,
     id: &str,
     header: &ArchiveHeader,
     raw: String,

@@ -1,8 +1,9 @@
 //! Explicit conversion output. Recovery reads verified archive references, not S7 text.
+use super::TransactionConnection;
 use crate::store::pinning::management::{self, ManagementError, Result, native, records};
 use native::{NativeKey, NativeRow, meter::Budget};
-use records::segmented::{ArchiveHeader, ArchiveRef, read_archive, write_archive};
-use sea_orm::{ConnectionTrait, DatabaseTransaction, Statement};
+use records::segmented::{ArchiveHeader, ArchiveRef, read_archive, write_archive_in};
+use sea_orm::{ConnectionTrait, Statement};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use std::io::{Seek, SeekFrom};
@@ -21,7 +22,7 @@ struct UpgradeStamp {
 }
 
 pub(crate) async fn upgrade_stamp(
-    tx: &DatabaseTransaction,
+    tx: &impl TransactionConnection,
     request: &super::UpgradeRequest<'_>,
     preparing: bool,
 ) -> Result<()> {
@@ -143,7 +144,7 @@ async fn reference<C: ConnectionTrait>(db: &C, id: &str) -> Result<Option<Archiv
 }
 
 async fn store_json<T: Serialize + ?Sized>(
-    tx: &DatabaseTransaction,
+    tx: &impl TransactionConnection,
     id: &str,
     header: &ArchiveHeader,
     value: &T,
@@ -155,7 +156,7 @@ async fn store_json<T: Serialize + ?Sized>(
         .file
         .seek(SeekFrom::Start(0))
         .map_err(|_| ManagementError::Database)?;
-    write_archive(tx, id, header, &mut spool.file, budget).await
+    write_archive_in(tx, id, header, &mut spool.file, budget).await
 }
 
 /// The archive trailer is verified before JSON is exposed. The caller's budget
@@ -406,7 +407,7 @@ pub async fn recover_frozen_review<C: ConnectionTrait>(
 }
 
 pub(crate) async fn convert_source(
-    tx: &DatabaseTransaction,
+    tx: &impl TransactionConnection,
     key: &NativeKey,
     scope: &str,
     identity: &str,

@@ -149,7 +149,7 @@ async fn postgres_executor_deadline_is_shared_across_successive_commands() {
     let started = Instant::now();
     let stop = Stop::new(started + Duration::from_secs(1));
     let observation = stop.clone();
-    let result = own_work(pool.clone(), stop, |db| async move {
+    let result: Result<(), DbErr> = own_work(pool.clone(), stop, |db| async move {
         let _root = db.begin().await?;
         db.query_one(statement("SELECT pg_sleep(0.6)")).await?;
         db.query_one(statement("SELECT pg_sleep(1)")).await?;
@@ -203,7 +203,7 @@ async fn postgres_executor_unwind_disconnects_the_unclean_backend() {
     let work_marker = marker.clone();
     let work_pool = pool.clone();
     let mut owner = tokio::spawn(async move {
-        own_work(
+        own_work::<(), _, _>(
             work_pool,
             Stop::new(Instant::now() + super::super::BUDGET),
             |db| async move {

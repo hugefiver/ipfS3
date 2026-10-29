@@ -25,14 +25,19 @@ pub(super) fn sqlite_guards() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
-pub(super) async fn install<C: ConnectionTrait>(db: &C) -> std::result::Result<(), sea_orm::DbErr> {
-    if db.get_database_backend() == DatabaseBackend::Postgres {
+pub(super) async fn install<C: ConnectionTrait>(
+    db: &C,
+    fresh: bool,
+) -> std::result::Result<(), sea_orm::DbErr> {
+    if !fresh && db.get_database_backend() == DatabaseBackend::Postgres {
         db.execute_unprepared("LOCK TABLE pin_management_archive IN ACCESS EXCLUSIVE MODE NOWAIT")
             .await?;
     }
     // Index construction copies only identities inside the database, not bodies
     // or a materialized application-side inventory. Old root bytes stay intact.
-    db.execute_unprepared("INSERT INTO pin_management_archive_identity(archive_id) SELECT archive_id FROM pin_management_archive").await?;
+    if !fresh {
+        db.execute_unprepared("INSERT INTO pin_management_archive_identity(archive_id) SELECT archive_id FROM pin_management_archive").await?;
+    }
     if db.get_database_backend() == DatabaseBackend::Sqlite {
         for (_, ddl) in sqlite_guards() {
             db.execute_unprepared(ddl).await?;
