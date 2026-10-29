@@ -34,6 +34,66 @@ The native runner isolation fixture is also directly runnable and is part of CI 
 pwsh -NoProfile -File tests/native-runner.Tests.ps1
 ```
 
+## CI test harness distribution
+
+The default CI compiles its Rust test set once with `cargo test --no-run` and
+Cargo JSON output. It packages only the executables reported for this package:
+the library and gateway test harnesses, `integration`, the three lightweight
+security targets, `schema_baseline`, `schema_baseline_semantics`, and the normal
+gateway binary required by Cargo's `CARGO_BIN_EXE_ipfs-s3-gateway` contract.
+The build job sets `CARGO_PROFILE_TEST_DEBUG=0` and
+`CARGO_PROFILE_DEV_DEBUG=0` only for this distributed harness build. CI test and
+gateway executables therefore omit debug symbols, while assertions and their
+panic source file/line remain enabled. Local Cargo development profiles are
+unchanged. Native-debugger and symbolized-backtrace source detail may consequently
+be reduced in CI failures. Consumers check out the same commit and extract the
+gzip-compressed tar (level 1) at the same absolute repository path and relative
+`target/ci` path. This preserves
+`CARGO_MANIFEST_DIR`, embedded gateway paths, executable modes, and repository
+working-directory behavior; the runner rejects a different checkout path.
+
+The library harness is listed dynamically with `--list --format terse`. Every
+listed test belongs to exactly one shard:
+
+- `store::pinning::management::` uses `management`.
+- Other `store::pinning::` tests use `store-pinning-control`, except
+  `store::pinning::legacy_migration::`, which stays in
+  `core-legacy-remainder`.
+- Other `pinning::` tests use `worker-providers`.
+- All remaining and newly introduced top-level modules use
+  `core-legacy-remainder`.
+
+Each nonempty shard starts the library harness once with exact OR filters, so
+in-process locks and `current_exe()` child tests retain normal libtest behavior.
+An empty shard fails without invoking the harness; it cannot falsely pass or
+accidentally run the full library suite. Ignored tests keep libtest's default
+ignored semantics.
+The separate non-library job executes every packaged harness, while the native
+PowerShell runner remains independent. The final job named `test` succeeds only
+when build, all matrix shards, non-library harnesses, native runner, Clippy, and
+formatting have all succeeded.
+
+The runner's focused behavior checks cover exhaustive and disjoint grouping,
+the explicit remainder, empty shards, and child exit-code propagation:
+
+```powershell
+python3 tests/ci_test_runner.Tests.py
+```
+
+CI build and execution entrypoints are:
+
+```powershell
+python3 scripts/ci_test_runner.py build
+python3 scripts/ci_test_runner.py run-lib-shard worker-providers
+python3 scripts/ci_test_runner.py run-harnesses integration http_admission
+```
+
+The build command uses the CI target set above rather than all integration-test
+targets. It does not opt ignored PostgreSQL tests into execution or provide an
+external database URL. Compilation, artifact transfer, and a local runner check
+do not establish cross-runner success or a performance improvement; those require
+the completed GitHub Actions run.
+
 ## Store lifecycle integrity
 
 The SQL observer records SeaORM metric-callback executions, including nested generic

@@ -11,6 +11,4 @@ mod fixtures;
 #[cfg(any(test, feature = "historical-fixtures"))]
 pub use fixtures::*;
 #[cfg(test)]
-mod baseline_tests;
-#[cfg(test)]
 mod stage3_tests;

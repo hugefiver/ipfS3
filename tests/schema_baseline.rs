@@ -124,14 +124,40 @@ async fn exercise(db: &DatabaseConnection, source: Option<&str>) {
             .await
             .is_err()
         );
-        assert!(
+        let owner_query = if db.get_database_backend() == DatabaseBackend::Sqlite {
+            "SELECT owner FROM buckets INDEXED BY idx_custom_bucket_owner WHERE owner='owner'"
+        } else {
+            use sea_orm::TransactionTrait;
+            let tx = db.begin().await.unwrap();
+            tx.execute_unprepared("SET LOCAL enable_seqscan=off")
+                .await
+                .unwrap();
+            let plan = tx
+                .query_all(Statement::from_string(
+                    db.get_database_backend(),
+                    "EXPLAIN ANALYZE SELECT owner FROM buckets WHERE owner='owner'",
+                ))
+                .await
+                .unwrap();
+            assert!(plan.iter().any(|row| {
+                row.try_get::<String>("", "QUERY PLAN")
+                    .unwrap()
+                    .contains("idx_custom_bucket_owner")
+            }));
+            tx.commit().await.unwrap();
+            "SELECT owner FROM buckets WHERE owner='owner'"
+        };
+        assert_eq!(
             db.query_one(Statement::from_string(
                 db.get_database_backend(),
-                "SELECT owner FROM buckets WHERE owner='owner'"
+                owner_query
             ))
             .await
             .unwrap()
-            .is_some()
+            .unwrap()
+            .try_get::<String>("", "owner")
+            .unwrap(),
+            "owner"
         );
     } else {
         initialization::open(db).await.unwrap();
@@ -150,34 +176,46 @@ async fn exercise(db: &DatabaseConnection, source: Option<&str>) {
     );
 }
 
+async fn sqlite_exercise(source: Option<&str>) {
+    let directory = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        directory
+            .path()
+            .join("source.sqlite")
+            .to_string_lossy()
+            .replace('\\', "/")
+    );
+    let db = store::connect_database(&url).await.unwrap();
+    exercise(&db, source).await;
+    db.close().await.unwrap();
+    let db = store::connect_database(&url).await.unwrap();
+    initialization::open(&db).await.unwrap();
+    assert_eq!(
+        store::object::get_by_id(&db, "object").await.unwrap().size,
+        3
+    );
+    db.close().await.unwrap();
+}
+
 #[tokio::test]
-async fn sqlite_fresh_and_bound_historical_sources() {
-    for source in [
-        None,
-        Some(history::M13),
-        Some(history::M17),
-        Some(history::M23),
-    ] {
-        let directory = tempfile::tempdir().unwrap();
-        let url = format!(
-            "sqlite://{}?mode=rwc",
-            directory
-                .path()
-                .join("source.sqlite")
-                .to_string_lossy()
-                .replace('\\', "/")
-        );
-        let db = store::connect_database(&url).await.unwrap();
-        exercise(&db, source).await;
-        db.close().await.unwrap();
-        let db = store::connect_database(&url).await.unwrap();
-        initialization::open(&db).await.unwrap();
-        assert_eq!(
-            store::object::get_by_id(&db, "object").await.unwrap().size,
-            3
-        );
-        db.close().await.unwrap();
-    }
+async fn sqlite_fresh() {
+    sqlite_exercise(None).await;
+}
+
+#[tokio::test]
+async fn sqlite_bound_m13() {
+    sqlite_exercise(Some(history::M13)).await;
+}
+
+#[tokio::test]
+async fn sqlite_bound_m17() {
+    sqlite_exercise(Some(history::M17)).await;
+}
+
+#[tokio::test]
+async fn sqlite_bound_m23() {
+    sqlite_exercise(Some(history::M23)).await;
 }
 
 #[tokio::test]

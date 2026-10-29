@@ -105,11 +105,39 @@ pub async fn sqlite(db: &DatabaseConnection) -> BTreeMap<String, Vec<String>> {
         if kind == "table" {
             result.insert(format!("checks:{name}"), checks(&sql));
         } else {
-            // The index key/expression list and WHERE predicate are its semantics;
-            // column/uniqueness/collation metadata is also compared by baseline_tests.
+            // Preserve index expressions and WHERE predicates in addition to PRAGMA metadata.
             let start = sql.find('(').unwrap();
             result.insert(format!("index:{name}"), vec![expression(&sql[start..])]);
         }
+    }
+    for (kind, sql) in [
+        (
+            "columns",
+            "SELECT json_array(s.name,p.name,upper(p.type),p.\"notnull\",p.dflt_value,p.pk) AS value FROM sqlite_schema s JOIN pragma_table_info(s.name) p WHERE s.type='table' AND s.name NOT IN ('sqlite_sequence','seaql_migrations','_ipfs_s3_migration_lock') ORDER BY value",
+        ),
+        (
+            "foreign_keys",
+            "SELECT json_array(s.name,f.seq,f.\"table\",f.\"from\",f.\"to\",f.on_update,f.on_delete,f.match) AS value FROM sqlite_schema s JOIN pragma_foreign_key_list(s.name) f WHERE s.type='table' ORDER BY value",
+        ),
+        (
+            "indexes",
+            "SELECT json_array(s.name,i.\"unique\",i.origin,i.partial,(SELECT json_group_array(json_array(x.name,x.desc,x.coll)) FROM (SELECT * FROM pragma_index_xinfo(i.name) WHERE key=1 ORDER BY seqno) x)) AS value FROM sqlite_schema s JOIN pragma_index_list(s.name) i WHERE s.type='table' AND s.name NOT IN ('seaql_migrations','_ipfs_s3_migration_lock') ORDER BY value",
+        ),
+        (
+            "triggers",
+            "SELECT json_array(tbl_name,name) AS value FROM sqlite_schema WHERE type='trigger' ORDER BY value",
+        ),
+    ] {
+        let rows = db
+            .query_all(Statement::from_string(db.get_database_backend(), sql))
+            .await
+            .unwrap();
+        result.insert(
+            kind.into(),
+            rows.into_iter()
+                .map(|row| row.try_get("", "value").unwrap())
+                .collect(),
+        );
     }
     result
 }

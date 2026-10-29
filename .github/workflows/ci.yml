@@ -10,7 +10,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  test:
+  clippy:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -23,27 +23,103 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
-
-      - name: Check
-        run: cargo check --all-targets
+        with:
+          shared-key: ci-clippy
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
-      - name: Unit tests
-        run: cargo test --lib
+  build-test-harnesses:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_DIR: target/ci
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v7
 
-      - name: Gateway lifecycle and readiness tests
-        run: cargo test --bin ipfs-s3-gateway
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: "1.92"
 
-      - name: Integration tests
-        run: cargo test --test integration
+      - name: Cache test build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-test-build
 
-      - name: Lightweight security regressions
-        run: |
-          cargo test --test http_admission
-          cargo test --test object_read_snapshot
-          cargo test --test bucket_config_owner_atomicity
+      - name: Test CI runner behavior
+        run: python3 tests/ci_test_runner.Tests.py
+
+      - name: Build test harnesses
+        run: python3 scripts/ci_test_runner.py build
+
+      - name: Upload test harnesses
+        uses: actions/upload-artifact@v7
+        with:
+          path: target/ci-test-harnesses.tar.gz
+          if-no-files-found: error
+          archive: false
+          retention-days: 1
+
+  lib-tests:
+    needs: build-test-harnesses
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - core-legacy-remainder
+          - worker-providers
+          - store-pinning-control
+          - management
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download test harnesses
+        uses: actions/download-artifact@v8
+        with:
+          name: ci-test-harnesses.tar.gz
+          path: target/download
+
+      - name: Extract test harnesses
+        shell: pwsh
+        run: tar -xzf target/download/ci-test-harnesses.tar.gz
+
+      - name: Run library shard
+        run: python3 scripts/ci_test_runner.py run-lib-shard ${{ matrix.shard }}
+
+  other-test-harnesses:
+    needs: build-test-harnesses
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download test harnesses
+        uses: actions/download-artifact@v8
+        with:
+          name: ci-test-harnesses.tar.gz
+          path: target/download
+
+      - name: Extract test harnesses
+        shell: pwsh
+        run: tar -xzf target/download/ci-test-harnesses.tar.gz
+
+      - name: Run non-library test harnesses
+        run: >-
+          python3 scripts/ci_test_runner.py run-harnesses
+          bin
+          integration
+          http_admission
+          object_read_snapshot
+          bucket_config_owner_atomicity
+          schema_baseline
+          schema_baseline_semantics
+
+  native-runner:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
 
       - name: Native runner isolation tests
         shell: pwsh
@@ -62,3 +138,37 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+  test:
+    if: ${{ always() }}
+    needs:
+      - clippy
+      - build-test-harnesses
+      - lib-tests
+      - other-test-harnesses
+      - native-runner
+      - fmt
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every CI task to pass
+        shell: pwsh
+        env:
+          CLIPPY_RESULT: ${{ needs.clippy.result }}
+          BUILD_RESULT: ${{ needs.build-test-harnesses.result }}
+          LIB_RESULT: ${{ needs.lib-tests.result }}
+          OTHER_RESULT: ${{ needs.other-test-harnesses.result }}
+          NATIVE_RESULT: ${{ needs.native-runner.result }}
+          FMT_RESULT: ${{ needs.fmt.result }}
+        run: |
+          $results = [ordered]@{
+            clippy = $env:CLIPPY_RESULT
+            build = $env:BUILD_RESULT
+            library = $env:LIB_RESULT
+            other = $env:OTHER_RESULT
+            native = $env:NATIVE_RESULT
+            fmt = $env:FMT_RESULT
+          }
+          $results.GetEnumerator() | ForEach-Object { Write-Host "$($_.Key): $($_.Value)" }
+          if (@($results.Values | Where-Object { $_ -ne 'success' }).Count -ne 0) {
+            throw 'One or more required CI tasks did not succeed'
+          }
