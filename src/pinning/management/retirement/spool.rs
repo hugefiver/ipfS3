@@ -7,6 +7,9 @@ use std::{
     time::{Duration, Instant},
 };
 pub(super) mod budget;
+#[cfg(test)]
+#[path = "spool/close_tests.rs"]
+mod close_tests;
 mod keys;
 #[cfg(test)]
 #[path = "spool/run_tests.rs"]
@@ -331,14 +334,30 @@ pub(super) async fn connect_file(path: &Path) -> Result<DatabaseConnection> {
     Ok(sea_orm::SqlxSqliteConnector::from_sqlx_sqlite_pool(pool))
 }
 
+pub(super) async fn close_file(db: &DatabaseConnection) -> Result<()> {
+    let pool = db.get_sqlite_connection_pool();
+    let connection = pool.acquire().await;
+    // Retain the single connection's permit until its worker has stopped.
+    // Mark the pool closed first, without awaiting it while holding that permit.
+    let ((), closed) = tokio::join!(
+        biased;
+        pool.close(),
+        async {
+            match connection {
+                Ok(connection) => connection.close().await,
+                Err(sqlx::Error::PoolClosed) => Ok(()),
+                Err(error) => Err(error),
+            }
+        }
+    );
+    closed.map_err(|_| ManagementError::Database)
+}
+
 pub(super) async fn close_failed_open<T>(db: &DatabaseConnection, result: Result<T>) -> Result<T> {
     match result {
         Ok(value) => Ok(value),
         Err(error) => {
-            db.clone()
-                .close()
-                .await
-                .map_err(|_| ManagementError::Database)?;
+            close_file(db).await?;
             Err(error)
         }
     }
@@ -349,11 +368,7 @@ impl InventorySpool {
         super::task_budget::TaskBudget::forward_cache(&self.db, false).await
     }
     pub async fn close(&self) -> Result<()> {
-        self.db
-            .clone()
-            .close()
-            .await
-            .map_err(|_| ManagementError::Database)
+        close_file(&self.db).await
     }
     /// The local artifact adapter supplies its exclusive, owner-protected
     /// reservation and a protected parent (SQLite journals share that parent).

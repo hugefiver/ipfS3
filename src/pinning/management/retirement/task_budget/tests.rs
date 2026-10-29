@@ -350,7 +350,7 @@ async fn failed_authority_decode_settles_actual_read_and_copy_work() {
     .unwrap();
     assert_eq!(get::<i64>(&row, "rows_used").unwrap() as u64, total.rows);
     assert_eq!(get::<i64>(&row, "bytes_used").unwrap() as u64, total.bytes);
-    reopened.close().await.unwrap();
+    spool::close_file(&reopened).await.unwrap();
     union.close().await.unwrap();
     workspace.cleanup().unwrap();
 }

@@ -69,11 +69,7 @@ impl PlanUnion {
         Ok(Self { db })
     }
     pub async fn close(&self) -> Result<()> {
-        self.db
-            .clone()
-            .close()
-            .await
-            .map_err(|_| ManagementError::Database)
+        super::spool::close_file(&self.db).await
     }
     /// Uses the same protected-file and protected-parent contract as InventorySpool.
     pub async fn create(path: &Path, reservation: std::fs::File) -> Result<Self> {
