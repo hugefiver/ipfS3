@@ -15667,7 +15667,7 @@ async fn lifecycle_expiration_noncurrent() {
     threshold.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lifecycle_expiration_invariants() {
     let mut deleted_config = start_lifecycle_harness(KuboScript::repeated_add(
         "QmLifecycleDeletedConfig",
@@ -15928,8 +15928,11 @@ async fn lifecycle_expiration_invariants() {
 
     let mut publication_delete_race = start_lifecycle_harness(KuboScript::repeated_add(
         "QmLifecyclePublicationDeleteRace",
-        2,
-        HashMap::new(),
+        3,
+        HashMap::from([(
+            "QmLifecyclePublicationDeleteRace".to_owned(),
+            b"replacement".to_vec(),
+        )]),
     ))
     .await;
     assert_eq!(
@@ -15956,36 +15959,90 @@ async fn lifecycle_expiration_invariants() {
         endpoint: publication_delete_race.endpoint.clone(),
         bucket: publication_delete_race.bucket.clone(),
     };
-    let (published, deleted) = tokio::join!(
+    // Hold the admitted PUT before publication so DELETE supersedes its fence.
+    let mut block = support::decompress::block_next_kubo_request(
+        &publication_delete_race.kubo,
+        KuboBlockTarget::PinAdd,
+        wiremock::ResponseTemplate::new(200).set_body_string("{\"Pins\":[]}"),
+    )
+    .await;
+    let task = tokio::spawn(async move {
         signed_put_with_tagging(
             &endpoint,
             "publication-delete-race",
             b"replacement".to_vec(),
             "generation=new",
-        ),
-        signed_delete_object(&endpoint, "publication-delete-race"),
-    );
-    assert_eq!(published.status(), StatusCode::OK);
+        )
+        .await
+    });
+    block.wait_until_blocked().await;
+    let deleted = signed_delete_object(&publication_delete_race, "publication-delete-race").await;
+    block.release();
+    let published = tokio::time::timeout(std::time::Duration::from_secs(10), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+    assert_eq!(published.status(), StatusCode::CONFLICT);
+    assert_mpu_s3_error(published, "OperationAborted").await;
     assert!(
-        matches!(
-            deleted.status(),
-            StatusCode::NO_CONTENT | StatusCode::CONFLICT
-        ),
-        "the concurrent delete must either serialize or report a mutation conflict"
+        publication_delete_race
+            .version_rows("publication-delete-race")
+            .await
+            .is_empty(),
+        "the superseded PUT must not resurrect the deleted object"
     );
-    if deleted.status() == StatusCode::CONFLICT {
-        assert_eq!(
-            signed_delete_object(&endpoint, "publication-delete-race")
-                .await
-                .status(),
-            StatusCode::NO_CONTENT,
-            "a serialized retry after the publication/delete race must complete"
-        );
-    }
+
+    assert_eq!(
+        signed_put_with_tagging(
+            &publication_delete_race,
+            "publication-delete-race",
+            b"replacement".to_vec(),
+            "generation=new",
+        )
+        .await
+        .status(),
+        StatusCode::OK,
+        "a serialized retry of the aborted PUT must publish"
+    );
+    let replacement = publication_delete_race
+        .version_rows("publication-delete-race")
+        .await;
+    assert_eq!(replacement.len(), 1);
     assert_eq!(
         publication_delete_race.execute_claim(&claim).await.state,
         "cancelled"
     );
+    assert_eq!(
+        publication_delete_race
+            .version_rows("publication-delete-race")
+            .await,
+        replacement,
+        "the old lifecycle claim must leave the replacement untouched"
+    );
+    assert_signed_body(
+        &publication_delete_race,
+        "publication-delete-race",
+        b"replacement",
+    )
+    .await;
+    assert_eq!(
+        signed_delete_object(&publication_delete_race, "publication-delete-race")
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert!(
+        publication_delete_race
+            .version_rows("publication-delete-race")
+            .await
+            .is_empty()
+    );
+    assert_mpu_s3_error(
+        signed_get(&publication_delete_race, "publication-delete-race").await,
+        "NoSuchKey",
+    )
+    .await;
     publication_delete_race.assert_no_pin_removal().await;
     publication_delete_race.shutdown().await;
 
