@@ -5,12 +5,12 @@ use sea_orm::{
     ConnectionTrait, DatabaseConnection, DatabaseTransaction, TransactionError, TransactionTrait,
 };
 
-use super::{PublicationObject, invalid_publication, leases, ledger, quota};
+use super::{PublicationObject, invalid_publication, ledger};
 use crate::{
     error::{AppError, AppResult},
     pinning::{
         tags::ObjectTag,
-        zip_policy::{CapturedZipIntent, ZipBoundOutput, select_zip_intents},
+        zip_policy::{CapturedZipIntent, ZipBoundOutput},
     },
     store::{
         object_version::{BucketVersioningState, PublicationResult},
@@ -23,7 +23,12 @@ pub(super) mod allocation;
 mod capture;
 mod execution;
 mod input;
+mod keys;
 mod legacy;
+mod objects;
+mod pins;
+mod sql;
+mod work;
 
 pub use execution::ZipExecutionSettlement;
 pub use input::{LegacyZipInputProof, bind_legacy_import_input, read_legacy_import_input};
@@ -70,10 +75,25 @@ pub async fn publish_captured_zip(
     db: &DatabaseConnection,
     request: CapturedZipPublication,
 ) -> AppResult<Vec<(String, PublicationResult)>> {
+    let request = std::sync::Arc::new(request);
+    let session = work::session(&request)?;
     for retry in 0..=super::MAX_TRANSACTION_RETRIES {
+        work::begin_attempt(&session)?;
         let request = request.clone();
+        let session = session.clone();
         match db
-            .transaction(|tx| Box::pin(async move { publish_in_transaction(tx, &request).await }))
+            .transaction(|tx| {
+                Box::pin(async move {
+                    publish_with_reservations(
+                        &mut super::reservations::BorrowedWithWork {
+                            db: tx,
+                            work: &session,
+                        },
+                        &request,
+                    )
+                    .await
+                })
+            })
             .await
         {
             Ok(result) => return Ok(result),
@@ -94,8 +114,9 @@ pub(crate) async fn publish_captured_zip_store(
     store: &crate::store::Store,
     request: CapturedZipPublication,
 ) -> AppResult<Vec<(String, PublicationResult)>> {
-    let session = super::super::management::records::SharedDecodeBudget::default();
+    let session = work::session(&request)?;
     for retry in 0..=super::MAX_TRANSACTION_RETRIES {
+        work::begin_attempt(&session)?;
         let tx = store
             .begin_publication_runtime(super::super::management::records::DecodeWork::shared(
                 &session,
@@ -263,17 +284,6 @@ fn candidate_binding(object: &PublicationObject) -> ZipBoundOutput {
     }
 }
 
-async fn bound(
-    tx: &DatabaseTransaction,
-    object: &PublicationObject,
-    path: &str,
-) -> AppResult<(ZipBoundOutput, VersionBinding)> {
-    let binding = storage::binding_for_published_object(tx, path, &object.id).await?;
-    let mut bound = candidate_binding(object);
-    bound.version_id = binding.version_row_id.clone();
-    Ok((bound, binding))
-}
-
 pub(super) async fn publish_in_transaction(
     tx: &DatabaseTransaction,
     request: &CapturedZipPublication,
@@ -281,6 +291,7 @@ pub(super) async fn publish_in_transaction(
     publish_with_reservations(&mut super::reservations::Borrowed(tx), request).await
 }
 
+#[tracing::instrument(name = "zip_publication", skip_all, fields(batch_id = %request.batch_id, outputs = request.successes.len()))]
 async fn publish_with_reservations<
     R: super::reservations::Reservations<Connection = DatabaseTransaction>,
 >(
@@ -291,7 +302,10 @@ async fn publish_with_reservations<
     validate(request)?;
     crate::store::import::ownership::lock_bucket_for_ownership(tx, request.capture.bucket())
         .await?;
-    let session = reservations.runtime_work().cloned().unwrap_or_default();
+    let session = match reservations.runtime_work() {
+        Some(session) => session.clone(),
+        None => work::session(request)?,
+    };
     let work = super::super::management::records::DecodeWork::shared(&session);
     work.with(|session| session.check())
         .map_err(super::super::management::admission::work_error)?;
@@ -319,9 +333,11 @@ async fn publish_with_reservations<
     let mut maintenance = PublicationLease::start(tx, maintained_guard, &request.batch_id).await?;
     let ordered = objects(request);
     let state = crate::store::bucket::lock_versioning_state(tx, request.capture.bucket()).await?;
-    let owners = lock_version_frontier(tx, &ordered, state, Some(&mut maintenance)).await?;
+    let locked_objects =
+        objects::LockedObjects::load(tx, request, work, Some(&mut maintenance)).await?;
+    let owners = locked_objects.owners(state);
     maintenance.checkpoint(tx).await?;
-    capture::verify_batch(tx, request).await?;
+    let batch_before = capture::verify_batch(tx, request).await?;
     if let storage::RootOutcome::Verified { claim, .. } = &request.root_outcome {
         maintenance
             .root_locked(tx, &request.batch_id, claim)
@@ -332,129 +348,124 @@ async fn publish_with_reservations<
     if let Some(snapshot) = &admission {
         execution::verify_manifest(tx, request, snapshot).await?;
     }
-    capture::verify_manifest(tx, request).await?;
+    let manifest_before = capture::verify_manifest(tx, request).await?;
+    let manifest_bytes = manifest_before.iter().try_fold(0usize, |total, row| {
+        total
+            .checked_add(row.batch_id.len())
+            .and_then(|n| n.checked_add(row.path.len()))
+            .and_then(|n| n.checked_add(row.object_key.as_ref().map_or(0, String::len)))
+            .and_then(|n| n.checked_add(row.cid.as_ref().map_or(0, String::len)))
+            .and_then(|n| n.checked_add(row.error_code.as_ref().map_or(0, String::len)))
+            .and_then(|n| n.checked_add(256))
+            .ok_or(AppError::ManagementBudget)
+    })?;
+    let _manifest_resident = sql::retain_copy(work, manifest_bytes)?;
 
     // This candidate selection is lock budgeting only. Real immutable row IDs
     // replace all placeholders before any decision/lease is written.
+    let candidate_inputs_resident = sql::retain_copy(work, work::candidate_bytes(request)?)?;
     let source_candidate = request.source.as_ref().map(candidate_binding);
     let candidates = request
         .successes
         .iter()
         .map(candidate_binding)
         .collect::<Vec<_>>();
-    let candidate = select_zip_intents(
+    let (candidate, _candidate_resident) = work::select(
         &request.capture,
         &request.manifest,
         source_candidate.as_ref(),
         &candidates,
-    )
-    .map_err(|_| invalid())?;
-    let (limits, routes, allocatable) =
-        allocation::frozen_allocation(&request.capture, &candidate)?;
-    let pairs =
-        allocation::attachment_pairs(reservations, &candidate, &limits, &mut maintenance, work)
-            .await?;
-    maintenance.checkpoint(tx).await?;
-    leases::lock_publication_lifecycle_frontier_with_maintenance(
+        work,
+    )?;
+    drop(source_candidate);
+    drop(candidates);
+    drop(candidate_inputs_resident);
+    let allocation_keys = keys::AllocationKeys::load(
         tx,
-        &owners,
-        &pairs,
+        &request.capture,
+        &candidate,
+        work,
         Some(&mut maintenance),
     )
     .await?;
-    maintenance.checkpoint(tx).await?;
-    quota::lock_publication_usage_rows(
-        tx,
-        &pairs.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
-    )
-    .await?;
-    maintenance.checkpoint(tx).await?;
-    if let Some(owner) = reservations.runtime() {
-        ledger::verify_runtime_birth_routes(owner, &routes, &allocatable, true, work).await?;
-    } else if allocatable.len() == routes.len() {
-        ledger::verify_selected_routes(tx, &routes, true).await?;
-    } else {
-        ledger::verify_birth_candidate_routes(tx, &routes, &allocatable, true).await?;
-    }
-    maintenance.checkpoint(tx).await?;
-    crate::store::residency::prepare_hot_publication_frontier_with_maintenance(
-        tx,
-        ordered.iter().map(|o| o.cid.clone()).collect(),
-        Some(&mut maintenance),
-    )
-    .await?;
+    let routes = &allocation_keys.routes;
+    let allocatable = &allocation_keys.enabled;
     maintenance.checkpoint(tx).await?;
     let now = crate::store::database_clock::database_now(tx).await?;
-    let mut results = Vec::with_capacity(ordered.len());
-    for object in ordered {
-        maintenance.checkpoint(tx).await?;
-        results.push((
-            object.key.clone(),
-            super::write_object_version_and_update_lifecycle(
-                tx,
-                object,
-                state,
-                now,
-                reservations.runtime(),
-            )
-            .await?,
-        ));
+    let pin_snapshot = pins::LockedPins::load(
+        reservations,
+        &allocation_keys,
+        &candidate,
+        &owners,
+        now,
+        work,
+        Some(&mut maintenance),
+    )
+    .await?;
+    let shape_bytes = work
+        .with(|session| allocation::selection_shape_bytes(&candidate, session))
+        .map_err(super::super::management::admission::work_error)?;
+    let candidate_shape_resident = sql::retain_copy(work, shape_bytes)?;
+    let candidate_shape = allocation::selection_shape(&candidate);
+    drop(candidate);
+    drop(_candidate_resident);
+    maintenance.checkpoint(reservations.db()).await?;
+    let tx = reservations.db();
+    allocation_keys
+        .verify_aliases(tx, work, Some(&mut maintenance))
+        .await?;
+    if let Some(owner) = reservations.runtime() {
+        ledger::verify_runtime_birth_routes(owner, routes, allocatable, true, work).await?;
+    } else if allocatable.len() == routes.len() {
+        ledger::verify_selected_routes(tx, routes, true).await?;
+    } else {
+        ledger::verify_birth_candidate_routes(tx, routes, allocatable, true).await?;
     }
     maintenance.checkpoint(tx).await?;
-    let source_bound = match request.source.as_ref() {
-        Some(object) => Some(bound(tx, object, "source").await?.0),
-        None => None,
-    };
-    let by_key = request
-        .successes
-        .iter()
-        .map(|o| (&o.key, o))
-        .collect::<BTreeMap<_, _>>();
-    let mut successful = Vec::new();
-    let mut bindings = Vec::new();
-    for file in &request.manifest.successful {
-        maintenance.checkpoint(tx).await?;
-        let (output, binding) = bound(tx, by_key[&file.object_key], &file.relative_path).await?;
-        successful.push(output);
-        bindings.push(binding);
-    }
-    let selected = select_zip_intents(
+    let physical_frontier = objects::prepare_physical(
+        tx,
+        ordered.iter().map(|object| object.cid.clone()).collect(),
+        now,
+        work,
+        Some(&mut maintenance),
+    )
+    .await?;
+    maintenance.checkpoint(tx).await?;
+    pin_snapshot
+        .lock_tail(tx, work, Some(&mut maintenance))
+        .await?;
+    let mut object_writes = locked_objects.plan(request, state, now, work)?;
+    let (selected, _selected_resident) = work::select(
         &request.capture,
         &request.manifest,
-        source_bound.as_ref(),
-        &successful,
-    )
-    .map_err(|_| invalid())?;
-    allocation::verify_candidate(&candidate, &selected)?;
-    if let (Some(source), Some(decision)) = (&request.source, &selected.source_decision) {
-        super::tags::replace_object_tags(tx, &source.id, &request.source_tags).await?;
-        crate::store::pinning::decision::write_for_object_in_transaction(tx, &source.id, decision)
-            .await?;
-    }
-    for (output, decision) in &selected.output_decisions {
-        maintenance.checkpoint(tx).await?;
-        // Each real output is a new control/version owner, not a reuse of the
-        // source's unique control revision. Authorization remains frozen.
-        let mut decision = decision.clone();
-        decision.control_revision = uuid::Uuid::new_v4().to_string();
-        crate::store::pinning::decision::write_for_object_in_transaction(
-            tx,
-            &output.object_id,
-            &decision,
-        )
+        object_writes.source.as_ref(),
+        &object_writes.outputs,
+        work,
+    )?;
+    allocation::verify_candidate(&candidate_shape, &selected)?;
+    object_writes.decisions(request, &selected, work)?;
+    let pin_writes = pin_snapshot.plan(&selected, &allocation_keys, &owners, request, now, work)?;
+    drop(selected);
+    drop(_selected_resident);
+    drop(candidate_shape);
+    drop(candidate_shape_resident);
+    let results = &object_writes.results;
+    let bindings = &object_writes.bindings;
+    object_writes
+        .persist(reservations.db(), work, &mut maintenance)
         .await?;
-    }
-    maintenance.checkpoint(tx).await?;
-    allocation::create_leases(reservations, &selected, &limits, now, &mut maintenance).await?;
+    pin_writes
+        .persist(reservations.db(), work, &mut maintenance)
+        .await?;
     let tx = reservations.db();
     maintenance.checkpoint(tx).await?;
-    let terminal = execution::terminal_result(tx, request, &results).await?;
+    let terminal = execution::terminal_result(tx, request, results).await?;
     match &request.root_outcome {
         storage::RootOutcome::ClaimedFailed { claim, code } => {
             storage::publish_with_maintenance(
                 tx,
                 &claim.batch_id,
-                &bindings,
+                bindings,
                 request.source.is_some(),
                 &terminal,
                 storage::RootOutcome::Failed { code },
@@ -467,7 +478,7 @@ async fn publish_with_reservations<
             storage::publish_with_maintenance(
                 tx,
                 &request.batch_id,
-                &bindings,
+                bindings,
                 request.source.is_some(),
                 &terminal,
                 outcome.clone(),
@@ -478,9 +489,16 @@ async fn publish_with_reservations<
         }
     }
     maintenance.checkpoint(tx).await?;
+    let settlement_bytes = match &request.authority {
+        ZipPublicationAuthority::Legacy(authority) => authority.result_rows.len().checked_mul(2048),
+        ZipPublicationAuthority::Execution { .. } => Some(0),
+    }
+    .and_then(|bytes| bytes.checked_add(terminal.len()))
+    .ok_or(AppError::ManagementBudget)?;
+    let _settlement_resident = sql::retain_copy(work, settlement_bytes)?;
     match &request.authority {
         ZipPublicationAuthority::Legacy(authority) => {
-            legacy::settle(tx, request, authority, &results, now).await?
+            legacy::settle(tx, request, authority, results, now).await?
         }
         ZipPublicationAuthority::Execution {
             claim,
@@ -494,16 +512,35 @@ async fn publish_with_reservations<
                 claim,
                 source_guard.as_ref(),
                 settlement,
-                &results,
+                results,
                 &terminal,
                 now,
             )
             .await?
         }
     }
+    storage::verify_published(
+        tx,
+        &batch_before,
+        &manifest_before,
+        bindings,
+        request.source.is_some(),
+        &terminal,
+        &request.root_outcome,
+    )
+    .await?;
+    object_writes.verify(tx, work).await?;
+    physical_frontier.verify(tx, work, None).await?;
+    pin_writes.verify(reservations, work).await?;
+    if let Some(owner) = reservations.runtime() {
+        ledger::verify_runtime_birth_routes(owner, routes, allocatable, false, work).await?;
+    } else {
+        ledger::verify_birth_candidate_routes(tx, routes, allocatable, false).await?;
+    }
+    allocation_keys.verify_aliases(tx, work, None).await?;
     work.with(|session| session.check())
         .map_err(super::super::management::admission::work_error)?;
-    Ok(results)
+    Ok(object_writes.results)
 }
 
 pub(super) use capture::read_capture;

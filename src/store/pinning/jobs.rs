@@ -3104,7 +3104,10 @@ pub(crate) async fn finish_nonprojecting_job<C: ConnectionTrait>(
     Ok(())
 }
 
-fn new_job_active_model(job: NewPinJob, now: DateTimeUtc) -> pin_job::ActiveModel {
+pub(in crate::store::pinning) fn new_job_active_model(
+    job: NewPinJob,
+    now: DateTimeUtc,
+) -> pin_job::ActiveModel {
     match job {
         NewPinJob::Target(job) => {
             let operation = job.operation.operation();

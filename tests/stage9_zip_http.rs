@@ -20,11 +20,12 @@ use http::{HeaderMap, StatusCode};
 use ipfs_s3_gateway::store::{
     self,
     entities::{
-        object, object_version, pin_lease, pin_lease_target, pin_provider_usage, remote_pin,
+        object, object_version, pin_invocation_route, pin_job, pin_lease, pin_lease_target,
+        pin_provider_usage, remote_pin,
     },
     zip,
 };
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
 
 use fixture::{
     ARCHIVE_CID, ARCHIVE_KEY, BUCKET, ENTRY_POINTS, EntryPoint, Fixture, OUTPUT_BODY, OUTPUT_CID,
@@ -354,15 +355,15 @@ async fn assert_quota(fixture: &Fixture, occupied: bool, cid: &str, size: i64) {
         );
         assert_ne!(
             remotes[0].status, "pinned",
-            "fixture must not pretend Noop/remote work completed"
+            "fixture must not pretend remote work completed"
         );
     }
     let usages = pin_provider_usage::Entity::find().all(db).await.unwrap();
-    assert!(
-        usages
-            .iter()
-            .all(|usage| usage.provider == fixture.provider)
-    );
+    assert_eq!(usages.len(), if occupied { 4 } else { 0 });
+    assert!(usages.iter().all(|usage| {
+        usage.provider == fixture.provider
+            || (usage.reserved_pins == 0 && usage.reserved_bytes == 0)
+    }));
     assert_eq!(
         usages.iter().map(|usage| usage.reserved_pins).sum::<i64>(),
         i64::from(occupied)
@@ -414,6 +415,166 @@ async fn assert_non_zip_automatic(fixture: &Fixture) {
         )
     );
     assert_quota(fixture, true, ARCHIVE_CID, object.size).await;
+}
+
+async fn run_distinct_output_batch(outputs: usize) {
+    let archive = zip_fixture::distinct_outputs_zip(outputs);
+    let output_cids = zip_fixture::distinct_output_cids(outputs);
+    let replies = output_cids.iter().map(|cid| AddReply::Ok(cid)).collect();
+    let fixture = Fixture::new(EntryPoint::CompleteMpu, true, &archive, replies).await;
+    let outcome = AssertUnwindSafe(async {
+        fixture.enable_versioning().await;
+        let upload_id = fixture
+            .publish(EntryPoint::CompleteMpu, archive, true, false)
+            .await;
+        let db = fixture.state.store.db();
+        let snapshot = zip::snapshot(db, &upload_id).await.unwrap().unwrap();
+        assert_eq!(snapshot.batch.state, "published");
+        assert_eq!(
+            snapshot.batch.root_status, "complete",
+            "root publication: {:?}",
+            snapshot.batch
+        );
+        assert_eq!(snapshot.batch.root_cid.as_deref(), Some(ROOT_CID));
+        assert!(snapshot.batch.terminal_result.is_some());
+        assert_eq!(snapshot.entries.len(), outputs);
+        assert!(snapshot.entries.iter().all(|entry| {
+            entry.error_code.is_none()
+                && entry.version_row_id.is_some()
+                && entry.object_key.is_some()
+        }));
+        let actual_cids = snapshot
+            .entries
+            .iter()
+            .map(|entry| entry.cid.as_deref().unwrap())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual_cids, output_cids.iter().copied().collect());
+
+        let source = store::object::get_latest(db, BUCKET, ARCHIVE_KEY)
+            .await
+            .unwrap();
+        assert_eq!(source.cid, ARCHIVE_CID);
+        assert_eq!(
+            object::Entity::find().count(db).await.unwrap(),
+            (outputs + 1) as u64
+        );
+        assert_eq!(
+            object_version::Entity::find().count(db).await.unwrap(),
+            (outputs + 1) as u64
+        );
+        let leases = pin_lease::Entity::find().all(db).await.unwrap();
+        assert_eq!(leases.len(), outputs);
+        assert!(leases.iter().all(|lease| {
+            lease.source == "automatic" && lease.provider_mode == "one" && lease.state == "active"
+        }));
+        let targets = pin_lease_target::Entity::find().all(db).await.unwrap();
+        assert_eq!(targets.len(), outputs);
+        assert!(targets.iter().all(|target| {
+            target.provider == fixture.provider
+                && target.state == "waiting"
+                && actual_cids.contains(target.cid.as_str())
+        }));
+        let remotes = remote_pin::Entity::find().all(db).await.unwrap();
+        assert_eq!(remotes.len(), outputs);
+        assert_eq!(
+            pin_job::Entity::find().count(db).await.unwrap(),
+            outputs as u64
+        );
+        assert_eq!(
+            pin_invocation_route::Entity::find()
+                .count(db)
+                .await
+                .unwrap(),
+            outputs as u64
+        );
+        let usages = pin_provider_usage::Entity::find().all(db).await.unwrap();
+        assert_eq!(usages.len(), 4);
+        assert_eq!(
+            usages.iter().map(|usage| usage.reserved_pins).sum::<i64>(),
+            outputs as i64
+        );
+        assert_eq!(
+            usages.iter().map(|usage| usage.reserved_bytes).sum::<i64>(),
+            outputs as i64 * 8
+        );
+        for index in [0, outputs / 2, outputs - 1] {
+            let key = format!("expanded/entry-{index:02}.txt");
+            let response = send_sigv4(
+                reqwest::Method::GET,
+                fixture.endpoint(),
+                BUCKET,
+                &key,
+                &[],
+                Vec::new(),
+                HeaderMap::new(),
+                "test",
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "GET {key}");
+            assert_eq!(
+                response.bytes().await.unwrap().as_ref(),
+                &(index as u64).to_le_bytes()
+            );
+        }
+
+        let before_replay = (
+            object_version::Entity::find().count(db).await.unwrap(),
+            pin_lease::Entity::find().count(db).await.unwrap(),
+            pin_lease_target::Entity::find().count(db).await.unwrap(),
+            remote_pin::Entity::find().count(db).await.unwrap(),
+            pin_job::Entity::find().count(db).await.unwrap(),
+            pin_invocation_route::Entity::find()
+                .count(db)
+                .await
+                .unwrap(),
+        );
+        let replay = support::decompress::complete_multipart(
+            &fixture,
+            ARCHIVE_KEY,
+            &upload_id,
+            &[(1, fixture::PART_CID.to_owned())],
+        )
+        .await;
+        let status = replay.status();
+        let body = replay.text().await.unwrap();
+        assert_eq!(status, StatusCode::OK, "Complete replay: {body}");
+        assert!(body.contains(ARCHIVE_CID), "{body}");
+        assert_eq!(
+            (
+                object_version::Entity::find().count(db).await.unwrap(),
+                pin_lease::Entity::find().count(db).await.unwrap(),
+                pin_lease_target::Entity::find().count(db).await.unwrap(),
+                remote_pin::Entity::find().count(db).await.unwrap(),
+                pin_job::Entity::find().count(db).await.unwrap(),
+                pin_invocation_route::Entity::find()
+                    .count(db)
+                    .await
+                    .unwrap(),
+            ),
+            before_replay
+        );
+    })
+    .catch_unwind()
+    .await;
+    fixture.shutdown().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
+async fn legacy_complete_mpu_four_psa_one_publishes_21_distinct_outputs_and_replays() {
+    run_distinct_output_batch(21).await;
+}
+
+#[tokio::test]
+async fn legacy_complete_mpu_four_psa_one_publishes_256_distinct_outputs_and_replays() {
+    run_distinct_output_batch(256).await;
+}
+
+#[tokio::test]
+async fn legacy_complete_mpu_four_psa_one_publishes_1649_distinct_outputs_and_replays() {
+    run_distinct_output_batch(1649).await;
 }
 
 #[tokio::test]

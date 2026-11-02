@@ -9,8 +9,9 @@ use ipfs_s3_gateway::{
     store::{
         self,
         entities::{
-            object, object_version, pin_extension_decision, pin_job, pin_lease, pin_lease_target,
-            pin_provider_usage, remote_pin,
+            object, object_version, physical_residency, pin_extension_decision,
+            pin_invocation_route, pin_job, pin_lease, pin_lease_target, pin_provider_usage,
+            remote_pin, remote_pin_ledger,
         },
         pinning::publication,
     },
@@ -289,11 +290,56 @@ async fn r25_store_tail_manifest_fault_rolls_back_versions_leases_quota_jobs_and
         0
     );
     assert_eq!(pin_job::Entity::find().count(&db).await.unwrap(), 0);
+    assert_eq!(
+        pin_invocation_route::Entity::find()
+            .count(&db)
+            .await
+            .unwrap(),
+        0
+    );
     assert_eq!(remote_pin::Entity::find().count(&db).await.unwrap(), 0);
+    assert_eq!(
+        remote_pin_ledger::Entity::find().count(&db).await.unwrap(),
+        0
+    );
+    assert_eq!(
+        physical_residency::Entity::find().count(&db).await.unwrap(),
+        0
+    );
     let snapshot = store::zip::snapshot(&db, "batch").await.unwrap().unwrap();
     assert_eq!(snapshot.batch.state, "open");
     assert!(snapshot.batch.terminal_result.is_none());
     assert!(snapshot.entries.iter().all(|e| e.version_row_id.is_none()));
+}
+
+#[tokio::test]
+async fn zip_settlement_manifest_drift_rolls_back_the_entire_publication() {
+    for mutation in [
+        "UPDATE zip_manifest_entries SET cid='tampered' WHERE batch_id=NEW.id AND cid IS NOT NULL;",
+        "UPDATE zip_manifest_entries SET size=size+1 WHERE batch_id=NEW.id AND cid IS NOT NULL;",
+        "UPDATE physical_residencies SET verification_state='failed';",
+        "INSERT INTO zip_manifest_entries(batch_id,path,error_code,created_at) SELECT NEW.id,'extra-failure','invalid_path',created_at FROM zip_manifest_entries WHERE batch_id=NEW.id LIMIT 1;",
+    ] {
+        let db = setup().await;
+        let config = config();
+        let (request, batch, capture, guard) = prepared(&db, &config, vec![]).await;
+        db.execute_unprepared(&format!(
+            "CREATE TRIGGER mutate_manifest AFTER UPDATE OF state ON zip_batches WHEN NEW.state='published' BEGIN {mutation} END"
+        ))
+        .await
+        .unwrap();
+        let before = sqlite_publication_snapshot(&db).await;
+        let result = publish_captured(&db, request, batch, &capture, guard).await;
+        assert!(
+            matches!(
+                result,
+                Err(ipfs_s3_gateway::error::AppError::Internal(_)
+                    | ipfs_s3_gateway::error::AppError::InvalidPinningRequest(_))
+            ),
+            "manifest mutation must reach final validation: {mutation}; got {result:?}"
+        );
+        assert_eq!(sqlite_publication_snapshot(&db).await, before);
+    }
 }
 
 #[tokio::test]

@@ -30,7 +30,7 @@ pub(in crate::store::pinning::publication) fn read_capture(
 pub(super) async fn verify_batch(
     tx: &DatabaseTransaction,
     request: &CapturedZipPublication,
-) -> AppResult<()> {
+) -> AppResult<zip_batch::Model> {
     let query = zip_batch::Entity::find_by_id(&request.batch_id);
     let row = if tx.get_database_backend() == DatabaseBackend::Postgres {
         query.lock_exclusive().one(tx).await?
@@ -81,13 +81,13 @@ pub(super) async fn verify_batch(
             }
         }
     }
-    Ok(())
+    Ok(row)
 }
 
 pub(super) async fn verify_manifest(
     tx: &DatabaseTransaction,
     request: &CapturedZipPublication,
-) -> AppResult<()> {
+) -> AppResult<Vec<zip_manifest_entry::Model>> {
     let query = zip_manifest_entry::Entity::find()
         .filter(zip_manifest_entry::Column::BatchId.eq(&request.batch_id));
     let rows = if tx.get_database_backend() == DatabaseBackend::Postgres {
@@ -96,13 +96,13 @@ pub(super) async fn verify_manifest(
         query.all(tx).await?
     };
     let mut successes = BTreeSet::new();
-    for row in rows {
+    for row in &rows {
         if row.version_row_id.is_some() {
             return Err(invalid());
         }
-        match (row.object_key, row.cid, row.size, row.error_code) {
+        match (&row.object_key, &row.cid, row.size, &row.error_code) {
             (Some(key), Some(cid), Some(size), None) => {
-                successes.insert((row.path, key, cid, size));
+                successes.insert((row.path.clone(), key.clone(), cid.clone(), size));
             }
             (None, None, None, Some(_)) => {}
             _ => return Err(invalid()),
@@ -126,5 +126,5 @@ pub(super) async fn verify_manifest(
             "stale ZIP batch manifest binding".into(),
         ));
     }
-    Ok(())
+    Ok(rows)
 }

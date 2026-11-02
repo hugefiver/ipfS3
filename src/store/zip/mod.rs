@@ -6,7 +6,7 @@ pub mod import_intake;
 mod manifest;
 mod publication;
 pub(crate) mod publication_lease;
-pub(crate) use publication::publish_with_maintenance;
+pub(crate) use publication::{publish_with_maintenance, verify_published};
 pub mod recovery;
 mod root;
 

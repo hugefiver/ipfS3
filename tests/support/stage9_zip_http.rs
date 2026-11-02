@@ -1,7 +1,7 @@
 //! Owned real-TCP fixture for legacy ZIP automatic-output pinning acceptance.
 //!
-//! No pinning worker is started: Noop is a local CID route, not evidence that a
-//! remote provider has pinned anything. Assertions observe durable publication.
+//! No pinning worker is started: local PSA endpoints are routing fixtures, not
+//! evidence that a remote provider has pinned anything. Assertions observe durable publication.
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
@@ -31,7 +31,7 @@ use crate::support::{
 pub const ARCHIVE_CID: &str = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
 pub const OUTPUT_CID: &str = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyk4";
 pub const ROOT_CID: &str = "bafybeib4r26s6xrk5uqyy6k5lkwxmrsfecmfxluvlz44b2qnt3rottiw3u";
-const PART_CID: &str = "QmStage9Part";
+pub const PART_CID: &str = "QmStage9Part";
 pub const BUCKET: &str = "test-bkt";
 pub const ARCHIVE_KEY: &str = "archive.zip";
 pub const OUTPUT_BODY: &[u8] = b"\0";
@@ -85,18 +85,30 @@ impl Fixture {
             }
             EntryPoint::Import => {}
         }
+        let mut cat_bodies = HashMap::from([
+            (ARCHIVE_CID.into(), archive.to_vec()),
+            (PART_CID.into(), archive.to_vec()),
+            (OUTPUT_CID.into(), OUTPUT_BODY.to_vec()),
+        ]);
+        for (index, reply) in replies.iter().enumerate() {
+            if let AddReply::Ok(cid) = reply
+                && *cid != OUTPUT_CID
+            {
+                cat_bodies.insert((*cid).to_owned(), (index as u64).to_le_bytes().to_vec());
+            }
+        }
+        let sizes = cat_bodies
+            .iter()
+            .map(|(cid, bytes)| (cid.clone(), bytes.len()))
+            .collect();
         add_replies.extend(replies);
         let kubo = start_kubo_harness(KuboScript {
             add_replies,
-            cat_bodies: HashMap::from([
-                (ARCHIVE_CID.into(), archive.to_vec()),
-                (PART_CID.into(), archive.to_vec()),
-                (OUTPUT_CID.into(), OUTPUT_BODY.to_vec()),
-            ]),
+            cat_bodies,
         })
         .await
         .server;
-        mount_directory_and_import(&kubo, archive.len()).await;
+        mount_directory_and_import(&kubo, sizes).await;
         let directory = tempfile::Builder::new()
             .prefix("stage9-zip-http-")
             .tempdir()
@@ -127,50 +139,127 @@ auto_pin_outputs = {auto}
 [pinning_identity]
 primary_storage_domain = 'stage9-owned-kubo'
 [[pinning_identity.providers]]
-config_name = 'local-noop'
-provider_id = 'stage9-noop'
-display_name = 'Stage9 local Noop'
-backend = 'noop'
-scope = 'stage9-owned-scope'
-storage_domain = 'stage9-noop-domain'
+config_name = 'pinata-primary'
+provider_id = 'stage9-pinata-primary'
+display_name = 'Stage9 Pinata primary'
+backend = 'pinata'
+scope = 'stage9-pinata-primary'
+storage_domain = 'stage9-pinata-primary'
 credential_revision = 1
 endpoint_revision = 1
-api_profile = 'noop'
+secret_ref = 'env:PATH'
+api_profile = 'pinata-psa'
+strategy = 'cid'
+cleanup = 'retain'
+[[pinning_identity.providers]]
+config_name = 'filebase-primary'
+provider_id = 'stage9-filebase-primary'
+display_name = 'Stage9 Filebase primary'
+backend = 'filebase'
+scope = 'stage9-filebase-primary'
+storage_domain = 'stage9-filebase-primary'
+credential_revision = 1
+endpoint_revision = 1
+secret_ref = 'env:PATH'
+api_profile = 'filebase-psa'
+strategy = 'cid'
+cleanup = 'retain'
+[[pinning_identity.providers]]
+config_name = 'pinata-fallback'
+provider_id = 'stage9-pinata-fallback'
+display_name = 'Stage9 Pinata fallback'
+backend = 'pinata'
+scope = 'stage9-pinata-fallback'
+storage_domain = 'stage9-pinata-fallback'
+credential_revision = 1
+endpoint_revision = 1
+secret_ref = 'env:PATH'
+api_profile = 'pinata-psa'
+strategy = 'cid'
+cleanup = 'retain'
+[[pinning_identity.providers]]
+config_name = 'filebase-fallback'
+provider_id = 'stage9-filebase-fallback'
+display_name = 'Stage9 Filebase fallback'
+backend = 'filebase'
+scope = 'stage9-filebase-fallback'
+storage_domain = 'stage9-filebase-fallback'
+credential_revision = 1
+endpoint_revision = 1
+secret_ref = 'env:PATH'
+api_profile = 'filebase-psa'
 strategy = 'cid'
 cleanup = 'retain'
 [[pinning.providers]]
-name = 'local-noop'
-kind = 'noop'
+name = 'pinata-primary'
+kind = 'pinata'
+token_env = 'PATH'
+endpoint = {pinata_endpoint:?}
 priority = 1
 max_bytes = 1000000
-max_pins = 100
+max_pins = 10000
+[[pinning.providers]]
+name = 'filebase-primary'
+kind = 'filebase'
+token_env = 'PATH'
+endpoint = {filebase_endpoint:?}
+priority = 2
+max_bytes = 1000000
+max_pins = 10000
+[[pinning.providers]]
+name = 'pinata-fallback'
+kind = 'pinata'
+token_env = 'PATH'
+endpoint = {pinata_endpoint:?}
+priority = 3
+max_bytes = 1000000
+max_pins = 10000
+[[pinning.providers]]
+name = 'filebase-fallback'
+kind = 'filebase'
+token_env = 'PATH'
+endpoint = {filebase_endpoint:?}
+priority = 4
+max_bytes = 1000000
+max_pins = 10000
 [[pinning.policies]]
 bucket = 'test-bkt'
 prefix = ''
 trigger = 'always'
 provider_mode = 'one'
-providers = ['local-noop']
+providers = ['pinata-primary', 'filebase-primary', 'pinata-fallback', 'filebase-fallback']
 default_duration = '1h'
 max_duration = '30d'
 allow_decompressed = true
 "#,
-            kubo_url = kubo.uri()
+            kubo_url = kubo.uri(),
+            pinata_endpoint = format!("{}/psa", kubo.uri()),
+            filebase_endpoint = format!("{}/v1/ipfs", kubo.uri()),
         );
         let config: Config = toml::from_str(&text).expect("explicit on/off gateway config");
         let state = AppState::new(&config)
             .await
             .expect("initialize configured gateway and routes");
-        let provider = state.pinning.effective_config().providers[0]
+        let effective = state.pinning.effective_config();
+        assert_eq!(effective.providers.len(), 4);
+        for configured in &effective.providers {
+            let provider = configured.identity.allocation_key();
+            assert_eq!(
+                state
+                    .pinning
+                    .provider(&provider)
+                    .unwrap()
+                    .invocation_route(),
+                ("psa", "cid")
+            );
+        }
+        let provider = effective
+            .providers
+            .iter()
+            .min_by_key(|provider| provider.limits.priority)
+            .unwrap()
             .identity
             .allocation_key();
-        assert_eq!(
-            state
-                .pinning
-                .provider(&provider)
-                .unwrap()
-                .invocation_route(),
-            ("noop", "cid")
-        );
         store::bucket::create(state.store.db(), BUCKET, Some("test"))
             .await
             .unwrap();
@@ -302,8 +391,9 @@ allow_decompressed = true
                 part.bytes().await.unwrap();
                 // Complete carries only the old uploadId/XML inputs, not new ZIP controls.
                 let response = complete_multipart(self, ARCHIVE_KEY, &id, &[(1, etag)]).await;
-                assert_eq!(response.status(), StatusCode::OK, "legacy CompleteMPU");
+                let status = response.status();
                 let xml = response.text().await.unwrap();
+                assert_eq!(status, StatusCode::OK, "legacy CompleteMPU: {xml}");
                 assert!(
                     xml.contains(if decompress {
                         "<DecompressZipResult>"
@@ -422,12 +512,14 @@ impl Drop for Fixture {
     }
 }
 
-async fn mount_directory_and_import(kubo: &MockServer, archive_size: usize) {
+async fn mount_directory_and_import(kubo: &MockServer, mut sizes: HashMap<String, usize>) {
+    let archive_size = sizes[ARCHIVE_CID];
+    sizes.insert(ROOT_CID.to_owned(), 1);
     Mock::given(method("POST")).and(path("/api/v0/files/stat"))
         .respond_with(move |request: &wiremock::Request| {
             let arg = request.url.query_pairs().find(|(key, _)| key == "arg").unwrap().1.into_owned();
-            let (cid, size) = if arg == format!("/ipfs/{ARCHIVE_CID}") { (ARCHIVE_CID, archive_size) }
-                else if arg == format!("/ipfs/{ROOT_CID}") { (ROOT_CID, 1) } else { (OUTPUT_CID, OUTPUT_BODY.len()) };
+            let cid = arg.strip_prefix("/ipfs/").unwrap();
+            let size = sizes[cid];
             ResponseTemplate::new(200).set_body_string(format!(
                 "{{\"Hash\":\"{cid}\",\"Size\":{size},\"CumulativeSize\":{size},\"Type\":\"file\",\"WithLocality\":true,\"Local\":true}}"))
         }).mount(kubo).await;
@@ -441,10 +533,23 @@ async fn mount_directory_and_import(kubo: &MockServer, archive_size: usize) {
         .await;
     Mock::given(method("POST"))
         .and(path("/api/v0/resolve"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_string(format!("{{\"Path\":\"/ipfs/{OUTPUT_CID}\"}}")),
-        )
+        .respond_with(|request: &wiremock::Request| {
+            let arg = request
+                .url
+                .query_pairs()
+                .find(|(key, _)| key == "arg")
+                .unwrap()
+                .1
+                .into_owned();
+            let path = arg.rsplit('/').next().unwrap();
+            let cid = path
+                .strip_prefix("entry-")
+                .and_then(|path| path.strip_suffix(".txt"))
+                .and_then(|index| index.parse::<usize>().ok())
+                .map(crate::zip_fixture::distinct_output_cid)
+                .unwrap_or_else(|| OUTPUT_CID.to_owned());
+            ResponseTemplate::new(200).set_body_string(format!("{{\"Path\":\"/ipfs/{cid}\"}}"))
+        })
         .mount(kubo)
         .await;
     Mock::given(method("POST"))

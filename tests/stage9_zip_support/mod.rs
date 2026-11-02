@@ -233,6 +233,60 @@ pub async fn prepared_with_outputs(
     (request, batch, capture, guard)
 }
 
+/// Publish at the transaction boundary without caller-side guard cleanup.
+#[allow(dead_code)]
+pub async fn publish_captured(
+    db: &DatabaseConnection,
+    request: ZipPublicationRequest,
+    batch: ZipBatchPublication,
+    capture: &CapturedZipIntent,
+    guard: StandardMutationGuard,
+) -> ipfs_s3_gateway::error::AppResult<Vec<(String, store::object_version::PublicationResult)>> {
+    let successful = batch
+        .entries
+        .iter()
+        .map(|binding| {
+            let object = request
+                .entries
+                .iter()
+                .find(|object| object.id == binding.object_id)
+                .expect("fixture binding has an output object");
+            ipfs_s3_gateway::zip::batch::ManifestFile {
+                relative_path: binding.path.clone(),
+                object_key: object.key.clone(),
+                cid: object.cid.clone(),
+                size: object.logical_size,
+            }
+        })
+        .collect();
+    publication::publish_captured_zip(
+        db,
+        publication::CapturedZipPublication {
+            batch_id: batch.batch_id,
+            source: Some(request.archive.object),
+            source_tags: request.archive.tags,
+            successes: request.entries,
+            manifest: ipfs_s3_gateway::zip::batch::FinalZipManifest {
+                successful,
+                ..Default::default()
+            },
+            capture: capture.clone(),
+            authority: publication::ZipPublicationAuthority::Legacy(Box::new(
+                publication::LegacyZipAuthority {
+                    standard_guard: Some(guard),
+                    upload_target: None,
+                    import_guard: None,
+                    result_rows: Vec::new(),
+                    replay: None,
+                },
+            )),
+            root_outcome: batch.root_outcome,
+            terminal_result: batch.terminal_result,
+        },
+    )
+    .await
+}
+
 pub async fn publish(
     db: &DatabaseConnection,
     config: &ValidatedPinningConfig,

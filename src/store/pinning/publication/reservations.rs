@@ -51,6 +51,10 @@ pub(super) trait Reservations: Send {
 }
 
 pub(super) struct Borrowed<'a, C>(pub(super) &'a C);
+pub(super) struct BorrowedWithWork<'a, C> {
+    pub(super) db: &'a C,
+    pub(super) work: &'a super::super::management::records::SharedDecodeBudget,
+}
 
 #[async_trait::async_trait]
 impl<C: ConnectionTrait> Reservations for Borrowed<'_, C> {
@@ -68,6 +72,36 @@ impl<C: ConnectionTrait> Reservations for Borrowed<'_, C> {
     ) -> AppResult<quota::ReservationOutcome> {
         quota::reserve_unique_with_work(
             self.0,
+            provider,
+            &target.cid,
+            target.logical_size,
+            limits,
+            now,
+            work,
+        )
+        .await
+    }
+}
+
+#[async_trait::async_trait]
+impl<C: ConnectionTrait> Reservations for BorrowedWithWork<'_, C> {
+    type Connection = C;
+    fn db(&self) -> &C {
+        self.db
+    }
+    fn runtime_work(&self) -> Option<&super::super::management::records::SharedDecodeBudget> {
+        Some(self.work)
+    }
+    async fn reserve(
+        &mut self,
+        provider: &str,
+        target: &PinTargetSpec,
+        limits: &ProviderLimitMap,
+        now: DateTime<Utc>,
+        work: super::super::management::records::DecodeWork<'_>,
+    ) -> AppResult<quota::ReservationOutcome> {
+        quota::reserve_unique_with_work(
+            self.db,
             provider,
             &target.cid,
             target.logical_size,

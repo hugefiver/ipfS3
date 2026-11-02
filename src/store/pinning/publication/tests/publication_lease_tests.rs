@@ -14,6 +14,20 @@ async fn fixture(
     StandardMutationGuard,
     MultipartUploadTargetIdentity,
 ) {
+    fixture_with_entries(db, id, root, 2).await
+}
+
+async fn fixture_with_entries(
+    db: &DatabaseConnection,
+    id: &str,
+    root: bool,
+    entry_count: usize,
+) -> (
+    ZipPublicationRequest,
+    ZipBatchPublication,
+    StandardMutationGuard,
+    MultipartUploadTargetIdentity,
+) {
     let mut archive = object("lease-archive", "archive.zip", "bafy-archive", 7);
     archive.multipart = true;
     let archive = request(
@@ -60,6 +74,19 @@ async fn fixture(
             object("lease-b", "out/b", "bafy-b", 4),
         ],
     };
+    for index in 2..entry_count {
+        let (cid, size) = match index % 80 {
+            0 => ("bafy-a".to_owned(), 3),
+            1 => ("bafy-b".to_owned(), 4),
+            value => (format!("bafy-{value}"), 3),
+        };
+        request.entries.push(object(
+            &format!("lease-{index:04}"),
+            &format!("out/{index:04}"),
+            &cid,
+            size,
+        ));
+    }
     let mut batch = admitted.prepare(db, &mut request).await;
     if root {
         let claim = storage::claim_root(db, id, "lease-worker", 600)
@@ -151,7 +178,7 @@ async fn legacy_mpu_publication_renews_live_leases_before_objects_and_adopts_com
 }
 
 #[tokio::test]
-async fn legacy_mpu_periodic_maintenance_revisits_frontier_targets_and_both_binding_loops() {
+async fn legacy_mpu_periodic_maintenance_revisits_sql_chunks_and_manifest_bindings() {
     let db = setup().await;
     for provider in ["pinata", "filebase"] {
         let identity = crate::pinning::identity::ProviderIdentity::legacy(
@@ -178,12 +205,13 @@ async fn legacy_mpu_periodic_maintenance_revisits_frontier_targets_and_both_bind
         publish_object(&db, prior, &limits()).await.unwrap();
     }
     db.execute_unprepared("UPDATE remote_pins SET status='failed',request_id='failed-'||provider||cid,failure_attempts=8,next_retry_at=NULL; DELETE FROM pin_jobs;").await.unwrap();
-    let (request, batch, guard, target) = fixture(&db, "lease-periodic", true).await;
+    let (request, batch, guard, target) =
+        fixture_with_entries(&db, "lease-periodic", true, 901).await;
     db.execute_unprepared("CREATE TABLE renewal_count(n INTEGER NOT NULL); INSERT INTO renewal_count VALUES(0); CREATE TABLE lease_observations(stage TEXT NOT NULL,n INTEGER NOT NULL); CREATE TRIGGER count_renewal AFTER UPDATE ON standard_mutation_leases BEGIN UPDATE renewal_count SET n=n+1; END; CREATE TRIGGER observe_root_first AFTER UPDATE ON zip_root_builds WHEN julianday(OLD.lease_until)<julianday('now','+100 seconds') BEGIN INSERT INTO lease_observations SELECT 'root-first',n FROM renewal_count; END;").await.unwrap();
     for (table, stage, event, condition) in [
         ("objects", "object", "INSERT", ""),
         ("pin_lease_targets", "target", "INSERT", ""),
-        ("remote_pins", "projection", "UPDATE", ""),
+        ("remote_pins", "projection", "INSERT", ""),
         (
             "remote_pins",
             "failed",
@@ -231,10 +259,10 @@ async fn legacy_mpu_periodic_maintenance_revisits_frontier_targets_and_both_bind
         .unwrap()
         .1;
     assert!(
-        root_first > 1,
-        "version frontier must maintain the standard lease before the original batch lock"
+        (4..901).contains(&root_first),
+        "frontier reads must maintain between SQL chunks without per-entry renewal: {root_first}"
     );
-    for stage in ["object", "target", "failed", "projection", "binding"] {
+    for stage in ["object", "target", "projection", "binding"] {
         let counts = observed
             .iter()
             .filter(|(name, _)| name == stage)
@@ -243,8 +271,9 @@ async fn legacy_mpu_periodic_maintenance_revisits_frontier_targets_and_both_bind
         assert!(counts.len() >= 2, "{stage}: {observed:?}");
         assert!(
             counts.windows(2).all(|pair| pair[1] >= pair[0])
-                && counts.windows(2).any(|pair| pair[1] > pair[0]),
-            "maintenance inside {stage}: {observed:?}"
+                && counts.windows(2).any(|pair| pair[1] > pair[0])
+                && counts.windows(2).any(|pair| pair[1] == pair[0]),
+            "maintenance between SQL chunks, shared within each chunk for {stage}: {observed:?}"
         );
     }
     let last_target = observed
@@ -259,72 +288,29 @@ async fn legacy_mpu_periodic_maintenance_revisits_frontier_targets_and_both_bind
         .unwrap()
         .1;
     assert!(
-        first_binding > last_target + 2,
-        "exact-version validation must maintain before the manifest write loop"
+        first_binding > last_target,
+        "exact-version validation must maintain before the manifest write chunks"
     );
-}
-
-#[tokio::test]
-async fn legacy_mpu_shared_cid_projection_maintains_between_each_owned_lease_and_target() {
-    let db = setup().await;
-    for provider in ["pinata", "filebase"] {
-        let identity = crate::pinning::identity::ProviderIdentity::legacy(
-            provider, "noop", None, "psa", "psa",
-        );
-        ledger::register_route(&db, provider, &identity)
-            .await
-            .unwrap();
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|(stage, _)| stage == "failed")
+            .count(),
+        4
+    );
+    let mut binding_chunks = std::collections::BTreeMap::new();
+    for (_, renewal) in observed.iter().filter(|(stage, _)| stage == "binding") {
+        *binding_chunks.entry(renewal).or_insert(0) += 1;
     }
-    for index in 0..3 {
-        let prior = request(
-            object(
-                &format!("hot-owner-{index}"),
-                &format!("prior/{index}"),
-                "bafy-a",
-                3,
-            ),
-            vec![tag("ipfs-s3:pin", "true")],
-            [LeaseSource::Automatic, LeaseSource::Manual]
-                .into_iter()
-                .map(|source| {
-                    intent(
-                        source,
-                        ProviderMode::All,
-                        &["pinata", "filebase"],
-                        ContentMode::Object,
-                    )
-                })
-                .collect(),
-        );
-        publish_object(&db, prior, &limits()).await.unwrap();
-    }
-    let (request, batch, guard, target) = fixture(&db, "lease-hot-cid", true).await;
-    let source_lease = lease_id("lease-archive", LeaseSource::Manual);
-    db.execute_unprepared(&format!("CREATE TABLE shared_projection_probe(armed INTEGER NOT NULL); INSERT INTO shared_projection_probe VALUES(0); CREATE TABLE shared_projection_visits(kind TEXT NOT NULL,id TEXT NOT NULL); CREATE TRIGGER arm_shared_projection AFTER INSERT ON pin_lease_targets WHEN NEW.lease_id='{source_lease}' AND NEW.cid='bafy-b' AND NEW.provider='filebase' BEGIN UPDATE shared_projection_probe SET armed=1; END")).await.unwrap();
-    for (table, kind) in [("pin_leases", "lease"), ("pin_lease_targets", "target")] {
-        db.execute_unprepared(&format!("CREATE TRIGGER require_shared_{kind}_renewal BEFORE UPDATE ON {table} WHEN (SELECT armed FROM shared_projection_probe)=1 BEGIN SELECT CASE WHEN EXISTS(SELECT 1 FROM standard_mutation_leases WHERE julianday(lease_until)<julianday('now','+100 seconds')) THEN RAISE(ABORT,'shared projection needs renewal') END; END; CREATE TRIGGER consume_shared_{kind}_budget AFTER UPDATE ON {table} WHEN (SELECT armed FROM shared_projection_probe)=1 BEGIN INSERT INTO shared_projection_visits VALUES('{kind}',NEW.id); UPDATE standard_mutation_leases SET lease_until=strftime('%Y-%m-%dT%H:%M:%fZ','now','+10 seconds'); END")).await.unwrap();
-    }
-    storage::publication_lease::RENEW_EVERY_CHECKPOINT_FOR_BATCH
-        .lock()
-        .unwrap()
-        .insert("lease-hot-cid".into());
-    let result = publish(&db, request, batch, guard, target).await;
-    storage::publication_lease::RENEW_EVERY_CHECKPOINT_FOR_BATCH
-        .lock()
-        .unwrap()
-        .remove("lease-hot-cid");
-    result.unwrap();
-    let owners = db.query_one(Statement::from_string(DatabaseBackend::Sqlite,
-        "SELECT COUNT(DISTINCT l.owner_object_id) AS owners,COUNT(DISTINCT l.id) AS leases,COUNT(DISTINCT t.id) AS targets FROM pin_leases l JOIN pin_lease_targets t ON t.lease_id=l.id WHERE t.cid='bafy-a' AND l.owner_object_id LIKE 'hot-owner-%' AND EXISTS(SELECT 1 FROM shared_projection_visits v WHERE v.kind='lease' AND v.id=l.id) AND EXISTS(SELECT 1 FROM shared_projection_visits v WHERE v.kind='target' AND v.id=t.id)".to_owned())).await.unwrap().unwrap();
-    assert_eq!(owners.try_get::<i64>("", "owners").unwrap(), 3);
-    assert_eq!(owners.try_get::<i64>("", "leases").unwrap(), 6);
-    assert_eq!(owners.try_get::<i64>("", "targets").unwrap(), 12);
-    let snapshot = storage::snapshot(&db, "lease-hot-cid")
+    let mut sizes = binding_chunks.into_values().collect::<Vec<_>>();
+    sizes.sort_unstable();
+    assert_eq!(sizes, [3, 449, 449]);
+    let snapshot = storage::snapshot(&db, "lease-periodic")
         .await
         .unwrap()
         .unwrap();
     assert_eq!(snapshot.batch.state, "published");
-    assert_eq!(snapshot.batch.root_status, "complete");
+    assert_eq!(snapshot.entries.len(), 901);
     assert!(
         snapshot
             .entries
@@ -332,7 +318,205 @@ async fn legacy_mpu_shared_cid_projection_maintains_between_each_owned_lease_and
             .all(|entry| entry.version_row_id.is_some())
     );
     assert_eq!(snapshot.references[0].state, "adopted");
-    assert!(multipart::get_upload(&db, "lease-hot-cid").await.is_err());
+    assert_eq!(targets_for_object(&db, "lease-archive").await.len(), 160);
+    assert_eq!(rows::<object::Entity>(&db).await, 904);
+    assert_eq!(rows::<object_version::Entity>(&db).await, 904);
+}
+
+#[tokio::test]
+async fn legacy_mpu_shared_cid_projection_preserves_owners_and_rolls_back_lost_guard() {
+    for lose_guard in [false, true] {
+        let db = setup().await;
+        for provider in ["pinata", "filebase"] {
+            let identity = crate::pinning::identity::ProviderIdentity::legacy(
+                provider, "noop", None, "psa", "psa",
+            );
+            ledger::register_route(&db, provider, &identity)
+                .await
+                .unwrap();
+        }
+        for index in 0..3 {
+            let prior = request(
+                object(
+                    &format!("hot-owner-{index}"),
+                    &format!("prior/{index}"),
+                    "bafy-a",
+                    3,
+                ),
+                vec![tag("ipfs-s3:pin", "true")],
+                [LeaseSource::Automatic, LeaseSource::Manual]
+                    .into_iter()
+                    .map(|source| {
+                        intent(
+                            source,
+                            ProviderMode::All,
+                            &["pinata", "filebase"],
+                            ContentMode::Object,
+                        )
+                    })
+                    .collect(),
+            );
+            publish_object(&db, prior, &limits()).await.unwrap();
+        }
+        let (request, batch, guard, target) = fixture(&db, "lease-hot-cid", true).await;
+        let before = storage::snapshot(&db, "lease-hot-cid")
+            .await
+            .unwrap()
+            .unwrap();
+        let leases_before = pin_lease::Entity::find()
+            .order_by_asc(pin_lease::Column::Id)
+            .all(&db)
+            .await
+            .unwrap();
+        let targets_before = pin_lease_target::Entity::find()
+            .order_by_asc(pin_lease_target::Column::Id)
+            .all(&db)
+            .await
+            .unwrap();
+        let standard_before = standard_mutation_lease::Entity::find()
+            .all(&db)
+            .await
+            .unwrap();
+        let remotes_before = remote_pin::Entity::find()
+            .order_by_asc(remote_pin::Column::Provider)
+            .order_by_asc(remote_pin::Column::Cid)
+            .all(&db)
+            .await
+            .unwrap();
+        let jobs_before = pin_job::Entity::find()
+            .order_by_asc(pin_job::Column::Id)
+            .all(&db)
+            .await
+            .unwrap();
+        let source_lease = lease_id("lease-archive", LeaseSource::Manual);
+        let expire = if lose_guard {
+            "UPDATE standard_mutation_leases SET lease_until='2000-01-01T00:00:00Z';"
+        } else {
+            ""
+        };
+        db.execute_unprepared(&format!("CREATE TABLE shared_projection_visits(id TEXT NOT NULL); CREATE TRIGGER observe_shared_projection AFTER INSERT ON pin_lease_targets WHEN NEW.lease_id='{source_lease}' BEGIN INSERT INTO shared_projection_visits VALUES(NEW.id); {expire} END")).await.unwrap();
+        storage::publication_lease::RENEW_EVERY_CHECKPOINT_FOR_BATCH
+            .lock()
+            .unwrap()
+            .insert("lease-hot-cid".into());
+        let result = publish(&db, request, batch, guard, target).await;
+        storage::publication_lease::RENEW_EVERY_CHECKPOINT_FOR_BATCH
+            .lock()
+            .unwrap()
+            .remove("lease-hot-cid");
+        if lose_guard {
+            assert!(matches!(
+                result,
+                Err(TransactionError::Transaction(
+                    AppError::StaleContentMutation
+                ))
+            ));
+            let after = storage::snapshot(&db, "lease-hot-cid")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.batch, before.batch);
+            assert_eq!(after.entries, before.entries);
+            assert_eq!(after.builds, before.builds);
+            assert_eq!(after.references, before.references);
+            assert_eq!(
+                pin_lease::Entity::find()
+                    .order_by_asc(pin_lease::Column::Id)
+                    .all(&db)
+                    .await
+                    .unwrap(),
+                leases_before
+            );
+            assert_eq!(
+                pin_lease_target::Entity::find()
+                    .order_by_asc(pin_lease_target::Column::Id)
+                    .all(&db)
+                    .await
+                    .unwrap(),
+                targets_before
+            );
+            assert_eq!(
+                standard_mutation_lease::Entity::find()
+                    .all(&db)
+                    .await
+                    .unwrap(),
+                standard_before
+            );
+            assert_eq!(
+                remote_pin::Entity::find()
+                    .order_by_asc(remote_pin::Column::Provider)
+                    .order_by_asc(remote_pin::Column::Cid)
+                    .all(&db)
+                    .await
+                    .unwrap(),
+                remotes_before
+            );
+            assert_eq!(
+                pin_job::Entity::find()
+                    .order_by_asc(pin_job::Column::Id)
+                    .all(&db)
+                    .await
+                    .unwrap(),
+                jobs_before
+            );
+            assert_eq!(rows::<object::Entity>(&db).await, 3);
+            assert_eq!(rows::<object_version::Entity>(&db).await, 3);
+            assert!(multipart::get_upload(&db, "lease-hot-cid").await.is_ok());
+            continue;
+        }
+        result.unwrap();
+        let visits = db
+            .query_one(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "SELECT COUNT(*) AS n FROM shared_projection_visits".to_owned(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(visits.try_get::<i64>("", "n").unwrap(), 4);
+        let old_lease_ids = leases_before
+            .iter()
+            .map(|row| row.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pin_lease::Entity::find()
+                .filter(pin_lease::Column::Id.is_in(old_lease_ids.clone()))
+                .order_by_asc(pin_lease::Column::Id)
+                .all(&db)
+                .await
+                .unwrap(),
+            leases_before
+        );
+        assert_eq!(
+            pin_lease_target::Entity::find()
+                .filter(pin_lease_target::Column::LeaseId.is_in(old_lease_ids))
+                .order_by_asc(pin_lease_target::Column::Id)
+                .all(&db)
+                .await
+                .unwrap(),
+            targets_before
+        );
+        assert_eq!(targets_for_object(&db, "lease-archive").await.len(), 4);
+        let owners = db.query_one(Statement::from_string(DatabaseBackend::Sqlite,
+        "SELECT COUNT(DISTINCT l.owner_object_id) AS owners,COUNT(DISTINCT l.id) AS leases,COUNT(DISTINCT t.id) AS targets FROM pin_leases l JOIN pin_lease_targets t ON t.lease_id=l.id WHERE t.cid='bafy-a' AND l.owner_object_id LIKE 'hot-owner-%' AND l.state='active' AND t.state='waiting'".to_owned())).await.unwrap().unwrap();
+        assert_eq!(owners.try_get::<i64>("", "owners").unwrap(), 3);
+        assert_eq!(owners.try_get::<i64>("", "leases").unwrap(), 6);
+        assert_eq!(owners.try_get::<i64>("", "targets").unwrap(), 12);
+        let snapshot = storage::snapshot(&db, "lease-hot-cid")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.batch.state, "published");
+        assert_eq!(snapshot.batch.root_status, "complete");
+        assert!(
+            snapshot
+                .entries
+                .iter()
+                .all(|entry| entry.version_row_id.is_some())
+        );
+        assert_eq!(snapshot.references[0].state, "adopted");
+        assert!(multipart::get_upload(&db, "lease-hot-cid").await.is_err());
+    }
 }
 
 #[tokio::test]

@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseTransaction,
-    EntityTrait, QueryFilter, QuerySelect, Set,
+    EntityTrait, QueryFilter, QuerySelect, Set, Statement,
 };
 
 use super::{
@@ -13,7 +13,7 @@ use super::{
 };
 use crate::{
     error::{AppError, AppResult},
-    store::entities::{object, object_version, zip_batch, zip_manifest_entry, zip_root_reference},
+    store::entities::{object_version, zip_batch, zip_root_reference},
 };
 
 #[derive(Clone, Debug)]
@@ -73,26 +73,6 @@ pub enum RootOutcome {
     },
 }
 
-async fn lock_version(tx: &DatabaseTransaction, id: &str) -> AppResult<object_version::Model> {
-    let query = object_version::Entity::find_by_id(id);
-    let row = if tx.get_database_backend() == DatabaseBackend::Postgres {
-        query.lock_shared().one(tx).await?
-    } else {
-        query.one(tx).await?
-    };
-    row.ok_or_else(stale)
-}
-
-async fn lock_object(tx: &DatabaseTransaction, id: &str) -> AppResult<object::Model> {
-    let query = object::Entity::find_by_id(id);
-    let row = if tx.get_database_backend() == DatabaseBackend::Postgres {
-        query.lock_shared().one(tx).await?
-    } else {
-        query.one(tx).await?
-    };
-    row.ok_or_else(stale)
-}
-
 async fn bind_versions(
     tx: &DatabaseTransaction,
     batch: &zip_batch::Model,
@@ -112,44 +92,94 @@ async fn bind_versions(
     let mut seen = HashSet::new();
     let mut resolved = Vec::with_capacity(successes);
     for binding in bindings {
-        if let Some(lease) = maintenance.as_deref_mut() {
-            lease.checkpoint(tx).await?;
-        }
         if !seen.insert(&binding.path) {
             return Err(invalid());
         }
         let entry = by_path.get(binding.path.as_str()).ok_or_else(invalid)?;
-        let key = entry.object_key.as_deref().ok_or_else(invalid)?;
         if entry.version_row_id.is_some() || binding.version_row_id.is_empty() {
-            return Err(stale());
-        }
-        // Exact existence at publication; historical manifest keeps its immutable
-        // ID/CID/size after lifecycle deletes the version or the current key moves.
-        let version = lock_version(tx, &binding.version_row_id).await?;
-        if version.kind != "object" || version.bucket != batch.bucket || version.key != key {
-            return Err(stale());
-        }
-        let obj = lock_object(tx, version.object_id.as_deref().ok_or_else(stale)?).await?;
-        if obj.bucket != batch.bucket
-            || obj.key != key
-            || Some(obj.cid.as_str()) != entry.cid.as_deref()
-            || Some(obj.size) != entry.size
-        {
             return Err(stale());
         }
         resolved.push(((*entry).clone(), binding.version_row_id.clone()));
     }
-    // Complete exact-version validation before writing any manifest binding.
-    for (entry, version_row_id) in resolved {
+    const PARAMS: usize = 900;
+    for chunk in resolved.chunks(PARAMS) {
         if let Some(lease) = maintenance.as_deref_mut() {
             lease.checkpoint(tx).await?;
         }
-        zip_manifest_entry::ActiveModel {
-            version_row_id: Set(Some(version_row_id)),
-            ..entry.into()
+        let values = chunk
+            .iter()
+            .map(|(_, id)| id.clone().into())
+            .collect::<Vec<_>>();
+        let slots = (1..=chunk.len())
+            .map(|index| format!("${index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let lock = if tx.get_database_backend() == DatabaseBackend::Postgres {
+            " FOR SHARE OF v,o NOWAIT"
+        } else {
+            ""
+        };
+        let rows = tx.query_all(Statement::from_sql_and_values(tx.get_database_backend(), format!(
+            "SELECT v.id AS version_row_id,v.bucket AS version_bucket,v.key AS version_key,v.kind,v.object_id,o.bucket AS object_bucket,o.key AS object_key,o.cid,o.size FROM object_versions v JOIN objects o ON o.id=v.object_id WHERE v.id IN ({slots}) ORDER BY v.id{lock}"
+        ), values)).await?;
+        if rows.len() != chunk.len() {
+            return Err(stale());
         }
-        .update(tx)
-        .await?;
+        let actual = rows
+            .into_iter()
+            .map(|row| {
+                Ok((
+                    row.try_get::<String>("", "version_row_id")?,
+                    (
+                        row.try_get::<String>("", "version_bucket")?,
+                        row.try_get::<String>("", "version_key")?,
+                        row.try_get::<String>("", "kind")?,
+                        row.try_get::<String>("", "object_bucket")?,
+                        row.try_get::<String>("", "object_key")?,
+                        row.try_get::<String>("", "cid")?,
+                        row.try_get::<i64>("", "size")?,
+                    ),
+                ))
+            })
+            .collect::<Result<HashMap<_, _>, sea_orm::DbErr>>()?;
+        for (entry, id) in chunk {
+            let key = entry.object_key.as_deref().ok_or_else(invalid)?;
+            let Some((version_bucket, version_key, kind, object_bucket, object_key, cid, size)) =
+                actual.get(id)
+            else {
+                return Err(stale());
+            };
+            if kind != "object"
+                || version_bucket != &batch.bucket
+                || version_key != key
+                || object_bucket != &batch.bucket
+                || object_key != key
+                || Some(cid.as_str()) != entry.cid.as_deref()
+                || Some(*size) != entry.size
+            {
+                return Err(stale());
+            }
+        }
+    }
+    for chunk in resolved.chunks((PARAMS - 1) / 2) {
+        if let Some(lease) = maintenance.as_deref_mut() {
+            lease.checkpoint(tx).await?;
+        }
+        let mut values = vec![batch.id.clone().into()];
+        let mut tuples = Vec::with_capacity(chunk.len());
+        for (entry, version) in chunk {
+            values.push(entry.path.clone().into());
+            let path = values.len();
+            values.push(version.clone().into());
+            tuples.push(format!("(${path},${})", values.len()));
+        }
+        let result = tx.execute(Statement::from_sql_and_values(tx.get_database_backend(), format!(
+            "WITH changes(path,version_row_id) AS (VALUES {}) UPDATE zip_manifest_entries SET version_row_id=(SELECT c.version_row_id FROM changes c WHERE c.path=zip_manifest_entries.path) WHERE batch_id=$1 AND version_row_id IS NULL AND EXISTS (SELECT 1 FROM changes c WHERE c.path=zip_manifest_entries.path)",
+            tuples.join(",")
+        ), values)).await?;
+        if result.rows_affected() != chunk.len() as u64 {
+            return Err(stale());
+        }
     }
     Ok((successes, failed))
 }
@@ -634,6 +664,125 @@ pub(crate) async fn publish_with_maintenance(
     }
     .update(tx)
     .await?;
+    Ok(())
+}
+
+/// Recheck the externally visible ZIP settlement after all caller-side authority writes.
+pub(crate) async fn verify_published(
+    tx: &DatabaseTransaction,
+    before: &zip_batch::Model,
+    expected_entries: &[crate::store::entities::zip_manifest_entry::Model],
+    bindings: &[VersionBinding],
+    source_published: bool,
+    terminal_result: &str,
+    outcome: &RootOutcome,
+) -> AppResult<()> {
+    let batch = zip_batch::Entity::find_by_id(&before.id)
+        .one(tx)
+        .await?
+        .ok_or_else(stale)?;
+    if batch.state != "published"
+        || batch.source_published != source_published
+        || batch.terminal_result.as_deref() != Some(terminal_result)
+        || batch.owner != before.owner
+        || batch.source != before.source
+        || batch.token != before.token
+        || batch.fingerprint != before.fingerprint
+        || batch.bucket != before.bucket
+        || batch.archive_key != before.archive_key
+        || batch.input_identity != before.input_identity
+        || batch.captured_options != before.captured_options
+        || batch.manifest_prepared != before.manifest_prepared
+        || batch.root_revision != before.root_revision
+        || batch.root_epoch != before.root_epoch
+        || batch.created_at != before.created_at
+    {
+        return Err(stale());
+    }
+    let entries = manifest::entries(tx, &before.id).await?;
+    let expected = expected_entries
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect::<HashMap<_, _>>();
+    let versions = bindings
+        .iter()
+        .map(|binding| (binding.path.as_str(), binding.version_row_id.as_str()))
+        .collect::<HashMap<_, _>>();
+    if entries.len() != expected.len()
+        || versions.len() != bindings.len()
+        || expected_entries
+            .iter()
+            .filter(|entry| entry.cid.is_some())
+            .count()
+            != bindings.len()
+    {
+        return Err(stale());
+    }
+    for entry in &entries {
+        let prior = expected.get(entry.path.as_str()).ok_or_else(stale)?;
+        if (
+            &entry.batch_id,
+            &entry.object_key,
+            &entry.cid,
+            &entry.size,
+            &entry.error_code,
+            &entry.created_at,
+        ) != (
+            &prior.batch_id,
+            &prior.object_key,
+            &prior.cid,
+            &prior.size,
+            &prior.error_code,
+            &prior.created_at,
+        ) || entry.version_row_id.as_deref() != versions.get(entry.path.as_str()).copied()
+            || entry.cid.is_some() != entry.version_row_id.is_some()
+        {
+            return Err(stale());
+        }
+    }
+    let failures = expected_entries
+        .iter()
+        .filter(|entry| entry.cid.is_none())
+        .count();
+    match outcome {
+        RootOutcome::Disabled
+            if batch.root_status == "disabled"
+                && batch.root_cid.is_none()
+                && batch.root_error_code.is_none() => {}
+        RootOutcome::Empty
+            if batch.root_status == "empty"
+                && batch.root_cid.is_none()
+                && batch.root_error_code.is_none() => {}
+        RootOutcome::Failed { code } | RootOutcome::ClaimedFailed { code, .. }
+            if batch.root_status == "failed"
+                && batch.root_cid.is_none()
+                && batch.root_error_code.as_deref() == Some(*code) => {}
+        RootOutcome::Verified {
+            claim,
+            node_identity,
+            tier,
+            cid,
+        } if batch.root_status == if failures > 0 { "partial" } else { "complete" }
+            && batch.root_cid.as_deref() == Some(cid)
+            && batch.root_error_code.is_none() =>
+        {
+            let reference = zip_root_reference::Entity::find_by_id((
+                claim.batch_id.clone(),
+                claim.revision,
+                claim.epoch,
+                node_identity.clone(),
+                tier.clone(),
+                cid.clone(),
+            ))
+            .one(tx)
+            .await?
+            .ok_or_else(stale)?;
+            if reference.state != "adopted" || reference.verification_receipt.is_none() {
+                return Err(stale());
+            }
+        }
+        _ => return Err(stale()),
+    }
     Ok(())
 }
 

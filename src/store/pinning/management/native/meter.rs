@@ -69,6 +69,11 @@ pub struct ResidentGuard {
     state: Arc<Mutex<Resident>>,
     bytes: usize,
 }
+impl ResidentGuard {
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
 impl Drop for ResidentGuard {
     fn drop(&mut self) {
         if let Ok(mut state) = self.state.lock() {
