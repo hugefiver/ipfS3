@@ -12,6 +12,7 @@ use ipfs_s3_gateway::{
 use std::{collections::BTreeSet, time::Instant};
 
 #[tokio::test]
+#[ignore = "opt-in 100,000-object CLI scale acceptance; run explicitly with --ignored"]
 async fn real_100k_two_provider_cli_output_and_original_confirmation_recovery() {
     let started = Instant::now();
     let fixture = support::fixture().await;

@@ -274,6 +274,7 @@ async fn verify_original(spool: &Path, output: &Path, owners: usize) {
 }
 
 #[tokio::test]
+#[ignore = "opt-in 100,000-owner retirement scale measurement; run explicitly with --ignored"]
 async fn hundred_thousand_owner_inventory_resumes_and_exports_without_materializing() {
     owner_inventory(100_000).await;
 }

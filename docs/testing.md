@@ -623,14 +623,18 @@ every edit or release. Reuse passing evidence when later changes don't affect th
 covered behavior or interfaces. Full Stage 7.5 acceptance still requires all
 conditions in the [Stage 7.5 plan](superpowers/plans/2026-09-20-pinning-zip-unixfs.md#必要验收).
 
+Scale and wall-clock measurement targets are opt-in: their 100,000-row
+workloads are `#[ignore]`d, run only with an explicit `--ignored` invocation,
+and are excluded from the default suite and CI.
+
 ```powershell
 cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_storage
 cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_storage_guards
 cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --lib conversion_read_capability_is_exact_and_does_not_escape_its_task
 cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --lib final_attestation_fence_rolls_back_mutation_or_cancellation
 cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage7_management_evidence --test stage7_management_directory_evidence
-cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_management_scale -- --nocapture --test-threads=1
-cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_retirement_scale -- --nocapture --test-threads=1
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_management_scale -- --ignored --nocapture --test-threads=1
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_retirement_scale hundred_thousand_owner_inventory_resumes_and_exports_without_materializing -- --ignored --exact --nocapture --test-threads=1
 cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_management_workflow --test stage75_history_conversion
 cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_consumers
 cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_transaction_lifetime --test stage75_transaction_postgres
@@ -638,7 +642,7 @@ cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_manag
 cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_initialization
 cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_management_history_export
 cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_management_checkpoint_cli
-cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_management_cli_scale real_100k_two_provider_cli_output_and_original_confirmation_recovery -- --exact --nocapture --test-threads=1
+cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_management_cli_scale real_100k_two_provider_cli_output_and_original_confirmation_recovery -- --ignored --exact --nocapture --test-threads=1
 cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_checkpoint_integrity
 cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_retirement_status
 cargo +1.92.0-x86_64-pc-windows-gnu test --locked --offline --test stage75_locator_meet

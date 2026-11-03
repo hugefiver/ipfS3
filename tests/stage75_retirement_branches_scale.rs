@@ -286,6 +286,7 @@ async fn retain_shared_owners_and_cancelled_targetless_lease_preserves_all_respo
 }
 
 #[tokio::test]
+#[ignore = "opt-in 100,000-row large-inventory scale coverage; run explicitly with --ignored"]
 async fn retain_large_inventory_keeps_shared_owners_targetless_lease_and_all_epochs() {
     let fixture = Fixture::new().await;
     let (remote, _) = retained_responsibilities(&fixture, MAX_ITEMS + 1).await;
@@ -508,6 +509,7 @@ async fn two_owner_shared_cid_retirement_confirms_complete_migration_selection()
 }
 
 #[tokio::test]
+#[ignore = "opt-in 100,000-row large-inventory scale coverage; run explicitly with --ignored"]
 async fn migrate_large_database_selects_every_active_shared_cid_owner() {
     let mut fixture = Fixture::new().await;
     let (targets, destinations) = migrations(&mut fixture, 2, true).await;
@@ -648,6 +650,7 @@ async fn cleanup_resources(fixture: &Fixture, count: usize) -> Vec<RetirementRes
 }
 
 #[tokio::test]
+#[ignore = "opt-in 100,000-row large-inventory scale coverage; run explicitly with --ignored"]
 async fn controlled_cleanup_large_database_schedules_all_safe_current_resources_without_io() {
     let fixture = Fixture::new_with_cleanup(true).await;
     let resources = cleanup_resources(&fixture, 2).await;
@@ -745,6 +748,7 @@ async fn controlled_cleanup_large_database_schedules_all_safe_current_resources_
 }
 
 #[tokio::test]
+#[ignore = "opt-in 100,000-row large-inventory scale coverage; run explicitly with --ignored"]
 async fn root_release_large_database_changes_only_selected_logical_reference() {
     let fixture = Fixture::new().await;
     let selected = domain::root(&fixture, "selected").await;
@@ -889,6 +893,7 @@ async fn reject_complete_oversize_selection(fixture: &Fixture, request: PlanRequ
 }
 
 #[tokio::test]
+#[ignore = "opt-in 100,000-row large-inventory scale coverage; run explicitly with --ignored"]
 async fn full_129_migrated_active_targets_reject_without_any_prefix() {
     let mut fixture = Fixture::new().await;
     let (targets, destinations) = migrations(&mut fixture, MAX_ITEMS + 1, false).await;
@@ -918,6 +923,7 @@ async fn full_129_migrated_active_targets_reject_without_any_prefix() {
 }
 
 #[tokio::test]
+#[ignore = "opt-in 100,000-row large-inventory scale coverage; run explicitly with --ignored"]
 async fn full_129_safe_current_cleanup_resources_reject_without_any_prefix() {
     let fixture = Fixture::new_with_cleanup(true).await;
     let resources = cleanup_resources(&fixture, MAX_ITEMS + 1).await;
@@ -943,6 +949,7 @@ async fn full_129_safe_current_cleanup_resources_reject_without_any_prefix() {
 }
 
 #[tokio::test]
+#[ignore = "opt-in 100,000-row large-inventory scale coverage; run explicitly with --ignored"]
 async fn full_129_verified_root_references_reject_without_any_prefix() {
     let fixture = Fixture::new().await;
     let mut references = Vec::new();

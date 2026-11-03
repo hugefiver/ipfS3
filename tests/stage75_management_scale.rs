@@ -29,6 +29,7 @@ use std::time::Instant;
 const UNRELATED_CID: &str = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
 
 #[tokio::test]
+#[ignore = "opt-in Stage 7.5 management scale measurement; run explicitly with --ignored"]
 async fn offline_preparation_and_original_replay_are_scoped_to_the_exact_version() {
     use ipfs_s3_gateway::{kubo::KuboClient, pinning::management::evidence};
     use tokio_util::sync::CancellationToken;
@@ -173,6 +174,7 @@ async fn insert_unrelated_batch(db: &DatabaseConnection, first: u32, last: u32) 
 }
 
 #[tokio::test]
+#[ignore = "opt-in Stage 7.5 management scale measurement; run explicitly with --ignored"]
 async fn local_create_and_committed_replay_survive_unrelated_growth() {
     let fixture = support::Fixture::new().await;
     let history = fixture
@@ -468,6 +470,7 @@ async fn explain_queries(db: &DatabaseConnection, queries: metrics::QuerySample)
 }
 
 #[tokio::test]
+#[ignore = "opt-in Stage 7.5 management scale measurement; run explicitly with --ignored"]
 async fn ordinary_publication_with_applied_history_has_local_cost() {
     use ipfs_s3_gateway::{
         kubo::KuboClient, pinning::coordinator::PinningCoordinator, store::Store,
