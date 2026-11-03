@@ -50,6 +50,8 @@ pub(crate) const CID: &str = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevt
 pub(crate) fn runtime() -> std::sync::Arc<PinningCoordinator> {
     let config: Config = toml::from_str(
         r#"
+        [decompress_zip]
+        auto_pin_outputs = false
         [pinning_identity]
         primary_storage_domain = 'local'
         [[pinning_identity.providers]]

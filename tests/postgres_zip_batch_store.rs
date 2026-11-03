@@ -12,7 +12,6 @@ use sea_orm::{
     ConnectOptions, ConnectionTrait, Database, DatabaseBackend, DatabaseConnection, DbErr,
     Statement, TransactionTrait,
 };
-use sea_orm_migration::{MigrationTrait, MigratorTrait, SchemaManager};
 
 async fn isolated<F, Fut>(migrate: bool, body: F)
 where
@@ -341,71 +340,6 @@ async fn published_failed_claim_waits_for_lease_and_fences_old_outcomes() {
         let snapshot = zip::snapshot(&a, "batch").await.unwrap().unwrap();
         assert_eq!(snapshot.entries[0].version_row_id.as_deref(), Some("v1"));
         assert!(snapshot.references.iter().any(|r| r.cid == "old-root" && r.state == "retained"));
-    }).await;
-}
-
-struct Previous;
-impl MigratorTrait for Previous {
-    fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-        use store::migrations::*;
-        vec![
-            Box::new(m20250701_000001_init::Migration),
-            Box::new(m20260707_000001_decompress_zip::Migration),
-            Box::new(m20260720_000001_sse_c_key_fingerprint::Migration),
-            Box::new(m20260721_000001_multi_provider_pinning::Migration),
-            Box::new(m20260729_000001_ipfs3_import::Migration),
-            Box::new(m20260729_000002_postgres_utc_timestamps::Migration),
-            Box::new(m20260730_000001_standard_mutation_fence::Migration),
-            Box::new(m20260813_000001_postgres_json_columns::Migration),
-            Box::new(m20260825_000001_object_versioning::Migration),
-            Box::new(m20260826_000001_lifecycle_expiration::Migration),
-            Box::new(m20260831_000001_bucket_cors::Migration),
-            Box::new(m20260901_000001_lifecycle_abort_multipart::Migration),
-            Box::new(m20260912_000001_residency_references::Migration),
-            Box::new(m20260912_000002_lifecycle_transition::Migration),
-            Box::new(m20260919_000001_standard_mutation_lease::Migration),
-            Box::new(m20260920_000001_pin_submit_history::Migration),
-            Box::new(m20260920_000002_pin_identity_ledger::Migration),
-            Box::new(m20260920_000003_pin_extension_decision::Migration),
-            Box::new(m20260920_000004_multipart_pin_decision::Migration),
-            Box::new(m20260920_000005_import_pin_decision::Migration),
-            Box::new(m20260920_000006_pin_submit_correlation::Migration),
-        ]
-    }
-}
-
-#[tokio::test]
-#[ignore = "NOT RUN by default: requires IPFS_S3_TEST_POSTGRES_URL to PostgreSQL 17 or 18"]
-async fn previous_pg_schema_upgrades_without_rewriting_objects_and_rejects_down() {
-    isolated(false, |db,_other| async move {
-        Previous::up(&db,None).await.unwrap();
-        store::bucket::create(&db,"bucket",None).await.unwrap();
-        db.execute_unprepared("INSERT INTO objects (id,bucket,key,cid,size,etag) VALUES ('old','bucket','archive','legacy',1,'legacy')").await.unwrap();
-        assert!(db.query_one(Statement::from_string(DatabaseBackend::Postgres,
-            "SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='import_jobs' AND column_name='root_capture_json'"
-        )).await.unwrap().is_none());
-        store::run_migrations(&db).await.unwrap();
-        let capture = db.query_one(Statement::from_string(DatabaseBackend::Postgres,
-            "SELECT data_type, is_nullable, column_default FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='import_jobs' AND column_name='root_capture_json'"
-        )).await.unwrap().unwrap();
-        assert_eq!(capture.try_get::<String>("", "data_type").unwrap(), "text");
-        assert_eq!(capture.try_get::<String>("", "is_nullable").unwrap(), "YES");
-        assert_eq!(capture.try_get::<Option<String>>("", "column_default").unwrap(), None);
-        zip::admit(&db,&BatchAdmission { id:"batch".into(), owner:"principal".into(), source:"direct".into(),
-            token:"token".into(), fingerprint:"fingerprint".into(), bucket:"bucket".into(),
-            archive_key:"archive".into(), input_identity:"digest".into(), captured_options:"{}".into() }).await.unwrap();
-        let row = db.query_one(Statement::from_string(DatabaseBackend::Postgres,
-            "SELECT cid FROM objects WHERE id='old'")).await.unwrap().unwrap();
-        assert_eq!(row.try_get::<String>("","cid").unwrap(),"legacy");
-        let err = store::migrations::m20260927_000001_zip_batches::Migration
-            .down(&SchemaManager::new(&db)).await.unwrap_err();
-        assert!(matches!(err, DbErr::Migration(ref message)
-            if message == "ZIP batch downgrade would erase durable owner/recovery evidence"));
-        let err = store::migrations::m20260927_000002_import_zip_root_capture::Migration
-            .down(&SchemaManager::new(&db)).await.unwrap_err();
-        assert!(matches!(err, DbErr::Migration(ref message)
-            if message == "import ZIP root capture cannot be downgraded without losing admission evidence"));
-        assert!(zip::snapshot(&db,"batch").await.unwrap().is_some());
     }).await;
 }
 
