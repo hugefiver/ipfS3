@@ -1,7 +1,7 @@
 # Test-only, uniquely project-scoped resources. Cold is offline: no swarm repair.
 services:
   postgres:
-    image: postgres:17
+    image: postgres:18
     pull_policy: never
     environment:
       POSTGRES_DB: ipfs3
@@ -10,7 +10,7 @@ services:
     ports:
       - "127.0.0.1:${IPFS_S3_F1_POSTGRES_PORT:?required}:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "ipfs3", "-d", "ipfs3"]
       interval: 1s

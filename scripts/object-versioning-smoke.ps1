@@ -315,7 +315,7 @@ function Assert-ComposeVersion {
 
 function Assert-RequiredLocalImages {
     $images = @(
-        "postgres:17",
+        "postgres:18",
         "ghcr.io/hugefiver/ipfs3-kubo:latest",
         "ghcr.io/hugefiver/ipfs3:latest",
         "rust:latest",

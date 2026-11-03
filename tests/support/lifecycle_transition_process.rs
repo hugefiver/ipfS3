@@ -159,7 +159,7 @@ async fn parent_main() {
     assert_ne!(hot_url, cold_url, "hot and cold Kubo URLs must differ");
 
     let base = connect(&postgres_url, None, 1).await;
-    assert_pg17(&base).await;
+    assert_supported_postgres(&base).await;
     let hot = KuboClient::new(hot_url.clone());
     let cold = KuboClient::new(cold_url.clone());
     let hot_node = hot
@@ -1561,7 +1561,7 @@ async fn connect(
     db
 }
 
-async fn assert_pg17(db: &DatabaseConnection) {
+async fn assert_supported_postgres(db: &DatabaseConnection) {
     let version = db
         .query_one(Statement::from_string(
             DatabaseBackend::Postgres,
@@ -1575,8 +1575,8 @@ async fn assert_pg17(db: &DatabaseConnection) {
         .parse::<u32>()
         .expect("numeric PostgreSQL version");
     assert!(
-        (170_000..180_000).contains(&version),
-        "process fixture requires PostgreSQL 17, got {version}"
+        (170_000..190_000).contains(&version),
+        "process fixture requires PostgreSQL 17 or 18, got {version}"
     );
 }
 

@@ -1,4 +1,4 @@
-//! Real PostgreSQL 17 evidence. Each ignored test requires an explicit test URL
+//! Real PostgreSQL 17/18 evidence. Each ignored test requires an explicit test URL
 //! and creates/drops only its own UUID-named schema (never the public schema).
 #[path = "support/postgres_pinning_stage3.rs"]
 mod postgres;
@@ -158,7 +158,7 @@ fn decision_insert(
 }
 
 #[tokio::test]
-#[ignore = "requires IPFS_S3_TEST_POSTGRES_URL to an isolated PostgreSQL 17 test container"]
+#[ignore = "requires IPFS_S3_TEST_POSTGRES_URL to an isolated PostgreSQL 17 or 18 test container"]
 async fn pg17_exact_version_owner_fk_checks_and_snapshot_read() {
     isolated(true, |db| async move {
         seeded_bucket(&db).await;
@@ -305,7 +305,7 @@ async fn pg17_exact_version_owner_fk_checks_and_snapshot_read() {
 }
 
 #[tokio::test]
-#[ignore = "requires IPFS_S3_TEST_POSTGRES_URL to an isolated PostgreSQL 17 test container"]
+#[ignore = "requires IPFS_S3_TEST_POSTGRES_URL to an isolated PostgreSQL 17 or 18 test container"]
 async fn pg17_object_and_zip_decision_insert_failure_roll_back_all_rows() {
     isolated(true, |db| async move {
         seeded_bucket(&db).await;
@@ -326,7 +326,7 @@ async fn pg17_object_and_zip_decision_insert_failure_roll_back_all_rows() {
 }
 
 #[tokio::test]
-#[ignore = "requires IPFS_S3_TEST_POSTGRES_URL to an isolated PostgreSQL 17 test container"]
+#[ignore = "requires IPFS_S3_TEST_POSTGRES_URL to an isolated PostgreSQL 17 or 18 test container"]
 async fn pg17_mpu_jsonb_roundtrip_and_failed_completion_preserves_upload() {
     isolated(true, |db| async move {
         seeded_bucket(&db).await;
@@ -350,7 +350,7 @@ async fn pg17_mpu_jsonb_roundtrip_and_failed_completion_preserves_upload() {
 }
 
 #[tokio::test]
-#[ignore = "requires IPFS_S3_TEST_POSTGRES_URL to an isolated PostgreSQL 17 test container"]
+#[ignore = "requires IPFS_S3_TEST_POSTGRES_URL to an isolated PostgreSQL 17 or 18 test container"]
 async fn pg17_import_text_decision_and_failed_final_update_roll_back_publication() {
     isolated(true, |db| async move {
         seeded_bucket(&db).await;

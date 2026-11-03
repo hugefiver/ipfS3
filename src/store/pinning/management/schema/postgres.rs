@@ -159,8 +159,11 @@ async fn columns<C: ConnectionTrait>(db: &C, table: &str) -> Result<()> {
 }
 
 async fn constraints<C: ConnectionTrait>(db: &C, table: &str) -> Result<()> {
+    // contype='n' (NOT NULL) rows only exist in PostgreSQL 18+; nullability is
+    // verified per column by `columns` below, so they are excluded from the
+    // exact constraint fingerprint while unexpected kinds still fail closed.
     let rows = db.query_all(Statement::from_sql_and_values(db.get_database_backend(),
-        "SELECT k.contype::text AS kind,pg_get_constraintdef(k.oid,false) AS definition,k.convalidated,k.condeferrable,k.condeferred,k.conislocal,k.connoinherit,CASE WHEN k.contype='f' THEN rn.nspname=current_schema() ELSE true END AS local_reference FROM pg_constraint k JOIN pg_class c ON c.oid=k.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace LEFT JOIN pg_class rc ON rc.oid=k.confrelid LEFT JOIN pg_namespace rn ON rn.oid=rc.relnamespace WHERE n.nspname=current_schema() AND c.relname=$1 LIMIT 16",[table.into()])).await.map_err(|_| ManagementError::Schema)?;
+        "SELECT k.contype::text AS kind,pg_get_constraintdef(k.oid,false) AS definition,k.convalidated,k.condeferrable,k.condeferred,k.conislocal,k.connoinherit,CASE WHEN k.contype='f' THEN rn.nspname=current_schema() ELSE true END AS local_reference FROM pg_constraint k JOIN pg_class c ON c.oid=k.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace LEFT JOIN pg_class rc ON rc.oid=k.confrelid LEFT JOIN pg_namespace rn ON rn.oid=rc.relnamespace WHERE n.nspname=current_schema() AND c.relname=$1 AND k.contype<>'n' LIMIT 16",[table.into()])).await.map_err(|_| ManagementError::Schema)?;
     let expected = definitions(table);
     if rows.len() != expected.len() {
         return Err(ManagementError::Schema);

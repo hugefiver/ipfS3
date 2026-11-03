@@ -34,14 +34,15 @@ async fn setup() -> (tempfile::TempDir, DatabaseConnection, DatabaseConnection) 
     (dir, a, b)
 }
 
-// Real PG17 must be explicitly requested. Touches only a fresh UUID schema.
+// Real PostgreSQL 17/18 must be explicitly requested. Touches only a fresh UUID schema.
 async fn pg_isolated<F, Fut>(body: F)
 where
     F: FnOnce(DatabaseConnection, DatabaseConnection) -> Fut,
     Fut: Future<Output = ()>,
 {
-    let url = std::env::var("IPFS_S3_TEST_POSTGRES_URL")
-        .expect("NOT RUN: set IPFS_S3_TEST_POSTGRES_URL to an authorized PG17 database");
+    let url = std::env::var("IPFS_S3_TEST_POSTGRES_URL").expect(
+        "NOT RUN: set IPFS_S3_TEST_POSTGRES_URL to an authorized PostgreSQL 17 or 18 database",
+    );
     let admin = Database::connect(&url).await.unwrap();
     let version: String = admin
         .query_one(Statement::from_string(
@@ -53,7 +54,10 @@ where
         .unwrap()
         .try_get("", "server_version")
         .unwrap();
-    assert!(version.starts_with("17."), "requires PostgreSQL 17");
+    assert!(
+        version.starts_with("17.") || version.starts_with("18."),
+        "requires PostgreSQL 17 or 18"
+    );
     let schema = format!("zip_v2_{}", uuid::Uuid::new_v4().simple());
     assert!(
         schema
@@ -330,7 +334,7 @@ async fn pending_failure_fences_without_fake_legacy_publication() {
 }
 
 #[tokio::test]
-#[ignore = "requires explicitly authorized IPFS_S3_TEST_POSTGRES_URL to PG17"]
+#[ignore = "requires explicitly authorized IPFS_S3_TEST_POSTGRES_URL to PostgreSQL 17 or 18"]
 async fn pg17_v2_schema_two_gateways_takeover_and_stale_cleanup() {
     pg_isolated(|a,b| async move {
         execution::admit(&a,&request("pg")).await.unwrap();

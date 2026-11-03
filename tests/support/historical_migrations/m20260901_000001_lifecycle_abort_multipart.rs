@@ -8,6 +8,7 @@ const POSTGRES_COLUMN_DEPENDENCY: &str =
 const POSTGRES_TARGET_COLUMN_CONSTRAINT_QUERY: &str = "SELECT conname \
      FROM pg_constraint \
      WHERE conrelid = 'lifecycle_actions'::regclass \
+       AND contype <> 'n' \
        AND (\
          pg_get_constraintdef(oid) LIKE '%target_type%' \
          OR pg_get_constraintdef(oid) LIKE '%target_upload_id%' \
@@ -826,7 +827,7 @@ mod tests {
         );
         assert_eq!(
             normalize_sql(POSTGRES_TARGET_COLUMN_CONSTRAINT_QUERY),
-            "SELECT conname FROM pg_constraint WHERE conrelid = 'lifecycle_actions'::regclass AND (pg_get_constraintdef(oid) LIKE '%target_type%' OR pg_get_constraintdef(oid) LIKE '%target_upload_id%' OR pg_get_constraintdef(oid) LIKE '%target_upload_created_at%')"
+            "SELECT conname FROM pg_constraint WHERE conrelid = 'lifecycle_actions'::regclass AND contype <> 'n' AND (pg_get_constraintdef(oid) LIKE '%target_type%' OR pg_get_constraintdef(oid) LIKE '%target_upload_id%' OR pg_get_constraintdef(oid) LIKE '%target_upload_created_at%')"
         );
         assert_eq!(
             postgres_down_after_dependency_check(),

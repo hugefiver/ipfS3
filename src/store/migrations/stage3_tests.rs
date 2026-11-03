@@ -156,7 +156,7 @@ async fn sqlite_stage2_upgrade_does_not_promote_historical_control_tags() {
 }
 
 #[tokio::test]
-#[ignore = "requires IPFS_S3_TEST_POSTGRES_URL to an isolated PostgreSQL 17 test container"]
+#[ignore = "requires IPFS_S3_TEST_POSTGRES_URL to an isolated PostgreSQL 17 or 18 test container"]
 async fn pg17_stage2_upgrade_retains_raw_tags_without_backfilling_decisions() {
     postgres::isolated(false, |db| async move {
         upgrade_with_historical_raw_tags(&db).await;

@@ -136,7 +136,7 @@ try {
     $null = Invoke-Step 's3s-version' cargo @('tree','--locked','--offline','-p','s3s','--depth','0')
     $null = Invoke-Step 'sdk-version' cargo @('tree','--locked','--offline','-p','rust-s3','--depth','0')
     $null = Invoke-Step 'docker-version' docker @('version','--format','{{.Server.Version}}')
-    $null = Invoke-Step 'cached-images' docker @('image','inspect','postgres:17','ipfs/kubo:v0.43.0','amazon/aws-cli:latest','--format','{{.RepoTags}}')
+    $null = Invoke-Step 'cached-images' docker @('image','inspect','postgres:18','ipfs/kubo:v0.43.0','amazon/aws-cli:latest','--format','{{.RepoTags}}')
     $null = Invoke-Step 'aws-version' docker @('run','--rm','--pull=never','amazon/aws-cli:latest','--version')
     $password = [guid]::NewGuid().ToString('N'); $script:Secrets.Add($password)
     Set-RunEnv 'IPFS_S3_F1_PASSWORD' $password

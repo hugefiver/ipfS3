@@ -1,4 +1,4 @@
-//! Real PG17 race target: run explicitly with IPFS_S3_TEST_POSTGRES_URL and --ignored.
+//! Real PostgreSQL 17/18 race target: run explicitly with IPFS_S3_TEST_POSTGRES_URL and --ignored.
 //! Only this test's UUID-named schema is created/dropped; never touches public.
 use std::{future::Future, panic::AssertUnwindSafe, time::Duration};
 
@@ -20,7 +20,7 @@ where
     Fut: Future<Output = ()>,
 {
     let url = std::env::var("IPFS_S3_TEST_POSTGRES_URL")
-        .expect("NOT RUN: set IPFS_S3_TEST_POSTGRES_URL to an authorized isolated PG17 database");
+        .expect("NOT RUN: set IPFS_S3_TEST_POSTGRES_URL to an authorized isolated PostgreSQL 17 or 18 database");
     let admin = Database::connect(&url).await.unwrap();
     let version: String = admin
         .query_one(Statement::from_string(
@@ -32,7 +32,10 @@ where
         .unwrap()
         .try_get("", "server_version")
         .unwrap();
-    assert!(version.starts_with("17."), "requires PostgreSQL 17");
+    assert!(
+        version.starts_with("17.") || version.starts_with("18."),
+        "requires PostgreSQL 17 or 18"
+    );
     let schema = format!("zip_batch_{}", uuid::Uuid::new_v4().simple());
     assert!(
         schema
@@ -154,7 +157,7 @@ async fn prepared_output(db: &DatabaseConnection) {
 }
 
 #[tokio::test]
-#[ignore = "NOT RUN by default: requires IPFS_S3_TEST_POSTGRES_URL to PG17"]
+#[ignore = "NOT RUN by default: requires IPFS_S3_TEST_POSTGRES_URL to PostgreSQL 17 or 18"]
 async fn pg17_schema_rejects_invalid_batch_manifest_and_root_evidence() {
     isolated(true, |db, _| async move {
         prepared_output(&db).await;
@@ -176,7 +179,7 @@ async fn pg17_schema_rejects_invalid_batch_manifest_and_root_evidence() {
 }
 
 #[tokio::test]
-#[ignore = "NOT RUN by default: requires IPFS_S3_TEST_POSTGRES_URL to PG17"]
+#[ignore = "NOT RUN by default: requires IPFS_S3_TEST_POSTGRES_URL to PostgreSQL 17 or 18"]
 async fn pg17_same_token_concurrent_admission_returns_one_immutable_batch() {
     isolated(true, |a, b| async move {
         store::bucket::create(&a, "bucket", None).await.unwrap();
@@ -202,7 +205,7 @@ async fn pg17_same_token_concurrent_admission_returns_one_immutable_batch() {
 }
 
 #[tokio::test]
-#[ignore = "NOT RUN by default: requires IPFS_S3_TEST_POSTGRES_URL to PG17"]
+#[ignore = "NOT RUN by default: requires IPFS_S3_TEST_POSTGRES_URL to PostgreSQL 17 or 18"]
 async fn pg17_adopted_root_requires_receipt_and_has_one_owner() {
     isolated(true, |db, _| async move {
         prepared_output(&db).await;
@@ -221,7 +224,7 @@ async fn pg17_adopted_root_requires_receipt_and_has_one_owner() {
 }
 
 #[tokio::test]
-#[ignore = "NOT RUN by default: requires IPFS_S3_TEST_POSTGRES_URL to PG17"]
+#[ignore = "NOT RUN by default: requires IPFS_S3_TEST_POSTGRES_URL to PostgreSQL 17 or 18"]
 async fn concurrent_claim_and_close_serializes_and_fences_old_epoch() {
     isolated(true, |a,b| async move {
         let admission = BatchAdmission { id:"batch".into(), owner:"owner".into(), source:"direct".into(),
@@ -271,7 +274,7 @@ async fn concurrent_claim_and_close_serializes_and_fences_old_epoch() {
 }
 
 #[tokio::test]
-#[ignore = "NOT RUN by default: requires IPFS_S3_TEST_POSTGRES_URL to PG17"]
+#[ignore = "NOT RUN by default: requires IPFS_S3_TEST_POSTGRES_URL to PostgreSQL 17 or 18"]
 async fn published_failed_claim_waits_for_lease_and_fences_old_outcomes() {
     isolated(true, |a, b| async move {
         store::bucket::create(&a, "bucket", None).await.unwrap();
@@ -372,7 +375,7 @@ impl MigratorTrait for Previous {
 }
 
 #[tokio::test]
-#[ignore = "NOT RUN by default: requires IPFS_S3_TEST_POSTGRES_URL to PG17"]
+#[ignore = "NOT RUN by default: requires IPFS_S3_TEST_POSTGRES_URL to PostgreSQL 17 or 18"]
 async fn previous_pg_schema_upgrades_without_rewriting_objects_and_rejects_down() {
     isolated(false, |db,_other| async move {
         Previous::up(&db,None).await.unwrap();

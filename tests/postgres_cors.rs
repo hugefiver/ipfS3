@@ -172,8 +172,8 @@ async fn assert_supported_postgres_version(db: &DatabaseConnection) {
         .parse()
         .expect("PostgreSQL server version must be numeric");
     assert!(
-        (170000..180000).contains(&version),
-        "PostgreSQL CORS tests require PostgreSQL 17"
+        (170000..190000).contains(&version),
+        "PostgreSQL CORS tests require PostgreSQL 17 or 18"
     );
 }
 

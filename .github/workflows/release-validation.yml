@@ -21,7 +21,7 @@ jobs:
       IPFS_S3_TEST_POSTGRES_URL: postgres://ipfs3:ipfs3@127.0.0.1:5432/ipfs3_import_test
     services:
       postgres:
-        image: postgres:17
+        image: postgres:18
         env:
           POSTGRES_DB: ipfs3_import_test
           POSTGRES_USER: ipfs3

@@ -408,9 +408,9 @@ function Test-LocalImage {
 function Assert-RequiredLocalImages {
     param([Parameter(Mandatory)][hashtable]$State, [Parameter(Mandatory)][ValidateSet("full", "postgres", "aws", "browser")][string]$Mode)
     $images = if ($Mode -eq "postgres") {
-        @("postgres:17")
+        @("postgres:18")
     } else {
-        @("postgres:17", $KuboImage, $GatewayRuntimeBaseImage, "rust:latest", $AwsImage)
+        @("postgres:18", $KuboImage, $GatewayRuntimeBaseImage, "rust:latest", $AwsImage)
     }
     $identities = @{}
     foreach ($image in $images) {
@@ -551,19 +551,19 @@ function Wait-CorsTopologyHealthy {
     }
 }
 
-function Assert-Postgres17Ready {
+function Assert-PostgresReady {
     param([Parameter(Mandatory)][hashtable]$State)
     $result = Invoke-Compose -State $State -Arguments @(
         "exec", "-T", "postgres", "psql", "-X", "-U", "ipfs3", "-d", "ipfs3",
         "-A", "-t", "-c", "SHOW server_version_num"
-    ) -Stage "postgres" -Label "Bucket CORS PostgreSQL 17 probe"
+    ) -Stage "postgres" -Label "Bucket CORS PostgreSQL 17/18 probe"
     $versions = @($result.StdOut | Where-Object { $_ -match '^[0-9]+$' })
     if ($versions.Count -ne 1) { throw "Bucket CORS PostgreSQL version probe was invalid" }
     [int]$version = 0
-    if (-not [int]::TryParse($versions[0], [ref]$version) -or $version -lt 170000 -or $version -ge 180000) {
-        throw "Bucket CORS PostgreSQL 17 is required"
+    if (-not [int]::TryParse($versions[0], [ref]$version) -or $version -lt 170000 -or $version -ge 190000) {
+        throw "Bucket CORS PostgreSQL 17 or 18 is required"
     }
-    $State.Receipts.Add((Write-CorsEvidence -Category "assertion" -Value "postgres17=passed"))
+    $State.Receipts.Add((Write-CorsEvidence -Category "assertion" -Value "postgres=passed"))
 }
 
 function Assert-RustSuiteExecuted {
@@ -1215,7 +1215,7 @@ function Invoke-CorsPostgresOnly {
     Set-CorsStage -State $State -Stage "health"
     Wait-CorsTopologyHealthy -State $State -Services @("postgres")
     Set-CorsStage -State $State -Stage "postgres"
-    Assert-Postgres17Ready -State $State
+    Assert-PostgresReady -State $State
     Invoke-CorsPostgresSuite -State $State
 }
 
@@ -1274,7 +1274,7 @@ function Invoke-CorsMain {
     Set-CorsStage -State $State -Stage "health"
     Wait-CorsTopologyHealthy -State $state -Services @('postgres', 'kubo', 'gateway')
     Set-CorsStage -State $State -Stage "postgres"
-    Assert-Postgres17Ready -State $State
+    Assert-PostgresReady -State $State
     if ($State.Mode -eq "aws") {
         Invoke-CorsAwsDiagnostic -State $State
         return

@@ -76,7 +76,7 @@ impl RealEndpoints {
         let hot_id = kubo_id(&self.hot_kubo).await;
         let cold_id = kubo_id(&self.cold_kubo).await;
         assert_ne!(hot_id, cold_id, "hot and cold Kubo node IDs must differ");
-        connect_pg17(&self.postgres_url).await
+        connect_supported_postgres(&self.postgres_url).await
     }
 }
 
@@ -1021,7 +1021,7 @@ pub async fn prepare_backend_stop_fixture() {
 
 pub async fn hot_stopped_fixture_read() {
     let endpoints = RealEndpoints::required();
-    let db = connect_pg17(&endpoints.postgres_url).await;
+    let db = connect_supported_postgres(&endpoints.postgres_url).await;
     assert_gateway_healthy(&endpoints.gateway_a, "gateway A").await;
     assert_gateway_healthy(&endpoints.gateway_b, "gateway B").await;
     assert_backend_unavailable(&endpoints.hot_kubo, "hot Kubo").await;
@@ -1053,7 +1053,7 @@ pub async fn hot_stopped_fixture_read() {
 
 pub async fn cold_stopped_fixture_fails_closed() {
     let endpoints = RealEndpoints::required();
-    let db = connect_pg17(&endpoints.postgres_url).await;
+    let db = connect_supported_postgres(&endpoints.postgres_url).await;
     assert_gateway_healthy(&endpoints.gateway_a, "gateway A").await;
     assert_gateway_healthy(&endpoints.gateway_b, "gateway B").await;
     let _hot_id = kubo_id(&endpoints.hot_kubo).await;
@@ -1113,7 +1113,7 @@ pub async fn cleanup_backend_stop_fixture() {
         .expect("close transition PostgreSQL connection");
 }
 
-async fn connect_pg17(url: &str) -> DatabaseConnection {
+async fn connect_supported_postgres(url: &str) -> DatabaseConnection {
     let mut options = ConnectOptions::new(url.to_owned());
     options.max_connections(2).min_connections(1);
     let db = tokio::time::timeout(Duration::from_secs(15), Database::connect(options))
@@ -1134,8 +1134,8 @@ async fn connect_pg17(url: &str) -> DatabaseConnection {
         .parse::<u32>()
         .expect("numeric PostgreSQL server_version_num");
     assert!(
-        (170_000..180_000).contains(&version),
-        "real transition suite requires PostgreSQL 17, got server_version_num={version}"
+        (170_000..190_000).contains(&version),
+        "real transition suite requires PostgreSQL 17 or 18, got server_version_num={version}"
     );
     db
 }

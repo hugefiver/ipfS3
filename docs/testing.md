@@ -171,7 +171,7 @@ remote account permissions or remote pin success. Record those separately when
 their environment and authorization are available; don't count them as green
 based on the commands above.
 
-For isolated PostgreSQL 17 coverage, run `postgres_pinning_stage3` and
+For isolated PostgreSQL 17 or 18 coverage, run `postgres_pinning_stage3` and
 `postgres_stage3_route_fence` against the configured test database; these are
 distinct from SQLite checks. Recorded focused results are 5 schema tests and
 2 route-interleaving tests passing. The new Noop path has not been rerun on PG.
@@ -689,7 +689,7 @@ within the task's saved caps. Use the effective limits documented in the
 [management guide](../src/pinning/management/README.md); a retained archive probe
 without the original checkpoint cannot replace this end-to-end acceptance.
 
-Use only the locally cached `postgres:17.11` image with `--pull=never`, loopback
+Use only a locally cached `postgres:18` or `postgres:17.11` image with `--pull=never`, loopback
 binding and an explicitly authorized task-owned instance. Don't pull images, touch
 existing instances or production databases, or delete databases/volumes. Stop only
 the task-owned instance and report retained resources.

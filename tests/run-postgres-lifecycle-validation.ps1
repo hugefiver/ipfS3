@@ -77,7 +77,7 @@ function Assert-PostgresReachable {
         if ($response -notin @(83, 78)) { throw "Not a PostgreSQL SSL negotiation response" }
     }
     catch {
-        throw "PostgreSQL reachability probe failed. Prepare a reachable PostgreSQL 17 instance yourself; no infrastructure will be provisioned."
+        throw "PostgreSQL reachability probe failed. Prepare a reachable PostgreSQL 17 or 18 instance yourself; no infrastructure will be provisioned."
     }
     finally { $client.Dispose() }
     Write-Diagnostic "PostgreSQL protocol reachable; authentication, server major version and gateway/database pairing remain Task 9 prerequisites."

@@ -1,4 +1,4 @@
-//! Explicit PG17 publication evidence, not an extrapolation from legacy ZIP batches.
+//! Explicit PostgreSQL 17/18 publication evidence, not an extrapolation from legacy ZIP batches.
 //! Run this target with IPFS_S3_TEST_POSTGRES_URL and --ignored. Each test owns
 //! only a fresh UUID schema, including its fault-injection trigger.
 use std::{collections::BTreeMap, future::Future, panic::AssertUnwindSafe, time::Duration};
@@ -57,7 +57,7 @@ where
     Fut: Future<Output = ()>,
 {
     let url = std::env::var("IPFS_S3_TEST_POSTGRES_URL")
-        .expect("NOT RUN: set IPFS_S3_TEST_POSTGRES_URL to an authorized isolated PG17 database");
+        .expect("NOT RUN: set IPFS_S3_TEST_POSTGRES_URL to an authorized isolated PostgreSQL 17 or 18 database");
     let admin = Database::connect(&url).await.unwrap();
     let version: String = admin
         .query_one(sql("SHOW server_version"))
@@ -67,8 +67,8 @@ where
         .try_get("", "server_version")
         .unwrap();
     assert!(
-        version.starts_with("17."),
-        "requires PostgreSQL 17, got {version}"
+        version.starts_with("17.") || version.starts_with("18."),
+        "requires PostgreSQL 17 or 18, got {version}"
     );
     let schema = format!("zip_v2_pub_{}", uuid::Uuid::new_v4().simple());
     assert!(
@@ -630,7 +630,7 @@ async fn assert_published(db: &DatabaseConnection, id: &str, expected: i64) {
 }
 
 #[tokio::test]
-#[ignore = "requires explicitly authorized IPFS_S3_TEST_POSTGRES_URL to PG17"]
+#[ignore = "requires explicitly authorized IPFS_S3_TEST_POSTGRES_URL to PostgreSQL 17 or 18"]
 async fn same_token_same_input_two_connections_commit_one_version_targets_and_quota() {
     isolated(|pg| async move {
         let policy = Policy::new(&pg.a).await;
@@ -715,7 +715,7 @@ async fn same_token_same_input_two_connections_commit_one_version_targets_and_qu
 }
 
 #[tokio::test]
-#[ignore = "requires explicitly authorized IPFS_S3_TEST_POSTGRES_URL to PG17"]
+#[ignore = "requires explicitly authorized IPFS_S3_TEST_POSTGRES_URL to PostgreSQL 17 or 18"]
 async fn source_prefix_owners_are_not_superseded_by_v2_output_admission() {
     isolated(|pg| async move {
         let policy = Policy::new(&pg.a).await;
@@ -848,7 +848,7 @@ async fn source_prefix_owners_are_not_superseded_by_v2_output_admission() {
 }
 
 #[tokio::test]
-#[ignore = "requires explicitly authorized IPFS_S3_TEST_POSTGRES_URL to PG17"]
+#[ignore = "requires explicitly authorized IPFS_S3_TEST_POSTGRES_URL to PostgreSQL 17 or 18"]
 async fn final_authority_failure_rolls_back_every_row_and_valid_admitted_epoch_recovers() {
     isolated(|pg| async move {
         let policy = Policy::new(&pg.a).await;
@@ -920,7 +920,7 @@ async fn final_authority_failure_rolls_back_every_row_and_valid_admitted_epoch_r
 }
 
 #[tokio::test]
-#[ignore = "requires explicitly authorized IPFS_S3_TEST_POSTGRES_URL to PG17"]
+#[ignore = "requires explicitly authorized IPFS_S3_TEST_POSTGRES_URL to PostgreSQL 17 or 18"]
 async fn claim_expiring_behind_bucket_lock_cannot_publish_or_consume_intact_admission() {
     isolated(|pg| async move {
         let policy = Policy::new(&pg.a).await;
@@ -959,7 +959,7 @@ async fn claim_expiring_behind_bucket_lock_cannot_publish_or_consume_intact_admi
 }
 
 #[tokio::test]
-#[ignore = "requires explicitly authorized IPFS_S3_TEST_POSTGRES_URL to PG17"]
+#[ignore = "requires explicitly authorized IPFS_S3_TEST_POSTGRES_URL to PostgreSQL 17 or 18"]
 async fn one_displaced_exact_guard_after_hint_fences_whole_publication_without_recapture() {
     isolated(|pg| async move {
         let policy = Policy::new(&pg.a).await;

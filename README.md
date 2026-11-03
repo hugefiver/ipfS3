@@ -47,7 +47,7 @@ An S3-compatible gateway backed by IPFS (Kubo). Translates S3 API calls into Kub
   A write-side upstream failure fails the request and is never replayed.
 
 **Verification boundary:** Stage 4 passed isolated Kubo 0.43.0 and PostgreSQL 17
-checks, signed HTTP regressions, and mock URL/provider recovery tests. Real
+and 18 checks, signed HTTP regressions, and mock URL/provider recovery tests. Real
 Filebase/Pinata account writes remain **NOT RUN**. The process-restart check uses
 two test executables with the production import components, not the production
 `main` binary; it does not claim complete deployment or remote-account coverage.
@@ -73,7 +73,7 @@ docker compose up -d --build
 ### PostgreSQL production baseline
 
 `docker-compose.postgres.yml` is an explicit single-node production baseline:
-one PostgreSQL 17 service, one Kubo service, and one gateway. The default
+one PostgreSQL 18 service, one Kubo service, and one gateway. The default
 `docker-compose.yml` remains the SQLite development stack. PostgreSQL and Kubo
 publish no host ports; only the gateway is published, and its host bind must be
 an explicit non-wildcard address.
@@ -119,7 +119,7 @@ separate deployment below.
 ### Two-gateway horizontal scaling
 
 `docker-compose.multi-gateway.yml` runs exactly two normal gateway replicas
-behind one Nginx entry point. Both replicas share one PostgreSQL 17 service, one
+behind one Nginx entry point. Both replicas share one PostgreSQL 18 service, one
 Kubo service, identical S3 credentials, and the same master key. There is no
 session stickiness: PostgreSQL provides shared metadata and Kubo provides shared
 content. PostgreSQL startup migrations are serialized with a transaction-scoped
@@ -168,7 +168,7 @@ master-key rotation.
 ### IPFS Cluster pinset replication
 
 `docker-compose.cluster.yml` is a separate one-gateway profile, not combined
-with horizontal scaling. It starts exactly seven roles: PostgreSQL 17; Kubo A
+with horizontal scaling. It starts exactly seven roles: PostgreSQL 18; Kubo A
 and Kubo B at v0.43.0 with separate repositories; a one-shot swarm-bootstrap
 service; Cluster A and Cluster B in full CRDT mode at v1.1.6 with separate
 identities; and the gateway through the Cluster A proxy. Each peer's connector

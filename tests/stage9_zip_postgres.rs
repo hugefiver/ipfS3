@@ -1,4 +1,4 @@
-//! Explicit opt-in only; owns a fresh UUID schema in an authorized PG17 test DB.
+//! Explicit opt-in only; owns a fresh UUID schema in an authorized PostgreSQL 17/18 test DB.
 //! IPFS_S3_TEST_POSTGRES_URL + --ignored. No production or account access.
 mod stage9_zip_support;
 use futures_util::FutureExt;
@@ -14,12 +14,13 @@ use stage9_zip_support::*;
 use std::panic::AssertUnwindSafe;
 
 #[tokio::test]
-#[ignore = "requires explicitly authorized isolated PostgreSQL 17"]
+#[ignore = "requires explicitly authorized isolated PostgreSQL 17 or 18"]
 async fn r25_pg_tail_rollback_then_exact_shared_cid_publication() {
     // Same fixture on both engines; SQLite is not used as PG transaction evidence.
     let sqlite = setup().await;
     sqlite.close().await.unwrap();
-    let url = std::env::var("IPFS_S3_TEST_POSTGRES_URL").expect("set authorized isolated PG17 URL");
+    let url = std::env::var("IPFS_S3_TEST_POSTGRES_URL")
+        .expect("set authorized isolated PostgreSQL 17 or 18 URL");
     let admin = Database::connect(&url).await.unwrap();
     let version: String = admin
         .query_one(Statement::from_string(
@@ -31,7 +32,7 @@ async fn r25_pg_tail_rollback_then_exact_shared_cid_publication() {
         .unwrap()
         .try_get("", "server_version")
         .unwrap();
-    assert!(version.starts_with("17."));
+    assert!(version.starts_with("17.") || version.starts_with("18."));
     let schema = format!("r25_zip_store_{}", uuid::Uuid::new_v4().simple());
     assert!(
         schema

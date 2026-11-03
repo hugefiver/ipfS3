@@ -1,4 +1,4 @@
-//! PostgreSQL 17 two-connection route/publication serialization; no default skip masquerades as proof.
+//! PostgreSQL 17/18 two-connection route/publication serialization; no default skip masquerades as proof.
 #[path = "stage3_route_fence.rs"]
 mod fixture;
 
@@ -22,7 +22,7 @@ where
     Fut: Future<Output = ()>,
 {
     let url = std::env::var("IPFS_S3_TEST_POSTGRES_URL")
-        .expect("requires an authorized isolated PostgreSQL 17 URL");
+        .expect("requires an authorized isolated PostgreSQL 17 or 18 URL");
     let admin = Database::connect(&url).await.unwrap();
     let version: String = admin
         .query_one(Statement::from_string(
@@ -34,7 +34,10 @@ where
         .unwrap()
         .try_get("", "server_version")
         .unwrap();
-    assert!(version.starts_with("17."), "requires PostgreSQL 17");
+    assert!(
+        version.starts_with("17.") || version.starts_with("18."),
+        "requires PostgreSQL 17 or 18"
+    );
     let schema = format!("stage3_route_{}", uuid::Uuid::new_v4().simple());
     admin
         .execute_unprepared(&format!("CREATE SCHEMA {schema}"))
@@ -90,7 +93,7 @@ fn decided<'a>(
 }
 
 #[tokio::test]
-#[ignore = "requires explicit IPFS_S3_TEST_POSTGRES_URL pointing to PostgreSQL 17"]
+#[ignore = "requires explicit IPFS_S3_TEST_POSTGRES_URL pointing to PostgreSQL 17 or 18"]
 async fn route_update_and_publication_serialize_both_directions_without_deadlock() {
     isolated(|a, b, observer| async move {
         store::bucket::create(&a, "route-fence", None).await.unwrap();

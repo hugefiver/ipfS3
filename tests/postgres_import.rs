@@ -337,7 +337,7 @@ async fn migration_backend_state(
              EXISTS (SELECT 1 FROM pg_locks WHERE pid = a.pid AND locktype = 'advisory' \
                      AND classid = {MIGRATION_LOCK_KEY_1}::oid \
                      AND objid = {MIGRATION_LOCK_KEY_2}::oid AND NOT granted) AS advisory_waiting, \
-             ((query LIKE '%CREATE TABLE IF NOT EXISTS buckets%' \
+             ((query LIKE '%CREATE TABLE buckets%' \
                OR query LIKE '%CREATE TABLE zip_batches%') \
               AND EXISTS (SELECT 1 FROM pg_locks WHERE pid = a.pid \
                           AND locktype = 'transactionid' AND NOT granted)) AS ddl_waiting \

@@ -11,8 +11,9 @@ where
     F: FnOnce(DatabaseConnection) -> Fut,
     Fut: Future<Output = ()>,
 {
-    let url = std::env::var("IPFS_S3_TEST_POSTGRES_URL")
-        .expect("set IPFS_S3_TEST_POSTGRES_URL to an authorized, isolated PostgreSQL 17 endpoint");
+    let url = std::env::var("IPFS_S3_TEST_POSTGRES_URL").expect(
+        "set IPFS_S3_TEST_POSTGRES_URL to an authorized, isolated PostgreSQL 17 or 18 endpoint",
+    );
     let admin = Database::connect(&url)
         .await
         .expect("test PostgreSQL must be reachable");
@@ -26,8 +27,8 @@ where
         .unwrap();
     let version: String = version.try_get("", "server_version").unwrap();
     assert!(
-        version.starts_with("17."),
-        "requires PostgreSQL 17, got {version}"
+        version.starts_with("17.") || version.starts_with("18."),
+        "requires PostgreSQL 17 or 18, got {version}"
     );
 
     let schema = format!("stage3_evidence_{}", uuid::Uuid::new_v4().simple());

@@ -1,6 +1,6 @@
 services:
   postgres-import:
-    image: postgres:17
+    image: postgres:18
     environment:
       POSTGRES_DB: ipfs3_import_test
       POSTGRES_USER: ipfs3

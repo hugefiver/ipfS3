@@ -1,4 +1,4 @@
-//! Real PG17 regression: A publishes source X/output Y, B publishes outputs X/Y,
+//! Real PostgreSQL 17/18 regression: A publishes source X/output Y, B publishes outputs X/Y,
 //! in different buckets with previously unseen CIDs X < Y. AFTER INSERT gates
 //! hold the actual unique-key insert locks, not simulated Rust-side locks.
 //! Run with an authorized IPFS_S3_TEST_POSTGRES_URL and --ignored --nocapture.
@@ -46,7 +46,7 @@ where
     Fut: Future<Output = ()>,
 {
     let url = std::env::var("IPFS_S3_TEST_POSTGRES_URL")
-        .expect("set IPFS_S3_TEST_POSTGRES_URL to an explicitly authorized isolated PG17 database");
+        .expect("set IPFS_S3_TEST_POSTGRES_URL to an explicitly authorized isolated PostgreSQL 17 or 18 database");
     let admin = Database::connect(&url).await.unwrap();
     let version: String = admin
         .query_one(sql("SHOW server_version"))
@@ -55,7 +55,10 @@ where
         .unwrap()
         .try_get("", "server_version")
         .unwrap();
-    assert!(version.starts_with("17."), "requires PG17, got {version}");
+    assert!(
+        version.starts_with("17.") || version.starts_with("18."),
+        "requires PostgreSQL 17 or 18, got {version}"
+    );
     let schema = format!("zip_v2_lock_{}", uuid::Uuid::new_v4().simple());
     assert!(
         schema
@@ -572,7 +575,7 @@ fn cid(bytes: &[u8]) -> String {
 }
 
 #[tokio::test]
-#[ignore = "requires explicitly authorized IPFS_S3_TEST_POSTGRES_URL to PG17"]
+#[ignore = "requires explicitly authorized IPFS_S3_TEST_POSTGRES_URL to PostgreSQL 17 or 18"]
 async fn source_and_outputs_prelock_new_residencies_in_one_order_without_retry() {
     isolated(|pg| async move {
         let mut cids = [cid(b"new physical residency one"), cid(b"new physical residency two")];

@@ -93,12 +93,16 @@ pub(super) async fn validate<C: ConnectionTrait>(db: &C) -> Result<()> {
         .map_err(|_| ManagementError::Schema)?;
     let tables = tables(DatabaseBackend::Postgres);
     let names = tables.iter().map(|(name, _)| *name).collect::<Vec<_>>();
+    // PostgreSQL 18 catalogs NOT NULL constraints in pg_constraint (contype='n').
+    // They are excluded here because nullability is already verified through
+    // pg_attribute by postgres_tables; every other unexpected constraint kind
+    // still fails this validation.
     let rows = db.query_all(Statement::from_string(DatabaseBackend::Postgres, format!(
         "SELECT wanted.table_name, checks.* FROM {TABLES} CROSS JOIN LATERAL (\
          SELECT CASE WHEN octet_length(pg_get_constraintdef(k.oid,false))<={SQL_BYTES} THEN pg_get_constraintdef(k.oid,false) ELSE NULL END AS definition, \
          k.convalidated AND NOT k.condeferrable AND NOT k.condeferred AND k.conislocal AND k.coninhcount=0 AND k.conparentid=0 AND k.contypid=0 AND k.connamespace=n.oid AND k.connoinherit=(k.contype<>'c') AS ordinary \
          FROM pg_constraint k JOIN pg_class c ON c.oid=k.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace \
-         WHERE n.nspname=current_schema() AND c.relname=wanted.table_name LIMIT 32) checks")))
+         WHERE n.nspname=current_schema() AND c.relname=wanted.table_name AND k.contype<>'n' LIMIT 32) checks")))
         .await.map_err(|_| ManagementError::Schema)?;
     let groups = grouped(rows, &names, 32)?;
     for table in names.iter().copied() {

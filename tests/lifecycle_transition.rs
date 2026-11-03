@@ -6,31 +6,31 @@ mod lifecycle_transition_real_http;
 mod lifecycle_transition_real_sigv4;
 
 #[tokio::test]
-#[ignore = "NOT RUN by default: requires PG17, two independent Kubo nodes, and two real gateway OS processes"]
+#[ignore = "NOT RUN by default: requires PostgreSQL 17 or 18, two independent Kubo nodes, and two real gateway OS processes"]
 async fn real_lifecycle_transition_current_plain_encrypted_copy_and_reporting_matrix() {
     lifecycle_transition_real::current_transition_matrix().await;
 }
 
 #[tokio::test]
-#[ignore = "NOT RUN by default: requires PG17, two independent Kubo nodes, and two real gateway OS processes"]
+#[ignore = "NOT RUN by default: requires PostgreSQL 17 or 18, two independent Kubo nodes, and two real gateway OS processes"]
 async fn real_lifecycle_transition_noncurrent_public_and_null_version_matrix() {
     lifecycle_transition_real::noncurrent_transition_matrix().await;
 }
 
 #[tokio::test]
-#[ignore = "NOT RUN by default: requires real signed import route plus PG17 and independent hot/cold Kubo nodes"]
+#[ignore = "NOT RUN by default: requires real signed import route plus PostgreSQL 17 or 18 and independent hot/cold Kubo nodes"]
 async fn real_lifecycle_transition_integrity_nondefault_raw_leaf_import_to_ia() {
     lifecycle_transition_real::nondefault_raw_leaf_import_integrity().await;
 }
 
 #[tokio::test]
-#[ignore = "NOT RUN by default: requires PG17 and independent real hot/cold Kubo nodes"]
+#[ignore = "NOT RUN by default: requires PostgreSQL 17 or 18 and independent real hot/cold Kubo nodes"]
 async fn real_lifecycle_transition_integrity_empty_and_multiblock_cross_range() {
     lifecycle_transition_real::empty_and_multiblock_integrity().await;
 }
 
 #[tokio::test]
-#[ignore = "NOT RUN by default: requires PG17 and independent real hot/cold Kubo nodes"]
+#[ignore = "NOT RUN by default: requires PostgreSQL 17 or 18 and independent real hot/cold Kubo nodes"]
 async fn real_lifecycle_transition_integrity_multipart_root_to_ia() {
     lifecycle_transition_real::multipart_root_integrity().await;
 }
