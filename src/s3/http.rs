@@ -1,9 +1,10 @@
+use axum::body::HttpBody as _;
 use axum::extract::Request;
 use axum::middleware::Next;
 use axum::response::Response;
 use http::header::CONTENT_LENGTH;
 
-/// Rejects browser forms before s3s reads them, then bridges decoded length.
+/// Rejects browser forms, then bridges decoded or proven-empty POST lengths.
 ///
 /// `x-amz-decoded-content-length` is part of the signed request and gives s3s
 /// the exact decoded body length without changing the observed wire framing.
@@ -46,6 +47,20 @@ pub async fn bridge_chunked_content_length(mut request: Request, next: Next) -> 
         && length.as_bytes().iter().all(u8::is_ascii_digit)
     {
         request.headers_mut().insert(CONTENT_LENGTH, length);
+    }
+    if request.method() == http::Method::POST
+        && !request.headers().contains_key(CONTENT_LENGTH)
+        && !request
+            .headers()
+            .contains_key(http::header::TRANSFER_ENCODING)
+        && !request
+            .headers()
+            .contains_key("x-amz-decoded-content-length")
+        && request.body().is_end_stream()
+    {
+        request
+            .headers_mut()
+            .insert(CONTENT_LENGTH, http::HeaderValue::from_static("0"));
     }
 
     next.run(request).await
@@ -118,6 +133,123 @@ mod tests {
             .headers()
             .get(OBSERVED_CONTENT_LENGTH)
             .cloned()
+    }
+
+    async fn bridged_headers(request: Request) -> HeaderMap {
+        Router::new()
+            .route(
+                "/",
+                any(|headers: HeaderMap| async move {
+                    let mut response = Response::new(Body::empty());
+                    response.extensions_mut().insert(headers);
+                    response
+                }),
+            )
+            .layer(from_fn(bridge_chunked_content_length))
+            .oneshot(request)
+            .await
+            .unwrap()
+            .extensions_mut()
+            .remove::<HeaderMap>()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn supplies_zero_for_proven_empty_posts_without_framing() {
+        for version in [http::Version::HTTP_11, http::Version::HTTP_2] {
+            let request = Request::builder()
+                .method(http::Method::POST)
+                .version(version)
+                .uri("/")
+                .header("authorization", "signed-request")
+                .header("x-amz-content-sha256", "signed-payload")
+                .header("x-amz-meta-name", "metadata")
+                .body(Body::empty())
+                .unwrap();
+            let original = request.headers().clone();
+            let headers = bridged_headers(request).await;
+            assert_eq!(
+                headers.get(CONTENT_LENGTH),
+                Some(&HeaderValue::from_static("0"))
+            );
+            for (name, value) in &original {
+                assert_eq!(headers.get(name), Some(value));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn does_not_infer_zero_from_http2_missing_framing_or_poll_streams() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let polls = Arc::new(AtomicUsize::new(0));
+        let observed = polls.clone();
+        let pending = futures_util::stream::poll_fn(move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            std::task::Poll::Pending::<Option<Result<bytes::Bytes, std::io::Error>>>
+        });
+        for body in [Body::from("payload"), Body::from_stream(pending)] {
+            let request = Request::builder()
+                .method(http::Method::POST)
+                .version(http::Version::HTTP_2)
+                .uri("/")
+                .body(body)
+                .unwrap();
+            assert!(!bridged_headers(request).await.contains_key(CONTENT_LENGTH));
+        }
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn empty_post_preserves_framing_and_decoded_length_validation() {
+        for (name, value, expected) in [
+            ("content-length", "7", Some("7")),
+            ("transfer-encoding", "chunked", None),
+            ("x-amz-decoded-content-length", "12x", None),
+            ("x-amz-decoded-content-length", "", None),
+            ("x-amz-decoded-content-length", "-1", None),
+            ("x-amz-decoded-content-length", "0", Some("0")),
+            ("x-amz-decoded-content-length", "11", Some("11")),
+        ] {
+            let request = Request::builder()
+                .method(http::Method::POST)
+                .uri("/")
+                .header(name, value)
+                .body(Body::empty())
+                .unwrap();
+            let headers = bridged_headers(request).await;
+            assert_eq!(headers.get(name).unwrap(), value);
+            assert_eq!(
+                headers.get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_post_form_admission_precedes_zero_bridge() {
+        let app = Router::new()
+            .route("/", any(|| async { http::StatusCode::IM_A_TEAPOT }))
+            .layer(from_fn(bridge_chunked_content_length));
+        let request = Request::builder()
+            .method(http::Method::POST)
+            .uri("/?uploads")
+            .header("content-type", "Multipart/Form-Data ; boundary=upload")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.oneshot(request).await.unwrap().status(),
+            http::StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_non_post_is_not_given_content_length() {
+        let request = Request::builder().uri("/").body(Body::empty()).unwrap();
+        assert!(!bridged_headers(request).await.contains_key(CONTENT_LENGTH));
     }
 
     #[tokio::test]
