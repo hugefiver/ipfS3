@@ -265,9 +265,7 @@ pub async fn publish_object(
     .await
 }
 
-/// Stage 3 opt-in path. The decision is captured before upload/MPU/import
-/// side effects and stored with the exact content version on successful publish.
-/// A changed accepted provider revision is a hard error, never a fresh interpretation of tags.
+/// An authenticated control capture resolved against the current publication policy.
 pub struct DecidedPublish<'a> {
     pub decision: &'a ExtensionDecision,
     pub config: &'a crate::pinning::config::ValidatedPinningConfig,
@@ -277,62 +275,65 @@ pub struct DecidedPublish<'a> {
 
 impl DecidedPublish<'_> {
     fn validate(&self, request: &PublicationRequest) -> AppResult<()> {
-        self.decision
-            .verify_revision(self.config, self.mode)
-            .map_err(invalid_publication)?;
-        self.decision
-            .validate_policy(&request.policy)
-            .map_err(invalid_publication)?;
+        let current = crate::pinning::policy::PinPolicyEvaluator::with_mode(self.config, self.mode)
+            .resolve_captured_publication(
+                crate::pinning::policy::PublicationContext {
+                    bucket: &request.object.bucket,
+                    key: &request.object.key,
+                    tags: &request.policy.tags,
+                    is_decompress_zip: false,
+                },
+                self.decision,
+            )?;
+        if current != request.policy {
+            return Err(invalid_publication(
+                "publication does not match current policy",
+            ));
+        }
         Ok(())
     }
 
-    fn snapshot(&self) -> AppResult<DecidedSnapshot> {
-        self.decision
-            .verify_revision(self.config, self.mode)
-            .map_err(invalid_publication)?;
+    fn snapshot(&self, policy: &PublicationPolicy) -> AppResult<DecidedSnapshot> {
         let mut routes = BTreeMap::new();
         let mut allocatable = BTreeSet::new();
-        for name in self
-            .decision
-            .effective_intents
-            .iter()
-            .flat_map(|intent| &intent.providers)
-        {
+        let mut limits = self.limits.clone();
+        for name in policy.leases.iter().flat_map(|intent| &intent.providers) {
             let provider = self
                 .config
                 .providers
                 .iter()
                 .find(|provider| &provider.name == name)
-                .ok_or_else(|| invalid_publication("captured pinning provider is unavailable"))?;
-            if provider.identity.allocation_key() != *name {
-                return Err(invalid_publication(
-                    "captured provider allocation key changed",
-                ));
-            }
-            let route = provider.route_snapshot();
-            if self.limits.get(name).is_some_and(|limit| limit.enabled) {
+                .ok_or_else(|| invalid_publication("current pinning provider is unavailable"))?;
+            let limit = limits
+                .get_mut(name)
+                .ok_or_else(|| invalid_publication("current provider limits unavailable"))?;
+            limit.enabled &= !provider.identity.retired;
+            if limit.enabled {
                 allocatable.insert(name.clone());
             }
-            if routes
-                .insert(name.clone(), route.clone())
-                .is_some_and(|old| old != route)
-            {
-                return Err(invalid_publication("captured provider route is ambiguous"));
-            }
+            routes.insert(name.clone(), provider.route_snapshot());
         }
         Ok(DecidedSnapshot {
             decision: self.decision.clone(),
             routes,
             allocatable,
+            limits,
+            zip_current: None,
         })
     }
 }
 
 #[derive(Clone)]
 struct DecidedSnapshot {
+    zip_current: Option<(
+        crate::pinning::config::ValidatedPinningConfig,
+        crate::pinning::zip_policy::ValidatedZipOutputRules,
+        crate::config::OptionalPinControlMode,
+    )>,
     decision: ExtensionDecision,
     routes: BTreeMap<String, ProviderRouteSnapshot>,
     allocatable: BTreeSet<String>,
+    limits: ProviderLimitMap,
 }
 
 /// Cheap fail-fast check before a durable completion/import starts source or Kubo I/O.
@@ -340,8 +341,9 @@ struct DecidedSnapshot {
 pub async fn preflight_decided_routes(
     db: &DatabaseConnection,
     captured: DecidedPublish<'_>,
+    policy: &PublicationPolicy,
 ) -> AppResult<()> {
-    let snapshot = captured.snapshot()?;
+    let snapshot = captured.snapshot(policy)?;
     ledger::verify_birth_candidate_routes(db, &snapshot.routes, &snapshot.allocatable, false).await
 }
 
@@ -352,12 +354,17 @@ pub(crate) async fn preflight_captured_zip_routes(
     store: &crate::store::Store,
     capture: &crate::pinning::zip_policy::CapturedZipIntent,
     current: &crate::pinning::config::ValidatedPinningConfig,
+    rules: &crate::pinning::zip_policy::ValidatedZipOutputRules,
+    mode: crate::config::OptionalPinControlMode,
     manifest: Option<&crate::zip::batch::FinalZipManifest>,
 ) -> AppResult<()> {
     let mut routes = BTreeMap::new();
     let mut flags = BTreeMap::new();
     let mut allocatable = BTreeSet::new();
-    for frozen in capture.io_provider_candidates(manifest) {
+    let selection = capture
+        .resolve_current_with_rules(current, rules, mode)
+        .map_err(|error| invalid_publication(&error.to_string()))?;
+    for frozen in selection.io_provider_candidates(manifest) {
         let unavailable =
             || invalid_publication("captured pinning configuration revision is unavailable");
         let provider = current
@@ -365,7 +372,9 @@ pub(crate) async fn preflight_captured_zip_routes(
             .iter()
             .find(|provider| provider.name == frozen.config_name)
             .ok_or_else(unavailable)?;
-        if provider.validate_route_snapshot(&frozen.route).is_err()
+        if !provider
+            .route_snapshot()
+            .execution_compatible(&frozen.route)
             || (frozen.enabled && (!provider.limits.enabled || provider.identity.retired))
         {
             return Err(unavailable());
@@ -397,6 +406,7 @@ pub async fn publish_decided_object(
     captured: DecidedPublish<'_>,
 ) -> AppResult<PublicationResult> {
     captured.validate(&request)?;
+    let snapshot = captured.snapshot(&request.policy)?;
     run_publication_with_retries_and_hot_receipt(
         db.into(),
         request,
@@ -409,7 +419,7 @@ pub async fn publish_decided_object(
         None,
         None,
         captured.limits,
-        Some(captured.snapshot()?),
+        Some(snapshot),
     )
     .await
 }
@@ -423,6 +433,7 @@ pub async fn publish_decided_standard_object(
     captured: DecidedPublish<'_>,
 ) -> AppResult<PublicationResult> {
     captured.validate(&request)?;
+    let snapshot = captured.snapshot(&request.policy)?;
     require_decision_origin(captured.decision, &guard.mutation_id)?;
     run_publication_with_retries_and_hot_receipt(
         db.into(),
@@ -436,7 +447,7 @@ pub async fn publish_decided_standard_object(
         None,
         None,
         captured.limits,
-        Some(captured.snapshot()?),
+        Some(snapshot),
     )
     .await
 }
@@ -451,6 +462,7 @@ pub async fn publish_decided_standard_object_with_hot_receipt(
     captured: DecidedPublish<'_>,
 ) -> AppResult<PublicationResult> {
     captured.validate(&request)?;
+    let snapshot = captured.snapshot(&request.policy)?;
     require_decision_origin(captured.decision, &guard.mutation_id)?;
     let receipt = match HotPublicationReceipt::validate(receipt, &request.object.cid) {
         Ok(receipt) => receipt,
@@ -471,7 +483,7 @@ pub async fn publish_decided_standard_object_with_hot_receipt(
         None,
         Some(receipt),
         captured.limits,
-        Some(captured.snapshot()?),
+        Some(snapshot),
     )
     .await
 }
@@ -491,13 +503,12 @@ pub async fn publish_decided_completed_upload(
             completion_attempt_id: completion_attempt_id.clone(),
             source,
         })?;
-    let snapshot =
-        captured
-            .snapshot()
-            .map_err(|source| CommitCompletedUploadError::RolledBack {
-                completion_attempt_id,
-                source,
-            })?;
+    let snapshot = captured.snapshot(&request.policy).map_err(|source| {
+        CommitCompletedUploadError::RolledBack {
+            completion_attempt_id,
+            source,
+        }
+    })?;
     run_completed_publication_with_retries_and_decision(
         db.into(),
         upload_target,
@@ -521,6 +532,7 @@ pub async fn publish_decided_import_object(
     captured: DecidedPublish<'_>,
 ) -> AppResult<PublicationResult> {
     captured.validate(&request)?;
+    let snapshot = captured.snapshot(&request.policy)?;
     require_decision_origin(captured.decision, &guard.job_id)?;
     run_publication_with_retries_and_hot_receipt(
         db.into(),
@@ -534,7 +546,7 @@ pub async fn publish_decided_import_object(
         Some(now),
         None,
         captured.limits,
-        Some(captured.snapshot()?),
+        Some(snapshot),
     )
     .await
 }
@@ -546,8 +558,9 @@ pub async fn publish_decided_zip(
     request: ZipPublicationRequest,
     guard: Option<StandardMutationGuard>,
     captured: DecidedPublish<'_>,
+    rules: &crate::pinning::zip_policy::ValidatedZipOutputRules,
 ) -> AppResult<PublicationResult> {
-    publish_decided_zip_with_batch(db, request, guard, None, captured).await
+    publish_decided_zip_with_batch(db, request, guard, None, captured, rules).await
 }
 
 /// Finalizes the prepared manifest in the very same transaction that writes
@@ -558,8 +571,9 @@ pub async fn publish_decided_zip_batch(
     guard: Option<StandardMutationGuard>,
     batch: ZipBatchPublication,
     captured: DecidedPublish<'_>,
+    rules: &crate::pinning::zip_policy::ValidatedZipOutputRules,
 ) -> AppResult<PublicationResult> {
-    publish_decided_zip_with_batch(db, request, guard, Some(batch), captured).await
+    publish_decided_zip_with_batch(db, request, guard, Some(batch), captured, rules).await
 }
 
 async fn publish_decided_zip_with_batch(
@@ -568,10 +582,11 @@ async fn publish_decided_zip_with_batch(
     guard: Option<StandardMutationGuard>,
     batch: Option<ZipBatchPublication>,
     captured: DecidedPublish<'_>,
+    rules: &crate::pinning::zip_policy::ValidatedZipOutputRules,
 ) -> AppResult<PublicationResult> {
     captured
         .decision
-        .validate_policy(&request.archive.policy)
+        .validate_snapshot()
         .map_err(invalid_publication)?;
     if let Some(guard) = &guard {
         require_decision_origin(captured.decision, &guard.mutation_id)?;
@@ -591,7 +606,7 @@ async fn publish_decided_zip_with_batch(
         None,
         None,
         captured.limits,
-        Some(zip_decided_snapshot(captured.decision)?),
+        Some(zip_decided_snapshot(&captured, rules)?),
     )
     .await
 }
@@ -602,6 +617,7 @@ pub async fn publish_decided_completed_zip(
     request: ZipPublicationRequest,
     guard: Option<StandardMutationGuard>,
     captured: DecidedPublish<'_>,
+    rules: &crate::pinning::zip_policy::ValidatedZipOutputRules,
 ) -> Result<PublicationResult, CommitCompletedUploadError> {
     publish_decided_completed_zip_with_batch(
         db,
@@ -611,12 +627,14 @@ pub async fn publish_decided_completed_zip(
         None,
         None,
         captured,
+        rules,
     )
     .await
 }
 
 /// MPU completion and batch publication share the original commit/unknown-outcome
 /// classification. On OutcomeUnknown, reconcile the upload AND batch before retrying.
+#[allow(clippy::too_many_arguments)]
 pub async fn publish_decided_completed_zip_batch(
     db: &DatabaseConnection,
     upload_target: &MultipartUploadTargetIdentity,
@@ -625,6 +643,7 @@ pub async fn publish_decided_completed_zip_batch(
     batch: ZipBatchPublication,
     replay: ZipCompletedReplay,
     captured: DecidedPublish<'_>,
+    rules: &crate::pinning::zip_policy::ValidatedZipOutputRules,
 ) -> Result<PublicationResult, CommitCompletedUploadError> {
     publish_decided_completed_zip_with_batch(
         db,
@@ -634,10 +653,12 @@ pub async fn publish_decided_completed_zip_batch(
         Some(batch),
         Some(replay),
         captured,
+        rules,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn publish_decided_completed_zip_with_batch(
     db: &DatabaseConnection,
     upload_target: &MultipartUploadTargetIdentity,
@@ -646,11 +667,12 @@ async fn publish_decided_completed_zip_with_batch(
     batch: Option<ZipBatchPublication>,
     replay: Option<ZipCompletedReplay>,
     captured: DecidedPublish<'_>,
+    rules: &crate::pinning::zip_policy::ValidatedZipOutputRules,
 ) -> Result<PublicationResult, CommitCompletedUploadError> {
     let completion_attempt_id = request.archive.object.id.clone();
     captured
         .decision
-        .validate_policy(&request.archive.policy)
+        .validate_snapshot()
         .map_err(invalid_publication)
         .and_then(|()| require_decision_origin(captured.decision, &upload_target.upload_id))
         .and_then(|()| {
@@ -663,7 +685,7 @@ async fn publish_decided_completed_zip_with_batch(
             completion_attempt_id: completion_attempt_id.clone(),
             source,
         })?;
-    let snapshot = zip_decided_snapshot(captured.decision).map_err(|source| {
+    let snapshot = zip_decided_snapshot(&captured, rules).map_err(|source| {
         CommitCompletedUploadError::RolledBack {
             completion_attempt_id,
             source,
@@ -690,12 +712,23 @@ pub async fn publish_decided_import_zip(
     result_rows: Vec<import_job_result::ActiveModel>,
     now: DateTime<Utc>,
     captured: DecidedPublish<'_>,
+    rules: &crate::pinning::zip_policy::ValidatedZipOutputRules,
 ) -> AppResult<PublicationResult> {
-    publish_decided_import_zip_with_batch(db, request, guard, result_rows, now, None, captured)
-        .await
+    publish_decided_import_zip_with_batch(
+        db,
+        request,
+        guard,
+        result_rows,
+        now,
+        None,
+        captured,
+        rules,
+    )
+    .await
 }
 
 /// Import completion, result rows, and batch finalization are one atomic write.
+#[allow(clippy::too_many_arguments)]
 pub async fn publish_decided_import_zip_batch(
     db: &DatabaseConnection,
     request: ZipPublicationRequest,
@@ -704,6 +737,7 @@ pub async fn publish_decided_import_zip_batch(
     now: DateTime<Utc>,
     batch: ZipBatchPublication,
     captured: DecidedPublish<'_>,
+    rules: &crate::pinning::zip_policy::ValidatedZipOutputRules,
 ) -> AppResult<PublicationResult> {
     publish_decided_import_zip_with_batch(
         db,
@@ -713,10 +747,12 @@ pub async fn publish_decided_import_zip_batch(
         now,
         Some(batch),
         captured,
+        rules,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn publish_decided_import_zip_with_batch(
     db: &DatabaseConnection,
     request: ZipPublicationRequest,
@@ -725,10 +761,11 @@ async fn publish_decided_import_zip_with_batch(
     now: DateTime<Utc>,
     batch: Option<ZipBatchPublication>,
     captured: DecidedPublish<'_>,
+    rules: &crate::pinning::zip_policy::ValidatedZipOutputRules,
 ) -> AppResult<PublicationResult> {
     captured
         .decision
-        .validate_policy(&request.archive.policy)
+        .validate_snapshot()
         .map_err(invalid_publication)?;
     require_decision_origin(captured.decision, &guard.job_id)?;
     if let Some(batch) = &batch {
@@ -746,7 +783,7 @@ async fn publish_decided_import_zip_with_batch(
         Some(now),
         None,
         captured.limits,
-        Some(zip_decided_snapshot(captured.decision)?),
+        Some(zip_decided_snapshot(&captured, rules)?),
     )
     .await
 }
@@ -765,12 +802,18 @@ fn require_decision_origin(
     Ok(())
 }
 
-fn zip_decided_snapshot(decision: &ExtensionDecision) -> AppResult<DecidedSnapshot> {
+fn zip_decided_snapshot(
+    captured: &DecidedPublish<'_>,
+    rules: &crate::pinning::zip_policy::ValidatedZipOutputRules,
+) -> AppResult<DecidedSnapshot> {
+    let decision = captured.decision;
     decision.validate_snapshot().map_err(invalid_publication)?;
     Ok(DecidedSnapshot {
         decision: decision.clone(),
         routes: BTreeMap::new(),
         allocatable: BTreeSet::new(),
+        limits: captured.limits.clone(),
+        zip_current: Some((captured.config.clone(), rules.clone(), captured.mode)),
     })
 }
 
@@ -1714,6 +1757,7 @@ async fn publish_with_reservations<
             result_rows,
             decided,
             replay,
+            limits,
         )
         .await;
     }
@@ -1722,9 +1766,10 @@ async fn publish_with_reservations<
             "ZIP publication requires its durable captured admission; needs_attention",
         ));
     }
+    let limits = decided.map_or(limits, |snapshot| &snapshot.limits);
     if let Some(decision) = decided.map(|snapshot| &snapshot.decision) {
         decision
-            .validate_policy(&request.policy)
+            .replay_policy(request.policy.tags.clone())
             .map_err(invalid_publication)?;
     }
     if standard_guard.is_some() && import_guard.is_some() {
@@ -2375,8 +2420,17 @@ async fn assign_target_providers_core<R: reservations::Reservations>(
                     // non-RPC provider. Preserve that provider's fallback chance.
                     continue;
                 }
+                let original_route =
+                    original_lease_route(reservations, lease_id, &provider, work).await?;
                 let outcome = reservations
-                    .reserve(&provider, &target, limits, now, work)
+                    .reserve(
+                        &provider,
+                        &target,
+                        limits,
+                        now,
+                        work,
+                        original_route.as_ref(),
+                    )
                     .await?;
                 if matches!(
                     outcome,
@@ -2459,6 +2513,27 @@ async fn reserve_and_insert_target_with_work<C: ConnectionTrait>(
     .await
 }
 
+async fn original_lease_route<R: reservations::Reservations>(
+    reservations: &R,
+    lease_id: &str,
+    provider: &str,
+    work: super::management::records::DecodeWork<'_>,
+) -> AppResult<Option<ProviderRouteSnapshot>> {
+    let row = super::management::records::current_model::<
+        crate::store::entities::pin_lease_requirement::Entity,
+        _,
+    >(&reservations.catalog(work), &[lease_id], work)
+    .await
+    .map_err(super::management::admission::work_error)?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let birth: crate::store::entities::pin_lease_requirement::contract::BirthContract =
+        serde_json::from_str(&row.contract)
+            .map_err(|_| invalid_publication("invalid lease resource contract"))?;
+    Ok(birth.candidates.get(provider).cloned().flatten())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn reserve_and_insert_target_core<R: reservations::Reservations>(
     reservations: &mut R,
@@ -2471,8 +2546,9 @@ async fn reserve_and_insert_target_core<R: reservations::Reservations>(
     failed_user_touches: &mut BTreeSet<(String, String)>,
     work: super::management::records::DecodeWork<'_>,
 ) -> AppResult<quota::ReservationOutcome> {
+    let original_route = original_lease_route(reservations, lease_id, provider, work).await?;
     let outcome = reservations
-        .reserve(provider, target, limits, now, work)
+        .reserve(provider, target, limits, now, work, original_route.as_ref())
         .await?;
     insert_reserved_target(
         reservations,
@@ -2617,6 +2693,7 @@ async fn insert_target<C: ConnectionTrait>(
         logical_size: Set(target.logical_size),
         provider: Set(provider.to_owned()),
         state: Set(state.to_owned()),
+        last_error: Set(None),
         created_at: Set(now),
         last_touched_at: Set(now),
     })
@@ -2978,6 +3055,7 @@ mod zip_batch_publication_tests {
                 terminal_result: "{}".into(),
             },
             captured_request(&decision, &config, &limits),
+            &crate::pinning::zip_policy::ValidatedZipOutputRules::compile(&[], &config).unwrap(),
         )
         .await;
         assert!(matches!(
@@ -3036,6 +3114,13 @@ mod zip_batch_publication_tests {
             root_outcome: RootOutcome::Disabled,
             terminal_result: "{}".into(),
         };
+        let decided = tests::zip_fixture::current_snapshot(
+            &db,
+            &batch.batch_id,
+            &zip_request.archive,
+            &limits,
+        )
+        .await;
         let error = publication_attempt(
             (&db).into(),
             zip_request.archive,
@@ -3048,17 +3133,16 @@ mod zip_batch_publication_tests {
             None,
             None,
             limits,
-            None,
+            Some(decided),
             None,
             &Default::default(),
         )
         .await
         .unwrap_err();
-        assert!(matches!(
-            error,
-            TransactionError::Transaction(AppError::Internal(message))
-                if message.contains("stale ZIP batch")
-        ));
+        assert!(
+            matches!(&error, TransactionError::Transaction(AppError::Internal(_))),
+            "{error:?}"
+        );
         assert_eq!(object::Entity::find().count(&db).await.unwrap(), 0);
         assert_eq!(object_version::Entity::find().count(&db).await.unwrap(), 0);
         assert_eq!(pin_lease::Entity::find().count(&db).await.unwrap(), 0);

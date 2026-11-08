@@ -73,6 +73,7 @@ fn state(value: &str) -> StoredTargetState {
         "quota_blocked" => StoredTargetState::QuotaBlocked,
         "evicted" => StoredTargetState::Evicted,
         "released" => StoredTargetState::Released,
+        "error" => StoredTargetState::Error,
         _ => StoredTargetState::Unknown,
     }
 }
@@ -390,6 +391,7 @@ pub(super) fn assemble(
             "pending" => JobState::Pending,
             "running" => JobState::Running,
             "done" => JobState::Done,
+            "error" => JobState::Error,
             _ => JobState::Unknown,
         };
         let operation = match job.operation.as_str() {

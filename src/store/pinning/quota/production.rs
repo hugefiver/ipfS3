@@ -32,6 +32,7 @@ pub(in crate::store::pinning) async fn reserve(
     limits: &ProviderLimitMap,
     now: DateTimeUtc,
     work: DecodeWork<'_>,
+    original_route: Option<&crate::pinning::identity::ProviderRouteSnapshot>,
 ) -> AppResult<ReservationOutcome> {
     admission::lock_sqlite_writer_in_caller_transaction(owner.db()).await?;
     if legacy_migration::source_is_migrated_with_work(owner.db(), provider, work)
@@ -43,7 +44,17 @@ pub(in crate::store::pinning) async fn reserve(
         ));
     }
     for attempt in 0..SQLITE_RETRY_LIMIT {
-        let result = reserve_attempt(owner, provider, cid, cid_size, limits, now, work).await;
+        let result = reserve_attempt(
+            owner,
+            provider,
+            cid,
+            cid_size,
+            limits,
+            now,
+            work,
+            original_route,
+        )
+        .await;
         match result {
             Ok(ReserveAttempt::Outcome(outcome)) => return Ok(outcome),
             Ok(ReserveAttempt::Waiting(_)) => {
@@ -70,6 +81,7 @@ async fn reserve_attempt(
     limits: &ProviderLimitMap,
     now: DateTimeUtc,
     work: DecodeWork<'_>,
+    original_route: Option<&crate::pinning::identity::ProviderRouteSnapshot>,
 ) -> AppResult<ReserveAttempt> {
     if super::super::ledger::allocation_cid_with_work(owner.db(), provider, cid, work).await? != cid
     {
@@ -97,6 +109,7 @@ async fn reserve_attempt(
             false,
             work,
             None,
+            original_route,
         )
         .await;
     }
@@ -138,6 +151,7 @@ async fn reserve_attempt(
                         work,
                         capacity,
                         None,
+                        original_route,
                     )
                     .await
                 }
@@ -149,6 +163,7 @@ async fn reserve_attempt(
                         work,
                         capacity,
                         None,
+                        original_route,
                     )
                     .await
                 }
@@ -163,6 +178,7 @@ async fn reserve_attempt(
                 false,
                 work,
                 None,
+                original_route,
             )
             .await
         }

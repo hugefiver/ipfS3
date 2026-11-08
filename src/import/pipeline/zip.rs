@@ -37,6 +37,29 @@ pub(super) async fn execute_zip_job(
         .await
         .map_err(|error| map_publication_error(error, cancellation))?;
     let capture = legacy_capture(job)?;
+    capture
+        .resolve_current_with_rules(
+            state.pinning.effective_config(),
+            state.pinning.zip_output_rules(),
+            state.pinning.control_mode(),
+        )
+        .and_then(|resolved| resolved.validate_durable_current(state.pinning.effective_config()))
+        .map_err(|_| {
+            terminal_failure(
+                ImportFailureCode::PublicationFailed,
+                "current durable ZIP provider identity is unavailable",
+            )
+        })?;
+    crate::store::pinning::publication::preflight_captured_zip_routes(
+        &state.store,
+        &capture,
+        state.pinning.effective_config(),
+        state.pinning.zip_output_rules(),
+        state.pinning.control_mode(),
+        None,
+    )
+    .await
+    .map_err(|error| map_publication_error(error, cancellation))?;
     let batch = zip::read(db, &job.id)
         .await
         .map_err(|error| map_publication_error(error, cancellation))?;

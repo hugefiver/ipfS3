@@ -6,8 +6,8 @@ use std::{cmp, collections::BTreeSet};
 
 use chrono::{DateTime, Utc};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseTransaction, EntityTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set, TryInsertResult, sea_query::Expr,
+    ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, DatabaseTransaction, EntityTrait,
+    QueryFilter, QueryOrder, QuerySelect, QueryTrait, Set, TryInsertResult, sea_query::Expr,
 };
 
 use crate::{
@@ -376,12 +376,13 @@ pub async fn reserve_unique<C: ConnectionTrait>(
 }
 
 #[derive(Clone, Copy)]
-enum ReservationIntent {
-    Admission,
-    Publication,
+enum ReservationIntent<'a> {
+    Admission(Option<&'a crate::pinning::identity::ProviderRouteSnapshot>),
+    Publication(Option<&'a crate::pinning::identity::ProviderRouteSnapshot>),
     Waiter,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn reserve_unique_with_work<C: ConnectionTrait>(
     db: &C,
     provider: &str,
@@ -390,13 +391,14 @@ pub(crate) async fn reserve_unique_with_work<C: ConnectionTrait>(
     limits: &ProviderLimitMap,
     now: DateTimeUtc,
     work: DecodeWork<'_>,
+    original_route: Option<&crate::pinning::identity::ProviderRouteSnapshot>,
 ) -> AppResult<ReservationOutcome> {
     reserve_unique_for_intent_with_work(
         db,
         (provider, cid, cid_size),
         limits,
         now,
-        ReservationIntent::Publication,
+        ReservationIntent::Publication(original_route),
         work,
         None,
     )
@@ -434,7 +436,7 @@ async fn reserve_unique_for_intent<C: ConnectionTrait>(
         if waiter {
             ReservationIntent::Waiter
         } else {
-            ReservationIntent::Admission
+            ReservationIntent::Admission(None)
         },
         DecodeWork::shared(&work),
         None,
@@ -446,7 +448,7 @@ async fn reserve_unique_for_intent_with_work<C: ConnectionTrait>(
     (provider, cid, cid_size): (&str, &str, i64),
     limits: &ProviderLimitMap,
     now: DateTimeUtc,
-    intent: ReservationIntent,
+    intent: ReservationIntent<'_>,
     work: DecodeWork<'_>,
     runtime: Option<&crate::store::RuntimeTransaction>,
 ) -> AppResult<ReservationOutcome> {
@@ -474,12 +476,18 @@ async fn reserve_unique_for_intent_with_work<C: ConnectionTrait>(
             waiter,
             work,
             runtime,
+            match intent {
+                ReservationIntent::Publication(route) | ReservationIntent::Admission(route) => {
+                    route
+                }
+                _ => None,
+            },
         )
         .await
         {
             Ok(ReserveAttempt::Outcome(outcome)) => Ok(Some(outcome)),
             Ok(ReserveAttempt::Waiting(usage)) => {
-                let evict = if matches!(intent, ReservationIntent::Admission) {
+                let evict = if matches!(intent, ReservationIntent::Admission(_)) {
                     eviction_candidates(
                         db,
                         provider,
@@ -524,13 +532,37 @@ pub(in crate::store::pinning) async fn reserve_runtime_unique(
         (provider, cid, cid_size),
         limits,
         now,
-        ReservationIntent::Admission,
+        ReservationIntent::Admission(None),
         work,
         Some(tx),
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(in crate::store::pinning) async fn reserve_runtime_unique_with_route(
+    tx: &crate::store::RuntimeTransaction,
+    provider: &str,
+    cid: &str,
+    cid_size: i64,
+    limits: &ProviderLimitMap,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+    original_route: &crate::pinning::identity::ProviderRouteSnapshot,
+) -> AppResult<ReservationOutcome> {
+    reserve_unique_for_intent_with_work(
+        tx.db(),
+        (provider, cid, cid_size),
+        limits,
+        now,
+        ReservationIntent::Admission(Some(original_route)),
+        work,
+        Some(tx),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(in crate::store::pinning) async fn reserve_runtime_publication(
     tx: &crate::store::RuntimeTransaction,
     provider: &str,
@@ -539,13 +571,14 @@ pub(in crate::store::pinning) async fn reserve_runtime_publication(
     limits: &ProviderLimitMap,
     now: DateTimeUtc,
     work: DecodeWork<'_>,
+    original_route: Option<&crate::pinning::identity::ProviderRouteSnapshot>,
 ) -> AppResult<ReservationOutcome> {
     reserve_unique_for_intent_with_work(
         tx.db(),
         (provider, cid, cid_size),
         limits,
         now,
-        ReservationIntent::Publication,
+        ReservationIntent::Publication(original_route),
         work,
         Some(tx),
     )
@@ -677,6 +710,23 @@ async fn confirmed_release_inner<C: ConnectionTrait>(
     now: DateTimeUtc,
     runtime: Option<(&crate::store::RuntimeTransaction, DecodeWork<'_>)>,
 ) -> AppResult<ConfirmedReleaseOutcome> {
+    let session = SharedDecodeBudget::default();
+    let work = runtime
+        .map(|(_, work)| work)
+        .unwrap_or_else(|| DecodeWork::shared(&session));
+    let error_hold = leases::active_error_hold_condition(db, provider, cid, work).await?;
+    work.copy(&(provider, cid)).map_err(admission::work_error)?;
+    let held = sea_orm::sea_query::Query::select()
+        .expr(Expr::value(1))
+        .cond_where(error_hold.clone())
+        .to_owned();
+    if db
+        .query_one(db.get_database_backend().build(&held))
+        .await?
+        .is_some()
+    {
+        return Ok(ConfirmedReleaseOutcome::Stale);
+    }
     let debt = match runtime {
         Some((tx, work)) => {
             super::ledger::submission::admission_barrier_with_catalog(
@@ -790,6 +840,7 @@ async fn confirmed_release_inner<C: ConnectionTrait>(
         .filter(remote_pin::Column::Provider.eq(provider))
         .filter(remote_pin::Column::Cid.eq(cid))
         .filter(remote_pin::Column::Epoch.eq(expected_remote_epoch))
+        .filter(error_hold.not())
         .filter(remote_pin::Column::Status.is_in(capacity_holding_statuses()));
     if let RequestIdentityGuard::Exact(expected) = request_guard {
         released = match expected {
@@ -847,14 +898,103 @@ pub async fn wake_provider_waiters<C: ConnectionTrait>(
     leases::wake_quota_waiting_targets(db, provider, limits, now).await
 }
 
+#[derive(Debug)]
+pub(crate) enum WaiterWakeOutcome {
+    Woken(Vec<String>),
+    Invalid(Box<QuotaWaiterCandidate>),
+}
+
 pub(crate) async fn wake_runtime_provider_waiters(
     tx: &crate::store::RuntimeTransaction,
     provider: &str,
     limits: &ProviderLimits,
     now: DateTimeUtc,
     work: DecodeWork<'_>,
-) -> AppResult<Vec<String>> {
-    leases::wake_runtime_quota_waiting_targets(tx, provider, limits, now, work).await
+    policy: Option<&crate::pinning::policy::PinPolicyEvaluator>,
+) -> AppResult<WaiterWakeOutcome> {
+    leases::wake_runtime_quota_waiting_targets(tx, provider, limits, now, work, policy).await
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QuotaWaiterCursor {
+    pub created_at: DateTimeUtc,
+    pub target_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct QuotaWaiterCandidate {
+    pub lease: pin_lease::Model,
+    pub target: pin_lease_target::Model,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct QuotaWaiterPage {
+    pub scanned: u64,
+    pub next: Option<QuotaWaiterCursor>,
+    pub candidates: Vec<QuotaWaiterCandidate>,
+}
+
+/// Reads one bounded FIFO page of due waiters. Discovery grants no mutation authority;
+/// the transition transaction must revalidate the returned lease generation and target row.
+pub(crate) async fn quota_waiter_page<C: ConnectionTrait>(
+    db: &C,
+    after: Option<&QuotaWaiterCursor>,
+    now: DateTimeUtc,
+    limit: u64,
+) -> AppResult<QuotaWaiterPage> {
+    if limit == 0 {
+        return Ok(QuotaWaiterPage {
+            scanned: 0,
+            next: None,
+            candidates: Vec::new(),
+        });
+    }
+    let active_leases = pin_lease::Entity::find()
+        .select_only()
+        .column(pin_lease::Column::Id)
+        .filter(pin_lease::Column::State.eq(ACTIVE_LEASE_STATE))
+        .filter(pin_lease::Column::ExpiresAt.gt(now))
+        .into_query();
+    let mut query = pin_lease_target::Entity::find()
+        .filter(pin_lease_target::Column::State.eq(TARGET_QUOTA_WAITING))
+        .filter(pin_lease_target::Column::LastTouchedAt.lte(now))
+        .filter(pin_lease_target::Column::LeaseId.in_subquery(active_leases))
+        .order_by_asc(pin_lease_target::Column::CreatedAt)
+        .order_by_asc(pin_lease_target::Column::Id);
+    if let Some(after) = after {
+        query = query.filter(
+            Condition::any()
+                .add(pin_lease_target::Column::CreatedAt.gt(after.created_at))
+                .add(
+                    Condition::all()
+                        .add(pin_lease_target::Column::CreatedAt.eq(after.created_at))
+                        .add(pin_lease_target::Column::Id.gt(after.target_id.clone())),
+                ),
+        );
+    }
+    let targets = query.limit(limit).all(db).await?;
+    let scanned = u64::try_from(targets.len()).unwrap_or(u64::MAX);
+    let next = targets.last().map(|target| QuotaWaiterCursor {
+        created_at: target.created_at,
+        target_id: target.id.clone(),
+    });
+    let mut candidates = Vec::with_capacity(targets.len());
+    for target in targets {
+        let Some(lease) = pin_lease::Entity::find_by_id(target.lease_id.clone())
+            .one(db)
+            .await?
+        else {
+            continue;
+        };
+        if lease.state == ACTIVE_LEASE_STATE && lease.expires_at > now {
+            candidates.push(QuotaWaiterCandidate { lease, target });
+        }
+    }
+    Ok(QuotaWaiterPage {
+        scanned,
+        next,
+        candidates,
+    })
 }
 
 /// Marks enough oldest reservations to satisfy the oldest active FIFO waiter after confirmation.
@@ -996,9 +1136,11 @@ async fn reserve_unique_attempt<C: ConnectionTrait>(
         waiter,
         DecodeWork::shared(&work),
         None,
+        None,
     )
     .await
 }
+#[allow(clippy::too_many_arguments)]
 async fn reserve_unique_attempt_with_work<C: ConnectionTrait>(
     db: &C,
     (provider, cid, cid_size): (&str, &str, i64),
@@ -1007,6 +1149,7 @@ async fn reserve_unique_attempt_with_work<C: ConnectionTrait>(
     waiter: bool,
     work: DecodeWork<'_>,
     runtime: Option<&crate::store::RuntimeTransaction>,
+    original_route: Option<&crate::pinning::identity::ProviderRouteSnapshot>,
 ) -> AppResult<ReserveAttempt> {
     let catalog = runtime.map_or_else(
         || super::legacy_migration::ReceiptCatalog::full(db),
@@ -1108,6 +1251,7 @@ async fn reserve_unique_attempt_with_work<C: ConnectionTrait>(
                 now,
                 work,
                 runtime,
+                original_route,
             )
             .await
         }
@@ -1121,6 +1265,7 @@ async fn reserve_unique_attempt_with_work<C: ConnectionTrait>(
                 now,
                 work,
                 runtime,
+                original_route,
             )
             .await
         }
@@ -1242,16 +1387,7 @@ async fn assert_reusable_route_from_candidates(
             let new: ProviderRouteSnapshot = work
                 .with(|work| work.typed(&current.snapshot))
                 .map_err(admission::work_error)?;
-            if old.provider_id == new.provider_id
-                && old.backend == new.backend
-                && old.scope == new.scope
-                && old.storage_domain == new.storage_domain
-                && old.credential_revision == new.credential_revision
-                && old.endpoint_revision == new.endpoint_revision
-                && old.secret_ref == new.secret_ref
-                && old.api_profile == new.api_profile
-                && old.strategy == new.strategy
-            {
+            if new.execution_compatible(&old) {
                 Ok(())
             } else {
                 Err(invalid_quota(
@@ -1437,6 +1573,7 @@ async fn reserve_new_remote<C: ConnectionTrait>(
         now,
         DecodeWork::shared(&work),
         None,
+        None,
     )
     .await
 }
@@ -1447,10 +1584,19 @@ async fn reserve_new_remote_with_work<C: ConnectionTrait>(
     now: DateTimeUtc,
     work: DecodeWork<'_>,
     runtime: Option<&crate::store::RuntimeTransaction>,
+    original_route: Option<&crate::pinning::identity::ProviderRouteSnapshot>,
 ) -> AppResult<ReserveAttempt> {
     let capacity = reserve_capacity(db, provider, cid_size, limits).await?;
-    reserve_new_remote_with_capacity(db, (provider, cid, cid_size), now, work, capacity, runtime)
-        .await
+    reserve_new_remote_with_capacity(
+        db,
+        (provider, cid, cid_size),
+        now,
+        work,
+        capacity,
+        runtime,
+        original_route,
+    )
+    .await
 }
 
 async fn reserve_new_remote_with_capacity<C: ConnectionTrait>(
@@ -1460,6 +1606,7 @@ async fn reserve_new_remote_with_capacity<C: ConnectionTrait>(
     work: DecodeWork<'_>,
     capacity: CapacityReservation,
     runtime: Option<&crate::store::RuntimeTransaction>,
+    original_route: Option<&crate::pinning::identity::ProviderRouteSnapshot>,
 ) -> AppResult<ReserveAttempt> {
     match capacity {
         CapacityReservation::Reserved(grant) => {
@@ -1480,11 +1627,24 @@ async fn reserve_new_remote_with_capacity<C: ConnectionTrait>(
             if matches!(inserted, TryInsertResult::Inserted(_)) {
                 match runtime {
                     Some(tx) => {
-                        super::ledger::capture_runtime_reservation(tx, provider, cid, work).await?
+                        super::ledger::capture_runtime_reservation(
+                            tx,
+                            provider,
+                            cid,
+                            work,
+                            original_route,
+                        )
+                        .await?
                     }
                     None => {
-                        super::ledger::capture_reservation_with_work(db, provider, cid, work)
-                            .await?
+                        super::ledger::capture_reservation_with_work(
+                            db,
+                            provider,
+                            cid,
+                            work,
+                            original_route,
+                        )
+                        .await?
                     }
                 }
                 return Ok(ReserveAttempt::Outcome(ReservationOutcome::Reserved));
@@ -1497,6 +1657,7 @@ async fn reserve_new_remote_with_capacity<C: ConnectionTrait>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn reacquire_absent_remote<C: ConnectionTrait>(
     db: &C,
     (provider, cid, cid_size): (&str, &str, i64),
@@ -1505,6 +1666,7 @@ async fn reacquire_absent_remote<C: ConnectionTrait>(
     now: DateTimeUtc,
     work: DecodeWork<'_>,
     runtime: Option<&crate::store::RuntimeTransaction>,
+    original_route: Option<&crate::pinning::identity::ProviderRouteSnapshot>,
 ) -> AppResult<ReserveAttempt> {
     let epoch = next_epoch(remote.epoch)?;
     let capacity = reserve_capacity(db, provider, cid_size, limits).await?;
@@ -1518,6 +1680,7 @@ async fn reacquire_absent_remote<C: ConnectionTrait>(
         work,
         capacity,
         runtime,
+        original_route,
     )
     .await
 }
@@ -1533,6 +1696,7 @@ async fn reacquire_absent_with_capacity<C: ConnectionTrait>(
     work: DecodeWork<'_>,
     capacity: CapacityReservation,
     runtime: Option<&crate::store::RuntimeTransaction>,
+    original_route: Option<&crate::pinning::identity::ProviderRouteSnapshot>,
 ) -> AppResult<ReserveAttempt> {
     match capacity {
         CapacityReservation::Reserved(grant) => {
@@ -1583,11 +1747,24 @@ async fn reacquire_absent_with_capacity<C: ConnectionTrait>(
             if activated.rows_affected == 1 {
                 match runtime {
                     Some(tx) => {
-                        super::ledger::capture_runtime_reallocation(tx, provider, cid, work).await?
+                        super::ledger::capture_runtime_reallocation(
+                            tx,
+                            provider,
+                            cid,
+                            work,
+                            original_route,
+                        )
+                        .await?
                     }
                     None => {
-                        super::ledger::capture_reallocation_with_work(db, provider, cid, work)
-                            .await?
+                        super::ledger::capture_reallocation_with_work(
+                            db,
+                            provider,
+                            cid,
+                            work,
+                            original_route,
+                        )
+                        .await?
                     }
                 }
                 Ok(ReserveAttempt::Outcome(ReservationOutcome::Reserved))
@@ -2321,6 +2498,7 @@ mod tests {
                 &limits,
                 time(1),
                 super::DecodeWork::shared(&work),
+                None,
             )
             .await
             .unwrap();

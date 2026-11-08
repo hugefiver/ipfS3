@@ -2,7 +2,6 @@ use std::{borrow::Cow, collections::BTreeSet};
 
 use anyhow::{anyhow, ensure};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use super::*;
 use crate::{
@@ -15,7 +14,7 @@ use crate::{
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct CapturedProvider {
+pub(crate) struct CapturedProvider {
     pub selected: ZipSelectedProvider,
     pub limits: ProviderLimits,
     pub requests_per_second: Option<u32>,
@@ -97,14 +96,30 @@ pub(super) struct Rule {
     pub policy: Option<CapturedPolicy>,
 }
 
-/// A frozen common restriction set. None means ordinary ordered policies;
-/// Some([]) is an explicit deny-by-default set, not an omitted default.
+/// None means ordinary ordered policies; Some([]) denies all ZIP output work.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "DecodedZipOutputRules")]
 pub struct ValidatedZipOutputRules {
     pub(super) rules: Option<Vec<Rule>>,
     pub(super) policies: Vec<CapturedPolicy>,
-    revision: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DecodedZipOutputRules {
+    rules: Option<Vec<Rule>>,
+    policies: Vec<CapturedPolicy>,
+    #[serde(default, rename = "revision")]
+    _legacy_revision: Option<serde::de::IgnoredAny>,
+}
+
+impl From<DecodedZipOutputRules> for ValidatedZipOutputRules {
+    fn from(raw: DecodedZipOutputRules) -> Self {
+        Self {
+            rules: raw.rules,
+            policies: raw.policies,
+        }
+    }
 }
 
 /// Use the coordinator's established allocation namespace. A config already
@@ -170,16 +185,7 @@ impl ValidatedZipOutputRules {
         raw: &[ZipOutputRuleConfig],
         config: &ValidatedPinningConfig,
     ) -> anyhow::Result<Self> {
-        let mut compiled = Self::compile_optional(Some(raw), config)?;
-        if raw.is_empty() {
-            // The pre-core empty rule set never selects a policy. Preserve its
-            // old replay fingerprint; new captures use compile_optional below
-            // and still bind the effective policy snapshot.
-            let mut hash = Sha256::new();
-            hash.update(b"zip-output-rules/v1");
-            hash.update(0_u64.to_be_bytes());
-            compiled.revision = hex::encode(hash.finalize());
-        }
+        let compiled = Self::compile_optional(Some(raw), config)?;
         for policy in compiled
             .rules
             .as_ref()
@@ -203,8 +209,7 @@ impl ValidatedZipOutputRules {
         config: &ValidatedPinningConfig,
     ) -> anyhow::Result<Self> {
         validate_migration(zip, config)?;
-        // Resolve historical IDs in the same namespace old coordinator used,
-        // including explicit identities and provider allocation aliases.
+        // Provider references use the coordinator's physical allocation namespace.
         let config = normalized_for_zip(config)?;
         Self::compile_optional(zip.output_rules(), &config)
     }
@@ -236,9 +241,17 @@ impl ValidatedZipOutputRules {
                         None
                     }
                     ZipRuleEffect::Allow => {
-                        let reference = item.policy_id.as_deref().ok_or_else(|| anyhow!("ZIP allow rule needs policy_index or an exact historical policy_id"))?;
+                        let reference = item.policy_id.as_deref().ok_or_else(|| anyhow!("ZIP allow rule needs policy_index or an exact policy_id"))?;
                         let policy = if let Some(index) = reference.strip_prefix("@index:") {
                             index.parse::<usize>().ok().and_then(|index| policies.get(index))
+                        } else if let Some((index, digest)) = reference.strip_prefix("policy:").and_then(|value| value.split_once(':')) {
+                            if !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())
+                                && digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                            {
+                                index.parse::<usize>().ok().and_then(|index| policies.get(index))
+                            } else {
+                                None
+                            }
                         } else {
                             policies.iter().find(|policy| policy.policy.identity == reference)
                         }.ok_or_else(|| anyhow!("ZIP rule references unknown policy identity or policy_index; migrate to a valid policy_index or exact policy_id"))?;
@@ -253,19 +266,7 @@ impl ValidatedZipOutputRules {
             rules.sort_by(|a, b| a.raw.priority.cmp(&b.raw.priority).then_with(|| a.raw.name.cmp(&b.raw.name)));
             Ok(rules)
         }).transpose()?;
-        let encoded = serde_json::to_vec(&(&rules, &policies))?;
-        let mut hash = Sha256::new();
-        hash.update(b"zip-captured-policy/v1");
-        hash.update(encoded);
-        Ok(Self {
-            rules,
-            policies,
-            revision: hex::encode(hash.finalize()),
-        })
-    }
-
-    pub fn revision(&self) -> &str {
-        &self.revision
+        Ok(Self { rules, policies })
     }
 
     /// Admission can conservatively establish that some real output in the
@@ -307,7 +308,7 @@ impl ValidatedZipOutputRules {
                     }) {
                         return None;
                     }
-                    rule.policy.as_ref().filter(|policy| {
+                    self.choose(bucket, &scope).0.filter(|policy| {
                         policy.policy.trigger == PolicyTrigger::Always && policy.available()
                     })
                 })
@@ -331,8 +332,7 @@ impl ValidatedZipOutputRules {
         }
     }
 
-    /// Compatibility only: R25-B/C must delete this current-config adapter
-    /// decision flow. New publication accepts only capture + exact bindings.
+    /// Compatibility plan for adapters; guarded publication selects exact bindings.
     pub fn plan(
         &self,
         targets: ZipTargets,
@@ -368,7 +368,23 @@ impl ValidatedZipOutputRules {
                     Some(rule.raw.name.clone()),
                     Some(ZipPlanWarning::Denied),
                 ),
-                Some(rule) => (rule.policy.as_ref(), Some(rule.raw.name.clone()), None),
+                Some(rule) => {
+                    let policy = self
+                        .policies
+                        .iter()
+                        .find(|policy| {
+                            (policy.policy.bucket == "*" || policy.policy.bucket == bucket)
+                                && key.starts_with(&policy.policy.prefix)
+                        })
+                        .filter(|policy| policy.policy.trigger == PolicyTrigger::Always)
+                        .and(rule.policy.as_ref())
+                        .filter(|policy| policy.policy.trigger == PolicyTrigger::Always);
+                    (
+                        policy,
+                        Some(rule.raw.name.clone()),
+                        policy.is_none().then_some(ZipPlanWarning::NoMatchingRule),
+                    )
+                }
             }
         } else {
             let policy = self.policies.iter().find(|p| {

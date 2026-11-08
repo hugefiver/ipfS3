@@ -96,6 +96,22 @@ pub(super) fn tables(versions: &[String]) -> Vec<TableImage> {
             "upload_id",
         ),
     ];
+    let current = versions.last().map(String::as_str) == Some(MANAGEMENT);
+    for table in &mut tables {
+        match table.table.as_str() {
+            "pin_extension_decisions" if !current => {
+                table.columns.push("config_revision".into());
+                table.columns.sort();
+            }
+            "pin_lease_targets" if !current => {
+                table.columns.retain(|column| column != "last_error")
+            }
+            "zip_v2_mpu_intakes" if current => {
+                table.columns.retain(|column| column != "rule_revision")
+            }
+            _ => {}
+        }
+    }
     if history::has_final_layout(versions) {
         let cold = import_job::Column::iter()
             .filter(|column| column.is_request())
@@ -149,8 +165,16 @@ pub(super) fn validate_versions(actual: &[String], writing: bool) -> AppResult<(
     // Registered prefixes must end at an explicitly supported catalog shape.
     if !matches!(
         actual.last().map(String::as_str),
-        Some(STAGE5 | STAGE6 | SCHEMA | ZIP_CAPTURE | MANAGEMENT | history::M23)
-    ) || !(history::is_prefix(actual) || actual == [MANAGEMENT])
+        Some(
+            STAGE5
+                | STAGE6
+                | SCHEMA
+                | ZIP_CAPTURE
+                | MANAGEMENT
+                | history::M23
+                | crate::store::migrations::baseline::VERSION
+        )
+    ) || !(history::is_prefix(actual) || history::has_final_layout(actual))
     {
         return Err(refused("unknown or incomplete schema"));
     }

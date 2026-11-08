@@ -42,7 +42,6 @@ pub async fn write_for_object_in_transaction<C: ConnectionTrait>(
         version_row_id: Set(row.id.clone()),
         object_id: Set(object_id.to_owned()),
         control_revision: Set(decision.control_revision.clone()),
-        config_revision: Set(decision.config_revision.clone()),
         effect: Set(match decision.effect {
             DecisionEffect::Accepted => "accepted",
             DecisionEffect::Skipped => "skipped",
@@ -106,10 +105,7 @@ pub async fn read_for_version<C: ConnectionTrait>(
         "no_intent" => DecisionEffect::NoIntent,
         _ => return Err(AppError::Internal("invalid stored extension effect".into())),
     };
-    if effect != decision.effect
-        || row.config_revision != decision.config_revision
-        || row.control_revision != decision.control_revision
-    {
+    if effect != decision.effect || row.control_revision != decision.control_revision {
         return Err(AppError::Internal(
             "stored extension decision metadata mismatch".into(),
         ));

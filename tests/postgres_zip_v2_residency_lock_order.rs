@@ -242,7 +242,6 @@ async fn prepared(
         captured_options: serde_json::json!({
             "options": options,
             "target_prefix": capture.target_prefix(),
-            "rule_revision": capture.policy_revision(),
             "zip_intent": capture,
         })
         .to_string(),
@@ -346,7 +345,6 @@ async fn prepared(
             })
             .collect(),
         targets: ZipTargets::None,
-        captured_rule_revision: Some(capture.policy_revision().into()),
         root_outcome: zip::RootOutcome::Disabled,
         terminal_result: "{\"result_version\":2}".into(),
     }
@@ -592,8 +590,6 @@ async fn source_and_outputs_prelock_new_residencies_in_one_order_without_retry()
         let a = prepared(&pg.a, "execution-a", "bucket-a", Some(&x), &[("output-y", &y)], &config, &zip_config).await;
         // Reverse the output input order as well: the frontier must sort it.
         let b = prepared(&pg.b, "execution-b", "bucket-b", None, &[("output-y", &y), ("output-x", &x)], &config, &zip_config).await;
-        assert_eq!(a.captured_rule_revision.as_deref(), Some(rules.revision()));
-        assert_eq!(b.captured_rule_revision.as_deref(), Some(rules.revision()));
         let count: i64 = pg.gate.query_one(sql("SELECT count(*) AS n FROM physical_residencies"))
             .await.unwrap().unwrap().try_get("", "n").unwrap();
         assert_eq!(count, 0, "X and Y must both be previously unseen CIDs");

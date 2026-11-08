@@ -1,4 +1,4 @@
-//! Birth intent, independent of future policy/configuration and selected targets.
+//! Resource birth, ownership, and management requirements.
 use crate::store::pinning::management::{
     self, ManagementError,
     records::{self, DecodeWork, SharedDecodeBudget},
@@ -224,22 +224,20 @@ async fn insert_inner<C: ConnectionTrait>(
         candidate_order: candidates.to_vec(),
         candidates: routes,
     };
-    let encoded = if let Some(requirements) = requirements {
-        let mut encoded = serde_json::to_value(&contract)
-            .map_err(|_| AppError::Internal("birth contract serialization".into()))?;
+    let mut encoded = serde_json::to_value(&contract)
+        .map_err(|_| AppError::Internal("birth contract serialization".into()))?;
+    if let Some(requirements) = requirements {
         encoded
             .as_object_mut()
-            .ok_or_else(|| AppError::Internal("birth contract serialization".into()))?
+            .expect("birth serializes as an object")
             .insert(
                 "management_requirements".into(),
                 serde_json::to_value(requirements)
                     .map_err(|_| AppError::Internal("birth contract serialization".into()))?,
             );
-        serde_json::to_string(&encoded)
-    } else {
-        serde_json::to_string(&contract)
     }
-    .map_err(|_| AppError::Internal("birth contract serialization".into()))?;
+    let encoded = serde_json::to_string(&encoded)
+        .map_err(|_| AppError::Internal("birth contract serialization".into()))?;
     super::Entity::insert(super::ActiveModel {
         lease_id: Set(lease_id.into()),
         owner_object_id: Set(owner.into()),

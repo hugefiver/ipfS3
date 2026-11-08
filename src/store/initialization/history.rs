@@ -467,7 +467,7 @@ pub(crate) async fn convert_source(
         database_scope: scope.into(),
         database_identity: identity.into(),
         principal: native::value(&row, "principal").unwrap_or("").into(),
-        catalog: vec![management::schema::VERSION.into()],
+        catalog: native::current_versions(),
         request: String::new(),
         configuration: String::new(),
         acknowledgements: vec![],

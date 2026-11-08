@@ -7,7 +7,7 @@ use ipfs_s3_gateway::{
         decision::DecisionOrigin,
         policy::{PinPolicyEvaluator, PublicationContext},
         tags::ObjectTag,
-        zip_policy::{ValidatedZipOutputRules, decode_legacy_v2_intent},
+        zip_policy::decode_legacy_v2_intent,
     },
     state::AppState,
     store::{
@@ -37,7 +37,7 @@ pub async fn historical_empty(
     )
     .unwrap();
     let tags = vec![ObjectTag::new("ipfs-s3:zip-root", "false")];
-    let mut decision = PinPolicyEvaluator::new(&original)
+    let decision = PinPolicyEvaluator::new(&original)
         .evaluate_publication_decision(
             PublicationContext {
                 bucket,
@@ -49,12 +49,6 @@ pub async fn historical_empty(
         )
         .unwrap()
         .1;
-    decision
-        .capture_durable_revision(
-            &original,
-            ipfs_s3_gateway::config::OptionalPinControlMode::Strict,
-        )
-        .unwrap();
     assert!(decision.effective_intents.is_empty());
     let options = ZipV2Options {
         publish_source: false,
@@ -65,9 +59,8 @@ pub async fn historical_empty(
         root_enabled: false,
         result_version: 2,
     };
-    let rules = ValidatedZipOutputRules::compile(&[], &original).unwrap();
     let old = serde_json::json!({"bucket":bucket,"source_key":key,"target_prefix":"out/","options":options,
-        "source_decision":decision,"providers":[],"pin_plan":{"rule_revision":rules.revision(),
+        "source_decision":decision,"providers":[],"pin_plan":{"rule_revision":"historical-rule-revision",
             "targets":{"source":false,"extracted":false},"outputs":[]}});
     let capture = decode_legacy_v2_intent(&old.to_string()).unwrap();
     assert_eq!(capture.v2_options().as_ref(), Some(&options));
@@ -90,7 +83,7 @@ pub async fn historical_empty(
             bucket: bucket.into(),
             source_key: key.into(),
             captured_options: serde_json::json!({"options":options,"legacy_zip_intent":old,
-            "target_prefix":"out/","source_tags":tags,"rule_revision":rules.revision()})
+            "target_prefix":"out/","source_tags":tags,"rule_revision":"historical-rule-revision"})
             .to_string(),
         },
         prefix: "out/".into(),

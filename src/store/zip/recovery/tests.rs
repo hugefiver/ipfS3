@@ -321,7 +321,8 @@ async fn current_direct_capture_verifies_original_origin_options_and_exact_versi
         DecisionOrigin::new("owner", "root-token"),
     )
     .unwrap();
-    let captured = json!({"options":intent.v2_options(),"target_prefix":"out/","rule_revision":intent.policy_revision(),"zip_intent":intent});
+    let captured =
+        json!({"options":intent.v2_options(),"target_prefix":"out/","zip_intent":intent});
     let (_, mut snapshot, claim) = native(captured.clone(), "direct", false, false).await;
     assert_eq!(files(&snapshot, &claim).unwrap().len(), 1);
     for pointer in [
@@ -330,7 +331,6 @@ async fn current_direct_capture_verifies_original_origin_options_and_exact_versi
         "/zip_intent/bucket",
         "/zip_intent/source_key",
         "/zip_intent/target_prefix",
-        "/rule_revision",
     ] {
         let mut value = captured.clone();
         *value.pointer_mut(pointer).unwrap() = "other".into();

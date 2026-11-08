@@ -2,6 +2,7 @@
 //! Use these bounded entry points, not direct serde deserialization of model DTOs.
 
 mod bounds;
+pub(crate) mod compat;
 pub mod conversion;
 mod review;
 pub mod v3;

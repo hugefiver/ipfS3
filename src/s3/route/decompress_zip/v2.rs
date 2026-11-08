@@ -206,69 +206,30 @@ fn store_error(error: AppError) -> s3s::S3Error {
     }
 }
 
-/// Only newly applicable explicit safety vetoes block new I/O. An original Deny
-/// already means local-only/skipped for that scope, not a revoked authorization.
-pub(super) fn current_io_denied(
+pub(super) async fn preflight_current(
     state: &AppState,
     capture: &crate::pinning::zip_policy::CapturedZipIntent,
+    claim: &execution::Claim,
     manifest: Option<&crate::zip::batch::FinalZipManifest>,
-) -> bool {
-    use crate::pinning::{
-        tags::ContentMode,
-        zip_policy::{ZipOutputKind, ZipRuleEffect},
-    };
-    let manual = &capture.source_decision().effective_intents;
-    let source = capture.automatic_output_eligible(ZipOutputKind::Source, capture.source_key())
-        || manual
-            .iter()
-            .any(|intent| intent.content_mode == ContentMode::Object);
-    let manual_extracted = manual
-        .iter()
-        .any(|intent| intent.content_mode == ContentMode::Decompressed);
-    state
-        .pinning
-        .decompress_zip_config()
-        .output_rules()
-        .is_some_and(|rules| {
-            rules.iter().any(|rule| {
-                if rule.effect != ZipRuleEffect::Deny
-                    || (rule.bucket != "*" && rule.bucket != capture.bucket())
-                {
-                    return false;
-                }
-                if source
-                    && capture.source_key().starts_with(&rule.prefix)
-                    && !capture.originally_denied_scope(capture.source_key())
-                {
-                    return true;
-                }
-                if let Some(manifest) = manifest {
-                    return manifest.successful.iter().any(|file| {
-                        file.object_key.starts_with(&rule.prefix)
-                            && !capture.originally_denied_scope(&file.object_key)
-                            && (manual_extracted
-                                || capture.automatic_output_eligible(
-                                    ZipOutputKind::Extracted,
-                                    &file.object_key,
-                                ))
-                    });
-                }
-                // Pending has no admitted successes yet. Only the overlapping
-                // scope with frozen remote eligibility can conservatively veto.
-                if !(capture.target_prefix().starts_with(&rule.prefix)
-                    || rule.prefix.starts_with(capture.target_prefix()))
-                {
-                    return false;
-                }
-                let scope = if rule.prefix.len() > capture.target_prefix().len() {
-                    &rule.prefix
-                } else {
-                    capture.target_prefix()
-                };
-                !capture.originally_denied_scope(scope)
-                    && (manual_extracted || capture.automatic_extracted_scope_eligible(scope))
-            })
-        })
+) -> S3Result<()> {
+    if let Err(error) = publication::preflight_captured_zip_routes(
+        &state.store,
+        capture,
+        state.pinning.effective_config(),
+        state.pinning.zip_output_rules(),
+        state.pinning.control_mode(),
+        manifest,
+    )
+    .await
+    {
+        if matches!(error, AppError::InvalidPinningRequest(_)) {
+            execution::fence(state.store.db(), claim)
+                .await
+                .map_err(store_error)?;
+        }
+        return Err(store_error(error));
+    }
+    Ok(())
 }
 
 async fn admitted_manifest(
@@ -879,7 +840,7 @@ pub(super) async fn put(
         let contract = request_contract(&req, &parsed, &options, &principal)?;
         let captured =
             serde_json::json!({"options": options, "target_prefix": parsed.target_prefix,
-            "rule_revision": capture.policy_revision(), "zip_intent": capture})
+            "zip_intent": capture})
             .to_string();
         let request = execution::Admission {
             id,
@@ -1012,16 +973,6 @@ pub(super) async fn put(
             return Err(recovery_attention());
         }
     };
-    if execution.state != "admitted" && current_io_denied(state, &intent, None) {
-        hash_body(req.input, &mut input).await?;
-        let (sha, size) = finish_input(&input)?;
-        if let Some((original_sha, _, original_size)) = bound_input
-            && (&sha != original_sha || size != original_size)
-        {
-            return Err(conflict());
-        }
-        return Err(conflict());
-    }
     let worker = uuid::Uuid::new_v4().to_string();
     let Some(claim) = execution::claim(state.store.db(), &id, &worker, LEASE_SECONDS)
         .await
@@ -1032,6 +983,9 @@ pub(super) async fn put(
         return Err(conflict());
     };
     let lease = Lease::start(state.clone(), claim.clone());
+    if execution.state != "admitted" {
+        preflight_current(state, &intent, &claim, None).await?;
+    }
     let mut recovered_source_guard = None;
     let (archive, sha, manifest) = if execution.state == "admitted" {
         tokio::select! {
@@ -1268,9 +1222,7 @@ pub(super) async fn put(
     {
         return Err(conflict());
     }
-    if execution.state == "admitted" && current_io_denied(state, &intent, Some(&manifest)) {
-        return Err(conflict());
-    }
+    preflight_current(state, &intent, &claim, Some(&manifest)).await?;
     let root_outcome = build_zip_root(
         state,
         &id,
@@ -1331,10 +1283,20 @@ pub(super) async fn put(
     if lease.cancelled.is_cancelled() {
         return Err(conflict());
     }
-    if let Err(error) =
-        publication::application::publish_captured_zip(&state.store, publication).await
+    if let Err(error) = publication::application::publish_captured_zip(
+        &state.store,
+        publication,
+        state.pinning.effective_config(),
+        state.pinning.zip_output_rules(),
+        state.pinning.control_mode(),
+    )
+    .await
     {
-        if matches!(error, AppError::StaleContentMutation) {
+        if matches!(error, AppError::InvalidPinningRequest(_)) {
+            execution::fence(state.store.db(), &claim)
+                .await
+                .map_err(store_error)?;
+        } else if matches!(error, AppError::StaleContentMutation) {
             let fenced = if options.publish_source {
                 execution::fence(state.store.db(), &claim).await
             } else {

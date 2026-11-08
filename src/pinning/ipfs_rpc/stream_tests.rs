@@ -332,9 +332,17 @@ async fn malformed_multi_root_or_failed_car_imports_never_unpin() {
 }
 
 #[tokio::test]
-async fn post_mutation_verification_permission_error_keeps_unknown_effect() {
+async fn upload_confirmation_permission_error_never_completes_submit() {
     let source = MockServer::start().await;
     let target = MockServer::start().await;
+    source_file(&source, CID, b"stored").await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/add"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(format!("{{\"Hash\":\"{CID}\"}}\n")),
+        )
+        .mount(&target)
+        .await;
     Mock::given(method("POST"))
         .and(path("/api/v0/pin/add"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"Pins": [CID]})))
@@ -345,10 +353,53 @@ async fn post_mutation_verification_permission_error_keeps_unknown_effect() {
         .respond_with(ResponseTemplate::new(403))
         .mount(&target)
         .await;
-    let p = provider(&target, &source, RpcProfile::Kubo, RpcStrategy::Cid);
-    let error = p.submit(submit(CID)).await.unwrap_err();
+    let p = provider(&target, &source, RpcProfile::Kubo, RpcStrategy::Upload);
+    let observation = p.submit_observed(submit(CID)).await;
+    let error = observation.result.unwrap_err();
     assert!(!error.definitely_not_submitted());
     assert_eq!(error.class, ProviderErrorClass::Protocol);
+    assert_eq!(observation.effect, RpcSubmitEffect::Observed);
+    assert!(
+        observation
+            .resources
+            .iter()
+            .all(|resource| resource.ownership == crate::pinning::identity::Ownership::Unknown)
+    );
+}
+
+#[tokio::test]
+async fn car_confirmation_permission_error_never_completes_submit() {
+    let source = MockServer::start().await;
+    let target = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/dag/export"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"mock CAR"))
+        .mount(&source)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/dag/import"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            "{{\"Root\":{{\"Cid\":{{\"/\":\"{CID}\"}},\"PinErrorMsg\":\"\"}}}}\n{{\"Stats\":{{\"BlockCount\":1,\"BlockBytesCount\":8}}}}\n"
+        )))
+        .mount(&target)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/pin/ls"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&target)
+        .await;
+    let p = provider(&target, &source, RpcProfile::Kubo, RpcStrategy::Car);
+    let observation = p.submit_observed(submit(CID)).await;
+    let error = observation.result.unwrap_err();
+    assert!(!error.definitely_not_submitted());
+    assert_eq!(error.class, ProviderErrorClass::Protocol);
+    assert_eq!(observation.effect, RpcSubmitEffect::Observed);
+    assert!(
+        observation
+            .resources
+            .iter()
+            .all(|resource| resource.ownership == crate::pinning::identity::Ownership::Unknown)
+    );
 }
 
 #[tokio::test]

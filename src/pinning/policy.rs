@@ -8,9 +8,7 @@ use crate::{
         config::{
             LeaseDuration, PolicyTrigger, ProviderMode, ValidatedPinningConfig, ValidatedPolicy,
         },
-        decision::{
-            DecisionEffect, DecisionOrigin, ExtensionDecision, WarningCode, config_revision,
-        },
+        decision::{DecisionEffect, DecisionOrigin, ExtensionDecision, WarningCode},
         tags::{ContentMode, ObjectTag, PinControl},
     },
 };
@@ -48,9 +46,7 @@ pub struct PublicationPolicy {
 
 #[derive(Debug, Clone)]
 pub struct PinPolicyEvaluator {
-    policies: Vec<ValidatedPolicy>,
-    provider_limits: crate::pinning::config::ProviderLimitMap,
-    config_revision: String,
+    config: ValidatedPinningConfig,
     optional_control: OptionalPinControlMode,
 }
 
@@ -61,9 +57,7 @@ impl PinPolicyEvaluator {
 
     pub fn with_mode(config: &ValidatedPinningConfig, mode: OptionalPinControlMode) -> Self {
         Self {
-            policies: config.policies.clone(),
-            provider_limits: config.provider_limits.clone(),
-            config_revision: config_revision(config, mode),
+            config: config.clone(),
             optional_control: mode,
         }
     }
@@ -113,7 +107,8 @@ impl PinPolicyEvaluator {
                 .providers
                 .iter()
                 .filter(|name| {
-                    self.provider_limits
+                    self.config
+                        .provider_limits
                         .get(*name)
                         .is_some_and(|limits| limits.enabled)
                 })
@@ -146,16 +141,95 @@ impl PinPolicyEvaluator {
         } else {
             DecisionEffect::NoIntent
         };
-        let decision = ExtensionDecision::capture(
-            origin,
-            self.config_revision.clone(),
-            effect,
-            warning,
-            control,
-            &policy,
-        )
-        .map_err(invalid_request)?;
+        let decision = ExtensionDecision::capture(origin, effect, warning, control, &policy)
+            .map_err(invalid_request)?;
+        decision.validate_policy(&policy).map_err(invalid_request)?;
         Ok((policy, decision))
+    }
+
+    pub fn resolve_captured_publication(
+        &self,
+        context: PublicationContext<'_>,
+        captured: &ExtensionDecision,
+    ) -> Result<PublicationPolicy, PolicyError> {
+        captured.validate_snapshot().map_err(invalid_request)?;
+        if pin_control(context.tags)? != captured.control {
+            return Err(invalid_request(
+                "captured control does not match publication tags",
+            ));
+        }
+        let Some(policy) = self.matching_policy(context.bucket, context.key) else {
+            if captured.effect == DecisionEffect::Accepted {
+                return Err(invalid_request(
+                    "no pinning policy matches the accepted control",
+                ));
+            }
+            return Ok(PublicationPolicy {
+                tags: context.tags.to_vec(),
+                leases: Vec::new(),
+            });
+        };
+        let mut leases = Vec::new();
+        if policy.trigger == PolicyTrigger::Always {
+            leases.push(lease_intent(
+                policy,
+                LeaseSource::Automatic,
+                ContentMode::Object,
+                policy.default_duration,
+            ));
+        }
+        if captured.effect == DecisionEffect::Accepted {
+            let available = policy
+                .providers
+                .iter()
+                .filter(|name| {
+                    self.config.providers.iter().any(|provider| {
+                        provider.name == **name
+                            && provider.limits.enabled
+                            && !provider.identity.retired
+                    })
+                })
+                .count();
+            if available == 0
+                || (policy.provider_mode == ProviderMode::All
+                    && available != policy.providers.len())
+            {
+                return Err(invalid_request(
+                    "accepted manual pinning has no available provider",
+                ));
+            }
+            let PinControl::Request { duration, content } = captured.control else {
+                return Err(invalid_request("accepted control is not a pin request"));
+            };
+            let duration = duration.unwrap_or(policy.default_duration);
+            if duration > policy.max_duration {
+                return Err(invalid_request("requested duration exceeds policy maximum"));
+            }
+            validate_manual_content(content, context.is_decompress_zip, policy)?;
+            leases.push(lease_intent(policy, LeaseSource::Manual, content, duration));
+        }
+        Ok(PublicationPolicy {
+            tags: context.tags.to_vec(),
+            leases,
+        })
+    }
+
+    pub fn resolve_lease_policy(
+        &self,
+        bucket: &str,
+        key: &str,
+        source: LeaseSource,
+    ) -> Option<LeaseIntent> {
+        let policy = self.matching_policy(bucket, key)?;
+        if source == LeaseSource::Automatic && policy.trigger != PolicyTrigger::Always {
+            return None;
+        }
+        Some(lease_intent(
+            policy,
+            source,
+            ContentMode::Object,
+            policy.default_duration,
+        ))
     }
 
     pub fn evaluate_publication(
@@ -208,6 +282,8 @@ impl PinPolicyEvaluator {
 
     pub fn evaluate_tag_replacement(
         &self,
+        bucket: &str,
+        key: &str,
         existing_manual: Option<&ExistingManualLease>,
         replacement: &[ObjectTag],
         now: DateTime<Utc>,
@@ -234,29 +310,38 @@ impl PinPolicyEvaluator {
                 "ipfs-s3:retain-until is required to renew a manual pin lease",
             )),
             PinControl::Renew { retain_until } => {
-                self.evaluate_renewal(existing, retain_until, now)
+                self.evaluate_renewal(bucket, key, existing, retain_until, now)
             }
         }
     }
 
-    fn matching_policy(&self, bucket: &str, key: &str) -> Option<&ValidatedPolicy> {
-        self.policies.iter().find(|policy| {
+    pub fn matching_policy(&self, bucket: &str, key: &str) -> Option<&ValidatedPolicy> {
+        self.config.policies.iter().find(|policy| {
             (policy.bucket == "*" || policy.bucket == bucket) && key.starts_with(&policy.prefix)
         })
     }
 
     fn evaluate_renewal(
         &self,
+        bucket: &str,
+        key: &str,
         existing: &ExistingManualLease,
         retain_until: DateTime<Utc>,
         now: DateTime<Utc>,
     ) -> Result<ManualLeaseMutation, PolicyError> {
         let policy = self
-            .policies
-            .iter()
-            .find(|policy| policy.identity == existing.policy_id)
-            .ok_or_else(|| invalid_request("captured pinning policy is unknown"))?;
-        let maximum_retain_until = maximum_retain_until(now, policy.max_duration)?;
+            .matching_policy(bucket, key)
+            .ok_or_else(|| invalid_request("no pinning policy matches this object"))?;
+        Self::evaluate_authorized_renewal(existing, retain_until, now, policy.max_duration)
+    }
+
+    pub(crate) fn evaluate_authorized_renewal(
+        existing: &ExistingManualLease,
+        retain_until: DateTime<Utc>,
+        now: DateTime<Utc>,
+        current_max: crate::pinning::config::LeaseDuration,
+    ) -> Result<ManualLeaseMutation, PolicyError> {
+        let maximum_retain_until = maximum_retain_until(now, current_max)?;
         if retain_until > maximum_retain_until {
             return Err(invalid_request(
                 "retention timestamp exceeds policy maximum duration",
@@ -399,6 +484,85 @@ mod tests {
             tags::{ContentMode, ObjectTag},
         },
     };
+
+    #[test]
+    fn captured_control_uses_current_policy_and_does_not_activate_skipped_control() {
+        use crate::{config::OptionalPinControlMode, pinning::decision::DecisionOrigin};
+        let mut raw = PinningConfig {
+            providers: vec![provider("alpha", 1), provider("bravo", 2)],
+            policies: vec![rule(
+                "bucket",
+                "",
+                "request",
+                "one",
+                &["alpha"],
+                "1d",
+                "30d",
+                false,
+            )],
+            ..PinningConfig::default()
+        };
+        let original = ValidatedPinningConfig::from_raw(&raw, |_| None).unwrap();
+        let requested = tags(&[("ipfs-s3:pin", "true")]);
+        let context = PublicationContext {
+            bucket: "bucket",
+            key: "object",
+            tags: &requested,
+            is_decompress_zip: false,
+        };
+        let (_, accepted) = PinPolicyEvaluator::new(&original)
+            .evaluate_publication_decision(
+                context.clone(),
+                DecisionOrigin::new("owner", "accepted"),
+            )
+            .unwrap();
+        let empty = ValidatedPinningConfig::from_raw(&PinningConfig::default(), |_| None).unwrap();
+        let (_, skipped) = PinPolicyEvaluator::with_mode(&empty, OptionalPinControlMode::Warn)
+            .evaluate_publication_decision(context.clone(), DecisionOrigin::new("owner", "skipped"))
+            .unwrap();
+        raw.policies[0].providers = vec!["bravo".into(), "alpha".into()];
+        raw.providers[1].priority = 0;
+        raw.policies[0].default_duration = "2d".into();
+        raw.policies[0].max_duration = "3d".into();
+        let current = ValidatedPinningConfig::from_raw(&raw, |_| None).unwrap();
+        let evaluator = PinPolicyEvaluator::new(&current);
+        let resolved = evaluator
+            .resolve_captured_publication(context.clone(), &accepted)
+            .unwrap();
+        assert_eq!(resolved.leases[0].providers, vec!["bravo", "alpha"]);
+        assert_eq!(
+            resolved.leases[0].duration,
+            LeaseDuration::parse("2d").unwrap()
+        );
+        assert!(
+            evaluator
+                .resolve_captured_publication(context.clone(), &skipped)
+                .unwrap()
+                .leases
+                .is_empty()
+        );
+        assert!(
+            PinPolicyEvaluator::new(&empty)
+                .resolve_captured_publication(context.clone(), &accepted)
+                .is_err()
+        );
+        let mut unavailable = current.clone();
+        for provider in &mut unavailable.providers {
+            provider.limits.enabled = false;
+        }
+        assert!(
+            PinPolicyEvaluator::new(&unavailable)
+                .resolve_captured_publication(context, &accepted)
+                .is_err()
+        );
+        assert_eq!(
+            evaluator
+                .matching_policy("bucket", "object")
+                .unwrap()
+                .max_duration,
+            LeaseDuration::parse("3d").unwrap()
+        );
+    }
 
     const NOW_YEAR: i32 = 2026;
 
@@ -713,7 +877,7 @@ mod tests {
     #[test]
     fn warn_with_only_disabled_provider_is_explicit_but_strict_stays_invalid() {
         use crate::{
-            config::{Config, OptionalPinControlMode},
+            config::Config,
             pinning::decision::{DecisionEffect, DecisionOrigin, WarningCode},
         };
         let mut raw: Config = toml::from_str("[pinning_control]\nunavailable = 'warn'").unwrap();
@@ -747,21 +911,20 @@ mod tests {
         assert_eq!(decision.effect, DecisionEffect::Skipped);
         assert_eq!(decision.warning, Some(WarningCode::NoAvailableProvider));
         assert!(policy.leases.is_empty());
-        // Captured skipped control stays skipped even if the deployment switches
-        // back to strict; no new pin work is created during completion.
-        assert!(
-            decision
-                .verify_revision(&validated, OptionalPinControlMode::Strict)
-                .is_ok()
-        );
         raw.pinning.providers[0].enabled = true;
         let changed = ValidatedPinningConfig::from_config(&raw, |_| None).unwrap();
-        assert!(
-            decision
-                .verify_revision(&changed, OptionalPinControlMode::Warn)
-                .is_ok()
-        );
-        assert_eq!(decision.effect, DecisionEffect::Skipped); // Never re-evaluate old tags.
+        let resolved = PinPolicyEvaluator::new(&changed)
+            .resolve_captured_publication(
+                PublicationContext {
+                    bucket: "bucket",
+                    key: "object",
+                    tags: &requested,
+                    is_decompress_zip: false,
+                },
+                &decision,
+            )
+            .unwrap();
+        assert!(resolved.leases.is_empty());
 
         let invalid = tags(&[("ipfs-s3:pin", "true"), ("ipfs-s3:duration", "31d")]);
         assert!(
@@ -905,163 +1068,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_custom_route_capture_preserves_local_intent_but_never_cross_replays() {
-        use crate::{
-            config::OptionalPinControlMode,
-            pinning::decision::{DecisionEffect, DecisionOrigin},
-        };
-        let mut remote = provider("remote", 1);
-        remote.kind = "pinata".into();
-        remote.token_env = Some("PINNING_TOKEN".into());
-        remote.endpoint = Some("https://remote.example.test/secret-in-path".into());
-        let raw = PinningConfig {
-            providers: vec![remote],
-            policies: vec![rule(
-                "bucket",
-                "",
-                "request",
-                "one",
-                &["remote"],
-                "1d",
-                "30d",
-                false,
-            )],
-            ..PinningConfig::default()
-        };
-        let secret = "test-secret-not-in-snapshot";
-        let validated =
-            ValidatedPinningConfig::from_raw(&raw, |_| Some(secret.to_owned())).unwrap();
-        let evaluator = PinPolicyEvaluator::with_mode(&validated, OptionalPinControlMode::Warn);
-        let requested = tags(&[("ipfs-s3:pin", "true")]);
-        let (policy, accepted) = evaluator
-            .evaluate_publication_decision(
-                PublicationContext {
-                    bucket: "bucket",
-                    key: "object",
-                    tags: &requested,
-                    is_decompress_zip: false,
-                },
-                DecisionOrigin::new("principal", "request"),
-            )
-            .unwrap();
-        assert_eq!(accepted.effect, DecisionEffect::Accepted);
-        assert_eq!(policy.leases.len(), 1);
-        assert!(
-            accepted
-                .verify_revision(&validated, OptionalPinControlMode::Warn)
-                .is_ok()
-        );
-        assert!(
-            accepted
-                .verify_revision(&validated.clone(), OptionalPinControlMode::Warn)
-                .is_ok()
-        );
-        // A process-local keyed route binding proves an unchanged reload while
-        // rejecting a different endpoint without exposing the URL or token.
-        let reloaded = ValidatedPinningConfig::from_raw(&raw, |_| Some(secret.to_owned())).unwrap();
-        assert!(
-            accepted
-                .verify_revision(&reloaded, OptionalPinControlMode::Warn)
-                .is_ok()
-        );
-        let mut changed = raw.clone();
-        changed.providers[0].endpoint = Some("https://other.example.test/secret-in-path".into());
-        let changed =
-            ValidatedPinningConfig::from_raw(&changed, |_| Some(secret.to_owned())).unwrap();
-        assert!(
-            accepted
-                .verify_revision(&changed, OptionalPinControlMode::Warn)
-                .is_err()
-        );
-        let encoded = serde_json::to_string(&accepted).unwrap();
-        assert!(!encoded.contains(secret));
-        assert!(!encoded.contains("secret-in-path"));
-        let (_, skipped) = evaluator
-            .evaluate_publication_decision(
-                PublicationContext {
-                    bucket: "other",
-                    key: "object",
-                    tags: &requested,
-                    is_decompress_zip: false,
-                },
-                DecisionOrigin::new("principal", "other-request"),
-            )
-            .unwrap();
-        assert!(!serde_json::to_string(&skipped).unwrap().contains(secret));
-    }
-
-    #[test]
-    fn strict_legacy_default_endpoint_is_stable_but_switching_endpoint_is_not() {
-        use crate::{config::OptionalPinControlMode, pinning::decision::DecisionOrigin};
-        let mut remote = provider("remote", 1);
-        remote.kind = "pinata".into();
-        remote.token_env = Some("PINNING_TOKEN".into());
-        remote.endpoint = None;
-        let mut raw = PinningConfig {
-            providers: vec![remote],
-            policies: vec![rule(
-                "bucket",
-                "",
-                "request",
-                "one",
-                &["remote"],
-                "1d",
-                "30d",
-                false,
-            )],
-            ..PinningConfig::default()
-        };
-        let original = ValidatedPinningConfig::from_raw(&raw, |_| Some("token".into())).unwrap();
-        let tags = tags(&[("ipfs-s3:pin", "true")]);
-        let (_, captured) = PinPolicyEvaluator::new(&original)
-            .evaluate_publication_decision(
-                PublicationContext {
-                    bucket: "bucket",
-                    key: "object",
-                    tags: &tags,
-                    is_decompress_zip: false,
-                },
-                DecisionOrigin::new("principal", "request"),
-            )
-            .unwrap();
-        let same = ValidatedPinningConfig::from_raw(&raw, |_| Some("token".into())).unwrap();
-        assert!(
-            captured
-                .verify_revision(&same, OptionalPinControlMode::Strict)
-                .is_ok()
-        );
-        let rotated_token =
-            ValidatedPinningConfig::from_raw(&raw, |_| Some("different-token".into())).unwrap();
-        assert!(
-            captured
-                .verify_revision(&rotated_token, OptionalPinControlMode::Strict)
-                .is_err()
-        );
-        raw.providers[0].endpoint = Some("https://other.example.test/v3".into());
-        let changed = ValidatedPinningConfig::from_raw(&raw, |_| Some("token".into())).unwrap();
-        assert!(
-            captured
-                .verify_revision(&changed, OptionalPinControlMode::Strict)
-                .is_err()
-        );
-        let no_policy =
-            ValidatedPinningConfig::from_raw(&PinningConfig::default(), |_| None).unwrap();
-        assert!(
-            PinPolicyEvaluator::new(&no_policy)
-                .evaluate_publication_decision(
-                    PublicationContext {
-                        bucket: "bucket",
-                        key: "object",
-                        tags: &tags,
-                        is_decompress_zip: false
-                    },
-                    DecisionOrigin::new("principal", "strict-no-policy"),
-                )
-                .is_err()
-        );
-    }
-
-    #[test]
     fn request_trigger_requires_a_manual_request() {
         let evaluator = request_policy();
         let no_tags = Vec::new();
@@ -1174,13 +1180,25 @@ mod tests {
 
         assert_eq!(
             evaluator
-                .evaluate_tag_replacement(Some(&existing), &renew_tags(at(25)), now())
+                .evaluate_tag_replacement(
+                    "bucket",
+                    "object",
+                    Some(&existing),
+                    &renew_tags(at(25)),
+                    now()
+                )
                 .unwrap(),
             ManualLeaseMutation::Keep
         );
         assert_eq!(
             evaluator
-                .evaluate_tag_replacement(Some(&existing), &renew_tags(at(26)), now())
+                .evaluate_tag_replacement(
+                    "bucket",
+                    "object",
+                    Some(&existing),
+                    &renew_tags(at(26)),
+                    now()
+                )
                 .unwrap(),
             ManualLeaseMutation::Renew {
                 retain_until: at(26)
@@ -1188,12 +1206,24 @@ mod tests {
         );
         assert!(
             evaluator
-                .evaluate_tag_replacement(Some(&existing), &renew_tags(at(24)), now())
+                .evaluate_tag_replacement(
+                    "bucket",
+                    "object",
+                    Some(&existing),
+                    &renew_tags(at(24)),
+                    now()
+                )
                 .is_err()
         );
         assert!(
             evaluator
-                .evaluate_tag_replacement(Some(&existing), &renew_tags(august(21)), now())
+                .evaluate_tag_replacement(
+                    "bucket",
+                    "object",
+                    Some(&existing),
+                    &renew_tags(august(21)),
+                    now()
+                )
                 .is_err()
         );
     }
@@ -1209,7 +1239,13 @@ mod tests {
 
         assert_eq!(
             evaluator
-                .evaluate_tag_replacement(Some(&existing), &renew_tags(at(22)), now())
+                .evaluate_tag_replacement(
+                    "bucket",
+                    "object",
+                    Some(&existing),
+                    &renew_tags(at(22)),
+                    now()
+                )
                 .unwrap(),
             ManualLeaseMutation::Renew {
                 retain_until: at(22)
@@ -1217,12 +1253,24 @@ mod tests {
         );
         assert!(
             evaluator
-                .evaluate_tag_replacement(Some(&existing), &renew_tags(now()), now())
+                .evaluate_tag_replacement(
+                    "bucket",
+                    "object",
+                    Some(&existing),
+                    &renew_tags(now()),
+                    now()
+                )
                 .is_err()
         );
         assert!(
             evaluator
-                .evaluate_tag_replacement(Some(&existing), &renew_tags(at(20)), now())
+                .evaluate_tag_replacement(
+                    "bucket",
+                    "object",
+                    Some(&existing),
+                    &renew_tags(at(20)),
+                    now()
+                )
                 .is_err()
         );
     }
@@ -1238,14 +1286,20 @@ mod tests {
             let existing = existing_manual(policy_id(&evaluator), state, at(20));
             assert!(
                 evaluator
-                    .evaluate_tag_replacement(Some(&existing), &renew_tags(at(22)), now())
+                    .evaluate_tag_replacement(
+                        "bucket",
+                        "object",
+                        Some(&existing),
+                        &renew_tags(at(22)),
+                        now()
+                    )
                     .is_err()
             );
         }
     }
 
     #[test]
-    fn unknown_captured_policy_identity_is_rejected() {
+    fn renewal_matches_current_object_policy_instead_of_historical_identity() {
         let evaluator = request_policy();
         let existing = existing_manual(
             "policy:unknown".to_owned(),
@@ -1255,7 +1309,24 @@ mod tests {
 
         assert!(
             evaluator
-                .evaluate_tag_replacement(Some(&existing), &renew_tags(at(26)), now())
+                .evaluate_tag_replacement(
+                    "bucket",
+                    "object",
+                    Some(&existing),
+                    &renew_tags(at(26)),
+                    now()
+                )
+                .is_ok()
+        );
+        assert!(
+            evaluator
+                .evaluate_tag_replacement(
+                    "unmatched",
+                    "object",
+                    Some(&existing),
+                    &renew_tags(at(26)),
+                    now()
+                )
                 .is_err()
         );
     }
@@ -1278,19 +1349,19 @@ mod tests {
 
         assert_eq!(
             evaluator
-                .evaluate_tag_replacement(Some(&active), &empty, now())
+                .evaluate_tag_replacement("bucket", "object", Some(&active), &empty, now())
                 .unwrap(),
             ManualLeaseMutation::Cancel
         );
         assert_eq!(
             evaluator
-                .evaluate_tag_replacement(Some(&active), &cancel, now())
+                .evaluate_tag_replacement("bucket", "object", Some(&active), &cancel, now())
                 .unwrap(),
             ManualLeaseMutation::Cancel
         );
         assert_eq!(
             evaluator
-                .evaluate_tag_replacement(Some(&expired), &empty, now())
+                .evaluate_tag_replacement("bucket", "object", Some(&expired), &empty, now())
                 .unwrap(),
             ManualLeaseMutation::Keep
         );
@@ -1309,12 +1380,12 @@ mod tests {
 
         assert!(
             evaluator
-                .evaluate_tag_replacement(None, &request, now())
+                .evaluate_tag_replacement("bucket", "object", None, &request, now())
                 .is_err()
         );
         assert!(
             evaluator
-                .evaluate_tag_replacement(Some(&existing), &reconfigured, now())
+                .evaluate_tag_replacement("bucket", "object", Some(&existing), &reconfigured, now())
                 .is_err()
         );
     }

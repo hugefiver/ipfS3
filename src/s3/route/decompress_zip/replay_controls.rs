@@ -258,7 +258,7 @@ mod tests {
         use crate::pinning::{
             coordinator::PinningCoordinator,
             decision::DecisionOrigin,
-            zip_policy::{ValidatedZipOutputRules, ZipCaptureContext, capture_zip_intent},
+            zip_policy::{ZipCaptureContext, capture_zip_intent},
         };
         let coordinator = PinningCoordinator::disabled_for_test();
         let mut headers = HeaderMap::new();
@@ -293,13 +293,12 @@ mod tests {
         )
         .unwrap();
         assert!(current.controls().auto_pin_outputs);
-        let empty = ValidatedZipOutputRules::compile(&[], coordinator.effective_config()).unwrap();
         let legacy = serde_json::json!({
             "bucket": "bucket", "source_key": "archive.zip", "target_prefix": "out/",
             "options": current.v2_options().unwrap(),
             "source_decision": current.source_decision(), "providers": [],
             "pin_plan": {
-                "rule_revision": empty.revision(),
+                "rule_revision": "historical-config-digest",
                 "targets": {"source": false, "extracted": false}, "outputs": [],
             },
         });
@@ -311,11 +310,11 @@ mod tests {
             assert!(!decoded.controls().auto_pin_outputs);
             assert_eq!(decoded.source_decision(), current.source_decision());
             assert_eq!(decoded.v2_options(), current.v2_options());
-            assert_eq!(decoded.policy_revision(), empty.revision());
+            assert_eq!(decoded.bucket(), "bucket");
         }
         let mut revision_only = legacy;
         revision_only.as_object_mut().unwrap().remove("pin_plan");
-        revision_only["rule_revision"] = serde_json::json!(empty.revision());
+        revision_only["rule_revision"] = serde_json::json!("historical-config-digest");
         assert!(saved_intent(&revision_only).is_err());
     }
 

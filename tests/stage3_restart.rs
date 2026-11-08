@@ -280,7 +280,7 @@ async fn kubo_counts(kubo: &MockServer) -> [usize; 3] {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn accepted_mpu_survives_real_restart_and_revision_changes_fail_before_io() {
+async fn accepted_mpu_survives_real_restart_and_uses_current_policy_without_digest_fence() {
     let directory = tempfile::tempdir().expect("own test files");
     let kubo = MockServer::start().await;
     let pinata = MockServer::start().await;
@@ -354,14 +354,13 @@ async fn accepted_mpu_survives_real_restart_and_revision_changes_fail_before_io(
     assert_eq!(captured.effect, DecisionEffect::Accepted);
     assert_eq!(captured.origin.principal_id, "test");
     assert_eq!(captured.origin.request_id, good);
-    assert!(captured.config_revision.starts_with("d91d726f120fab02"));
     assert_eq!(
-        decision(&db, &credential).await.config_revision,
-        captured.config_revision
+        decision(&db, &credential).await.effect,
+        DecisionEffect::Accepted
     );
     assert_eq!(
-        decision(&db, &endpoint_id).await.config_revision,
-        captured.config_revision
+        decision(&db, &endpoint_id).await.effect,
+        DecisionEffect::Accepted
     );
     assert_eq!(
         rows(&db).await,
@@ -431,65 +430,53 @@ async fn accepted_mpu_survives_real_restart_and_revision_changes_fail_before_io(
     );
     b.stop();
 
-    for (label, changed_credential, changed_endpoint, key, id) in [
-        ("credential", 2, 1, "credential", &credential),
-        ("endpoint", 1, 2, "endpoint", &endpoint_id),
+    for (label, duration, key, id) in [
+        ("priority-quota", "2h", "credential", &credential),
+        ("policy-duration", "3h", "endpoint", &endpoint_id),
     ] {
         std::fs::write(
             &config_file,
-            config(
-                &db_url,
-                &kubo,
-                &pinata,
-                port,
-                changed_credential,
-                changed_endpoint,
-            ),
+            config(&db_url, &kubo, &pinata, port, 1, 1)
+                .replace("priority = 1", "priority = 9")
+                .replace("max_bytes = 100000", "max_bytes = 200000")
+                .replace("max_pins = 100", "max_pins = 200")
+                .replace(
+                    "default_duration = \"1h\"",
+                    &format!("default_duration = \"{duration}\""),
+                ),
         )
         .unwrap();
         let mut changed = start_gateway(directory.path(), &config_file, port, label).await;
-        let before_rows = rows(&db).await;
+        assert_eq!(decision(&db, id).await.effect, DecisionEffect::Accepted);
         let before_kubo = kubo_counts(&kubo).await;
-        let before_pinata = pinata.received_requests().await.unwrap().len();
-        let before_decision = decision(&db, id).await;
         let (status, body) = complete(&changed.endpoint, key, id).await;
-        assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{label}: {body}");
-        assert!(
-            body.contains("captured pinning configuration revision is unavailable"),
-            "{label}: {body}"
-        );
+        assert_eq!(status, reqwest::StatusCode::OK, "{label}: {body}");
+        let object = object::Entity::find()
+            .filter(object::Column::Key.eq(key))
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(object.cid, CID);
+        let lease = pin_lease::Entity::find()
+            .filter(pin_lease::Column::OwnerObjectId.eq(&object.id))
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        let expected_seconds = if duration == "2h" { 7200 } else { 10800 };
         assert_eq!(
-            decision(&db, id).await,
-            before_decision,
-            "{label} changed capture"
+            (lease.expires_at - lease.created_at).num_seconds(),
+            expected_seconds
         );
-        assert_eq!(
-            rows(&db).await,
-            before_rows,
-            "{label} published/queued work"
-        );
-        assert_eq!(
-            object::Entity::find()
-                .filter(object::Column::Key.eq(key))
-                .count(&db)
-                .await
-                .unwrap(),
-            0,
-            "{label} published an object"
-        );
-        assert_eq!(
-            kubo_counts(&kubo).await,
-            before_kubo,
-            "{label} invoked cat/add/pin"
-        );
-        assert_eq!(
-            pinata.received_requests().await.unwrap().len(),
-            before_pinata,
-            "{label} reached Pinata"
-        );
+        let after_kubo = kubo_counts(&kubo).await;
+        assert_eq!(after_kubo, before_kubo.map(|count| count + 1));
         changed.stop();
     }
-    assert_eq!(rows(&db).await, published);
+    let completed = rows(&db).await;
+    assert_eq!(completed.objects, 3);
+    assert_eq!(completed.uploads, 0);
+    assert_eq!(completed.leases, 3);
     drop(db);
     // All child processes are reaped before the mock servers and temporary directory drop.
 }

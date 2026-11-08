@@ -2,7 +2,7 @@
 use super::*;
 use sea_orm_migration::MigratorTrait;
 
-pub(super) fn current_versions() -> Vec<String> {
+pub(crate) fn current_versions() -> Vec<String> {
     crate::store::migrator::Migrator::migrations()
         .iter()
         .map(|migration| migration.name().to_owned())
@@ -15,7 +15,7 @@ pub(crate) fn archived_catalog(versions: &[String]) -> Result<&'static [NativeTa
     use std::sync::LazyLock;
     static VERSIONS: LazyLock<Vec<String>> = LazyLock::new(current_versions);
     static PRE_DOCUMENTS: LazyLock<Vec<NativeTable>> = LazyLock::new(|| {
-        let mut tables = registry();
+        let mut tables = baseline_catalog().to_vec();
         tables.retain(|table| table.table != "import_job_requests");
         *tables
             .iter_mut()
@@ -34,8 +34,13 @@ pub(crate) fn archived_catalog(versions: &[String]) -> Result<&'static [NativeTa
         }
         tables
     });
-    if versions == *VERSIONS || crate::store::migrations::history::is_m23(versions) {
+    if versions == *VERSIONS {
         return Ok(current_catalog());
+    }
+    if versions == [crate::store::migrations::baseline::VERSION]
+        || crate::store::migrations::history::is_m23(versions)
+    {
+        return Ok(baseline_catalog());
     }
     if !crate::store::migrations::history::is_prefix(versions) {
         return Err(ManagementError::InvalidEvidence);
@@ -51,6 +56,38 @@ pub(crate) fn archived_catalog(versions: &[String]) -> Result<&'static [NativeTa
 pub(crate) fn current_catalog() -> &'static [NativeTable] {
     use std::sync::LazyLock;
     static CATALOG: LazyLock<Vec<NativeTable>> = LazyLock::new(registry);
+    &CATALOG
+}
+
+fn baseline_catalog() -> &'static [NativeTable] {
+    static CATALOG: std::sync::LazyLock<Vec<NativeTable>> = std::sync::LazyLock::new(|| {
+        let mut tables = registry();
+        for table in &mut tables {
+            match table.table.as_str() {
+                "pin_extension_decisions" | "zip_v2_mpu_intakes" => {
+                    let name = if table.table == "pin_extension_decisions" {
+                        "config_revision"
+                    } else {
+                        "rule_revision"
+                    };
+                    table.columns.push(name.into());
+                    table.columns.sort();
+                    table
+                        .definitions
+                        .push(super::super::catalog::raw_column(&table.table, name));
+                    table.definitions.sort_by(|a, b| a.name.cmp(&b.name));
+                }
+                "pin_lease_targets" => {
+                    table.columns.retain(|name| name != "last_error");
+                    table
+                        .definitions
+                        .retain(|column| column.name != "last_error");
+                }
+                _ => {}
+            }
+        }
+        tables
+    });
     &CATALOG
 }
 

@@ -58,7 +58,7 @@ async fn exercise(db: &DatabaseConnection, source: Option<&str>) {
             database_scope: &binding.0,
             native_identity: &binding.1,
             source_version: source,
-            target_version: baseline::VERSION,
+            target_version: schema::VERSION,
         };
         initialization::upgrade_existing(db, request())
             .await
@@ -163,7 +163,10 @@ async fn exercise(db: &DatabaseConnection, source: Option<&str>) {
         initialization::open(db).await.unwrap();
     }
     initialization::open(db).await.unwrap();
-    assert_eq!(schema::validate(db).await.unwrap(), [baseline::VERSION]);
+    assert_eq!(
+        schema::validate(db).await.unwrap(),
+        [baseline::VERSION, schema::VERSION]
+    );
     store::bucket::create(db, "baseline", None).await.unwrap();
     store::object::upsert(
         db, "object", "baseline", "key", "cid", 3, None, "cid", None, false, None, None, false,
@@ -248,7 +251,20 @@ async fn old_target_stamp_and_interrupted_backfill_remain_recoverable() {
     use native::meter::Budget;
     use sea_orm::TransactionTrait;
     use store::pinning::management::records::segmented::{ArchiveHeader, write_archive};
-    for source in [history::M13, history::M17] {
+    struct OldBaseline;
+    impl MigratorTrait for OldBaseline {
+        fn migrations() -> Vec<Box<dyn sea_orm_migration::MigrationTrait>> {
+            vec![Box::new(
+                store::migrations::m20261027_000001_schema_baseline::Migration,
+            )]
+        }
+    }
+    for (source, old_target) in [
+        (history::M13, history::M23),
+        (history::M17, history::M23),
+        (history::M13, baseline::VERSION),
+        (history::M17, baseline::VERSION),
+    ] {
         let directory = tempfile::tempdir().unwrap();
         let url = format!(
             "sqlite://{}?mode=rwc",
@@ -259,10 +275,14 @@ async fn old_target_stamp_and_interrupted_backfill_remain_recoverable() {
                 .replace('\\', "/")
         );
         let db = store::connect_database(&url).await.unwrap();
-        Historical::up(&db, None).await.unwrap();
+        if old_target == baseline::VERSION {
+            OldBaseline::up(&db, None).await.unwrap();
+        } else {
+            Historical::up(&db, None).await.unwrap();
+        }
         let (scope, identity) = native::scope::binding(&db).await.unwrap();
-        let stamp=serde_json::to_vec(&serde_json::json!({"scope":scope,"identity":identity,"source":source,"target":history::M23})).unwrap();
-        let id = format!("history:upgrade:{}", history::M23);
+        let stamp=serde_json::to_vec(&serde_json::json!({"scope":scope,"identity":identity,"source":source,"target":old_target})).unwrap();
+        let id = format!("history:upgrade:{old_target}");
         let tx = db.begin().await.unwrap();
         write_archive(
             &tx,
@@ -271,7 +291,7 @@ async fn old_target_stamp_and_interrupted_backfill_remain_recoverable() {
                 database_scope: scope.clone(),
                 database_identity: identity.clone(),
                 principal: "explicit_local_upgrade".into(),
-                catalog: vec![source.into(), history::M23.into()],
+                catalog: vec![source.into(), old_target.into()],
                 request: String::new(),
                 configuration: String::new(),
                 acknowledgements: vec![],
@@ -302,9 +322,37 @@ async fn old_target_stamp_and_interrupted_backfill_remain_recoverable() {
             database_scope: &scope,
             native_identity: &identity,
             source_version: source,
-            target_version: baseline::VERSION,
+            target_version: schema::VERSION,
         };
         assert!(initialization::open(&db).await.is_err());
+        if old_target == baseline::VERSION {
+            assert!(
+                initialization::upgrade_existing(
+                    &db,
+                    UpgradeRequest {
+                        source_version: baseline::VERSION,
+                        ..request()
+                    }
+                )
+                .await
+                .is_err()
+            );
+            assert!(
+                initialization::upgrade_existing(
+                    &db,
+                    UpgradeRequest {
+                        source_version: if source == history::M13 {
+                            history::M17
+                        } else {
+                            history::M13
+                        },
+                        ..request()
+                    }
+                )
+                .await
+                .is_err()
+            );
+        }
         db.close().await.unwrap();
         let db = store::connect_database(&url).await.unwrap();
         initialization::upgrade_existing(&db, request())
@@ -351,7 +399,7 @@ async fn ledger_failure_rolls_back_m23_conversion_and_preserves_source() {
         database_scope: &scope,
         native_identity: &identity,
         source_version: history::M23,
-        target_version: baseline::VERSION,
+        target_version: schema::VERSION,
     };
     assert!(
         initialization::upgrade_existing(&db, request())
@@ -369,7 +417,7 @@ async fn ledger_failure_rolls_back_m23_conversion_and_preserves_source() {
         .map(|r| r.try_get::<String>("", "version").unwrap())
         .collect::<Vec<_>>();
     assert!(history::is_m23(&versions));
-    assert!(db.query_one(Statement::from_string(DatabaseBackend::Sqlite,"SELECT 1 FROM pin_management_inline_archive WHERE archive_id='history:upgrade:m20261027_000001_schema_baseline'")).await.unwrap().is_none());
+    assert!(db.query_one(Statement::from_string(DatabaseBackend::Sqlite,"SELECT 1 FROM pin_management_inline_archive WHERE archive_id='history:upgrade:m20261108_000001_current_pinning_config'")).await.unwrap().is_none());
     db.execute_unprepared("DROP TRIGGER fail_normalization")
         .await
         .unwrap();
@@ -424,7 +472,7 @@ async fn corrupt_source_is_rejected_without_preparation(
                 database_scope: &scope,
                 native_identity: &identity,
                 source_version: source,
-                target_version: baseline::VERSION,
+                target_version: schema::VERSION,
             }
         )
         .await
@@ -597,7 +645,7 @@ async fn postgres_old_target_stamp_recovers_without_rewriting_original() {
             write_archive(&tx, &id, &header, &mut original.as_slice(), &mut Budget::default()).await.unwrap();
             tx.execute_unprepared("UPDATE pin_management_readiness SET state='backfill'").await.unwrap();
             tx.commit().await.unwrap();
-            initialization::upgrade_existing(&db, UpgradeRequest { database_scope:&scope, native_identity:&identity, source_version:source, target_version:baseline::VERSION }).await.unwrap();
+            initialization::upgrade_existing(&db, UpgradeRequest { database_scope:&scope, native_identity:&identity, source_version:source, target_version:schema::VERSION }).await.unwrap();
             let row = db.query_one(Statement::from_sql_and_values(DatabaseBackend::Postgres, "SELECT payload,header FROM pin_management_inline_archive WHERE archive_id=$1", [id.into()])).await.unwrap().unwrap();
             assert_eq!(row.try_get::<Vec<u8>>("", "payload").unwrap(), original);
             assert_eq!(row.try_get::<String>("", "header").unwrap(), serde_json::to_string(&header).unwrap());

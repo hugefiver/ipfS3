@@ -1104,7 +1104,13 @@ impl DecompressZipRoute {
                     terminal_result,
                 };
                 let results = lease
-                    .commit(publish_captured_zip(&self.state.store, request))
+                    .commit(publish_captured_zip(
+                        &self.state.store,
+                        request,
+                        self.state.pinning.effective_config(),
+                        self.state.pinning.zip_output_rules(),
+                        self.state.pinning.control_mode(),
+                    ))
                     .await?;
                 let publication_result = results
                     .into_iter()

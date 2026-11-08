@@ -118,6 +118,13 @@ pub struct CanonicalResourceKey {
 }
 
 impl ProviderRouteSnapshot {
+    /// Execution compatibility never changes the historical deletion authority.
+    pub fn execution_compatible(&self, original: &Self) -> bool {
+        let mut execution = self.clone();
+        execution.cleanup = original.cleanup;
+        execution == *original
+    }
+
     pub fn resource_type(&self) -> RemoteResourceType {
         resource_type(&self.api_profile)
     }

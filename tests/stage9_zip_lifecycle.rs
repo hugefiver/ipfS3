@@ -371,9 +371,15 @@ async fn r25_source_false_shared_core_has_no_virtual_archive_or_empty_lease() {
         assert!(error.to_string().contains("ck_zip_v2_input"), "{error}");
         assert_eq!(object_entity::Entity::find().count(&db).await.unwrap(), 0);
         assert_eq!(pin_lease::Entity::find().count(&db).await.unwrap(), 0);
-        publication::publish_captured_zip(&db, request)
-            .await
-            .unwrap();
+        publication::publish_captured_zip(
+            &db,
+            request,
+            &config(),
+            &output_rules(&config()),
+            OptionalPinControlMode::Warn,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             object_entity::Entity::find().count(&db).await.unwrap(),
             if empty { 0 } else { 2 }
@@ -403,11 +409,17 @@ async fn r25_execution_completion_fault_restores_entire_common_publication() {
     let request = prepared_source_false(&db, false).await;
     db.execute_unprepared("CREATE TRIGGER r25_execution_tail BEFORE UPDATE OF state ON zip_v2_executions WHEN NEW.state='completed' BEGIN SELECT RAISE(ABORT,'execution tail'); END").await.unwrap();
     assert!(
-        publication::publish_captured_zip(&db, request.clone())
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("execution tail")
+        publication::publish_captured_zip(
+            &db,
+            request.clone(),
+            &config(),
+            &output_rules(&config()),
+            OptionalPinControlMode::Warn
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("execution tail")
     );
     assert_eq!(object_entity::Entity::find().count(&db).await.unwrap(), 0);
     assert_eq!(pin_lease::Entity::find().count(&db).await.unwrap(), 0);
@@ -429,7 +441,13 @@ async fn r25_execution_completion_fault_restores_entire_common_publication() {
     db.execute_unprepared("DROP TRIGGER r25_execution_tail")
         .await
         .unwrap();
-    publication::publish_captured_zip(&db, request)
-        .await
-        .unwrap();
+    publication::publish_captured_zip(
+        &db,
+        request,
+        &config(),
+        &output_rules(&config()),
+        OptionalPinControlMode::Warn,
+    )
+    .await
+    .unwrap();
 }

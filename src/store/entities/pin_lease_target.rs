@@ -10,6 +10,7 @@ pub struct Model {
     pub logical_size: i64,
     pub provider: String,
     pub state: String,
+    pub last_error: Option<String>,
     pub created_at: DateTimeUtc,
     pub last_touched_at: DateTimeUtc,
 }

@@ -112,7 +112,7 @@ async fn prepared_manifest_with_controls(
     let capture = r25_review_publication::capture(root_enabled, targets);
     let captured_options = serde_json::json!({
         "options": capture.v2_options().unwrap(), "target_prefix": capture.target_prefix(),
-        "rule_revision": capture.policy_revision(), "zip_intent": capture,
+        "zip_intent": capture,
     })
     .to_string();
     r25_review_publication::prepare_with_envelope(db, successes, failures, captured_options).await
@@ -126,7 +126,6 @@ fn request(claim: execution::Claim, successes: Vec<ZipV2Success>) -> ZipV2Public
         source_guard: None,
         successes,
         targets: ZipTargets::None,
-        captured_rule_revision: None,
         root_outcome: zip::RootOutcome::Disabled,
         terminal_result: "{\"result_version\":2}".into(),
     }
@@ -255,7 +254,6 @@ async fn each_output_gets_independent_automatic_policy_private_gets_no_lease_and
         ],
     );
     publication.targets = ZipTargets::Extracted;
-    publication.captured_rule_revision = Some(rules.revision().into());
     publication::publish_zip_v2(
         &second,
         publication,
@@ -306,53 +304,6 @@ async fn each_output_gets_independent_automatic_policy_private_gets_no_lease_and
             .iter()
             .all(|lease| lease.source == "automatic")
     );
-}
-
-#[tokio::test]
-async fn captured_rule_revision_cannot_be_replanned_with_new_permissions() {
-    let (_dir, first, second) = setup().await;
-    let config = pin_config();
-    let rules = output_rules(&config);
-    let claim = r25_review_publication::historical_revision_only(
-        &first,
-        &[("one", "out/a/one", "cid-1")],
-        ZipTargets::Extracted,
-        Some(&"0".repeat(64)),
-    )
-    .await;
-    let mut publication = request(claim, vec![success("one", "out/a/one", "cid-1", "one")]);
-    publication.targets = ZipTargets::Extracted;
-    publication.captured_rule_revision = Some("0".repeat(64));
-    let original = execution::read(&first, "v2-execution")
-        .await
-        .unwrap()
-        .unwrap();
-    let error = publication::publish_zip_v2(
-        &second,
-        publication,
-        &rules,
-        &config,
-        &config.provider_limits,
-    )
-    .await
-    .unwrap_err();
-    assert!(
-        matches!(error, ipfs_s3_gateway::error::AppError::InvalidPinningRequest(ref message) if message.contains("needs_attention"))
-    );
-    assert_eq!(
-        execution::read(&first, "v2-execution")
-            .await
-            .unwrap()
-            .unwrap(),
-        original
-    );
-    assert_eq!(object::Entity::find().count(&first).await.unwrap(), 0);
-    assert_eq!(pin_lease::Entity::find().count(&first).await.unwrap(), 0);
-    assert_eq!(
-        object_version::Entity::find().count(&first).await.unwrap(),
-        0
-    );
-    assert_eq!(remote_pin::Entity::find().count(&first).await.unwrap(), 0);
 }
 
 #[tokio::test]
@@ -811,7 +762,6 @@ async fn unverified_root_cid_cannot_commit_written_output_leases_or_guard_comple
         vec![success("one", "out/a/one", "cid-1", "one")],
     );
     publication.targets = ZipTargets::Extracted;
-    publication.captured_rule_revision = Some(rules.revision().into());
     publication.root_outcome = zip::RootOutcome::Verified {
         claim: zip::RootClaim {
             batch_id: claim.batch_id.clone(),

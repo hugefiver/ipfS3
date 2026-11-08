@@ -100,10 +100,13 @@ impl Rows {
         work: &SharedDecodeBudget,
     ) -> Result<Self> {
         macro_rules! rows {
-            ($module:ident, $table:literal, $($name:ident),+ $(,)?) => {{
+            ($module:ident, $table:literal, $($name:ident),+ $(,)? $(; $optional:ident)?) => {{
                 frame.table($table).ok_or(SnapshotError::InvalidEvidence)?.rows.iter().map(|public| {
                     let original = original_row(frame, $table, public, work)?;
-                    Ok($module::Model { $($name: field(&original, stringify!($name))?),+ })
+                    Ok($module::Model {
+                        $($name: field(&original, stringify!($name))?),+
+                        $(, $optional: value(&original, stringify!($optional)).map(str::to_owned))?
+                    })
                 }).collect::<Result<Vec<_>>>()?
             }};
         }
@@ -141,7 +144,8 @@ impl Rows {
                 provider,
                 state,
                 created_at,
-                last_touched_at
+                last_touched_at;
+                last_error
             ),
             remotes: rows!(
                 remote_pin,
@@ -352,7 +356,6 @@ pub(super) fn objects(
                 if value(row, "effect") != Some(expected)
                     || value(row, "object_id") != Some(&identity.object_id)
                     || value(row, "control_revision") != Some(&decision.control_revision)
-                    || value(row, "config_revision") != Some(&decision.config_revision)
                 {
                     return Err(SnapshotError::InvalidEvidence);
                 }
@@ -414,9 +417,6 @@ pub(super) fn objects(
                 control_revision: captured
                     .as_ref()
                     .map(|decision| decision.control_revision.clone()),
-                config_revision: captured
-                    .as_ref()
-                    .map(|decision| decision.config_revision.clone()),
                 selection: if legacy_unknown
                     || decision == Some(DecisionState::Skipped)
                     || matches!(item.action, Action::Backfill(_))

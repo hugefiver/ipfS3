@@ -269,7 +269,7 @@ async fn fixture(plan_id: &str) -> Fixture {
                     levels: vec![ConfirmationLevel::RemotePinned],
                     min_replicas: 1,
                     max_age_secs: None,
-                    policy_revision: config.pinning.policies[0].identity.clone(),
+                    policy_id: Some(config.pinning.policies[0].identity.clone()),
                 },
             }),
             subject: Subject::Object {

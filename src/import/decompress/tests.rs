@@ -244,7 +244,7 @@ async fn claimed_historical_job(
         tags: vec![],
         decompress_prefix: Some("out/".into()),
     };
-    let (_, mut decision) = PinPolicyEvaluator::new(&original)
+    let (_, decision) = PinPolicyEvaluator::new(&original)
         .evaluate_publication_decision(
             PublicationContext {
                 bucket: &request.bucket,
@@ -254,9 +254,6 @@ async fn claimed_historical_job(
             },
             DecisionOrigin::new("test", id),
         )
-        .unwrap();
-    decision
-        .capture_durable_revision(&original, crate::config::OptionalPinControlMode::default())
         .unwrap();
     let now = Utc::now();
     ownership::submit_decided(state.store.db(), request, decision, now)

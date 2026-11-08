@@ -95,7 +95,7 @@ async fn fixture(db: DatabaseConnection) -> Fixture {
          INSERT INTO pin_leases
          (id,owner_object_id,source,policy_id,provider_mode,content_mode,
           created_at,last_touched_at,expires_at,generation,state)
-         VALUES ('lease-1','object-1','test','policy','all','full',
+         VALUES ('lease-1','object-1','automatic','policy','all','full',
                  CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP + INTERVAL '1 hour',1,'active');
          INSERT INTO pin_lease_targets
          (id,lease_id,cid,logical_size,provider,state,created_at,last_touched_at)
@@ -125,12 +125,21 @@ async fn fixture(db: DatabaseConnection) -> Fixture {
             max_pins: 100,
             requests_per_second: None,
         }],
+        policies: vec![crate::config::PolicyConfig {
+            bucket: "bucket".to_owned(),
+            prefix: String::new(),
+            trigger: "always".to_owned(),
+            provider_mode: "all".to_owned(),
+            providers: vec!["noop".to_owned()],
+            default_duration: "1h".to_owned(),
+            max_duration: "1h".to_owned(),
+            allow_decompressed: false,
+        }],
         ..Default::default()
     };
     let validated = ValidatedPinningConfig::from_raw(&raw, |_| None).unwrap();
     let mut coordinator = PinningCoordinator::build(validated).unwrap();
-    let mut provider = ScriptProvider::new([]);
-    Arc::get_mut(&mut provider).unwrap().route = ("noop", "cid");
+    let provider = ScriptProvider::new([]);
     PinningCoordinator::replace_provider_for_test(&mut coordinator, "noop", provider.clone());
     Fixture {
         store: Store::new(db),
@@ -292,7 +301,7 @@ async fn postgres_identity_park_rechecks_restored_route_and_exact_claim() {
 
 #[tokio::test]
 #[ignore = "requires IPFS_S3_TEST_POSTGRES_URL; run explicitly with --ignored"]
-async fn postgres_missing_provider_worker_retries_and_finishes_ordinary_jobs_without_quota_drift() {
+async fn postgres_missing_provider_worker_errors_ordinary_jobs_without_quota_drift() {
     with_postgres_fixture(|fixture| async move {
         fixture.enqueue_poll("unavailable-request").await;
         let db = fixture.store.db();
@@ -304,35 +313,48 @@ async fn postgres_missing_provider_worker_retries_and_finishes_ordinary_jobs_wit
         }
         let before = resource_state(&fixture).await;
         assert_eq!((before.1.reserved_bytes, before.1.reserved_pins), (100, 1));
-        let mut missing = PinningCoordinator::disabled_for_test();
-        PinningCoordinator::configure_worker_for_test(&mut missing, |settings| {
-            settings.max_attempts = 2;
-        });
+        let missing = PinningCoordinator::disabled_for_test();
         let global = Arc::new(Semaphore::new(3));
-        for pass in 1..=3 {
-            let rows = pin_job::Entity::find().all(db).await.unwrap();
-            assert_eq!(rows.len(), 3);
-            let due = rows.iter().map(|row| row.next_attempt_at).max().unwrap();
-            let claims = jobs::claim_due_jobs(db, due, chrono::Duration::seconds(30), 3)
-                .await
-                .unwrap();
-            assert_eq!(claims.len(), 3);
-            for claimed in claims {
-                let id = claimed.model.id.clone();
-                tokio::time::timeout(
-                    Duration::from_secs(5),
-                    worker::execute_claimed_job(&fixture.store, &missing, &global, claimed),
-                )
-                .await
-                .expect("worker dispatch did not settle")
-                .unwrap();
-                let row = job(&fixture, &id).await;
-                assert_eq!(row.state, if pass < 3 { "pending" } else { "done" });
-                assert_eq!(row.attempts, pass.min(2));
-                assert_eq!(row.locked_until, None);
-            }
-            assert_eq!(resource_state(&fixture).await, before);
+        let rows = pin_job::Entity::find().all(db).await.unwrap();
+        assert_eq!(rows.len(), 3);
+        let due = rows.iter().map(|row| row.next_attempt_at).max().unwrap();
+        let claims = jobs::claim_due_jobs(db, due, chrono::Duration::seconds(30), 3)
+            .await
+            .unwrap();
+        assert_eq!(claims.len(), 3);
+        for claimed in claims {
+            let id = claimed.model.id.clone();
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                worker::execute_claimed_job(&fixture.store, &missing, &global, claimed),
+            )
+            .await
+            .expect("worker dispatch did not settle")
+            .unwrap();
+            let row = job(&fixture, &id).await;
+            assert_eq!(row.state, "error");
+            assert_eq!(row.attempts, 0);
+            assert!(row.locked_until.is_none());
         }
+        let (remote, usage, mut target) = resource_state(&fixture).await;
+        assert_eq!(remote, before.0);
+        assert_eq!(usage, before.1);
+        assert_eq!(target.state, "error");
+        assert!(target.last_error.is_some());
+        target.state = before.2.state.clone();
+        target.last_error = before.2.last_error.clone();
+        assert_eq!(target, before.2);
+        assert!(
+            jobs::claim_due_jobs(
+                db,
+                due + chrono::Duration::hours(2),
+                chrono::Duration::seconds(30),
+                3
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
         assert_no_provider_calls(&fixture);
     })
     .await;
@@ -340,17 +362,9 @@ async fn postgres_missing_provider_worker_retries_and_finishes_ordinary_jobs_wit
 
 #[tokio::test]
 #[ignore = "requires IPFS_S3_TEST_POSTGRES_URL; run explicitly with --ignored"]
-async fn postgres_missing_provider_submit_keeps_durable_recovery_and_reservation() {
+async fn postgres_missing_provider_submit_stays_terminal_without_releasing_reservation() {
     isolated(|fixture| async move {
-        let seed = fixture.store.db().begin().await.unwrap();
-        jobs::enqueue_job(
-            &seed,
-            jobs::submit_job("noop", "bafy-worker", "lease-1", "target-1", 1, Utc::now()),
-        )
-        .await
-        .unwrap();
-        seed.execute_unprepared("INSERT INTO pin_submit_history (job_id,api,strategy,effect,state,submit_calls,recovery_queries,started_at) SELECT id,'psa','cid','unknown','active',0,0,created_at FROM pin_jobs WHERE operation='submit' ON CONFLICT(job_id) DO NOTHING").await.unwrap();
-        seed.commit().await.unwrap();
+        fixture.enqueue_submit().await;
         let claimed = claim_one(&fixture).await;
         let before = resource_state(&fixture).await;
         let history = jobs::submission_history(fixture.store.db(), &claimed.model.id)
@@ -365,18 +379,36 @@ async fn postgres_missing_provider_submit_keeps_durable_recovery_and_reservation
         .await
         .unwrap();
         let row = job(&fixture, &claimed.model.id).await;
-        assert_eq!(row.state, "pending");
-        assert_eq!(row.submit_phase.as_deref(), Some("recovering"));
-        assert_eq!(row.attempts, 1);
+        assert_eq!(row.state, "error");
+        assert_eq!(row.submit_phase, claimed.model.submit_phase);
+        assert_eq!(row.attempts, 0);
         assert_eq!(row.locked_until, None);
-        assert!(row.next_attempt_at > claimed.model.next_attempt_at);
+        assert_eq!(row.next_attempt_at, claimed.model.next_attempt_at);
         assert_eq!(
             jobs::submission_history(fixture.store.db(), &row.id)
                 .await
                 .unwrap(),
             history
         );
-        assert_eq!(resource_state(&fixture).await, before);
+        let (remote, usage, mut target) = resource_state(&fixture).await;
+        assert_eq!(remote, before.0);
+        assert_eq!(usage, before.1);
+        assert_eq!(target.state, "error");
+        assert!(target.last_error.is_some());
+        target.state = before.2.state.clone();
+        target.last_error = before.2.last_error.clone();
+        assert_eq!(target, before.2);
+        assert!(
+            jobs::claim_due_jobs(
+                fixture.store.db(),
+                Utc::now() + chrono::Duration::hours(2),
+                chrono::Duration::seconds(30),
+                1
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
         assert_no_provider_calls(&fixture);
     })
     .await;
@@ -407,13 +439,10 @@ async fn postgres_unavailable_provider_rechecks_claim_and_current_remote_epoch()
             .await
             .unwrap();
         let old = job(&fixture, &claimed.model.id).await;
-        assert_eq!(old.state, "done");
+        assert_eq!(old.state, "error");
         assert_eq!(old.attempts, 0);
         assert_eq!(old.locked_until, None);
-        let current = current_reconciles(&fixture, 2).await;
-        assert_eq!(current.len(), 1);
-        assert_eq!(current[0].state, "pending");
-        assert_eq!(current[0].attempts, 0);
+        assert!(current_reconciles(&fixture, 2).await.is_empty());
         assert_eq!(resource_state(&fixture).await, before);
         assert_no_provider_calls(&fixture);
     })

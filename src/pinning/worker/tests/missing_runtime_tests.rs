@@ -57,7 +57,7 @@ async fn missing_runtime_entry_parks_captured_identity_without_runtime_before_ex
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(row.state, "running");
+    assert_eq!(row.state, "error");
     assert_eq!(row.attempts, 8);
     assert!(row.locked_until.is_none());
     assert!(row.last_error.is_some());
@@ -100,7 +100,7 @@ async fn missing_runtime_entry_rejects_registered_poll_without_capture_and_unkno
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(row.state, "running");
+        assert_eq!(row.state, "error");
         assert_eq!(row.attempts, 0);
         assert!(row.locked_until.is_none());
         assert!(row.last_error.is_some());
@@ -117,7 +117,7 @@ async fn missing_runtime_entry_rejects_registered_poll_without_capture_and_unkno
 }
 
 #[tokio::test]
-async fn missing_runtime_entry_propagates_invalid_registered_route_without_settlement() {
+async fn missing_runtime_entry_rejects_registration_drift_after_clean_admission_without_io() {
     use sea_orm::{ActiveModelTrait, IntoActiveModel, Set};
     let fixture = fixture([]).await;
     let db = fixture.store.db();
@@ -128,6 +128,24 @@ async fn missing_runtime_entry_propagates_invalid_registered_route_without_settl
         .unwrap();
     fixture.enqueue_poll("registered-drift").await;
     let claimed = claim(&fixture).await;
+    let admitted = super::super::admit_claimed_job(
+        &fixture.store,
+        &fixture.coordinator,
+        &Arc::new(Semaphore::new(2)),
+        claimed.clone(),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        admitted,
+        super::super::WorkerContinuation::RunJob(_)
+    ));
+    let before = pin_job::Entity::find_by_id(&claimed.model.id)
+        .one(db)
+        .await
+        .unwrap()
+        .unwrap();
     let mut registered = pin_provider_route::Entity::find_by_id("noop".to_owned())
         .one(db)
         .await
@@ -145,14 +163,19 @@ async fn missing_runtime_entry_propagates_invalid_registered_route_without_settl
         claimed.clone(),
     )
     .await;
-    assert!(result.is_err());
+    assert!(matches!(
+        result,
+        Err(crate::error::AppError::InvalidPinningRequest(_))
+    ));
     let row = pin_job::Entity::find_by_id(claimed.model.id.clone())
         .one(db)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(row, claimed.model);
+    assert_eq!(row, before);
     assert_eq!(fixture.provider.gets.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.provider.submits.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.provider.unpins.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -184,7 +207,7 @@ async fn missing_runtime_entry_stale_claim_cannot_retry_or_park_successor() {
 }
 
 #[tokio::test]
-async fn missing_runtime_entry_stale_reconcile_finishes_and_enqueues_current_epoch_atomically() {
+async fn missing_runtime_entry_stale_reconcile_terminates_without_replacement() {
     let fixture = fixture([]).await;
     jobs::enqueue_job(
         fixture.store.db(),
@@ -206,17 +229,17 @@ async fn missing_runtime_entry_stale_reconcile_finishes_and_enqueues_current_epo
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(old.state, "done");
+    assert_eq!(old.state, "error");
     assert_eq!(old.attempts, 0);
     assert!(old.locked_until.is_none());
-    let current = pin_job::Entity::find()
-        .filter(pin_job::Column::ExpectedRemoteEpoch.eq(2))
-        .one(fixture.store.db())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(current.state, "pending");
-    assert_eq!(current.operation, "reconcile");
+    assert!(
+        pin_job::Entity::find()
+            .filter(pin_job::Column::ExpectedRemoteEpoch.eq(2))
+            .one(fixture.store.db())
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]

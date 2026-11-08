@@ -185,7 +185,14 @@ async fn mpu_final_publication_rereads_decision_and_accepts_single_authority() {
     .await
     .unwrap();
     assert!(matches!(
-        publication::publish_captured_zip(&db, request.clone()).await,
+        publication::publish_captured_zip(
+            &db,
+            request.clone(),
+            &config,
+            &stage9_zip_support::output_rules(&config),
+            OptionalPinControlMode::Warn
+        )
+        .await,
         Err(ipfs_s3_gateway::error::AppError::InvalidPinningRequest(_))
     ));
     assert_eq!(object_version::Entity::find().count(&db).await.unwrap(), 0);
@@ -204,9 +211,15 @@ async fn mpu_final_publication_rereads_decision_and_accepts_single_authority() {
     ))
     .await
     .unwrap();
-    publication::publish_captured_zip(&db, request)
-        .await
-        .unwrap();
+    publication::publish_captured_zip(
+        &db,
+        request,
+        &config,
+        &stage9_zip_support::output_rules(&config),
+        OptionalPinControlMode::Warn,
+    )
+    .await
+    .unwrap();
     assert_eq!(object_version::Entity::find().count(&db).await.unwrap(), 3);
     assert!(store::multipart::get_upload(&db, "batch").await.is_err());
 }

@@ -99,7 +99,9 @@ impl Budget {
     }
 
     fn requirements(&mut self, requirements: &Requirements) -> Result<(), SafeError> {
-        self.id(&requirements.policy_revision)?;
+        if let Some(policy_id) = &requirements.policy_id {
+            self.id(policy_id)?;
+        }
         if requirements.provider_ids.is_empty()
             || requirements.provider_ids.len() > MAX_PROVIDERS
             || requirements.min_replicas == 0
@@ -135,9 +137,6 @@ impl Budget {
         self.rows(1)?;
         self.exact(&object.identity)?;
         if let Some(value) = &object.control_revision {
-            self.id(value)?;
-        }
-        if let Some(value) = &object.config_revision {
             self.id(value)?;
         }
         if object.allowed_routes.len() > MAX_PROVIDERS {

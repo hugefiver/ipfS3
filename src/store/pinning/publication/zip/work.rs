@@ -56,7 +56,10 @@ pub(super) fn select(
     Ok((selected, resident))
 }
 
-pub(super) fn session(request: &CapturedZipPublication) -> AppResult<SharedDecodeBudget> {
+pub(super) fn session(
+    request: &CapturedZipPublication,
+    selection: &CapturedZipIntent,
+) -> AppResult<SharedDecodeBudget> {
     // Start the deadline before validation or shape scanning. Only tighten this session.
     let session = std::sync::Arc::new(std::sync::Mutex::new(
         ReadSession::for_zip_publication(65_536).map_err(work_error)?,
@@ -84,11 +87,11 @@ pub(super) fn session(request: &CapturedZipPublication) -> AppResult<SharedDecod
     let validation_resident = sql::retain_copy(work, validation_bytes)?;
     validate(request)?;
     drop(validation_resident);
-    let shape = bounds.shape(
-        &request.capture,
-        request.successes.len(),
-        request.source.is_some(),
-    )?;
+    let selection_bounds = work
+        .with(|session| allocation::CaptureBounds::measure(selection, session))
+        .map_err(work_error)?;
+    let shape =
+        selection_bounds.shape(selection, request.successes.len(), request.source.is_some())?;
     work.with(|session| session.zip_publication_shape(shape))
         .map_err(work_error)?;
     sql::charge(

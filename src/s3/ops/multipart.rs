@@ -251,7 +251,6 @@ pub async fn create_multipart_upload(
                 request_contract: contract,
                 options,
                 captured_config,
-                rule_revision: zip_intent.policy_revision().to_owned(),
                 content_type,
                 metadata,
                 tags,
@@ -304,7 +303,7 @@ pub async fn create_multipart_upload(
         ),
         _ => None,
     };
-    let mut decision = if let Some(intent) = &zip_intent {
+    let decision = if let Some(intent) = &zip_intent {
         intent.source_decision().clone()
     } else {
         state
@@ -322,14 +321,12 @@ pub async fn create_multipart_upload(
             .map_err(crate::error::AppError::from)?
             .1
     };
-    if zip_intent.is_none() {
-        decision
-            .capture_durable_revision(
-                state.pinning.effective_config(),
-                state.pinning.control_mode(),
-            )
-            .map_err(invalid_pinning_argument)?;
-    }
+
+    state
+        .pinning
+        .effective_config()
+        .validate_durable_intents(&decision.effective_intents)
+        .map_err(|error| invalid_pinning_argument(&error.to_string()))?;
 
     // For SSE-S3 we generate a per-object key now and persist its wrapped form
     // so the same key can be reused for every part. SSE-C keys are supplied
@@ -904,7 +901,6 @@ pub async fn assemble_zip_v2_archive(
         || persisted.request_fingerprint != intake.request_fingerprint
         || persisted.captured_options != intake.captured_options
         || persisted.captured_config != intake.captured_config
-        || persisted.rule_revision != intake.rule_revision
         || persisted.target_prefix != intake.target_prefix
         || persisted.token != intake.token
     {
@@ -956,7 +952,6 @@ pub async fn assemble_zip_v2_archive(
             .as_bool()
             .is_none_or(|default| options.root_enabled != options.root_override.unwrap_or(default))
         || options.result_version != 2
-        || intake.rule_revision.is_empty()
         || contract["version"] != 2
         || contract["owner"] != principal
         || contract["bucket"] != req.input.bucket
@@ -1246,6 +1241,7 @@ impl CompletedUploadFinalizerStore for DatabaseCompletedUploadFinalizer<'_> {
                 mode: self.pinning.control_mode(),
                 limits: self.pinning.provider_limits(),
             },
+            self.pinning.zip_output_rules(),
         )
         .await
     }
@@ -1373,6 +1369,9 @@ pub async fn finalize_completed_multipart_zip_batch(
             crate::store::pinning::publication::application::publish_captured_zip(
                 &state.store,
                 request,
+                state.pinning.effective_config(),
+                state.pinning.zip_output_rules(),
+                state.pinning.control_mode(),
             )
             .await,
         )
@@ -1783,26 +1782,49 @@ pub async fn complete_multipart_upload_inner(
     } else {
         persisted_decision
     };
-    if zip_intent.is_none()
-        && let Some(decision) = &pin_decision
-    {
-        decision
-            .verify_revision(
-                state.pinning.effective_config(),
-                state.pinning.control_mode(),
-            )
-            .map_err(invalid_pinning_argument)?;
-    }
     // NULL is an unknown historical capture, not permission to reinterpret raw
     // reserved tags or opt into a newly installed policy at completion.
-    let publication_policy = match &pin_decision {
-        Some(decision) => decision
-            .replay_policy(tags.clone())
-            .map_err(invalid_pinning_argument)?,
-        None => PublicationPolicy {
+    let publication_policy = if let Some(intent) = &zip_intent {
+        let resolved = intent
+            .resolve_current_with_rules(
+                state.pinning.effective_config(),
+                state.pinning.zip_output_rules(),
+                state.pinning.control_mode(),
+            )
+            .map_err(|error| invalid_pinning_argument(&error.to_string()))?;
+        resolved
+            .validate_durable_current(state.pinning.effective_config())
+            .map_err(|error| invalid_pinning_argument(&error.to_string()))?;
+        PublicationPolicy {
             tags: tags.clone(),
-            leases: Vec::new(),
-        },
+            leases: resolved.source_intents().to_vec(),
+        }
+    } else {
+        let policy = match &pin_decision {
+            Some(decision) => state
+                .pinning
+                .policy()
+                .resolve_captured_publication(
+                    PublicationContext {
+                        bucket,
+                        key,
+                        tags: &tags,
+                        is_decompress_zip: false,
+                    },
+                    decision,
+                )
+                .map_err(crate::error::AppError::from)?,
+            None => PublicationPolicy {
+                tags: tags.clone(),
+                leases: Vec::new(),
+            },
+        };
+        state
+            .pinning
+            .effective_config()
+            .validate_durable_intents(&policy.leases)
+            .map_err(|error| invalid_pinning_argument(&error.to_string()))?;
+        policy
     };
 
     // This read rejects an already-overwritten route before admission or Kubo I/O.
@@ -1812,6 +1834,8 @@ pub async fn complete_multipart_upload_inner(
             &state.store,
             intent,
             state.pinning.effective_config(),
+            state.pinning.zip_output_rules(),
+            state.pinning.control_mode(),
             None,
         )
         .await?;
@@ -1824,6 +1848,7 @@ pub async fn complete_multipart_upload_inner(
                 mode: state.pinning.control_mode(),
                 limits: state.pinning.provider_limits(),
             },
+            &publication_policy,
         )
         .await?;
     }
@@ -4934,7 +4959,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepted_multipart_provider_revision_drift_rejects_before_admission_or_kubo() {
+    async fn multipart_runtime_route_mismatch_rejects_before_admission_or_kubo() {
         use crate::pinning::decision::DecisionEffect;
         use crate::store::entities::{import_destination, standard_mutation_lease};
 
@@ -5027,14 +5052,6 @@ mod tests {
             rotated.providers[0].identity.endpoint_revision += 1;
             Arc::get_mut(&mut state).unwrap().pinning =
                 crate::pinning::coordinator::PinningCoordinator::build(rotated).unwrap();
-            assert!(
-                decision
-                    .verify_revision(
-                        state.pinning.effective_config(),
-                        state.pinning.control_mode()
-                    )
-                    .is_err()
-            );
 
             let mut complete = complete_request(&upload_id, part_etag.value());
             if zip {
@@ -5048,11 +5065,6 @@ mod tests {
             let result = complete_multipart_upload_inner(&state, complete).await;
             let error = result.unwrap_err();
             assert_eq!(error.code().as_str(), "InvalidArgument", "zip={zip}");
-            assert!(
-                error
-                    .to_string()
-                    .contains("captured pinning configuration revision is unavailable")
-            );
             assert_eq!(
                 kubo.received_requests().await.unwrap().len(),
                 before.len(),
@@ -5177,12 +5189,7 @@ mod tests {
                 assert_eq!(capture.origin(), &decision.origin);
                 assert_eq!(capture.source_decision(), &decision);
             }
-            decision
-                .verify_revision(
-                    state.pinning.effective_config(),
-                    state.pinning.control_mode(),
-                )
-                .unwrap();
+            decision.validate_snapshot().unwrap();
             crate::store::multipart::upsert_part(
                 state.store.db(),
                 &upload_id,
@@ -5297,7 +5304,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn r25_zip_mpu_automatic_transport_drift_is_rejected_before_io() {
+    async fn zip_mpu_current_route_mismatch_rejects_before_io_and_unavailable_auto_is_skipped() {
         use crate::pinning::coordinator::PinningCoordinator;
         use crate::store::entities::{import_destination, object, standard_mutation_lease};
 
@@ -5320,8 +5327,10 @@ mod tests {
                 .mount(&kubo)
                 .await;
             let mut state = pinning_test_state(kubo.uri(), "always", "one", "", true).await;
-            let mut zip = state.pinning.decompress_zip_config().clone();
-            zip.auto_pin_outputs = Some(true);
+            let zip = crate::config::DecompressZipConfig {
+                auto_pin_outputs: Some(true),
+                ..Default::default()
+            };
             Arc::get_mut(&mut state).unwrap().pinning =
                 PinningCoordinator::build_with_decompress_config(
                     state.pinning.effective_config().clone(),
@@ -5359,6 +5368,15 @@ mod tests {
                 "disabled" => provider.limits.enabled = false,
                 _ => unreachable!(),
             }
+            if matches!(field, "retired" | "disabled") {
+                for provider in &mut current.providers {
+                    if field == "retired" {
+                        provider.identity.retired = true;
+                    } else {
+                        provider.limits.enabled = false;
+                    }
+                }
+            }
             Arc::get_mut(&mut state).unwrap().pinning =
                 PinningCoordinator::build_with_decompress_config(
                     current,
@@ -5367,19 +5385,20 @@ mod tests {
                     &zip,
                 )
                 .unwrap();
-            let error = complete_multipart_upload_inner(
+            let result = complete_multipart_upload_inner(
                 &state,
                 r25_authenticated_complete(&upload.upload_id),
             )
-            .await
-            .unwrap_err();
-            assert_eq!(error.code().as_str(), "InvalidArgument", "{field}");
-            assert!(
-                error
-                    .to_string()
-                    .contains("captured pinning configuration revision is unavailable"),
-                "{field}: {error}"
-            );
+            .await;
+            if matches!(field, "retired" | "disabled") {
+                let completed = result.unwrap();
+                assert_eq!(completed.zip_intent.as_ref(), Some(&capture));
+                assert!(completed.publication_policy.leases.is_empty());
+                assert_eq!(pinning_row_counts(&state).await, [0; 5]);
+                continue;
+            }
+            let error = result.unwrap_err();
+            assert_eq!(error.code().as_str(), "InvalidArgument", "{field}: {error}");
             assert!(
                 kubo.received_requests().await.unwrap().is_empty(),
                 "{field}"
@@ -5469,15 +5488,6 @@ mod tests {
                 &zip,
             )
             .unwrap();
-        assert!(
-            capture
-                .source_decision()
-                .verify_revision(
-                    state.pinning.effective_config(),
-                    state.pinning.control_mode()
-                )
-                .is_err()
-        );
         let completed =
             complete_multipart_upload_inner(&state, r25_authenticated_complete(&upload.upload_id))
                 .await
@@ -5489,7 +5499,7 @@ mod tests {
         );
         assert_eq!(
             completed.publication_policy.leases[0].duration.as_seconds(),
-            3600
+            7200
         );
         assert_eq!(completed.root_cid, "QmRoot");
         assert_eq!(
@@ -5523,8 +5533,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn r25_zip_mpu_ineligible_original_scope_ignores_current_provider_and_policy_drift() {
-        use crate::pinning::{config::PolicyTrigger, coordinator::PinningCoordinator};
+    async fn legacy_zip_mpu_without_remote_duties_ignores_current_source_automatic_policy() {
+        use crate::pinning::{
+            config::{PolicyTrigger, ValidatedPinningConfig},
+            coordinator::PinningCoordinator,
+        };
 
         for (trigger, prefix, available) in [
             ("request", "", true),
@@ -5560,10 +5573,15 @@ mod tests {
             assert!(capture.source_decision().effective_intents.is_empty());
             assert!(!capture.controls().targets.extracted);
             let mut current = state.pinning.effective_config().clone();
-            for provider in &mut current.providers {
-                provider.identity.endpoint_revision += 1;
-                provider.limits.enabled = true;
-            }
+            let mut legacy: crate::config::PinningConfig = toml::from_str(
+                "[[providers]]\nname='remote'\nkind='pinata'\ntoken_env='REMOTE_TOKEN'\npriority=1\nmax_bytes=10000\nmax_pins=100\n",
+            ).unwrap();
+            legacy.providers[0].endpoint = Some(kubo.uri());
+            let legacy =
+                ValidatedPinningConfig::from_raw(&legacy, |_| Some("test-token".into())).unwrap();
+            current.providers = legacy.providers;
+            current.provider_limits = legacy.provider_limits;
+            current.policies[0].providers = vec!["remote".into()];
             current.policies[0].trigger = PolicyTrigger::Always;
             current.policies[0].prefix.clear();
             let zip: crate::config::DecompressZipConfig = toml::from_str(

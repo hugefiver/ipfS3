@@ -4285,6 +4285,9 @@ async fn completed_publication_winner_removes_the_exact_upload() {
     publication.archive.object.multipart = true;
     let guard = admitted.completion_guard(&first).await;
     let replay = zip_fixture::replay();
+    let decided =
+        zip_fixture::current_snapshot(&first, &batch.batch_id, &publication.archive, &limits())
+            .await;
     let completion_transaction = first.begin().await.unwrap();
     let publication_result = publish_in_transaction_with_batch(
         &completion_transaction,
@@ -4298,7 +4301,7 @@ async fn completed_publication_winner_removes_the_exact_upload() {
         None,
         None,
         &limits(),
-        None,
+        Some(&decided),
         Some(&replay),
     )
     .await
@@ -4538,7 +4541,10 @@ async fn multipart_non_zip_and_zip_success_publish_and_remove_upload_parts_atomi
     archive_object.multipart = true;
     let archive = request(
         archive_object,
-        vec![tag("ipfs-s3:pin", "true")],
+        vec![
+            tag("ipfs-s3:pin", "true"),
+            tag("ipfs-s3:content", "decompressed"),
+        ],
         vec![intent(
             LeaseSource::Manual,
             ProviderMode::All,
@@ -4592,7 +4598,7 @@ async fn multipart_non_zip_and_zip_success_publish_and_remove_upload_parts_atomi
             .count(&db)
             .await
             .unwrap(),
-        1
+        2
     );
     assert_eq!(
         pin_lease::Entity::find()
@@ -5112,11 +5118,99 @@ async fn new_one_mode_target_on_failed_remote_gets_current_epoch_reconcile() {
 }
 
 #[tokio::test]
+async fn legacy_zip_uses_current_quota_without_rewriting_admission_capture() {
+    let db = setup().await;
+    let archive = request(
+        object("zip-frozen", "archive.zip", "bafy-zip-frozen", 10),
+        vec![
+            tag("ipfs-s3:pin", "true"),
+            tag("ipfs-s3:content", "decompressed"),
+        ],
+        vec![intent(
+            LeaseSource::Manual,
+            ProviderMode::One,
+            &["pinata"],
+            ContentMode::Decompressed,
+        )],
+    );
+    let admitted = zip_fixture::direct(&db, &archive, "out/").await;
+    let original = crate::store::entities::zip_batch::Entity::find_by_id(&admitted.id)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap()
+        .captured_options;
+    let mut current = limits();
+    current.get_mut("pinata").unwrap().max_bytes = 1;
+    current.get_mut("pinata").unwrap().priority = 100;
+    admitted
+        .publish(
+            &db,
+            ZipPublicationRequest {
+                archive,
+                entries: vec![object(
+                    "zip-frozen-entry",
+                    "out/item",
+                    "bafy-zip-frozen-entry",
+                    3,
+                )],
+            },
+            &current,
+        )
+        .await
+        .unwrap();
+    let targets = pin_lease_target::Entity::find().all(&db).await.unwrap();
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].state, "quota_blocked");
+    assert_eq!(targets[0].provider, "pinata");
+    assert_eq!(targets[0].cid, "bafy-zip-frozen-entry");
+    let row = crate::store::entities::zip_batch::Entity::find_by_id(&admitted.id)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.captured_options, original);
+    let version = crate::store::entities::object_version::Entity::find()
+        .filter(crate::store::entities::object_version::Column::ObjectId.eq("zip-frozen"))
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    let decision = crate::store::pinning::decision::read_for_version(&db, &version.id)
+        .await
+        .unwrap()
+        .unwrap();
+    decision.validate_snapshot().unwrap();
+    assert_eq!(
+        decision
+            .replay_policy(vec![
+                tag("ipfs-s3:pin", "true"),
+                tag("ipfs-s3:content", "decompressed")
+            ])
+            .unwrap()
+            .leases,
+        admitted.capture.source_decision().effective_intents
+    );
+    let birth =
+        crate::store::entities::pin_lease_requirement::contract::get(&db, &targets[0].lease_id)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        birth.candidates["pinata"].as_ref().unwrap().cleanup,
+        crate::pinning::identity::CleanupMode::Managed
+    );
+}
+
+#[tokio::test]
 async fn zip_decompressed_manual_targets_only_successful_entries_while_automatic_targets_archive() {
     let db = setup().await;
     let archive = request(
         object("zip", "archive.zip", "bafy-archive", 10),
-        vec![tag("ipfs-s3:pin", "true")],
+        vec![
+            tag("ipfs-s3:pin", "true"),
+            tag("ipfs-s3:content", "decompressed"),
+        ],
         vec![
             intent(
                 LeaseSource::Automatic,

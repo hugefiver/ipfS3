@@ -32,9 +32,36 @@ pub async fn replace_sqlite_layout(tx: &DatabaseTransaction, endpoint: &str) {
             .into_iter()
             .map(|r| format!("\"{}\"", r.try_get::<String>("", "name").unwrap()))
             .collect::<Vec<_>>();
+        let current_columns = tx
+            .query_all(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "SELECT name FROM pragma_table_info($1)",
+                [table.clone().into()],
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.try_get::<String>("", "name").unwrap())
+            .collect::<Vec<_>>();
         let cells = columns
             .iter()
-            .map(|c| format!("quote({c})"))
+            .map(|c| match (table.as_str(), c.as_str()) {
+                ("pin_extension_decisions", "\"config_revision\"")
+                    if !current_columns
+                        .iter()
+                        .any(|column| column == "config_revision") =>
+                {
+                    format!("quote('{}')", "0".repeat(64))
+                }
+                ("zip_v2_mpu_intakes", "\"rule_revision\"")
+                    if !current_columns
+                        .iter()
+                        .any(|column| column == "rule_revision") =>
+                {
+                    "quote('historical-rule')".into()
+                }
+                _ => format!("quote({c})"),
+            })
             .collect::<Vec<_>>()
             .join(" || ',' || ");
         let sql = format!(

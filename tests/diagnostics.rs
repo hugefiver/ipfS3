@@ -177,6 +177,8 @@ fn cli_reads_the_same_config_without_connecting_or_writing_and_redacts_values() 
 fn alias_fixture(database_url: &str) -> String {
     format!(
         r#"
+        [decompress_zip]
+        auto_pin_outputs = false
         [storage]
         database_url = "{database_url}"
         [pinning]
@@ -504,7 +506,6 @@ async fn status_pages_real_sqlite_snapshot_without_writing_or_leaking_raw_eviden
         legacy_unknown: false,
         origin: DecisionOrigin::new("principal", "request"),
         control_revision: "33333333-3333-4333-8333-333333333333".into(),
-        config_revision: "a".repeat(64),
         control: PinControl::Absent,
         effective_intents: Vec::new(),
     };
@@ -512,7 +513,6 @@ async fn status_pages_real_sqlite_snapshot_without_writing_or_leaking_raw_eviden
         version_row_id: Set("version-current".into()),
         object_id: Set("owner".into()),
         control_revision: Set(decision.control_revision.clone()),
-        config_revision: Set(decision.config_revision.clone()),
         effect: Set("no_intent".into()),
         snapshot: Set(serde_json::to_string(&decision).unwrap()),
     })
@@ -561,6 +561,7 @@ async fn status_pages_real_sqlite_snapshot_without_writing_or_leaking_raw_eviden
             logical_size: Set(3),
             provider: Set(provider.clone()),
             state: Set("pinned".into()),
+            last_error: Set(None),
             created_at: Set(now),
             last_touched_at: Set(now),
         })
@@ -708,7 +709,6 @@ async fn status_pages_real_sqlite_snapshot_without_writing_or_leaking_raw_eviden
             "secret-first-error-sentinel",
             "secret-last-error-sentinel",
             "secret-route-token-sentinel",
-            &decision.config_revision,
         ] {
             assert!(!combined.contains(secret), "leaked {secret}");
         }

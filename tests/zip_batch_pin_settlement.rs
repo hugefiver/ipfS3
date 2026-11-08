@@ -22,7 +22,8 @@ async fn rejects_settlement_mutation(mutation: &str) {
     ))
     .await
     .unwrap();
-    let result = stage9_zip_support::publish_captured(&db, request, batch, &capture, guard).await;
+    let result =
+        stage9_zip_support::publish_captured(&db, &config, request, batch, &capture, guard).await;
     assert!(
         matches!(
             result,

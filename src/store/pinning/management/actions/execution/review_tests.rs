@@ -55,7 +55,6 @@ async fn explicit_reapply_grants_new_source_permission_without_rewriting_skipped
     };
     let skipped = ExtensionDecision::capture(
         DecisionOrigin::new("fixture", "skipped-request"),
-        "1".repeat(64),
         DecisionEffect::Skipped,
         Some(WarningCode::NoAvailableProvider),
         PinControl::from_tags(&tag_set).unwrap(),

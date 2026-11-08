@@ -931,7 +931,7 @@ async fn source_and_entries_targets_intersect_per_output_deny_and_do_not_copy_ar
 }
 
 #[tokio::test]
-async fn changed_remote_rules_after_create_reject_source_complete_before_archive_io() {
+async fn current_automatic_deny_after_create_publishes_source_and_entries_without_remote_work() {
     let archive = legal_single_entry_zip();
     let mut harness = start_harness_with_root_default(
         KuboScript {
@@ -1065,27 +1065,66 @@ async fn changed_remote_rules_after_create_reject_source_complete_before_archive
     .await;
     let status = first.status();
     let xml = first.text().await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{xml}");
+    assert_eq!(count(&harness, "objects").await, 2);
+    assert_eq!(count(&harness, "multipart_uploads").await, 0);
+    let db = harness.state.store.db();
     assert_eq!(
-        status,
-        StatusCode::CONFLICT,
-        "{xml}; adds={}; cats={}; objects={}; original_revision={}; current_revision={}",
-        harness.captured_add_file_bytes().len(),
-        kubo_cat_calls(&harness).await,
-        count(&harness, "objects").await,
-        captured.rule_revision,
-        changed.pinning.zip_output_rules().revision()
-    );
-    assert_eq!(harness.captured_add_file_bytes().len(), 0);
-    assert_eq!(kubo_cat_calls(&harness).await, 0);
-    assert_eq!(count(&harness, "objects").await, 0);
-    assert_eq!(count(&harness, "multipart_uploads").await, 1);
-    assert_eq!(
-        store::multipart::v2_zip::read_by_upload(harness.state.store.db(), &id)
+        store::object::get_latest(db, &harness.bucket, "archive.zip")
             .await
             .unwrap()
+            .cid,
+        "QmArchive"
+    );
+    assert_eq!(
+        store::object::get_latest(db, &harness.bucket, "out/file.txt")
+            .await
             .unwrap()
-            .captured_options,
-        captured.captured_options
+            .cid,
+        "QmOutput"
+    );
+    assert_eq!(versions(&harness, "archive.zip").await, 1);
+    assert_eq!(versions(&harness, "out/file.txt").await, 1);
+    for table in ["pin_leases", "pin_lease_targets", "remote_pins", "pin_jobs"] {
+        assert_eq!(count(&harness, table).await, 0, "{table}");
+    }
+    let usage = db.query_one(Statement::from_string(db.get_database_backend(),
+        "SELECT COALESCE(SUM(reserved_bytes),0) AS bytes, COALESCE(SUM(reserved_pins),0) AS pins FROM pin_provider_usage".to_owned(),
+    )).await.unwrap().unwrap();
+    assert_eq!(
+        (
+            usage.try_get::<i64>("", "bytes").unwrap(),
+            usage.try_get::<i64>("", "pins").unwrap()
+        ),
+        (0, 0)
+    );
+    let retained = store::multipart::v2_zip::read_by_upload(db, &id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(retained.captured_options, captured.captured_options);
+    assert_eq!(retained.captured_config, captured.captured_config);
+    assert_eq!(retained.request_fingerprint, captured.request_fingerprint);
+    let terminal = store::zip::execution::read(db, &id).await.unwrap().unwrap();
+    assert_eq!(terminal.state, "completed");
+    let calls = harness.kubo.received_requests().await.unwrap().len();
+    let replay = support::sigv4::send_sigv4(
+        reqwest::Method::POST,
+        &server.endpoint,
+        &harness.bucket,
+        "archive.zip",
+        &[("uploadId", &id)],
+        complete_body(None),
+        HeaderMap::new(),
+        "test",
+    )
+    .await;
+    assert_eq!(replay.status(), StatusCode::OK);
+    assert_eq!(replay.text().await.unwrap(), xml);
+    assert_eq!(harness.kubo.received_requests().await.unwrap().len(), calls);
+    assert_eq!(
+        store::zip::execution::read(db, &id).await.unwrap().unwrap(),
+        terminal
     );
 }
 

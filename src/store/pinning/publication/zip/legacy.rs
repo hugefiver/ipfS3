@@ -145,6 +145,7 @@ pub(in crate::store::pinning::publication) async fn publish_legacy_in_transactio
     result_rows: Vec<import_job_result::ActiveModel>,
     decided: Option<&DecidedSnapshot>,
     replay: Option<&ZipCompletedReplay>,
+    current_limits: &crate::pinning::config::ProviderLimitMap,
 ) -> AppResult<PublicationResult> {
     // Read only after acquiring bucket, even for this compatibility adapter.
     ownership::lock_bucket_for_ownership(tx, &request.object.bucket).await?;
@@ -158,8 +159,14 @@ pub(in crate::store::pinning::publication) async fn publish_legacy_in_transactio
     }
     capture
         .source_decision()
-        .validate_policy(&request.policy)
+        .replay_policy(request.policy.tags.clone())
         .map_err(|_| invalid())?;
+    let (config, rules, mode) = decided
+        .and_then(|snapshot| snapshot.zip_current.as_ref())
+        .ok_or_else(invalid)?;
+    let selection = capture
+        .resolve_current_with_rules(config, rules, *mode)
+        .map_err(|error| AppError::InvalidPinningRequest(error.to_string()))?;
     let by_id = entries
         .iter()
         .map(|o| (&o.id, o))
@@ -197,6 +204,8 @@ pub(in crate::store::pinning::publication) async fn publish_legacy_in_transactio
             root_outcome: batch.root_outcome.clone(),
             terminal_result: batch.terminal_result.clone(),
         },
+        current_limits,
+        &selection,
     )
     .await?;
     results

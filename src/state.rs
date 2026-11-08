@@ -374,7 +374,6 @@ mod tests {
             state.pinning.effective_config().policies[0].providers,
             vec![expected_key.clone()]
         );
-        let revision = state.pinning.zip_output_rules().revision().to_owned();
         let outputs = ["exports/public/file", "exports/private/file"]
             .into_iter()
             .map(|key| ZipPublishedOutput {
@@ -396,7 +395,6 @@ mod tests {
                 &outputs,
             )
             .unwrap();
-        assert_eq!(plan.rule_revision, revision);
         assert_eq!(plan.outputs[0].kind, ZipOutputKind::Extracted);
         assert_eq!(plan.outputs[0].rule_name.as_deref(), Some("high"));
         assert_eq!(
@@ -433,7 +431,6 @@ mod tests {
         );
 
         config.decompress_zip.pin_output_rules.clear();
-        assert_eq!(state.pinning.zip_output_rules().revision(), revision);
         assert_eq!(
             state
                 .pinning

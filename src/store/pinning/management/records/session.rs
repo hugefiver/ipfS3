@@ -353,11 +353,11 @@ impl ReadSession {
             return Ok(parsed.clone());
         }
         self.nodes(2)?;
-        let result = Arc::new(results::decode_facts(
-            raw.strip_prefix("S7R1\n")
-                .ok_or(ManagementError::InvalidEvidence)?,
-            self,
-        )?);
+        let body = raw
+            .strip_prefix("S7R1\n")
+            .ok_or(ManagementError::InvalidEvidence)?;
+        results::original::verify(row, body, self)?;
+        let result = Arc::new(results::decode_facts(body, self)?);
         let row = archive::retain_row_ref(row, self)?;
         self.results.push((row, result.clone()));
         Ok(result)

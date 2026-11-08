@@ -176,7 +176,7 @@ async fn renew_mixed_migration_tracks_destination_delta_and_untouched_source_pai
         .iter()
         .map(|provider| provider.identity.provider_id.clone())
         .collect();
-    intent.requirements.policy_revision = fixture.config.pinning.policies[0].identity.clone();
+    intent.requirements.policy_id = Some(fixture.config.pinning.policies[0].identity.clone());
     let birth_binding = confirm_migration_mix(&fixture, &birth_request).await;
     let birth =
         super::super::super::apply(&fixture.db, &fixture.config, &fixture.auth, &birth_binding)
@@ -831,7 +831,7 @@ async fn renew_mixed_one_unselected_candidate_does_not_prove_a_resource_epoch_bu
                 .clone()
         })
         .collect();
-    intent.requirements.policy_revision = fixture.config.pinning.policies[0].identity.clone();
+    intent.requirements.policy_id = Some(fixture.config.pinning.policies[0].identity.clone());
     let mut renew = request.items[0].clone();
     renew.item_id = "b-renew".into();
     renew.action = Action::Renew {

@@ -5,7 +5,6 @@ use std::{
 
 use anyhow::{anyhow, bail};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::{
     config::{Config, OptionalPinControlMode, PinningConfig, PolicyConfig, ProviderConfig},
@@ -88,13 +87,6 @@ impl PolicyTrigger {
             _ => bail!("unknown policy trigger `{raw}`"),
         }
     }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Always => "always",
-            Self::Request => "request",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,13 +102,6 @@ impl ProviderMode {
             "one" => Ok(Self::One),
             "all" => Ok(Self::All),
             _ => bail!("unknown provider mode `{raw}`"),
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::One => "one",
-            Self::All => "all",
         }
     }
 }
@@ -236,36 +221,7 @@ pub struct ValidatedPolicy {
 
 impl ValidatedPolicy {
     pub(crate) fn refresh_identity(&mut self, index: usize) {
-        let mut canonical = String::new();
-        for field in [
-            &self.bucket,
-            &self.prefix,
-            self.trigger.as_str(),
-            self.provider_mode.as_str(),
-        ] {
-            append_canonical_field(&mut canonical, field);
-        }
-        append_canonical_field(&mut canonical, &self.providers.len().to_string());
-        for provider in &self.providers {
-            append_canonical_field(&mut canonical, provider);
-        }
-        append_canonical_field(
-            &mut canonical,
-            &self.default_duration.as_seconds().to_string(),
-        );
-        append_canonical_field(&mut canonical, &self.max_duration.as_seconds().to_string());
-        append_canonical_field(
-            &mut canonical,
-            if self.allow_decompressed {
-                "true"
-            } else {
-                "false"
-            },
-        );
-        self.identity = format!(
-            "policy:{index}:{}",
-            hex::encode(Sha256::digest(canonical.as_bytes()))
-        );
+        self.identity = format!("policy:{index}");
     }
 }
 
@@ -279,6 +235,29 @@ pub struct ValidatedPinningConfig {
 }
 
 impl ValidatedPinningConfig {
+    pub fn validate_durable_intents(
+        &self,
+        intents: &[super::policy::LeaseIntent],
+    ) -> anyhow::Result<()> {
+        for name in intents.iter().flat_map(|intent| &intent.providers) {
+            let provider = self
+                .providers
+                .iter()
+                .find(|provider| &provider.name == name)
+                .ok_or_else(|| anyhow!("pinning provider is unavailable"))?;
+            if provider.limits.enabled
+                && !provider.identity.retired
+                && provider.kind != ProviderKind::Noop
+                && provider.identity.provider_id.starts_with("legacy:")
+            {
+                bail!(
+                    "durable remote pinning requires an explicit provider identity and revisions"
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub fn from_raw<F>(raw: &PinningConfig, get_env: F) -> anyhow::Result<Self>
     where
         F: Fn(&str) -> Option<String>,
@@ -708,15 +687,7 @@ impl ValidatedPinningConfig {
                 .then_with(|| left.cmp(right))
         });
 
-        let identity = policy_identity(
-            index,
-            policy,
-            trigger,
-            provider_mode,
-            &providers,
-            default_duration,
-            max_duration,
-        );
+        let identity = format!("policy:{index}");
         Ok(ValidatedPolicy {
             identity,
             bucket: policy.bucket.clone(),
@@ -861,48 +832,6 @@ fn validate_identity_route(
 fn quota_as_i64(value: u64, provider_name: &str, quota_name: &str) -> anyhow::Result<i64> {
     i64::try_from(value)
         .map_err(|_| anyhow!("provider `{provider_name}` {quota_name} exceeds i64::MAX"))
-}
-
-fn policy_identity(
-    index: usize,
-    policy: &PolicyConfig,
-    trigger: PolicyTrigger,
-    provider_mode: ProviderMode,
-    providers: &[String],
-    default_duration: LeaseDuration,
-    max_duration: LeaseDuration,
-) -> String {
-    let mut canonical = String::new();
-    append_canonical_field(&mut canonical, &policy.bucket);
-    append_canonical_field(&mut canonical, &policy.prefix);
-    append_canonical_field(&mut canonical, trigger.as_str());
-    append_canonical_field(&mut canonical, provider_mode.as_str());
-    append_canonical_field(&mut canonical, &providers.len().to_string());
-    for provider in providers {
-        append_canonical_field(&mut canonical, provider);
-    }
-    append_canonical_field(&mut canonical, &default_duration.as_seconds().to_string());
-    append_canonical_field(&mut canonical, &max_duration.as_seconds().to_string());
-    append_canonical_field(
-        &mut canonical,
-        if policy.allow_decompressed {
-            "true"
-        } else {
-            "false"
-        },
-    );
-
-    format!(
-        "policy:{index}:{}",
-        hex::encode(Sha256::digest(canonical.as_bytes()))
-    )
-}
-
-fn append_canonical_field(canonical: &mut String, value: &str) {
-    canonical.push_str(&value.len().to_string());
-    canonical.push(':');
-    canonical.push_str(value);
-    canonical.push('|');
 }
 
 #[cfg(test)]
@@ -1335,8 +1264,8 @@ mod tests {
             vec!["filebase", "pinata", "noop"]
         );
         assert_eq!(validated.policies[1].bucket, "second-bucket");
-        assert!(validated.policies[0].identity.starts_with("policy:0:"));
-        assert!(validated.policies[1].identity.starts_with("policy:1:"));
+        assert_eq!(validated.policies[0].identity, "policy:0");
+        assert_eq!(validated.policies[1].identity, "policy:1");
 
         assert_eq!(validated.provider_limits["filebase"].priority, 1);
         assert_eq!(validated.provider_limits["filebase"].max_bytes, 100);
@@ -1382,64 +1311,13 @@ mod tests {
     }
 
     #[test]
-    fn policy_identity_is_canonical_and_changes_for_each_field() {
-        let fixture = canonical_identity_fixture();
-        let identity = first_policy_identity(&fixture);
-        assert_eq!(
-            identity,
-            "policy:0:61f2bdb126be32dd2420746af2c3e6634c28c4d90ab42a86ba4f4b03c7975690"
-        );
-
-        let mut equivalent_duration = fixture.clone();
-        equivalent_duration.policies[0].default_duration = "1m".to_owned();
-        assert_eq!(first_policy_identity(&equivalent_duration), identity);
-
-        let mut changed_bucket = fixture.clone();
-        changed_bucket.policies[0].bucket = "archives".to_owned();
-
-        let mut changed_prefix = fixture.clone();
-        changed_prefix.policies[0].prefix = "thumbnails/".to_owned();
-
-        let mut changed_trigger = fixture.clone();
-        changed_trigger.policies[0].trigger = "always".to_owned();
-
-        let mut changed_provider_mode = fixture.clone();
-        changed_provider_mode.policies[0].provider_mode = "one".to_owned();
-
-        let mut changed_provider_list = fixture.clone();
-        changed_provider_list.policies[0].providers = vec!["alpha".to_owned()];
-
-        let mut changed_default_duration = fixture.clone();
-        changed_default_duration.policies[0].default_duration = "2m".to_owned();
-
-        let mut changed_max_duration = fixture.clone();
-        changed_max_duration.policies[0].max_duration = "3h".to_owned();
-
-        let mut changed_allow_decompressed = fixture.clone();
-        changed_allow_decompressed.policies[0].allow_decompressed = false;
-
-        let mutations = vec![
-            ("bucket", changed_bucket),
-            ("prefix", changed_prefix),
-            ("trigger", changed_trigger),
-            ("provider mode", changed_provider_mode),
-            ("provider list", changed_provider_list),
-            ("default duration", changed_default_duration),
-            ("max duration", changed_max_duration),
-            ("allow decompressed", changed_allow_decompressed),
-        ];
-        for (field, config) in mutations {
-            assert_ne!(
-                first_policy_identity(&config),
-                identity,
-                "{field} should change the policy identity"
-            );
-        }
-
-        let mut reordered = fixture.clone();
-        reordered.policies.push(policy("other", vec!["alpha"]));
-        reordered.policies.reverse();
-        assert_ne!(identity_for_policy(&reordered, "photos"), identity);
+    fn policy_reference_locates_configuration_without_freezing_its_contents() {
+        let mut config = canonical_identity_fixture();
+        assert_eq!(first_policy_identity(&config), "policy:0");
+        config.policies[0].max_duration = "3h".into();
+        assert_eq!(first_policy_identity(&config), "policy:0");
+        config.policies.insert(0, policy("other", vec!["alpha"]));
+        assert_eq!(identity_for_policy(&config, "photos"), "policy:1");
     }
 
     fn canonical_identity_fixture() -> PinningConfig {

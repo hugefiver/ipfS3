@@ -244,18 +244,13 @@ async fn cid_intake_has_no_source_side_effect_and_status_is_read_only() {
     assert_eq!(durable.schema_version(), 1);
     uuid::Uuid::parse_str(&durable.source_decision().control_revision).unwrap();
     let mut expected_capture = serde_json::to_value(&independent).unwrap();
-    // Each decision owns a fresh control nonce. Normalize only that nonce, not
-    // the independently compiled config/policy revisions or any frozen context.
+    // Each admission owns a fresh control nonce; all authenticated controls stay intact.
     expected_capture["source_decision"]["control_revision"] =
         serde_json::Value::String(durable.source_decision().control_revision.clone());
     assert_eq!(
         serde_json::to_value(&durable).unwrap(),
         expected_capture,
-        "full frozen policy/routes/durations/config and context must match independent admission"
-    );
-    assert_eq!(
-        captured["rule_revision"].as_str(),
-        Some(independent.policy_revision())
+        "admission evidence and authenticated context must match independent admission"
     );
     let same = post(&h, "archive.zip", &xml, headers("intake-cid", None)).await;
     assert_eq!(same.status(), StatusCode::ACCEPTED);

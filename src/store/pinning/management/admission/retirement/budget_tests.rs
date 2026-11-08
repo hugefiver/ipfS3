@@ -172,6 +172,7 @@ async fn post_retirement_other_domain_allocation_uses_the_callers_remaining_budg
         &fixture.config.pinning.provider_limits,
         now,
         records::DecodeWork::shared(&baseline),
+        None,
     )
     .await
     .unwrap();
@@ -201,6 +202,7 @@ async fn post_retirement_other_domain_allocation_uses_the_callers_remaining_budg
             &fixture.config.pinning.provider_limits,
             now,
             records::DecodeWork::shared(&work),
+            None,
         )
         .await;
         if limited != 0 {
@@ -235,7 +237,8 @@ async fn post_retirement_other_domain_allocation_uses_the_callers_remaining_budg
             10,
             &fixture.config.pinning.provider_limits,
             now,
-            records::DecodeWork::shared(&work)
+            records::DecodeWork::shared(&work),
+            None,
         )
         .await,
         Err(crate::error::AppError::InvalidPinningRequest(_))

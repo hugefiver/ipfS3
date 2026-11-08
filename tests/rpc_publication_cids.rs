@@ -533,8 +533,10 @@ async fn zip_v2_source_and_outputs_share_the_canonical_rpc_frontier_and_keep_ori
     let canonical = canonical_resource_cid(V0).unwrap();
     let config = config(vec![provider("rpc", true, 1)], ProviderMode::One);
     let db = database(&config).await;
-    let rules = ValidatedZipOutputRules::compile(
-        &[ZipOutputRuleConfig {
+    let zip_config = ipfs_s3_gateway::config::DecompressZipConfig {
+        auto_pin_outputs: Some(true),
+        unixfs_directory_root: false,
+        pin_output_rules: vec![ZipOutputRuleConfig {
             name: "all".into(),
             priority: 1,
             bucket: "bucket".into(),
@@ -542,7 +544,48 @@ async fn zip_v2_source_and_outputs_share_the_canonical_rpc_frontier_and_keep_ori
             effect: ZipRuleEffect::Allow,
             policy_id: Some(config.policies[0].identity.clone()),
         }],
+        ..Default::default()
+    };
+    let rules = ValidatedZipOutputRules::from_config(&zip_config, &config).unwrap();
+    let headers = http::HeaderMap::from_iter([
+        (
+            "x-ipfs3-zip-contract".parse().unwrap(),
+            "v2".parse().unwrap(),
+        ),
+        (
+            "x-ipfs3-zip-token".parse().unwrap(),
+            "token".parse().unwrap(),
+        ),
+        (
+            "x-ipfs3-zip-publish-source".parse().unwrap(),
+            "true".parse().unwrap(),
+        ),
+        (
+            "x-ipfs3-zip-targets".parse().unwrap(),
+            "both".parse().unwrap(),
+        ),
+    ]);
+    let controls = ipfs_s3_gateway::zip::options::parse_authenticated_zip_controls(
+        &headers,
+        &[("decompress-zip".into(), "out/".into())],
+        &[],
+        true,
+        false,
+    )
+    .unwrap()
+    .unwrap();
+    let capture = ipfs_s3_gateway::pinning::zip_policy::capture_zip_intent(
         &config,
+        &zip_config,
+        OptionalPinControlMode::Strict,
+        ipfs_s3_gateway::pinning::zip_policy::ZipCaptureContext {
+            bucket: "bucket",
+            source_key: "archive.zip",
+            target_prefix: "out/",
+            tags: &[],
+        },
+        &controls,
+        DecisionOrigin::new("principal", "v2"),
     )
     .unwrap();
     let admission = execution::Admission {
@@ -554,10 +597,8 @@ async fn zip_v2_source_and_outputs_share_the_canonical_rpc_frontier_and_keep_ori
         request_contract: "contract".into(),
         bucket: "bucket".into(),
         source_key: "archive.zip".into(),
-        captured_options: serde_json::json!({"options": {
-            "publish_source": true, "publish_extracted": true, "targets": "both", "token": "token",
-            "root_override": null, "root_enabled": false, "result_version": 2,
-        }, "rule_revision": rules.revision()})
+        captured_options: serde_json::json!({"options": capture.v2_options().unwrap(),
+            "target_prefix": capture.target_prefix(), "zip_intent": capture})
         .to_string(),
     };
     execution::admit(&db, &admission).await.unwrap();
@@ -677,7 +718,6 @@ async fn zip_v2_source_and_outputs_share_the_canonical_rpc_frontier_and_keep_ori
                 policy: policy("out/file"),
             }],
             targets: ZipTargets::Both,
-            captured_rule_revision: Some(rules.revision().into()),
             root_outcome: zip::RootOutcome::Disabled,
             terminal_result: "{\"result_version\":2}".into(),
         },

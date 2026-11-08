@@ -118,7 +118,6 @@ async fn signed_create_replays_original_snapshot_across_connections_and_rejects_
     assert_eq!(opts.root_override, Some(true));
     assert!(opts.root_enabled);
     assert!(!opts.publish_source);
-    assert!(!record.rule_revision.is_empty());
     assert_eq!(record.owner, "test");
     assert_eq!(count(&second, "multipart_uploads").await, 1);
     assert_eq!(count(&second, "zip_v2_mpu_intakes").await, 1);

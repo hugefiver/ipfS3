@@ -149,7 +149,7 @@ pub(super) fn target(
             levels: vec![level],
             min_replicas,
             max_age_secs,
-            policy_revision: lease.policy_id.clone(),
+            policy_id: crate::pinning::management::model::policy_reference(&lease.policy_id),
         })
     });
     Ok((selected, requirements, candidates))

@@ -4,16 +4,12 @@ use sea_orm_migration::{MigrationTrait, SchemaManager};
 
 fn historical_decision(request: &str) -> String {
     use crate::pinning::{
-        config::ValidatedPinningConfig,
-        decision::{DecisionEffect, DecisionOrigin, ExtensionDecision, config_revision},
+        decision::{DecisionEffect, DecisionOrigin, ExtensionDecision},
         policy::PublicationPolicy,
         tags::PinControl,
     };
-    let config = crate::config::Config::default_for_test();
-    let validated = ValidatedPinningConfig::from_config(&config, |_| None).unwrap();
     let decision = ExtensionDecision::capture(
         DecisionOrigin::new("historical-owner", request),
-        config_revision(&validated, config.pinning_control.unavailable),
         DecisionEffect::NoIntent,
         None,
         PinControl::Absent,
@@ -23,7 +19,9 @@ fn historical_decision(request: &str) -> String {
         },
     )
     .unwrap();
-    serde_json::to_string_pretty(&decision).unwrap()
+    let mut original = serde_json::to_value(&decision).unwrap();
+    original["config_revision"] = "a".repeat(64).into();
+    serde_json::to_string_pretty(&original).unwrap()
 }
 
 async fn catalog_metadata(db: &DatabaseConnection) -> Vec<(String, String, Option<String>)> {
@@ -159,9 +157,31 @@ async fn native_historical_captures_are_not_filled_or_rewritten_by_inventory_or_
             .filter(|column| column != "job_id"),
     );
     jobs.columns.sort();
+    let mut expected = before.clone();
+    for (tables, table_name, column) in [
+        (&mut expected, "pin_extension_decisions", "config_revision"),
+        (&mut historical_shape, "pin_lease_targets", "last_error"),
+    ] {
+        let table = tables
+            .iter_mut()
+            .find(|table| table.table == table_name)
+            .unwrap();
+        table.columns.retain(|name| name != column);
+        for row in &mut table.rows {
+            row.remove(column);
+        }
+    }
+    let intake = expected
+        .iter_mut()
+        .find(|table| table.table == "zip_v2_mpu_intakes")
+        .unwrap();
+    intake.columns.retain(|name| name != "rule_revision");
+    for row in &mut intake.rows {
+        row.remove("rule_revision");
+    }
     assert_eq!(
-        historical_shape, before,
-        "all native historical columns and rows remain unchanged"
+        historical_shape, expected,
+        "retained historical columns and rows remain unchanged"
     );
     let upgraded_metadata = catalog_metadata(&db).await;
     assert!(

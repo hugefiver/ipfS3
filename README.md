@@ -935,9 +935,11 @@ Internal integration APIs (not a new public HTTP/CLI surface):
 (must complete before accepting publications), `provider_identity`,
 `store::pinning::ledger::{status, lease_status, invocation_snapshot}` and typed
 `provider::{RemoteRef, QueryObservation}`. Historical PSA/Pinata get/find/unpin
-routing remains available; a missing/mismatched scope or credential/endpoint
-revision parks work before network IO. A changed strategy cannot resend an old
-pending submit; ambiguous calls query their captured actual protocol instead.
+routing remains available; a missing or mismatched scope, credential revision or
+endpoint revision terminates the affected task with an error before network IO.
+A changed strategy cannot resend an old pending submit. Ambiguous calls retain
+their responsibility; supported read-only reconciliation uses their original
+protocol and resource identity without restarting terminal work.
 
 Stage 2 regression tests use real SQLite/PostgreSQL transactions and local mock
 HTTP providers, including concurrent shared-CID publication/cancel/expiry,
@@ -984,8 +986,17 @@ every executable configured non-Noop provider, including operator-maintained
 `credential_revision` and `endpoint_revision`. New legacy async work is refused, rather than guessed
 from a provider name. Noop and requests with no executable remote intent remain
 allowed; historical jobs retain their captured route and aren't rewritten.
-Changing either revision before an accepted MPU completes fails before remote
-work or object publication. New remote submissions use an opaque UUID
+Pinning tasks resolve policies, provider order and capacity from the current
+configuration. New publications and renewals enforce current retention limits;
+existing lease expiry timestamps remain unchanged. A captured skipped or
+cancelled request is not reactivated by a configuration edit. Existing remote resources and invocations
+retain their exact account, route and epoch: an actual identity or state mismatch
+terminates the affected work with an error rather than repeatedly parking it.
+Historical cleanup responsibility is retained. See the
+[recovery and upgrade runbook](docs/pinning-recovery.md#configuration-and-terminal-errors)
+for task errors, unresolved remote effects and database upgrades.
+
+New remote submissions use an opaque UUID
 correlation; older jobs retain their original structured ID for recovery Find.
 
 Operators can run the following locally with the gateway binary. These aren't
@@ -1120,7 +1131,14 @@ aren't forwarded to a redirected destination. Certificate verification stays
 enabled. Custom `tls_ca_pem`, `tls_client_cert_pem`, `tls_client_key_pem`, and
 `tls_insecure = true` are explicitly rejected, not silently ignored or supported.
 
-Kubo CID pinning needs the DAG available to the target. Upload streams the actual
+Kubo CID pinning needs the DAG available to the target. Its `cid` completion
+contract is a complete successful `pin/add` response containing exactly one
+CID-equivalent root from the captured provider route. The receipt retains
+`PinAccepted` evidence; it does not claim an independent recursive/local-content
+verification. A later confirmation query is not required to complete this submit.
+Upload and CAR retain their recursive and local-content verification requirements.
+
+Upload streams the actual
 stored bytes from source Kubo (ciphertext for encrypted objects); it can't upload
 a directory with `cat(root)`. CAR transfers a complete single-root DAG and verifies
 the recursive root and local completeness. Filebase upload sends only
@@ -1221,6 +1239,9 @@ object ID and canonical CID. Provider selection binds stable identity, backend,
 scope, storage domain, API/strategy and revisions, including the original route;
 it isn't just a config alias. Selection remains subject to local policy and
 stored evidence. Don't infer ZIP ownership from a prefix or old log.
+
+For stalled submissions, admission barriers and safe retry prerequisites, see the
+[pinning recovery runbook](docs/pinning-recovery.md).
 
 The nine action families are:
 

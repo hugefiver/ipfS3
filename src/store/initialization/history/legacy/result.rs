@@ -1,7 +1,6 @@
 //! Checked historical result data. This does not implement worker permission.
 use super::*;
 use crate::store::pinning::management::actions::execution::facts::{self, Input, ItemFacts};
-use serde::ser::SerializeStruct;
 mod coordinates;
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,74 +22,14 @@ pub struct RecordedAction {
     pub migration_points: Vec<records::MigrationPoint>,
     pub decision: Option<records::OperatorDecision>,
 }
-struct WithoutState<'a>(&'a RecordedAction);
-impl Serialize for WithoutState<'_> {
-    fn serialize<S: serde::Serializer>(
-        &self,
-        serializer: S,
-    ) -> std::result::Result<S::Ok, S::Error> {
-        let action = self.0;
-        let mut output = serializer.serialize_struct(
-            "CommittedAction",
-            if action.root_releases.is_empty() {
-                5
-            } else {
-                6
-            },
-        )?;
-        output.serialize_field("receipt", &action.receipt)?;
-        output.serialize_field("targets", &action.targets)?;
-        if !action.root_releases.is_empty() {
-            output.serialize_field("root_releases", &action.root_releases)?;
-        }
-        output.serialize_field("jobs", &action.jobs)?;
-        output.serialize_field("migration_points", &action.migration_points)?;
-        output.serialize_field("decision", &action.decision)?;
-        output.end()
-    }
-}
 #[derive(Serialize, Deserialize)]
 struct Envelope(RecordedAction, ItemFacts, String);
-fn identity(
-    scope: &str,
-    identity: &str,
-    principal: &str,
-    plan: &str,
-    envelope: &Envelope,
-) -> Result<String> {
-    struct Sink(Sha256);
-    impl std::io::Write for Sink {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.update(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut hash = Sink(Sha256::new());
-    hash.0.update(b"stage7/facts/1\0");
-    serde_json::to_writer(
-        &mut hash,
-        &(
-            scope,
-            identity,
-            principal,
-            plan,
-            &envelope.0.receipt.binding.request.item_id,
-            WithoutState(&envelope.0),
-            &envelope.1,
-        ),
-    )
-    .map_err(|_| ManagementError::InvalidEvidence)?;
-    Ok(hex::encode(hash.0.finalize()))
-}
 fn decode(row: &NativeRow, work: &mut records::ReadSession) -> Result<Envelope> {
-    work.typed(
-        protocol::cell(row, "result")?
-            .strip_prefix("S7R1\n")
-            .ok_or(ManagementError::InvalidEvidence)?,
-    )
+    let body = protocol::cell(row, "result")?
+        .strip_prefix("S7R1\n")
+        .ok_or(ManagementError::InvalidEvidence)?;
+    records::verify_original_facts(row, body, work)?;
+    work.typed(body)
 }
 
 pub(super) fn frozen(
@@ -127,21 +66,9 @@ pub(super) fn frozen(
         .enumerate()
         .find(|(_, entry)| entry.request.item_id == key.values[2])
         .ok_or(ManagementError::Confirmation)?;
-    let scope = protocol::cell(row, "database_scope")?;
-    let database_identity = protocol::cell(row, "native_identity")?;
-    let principal = protocol::cell(row, "principal")?;
     if original.0.receipt.binding != *entry
         || original.1.0 != ordinal
         || original.2 != actual.2
-        || original.2
-            != identity(
-                scope,
-                database_identity,
-                principal,
-                &key.values[1],
-                &original,
-            )?
-        || actual.2 != identity(scope, database_identity, principal, &key.values[1], &actual)?
         || original.0.receipt.intent_ids
             != work.typed::<Vec<String>>(protocol::cell(row, "intent_ids")?)?
         || original.0.receipt.job_ids
@@ -197,14 +124,6 @@ pub(super) fn recorded(review: &Review, key: &NativeKey) -> Result<Option<Record
             || action.receipt.job_ids != jobs
             || action.jobs.iter().map(|job| &job.job_id).ne(jobs.iter())
             || action.jobs.windows(2).any(|p| p[0].job_id >= p[1].job_id)
-            || *digest
-                != identity(
-                    &review.database_scope,
-                    &review.database_identity,
-                    &review.principal,
-                    &review.request.plan_id,
-                    &envelope,
-                )?
         {
             return Err(ManagementError::Confirmation);
         }
@@ -302,14 +221,6 @@ pub(super) fn recorded(review: &Review, key: &NativeKey) -> Result<Option<Record
             }
             let predecessor = decode(row, &mut work)?;
             if predecessor.2 != dependency.2
-                || predecessor.2
-                    != identity(
-                        &review.database_scope,
-                        &review.database_identity,
-                        &review.principal,
-                        &key.values[1],
-                        &predecessor,
-                    )?
                 || predecessor.0.receipt.binding.request.item_id != key.values[2]
             {
                 return Err(ManagementError::Confirmation);

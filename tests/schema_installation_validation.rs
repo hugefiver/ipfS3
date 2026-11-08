@@ -1,8 +1,8 @@
 use ipfs_s3_gateway::store::{
     self,
     initialization::{self, UpgradeRequest},
-    migrations::{Historical, baseline, history},
-    pinning::management::native,
+    migrations::{Historical, history},
+    pinning::management::{native, schema},
 };
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
@@ -126,7 +126,7 @@ async fn stamp(db: &DatabaseConnection) -> (String, Vec<u8>) {
         .query_one(Statement::from_sql_and_values(
             db.get_database_backend(),
             "SELECT header,payload FROM pin_management_inline_archive WHERE archive_id=$1",
-            [format!("history:upgrade:{}", baseline::VERSION).into()],
+            [format!("history:upgrade:{}", schema::VERSION).into()],
         ))
         .await
         .unwrap()
@@ -149,7 +149,7 @@ async fn reject_damaged_source(db: &DatabaseConnection, fault: &Fault) {
                 database_scope: &binding.0,
                 native_identity: &binding.1,
                 source_version: history::M23,
-                target_version: baseline::VERSION,
+                target_version: schema::VERSION,
             },
         )
         .await
@@ -187,7 +187,7 @@ async fn upgrade_healthy_then_reject_current_damage(db: &DatabaseConnection) {
             database_scope: &binding.0,
             native_identity: &binding.1,
             source_version: history::M23,
-            target_version: baseline::VERSION,
+            target_version: schema::VERSION,
         },
     )
     .await

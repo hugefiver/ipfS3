@@ -139,18 +139,16 @@ fn decision_insert(
     version: &str,
     owner: &str,
     revision: &str,
-    config: &str,
     effect: &str,
     snapshot: &str,
 ) -> Statement {
     Statement::from_sql_and_values(
         DatabaseBackend::Postgres,
-        "INSERT INTO pin_extension_decisions (version_row_id,object_id,control_revision,config_revision,effect,snapshot) VALUES ($1,$2,$3,$4,$5,$6)",
+        "INSERT INTO pin_extension_decisions (version_row_id,object_id,control_revision,effect,snapshot) VALUES ($1,$2,$3,$4,$5)",
         [
             version.into(),
             owner.into(),
             revision.into(),
-            config.into(),
             effect.into(),
             snapshot.into(),
         ],
@@ -208,7 +206,6 @@ async fn pg17_exact_version_owner_fk_checks_and_snapshot_read() {
             "missing-version",
             "owner-one",
             "revision-missing",
-            &free_decision.config_revision,
             "skipped",
             &snapshot,
         );
@@ -222,7 +219,6 @@ async fn pg17_exact_version_owner_fk_checks_and_snapshot_read() {
             &unclaimed.id,
             "owner-two",
             "revision-wrong-owner",
-            &free_decision.config_revision,
             "skipped",
             &snapshot,
         );
@@ -232,24 +228,10 @@ async fn pg17_exact_version_owner_fk_checks_and_snapshot_read() {
             "fk_pin_extension_decisions_owner",
         );
         assert_eq!(count(&db, "pin_extension_decisions").await, 2);
-        let short_revision = decision_insert(
-            &unclaimed.id,
-            "owner-three",
-            "revision-short",
-            "short",
-            "skipped",
-            &snapshot,
-        );
-        assert_pg_constraint(
-            db.execute(short_revision).await.unwrap_err(),
-            "23514",
-            "ck_pin_extension_decisions_revision",
-        );
         let bad_effect = decision_insert(
             &unclaimed.id,
             "owner-three",
             "revision-effect",
-            &free_decision.config_revision,
             "maybe",
             &snapshot,
         );
@@ -263,7 +245,6 @@ async fn pg17_exact_version_owner_fk_checks_and_snapshot_read() {
             &unclaimed.id,
             "owner-three",
             &original_revision,
-            &free_decision.config_revision,
             "skipped",
             &snapshot,
         );
@@ -280,7 +261,6 @@ async fn pg17_exact_version_owner_fk_checks_and_snapshot_read() {
                 &unclaimed.id,
                 "owner-three",
                 &free_decision.control_revision,
-                &free_decision.config_revision,
                 "skipped",
                 &snapshot,
             ))
@@ -319,7 +299,8 @@ async fn pg17_object_and_zip_decision_insert_failure_roll_back_all_rows() {
         let entry = PublicationObject::from_put("entry-object".into(), BUCKET, "unzipped/item", CID.into(), 1, None, None, false, None, None, Utc::now());
         let result = publication::publish_decided_zip(&db, ZipPublicationRequest {
             archive: request("archive-object", "archive.zip", policy), entries: vec![entry],
-        }, None, captured_args(&decision, &config, &limits)).await;
+        }, None, captured_args(&decision, &config, &limits),
+        &ipfs_s3_gateway::pinning::zip_policy::ValidatedZipOutputRules::compile(&[], &config).unwrap()).await;
         // The decision-insert trigger or the admission preflight must reject the
         // publication; either way no durable row may survive.
         assert!(result.is_err(), "{result:?}");
@@ -436,6 +417,8 @@ async fn sqlite_decision_write_failure_rolls_back_object_and_zip_publication() {
         },
         None,
         captured_args(&decision, &config, &limits),
+        &ipfs_s3_gateway::pinning::zip_policy::ValidatedZipOutputRules::compile(&[], &config)
+            .unwrap(),
     )
     .await;
     assert!(result.is_err());

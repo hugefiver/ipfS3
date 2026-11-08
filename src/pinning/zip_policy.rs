@@ -24,9 +24,7 @@ pub enum ZipRuleEffect {
     Deny,
 }
 
-/// policy_index is a readable, zero-based config reference. The historical
-/// policy_id field remains an exact opaque alias, never a prefix/fuzzy match.
-/// Both resolve to the existing policy identity; there is no ZIP policy identity.
+/// policy_index and policy_id reference current policies within their scope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ZipOutputRuleConfig {
     pub name: String,
@@ -63,7 +61,7 @@ impl<'de> Deserialize<'de> for ZipOutputRuleConfig {
             .is_some_and(|id| id.starts_with("@index:"))
         {
             return Err(serde::de::Error::custom(
-                "policy_id must be an exact historical identity; use policy_index for an ordered reference",
+                "policy_id must be an exact policy reference; use policy_index for an ordered reference",
             ));
         }
         Ok(Self {
@@ -138,14 +136,29 @@ pub struct ZipOutputDecision {
     pub intents: Vec<ZipPlannedIntent>,
 }
 
-/// Temporary pre-core compatibility result. Remove executable use of this DTO
-/// and ValidatedZipOutputRules::plan from adapters/publication during R25-B/C.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "DecodedZipOutputPinPlan")]
 pub struct ZipOutputPinPlan {
-    pub rule_revision: String,
     pub targets: ZipTargets,
     pub outputs: Vec<ZipOutputDecision>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DecodedZipOutputPinPlan {
+    targets: ZipTargets,
+    outputs: Vec<ZipOutputDecision>,
+    #[serde(default, rename = "rule_revision")]
+    _legacy_rule_revision: Option<serde::de::IgnoredAny>,
+}
+
+impl From<DecodedZipOutputPinPlan> for ZipOutputPinPlan {
+    fn from(raw: DecodedZipOutputPinPlan) -> Self {
+        Self {
+            targets: raw.targets,
+            outputs: raw.outputs,
+        }
+    }
 }
 
 #[cfg(test)]

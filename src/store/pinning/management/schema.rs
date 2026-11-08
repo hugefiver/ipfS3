@@ -3,8 +3,10 @@ use super::{ManagementError, Result};
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 use sea_orm_migration::MigratorTrait;
 
-pub const VERSION: &str = crate::store::migrations::baseline::VERSION;
+pub const VERSION: &str =
+    crate::store::migrations::m20261108_000001_current_pinning_config::VERSION;
 mod installation;
+pub(crate) use installation::expressions::{canonical as canonical_expression, table_shape};
 pub mod storage;
 pub const RECORDS: &str = "pin_management_records";
 pub const RETIREMENTS: &str = "pin_management_retirements";
@@ -122,7 +124,19 @@ pub(crate) async fn validate_m23_layout<C: ConnectionTrait>(db: &C, backfill: bo
     if db.get_database_backend() == DatabaseBackend::Postgres {
         postgres::validate(db).await?;
     }
-    validate_installation_catalog(db).await
+    let mut tables = installation_catalog().to_vec();
+    let historical =
+        super::native::archived_catalog(&[crate::store::migrations::baseline::VERSION.into()])?;
+    for table in &mut tables {
+        if let Some(original) = historical
+            .iter()
+            .find(|original| original.table == table.table)
+        {
+            *table = original.clone();
+        }
+    }
+    super::catalog::validate(db, &tables).await?;
+    installation::validate(db).await
 }
 
 /// Cold installation qualification includes tables outside the management

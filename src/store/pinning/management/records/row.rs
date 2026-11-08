@@ -1,7 +1,6 @@
 //! Stable row owners; views borrow original cells, including SQL NULL.
 use super::*;
 use crate::store::pinning::management::actions::execution::facts::ItemFacts;
-use crate::store::pinning::management::schema;
 use std::sync::Arc;
 
 pub(crate) enum RowHandle {
@@ -252,7 +251,7 @@ impl<'a> FrozenRows<'a> {
             Self::Frame(frame) => frame.validate_current(),
             Self::Execution(_) => Ok(()),
             Self::Archive(rows) => {
-                if rows.schema_versions() == [schema::VERSION]
+                if rows.schema_versions() == native::current_versions()
                     && rows.catalog() == native::current_catalog()
                 {
                     Ok(())

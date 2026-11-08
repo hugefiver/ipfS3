@@ -86,7 +86,6 @@ pub struct ObjectEvidence {
     pub decision: Option<DecisionState>,
     pub legacy_unknown: bool,
     pub control_revision: Option<String>,
-    pub config_revision: Option<String>,
     pub selection: SelectionEvidence,
     /// Committed exact bindings; root_revision is NOT a manifest revision.
     pub manifest_bindings: Vec<ManifestBinding>,
@@ -143,6 +142,7 @@ pub enum StoredTargetState {
     QuotaBlocked,
     Evicted,
     Released,
+    Error,
     Unknown,
 }
 
@@ -203,6 +203,7 @@ pub enum JobState {
     Pending,
     Running,
     Done,
+    Error,
     Unknown,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]

@@ -455,16 +455,17 @@ pub(crate) fn project_target_rows(
                             levels: vec![level],
                             min_replicas,
                             max_age_secs,
-                            policy_revision: native::value(
-                                target
-                                    .lease
-                                    .native_tuple
-                                    .as_ref()
-                                    .ok_or(ManagementError::InvalidEvidence)?,
-                                "policy_id",
-                            )
-                            .ok_or(ManagementError::InvalidEvidence)?
-                            .into(),
+                            policy_id: crate::pinning::management::policy_reference(
+                                native::value(
+                                    target
+                                        .lease
+                                        .native_tuple
+                                        .as_ref()
+                                        .ok_or(ManagementError::InvalidEvidence)?,
+                                    "policy_id",
+                                )
+                                .ok_or(ManagementError::InvalidEvidence)?,
+                            ),
                         });
                     }
                 }
@@ -1172,34 +1173,5 @@ pub async fn failover_candidates<C: ConnectionTrait>(
         .iter()
         .position(|candidate| candidate == failed)
         .ok_or(ManagementError::Changed)?;
-    Ok(Some(candidates[start..].to_vec()))
-}
-
-pub(crate) async fn failover_candidates_runtime(
-    tx: &crate::store::RuntimeTransaction,
-    lease: &str,
-    cid: &str,
-    failed: &str,
-    work: records::DecodeWork<'_>,
-) -> crate::error::AppResult<Option<Vec<String>>> {
-    let Some(birth) = pin_lease_requirement::contract::get_with_work(tx.db(), lease, work)
-        .await
-        .map_err(crate::store::pinning::management::admission::work_error)?
-    else {
-        return Ok(None);
-    };
-    let candidates =
-        candidates_for_cid_catalog(tx.catalog(work), lease, cid, &birth, work.budget().clone())
-            .await
-            .map_err(crate::store::pinning::management::admission::work_error)?
-            .into_iter()
-            .map(|(_, allocation, _)| allocation)
-            .collect::<Vec<_>>();
-    let start = candidates
-        .iter()
-        .position(|candidate| candidate == failed)
-        .ok_or_else(|| {
-            crate::store::pinning::management::admission::work_error(ManagementError::Changed)
-        })?;
     Ok(Some(candidates[start..].to_vec()))
 }

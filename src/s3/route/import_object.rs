@@ -228,7 +228,6 @@ impl ImportObjectRoute {
                     serde_json::json!({
                         "options": &options,
                         "target_prefix": prefix,
-                        "rule_revision": zip_intent.as_ref().map(|intent| intent.policy_revision()),
                         "zip_intent": zip_intent,
                         "source_content_type": object_content_type,
                         "source_metadata": metadata,
@@ -406,7 +405,7 @@ impl ImportObjectRoute {
         } else {
             None
         };
-        let mut decision = if let Some(intent) = &zip_intent {
+        let decision = if let Some(intent) = &zip_intent {
             intent.source_decision().clone()
         } else {
             self.state
@@ -425,12 +424,11 @@ impl ImportObjectRoute {
                 .1
         };
         if zip_intent.is_none() {
-            decision
-                .capture_durable_revision(
-                    self.state.pinning.effective_config(),
-                    self.state.pinning.control_mode(),
-                )
-                .map_err(|error| AppError::InvalidPinningRequest(error.to_owned()))?;
+            self.state
+                .pinning
+                .effective_config()
+                .validate_durable_intents(&decision.effective_intents)
+                .map_err(|error| AppError::InvalidPinningRequest(error.to_string()))?;
         }
         if let ImportSource::Url(url) = &source {
             self.coordinator

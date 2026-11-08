@@ -9,7 +9,9 @@ use ipfs_s3_gateway::{
         coordinator::normalize_validated_config,
         decision::DecisionOrigin,
         tags::ObjectTag,
-        zip_policy::{CapturedZipIntent, ZipCaptureContext, capture_zip_intent},
+        zip_policy::{
+            CapturedZipIntent, ValidatedZipOutputRules, ZipCaptureContext, capture_zip_intent,
+        },
     },
     store::{
         self,
@@ -58,6 +60,17 @@ pub fn config() -> ValidatedPinningConfig {
             |_| None,
         )
         .unwrap(),
+    )
+    .unwrap()
+}
+
+pub fn output_rules(config: &ValidatedPinningConfig) -> ValidatedZipOutputRules {
+    ValidatedZipOutputRules::from_config(
+        &DecompressZipConfig {
+            auto_pin_outputs: Some(true),
+            ..Default::default()
+        },
+        config,
     )
     .unwrap()
 }
@@ -237,6 +250,7 @@ pub async fn prepared_with_outputs(
 #[allow(dead_code)]
 pub async fn publish_captured(
     db: &DatabaseConnection,
+    config: &ValidatedPinningConfig,
     request: ZipPublicationRequest,
     batch: ZipBatchPublication,
     capture: &CapturedZipIntent,
@@ -283,6 +297,9 @@ pub async fn publish_captured(
             root_outcome: batch.root_outcome,
             terminal_result: batch.terminal_result,
         },
+        config,
+        &output_rules(config),
+        OptionalPinControlMode::Warn,
     )
     .await
 }
@@ -306,6 +323,7 @@ pub async fn publish(
             mode: OptionalPinControlMode::Warn,
             limits: &config.provider_limits,
         },
+        &output_rules(config),
     )
     .await
 }

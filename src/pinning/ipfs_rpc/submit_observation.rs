@@ -214,7 +214,10 @@ impl IpfsRpcProvider {
     ) -> Result<RemotePin, ProviderError> {
         cid::parse(&request.cid)?;
         match self.strategy {
-            RpcStrategy::Cid => self.pin_cid(&request.cid, evidence).await?,
+            RpcStrategy::Cid => {
+                self.pin_cid(&request.cid, evidence).await?;
+                return self.remote_pin(&request.cid);
+            }
             RpcStrategy::Upload => self.upload(&request.cid, evidence).await?,
             RpcStrategy::Car => self.import_car(&request.cid, evidence).await?,
         }

@@ -70,9 +70,7 @@ pub(super) async fn create(
     )
     .ok_or(ManagementError::InvalidEvidence)?;
     let policy = policy(config, capture)?;
-    if intent.requirements.policy_revision != policy.identity
-        || !within_policy_duration(started_at, expires_at, policy.max_duration.as_seconds())
-    {
+    if !within_policy_duration(started_at, expires_at, policy.max_duration.as_seconds()) {
         return Err(ManagementError::Confirmation);
     }
     work.with(|work| work.nodes(1))?;
@@ -117,10 +115,10 @@ pub(super) async fn create(
         check_accounting(tx, &provider.name, stored_cid, bytes, work).await?;
     }
     let duration = expires_at.signed_duration_since(started_at).num_seconds();
-    work.copy(&intent.requirements.policy_revision)?;
+    work.copy(&policy.identity)?;
     let lease_intent = LeaseIntent {
         source: LeaseSource::Manual,
-        policy_id: intent.requirements.policy_revision.clone(),
+        policy_id: policy.identity.clone(),
         provider_mode: match intent.requirements.mode {
             ProviderMode::One => AllocationMode::One,
             ProviderMode::All => AllocationMode::All,

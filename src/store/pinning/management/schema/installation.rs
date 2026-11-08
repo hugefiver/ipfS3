@@ -1,6 +1,6 @@
 //! Cold installation semantics outside the management evidence projection.
 use super::*;
-mod expressions;
+pub(super) mod expressions;
 
 const TABLES: &[&str] = &[
     "bucket_cors_configs",

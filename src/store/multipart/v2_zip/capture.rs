@@ -13,7 +13,8 @@ struct Envelope {
     schema_version: u8,
     options: ZipV2Options,
     target_prefix: String,
-    rule_revision: String,
+    #[serde(default, rename = "rule_revision", skip_serializing)]
+    _legacy_rule_revision: Option<String>,
     zip_intent: serde_json::Value,
 }
 
@@ -39,7 +40,7 @@ pub(super) fn envelope(request: &Intake, intent: &CapturedZipIntent) -> AppResul
         schema_version: 1,
         options: request.options.clone(),
         target_prefix: request.target_prefix.clone(),
-        rule_revision: request.rule_revision.clone(),
+        _legacy_rule_revision: None,
         zip_intent: serde_json::to_value(intent).map_err(|_| attention())?,
     })
     .map_err(|_| attention())
@@ -50,10 +51,7 @@ pub(super) fn read(record: &Record) -> AppResult<(ZipV2Options, Option<CapturedZ
         serde_json::from_str(&record.captured_options).map_err(|_| conflict())?;
     if value.get("options").is_some() {
         let envelope: Envelope = serde_json::from_value(value).map_err(|_| attention())?;
-        if envelope.schema_version != 1
-            || envelope.target_prefix != record.target_prefix
-            || envelope.rule_revision != record.rule_revision
-        {
+        if envelope.schema_version != 1 || envelope.target_prefix != record.target_prefix {
             return Err(attention());
         }
         let intent = CapturedZipIntent::decode_json(&envelope.zip_intent.to_string())

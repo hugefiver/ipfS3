@@ -54,7 +54,7 @@ pub(super) enum CaptureSemantics {
 /// Read persisted JSON via decode_json, verify admission origin in the store
 /// guard, then bind the final manifest to actual versions before selection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "DecodedZipIntent")]
 pub struct CapturedZipIntent {
     pub(super) schema_version: u8,
     pub(super) contract: ZipContract,
@@ -67,6 +67,53 @@ pub struct CapturedZipIntent {
     pub(super) source_providers: Vec<CapturedProvider>,
     pub(super) policy: ValidatedZipOutputRules,
     pub(super) historical_plan: Option<ZipOutputPinPlan>,
+    #[serde(skip)]
+    pub(super) resolved_source: Option<ResolvedZipSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ResolvedZipSource {
+    pub intents: Vec<LeaseIntent>,
+    pub providers: Vec<CapturedProvider>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DecodedZipIntent {
+    schema_version: u8,
+    contract: ZipContract,
+    semantics: CaptureSemantics,
+    bucket: String,
+    source_key: String,
+    target_prefix: String,
+    controls: CapturedZipControls,
+    source_decision: ExtensionDecision,
+    source_providers: Vec<CapturedProvider>,
+    policy: ValidatedZipOutputRules,
+    historical_plan: Option<ZipOutputPinPlan>,
+    #[serde(default, rename = "policy_revision")]
+    _legacy_policy_revision: Option<serde::de::IgnoredAny>,
+    #[serde(default, rename = "rule_revision")]
+    _legacy_rule_revision: Option<serde::de::IgnoredAny>,
+}
+
+impl From<DecodedZipIntent> for CapturedZipIntent {
+    fn from(raw: DecodedZipIntent) -> Self {
+        Self {
+            schema_version: raw.schema_version,
+            contract: raw.contract,
+            semantics: raw.semantics,
+            bucket: raw.bucket,
+            source_key: raw.source_key,
+            target_prefix: raw.target_prefix,
+            controls: raw.controls,
+            source_decision: raw.source_decision,
+            source_providers: raw.source_providers,
+            policy: raw.policy,
+            historical_plan: raw.historical_plan,
+            resolved_source: None,
+        }
+    }
 }
 
 impl CapturedZipIntent {
@@ -85,6 +132,142 @@ impl CapturedZipIntent {
     pub fn source_decision(&self) -> &ExtensionDecision {
         &self.source_decision
     }
+    /// Resolve executable policy in memory; the admission decision stays unchanged.
+    pub fn resolve_current(
+        &self,
+        config: &ValidatedPinningConfig,
+        zip: &DecompressZipConfig,
+        mode: OptionalPinControlMode,
+    ) -> anyhow::Result<Self> {
+        let rules = ValidatedZipOutputRules::from_config(zip, config)?;
+        self.resolve_current_with_rules(config, &rules, mode)
+    }
+
+    pub fn resolve_current_with_rules(
+        &self,
+        config: &ValidatedPinningConfig,
+        rules: &ValidatedZipOutputRules,
+        mode: OptionalPinControlMode,
+    ) -> anyhow::Result<Self> {
+        self.validate()?;
+        let normalized = super::rules::normalized_for_zip(config)?;
+        let config = normalized.as_ref();
+        let mut tags = Vec::new();
+        match &self.source_decision.control {
+            PinControl::Absent => {}
+            PinControl::Cancel => tags.push(ObjectTag::new("ipfs-s3:pin", "false")),
+            PinControl::Request { duration, content } => {
+                tags.push(ObjectTag::new("ipfs-s3:pin", "true"));
+                if let Some(duration) = duration {
+                    tags.push(ObjectTag::new(
+                        "ipfs-s3:duration",
+                        format!("{}s", duration.as_seconds()),
+                    ));
+                }
+                if *content == ContentMode::Decompressed {
+                    tags.push(ObjectTag::new("ipfs-s3:content", "decompressed"));
+                }
+            }
+            PinControl::Renew { retain_until } => {
+                tags.push(ObjectTag::new("ipfs-s3:pin", "true"));
+                tags.push(ObjectTag::new(
+                    "ipfs-s3:retain-until",
+                    retain_until.to_rfc3339(),
+                ));
+            }
+        }
+        let mut source = PinPolicyEvaluator::with_mode(config, mode).resolve_captured_publication(
+            PublicationContext {
+                bucket: &self.bucket,
+                key: &self.source_key,
+                tags: &tags,
+                is_decompress_zip: true,
+            },
+            &self.source_decision,
+        )?;
+        source
+            .leases
+            .retain(|intent| intent.source == LeaseSource::Manual);
+        let names = source
+            .leases
+            .iter()
+            .flat_map(|intent| intent.providers.iter().cloned())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut resolved = self.clone();
+        resolved.policy = rules.clone();
+        resolved.resolved_source = Some(ResolvedZipSource {
+            intents: source.leases,
+            providers: super::rules::capture_providers(&names, config)?,
+        });
+        resolved.ensure_automatic_durable()?;
+        resolved.validate()?;
+        Ok(resolved)
+    }
+
+    /// Durable MPU/import callers check current manual routes before content IO.
+    pub fn validate_durable_current(&self, config: &ValidatedPinningConfig) -> anyhow::Result<()> {
+        let source = self
+            .resolved_source
+            .as_ref()
+            .context("ZIP durable validation requires current policy resolution")?;
+        let mut intents = source.intents.clone();
+        for intent in &mut intents {
+            intent.providers.retain(|name| {
+                source.providers.iter().any(|provider| {
+                    provider.selected.enabled && provider.selected.config_name == *name
+                })
+            });
+        }
+        super::rules::normalized_for_zip(config)?.validate_durable_intents(&intents)
+    }
+
+    fn ensure_automatic_durable(&self) -> anyhow::Result<()> {
+        if self.controls.targets.extracted {
+            for policy in self
+                .policy
+                .output_candidates(&self.bucket, &self.target_prefix)
+            {
+                policy.ensure_durable()?;
+            }
+        }
+        if self.controls.targets.source
+            && let Some(policy) =
+                self.policy
+                    .choose(&self.bucket, &self.source_key)
+                    .0
+                    .filter(|policy| {
+                        policy.policy.trigger == PolicyTrigger::Always && policy.available()
+                    })
+        {
+            policy.ensure_durable()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn source_intents(&self) -> &[LeaseIntent] {
+        self.resolved_source
+            .as_ref()
+            .map_or(&self.source_decision.effective_intents, |source| {
+                &source.intents
+            })
+    }
+
+    pub(crate) fn source_provider_candidates(&self) -> &[CapturedProvider] {
+        self.resolved_source
+            .as_ref()
+            .map_or(&self.source_providers, |source| &source.providers)
+    }
+
+    pub(super) fn selection_semantics(&self) -> CaptureSemantics {
+        if self.resolved_source.is_some() {
+            CaptureSemantics::Current
+        } else {
+            self.semantics
+        }
+    }
+
     pub fn bucket(&self) -> &str {
         &self.bucket
     }
@@ -94,10 +277,6 @@ impl CapturedZipIntent {
     pub fn target_prefix(&self) -> &str {
         &self.target_prefix
     }
-    pub fn policy_revision(&self) -> &str {
-        self.policy.revision()
-    }
-
     /// Unknown input uses the bounded original scope; a guard-verified manifest
     /// uses only actual duties. This read never binds an owner or grants a lease.
     pub(crate) fn io_provider_candidates(
@@ -105,10 +284,10 @@ impl CapturedZipIntent {
         manifest: Option<&crate::zip::batch::FinalZipManifest>,
     ) -> Vec<&ZipSelectedProvider> {
         let mut providers = self
-            .source_providers
+            .source_provider_candidates()
             .iter()
             .filter(|provider| {
-                self.source_decision.effective_intents.iter().any(|intent| {
+                self.source_intents().iter().any(|intent| {
                     let has_subject = match intent.content_mode {
                         ContentMode::Object => self.controls.publish_source,
                         ContentMode::Decompressed => {
@@ -121,7 +300,7 @@ impl CapturedZipIntent {
             })
             .map(|provider| &provider.selected)
             .collect::<Vec<_>>();
-        match self.semantics {
+        match self.selection_semantics() {
             CaptureSemantics::Current => {
                 if self.controls.publish_source
                     && self.controls.targets.source
@@ -202,7 +381,7 @@ impl CapturedZipIntent {
     }
 
     /// Read-only qualification for a safety veto, not a publication binding or
-    /// lease selection. Use the same frozen choose/availability primitives.
+    /// lease selection. It uses the same policy choice and availability checks.
     pub(crate) fn automatic_output_eligible(&self, kind: ZipOutputKind, key: &str) -> bool {
         let targeted = match kind {
             ZipOutputKind::Source => self.controls.targets.source,
@@ -211,7 +390,7 @@ impl CapturedZipIntent {
         if !targeted {
             return false;
         }
-        match self.semantics {
+        match self.selection_semantics() {
             CaptureSemantics::Current => {
                 self.policy
                     .choose(&self.bucket, key)
@@ -230,37 +409,6 @@ impl CapturedZipIntent {
                 })
             }),
         }
-    }
-
-    pub(crate) fn automatic_extracted_scope_eligible(&self, prefix: &str) -> bool {
-        if !self.controls.targets.extracted {
-            return false;
-        }
-        match self.semantics {
-            CaptureSemantics::Current => !self
-                .policy
-                .output_candidates(&self.bucket, prefix)
-                .is_empty(),
-            CaptureSemantics::LegacyV1 => false,
-            CaptureSemantics::LegacyV2 => self.historical_plan.as_ref().is_some_and(|plan| {
-                plan.outputs.iter().any(|old| {
-                    old.kind == ZipOutputKind::Extracted
-                        && old.output.bucket == self.bucket
-                        && old.output.key.starts_with(prefix)
-                        && !old.intents.is_empty()
-                })
-            }),
-        }
-    }
-
-    pub(crate) fn originally_denied_scope(&self, prefix: &str) -> bool {
-        self.policy.rules.as_ref().is_some_and(|rules| {
-            rules.iter().any(|rule| {
-                rule.raw.effect == ZipRuleEffect::Deny
-                    && (rule.raw.bucket == "*" || rule.raw.bucket == self.bucket)
-                    && prefix.starts_with(&rule.raw.prefix)
-            })
-        })
     }
 
     /// Frozen effective options for fingerprint/persist/replay adapters. No
@@ -292,7 +440,7 @@ impl CapturedZipIntent {
         &self,
         provider_id: &str,
     ) -> Option<&crate::pinning::config::ProviderLimits> {
-        self.source_providers
+        self.source_provider_candidates()
             .iter()
             .chain(
                 self.policy
@@ -532,17 +680,13 @@ pub fn capture_zip_intent(
             },
             origin,
         )?;
-    // New ZIP archive policy only owns its explicitly authorized manual group.
-    // Automatic selection happens later from frozen policy + exact outputs.
+    // The archive owns manual groups; automatic work is selected per exact output.
     source_policy
         .leases
         .retain(|intent| intent.source == LeaseSource::Manual);
     source_decision.effective_intents = source_policy.leases.clone();
     source_decision
         .validate_policy(&source_policy)
-        .map_err(anyhow::Error::msg)?;
-    source_decision
-        .capture_durable_revision(config, mode)
         .map_err(anyhow::Error::msg)?;
     let names = source_decision
         .effective_intents
@@ -552,20 +696,6 @@ pub fn capture_zip_intent(
         .into_iter()
         .collect::<Vec<_>>();
     let source_providers = super::rules::capture_providers(&names, config)?;
-    // Only potentially executable candidates need durable remote evidence.
-    if controls.targets.extracted {
-        for p in output_candidates {
-            p.ensure_durable()?;
-        }
-    }
-    if controls.targets.source
-        && let Some(p) = policy
-            .choose(context.bucket, context.source_key)
-            .0
-            .filter(|p| p.policy.trigger == PolicyTrigger::Always && p.available())
-    {
-        p.ensure_durable()?;
-    }
     let capture = CapturedZipIntent {
         schema_version: 1,
         contract,
@@ -578,7 +708,9 @@ pub fn capture_zip_intent(
         source_providers,
         policy,
         historical_plan: None,
+        resolved_source: None,
     };
+    capture.ensure_automatic_durable()?;
     capture.validate()?;
     Ok(capture)
 }

@@ -1,5 +1,4 @@
-//! Native admission for pre-R25 store fixtures, with their original frozen v1
-//! source intents. This does not enable new archive Automatic pinning.
+//! Native ZIP admission with explicit current configuration for publication tests.
 use super::*;
 use crate::pinning::{
     decision::{DecisionEffect, DecisionOrigin, ExtensionDecision},
@@ -62,7 +61,6 @@ pub(in crate::store::pinning::publication) async fn original_capture<
     }
     let decision = ExtensionDecision::capture(
         DecisionOrigin::new("principal", origin),
-        "a".repeat(64), // Original fixture revision, not a current configuration.
         if archive
             .policy
             .leases
@@ -78,7 +76,7 @@ pub(in crate::store::pinning::publication) async fn original_capture<
         &archive.policy,
     )
     .unwrap();
-    decode_legacy_v1_intent(
+    let capture = decode_legacy_v1_intent(
         &serde_json::json!({
             "bucket": archive.object.bucket, "source_key": archive.object.key,
             "target_prefix": prefix, "root_capture": ZipRootCapture::Configured(false),
@@ -87,7 +85,19 @@ pub(in crate::store::pinning::publication) async fn original_capture<
         })
         .to_string(),
     )
-    .unwrap()
+    .unwrap();
+    if archive
+        .policy
+        .leases
+        .iter()
+        .any(|intent| intent.source == LeaseSource::Automatic)
+    {
+        let mut value = serde_json::to_value(&capture).unwrap();
+        value["controls"]["targets"]["source"] = serde_json::json!(true);
+        CapturedZipIntent::decode_json(&value.to_string()).unwrap()
+    } else {
+        capture
+    }
 }
 
 pub(super) async fn direct(
@@ -143,7 +153,110 @@ pub(super) async fn with_guard(
     }
 }
 
+pub(in crate::store::pinning::publication) async fn current_snapshot(
+    db: &DatabaseConnection,
+    batch_id: &str,
+    archive: &PublicationRequest,
+    limits: &ProviderLimitMap,
+) -> DecidedSnapshot {
+    let row = crate::store::entities::zip_batch::Entity::find_by_id(batch_id)
+        .one(db)
+        .await
+        .unwrap()
+        .unwrap();
+    let admitted = AdmittedZip {
+        capture: decode_zip_capture_json(&row.captured_options).unwrap(),
+        guard: None,
+        id: batch_id.into(),
+    };
+    let config = admitted.current_config(archive, limits);
+    let rules = crate::pinning::zip_policy::ValidatedZipOutputRules::from_config(
+        &crate::config::DecompressZipConfig::default(),
+        &config,
+    )
+    .unwrap();
+    zip_decided_snapshot(
+        &DecidedPublish {
+            decision: admitted.capture.source_decision(),
+            config: &config,
+            mode: crate::config::OptionalPinControlMode::Warn,
+            limits,
+        },
+        &rules,
+    )
+    .unwrap()
+}
+
 impl AdmittedZip {
+    fn current_config(
+        &self,
+        archive: &PublicationRequest,
+        limits: &ProviderLimitMap,
+    ) -> crate::pinning::config::ValidatedPinningConfig {
+        use crate::config::{PinningConfig, PolicyConfig, ProviderConfig};
+        let providers = limits
+            .iter()
+            .map(|(name, limit)| ProviderConfig {
+                name: name.clone(),
+                kind: "noop".into(),
+                enabled: limit.enabled,
+                priority: limit.priority,
+                max_bytes: limit.max_bytes as u64,
+                max_pins: limit.max_pins as u64,
+                token_env: None,
+                endpoint: None,
+                api: None,
+                strategy: None,
+                upload_endpoint: None,
+                cluster: None,
+                requests_per_second: None,
+            })
+            .collect();
+        let policies = archive
+            .policy
+            .leases
+            .first()
+            .map(|intent| PolicyConfig {
+                bucket: archive.object.bucket.clone(),
+                prefix: String::new(),
+                trigger: if archive
+                    .policy
+                    .leases
+                    .iter()
+                    .any(|intent| intent.source == LeaseSource::Automatic)
+                {
+                    "always"
+                } else {
+                    "request"
+                }
+                .into(),
+                provider_mode: if intent.provider_mode == ProviderMode::All {
+                    "all"
+                } else {
+                    "one"
+                }
+                .into(),
+                providers: intent.providers.clone(),
+                default_duration: format!("{}s", intent.duration.as_seconds()),
+                max_duration: format!("{}s", intent.duration.as_seconds()),
+                allow_decompressed: true,
+            })
+            .into_iter()
+            .collect();
+        let raw = PinningConfig {
+            providers,
+            policies,
+            ..Default::default()
+        };
+        let mut config =
+            crate::pinning::config::ValidatedPinningConfig::from_raw(&raw, |_| None).unwrap();
+        for provider in &mut config.providers {
+            provider.identity =
+                ProviderIdentity::legacy(&provider.name, "noop", None, "psa", "psa");
+        }
+        config
+    }
+
     pub(super) async fn prepare(
         &self,
         db: &DatabaseConnection,
@@ -204,9 +317,10 @@ impl AdmittedZip {
         limits: &ProviderLimitMap,
     ) -> AppResult<PublicationResult> {
         let batch = self.prepare(db, &mut request).await;
-        let config = crate::pinning::config::ValidatedPinningConfig::from_raw(
-            &crate::config::PinningConfig::default(),
-            |_| None,
+        let config = self.current_config(&request.archive, limits);
+        let rules = crate::pinning::zip_policy::ValidatedZipOutputRules::from_config(
+            &crate::config::DecompressZipConfig::default(),
+            &config,
         )
         .unwrap();
         publish_decided_zip_batch(
@@ -220,6 +334,7 @@ impl AdmittedZip {
                 mode: crate::config::OptionalPinControlMode::Warn,
                 limits,
             },
+            &rules,
         )
         .await
     }
@@ -234,9 +349,10 @@ impl AdmittedZip {
         limits: &ProviderLimitMap,
     ) -> AppResult<PublicationResult> {
         let batch = self.prepare(db, &mut request).await;
-        let config = crate::pinning::config::ValidatedPinningConfig::from_raw(
-            &crate::config::PinningConfig::default(),
-            |_| None,
+        let config = self.current_config(&request.archive, limits);
+        let rules = crate::pinning::zip_policy::ValidatedZipOutputRules::from_config(
+            &crate::config::DecompressZipConfig::default(),
+            &config,
         )
         .unwrap();
         publish_decided_import_zip_batch(
@@ -252,6 +368,7 @@ impl AdmittedZip {
                 mode: crate::config::OptionalPinControlMode::Warn,
                 limits,
             },
+            &rules,
         )
         .await
     }
@@ -266,9 +383,10 @@ impl AdmittedZip {
         let guard = self.completion_guard(db).await;
         request.archive.object.multipart = true;
         let batch = self.prepare(db, &mut request).await;
-        let config = crate::pinning::config::ValidatedPinningConfig::from_raw(
-            &crate::config::PinningConfig::default(),
-            |_| None,
+        let config = self.current_config(&request.archive, limits);
+        let rules = crate::pinning::zip_policy::ValidatedZipOutputRules::from_config(
+            &crate::config::DecompressZipConfig::default(),
+            &config,
         )
         .unwrap();
         publish_decided_completed_zip_batch(
@@ -284,6 +402,7 @@ impl AdmittedZip {
                 mode: crate::config::OptionalPinControlMode::Warn,
                 limits,
             },
+            &rules,
         )
         .await
     }

@@ -19,7 +19,9 @@ pub(in crate::store::pinning::legacy_migration) async fn validate_sqlite_metadat
         schema::validate_sqlite_with_versions(db, versions)
             .await
             .map_err(|_| invalid())?;
-    } else if crate::store::migrations::history::is_m23(versions) {
+    } else if crate::store::migrations::history::is_m23(versions)
+        || versions == [crate::store::migrations::baseline::VERSION]
+    {
         schema::validate_m23_layout(db, false)
             .await
             .map_err(|_| invalid())?;
@@ -33,12 +35,18 @@ pub(super) async fn validate_versions<C: ConnectionTrait>(
     db: &C,
     versions: &[String],
 ) -> AppResult<()> {
-    if crate::store::migrations::history::is_m23(versions) {
+    if crate::store::migrations::history::is_m23(versions)
+        || versions == [crate::store::migrations::baseline::VERSION]
+    {
         schema::validate_m23_layout(db, false)
             .await
             .map_err(|_| invalid())
     } else {
-        validate(db, versions == [schema::VERSION]).await
+        validate(
+            db,
+            versions.last().map(String::as_str) == Some(schema::VERSION),
+        )
+        .await
     }
 }
 

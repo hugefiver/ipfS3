@@ -7,9 +7,7 @@ use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter};
 use crate::{
     error::{AppError, AppResult},
     pinning::{
-        decision::{
-            DecisionEffect, DecisionOrigin, ExtensionDecision, WarningCode, config_revision,
-        },
+        decision::{DecisionEffect, DecisionOrigin, ExtensionDecision, WarningCode},
         policy::{
             ExistingManualLease, ExistingManualLeaseState, ManualLeaseMutation, PublicationContext,
             PublicationPolicy,
@@ -226,10 +224,6 @@ fn capture_tag_decision(
     let control =
         PinControl::from_tags(replacement).map_err(|_| invalid_pinning_request(INVALID_TAG_SET))?;
     let origin = DecisionOrigin::new(principal, uuid::Uuid::new_v4().to_string());
-    let revision = config_revision(
-        state.pinning.effective_config(),
-        state.pinning.control_mode(),
-    );
     let policy = PublicationPolicy {
         tags: replacement.to_vec(),
         // Replacing tags is not a publication. Existing automatic work persists
@@ -254,10 +248,8 @@ fn capture_tag_decision(
         };
         if let Some(old_control) = old_control.filter(|old| !matches!(old, PinControl::Absent)) {
             if old_control == control {
-                return ExtensionDecision::capture_legacy_unknown(
-                    origin, revision, control, &policy,
-                )
-                .map_err(invalid_pinning_request);
+                return ExtensionDecision::capture_legacy_unknown(origin, control, &policy)
+                    .map_err(invalid_pinning_request);
             }
             if matches!(control, PinControl::Request { .. }) {
                 return Err(invalid_pinning_request(
@@ -302,8 +294,9 @@ fn capture_tag_decision(
     } else {
         DecisionEffect::NoIntent
     };
-    ExtensionDecision::capture(origin, revision, effect, warning, control, &policy)
-        .map_err(invalid_pinning_request)
+    let decision = ExtensionDecision::capture(origin, effect, warning, control, &policy)
+        .map_err(invalid_pinning_request)?;
+    Ok(decision)
 }
 
 fn version_selector(version_id: Option<&str>) -> AppResult<VersionSelector> {
@@ -380,7 +373,7 @@ async fn replace_tag_set(
         let attempted = operation_state
             .pinning
             .policy()
-            .evaluate_tag_replacement(existing.as_ref(), &replacement, now)
+            .evaluate_tag_replacement(&bucket, &key, existing.as_ref(), &replacement, now)
             .map_err(AppError::from);
         let decision = capture_tag_decision(
             &operation_state,
@@ -713,6 +706,235 @@ mod tests {
         .unwrap();
         let policy_id = validated.policies[0].identity.clone();
         (PinningCoordinator::build(validated).unwrap(), policy_id)
+    }
+
+    #[tokio::test]
+    async fn publication_uses_current_candidates_and_quota_after_edits() {
+        let mut fixture = fixture().await;
+        let mut config = fixture.state.pinning.effective_config().clone();
+        config.policies[0].provider_mode = ProviderMode::One;
+        config.policies[0].refresh_identity(0);
+        config.providers[1].limits.enabled = false;
+        config.provider_limits.get_mut("beta").unwrap().enabled = false;
+        Arc::get_mut(&mut fixture.state).unwrap().pinning =
+            PinningCoordinator::build(config).unwrap();
+        let tags = vec![ObjectTag::new("ipfs-s3:pin", "true")];
+        let (_, decision) = fixture
+            .state
+            .pinning
+            .policy()
+            .evaluate_publication_decision(
+                PublicationContext {
+                    bucket: BUCKET,
+                    key: KEY,
+                    tags: &tags,
+                    is_decompress_zip: false,
+                },
+                DecisionOrigin::new("principal", "frozen-execution"),
+            )
+            .unwrap();
+        let mut current = fixture.state.pinning.effective_config().clone();
+        current.policies[0].max_duration = LeaseDuration::parse("2h").unwrap();
+        current.policies[0].refresh_identity(0);
+        current.providers[0].limits.priority = 100;
+        current.providers[0].limits.max_bytes = 0;
+        current.providers[0].identity.cleanup = crate::pinning::identity::CleanupMode::Retain;
+        current.providers[1].limits.enabled = true;
+        current.providers[1].limits.priority = 0;
+        for provider in &current.providers {
+            current
+                .provider_limits
+                .insert(provider.name.clone(), provider.limits.clone());
+            crate::store::pinning::ledger::register_configured_route(
+                fixture.state.store.db(),
+                &provider.name,
+                provider,
+            )
+            .await
+            .unwrap();
+        }
+        let captured = || publication::DecidedPublish {
+            decision: &decision,
+            config: &current,
+            mode: crate::config::OptionalPinControlMode::Warn,
+            limits: &current.provider_limits,
+        };
+        let policy = crate::pinning::policy::PinPolicyEvaluator::new(&current)
+            .resolve_captured_publication(
+                PublicationContext {
+                    bucket: BUCKET,
+                    key: KEY,
+                    tags: &tags,
+                    is_decompress_zip: false,
+                },
+                &decision,
+            )
+            .unwrap();
+        publication::preflight_decided_routes(fixture.state.store.db(), captured(), &policy)
+            .await
+            .unwrap();
+        publication::publish_decided_object(
+            fixture.state.store.db(),
+            PublicationRequest {
+                object: PublicationObject::from_put(
+                    "frozen-execution-owner".into(),
+                    BUCKET,
+                    KEY,
+                    "bafy-frozen-execution".into(),
+                    10,
+                    None,
+                    None,
+                    false,
+                    None,
+                    None,
+                    Utc::now(),
+                ),
+                tags,
+                policy,
+                object_target: PinTargetSpec {
+                    cid: "bafy-frozen-execution".into(),
+                    logical_size: 10,
+                },
+            },
+            captured(),
+        )
+        .await
+        .unwrap();
+        let targets = pin_lease_target::Entity::find()
+            .all(fixture.state.store.db())
+            .await
+            .unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].provider, "beta");
+        assert_eq!(targets[0].state, "waiting");
+        let birth = crate::store::entities::pin_lease_requirement::contract::get(
+            fixture.state.store.db(),
+            &targets[0].lease_id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            birth.candidates["alpha"].as_ref().unwrap().cleanup,
+            crate::pinning::identity::CleanupMode::Retain
+        );
+        current.providers[0].identity.endpoint_revision += 1;
+        assert!(
+            publication::preflight_decided_routes(
+                fixture.state.store.db(),
+                publication::DecidedPublish {
+                    decision: &decision,
+                    config: &current,
+                    mode: crate::config::OptionalPinControlMode::Strict,
+                    limits: &current.provider_limits
+                },
+                &crate::pinning::policy::PinPolicyEvaluator::new(&current)
+                    .resolve_captured_publication(
+                        PublicationContext {
+                            bucket: BUCKET,
+                            key: KEY,
+                            tags: &[ObjectTag::new("ipfs-s3:pin", "true")],
+                            is_decompress_zip: false
+                        },
+                        &decision
+                    )
+                    .unwrap(),
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn renewal_uses_current_maximum_after_policy_edit_and_tag_replacement() {
+        let mut fixture = fixture_with_providers(&["alpha"]).await;
+        let now = Utc::now();
+        let tags = vec![ObjectTag::new("ipfs-s3:pin", "true")];
+        let (policy, decision) = fixture
+            .state
+            .pinning
+            .policy()
+            .evaluate_publication_decision(
+                PublicationContext {
+                    bucket: BUCKET,
+                    key: KEY,
+                    tags: &tags,
+                    is_decompress_zip: false,
+                },
+                DecisionOrigin::new("principal", "birth-auth"),
+            )
+            .unwrap();
+        for provider in &fixture.state.pinning.effective_config().providers {
+            crate::store::pinning::ledger::register_configured_route(
+                fixture.state.store.db(),
+                &provider.name,
+                provider,
+            )
+            .await
+            .unwrap();
+        }
+        publication::publish_decided_object(
+            fixture.state.store.db(),
+            PublicationRequest {
+                object: PublicationObject::from_put(
+                    "birth-auth-owner".into(),
+                    BUCKET,
+                    KEY,
+                    "bafy-birth-auth".into(),
+                    10,
+                    None,
+                    None,
+                    false,
+                    None,
+                    None,
+                    now,
+                ),
+                tags,
+                policy,
+                object_target: PinTargetSpec {
+                    cid: "bafy-birth-auth".into(),
+                    logical_size: 10,
+                },
+            },
+            publication::DecidedPublish {
+                decision: &decision,
+                config: fixture.state.pinning.effective_config(),
+                mode: fixture.state.pinning.control_mode(),
+                limits: fixture.state.pinning.provider_limits(),
+            },
+        )
+        .await
+        .unwrap();
+        let mut config = fixture.state.pinning.effective_config().clone();
+        config.policies[0].max_duration = LeaseDuration::parse("6h").unwrap();
+        config.policies[0].refresh_identity(0);
+        Arc::get_mut(&mut fixture.state).unwrap().pinning =
+            PinningCoordinator::build(config).unwrap();
+        for hours in [4, 5] {
+            let until = (now + chrono::TimeDelta::hours(hours)).to_rfc3339();
+            put_object_tagging_at(
+                &fixture.state,
+                put_request(&[("ipfs-s3:pin", "true"), ("ipfs-s3:retain-until", &until)]),
+                now,
+            )
+            .await
+            .unwrap();
+        }
+        let lease = load_manual_lease(fixture.state.store.db(), "birth-auth-owner")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease.expires_at, now + chrono::TimeDelta::hours(5));
+        let over = (now + chrono::TimeDelta::hours(7)).to_rfc3339();
+        assert!(
+            put_object_tagging_at(
+                &fixture.state,
+                put_request(&[("ipfs-s3:pin", "true"), ("ipfs-s3:retain-until", &over)]),
+                now
+            )
+            .await
+            .is_err()
+        );
     }
 
     async fn fixture() -> Fixture {
@@ -1146,6 +1368,7 @@ mod tests {
                 logical_size: Set(10),
                 provider: Set(target.provider.to_owned()),
                 state: Set(target.target_state.to_owned()),
+                last_error: Set(None),
                 created_at: Set(time(1)),
                 last_touched_at: Set(time(1)),
             })
@@ -2578,7 +2801,7 @@ mod tests {
     #[tokio::test]
     async fn expired_reactivation_preserves_original_targets_quota_and_creates_typed_current_work()
     {
-        let fixture = fixture().await;
+        let mut fixture = fixture().await;
         let targets = [
             TargetSeed {
                 id: "target-reserved",
@@ -2620,6 +2843,47 @@ mod tests {
         )
         .await;
         seed_usage(&fixture, "alpha", 3).await;
+        for provider in &fixture.state.pinning.effective_config().providers {
+            crate::store::pinning::ledger::register_configured_route(
+                fixture.state.store.db(),
+                &provider.name,
+                provider,
+            )
+            .await
+            .unwrap();
+        }
+        for target in &targets {
+            crate::store::pinning::ledger::capture_reservation(
+                fixture.state.store.db(),
+                target.provider,
+                target.cid,
+            )
+            .await
+            .unwrap();
+        }
+        crate::store::entities::pin_lease_requirement::contract::insert(
+            fixture.state.store.db(),
+            "manual",
+            OBJECT_ID,
+            "all",
+            "decompressed",
+            targets.iter().map(|target| target.cid.to_owned()),
+            &["alpha".into(), "beta".into()],
+            time(0),
+        )
+        .await
+        .unwrap();
+        fixture
+            .state
+            .pinning
+            .register_identities(&fixture.state.store)
+            .await
+            .unwrap();
+        let mut changed = fixture.state.pinning.effective_config().clone();
+        changed.policies[0].max_duration = LeaseDuration::parse("1h").unwrap();
+        changed.policies[0].refresh_identity(0);
+        Arc::get_mut(&mut fixture.state).unwrap().pinning =
+            PinningCoordinator::build(changed).unwrap();
         for target in &targets {
             jobs::enqueue_job(
                 fixture.state.store.db(),
@@ -2638,6 +2902,26 @@ mod tests {
             .map(|target| (target.id, target.cid, target.provider))
             .collect::<Vec<_>>();
 
+        let rejected = put_object_tagging_at(
+            &fixture.state,
+            put_request(&[
+                ("ipfs-s3:pin", "true"),
+                ("ipfs-s3:retain-until", "2026-07-22T06:00:00Z"),
+            ]),
+            time(2),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(rejected.code().as_str(), "InvalidArgument");
+        let unchanged = manual_lease(&fixture).await;
+        assert_eq!(
+            (unchanged.state.as_str(), unchanged.generation),
+            ("expired", 9)
+        );
+        let mut current = fixture.state.pinning.effective_config().clone();
+        current.policies[0].max_duration = LeaseDuration::parse("4h").unwrap();
+        Arc::get_mut(&mut fixture.state).unwrap().pinning =
+            PinningCoordinator::build(current).unwrap();
         put_object_tagging_at(
             &fixture.state,
             put_request(&[

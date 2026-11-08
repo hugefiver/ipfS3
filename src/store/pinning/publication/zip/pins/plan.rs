@@ -76,6 +76,7 @@ impl PinWriteSet {
                 .map(|p| (p.clone(), keys.routes.get(p).cloned()))
                 .collect(),
         };
+        let contract = serde_json::to_value(&contract).map_err(|_| invalid())?;
         work.copy(&contract).map_err(work_error)?;
         let contract = serde_json::to_string(&contract).map_err(|_| invalid())?;
         let target_bytes = selected.targets.iter().try_fold(0usize, |total, target| {
@@ -168,6 +169,7 @@ impl PinWriteSet {
                 cid: pair.1.clone(),
                 logical_size: size,
                 state: state.into(),
+                last_error: None,
                 created_at: now,
                 last_touched_at: now,
             },

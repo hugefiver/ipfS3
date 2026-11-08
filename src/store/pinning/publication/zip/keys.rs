@@ -31,10 +31,21 @@ impl AllocationKeys {
         db: &C,
         capture: &CapturedZipIntent,
         selected: &ZipIntentSelection,
+        current_limits: Option<&ProviderLimitMap>,
         work: DecodeWork<'_>,
         mut maintenance: Option<&mut super::PublicationLease<'_>>,
     ) -> AppResult<Self> {
-        let (limits, routes, enabled) = frozen_allocation(capture, selected)?;
+        let (mut limits, routes, enabled) = frozen_allocation(capture, selected)?;
+        if let Some(current) = current_limits {
+            for (name, frozen) in &mut limits {
+                let current = current.get(name).ok_or_else(invalid)?;
+                if frozen.enabled && !current.enabled {
+                    return Err(invalid());
+                }
+                frozen.max_bytes = current.max_bytes;
+                frozen.max_pins = current.max_pins;
+            }
+        }
         let mut raw = BTreeSet::new();
         for lease in &selected.leases {
             let providers = publication::ordered_enabled_providers(&lease.intent, &limits)?;

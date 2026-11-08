@@ -57,6 +57,7 @@ pub fn decode_legacy_v1_intent(json: &str) -> anyhow::Result<CapturedZipIntent> 
         source_providers: old.providers,
         policy: ValidatedZipOutputRules::compile(&[], &empty)?,
         historical_plan: None,
+        resolved_source: None,
     };
     capture.validate()?;
     Ok(capture)
@@ -121,6 +122,7 @@ pub fn decode_legacy_v2_intent(json: &str) -> anyhow::Result<CapturedZipIntent> 
         source_providers: old.providers,
         policy: ValidatedZipOutputRules::compile(&[], &empty)?,
         historical_plan: Some(old.pin_plan),
+        resolved_source: None,
     };
     capture.validate()?;
     Ok(capture)

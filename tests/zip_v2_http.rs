@@ -2051,10 +2051,14 @@ async fn signed_remote_route_drift_during_publication_rolls_back_versions_and_re
 }
 
 #[tokio::test]
-async fn stale_captured_remote_rules_reject_a_pending_retry_before_another_kubo_add() {
+async fn current_automatic_deny_resumes_pending_retry_with_local_publication_only() {
     let harness = rule_harness(
         KuboScript {
-            add_replies: vec![AddReply::Ok("QmArchive"), AddReply::Ok("QmShared")],
+            add_replies: vec![
+                AddReply::Ok("QmArchive"),
+                AddReply::Ok("QmShared"),
+                AddReply::Ok("QmShared"),
+            ],
             cat_bodies: HashMap::from([("QmArchive".into(), legal_single_entry_zip())]),
         },
         false,
@@ -2111,14 +2115,6 @@ async fn stale_captured_remote_rules_reject_a_pending_retry_before_another_kubo_
         pinning: changed.pinning.clone(),
     });
     let server = support::decompress::start_s3_server(state, std::sync::Arc::default()).await;
-    let add_count = harness
-        ._kubo
-        .received_requests()
-        .await
-        .unwrap()
-        .into_iter()
-        .filter(|request| request.url.path() == "/api/v0/add")
-        .count();
     let retry = support::sigv4::send_sigv4(
         reqwest::Method::PUT,
         &server.endpoint,
@@ -2140,22 +2136,68 @@ async fn stale_captured_remote_rules_reject_a_pending_retry_before_another_kubo_
         .into_iter()
         .filter(|request| request.url.path() == "/api/v0/add")
         .count();
-    assert_eq!(
-        final_count, add_count,
-        "stale policy must be rejected before any second upload; status={status}; {xml}"
-    );
+    assert_eq!(status, StatusCode::OK, "{xml}");
     let retained = store::zip::execution::read(db, &id).await.unwrap().unwrap();
+    assert_eq!(retained.state, "completed");
     assert_eq!(retained.captured_options, captured);
     assert_eq!(
-        status,
-        StatusCode::CONFLICT,
-        "{xml}; state={}; adds_before={add_count}; adds_after={final_count}",
-        retained.state
+        store::object::get_latest(db, &harness.bucket, OUTPUT)
+            .await
+            .unwrap()
+            .cid,
+        "QmShared"
+    );
+    assert!(
+        store::object::get_latest(db, &harness.bucket, SOURCE)
+            .await
+            .is_err()
+    );
+    assert_eq!(pin_lease::Entity::find().count(db).await.unwrap(), 0);
+    assert_eq!(pin_lease_target::Entity::find().count(db).await.unwrap(), 0);
+    assert_eq!(remote_pin::Entity::find().count(db).await.unwrap(), 0);
+    assert_eq!(pin_job::Entity::find().count(db).await.unwrap(), 0);
+    let usage = db.query_one(Statement::from_string(db.get_database_backend(),
+        "SELECT COALESCE(SUM(reserved_bytes),0) AS bytes, COALESCE(SUM(reserved_pins),0) AS pins FROM pin_provider_usage".to_owned(),
+    )).await.unwrap().unwrap();
+    assert_eq!(
+        (
+            usage.try_get::<i64>("", "bytes").unwrap(),
+            usage.try_get::<i64>("", "pins").unwrap()
+        ),
+        (0, 0)
+    );
+    let replay = support::sigv4::send_sigv4(
+        reqwest::Method::PUT,
+        &server.endpoint,
+        &harness.bucket,
+        SOURCE,
+        QUERY,
+        legal_single_entry_zip(),
+        remote_controls("rule-revision-retry"),
+        "test",
+    )
+    .await;
+    assert_eq!(replay.status(), StatusCode::OK);
+    assert_eq!(replay.text().await.unwrap(), xml);
+    assert_eq!(
+        harness
+            ._kubo
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| request.url.path() == "/api/v0/add")
+            .count(),
+        final_count
+    );
+    assert_eq!(
+        store::zip::execution::read(db, &id).await.unwrap().unwrap(),
+        retained
     );
 }
 
 #[tokio::test]
-async fn local_only_pending_retry_ignores_unrelated_rule_revision() {
+async fn local_only_pending_retry_reads_historical_ignored_rule_digest() {
     let archive = legal_single_entry_zip();
     let harness = start_harness_with_root_default(
         KuboScript {

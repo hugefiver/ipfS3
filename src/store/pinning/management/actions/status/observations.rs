@@ -56,7 +56,10 @@ pub(super) async fn needs_attention<C: ConnectionTrait>(
         else {
             return Ok(true);
         };
-        if job.last_error.is_some() || job.state == "running" && job.locked_until.is_none() {
+        if job.state == "error"
+            || job.last_error.is_some()
+            || job.state == "running" && job.locked_until.is_none()
+        {
             return Ok(true);
         }
         for _ in 0..2 {
@@ -208,7 +211,17 @@ pub(super) async fn needs_attention<C: ConnectionTrait>(
             else {
                 return Ok(true);
             };
-            if remote.epoch != authority.remote_epoch || remote.request_id != authority.resource_id
+            let canonical_cid_read = authority.resource_id.is_none()
+                && remote.request_id.as_deref()
+                    == crate::pinning::ipfs_rpc::canonical_cid_request_id(
+                        &authority.route,
+                        &authority.cid,
+                    )
+                    .ok()
+                    .flatten()
+                    .as_deref();
+            if remote.epoch != authority.remote_epoch
+                || remote.request_id != authority.resource_id && !canonical_cid_read
             {
                 return Ok(true);
             }
@@ -232,6 +245,13 @@ pub(super) async fn needs_attention<C: ConnectionTrait>(
             != Some(&authority.route)
             || matches!(row.effect.as_str(), "unknown" | "reported_unknown")
             || row.last_error.is_some()
+        {
+            return Ok(true);
+        }
+        if crate::store::pinning::ledger::submission::is_rpc(&authority.route)
+            && !crate::store::pinning::ledger::submission::held_evidence_known(db, &row)
+                .await
+                .map_err(|_| ManagementError::InvalidEvidence)?
         {
             return Ok(true);
         }

@@ -1,6 +1,7 @@
 //! Strict business result envelope. The original foundation receipt remains
 //! readable, but cannot masquerade as a management worker/point authority.
 use super::*;
+pub(super) mod original;
 use crate::pinning::{
     identity::ProviderRouteSnapshot,
     management::{ExactObject, Intent},
@@ -706,7 +707,6 @@ fn restore_record(
                     )?
                     .as_ref()
                     != &producer.receipt.job_ids
-                || execution::facts::identity(binding, producer, local)? != *identity
             {
                 return Err(ManagementError::Confirmation);
             }
@@ -740,9 +740,6 @@ fn restore_record(
             if ordinal == facts.0 {
                 selected = Some(operation);
             }
-        }
-        if execution::facts::identity(binding, action, facts)? != *hash {
-            return Err(ManagementError::Confirmation);
         }
         context
             .decoding

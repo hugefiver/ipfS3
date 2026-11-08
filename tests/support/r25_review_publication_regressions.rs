@@ -47,11 +47,10 @@ async fn fresh_first_intake_capture_and_exact_native_guards_are_ready_before_pub
 }
 
 #[tokio::test]
-async fn historical_null_or_current_revision_without_original_evidence_never_backfills_permission()
-{
+async fn historical_options_without_original_control_evidence_never_backfill_permission() {
     let config = pin_config();
     let rules = output_rules(&config);
-    for revision in [None, Some(rules.revision())] {
+    for revision in [None, Some("historical-rule-revision")] {
         let (_dir, first, second) = setup().await;
         let claim = r25_review_publication::historical_revision_only(
             &first,
@@ -73,7 +72,6 @@ async fn historical_null_or_current_revision_without_original_evidence_never_bac
             vec![success("one", "out/a/one", "cid-1", "one")],
         );
         request.targets = ZipTargets::Extracted;
-        request.captured_rule_revision = revision.map(str::to_owned);
         let error =
             publication::publish_zip_v2(&second, request, &rules, &config, &config.provider_limits)
                 .await
@@ -124,8 +122,8 @@ async fn historical_null_or_current_revision_without_original_evidence_never_bac
 }
 
 #[tokio::test]
-async fn original_capture_survives_config_drift_and_native_terminal_tail_rolls_back_exact_versions()
-{
+async fn current_policy_routes_and_duration_apply_without_rewriting_raw_capture_and_tail_rolls_back()
+ {
     let (_dir, first, second) = setup().await;
     let original_config = pin_config();
     for provider in &original_config.providers {
@@ -146,15 +144,17 @@ async fn original_capture_survives_config_drift_and_native_terminal_tail_rolls_b
         .unwrap();
     let capture = publication::decode_zip_capture_json(&original.captured_options).unwrap();
     assert!(capture.controls().auto_pin_outputs);
-    let later_config = ValidatedPinningConfig::from_raw(&Default::default(), |_| None).unwrap();
-    let later_rules = ValidatedZipOutputRules::compile(&[], &later_config).unwrap();
-    assert_ne!(capture.policy_revision(), later_rules.revision());
+    let mut later_config = original_config.clone();
+    later_config.policies[1].default_duration =
+        ipfs_s3_gateway::pinning::config::LeaseDuration::parse("2h").unwrap();
+    let mut current_rules = output_rule_config(&later_config);
+    current_rules[0].policy_id = Some(later_config.policies[1].identity.clone());
+    let later_rules = ValidatedZipOutputRules::compile(&current_rules, &later_config).unwrap();
     let mut request = request(
         claim.clone(),
         vec![success("one", "out/a/one", "cid-1", "one")],
     );
     request.targets = ZipTargets::Extracted;
-    request.captured_rule_revision = Some(capture.policy_revision().into());
     first.execute_unprepared("CREATE TRIGGER fail_review_publication_tail BEFORE UPDATE OF state ON zip_v2_executions WHEN NEW.state='completed' BEGIN SELECT RAISE(FAIL, 'review publication terminal tail'); END;").await.unwrap();
     let error = publication::publish_zip_v2(
         &second,
@@ -262,10 +262,10 @@ async fn original_capture_survives_config_drift_and_native_terminal_tail_rolls_b
     assert_eq!(leases[0].source, "automatic");
     assert_eq!(
         (leases[0].expires_at - leases[0].created_at).num_seconds(),
-        3600
+        7200
     );
     let targets = pin_lease_target::Entity::find().all(&first).await.unwrap();
     assert_eq!(targets.len(), 1);
-    assert_eq!(targets[0].provider, "a");
+    assert_eq!(targets[0].provider, "b");
     assert_eq!(remote_pin::Entity::find().count(&first).await.unwrap(), 1);
 }

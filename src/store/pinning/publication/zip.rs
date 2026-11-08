@@ -74,13 +74,33 @@ fn invalid() -> AppError {
 pub async fn publish_captured_zip(
     db: &DatabaseConnection,
     request: CapturedZipPublication,
+    config: &crate::pinning::config::ValidatedPinningConfig,
+    rules: &crate::pinning::zip_policy::ValidatedZipOutputRules,
+    mode: crate::config::OptionalPinControlMode,
 ) -> AppResult<Vec<(String, PublicationResult)>> {
+    let selection = request
+        .capture
+        .resolve_current_with_rules(config, rules, mode)
+        .map_err(|error| AppError::InvalidPinningRequest(error.to_string()))?;
+    publish_captured_zip_with_limits(db, request, Some(&config.provider_limits), &selection).await
+}
+
+pub(super) async fn publish_captured_zip_with_limits(
+    db: &DatabaseConnection,
+    request: CapturedZipPublication,
+    current_limits: Option<&crate::pinning::config::ProviderLimitMap>,
+    selection: &CapturedZipIntent,
+) -> AppResult<Vec<(String, PublicationResult)>> {
+    let selection = std::sync::Arc::new(selection.clone());
+    let current_limits = current_limits.cloned().map(std::sync::Arc::new);
     let request = std::sync::Arc::new(request);
-    let session = work::session(&request)?;
+    let session = work::session(&request, &selection)?;
     for retry in 0..=super::MAX_TRANSACTION_RETRIES {
         work::begin_attempt(&session)?;
         let request = request.clone();
         let session = session.clone();
+        let current_limits = current_limits.clone();
+        let selection = selection.clone();
         match db
             .transaction(|tx| {
                 Box::pin(async move {
@@ -90,6 +110,8 @@ pub async fn publish_captured_zip(
                             work: &session,
                         },
                         &request,
+                        current_limits.as_deref(),
+                        &selection,
                     )
                     .await
                 })
@@ -113,8 +135,16 @@ pub async fn publish_captured_zip(
 pub(crate) async fn publish_captured_zip_store(
     store: &crate::store::Store,
     request: CapturedZipPublication,
+    config: &crate::pinning::config::ValidatedPinningConfig,
+    rules: &crate::pinning::zip_policy::ValidatedZipOutputRules,
+    mode: crate::config::OptionalPinControlMode,
 ) -> AppResult<Vec<(String, PublicationResult)>> {
-    let session = work::session(&request)?;
+    let selection = request
+        .capture
+        .resolve_current_with_rules(config, rules, mode)
+        .map_err(|error| AppError::InvalidPinningRequest(error.to_string()))?;
+    let current_limits = &config.provider_limits;
+    let session = work::session(&request, &selection)?;
     for retry in 0..=super::MAX_TRANSACTION_RETRIES {
         work::begin_attempt(&session)?;
         let tx = store
@@ -124,7 +154,13 @@ pub(crate) async fn publish_captured_zip_store(
             .await
             .map_err(super::transaction_error_into_app)?;
         let mut owner = super::PublicationTransaction::Runtime(tx, session.clone());
-        let result = Box::pin(publish_with_reservations(&mut owner, &request)).await;
+        let result = Box::pin(publish_with_reservations(
+            &mut owner,
+            &request,
+            Some(current_limits),
+            &selection,
+        ))
+        .await;
         let result = match result {
             Ok(result) => {
                 owner.into_db().commit().await.map_err(|error| {
@@ -287,8 +323,16 @@ fn candidate_binding(object: &PublicationObject) -> ZipBoundOutput {
 pub(super) async fn publish_in_transaction(
     tx: &DatabaseTransaction,
     request: &CapturedZipPublication,
+    current_limits: &crate::pinning::config::ProviderLimitMap,
+    selection: &CapturedZipIntent,
 ) -> AppResult<Vec<(String, PublicationResult)>> {
-    publish_with_reservations(&mut super::reservations::Borrowed(tx), request).await
+    publish_with_reservations(
+        &mut super::reservations::Borrowed(tx),
+        request,
+        Some(current_limits),
+        selection,
+    )
+    .await
 }
 
 #[tracing::instrument(name = "zip_publication", skip_all, fields(batch_id = %request.batch_id, outputs = request.successes.len()))]
@@ -297,6 +341,8 @@ async fn publish_with_reservations<
 >(
     reservations: &mut R,
     request: &CapturedZipPublication,
+    current_limits: Option<&crate::pinning::config::ProviderLimitMap>,
+    selection: &CapturedZipIntent,
 ) -> AppResult<Vec<(String, PublicationResult)>> {
     let tx = reservations.db();
     validate(request)?;
@@ -304,7 +350,7 @@ async fn publish_with_reservations<
         .await?;
     let session = match reservations.runtime_work() {
         Some(session) => session.clone(),
-        None => work::session(request)?,
+        None => work::session(request, selection)?,
     };
     let work = super::super::management::records::DecodeWork::shared(&session);
     work.with(|session| session.check())
@@ -371,7 +417,7 @@ async fn publish_with_reservations<
         .map(candidate_binding)
         .collect::<Vec<_>>();
     let (candidate, _candidate_resident) = work::select(
-        &request.capture,
+        selection,
         &request.manifest,
         source_candidate.as_ref(),
         &candidates,
@@ -382,8 +428,9 @@ async fn publish_with_reservations<
     drop(candidate_inputs_resident);
     let allocation_keys = keys::AllocationKeys::load(
         tx,
-        &request.capture,
+        selection,
         &candidate,
+        current_limits,
         work,
         Some(&mut maintenance),
     )
@@ -436,7 +483,7 @@ async fn publish_with_reservations<
         .await?;
     let mut object_writes = locked_objects.plan(request, state, now, work)?;
     let (selected, _selected_resident) = work::select(
-        &request.capture,
+        selection,
         &request.manifest,
         object_writes.source.as_ref(),
         &object_writes.outputs,

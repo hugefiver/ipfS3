@@ -51,23 +51,30 @@ pub(crate) fn resolved_policy(
                 "persisted import pin decision is invalid",
             ));
         }
-        decision
-            .verify_revision(
-                state.pinning.effective_config(),
-                state.pinning.control_mode(),
+        let policy = state
+            .pinning
+            .policy()
+            .resolve_captured_publication(
+                PublicationContext {
+                    bucket: &job.bucket,
+                    key: &job.key,
+                    tags: &tags,
+                    is_decompress_zip: job.decompress_prefix.is_some(),
+                },
+                &decision,
             )
+            .map_err(AppError::from)
+            .map_err(|error| map_publication_error(error, cancellation))?;
+        state
+            .pinning
+            .effective_config()
+            .validate_durable_intents(&policy.leases)
             .map_err(|_| {
                 terminal_failure(
                     ImportFailureCode::PublicationFailed,
-                    "captured pinning configuration is unavailable",
+                    "current durable provider identity is unavailable",
                 )
             })?;
-        let policy = decision.replay_policy(tags).map_err(|_| {
-            terminal_failure(
-                ImportFailureCode::PublicationFailed,
-                "persisted import pin decision is invalid",
-            )
-        })?;
         return Ok((policy, Some(decision)));
     }
     if !matches!(PinControl::from_tags(&tags), Ok(PinControl::Absent)) {
@@ -87,6 +94,16 @@ pub(crate) fn resolved_policy(
         })
         .map_err(AppError::from)
         .map_err(|error| map_publication_error(error, cancellation))?;
+    state
+        .pinning
+        .effective_config()
+        .validate_durable_intents(&policy.leases)
+        .map_err(|_| {
+            terminal_failure(
+                ImportFailureCode::PublicationFailed,
+                "current durable provider identity is unavailable",
+            )
+        })?;
     Ok((policy, None))
 }
 

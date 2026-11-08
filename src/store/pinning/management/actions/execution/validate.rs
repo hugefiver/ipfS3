@@ -261,7 +261,6 @@ pub(super) fn action(
                 return Err(ManagementError::Confirmation);
             };
             if native::value(lease, "owner_object_id") != Some(&capture.owner_identity.object_id)
-                || native::value(lease, "policy_id") != Some(&intent.requirements.policy_revision)
                 || native::parse_time(cell(lease, "created_at")?)?.timestamp() != intent.started_at
                 || native::parse_time(cell(lease, "expires_at")?)?.timestamp() != intent.expires_at
             {
@@ -332,9 +331,14 @@ pub(super) fn action(
                 .target
                 .as_ref()
                 .ok_or(ManagementError::Confirmation)?;
+            let originals = binding.frozen_rows()?;
+            let confirmed_target = originals
+                .row("pin_lease_targets", &[&selected.id])
+                .ok_or(ManagementError::Confirmation)?;
+            // Planning tuples carry confidential-cell references, not their original values.
             if action.receipt.intent_ids != [selected.lease.id.clone()]
                 || action.targets != [selected.id.clone()]
-                || op.row(*target)? != &selected.native_tuple
+                || !op.row(*target)?.iter().eq(confirmed_target.iter())
                 || native::value(op.row(*lease)?, "id") != Some(&selected.lease.id)
                 || resources.is_empty()
             {

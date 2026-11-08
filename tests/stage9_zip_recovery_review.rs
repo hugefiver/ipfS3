@@ -112,12 +112,7 @@ async fn historical_bare_completed_mpu_status_remains_legal_but_bad_envelopes_do
     .await;
     assert_eq!(status(&h, &id, KEY).await.status, StatusCode::OK);
     let before = Effects::read(&h).await;
-    for field in [
-        "schema_version",
-        "target_prefix",
-        "rule_revision",
-        "zip_intent",
-    ] {
+    for field in ["schema_version", "target_prefix", "zip_intent"] {
         let mut broken = original.clone();
         broken[field] = if field == "schema_version" {
             2.into()
@@ -292,7 +287,7 @@ async fn pending_recovery_requires_fresh_exact_claim_and_unchanged_complete_bind
         "worker='successor-worker'",
         "input_art_cid='different-bound-artifact'",
         "input_art_size=input_art_size+1",
-        "captured_options=json_set(captured_options,'$.rule_revision','different-capture')",
+        "captured_options=json_set(captured_options,'$.zip_intent.source_decision.control_revision','different-capture')",
         "lease_until=datetime('now','-1 minute')",
     ] {
         let archive = support::decompress::legal_single_entry_zip();
@@ -448,7 +443,7 @@ async fn bound_pending_chunked_body_is_verified_to_eof_before_recovery_or_confli
 }
 
 #[tokio::test]
-async fn current_explicit_deny_rejects_bound_remote_pending_before_any_new_io() {
+async fn current_automatic_deny_resumes_bound_direct_locally_and_preserves_raw_input_guards() {
     use ipfs_s3_gateway::pinning::zip_policy::ZipRuleEffect;
     let mut fixture = safety::SafetyFixture::new(false).await;
     let saved = fixture
@@ -457,27 +452,40 @@ async fn current_explicit_deny_rejects_bound_remote_pending_before_any_new_io() 
     fixture
         .change_current_rule(ZipRuleEffect::Deny, "test-bkt", "out/")
         .await;
-    for archive in [
-        fixture.archive.clone(),
-        with_comment(fixture.archive.clone(), b"different raw ZIP"),
-    ] {
-        let before = Effects::read(&fixture.h).await;
-        let response = fixture.direct(&saved.token, "extracted", archive).await;
-        assert_eq!(response.status, StatusCode::CONFLICT, "{response:?}");
-        assert_eq!(Effects::read(&fixture.h).await, before);
-        assert_eq!(
-            execution::read(fixture.h.state.store.db(), &saved.id)
-                .await
-                .unwrap()
-                .unwrap()
-                .captured_options,
-            saved.captured_options
-        );
+    let response = fixture
+        .direct(&saved.token, "extracted", fixture.archive.clone())
+        .await;
+    assert_eq!(response.status, StatusCode::OK, "{response:?}");
+    assert_eq!(count(&fixture.h, "objects").await, 1);
+    for table in ["pin_leases", "pin_lease_targets", "remote_pins", "pin_jobs"] {
+        assert_eq!(count(&fixture.h, table).await, 0, "{table}");
     }
-    // A safety veto cannot bypass the raw body's clean EOF/trailer contract.
+    let retained = execution::read(fixture.h.state.store.db(), &saved.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(retained.state, "completed");
+    assert_eq!(retained.captured_options, saved.captured_options);
+    assert_eq!(retained.request_fingerprint, saved.request_fingerprint);
+    assert_eq!(retained.input_sha256, saved.input_sha256);
+    let after = Effects::read(&fixture.h).await;
+    assert!(
+        after
+            .quota
+            .iter()
+            .all(|(_, bytes, pins)| *bytes == 0 && *pins == 0)
+    );
+    let changed = fixture
+        .direct(
+            &saved.token,
+            "extracted",
+            with_comment(fixture.archive.clone(), b"different raw ZIP"),
+        )
+        .await;
+    assert_eq!(changed.status, StatusCode::CONFLICT, "{changed:?}");
+    assert_eq!(Effects::read(&fixture.h).await, after);
     let mut incomplete = fixture.archive.clone();
     incomplete.pop();
-    let before = Effects::read(&fixture.h).await;
     assert_eq!(
         fixture
             .direct(&saved.token, "extracted", incomplete)
@@ -485,11 +493,18 @@ async fn current_explicit_deny_rejects_bound_remote_pending_before_any_new_io() 
             .status,
         StatusCode::BAD_REQUEST
     );
-    assert_eq!(Effects::read(&fixture.h).await, before);
+    assert_eq!(Effects::read(&fixture.h).await, after);
+    assert_eq!(
+        fixture
+            .direct(&saved.token, "extracted", fixture.archive.clone())
+            .await,
+        response
+    );
+    assert_eq!(Effects::read(&fixture.h).await, after);
 }
 
 #[tokio::test]
-async fn current_explicit_deny_blocks_mpu_before_assembly_without_rewriting_capture() {
+async fn current_automatic_deny_resumes_mpu_locally_without_rewriting_capture() {
     use ipfs_s3_gateway::pinning::zip_policy::ZipRuleEffect;
     let mut fixture = safety::SafetyFixture::new(true).await;
     let (id, etag) = fixture.create_and_upload("current-safety-mpu").await;
@@ -500,21 +515,36 @@ async fn current_explicit_deny_blocks_mpu_before_assembly_without_rewriting_capt
     fixture
         .change_current_rule(ZipRuleEffect::Deny, "test-bkt", "")
         .await;
-    let before = Effects::read(&fixture.h).await;
     let response = complete(&fixture.h, &id, &etag).await;
-    assert_eq!(response.status, StatusCode::CONFLICT, "{response:?}");
-    assert_eq!(Effects::read(&fixture.h).await, before);
+    assert_eq!(response.status, StatusCode::OK, "{response:?}");
     let retained = v2_zip::read_by_upload(fixture.h.state.store.db(), &id)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(retained.captured_options, saved.captured_options);
     assert_eq!(retained.captured_config, saved.captured_config);
-    assert_eq!(retained.rule_revision, saved.rule_revision);
     assert_eq!(retained.request_fingerprint, saved.request_fingerprint);
-    assert_eq!(retained.active_upload_id, saved.active_upload_id);
-    assert_eq!(count(&fixture.h, "objects").await, 0);
-    assert_eq!(count(&fixture.h, "multipart_uploads").await, 1);
+    assert!(retained.active_upload_id.is_none());
+    assert_eq!(count(&fixture.h, "objects").await, 2);
+    assert_eq!(count(&fixture.h, "multipart_uploads").await, 0);
+    for table in ["pin_leases", "pin_lease_targets", "remote_pins", "pin_jobs"] {
+        assert_eq!(count(&fixture.h, table).await, 0, "{table}");
+    }
+    let terminal = execution::read(fixture.h.state.store.db(), &id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(terminal.state, "completed");
+    assert_eq!(terminal.captured_options, saved.captured_options);
+    let after = Effects::read(&fixture.h).await;
+    assert!(
+        after
+            .quota
+            .iter()
+            .all(|(_, bytes, pins)| *bytes == 0 && *pins == 0)
+    );
+    assert_eq!(complete(&fixture.h, &id, &etag).await, response);
+    assert_eq!(Effects::read(&fixture.h).await, after);
 }
 
 #[tokio::test]
@@ -556,7 +586,7 @@ async fn current_unrelated_deny_or_allow_changes_do_not_freeze_original_capture(
             assert_eq!(leases.len(), 1);
             assert_eq!(
                 (leases[0].expires_at - leases[0].created_at).num_seconds(),
-                3600
+                7200
             );
         }
     }
@@ -666,7 +696,10 @@ async fn persisted_mpu_decode_contradictions_are_409_but_malformed_client_stays_
             serde_json::json!("other"),
         ),
         ("/target_prefix", serde_json::json!("other/")),
-        ("/rule_revision", serde_json::json!("other")),
+        (
+            "/zip_intent/source_decision/control_revision",
+            serde_json::json!("other"),
+        ),
     ] {
         let mut tampered = original.clone();
         *tampered.pointer_mut(pointer).unwrap() = value;
@@ -925,17 +958,43 @@ async fn assert_p2_admitted_exact_outputs(mpu: bool, intersects: bool) {
     assert_eq!(count(&fixture.h, "objects").await, 0);
     assert_eq!(count(&fixture.h, "object_versions").await, 0);
     expire(&fixture.h, &saved.id).await;
-    fixture
-        .change_current_rule(
-            ZipRuleEffect::Deny,
-            "test-bkt",
-            if intersects {
+    let original = fixture.h.state.clone();
+    let mut current_zip = original.pinning.decompress_zip_config().clone();
+    current_zip
+        .pin_output_rules
+        .push(ipfs_s3_gateway::pinning::zip_policy::ZipOutputRuleConfig {
+            name: "current-narrow-deny".into(),
+            priority: 0,
+            bucket: fixture.h.bucket.clone(),
+            prefix: if intersects {
                 "out/public/"
             } else {
                 "out/private/"
-            },
+            }
+            .into(),
+            effect: ZipRuleEffect::Deny,
+            policy_id: None,
+        });
+    let pinning =
+        ipfs_s3_gateway::pinning::coordinator::PinningCoordinator::build_with_decompress_config(
+            original.pinning.effective_config().clone(),
+            Some(original.kubo.clone()),
+            original.pinning.control_mode(),
+            &current_zip,
         )
-        .await;
+        .unwrap();
+    let current = std::sync::Arc::new(ipfs_s3_gateway::state::AppState {
+        kubo: original.kubo.clone(),
+        cold_kubo: original.cold_kubo.clone(),
+        store: original.store.clone(),
+        credentials: original.credentials.clone(),
+        master_key: ipfs_s3_gateway::crypto::key::MasterKey::from_hex(&"0".repeat(64)).unwrap(),
+        pinning,
+    });
+    let current_server =
+        support::decompress::start_s3_server(current.clone(), std::sync::Arc::default()).await;
+    fixture.h.state = current;
+    fixture.h.endpoint = current_server.endpoint.clone();
     let before = Effects::read(&fixture.h).await;
     let response = if let Some((id, etag)) = &upload {
         complete(&fixture.h, id, etag).await
@@ -963,49 +1022,36 @@ async fn assert_p2_admitted_exact_outputs(mpu: bool, intersects: bool) {
     assert_eq!(remaining.input_sha256, saved.input_sha256);
     assert_eq!(remaining.input_art_cid, saved.input_art_cid);
     assert_eq!(remaining.input_art_size, saved.input_art_size);
-    if intersects {
-        assert_eq!(response.status, StatusCode::CONFLICT, "{response:?}");
-        assert_eq!(remaining.state, "admitted");
-        assert_eq!(after, before);
-    } else {
-        assert_eq!(response.status, StatusCode::OK, "{response:?}");
-        assert_eq!(remaining.state, "completed");
-        assert_eq!(count(&fixture.h, "objects").await, if mpu { 2 } else { 1 });
-        assert_eq!(
-            count(&fixture.h, "object_versions").await,
-            if mpu { 2 } else { 1 }
-        );
-        assert_eq!(
-            count(&fixture.h, "pin_leases").await,
-            if mpu { 2 } else { 1 }
-        );
-        assert_eq!(
-            count(&fixture.h, "pin_lease_targets").await,
-            if mpu { 2 } else { 1 }
-        );
-        assert_eq!(count(&fixture.h, "pin_jobs").await, if mpu { 2 } else { 1 });
-        assert_eq!(
-            count(&fixture.h, "remote_pins").await,
-            if mpu { 2 } else { 1 }
-        );
-        assert_eq!(after.quota.len(), 1);
-        assert_eq!(
-            after.quota[0].1,
-            18 + if mpu { fixture.archive.len() as i64 } else { 0 }
-        );
-        assert_eq!(after.quota[0].2, if mpu { 2 } else { 1 });
-        assert_eq!(
-            ipfs_s3_gateway::store::object::get_latest(
-                fixture.h.state.store.db(),
-                &fixture.h.bucket,
-                "out/public/file.txt"
-            )
-            .await
-            .unwrap()
-            .cid,
-            OUTPUT
-        );
+    assert_eq!(response.status, StatusCode::OK, "{response:?}");
+    assert_eq!(remaining.state, "completed");
+    assert_eq!(count(&fixture.h, "objects").await, if mpu { 2 } else { 1 });
+    assert_eq!(
+        count(&fixture.h, "object_versions").await,
+        if mpu { 2 } else { 1 }
+    );
+    let remote_count = i64::from(mpu) + i64::from(!intersects);
+    for table in ["pin_leases", "pin_lease_targets", "pin_jobs", "remote_pins"] {
+        assert_eq!(count(&fixture.h, table).await, remote_count, "{table}");
     }
+    assert_eq!(
+        after.quota.iter().map(|(_, bytes, _)| *bytes).sum::<i64>(),
+        (if intersects { 0 } else { 18 }) + if mpu { fixture.archive.len() as i64 } else { 0 }
+    );
+    assert_eq!(
+        after.quota.iter().map(|(_, _, pins)| *pins).sum::<i64>(),
+        remote_count
+    );
+    assert_eq!(
+        ipfs_s3_gateway::store::object::get_latest(
+            fixture.h.state.store.db(),
+            &fixture.h.bucket,
+            "out/public/file.txt"
+        )
+        .await
+        .unwrap()
+        .cid,
+        OUTPUT
+    );
 }
 
 #[tokio::test]
@@ -1017,10 +1063,11 @@ async fn p2_mpu_admitted_disjoint_current_deny_publishes_exact_successes_without
     assert_p2_admitted_exact_outputs(true, false).await;
 }
 #[tokio::test]
-async fn p2_direct_admitted_intersecting_current_deny_has_zero_new_io_or_publication() {
+async fn p2_direct_admitted_intersecting_current_deny_publishes_locally_without_output_pin_or_new_io()
+ {
     assert_p2_admitted_exact_outputs(false, true).await;
 }
 #[tokio::test]
-async fn p2_mpu_admitted_intersecting_current_deny_has_zero_new_io_or_publication() {
+async fn p2_mpu_admitted_intersecting_current_deny_keeps_source_pin_without_output_pin_or_new_io() {
     assert_p2_admitted_exact_outputs(true, true).await;
 }

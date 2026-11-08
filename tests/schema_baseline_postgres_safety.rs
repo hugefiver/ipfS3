@@ -1,7 +1,7 @@
 use ipfs_s3_gateway::store::{
     initialization::{self, UpgradeRequest},
-    migrations::{Historical, baseline, history},
-    pinning::management::{native, records},
+    migrations::{Historical, history},
+    pinning::management::{native, records, schema},
 };
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement, TransactionTrait};
 use sea_orm_migration::MigratorTrait;
@@ -25,7 +25,7 @@ async fn start(
                 database_scope: &scope,
                 native_identity: &identity,
                 source_version: source,
-                target_version: baseline::VERSION,
+                target_version: schema::VERSION,
             },
         )
         .await
@@ -170,6 +170,22 @@ async fn explicit_upgrade_uncertain_commit_is_not_retried() {
 
 #[tokio::test]
 #[ignore = "requires authorized isolated IPFS_S3_TEST_POSTGRES_URL"]
+async fn state_enum_migration_preserves_other_state_checks() {
+    use sea_orm_migration::{MigrationTrait, SchemaManager};
+    postgres::with_schema(|db| async move {
+        Historical::up(&db, None).await.unwrap();
+        db.execute_unprepared("ALTER TABLE pin_jobs ADD CONSTRAINT application_attempt_guard CHECK(state<>'running' OR attempts>0)").await.unwrap();
+        let tx = db.begin().await.unwrap();
+        ipfs_s3_gateway::store::migrations::m20261108_000001_current_pinning_config::Migration
+            .up(&SchemaManager::new(&tx)).await.unwrap();
+        tx.commit().await.unwrap();
+        assert!(db.execute_unprepared("INSERT INTO pin_jobs(id,operation,provider,cid,expected_remote_epoch,submit_phase,state,next_attempt_at) VALUES ('rejected','unpin','provider','cid',1,NULL,'running',CURRENT_TIMESTAMP)").await.is_err());
+        db.execute_unprepared("INSERT INTO pin_jobs(id,operation,provider,cid,expected_remote_epoch,submit_phase,state,next_attempt_at) VALUES ('terminal','unpin','provider','cid',1,NULL,'error',CURRENT_TIMESTAMP)").await.unwrap();
+    }).await;
+}
+
+#[tokio::test]
+#[ignore = "requires authorized isolated IPFS_S3_TEST_POSTGRES_URL"]
 async fn failed_original_rolls_back_only_its_unit_and_never_publishes_ready() {
     postgres::with_schema(|db| async move {
         Historical::up(&db, Some(history::prefix(history::M13).unwrap().len() as u32)).await.unwrap();
@@ -181,7 +197,7 @@ async fn failed_original_rolls_back_only_its_unit_and_never_publishes_ready() {
         let source = records::locator::source_key(&key).unwrap();
         assert!(db.query_one(Statement::from_sql_and_values(DatabaseBackend::Postgres, "SELECT 1 FROM pin_management_source_control WHERE source_key=$1", [source.into()])).await.unwrap().is_none());
         assert_eq!(db.query_one(sql("SELECT snapshot FROM pin_provider_routes WHERE provider='broken'")).await.unwrap().unwrap().try_get::<String>("", "snapshot").unwrap(), "{not valid json");
-        assert!(db.query_one(sql("SELECT 1 FROM pin_management_inline_archive WHERE archive_id='history:upgrade:m20261027_000001_schema_baseline'")).await.unwrap().is_some());
+        assert!(db.query_one(sql("SELECT 1 FROM pin_management_inline_archive WHERE archive_id='history:upgrade:m20261108_000001_current_pinning_config'")).await.unwrap().is_some());
         assert!(initialization::open(&db).await.is_err());
         pool_is_clean(&db).await;
     }).await;

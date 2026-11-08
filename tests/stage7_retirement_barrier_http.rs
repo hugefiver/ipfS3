@@ -325,6 +325,14 @@ async fn actually_dispatched_unknown_callback_is_retained_at_live_and_late_old_e
             .await
             .unwrap();
         fixture.retire().await;
+        assert!(
+            pin_provider_route::Entity::find_by_id(&claimed.model.provider)
+                .one(fixture.state.store.db())
+                .await
+                .unwrap()
+                .unwrap()
+                .retired
+        );
         if late {
             let tx = fixture.state.store.db().begin().await.unwrap();
             leases::cancel_lease(&tx, claimed.model.lease_id.as_deref().unwrap(), now)
@@ -335,19 +343,35 @@ async fn actually_dispatched_unknown_callback_is_retained_at_live_and_late_old_e
         let before = native::capture(fixture.state.store.db()).await.unwrap();
         let observation = dispatched.await.unwrap();
         assert_eq!(observation.effect, SubmitEffect::Unknown);
+        assert!(observation.resources.is_empty());
         let outcome =
             ledger::submission::record(fixture.state.store.db(), &claimed, &id, &observation, now)
                 .await
                 .unwrap();
-        assert_eq!(outcome, !late);
+        assert!(
+            !outcome,
+            "retired provider scope cannot project an old invocation"
+        );
         let saved = ledger::submission::latest(fixture.state.store.db(), &claimed.model.id)
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(saved.id, id);
+        assert_eq!(saved.provider, claimed.model.provider);
+        assert_eq!(saved.expected_cid, claimed.model.cid);
         assert_eq!(saved.outcome, "unknown");
         assert!(saved.needs_attention && saved.observed_at.is_some());
+        assert!(
+            serde_json::from_str::<Vec<serde_json::Value>>(&saved.resources)
+                .unwrap()
+                .is_empty()
+        );
         let after = native::capture(fixture.state.store.db()).await.unwrap();
         for table in [
+            "pin_jobs",
+            "pin_submit_history",
+            "pin_leases",
+            "pin_lease_targets",
             "remote_pins",
             "remote_pin_ledger",
             "pin_provider_usage",
@@ -463,7 +487,7 @@ async fn regular_import_intake_rolls_back_owned_source_and_destination_claims_on
             value: "1h".into(),
         },
     ];
-    let (_, mut decision) = fixture
+    let (_, decision) = fixture
         .state
         .pinning
         .policy()
@@ -475,12 +499,6 @@ async fn regular_import_intake_rolls_back_owned_source_and_destination_claims_on
                 is_decompress_zip: false,
             },
             DecisionOrigin::new("test", &id),
-        )
-        .unwrap();
-    decision
-        .capture_durable_revision(
-            fixture.state.pinning.effective_config(),
-            fixture.state.pinning.control_mode(),
         )
         .unwrap();
     let request = NewImportJob {

@@ -188,7 +188,7 @@ fn request(
             levels: vec![ConfirmationLevel::RemotePinned],
             min_replicas: 1,
             max_age_secs: None,
-            policy_revision: "explicit-policy".into(),
+            policy_id: Some("explicit-policy".into()),
         },
     };
     PlanRequest {
@@ -300,7 +300,6 @@ async fn snapshot_adapter_reads_real_facts_and_refuses_missing_fences_without_db
         "native capture must be plannable, with per-item evidence gaps"
     );
     let planning = planning.unwrap();
-    assert_eq!(planning.targets[0].native_tuple.len(), 8);
     assert!(planning.native_frame.is_some());
     assert!(before == contents(&db).await);
     assert!(
@@ -312,6 +311,34 @@ async fn snapshot_adapter_reads_real_facts_and_refuses_missing_fences_without_db
             .cid
             == CID
     );
+}
+
+#[tokio::test]
+async fn snapshot_adapter_recognizes_terminal_errors_without_schema_failure() {
+    let db = store::connect_database("sqlite::memory:").await.unwrap();
+    let config = config();
+    setup(&db, &config).await;
+    let identity = publish(&db, &config, "terminal-error", CID, true).await;
+    let target = pin_lease_target::Entity::find()
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    db.execute_unprepared("UPDATE pin_lease_targets SET state='error',last_error='policy unavailable'; UPDATE pin_jobs SET state='error'").await.unwrap();
+    let selected = request(identity, &config, Some(target.id));
+    let before = contents(&db).await;
+    let result = collect(&db, &config, &selected).await.unwrap();
+    assert!(result.targets[0].state == db_snapshot::StoredTargetState::Error);
+    assert!(!result.jobs.is_empty());
+    assert!(
+        result
+            .jobs
+            .iter()
+            .all(|job| job.state == db_snapshot::JobState::Error)
+    );
+    let planning = result.planning_snapshot().unwrap();
+    assert!(planning.targets[0].state == TargetState::Blocked);
+    assert!(before == contents(&db).await);
 }
 
 #[tokio::test]
@@ -450,6 +477,7 @@ async fn snapshot_adapter_formally_parses_cids_and_does_not_echo_input_or_db_err
     assert!(!error.to_string().contains("bafyinvalidnotacid"));
     assert!(before == contents(&db).await);
     let empty = store::connect_database("sqlite::memory:").await.unwrap(); // Deliberately not migrated.
+    let empty_before = contents(&empty).await;
     let error = collect(
         &empty,
         &config,
@@ -467,8 +495,10 @@ async fn snapshot_adapter_formally_parses_cids_and_does_not_echo_input_or_db_err
     .await
     .err()
     .unwrap();
-    assert_eq!(error, SnapshotError::UnsupportedEvidence);
+    assert_eq!(error, SnapshotError::DatabaseUnavailable);
     assert!(!error.to_string().contains("object_versions"));
+    assert!(!error.to_string().contains("pin_management_records"));
+    assert!(empty_before == contents(&empty).await);
 }
 
 #[tokio::test]
@@ -518,10 +548,6 @@ async fn snapshot_adapter_legacy_and_skipped_are_candidates_with_real_decision_r
         skipped.objects[0].control_revision.as_deref(),
         Some(decision.control_revision.as_str())
     );
-    assert_eq!(
-        skipped.objects[0].config_revision.as_deref(),
-        Some(decision.config_revision.as_str())
-    );
     assert!(skipped.objects[0].selection == SelectionEvidence::LegacyZipCandidate);
     assert!(skipped.targets.is_empty() && skipped.jobs.is_empty());
     assert!(skipped.applied.is_empty());
@@ -551,7 +577,6 @@ async fn snapshot_adapter_wire_request_does_not_supply_snapshot_authority_or_rec
             permitted: Some(true),
             allowed_routes: vec![selected_route.clone()],
             control_revision: Some("client-claim".into()),
-            config_revision: Some("client-claim".into()),
             decision: Some(DecisionState::None),
             evidence: SelectionEvidence::ExplicitObject,
         }],
@@ -904,10 +929,21 @@ async fn snapshot_adapter_retained_cleanup_generation_and_historical_epoch_remai
         frame.original_value("pin_resource_history", &history_key, "ledger")
             == Some(original_history)
     );
-    assert!(frame == &native_before);
+    for key in &frame.frontier {
+        let values = key.values.iter().map(String::as_str).collect::<Vec<_>>();
+        let scoped_row = frame.row(&key.table, &values).unwrap();
+        let original_row = native_before.row(&key.table, &values).unwrap();
+        assert!(scoped_row == original_row);
+        for column in scoped_row.keys() {
+            assert_eq!(
+                frame.original_value(&key.table, &values, column),
+                native_before.original_value(&key.table, &values, column),
+            );
+        }
+    }
     assert!(
-        frame
-            == &store::pinning::management::native::capture(&db)
+        native_before
+            == store::pinning::management::native::capture(&db)
                 .await
                 .unwrap()
     );
@@ -915,8 +951,7 @@ async fn snapshot_adapter_retained_cleanup_generation_and_historical_epoch_remai
 }
 
 #[tokio::test]
-async fn snapshot_adapter_provider_inventory_preserves_real_reservations_but_has_no_invented_frontier()
- {
+async fn snapshot_adapter_provider_scope_does_not_invent_inventory_or_change_reservations() {
     let db = store::connect_database("sqlite::memory:").await.unwrap();
     let config = config();
     setup(&db, &config).await;
@@ -931,21 +966,34 @@ async fn snapshot_adapter_provider_inventory_preserves_real_reservations_but_has
         items: vec![ItemRequest {
             item_id: "provider".into(),
             subject: Subject::Provider {
-                route: route(&config),
+                route: RouteIdentity::from_original(config.providers[0].route_snapshot()),
             },
             action: Action::Retire,
         }],
     };
     let before = contents(&db).await;
     let inventory = collect(&db, &config, &selected).await.unwrap();
-    assert!(inventory.objects.is_empty()); // No implicit prefix/key discovery.
-    assert_eq!(inventory.targets.len(), 1);
-    assert_eq!(inventory.leases[0].object_id, identity.object_id);
-    assert_eq!(inventory.usage[0].reserved_bytes, 10);
-    assert_eq!(inventory.usage[0].reserved_pins, 1);
+    assert!(inventory.objects.is_empty());
+    assert!(inventory.targets.is_empty() && inventory.leases.is_empty());
+    let target = pin_lease_target::Entity::find()
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    let exact = collect(
+        &db,
+        &config,
+        &request(identity.clone(), &config, Some(target.id)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(exact.leases[0].object_id, identity.object_id);
+    assert_eq!(exact.usage[0].reserved_bytes, 10);
+    assert_eq!(exact.usage[0].reserved_pins, 1);
     assert!(!inventory.routes[0].allocation_allowed);
     let native = inventory.planning_snapshot().unwrap();
     assert!(!native.inventories[0].frontier.is_empty());
+    assert!(!native.inventories[0].complete);
     assert!(native.native_frame.is_some());
     assert!(before == contents(&db).await);
 }
@@ -955,23 +1003,27 @@ async fn snapshot_adapter_inventory_budget_counts_utf8_bytes_without_returning_d
     let db = store::connect_database("sqlite::memory:").await.unwrap();
     let config = config();
     setup(&db, &config).await;
-    // Production writer, migrated schema. Fewer characters than MAX_TEXT_BYTES,
-    // more UTF-8 bytes; a character-count budget would incorrectly accept it.
+    let before_registration = contents(&db).await;
     let mut changed = config.providers[0].identity.clone();
     changed.display_name = "界".repeat(MAX_TEXT_BYTES / 2 + 1);
-    ledger::register_route(&db, &changed.allocation_key(), &changed)
-        .await
-        .unwrap();
-    let selected = PlanRequest {
-        plan_id: "provider-retire".into(),
-        items: vec![ItemRequest {
-            item_id: "provider".into(),
-            subject: Subject::Provider {
-                route: route(&config),
-            },
-            action: Action::Retire,
-        }],
-    };
+    assert!(matches!(
+        ledger::register_route(&db, &changed.allocation_key(), &changed).await,
+        Err(ipfs_s3_gateway::error::AppError::ManagementBudget)
+    ));
+    assert!(before_registration == contents(&db).await);
+
+    let identity = publish(&db, &config, "byte-budget", CID, false).await;
+    let page_limit = store::pinning::management::native::meter::PAGE_BYTES;
+    let metadata = serde_json::to_string(&"界".repeat(page_limit / 2 + 1)).unwrap();
+    assert!(metadata.chars().count() < page_limit && metadata.len() > page_limit);
+    db.execute(Statement::from_sql_and_values(
+        db.get_database_backend(),
+        "UPDATE objects SET metadata=$1 WHERE id=$2",
+        [metadata.into(), identity.object_id.clone().into()],
+    ))
+    .await
+    .unwrap();
+    let selected = request(identity, &config, None);
     let before = contents(&db).await;
     let error = collect(&db, &config, &selected).await.err().unwrap();
     assert_eq!(error, SnapshotError::LimitExceeded);

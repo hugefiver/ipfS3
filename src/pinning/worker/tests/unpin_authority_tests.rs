@@ -118,8 +118,8 @@ async fn managed_unpin_writer_parks_revoked_cleanup_without_recording_ordinary_r
         .unwrap()
         .unwrap();
     assert_eq!(
-        job.state, "running",
-        "revoked managed work needs attention, not ordinary completion"
+        job.state, "error",
+        "revoked managed work must stop automatic dispatch"
     );
     assert!(job.locked_until.is_none());
     assert!(job.last_error.is_some());

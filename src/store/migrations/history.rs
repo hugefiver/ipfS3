@@ -63,11 +63,19 @@ pub fn is_m23(versions: &[String]) -> bool {
 
 /// Layout-only predicate for immutable historical documents.
 pub fn has_final_layout(versions: &[String]) -> bool {
-    versions == [super::baseline::VERSION] || is_m23(versions)
+    versions == [super::baseline::VERSION]
+        || versions
+            == [
+                super::baseline::VERSION,
+                super::m20261108_000001_current_pinning_config::VERSION,
+            ]
+        || is_m23(versions)
 }
 
 pub fn has_stage(versions: &[String], stage: &str) -> bool {
-    versions == [super::baseline::VERSION] || versions.iter().any(|v| v == stage)
+    versions
+        .iter()
+        .any(|version| version == super::baseline::VERSION || version == stage)
 }
 
 pub fn final_checkpoint(revision: &str, catalog: &[String]) -> bool {

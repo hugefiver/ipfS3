@@ -956,7 +956,7 @@ async fn transient_source_failure_uses_a_bounded_database_clock_retry_budget() {
 }
 
 #[tokio::test]
-async fn local_only_targets_ignore_unrelated_output_rule_revision_changes() {
+async fn local_only_targets_read_historical_ignored_rule_digest() {
     let harness = start_import_harness(ImportHarnessConfig {
         poll_interval_ms: 1_000,
         ..ImportHarnessConfig::default()

@@ -61,7 +61,8 @@ auto_pin_outputs = true
 # prefix = "exports/"
 # effect = "allow"
 # policy_index = 0 # zero-based position in pinning.policies, resolved at load
-# Historical policy_id aliases are exact matches only; do not use both fields.
+# policy_id = "policy:0" is an alternative reference; do not use both fields.
+# Older policy:index:digest references resolve by index; their digest is ignored.
 # Optional per-input ZIP limits: 16 GiB raw source ZIP bytes (including ZIP
 # framing), 8 GiB decompressed total and per entry, 10,000 entries, 64 MiB
 # metadata; no overall processing deadline. The new raw-source intake boundary

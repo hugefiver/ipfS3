@@ -224,7 +224,9 @@ pub(super) async fn execute_claim(
     match outcome {
         Ok(()) | Err(RunError::Lost) => {}
         Err(RunError::Fenced) => {
-            let _ = execution::fence(state.store.db(), claim).await;
+            if let Err(error) = execution::fence(state.store.db(), claim).await {
+                tracing::warn!(%error, batch_id = %claim.batch_id, "ZIP import terminal settlement failed");
+            }
         }
         Err(RunError::DigestMismatch(measured)) => {
             // The measured digest came from this first, complete source read,
@@ -321,6 +323,29 @@ async fn execute_inner(
         || intent.v2_options().as_ref() != Some(&options)
     {
         return Err(RunError::Fenced);
+    }
+    intent
+        .resolve_current_with_rules(
+            state.pinning.effective_config(),
+            state.pinning.zip_output_rules(),
+            state.pinning.control_mode(),
+        )
+        .and_then(|resolved| resolved.validate_durable_current(state.pinning.effective_config()))
+        .map_err(|_| RunError::Fenced)?;
+    if snapshot.state == "pending" {
+        crate::store::pinning::publication::preflight_captured_zip_routes(
+            &state.store,
+            &intent,
+            state.pinning.effective_config(),
+            state.pinning.zip_output_rules(),
+            state.pinning.control_mode(),
+            None,
+        )
+        .await
+        .map_err(|error| match error {
+            AppError::InvalidPinningRequest(_) => RunError::Fenced,
+            _ => RunError::Retry,
+        })?;
     }
     let limits = state.pinning.zip_extraction_limits();
     if snapshot.state == "pending" {
@@ -606,6 +631,19 @@ async fn execute_inner(
         }
     }
     manifest.root_error = root_error;
+    crate::store::pinning::publication::preflight_captured_zip_routes(
+        &state.store,
+        &intent,
+        state.pinning.effective_config(),
+        state.pinning.zip_output_rules(),
+        state.pinning.control_mode(),
+        Some(&manifest),
+    )
+    .await
+    .map_err(|error| match error {
+        AppError::InvalidPinningRequest(_) => RunError::Fenced,
+        _ => RunError::Retry,
+    })?;
     if !import_intake::renew(db, claim, 60)
         .await
         .map_err(|_| RunError::Retry)?
@@ -661,9 +699,19 @@ async fn execute_inner(
         root_outcome: root,
         terminal_result: terminal,
     };
-    match publish_captured_zip(&state.store, request).await {
+    match publish_captured_zip(
+        &state.store,
+        request,
+        state.pinning.effective_config(),
+        state.pinning.zip_output_rules(),
+        state.pinning.control_mode(),
+    )
+    .await
+    {
         Ok(_) => Ok(()),
-        Err(AppError::StaleContentMutation) => Err(RunError::Fenced),
+        Err(AppError::StaleContentMutation | AppError::InvalidPinningRequest(_)) => {
+            Err(RunError::Fenced)
+        }
         Err(_) => {
             // An unknown DB commit outcome is not proof of rollback. The next
             // due claim reconciles the committed receipt or retries the exact

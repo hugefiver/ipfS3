@@ -86,7 +86,7 @@ pub enum SelectionEvidence {
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "super::wire::compat::ObjectSnapshot")]
 pub struct ObjectSnapshot {
     pub identity: ExactObject,
     pub logical_bytes: u64,
@@ -96,7 +96,6 @@ pub struct ObjectSnapshot {
     /// Parent's per-object, stored-byte safety decision for exact route revisions.
     pub allowed_routes: Vec<RouteIdentity>,
     pub control_revision: Option<String>,
-    pub config_revision: Option<String>,
     pub decision: Option<DecisionState>,
     pub evidence: SelectionEvidence,
 }
@@ -359,7 +358,7 @@ pub enum ProviderMode {
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "super::wire::compat::Requirements")]
 pub struct Requirements {
     pub mode: ProviderMode,
     /// Full frozen requirement set, not just currently available providers.
@@ -367,7 +366,20 @@ pub struct Requirements {
     pub levels: Vec<ConfirmationLevel>,
     pub min_replicas: u32,
     pub max_age_secs: Option<u32>,
-    pub policy_revision: String,
+    pub policy_id: Option<String>,
+}
+
+pub(crate) fn policy_reference(stored: &str) -> Option<String> {
+    let mut parts = stored.split(':');
+    if let (Some("policy"), Some(index), Some(digest), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+        && index.parse::<usize>().is_ok()
+        && digest.len() == 64
+        && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    Some(stored.to_owned())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -26,7 +26,6 @@ pub struct Intake {
     pub request_contract: String,
     pub options: ZipV2Options,
     pub captured_config: String,
-    pub rule_revision: String,
     pub content_type: Option<String>,
     pub metadata: Option<JsonValue>,
     pub tags: Vec<ObjectTag>,
@@ -45,7 +44,6 @@ pub struct Record {
     pub request_fingerprint: String,
     pub captured_options: String,
     pub captured_config: String,
-    pub rule_revision: String,
 }
 
 impl Record {
@@ -122,7 +120,6 @@ pub async fn capture_complete(
         || current.request_fingerprint != record.request_fingerprint
         || current.captured_options != record.captured_options
         || current.captured_config != record.captured_config
-        || current.rule_revision != record.rule_revision
         || current.target_prefix != record.target_prefix
     {
         return Err(conflict());
@@ -512,7 +509,6 @@ pub async fn read_by_upload<C: ConnectionTrait>(
             request_fingerprint: row.try_get("", "request_fingerprint")?,
             captured_options: row.try_get("", "captured_options")?,
             captured_config: row.try_get("", "captured_config")?,
-            rule_revision: row.try_get("", "rule_revision")?,
         })
     })
     .transpose()
@@ -628,7 +624,6 @@ async fn create_in_transaction(
 ) -> AppResult<String> {
     if (!request.options.publish_extracted && !request.options.publish_source)
         || request.options.token != request.token
-        || request.rule_revision.is_empty()
     {
         return Err(AppError::InvalidZipParameter(
             "invalid ZIP v2 upload intake".into(),
@@ -695,12 +690,12 @@ async fn create_in_transaction(
     .await?;
     let now = crate::store::database_clock::database_now(tx).await?;
     tx.execute(query(tx,
-        "INSERT INTO zip_v2_mpu_intakes (original_upload_id,active_upload_id,execution_id,owner,token,bucket,archive_key,target_prefix,request_fingerprint,captured_options,captured_config,rule_revision,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        "INSERT INTO zip_v2_mpu_intakes (original_upload_id,active_upload_id,execution_id,owner,token,bucket,archive_key,target_prefix,request_fingerprint,captured_options,captured_config,rule_revision,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
+        "INSERT INTO zip_v2_mpu_intakes (original_upload_id,active_upload_id,execution_id,owner,token,bucket,archive_key,target_prefix,request_fingerprint,captured_options,captured_config,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO zip_v2_mpu_intakes (original_upload_id,active_upload_id,execution_id,owner,token,bucket,archive_key,target_prefix,request_fingerprint,captured_options,captured_config,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
         vec![request.upload_id.clone().into(),request.upload_id.clone().into(),execution.id.into(),
              request.owner.clone().into(),request.token.clone().into(),request.bucket.clone().into(),
              request.key.clone().into(),request.target_prefix.clone().into(),request_fingerprint.into(),
-             captured_options.into(),request.captured_config.clone().into(),request.rule_revision.clone().into(),now.into()]
+             captured_options.into(),request.captured_config.clone().into(),now.into()]
     )).await?;
     Ok(request.upload_id.clone())
 }

@@ -194,16 +194,16 @@ async fn mismatch_preserves_unknown_ownership_and_never_unpins() {
 }
 
 #[tokio::test]
-async fn recursive_local_proof_is_required_for_kubo_cid_submit() {
+async fn exact_recursive_pin_add_ack_completes_kubo_cid_submit() {
     let target = MockServer::start().await;
     let source = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/v0/pin/add"))
         .and(query_param("recursive", "true"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"Pins": [CID]})))
+        .expect(1)
         .mount(&target)
         .await;
-    local(&target, CID).await;
     let p = provider(&target, &source, RpcProfile::Kubo, RpcStrategy::Cid);
     assert_eq!(
         p.submit(submit(CID)).await.unwrap().status,

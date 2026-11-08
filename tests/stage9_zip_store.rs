@@ -69,9 +69,10 @@ async fn r25_store_nonfinal_duplicate_collection_rejected_without_admitted_state
     use ipfs_s3_gateway::zip::batch::{FinalZipManifest, ManifestFile};
     use publication::{CapturedZipPublication, LegacyZipAuthority, ZipPublicationAuthority};
     let db = setup().await;
+    let config = config();
     let (request, batch, capture, guard) = prepared_with_outputs(
         &db,
-        &config(),
+        &config,
         vec![],
         vec![
             ("first".into(), object("first", "out/same.txt", "first-cid")),
@@ -118,6 +119,9 @@ async fn r25_store_nonfinal_duplicate_collection_rejected_without_admitted_state
             root_outcome: batch.root_outcome,
             terminal_result: batch.terminal_result,
         },
+        &config,
+        &output_rules(&config),
+        ipfs_s3_gateway::config::OptionalPinControlMode::Warn,
     )
     .await
     .unwrap_err();
@@ -329,7 +333,7 @@ async fn zip_settlement_manifest_drift_rolls_back_the_entire_publication() {
         .await
         .unwrap();
         let before = sqlite_publication_snapshot(&db).await;
-        let result = publish_captured(&db, request, batch, &capture, guard).await;
+        let result = publish_captured(&db, &config, request, batch, &capture, guard).await;
         assert!(
             matches!(
                 result,
@@ -343,7 +347,7 @@ async fn zip_settlement_manifest_drift_rolls_back_the_entire_publication() {
 }
 
 #[tokio::test]
-async fn r25_store_frozen_capture_does_not_recompute_current_config() {
+async fn r25_store_current_config_without_policy_publishes_without_remote_leases() {
     let db = setup().await;
     let (request, batch, capture, guard) = prepared(&db, &config(), vec![]).await;
     let changed = ValidatedPinningConfig::from_raw(&PinningConfig::default(), |_| None).unwrap();
@@ -351,7 +355,9 @@ async fn r25_store_frozen_capture_does_not_recompute_current_config() {
     publish(&db, &changed, request, batch, &capture, guard)
         .await
         .unwrap();
-    assert_eq!(pin_lease::Entity::find().count(&db).await.unwrap(), 2);
+    assert_eq!(object::Entity::find().count(&db).await.unwrap(), 3);
+    assert_eq!(pin_lease::Entity::find().count(&db).await.unwrap(), 0);
+    assert_eq!(pin_job::Entity::find().count(&db).await.unwrap(), 0);
 }
 
 #[tokio::test]
@@ -422,7 +428,8 @@ async fn r25_store_durable_mpu_capture_cannot_replace_output_ownership_guard() {
     };
     use sea_orm::{ActiveModelTrait, IntoActiveModel, Set};
     let db = setup().await;
-    let (mut request, batch, _, guard) = prepared(&db, &config(), vec![]).await;
+    let config = config();
+    let (mut request, batch, _, guard) = prepared(&db, &config, vec![]).await;
     let capture = intake_capture("batch");
     store::multipart::create_upload_with_zip_intent(
         &db,
@@ -524,9 +531,15 @@ async fn r25_store_durable_mpu_capture_cannot_replace_output_ownership_guard() {
         root_outcome: batch.root_outcome,
         terminal_result: serde_json::json!({"archive_cid": "archive-cid"}).to_string(),
     };
-    let error = publication::publish_captured_zip(&db, request.clone())
-        .await
-        .unwrap_err();
+    let error = publication::publish_captured_zip(
+        &db,
+        request.clone(),
+        &config,
+        &output_rules(&config),
+        ipfs_s3_gateway::config::OptionalPinControlMode::Warn,
+    )
+    .await
+    .unwrap_err();
     assert!(
         error
             .to_string()
@@ -545,9 +558,15 @@ async fn r25_store_durable_mpu_capture_cannot_replace_output_ownership_guard() {
         unreachable!()
     };
     authority.standard_guard = Some(guard);
-    publication::publish_captured_zip(&db, guarded)
-        .await
-        .unwrap();
+    publication::publish_captured_zip(
+        &db,
+        guarded,
+        &config,
+        &output_rules(&config),
+        ipfs_s3_gateway::config::OptionalPinControlMode::Warn,
+    )
+    .await
+    .unwrap();
     assert_eq!(object_version::Entity::find().count(&db).await.unwrap(), 3);
     assert!(store::multipart::get_upload(&db, "batch").await.is_err());
     store::zip::BatchAdmission::replay_lookup(

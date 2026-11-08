@@ -53,6 +53,7 @@ use crate::{
 pub use crate::store::pinning::management::admission::{ManagementJobReport, ManagementJobScope};
 
 mod phases;
+mod quota_waiter;
 mod unavailable;
 use phases::{CommittedObservation, PendingObservation, WorkerContinuation};
 
@@ -426,6 +427,8 @@ async fn run_worker(
         std::collections::HashMap::new();
     let provider_occupancy = ProviderOccupancy::default();
     let mut receipt_cursor = String::new();
+    let mut missing_receipt_cursor = String::new();
+    let mut quota_waiter_scan = quota_waiter::ScanState::default();
 
     loop {
         let maintenance_due = tokio::select! {
@@ -462,7 +465,15 @@ async fn run_worker(
             let recovery = tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => break,
-                result = recover_parked_receipts(&coordinator, &store, &mut receipt_cursor) => result,
+                result = async {
+                    recover_parked_receipts(&coordinator, &store, &mut receipt_cursor).await?;
+                    recover_missing_receipt_parks(
+                        &coordinator,
+                        &store,
+                        &mut missing_receipt_cursor,
+                    )
+                    .await
+                } => result,
             };
             if let Err(error) = recovery {
                 tracing::error!(error = %error, "pinning worker receipt recovery failed");
@@ -476,7 +487,16 @@ async fn run_worker(
                 let maintenance = tokio::select! {
                     biased;
                     _ = cancellation.cancelled() => break,
-                    result = coordinate_quota_waiters(&coordinator, &store, Utc::now()) => result,
+                    result = async {
+                        quota_waiter::coordinate_with_state(
+                            &coordinator,
+                            &store,
+                            Utc::now(),
+                            &mut quota_waiter_scan,
+                        )
+                        .await?;
+                        coordinate_quota_waiters(&coordinator, &store, Utc::now()).await
+                    } => result,
                 };
                 if let Err(error) = maintenance {
                     tracing::error!(error = %error, "pinning worker quota maintenance failed");
@@ -632,41 +652,137 @@ async fn recover_parked_receipts(
         coordinator.settings().claim_limit,
     )
     .await?;
-    *cursor = next.unwrap_or_default();
     for job in candidates {
-        let work = SharedDecodeBudget::default();
-        // Discovery has no authority. Transient failures leave the fact intact
-        // and the next keyset cycle (or restart) retries without a provider POST.
-        let attempt = async {
-            let context =
-                read_context_for_job_with_work(store, coordinator, &job, work.clone()).await?;
-            let tx = store.begin_runtime(DecodeWork::shared(&work)).await?;
-            job_authority::lock_runtime_source(&tx, &job, work.clone()).await?;
-            if job_authority::projection_and_source_catalog(
+        wake_parked_receipt(coordinator, store, &job).await?;
+    }
+    *cursor = next.unwrap_or_default();
+    Ok(())
+}
+
+async fn recover_missing_receipt_parks(
+    coordinator: &PinningCoordinator,
+    store: &Store,
+    cursor: &mut String,
+) -> AppResult<()> {
+    let (next, candidates) = ledger::submission::missing_receipt_park_candidates(
+        store.db(),
+        cursor,
+        coordinator.settings().claim_limit,
+    )
+    .await?;
+    for job in candidates {
+        reset_missing_receipt_job(coordinator, store, &job).await?;
+    }
+    *cursor = next.unwrap_or_default();
+    Ok(())
+}
+
+async fn reset_missing_receipt_job(
+    coordinator: &PinningCoordinator,
+    store: &Store,
+    job: &pin_job::Model,
+) -> AppResult<bool> {
+    let work = SharedDecodeBudget::default();
+    let context = read_context_for_job_with_work(store, coordinator, job, work.clone()).await?;
+    let tx = store.begin_runtime(DecodeWork::shared(&work)).await?;
+    job_authority::lock_runtime_source(&tx, job, work.clone()).await?;
+    if !current_job_policy(&tx, coordinator, job).await?
+        && !matches!(
+            job_authority::check_before_call_catalog(
                 tx.catalog(DecodeWork::shared(&work)),
-                &job,
-                context.as_ref().map(CurrentReadContext::config),
-                context.as_ref().map(|context| context.idle_timeout_millis),
-                work.clone(),
+                job,
+                work.clone()
             )
-            .await?
-            {
-                ledger::submission::wake_runtime_parked(
-                    &tx,
-                    &job.id,
-                    Utc::now(),
-                    DecodeWork::shared(&work),
-                )
-                .await?;
-            }
-            tx.commit().await
+            .await
+            .map_err(admission::work_error)?,
+            Some(JobPermit::Submit(_))
+        )
+    {
+        jobs::terminate_parked_submit(&tx, job, "current owner policy mismatch", Utc::now())
+            .await?;
+        tx.commit().await?;
+        return Ok(false);
+    }
+    if !job_authority::projection_and_source_catalog(
+        tx.catalog(DecodeWork::shared(&work)),
+        job,
+        context.as_ref().map(CurrentReadContext::config),
+        context.as_ref().map(|context| context.idle_timeout_millis),
+        work.clone(),
+    )
+    .await?
+    {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    let _lifecycle = leases::lock_worker_observation_lifecycle(&tx, job).await?;
+    let reset = ledger::submission::reset_runtime_missing_receipt(
+        &tx,
+        job,
+        Utc::now(),
+        DecodeWork::shared(&work),
+    )
+    .await;
+    match reset {
+        Ok(true) => {
+            tx.commit().await?;
+            Ok(true)
         }
-        .await;
-        if let Err(error) = attempt {
-            tracing::warn!(job_id = %job.id, error = %error, "parked RPC receipt remains pending recovery");
+        Ok(false) => {
+            tx.rollback().await?;
+            Ok(false)
+        }
+        Err(error) => {
+            tx.rollback().await?;
+            Err(error)
         }
     }
-    Ok(())
+}
+
+async fn wake_parked_receipt(
+    coordinator: &PinningCoordinator,
+    store: &Store,
+    job: &pin_job::Model,
+) -> AppResult<()> {
+    let work = SharedDecodeBudget::default();
+    let context = read_context_for_job_with_work(store, coordinator, job, work.clone()).await?;
+    let tx = store.begin_runtime(DecodeWork::shared(&work)).await?;
+    job_authority::lock_runtime_source(&tx, job, work.clone()).await?;
+    if !current_job_policy(&tx, coordinator, job).await?
+        && !matches!(
+            job_authority::check_before_call_catalog(
+                tx.catalog(DecodeWork::shared(&work)),
+                job,
+                work.clone()
+            )
+            .await
+            .map_err(admission::work_error)?,
+            Some(JobPermit::Submit(_))
+        )
+    {
+        jobs::terminate_parked_submit(&tx, job, "current owner policy mismatch", Utc::now())
+            .await?;
+        tx.commit().await?;
+        return Ok(());
+    }
+    if job_authority::projection_and_source_catalog(
+        tx.catalog(DecodeWork::shared(&work)),
+        job,
+        context.as_ref().map(CurrentReadContext::config),
+        context.as_ref().map(|context| context.idle_timeout_millis),
+        work.clone(),
+    )
+    .await?
+    {
+        ledger::submission::wake_runtime_parked(
+            &tx,
+            &job.id,
+            Utc::now(),
+            DecodeWork::shared(&work),
+        )
+        .await?;
+    }
+    tx.commit().await
 }
 
 // A completion releases capacity and can publish due failover work. Refill it
@@ -730,11 +846,21 @@ fn execute_claimed_job_with_cancellation<'a>(
     claimed: ClaimedPinJob,
     cancellation: &'a CancellationToken,
 ) -> Pin<Box<dyn Future<Output = AppResult<()>> + Send + 'a>> {
+    let terminal_claim = claimed.clone();
     let phase = phases::admission_future(store, coordinator, global, claimed, cancellation);
     Box::pin(async move {
-        phases::drive(store, coordinator, Some((global, cancellation)), phase)
-            .await
-            .map(|_| ())
+        match phases::drive(store, coordinator, Some((global, cancellation)), phase).await {
+            Ok(_) => Ok(()),
+            Err(AppError::InvalidPinningRequest(_)) => {
+                terminate_current_job(
+                    store,
+                    &terminal_claim,
+                    "current authority or policy mismatch",
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        }
     })
 }
 
@@ -745,7 +871,10 @@ async fn admit_claimed_job(
     claimed: ClaimedPinJob,
     cancellation: &CancellationToken,
 ) -> AppResult<WorkerContinuation> {
-    validate_operation_scope(&claimed.model)?;
+    if validate_operation_scope(&claimed.model).is_err() {
+        terminate_current_job(store, &claimed, "invalid persisted job scope").await?;
+        return Ok(WorkerContinuation::Done);
+    }
     let admission_work = SharedDecodeBudget::default();
     if cancellation.is_cancelled() {
         return Ok(WorkerContinuation::Done);
@@ -823,6 +952,17 @@ async fn admit_claimed_job(
         {
             return Ok(WorkerContinuation::Done);
         }
+    }
+    if matches!(claimed.model.operation.as_str(), "submit" | "poll")
+        && !current_job_policy(store.db(), coordinator, &claimed.model).await?
+        && !matches!(
+            job_authority::check_before_call_store(store, &claimed.model, admission_work.clone())
+                .await?,
+            Some(JobPermit::Submit(_))
+        )
+    {
+        terminate_current_job(store, &claimed, "current owner policy mismatch").await?;
+        return Ok(WorkerContinuation::Done);
     }
     if claimed.reclaimed {
         recover_durable_observation_coordination(
@@ -910,8 +1050,8 @@ fn operation_future<'a>(
 }
 
 /// A typed readonly/late directive never enters ordinary reconcile, failover,
-/// no-desired cleanup or target projection. Only its original opaque resource is
-/// read; missing identity is attention, never a CID-search ownership guess.
+/// no-desired cleanup or target projection. Only RPC/Cid with an exact captured
+/// route may derive its canonical reference when the original receipt had no ID.
 async fn execute_management_observation(
     store: &Store,
     coordinator: &PinningCoordinator,
@@ -927,11 +1067,22 @@ async fn execute_management_observation(
     {
         return jobs::finish_nonprojecting_job(store.db(), &claimed, true, Utc::now()).await;
     }
-    let Some(request_id) = authority.resource_id else {
-        return jobs::finish_nonprojecting_job(store.db(), &claimed, true, Utc::now()).await;
+    let canonical_fallback = authority.resource_id.is_none();
+    let request_id = match authority.resource_id.clone() {
+        Some(request_id) => request_id,
+        None => {
+            let Ok(Some(request_id)) = crate::pinning::ipfs_rpc::canonical_cid_request_id(
+                &authority.route,
+                &authority.cid,
+            ) else {
+                return jobs::finish_nonprojecting_job(store.db(), &claimed, true, Utc::now())
+                    .await;
+            };
+            request_id
+        }
     };
     let expected_request_id = request_id.clone();
-    let Some(slot) = acquire_provider_slot(
+    let Some(mut slot) = acquire_provider_slot(
         coordinator,
         store,
         &mut claimed,
@@ -943,6 +1094,8 @@ async fn execute_management_observation(
         return Ok(());
     };
     let preflight_job = claimed.model.clone();
+    slot.health_observed_by_call = true;
+    let call_runtime = slot.runtime.clone();
     let (observation, capture) = match provider_call_with_heartbeat(
         slot,
         coordinator,
@@ -955,7 +1108,11 @@ async fn execute_management_observation(
         move || async move {
             admission::managed_call_allowed_store(store, &preflight_job, ManagedCall::Observe).await
         },
-        move |provider| async move { Ok(provider.get_observed(&request_id).await) },
+        move |provider| async move {
+            let observation = provider.get_observed(&request_id).await;
+            update_provider_health(&call_runtime, &observation.result).await;
+            Ok(observation)
+        },
     )
     .await?
     {
@@ -975,11 +1132,56 @@ async fn execute_management_observation(
     if let Some(capture) = capture {
         commit_pin_fact(store, &capture, &observation, Utc::now()).await?;
     }
-    let attention = observation.result.as_ref().is_err()
+    let verified_canonical = !canonical_fallback
+        || matches!(observation.resources.as_slice(), [resource]
+            if resource.resource_type == crate::pinning::identity::RemoteResourceType::RpcPin
+                && resource.status == crate::pinning::provider::ObservedResourceStatus::RecursiveVerified
+                && resource.ownership == crate::pinning::identity::Ownership::Unknown
+                && resource.replica_evidence.is_none()
+                && resource.request_id == expected_request_id
+                && crate::pinning::provider::cids_equivalent(
+                    &resource.cid,
+                    &claimed.model.cid,
+                )
+                .ok() == Some(true));
+    let attention = !verified_canonical
+        || observation.result.as_ref().is_err()
         || !observation.result.as_ref().is_ok_and(|remote| {
             valid_remote(remote, &claimed.model.cid, Some(&expected_request_id))
-                && remote.status != RemotePinStatus::Failed
+                && remote.status == RemotePinStatus::Pinned
         });
+    if !attention {
+        for parked in ledger::submission::parked_receipt_scope_candidates(
+            store.db(),
+            &claimed.model.provider,
+            &claimed.model.cid,
+        )
+        .await?
+        {
+            if parked.state == "error" {
+                let session = SharedDecodeBudget::default();
+                let work = DecodeWork::shared(&session);
+                let tx = store.begin_runtime(work).await?;
+                match ledger::submission::settle_terminal_read(
+                    &tx,
+                    &claimed.model,
+                    &parked.id,
+                    Utc::now(),
+                    work,
+                )
+                .await
+                {
+                    Ok(_) => tx.commit().await?,
+                    Err(error) => {
+                        tx.rollback().await?;
+                        return Err(error);
+                    }
+                }
+            } else {
+                wake_parked_receipt(coordinator, store, &parked).await?;
+            }
+        }
+    }
     jobs::finish_nonprojecting_job(
         store.db(),
         &claimed,
@@ -1163,6 +1365,33 @@ fn observed_route_matches(
                 .is_some()
         },
     )
+}
+
+async fn terminate_current_job(
+    store: &Store,
+    claimed: &ClaimedPinJob,
+    safe_reason: &str,
+) -> AppResult<()> {
+    let work = SharedDecodeBudget::default();
+    let tx = store.begin_runtime(DecodeWork::shared(&work)).await?;
+    if !jobs::fence_job_claim(&tx, &claimed.model.id, claimed_lock(claimed)?).await? {
+        tx.rollback().await?;
+        return Ok(());
+    }
+    match job_authority::fence_runtime_authority(&tx, &claimed.model, work).await {
+        Ok(_) | Err(AppError::InvalidPinningRequest(_)) => {}
+        Err(error) => {
+            tx.rollback().await?;
+            return Err(error);
+        }
+    }
+    match jobs::terminate_claim(&tx, claimed, safe_reason, Utc::now()).await {
+        Ok(_) => tx.commit().await,
+        Err(error) => {
+            tx.rollback().await?;
+            Err(error)
+        }
+    }
 }
 
 async fn park_identity_if_current(
@@ -1979,6 +2208,17 @@ async fn recover_submit(
             txn.commit().await?;
             return Ok(WorkerContinuation::Done);
         }
+        if evidence.outcome == "unknown" {
+            return recover_unknown_rpc(
+                store,
+                coordinator,
+                global,
+                claimed,
+                evidence,
+                cancellation,
+            )
+            .await;
+        }
         return jobs::park_submit_store(
             store,
             &claimed,
@@ -2005,11 +2245,15 @@ async fn recover_submit(
             .is_some_and(|history| ledger::submission::is_rpc_api(&history.api))
     };
     if historical_rpc {
-        return jobs::park_submit(
-            store.db(),
+        if reset_missing_receipt_job(coordinator, store, &claimed.model).await? {
+            transition(&claimed, "recovering", "ready_zero_call_recovery", None);
+            return Ok(WorkerContinuation::Done);
+        }
+        return jobs::park_submit_store(
+            store,
             &claimed,
             "needs_attention",
-            "historical RPC invocation lacks submission evidence",
+            jobs::RPC_MISSING_RECEIPT_PARK_REASON,
             Utc::now(),
         )
         .await
@@ -2136,11 +2380,204 @@ async fn recover_submit(
     }
 }
 
+async fn recover_unknown_rpc(
+    store: &Store,
+    coordinator: &PinningCoordinator,
+    global: &Arc<Semaphore>,
+    mut claimed: ClaimedPinJob,
+    evidence: ledger::submission_entity::Model,
+    cancellation: &CancellationToken,
+) -> AppResult<WorkerContinuation> {
+    let work = SharedDecodeBudget::default();
+    if let Some(recovery) = ledger::submission::verified_rpc_recovery(
+        store.db(),
+        &evidence,
+        &claimed.model,
+        work.clone(),
+    )
+    .await?
+    {
+        let observation = recovery.observation;
+        let remote = observation
+            .result
+            .as_ref()
+            .expect("verified recovery has a pinned remote")
+            .clone();
+        return Ok(WorkerContinuation::PersistObservation(Box::new(
+            PendingObservation {
+                claimed,
+                remote,
+                origin: RemoteStatusOrigin::Adopt,
+                source: ObservationSource::RpcRecovery(recovery.sequence),
+                typed: Some(observation),
+            },
+        )));
+    }
+    let Some(request_id) = ledger::submission::unknown_recovery_request(&evidence) else {
+        return jobs::park_submit_store(
+            store,
+            &claimed,
+            "needs_attention",
+            jobs::RPC_RECOVERY_PARK_REASON,
+            Utc::now(),
+        )
+        .await
+        .map(|_| WorkerContinuation::Done);
+    };
+    let Some(mut slot) = acquire_provider_slot(
+        coordinator,
+        store,
+        &mut claimed,
+        coordinator.settings().lock_for,
+        cancellation,
+    )
+    .await?
+    else {
+        return Ok(WorkerContinuation::Done);
+    };
+    let provider_route = slot.provider.invocation_route();
+    let capture_work = SharedDecodeBudget::default();
+    let capture_tx = store
+        .begin_runtime(DecodeWork::shared(&capture_work))
+        .await?;
+    if !jobs::fence_job_claim(&capture_tx, &claimed.model.id, claimed_lock(&claimed)?).await? {
+        capture_tx.rollback().await?;
+        return Ok(WorkerContinuation::Done);
+    }
+    let capture = job_authority::InvocationCapture::capture_with_work(
+        &capture_tx,
+        &claimed.model,
+        ManagedCall::Observe,
+        DecodeWork::shared(&capture_work),
+    )
+    .await?;
+    if invocation_route_for_snapshot(&capture.route) != Some(provider_route) {
+        capture_tx.rollback().await?;
+        return jobs::park_submit_store(
+            store,
+            &claimed,
+            "needs_attention",
+            "historical RPC recovery route changed",
+            Utc::now(),
+        )
+        .await
+        .map(|_| WorkerContinuation::Done);
+    }
+    capture_tx.rollback().await?;
+    let history_tx = store.db().begin().await?;
+    let history = jobs::begin_recovery_query(&history_tx, &claimed, Utc::now()).await?;
+    history_tx.commit().await?;
+    if history.is_none() {
+        return Ok(WorkerContinuation::Done);
+    }
+    let preflight_job = claimed.model.clone();
+    let preflight_receipt = evidence.id.clone();
+    let expected_request_id = request_id.clone();
+    slot.health_observed_by_call = true;
+    let call_runtime = slot.runtime.clone();
+    let observation = match provider_call_with_heartbeat(
+        slot,
+        coordinator,
+        global,
+        store,
+        &mut claimed,
+        coordinator.settings().lock_for,
+        cancellation,
+        ManagedCall::Observe,
+        move || async move {
+            ledger::submission::recovery_read_allowed(
+                store.db(),
+                &preflight_job,
+                &preflight_receipt,
+            )
+            .await
+        },
+        move |provider| async move {
+            let observation = provider.get_observed(&expected_request_id).await;
+            update_provider_health(&call_runtime, &observation.result).await;
+            Ok(observation)
+        },
+    )
+    .await?
+    {
+        ProviderCallOutcome::Cancelled | ProviderCallOutcome::StaleClaim => {
+            return Ok(WorkerContinuation::Done);
+        }
+        ProviderCallOutcome::PreflightRejected => {
+            finish_and_reconcile(store, &claimed, Utc::now()).await?;
+            return Ok(WorkerContinuation::Done);
+        }
+        ProviderCallOutcome::Completed(Ok(observation), _) => observation,
+        ProviderCallOutcome::Completed(Err(error), _) => crate::pinning::provider::PinObservation {
+            result: Err(error),
+            resources: Vec::new(),
+        },
+    };
+    commit_pin_fact(store, &capture, &observation, Utc::now()).await?;
+    if let Some(recovery) =
+        ledger::submission::verified_rpc_recovery(store.db(), &evidence, &claimed.model, work)
+            .await?
+    {
+        let observation = recovery.observation;
+        let remote = observation
+            .result
+            .as_ref()
+            .expect("verified recovery has a pinned remote")
+            .clone();
+        return Ok(WorkerContinuation::PersistObservation(Box::new(
+            PendingObservation {
+                claimed,
+                remote,
+                origin: RemoteStatusOrigin::Adopt,
+                source: ObservationSource::RpcRecovery(recovery.sequence),
+                typed: Some(observation),
+            },
+        )));
+    }
+    let error = observation.result.err().unwrap_or_else(protocol_error);
+    retry_rpc_submit_recovery(store, coordinator, &claimed, &error)
+        .await
+        .map(|_| WorkerContinuation::Done)
+}
+
 async fn retry_submit_recovery(
     store: &Store,
     coordinator: &PinningCoordinator,
     claimed: &ClaimedPinJob,
     error: &ProviderError,
+) -> AppResult<()> {
+    retry_submit_recovery_with_reason(
+        store,
+        coordinator,
+        claimed,
+        error,
+        provider_error_label(error.class),
+    )
+    .await
+}
+
+async fn retry_rpc_submit_recovery(
+    store: &Store,
+    coordinator: &PinningCoordinator,
+    claimed: &ClaimedPinJob,
+    error: &ProviderError,
+) -> AppResult<()> {
+    retry_submit_recovery_with_reason(
+        store,
+        coordinator,
+        claimed,
+        error,
+        jobs::RPC_RECOVERY_PARK_REASON,
+    )
+    .await
+}
+
+async fn retry_submit_recovery_with_reason(
+    store: &Store,
+    coordinator: &PinningCoordinator,
+    claimed: &ClaimedPinJob,
+    error: &ProviderError,
+    redacted_error: &str,
 ) -> AppResult<()> {
     let delay = provider_retry_delay(
         &claimed.model,
@@ -2163,14 +2600,7 @@ async fn retry_submit_recovery(
         Vec::new()
     };
     jobs::record_submit_error(&txn, claimed, "unknown", &error.safe_evidence("find")).await?;
-    jobs::retry_submit_recovery(
-        txn.db(),
-        claimed,
-        now,
-        delay,
-        provider_error_label(error.class),
-    )
-    .await?;
+    jobs::retry_submit_recovery(txn.db(), claimed, now, delay, redacted_error).await?;
     txn.commit().await?;
     if !evicted.is_empty() {
         coordinate_quota_evicted_one_targets(store, coordinator, &evicted, now).await?;
@@ -2393,6 +2823,7 @@ async fn current_poll_request(store: &Store, job: &pin_job::Model) -> AppResult<
 enum ObservationSource {
     ProviderObserved,
     PersistedReplay,
+    RpcRecovery(i64),
 }
 
 async fn persist_observation_phase(
@@ -2681,21 +3112,39 @@ async fn persist_typed_observation_status_phase(
     } else {
         None
     };
-    if let Some(receipt) = rpc_receipt.as_ref()
-        && !ledger::submission::project_runtime_observation_receipt(
-            &txn,
-            claimed,
-            receipt,
-            observation_time,
-            DecodeWork::shared(&work),
-            rpc_lifecycle
-                .as_ref()
-                .expect("RPC lifecycle was acquired before its receipt fence"),
-        )
-        .await?
-    {
-        txn.rollback().await?;
-        return Ok(PersistObservationResult::StaleClaim);
+    if let Some(receipt) = rpc_receipt.as_ref() {
+        let frontier = rpc_lifecycle
+            .as_ref()
+            .expect("RPC lifecycle was acquired before its receipt fence");
+        let projectable = match source {
+            ObservationSource::RpcRecovery(sequence) => {
+                ledger::submission::project_runtime_recovery_receipt(
+                    &txn,
+                    claimed,
+                    receipt,
+                    sequence,
+                    observation_time,
+                    DecodeWork::shared(&work),
+                    frontier,
+                )
+                .await?
+            }
+            _ => {
+                ledger::submission::project_runtime_observation_receipt(
+                    &txn,
+                    claimed,
+                    receipt,
+                    observation_time,
+                    DecodeWork::shared(&work),
+                    frontier,
+                )
+                .await?
+            }
+        };
+        if !projectable {
+            txn.rollback().await?;
+            return Ok(PersistObservationResult::StaleClaim);
+        }
     }
     let live = jobs::fence_job_claim(&txn, &claimed.model.id, claimed_lock(claimed)?).await?;
     if live && rpc_receipt.is_none() {
@@ -2721,8 +3170,11 @@ async fn persist_typed_observation_status_phase(
         Some(lifecycle) => lifecycle,
         None => leases::lock_worker_observation_lifecycle(&txn, &claimed.model).await?,
     };
-    let authority =
+    let mut authority =
         job_authority::fence_runtime_authority(&txn, &claimed.model, work.clone()).await?;
+    if let ObservationSource::RpcRecovery(sequence) = source {
+        authority.bind_submission_recovery(sequence);
+    }
     if !authority
         .projection_and_source_allowed(
             source_context.as_ref().map(CurrentReadContext::config),
@@ -2768,8 +3220,10 @@ async fn persist_typed_observation_status_phase(
         observation_status = update.status;
     }
     let result = lifecycle.apply(update, &authority).await?;
-    if source == ObservationSource::ProviderObserved
-        && let RemoteStatusApplyResult::Applied { ref affected, .. } = result
+    if matches!(
+        source,
+        ObservationSource::ProviderObserved | ObservationSource::RpcRecovery(_)
+    ) && let RemoteStatusApplyResult::Applied { ref affected, .. } = result
     {
         // POST /pins may return an already existing resource. A correlated
         // request id is not exclusive creation evidence for managed cleanup.
@@ -2784,12 +3238,26 @@ async fn persist_typed_observation_status_phase(
             DecodeWork::shared(&work),
         )
         .await?;
-        ledger::submission::settle_runtime_matching(
-            &txn,
-            &claimed.model,
-            DecodeWork::shared(&work),
-        )
-        .await?;
+        match source {
+            ObservationSource::RpcRecovery(sequence) => {
+                ledger::submission::settle_runtime_recovery(
+                    &txn,
+                    &claimed.model,
+                    sequence,
+                    observation_time,
+                    DecodeWork::shared(&work),
+                )
+                .await?;
+            }
+            _ => {
+                ledger::submission::settle_runtime_matching(
+                    &txn,
+                    &claimed.model,
+                    DecodeWork::shared(&work),
+                )
+                .await?;
+            }
+        }
     }
     if !authority
         .fresh_source_allowed(
@@ -3368,16 +3836,50 @@ async fn reconcile_without_desired(
             "reconcile_wait"
         }
         NoRequestRemoteCompletion::Stale => {
-            complete_claimed_if_live(&txn, claimed, now).await?;
-            ensure_runtime_reconcile(
-                &txn,
+            if matches!(
+                leases::check_remote_epoch(
+                    &txn,
+                    &claimed.model.provider,
+                    &claimed.model.cid,
+                    claimed
+                        .model
+                        .expected_remote_epoch
+                        .expect("validated scope")
+                )
+                .await?,
+                leases::GenerationDecision::Current
+            ) && leases::has_active_error_hold(
+                &txn.catalog(DecodeWork::shared(&work)),
                 &claimed.model.provider,
                 &claimed.model.cid,
-                now,
                 DecodeWork::shared(&work),
             )
-            .await?;
-            "stale_current_reconcile"
+            .await?
+            {
+                if !jobs::terminate_claim(
+                    &txn,
+                    claimed,
+                    "active error target retains resource",
+                    now,
+                )
+                .await?
+                {
+                    txn.rollback().await?;
+                    return Ok(());
+                }
+                "held_error_target"
+            } else {
+                complete_claimed_if_live(&txn, claimed, now).await?;
+                ensure_runtime_reconcile(
+                    &txn,
+                    &claimed.model.provider,
+                    &claimed.model.cid,
+                    now,
+                    DecodeWork::shared(&work),
+                )
+                .await?;
+                "stale_current_reconcile"
+            }
         }
     };
     txn.commit().await?;
@@ -3896,28 +4398,9 @@ async fn park_exhausted_ordinary_job(
             .one(store.db())
             .await?
             .and_then(|remote| remote.request_id);
-    if claimed.model.operation == "reconcile" {
-        let current = complete_reconcile_at_expected_epoch(store, &claimed, Utc::now()).await?;
-        transition(
-            &claimed,
-            "running",
-            if current {
-                "coordination_required"
-            } else {
-                "stale_current_reconcile"
-            },
-            request_id.as_deref(),
-        );
-        return Ok(());
-    }
     if claimed.model.target_id.is_none() {
-        complete_claimed_if_live(store.db(), &claimed, Utc::now()).await?;
-        transition(
-            &claimed,
-            "running",
-            "coordination_required",
-            request_id.as_deref(),
-        );
+        terminate_current_job(store, &claimed, "worker retry budget exhausted").await?;
+        transition(&claimed, "running", "error", request_id.as_deref());
         return Ok(());
     }
 
@@ -3976,13 +4459,7 @@ async fn park_exhausted_ordinary_job(
         ExhaustedCoordinationPhase::AfterCoordination,
     )
     .await?;
-    jobs::complete_job(
-        store.db(),
-        &claimed.model.id,
-        claimed_lock(&claimed)?,
-        Utc::now(),
-    )
-    .await?;
+    terminate_current_job(store, &claimed, "worker retry budget exhausted").await?;
     #[cfg(test)]
     leases::record_worker_job_event_for_test(
         &claimed.model.provider,
@@ -5087,9 +5564,30 @@ async fn wake_provider_waiters_after_release(
     let session = SharedDecodeBudget::default();
     let work = DecodeWork::shared(&session);
     let txn = store.begin_runtime(work).await?;
-    let woken =
-        store_quota::wake_runtime_provider_waiters(&txn, provider, limits, now, work).await?;
-    txn.commit().await?;
+    let woken = store_quota::wake_runtime_provider_waiters(
+        &txn,
+        provider,
+        limits,
+        now,
+        work,
+        Some(coordinator.policy()),
+    )
+    .await;
+    let woken = match woken {
+        Ok(store_quota::WaiterWakeOutcome::Woken(woken)) => {
+            txn.commit().await?;
+            woken
+        }
+        Ok(store_quota::WaiterWakeOutcome::Invalid(candidate)) => {
+            txn.rollback().await?;
+            quota_waiter::terminate_candidate(store, &candidate, now).await?;
+            return Ok(Vec::new());
+        }
+        Err(error) => {
+            txn.rollback().await?;
+            return Err(error);
+        }
+    };
     let retry_delay = chrono_duration(coordinator.settings().interval)?;
     let txn = store.db().begin().await?;
     let requeued =
@@ -5134,8 +5632,10 @@ async fn coordinate_quota_waiters(
         }
         // A permanently closed waiter is not capacity pressure or permission to
         // evict existing references. Do not let it poison unrelated queue scans.
-        if provider_domain_closed(store, &provider).await? {
-            continue;
+        match provider_domain_closed(store, &provider).await {
+            Ok(false) => {}
+            Ok(true) | Err(AppError::InvalidPinningRequest(_)) => continue,
+            Err(error) => return Err(error),
         }
         let txn = store.db().begin().await?;
         leases::requeue_released_all_quota_targets(&txn, &provider, retry_delay, now).await?;
@@ -5145,18 +5645,29 @@ async fn coordinate_quota_waiters(
             let budget = SharedDecodeBudget::default();
             let work = DecodeWork::shared(&budget);
             let txn = store.begin_runtime(work).await?;
-            let result =
-                store_quota::wake_runtime_provider_waiters(&txn, &provider, &limits, now, work)
-                    .await
-                    .and_then(|woken| {
-                        work.with(|session| session.check())
-                            .map_err(admission::work_error)?;
-                        Ok(woken)
-                    });
+            let result = store_quota::wake_runtime_provider_waiters(
+                &txn,
+                &provider,
+                &limits,
+                now,
+                work,
+                Some(coordinator.policy()),
+            )
+            .await
+            .and_then(|woken| {
+                work.with(|session| session.check())
+                    .map_err(admission::work_error)?;
+                Ok(woken)
+            });
             match result {
-                Ok(woken) => {
+                Ok(store_quota::WaiterWakeOutcome::Woken(woken)) => {
                     txn.commit().await?;
                     woken
+                }
+                Ok(store_quota::WaiterWakeOutcome::Invalid(candidate)) => {
+                    txn.rollback().await?;
+                    quota_waiter::terminate_candidate(store, &candidate, now).await?;
+                    continue;
                 }
                 Err(error) => {
                     txn.rollback().await?;
@@ -5178,8 +5689,20 @@ async fn coordinate_quota_waiters(
         let session = SharedDecodeBudget::default();
         let txn = store.begin_runtime(DecodeWork::shared(&session)).await?;
         let evicted =
-            store_quota::evict_runtime_provider_waiter(&txn, &provider, &limits, now).await?;
-        txn.commit().await?;
+            match store_quota::evict_runtime_provider_waiter(&txn, &provider, &limits, now).await {
+                Ok(evicted) => {
+                    txn.commit().await?;
+                    evicted
+                }
+                Err(AppError::InvalidPinningRequest(_)) => {
+                    txn.rollback().await?;
+                    continue;
+                }
+                Err(error) => {
+                    txn.rollback().await?;
+                    return Err(error);
+                }
+            };
         coordinate_quota_evicted_one_targets(store, coordinator, &evicted, now).await?;
     }
     #[cfg(test)]
@@ -5253,11 +5776,31 @@ async fn coordinate_quota_evicted_one_targets(
         else {
             continue;
         };
-        let Some(providers) =
-            ordered_target_failover(store, coordinator, &lease, &target.cid, &target.provider)
-                .await?
-        else {
-            continue;
+        let providers = match ordered_target_failover(
+            store,
+            coordinator,
+            &lease,
+            &target.cid,
+            &target.provider,
+        )
+        .await
+        {
+            Ok(Some(providers)) => providers,
+            Ok(None) | Err(AppError::InvalidPinningRequest(_)) => {
+                if let Some(row) = pin_lease_target::Entity::find_by_id(&target.target_id)
+                    .one(store.db())
+                    .await?
+                {
+                    quota_waiter::terminate_candidate(
+                        store,
+                        &store_quota::QuotaWaiterCandidate { lease, target: row },
+                        now,
+                    )
+                    .await?;
+                }
+                continue;
+            }
+            Err(error) => return Err(error),
         };
         let session = SharedDecodeBudget::default();
         let work = DecodeWork::shared(&session);
@@ -5277,6 +5820,120 @@ async fn coordinate_quota_evicted_one_targets(
     Ok(())
 }
 
+async fn current_candidate_route(
+    store: &Store,
+    coordinator: &PinningCoordinator,
+    provider: &str,
+    cid: &str,
+) -> AppResult<bool> {
+    let Some(identity) = coordinator.provider_identity(provider) else {
+        return Ok(false);
+    };
+    let Some(registered) = pin_provider_route::Entity::find_by_id(provider)
+        .one(store.db())
+        .await?
+    else {
+        return Ok(false);
+    };
+    let Ok(route) = serde_json::from_str::<crate::pinning::identity::ProviderRouteSnapshot>(
+        &registered.snapshot,
+    ) else {
+        return Ok(false);
+    };
+    if registered.retired || !identity.route_snapshot().execution_compatible(&route) {
+        return Ok(false);
+    }
+    if remote_pin::Entity::find_by_id((provider.to_owned(), cid.to_owned()))
+        .one(store.db())
+        .await?
+        .is_some()
+    {
+        match store_quota::assert_reusable_route(store.db(), provider, cid).await {
+            Ok(()) => {}
+            Err(AppError::InvalidPinningRequest(_)) => return Ok(false),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(true)
+}
+
+async fn current_job_policy<C: ConnectionTrait>(
+    db: &C,
+    coordinator: &PinningCoordinator,
+    job: &pin_job::Model,
+) -> AppResult<bool> {
+    let (Some(lease_id), Some(target_id), Some(generation)) = (
+        job.lease_id.as_deref(),
+        job.target_id.as_deref(),
+        job.expected_generation,
+    ) else {
+        return Ok(false);
+    };
+    let Some(lease) = pin_lease::Entity::find_by_id(lease_id).one(db).await? else {
+        return Ok(false);
+    };
+    let Some(target) = pin_lease_target::Entity::find_by_id(target_id)
+        .one(db)
+        .await?
+    else {
+        return Ok(false);
+    };
+    if lease.generation != generation
+        || lease.state != "active"
+        || target.lease_id != lease.id
+        || target.provider != job.provider
+        || target.cid != job.cid
+        || !matches!(
+            target.state.as_str(),
+            "waiting" | "submitted" | "pinned" | "degraded"
+        )
+    {
+        return Ok(false);
+    }
+    Ok(current_lease_intent(db, coordinator, &lease)
+        .await?
+        .is_some_and(|intent| {
+            intent.providers.contains(&job.provider)
+                && coordinator
+                    .provider_limits()
+                    .get(&job.provider)
+                    .is_some_and(|limits| limits.enabled)
+        }))
+}
+
+async fn current_lease_intent<C: ConnectionTrait>(
+    db: &C,
+    coordinator: &PinningCoordinator,
+    lease: &pin_lease::Model,
+) -> AppResult<Option<crate::pinning::policy::LeaseIntent>> {
+    let Some(owner) = object::Entity::find_by_id(&lease.owner_object_id)
+        .one(db)
+        .await?
+    else {
+        return Ok(None);
+    };
+    if lease.content_mode == "decompressed"
+        && !coordinator
+            .policy()
+            .matching_policy(&owner.bucket, &owner.key)
+            .is_some_and(|policy| policy.allow_decompressed)
+    {
+        return Ok(None);
+    }
+    let source = match lease.source.as_str() {
+        "automatic" => crate::pinning::policy::LeaseSource::Automatic,
+        "manual" => crate::pinning::policy::LeaseSource::Manual,
+        _ => return Ok(None),
+    };
+    let intent = coordinator
+        .policy()
+        .resolve_lease_policy(&owner.bucket, &owner.key, source);
+    Ok(intent.filter(|intent| match intent.provider_mode {
+        ProviderMode::One => lease.provider_mode == "one",
+        ProviderMode::All => lease.provider_mode == "all",
+    }))
+}
+
 async fn ordered_target_failover(
     store: &Store,
     coordinator: &PinningCoordinator,
@@ -5284,31 +5941,45 @@ async fn ordered_target_failover(
     cid: &str,
     failed: &str,
 ) -> AppResult<Option<Vec<String>>> {
-    let frozen = {
-        let work = SharedDecodeBudget::default();
-        let tx = store.begin_runtime(DecodeWork::shared(&work)).await?;
-        let result =
-            crate::store::pinning::management::actions::points::failover_candidates_runtime(
-                &tx,
-                &lease.id,
-                cid,
-                failed,
-                DecodeWork::shared(&work),
-            )
-            .await;
-        tx.rollback().await?;
-        result
-    }
-    .map_err(|_| {
-        AppError::InvalidPinningRequest("exact management fallback point needs attention".into())
-    })?;
-    let Some(frozen) = frozen else {
-        return Ok(coordinator
-            .ordered_failover_providers(&lease.policy_id, failed)
-            .await);
+    current_target_failover(store, coordinator, lease, cid, failed, false).await
+}
+
+async fn current_target_failover(
+    store: &Store,
+    coordinator: &PinningCoordinator,
+    lease: &pin_lease::Model,
+    cid: &str,
+    failed: &str,
+    unallocated_waiter: bool,
+) -> AppResult<Option<Vec<String>>> {
+    let Some(intent) = current_lease_intent(store.db(), coordinator, lease).await? else {
+        return Ok(None);
     };
+    let Some(index) = intent
+        .providers
+        .iter()
+        .position(|provider| provider == failed)
+    else {
+        return Ok(None);
+    };
+    if !coordinator
+        .provider_limits()
+        .get(failed)
+        .is_some_and(|limits| limits.enabled)
+        || !current_candidate_route(store, coordinator, failed, cid).await?
+    {
+        return Ok(None);
+    }
     let mut eligible = vec![failed.to_owned()];
-    for provider in frozen.into_iter().skip(1) {
+    for provider in intent
+        .providers
+        .into_iter()
+        .skip(if unallocated_waiter { 0 } else { index + 1 })
+        .filter(|provider| provider != failed)
+    {
+        if !current_candidate_route(store, coordinator, &provider, cid).await? {
+            continue;
+        }
         if coordinator
             .provider_limits()
             .get(&provider)
@@ -5523,6 +6194,8 @@ mod tests {
     mod heartbeat_transaction_tests;
     mod missing_runtime_tests;
     mod postgres_tests;
+    mod quota_waiter_tests;
+    mod terminal_tests;
     mod unpin_authority_tests;
 
     use std::{
@@ -5553,7 +6226,9 @@ mod tests {
         },
         store::{
             Store,
-            entities::{pin_job, pin_lease, pin_lease_target, pin_provider_usage, remote_pin},
+            entities::{
+                object, pin_job, pin_lease, pin_lease_target, pin_provider_usage, remote_pin,
+            },
             pinning::{jobs, leases},
         },
     };
@@ -5689,7 +6364,7 @@ mod tests {
     impl ScriptProvider {
         fn new(scripts: impl IntoIterator<Item = Script>) -> Arc<Self> {
             Arc::new(Self {
-                route: ("psa", "cid"),
+                route: ("noop", "cid"),
                 scripts: Mutex::new(scripts.into_iter().collect()),
                 submits: AtomicUsize::new(0),
                 gets: AtomicUsize::new(0),
@@ -6024,7 +6699,7 @@ mod tests {
             "INSERT INTO pin_leases \
              (id, owner_object_id, source, policy_id, provider_mode, content_mode, created_at, \
               last_touched_at, expires_at, generation, state) \
-             VALUES ('lease-1', 'object-1', 'test', 'policy', 'all', 'full', \
+             VALUES ('lease-1', 'object-1', 'automatic', 'policy', 'all', 'full', \
                      '{created}', '{created}', '{expires}', 1, 'active')"
         ))
         .await
@@ -6103,7 +6778,16 @@ mod tests {
                     requests_per_second: None,
                 },
             ],
-            policies: Vec::new(),
+            policies: vec![crate::config::PolicyConfig {
+                bucket: "bucket".to_owned(),
+                prefix: String::new(),
+                trigger: "always".to_owned(),
+                provider_mode: "all".to_owned(),
+                providers: vec!["noop".to_owned(), "fast".to_owned(), "third".to_owned()],
+                default_duration: "1h".to_owned(),
+                max_duration: "1h".to_owned(),
+                allow_decompressed: false,
+            }],
         };
         let validated = ValidatedPinningConfig::from_raw(&raw, |_| None).unwrap();
         let mut coordinator = PinningCoordinator::build(validated).unwrap();
@@ -6141,7 +6825,7 @@ mod tests {
                  INSERT INTO pin_leases \
                  (id, owner_object_id, source, policy_id, provider_mode, content_mode, created_at, \
                   last_touched_at, expires_at, generation, state) \
-                 VALUES ('{lease_id}', 'object-1', 'exhausted-test', 'policy', 'one', 'full', '{}', \
+                 VALUES ('{lease_id}', 'object-1', 'manual', 'policy', 'one', 'full', '{}', \
                          '{}', '{}', 1, 'active'); \
                  INSERT INTO pin_lease_targets \
                  (id, lease_id, cid, logical_size, provider, state, created_at, last_touched_at) \
@@ -6169,6 +6853,7 @@ mod tests {
             ))
             .await
             .unwrap();
+        fixture.prepare_one_fixture().await;
         let job = pin_job::Entity::find()
             .filter(pin_job::Column::Cid.eq(cid))
             .filter(pin_job::Column::Operation.eq("poll"))
@@ -6285,7 +6970,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .state,
-            "done"
+            "error"
         );
         assert_eq!(fixture.provider.gets.load(Ordering::SeqCst), 0);
     }
@@ -6353,12 +7038,138 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .state,
-            "done"
+            "error"
         );
         assert_eq!(fixture.provider.gets.load(Ordering::SeqCst), 0);
     }
 
     impl Fixture {
+        async fn prepare_one_fixture(&mut self) {
+            use crate::store::entities::object;
+            use sea_orm::Set;
+            if !self
+                .coordinator
+                .effective_config()
+                .policies
+                .iter()
+                .any(|policy| policy.prefix == "one/")
+            {
+                PinningCoordinator::configure_policy_providers_for_test(
+                    &mut self.coordinator,
+                    "policy",
+                    &["noop", "fast"],
+                );
+            }
+            let db = self.store.db();
+            for lease in pin_lease::Entity::find()
+                .filter(pin_lease::Column::ProviderMode.eq("one"))
+                .all(db)
+                .await
+                .unwrap()
+            {
+                let owner = object::Entity::find_by_id(&lease.owner_object_id)
+                    .one(db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if !owner.key.starts_with("one/") {
+                    let target = pin_lease_target::Entity::find()
+                        .filter(pin_lease_target::Column::LeaseId.eq(&lease.id))
+                        .one(db)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let owner_id = format!("object-one-{}", lease.id);
+                    let mut copy: object::ActiveModel = owner.into();
+                    copy.id = Set(owner_id.clone());
+                    copy.key = Set(format!("one/{}", lease.id));
+                    copy.cid = Set(target.cid.clone());
+                    copy.etag = Set(target.cid);
+                    copy.size = Set(target.logical_size);
+                    object::Entity::insert(copy).exec(db).await.unwrap();
+                    pin_lease::Entity::update_many()
+                        .col_expr(
+                            pin_lease::Column::OwnerObjectId,
+                            sea_orm::sea_query::Expr::value(owner_id),
+                        )
+                        .col_expr(
+                            pin_lease::Column::Source,
+                            sea_orm::sea_query::Expr::value(if lease.source == "manual" {
+                                "manual"
+                            } else {
+                                "automatic"
+                            }),
+                        )
+                        .filter(pin_lease::Column::Id.eq(&lease.id))
+                        .exec(db)
+                        .await
+                        .unwrap();
+                }
+            }
+            self.register_fixture_routes().await;
+        }
+
+        async fn register_fixture_routes(&self) {
+            use crate::store::{entities::pin_invocation_route, pinning::ledger};
+            let db = self.store.db();
+            self.coordinator
+                .register_identities(&self.store)
+                .await
+                .unwrap();
+            for remote in remote_pin::Entity::find().all(db).await.unwrap() {
+                if self
+                    .coordinator
+                    .provider_identity(&remote.provider)
+                    .is_none()
+                {
+                    continue;
+                }
+                if ledger::get(db, &remote.provider, &remote.cid)
+                    .await
+                    .unwrap()
+                    .is_some()
+                {
+                    continue;
+                }
+                ledger::capture_reservation(db, &remote.provider, &remote.cid)
+                    .await
+                    .unwrap();
+                if remote.request_id.is_some() {
+                    let status = match remote.status.as_str() {
+                        "pinned" => RemotePinStatus::Pinned,
+                        "failed" => RemotePinStatus::Failed,
+                        "pinning" => RemotePinStatus::Pinning,
+                        _ => RemotePinStatus::Queued,
+                    };
+                    ledger::observe(
+                        db,
+                        &remote.provider,
+                        &remote.cid,
+                        status,
+                        ledger::Ownership::ApplicationCreated,
+                        Utc::now(),
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+            for job in pin_job::Entity::find().all(db).await.unwrap() {
+                if self.coordinator.provider_identity(&job.provider).is_none() {
+                    continue;
+                }
+                if pin_invocation_route::Entity::find_by_id(&job.id)
+                    .one(db)
+                    .await
+                    .unwrap()
+                    .is_none()
+                {
+                    ledger::capture_invocation(db, &job.id, &job.provider, &job.cid)
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+
         async fn seed_quota_candidate(
             &self,
             cid: &str,
@@ -6370,10 +7181,11 @@ mod tests {
             self.store
                 .db()
                 .execute_unprepared(&format!(
-                    "INSERT INTO pin_leases \
+                    "INSERT INTO objects(id,bucket,key,cid,size,etag) VALUES('object-{suffix}','bucket','{suffix}','{cid}',100,'{cid}'); \
+                     INSERT INTO pin_leases \
                      (id, owner_object_id, source, policy_id, provider_mode, content_mode, \
                       created_at, last_touched_at, expires_at, generation, state) \
-                     VALUES ('lease-{suffix}', 'object-1', 'quota-{suffix}', 'policy', 'all', \
+                     VALUES ('lease-{suffix}', 'object-{suffix}', 'automatic', 'policy', 'all', \
                              'full', '{touched}', '{touched}', '{expires}', 1, 'active'); \
                      INSERT INTO pin_lease_targets \
                      (id, lease_id, cid, logical_size, provider, state, created_at, last_touched_at) \
@@ -6387,6 +7199,7 @@ mod tests {
                 ))
                 .await
                 .unwrap();
+            self.register_fixture_routes().await;
         }
 
         async fn seed_quota_waiter(&self, cid: &str, suffix: &str, logical_size: i64) {
@@ -6396,10 +7209,11 @@ mod tests {
             self.store
                 .db()
                 .execute_unprepared(&format!(
-                    "INSERT INTO pin_leases \
+                    "INSERT INTO objects(id,bucket,key,cid,size,etag) VALUES('object-{suffix}','bucket','{suffix}','{cid}',100,'{cid}'); \
+                     INSERT INTO pin_leases \
                      (id, owner_object_id, source, policy_id, provider_mode, content_mode, \
                       created_at, last_touched_at, expires_at, generation, state) \
-                     VALUES ('lease-{suffix}', 'object-1', 'quota-{suffix}', 'policy', 'all', \
+                     VALUES ('lease-{suffix}', 'object-{suffix}', 'automatic', 'policy', 'all', \
                              'full', '{created}', '{created}', '{expires}', 1, 'active'); \
                      INSERT INTO pin_lease_targets \
                      (id, lease_id, cid, logical_size, provider, state, created_at, last_touched_at) \
@@ -6408,6 +7222,7 @@ mod tests {
                 ))
                 .await
                 .unwrap();
+            self.register_fixture_routes().await;
         }
 
         async fn enqueue_submit(&self) {
@@ -6419,7 +7234,7 @@ mod tests {
             .unwrap();
             // Modern fixture: tests may simulate a crash by writing calling
             // directly. Supply that simulated call's explicit historical route.
-            self.store.db().execute_unprepared("INSERT INTO pin_submit_history (job_id,api,strategy,effect,state,submit_calls,recovery_queries,started_at) SELECT id,'psa','cid','unknown','active',0,0,created_at FROM pin_jobs WHERE operation='submit' ON CONFLICT(job_id) DO NOTHING").await.unwrap();
+            self.store.db().execute_unprepared("INSERT INTO pin_submit_history (job_id,api,strategy,effect,state,submit_calls,recovery_queries,started_at) SELECT id,'noop','cid','unknown','active',0,0,created_at FROM pin_jobs WHERE operation='submit' ON CONFLICT(job_id) DO NOTHING").await.unwrap();
         }
 
         async fn enqueue_poll(&self, request_id: &str) {
@@ -6516,10 +7331,11 @@ mod tests {
             self.store
                 .db()
                 .execute_unprepared(&format!(
-                    "INSERT INTO pin_leases \
+                    "INSERT INTO objects (id,bucket,key,cid,size,etag) VALUES ('object-{suffix}','bucket','{suffix}','{cid}',100,'{cid}'); \
+                     INSERT INTO pin_leases \
                      (id, owner_object_id, source, policy_id, provider_mode, content_mode, \
                       created_at, last_touched_at, expires_at, generation, state) \
-                     VALUES ('{lease_id}', 'object-1', '{suffix}', 'policy', 'all', 'full', \
+                     VALUES ('{lease_id}', 'object-{suffix}', 'automatic', 'policy', 'all', 'full', \
                              '{created}', '{created}', '{expires}', 1, 'active'); \
                      INSERT INTO pin_lease_targets \
                      (id, lease_id, cid, logical_size, provider, state, created_at, last_touched_at) \
@@ -6532,6 +7348,7 @@ mod tests {
                 ))
                 .await
                 .unwrap();
+            self.register_fixture_routes().await;
             let jobs::NewPinJob::Target(job) =
                 jobs::poll_job(provider, &cid, &lease_id, &target_id, 1, &request_id, due)
             else {
@@ -7014,7 +7831,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_provider_ordinary_jobs_retry_then_park_without_releasing_quota() {
+    async fn missing_provider_ordinary_jobs_error_without_releasing_quota_or_retrying() {
         let fixture = fixture([]).await;
         fixture.enqueue_poll("missing-provider-request").await;
         jobs::enqueue_job(
@@ -7031,45 +7848,7 @@ mod tests {
         .unwrap();
         let missing = PinningCoordinator::disabled_for_test();
 
-        for expected_attempt in 1..=8 {
-            let due = pin_job::Entity::find()
-                .filter(pin_job::Column::State.eq("pending"))
-                .order_by_desc(pin_job::Column::NextAttemptAt)
-                .one(fixture.store.db())
-                .await
-                .unwrap()
-                .expect("ordinary missing-provider work must remain durable")
-                .next_attempt_at;
-            let claimed =
-                jobs::claim_due_jobs(fixture.store.db(), due, chrono::Duration::seconds(30), 3)
-                    .await
-                    .unwrap();
-            assert_eq!(claimed.len(), 3);
-            for job in claimed {
-                super::execute_claimed_job(
-                    &fixture.store,
-                    &missing,
-                    &Arc::new(Semaphore::new(2)),
-                    job,
-                )
-                .await
-                .unwrap();
-            }
-            let rows = pin_job::Entity::find()
-                .filter(pin_job::Column::Operation.is_in(["poll", "unpin", "reconcile"]))
-                .all(fixture.store.db())
-                .await
-                .unwrap();
-            assert_eq!(rows.len(), 3);
-            for row in rows {
-                assert_eq!(row.state, "pending");
-                assert_eq!(row.attempts, expected_attempt);
-                assert_eq!(row.locked_until, None);
-                assert!(row.next_attempt_at > row.updated_at);
-            }
-        }
-
-        let final_due = pin_job::Entity::find()
+        let due = pin_job::Entity::find()
             .filter(pin_job::Column::State.eq("pending"))
             .order_by_desc(pin_job::Column::NextAttemptAt)
             .one(fixture.store.db())
@@ -7077,27 +7856,45 @@ mod tests {
             .unwrap()
             .unwrap()
             .next_attempt_at;
-        let claimed = jobs::claim_due_jobs(
-            fixture.store.db(),
-            final_due,
-            chrono::Duration::seconds(30),
-            3,
-        )
-        .await
-        .unwrap();
+        let claimed =
+            jobs::claim_due_jobs(fixture.store.db(), due, chrono::Duration::seconds(30), 3)
+                .await
+                .unwrap();
+        assert_eq!(claimed.len(), 3);
         for job in claimed {
             super::execute_claimed_job(&fixture.store, &missing, &Arc::new(Semaphore::new(2)), job)
                 .await
                 .unwrap();
         }
+        let rows = pin_job::Entity::find()
+            .filter(pin_job::Column::Operation.is_in(["poll", "unpin", "reconcile"]))
+            .all(fixture.store.db())
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        for row in rows {
+            assert_eq!(row.state, "error");
+            assert_eq!(row.attempts, 0);
+            assert_eq!(row.locked_until, None);
+        }
         assert_eq!(
-            pin_job::Entity::find()
-                .filter(pin_job::Column::Operation.is_in(["poll", "unpin", "reconcile"]))
-                .filter(pin_job::Column::State.eq("done"))
-                .count(fixture.store.db())
+            pin_lease_target::Entity::find_by_id("target-1".to_owned())
+                .one(fixture.store.db())
                 .await
-                .unwrap(),
-            3
+                .unwrap()
+                .unwrap()
+                .state,
+            "error"
+        );
+        let later = Utc::now() + chrono::Duration::days(30);
+        super::coordinate_quota_waiters(&fixture.coordinator, &fixture.store, later)
+            .await
+            .unwrap();
+        assert!(
+            jobs::claim_due_jobs(fixture.store.db(), later, chrono::Duration::seconds(30), 10)
+                .await
+                .unwrap()
+                .is_empty()
         );
         let usage = pin_provider_usage::Entity::find_by_id("noop".to_owned())
             .one(fixture.store.db())
@@ -7238,87 +8035,18 @@ mod tests {
             settings.shutdown_grace = std::time::Duration::from_millis(30);
         });
         let db = fixture.store.db().clone();
-        tokio::time::pause();
-        let clock_keepalive = PausedClockHold::start().await;
         let handle = missing.start(Store::new(db.clone()), CancellationToken::new());
-        tokio::task::yield_now().await;
-        tokio::time::advance(std::time::Duration::from_millis(1)).await;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let (deadline_release, deadline_receiver) = std::sync::mpsc::channel::<()>();
-        let mut deadline_wait = tokio::task::spawn_blocking(move || {
-            let _ = deadline_receiver
-                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
-        });
         let mut completed = handle.completed.clone();
-        loop {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "missing-provider worker did not durably park ordinary work"
-            );
-            if *completed.borrow_and_update() < 3 {
-                tokio::select! {
-                    result = completed.changed() => result.expect("worker completion channel closed"),
-                    _ = &mut deadline_wait => {},
-                }
-                continue;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while *completed.borrow_and_update() < 3 {
+                completed
+                    .changed()
+                    .await
+                    .expect("worker completion channel closed");
             }
-            let rows = pin_job::Entity::find()
-                .filter(pin_job::Column::Operation.is_in(["poll", "unpin", "reconcile"]))
-                .all(&db)
-                .await
-                .unwrap();
-            if rows.len() == 3 && rows.iter().all(|row| row.state == "done") {
-                break;
-            }
-            assert_eq!(rows.len(), 3);
-            for row in &rows {
-                match row.state.as_str() {
-                    "pending" => assert!((1..=2).contains(&row.attempts), "{row:?}"),
-                    "running" => {
-                        assert!((0..=2).contains(&row.attempts), "{row:?}");
-                        assert!(row.locked_until.is_some());
-                    }
-                    "done" => assert_eq!(row.attempts, 2),
-                    state => panic!("unexpected missing-provider job state: {state}"),
-                }
-            }
-            // A persisted running row can outlive its execution. Wait for a
-            // completion or its wall-clock lease expiry before driving a tick.
-            if let Some(until) = rows
-                .iter()
-                .filter(|row| row.state == "running")
-                .filter_map(|row| row.locked_until)
-                .max()
-            {
-                let remaining = (until - Utc::now()).to_std().unwrap_or_default();
-                if let Some(result) = before_wall_deadline(
-                    (std::time::Instant::now() + remaining).min(deadline),
-                    completed.changed(),
-                )
-                .await
-                {
-                    result.expect("worker completion channel closed");
-                    continue;
-                }
-            } else {
-                let due = rows
-                    .iter()
-                    .filter(|row| row.state == "pending")
-                    .map(|row| row.next_attempt_at)
-                    .max()
-                    .unwrap();
-                while Utc::now() < due {
-                    assert!(std::time::Instant::now() < deadline);
-                    tokio::task::yield_now().await;
-                }
-            }
-            tokio::time::advance(std::time::Duration::from_millis(5)).await;
-            tokio::task::yield_now().await;
-        }
-        drop(deadline_release);
-        deadline_wait.await.unwrap();
-        clock_keepalive.finish().await;
-        tokio::time::resume();
+        })
+        .await
+        .expect("missing-provider worker did not durably terminate ordinary work");
         handle.shutdown(std::time::Duration::from_millis(50)).await;
 
         let rows = pin_job::Entity::find()
@@ -7328,10 +8056,20 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 3);
         for row in rows {
-            assert_eq!(row.state, "done");
-            assert_eq!(row.attempts, 2);
+            assert_eq!(row.state, "error");
+            assert_eq!(row.attempts, 0);
             assert_eq!(row.locked_until, None);
         }
+        let later = Utc::now() + chrono::Duration::days(30);
+        super::coordinate_quota_waiters(&fixture.coordinator, &Store::new(db.clone()), later)
+            .await
+            .unwrap();
+        assert!(
+            jobs::claim_due_jobs(&db, later, chrono::Duration::seconds(30), 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         let usage = pin_provider_usage::Entity::find_by_id("noop".to_owned())
             .one(&db)
             .await
@@ -7343,7 +8081,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_provider_ambiguous_submit_keeps_stable_recovery_then_finds_on_restore() {
+    async fn missing_provider_ambiguous_submit_is_terminal_even_after_provider_restore() {
         let fixture = fixture([Script::Find(Ok(vec![remote(
             "accepted-before-provider-removal",
             RemotePinStatus::Queued,
@@ -7412,14 +8150,14 @@ mod tests {
                     .await
                     .unwrap()
                     .unwrap();
-                if row.state == "pending" && row.attempts == 1 {
+                if row.state == "error" {
                     break;
                 }
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("missing-provider worker did not schedule Submit recovery");
+        .expect("missing-provider worker did not durably terminate Submit recovery");
         missing_handle
             .shutdown(std::time::Duration::from_millis(30))
             .await;
@@ -7429,10 +8167,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(waiting.state, "pending");
+        assert_eq!(waiting.state, "error");
         assert_eq!(waiting.submit_phase.as_deref(), Some("recovering"));
-        assert_eq!(waiting.attempts, 1);
-        assert!(waiting.next_attempt_at >= waiting.updated_at + chrono::Duration::seconds(300));
+        assert_eq!(waiting.attempts, 0);
+        assert_eq!(waiting.locked_until, None);
         let usage = pin_provider_usage::Entity::find_by_id("noop".to_owned())
             .one(fixture.store.db())
             .await
@@ -7440,37 +8178,42 @@ mod tests {
             .unwrap();
         assert_eq!((usage.reserved_bytes, usage.reserved_pins), (100, 1));
 
-        let restored = jobs::claim_due_jobs(
-            fixture.store.db(),
-            waiting.next_attempt_at,
-            chrono::Duration::seconds(30),
-            1,
-        )
-        .await
-        .unwrap()
-        .pop()
-        .unwrap();
-        assert_eq!(restored.model.id, stable_id);
-        super::execute_claimed_job(
-            &fixture.store,
-            &fixture.coordinator,
-            &Arc::new(Semaphore::new(2)),
-            restored,
-        )
-        .await
-        .unwrap();
-        assert_eq!(fixture.provider.finds.load(Ordering::SeqCst), 1);
-        assert_eq!(fixture.provider.submits.load(Ordering::SeqCst), 0);
+        let later = Utc::now() + chrono::Duration::days(30);
+        super::coordinate_quota_waiters(&fixture.coordinator, &fixture.store, later)
+            .await
+            .unwrap();
+        assert!(
+            super::claim_ready_jobs(
+                &fixture.coordinator,
+                &fixture.store,
+                &CancellationToken::new(),
+                &super::ProviderOccupancy::default(),
+                &Default::default(),
+                later,
+                10,
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
         assert_eq!(
-            remote_pin::Entity::find_by_id(("noop".to_owned(), "bafy-worker".to_owned()))
+            pin_job::Entity::find_by_id(stable_id)
                 .one(fixture.store.db())
                 .await
                 .unwrap()
-                .unwrap()
-                .request_id
-                .as_deref(),
-            Some("accepted-before-provider-removal")
+                .unwrap(),
+            waiting
         );
+        assert_eq!(fixture.provider.finds.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.provider.submits.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.provider.unpins.load(Ordering::SeqCst), 0);
+        let remote = remote_pin::Entity::find_by_id(("noop".to_owned(), "bafy-worker".to_owned()))
+            .one(fixture.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(remote.request_id, None);
+        assert_eq!(remote.status, "reserved");
     }
 
     #[tokio::test]
@@ -7656,8 +8399,18 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(row.state, "running");
+        assert_eq!(row.state, "error");
         assert_eq!(row.locked_until, None);
+        let later = Utc::now() + chrono::Duration::days(30);
+        super::coordinate_quota_waiters(&fixture.coordinator, &fixture.store, later)
+            .await
+            .unwrap();
+        assert!(
+            jobs::claim_due_jobs(fixture.store.db(), later, chrono::Duration::seconds(30), 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(fixture.provider.finds.load(Ordering::SeqCst), 0);
         assert_eq!(fixture.provider.submits.load(Ordering::SeqCst), 0);
         let usage = pin_provider_usage::Entity::find_by_id("noop")
@@ -7670,7 +8423,7 @@ mod tests {
             !jobs::resume_rejected_submit_after_repair(
                 fixture.store.db(),
                 &row.id,
-                "psa",
+                "noop",
                 "cid",
                 Utc::now()
             )
@@ -7680,7 +8433,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stage1_auth_rejection_can_resume_only_after_explicit_same_route_repair() {
+    async fn stage1_auth_rejection_remains_terminal_after_explicit_same_route_repair() {
         let fixture = fixture([
             Script::Submit(Err(provider_error(
                 crate::pinning::provider::ProviderErrorClass::Authentication,
@@ -7692,6 +8445,26 @@ mod tests {
         fixture.enqueue_submit().await;
         fixture.run_one_due().await;
         let id = "submit:noop:bafy-worker:target-1:g1";
+        let rejected = pin_job::Entity::find_by_id(id)
+            .one(fixture.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rejected.state, "error");
+        assert_eq!(rejected.locked_until, None);
+        let history = jobs::submission_history(fixture.store.db(), id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                history.api.as_str(),
+                history.strategy.as_str(),
+                history.effect.as_str(),
+                history.state.as_str()
+            ),
+            ("noop", "cid", "not_created", "blocked")
+        );
         assert!(
             !jobs::resume_rejected_submit_after_repair(
                 fixture.store.db(),
@@ -7704,17 +8477,16 @@ mod tests {
             .unwrap()
         );
         assert!(
-            jobs::resume_rejected_submit_after_repair(
+            !jobs::resume_rejected_submit_after_repair(
                 fixture.store.db(),
                 id,
-                "psa",
+                "noop",
                 "cid",
                 Utc::now()
             )
             .await
             .unwrap()
         );
-        // A repaired configuration starts a new runtime with Healthy health.
         *fixture
             .coordinator
             .provider_runtime("noop")
@@ -7722,16 +8494,33 @@ mod tests {
             .health
             .write()
             .await = super::ProviderHealth::Healthy;
-        fixture.run_one_due().await;
-        assert_eq!(fixture.provider.submits.load(Ordering::SeqCst), 2);
+        let later = Utc::now() + chrono::Duration::days(30);
+        super::coordinate_quota_waiters(&fixture.coordinator, &fixture.store, later)
+            .await
+            .unwrap();
+        assert!(
+            jobs::claim_due_jobs(fixture.store.db(), later, chrono::Duration::seconds(30), 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(fixture.provider.submits.load(Ordering::SeqCst), 1);
         assert_eq!(fixture.provider.finds.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            pin_job::Entity::find_by_id(id)
+                .one(fixture.store.db())
+                .await
+                .unwrap()
+                .unwrap(),
+            rejected
+        );
         assert_eq!(
             jobs::submission_history(fixture.store.db(), id)
                 .await
                 .unwrap()
                 .unwrap()
                 .state,
-            "settled"
+            "blocked"
         );
     }
 
@@ -8450,6 +9239,23 @@ mod tests {
             fixture.enqueue_submit().await;
             fixture.store.db().execute_unprepared("UPDATE pin_jobs SET submit_phase='recovering'; UPDATE pin_submit_history SET recovery_queries=8").await.unwrap();
             fixture.run_one_due().await;
+            let history =
+                jobs::submission_history(fixture.store.db(), "submit:noop:bafy-worker:target-1:g1")
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(history.submit_calls, 0);
+            assert_eq!(history.recovery_queries, 8);
+            assert_eq!(history.effect, "unknown");
+            assert!(
+                !super::ledger::submission::has_resource_debt(
+                    fixture.store.db(),
+                    "noop",
+                    "bafy-worker"
+                )
+                .await
+                .unwrap()
+            );
             if expire {
                 fixture
                     .store
@@ -8515,16 +9321,34 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(reconcile.state, "running");
+            assert_eq!(reconcile.state, "done");
             assert_eq!(reconcile.locked_until, None);
+            let submit = pin_job::Entity::find()
+                .filter(pin_job::Column::Operation.eq("submit"))
+                .one(fixture.store.db())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(submit.state, "error");
+            assert_eq!(submit.locked_until, None);
             assert_eq!(fixture.provider.submits.load(Ordering::SeqCst), 0);
             assert_eq!(fixture.provider.finds.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.provider.gets.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.provider.unpins.load(Ordering::SeqCst), 0);
             let usage = pin_provider_usage::Entity::find_by_id("noop")
                 .one(fixture.store.db())
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!((usage.reserved_bytes, usage.reserved_pins), (100, 1));
+            assert_eq!((usage.reserved_bytes, usage.reserved_pins), (0, 0));
+            let remote =
+                remote_pin::Entity::find_by_id(("noop".to_owned(), "bafy-worker".to_owned()))
+                    .one(fixture.store.db())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(remote.status, "absent");
+            assert_eq!(remote.request_id, None);
         }
     }
 
@@ -8757,7 +9581,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(ambiguous_row.state, "running");
+        assert_eq!(ambiguous_row.state, "error");
         assert_eq!(ambiguous_row.locked_until, None);
         assert_eq!(ambiguous_row.submit_phase.as_deref(), Some("recovering"));
         assert_eq!(ambiguous_row.attempts, 7);
@@ -8779,23 +9603,23 @@ mod tests {
             .unwrap();
         assert_eq!((usage.reserved_bytes, usage.reserved_pins), (100, 1));
 
-        assert!(
-            jobs::claim_due_jobs(
-                fixture.store.db(),
-                Utc::now() + chrono::Duration::days(30),
-                chrono::Duration::seconds(30),
-                10
-            )
+        let later = Utc::now() + chrono::Duration::days(30);
+        super::coordinate_quota_waiters(&fixture.coordinator, &fixture.store, later)
             .await
-            .unwrap()
-            .is_empty()
+            .unwrap();
+        assert!(
+            jobs::claim_due_jobs(fixture.store.db(), later, chrono::Duration::seconds(30), 10)
+                .await
+                .unwrap()
+                .is_empty()
         );
         let converged = pin_job::Entity::find_by_id(ambiguous_row.id)
             .one(fixture.store.db())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(converged.state, "running");
+        assert_eq!(converged.state, "error");
+        assert_eq!(converged.locked_until, None);
         assert_eq!(converged.attempts, 7);
         assert_eq!(fixture.provider.submits.load(Ordering::SeqCst), 0);
         assert_eq!(fixture.provider.finds.load(Ordering::SeqCst), 8);
@@ -8826,7 +9650,7 @@ mod tests {
                 "INSERT INTO pin_leases \
                  (id, owner_object_id, source, policy_id, provider_mode, content_mode, created_at, \
                   last_touched_at, expires_at, generation, state) \
-                 VALUES ('lease-handoff', 'object-1', 'copy', 'policy', 'all', 'full', \
+                 VALUES ('lease-handoff', 'object-1', 'manual', 'policy', 'all', 'full', \
                          '{created}', '{created}', '{expires}', 1, 'active'); \
                  INSERT INTO pin_lease_targets \
                  (id, lease_id, cid, logical_size, provider, state, created_at, last_touched_at) \
@@ -8906,7 +9730,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reclaimed_submit_finds_before_stale_target_and_releases_only_via_reconcile() {
+    async fn reclaimed_cancelled_zero_dispatch_submit_errors_and_releases_only_via_reconcile() {
         let fixture = fixture([Script::Find(Ok(Vec::new()))]).await;
         fixture.enqueue_submit().await;
         let past = Utc::now() - chrono::Duration::seconds(60);
@@ -8920,12 +9744,37 @@ mod tests {
             ))
             .await
             .unwrap();
+        fixture.register_fixture_routes().await;
         leases::cancel_lease(fixture.store.db(), "lease-1", Utc::now())
             .await
             .unwrap();
 
         fixture.run_claim_at(Utc::now()).await;
-        assert_eq!(fixture.provider.finds.load(Ordering::SeqCst), 1);
+        let submit = pin_job::Entity::find()
+            .filter(pin_job::Column::Operation.eq("submit"))
+            .one(fixture.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(submit.state, "error");
+        assert_eq!(submit.locked_until, None);
+        let history = jobs::submission_history(fixture.store.db(), &submit.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(history.submit_calls, 0);
+        assert_eq!(history.recovery_queries, 0);
+        assert_eq!(history.effect, "unknown");
+        assert!(
+            !super::ledger::submission::has_resource_debt(
+                fixture.store.db(),
+                "noop",
+                "bafy-worker"
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(fixture.provider.finds.load(Ordering::SeqCst), 0);
         assert_eq!(fixture.provider.submits.load(Ordering::SeqCst), 0);
         let usage = pin_provider_usage::Entity::find_by_id("noop".to_owned())
             .one(fixture.store.db())
@@ -8935,6 +9784,19 @@ mod tests {
         assert_eq!((usage.reserved_bytes, usage.reserved_pins), (100, 1));
 
         fixture.run_one_due().await;
+        let reconcile = pin_job::Entity::find()
+            .filter(pin_job::Column::Operation.eq("reconcile"))
+            .one(fixture.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reconcile.state, "pending");
+        let held = pin_provider_usage::Entity::find_by_id("noop")
+            .one(fixture.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((held.reserved_bytes, held.reserved_pins), (100, 1));
         fixture.run_one_due().await;
         let usage = pin_provider_usage::Entity::find_by_id("noop".to_owned())
             .one(fixture.store.db())
@@ -8950,6 +9812,24 @@ mod tests {
                 .unwrap()
                 .status,
             "absent"
+        );
+        assert_eq!(fixture.provider.finds.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.provider.submits.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.provider.unpins.load(Ordering::SeqCst), 0);
+        let later = Utc::now() + chrono::Duration::days(30);
+        assert!(
+            jobs::claim_due_jobs(fixture.store.db(), later, chrono::Duration::seconds(30), 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            pin_job::Entity::find_by_id(submit.id.clone())
+                .one(fixture.store.db())
+                .await
+                .unwrap()
+                .unwrap(),
+            submit
         );
     }
 
@@ -9253,6 +10133,7 @@ mod tests {
             .await
             .unwrap();
         fixture.enqueue_poll("sticky-request").await;
+        fixture.prepare_one_fixture().await;
 
         fixture.run_one_due().await;
 
@@ -9382,7 +10263,7 @@ mod tests {
                  INSERT INTO pin_leases \
                  (id, owner_object_id, source, policy_id, provider_mode, content_mode, created_at, \
                   last_touched_at, expires_at, generation, state) \
-                 VALUES ('{lease_id}', 'object-1', 'order-test', 'policy', 'one', 'full', '{}', \
+                 VALUES ('{lease_id}', 'object-1', 'manual', 'policy', 'one', 'full', '{}', \
                          '{}', '{}', 1, 'active'); \
                  INSERT INTO pin_lease_targets \
                  (id, lease_id, cid, logical_size, provider, state, created_at, last_touched_at) \
@@ -9410,6 +10291,7 @@ mod tests {
         )
         .await
         .unwrap();
+        fixture.prepare_one_fixture().await;
         *leases::test_gates::LIFECYCLE_ORDER_RECORDER.lock().await =
             Some(leases::test_gates::LifecycleOrderRecorder {
                 owner_ids: BTreeSet::new(),
@@ -9511,7 +10393,7 @@ mod tests {
     #[tokio::test]
     async fn coordination_pinned_replacement_convergence_splits_canonical_lock_phases() {
         let _order_guard = leases::test_gates::LIFECYCLE_ORDER_TEST_LOCK.lock().await;
-        let fixture = fixture([Script::Get(Ok(remote_for(
+        let mut fixture = fixture([Script::Get(Ok(remote_for(
             "bafy-order-pinned",
             "replacement-pinned",
             RemotePinStatus::Pinned,
@@ -9538,7 +10420,7 @@ mod tests {
                  INSERT INTO pin_leases \
                  (id, owner_object_id, source, policy_id, provider_mode, content_mode, created_at, \
                   last_touched_at, expires_at, generation, state) \
-                 VALUES ('{lease_id}', 'object-1', 'order-pinned', 'policy', 'one', 'full', '{}', \
+                 VALUES ('{lease_id}', 'object-1', 'manual', 'policy', 'one', 'full', '{}', \
                          '{}', '{}', 2, 'active'); \
                  INSERT INTO pin_lease_targets \
                  (id, lease_id, cid, logical_size, provider, state, created_at, last_touched_at) \
@@ -9571,6 +10453,7 @@ mod tests {
         )
         .await
         .unwrap();
+        fixture.prepare_one_fixture().await;
         *leases::test_gates::LIFECYCLE_ORDER_RECORDER.lock().await =
             Some(leases::test_gates::LifecycleOrderRecorder {
                 owner_ids: BTreeSet::new(),
@@ -9697,6 +10580,7 @@ mod tests {
             .await
             .unwrap();
         fixture.enqueue_submit().await;
+        fixture.prepare_one_fixture().await;
         let initial_job = pin_job::Entity::find()
             .filter(pin_job::Column::State.eq("pending"))
             .filter(pin_job::Column::Operation.eq("submit"))
@@ -9881,18 +10765,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn coordination_pinned_fallback_reconciles_ambiguous_old_submit_then_not_found_delete() {
-        let mut fixture = fixture([
-            Script::Find(Ok(vec![remote(
-                "accepted-old-request",
-                RemotePinStatus::Pinned,
-            )])),
-            Script::Unpin(Err(provider_error(
-                crate::pinning::provider::ProviderErrorClass::NotFound,
-                "provider NotFound body must stay redacted",
-            ))),
-        ])
-        .await;
+    async fn coordination_pinned_fallback_keeps_terminal_source_debt_without_automatic_cleanup() {
+        let mut fixture = fixture([]).await;
         PinningCoordinator::configure_policy_providers_for_test(
             &mut fixture.coordinator,
             "policy",
@@ -9905,18 +10779,37 @@ mod tests {
             .db()
             .execute_unprepared(&format!(
                 "UPDATE pin_leases SET provider_mode='one' WHERE id='lease-1'; \
-                 UPDATE pin_jobs SET state='running', submit_phase='calling', locked_until='{}' \
-                 WHERE operation='submit'; \
                  INSERT INTO remote_pins \
                  (provider, cid, cid_size, request_id, status, epoch, failure_attempts, last_touched_at) \
                  VALUES ('fast', 'bafy-worker', 100, 'shared-fast', 'pinned', 7, 0, '{}'); \
                  INSERT INTO pin_provider_usage (provider, reserved_bytes, reserved_pins) \
                  VALUES ('fast', 100, 1)",
-                (now + chrono::Duration::seconds(60)).to_rfc3339(),
                 now.to_rfc3339()
             ))
             .await
             .unwrap();
+        fixture.prepare_one_fixture().await;
+        let dispatched = jobs::claim_due_jobs(
+            fixture.store.db(),
+            Utc::now(),
+            chrono::Duration::seconds(30),
+            1,
+        )
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+        let tx = fixture.store.db().begin().await.unwrap();
+        assert_eq!(
+            jobs::prepare_submit_call(&tx, &dispatched, Utc::now())
+                .await
+                .unwrap(),
+            jobs::SubmitCallDecision::ReadyToCall
+        );
+        jobs::record_submit_invocation(&tx, &dispatched, "noop", "cid", Utc::now())
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
         let ambiguous_submit = pin_job::Entity::find()
             .filter(pin_job::Column::Operation.eq("submit"))
             .one(fixture.store.db())
@@ -9996,7 +10889,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(waiting_reconcile.state, "pending");
-        assert!(waiting_reconcile.next_attempt_at >= now + chrono::Duration::seconds(60));
+        assert!(waiting_reconcile.next_attempt_at >= ambiguous_submit.locked_until.unwrap());
         assert_eq!(fixture.provider.finds.load(Ordering::SeqCst), 0);
         assert_eq!(fixture.provider.unpins.load(Ordering::SeqCst), 0);
 
@@ -10011,47 +10904,42 @@ mod tests {
             .await
             .unwrap();
         fixture.run_claim_at(Utc::now()).await;
-        assert_eq!(fixture.provider.finds.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.provider.finds.load(Ordering::SeqCst), 0);
         assert_eq!(fixture.provider.submits.load(Ordering::SeqCst), 0);
         assert_eq!(
-            remote_pin::Entity::find_by_id(("noop".to_owned(), "bafy-worker".to_owned()))
+            pin_job::Entity::find_by_id(&ambiguous_submit.id)
                 .one(fixture.store.db())
                 .await
                 .unwrap()
                 .unwrap()
-                .request_id
-                .as_deref(),
-            Some("accepted-old-request")
+                .state,
+            "error"
         );
-
+        let history = jobs::submission_history(fixture.store.db(), &ambiguous_submit.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(history.submit_calls, 1);
+        assert_eq!(history.effect, "unknown");
         fixture.run_one_due().await;
-        let unpin = pin_job::Entity::find_by_id("unpin:noop:bafy-worker:e2".to_owned())
+        let held = remote_pin::Entity::find_by_id(("noop".to_owned(), "bafy-worker".to_owned()))
             .one(fixture.store.db())
             .await
             .unwrap()
-            .expect("remote Reconcile must create an exact current-epoch Unpin");
-        assert_eq!(unpin.state, "pending");
-        assert!(unpin.lease_id.is_none());
-        assert!(unpin.target_id.is_none());
-        assert!(unpin.expected_generation.is_none());
-        fixture.run_one_due().await;
-
-        let converged =
-            remote_pin::Entity::find_by_id(("noop".to_owned(), "bafy-worker".to_owned()))
-                .one(fixture.store.db())
-                .await
-                .unwrap()
-                .unwrap();
-        assert_eq!(converged.status, "absent");
-        assert_eq!(converged.epoch, 2);
-        assert_eq!(converged.request_id, None);
-        assert_eq!(fixture.provider.unpins.load(Ordering::SeqCst), 1);
+            .unwrap();
+        assert_eq!(held.status, "reserved");
+        assert_eq!(held.epoch, 2);
+        assert_eq!(held.request_id, None);
+        assert_eq!(fixture.provider.unpins.load(Ordering::SeqCst), 0);
         let old_usage = pin_provider_usage::Entity::find_by_id("noop".to_owned())
             .one(fixture.store.db())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!((old_usage.reserved_bytes, old_usage.reserved_pins), (0, 0));
+        assert_eq!(
+            (old_usage.reserved_bytes, old_usage.reserved_pins),
+            (100, 1)
+        );
         let fallback_usage = pin_provider_usage::Entity::find_by_id("fast".to_owned())
             .one(fixture.store.db())
             .await
@@ -10062,13 +10950,13 @@ mod tests {
             (100, 1)
         );
         assert_eq!(
-            pin_job::Entity::find_by_id("unpin:noop:bafy-worker:e2".to_owned())
+            pin_job::Entity::find_by_id("reconcile:noop:bafy-worker:e2".to_owned())
                 .one(fixture.store.db())
                 .await
                 .unwrap()
                 .unwrap()
                 .state,
-            "done"
+            "error"
         );
     }
 
@@ -10112,6 +11000,7 @@ mod tests {
             .await
             .unwrap();
         fixture.enqueue_poll("shared-failed-request").await;
+        fixture.prepare_one_fixture().await;
 
         fixture.run_one_due().await;
 
@@ -10520,7 +11409,7 @@ mod tests {
                 "INSERT INTO pin_leases \
                  (id, owner_object_id, source, policy_id, provider_mode, content_mode, created_at, \
                   last_touched_at, expires_at, generation, state) \
-                 VALUES ('lease-all-copy', 'object-1', 'copy', 'policy', 'all', 'full', '{}', '{}', \
+                 VALUES ('lease-all-copy', 'object-1', 'manual', 'policy', 'all', 'full', '{}', '{}', \
                          '{}', 1, 'active'); \
                  INSERT INTO pin_lease_targets \
                  (id, lease_id, cid, logical_size, provider, state, created_at, last_touched_at) \
@@ -10857,10 +11746,11 @@ mod tests {
             .store
             .db()
             .execute_unprepared(&format!(
-                "INSERT INTO pin_leases \
+                "INSERT INTO objects(id,bucket,key,cid,size,etag) VALUES('object-3','bucket','third-copy','bafy-worker',100,'bafy-worker'); \
+                 INSERT INTO pin_leases \
                  (id, owner_object_id, source, policy_id, provider_mode, content_mode, created_at, \
                   last_touched_at, expires_at, generation, state) \
-                 VALUES ('lease-3', 'object-1', 'copy', 'policy', 'all', 'full', \
+                 VALUES ('lease-3', 'object-3', 'automatic', 'policy', 'all', 'full', \
                          '{later}', '{later}', '{expires}', 1, 'active'); \
                  INSERT INTO pin_lease_targets \
                  (id, lease_id, cid, logical_size, provider, state, created_at, last_touched_at) \
@@ -11598,12 +12488,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_provider_jobs_get_bounded_progress_without_squeezing_a_healthy_provider() {
+    async fn unknown_provider_jobs_become_terminal_without_squeezing_a_healthy_provider() {
         let mut fixture = fixture([]).await;
         let fast = Arc::new(GetBlocker {
             entered: Notify::new(),
             release: Notify::new(),
-            result: remote("request-known-fair", RemotePinStatus::Queued),
+            result: remote_for(
+                "bafy-known-fair",
+                "request-known-fair",
+                RemotePinStatus::Pinned,
+            ),
         });
         let fast_provider = ScriptProvider::new([Script::BlockGet(fast.clone())]);
         PinningCoordinator::replace_provider_for_test(
@@ -11625,7 +12519,7 @@ mod tests {
                 due + chrono::Duration::milliseconds(1),
             )
             .await;
-        fixture
+        let healthy_id = fixture
             .seed_poll_for(
                 "fast",
                 "known-fair",
@@ -11657,26 +12551,52 @@ mod tests {
                         .all(&db)
                         .await
                         .unwrap();
-                    if jobs.len() == 2
-                        && jobs.iter().any(|job| job.attempts == 1)
-                        && jobs.iter().all(|job| job.state == "pending")
-                    {
+                    if jobs.len() == 2 && jobs.iter().all(|job| job.state == "error") {
                         break jobs;
+                    }
+                    tokio::time::advance(std::time::Duration::from_millis(10)).await;
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
+        .await
+        .expect("unknown-provider work did not terminate while healthy work was in flight");
+        tokio::time::resume();
+        fast.release.notify_one();
+        before_wall_deadline(
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+            async {
+                loop {
+                    let healthy = pin_job::Entity::find_by_id(healthy_id.clone())
+                        .one(&db)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    if healthy.state == "done" {
+                        break;
                     }
                     tokio::task::yield_now().await;
                 }
             },
         )
         .await
-        .expect("unknown-provider work did not durably retry while healthy work was in flight");
-        tokio::time::resume();
-        fast.release.notify_one();
+        .expect("healthy provider did not complete alongside terminal unknown-provider work");
         handle.shutdown(std::time::Duration::from_secs(1)).await;
 
         assert_eq!(unknown.len(), 2);
-        assert!(unknown.iter().any(|job| job.attempts == 1));
-        assert!(unknown.iter().all(|job| job.attempts <= 1));
-        assert!(unknown.iter().all(|job| job.state == "pending"));
+        assert!(unknown.iter().all(|job| job.attempts == 0));
+        assert!(unknown.iter().all(|job| job.state == "error"));
+        assert!(unknown.iter().all(|job| job.locked_until.is_none()));
+        let later = Utc::now() + chrono::Duration::days(30);
+        super::coordinate_quota_waiters(&fixture.coordinator, &Store::new(db.clone()), later)
+            .await
+            .unwrap();
+        assert!(
+            jobs::claim_due_jobs(&db, later, chrono::Duration::seconds(30), 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(fast_provider.gets.load(Ordering::SeqCst), 1);
     }
 
@@ -11900,7 +12820,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_cancelled_target_keeps_usage_until_adopted_request_is_unpinned() {
+    async fn shutdown_cancelled_dispatched_submit_is_terminal_and_keeps_unknown_usage() {
         let _paused_clock_test = SHUTDOWN_PAUSED_CLOCK_TEST_LOCK.lock().await;
         let blocker = Arc::new(SubmitBlocker {
             entered: Notify::new(),
@@ -11910,18 +12830,13 @@ mod tests {
                 RemotePinStatus::Queued,
             )))),
         });
-        let delete_blocker = Arc::new(UnpinBlocker {
-            entered: Notify::new(),
-            release: Notify::new(),
-            result: Mutex::new(Some(Ok(()))),
-        });
         let mut fixture = file_backed_fixture([
             Script::BlockSubmit(blocker.clone()),
             Script::Find(Ok(vec![remote(
                 "accepted-cancelled-target",
                 RemotePinStatus::Queued,
             )])),
-            Script::BlockUnpin(delete_blocker.clone()),
+            Script::Unpin(Ok(())),
         ])
         .await;
         PinningCoordinator::configure_worker_for_test(&mut fixture.coordinator, |settings| {
@@ -11979,7 +12894,7 @@ mod tests {
                 held_after_shutdown.reserved_pins
             ),
             (100, 1),
-            "shutdown must not release usage before durable recovery and Unpin"
+            "shutdown must retain quota for the dispatched Submit's unknown effect"
         );
 
         let restart = Fixture {
@@ -11994,104 +12909,73 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        tokio::time::pause();
-        tokio::time::advance(std::time::Duration::from_secs(31)).await;
-        tokio::time::resume();
-        let claimed = jobs::claim_due_jobs(
-            restart.store.db(),
-            blocked.locked_until.unwrap() + chrono::Duration::seconds(1),
-            chrono::Duration::seconds(30),
-            1,
-        )
-        .await;
-        let claimed = claimed.unwrap().pop().unwrap();
-        assert!(claimed.reclaimed);
-        assert_eq!(claimed.model.submit_phase.as_deref(), Some("recovering"));
-        super::execute_claimed_job(
-            &restart.store,
-            &restart.coordinator,
-            &Arc::new(Semaphore::new(2)),
-            claimed,
-        )
-        .await
-        .unwrap();
-        assert_eq!(restart.provider.submits.load(Ordering::SeqCst), 1);
-        assert_eq!(restart.provider.finds.load(Ordering::SeqCst), 1);
-        let held_after_adopt = pin_provider_usage::Entity::find_by_id("noop".to_owned())
-            .one(restart.store.db())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            (
-                held_after_adopt.reserved_bytes,
-                held_after_adopt.reserved_pins
-            ),
-            (100, 1)
-        );
-
-        let mut unpin = pin_job::Entity::find()
-            .filter(pin_job::Column::Operation.eq("unpin"))
-            .filter(pin_job::Column::State.eq("pending"))
-            .one(restart.store.db())
-            .await
-            .unwrap();
-        if unpin.is_none() {
-            restart.run_one_due().await;
-            unpin = pin_job::Entity::find()
-                .filter(pin_job::Column::Operation.eq("unpin"))
-                .filter(pin_job::Column::State.eq("pending"))
-                .one(restart.store.db())
-                .await
-                .unwrap();
-        }
-        let unpin = unpin.expect("adopted request with no refs must converge to Unpin");
-        let claimed = jobs::claim_due_jobs(
-            restart.store.db(),
-            unpin.next_attempt_at,
-            chrono::Duration::seconds(30),
-            1,
-        )
-        .await
-        .unwrap()
-        .pop()
-        .unwrap();
-        let entered = delete_blocker.entered.notified();
-        let db = restart.store.db().clone();
-        let coordinator = restart.coordinator.clone();
-        let delete = tokio::spawn(async move {
-            super::execute_claimed_job(
-                &Store::new(db),
-                &coordinator,
-                &Arc::new(Semaphore::new(2)),
-                claimed,
+        let later = Utc::now() + chrono::Duration::days(30);
+        for tick in 0..3 {
+            let claims = jobs::claim_due_jobs(
+                restart.store.db(),
+                later + chrono::Duration::seconds(tick * 60),
+                chrono::Duration::seconds(30),
+                10,
             )
             .await
-        });
-        tokio::time::timeout(std::time::Duration::from_secs(2), entered)
-            .await
-            .expect("Unpin did not enter provider DELETE");
-        let held_before_delete = pin_provider_usage::Entity::find_by_id("noop".to_owned())
+            .unwrap();
+            for claim in claims {
+                super::execute_claimed_job(
+                    &restart.store,
+                    &restart.coordinator,
+                    &Arc::new(Semaphore::new(2)),
+                    claim,
+                )
+                .await
+                .unwrap();
+            }
+        }
+        let terminal = pin_job::Entity::find_by_id(blocked.id.clone())
             .one(restart.store.db())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(
-            (
-                held_before_delete.reserved_bytes,
-                held_before_delete.reserved_pins
-            ),
-            (100, 1)
+        assert_eq!(terminal.state, "error");
+        assert_eq!(terminal.locked_until, None);
+        let history = jobs::submission_history(restart.store.db(), &blocked.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(history.submit_calls, 1);
+        assert_eq!(history.recovery_queries, 0);
+        assert_eq!(history.effect, "unknown");
+        assert!(
+            super::ledger::submission::has_resource_debt(restart.store.db(), "noop", "bafy-worker")
+                .await
+                .unwrap()
         );
-        delete_blocker.release.notify_one();
-        delete.await.unwrap().unwrap();
-        assert_eq!(restart.provider.unpins.load(Ordering::SeqCst), 1);
-        let released = pin_provider_usage::Entity::find_by_id("noop".to_owned())
+        assert_eq!(restart.provider.submits.load(Ordering::SeqCst), 1);
+        assert_eq!(restart.provider.finds.load(Ordering::SeqCst), 0);
+        assert_eq!(restart.provider.unpins.load(Ordering::SeqCst), 0);
+        let held = pin_provider_usage::Entity::find_by_id("noop".to_owned())
             .one(restart.store.db())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!((released.reserved_bytes, released.reserved_pins), (0, 0));
+        assert_eq!((held.reserved_bytes, held.reserved_pins), (100, 1));
+        let remote = remote_pin::Entity::find_by_id(("noop".to_owned(), "bafy-worker".to_owned()))
+            .one(restart.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(remote.status, "reserved");
+        assert_eq!(remote.request_id, None);
+        assert!(
+            jobs::claim_due_jobs(
+                restart.store.db(),
+                later + chrono::Duration::days(30),
+                chrono::Duration::seconds(30),
+                10,
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -12113,20 +12997,39 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(parked.state, "done");
+        assert_eq!(parked.state, "error");
         assert_eq!(parked.attempts, 8);
-        assert_eq!(
-            pin_job::Entity::find()
-                .filter(pin_job::Column::State.eq("pending"))
-                .count(fixture.store.db())
+        assert_eq!(parked.locked_until, None);
+        let later = Utc::now() + chrono::Duration::days(30);
+        super::coordinate_quota_waiters(&fixture.coordinator, &fixture.store, later)
+            .await
+            .unwrap();
+        assert!(
+            jobs::claim_due_jobs(fixture.store.db(), later, chrono::Duration::seconds(30), 10)
                 .await
-                .unwrap(),
-            0
+                .unwrap()
+                .is_empty()
         );
+        assert_eq!(
+            pin_job::Entity::find_by_id(parked.id.clone())
+                .one(fixture.store.db())
+                .await
+                .unwrap()
+                .unwrap(),
+            parked
+        );
+        let usage = pin_provider_usage::Entity::find_by_id("noop")
+            .one(fixture.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((usage.reserved_bytes, usage.reserved_pins), (100, 1));
+        assert_eq!(fixture.provider.gets.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.provider.unpins.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
-    async fn exhausted_poll_from_renewed_generation_completes_without_failover() {
+    async fn exhausted_poll_from_renewed_generation_errors_without_failover() {
         let cid = "bafy-exhausted-renewed-generation";
         let lease_id = "lease-exhausted-renewed-generation";
         let target_id = "target-exhausted-renewed-generation";
@@ -12162,9 +13065,16 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let owner = object::Entity::find_by_id(lease_before.owner_object_id.clone())
+            .one(fixture.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(owner.is_latest);
+        assert_eq!(owner.key, format!("one/{lease_id}"));
         let renewal = leases::renew_manual_lease(
             fixture.store.db(),
-            "object-1",
+            &lease_before.owner_object_id,
             lease_id,
             lease_before.expires_at + chrono::Duration::hours(1),
             Utc::now(),
@@ -12263,8 +13173,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(completed.state, "done");
+        assert_eq!(completed.state, "error");
         assert_eq!(completed.expected_generation, Some(1));
+        assert_eq!(completed.attempts, 8);
+        assert_eq!(completed.locked_until, None);
         assert_eq!(fixture.provider.gets.load(Ordering::SeqCst), 0);
     }
 
@@ -12325,9 +13237,16 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(lease_before.generation, 1);
+        let owner = object::Entity::find_by_id(lease_before.owner_object_id.clone())
+            .one(fixture.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(owner.is_latest);
+        assert_eq!(owner.key, format!("one/{lease_id}"));
         let renewal = leases::renew_manual_lease(
             fixture.store.db(),
-            "object-1",
+            &lease_before.owner_object_id,
             lease_id,
             lease_before.expires_at + chrono::Duration::hours(1),
             Utc::now(),
@@ -12404,15 +13323,16 @@ mod tests {
             current_jobs_after_renewal,
             "the generation-2 Poll/Reconcile work must survive the stale coordination rollback"
         );
-        assert_eq!(
-            pin_job::Entity::find_by_id(job.id)
-                .one(fixture.store.db())
-                .await
-                .unwrap()
-                .unwrap()
-                .state,
-            "done"
-        );
+        let terminal = pin_job::Entity::find_by_id(job.id)
+            .one(fixture.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal.state, "done");
+        assert_eq!(terminal.expected_generation, Some(1));
+        assert_eq!(terminal.attempts, 8);
+        assert_eq!(terminal.locked_until, None);
+        assert_eq!(fixture.provider.gets.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -12435,7 +13355,7 @@ mod tests {
                 "INSERT INTO pin_leases \
                  (id, owner_object_id, source, policy_id, provider_mode, content_mode, created_at, \
                   last_touched_at, expires_at, generation, state) \
-                 VALUES ('lease-exhausted-other', 'object-1', 'other-scope', 'policy', 'one', 'full', \
+                 VALUES ('lease-exhausted-other', 'object-1', 'manual', 'policy', 'one', 'full', \
                          '{}', '{}', '{}', 1, 'active'); \
                  UPDATE pin_jobs SET lease_id='lease-exhausted-other' WHERE id='{}'",
                 now.to_rfc3339(),
@@ -13075,6 +13995,16 @@ mod tests {
             )
             .await
             .unwrap();
+        super::ledger::observe(
+            fixture.store.db(),
+            "noop",
+            "bafy-worker",
+            RemotePinStatus::Pinned,
+            super::ledger::Ownership::ApplicationCreated,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
         leases::cancel_lease(fixture.store.db(), "lease-1", Utc::now())
             .await
             .unwrap();
@@ -13096,6 +14026,7 @@ mod tests {
                 .state,
             "quota_waiting"
         );
+        assert_eq!(fixture.provider.unpins.load(Ordering::SeqCst), 1);
     }
 
     async fn assert_quota_confirmed_delete_wakes_waiter(
@@ -13115,6 +14046,16 @@ mod tests {
             )
             .await
             .unwrap();
+        super::ledger::observe(
+            fixture.store.db(),
+            "noop",
+            "bafy-worker",
+            RemotePinStatus::Pinned,
+            super::ledger::Ownership::ApplicationCreated,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
         leases::cancel_lease(fixture.store.db(), "lease-1", Utc::now())
             .await
             .unwrap();
@@ -13146,6 +14087,7 @@ mod tests {
                 .unwrap(),
             1
         );
+        assert_eq!(fixture.provider.unpins.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -13183,6 +14125,16 @@ mod tests {
             ))
             .await
             .unwrap();
+        super::ledger::observe(
+            fixture.store.db(),
+            "noop",
+            "bafy-worker",
+            RemotePinStatus::Pinned,
+            super::ledger::Ownership::ApplicationCreated,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
         leases::cancel_lease(fixture.store.db(), "lease-1", Utc::now())
             .await
             .unwrap();
@@ -13283,7 +14235,7 @@ mod tests {
                   INSERT INTO pin_leases \
                   (id, owner_object_id, source, policy_id, provider_mode, content_mode, created_at, \
                    last_touched_at, expires_at, generation, state) \
-                  VALUES ('lease-quota-old', 'object-1', 'quota-old', 'policy', 'all', 'full', \
+                  VALUES ('lease-quota-old', 'object-1', 'manual', 'policy', 'all', 'full', \
                           '{oldest_text}', '{oldest_text}', '{expires}', 1, 'active'), \
                          ('lease-quota-older', 'object-1', 'quota-older', 'policy', 'all', 'full', \
                           '{older_text}', '{older_text}', '{expires}', 1, 'active'); \
@@ -13563,6 +14515,16 @@ mod tests {
             ))
             .await
             .unwrap();
+        super::ledger::observe(
+            fixture.store.db(),
+            "noop",
+            "bafy-worker",
+            RemotePinStatus::Failed,
+            super::ledger::Ownership::ApplicationCreated,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
         jobs::enqueue_job(
             fixture.store.db(),
             jobs::reconcile_job("noop", "bafy-worker", 1, due),
@@ -13595,7 +14557,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_blocked_submit_response_cannot_resurrect_released_remote_or_overcommit() {
+    async fn stale_blocked_submit_response_keeps_cancelled_scope_and_unknown_quota_held() {
         let blocker = Arc::new(SubmitBlocker {
             entered: Notify::new(),
             release: Notify::new(),
@@ -13698,49 +14660,70 @@ mod tests {
         .await
         .unwrap();
 
-        for _ in 0..4 {
-            let remote =
-                remote_pin::Entity::find_by_id(("noop".to_owned(), "bafy-worker".to_owned()))
-                    .one(fixture.store.db())
-                    .await
-                    .unwrap()
-                    .unwrap();
-            if remote.status == "absent" {
-                break;
-            }
-            let pending = pin_job::Entity::find()
-                .filter(pin_job::Column::State.eq("pending"))
-                .filter(pin_job::Column::Operation.is_in(["reconcile", "unpin"]))
-                .order_by_asc(pin_job::Column::NextAttemptAt)
-                .one(fixture.store.db())
+        let terminal = pin_job::Entity::find_by_id(submit.id.clone())
+            .one(fixture.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal.state, "error");
+        assert_eq!(terminal.locked_until, None);
+        let later = Utc::now() + chrono::Duration::days(30);
+        for tick in 0..2 {
+            let claims = jobs::claim_due_jobs(
+                fixture.store.db(),
+                later + chrono::Duration::seconds(tick * 60),
+                chrono::Duration::seconds(30),
+                10,
+            )
+            .await
+            .unwrap();
+            for claim in claims {
+                super::execute_claimed_job(
+                    &fixture.store,
+                    &fixture.coordinator,
+                    &Arc::new(Semaphore::new(2)),
+                    claim,
+                )
                 .await
-                .unwrap()
-                .expect("reclaimed adoption must converge through remote cleanup");
-            fixture.run_claim_at(pending.next_attempt_at).await;
+                .unwrap();
+            }
         }
-        assert_eq!(
+        let held_remote =
             remote_pin::Entity::find_by_id(("noop".to_owned(), "bafy-worker".to_owned()))
                 .one(fixture.store.db())
                 .await
                 .unwrap()
-                .unwrap()
-                .status,
-            "absent"
-        );
+                .unwrap();
+        assert_eq!(held_remote.status, "reserved");
+        assert_eq!(held_remote.request_id, None);
+        assert_eq!(fixture.provider.submits.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.provider.finds.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.provider.unpins.load(Ordering::SeqCst), 0);
 
         blocker.release.notify_one();
-        let _stale_result = worker_a.await.unwrap();
+        worker_a.await.unwrap().unwrap();
 
         let remote = remote_pin::Entity::find_by_id(("noop".to_owned(), "bafy-worker".to_owned()))
             .one(fixture.store.db())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(
-            (remote.status.as_str(), remote.request_id.as_deref()),
-            ("absent", None),
-            "worker A's stale response must not revive a released remote"
+        assert_eq!(remote, held_remote);
+        let history = jobs::submission_history(fixture.store.db(), &submit.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(history.submit_calls, 1);
+        assert_eq!(history.recovery_queries, 0);
+        assert_eq!(history.effect, "unknown");
+        assert!(
+            super::ledger::submission::has_resource_debt(fixture.store.db(), "noop", "bafy-worker")
+                .await
+                .unwrap()
         );
+        super::coordinate_quota_waiters(&fixture.coordinator, &fixture.store, Utc::now())
+            .await
+            .unwrap();
         let usage = pin_provider_usage::Entity::find_by_id("noop".to_owned())
             .one(fixture.store.db())
             .await
@@ -13754,17 +14737,39 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .state,
-            "waiting"
+            "quota_waiting"
+        );
+        assert_eq!(
+            pin_lease_target::Entity::find_by_id("target-1")
+                .one(fixture.store.db())
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "released"
         );
         assert_eq!(
             pin_job::Entity::find()
                 .filter(pin_job::Column::TargetId.eq("target-1"))
-                .filter(pin_job::Column::State.ne("done"))
-                .count(fixture.store.db())
+                .all(fixture.store.db())
                 .await
                 .unwrap(),
-            0,
+            vec![terminal],
             "the stale response must not project target-scoped work"
+        );
+        assert_eq!(fixture.provider.submits.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.provider.finds.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.provider.unpins.load(Ordering::SeqCst), 0);
+        assert!(
+            jobs::claim_due_jobs(
+                fixture.store.db(),
+                later + chrono::Duration::days(30),
+                chrono::Duration::seconds(30),
+                10,
+            )
+            .await
+            .unwrap()
+            .is_empty()
         );
     }
 
@@ -13847,31 +14852,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quota_no_request_zero_match_recovery_marks_submit_safe_then_releases_once() {
+    async fn quota_no_request_cancelled_zero_dispatch_submit_errors_then_reconcile_releases_once() {
         let fixture = fixture([Script::Find(Ok(Vec::new()))]).await;
         fixture.enqueue_submit().await;
         fixture
             .store
             .db()
             .execute_unprepared(
-                "UPDATE pin_leases SET state='cancelled' WHERE id='lease-1'; \
-                 UPDATE pin_lease_targets SET state='released' WHERE id='target-1'; \
-                 UPDATE pin_jobs SET submit_phase='recovering' WHERE operation='submit'",
+                "UPDATE pin_jobs SET submit_phase='recovering' WHERE operation='submit'",
             )
             .await
             .unwrap();
+        fixture.register_fixture_routes().await;
+        let cancellation = fixture.store.db().begin().await.unwrap();
+        leases::cancel_lease(&cancellation, "lease-1", Utc::now())
+            .await
+            .unwrap();
+        cancellation.commit().await.unwrap();
 
         fixture.run_one_due().await;
-        assert_eq!(fixture.provider.finds.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            pin_job::Entity::find()
-                .filter(pin_job::Column::Operation.eq("submit"))
-                .one(fixture.store.db())
-                .await
-                .unwrap()
-                .unwrap()
-                .state,
-            "done"
+        assert_eq!(fixture.provider.finds.load(Ordering::SeqCst), 0);
+        let submit = pin_job::Entity::find()
+            .filter(pin_job::Column::Operation.eq("submit"))
+            .one(fixture.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(submit.state, "error");
+        assert_eq!(submit.locked_until, None);
+        let history = jobs::submission_history(fixture.store.db(), &submit.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(history.submit_calls, 0);
+        assert_eq!(history.recovery_queries, 0);
+        assert_eq!(history.effect, "unknown");
+        assert!(
+            !super::ledger::submission::has_resource_debt(
+                fixture.store.db(),
+                "noop",
+                "bafy-worker"
+            )
+            .await
+            .unwrap()
         );
         let usage = pin_provider_usage::Entity::find_by_id("noop".to_owned())
             .one(fixture.store.db())
@@ -13880,6 +14903,20 @@ mod tests {
             .unwrap();
         assert_eq!((usage.reserved_bytes, usage.reserved_pins), (100, 1));
 
+        fixture.run_one_due().await;
+        let reconcile = pin_job::Entity::find()
+            .filter(pin_job::Column::Operation.eq("reconcile"))
+            .one(fixture.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reconcile.state, "pending");
+        let held = pin_provider_usage::Entity::find_by_id("noop")
+            .one(fixture.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((held.reserved_bytes, held.reserved_pins), (100, 1));
         fixture.run_one_due().await;
         let usage = pin_provider_usage::Entity::find_by_id("noop".to_owned())
             .one(fixture.store.db())
@@ -13893,6 +14930,9 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(remote.status, "absent");
+        assert_eq!(fixture.provider.finds.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.provider.submits.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.provider.unpins.load(Ordering::SeqCst), 0);
 
         let txn = fixture.store.db().begin().await.unwrap();
         assert_eq!(
@@ -13914,6 +14954,25 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!((usage.reserved_bytes, usage.reserved_pins), (0, 0));
+        assert!(
+            jobs::claim_due_jobs(
+                fixture.store.db(),
+                Utc::now() + chrono::Duration::days(30),
+                chrono::Duration::seconds(30),
+                10,
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(
+            pin_job::Entity::find_by_id(submit.id.clone())
+                .one(fixture.store.db())
+                .await
+                .unwrap()
+                .unwrap(),
+            submit
+        );
     }
 
     #[tokio::test]
@@ -13982,7 +15041,7 @@ mod tests {
                 "INSERT INTO pin_leases \
                  (id, owner_object_id, source, policy_id, provider_mode, content_mode, created_at, \
                   last_touched_at, expires_at, generation, state) \
-                 VALUES ('lease-during-delete', 'object-1', 'copy', 'policy', 'all', 'full', \
+                 VALUES ('lease-during-delete', 'object-1', 'manual', 'policy', 'all', 'full', \
                          '{created}', '{created}', '{expires}', 1, 'active'); \
                  INSERT INTO pin_lease_targets \
                  (id, lease_id, cid, logical_size, provider, state, created_at, last_touched_at) \
@@ -14620,6 +15679,7 @@ mod tests {
             .await
             .unwrap();
         fixture.enqueue_poll("trace-status-failed").await;
+        fixture.prepare_one_fixture().await;
         let job = pin_job::Entity::find()
             .filter(pin_job::Column::Operation.eq("poll"))
             .one(fixture.store.db())

@@ -8,6 +8,7 @@ pub(crate) struct CompletionReader<'a> {
     actions: Vec<records::TrustedAppliedAction>,
     work: records::SharedDecodeBudget,
     runtime: Option<&'a crate::store::RuntimeTransaction>,
+    submission_recovery: Option<i64>,
 }
 
 impl<'a> CompletionReader<'a> {
@@ -30,6 +31,7 @@ impl<'a> CompletionReader<'a> {
             actions,
             work,
             runtime: None,
+            submission_recovery: None,
         }
     }
 
@@ -45,6 +47,7 @@ impl<'a> CompletionReader<'a> {
             actions,
             work,
             runtime: Some(tx),
+            submission_recovery: None,
         }
     }
 
@@ -86,17 +89,35 @@ impl<'a> CompletionReader<'a> {
         std::ptr::eq(self.tx, tx) && std::ptr::eq(self.job, job)
     }
 
+    pub(crate) fn bind_submission_recovery(&mut self, recovery_sequence: i64) {
+        self.submission_recovery = Some(recovery_sequence);
+    }
+
     pub(in crate::store::pinning) async fn submission_projection_allowed(
         &self,
         remote: &remote_pin::Model,
     ) -> AppResult<bool> {
-        ledger::submission::projection_allowed_catalog(
-            self.catalog(),
-            self.job,
-            remote,
-            records::DecodeWork::shared(&self.work),
-        )
-        .await
+        match self.submission_recovery {
+            Some(sequence) => {
+                ledger::submission::recovery_projection_allowed_catalog(
+                    self.catalog(),
+                    self.job,
+                    remote,
+                    sequence,
+                    records::DecodeWork::shared(&self.work),
+                )
+                .await
+            }
+            None => {
+                ledger::submission::projection_allowed_catalog(
+                    self.catalog(),
+                    self.job,
+                    remote,
+                    records::DecodeWork::shared(&self.work),
+                )
+                .await
+            }
+        }
     }
 
     /// Dispatch uses this reader's complete immutable action set under the same
@@ -110,6 +131,17 @@ impl<'a> CompletionReader<'a> {
         self.validate().await?;
         let permit = self.permit().await?;
         if !call.allows(&self.job.operation, permit.as_ref()) {
+            return Ok(false);
+        }
+        if matches!(call, ManagedCall::Cleanup)
+            && crate::store::pinning::leases::has_active_error_hold(
+                &self.catalog(),
+                &self.job.provider,
+                &self.job.cid,
+                records::DecodeWork::shared(&self.work),
+            )
+            .await?
+        {
             return Ok(false);
         }
         if matches!(call, ManagedCall::Submit)

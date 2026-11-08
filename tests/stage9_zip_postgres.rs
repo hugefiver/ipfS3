@@ -73,7 +73,7 @@ async fn r25_pg_tail_rollback_then_exact_shared_cid_publication() {
             root_outcome: batch.root_outcome.clone(), terminal_result: batch.terminal_result.clone() };
         db.execute_unprepared("CREATE FUNCTION r25_tail() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.state='published' THEN RAISE EXCEPTION 'r25 PG tail'; END IF; RETURN NEW; END $$").await.unwrap();
         db.execute_unprepared("CREATE TRIGGER r25_tail BEFORE UPDATE ON zip_batches FOR EACH ROW EXECUTE FUNCTION r25_tail()").await.unwrap();
-        assert!(ipfs_s3_gateway::store::pinning::publication::publish_captured_zip(&db, common.clone()).await.unwrap_err().to_string().contains("r25 PG tail"));
+        assert!(ipfs_s3_gateway::store::pinning::publication::publish_captured_zip(&db, common.clone(), &config, &output_rules(&config), ipfs_s3_gateway::config::OptionalPinControlMode::Warn).await.unwrap_err().to_string().contains("r25 PG tail"));
         assert_eq!(object_version::Entity::find().count(&db).await.unwrap(), 0);
         assert_eq!(pin_lease::Entity::find().count(&db).await.unwrap(), 0);
         assert_eq!(pin_provider_usage::Entity::find().count(&db).await.unwrap(), 0);
@@ -82,7 +82,7 @@ async fn r25_pg_tail_rollback_then_exact_shared_cid_publication() {
         assert!(snapshot.entries.iter().all(|e| e.version_row_id.is_none()));
         db.execute_unprepared("DROP TRIGGER r25_tail ON zip_batches").await.unwrap();
         // Known rollback keeps the claim; retry the same exact captured request.
-        ipfs_s3_gateway::store::pinning::publication::publish_captured_zip(&db, common).await.unwrap();
+        ipfs_s3_gateway::store::pinning::publication::publish_captured_zip(&db, common, &config, &output_rules(&config), ipfs_s3_gateway::config::OptionalPinControlMode::Warn).await.unwrap();
         assert_eq!(object_version::Entity::find().count(&db).await.unwrap(), 3);
         assert_eq!(pin_lease::Entity::find().count(&db).await.unwrap(), 2);
         let usage = pin_provider_usage::Entity::find().one(&db).await.unwrap().unwrap();

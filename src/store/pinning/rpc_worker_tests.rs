@@ -12,8 +12,11 @@ use crate::{
     },
     store::{
         self,
-        entities::{pin_provider_usage, pin_resource_history},
-        pinning::publication::{self, PinTargetSpec, PublicationObject, PublicationRequest},
+        entities::{pin_provider_usage, pin_replica_observation, pin_resource_history},
+        pinning::{
+            management::records,
+            publication::{self, PinTargetSpec, PublicationObject, PublicationRequest},
+        },
     },
 };
 use sea_orm::{ConnectionTrait, Set};
@@ -30,6 +33,8 @@ struct RpcFixture {
     store: Store,
     coordinator: Arc<PinningCoordinator>,
     provider: String,
+    policy_id: String,
+    raw: Config,
 }
 
 async fn source_file(source: &MockServer) {
@@ -68,13 +73,12 @@ async fn fixture(
     fixture_on_database(endpoint, source, profile, strategy, db).await
 }
 
-async fn fixture_on_database(
-    endpoint: String,
-    source: &MockServer,
+fn rpc_config(
+    endpoint: &str,
+    source_endpoint: &str,
     profile: RpcProfile,
     strategy: RpcStrategy,
-    db: sea_orm::DatabaseConnection,
-) -> RpcFixture {
+) -> Config {
     let (kind, profile_name) = match profile {
         RpcProfile::Filebase => ("filebase", "filebase"),
         RpcProfile::Kubo => ("ipfs_rpc", "kubo"),
@@ -83,7 +87,7 @@ async fn fixture_on_database(
         RpcProfile::Filebase => "filebase-rpc",
         RpcProfile::Kubo => "kubo",
     };
-    let raw: Config = toml::from_str(&format!(
+    let mut raw: Config = toml::from_str(&format!(
         r#"
         [[pinning.providers]]
         name = 'rpc-fixture'
@@ -95,6 +99,15 @@ async fn fixture_on_database(
         priority = 1
         max_bytes = 100
         max_pins = 1
+
+        [[pinning.policies]]
+        bucket = 'rpc'
+        prefix = ''
+        trigger = 'always'
+        provider_mode = 'all'
+        providers = ['rpc-fixture']
+        default_duration = '1h'
+        max_duration = '2h'
 
         [[pinning_rpc.providers]]
         config_name = 'rpc-fixture'
@@ -125,11 +138,25 @@ async fn fixture_on_database(
         strategy.as_str(),
     ))
     .unwrap();
+    raw.kubo.rpc_url = source_endpoint.into();
+    raw.decompress_zip.auto_pin_outputs = Some(false);
+    raw
+}
+
+async fn fixture_on_database(
+    endpoint: String,
+    source: &MockServer,
+    profile: RpcProfile,
+    strategy: RpcStrategy,
+    db: sea_orm::DatabaseConnection,
+) -> RpcFixture {
+    let raw = rpc_config(&endpoint, &source.uri(), profile, strategy);
     let validated = ValidatedPinningConfig::from_config(&raw, |name| {
         (name == "TEST_RPC_SECRET").then(|| "private-fixture-token".into())
     })
     .unwrap();
     let key = validated.providers[0].identity.allocation_key();
+    let policy_id = validated.policies[0].identity.clone();
     let coordinator =
         PinningCoordinator::build_with_kubo(validated, Some(KuboClient::new(source.uri())))
             .unwrap();
@@ -146,6 +173,8 @@ async fn fixture_on_database(
         store,
         coordinator,
         provider: key,
+        policy_id,
+        raw,
     };
     fixture.publish("first", CID).await;
     fixture
@@ -174,7 +203,7 @@ impl RpcFixture {
                     tags: vec![],
                     leases: vec![LeaseIntent {
                         source: LeaseSource::Automatic,
-                        policy_id: "rpc-contract".into(),
+                        policy_id: self.policy_id.clone(),
                         provider_mode: ProviderMode::All,
                         providers: vec![self.provider.clone()],
                         content_mode: ContentMode::Object,
@@ -530,7 +559,7 @@ async fn worker_mismatch_and_multiple_roots_keep_actual_resources_without_expect
                 .await
                 .unwrap()
                 .iter()
-                .all(|target| target.state != "pinned")
+                .all(|target| target.state == "error")
         );
         fixture.assert_held().await;
         assert!(
@@ -600,6 +629,975 @@ async fn worker_unknown_empty_reported_and_timeout_keep_debt_and_never_retry_htt
         );
         no_delete(&target).await;
     }
+}
+
+#[tokio::test]
+async fn parked_unknown_cid_receipt_recovers_from_one_bounded_verified_read() {
+    use crate::store::entities::pin_replica_observation;
+
+    let source = MockServer::start().await;
+    let target = MockServer::start().await;
+    recursive(&target).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/id"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"ID":"node-target"})),
+        )
+        .mount(&target)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/files/stat"))
+        .and(query_param("arg", format!("/ipfs/{CID}")))
+        .and(query_param("offline", "true"))
+        .and(query_param("with-local", "true"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"Hash":CID,"WithLocality":true,"Local":true})),
+        )
+        .mount(&target)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/pin/add"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&target)
+        .await;
+    let fixture = fixture(target.uri(), &source, RpcProfile::Kubo, RpcStrategy::Cid).await;
+    let claim = fixture.claim().await.unwrap();
+    let job_id = claim.model.id.clone();
+    fixture.run(claim).await.unwrap();
+    let original = fixture.evidence().await.pop().unwrap();
+    assert_eq!(
+        (original.effect.as_str(), original.outcome.as_str()),
+        ("unknown", "unknown")
+    );
+    assert!(original.needs_attention);
+
+    recover_parked_receipts(&fixture.coordinator, &fixture.store, &mut String::new())
+        .await
+        .unwrap();
+    let recovery = fixture
+        .claim()
+        .await
+        .expect("bounded maintenance must wake the exact parked cid receipt");
+    fixture.run(recovery).await.unwrap();
+
+    let settled = fixture.evidence().await.pop().unwrap();
+    assert_eq!(settled.id, original.id);
+    assert_eq!(settled.submit_call, original.submit_call);
+    assert_eq!(settled.route, original.route);
+    assert_eq!(settled.remote_epoch, original.remote_epoch);
+    assert_eq!(settled.effect, "unknown");
+    assert_eq!(settled.outcome, "unknown");
+    assert_eq!(settled.resources, original.resources);
+    assert_eq!(settled.observed_at, original.observed_at);
+    assert!(!settled.needs_attention);
+    let recovery_facts = pin_replica_observation::Entity::find()
+        .filter(pin_replica_observation::Column::JobId.eq(&job_id))
+        .order_by_asc(pin_replica_observation::Column::Sequence)
+        .all(fixture.store.db())
+        .await
+        .unwrap();
+    assert_eq!(recovery_facts.len(), 2);
+    let recovery_fact = &recovery_facts[0];
+    assert_eq!(recovery_fact.route, original.route);
+    assert_eq!(recovery_fact.remote_epoch, original.remote_epoch);
+    assert_eq!(recovery_fact.phase, "submit");
+    assert!(!recovery_fact.projectable);
+    let closure = &recovery_facts[1];
+    assert_eq!(closure.phase, "submit_recovery");
+    assert!(closure.outcome.starts_with("VerifiedPinned:"));
+    assert!(closure.projectable);
+    assert_eq!(closure.route, original.route);
+    assert_eq!(closure.remote_epoch, original.remote_epoch);
+    let resources: Vec<crate::pinning::provider::ObservedResource> =
+        serde_json::from_str(&recovery_fact.resources).unwrap();
+    assert_eq!(resources.len(), 1);
+    assert_eq!(resources[0].cid, CID);
+    assert_eq!(
+        resources[0].status,
+        crate::pinning::provider::ObservedResourceStatus::RecursiveVerified
+    );
+    assert_eq!(resources[0].ownership, Ownership::Unknown);
+    let history = jobs::submission_history(fixture.store.db(), &job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((history.submit_calls, history.recovery_queries), (1, 1));
+    assert_eq!(
+        (history.effect.as_str(), history.state.as_str()),
+        ("created", "settled")
+    );
+    assert_eq!(
+        ledger::submission::admission_barrier(fixture.store.db(), &fixture.provider)
+            .await
+            .unwrap(),
+        ledger::submission::AdmissionBarrier::Clear
+    );
+    assert_eq!(
+        target
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path() == "/api/v0/pin/add")
+            .count(),
+        1
+    );
+    fixture.assert_held().await;
+    no_delete(&target).await;
+}
+
+#[tokio::test]
+async fn historical_single_pin_accepted_unknown_requires_verified_read_before_recovery() {
+    let source = MockServer::start().await;
+    let target = MockServer::start().await;
+    recursive(&target).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/id"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"ID":"node-target"})),
+        )
+        .mount(&target)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/files/stat"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"Hash":CID,"WithLocality":true,"Local":true})),
+        )
+        .mount(&target)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/pin/add"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"Pins":[CID,CID]})),
+        )
+        .expect(1)
+        .mount(&target)
+        .await;
+    let fixture = fixture(target.uri(), &source, RpcProfile::Kubo, RpcStrategy::Cid).await;
+    fixture.run(fixture.claim().await.unwrap()).await.unwrap();
+    let original = fixture.evidence().await.pop().unwrap();
+    assert_eq!(
+        (original.effect.as_str(), original.outcome.as_str()),
+        ("observed", "unknown")
+    );
+    let resources: Vec<ledger::submission::ResourceEvidence> =
+        serde_json::from_str(&original.resources).unwrap();
+    assert!(matches!(resources.as_slice(), [resource]
+        if resource.resource.status == crate::pinning::provider::ObservedResourceStatus::PinAccepted));
+    assert!(original.needs_attention);
+    recover_parked_receipts(&fixture.coordinator, &fixture.store, &mut String::new())
+        .await
+        .unwrap();
+    fixture.run(fixture.claim().await.unwrap()).await.unwrap();
+    let settled = fixture.evidence().await.pop().unwrap();
+    assert_eq!(settled.effect, "observed");
+    assert_eq!(settled.outcome, "unknown");
+    assert_eq!(settled.resources, original.resources);
+    assert_eq!(settled.observed_at, original.observed_at);
+    assert!(!settled.needs_attention);
+    assert_eq!(
+        ledger::submission::admission_barrier(fixture.store.db(), &fixture.provider)
+            .await
+            .unwrap(),
+        ledger::submission::AdmissionBarrier::Clear
+    );
+    let requests = target.received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.url.path() == "/api/v0/pin/add")
+            .count(),
+        1
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.url.path() == "/api/v0/pin/ls")
+    );
+    no_delete(&target).await;
+}
+
+#[tokio::test]
+async fn confirmed_management_reconcile_without_id_recovers_exact_unknown_cid_receipt() {
+    confirmed_management_cid_reconcile(false, false, false).await;
+}
+
+#[tokio::test]
+async fn confirmed_management_reconcile_with_id_reports_late_conflicting_debt() {
+    confirmed_management_cid_reconcile(true, false, false).await;
+}
+
+#[tokio::test]
+async fn confirmed_read_settles_terminal_late_matched_cid_without_waking_original() {
+    confirmed_management_cid_reconcile(true, true, false).await;
+}
+
+#[tokio::test]
+async fn confirmed_management_reconcile_rejects_private_target_drift() {
+    confirmed_management_cid_reconcile(false, false, true).await;
+}
+
+async fn confirmed_management_cid_reconcile(
+    explicit_resource: bool,
+    late_matched: bool,
+    tamper_private_target: bool,
+) {
+    use crate::pinning::management::*;
+    use crate::store::entities::{object, object_version};
+
+    let source = MockServer::start().await;
+    let target = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/files/stat"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"Hash":CID,"Type":"file"})),
+        )
+        .mount(&source)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/cat"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; 100]))
+        .mount(&source)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/id"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"ID":"SourceNode"})),
+        )
+        .mount(&source)
+        .await;
+    recursive(&target).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/id"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"ID":"TargetNode"})),
+        )
+        .mount(&target)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/files/stat"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"Hash":CID,"WithLocality":true,"Local":true})),
+        )
+        .mount(&target)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/pin/add"))
+        .respond_with(if late_matched {
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"Pins":[CID]}))
+        } else {
+            ResponseTemplate::new(503)
+        })
+        .expect(1)
+        .mount(&target)
+        .await;
+    let directory = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        directory
+            .path()
+            .join("confirmed-reconcile.sqlite")
+            .to_string_lossy()
+            .replace('\\', "/")
+    );
+    let db = store::connect_database(&url).await.unwrap();
+    let fixture = fixture_on_database(
+        target.uri(),
+        &source,
+        RpcProfile::Kubo,
+        RpcStrategy::Cid,
+        db,
+    )
+    .await;
+    let original_claim = fixture.claim().await.unwrap();
+    let original_job_id = original_claim.model.id.clone();
+    if late_matched {
+        let dispatched = dispatch_submit(
+            &fixture.store,
+            &fixture.coordinator,
+            &Arc::new(Semaphore::new(2)),
+            original_claim,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        jobs::park_submit_store(
+            &fixture.store,
+            &dispatched.claimed,
+            "needs_attention",
+            jobs::RPC_RECOVERY_PARK_REASON,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        ledger::submission::complete_fact(
+            &fixture.store,
+            dispatched.rpc_invocation.as_ref().unwrap(),
+            &dispatched.observation,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    } else {
+        fixture.run(original_claim).await.unwrap();
+        fixture.store.db().execute_unprepared(
+            "UPDATE pin_submit_history SET recovery_queries=8 WHERE job_id IN (SELECT id FROM pin_jobs WHERE operation='submit')",
+        ).await.unwrap();
+        let recovery = fixture
+            .claim()
+            .await
+            .expect("the already scheduled original recovery must become due");
+        assert_eq!(recovery.model.id, original_job_id);
+        assert_eq!(recovery.model.submit_phase.as_deref(), Some("recovering"));
+        fixture.run(recovery).await.unwrap();
+    }
+    recover_parked_receipts(&fixture.coordinator, &fixture.store, &mut String::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        pin_job::Entity::find_by_id(&original_job_id)
+            .one(fixture.store.db())
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        "error"
+    );
+    assert!(fixture.claim().await.is_none());
+    fixture.assert_held().await;
+    let original_receipt = fixture.evidence().await.pop().unwrap();
+    assert!(original_receipt.needs_attention);
+    assert!(
+        !target
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|request| request.url.path() == "/api/v0/pin/ls")
+    );
+
+    let original_route: crate::pinning::identity::ProviderRouteSnapshot =
+        serde_json::from_str(&original_receipt.route).unwrap();
+    let canonical_request =
+        crate::pinning::ipfs_rpc::canonical_cid_request_id(&original_route, CID)
+            .unwrap()
+            .unwrap();
+    if explicit_resource {
+        remote_pin::Entity::update_many()
+            .col_expr(
+                remote_pin::Column::RequestId,
+                sea_orm::sea_query::Expr::value(canonical_request.clone()),
+            )
+            .filter(remote_pin::Column::Provider.eq(&fixture.provider))
+            .filter(remote_pin::Column::Cid.eq(CID))
+            .exec(fixture.store.db())
+            .await
+            .unwrap();
+    }
+    let object = object::Entity::find()
+        .filter(object::Column::Bucket.eq("rpc"))
+        .filter(object::Column::Key.eq("first"))
+        .one(fixture.store.db())
+        .await
+        .unwrap()
+        .unwrap();
+    let version = object_version::Entity::find()
+        .filter(object_version::Column::ObjectId.eq(&object.id))
+        .one(fixture.store.db())
+        .await
+        .unwrap()
+        .unwrap();
+    let identity = ExactObject {
+        bucket: object.bucket.clone(),
+        key: object.key.clone(),
+        object_id: object.id.clone(),
+        private_version_id: version.id,
+        public_version: version
+            .version_id
+            .map_or(PublicVersionId::Null, PublicVersionId::Version),
+        cid: crate::pinning::provider::canonical_resource_cid(&object.cid).unwrap(),
+    };
+    let config = local_config::compile(&fixture.raw, |name| {
+        (name == "TEST_RPC_SECRET").then(|| "private-fixture-token".into())
+    })
+    .unwrap()
+    .with_source_node("SourceNode".into())
+    .unwrap();
+    let auth = records::authorize_local(&fixture.raw, fixture.store.db())
+        .await
+        .unwrap();
+    let source_client = KuboClient::new(source.uri());
+    assert_eq!(source_client.base_url(), config.source_endpoint);
+    assert_eq!(
+        source_client.local_node_identity().await.unwrap(),
+        "SourceNode"
+    );
+    assert_eq!(object.size, 100);
+    assert!(!object.encrypted);
+    let prepared = evidence::prepare(
+        fixture.store.db(),
+        &config,
+        &auth,
+        &source_client,
+        &evidence::PrepareRequest {
+            record_id: uuid::Uuid::new_v4().to_string(),
+            identity: identity.clone(),
+            expected_node: "SourceNode".into(),
+            max_stored_bytes: 100,
+            ttl: ChronoDuration::minutes(15),
+            directory: false,
+        },
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(prepared.stored_bytes, Some(100));
+    let target_row = pin_lease_target::Entity::find()
+        .filter(pin_lease_target::Column::Cid.eq(CID))
+        .one(fixture.store.db())
+        .await
+        .unwrap()
+        .unwrap();
+    let request = PlanRequest {
+        plan_id: "rpc-unknown-reconcile".into(),
+        items: vec![ItemRequest {
+            item_id: "unknown-cid".into(),
+            action: Action::Reconcile,
+            subject: Subject::Object {
+                identity,
+                target: TargetSelection::Existing {
+                    target_id: target_row.id.clone(),
+                    source: None,
+                },
+            },
+        }],
+    };
+    let snapshot = db_snapshot::collect_with_config(fixture.store.db(), &config, &request)
+        .await
+        .unwrap()
+        .planning_snapshot()
+        .unwrap();
+    let plan = dry_run(&request, &snapshot).unwrap();
+    assert_eq!(plan.items().len(), 1);
+    assert!(
+        matches!(
+            plan.items()[0].status,
+            PlanStatus::Ready | PlanStatus::Candidate
+        ),
+        "readonly reconcile plan blocked: {:?}; target={}",
+        plan.items()[0].status,
+        target_row.state
+    );
+    assert!(
+        matches!(&plan.items()[0].step, Some(PlannedStep::Object(step)) if step.source == RemoteDirective::ReconcileHistorical),
+        "expected a bound historical readonly observation"
+    );
+    let ack = plan
+        .items()
+        .iter()
+        .filter(|entry| entry.status == PlanStatus::Candidate)
+        .map(|entry| entry.request.item_id.clone())
+        .collect();
+    let binding = records::confirm(
+        fixture.store.db(),
+        &config,
+        &auth,
+        (&request, &snapshot, &plan),
+        ack,
+        ChronoDuration::minutes(5),
+    )
+    .await
+    .unwrap();
+    let check = fixture.store.db().begin().await.unwrap();
+    let checked = records::revalidate_confirmed_in_transaction(&check, &config, &auth, &binding)
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "readonly confirmation revalidation failed: {error:?}; plan={:?}",
+                plan.items()[0].status
+            )
+        });
+    assert_eq!(checked.len(), 1);
+    assert!(matches!(
+        checked[0].outcome,
+        RevalidationOutcome::Checked(_)
+    ));
+    check.rollback().await.unwrap();
+    if tamper_private_target {
+        pin_lease_target::Entity::update_many()
+            .col_expr(
+                pin_lease_target::Column::LastError,
+                sea_orm::sea_query::Expr::value("changed private target diagnostic"),
+            )
+            .filter(pin_lease_target::Column::Id.eq(&target_row.id))
+            .exec(fixture.store.db())
+            .await
+            .unwrap();
+        let failure = match crate::store::pinning::management::actions::apply_cancellable(
+            fixture.store.db(),
+            &config,
+            &auth,
+            &binding,
+            CancellationToken::new(),
+        )
+        .await
+        {
+            Err(failure) => failure,
+            Ok(_) => {
+                panic!("changed private target cell must invalidate the confirmed observation")
+            }
+        };
+        assert_eq!(
+            failure.failure.cause,
+            crate::store::pinning::management::ManagementError::Changed
+        );
+        assert!(
+            failure
+                .transaction
+                .is_some_and(|failure| failure.rollback_confirmed)
+        );
+        assert_eq!(
+            pin_job::Entity::find()
+                .filter(pin_job::Column::Id.like("management-observe:%"))
+                .all(fixture.store.db())
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            pin_job::Entity::find_by_id(&original_job_id)
+                .one(fixture.store.db())
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "error"
+        );
+        fixture.assert_held().await;
+        no_delete(&target).await;
+        fixture.store.db().clone().close().await.unwrap();
+        return;
+    }
+    let applied = crate::store::pinning::management::actions::apply_cancellable(
+        fixture.store.db(), &config, &auth, &binding, CancellationToken::new(),
+    ).await.unwrap_or_else(|failure| {
+        let states = failure.failure.items.iter().map(|item| (&item.item_id, item.state)).collect::<Vec<_>>();
+        panic!("readonly apply failed after checked confirmation: cause={:?}; transaction={:?}; items={states:?}; plan={:?}; target={}", failure.failure.cause, failure.transaction, plan.items()[0].status, target_row.state)
+    });
+    let authority = applied.items[0]
+        .jobs
+        .iter()
+        .find(|job| job.directive == records::JobDirective::ReadOnlyObserve)
+        .unwrap();
+    assert_eq!(
+        authority.resource_id.as_deref(),
+        explicit_resource.then_some(canonical_request.as_str())
+    );
+    let scope = ManagementJobScope::from_applied(fixture.store.db(), &auth, &binding)
+        .await
+        .unwrap();
+    let report = management_tick(
+        &fixture.coordinator,
+        &fixture.store,
+        &scope,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.items[0].state, records::ActionState::ReadOnly);
+    assert!(report.replica_observations.iter().any(|fact| {
+        fact.job_id == authority.job_id
+            && fact.phase == "reconcile"
+            && fact.outcome == "ReportedPinned"
+            && !fact.projectable
+    }));
+
+    let recovery = pin_job::Entity::find_by_id(&original_job_id)
+        .one(fixture.store.db())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovery.state, "error");
+    assert!(recovery.locked_until.is_none());
+    assert_eq!(
+        pin_lease_target::Entity::find_by_id(recovery.target_id.clone().unwrap())
+            .one(fixture.store.db())
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        "error"
+    );
+    assert!(fixture.claim().await.is_none());
+    let receipt = fixture.evidence().await.pop().unwrap();
+    assert_eq!(
+        (receipt.effect.as_str(), receipt.outcome.as_str()),
+        if late_matched {
+            ("observed", "matched")
+        } else {
+            ("unknown", "unknown")
+        }
+    );
+    assert_eq!(receipt.resources, original_receipt.resources);
+    assert_eq!(receipt.observed_at, original_receipt.observed_at);
+    assert!(!receipt.needs_attention);
+    assert_eq!(
+        ledger::submission::admission_barrier(fixture.store.db(), &fixture.provider)
+            .await
+            .unwrap(),
+        ledger::submission::AdmissionBarrier::Clear
+    );
+    let final_report = scope.report(&fixture.store).await.unwrap();
+    assert_eq!(final_report.items[0].state, records::ActionState::ReadOnly);
+    pin_replica_observation::Entity::insert(pin_replica_observation::ActiveModel {
+        sequence: Default::default(),
+        job_id: Set(original_job_id.clone()),
+        provider: Set(fixture.provider.clone()),
+        expected_cid: Set(CID.into()),
+        route: Set(receipt.route.clone()),
+        remote_epoch: Set(receipt.remote_epoch),
+        claim_until: Set(Utc::now()),
+        lease_id: Set(recovery.lease_id.clone()),
+        target_id: Set(recovery.target_id.clone()),
+        expected_generation: Set(recovery.expected_generation),
+        phase: Set("submit".into()),
+        resources: Set("[]".into()),
+        outcome: Set("Unknown".into()),
+        safe_error: Set(Some("late conflicting read".into())),
+        projectable: Set(false),
+        observed_at: Set(Utc::now()),
+    })
+    .exec(fixture.store.db())
+    .await
+    .unwrap();
+    assert_eq!(
+        ledger::submission::admission_barrier(fixture.store.db(), &fixture.provider)
+            .await
+            .unwrap(),
+        ledger::submission::AdmissionBarrier::Operator
+    );
+    assert_eq!(
+        scope.report(&fixture.store).await.unwrap().items[0].state,
+        records::ActionState::NeedsAttention
+    );
+    assert!(fixture.claim().await.is_none());
+    assert_eq!(
+        target
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path() == "/api/v0/pin/add")
+            .count(),
+        1
+    );
+    fixture.assert_held().await;
+    no_delete(&target).await;
+    fixture.store.db().clone().close().await.unwrap();
+}
+
+#[tokio::test]
+async fn cid_unknown_with_extra_root_never_enters_read_recovery() {
+    let source = MockServer::start().await;
+    let target = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/pin/add"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"Pins":[CID,OTHER]})),
+        )
+        .expect(1)
+        .mount(&target)
+        .await;
+    let fixture = fixture(target.uri(), &source, RpcProfile::Kubo, RpcStrategy::Cid).await;
+    fixture.run(fixture.claim().await.unwrap()).await.unwrap();
+    let receipt = fixture.evidence().await.pop().unwrap();
+    assert_eq!(receipt.outcome, "cid_mismatch");
+    assert!(receipt.needs_attention);
+    recover_parked_receipts(&fixture.coordinator, &fixture.store, &mut String::new())
+        .await
+        .unwrap();
+    assert!(fixture.claim().await.is_none());
+    assert!(
+        target
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| request.url.path() == "/api/v0/pin/add")
+    );
+    fixture.assert_held().await;
+    no_delete(&target).await;
+}
+
+#[tokio::test]
+async fn absent_cid_recovery_exhausts_original_budget_without_claiming_not_submitted() {
+    let source = MockServer::start().await;
+    let target = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/pin/add"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&target)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/pin/ls"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+            "Message": format!("path '{CID}' is not pinned"),
+            "Code": 0,
+            "Type": "error"
+        })))
+        .mount(&target)
+        .await;
+    let fixture = fixture(target.uri(), &source, RpcProfile::Kubo, RpcStrategy::Cid).await;
+    let claim = fixture.claim().await.unwrap();
+    let job_id = claim.model.id.clone();
+    fixture.run(claim).await.unwrap();
+    recover_parked_receipts(&fixture.coordinator, &fixture.store, &mut String::new())
+        .await
+        .unwrap();
+    for _ in 0..jobs::MAX_SUBMIT_RECOVERY_ATTEMPTS {
+        let claim = fixture
+            .claim()
+            .await
+            .expect("each remaining original recovery opportunity must become due");
+        fixture.run(claim).await.unwrap();
+    }
+    let receipt = fixture.evidence().await.pop().unwrap();
+    assert_eq!(
+        (receipt.effect.as_str(), receipt.outcome.as_str()),
+        ("unknown", "unknown")
+    );
+    assert!(receipt.needs_attention);
+    let history = jobs::submission_history(fixture.store.db(), &job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(history.submit_calls, 1);
+    assert_eq!(history.recovery_queries, jobs::MAX_SUBMIT_RECOVERY_ATTEMPTS);
+    let terminal = pin_job::Entity::find_by_id(&job_id)
+        .one(fixture.store.db())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(terminal.state, "error");
+    assert!(terminal.locked_until.is_none());
+    assert_eq!(
+        (history.effect.as_str(), history.state.as_str()),
+        ("unknown", "needs_attention")
+    );
+    for _ in 0..2 {
+        recover_parked_receipts(&fixture.coordinator, &fixture.store, &mut String::new())
+            .await
+            .unwrap();
+        assert!(fixture.claim().await.is_none());
+    }
+    let requests = target.received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.url.path() == "/api/v0/pin/add")
+            .count(),
+        1
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.url.path() == "/api/v0/pin/ls")
+            .count(),
+        usize::try_from(jobs::MAX_SUBMIT_RECOVERY_ATTEMPTS).unwrap()
+    );
+    assert!(
+        pin_replica_observation::Entity::find()
+            .filter(pin_replica_observation::Column::JobId.eq(job_id))
+            .all(fixture.store.db())
+            .await
+            .unwrap()
+            .iter()
+            .all(|fact| !fact.projectable && fact.outcome == "Unknown")
+    );
+    fixture.assert_held().await;
+    no_delete(&target).await;
+}
+
+#[tokio::test]
+async fn zero_call_submit_with_no_receipt_resets_before_one_fresh_post() {
+    let source = MockServer::start().await;
+    let target = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/pin/add"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"Pins":[CID]})))
+        .expect(1)
+        .mount(&target)
+        .await;
+    let fixture = fixture(target.uri(), &source, RpcProfile::Kubo, RpcStrategy::Cid).await;
+    let mut claim = fixture.claim().await.unwrap();
+    let job_id = claim.model.id.clone();
+    pin_job::Entity::update_many()
+        .col_expr(
+            pin_job::Column::SubmitPhase,
+            sea_orm::sea_query::Expr::value("recovering"),
+        )
+        .filter(pin_job::Column::Id.eq(&job_id))
+        .exec(fixture.store.db())
+        .await
+        .unwrap();
+    claim.model.submit_phase = Some("recovering".into());
+    fixture.run(claim).await.unwrap();
+    assert!(
+        jobs::submission_history(fixture.store.db(), &job_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(target.received_requests().await.unwrap().is_empty());
+    let reset = fixture
+        .claim()
+        .await
+        .expect("zero-call proof must restore ready work");
+    assert_eq!(reset.model.submit_phase.as_deref(), Some("ready"));
+    fixture.run(reset).await.unwrap();
+    assert_eq!(fixture.evidence().await[0].outcome, "matched");
+    let history = jobs::submission_history(fixture.store.db(), &job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(history.submit_calls, 1);
+    fixture.assert_held().await;
+    no_delete(&target).await;
+}
+
+#[tokio::test]
+async fn maintenance_resets_only_exact_zero_call_missing_receipt_placeholder() {
+    let source = MockServer::start().await;
+    let target = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/pin/add"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"Pins":[CID]})))
+        .expect(1)
+        .mount(&target)
+        .await;
+    let fixture = fixture(target.uri(), &source, RpcProfile::Kubo, RpcStrategy::Cid).await;
+    let mut claim = fixture.claim().await.unwrap();
+    pin_job::Entity::update_many()
+        .col_expr(
+            pin_job::Column::SubmitPhase,
+            sea_orm::sea_query::Expr::value("recovering"),
+        )
+        .filter(pin_job::Column::Id.eq(&claim.model.id))
+        .exec(fixture.store.db())
+        .await
+        .unwrap();
+    claim.model.submit_phase = Some("recovering".into());
+    jobs::history::Entity::insert(jobs::history::ActiveModel {
+        job_id: Set(claim.model.id.clone()),
+        correlation: Set(None),
+        api: Set("unknown".into()),
+        strategy: Set("unknown".into()),
+        effect: Set("unknown".into()),
+        state: Set("needs_attention".into()),
+        first_error: Set(Some(jobs::RPC_MISSING_RECEIPT_PARK_REASON.into())),
+        last_error: Set(Some(jobs::RPC_MISSING_RECEIPT_PARK_REASON.into())),
+        submit_calls: Set(0),
+        recovery_queries: Set(0),
+        started_at: Set(Utc::now()),
+    })
+    .exec(fixture.store.db())
+    .await
+    .unwrap();
+    pin_job::Entity::update_many()
+        .col_expr(
+            pin_job::Column::LockedUntil,
+            sea_orm::sea_query::Expr::value(Option::<DateTime<Utc>>::None),
+        )
+        .col_expr(
+            pin_job::Column::LastError,
+            sea_orm::sea_query::Expr::value(jobs::RPC_MISSING_RECEIPT_PARK_REASON),
+        )
+        .filter(pin_job::Column::Id.eq(&claim.model.id))
+        .exec(fixture.store.db())
+        .await
+        .unwrap();
+    let history = jobs::submission_history(fixture.store.db(), &claim.model.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((history.submit_calls, history.recovery_queries), (0, 0));
+    recover_missing_receipt_parks(&fixture.coordinator, &fixture.store, &mut String::new())
+        .await
+        .unwrap();
+    assert!(
+        jobs::submission_history(fixture.store.db(), &claim.model.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let reset = fixture
+        .claim()
+        .await
+        .expect("exact placeholder must be restored");
+    assert_eq!(reset.model.submit_phase.as_deref(), Some("ready"));
+    fixture.run(reset).await.unwrap();
+    assert_eq!(fixture.evidence().await[0].outcome, "matched");
+    assert_eq!(
+        target
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path() == "/api/v0/pin/add")
+            .count(),
+        1
+    );
+    no_delete(&target).await;
+}
+
+#[tokio::test]
+async fn committed_submit_call_without_receipt_never_resets_or_posts_again() {
+    let source = MockServer::start().await;
+    let target = MockServer::start().await;
+    let fixture = fixture(target.uri(), &source, RpcProfile::Kubo, RpcStrategy::Cid).await;
+    let mut claim = fixture.claim().await.unwrap();
+    let job_id = claim.model.id.clone();
+    pin_job::Entity::update_many()
+        .col_expr(
+            pin_job::Column::SubmitPhase,
+            sea_orm::sea_query::Expr::value("recovering"),
+        )
+        .filter(pin_job::Column::Id.eq(&job_id))
+        .exec(fixture.store.db())
+        .await
+        .unwrap();
+    claim.model.submit_phase = Some("recovering".into());
+    jobs::record_submit_invocation(fixture.store.db(), &claim, "kubo", "cid", Utc::now())
+        .await
+        .unwrap();
+    fixture.run(claim).await.unwrap();
+    let parked = pin_job::Entity::find_by_id(&job_id)
+        .one(fixture.store.db())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(parked.state, "error");
+    assert!(parked.locked_until.is_none());
+    assert_eq!(
+        jobs::submission_history(fixture.store.db(), &parked.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .submit_calls,
+        1
+    );
+    recover_missing_receipt_parks(&fixture.coordinator, &fixture.store, &mut String::new())
+        .await
+        .unwrap();
+    assert!(fixture.claim().await.is_none());
+    assert!(target.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1043,9 +2041,9 @@ async fn scheduler_receipt_candidates_cannot_authorize_stale_lifetime_retired_pr
 }
 
 #[tokio::test]
-async fn scheduler_recovers_completed_park_without_repeating_provider_post() {
+async fn scheduler_keeps_terminal_receipt_debt_without_repeating_provider_post() {
     let db = store::connect_database("sqlite::memory:").await.unwrap();
-    observed_parked_recovery(db).await;
+    observed_terminal_receipt(db).await;
 }
 
 #[tokio::test]
@@ -1064,7 +2062,7 @@ async fn postgres_warm_rpc_fact_park_and_recovery_do_not_revalidate_structure() 
         .max_connections(4)
         .set_schema_search_path(schema.clone());
     let db = sea_orm::Database::connect(options).await.unwrap();
-    let outcome = std::panic::AssertUnwindSafe(observed_parked_recovery(db.clone()))
+    let outcome = std::panic::AssertUnwindSafe(observed_terminal_receipt(db.clone()))
         .catch_unwind()
         .await;
     db.close().await.unwrap();
@@ -1078,7 +2076,7 @@ async fn postgres_warm_rpc_fact_park_and_recovery_do_not_revalidate_structure() 
     }
 }
 
-async fn observed_parked_recovery(mut db: sea_orm::DatabaseConnection) {
+async fn observed_terminal_receipt(mut db: sea_orm::DatabaseConnection) {
     let trace = crate::sql_trace::SqlTrace::default();
     trace.attach(&mut db);
     let source = MockServer::start().await;
@@ -1137,7 +2135,7 @@ async fn observed_parked_recovery(mut db: sea_orm::DatabaseConnection) {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(parked.state, "running");
+    assert_eq!(parked.state, "error");
     assert!(parked.locked_until.is_none());
     assert_eq!(
         ledger::submission::latest(fixture.store.db(), &job_id)
@@ -1154,14 +2152,14 @@ async fn observed_parked_recovery(mut db: sea_orm::DatabaseConnection) {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(due.state, "pending");
-    assert_eq!(due.submit_phase.as_deref(), Some("recovering"));
+    assert_eq!(due.state, "error");
+    assert!(fixture.claim().await.is_none());
     fixture.drain().await;
-    trace.take("RPC warm claim/fact/park/recovery", true);
+    trace.take("RPC warm terminal receipt maintenance", true);
     let settled = fixture.evidence().await;
     assert_eq!(settled[0].resources, receipt.resources);
     assert_eq!(settled[0].observed_at, receipt.observed_at);
-    assert!(!settled[0].needs_attention);
+    assert!(settled[0].needs_attention);
     fixture.assert_held().await;
     no_delete(&target).await;
 }

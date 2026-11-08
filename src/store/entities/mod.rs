@@ -117,6 +117,7 @@ mod tests {
             logical_size: 1_024,
             provider: "pinata".to_owned(),
             state: "submitted".to_owned(),
+            last_error: None,
             created_at,
             last_touched_at: touched_at,
         };

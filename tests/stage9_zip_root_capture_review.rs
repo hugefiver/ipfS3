@@ -40,7 +40,10 @@ async fn all_original_root_capture_forges_are_rejected_without_short_circuiting(
         ("/options/root_override", json!("true")),
         ("/target_prefix", json!("other/")),
         ("/schema_version", json!(2)),
-        ("/rule_revision", json!("different")),
+        (
+            "/zip_intent/source_decision/control_revision",
+            json!("different"),
+        ),
         ("/zip_intent/bucket", json!("another")),
         ("/zip_intent/source_key", json!("another.zip")),
         ("/zip_intent/target_prefix", json!("other/")),

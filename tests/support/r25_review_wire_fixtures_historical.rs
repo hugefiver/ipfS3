@@ -1,14 +1,13 @@
 //! Original source-only URL promise, admitted through the native historical seam.
 //! This creates a pending request; only the real worker may attest/bind/settle it.
 use ipfs_s3_gateway::{
-    config::OptionalPinControlMode,
     import::ImportSource,
     pinning::{
         config::ValidatedPinningConfig,
         decision::DecisionOrigin,
         policy::{PinPolicyEvaluator, PublicationContext},
         tags::ObjectTag,
-        zip_policy::{ValidatedZipOutputRules, decode_legacy_v2_intent},
+        zip_policy::decode_legacy_v2_intent,
     },
     store::zip::{execution, import_intake},
     zip::options::{ZipTargets, ZipV2Options},
@@ -29,7 +28,7 @@ pub fn source_only_request(
     ];
     // `original` is the authorized first-native fixture policy, supplied BEFORE
     // admit. No stored/pending job is upgraded using a later configuration.
-    let mut decision = PinPolicyEvaluator::new(original)
+    let decision = PinPolicyEvaluator::new(original)
         .evaluate_publication_decision(
             PublicationContext {
                 bucket,
@@ -41,9 +40,6 @@ pub fn source_only_request(
         )
         .unwrap()
         .1;
-    decision
-        .capture_durable_revision(original, OptionalPinControlMode::Strict)
-        .unwrap();
     assert_eq!(decision.effective_intents.len(), 1);
     assert_eq!(
         decision.effective_intents[0].source,
@@ -72,9 +68,8 @@ pub fn source_only_request(
         root_enabled: true,
         result_version: 2,
     };
-    let rules = ValidatedZipOutputRules::compile(&[], original).unwrap();
     let old = serde_json::json!({"bucket":bucket,"source_key":"archive.zip","target_prefix":"out/","options":options,
-        "source_decision":decision,"providers":providers,"pin_plan":{"rule_revision":rules.revision(),
+        "source_decision":decision,"providers":providers,"pin_plan":{"rule_revision":"historical-rule-revision",
             "targets":{"source":false,"extracted":false},"outputs":[]}});
     let capture = decode_legacy_v2_intent(&old.to_string()).unwrap();
     assert_eq!(capture.v2_options(), Some(options.clone()));
@@ -94,7 +89,7 @@ pub fn source_only_request(
             request_fingerprint:hex::encode(Sha256::digest(contract.as_bytes())), request_contract:contract,
             bucket:bucket.into(), source_key:"archive.zip".into(),
             captured_options:serde_json::json!({"options":options,"legacy_zip_intent":old,
-                "target_prefix":"out/","source_tags":tags,"rule_revision":rules.revision(),
+                "target_prefix":"out/","source_tags":tags,"rule_revision":"historical-rule-revision",
                 "source_content_type":"application/zip","source_metadata":{"label":"signed-source"}}).to_string(),
         },
         prefix:"out/".into(), source_descriptor:descriptor, expected_sha256:Some(expected.into()),

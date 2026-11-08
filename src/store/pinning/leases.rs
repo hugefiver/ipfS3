@@ -1480,7 +1480,10 @@ pub(crate) async fn wake_quota_waiting_targets<C: ConnectionTrait>(
     limits: &ProviderLimits,
     now: DateTimeUtc,
 ) -> AppResult<Vec<String>> {
-    wake_quota_waiting_targets_impl(db, provider, limits, now, None).await
+    match wake_quota_waiting_targets_impl(db, provider, limits, now, None, None).await? {
+        quota::WaiterWakeOutcome::Woken(woken) => Ok(woken),
+        quota::WaiterWakeOutcome::Invalid(_) => Err(invalid("quota waiter is not eligible")),
+    }
 }
 
 pub(crate) async fn wake_runtime_quota_waiting_targets(
@@ -1489,8 +1492,9 @@ pub(crate) async fn wake_runtime_quota_waiting_targets(
     limits: &ProviderLimits,
     now: DateTimeUtc,
     work: DecodeWork<'_>,
-) -> AppResult<Vec<String>> {
-    wake_quota_waiting_targets_impl(tx.db(), provider, limits, now, Some((tx, work))).await
+    policy: Option<&crate::pinning::policy::PinPolicyEvaluator>,
+) -> AppResult<quota::WaiterWakeOutcome> {
+    wake_quota_waiting_targets_impl(tx.db(), provider, limits, now, Some((tx, work)), policy).await
 }
 
 async fn wake_quota_waiting_targets_impl<C: ConnectionTrait>(
@@ -1499,7 +1503,8 @@ async fn wake_quota_waiting_targets_impl<C: ConnectionTrait>(
     limits: &ProviderLimits,
     now: DateTimeUtc,
     runtime: Option<(&crate::store::RuntimeTransaction, DecodeWork<'_>)>,
-) -> AppResult<Vec<String>> {
+    policy: Option<&crate::pinning::policy::PinPolicyEvaluator>,
+) -> AppResult<quota::WaiterWakeOutcome> {
     super::management::admission::lock_sqlite_writer_in_caller_transaction(db).await?;
     if let Some((_, work)) = runtime {
         work.with(|session| session.check())
@@ -1538,7 +1543,7 @@ async fn wake_quota_waiting_targets_impl<C: ConnectionTrait>(
         }
     }
     if candidates.is_empty() {
-        return Ok(Vec::new());
+        return Ok(quota::WaiterWakeOutcome::Woken(Vec::new()));
     }
 
     let pairs = candidates
@@ -1582,7 +1587,43 @@ async fn wake_quota_waiting_targets_impl<C: ConnectionTrait>(
 
     let limit_map = ProviderLimitMap::from([(provider.to_owned(), limits.clone())]);
     let mut woken = Vec::new();
-    for (target, _) in candidates {
+    for (target, lease) in candidates {
+        if let Some(policy) = policy {
+            let owner = object::Entity::find_by_id(&lease.owner_object_id)
+                .one(db)
+                .await?;
+            let source = match lease.source.as_str() {
+                "automatic" => Some(crate::pinning::policy::LeaseSource::Automatic),
+                "manual" => Some(crate::pinning::policy::LeaseSource::Manual),
+                _ => None,
+            };
+            let intent = owner.as_ref().zip(source).and_then(|(owner, source)| {
+                policy.resolve_lease_policy(&owner.bucket, &owner.key, source)
+            });
+            let content_allowed = lease.content_mode != "decompressed"
+                || owner.as_ref().is_some_and(|owner| {
+                    policy
+                        .matching_policy(&owner.bucket, &owner.key)
+                        .is_some_and(|policy| policy.allow_decompressed)
+                });
+            if !limits.enabled
+                || !content_allowed
+                || !intent.is_some_and(|intent| {
+                    intent
+                        .providers
+                        .iter()
+                        .any(|candidate| candidate == provider)
+                        && match intent.provider_mode {
+                            ProviderMode::One => lease.provider_mode == "one",
+                            ProviderMode::All => lease.provider_mode == "all",
+                        }
+                })
+            {
+                return Ok(quota::WaiterWakeOutcome::Invalid(Box::new(
+                    quota::QuotaWaiterCandidate { lease, target },
+                )));
+            }
+        }
         let reservation = match runtime {
             Some((tx, work)) => {
                 quota::reserve_runtime_waiter(
@@ -1594,7 +1635,7 @@ async fn wake_quota_waiting_targets_impl<C: ConnectionTrait>(
                     now,
                     work,
                 )
-                .await?
+                .await
             }
             None => {
                 quota::reserve_unique_for_waiter(
@@ -1605,8 +1646,17 @@ async fn wake_quota_waiting_targets_impl<C: ConnectionTrait>(
                     &limit_map,
                     now,
                 )
-                .await?
+                .await
             }
+        };
+        let reservation = match reservation {
+            Ok(reservation) => reservation,
+            Err(AppError::InvalidPinningRequest(_)) => {
+                return Ok(quota::WaiterWakeOutcome::Invalid(Box::new(
+                    quota::QuotaWaiterCandidate { lease, target },
+                )));
+            }
+            Err(error) => return Err(error),
         };
         match reservation {
             ReservationOutcome::QuotaWaiting { .. } => break,
@@ -1618,7 +1668,7 @@ async fn wake_quota_waiting_targets_impl<C: ConnectionTrait>(
             ReservationOutcome::Reserved | ReservationOutcome::Reused => {
                 set_prelocked_target_state(db, &target, TARGET_WAITING).await?;
                 quota::refresh_remote_max_active_touch(db, provider, &target.cid).await?;
-                project_inserted_target_from_prelocked_remote(
+                match project_inserted_target_from_prelocked_remote(
                     db,
                     &target.id,
                     provider,
@@ -1626,12 +1676,21 @@ async fn wake_quota_waiting_targets_impl<C: ConnectionTrait>(
                     now,
                     runtime,
                 )
-                .await?;
+                .await
+                {
+                    Ok(_) => {}
+                    Err(AppError::InvalidPinningRequest(_)) => {
+                        return Ok(quota::WaiterWakeOutcome::Invalid(Box::new(
+                            quota::QuotaWaiterCandidate { lease, target },
+                        )));
+                    }
+                    Err(error) => return Err(error),
+                }
                 woken.push(target.id);
             }
         }
     }
-    Ok(woken)
+    Ok(quota::WaiterWakeOutcome::Woken(woken))
 }
 
 /// Requeues all-mode targets released by quota eviction after a durable cooldown.
@@ -2688,6 +2747,13 @@ async fn complete_no_request_remote_absence_core<C: ConnectionTrait>(
     now: DateTimeUtc,
     runtime: Option<(&crate::store::RuntimeTransaction, DecodeWork<'_>)>,
 ) -> AppResult<NoRequestRemoteCompletion> {
+    let session = SharedDecodeBudget::default();
+    let work = runtime
+        .map(|(_, work)| work)
+        .unwrap_or_else(|| DecodeWork::shared(&session));
+    if has_active_error_hold(db, provider, cid, work).await? {
+        return Ok(NoRequestRemoteCompletion::Stale);
+    }
     if !guard_reconcile_remote_epoch(db, provider, cid, expected_remote_epoch).await?
         || !matches!(
             check_remote_epoch(db, provider, cid, expected_remote_epoch).await?,
@@ -4075,7 +4141,10 @@ async fn refresh_renewal_snapshot_targets_with_work<C: ConnectionTrait>(
 ) -> Result<(), RenewManualLeaseError> {
     work.with(|work| work.nodes(1 + targets.len()))
         .map_err(renewal_work_error)?;
-    let mut ordered_targets = targets.iter().collect::<Vec<_>>();
+    let mut ordered_targets = targets
+        .iter()
+        .filter(|target| target.state != "error")
+        .collect::<Vec<_>>();
     ordered_targets.sort_by(|a, b| compare_target_order(a, b));
     work.with(|work| work.nodes(1 + ordered_targets.len()))
         .map_err(renewal_work_error)?;
@@ -4947,6 +5016,7 @@ pub async fn fail_one_target<C: ConnectionTrait>(
         limits,
         now,
         None,
+        false,
         None,
     )
     .await
@@ -4994,6 +5064,66 @@ pub(crate) async fn fail_runtime_one_target(
         limits,
         now,
         None,
+        false,
+        Some((tx, work)),
+    )
+    .await
+}
+
+pub(crate) async fn terminate_quota_waiter(
+    tx: &crate::store::RuntimeTransaction,
+    candidate: &quota::QuotaWaiterCandidate,
+    now: DateTimeUtc,
+) -> AppResult<bool> {
+    let Some(lease) = lock_lifecycle_lease(tx.db(), &candidate.lease, true).await? else {
+        return Ok(false);
+    };
+    if lease != candidate.lease || lease.state != LEASE_ACTIVE || lease.expires_at <= now {
+        return Ok(false);
+    }
+    let Some(target) = lock_lifecycle_target(tx.db(), &candidate.target, true).await? else {
+        return Ok(false);
+    };
+    if target != candidate.target
+        || !matches!(target.state.as_str(), TARGET_QUOTA_WAITING | TARGET_EVICTED)
+    {
+        return Ok(false);
+    }
+    let changed = pin_lease_target::Entity::update_many()
+        .col_expr(pin_lease_target::Column::State, Expr::value("error"))
+        .col_expr(
+            pin_lease_target::Column::LastError,
+            Expr::value("current policy or allocation authority mismatch"),
+        )
+        .filter(pin_lease_target::Column::Id.eq(&target.id))
+        .filter(pin_lease_target::Column::State.eq(&target.state))
+        .filter(pin_lease_target::Column::LeaseId.eq(&lease.id))
+        .filter(pin_lease_target::Column::Provider.eq(&target.provider))
+        .filter(pin_lease_target::Column::Cid.eq(&target.cid))
+        .exec(tx.db())
+        .await?;
+    Ok(changed.rows_affected == 1)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn fail_runtime_one_quota_waiter(
+    tx: &crate::store::RuntimeTransaction,
+    lease_id: &str,
+    target_id: &str,
+    expected_generation: i64,
+    ordered_providers: &[String],
+    limits: &ProviderLimitMap,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+) -> AppResult<Option<pin_lease_target::Model>> {
+    fail_one_target_at_generation(
+        tx.db(),
+        (lease_id, target_id),
+        ordered_providers,
+        limits,
+        now,
+        Some(expected_generation),
+        true,
         Some((tx, work)),
     )
     .await
@@ -5061,6 +5191,7 @@ async fn fail_one_target_for_job_core<C: ConnectionTrait>(
         limits,
         now,
         Some(expected_generation),
+        false,
         runtime,
     )
     .await?;
@@ -5070,6 +5201,7 @@ async fn fail_one_target_for_job_core<C: ConnectionTrait>(
     Ok(TargetJobFailoverOutcome::Current)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn fail_one_target_at_generation<C: ConnectionTrait>(
     db: &C,
     (lease_id, failed_target_id): (&str, &str),
@@ -5077,6 +5209,7 @@ async fn fail_one_target_at_generation<C: ConnectionTrait>(
     limits: &ProviderLimitMap,
     now: DateTimeUtc,
     expected_generation: Option<i64>,
+    quota_waiter: bool,
     runtime: Option<(&crate::store::RuntimeTransaction, DecodeWork<'_>)>,
 ) -> AppResult<Option<pin_lease_target::Model>> {
     super::management::admission::lock_sqlite_writer_in_caller_transaction(db).await?;
@@ -5089,6 +5222,7 @@ async fn fail_one_target_at_generation<C: ConnectionTrait>(
     if lease.state != LEASE_ACTIVE
         || lease.provider_mode != "one"
         || expected_generation.is_some_and(|expected| lease.generation != expected)
+        || (quota_waiter && lease.expires_at <= now)
     {
         return Ok(None);
     }
@@ -5098,12 +5232,15 @@ async fn fail_one_target_at_generation<C: ConnectionTrait>(
     else {
         return Ok(None);
     };
-    if failed.lease_id != lease_id
-        || !matches!(
+    let valid_source = if quota_waiter {
+        failed.state == TARGET_QUOTA_WAITING
+    } else {
+        matches!(
             failed.state.as_str(),
             TARGET_WAITING | TARGET_SUBMITTED | TARGET_PINNED | TARGET_DEGRADED | TARGET_EVICTED
         )
-    {
+    };
+    if failed.lease_id != lease_id || !valid_source {
         return Ok(None);
     }
     let Some(failed_index) = ordered_providers
@@ -5113,74 +5250,37 @@ async fn fail_one_target_at_generation<C: ConnectionTrait>(
         return Ok(None);
     };
 
-    // Caller health ordering may shrink the birth set, never add a later policy
-    // provider or issue a write under a reduced/changed original contract.
-    let birth = match runtime {
-        Some((_, work)) => crate::store::entities::pin_lease_requirement::contract::get_with_work(
-            db, lease_id, work,
-        )
-        .await
-        .map_err(super::management::admission::work_error)?,
-        None => crate::store::entities::pin_lease_requirement::contract::get(db, lease_id).await?,
-    };
-    let mut allowed = BTreeSet::new();
-    if let Some(birth) = &birth {
-        let points = match runtime {
-            Some((tx, work)) => {
-                super::management::actions::points::candidates_for_cid_catalog(
-                    tx.catalog(work),
-                    lease_id,
-                    &failed.cid,
-                    birth,
-                    work.budget().clone(),
-                )
-                .await
-            }
-            None => {
-                super::management::actions::points::candidates_for_cid(
-                    db,
-                    lease_id,
-                    &failed.cid,
-                    birth,
-                )
-                .await
-            }
-        }
-        .map_err(|_| invalid("invalid exact management fallback point"))?;
-        for (slot, provider, point) in &points {
-            let original = point
+    let birth = crate::store::entities::pin_lease_requirement::contract::get(db, lease_id).await?;
+    let mut quota_allocation_routes = BTreeMap::new();
+    for provider in ordered_providers {
+        if let Some(row) = pin_provider_route::Entity::find_by_id(provider.clone())
+            .one(db)
+            .await?
+            && !row.retired
+            && let Ok(mut route) = serde_json::from_str::<
+                crate::pinning::identity::ProviderRouteSnapshot,
+            >(&row.snapshot)
+        {
+            if let Some(original) = birth
                 .as_ref()
-                .map(|point| &point.destination_route)
-                .or_else(|| birth.candidates.get(slot).and_then(Option::as_ref));
-            if let Some(original) = original
-                && pin_provider_route::Entity::find_by_id(provider.clone())
-                    .one(db)
-                    .await?
-                    .filter(|row| !row.retired)
-                    .and_then(|row| {
-                        serde_json::from_str::<crate::pinning::identity::ProviderRouteSnapshot>(
-                            &row.snapshot,
-                        )
-                        .ok()
-                    })
-                    .as_ref()
-                    == Some(original)
+                .and_then(|birth| birth.candidates.get(provider))
+                .and_then(Option::as_ref)
+                && route.execution_compatible(original)
             {
-                allowed.insert(provider.clone());
+                route.cleanup = original.cleanup;
             }
+            quota_allocation_routes.insert(provider.clone(), route);
         }
     }
-    let frozen_allows = |provider: &String| birth.is_none() || allowed.contains(provider);
 
     let mut targets = lease_targets(db, lease_id).await?;
     targets.sort_by(compare_target_order);
     let eligible_suffix = ordered_providers[failed_index + 1..]
         .iter()
         .filter(|provider| {
-            frozen_allows(provider)
-                && limits
-                    .get(*provider)
-                    .is_some_and(|provider_limits| provider_limits.enabled)
+            limits
+                .get(*provider)
+                .is_some_and(|provider_limits| provider_limits.enabled)
         })
         .cloned()
         .collect::<BTreeSet<_>>();
@@ -5217,10 +5317,9 @@ async fn fail_one_target_at_generation<C: ConnectionTrait>(
         ordered_providers[failed_index + 1..]
             .iter()
             .filter(|provider| {
-                frozen_allows(provider)
-                    && limits
-                        .get(*provider)
-                        .is_some_and(|provider_limits| provider_limits.enabled)
+                limits
+                    .get(*provider)
+                    .is_some_and(|provider_limits| provider_limits.enabled)
                     && !existing_providers.contains(*provider)
             })
             .cloned()
@@ -5252,6 +5351,9 @@ async fn fail_one_target_at_generation<C: ConnectionTrait>(
                 .map(|provider| (provider.clone(), candidate_cids[provider].clone())),
         )
         .collect::<Vec<_>>();
+    if quota_waiter {
+        remote_pairs.push((failed.provider.clone(), failed.cid.clone()));
+    }
     remote_pairs.sort();
     remote_pairs.dedup();
     let mut candidate_remotes = BTreeMap::new();
@@ -5261,9 +5363,38 @@ async fn fail_one_target_at_generation<C: ConnectionTrait>(
             lock_remote_after_lifecycle(db, provider, cid).await?,
         );
     }
-    quota::lock_publication_usage_rows(db, &candidates).await?;
+    let mut usage_providers = candidates.clone();
+    if quota_waiter {
+        usage_providers.push(failed.provider.clone());
+    }
+    quota::lock_publication_usage_rows(db, &usage_providers).await?;
+    if quota_waiter {
+        let session = SharedDecodeBudget::default();
+        let work = runtime
+            .map(|(_, work)| work)
+            .unwrap_or_else(|| DecodeWork::shared(&session));
+        work.copy(&(&failed.provider, &failed.cid, &failed.id, lease.generation))
+            .map_err(work_error)?;
+        work.with(|work| work.nodes(1)).map_err(work_error)?;
+        let schema = persistent_lease_schema(db, work).await?;
+        let allocated = db.query_one(sea_orm::Statement::from_sql_and_values(db.get_database_backend(), format!(
+            "SELECT 1 WHERE EXISTS (SELECT 1 FROM {schema}.remote_pins WHERE provider=$1 AND cid=$2 AND (status<>'absent' OR request_id IS NOT NULL) LIMIT 1)
+             OR EXISTS (SELECT 1 FROM {schema}.pin_jobs WHERE target_id=$3 AND expected_generation=$4 LIMIT 1)
+             OR EXISTS (SELECT 1 FROM {schema}.remote_pin_ledger WHERE provider=$1 AND cid=$2 AND effect NOT IN ('absent','not_created') LIMIT 1)
+             OR EXISTS (SELECT 1 FROM {schema}.pin_submit_observations WHERE provider=$1 AND expected_cid=$2 AND needs_attention=TRUE LIMIT 1)
+             OR EXISTS (SELECT 1 FROM {schema}.pin_submit_history h JOIN {schema}.pin_jobs j ON j.id=h.job_id WHERE j.provider=$1 AND j.cid=$2 AND h.submit_calls>0 AND h.effect='unknown' LIMIT 1)"
+        ), vec![failed.provider.clone().into(), failed.cid.clone().into(), failed.id.clone().into(), lease.generation.into()])).await?.is_some();
+        if allocated {
+            return Ok(None);
+        }
+    }
 
     if let Some(existing) = existing {
+        if quota_waiter {
+            #[cfg(test)]
+            record_target_cas(&failed.id).await;
+            set_prelocked_target_state(db, &failed, TARGET_RELEASED).await?;
+        }
         if existing.state == TARGET_PINNED {
             let cleanup = converge_one_after_replacement_inner(
                 db,
@@ -5295,10 +5426,11 @@ async fn fail_one_target_at_generation<C: ConnectionTrait>(
                 .one(db)
                 .await?
         {
-            let original = serde_json::from_str::<crate::pinning::identity::ProviderRouteSnapshot>(
-                &route.snapshot,
-            )
-            .map_err(|_| invalid("retirement attribution needs attention; fallback denied"))?;
+            let Ok(original) = serde_json::from_str::<
+                crate::pinning::identity::ProviderRouteSnapshot,
+            >(&route.snapshot) else {
+                continue;
+            };
             let closed = match runtime {
                 Some((tx, work)) => {
                     super::management::admission::registration_closed_catalog(
@@ -5322,7 +5454,41 @@ async fn fail_one_target_at_generation<C: ConnectionTrait>(
         {
             continue;
         }
+        if candidate_remotes
+            .get(&(provider.clone(), cid.clone()))
+            .and_then(Option::as_ref)
+            .is_some()
+        {
+            let reusable = match runtime {
+                Some((tx, work)) => {
+                    quota::assert_reusable_route_catalog(tx.catalog(work), &provider, cid, work)
+                        .await
+                }
+                None => quota::assert_reusable_route(db, &provider, cid).await,
+            };
+            match reusable {
+                Ok(()) => {}
+                Err(AppError::InvalidPinningRequest(_)) => continue,
+                Err(error) => return Err(error),
+            }
+        }
         let reservation = match runtime {
+            Some((tx, work)) if quota_waiter => {
+                let Some(original) = quota_allocation_routes.get(&provider) else {
+                    continue;
+                };
+                quota::reserve_runtime_unique_with_route(
+                    tx,
+                    &provider,
+                    cid,
+                    failed.logical_size,
+                    limits,
+                    now,
+                    work,
+                    original,
+                )
+                .await?
+            }
             Some((tx, work)) => {
                 quota::reserve_runtime_unique(
                     tx,
@@ -5366,6 +5532,11 @@ async fn fail_one_target_at_generation<C: ConnectionTrait>(
     if updated.rows_affected != 1 {
         return Err(stale_lifecycle_error("one failover lease"));
     }
+    if quota_waiter {
+        #[cfg(test)]
+        record_target_cas(&failed.id).await;
+        set_prelocked_target_state(db, &failed, TARGET_RELEASED).await?;
+    }
 
     let replacement_id = target_id(lease_id, &provider, &cid);
     let replacement_created_at = pin_lease_target::Entity::find()
@@ -5385,6 +5556,7 @@ async fn fail_one_target_at_generation<C: ConnectionTrait>(
         logical_size: Set(failed.logical_size),
         provider: Set(provider.clone()),
         state: Set(TARGET_WAITING.to_owned()),
+        last_error: Set(None),
         created_at: Set(replacement_created_at),
         last_touched_at: Set(now),
     })
@@ -6985,17 +7157,20 @@ async fn end_leases_core<C: ConnectionTrait>(
                 is_desired_target_state(&target.state)
                     || matches!(
                         target.state.as_str(),
-                        TARGET_QUOTA_WAITING | TARGET_QUOTA_BLOCKED
+                        TARGET_QUOTA_WAITING | TARGET_QUOTA_BLOCKED | "error"
                     )
             }),
         );
     }
     targets.sort_by(compare_target_order);
     for target in targets {
-        if is_desired_target_state(&target.state) {
+        if is_desired_target_state(&target.state) || target.state == "error" {
             work.copy(&(&target.provider, &target.cid))
                 .map_err(work_error)?;
             pairs.insert((target.provider.clone(), target.cid.clone()));
+        }
+        if target.state == "error" {
+            continue;
         }
 
         #[cfg(test)]
@@ -7078,7 +7253,9 @@ async fn schedule_after_desired_change_core<C: ConnectionTrait>(
         if remote.status != REMOTE_ABSENT {
             ensure_reconcile_core(db, provider, cid, epoch, now, work, runtime).await?;
         }
-    } else if remote.status != REMOTE_ABSENT || remote.request_id.is_some() {
+    } else if (remote.status != REMOTE_ABSENT || remote.request_id.is_some())
+        && !has_active_error_hold(db, provider, cid, work).await?
+    {
         let NewPinJob::Remote(job) = jobs::unpin_job(provider, cid, epoch, now) else {
             unreachable!("unpin constructor is remote scoped")
         };
@@ -7120,6 +7297,59 @@ fn active_target_states() -> [&'static str; 4] {
         TARGET_PINNED,
         TARGET_DEGRADED,
     ]
+}
+
+async fn persistent_lease_schema<C: ConnectionTrait>(
+    db: &C,
+    work: DecodeWork<'_>,
+) -> AppResult<String> {
+    work.with(|work| work.nodes(3)).map_err(work_error)?;
+    if db.get_database_backend() == sea_orm::DatabaseBackend::Sqlite {
+        return Ok("\"main\"".to_owned());
+    }
+    let row = db.query_one(sea_orm::Statement::from_string(db.get_database_backend(),
+        "SELECT pg_catalog.quote_ident(n.nspname) AS schema_name FROM pg_catalog.pg_namespace n JOIN pg_catalog.pg_class t ON t.relnamespace=n.oid AND t.relname='pin_lease_targets' AND t.relpersistence='p' AND t.relkind IN ('r','p') JOIN pg_catalog.pg_class l ON l.relnamespace=n.oid AND l.relname='pin_leases' AND l.relpersistence='p' AND l.relkind IN ('r','p') WHERE n.nspname=ANY(pg_catalog.current_schemas(false)) ORDER BY pg_catalog.array_position(pg_catalog.current_schemas(false),n.nspname) LIMIT 1",
+    )).await?.ok_or_else(|| AppError::Database("persistent lease relations unavailable".into()))?;
+    let schema: String = row.try_get("", "schema_name")?;
+    work.copy(&schema).map_err(work_error)?;
+    Ok(schema)
+}
+
+pub(crate) async fn active_error_hold_condition<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+    cid: &str,
+    work: DecodeWork<'_>,
+) -> AppResult<sea_orm::Condition> {
+    work.copy(&(provider, cid)).map_err(work_error)?;
+    let schema = persistent_lease_schema(db, work).await?;
+    let (provider_parameter, cid_parameter) =
+        if db.get_database_backend() == sea_orm::DatabaseBackend::Postgres {
+            ("$1", "$2")
+        } else {
+            ("?", "?")
+        };
+    Ok(sea_orm::Condition::all().add(Expr::cust_with_values(
+        format!("EXISTS (SELECT 1 FROM {schema}.\"pin_lease_targets\" t JOIN {schema}.\"pin_leases\" l ON l.id=t.lease_id WHERE t.provider={provider_parameter} AND t.cid={cid_parameter} AND t.state='error' AND l.state='active' LIMIT 1)"),
+        [provider, cid],
+    )))
+}
+
+pub(crate) async fn has_active_error_hold<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+    cid: &str,
+    work: DecodeWork<'_>,
+) -> AppResult<bool> {
+    let condition = active_error_hold_condition(db, provider, cid, work).await?;
+    let query = sea_orm::sea_query::Query::select()
+        .expr(Expr::value(1))
+        .cond_where(condition)
+        .to_owned();
+    Ok(db
+        .query_one(db.get_database_backend().build(&query))
+        .await?
+        .is_some())
 }
 
 fn is_desired_target_state(state: &str) -> bool {

@@ -229,15 +229,15 @@ async fn observed_resource_vector_is_bounded_and_duplicate_roots_still_fail() {
 }
 
 #[tokio::test]
-async fn successful_observation_is_recursive_verified_but_ownership_stays_unknown() {
+async fn cid_submit_completes_from_one_exact_pin_add_ack_without_confirmation_io() {
     let source = MockServer::start().await;
     let target = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/v0/pin/add"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"Pins": [CID]})))
+        .expect(1)
         .mount(&target)
         .await;
-    super::tests::local(&target, CID).await;
     let p = provider(&target, &source, RpcProfile::Kubo, RpcStrategy::Cid);
     let observation = p.submit_observed(submit(CID)).await;
     assert_eq!(
@@ -248,9 +248,20 @@ async fn successful_observation_is_recursive_verified_but_ownership_stays_unknow
     assert_eq!(observation.resources.len(), 1);
     assert_eq!(
         observation.resources[0].status,
-        RpcResourceStatus::RecursiveVerified
+        RpcResourceStatus::PinAccepted
     );
     assert_eq!(observation.resources[0].ownership, Ownership::Unknown);
+    assert!(source.received_requests().await.unwrap().is_empty());
+    assert_eq!(
+        target
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|request| request.url.path())
+            .collect::<Vec<_>>(),
+        ["/api/v0/pin/add"]
+    );
 }
 
 #[tokio::test]

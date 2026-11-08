@@ -10,9 +10,7 @@ use s3s::{S3Request, S3Response, S3Result};
 
 use crate::crypto::EncryptionMode;
 use crate::error::AppError;
-use crate::pinning::decision::{
-    DecisionEffect, DecisionOrigin, ExtensionDecision, WarningCode, config_revision,
-};
+use crate::pinning::decision::{DecisionEffect, DecisionOrigin, ExtensionDecision, WarningCode};
 use crate::pinning::policy::{PublicationContext, PublicationPolicy};
 use crate::pinning::tags::{ObjectTag, PinControl};
 use crate::state::AppState;
@@ -454,7 +452,6 @@ pub(crate) fn verify_publication_preflight(
         || expected_decision.effect != decision.effect
         || expected_decision.warning != decision.warning
         || expected_decision.legacy_unknown != decision.legacy_unknown
-        || expected_decision.config_revision != decision.config_revision
         || expected_decision.control != decision.control
         || expected_decision.effective_intents != decision.effective_intents
         || expected_decision.origin.principal_id != decision.origin.principal_id
@@ -512,21 +509,10 @@ fn inherited_unexecuted_decision(
         leases: automatic.leases,
     };
     let origin = DecisionOrigin::new(principal, mutation_id);
-    let revision = config_revision(
-        state.pinning.effective_config(),
-        state.pinning.control_mode(),
-    );
     let decision = if legacy_unknown {
-        ExtensionDecision::capture_legacy_unknown(origin, revision, control, &policy)
+        ExtensionDecision::capture_legacy_unknown(origin, control, &policy)
     } else {
-        ExtensionDecision::capture(
-            origin,
-            revision,
-            DecisionEffect::Skipped,
-            warning,
-            control,
-            &policy,
-        )
+        ExtensionDecision::capture(origin, DecisionEffect::Skipped, warning, control, &policy)
     }
     .map_err(invalid_pinning_argument)?;
     Ok((policy, decision))

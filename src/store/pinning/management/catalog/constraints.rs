@@ -98,6 +98,10 @@ fn foreign_keys(table: &str) -> Option<Vec<ForeignKey>> {
     })
 }
 pub(super) async fn validate<C: ConnectionTrait>(db: &C, tables: &[NativeTable]) -> Result<()> {
+    let current = tables.iter().any(|table| {
+        table.table == "pin_lease_targets"
+            && table.columns.iter().any(|column| column == "last_error")
+    });
     for table in tables {
         if let Some(expected) = foreign_keys(&table.table) {
             if db.get_database_backend() == DatabaseBackend::Sqlite {
@@ -132,9 +136,11 @@ pub(super) async fn validate<C: ConnectionTrait>(db: &C, tables: &[NativeTable])
             ),
             (
                 "pin_lease_targets",
-                vec![
-                    "CHECK(state IN ('waiting','submitted','pinned','degraded','quota_waiting','quota_blocked','evicted','released'))",
-                ],
+                vec![if current {
+                    "CHECK(state IN ('waiting','submitted','pinned','degraded','quota_waiting','quota_blocked','evicted','released','error'))"
+                } else {
+                    "CHECK(state IN ('waiting','submitted','pinned','degraded','quota_waiting','quota_blocked','evicted','released'))"
+                }],
             ),
             (
                 "remote_pins",
@@ -147,7 +153,11 @@ pub(super) async fn validate<C: ConnectionTrait>(db: &C, tables: &[NativeTable])
             (
                 "pin_jobs",
                 vec![
-                    "CHECK(state IN ('pending','running','done'))",
+                    if current {
+                        "CHECK(state IN ('pending','running','done','error'))"
+                    } else {
+                        "CHECK(state IN ('pending','running','done'))"
+                    },
                     "CHECK(((operation IN ('submit','poll') AND lease_id IS NOT NULL AND target_id IS NOT NULL AND expected_generation IS NOT NULL AND expected_remote_epoch IS NULL) OR (operation IN ('unpin','reconcile') AND lease_id IS NULL AND target_id IS NULL AND expected_generation IS NULL AND expected_remote_epoch IS NOT NULL)))",
                     "CHECK(((operation='submit' AND submit_phase IS NOT NULL AND submit_phase IN ('ready','calling','recovering','recovery_backoff')) OR (operation<>'submit' AND submit_phase IS NULL)))",
                 ],
@@ -201,7 +211,7 @@ pub(super) async fn validate<C: ConnectionTrait>(db: &C, tables: &[NativeTable])
             }
         }
     } else {
-        pg_checks(db).await?;
+        pg_checks(db, current).await?;
         pg_unique_indexes(db).await?;
         let row=db.query_one(Statement::from_string(DatabaseBackend::Postgres,"SELECT t.tgtype::integer AS flags,t.tgenabled::text AS enabled,t.tgqual IS NULL AS unconditional,t.tgattr::text AS columns,encode(t.tgargs,'hex') AS args,p.prosrc AS body,p.prosecdef,p.proconfig IS NULL AS default_config,pn.nspname=current_schema() AS local_function FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid=t.tgrelid JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace JOIN pg_catalog.pg_proc p ON p.oid=t.tgfoid JOIN pg_catalog.pg_namespace pn ON pn.oid=p.pronamespace WHERE n.nspname=current_schema() AND c.relname='pin_legacy_migration_items' AND t.tgname='pin_legacy_item_bound' AND NOT t.tgisinternal")).await.map_err(|_|ManagementError::Schema)?.ok_or(ManagementError::Schema)?;
         if row
@@ -395,7 +405,7 @@ async fn pg_foreign_keys<C: ConnectionTrait>(
     }
     Ok(())
 }
-async fn pg_checks<C: ConnectionTrait>(db: &C) -> Result<()> {
+async fn pg_checks<C: ConnectionTrait>(db: &C, current: bool) -> Result<()> {
     for (table, expected) in [
         (
             "pin_leases",
@@ -452,7 +462,19 @@ async fn pg_checks<C: ConnectionTrait>(db: &C) -> Result<()> {
                     .map_err(|_| ManagementError::Schema)?,
             ));
         }
-        let mut expected = expected.into_iter().map(compact).collect::<Vec<_>>();
+        let mut expected = expected
+            .into_iter()
+            .map(|expression| {
+                let expression = if current {
+                    expression
+                        .replace("'done'::text]", "'done'::text, 'error'::text]")
+                        .replace("'released'::text]", "'released'::text, 'error'::text]")
+                } else {
+                    expression.to_owned()
+                };
+                compact(&expression)
+            })
+            .collect::<Vec<_>>();
         expected.sort();
         actual.sort();
         if actual != expected {

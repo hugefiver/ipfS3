@@ -42,7 +42,6 @@ pub struct ZipV2Publication {
     pub source_guard: Option<StandardMutationGuard>,
     pub successes: Vec<ZipV2Success>,
     pub targets: ZipTargets,
-    pub captured_rule_revision: Option<String>,
     pub root_outcome: storage::RootOutcome,
     pub terminal_result: String,
 }
@@ -56,11 +55,19 @@ pub enum ZipV2PublicationResult {
 pub async fn publish_zip_v2(
     db: &DatabaseConnection,
     request: ZipV2Publication,
-    _rules: &ValidatedZipOutputRules,
-    _config: &ValidatedPinningConfig,
-    _limits: &ProviderLimitMap,
+    rules: &ValidatedZipOutputRules,
+    config: &ValidatedPinningConfig,
+    limits: &ProviderLimitMap,
 ) -> AppResult<ZipV2PublicationResult> {
-    publish(db, request, ZipExecutionSettlement::Direct).await
+    publish(
+        db,
+        request,
+        ZipExecutionSettlement::Direct,
+        limits,
+        rules,
+        config,
+    )
+    .await
 }
 
 impl ZipV2Publication {
@@ -68,21 +75,37 @@ impl ZipV2Publication {
         self,
         db: &DatabaseConnection,
         contract: String,
-        _rules: &ValidatedZipOutputRules,
-        _config: &ValidatedPinningConfig,
-        _limits: &ProviderLimitMap,
+        rules: &ValidatedZipOutputRules,
+        config: &ValidatedPinningConfig,
+        limits: &ProviderLimitMap,
     ) -> AppResult<ZipV2PublicationResult> {
-        publish(db, self, ZipExecutionSettlement::Mpu { contract }).await
+        publish(
+            db,
+            self,
+            ZipExecutionSettlement::Mpu { contract },
+            limits,
+            rules,
+            config,
+        )
+        .await
     }
 
     pub async fn publish_import(
         self,
         db: &DatabaseConnection,
-        _rules: &ValidatedZipOutputRules,
-        _config: &ValidatedPinningConfig,
-        _limits: &ProviderLimitMap,
+        rules: &ValidatedZipOutputRules,
+        config: &ValidatedPinningConfig,
+        limits: &ProviderLimitMap,
     ) -> AppResult<ZipV2PublicationResult> {
-        publish(db, self, ZipExecutionSettlement::Import).await
+        publish(
+            db,
+            self,
+            ZipExecutionSettlement::Import,
+            limits,
+            rules,
+            config,
+        )
+        .await
     }
 }
 
@@ -90,12 +113,34 @@ async fn publish(
     db: &DatabaseConnection,
     request: ZipV2Publication,
     settlement: ZipExecutionSettlement,
+    limits: &ProviderLimitMap,
+    rules: &ValidatedZipOutputRules,
+    config: &ValidatedPinningConfig,
 ) -> AppResult<ZipV2PublicationResult> {
     let row = zip_batch::Entity::find_by_id(&request.claim.batch_id)
         .one(db)
         .await?
         .ok_or_else(|| super::invalid_publication("missing ZIP capture; needs_attention"))?;
     let capture = zip::read_capture(&row.captured_options)?;
+    let selection = match capture.resolve_current_with_rules(
+        config,
+        rules,
+        crate::config::OptionalPinControlMode::Strict,
+    ) {
+        Ok(selection) => selection,
+        Err(error) => {
+            execution::fence(db, &request.claim).await?;
+            return Err(super::invalid_publication(&error.to_string()));
+        }
+    };
+    if matches!(
+        &settlement,
+        ZipExecutionSettlement::Mpu { .. } | ZipExecutionSettlement::Import
+    ) && let Err(error) = selection.validate_durable_current(config)
+    {
+        execution::fence(db, &request.claim).await?;
+        return Err(super::invalid_publication(&error.to_string()));
+    }
     if capture
         .v2_options()
         .is_none_or(|o| o.targets != request.targets)
@@ -122,7 +167,7 @@ async fn publish(
             .collect(),
         ..Default::default()
     };
-    let result = zip::publish_captured_zip(
+    let result = zip::publish_captured_zip_with_limits(
         db,
         CapturedZipPublication {
             batch_id: claim.batch_id.clone(),
@@ -139,9 +184,16 @@ async fn publish(
             root_outcome: request.root_outcome,
             terminal_result: request.terminal_result,
         },
+        Some(limits),
+        &selection,
     )
     .await;
-    if matches!(result, Err(crate::error::AppError::StaleContentMutation)) {
+    if matches!(
+        result,
+        Err(crate::error::AppError::InvalidPinningRequest(_))
+    ) {
+        execution::fence(db, &claim).await?;
+    } else if matches!(result, Err(crate::error::AppError::StaleContentMutation)) {
         let fenced = if source_exists {
             execution::fence(db, &claim).await
         } else {

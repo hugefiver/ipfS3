@@ -423,7 +423,7 @@ async fn verify_birth_routes_core<C: ConnectionTrait>(
             serde_json::from_str(&route.snapshot).map_err(|_| {
                 AppError::InvalidPinningRequest("registered provider route is invalid".into())
             })?;
-        if (route.retired && allocatable.contains(key)) || current != *snapshot {
+        if (route.retired && allocatable.contains(key)) || !current.execution_compatible(snapshot) {
             return Err(AppError::InvalidPinningRequest(
                 "captured provider route no longer matches registration".into(),
             ));
@@ -470,6 +470,7 @@ pub async fn capture_reservation<C: ConnectionTrait>(
         provider,
         cid,
         super::management::records::DecodeWork::shared(&work),
+        None,
     )
     .await
 }
@@ -478,8 +479,9 @@ pub(crate) async fn capture_reservation_with_work<C: ConnectionTrait>(
     provider: &str,
     cid: &str,
     work: super::management::records::DecodeWork<'_>,
+    original_route: Option<&ProviderRouteSnapshot>,
 ) -> AppResult<()> {
-    capture_reservation_core(db, provider, cid, work, None).await
+    capture_reservation_core(db, provider, cid, work, None, original_route).await
 }
 
 pub(in crate::store::pinning) async fn capture_runtime_reservation(
@@ -487,8 +489,25 @@ pub(in crate::store::pinning) async fn capture_runtime_reservation(
     provider: &str,
     cid: &str,
     work: super::management::records::DecodeWork<'_>,
+    original_route: Option<&ProviderRouteSnapshot>,
 ) -> AppResult<()> {
-    capture_reservation_core(tx.db(), provider, cid, work, Some(tx)).await
+    capture_reservation_core(tx.db(), provider, cid, work, Some(tx), original_route).await
+}
+
+fn allocation_route(current: &str, original: Option<&ProviderRouteSnapshot>) -> AppResult<String> {
+    let Some(original) = original else {
+        return Ok(current.to_owned());
+    };
+    let registered: ProviderRouteSnapshot = serde_json::from_str(current).map_err(|_| {
+        AppError::InvalidPinningRequest("invalid registered allocation route".into())
+    })?;
+    if !registered.execution_compatible(original) {
+        return Err(AppError::InvalidPinningRequest(
+            "original allocation route unavailable".into(),
+        ));
+    }
+    serde_json::to_string(original)
+        .map_err(|_| AppError::Internal("allocation route serialization".into()))
 }
 
 async fn capture_reservation_core<C: ConnectionTrait>(
@@ -497,6 +516,7 @@ async fn capture_reservation_core<C: ConnectionTrait>(
     cid: &str,
     work: super::management::records::DecodeWork<'_>,
     runtime: Option<&crate::store::RuntimeTransaction>,
+    original_route: Option<&ProviderRouteSnapshot>,
 ) -> AppResult<()> {
     match runtime {
         Some(tx) => super::management::admission::lock_runtime_provider(tx, provider, work).await?,
@@ -524,7 +544,7 @@ async fn capture_reservation_core<C: ConnectionTrait>(
     remote_pin_ledger::Entity::insert(remote_pin_ledger::ActiveModel {
         provider: Set(provider.into()),
         cid: Set(cid.into()),
-        route: Set(Some(route.snapshot)),
+        route: Set(Some(allocation_route(&route.snapshot, original_route)?)),
         ownership: Set("unknown".into()),
         effect: Set("reserved".into()),
         ..Default::default()
@@ -548,6 +568,7 @@ pub async fn capture_reallocation<C: ConnectionTrait>(
         provider,
         cid,
         super::management::records::DecodeWork::shared(&work),
+        None,
     )
     .await
 }
@@ -556,8 +577,9 @@ pub(crate) async fn capture_reallocation_with_work<C: ConnectionTrait>(
     provider: &str,
     cid: &str,
     work: super::management::records::DecodeWork<'_>,
+    original_route: Option<&ProviderRouteSnapshot>,
 ) -> AppResult<()> {
-    capture_reallocation_core(db, provider, cid, work, None).await
+    capture_reallocation_core(db, provider, cid, work, None, original_route).await
 }
 
 pub(in crate::store::pinning) async fn capture_runtime_reallocation(
@@ -565,8 +587,9 @@ pub(in crate::store::pinning) async fn capture_runtime_reallocation(
     provider: &str,
     cid: &str,
     work: super::management::records::DecodeWork<'_>,
+    original_route: Option<&ProviderRouteSnapshot>,
 ) -> AppResult<()> {
-    capture_reallocation_core(tx.db(), provider, cid, work, Some(tx)).await
+    capture_reallocation_core(tx.db(), provider, cid, work, Some(tx), original_route).await
 }
 
 async fn capture_reallocation_core<C: ConnectionTrait>(
@@ -575,6 +598,7 @@ async fn capture_reallocation_core<C: ConnectionTrait>(
     cid: &str,
     work: super::management::records::DecodeWork<'_>,
     runtime: Option<&crate::store::RuntimeTransaction>,
+    original_route: Option<&ProviderRouteSnapshot>,
 ) -> AppResult<()> {
     match runtime {
         Some(tx) => super::management::admission::lock_runtime_provider(tx, provider, work).await?,
@@ -585,7 +609,7 @@ async fn capture_reallocation_core<C: ConnectionTrait>(
         None => get_with_work(db, provider, cid, work).await?,
     };
     let Some(row) = row else {
-        return capture_reservation_core(db, provider, cid, work, runtime).await;
+        return capture_reservation_core(db, provider, cid, work, runtime, original_route).await;
     };
     if row.effect != "absent" {
         return Err(AppError::Internal(
@@ -606,7 +630,7 @@ async fn capture_reallocation_core<C: ConnectionTrait>(
         ));
     }
     let mut active: remote_pin_ledger::ActiveModel = row.into();
-    active.route = Set(Some(route.snapshot));
+    active.route = Set(Some(allocation_route(&route.snapshot, original_route)?));
     active.ownership = Set("unknown".into());
     active.effect = Set("reserved".into());
     active.first_observed_at = Set(None);
@@ -1634,6 +1658,9 @@ async fn cleanup_from_candidates_core(
     candidates: Option<super::management::records::locator::AuthorityView>,
     catalog: super::legacy_migration::ReceiptCatalog<'_>,
 ) -> AppResult<bool> {
+    if super::leases::has_active_error_hold(&catalog, provider, cid, work).await? {
+        return Ok(false);
+    }
     let row = if let Some(candidates) = candidates {
         if !candidates.originals.is_empty()
             && super::legacy_migration::resource_binding_from_catalog(

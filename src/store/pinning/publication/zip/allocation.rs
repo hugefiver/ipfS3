@@ -59,6 +59,19 @@ impl CaptureBounds {
                 list: "",
             })
             .map_err(|_| ManagementError::Budget)?;
+        let source = capture.source_provider_candidates();
+        bounds.source_providers = copied(session, source)?;
+        let source_intents_bytes = copied(session, capture.source_intents())?;
+        bounds.capture_bytes = bounds
+            .capture_bytes
+            .checked_add(bounds.source_providers)
+            .and_then(|bytes| bytes.checked_add(source_intents_bytes))
+            .ok_or(ManagementError::Budget)?;
+        bounds.provider_count = bounds.provider_count.max(source.len());
+        bounds.provider_total = bounds
+            .provider_total
+            .checked_add(source.len())
+            .ok_or(ManagementError::Budget)?;
         Ok(bounds)
     }
 
@@ -78,7 +91,7 @@ impl CaptureBounds {
         let mut bytes = add(self.capture_bytes, mul(outputs.len(), 288)?)?;
         if source.is_some() {
             bytes = add(bytes, copied(session, capture.source_decision())?)?;
-            for intent in &capture.source_decision().effective_intents {
+            for intent in capture.source_intents() {
                 let targets =
                     if intent.content_mode == crate::pinning::tags::ContentMode::Decompressed {
                         output_bytes
@@ -99,7 +112,6 @@ impl CaptureBounds {
             &(
                 capture.origin(),
                 &capture.source_decision().control_revision,
-                capture.policy_revision(),
             ),
         )?;
         // planned temporaries coexist with the persistent lease and decision intent copies.
@@ -134,7 +146,7 @@ impl CaptureBounds {
         source: bool,
     ) -> AppResult<usize> {
         let budget = || crate::error::AppError::ManagementBudget;
-        let manual = capture.source_decision().effective_intents.len();
+        let manual = capture.source_intents().len();
         let objects = outputs
             .checked_add(usize::from(source))
             .ok_or_else(budget)?;

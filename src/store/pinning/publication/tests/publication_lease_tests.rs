@@ -32,7 +32,10 @@ async fn fixture_with_entries(
     archive.multipart = true;
     let archive = request(
         archive,
-        vec![tag("ipfs-s3:pin", "true")],
+        vec![
+            tag("ipfs-s3:pin", "true"),
+            tag("ipfs-s3:content", "decompressed"),
+        ],
         vec![intent(
             LeaseSource::Manual,
             ProviderMode::All,
@@ -125,6 +128,8 @@ async fn publish(
     guard: StandardMutationGuard,
     target: MultipartUploadTargetIdentity,
 ) -> Result<PublicationResult, TransactionError<AppError>> {
+    let decided =
+        zip_fixture::current_snapshot(db, &batch.batch_id, &request.archive, &limits()).await;
     publication_attempt(
         db.into(),
         request.archive,
@@ -137,7 +142,7 @@ async fn publish(
         None,
         None,
         limits(),
-        None,
+        Some(decided),
         Some(zip_fixture::replay()),
         &Default::default(),
     )

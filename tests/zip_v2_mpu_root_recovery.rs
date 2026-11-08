@@ -438,7 +438,10 @@ async fn persisted_mpu_capture_requires_exact_protocol_flags_token_and_root_iden
         ("/options/root_override", json!("true")),
         ("/target_prefix", json!("other/")),
         ("/schema_version", json!(2)),
-        ("/rule_revision", json!("different")),
+        (
+            "/zip_intent/source_decision/control_revision",
+            json!("different"),
+        ),
         ("/zip_intent/bucket", json!("another")),
         ("/zip_intent/source_key", json!("another.zip")),
         ("/zip_intent/target_prefix", json!("other/")),
@@ -714,7 +717,10 @@ async fn paired_original_mpu_envelope_tampering_is_409_before_rpc_or_publication
         ),
         ("/zip_intent/controls/root", json!({"configured":false})),
         ("/target_prefix", json!("other/")),
-        ("/rule_revision", json!("other")),
+        (
+            "/zip_intent/source_decision/control_revision",
+            json!("other"),
+        ),
     ] {
         let mut tampered = original.clone();
         *tampered.pointer_mut(pointer).unwrap() = value;

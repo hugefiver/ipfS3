@@ -128,12 +128,14 @@ async fn runtime_wake_batches_fifo_deduplicates_and_reuses_clone_qualification()
         let started = std::time::Instant::now();
         let tx = owner.begin_runtime(work).await.unwrap();
         begin_sql.push(session.lock().unwrap().task_usage().unwrap().sql);
-        assert_eq!(
-            wake_runtime_provider_waiters(&tx, "pinata", &limits(), now, work)
+        let WaiterWakeOutcome::Woken(woken) =
+            wake_runtime_provider_waiters(&tx, "pinata", &limits(), now, work, None)
                 .await
-                .unwrap(),
-            expected
-        );
+                .unwrap()
+        else {
+            panic!("valid waiters must be admitted");
+        };
+        assert_eq!(woken, expected);
         work.with(|session| session.check()).unwrap();
         tx.commit().await.unwrap();
         let used = session.lock().unwrap().task_usage().unwrap();
@@ -202,12 +204,14 @@ async fn runtime_wake_shared_budget_exhaustion_after_reservation_rolls_back_ever
     let baseline = SharedDecodeBudget::default();
     let work = DecodeWork::shared(&baseline);
     let tx = store.begin_runtime(work).await.unwrap();
-    assert_eq!(
-        wake_runtime_provider_waiters(&tx, "pinata", &limits(), now, work)
+    let WaiterWakeOutcome::Woken(woken) =
+        wake_runtime_provider_waiters(&tx, "pinata", &limits(), now, work, None)
             .await
-            .unwrap(),
-        ["head"]
-    );
+            .unwrap()
+    else {
+        panic!("the valid queue head must be admitted");
+    };
+    assert_eq!(woken, ["head"]);
     assert_eq!(
         reserve_runtime_waiter(
             &tx,
@@ -249,7 +253,7 @@ async fn runtime_wake_shared_budget_exhaustion_after_reservation_rolls_back_ever
     let tx = store.begin_runtime(work).await.unwrap();
     work.with(|session| session.consume(0, prior_work as usize))
         .unwrap();
-    let result = wake_runtime_provider_waiters(&tx, "pinata", &limits(), now, work).await;
+    let result = wake_runtime_provider_waiters(&tx, "pinata", &limits(), now, work, None).await;
     assert!(
         matches!(result, Err(AppError::ManagementBudget)),
         "{result:?}"
@@ -312,12 +316,14 @@ async fn runtime_wake_operator_debt_preserves_the_queued_admission() {
     let session = SharedDecodeBudget::default();
     let work = DecodeWork::shared(&session);
     let tx = store.begin_runtime(work).await.unwrap();
-    assert!(
-        wake_runtime_provider_waiters(&tx, "pinata", &limits(), now, work)
+    let WaiterWakeOutcome::Woken(woken) =
+        wake_runtime_provider_waiters(&tx, "pinata", &limits(), now, work, None)
             .await
             .unwrap()
-            .is_empty()
-    );
+    else {
+        panic!("provider debt does not make a valid waiter malformed");
+    };
+    assert!(woken.is_empty());
     work.with(|session| session.check()).unwrap();
     tx.commit().await.unwrap();
     assert_eq!(

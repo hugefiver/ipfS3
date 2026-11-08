@@ -102,16 +102,10 @@ pub(super) fn root_prefix(batch: &zip_batch::Model, value: &Value) -> AppResult<
         if versioned {
             if batch.source != "mpu"
                 || value["schema_version"] != 1
-                || object.len() != 5
-                || ![
-                    "schema_version",
-                    "options",
-                    "target_prefix",
-                    "rule_revision",
-                    "zip_intent",
-                ]
-                .iter()
-                .all(|field| object.contains_key(*field))
+                || object.len() != 4 + usize::from(object.contains_key("rule_revision"))
+                || !["schema_version", "options", "target_prefix", "zip_intent"]
+                    .iter()
+                    .all(|field| object.contains_key(*field))
             {
                 return Err(stale());
             }
@@ -120,11 +114,10 @@ pub(super) fn root_prefix(batch: &zip_batch::Model, value: &Value) -> AppResult<
             // silently select the historical direct envelope.
             return Err(stale());
         }
-        let revision = value
+        if value
             .get("rule_revision")
-            .and_then(Value::as_str)
-            .ok_or_else(stale)?;
-        if revision.is_empty() {
+            .is_some_and(|revision| revision.as_str().is_none_or(str::is_empty))
+        {
             return Err(stale());
         }
         if object.contains_key("zip_intent")
@@ -135,10 +128,7 @@ pub(super) fn root_prefix(batch: &zip_batch::Model, value: &Value) -> AppResult<
         {
             let intent = decode_zip_capture_json(&value.to_string()).map_err(|_| stale())?;
             verify_intent(batch, &intent)?;
-            if intent.target_prefix() != prefix
-                || intent.policy_revision() != revision
-                || intent.v2_options().as_ref() != Some(&captured)
-            {
+            if intent.target_prefix() != prefix || intent.v2_options().as_ref() != Some(&captured) {
                 return Err(stale());
             }
         } else {

@@ -235,7 +235,7 @@ pub(crate) async fn current_state_catalog(
             .ok_or(ManagementError::Changed)?;
         if matches!(
             target.state.as_str(),
-            "quota_waiting" | "quota_blocked" | "failed"
+            "quota_waiting" | "quota_blocked" | "failed" | "error"
         ) {
             return Ok(NeedsAttention);
         }

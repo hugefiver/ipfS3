@@ -266,7 +266,15 @@ fn r25_source_false_is_ownerless_and_explicit_source_is_not_disabled_by_auto_swi
             select_zip_intents(&explicit, &manifest(&outputs), Some(&source), &outputs).unwrap();
         assert_eq!(selected.leases.len(), expected);
         assert_eq!(
-            selected.source_decision.unwrap().effective_intents.len(),
+            selected.source_decision.as_ref().unwrap(),
+            explicit.source_decision()
+        );
+        assert_eq!(
+            selected
+                .leases
+                .iter()
+                .filter(|lease| lease.owner == source)
+                .count(),
             usize::from(matches!(targets, "source" | "both"))
         );
     }
@@ -276,7 +284,10 @@ fn r25_source_false_is_ownerless_and_explicit_source_is_not_disabled_by_auto_swi
 fn r25_manifest_binding_rejects_nonfinal_root_directory_failed_and_wrong_versions() {
     let source = bound("exports/archive.zip", "source");
     let outputs = [bound("exports/a", "output")];
-    let captured = capture(&fixture(), &enabled(), false, &[], &[]).unwrap();
+    let captured = capture(&fixture(), &enabled(), false, &[], &[])
+        .unwrap()
+        .resolve_current(&fixture(), &enabled(), OptionalPinControlMode::Warn)
+        .unwrap();
     let final_manifest = manifest(&outputs);
     for bad in [
         bound("exports/", "root"),
@@ -393,20 +404,55 @@ fn r25_policy_index_resolves_exact_alias_at_load_and_bad_references_reject() {
 }
 
 #[test]
-fn r25_captured_policy_and_skipped_decision_are_not_reinterpreted_by_current_config() {
+fn current_config_edits_change_execution_without_rewriting_capture_receipts() {
     let mut config = fixture();
     let source = bound("exports/archive.zip", "source");
     let outputs = [bound("exports/a", "output")];
     let captured = capture(&config, &enabled(), true, &[], &[]).unwrap();
     let frozen = serde_json::to_string(&captured).unwrap();
-    let expected =
-        select_zip_intents(&captured, &manifest(&outputs), Some(&source), &outputs).unwrap();
-    config.policies.clear();
-    config.providers[0].limits.enabled = false;
     let decoded = CapturedZipIntent::decode_json(&frozen).unwrap();
+    config.policies[0].default_duration =
+        crate::pinning::config::LeaseDuration::parse("90m").unwrap();
+    config.policies[0].max_duration = crate::pinning::config::LeaseDuration::parse("3h").unwrap();
+    config.providers[0].limits.max_bytes = 42;
+    let current = decoded
+        .resolve_current(&config, &enabled(), OptionalPinControlMode::Warn)
+        .unwrap();
+    let selected =
+        select_zip_intents(&current, &manifest(&outputs), Some(&source), &outputs).unwrap();
     assert_eq!(
-        select_zip_intents(&decoded, &manifest(&outputs), Some(&source), &outputs).unwrap(),
-        expected
+        selected.leases[0].intent.duration,
+        config.policies[0].default_duration
+    );
+    assert_eq!(
+        current
+            .provider_limits(&selected.leases[0].providers[0].route.provider_id)
+            .unwrap()
+            .max_bytes,
+        42
+    );
+    assert_eq!(current.source_decision(), decoded.source_decision());
+    assert_eq!(current.controls(), decoded.controls());
+    assert_eq!(serde_json::to_string(&decoded).unwrap(), frozen);
+    config.providers[0].limits.enabled = false;
+    let current = decoded
+        .resolve_current(&config, &enabled(), OptionalPinControlMode::Warn)
+        .unwrap();
+    assert!(
+        select_zip_intents(&current, &manifest(&outputs), Some(&source), &outputs)
+            .unwrap()
+            .leases
+            .is_empty()
+    );
+    config.policies.clear();
+    let current = decoded
+        .resolve_current(&config, &enabled(), OptionalPinControlMode::Warn)
+        .unwrap();
+    assert!(
+        select_zip_intents(&current, &manifest(&outputs), Some(&source), &outputs)
+            .unwrap()
+            .leases
+            .is_empty()
     );
     assert!(
         !capture(&config, &enabled(), true, &[], &[])
@@ -429,8 +475,11 @@ fn r25_captured_policy_and_skipped_decision_are_not_reinterpreted_by_current_con
     );
     let current = fixture();
     assert_eq!(current.policies.len(), 1);
-    let retained =
-        CapturedZipIntent::decode_json(&serde_json::to_string(&skipped).unwrap()).unwrap();
+    let skipped_raw = serde_json::to_string(&skipped).unwrap();
+    let retained = CapturedZipIntent::decode_json(&skipped_raw)
+        .unwrap()
+        .resolve_current(&current, &enabled(), OptionalPinControlMode::Warn)
+        .unwrap();
     assert_eq!(
         retained.source_decision().effect,
         crate::pinning::decision::DecisionEffect::Skipped
@@ -484,10 +533,24 @@ fn r25_stage6_confirmation_is_frozen_in_output_and_manual_routes() {
     }
     let json = serde_json::to_string(&captured).unwrap();
     assert_eq!(CapturedZipIntent::decode_json(&json).unwrap(), captured);
+    config.providers[0].cluster.as_mut().unwrap().min_replicas = 5;
+    let current = captured
+        .resolve_current(&config, &enabled(), OptionalPinControlMode::Warn)
+        .unwrap();
+    let selected =
+        select_zip_intents(&current, &manifest(&outputs), Some(&source), &outputs).unwrap();
+    for lease in selected.leases {
+        assert_eq!(
+            lease.providers[0].route.confirmation,
+            config.providers[0].route_snapshot().confirmation
+        );
+        assert_ne!(lease.providers[0].route.confirmation, required);
+    }
+    assert_eq!(serde_json::to_string(&captured).unwrap(), json);
 }
 
 #[test]
-fn r25_legacy_v1_frozen_archive_auto_and_manual_owner_are_preserved() {
+fn legacy_v1_receipt_keeps_original_evidence_and_resolves_current_manual_owner() {
     let config = fixture();
     let tags = [
         ObjectTag::new("ipfs-s3:pin", "true"),
@@ -516,19 +579,79 @@ fn r25_legacy_v1_frozen_archive_auto_and_manual_owner_are_preserved() {
     });
     let decoded = decode_legacy_v1_intent(&historical.to_string()).unwrap();
     assert!(!decoded.controls().result_enabled);
+    assert_eq!(decoded.source_decision().effective_intents.len(), 2);
+    let receipt = serde_json::to_string(&decoded).unwrap();
+    let current = decoded
+        .resolve_current(&config, &enabled(), OptionalPinControlMode::Warn)
+        .unwrap();
     let source = bound("exports/archive.zip", "source");
     let outputs = [bound("exports/a", "output")];
     let selected =
-        select_zip_intents(&decoded, &manifest(&outputs), Some(&source), &outputs).unwrap();
-    assert_eq!(selected.leases.len(), 2);
-    assert!(selected.leases.iter().all(|lease| lease.owner == source));
-    assert_eq!(selected.leases[0].intent.source, LeaseSource::Automatic);
+        select_zip_intents(&current, &manifest(&outputs), Some(&source), &outputs).unwrap();
+    assert_eq!(selected.leases.len(), 1);
+    assert_eq!(selected.leases[0].owner, source);
+    assert_eq!(selected.leases[0].intent.source, LeaseSource::Manual);
+    assert_eq!(selected.leases[0].targets, outputs);
     assert_eq!(
-        selected.leases[0].targets.as_slice(),
-        std::slice::from_ref(&source)
+        selected.source_decision.as_ref().unwrap(),
+        decoded.source_decision()
     );
-    assert_eq!(selected.leases[1].intent.source, LeaseSource::Manual);
-    assert_eq!(selected.leases[1].targets, outputs);
+    assert_eq!(serde_json::to_string(&decoded).unwrap(), receipt);
+}
+
+#[test]
+fn explicit_output_rules_select_distinct_always_policies_for_shared_cid() {
+    let mut config = fixture();
+    let mut beta = config.providers[0].clone();
+    beta.name = "beta".into();
+    beta.identity =
+        crate::pinning::identity::ProviderIdentity::legacy("beta", "noop", None, "noop", "cid");
+    config
+        .provider_limits
+        .insert(beta.name.clone(), beta.limits.clone());
+    config.providers.push(beta);
+    let mut second = config.policies[0].clone();
+    second.providers = vec!["beta".into()];
+    second.refresh_identity(1);
+    config.policies.push(second);
+    let mut zip = enabled();
+    zip.pin_output_rules = vec![
+        rule(
+            "first",
+            "exports/first.txt",
+            ZipRuleEffect::Allow,
+            Some(config.policies[0].identity.clone()),
+        ),
+        rule(
+            "second",
+            "exports/second.txt",
+            ZipRuleEffect::Allow,
+            Some(config.policies[1].identity.clone()),
+        ),
+    ];
+    let captured = capture(&config, &zip, true, &[], &[]).unwrap();
+    let current = captured
+        .resolve_current(&config, &zip, OptionalPinControlMode::Warn)
+        .unwrap();
+    let source = bound("exports/archive.zip", "source");
+    let outputs = [
+        bound("exports/first.txt", "first"),
+        bound("exports/second.txt", "second"),
+    ];
+    let selected =
+        select_zip_intents(&current, &manifest(&outputs), Some(&source), &outputs).unwrap();
+    assert_eq!(selected.leases.len(), 2);
+    for (index, lease) in selected.leases.iter().enumerate() {
+        assert_eq!(lease.owner, outputs[index]);
+        assert_eq!(lease.intent.policy_id, config.policies[index].identity);
+        assert_eq!(lease.intent.providers, config.policies[index].providers);
+        assert_eq!(lease.targets, vec![outputs[index].clone()]);
+    }
+    assert_eq!(selected.leases[0].owner.cid, selected.leases[1].owner.cid);
+    assert_ne!(
+        selected.leases[0].providers[0].config_name,
+        selected.leases[1].providers[0].config_name
+    );
 }
 
 #[test]
@@ -554,7 +677,7 @@ fn r25_ordered_first_match_cannot_promote_shadowed_request_policy_to_always() {
 }
 
 #[test]
-fn r25_legacy_v2_exact_frozen_plan_survives_config_change_but_not_evidence_loss() {
+fn legacy_v2_receipt_survives_current_config_changes_and_rejects_evidence_loss() {
     let mut config = fixture();
     let captured = capture(&config, &enabled(), true, &[], &[]).unwrap();
     let value = serde_json::to_value(&captured).unwrap();
@@ -574,17 +697,32 @@ fn r25_legacy_v2_exact_frozen_plan_survives_config_change_but_not_evidence_loss(
         "options": captured.v2_options(), "source_decision": value["source_decision"],
         "providers": value["source_providers"], "pin_plan": old,
     });
+    historical["pin_plan"]["rule_revision"] = "obsolete-rule-digest".into();
     let decoded = decode_legacy_v2_intent(&historical.to_string()).unwrap();
-    config.policies.clear();
     let source = bound("exports/archive.zip", "source");
     let outputs = [bound("exports/a", "output")];
+    let current = decoded
+        .resolve_current(&config, &enabled(), OptionalPinControlMode::Warn)
+        .unwrap();
     let selected =
-        select_zip_intents(&decoded, &manifest(&outputs), Some(&source), &outputs).unwrap();
+        select_zip_intents(&current, &manifest(&outputs), Some(&source), &outputs).unwrap();
     assert_eq!(selected.leases.len(), 1);
     assert_eq!(selected.leases[0].owner, outputs[0]);
+    let receipt = serde_json::to_string(&decoded).unwrap();
+    config.policies.clear();
+    let current = decoded
+        .resolve_current(&config, &enabled(), OptionalPinControlMode::Warn)
+        .unwrap();
     assert!(
-        select_zip_intents(&decoded, &FinalZipManifest::default(), Some(&source), &[]).is_err()
+        select_zip_intents(&current, &manifest(&outputs), Some(&source), &outputs)
+            .unwrap()
+            .leases
+            .is_empty()
     );
+    assert_eq!(serde_json::to_string(&decoded).unwrap(), receipt);
+    let mut wrong = outputs[0].clone();
+    wrong.cid = "wrong-cid".into();
+    assert!(select_zip_intents(&current, &manifest(&outputs), Some(&source), &[wrong]).is_err());
     historical["pin_plan"]["outputs"][0]["intents"][0]["providers"][0]["route"]["api_profile"] =
         "cluster-rest".into();
     assert!(
@@ -596,56 +734,195 @@ fn r25_legacy_v2_exact_frozen_plan_survives_config_change_but_not_evidence_loss(
 }
 
 #[test]
-fn r25_empty_compatibility_revision_stays_legacy_but_current_capture_binds_policies() {
-    let configured = fixture();
-    let disabled =
-        ValidatedPinningConfig::from_raw(&crate::config::PinningConfig::default(), |_| None)
-            .unwrap();
+fn accepted_manual_control_resolves_current_scope_duration_and_provider_order() {
+    let mut config = fixture();
+    let tags = [ObjectTag::new("ipfs-s3:pin", "true")];
+    let captured = capture(&config, &enabled(), true, &[], &tags).unwrap();
+    let raw = serde_json::to_string(&captured).unwrap();
+    let mut fallback = config.providers[0].clone();
+    fallback.name = "fallback".into();
+    fallback.identity =
+        crate::pinning::identity::ProviderIdentity::legacy("fallback", "noop", None, "noop", "cid");
+    fallback.limits.priority = 0;
+    config
+        .provider_limits
+        .insert(fallback.name.clone(), fallback.limits.clone());
+    config.providers.push(fallback);
+    config.policies[0].providers = vec!["fallback".into(), "remote".into()];
+    config.policies[0].default_duration =
+        crate::pinning::config::LeaseDuration::parse("30m").unwrap();
+    let current = captured
+        .resolve_current(&config, &enabled(), OptionalPinControlMode::Warn)
+        .unwrap();
     let source = bound("exports/archive.zip", "source");
     let outputs = [bound("exports/a", "output")];
-    let published = [super::output("exports/a", "null", "shared-cid")];
-    for config in [&configured, &disabled] {
-        let compatibility = ValidatedZipOutputRules::compile(&[], config).unwrap();
-        // Committed old encoder: domain bytes followed by a zero u64 count.
-        assert_eq!(
-            compatibility.revision(),
-            "5c85eb380c83a82f29bb4ec40150eaf3cee5628d2fdb67b9421bba7379dc8634"
-        );
-        let plan = compatibility
-            .plan(
-                ZipTargets {
-                    source: false,
-                    extracted: true,
-                },
-                None,
-                &published,
-            )
-            .unwrap();
-        assert_eq!(
-            plan.outputs[0].warning,
-            Some(ZipPlanWarning::NoMatchingRule)
-        );
-        assert!(plan.outputs[0].intents.is_empty());
-    }
-    let active_capture = capture(&configured, &enabled(), true, &[], &[]).unwrap();
-    let inactive_capture = capture(&disabled, &enabled(), true, &[], &[]).unwrap();
-    assert_ne!(
-        active_capture.policy_revision(),
-        inactive_capture.policy_revision()
+    let selected =
+        select_zip_intents(&current, &manifest(&outputs), Some(&source), &outputs).unwrap();
+    let manual = selected
+        .leases
+        .iter()
+        .find(|lease| lease.intent.source == LeaseSource::Manual)
+        .unwrap();
+    assert_eq!(manual.intent.providers, config.policies[0].providers);
+    assert_eq!(manual.intent.duration, config.policies[0].default_duration);
+    assert_eq!(
+        selected.source_decision.as_ref().unwrap(),
+        captured.source_decision()
     );
-    for (captured, expected_leases) in [(&active_capture, 1), (&inactive_capture, 0)] {
-        assert_eq!(
-            select_zip_intents(captured, &manifest(&outputs), Some(&source), &outputs)
-                .unwrap()
-                .leases
-                .len(),
-            expected_leases
-        );
-    }
+    assert_eq!(serde_json::to_string(&captured).unwrap(), raw);
+    let duration_tags = [
+        ObjectTag::new("ipfs-s3:pin", "true"),
+        ObjectTag::new("ipfs-s3:duration", "90m"),
+    ];
+    let explicit = capture(&config, &enabled(), true, &[], &duration_tags).unwrap();
+    config.policies[0].max_duration = crate::pinning::config::LeaseDuration::parse("1h").unwrap();
+    assert!(
+        explicit
+            .resolve_current(&config, &enabled(), OptionalPinControlMode::Warn)
+            .is_err()
+    );
+    config.policies[0].prefix = "elsewhere/".into();
+    assert!(
+        captured
+            .resolve_current(&config, &enabled(), OptionalPinControlMode::Warn)
+            .is_err()
+    );
 }
 
 #[test]
-fn r25_legacy_empty_rule_plan_stays_no_intent_when_current_auto_is_enabled() {
+fn current_automatic_remote_candidates_require_durable_identity_after_admission() {
+    let mut explicit = fixture();
+    let provider = &mut explicit.providers[0];
+    provider.kind = crate::pinning::config::ProviderKind::Pinata;
+    provider.identity = crate::pinning::identity::ProviderIdentity::legacy(
+        "remote",
+        "pinata",
+        None,
+        "pinata-v3",
+        "cid",
+    );
+    provider.identity.provider_id = "pinata-admission".into();
+    provider.identity.scope = "account:admission".into();
+    provider.identity.storage_domain = "pinata:admission".into();
+    let mut legacy = explicit.clone();
+    legacy.providers[0].identity = crate::pinning::identity::ProviderIdentity::legacy(
+        "remote",
+        "pinata",
+        None,
+        "pinata-v3",
+        "cid",
+    );
+    for targets in ["source", "extracted"] {
+        let captured = capture(
+            &explicit,
+            &enabled(),
+            true,
+            &[("x-ipfs3-zip-targets", targets)],
+            &[],
+        )
+        .unwrap();
+        let receipt = serde_json::to_string(&captured).unwrap();
+        let current_rules = ValidatedZipOutputRules::from_config(&enabled(), &legacy).unwrap();
+        assert!(
+            captured
+                .resolve_current_with_rules(&legacy, &current_rules, OptionalPinControlMode::Warn)
+                .is_err()
+        );
+        assert_eq!(serde_json::to_string(&captured).unwrap(), receipt);
+        let mut denied = enabled();
+        denied.pin_output_rules = vec![rule("deny", "exports/", ZipRuleEffect::Deny, None)];
+        let denied_current = captured
+            .resolve_current(&legacy, &denied, OptionalPinControlMode::Warn)
+            .unwrap();
+        let source = bound("exports/archive.zip", "source");
+        let outputs = [bound("exports/a", "output")];
+        assert!(
+            select_zip_intents(
+                &denied_current,
+                &manifest(&outputs),
+                Some(&source),
+                &outputs
+            )
+            .unwrap()
+            .leases
+            .is_empty()
+        );
+        legacy.providers[0].identity = explicit.providers[0].identity.clone();
+        legacy.providers[0].identity.provider_id = "pinata-current".into();
+        let current = captured
+            .resolve_current(&legacy, &enabled(), OptionalPinControlMode::Warn)
+            .unwrap();
+        let source = bound("exports/archive.zip", "source");
+        let outputs = [bound("exports/a", "output")];
+        let selected =
+            select_zip_intents(&current, &manifest(&outputs), Some(&source), &outputs).unwrap();
+        assert_eq!(
+            selected.leases[0].providers[0].route.provider_id,
+            "pinata-current"
+        );
+        legacy.providers[0].identity = crate::pinning::identity::ProviderIdentity::legacy(
+            "remote",
+            "pinata",
+            None,
+            "pinata-v3",
+            "cid",
+        );
+    }
+    let manual_zip = DecompressZipConfig {
+        auto_pin_outputs: Some(false),
+        ..Default::default()
+    };
+    let captured = capture(
+        &explicit,
+        &manual_zip,
+        true,
+        &[("x-ipfs3-zip-targets", "none")],
+        &[ObjectTag::new("ipfs-s3:pin", "true")],
+    )
+    .unwrap();
+    let receipt = serde_json::to_string(&captured).unwrap();
+    let current = captured
+        .resolve_current(&legacy, &manual_zip, OptionalPinControlMode::Warn)
+        .unwrap();
+    assert!(current.validate_durable_current(&legacy).is_err());
+    assert_eq!(serde_json::to_string(&captured).unwrap(), receipt);
+    legacy.providers[0].identity = explicit.providers[0].identity.clone();
+    legacy.providers[0].identity.provider_id = "pinata-current".into();
+    let current = captured
+        .resolve_current(&legacy, &manual_zip, OptionalPinControlMode::Warn)
+        .unwrap();
+    current.validate_durable_current(&legacy).unwrap();
+}
+
+#[test]
+fn known_historical_config_digests_decode_without_relaxing_unknown_fields() {
+    let captured = capture(&fixture(), &enabled(), true, &[], &[]).unwrap();
+    let mut old = serde_json::to_value(&captured).unwrap();
+    old["policy"]["revision"] = "obsolete-policy-digest".into();
+    old["policy_revision"] = "obsolete-policy-digest".into();
+    old["rule_revision"] = "obsolete-rule-digest".into();
+    let decoded = CapturedZipIntent::decode_json(&old.to_string()).unwrap();
+    let source = bound("exports/archive.zip", "source");
+    let outputs = [bound("exports/a", "output")];
+    let current = decoded
+        .resolve_current(&fixture(), &enabled(), OptionalPinControlMode::Warn)
+        .unwrap();
+    assert_eq!(
+        select_zip_intents(&current, &manifest(&outputs), Some(&source), &outputs)
+            .unwrap()
+            .leases
+            .len(),
+        1
+    );
+    old["untrusted_override"] = true.into();
+    assert!(CapturedZipIntent::decode_json(&old.to_string()).is_err());
+    old.as_object_mut().unwrap().remove("untrusted_override");
+    old["policy"]["untrusted_override"] = true.into();
+    assert!(CapturedZipIntent::decode_json(&old.to_string()).is_err());
+}
+
+#[test]
+fn legacy_empty_plan_receipt_is_retained_while_current_rules_choose_automatic_work() {
     let config = fixture();
     let current = capture(&config, &enabled(), true, &[], &[]).unwrap();
     let value = serde_json::to_value(&current).unwrap();
@@ -660,10 +937,7 @@ fn r25_legacy_empty_rule_plan_stays_no_intent_when_current_auto_is_enabled() {
             &[super::output("exports/a", "null", "shared-cid")],
         )
         .unwrap();
-    assert_eq!(
-        old_plan.rule_revision,
-        "5c85eb380c83a82f29bb4ec40150eaf3cee5628d2fdb67b9421bba7379dc8634"
-    );
+    assert!(old_plan.outputs[0].intents.is_empty());
     let historical = serde_json::json!({
         "bucket": "photos", "source_key": "exports/archive.zip", "target_prefix": "exports/",
         "options": current.v2_options(), "source_decision": value["source_decision"],
@@ -673,23 +947,21 @@ fn r25_legacy_empty_rule_plan_stays_no_intent_when_current_auto_is_enabled() {
     let source = bound("exports/archive.zip", "source");
     let outputs = [bound("exports/a", "output")];
     let final_manifest = manifest(&outputs);
-    let previous = select_zip_intents(&decoded, &final_manifest, Some(&source), &outputs).unwrap();
-    assert!(previous.leases.is_empty());
-    assert!(previous.output_decisions[0].1.effective_intents.is_empty());
-    assert_eq!(previous.warnings[0].1, ZipPlanWarning::NoMatchingRule);
+    let receipt = serde_json::to_string(&decoded).unwrap();
+    assert!(decoded.source_decision().effective_intents.is_empty());
+    let resolved = decoded
+        .resolve_current(&config, &enabled(), OptionalPinControlMode::Warn)
+        .unwrap();
+    let selected = select_zip_intents(&resolved, &final_manifest, Some(&source), &outputs).unwrap();
+    assert_eq!(selected.leases.len(), 1);
+    assert_eq!(selected.leases[0].intent.source, LeaseSource::Automatic);
     assert_eq!(
-        select_zip_intents(&current, &final_manifest, Some(&source), &outputs)
-            .unwrap()
-            .leases
-            .len(),
-        1
+        selected.source_decision.as_ref().unwrap(),
+        decoded.source_decision()
     );
-    assert_eq!(
-        select_zip_intents(&decoded, &final_manifest, Some(&source), &outputs).unwrap(),
-        previous
-    );
+    assert_eq!(serde_json::to_string(&decoded).unwrap(), receipt);
     let mut revision_only = historical;
-    let revision = revision_only["pin_plan"]["rule_revision"].clone();
+    let revision = serde_json::Value::String("obsolete-config-digest".into());
     revision_only.as_object_mut().unwrap().remove("pin_plan");
     revision_only["rule_revision"] = revision;
     assert!(
@@ -734,5 +1006,5 @@ fn r25_exact_old_alias_and_index_share_the_existing_allocation_identity() {
         normalized.providers[0].name
     );
     zip.pin_output_rules[0].policy_id = Some(config.policies[0].identity.clone());
-    assert!(validate_zip_config(&zip, &config).is_err()); // no fuzzy pre-normalization alias
+    validate_zip_config(&zip, &config).unwrap();
 }

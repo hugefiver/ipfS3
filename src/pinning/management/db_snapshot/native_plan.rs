@@ -403,7 +403,6 @@ fn objects(
             permitted,
             allowed_routes,
             control_revision: evidence.control_revision.clone(),
-            config_revision: evidence.config_revision.clone(),
             decision: evidence.decision,
             evidence: selection,
         });

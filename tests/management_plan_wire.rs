@@ -47,7 +47,7 @@ fn intent() -> Intent {
             levels: vec![ConfirmationLevel::ContentVerified],
             min_replicas: 1,
             max_age_secs: None,
-            policy_revision: "policy-1".into(),
+            policy_id: Some("policy-1".into()),
         },
     }
 }
@@ -99,7 +99,6 @@ fn fixture(action: Action) -> (PlanRequest, Snapshot) {
             permitted: Some(true),
             allowed_routes: vec![source.clone(), destination.clone()],
             control_revision: Some("control-1".into()),
-            config_revision: Some("config-1".into()),
             decision: Some(if matches!(action, Action::Reapply(_)) {
                 DecisionState::Skipped
             } else {

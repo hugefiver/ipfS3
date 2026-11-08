@@ -2,7 +2,7 @@
 use chrono::{DateTime, Utc};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, Iterable, QueryFilter, QueryOrder,
-    Statement, TransactionTrait,
+    QuerySelect, Statement, TransactionTrait,
     sea_query::{Expr, Iden},
 };
 use serde::{Deserialize, Serialize};
@@ -20,13 +20,14 @@ use crate::{
     pinning::{
         identity::{CanonicalResourceKey, Ownership, ProviderRouteSnapshot, RemoteResourceType},
         provider::{
-            ObservedResource, ObservedResourceStatus, ProviderError, RemotePinStatus, SubmitEffect,
-            SubmitObservation, canonical_resource_cid, cids_equivalent,
+            ObservedResource, ObservedResourceStatus, PinObservation, ProviderError, RemotePin,
+            RemotePinStatus, SubmitEffect, SubmitObservation, canonical_resource_cid,
+            cids_equivalent,
         },
     },
     store::entities::{
         pin_invocation_route, pin_job, pin_lease, pin_lease_target, pin_provider_route,
-        pin_resource_history, remote_pin, remote_pin_ledger,
+        pin_replica_observation, pin_resource_history, remote_pin, remote_pin_ledger,
     },
 };
 
@@ -94,6 +95,26 @@ pub fn is_rpc_api(api: &str) -> bool {
         api,
         "rpc" | "kubo" | "filebase-rpc" | "cluster-proxy" | "cluster-rest"
     )
+}
+
+fn complete_resource_status(
+    route: &ProviderRouteSnapshot,
+    expected_cid: &str,
+    resource: &ObservedResource,
+) -> bool {
+    if route.resource_type() == RemoteResourceType::ClusterPin {
+        return matches!(
+            resource.status,
+            ObservedResourceStatus::PinAccepted | ObservedResourceStatus::ReplicasVerified
+        );
+    }
+    resource.status == ObservedResourceStatus::RecursiveVerified
+        || resource.status == ObservedResourceStatus::PinAccepted
+            && crate::pinning::ipfs_rpc::canonical_cid_request_id(route, expected_cid)
+                .ok()
+                .flatten()
+                .as_deref()
+                == Some(resource.request_id.as_str())
 }
 
 pub fn typed_error(error: &ProviderError, effect: SubmitEffect) -> String {
@@ -298,7 +319,7 @@ async fn record_in_transaction<C: ConnectionTrait>(
 ) -> AppResult<bool> {
     let invocation = capture_fact(db, claimed, id).await?;
     let row = write_fact(db, &invocation, observation, now).await?;
-    let can_project = project_receipt(db, claimed, &row, now, None, true).await?;
+    let can_project = project_receipt(db, claimed, &row, now, None, true, None).await?;
     if matches!(row.outcome.as_str(), "matched" | "accepted") {
         if can_project {
             db.execute(Statement::from_sql_and_values(
@@ -361,16 +382,7 @@ async fn write_fact<C: ConnectionTrait>(
         && keys.len() == 1
         && matches_expected
         && resources.iter().all(|r| {
-            r.key.is_some()
-                && if cluster {
-                    matches!(
-                        r.resource.status,
-                        ObservedResourceStatus::PinAccepted
-                            | ObservedResourceStatus::ReplicasVerified
-                    )
-                } else {
-                    r.resource.status == ObservedResourceStatus::RecursiveVerified
-                }
+            r.key.is_some() && complete_resource_status(&route, &row.expected_cid, &r.resource)
         });
     let safe_not_submitted = observation.effect == SubmitEffect::NotSubmitted
         && resources.is_empty()
@@ -468,6 +480,7 @@ pub(crate) async fn project_runtime_receipt(
         now,
         Some((tx.catalog(work), work)),
         true,
+        None,
     )
     .await
 }
@@ -489,6 +502,28 @@ pub(crate) async fn project_runtime_observation_receipt(
         now,
         Some((tx.catalog(work), work)),
         false,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn project_runtime_recovery_receipt(
+    tx: &crate::store::RuntimeTransaction,
+    claimed: &ClaimedPinJob,
+    row: &evidence::Model,
+    recovery_sequence: i64,
+    now: DateTime<Utc>,
+    work: crate::store::pinning::management::records::DecodeWork<'_>,
+    _frontier: &crate::store::pinning::leases::LockedWorkerObservation<'_>,
+) -> AppResult<bool> {
+    project_receipt(
+        tx.db(),
+        claimed,
+        row,
+        now,
+        Some((tx.catalog(work), work)),
+        false,
+        Some(recovery_sequence),
     )
     .await
 }
@@ -503,6 +538,7 @@ async fn project_receipt<C: ConnectionTrait>(
         crate::store::pinning::management::records::DecodeWork<'_>,
     )>,
     lock_lifecycle: bool,
+    recovery_sequence: Option<i64>,
 ) -> AppResult<bool> {
     let claim = claimed
         .model
@@ -530,15 +566,24 @@ async fn project_receipt<C: ConnectionTrait>(
     let remote = lock_receipt_remote(db, &claimed.model.provider, &claimed.model.cid).await?;
     let matched_context = match (current_job.as_ref(), remote.as_ref()) {
         (Some(job), Some(remote)) => {
-            receipt_context_core(
-                db,
-                row,
-                job,
-                remote,
-                matching_request(row).as_deref(),
-                runtime,
-            )
-            .await?
+            let request = if let Some(sequence) = recovery_sequence {
+                verified_rpc_recovery(
+                    db,
+                    row,
+                    job,
+                    runtime
+                        .map(|(_, work)| work.budget().clone())
+                        .unwrap_or_default(),
+                )
+                .await?
+                .filter(|recovery| recovery.sequence == sequence)
+                .and_then(|recovery| recovery.observation.result.ok())
+                .map(|remote| remote.request_id)
+            } else {
+                matching_request(row)
+            };
+            recovery_sequence.is_none_or(|_| remote.epoch == row.remote_epoch && request.is_some())
+                && receipt_context_core(db, row, job, remote, request.as_deref(), runtime).await?
         }
         _ => false,
     };
@@ -646,7 +691,209 @@ async fn lock_receipt_remote<C: ConnectionTrait>(
 
 /// Revalidate complete roots/request and their historical canonical scope;
 /// `matched` alone is not an authorization to replay a malformed receipt.
-fn matching_request(row: &evidence::Model) -> Option<String> {
+pub(crate) fn unknown_recovery_request(row: &evidence::Model) -> Option<String> {
+    if row.outcome != "unknown"
+        || row.observed_at.is_none()
+        || row.id != format!("{}:call:{}", row.job_id, row.submit_call)
+    {
+        return None;
+    }
+    let route: ProviderRouteSnapshot = serde_json::from_str(&row.route).ok()?;
+    let request = crate::pinning::ipfs_rpc::canonical_cid_request_id(&route, &row.expected_cid)
+        .ok()
+        .flatten()?;
+    let resources: Vec<ResourceEvidence> = serde_json::from_str(&row.resources).ok()?;
+    if resources.is_empty() {
+        return (row.effect == "unknown").then_some(request);
+    }
+    let [resource] = resources.as_slice() else {
+        return None;
+    };
+    let expected = canonical_resource_cid(&row.expected_cid).ok()?;
+    let key = CanonicalResourceKey {
+        backend: route.backend,
+        scope: route.scope,
+        resource_type: RemoteResourceType::RpcPin,
+        resource_id: expected,
+    };
+    (row.effect == "observed"
+        && resource.key.as_ref() == Some(&key)
+        && resource.resource.resource_type == RemoteResourceType::RpcPin
+        && resource.resource.status == ObservedResourceStatus::PinAccepted
+        && resource.resource.ownership == Ownership::Unknown
+        && resource.resource.replica_evidence.is_none()
+        && resource.resource.request_id == request
+        && cids_equivalent(&resource.resource.cid, &row.expected_cid).ok() == Some(true))
+    .then_some(request)
+}
+
+fn terminal_read_request(row: &evidence::Model) -> Option<String> {
+    if let Some(request) = unknown_recovery_request(row) {
+        return Some(request);
+    }
+    let route: ProviderRouteSnapshot = serde_json::from_str(&row.route).ok()?;
+    let canonical = crate::pinning::ipfs_rpc::canonical_cid_request_id(&route, &row.expected_cid)
+        .ok()
+        .flatten()?;
+    if row.id != format!("{}:call:{}", row.job_id, row.submit_call) {
+        return None;
+    }
+    matching_request(row).filter(|request| request == &canonical)
+}
+
+pub(crate) struct VerifiedRpcRecovery {
+    pub sequence: i64,
+    pub observation: PinObservation,
+}
+
+fn recovery_resource(
+    row: &evidence::Model,
+    fact: &pin_replica_observation::Model,
+    request: &str,
+) -> Option<ObservedResource> {
+    let observed_at = row.observed_at.as_ref()?;
+    if fact.provider != row.provider
+        || fact.expected_cid != row.expected_cid
+        || fact.route != row.route
+        || fact.remote_epoch != row.remote_epoch
+        || fact.projectable
+        || fact.outcome != "ReportedPinned"
+        || fact.safe_error.is_some()
+        || &fact.observed_at < observed_at
+    {
+        return None;
+    }
+    let resources: Vec<ObservedResource> = serde_json::from_str(&fact.resources).ok()?;
+    let [resource] = resources.as_slice() else {
+        return None;
+    };
+    (resource.resource_type == RemoteResourceType::RpcPin
+        && resource.status == ObservedResourceStatus::RecursiveVerified
+        && resource.ownership == Ownership::Unknown
+        && resource.replica_evidence.is_none()
+        && resource.request_id == request
+        && cids_equivalent(&resource.cid, &row.expected_cid).ok() == Some(true))
+    .then(|| resource.clone())
+}
+
+/// Consume only an actual positive read fact bound to this original unknown
+/// invocation. Automatic reads name the Submit job; explicit management reads
+/// retain their own Reconcile job and must carry matching confirmed authority.
+pub(crate) async fn verified_rpc_recovery<C: ConnectionTrait>(
+    db: &C,
+    row: &evidence::Model,
+    job: &pin_job::Model,
+    work: crate::store::pinning::management::records::SharedDecodeBudget,
+) -> AppResult<Option<VerifiedRpcRecovery>> {
+    let request = if job.state == "error" {
+        terminal_read_request(row)
+    } else {
+        unknown_recovery_request(row)
+    };
+    let Some(request) = request else {
+        return Ok(None);
+    };
+    let facts = pin_replica_observation::Entity::find()
+        .filter(pin_replica_observation::Column::Provider.eq(&row.provider))
+        .filter(pin_replica_observation::Column::ExpectedCid.eq(&row.expected_cid))
+        .filter(pin_replica_observation::Column::Route.eq(&row.route))
+        .filter(pin_replica_observation::Column::RemoteEpoch.eq(row.remote_epoch))
+        .filter(pin_replica_observation::Column::Projectable.eq(false))
+        .order_by_desc(pin_replica_observation::Column::Sequence)
+        .limit(u64::try_from(jobs::MAX_SUBMIT_RECOVERY_ATTEMPTS).unwrap_or(8))
+        .all(db)
+        .await?;
+    for fact in facts {
+        if row
+            .observed_at
+            .as_ref()
+            .is_some_and(|observed_at| &fact.observed_at < observed_at)
+        {
+            continue;
+        }
+        let Some(resource) = recovery_resource(row, &fact, &request) else {
+            return Ok(None);
+        };
+        let origin_matches = if fact.job_id == row.job_id {
+            fact.phase == "submit"
+                && fact.lease_id == job.lease_id
+                && fact.target_id == job.target_id
+                && fact.expected_generation == job.expected_generation
+        } else if fact.phase == "reconcile" {
+            let Some(management_job) = pin_job::Entity::find_by_id(&fact.job_id).one(db).await?
+            else {
+                continue;
+            };
+            let authority =
+                crate::store::pinning::management::actions::job_authority::lookup_with_work(
+                    db,
+                    &management_job,
+                    work.clone(),
+                )
+                .await
+                .map_err(crate::store::pinning::management::actions::job_authority::safe)?;
+            authority.is_some_and(|authority| {
+                authority.directive
+                    == crate::store::pinning::management::records::JobDirective::ReadOnlyObserve
+                    && authority.provider == row.provider
+                    && authority.cid == row.expected_cid
+                    && authority.remote_epoch == row.remote_epoch
+                    && serde_json::from_str::<ProviderRouteSnapshot>(&row.route)
+                        .ok()
+                        .as_ref()
+                        == Some(&authority.route)
+                    && authority.lease_id == job.lease_id
+                    && authority.lease_generation == job.expected_generation
+                    && authority
+                        .resource_id
+                        .as_deref()
+                        .is_none_or(|id| id == request)
+            })
+        } else {
+            false
+        };
+        if origin_matches {
+            return Ok(Some(VerifiedRpcRecovery {
+                sequence: fact.sequence,
+                observation: PinObservation {
+                    result: Ok(RemotePin {
+                        request_id: request.clone(),
+                        cid: resource.cid.clone(),
+                        status: RemotePinStatus::Pinned,
+                        raw_status: "recursive".into(),
+                        failure_reason: None,
+                    }),
+                    resources: vec![resource],
+                },
+            }));
+        }
+    }
+    Ok(None)
+}
+
+pub(crate) async fn recovery_read_allowed<C: ConnectionTrait>(
+    db: &C,
+    job: &pin_job::Model,
+    receipt_id: &str,
+) -> AppResult<bool> {
+    let Some(row) = latest(db, &job.id).await? else {
+        return Ok(false);
+    };
+    let Some(request) = unknown_recovery_request(&row) else {
+        return Ok(false);
+    };
+    let Some(remote) = remote_pin::Entity::find_by_id((job.provider.clone(), job.cid.clone()))
+        .one(db)
+        .await?
+    else {
+        return Ok(false);
+    };
+    Ok(row.id == receipt_id
+        && remote.epoch == row.remote_epoch
+        && receipt_context_core(db, &row, job, &remote, Some(&request), None).await?)
+}
+
+pub(crate) fn matching_request(row: &evidence::Model) -> Option<String> {
     if !matches!(row.outcome.as_str(), "matched" | "accepted")
         || row.effect != "observed"
         || row.observed_at.is_none()
@@ -665,8 +912,8 @@ fn matching_request(row: &evidence::Model) -> Option<String> {
     }
     let expected = canonical_resource_cid(&row.expected_cid).ok()?;
     let key = CanonicalResourceKey {
-        backend: route.backend,
-        scope: route.scope,
+        backend: route.backend.clone(),
+        scope: route.scope.clone(),
         resource_type: family,
         resource_id: expected,
     };
@@ -675,15 +922,7 @@ fn matching_request(row: &evidence::Model) -> Option<String> {
         .all(|resource| {
             resource.key.as_ref() == Some(&key)
                 && resource.resource.resource_type == family
-                && if family == RemoteResourceType::ClusterPin {
-                    matches!(
-                        resource.resource.status,
-                        ObservedResourceStatus::PinAccepted
-                            | ObservedResourceStatus::ReplicasVerified
-                    )
-                } else {
-                    resource.resource.status == ObservedResourceStatus::RecursiveVerified
-                }
+                && complete_resource_status(&route, &row.expected_cid, &resource.resource)
                 && resource.resource.request_id == *request
                 && cids_equivalent(&resource.resource.cid, &row.expected_cid).unwrap_or(false)
         })
@@ -871,17 +1110,54 @@ async fn wake_parked_core<C: ConnectionTrait>(
     let Some(row) = latest(db, id).await? else {
         return Ok(false);
     };
-    let Some(request) = matching_request(&row) else {
+    let Some(history) = jobs::submission_history(db, id).await? else {
         return Ok(false);
     };
+    if job.state == "running"
+        && job.locked_until.is_none()
+        && (history.recovery_queries >= jobs::MAX_SUBMIT_RECOVERY_ATTEMPTS
+            || now.signed_duration_since(history.started_at) >= chrono::Duration::hours(1))
+    {
+        jobs::terminate_parked_submit(db, &job, "submit recovery budget exhausted", now).await?;
+        return Ok(false);
+    }
+    let matching = matching_request(&row);
+    let unknown = unknown_recovery_request(&row);
+    let verified = if unknown.is_some() {
+        verified_rpc_recovery(
+            db,
+            &row,
+            &job,
+            runtime
+                .map(|(_, work)| work.budget().clone())
+                .unwrap_or_default(),
+        )
+        .await?
+    } else {
+        None
+    };
+    let request = matching.as_ref().or(unknown.as_ref());
+    let automatic_unknown = unknown.is_some() && verified.is_none();
     if job.state != "running"
         || job.locked_until.is_some()
         || job.submit_phase.as_deref() != Some("recovering")
-        || job.last_error.as_deref() != Some(jobs::RPC_RECOVERY_PARK_REASON)
-        || jobs::submission_history(db, id)
-            .await?
-            .is_none_or(|history| history.state != "needs_attention")
-        || !receipt_context_core(db, &row, &job, &remote, Some(&request), runtime).await?
+        || history.state != "needs_attention"
+        || request.is_none()
+        || matching.is_some() && job.last_error.as_deref() != Some(jobs::RPC_RECOVERY_PARK_REASON)
+        || automatic_unknown
+            && (job.last_error.as_deref() != Some(jobs::RPC_RECOVERY_PARK_REASON)
+                || history.recovery_queries >= jobs::MAX_SUBMIT_RECOVERY_ATTEMPTS
+                || now.signed_duration_since(history.started_at) >= chrono::Duration::hours(1))
+        || unknown.is_some() && remote.epoch != row.remote_epoch
+        || !receipt_context_core(
+            db,
+            &row,
+            &job,
+            &remote,
+            request.map(String::as_str),
+            runtime,
+        )
+        .await?
     {
         return Ok(false);
     }
@@ -902,7 +1178,14 @@ async fn wake_parked_core<C: ConnectionTrait>(
     if !authority {
         return Ok(false);
     }
-    jobs::wake_rpc_receipt(db, &job, row.submit_call, now).await
+    jobs::wake_rpc_parked(
+        db,
+        &job,
+        row.submit_call,
+        verified.is_none().then_some(jobs::RPC_RECOVERY_PARK_REASON),
+        now,
+    )
+    .await
 }
 
 /// Primary-key keyset paging bounds the rows examined, not merely the number
@@ -921,7 +1204,7 @@ pub(crate) async fn parked_receipt_candidates<C: ConnectionTrait>(
     };
     let rows = db.query_all(Statement::from_sql_and_values(
         db.get_database_backend(),
-        format!("SELECT id, job_id, outcome, observed_at, needs_attention FROM {} WHERE id > $1 ORDER BY id LIMIT $2", relation.table),
+        format!("SELECT e.id, e.job_id, e.outcome, e.observed_at, e.needs_attention FROM {} AS e WHERE e.id > $1 AND EXISTS (SELECT 1 FROM {jobs_table} AS j WHERE j.id=e.job_id AND j.operation='submit' AND j.state='running' AND j.locked_until IS NULL AND j.submit_phase='recovering') ORDER BY e.id LIMIT $2", relation.table),
         [after.into(), i64::try_from(limit).unwrap_or(i64::MAX).into()],
     )).await?;
     let mut cursor = None;
@@ -934,20 +1217,264 @@ pub(crate) async fn parked_receipt_candidates<C: ConnectionTrait>(
                 .is_none()
             || !matches!(
                 row.try_get::<String>("", "outcome")?.as_str(),
-                "matched" | "accepted"
+                "matched" | "accepted" | "unknown"
             )
         {
             continue;
         }
         if let Some(job) = db.query_one(Statement::from_sql_and_values(
             db.get_database_backend(),
-            format!("SELECT * FROM {jobs_table} WHERE id=$1 AND operation='submit' AND state='running' AND locked_until IS NULL AND submit_phase='recovering' AND last_error=$2"),
-            [row.try_get::<String>("", "job_id")?.into(), jobs::RPC_RECOVERY_PARK_REASON.into()],
+            format!("SELECT * FROM {jobs_table} WHERE id=$1 AND operation='submit' AND state='running' AND locked_until IS NULL AND submit_phase='recovering'"),
+            [row.try_get::<String>("", "job_id")?.into()],
         )).await? {
             candidates.push(pin_job::Model::from_query_result(&job, "")?);
         }
     }
     Ok((cursor, candidates))
+}
+
+pub(crate) async fn missing_receipt_park_candidates<C: ConnectionTrait>(
+    db: &C,
+    after: &str,
+    limit: u64,
+) -> AppResult<(Option<String>, Vec<pin_job::Model>)> {
+    let rows = pin_job::Entity::find()
+        .filter(pin_job::Column::Id.gt(after))
+        .filter(pin_job::Column::Operation.eq("submit"))
+        .filter(pin_job::Column::State.eq("running"))
+        .filter(pin_job::Column::LockedUntil.is_null())
+        .filter(pin_job::Column::SubmitPhase.eq("recovering"))
+        .filter(pin_job::Column::LastError.eq(jobs::RPC_MISSING_RECEIPT_PARK_REASON))
+        .order_by_asc(pin_job::Column::Id)
+        .limit(limit)
+        .all(db)
+        .await?;
+    let cursor = rows.last().map(|job| job.id.clone());
+    Ok((cursor, rows))
+}
+
+pub(crate) async fn parked_receipt_scope_candidates<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+    cid: &str,
+) -> AppResult<Vec<pin_job::Model>> {
+    let rows = evidence::Entity::find()
+        .filter(evidence::Column::Provider.eq(provider))
+        .filter(evidence::Column::ExpectedCid.eq(cid))
+        .filter(evidence::Column::Outcome.is_in(["unknown", "matched", "accepted"]))
+        .filter(evidence::Column::NeedsAttention.eq(true))
+        .order_by_desc(evidence::Column::SubmitCall)
+        .limit(u64::try_from(jobs::MAX_SUBMIT_RECOVERY_ATTEMPTS).unwrap_or(8))
+        .all(db)
+        .await?;
+    let mut candidates = Vec::new();
+    for row in rows {
+        if let Some(job) = pin_job::Entity::find_by_id(row.job_id).one(db).await?
+            && job.operation == "submit"
+            && (job.state == "error"
+                || (job.state == "running" && job.submit_phase.as_deref() == Some("recovering")))
+            && job.locked_until.is_none()
+        {
+            candidates.push(job);
+        }
+    }
+    Ok(candidates)
+}
+
+pub(crate) async fn reset_runtime_missing_receipt(
+    tx: &crate::store::RuntimeTransaction,
+    snapshot: &pin_job::Model,
+    now: DateTime<Utc>,
+    work: crate::store::pinning::management::records::DecodeWork<'_>,
+) -> AppResult<bool> {
+    crate::store::pinning::management::admission::lock_sqlite_writer_in_caller_transaction(tx.db())
+        .await?;
+    crate::store::pinning::quota::lock_runtime_allocation_admission(tx, &snapshot.provider, work)
+        .await?;
+    if tx.get_database_backend() == sea_orm::DatabaseBackend::Postgres {
+        tx.query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT id FROM pin_jobs WHERE id=$1 FOR UPDATE NOWAIT",
+            [snapshot.id.clone().into()],
+        ))
+        .await?;
+    }
+    let Some(job) = jobs::lock_submit_receipt(tx.db(), &snapshot.id).await? else {
+        return Ok(false);
+    };
+    let exact_claim = snapshot.locked_until.is_some() && job.locked_until == snapshot.locked_until;
+    let exact_park = snapshot.locked_until.is_none()
+        && job.locked_until.is_none()
+        && job.last_error.as_deref() == Some(jobs::RPC_MISSING_RECEIPT_PARK_REASON);
+    if !(exact_claim || exact_park)
+        || job.operation != "submit"
+        || job.state != "running"
+        || job.submit_phase.as_deref() != Some("recovering")
+        || !jobs::check_target_job_generation(tx.db(), &job).await?
+        || !job
+            .last_error
+            .as_deref()
+            .is_none_or(|error| error == jobs::RPC_MISSING_RECEIPT_PARK_REASON)
+    {
+        return Ok(false);
+    }
+    let Some(capture) = pin_invocation_route::Entity::find_by_id(&job.id)
+        .one(tx.db())
+        .await?
+    else {
+        return Ok(false);
+    };
+    let Ok(route) = serde_json::from_str::<ProviderRouteSnapshot>(&capture.route) else {
+        return Ok(false);
+    };
+    if crate::pinning::ipfs_rpc::canonical_cid_request_id(&route, &job.cid)
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        return Ok(false);
+    }
+    let Some(remote) = lock_receipt_remote(tx.db(), &job.provider, &job.cid).await? else {
+        return Ok(false);
+    };
+    let Some(ledger) =
+        remote_pin_ledger::Entity::find_by_id((job.provider.clone(), job.cid.clone()))
+            .one(tx.db())
+            .await?
+    else {
+        return Ok(false);
+    };
+    if capture.remote_epoch != remote.epoch
+        || remote.status != "reserved"
+        || remote.request_id.is_some()
+        || remote.failure_attempts != 0
+        || remote.next_retry_at.is_some()
+        || remote.last_failed_request_id.is_some()
+        || remote.last_error_class.is_some()
+        || remote.last_error_text.is_some()
+        || ledger.route.as_deref() != Some(capture.route.as_str())
+        || ledger.ownership != "unknown"
+        || ledger.effect != "reserved"
+        || ledger.first_observed_at.is_some()
+        || ledger.last_observed_at.is_some()
+        || ledger.remote_pinned_at.is_some()
+        || ledger.gateway_verified_at.is_some()
+        || ledger.content_verified_at.is_some()
+        || ledger.first_error.is_some()
+        || ledger.last_error.is_some()
+    {
+        return Ok(false);
+    }
+    let history = jobs::submission_history(tx.db(), &job.id).await?;
+    if history.as_ref().is_some_and(|history| {
+        history.correlation.is_some()
+            || history.api != "unknown"
+            || history.strategy != "unknown"
+            || history.effect != "unknown"
+            || history.state != "needs_attention"
+            || history.submit_calls != 0
+            || history.recovery_queries != 0
+            || history.first_error.as_deref() != Some(jobs::RPC_MISSING_RECEIPT_PARK_REASON)
+            || history.last_error.as_deref() != Some(jobs::RPC_MISSING_RECEIPT_PARK_REASON)
+    }) {
+        return Ok(false);
+    }
+    if evidence::Entity::find()
+        .filter(evidence::Column::JobId.eq(&job.id))
+        .one(tx.db())
+        .await?
+        .is_some()
+        || pin_replica_observation::Entity::find()
+            .filter(pin_replica_observation::Column::Provider.eq(&job.provider))
+            .filter(pin_replica_observation::Column::ExpectedCid.eq(&job.cid))
+            .filter(pin_replica_observation::Column::RemoteEpoch.eq(remote.epoch))
+            .one(tx.db())
+            .await?
+            .is_some()
+    {
+        return Ok(false);
+    }
+    let aliases = observations_catalog(tx.catalog(work), &job.provider, work).await?;
+    if aliases
+        .iter()
+        .any(|row| row.expected_cid == job.cid && row.remote_epoch == remote.epoch)
+    {
+        return Ok(false);
+    }
+    if crate::store::pinning::legacy_migration::release_history_catalog(
+        tx.catalog(work),
+        &job.provider,
+        &job.cid,
+        work,
+    )
+    .await
+    .map_err(crate::store::pinning::management::admission::work_error)?
+    .iter()
+    .any(|release| release.epoch >= remote.epoch)
+    {
+        return Ok(false);
+    }
+    let competing = pin_job::Entity::find()
+        .filter(pin_job::Column::Provider.eq(&job.provider))
+        .filter(pin_job::Column::Cid.eq(&job.cid))
+        .filter(pin_job::Column::Id.ne(&job.id))
+        .filter(pin_job::Column::Operation.is_in(["submit", "poll", "unpin"]))
+        .filter(pin_job::Column::State.is_in(["pending", "running"]))
+        .one(tx.db())
+        .await?;
+    if competing.is_some() {
+        return Ok(false);
+    }
+    if history.is_some() {
+        let deleted = jobs::history::Entity::delete_many()
+            .filter(jobs::history::Column::JobId.eq(&job.id))
+            .filter(jobs::history::Column::SubmitCalls.eq(0))
+            .filter(jobs::history::Column::RecoveryQueries.eq(0))
+            .filter(jobs::history::Column::Effect.eq("unknown"))
+            .filter(jobs::history::Column::State.eq("needs_attention"))
+            .filter(jobs::history::Column::FirstError.eq(jobs::RPC_MISSING_RECEIPT_PARK_REASON))
+            .filter(jobs::history::Column::LastError.eq(jobs::RPC_MISSING_RECEIPT_PARK_REASON))
+            .exec(tx.db())
+            .await?;
+        if deleted.rows_affected != 1 {
+            return Err(AppError::Internal(
+                "zero-call RPC history changed during recovery".into(),
+            ));
+        }
+    }
+    let mut update = pin_job::Entity::update_many()
+        .col_expr(pin_job::Column::State, Expr::value("pending"))
+        .col_expr(pin_job::Column::SubmitPhase, Expr::value("ready"))
+        .col_expr(
+            pin_job::Column::LockedUntil,
+            Expr::value(Option::<DateTime<Utc>>::None),
+        )
+        .col_expr(
+            pin_job::Column::LastError,
+            Expr::value(Option::<String>::None),
+        )
+        .col_expr(pin_job::Column::NextAttemptAt, Expr::value(now))
+        .col_expr(pin_job::Column::UpdatedAt, Expr::value(now))
+        .filter(pin_job::Column::Id.eq(&job.id))
+        .filter(pin_job::Column::Operation.eq("submit"))
+        .filter(pin_job::Column::State.eq("running"))
+        .filter(pin_job::Column::SubmitPhase.eq("recovering"))
+        .filter(pin_job::Column::LeaseId.eq(job.lease_id.clone()))
+        .filter(pin_job::Column::TargetId.eq(job.target_id.clone()))
+        .filter(pin_job::Column::ExpectedGeneration.eq(job.expected_generation));
+    update = match snapshot.locked_until {
+        Some(claim) => update.filter(pin_job::Column::LockedUntil.eq(claim)),
+        None => update
+            .filter(pin_job::Column::LockedUntil.is_null())
+            .filter(pin_job::Column::LastError.eq(jobs::RPC_MISSING_RECEIPT_PARK_REASON)),
+    };
+    let changed = update.exec(tx.db()).await?;
+    if changed.rows_affected != 1 {
+        return Err(AppError::Internal(
+            "zero-call RPC job changed during recovery".into(),
+        ));
+    }
+    Ok(true)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -968,6 +1495,7 @@ struct AdmissionSnapshot {
     remotes: BTreeMap<String, remote_pin::Model>,
     captures: BTreeMap<String, pin_invocation_route::Model>,
     ledgers: BTreeMap<String, remote_pin_ledger::Model>,
+    recoveries: Vec<pin_replica_observation::Model>,
     registered: Option<pin_provider_route::Model>,
     archives: Vec<pin_resource_history::Model>,
     targets: BTreeMap<String, pin_lease_target::Model>,
@@ -1035,6 +1563,21 @@ impl AdmissionSnapshot {
             format!("SELECT \"job_id\" FROM \"pin_submit_observations\" WHERE {scope}");
         let invocation_scope = format!("\"job_id\" IN ({evidence_jobs})");
         let job_scope = format!("{scope} AND \"id\" IN ({evidence_jobs})");
+        let recovery_scope = format!(
+            "{scope} AND EXISTS (SELECT 1 FROM \"pin_submit_observations\" AS evidence \
+             WHERE evidence.\"provider\"=\"pin_replica_observations\".\"provider\" \
+             AND evidence.\"expected_cid\"=\"pin_replica_observations\".\"expected_cid\" \
+             AND evidence.\"route\"=\"pin_replica_observations\".\"route\" \
+             AND evidence.\"remote_epoch\"=\"pin_replica_observations\".\"remote_epoch\") \
+             AND (\"pin_replica_observations\".\"projectable\"=TRUE \
+             OR NOT EXISTS (SELECT 1 FROM \"pin_replica_observations\" AS newer \
+             WHERE newer.\"provider\"=\"pin_replica_observations\".\"provider\" \
+             AND newer.\"expected_cid\"=\"pin_replica_observations\".\"expected_cid\" \
+             AND newer.\"route\"=\"pin_replica_observations\".\"route\" \
+             AND newer.\"remote_epoch\"=\"pin_replica_observations\".\"remote_epoch\" \
+             AND newer.\"projectable\"=FALSE \
+             AND newer.\"sequence\">\"pin_replica_observations\".\"sequence\"))"
+        );
         let remote_scope = format!(
             "{scope} AND \"cid\" IN (SELECT \"expected_cid\" FROM \"pin_submit_observations\" WHERE {scope})"
         );
@@ -1053,6 +1596,7 @@ impl AdmissionSnapshot {
             admission_table::<remote_pin::Entity>("remote", &remote_scope),
             admission_table::<pin_invocation_route::Entity>("capture", &invocation_scope),
             admission_table::<remote_pin_ledger::Entity>("ledger", &scope),
+            admission_table::<pin_replica_observation::Entity>("recovery", &recovery_scope),
             admission_table::<pin_provider_route::Entity>("registered", "\"provider\" = $1"),
             admission_table::<pin_resource_history::Entity>("archive", &scope),
             admission_table::<pin_lease_target::Entity>("target", &target_scope),
@@ -1148,6 +1692,30 @@ impl AdmissionSnapshot {
                 "ledger" => {
                     let model = remote_pin_ledger::Model::from_query_result(&row, "")?;
                     snapshot.ledgers.insert(model.cid.clone(), model);
+                }
+                "recovery" => {
+                    let mut model = pin_replica_observation::Model::from_query_result(&row, "")?;
+                    if model.provider != provider {
+                        let pk = [("sequence".into(), model.sequence.to_string())].into();
+                        let Some(binding) =
+                            crate::store::pinning::legacy_migration::resolve_with_catalog(
+                                "pin_replica_observations",
+                                &pk,
+                                &model.provider,
+                                work,
+                                catalog,
+                            )
+                            .await
+                            .map_err(W::into_app)?
+                        else {
+                            continue;
+                        };
+                        if binding.operational_key != provider {
+                            continue;
+                        }
+                        model.provider = provider.into();
+                    }
+                    snapshot.recoveries.push(model);
                 }
                 "registered" => {
                     snapshot.registered =
@@ -1292,7 +1860,121 @@ impl AdmissionSnapshot {
                     && history.state == "needs_attention");
             return Ok(runnable && self.context_valid(row, job, remote, Some(&request))?);
         }
+        if let Some(request) = unknown_recovery_request(row) {
+            let claimed =
+                job.state == "running" && job.locked_until.is_some() && history.state == "active";
+            let due = job.state == "pending"
+                && job.submit_phase.as_deref() == Some("recovering")
+                && history.state == "active";
+            let bounded_park = job.state == "running"
+                && job.locked_until.is_none()
+                && job.submit_phase.as_deref() == Some("recovering")
+                && job.last_error.as_deref() == Some(jobs::RPC_RECOVERY_PARK_REASON)
+                && history.state == "needs_attention"
+                && history.recovery_queries < jobs::MAX_SUBMIT_RECOVERY_ATTEMPTS
+                && now.signed_duration_since(history.started_at) < chrono::Duration::hours(1);
+            return Ok(remote.epoch == row.remote_epoch
+                && (claimed || due || bounded_park)
+                && self.context_valid(row, job, remote, Some(&request))?);
+        }
         Ok(false)
+    }
+
+    fn recovered_known(&self, row: &evidence::Model, ledger: &remote_pin_ledger::Model) -> bool {
+        let request = if self
+            .jobs
+            .get(&row.job_id)
+            .is_some_and(|job| job.state == "error")
+        {
+            terminal_read_request(row)
+        } else {
+            unknown_recovery_request(row)
+        };
+        let Some(request) = request else {
+            return false;
+        };
+        let (Some(job), Some(history), Some(remote), Some(capture)) = (
+            self.jobs.get(&row.job_id),
+            self.histories.get(&row.job_id),
+            self.remotes.get(&row.expected_cid),
+            self.captures.get(&row.job_id),
+        ) else {
+            return false;
+        };
+        let Some(recovery) = self
+            .recoveries
+            .iter()
+            .filter(|fact| {
+                fact.job_id == row.job_id
+                    && fact.provider == row.provider
+                    && fact.expected_cid == row.expected_cid
+                    && fact.route == row.route
+                    && fact.remote_epoch == row.remote_epoch
+                    && fact.phase == "submit_recovery"
+                    && fact.projectable
+            })
+            .max_by_key(|fact| fact.sequence)
+        else {
+            return false;
+        };
+        let Some(source_sequence) = recovery
+            .outcome
+            .strip_prefix("VerifiedPinned:")
+            .and_then(|sequence| sequence.parse::<i64>().ok())
+            .filter(|sequence| *sequence < recovery.sequence)
+        else {
+            return false;
+        };
+        if self.recoveries.iter().any(|fact| {
+            !fact.projectable
+                && fact.provider == recovery.provider
+                && fact.expected_cid == recovery.expected_cid
+                && fact.route == recovery.route
+                && fact.remote_epoch == recovery.remote_epoch
+                && fact.sequence > source_sequence
+        }) {
+            return false;
+        }
+        let Ok(resources) = serde_json::from_str::<Vec<ObservedResource>>(&recovery.resources)
+        else {
+            return false;
+        };
+        let [resource] = resources.as_slice() else {
+            return false;
+        };
+        let Some(observed_at) = row.observed_at.as_ref() else {
+            return false;
+        };
+        !row.needs_attention
+            && recovery.projectable
+            && recovery.phase == "submit_recovery"
+            && recovery.safe_error.is_none()
+            && recovery.provider == row.provider
+            && recovery.expected_cid == row.expected_cid
+            && recovery.route == row.route
+            && recovery.remote_epoch == row.remote_epoch
+            && recovery.lease_id == job.lease_id
+            && recovery.target_id == job.target_id
+            && recovery.expected_generation == job.expected_generation
+            && &recovery.observed_at >= observed_at
+            && resource.resource_type == RemoteResourceType::RpcPin
+            && resource.status == ObservedResourceStatus::RecursiveVerified
+            && resource.ownership == Ownership::Unknown
+            && resource.replica_evidence.is_none()
+            && resource.request_id == request
+            && cids_equivalent(&resource.cid, &row.expected_cid).ok() == Some(true)
+            && history.submit_calls == row.submit_call
+            && history.state == "settled"
+            && history.effect == "created"
+            && capture.route == row.route
+            && capture.remote_epoch == row.remote_epoch
+            && remote.provider == row.provider
+            && remote.cid == row.expected_cid
+            && remote.epoch == row.remote_epoch
+            && remote.status == "pinned"
+            && remote.request_id.as_deref() == Some(request.as_str())
+            && ledger.effect == "confirmed"
+            && ledger.route.as_deref() == Some(row.route.as_str())
     }
 
     fn held_known(&self, ledger: &remote_pin_ledger::Model) -> bool {
@@ -1313,14 +1995,20 @@ impl AdmissionSnapshot {
                 });
         }
         rows.into_iter().any(|row| {
-            !row.needs_attention
-                && matches!(
-                    row.outcome.as_str(),
-                    "matched" | "accepted" | "not_submitted"
-                )
-                && ledger.route.as_deref() == Some(row.route.as_str())
-                && (ledger.effect != "not_created" || row.outcome == "not_submitted")
-                && !self.released(row)
+            !self.released(row)
+                && (self.recovered_known(row, ledger)
+                    || !row.needs_attention
+                        && (row.outcome == "not_submitted"
+                            || !self
+                                .jobs
+                                .get(&row.job_id)
+                                .is_some_and(|job| job.state == "error"))
+                        && matches!(
+                            row.outcome.as_str(),
+                            "matched" | "accepted" | "not_submitted"
+                        )
+                        && ledger.route.as_deref() == Some(row.route.as_str())
+                        && (ledger.effect != "not_created" || row.outcome == "not_submitted"))
         })
     }
 }
@@ -1365,7 +2053,7 @@ async fn settle_matching_core<C: ConnectionTrait>(
     else {
         return Ok(());
     };
-    if projection_core(db, job, &remote, runtime).await? {
+    if projection_core(db, job, &remote, runtime, None).await? {
         evidence::Entity::update_many()
             .col_expr(evidence::Column::NeedsAttention, Expr::value(false))
             .filter(evidence::Column::Id.eq(row.id))
@@ -1373,6 +2061,279 @@ async fn settle_matching_core<C: ConnectionTrait>(
             .await?;
     }
     Ok(())
+}
+
+/// A confirmed Reconcile may close an invocation's debt without waking its
+/// terminal Submit or granting target projection, Submit, release, or cleanup.
+pub(crate) async fn settle_terminal_read(
+    tx: &crate::store::RuntimeTransaction,
+    read_job: &pin_job::Model,
+    source_id: &str,
+    now: DateTime<Utc>,
+    work: crate::store::pinning::management::records::DecodeWork<'_>,
+) -> AppResult<bool> {
+    use crate::store::pinning::management::actions::job_authority::{self, JobPermit};
+    let Some(claim_until) = read_job.locked_until else {
+        return Ok(false);
+    };
+    if read_job.operation != "reconcile"
+        || !jobs::fence_job_claim(tx.db(), &read_job.id, claim_until).await?
+    {
+        return Ok(false);
+    }
+    job_authority::fence_runtime_authority(tx, read_job, work.budget().clone()).await?;
+    let permit =
+        job_authority::check_before_call_catalog(tx.catalog(work), read_job, work.budget().clone())
+            .await
+            .map_err(job_authority::safe)?;
+    let Some(JobPermit::ReadOnly(authority)) = permit else {
+        return Ok(false);
+    };
+    let Some(job) = jobs::lock_submit_receipt(tx.db(), source_id).await? else {
+        return Ok(false);
+    };
+    if job.state != "error" || job.operation != "submit" || job.locked_until.is_some() {
+        return Ok(false);
+    }
+    let Some(row) = latest(tx.db(), &job.id).await? else {
+        return Ok(false);
+    };
+    let Some(request) = terminal_read_request(&row) else {
+        return Ok(false);
+    };
+    let Some(capture) = pin_invocation_route::Entity::find_by_id(&job.id)
+        .one(tx.db())
+        .await?
+    else {
+        return Ok(false);
+    };
+    if !row.needs_attention
+        || row.job_id != job.id
+        || row.provider != job.provider
+        || row.expected_cid != job.cid
+        || job.expected_remote_epoch.is_some()
+        || job.lease_id.is_none()
+        || job.target_id.is_none()
+        || job.expected_generation.is_none()
+        || authority.provider != row.provider
+        || authority.cid != row.expected_cid
+        || authority.remote_epoch != row.remote_epoch
+        || serde_json::from_str::<ProviderRouteSnapshot>(&row.route)
+            .ok()
+            .as_ref()
+            != Some(&authority.route)
+        || capture.route != row.route
+        || capture.remote_epoch != row.remote_epoch
+    {
+        return Ok(false);
+    }
+    let Some(remote) = lock_receipt_remote(tx.db(), &job.provider, &job.cid).await? else {
+        return Ok(false);
+    };
+    let Some(ledger) =
+        remote_pin_ledger::Entity::find_by_id((job.provider.clone(), job.cid.clone()))
+            .one(tx.db())
+            .await?
+    else {
+        return Ok(false);
+    };
+    if remote.epoch != row.remote_epoch
+        || remote.status == "absent"
+        || remote.request_id.as_ref().is_some_and(|id| id != &request)
+        || ledger.route.as_deref() != Some(row.route.as_str())
+        || crate::store::pinning::legacy_migration::release_history_catalog(
+            tx.catalog(work),
+            &job.provider,
+            &job.cid,
+            work,
+        )
+        .await
+        .map_err(job_authority::safe)?
+        .iter()
+        .any(|release| release.epoch >= row.remote_epoch)
+    {
+        return Ok(false);
+    }
+    let Some(recovery) = verified_rpc_recovery(tx.db(), &row, &job, work.budget().clone()).await?
+    else {
+        return Ok(false);
+    };
+    let Some(fact) = pin_replica_observation::Entity::find_by_id(recovery.sequence)
+        .one(tx.db())
+        .await?
+    else {
+        return Ok(false);
+    };
+    if fact.job_id != read_job.id || fact.claim_until != claim_until {
+        return Ok(false);
+    }
+    let history = jobs::history::Entity::update_many()
+        .col_expr(jobs::history::Column::State, Expr::value("settled"))
+        .col_expr(jobs::history::Column::Effect, Expr::value("created"))
+        .filter(jobs::history::Column::JobId.eq(&job.id))
+        .filter(jobs::history::Column::SubmitCalls.eq(row.submit_call))
+        .exec(tx.db())
+        .await?;
+    if history.rows_affected != 1 {
+        return Ok(false);
+    }
+    let remote_changed = remote_pin::Entity::update_many()
+        .col_expr(remote_pin::Column::Status, Expr::value("pinned"))
+        .col_expr(remote_pin::Column::RequestId, Expr::value(request))
+        .filter(remote_pin::Column::Provider.eq(&job.provider))
+        .filter(remote_pin::Column::Cid.eq(&job.cid))
+        .filter(remote_pin::Column::Epoch.eq(row.remote_epoch))
+        .exec(tx.db())
+        .await?;
+    let ledger_changed = remote_pin_ledger::Entity::update_many()
+        .col_expr(remote_pin_ledger::Column::Effect, Expr::value("confirmed"))
+        .col_expr(
+            remote_pin_ledger::Column::LastError,
+            Expr::value(Option::<String>::None),
+        )
+        .col_expr(remote_pin_ledger::Column::LastObservedAt, Expr::value(now))
+        .col_expr(remote_pin_ledger::Column::RemotePinnedAt, Expr::value(now))
+        .filter(remote_pin_ledger::Column::Provider.eq(&job.provider))
+        .filter(remote_pin_ledger::Column::Cid.eq(&job.cid))
+        .filter(remote_pin_ledger::Column::Route.eq(&row.route))
+        .exec(tx.db())
+        .await?;
+    if remote_changed.rows_affected != 1 || ledger_changed.rows_affected != 1 {
+        return Err(AppError::Database(
+            "terminal recovery resource compare-and-set failed".into(),
+        ));
+    }
+    settle_recovery_fact(tx, &job, &row, recovery, claim_until, now).await?;
+    Ok(true)
+}
+
+pub(crate) async fn settle_runtime_recovery(
+    tx: &crate::store::RuntimeTransaction,
+    job: &pin_job::Model,
+    recovery_sequence: i64,
+    now: DateTime<Utc>,
+    work: crate::store::pinning::management::records::DecodeWork<'_>,
+) -> AppResult<()> {
+    let Some(row) = latest(tx.db(), &job.id).await? else {
+        return Ok(());
+    };
+    let Some(recovery) = verified_rpc_recovery(tx.db(), &row, job, work.budget().clone())
+        .await?
+        .filter(|recovery| recovery.sequence == recovery_sequence)
+    else {
+        return Ok(());
+    };
+    let claim_until = job
+        .locked_until
+        .ok_or_else(|| AppError::Internal("RPC recovery claim missing".into()))?;
+    settle_recovery_fact(tx, job, &row, recovery, claim_until, now).await
+}
+
+async fn settle_recovery_fact(
+    tx: &crate::store::RuntimeTransaction,
+    job: &pin_job::Model,
+    row: &evidence::Model,
+    recovery: VerifiedRpcRecovery,
+    claim_until: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> AppResult<()> {
+    let settled = evidence::Entity::update_many()
+        .col_expr(evidence::Column::NeedsAttention, Expr::value(false))
+        .filter(evidence::Column::Id.eq(&row.id))
+        .filter(evidence::Column::JobId.eq(&job.id))
+        .filter(evidence::Column::SubmitCall.eq(row.submit_call))
+        .filter(evidence::Column::Route.eq(&row.route))
+        .filter(evidence::Column::RemoteEpoch.eq(row.remote_epoch))
+        .filter(evidence::Column::Outcome.eq(&row.outcome))
+        .filter(evidence::Column::Effect.eq(&row.effect))
+        .filter(evidence::Column::NeedsAttention.eq(true))
+        .exec(tx.db())
+        .await?;
+    if settled.rows_affected != 1 {
+        return Err(AppError::Internal(
+            "RPC recovery receipt identity changed".into(),
+        ));
+    }
+    let existing = pin_replica_observation::Entity::find()
+        .filter(pin_replica_observation::Column::JobId.eq(&job.id))
+        .filter(pin_replica_observation::Column::Phase.eq("submit_recovery"))
+        .filter(pin_replica_observation::Column::Route.eq(&row.route))
+        .filter(pin_replica_observation::Column::RemoteEpoch.eq(row.remote_epoch))
+        .filter(pin_replica_observation::Column::Projectable.eq(true))
+        .one(tx.db())
+        .await?;
+    if existing.is_some() {
+        return Err(AppError::Internal(
+            "RPC recovery closure already exists".into(),
+        ));
+    }
+    pin_replica_observation::Entity::insert(pin_replica_observation::ActiveModel {
+        sequence: Default::default(),
+        job_id: sea_orm::Set(job.id.clone()),
+        provider: sea_orm::Set(job.provider.clone()),
+        expected_cid: sea_orm::Set(job.cid.clone()),
+        route: sea_orm::Set(row.route.clone()),
+        remote_epoch: sea_orm::Set(row.remote_epoch),
+        claim_until: sea_orm::Set(claim_until),
+        lease_id: sea_orm::Set(job.lease_id.clone()),
+        target_id: sea_orm::Set(job.target_id.clone()),
+        expected_generation: sea_orm::Set(job.expected_generation),
+        phase: sea_orm::Set("submit_recovery".into()),
+        resources: sea_orm::Set(
+            serde_json::to_string(&recovery.observation.resources).map_err(|_| {
+                AppError::Internal("RPC recovery closure serialization failed".into())
+            })?,
+        ),
+        outcome: sea_orm::Set(format!("VerifiedPinned:{}", recovery.sequence)),
+        safe_error: sea_orm::Set(None),
+        projectable: sea_orm::Set(true),
+        observed_at: sea_orm::Set(now),
+    })
+    .exec(tx.db())
+    .await?;
+    Ok(())
+}
+
+pub(crate) async fn has_resource_debt<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+    cid: &str,
+) -> AppResult<bool> {
+    if evidence::Entity::find()
+        .filter(evidence::Column::Provider.eq(provider))
+        .filter(evidence::Column::ExpectedCid.eq(cid))
+        .filter(evidence::Column::NeedsAttention.eq(true))
+        .one(db)
+        .await?
+        .is_some()
+    {
+        return Ok(true);
+    }
+    if let Some(ledger) =
+        remote_pin_ledger::Entity::find_by_id((provider.to_owned(), cid.to_owned()))
+            .one(db)
+            .await?
+        && (matches!(ledger.effect.as_str(), "unknown" | "reported_unknown")
+            || super::decode_route(&ledger).is_some_and(|route| is_rpc(&route))
+                && !held_evidence_known(db, &ledger).await?)
+    {
+        return Ok(true);
+    }
+    let jobs = pin_job::Entity::find()
+        .filter(pin_job::Column::Provider.eq(provider))
+        .filter(pin_job::Column::Cid.eq(cid))
+        .filter(pin_job::Column::Operation.eq("submit"))
+        .all(db)
+        .await?;
+    for job in jobs {
+        if jobs::submission_history(db, &job.id)
+            .await?
+            .is_some_and(|history| history.submit_calls > 0 && history.effect == "unknown")
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub async fn has_debt<C: ConnectionTrait>(db: &C, provider: &str) -> AppResult<bool> {
@@ -1467,6 +2428,15 @@ async fn held_evidence_core<C: ConnectionTrait>(
     if ledger.effect == "reserved" {
         return Ok(super::decode_route(ledger).is_some_and(|route| is_rpc(&route)));
     }
+    let snapshot = match runtime {
+        Some((catalog, work)) => {
+            AdmissionSnapshot::read_with_catalog(&ledger.provider, catalog, &work).await?
+        }
+        None => AdmissionSnapshot::read(db, &ledger.provider).await?,
+    };
+    if snapshot.held_known(ledger) {
+        return Ok(true);
+    }
     let rows = match runtime {
         Some((catalog, work)) => observations_catalog(catalog, &ledger.provider, work).await?,
         None => observations(db, &ledger.provider).await?,
@@ -1483,6 +2453,14 @@ async fn held_evidence_core<C: ConnectionTrait>(
             }));
     }
     for row in rows {
+        if row.outcome != "not_submitted"
+            && snapshot
+                .jobs
+                .get(&row.job_id)
+                .is_some_and(|job| job.state == "error")
+        {
+            continue;
+        }
         if row.needs_attention
             || !matches!(
                 row.outcome.as_str(),
@@ -1530,6 +2508,11 @@ pub async fn matching_pin_held<C: ConnectionTrait>(
     provider: &str,
     cid: &str,
 ) -> AppResult<bool> {
+    if let Some(ledger) = super::get(db, provider, cid).await?
+        && held_evidence_known(db, &ledger).await?
+    {
+        return Ok(true);
+    }
     let rows = observations(db, provider).await?.into_iter().filter(|row| {
         row.expected_cid == cid && matches!(row.outcome.as_str(), "matched" | "accepted")
     });
@@ -1551,6 +2534,11 @@ pub(in crate::store::pinning) async fn matching_pin_held_catalog(
     cid: &str,
     work: crate::store::pinning::management::records::DecodeWork<'_>,
 ) -> AppResult<bool> {
+    if let Some(ledger) = super::get_catalog(catalog, provider, cid, work).await?
+        && held_evidence_known_catalog(catalog, &ledger, work).await?
+    {
+        return Ok(true);
+    }
     let rows = observations_catalog(catalog, provider, work).await?;
     for row in rows.into_iter().filter(|row| {
         row.expected_cid == cid && matches!(row.outcome.as_str(), "matched" | "accepted")
@@ -1717,7 +2705,7 @@ pub async fn projection_allowed<C: ConnectionTrait>(
     job: &crate::store::entities::pin_job::Model,
     remote: &remote_pin::Model,
 ) -> AppResult<bool> {
-    projection_core(db, job, remote, None).await
+    projection_core(db, job, remote, None, None).await
 }
 
 pub(crate) async fn projection_allowed_catalog(
@@ -1732,7 +2720,24 @@ pub(crate) async fn projection_allowed_catalog(
     ) {
         return projection_allowed(&catalog, job, remote).await;
     }
-    projection_core(&catalog, job, remote, Some((catalog, work))).await
+    projection_core(&catalog, job, remote, Some((catalog, work)), None).await
+}
+
+pub(crate) async fn recovery_projection_allowed_catalog(
+    catalog: crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
+    job: &pin_job::Model,
+    remote: &remote_pin::Model,
+    recovery_sequence: i64,
+    work: crate::store::pinning::management::records::DecodeWork<'_>,
+) -> AppResult<bool> {
+    projection_core(
+        &catalog,
+        job,
+        remote,
+        Some((catalog, work)),
+        Some(recovery_sequence),
+    )
+    .await
 }
 
 async fn projection_core<C: ConnectionTrait>(
@@ -1743,6 +2748,7 @@ async fn projection_core<C: ConnectionTrait>(
         crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
         crate::store::pinning::management::records::DecodeWork<'_>,
     )>,
+    recovery_sequence: Option<i64>,
 ) -> AppResult<bool> {
     let Some(captured) = pin_invocation_route::Entity::find_by_id(job.id.clone())
         .one(db)
@@ -1801,7 +2807,23 @@ async fn projection_core<C: ConnectionTrait>(
         let Some(row) = latest(db, &job.id).await? else {
             return Ok(false);
         };
-        let Some(request) = matching_request(&row) else {
+        let request = if let Some(sequence) = recovery_sequence {
+            verified_rpc_recovery(
+                db,
+                &row,
+                job,
+                runtime
+                    .map(|(_, work)| work.budget().clone())
+                    .unwrap_or_default(),
+            )
+            .await?
+            .filter(|recovery| recovery.sequence == sequence)
+            .and_then(|recovery| recovery.observation.result.ok())
+            .map(|remote| remote.request_id)
+        } else {
+            matching_request(&row)
+        };
+        let Some(request) = request else {
             return Ok(false);
         };
         return receipt_context_core(db, &row, job, remote, Some(&request), runtime).await;

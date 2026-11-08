@@ -90,8 +90,63 @@ fn normalized(mut tokens: &[String]) -> Vec<String> {
     tokens.to_vec()
 }
 
-pub(super) fn canonical(sql: &str) -> Result<Vec<String>> {
+pub(crate) fn canonical(sql: &str) -> Result<Vec<String>> {
     Ok(normalized(&tokens(sql, true)?))
+}
+
+pub(crate) fn table_shape(sql: &str) -> Result<Vec<Vec<String>>> {
+    let mut tokens = tokens(sql, true)?;
+    if tokens.last().is_some_and(|token| token == ";") {
+        tokens.pop();
+    }
+    if tokens
+        .get(2..5)
+        .is_some_and(|part| part.iter().map(String::as_str).eq(["if", "not", "exists"]))
+    {
+        tokens.drain(2..5);
+    }
+    if tokens.first().map(String::as_str) != Some("create")
+        || tokens.get(1).map(String::as_str) != Some("table")
+        || tokens.get(3).map(String::as_str) != Some("(")
+        || tokens.last().map(String::as_str) != Some(")")
+    {
+        return Err(ManagementError::Schema);
+    }
+    let mut clauses = Vec::new();
+    let body = &tokens[4..tokens.len() - 1];
+    let mut start = 0;
+    let mut depth = 0i32;
+    for (index, token) in body.iter().enumerate() {
+        match token.as_str() {
+            "(" => depth += 1,
+            ")" => {
+                depth -= 1;
+                if depth < 0 {
+                    return Err(ManagementError::Schema);
+                }
+            }
+            "," if depth == 0 => {
+                clauses.push(body[start..index].to_vec());
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return Err(ManagementError::Schema);
+    }
+    clauses.push(body[start..].to_vec());
+    for clause in &mut clauses {
+        if clause.first().is_some_and(|token| token == "constraint") {
+            if clause.len() < 3 {
+                return Err(ManagementError::Schema);
+            }
+            clause.drain(..2);
+        }
+    }
+    clauses.sort();
+    clauses.insert(0, tokens[..3].to_vec());
+    Ok(clauses)
 }
 
 pub(super) fn canonical_default(sql: &str) -> Result<Vec<String>> {

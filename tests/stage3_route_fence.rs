@@ -24,8 +24,8 @@ use ipfs_s3_gateway::{
         self, Store,
         entities::{
             import_destination, object, object_version, pin_extension_decision, pin_job, pin_lease,
-            pin_lease_target, pin_provider_usage, remote_pin, remote_pin_ledger,
-            standard_mutation_lease,
+            pin_lease_target, pin_provider_route, pin_provider_usage, remote_pin,
+            remote_pin_ledger, standard_mutation_lease,
         },
         import::{jobs as import_jobs, ownership as import_ownership},
         pinning::{
@@ -41,7 +41,7 @@ use s3s::dto::{
     CompleteMultipartUploadInput, CompletedMultipartUpload, CompletedPart,
     CreateMultipartUploadInput, ETag,
 };
-use sea_orm::{Database, EntityTrait, PaginatorTrait};
+use sea_orm::{ConnectionTrait, Database, DatabaseBackend, EntityTrait, PaginatorTrait, Statement};
 use tokio_util::sync::CancellationToken;
 use wiremock::MockServer;
 
@@ -168,7 +168,7 @@ async fn missing_registered_remote_route_fails_preflight_and_publication() {
         limits: runtime.provider_limits(),
     };
     assert!(
-        publication::preflight_decided_routes(&db, args())
+        publication::preflight_decided_routes(&db, args(), &request.policy)
             .await
             .is_err()
     );
@@ -222,7 +222,8 @@ async fn one_and_all_validate_every_executable_candidate_before_any_allocation()
                     config: runtime.effective_config(),
                     mode: runtime.control_mode(),
                     limits: runtime.provider_limits(),
-                }
+                },
+                &request.policy,
             )
             .await
             .is_err(),
@@ -284,9 +285,6 @@ async fn db_route_override_rolls_back_new_and_shared_cid_decided_publications() 
         .unwrap();
     for (id, cid) in [("new", "bafy-new-route-fence"), ("shared", CID)] {
         let (request, decision) = captured(&runtime, id, cid);
-        decision
-            .verify_revision(runtime.effective_config(), runtime.control_mode())
-            .unwrap();
         let result = publication::publish_decided_object(
             &db,
             request,
@@ -395,33 +393,146 @@ async fn enabled_legacy_noop_capture_rejects_same_name_real_route_before_mpu_io_
         .await
         .unwrap();
 
-    // Another gateway has an executable network provider with the same legacy
-    // allocation key. A's in-memory revision remains unchanged.
-    let mut b_config = config;
-    b_config.pinning.providers[0].kind = "pinata".into();
-    b_config.pinning.providers[0].token_env = Some("ROUTE_TOKEN".into());
-    let b = ValidatedPinningConfig::from_config(&b_config, |_| Some("test-token".into())).unwrap();
-    ledger::register_route(store.db(), "backup", &b.providers[0].identity)
-        .await
-        .unwrap();
-    decision
-        .verify_revision(runtime.effective_config(), runtime.control_mode())
-        .unwrap();
     let args = || DecidedPublish {
         decision: &decision,
         config: runtime.effective_config(),
         mode: runtime.control_mode(),
         limits: runtime.provider_limits(),
     };
+    let tags = vec![ObjectTag::new("ipfs-s3:pin", "true")];
+    let (_, import_decision) = runtime
+        .policy()
+        .evaluate_publication_decision(
+            PublicationContext {
+                bucket: "route-fence",
+                key: "import",
+                tags: &tags,
+                is_decompress_zip: false,
+            },
+            DecisionOrigin::new("principal", "noop-import"),
+        )
+        .unwrap();
+    let now = Utc::now();
+    import_ownership::submit_decided(
+        store.db(),
+        import_jobs::NewImportJob {
+            id: "noop-import".into(),
+            bucket: "route-fence".into(),
+            key: "import".into(),
+            source: ImportSource::Cid(CID.into()),
+            request_fingerprint: "noop-fingerprint".into(),
+            client_token: None,
+            object_content_type: None,
+            metadata: HashMap::new(),
+            tags,
+            decompress_prefix: None,
+        },
+        import_decision,
+        now,
+    )
+    .await
+    .unwrap();
+    let claimed = import_jobs::claim_due(
+        store.db(),
+        "worker",
+        now,
+        now + chrono::TimeDelta::seconds(60),
+        1,
+    )
+    .await
+    .unwrap()
+    .pop()
+    .unwrap();
+    let policy = decision
+        .replay_policy(vec![ObjectTag::new("ipfs-s3:pin", "true")])
+        .unwrap();
+    publication::publish_decided_object(
+        store.db(),
+        PublicationRequest {
+            object: PublicationObject::from_put(
+                "noop-good".into(),
+                "route-fence",
+                "healthy",
+                CID.into(),
+                1,
+                None,
+                None,
+                false,
+                None,
+                None,
+                Utc::now(),
+            ),
+            tags: policy.tags.clone(),
+            object_target: PinTargetSpec {
+                cid: CID.into(),
+                logical_size: 1,
+            },
+            policy,
+        },
+        args(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(counts(store.db()).await[0], 1);
+
+    let original_route = pin_provider_route::Entity::find_by_id("backup")
+        .one(store.db())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut b_config = config;
+    b_config.pinning.providers[0].kind = "pinata".into();
+    b_config.pinning.providers[0].token_env = Some("ROUTE_TOKEN".into());
+    let b = ValidatedPinningConfig::from_config(&b_config, |_| Some("test-token".into())).unwrap();
+    assert!(matches!(
+        ledger::register_route(store.db(), "backup", &b.providers[0].identity).await,
+        Err(ipfs_s3_gateway::error::AppError::InvalidPinningRequest(_))
+    ));
+    assert_eq!(
+        pin_provider_route::Entity::find_by_id("backup")
+            .one(store.db())
+            .await
+            .unwrap(),
+        Some(original_route.clone())
+    );
+    // Registration rejects legacy alias reassignment. Inject drift to exercise
+    // the independent publication and pre-I/O fences against a changed DB route.
+    let drift = store
+        .db()
+        .execute(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE pin_provider_routes SET snapshot=? WHERE provider='backup'",
+            [serde_json::to_string(&b.providers[0].route_snapshot())
+                .unwrap()
+                .into()],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(drift.rows_affected(), 1);
     let before = counts(store.db()).await;
     let usage_before = pin_provider_usage::Entity::find_by_id("backup")
         .one(store.db())
         .await
         .unwrap();
     assert!(
-        publication::preflight_decided_routes(store.db(), args())
-            .await
-            .is_err()
+        publication::preflight_decided_routes(
+            store.db(),
+            args(),
+            &runtime
+                .policy()
+                .resolve_captured_publication(
+                    PublicationContext {
+                        bucket: "route-fence",
+                        key: "mpu",
+                        tags: &[ObjectTag::new("ipfs-s3:pin", "true")],
+                        is_decompress_zip: false,
+                    },
+                    &decision,
+                )
+                .unwrap(),
+        )
+        .await
+        .is_err()
     );
     let complete = S3Request {
         input: CompleteMultipartUploadInput {
@@ -457,12 +568,12 @@ async fn enabled_legacy_noop_capture_rejects_same_name_real_route_before_mpu_io_
             .unwrap(),
         0
     );
-    assert_eq!(
-        import_destination::Entity::find()
-            .count(store.db())
+    assert!(
+        import_destination::Entity::find_by_id(("route-fence".into(), "mpu".into()))
+            .one(store.db())
             .await
-            .unwrap(),
-        0
+            .unwrap()
+            .is_none()
     );
     assert!(
         store::multipart::get_part(store.db(), &upload_id, 1)
@@ -511,55 +622,6 @@ async fn enabled_legacy_noop_capture_rejects_same_name_real_route_before_mpu_io_
         usage_before
     );
 
-    // A separate accepted import on the same gateway must also stop before its
-    // CID source contacts Kubo (including the ZIP path, which starts with cat).
-    let tags = vec![ObjectTag::new("ipfs-s3:pin", "true")];
-    let (_, mut import_decision) = runtime
-        .policy()
-        .evaluate_publication_decision(
-            PublicationContext {
-                bucket: "route-fence",
-                key: "import",
-                tags: &tags,
-                is_decompress_zip: false,
-            },
-            DecisionOrigin::new("principal", "noop-import"),
-        )
-        .unwrap();
-    import_decision
-        .capture_durable_revision(runtime.effective_config(), runtime.control_mode())
-        .unwrap();
-    let now = Utc::now();
-    import_ownership::submit_decided(
-        store.db(),
-        import_jobs::NewImportJob {
-            id: "noop-import".into(),
-            bucket: "route-fence".into(),
-            key: "import".into(),
-            source: ImportSource::Cid(CID.into()),
-            request_fingerprint: "noop-fingerprint".into(),
-            client_token: None,
-            object_content_type: None,
-            metadata: HashMap::new(),
-            tags,
-            decompress_prefix: None,
-        },
-        import_decision,
-        now,
-    )
-    .await
-    .unwrap();
-    let claimed = import_jobs::claim_due(
-        store.db(),
-        "worker",
-        now,
-        now + chrono::TimeDelta::seconds(60),
-        1,
-    )
-    .await
-    .unwrap()
-    .pop()
-    .unwrap();
     let destination_before =
         import_destination::Entity::find_by_id(("route-fence".into(), "import".into()))
             .one(store.db())
@@ -594,41 +656,4 @@ async fn enabled_legacy_noop_capture_rejects_same_name_real_route_before_mpu_io_
     );
     assert!(kubo.received_requests().await.unwrap().is_empty());
     assert_eq!(counts(store.db()).await, before);
-
-    // Normal Noop is still permitted when its own registered route is current.
-    runtime.register_identities(&store).await.unwrap();
-    let policy = decision
-        .replay_policy(vec![ipfs_s3_gateway::pinning::tags::ObjectTag::new(
-            "ipfs-s3:pin",
-            "true",
-        )])
-        .unwrap();
-    publication::publish_decided_object(
-        store.db(),
-        PublicationRequest {
-            object: PublicationObject::from_put(
-                "noop-good".into(),
-                "route-fence",
-                "new",
-                CID.into(),
-                1,
-                None,
-                None,
-                false,
-                None,
-                None,
-                Utc::now(),
-            ),
-            tags: policy.tags.clone(),
-            object_target: PinTargetSpec {
-                cid: CID.into(),
-                logical_size: 1,
-            },
-            policy,
-        },
-        args(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(counts(store.db()).await[0], before[0] + 1);
 }

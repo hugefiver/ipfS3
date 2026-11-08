@@ -24,14 +24,18 @@ struct Invocation {
 
 impl Invocation {
     async fn new(api: &str) -> Self {
-        let db = store::connect_database("sqlite::memory:").await.unwrap();
-        Self::with_database(db, api).await
+        Self::new_with_strategy(api, "cid").await
     }
 
-    async fn with_database(db: DatabaseConnection, api: &str) -> Self {
+    async fn new_with_strategy(api: &str, strategy: &str) -> Self {
+        let db = store::connect_database("sqlite::memory:").await.unwrap();
+        Self::with_database(db, api, strategy).await
+    }
+
+    async fn with_database(db: DatabaseConnection, api: &str, strategy: &str) -> Self {
         store::run_migrations(&db).await.unwrap();
         let now = store::database_clock::database_now(&db).await.unwrap();
-        let identity = ProviderIdentity::legacy(PROVIDER, "kubo", None, api, "cid");
+        let identity = ProviderIdentity::legacy(PROVIDER, "kubo", None, api, strategy);
         ledger::register_route(&db, PROVIDER, &identity)
             .await
             .unwrap();
@@ -67,6 +71,7 @@ impl Invocation {
             logical_size: Set(100),
             provider: Set(PROVIDER.into()),
             state: Set("waiting".into()),
+            last_error: Set(None),
             created_at: Set(now),
             last_touched_at: Set(now),
         })
@@ -108,7 +113,7 @@ impl Invocation {
             jobs::prepare_submit_call(&tx, &claimed, now).await.unwrap(),
             jobs::SubmitCallDecision::ReadyToCall
         );
-        jobs::record_submit_invocation(&tx, &claimed, api, "cid", now)
+        jobs::record_submit_invocation(&tx, &claimed, api, strategy, now)
             .await
             .unwrap();
         let id = begin(&tx, &claimed, now).await.unwrap().unwrap();
@@ -319,6 +324,57 @@ async fn cancelled_unknown_receipt_records_facts_without_projection() {
     }
 }
 
+fn cid_pin_ack() -> SubmitObservation {
+    let request_id = format!("rpc-pin:kubo:{CID}");
+    SubmitObservation {
+        result: Ok(RemotePin {
+            request_id: request_id.clone(),
+            cid: CID.into(),
+            status: RemotePinStatus::Pinned,
+            raw_status: "recursive".into(),
+            failure_reason: None,
+        }),
+        resources: vec![ObservedResource {
+            resource_type: RemoteResourceType::RpcPin,
+            cid: CID.into(),
+            request_id,
+            status: ObservedResourceStatus::PinAccepted,
+            ownership: Ownership::Unknown,
+            replica_evidence: None,
+        }],
+        effect: SubmitEffect::Observed,
+    }
+}
+
+#[tokio::test]
+async fn pin_accepted_matches_only_the_original_cid_strategy() {
+    for (strategy, expected_outcome, expected_attention) in
+        [("cid", "matched", false), ("upload", "unknown", true)]
+    {
+        let invocation = Invocation::new_with_strategy("kubo", strategy).await;
+        assert!(
+            record(
+                &invocation.db,
+                &invocation.claimed,
+                &invocation.id,
+                &cid_pin_ack(),
+                invocation.now,
+            )
+            .await
+            .unwrap()
+        );
+        let saved = latest(&invocation.db, &invocation.claimed.model.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.outcome, expected_outcome, "strategy={strategy}");
+        assert_eq!(
+            saved.needs_attention, expected_attention,
+            "strategy={strategy}"
+        );
+    }
+}
+
 fn observed(api: &str, success: bool) -> SubmitObservation {
     let cluster = api == "cluster-rest";
     SubmitObservation {
@@ -355,6 +411,44 @@ fn observed(api: &str, success: bool) -> SubmitObservation {
         }],
         effect: SubmitEffect::Observed,
     }
+}
+
+#[tokio::test]
+async fn terminal_cid_read_closure_excludes_upload_car_and_cluster() {
+    let invocation = Invocation::new("kubo").await;
+    let captured = capture_fact(&invocation.db, &invocation.claimed, &invocation.id)
+        .await
+        .unwrap();
+    let route = ledger::job_route(&invocation.db, &invocation.claimed.model.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let request = crate::pinning::ipfs_rpc::canonical_cid_request_id(&route, CID)
+        .unwrap()
+        .unwrap();
+    let mut observation = observed("kubo", true);
+    observation.result.as_mut().unwrap().request_id = request.clone();
+    observation.resources[0].request_id = request.clone();
+    let store = store::Store::new(invocation.db);
+    let receipt = complete_fact(&store, &captured, &observation, invocation.now)
+        .await
+        .unwrap();
+    assert_eq!(
+        terminal_read_request(&receipt).as_deref(),
+        Some(request.as_str())
+    );
+    for strategy in ["upload", "car"] {
+        let mut row = receipt.clone();
+        let mut route: ProviderRouteSnapshot = serde_json::from_str(&row.route).unwrap();
+        route.strategy = strategy.into();
+        row.route = serde_json::to_string(&route).unwrap();
+        assert!(terminal_read_request(&row).is_none());
+    }
+    let mut row = receipt;
+    let mut route: ProviderRouteSnapshot = serde_json::from_str(&row.route).unwrap();
+    route.api_profile = "cluster-rest".into();
+    row.route = serde_json::to_string(&route).unwrap();
+    assert!(terminal_read_request(&row).is_none());
 }
 
 #[derive(Clone, Copy)]
@@ -545,6 +639,7 @@ async fn check_unknown_projection_after_receipt_commit(lifetime: Lifetime) {
     .unwrap();
     for api in ["kubo", "cluster-rest"] {
         for observation in [unknown(), observed(api, false)] {
+            let recoverable = api == "kubo" && observation.resources.is_empty();
             let Invocation {
                 db, claimed, id, ..
             } = Invocation::new(api).await;
@@ -643,14 +738,29 @@ async fn check_unknown_projection_after_receipt_commit(lifetime: Lifetime) {
             );
             let after = ProjectionState::read(store.db(), &claimed.model.id).await;
             if matches!(lifetime, Lifetime::Live) {
-                assert_eq!(after.target.state, "degraded");
+                assert_eq!(
+                    after.target.state,
+                    if recoverable { "degraded" } else { "error" }
+                );
                 assert_eq!(after.ledger.effect, "unknown");
                 assert!(after.ledger.last_error.is_some());
-                assert_eq!(after.history.state, "needs_attention");
+                assert_eq!(
+                    after.history.state,
+                    if recoverable {
+                        "active"
+                    } else {
+                        "needs_attention"
+                    }
+                );
                 assert!(after.history.last_error.is_some());
-                assert_eq!(after.job.state, "running");
+                assert_eq!(
+                    after.job.state,
+                    if recoverable { "pending" } else { "error" }
+                );
                 assert!(after.job.locked_until.is_none());
-                assert_eq!(after.job.submit_phase.as_deref(), Some("recovering"));
+                if recoverable {
+                    assert_eq!(after.job.submit_phase.as_deref(), Some("recovering"));
+                }
                 assert_eq!(after.lease, after_change.lease);
                 assert_eq!(after.remote, after_change.remote);
             } else {
@@ -895,7 +1005,7 @@ async fn postgres_invocation() -> (Invocation, DatabaseConnection, String) {
             panic!("isolated receipt fixture connection failed: {error}");
         }
     };
-    match std::panic::AssertUnwindSafe(Invocation::with_database(db.clone(), "kubo"))
+    match std::panic::AssertUnwindSafe(Invocation::with_database(db.clone(), "kubo", "cid"))
         .catch_unwind()
         .await
     {
@@ -916,17 +1026,17 @@ async fn bounded_candidate_pages_progress_past_inflight_and_unwakeable_history()
     let captured = capture_fact(&invocation.db, &invocation.claimed, &invocation.id)
         .await
         .unwrap();
-    let tx = invocation.db.begin().await.unwrap();
-    jobs::park_submit(
-        &tx,
-        &invocation.claimed,
-        "needs_attention",
-        jobs::RPC_RECOVERY_PARK_REASON,
-        invocation.now,
-    )
-    .await
-    .unwrap();
-    tx.commit().await.unwrap();
+    invocation.db.execute(Statement::from_sql_and_values(
+        invocation.db.get_database_backend(),
+        "UPDATE pin_jobs SET locked_until=NULL,submit_phase='recovering',last_error=$1 WHERE id=$2",
+        [jobs::RPC_RECOVERY_PARK_REASON.into(), invocation.claimed.model.id.clone().into()],
+    )).await.unwrap();
+    jobs::history::Entity::update_many()
+        .col_expr(jobs::history::Column::State, Expr::value("needs_attention"))
+        .filter(jobs::history::Column::JobId.eq(&invocation.claimed.model.id))
+        .exec(&invocation.db)
+        .await
+        .unwrap();
     let store = store::Store::new(invocation.db);
     let receipt = complete_fact(&store, &captured, &observed("kubo", true), invocation.now)
         .await
@@ -948,18 +1058,31 @@ async fn bounded_candidate_pages_progress_past_inflight_and_unwakeable_history()
             .await
             .unwrap();
     }
-    let mut cursor = String::new();
-    let mut found = Vec::new();
-    for _ in 0..3 {
-        let (next, candidates) = parked_receipt_candidates(store.db(), &cursor, 1)
-            .await
-            .unwrap();
-        let next = next.expect("each page must advance past one persisted identity");
-        assert!(next > cursor);
-        cursor = next;
-        found.extend(candidates);
-    }
+    let mut terminal = invocation.claimed.model.clone().into_active_model();
+    terminal.id = Set("!terminal".into());
+    terminal.state = Set("error".into());
+    terminal.locked_until = Set(None);
+    pin_job::Entity::insert(terminal)
+        .exec(store.db())
+        .await
+        .unwrap();
+    let mut terminal_fact = receipt.clone().into_active_model();
+    terminal_fact.id = Set("!terminal:call:1".into());
+    terminal_fact.job_id = Set("!terminal".into());
+    evidence::Entity::insert(terminal_fact)
+        .exec(store.db())
+        .await
+        .unwrap();
+    let (cursor, found) = parked_receipt_candidates(store.db(), "", 1).await.unwrap();
+    let cursor = cursor.expect("the first page must reach runnable parked work");
     assert_eq!(found.len(), 1);
+    assert!(
+        evidence::Entity::find_by_id("!terminal:call:1")
+            .one(store.db())
+            .await
+            .unwrap()
+            .is_some()
+    );
     assert_eq!(found[0].id, invocation.claimed.model.id);
     let work = crate::store::pinning::management::records::SharedDecodeBudget::default();
     let tx = store

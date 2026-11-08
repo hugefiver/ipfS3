@@ -229,8 +229,9 @@ impl PinningCoordinator {
         let zip = DecompressZipConfig {
             unixfs_directory_root: zip_root_default,
             limits: zip_extraction_limits,
+            auto_pin_outputs: Some(!raw_rules.is_empty()),
             pin_output_rules: raw_rules.to_vec(),
-            ..DecompressZipConfig::default()
+            pin_output_rules_provided: true,
         };
         Self::build_with_decompress_config(config, kubo, mode, &zip)
     }
@@ -244,7 +245,7 @@ impl PinningCoordinator {
         // Resolve aliases before policy evaluation: all later target, quota and
         // job keys use the same physical resource namespace.
         let config = normalize_validated_config(config)?;
-        let zip_output_rules = ValidatedZipOutputRules::compile(&zip.pin_output_rules, &config)?;
+        let zip_output_rules = ValidatedZipOutputRules::from_config(zip, &config)?;
         let claim_limit = config
             .worker_concurrency
             .checked_mul(2)
@@ -567,16 +568,35 @@ impl PinningCoordinator {
         policy_id: &str,
         providers: &[&str],
     ) {
-        Arc::get_mut(coordinator)
-            .expect("test coordinator must not yet be shared")
+        let coordinator =
+            Arc::get_mut(coordinator).expect("test coordinator must not yet be shared");
+        let providers = providers
+            .iter()
+            .map(|provider| (*provider).to_owned())
+            .collect::<Vec<_>>();
+        coordinator
             .policy_providers
-            .insert(
-                policy_id.to_owned(),
-                providers
-                    .iter()
-                    .map(|provider| (*provider).to_owned())
-                    .collect(),
-            );
+            .insert(policy_id.to_owned(), providers.clone());
+        coordinator
+            .effective_config
+            .policies
+            .retain(|policy| !(policy.bucket == "bucket" && policy.prefix == "one/"));
+        coordinator.effective_config.policies.insert(
+            0,
+            super::config::ValidatedPolicy {
+                identity: policy_id.to_owned(),
+                bucket: "bucket".to_owned(),
+                prefix: "one/".to_owned(),
+                trigger: super::config::PolicyTrigger::Always,
+                provider_mode: super::config::ProviderMode::One,
+                providers,
+                default_duration: super::config::LeaseDuration::parse("1h").unwrap(),
+                max_duration: super::config::LeaseDuration::parse("24h").unwrap(),
+                allow_decompressed: true,
+            },
+        );
+        coordinator.policy =
+            PinPolicyEvaluator::with_mode(&coordinator.effective_config, coordinator.control_mode);
     }
 }
 
@@ -694,18 +714,10 @@ mod tests {
         assert_eq!(disabled.control_mode(), OptionalPinControlMode::Strict);
         assert!(disabled.provider_limits().is_empty());
         assert!(disabled.provider("noop").is_none());
-        assert_eq!(
-            disabled.zip_output_rules().revision(),
-            coordinator.zip_output_rules().revision()
-        );
 
         let with_kubo =
             PinningCoordinator::build_with_kubo(validated_noop_fixture(), None).unwrap();
         assert_eq!(with_kubo.control_mode(), OptionalPinControlMode::Strict);
-        assert_eq!(
-            with_kubo.zip_output_rules().revision(),
-            coordinator.zip_output_rules().revision()
-        );
     }
 
     #[test]
@@ -783,12 +795,6 @@ mod tests {
         assert_eq!(coordinator.provider_limits(), &effective.provider_limits);
         assert_eq!(coordinator.provider(&key).unwrap().name(), key);
         assert_eq!(coordinator.control_mode(), OptionalPinControlMode::Warn);
-        assert_eq!(
-            coordinator.zip_output_rules().revision(),
-            PinningCoordinator::disabled_for_test()
-                .zip_output_rules()
-                .revision()
-        );
 
         let tags = [ObjectTag::new("ipfs-s3:pin", "true")];
         let (policy, decision) = coordinator
@@ -805,16 +811,19 @@ mod tests {
             .unwrap();
         assert_eq!(policy.leases[0].providers, vec![key]);
         assert_eq!(decision.effect, DecisionEffect::Accepted);
-        assert!(
-            decision
-                .verify_revision(effective, coordinator.control_mode())
-                .is_ok()
-        );
-        assert!(
-            decision
-                .verify_revision(effective, OptionalPinControlMode::Strict)
-                .is_err()
-        );
+        let resolved = coordinator
+            .policy()
+            .resolve_captured_publication(
+                PublicationContext {
+                    bucket: "bucket",
+                    key: "object",
+                    tags: &tags,
+                    is_decompress_zip: false,
+                },
+                &decision,
+            )
+            .unwrap();
+        assert_eq!(resolved.leases, policy.leases);
     }
 
     #[test]
@@ -838,13 +847,6 @@ mod tests {
         )
         .unwrap();
         assert!(!coordinator.zip_root_default());
-        assert_ne!(
-            coordinator.zip_output_rules().revision(),
-            PinningCoordinator::build(validated.clone())
-                .unwrap()
-                .zip_output_rules()
-                .revision()
-        );
         let plan = coordinator
             .zip_output_rules()
             .plan(
@@ -896,6 +898,47 @@ mod tests {
                 .outputs[0]
                 .warning,
             Some(ZipPlanWarning::NoMatchingRule)
+        );
+    }
+
+    #[test]
+    fn coordinator_keeps_omitted_and_explicit_empty_zip_rules_distinct() {
+        let config = validated_noop_fixture();
+        let mut zip = crate::config::DecompressZipConfig {
+            auto_pin_outputs: Some(true),
+            ..Default::default()
+        };
+        for explicit_empty in [false, true] {
+            zip.pin_output_rules_provided = explicit_empty;
+            let coordinator = PinningCoordinator::build_with_decompress_config(
+                config.clone(),
+                None,
+                OptionalPinControlMode::Strict,
+                &zip,
+            )
+            .unwrap();
+            let plan = coordinator
+                .zip_output_rules()
+                .plan(
+                    ZipTargets {
+                        source: false,
+                        extracted: true,
+                    },
+                    None,
+                    &[ZipPublishedOutput {
+                        bucket: "bucket".to_owned(),
+                        key: "file".to_owned(),
+                        version_id: "v1".to_owned(),
+                        cid: "cid".to_owned(),
+                    }],
+                )
+                .unwrap();
+            assert_eq!(plan.outputs[0].intents.len(), usize::from(!explicit_empty));
+        }
+        let default = PinningCoordinator::build(config).unwrap();
+        assert_eq!(
+            default.decompress_zip_config().auto_pin_outputs,
+            Some(false)
         );
     }
 

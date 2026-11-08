@@ -38,8 +38,7 @@ pub struct ZipSelectedLease {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ZipIntentSelection {
     pub leases: Vec<ZipSelectedLease>,
-    /// Exact real source's decision; absent for source=false. Manual capture is
-    /// preserved, with an explicitly selected source intent appended, if any.
+    /// Original real source admission receipt; absent for source=false.
     pub source_decision: Option<ExtensionDecision>,
     /// Persist with each exact successful object, including no-intent results.
     pub output_decisions: Vec<(ZipBoundOutput, ExtensionDecision)>,
@@ -107,7 +106,9 @@ pub fn select_zip_intents(
             "ZIP binding is not an exact successful published output"
         );
     }
-    if let Some(plan) = &capture.historical_plan {
+    if capture.selection_semantics() == CaptureSemantics::LegacyV2
+        && let Some(plan) = &capture.historical_plan
+    {
         let expected = usize::from(capture.controls.targets.source)
             + if capture.controls.targets.extracted {
                 successful.len()
@@ -125,7 +126,7 @@ pub fn select_zip_intents(
         output_decisions: Vec::new(),
         warnings: Vec::new(),
     };
-    for intent in &capture.source_decision.effective_intents {
+    for intent in capture.source_intents() {
         let owner = source.expect("capture validation requires real source for source intents");
         let targets = if intent.content_mode == ContentMode::Decompressed {
             successful.to_vec()
@@ -142,7 +143,7 @@ pub fn select_zip_intents(
                     .iter()
                     .map(|name| {
                         capture
-                            .source_providers
+                            .source_provider_candidates()
                             .iter()
                             .find(|p| &p.selected.config_name == name)
                             .expect("capture route evidence validated")
@@ -163,52 +164,43 @@ pub fn select_zip_intents(
             ZipOutputKind::Source => capture.controls.targets.source,
             ZipOutputKind::Extracted => capture.controls.targets.extracted,
         };
-        let (planned, warning) = if capture.semantics == CaptureSemantics::LegacyV1 || !eligible {
-            (Vec::new(), None)
-        } else if capture.semantics == CaptureSemantics::LegacyV2 {
-            let plan = capture.historical_plan.as_ref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "historical ZIP capture needs_attention: missing frozen output decisions"
-                )
-            })?;
-            let old = plan
-                .outputs
-                .iter()
-                .find(|old| {
-                    old.kind == kind
-                        && old.output.bucket == output.bucket
-                        && old.output.key == output.key
-                        && old.output.version_id == output.version_id
-                        && old.output.cid == output.cid
-                })
-                .ok_or_else(|| {
+        let (planned, warning) =
+            if capture.selection_semantics() == CaptureSemantics::LegacyV1 || !eligible {
+                (Vec::new(), None)
+            } else if capture.selection_semantics() == CaptureSemantics::LegacyV2 {
+                let plan = capture.historical_plan.as_ref().ok_or_else(|| {
                     anyhow::anyhow!(
-                        "historical ZIP capture needs_attention: missing exact output evidence"
+                        "historical ZIP capture needs_attention: missing frozen output decisions"
                     )
                 })?;
-            (old.intents.clone(), old.warning)
-        } else {
-            let (policy, _, warning) = capture.policy.choose(&output.bucket, &output.key);
-            match policy.filter(|p| p.policy.trigger == PolicyTrigger::Always) {
-                Some(policy) if policy.available() => {
-                    (vec![policy.planned(LeaseSource::Automatic)], warning)
+                let old = plan
+                    .outputs
+                    .iter()
+                    .find(|old| {
+                        old.kind == kind
+                            && old.output.bucket == output.bucket
+                            && old.output.key == output.key
+                            && old.output.version_id == output.version_id
+                            && old.output.cid == output.cid
+                    })
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "historical ZIP capture needs_attention: missing exact output evidence"
+                        )
+                    })?;
+                (old.intents.clone(), old.warning)
+            } else {
+                let (policy, _, warning) = capture.policy.choose(&output.bucket, &output.key);
+                match policy.filter(|p| p.policy.trigger == PolicyTrigger::Always) {
+                    Some(policy) if policy.available() => {
+                        (vec![policy.planned(LeaseSource::Automatic)], warning)
+                    }
+                    Some(_) => (Vec::new(), Some(ZipPlanWarning::NoAvailableProvider)),
+                    None => (Vec::new(), warning),
                 }
-                Some(_) => (Vec::new(), Some(ZipPlanWarning::NoAvailableProvider)),
-                None => (Vec::new(), warning),
-            }
-        };
+            };
         if let Some(warning) = warning {
             result.warnings.push((output.clone(), warning));
-        }
-        if kind == ZipOutputKind::Source {
-            let decision = result
-                .source_decision
-                .as_mut()
-                .expect("exact source binding validated");
-            decision
-                .effective_intents
-                .extend(planned.iter().map(|planned| planned.intent.clone()));
-            decision.validate_snapshot().map_err(anyhow::Error::msg)?;
         }
         for planned in &planned {
             result.leases.push(ZipSelectedLease {
@@ -225,7 +217,6 @@ pub fn select_zip_intents(
                 legacy_unknown: false,
                 origin: capture.origin().clone(),
                 control_revision: capture.source_decision.control_revision.clone(),
-                config_revision: capture.policy_revision().into(),
                 control: PinControl::Absent,
                 effective_intents: planned.into_iter().map(|p| p.intent).collect(),
             };
@@ -283,9 +274,5 @@ pub(super) fn compatibility_plan(
             intents,
         });
     }
-    Ok(ZipOutputPinPlan {
-        rule_revision: rules.revision().into(),
-        targets,
-        outputs,
-    })
+    Ok(ZipOutputPinPlan { targets, outputs })
 }

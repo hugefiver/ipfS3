@@ -132,7 +132,7 @@ pub async fn upgrade_existing(
     use super::pinning::management::schema;
     if !matches!(
         request.source_version,
-        legacy::M13 | legacy::M17 | legacy::M23
+        legacy::M13 | legacy::M17 | legacy::M23 | super::migrations::baseline::VERSION
     ) || request.target_version != schema::VERSION
     {
         return Err(required());
@@ -184,15 +184,25 @@ async fn prepare_upgrade(
     let preparing = versions != known;
     let mut needs_backfill = false;
     if preparing {
-        let old_final = legacy::is_m23(&versions);
-        let source = legacy::prefix(request.source_version).ok_or_else(required)?;
-        if !old_final
-            && !versions
-                .iter()
-                .map(String::as_str)
-                .eq(source.iter().copied())
-        {
-            return Err(required());
+        let old_baseline = versions == [super::migrations::baseline::VERSION];
+        let old_final = legacy::is_m23(&versions) || old_baseline;
+        if old_baseline {
+            if !matches!(
+                request.source_version,
+                super::migrations::baseline::VERSION | legacy::M13 | legacy::M17
+            ) {
+                return Err(required());
+            }
+        } else {
+            let source = legacy::prefix(request.source_version).ok_or_else(required)?;
+            if !old_final
+                && !versions
+                    .iter()
+                    .map(String::as_str)
+                    .eq(source.iter().copied())
+            {
+                return Err(required());
+            }
         }
         let old_catalog = native::archived_catalog(&versions).map_err(|_| required())?;
         catalog::validate(tx, old_catalog)
@@ -233,7 +243,9 @@ async fn prepare_upgrade(
             schema::validate_m23_layout(tx, needs_backfill)
                 .await
                 .map_err(|_| required())?;
-            if request.source_version == legacy::M23 {
+            if request.source_version == legacy::M23
+                || request.source_version == super::migrations::baseline::VERSION
+            {
                 if needs_backfill {
                     return Err(required());
                 }
@@ -242,7 +254,11 @@ async fn prepare_upgrade(
                 history::upgrade_stamp(
                     tx,
                     &UpgradeRequest {
-                        target_version: legacy::M23,
+                        target_version: if old_baseline {
+                            super::migrations::baseline::VERSION
+                        } else {
+                            legacy::M23
+                        },
                         ..request
                     },
                     false,
@@ -262,17 +278,20 @@ async fn prepare_upgrade(
             .await?;
             needs_backfill = true;
         }
+        super::migrations::m20261108_000001_current_pinning_config::install(tx).await?;
         tx.execute_unprepared("DELETE FROM seaql_migrations")
             .await?;
-        tx.execute(Statement::from_sql_and_values(
-            tx.get_database_backend(),
-            "INSERT INTO seaql_migrations(version,applied_at) VALUES ($1,$2)",
-            [
-                schema::VERSION.into(),
-                chrono::Utc::now().timestamp().into(),
-            ],
-        ))
-        .await?;
+        for version in &known {
+            tx.execute(Statement::from_sql_and_values(
+                tx.get_database_backend(),
+                "INSERT INTO seaql_migrations(version,applied_at) VALUES ($1,$2)",
+                [
+                    version.clone().into(),
+                    chrono::Utc::now().timestamp().into(),
+                ],
+            ))
+            .await?;
+        }
     }
     history::upgrade_stamp(tx, &request, preparing)
         .await

@@ -237,7 +237,7 @@ mod tests {
                 .map(|version| (*version).to_owned())
                 .collect();
         let catalog = native::archived_catalog(&manifest.0).unwrap();
-        assert!(catalog == original.catalog());
+        assert!(catalog != original.catalog());
         let historical = ArchivedRows {
             owner: original.owner.clone(),
             manifest: Arc::new(manifest),

@@ -62,6 +62,19 @@ pub struct IpfsRpcProvider {
     source: Option<Transport>,
 }
 
+pub(crate) fn canonical_cid_request_id(
+    route: &ProviderRouteSnapshot,
+    expected_cid: &str,
+) -> Result<Option<String>, ProviderError> {
+    if route.resource_type() != RemoteResourceType::RpcPin
+        || route.strategy != RpcStrategy::Cid.as_str()
+        || !matches!(route.api_profile.as_str(), "rpc" | "kubo")
+    {
+        return Ok(None);
+    }
+    cid::request_id(RpcProfile::Kubo, expected_cid).map(Some)
+}
+
 impl IpfsRpcProvider {
     /// `endpoint` must be an administrator-trusted RPC base, not a tag or object
     /// value. Accepts origin/prefix or an already suffixed /api/v0 base. Private

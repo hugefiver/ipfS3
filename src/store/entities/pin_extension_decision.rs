@@ -7,7 +7,6 @@ pub struct Model {
     pub version_row_id: String,
     pub object_id: String,
     pub control_revision: String,
-    pub config_revision: String,
     pub effect: String,
     pub snapshot: String,
 }

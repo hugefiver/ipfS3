@@ -14,7 +14,7 @@ pub mod meter;
 pub mod scan;
 pub mod scope;
 pub use catalog_list::CatalogList;
-pub(crate) use history::{archived_catalog, current_catalog};
+pub(crate) use history::{archived_catalog, current_catalog, current_versions};
 
 pub const MAX_ROWS: usize = 4096;
 pub const MAX_BYTES: usize = 4 * 1024 * 1024;
@@ -491,7 +491,7 @@ pub fn registry() -> Vec<NativeTable> {
         ),
         raw(
             "zip_v2_mpu_intakes",
-            "original_upload_id,active_upload_id,execution_id,owner,token,bucket,archive_key,target_prefix,request_fingerprint,captured_options,captured_config,rule_revision,created_at",
+            "original_upload_id,active_upload_id,execution_id,owner,token,bucket,archive_key,target_prefix,request_fingerprint,captured_options,captured_config,created_at",
             "original_upload_id",
         ),
         raw(

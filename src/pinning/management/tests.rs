@@ -33,7 +33,6 @@ fn object() -> ObjectSnapshot {
         permitted: Some(true),
         allowed_routes: vec![route()],
         control_revision: Some("control-1".into()),
-        config_revision: Some("config-1".into()),
         decision: Some(DecisionState::None),
         evidence: SelectionEvidence::ExplicitObject,
     }
@@ -46,7 +45,7 @@ fn requirements() -> Requirements {
         levels: vec![ConfirmationLevel::ContentVerified],
         min_replicas: 1,
         max_age_secs: None,
-        policy_revision: "policy-1".into(),
+        policy_id: Some("policy-1".into()),
     }
 }
 
@@ -515,7 +514,6 @@ fn every_identity_fence_and_safety_change_stops_confirmation() {
         |s| s.objects[0].permitted = Some(false),
         |s| s.objects[0].allowed_routes.clear(),
         |s| s.objects[0].control_revision = Some("control-2".into()),
-        |s| s.objects[0].config_revision = Some("config-2".into()),
         |s| {
             s.targets[0].native_tuple.insert(
                 "last_touched_at".into(),

@@ -261,27 +261,51 @@ async fn r25_native_mpu_route_fence_preserves_first_capture_and_has_no_io() {
                 unavailable.credential_revision += 1;
                 ipfs_s3_gateway::store::pinning::ledger::register_route(h.state.store.db(), &provider.name, &unavailable)
                     .await.unwrap();
-                for _ in 0..2 {
+                let mut terminal_execution = None;
+                for attempt in 0..2 {
                     let denied = request::complete(&h, &id, &etag, HeaderMap::new()).await;
-                    assert_eq!(denied.status, StatusCode::BAD_REQUEST, "{denied:?}");
-                    assert!(denied.body.contains("<Code>InvalidArgument</Code>"), "{denied:?}");
+                    let expected_status = if v2 && attempt > 0 { StatusCode::CONFLICT } else { StatusCode::BAD_REQUEST };
+                    assert_eq!(denied.status, expected_status, "{denied:?}");
+                    if attempt == 0 {
+                        assert!(denied.body.contains("<Code>InvalidArgument</Code>"), "{denied:?}");
+                    }
                     assert_eq!(h.kubo.received_requests().await.unwrap().len(), io);
                     assert_eq!(Ledger::read(&h).await, ledger);
                     assert_eq!(ipfs_s3_gateway::store::multipart::get_upload(h.state.store.db(), &id).await.unwrap(), upload);
                     assert_eq!(ipfs_s3_gateway::store::multipart::list_parts(h.state.store.db(), &id).await.unwrap(), parts);
                     assert_eq!(zip::read(h.state.store.db(), &id).await.unwrap(), batch);
-                    assert_eq!(execution::read(h.state.store.db(), &id).await.unwrap(), before_execution);
+                    if v2 {
+                        let current_execution = execution::read(h.state.store.db(), &id).await.unwrap().unwrap();
+                        assert_eq!(current_execution.state, "fenced");
+                        assert_eq!(current_execution.captured_options, original_capture);
+                        assert!(current_execution.epoch > before_execution.as_ref().unwrap().epoch);
+                        if let Some(terminal) = &terminal_execution {
+                            assert_eq!(&current_execution, terminal);
+                        } else {
+                            terminal_execution = Some(current_execution);
+                        }
+                    } else {
+                        assert_eq!(execution::read(h.state.store.db(), &id).await.unwrap(), before_execution);
+                    }
                     let guards = h.state.store.db().query_one(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
                         "SELECT (SELECT COUNT(*) FROM standard_mutation_leases) AS guards, (SELECT COUNT(*) FROM import_destinations) AS admissions, (SELECT COUNT(*) FROM zip_v2_mpu_completions WHERE upload_id=?) AS completions",
                         vec![id.clone().into()],
                     )).await.unwrap().unwrap();
-                    for name in ["guards", "admissions", "completions"] {
+                    for name in ["guards", "admissions"] {
                         assert_eq!(guards.try_get::<i64>("", name).unwrap(), 0, "{name}");
                     }
+                    assert_eq!(guards.try_get::<i64>("", "completions").unwrap(), i64::from(v2));
                 }
                 ipfs_s3_gateway::store::pinning::ledger::register_route(h.state.store.db(), &provider.name, &provider.identity)
                     .await.unwrap();
                 let completed = request::complete(&h, &id, &etag, HeaderMap::new()).await;
+                if v2 {
+                    assert_eq!(completed.status, StatusCode::CONFLICT, "{completed:?}");
+                    assert_eq!(execution::read(h.state.store.db(), &id).await.unwrap(), terminal_execution);
+                    assert_eq!(h.kubo.received_requests().await.unwrap().len(), io);
+                    assert_eq!(Ledger::read(&h).await, ledger);
+                    return;
+                }
                 assert_eq!(completed.status, StatusCode::OK, "{completed:?}");
                 assert_eq!(zip::read(h.state.store.db(), &id).await.unwrap().unwrap().captured_options, original_capture);
                 let after = Ledger::read(&h).await;
@@ -329,7 +353,7 @@ async fn r25_server_with_frozen_store(
 }
 
 #[tokio::test]
-async fn r25_native_v2_mpu_empty_rule_capture_ignores_new_allow_and_deny() {
+async fn native_v2_mpu_uses_current_output_rules_and_duration_without_rewriting_capture() {
     use support::{
         sigv4::send_sigv4,
         stage9_zip_replay::{BUCKET, KEY},
@@ -374,18 +398,31 @@ async fn r25_native_v2_mpu_empty_rule_capture_ignores_new_allow_and_deny() {
                 let server = r25_server_with_frozen_store(&h.state, current, &zip_config).await;
                 let verified = AssertUnwindSafe(async {
                 let xml = format!("<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>").into_bytes();
+                let io_before = h.kubo.received_requests().await.unwrap().len();
                 let completed = request::Receipt::read(send_sigv4(reqwest::Method::POST, &server.endpoint, BUCKET, KEY,
                     &[("uploadId", &id)], xml.clone(), HeaderMap::new(), "test").await).await;
                 assert_eq!(completed.status, StatusCode::OK, "{completed:?}");
+                assert!(h.kubo.received_requests().await.unwrap().len() > io_before);
                 let final_execution = execution::read(h.state.store.db(), &id).await.unwrap().unwrap();
                 assert_eq!(final_execution.captured_options, original.captured_options);
                 assert_eq!(zip::read(h.state.store.db(), &id).await.unwrap().unwrap().captured_options, original.captured_options);
                 let after = Ledger::read(&h).await;
                 let remote = h.state.store.db().query_one(Statement::from_string(DatabaseBackend::Sqlite,
-                    "SELECT (SELECT COUNT(*) FROM pin_leases) AS leases, (SELECT COUNT(*) FROM pin_lease_targets) AS targets, (SELECT COUNT(*) FROM remote_pins) AS remotes, (SELECT COUNT(*) FROM pin_jobs) AS jobs, (SELECT COALESCE(SUM(reserved_bytes),0) FROM pin_provider_usage) AS bytes, (SELECT COALESCE(SUM(reserved_pins),0) FROM pin_provider_usage) AS pins".to_owned(),
+                    "SELECT (SELECT COUNT(*) FROM objects) AS objects, (SELECT COUNT(*) FROM pin_leases) AS leases, (SELECT COUNT(*) FROM pin_lease_targets) AS targets, (SELECT COUNT(*) FROM remote_pins) AS remotes, (SELECT COUNT(*) FROM pin_jobs) AS jobs, (SELECT COALESCE(SUM(reserved_bytes),0) FROM pin_provider_usage) AS bytes, (SELECT COALESCE(SUM(reserved_pins),0) FROM pin_provider_usage) AS pins".to_owned(),
                 )).await.unwrap().unwrap();
-                for field in ["leases", "targets", "remotes", "jobs", "bytes", "pins"] {
-                    assert_eq!(remote.try_get::<i64>("", field).unwrap(), 0, "{effect}: {field}");
+                assert_eq!(remote.try_get::<i64>("", "objects").unwrap(), 1);
+                let expected_pins = if effect == "allow" { 1 } else { 0 };
+                for field in ["leases", "targets", "remotes", "jobs", "pins"] {
+                    assert_eq!(remote.try_get::<i64>("", field).unwrap(), expected_pins, "{effect}: {field}");
+                }
+                if effect == "allow" {
+                    assert!(remote.try_get::<i64>("", "bytes").unwrap() > 0);
+                    let lease = h.state.store.db().query_one(Statement::from_string(DatabaseBackend::Sqlite,
+                        "SELECT strftime('%s',expires_at)-strftime('%s',created_at) AS duration FROM pin_leases".to_owned(),
+                    )).await.unwrap().unwrap();
+                    assert_eq!(lease.try_get::<i64>("", "duration").unwrap(), 7200);
+                } else {
+                    assert_eq!(remote.try_get::<i64>("", "bytes").unwrap(), 0);
                 }
                 assert_eq!(send_sigv4(reqwest::Method::GET, &server.endpoint, BUCKET, KEY,
                     &[], Vec::new(), HeaderMap::new(), "test").await.status(), StatusCode::NOT_FOUND);
@@ -696,7 +733,7 @@ async fn r25_p2_admitted_mpu_unmatched_provider_drift() {
         .unwrap();
     current.providers[1].identity.endpoint_revision += 1;
     current.providers[1].identity.credential_revision += 1;
-    let beta = current.providers[1].name.clone();
+    let beta = current.providers[1].identity.allocation_key();
     let io = h.kubo.received_requests().await.unwrap().len();
     let server = r25_server_with_frozen_store(&h.state, current, &zip_config).await;
     let checked = AssertUnwindSafe(async {
@@ -732,10 +769,10 @@ async fn r25_p2_admitted_mpu_unmatched_provider_drift() {
 }
 
 #[tokio::test]
-async fn r25_p2_admitted_mpu_exact_provider_drift_preserves_capture_and_blocks_builder() {
+async fn admitted_mpu_registered_identity_mismatch_is_terminal_without_dangerous_io() {
     use support::sigv4::send_sigv4;
-    for drift in ["endpoint", "registered", "disabled", "retired"] {
-        let (h, mut current, zip_config, id, xml) = r25_p2_interrupted_mpu().await;
+    for drift in ["registered", "retired"] {
+        let (h, current, zip_config, id, xml) = r25_p2_interrupted_mpu().await;
         let original = execution::read(h.state.store.db(), &id)
             .await
             .unwrap()
@@ -750,11 +787,6 @@ async fn r25_p2_admitted_mpu_exact_provider_drift_preserves_capture_and_blocks_b
         let parts = ipfs_s3_gateway::store::multipart::list_parts(h.state.store.db(), &id)
             .await
             .unwrap();
-        match drift {
-            "endpoint" => current.providers[0].identity.endpoint_revision += 1,
-            "disabled" => current.providers[0].limits.enabled = false,
-            _ => {}
-        }
         let server = r25_server_with_frozen_store(&h.state, current.clone(), &zip_config).await;
         let checked = AssertUnwindSafe(async {
             if drift == "registered" {
@@ -762,13 +794,13 @@ async fn r25_p2_admitted_mpu_exact_provider_drift_preserves_capture_and_blocks_b
                 route.credential_revision += 1;
                 let changed = h.state.store.db().execute(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
                     "UPDATE pin_provider_routes SET snapshot=? WHERE provider=?",
-                    vec![serde_json::to_string(&route).unwrap().into(), current.providers[0].name.clone().into()],
+                    vec![serde_json::to_string(&route).unwrap().into(), current.providers[0].identity.allocation_key().into()],
                 )).await.unwrap();
                 assert_eq!(changed.rows_affected(), 1);
             } else if drift == "retired" {
                 let changed = h.state.store.db().execute(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
                     "UPDATE pin_provider_routes SET retired=TRUE WHERE provider=?",
-                    [current.providers[0].name.clone().into()],
+                    [current.providers[0].identity.allocation_key().into()],
                 )).await.unwrap();
                 assert_eq!(changed.rows_affected(), 1);
             }
@@ -779,8 +811,7 @@ async fn r25_p2_admitted_mpu_exact_provider_drift_preserves_capture_and_blocks_b
             assert!(response.body.contains("<Code>InvalidArgument</Code>"), "{drift}: {response:?}");
             assert_eq!(h.kubo.received_requests().await.unwrap().len(), io, "{drift}: no builder/CAT/add/pin");
             let row = execution::read(h.state.store.db(), &id).await.unwrap().unwrap();
-            assert_eq!(row.state, "admitted");
-            // Claim/group scheduling metadata may advance, never capture/input/parts or publication.
+            assert_eq!(row.state, "fenced");
             assert!(row.epoch > original.epoch);
             assert_eq!(row.request_contract, original.request_contract);
             assert_eq!(row.request_fingerprint, original.request_fingerprint);
@@ -798,6 +829,11 @@ async fn r25_p2_admitted_mpu_exact_provider_drift_preserves_capture_and_blocks_b
                 "SELECT (SELECT COUNT(*) FROM objects) AS objects,(SELECT COUNT(*) FROM object_versions) AS versions,(SELECT COUNT(*) FROM pin_leases) AS leases,(SELECT COUNT(*) FROM pin_lease_targets) AS targets,(SELECT COUNT(*) FROM remote_pins) AS remotes,(SELECT COUNT(*) FROM pin_jobs) AS jobs".to_owned(),
             )).await.unwrap().unwrap();
             for name in ["objects", "versions", "leases", "targets", "remotes", "jobs"] { assert_eq!(counts.try_get::<i64>("", name).unwrap(), 0, "{drift}/{name}"); }
+            let repeated = request::Receipt::read(send_sigv4(reqwest::Method::POST, &server.endpoint, &h.bucket, "archive.zip",
+                &[("uploadId", &id)], xml, HeaderMap::new(), "test").await).await;
+            assert!(!repeated.status.is_success(), "{repeated:?}");
+            assert_eq!(execution::read(h.state.store.db(), &id).await.unwrap().unwrap(), row);
+            assert_eq!(h.kubo.received_requests().await.unwrap().len(), io);
         }).catch_unwind().await;
         server.shutdown().await;
         checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));

@@ -397,17 +397,6 @@ pub(super) async fn complete(
     let contract =
         store::multipart::v2_zip::complete_request_contract(parts).map_err(store_error)?;
     let db = state.store.db();
-    if admitted.state == "pending"
-        && let Some(intent) = &intent
-    {
-        store::pinning::publication::preflight_captured_zip_routes(
-            &state.store,
-            intent,
-            state.pinning.effective_config(),
-            None,
-        )
-        .await?;
-    }
     match store::multipart::v2_zip::capture_complete(
         db,
         &intake,
@@ -428,9 +417,6 @@ pub(super) async fn complete(
             "ZIP capture needs_attention: missing original multipart intent"
         )
     })?;
-    if admitted.state != "admitted" && super::v2::current_io_denied(state, &intent, None) {
-        return Err(conflict());
-    }
     let claim = execution::claim(db, id, &uuid::Uuid::new_v4().to_string(), LEASE_SECONDS)
         .await
         .map_err(store_error)?
@@ -442,6 +428,22 @@ pub(super) async fn complete(
         .ok_or_else(conflict)?;
     if snapshot.epoch != claim.epoch || snapshot.worker.as_deref() != Some(&claim.worker) {
         return Err(conflict());
+    }
+    let durable = intent
+        .resolve_current_with_rules(
+            state.pinning.effective_config(),
+            state.pinning.zip_output_rules(),
+            state.pinning.control_mode(),
+        )
+        .and_then(|resolved| resolved.validate_durable_current(state.pinning.effective_config()));
+    if let Err(error) = durable {
+        execution::fence(db, &claim).await.map_err(store_error)?;
+        return Err(store_error(AppError::InvalidPinningRequest(
+            error.to_string(),
+        )));
+    }
+    if snapshot.state != "admitted" {
+        super::v2::preflight_current(state, &intent, &claim, None).await?;
     }
     let (manifest, source_guard) = if snapshot.state == "admitted" {
         retained_manifest(state, &intake, &claim).await?
@@ -524,17 +526,7 @@ pub(super) async fn complete(
     {
         return Err(conflict());
     }
-    store::pinning::publication::preflight_captured_zip_routes(
-        &state.store,
-        &intent,
-        state.pinning.effective_config(),
-        Some(&manifest),
-    )
-    .await?;
-    if snapshot.state == "admitted" && super::v2::current_io_denied(state, &intent, Some(&manifest))
-    {
-        return Err(conflict());
-    }
+    super::v2::preflight_current(state, &intent, &claim, Some(&manifest)).await?;
     let root_outcome =
         super::v2::build_zip_root(state, id, &manifest, options.build_root(), &lease.cancelled)
             .await?;
@@ -618,8 +610,17 @@ pub(super) async fn complete(
     if lease.cancelled.is_cancelled() {
         return Err(conflict());
     }
-    let publication = publish_captured_zip(&state.store, request).await;
-    if matches!(publication, Err(AppError::StaleContentMutation)) {
+    let publication = publish_captured_zip(
+        &state.store,
+        request,
+        state.pinning.effective_config(),
+        state.pinning.zip_output_rules(),
+        state.pinning.control_mode(),
+    )
+    .await;
+    if matches!(publication, Err(AppError::InvalidPinningRequest(_))) {
+        execution::fence(db, &claim).await.map_err(store_error)?;
+    } else if matches!(publication, Err(AppError::StaleContentMutation)) {
         let fenced = if options.publish_source {
             execution::fence(db, &claim).await
         } else {

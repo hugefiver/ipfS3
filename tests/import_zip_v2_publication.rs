@@ -45,7 +45,8 @@ async fn setup() -> (tempfile::TempDir, DatabaseConnection, DatabaseConnection) 
 async fn prepared(db: &DatabaseConnection, outputs: bool) -> (execution::Claim, ZipV2Publication) {
     let contract = "{\"contract\":\"import\"}";
     let capture = native::capture();
-    let options = serde_json::json!({"options":capture.v2_options().unwrap(),"zip_intent":capture,"rule_revision":null}).to_string();
+    let options = serde_json::json!({"options":capture.v2_options().unwrap(),"zip_intent":capture})
+        .to_string();
     let admission = execution::Admission {
         id: "import-execution".into(),
         owner: "principal".into(),
@@ -157,7 +158,7 @@ async fn prepared(db: &DatabaseConnection, outputs: bool) -> (execution::Claim, 
     };
     let publication = ZipV2Publication {
         claim: claim.clone(), source: None, source_policy: None, source_guard: None,
-        successes, targets: ZipTargets::None, captured_rule_revision: None,
+        successes, targets: ZipTargets::None,
         root_outcome: if outputs { zip::RootOutcome::Failed { code: "root_build_failed" } } else { zip::RootOutcome::Empty },
         terminal_result: serde_json::json!({"input_sha256":verified.sha256,"published_count":if outputs {1} else {0},"failed_count":0,"status":if outputs {"completed"} else {"failed"}}).to_string(),
     };

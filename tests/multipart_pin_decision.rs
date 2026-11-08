@@ -280,6 +280,13 @@ async fn signed_multipart_warn_capture_replays_after_provider_appears_and_abort_
     assert_eq!(decision.effect, DecisionEffect::Skipped);
     assert_eq!(decision.origin.principal_id, "test");
     assert_eq!(decision.origin.request_id, id);
+    let mut historical_row = row.clone();
+    historical_row.pin_decision_json.as_mut().unwrap()["config_revision"] =
+        serde_json::json!("a".repeat(64));
+    assert_eq!(
+        store::multipart::decision_from_upload(&historical_row).unwrap(),
+        Some(decision.clone())
+    );
     assert!(
         !row.pin_decision_json
             .unwrap()
@@ -579,7 +586,7 @@ async fn warn_never_drops_automatic_policy_when_provider_is_unavailable() {
 }
 
 #[tokio::test]
-async fn accepted_multipart_rejects_changed_provider_revision_without_reinterpreting_tags() {
+async fn accepted_multipart_uses_current_duration_after_unrelated_config_changes() {
     let kubo = kubo().await;
     let first = state(&kubo, OptionalPinControlMode::Warn).await;
     let admitting = Arc::new(AppState {
@@ -616,21 +623,36 @@ async fn accepted_multipart_rejects_changed_provider_revision_without_reinterpre
     part(&endpoint, "captured", &id).await;
     server.abort();
 
-    let (endpoint, server) = serve(first.clone()).await;
-    let rejected = complete(&endpoint, "captured", &id).await;
-    assert_eq!(rejected.status(), reqwest::StatusCode::BAD_REQUEST);
-    assert!(
-        rejected
-            .text()
-            .await
-            .unwrap()
-            .contains("captured pinning configuration revision is unavailable")
-    );
+    let mut current = available_policy("request");
+    current.providers[0].priority = 9;
+    current.providers[0].max_bytes = 20_000;
+    current.providers[0].max_pins = 200;
+    current.policies[0].default_duration = "2h".into();
+    let restarted = Arc::new(AppState {
+        kubo: first.kubo.clone(),
+        cold_kubo: None,
+        store: first.store.clone(),
+        credentials: first.credentials.clone(),
+        master_key: MasterKey::from_hex(&"0".repeat(64)).unwrap(),
+        pinning: pinning(current, OptionalPinControlMode::Strict),
+    });
+    let (endpoint, server) = serve(restarted.clone()).await;
+    let completed = complete(&endpoint, "captured", &id).await;
+    assert_eq!(completed.status(), reqwest::StatusCode::OK);
+    assert!(completed.headers()["etag"].to_str().unwrap().contains(CID));
     assert!(
         store::multipart::get_upload(first.store.db(), &id)
             .await
-            .is_ok()
+            .is_err()
     );
-    no_remote_work(&first).await;
+    let leases = pin_lease::Entity::find()
+        .all(first.store.db())
+        .await
+        .unwrap();
+    assert_eq!(leases.len(), 1);
+    assert_eq!(
+        (leases[0].expires_at - leases[0].created_at).num_seconds(),
+        7200
+    );
     server.abort();
 }

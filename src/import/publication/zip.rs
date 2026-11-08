@@ -149,7 +149,7 @@ pub(crate) async fn publish_zip_import(
             standard_guard: None, upload_target: None, import_guard: Some(guard), result_rows, replay: None,
         })), root_outcome,
         terminal_result: serde_json::json!({"batch_id": job.id, "archive_cid": artifact.cid, "root_enabled": root_enabled}).to_string(),
-    }).await.map_err(|error| map_publication_error(error, cancellation))?;
+    }, state.pinning.effective_config(), state.pinning.zip_output_rules(), state.pinning.control_mode()).await.map_err(|error| map_publication_error(error, cancellation))?;
     published
         .into_iter()
         .find(|(key, _)| key == &job.key)

@@ -83,7 +83,6 @@ pub(super) fn intake_with_source(
             ),
             options: capture.v2_options().unwrap(),
             captured_config: "{}".into(),
-            rule_revision: "original-revision".into(),
             content_type: None,
             metadata: None,
             tags: vec![],
@@ -138,8 +137,8 @@ async fn seed_historical_bare(db: &DatabaseConnection, request: &Intake) {
         .await
         .unwrap();
     tx.execute(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
-        "INSERT INTO zip_v2_mpu_intakes (original_upload_id,active_upload_id,execution_id,owner,token,bucket,archive_key,target_prefix,request_fingerprint,captured_options,captured_config,rule_revision,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        vec![request.upload_id.clone().into(),request.upload_id.clone().into(),request.upload_id.clone().into(),request.owner.clone().into(),request.token.clone().into(),request.bucket.clone().into(),request.key.clone().into(),request.target_prefix.clone().into(),fingerprint.into(),options.into(),request.captured_config.clone().into(),request.rule_revision.clone().into(),now.into()]
+        "INSERT INTO zip_v2_mpu_intakes (original_upload_id,active_upload_id,execution_id,owner,token,bucket,archive_key,target_prefix,request_fingerprint,captured_options,captured_config,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        vec![request.upload_id.clone().into(),request.upload_id.clone().into(),request.upload_id.clone().into(),request.owner.clone().into(),request.token.clone().into(),request.bucket.clone().into(),request.key.clone().into(),request.target_prefix.clone().into(),fingerprint.into(),options.into(),request.captured_config.clone().into(),now.into()]
     )).await.unwrap();
     tx.commit().await.unwrap();
 }
@@ -262,6 +261,15 @@ async fn r25_v2_mpu_envelope_and_historical_bare_preserve_empty_receipt_not_null
                 .unwrap();
             tx.commit().await.unwrap();
         } else {
+            let current = config();
+            let rules = ipfs_s3_gateway::pinning::zip_policy::ValidatedZipOutputRules::from_config(
+                &DecompressZipConfig {
+                    auto_pin_outputs: Some(false),
+                    ..Default::default()
+                },
+                &current,
+            )
+            .unwrap();
             publication::publish_captured_zip(
                 &db,
                 CapturedZipPublication {
@@ -279,6 +287,9 @@ async fn r25_v2_mpu_envelope_and_historical_bare_preserve_empty_receipt_not_null
                     root_outcome: RootOutcome::Disabled,
                     terminal_result: terminal,
                 },
+                &current,
+                &rules,
+                OptionalPinControlMode::Warn,
             )
             .await
             .unwrap();
@@ -400,14 +411,12 @@ async fn r25_v2_mpu_create_capture_is_atomic_and_token_replay_keeps_first_intent
         serde_json::to_value(&first.options).unwrap()
     );
     assert_eq!(envelope["target_prefix"], "out/");
-    assert_eq!(envelope["rule_revision"], first.rule_revision);
     assert_eq!(
         envelope["zip_intent"],
         serde_json::to_value(&capture).unwrap()
     );
     let (mut later, later_capture) = intake("mpu-later", false, true);
     later.captured_config = "{\"changed\":true}".into();
-    later.rule_revision = "later-revision".into();
     assert_eq!(
         v2_zip::create_or_replay_with_zip_intent(&db, &later, &later_capture)
             .await

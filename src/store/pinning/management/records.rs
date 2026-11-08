@@ -23,6 +23,7 @@ mod inspection;
 mod inventory_review;
 pub mod locator;
 mod results;
+pub(crate) use results::original::verify as verify_original_facts;
 mod retirement;
 pub(crate) mod roots;
 mod row;

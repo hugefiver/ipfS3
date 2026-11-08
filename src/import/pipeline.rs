@@ -197,11 +197,12 @@ async fn execute_job_inner(
     }
     // Fail closed before even contacting a source when a historical raw pin tag
     // has no admission snapshot or an accepted snapshot cannot be safely replayed.
-    let (_, decision) = resolved_policy(state, job, cancellation)?;
+    let (policy, decision) = resolved_policy(state, job, cancellation)?;
     if let Some(decision) = &decision {
         crate::store::pinning::publication::preflight_decided_routes(
             state.store.db(),
             decided_publish(state, decision),
+            &policy,
         )
         .await
         .map_err(|error| map_publication_error(error, cancellation))?;
@@ -1357,7 +1358,7 @@ mod tests {
                 .unwrap();
             let id = format!("route-import-{zip}");
             let tags = vec![ObjectTag::new("ipfs-s3:pin", "true")];
-            let (_, mut decision) = state
+            let (_, decision) = state
                 .pinning
                 .policy()
                 .evaluate_publication_decision(
@@ -1371,12 +1372,6 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(decision.effect, DecisionEffect::Accepted);
-            decision
-                .capture_durable_revision(
-                    state.pinning.effective_config(),
-                    state.pinning.control_mode(),
-                )
-                .unwrap();
             let now = Utc::now();
             ownership::submit_decided(
                 state.store.db(),

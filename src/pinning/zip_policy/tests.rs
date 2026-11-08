@@ -199,7 +199,6 @@ fn equal_priority_uses_name_not_input_order_and_prefix_is_literal() {
     assert_eq!(plan.outputs[0].intents.len(), 1);
     candidates.reverse();
     let reordered = ValidatedZipOutputRules::compile(&candidates, &config).unwrap();
-    assert_eq!(engine.revision(), reordered.revision());
     assert_eq!(
         plan,
         reordered
@@ -455,11 +454,22 @@ fn real_remote_route_needs_explicit_identity_and_captures_safe_revision() {
     let rotated =
         ValidatedPinningConfig::from_config(&explicit_raw, |_| Some("private-token".into()))
             .unwrap();
-    assert_ne!(
-        engine.revision(),
-        ValidatedZipOutputRules::compile(&[allow], &rotated)
-            .unwrap()
-            .revision()
+    let rotated_plan = ValidatedZipOutputRules::compile(&[allow], &rotated)
+        .unwrap()
+        .plan(
+            ZipTargets {
+                source: true,
+                extracted: false,
+            },
+            Some(output("exports/archive.zip", "v1", "cid")),
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        rotated_plan.outputs[0].intents[0].providers[0]
+            .route
+            .endpoint_revision,
+        4
     );
 }
 
@@ -546,6 +556,97 @@ fn v2_rules_do_not_change_legacy_first_match_or_inherit_archive_manual_control()
         .unwrap();
     assert!(plan.outputs[0].intents.is_empty());
     assert_eq!(plan.outputs[0].output.key, "exports/item");
+    for reference in [
+        "@index:1",
+        "policy:1:61f2bdb126be32dd2420746af2c3e6634c28c4d90ab42a86ba4f4b03c7975690",
+    ] {
+        let indexed = ValidatedZipOutputRules::compile(
+            &[rule(
+                "shadowed",
+                "exports/",
+                ZipRuleEffect::Allow,
+                Some(reference.into()),
+            )],
+            &config,
+        )
+        .unwrap();
+        let plan = indexed
+            .plan(
+                ZipTargets {
+                    source: false,
+                    extracted: true,
+                },
+                None,
+                &[output("exports/item", "v1", "cid")],
+            )
+            .unwrap();
+        assert!(plan.outputs[0].intents.is_empty());
+    }
+}
+
+#[test]
+fn historical_policy_alias_resolves_edited_current_policy_without_digest_lock() {
+    let old_id = "policy:0:61f2bdb126be32dd2420746af2c3e6634c28c4d90ab42a86ba4f4b03c7975690";
+    let reference: ZipOutputRuleConfig = toml::from_str(&format!(
+        "name='legacy'\npriority=0\nbucket='photos'\nprefix='exports/'\neffect='allow'\npolicy_id='{old_id}'"
+    )).unwrap();
+    let mut config = fixture();
+    config.policies[0].default_duration =
+        crate::pinning::config::LeaseDuration::parse("30m").unwrap();
+    config.providers[0].name = "current".into();
+    config.providers[0].identity =
+        crate::pinning::identity::ProviderIdentity::legacy("current", "noop", None, "noop", "cid");
+    config.policies[0].providers = vec!["current".into()];
+    config.provider_limits.clear();
+    config
+        .provider_limits
+        .insert("current".into(), config.providers[0].limits.clone());
+    let zip = crate::config::DecompressZipConfig {
+        auto_pin_outputs: Some(true),
+        pin_output_rules: vec![reference.clone()],
+        ..Default::default()
+    };
+    validate_zip_config(&zip, &config).unwrap();
+    let plan = ValidatedZipOutputRules::from_config(&zip, &config)
+        .unwrap()
+        .plan(
+            ZipTargets {
+                source: false,
+                extracted: true,
+            },
+            None,
+            &[output("exports/item", "v1", "cid")],
+        )
+        .unwrap();
+    let selected = &plan.outputs[0].intents[0];
+    assert_eq!(selected.intent.policy_id, config.policies[0].identity);
+    assert_eq!(
+        selected.intent.duration,
+        config.policies[0].default_duration
+    );
+    assert_eq!(selected.intent.providers, config.policies[0].providers);
+    assert_eq!(selected.providers[0].config_name, "current");
+    let mut outside = reference.clone();
+    outside.prefix = "elsewhere/".into();
+    assert!(ValidatedZipOutputRules::compile(&[outside], &config).is_err());
+    let mut other_bucket = reference.clone();
+    other_bucket.bucket = "elsewhere".into();
+    assert!(ValidatedZipOutputRules::compile(&[other_bucket], &config).is_err());
+    let digest = old_id.rsplit(':').next().unwrap();
+    for malformed in [
+        format!("policy:99:{digest}"),
+        format!("policy:-1:{digest}"),
+        format!("policy:+0:{digest}"),
+        format!("policy::{digest}"),
+        format!("policy:0:{}", &digest[..63]),
+        format!("policy:0:{digest}0"),
+        format!("policy:0:{}", digest.to_uppercase()),
+        format!("policy:0:{digest}:extra"),
+    ] {
+        let mut invalid = reference.clone();
+        invalid.policy_id = Some(malformed);
+        assert!(ValidatedZipOutputRules::compile(&[invalid], &config).is_err());
+    }
 }
 
 #[test]

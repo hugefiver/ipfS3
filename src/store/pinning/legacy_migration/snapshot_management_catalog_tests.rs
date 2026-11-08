@@ -788,7 +788,15 @@ async fn registered_management_requires_exact_columns_keys_constraints_and_no_sh
 #[test]
 fn prefix_specific_fence_order_keeps_retirement_between_usage_and_routes_and_records_in_tail() {
     for endpoint in ENDPOINTS.into_iter().chain([management_schema::VERSION]) {
-        let versions = vec![endpoint.into()];
+        let versions = if endpoint == management_schema::VERSION {
+            crate::store::pinning::management::native::current_versions()
+        } else {
+            crate::store::migrations::history::prefix(endpoint)
+                .unwrap()
+                .iter()
+                .map(|version| (*version).to_owned())
+                .collect()
+        };
         let order = super::super::super::fence::lock_order(&versions);
         let names = order
             .iter()
@@ -807,8 +815,24 @@ fn prefix_specific_fence_order_keeps_retirement_between_usage_and_routes_and_rec
             first.push(management_schema::RETIREMENTS);
         }
         first.push("pin_provider_routes");
-        assert_eq!(&names[..first.len()], first);
-        assert_eq!(order[4].1, "created_at,id");
+        for pair in first.windows(2) {
+            let earlier = names.iter().position(|name| *name == pair[0]).unwrap();
+            let later = names.iter().position(|name| *name == pair[1]).unwrap();
+            assert!(
+                earlier < later,
+                "{} must be locked before {}",
+                pair[0],
+                pair[1]
+            );
+        }
+        assert_eq!(
+            order
+                .iter()
+                .find(|(table, _)| table == "pin_lease_targets")
+                .unwrap()
+                .1,
+            "created_at,id"
+        );
         assert_eq!(
             names.contains(&management_schema::RECORDS),
             endpoint == management_schema::VERSION
@@ -854,7 +878,13 @@ async fn admission_schema_returns_exact_prefixes_and_does_not_cache_historical_a
                 .iter()
                 .copied())
     );
-    assert_eq!(current, [management_schema::VERSION]);
+    assert_eq!(
+        current,
+        [
+            crate::store::migrations::baseline::VERSION,
+            management_schema::VERSION
+        ]
+    );
     assert_eq!(
         current.last().map(String::as_str),
         Some(management_schema::VERSION)

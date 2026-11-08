@@ -89,7 +89,7 @@ pub(crate) async fn upgrade_with_historical_raw_tags(db: &DatabaseConnection) {
             database_scope: &scope,
             native_identity: &identity,
             source_version: m::history::M23,
-            target_version: m::baseline::VERSION,
+            target_version: crate::store::pinning::management::schema::VERSION,
         },
     )
     .await

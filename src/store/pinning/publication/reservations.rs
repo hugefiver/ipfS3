@@ -47,6 +47,7 @@ pub(super) trait Reservations: Send {
         limits: &ProviderLimitMap,
         now: DateTime<Utc>,
         work: super::super::management::records::DecodeWork<'_>,
+        original_route: Option<&ProviderRouteSnapshot>,
     ) -> AppResult<quota::ReservationOutcome>;
 }
 
@@ -69,6 +70,7 @@ impl<C: ConnectionTrait> Reservations for Borrowed<'_, C> {
         limits: &ProviderLimitMap,
         now: DateTime<Utc>,
         work: super::super::management::records::DecodeWork<'_>,
+        original_route: Option<&ProviderRouteSnapshot>,
     ) -> AppResult<quota::ReservationOutcome> {
         quota::reserve_unique_with_work(
             self.0,
@@ -78,6 +80,7 @@ impl<C: ConnectionTrait> Reservations for Borrowed<'_, C> {
             limits,
             now,
             work,
+            original_route,
         )
         .await
     }
@@ -99,6 +102,7 @@ impl<C: ConnectionTrait> Reservations for BorrowedWithWork<'_, C> {
         limits: &ProviderLimitMap,
         now: DateTime<Utc>,
         work: super::super::management::records::DecodeWork<'_>,
+        original_route: Option<&ProviderRouteSnapshot>,
     ) -> AppResult<quota::ReservationOutcome> {
         quota::reserve_unique_with_work(
             self.db,
@@ -108,6 +112,7 @@ impl<C: ConnectionTrait> Reservations for BorrowedWithWork<'_, C> {
             limits,
             now,
             work,
+            original_route,
         )
         .await
     }
@@ -161,6 +166,7 @@ impl Reservations for PublicationTransaction {
         limits: &ProviderLimitMap,
         now: DateTime<Utc>,
         work: super::super::management::records::DecodeWork<'_>,
+        original_route: Option<&ProviderRouteSnapshot>,
     ) -> AppResult<quota::ReservationOutcome> {
         if let Self::Runtime(tx, session) = self {
             return quota::reserve_runtime_publication(
@@ -171,6 +177,7 @@ impl Reservations for PublicationTransaction {
                 limits,
                 now,
                 DecodeWork::shared(session),
+                original_route,
             )
             .await;
         }
@@ -182,6 +189,7 @@ impl Reservations for PublicationTransaction {
             limits,
             now,
             work,
+            original_route,
         )
         .await
     }

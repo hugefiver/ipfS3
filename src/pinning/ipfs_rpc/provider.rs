@@ -1,7 +1,11 @@
 use super::{IpfsRpcProvider, Pins, RpcProfile, cid, error};
-use crate::pinning::provider::{
-    FindPin, PinningProvider, ProviderError, ProviderErrorClass, QueryObservation, RemotePin,
-    SubmitObservation, SubmitPin,
+use crate::pinning::{
+    identity::{Ownership, RemoteResourceType},
+    provider::{
+        FindPin, ObservedResource, ObservedResourceStatus, PinObservation, PinningProvider,
+        ProviderError, ProviderErrorClass, QueryObservation, RemotePin, SubmitObservation,
+        SubmitPin,
+    },
 };
 
 #[async_trait::async_trait]
@@ -33,6 +37,25 @@ impl PinningProvider for IpfsRpcProvider {
                     "RPC pin is authoritatively absent",
                 )
             })
+    }
+
+    async fn get_observed(&self, request_id: &str) -> PinObservation {
+        let result = self.get(request_id).await;
+        let resources = result
+            .as_ref()
+            .ok()
+            .map(|remote| {
+                vec![ObservedResource {
+                    resource_type: RemoteResourceType::RpcPin,
+                    cid: remote.cid.clone(),
+                    request_id: remote.request_id.clone(),
+                    status: ObservedResourceStatus::RecursiveVerified,
+                    ownership: Ownership::Unknown,
+                    replica_evidence: None,
+                }]
+            })
+            .unwrap_or_default();
+        PinObservation { result, resources }
     }
 
     async fn find(&self, query: FindPin) -> Result<Vec<RemotePin>, ProviderError> {
@@ -87,6 +110,16 @@ impl PinningProvider for IpfsRpcProvider {
     ) -> Result<RemotePin, ProviderError> {
         self.historical_route(api, strategy)?;
         self.get(id).await
+    }
+
+    async fn get_observed_historical(&self, id: &str, api: &str, strategy: &str) -> PinObservation {
+        match self.historical_route(api, strategy) {
+            Ok(()) => self.get_observed(id).await,
+            Err(error) => PinObservation {
+                result: Err(error),
+                resources: Vec::new(),
+            },
+        }
     }
 
     async fn unpin_historical(

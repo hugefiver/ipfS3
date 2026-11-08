@@ -377,7 +377,6 @@ impl Policy {
                 result_version: 2,
             }
         );
-        assert_eq!(capture.policy_revision(), self.rules.revision());
         execution::Admission {
             id: id.into(),
             owner: "principal".into(),
@@ -390,7 +389,6 @@ impl Policy {
             captured_options: serde_json::json!({
                 "options": options,
                 "target_prefix": capture.target_prefix(),
-                "rule_revision": capture.policy_revision(),
                 "zip_intent": capture,
             })
             .to_string(),
@@ -447,7 +445,6 @@ impl Policy {
             source_guard: None,
             successes,
             targets: ZipTargets::Extracted,
-            captured_rule_revision: Some(self.rules.revision().into()),
             root_outcome: zip::RootOutcome::Disabled,
             terminal_result: serde_json::json!({"result_version":2,"entries":outputs.len()})
                 .to_string(),

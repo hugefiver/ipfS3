@@ -94,6 +94,10 @@ pub(crate) async fn fixture_with_database(
     )
     .unwrap();
     raw.kubo.rpc_url = server.uri();
+    raw.decompress_zip.auto_pin_outputs = Some(false);
+    if automatic {
+        raw.pinning.policies[0].trigger = "always".into();
+    }
     let config = local_config::compile(&raw, |_| None)
         .unwrap()
         .with_source_node(CID.into())
@@ -196,7 +200,7 @@ pub(crate) async fn fixture_with_database(
                     levels: vec![ConfirmationLevel::RemotePinned],
                     min_replicas: 1,
                     max_age_secs: None,
-                    policy_revision: config.pinning.policies[0].identity.clone(),
+                    policy_id: Some(config.pinning.policies[0].identity.clone()),
                 },
             }),
             subject: Subject::Object {

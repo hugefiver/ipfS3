@@ -49,7 +49,6 @@ impl ObjectWriteSet {
                 .checked_add(bound.version_id.len())
                 .and_then(|n| n.checked_add(bound.object_id.len()))
                 .and_then(|n| n.checked_add(decision.control_revision.len()))
-                .and_then(|n| n.checked_add(decision.config_revision.len()))
                 .and_then(|n| n.checked_add(256))
                 .ok_or(AppError::ManagementBudget)?;
             self.resident.push(sql::retain_copy(work, bytes)?);
@@ -57,7 +56,6 @@ impl ObjectWriteSet {
                 version_row_id: bound.version_id.clone(),
                 object_id: bound.object_id.clone(),
                 control_revision: decision.control_revision.clone(),
-                config_revision: decision.config_revision.clone(),
                 effect: match decision.effect {
                     crate::pinning::decision::DecisionEffect::Accepted => "accepted",
                     crate::pinning::decision::DecisionEffect::Skipped => "skipped",

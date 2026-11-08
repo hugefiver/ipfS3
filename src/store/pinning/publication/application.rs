@@ -31,6 +31,7 @@ pub(crate) async fn publish_decided_standard_object(
     captured: DecidedPublish<'_>,
 ) -> AppResult<PublicationResult> {
     captured.validate(&request)?;
+    let snapshot = captured.snapshot(&request.policy)?;
     require_decision_origin(captured.decision, &guard.mutation_id)?;
     run_publication_with_retries_and_hot_receipt(
         PublicationDatabase::Store(store),
@@ -44,7 +45,7 @@ pub(crate) async fn publish_decided_standard_object(
         None,
         None,
         captured.limits,
-        Some(captured.snapshot()?),
+        Some(snapshot),
     )
     .await
 }
@@ -57,6 +58,7 @@ pub(crate) async fn publish_decided_standard_object_with_hot_receipt(
     captured: DecidedPublish<'_>,
 ) -> AppResult<PublicationResult> {
     captured.validate(&request)?;
+    let snapshot = captured.snapshot(&request.policy)?;
     require_decision_origin(captured.decision, &guard.mutation_id)?;
     let receipt = match HotPublicationReceipt::validate(receipt, &request.object.cid) {
         Ok(receipt) => receipt,
@@ -77,7 +79,7 @@ pub(crate) async fn publish_decided_standard_object_with_hot_receipt(
         None,
         Some(receipt),
         captured.limits,
-        Some(captured.snapshot()?),
+        Some(snapshot),
     )
     .await
 }
@@ -92,7 +94,7 @@ pub(crate) async fn publish_decided_completed_upload(
     let snapshot = captured
         .validate(&request)
         .and_then(|()| require_decision_origin(captured.decision, &upload_target.upload_id))
-        .and_then(|()| captured.snapshot())
+        .and_then(|()| captured.snapshot(&request.policy))
         .map_err(|source| CommitCompletedUploadError::RolledBack {
             completion_attempt_id: request.object.id.clone(),
             source,
@@ -138,13 +140,14 @@ pub(crate) async fn publish_decided_completed_zip(
     request: ZipPublicationRequest,
     guard: Option<StandardMutationGuard>,
     captured: DecidedPublish<'_>,
+    rules: &crate::pinning::zip_policy::ValidatedZipOutputRules,
 ) -> Result<PublicationResult, CommitCompletedUploadError> {
     let snapshot = captured
         .decision
-        .validate_policy(&request.archive.policy)
+        .validate_snapshot()
         .map_err(invalid_publication)
         .and_then(|()| require_decision_origin(captured.decision, &upload_target.upload_id))
-        .and_then(|()| zip_decided_snapshot(captured.decision))
+        .and_then(|()| zip_decided_snapshot(&captured, rules))
         .map_err(|source| CommitCompletedUploadError::RolledBack {
             completion_attempt_id: request.archive.object.id.clone(),
             source,
@@ -193,6 +196,7 @@ pub(crate) async fn publish_decided_import_object(
     captured: DecidedPublish<'_>,
 ) -> AppResult<PublicationResult> {
     captured.validate(&request)?;
+    let snapshot = captured.snapshot(&request.policy)?;
     require_decision_origin(captured.decision, &guard.job_id)?;
     run_publication_with_retries_and_hot_receipt(
         PublicationDatabase::Store(store),
@@ -206,7 +210,7 @@ pub(crate) async fn publish_decided_import_object(
         Some(now),
         None,
         captured.limits,
-        Some(captured.snapshot()?),
+        Some(snapshot),
     )
     .await
 }

@@ -10,10 +10,16 @@ macro_rules! migrations {
     }
 }
 pub(crate) fn native() -> Vec<Box<dyn MigrationTrait>> {
-    vec![Box::new(m20261027_000001_schema_baseline::Migration)]
+    vec![
+        Box::new(m20261027_000001_schema_baseline::Migration),
+        Box::new(m20261108_000001_current_pinning_config::Migration),
+    ]
 }
 pub(super) fn shared() -> Vec<Box<dyn bridge::SharedMigration>> {
-    vec![Box::new(m20261027_000001_schema_baseline::Migration)]
+    vec![
+        Box::new(m20261027_000001_schema_baseline::Migration),
+        Box::new(m20261108_000001_current_pinning_config::Migration),
+    ]
 }
 migrations!(
     m20250701_000001_init,
