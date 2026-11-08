@@ -47,6 +47,9 @@ jobs:
       - name: Run live PostgreSQL import tests
         run: cargo test --test postgres_import -- --nocapture --test-threads=1
 
+      - name: Run live PostgreSQL current pinning migration tests
+        run: cargo test --test postgres_current_pinning -- --include-ignored --nocapture --test-threads=1
+
   postgres-production-deployment:
     runs-on: ubuntu-latest
     timeout-minutes: 60

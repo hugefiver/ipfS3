@@ -6,7 +6,7 @@ use sea_orm_migration::MigratorTrait;
 pub const VERSION: &str =
     crate::store::migrations::m20261108_000001_current_pinning_config::VERSION;
 mod installation;
-pub(crate) use installation::expressions::{canonical as canonical_expression, table_shape};
+pub(crate) use installation::expressions::table_shape;
 pub mod storage;
 pub const RECORDS: &str = "pin_management_records";
 pub const RETIREMENTS: &str = "pin_management_retirements";

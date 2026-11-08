@@ -179,6 +179,61 @@ async fn sqlite<C: ConnectionTrait>(db: &C) -> Result<(), DbErr> {
     Ok(())
 }
 
+fn original_state_constraint_matches(definition: &str, states: &str) -> Result<bool, DbErr> {
+    let old_states = states
+        .strip_suffix(",'error'")
+        .ok_or_else(|| DbErr::Migration("invalid compiled state constraint".into()))?;
+    let array = old_states
+        .split(',')
+        .map(|state| format!("{state}::text"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let expected = pg_constraint_tokens(&format!("CHECK ((state = ANY (ARRAY[{array}])))"))?;
+    Ok(pg_constraint_tokens(definition)? == expected)
+}
+
+// Only pg_get_constraintdef output is compared here; SQLite bracket quoting is unrelated.
+fn pg_constraint_tokens(sql: &str) -> Result<Vec<String>, DbErr> {
+    let mut chars = sql.chars().peekable();
+    let mut tokens = Vec::new();
+    while let Some(c) = chars.next() {
+        if c.is_whitespace() {
+            continue;
+        }
+        let mut token = c.to_string();
+        if matches!(c, '\'' | '"') {
+            let escape_string = c == '\'' && tokens.last().is_some_and(|t| t == "e");
+            loop {
+                let next = chars
+                    .next()
+                    .ok_or_else(|| DbErr::Migration("invalid installed state constraint".into()))?;
+                token.push(next);
+                if next == '\\' && escape_string {
+                    token.push(chars.next().ok_or_else(|| {
+                        DbErr::Migration("invalid installed state constraint".into())
+                    })?);
+                } else if next == c {
+                    if chars.peek() == Some(&c) {
+                        token.push(chars.next().unwrap());
+                    } else {
+                        break;
+                    }
+                }
+            }
+        } else if c.is_ascii_alphanumeric() || c == '_' {
+            while chars
+                .peek()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_')
+            {
+                token.push(chars.next().unwrap());
+            }
+            token.make_ascii_lowercase();
+        }
+        tokens.push(token);
+    }
+    Ok(tokens)
+}
+
 async fn postgres<C: ConnectionTrait>(db: &C) -> Result<(), DbErr> {
     db.execute_unprepared("ALTER TABLE pin_extension_decisions DROP CONSTRAINT ck_pin_extension_decisions_revision, DROP COLUMN config_revision; ALTER TABLE zip_v2_mpu_intakes DROP CONSTRAINT ck_zip_v2_mpu_identity, DROP COLUMN rule_revision; ALTER TABLE pin_lease_targets ADD COLUMN last_error TEXT").await?;
     let intake = definition("zip_v2_mpu_intakes", true);
@@ -200,21 +255,12 @@ async fn postgres<C: ConnectionTrait>(db: &C) -> Result<(), DbErr> {
             "'waiting','submitted','pinned','degraded','quota_waiting','quota_blocked','evicted','released','error'",
         ),
     ] {
-        let old_states = states.strip_suffix(",'error'").expect("new terminal state");
-        let array = old_states
-            .split(',')
-            .map(|state| format!("{state}::text"))
-            .collect::<Vec<_>>()
-            .join(",");
-        let canonical = crate::store::pinning::management::schema::canonical_expression;
-        let expected = canonical(&format!("CHECK ((state = ANY (ARRAY[{array}])))"))
-            .map_err(|_| DbErr::Migration("invalid compiled state constraint".into()))?;
         let constraints = db.query_all(Statement::from_sql_and_values(DatabaseBackend::Postgres,
             "SELECT c.conname,pg_get_constraintdef(c.oid,false) AS definition FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid JOIN pg_namespace n ON n.oid=t.relnamespace JOIN pg_attribute a ON a.attrelid=t.oid AND a.attname='state' WHERE n.nspname=current_schema() AND t.relname=$1 AND c.contype='c' AND c.convalidated AND NOT c.condeferrable AND a.attnum=ANY(c.conkey)", [table.into()])).await?;
         let mut matches = Vec::new();
         for row in constraints {
             let definition: String = row.try_get("", "definition")?;
-            if canonical(&definition).ok().as_ref() == Some(&expected) {
+            if original_state_constraint_matches(&definition, states)? {
                 matches.push(row.try_get::<String>("", "conname")?);
             }
         }
@@ -234,4 +280,74 @@ async fn postgres<C: ConnectionTrait>(db: &C) -> Result<(), DbErr> {
         .await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::original_state_constraint_matches;
+
+    const PIN_JOB_STATES: &str = "'pending','running','done','error'";
+    const PIN_TARGET_STATES: &str = "'waiting','submitted','pinned','degraded','quota_waiting','quota_blocked','evicted','released','error'";
+
+    #[test]
+    fn pg_state_constraints_match_with_array_element_spacing() {
+        let spaced =
+            "CHECK ((state = ANY (ARRAY['pending'::text, 'running'::text, 'done'::text])))";
+        let compact = "CHECK ((state = ANY (ARRAY['pending'::text,'running'::text,'done'::text])))";
+        assert!(original_state_constraint_matches(spaced, PIN_JOB_STATES).unwrap());
+        assert!(original_state_constraint_matches(compact, PIN_JOB_STATES).unwrap());
+        let targets = "CHECK ((state = ANY (ARRAY['waiting'::text, 'submitted'::text, 'pinned'::text, 'degraded'::text, 'quota_waiting'::text, 'quota_blocked'::text, 'evicted'::text, 'released'::text])))";
+        assert!(original_state_constraint_matches(targets, PIN_TARGET_STATES).unwrap());
+        for (definition, states) in [(spaced, PIN_JOB_STATES), (targets, PIN_TARGET_STATES)] {
+            let formatted = definition
+                .replace("ARRAY[", "ARRAY [\n\t")
+                .replace(", ", ",\n\t ")
+                .replace("::text", " :: TEXT ");
+            assert!(original_state_constraint_matches(&formatted, states).unwrap());
+        }
+    }
+
+    #[test]
+    fn pg_state_constraints_preserve_literal_and_identifier_tokens() {
+        let original =
+            "CHECK ((state = ANY (ARRAY['pending'::text, 'running'::text, 'done'::text])))";
+        for changed in [
+            original.replace("pending", "pend ing"),
+            original.replace("pending", "Pending"),
+            original.replace("pending", "pend\t ing"),
+            original.replace("pending", "pend''ing"),
+            original.replace("'pending'", r"E'pend\'ing'"),
+            original.replace("'pending'", r"'pend\ing'"),
+            original.replace("state", "\"sta\"\"te\""),
+            original.replace("state", "sta te"),
+            original.replace("state", "\"STATE\""),
+            original.replace("state", "\"sta te\""),
+            original.replace("done", "unknown"),
+            original.replace("'done'::text", "'done'::text, 'done'::text"),
+            original.replace("state = ANY", "state <> ANY"),
+            original.replace(")))", ")) AND attempts > 0)"),
+            original.replace(")))", ")) OR true)"),
+        ] {
+            assert!(
+                !original_state_constraint_matches(&changed, PIN_JOB_STATES).unwrap(),
+                "{changed}"
+            );
+        }
+        let targets = "CHECK ((state = ANY (ARRAY['waiting'::text, 'submitted'::text, 'pinned'::text, 'degraded'::text, 'quota_waiting'::text, 'quota_blocked'::text, 'evicted'::text, 'released'::text])))";
+        assert!(
+            !original_state_constraint_matches(
+                &targets.replace("quota_waiting", "quota_ waiting"),
+                PIN_TARGET_STATES
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn pg_state_constraints_reject_already_upgraded_or_partial_lists() {
+        let with_error = "CHECK ((state = ANY (ARRAY['pending'::text, 'running'::text, 'done'::text, 'error'::text])))";
+        assert!(!original_state_constraint_matches(with_error, PIN_JOB_STATES).unwrap());
+        let missing = "CHECK ((state = ANY (ARRAY['pending'::text, 'running'::text])))";
+        assert!(!original_state_constraint_matches(missing, PIN_JOB_STATES).unwrap());
+    }
 }
