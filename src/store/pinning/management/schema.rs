@@ -3,8 +3,7 @@ use super::{ManagementError, Result};
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 use sea_orm_migration::MigratorTrait;
 
-pub const VERSION: &str =
-    crate::store::migrations::m20261108_000001_current_pinning_config::VERSION;
+pub const VERSION: &str = crate::store::migrations::m20261109_000001_pin_cid_comparisons::VERSION;
 mod installation;
 pub(crate) use installation::expressions::table_shape;
 pub mod storage;
@@ -124,7 +123,7 @@ pub(crate) async fn validate_m23_layout<C: ConnectionTrait>(db: &C, backfill: bo
     if db.get_database_backend() == DatabaseBackend::Postgres {
         postgres::validate(db).await?;
     }
-    let mut tables = installation_catalog().to_vec();
+    let mut tables = previous_installation_catalog().to_vec();
     let historical =
         super::native::archived_catalog(&[crate::store::migrations::baseline::VERSION.into()])?;
     for table in &mut tables {
@@ -139,6 +138,16 @@ pub(crate) async fn validate_m23_layout<C: ConnectionTrait>(db: &C, backfill: bo
     installation::validate(db).await
 }
 
+pub(crate) async fn validate_previous_current<C: ConnectionTrait>(db: &C) -> Result<()> {
+    reject_sqlite_shadows(db).await?;
+    storage::validate_schema(db, false).await?;
+    if db.get_database_backend() == DatabaseBackend::Postgres {
+        postgres::validate(db).await?;
+    }
+    super::catalog::validate(db, previous_installation_catalog()).await?;
+    installation::validate(db).await
+}
+
 /// Cold installation qualification includes tables outside the management
 /// evidence projection. They must not become archive members or revision inputs.
 pub(crate) async fn validate_installation_catalog<C: ConnectionTrait>(db: &C) -> Result<()> {
@@ -146,7 +155,7 @@ pub(crate) async fn validate_installation_catalog<C: ConnectionTrait>(db: &C) ->
     installation::validate(db).await
 }
 
-fn installation_catalog() -> &'static [super::native::NativeTable] {
+fn previous_installation_catalog() -> &'static [super::native::NativeTable] {
     use super::native::{entity, raw};
     use crate::store::entities::*;
     static CATALOG: std::sync::LazyLock<Vec<super::native::NativeTable>> = std::sync::LazyLock::new(
@@ -162,6 +171,17 @@ fn installation_catalog() -> &'static [super::native::NativeTable] {
             tables
         },
     );
+    &CATALOG
+}
+
+fn installation_catalog() -> &'static [super::native::NativeTable] {
+    use super::native::entity;
+    static CATALOG: std::sync::LazyLock<Vec<super::native::NativeTable>> =
+        std::sync::LazyLock::new(|| {
+            let mut tables = previous_installation_catalog().to_vec();
+            tables.push(entity::<crate::store::pinning::cid_comparison::Entity>());
+            tables
+        });
     &CATALOG
 }
 

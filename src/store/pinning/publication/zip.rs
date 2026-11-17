@@ -94,7 +94,7 @@ pub(super) async fn publish_captured_zip_with_limits(
     let selection = std::sync::Arc::new(selection.clone());
     let current_limits = current_limits.cloned().map(std::sync::Arc::new);
     let request = std::sync::Arc::new(request);
-    let session = work::session(&request, &selection)?;
+    let session = work::session();
     for retry in 0..=super::MAX_TRANSACTION_RETRIES {
         work::begin_attempt(&session)?;
         let request = request.clone();
@@ -144,7 +144,7 @@ pub(crate) async fn publish_captured_zip_store(
         .resolve_current_with_rules(config, rules, mode)
         .map_err(|error| AppError::InvalidPinningRequest(error.to_string()))?;
     let current_limits = &config.provider_limits;
-    let session = work::session(&request, &selection)?;
+    let session = work::session();
     for retry in 0..=super::MAX_TRANSACTION_RETRIES {
         work::begin_attempt(&session)?;
         let tx = store
@@ -195,7 +195,6 @@ fn objects(request: &CapturedZipPublication) -> Vec<&PublicationObject> {
 }
 
 fn validate(request: &CapturedZipPublication) -> AppResult<()> {
-    serialize_zip_capture(&request.capture)?;
     if request.batch_id.is_empty()
         || request.source.is_some() != request.capture.controls().publish_source
         || request.terminal_result.is_empty()
@@ -350,7 +349,7 @@ async fn publish_with_reservations<
         .await?;
     let session = match reservations.runtime_work() {
         Some(session) => session.clone(),
-        None => work::session(request, selection)?,
+        None => work::session(),
     };
     let work = super::super::management::records::DecodeWork::shared(&session);
     work.with(|session| session.check())
@@ -395,28 +394,16 @@ async fn publish_with_reservations<
         execution::verify_manifest(tx, request, snapshot).await?;
     }
     let manifest_before = capture::verify_manifest(tx, request).await?;
-    let manifest_bytes = manifest_before.iter().try_fold(0usize, |total, row| {
-        total
-            .checked_add(row.batch_id.len())
-            .and_then(|n| n.checked_add(row.path.len()))
-            .and_then(|n| n.checked_add(row.object_key.as_ref().map_or(0, String::len)))
-            .and_then(|n| n.checked_add(row.cid.as_ref().map_or(0, String::len)))
-            .and_then(|n| n.checked_add(row.error_code.as_ref().map_or(0, String::len)))
-            .and_then(|n| n.checked_add(256))
-            .ok_or(AppError::ManagementBudget)
-    })?;
-    let _manifest_resident = sql::retain_copy(work, manifest_bytes)?;
 
-    // This candidate selection is lock budgeting only. Real immutable row IDs
-    // replace all placeholders before any decision/lease is written.
-    let candidate_inputs_resident = sql::retain_copy(work, work::candidate_bytes(request)?)?;
+    // Real immutable row IDs replace all placeholders before any decision/lease is written.
+
     let source_candidate = request.source.as_ref().map(candidate_binding);
     let candidates = request
         .successes
         .iter()
         .map(candidate_binding)
         .collect::<Vec<_>>();
-    let (candidate, _candidate_resident) = work::select(
+    let candidate = work::select(
         selection,
         &request.manifest,
         source_candidate.as_ref(),
@@ -425,7 +412,6 @@ async fn publish_with_reservations<
     )?;
     drop(source_candidate);
     drop(candidates);
-    drop(candidate_inputs_resident);
     let allocation_keys = keys::AllocationKeys::load(
         tx,
         selection,
@@ -449,13 +435,8 @@ async fn publish_with_reservations<
         Some(&mut maintenance),
     )
     .await?;
-    let shape_bytes = work
-        .with(|session| allocation::selection_shape_bytes(&candidate, session))
-        .map_err(super::super::management::admission::work_error)?;
-    let candidate_shape_resident = sql::retain_copy(work, shape_bytes)?;
     let candidate_shape = allocation::selection_shape(&candidate);
     drop(candidate);
-    drop(_candidate_resident);
     maintenance.checkpoint(reservations.db()).await?;
     let tx = reservations.db();
     allocation_keys
@@ -482,7 +463,7 @@ async fn publish_with_reservations<
         .lock_tail(tx, work, Some(&mut maintenance))
         .await?;
     let mut object_writes = locked_objects.plan(request, state, now, work)?;
-    let (selected, _selected_resident) = work::select(
+    let selected = work::select(
         selection,
         &request.manifest,
         object_writes.source.as_ref(),
@@ -493,9 +474,7 @@ async fn publish_with_reservations<
     object_writes.decisions(request, &selected, work)?;
     let pin_writes = pin_snapshot.plan(&selected, &allocation_keys, &owners, request, now, work)?;
     drop(selected);
-    drop(_selected_resident);
     drop(candidate_shape);
-    drop(candidate_shape_resident);
     let results = &object_writes.results;
     let bindings = &object_writes.bindings;
     object_writes
@@ -536,13 +515,6 @@ async fn publish_with_reservations<
         }
     }
     maintenance.checkpoint(tx).await?;
-    let settlement_bytes = match &request.authority {
-        ZipPublicationAuthority::Legacy(authority) => authority.result_rows.len().checked_mul(2048),
-        ZipPublicationAuthority::Execution { .. } => Some(0),
-    }
-    .and_then(|bytes| bytes.checked_add(terminal.len()))
-    .ok_or(AppError::ManagementBudget)?;
-    let _settlement_resident = sql::retain_copy(work, settlement_bytes)?;
     match &request.authority {
         ZipPublicationAuthority::Legacy(authority) => {
             legacy::settle(tx, request, authority, results, now).await?

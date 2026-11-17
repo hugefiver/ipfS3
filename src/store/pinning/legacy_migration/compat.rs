@@ -70,7 +70,7 @@ async fn identity_binding_catalog<W: Work>(
 ) -> Result<Option<LegacyBinding>, W::Error> {
     let db = &catalog;
     let versions = catalog.classify().await.map_err(W::application)?;
-    if versions.last().map(String::as_str) == Some(management::schema::VERSION) {
+    if crate::store::migrations::history::has_current_pinning_layout(&versions) {
         let session = management::records::SharedDecodeBudget::default();
         let context = work.decode().unwrap_or(DecodeWork::shared(&session));
         let candidates = catalog
@@ -128,7 +128,7 @@ pub(crate) async fn resource_receipt_candidates_with_work<C: ConnectionTrait>(
     let versions = super::admission_schema::receipt_schema(db)
         .await
         .map_err(<DecodeWork<'_> as Work>::application)?;
-    if versions.last().map(String::as_str) != Some(management::schema::VERSION) {
+    if !crate::store::migrations::history::has_current_pinning_layout(&versions) {
         return Ok(None);
     }
     management::admission::authority::load(db, &resource_receipt_selectors(provider, cid), work)
@@ -194,6 +194,32 @@ pub(in crate::store::pinning) async fn resource_binding_from_catalog(
         return Ok(None);
     }
     Ok(Some(binding))
+}
+
+pub(in crate::store::pinning) async fn resource_binding_from_loaded(
+    binding: Option<LegacyBinding>,
+    provider: &str,
+    cid: &str,
+    work: DecodeWork<'_>,
+    catalog: ReceiptCatalog<'_>,
+) -> management::Result<(Option<LegacyBinding>, String)> {
+    let operational = binding.as_ref().map_or_else(
+        || provider.to_owned(),
+        |binding| binding.operational_key.clone(),
+    );
+    let visible = if let Some(binding) = binding {
+        if super::resource_lifetime::fresh_with_work(&catalog, &binding, cid, &work)
+            .await?
+            .is_none()
+        {
+            Some(binding)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    Ok((visible, operational))
 }
 
 pub async fn resource_key<C: ConnectionTrait>(

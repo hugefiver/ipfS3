@@ -137,12 +137,19 @@ async fn select(
 ) -> Result<Vec<TrustedAppliedAction>> {
     let db = &catalog;
     let context = DecodeWork::shared(&work);
-    let remaining = native::MAX_ROWS
-        .checked_sub(candidate_rows)
-        .ok_or(ManagementError::Budget)?;
-    let remaining_bytes = native::MAX_BYTES
-        .checked_sub(candidate_bytes)
-        .ok_or(ManagementError::Budget)?;
+    let publication = context.with(|session| Ok(session.is_publication()))?;
+    let (remaining, remaining_bytes) = if publication {
+        (0, 0)
+    } else {
+        (
+            native::MAX_ROWS
+                .checked_sub(candidate_rows)
+                .ok_or(ManagementError::Budget)?,
+            native::MAX_BYTES
+                .checked_sub(candidate_bytes)
+                .ok_or(ManagementError::Budget)?,
+        )
+    };
     let (rows,locator_bytes)=bounded_projection(db,&format!("FROM pin_management_records WHERE kind='action' AND state='applied' AND completed_at IS NOT NULL AND ({predicate})"),&[("database_scope","database_scope"),("plan_id","plan_id"),("item_id","item_id"),("kind","kind")],"plan_id,item_id",values,(remaining,remaining_bytes),context).await?;
     if rows.is_empty() {
         return Ok(vec![]);
@@ -157,7 +164,18 @@ async fn select(
         &[("database_scope", "database_scope")],
         "database_scope",
         vec![],
-        (remaining - rows.len(), remaining_bytes - locator_bytes),
+        if publication {
+            (0, 0)
+        } else {
+            (
+                remaining
+                    .checked_sub(rows.len())
+                    .ok_or(ManagementError::Budget)?,
+                remaining_bytes
+                    .checked_sub(locator_bytes)
+                    .ok_or(ManagementError::Budget)?,
+            )
+        },
         context,
     )
     .await?;
@@ -237,6 +255,35 @@ pub(crate) async fn bounded_projection<C: ConnectionTrait>(
     work: DecodeWork<'_>,
 ) -> Result<(Vec<QueryResult>, usize)> {
     let backend = db.get_database_backend();
+    if work.with(|session| Ok(session.is_publication()))? {
+        let fields = columns
+            .iter()
+            .map(|(column, alias)| format!("CAST({column} AS TEXT) AS \"{alias}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let rows = db
+            .query_all(Statement::from_sql_and_values(
+                backend,
+                format!("SELECT {fields} {source} ORDER BY {order}"),
+                values,
+            ))
+            .await
+            .map_err(|_| ManagementError::Database)?;
+        let actual = rows.iter().try_fold(0usize, |sum, row| {
+            let row_bytes = columns.iter().try_fold(0usize, |sum, (_, alias)| {
+                sum.checked_add(
+                    row.try_get::<Option<String>>("", alias)
+                        .map_err(|_| ManagementError::InvalidEvidence)?
+                        .as_ref()
+                        .map_or(0, String::len),
+                )
+                .ok_or(ManagementError::Budget)
+            })?;
+            work.index_cells(columns.len(), row_bytes)?;
+            sum.checked_add(row_bytes).ok_or(ManagementError::Budget)
+        })?;
+        return Ok((rows, actual));
+    }
     let terms = columns
         .iter()
         .map(|(column, _)| {

@@ -13,12 +13,14 @@ pub(crate) fn native() -> Vec<Box<dyn MigrationTrait>> {
     vec![
         Box::new(m20261027_000001_schema_baseline::Migration),
         Box::new(m20261108_000001_current_pinning_config::Migration),
+        Box::new(m20261109_000001_pin_cid_comparisons::Migration),
     ]
 }
 pub(super) fn shared() -> Vec<Box<dyn bridge::SharedMigration>> {
     vec![
         Box::new(m20261027_000001_schema_baseline::Migration),
         Box::new(m20261108_000001_current_pinning_config::Migration),
+        Box::new(m20261109_000001_pin_cid_comparisons::Migration),
     ]
 }
 migrations!(

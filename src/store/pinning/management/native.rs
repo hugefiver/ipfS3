@@ -55,6 +55,8 @@ pub struct NativeFrame {
     scoped: Option<scope::ScopeEvidence>,
     #[serde(skip)]
     _resident: Vec<std::sync::Arc<meter::ResidentGuard>>,
+    #[serde(skip)]
+    publication: bool,
 }
 
 impl PartialEq for NativeFrame {
@@ -107,7 +109,7 @@ impl NativeFrame {
             count = count
                 .checked_add(table.rows.len())
                 .ok_or(ManagementError::Budget)?;
-            if count > MAX_ROWS {
+            if !self.publication && count > MAX_ROWS {
                 return Err(ManagementError::Budget);
             }
             for row in &table.rows {
@@ -137,7 +139,7 @@ impl NativeFrame {
                         bytes = bytes
                             .checked_add(value.len())
                             .ok_or(ManagementError::Budget)?;
-                        if bytes > MAX_BYTES {
+                        if !self.publication && bytes > MAX_BYTES {
                             return Err(ManagementError::Budget);
                         }
                     }
@@ -630,6 +632,7 @@ pub(crate) async fn capture_with_work<C: ConnectionTrait>(
 ) -> Result<NativeFrame> {
     let versions = super::schema::validate(db).await?;
     let backend = db.get_database_backend();
+    let publication = work.with(|work| Ok(work.is_publication()))?;
     work.with(|work| work.nodes(1 + current_catalog().len()))?;
     for table in current_catalog() {
         work.copy(&table.table)?;
@@ -659,6 +662,9 @@ pub(crate) async fn capture_with_work<C: ConnectionTrait>(
             .map_err(|_| ManagementError::Schema)?;
         if columns.as_slice() != table.columns.as_slice() {
             return Err(ManagementError::Schema);
+        }
+        if publication {
+            continue;
         }
         let terms: Vec<_> = table
             .columns
@@ -777,13 +783,17 @@ pub(crate) async fn capture_with_work<C: ConnectionTrait>(
             .map(|c| format!("\"{c}\""))
             .collect::<Vec<_>>()
             .join(",");
+        let limit = if publication {
+            String::new()
+        } else {
+            format!(" LIMIT {}", MAX_ROWS + 1)
+        };
         let rows = db
             .query_all(Statement::from_string(
                 backend,
                 format!(
-                    "SELECT {fields} FROM \"{}\" ORDER BY {order} LIMIT {}",
-                    table.table,
-                    MAX_ROWS + 1
+                    "SELECT {fields} FROM \"{}\" ORDER BY {order}{limit}",
+                    table.table
                 ),
             ))
             .await
@@ -859,6 +869,7 @@ pub(crate) async fn capture_with_work<C: ConnectionTrait>(
         private,
         scoped: None,
         _resident: Vec::new(),
+        publication,
     })
 }
 

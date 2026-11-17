@@ -32,7 +32,7 @@ pub(super) async fn classify_row(
         let classification = check.check().and_then(|()| {
             #[cfg(test)]
             tests::at(&blocking_hook, tests::Phase::Classifying);
-            classify::classify_source(&key, &row)
+            classify::classify_source(&key, &row, check.is_publication())
         });
         #[cfg(test)]
         tests::at(&blocking_hook, tests::Phase::Classified);

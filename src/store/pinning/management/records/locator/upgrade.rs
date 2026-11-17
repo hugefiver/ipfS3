@@ -13,7 +13,7 @@ pub(super) async fn classify_for_write(
             let encoding = legacy::encoding(tx, key, budget).await?;
             if encoding == Some(true) {
                 let review = legacy::read(tx, key, budget).await?;
-                return action(key, row, &review);
+                return action(key, row, &review, budget.is_publication());
             }
             if encoding.is_none() {
                 let (scope, identity) = native::scope::binding(tx).await?;
@@ -69,7 +69,7 @@ pub(super) async fn classify_for_write(
             }
         }
     }
-    let mut result = classify::classify_source(key, row)?;
+    let mut result = classify::classify_source(key, row, budget.is_publication())?;
     narrow::bind_retirement_domain(tx, key, row, &mut result, budget).await?;
     Ok(result)
 }
@@ -78,6 +78,7 @@ fn action(
     key: &NativeKey,
     row: &NativeRow,
     review: &legacy::Review,
+    publication: bool,
 ) -> Result<SourceClassification> {
     let mut result = SourceClassification::default();
     let members = AuthoritySelector::RecordMembers(
@@ -86,7 +87,13 @@ fn action(
     );
     result.selectors.insert(members.clone());
     result.membership_lookups.insert(members);
-    classify::classify_archive(key, row, &mut result, Some(review))?;
+    classify::classify_archive(
+        key,
+        row,
+        &mut result,
+        Some(review),
+        &mut decode_budget(publication),
+    )?;
     if let Some(recorded) = review.recorded_result(key)? {
         entry(&mut result, &recorded.receipt.binding)?;
         result.item_position = review

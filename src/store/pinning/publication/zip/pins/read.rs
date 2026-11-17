@@ -64,10 +64,12 @@ async fn lock_ids<C: ConnectionTrait>(
     Ok(())
 }
 
-pub(super) async fn by_pairs<E: EntityTrait + Default, C: ConnectionTrait>(
+async fn by_pairs_column<E: EntityTrait + Default, C: ConnectionTrait>(
     db: &C,
     pairs: &BTreeSet<Pair>,
+    cid_column: &str,
     extra: &str,
+    order: &str,
     work: DecodeWork<'_>,
     resident: &mut Vec<ResidentGuard>,
     mut maintenance: Option<&mut super::super::PublicationLease<'_>>,
@@ -85,11 +87,11 @@ pub(super) async fn by_pairs<E: EntityTrait + Default, C: ConnectionTrait>(
                 sql::read::<E, _>(
                     db,
                     &format!(
-                        "provider=$1 AND cid IN ({}) {extra}",
+                        "provider=$1 AND {cid_column} IN ({}) {extra}",
                         sql::slots(chunk.len(), 1)
                     ),
                     values,
-                    "provider,cid",
+                    order,
                     work,
                     resident,
                     maintenance.as_deref_mut(),
@@ -99,6 +101,27 @@ pub(super) async fn by_pairs<E: EntityTrait + Default, C: ConnectionTrait>(
         }
     }
     Ok(rows)
+}
+
+pub(super) async fn by_pairs<E: EntityTrait + Default, C: ConnectionTrait>(
+    db: &C,
+    pairs: &BTreeSet<Pair>,
+    extra: &str,
+    work: DecodeWork<'_>,
+    resident: &mut Vec<ResidentGuard>,
+    maintenance: Option<&mut super::super::PublicationLease<'_>>,
+) -> AppResult<Vec<E::Model>> {
+    by_pairs_column::<E, _>(
+        db,
+        pairs,
+        "cid",
+        extra,
+        "provider,cid",
+        work,
+        resident,
+        maintenance,
+    )
+    .await
 }
 
 async fn lock_pairs<C: ConnectionTrait>(
@@ -152,65 +175,92 @@ pub(super) async fn new_allocation_safe<C: ConnectionTrait>(
 impl PinEvidence {
     pub(super) async fn load<R: publication::reservations::Reservations>(
         reservations: &R,
-        providers: &BTreeSet<String>,
         pairs: &BTreeSet<Pair>,
+        job_ids: &BTreeSet<String>,
         work: DecodeWork<'_>,
         resident: &mut Vec<ResidentGuard>,
         mut maintenance: Option<&mut super::super::PublicationLease<'_>>,
     ) -> AppResult<Self> {
         let db = reservations.db();
         let catalog = reservations.catalog(work);
-        let mut scope = providers.clone();
-        let mut replica_pairs = pairs.clone();
-        for provider in providers {
-            scope.extend(
-                legacy_migration::admission_historical_keys_with_catalog(provider, &work, catalog)
-                    .await
-                    .map_err(work_error)?,
-            );
-            scope.extend(
-                legacy_migration::historical_keys_with_catalog(
-                    "pin_jobs", provider, None, work, catalog,
+        let mut scope = pairs
+            .iter()
+            .map(|(provider, _)| provider.clone())
+            .collect::<BTreeSet<_>>();
+        let mut evidence_pairs = pairs.clone();
+        let resources = pairs
+            .iter()
+            .flat_map(|(provider, cid)| {
+                [
+                    "pin_submit_observations",
+                    "pin_resource_history",
+                    "pin_replica_observations",
+                ]
+                .map(|table| (table.to_owned(), provider.clone(), cid.clone()))
+            })
+            .collect::<Vec<_>>();
+        if !resources.is_empty() {
+            use crate::store::pinning::management::records::locator::AuthoritySelector;
+            let selectors = resources
+                .iter()
+                .map(|(table, provider, cid)| {
+                    AuthoritySelector::LegacyResource(
+                        table.clone(),
+                        provider.clone(),
+                        Some(cid.clone()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let candidates = catalog.load(&selectors, work).await.map_err(work_error)?;
+            let (aliases_by_resource, _) =
+                legacy_migration::historical_resource_keys_from_loaded_catalog(
+                    &resources,
+                    &candidates,
+                    &work,
+                    work,
+                    catalog,
                 )
                 .await
-                .map_err(work_error)?,
-            );
-            let mut aliases = legacy_migration::historical_keys_with_catalog(
-                "pin_replica_observations",
-                provider,
-                None,
-                work,
-                catalog,
-            )
-            .await
-            .map_err(work_error)?;
-            aliases.push(provider.clone());
-            for alias in aliases {
-                replica_pairs.extend(
-                    pairs
-                        .iter()
-                        .filter(|(p, _)| p == provider)
-                        .map(|(_, cid)| (alias.clone(), cid.clone())),
-                );
+                .map_err(work_error)?;
+            for ((_, _, cid), aliases) in aliases_by_resource {
+                for alias in aliases {
+                    scope.insert(alias.clone());
+                    evidence_pairs.insert((alias, cid.clone()));
+                }
             }
         }
-        let keys = scope.iter().cloned().collect::<Vec<_>>();
-        let submissions = by_ids::<pin_submit_observation::Entity, _>(
+        let mut submissions = BTreeMap::new();
+        for row in by_pairs_column::<pin_submit_observation::Entity, _>(
             db,
-            "provider",
-            &keys,
+            &evidence_pairs,
+            "expected_cid",
+            "",
+            "id",
             work,
             resident,
             maintenance.as_deref_mut(),
         )
         .await?
-        .into_iter()
-        .map(|row| (row.id.clone(), row))
-        .collect();
-        let releases = by_ids::<pin_resource_history::Entity, _>(
+        {
+            submissions.insert(row.id.clone(), row);
+        }
+        let ids = job_ids.iter().cloned().collect::<Vec<_>>();
+        for row in by_ids::<pin_submit_observation::Entity, _>(
             db,
-            "provider",
-            &keys,
+            "job_id",
+            &ids,
+            work,
+            resident,
+            maintenance.as_deref_mut(),
+        )
+        .await?
+        {
+            submissions.insert(row.id.clone(), row);
+        }
+        let releases = by_pairs::<pin_resource_history::Entity, _>(
+            db,
+            &evidence_pairs,
+            "",
             work,
             resident,
             maintenance.as_deref_mut(),
@@ -219,53 +269,39 @@ impl PinEvidence {
         .into_iter()
         .map(|row| ((row.provider.clone(), row.cid.clone(), row.epoch), row))
         .collect();
-        let mut histories = BTreeMap::new();
-        for chunk in keys.chunks(sql::PARAMS) {
-            let slots = sql::slots(chunk.len(), 0);
-            let predicate = format!(
-                "job_id IN (SELECT id FROM pin_jobs WHERE provider IN ({slots}) UNION SELECT job_id FROM pin_submit_observations WHERE provider IN ({slots}))"
-            );
-            for row in sql::read::<jobs::history::Entity, _>(
-                db,
-                &predicate,
-                chunk.iter().cloned().map(Into::into).collect(),
-                "job_id",
-                work,
-                resident,
-                maintenance.as_deref_mut(),
-            )
-            .await?
-            {
-                histories.insert(row.job_id.clone(), row);
-            }
-        }
-        let mut replicas = BTreeMap::new();
-        let mut by_provider: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-        for (provider, cid) in &replica_pairs {
-            by_provider.entry(provider).or_default().push(cid);
-        }
-        for (provider, cids) in by_provider {
-            for chunk in cids.chunks(sql::PARAMS - 1) {
-                let mut values = vec![provider.into()];
-                values.extend(chunk.iter().copied().map(Into::into));
-                for row in sql::read::<pin_replica_observation::Entity, _>(
-                    db,
-                    &format!(
-                        "provider=$1 AND expected_cid IN ({})",
-                        sql::slots(chunk.len(), 1)
-                    ),
-                    values,
-                    "sequence",
-                    work,
-                    resident,
-                    maintenance.as_deref_mut(),
-                )
-                .await?
-                {
-                    replicas.insert(row.sequence, row);
-                }
-            }
-        }
+        let related_jobs = job_ids
+            .iter()
+            .cloned()
+            .chain(submissions.values().map(|row| row.job_id.clone()))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let histories = by_ids::<jobs::history::Entity, _>(
+            db,
+            "job_id",
+            &related_jobs,
+            work,
+            resident,
+            maintenance.as_deref_mut(),
+        )
+        .await?
+        .into_iter()
+        .map(|row| (row.job_id.clone(), row))
+        .collect();
+        let replicas = by_pairs_column::<pin_replica_observation::Entity, _>(
+            db,
+            &evidence_pairs,
+            "expected_cid",
+            "",
+            "sequence",
+            work,
+            resident,
+            maintenance,
+        )
+        .await?
+        .into_iter()
+        .map(|row| (row.sequence, row))
+        .collect();
         Ok(Self {
             providers: scope,
             submissions,
@@ -275,7 +311,6 @@ impl PinEvidence {
         })
     }
 }
-
 impl LockedPins {
     pub(in crate::store::pinning::publication::zip) async fn load<
         R: publication::reservations::Reservations,
@@ -524,45 +559,71 @@ impl LockedPins {
                 provider.clone(),
                 ledger::submission::admission_barrier_with_catalog(provider, catalog, work).await?,
             );
-            use crate::store::pinning::management::records::locator::AuthoritySelector;
-            let candidates = catalog
-                .load(
-                    &[
+            let provider_pairs = remotes
+                .keys()
+                .filter(|(candidate, _)| candidate == provider)
+                .cloned()
+                .collect::<Vec<_>>();
+            if !provider_pairs.is_empty() {
+                use crate::store::pinning::management::records::locator::AuthoritySelector;
+                let resources = provider_pairs
+                    .iter()
+                    .flat_map(|(provider, cid)| {
+                        ["remote_pin_ledger", "remote_pins"]
+                            .map(|table| (table.to_owned(), provider.clone(), cid.clone()))
+                    })
+                    .collect::<Vec<_>>();
+                let selectors = resources
+                    .iter()
+                    .map(|(table, provider, cid)| {
                         AuthoritySelector::LegacyResource(
-                            "remote_pins".into(),
+                            table.clone(),
                             provider.clone(),
-                            None,
-                        ),
-                        AuthoritySelector::LegacyResource(
-                            "remote_pin_ledger".into(),
-                            provider.clone(),
-                            None,
-                        ),
-                    ],
-                    work,
-                )
-                .await
-                .map_err(work_error)?;
-            for pair in remotes.keys().filter(|(p, _)| p == provider) {
-                if let Some(binding) = legacy_migration::resource_binding_from_catalog(
-                    &pair.0,
-                    &pair.1,
+                            Some(cid.clone()),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let candidates = catalog.load(&selectors, work).await.map_err(work_error)?;
+                let (_, bindings) = legacy_migration::historical_resource_keys_from_loaded_catalog(
+                    &resources,
                     &candidates,
+                    &work,
                     work,
                     catalog,
                 )
                 .await
-                .map_err(work_error)?
-                {
-                    if binding.source_retired {
-                        retired_sources.insert(pair.clone());
-                    }
-                    if binding.historical_route.is_none() {
-                        unconfirmed_sources.insert(pair.clone());
+                .map_err(work_error)?;
+                for pair in &provider_pairs {
+                    let binding =
+                        ["remote_pin_ledger", "remote_pins"]
+                            .into_iter()
+                            .find_map(|table| {
+                                bindings
+                                    .get(&(table.to_owned(), pair.0.clone(), pair.1.clone()))
+                                    .cloned()
+                            });
+                    let (binding, operational) = legacy_migration::resource_binding_from_loaded(
+                        binding, &pair.0, &pair.1, work, catalog,
+                    )
+                    .await
+                    .map_err(work_error)?;
+                    if let Some(binding) = binding {
+                        if binding.source_retired {
+                            retired_sources.insert(pair.clone());
+                        }
+                        if binding.historical_route.is_none() {
+                            unconfirmed_sources.insert(pair.clone());
+                        }
                     }
                     if let Some(ledger) =
-                        ledger::get_from_catalog(&pair.0, &pair.1, &candidates, work, catalog)
-                            .await?
+                        crate::store::pinning::management::records::current_model::<
+                            remote_pin_ledger::Entity,
+                            _,
+                        >(
+                            &catalog, &[operational.as_str(), pair.1.as_str()], work
+                        )
+                        .await
+                        .map_err(work_error)?
                     {
                         ledgers.insert(pair.clone(), ledger);
                     }
@@ -570,16 +631,19 @@ impl LockedPins {
             }
         }
         let new_allocation_safe = new_allocation_safe(db, work).await?;
-        let evidence_providers = pairs
+        let evidence_pairs = pairs
             .iter()
-            .map(|(provider, _)| provider.clone())
-            .chain(providers)
-            .chain(jobs.values().map(|job| job.provider.clone()))
+            .cloned()
+            .chain(
+                jobs.values()
+                    .map(|job| (job.provider.clone(), job.cid.clone())),
+            )
             .collect();
+        let evidence_job_ids = jobs.keys().cloned().collect();
         let evidence = PinEvidence::load(
             reservations,
-            &evidence_providers,
-            &pairs,
+            &evidence_pairs,
+            &evidence_job_ids,
             work,
             &mut resident,
             maintenance.as_deref_mut(),

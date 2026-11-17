@@ -179,7 +179,7 @@ pub(super) struct Sections {
 }
 impl Sections {
     pub(super) fn parse(raw: &str, work: &mut DecodeBudget) -> Result<Self> {
-        if !raw.starts_with(FRAME) || raw.len() > native::MAX_BYTES {
+        if !raw.starts_with(FRAME) || !work.is_publication() && raw.len() > native::MAX_BYTES {
             return Err(ManagementError::InvalidEvidence);
         }
         fn number(raw: &str, start: usize) -> Result<usize> {
@@ -193,7 +193,7 @@ impl Sections {
         }
         let lengths = [number(raw, 5)?, number(raw, 13)?, number(raw, 21)?];
         let count = number(raw, 29)?;
-        if count > native::MAX_ROWS {
+        if !work.is_publication() && count > native::MAX_ROWS {
             return Err(ManagementError::Budget);
         }
         let directory_end = 38usize
@@ -276,7 +276,11 @@ fn before_digest(key: &Key, raw: &str) -> Result<sha2::digest::Output<Sha256>> {
 fn encoded<T: Serialize>(value: &T, work: &mut DecodeBudget) -> Result<String> {
     let (_, length) = codec::measure(value)?;
     work.bytes(length)?;
-    codec::serialize_bounded(value, crate::pinning::management::wire::MAX_WIRE_BYTES)
+    if work.is_publication() {
+        serde_json::to_string(value).map_err(|_| ManagementError::InvalidEvidence)
+    } else {
+        codec::serialize_bounded(value, crate::pinning::management::wire::MAX_WIRE_BYTES)
+    }
 }
 
 pub(super) fn assemble(
@@ -286,14 +290,14 @@ pub(super) fn assemble(
     leaves: &[String],
     work: &mut DecodeBudget,
 ) -> Result<String> {
-    if leaves.len() > native::MAX_ROWS {
+    if !work.is_publication() && leaves.len() > native::MAX_ROWS {
         return Err(ManagementError::Budget);
     }
     let length = leaves.iter().try_fold(
         39 + 8 * leaves.len() + head.len() + core.len() + manifest.len(),
         |sum, leaf| sum.checked_add(leaf.len()).ok_or(ManagementError::Budget),
     )?;
-    if length > native::MAX_BYTES {
+    if !work.is_publication() && length > native::MAX_BYTES {
         return Err(ManagementError::Budget);
     }
     work.bytes(length)?;
@@ -381,12 +385,12 @@ impl Manifest {
             count = count
                 .checked_add(rows.len())
                 .ok_or(ManagementError::Budget)?;
-            if count > native::MAX_ROWS {
+            if !work.is_publication() && count > native::MAX_ROWS {
                 return Err(ManagementError::Budget);
             }
             for (position, row) in rows.iter().enumerate() {
                 if row.0.len() != table.primary_key.len()
-                    || row.3 > native::MAX_BYTES
+                    || !work.is_publication() && row.3 > native::MAX_BYTES
                     || row.4.len() != 64
                     || !row
                         .4

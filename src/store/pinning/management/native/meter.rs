@@ -95,6 +95,7 @@ pub struct Budget {
     failed: bool,
     task_bytes: Option<u64>,
     transfer_bytes: Option<u64>,
+    publication: bool,
 }
 impl Default for Budget {
     fn default() -> Self {
@@ -115,13 +116,25 @@ impl Budget {
             failed: false,
             task_bytes: None,
             transfer_bytes: None,
+            publication: false,
         }
+    }
+    pub(crate) fn for_publication() -> Self {
+        let mut budget = Self::default();
+        budget.publication = true;
+        budget
+    }
+    pub(crate) fn is_publication(&self) -> bool {
+        self.publication
     }
     pub fn cancellation(&self) -> Arc<AtomicBool> {
         self.cancelled.clone()
     }
     pub(crate) fn remaining_io_allowance(&self) -> Result<(u64, u64)> {
         self.check()?;
+        if self.publication {
+            return Err(ManagementError::InvalidEvidence);
+        }
         Ok((
             self.limits
                 .rows
@@ -137,10 +150,10 @@ impl Budget {
     /// deadline, cancellation and resident pool. Its work is returned to its owner.
     pub(crate) fn remaining_budget(&self) -> Result<Self> {
         self.check()?;
-        Ok(Self {
-            work: WorkMeter::default(),
-            retirement_accounted: WorkMeter::default(),
-            limits: Limits {
+        let limits = if self.publication {
+            self.limits
+        } else {
+            Limits {
                 rows: self
                     .limits
                     .rows
@@ -157,29 +170,45 @@ impl Budget {
                     .checked_sub(self.work.sql)
                     .ok_or(ManagementError::Budget)?,
                 ..self.limits
-            },
+            }
+        };
+        Ok(Self {
+            work: WorkMeter::default(),
+            retirement_accounted: WorkMeter::default(),
+            limits,
             deadline: self.deadline,
             wall_deadline: self.wall_deadline,
             enforce_wall_deadline: self.enforce_wall_deadline,
             cancelled: self.cancelled.clone(),
             resident: self.resident.clone(),
             failed: self.failed,
-            task_bytes: self.task_bytes.map(|limit| {
-                limit.saturating_sub(
-                    self.work
-                        .raw_bytes
-                        .saturating_add(self.work.copied_bytes)
-                        .saturating_add(self.work.output_bytes),
-                )
-            }),
-            transfer_bytes: self
-                .transfer_bytes
-                .map(|limit| limit - (self.work.raw_bytes + self.work.copied_bytes)),
+            task_bytes: if self.publication {
+                None
+            } else {
+                self.task_bytes.map(|limit| {
+                    limit.saturating_sub(
+                        self.work
+                            .raw_bytes
+                            .saturating_add(self.work.copied_bytes)
+                            .saturating_add(self.work.output_bytes),
+                    )
+                })
+            },
+            transfer_bytes: if self.publication {
+                None
+            } else {
+                self.transfer_bytes
+                    .map(|limit| limit - (self.work.raw_bytes + self.work.copied_bytes))
+            },
+            publication: self.publication,
         })
     }
     /// Transfers charge raw IO and independent copies; output_bytes only records
     /// completion of writes already included in raw IO.
     pub(crate) fn restrict_transfer_bytes(&mut self, remaining: u64) -> Result<()> {
+        if self.publication {
+            return self.check();
+        }
         let limit = self
             .work
             .raw_bytes
@@ -190,6 +219,9 @@ impl Budget {
         self.check()
     }
     pub(crate) fn restrict_work_bytes(&mut self, bytes: u64) -> Result<()> {
+        if self.publication {
+            return self.check();
+        }
         self.task_bytes = Some(self.task_bytes.map_or(bytes, |old| old.min(bytes)));
         self.check()
     }
@@ -214,12 +246,13 @@ impl Budget {
             return Err(ManagementError::Budget);
         }
         if self.failed
-            || Instant::now() >= self.deadline
             || self.cancelled.load(Ordering::Relaxed)
-            || self.enforce_wall_deadline
-                && self
-                    .wall_deadline
-                    .is_none_or(|end| std::time::SystemTime::now() >= end)
+            || !self.publication
+                && (Instant::now() >= self.deadline
+                    || self.enforce_wall_deadline
+                        && self
+                            .wall_deadline
+                            .is_none_or(|end| std::time::SystemTime::now() >= end))
         {
             Err(ManagementError::Budget)
         } else {
@@ -228,6 +261,9 @@ impl Budget {
     }
     pub fn remaining(&self) -> Result<Duration> {
         self.check()?;
+        if self.publication {
+            return Err(ManagementError::InvalidEvidence);
+        }
         let remaining = self.deadline.saturating_duration_since(Instant::now());
         if self.enforce_wall_deadline {
             Ok(remaining.min(
@@ -248,6 +284,9 @@ impl Budget {
         bytes: u64,
         elapsed: Duration,
     ) -> Result<()> {
+        if self.publication {
+            return self.check();
+        }
         self.limits.rows = self.limits.rows.min(
             self.work
                 .rows
@@ -271,9 +310,10 @@ impl Budget {
             self.work.rows = add(self.work.rows, rows)?;
             self.work.cells = add(self.work.cells, cells)?;
             self.work.raw_bytes = add(self.work.raw_bytes, bytes)?;
-            if self.work.sql > self.limits.sql
-                || self.work.rows > self.limits.rows
-                || self.work.raw_bytes > self.limits.bytes
+            if !self.publication
+                && (self.work.sql > self.limits.sql
+                    || self.work.rows > self.limits.rows
+                    || self.work.raw_bytes > self.limits.bytes)
             {
                 return Err(ManagementError::Budget);
             }
@@ -290,7 +330,7 @@ impl Budget {
             .used
             .checked_add(bytes)
             .ok_or(ManagementError::Budget)?;
-        if total > self.limits.resident {
+        if !self.publication && total > self.limits.resident {
             self.failed = true;
             return Err(ManagementError::Budget);
         }
@@ -307,6 +347,9 @@ impl Budget {
 
     pub fn checkpoint(&self) -> Result<Checkpoint> {
         self.check()?;
+        if self.publication {
+            return Err(ManagementError::InvalidEvidence);
+        }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|_| ManagementError::Budget)?;

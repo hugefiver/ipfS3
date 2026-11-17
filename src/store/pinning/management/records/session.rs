@@ -6,8 +6,8 @@ use std::{collections::BTreeSet, sync::Arc};
 pub struct ReadSession {
     storage: native::meter::Budget,
     task_limit: Option<(u64, u64)>,
-    publication_limit: Option<(usize, usize)>,
     task_cancel: Option<super::super::transaction::CancellationToken>,
+    publication: bool,
     failed: bool,
     pub(super) frozen_sources: Vec<evidence::FrozenSourceIndex>,
     pub(super) bytes: usize,
@@ -26,60 +26,15 @@ pub struct ReadSession {
 }
 
 impl ReadSession {
-    pub(crate) fn for_zip_publication(shape: usize) -> Result<Self> {
-        let rows = shape
-            .checked_mul(16)
-            .and_then(|n| n.checked_add(4096))
-            .and_then(|n| n.checked_mul(4))
-            .ok_or(ManagementError::Budget)?
-            .min(1_048_576) as u64;
-        let bytes = 256 * 1024 * 1024;
-        Ok(Self {
-            storage: native::meter::Budget::new(native::meter::Limits {
-                rows,
-                bytes: bytes as u64,
-                sql: 16384,
-                resident: 64 * 1024 * 1024,
-                elapsed: std::time::Duration::from_secs(30),
-            }),
-            publication_limit: Some((4 * crate::pinning::management::wire::MAX_WIRE_NODES, bytes)),
+    pub(crate) fn for_publication() -> Self {
+        Self {
+            storage: native::meter::Budget::for_publication(),
+            publication: true,
             ..Self::default()
-        })
+        }
     }
-    pub(crate) fn zip_publication_shape(&mut self, shape: usize) -> Result<()> {
-        let rows = shape
-            .checked_mul(16)
-            .and_then(|n| n.checked_add(4096))
-            .and_then(|n| n.checked_mul(4))
-            .ok_or(ManagementError::Budget)?
-            .min(1_048_576) as u64;
-        let remaining = self.storage.remaining()?;
-        self.storage
-            .restrict_remaining(rows, 256 * 1024 * 1024, remaining)?;
-        self.check()
-    }
-    pub(crate) fn publication_preflight<T>(
-        &mut self,
-        measure: impl FnOnce(&Self) -> Result<T>,
-    ) -> Result<T> {
-        self.check()?;
-        let measured = measure(self);
-        self.failed |= matches!(&measured, Err(ManagementError::Budget));
-        measured
-    }
-    pub(crate) fn measure<T: Serialize + ?Sized>(&self, value: &T) -> Result<(usize, usize)> {
-        self.check()?;
-        let measured = codec::measure(value)?;
-        self.check()?;
-        Ok(measured)
-    }
-    fn node_limit(&self) -> usize {
-        self.publication_limit
-            .map_or(crate::pinning::management::wire::MAX_WIRE_NODES, |v| v.0)
-    }
-    fn byte_limit(&self) -> usize {
-        self.publication_limit
-            .map_or(crate::pinning::management::wire::MAX_WIRE_BYTES, |v| v.1)
+    pub(crate) fn is_publication(&self) -> bool {
+        self.publication
     }
     pub(crate) fn begin_publication_attempt(&mut self) -> Result<()> {
         self.check()?;
@@ -231,11 +186,12 @@ impl ReadSession {
                 .pages
                 .checked_add(used.pages)
                 .ok_or(ManagementError::Budget)?;
-            let limit = self
-                .publication_limit
-                .map_or(native::meter::Limits::default().bytes, |v| v.1 as u64);
-            if self.storage.work.copied_bytes > limit || self.storage.work.output_bytes > limit {
-                return Err(ManagementError::Budget);
+            if !self.publication {
+                let limit = native::meter::Limits::default().bytes;
+                if self.storage.work.copied_bytes > limit || self.storage.work.output_bytes > limit
+                {
+                    return Err(ManagementError::Budget);
+                }
             }
             checked?;
             self.storage.charge(0, 0, 0, 0)?;
@@ -260,6 +216,9 @@ impl ReadSession {
     #[track_caller]
     pub(crate) fn nodes(&mut self, amount: usize) -> Result<()> {
         self.check()?;
+        if self.publication {
+            return Ok(());
+        }
         self.nodes = match self.nodes.checked_add(amount) {
             Some(value) => value,
             None => {
@@ -267,7 +226,7 @@ impl ReadSession {
                 return Err(ManagementError::Budget);
             }
         };
-        if self.nodes > self.node_limit() {
+        if !self.publication && self.nodes > crate::pinning::management::wire::MAX_WIRE_NODES {
             self.failed = true;
             return Err(ManagementError::Budget);
         }
@@ -288,25 +247,20 @@ impl ReadSession {
                 return Err(ManagementError::Budget);
             }
         }
-        if let Some((_, bytes)) = self.publication_limit {
-            let used = self.storage_usage();
-            if used
-                .raw_bytes
-                .checked_add(used.copied_bytes)
-                .and_then(|n| n.checked_add(used.output_bytes))
-                .and_then(|n| n.checked_add(self.bytes as u64))
-                .is_none_or(|n| n > bytes as u64)
-            {
-                return Err(ManagementError::Budget);
-            }
-        }
-        if self.failed || self.nodes > self.node_limit() || self.bytes > self.byte_limit() {
+        if self.failed
+            || !self.publication
+                && (self.nodes > crate::pinning::management::wire::MAX_WIRE_NODES
+                    || self.bytes > crate::pinning::management::wire::MAX_WIRE_BYTES)
+        {
             return Err(ManagementError::Budget);
         }
         Ok(())
     }
     #[track_caller]
     pub(crate) fn copy<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<()> {
+        if self.publication {
+            return self.check();
+        }
         let (nodes, bytes) = codec::measure(value)?;
         self.nodes(nodes)?;
         self.bytes(bytes)
@@ -365,6 +319,9 @@ impl ReadSession {
     #[track_caller]
     pub(crate) fn bytes(&mut self, amount: usize) -> Result<()> {
         self.check()?;
+        if self.publication {
+            return Ok(());
+        }
         self.bytes = match self.bytes.checked_add(amount) {
             Some(value) => value,
             None => {
@@ -372,7 +329,7 @@ impl ReadSession {
                 return Err(ManagementError::Budget);
             }
         };
-        if self.bytes > self.byte_limit() {
+        if !self.publication && self.bytes > crate::pinning::management::wire::MAX_WIRE_BYTES {
             self.failed = true;
             return Err(ManagementError::Budget);
         }
@@ -383,35 +340,6 @@ impl ReadSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn publication_attempt_drops_typed_snapshot_without_resetting_cumulative_work() {
-        let mut session = ReadSession::for_zip_publication(1).unwrap();
-        session.typed_shared::<Vec<u8>>("[1]").unwrap();
-        let before = session.usage();
-        session.begin_publication_attempt().unwrap();
-        session.typed_shared::<Vec<u8>>("[1]").unwrap();
-        assert!(session.usage().0 > before.0);
-        assert!(session.usage().1 > before.1);
-    }
-
-    #[test]
-    fn publication_resident_failure_is_sticky_after_attempt_reset() {
-        let mut session = ReadSession::for_zip_publication(1).unwrap();
-        let mut budget = session.storage_budget().unwrap();
-        assert!(matches!(
-            budget.reserve(64 * 1024 * 1024 + 1),
-            Err(ManagementError::Budget)
-        ));
-        assert_eq!(
-            session.finish_storage(&budget),
-            Err(ManagementError::Budget)
-        );
-        assert_eq!(
-            session.begin_publication_attempt(),
-            Err(ManagementError::Budget)
-        );
-    }
-
     #[test]
     fn task_storage_and_decode_share_remaining_allowance_without_expanding_defaults() {
         let mut session =

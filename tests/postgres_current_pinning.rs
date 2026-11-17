@@ -1,6 +1,9 @@
 use ipfs_s3_gateway::store::{
     initialization,
-    migrations::{baseline, m20261108_000001_current_pinning_config as current},
+    migrations::{
+        baseline, m20261108_000001_current_pinning_config as current,
+        m20261109_000001_pin_cid_comparisons as cid_comparisons,
+    },
 };
 use sea_orm::{ConnectionTrait, DbErr, RuntimeErr, TransactionTrait};
 use sea_orm_migration::{MigrationTrait, SchemaManager};
@@ -37,7 +40,14 @@ async fn old_baseline_upgrades_through_public_entry_and_preserves_history() {
             "SELECT version AS value FROM seaql_migrations ORDER BY version",
         )
         .await;
-        assert_eq!(versions, [baseline::VERSION, current::VERSION]);
+        assert_eq!(
+            versions,
+            [
+                baseline::VERSION,
+                current::VERSION,
+                cid_comparisons::VERSION
+            ]
+        );
     })
     .await;
 }

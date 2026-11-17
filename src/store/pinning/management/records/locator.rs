@@ -11,6 +11,15 @@ mod classify;
 mod discovery;
 mod narrow;
 mod upgrade;
+
+fn decode_budget(publication: bool) -> DecodeBudget {
+    if publication {
+        DecodeBudget::for_publication()
+    } else {
+        DecodeBudget::default()
+    }
+}
+
 pub use classify::{DependencyKind, SourceClassification};
 pub(in crate::store::pinning) use discovery::discover_observed_authority;
 pub(in crate::store::pinning) use discovery::discover_quota_authority;
@@ -132,7 +141,11 @@ fn route_selectors(
 
 /// Classification is total for supported originals. Unknown encodings remain
 /// global-pending; the caller cannot supply a more permissive selector list.
-fn basic_selectors(key: &NativeKey, row: &NativeRow) -> Result<BTreeSet<AuthoritySelector>> {
+fn basic_selectors(
+    key: &NativeKey,
+    row: &NativeRow,
+    publication: bool,
+) -> Result<BTreeSet<AuthoritySelector>> {
     let mut set = BTreeSet::new();
     match key.table.as_str() {
         "pin_provider_routes" => {
@@ -174,7 +187,7 @@ fn basic_selectors(key: &NativeKey, row: &NativeRow) -> Result<BTreeSet<Authorit
                 let body = required(row, "result")?
                     .strip_prefix("S7R1\n")
                     .ok_or(ManagementError::InvalidEvidence)?;
-                let decoded = results::decode_facts(body, &mut DecodeBudget::default())?;
+                let decoded = results::decode_facts(body, &mut decode_budget(publication))?;
                 let results::DecodedResult::Facts(action, _, _) = decoded;
                 for lease in &action.receipt.intent_ids {
                     set.insert(AuthoritySelector::Lease(lease.clone()));

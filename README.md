@@ -1474,12 +1474,17 @@ URL, native physical identity, database scope, source version and target version
 It doesn't load gateway config, construct AppState, register identities, start
 workers or perform source/provider RPC. Supported sources are the exact historical
 ledgers ending at `m20261013_000001_zip_root_logical_release`,
-`m20261017_000001_management_storage`, or `m20261023_000001_inline_documents`.
-The target is `m20261027_000001_schema_baseline`. Obtain the actual identity/scope from
+`m20261017_000001_management_storage`, `m20261023_000001_inline_documents`,
+`m20261027_000001_schema_baseline`, or `m20261108_000001_current_pinning_config`.
+The target is `m20261109_000001_pin_cid_comparisons`. Obtain the actual identity/scope from
 authorized database records, not a guessed UUID or a file claim. No identity
 discovery CLI is provided here.
 
-Empty databases install the final layout directly with one baseline ledger entry.
+Empty databases install the baseline and registered current migrations. The CID
+comparison migration builds an indexed canonical comparison key for existing remote
+and ledger CIDs without changing their original values or object ETags. New pin
+allocations maintain this index in their existing write transaction and query only
+equivalent CID aliases; they do not enumerate the provider's full CID history.
 A ready m23 database retains its tables, indexes, identity, scope and historical
 archives; maintenance normalizes the live migration ledger and adds a separately
 bound conversion stamp without rerunning history backfill. m13/m17 conversions
@@ -1536,7 +1541,7 @@ ipfs-s3-gateway --pinning-manage-upgrade `
   --native-identity $upgradeNativeIdentity `
   --database-scope $upgradeDatabaseScope `
   --source-version m20261013_000001_zip_root_logical_release `
-  --target-version m20261027_000001_schema_baseline
+  --target-version m20261109_000001_pin_cid_comparisons
 ```
 
 ### Policies and coordination

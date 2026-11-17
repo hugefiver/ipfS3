@@ -126,83 +126,16 @@ fn fixture(
 }
 
 #[test]
-fn large_legal_provider_text_is_rejected_before_selection_expands_outputs() {
-    let (capture, source, outputs, mut manifest) = fixture(256 * 1024, 256);
-    let encoded = serde_json::to_string(&capture).unwrap();
-    assert!(encoded.len() < crate::pinning::management::wire::MAX_WIRE_BYTES);
-    CapturedZipIntent::decode_json(&encoded).unwrap();
-    let session = std::sync::Arc::new(std::sync::Mutex::new(
-        ReadSession::for_zip_publication(65_536).unwrap(),
-    ));
-    let work = DecodeWork::shared(&session);
-    assert!(matches!(
-        select(&capture, &manifest, Some(&source), &outputs, work),
-        Err(AppError::ManagementBudget)
-    ));
-    assert_eq!(
-        session.lock().unwrap().begin_publication_attempt(),
-        Err(ManagementError::Budget)
-    );
-    // A selector-first implementation would reject the bindings before reporting budget exhaustion.
-    manifest.successful.clear();
-    let session = std::sync::Arc::new(std::sync::Mutex::new(
-        ReadSession::for_zip_publication(65_536).unwrap(),
-    ));
-    assert!(matches!(
-        select(
-            &capture,
-            &manifest,
-            Some(&source),
-            &outputs,
-            DecodeWork::shared(&session)
-        ),
-        Err(AppError::ManagementBudget)
-    ));
-}
-
-#[test]
-fn small_selection_matches_selector_and_charges_before_each_retry() {
+fn small_selection_matches_selector_across_attempts() {
     let (capture, source, outputs, manifest) = fixture(8, 2);
     let expected = select_zip_intents(&capture, &manifest, Some(&source), &outputs).unwrap();
-    let session = std::sync::Arc::new(std::sync::Mutex::new(
-        ReadSession::for_zip_publication(100).unwrap(),
-    ));
+    let session = std::sync::Arc::new(std::sync::Mutex::new(ReadSession::for_publication()));
     let work = DecodeWork::shared(&session);
-    let (actual, resident) = select(&capture, &manifest, Some(&source), &outputs, work).unwrap();
+    let actual = select(&capture, &manifest, Some(&source), &outputs, work).unwrap();
     assert_eq!(actual, expected);
-    let first = session.lock().unwrap().storage_usage().copied_bytes;
-    assert!(first > 0);
-    drop(actual);
-    drop(resident);
     begin_attempt(&session).unwrap();
-    let (_, _resident) = select(&capture, &manifest, Some(&source), &outputs, work).unwrap();
-    assert_eq!(
-        session.lock().unwrap().storage_usage().copied_bytes,
-        first * 2
-    );
-}
-
-#[test]
-fn normal_four_psa_1649_selection_fits_unchanged_publication_limits() {
-    let (capture, source, outputs, manifest) = fixture(16, 1649);
-    let session = std::sync::Arc::new(std::sync::Mutex::new(
-        ReadSession::for_zip_publication(65_536).unwrap(),
-    ));
-    let work = DecodeWork::shared(&session);
-    let (candidate, candidate_resident) =
-        select(&capture, &manifest, Some(&source), &outputs, work).unwrap();
-    assert_eq!(candidate.leases.len(), 1649);
-    let shape_bytes = work
-        .with(|session| allocation::selection_shape_bytes(&candidate, session))
-        .unwrap();
-    let shape_resident = sql::retain_copy(work, shape_bytes).unwrap();
-    let shape = allocation::selection_shape(&candidate);
-    drop(candidate);
-    drop(candidate_resident);
-    let (exact, _resident) = select(&capture, &manifest, Some(&source), &outputs, work).unwrap();
-    allocation::verify_candidate(&shape, &exact).unwrap();
-    drop(shape_resident);
-    assert!(session.lock().unwrap().storage_usage().copied_bytes < 256 * 1024 * 1024);
+    let retried = select(&capture, &manifest, Some(&source), &outputs, work).unwrap();
+    assert_eq!(retried, expected);
 }
 
 #[test]

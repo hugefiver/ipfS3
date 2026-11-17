@@ -1524,6 +1524,21 @@ impl AdmissionSnapshot {
     async fn read<C: ConnectionTrait>(db: &C, provider: &str) -> AppResult<Self> {
         Self::read_with_catalog(
             provider,
+            None,
+            crate::store::pinning::legacy_migration::ReceiptCatalog::full(db),
+            &(),
+        )
+        .await
+    }
+
+    async fn read_resource<C: ConnectionTrait>(
+        db: &C,
+        provider: &str,
+        cid: &str,
+    ) -> AppResult<Self> {
+        Self::read_with_catalog(
+            provider,
+            Some(cid),
             crate::store::pinning::legacy_migration::ReceiptCatalog::full(db),
             &(),
         )
@@ -1532,73 +1547,196 @@ impl AdmissionSnapshot {
 
     async fn read_with_catalog<W: crate::store::pinning::legacy_migration::ReceiptWork>(
         provider: &str,
+        cid: Option<&str>,
         catalog: crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
         work: &W,
     ) -> AppResult<Self> {
-        let mut keys = match catalog {
-            crate::store::pinning::legacy_migration::ReceiptCatalog::Full(_) => {
-                crate::store::pinning::legacy_migration::admission_historical_keys(
-                    &catalog, provider, work,
-                )
-                .await
+        let aliases =
+            crate::store::pinning::legacy_migration::admission_historical_resources_with_catalog(
+                provider, work, catalog,
+            )
+            .await
+            .map_err(W::into_app)?;
+        let mut values: Vec<sea_orm::Value> = vec![provider.into()];
+        let mut alias_slots = Vec::new();
+        for (table, alias, cid) in aliases {
+            if alias == provider {
+                continue;
             }
-            _ => {
-                crate::store::pinning::legacy_migration::admission_historical_keys_with_catalog(
-                    provider, work, catalog,
-                )
-                .await
-            }
+            let table_slot = values.len() + 1;
+            values.push(table.into());
+            let provider_slot = values.len() + 1;
+            values.push(alias.into());
+            let cid_slot = cid.map(|cid| {
+                let slot = values.len() + 1;
+                values.push(cid.into());
+                slot
+            });
+            alias_slots.push((table_slot, provider_slot, cid_slot));
         }
-        .map_err(W::into_app)?;
-        keys.retain(|key| key != provider);
-        keys.sort();
-        keys.dedup();
-        keys.insert(0, provider.into());
-        let slots = (1..=keys.len())
-            .map(|i| format!("${i}"))
-            .collect::<Vec<_>>()
-            .join(",");
-        let scope = format!("\"provider\" IN ({slots})");
-        let evidence_jobs =
-            format!("SELECT \"job_id\" FROM \"pin_submit_observations\" WHERE {scope}");
+        let aliases_sql = if alias_slots.is_empty() {
+            "SELECT CAST(NULL AS TEXT) AS \"table_name\", \
+             CAST(NULL AS TEXT) AS \"provider\", \
+             CAST(NULL AS TEXT) AS \"cid\" WHERE 1=0"
+                .into()
+        } else {
+            let rows = alias_slots
+                .iter()
+                .map(|(table_slot, provider_slot, cid_slot)| match cid_slot {
+                    Some(cid_slot) => {
+                        format!("(${table_slot},${provider_slot},${cid_slot})")
+                    }
+                    None => format!("(${table_slot},${provider_slot},CAST(NULL AS TEXT))"),
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("VALUES {rows}")
+        };
+        let resource_scope = |table: &str, prefix: &str, cid_column: &str| {
+            let column = |name: &str| {
+                if prefix.is_empty() {
+                    format!("\"{name}\"")
+                } else {
+                    format!("{prefix}.\"{name}\"")
+                }
+            };
+            let provider_column = column("provider");
+            if alias_slots.is_empty() {
+                return format!("{provider_column}=$1");
+            }
+            let cid_column = column(cid_column);
+            format!(
+                "{provider_column}=$1 OR ({provider_column},{cid_column}) IN \
+                 (SELECT \"provider\",\"cid\" FROM resource_aliases \
+                  WHERE \"table_name\"='{table}' AND \"cid\" IS NOT NULL) \
+                 OR {provider_column} IN \
+                 (SELECT \"provider\" FROM resource_aliases \
+                  WHERE \"table_name\"='{table}' AND \"cid\" IS NULL)"
+            )
+        };
+        let registered_route = |column: &str| {
+            format!(
+                "{column}=(SELECT \"snapshot\" FROM \"pin_provider_routes\" \
+                 WHERE \"provider\"=$1)"
+            )
+        };
+        let candidate_sql = if let Some(cid) = cid {
+            let slot = values.len() + 1;
+            values.push(cid.into());
+            format!("SELECT CAST(${slot} AS TEXT) AS \"cid\"")
+        } else {
+            let evidence_scope =
+                resource_scope("pin_submit_observations", "unresolved", "expected_cid");
+            let ledger_scope = resource_scope("remote_pin_ledger", "ledger", "cid");
+            let witness_scope =
+                resource_scope("pin_submit_observations", "witness", "expected_cid");
+            let terminal_job_scope = resource_scope("pin_jobs", "job", "cid");
+            let release_scope = resource_scope("pin_resource_history", "released", "cid");
+            let normal_witness = format!(
+                "EXISTS (SELECT 1 FROM \"pin_submit_observations\" witness \
+                 WHERE ({witness_scope}) \
+                 AND witness.\"expected_cid\"=ledger.\"cid\" \
+                 AND witness.\"needs_attention\"=FALSE \
+                 AND witness.\"outcome\" IN ('matched','accepted','not_submitted') \
+                 AND ledger.\"route\"=witness.\"route\" \
+                 AND (ledger.\"effect\"<>'not_created' OR witness.\"outcome\"='not_submitted') \
+                 AND (witness.\"outcome\"='not_submitted' OR NOT EXISTS \
+                     (SELECT 1 FROM \"pin_jobs\" job WHERE ({terminal_job_scope}) \
+                      AND job.\"id\"=witness.\"job_id\" \
+                      AND job.\"cid\"=witness.\"expected_cid\" \
+                      AND job.\"state\"='error')) \
+                 AND NOT EXISTS (SELECT 1 FROM \"pin_resource_history\" released \
+                     WHERE ({release_scope}) \
+                     AND released.\"cid\"=witness.\"expected_cid\" \
+                     AND released.\"epoch\">=witness.\"remote_epoch\"))"
+            );
+            let absent_witness = format!(
+                "EXISTS (SELECT 1 FROM \"pin_submit_observations\" witness \
+                     WHERE ({witness_scope}) \
+                     AND witness.\"expected_cid\"=ledger.\"cid\") \
+                 AND NOT EXISTS (SELECT 1 FROM \"pin_submit_observations\" witness \
+                     WHERE ({witness_scope}) \
+                     AND witness.\"expected_cid\"=ledger.\"cid\" \
+                     AND (witness.\"needs_attention\"=TRUE \
+                          OR witness.\"outcome\"<>'not_submitted' \
+                          OR ledger.\"route\"<>witness.\"route\" \
+                          OR ledger.\"route\" IS NULL))"
+            );
+            format!(
+                "SELECT unresolved.\"expected_cid\" AS \"cid\" \
+                 FROM \"pin_submit_observations\" unresolved \
+                 WHERE ({evidence_scope}) AND unresolved.\"needs_attention\"=TRUE \
+                 UNION SELECT ledger.\"cid\" FROM \"remote_pin_ledger\" ledger \
+                 WHERE ({ledger_scope}) AND CASE \
+                     WHEN ledger.\"effect\"='reserved' AND COALESCE(({}), FALSE) THEN FALSE \
+                     WHEN ledger.\"effect\"='absent' THEN NOT ({absent_witness}) \
+                     ELSE NOT ({normal_witness}) END",
+                registered_route("ledger.\"route\"")
+            )
+        };
+        let candidate = "SELECT \"cid\" FROM candidate_cids";
+        let evidence_scope = format!(
+            "({}) AND \"expected_cid\" IN ({candidate})",
+            resource_scope("pin_submit_observations", "", "expected_cid")
+        );
+        let evidence_jobs = format!(
+            "SELECT evidence.\"job_id\" FROM \"pin_submit_observations\" evidence \
+             WHERE ({}) AND evidence.\"expected_cid\" IN ({candidate})",
+            resource_scope("pin_submit_observations", "evidence", "expected_cid")
+        );
         let invocation_scope = format!("\"job_id\" IN ({evidence_jobs})");
-        let job_scope = format!("{scope} AND \"id\" IN ({evidence_jobs})");
+        let job_scope = format!(
+            "({}) AND \"cid\" IN ({candidate}) AND \"id\" IN ({evidence_jobs})",
+            resource_scope("pin_jobs", "", "cid")
+        );
         let recovery_scope = format!(
-            "{scope} AND EXISTS (SELECT 1 FROM \"pin_submit_observations\" AS evidence \
+            "({}) AND \"expected_cid\" IN ({candidate}) \
+             AND EXISTS (SELECT 1 FROM \"pin_submit_observations\" evidence \
              WHERE evidence.\"provider\"=\"pin_replica_observations\".\"provider\" \
              AND evidence.\"expected_cid\"=\"pin_replica_observations\".\"expected_cid\" \
              AND evidence.\"route\"=\"pin_replica_observations\".\"route\" \
              AND evidence.\"remote_epoch\"=\"pin_replica_observations\".\"remote_epoch\") \
              AND (\"pin_replica_observations\".\"projectable\"=TRUE \
-             OR NOT EXISTS (SELECT 1 FROM \"pin_replica_observations\" AS newer \
+             OR NOT EXISTS (SELECT 1 FROM \"pin_replica_observations\" newer \
              WHERE newer.\"provider\"=\"pin_replica_observations\".\"provider\" \
              AND newer.\"expected_cid\"=\"pin_replica_observations\".\"expected_cid\" \
              AND newer.\"route\"=\"pin_replica_observations\".\"route\" \
              AND newer.\"remote_epoch\"=\"pin_replica_observations\".\"remote_epoch\" \
              AND newer.\"projectable\"=FALSE \
-             AND newer.\"sequence\">\"pin_replica_observations\".\"sequence\"))"
+             AND newer.\"sequence\">\"pin_replica_observations\".\"sequence\"))",
+            resource_scope("pin_replica_observations", "", "expected_cid")
         );
         let remote_scope = format!(
-            "{scope} AND \"cid\" IN (SELECT \"expected_cid\" FROM \"pin_submit_observations\" WHERE {scope})"
+            "({}) AND \"cid\" IN ({candidate})",
+            resource_scope("remote_pins", "", "cid")
+        );
+        let ledger_rows_scope = format!(
+            "({}) AND \"cid\" IN ({candidate})",
+            resource_scope("remote_pin_ledger", "", "cid")
+        );
+        let archive_scope = format!(
+            "({}) AND \"cid\" IN ({candidate})",
+            resource_scope("pin_resource_history", "", "cid")
         );
         let target_scope = format!(
-            "{scope} AND \"id\" IN (SELECT \"target_id\" FROM \"pin_jobs\" WHERE {job_scope})"
+            "({}) AND \"cid\" IN ({candidate}) \
+             AND \"id\" IN (SELECT \"target_id\" FROM \"pin_jobs\" WHERE {job_scope})",
+            resource_scope("pin_lease_targets", "", "cid")
         );
         let lease_scope = format!(
-            "\"id\" IN (SELECT \"lease_id\" FROM \"pin_lease_targets\" WHERE {scope}) \
-             AND \"id\" IN (SELECT \"lease_id\" FROM \"pin_jobs\" WHERE {job_scope} \
+            "\"id\" IN (SELECT \"lease_id\" FROM \"pin_jobs\" WHERE {job_scope} \
              UNION SELECT \"lease_id\" FROM \"pin_lease_targets\" WHERE {target_scope})"
         );
         let tables = [
-            admission_table::<evidence::Entity>("evidence", &scope),
+            admission_table::<evidence::Entity>("evidence", &evidence_scope),
             admission_table::<pin_job::Entity>("job", &job_scope),
             admission_table::<jobs::history::Entity>("history", &invocation_scope),
             admission_table::<remote_pin::Entity>("remote", &remote_scope),
             admission_table::<pin_invocation_route::Entity>("capture", &invocation_scope),
-            admission_table::<remote_pin_ledger::Entity>("ledger", &scope),
+            admission_table::<remote_pin_ledger::Entity>("ledger", &ledger_rows_scope),
             admission_table::<pin_replica_observation::Entity>("recovery", &recovery_scope),
             admission_table::<pin_provider_route::Entity>("registered", "\"provider\" = $1"),
-            admission_table::<pin_resource_history::Entity>("archive", &scope),
+            admission_table::<pin_resource_history::Entity>("archive", &archive_scope),
             admission_table::<pin_lease_target::Entity>("target", &target_scope),
             admission_table::<pin_lease::Entity>("lease", &lease_scope),
         ];
@@ -1619,7 +1757,11 @@ impl AdmissionSnapshot {
             })
             .collect::<Vec<_>>()
             .join(", ");
-        let mut sql = format!("SELECT 'empty' AS \"__admission_kind\", {seed} WHERE 1=0");
+        let mut sql = format!(
+            "WITH resource_aliases(\"table_name\",\"provider\",\"cid\") AS ({aliases_sql}), \
+             candidate_cids(\"cid\") AS ({candidate_sql}) \
+             SELECT 'empty' AS \"__admission_kind\", {seed} WHERE 1=0"
+        );
         for table in &tables {
             let fields = columns
                 .keys()
@@ -1642,9 +1784,7 @@ impl AdmissionSnapshot {
             .query_all(Statement::from_sql_and_values(
                 catalog.get_database_backend(),
                 sql,
-                keys.into_iter()
-                    .map(sea_orm::Value::from)
-                    .collect::<Vec<_>>(),
+                values,
             ))
             .await?
         {
@@ -1682,16 +1822,74 @@ impl AdmissionSnapshot {
                     snapshot.histories.insert(model.job_id.clone(), model);
                 }
                 "remote" => {
-                    let model = remote_pin::Model::from_query_result(&row, "")?;
-                    snapshot.remotes.insert(model.cid.clone(), model);
+                    let mut model = remote_pin::Model::from_query_result(&row, "")?;
+                    let current = model.provider == provider;
+                    if !current {
+                        let pk = [
+                            ("provider".into(), model.provider.clone()),
+                            ("cid".into(), model.cid.clone()),
+                        ]
+                        .into();
+                        let Some(binding) =
+                            crate::store::pinning::legacy_migration::resolve_with_catalog(
+                                "remote_pins",
+                                &pk,
+                                &model.provider,
+                                work,
+                                catalog,
+                            )
+                            .await
+                            .map_err(W::into_app)?
+                        else {
+                            continue;
+                        };
+                        if binding.operational_key != provider {
+                            continue;
+                        }
+                        model.provider = provider.into();
+                    }
+                    if current {
+                        snapshot.remotes.insert(model.cid.clone(), model);
+                    } else {
+                        snapshot.remotes.entry(model.cid.clone()).or_insert(model);
+                    }
                 }
                 "capture" => {
                     let model = pin_invocation_route::Model::from_query_result(&row, "")?;
                     snapshot.captures.insert(model.job_id.clone(), model);
                 }
                 "ledger" => {
-                    let model = remote_pin_ledger::Model::from_query_result(&row, "")?;
-                    snapshot.ledgers.insert(model.cid.clone(), model);
+                    let mut model = remote_pin_ledger::Model::from_query_result(&row, "")?;
+                    let current = model.provider == provider;
+                    if !current {
+                        let pk = [
+                            ("provider".into(), model.provider.clone()),
+                            ("cid".into(), model.cid.clone()),
+                        ]
+                        .into();
+                        let Some(binding) =
+                            crate::store::pinning::legacy_migration::resolve_with_catalog(
+                                "remote_pin_ledger",
+                                &pk,
+                                &model.provider,
+                                work,
+                                catalog,
+                            )
+                            .await
+                            .map_err(W::into_app)?
+                        else {
+                            continue;
+                        };
+                        if binding.operational_key != provider {
+                            continue;
+                        }
+                        model.provider = provider.into();
+                    }
+                    if current {
+                        snapshot.ledgers.insert(model.cid.clone(), model);
+                    } else {
+                        snapshot.ledgers.entry(model.cid.clone()).or_insert(model);
+                    }
                 }
                 "recovery" => {
                     let mut model = pin_replica_observation::Model::from_query_result(&row, "")?;
@@ -2355,7 +2553,7 @@ pub(in crate::store::pinning) async fn admission_barrier_with_catalog(
     work: crate::store::pinning::management::records::DecodeWork<'_>,
 ) -> AppResult<AdmissionBarrier> {
     let now = Utc::now();
-    let snapshot = AdmissionSnapshot::read_with_catalog(provider, catalog, &work).await?;
+    let snapshot = AdmissionSnapshot::read_with_catalog(provider, None, catalog, &work).await?;
     admission_barrier_from_snapshot(snapshot, now)
 }
 
@@ -2430,77 +2628,17 @@ async fn held_evidence_core<C: ConnectionTrait>(
     }
     let snapshot = match runtime {
         Some((catalog, work)) => {
-            AdmissionSnapshot::read_with_catalog(&ledger.provider, catalog, &work).await?
-        }
-        None => AdmissionSnapshot::read(db, &ledger.provider).await?,
-    };
-    if snapshot.held_known(ledger) {
-        return Ok(true);
-    }
-    let rows = match runtime {
-        Some((catalog, work)) => observations_catalog(catalog, &ledger.provider, work).await?,
-        None => observations(db, &ledger.provider).await?,
-    }
-    .into_iter()
-    .filter(|row| row.expected_cid == ledger.cid)
-    .collect::<Vec<_>>();
-    if ledger.effect == "absent" {
-        return Ok(!rows.is_empty()
-            && rows.iter().all(|row| {
-                !row.needs_attention
-                    && row.outcome == "not_submitted"
-                    && ledger.route.as_deref() == Some(row.route.as_str())
-            }));
-    }
-    for row in rows {
-        if row.outcome != "not_submitted"
-            && snapshot
-                .jobs
-                .get(&row.job_id)
-                .is_some_and(|job| job.state == "error")
-        {
-            continue;
-        }
-        if row.needs_attention
-            || !matches!(
-                row.outcome.as_str(),
-                "matched" | "accepted" | "not_submitted"
+            AdmissionSnapshot::read_with_catalog(
+                &ledger.provider,
+                Some(&ledger.cid),
+                catalog,
+                &work,
             )
-            || ledger.route.as_deref() != Some(row.route.as_str())
-        {
-            continue;
+            .await?
         }
-        if ledger.effect == "not_created" && row.outcome != "not_submitted" {
-            continue;
-        }
-        let released = match runtime {
-            Some((catalog, work)) => {
-                crate::store::pinning::legacy_migration::release_history_catalog(
-                    catalog,
-                    &ledger.provider,
-                    &ledger.cid,
-                    work,
-                )
-                .await
-                .map_err(crate::store::pinning::management::admission::work_error)?
-            }
-            None => {
-                crate::store::pinning::legacy_migration::release_history(
-                    db,
-                    &ledger.provider,
-                    &ledger.cid,
-                )
-                .await?
-            }
-        };
-        if !released
-            .iter()
-            .any(|history| history.epoch >= row.remote_epoch)
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+        None => AdmissionSnapshot::read_resource(db, &ledger.provider, &ledger.cid).await?,
+    };
+    Ok(snapshot.held_known(ledger))
 }
 
 pub async fn matching_pin_held<C: ConnectionTrait>(

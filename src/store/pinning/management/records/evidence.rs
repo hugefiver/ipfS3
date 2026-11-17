@@ -203,17 +203,19 @@ impl Evidence {
             .map_err(|_| ManagementError::InvalidEvidence)
     }
     pub(super) fn check_remaining(&self, rows: usize, bytes: usize) -> Result<()> {
-        if self
+        let total_rows = self
             .rows
             .len()
             .checked_add(self.locators.len())
             .and_then(|n| n.checked_add(self.reserved_rows))
             .and_then(|n| n.checked_add(rows))
-            .is_none_or(|n| n > native::MAX_ROWS)
-            || self
-                .bytes
-                .checked_add(bytes)
-                .is_none_or(|n| n > native::MAX_BYTES)
+            .ok_or(ManagementError::Budget)?;
+        let total_bytes = self
+            .bytes
+            .checked_add(bytes)
+            .ok_or(ManagementError::Budget)?;
+        if !self.budget()?.is_publication()
+            && (total_rows > native::MAX_ROWS || total_bytes > native::MAX_BYTES)
         {
             return Err(ManagementError::Budget);
         }

@@ -34,7 +34,9 @@ pub(crate) fn archived_catalog(versions: &[String]) -> Result<&'static [NativeTa
         }
         tables
     });
-    if versions == *VERSIONS {
+    if versions == *VERSIONS
+        || crate::store::migrations::history::has_current_pinning_layout(versions)
+    {
         return Ok(current_catalog());
     }
     if versions == [crate::store::migrations::baseline::VERSION]

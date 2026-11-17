@@ -2,6 +2,7 @@
 pub const M13: &str = "m20261013_000001_zip_root_logical_release";
 pub const M17: &str = "m20261017_000001_management_storage";
 pub const M23: &str = "m20261023_000001_inline_documents";
+pub const CURRENT_PINNING: &str = super::m20261108_000001_current_pinning_config::VERSION;
 pub const VERSIONS: &[&str] = &[
     "m20250701_000001_init",
     "m20260707_000001_decompress_zip",
@@ -61,14 +62,24 @@ pub fn is_m23(versions: &[String]) -> bool {
     versions.len() == VERSIONS.len() && is_prefix(versions)
 }
 
-/// Layout-only predicate for immutable historical documents.
-pub fn has_final_layout(versions: &[String]) -> bool {
-    versions == [super::baseline::VERSION]
+pub fn has_current_pinning_layout(versions: &[String]) -> bool {
+    versions
+        == [
+            super::baseline::VERSION,
+            super::m20261108_000001_current_pinning_config::VERSION,
+        ]
         || versions
             == [
                 super::baseline::VERSION,
                 super::m20261108_000001_current_pinning_config::VERSION,
+                super::m20261109_000001_pin_cid_comparisons::VERSION,
             ]
+}
+
+/// Layout-only predicate for immutable historical documents.
+pub fn has_final_layout(versions: &[String]) -> bool {
+    versions == [super::baseline::VERSION]
+        || has_current_pinning_layout(versions)
         || is_m23(versions)
 }
 

@@ -83,6 +83,9 @@ fn limits() -> ProviderLimitMap {
 }
 
 async fn history(db: &DatabaseConnection, cid: &str) {
+    crate::store::pinning::cid_comparison::ensure_cid_comparisons(db, [cid])
+        .await
+        .unwrap();
     remote_pin_ledger::Entity::insert(remote_pin_ledger::ActiveModel {
         provider: Set("pinata".into()),
         cid: Set(cid.into()),
@@ -145,61 +148,94 @@ async fn bounded_allocation_rejects_ledger_only_alias_without_a_remote() {
 }
 
 #[tokio::test]
-async fn object_allocation_frontier_uses_remaining_publication_work() {
-    frontier_remaining_work(false).await;
+async fn non_rpc_allocation_preserves_the_original_cid() {
+    let (store, _) = fixture("pinata-v3").await;
+    history(store.db(), ALIAS).await;
+    assert_eq!(
+        ledger::allocation_cid(store.db(), "pinata", ALIAS)
+            .await
+            .unwrap(),
+        ALIAS
+    );
+    let session = SharedDecodeBudget::default();
+    let work = DecodeWork::shared(&session);
+    let tx = store.begin_runtime(work).await.unwrap();
+    assert_eq!(
+        ledger::allocation_cid_with_work(&tx.catalog(work), "pinata", ALIAS, work)
+            .await
+            .unwrap(),
+        ALIAS
+    );
+    tx.rollback().await.unwrap();
 }
 
 #[tokio::test]
-async fn zip_allocation_frontier_uses_remaining_publication_work() {
-    frontier_remaining_work(true).await;
+async fn allocation_rejects_supported_multibase_aliases_from_each_history_table() {
+    let canonical = crate::pinning::provider::canonical_resource_cid(ALIAS).unwrap();
+    let cid = cid::Cid::try_from(canonical.as_str()).unwrap();
+    let v1_base58 = cid::multibase::encode(cid::multibase::Base::Base58Btc, cid.to_bytes());
+    for (table, alias) in [("remote", ALIAS), ("ledger", v1_base58.as_str())] {
+        let (store, _) = fixture("kubo").await;
+        crate::store::pinning::cid_comparison::ensure_cid_comparisons(store.db(), [alias])
+            .await
+            .unwrap();
+        if table == "remote" {
+            remote_pin::Entity::insert(remote_pin::ActiveModel {
+                provider: Set("pinata".into()),
+                cid: Set(alias.into()),
+                cid_size: Set(7),
+                epoch: Set(1),
+                status: Set("reserved".into()),
+                failure_attempts: Set(0),
+                last_touched_at: Set(Utc::now()),
+                ..Default::default()
+            })
+            .exec(store.db())
+            .await
+            .unwrap();
+        } else {
+            history(store.db(), alias).await;
+        }
+        assert!(matches!(
+            ledger::allocation_cid(store.db(), "pinata", &canonical).await,
+            Err(AppError::InvalidPinningRequest(_))
+        ));
+        let session = SharedDecodeBudget::default();
+        let work = DecodeWork::shared(&session);
+        let tx = store.begin_runtime(work).await.unwrap();
+        assert!(matches!(
+            ledger::allocation_cid_with_work(&tx.catalog(work), "pinata", &canonical, work).await,
+            Err(AppError::InvalidPinningRequest(_))
+        ));
+        tx.rollback().await.unwrap();
+    }
 }
 
-async fn frontier_remaining_work(zip: bool) {
-    for profile in ["kubo", "cluster-rest"] {
-        let (store, identity) = fixture(profile).await;
-        let request = request(ALIAS);
-        let selection = selected(&request, &identity);
-        {
-            let session = SharedDecodeBudget::default();
-            let work = DecodeWork::shared(&session);
-            let tx = store.begin_runtime(work).await.unwrap();
-            let owner = PublicationTransaction::Runtime(tx, session.clone());
-            work.with(|session| {
-                session.consume(0, crate::pinning::management::wire::MAX_WIRE_BYTES - 1)
-            })
-            .unwrap();
-            let result = if zip {
-                let mut maintenance =
-                    crate::store::zip::publication_lease::PublicationLease::start(
-                        owner.db(),
-                        None,
-                        "frontier",
-                    )
-                    .await
-                    .unwrap();
-                super::zip::allocation::attachment_pairs(
-                    &owner,
-                    &selection,
-                    &limits(),
-                    &mut maintenance,
-                    work,
-                )
-                .await
-            } else {
-                publication_attachment_pairs(&owner, &request, &[], &limits(), work).await
-            };
-            assert!(
-                matches!(result, Err(AppError::ManagementBudget)),
-                "zip={zip}: {result:?}"
-            );
-            owner.into_db().rollback().await.unwrap();
-        }
-        assert_eq!(object::Entity::find().count(store.db()).await.unwrap(), 0);
-        assert_eq!(
-            remote_pin::Entity::find().count(store.db()).await.unwrap(),
-            0
-        );
-    }
+#[tokio::test]
+async fn allocation_ignores_invalid_history_and_stale_comparison_rows() {
+    let (store, _) = fixture("kubo").await;
+    let canonical = crate::pinning::provider::canonical_resource_cid(ALIAS).unwrap();
+    crate::store::pinning::cid_comparison::ensure_cid_comparisons(store.db(), [ALIAS, "not-a-cid"])
+        .await
+        .unwrap();
+    history(store.db(), "not-a-cid").await;
+
+    assert_eq!(
+        ledger::allocation_cid(store.db(), "pinata", &canonical)
+            .await
+            .unwrap(),
+        canonical
+    );
+    let session = SharedDecodeBudget::default();
+    let work = DecodeWork::shared(&session);
+    let tx = store.begin_runtime(work).await.unwrap();
+    assert_eq!(
+        ledger::allocation_cid_with_work(&tx.catalog(work), "pinata", &canonical, work)
+            .await
+            .unwrap(),
+        canonical
+    );
+    tx.rollback().await.unwrap();
 }
 
 #[tokio::test]
@@ -212,6 +248,12 @@ async fn object_and_zip_frontiers_preserve_canonical_keys_and_reject_both_alias_
                 "canonical" => history(store.db(), &canonical).await,
                 "ledger_alias" => history(store.db(), ALIAS).await,
                 "remote_alias" => {
+                    crate::store::pinning::cid_comparison::ensure_cid_comparisons(
+                        store.db(),
+                        [ALIAS],
+                    )
+                    .await
+                    .unwrap();
                     remote_pin::Entity::insert(remote_pin::ActiveModel {
                         provider: Set("pinata".into()),
                         cid: Set(ALIAS.into()),
@@ -264,7 +306,7 @@ async fn object_and_zip_frontiers_preserve_canonical_keys_and_reject_both_alias_
 }
 
 #[tokio::test]
-async fn ledger_history_frontier_fails_closed_with_only_remaining_work_and_rolls_back() {
+async fn unrelated_ledger_history_does_not_consume_remaining_allocation_work() {
     use crate::store::pinning::management::{
         native::meter::Budget, records::ReadSession, transaction::CancellationToken,
     };
@@ -286,22 +328,30 @@ async fn ledger_history_frontier_fails_closed_with_only_remaining_work_and_rolls
             .await
             .unwrap();
         let original = cid::Cid::try_from(ALIAS).unwrap().to_bytes();
-        let rows = (0..=255)
+        let original_last = *original.last().unwrap();
+        let historical_cids = (0..=255)
+            .filter(|index| *index != original_last)
             .map(|index| {
                 let mut bytes = original.clone();
                 let last = bytes.len() - 1;
                 bytes[last] = index;
-                let cid = cid::Cid::try_from(bytes.as_slice()).unwrap();
-                remote_pin_ledger::ActiveModel {
-                    provider: Set("pinata".into()),
-                    cid: Set(cid.to_string()),
-                    route: Set(None),
-                    ownership: Set("unknown".into()),
-                    effect: Set("absent".into()),
-                    ..Default::default()
-                }
+                cid::Cid::try_from(bytes.as_slice()).unwrap().to_string()
             })
             .collect::<Vec<_>>();
+        let rows = historical_cids
+            .iter()
+            .map(|cid| remote_pin_ledger::ActiveModel {
+                provider: Set("pinata".into()),
+                cid: Set(cid.clone()),
+                route: Set(None),
+                ownership: Set("unknown".into()),
+                effect: Set("absent".into()),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        crate::store::pinning::cid_comparison::ensure_cid_comparisons(owner.db(), &historical_cids)
+            .await
+            .unwrap();
         remote_pin_ledger::Entity::insert_many(rows)
             .exec(owner.db())
             .await
@@ -325,9 +375,13 @@ async fn ledger_history_frontier_fails_closed_with_only_remaining_work_and_rolls
         } else {
             publication_attachment_pairs(&owner, &request, &[], &limits(), work).await
         };
-        assert!(
-            matches!(result, Err(AppError::ManagementBudget)),
-            "zip={zip}: {result:?}"
+        assert_eq!(
+            result.unwrap(),
+            vec![(
+                "pinata".into(),
+                crate::pinning::provider::canonical_resource_cid(ALIAS).unwrap(),
+            )],
+            "zip={zip}"
         );
         owner.into_db().rollback().await.unwrap();
         assert_eq!(
@@ -339,6 +393,38 @@ async fn ledger_history_frontier_fails_closed_with_only_remaining_work_and_rolls
         );
         assert_eq!(object::Entity::find().count(store.db()).await.unwrap(), 0);
     }
+}
+
+#[tokio::test]
+async fn publication_writes_the_remote_ledger_and_comparison_identity_together() {
+    let (store, _) = fixture("kubo").await;
+    application::publish_object(&store, request(ALIAS), &limits())
+        .await
+        .unwrap();
+    let canonical = crate::pinning::provider::canonical_resource_cid(ALIAS).unwrap();
+    let comparison = crate::store::pinning::cid_comparison::Entity::find_by_id(canonical.clone())
+        .one(store.db())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        comparison.canonical_cid.as_deref(),
+        Some(canonical.as_str())
+    );
+    assert!(
+        remote_pin::Entity::find_by_id(("pinata".to_owned(), canonical.clone()))
+            .one(store.db())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        remote_pin_ledger::Entity::find_by_id(("pinata".to_owned(), canonical))
+            .one(store.db())
+            .await
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[tokio::test]

@@ -880,10 +880,7 @@ async fn admission_schema_returns_exact_prefixes_and_does_not_cache_historical_a
     );
     assert_eq!(
         current,
-        [
-            crate::store::migrations::baseline::VERSION,
-            management_schema::VERSION
-        ]
+        crate::store::pinning::management::native::current_versions()
     );
     assert_eq!(
         current.last().map(String::as_str),

@@ -1,6 +1,6 @@
 //! Typed private decoding without an intermediate JSON value tree.
 use super::*;
-use serde::de::{DeserializeOwned, MapAccess, SeqAccess, Visitor};
+use serde::de::{DeserializeOwned, IgnoredAny, MapAccess, SeqAccess, Visitor};
 
 /// Streaming serialization measurement; no serialized document is retained.
 pub(in crate::store::pinning::management::records) fn measure<T: Serialize + ?Sized>(
@@ -159,19 +159,11 @@ pub(in crate::store::pinning::management::records) fn charge_json_scan(
 ) -> Result<()> {
     budget.bytes(input.len())?;
     let (_, _, scratch) = string_allocations(input.as_bytes());
-    // check_structure uses deserialize_any, so escaped strings need scratch.
     budget.bytes(scratch)?;
-    budget.nodes(count_nodes(
-        input.as_bytes(),
-        crate::pinning::management::wire::MAX_WIRE_NODES,
-    )?)?;
-    crate::pinning::management::wire::check_structure(input.as_bytes()).map_err(|error| {
-        if error == crate::pinning::management::SafeError::LimitExceeded {
-            ManagementError::Budget
-        } else {
-            ManagementError::InvalidEvidence
-        }
-    })?;
+    let node_limit =
+        (!budget.is_publication()).then_some(crate::pinning::management::wire::MAX_WIRE_NODES);
+    budget.nodes(count_nodes(input.as_bytes(), node_limit)?)?;
+    check_structure(input, budget.is_publication())?;
     budget.bytes(scratch)
 }
 /// Ordinary owned serde additionally materializes output strings. Unlike typed
@@ -183,25 +175,34 @@ pub(in crate::store::pinning::management::records) fn charge_json_owned(
     charge_json_scan(input, budget)?;
     budget.bytes(string_bytes(input.as_bytes()))
 }
+
+fn check_structure(input: &str, publication: bool) -> Result<()> {
+    if publication {
+        serde_json::from_str::<IgnoredAny>(input)
+            .map(|_| ())
+            .map_err(|_| ManagementError::InvalidEvidence)
+    } else {
+        crate::pinning::management::wire::check_structure(input.as_bytes()).map_err(|error| {
+            if error == crate::pinning::management::SafeError::LimitExceeded {
+                ManagementError::Budget
+            } else {
+                ManagementError::InvalidEvidence
+            }
+        })
+    }
+}
+
 fn deserialize_typed<T: DeserializeOwned>(
     unpacked: &str,
     budget: &mut evidence::Budget,
 ) -> Result<T> {
-    budget.nodes(count_nodes(
-        unpacked.as_bytes(),
-        crate::pinning::management::wire::MAX_WIRE_NODES,
-    )?)?;
+    let publication = budget.is_publication();
+    let node_limit = (!publication).then_some(crate::pinning::management::wire::MAX_WIRE_NODES);
+    budget.nodes(count_nodes(unpacked.as_bytes(), node_limit)?)?;
     budget.nodes(keys(unpacked.as_bytes()))?;
     let (strings, key_bytes, scratch) = string_allocations(unpacked.as_bytes());
-    // Structural preflight decodes escaped strings into scratch.
     budget.bytes(scratch)?;
-    crate::pinning::management::wire::check_structure(unpacked.as_bytes()).map_err(|error| {
-        if error == crate::pinning::management::SafeError::LimitExceeded {
-            ManagementError::Budget
-        } else {
-            ManagementError::InvalidEvidence
-        }
-    })?;
+    check_structure(unpacked, publication)?;
     // Unique needs scratch and owned map keys; its values retain no output.
     budget.bytes(scratch)?;
     budget.bytes(key_bytes)?;

@@ -200,6 +200,7 @@ impl ScopedRead {
                 .into_iter()
                 .map(std::sync::Arc::new)
                 .collect(),
+            publication: budget.is_publication(),
         };
         for (key, original) in self.rows {
             let table = frame
@@ -1036,10 +1037,14 @@ async fn read_page_reusing<C: ConnectionTrait>(
         .map(|(i, c)| format!("CAST(length({}) AS BIGINT) AS n{i}", octets(backend, c)))
         .collect::<Vec<_>>();
     projection.extend(t.primary_key.iter().enumerate().map(|(i, c)| {
-        format!(
-            "CASE WHEN length({})<=1024 THEN CAST(\"{c}\" AS TEXT) END AS k{i}",
-            octets(backend, c)
-        )
+        if budget.is_publication() {
+            format!("CAST(\"{c}\" AS TEXT) AS k{i}")
+        } else {
+            format!(
+                "CASE WHEN length({})<=1024 THEN CAST(\"{c}\" AS TEXT) END AS k{i}",
+                octets(backend, c)
+            )
+        }
     }));
     budget.charge(1, 0, 0, 0)?;
     let _metadata =
@@ -1107,7 +1112,7 @@ async fn read_page_reusing<C: ConnectionTrait>(
             sum.checked_add(usize::try_from(n.unwrap_or(0)).map_err(|_| ManagementError::Budget)?)
                 .ok_or(ManagementError::Budget)
         })?;
-        if bytes > PAGE_BYTES && !upgrade {
+        if bytes > PAGE_BYTES && !upgrade && !budget.is_publication() {
             return Err(ManagementError::Budget);
         }
         if payload + bytes > PAGE_BYTES && !page.rows.is_empty() {

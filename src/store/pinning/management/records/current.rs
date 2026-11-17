@@ -84,13 +84,23 @@ pub(crate) async fn current_management_rows<C: ConnectionTrait>(
         .iter()
         .map(|column| (column.as_str(), column.as_str()))
         .collect::<Vec<_>>();
+    let limits = if work.with(|session| Ok(session.is_publication()))? {
+        (0, 0)
+    } else {
+        (
+            native::MAX_ROWS
+                .checked_sub(result.len())
+                .ok_or(ManagementError::Budget)?,
+            native::MAX_BYTES,
+        )
+    };
     let (rows, bytes) = index::bounded_projection(
         db,
         &format!("FROM pin_management_records WHERE {predicate}"),
         &columns,
         "database_scope,plan_id,item_id,kind",
         values,
-        (native::MAX_ROWS - result.len(), native::MAX_BYTES),
+        limits,
         work,
     )
     .await?;
@@ -208,6 +218,46 @@ where
         .find(|table| table.table == name)
         .ok_or(ManagementError::Schema)?;
     let backend = db.get_database_backend();
+    if work.with(|session| Ok(session.is_publication()))? {
+        let fields = table
+            .columns
+            .iter()
+            .map(|column| format!("\"{name}\".\"{column}\" AS \"{column}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let limit_clause = if limit < native::MAX_ROWS {
+            format!(
+                " LIMIT {}",
+                limit.checked_add(1).ok_or(ManagementError::Budget)?
+            )
+        } else {
+            String::new()
+        };
+        let rows = db
+            .query_all(Statement::from_sql_and_values(
+                backend,
+                format!("SELECT {fields} {source} ORDER BY {order}{limit_clause}"),
+                values,
+            ))
+            .await
+            .map_err(|_| ManagementError::Database)?;
+        if limit < native::MAX_ROWS && rows.len() > limit {
+            return Err(ManagementError::Budget);
+        }
+        work.index_cells(
+            rows.len()
+                .checked_mul(table.columns.len())
+                .ok_or(ManagementError::Budget)?,
+            0,
+        )?;
+        work.with(|work| work.nodes(1 + rows.len()))?;
+        return rows
+            .into_iter()
+            .map(|row| {
+                E::Model::from_query_result(&row, "").map_err(|_| ManagementError::InvalidEvidence)
+            })
+            .collect();
+    }
     let terms = table
         .columns
         .iter()

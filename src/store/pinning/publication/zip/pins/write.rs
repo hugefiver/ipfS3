@@ -72,9 +72,19 @@ impl PinWriteSet {
             .await?;
         let (inserted, updated) = changes(&self.before.remotes, &self.remotes);
         sql::update::<remote_pin::Entity, _>(db, &updated, work, Some(maintenance)).await?;
+        crate::store::pinning::cid_comparison::ensure_cid_comparisons(
+            db,
+            inserted.iter().map(|row| row.cid.as_str()),
+        )
+        .await?;
         sql::insert::<remote_pin::Entity, _>(db, &inserted, work, Some(maintenance)).await?;
         let (inserted, updated) = changes(&self.before.ledgers, &self.ledgers);
         sql::update::<remote_pin_ledger::Entity, _>(db, &updated, work, Some(maintenance)).await?;
+        crate::store::pinning::cid_comparison::ensure_cid_comparisons(
+            db,
+            inserted.iter().map(|row| row.cid.as_str()),
+        )
+        .await?;
         sql::insert::<remote_pin_ledger::Entity, _>(db, &inserted, work, Some(maintenance)).await?;
         let (inserted, updated) = changes(&self.before.targets, &self.targets);
         sql::update::<pin_lease_target::Entity, _>(db, &updated, work, Some(maintenance)).await?;
@@ -241,24 +251,22 @@ impl PinWriteSet {
         reservations: &R,
         work: DecodeWork<'_>,
     ) -> AppResult<()> {
-        let providers = self
+        let pairs = self
             .before
             .pairs
             .iter()
-            .map(|(provider, _)| provider.clone())
-            .chain(self.before.barriers.keys().cloned())
-            .chain(self.before.jobs.values().map(|job| job.provider.clone()))
+            .cloned()
+            .chain(
+                self.before
+                    .jobs
+                    .values()
+                    .map(|job| (job.provider.clone(), job.cid.clone())),
+            )
             .collect();
+        let job_ids = self.before.jobs.keys().cloned().collect();
         let mut resident = Vec::new();
-        let evidence = PinEvidence::load(
-            reservations,
-            &providers,
-            &self.before.pairs,
-            work,
-            &mut resident,
-            None,
-        )
-        .await?;
+        let evidence =
+            PinEvidence::load(reservations, &pairs, &job_ids, work, &mut resident, None).await?;
         if evidence != self.before.evidence {
             return Err(invalid());
         }

@@ -132,7 +132,11 @@ pub async fn upgrade_existing(
     use super::pinning::management::schema;
     if !matches!(
         request.source_version,
-        legacy::M13 | legacy::M17 | legacy::M23 | super::migrations::baseline::VERSION
+        legacy::M13
+            | legacy::M17
+            | legacy::M23
+            | legacy::CURRENT_PINNING
+            | super::migrations::baseline::VERSION
     ) || request.target_version != schema::VERSION
     {
         return Err(required());
@@ -185,12 +189,21 @@ async fn prepare_upgrade(
     let mut needs_backfill = false;
     if preparing {
         let old_baseline = versions == [super::migrations::baseline::VERSION];
-        let old_final = legacy::is_m23(&versions) || old_baseline;
+        let old_current = versions
+            == [
+                super::migrations::baseline::VERSION,
+                super::migrations::m20261108_000001_current_pinning_config::VERSION,
+            ];
+        let old_final = legacy::is_m23(&versions) || old_baseline || old_current;
         if old_baseline {
             if !matches!(
                 request.source_version,
                 super::migrations::baseline::VERSION | legacy::M13 | legacy::M17
             ) {
+                return Err(required());
+            }
+        } else if old_current {
+            if request.source_version != legacy::CURRENT_PINNING {
                 return Err(required());
             }
         } else {
@@ -240,16 +253,22 @@ async fn prepare_upgrade(
                 return Err(required());
             }
             needs_backfill = state == "backfill";
-            schema::validate_m23_layout(tx, needs_backfill)
-                .await
-                .map_err(|_| required())?;
+            if old_current {
+                schema::validate_previous_current(tx)
+                    .await
+                    .map_err(|_| required())?;
+            } else {
+                schema::validate_m23_layout(tx, needs_backfill)
+                    .await
+                    .map_err(|_| required())?;
+            }
             if request.source_version == legacy::M23
                 || request.source_version == super::migrations::baseline::VERSION
             {
                 if needs_backfill {
                     return Err(required());
                 }
-            } else {
+            } else if request.source_version != legacy::CURRENT_PINNING {
                 // The old target is immutable evidence, not an alias of the new one.
                 history::upgrade_stamp(
                     tx,
@@ -278,7 +297,10 @@ async fn prepare_upgrade(
             .await?;
             needs_backfill = true;
         }
-        super::migrations::m20261108_000001_current_pinning_config::install(tx).await?;
+        if !old_current {
+            super::migrations::m20261108_000001_current_pinning_config::install(tx).await?;
+        }
+        super::migrations::m20261109_000001_pin_cid_comparisons::install(tx).await?;
         tx.execute_unprepared("DELETE FROM seaql_migrations")
             .await?;
         for version in &known {

@@ -588,7 +588,7 @@ pub(crate) async fn seal_originals(
     keys: &[native::NativeKey],
     work: DecodeWork<'_>,
 ) -> Result<()> {
-    let mut budget = native::meter::Budget::default();
+    let mut budget = work.with(|session| session.storage_budget())?;
     let result = async {
         for key in keys {
             locator::rebuild_source(tx, key, &mut budget).await?;

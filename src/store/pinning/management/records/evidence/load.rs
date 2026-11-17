@@ -453,6 +453,52 @@ impl Evidence {
             .find(|table| table.table == super::super::super::schema::RECORDS)
             .ok_or(ManagementError::Schema)?;
         let backend = db.get_database_backend();
+        if self.budget()?.is_publication() {
+            let fields = table
+                .columns
+                .iter()
+                .map(|column| format!("CAST(\"{column}\" AS TEXT) AS \"{column}\""))
+                .collect::<Vec<_>>()
+                .join(",");
+            let actual = db
+                .query_all(Statement::from_sql_and_values(
+                    backend,
+                    format!(
+                        "SELECT {fields} FROM pin_management_records WHERE {predicate} ORDER BY item_id"
+                    ),
+                    values,
+                ))
+                .await
+                .map_err(|_| ManagementError::Database)?;
+            return actual
+                .into_iter()
+                .map(|row| {
+                    let original = table
+                        .columns
+                        .iter()
+                        .map(|column| {
+                            Ok((
+                                column.clone(),
+                                row.try_get::<Option<String>>("", column)
+                                    .map_err(|_| ManagementError::InvalidEvidence)?,
+                            ))
+                        })
+                        .collect::<Result<native::NativeRow>>()?;
+                    let bytes = original
+                        .values()
+                        .flatten()
+                        .try_fold(0usize, |total, value| {
+                            total
+                                .checked_add(value.len())
+                                .ok_or(ManagementError::Budget)
+                        })?;
+                    let mut work = self.budget()?;
+                    work.index_cells(table.columns.len(), bytes)?;
+                    work.copy(&table.columns)?;
+                    Ok(original)
+                })
+                .collect();
+        }
         let terms = table
             .columns
             .iter()

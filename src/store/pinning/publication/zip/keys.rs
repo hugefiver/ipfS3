@@ -6,15 +6,12 @@ use crate::{
         identity::{ProviderRouteSnapshot, RemoteResourceType},
         zip_policy::{CapturedZipIntent, ZipIntentSelection},
     },
-    store::{
-        entities::{remote_pin, remote_pin_ledger},
-        pinning::{
-            management::{admission::work_error, records::DecodeWork},
-            publication,
-        },
+    store::pinning::{
+        management::{admission::work_error, records::DecodeWork},
+        publication,
     },
 };
-use sea_orm::ConnectionTrait;
+use sea_orm::{ConnectionTrait, Statement};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) struct AllocationKeys {
@@ -23,7 +20,50 @@ pub(super) struct AllocationKeys {
     pub enabled: BTreeSet<String>,
     pub canonical: BTreeMap<(String, String), String>,
     pub pairs: Vec<(String, String)>,
-    _resident: crate::store::pinning::management::native::meter::ResidentGuard,
+}
+
+async fn reject_historical_aliases<C: ConnectionTrait>(
+    db: &C,
+    expected: &BTreeMap<String, BTreeSet<String>>,
+    work: DecodeWork<'_>,
+    mut maintenance: Option<&mut super::PublicationLease<'_>>,
+) -> AppResult<()> {
+    for (provider, cids) in expected {
+        for chunk in cids.iter().collect::<Vec<_>>().chunks(sql::PARAMS - 1) {
+            if let Some(lease) = maintenance.as_deref_mut() {
+                lease.checkpoint(db).await?;
+            }
+            sql::charge(
+                work,
+                crate::store::pinning::management::native::meter::WorkMeter {
+                    sql: 1,
+                    ..Default::default()
+                },
+            )?;
+            let mut values = vec![provider.as_str().into()];
+            values.extend(chunk.iter().map(|cid| cid.as_str().into()));
+            let row = db
+                .query_one(Statement::from_sql_and_values(
+                    db.get_database_backend(),
+                    format!(
+                        "SELECT 1 AS present FROM pin_cid_comparisons comparison \
+                         WHERE comparison.canonical_cid IN ({}) \
+                         AND comparison.cid<>comparison.canonical_cid \
+                         AND (EXISTS(SELECT 1 FROM remote_pins remote \
+                             WHERE remote.provider=$1 AND remote.cid=comparison.cid) \
+                         OR EXISTS(SELECT 1 FROM remote_pin_ledger ledger \
+                             WHERE ledger.provider=$1 AND ledger.cid=comparison.cid)) LIMIT 1",
+                        sql::slots(chunk.len(), 1)
+                    ),
+                    values,
+                ))
+                .await?;
+            if row.is_some() {
+                return Err(invalid());
+            }
+        }
+    }
+    Ok(())
 }
 
 impl AllocationKeys {
@@ -76,73 +116,19 @@ impl AllocationKeys {
             }
             canonical.insert((provider, cid), key);
         }
-        for (provider, expected) in expected {
-            let mut resident = Vec::new();
-            let remotes = sql::read::<remote_pin::Entity, _>(
-                db,
-                "provider=$1",
-                vec![provider.clone().into()],
-                "cid",
-                work,
-                &mut resident,
-                maintenance.as_deref_mut(),
-            )
-            .await?;
-            let ledgers = sql::read::<remote_pin_ledger::Entity, _>(
-                db,
-                "provider=$1",
-                vec![provider.into()],
-                "cid",
-                work,
-                &mut resident,
-                maintenance.as_deref_mut(),
-            )
-            .await?;
-            for old in remotes
-                .iter()
-                .map(|r| &r.cid)
-                .chain(ledgers.iter().map(|r| &r.cid))
-            {
-                if let Ok(key) = crate::pinning::provider::canonical_resource_cid(old)
-                    && old != &key
-                    && expected.contains(&key)
-                {
-                    return Err(invalid());
-                }
-            }
-        }
+        reject_historical_aliases(db, &expected, work, maintenance.as_deref_mut()).await?;
         let pairs = canonical
             .iter()
             .map(|((provider, _), cid)| (provider.clone(), cid.clone()))
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
-        let bytes = canonical
-            .iter()
-            .try_fold(0usize, |total, ((provider, raw), cid)| {
-                total
-                    .checked_add(provider.len())
-                    .and_then(|n| n.checked_add(raw.len()))
-                    .and_then(|n| n.checked_add(cid.len()))
-                    .and_then(|n| n.checked_add(192))
-                    .ok_or(crate::error::AppError::ManagementBudget)
-            })?
-            .checked_add(
-                routes
-                    .len()
-                    .checked_mul(2048)
-                    .ok_or(crate::error::AppError::ManagementBudget)?,
-            )
-            .and_then(|n| n.checked_add(limits.len().checked_mul(256)?))
-            .ok_or(crate::error::AppError::ManagementBudget)?;
-        let resident = sql::retain_copy(work, bytes)?;
         Ok(Self {
             limits,
             routes,
             enabled,
             canonical,
             pairs,
-            _resident: resident,
         })
     }
 
@@ -164,41 +150,6 @@ impl AllocationKeys {
                     .insert(cid.clone());
             }
         }
-        for (provider, expected) in expected {
-            let mut resident = Vec::new();
-            let remotes = sql::read::<remote_pin::Entity, _>(
-                db,
-                "provider=$1",
-                vec![provider.clone().into()],
-                "cid",
-                work,
-                &mut resident,
-                maintenance.as_deref_mut(),
-            )
-            .await?;
-            let ledgers = sql::read::<remote_pin_ledger::Entity, _>(
-                db,
-                "provider=$1",
-                vec![provider.into()],
-                "cid",
-                work,
-                &mut resident,
-                maintenance.as_deref_mut(),
-            )
-            .await?;
-            for old in remotes
-                .iter()
-                .map(|row| &row.cid)
-                .chain(ledgers.iter().map(|row| &row.cid))
-            {
-                if let Ok(canonical) = crate::pinning::provider::canonical_resource_cid(old)
-                    && old != &canonical
-                    && expected.contains(&canonical)
-                {
-                    return Err(invalid());
-                }
-            }
-        }
-        Ok(())
+        reject_historical_aliases(db, &expected, work, maintenance.as_deref_mut()).await
     }
 }

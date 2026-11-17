@@ -43,6 +43,14 @@ impl ValidationContext {
         result
     }
     pub(crate) fn point(&mut self) -> Result<()> {
+        if self
+            .decoding
+            .lock()
+            .map_err(|_| ManagementError::InvalidEvidence)?
+            .is_publication()
+        {
+            return Ok(());
+        }
         self.points = self.points.checked_add(1).ok_or(ManagementError::Budget)?;
         if self.points > native::MAX_ROWS {
             return Err(ManagementError::Budget);

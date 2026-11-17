@@ -380,37 +380,6 @@ impl CapturedZipIntent {
         providers
     }
 
-    /// Read-only qualification for a safety veto, not a publication binding or
-    /// lease selection. It uses the same policy choice and availability checks.
-    pub(crate) fn automatic_output_eligible(&self, kind: ZipOutputKind, key: &str) -> bool {
-        let targeted = match kind {
-            ZipOutputKind::Source => self.controls.targets.source,
-            ZipOutputKind::Extracted => self.controls.targets.extracted,
-        };
-        if !targeted {
-            return false;
-        }
-        match self.selection_semantics() {
-            CaptureSemantics::Current => {
-                self.policy
-                    .choose(&self.bucket, key)
-                    .0
-                    .is_some_and(|policy| {
-                        policy.policy.trigger == PolicyTrigger::Always && policy.available()
-                    })
-            }
-            CaptureSemantics::LegacyV1 => false,
-            CaptureSemantics::LegacyV2 => self.historical_plan.as_ref().is_some_and(|plan| {
-                plan.outputs.iter().any(|old| {
-                    old.kind == kind
-                        && old.output.bucket == self.bucket
-                        && old.output.key == key
-                        && !old.intents.is_empty()
-                })
-            }),
-        }
-    }
-
     /// Frozen effective options for fingerprint/persist/replay adapters. No
     /// adapter needs to derive targets or consult current defaults a second time.
     pub fn v2_options(&self) -> Option<crate::zip::options::ZipV2Options> {

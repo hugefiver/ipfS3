@@ -262,6 +262,126 @@ async fn additional_inline_constraints_refuse_rebuild_without_weakening_data_gua
     }
 }
 
+#[tokio::test]
+async fn previous_current_upgrade_backfills_cid_comparisons_without_rekeying_history() {
+    let (_directory, db) = baseline().await;
+    Migrator::up(&db, Some(1)).await.unwrap();
+    let v0 = "QmYwAPJzv5CZsnAzt8auVTL7VYhESWDFoCPTqCkiP6fKGE";
+    let canonical = crate::pinning::provider::canonical_resource_cid(v0).unwrap();
+    let parsed = cid::Cid::try_from(canonical.as_str()).unwrap();
+    let base58 = cid::multibase::encode(cid::multibase::Base::Base58Btc, parsed.to_bytes());
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "INSERT INTO remote_pins(provider,cid,cid_size,status,epoch,last_touched_at) VALUES ('remote',$1,1,'reserved',1,CURRENT_TIMESTAMP)",
+        [v0.into()],
+    ))
+    .await
+    .unwrap();
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "INSERT INTO remote_pin_ledger(provider,cid,ownership,effect) VALUES ('ledger',$1,'unknown','absent')",
+        [base58.clone().into()],
+    ))
+    .await
+    .unwrap();
+    db.execute_unprepared("INSERT INTO remote_pin_ledger(provider,cid,ownership,effect) VALUES ('invalid','not-a-cid','unknown','absent')")
+        .await
+        .unwrap();
+    let (scope, identity) = native::scope::binding(&db).await.unwrap();
+    initialization::upgrade_existing(
+        &db,
+        initialization::UpgradeRequest {
+            native_identity: &identity,
+            database_scope: &scope,
+            source_version: super::history::CURRENT_PINNING,
+            target_version: schema::VERSION,
+        },
+    )
+    .await
+    .unwrap();
+    initialization::open(&db).await.unwrap();
+
+    for alias in [v0, base58.as_str()] {
+        let row = db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "SELECT canonical_cid FROM pin_cid_comparisons WHERE cid=$1",
+                [alias.into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.try_get::<String>("", "canonical_cid").unwrap(),
+            canonical
+        );
+    }
+    let invalid = db
+        .query_one(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "SELECT canonical_cid FROM pin_cid_comparisons WHERE cid='not-a-cid'",
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        invalid
+            .try_get::<Option<String>>("", "canonical_cid")
+            .unwrap()
+            .is_none()
+    );
+    let versions = db
+        .query_all(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "SELECT version FROM seaql_migrations ORDER BY version",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(versions.len(), 3);
+    assert_eq!(
+        versions
+            .last()
+            .unwrap()
+            .try_get::<String>("", "version")
+            .unwrap(),
+        schema::VERSION
+    );
+    let index_columns = db
+        .query_all(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "SELECT name FROM pragma_index_info('idx_pin_cid_comparisons_canonical_cid_cid') ORDER BY seqno",
+        ))
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.try_get::<String>("", "name").unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(index_columns, ["canonical_cid", "cid"]);
+    assert!(
+        native::current_catalog()
+            .iter()
+            .all(|table| table.table != "pin_cid_comparisons")
+    );
+    let old_versions = vec![
+        super::baseline::VERSION.into(),
+        super::history::CURRENT_PINNING.into(),
+    ];
+    assert!(native::archived_catalog(&old_versions).unwrap() == native::current_catalog());
+    let original_count: i64 = db
+        .query_one(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "SELECT (SELECT COUNT(*) FROM remote_pins WHERE provider='remote' AND cid=$1) + \
+             (SELECT COUNT(*) FROM remote_pin_ledger WHERE provider='ledger' AND cid=$2) AS n",
+            [v0.into(), base58.into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "n")
+        .unwrap();
+    assert_eq!(original_count, 2);
+}
+
 #[test]
 fn historical_catalog_is_not_the_current_catalog() {
     let old = native::archived_catalog(&[super::baseline::VERSION.into()]).unwrap();

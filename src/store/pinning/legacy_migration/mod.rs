@@ -37,7 +37,7 @@ pub use compat::{
     resource_key,
 };
 pub(in crate::store::pinning) use compat::{
-    identity_binding_from_catalog, resource_binding_from_catalog,
+    identity_binding_from_catalog, resource_binding_from_catalog, resource_binding_from_loaded,
 };
 pub(crate) use compat::{original_job_provider_with_work, release_history_with_work};
 pub(crate) use compat::{
@@ -52,8 +52,8 @@ pub use model::{
 };
 pub(in crate::store::pinning) use projection::R26Admission;
 pub(crate) use receipt::ReceiptCatalog;
+#[cfg(test)]
 pub(crate) use receipt::admission_historical_keys;
-pub(in crate::store::pinning) use receipt::admission_historical_keys_with_catalog;
 pub(crate) use receipt::historical_job_keys;
 pub(in crate::store::pinning) use receipt::historical_job_keys_from_catalog;
 #[cfg(test)]
@@ -63,6 +63,9 @@ pub(crate) use receipt::source_is_migrated_catalog;
 pub(crate) use receipt::source_is_migrated_with_work;
 pub(in crate::store::pinning) use receipt::work::Work as ReceiptWork;
 pub use receipt::{LegacyBinding, historical_keys, resolve_legacy_binding, source_is_migrated};
+pub(in crate::store::pinning) use receipt::{
+    admission_historical_resources_with_catalog, historical_resource_keys_from_loaded_catalog,
+};
 pub(crate) use receipt::{historical_keys_catalog, resolve_with_catalog};
 pub(crate) async fn historical_keys_budgeted<C: sea_orm::ConnectionTrait>(
     db: &C,

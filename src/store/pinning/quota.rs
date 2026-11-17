@@ -1625,6 +1625,7 @@ async fn reserve_new_remote_with_capacity<C: ConnectionTrait>(
                 }
             };
             if matches!(inserted, TryInsertResult::Inserted(_)) {
+                super::cid_comparison::ensure_cid_comparisons(db, [cid]).await?;
                 match runtime {
                     Some(tx) => {
                         super::ledger::capture_runtime_reservation(

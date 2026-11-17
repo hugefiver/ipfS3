@@ -1,3 +1,4 @@
+pub(crate) mod cid_comparison;
 pub mod decision;
 pub mod jobs;
 pub mod leases;

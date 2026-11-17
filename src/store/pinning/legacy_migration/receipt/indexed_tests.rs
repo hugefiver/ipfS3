@@ -209,7 +209,7 @@ async fn operation_projection_is_root_local_and_follows_reversal_dependencies() 
 }
 
 #[tokio::test]
-async fn candidate_operation_roots_are_empty_or_bounded_by_distinct_identity() {
+async fn candidate_operation_roots_are_empty_and_follow_distinct_identity() {
     let fixture = crate::stage7_management_test_support::Fixture::new().await;
     let work = records::SharedDecodeBudget::default();
     let context = records::DecodeWork::shared(&work);
@@ -281,13 +281,9 @@ async fn candidate_operation_roots_are_empty_or_bounded_by_distinct_identity() {
     view.classifications
         .insert(key.clone(), SourceClassification::default());
     view.proof.memberships[root].sources.push(key);
-    assert!(matches!(
-        operation_ids(&view, &selector, &context),
-        Err(ManagementError::Changed)
-    ));
-    assert!(matches!(
-        active_for_loaded(&fixture.db, &selector, &view, &context, context).await,
-        Err(ManagementError::Changed)
-    ));
+    assert_eq!(
+        operation_ids(&view, &selector, &context).unwrap().len(),
+        129
+    );
     assert_eq!(operation_ids(&view, &other, &context).unwrap().len(), 128);
 }

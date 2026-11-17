@@ -10,7 +10,7 @@ pub(crate) async fn rebuild_sources(
     keys: &std::collections::BTreeSet<native::NativeKey>,
     work: records::DecodeWork<'_>,
 ) -> Result<()> {
-    let mut budget = Budget::default();
+    let mut budget = work.with(|session| session.storage_budget())?;
     let result = records::locator::rebuild_sources(tx, keys, &mut budget).await;
     charge(&budget, work)?;
     result
@@ -22,7 +22,7 @@ pub(crate) async fn load<C: ConnectionTrait>(
     work: records::DecodeWork<'_>,
 ) -> Result<AuthorityView> {
     work.copy(selectors)?;
-    let mut budget = Budget::default();
+    let mut budget = work.with(|session| session.storage_budget())?;
     let result = records::locator::discover_authority(db, selectors, &mut budget).await;
     // Charge storage work into the outer shared session, including failed reads.
     // A sub-call cannot reset the enclosing operation's work allowance.
@@ -40,7 +40,7 @@ pub(in crate::store::pinning) async fn load_observed(
     work: records::DecodeWork<'_>,
 ) -> Result<AuthorityView> {
     work.copy(selectors)?;
-    let mut budget = Budget::default();
+    let mut budget = work.with(|session| session.storage_budget())?;
     let result =
         records::locator::discover_observed_authority(window, selectors, &mut budget).await;
     charge(&budget, work)?;
@@ -53,7 +53,7 @@ pub(in crate::store::pinning) async fn load_runtime(
     work: records::DecodeWork<'_>,
 ) -> Result<AuthorityView> {
     work.copy(selectors)?;
-    let mut budget = Budget::default();
+    let mut budget = work.with(|session| session.storage_budget())?;
     let result =
         records::locator::discover_runtime_authority(tx, selectors, &mut budget, work).await;
     charge(&budget, work)?;
@@ -66,7 +66,7 @@ pub(in crate::store::pinning) async fn load_quota(
     work: records::DecodeWork<'_>,
 ) -> Result<AuthorityView> {
     work.copy(selectors)?;
-    let mut budget = Budget::default();
+    let mut budget = work.with(|session| session.storage_budget())?;
     let result = records::locator::discover_quota_authority(window, selectors, &mut budget).await;
     charge(&budget, work)?;
     result

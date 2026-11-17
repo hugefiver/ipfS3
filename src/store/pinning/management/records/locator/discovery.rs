@@ -121,6 +121,118 @@ async fn membership<C: ConnectionTrait>(
     Ok(seals)
 }
 
+async fn read_memberships<C: ConnectionTrait>(
+    tx: &C,
+    selectors: &[AuthoritySelector],
+    budget: &mut Budget,
+) -> Result<BTreeMap<AuthoritySelector, Vec<SourceSeal>>> {
+    let mut requested = BTreeMap::new();
+    for selector in selectors {
+        let (kind, key) = selector.sql()?;
+        requested.insert((kind.to_owned(), key), selector.clone());
+    }
+    let mut predicates = Vec::new();
+    let mut values = Vec::new();
+    for (kind, key) in requested.keys() {
+        predicates.push(format!(
+            "(selector_kind=${} AND selector_key=${})",
+            values.len() + 1,
+            values.len() + 2
+        ));
+        values.push(kind.clone().into());
+        values.push(key.clone().into());
+    }
+    let key_bytes = requested.keys().try_fold(0u64, |total, (kind, key)| {
+        total
+            .checked_add((kind.len() + key.len()) as u64)
+            .ok_or(ManagementError::Budget)
+    })?;
+    budget.charge(1, 0, 0, key_bytes)?;
+    if tx
+        .query_one(Statement::from_sql_and_values(
+            tx.get_database_backend(),
+            format!(
+                "SELECT 1 FROM pin_management_pending_scope WHERE \
+                 (selector_kind='unknown' AND selector_key='*') OR ({}) LIMIT 1",
+                predicates.join(" OR ")
+            ),
+            values.clone(),
+        ))
+        .await
+        .map_err(|_| ManagementError::Database)?
+        .is_some()
+    {
+        return Err(ManagementError::Changed);
+    }
+    let _resident = budget.reserve(PAGE_ROWS * 4352)?;
+    let mut result = selectors
+        .iter()
+        .cloned()
+        .map(|selector| (selector, Vec::new()))
+        .collect::<BTreeMap<_, _>>();
+    let mut after = (String::new(), String::new(), String::new());
+    loop {
+        budget.charge(1, 0, 0, 0)?;
+        let mut page_values = values.clone();
+        page_values.extend([
+            after.0.clone().into(),
+            after.1.clone().into(),
+            after.2.clone().into(),
+        ]);
+        let after_slot = page_values.len() - 2;
+        let length = if tx.get_database_backend() == DatabaseBackend::Sqlite {
+            "length(CAST(l.source_key AS BLOB))"
+        } else {
+            "octet_length(l.source_key)"
+        };
+        let rows = tx
+            .query_all(Statement::from_sql_and_values(
+                tx.get_database_backend(),
+                format!(
+                    "SELECT l.selector_kind,l.selector_key,CASE WHEN {length}<=4096 \
+                     THEN l.source_key END AS source_key,c.source_generation,\
+                     c.locator_generation,c.sealed_source,c.sealed_locator \
+                     FROM pin_management_locator l LEFT JOIN pin_management_source_control c \
+                     ON c.source_key=l.source_key WHERE ({}) AND \
+                     (l.selector_kind,l.selector_key,l.source_key)>\
+                     (${},${},${}) ORDER BY l.selector_kind,l.selector_key,l.source_key \
+                     LIMIT {PAGE_ROWS}",
+                    predicates.join(" OR "),
+                    after_slot,
+                    after_slot + 1,
+                    after_slot + 2
+                ),
+                page_values,
+            ))
+            .await
+            .map_err(|_| ManagementError::Database)?;
+        let eof = rows.len() < PAGE_ROWS;
+        budget.charge(0, rows.len() as u64, rows.len() as u64 * 7, 0)?;
+        for row in rows {
+            let kind: String = row
+                .try_get("", "selector_kind")
+                .map_err(|_| ManagementError::Changed)?;
+            let key: String = row
+                .try_get("", "selector_key")
+                .map_err(|_| ManagementError::Changed)?;
+            let sealed = seal(&row)?;
+            budget.charge(0, 0, 0, sealed.source_key.len() as u64)?;
+            after = (kind.clone(), key.clone(), sealed.source_key.clone());
+            let selector = requested
+                .get(&(kind, key))
+                .ok_or(ManagementError::Changed)?;
+            result
+                .get_mut(selector)
+                .ok_or(ManagementError::Changed)?
+                .push(sealed);
+        }
+        if eof {
+            break;
+        }
+    }
+    Ok(result)
+}
+
 async fn exact_seal<C: ConnectionTrait>(
     tx: &C,
     key: &NativeKey,
@@ -155,7 +267,7 @@ async fn discover_validated<C: ConnectionTrait>(
     selectors: &[AuthoritySelector],
     budget: &mut Budget,
 ) -> Result<AuthorityView> {
-    if selectors.is_empty() || selectors.len() > 128 {
+    if selectors.is_empty() || !budget.is_publication() && selectors.len() > 128 {
         return Err(ManagementError::InvalidEvidence);
     }
     let (database_scope, database_identity) = scope::binding(tx).await?;
@@ -172,21 +284,31 @@ async fn discover_validated<C: ConnectionTrait>(
     let mut memberships = BTreeMap::new();
     let mut sources = BTreeMap::<NativeKey, SourceSeal>::new();
     loop {
-        while let Some(selector) = pending.pop_first() {
-            if memberships.contains_key(&selector) {
+        while !pending.is_empty() {
+            let mut batch = Vec::new();
+            while batch.len() < 128
+                && let Some(selector) = pending.pop_first()
+            {
+                if !memberships.contains_key(&selector) {
+                    batch.push(selector);
+                }
+            }
+            if batch.is_empty() {
                 continue;
             }
-            let matched = membership(tx, &selector, budget).await?;
-            let mut keys = Vec::new();
-            for seal in matched {
-                keys.push(seal.source.clone());
-                if sources.get(&seal.source).is_some_and(|old| old != &seal) {
-                    return Err(ManagementError::Changed);
+            let mut matched = read_memberships(tx, &batch, budget).await?;
+            for selector in batch {
+                let mut keys = Vec::new();
+                for seal in matched.remove(&selector).ok_or(ManagementError::Changed)? {
+                    keys.push(seal.source.clone());
+                    if sources.get(&seal.source).is_some_and(|old| old != &seal) {
+                        return Err(ManagementError::Changed);
+                    }
+                    sources.insert(seal.source.clone(), seal);
                 }
-                sources.insert(seal.source.clone(), seal);
+                keys.sort();
+                memberships.insert(selector, keys);
             }
-            keys.sort();
-            memberships.insert(selector, keys);
         }
         let unread = sources
             .keys()
@@ -217,7 +339,12 @@ async fn discover_validated<C: ConnectionTrait>(
         view.classifications.insert(key, classification);
         view._resident.extend(resident);
     }
-    validate_graph(&view.originals, &view.classifications, &memberships)?;
+    validate_graph(
+        &view.originals,
+        &view.classifications,
+        &memberships,
+        budget.is_publication(),
+    )?;
     view.proof.memberships = memberships
         .into_iter()
         .map(|(selector, sources)| AuthorityMembership { selector, sources })
@@ -382,6 +509,7 @@ fn validate_graph(
     rows: &BTreeMap<NativeKey, NativeRow>,
     classes: &BTreeMap<NativeKey, SourceClassification>,
     memberships: &BTreeMap<AuthoritySelector, Vec<NativeKey>>,
+    publication: bool,
 ) -> Result<()> {
     fn visit(
         key: &NativeKey,
@@ -409,6 +537,8 @@ fn validate_graph(
         Ok(())
     }
     let mut done = BTreeSet::new();
+    let mut legacy_confirmations =
+        BTreeMap::<String, crate::store::pinning::legacy_migration::Confirmation>::new();
     for (key, class) in classes {
         visit(key, classes, &mut BTreeSet::new(), &mut done)?;
         for dependency in class.dependencies.keys() {
@@ -448,14 +578,14 @@ fn validate_graph(
                 required(&rows[key], "native_before")?.strip_prefix(archive::LOCATOR)
         {
             let (anchor, core_hash, manifest_hash): (archive::Key, String, String) =
-                DecodeBudget::default().typed(pointer)?;
+                decode_budget(publication).typed(pointer)?;
             let anchor = NativeKey {
                 table: anchor.0,
                 values: anchor.1,
             };
             let original = rows.get(&anchor).ok_or(ManagementError::InvalidEvidence)?;
             let raw = required(original, "native_before")?;
-            let mut work = DecodeBudget::default();
+            let mut work = decode_budget(publication);
             let sections = archive::Sections::parse(raw, &mut work)?;
             let head: archive::Head = work.typed(&raw[sections.head])?;
             if core_hash != head.5 || manifest_hash != head.6 {
@@ -532,23 +662,40 @@ fn validate_graph(
             }
         }
         if key.table == "pin_legacy_migration_items" {
-            validate_legacy_item(&rows[key], rows)?;
+            let operation_id = required(&rows[key], "operation_id")?;
+            let operation = NativeKey {
+                table: "pin_legacy_migrations".into(),
+                values: vec![operation_id.into()],
+            };
+            let operation = rows
+                .get(&operation)
+                .ok_or(ManagementError::InvalidEvidence)?;
+            if !legacy_confirmations.contains_key(operation_id) {
+                let mut work = decode_budget(publication);
+                let confirmation = work.typed(required(operation, "confirmation")?)?;
+                legacy_confirmations.insert(operation_id.into(), confirmation);
+            }
+            validate_legacy_item(
+                &rows[key],
+                required(operation, "direction")?,
+                legacy_confirmations
+                    .get(operation_id)
+                    .ok_or(ManagementError::InvalidEvidence)?,
+                publication,
+            )?;
         }
     }
     Ok(())
 }
 
-fn validate_legacy_item(row: &NativeRow, rows: &BTreeMap<NativeKey, NativeRow>) -> Result<()> {
+fn validate_legacy_item(
+    row: &NativeRow,
+    direction: &str,
+    confirmation: &crate::store::pinning::legacy_migration::Confirmation,
+    publication: bool,
+) -> Result<()> {
     use crate::store::pinning::legacy_migration as legacy;
-    let operation = NativeKey {
-        table: "pin_legacy_migrations".into(),
-        values: vec![required(row, "operation_id")?.into()],
-    };
-    let operation = rows
-        .get(&operation)
-        .ok_or(ManagementError::InvalidEvidence)?;
-    let mut work = DecodeBudget::default();
-    let confirmation: legacy::Confirmation = work.typed(required(operation, "confirmation")?)?;
+    let mut work = decode_budget(publication);
     let key: BTreeMap<String, String> = work.typed(required(row, "original_key")?)?;
     let bindings: Vec<legacy::Binding> = work.typed(required(row, "bindings")?)?;
     let table = required(row, "table_kind")?;
@@ -618,7 +765,7 @@ fn validate_legacy_item(row: &NativeRow, rows: &BTreeMap<NativeKey, NativeRow>) 
     let expected_after = find(after, &after_key, true)?;
     let actual_before: Option<NativeRow> = work.typed(required(row, "before_image")?)?;
     let actual_after: Option<NativeRow> = work.typed(required(row, "after_image")?)?;
-    let pair = if required(operation, "direction")? == "rollback" {
+    let pair = if direction == "rollback" {
         (expected_after, expected_before)
     } else {
         (expected_before, expected_after)
@@ -715,5 +862,5 @@ pub(super) async fn validate_sources_dependencies(
         memberships.insert(group, keys);
         group_reads.push(selected);
     }
-    validate_graph(&rows, &classes, &memberships)
+    validate_graph(&rows, &classes, &memberships, budget.is_publication())
 }

@@ -1,4 +1,4 @@
-//! Parameter- and byte-bounded statements for the ZIP final write set.
+//! Parameter-batched statements for the ZIP final write set.
 use crate::{
     error::{AppError, AppResult},
     store::pinning::management::{
@@ -86,7 +86,6 @@ pub(super) async fn delete<E: EntityTrait + Default, C: ConnectionTrait>(
             work,
             WorkMeter {
                 sql: 1,
-                output_bytes: values.iter().map(bytes).sum::<usize>() as u64,
                 ..Default::default()
             },
         )?;
@@ -107,21 +106,10 @@ pub(super) async fn delete<E: EntityTrait + Default, C: ConnectionTrait>(
     }
     Ok(())
 }
-const ENCODED_BYTES: usize = 1024 * 1024;
-
-fn bytes(value: &Value) -> usize {
-    match value {
-        Value::String(Some(s)) => s.len(),
-        Value::Bytes(Some(b)) => b.len(),
-        Value::Json(Some(j)) => j.to_string().len(),
-        _ => 64,
-    }
-}
-
-pub(super) fn retain(work: DecodeWork<'_>, size: usize) -> AppResult<ResidentGuard> {
+pub(super) fn retain(work: DecodeWork<'_>, _size: usize) -> AppResult<ResidentGuard> {
     work.with(|session| {
         let mut budget = session.storage_budget()?;
-        let retained = budget.reserve(size);
+        let retained = budget.reserve(0);
         let finished = session.finish_storage(&budget);
         match retained {
             Ok(guard) => {
@@ -137,15 +125,8 @@ pub(super) fn retain(work: DecodeWork<'_>, size: usize) -> AppResult<ResidentGua
     .map_err(work_error)
 }
 
-pub(super) fn retain_copy(work: DecodeWork<'_>, size: usize) -> AppResult<ResidentGuard> {
-    charge(
-        work,
-        WorkMeter {
-            copied_bytes: size as u64,
-            ..Default::default()
-        },
-    )?;
-    retain(work, size)
+pub(super) fn retain_copy(work: DecodeWork<'_>, _size: usize) -> AppResult<ResidentGuard> {
+    retain(work, 0)
 }
 
 pub(super) fn charge(work: DecodeWork<'_>, used: WorkMeter) -> AppResult<()> {
@@ -159,48 +140,11 @@ pub(super) async fn read<E: EntityTrait + Default, C: ConnectionTrait>(
     values: Vec<Value>,
     order: &str,
     work: DecodeWork<'_>,
-    resident: &mut Vec<ResidentGuard>,
-    mut maintenance: Option<&mut super::PublicationLease<'_>>,
+    _resident: &mut Vec<ResidentGuard>,
+    maintenance: Option<&mut super::PublicationLease<'_>>,
 ) -> AppResult<Vec<E::Model>> {
     let table = E::default().table_name().to_owned();
-    let columns = E::Column::iter()
-        .map(|c| Iden::to_string(&c))
-        .collect::<Vec<_>>();
-    let terms = columns
-        .iter()
-        .map(|c| {
-            if db.get_database_backend() == sea_orm::DatabaseBackend::Sqlite {
-                format!("LENGTH(CAST(COALESCE(CAST(\"{c}\" AS TEXT),'') AS BLOB))")
-            } else {
-                format!("OCTET_LENGTH(COALESCE(CAST(\"{c}\" AS TEXT),''))::bigint")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("+");
-    if let Some(lease) = maintenance.as_deref_mut() {
-        lease.checkpoint(db).await?;
-    }
-    charge(
-        work,
-        WorkMeter {
-            sql: 1,
-            ..Default::default()
-        },
-    )?;
-    let measured = db.query_one(Statement::from_sql_and_values(db.get_database_backend(),
-        format!("SELECT COUNT(*) AS n,CAST(COALESCE(SUM({terms}),0) AS BIGINT) AS bytes FROM \"{table}\" WHERE {predicate}"), values.clone())).await?.ok_or_else(super::invalid)?;
-    let count = usize::try_from(measured.try_get::<i64>("", "n")?)
-        .map_err(|_| AppError::ManagementBudget)?;
-    let size = usize::try_from(measured.try_get::<i64>("", "bytes")?)
-        .map_err(|_| AppError::ManagementBudget)?;
-    let cells = count
-        .checked_mul(columns.len())
-        .ok_or(AppError::ManagementBudget)?;
-    resident.push(retain(
-        work,
-        size.checked_add(cells.checked_mul(64).ok_or(AppError::ManagementBudget)?)
-            .ok_or(AppError::ManagementBudget)?,
-    )?);
+    let columns = E::Column::iter().count();
     if let Some(lease) = maintenance {
         lease.checkpoint(db).await?;
     }
@@ -208,26 +152,29 @@ pub(super) async fn read<E: EntityTrait + Default, C: ConnectionTrait>(
         work,
         WorkMeter {
             sql: 1,
-            rows: count as u64,
-            cells: cells as u64,
-            raw_bytes: size as u64,
             ..Default::default()
         },
     )?;
-    work.index_cells(cells, size).map_err(work_error)?;
     let rows = db
         .query_all(Statement::from_sql_and_values(
             db.get_database_backend(),
-            format!(
-                "SELECT * FROM \"{table}\" WHERE {predicate} ORDER BY {order} LIMIT {}",
-                count.saturating_add(1)
-            ),
+            format!("SELECT * FROM \"{table}\" WHERE {predicate} ORDER BY {order}"),
             values,
         ))
         .await?;
-    if rows.len() != count {
-        return Err(super::invalid());
-    }
+    let cells = rows
+        .len()
+        .checked_mul(columns)
+        .ok_or(AppError::ManagementBudget)?;
+    charge(
+        work,
+        WorkMeter {
+            rows: rows.len() as u64,
+            cells: cells as u64,
+            ..Default::default()
+        },
+    )?;
+    work.index_cells(cells, 0).map_err(work_error)?;
     rows.iter()
         .map(|row| E::Model::from_query_result(row, "").map_err(AppError::from))
         .collect()
@@ -263,26 +210,18 @@ pub(super) async fn insert<E: EntityTrait + Default, C: ConnectionTrait>(
         }
         let mut values = Vec::new();
         let mut tuples = Vec::new();
-        let mut size = prefix.len();
         for row in &rows[start..] {
-            let cells = columns.iter().map(|c| row.get(*c)).collect::<Vec<_>>();
-            let added = cells.iter().map(bytes).sum::<usize>() + columns.len() * 8;
-            if added + prefix.len() > ENCODED_BYTES {
-                return Err(AppError::ManagementBudget);
-            }
-            if values.len() + columns.len() > PARAMS || size + added > ENCODED_BYTES {
+            if values.len() + columns.len() > PARAMS {
                 break;
             }
+            let cells = columns.iter().map(|c| row.get(*c)).collect::<Vec<_>>();
             tuples.push(format!("({})", slots(cells.len(), values.len())));
             values.extend(cells);
-            size += added;
         }
-        let _resident = retain(work, size)?;
         charge(
             work,
             WorkMeter {
                 sql: 1,
-                output_bytes: size as u64,
                 ..Default::default()
             },
         )?;
@@ -347,30 +286,22 @@ pub(super) async fn update<E: EntityTrait + Default, C: ConnectionTrait>(
         }
         let mut values = Vec::new();
         let mut tuples = Vec::new();
-        let mut size = header.len() + set.len() + matches.len() + 128;
         for (old, new) in &rows[start..] {
             let cells = columns
                 .iter()
                 .map(|c| old.get(*c))
                 .chain(columns.iter().map(|c| new.get(*c)))
                 .collect::<Vec<_>>();
-            let added = cells.iter().map(bytes).sum::<usize>() + cells.len() * 8;
-            if added + header.len() + set.len() + matches.len() + 128 > ENCODED_BYTES {
-                return Err(AppError::ManagementBudget);
-            }
-            if values.len() + cells.len() > PARAMS || size + added > ENCODED_BYTES {
+            if values.len() + cells.len() > PARAMS {
                 break;
             }
             tuples.push(format!("({})", slots(cells.len(), values.len())));
             values.extend(cells);
-            size += added;
         }
-        let _resident = retain(work, size)?;
         charge(
             work,
             WorkMeter {
                 sql: 1,
-                output_bytes: size as u64,
                 ..Default::default()
             },
         )?;

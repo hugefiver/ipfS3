@@ -42,8 +42,8 @@ use ipfs_s3_gateway::{
     zip::options::ZipTargets,
 };
 use sea_orm::{
-    ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter, Set,
-    TransactionTrait,
+    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
+    Set, Statement, TransactionTrait,
 };
 use sha2::{Digest, Sha256};
 
@@ -260,6 +260,101 @@ async fn assert_remote(db: &DatabaseConnection, provider: &str, cid: &str, refs:
 }
 
 #[tokio::test]
+async fn small_rpc_publication_completes_with_large_valid_reservation_history() {
+    let mut configured = provider("history-rpc", true, 1);
+    configured.limits.max_pins = 10_000;
+    configured.limits.max_bytes = 100_000;
+    let config = config(vec![configured], ProviderMode::All);
+    let db = database(&config).await;
+    let provider = &config.providers[0].name;
+    let route = store::entities::pin_provider_route::Entity::find_by_id(provider.clone())
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap()
+        .snapshot;
+    let now = Utc::now();
+    let cids = (0u64..4200)
+        .map(|n| {
+            let digest = Sha256::digest(n.to_le_bytes());
+            let hash = cid::multihash::Multihash::<64>::wrap(0x12, &digest).unwrap();
+            cid::Cid::new_v1(0x55, hash).to_string()
+        })
+        .collect::<Vec<_>>();
+    for chunk in cids.chunks(100) {
+        remote_pin::Entity::insert_many(chunk.iter().map(|cid| remote_pin::ActiveModel {
+            provider: Set(provider.clone()),
+            cid: Set(cid.clone()),
+            request_id: Set(None),
+            cid_size: Set(7),
+            status: Set("reserved".into()),
+            epoch: Set(1),
+            failure_attempts: Set(0),
+            next_retry_at: Set(None),
+            last_failed_request_id: Set(None),
+            last_touched_at: Set(now),
+            last_error_class: Set(None),
+            last_error_text: Set(None),
+        }))
+        .exec(&db)
+        .await
+        .unwrap();
+        remote_pin_ledger::Entity::insert_many(chunk.iter().map(|cid| {
+            remote_pin_ledger::ActiveModel {
+                provider: Set(provider.clone()),
+                cid: Set(cid.clone()),
+                route: Set(Some(route.clone())),
+                ownership: Set("unknown".into()),
+                effect: Set("reserved".into()),
+                first_observed_at: Set(None),
+                last_observed_at: Set(None),
+                remote_pinned_at: Set(None),
+                gateway_verified_at: Set(None),
+                content_verified_at: Set(None),
+                first_error: Set(None),
+                last_error: Set(None),
+            }
+        }))
+        .exec(&db)
+        .await
+        .unwrap();
+    }
+    db.execute(Statement::from_sql_and_values(
+        db.get_database_backend(),
+        "INSERT INTO pin_cid_comparisons(cid,canonical_cid) SELECT cid,cid FROM remote_pins WHERE provider=$1",
+        [provider.clone().into()],
+    ))
+    .await
+    .unwrap();
+    pin_provider_usage::Entity::insert(pin_provider_usage::ActiveModel {
+        provider: Set(provider.clone()),
+        reserved_pins: Set(4200),
+        reserved_bytes: Set(29_400),
+        observed_bytes: Set(None),
+        observed_pins: Set(None),
+        observed_at: Set(None),
+    })
+    .exec(&db)
+    .await
+    .unwrap();
+    let (request, decision) = decided_request(&config, "new-object", "new-key", OTHER);
+    publication::publish_decided_object(&db, request, captured(&config, &decision))
+        .await
+        .expect("unrelated valid reservations must not reject a small publication");
+    assert_original_version(&db, "new-object", OTHER).await;
+    let target = pin_lease_target::Entity::find()
+        .filter(pin_lease_target::Column::Provider.eq(provider))
+        .filter(pin_lease_target::Column::Cid.eq(OTHER))
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(target.state, "waiting");
+    let usage = quota::read_usage(&db, provider).await.unwrap().unwrap();
+    assert_eq!((usage.reserved_pins, usage.reserved_bytes), (4201, 29_407));
+}
+
+#[tokio::test]
 async fn rpc_equivalent_versions_keep_original_cids_and_share_one_reservation_with_two_refs() {
     let canonical = canonical_resource_cid(V0).unwrap();
     for mode in [ProviderMode::One, ProviderMode::All] {
@@ -447,6 +542,13 @@ async fn unknown_historical_alias_rejects_new_publication_and_keeps_old_debt_unc
             .await
             .unwrap();
         }
+        db.execute(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            "INSERT INTO pin_cid_comparisons(cid,canonical_cid) VALUES ($1,$2)",
+            [V0.into(), canonical.clone().into()],
+        ))
+        .await
+        .unwrap();
         pin_provider_usage::Entity::insert(pin_provider_usage::ActiveModel {
             provider: Set(provider.clone()),
             reserved_bytes: Set(7),

@@ -205,11 +205,16 @@ fn entry(result: &mut SourceClassification, entry: &PlanEntry) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn classify_source(key: &NativeKey, row: &NativeRow) -> Result<SourceClassification> {
+pub(super) fn classify_source(
+    key: &NativeKey,
+    row: &NativeRow,
+    publication: bool,
+) -> Result<SourceClassification> {
     let mut result = SourceClassification {
-        selectors: basic_selectors(key, row)?,
+        selectors: basic_selectors(key, row, publication)?,
         ..Default::default()
     };
+    let mut decode = decode_budget(publication);
     narrow::extend(key, row, &mut result.selectors)?;
     match key.table.as_str() {
         "pin_provider_routes" => {
@@ -228,13 +233,13 @@ pub(super) fn classify_source(key: &NativeKey, row: &NativeRow) -> Result<Source
                 .membership_lookups
                 .insert(AuthoritySelector::RecordMembers(scope.into(), plan.into()));
             if kind == "action" {
-                classify_archive(key, row, &mut result, None)?;
+                classify_archive(key, row, &mut result, None, &mut decode)?;
                 if required(row, "state")? == "applied" {
                     let decoded = results::decode_facts(
                         required(row, "result")?
                             .strip_prefix("S7R1\n")
                             .ok_or(ManagementError::InvalidEvidence)?,
-                        &mut DecodeBudget::default(),
+                        &mut decode,
                     )?;
                     let results::DecodedResult::Facts(action, facts, _) = decoded;
                     if action.receipt.binding.request.item_id != required(row, "item_id")? {
@@ -449,8 +454,8 @@ pub(super) fn classify_archive(
     row: &NativeRow,
     result: &mut SourceClassification,
     historical: Option<&crate::store::initialization::history::legacy::Review>,
+    work: &mut DecodeBudget,
 ) -> Result<()> {
-    let mut work = DecodeBudget::default();
     let raw_binding = required(row, "binding")?;
     let (anchor, binding_hash, confirmed) = if archive::is_shared_binding(raw_binding) {
         let (anchor, hash, _): (archive::Key, String, String) = work.typed(
@@ -522,7 +527,7 @@ pub(super) fn classify_archive(
     if anchor != *key {
         return Err(ManagementError::InvalidEvidence);
     }
-    let dependencies = archive::dependencies(std::sync::Arc::new(row.clone()), &mut work)?;
+    let dependencies = archive::dependencies(std::sync::Arc::new(row.clone()), work)?;
     for dependency in dependencies {
         if dependency != *key {
             result
@@ -530,7 +535,7 @@ pub(super) fn classify_archive(
                 .insert(dependency, DependencyKind::Archive);
         }
     }
-    let sections = archive::Sections::parse(raw, &mut work)?;
+    let sections = archive::Sections::parse(raw, work)?;
     let head: archive::Head = work.typed(&raw[sections.head])?;
     let core_raw = &raw[sections.core];
     if binding_hash != head.5

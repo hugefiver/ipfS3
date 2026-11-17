@@ -27,6 +27,31 @@ pub(crate) use unpin::prepare_runtime_unpin_effect;
 pub mod submission;
 pub use crate::store::entities::pin_submit_observation as submission_entity;
 
+const HISTORICAL_ALIAS: &str = "historical RPC CID alias requires explicit migration";
+
+async fn historical_alias_exists<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+    canonical: &str,
+) -> AppResult<bool> {
+    let row = db
+        .query_one(sea_orm::Statement::from_sql_and_values(
+            db.get_database_backend(),
+            "SELECT 1 AS present FROM (\
+             SELECT comparison.cid FROM pin_cid_comparisons comparison \
+             JOIN remote_pins remote ON remote.cid=comparison.cid \
+             WHERE comparison.canonical_cid=$1 AND comparison.cid<>$1 AND remote.provider=$2 \
+             UNION ALL \
+             SELECT comparison.cid FROM pin_cid_comparisons comparison \
+             JOIN remote_pin_ledger ledger ON ledger.cid=comparison.cid \
+             WHERE comparison.canonical_cid=$1 AND comparison.cid<>$1 AND ledger.provider=$2\
+             ) aliases LIMIT 1",
+            [canonical.into(), provider.into()],
+        ))
+        .await?;
+    Ok(row.is_some())
+}
+
 pub(crate) async fn allocation_cid_with_work<C: ConnectionTrait>(
     db: &C,
     provider: &str,
@@ -51,8 +76,6 @@ pub(crate) async fn allocation_cid_with_work<C: ConnectionTrait>(
         work.copy(cid).map_err(admission::work_error)?;
         return Ok(cid.into());
     }
-    // CID parsing and base conversion use bounded input/output scratch as well
-    // as the returned allocation key.
     work.index_cells(
         4,
         cid.len()
@@ -63,45 +86,10 @@ pub(crate) async fn allocation_cid_with_work<C: ConnectionTrait>(
     .map_err(admission::work_error)?;
     let canonical = crate::pinning::provider::canonical_resource_cid(cid)
         .map_err(|_| AppError::InvalidPinningRequest("invalid RPC resource CID".into()))?;
-    for source in [
-        "FROM remote_pins WHERE provider=$1",
-        "FROM remote_pin_ledger WHERE provider=$1",
-    ] {
-        work.copy(provider).map_err(admission::work_error)?;
-        let (rows, bytes) = records::bounded_projection(
-            db,
-            source,
-            &[("cid", "cid")],
-            "cid",
-            vec![provider.into()],
-            (
-                crate::pinning::management::wire::MAX_WIRE_NODES,
-                crate::pinning::management::wire::MAX_WIRE_BYTES,
-            ),
-            work,
-        )
-        .await
+    work.copy(&(provider, &canonical))
         .map_err(admission::work_error)?;
-        work.index_cells(rows.len(), bytes)
-            .map_err(admission::work_error)?;
-        for row in rows {
-            let old = row.try_get::<String>("", "cid")?;
-            work.index_cells(
-                3,
-                old.len()
-                    .checked_mul(3)
-                    .and_then(|bytes| bytes.checked_add(256))
-                    .ok_or(AppError::ManagementBudget)?,
-            )
-            .map_err(admission::work_error)?;
-            if old != canonical
-                && crate::pinning::provider::cids_equivalent(&old, &canonical).unwrap_or(false)
-            {
-                return Err(AppError::InvalidPinningRequest(
-                    "historical RPC CID alias requires explicit migration".into(),
-                ));
-            }
-        }
+    if historical_alias_exists(db, provider, &canonical).await? {
+        return Err(AppError::InvalidPinningRequest(HISTORICAL_ALIAS.into()));
     }
     Ok(canonical)
 }
@@ -130,34 +118,8 @@ pub async fn allocation_cid<C: ConnectionTrait>(
     }
     let canonical = crate::pinning::provider::canonical_resource_cid(cid)
         .map_err(|_| AppError::InvalidPinningRequest("invalid RPC resource CID".into()))?;
-    // Unknown historical aliases cannot be converted into new scope/ownership.
-    let remotes = crate::store::entities::remote_pin::Entity::find()
-        .filter(crate::store::entities::remote_pin::Column::Provider.eq(provider))
-        .all(db)
-        .await?;
-    for remote in remotes {
-        if remote.cid != canonical
-            && crate::pinning::provider::cids_equivalent(&remote.cid, &canonical).unwrap_or(false)
-        {
-            return Err(AppError::InvalidPinningRequest(
-                "historical RPC CID alias requires explicit migration".into(),
-            ));
-        }
-    }
-    // Job/remote deletion is not proof that an older alias had no side effects.
-    // Do not assign today's registration or ownership to that historical row.
-    for evidence in remote_pin_ledger::Entity::find()
-        .filter(remote_pin_ledger::Column::Provider.eq(provider))
-        .all(db)
-        .await?
-    {
-        if evidence.cid != canonical
-            && crate::pinning::provider::cids_equivalent(&evidence.cid, &canonical).unwrap_or(false)
-        {
-            return Err(AppError::InvalidPinningRequest(
-                "historical RPC ledger alias requires explicit migration".into(),
-            ));
-        }
+    if historical_alias_exists(db, provider, &canonical).await? {
+        return Err(AppError::InvalidPinningRequest(HISTORICAL_ALIAS.into()));
     }
     Ok(canonical)
 }
@@ -541,6 +503,7 @@ async fn capture_reservation_core<C: ConnectionTrait>(
     }
     work.copy(&(provider, cid))
         .map_err(super::management::admission::work_error)?;
+    super::cid_comparison::ensure_cid_comparisons(db, [cid]).await?;
     remote_pin_ledger::Entity::insert(remote_pin_ledger::ActiveModel {
         provider: Set(provider.into()),
         cid: Set(cid.into()),

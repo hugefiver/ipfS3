@@ -392,7 +392,9 @@ pub(crate) async fn preflight_captured_zip_routes(
             allocatable.insert(frozen.config_name.clone());
         }
     }
-    let budget = super::management::records::SharedDecodeBudget::default();
+    let budget = std::sync::Arc::new(std::sync::Mutex::new(
+        super::management::records::ReadSession::for_publication(),
+    ));
     let work = super::management::records::DecodeWork::shared(&budget);
     let tx = store.begin_runtime(work).await?;
     let result = ledger::verify_runtime_birth_routes(&tx, &routes, &allocatable, false, work).await;
@@ -1188,7 +1190,9 @@ async fn delete_version_attempt(
             PublicationTransaction::Full(db.begin().await.map_err(TransactionError::Connection)?)
         }
         reservations::PublicationDatabase::Store(store) => {
-            let work = super::management::records::SharedDecodeBudget::default();
+            let work = std::sync::Arc::new(std::sync::Mutex::new(
+                super::management::records::ReadSession::for_publication(),
+            ));
             let tx = store
                 .begin_publication_runtime(super::management::records::DecodeWork::shared(&work))
                 .await?;
@@ -1489,7 +1493,9 @@ async fn run_publication_with_retries_and_hot_receipt(
     limits: &ProviderLimitMap,
     decision: Option<DecidedSnapshot>,
 ) -> AppResult<PublicationResult> {
-    let session = super::management::records::SharedDecodeBudget::default();
+    let session = std::sync::Arc::new(std::sync::Mutex::new(
+        super::management::records::ReadSession::for_publication(),
+    ));
     let result = async {
         for retry in 0..=MAX_TRANSACTION_RETRIES {
             match publication_attempt(
@@ -1561,7 +1567,9 @@ async fn run_completed_publication_with_retries_and_decision(
     decision: Option<DecidedSnapshot>,
     replay: Option<ZipCompletedReplay>,
 ) -> Result<PublicationResult, CommitCompletedUploadError> {
-    let session = super::management::records::SharedDecodeBudget::default();
+    let session = std::sync::Arc::new(std::sync::Mutex::new(
+        super::management::records::ReadSession::for_publication(),
+    ));
     let completion_attempt_id = request.object.id.clone();
     let result = async {
         for retry in 0..=MAX_TRANSACTION_RETRIES {
@@ -1806,7 +1814,11 @@ async fn publish_with_reservations<
     } else {
         acquire_sqlite_publication_write_intent(db, &request.object.bucket).await?;
     }
-    let session = reservations.runtime_work().cloned().unwrap_or_default();
+    let session = reservations.runtime_work().cloned().unwrap_or_else(|| {
+        std::sync::Arc::new(std::sync::Mutex::new(
+            super::management::records::ReadSession::for_publication(),
+        ))
+    });
     let work = super::management::records::DecodeWork::shared(&session);
     work.with(|session| session.check())
         .map_err(super::management::admission::work_error)?;
@@ -2146,7 +2158,11 @@ async fn create_publication_leases<R: reservations::Reservations>(
         // same provider resource. Keep one target/reference per lease/resource.
         let mut assigned_targets = BTreeMap::new();
         for target in targets {
-            let work = reservations.runtime_work().cloned().unwrap_or_default();
+            let work = reservations.runtime_work().cloned().unwrap_or_else(|| {
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    super::management::records::ReadSession::for_publication(),
+                ))
+            });
             assign_target_providers_core(
                 reservations,
                 &lease_id,
@@ -2214,7 +2230,9 @@ async fn insert_absolute_lease<C: ConnectionTrait>(
     now: DateTime<Utc>,
     requirements: Option<&crate::pinning::management::Requirements>,
 ) -> AppResult<()> {
-    let work = super::management::records::SharedDecodeBudget::default();
+    let work = std::sync::Arc::new(std::sync::Mutex::new(
+        super::management::records::ReadSession::for_publication(),
+    ));
     insert_absolute_lease_with_work(
         db,
         lease_id,
@@ -2640,7 +2658,11 @@ async fn settle_publication_remotes<R: reservations::Reservations>(
     now: DateTime<Utc>,
     mut maintenance: Option<&mut crate::store::zip::publication_lease::PublicationLease<'_>>,
 ) -> AppResult<()> {
-    let session = reservations.runtime_work().cloned().unwrap_or_default();
+    let session = reservations.runtime_work().cloned().unwrap_or_else(|| {
+        std::sync::Arc::new(std::sync::Mutex::new(
+            super::management::records::ReadSession::for_publication(),
+        ))
+    });
     let work = super::management::records::DecodeWork::shared(&session);
     let runtime = reservations.runtime().map(|tx| (tx, work));
     let db = reservations.db();

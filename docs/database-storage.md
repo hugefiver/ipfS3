@@ -62,8 +62,10 @@ upgrade-required. Operators must quiesce writers and workers and retain a separa
 backup before invoking the explicit local upgrade entry.
 
 `store::initialization::upgrade_existing` accepts the exact source versions
-`m20261013_000001_zip_root_logical_release` and
-`m20261017_000001_management_storage`, the current target version, and the original
+`m20261013_000001_zip_root_logical_release`,
+`m20261017_000001_management_storage`, `m20261023_000001_inline_documents`,
+`m20261027_000001_schema_baseline`, and `m20261108_000001_current_pinning_config`,
+the current target version, and the original
 database scope and native identity. Import layout conversion runs in the isolated
 schema transaction: SQL projects at most 256 bounded IDs per page, then copies
 their cold cells within the database without driver materialization or JSON
@@ -91,7 +93,9 @@ The existing CLI entry is `--pinning-manage-upgrade` with `--database-url`,
 `--native-identity`, `--database-scope`, `--source-version`, and `--target-version`.
 It opens an existing database without ordinary gateway initialization or provider
 RPCs. Use the preserved original identity and a supported source version; the
-target is `m20261023_000001_inline_documents`. Keep the operator's independent
+target is `m20261109_000001_pin_cid_comparisons`. This migration derives indexed
+canonical comparison keys from existing remote and ledger CID strings; original
+CIDs, object ETags and historical receipt contents stay unchanged. Keep the operator's independent
 backup until restore has been verified. No migration deletes that backup.
 
 PostgreSQL preparation has an unresolved migration-lock timeout, error-redaction,

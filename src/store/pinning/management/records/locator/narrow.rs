@@ -25,7 +25,7 @@ pub(super) async fn bind_retirement_domain<C: ConnectionTrait>(
         .strip_prefix("S7R1\n")
         .ok_or(ManagementError::InvalidEvidence)?;
     let results::DecodedResult::Facts(action, _, _) =
-        results::decode_facts(body, &mut DecodeBudget::default())?;
+        results::decode_facts(body, &mut decode_budget(budget.is_publication()))?;
     let crate::pinning::management::Subject::Provider { route } =
         &action.receipt.binding.request.subject
     else {

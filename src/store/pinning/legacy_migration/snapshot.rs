@@ -96,7 +96,7 @@ pub(super) fn tables(versions: &[String]) -> Vec<TableImage> {
             "upload_id",
         ),
     ];
-    let current = versions.last().map(String::as_str) == Some(MANAGEMENT);
+    let current = history::has_current_pinning_layout(versions);
     for table in &mut tables {
         match table.table.as_str() {
             "pin_extension_decisions" if !current => {
@@ -171,6 +171,7 @@ pub(super) fn validate_versions(actual: &[String], writing: bool) -> AppResult<(
                 | SCHEMA
                 | ZIP_CAPTURE
                 | MANAGEMENT
+                | history::CURRENT_PINNING
                 | history::M23
                 | crate::store::migrations::baseline::VERSION
         )

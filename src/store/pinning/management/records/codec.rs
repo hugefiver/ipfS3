@@ -3,7 +3,7 @@ use super::*;
 mod typed;
 pub(super) use typed::{charge_json_owned, charge_json_scan, decode_json, measure};
 
-fn count_nodes(input: &[u8], limit: usize) -> Result<usize> {
+fn count_nodes(input: &[u8], limit: Option<usize>) -> Result<usize> {
     let mut index = 0;
     let mut nodes = 0usize;
     while index < input.len() {
@@ -35,7 +35,7 @@ fn count_nodes(input: &[u8], limit: usize) -> Result<usize> {
             }
         }
         nodes = nodes.checked_add(1).ok_or(ManagementError::Budget)?;
-        if nodes > limit {
+        if limit.is_some_and(|limit| nodes > limit) {
             return Err(ManagementError::Budget);
         }
     }
