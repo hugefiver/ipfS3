@@ -1,8 +1,8 @@
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set, TransactionError, TransactionTrait,
-    sea_query::{Condition, Expr, LockBehavior, LockType, OnConflict, Query, SimpleExpr},
+    QueryOrder, QuerySelect, QueryTrait, Set, TransactionError, TransactionTrait,
+    sea_query::{Condition, Expr, OnConflict, Query, SimpleExpr},
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -685,22 +685,7 @@ async fn claim_due_in_transaction<C: ConnectionTrait>(
             .await?;
     }
     let candidates = due_candidates(db, database_now(db).await?, limit).await?;
-    let mut locked_buckets = std::collections::BTreeSet::new();
-    for bucket in candidates
-        .iter()
-        .map(|candidate| candidate.bucket.clone())
-        .collect::<std::collections::BTreeSet<_>>()
-    {
-        match lock_bucket_for_ownership(db, &bucket).await {
-            Ok(()) => {
-                locked_buckets.insert(bucket);
-            }
-            Err(AppError::NoSuchBucket(_)) => {}
-            Err(error) => return Err(error),
-        }
-    }
-    // Candidate discovery is not authorization. After all bucket locks are held,
-    // re-read due rows and sample the engine clock before installing a lease.
+    // Lease time starts after acquiring the write locks.
     let now = database_now(db).await?;
     let lease_until = now.checked_add_signed(lease_for).ok_or_else(|| {
         AppError::InvalidArgument(
@@ -709,22 +694,6 @@ async fn claim_due_in_transaction<C: ConnectionTrait>(
     })?;
     let mut claimed = Vec::with_capacity(candidates.len());
     for candidate in candidates {
-        if !locked_buckets.contains(&candidate.bucket) {
-            continue;
-        }
-        let query =
-            lifecycle_action::Entity::find_by_id(candidate.id).filter(due_claim_condition(now));
-        let candidate = if db.get_database_backend() == DatabaseBackend::Postgres {
-            query
-                .lock_with_behavior(LockType::Update, LockBehavior::SkipLocked)
-                .one(db)
-                .await?
-        } else {
-            query.one(db).await?
-        };
-        let Some(candidate) = candidate else {
-            continue;
-        };
         let transition = is_transition_action(&candidate);
         let transition_saga = if transition {
             transition_saga_state(db, &candidate.id).await?
@@ -763,12 +732,31 @@ async fn due_candidates<C: ConnectionTrait>(
     now: DateTime<Utc>,
     limit: u64,
 ) -> AppResult<Vec<lifecycle_action::Model>> {
-    let query = lifecycle_action::Entity::find()
-        .filter(due_claim_condition(now))
+    let due = lifecycle_action::Entity::find().filter(due_claim_condition(now));
+    if db.get_database_backend() == DatabaseBackend::Postgres {
+        // Consume the ordered queue until `limit` actions pass both locks. The lateral
+        // lookup depends on the locked bucket, and rechecks eligibility on the locked action.
+        let mut stmt = due.build(DatabaseBackend::Postgres);
+        stmt.sql = format!(
+            "SELECT ready.* FROM (\
+                 SELECT a.id FROM ({due}) a JOIN buckets b ON b.name = a.bucket \
+                 ORDER BY a.due_at, a.id FOR NO KEY UPDATE OF b SKIP LOCKED\
+             ) owned CROSS JOIN LATERAL (\
+                 SELECT a.* FROM ({due}) a WHERE a.id = owned.id FOR UPDATE SKIP LOCKED\
+             ) ready LIMIT {limit}",
+            due = stmt.sql,
+        );
+        return Ok(lifecycle_action::Entity::find()
+            .from_raw_sql(stmt)
+            .all(db)
+            .await?);
+    }
+    Ok(due
         .order_by_asc(lifecycle_action::Column::DueAt)
         .order_by_asc(lifecycle_action::Column::Id)
-        .limit(limit);
-    Ok(query.all(db).await?)
+        .limit(limit)
+        .all(db)
+        .await?)
 }
 
 async fn claim_candidate<C: ConnectionTrait>(

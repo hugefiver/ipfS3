@@ -183,6 +183,42 @@ async fn run_worker(
     after_claim: Option<Arc<LifecycleAfterClaimGate>>,
     tiers: Option<OwnedTierClients>,
 ) {
+    let scan = async {
+        let mut poll = tokio::time::interval(config.poll_interval);
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => break,
+                _ = poll.tick() => {
+                    if !scan_one_page(&store, &config, &cancellation).await {
+                        break;
+                    }
+                }
+            }
+        }
+    };
+    tokio::join!(
+        scan,
+        run_actions(
+            &store,
+            &config,
+            &cancellation,
+            &worker_id,
+            after_claim.as_deref(),
+            tiers.as_ref()
+        )
+    );
+}
+
+async fn run_actions(
+    store: &Store,
+    config: &ValidatedLifecycleConfig,
+    cancellation: &CancellationToken,
+    worker_id: &str,
+    after_claim: Option<&LifecycleAfterClaimGate>,
+    tiers: Option<&OwnedTierClients>,
+) {
     let mut actions = JoinSet::new();
     let mut poll = tokio::time::interval(config.poll_interval);
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -201,16 +237,13 @@ async fn run_worker(
                 while let Some(joined) = actions.try_join_next() {
                     log_join_result(Some(joined), "action_task");
                 }
-                if !scan_one_page(&store, &config, &cancellation).await {
-                    break;
-                }
                 if !claim_and_start_actions(
-                    &store,
-                    &config,
-                    &worker_id,
-                    &cancellation,
-                    after_claim.as_deref(),
-                    tiers.as_ref(),
+                    store,
+                    config,
+                    worker_id,
+                    cancellation,
+                    after_claim,
+                    tiers,
                     &mut actions,
                 )
                 .await

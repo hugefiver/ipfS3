@@ -13,9 +13,87 @@ use ipfs_s3_gateway::store::{
 };
 use sea_orm::{
     ConnectOptions, ConnectionTrait, Database, DatabaseBackend, DatabaseConnection, DbErr,
-    EntityTrait, Statement,
+    EntityTrait, Statement, TransactionTrait,
 };
 use sea_orm_migration::{MigrationTrait, MigratorTrait, SchemaManager};
+
+#[path = "support/baseline_postgres.rs"]
+mod baseline_postgres;
+
+#[tokio::test]
+#[ignore = "requires IPFS_S3_TEST_POSTGRES_URL"]
+async fn postgres_lifecycle_ready_action_passes_blocked_scan_bucket_and_action() {
+    use ipfs_s3_gateway::{config::LifecycleWorkerConfig, lifecycle::worker::start_worker, store};
+    use tokio_util::sync::CancellationToken;
+
+    baseline_postgres::with_schema(|db| async move {
+        store::run_migrations(&db).await.unwrap();
+        db.execute_unprepared("INSERT INTO buckets (name) VALUES ('scan'), ('a'), ('b'), ('c')")
+            .await.unwrap();
+        let config_json = r#"{"schema_version":1,"rules":[{
+            "id":"expire", "status":"enabled", "selector":{"kind":"modern","filter":{"kind":"all"}},
+            "expiration":{"kind":"days","days":1}
+        }]}"#;
+        store::lifecycle_config::put_configuration(&db, "scan", config_json)
+            .await.unwrap();
+        db.execute_unprepared(
+            "INSERT INTO lifecycle_actions (id, idempotency_key, bucket, object_key, config_revision, \
+             rule_id, action_kind, target_type, target_upload_id, target_upload_created_at, due_at, \
+             state, next_attempt_at, created_at, updated_at) \
+             SELECT name, name, name, 'key', 1, 'id:abort', 'abort_incomplete_multipart_upload', \
+             'multipart_upload', 'missing', now(), now(), 'pending', \
+             CASE WHEN name = 'c' THEN now() + interval '1 hour' ELSE now() END, now(), now() \
+             FROM buckets WHERE name IN ('a','b','c')",
+        ).await.unwrap();
+        let locks = db.begin().await.unwrap();
+        for sql in [
+            "LOCK TABLE object_versions IN ACCESS EXCLUSIVE MODE",
+            "SELECT name FROM buckets WHERE name = 'a' FOR NO KEY UPDATE",
+            "SELECT id FROM lifecycle_actions WHERE id = 'b' FOR UPDATE",
+        ] {
+            locks.execute_unprepared(sql).await.unwrap();
+        }
+
+        let config = LifecycleWorkerConfig {
+            worker_concurrency: 1,
+            poll_interval_ms: 10,
+            ..Default::default()
+        };
+        let cancel = CancellationToken::new();
+        let _on_panic = cancel.clone().drop_guard();
+        let worker = start_worker(store::Store::new(db.clone()), config.validate().unwrap(), cancel);
+        let blocked = Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT 1 FROM pg_locks WHERE relation = 'object_versions'::regclass AND NOT granted",
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while db.query_one(blocked.clone()).await.unwrap().is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("scan page must be blocked on the versions table");
+        db.execute_unprepared("UPDATE lifecycle_actions SET next_attempt_at = now() WHERE id = 'c'")
+            .await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let ready = lifecycle_action::Entity::find_by_id("c").one(&db).await.unwrap().unwrap();
+                if ready.state == "cancelled" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the ready stale action must reach its terminal state while all locks are held");
+        for id in ["a", "b"] {
+            let busy = lifecycle_action::Entity::find_by_id(id).one(&db).await.unwrap().unwrap();
+            assert_eq!(busy.attempts, 0);
+        }
+        locks.rollback().await.unwrap();
+        worker.shutdown(Duration::from_secs(2)).await;
+    }).await;
+}
 
 struct PreLifecycleMigrator;
 
