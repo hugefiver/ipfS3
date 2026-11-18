@@ -13,7 +13,7 @@ use sea_orm::{
     TransactionTrait, sea_query::Expr,
 };
 use tokio::{
-    sync::{OwnedSemaphorePermit, Semaphore},
+    sync::{Notify, OwnedSemaphorePermit, Semaphore},
     task::JoinSet,
 };
 use tokio_util::sync::CancellationToken;
@@ -357,8 +357,13 @@ pub(crate) fn start(
     }
 }
 
+tokio::task_local! {
+    static CID_START: (std::cell::Cell<Option<OwnedSemaphorePermit>>, Arc<Notify>);
+}
+
 #[derive(Clone)]
 struct JobLogContext {
+    background: bool,
     job_id: String,
     provider: String,
     cid: String,
@@ -367,8 +372,9 @@ struct JobLogContext {
 }
 
 impl JobLogContext {
-    fn from_model(model: &crate::store::entities::pin_job::Model) -> Self {
+    fn from_model(model: &crate::store::entities::pin_job::Model, background: bool) -> Self {
         Self {
+            background,
             job_id: model.id.clone(),
             provider: model.provider.clone(),
             cid: model.cid.clone(),
@@ -419,158 +425,209 @@ async fn run_worker(
     #[cfg(test)] completion: tokio::sync::watch::Sender<u64>,
 ) {
     let settings = coordinator.settings().clone();
-    let global = Arc::new(Semaphore::new(settings.worker_concurrency));
+    let global = coordinator.http_slots.clone();
     let mut interval = tokio::time::interval(settings.interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut in_flight = JoinSet::new();
     let mut job_contexts: std::collections::HashMap<tokio::task::Id, JobLogContext> =
         std::collections::HashMap::new();
-    let provider_occupancy = ProviderOccupancy::default();
+    let ordinary_occupancy = ProviderOccupancy::default();
+    let cid_occupancy = ProviderOccupancy::default();
+    let kubo_cid: BTreeSet<_> = coordinator
+        .provider_limits()
+        .keys()
+        .filter(|name| {
+            coordinator
+                .provider(name)
+                .is_some_and(|p| p.invocation_route() == ("kubo", "cid"))
+        })
+        .cloned()
+        .collect();
+    let start_slots: BTreeMap<_, _> = kubo_cid
+        .iter()
+        .map(|name| (name.clone(), Arc::new(Semaphore::new(1))))
+        .collect();
+    let cid_limit = settings.worker_concurrency.saturating_mul(2).max(64);
     let mut expiry_cursor = String::new();
-    let mut receipt_cursor = String::new();
-    let mut missing_receipt_cursor = String::new();
-    let mut quota_waiter_scan = quota_waiter::ScanState::default();
-
-    loop {
-        let maintenance_due = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => break,
-            _ = interval.tick() => true,
-            completed = in_flight.join_next_with_id(), if !in_flight.is_empty() => {
-                if let Some(completed) = completed {
-                    handle_join_result(completed, &mut job_contexts, "pinning worker task failed");
-                    #[cfg(test)]
-                    completion.send_modify(|completed| *completed += 1);
-                }
-                false
+    let maintenance_tick = Notify::new();
+    let wake = Arc::new(Notify::new());
+    let maintenance = async {
+        let mut receipt_cursor = String::new();
+        let mut missing_receipt_cursor = String::new();
+        let mut quota_waiter_scan = quota_waiter::ScanState::default();
+        loop {
+            maintenance_tick.notified().await;
+            if let Err(error) =
+                recover_parked_receipts(&coordinator, &store, &mut receipt_cursor).await
+            {
+                tracing::error!(%error, "pinning worker receipt scan failed");
             }
-        };
-        if cancellation.is_cancelled() {
-            break;
+            if let Err(error) =
+                recover_missing_receipt_parks(&coordinator, &store, &mut missing_receipt_cursor)
+                    .await
+            {
+                tracing::error!(%error, "pinning worker missing receipt scan failed");
+            }
+            if let Err(error) = quota_waiter::coordinate_with_state(
+                &coordinator,
+                &store,
+                Utc::now(),
+                &mut quota_waiter_scan,
+            )
+            .await
+            {
+                tracing::error!(%error, "pinning worker quota waiter scan failed");
+            }
+            if let Err(error) = coordinate_quota_waiters(&coordinator, &store, Utc::now()).await {
+                tracing::error!(%error, "pinning worker quota maintenance failed");
+            }
+            wake.notify_one();
         }
-        while let Some(completed) = in_flight.try_join_next_with_id() {
-            handle_join_result(completed, &mut job_contexts, "pinning worker task failed");
-            #[cfg(test)]
-            completion.send_modify(|completed| *completed += 1);
-        }
-        if maintenance_due {
-            let expiry = tokio::select! {
+    };
+    let dispatch = async {
+        loop {
+            let maintenance_due = tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => break,
-                result = expire_worker_leases(&store, Utc::now(), &mut expiry_cursor, settings.claim_limit) => result,
-            };
-            if let Err(error) = expiry {
-                tracing::error!(error = %error, "pinning worker expiry failed");
-            }
-        }
-        for after_maintenance in [false, true] {
-            if after_maintenance {
-                if !maintenance_due {
-                    break;
+                _ = interval.tick() => true,
+                _ = wake.notified() => false,
+                completed = in_flight.join_next_with_id(), if !in_flight.is_empty() => {
+                    if let Some(completed) = completed {
+                        handle_join_result(completed, &mut job_contexts, "pinning worker task failed");
+                        #[cfg(test)]
+                        completion.send_modify(|completed| *completed += 1);
+                    }
+                    false
                 }
-                let maintenance = tokio::select! {
+            };
+            if cancellation.is_cancelled() {
+                break;
+            }
+            while let Some(completed) = in_flight.try_join_next_with_id() {
+                handle_join_result(completed, &mut job_contexts, "pinning worker task failed");
+                #[cfg(test)]
+                completion.send_modify(|completed| *completed += 1);
+            }
+            if maintenance_due {
+                let expiry = tokio::select! {
                     biased;
                     _ = cancellation.cancelled() => break,
-                    result = async {
-                        if let Err(error) = recover_parked_receipts(
-                            &coordinator, &store, &mut receipt_cursor,
-                        ).await {
-                            tracing::error!(%error, "pinning worker receipt scan failed");
-                        }
-                        if let Err(error) = recover_missing_receipt_parks(
-                            &coordinator, &store, &mut missing_receipt_cursor,
-                        ).await {
-                            tracing::error!(%error, "pinning worker missing receipt scan failed");
-                        }
-                        if let Err(error) = quota_waiter::coordinate_with_state(
-                            &coordinator,
-                            &store,
-                            Utc::now(),
-                            &mut quota_waiter_scan,
-                        )
-                        .await {
-                            tracing::error!(%error, "pinning worker quota waiter scan failed");
-                        }
-                        coordinate_quota_waiters(&coordinator, &store, Utc::now()).await
-                    } => result,
+                    result = expire_worker_leases(&store, Utc::now(), &mut expiry_cursor, settings.claim_limit) => result,
                 };
-                if let Err(error) = maintenance {
-                    tracing::error!(error = %error, "pinning worker quota maintenance failed");
-                }
-                while let Some(completed) = in_flight.try_join_next_with_id() {
-                    handle_join_result(completed, &mut job_contexts, "pinning worker task failed");
-                    #[cfg(test)]
-                    completion.send_modify(|completed| *completed += 1);
+                if let Err(error) = expiry {
+                    tracing::error!(error = %error, "pinning worker expiry failed");
                 }
             }
-            let active_job_ids = job_contexts
+            let cid_count = job_contexts.values().filter(|job| job.background).count();
+            let ordinary_count = in_flight.len() - cid_count;
+            let mut active_job_ids = job_contexts
                 .values()
-                .map(|context| context.job_id.clone())
-                .collect::<BTreeSet<_>>();
-            let available = settings.worker_concurrency.saturating_sub(in_flight.len());
-            let scan = async {
-                let now = Utc::now();
-                let limit = u64::try_from(available).unwrap_or(u64::MAX);
-                claim_ready_jobs(
+                .map(|job| job.job_id.clone())
+                .collect();
+            for background in [false, true] {
+                let eligible;
+                let (provider_occupancy, lane, limit) = if background {
+                    if cid_count >= cid_limit {
+                        continue;
+                    }
+                    eligible = start_slots
+                        .iter()
+                        .filter(|(_, slot)| slot.available_permits() != 0)
+                        .map(|(provider, _)| provider.clone())
+                        .collect::<BTreeSet<_>>();
+                    if eligible.is_empty() {
+                        continue;
+                    }
+                    (&cid_occupancy, jobs::WorkerClaimLane::KuboCid(&eligible), 1)
+                } else {
+                    (
+                        &ordinary_occupancy,
+                        jobs::WorkerClaimLane::Ordinary(&kubo_cid),
+                        settings.worker_concurrency.saturating_sub(ordinary_count) as u64,
+                    )
+                };
+                let scan = claim_ready_jobs(
                     &coordinator,
                     &store,
                     &cancellation,
-                    &provider_occupancy,
+                    provider_occupancy,
                     &active_job_ids,
-                    now,
+                    Utc::now(),
                     limit,
-                )
-                .await
-            };
-            let scan_result = tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => break,
-                result = scan => result,
-            };
-            match scan_result {
-                Ok(claimed) => {
-                    for job in claimed {
-                        if cancellation.is_cancelled() {
-                            break;
-                        }
-                        let coordinator = coordinator.clone();
-                        let store = store.clone();
-                        let global = global.clone();
-                        let cancellation = cancellation.clone();
-                        let context = JobLogContext::from_model(&job.model);
-                        let task_context = context.clone();
-                        let occupancy = provider_occupancy.enter(job.model.provider.clone());
-                        let execution = async move {
-                            let _occupancy = occupancy;
-                            if let Err(error) = execute_claimed_job_with_cancellation(
-                                &store,
-                                &coordinator,
-                                &global,
-                                job,
-                                &cancellation,
-                            )
-                            .await
-                            {
-                                tracing::error!(
-                                    job_id = %task_context.job_id,
-                                    provider = %task_context.provider,
-                                    cid = %task_context.cid,
-                                    lease_id = ?task_context.lease_id,
-                                    target_id = ?task_context.target_id,
-                                    error = %error,
-                                    "pinning job execution failed"
-                                );
+                    lane,
+                );
+                let scan_result = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => break,
+                    result = scan => result,
+                };
+                match scan_result {
+                    Ok(claimed) => {
+                        for job in claimed {
+                            if cancellation.is_cancelled() {
+                                break;
                             }
-                        };
-                        let handle = in_flight.spawn(execution);
-                        job_contexts.insert(handle.id(), context);
+                            let coordinator = coordinator.clone();
+                            let store = store.clone();
+                            let global = global.clone();
+                            let cancellation = cancellation.clone();
+                            let context = JobLogContext::from_model(&job.model, background);
+                            active_job_ids.insert(context.job_id.clone());
+                            let task_context = context.clone();
+                            let occupancy = provider_occupancy.enter(job.model.provider.clone());
+                            let execution = async move {
+                                let _occupancy = occupancy;
+                                if let Err(error) = execute_claimed_job_with_cancellation(
+                                    &store,
+                                    &coordinator,
+                                    &global,
+                                    job,
+                                    &cancellation,
+                                )
+                                .await
+                                {
+                                    tracing::error!(
+                                        job_id = %task_context.job_id,
+                                        provider = %task_context.provider,
+                                        cid = %task_context.cid,
+                                        lease_id = ?task_context.lease_id,
+                                        target_id = ?task_context.target_id,
+                                        error = %error,
+                                        "pinning job execution failed"
+                                    );
+                                }
+                            };
+                            let handle = if background {
+                                let start = start_slots[&context.provider]
+                                    .clone()
+                                    .try_acquire_owned()
+                                    .expect("only the scheduler reserves eligible CID starts");
+                                if start_slots.len() > 1 {
+                                    wake.notify_one();
+                                }
+                                in_flight.spawn(CID_START.scope(
+                                    (std::cell::Cell::new(Some(start)), wake.clone()),
+                                    execution,
+                                ))
+                            } else {
+                                in_flight.spawn(execution)
+                            };
+                            job_contexts.insert(handle.id(), context);
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(error = %error, "pinning worker scan failed");
                     }
                 }
-                Err(error) => {
-                    tracing::error!(error = %error, "pinning worker scan failed");
-                }
+            }
+            if maintenance_due {
+                maintenance_tick.notify_one();
             }
         }
+    };
+    tokio::select! {
+        () = dispatch => {},
+        () = maintenance => unreachable!(),
     }
 
     let drain = async {
@@ -600,21 +657,36 @@ pub async fn management_tick(
     cancellation: &CancellationToken,
 ) -> AppResult<ManagementJobReport> {
     if !cancellation.is_cancelled() {
+        use futures_util::{StreamExt, stream::FuturesUnordered};
+        let settings = coordinator.settings();
         let claimed = jobs::claim_due_management_jobs(
             store,
             scope,
             Utc::now(),
-            coordinator.settings().lock_for,
-            coordinator.settings().claim_limit,
+            settings.lock_for,
+            settings.claim_limit.min(settings.worker_concurrency as u64),
         )
         .await?;
-        let global = Arc::new(Semaphore::new(coordinator.settings().worker_concurrency));
-        for job in claimed {
-            if cancellation.is_cancelled() {
-                break;
+        let mut running: FuturesUnordered<_> = claimed
+            .into_iter()
+            .map(|job| {
+                execute_claimed_job_with_cancellation(
+                    store,
+                    coordinator,
+                    &coordinator.http_slots,
+                    job,
+                    cancellation,
+                )
+            })
+            .collect();
+        let mut first_error = None;
+        while let Some(result) = running.next().await {
+            if let Err(error) = result {
+                first_error.get_or_insert(error);
             }
-            execute_claimed_job_with_cancellation(store, coordinator, &global, job, cancellation)
-                .await?;
+        }
+        if let Some(error) = first_error {
+            return Err(error);
         }
     }
     scope.report(store).await
@@ -848,6 +920,7 @@ async fn wake_parked_receipt(
 
 // A completion releases capacity and can publish due failover work. Refill it
 // without waiting for the maintenance interval or rerunning global maintenance.
+#[allow(clippy::too_many_arguments)]
 async fn claim_ready_jobs(
     coordinator: &PinningCoordinator,
     store: &Store,
@@ -856,6 +929,7 @@ async fn claim_ready_jobs(
     active_job_ids: &BTreeSet<String>,
     now: DateTime<Utc>,
     claim_limit: u64,
+    lane: jobs::WorkerClaimLane<'_>,
 ) -> AppResult<Vec<ClaimedPinJob>> {
     if cancellation.is_cancelled() {
         return Ok(Vec::new());
@@ -877,6 +951,7 @@ async fn claim_ready_jobs(
         coordinator.settings().lock_for,
         claim_limit,
         jobs::WorkerClaimSchedule {
+            lane,
             in_flight_by_provider: &occupancy.in_flight,
             last_served_ticket_by_provider: &occupancy.last_served_ticket,
             configured_priorities: &configured_priorities,
@@ -1143,14 +1218,8 @@ async fn execute_management_observation(
         }
     };
     let expected_request_id = request_id.clone();
-    let Some(mut slot) = acquire_provider_slot(
-        coordinator,
-        store,
-        &mut claimed,
-        coordinator.settings().lock_for,
-        cancellation,
-    )
-    .await?
+    let Some(mut slot) =
+        acquire_provider_slot(coordinator, store, &mut claimed, false, cancellation).await?
     else {
         return Ok(());
     };
@@ -1623,7 +1692,7 @@ async fn dispatch_submit(
         coordinator,
         store,
         &mut claimed,
-        coordinator.settings().lock_for,
+        CID_START.try_with(|_| ()).is_ok(),
         cancellation,
     )
     .await?
@@ -1785,6 +1854,10 @@ async fn dispatch_submit(
             jobs::check_target_job_generation(store.db(), &preflight_job).await
         },
         move |provider| async move {
+            let _ = CID_START.try_with(|(start, wake)| {
+                drop(start.take());
+                wake.notify_one();
+            });
             let observation = provider.submit_observed(request).await;
             update_provider_health(&call_runtime, &observation.result).await;
             Ok(observation)
@@ -2330,14 +2403,8 @@ async fn recover_submit(
         &claimed.model.cid,
         history.correlation.as_deref().unwrap_or(&claimed.model.id),
     );
-    let Some(slot) = acquire_provider_slot(
-        coordinator,
-        store,
-        &mut claimed,
-        coordinator.settings().lock_for,
-        cancellation,
-    )
-    .await?
+    let Some(slot) =
+        acquire_provider_slot(coordinator, store, &mut claimed, false, cancellation).await?
     else {
         return Ok(WorkerContinuation::Done);
     };
@@ -2485,14 +2552,8 @@ async fn recover_unknown_rpc(
         .await
         .map(|_| WorkerContinuation::Done);
     };
-    let Some(mut slot) = acquire_provider_slot(
-        coordinator,
-        store,
-        &mut claimed,
-        coordinator.settings().lock_for,
-        cancellation,
-    )
-    .await?
+    let Some(mut slot) =
+        acquire_provider_slot(coordinator, store, &mut claimed, false, cancellation).await?
     else {
         return Ok(WorkerContinuation::Done);
     };
@@ -2696,14 +2757,8 @@ async fn execute_poll(
         finish_and_reconcile(store, &claimed, Utc::now()).await?;
         return Ok(WorkerContinuation::Done);
     };
-    let Some(mut slot) = acquire_provider_slot(
-        coordinator,
-        store,
-        &mut claimed,
-        coordinator.settings().lock_for,
-        cancellation,
-    )
-    .await?
+    let Some(mut slot) =
+        acquire_provider_slot(coordinator, store, &mut claimed, false, cancellation).await?
     else {
         return Ok(WorkerContinuation::Done);
     };
@@ -3399,14 +3454,8 @@ async fn execute_unpin(
     if !prepare_unpin_writer(store, &claimed, expected_epoch).await? {
         return Ok(());
     }
-    let Some(slot) = acquire_provider_slot(
-        coordinator,
-        store,
-        &mut claimed,
-        coordinator.settings().lock_for,
-        cancellation,
-    )
-    .await?
+    let Some(slot) =
+        acquire_provider_slot(coordinator, store, &mut claimed, false, cancellation).await?
     else {
         return Ok(());
     };
@@ -4247,14 +4296,8 @@ async fn reconcile_failed(
         return Ok(());
     }
 
-    let Some(slot) = acquire_provider_slot(
-        coordinator,
-        store,
-        &mut claimed,
-        coordinator.settings().lock_for,
-        cancellation,
-    )
-    .await?
+    let Some(slot) =
+        acquire_provider_slot(coordinator, store, &mut claimed, false, cancellation).await?
     else {
         return Ok(());
     };
@@ -4817,7 +4860,7 @@ async fn load_submit_context(
 struct ProviderCallSlot {
     provider: Arc<dyn PinningProvider>,
     runtime: ProviderRuntime,
-    _provider_permit: OwnedSemaphorePermit,
+    provider_permit: Option<OwnedSemaphorePermit>,
     health_observed_by_call: bool,
 }
 
@@ -4825,7 +4868,7 @@ async fn acquire_provider_slot(
     coordinator: &PinningCoordinator,
     store: &Store,
     claimed: &mut ClaimedPinJob,
-    lock_for: ChronoDuration,
+    background_submit: bool,
     cancellation: &CancellationToken,
 ) -> AppResult<Option<ProviderCallSlot>> {
     if cancellation.is_cancelled() {
@@ -4910,19 +4953,23 @@ async fn acquire_provider_slot(
                 "missing runtime for pinning provider `{provider_name}`"
             ))
         })?;
+    let lock_for = coordinator.settings().lock_for;
     renew_claim_once(store, claimed, lock_for).await?;
-    let permit = runtime.concurrency.clone().acquire_owned();
-    let ClaimWait::Ready(provider_permit) =
-        wait_with_claim_heartbeat(store, claimed, lock_for, cancellation, permit).await?
-    else {
-        return Ok(None);
+    let provider_permit = if background_submit {
+        None
+    } else {
+        let permit = runtime.concurrency.clone().acquire_owned();
+        let ClaimWait::Ready(permit) =
+            wait_with_claim_heartbeat(store, claimed, lock_for, cancellation, permit).await?
+        else {
+            return Ok(None);
+        };
+        Some(permit.map_err(|_| AppError::Internal("provider semaphore closed".to_owned()))?)
     };
-    let provider_permit =
-        provider_permit.map_err(|_| AppError::Internal("provider semaphore closed".to_owned()))?;
     Ok(Some(ProviderCallSlot {
         provider,
         runtime,
-        _provider_permit: provider_permit,
+        provider_permit,
         health_observed_by_call: false,
     }))
 }
@@ -5125,14 +5172,17 @@ where
 
     // Rate waiting is complete before a global HTTP permit is requested. Slow providers can hold
     // only their own permit/start gate while sleeping, never global capacity needed by peers.
-    let global_permit = global.clone().acquire_owned();
-    let ClaimWait::Ready(global_permit) =
-        wait_with_claim_heartbeat(store, claimed, lock_for, cancellation, global_permit).await?
-    else {
-        return Ok(ProviderCallOutcome::Cancelled);
+    let _global_permit = if slot.provider_permit.is_some() {
+        let permit = global.clone().acquire_owned();
+        let ClaimWait::Ready(permit) =
+            wait_with_claim_heartbeat(store, claimed, lock_for, cancellation, permit).await?
+        else {
+            return Ok(ProviderCallOutcome::Cancelled);
+        };
+        Some(permit.map_err(|_| AppError::Internal("worker semaphore closed".to_owned()))?)
+    } else {
+        None
     };
-    let _global_permit =
-        global_permit.map_err(|_| AppError::Internal("worker semaphore closed".to_owned()))?;
 
     let ClaimWait::Ready(current) =
         wait_with_claim_heartbeat(store, claimed, lock_for, cancellation, preflight()).await?
@@ -5164,9 +5214,6 @@ where
             None,
         ));
     }
-    if cancellation.is_cancelled() {
-        return Ok(ProviderCallOutcome::Cancelled);
-    }
     let work = SharedDecodeBudget::default();
     let permit = job_authority::check_before_call_store(store, &claimed.model, work).await?;
     if !managed_call.allows(&claimed.model.operation, permit.as_ref()) {
@@ -5174,14 +5221,6 @@ where
     }
     let managed_receipt = permit.is_some();
     drop(permit);
-    if !slot.runtime.min_request_interval.is_zero() {
-        *rate_gate = Some(tokio::time::Instant::now() + slot.runtime.min_request_interval);
-    }
-    drop(rate_gate);
-    let heartbeat = claim_heartbeat_period(lock_for)?;
-    let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + heartbeat, heartbeat);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let provider = slot.provider.clone();
     let capture = if managed_receipt {
         // Isolate the large source revalidation future while keeping all claim,
         // frontier, authority and route checks in the same dispatch transaction.
@@ -5201,7 +5240,6 @@ where
     } else {
         None
     };
-    let mut future = Box::pin(call(provider));
     // A dispatched Submit must finish collecting its structured evidence even
     // when a claim is lost. Its caller appends evidence under the old invocation
     // and independently refuses projection into a new claim/lifetime.
@@ -5214,9 +5252,22 @@ where
                 &claimed.model.id,
             )
             .await?);
+    if cancellation.is_cancelled() {
+        return Ok(ProviderCallOutcome::Cancelled);
+    }
+    let heartbeat = claim_heartbeat_period(lock_for)?;
+    let start = tokio::time::Instant::now();
+    let mut interval = tokio::time::interval_at(start + heartbeat, heartbeat);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    if !slot.runtime.min_request_interval.is_zero() {
+        *rate_gate = Some(start + slot.runtime.min_request_interval);
+    }
+    drop(rate_gate);
+    let mut future = Box::pin(call(slot.provider.clone()));
     let mut lost_rpc_claim = false;
     let result = loop {
         tokio::select! {
+            biased;
             result = &mut future => break result,
             _ = interval.tick(), if !lost_rpc_claim => {
                 let renewal = renew_claim_once(store, claimed, lock_for).await;
@@ -6369,6 +6420,7 @@ mod tests {
         let mut contexts = HashMap::from([(
             task_id,
             super::JobLogContext {
+                background: false,
                 job_id: "success-job".to_owned(),
                 provider: "noop".to_owned(),
                 cid: "bafy-success".to_owned(),
@@ -8342,6 +8394,7 @@ mod tests {
                 &Default::default(),
                 later,
                 10,
+                jobs::WorkerClaimLane::All,
             )
             .await
             .unwrap()
@@ -9489,6 +9542,7 @@ mod tests {
                     &Default::default(),
                     now,
                     10,
+                    jobs::WorkerClaimLane::All,
                 )
                 .await
                 .unwrap();
@@ -12599,6 +12653,7 @@ mod tests {
                 &Default::default(),
                 now,
                 1,
+                jobs::WorkerClaimLane::All,
             )
             .await
             .unwrap()

@@ -2098,6 +2098,7 @@ pub(crate) async fn claim_due_management_jobs(
             now + lock_for,
             work.clone(),
             Some(&tx),
+            WorkerClaimLane::All,
         )
         .await?
         {
@@ -2119,7 +2120,39 @@ pub(crate) async fn claim_due_management_jobs(
     Ok(claimed)
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum WorkerClaimLane<'a> {
+    All,
+    Ordinary(&'a BTreeSet<String>),
+    KuboCid(&'a BTreeSet<String>),
+}
+
+impl WorkerClaimLane<'_> {
+    fn due(self, now: DateTimeUtc) -> Condition {
+        let providers = match self {
+            Self::All => return due_claim_condition(now),
+            Self::Ordinary(providers) | Self::KuboCid(providers) => providers,
+        };
+        let fresh = Condition::all()
+            .add(pin_job::Column::Provider.is_in(providers.iter().cloned()))
+            .add(pin_job::Column::State.eq(STATE_PENDING))
+            .add(pin_job::Column::Operation.eq("submit"))
+            // Make the complement two-valued even when submit_phase is NULL.
+            .add(pin_job::Column::SubmitPhase.is_not_null())
+            .add(pin_job::Column::SubmitPhase.eq(SUBMIT_PHASE_READY));
+        Condition::all()
+            .add(due_claim_condition(now))
+            .add(if matches!(self, Self::Ordinary(_)) {
+                fresh.not()
+            } else {
+                fresh
+            })
+    }
+}
+
+#[derive(Clone, Copy)]
 pub(crate) struct WorkerClaimSchedule<'a> {
+    pub lane: WorkerClaimLane<'a>,
     pub in_flight_by_provider: &'a BTreeMap<String, usize>,
     pub last_served_ticket_by_provider: &'a BTreeMap<String, u64>,
     pub configured_priorities: &'a BTreeMap<String, u32>,
@@ -2146,6 +2179,7 @@ pub async fn claim_due_jobs_fair<C: ConnectionTrait + TransactionTrait>(
         lock_for,
         limit,
         WorkerClaimSchedule {
+            lane: WorkerClaimLane::All,
             in_flight_by_provider,
             last_served_ticket_by_provider,
             configured_priorities,
@@ -2168,31 +2202,20 @@ pub(crate) async fn claim_due_worker_jobs_fair<C: ConnectionTrait + TransactionT
     }
     let locked_until = now + lock_for;
     for attempt in 0..=MAX_SQLITE_CLAIM_RETRIES {
-        let in_flight_by_provider = schedule.in_flight_by_provider.clone();
-        let last_served_ticket_by_provider = schedule.last_served_ticket_by_provider.clone();
-        let configured_priorities = schedule.configured_priorities.clone();
-        let active_job_ids = schedule.active_job_ids.clone();
-        let result = db
-            .transaction(|txn| {
-                Box::pin(async move {
-                    lock_sqlite_claim_writer(txn).await?;
-                    claim_worker_batch(
-                        txn,
-                        now,
-                        locked_until,
-                        limit,
-                        WorkerClaimSchedule {
-                            in_flight_by_provider: &in_flight_by_provider,
-                            last_served_ticket_by_provider: &last_served_ticket_by_provider,
-                            configured_priorities: &configured_priorities,
-                            active_job_ids: &active_job_ids,
-                        },
-                        None,
-                    )
-                    .await
-                })
-            })
-            .await;
+        let result = async {
+            let tx = db.begin().await?;
+            match claim_worker_batch(&tx, now, locked_until, limit, schedule, None).await {
+                Ok(claimed) => {
+                    tx.commit().await?;
+                    Ok(claimed)
+                }
+                Err(error) => {
+                    tx.rollback().await?;
+                    Err(error)
+                }
+            }
+        }
+        .await;
         match result {
             Ok(claimed) => return Ok(claimed),
             Err(error)
@@ -2220,24 +2243,8 @@ pub(crate) async fn claim_due_worker_jobs_store(
     let work = SharedDecodeBudget::default();
     for attempt in 0..=MAX_SQLITE_CLAIM_RETRIES {
         let tx = store.begin_runtime(DecodeWork::shared(&work)).await?;
-        let result = async {
-            lock_sqlite_claim_writer(tx.db()).await?;
-            claim_worker_batch(
-                tx.db(),
-                now,
-                now + lock_for,
-                limit,
-                WorkerClaimSchedule {
-                    in_flight_by_provider: schedule.in_flight_by_provider,
-                    last_served_ticket_by_provider: schedule.last_served_ticket_by_provider,
-                    configured_priorities: schedule.configured_priorities,
-                    active_job_ids: schedule.active_job_ids,
-                },
-                Some(&tx),
-            )
-            .await
-        }
-        .await;
+        let result =
+            claim_worker_batch(tx.db(), now, now + lock_for, limit, schedule, Some(&tx)).await;
         match result {
             Ok(claimed) => {
                 tx.commit().await?;
@@ -2264,7 +2271,8 @@ async fn claim_worker_batch(
     schedule: WorkerClaimSchedule<'_>,
     runtime: Option<&crate::store::RuntimeTransaction>,
 ) -> Result<Vec<ClaimedPinJob>, sea_orm::DbErr> {
-    let mut due = Condition::all().add(due_claim_condition(now));
+    lock_sqlite_claim_writer(tx).await?;
+    let mut due = Condition::all().add(schedule.lane.due(now));
     if !schedule.active_job_ids.is_empty() {
         due = due.add(pin_job::Column::Id.is_not_in(schedule.active_job_ids.clone()));
     }
@@ -2301,19 +2309,16 @@ async fn claim_worker_batch(
     update_plan.sort_by(|left, right| left.candidate.id.cmp(&right.candidate.id));
     let mut claimed = Vec::with_capacity(update_plan.len());
     for ranked in update_plan {
-        let result = if let Some(owner) = runtime {
-            claim_candidate_core(
-                tx,
-                ranked.candidate,
-                now,
-                locked_until,
-                SharedDecodeBudget::default(),
-                Some(owner),
-            )
-            .await?
-        } else {
-            claim_candidate(tx, ranked.candidate, now, locked_until).await?
-        };
+        let result = claim_candidate_core(
+            tx,
+            ranked.candidate,
+            now,
+            locked_until,
+            SharedDecodeBudget::default(),
+            runtime,
+            schedule.lane,
+        )
+        .await?;
         if let Some(job) = result {
             claimed.push((ranked.fair_rank, job));
         }
@@ -2432,23 +2437,16 @@ async fn claim_candidate<C: ConnectionTrait>(
     now: DateTimeUtc,
     locked_until: DateTimeUtc,
 ) -> Result<Option<ClaimedPinJob>, sea_orm::DbErr> {
-    claim_candidate_with_work(
+    claim_candidate_core(
         db,
         candidate,
         now,
         locked_until,
-        super::management::records::SharedDecodeBudget::default(),
+        SharedDecodeBudget::default(),
+        None,
+        WorkerClaimLane::All,
     )
     .await
-}
-async fn claim_candidate_with_work<C: ConnectionTrait>(
-    db: &C,
-    candidate: pin_job::Model,
-    now: DateTimeUtc,
-    locked_until: DateTimeUtc,
-    work: super::management::records::SharedDecodeBudget,
-) -> Result<Option<ClaimedPinJob>, sea_orm::DbErr> {
-    claim_candidate_core(db, candidate, now, locked_until, work, None).await
 }
 
 async fn claim_candidate_core<C: ConnectionTrait>(
@@ -2458,11 +2456,12 @@ async fn claim_candidate_core<C: ConnectionTrait>(
     locked_until: DateTimeUtc,
     work: SharedDecodeBudget,
     runtime: Option<&crate::store::RuntimeTransaction>,
+    lane: WorkerClaimLane<'_>,
 ) -> Result<Option<ClaimedPinJob>, sea_orm::DbErr> {
     let candidate = if db.get_database_backend() == DatabaseBackend::Postgres {
         // A previous claim in this batch already holds the pin_jobs revision row.
         let Some(current) = pin_job::Entity::find_by_id(&candidate.id)
-            .filter(due_claim_condition(now))
+            .filter(lane.due(now))
             .lock_with_behavior(
                 sea_orm::sea_query::LockType::Update,
                 sea_orm::sea_query::LockBehavior::SkipLocked,
@@ -4651,6 +4650,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ordinary_lane_reaches_unpin_and_reclaim_behind_ready_submit_backlog() {
+        let db = setup().await;
+        for (provider, cid) in [
+            ("a-other", "ordinary"),
+            ("blocked", "no-slot"),
+            ("kubo", "first"),
+            ("kubo", "next-1"),
+            ("kubo", "next-2"),
+            ("kubo", "next-3"),
+        ] {
+            enqueue_job(
+                &db,
+                submit_job(provider, cid, "lease", "target", 1, time(0)),
+            )
+            .await
+            .unwrap();
+        }
+        enqueue_job(&db, unpin_job("kubo", "remove", 1, time(1)))
+            .await
+            .unwrap();
+        let available = BTreeSet::from(["kubo".to_owned()]);
+        let schedule = WorkerClaimSchedule {
+            lane: WorkerClaimLane::KuboCid(&available),
+            in_flight_by_provider: &BTreeMap::new(),
+            last_served_ticket_by_provider: &BTreeMap::new(),
+            configured_priorities: &BTreeMap::new(),
+            active_job_ids: &BTreeSet::new(),
+        };
+        let lock = Duration::seconds(30);
+        let fresh = claim_due_worker_jobs_fair(&db, time(1), lock, 1, schedule)
+            .await
+            .unwrap();
+        assert_eq!(fresh[0].model.cid, "first");
+
+        let all_kubo = BTreeSet::from(["kubo".to_owned(), "blocked".to_owned()]);
+        let ordinary = claim_due_worker_jobs_fair(
+            &db,
+            time(60),
+            lock,
+            3,
+            WorkerClaimSchedule {
+                lane: WorkerClaimLane::Ordinary(&all_kubo),
+                ..schedule
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            ordinary
+                .iter()
+                .map(|j| (j.model.cid.as_str(), j.reclaimed))
+                .collect::<Vec<_>>(),
+            [("ordinary", false), ("first", true), ("remove", false)]
+        );
+    }
+
+    #[tokio::test]
     async fn fair_claim_excludes_locally_active_expired_jobs_without_starving_the_next_candidate() {
         let directory = tempfile::tempdir().unwrap();
         let url = format!(
@@ -4692,6 +4748,7 @@ mod tests {
             Duration::seconds(30),
             1,
             WorkerClaimSchedule {
+                lane: WorkerClaimLane::All,
                 in_flight_by_provider: &occupancy,
                 last_served_ticket_by_provider: &BTreeMap::new(),
                 configured_priorities: &BTreeMap::new(),

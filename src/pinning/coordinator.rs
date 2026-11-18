@@ -67,6 +67,7 @@ pub struct PinningCoordinator {
     policy_providers: HashMap<String, Vec<String>>,
     providers: HashMap<String, Arc<dyn PinningProvider>>,
     settings: WorkerSettings,
+    pub(crate) http_slots: Arc<Semaphore>,
     provider_runtime: HashMap<String, ProviderRuntime>,
     identities: HashMap<String, ProviderIdentity>,
 }
@@ -338,6 +339,7 @@ impl PinningCoordinator {
             },
             policy_providers,
             providers,
+            http_slots: Arc::new(Semaphore::new(settings.worker_concurrency)),
             settings,
             provider_runtime,
             identities,
@@ -533,11 +535,10 @@ impl PinningCoordinator {
         coordinator: &mut Arc<Self>,
         configure: impl FnOnce(&mut WorkerSettings),
     ) {
-        configure(
-            &mut Arc::get_mut(coordinator)
-                .expect("test coordinator must not yet be shared")
-                .settings,
-        );
+        let coordinator =
+            Arc::get_mut(coordinator).expect("test coordinator must not yet be shared");
+        configure(&mut coordinator.settings);
+        coordinator.http_slots = Arc::new(Semaphore::new(coordinator.settings.worker_concurrency));
     }
 
     #[cfg(test)]

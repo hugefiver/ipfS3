@@ -26,6 +26,9 @@ use wiremock::{
     matchers::{method, path, query_param},
 };
 
+#[path = "rpc_worker_tests/cid_flow.rs"]
+mod cid_flow;
+
 const CID: &str = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
 const OTHER: &str = "bafkreigh2akiscaildc6ii5zji4bq7kly5k3s7svv6q2wx2nn5rtj5xuu4";
 
@@ -70,7 +73,8 @@ async fn fixture(
     strategy: RpcStrategy,
 ) -> RpcFixture {
     let db = store::connect_database("sqlite::memory:").await.unwrap();
-    fixture_on_database(endpoint, source, profile, strategy, db).await
+    let raw = rpc_config(&endpoint, &source.uri(), profile, strategy);
+    fixture_on_database(raw, db).await
 }
 
 fn rpc_config(
@@ -143,23 +147,18 @@ fn rpc_config(
     raw
 }
 
-async fn fixture_on_database(
-    endpoint: String,
-    source: &MockServer,
-    profile: RpcProfile,
-    strategy: RpcStrategy,
-    db: sea_orm::DatabaseConnection,
-) -> RpcFixture {
-    let raw = rpc_config(&endpoint, &source.uri(), profile, strategy);
+async fn fixture_on_database(raw: Config, db: sea_orm::DatabaseConnection) -> RpcFixture {
     let validated = ValidatedPinningConfig::from_config(&raw, |name| {
         (name == "TEST_RPC_SECRET").then(|| "private-fixture-token".into())
     })
     .unwrap();
     let key = validated.providers[0].identity.allocation_key();
     let policy_id = validated.policies[0].identity.clone();
-    let coordinator =
-        PinningCoordinator::build_with_kubo(validated, Some(KuboClient::new(source.uri())))
-            .unwrap();
+    let coordinator = PinningCoordinator::build_with_kubo(
+        validated,
+        Some(KuboClient::new(raw.kubo.rpc_url.clone())),
+    )
+    .unwrap();
     store::run_migrations(&db).await.unwrap();
     let manager = SchemaManager::new(&db);
     assert!(
@@ -238,6 +237,7 @@ impl RpcFixture {
                 last_served_ticket_by_provider: &Default::default(),
                 configured_priorities: &Default::default(),
                 active_job_ids: &Default::default(),
+                lane: jobs::WorkerClaimLane::All,
             },
         )
         .await
@@ -1014,14 +1014,13 @@ async fn confirmed_management_cid_reconcile(
             .replace('\\', "/")
     );
     let db = store::connect_database(&url).await.unwrap();
-    let fixture = fixture_on_database(
-        target.uri(),
-        &source,
+    let raw = rpc_config(
+        &target.uri(),
+        &source.uri(),
         RpcProfile::Kubo,
         RpcStrategy::Cid,
-        db,
-    )
-    .await;
+    );
+    let fixture = fixture_on_database(raw, db).await;
     let original_claim = fixture.claim().await.unwrap();
     let original_job_id = original_claim.model.id.clone();
     if late_matched {
@@ -2203,14 +2202,13 @@ async fn observed_terminal_receipt(mut db: sea_orm::DatabaseConnection) {
         .expect(1)
         .mount(&target)
         .await;
-    let fixture = fixture_on_database(
-        target.uri(),
-        &source,
+    let raw = rpc_config(
+        &target.uri(),
+        &source.uri(),
         RpcProfile::Filebase,
         RpcStrategy::Upload,
-        db,
-    )
-    .await;
+    );
+    let fixture = fixture_on_database(raw, db).await;
     trace.take("RPC cold fixture", false);
     let claim = fixture.claim().await.unwrap();
     let dispatched = dispatch_submit(
@@ -2313,7 +2311,8 @@ async fn postgres_shared_cid_receipt_projection_orders_all_leases_before_remote(
         .await;
     let mut completion = None;
     let result = std::panic::AssertUnwindSafe(async {
-        let fixture = Arc::new(fixture_on_database(target.uri(), &source, RpcProfile::Filebase, RpcStrategy::Upload, db.clone()).await);
+        let raw = rpc_config(&target.uri(), &source.uri(), RpcProfile::Filebase, RpcStrategy::Upload);
+        let fixture = Arc::new(fixture_on_database(raw, db.clone()).await);
         fixture.publish("shared", CID).await;
         let claimed = fixture.claim().await.unwrap();
         let original_lease = claimed.model.lease_id.clone().unwrap();
