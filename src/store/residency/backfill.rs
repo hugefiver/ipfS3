@@ -2,7 +2,7 @@ use chrono::Duration;
 use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, DatabaseConnection,
     DatabaseTransaction, EntityTrait, QueryFilter, QuerySelect, Statement, TransactionError,
-    TransactionTrait, sea_query::Expr,
+    TransactionTrait, UpdateMany, sea_query::Expr,
 };
 
 use crate::{
@@ -245,6 +245,47 @@ pub async fn pending_hot_residency_page<C: ConnectionTrait>(
     })
 }
 
+async fn active_claim_update<C: ConnectionTrait>(
+    txn: &C,
+    claim: &ClaimedResidencyBackfill,
+) -> AppResult<UpdateMany<residency_backfill::Entity>> {
+    let active_lease = match txn.get_database_backend() {
+        DatabaseBackend::Postgres => "\"lease_until\" > clock_timestamp()",
+        DatabaseBackend::Sqlite => "julianday(\"lease_until\") > julianday('now')",
+        DatabaseBackend::MySql => {
+            return Err(AppError::Internal(
+                "residency backfill requires SQLite or PostgreSQL".to_owned(),
+            ));
+        }
+    };
+    Ok(residency_backfill::Entity::update_many()
+        .col_expr(
+            residency_backfill::Column::UpdatedAt,
+            Expr::value(database_now(txn).await?),
+        )
+        .filter(residency_backfill::Column::Id.eq(BACKFILL_ID))
+        .filter(residency_backfill::Column::ClaimEpoch.eq(claim.claim_epoch))
+        .filter(residency_backfill::Column::ClaimedBy.eq(&claim.worker_id))
+        .filter(residency_backfill::Column::Completed.eq(false))
+        .filter(Expr::cust(active_lease)))
+}
+
+/// Fence a receipt or checkpoint a processed prefix without releasing the claim.
+pub(crate) async fn record_residency_backfill_progress<C: ConnectionTrait>(
+    db: &C,
+    claim: &ClaimedResidencyBackfill,
+    cursor: Option<&ResidencyBackfillCursor>,
+) -> AppResult<bool> {
+    let mut update = active_claim_update(db, claim).await?;
+    if let Some(cursor) = cursor {
+        update = update.col_expr(
+            residency_backfill::Column::CursorVersionRowId,
+            Expr::value(cursor.version_row_id.clone()),
+        );
+    }
+    Ok(update.exec(db).await?.rows_affected == 1)
+}
+
 pub async fn checkpoint_residency_backfill_in_transaction(
     txn: &DatabaseTransaction,
     claim: &ClaimedResidencyBackfill,
@@ -259,17 +300,8 @@ pub async fn checkpoint_residency_backfill_in_transaction(
             "invalid residency backfill checkpoint".to_owned(),
         ));
     }
-    let now = database_now(txn).await?;
-    let active_lease = match txn.get_database_backend() {
-        DatabaseBackend::Postgres => "\"lease_until\" > clock_timestamp()",
-        DatabaseBackend::Sqlite => "julianday(\"lease_until\") > julianday('now')",
-        DatabaseBackend::MySql => {
-            return Err(AppError::Internal(
-                "residency backfill requires SQLite or PostgreSQL".to_owned(),
-            ));
-        }
-    };
-    let updated = residency_backfill::Entity::update_many()
+    let updated = active_claim_update(txn, claim)
+        .await?
         .col_expr(
             residency_backfill::Column::CursorVersionRowId,
             Expr::value(if complete {
@@ -287,12 +319,6 @@ pub async fn checkpoint_residency_backfill_in_transaction(
             residency_backfill::Column::ClaimedBy,
             Expr::value(Option::<String>::None),
         )
-        .col_expr(residency_backfill::Column::UpdatedAt, Expr::value(now))
-        .filter(residency_backfill::Column::Id.eq(BACKFILL_ID))
-        .filter(residency_backfill::Column::ClaimEpoch.eq(claim.claim_epoch))
-        .filter(residency_backfill::Column::ClaimedBy.eq(&claim.worker_id))
-        .filter(residency_backfill::Column::Completed.eq(false))
-        .filter(Expr::cust(active_lease))
         .exec(txn)
         .await?;
     Ok(updated.rows_affected == 1)
@@ -312,17 +338,8 @@ pub async fn release_residency_backfill_in_transaction(
             "invalid residency backfill release".to_owned(),
         ));
     }
-    let now = database_now(txn).await?;
-    let active_lease = match txn.get_database_backend() {
-        DatabaseBackend::Postgres => "\"lease_until\" > clock_timestamp()",
-        DatabaseBackend::Sqlite => "julianday(\"lease_until\") > julianday('now')",
-        DatabaseBackend::MySql => {
-            return Err(AppError::Internal(
-                "residency backfill requires SQLite or PostgreSQL".to_owned(),
-            ));
-        }
-    };
-    let updated = residency_backfill::Entity::update_many()
+    let updated = active_claim_update(txn, claim)
+        .await?
         .col_expr(
             residency_backfill::Column::LeaseUntil,
             Expr::value(Option::<chrono::DateTime<chrono::Utc>>::None),
@@ -331,12 +348,6 @@ pub async fn release_residency_backfill_in_transaction(
             residency_backfill::Column::ClaimedBy,
             Expr::value(Option::<String>::None),
         )
-        .col_expr(residency_backfill::Column::UpdatedAt, Expr::value(now))
-        .filter(residency_backfill::Column::Id.eq(BACKFILL_ID))
-        .filter(residency_backfill::Column::ClaimEpoch.eq(claim.claim_epoch))
-        .filter(residency_backfill::Column::ClaimedBy.eq(&claim.worker_id))
-        .filter(residency_backfill::Column::Completed.eq(false))
-        .filter(Expr::cust(active_lease))
         .exec(txn)
         .await?;
     Ok(updated.rows_affected == 1)

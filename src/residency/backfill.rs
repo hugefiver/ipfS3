@@ -2,6 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::Duration as ChronoDuration;
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use sea_orm::TransactionTrait;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -9,19 +10,17 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     error::{AppError, AppResult},
     kubo::{KuboClient, LocalResidencyVerificationReceipt},
-    residency::{ClaimedResidencyBackfill, ResidencyBackfillCursor},
+    residency::{ClaimedResidencyBackfill, ResidencyBackfillCursor, VersionResidencyIdentity},
     store::{
         Store,
         residency::{
             checkpoint_residency_backfill_in_transaction, claim_residency_backfill,
             mark_hot_verified_in_transaction, pending_hot_residency_page,
-            release_residency_backfill_in_transaction,
+            record_residency_backfill_progress, release_residency_backfill_in_transaction,
         },
     },
 };
 
-// One item plus one row of look-ahead is enough to advance a stable cursor and
-// identify the end of a pass without loading a large batch before external IO.
 const PAGE_SIZE: u64 = 2;
 const CLAIM_LEASE: ChronoDuration = ChronoDuration::minutes(30);
 const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -108,7 +107,6 @@ fn start_worker_with_verifier<V: ResidencyVerifier>(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProcessOutcome {
-    Progress,
     Idle,
     Contended,
     Cancelled,
@@ -123,7 +121,6 @@ async fn run_worker<V: ResidencyVerifier>(
     loop {
         let outcome = process_one(&store, verifier.as_ref(), &cancellation, &settings).await;
         match outcome {
-            Ok(ProcessOutcome::Progress) => continue,
             Ok(ProcessOutcome::Cancelled) => break,
             Ok(ProcessOutcome::Idle | ProcessOutcome::Contended) => {}
             Err(_) => tracing::error!(failure = "residency_backfill_iteration"),
@@ -143,128 +140,146 @@ async fn process_one<V: ResidencyVerifier>(
     cancellation: &CancellationToken,
     settings: &WorkerSettings,
 ) -> AppResult<ProcessOutcome> {
-    let claim = tokio::select! {
-        biased;
-        _ = cancellation.cancelled() => return Ok(ProcessOutcome::Cancelled),
-        result = claim_residency_backfill(
-            store.db(),
-            &settings.worker_id,
-            settings.claim_lease,
-        ) => result?,
-    };
-    let Some(claim) = claim else {
-        return Ok(ProcessOutcome::Contended);
-    };
-
     if cancellation.is_cancelled() {
-        release_claim(store, &claim).await?;
         return Ok(ProcessOutcome::Cancelled);
     }
-
-    let page =
-        pending_hot_residency_page(store.db(), claim.cursor.as_ref(), settings.page_size).await?;
-    let Some(item) = page.items.first() else {
-        let checkpointed = checkpoint_claim(store, &claim, None, true).await?;
-        return Ok(if checkpointed {
-            ProcessOutcome::Idle
-        } else {
-            ProcessOutcome::Contended
-        });
-    };
-
-    let receipt = tokio::select! {
-        biased;
-        _ = cancellation.cancelled() => {
-            release_claim(store, &claim).await?;
-            return Ok(ProcessOutcome::Cancelled);
-        }
-        result = verifier.verify_local_residency(&item.identity.cid) => result,
-    };
-
-    let next_cursor = ResidencyBackfillCursor {
-        version_row_id: item.identity.version_row_id.clone(),
-    };
-    let completes_pass = page.complete && page.items.len() == 1;
-
-    let receipt = match receipt {
-        Ok(receipt) if receipt.cid == item.identity.cid && !receipt.node_identity.is_empty() => {
-            receipt
-        }
-        Ok(_) => {
-            tracing::warn!(failure = "residency_verification_receipt_mismatch");
-            let checkpointed =
-                checkpoint_claim(store, &claim, Some(&next_cursor), completes_pass).await?;
-            return Ok(checkpoint_outcome(checkpointed, completes_pass));
-        }
-        Err(_) => {
-            tracing::warn!(failure = "residency_verification");
-            let checkpointed =
-                checkpoint_claim(store, &claim, Some(&next_cursor), completes_pass).await?;
-            return Ok(checkpoint_outcome(checkpointed, completes_pass));
-        }
-    };
-
-    let serialized_receipt = serde_json::to_string(&receipt).map_err(|_| {
-        AppError::Internal("local residency receipt serialization failed".to_owned())
-    })?;
-    let txn = store.db().begin().await?;
-    let marked = mark_hot_verified_in_transaction(
-        &txn,
-        &item.identity,
-        &receipt.node_identity,
-        &serialized_receipt,
-    )
-    .await;
-    if marked.is_err() {
-        txn.rollback().await?;
-        tracing::warn!(failure = "residency_verification_owner_revalidation");
-        let checkpointed =
-            checkpoint_claim(store, &claim, Some(&next_cursor), completes_pass).await?;
-        return Ok(checkpoint_outcome(checkpointed, completes_pass));
-    }
-
-    // Owner/version rows are locked by mark_hot_verified first. The durable
-    // claim row is deliberately fenced second to preserve global lock order.
-    let checkpointed = checkpoint_residency_backfill_in_transaction(
-        &txn,
-        &claim,
-        Some(&next_cursor),
-        completes_pass,
-    )
-    .await?;
-    if !checkpointed {
-        txn.rollback().await?;
+    let Some(claim) =
+        claim_residency_backfill(store.db(), &settings.worker_id, settings.claim_lease).await?
+    else {
         return Ok(ProcessOutcome::Contended);
+    };
+    let outcome = process_claim(store, verifier, cancellation, &claim, settings).await;
+    match &outcome {
+        Err(_) => {
+            if release_claim(store, &claim).await.is_err() {
+                tracing::error!(failure = "residency_backfill_release");
+            }
+        }
+        Ok(ProcessOutcome::Cancelled) => release_claim(store, &claim).await?,
+        _ => {}
     }
-    txn.commit().await?;
-    Ok(checkpoint_outcome(true, completes_pass))
+    outcome
 }
 
-fn checkpoint_outcome(checkpointed: bool, completes_pass: bool) -> ProcessOutcome {
-    if checkpointed && completes_pass {
-        ProcessOutcome::Idle
-    } else if checkpointed {
-        ProcessOutcome::Progress
+async fn process_claim<V: ResidencyVerifier>(
+    store: &Store,
+    verifier: &V,
+    cancellation: &CancellationToken,
+    claim: &ClaimedResidencyBackfill,
+    settings: &WorkerSettings,
+) -> AppResult<ProcessOutcome> {
+    let mut pending = FuturesUnordered::new();
+    let mut cursor = claim.cursor.clone();
+    let mut discovered = 0u64;
+    let mut checkpointed = 0;
+    // Only in-flight rows need bookkeeping: each remembers the cursor immediately before it.
+    let mut outstanding = Vec::new();
+    let mut exhausted = false;
+    let lease = tokio::time::sleep(
+        settings
+            .claim_lease
+            .to_std()
+            .expect("validated claim lease"),
+    );
+    tokio::pin!(lease);
+    loop {
+        if !exhausted {
+            let available = settings.page_size - pending.len() as u64;
+            let page = pending_hot_residency_page(store.db(), cursor.as_ref(), available).await?;
+            exhausted = page.complete;
+            for item in page.items {
+                discovered += 1;
+                let position = discovered;
+                let previous = cursor.replace(ResidencyBackfillCursor {
+                    version_row_id: item.identity.version_row_id.clone(),
+                });
+                outstanding.push((position, previous));
+                pending.push(async move {
+                    let receipt = verifier.verify_local_residency(&item.identity.cid).await;
+                    (position, item.identity, receipt)
+                });
+            }
+        }
+        let result = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Ok(ProcessOutcome::Cancelled),
+            _ = &mut lease => return Ok(ProcessOutcome::Contended),
+            result = pending.next() => result,
+        };
+        let Some((position, identity, receipt)) = result else {
+            break;
+        };
+        outstanding.retain(|(index, _)| *index != position);
+        let (prefix, safe_cursor) = outstanding
+            .first()
+            .map_or((discovered, cursor.as_ref()), |(first, previous)| {
+                (first - 1, previous.as_ref())
+            });
+        let checkpoint = if prefix - checkpointed >= settings.page_size {
+            checkpointed = prefix;
+            safe_cursor
+        } else {
+            None
+        };
+        if !record_verification(store, claim, &identity, receipt, checkpoint).await? {
+            return Ok(ProcessOutcome::Contended);
+        }
+    }
+
+    let txn = store.db().begin().await?;
+    if checkpoint_residency_backfill_in_transaction(&txn, claim, None, true).await? {
+        txn.commit().await?;
+        Ok(ProcessOutcome::Idle)
     } else {
-        ProcessOutcome::Contended
+        txn.rollback().await?;
+        Ok(ProcessOutcome::Contended)
     }
 }
 
-async fn checkpoint_claim(
+async fn record_verification(
     store: &Store,
     claim: &ClaimedResidencyBackfill,
-    next_cursor: Option<&ResidencyBackfillCursor>,
-    complete: bool,
+    identity: &VersionResidencyIdentity,
+    result: AppResult<LocalResidencyVerificationReceipt>,
+    checkpoint: Option<&ResidencyBackfillCursor>,
 ) -> AppResult<bool> {
-    let txn = store.db().begin().await?;
-    let checkpointed =
-        checkpoint_residency_backfill_in_transaction(&txn, claim, next_cursor, complete).await?;
-    if checkpointed {
-        txn.commit().await?;
-    } else {
-        txn.rollback().await?;
+    match result {
+        Ok(receipt) if receipt.cid == identity.cid && !receipt.node_identity.is_empty() => {
+            let serialized = serde_json::to_string(&receipt).map_err(|_| {
+                AppError::Internal("local residency receipt serialization failed".to_owned())
+            })?;
+            let txn = store.db().begin().await?;
+            match mark_hot_verified_in_transaction(
+                &txn,
+                identity,
+                &receipt.node_identity,
+                &serialized,
+            )
+            .await
+            {
+                Ok(_) => {
+                    if !record_residency_backfill_progress(&txn, claim, checkpoint).await? {
+                        txn.rollback().await?;
+                        return Ok(false);
+                    }
+                    txn.commit().await?;
+                    return Ok(true);
+                }
+                Err(error @ AppError::Database(_)) => return Err(error),
+                Err(_) => {
+                    txn.rollback().await?;
+                    tracing::warn!(failure = "residency_verification_owner_revalidation");
+                }
+            }
+        }
+        Ok(_) => tracing::warn!(failure = "residency_verification_receipt_mismatch"),
+        Err(_) => tracing::warn!(failure = "residency_verification"),
     }
-    Ok(checkpointed)
+    if checkpoint.is_some() {
+        record_residency_backfill_progress(store.db(), claim, checkpoint).await
+    } else {
+        Ok(true)
+    }
 }
 
 async fn release_claim(store: &Store, claim: &ClaimedResidencyBackfill) -> AppResult<()> {
@@ -289,7 +304,10 @@ mod tests {
         time::Duration,
     };
 
-    use sea_orm::{ActiveModelTrait, ActiveValue::Set, Database, EntityTrait, TransactionTrait};
+    use sea_orm::{
+        ActiveModelTrait, ActiveValue::Set, ConnectionTrait, Database, EntityTrait,
+        TransactionTrait,
+    };
     use tokio::sync::{Mutex, Notify};
 
     use super::*;
@@ -467,6 +485,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn receipt_write_error_releases_claim_and_preserves_the_processed_prefix() {
+        let store = test_store().await;
+        seed_pending(&store, "a", CID_A).await;
+        seed_pending(&store, "b", CID_B).await;
+        seed_pending(&store, "c", CID_C).await;
+        store.db().execute_unprepared(
+            "CREATE TRIGGER reject_receipt BEFORE UPDATE OF verification_receipt ON physical_residencies \
+             BEGIN SELECT RAISE(ABORT, 'injected write failure'); END",
+        ).await.unwrap();
+        let verifier = ScriptedVerifier {
+            failures: Mutex::new(HashMap::from([
+                (CID_A.to_owned(), 1),
+                (CID_B.to_owned(), 1),
+            ])),
+            calls: Mutex::new(Vec::new()),
+        };
+        let token = CancellationToken::new();
+        assert!(matches!(
+            process_one(&store, &verifier, &token, &test_settings("worker-a")).await,
+            Err(AppError::Database(_))
+        ));
+        store
+            .db()
+            .execute_unprepared("DROP TRIGGER reject_receipt")
+            .await
+            .unwrap();
+        assert_eq!(
+            process_one(&store, &verifier, &token, &test_settings("worker-b"))
+                .await
+                .unwrap(),
+            ProcessOutcome::Idle
+        );
+        wait_verified(&store, "version-c").await;
+        let calls = verifier.calls.lock().await;
+        assert_eq!(calls.len(), 4, "the new claim must resume after a and b");
+        assert_eq!(calls[3], CID_C);
+    }
+
+    #[tokio::test]
     async fn retries_failures_fairly_and_revisits_completed_scans_for_new_writes() {
         let store = test_store().await;
         seed_pending(&store, "a", CID_A).await;
@@ -485,11 +542,12 @@ mod tests {
         wait_verified(&store, "version-a").await;
         wait_verified(&store, "version-b").await;
         wait_pass_complete(&store).await;
-        assert_eq!(
-            &verifier.calls.lock().await[..3],
-            &[CID_A.to_owned(), CID_B.to_owned(), CID_A.to_owned()],
-            "a failed item must not block b and must be retried on the next pass"
-        );
+        {
+            let calls = verifier.calls.lock().await;
+            assert_eq!(calls.len(), 3);
+            assert!(calls[..2].iter().any(|cid| cid == CID_B));
+            assert_eq!(calls[2], CID_A, "retry a only after b was attempted");
+        }
 
         // This ID sorts before the previous cursor, proving a completed pass is
         // restarted rather than treated as a permanent terminal state.
@@ -525,10 +583,12 @@ mod tests {
             &self,
             cid: &str,
         ) -> AppResult<LocalResidencyVerificationReceipt> {
-            self.started.store(true, Ordering::Release);
-            self.started_notify.notify_waiters();
-            while !self.released.load(Ordering::Acquire) {
-                self.release.notified().await;
+            if cid == CID_A {
+                self.started.store(true, Ordering::Release);
+                self.started_notify.notify_waiters();
+                while !self.released.load(Ordering::Acquire) {
+                    self.release.notified().await;
+                }
             }
             Ok(LocalResidencyVerificationReceipt {
                 node_identity: "test-node".to_owned(),
@@ -592,17 +652,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expired_epoch_cannot_commit_a_verification_receipt() {
+    async fn later_receipts_commit_while_slow_item_is_fenced_on_takeover() {
         let store = test_store().await;
         seed_pending(&store, "a", CID_A).await;
+        seed_pending(&store, "b", CID_B).await;
+        seed_pending(&store, "c", CID_C).await;
         let verifier = Arc::new(GateVerifier {
             started: AtomicBool::new(false),
             started_notify: Notify::new(),
             released: AtomicBool::new(false),
             release: Notify::new(),
         });
-        let mut settings = test_settings("worker-a");
-        settings.claim_lease = ChronoDuration::milliseconds(50);
+        let settings = test_settings("worker-a");
         let worker_store = store.clone();
         let worker_verifier = verifier.clone();
         let worker = tokio::spawn(async move {
@@ -615,7 +676,22 @@ mod tests {
             .await
         });
         verifier.wait_started().await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        wait_verified(&store, "version-b").await;
+        wait_verified(&store, "version-c").await;
+        let state = residency_backfill::Entity::find_by_id("hot_verification")
+            .one(store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.claimed_by.as_deref(), Some("worker-a"));
+        assert!(state.cursor_version_row_id.is_none());
+        store
+            .db()
+            .execute_unprepared(
+                "UPDATE residency_backfill SET lease_until = '2000-01-01T00:00:00+00:00'",
+            )
+            .await
+            .unwrap();
         let replacement =
             claim_residency_backfill(store.db(), "worker-b", ChronoDuration::seconds(5))
                 .await
@@ -642,6 +718,12 @@ mod tests {
             .unwrap();
         assert_eq!(state.claim_epoch, 2);
         assert_eq!(state.claimed_by.as_deref(), Some("worker-b"));
+        let fast = resolve_version_residency(store.db(), "version-b")
+            .await
+            .unwrap();
+        let receipt: LocalResidencyVerificationReceipt =
+            serde_json::from_str(fast.physical.verification_receipt.as_deref().unwrap()).unwrap();
+        assert_eq!(receipt.cid, CID_B);
 
         let txn = store.db().begin().await.unwrap();
         assert!(
