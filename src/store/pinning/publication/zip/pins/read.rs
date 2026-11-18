@@ -64,12 +64,20 @@ async fn lock_ids<C: ConnectionTrait>(
     Ok(())
 }
 
+struct PairQuery<'a> {
+    cid_column: &'a str,
+    extra: &'a str,
+    order: &'a str,
+}
+
 async fn by_pairs_column<E: EntityTrait + Default, C: ConnectionTrait>(
     db: &C,
     pairs: &BTreeSet<Pair>,
-    cid_column: &str,
-    extra: &str,
-    order: &str,
+    PairQuery {
+        cid_column,
+        extra,
+        order,
+    }: PairQuery<'_>,
     work: DecodeWork<'_>,
     resident: &mut Vec<ResidentGuard>,
     mut maintenance: Option<&mut super::super::PublicationLease<'_>>,
@@ -114,9 +122,11 @@ pub(super) async fn by_pairs<E: EntityTrait + Default, C: ConnectionTrait>(
     by_pairs_column::<E, _>(
         db,
         pairs,
-        "cid",
-        extra,
-        "provider,cid",
+        PairQuery {
+            cid_column: "cid",
+            extra,
+            order: "provider,cid",
+        },
         work,
         resident,
         maintenance,
@@ -235,9 +245,11 @@ impl PinEvidence {
         for row in by_pairs_column::<pin_submit_observation::Entity, _>(
             db,
             &evidence_pairs,
-            "expected_cid",
-            "AND needs_attention=FALSE",
-            "id",
+            PairQuery {
+                cid_column: "expected_cid",
+                extra: "AND needs_attention=FALSE",
+                order: "id",
+            },
             work,
             resident,
             maintenance.as_deref_mut(),
@@ -294,9 +306,11 @@ impl PinEvidence {
         let replicas = by_pairs_column::<pin_replica_observation::Entity, _>(
             db,
             &evidence_pairs,
-            "expected_cid",
-            "",
-            "sequence",
+            PairQuery {
+                cid_column: "expected_cid",
+                extra: "",
+                order: "sequence",
+            },
             work,
             resident,
             maintenance,

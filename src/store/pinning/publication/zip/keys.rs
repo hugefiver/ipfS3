@@ -73,7 +73,7 @@ impl AllocationKeys {
         selected: &ZipIntentSelection,
         current_limits: Option<&ProviderLimitMap>,
         work: DecodeWork<'_>,
-        mut maintenance: Option<&mut super::PublicationLease<'_>>,
+        maintenance: Option<&mut super::PublicationLease<'_>>,
     ) -> AppResult<Self> {
         let (mut limits, routes, enabled) = frozen_allocation(capture, selected)?;
         if let Some(current) = current_limits {
@@ -116,7 +116,7 @@ impl AllocationKeys {
             }
             canonical.insert((provider, cid), key);
         }
-        reject_historical_aliases(db, &expected, work, maintenance.as_deref_mut()).await?;
+        reject_historical_aliases(db, &expected, work, maintenance).await?;
         let pairs = canonical
             .iter()
             .map(|((provider, _), cid)| (provider.clone(), cid.clone()))
@@ -136,7 +136,7 @@ impl AllocationKeys {
         &self,
         db: &C,
         work: DecodeWork<'_>,
-        mut maintenance: Option<&mut super::PublicationLease<'_>>,
+        maintenance: Option<&mut super::PublicationLease<'_>>,
     ) -> AppResult<()> {
         let mut expected: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for ((provider, _), cid) in &self.canonical {
@@ -150,6 +150,6 @@ impl AllocationKeys {
                     .insert(cid.clone());
             }
         }
-        reject_historical_aliases(db, &expected, work, maintenance.as_deref_mut()).await
+        reject_historical_aliases(db, &expected, work, maintenance).await
     }
 }

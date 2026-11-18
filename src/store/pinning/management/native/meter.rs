@@ -120,9 +120,10 @@ impl Budget {
         }
     }
     pub(crate) fn for_publication() -> Self {
-        let mut budget = Self::default();
-        budget.publication = true;
-        budget
+        Self {
+            publication: true,
+            ..Self::default()
+        }
     }
     pub(crate) fn is_publication(&self) -> bool {
         self.publication

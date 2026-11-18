@@ -1174,35 +1174,33 @@ impl PinningProvider for PinataClient {
     }
 
     async fn unpin_owned(&self, id: &str) -> Result<(), ProviderError> {
-        if self.api == PinataApi::V3 && self.legacy_psa.is_none() {
-            if self.strategy == PinataStrategy::Cid
-                && id.starts_with(V3_REQUEST_ID_PREFIX)
-                && !id.starts_with(V3_FILE_PREFIX)
-            {
-                let queue = self.request_ref(id)?;
-                let url = self.pin_by_cid_request_url(&queue.provider_id)?;
-                let response = self
-                    .execute(self.http.delete(url), Operation::Unpin)
-                    .await?;
-                if response.status() == StatusCode::NOT_FOUND {
-                    // The queue entry may have become a file before its first poll.
-                    let (_, file) = self.observe_v3(id, &queue).await.map_err(|err| {
-                        if err.class == ProviderErrorClass::NotFound {
-                            protocol_error(
-                                "queue request unavailable without a bound completed file",
-                            )
-                        } else {
-                            err
-                        }
-                    })?;
-                    let file = file.ok_or_else(|| {
+        if self.api == PinataApi::V3
+            && self.legacy_psa.is_none()
+            && self.strategy == PinataStrategy::Cid
+            && id.starts_with(V3_REQUEST_ID_PREFIX)
+            && !id.starts_with(V3_FILE_PREFIX)
+        {
+            let queue = self.request_ref(id)?;
+            let url = self.pin_by_cid_request_url(&queue.provider_id)?;
+            let response = self
+                .execute(self.http.delete(url), Operation::Unpin)
+                .await?;
+            if response.status() == StatusCode::NOT_FOUND {
+                // The queue entry may have become a file before its first poll.
+                let (_, file) = self.observe_v3(id, &queue).await.map_err(|err| {
+                    if err.class == ProviderErrorClass::NotFound {
                         protocol_error("queue request unavailable without a bound completed file")
-                    })?;
-                    return self.unpin(&file).await;
-                }
-                self.require_success(response, Operation::Unpin).await?;
-                return Ok(());
+                    } else {
+                        err
+                    }
+                })?;
+                let file = file.ok_or_else(|| {
+                    protocol_error("queue request unavailable without a bound completed file")
+                })?;
+                return self.unpin(&file).await;
             }
+            self.require_success(response, Operation::Unpin).await?;
+            return Ok(());
         }
         if self.api != PinataApi::Legacy || self.legacy_psa.is_some() {
             return self.unpin(id).await;

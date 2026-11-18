@@ -1304,10 +1304,10 @@ pub(crate) async fn reset_runtime_missing_receipt(
         || job.state != "running"
         || job.submit_phase.as_deref() != Some("recovering")
         || !jobs::check_target_job_generation(tx.db(), &job).await?
-        || !job
+        || job
             .last_error
             .as_deref()
-            .is_none_or(|error| error == jobs::RPC_MISSING_RECEIPT_PARK_REASON)
+            .is_some_and(|error| error != jobs::RPC_MISSING_RECEIPT_PARK_REASON)
     {
         return Ok(false);
     }
@@ -2284,10 +2284,10 @@ impl AdmissionSnapshot {
                 && (self.recovered_known(row, ledger)
                     || !row.needs_attention
                         && (row.outcome == "not_submitted"
-                            || !self
+                            || self
                                 .jobs
                                 .get(&row.job_id)
-                                .is_some_and(|job| job.state == "error"))
+                                .is_none_or(|job| job.state != "error"))
                         && matches!(
                             row.outcome.as_str(),
                             "matched" | "accepted" | "not_submitted"
