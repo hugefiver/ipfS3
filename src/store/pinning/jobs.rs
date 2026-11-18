@@ -118,20 +118,14 @@ async fn management_retryable_park_at_allocation<C: ConnectionTrait>(
     {
         return Ok(false);
     }
-    let Some(owner) = canonical_desired_target_with_work(db, &job.provider, &job.cid, work)
-        .await
-        .map_err(management_error)?
-    else {
-        return Ok(false);
-    };
     let now = crate::store::database_clock::database_now(db).await?;
-    let Some(lease) = records::current_model::<pin_lease::Entity, _>(db, &[&owner.lease_id], work)
+    let Some(owner) = canonical_submit_target_with_work(db, &job.provider, &job.cid, now, work)
         .await
         .map_err(management_error)?
     else {
         return Ok(false);
     };
-    if job.target_id.as_deref() != Some(&owner.id) || lease.expires_at <= now {
+    if job.target_id.as_deref() != Some(&owner.id) {
         return Ok(false);
     }
     let Some(history) = records::current_model::<history::Entity, _>(db, &[&job.id], work)
@@ -1380,6 +1374,52 @@ pub async fn fence_parked_submits(
     Ok(parked)
 }
 
+pub(crate) async fn wake_late_receipt_reconcile(
+    tx: &crate::store::RuntimeTransaction,
+    remote: &remote_pin::Model,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+) -> AppResult<()> {
+    let NewPinJob::Remote(job) = reconcile_job(&remote.provider, &remote.cid, remote.epoch, now)
+    else {
+        unreachable!("Reconcile is remote scoped")
+    };
+    if let Some(existing) = records::current_model::<pin_job::Entity, _>(tx.db(), &[&job.id], work)
+        .await
+        .map_err(management_error)?
+    {
+        if super::management::actions::job_authority::lookup_catalog(
+            tx.catalog(work),
+            &existing,
+            work.budget().clone(),
+        )
+        .await
+        .map_err(management_error)?
+        .is_some()
+        {
+            return Ok(());
+        }
+        pin_job::Entity::update_many()
+            .col_expr(pin_job::Column::State, Expr::value(STATE_PENDING))
+            .col_expr(pin_job::Column::NextAttemptAt, Expr::value(now))
+            .col_expr(pin_job::Column::UpdatedAt, Expr::value(now))
+            .col_expr(
+                pin_job::Column::LastError,
+                Expr::value(Option::<String>::None),
+            )
+            .filter(pin_job::Column::Id.eq(&job.id))
+            .filter(pin_job::Column::Operation.eq("reconcile"))
+            .filter(pin_job::Column::ExpectedRemoteEpoch.eq(remote.epoch))
+            .filter(pin_job::Column::State.is_in([STATE_RUNNING, STATE_ERROR]))
+            .filter(pin_job::Column::LockedUntil.is_null())
+            .filter(pin_job::Column::LastError.eq(PARKED_RECONCILE_REASON))
+            .exec(tx.db())
+            .await?;
+    }
+    ensure_runtime_reconcile(tx, job, now, work).await?;
+    Ok(())
+}
+
 /// Keep remote responsibility without periodically scheduling work which cannot
 /// make progress until an operator resolves a parked Submit.
 /// The caller must first hold `fence_parked_submits` in this same transaction,
@@ -1725,7 +1765,7 @@ async fn ensure_submit_core<C: ConnectionTrait>(
     if target_work_terminal(db, &job, work).await? {
         return Ok(EnsureJobOutcome::Terminal);
     }
-    validate_submit_owner_with_work(db, &job, work).await?;
+    validate_submit_owner_with_work(db, &job, now, work).await?;
     match runtime {
         Some(tx) => {
             super::quota::lock_runtime_allocation_admission(tx, &job.provider, work).await?
@@ -2792,7 +2832,7 @@ pub(in crate::store::pinning) async fn poll_continuity_catalog(
     }
     Ok(
         poll_names_request_catalog(catalog, job, request_id, work).await?
-            && canonical_desired_target_with_work(db, &job.provider, &job.cid, work)
+            && canonical_target_with_work(db, &job.provider, &job.cid, None, work)
                 .await?
                 .is_some_and(|target| Some(target.id.as_str()) == job.target_id.as_deref()),
     )
@@ -2947,7 +2987,9 @@ async fn prepare_submit_core<C: ConnectionTrait>(
         return Err(invalid_job("submit preparation requires a claimed Submit"));
     }
 
-    let canonical = canonical_desired_target(db, &job.provider, &job.cid).await?;
+    let canonical = canonical_submit_target_with_work(db, &job.provider, &job.cid, now, work)
+        .await
+        .map_err(management_error)?;
     let current = check_target_job_generation(db, job).await?
         && canonical.as_ref().map(|target| target.id.as_str()) == job.target_id.as_deref()
         && remote_is_reserved_without_request(db, &job.provider, &job.cid).await?;
@@ -3712,6 +3754,7 @@ async fn reactivate_job<C: ConnectionTrait>(
 async fn validate_submit_owner_with_work<C: ConnectionTrait>(
     db: &C,
     job: &TargetPinJob,
+    now: DateTimeUtc,
     work: DecodeWork<'_>,
 ) -> AppResult<()> {
     work.copy(&job.id).map_err(management_error)?;
@@ -3725,7 +3768,7 @@ async fn validate_submit_owner_with_work<C: ConnectionTrait>(
     {
         return Err(invalid_job("Submit job ID does not match its scope"));
     }
-    let canonical = canonical_desired_target_with_work(db, &job.provider, &job.cid, work)
+    let canonical = canonical_submit_target_with_work(db, &job.provider, &job.cid, now, work)
         .await
         .map_err(management_error)?;
     work.copy(&(
@@ -3893,16 +3936,52 @@ async fn canonical_desired_target<C: ConnectionTrait>(
         .await?)
 }
 
-pub(crate) async fn canonical_desired_target_with_work<C: ConnectionTrait>(
+pub(crate) async fn canonical_submit_target_with_work<C: ConnectionTrait>(
     db: &C,
     provider: &str,
     cid: &str,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+) -> super::management::Result<Option<pin_lease_target::Model>> {
+    canonical_target_with_work(db, provider, cid, Some(now), work).await
+}
+
+async fn canonical_target_with_work<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+    cid: &str,
+    live_at: Option<DateTimeUtc>,
     work: DecodeWork<'_>,
 ) -> super::management::Result<Option<pin_lease_target::Model>> {
     for _ in 0..2 {
         work.copy(&(provider, cid))?;
     }
-    let mut targets=records::current_models::<pin_lease_target::Entity,_>(db,"FROM (SELECT pin_lease_targets.* FROM pin_lease_targets INNER JOIN pin_leases ON pin_lease_targets.lease_id=pin_leases.id WHERE pin_lease_targets.provider=$1 AND pin_lease_targets.cid=$2 AND pin_leases.state='active' AND pin_lease_targets.state IN ('waiting','submitted','pinned','degraded') ORDER BY pin_lease_targets.created_at,pin_lease_targets.id LIMIT 1) AS pin_lease_targets WHERE TRUE","created_at,id",vec![provider.into(),cid.into()],1,work).await?;
+    let mut values = vec![provider.into(), cid.into()];
+    let expiry = if let Some(now) = live_at {
+        values.push(now.into());
+        if db.get_database_backend() == DatabaseBackend::Sqlite {
+            "AND julianday(l.expires_at) > julianday($3)"
+        } else {
+            "AND l.expires_at > $3"
+        }
+    } else {
+        ""
+    };
+    let source = format!(
+        "FROM (SELECT t.* FROM pin_lease_targets t JOIN pin_leases l ON t.lease_id=l.id \
+         WHERE t.provider=$1 AND t.cid=$2 AND l.state='active' {expiry} \
+         AND t.state IN ('waiting','submitted','pinned','degraded') \
+         ORDER BY t.created_at,t.id LIMIT 1) AS pin_lease_targets WHERE TRUE"
+    );
+    let mut targets = records::current_models::<pin_lease_target::Entity, _>(
+        db,
+        &source,
+        "created_at,id",
+        values,
+        1,
+        work,
+    )
+    .await?;
     Ok(targets.pop())
 }
 
@@ -4243,13 +4322,14 @@ mod tests {
         epoch: i64,
         created_at: DateTimeUtc,
     ) {
+        let expires_at = (created_at + Duration::days(1)).to_rfc3339();
         let created_at = created_at.to_rfc3339();
         db.execute_unprepared(&format!(
             "INSERT INTO pin_leases \
              (id, owner_object_id, source, policy_id, provider_mode, content_mode, created_at, \
               last_touched_at, expires_at, generation, state) \
              VALUES ('{lease_id}', 'object-1', 'test', 'policy', 'all', 'full', \
-                     '{created_at}', '{created_at}', '{created_at}', {generation}, 'active')"
+                     '{created_at}', '{created_at}', '{expires_at}', {generation}, 'active')"
         ))
         .await
         .unwrap();

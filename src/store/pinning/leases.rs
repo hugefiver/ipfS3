@@ -2630,10 +2630,15 @@ async fn complete_remote_delete_core<C: ConnectionTrait>(
 
             set_prelocked_target_state(db, &desired.target, TARGET_WAITING).await?;
         }
-        let canonical = snapshot
+        let Some(canonical) = snapshot
             .desired
-            .first()
-            .ok_or_else(|| invalid("active delete compensation has no canonical target"))?;
+            .iter()
+            .find(|target| target.lease.expires_at > now)
+        else {
+            let reconcile_job_id =
+                delete_reconcile(db, provider, cid, current_epoch, now, runtime).await?;
+            return Ok(RemoteDeleteCompletion::ReconcileRequired { reconcile_job_id });
+        };
         let NewPinJob::Target(job) = jobs::submit_job(
             provider,
             cid,
@@ -3108,12 +3113,12 @@ async fn prepare_failed_remote_resubmit_prelocked<C: ConnectionTrait>(
     if remote.failure_attempts >= MAX_FAILED_REQUEST_ATTEMPTS {
         return Ok(FailedRemoteResubmitDecision::Exhausted);
     }
-    if !desired
+    let Some(canonical) = desired
         .iter()
-        .any(|desired| desired.lease.provider_mode == "all")
-    {
+        .find(|target| target.lease.provider_mode == "all" && target.lease.expires_at > now)
+    else {
         return Ok(FailedRemoteResubmitDecision::NoAllModeTarget);
-    }
+    };
     // A historical Reconcile may inspect its captured request, but a new
     // Submit needs today's matching allocation route.
     match runtime {
@@ -3210,10 +3215,6 @@ async fn prepare_failed_remote_resubmit_prelocked<C: ConnectionTrait>(
 
         set_prelocked_target_state(db, &desired.target, TARGET_WAITING).await?;
     }
-    let canonical = desired
-        .iter()
-        .find(|desired| desired.lease.provider_mode == "all")
-        .ok_or_else(|| invalid("failed remote has no canonical all-mode target"))?;
     work.copy(&(provider, cid, &canonical.lease.id, &canonical.target.id))
         .map_err(work_error)?;
     let NewPinJob::Target(job) = jobs::submit_job(
@@ -3380,7 +3381,13 @@ async fn renew_manual_lease_for_owner<C: ConnectionTrait>(
                 .cloned()
                 .collect();
             refresh_renewal_snapshot_targets_with_work(
-                db, &snapshot, generation, &targets, now, work, runtime,
+                db,
+                &snapshot,
+                (generation, retain_until),
+                &targets,
+                now,
+                work,
+                runtime,
             )
             .await?;
             return Ok(ManualLeaseRenewalOutcome::Extended { generation });
@@ -3412,7 +3419,7 @@ async fn renew_manual_lease_for_owner<C: ConnectionTrait>(
     refresh_renewal_snapshot_targets_with_work(
         db,
         &snapshot,
-        generation,
+        (generation, retain_until),
         &recoverable,
         now,
         work,
@@ -3559,7 +3566,13 @@ pub(crate) async fn renew_confirmed_lease_in_transaction(
         .cloned()
         .collect::<Vec<_>>();
     refresh_renewal_snapshot_targets_with_work(
-        tx, &snapshot, generation, &targets, now, work, None,
+        tx,
+        &snapshot,
+        (generation, expiry),
+        &targets,
+        now,
+        work,
+        None,
     )
     .await
     .map_err(confirmed_renewal_error)?;
@@ -4247,7 +4260,7 @@ async fn restore_snapshot_targets<C: ConnectionTrait>(
 async fn refresh_renewal_snapshot_targets_with_work<C: ConnectionTrait>(
     db: &C,
     snapshot: &RenewalSnapshot,
-    generation: i64,
+    renewed: (i64, DateTimeUtc),
     targets: &[pin_lease_target::Model],
     now: DateTimeUtc,
     work: super::management::records::DecodeWork<'_>,
@@ -4321,7 +4334,7 @@ async fn refresh_renewal_snapshot_targets_with_work<C: ConnectionTrait>(
                 snapshot,
                 provider,
                 cid,
-                generation,
+                renewed,
                 &refreshed_targets,
                 work,
             )?,
@@ -4441,7 +4454,7 @@ fn renewal_projected_desired_targets(
     snapshot: &RenewalSnapshot,
     provider: &str,
     cid: &str,
-    generation: i64,
+    (generation, expires_at): (i64, DateTimeUtc),
     refreshed_targets: &BTreeMap<String, pin_lease_target::Model>,
     work: DecodeWork<'_>,
 ) -> Result<Vec<DesiredTarget>, RenewManualLeaseError> {
@@ -4471,6 +4484,7 @@ fn renewal_projected_desired_targets(
             work.copy(LEASE_ACTIVE).map_err(renewal_work_error)?;
             lease.state = LEASE_ACTIVE.to_owned();
             lease.generation = generation;
+            lease.expires_at = expires_at;
         }
         if lease.state == LEASE_ACTIVE && is_desired_target_state(&target.state) {
             projected.push(DesiredTarget { target, lease });
@@ -5084,7 +5098,7 @@ pub async fn failover_target_if_feasible<C: ConnectionTrait>(
     else {
         return Ok(GenerationDecision::Stale);
     };
-    if lease.state != LEASE_ACTIVE || lease.provider_mode != "one" {
+    if lease.state != LEASE_ACTIVE || lease.expires_at <= now || lease.provider_mode != "one" {
         return Ok(GenerationDecision::NoLongerNeeded);
     }
     let Some(retiring) = pin_lease_target::Entity::find_by_id(retiring_target_id.to_owned())
@@ -5408,7 +5422,7 @@ async fn fail_one_target_at_generation<C: ConnectionTrait>(
     if lease.state != LEASE_ACTIVE
         || lease.provider_mode != "one"
         || expected_generation.is_some_and(|expected| lease.generation != expected)
-        || (quota_waiter && lease.expires_at <= now)
+        || lease.expires_at <= now
     {
         return Ok(None);
     }
@@ -6710,7 +6724,10 @@ async fn project_prelocked_target_state<C: ConnectionTrait>(
         }
         REMOTE_RESERVED if remote.request_id.is_none() => {
             set_prelocked_target_state(db, &desired.target, TARGET_WAITING).await?;
-            let canonical = canonical()?;
+            let live_owner = all_desired
+                .iter()
+                .find(|target| target.lease.expires_at > now);
+            let canonical = live_owner.unwrap_or(desired);
             work.copy(&(
                 &desired.target.provider,
                 &desired.target.cid,
@@ -6730,7 +6747,7 @@ async fn project_prelocked_target_state<C: ConnectionTrait>(
             };
             work.copy(&job.id).map_err(work_error)?;
             let submit_job_id = job.id.clone();
-            if !schedule_work {
+            if live_owner.is_none() || !schedule_work {
                 return Ok(TargetProjection::Waiting { submit_job_id });
             }
             if let Some((blocking, _)) = jobs::blocking_live_submit_with_work(

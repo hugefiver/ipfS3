@@ -1073,7 +1073,7 @@ async fn bounded_candidate_pages_progress_past_inflight_and_unwakeable_history()
         .exec(store.db())
         .await
         .unwrap();
-    let (cursor, found) = parked_receipt_candidates(store.db(), "", 1).await.unwrap();
+    let (cursor, found, _) = parked_receipt_candidates(store.db(), "", 1).await.unwrap();
     let cursor = cursor.expect("the first page must reach runnable parked work");
     assert_eq!(found.len(), 1);
     assert!(

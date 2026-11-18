@@ -737,13 +737,20 @@ async fn recover_parked_receipts(
     store: &Store,
     cursor: &mut String,
 ) -> AppResult<()> {
-    let (next, candidates) = ledger::submission::parked_receipt_candidates(
+    let (next, candidates, cleanup) = ledger::submission::parked_receipt_candidates(
         store.db(),
         cursor,
         coordinator.settings().claim_limit,
     )
     .await?;
     recover_receipt_page(coordinator, store, candidates, ReceiptRecovery::Wake).await;
+    for id in cleanup {
+        if let Err(error) =
+            Box::pin(ledger::submission::late_cleanup::recover_wake(store, &id)).await
+        {
+            tracing::error!(job_id = %id, %error, "late Submit cleanup wake failed");
+        }
+    }
     *cursor = next.unwrap_or_default();
     Ok(())
 }
@@ -1718,7 +1725,6 @@ async fn dispatch_submit(
     let work = SharedDecodeBudget::default();
     let source_context =
         read_context_for_job_with_work(store, coordinator, &claimed.model, work.clone()).await?;
-    let now = Utc::now();
     let txn = store.begin_runtime(DecodeWork::shared(&work)).await?;
     job_authority::lock_runtime_source(&txn, &claimed.model, work.clone()).await?;
     leases::lock_submit_admission_frontier(&txn, &claimed.model).await?;
@@ -1734,10 +1740,11 @@ async fn dispatch_submit(
         )
         .await?
     {
-        jobs::finish_nonprojecting_job(&txn, &claimed, true, now).await?;
+        jobs::finish_nonprojecting_job(&txn, &claimed, true, Utc::now()).await?;
         txn.commit().await?;
         return Ok(None);
     }
+    let now = Utc::now();
     let decision =
         jobs::prepare_runtime_submit_call(&txn, &claimed, now, DecodeWork::shared(&work)).await?;
     let mut correlation = None;
@@ -1989,13 +1996,25 @@ async fn record_submit_phase(
         )
         .await?;
         if !can_project && source_allowed {
-            ledger::submission::wake_runtime_parked(
+            let now = Utc::now();
+            if !ledger::submission::wake_runtime_parked(
                 &txn,
                 &claimed.model.id,
-                Utc::now(),
+                now,
                 DecodeWork::shared(&work),
             )
-            .await?;
+            .await?
+                && matches!(evidence.outcome.as_str(), "matched" | "accepted")
+            {
+                Box::pin(ledger::submission::late_cleanup::wake(
+                    &txn,
+                    evidence,
+                    &claimed.model,
+                    now,
+                    DecodeWork::shared(&work),
+                ))
+                .await?;
+            }
         }
         txn.commit().await?;
         if can_project
@@ -3868,11 +3887,24 @@ async fn reconcile_without_desired(
     store: &Store,
     coordinator: &PinningCoordinator,
     claimed: &ClaimedPinJob,
-    snapshot: RemoteWorkSnapshot,
+    mut snapshot: RemoteWorkSnapshot,
 ) -> AppResult<()> {
     let now = Utc::now();
     let work = SharedDecodeBudget::default();
     let txn = store.begin_runtime(DecodeWork::shared(&work)).await?;
+    // Repair and receipt arrival both fence Submit before remote/Reconcile.
+    let submit_needs_attention = snapshot.remote.request_id.is_none()
+        && jobs::fence_parked_submits(&txn, &claimed.model.provider, &claimed.model.cid).await?;
+    if snapshot.remote.request_id.is_none()
+        && let Some(request) = Box::pin(ledger::submission::late_cleanup::settle(
+            &txn,
+            claimed,
+            DecodeWork::shared(&work),
+        ))
+        .await?
+    {
+        snapshot.remote.request_id = Some(request);
+    }
     if snapshot.remote.request_id.is_some() {
         let epoch_current = leases::guard_reconcile_remote_epoch(
             &txn,
@@ -3937,11 +3969,6 @@ async fn reconcile_without_desired(
         );
         return Ok(());
     }
-    // Match repair's Submit -> Reconcile lock order. This must precede the
-    // remote epoch fence below; never acquire Submit after holding remote or
-    // this Reconcile's row lock.
-    let submit_needs_attention =
-        jobs::fence_parked_submits(&txn, &claimed.model.provider, &claimed.model.cid).await?;
     let completion = leases::complete_runtime_no_request_remote_absence(
         &txn,
         &claimed.model.provider,
@@ -5252,6 +5279,25 @@ where
                 &claimed.model.id,
             )
             .await?);
+    let submit_expiry = if matches!(managed_call, ManagedCall::Submit) {
+        let Some(lease) = store
+            .db()
+            .query_one(sea_orm::Statement::from_sql_and_values(
+                store.db().get_database_backend(),
+                "SELECT expires_at FROM pin_leases WHERE id=$1 AND generation=$2 AND state='active'",
+                [
+                    claimed.model.lease_id.clone().into(),
+                    claimed.model.expected_generation.into(),
+                ],
+            ))
+            .await?
+        else {
+            return Ok(ProviderCallOutcome::PreflightRejected);
+        };
+        Some(lease.try_get::<DateTime<Utc>>("", "expires_at")?)
+    } else {
+        None
+    };
     if cancellation.is_cancelled() {
         return Ok(ProviderCallOutcome::Cancelled);
     }
@@ -5259,16 +5305,25 @@ where
     let start = tokio::time::Instant::now();
     let mut interval = tokio::time::interval_at(start + heartbeat, heartbeat);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    if !slot.runtime.min_request_interval.is_zero() {
-        *rate_gate = Some(start + slot.runtime.min_request_interval);
-    }
-    drop(rate_gate);
-    let mut future = Box::pin(call(slot.provider.clone()));
+    let mut future = Box::pin(async {
+        // First poll is the start boundary; no rate slot or HTTP is spent on an expired Submit.
+        if submit_expiry.is_some_and(|at| at <= Utc::now()) {
+            return None;
+        }
+        if !slot.runtime.min_request_interval.is_zero() {
+            *rate_gate = Some(tokio::time::Instant::now() + slot.runtime.min_request_interval);
+        }
+        drop(rate_gate);
+        Some(call(slot.provider.clone()).await)
+    });
     let mut lost_rpc_claim = false;
     let result = loop {
         tokio::select! {
             biased;
-            result = &mut future => break result,
+            result = &mut future => match result {
+                Some(result) => break result,
+                None => return Ok(ProviderCallOutcome::PreflightRejected),
+            },
             _ = interval.tick(), if !lost_rpc_claim => {
                 let renewal = renew_claim_once(store, claimed, lock_for).await;
                 if retain_receipt && renewal.is_err() { lost_rpc_claim = true; } else { renewal?; }

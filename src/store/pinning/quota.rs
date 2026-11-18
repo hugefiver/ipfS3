@@ -750,26 +750,6 @@ async fn confirmed_release_inner<C: ConnectionTrait>(
         }
         None => super::ledger::get(db, provider, cid).await?,
     };
-    if let Some(row) = ledger
-        && super::ledger::decode_route(&row)
-            .is_some_and(|route| super::ledger::submission::is_rpc(&route))
-        && !(confirmed_delete && row.effect == "cleanup_pending")
-        && (row.effect != "not_created"
-            || match runtime {
-                Some((tx, work)) => {
-                    super::ledger::submission::matching_pin_held_catalog(
-                        tx.catalog(work),
-                        provider,
-                        cid,
-                        work,
-                    )
-                    .await?
-                }
-                None => super::ledger::submission::matching_pin_held(db, provider, cid).await?,
-            })
-    {
-        return Ok(ConfirmedReleaseOutcome::Stale);
-    }
     let Some(remote) = remote_pin::Entity::find_by_id((provider.to_owned(), cid.to_owned()))
         .one(db)
         .await?
@@ -783,6 +763,57 @@ async fn confirmed_release_inner<C: ConnectionTrait>(
         && remote.request_id.as_deref() != expected
     {
         return Ok(ConfirmedReleaseOutcome::Stale);
+    }
+    if remote.request_id.is_none()
+        && ledger
+            .as_ref()
+            .and_then(super::ledger::decode_route)
+            .is_none()
+        && records::current_model::<pin_provider_route::Entity, _>(&catalog, &[provider], work)
+            .await
+            .map_err(admission::work_error)?
+            .is_some_and(|r| {
+                serde_json::from_str(&r.snapshot)
+                    .map_or(true, |route| super::ledger::submission::is_rpc(&route))
+            })
+    {
+        return Ok(ConfirmedReleaseOutcome::Stale);
+    }
+    let mut local_release = None;
+    if let Some(row) = &ledger
+        && super::ledger::decode_route(row)
+            .is_some_and(|route| super::ledger::submission::is_rpc(&route))
+        && !(confirmed_delete && row.effect == "cleanup_pending")
+    {
+        if remote.status == REMOTE_STATUS_RESERVED && remote.request_id.is_none() {
+            if newest_active_target_touch(db, provider, cid)
+                .await?
+                .is_some()
+            {
+                return Ok(ConfirmedReleaseOutcome::Stale);
+            }
+            let Some(histories) =
+                super::ledger::submission::undispatched_reservation(catalog, row, &work).await?
+            else {
+                return Ok(ConfirmedReleaseOutcome::Stale);
+            };
+            local_release = Some(histories);
+        } else if row.effect != "not_created"
+            || match runtime {
+                Some((tx, work)) => {
+                    super::ledger::submission::matching_pin_held_catalog(
+                        tx.catalog(work),
+                        provider,
+                        cid,
+                        work,
+                    )
+                    .await?
+                }
+                None => super::ledger::submission::matching_pin_held(db, provider, cid).await?,
+            }
+        {
+            return Ok(ConfirmedReleaseOutcome::Stale);
+        }
     }
     if remote.status == REMOTE_STATUS_ABSENT {
         return Ok(ConfirmedReleaseOutcome::AlreadyAbsent);
@@ -845,6 +876,11 @@ async fn confirmed_release_inner<C: ConnectionTrait>(
         .filter(remote_pin::Column::Epoch.eq(expected_remote_epoch))
         .filter(error_hold.not())
         .filter(remote_pin::Column::Status.is_in(capacity_holding_statuses()));
+    if local_release.is_some() {
+        released = released
+            .filter(remote_pin::Column::Status.eq(REMOTE_STATUS_RESERVED))
+            .filter(remote_pin::Column::RequestId.is_null());
+    }
     if let RequestIdentityGuard::Exact(expected) = request_guard {
         released = match expected {
             Some(request_id) => released.filter(remote_pin::Column::RequestId.eq(request_id)),
@@ -875,17 +911,45 @@ async fn confirmed_release_inner<C: ConnectionTrait>(
                 .to_owned(),
         ));
     }
+    if let Some(histories) = local_release {
+        use super::jobs::history;
+        use crate::store::entities::pin_resource_history;
+        for (id, calls) in histories {
+            let settled = history::Entity::update_many()
+                .col_expr(history::Column::Effect, Expr::value("not_created"))
+                .filter(history::Column::JobId.eq(id))
+                .filter(history::Column::SubmitCalls.eq(calls))
+                .filter(history::Column::Effect.eq("unknown"))
+                .exec(db)
+                .await?;
+            if settled.rows_affected != 1 {
+                return Err(invalid_quota(
+                    "undispatched Submit history changed during release",
+                ));
+            }
+        }
+        pin_resource_history::Entity::insert(pin_resource_history::ActiveModel {
+            provider: Set(provider.into()),
+            cid: Set(cid.into()),
+            epoch: Set(remote.epoch),
+            ledger: Set(
+                serde_json::json!({"local_reservation_released": true, "ledger": ledger})
+                    .to_string(),
+            ),
+        })
+        .exec(db)
+        .await?;
+    } else if let Some((tx, work)) = runtime {
+        super::ledger::archive_runtime_confirmed_release(tx, &remote, work, confirmed_delete)
+            .await?;
+    } else {
+        super::ledger::archive_release_row(db, &remote, ledger, Some(confirmed_delete)).await?;
+    }
     match runtime {
         Some((tx, work)) => {
-            super::ledger::archive_runtime_confirmed_release(tx, &remote, work, confirmed_delete)
-                .await?;
-            super::ledger::mark_runtime_effect(tx, provider, cid, "absent", work).await?;
+            super::ledger::mark_runtime_effect(tx, provider, cid, "absent", work).await?
         }
-        None => {
-            let row = super::ledger::get(db, &remote.provider, &remote.cid).await?;
-            super::ledger::archive_release_row(db, &remote, row, Some(confirmed_delete)).await?;
-            super::ledger::mark_effect(db, provider, cid, "absent").await?;
-        }
+        None => super::ledger::mark_effect(db, provider, cid, "absent").await?,
     }
     Ok(ConfirmedReleaseOutcome::Released)
 }

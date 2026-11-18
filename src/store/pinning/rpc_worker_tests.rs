@@ -28,6 +28,8 @@ use wiremock::{
 
 #[path = "rpc_worker_tests/cid_flow.rs"]
 mod cid_flow;
+#[path = "rpc_worker_tests/local_release.rs"]
+mod local_release;
 
 const CID: &str = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
 const OTHER: &str = "bafkreigh2akiscaildc6ii5zji4bq7kly5k3s7svv6q2wx2nn5rtj5xuu4";
@@ -266,7 +268,26 @@ impl RpcFixture {
             };
             self.run(claim).await.unwrap();
         }
-        panic!("RPC worker did not reach a stable bounded state");
+        self.fail_drain().await;
+    }
+
+    async fn fail_drain(&self) -> ! {
+        use crate::store::entities::{pin_invocation_route, pin_provider_route, remote_pin_ledger};
+
+        let db = self.store.db();
+        let remotes = remote_pin::Entity::find().all(db).await.unwrap();
+        let ledgers = remote_pin_ledger::Entity::find().all(db).await.unwrap();
+        let jobs = pin_job::Entity::find().all(db).await.unwrap();
+        let histories = jobs::history::Entity::find().all(db).await.unwrap();
+        let archives = pin_resource_history::Entity::find().all(db).await.unwrap();
+        let captures = pin_invocation_route::Entity::find().all(db).await.unwrap();
+        let registrations = pin_provider_route::Entity::find().all(db).await.unwrap();
+        let receipts = self.evidence().await;
+        panic!(
+            "RPC worker did not reach a stable bounded state: \
+             remotes={remotes:?}; ledgers={ledgers:?}; jobs={jobs:?}; histories={histories:?}; \
+             archives={archives:?}; captures={captures:?}; registrations={registrations:?}; receipts={receipts:?}"
+        );
     }
 
     async fn evidence(&self) -> Vec<ledger::submission_entity::Model> {
@@ -392,17 +413,14 @@ async fn worker_releases_a_shared_backup_cid_from_its_historical_submit_receipt(
     );
 }
 
-#[tokio::test]
-async fn worker_kubo_cid_keeps_exact_api_and_unknown_ownership_without_double_counting() {
-    let source = MockServer::start().await;
-    let target = MockServer::start().await;
-    recursive(&target).await;
+async fn expect_kubo_cid_pin(target: &MockServer) {
+    recursive(target).await;
     Mock::given(method("POST"))
         .and(path("/api/v0/id"))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(serde_json::json!({"ID":"node-target"})),
         )
-        .mount(&target)
+        .mount(target)
         .await;
     Mock::given(method("POST"))
         .and(path("/api/v0/files/stat"))
@@ -413,7 +431,7 @@ async fn worker_kubo_cid_keeps_exact_api_and_unknown_ownership_without_double_co
             ResponseTemplate::new(200)
                 .set_body_json(serde_json::json!({"Hash":CID,"WithLocality":true,"Local":true})),
         )
-        .mount(&target)
+        .mount(target)
         .await;
     Mock::given(method("POST"))
         .and(path("/api/v0/pin/add"))
@@ -421,8 +439,15 @@ async fn worker_kubo_cid_keeps_exact_api_and_unknown_ownership_without_double_co
         .and(query_param("recursive", "true"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"Pins":[CID]})))
         .expect(1)
-        .mount(&target)
+        .mount(target)
         .await;
+}
+
+#[tokio::test]
+async fn worker_kubo_cid_keeps_exact_api_and_unknown_ownership_without_double_counting() {
+    let source = MockServer::start().await;
+    let target = MockServer::start().await;
+    expect_kubo_cid_pin(&target).await;
     let fixture = fixture(target.uri(), &source, RpcProfile::Kubo, RpcStrategy::Cid).await;
     fixture.drain().await;
     let evidence = fixture.evidence().await;

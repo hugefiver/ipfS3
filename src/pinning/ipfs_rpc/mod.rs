@@ -75,6 +75,22 @@ pub(crate) fn canonical_cid_request_id(
     cid::request_id(RpcProfile::Kubo, expected_cid).map(Some)
 }
 
+pub(crate) fn observed_handle_matches(
+    route: &ProviderRouteSnapshot,
+    handle: &str,
+    expected: &str,
+) -> bool {
+    [RpcProfile::Kubo, RpcProfile::Filebase]
+        .into_iter()
+        .any(|profile| {
+            matches!(
+                (route.api_profile.as_str(), profile),
+                ("rpc", _) | ("kubo", RpcProfile::Kubo) | ("filebase-rpc", RpcProfile::Filebase)
+            ) && cid::decode(profile, handle)
+                .is_ok_and(|cid| cid::equivalent(&cid, expected).unwrap_or(false))
+        })
+}
+
 impl IpfsRpcProvider {
     /// `endpoint` must be an administrator-trusted RPC base, not a tag or object
     /// value. Accepts origin/prefix or an already suffixed /api/v0 base. Private

@@ -66,6 +66,8 @@ struct TargetState {
     release: Arc<Semaphore>,
     adds: Arc<AtomicUsize>,
     reads: Arc<AtomicUsize>,
+    removes: Arc<AtomicUsize>,
+    remove_ack: Arc<Semaphore>,
     unexpected: Arc<AtomicUsize>,
     first_response: (StatusCode, String),
 }
@@ -93,6 +95,21 @@ async fn pin_ls(
     serde_json::json!({"Keys":{(cid):{"Type":"recursive"}}}).to_string()
 }
 
+async fn pin_rm(
+    State(state): State<TargetState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> (StatusCode, String) {
+    state.removes.fetch_add(1, Ordering::SeqCst);
+    if query.get("arg").map(String::as_str) != Some(CID) {
+        return (StatusCode::BAD_REQUEST, String::new());
+    }
+    state.remove_ack.acquire().await.unwrap().forget();
+    (
+        StatusCode::OK,
+        serde_json::json!({"Pins":[CID]}).to_string(),
+    )
+}
+
 struct Fixture {
     store: Store,
     coordinator: Arc<PinningCoordinator>,
@@ -105,6 +122,7 @@ struct Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.target.release.add_permits(1);
+        self.target.remove_ack.add_permits(1);
         self.server.abort();
     }
 }
@@ -116,6 +134,25 @@ impl Fixture {
     }
 
     async fn with_database(first_response: (StatusCode, String), db: DatabaseConnection) -> Self {
+        Self::with_route(first_response, db, false).await
+    }
+
+    async fn with_route(
+        first_response: (StatusCode, String),
+        db: DatabaseConnection,
+        kubo_cid: bool,
+    ) -> Self {
+        let (kind, profile, api_profile, strategy, submit_path) = if kubo_cid {
+            ("ipfs_rpc", "kubo", "kubo", "cid", "/api/v0/pin/add")
+        } else {
+            (
+                "filebase",
+                "filebase",
+                "filebase-rpc",
+                "upload",
+                "/api/v0/add",
+            )
+        };
         let source = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/v0/files/stat"))
@@ -143,23 +180,26 @@ impl Fixture {
             release: Arc::new(Semaphore::new(0)),
             adds: Arc::new(AtomicUsize::new(0)),
             reads: Arc::new(AtomicUsize::new(0)),
+            removes: Arc::new(AtomicUsize::new(0)),
+            remove_ack: Arc::new(Semaphore::new(0)),
             unexpected: Arc::new(AtomicUsize::new(0)),
             first_response,
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        // No DELETE or pin/rm route exists; any unexpected request also fails the leaf operation.
         let app = Router::new()
-            .route("/api/v0/add", post(add))
+            .route(submit_path, post(add))
             .route("/api/v0/pin/ls", post(pin_ls))
+            .route("/api/v0/pin/rm", post(pin_rm))
             .with_state(target.clone())
             .layer(axum::middleware::from_fn_with_state(
                 target.clone(),
-                |State(state): State<TargetState>,
-                 request: axum::extract::Request,
-                 next: axum::middleware::Next| async move {
+                move |State(state): State<TargetState>,
+                      request: axum::extract::Request,
+                      next: axum::middleware::Next| async move {
                     if request.method() != "POST"
-                        || !matches!(request.uri().path(), "/api/v0/add" | "/api/v0/pin/ls")
+                        || (request.uri().path() != submit_path
+                            && !matches!(request.uri().path(), "/api/v0/pin/ls" | "/api/v0/pin/rm"))
                     {
                         state.unexpected.fetch_add(1, Ordering::SeqCst);
                     }
@@ -177,17 +217,17 @@ impl Fixture {
             worker_interval = '1s'
             [[pinning.providers]]
             name = 'rpc'
-            kind = 'filebase'
+            kind = '{kind}'
             api = 'rpc'
             endpoint = '{endpoint}'
-            strategy = 'upload'
+            strategy = '{strategy}'
             token_env = 'FIXTURE_SECRET'
             priority = 1
             max_bytes = 1000
             max_pins = 10
             [[pinning_rpc.providers]]
             config_name = 'rpc'
-            profile = 'filebase'
+            profile = '{profile}'
             auth = 'bearer'
             allow_private_network = true
             control_timeout_seconds = 20
@@ -198,14 +238,14 @@ impl Fixture {
             config_name = 'rpc'
             provider_id = 'rpc'
             display_name = 'RPC fixture'
-            backend = 'filebase'
+            backend = '{profile}'
             scope = 'availability-node'
             storage_domain = 'remote'
             credential_revision = 1
             endpoint_revision = 1
             secret_ref = 'env:FIXTURE_SECRET'
-            api_profile = 'filebase-rpc'
-            strategy = 'upload'
+            api_profile = '{api_profile}'
+            strategy = '{strategy}'
             cleanup = 'managed'
             [[pinning.policies]]
             bucket = 'availability'
@@ -328,12 +368,12 @@ impl Fixture {
         assert_eq!((usage.reserved_bytes, usage.reserved_pins), (bytes, pins));
     }
     fn assert_posts(&self, count: usize) {
-        assert_eq!(self.target.adds.load(Ordering::SeqCst), count);
-        assert_eq!(
-            self.target.unexpected.load(Ordering::SeqCst),
-            0,
-            "no DELETE, pin/rm or fallback I/O is allowed"
-        );
+        self.assert_requests(count, 0);
+    }
+    fn assert_requests(&self, adds: usize, removes: usize) {
+        assert_eq!(self.target.adds.load(Ordering::SeqCst), adds);
+        assert_eq!(self.target.removes.load(Ordering::SeqCst), removes);
+        assert_eq!(self.target.unexpected.load(Ordering::SeqCst), 0);
     }
 
     async fn expire_submit_claim(&self) -> pin_job::Model {
@@ -785,15 +825,17 @@ async fn unknown_a_keeps_waiter_recoverable_but_never_grants_capacity_or_reposts
     assert_eq!(fixture.target.reads.load(Ordering::SeqCst), 0);
 }
 
+#[path = "rpc_recovery_availability/late_cleanup.rs"]
+mod late_cleanup;
+
 #[tokio::test]
-async fn late_matched_receipt_cannot_wake_changed_history_identity_or_zero_desired() {
+async fn late_matched_receipt_cannot_wake_changed_history_or_identity() {
     for boundary in [
         "credential",
         "endpoint",
         "capture_epoch",
         "archived_lifetime",
         "generation",
-        "zero_desired",
         "request",
         "history_call",
         "history_strategy",
@@ -883,13 +925,6 @@ async fn late_matched_receipt_cannot_wake_changed_history_identity_or_zero_desir
                     .exec(fixture.store.db())
                     .await
                     .unwrap();
-            }
-            "zero_desired" => {
-                let txn = fixture.store.db().begin().await.unwrap();
-                leases::cancel_lease(&txn, original.lease_id.as_deref().unwrap(), Utc::now())
-                    .await
-                    .unwrap();
-                txn.commit().await.unwrap();
             }
             "request" => {
                 remote_pin::Entity::update_many()

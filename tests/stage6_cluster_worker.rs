@@ -494,6 +494,125 @@ async fn stage6_route_credential_endpoint_and_protocol_drift_park_without_http()
 }
 
 #[tokio::test]
+async fn stage6_late_accepted_cluster_submit_releases_only_after_native_delete_ack() {
+    use axum::{Json, Router, routing::post};
+    use http::Method;
+    use ipfs_s3_gateway::{
+        pinning::identity::CleanupMode,
+        store::entities::{pin_job, pin_lease_target},
+    };
+    use std::time::Duration;
+    use tokio::{
+        sync::{mpsc, oneshot},
+        time::timeout,
+    };
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let (calls, mut received) = mpsc::unbounded_channel();
+    let write = move |method: Method| {
+        let calls = calls.clone();
+        async move {
+            let (reply, gate) = oneshot::channel::<()>();
+            calls.send((method, reply)).unwrap();
+            gate.await.unwrap();
+            Json(serde_json::json!({"cid": fixture::canonical()}))
+        }
+    };
+    // Only the canonical native pin route can acknowledge writes. No replica GET proves a pin.
+    let app = Router::new().route(
+        &format!("/pins/{}", fixture::canonical()),
+        post(write.clone()).delete(write),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut fixture = Fixture::configured("rest", false, "sqlite::memory:", |config| {
+        config.pinning.providers[0]
+            .cluster
+            .as_mut()
+            .unwrap()
+            .rest_endpoint = endpoint;
+        config.pinning_identity.providers[0].cleanup = CleanupMode::Managed;
+    })
+    .await;
+    let lease = fixture.put("in-flight").await;
+    let db = fixture.state.store.db().clone();
+    let usage = || async {
+        let row = pin_provider_usage::Entity::find()
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        (row.reserved_bytes, row.reserved_pins)
+    };
+    let remote = || async { remote_pin::Entity::find().one(&db).await.unwrap().unwrap() };
+    let target = || async {
+        pin_lease_target::Entity::find()
+            .filter(pin_lease_target::Column::LeaseId.eq(&lease))
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    fixture.start();
+    let wait = Duration::from_secs(12);
+    let (method, accept) = timeout(wait, received.recv())
+        .await
+        .expect("Cluster POST")
+        .unwrap();
+    assert_eq!(method, Method::POST);
+    let in_flight = pin_submit_observation::Entity::find()
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(in_flight.outcome, "in_flight");
+    let response = fixture.s3(Method::DELETE, "in-flight", &[]).await;
+    assert_eq!(response.status(), http::StatusCode::NO_CONTENT);
+    assert_eq!(target().await.state, "released");
+    assert_eq!(usage().await, (4, 1));
+    accept.send(()).unwrap();
+
+    let (method, ack) = timeout(wait, received.recv())
+        .await
+        .expect("native Cluster DELETE")
+        .unwrap();
+    assert_eq!(method, Method::DELETE);
+    let accepted = pin_submit_observation::Entity::find_by_id(in_flight.id)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(accepted.outcome, "accepted");
+    assert_eq!(accepted.submit_call, 1);
+    assert_ne!(remote().await.status, "absent");
+    assert_eq!(usage().await, (4, 1), "DELETE is still awaiting its ACK");
+    ack.send(()).unwrap();
+    timeout(wait, async {
+        while remote().await.status != "absent" {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("release after matching CID acknowledgement");
+    fixture.stop().await;
+    assert_eq!(usage().await, (0, 0));
+    assert_eq!(target().await.state, "released");
+    let submits = pin_job::Entity::find()
+        .filter(pin_job::Column::Operation.eq("submit"))
+        .all(&db)
+        .await
+        .unwrap();
+    assert_eq!(submits.len(), 1);
+    assert_eq!(submits[0].id, accepted.job_id);
+    assert_ne!(submits[0].state, "pending");
+    assert!(
+        received.try_recv().is_err(),
+        "a second native write was dispatched"
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn stage6_late_poll_cannot_project_across_an_archived_release_even_with_same_cid_id() {
     late_poll_archived_release(Fixture::new("rest", false, "sqlite::memory:").await).await;
 }

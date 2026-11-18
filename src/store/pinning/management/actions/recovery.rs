@@ -229,7 +229,7 @@ pub(super) async fn schedule_target(
             return Ok(());
         }
         let owner =
-            jobs::canonical_desired_target_with_work(tx, &target.provider, &target.cid, work)
+            jobs::canonical_submit_target_with_work(tx, &target.provider, &target.cid, now, work)
                 .await?
                 .ok_or(ManagementError::Changed)?;
         let owner_lease =

@@ -35,6 +35,9 @@ use crate::{
 mod bounded;
 pub(crate) use bounded::{latest_rpc, latest_rpc_with_work, rejected_non_rpc_call_with_work};
 
+#[path = "submission/late_cleanup.rs"]
+pub(crate) mod late_cleanup;
+
 #[cfg(test)]
 #[path = "submission_context_tests.rs"]
 mod context_tests;
@@ -945,6 +948,21 @@ async fn receipt_context_core<C: ConnectionTrait>(
         crate::store::pinning::management::records::DecodeWork<'_>,
     )>,
 ) -> AppResult<bool> {
+    Ok(jobs::check_target_job_generation(db, job).await?
+        && receipt_resource_context(db, row, job, remote, request, runtime).await?)
+}
+
+async fn receipt_resource_context<C: ConnectionTrait>(
+    db: &C,
+    row: &evidence::Model,
+    job: &pin_job::Model,
+    remote: &remote_pin::Model,
+    request: Option<&str>,
+    runtime: Option<(
+        crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
+        crate::store::pinning::management::records::DecodeWork<'_>,
+    )>,
+) -> AppResult<bool> {
     let pk = [("id".into(), row.id.clone())].into();
     let operational = match runtime {
         Some((catalog, work)) => crate::store::pinning::legacy_migration::resolve_with_catalog(
@@ -981,7 +999,6 @@ async fn receipt_context_core<C: ConnectionTrait>(
                 .as_deref()
                 .is_some_and(|existing| existing != request)
         })
-        || !jobs::check_target_job_generation(db, job).await?
     {
         return Ok(false);
     }
@@ -1200,7 +1217,7 @@ pub(crate) async fn parked_receipt_candidates<C: ConnectionTrait>(
     db: &C,
     after: &str,
     limit: u64,
-) -> AppResult<(Option<String>, Vec<String>)> {
+) -> AppResult<(Option<String>, Vec<String>, Vec<String>)> {
     let relation = fact_relation(db).await?;
     let jobs_table = if db.get_database_backend() == sea_orm::DatabaseBackend::Sqlite {
         "\"main\".\"pin_jobs\""
@@ -1209,18 +1226,31 @@ pub(crate) async fn parked_receipt_candidates<C: ConnectionTrait>(
     };
     let rows = db.query_all(Statement::from_sql_and_values(
         db.get_database_backend(),
-        format!("SELECT e.id, CASE WHEN e.needs_attention AND e.observed_at IS NOT NULL AND e.outcome IN ('matched','accepted','unknown') THEN e.job_id END AS job_id FROM {} AS e WHERE e.id > $1 AND EXISTS (SELECT 1 FROM {jobs_table} AS j WHERE j.id=e.job_id AND j.operation='submit' AND j.state='running' AND j.locked_until IS NULL AND j.submit_phase='recovering') ORDER BY e.id LIMIT $2", relation.table),
+        format!("SELECT id, job_id, ended, (needs_attention AND observed_at IS NOT NULL AND outcome IN ('matched','accepted','unknown')) AS ready FROM (\
+            SELECT e.id,e.job_id,e.needs_attention,e.outcome,e.observed_at,\
+                   (j.state='running' AND j.locked_until IS NULL AND j.submit_phase='recovering') AS parked,\
+                   (e.needs_attention AND e.outcome IN ('matched','accepted') AND e.observed_at IS NOT NULL AND EXISTS (\
+                       SELECT 1 FROM pin_leases l JOIN pin_lease_targets t ON t.lease_id=l.id \
+                       JOIN remote_pins r ON r.provider=t.provider AND r.cid=t.cid \
+                       WHERE l.id=j.lease_id AND t.id=j.target_id AND t.state='released' \
+                       AND l.state IN ('expired','cancelled','evicted') AND r.provider=e.provider \
+                       AND r.cid=e.expected_cid AND r.epoch>=e.remote_epoch AND r.request_id IS NULL AND r.status<>'absent'\
+                   )) AS ended FROM {} e JOIN {jobs_table} j ON j.id=e.job_id AND j.operation='submit' WHERE e.id>$1\
+        ) receipt WHERE parked OR ended ORDER BY id LIMIT $2", relation.table),
         [after.into(), i64::try_from(limit).unwrap_or(i64::MAX).into()],
     )).await?;
     let mut cursor = None;
     let mut candidates = Vec::new();
+    let mut cleanup = Vec::new();
     for row in rows {
         cursor = Some(row.try_get::<String>("", "id")?);
-        if let Some(job_id) = row.try_get::<Option<String>>("", "job_id")? {
-            candidates.push(job_id);
+        if row.try_get::<bool>("", "ended")? {
+            cleanup.push(row.try_get("", "job_id")?);
+        } else if row.try_get::<bool>("", "ready")? {
+            candidates.push(row.try_get("", "job_id")?);
         }
     }
-    Ok((cursor, candidates))
+    Ok((cursor, candidates, cleanup))
 }
 
 pub(crate) async fn missing_receipt_park_candidates<C: ConnectionTrait>(
@@ -1523,6 +1553,7 @@ impl AdmissionSnapshot {
             None,
             crate::store::pinning::legacy_migration::ReceiptCatalog::full(db),
             &(),
+            false,
         )
         .await
     }
@@ -1537,6 +1568,7 @@ impl AdmissionSnapshot {
             Some(cid),
             crate::store::pinning::legacy_migration::ReceiptCatalog::full(db),
             &(),
+            false,
         )
         .await
     }
@@ -1546,6 +1578,7 @@ impl AdmissionSnapshot {
         cid: Option<&str>,
         catalog: crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
         work: &W,
+        include_undispatched_jobs: bool,
     ) -> AppResult<Self> {
         let aliases =
             crate::store::pinning::legacy_migration::admission_historical_resources_with_catalog(
@@ -1681,11 +1714,16 @@ impl AdmissionSnapshot {
              WHERE ({}) AND evidence.\"expected_cid\" IN ({candidate})",
             resource_scope("pin_submit_observations", "evidence", "expected_cid")
         );
-        let invocation_scope = format!("\"job_id\" IN ({evidence_jobs})");
-        let job_scope = format!(
-            "({}) AND \"cid\" IN ({candidate}) AND \"id\" IN ({evidence_jobs})",
+        let mut job_scope = format!(
+            "({}) AND \"cid\" IN ({candidate})",
             resource_scope("pin_jobs", "", "cid")
         );
+        let invocation_scope = if include_undispatched_jobs {
+            format!("\"job_id\" IN (SELECT \"id\" FROM pin_jobs WHERE {job_scope})")
+        } else {
+            job_scope.push_str(&format!(" AND \"id\" IN ({evidence_jobs})"));
+            format!("\"job_id\" IN ({evidence_jobs})")
+        };
         let recovery_scope = format!(
             "({}) AND \"expected_cid\" IN ({candidate}) \
              AND EXISTS (SELECT 1 FROM \"pin_submit_observations\" evidence \
@@ -1703,6 +1741,14 @@ impl AdmissionSnapshot {
              AND newer.\"sequence\">\"pin_replica_observations\".\"sequence\"))",
             resource_scope("pin_replica_observations", "", "expected_cid")
         );
+        let recovery_scope = if include_undispatched_jobs {
+            format!(
+                "({}) AND \"expected_cid\" IN ({candidate})",
+                resource_scope("pin_replica_observations", "", "expected_cid")
+            )
+        } else {
+            recovery_scope
+        };
         let remote_scope = format!(
             "({}) AND \"cid\" IN ({candidate})",
             resource_scope("remote_pins", "", "cid")
@@ -2259,6 +2305,51 @@ impl AdmissionSnapshot {
             && ledger.route.as_deref() == Some(row.route.as_str())
     }
 
+    fn local_release_archived(&self, ledger: &remote_pin_ledger::Model) -> bool {
+        let Some(remote) = self.remotes.get(&ledger.cid) else {
+            return false;
+        };
+        remote.status == "absent"
+            && remote.request_id.is_none()
+            && super::decode_route(ledger).is_some_and(|route| is_rpc(&route))
+            && self.archives.iter().any(|archive| {
+                archive.cid == ledger.cid
+                    && archive.epoch == remote.epoch
+                    && serde_json::from_str::<serde_json::Value>(&archive.ledger).is_ok_and(
+                        |fact| {
+                            fact["local_reservation_released"] == true
+                                && matches!(
+                                    fact["ledger"]["effect"].as_str(),
+                                    Some("reserved" | "unknown" | "not_created")
+                                )
+                                && fact["ledger"]["route"].as_str() == ledger.route.as_deref()
+                                && fact["ledger"]["provider"] == ledger.provider
+                                && fact["ledger"]["cid"] == ledger.cid
+                        },
+                    )
+            })
+    }
+
+    fn late_cleanup_known(&self, row: &evidence::Model, ledger: &remote_pin_ledger::Model) -> bool {
+        // Reconcile can settle the invocation without changing its terminal Submit job.
+        ledger.effect == "cleanup_pending"
+            && self.histories.get(&row.job_id).is_some_and(|history| {
+                history.submit_calls == row.submit_call
+                    && history.state == "settled"
+                    && history.effect == "created"
+            })
+            && self.captures.get(&row.job_id).is_some_and(|capture| {
+                capture.route == row.route && capture.remote_epoch == row.remote_epoch
+            })
+            && self.remotes.get(&ledger.cid).is_some_and(|remote| {
+                remote.epoch >= row.remote_epoch
+                    && remote
+                        .request_id
+                        .as_deref()
+                        .is_some_and(|request| matching_request(row).as_deref() == Some(request))
+            })
+    }
+
     fn held_known(&self, ledger: &remote_pin_ledger::Model) -> bool {
         if self.unreadable.contains(&ledger.cid) {
             return false;
@@ -2272,12 +2363,13 @@ impl AdmissionSnapshot {
             .filter(|row| row.expected_cid == ledger.cid)
             .collect::<Vec<_>>();
         if ledger.effect == "absent" {
-            return !rows.is_empty()
-                && rows.iter().all(|row| {
-                    !row.needs_attention
-                        && row.outcome == "not_submitted"
-                        && ledger.route.as_deref() == Some(row.route.as_str())
-                });
+            return self.local_release_archived(ledger)
+                || !rows.is_empty()
+                    && rows.iter().all(|row| {
+                        !row.needs_attention
+                            && row.outcome == "not_submitted"
+                            && ledger.route.as_deref() == Some(row.route.as_str())
+                    });
         }
         rows.into_iter().any(|row| {
             !self.released(row)
@@ -2287,7 +2379,8 @@ impl AdmissionSnapshot {
                             || self
                                 .jobs
                                 .get(&row.job_id)
-                                .is_none_or(|job| job.state != "error"))
+                                .is_none_or(|job| job.state != "error")
+                            || self.late_cleanup_known(row, ledger))
                         && matches!(
                             row.outcome.as_str(),
                             "matched" | "accepted" | "not_submitted"
@@ -2296,6 +2389,154 @@ impl AdmissionSnapshot {
                         && (ledger.effect != "not_created" || row.outcome == "not_submitted"))
         })
     }
+}
+
+/// The epoch advances when references change. Only an archived release, not an
+/// older epoch alone, separates a previous invocation from this reservation.
+pub(in crate::store::pinning) async fn undispatched_reservation<
+    W: crate::store::pinning::legacy_migration::ReceiptWork,
+>(
+    catalog: crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
+    ledger: &remote_pin_ledger::Model,
+    work: &W,
+) -> AppResult<Option<Vec<(String, i32)>>> {
+    if !matches!(
+        ledger.effect.as_str(),
+        "reserved" | "unknown" | "not_created"
+    ) || ledger.ownership != "unknown"
+        || !super::decode_route(ledger).is_some_and(|route| is_rpc(&route))
+    {
+        return Ok(None);
+    }
+    let snapshot = AdmissionSnapshot::read_with_catalog(
+        &ledger.provider,
+        Some(&ledger.cid),
+        catalog,
+        work,
+        true,
+    )
+    .await?;
+    let Some(remote) = snapshot.remotes.get(&ledger.cid) else {
+        return Ok(None);
+    };
+    if remote.status != "reserved" || remote.request_id.is_some() {
+        return Ok(None);
+    }
+    let last_release = match snapshot.archives.iter().max_by_key(|row| row.epoch) {
+        Some(row) => {
+            let Ok(fact) = serde_json::from_str::<serde_json::Value>(&row.ledger) else {
+                return Ok(None);
+            };
+            if fact["ledger"]["provider"] != remote.provider
+                || fact["ledger"]["cid"] != remote.cid
+                || !(fact["local_reservation_released"] == true
+                    && matches!(
+                        fact["ledger"]["effect"].as_str(),
+                        Some("reserved" | "unknown" | "not_created")
+                    )
+                    || fact["confirmed_absent"] == true
+                    || fact["unpin_accepted"] == true)
+            {
+                return Ok(None);
+            }
+            row.epoch
+        }
+        None => 0,
+    };
+    // A prepared invocation sets both summaries to unknown before rate waiting.
+    // Account for every call, including older attempts of the same Submit.
+    let mut calls = BTreeSet::new();
+    for row in snapshot
+        .evidence
+        .iter()
+        .filter(|r| r.remote_epoch > last_release)
+    {
+        let Some(history) = snapshot.histories.get(&row.job_id) else {
+            return Ok(None);
+        };
+        let Some(capture) = snapshot.captures.get(&row.job_id) else {
+            return Ok(None);
+        };
+        if row.outcome != "not_submitted"
+            || row.effect != "not_created"
+            || row.needs_attention
+            || row.resources != "[]"
+            || row.observed_at.is_none()
+            || row.id != format!("{}:call:{}", row.job_id, row.submit_call)
+            || row.route != capture.route
+            || Some(row.route.as_str()) != ledger.route.as_deref()
+            || row.remote_epoch > capture.remote_epoch
+            || (row.submit_call == history.submit_calls && row.remote_epoch != capture.remote_epoch)
+            || !(1..=history.submit_calls).contains(&row.submit_call)
+            || !calls.insert((row.job_id.as_str(), row.submit_call))
+        {
+            return Ok(None);
+        }
+    }
+    let undispatched = snapshot
+        .registered
+        .as_ref()
+        .is_some_and(|r| !r.retired && Some(r.snapshot.as_str()) == ledger.route.as_deref())
+        && snapshot.unreadable.is_empty()
+        && snapshot.unwitnessed_submissions.is_empty()
+        && last_release < remote.epoch
+        && (ledger.effect == "reserved" || !calls.is_empty())
+        && snapshot
+            .recoveries
+            .iter()
+            .all(|row| row.remote_epoch <= last_release)
+        && snapshot
+            .jobs
+            .values()
+            .filter(|job| matches!(job.operation.as_str(), "submit" | "poll" | "unpin"))
+            .all(|job| {
+                snapshot.captures.get(&job.id).is_some_and(|capture| {
+                    capture.remote_epoch <= last_release
+                        || (capture.remote_epoch <= remote.epoch
+                            && Some(capture.route.as_str()) == ledger.route.as_deref()
+                            && job.locked_until.is_none()
+                            && match job.operation.as_str() {
+                                // Lease end schedules an Unpin even with no request. Its
+                                // no-op completion leaves only the epoch-scoped job.
+                                "unpin" => {
+                                    job.state == "done"
+                                        && job.attempts == 0
+                                        && job.last_error.is_none()
+                                        && job.expected_remote_epoch == Some(capture.remote_epoch)
+                                }
+                                "submit" if job.submit_phase.as_deref() == Some("ready") => {
+                                    match snapshot.histories.get(&job.id) {
+                                        None => {
+                                            matches!(job.state.as_str(), "done" | "error")
+                                                && job.attempts == 0
+                                        }
+                                        Some(history) => {
+                                            job.state == "done"
+                                                && matches!(
+                                                    history.effect.as_str(),
+                                                    "unknown" | "not_created"
+                                                )
+                                                && (1..=jobs::MAX_SUBMIT_RECOVERY_ATTEMPTS)
+                                                    .contains(&history.submit_calls)
+                                                && (1..=history.submit_calls)
+                                                    .all(|n| calls.contains(&(job.id.as_str(), n)))
+                                        }
+                                    }
+                                }
+                                _ => false,
+                            })
+                })
+            });
+    Ok(undispatched.then(|| {
+        snapshot
+            .histories
+            .values()
+            .filter(|h| {
+                h.effect == "unknown" && calls.contains(&(h.job_id.as_str(), h.submit_calls))
+            })
+            .map(|h| (h.job_id.clone(), h.submit_calls))
+            .collect()
+    }))
 }
 
 /// A reclaimed matching invocation may settle its temporary claim-loss debt
@@ -2595,15 +2836,27 @@ pub(crate) async fn has_resource_debt<C: ConnectionTrait>(
     {
         return Ok(true);
     }
-    if let Some(ledger) =
-        remote_pin_ledger::Entity::find_by_id((provider.to_owned(), cid.to_owned()))
-            .one(db)
+    let ledger = remote_pin_ledger::Entity::find_by_id((provider.to_owned(), cid.to_owned()))
+        .one(db)
+        .await?;
+    let debt_unless_undispatched = async {
+        match &ledger {
+            Some(row) => Ok(undispatched_reservation(
+                crate::store::pinning::legacy_migration::ReceiptCatalog::full(db),
+                row,
+                &(),
+            )
             .await?
-        && (matches!(ledger.effect.as_str(), "unknown" | "reported_unknown")
-            || super::decode_route(&ledger).is_some_and(|route| is_rpc(&route))
-                && !held_evidence_known(db, &ledger).await?)
+            .is_none()),
+            None => Ok(true),
+        }
+    };
+    if let Some(row) = &ledger
+        && (matches!(row.effect.as_str(), "unknown" | "reported_unknown")
+            || super::decode_route(row).is_some_and(|route| is_rpc(&route))
+                && !held_evidence_known(db, row).await?)
     {
-        return Ok(true);
+        return debt_unless_undispatched.await;
     }
     let jobs = pin_job::Entity::find()
         .filter(pin_job::Column::Provider.eq(provider))
@@ -2616,7 +2869,7 @@ pub(crate) async fn has_resource_debt<C: ConnectionTrait>(
             .await?
             .is_some_and(|history| history.submit_calls > 0 && history.effect == "unknown")
         {
-            return Ok(true);
+            return debt_unless_undispatched.await;
         }
     }
     Ok(false)
@@ -2647,7 +2900,8 @@ pub(in crate::store::pinning) async fn admission_barriers_with_catalog<
     work: &W,
     include_cleanup: bool,
 ) -> AppResult<BTreeMap<String, AdmissionBarrier>> {
-    let snapshot = AdmissionSnapshot::read_with_catalog(provider, None, catalog, work).await?;
+    let snapshot =
+        AdmissionSnapshot::read_with_catalog(provider, None, catalog, work, false).await?;
     admission_barriers_from_snapshot(snapshot, Utc::now(), include_cleanup)
 }
 
@@ -2775,6 +3029,7 @@ async fn held_evidence_core<C: ConnectionTrait>(
                 Some(&ledger.cid),
                 catalog,
                 &work,
+                false,
             )
             .await?
         }
