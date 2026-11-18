@@ -195,6 +195,7 @@ pub struct RemoteEvidence {
     /// No live provider probe or observation-freshness guarantee is performed.
     pub observation_current: bool,
     pub confirmed_absent: bool,
+    pub unpin_accepted: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]

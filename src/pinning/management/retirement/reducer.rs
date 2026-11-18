@@ -427,12 +427,7 @@ impl InventorySpool {
                             original: Some(original.clone()),
                             available,
                             allocation_allowed: false,
-                            cleanup: match original.cleanup {
-                                crate::pinning::identity::CleanupMode::Managed => {
-                                    CleanupMode::Managed
-                                }
-                                _ => CleanupMode::Retain,
-                            },
+                            cleanup: CleanupMode::Managed,
                             exclusive_management: false,
                         };
                         // Historical revisions share allocation keys. Preserve
@@ -832,9 +827,7 @@ impl InventorySpool {
             }
         };
         let ownership = match ledger.ownership.as_str() {
-            "application_created" if route.resource_type != ResourceType::RpcPin => {
-                Ownership::ApplicationCreated
-            }
+            "application_created" => Ownership::ApplicationCreated,
             "external_existing" => Ownership::ExternalExisting,
             _ => Ownership::Unknown,
         };

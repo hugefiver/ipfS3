@@ -151,7 +151,7 @@ pub fn normalize_validated_config(
             alias.display_name.clone_from(&existing.display_name);
             if &alias != existing {
                 return Err(anyhow!(
-                    "aliases in the same pinning domain must agree on protocol, strategy, revisions and cleanup"
+                    "aliases in the same pinning domain must agree on protocol, strategy and revisions"
                 ));
             }
         } else {

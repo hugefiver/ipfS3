@@ -271,27 +271,57 @@ impl PinningProvider for PsaClient {
     }
 
     async fn submit(&self, request: SubmitPin) -> Result<RemotePin, ProviderError> {
-        let body = PsaPin {
-            cid: &request.cid,
-            name: &request.name,
-            origins: Vec::new(),
-            meta: &request.metadata,
+        self.submit_observed(request).await.result
+    }
+
+    async fn submit_observed(
+        &self,
+        request: SubmitPin,
+    ) -> crate::pinning::provider::SubmitObservation {
+        use crate::pinning::{
+            identity::{Ownership, RemoteResourceType},
+            provider::{ObservedResource, ObservedResourceStatus, SubmitObservation},
         };
-        let url = self.pins_url()?;
-        let response = self
-            .execute(self.http.post(url).json(&body), Operation::Submit)
-            .await?;
-        let status = self
-            .decode_status(
-                self.require_success(response, Operation::Submit).await?,
-                Operation::Submit,
-            )
-            .await?;
-        let remote_pin = self.remote_pin(status)?;
-        if remote_pin.cid != request.cid {
-            return Err(protocol_error("provider response failed pin correlation"));
+        let mut created = false;
+        let result = async {
+            let body = PsaPin {
+                cid: &request.cid,
+                name: &request.name,
+                origins: Vec::new(),
+                meta: &request.metadata,
+            };
+            let response = self
+                .execute(
+                    self.http.post(self.pins_url()?).json(&body),
+                    Operation::Submit,
+                )
+                .await?;
+            created = response.status() == StatusCode::CREATED;
+            let status = self
+                .decode_status(
+                    self.require_success(response, Operation::Submit).await?,
+                    Operation::Submit,
+                )
+                .await?;
+            let remote = self.remote_pin(status)?;
+            if remote.cid != request.cid {
+                return Err(protocol_error("provider response failed pin correlation"));
+            }
+            Ok(remote)
         }
-        Ok(remote_pin)
+        .await;
+        let mut observation = SubmitObservation::from(result);
+        if created && let Ok(remote) = &observation.result {
+            observation.resources.push(ObservedResource {
+                resource_type: RemoteResourceType::PsaRequest,
+                cid: remote.cid.clone(),
+                request_id: remote.request_id.clone(),
+                status: ObservedResourceStatus::PinAccepted,
+                ownership: Ownership::ApplicationCreated,
+                replica_evidence: None,
+            });
+        }
+        observation
     }
 
     async fn get(&self, request_id: &str) -> Result<RemotePin, ProviderError> {
@@ -817,6 +847,20 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.class, ProviderErrorClass::RateLimited);
         assert_eq!(error.retry_after, None);
+    }
+
+    #[tokio::test]
+    async fn accepted_delete_finishes_without_polling_the_exact_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/pins/request-7"))
+            .respond_with(ResponseTemplate::new(202))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = PsaClient::new("test".into(), server.uri(), super::test_token(TOKEN));
+        provider.unpin("request-7").await.unwrap();
+        assert_eq!(requests(&server).await.len(), 1);
     }
 
     #[tokio::test]

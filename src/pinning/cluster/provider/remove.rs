@@ -59,7 +59,12 @@ impl ClusterProvider {
             progress.run(self.options.transfer_limits.idle_timeout, cancel, async {
                 let response = self.target.execute(request).await?;
                 out.http_status = Some(response.status().as_u16());
-                self.parse_pin(response, out, &progress).await
+                if matches!(response.status().as_u16(), 202 | 204) {
+                    self.record(out, cid, ClusterResourceStatus::UnpinAccepted)?;
+                    Ok(cid.clone())
+                } else {
+                    self.parse_pin(response, out, &progress).await
+                }
             }),
         )
         .await

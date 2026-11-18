@@ -46,9 +46,20 @@ Docker against the local docker-compose stack.
 - [x] Standard S3 object-tag control
 - [x] Durable asynchronous worker and crash recovery
 - [x] Sticky `one` failover and `all` provider coordination
-- [x] Lease duration, renewal, expiry, and remote unpin
+- [x] Lease duration, renewal and expiry; remote unpin on supported routes (provider-wide coverage is tracked below)
 - [x] Decompressed ZIP entry targets
 - [x] Unique-CID local soft quota and eviction
+
+## Current priorities — Pin expiry and project-wide fault isolation
+
+- [x] **Make expiry cleanup automatic for every pinning service**, including Pinata, Filebase PSA/RPC, Kubo RPC and IPFS Cluster. Start cleanup with the service and resume pending cleanup after restart; no `managed` opt-in, separate command or protocol exemption. Remove `cleanup = "retain"` from the configuration schema, defaults, examples and deployment configuration. Migrate existing settings and stored `retain` records so they do not silently disable cleanup after upgrade.
+  - Use the native delete for the gateway's submitted backup pin: the request or file handle where available, otherwise the CID. On a shared CID-addressed backup this removes the node's pin for that CID, including an independent hold on the same CID. Expiry leaves the S3 object and primary copy intact.
+  - [x] Share one quota reservation per `(provider, canonical CID)` and keep the remote pin while another live reference needs it. The same CID on another provider is independent ([shared-CID coverage](tests/integration/pinning.rs#L3308-L3392)).
+  - [x] Mark each expired reference as released. The record whose expiry removes the **last live reference** owns the physical cleanup job; earlier records do not enqueue one.
+  - Assign that job when the last reference ends, not in advance from a scheduled expiry time. Concurrent expiries or retries must not create duplicate cleanup jobs. A renewal or new reference must prevent stale cleanup from removing a pin it still needs. Return pin quota when the provider accepts the unpin or reports the pin already absent, then wake eligible waiters. Block reclamation is the node's GC responsibility.
+- [x] **Review failure propagation across the whole project**, from S3 requests, multipart completion and ZIP/import publication through pin scheduling, lifecycle/GC and database maintenance. For each failure, identify which work actually depends on it; keep unrelated work running without weakening atomic publication or reporting an unconfirmed remote outcome as success.
+  - Unresolved receipts hold their own CIDs. Lease expiry and receipt recovery handle failures per item, so ready jobs still dispatch. PostgreSQL claim fences lock the job without updating shared revision rows; terminal writes use the same target-before-job order as projection. Real account-wide capacity limits still apply.
+  - Acceptance: while one CID's submit or unpin remains unresolved, a second eligible CID on the same provider, a pin on another provider, and an unrelated S3 upload can all finish without operator intervention. The failed item remains visible and does not monopolize the queue; after the cause clears, eligible waiting or blocked work resumes automatically.
 
 ## Delivered — Release Assignment Pending
 

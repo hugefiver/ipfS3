@@ -136,6 +136,7 @@ pub async fn upgrade_existing(
             | legacy::M17
             | legacy::M23
             | legacy::CURRENT_PINNING
+            | legacy::CID_COMPARISONS
             | super::migrations::baseline::VERSION
     ) || request.target_version != schema::VERSION
     {
@@ -194,7 +195,14 @@ async fn prepare_upgrade(
                 super::migrations::baseline::VERSION,
                 super::migrations::m20261108_000001_current_pinning_config::VERSION,
             ];
-        let old_final = legacy::is_m23(&versions) || old_baseline || old_current;
+        let with_comparisons = versions
+            == [
+                super::migrations::baseline::VERSION,
+                legacy::CURRENT_PINNING,
+                legacy::CID_COMPARISONS,
+            ];
+        let old_final =
+            legacy::is_m23(&versions) || old_baseline || old_current || with_comparisons;
         if old_baseline {
             if !matches!(
                 request.source_version,
@@ -202,8 +210,8 @@ async fn prepare_upgrade(
             ) {
                 return Err(required());
             }
-        } else if old_current {
-            if request.source_version != legacy::CURRENT_PINNING {
+        } else if with_comparisons || old_current {
+            if Some(request.source_version) != versions.last().map(String::as_str) {
                 return Err(required());
             }
         } else {
@@ -253,7 +261,7 @@ async fn prepare_upgrade(
                 return Err(required());
             }
             needs_backfill = state == "backfill";
-            if old_current {
+            if old_current || with_comparisons {
                 schema::validate_previous_current(tx)
                     .await
                     .map_err(|_| required())?;
@@ -268,7 +276,10 @@ async fn prepare_upgrade(
                 if needs_backfill {
                     return Err(required());
                 }
-            } else if request.source_version != legacy::CURRENT_PINNING {
+            } else if !matches!(
+                request.source_version,
+                legacy::CURRENT_PINNING | legacy::CID_COMPARISONS
+            ) {
                 // The old target is immutable evidence, not an alias of the new one.
                 history::upgrade_stamp(
                     tx,
@@ -297,10 +308,13 @@ async fn prepare_upgrade(
             .await?;
             needs_backfill = true;
         }
-        if !old_current {
+        if !old_current && !with_comparisons {
             super::migrations::m20261108_000001_current_pinning_config::install(tx).await?;
         }
-        super::migrations::m20261109_000001_pin_cid_comparisons::install(tx).await?;
+        if !with_comparisons {
+            super::migrations::m20261109_000001_pin_cid_comparisons::install(tx).await?;
+        }
+        super::migrations::m20261110_000001_cleanup_identity::install(tx).await?;
         tx.execute_unprepared("DELETE FROM seaql_migrations")
             .await?;
         for version in &known {

@@ -257,14 +257,11 @@ fn provider_operations(provider: &ValidatedProvider) -> Value {
             },
         )
     };
-    let cleanup =
-        if provider.identity.cleanup == ipfs_s3_gateway::pinning::identity::CleanupMode::Retain {
-            "denied"
-        } else if active && kind != ProviderKind::Noop {
-            "unknown"
-        } else {
-            "denied"
-        };
+    let cleanup = if active && kind != ProviderKind::Noop {
+        "unknown"
+    } else {
+        "denied"
+    };
     let mut operations = vec![
         supported("submit_cid", cid),
         supported("upload_bytes", upload),

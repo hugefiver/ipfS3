@@ -75,6 +75,9 @@ impl PinningProvider for IpfsRpcProvider {
         };
         let response = self.target.control("pin/rm", query, true).await?;
         response.check(true)?;
+        if matches!(response.status.as_u16(), 202 | 204) {
+            return Ok(());
+        }
         let pins: Pins = response.json()?;
         if pins.pins.len() != 1 || !cid::equivalent(&pins.pins[0], &cid).unwrap_or(false) {
             return Err(error::protocol("RPC pin/rm did not confirm the exact root"));

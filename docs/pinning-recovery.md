@@ -122,9 +122,19 @@ historical or unknown responsibility.
 
 An active lease with an error target still retains its remote resource and quota.
 Cancelling another lease that shares the CID does not authorize deleting that
-resource. The error lease must end before its hold is removed; cleanup still
-requires the original route, ownership and release evidence. This does not
-restart the failed task.
+resource. When the last reference ends, the worker cleans up the submitted pin
+on its original backup route. Request- or file-based APIs target the exact
+handle. On CID-based APIs the delete applies to the entire CID on that backup
+node, including any independent pin of the same CID. Keep the primary storage
+separate from these backup destinations. A pin found by lookup alone is not a
+gateway submission receipt.
+
+The worker returns pin quota when the provider accepts the unpin request or
+reports the exact pin already absent. It does not poll for physical removal. A
+successful Kubo-style `pin/rm` removes the pin; blocks can remain readable until
+the node's own GC. The gateway does not trigger GC. A failed request stays
+visible on its CID while unrelated work continues. Expiry leaves S3 object
+versions and their primary content in place.
 
 If an earlier manual edit has damaged accounting, stop automated corrective
 writes and retain a database backup. Reconcile complete provider and database

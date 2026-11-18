@@ -172,6 +172,7 @@ pub(super) fn validate_versions(actual: &[String], writing: bool) -> AppResult<(
                 | ZIP_CAPTURE
                 | MANAGEMENT
                 | history::CURRENT_PINNING
+                | history::CID_COMPARISONS
                 | history::M23
                 | crate::store::migrations::baseline::VERSION
         )

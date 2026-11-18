@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CleanupMode {
-    #[default]
     Retain,
+    #[default]
     Managed,
 }
 
@@ -118,7 +118,7 @@ pub struct CanonicalResourceKey {
 }
 
 impl ProviderRouteSnapshot {
-    /// Execution compatibility never changes the historical deletion authority.
+    /// Legacy cleanup preferences are not transport or ownership evidence.
     pub fn execution_compatible(&self, original: &Self) -> bool {
         let mut execution = self.clone();
         execution.cleanup = original.cleanup;
@@ -206,7 +206,7 @@ impl ProviderIdentity {
             api_profile: raw.api_profile.clone(),
             strategy: raw.strategy.clone(),
             retired: raw.retired,
-            cleanup: raw.cleanup,
+            cleanup: CleanupMode::Managed,
         })
     }
 
@@ -250,7 +250,7 @@ impl ProviderIdentity {
     }
 
     pub fn validate_route_snapshot(&self, snapshot: &ProviderRouteSnapshot) -> anyhow::Result<()> {
-        if self.route_snapshot() != *snapshot {
+        if !self.route_snapshot().execution_compatible(snapshot) {
             bail!("provider route snapshot does not match the configured identity revision");
         }
         Ok(())

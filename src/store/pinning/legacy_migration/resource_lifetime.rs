@@ -158,7 +158,7 @@ pub(super) async fn fresh_with_work<C: ConnectionTrait, W: Work>(
             && !binding.release_epochs_at_migration.contains(&release)
         {
             let image: serde_json::Value = work.parse(&image, "release lifetime image invalid")?;
-            if image["confirmed_absent"] == true
+            if (image["confirmed_absent"] == true || image["unpin_accepted"] == true)
                 && image["ledger"]["provider"].as_str() == Some(&binding.operational_key)
                 && image["ledger"]["cid"].as_str() == Some(cid)
             {

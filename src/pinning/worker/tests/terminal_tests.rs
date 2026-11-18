@@ -504,15 +504,13 @@ async fn active_error_shared_reference_blocks_queued_unpin_until_lease_ends() {
             .unwrap()
             .unwrap();
         assert_eq!((released.reserved_bytes, released.reserved_pins), (0, 0));
-        assert_eq!(
-            pin_lease_target::Entity::find_by_id("target-1")
-                .one(fixture.store.db())
-                .await
-                .unwrap()
-                .unwrap()
-                .state,
-            "error"
-        );
+        let ended = pin_lease_target::Entity::find_by_id("target-1")
+            .one(fixture.store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ended.state, "released");
+        assert!(ended.last_error.is_some());
     }
 }
 

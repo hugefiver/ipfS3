@@ -692,7 +692,7 @@ mod tests {
         assert!(identity.retired);
         assert_eq!(
             identity.cleanup,
-            crate::pinning::identity::CleanupMode::Retain
+            crate::pinning::identity::CleanupMode::Managed
         );
     }
 
@@ -711,7 +711,7 @@ mod tests {
                 .providers
                 .iter()
                 .all(|provider| provider.identity.cleanup
-                    == crate::pinning::identity::CleanupMode::Retain)
+                    == crate::pinning::identity::CleanupMode::Managed)
         );
     }
 

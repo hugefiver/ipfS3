@@ -923,7 +923,19 @@ async fn typed_unpin_primitive_rejects_wrong_scope_and_never_runs_during_submit(
     );
     assert_eq!(out.effect, ClusterWriteEffect::NotSubmitted);
     assert!(server.received_requests().await.unwrap().is_empty());
-    // No valid deletion is executed: ledger authorization is outside this leaf.
+    reference.resource = provider.resource_key(CID).unwrap();
+    Mock::given(method("DELETE"))
+        .and(path(format!("/pins/{}", reference.resource.cid)))
+        .respond_with(ResponseTemplate::new(202))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let out = provider
+        .unpin_authorized_ref(&reference, &CancellationToken::new())
+        .await;
+    assert!(out.result.is_ok());
+    assert_eq!(out.effect, ClusterWriteEffect::Observed);
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
 mod loopback {

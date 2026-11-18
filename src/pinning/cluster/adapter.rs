@@ -101,6 +101,23 @@ impl PinningProvider for ClusterAdapter {
         }
         Ok(vec![self.get(&query.cid).await?])
     }
+    async fn unpin_owned(&self, id: &str) -> Result<(), ProviderError> {
+        let resource = self
+            .leaf
+            .resource_key(id)
+            .map_err(observation::write_error)?;
+        let reference = super::provider::ClusterRemoteRef {
+            resource,
+            protocol: self.protocol,
+            strategy: self.strategy,
+        };
+        let receipt = self
+            .leaf
+            .unpin_authorized_ref(&reference, &tokio_util::sync::CancellationToken::new())
+            .await;
+        receipt.result.map(|_| ()).map_err(observation::write_error)
+    }
+
     async fn unpin(&self, _id: &str) -> Result<(), ProviderError> {
         // Every transport footprint has Unknown ownership. An untyped CID is
         // not the authorized historical reference required by the remove leaf.

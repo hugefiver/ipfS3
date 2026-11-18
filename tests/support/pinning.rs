@@ -625,6 +625,11 @@ impl PinningHarness {
         self.proxy_for_provider(provider).block_next_submit().await
     }
 
+    pub async fn block_next_find(&self, provider: &str) -> ProviderRequestBlock {
+        let state = &self.proxy_for_provider(provider).state;
+        state.arm_block(&state.next_find_block).await
+    }
+
     pub async fn block_next_delete(&self, provider: &str) -> ProviderRequestBlock {
         self.proxy_for_provider(provider).block_next_delete().await
     }
@@ -1236,6 +1241,7 @@ impl ProviderProxy {
             requests: Mutex::new(Vec::new()),
             request_observed: Notify::new(),
             next_submit_block: Mutex::new(None),
+            next_find_block: Mutex::new(None),
             next_delete_block: Mutex::new(None),
             all_blocks: Mutex::new(Vec::new()),
             client: reqwest::Client::new(),
@@ -1343,6 +1349,7 @@ struct ProviderProxyState {
     requests: Mutex<Vec<ObservedPsaRequest>>,
     request_observed: Notify,
     next_submit_block: Mutex<Option<Arc<RequestBlockState>>>,
+    next_find_block: Mutex<Option<Arc<RequestBlockState>>>,
     next_delete_block: Mutex<Option<Arc<RequestBlockState>>>,
     all_blocks: Mutex<Vec<Arc<RequestBlockState>>>,
     client: reqwest::Client,
@@ -1364,6 +1371,8 @@ impl ProviderProxyState {
     async fn maybe_block(&self, method: &Method, path: &str) {
         let slot = if method == Method::POST && path.ends_with("/pins") {
             Some(&self.next_submit_block)
+        } else if method == Method::GET && path.ends_with("/pins") {
+            Some(&self.next_find_block)
         } else if method == Method::DELETE {
             Some(&self.next_delete_block)
         } else {

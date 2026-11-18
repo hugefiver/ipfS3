@@ -167,7 +167,8 @@ impl CurrentRetirementScan {
                                     value(&row, "ledger")
                                         .ok_or(ManagementError::InvalidEvidence)?,
                                 )?;
-                                self.attention |= !history.confirmed_absent;
+                                self.attention |=
+                                    !(history.confirmed_absent || history.unpin_accepted);
                             } else if value(&row, "effect") != Some("absent") {
                                 let not_created = value(&row, "effect") == Some("not_created");
                                 let unknown = if not_created {
@@ -243,6 +244,8 @@ impl CurrentRetirementScan {
 struct HistoricalAbsence {
     #[serde(default)]
     confirmed_absent: bool,
+    #[serde(default)]
+    unpin_accepted: bool,
 }
 
 fn same_domain(left: &RouteIdentity, right: &RouteIdentity) -> bool {

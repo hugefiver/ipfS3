@@ -198,7 +198,7 @@ impl ValidatedProvider {
         &self,
         snapshot: &crate::pinning::identity::ProviderRouteSnapshot,
     ) -> anyhow::Result<()> {
-        if self.route_snapshot() != *snapshot {
+        if !self.route_snapshot().execution_compatible(snapshot) {
             bail!("historical provider route or confirmation revision unavailable");
         }
         Ok(())
@@ -1415,7 +1415,7 @@ mod tests {
         assert_eq!(provider.identity.display_name, "Primary Pinata");
         assert_eq!(
             provider.identity.cleanup,
-            crate::pinning::identity::CleanupMode::Retain
+            crate::pinning::identity::CleanupMode::Managed
         );
 
         let snapshot = provider.identity.route_snapshot();

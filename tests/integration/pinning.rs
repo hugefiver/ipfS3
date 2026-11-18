@@ -68,7 +68,7 @@ async fn assert_unknown_psa_resource(
         .expect("PSA ledger exists");
     assert_eq!(
         ledger.ownership, "unknown",
-        "PSA response is not creation proof"
+        "finding a handle without a creation receipt cannot prove ownership"
     );
     assert_eq!(
         ledger.effect,
@@ -93,6 +93,37 @@ async fn assert_unknown_psa_resource(
             .expect("cleanup eligibility"),
         "managed route alone cannot authorize DELETE"
     );
+}
+
+fn pinata_submit_and_find(handle: &str, cid: &str, status: &str) -> Vec<PsaReply> {
+    vec![
+        PsaReply::submit_status("/psa/pins", handle, cid, status),
+        PsaReply::find_for_job("/psa/pins", handle, cid, status),
+    ]
+}
+
+async fn recover_pinata_submit_without_receipt(harness: &mut PinningHarness, cid: &str) {
+    let block = harness.block_next_submit("pinata-primary").await;
+    harness.restart_worker();
+    block.wait_until_blocked().await;
+    harness.stop_worker_without_unlocking().await;
+    block.release();
+    harness.advance_past_job_lock().await;
+    harness.run_worker_until_idle().await;
+    let requests = harness.pinata_requests().await;
+    assert_eq!(requests.len(), 2);
+    assert_submit_request(&requests[0], "/psa/pins", cid);
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let correlation = body["meta"]["gateway_job_id"].as_str().unwrap();
+    assert_find_request_for_job(&requests[1], "/psa/pins", cid, correlation);
+}
+
+fn accepted_pinata_delete(handle: &str) -> PsaReply {
+    PsaReply::empty(
+        http::Method::DELETE,
+        format!("/psa/pins/{handle}"),
+        StatusCode::ACCEPTED.as_u16(),
+    )
 }
 
 async fn assert_no_psa_delete(harness: &PinningHarness) {
@@ -1101,11 +1132,7 @@ async fn test_pinning_put_tagging_reactivates_expired_lease_with_unknown_resourc
             (PIN_CID_ENTRY.to_owned(), SINGLE_ENTRY_BYTES.to_vec()),
         ]),
     };
-    config.pinata_script = vec![PsaReply::pinned_submit(
-        "/psa/pins",
-        "pinata-entry-request",
-        PIN_CID_ENTRY,
-    )];
+    config.pinata_script = pinata_submit_and_find("pinata-entry-request", PIN_CID_ENTRY, "pinned");
     let mut harness = start_pinning_harness(config).await;
     let pinata_key = harness.provider_key("pinata-primary");
 
@@ -1172,7 +1199,7 @@ async fn test_pinning_put_tagging_reactivates_expired_lease_with_unknown_resourc
         vec![("submit", "pending", PIN_CID_ENTRY)]
     );
 
-    harness.run_worker_until_idle().await;
+    recover_pinata_submit_without_receipt(&mut harness, PIN_CID_ENTRY).await;
     let submitted_remote = remote_pin(&harness, "pinata-primary", PIN_CID_ENTRY).await;
     assert_eq!(
         (
@@ -1183,9 +1210,6 @@ async fn test_pinning_put_tagging_reactivates_expired_lease_with_unknown_resourc
         ("pinned", Some("pinata-entry-request"), 1)
     );
     assert_eq!(lease_targets(&harness, &manual.id).await[0].state, "pinned");
-    let submit = harness.provider_requests().await;
-    assert_eq!(submit.len(), 1);
-    assert_submit_request(&submit[0], "/psa/pins", PIN_CID_ENTRY);
 
     harness.advance_past_lease_expiry("archive.zip").await;
     harness.restart_worker();
@@ -1233,7 +1257,7 @@ async fn test_pinning_put_tagging_reactivates_expired_lease_with_unknown_resourc
         ("pinned", Some("pinata-entry-request"), 2)
     );
     let requests_after_release = harness.provider_requests().await;
-    assert_eq!(requests_after_release.len(), 1);
+    assert_eq!(requests_after_release.len(), 2);
     assert_unknown_psa_resource(&harness, "pinata-primary", PIN_CID_ENTRY, "retained").await;
     assert_eq!(harness.provider_usage(&pinata_key).await.reserved_pins, 1);
     assert_no_psa_delete(&harness).await;
@@ -1303,8 +1327,8 @@ async fn test_pinning_put_tagging_reactivates_expired_lease_with_unknown_resourc
     assert_unknown_psa_resource(&harness, "pinata-primary", PIN_CID_ENTRY, "retained").await;
     assert_eq!(
         harness.provider_requests().await.len(),
-        1,
-        "no duplicate Submit"
+        2,
+        "no additional request after adoption"
     );
     assert_signed_body(&harness, "archive.zip", &legal_single_entry_zip()).await;
     assert_no_kubo_pin_removes(&harness).await;
@@ -1312,7 +1336,7 @@ async fn test_pinning_put_tagging_reactivates_expired_lease_with_unknown_resourc
 }
 
 #[tokio::test]
-async fn test_pinning_overwrite_and_deletes_retain_unknown_remote_leases() {
+async fn test_pinning_overwrite_and_deletes_release_the_receipted_remote_handles() {
     let mut config = PinningHarnessConfig::request_one();
     config.kubo_script = KuboScript {
         add_replies: vec![
@@ -1336,6 +1360,10 @@ async fn test_pinning_overwrite_and_deletes_retain_unknown_remote_leases() {
         PsaReply::pinned_submit("/psa/pins", "pinata-delete-request", PIN_CID_DELETE),
         PsaReply::pinned_submit("/psa/pins", "pinata-batch-a-request", PIN_CID_BATCH_A),
         PsaReply::pinned_submit("/psa/pins", "pinata-batch-b-request", PIN_CID_BATCH_B),
+        accepted_pinata_delete("pinata-old-request"),
+        accepted_pinata_delete("pinata-delete-request"),
+        accepted_pinata_delete("pinata-batch-a-request"),
+        accepted_pinata_delete("pinata-batch-b-request"),
     ];
     let mut harness = start_pinning_harness(config).await;
 
@@ -1442,9 +1470,8 @@ async fn test_pinning_overwrite_and_deletes_retain_unknown_remote_leases() {
                 .request_id
                 .as_deref(),
         ),
-        ("pinned", Some("pinata-new-request"))
+        ("absent", Some("pinata-new-request"))
     );
-    assert_unknown_psa_resource(&harness, "pinata-primary", PIN_CID_OLD, "retained").await;
     assert_signed_body(&harness, "overwrite.txt", b"new").await;
 
     for (key, body, cid) in [
@@ -1541,18 +1568,9 @@ async fn test_pinning_overwrite_and_deletes_retain_unknown_remote_leases() {
                 remote.request_id.as_deref(),
                 remote.epoch
             ),
-            (
-                "pinned",
-                Some(match cid {
-                    PIN_CID_DELETE => "pinata-delete-request",
-                    PIN_CID_BATCH_A => "pinata-batch-a-request",
-                    _ => "pinata-batch-b-request",
-                }),
-                2
-            ),
+            ("absent", None, 2),
             "remote lifecycle for {cid}"
         );
-        assert_unknown_psa_resource(&harness, "pinata-primary", cid, "retained").await;
     }
     assert_eq!(
         harness
@@ -1565,8 +1583,8 @@ async fn test_pinning_overwrite_and_deletes_retain_unknown_remote_leases() {
                 usage.reserved_pins
             ))
             .collect::<Vec<_>>(),
-        vec![("pinata-primary", 26, 5)],
-        "all five distinct CID reservations remain until ownership is proven"
+        vec![("pinata-primary", 3, 1)],
+        "only the replacement object's reservation remains"
     );
     let requests = harness.provider_requests().await;
     let delete_paths = requests
@@ -1577,13 +1595,19 @@ async fn test_pinning_overwrite_and_deletes_retain_unknown_remote_leases() {
                 request.has_valid_authorization(),
                 "PSA DELETE authorization"
             );
-            request.path.clone()
+            request.path.as_str()
         })
-        .collect::<Vec<_>>();
-    assert!(
-        delete_paths.is_empty(),
-        "unknown PSA resources cannot be deleted"
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        delete_paths,
+        BTreeSet::from([
+            "/psa/pins/pinata-old-request",
+            "/psa/pins/pinata-delete-request",
+            "/psa/pins/pinata-batch-a-request",
+            "/psa/pins/pinata-batch-b-request",
+        ])
     );
+    assert_eq!(requests.len(), 9, "five submits and four accepted deletes");
     assert_eq!(
         requests
             .iter()
@@ -1742,6 +1766,10 @@ async fn test_pinning_reclaimed_submit_with_cancelled_target_retains_unknown_rem
     harness.stop_worker_without_unlocking().await;
     submit_block.release();
 
+    harness.advance_past_job_lock().await;
+    let find_block = harness.block_next_find("pinata-primary").await;
+    harness.restart_worker();
+    find_block.wait_until_blocked().await;
     let cancel = signed_delete_object_tagging(&harness, "cancelled-recover.txt").await;
     assert_eq!(cancel.status(), StatusCode::NO_CONTENT);
     assert_eq!(
@@ -1758,9 +1786,7 @@ async fn test_pinning_reclaimed_submit_with_cancelled_target_retains_unknown_rem
         vec![("pinata-primary".to_owned(), 4, 1)],
         "cancelling an ambiguous Submit retains the reservation"
     );
-
-    harness.advance_past_job_lock().await;
-    harness.restart_worker();
+    find_block.release();
     let find = harness
         .wait_for_provider_request("pinata-primary", http::Method::GET, "/psa/pins", 1)
         .await;
@@ -1857,15 +1883,17 @@ async fn test_pinning_recovery_find_none_with_no_desired_target_never_posts() {
     harness.stop_worker_without_unlocking().await;
     submit_block.release();
 
+    harness.advance_past_job_lock().await;
+    let find_block = harness.block_next_find("pinata-primary").await;
+    harness.restart_worker();
+    find_block.wait_until_blocked().await;
     let cancel = signed_delete_object_tagging(&harness, "no-match.txt").await;
     assert_eq!(cancel.status(), StatusCode::NO_CONTENT);
     assert_eq!(
         harness.target_states("no-match.txt").await,
         vec![("pinata-primary".to_owned(), "released".to_owned()),]
     );
-
-    harness.advance_past_job_lock().await;
-    harness.restart_worker();
+    find_block.release();
     let find = harness
         .wait_for_provider_request("pinata-primary", http::Method::GET, "/psa/pins", 1)
         .await;
@@ -1890,29 +1918,42 @@ async fn test_pinning_recovery_find_none_with_no_desired_target_never_posts() {
     harness
         .run_current_reconcile("pinata-primary", TEST_CID)
         .await;
+    let history = store::pinning::jobs::submission_history(harness.state.store.db(), &submit.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            history.submit_calls,
+            history.recovery_queries,
+            history.effect.as_str()
+        ),
+        (1, 1, "unknown"),
+        "an empty listing does not disprove the accepted POST"
+    );
     let remote = remote_pin(&harness, "pinata-primary", TEST_CID).await;
     assert_eq!(
         (remote.status.as_str(), remote.request_id.as_deref()),
-        ("absent", None)
+        ("reserved", None)
     );
-    assert_eq!(
-        harness
-            .provider_usages()
-            .await
-            .into_iter()
-            .map(|usage| (usage.provider, usage.reserved_bytes, usage.reserved_pins))
-            .collect::<Vec<_>>(),
-        vec![("pinata-primary".to_owned(), 0, 0)],
-        "the no-request reservation releases exactly once"
-    );
+    let usage = harness.provider_usage("pinata-primary").await;
+    assert_eq!((usage.reserved_bytes, usage.reserved_pins), (4, 1));
     let reconciles = harness
         .pin_jobs()
         .await
         .into_iter()
         .filter(|job| job.operation == "reconcile")
         .collect::<Vec<_>>();
-    assert_eq!(reconciles.len(), 1, "one stable Reconcile owns the release");
-    assert_eq!(reconciles[0].state, "done");
+    assert_eq!(
+        reconciles.len(),
+        1,
+        "only one Reconcile tracks the unknown effect"
+    );
+    assert_eq!(reconciles[0].state, "pending");
+    assert!(
+        reconciles[0].next_attempt_at > Utc::now(),
+        "unresolved evidence cannot spin the worker"
+    );
     let requests = harness.provider_requests().await;
     assert_eq!(
         requests.len(),
@@ -1937,10 +1978,11 @@ async fn test_pinning_recovery_find_none_with_no_desired_target_never_posts() {
 #[tokio::test]
 async fn test_pinning_running_submit_blocks_quota_release_then_retains_unknown_remote() {
     let mut config = PinningHarnessConfig::request_one();
-    config.pinata_script = vec![
-        PsaReply::pinned_submit("/psa/pins", "live-lock-request", TEST_CID),
-        PsaReply::find_for_job("/psa/pins", "live-lock-request", TEST_CID, "pinned"),
-    ];
+    config.pinata_script = vec![PsaReply::pinned_submit(
+        "/psa/pins",
+        "live-lock-request",
+        TEST_CID,
+    )];
     let mut harness = start_pinning_harness(config).await;
 
     let put = signed_put_with_tagging(
@@ -2018,36 +2060,25 @@ async fn test_pinning_running_submit_blocks_quota_release_then_retains_unknown_r
 
     harness.advance_past_job_lock().await;
     harness.restart_worker();
-    let find = harness
-        .wait_for_provider_request("pinata-primary", http::Method::GET, "/psa/pins", 1)
-        .await;
-    assert_find_request_for_job(
-        &find,
-        "/psa/pins",
-        TEST_CID,
-        &captured_submit_correlation(&harness, &submit.id).await,
-    );
-    assert!(post.sequence < find.sequence);
-    harness.wait_for_job_state(&submit.id, "done").await;
+    let terminal = harness.wait_for_job_state(&submit.id, "error").await;
+    assert!(terminal.locked_until.is_none());
+    assert!(terminal.last_error.is_some());
     harness.stop_worker_without_unlocking().await;
-
     harness
         .run_current_reconcile("pinata-primary", TEST_CID)
         .await;
-    let unpin = harness
-        .pin_jobs()
-        .await
-        .into_iter()
-        .find(|job| job.operation == "unpin")
-        .expect("cancelled remote retains a fenced Unpin");
-    assert_eq!(unpin.state, "done");
+    assert_eq!(harness.pin_job(&submit.id).await.state, "error");
+    assert_eq!(
+        harness.target_states("live-lock.txt").await,
+        vec![("pinata-primary".to_owned(), "released".to_owned())]
+    );
 
     let retained = remote_pin(&harness, "pinata-primary", TEST_CID).await;
     assert_eq!(
         (retained.status.as_str(), retained.request_id.as_deref()),
-        ("pinned", Some("live-lock-request"))
+        ("reserved", None),
+        "without a receipt the interrupted POST still holds quota"
     );
-    assert_unknown_psa_resource(&harness, "pinata-primary", TEST_CID, "retained").await;
     assert_eq!(
         harness
             .provider_usages()
@@ -2060,19 +2091,10 @@ async fn test_pinning_running_submit_blocks_quota_release_then_retains_unknown_r
     let requests = harness.provider_requests().await;
     assert_eq!(
         requests.len(),
-        2,
-        "live-lock recovery must not re-submit or DELETE"
+        1,
+        "the cancelled authority cannot retry, adopt or delete"
     );
-    assert_eq!(
-        requests
-            .iter()
-            .map(|request| (request.method.clone(), request.path.as_str()))
-            .collect::<Vec<_>>(),
-        vec![
-            (http::Method::POST, "/psa/pins"),
-            (http::Method::GET, "/psa/pins"),
-        ]
-    );
+    assert_submit_request_for_job(&requests[0], "/psa/pins", TEST_CID, &submit);
     assert_signed_body(&harness, "live-lock.txt", b"body").await;
     assert_no_kubo_pin_removes(&harness).await;
     harness.shutdown().await;
@@ -2418,15 +2440,13 @@ async fn test_pinning_failed_all_unknown_remote_retains_request_without_resubmis
         ],
         3,
     );
-    config.pinata_script = vec![
-        PsaReply::submit_status("/psa/pins", "failed-all", PIN_CID_SHARED, "queued"),
-        PsaReply::pin_status(
-            "/psa/pins/failed-all",
-            "failed-all",
-            PIN_CID_SHARED,
-            "failed",
-        ),
-    ];
+    config.pinata_script = pinata_submit_and_find("failed-all", PIN_CID_SHARED, "queued");
+    config.pinata_script.push(PsaReply::pin_status(
+        "/psa/pins/failed-all",
+        "failed-all",
+        PIN_CID_SHARED,
+        "failed",
+    ));
     config.filebase_script = vec![PsaReply::pinned_submit(
         "/v1/ipfs/pins",
         "one-fallback",
@@ -2439,7 +2459,7 @@ async fn test_pinning_failed_all_unknown_remote_retains_request_without_resubmis
             signed_put_with_tagging(&harness, key, b"shared".to_vec(), "ipfs-s3%3Apin=true").await;
         assert_eq!(response.status(), StatusCode::OK);
     }
-    harness.run_worker_until_idle().await;
+    recover_pinata_submit_without_receipt(&mut harness, PIN_CID_SHARED).await;
     let poll = harness
         .pin_jobs()
         .await
@@ -2528,6 +2548,7 @@ async fn test_pinning_failed_all_unknown_remote_retains_request_without_resubmis
             .collect::<Vec<_>>(),
         vec![
             (http::Method::POST, "/psa/pins"),
+            (http::Method::GET, "/psa/pins"),
             (http::Method::GET, "/psa/pins/failed-all"),
         ]
     );
@@ -2546,15 +2567,13 @@ async fn test_pinning_failed_unknown_remote_stops_without_delete_or_retry_spin()
     let mut config = PinningHarnessConfig::request_one();
     config.policies[0].provider_mode = "all".to_owned();
     config.kubo_script = repeated_shared_kubo(1);
-    config.pinata_script = vec![
-        PsaReply::submit_status("/psa/pins", "failed-cycle-1", PIN_CID_SHARED, "queued"),
-        PsaReply::pin_status(
-            "/psa/pins/failed-cycle-1",
-            "failed-cycle-1",
-            PIN_CID_SHARED,
-            "failed",
-        ),
-    ];
+    config.pinata_script = pinata_submit_and_find("failed-cycle-1", PIN_CID_SHARED, "queued");
+    config.pinata_script.push(PsaReply::pin_status(
+        "/psa/pins/failed-cycle-1",
+        "failed-cycle-1",
+        PIN_CID_SHARED,
+        "failed",
+    ));
     let mut harness = start_pinning_harness(config).await;
 
     let put = signed_put_with_tagging(
@@ -2565,7 +2584,7 @@ async fn test_pinning_failed_unknown_remote_stops_without_delete_or_retry_spin()
     )
     .await;
     assert_eq!(put.status(), StatusCode::OK);
-    harness.run_worker_until_idle().await;
+    recover_pinata_submit_without_receipt(&mut harness, PIN_CID_SHARED).await;
 
     let poll = harness
         .pin_jobs()
@@ -2615,7 +2634,7 @@ async fn test_pinning_failed_unknown_remote_stops_without_delete_or_retry_spin()
             .iter()
             .map(|r| &r.method)
             .collect::<Vec<_>>(),
-        vec![&http::Method::POST, &http::Method::GET]
+        vec![&http::Method::POST, &http::Method::GET, &http::Method::GET]
     );
     assert_no_psa_delete(&harness).await;
     assert!(
@@ -2685,7 +2704,7 @@ async fn test_pinning_failed_unknown_remote_stops_without_delete_or_retry_spin()
     assert!(reset_by_target.next_retry_at.is_some());
     assert_eq!(
         harness.pinata_requests().await.len(),
-        2,
+        3,
         "no new PSA request from renewal or shared CID"
     );
     assert_no_psa_delete(&harness).await;
@@ -2779,14 +2798,10 @@ async fn test_pinning_stale_poll_owner_hands_off_without_duplicate_post() {
 }
 
 #[tokio::test]
-async fn test_pinning_stale_remote_epoch_parks_unowned_unpin_without_delete() {
+async fn test_pinning_stale_remote_epoch_terminates_unowned_unpin_without_delete() {
     let mut config = PinningHarnessConfig::request_one();
     config.kubo_script = repeated_shared_kubo(1);
-    config.pinata_script = vec![PsaReply::pinned_submit(
-        "/psa/pins",
-        "epoch-pinned",
-        PIN_CID_SHARED,
-    )];
+    config.pinata_script = pinata_submit_and_find("epoch-pinned", PIN_CID_SHARED, "pinned");
     let mut harness = start_pinning_harness(config).await;
 
     let put = signed_put_with_tagging(
@@ -2797,7 +2812,7 @@ async fn test_pinning_stale_remote_epoch_parks_unowned_unpin_without_delete() {
     )
     .await;
     assert_eq!(put.status(), StatusCode::OK);
-    harness.run_worker_until_idle().await;
+    recover_pinata_submit_without_receipt(&mut harness, PIN_CID_SHARED).await;
     let object = latest_pinning_object(&harness, "epoch.txt").await;
     let manual = owner_leases(&harness, &object.id).await.remove(0);
 
@@ -2862,13 +2877,10 @@ async fn test_pinning_stale_remote_epoch_parks_unowned_unpin_without_delete() {
     assert_unknown_psa_resource(&harness, "pinata-primary", PIN_CID_SHARED, "confirmed").await;
 
     harness.restart_worker();
-    let parked = harness.wait_for_job_attention(&unpin.id).await;
+    let terminal = harness.wait_for_job_state(&unpin.id, "error").await;
     harness.stop_worker_without_unlocking().await;
-    assert_eq!(
-        (parked.state.as_str(), parked.locked_until),
-        ("running", None),
-        "old Unpin is durably parked for attention rather than reaching provider I/O"
-    );
+    assert!(terminal.locked_until.is_none());
+    assert!(terminal.last_error.is_some());
     assert_eq!(
         remote_pin(&harness, "pinata-primary", PIN_CID_SHARED)
             .await
@@ -2879,18 +2891,7 @@ async fn test_pinning_stale_remote_epoch_parks_unowned_unpin_without_delete() {
         harness.target_states("epoch-shared.txt").await,
         vec![("pinata-primary".to_owned(), "pinned".to_owned())]
     );
-    let ledger = store::pinning::ledger::get(
-        harness.state.store.db(),
-        &harness.provider_key("pinata-primary"),
-        PIN_CID_SHARED,
-    )
-    .await
-    .expect("load parked resource ledger")
-    .expect("ledger exists");
-    assert_eq!(
-        ledger.last_error.as_deref(),
-        Some("historical identity unavailable; needs_attention")
-    );
+    assert_unknown_psa_resource(&harness, "pinata-primary", PIN_CID_SHARED, "confirmed").await;
     assert!(
         harness
             .provider_requests()
@@ -2934,8 +2935,8 @@ async fn test_pinning_one_mode_failover_retains_unknown_primary_without_duplicat
         )],
         1,
     );
-    config.pinata_script = vec![
-        PsaReply::submit_status("/psa/pins", "sticky-primary", PIN_CID_SHARED, "queued"),
+    config.pinata_script = pinata_submit_and_find("sticky-primary", PIN_CID_SHARED, "queued");
+    config.pinata_script.extend([
         PsaReply::empty(
             http::Method::GET,
             "/psa/pins/sticky-primary",
@@ -2947,7 +2948,7 @@ async fn test_pinning_one_mode_failover_retains_unknown_primary_without_duplicat
             PIN_CID_SHARED,
             "failed",
         ),
-    ];
+    ]);
     config.filebase_script = vec![PsaReply::pinned_submit(
         "/v1/ipfs/pins",
         "sticky-secondary",
@@ -2963,7 +2964,7 @@ async fn test_pinning_one_mode_failover_retains_unknown_primary_without_duplicat
     )
     .await;
     assert_eq!(put.status(), StatusCode::OK);
-    harness.run_worker_until_idle().await;
+    recover_pinata_submit_without_receipt(&mut harness, PIN_CID_SHARED).await;
     let initial_poll = harness
         .pin_jobs()
         .await
@@ -3063,6 +3064,7 @@ async fn test_pinning_one_mode_failover_retains_unknown_primary_without_duplicat
             .collect::<Vec<_>>(),
         vec![
             (http::Method::POST, "/psa/pins"),
+            (http::Method::GET, "/psa/pins"),
             (http::Method::GET, "/psa/pins/sticky-primary"),
             (http::Method::GET, "/psa/pins/sticky-primary"),
         ]
@@ -3189,7 +3191,7 @@ async fn test_pinning_all_mode_partial_success_keeps_retrying_degraded_provider(
 }
 
 #[tokio::test]
-async fn test_pinning_quota_keeps_oldest_unknown_cid_reserved_after_eviction() {
+async fn test_pinning_quota_evicts_oldest_receipted_pin_and_admits_waiter() {
     let mut config = PinningHarnessConfig::request_one();
     config.providers[0].max_bytes = 6;
     config.providers[0].max_pins = 2;
@@ -3208,6 +3210,8 @@ async fn test_pinning_quota_keeps_oldest_unknown_cid_reserved_after_eviction() {
     config.pinata_script = vec![
         PsaReply::pinned_submit("/psa/pins", "old-request", PIN_CID_OLD),
         PsaReply::pinned_submit("/psa/pins", "newer-request", PIN_CID_NEWER),
+        accepted_pinata_delete("old-request"),
+        PsaReply::pinned_submit("/psa/pins", "incoming-request", PIN_CID_INCOMING),
     ];
     let mut harness = start_pinning_harness(config).await;
 
@@ -3262,43 +3266,17 @@ async fn test_pinning_quota_keeps_oldest_unknown_cid_reserved_after_eviction() {
             harness.provider_usage("pinata-primary").await.reserved_pins,
         ),
         (6, 2),
-        "the incoming CID cannot reserve until a remote DELETE is confirmed"
+        "the incoming CID waits until the old handle's DELETE is accepted"
     );
 
     harness
-        .run_worker_until_remote_effect("pinata-primary", PIN_CID_OLD, "retained")
+        .run_worker_until_remote_effect("pinata-primary", PIN_CID_INCOMING, "confirmed")
         .await;
-    assert_eq!(
-        (
-            harness
-                .provider_usage("pinata-primary")
-                .await
-                .reserved_bytes,
-            harness.provider_usage("pinata-primary").await.reserved_pins,
-        ),
-        (6, 2),
-        "eviction of an unknown resource cannot free its reservation"
-    );
+    let old = remote_pin(&harness, "pinata-primary", PIN_CID_OLD).await;
+    assert_eq!((old.status.as_str(), old.request_id), ("absent", None));
     assert_eq!(
         harness.target_states("incoming.txt").await,
-        vec![("pinata-primary".to_owned(), "quota_waiting".to_owned())]
-    );
-
-    assert_eq!(
-        remote_pin(&harness, "pinata-primary", PIN_CID_OLD)
-            .await
-            .status,
-        "pinned"
-    );
-    assert_eq!(
-        harness.remote_pins().await.len(),
-        2,
-        "no capacity for incoming CID"
-    );
-    assert_unknown_psa_resource(&harness, "pinata-primary", PIN_CID_OLD, "retained").await;
-    assert_eq!(
-        harness.target_states("incoming.txt").await,
-        vec![("pinata-primary".to_owned(), "quota_waiting".to_owned())]
+        vec![("pinata-primary".to_owned(), "pinned".to_owned())]
     );
     assert_eq!(
         (
@@ -3309,13 +3287,18 @@ async fn test_pinning_quota_keeps_oldest_unknown_cid_reserved_after_eviction() {
             harness.provider_usage("pinata-primary").await.reserved_pins,
         ),
         (6, 2),
-        "incoming CID cannot take an unproven resource's capacity"
+        "the incoming CID takes the released reservation"
     );
     let requests = harness.provider_requests().await;
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 4);
     assert_submit_request(&requests[0], "/psa/pins", PIN_CID_OLD);
     assert_submit_request(&requests[1], "/psa/pins", PIN_CID_NEWER);
-    assert_no_psa_delete(&harness).await;
+    assert_eq!(
+        (&requests[2].method, requests[2].path.as_str()),
+        (&http::Method::DELETE, "/psa/pins/old-request")
+    );
+    assert_submit_request(&requests[3], "/psa/pins", PIN_CID_INCOMING);
+    assert_signed_body(&harness, "old.txt", b"old").await;
     assert_signed_body(&harness, "incoming.txt", b"in!").await;
     assert_no_kubo_pin_removes(&harness).await;
     harness.shutdown().await;
@@ -3411,11 +3394,7 @@ async fn test_pinning_shared_cid_counts_once_and_blocks_unsafe_unpin() {
 #[tokio::test]
 async fn test_pinning_renewal_generation_reuses_retained_unknown_expiry_pin() {
     let mut config = PinningHarnessConfig::request_one();
-    config.pinata_script = vec![PsaReply::pinned_submit(
-        "/psa/pins",
-        "expiry-request",
-        TEST_CID,
-    )];
+    config.pinata_script = pinata_submit_and_find("expiry-request", TEST_CID, "pinned");
     let mut harness = start_pinning_harness(config).await;
 
     let put = signed_put_with_tagging(
@@ -3427,7 +3406,7 @@ async fn test_pinning_renewal_generation_reuses_retained_unknown_expiry_pin() {
     .await;
     assert_eq!(put.status(), StatusCode::OK);
     let initial_submit = only_submit_job(&harness).await;
-    harness.run_worker_until_idle().await;
+    recover_pinata_submit_without_receipt(&mut harness, TEST_CID).await;
     let object = latest_pinning_object(&harness, "expiry-renew.txt").await;
     let initial_lease = owner_leases(&harness, &object.id).await.remove(0);
     let initial_target = lease_targets(&harness, &initial_lease.id).await.remove(0);
@@ -3532,7 +3511,7 @@ async fn test_pinning_renewal_generation_reuses_retained_unknown_expiry_pin() {
         "pinned"
     );
     let requests = harness.provider_requests().await;
-    assert_eq!(requests.len(), 1);
+    assert_eq!(requests.len(), 2);
     assert_submit_request_for_job(&requests[0], "/psa/pins", TEST_CID, &initial_submit);
     assert_no_psa_delete(&harness).await;
     assert_unknown_psa_resource(&harness, "pinata-primary", TEST_CID, "retained").await;
@@ -3557,11 +3536,7 @@ async fn test_pinning_new_shared_target_after_cancel_reuses_unknown_remote_witho
             (PIN_CID_WAIT.to_owned(), b"wait".to_vec()),
         ]),
     };
-    config.pinata_script = vec![PsaReply::pinned_submit(
-        "/psa/pins",
-        "shared-before-delete",
-        PIN_CID_SHARED,
-    )];
+    config.pinata_script = pinata_submit_and_find("shared-before-delete", PIN_CID_SHARED, "pinned");
     let mut harness = start_pinning_harness(config).await;
 
     let first = signed_put_with_tagging(
@@ -3572,7 +3547,7 @@ async fn test_pinning_new_shared_target_after_cancel_reuses_unknown_remote_witho
     )
     .await;
     assert_eq!(first.status(), StatusCode::OK);
-    harness.run_worker_until_idle().await;
+    recover_pinata_submit_without_receipt(&mut harness, PIN_CID_SHARED).await;
     let initial_remote = remote_pin(&harness, "pinata-primary", PIN_CID_SHARED).await;
 
     let wait = signed_put_with_tagging(
@@ -3641,7 +3616,7 @@ async fn test_pinning_new_shared_target_after_cancel_reuses_unknown_remote_witho
     let requests = harness.provider_requests().await;
     assert_eq!(
         requests.len(),
-        1,
+        2,
         "shared CID must not need a replacement Submit"
     );
     assert_submit_request(&requests[0], "/psa/pins", PIN_CID_SHARED);
@@ -3652,13 +3627,12 @@ async fn test_pinning_new_shared_target_after_cancel_reuses_unknown_remote_witho
 }
 
 #[tokio::test]
-async fn test_pinning_expiry_retains_unknown_remote_and_preserves_s3_and_kubo_pin() {
+async fn test_pinning_expiry_releases_receipted_handle_and_preserves_s3_and_kubo_pin() {
     let mut config = PinningHarnessConfig::request_one();
-    config.pinata_script = vec![PsaReply::pinned_submit(
-        "/psa/pins",
-        "expiry-delete-request",
-        TEST_CID,
-    )];
+    config.pinata_script = vec![
+        PsaReply::pinned_submit("/psa/pins", "expiry-delete-request", TEST_CID),
+        accepted_pinata_delete("expiry-delete-request"),
+    ];
     let mut harness = start_pinning_harness(config).await;
 
     let put = signed_put_with_tagging(
@@ -3674,7 +3648,13 @@ async fn test_pinning_expiry_retains_unknown_remote_and_preserves_s3_and_kubo_pi
     let object = latest_pinning_object(&harness, "expired.txt").await;
     let manual = owner_leases(&harness, &object.id).await.remove(0);
     let target = lease_targets(&harness, &manual.id).await.remove(0);
-    assert_unknown_psa_resource(&harness, "pinata-primary", TEST_CID, "confirmed").await;
+    assert_eq!(
+        remote_pin(&harness, "pinata-primary", TEST_CID)
+            .await
+            .request_id
+            .as_deref(),
+        Some("expiry-delete-request")
+    );
 
     harness.advance_past_lease_expiry("expired.txt").await;
     harness.restart_worker();
@@ -3707,7 +3687,7 @@ async fn test_pinning_expiry_retains_unknown_remote_and_preserves_s3_and_kubo_pi
             remote.request_id.as_deref(),
             remote.epoch
         ),
-        ("pinned", Some("expiry-delete-request"), 2)
+        ("absent", None, 2)
     );
     assert_eq!(
         (
@@ -3717,13 +3697,15 @@ async fn test_pinning_expiry_retains_unknown_remote_and_preserves_s3_and_kubo_pi
                 .reserved_bytes,
             harness.provider_usage("pinata-primary").await.reserved_pins,
         ),
-        (4, 1)
+        (0, 0)
     );
-    assert_unknown_psa_resource(&harness, "pinata-primary", TEST_CID, "retained").await;
     let requests = harness.provider_requests().await;
-    assert_eq!(requests.len(), 1);
+    assert_eq!(requests.len(), 2);
     assert_submit_request(&requests[0], "/psa/pins", TEST_CID);
-    assert_no_psa_delete(&harness).await;
+    assert_eq!(
+        (&requests[1].method, requests[1].path.as_str()),
+        (&http::Method::DELETE, "/psa/pins/expiry-delete-request")
+    );
     assert_signed_body(&harness, "expired.txt", b"body").await;
     assert_no_kubo_pin_removes(&harness).await;
     harness.shutdown().await;

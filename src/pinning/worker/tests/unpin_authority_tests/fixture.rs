@@ -208,6 +208,8 @@ pub(super) async fn confirmed_cleanup() -> Fixture {
         "UPDATE remote_pins SET status='pinned',request_id='cleanup-resource'; \
          UPDATE remote_pin_ledger SET ownership='application_created',effect='confirmed', \
          first_observed_at=CURRENT_TIMESTAMP,last_observed_at=CURRENT_TIMESTAMP,remote_pinned_at=CURRENT_TIMESTAMP; \
+         INSERT INTO pin_cleanup_ownership(provider,cid,request_id,route) \
+         SELECT provider,cid,'cleanup-resource',route FROM remote_pin_ledger; \
          UPDATE pin_jobs SET state='done',locked_until=NULL; \
          UPDATE pin_leases SET state='cancelled',generation=generation+1; \
          UPDATE pin_lease_targets SET state='released'",

@@ -146,14 +146,33 @@ async fn store_observations_reload_business_rows() {
             records::SharedDecodeBudget::default(),
         )
     };
-    assert!(!observe().await.unwrap().0);
-    assert!(!observe().await.unwrap().0);
+    assert!(observe().await.unwrap().1.is_none());
     writer_available(store.db()).await;
+    store.db().execute_unprepared(
+        "INSERT INTO remote_pins(provider,cid,request_id,cid_size,status,epoch,last_touched_at) \
+         VALUES ('provider','cid','observed-request',1,'pinned',1,CURRENT_TIMESTAMP)",
+    ).await.unwrap();
+    let route = crate::pinning::identity::ProviderIdentity::legacy(
+        "provider", "filebase", None, "psa", "cid",
+    )
+    .route_snapshot();
     store
         .db()
-        .execute_unprepared("DELETE FROM remote_pin_ledger WHERE provider='provider' AND cid='cid'")
+        .execute(sea_orm::Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE remote_pin_ledger SET route=$1 WHERE provider='provider' AND cid='cid'",
+            [serde_json::to_string(&route).unwrap().into()],
+        ))
         .await
         .unwrap();
-    assert!(observe().await.unwrap().0);
+    store.db().execute_unprepared(
+        "INSERT INTO pin_cleanup_ownership(provider,cid,request_id,route) SELECT provider,cid,'observed-request',route FROM remote_pin_ledger",
+    ).await.unwrap();
+    let (may_delete, snapshot) = observe().await.unwrap();
+    assert!(may_delete);
+    assert_eq!(
+        snapshot.unwrap().remote.request_id.as_deref(),
+        Some("observed-request")
+    );
     writer_available(store.db()).await;
 }

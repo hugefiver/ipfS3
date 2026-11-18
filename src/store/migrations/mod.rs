@@ -5,6 +5,7 @@ pub(crate) mod legacy_receipts;
 pub mod m20261027_000001_schema_baseline;
 pub mod m20261108_000001_current_pinning_config;
 pub mod m20261109_000001_pin_cid_comparisons;
+pub mod m20261110_000001_cleanup_identity;
 pub(crate) mod registry;
 
 #[cfg(any(test, feature = "historical-fixtures"))]

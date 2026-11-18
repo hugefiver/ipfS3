@@ -263,6 +263,141 @@ async fn additional_inline_constraints_refuse_rebuild_without_weakening_data_gua
 }
 
 #[tokio::test]
+async fn upgrade_recreates_missing_retained_reconcile_with_its_original_route() {
+    let (_directory, db) = baseline().await;
+    Migrator::up(&db, Some(2)).await.unwrap();
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/v3/files/public/file-id"))
+        .respond_with(ResponseTemplate::new(202))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let config: crate::config::Config = toml::from_str(&format!(
+        r#"
+[pinning]
+worker_interval='1s'
+[[pinning.providers]]
+name='backup'
+kind='pinata'
+api='v3'
+strategy='upload'
+endpoint='{}/v3'
+token_env='TEST'
+priority=1
+max_bytes=10
+max_pins=1
+[pinning_identity]
+primary_storage_domain='primary'
+[[pinning_identity.providers]]
+config_name='backup'
+provider_id='backup-id'
+display_name='backup'
+backend='pinata'
+scope='backup-account'
+storage_domain='backup'
+credential_revision=1
+endpoint_revision=1
+secret_ref='env:TEST'
+api_profile='pinata-v3'
+strategy='upload'
+"#,
+        server.uri()
+    ))
+    .unwrap();
+    let validated = crate::pinning::config::ValidatedPinningConfig::from_config(&config, |_| {
+        Some("mock-token".into())
+    })
+    .unwrap();
+    let key = validated.providers[0].identity.allocation_key();
+    let runtime = crate::pinning::coordinator::PinningCoordinator::build_with_kubo(
+        validated,
+        Some(crate::kubo::KuboClient::new(server.uri())),
+    )
+    .unwrap();
+    let route = serde_json::json!({"provider_id":"backup-id","backend":"pinata","scope":"backup-account","storage_domain":"backup","endpoint_revision":1,"credential_revision":1,"secret_ref":"env:TEST","api_profile":"pinata-v3","strategy":"upload","cleanup":"retain"}).to_string();
+    let request = format!(
+        "pinata-v3:{}:{}:{}",
+        URL_SAFE_NO_PAD.encode("file-id"),
+        URL_SAFE_NO_PAD.encode("cid"),
+        URL_SAFE_NO_PAD.encode(r#"{"gateway_job_id":"posted-correlation"}"#)
+    );
+    db.execute(Statement::from_sql_and_values(DatabaseBackend::Sqlite, "INSERT INTO remote_pins(provider,cid,cid_size,status,epoch,request_id,last_touched_at) VALUES ('backup','cid',1,'pinned',3,$1,CURRENT_TIMESTAMP)",[request.into()])).await.unwrap();
+    db.execute(Statement::from_sql_and_values(DatabaseBackend::Sqlite, "INSERT INTO remote_pin_ledger(provider,cid,route,ownership,effect) VALUES ('backup','cid',$1,'unknown','retained')",[route.clone().into()])).await.unwrap();
+    db.execute_unprepared("INSERT INTO pin_jobs(id,operation,provider,cid,lease_id,target_id,expected_generation,submit_phase,state,next_attempt_at) VALUES ('original','submit','backup','cid','lease','target',1,'calling','done',CURRENT_TIMESTAMP); INSERT INTO pin_submit_history(job_id,api,strategy,effect,state,submit_calls,recovery_queries,started_at,correlation) VALUES ('original','pinata_v3','upload','created','settled',1,0,CURRENT_TIMESTAMP,'posted-correlation')").await.unwrap();
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "INSERT INTO pin_invocation_routes VALUES ('original',$1,1)",
+        [route.clone().into()],
+    ))
+    .await
+    .unwrap();
+    for table in ["pin_jobs", "remote_pins", "remote_pin_ledger"] {
+        db.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            format!("UPDATE {table} SET provider=$1 WHERE provider='backup'"),
+            [key.clone().into()],
+        ))
+        .await
+        .unwrap();
+    }
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "INSERT INTO pin_provider_usage(provider,reserved_bytes,reserved_pins) VALUES ($1,1,1)",
+        [key.clone().into()],
+    ))
+    .await
+    .unwrap();
+    let (scope, identity) = native::scope::binding(&db).await.unwrap();
+    initialization::upgrade_existing(
+        &db,
+        initialization::UpgradeRequest {
+            native_identity: &identity,
+            database_scope: &scope,
+            source_version: super::history::CID_COMPARISONS,
+            target_version: schema::VERSION,
+        },
+    )
+    .await
+    .unwrap();
+    initialization::open(&db).await.unwrap();
+    let job = db.query_one(Statement::from_sql_and_values(DatabaseBackend::Sqlite, "SELECT i.route,j.state FROM pin_jobs j JOIN pin_invocation_routes i ON i.job_id=j.id WHERE j.provider=$1 AND j.operation='reconcile' AND j.expected_remote_epoch=3 AND i.remote_epoch=3",[key.clone().into()])).await.unwrap().unwrap();
+    assert_eq!(job.try_get::<String>("", "state").unwrap(), "pending");
+    assert_eq!(job.try_get::<String>("", "route").unwrap(), route);
+    let store = crate::store::Store::new(db);
+    runtime.register_identities(&store).await.unwrap();
+    assert!(
+        crate::store::pinning::ledger::cleanup_allowed(store.db(), &key, "cid")
+            .await
+            .unwrap()
+    );
+    let worker = runtime.start(store.clone(), tokio_util::sync::CancellationToken::new());
+    let released = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            if crate::store::pinning::quota::read_usage(store.db(), &key)
+                .await
+                .unwrap()
+                .unwrap()
+                .reserved_pins
+                == 0
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    worker.shutdown(std::time::Duration::from_secs(5)).await;
+    released.expect("old exact file receipt should release its held quota");
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn previous_current_upgrade_backfills_cid_comparisons_without_rekeying_history() {
     let (_directory, db) = baseline().await;
     Migrator::up(&db, Some(1)).await.unwrap();
@@ -337,7 +472,7 @@ async fn previous_current_upgrade_backfills_cid_comparisons_without_rekeying_his
         ))
         .await
         .unwrap();
-    assert_eq!(versions.len(), 3);
+    assert_eq!(versions.len(), Migrator::migrations().len());
     assert_eq!(
         versions
             .last()

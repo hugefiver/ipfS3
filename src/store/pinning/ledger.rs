@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     error::{AppError, AppResult},
     pinning::{
-        identity::{CleanupMode, ProviderIdentity, ProviderRouteSnapshot},
+        identity::{ProviderIdentity, ProviderRouteSnapshot},
         provider::{RemotePinStatus, RemoteRef},
     },
     store::entities::{pin_job, pin_provider_route, remote_pin_ledger},
@@ -21,7 +21,7 @@ use crate::{
 pub use crate::pinning::identity::Ownership;
 
 pub(in crate::store::pinning) mod unpin;
-pub(crate) use unpin::prepare_runtime_unpin_effect;
+pub(crate) use unpin::{bind_file_handle, prepare_runtime_unpin_effect, transport_handle};
 
 #[path = "submission.rs"]
 pub mod submission;
@@ -672,26 +672,40 @@ pub async fn archive_confirmed_release<C: ConnectionTrait>(
     db: &C,
     remote: &crate::store::entities::remote_pin::Model,
 ) -> AppResult<()> {
-    archive_release_row(db, remote, get(db, &remote.provider, &remote.cid).await?).await
+    archive_release_row(
+        db,
+        remote,
+        get(db, &remote.provider, &remote.cid).await?,
+        Some(false),
+    )
+    .await
 }
 
 pub(in crate::store::pinning) async fn archive_runtime_confirmed_release(
     tx: &crate::store::RuntimeTransaction,
     remote: &crate::store::entities::remote_pin::Model,
     work: super::management::records::DecodeWork<'_>,
+    unpin_accepted: bool,
 ) -> AppResult<()> {
     let row = get_catalog(tx.catalog(work), &remote.provider, &remote.cid, work).await?;
-    archive_release_row(tx.db(), remote, row).await
+    archive_release_row(tx.db(), remote, row, Some(unpin_accepted)).await
 }
 
-async fn archive_release_row<C: ConnectionTrait>(
+pub(super) async fn archive_release_row<C: ConnectionTrait>(
     db: &C,
     remote: &crate::store::entities::remote_pin::Model,
     row: Option<remote_pin_ledger::Model>,
+    unpin_accepted: Option<bool>,
 ) -> AppResult<()> {
     use crate::store::entities::pin_resource_history;
+    db.execute(sea_orm::Statement::from_sql_and_values(
+        db.get_database_backend(),
+        "DELETE FROM pin_cleanup_ownership WHERE provider=$1 AND cid=$2",
+        [remote.provider.clone().into(), remote.cid.clone().into()],
+    ))
+    .await?;
     if let Some(row) = row {
-        let evidence = serde_json::json!({ "ledger": row, "request_id": remote.request_id, "status_before_release": remote.status, "confirmed_absent": true }).to_string();
+        let evidence = serde_json::json!({ "ledger": row, "request_id": remote.request_id, "status_before_release": remote.status, "confirmed_absent": unpin_accepted == Some(false), "unpin_accepted": unpin_accepted == Some(true), "request_superseded": unpin_accepted.is_none() }).to_string();
         pin_resource_history::Entity::insert(pin_resource_history::ActiveModel {
             provider: Set(remote.provider.clone()),
             cid: Set(remote.cid.clone()),
@@ -972,8 +986,8 @@ pub async fn route_matches<C: ConnectionTrait>(
 }
 
 fn route_compatible(mut route: ProviderRouteSnapshot, identity: &ProviderIdentity) -> bool {
-    // Historical API/strategy/cleanup are executed from the snapshot, never
-    // replaced by current TOML. Account/credential/endpoint changes isolate.
+    // Dispatch selects the historical API/strategy; credentials, account and
+    // endpoint revisions must still identify the same destination.
     route.api_profile.clone_from(&identity.api_profile);
     route.strategy.clone_from(&identity.strategy);
     route.cleanup = identity.cleanup;
@@ -1383,7 +1397,7 @@ async fn observe_inner<C: ConnectionTrait>(
     status: RemotePinStatus,
     ownership: Ownership,
     now: DateTime<Utc>,
-    claim: Option<(&pin_job::Model, &str, bool)>,
+    claim: Option<(&pin_job::Model, &str, bool, bool)>,
 ) -> AppResult<()> {
     observe_core(db, provider, cid, (status, ownership), now, claim, None).await
 }
@@ -1393,7 +1407,7 @@ pub(crate) async fn observe_runtime_claimed(
     job: &pin_job::Model,
     request_id: &str,
     has_desired_refs: bool,
-    observed: (RemotePinStatus, Ownership),
+    observed: (RemotePinStatus, Ownership, bool),
     now: DateTime<Utc>,
     work: super::management::records::DecodeWork<'_>,
 ) -> AppResult<()> {
@@ -1401,9 +1415,9 @@ pub(crate) async fn observe_runtime_claimed(
         tx.db(),
         &job.provider,
         &job.cid,
-        observed,
+        (observed.0, observed.1),
         now,
-        Some((job, request_id, has_desired_refs)),
+        Some((job, request_id, has_desired_refs, observed.2)),
         Some((tx.catalog(work), work)),
     )
     .await
@@ -1415,7 +1429,7 @@ async fn observe_core<C: ConnectionTrait>(
     cid: &str,
     (status, ownership): (RemotePinStatus, Ownership),
     now: DateTime<Utc>,
-    claim: Option<(&pin_job::Model, &str, bool)>,
+    claim: Option<(&pin_job::Model, &str, bool, bool)>,
     runtime: Option<(
         super::legacy_migration::ReceiptCatalog<'_>,
         super::management::records::DecodeWork<'_>,
@@ -1428,7 +1442,7 @@ async fn observe_core<C: ConnectionTrait>(
     if let Some(row) = row {
         let confirmed_retained = if status == RemotePinStatus::Pinned && row.effect == "retained" {
             match claim {
-                Some((job, request_id, true)) => {
+                Some((job, request_id, true, _)) => {
                     retained_confirmation_core(db, &row, job, request_id, runtime).await?
                 }
                 _ => false,
@@ -1443,6 +1457,14 @@ async fn observe_core<C: ConnectionTrait>(
         active.last_observed_at = Set(Some(now));
         if status == RemotePinStatus::Pinned && row.remote_pinned_at.is_none() {
             active.remote_pinned_at = Set(Some(now));
+        }
+        if let (Some((_, request_id, _, true)), Some(route)) = (claim, row.route.as_deref())
+            && status != RemotePinStatus::Failed
+        {
+            db.execute(sea_orm::Statement::from_sql_and_values(db.get_database_backend(),
+                "INSERT INTO pin_cleanup_ownership(provider,cid,request_id,route) VALUES ($1,$2,$3,$4) ON CONFLICT(provider,cid) DO UPDATE SET request_id=excluded.request_id, route=excluded.route, file_id=NULL",
+                [row.provider.clone().into(), row.cid.clone().into(), request_id.into(), route.into()],
+            )).await?;
         }
         if row.ownership == "unknown" && row.route.is_some() {
             active.ownership = Set(match ownership {
@@ -1651,36 +1673,26 @@ async fn cleanup_from_candidates_core(
         }
         get_with_work(&catalog, provider, cid, work).await?
     };
-    let Some(row) = row else {
-        return match catalog {
-            super::legacy_migration::ReceiptCatalog::Observed(window) => {
-                window.unregistered(provider).await
-            }
-            super::legacy_migration::ReceiptCatalog::Runtime(..) => {
-                super::management::admission::unregistered_catalog(catalog, provider).await
-            }
-            _ => legacy_unregistered_store(&catalog, provider).await,
-        };
+    let Some(row) = row else { return Ok(false) };
+    let Some(raw) = row.route.as_deref() else {
+        return Ok(false);
     };
-    // Stage 5 RPC receipts prove pin state, never exclusive creation. In
-    // particular an opaque RPC request id must not become CID-based delete authority.
-    let route = row
-        .route
-        .as_deref()
-        .map(|route| work.with(|work| work.typed::<ProviderRouteSnapshot>(route)))
-        .transpose()
+    let route = work
+        .with(|work| work.typed::<ProviderRouteSnapshot>(raw))
         .map_err(super::management::admission::work_error)?;
-    if route.as_ref().is_some_and(|route| {
-        matches!(
-            route.resource_type(),
-            crate::pinning::identity::RemoteResourceType::RpcPin
-                | crate::pinning::identity::RemoteResourceType::ClusterPin
-        )
-    }) {
+    // Synthetic legacy domains cannot distinguish a CID-wide destination from
+    // primary storage. Request/file-scoped adapters still use exact handles.
+    if route.storage_domain.starts_with("legacy:")
+        && (submission::is_rpc(&route) || route.api_profile == "pinata-legacy")
+    {
         return Ok(false);
     }
-    Ok(row.ownership == "application_created"
-        && route.is_some_and(|route| route.cleanup == CleanupMode::Managed))
+    // Keep submit authority separate from actual ownership on shared-CID backends.
+    if catalog.query_one(sea_orm::Statement::from_sql_and_values(catalog.get_database_backend(),
+        "SELECT 1 FROM pin_cleanup_ownership p JOIN remote_pins r ON r.provider=p.provider AND r.cid=p.cid AND r.request_id=p.request_id WHERE p.provider=$1 AND p.cid=$2 AND p.route=$3",
+        [row.provider.clone().into(), row.cid.clone().into(), raw.into()],
+    )).await?.is_some() { return Ok(true); }
+    unpin::historical_submission(&catalog, &row, &route, raw, work).await
 }
 
 // Retain the pre-registry low-level store API used by legacy embedders. The
@@ -1698,6 +1710,7 @@ pub struct ResourceStatus {
     pub display_name: Option<String>,
     pub remote_ref: Option<RemoteRef>,
     pub active_references: usize,
+    pub cleanup_receipt_eligible: bool,
     pub remote_status: String,
     pub ownership: Ownership,
     pub effect: LedgerEffect,
@@ -1755,6 +1768,7 @@ pub async fn status<C: ConnectionTrait>(
         route_provenance,
         remote_ref,
         active_references: snapshot.desired.len(),
+        cleanup_receipt_eligible: cleanup_allowed(db, provider, cid).await?,
         display_name: configured.map(|r| r.display_name),
         remote_status: remote.status,
         ownership,

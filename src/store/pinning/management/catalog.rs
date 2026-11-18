@@ -116,6 +116,7 @@ pub(crate) fn raw_column(table: &str, name: &str) -> NativeColumn {
         "TEXT"
     };
     let nullable = match table {
+        "pin_cleanup_ownership" => name == "file_id",
         "zip_mpu_replays" => !matches!(
             name,
             "batch_id" | "request_fingerprint" | "request_contract"

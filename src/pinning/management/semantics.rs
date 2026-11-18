@@ -537,18 +537,13 @@ fn validate_disposition(
                     || remote.application_references != Some(0)
                     || remote.inflight_operations != Some(0)
                     || remote.has_unknown_responsibility()
-                    || remote.retained
                     || remote.cleanup_pending
                     || remote.effect != SideEffect::Present
-                    || matches!(
-                        remote.route.resource_type,
-                        ResourceType::RpcPin | ResourceType::ClusterPin
-                    )
-                    || !capture.mutation_scope.routes.iter().any(|route| {
-                        route.identity == remote.route
-                            && route.available
-                            && route.cleanup == CleanupMode::Managed
-                    })
+                    || !capture
+                        .mutation_scope
+                        .routes
+                        .iter()
+                        .any(|route| route.identity == remote.route && route.available)
                     || !resources.iter().any(|selected| {
                         selected.key == remote.key
                             && selected.route == remote.route

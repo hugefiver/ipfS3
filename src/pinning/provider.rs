@@ -11,6 +11,21 @@ pub struct SubmitObservation {
     pub effect: SubmitEffect,
 }
 
+impl From<Result<RemotePin, ProviderError>> for SubmitObservation {
+    fn from(result: Result<RemotePin, ProviderError>) -> Self {
+        let effect = match &result {
+            Ok(_) => SubmitEffect::Observed,
+            Err(error) if error.definitely_not_submitted() => SubmitEffect::NotSubmitted,
+            Err(_) => SubmitEffect::Unknown,
+        };
+        Self {
+            result,
+            resources: Vec::new(),
+            effect,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct PinObservation {
     pub result: Result<RemotePin, ProviderError>,
@@ -107,17 +122,7 @@ pub trait PinningProvider: Send + Sync + 'static {
     /// Legacy providers retain their existing rejection/unknown classification.
     /// RPC implementations override this to preserve resource-level evidence.
     async fn submit_observed(&self, request: SubmitPin) -> SubmitObservation {
-        let result = self.submit(request).await;
-        let effect = match &result {
-            Ok(_) => SubmitEffect::Observed,
-            Err(error) if error.definitely_not_submitted() => SubmitEffect::NotSubmitted,
-            Err(_) => SubmitEffect::Unknown,
-        };
-        SubmitObservation {
-            result,
-            resources: Vec::new(),
-            effect,
-        }
+        SubmitObservation::from(self.submit(request).await)
     }
 
     async fn get(&self, request_id: &str) -> Result<RemotePin, ProviderError>;
@@ -156,6 +161,11 @@ pub trait PinningProvider: Send + Sync + 'static {
     async fn find(&self, query: FindPin) -> Result<Vec<RemotePin>, ProviderError>;
 
     async fn unpin(&self, request_id: &str) -> Result<(), ProviderError>;
+
+    /// Caller has fenced the original resource, route, creation receipt and last reference.
+    async fn unpin_owned(&self, request_id: &str) -> Result<(), ProviderError> {
+        self.unpin(request_id).await
+    }
 
     async fn unpin_historical(
         &self,
@@ -243,6 +253,15 @@ impl PinningProvider for HistoricalProvider {
         strategy: &str,
     ) -> Result<RemotePin, ProviderError> {
         self.inner.get_historical(id, api, strategy).await
+    }
+    async fn unpin_owned(&self, id: &str) -> Result<(), ProviderError> {
+        if self.inner.invocation_route() == self.invocation_route() {
+            self.inner.unpin_owned(id).await
+        } else {
+            self.inner
+                .unpin_historical(id, self.api, self.strategy)
+                .await
+        }
     }
     async fn unpin(&self, id: &str) -> Result<(), ProviderError> {
         self.inner

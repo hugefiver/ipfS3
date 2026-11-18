@@ -404,10 +404,10 @@ impl RetirementReview<'_> {
                 while let Some(row)=one(&self.spool.db,"SELECT identity,payload FROM facts WHERE kind='current' AND identity>$1 ORDER BY identity LIMIT 1",vec![after.into()]).await? {
                     after=get(&row,"identity")?;
                     let remote:RemoteSnapshot=decode(&get::<String>(&row,"payload")?)?;
-                    if remote.ownership!=Ownership::ApplicationCreated||remote.application_references!=Some(0)||remote.inflight_operations!=Some(0)||remote.has_unknown_responsibility()||remote.retained||remote.cleanup_pending||remote.effect!=SideEffect::Present||matches!(remote.route.resource_type,ResourceType::RpcPin|ResourceType::ClusterPin)
+                    if remote.ownership!=Ownership::ApplicationCreated||remote.application_references!=Some(0)||remote.inflight_operations!=Some(0)||remote.has_unknown_responsibility()||remote.cleanup_pending||remote.effect!=SideEffect::Present
                         ||!resources.iter().any(|r|r.key==remote.key&&r.route==remote.route&&r.epoch==remote.epoch&&Some(&r.resource_id)==remote.resource_id.as_ref()) {return Err(ManagementError::InvalidEvidence)}
                     let route=self.spool.lookup::<RouteSnapshot>("route_revision",&encode(&remote.route)?).await?.ok_or(ManagementError::InvalidEvidence)?;
-                    if !route.available||route.cleanup!=CleanupMode::Managed {return Err(ManagementError::InvalidEvidence)}
+                    if !route.available {return Err(ManagementError::InvalidEvidence)}
                     visited+=1;
                 }
                 if visited != resources.len() {

@@ -86,8 +86,29 @@ fn psa_config(endpoint: &str, scope: &str, cleanup: &str, names: &[(&str, &str)]
 }
 
 fn coordinator(cfg: &Config) -> Arc<PinningCoordinator> {
+    let mut cfg = cfg.clone();
+    cfg.decompress_zip.auto_pin_outputs = Some(false);
+    if let Some(provider) = cfg.pinning.providers.iter().find(|provider| {
+        !cfg.pinning_identity
+            .providers
+            .iter()
+            .any(|identity| identity.config_name == provider.name && identity.retired)
+    }) {
+        cfg.pinning
+            .policies
+            .push(ipfs_s3_gateway::config::PolicyConfig {
+                bucket: "stage2".into(),
+                prefix: String::new(),
+                trigger: "always".into(),
+                provider_mode: "all".into(),
+                providers: vec![provider.name.clone()],
+                default_duration: "1h".into(),
+                max_duration: "2h".into(),
+                allow_decompressed: false,
+            });
+    }
     PinningCoordinator::build(
-        ValidatedPinningConfig::from_config(cfg, |_| Some("test-only-token".into())).unwrap(),
+        ValidatedPinningConfig::from_config(&cfg, |_| Some("test-only-token".into())).unwrap(),
     )
     .unwrap()
 }
@@ -174,7 +195,7 @@ async fn try_publish(
                 tags: vec![],
                 leases: vec![LeaseIntent {
                     source: LeaseSource::Automatic,
-                    policy_id: "stage2".into(),
+                    policy_id: "policy:0".into(),
                     provider_mode: ProviderMode::All,
                     providers: vec![provider],
                     content_mode: ContentMode::Object,
@@ -365,8 +386,17 @@ async fn exercise_stage2(db: sea_orm::DatabaseConnection) {
         assert!(layered.any_provider_available);
         assert!(layered.all_targets_pinned);
     }
-    // Cancellation of one owner and expiry of the other race without releasing
-    // the retained resource or deleting the shared request.
+    // Model a pre-receipt PSA lifetime: the returned request cannot be tied to
+    // its original submit after restart, so cancellation retains this one hold.
+    store
+        .db()
+        .execute(sea_orm::Statement::from_sql_and_values(
+            store.db().get_database_backend(),
+            "DELETE FROM pin_cleanup_ownership WHERE provider=$1 AND cid='bafy-shared'",
+            [provider.clone().into()],
+        ))
+        .await
+        .unwrap();
     let cancel = end_lease_with_transaction_retry(&store, Some(&before[0].id));
     let expire = end_lease_with_transaction_retry(&store, None);
     // Make the fixture due without passing a future scheduling clock to the
@@ -607,9 +637,7 @@ async fn exercise_identity_isolation(store: &Store) {
                 .await
                 .unwrap()
                 .is_some_and(|j| {
-                    j.locked_until.is_none()
-                        && j.last_error.as_deref()
-                            == Some("historical identity unavailable; needs_attention")
+                    j.state == "error" && j.locked_until.is_none() && j.last_error.is_some()
                 })
         })
         .await;
@@ -631,7 +659,7 @@ async fn exercise_identity_isolation(store: &Store) {
 
 async fn exercise_cleanup_failure_with_attested_ownership(store: &Store) {
     let server = MockServer::start().await;
-    Mock::given(method("POST")).and(path("/pins")).respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"requestid":"managed","status":"pinned","pin":{"cid":"bafy-managed"}}))).expect(1).mount(&server).await;
+    Mock::given(method("POST")).and(path("/pins")).respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({"requestid":"managed","status":"pinned","pin":{"cid":"bafy-managed"}}))).expect(1).mount(&server).await;
     Mock::given(method("DELETE"))
         .and(path("/pins/managed"))
         .respond_with(ResponseTemplate::new(503))
@@ -651,18 +679,11 @@ async fn exercise_cleanup_failure_with_attested_ownership(store: &Store) {
         remote_is(store, &provider, "bafy-managed", "pinned")
     })
     .await;
-    // This tests the managed cleanup ledger once ownership is independently
-    // attested. The PSA POST response itself does not supply that proof.
-    ledger::observe(
-        store.db(),
-        &provider,
-        "bafy-managed",
-        ipfs_s3_gateway::pinning::provider::RemotePinStatus::Pinned,
-        ledger::Ownership::ApplicationCreated,
-        Utc::now(),
-    )
-    .await
-    .unwrap();
+    assert!(
+        ledger::cleanup_allowed(store.db(), &provider, "bafy-managed")
+            .await
+            .unwrap()
+    );
     let lease = lease_rows(store, &provider).await.remove(0);
     let txn = store.db().begin().await.unwrap();
     leases::cancel_lease(&txn, &lease.id, Utc::now())
@@ -745,6 +766,8 @@ async fn exercise_cleanup_failure_with_attested_ownership(store: &Store) {
         .unwrap();
     let archived: serde_json::Value = serde_json::from_str(&archive.ledger).unwrap();
     assert_eq!(archived["request_id"], "managed");
+    assert_eq!(archived["unpin_accepted"], true);
+    assert_eq!(archived["confirmed_absent"], false);
     let mut next = psa_config(
         &server.uri(),
         "managed",
@@ -850,6 +873,12 @@ async fn exercise_external_existing(store: &Store) {
 
 async fn exercise_late_success(store: &Store) {
     let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/pins/late"))
+        .respond_with(ResponseTemplate::new(202))
+        .expect(1)
+        .mount(&server)
+        .await;
     let post_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let seen_post = post_started.clone();
     Mock::given(method("POST")).and(path("/pins")).respond_with(move |_: &wiremock::Request| {
@@ -892,21 +921,9 @@ async fn exercise_late_success(store: &Store) {
         !remote_is(store, &provider, "bafy-late", "pinned").await,
         "provider response must arrive after lease expiry"
     );
-    wait_for("late pinned", || {
-        remote_is(store, &provider, "bafy-late", "pinned")
-    })
-    .await;
-    wait_for("late retained", || async {
-        ledger::get(store.db(), &provider, "bafy-late")
-            .await
-            .unwrap()
-            .unwrap()
-            .effect
-            == "retained"
-    })
-    .await;
+    wait_for_effect(store, &provider, "bafy-late", "absent").await;
     worker.shutdown(Duration::from_secs(5)).await;
-    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
     let after = pin_lease::Entity::find_by_id(before.id)
         .one(store.db())
         .await
@@ -921,7 +938,7 @@ async fn exercise_late_success(store: &Store) {
             .unwrap()
             .unwrap()
             .reserved_pins,
-        1
+        0
     );
     assert!(
         ledger::status(store.db(), &provider, "bafy-late")
@@ -1006,6 +1023,103 @@ async fn postgres_legacy_unknown_capacity_remains_isolated_after_upgrade() {
     if let Err(error) = result {
         std::panic::resume_unwind(error);
     }
+}
+
+#[tokio::test]
+async fn default_pinata_queue_cleans_only_its_bound_file_after_restart() {
+    use serde_json::{Value, json};
+    use std::sync::Mutex;
+    let directory = tempfile::tempdir().unwrap();
+    let database_path = directory
+        .path()
+        .join("pinata.db")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let db = store::connect_database(&format!("sqlite://{database_path}?mode=rwc"))
+        .await
+        .unwrap();
+    store::run_migrations(&db).await.unwrap();
+    store::bucket::create(&db, "stage2", None).await.unwrap();
+    let store = Store::new(db);
+    let server = MockServer::start().await;
+    let keys = Arc::new(Mutex::new(Value::Null));
+    let posted = keys.clone();
+    Mock::given(method("POST"))
+        .and(path("/v3/files/public/pin_by_cid"))
+        .respond_with(move |r: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&r.body).unwrap();
+            *posted.lock().unwrap() = body["keyvalues"].clone();
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"data":{"id":"queue-1","cid":"bafy-file","status":"queued"}}))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET")).and(path("/v3/files/public")).respond_with(move |_: &wiremock::Request| ResponseTemplate::new(200).set_body_json(json!({"data":{"files":[{"id":"other","cid":"bafy-file","keyvalues":{}},{"id":"owned","cid":"bafy-file","keyvalues":*keys.lock().unwrap()}]}}))).mount(&server).await;
+    Mock::given(method("DELETE"))
+        .and(path("/v3/files/public/owned"))
+        .respond_with(ResponseTemplate::new(202))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut cfg = psa_config(
+        &format!("{}/v3", server.uri()),
+        "pinata-scope",
+        "retain",
+        &[("pinata", "pinata-id")],
+    );
+    cfg.pinning.providers[0].kind = "pinata".into();
+    cfg.pinning_identity.providers[0].backend = "pinata".into();
+    cfg.pinning_identity.providers[0].api_profile = "pinata-v3".into();
+    let runtime = coordinator(&cfg);
+    runtime.register_identities(&store).await.unwrap();
+    let provider = runtime.provider_limits().keys().next().unwrap().clone();
+    publish(&store, &runtime, "file", "bafy-file").await;
+    let worker = runtime.start(store.clone(), CancellationToken::new());
+    wait_for("original queue submission", || {
+        remote_is(&store, &provider, "bafy-file", "queued")
+    })
+    .await;
+    worker.shutdown(Duration::from_secs(5)).await;
+    // Pre-upgrade submissions have a durable queue receipt but no file binding.
+    let cleared = store
+        .db()
+        .execute(sea_orm::Statement::from_sql_and_values(
+            store.db().get_database_backend(),
+            "DELETE FROM pin_cleanup_ownership WHERE provider=$1 AND cid=$2 AND file_id IS NULL",
+            [provider.clone().into(), "bafy-file".into()],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(cleared.rows_affected(), 1);
+    let worker = coordinator(&cfg).start(store.clone(), CancellationToken::new());
+    wait_for("mapped file", || {
+        remote_is(&store, &provider, "bafy-file", "pinned")
+    })
+    .await;
+    worker.shutdown(Duration::from_secs(5)).await;
+    let lease = lease_rows(&store, &provider).await.remove(0);
+    end_lease_with_transaction_retry(&store, Some(&lease.id)).await;
+    let restarted = coordinator(&cfg);
+    let worker = restarted.start(store.clone(), CancellationToken::new());
+    wait_for_effect(&store, &provider, "bafy-file", "absent").await;
+    worker.shutdown(Duration::from_secs(5)).await;
+    let received = server.received_requests().await.unwrap();
+    assert_eq!(
+        received
+            .iter()
+            .filter(|r| r.method.as_str() == "DELETE")
+            .count(),
+        1
+    );
+    assert_eq!(
+        quota::read_usage(store.db(), &provider)
+            .await
+            .unwrap()
+            .unwrap()
+            .reserved_pins,
+        0
+    );
 }
 
 #[tokio::test]

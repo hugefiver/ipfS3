@@ -148,8 +148,9 @@ max_pins = 10000
 # `storage_domain` is the physical/account pin domain. A provider whose domain
 # equals `primary_storage_domain` is rejected because it is not an independent
 # backup. Aliases for the same backend + scope intentionally share canonical
-# resource accounting. New explicit identities default to cleanup = "retain";
-# set cleanup = "managed" only for an exclusive, operationally verified scope.
+# resource accounting. After the final reference expires, cleanup uses the
+# recorded submission or creation receipt, exact resource and historical route. Old cleanup
+# settings are accepted but do not grant or suppress deletion authority.
 [pinning_identity]
 primary_storage_domain = "kubo:primary"
 
@@ -166,7 +167,6 @@ secret_ref = "env:PINATA_JWT"
 api_profile = "pinata-v3"
 strategy = "cid"
 retired = false
-cleanup = "retain"
 
 [[pinning_identity.providers]]
 config_name = "filebase-primary"
@@ -181,7 +181,6 @@ secret_ref = "env:FILEBASE_PINNING_TOKEN"
 api_profile = "filebase-psa"
 strategy = "cid"
 retired = false
-cleanup = "retain"
 
 # Policies are evaluated in file order. The first exact-bucket (or "*") and
 # literal-prefix match wins.
@@ -203,8 +202,9 @@ allow_decompressed = true
 # Scope/backend are administrator assertions, not inferred from endpoint/token.
 # Bump credential_revision for password/token/Basic username changes and
 # endpoint_revision for endpoint changes. Another account/pinset needs a new scope.
-# cleanup defaults to retain. An add/import/recursive pin/matching CID does NOT
-# establish ApplicationCreated ownership, even if cleanup is set to managed.
+# A successful, bound gateway submission authorizes CID-wide removal on the
+# selected backup node after the final reference. Independent pins of that CID
+# there are removed too. A read-only match alone remains visible and charged.
 # Stop/drain all old writers/workers and back up before the RPC ledger migration;
 # mixed versions and dangerous down/table deletion are unsupported.
 # Stage 5 verification is running; this example isn't a PASS or account receipt.
@@ -242,7 +242,6 @@ allow_decompressed = true
 # endpoint_revision = 1
 # api_profile = "kubo"
 # strategy = "car"
-# cleanup = "retain"
 #
 # Kubo Bearer alternative: set auth = "bearer" in its RPC entry, add
 # token_env = "KUBO_BACKUP_TOKEN" to its provider, and add
@@ -286,7 +285,6 @@ allow_decompressed = true
 # secret_ref = "env:FILEBASE_RPC_TOKEN"
 # api_profile = "filebase-rpc"
 # strategy = "upload"
-# cleanup = "retain"
 #
 # Public RPC requires HTTPS/public resolved addresses; private networking defaults
 # to denied. No endpoint may contain userinfo/query/fragment. Redirects aren't
@@ -336,7 +334,6 @@ allow_decompressed = true
 # endpoint_revision = 1
 # api_profile = "cluster-proxy"
 # strategy = "car"
-# cleanup = "retain"
 #
 # Authentication defaults to none independently for proxy_auth, rest_auth and
 # source (the main Kubo bytes/DAG reader). Each subtable accepts auth = "bearer"

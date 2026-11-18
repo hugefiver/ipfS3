@@ -14,6 +14,8 @@ struct HistoricalEnvelope {
     ledger: remote_pin_ledger::Model,
     request_id: Option<String>,
     confirmed_absent: bool,
+    #[serde(default)]
+    unpin_accepted: bool,
 }
 
 fn ownership(
@@ -23,11 +25,7 @@ fn ownership(
 ) -> Ownership {
     match value {
         "external_existing" => Ownership::ExternalExisting,
-        "application_created"
-            if route.is_some_and(|route| route.resource_type != ResourceType::RpcPin) =>
-        {
-            Ownership::ApplicationCreated
-        }
+        "application_created" if route.is_some() => Ownership::ApplicationCreated,
         "application_created" => {
             gaps.insert(EvidenceGap::OwnershipProofUnavailable);
             Ownership::Unknown
@@ -89,7 +87,7 @@ fn route_evidence(
     let configured = config
         .providers
         .iter()
-        .find(|provider| provider.route_snapshot() == *raw);
+        .find(|provider| provider.route_snapshot().execution_compatible(raw));
     let available = super::super::local_config::historical_route_available(raw, config);
     RouteEvidence {
         identity: route(raw),
@@ -99,10 +97,7 @@ fn route_evidence(
             && !retired
             && configured
                 .is_some_and(|provider| !provider.identity.retired && provider.limits.enabled),
-        cleanup: match raw.cleanup {
-            identity::CleanupMode::Retain => CleanupMode::Retain,
-            identity::CleanupMode::Managed => CleanupMode::Managed,
-        },
+        cleanup: CleanupMode::Managed,
         exclusive_management: None,
     }
 }
@@ -554,6 +549,16 @@ pub(super) fn assemble(
         let unsettled = submissions.iter().any(|row| {
             row.allocation == allocation && row.expected_cid == cid && row.needs_attention
         });
+        let release = remote.and_then(|remote| {
+            historical
+                .iter()
+                .find(|(entry, _, _)| {
+                    entry.provider == allocation
+                        && entry.cid == original_cid
+                        && entry.epoch == remote.epoch
+                })
+                .map(|(_, envelope, _)| envelope)
+        });
         remotes.push(RemoteEvidence {
             allocation: allocation.clone(),
             cid: cid.clone(),
@@ -591,7 +596,10 @@ pub(super) fn assemble(
                 .transpose()?,
             confirmations: confirmations(ledger),
             observation_current: false,
-            confirmed_absent: state == LedgerState::Absent,
+            confirmed_absent: state == LedgerState::Absent
+                && release.is_some_and(|e| e.confirmed_absent),
+            unpin_accepted: state == LedgerState::Absent
+                && release.is_some_and(|e| e.unpin_accepted),
         });
     }
     let mut historical_remotes = Vec::new();
@@ -616,7 +624,7 @@ pub(super) fn assemble(
             route: route.clone(),
             resource_id: envelope.request_id.clone(),
             epoch: Some(row.epoch),
-            effect: if envelope.confirmed_absent {
+            effect: if envelope.confirmed_absent || envelope.unpin_accepted {
                 SideEffect::Unknown
             } else {
                 effect(state, false)
@@ -625,12 +633,15 @@ pub(super) fn assemble(
             ownership: ownership(&envelope.ledger.ownership, route.as_ref(), &mut gaps),
             application_references: None,
             inflight_jobs: None,
-            retained: state == LedgerState::Retained,
-            cleanup_pending: state == LedgerState::CleanupPending,
+            retained: !(envelope.confirmed_absent || envelope.unpin_accepted)
+                && state == LedgerState::Retained,
+            cleanup_pending: !(envelope.confirmed_absent || envelope.unpin_accepted)
+                && state == LedgerState::CleanupPending,
             accounted_bytes: None,
             confirmations: confirmations(Some(&envelope.ledger)),
             observation_current: false,
             confirmed_absent: envelope.confirmed_absent,
+            unpin_accepted: envelope.unpin_accepted,
         });
     }
     let mut canonical_keys = BTreeSet::new();

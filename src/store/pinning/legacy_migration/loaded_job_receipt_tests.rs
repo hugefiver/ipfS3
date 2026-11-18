@@ -470,6 +470,8 @@ async fn cleanup_compound_keeps_fresh_alias_identity_and_ordinary_ownership_rule
     ))
     .await
     .unwrap();
+    db.execute(Statement::from_sql_and_values(db.get_database_backend(), "UPDATE remote_pins SET request_id='alias-request' WHERE provider=$1 AND cid='cleanup-alias'", [target.clone().into()])).await.unwrap();
+    db.execute(Statement::from_sql_and_values(db.get_database_backend(), "INSERT INTO pin_cleanup_ownership(provider,cid,request_id,route) SELECT provider,cid,'alias-request',route FROM remote_pin_ledger WHERE provider=$1 AND cid='cleanup-alias'", [target.clone().into()])).await.unwrap();
     let release = serde_json::json!({"confirmed_absent":true,"ledger":{"provider":target,"cid":"cleanup-alias"}}).to_string();
     db.execute(Statement::from_sql_and_values(db.get_database_backend(),
         "INSERT INTO pin_resource_history(provider,cid,epoch,ledger) VALUES ($1,'cleanup-alias',1,$2)",
@@ -533,8 +535,9 @@ async fn cleanup_compound_keeps_fresh_alias_identity_and_ordinary_ownership_rule
     db.execute(Statement::from_sql_and_values(db.get_database_backend(),
         "UPDATE remote_pin_ledger SET ownership='application_created' WHERE provider=$1 AND cid='ordinary-cleanup'",
         [target.clone().into()])).await.unwrap();
+    // A label without a bound request is not deletion authority.
     assert!(
-        ledger::cleanup_allowed(&db, &target, "ordinary-cleanup")
+        !ledger::cleanup_allowed(&db, &target, "ordinary-cleanup")
             .await
             .unwrap()
     );
@@ -568,10 +571,12 @@ async fn cleanup_compound_keeps_fresh_alias_identity_and_ordinary_ownership_rule
                 .await
                 .unwrap()
         );
-        assert!(
-            !ledger::cleanup_allowed(&tx, "old", "cleanup-alias")
+        let original_request = serde_json::to_string(&route).unwrap() == snapshot;
+        assert_eq!(
+            ledger::cleanup_allowed(&tx, "old", "cleanup-alias")
                 .await
-                .unwrap()
+                .unwrap(),
+            original_request
         );
         let (tx, cleanup) = ledger::prepare_runtime_unpin_effect(
             tx,
@@ -581,7 +586,7 @@ async fn cleanup_compound_keeps_fresh_alias_identity_and_ordinary_ownership_rule
         )
         .await
         .unwrap();
-        assert!(!cleanup);
+        assert_eq!(cleanup, original_request);
         tx.rollback().await.unwrap();
     }
     let tx = db.begin().await.unwrap();

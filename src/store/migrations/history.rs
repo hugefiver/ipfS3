@@ -3,6 +3,7 @@ pub const M13: &str = "m20261013_000001_zip_root_logical_release";
 pub const M17: &str = "m20261017_000001_management_storage";
 pub const M23: &str = "m20261023_000001_inline_documents";
 pub const CURRENT_PINNING: &str = super::m20261108_000001_current_pinning_config::VERSION;
+pub const CID_COMPARISONS: &str = super::m20261109_000001_pin_cid_comparisons::VERSION;
 pub const VERSIONS: &[&str] = &[
     "m20250701_000001_init",
     "m20260707_000001_decompress_zip",
@@ -72,7 +73,14 @@ pub fn has_current_pinning_layout(versions: &[String]) -> bool {
             == [
                 super::baseline::VERSION,
                 super::m20261108_000001_current_pinning_config::VERSION,
-                super::m20261109_000001_pin_cid_comparisons::VERSION,
+                CID_COMPARISONS,
+            ]
+        || versions
+            == [
+                super::baseline::VERSION,
+                CURRENT_PINNING,
+                CID_COMPARISONS,
+                super::m20261110_000001_cleanup_identity::VERSION,
             ]
 }
 

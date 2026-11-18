@@ -297,7 +297,7 @@ async fn no_delete(target: &MockServer) {
 }
 
 #[tokio::test]
-async fn worker_matched_preexisting_shared_cid_reuses_one_hold_and_retain_never_deletes() {
+async fn worker_releases_a_shared_backup_cid_from_its_historical_submit_receipt() {
     let source = MockServer::start().await;
     let target = MockServer::start().await;
     source_file(&source).await;
@@ -342,11 +342,24 @@ async fn worker_matched_preexisting_shared_cid_reuses_one_hold_and_retain_never_
     assert_eq!(targets.len(), 2);
     assert!(targets.iter().all(|target| target.state == "pinned"));
     fixture.assert_held().await;
+    fixture
+        .store
+        .db()
+        .execute_unprepared("DELETE FROM pin_cleanup_ownership")
+        .await
+        .unwrap();
     assert!(
-        !ledger::cleanup_allowed(fixture.store.db(), &fixture.provider, CID)
+        ledger::cleanup_allowed(fixture.store.db(), &fixture.provider, CID)
             .await
             .unwrap()
     );
+    Mock::given(method("POST"))
+        .and(path("/api/v0/pin/rm"))
+        .and(query_param("arg", CID))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"Pins":[CID]})))
+        .expect(1)
+        .mount(&target)
+        .await;
     for lease in pin_lease::Entity::find()
         .all(fixture.store.db())
         .await
@@ -359,21 +372,30 @@ async fn worker_matched_preexisting_shared_cid_reuses_one_hold_and_retain_never_
         txn.commit().await.unwrap();
     }
     fixture.drain().await;
-    fixture.assert_held().await;
-    assert!(!matches!(
-        store_quota::reserve_unique(
-            fixture.store.db(),
-            &fixture.provider,
-            OTHER,
-            100,
-            fixture.coordinator.provider_limits(),
-            Utc::now()
-        )
-        .await
-        .unwrap(),
-        store_quota::ReservationOutcome::Reserved | store_quota::ReservationOutcome::Reused
-    ));
-    no_delete(&target).await;
+    assert_eq!(
+        store_quota::read_usage(fixture.store.db(), &fixture.provider)
+            .await
+            .unwrap()
+            .unwrap()
+            .reserved_pins,
+        0
+    );
+    assert_eq!(
+        ledger::get(fixture.store.db(), &fixture.provider, CID)
+            .await
+            .unwrap()
+            .unwrap()
+            .effect,
+        "absent"
+    );
+    assert!(
+        source
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.url.path() != "/api/v0/pin/rm")
+    );
 }
 
 #[tokio::test]

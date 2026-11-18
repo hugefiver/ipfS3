@@ -49,7 +49,10 @@ fn original_routes(
         if super::super::validate::validate_route_identity(&route(&raw)).is_err() {
             continue;
         }
-        let configured = config.providers.iter().find(|p| p.route_snapshot() == *raw);
+        let configured = config
+            .providers
+            .iter()
+            .find(|p| p.route_snapshot().execution_compatible(&raw));
         let available = local_config::historical_route_available(&raw, config);
         let retired = matches!(value(row, "retired"), Some("1" | "true"));
         let domain = text(row, "provider")?;
@@ -67,10 +70,7 @@ fn original_routes(
                 && !retired
                 && !barrier
                 && configured.is_some_and(|p| p.limits.enabled && !p.identity.retired),
-            cleanup: match raw.cleanup {
-                crate::pinning::identity::CleanupMode::Retain => CleanupMode::Retain,
-                crate::pinning::identity::CleanupMode::Managed => CleanupMode::Managed,
-            },
+            cleanup: CleanupMode::Managed,
             exclusive_management: false,
         });
     }
@@ -108,10 +108,7 @@ fn original_routes(
                 original: Some(raw.as_ref().clone()),
                 available,
                 allocation_allowed: false,
-                cleanup: match raw.cleanup {
-                    crate::pinning::identity::CleanupMode::Retain => CleanupMode::Retain,
-                    crate::pinning::identity::CleanupMode::Managed => CleanupMode::Managed,
-                },
+                cleanup: CleanupMode::Managed,
                 exclusive_management: false,
             });
         }
@@ -133,10 +130,7 @@ fn original_routes(
                 original: Some(raw.clone()),
                 available,
                 allocation_allowed: false,
-                cleanup: match raw.cleanup {
-                    crate::pinning::identity::CleanupMode::Retain => CleanupMode::Retain,
-                    crate::pinning::identity::CleanupMode::Managed => CleanupMode::Managed,
-                },
+                cleanup: CleanupMode::Managed,
                 exclusive_management: false,
             });
         }
@@ -158,10 +152,7 @@ fn original_routes(
             original: Some(raw.clone()),
             available,
             allocation_allowed: false,
-            cleanup: match raw.cleanup {
-                crate::pinning::identity::CleanupMode::Retain => CleanupMode::Retain,
-                crate::pinning::identity::CleanupMode::Managed => CleanupMode::Managed,
-            },
+            cleanup: CleanupMode::Managed,
             exclusive_management: false,
         });
     }
@@ -197,10 +188,7 @@ fn original_routes(
                 original: Some(raw.clone()),
                 available,
                 allocation_allowed: false,
-                cleanup: match raw.cleanup {
-                    crate::pinning::identity::CleanupMode::Retain => CleanupMode::Retain,
-                    crate::pinning::identity::CleanupMode::Managed => CleanupMode::Managed,
-                },
+                cleanup: CleanupMode::Managed,
                 exclusive_management: false,
             });
         }

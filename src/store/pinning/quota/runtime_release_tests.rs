@@ -72,7 +72,7 @@ async fn runtime_release_usage_resolution_consumes_the_partially_used_operation_
         .await
         .unwrap()
         .unwrap();
-    super::super::ledger::archive_runtime_confirmed_release(&tx, &remote, work)
+    super::super::ledger::archive_runtime_confirmed_release(&tx, &remote, work, false)
         .await
         .unwrap();
     super::super::ledger::mark_runtime_effect(&tx, "pinata", "bafy-release", "absent", work)
@@ -126,8 +126,68 @@ async fn runtime_release_usage_resolution_consumes_the_partially_used_operation_
 }
 
 #[tokio::test]
+async fn runtime_release_confirmed_rpc_delete_unblocks_new_allocation() {
+    use sea_orm::TransactionTrait;
+    let store = fixture(true).await;
+    let db = store.db();
+    let cid = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
+    let identity =
+        crate::pinning::identity::ProviderIdentity::legacy("rpc", "ipfs", None, "kubo", "cid");
+    super::super::ledger::register_route(db, "rpc", &identity)
+        .await
+        .unwrap();
+    let limits = [(
+        "rpc".into(),
+        ProviderLimits {
+            priority: 1,
+            max_bytes: 7,
+            max_pins: 1,
+            enabled: true,
+        },
+    )]
+    .into();
+    let now = Utc::now();
+    assert_eq!(
+        reserve_unique(db, "rpc", cid, 7, &limits, now)
+            .await
+            .unwrap(),
+        ReservationOutcome::Reserved
+    );
+    db.execute_unprepared("UPDATE remote_pins SET request_id='pinned-request', status='pinned' WHERE provider='rpc'; UPDATE remote_pin_ledger SET effect='cleanup_pending' WHERE provider='rpc'").await.unwrap();
+    assert!(matches!(
+        reserve_unique(db, "rpc", cid, 7, &limits, now)
+            .await
+            .unwrap(),
+        ReservationOutcome::QuotaWaiting { .. }
+    ));
+    assert_eq!(
+        confirmed_release(db, "rpc", cid, 1, now).await.unwrap(),
+        ConfirmedReleaseOutcome::Stale
+    );
+    let tx = db.begin().await.unwrap();
+    assert_eq!(
+        confirmed_release_for_request(&tx, "rpc", cid, 1, Some("pinned-request"), now)
+            .await
+            .unwrap(),
+        ConfirmedReleaseOutcome::Released
+    );
+    tx.commit().await.unwrap();
+    assert_eq!(
+        read_usage(db, "rpc").await.unwrap().unwrap().reserved_pins,
+        0
+    );
+    assert_eq!(
+        reserve_unique(db, "rpc", cid, 7, &limits, now)
+            .await
+            .unwrap(),
+        ReservationOutcome::Reserved
+    );
+}
+
+#[tokio::test]
 async fn runtime_release_keeps_exact_request_epoch_usage_and_history_atomic() {
     let store = fixture(true).await;
+    store.db().execute_unprepared("INSERT INTO pin_submit_observations(id,job_id,submit_call,provider,expected_cid,route,remote_epoch,claim_until,effect,resources,outcome,needs_attention,started_at) SELECT 'unresolved','earlier',1,provider,'other-cid',route,1,CURRENT_TIMESTAMP,'unknown','[]','unknown',TRUE,CURRENT_TIMESTAMP FROM remote_pin_ledger").await.unwrap();
     for (epoch, request, expected) in [
         (2, "exact-request", ConfirmedReleaseOutcome::Stale),
         (1, "other-request", ConfirmedReleaseOutcome::Stale),

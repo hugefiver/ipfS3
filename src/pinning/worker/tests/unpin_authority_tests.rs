@@ -88,6 +88,16 @@ async fn managed_unpin_writer_parks_revoked_cleanup_without_recording_ordinary_r
     let mut unknown = ledger.into_active_model();
     unknown.ownership = Set("unknown".into());
     unknown.update(&tx).await.unwrap();
+    tx.execute(sea_orm::Statement::from_sql_and_values(
+        tx.get_database_backend(),
+        "DELETE FROM pin_cleanup_ownership WHERE provider=$1 AND cid=$2",
+        [
+            claimed.model.provider.clone().into(),
+            claimed.model.cid.clone().into(),
+        ],
+    ))
+    .await
+    .unwrap();
     tx.commit().await.unwrap();
 
     let fresh = job_authority::check_before_call_store(

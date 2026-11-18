@@ -514,7 +514,7 @@ impl Harness {
             let route: ProviderRouteSnapshot = serde_json::from_str(&row.route).unwrap();
             assert_eq!(route, identity.route_snapshot());
             assert_eq!(route.resource_type(), RemoteResourceType::RpcPin);
-            assert_eq!(route.cleanup, CleanupMode::Retain);
+            assert_eq!(route.cleanup, CleanupMode::Managed);
             let resources: Vec<ledger::submission::ResourceEvidence> =
                 serde_json::from_str(&row.resources).unwrap();
             assert_eq!(resources.len(), 1);
@@ -543,7 +543,7 @@ impl Harness {
             );
             assert!(evidence.remote_pinned_at.is_some());
             assert!(
-                !ledger::cleanup_allowed(db, &self.provider, cid)
+                ledger::cleanup_allowed(db, &self.provider, cid)
                     .await
                     .unwrap()
             );

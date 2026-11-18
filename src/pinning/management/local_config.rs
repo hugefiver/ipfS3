@@ -81,13 +81,13 @@ pub(crate) fn historical_route_available(
     !route.provider_id.starts_with("legacy:")
         && config.providers.iter().any(|provider| {
             let mut current = provider.route_snapshot();
-            if current == *route {
+            if current.execution_compatible(route) {
                 return true;
             }
             if !matches!(route.strategy.as_str(), "cid" | "car" | "upload") {
                 return false;
             }
             current.strategy = route.strategy.clone();
-            current == *route
+            current.execution_compatible(route)
         })
 }

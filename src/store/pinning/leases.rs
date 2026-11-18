@@ -2730,6 +2730,22 @@ async fn defer_delete_for_submit_ambiguity<C: ConnectionTrait>(
         }));
     }
 
+    if deleted_request_id.is_some() {
+        let session = SharedDecodeBudget::default();
+        let work = runtime.map_or_else(|| DecodeWork::shared(&session), |(_, work)| work);
+        let catalog = runtime.map_or_else(|| ReceiptCatalog::full(db), |(tx, _)| tx.catalog(work));
+        let row = ledger::get_catalog(catalog, provider, cid, work).await?;
+        ledger::archive_release_row(db, &current, row, Some(true)).await?;
+        // The DELETE was accepted. The reservation now covers only the other
+        // in-flight Submit; its job and submission evidence still fence release.
+        db.execute(sea_orm::Statement::from_sql_and_values(
+            db.get_database_backend(),
+            "UPDATE remote_pin_ledger SET effect='reserved', ownership='unknown' \
+             WHERE provider=$1 AND cid=$2 AND effect='cleanup_pending'",
+            [provider.into(), cid.into()],
+        ))
+        .await?;
+    }
     let reconcile_job_id = delete_reconcile(
         db,
         provider,
@@ -3165,6 +3181,23 @@ async fn prepare_failed_remote_resubmit_prelocked<C: ConnectionTrait>(
     if updated.exec(db).await?.rows_affected != 1 {
         return Ok(FailedRemoteResubmitDecision::Stale);
     }
+    let catalog = runtime.map_or_else(|| ReceiptCatalog::full(db), |tx| tx.catalog(work));
+    let row = ledger::get_catalog(catalog, provider, cid, work).await?;
+    let has_route = row.as_ref().is_some_and(|row| row.route.is_some());
+    // The worker enters after an acknowledged DELETE; a management replacement
+    // ends the old authorization without making any claim about the remote pin.
+    ledger::archive_release_row(db, remote, row, runtime.map(|_| true)).await?;
+    if runtime.is_some() {
+        // The accepted DELETE closed the old request. No call has used the
+        // replacement reservation yet; dispatch records uncertainty itself.
+        db.execute(sea_orm::Statement::from_sql_and_values(
+            db.get_database_backend(),
+            "UPDATE remote_pin_ledger SET effect='reserved', ownership='unknown' \
+             WHERE provider=$1 AND cid=$2 AND effect<>'reported_unknown'",
+            [provider.into(), cid.into()],
+        ))
+        .await?;
+    }
     mark_polls_for_request_done(db, provider, cid, expected_request_id, now).await?;
     for desired in desired
         .iter()
@@ -3193,10 +3226,30 @@ async fn prepare_failed_remote_resubmit_prelocked<C: ConnectionTrait>(
     };
     work.copy(&job.id).map_err(work_error)?;
     let submit_job_id = job.id.clone();
-    match runtime {
+    let ensured = match runtime {
         Some(tx) => jobs::ensure_runtime_submit(tx, job, now, work).await?,
         None => jobs::ensure_submit_with_work(db, job, now, work).await?,
     };
+    if has_route && ensured == jobs::EnsureJobOutcome::Reactivated {
+        // The stable target job is reused. Only its settled invocation on this
+        // exact route can start the replacement; call and recovery budgets survive.
+        let rebound = db.execute(sea_orm::Statement::from_sql_and_values(
+            db.get_database_backend(),
+            "UPDATE pin_invocation_routes SET remote_epoch=$1 WHERE job_id=$2 AND remote_epoch<=$3 \
+             AND route=(SELECT route FROM remote_pin_ledger WHERE provider=$4 AND cid=$5) \
+             AND NOT EXISTS (SELECT 1 FROM pin_resource_history h WHERE h.provider=$4 AND h.cid=$5 AND h.epoch>=pin_invocation_routes.remote_epoch AND h.epoch<$3) \
+             AND NOT EXISTS (SELECT 1 FROM pin_submit_history h WHERE h.job_id=$2 AND h.state<>'settled')",
+            [new_epoch.into(), submit_job_id.as_str().into(), remote.epoch.into(), provider.into(), cid.into()],
+        )).await?;
+        if rebound.rows_affected() != 1 {
+            return Err(stale_lifecycle_error("replacement Submit invocation"));
+        }
+        db.execute(sea_orm::Statement::from_sql_and_values(
+            db.get_database_backend(),
+            "UPDATE pin_submit_history SET state='active', effect='not_created' WHERE job_id=$1 AND state='settled'",
+            [submit_job_id.as_str().into()],
+        )).await?;
+    }
     Ok(FailedRemoteResubmitDecision::Prepared {
         new_epoch,
         submit_job_id,
@@ -3335,7 +3388,7 @@ async fn renew_manual_lease_for_owner<C: ConnectionTrait>(
         _ => return Err(RenewManualLeaseError::InvalidState),
     }
 
-    let recoverable: Vec<_> = snapshot
+    let mut recoverable: Vec<_> = snapshot
         .targets
         .iter()
         .filter(|target| target_recoverable_from_snapshot(&snapshot, target))
@@ -3351,10 +3404,9 @@ async fn renew_manual_lease_for_owner<C: ConnectionTrait>(
         .map_err(app_to_renewal_error)?;
     guard_renewal_owner(db, &snapshot.owner, owner_scope).await?;
     let generation = reactivate_expired_manual_lease(db, lease, retain_until, now).await?;
-    let restored_target_ids = restore_snapshot_targets(db, &snapshot, &recoverable, now).await?;
-    if restored_target_ids.is_empty() {
-        return Err(RenewManualLeaseError::NoRecoverableReservation);
-    }
+    let restored_target_ids =
+        restore_snapshot_targets(db, &snapshot, &mut recoverable, now).await?;
+    recoverable.retain(|target| target.state != TARGET_QUOTA_WAITING);
     refresh_renewal_snapshot_targets_with_work(
         db,
         &snapshot,
@@ -4121,7 +4173,7 @@ fn target_recoverable_from_snapshot(
 async fn restore_snapshot_targets<C: ConnectionTrait>(
     db: &C,
     snapshot: &RenewalSnapshot,
-    targets: &[pin_lease_target::Model],
+    targets: &mut [pin_lease_target::Model],
     now: DateTimeUtc,
 ) -> Result<Vec<String>, RenewManualLeaseError> {
     let mut restored = Vec::with_capacity(targets.len());
@@ -4130,8 +4182,22 @@ async fn restore_snapshot_targets<C: ConnectionTrait>(
             .remotes
             .get(&(target.provider.clone(), target.cid.clone()))
             .expect("recoverable target has snapshotted remote");
-        let state = target_state_from_remote(&remote.status)
-            .expect("recoverable target has restorable remote status");
+        // Keep the DELETE's epoch until its adapter acknowledges the unpin.
+        // Renewal waits for a fresh reservation instead of adopting the old pin.
+        let deleting = db
+            .query_one(sea_orm::Statement::from_sql_and_values(
+                db.get_database_backend(),
+                "SELECT 1 FROM remote_pin_ledger WHERE provider=$1 AND cid=$2 AND effect='cleanup_pending'",
+                [target.provider.as_str().into(), target.cid.as_str().into()],
+            ))
+            .await?
+            .is_some();
+        let state = if deleting {
+            TARGET_QUOTA_WAITING
+        } else {
+            target_state_from_remote(&remote.status)
+                .expect("recoverable target has restorable remote status")
+        };
         let last_touched_at = target.last_touched_at.max(now).max(remote.last_touched_at);
 
         #[cfg(test)]
@@ -4154,6 +4220,7 @@ async fn restore_snapshot_targets<C: ConnectionTrait>(
         if updated.rows_affected != 1 {
             return Err(stale_renewal_error());
         }
+        target.state = state.to_owned();
         restored.push(target.id.clone());
     }
     Ok(restored)
@@ -4877,6 +4944,7 @@ pub(in crate::store::pinning) async fn evict_provider_cids_core<C: ConnectionTra
 
     // Phase 2: target transitions use the original snapshot in stable `(created_at, id)` order.
     // The caller-provided transaction must roll back if a target CAS is stale after a lease CAS.
+    let mut last_evicted = BTreeMap::new();
     for desired in &targets {
         let target = &desired.target;
 
@@ -4900,6 +4968,10 @@ pub(in crate::store::pinning) async fn evict_provider_cids_core<C: ConnectionTra
         if updated.rows_affected != 1 {
             return Err(stale_lifecycle_error("eviction target"));
         }
+        last_evicted.insert(
+            (target.provider.as_str(), target.cid.as_str()),
+            target.id.as_str(),
+        );
     }
     // A lease-generation bump must not strand a non-evicted all-mode sibling behind an old
     // target-scoped Submit/Poll generation. Reproject every sibling while its complete frontier
@@ -4918,14 +4990,14 @@ pub(in crate::store::pinning) async fn evict_provider_cids_core<C: ConnectionTra
         )
         .await?;
     }
-    for (provider, cid) in &pairs {
+    for ((provider, cid), target_id) in last_evicted {
         if let Some(epoch) = bump_remote_epoch(db, provider, cid, now).await? {
             let session = SharedDecodeBudget::default();
             schedule_after_desired_change_core(
                 db,
-                provider,
-                cid,
+                (provider, cid),
                 epoch,
+                Some(target_id),
                 now,
                 DecodeWork::shared(&session),
                 runtime,
@@ -7168,7 +7240,7 @@ async fn end_leases_core<C: ConnectionTrait>(
 ) -> AppResult<()> {
     work.with(|work| work.nodes(2 + leases.len()))
         .map_err(work_error)?;
-    let mut pairs = BTreeSet::new();
+    let mut last_released = BTreeMap::new();
     let mut ordered_leases: Vec<_> = leases
         .iter()
         .filter(|lease| lease.state == LEASE_ACTIVE)
@@ -7230,28 +7302,26 @@ async fn end_leases_core<C: ConnectionTrait>(
     }
     targets.sort_by(compare_target_order);
     for target in targets {
-        if is_desired_target_state(&target.state) || target.state == "error" {
-            work.copy(&(&target.provider, &target.cid))
-                .map_err(work_error)?;
-            pairs.insert((target.provider.clone(), target.cid.clone()));
-        }
-        if target.state == "error" {
-            continue;
-        }
-
         #[cfg(test)]
         record_target_cas(&target.id).await;
 
-        pin_lease_target::Entity::update_many()
+        let updated = pin_lease_target::Entity::update_many()
             .col_expr(
                 pin_lease_target::Column::State,
                 Expr::value(target_state.to_owned()),
             )
             .filter(pin_lease_target::Column::Id.eq(&target.id))
+            .filter(pin_lease_target::Column::State.eq(&target.state))
             .exec(db)
             .await?;
+        if updated.rows_affected != 1 {
+            return Err(stale_lifecycle_error("ending target"));
+        }
+        if is_desired_target_state(&target.state) || target.state == "error" {
+            last_released.insert((target.provider, target.cid), target.id);
+        }
     }
-    for (provider, cid) in pairs {
+    for ((provider, cid), target_id) in last_released {
         if let Some(remote) =
             records::current_model::<remote_pin::Entity, _>(db, &[&provider, &cid], work)
                 .await
@@ -7260,8 +7330,16 @@ async fn end_leases_core<C: ConnectionTrait>(
             let epoch = bump_snapshotted_remote_epoch(db, &remote, now)
                 .await
                 .map_err(confirmed_renewal_error)?;
-            schedule_after_desired_change_core(db, &provider, &cid, epoch, now, work, runtime)
-                .await?;
+            schedule_after_desired_change_core(
+                db,
+                (&provider, &cid),
+                epoch,
+                Some(&target_id),
+                now,
+                work,
+                runtime,
+            )
+            .await?;
         }
     }
     Ok(())
@@ -7293,14 +7371,14 @@ async fn schedule_after_desired_change_with_work<C: ConnectionTrait>(
     now: DateTimeUtc,
     work: DecodeWork<'_>,
 ) -> AppResult<()> {
-    schedule_after_desired_change_core(db, provider, cid, epoch, now, work, None).await
+    schedule_after_desired_change_core(db, (provider, cid), epoch, None, now, work, None).await
 }
 
 async fn schedule_after_desired_change_core<C: ConnectionTrait>(
     db: &C,
-    provider: &str,
-    cid: &str,
+    (provider, cid): (&str, &str),
     epoch: i64,
+    last_target: Option<&str>,
     now: DateTimeUtc,
     work: DecodeWork<'_>,
     runtime: Option<&crate::store::RuntimeTransaction>,
@@ -7325,10 +7403,21 @@ async fn schedule_after_desired_change_core<C: ConnectionTrait>(
         let NewPinJob::Remote(job) = jobs::unpin_job(provider, cid, epoch, now) else {
             unreachable!("unpin constructor is remote scoped")
         };
-        match runtime {
+        work.copy(&job.id).map_err(work_error)?;
+        let job_id = job.id.clone();
+        let inserted = match runtime {
             Some(tx) => jobs::insert_runtime_job(tx, NewPinJob::Remote(job), now, work).await?,
             None => jobs::insert_new_job_with_work(db, NewPinJob::Remote(job), now, work).await?,
         };
+        if inserted && let Some(target_id) = last_target {
+            work.copy(&target_id).map_err(work_error)?;
+            db.execute(sea_orm::Statement::from_sql_and_values(
+                db.get_database_backend(),
+                "INSERT INTO pin_cleanup_job_targets(job_id,target_id) VALUES ($1,$2) ON CONFLICT(job_id) DO NOTHING",
+                [job_id.into(), target_id.into()],
+            ))
+            .await?;
+        }
     }
     Ok(())
 }
@@ -9229,65 +9318,6 @@ mod tests {
                 .await
                 .unwrap(),
             1
-        );
-    }
-
-    #[tokio::test]
-    async fn limits_aware_projection_surfaces_evictions_without_reserving_or_submitting() {
-        let db = setup().await;
-        seed_remote(&db, "pinata", "bafy-held", "pinned", Some("held"), 1).await;
-        seed_lease_target(
-            &db,
-            "lease-held",
-            "automatic",
-            "all",
-            "active",
-            1,
-            "target-held",
-            "pinata",
-            "bafy-held",
-            "pinned",
-            time(100),
-        )
-        .await;
-        seed_absent_remote_without_usage(&db, "pinata", "bafy-wait", 4).await;
-        seed_lease_target(
-            &db,
-            "lease-wait",
-            "quota-wait",
-            "all",
-            "active",
-            1,
-            "target-wait",
-            "pinata",
-            "bafy-wait",
-            "waiting",
-            time(100),
-        )
-        .await;
-
-        let result =
-            project_target_from_remote_with_limits(&db, "target-wait", &limits(100, 1), time(1))
-                .await
-                .unwrap();
-        assert_eq!(result.projection, TargetProjection::QuotaWaiting);
-        assert!(matches!(
-            result.reservation,
-            Some(ReservationOutcome::QuotaWaiting { ref evict })
-                if evict == &vec![("pinata".to_owned(), "bafy-held".to_owned())]
-        ));
-        assert_eq!(usage(&db, "pinata").await, (100, 1));
-        assert_eq!(remote(&db, "pinata", "bafy-wait").await.status, "absent");
-        assert_eq!(target_state(&db, "target-wait").await, "quota_waiting");
-        assert!(
-            pin_job::Entity::find()
-                .filter(pin_job::Column::Provider.eq("pinata"))
-                .filter(pin_job::Column::Cid.eq("bafy-wait"))
-                .filter(pin_job::Column::Operation.eq("submit"))
-                .one(&db)
-                .await
-                .unwrap()
-                .is_none()
         );
     }
 
@@ -11399,6 +11429,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn last_released_reference_owns_cleanup_even_when_it_ended_in_error() {
+        let db = setup().await;
+        let cid = "shared-release";
+        seed_remote(&db, "pinata", cid, "pinned", Some("request"), 1).await;
+        for (lease, state) in [("a", "pinned"), ("b", "pinned"), ("c", "error")] {
+            seed_lease_target(
+                &db,
+                lease,
+                lease,
+                "all",
+                "active",
+                1,
+                lease,
+                "pinata",
+                cid,
+                state,
+                time(20),
+            )
+            .await;
+        }
+        db.execute_unprepared(
+            "UPDATE pin_lease_targets SET last_error='remote failed' WHERE id='c'",
+        )
+        .await
+        .unwrap();
+        let tx = db.begin().await.unwrap();
+        cancel_lease(&tx, "a", time(1)).await.unwrap();
+        assert_eq!(
+            pin_job::Entity::find()
+                .filter(pin_job::Column::Operation.eq("unpin"))
+                .count(&tx)
+                .await
+                .unwrap(),
+            0
+        );
+        end_active_leases_for_object(&tx, "object-1", time(2))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let links = db.query_all(sea_orm::Statement::from_string(db.get_database_backend(),
+            "SELECT j.expected_remote_epoch, t.target_id FROM pin_cleanup_job_targets t JOIN pin_jobs j ON j.id=t.job_id WHERE j.operation='unpin'",
+        )).await.unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].try_get::<String>("", "target_id").unwrap(), "c");
+        assert_eq!(
+            links[0]
+                .try_get::<i64>("", "expected_remote_epoch")
+                .unwrap(),
+            3
+        );
+        let last = pin_lease_target::Entity::find_by_id("c")
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (last.state.as_str(), last.last_error.as_deref()),
+            ("released", Some("remote failed"))
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_renewal_during_delete_waits_for_confirmed_release() {
+        let db = setup().await;
+        let cid = "deleting";
+        let identity =
+            crate::pinning::identity::ProviderIdentity::legacy("pinata", "psa", None, "psa", "cid");
+        ledger::register_route(&db, "pinata", &identity)
+            .await
+            .unwrap();
+        seed_remote(&db, "pinata", cid, "pinned", Some("request"), 1).await;
+        ledger::capture_reservation(&db, "pinata", cid)
+            .await
+            .unwrap();
+        seed_lease_target(
+            &db,
+            "lease",
+            "manual",
+            "all",
+            "active",
+            1,
+            "target",
+            "pinata",
+            cid,
+            "pinned",
+            time(1),
+        )
+        .await;
+        expire_due_leases(&db, time(2)).await.unwrap();
+        ledger::mark_effect(&db, "pinata", cid, "cleanup_pending")
+            .await
+            .unwrap();
+        let tx = db.begin().await.unwrap();
+        let renewal = renew_manual_lease(&tx, "object-1", "lease", time(20), time(3))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert!(matches!(
+            renewal,
+            ManualLeaseRenewalOutcome::Reactivated { generation: 3, .. }
+        ));
+        assert_eq!(target_state(&db, "target").await, "quota_waiting");
+        assert_eq!(remote(&db, "pinata", cid).await.epoch, 2);
+        assert_eq!(usage(&db, "pinata").await, (100, 1));
+        let tx = db.begin().await.unwrap();
+        assert_eq!(
+            complete_remote_delete(&tx, "pinata", cid, 2, time(4))
+                .await
+                .unwrap(),
+            RemoteDeleteCompletion::Released
+        );
+        assert_eq!(
+            wake_quota_waiting_targets(&tx, "pinata", &limits(100, 1)["pinata"], time(4))
+                .await
+                .unwrap(),
+            ["target"]
+        );
+        tx.commit().await.unwrap();
+        assert_eq!(target_state(&db, "target").await, "waiting");
+        assert!(remote(&db, "pinata", cid).await.request_id.is_none());
+        assert_eq!(usage(&db, "pinata").await, (100, 1));
+    }
+
+    #[tokio::test]
     async fn cancellation_expiry_and_eviction_bump_each_affected_remote_once() {
         let db = setup().await;
         seed_remote(&db, "pinata", "bafy-cancel", "pinned", Some("r1"), 1).await;
@@ -11458,6 +11612,20 @@ mod tests {
             time(100),
         )
         .await;
+        seed_lease_target(
+            &db,
+            "lease-evict-shared",
+            "manual",
+            "one",
+            "active",
+            1,
+            "target-evict-shared",
+            "pinata",
+            "bafy-evict",
+            "pinned",
+            time(100),
+        )
+        .await;
         assert_eq!(
             evict_provider_cid(&db, "pinata", "bafy-evict", time(2))
                 .await
@@ -11465,6 +11633,14 @@ mod tests {
             GenerationDecision::Current
         );
         assert_eq!(remote(&db, "pinata", "bafy-evict").await.epoch, 2);
+        let owner = db.query_one(sea_orm::Statement::from_string(
+            db.get_database_backend(),
+            "SELECT target_id FROM pin_cleanup_job_targets WHERE job_id='unpin:pinata:bafy-evict:e2'",
+        )).await.unwrap().unwrap();
+        assert_eq!(
+            owner.try_get::<String>("", "target_id").unwrap(),
+            "target-evict-shared"
+        );
     }
 
     #[tokio::test]
@@ -12848,6 +13024,40 @@ mod tests {
         ))
         .await
         .unwrap();
+        let cid = "bafy-resubmit-order";
+        let identity =
+            crate::pinning::identity::ProviderIdentity::legacy("pinata", "psa", None, "psa", "cid");
+        ledger::register_route(&db, "pinata", &identity)
+            .await
+            .unwrap();
+        ledger::capture_reservation(&db, "pinata", cid)
+            .await
+            .unwrap();
+        db.execute_unprepared("INSERT INTO pin_cleanup_ownership(provider,cid,route,request_id) SELECT provider,cid,route,'failed-request' FROM remote_pin_ledger WHERE cid='bafy-resubmit-order'").await.unwrap();
+        let store = crate::store::Store::new(db.clone());
+        let budget = SharedDecodeBudget::default();
+        let tx = store
+            .begin_runtime(DecodeWork::shared(&budget))
+            .await
+            .unwrap();
+        assert_eq!(
+            prepare_runtime_failed_remote_resubmit(
+                &tx,
+                "pinata",
+                cid,
+                6,
+                "failed-request",
+                time(1)
+            )
+            .await
+            .unwrap(),
+            FailedRemoteResubmitDecision::Stale
+        );
+        assert!(
+            ledger::cleanup_allowed(tx.db(), "pinata", cid)
+                .await
+                .unwrap()
+        );
         start_lifecycle_order_recording(
             &["lease-a-resubmit-order", "lease-z-resubmit-order"],
             &["target-z-resubmit-first", "target-a-resubmit-later"],
@@ -12856,8 +13066,8 @@ mod tests {
         .await;
 
         assert!(matches!(
-            prepare_failed_remote_resubmit(
-                &db,
+            prepare_runtime_failed_remote_resubmit(
+                &tx,
                 "pinata",
                 "bafy-resubmit-order",
                 7,
@@ -12891,6 +13101,22 @@ mod tests {
                 ),
             ]
         );
+        tx.commit().await.unwrap();
+        let archived =
+            pin_resource_history::Entity::find_by_id(("pinata".to_owned(), cid.to_owned(), 7))
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+        let evidence: serde_json::Value = serde_json::from_str(&archived.ledger).unwrap();
+        assert_eq!(evidence["unpin_accepted"], true);
+        assert_eq!(evidence["confirmed_absent"], false);
+        db.execute_unprepared(
+            "UPDATE remote_pins SET request_id='failed-request' WHERE cid='bafy-resubmit-order'",
+        )
+        .await
+        .unwrap();
+        assert!(!ledger::cleanup_allowed(&db, "pinata", cid).await.unwrap());
     }
 
     #[tokio::test]

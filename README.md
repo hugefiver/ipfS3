@@ -867,19 +867,21 @@ complete example in `config.example.toml`. `config_name` joins the existing
    `pinata-legacy`, `pinata-psa`, `filebase-psa`, `kubo`, `filebase-rpc`, or `noop`;
    `strategy` must match the configured strategy (RPC also supports Kubo CAR).
    No implicit strategy fallback is added.
-- `cleanup` defaults to **`retain`** for explicit identities. Setting `managed`
-  requests cleanup only for independently proven application-created resources
-  in that scope. A PSA request ID or matching CID alone is not exclusive creation
-  proof; those resources remain unknown and retained, even in managed mode.
-  It never authorizes deleting external-existing or unknown resources.
-  Cleanup policy is captured for each resource, not retroactively replaced by
-  editing TOML. `retired = true` prevents new allocations while keeping the
-  configured route available for historical work. Do not remove its credentials
-  while reconciliation/cleanup is still required.
+- After the last reference, cleanup uses the original independent storage domain.
+  For Kubo/Filebase RPC, Cluster and Pinata legacy, a matching gateway submit
+  receipt authorizes removing the CID from that backup node, including any
+  independent pin of the same CID there. A CID seen only by lookup, an adopted
+  request or an unproven historical ownership label remains visible and charged.
+  Old `cleanup = "retain"` and `"managed"` values are accepted and ignored.
+  PSA deletes by request ID. Pinata v3 cancels the original queue request or
+  deletes its associated file ID. An accepted unpin (including HTTP 202) releases
+  local quota. The gateway does not poll for physical removal or trigger GC.
+  `retired = true` prevents new allocations while keeping the configured route
+  available for historical work. Keep its credentials until cleanup is complete.
 
 Provider aliases in the same backend/scope/resource namespace share remote rows,
 locks and quota. They must agree on limits, protocol/strategy, revisions, storage
-domain and cleanup. The lexically first stable provider ID is the representative;
+domain. The lexically first stable provider ID is the representative;
 keep that historical ID configured (renaming it is fine). Removing it or replacing
 it with another alias is not an ownership migration. Different objects referencing
 one CID retain independent lease deadlines and share one physical reservation.
@@ -1111,9 +1113,8 @@ RPC requires an explicit stable `provider_id`, `backend`, `scope`, independent
 The identity's profile and strategy must match its route. Scope is an
 administrator assertion, not inferred from a URL or credential. Bump revisions
 when credentials (including a Basic username) or endpoints change, and use a new
-scope for another account/pinset. `cleanup` defaults to `retain`. A successful
-add/import, recursive pin, receipt or matching CID doesn't prove
-`ApplicationCreated` ownership or grant delete authority, even with `managed`.
+scope for another account/pinset. A successful add/import, recursive pin or
+matching CID alone does not prove `ApplicationCreated` ownership.
 
 Secrets are environment references only. `token_env` on the provider names the
 Bearer token or Basic password variable; Basic also uses `username_env` on the

@@ -102,7 +102,7 @@ fn independent_kubo_all_strategies_and_auth_profiles_build_without_network_io() 
             assert_eq!(p.kind, ProviderKind::IpfsRpc);
             assert_eq!(p.identity.backend, "kubo");
             assert_eq!(p.identity.resource_type(), RemoteResourceType::RpcPin);
-            assert_eq!(p.identity.cleanup, CleanupMode::Retain);
+            assert_eq!(p.identity.cleanup, CleanupMode::Managed);
             assert!(!format!("{validated:?}").contains("mock-secret"));
             assert!(!format!("{validated:?}").contains("mock-user"));
             let key = p.identity.allocation_key();

@@ -114,9 +114,7 @@ pub(super) async fn reduce(
         let mut remote = unknown_remote(route.clone(), cid, epoch, inflight);
         remote.resource_id = Some(evidence.resource.request_id);
         remote.ownership = match evidence.resource.ownership {
-            crate::pinning::identity::Ownership::ApplicationCreated
-                if route.resource_type != ResourceType::RpcPin =>
-            {
+            crate::pinning::identity::Ownership::ApplicationCreated => {
                 Ownership::ApplicationCreated
             }
             crate::pinning::identity::Ownership::ExternalExisting => Ownership::ExternalExisting,

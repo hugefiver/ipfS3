@@ -753,6 +753,7 @@ async fn confirmed_release_inner<C: ConnectionTrait>(
     if let Some(row) = ledger
         && super::ledger::decode_route(&row)
             .is_some_and(|route| super::ledger::submission::is_rpc(&route))
+        && !(confirmed_delete && row.effect == "cleanup_pending")
         && (row.effect != "not_created"
             || match runtime {
                 Some((tx, work)) => {
@@ -876,11 +877,13 @@ async fn confirmed_release_inner<C: ConnectionTrait>(
     }
     match runtime {
         Some((tx, work)) => {
-            super::ledger::archive_runtime_confirmed_release(tx, &remote, work).await?;
+            super::ledger::archive_runtime_confirmed_release(tx, &remote, work, confirmed_delete)
+                .await?;
             super::ledger::mark_runtime_effect(tx, provider, cid, "absent", work).await?;
         }
         None => {
-            super::ledger::archive_confirmed_release(db, &remote).await?;
+            let row = super::ledger::get(db, &remote.provider, &remote.cid).await?;
+            super::ledger::archive_release_row(db, &remote, row, Some(confirmed_delete)).await?;
             super::ledger::mark_effect(db, provider, cid, "absent").await?;
         }
     }
