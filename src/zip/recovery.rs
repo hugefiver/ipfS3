@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use sea_orm::DatabaseConnection;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -20,6 +20,7 @@ use crate::{
 
 const LEASE_SECONDS: i64 = 600; // builder deadline is five minutes, with room for DB settlement
 const SCAN_INTERVAL: Duration = Duration::from_secs(30);
+const MAX_IN_FLIGHT: usize = 2;
 
 pub struct RecoveryWorker {
     cancel: CancellationToken,
@@ -49,16 +50,37 @@ pub fn start_worker(store: Store, kubo: KuboClient, parent: CancellationToken) -
     let join = tokio::spawn(async move {
         let mut interval = tokio::time::interval(SCAN_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut roots = JoinSet::new();
+        let mut pending = Vec::new().into_iter();
         loop {
             tokio::select! {
                 biased;
                 _ = worker_cancel.cancelled() => break,
-                _ = interval.tick() => {}
+                Some(joined) = roots.join_next(), if !roots.is_empty() => match joined {
+                    Ok(false) if pending.len() == 0 => continue,
+                    Err(error) => tracing::warn!(%error, "ZIP root recovery task failed"),
+                    _ => {}
+                },
+                _ = interval.tick(), if roots.len() < MAX_IN_FLIGHT => {}
             }
-            if let Err(error) = run_page(store.db(), &kubo, &worker_cancel).await {
-                tracing::warn!(%error, "ZIP root recovery page failed");
+            if pending.len() == 0 {
+                match durable::due_page(store.db()).await {
+                    Ok(ids) => pending = ids.into_iter(),
+                    Err(error) => {
+                        tracing::warn!(%error, "ZIP root recovery scan failed");
+                        continue;
+                    }
+                }
+            }
+            for id in pending.by_ref().take(MAX_IN_FLIGHT - roots.len()) {
+                let db = store.db().clone();
+                let kubo = kubo.clone();
+                let cancel = worker_cancel.clone();
+                roots.spawn(async move { recover_one(&db, &kubo, &cancel, id).await });
             }
         }
+        // Let builders retain known candidates under their original claims.
+        while roots.join_next().await.is_some() {}
     });
     RecoveryWorker { cancel, join }
 }
@@ -75,17 +97,28 @@ pub async fn run_page(
         if cancel.is_cancelled() {
             break;
         }
-        let worker = uuid::Uuid::new_v4().to_string();
-        let Ok(claim) = zip::claim_root(db, &id, &worker, LEASE_SECONDS).await else {
-            // Another gateway won the claim, or this batch changed since scan.
-            continue;
-        };
-        attempted += 1;
-        if let Err(error) = recover_claimed(db, kubo, cancel, &claim).await {
-            tracing::warn!(%error, batch_id = %id, "ZIP root recovery claim interrupted; lease will expire");
-        }
+        attempted += usize::from(recover_one(db, kubo, cancel, id).await);
     }
     Ok(attempted)
+}
+
+async fn recover_one(
+    db: &DatabaseConnection,
+    kubo: &KuboClient,
+    cancel: &CancellationToken,
+    id: String,
+) -> bool {
+    if cancel.is_cancelled() {
+        return false;
+    }
+    let worker = uuid::Uuid::new_v4().to_string();
+    let Ok(claim) = zip::claim_root(db, &id, &worker, LEASE_SECONDS).await else {
+        return false;
+    };
+    if let Err(error) = recover_claimed(db, kubo, cancel, &claim).await {
+        tracing::warn!(%error, batch_id = %id, "ZIP root recovery claim interrupted; lease will expire");
+    }
+    true
 }
 
 async fn recover_claimed(

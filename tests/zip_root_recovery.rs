@@ -717,13 +717,31 @@ async fn crashed_last_budgeted_attempt_is_quarantined_without_extra_root_io() {
 }
 
 #[tokio::test]
-async fn killed_worker_restarts_from_durable_intent_after_lease_expiry() {
+async fn worker_recovers_next_page_while_slow_root_waits_then_restarts_after_lease_expiry() {
     let (dir, a, b) = setup().await;
+    let page_size = zip::recovery::PAGE_SIZE;
+    let next_page_id = format!("next-{page_size:04}");
+    for index in 1..=page_size {
+        let id = format!("next-{index:04}");
+        // Invalid manifests occupy the rest of the first page; the next page is valid.
+        let key = if id == next_page_id {
+            "out/fast"
+        } else {
+            "out/mismatch"
+        };
+        a.execute_unprepared(&format!(
+            "INSERT INTO zip_batches (id,owner,source,token,fingerprint,bucket,archive_key,input_identity,captured_options,state,manifest_prepared,terminal_result,root_status,root_error_code,created_at,updated_at)
+             SELECT '{id}',owner,source,'{id}',fingerprint,bucket,archive_key,'{id}',captured_options,state,manifest_prepared,terminal_result,root_status,root_error_code,created_at,updated_at FROM zip_batches WHERE id='batch';
+             INSERT INTO zip_manifest_entries (batch_id,path,object_key,cid,size,version_row_id,created_at)
+             SELECT '{id}','fast','{key}',cid,size,'{id}',created_at FROM zip_manifest_entries WHERE batch_id='batch';"
+        )).await.unwrap();
+    }
     let kubo = MockServer::start().await;
     mock_directory(&kubo).await;
     Mock::given(method("POST"))
         .and(path("/api/v0/pin/add"))
-        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(5)))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(30)))
+        .up_to_n_times(1)
         .with_priority(1)
         .mount(&kubo)
         .await;
@@ -732,22 +750,22 @@ async fn killed_worker_restarts_from_durable_intent_after_lease_expiry() {
         KuboClient::new(kubo.uri()),
         CancellationToken::new(),
     );
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        loop {
-            if kubo
-                .received_requests()
-                .await
-                .unwrap()
-                .iter()
-                .any(|request| request.url.path() == "/api/v0/pin/add")
-            {
-                break;
-            }
+    wait_for_request(&kubo, "/api/v0/pin/add").await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while zip::read(&a, &next_page_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .root_status
+            != "complete"
+        {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     })
     .await
-    .unwrap();
+    .expect("the next page must finish while the first root is waiting for Kubo");
+    let slow = zip::snapshot(&a, "batch").await.unwrap().unwrap();
+    assert_eq!(slow.builds.last().unwrap().status, "invoked");
     let join = first.abort_for_test();
     assert!(join.await.unwrap_err().is_cancelled());
     assert_eq!(
