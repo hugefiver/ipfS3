@@ -714,7 +714,7 @@ async fn confirmed_release_inner<C: ConnectionTrait>(
     let work = runtime
         .map(|(_, work)| work)
         .unwrap_or_else(|| DecodeWork::shared(&session));
-    let error_hold = leases::active_error_hold_condition(db, provider, cid, work).await?;
+    let error_hold = leases::cleanup_hold_condition(db, provider, cid, work).await?;
     work.copy(&(provider, cid)).map_err(admission::work_error)?;
     let held = sea_orm::sea_query::Query::select()
         .expr(Expr::value(1))

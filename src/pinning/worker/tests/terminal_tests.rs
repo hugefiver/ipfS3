@@ -544,12 +544,12 @@ async fn active_error_no_request_hold_uses_persistent_tables_and_releases_after_
     tx.execute_unprepared("CREATE TEMP TABLE pin_leases AS SELECT * FROM main.pin_leases WHERE 0; CREATE TEMP TABLE pin_lease_targets AS SELECT * FROM main.pin_lease_targets WHERE 0").await.unwrap();
     let budget = SharedDecodeBudget::default();
     assert!(
-        leases::has_active_error_hold(&tx, "noop", "bafy-worker", DecodeWork::shared(&budget))
+        leases::target_holds_cleanup(&tx, "noop", "bafy-worker", DecodeWork::shared(&budget))
             .await
             .unwrap()
     );
     assert!(
-        !leases::has_active_error_hold(&tx, "noop", "other-cid", DecodeWork::shared(&budget))
+        !leases::target_holds_cleanup(&tx, "noop", "other-cid", DecodeWork::shared(&budget))
             .await
             .unwrap()
     );

@@ -134,7 +134,7 @@ impl<'a> CompletionReader<'a> {
             return Ok(false);
         }
         if matches!(call, ManagedCall::Cleanup)
-            && crate::store::pinning::leases::has_active_error_hold(
+            && crate::store::pinning::leases::target_holds_cleanup(
                 &self.catalog(),
                 &self.job.provider,
                 &self.job.cid,

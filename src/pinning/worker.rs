@@ -626,14 +626,15 @@ async fn expire_worker_leases(
     cursor: &mut String,
     limit: u64,
 ) -> AppResult<()> {
-    let ids = leases::due_runtime_lease_ids(store.db(), now, cursor, limit).await?;
+    let candidates = leases::due_runtime_leases(store.db(), now, cursor, limit).await?;
     let mut expired = 0;
-    for id in &ids {
+    for (id, generation) in &candidates {
         let result = async {
             let session = SharedDecodeBudget::default();
             let work = DecodeWork::shared(&session);
             let txn = store.begin_runtime(work).await?;
-            let changed = leases::expire_runtime_due_lease(&txn, id, now, work).await?;
+            let changed =
+                leases::expire_runtime_due_lease(&txn, id, *generation, now, work).await?;
             txn.commit().await?;
             Ok::<_, AppError>(changed)
         }
@@ -644,8 +645,12 @@ async fn expire_worker_leases(
             Err(error) => tracing::error!(lease_id = %id, %error, "pinning lease expiry failed"),
         }
     }
-    *cursor = if ids.len() as u64 == limit {
-        ids.into_iter().last().unwrap_or_default()
+    *cursor = if candidates.len() as u64 == limit {
+        candidates
+            .into_iter()
+            .last()
+            .map(|(id, _)| id)
+            .unwrap_or_default()
     } else {
         String::new()
     };
@@ -3936,7 +3941,7 @@ async fn reconcile_without_desired(
                 )
                 .await?,
                 leases::GenerationDecision::Current
-            ) && leases::has_active_error_hold(
+            ) && leases::target_holds_cleanup(
                 &txn.catalog(DecodeWork::shared(&work)),
                 &claimed.model.provider,
                 &claimed.model.cid,
@@ -6275,6 +6280,7 @@ async fn postgres_completion_rejects_an_interleaved_authority_mutation() {
 
 #[cfg(test)]
 mod tests {
+    mod expiry_tests;
     mod heartbeat_transaction_tests;
     mod missing_runtime_tests;
     mod postgres_tests;

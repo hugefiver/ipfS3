@@ -1649,7 +1649,7 @@ async fn cleanup_from_candidates_core(
     candidates: Option<super::management::records::locator::AuthorityView>,
     catalog: super::legacy_migration::ReceiptCatalog<'_>,
 ) -> AppResult<bool> {
-    if super::leases::has_active_error_hold(&catalog, provider, cid, work).await? {
+    if super::leases::target_holds_cleanup(&catalog, provider, cid, work).await? {
         return Ok(false);
     }
     let row = if let Some(candidates) = candidates {

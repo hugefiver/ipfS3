@@ -441,8 +441,42 @@ async fn worker_kubo_cid_keeps_exact_api_and_unknown_ownership_without_double_co
         serde_json::from_str(&evidence[0].resources).unwrap();
     assert_eq!(roots[0].resource.ownership, Ownership::Unknown);
     fixture.assert_held().await;
-    assert!(source.received_requests().await.unwrap().is_empty());
     no_delete(&target).await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/v0/pin/rm"))
+        .and(query_param("arg", CID))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"Pins":[CID]})))
+        .expect(1)
+        .mount(&target)
+        .await;
+    let now = Utc::now();
+    pin_lease::Entity::update_many()
+        .col_expr(pin_lease::Column::ExpiresAt, Expr::value(now))
+        .exec(fixture.store.db())
+        .await
+        .unwrap();
+    expire_worker_leases(&fixture.store, now, &mut String::new(), 1)
+        .await
+        .unwrap();
+    fixture.drain().await;
+    assert_eq!(
+        ledger::get(fixture.store.db(), &fixture.provider, CID)
+            .await
+            .unwrap()
+            .unwrap()
+            .effect,
+        "absent"
+    );
+    assert_eq!(
+        store_quota::read_usage(fixture.store.db(), &fixture.provider)
+            .await
+            .unwrap()
+            .unwrap()
+            .reserved_pins,
+        0
+    );
+    assert!(source.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]

@@ -112,7 +112,9 @@ pub async fn delete<C: ConnectionTrait + TransactionTrait>(db: &C, name: &str) -
                 .one(txn)
                 .await?
                 .is_some();
-            if has_versions {
+            if has_versions
+                || super::pinning::leases::bucket_has_expiry_in_progress(txn, &name).await?
+            {
                 return Err(AppError::BucketNotEmpty(name));
             }
 
@@ -509,6 +511,12 @@ mod tests {
             .await
             .unwrap();
 
+        db.execute_unprepared("INSERT INTO pin_leases (id,owner_object_id,source,policy_id,provider_mode,content_mode,created_at,last_touched_at,expires_at,generation,state) VALUES ('ending','legacy-hidden','manual','p','all','object',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,2,'expired');
+            INSERT INTO pin_lease_targets (id,lease_id,cid,logical_size,provider,state,created_at,last_touched_at) VALUES ('remaining','ending','cid',7,'side','pinned',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+        assert_not_empty(&db, "legacy-bucket").await;
+        db.execute_unprepared("UPDATE pin_lease_targets SET state='released' WHERE id='remaining'")
+            .await
+            .unwrap();
         delete(&db, "legacy-bucket").await.unwrap();
 
         assert!(!exists(&db, "legacy-bucket").await.unwrap());

@@ -698,6 +698,8 @@ pub enum RenewManualLeaseError {
     NotLatestOwner,
     #[error("manual lease state cannot be renewed")]
     InvalidState,
+    #[error("expired manual lease still has targets being released")]
+    ExpiryInProgress,
     #[error("expired manual lease has no recoverable remote reservation")]
     NoRecoverableReservation,
     #[error(transparent)]
@@ -2796,7 +2798,7 @@ async fn complete_no_request_remote_absence_core<C: ConnectionTrait>(
     let work = runtime
         .map(|(_, work)| work)
         .unwrap_or_else(|| DecodeWork::shared(&session));
-    if has_active_error_hold(db, provider, cid, work).await? {
+    if target_holds_cleanup(db, provider, cid, work).await? {
         return Ok(NoRequestRemoteCompletion::Stale);
     }
     if !guard_reconcile_remote_epoch(db, provider, cid, expected_remote_epoch).await?
@@ -3793,6 +3795,22 @@ async fn renewal_snapshot_inner<C: ConnectionTrait>(
     else {
         return Err(RenewManualLeaseError::NotLatestOwner);
     };
+    if lease.owner_object_id != owner_object_id {
+        return Err(RenewManualLeaseError::NotLatestOwner);
+    }
+    if lease.state == LEASE_EXPIRED
+        && pin_lease_target::Entity::find()
+            .select_only()
+            .column(pin_lease_target::Column::Id)
+            .filter(pin_lease_target::Column::LeaseId.eq(lease_id))
+            .filter(Expr::cust(RELEASABLE_TARGETS))
+            .into_tuple::<String>()
+            .one(db)
+            .await?
+            .is_some()
+    {
+        return Err(RenewManualLeaseError::ExpiryInProgress);
+    }
     for _ in 0..2 {
         work.copy(lease_id).map_err(renewal_work_error)?;
     }
@@ -4774,17 +4792,39 @@ pub async fn expire_due_leases<C: ConnectionTrait>(
     Ok(ids)
 }
 
-pub(crate) async fn due_runtime_lease_ids<C: ConnectionTrait>(
+const RELEASABLE_TARGETS: &str =
+    "state IN ('waiting','submitted','pinned','degraded','quota_waiting','quota_blocked','error')";
+const EXPIRY_PAGE_SIZE: usize = 16;
+
+pub(crate) async fn bucket_has_expiry_in_progress<C: ConnectionTrait>(
+    db: &C,
+    bucket: &str,
+) -> AppResult<bool> {
+    let query = sea_orm::Statement::from_sql_and_values(
+        db.get_database_backend(),
+        format!(
+            "SELECT 1 FROM objects o JOIN pin_leases l ON l.owner_object_id=o.id WHERE o.bucket=$1 AND l.state='expired' AND EXISTS (SELECT 1 FROM pin_lease_targets WHERE lease_id=l.id AND {RELEASABLE_TARGETS}) LIMIT 1"
+        ),
+        [bucket.into()],
+    );
+    Ok(db.query_one(query).await?.is_some())
+}
+
+pub(crate) async fn due_runtime_leases<C: ConnectionTrait>(
     db: &C,
     now: DateTimeUtc,
     after: &str,
     limit: u64,
-) -> AppResult<Vec<String>> {
+) -> AppResult<Vec<(String, i64)>> {
     Ok(pin_lease::Entity::find()
         .select_only()
         .column(pin_lease::Column::Id)
-        .filter(pin_lease::Column::State.eq(LEASE_ACTIVE))
-        .filter(pin_lease::Column::ExpiresAt.lte(now))
+        .column(pin_lease::Column::Generation)
+        .filter(Condition::any()
+            .add(Condition::all().add(pin_lease::Column::State.eq(LEASE_ACTIVE)).add(pin_lease::Column::ExpiresAt.lte(now)))
+            .add(Condition::all().add(pin_lease::Column::State.eq(LEASE_EXPIRED)).add(Expr::cust(format!(
+                "EXISTS (SELECT 1 FROM pin_lease_targets WHERE lease_id=pin_leases.id AND {RELEASABLE_TARGETS})"
+            )))))
         .filter(pin_lease::Column::Id.gt(after))
         .order_by_asc(pin_lease::Column::Id)
         .limit(limit)
@@ -4796,13 +4836,22 @@ pub(crate) async fn due_runtime_lease_ids<C: ConnectionTrait>(
 pub(crate) async fn expire_runtime_due_lease(
     tx: &crate::store::RuntimeTransaction,
     id: &str,
+    generation: i64,
     now: DateTimeUtc,
     work: DecodeWork<'_>,
 ) -> AppResult<bool> {
     super::management::admission::lock_sqlite_writer_in_caller_transaction(tx.db()).await?;
     let query = pin_lease::Entity::find_by_id(id)
-        .filter(pin_lease::Column::State.eq(LEASE_ACTIVE))
-        .filter(pin_lease::Column::ExpiresAt.lte(now));
+        .filter(pin_lease::Column::Generation.eq(generation))
+        .filter(
+            Condition::any()
+                .add(
+                    Condition::all()
+                        .add(pin_lease::Column::State.eq(LEASE_ACTIVE))
+                        .add(pin_lease::Column::ExpiresAt.lte(now)),
+                )
+                .add(pin_lease::Column::State.eq(LEASE_EXPIRED)),
+        );
     let query = if tx.get_database_backend() == DatabaseBackend::Postgres {
         query.lock_with_behavior(
             sea_orm::sea_query::LockType::Update,
@@ -4814,17 +4863,20 @@ pub(crate) async fn expire_runtime_due_lease(
     let Some(lease) = query.one(tx.db()).await? else {
         return Ok(false);
     };
-    end_leases_core(
+    let newly_expired = lease.state == LEASE_ACTIVE;
+    if newly_expired {
+        end_lease_header(tx.db(), &lease, LEASE_EXPIRED, now).await?;
+    }
+    let page = records::current_models::<pin_lease_target::Entity, _>(
         tx.db(),
-        &[lease],
-        LEASE_EXPIRED,
-        TARGET_RELEASED,
-        now,
+        &format!("FROM pin_lease_targets WHERE id IN (SELECT id FROM pin_lease_targets WHERE lease_id=$1 AND {RELEASABLE_TARGETS} ORDER BY created_at,id LIMIT {EXPIRY_PAGE_SIZE})"),
+        "created_at,id",
+        vec![id.into()],
+        EXPIRY_PAGE_SIZE,
         work,
-        Some(tx),
-    )
-    .await?;
-    Ok(true)
+    ).await.map_err(work_error)?;
+    end_lease_targets(tx.db(), page, TARGET_RELEASED, now, work, Some(tx)).await?;
+    Ok(newly_expired)
 }
 
 /// Evicts a provider/CID desired set and starts unpin/reconcile work without releasing quota.
@@ -7236,7 +7288,6 @@ async fn end_leases_core<C: ConnectionTrait>(
 ) -> AppResult<()> {
     work.with(|work| work.nodes(2 + leases.len()))
         .map_err(work_error)?;
-    let mut released_pairs = BTreeSet::new();
     let mut ordered_leases: Vec<_> = leases
         .iter()
         .filter(|lease| lease.state == LEASE_ACTIVE)
@@ -7246,26 +7297,7 @@ async fn end_leases_core<C: ConnectionTrait>(
     // Complete every lease CAS before taking target rows, so callers acquire lifecycle rows in
     // one global lease → target → remote order.
     for lease in &ordered_leases {
-        #[cfg(test)]
-        record_lease_cas(&lease.id).await;
-
-        let updated = pin_lease::Entity::update_many()
-            .col_expr(pin_lease::Column::State, Expr::value(state.to_owned()))
-            .col_expr(
-                pin_lease::Column::Generation,
-                Expr::value(increment_epoch(lease.generation)?),
-            )
-            .col_expr(pin_lease::Column::LastTouchedAt, Expr::value(now))
-            .filter(pin_lease::Column::Id.eq(&lease.id))
-            .filter(pin_lease::Column::Generation.eq(lease.generation))
-            .filter(pin_lease::Column::State.eq(LEASE_ACTIVE))
-            .exec(db)
-            .await?;
-        if updated.rows_affected != 1 {
-            return Err(AppError::Database(
-                "stale lease lifecycle compare-and-set".to_owned(),
-            ));
-        }
+        end_lease_header(db, lease, state, now).await?;
     }
 
     let mut targets = Vec::new();
@@ -7297,6 +7329,46 @@ async fn end_leases_core<C: ConnectionTrait>(
         );
     }
     targets.sort_by(compare_target_order);
+    end_lease_targets(db, targets, target_state, now, work, runtime).await
+}
+
+async fn end_lease_header<C: ConnectionTrait>(
+    db: &C,
+    lease: &pin_lease::Model,
+    state: &str,
+    now: DateTimeUtc,
+) -> AppResult<()> {
+    #[cfg(test)]
+    record_lease_cas(&lease.id).await;
+    let updated = pin_lease::Entity::update_many()
+        .col_expr(pin_lease::Column::State, Expr::value(state.to_owned()))
+        .col_expr(
+            pin_lease::Column::Generation,
+            Expr::value(increment_epoch(lease.generation)?),
+        )
+        .col_expr(pin_lease::Column::LastTouchedAt, Expr::value(now))
+        .filter(pin_lease::Column::Id.eq(&lease.id))
+        .filter(pin_lease::Column::Generation.eq(lease.generation))
+        .filter(pin_lease::Column::State.eq(LEASE_ACTIVE))
+        .exec(db)
+        .await?;
+    if updated.rows_affected != 1 {
+        return Err(AppError::Database(
+            "stale lease lifecycle compare-and-set".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+async fn end_lease_targets<C: ConnectionTrait>(
+    db: &C,
+    targets: Vec<pin_lease_target::Model>,
+    target_state: &str,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+    runtime: Option<&crate::store::RuntimeTransaction>,
+) -> AppResult<()> {
+    let mut released_pairs = BTreeSet::new();
     for target in targets {
         #[cfg(test)]
         record_target_cas(&target.id).await;
@@ -7385,7 +7457,7 @@ async fn schedule_after_desired_change_core<C: ConnectionTrait>(
             ensure_reconcile_core(db, provider, cid, epoch, now, work, runtime).await?;
         }
     } else if (remote.status != REMOTE_ABSENT || remote.request_id.is_some())
-        && !has_active_error_hold(db, provider, cid, work).await?
+        && !target_holds_cleanup(db, provider, cid, work).await?
     {
         let NewPinJob::Remote(job) = jobs::unpin_job(provider, cid, epoch, now) else {
             unreachable!("unpin constructor is remote scoped")
@@ -7447,7 +7519,7 @@ async fn persistent_lease_schema<C: ConnectionTrait>(
     Ok(schema)
 }
 
-pub(crate) async fn active_error_hold_condition<C: ConnectionTrait>(
+pub(crate) async fn cleanup_hold_condition<C: ConnectionTrait>(
     db: &C,
     provider: &str,
     cid: &str,
@@ -7462,18 +7534,18 @@ pub(crate) async fn active_error_hold_condition<C: ConnectionTrait>(
             ("?", "?")
         };
     Ok(sea_orm::Condition::all().add(Expr::cust_with_values(
-        format!("EXISTS (SELECT 1 FROM {schema}.\"pin_lease_targets\" t JOIN {schema}.\"pin_leases\" l ON l.id=t.lease_id WHERE t.provider={provider_parameter} AND t.cid={cid_parameter} AND t.state='error' AND l.state='active' LIMIT 1)"),
+        format!("EXISTS (SELECT 1 FROM {schema}.\"pin_lease_targets\" t JOIN {schema}.\"pin_leases\" l ON l.id=t.lease_id WHERE t.provider={provider_parameter} AND t.cid={cid_parameter} AND ((l.state='active' AND t.state='error') OR (l.state='expired' AND t.state IN ('waiting','submitted','pinned','degraded','error'))) LIMIT 1)"),
         [provider, cid],
     )))
 }
 
-pub(crate) async fn has_active_error_hold<C: ConnectionTrait>(
+pub(crate) async fn target_holds_cleanup<C: ConnectionTrait>(
     db: &C,
     provider: &str,
     cid: &str,
     work: DecodeWork<'_>,
 ) -> AppResult<bool> {
-    let condition = active_error_hold_condition(db, provider, cid, work).await?;
+    let condition = cleanup_hold_condition(db, provider, cid, work).await?;
     let query = sea_orm::sea_query::Query::select()
         .expr(Expr::value(1))
         .cond_where(condition)
@@ -9700,6 +9772,16 @@ mod tests {
         db.execute_unprepared("UPDATE pin_leases SET state = 'expired' WHERE id = 'lease-manual'")
             .await
             .unwrap();
+        assert!(matches!(
+            renew_manual_lease(&db, "object-1", "lease-manual", time(30), time(3)).await,
+            Err(RenewManualLeaseError::ExpiryInProgress)
+        ));
+        assert_eq!(
+            quota::confirmed_release(&db, "pinata", "bafy", 2, time(3))
+                .await
+                .unwrap(),
+            quota::ConfirmedReleaseOutcome::Stale
+        );
         db.execute_unprepared(
             "UPDATE pin_lease_targets SET state = 'released' WHERE id = 'target-manual'",
         )
