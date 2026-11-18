@@ -426,6 +426,7 @@ async fn run_worker(
     let mut job_contexts: std::collections::HashMap<tokio::task::Id, JobLogContext> =
         std::collections::HashMap::new();
     let provider_occupancy = ProviderOccupancy::default();
+    let mut expiry_cursor = String::new();
     let mut receipt_cursor = String::new();
     let mut missing_receipt_cursor = String::new();
     let mut quota_waiter_scan = quota_waiter::ScanState::default();
@@ -456,27 +457,10 @@ async fn run_worker(
             let expiry = tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => break,
-                result = expire_worker_leases(&store, Utc::now()) => result,
+                result = expire_worker_leases(&store, Utc::now(), &mut expiry_cursor, settings.claim_limit) => result,
             };
             if let Err(error) = expiry {
                 tracing::error!(error = %error, "pinning worker expiry failed");
-                continue;
-            }
-            let recovery = tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => break,
-                result = async {
-                    recover_parked_receipts(&coordinator, &store, &mut receipt_cursor).await?;
-                    recover_missing_receipt_parks(
-                        &coordinator,
-                        &store,
-                        &mut missing_receipt_cursor,
-                    )
-                    .await
-                } => result,
-            };
-            if let Err(error) = recovery {
-                tracing::error!(error = %error, "pinning worker receipt recovery failed");
             }
         }
         for after_maintenance in [false, true] {
@@ -488,19 +472,30 @@ async fn run_worker(
                     biased;
                     _ = cancellation.cancelled() => break,
                     result = async {
-                        quota_waiter::coordinate_with_state(
+                        if let Err(error) = recover_parked_receipts(
+                            &coordinator, &store, &mut receipt_cursor,
+                        ).await {
+                            tracing::error!(%error, "pinning worker receipt scan failed");
+                        }
+                        if let Err(error) = recover_missing_receipt_parks(
+                            &coordinator, &store, &mut missing_receipt_cursor,
+                        ).await {
+                            tracing::error!(%error, "pinning worker missing receipt scan failed");
+                        }
+                        if let Err(error) = quota_waiter::coordinate_with_state(
                             &coordinator,
                             &store,
                             Utc::now(),
                             &mut quota_waiter_scan,
                         )
-                        .await?;
+                        .await {
+                            tracing::error!(%error, "pinning worker quota waiter scan failed");
+                        }
                         coordinate_quota_waiters(&coordinator, &store, Utc::now()).await
                     } => result,
                 };
                 if let Err(error) = maintenance {
                     tracing::error!(error = %error, "pinning worker quota maintenance failed");
-                    break;
                 }
                 while let Some(completed) = in_flight.try_join_next_with_id() {
                     handle_join_result(completed, &mut job_contexts, "pinning worker task failed");
@@ -625,18 +620,37 @@ pub async fn management_tick(
     scope.report(store).await
 }
 
-async fn expire_worker_leases(store: &Store, now: DateTime<Utc>) -> AppResult<()> {
-    let session = crate::store::pinning::management::records::SharedDecodeBudget::default();
-    let txn = store
-        .begin_runtime(crate::store::pinning::management::records::DecodeWork::shared(&session))
-        .await?;
-    let expired = leases::expire_runtime_due_leases(&txn, now).await?;
-    txn.commit().await?;
-    if !expired.is_empty() {
-        tracing::info!(
-            expired_lease_count = expired.len(),
-            "pinning leases expired"
-        );
+async fn expire_worker_leases(
+    store: &Store,
+    now: DateTime<Utc>,
+    cursor: &mut String,
+    limit: u64,
+) -> AppResult<()> {
+    let ids = leases::due_runtime_lease_ids(store.db(), now, cursor, limit).await?;
+    let mut expired = 0;
+    for id in &ids {
+        let result = async {
+            let session = SharedDecodeBudget::default();
+            let work = DecodeWork::shared(&session);
+            let txn = store.begin_runtime(work).await?;
+            let changed = leases::expire_runtime_due_lease(&txn, id, now, work).await?;
+            txn.commit().await?;
+            Ok::<_, AppError>(changed)
+        }
+        .await;
+        match result {
+            Ok(true) => expired += 1,
+            Ok(false) => (),
+            Err(error) => tracing::error!(lease_id = %id, %error, "pinning lease expiry failed"),
+        }
+    }
+    *cursor = if ids.len() as u64 == limit {
+        ids.into_iter().last().unwrap_or_default()
+    } else {
+        String::new()
+    };
+    if expired > 0 {
+        tracing::info!(expired_lease_count = expired, "pinning leases expired");
     }
     Ok(())
 }
@@ -652,9 +666,7 @@ async fn recover_parked_receipts(
         coordinator.settings().claim_limit,
     )
     .await?;
-    for job in candidates {
-        wake_parked_receipt(coordinator, store, &job).await?;
-    }
+    recover_receipt_page(coordinator, store, candidates, ReceiptRecovery::Wake).await;
     *cursor = next.unwrap_or_default();
     Ok(())
 }
@@ -670,11 +682,55 @@ async fn recover_missing_receipt_parks(
         coordinator.settings().claim_limit,
     )
     .await?;
-    for job in candidates {
-        reset_missing_receipt_job(coordinator, store, &job).await?;
-    }
+    recover_receipt_page(
+        coordinator,
+        store,
+        candidates,
+        ReceiptRecovery::ResetMissing,
+    )
+    .await;
     *cursor = next.unwrap_or_default();
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ReceiptRecovery {
+    Wake,
+    ResetMissing,
+}
+
+async fn recover_receipt_page(
+    coordinator: &PinningCoordinator,
+    store: &Store,
+    candidates: Vec<String>,
+    recovery: ReceiptRecovery,
+) {
+    for id in candidates {
+        let result = async {
+            let mut parked = pin_job::Entity::find_by_id(&id)
+                .filter(pin_job::Column::Operation.eq("submit"))
+                .filter(pin_job::Column::State.eq("running"))
+                .filter(pin_job::Column::LockedUntil.is_null())
+                .filter(pin_job::Column::SubmitPhase.eq("recovering"));
+            if matches!(recovery, ReceiptRecovery::ResetMissing) {
+                parked = parked
+                    .filter(pin_job::Column::LastError.eq(jobs::RPC_MISSING_RECEIPT_PARK_REASON));
+            }
+            if let Some(job) = parked.one(store.db()).await? {
+                match recovery {
+                    ReceiptRecovery::Wake => wake_parked_receipt(coordinator, store, &job).await?,
+                    ReceiptRecovery::ResetMissing => {
+                        reset_missing_receipt_job(coordinator, store, &job).await?;
+                    }
+                }
+            }
+            Ok::<_, AppError>(())
+        }
+        .await;
+        if let Err(error) = result {
+            tracing::error!(job_id = %id, ?recovery, %error, "pinning receipt recovery failed");
+        }
+    }
 }
 
 async fn reset_missing_receipt_job(
@@ -5624,7 +5680,7 @@ async fn coordinate_quota_waiters(
         };
         if store.db().query_one(sea_orm::Statement::from_sql_and_values(
             store.db().get_database_backend(),
-            format!("SELECT 1 FROM {target_table} WHERE provider=$1 AND state IN ('quota_waiting','evicted') LIMIT 1"),
+            format!("SELECT 1 FROM {target_table} WHERE provider=$1 AND state IN ('quota_waiting','quota_blocked','evicted') LIMIT 1"),
             [provider.clone().into()],
         )).await?.is_none()
         {
@@ -7462,7 +7518,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tick_dispatches_due_work_after_expiry_commit_before_blocked_quota_maintenance() {
+    async fn tick_dispatches_due_work_after_isolated_expiry_before_blocked_quota_maintenance() {
         let blocker = Arc::new(GetBlocker {
             entered: Notify::new(),
             release: Notify::new(),
@@ -7486,7 +7542,9 @@ mod tests {
             .store
             .db()
             .execute_unprepared(&format!(
-                "UPDATE pin_leases SET expires_at='{}' WHERE id='lease-tick-expired'",
+                "UPDATE pin_leases SET expires_at='{}' WHERE id IN ('lease-1','lease-tick-expired'); \
+                 CREATE TRIGGER reject_one_expiry BEFORE UPDATE OF state ON pin_leases \
+                 WHEN OLD.id='lease-1' AND NEW.state='expired' BEGIN SELECT RAISE(ABORT,'expiry unavailable'); END",
                 due.to_rfc3339(),
             ))
             .await
@@ -7536,6 +7594,58 @@ mod tests {
         .await;
         assert_eq!(tick_waiter_state(&fixture, "tick-waiter").await, "waiting");
         handle.shutdown(std::time::Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn tick_expiry_rotates_past_a_failed_first_page_and_revisits_after_repair() {
+        let fixture = fixture([]).await;
+        let now = Utc::now();
+        fixture.seed_poll("rotate", now).await;
+        let db = fixture.store.db();
+        db.execute_unprepared("UPDATE pin_leases SET expires_at='2000-01-01T00:00:00+00:00' WHERE id IN ('lease-1','lease-rotate'); \
+            CREATE TRIGGER reject_first BEFORE UPDATE OF state ON pin_leases WHEN OLD.id='lease-1' \
+            BEGIN SELECT RAISE(ABORT,'cannot expire this lease'); END").await.unwrap();
+        let mut cursor = String::new();
+        for _ in 0..2 {
+            super::expire_worker_leases(&fixture.store, now, &mut cursor, 1)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            pin_lease::Entity::find_by_id("lease-rotate")
+                .one(db)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "expired"
+        );
+        assert_eq!(
+            pin_lease::Entity::find_by_id("lease-1")
+                .one(db)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "active"
+        );
+        db.execute_unprepared("DROP TRIGGER reject_first")
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            super::expire_worker_leases(&fixture.store, now, &mut cursor, 1)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            pin_lease::Entity::find_by_id("lease-1")
+                .one(db)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "expired"
+        );
     }
 
     #[tokio::test]
@@ -9276,7 +9386,7 @@ mod tests {
             let mut rounds = Vec::new();
             for tick in 0..5 {
                 let now = Utc::now() + chrono::Duration::seconds(tick * 60);
-                super::expire_worker_leases(&fixture.store, now)
+                super::expire_worker_leases(&fixture.store, now, &mut String::new(), 16)
                     .await
                     .unwrap();
                 super::coordinate_quota_waiters(&fixture.coordinator, &fixture.store, now)
@@ -12374,7 +12484,7 @@ mod tests {
         let mut served = Vec::new();
         for _ in 0..6 {
             let now = Utc::now();
-            super::expire_worker_leases(&fixture.store, now)
+            super::expire_worker_leases(&fixture.store, now, &mut String::new(), 16)
                 .await
                 .unwrap();
             super::coordinate_quota_waiters(&fixture.coordinator, &fixture.store, now)

@@ -281,7 +281,11 @@ async fn typed_postdispatch_rejection_is_debt_not_not_created_and_survives_termi
             )
             .await
             .unwrap(),
-            quota::ReservationOutcome::QuotaBlocked
+            if resources.is_empty() {
+                quota::ReservationOutcome::QuotaWaiting { evict: vec![] }
+            } else {
+                quota::ReservationOutcome::QuotaBlocked
+            }
         );
         pin_job::Entity::delete_by_id(claim.model.id.clone())
             .exec(store.db())
@@ -640,7 +644,11 @@ async fn historical_rpc_unknown_and_old_class_based_not_created_are_not_creation
                 )
                 .await
                 .unwrap(),
-                quota::ReservationOutcome::QuotaBlocked
+                if cid == CID {
+                    quota::ReservationOutcome::QuotaBlocked
+                } else {
+                    quota::ReservationOutcome::QuotaWaiting { evict: vec![] }
+                }
             );
         }
         assert!(

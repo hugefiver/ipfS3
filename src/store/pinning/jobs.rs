@@ -849,6 +849,14 @@ pub(crate) async fn terminate_claim<C: ConnectionTrait>(
     safe_reason: &str,
     now: DateTimeUtc,
 ) -> AppResult<bool> {
+    let pg = db.get_database_backend() == DatabaseBackend::Postgres;
+    if pg {
+        if !fence_job_claim(db, &claimed.model.id, claimed_lock(&claimed.model)?).await? {
+            return Ok(false);
+        }
+        // Projection writes target then job, including their table-wide revision rows.
+        mark_terminal_target(db, &claimed.model, safe_reason).await?;
+    }
     let changed = pin_job::Entity::update_many()
         .col_expr(pin_job::Column::State, Expr::value(STATE_ERROR))
         .col_expr(
@@ -865,7 +873,9 @@ pub(crate) async fn terminate_claim<C: ConnectionTrait>(
     if changed.rows_affected != 1 {
         return Ok(false);
     }
-    mark_terminal_target(db, &claimed.model, safe_reason).await?;
+    if !pg {
+        mark_terminal_target(db, &claimed.model, safe_reason).await?;
+    }
     Ok(true)
 }
 
@@ -957,6 +967,20 @@ pub(crate) async fn terminate_parked_submit<C: ConnectionTrait>(
     if job.operation != "submit" || job.state != STATE_RUNNING || job.locked_until.is_some() {
         return Ok(false);
     }
+    let pg = db.get_database_backend() == DatabaseBackend::Postgres;
+    if pg {
+        if pin_job::Entity::find_by_id(&job.id)
+            .filter(pin_job::Column::SubmitPhase.eq(SUBMIT_PHASE_RECOVERING))
+            .lock_exclusive()
+            .one(db)
+            .await?
+            .as_ref()
+            != Some(job)
+        {
+            return Ok(false);
+        }
+        mark_terminal_target(db, job, safe_reason).await?;
+    }
     let mut update = pin_job::Entity::update_many()
         .col_expr(pin_job::Column::State, Expr::value(STATE_ERROR))
         .col_expr(pin_job::Column::LastError, Expr::value(safe_reason))
@@ -976,7 +1000,9 @@ pub(crate) async fn terminate_parked_submit<C: ConnectionTrait>(
     if update.exec(db).await?.rows_affected != 1 {
         return Ok(false);
     }
-    mark_terminal_target(db, job, safe_reason).await?;
+    if !pg {
+        mark_terminal_target(db, job, safe_reason).await?;
+    }
     Ok(true)
 }
 
@@ -1186,6 +1212,20 @@ async fn lock_submit_receipt_with_work<C: ConnectionTrait>(
 }
 
 async fn lock_submit_receipt_rows<C: ConnectionTrait>(db: &C, id: &str) -> AppResult<()> {
+    if db.get_database_backend() == DatabaseBackend::Postgres {
+        for sql in [
+            "SELECT id FROM pin_jobs WHERE id=$1 FOR UPDATE",
+            "SELECT job_id FROM pin_submit_history WHERE job_id=$1 FOR UPDATE",
+        ] {
+            db.query_one(sea_orm::Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                sql,
+                [id.into()],
+            ))
+            .await?;
+        }
+        return Ok(());
+    }
     pin_job::Entity::update_many()
         .col_expr(
             pin_job::Column::LockedUntil,
@@ -1300,15 +1340,24 @@ pub async fn fence_parked_submits(
     provider: &str,
     cid: &str,
 ) -> AppResult<bool> {
-    let candidates = pin_job::Entity::find()
+    let query = pin_job::Entity::find()
         .filter(pin_job::Column::Provider.eq(provider))
         .filter(pin_job::Column::Cid.eq(cid))
         .filter(pin_job::Column::Operation.eq("submit"))
         .filter(pin_job::Column::State.is_in([STATE_RUNNING, STATE_ERROR]))
         .filter(pin_job::Column::LockedUntil.is_null())
         .order_by_asc(pin_job::Column::Id)
-        .all(db)
-        .await?;
+        .select_only()
+        .column(pin_job::Column::Id);
+    if db.get_database_backend() == DatabaseBackend::Postgres {
+        return Ok(!query
+            .lock_exclusive()
+            .into_tuple::<String>()
+            .all(db)
+            .await?
+            .is_empty());
+    }
+    let candidates = query.into_tuple::<String>().all(db).await?;
     let mut parked = false;
     for candidate in candidates {
         // The UPDATE predicate is rechecked after any wait on repair's row
@@ -1318,7 +1367,7 @@ pub async fn fence_parked_submits(
                 pin_job::Column::LockedUntil,
                 Expr::col(pin_job::Column::LockedUntil).into(),
             )
-            .filter(pin_job::Column::Id.eq(candidate.id))
+            .filter(pin_job::Column::Id.eq(candidate))
             .filter(pin_job::Column::Provider.eq(provider))
             .filter(pin_job::Column::Cid.eq(cid))
             .filter(pin_job::Column::Operation.eq("submit"))
@@ -2410,6 +2459,23 @@ async fn claim_candidate_core<C: ConnectionTrait>(
     work: SharedDecodeBudget,
     runtime: Option<&crate::store::RuntimeTransaction>,
 ) -> Result<Option<ClaimedPinJob>, sea_orm::DbErr> {
+    let candidate = if db.get_database_backend() == DatabaseBackend::Postgres {
+        // A previous claim in this batch already holds the pin_jobs revision row.
+        let Some(current) = pin_job::Entity::find_by_id(&candidate.id)
+            .filter(due_claim_condition(now))
+            .lock_with_behavior(
+                sea_orm::sea_query::LockType::Update,
+                sea_orm::sea_query::LockBehavior::SkipLocked,
+            )
+            .one(db)
+            .await?
+        else {
+            return Ok(None);
+        };
+        current
+    } else {
+        candidate
+    };
     let context = DecodeWork::shared(&work);
     let budget_error =
         |_| sea_orm::DbErr::Custom("claim data could not be read within its budget".into());
@@ -2480,6 +2546,23 @@ async fn claim_candidate_core<C: ConnectionTrait>(
         ) => {
             // Isolate one invalid/orphaned management row. Do not poison fair
             // scheduling of unrelated ordinary jobs or allow a None fallback.
+            if db.get_database_backend() == DatabaseBackend::Postgres
+                && let Some(target) = &claimed.model.target_id
+            {
+                // The claim has already written the job revision. Never wait for
+                // a projection holding the opposite end of target -> job.
+                let available = db.query_one(sea_orm::Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "SELECT source_table FROM pin_management_revision WHERE source_table='pin_lease_targets' \
+                     AND (NOT EXISTS (SELECT 1 FROM pin_lease_targets WHERE id=$1) OR EXISTS \
+                     (SELECT 1 FROM pin_lease_targets WHERE id=$1 FOR UPDATE SKIP LOCKED)) FOR UPDATE SKIP LOCKED",
+                    [target.clone().into()],
+                )).await?;
+                if available.is_none() {
+                    tracing::warn!(job_id = %claimed.model.id, "terminal target busy; leaving bounded claim for reclaim");
+                    return Ok(None);
+                }
+            }
             terminate_claim(db, &claimed, "current management authority mismatch", now)
                 .await
                 .map_err(|_| {
@@ -2521,14 +2604,20 @@ pub async fn renew_job_claim<C: ConnectionTrait>(
 
 /// Fences one exact running claim without advancing or releasing it.
 ///
-/// This is intentionally a no-op write rather than an unlocked read. When it is the first
-/// operation in a caller-owned transaction, later lifecycle mutations in that transaction are
-/// ordered after the durable job claim and cannot accept a response from an older claim window.
+/// Hold the matching row through the caller's transaction without firing PostgreSQL's
+/// table revision trigger. SQLite reserves its writer with the conditional update.
 pub async fn fence_job_claim<C: ConnectionTrait>(
     db: &C,
     job_id: &str,
     expected_locked_until: DateTimeUtc,
 ) -> AppResult<bool> {
+    if db.get_database_backend() == DatabaseBackend::Postgres {
+        return Ok(db.query_one(sea_orm::Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT id FROM pin_jobs WHERE id=$1 AND state='running' AND locked_until=$2 FOR UPDATE",
+            [job_id.into(), expected_locked_until.into()],
+        )).await?.is_some());
+    }
     let fenced = pin_job::Entity::update_many()
         .col_expr(
             pin_job::Column::LockedUntil,
@@ -4192,6 +4281,68 @@ mod tests {
             .await
             .unwrap()
             .unwrap()
+    }
+
+    mod isolated_postgres {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/postgres_pinning_stage3.rs"
+        ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an authorized isolated IPFS_S3_TEST_POSTGRES_URL"]
+    async fn postgres_different_cids_terminate_and_project_without_revision_deadlock() {
+        use sea_orm::Statement;
+        isolated_postgres::isolated(true, |db| async move {
+            let pg = DatabaseBackend::Postgres;
+            let schema: String = db.query_one(Statement::from_string(pg, "SELECT current_schema() AS s"))
+                .await.unwrap().unwrap().try_get("", "s").unwrap();
+            let mut options = ConnectOptions::new(std::env::var("IPFS_S3_TEST_POSTGRES_URL").unwrap());
+            options.set_schema_search_path(schema).max_connections(1);
+            let peer = Database::connect(options).await.unwrap();
+            peer.execute_unprepared("SET statement_timeout TO '10s'").await.unwrap();
+            db.execute_unprepared("INSERT INTO buckets(name) VALUES ('bucket'); INSERT INTO objects(id,bucket,key,cid,size,etag) VALUES ('object-1','bucket','key','a',1,'a')").await.unwrap();
+            let now = time(0);
+            seed_target_and_remote(&db, "lease", "target-a", "provider", "a", 1, "waiting", "reserved", None, 1, now).await;
+            db.execute_unprepared("INSERT INTO pin_lease_targets(id,lease_id,cid,logical_size,provider,state,created_at,last_touched_at) VALUES ('target-b','lease','b',1,'provider','waiting',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+            let seed = db.begin().await.unwrap();
+            enqueue_job(&seed, submit_job("provider", "a", "lease", "target-a", 1, now)).await.unwrap();
+            seed.commit().await.unwrap();
+            let claim = claim_due_jobs(&db, now, Duration::minutes(1), 1).await.unwrap().pop().unwrap();
+            let job_a = claim.model.id.clone();
+            let project = db.begin().await.unwrap();
+            project.execute_unprepared("UPDATE pin_lease_targets SET state='submitted' WHERE id='target-b'").await.unwrap();
+            let terminal = peer.begin().await.unwrap();
+            let pid: i32 = terminal.query_one(Statement::from_string(pg,"SELECT pg_backend_pid() AS pid"))
+                .await.unwrap().unwrap().try_get("", "pid").unwrap();
+            assert!(!fence_job_claim(&terminal, &job_a, now).await.unwrap());
+            assert!(fence_job_claim(&terminal, &job_a, claim.model.locked_until.unwrap()).await.unwrap());
+            assert!(project.query_one(Statement::from_sql_and_values(pg,
+                "SELECT id FROM pin_jobs WHERE id=$1 FOR UPDATE SKIP LOCKED", [job_a.clone().into()]))
+                .await.unwrap().is_none(), "the exact claim row must remain locked");
+            let finish = tokio::spawn(async move {
+                assert!(terminate_claim(&terminal, &claim, "terminal failure", now).await.unwrap());
+                terminal.commit().await.unwrap();
+            });
+            // Wait for A to contend on the shared target revision before B inserts its job.
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let blocked: bool = project.query_one(Statement::from_sql_and_values(pg,
+                        "SELECT pg_backend_pid()=ANY(pg_blocking_pids($1)) AS blocked", [pid.into()]))
+                        .await.unwrap().unwrap().try_get("", "blocked").unwrap();
+                    if blocked { break; }
+                    tokio::task::yield_now().await;
+                }
+            }).await.expect("terminal writer did not contend on the target revision");
+            enqueue_job(&project, poll_job("provider", "b", "lease", "target-b", 1, "request-b", now)).await.unwrap();
+            project.commit().await.unwrap();
+            finish.await.unwrap();
+            assert_eq!(job(&db, &job_a).await.state, STATE_ERROR);
+            assert_eq!(job(&db, &stable_poll_id("provider", "b", "target-b", 1, "request-b")).await.state, STATE_PENDING);
+            assert_eq!(pin_lease_target::Entity::find_by_id("target-a").one(&db).await.unwrap().unwrap().state, STATE_ERROR);
+            peer.close().await.unwrap();
+        }).await;
     }
 
     #[tokio::test]

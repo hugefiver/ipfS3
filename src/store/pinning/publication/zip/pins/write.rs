@@ -291,13 +291,15 @@ impl PinWriteSet {
             .map(|(provider, _)| provider)
             .collect::<BTreeSet<_>>();
         for provider in admitted {
-            if crate::store::pinning::ledger::submission::admission_barrier_with_catalog(
+            if crate::store::pinning::ledger::submission::admission_barriers_with_catalog(
                 provider,
                 reservations.catalog(work),
-                work,
+                &work,
+                true,
             )
             .await?
-                != AdmissionBarrier::Clear
+            .into_keys()
+            .any(|cid| self.affected.contains(&(provider.clone(), cid)))
             {
                 return Err(invalid());
             }

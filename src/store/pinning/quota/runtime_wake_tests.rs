@@ -89,7 +89,9 @@ async fn assert_unallocated(store: &Store, target: &pin_lease_target::Model) {
 async fn runtime_wake_batches_fifo_deduplicates_and_reuses_clone_qualification() {
     let store = fixture().await;
     let now = Utc::now();
-    for id in ["f", "e", "d", "c", "b", "a", "inactive", "cooldown"] {
+    for id in [
+        "f", "e", "d", "c", "b", "a", "inactive", "cooldown", "oversize", "terminal",
+    ] {
         let cid = if id == "b" {
             "bafy-a".into()
         } else {
@@ -101,6 +103,9 @@ async fn runtime_wake_batches_fifo_deduplicates_and_reuses_clone_qualification()
         .db()
         .execute_unprepared(&format!(
             "UPDATE pin_leases SET state='cancelled' WHERE id='lease-inactive';
+         UPDATE pin_lease_targets SET state='quota_blocked' WHERE id='b';
+         UPDATE pin_lease_targets SET state='quota_blocked',logical_size=101 WHERE id='oversize';
+         UPDATE pin_lease_targets SET state='error' WHERE id='terminal';
          UPDATE pin_lease_targets SET last_touched_at='{}' WHERE id='cooldown'",
             (now + chrono::Duration::hours(1)).to_rfc3339()
         ))
@@ -292,7 +297,17 @@ async fn runtime_wake_shared_budget_exhaustion_after_reservation_rolls_back_ever
 async fn runtime_wake_operator_debt_preserves_the_queued_admission() {
     let store = fixture().await;
     let now = Utc::now();
-    waiter(&store, "head", "bafy-head", now).await;
+    for id in ["a", "b", "c", "d"] {
+        waiter(&store, id, "bafy-unresolved", now).await;
+    }
+    waiter(&store, "tail", "bafy-tail", now).await;
+    store
+        .db()
+        .execute_unprepared(
+            "UPDATE pin_lease_targets SET state='quota_blocked' WHERE id IN ('a','tail')",
+        )
+        .await
+        .unwrap();
     let route =
         crate::pinning::identity::ProviderIdentity::legacy("pinata", "ipfs", None, "kubo", "cid")
             .route_snapshot();
@@ -323,25 +338,28 @@ async fn runtime_wake_operator_debt_preserves_the_queued_admission() {
     else {
         panic!("provider debt does not make a valid waiter malformed");
     };
-    assert!(woken.is_empty());
-    work.with(|session| session.check()).unwrap();
+    assert_eq!(woken, ["tail"]);
     tx.commit().await.unwrap();
-    assert_eq!(
-        pin_lease_target::Entity::find_by_id("head")
-            .one(store.db())
+    let usage = read_usage(store.db(), "pinata").await.unwrap().unwrap();
+    assert_eq!((usage.reserved_bytes, usage.reserved_pins), (7, 1));
+    assert_eq!(pin_job::Entity::find().count(store.db()).await.unwrap(), 1);
+
+    remote_pin_ledger::Entity::delete_by_id(("pinata".to_string(), "bafy-unresolved".to_string()))
+        .exec(store.db())
+        .await
+        .unwrap();
+    let tx = store.begin_runtime(work).await.unwrap();
+    let WaiterWakeOutcome::Woken(woken) =
+        wake_runtime_provider_waiters(&tx, "pinata", &limits(), now, work, None)
             .await
             .unwrap()
-            .unwrap()
-            .state,
-        "quota_waiting"
-    );
+    else {
+        panic!("valid waiters")
+    };
+    assert_eq!(woken, ["a", "b", "c", "d"]);
+    tx.commit().await.unwrap();
     let usage = read_usage(store.db(), "pinata").await.unwrap().unwrap();
-    assert_eq!((usage.reserved_bytes, usage.reserved_pins), (0, 0));
-    assert_eq!(
-        remote_pin::Entity::find().count(store.db()).await.unwrap(),
-        0
-    );
-    assert_eq!(pin_job::Entity::find().count(store.db()).await.unwrap(), 0);
+    assert_eq!((usage.reserved_bytes, usage.reserved_pins), (14, 2));
 }
 
 #[tokio::test]

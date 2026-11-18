@@ -430,6 +430,41 @@ async fn worker_kubo_cid_keeps_exact_api_and_unknown_ownership_without_double_co
 }
 
 #[tokio::test]
+async fn retained_rpc_without_submit_receipt_preserves_capacity_without_blocking_admission() {
+    let source = MockServer::start().await;
+    let target = MockServer::start().await;
+    let fixture = fixture(target.uri(), &source, RpcProfile::Kubo, RpcStrategy::Cid).await;
+    ledger::mark_effect(fixture.store.db(), &fixture.provider, CID, "retained")
+        .await
+        .unwrap();
+    assert_eq!(
+        ledger::submission::admission_barrier(fixture.store.db(), &fixture.provider)
+            .await
+            .unwrap(),
+        ledger::submission::AdmissionBarrier::Clear
+    );
+    let retained = ledger::get(fixture.store.db(), &fixture.provider, CID)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !ledger::submission::held_evidence_known(fixture.store.db(), &retained)
+            .await
+            .unwrap()
+    );
+    fixture.publish("second", OTHER).await;
+    let waiting = pin_lease_target::Entity::find()
+        .filter(pin_lease_target::Column::Cid.eq(OTHER))
+        .one(fixture.store.db())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(waiting.state, "quota_waiting");
+    fixture.assert_held().await;
+    assert!(target.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn worker_matched_receipt_survives_overwrite_object_and_bucket_delete() {
     let source = MockServer::start().await;
     let target = MockServer::start().await;
@@ -553,6 +588,21 @@ async fn worker_mismatch_and_multiple_roots_keep_actual_resources_without_expect
             serde_json::from_str(&evidence[0].resources).unwrap();
         assert_eq!(actual.len(), roots.len());
         assert!(actual.iter().any(|resource| resource.resource.cid == OTHER));
+        for cid in [CID, OTHER] {
+            assert_eq!(
+                store_quota::reserve_unique(
+                    fixture.store.db(),
+                    &fixture.provider,
+                    cid,
+                    100,
+                    fixture.coordinator.provider_limits(),
+                    Utc::now()
+                )
+                .await
+                .unwrap(),
+                store_quota::ReservationOutcome::QuotaBlocked
+            );
+        }
         assert!(
             pin_lease_target::Entity::find()
                 .all(fixture.store.db())
@@ -610,6 +660,15 @@ async fn worker_unknown_empty_reported_and_timeout_keep_debt_and_never_retry_htt
         let safe: serde_json::Value =
             serde_json::from_str(evidence[0].safe_error.as_deref().unwrap()).unwrap();
         assert_eq!(safe["effect"], "unknown");
+        ledger::mark_effect(fixture.store.db(), &fixture.provider, CID, "retained")
+            .await
+            .unwrap();
+        assert_eq!(
+            ledger::submission::admission_barrier(fixture.store.db(), &fixture.provider)
+                .await
+                .unwrap(),
+            ledger::submission::AdmissionBarrier::Operator
+        );
         assert!(
             jobs::submission_history(fixture.store.db(), &evidence[0].job_id)
                 .await
@@ -1528,6 +1587,9 @@ async fn maintenance_resets_only_exact_zero_call_missing_receipt_placeholder() {
         .unwrap()
         .unwrap();
     assert_eq!((history.submit_calls, history.recovery_queries), (0, 0));
+    // The first parked job cannot be decoded; discovery must still reach the real placeholder.
+    fixture.store.db().execute_unprepared("INSERT INTO pin_jobs(id,operation,provider,cid,lease_id,target_id,expected_generation,state,next_attempt_at,submit_phase,last_error,updated_at) \
+        SELECT '!broken-park',operation,'other','broken-cid',lease_id,target_id,expected_generation,state,next_attempt_at,submit_phase,last_error,'invalid time' FROM pin_jobs WHERE operation='submit'").await.unwrap();
     recover_missing_receipt_parks(&fixture.coordinator, &fixture.store, &mut String::new())
         .await
         .unwrap();

@@ -56,10 +56,11 @@ async fn runtime_release_usage_resolution_consumes_the_partially_used_operation_
     let baseline = SharedDecodeBudget::default();
     let work = DecodeWork::shared(&baseline);
     let tx = store.begin_runtime(work).await.unwrap();
-    super::super::ledger::submission::admission_barrier_with_catalog(
+    super::super::ledger::submission::admission_barriers_with_catalog(
         "pinata",
         tx.catalog(work),
-        work,
+        &work,
+        false,
     )
     .await
     .unwrap();

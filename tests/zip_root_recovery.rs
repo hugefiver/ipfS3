@@ -329,6 +329,10 @@ async fn inflight_cancellation_after_takeover_retains_only_the_old_epoch_candida
 #[tokio::test]
 async fn restart_rebuilds_original_snapshot_without_republishing_or_readding_files() {
     let (dir, a, b) = setup().await;
+    a.execute_unprepared("INSERT INTO zip_batches (id,owner,source,token,fingerprint,bucket,archive_key,input_identity,captured_options,state,manifest_prepared,terminal_result,root_status,root_error_code,created_at,updated_at)
+        SELECT 'a-bad',owner,source,'bad-token',fingerprint,bucket,archive_key,'bad-input','{',state,manifest_prepared,terminal_result,root_status,root_error_code,created_at,updated_at FROM zip_batches WHERE id='batch';
+        INSERT INTO zip_manifest_entries (batch_id,path,object_key,cid,size,version_row_id,created_at)
+        SELECT 'a-bad',path,object_key,cid,size,'bad-batch-version',created_at FROM zip_manifest_entries WHERE batch_id='batch';").await.unwrap();
     // A later overwrite must not replace the bound manifest version or CID.
     a.execute_unprepared("UPDATE object_versions SET is_latest=FALSE WHERE id='old-version'")
         .await
@@ -355,8 +359,14 @@ async fn restart_rebuilds_original_snapshot_without_republishing_or_readding_fil
         run_page(&b, &client, &CancellationToken::new())
             .await
             .unwrap(),
-        1
+        2
     );
+    let bad = zip::snapshot(&a, "a-bad").await.unwrap().unwrap();
+    assert_eq!(
+        bad.batch.root_error_code.as_deref(),
+        Some("invalid_manifest")
+    );
+    assert!(bad.references.is_empty());
     let snapshot = zip::snapshot(&a, "batch").await.unwrap().unwrap();
     assert_eq!(snapshot.batch.root_status, "complete");
     assert_eq!(snapshot.batch.root_cid.as_deref(), Some(ROOT));
@@ -527,6 +537,25 @@ async fn captured_disabled_root_does_not_retry_even_if_legacy_warning_is_retryab
         0
     );
     assert!(kubo.received_requests().await.unwrap().is_empty());
+    a.execute_unprepared("UPDATE zip_batches SET captured_options='{' WHERE id='batch'")
+        .await
+        .unwrap();
+    assert_eq!(
+        run_page(&b, &KuboClient::new(kubo.uri()), &CancellationToken::new())
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(kubo.received_requests().await.unwrap().is_empty());
+    assert_eq!(
+        zip::read(&a, "batch")
+            .await
+            .unwrap()
+            .unwrap()
+            .root_error_code
+            .as_deref(),
+        Some("invalid_manifest")
+    );
 }
 
 #[tokio::test]

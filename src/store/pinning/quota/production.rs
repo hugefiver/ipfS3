@@ -199,8 +199,13 @@ async fn prepare(
     use legacy_migration::ReceiptCatalog;
     let catalog = ReceiptCatalog::Quota(window);
     admission::check_quota_provider(window, provider, registered, work).await?;
-    match super::super::ledger::submission::admission_barrier_with_catalog(provider, catalog, work)
-        .await?
+    match super::super::ledger::submission::admission_barriers_with_catalog(
+        provider, catalog, &work, true,
+    )
+    .await?
+    .get(cid)
+    .copied()
+    .unwrap_or_default()
     {
         super::super::ledger::submission::AdmissionBarrier::Temporary => {
             return Ok(Prepared::Outcome(ReservationOutcome::QuotaWaiting {

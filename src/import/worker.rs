@@ -101,7 +101,15 @@ pub(crate) fn start_worker(
 ) -> ImportWorkerHandle {
     let task_shutdown = shutdown.clone();
     let task = tokio::spawn(async move {
-        run_worker(coordinator, state, task_shutdown).await;
+        let retention = coordinator.config().raw.terminal_retention_secs;
+        let cleanup = async {
+            tokio::select! {
+                biased;
+                _ = task_shutdown.cancelled() => (),
+                _ = clean_terminal_jobs(state.store.db(), retention) => (),
+            }
+        };
+        tokio::join!(biased; cleanup, run_worker(coordinator, state.clone(), task_shutdown.clone()));
     });
     ImportWorkerHandle { shutdown, task }
 }
@@ -121,10 +129,6 @@ async fn run_worker(
     let v2_lease = config.lease_duration_secs.clamp(1, 60) as i64;
     let mut poll = tokio::time::interval(Duration::from_millis(config.poll_interval_ms));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let cleanup_interval = Duration::from_secs(config.terminal_retention_secs.max(1))
-        .min(MAX_RETENTION_CLEANUP_INTERVAL);
-    let mut cleanup = tokio::time::interval(cleanup_interval);
-    cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
@@ -138,27 +142,6 @@ async fn run_worker(
             joined = v2_in_flight.join_next(), if !v2_in_flight.is_empty() => {
                 if let Some(Err(error)) = joined {
                     tracing::error!(%error, "v2 import task failed");
-                }
-            }
-            _ = cleanup.tick() => {
-                let cutoff = Utc::now()
-                    .checked_sub_signed(retention_delta(config.terminal_retention_secs))
-                    .unwrap_or(DateTime::<Utc>::MIN_UTC);
-                let cleanup_result = tokio::select! {
-                    biased;
-                    _ = shutdown.cancelled() => break,
-                    result = tokio::time::timeout(
-                        RETENTION_CLEANUP_TIMEOUT,
-                        jobs::delete_terminal_before(state.store.db(), cutoff),
-                    ) => result,
-                };
-                match cleanup_result {
-                    Ok(Ok(deleted)) if deleted > 0 => {
-                        tracing::debug!(deleted, "deleted expired terminal import jobs");
-                    }
-                    Ok(Ok(_)) => {}
-                    Ok(Err(error)) => tracing::error!(%error, "failed to clean up terminal import jobs"),
-                    Err(_) => tracing::warn!("terminal import job cleanup timed out"),
                 }
             }
             _ = poll.tick(), if imports_enabled => {
@@ -623,6 +606,29 @@ fn job_deadline(created_at: DateTime<Utc>, timeout_secs: u64) -> DateTime<Utc> {
 
 fn lease_delta(lease_duration_secs: u64) -> TimeDelta {
     TimeDelta::seconds(lease_duration_secs.min(i64::MAX as u64) as i64)
+}
+
+async fn clean_terminal_jobs(db: &DatabaseConnection, retention_secs: u64) {
+    let interval = Duration::from_secs(retention_secs.max(1)).min(MAX_RETENTION_CLEANUP_INTERVAL);
+    loop {
+        let cutoff = Utc::now()
+            .checked_sub_signed(retention_delta(retention_secs))
+            .unwrap_or(DateTime::<Utc>::MIN_UTC);
+        match tokio::time::timeout(
+            RETENTION_CLEANUP_TIMEOUT,
+            jobs::delete_terminal_before(db, cutoff),
+        )
+        .await
+        {
+            Ok(Ok(deleted)) if deleted > 0 => {
+                tracing::debug!(deleted, "deleted expired terminal import jobs")
+            }
+            Ok(Ok(_)) => (),
+            Ok(Err(error)) => tracing::error!(%error, "failed to clean up terminal import jobs"),
+            Err(_) => tracing::warn!("terminal import job cleanup timed out"),
+        }
+        tokio::time::sleep(interval).await;
+    }
 }
 
 fn retention_delta(retention_secs: u64) -> TimeDelta {
@@ -2126,7 +2132,8 @@ mod tests {
 
     #[tokio::test]
     async fn worker_retention_cleanup_deletes_only_old_terminal_jobs() {
-        let state = test_state("http://127.0.0.1:1".to_owned()).await;
+        let kubo = MockServer::start().await;
+        let (dir, mut state) = file_test_state("retention.sqlite", kubo.uri()).await;
         let now = Utc::now();
         let old = now - TimeDelta::seconds(120);
         submit(&state, "old-terminal", "old-terminal-key", old).await;
@@ -2194,13 +2201,72 @@ mod tests {
         .pop()
         .unwrap();
         assert_eq!(active.job.id, "active");
+        submit(&state, "waiting", "waiting-key", now).await;
 
+        // Hold cleanup's first connection checkout, leaving other connections available to poll.
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let first = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .min_connections(2)
+            .max_connections(4)
+            .test_before_acquire(false)
+            .before_acquire({
+                let first = first.clone();
+                let entered = entered.clone();
+                let resume = resume.clone();
+                move |_, _| {
+                    let pause = first.swap(false, std::sync::atomic::Ordering::Relaxed);
+                    let entered = entered.clone();
+                    let resume = resume.clone();
+                    Box::pin(async move {
+                        if pause {
+                            entered.notify_one();
+                            resume.notified().await;
+                        }
+                        Ok(true)
+                    })
+                }
+            })
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(dir.path().join("retention.sqlite")),
+            )
+            .await
+            .unwrap();
+        let observer = state.store.clone();
+        Arc::get_mut(&mut state).unwrap().store =
+            Store::new(sea_orm::SqlxSqliteConnector::from_sqlx_sqlite_pool(pool));
+        first.store(true, std::sync::atomic::Ordering::Relaxed);
         let worker = coordinator(ImportConfig {
             terminal_retention_secs: 60,
             poll_interval_ms: 1_000,
             ..ImportConfig::default()
         })
         .start(state.clone(), CancellationToken::new());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            entered.notified().await;
+            while import_job::Entity::find_by_id("waiting")
+                .one(observer.db())
+                .await
+                .unwrap()
+                .unwrap()
+                .attempts
+                == 0
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("business poll must claim work while retention is waiting");
+        assert!(
+            import_job::Entity::find_by_id("old-terminal")
+                .one(observer.db())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        resume.notify_one();
         tokio::time::timeout(Duration::from_millis(500), async {
             loop {
                 if import_job::Entity::find_by_id("old-terminal")

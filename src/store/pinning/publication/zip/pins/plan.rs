@@ -186,7 +186,7 @@ impl PinWriteSet {
         keys: &AllocationKeys,
         now: DateTime<Utc>,
     ) -> AppResult<&'static str> {
-        match self.before.barriers[&pair.0] {
+        match self.before.barriers.get(pair).copied().unwrap_or_default() {
             AdmissionBarrier::Temporary => return Ok("quota_waiting"),
             AdmissionBarrier::Operator => return Ok("quota_blocked"),
             AdmissionBarrier::Clear => {}

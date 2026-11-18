@@ -24,15 +24,17 @@ pub const MAX_REVISIONS: i64 = 5;
 /// lease expiry; claim_root rechecks under the batch lock before any Kubo IO.
 pub async fn due_page(db: &DatabaseConnection) -> AppResult<Vec<String>> {
     let backend = db.get_database_backend();
-    let (initial_due, lease_due, enabled) = match backend {
+    let (initial_due, lease_due, valid_capture, enabled) = match backend {
         DatabaseBackend::Postgres => (
             "b.updated_at <= clock_timestamp() - INTERVAL '30 seconds'",
             "r.lease_until <= clock_timestamp()",
+            "pg_input_is_valid(b.captured_options, 'jsonb')",
             "((b.captured_options::jsonb ->> 'root_enabled' = 'true' AND (b.captured_options::jsonb -> 'publish_extracted' IS NULL OR b.captured_options::jsonb -> 'publish_extracted' = 'true'::jsonb)) OR b.captured_options::jsonb #>> '{root_capture,configured}' = 'true' OR b.captured_options::jsonb #>> '{root_capture,tagged}' = 'true' OR (b.captured_options::jsonb #>> '{options,root_enabled}' = 'true' AND b.captured_options::jsonb #>> '{options,publish_extracted}' = 'true'))",
         ),
         DatabaseBackend::Sqlite => (
             "julianday(b.updated_at) <= julianday('now', '-30 seconds')",
             "julianday(r.lease_until) <= julianday('now')",
+            "json_valid(b.captured_options)",
             "((json_extract(b.captured_options,'$.root_enabled')=1 AND (json_type(b.captured_options,'$.publish_extracted') IS NULL OR json_extract(b.captured_options,'$.publish_extracted')=1)) OR json_extract(b.captured_options,'$.root_capture.configured')=1 OR json_extract(b.captured_options,'$.root_capture.tagged')=1 OR (json_extract(b.captured_options,'$.options.root_enabled')=1 AND json_extract(b.captured_options,'$.options.publish_extracted')=1))",
         ),
         _ => {
@@ -43,7 +45,8 @@ pub async fn due_page(db: &DatabaseConnection) -> AppResult<Vec<String>> {
     };
     let sql = format!("SELECT b.id FROM zip_batches b
         WHERE b.state='published' AND b.root_status='failed' AND b.manifest_prepared=TRUE
-          AND b.root_revision <= {MAX_REVISIONS} AND {enabled}
+          AND b.root_revision <= {MAX_REVISIONS}
+          AND CASE WHEN {valid_capture} THEN {enabled} ELSE TRUE END
           AND b.root_error_code NOT IN ('path_conflict','invalid_manifest','disabled','empty',
                                       'directory_block_too_large','directory_hash_collision','needs_attention')
           AND EXISTS (SELECT 1 FROM zip_manifest_entries m

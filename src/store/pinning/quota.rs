@@ -727,19 +727,21 @@ async fn confirmed_release_inner<C: ConnectionTrait>(
     {
         return Ok(ConfirmedReleaseOutcome::Stale);
     }
-    let debt = match runtime {
-        Some((tx, work)) => {
-            super::ledger::submission::admission_barrier_with_catalog(
-                provider,
-                tx.catalog(work),
-                work,
-            )
-            .await?
-                != super::ledger::submission::AdmissionBarrier::Clear
-        }
-        None => super::ledger::submission::has_debt(db, provider).await?,
-    };
-    if debt {
+    let catalog = runtime.map_or_else(
+        || super::legacy_migration::ReceiptCatalog::full(db),
+        |(tx, work)| tx.catalog(work),
+    );
+    // A confirmed removal settles its own cleanup marker, not unknown submissions.
+    let confirmed_delete = matches!(request_guard, RequestIdentityGuard::Exact(Some(_)));
+    if super::ledger::submission::admission_barriers_with_catalog(
+        provider,
+        catalog,
+        &work,
+        !confirmed_delete,
+    )
+    .await?
+    .contains_key(cid)
+    {
         return Ok(ConfirmedReleaseOutcome::Stale);
     }
     let ledger = match runtime {
@@ -1005,9 +1007,6 @@ pub(crate) async fn evict_for_provider_waiter(
     limits: &ProviderLimits,
     now: DateTimeUtc,
 ) -> AppResult<Vec<leases::QuotaEvictedTarget>> {
-    if super::ledger::submission::has_debt(db, provider).await? {
-        return Ok(Vec::new());
-    }
     evict_for_required_headroom(db, provider, EvictionRequest::Waiter, limits, now, None).await
 }
 
@@ -1017,9 +1016,6 @@ pub(crate) async fn evict_runtime_provider_waiter(
     limits: &ProviderLimits,
     now: DateTimeUtc,
 ) -> AppResult<Vec<leases::QuotaEvictedTarget>> {
-    if super::ledger::submission::has_debt(tx.db(), provider).await? {
-        return Ok(Vec::new());
-    }
     evict_for_required_headroom(
         tx.db(),
         provider,
@@ -1177,17 +1173,12 @@ async fn reserve_unique_attempt_with_work<C: ConnectionTrait>(
         }
         None
     };
-    let barrier = match runtime {
-        Some(tx) => {
-            super::ledger::submission::admission_barrier_with_catalog(
-                provider,
-                tx.catalog(work),
-                work,
-            )
+    let barrier =
+        super::ledger::submission::admission_barriers_with_catalog(provider, catalog, &work, true)
             .await?
-        }
-        None => super::ledger::submission::admission_barrier(db, provider).await?,
-    };
+            .get(cid)
+            .copied()
+            .unwrap_or_default();
     match barrier {
         super::ledger::submission::AdmissionBarrier::Temporary => {
             return Ok(ReserveAttempt::Outcome(ReservationOutcome::QuotaWaiting {
@@ -1937,6 +1928,13 @@ async fn eviction_candidates<C: ConnectionTrait>(
     limits: &ProviderLimits,
 ) -> AppResult<Vec<(String, String)>> {
     record_order_event("eviction_candidates");
+    let barriers = super::ledger::submission::admission_barriers_with_catalog(
+        provider,
+        super::legacy_migration::ReceiptCatalog::full(db),
+        &(),
+        true,
+    )
+    .await?;
     let remotes = remote_pin::Entity::find()
         .filter(remote_pin::Column::Provider.eq(provider))
         .filter(remote_pin::Column::Status.is_in(capacity_holding_statuses()))
@@ -1944,7 +1942,11 @@ async fn eviction_candidates<C: ConnectionTrait>(
         .await?;
     let mut candidates = Vec::with_capacity(remotes.len());
     for remote in remotes {
-        if !super::ledger::cleanup_allowed(db, provider, &remote.cid).await? {
+        // A request-less reservation with no submit debt can be cancelled locally.
+        let needs_delete = remote.request_id.is_some() || remote.status != REMOTE_STATUS_RESERVED;
+        if barriers.contains_key(&remote.cid)
+            || needs_delete && !super::ledger::cleanup_allowed(db, provider, &remote.cid).await?
+        {
             continue;
         }
         let Some(last_active_touch) = newest_active_target_touch(db, provider, &remote.cid).await?
@@ -2036,10 +2038,20 @@ async fn eviction_snapshot<C: ConnectionTrait>(
     limits: &ProviderLimits,
     now: DateTimeUtc,
 ) -> AppResult<EvictionSnapshot> {
+    let barriers = super::ledger::submission::admission_barriers_with_catalog(
+        provider,
+        super::legacy_migration::ReceiptCatalog::full(db),
+        &(),
+        true,
+    )
+    .await?;
     let (cid_size, excluded_cid, waiter_owner_ids) = match request {
         EvictionRequest::Waiter => {
             let waiting = active_quota_waiters(db, provider, now).await?;
-            let Some((target, _)) = waiting.first() else {
+            let Some((target, _)) = waiting
+                .iter()
+                .find(|(target, _)| !barriers.contains_key(&target.cid))
+            else {
                 return Ok(EvictionSnapshot {
                     selected: Vec::new(),
                     potential_pairs: Vec::new(),
@@ -2110,6 +2122,9 @@ async fn eviction_snapshot<C: ConnectionTrait>(
         .collect();
     let mut candidates = Vec::with_capacity(remotes.len());
     for remote in remotes {
+        if barriers.contains_key(&remote.cid) {
+            continue; // Unconfirmed capacity is neither evictable nor projected headroom.
+        }
         match newest_active_target_touch(db, provider, &remote.cid).await? {
             Some(last_active_touch) if excluded_cid != Some(remote.cid.as_str()) => {
                 candidates.push(EvictionCandidate {

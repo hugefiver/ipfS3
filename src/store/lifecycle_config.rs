@@ -256,8 +256,8 @@ async fn claim_next_scan_in_transaction<C: ConnectionTrait>(
     let cursor = candidate
         .scan_cursor
         .as_deref()
-        .map(|stored| decode_cursor(stored, &candidate.bucket).map_err(|_| stored_cursor_error()))
-        .transpose()?;
+        .map(|stored| decode_cursor(stored, &candidate.bucket))
+        .transpose();
     let lease_epoch = candidate
         .scan_lease_epoch
         .checked_add(1)
@@ -268,7 +268,14 @@ async fn claim_next_scan_in_transaction<C: ConnectionTrait>(
         )
     })?;
 
-    let updated = bucket_lifecycle_config::Entity::update_many()
+    let mut update = bucket_lifecycle_config::Entity::update_many();
+    if cursor.is_err() {
+        update = update.col_expr(
+            bucket_lifecycle_config::Column::ScanCursor,
+            Expr::value(None::<String>),
+        );
+    }
+    let updated = update
         .col_expr(
             bucket_lifecycle_config::Column::ScanLeaseEpoch,
             Expr::value(lease_epoch),
@@ -287,6 +294,10 @@ async fn claim_next_scan_in_transaction<C: ConnectionTrait>(
         return Ok(None);
     }
 
+    let cursor = cursor.unwrap_or_else(|_| {
+        tracing::warn!(bucket = %candidate.bucket, revision = candidate.revision, "reset invalid lifecycle scan cursor");
+        None
+    });
     Ok(Some(ClaimedLifecycleScan {
         bucket: candidate.bucket,
         config_revision: candidate.revision,
@@ -880,7 +891,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lifecycle_claim_scan_race_has_exactly_one_winner_and_rejects_bad_stored_cursor() {
+    async fn lifecycle_claim_scan_race_has_one_winner_and_restarts_from_bad_stored_cursor() {
         let db = setup().await;
         put_configuration(&db, "bucket", &json("race", 1))
             .await
@@ -911,9 +922,17 @@ mod tests {
             .exec(&db)
             .await
             .unwrap();
-        assert!(matches!(
-            claim_next_scan(&db, Duration::seconds(30)).await,
-            Err(AppError::Internal(message)) if message == "stored lifecycle scan cursor is invalid"
-        ));
+        let restarted = claim_next_scan(&db, Duration::seconds(30))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(restarted.bucket, "bucket");
+        assert!(restarted.cursor.is_none());
+        assert!(row(&db).await.scan_cursor.is_none());
+        assert!(
+            !finish_scan_page(&db, &winners[0], None, true)
+                .await
+                .unwrap()
+        );
     }
 }

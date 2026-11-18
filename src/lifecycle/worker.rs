@@ -801,6 +801,22 @@ mod tests {
             .unwrap();
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].target_upload_id.as_deref(), Some("b-due"));
+        bucket_lifecycle_config::Entity::update_many()
+            .col_expr(
+                bucket_lifecycle_config::Column::ScanCursor,
+                Expr::value("bad-cursor"),
+            )
+            .filter(bucket_lifecycle_config::Column::Bucket.eq("bucket"))
+            .exec(store.db())
+            .await
+            .unwrap();
+        assert!(super::scan_one_page(&store, &config, &cancellation).await);
+        let replay = bucket_lifecycle_config::Entity::find_by_id("bucket")
+            .one(store.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replay.scan_cursor, saved.scan_cursor);
         assert!(super::scan_one_page(&store, &config, &cancellation).await);
         let saved = bucket_lifecycle_config::Entity::find_by_id("bucket")
             .one(store.db())

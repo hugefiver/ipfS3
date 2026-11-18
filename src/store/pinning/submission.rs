@@ -165,16 +165,21 @@ pub async fn begin<C: ConnectionTrait>(
         return Ok(None);
     }
     let relation = fact_relation(db).await?;
-    if db.query_one(Statement::from_sql_and_values(
+    let unresolved = db.query_all(Statement::from_sql_and_values(
         db.get_database_backend(),
-        format!("SELECT id FROM {} WHERE provider=$1 AND expected_cid=$2 AND needs_attention=$3 LIMIT 1", relation.table),
+        format!("SELECT expected_cid, resources FROM {} WHERE provider=$1 AND needs_attention=$3 AND (expected_cid=$2 OR resources<>'[]')", relation.table),
         [claimed.model.provider.clone().into(), claimed.model.cid.clone().into(), true.into()],
-    )).await?
-        .is_some()
-    {
-        return Err(AppError::InvalidPinningRequest(
-            "RPC resource has an unresolved invocation; repeated POST is unsafe".into(),
-        ));
+    )).await?;
+    for row in unresolved {
+        if row.try_get::<String>("", "expected_cid")? == claimed.model.cid
+            || row
+                .try_get::<String>("", "resources")
+                .is_ok_and(|reports| reported_cids(&reports).any(|cid| cid == claimed.model.cid))
+        {
+            return Err(AppError::InvalidPinningRequest(
+                "RPC resource has an unresolved invocation; repeated POST is unsafe".into(),
+            ));
+        }
     }
     let history = jobs::submission_history(db, &claimed.model.id)
         .await?
@@ -1195,7 +1200,7 @@ pub(crate) async fn parked_receipt_candidates<C: ConnectionTrait>(
     db: &C,
     after: &str,
     limit: u64,
-) -> AppResult<(Option<String>, Vec<pin_job::Model>)> {
+) -> AppResult<(Option<String>, Vec<String>)> {
     let relation = fact_relation(db).await?;
     let jobs_table = if db.get_database_backend() == sea_orm::DatabaseBackend::Sqlite {
         "\"main\".\"pin_jobs\""
@@ -1204,30 +1209,15 @@ pub(crate) async fn parked_receipt_candidates<C: ConnectionTrait>(
     };
     let rows = db.query_all(Statement::from_sql_and_values(
         db.get_database_backend(),
-        format!("SELECT e.id, e.job_id, e.outcome, e.observed_at, e.needs_attention FROM {} AS e WHERE e.id > $1 AND EXISTS (SELECT 1 FROM {jobs_table} AS j WHERE j.id=e.job_id AND j.operation='submit' AND j.state='running' AND j.locked_until IS NULL AND j.submit_phase='recovering') ORDER BY e.id LIMIT $2", relation.table),
+        format!("SELECT e.id, CASE WHEN e.needs_attention AND e.observed_at IS NOT NULL AND e.outcome IN ('matched','accepted','unknown') THEN e.job_id END AS job_id FROM {} AS e WHERE e.id > $1 AND EXISTS (SELECT 1 FROM {jobs_table} AS j WHERE j.id=e.job_id AND j.operation='submit' AND j.state='running' AND j.locked_until IS NULL AND j.submit_phase='recovering') ORDER BY e.id LIMIT $2", relation.table),
         [after.into(), i64::try_from(limit).unwrap_or(i64::MAX).into()],
     )).await?;
     let mut cursor = None;
     let mut candidates = Vec::new();
     for row in rows {
         cursor = Some(row.try_get::<String>("", "id")?);
-        if !row.try_get::<bool>("", "needs_attention")?
-            || row
-                .try_get::<Option<DateTime<Utc>>>("", "observed_at")?
-                .is_none()
-            || !matches!(
-                row.try_get::<String>("", "outcome")?.as_str(),
-                "matched" | "accepted" | "unknown"
-            )
-        {
-            continue;
-        }
-        if let Some(job) = db.query_one(Statement::from_sql_and_values(
-            db.get_database_backend(),
-            format!("SELECT * FROM {jobs_table} WHERE id=$1 AND operation='submit' AND state='running' AND locked_until IS NULL AND submit_phase='recovering'"),
-            [row.try_get::<String>("", "job_id")?.into()],
-        )).await? {
-            candidates.push(pin_job::Model::from_query_result(&job, "")?);
+        if let Some(job_id) = row.try_get::<Option<String>>("", "job_id")? {
+            candidates.push(job_id);
         }
     }
     Ok((cursor, candidates))
@@ -1237,7 +1227,7 @@ pub(crate) async fn missing_receipt_park_candidates<C: ConnectionTrait>(
     db: &C,
     after: &str,
     limit: u64,
-) -> AppResult<(Option<String>, Vec<pin_job::Model>)> {
+) -> AppResult<(Option<String>, Vec<String>)> {
     let rows = pin_job::Entity::find()
         .filter(pin_job::Column::Id.gt(after))
         .filter(pin_job::Column::Operation.eq("submit"))
@@ -1247,9 +1237,12 @@ pub(crate) async fn missing_receipt_park_candidates<C: ConnectionTrait>(
         .filter(pin_job::Column::LastError.eq(jobs::RPC_MISSING_RECEIPT_PARK_REASON))
         .order_by_asc(pin_job::Column::Id)
         .limit(limit)
+        .select_only()
+        .column(pin_job::Column::Id)
+        .into_tuple::<String>()
         .all(db)
         .await?;
-    let cursor = rows.last().map(|job| job.id.clone());
+    let cursor = rows.last().cloned();
     Ok((cursor, rows))
 }
 
@@ -1477,8 +1470,9 @@ pub(crate) async fn reset_runtime_missing_receipt(
     Ok(true)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AdmissionBarrier {
+    #[default]
     Clear,
     Temporary,
     Operator,
@@ -1489,6 +1483,8 @@ pub enum AdmissionBarrier {
 /// without a reverse job lock or depending on the caller's isolation level.
 #[derive(Default)]
 struct AdmissionSnapshot {
+    unreadable: BTreeSet<String>,
+    unwitnessed_submissions: BTreeSet<String>,
     evidence: Vec<evidence::Model>,
     jobs: BTreeMap<String, pin_job::Model>,
     histories: BTreeMap<String, jobs::history::Model>,
@@ -1668,7 +1664,8 @@ impl AdmissionSnapshot {
                  WHERE ({evidence_scope}) AND unresolved.\"needs_attention\"=TRUE \
                  UNION SELECT ledger.\"cid\" FROM \"remote_pin_ledger\" ledger \
                  WHERE ({ledger_scope}) AND CASE \
-                     WHEN ledger.\"effect\"='reserved' AND COALESCE(({}), FALSE) THEN FALSE \
+                     WHEN ledger.\"effect\" IN ('cleanup_pending','reported_unknown') THEN TRUE \
+                     WHEN ledger.\"effect\" IN ('reserved','retained') AND COALESCE(({}), FALSE) THEN FALSE \
                      WHEN ledger.\"effect\"='absent' THEN NOT ({absent_witness}) \
                      ELSE NOT ({normal_witness}) END",
                 registered_route("ledger.\"route\"")
@@ -1727,7 +1724,18 @@ impl AdmissionSnapshot {
             "\"id\" IN (SELECT \"lease_id\" FROM \"pin_jobs\" WHERE {job_scope} \
              UNION SELECT \"lease_id\" FROM \"pin_lease_targets\" WHERE {target_scope})"
         );
+        let unwitnessed = format!(
+            "\"provider\"=$1 AND \"operation\"='submit' AND EXISTS (SELECT 1 FROM pin_submit_history h \
+             WHERE h.job_id=pin_jobs.id AND h.submit_calls>0 AND h.effect='unknown' \
+             AND NOT EXISTS (SELECT 1 FROM pin_submit_observations r WHERE r.job_id=h.job_id AND r.submit_call=h.submit_calls)){}",
+            if cid.is_some() {
+                " AND cid IN (SELECT cid FROM candidate_cids)"
+            } else {
+                ""
+            }
+        );
         let tables = [
+            admission_table::<pin_job::Entity>("unwitnessed", &unwitnessed),
             admission_table::<evidence::Entity>("evidence", &evidence_scope),
             admission_table::<pin_job::Entity>("job", &job_scope),
             admission_table::<jobs::history::Entity>("history", &invocation_scope),
@@ -1780,6 +1788,8 @@ impl AdmissionSnapshot {
             ));
         }
         let mut snapshot = Self::default();
+        let mut unreadable_jobs = BTreeSet::<String>::new();
+        let mut unreadable_leases = BTreeSet::<String>::new();
         for row in catalog
             .query_all(Statement::from_sql_and_values(
                 catalog.get_database_backend(),
@@ -1788,16 +1798,54 @@ impl AdmissionSnapshot {
             ))
             .await?
         {
-            match row.try_get::<String>("", "__admission_kind")?.as_str() {
+            let kind: String = row.try_get("", "__admission_kind")?;
+            // The UNION is shared across a provider. A model decoding error is
+            // local to the row's resources; SQL and attribution failures propagate.
+            macro_rules! model {
+                ($model:ty) => {
+                    match <$model>::from_query_result(&row, "") {
+                        Ok(model) => model,
+                        Err(error) => {
+                            match kind.as_str() {
+                                "evidence" | "recovery" => {
+                                    snapshot.unreadable.insert(row.try_get("", "expected_cid")?);
+                                    if kind == "evidence"
+                                        && let Ok(reports) = row.try_get::<String>("", "resources")
+                                    {
+                                        snapshot.unreadable.extend(reported_cids(&reports));
+                                    }
+                                }
+                                "capture" | "history" => {
+                                    unreadable_jobs.insert(row.try_get("", "job_id")?);
+                                }
+                                "lease" => {
+                                    unreadable_leases.insert(row.try_get("", "id")?);
+                                }
+                                "job" | "target" | "remote" | "ledger" | "archive" => {
+                                    snapshot.unreadable.insert(row.try_get("", "cid")?);
+                                }
+                                _ => return Err(error.into()),
+                            }
+                            continue;
+                        }
+                    }
+                };
+            }
+            match kind.as_str() {
+                "unwitnessed" => {
+                    snapshot
+                        .unwitnessed_submissions
+                        .insert(row.try_get("", "cid")?);
+                }
                 "evidence" => {
-                    let mut model = evidence::Model::from_query_result(&row, "")?;
-                    if model.provider != provider {
-                        let pk = [("id".into(), model.id.clone())].into();
+                    let original: String = row.try_get("", "provider")?;
+                    if original != provider {
+                        let pk = [("id".into(), row.try_get("", "id")?)].into();
                         let Some(binding) =
                             crate::store::pinning::legacy_migration::resolve_with_catalog(
                                 "pin_submit_observations",
                                 &pk,
-                                &model.provider,
+                                &original,
                                 work,
                                 catalog,
                             )
@@ -1809,20 +1857,23 @@ impl AdmissionSnapshot {
                         if binding.operational_key != provider {
                             continue;
                         }
-                        model.provider = provider.into(); // ephemeral admission projection only
+                    }
+                    let mut model = model!(evidence::Model);
+                    if original != provider {
+                        model.provider = provider.into();
                     }
                     snapshot.evidence.push(model);
                 }
                 "job" => {
-                    let model = pin_job::Model::from_query_result(&row, "")?;
+                    let model = model!(pin_job::Model);
                     snapshot.jobs.insert(model.id.clone(), model);
                 }
                 "history" => {
-                    let model = jobs::history::Model::from_query_result(&row, "")?;
+                    let model = model!(jobs::history::Model);
                     snapshot.histories.insert(model.job_id.clone(), model);
                 }
                 "remote" => {
-                    let mut model = remote_pin::Model::from_query_result(&row, "")?;
+                    let mut model = model!(remote_pin::Model);
                     let current = model.provider == provider;
                     if !current {
                         let pk = [
@@ -1855,11 +1906,11 @@ impl AdmissionSnapshot {
                     }
                 }
                 "capture" => {
-                    let model = pin_invocation_route::Model::from_query_result(&row, "")?;
+                    let model = model!(pin_invocation_route::Model);
                     snapshot.captures.insert(model.job_id.clone(), model);
                 }
                 "ledger" => {
-                    let mut model = remote_pin_ledger::Model::from_query_result(&row, "")?;
+                    let mut model = model!(remote_pin_ledger::Model);
                     let current = model.provider == provider;
                     if !current {
                         let pk = [
@@ -1892,7 +1943,7 @@ impl AdmissionSnapshot {
                     }
                 }
                 "recovery" => {
-                    let mut model = pin_replica_observation::Model::from_query_result(&row, "")?;
+                    let mut model = model!(pin_replica_observation::Model);
                     if model.provider != provider {
                         let pk = [("sequence".into(), model.sequence.to_string())].into();
                         let Some(binding) =
@@ -1920,7 +1971,7 @@ impl AdmissionSnapshot {
                         Some(pin_provider_route::Model::from_query_result(&row, "")?)
                 }
                 "archive" => {
-                    let mut model = pin_resource_history::Model::from_query_result(&row, "")?;
+                    let mut model = model!(pin_resource_history::Model);
                     if model.provider != provider {
                         let pk = [
                             ("provider".into(), model.provider.clone()),
@@ -1949,17 +2000,49 @@ impl AdmissionSnapshot {
                     snapshot.archives.push(model);
                 }
                 "target" => {
-                    let model = pin_lease_target::Model::from_query_result(&row, "")?;
+                    let model = model!(pin_lease_target::Model);
                     snapshot.targets.insert(model.id.clone(), model);
                 }
                 "lease" => {
-                    let model = pin_lease::Model::from_query_result(&row, "")?;
+                    let model = model!(pin_lease::Model);
                     snapshot.leases.insert(model.id.clone(), model);
                 }
                 _ => return Err(AppError::Internal("invalid admission snapshot row".into())),
             }
         }
+        for job in snapshot.jobs.values() {
+            if job
+                .lease_id
+                .as_ref()
+                .is_some_and(|id| unreadable_leases.contains(id))
+                || unreadable_jobs.contains(&job.id)
+            {
+                snapshot.unreadable.insert(job.cid.clone());
+            }
+        }
         Ok(snapshot)
+    }
+
+    fn confirmed_deleted(&self, ledger: &remote_pin_ledger::Model) -> bool {
+        if ledger.effect != "absent" {
+            return false;
+        }
+        let Some(remote) = self.remotes.get(&ledger.cid) else {
+            return false;
+        };
+        remote.status == "absent"
+            && self.archives.iter().any(|archive| {
+                archive.cid == ledger.cid
+                    && archive.epoch == remote.epoch
+                    && serde_json::from_str::<serde_json::Value>(&archive.ledger).is_ok_and(
+                        |fact| {
+                            (fact["confirmed_absent"] == true || fact["unpin_accepted"] == true)
+                                && fact["ledger"]["effect"] == "cleanup_pending"
+                                && fact["ledger"]["route"].as_str() == ledger.route.as_deref()
+                                && fact["request_id"].as_str().is_some_and(|id| !id.is_empty())
+                        },
+                    )
+            })
     }
 
     fn released(&self, row: &evidence::Model) -> bool {
@@ -1984,8 +2067,9 @@ impl AdmissionSnapshot {
         ) else {
             return Ok(false);
         };
-        let route: ProviderRouteSnapshot = serde_json::from_str(&row.route)
-            .map_err(|_| AppError::Internal("invalid RPC admission route".into()))?;
+        let Ok(route) = serde_json::from_str::<ProviderRouteSnapshot>(&row.route) else {
+            return Ok(false);
+        };
         Ok(job.id == row.job_id
             && job.operation == "submit"
             && job.provider == row.provider
@@ -2176,6 +2260,9 @@ impl AdmissionSnapshot {
     }
 
     fn held_known(&self, ledger: &remote_pin_ledger::Model) -> bool {
+        if self.unreadable.contains(&ledger.cid) {
+            return false;
+        }
         if ledger.effect == "reserved" {
             return super::decode_route(ledger).is_some_and(|route| is_rpc(&route));
         }
@@ -2497,13 +2584,14 @@ pub(crate) async fn has_resource_debt<C: ConnectionTrait>(
     provider: &str,
     cid: &str,
 ) -> AppResult<bool> {
-    if evidence::Entity::find()
-        .filter(evidence::Column::Provider.eq(provider))
-        .filter(evidence::Column::ExpectedCid.eq(cid))
-        .filter(evidence::Column::NeedsAttention.eq(true))
-        .one(db)
-        .await?
-        .is_some()
+    if admission_barriers_with_catalog(
+        provider,
+        crate::store::pinning::legacy_migration::ReceiptCatalog::full(db),
+        &(),
+        false,
+    )
+    .await?
+    .contains_key(cid)
     {
         return Ok(true);
     }
@@ -2542,33 +2630,59 @@ pub async fn admission_barrier<C: ConnectionTrait>(
     db: &C,
     provider: &str,
 ) -> AppResult<AdmissionBarrier> {
-    let now = Utc::now();
     let snapshot = AdmissionSnapshot::read(db, provider).await?;
-    admission_barrier_from_snapshot(snapshot, now)
+    Ok(
+        admission_barriers_from_snapshot(snapshot, Utc::now(), true)?
+            .into_values()
+            .max()
+            .unwrap_or_default(),
+    )
 }
 
-pub(in crate::store::pinning) async fn admission_barrier_with_catalog(
+pub(in crate::store::pinning) async fn admission_barriers_with_catalog<
+    W: crate::store::pinning::legacy_migration::ReceiptWork,
+>(
     provider: &str,
     catalog: crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
-    work: crate::store::pinning::management::records::DecodeWork<'_>,
-) -> AppResult<AdmissionBarrier> {
-    let now = Utc::now();
-    let snapshot = AdmissionSnapshot::read_with_catalog(provider, None, catalog, &work).await?;
-    admission_barrier_from_snapshot(snapshot, now)
+    work: &W,
+    include_cleanup: bool,
+) -> AppResult<BTreeMap<String, AdmissionBarrier>> {
+    let snapshot = AdmissionSnapshot::read_with_catalog(provider, None, catalog, work).await?;
+    admission_barriers_from_snapshot(snapshot, Utc::now(), include_cleanup)
 }
 
-fn admission_barrier_from_snapshot(
+fn reported_cids(resources: &str) -> impl Iterator<Item = String> {
+    serde_json::from_str::<Vec<serde_json::Value>>(resources)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item["resource"]["cid"].as_str().map(str::to_owned))
+        .flat_map(|raw| {
+            let canonical = canonical_resource_cid(&raw).ok().filter(|cid| *cid != raw);
+            Some(raw).into_iter().chain(canonical)
+        })
+}
+
+fn admission_barriers_from_snapshot(
     snapshot: AdmissionSnapshot,
     now: DateTime<Utc>,
-) -> AppResult<AdmissionBarrier> {
-    let mut temporary = false;
+    include_cleanup: bool,
+) -> AppResult<BTreeMap<String, AdmissionBarrier>> {
+    let mut barriers = BTreeMap::<String, AdmissionBarrier>::new();
     let mut temporary_cids = std::collections::BTreeSet::new();
     for row in snapshot.evidence.iter().filter(|row| row.needs_attention) {
-        if !snapshot.temporary(row, now)? {
-            return Ok(AdmissionBarrier::Operator);
+        let barrier = if snapshot.temporary(row, now)? {
+            temporary_cids.insert((row.expected_cid.clone(), row.route.clone()));
+            AdmissionBarrier::Temporary
+        } else {
+            AdmissionBarrier::Operator
+        };
+        let source = barriers.entry(row.expected_cid.clone()).or_default();
+        *source = (*source).max(barrier);
+        // A mismatched or partial upload may also have created the reported roots.
+        for cid in reported_cids(&row.resources) {
+            let related = barriers.entry(cid).or_default();
+            *related = (*related).max(barrier);
         }
-        temporary = true;
-        temporary_cids.insert((row.expected_cid.clone(), row.route.clone()));
     }
     // Older RPC holds without typed historical evidence are not made safe by
     // today's registration. Recognizing that ambiguity only denies admission;
@@ -2579,9 +2693,34 @@ fn admission_barrier_from_snapshot(
         .and_then(|row| serde_json::from_str::<ProviderRouteSnapshot>(&row.snapshot).ok())
         .is_some_and(|route| is_rpc(&route));
     for row in snapshot.ledgers.values() {
+        if row.effect == "cleanup_pending" {
+            if include_cleanup {
+                barriers
+                    .entry(row.cid.clone())
+                    .or_insert(AdmissionBarrier::Temporary);
+            }
+            continue;
+        }
+        // Retention keeps its quota hold; it is not an unresolved mutation.
+        if row.effect == "retained" && super::decode_route(row).is_some_and(|route| is_rpc(&route))
+        {
+            continue;
+        }
+        if row.effect == "reported_unknown"
+            || (row.effect == "unknown"
+                && !super::decode_route(row).is_some_and(|route| is_rpc(&route))
+                && snapshot
+                    .remotes
+                    .get(&row.cid)
+                    .is_none_or(|remote| remote.request_id.is_none()))
+        {
+            barriers.insert(row.cid.clone(), AdmissionBarrier::Operator);
+            continue;
+        }
         if (super::decode_route(row).is_some_and(|route| is_rpc(&route))
             || (current_rpc && super::decode_route(row).is_none()))
             && !snapshot.held_known(row)
+            && !snapshot.confirmed_deleted(row)
         {
             if row
                 .route
@@ -2590,14 +2729,17 @@ fn admission_barrier_from_snapshot(
             {
                 continue;
             }
-            return Ok(AdmissionBarrier::Operator);
+            barriers.insert(row.cid.clone(), AdmissionBarrier::Operator);
         }
     }
-    Ok(if temporary {
-        AdmissionBarrier::Temporary
-    } else {
-        AdmissionBarrier::Clear
-    })
+    for cid in snapshot
+        .unwitnessed_submissions
+        .into_iter()
+        .chain(snapshot.unreadable)
+    {
+        barriers.insert(cid, AdmissionBarrier::Operator);
+    }
+    Ok(barriers)
 }
 
 pub async fn held_evidence_known<C: ConnectionTrait>(

@@ -23,28 +23,7 @@ const PAGE_SIZE: u64 = 4;
 #[derive(Default)]
 pub(super) struct ScanState {
     after: Option<store_quota::QuotaWaiterCursor>,
-    blocked_sources: BTreeSet<String>,
-}
-
-#[cfg(test)]
-static CANDIDATE_FAILURE: std::sync::LazyLock<tokio::sync::Mutex<Option<String>>> =
-    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(None));
-
-#[cfg(test)]
-pub(super) async fn fail_candidate_once(target_id: &str) {
-    *CANDIDATE_FAILURE.lock().await = Some(target_id.to_owned());
-}
-
-#[cfg(test)]
-async fn stage_candidate_failure(target_id: &str) -> AppResult<()> {
-    let mut failure = CANDIDATE_FAILURE.lock().await;
-    if failure.as_deref() == Some(target_id) {
-        failure.take();
-        return Err(AppError::Database(
-            "test quota waiter candidate failure".to_owned(),
-        ));
-    }
-    Ok(())
+    blocked_resources: BTreeSet<(String, String)>,
 }
 
 pub(super) async fn terminate_candidate(
@@ -85,96 +64,112 @@ pub(super) async fn coordinate_with_state(
             .await?;
         if page.scanned == 0 {
             scan.after = None;
-            scan.blocked_sources.clear();
+            scan.blocked_resources.clear();
             break;
         }
         remaining = remaining.saturating_sub(page.scanned);
         let scanned = page.scanned;
         let page_next = page.next;
         for candidate in page.candidates {
-            let source = candidate.target.provider.clone();
-            if scan.blocked_sources.contains(&source) {
+            let pair = (
+                candidate.target.provider.clone(),
+                candidate.target.cid.clone(),
+            );
+            if scan.blocked_resources.contains(&pair) {
                 continue;
             }
-            #[cfg(test)]
-            stage_candidate_failure(&candidate.target.id).await?;
-            if candidate.target.logical_size < 0 {
-                terminate_candidate(store, &candidate, now).await?;
-                scan.blocked_sources.insert(source);
-                continue;
-            }
-            let providers = match super::current_target_failover(
-                store,
-                coordinator,
-                &candidate.lease,
-                &candidate.target.cid,
-                &source,
-                true,
-            )
-            .await
-            {
-                Ok(Some(providers)) => providers,
-                Ok(None) | Err(AppError::InvalidPinningRequest(_)) => {
-                    terminate_candidate(store, &candidate, now).await?;
-                    scan.blocked_sources.insert(source);
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-            if candidate.lease.provider_mode != "one" {
-                scan.blocked_sources.insert(source);
-                continue;
-            }
-            let session = SharedDecodeBudget::default();
-            let work = DecodeWork::shared(&session);
-            let tx = store.begin_runtime(work).await?;
-            let result = leases::fail_runtime_one_quota_waiter(
-                &tx,
-                &candidate.lease.id,
-                &candidate.target.id,
-                candidate.lease.generation,
-                &providers,
-                coordinator.provider_limits(),
-                now,
-                work,
-            )
-            .await
-            .and_then(|replacement| {
-                work.with(|session| session.check())
-                    .map_err(admission::work_error)?;
-                Ok(replacement)
-            });
-            match result {
-                Ok(Some(replacement)) => {
-                    tx.commit().await?;
-                    tracing::debug!(
-                        lease_id = %candidate.lease.id,
-                        source_provider = %source,
-                        destination_provider = %replacement.provider,
-                        "pinning one-mode quota waiter advanced to current candidate"
-                    );
-                }
-                Ok(None) => {
-                    tx.commit().await?;
-                    scan.blocked_sources.insert(source);
-                }
-                Err(AppError::InvalidPinningRequest(_)) => {
-                    tx.rollback().await?;
-                    terminate_candidate(store, &candidate, now).await?;
-                    scan.blocked_sources.insert(source);
-                }
+            match advance_candidate(coordinator, store, now, &candidate).await {
+                Ok(true) => continue,
+                Ok(false) => {}
                 Err(error) => {
-                    tx.rollback().await?;
-                    return Err(error);
+                    tracing::warn!(target = %candidate.target.id, provider = %pair.0, cid = %pair.1, %error, "quota waiter deferred until the next scan")
                 }
             }
+            scan.blocked_resources.insert(pair);
         }
         scan.after = page_next;
         if scanned < page_limit || scan.after.is_none() {
             scan.after = None;
-            scan.blocked_sources.clear();
+            scan.blocked_resources.clear();
             break;
         }
     }
     Ok(())
+}
+
+async fn advance_candidate(
+    coordinator: &PinningCoordinator,
+    store: &Store,
+    now: DateTime<Utc>,
+    candidate: &store_quota::QuotaWaiterCandidate,
+) -> AppResult<bool> {
+    let source = &candidate.target.provider;
+    if candidate.target.logical_size < 0 {
+        terminate_candidate(store, candidate, now).await?;
+        return Ok(false);
+    }
+    let providers = match super::current_target_failover(
+        store,
+        coordinator,
+        &candidate.lease,
+        &candidate.target.cid,
+        source,
+        true,
+    )
+    .await
+    {
+        Ok(Some(providers)) => providers,
+        Ok(None) | Err(AppError::InvalidPinningRequest(_)) => {
+            terminate_candidate(store, candidate, now).await?;
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    };
+    if candidate.lease.provider_mode != "one" {
+        return Ok(false);
+    }
+    let session = SharedDecodeBudget::default();
+    let work = DecodeWork::shared(&session);
+    let tx = store.begin_runtime(work).await?;
+    let result = leases::fail_runtime_one_quota_waiter(
+        &tx,
+        &candidate.lease.id,
+        &candidate.target.id,
+        candidate.lease.generation,
+        &providers,
+        coordinator.provider_limits(),
+        now,
+        work,
+    )
+    .await
+    .and_then(|replacement| {
+        work.with(|session| session.check())
+            .map_err(admission::work_error)?;
+        Ok(replacement)
+    });
+    match result {
+        Ok(Some(replacement)) => {
+            tx.commit().await?;
+            tracing::debug!(
+                lease_id = %candidate.lease.id,
+                source_provider = %source,
+                destination_provider = %replacement.provider,
+                "pinning one-mode quota waiter advanced to current candidate"
+            );
+            Ok(true)
+        }
+        Ok(None) => {
+            tx.commit().await?;
+            Ok(false)
+        }
+        Err(AppError::InvalidPinningRequest(_)) => {
+            tx.rollback().await?;
+            terminate_candidate(store, candidate, now).await?;
+            Ok(false)
+        }
+        Err(error) => {
+            tx.rollback().await?;
+            Err(error)
+        }
+    }
 }

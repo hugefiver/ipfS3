@@ -1510,9 +1510,33 @@ async fn wake_quota_waiting_targets_impl<C: ConnectionTrait>(
         work.with(|session| session.check())
             .map_err(super::management::admission::work_error)?;
     }
+    let session = SharedDecodeBudget::default();
+    let (catalog, work) = runtime.map_or_else(
+        || {
+            (
+                super::legacy_migration::ReceiptCatalog::full(db),
+                DecodeWork::shared(&session),
+            )
+        },
+        |(tx, work)| (tx.catalog(work), work),
+    );
+    let barriers =
+        super::ledger::submission::admission_barriers_with_catalog(provider, catalog, &work, true)
+            .await?;
+    // Exclude unresolved resources before the FIFO limit; a full page of debt
+    // must not hide an unrelated waiter. Reservation rechecks after prelocking.
     let waiting = pin_lease_target::Entity::find()
+        .filter(pin_lease_target::Column::Cid.is_not_in(barriers.into_keys()))
         .filter(pin_lease_target::Column::Provider.eq(provider))
-        .filter(pin_lease_target::Column::State.eq(TARGET_QUOTA_WAITING))
+        .filter(
+            Condition::any()
+                .add(pin_lease_target::Column::State.eq(TARGET_QUOTA_WAITING))
+                .add(
+                    Condition::all()
+                        .add(pin_lease_target::Column::State.eq(TARGET_QUOTA_BLOCKED))
+                        .add(pin_lease_target::Column::LogicalSize.lte(limits.max_bytes)),
+                ),
+        )
         .filter(pin_lease_target::Column::LastTouchedAt.lte(now))
         .filter(
             pin_lease_target::Column::LeaseId.in_subquery(
@@ -1659,7 +1683,12 @@ async fn wake_quota_waiting_targets_impl<C: ConnectionTrait>(
             Err(error) => return Err(error),
         };
         match reservation {
-            ReservationOutcome::QuotaWaiting { .. } => break,
+            ReservationOutcome::QuotaWaiting { .. } => {
+                if target.state == TARGET_QUOTA_BLOCKED {
+                    set_prelocked_target_state(db, &target, TARGET_QUOTA_WAITING).await?;
+                }
+                break;
+            }
             ReservationOutcome::QuotaBlocked => {
                 // This is a stable non-debt budget decision: waiter reservation
                 // maps operator debt to waiting, without rereading mutable debt.
@@ -4656,22 +4685,6 @@ pub async fn expire_due_leases<C: ConnectionTrait>(
     db: &C,
     now: DateTimeUtc,
 ) -> AppResult<Vec<String>> {
-    expire_due_leases_core(db, now, None).await
-}
-
-pub(crate) async fn expire_runtime_due_leases(
-    tx: &crate::store::RuntimeTransaction,
-    now: DateTimeUtc,
-) -> AppResult<Vec<String>> {
-    super::management::admission::lock_sqlite_writer_in_caller_transaction(tx.db()).await?;
-    expire_due_leases_core(tx.db(), now, Some(tx)).await
-}
-
-async fn expire_due_leases_core<C: ConnectionTrait>(
-    db: &C,
-    now: DateTimeUtc,
-    runtime: Option<&crate::store::RuntimeTransaction>,
-) -> AppResult<Vec<String>> {
     let leases = pin_lease::Entity::find()
         .filter(pin_lease::Column::State.eq(LEASE_ACTIVE))
         .filter(pin_lease::Column::ExpiresAt.lte(now))
@@ -4688,10 +4701,63 @@ async fn expire_due_leases_core<C: ConnectionTrait>(
         TARGET_RELEASED,
         now,
         DecodeWork::shared(&session),
-        runtime,
+        None,
     )
     .await?;
     Ok(ids)
+}
+
+pub(crate) async fn due_runtime_lease_ids<C: ConnectionTrait>(
+    db: &C,
+    now: DateTimeUtc,
+    after: &str,
+    limit: u64,
+) -> AppResult<Vec<String>> {
+    Ok(pin_lease::Entity::find()
+        .select_only()
+        .column(pin_lease::Column::Id)
+        .filter(pin_lease::Column::State.eq(LEASE_ACTIVE))
+        .filter(pin_lease::Column::ExpiresAt.lte(now))
+        .filter(pin_lease::Column::Id.gt(after))
+        .order_by_asc(pin_lease::Column::Id)
+        .limit(limit)
+        .into_tuple()
+        .all(db)
+        .await?)
+}
+
+pub(crate) async fn expire_runtime_due_lease(
+    tx: &crate::store::RuntimeTransaction,
+    id: &str,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+) -> AppResult<bool> {
+    super::management::admission::lock_sqlite_writer_in_caller_transaction(tx.db()).await?;
+    let query = pin_lease::Entity::find_by_id(id)
+        .filter(pin_lease::Column::State.eq(LEASE_ACTIVE))
+        .filter(pin_lease::Column::ExpiresAt.lte(now));
+    let query = if tx.get_database_backend() == DatabaseBackend::Postgres {
+        query.lock_with_behavior(
+            sea_orm::sea_query::LockType::Update,
+            sea_orm::sea_query::LockBehavior::SkipLocked,
+        )
+    } else {
+        query
+    };
+    let Some(lease) = query.one(tx.db()).await? else {
+        return Ok(false);
+    };
+    end_leases_core(
+        tx.db(),
+        &[lease],
+        LEASE_EXPIRED,
+        TARGET_RELEASED,
+        now,
+        work,
+        Some(tx),
+    )
+    .await?;
+    Ok(true)
 }
 
 /// Evicts a provider/CID desired set and starts unpin/reconcile work without releasing quota.

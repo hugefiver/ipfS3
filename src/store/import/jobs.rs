@@ -151,7 +151,7 @@ pub(crate) async fn find_idempotent<C: ConnectionTrait>(
     let Some(id) = query.into_tuple::<String>().one(txn).await? else {
         return Ok(None);
     };
-    Ok(load_payloads(txn, &[(0, id.clone())]).await?.remove(&id))
+    load_one_payload(txn, id).await.map(Some)
 }
 
 #[allow(dead_code)]
@@ -273,10 +273,7 @@ pub(crate) async fn insert_queued_with_zip_intent<C: ConnectionTrait>(
     .await?;
     import_job_request::Entity::insert(frozen).exec(txn).await?;
 
-    load_payloads(txn, &[(0, id.clone())])
-        .await?
-        .remove(&id)
-        .ok_or_else(|| AppError::Internal("inserted import job disappeared".to_owned()))
+    load_one_payload(txn, id).await
 }
 
 /// Claims due queued work and expired running leases in stable due-time order.
@@ -310,7 +307,25 @@ pub async fn claim_due(
             })
             .await;
         match result {
-            Ok(claimed) => return Ok(claimed),
+            Ok((ready, rejected)) => {
+                // Terminal ownership changes take the bucket lock before the job lock.
+                // Settle after the claim transaction releases its hot rows.
+                for (claim, bucket, reason) in rejected {
+                    let failure = ImportFailure {
+                        code: crate::import::ImportFailureCode::PublicationFailed,
+                        message: reason.to_owned(),
+                        retryable: false,
+                    };
+                    match super::ownership::fail_claimed(db, &claim, &bucket, &failure, now).await {
+                        Ok(()) => {
+                            tracing::warn!(job_id = %claim.job_id, reason, "failed unreadable import job")
+                        }
+                        Err(AppError::StaleImportOwnership) => (),
+                        Err(error) => return Err(error),
+                    }
+                }
+                return Ok(ready);
+            }
             Err(error)
                 if is_sqlite_contention(&error.to_string())
                     && attempt < MAX_SQLITE_CLAIM_RETRIES =>
@@ -329,7 +344,13 @@ async fn claim_due_in_transaction<C: ConnectionTrait>(
     now: DateTime<Utc>,
     lease_until: DateTime<Utc>,
     limit: u64,
-) -> Result<Vec<ClaimedImportJob>, sea_orm::DbErr> {
+) -> Result<
+    (
+        Vec<ClaimedImportJob>,
+        Vec<(ImportClaim, String, &'static str)>,
+    ),
+    sea_orm::DbErr,
+> {
     let id_bytes = if db.get_database_backend() == DatabaseBackend::Sqlite {
         "length(CAST(id AS BLOB))"
     } else {
@@ -360,35 +381,68 @@ async fn claim_due_in_transaction<C: ConnectionTrait>(
         }
     }
     claimed.sort_by_key(|(due_rank, _)| *due_rank);
-    let mut jobs = load_payloads(db, &claimed).await?;
-    let mut result = Vec::with_capacity(claimed.len());
-    for (_, id) in &claimed {
-        let job = jobs.remove(id).ok_or_else(|| {
-            sea_orm::DbErr::RecordNotFound("claimed import job disappeared".to_owned())
-        })?;
-        let attempt = u32::try_from(job.attempts).map_err(|_| {
-            sea_orm::DbErr::Custom("persisted import attempt is outside range".to_owned())
-        })?;
-        result.push(ClaimedImportJob {
-            claim: ImportClaim {
-                job_id: job.id.clone(),
-                worker_id: worker_id.to_owned(),
-                attempt,
-                claim_epoch: job.claim_epoch,
-                locked_until: lease_until,
-            },
-            job,
-        });
+    let mut pages = payload_pages(db, &claimed).await?;
+    let invalid = std::mem::take(&mut pages.rejected);
+    let mut jobs = load_payloads(db, pages).await?;
+    let mut ready = Vec::with_capacity(jobs.len());
+    let mut rejected = Vec::with_capacity(invalid.len());
+    let make_claim = |job_id, attempts: i32, claim_epoch| -> Result<_, sea_orm::DbErr> {
+        Ok(ImportClaim {
+            job_id,
+            worker_id: worker_id.to_owned(),
+            attempt: u32::try_from(attempts).map_err(|_| {
+                sea_orm::DbErr::Custom("persisted import attempt is outside range".into())
+            })?,
+            claim_epoch,
+            locked_until: lease_until,
+        })
+    };
+    for (_, id) in claimed {
+        if let Some(reason) = invalid.get(&id) {
+            let (attempts, epoch, bucket) = import_job::Entity::find_state()
+                .select_only()
+                .columns([
+                    import_job::Column::Attempts,
+                    import_job::Column::ClaimEpoch,
+                    import_job::Column::Bucket,
+                ])
+                .filter(import_job::Column::Id.eq(&id))
+                .into_tuple::<(i32, i64, String)>()
+                .one(db)
+                .await?
+                .ok_or_else(|| {
+                    sea_orm::DbErr::RecordNotFound("claimed import job disappeared".into())
+                })?;
+            rejected.push((make_claim(id, attempts, epoch)?, bucket, *reason));
+        } else {
+            let job = jobs.remove(&id).ok_or_else(|| {
+                sea_orm::DbErr::RecordNotFound("claimed import job disappeared".into())
+            })?;
+            ready.push(ClaimedImportJob {
+                claim: make_claim(id, job.attempts, job.claim_epoch)?,
+                job,
+            });
+        }
     }
-    Ok(result)
+    Ok((ready, rejected))
+}
+
+async fn load_one_payload<C: ConnectionTrait>(db: &C, id: String) -> AppResult<import_job::Model> {
+    let pages = payload_pages(db, &[(0, id.clone())]).await?;
+    if let Some(reason) = pages.rejected.get(&id) {
+        return Err(AppError::Internal((*reason).into()));
+    }
+    load_payloads(db, pages)
+        .await?
+        .remove(&id)
+        .ok_or_else(|| AppError::Internal("import job disappeared".into()))
 }
 
 async fn load_payloads<C: ConnectionTrait>(
     db: &C,
-    ids: &[(usize, String)],
+    pages: PayloadPages,
 ) -> Result<HashMap<String, import_job::Model>, sea_orm::DbErr> {
-    let pages = payload_pages(db, ids).await?;
-    let mut jobs = HashMap::with_capacity(ids.len());
+    let mut jobs = HashMap::new();
     for page in pages.small {
         jobs.extend(
             import_job::Entity::find()
@@ -416,6 +470,7 @@ async fn load_payloads<C: ConnectionTrait>(
 struct PayloadPages {
     small: Vec<Vec<(usize, String)>>,
     large: Vec<String>,
+    rejected: HashMap<String, &'static str>,
 }
 
 async fn payload_pages<C: ConnectionTrait>(
@@ -487,15 +542,25 @@ async fn payload_pages<C: ConnectionTrait>(
         let mut page = Vec::new();
         let mut bytes = 0;
         for item in group {
-            let (size, hot_size) = *sizes.get(&item.1).ok_or_else(|| {
-                sea_orm::DbErr::RecordNotFound("claimed import job disappeared".into())
-            })?;
-            resident = resident.saturating_add(
-                size.saturating_mul(2)
-                    .saturating_add((item.1.len() as i64).saturating_mul(8))
-                    .saturating_add(16384),
-            );
-            if size < 0 || !(0..=65536).contains(&hot_size) || resident > 32 * 1024 * 1024 {
+            let Some(&(size, hot_size)) = sizes.get(&item.1) else {
+                pages
+                    .rejected
+                    .insert(item.1.clone(), "frozen import request is missing");
+                continue;
+            };
+            let job_bytes = size
+                .saturating_mul(2)
+                .saturating_add((item.1.len() as i64).saturating_mul(8))
+                .saturating_add(16384);
+            if hot_size > 65536 || job_bytes > 32 * 1024 * 1024 {
+                pages.rejected.insert(
+                    item.1.clone(),
+                    "frozen import request exceeds the read limit",
+                );
+                continue;
+            }
+            resident = resident.saturating_add(job_bytes);
+            if resident > 32 * 1024 * 1024 {
                 return Err(sea_orm::DbErr::Custom(
                     "import request exceeds the resident budget".into(),
                 ));
@@ -1285,9 +1350,60 @@ mod tests {
         let pages = payload_pages(&db, &keys).await.unwrap();
         assert!(pages.small.is_empty());
         assert_eq!(pages.large, ["job-a", "job-z"]);
-        let jobs = claim_due(&db, "worker", time(0), time(30), 2)
+        for id in ["bad-missing", "bad-oversized"] {
+            crate::store::import::ownership::submit(&db, request(id, id), time(0))
+                .await
+                .unwrap();
+        }
+        db.execute_unprepared("DELETE FROM import_job_requests WHERE job_id='bad-missing';
+            UPDATE import_job_requests SET source_value=CAST(zeroblob(16777216) AS TEXT) WHERE job_id='bad-oversized';
+            ALTER TABLE import_job_requests RENAME TO unavailable_requests;").await.unwrap();
+        assert!(matches!(
+            claim_due(&db, "worker", time(0), time(30), 4).await,
+            Err(AppError::Database(_))
+        ));
+        assert_eq!(
+            import_job::Entity::find_state()
+                .select_only()
+                .column(import_job::Column::Id)
+                .filter(import_job::Column::State.eq("queued"))
+                .count(&db)
+                .await
+                .unwrap(),
+            4
+        );
+        db.execute_unprepared("ALTER TABLE unavailable_requests RENAME TO import_job_requests")
             .await
             .unwrap();
+        let jobs = claim_due(&db, "worker", time(0), time(30), 4)
+            .await
+            .unwrap();
+        for id in ["bad-missing", "bad-oversized"] {
+            let (state, failure, locked_by, completed) = import_job::Entity::find_state()
+                .select_only()
+                .columns([
+                    import_job::Column::State,
+                    import_job::Column::FailureCode,
+                    import_job::Column::LockedBy,
+                    import_job::Column::CompletedAt,
+                ])
+                .filter(import_job::Column::Id.eq(id))
+                .into_tuple::<(String, String, Option<String>, DateTime<Utc>)>()
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                (state.as_str(), failure.as_str(), locked_by, completed),
+                ("failed", "publication_failed", None, time(0))
+            );
+            let dest = import_destination::Entity::find_by_id(("bucket".to_owned(), id.to_owned()))
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(dest.owner_job_id.is_none());
+        }
         assert_eq!(
             jobs.iter()
                 .map(|job| job.job.id.as_str())

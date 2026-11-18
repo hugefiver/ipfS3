@@ -3089,11 +3089,19 @@ async fn test_pinning_one_mode_failover_retains_unknown_primary_without_duplicat
 #[tokio::test]
 async fn test_pinning_all_mode_partial_success_keeps_retrying_degraded_provider() {
     let mut config = PinningHarnessConfig::automatic_all();
-    config.pinata_script = vec![PsaReply::pinned_submit(
-        "/psa/pins",
-        "partial-pinata",
-        TEST_CID,
-    )];
+    config.policies[0].prefix = "partial".to_owned();
+    config
+        .kubo_script
+        .add_replies
+        .extend([AddReply::Ok(PIN_CID_NEW), AddReply::Ok(PIN_CID_INCOMING)]);
+    config.kubo_script.cat_bodies.extend([
+        (PIN_CID_NEW.to_owned(), b"next".to_vec()),
+        (PIN_CID_INCOMING.to_owned(), b"plain".to_vec()),
+    ]);
+    config.pinata_script = vec![
+        PsaReply::pinned_submit("/psa/pins", "partial-pinata", TEST_CID),
+        PsaReply::pinned_submit("/psa/pins", "next-pinata", PIN_CID_NEW),
+    ];
     config.filebase_script = vec![
         PsaReply::empty(
             http::Method::POST,
@@ -3101,6 +3109,7 @@ async fn test_pinning_all_mode_partial_success_keeps_retrying_degraded_provider(
             StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
         ),
         PsaReply::find_none_for_job("/v1/ipfs/pins", TEST_CID),
+        PsaReply::pinned_submit("/v1/ipfs/pins", "next-filebase", PIN_CID_NEW),
     ];
     let mut harness = start_pinning_harness(config).await;
 
@@ -3131,6 +3140,21 @@ async fn test_pinning_all_mode_partial_success_keeps_retrying_degraded_provider(
     assert_eq!(retry.state, "pending");
     assert_eq!(retry.submit_phase.as_deref(), Some("recovery_backoff"));
     assert!(retry.next_attempt_at > Utc::now());
+    // Keep A in backoff while the other uploads run, independent of test-host speed.
+    harness
+        .state
+        .store
+        .db()
+        .execute(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE pin_jobs SET next_attempt_at=$1 WHERE id=$2",
+            [
+                (Utc::now() + ChronoDuration::hours(1)).into(),
+                retry.id.clone().into(),
+            ],
+        ))
+        .await
+        .unwrap();
     let requests = harness.provider_requests().await;
     assert_eq!(requests.len(), 3);
     assert_submit_request(&requests[0], "/psa/pins", TEST_CID);
@@ -3142,6 +3166,24 @@ async fn test_pinning_all_mode_partial_success_keeps_retrying_degraded_provider(
         &captured_submit_correlation(&harness, &retry.id).await,
     );
     assert_signed_body(&harness, "partial.txt", b"happy").await;
+
+    for (key, bytes) in [("partial-next", b"next".as_slice()), ("plain", b"plain")] {
+        let put = signed_put_with_tagging(&harness, key, bytes.to_vec(), "").await;
+        assert_eq!(put.status(), StatusCode::OK);
+        assert_signed_body(&harness, key, bytes).await;
+    }
+    harness.run_worker_until_idle().await;
+    for (provider, request_id) in [
+        ("filebase-primary", "next-filebase"),
+        ("pinata-primary", "next-pinata"),
+    ] {
+        let next = remote_pin(&harness, provider, PIN_CID_NEW).await;
+        assert_eq!(next.status, "pinned");
+        assert_eq!(next.request_id.as_deref(), Some(request_id));
+    }
+    let unresolved = remote_pin(&harness, "filebase-primary", TEST_CID).await;
+    assert_eq!(unresolved.status, "reserved");
+    assert_eq!(harness.provider_usages().await[0].reserved_pins, 2);
     assert_no_kubo_pin_removes(&harness).await;
     harness.shutdown().await;
 }

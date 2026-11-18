@@ -171,6 +171,8 @@ impl Fixture {
         });
         let raw: Config = toml::from_str(&format!(
             r#"
+            [decompress_zip]
+            auto_pin_outputs = false
             [pinning]
             worker_interval = '1s'
             [[pinning.providers]]
@@ -205,6 +207,14 @@ impl Fixture {
             api_profile = 'filebase-rpc'
             strategy = 'upload'
             cleanup = 'managed'
+            [[pinning.policies]]
+            bucket = 'availability'
+            prefix = ''
+            trigger = 'always'
+            provider_mode = 'all'
+            providers = ['rpc']
+            default_duration = '1h'
+            max_duration = '1h'
         "#
         ))
         .unwrap();
@@ -253,7 +263,9 @@ impl Fixture {
                     tags: vec![],
                     leases: vec![LeaseIntent {
                         source: LeaseSource::Automatic,
-                        policy_id: "availability".into(),
+                        policy_id: self.coordinator.effective_config().policies[0]
+                            .identity
+                            .clone(),
                         provider_mode: ProviderMode::All,
                         providers: vec![self.provider.clone()],
                         content_mode: ContentMode::Object,
@@ -324,7 +336,7 @@ impl Fixture {
         );
     }
 
-    async fn takeover_park(&self) -> pin_job::Model {
+    async fn expire_submit_claim(&self) -> pin_job::Model {
         let original = self.submit().await;
         let expired = pin_job::Entity::update_many()
             .col_expr(
@@ -337,6 +349,11 @@ impl Fixture {
             .await
             .unwrap();
         assert_eq!(expired.rows_affected, 1);
+        original
+    }
+
+    async fn takeover_park(&self) -> pin_job::Model {
+        let original = self.expire_submit_claim().await;
         let recovery_worker = self
             .coordinator
             .start(self.store.clone(), CancellationToken::new());
@@ -461,7 +478,7 @@ async fn stable_operator_waiter_reason_survives_debt_settled_after_reserve_retur
         .coordinator
         .start(fixture.store.clone(), CancellationToken::new());
     held_start(&fixture).await;
-    let b = fixture.publish("b", OTHER).await;
+    let b = fixture.publish("b", CID).await;
     // Keep the periodic scanner out of B; this exact caller controls its wake.
     let wake_at = Utc::now() + chrono::Duration::seconds(30);
     pin_lease_target::Entity::update_many()
@@ -473,7 +490,13 @@ async fn stable_operator_waiter_reason_survives_debt_settled_after_reserve_retur
         .exec(&peer)
         .await
         .unwrap();
-    fixture.takeover_park().await;
+    let submit_id = fixture.submit().await.id;
+    jobs::history::Entity::update_many()
+        .col_expr(jobs::history::Column::State, Expr::value("needs_attention"))
+        .filter(jobs::history::Column::JobId.eq(&submit_id))
+        .exec(&peer)
+        .await
+        .unwrap();
     assert_eq!(
         ledger::submission::admission_barrier(&peer, &fixture.provider)
             .await
@@ -484,7 +507,7 @@ async fn stable_operator_waiter_reason_survives_debt_settled_after_reserve_retur
         quota::reserve_unique(
             &peer,
             &fixture.provider,
-            OTHER,
+            CID,
             100,
             fixture.coordinator.provider_limits(),
             wake_at
@@ -493,7 +516,7 @@ async fn stable_operator_waiter_reason_survives_debt_settled_after_reserve_retur
         .unwrap(),
         quota::ReservationOutcome::QuotaBlocked
     );
-    let gate = admission_gate(peer.clone(), 2, false);
+    let gate = admission_gate(peer.clone(), 1, true);
     let wake = quota::wake_provider_waiters(
         &gate,
         &fixture.provider,
@@ -501,25 +524,25 @@ async fn stable_operator_waiter_reason_survives_debt_settled_after_reserve_retur
         wake_at,
     );
     tokio::pin!(wake);
-    let result = tokio::select! {
-        _ = gate.entered.notified() => {
-            // Old code has returned operator QuotaBlocked and now starts its
-            // independent has_debt read. Complete A before that second read.
-            fixture.target.release.add_permits(1);
-            wait_for(|| async { fixture.target_state(&a).await == "pinned" && fixture.submit().await.state == "done" && !fixture.receipt().await.needs_attention }).await;
-            assert!(!ledger::submission::has_debt(fixture.store.db(), &fixture.provider).await.unwrap());
-            gate.resume.add_permits(1);
-            wake.await
-        }
-        result = &mut wake => {
-            // Stable waiter-specific classification needs no second debt read.
-            assert_eq!(gate.reads.load(Ordering::SeqCst), 1);
-            fixture.target.release.add_permits(1);
-            wait_for(|| async { fixture.target_state(&a).await == "pinned" && fixture.submit().await.state == "done" && !fixture.receipt().await.needs_attention }).await;
-            result
-        }
-    };
-    assert!(result.unwrap().is_empty());
+    tokio::select! {
+        _ = gate.entered.notified() => {},
+        result = &mut wake => panic!("wake bypassed the admission read: {result:?}"),
+    }
+    jobs::history::Entity::update_many()
+        .col_expr(jobs::history::Column::State, Expr::value("active"))
+        .filter(jobs::history::Column::JobId.eq(&submit_id))
+        .exec(&peer)
+        .await
+        .unwrap();
+    fixture.target.release.add_permits(1);
+    wait_for(|| async {
+        fixture.target_state(&a).await == "pinned"
+            && fixture.submit().await.state == "done"
+            && !fixture.receipt().await.needs_attention
+    })
+    .await;
+    gate.resume.add_permits(1);
+    assert!(wake.await.unwrap().is_empty());
     worker.shutdown(Duration::from_secs(2)).await;
     assert_eq!(
         fixture.target_state(&b).await,
@@ -539,8 +562,8 @@ async fn stable_operator_waiter_reason_survives_debt_settled_after_reserve_retur
     .unwrap();
     txn.commit().await.unwrap();
     assert_eq!(woken, vec![b.clone()]);
-    assert_eq!(fixture.target_state(&b).await, "waiting");
-    fixture.held(200, 2).await;
+    assert_eq!(fixture.target_state(&b).await, "pinned");
+    fixture.held(100, 1).await;
     peer.close().await.unwrap();
     fixture.store.db().clone().close().await.unwrap();
     _dir.close().unwrap();
@@ -558,7 +581,7 @@ async fn stable_admission_snapshot_old_inflight_and_new_done_never_become_operat
     let reserve = quota::reserve_unique(
         &gate,
         &fixture.provider,
-        OTHER,
+        CID,
         100,
         fixture.coordinator.provider_limits(),
         Utc::now(),
@@ -607,12 +630,8 @@ async fn healthy_held_a_different_cid_b_automatically_resumes() {
         .start(fixture.store.clone(), CancellationToken::new());
     held_start(&fixture).await;
     let b = fixture.publish("b", OTHER).await;
-    assert_eq!(
-        fixture.target_state(&b).await,
-        "quota_waiting",
-        "healthy in-flight debt must not permanently block B"
-    );
-    fixture.held(100, 1).await;
+    assert!(!fixture.target_state(&b).await.starts_with("quota_"));
+    fixture.held(200, 2).await;
     fixture.target.release.add_permits(1);
     wait_for(|| async {
         fixture.target_state(&a).await == "pinned" && fixture.target_state(&b).await == "pinned"
@@ -626,6 +645,29 @@ async fn healthy_held_a_different_cid_b_automatically_resumes() {
             .await
             .unwrap()
     );
+}
+
+#[tokio::test]
+async fn unreadable_receipt_holds_source_and_reported_cids_without_breaking_publication() {
+    let fixture = Fixture::new((StatusCode::OK, String::new())).await;
+    fixture.publish("first", CID).await;
+    let resources = serde_json::json!([null, {"resource": {"cid": OTHER}}]);
+    fixture.store.db().execute(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
+        "INSERT INTO pin_submit_observations(id,job_id,submit_call,provider,expected_cid,route,remote_epoch,claim_until,effect,resources,outcome,needs_attention,started_at,observed_at) SELECT 'bad','old-job',1,provider,$1,snapshot,1,CURRENT_TIMESTAMP,'unknown',$2,'unknown',TRUE,CURRENT_TIMESTAMP,'invalid timestamp' FROM pin_provider_routes",
+        [CID.into(), resources.to_string().into()],
+    )).await.unwrap();
+    for (key, cid) in [("same-source", CID), ("reported", OTHER)] {
+        let target = fixture.publish(key, cid).await;
+        assert_eq!(fixture.target_state(&target).await, "quota_blocked");
+    }
+    let healthy = fixture
+        .publish(
+            "independent",
+            "QmYwAPJzv5CZsnAzt8auVTL7VYhESWDFoCPTqCkiP6fKGE",
+        )
+        .await;
+    assert_eq!(fixture.target_state(&healthy).await, "waiting");
+    fixture.held(200, 2).await;
 }
 
 #[tokio::test]
@@ -711,7 +753,7 @@ async fn unknown_a_keeps_waiter_recoverable_but_never_grants_capacity_or_reposts
         .coordinator
         .start(fixture.store.clone(), CancellationToken::new());
     held_start(&fixture).await;
-    let b = fixture.publish("b", OTHER).await;
+    let b = fixture.publish("b", CID).await;
     assert_eq!(fixture.target_state(&b).await, "quota_waiting");
     fixture.target.release.add_permits(1);
     wait_for(|| async { fixture.receipt().await.outcome == "unknown" }).await;
@@ -950,11 +992,11 @@ async fn complete_receipt_before_takeover_parks_is_not_stranded_and_waiters_stay
         "old receipt may not replace B's live claim"
     );
     assert_ne!(fixture.target_state(&a).await, "pinned");
-    let b = fixture.publish("b", OTHER).await;
+    let b = fixture.publish("b", CID).await;
     assert_eq!(
         fixture.target_state(&b).await,
         "quota_waiting",
-        "complete but unprojected evidence is temporary, not operator debt"
+        "the same CID waits for projection"
     );
     jobs::park_submit(
         fixture.store.db(),
@@ -971,9 +1013,9 @@ async fn complete_receipt_before_takeover_parks_is_not_stranded_and_waiters_stay
     .await;
     worker.shutdown(Duration::from_secs(2)).await;
     assert!(!fixture.receipt().await.needs_attention);
-    fixture.held(200, 2).await;
-    fixture.assert_posts(2);
-    assert_eq!(fixture.target.reads.load(Ordering::SeqCst), 2);
+    fixture.held(100, 1).await;
+    fixture.assert_posts(1);
+    assert_eq!(fixture.target.reads.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -988,15 +1030,22 @@ async fn late_mismatch_and_extra_root_never_recover_from_expected_pin() {
             .coordinator
             .start(fixture.store.clone(), CancellationToken::new());
         held_start(&fixture).await;
-        fixture.takeover_park().await;
+        fixture.expire_submit_claim().await;
+        let recovery = fixture.coordinator.start(fixture.store.clone(), CancellationToken::new());
+        wait_for(|| async { fixture.submit().await.state == "error" }).await;
+        recovery.shutdown(Duration::from_secs(2)).await;
         fixture.target.release.add_permits(1);
         wait_for(|| async { fixture.receipt().await.observed_at.is_some() }).await;
         worker.shutdown(Duration::from_secs(2)).await;
         assert_eq!(fixture.receipt().await.outcome, "cid_mismatch");
         assert!(fixture.receipt().await.needs_attention);
         assert_ne!(fixture.target_state(&target).await, "pinned");
-        assert_eq!(fixture.submit().await.state, "running");
+        assert_eq!(fixture.submit().await.state, "error");
         assert!(fixture.submit().await.locked_until.is_none());
+        for (key, cid) in [("source-retry", CID), ("reported-retry", OTHER)] {
+            let blocked = fixture.publish(key, cid).await;
+            assert_eq!(fixture.target_state(&blocked).await, "quota_blocked");
+        }
         assert_eq!(
             fixture.target.reads.load(Ordering::SeqCst),
             0,
@@ -1188,7 +1237,7 @@ async fn postgres_actual_worker_receipt_lock_order_and_recoverable_waiters() {
                 .unwrap(),
             ledger::submission::AdmissionBarrier::Temporary
         );
-        let b = fixture.publish("b", OTHER).await;
+        let b = fixture.publish("b", CID).await;
         assert_eq!(fixture.target_state(&b).await, "quota_waiting");
         fixture.takeover_park().await;
         assert_eq!(
@@ -1219,9 +1268,9 @@ async fn postgres_actual_worker_receipt_lock_order_and_recoverable_waiters() {
         })
         .await;
         worker.shutdown(Duration::from_secs(2)).await;
-        fixture.held(200, 2).await;
-        fixture.assert_posts(2);
-        assert_eq!(fixture.target.reads.load(Ordering::SeqCst), 2);
+        fixture.held(100, 1).await;
+        fixture.assert_posts(1);
+        assert_eq!(fixture.target.reads.load(Ordering::SeqCst), 1);
         assert!(!fixture.receipt().await.needs_attention);
         assert!(
             !ledger::submission::has_debt(fixture.store.db(), &fixture.provider)

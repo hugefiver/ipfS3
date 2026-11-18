@@ -1083,7 +1083,7 @@ async fn bounded_candidate_pages_progress_past_inflight_and_unwakeable_history()
             .unwrap()
             .is_some()
     );
-    assert_eq!(found[0].id, invocation.claimed.model.id);
+    assert_eq!(found[0], invocation.claimed.model.id);
     let work = crate::store::pinning::management::records::SharedDecodeBudget::default();
     let tx = store
         .begin_runtime(crate::store::pinning::management::records::DecodeWork::shared(&work))
@@ -1092,7 +1092,7 @@ async fn bounded_candidate_pages_progress_past_inflight_and_unwakeable_history()
     assert!(
         wake_runtime_parked(
             &tx,
-            &found[0].id,
+            &found[0],
             invocation.now,
             crate::store::pinning::management::records::DecodeWork::shared(&work)
         )
@@ -1100,7 +1100,7 @@ async fn bounded_candidate_pages_progress_past_inflight_and_unwakeable_history()
         .unwrap()
     );
     tx.commit().await.unwrap();
-    let awakened = pin_job::Entity::find_by_id(&found[0].id)
+    let awakened = pin_job::Entity::find_by_id(&found[0])
         .one(store.db())
         .await
         .unwrap()

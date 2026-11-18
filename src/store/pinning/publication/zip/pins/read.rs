@@ -229,12 +229,14 @@ impl PinEvidence {
                 }
             }
         }
+        // Unresolved receipts are checked by resource at both admission and final
+        // settlement. Only settled receipts can support a positive projection.
         let mut submissions = BTreeMap::new();
         for row in by_pairs_column::<pin_submit_observation::Entity, _>(
             db,
             &evidence_pairs,
             "expected_cid",
-            "",
+            "AND needs_attention=FALSE",
             "id",
             work,
             resident,
@@ -245,10 +247,11 @@ impl PinEvidence {
             submissions.insert(row.id.clone(), row);
         }
         let ids = job_ids.iter().cloned().collect::<Vec<_>>();
-        for row in by_ids::<pin_submit_observation::Entity, _>(
+        for row in by_ids_where::<pin_submit_observation::Entity, _>(
             db,
             "job_id",
             &ids,
+            "AND needs_attention=FALSE",
             work,
             resident,
             maintenance.as_deref_mut(),
@@ -555,10 +558,12 @@ impl LockedPins {
         let mut retired_sources = BTreeSet::new();
         let mut unconfirmed_sources = BTreeSet::new();
         for provider in &providers {
-            barriers.insert(
-                provider.clone(),
-                ledger::submission::admission_barrier_with_catalog(provider, catalog, work).await?,
-            );
+            for (cid, barrier) in
+                ledger::submission::admission_barriers_with_catalog(provider, catalog, &work, true)
+                    .await?
+            {
+                barriers.insert((provider.clone(), cid), barrier);
+            }
             let provider_pairs = remotes
                 .keys()
                 .filter(|(candidate, _)| candidate == provider)

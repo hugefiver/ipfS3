@@ -168,7 +168,7 @@ async fn resource_release_history_at_final_settlement_rolls_back() {
 async fn unknown_submission_evidence_at_final_settlement_rolls_back() {
     rejects_settlement_mutation(
         "INSERT INTO pin_submit_observations(id,job_id,submit_call,provider,expected_cid,route,remote_epoch,claim_until,effect,resources,outcome,safe_error,needs_attention,started_at,observed_at)
-         SELECT 'injected-evidence','historical-job',1,provider,'historical-cid',route,1,CURRENT_TIMESTAMP,'unknown','[]','unknown',NULL,1,CURRENT_TIMESTAMP,NULL
+         SELECT 'injected-evidence','historical-job',1,provider,cid,route,1,CURRENT_TIMESTAMP,'unknown','[]','unknown',NULL,1,CURRENT_TIMESTAMP,NULL
          FROM remote_pin_ledger LIMIT 1;",
     )
     .await;
@@ -185,7 +185,7 @@ async fn replica_observation_at_final_settlement_rolls_back() {
 }
 
 #[tokio::test]
-async fn expected_new_rpc_reservation_keeps_final_submission_barrier_clear() {
+async fn zip_settlement_holds_unresolved_cid_and_reserves_unrelated_output() {
     use ipfs_s3_gateway::{
         config::Config,
         pinning::{config::ValidatedPinningConfig, coordinator::normalize_validated_config},
@@ -243,22 +243,38 @@ async fn expected_new_rpc_reservation_keeps_final_submission_barrier_clear() {
     .unwrap();
     let db = setup().await;
     let cid = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
+    let other = "bafkreigh2akiscaildc6ii5zji4bq7kly5k3s7svv6q2wx2nn5rtj5xuu4";
     let (request, batch, capture, guard) = stage9_zip_support::prepared_with_outputs(
         &db,
         &config,
         vec![],
-        vec![("a".into(), stage9_zip_support::object("a", "out/a", cid))],
+        vec![
+            ("a".into(), stage9_zip_support::object("a", "out/a", cid)),
+            ("b".into(), stage9_zip_support::object("b", "out/b", other)),
+        ],
     )
     .await;
+    db.execute_unprepared(&format!("INSERT INTO pin_submit_observations(id,job_id,submit_call,provider,expected_cid,route,remote_epoch,claim_until,effect,resources,outcome,needs_attention,started_at,observed_at) SELECT 'unknown','prior',1,provider,'{cid}',snapshot,1,CURRENT_TIMESTAMP,'unknown','[]','unknown',TRUE,CURRENT_TIMESTAMP,'invalid timestamp' FROM pin_provider_routes")).await.unwrap();
     publish(&db, &config, request, batch, &capture, guard)
         .await
         .unwrap();
     let ledgers = remote_pin_ledger::Entity::find().all(&db).await.unwrap();
     assert_eq!(ledgers.len(), 1);
-    assert_eq!(ledgers[0].effect, "reserved");
+    assert_eq!((&*ledgers[0].cid, &*ledgers[0].effect), (other, "reserved"));
+    let targets = pin_lease_target::Entity::find().all(&db).await.unwrap();
+    assert!(
+        targets
+            .iter()
+            .any(|t| t.cid == cid && t.state == "quota_blocked")
+    );
+    assert!(
+        targets
+            .iter()
+            .any(|t| t.cid == other && t.state == "waiting")
+    );
     assert_eq!(
         admission_barrier(&db, &ledgers[0].provider).await.unwrap(),
-        AdmissionBarrier::Clear
+        AdmissionBarrier::Operator
     );
     assert_eq!(jobs::history::Entity::find().count(&db).await.unwrap(), 0);
 }

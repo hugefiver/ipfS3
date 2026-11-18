@@ -28,7 +28,7 @@ from a key prefix.
 | State or evidence | Meaning and next step |
 | --- | --- |
 | `quota_waiting` | Capacity is unavailable. Check the current matching policy and provider capacity; One mode can select an eligible successor. Do not increase recorded capacity by deleting rows. |
-| `quota_blocked` or an `Operator` admission barrier | Inspect unresolved provider responsibilities and route fences. More free quota alone does not remove an unknown mutation. |
+| `quota_blocked` or an `Operator` admission barrier | Check the target size, the receipt for this CID and any resources reported by that receipt. Unrelated CIDs can use remaining capacity on the same provider. |
 | `running`, `recovering`, no `locked_until` | The job is parked. This database state does not mean a live task holds worker concurrency. |
 | `needs_attention`, unknown effect | The gateway cannot prove the complete remote outcome. Use evidence-based reconciliation; never blindly resubmit. |
 | `error` | The task or target has a terminal configuration, identity or state error. Inspect its reason; ordinary scans and restoring an old configuration do not restart it. |
@@ -66,9 +66,9 @@ for source preparation, confirmation expiry and exact-version selectors.
 
 Read the resulting observations and current responsibility, not only the CLI
 exit status. If the historical account is unavailable, a response is incomplete,
-additional resources remain unexplained or another invocation in the same
-allocation domain is unresolved, retain the barrier. Resolving one target does
-not settle other provider debt.
+or the receipt reports additional unexplained resources, retain the reservation
+and defer mutations of those CIDs. Resolving one target does not settle another
+target's debt.
 
 ## Renew or reapply only eligible intent
 
@@ -100,8 +100,8 @@ database failure is reported as a database failure, not committed as a successfu
 skip.
 
 Termination does not prove that a remote mutation failed. Unknown effects remain
-in the ledger and retain their quota responsibility; the affected provider's
-unsafe new mutations remain blocked until evidence resolves them. Read-only
+in the ledger and retain their quota responsibility. Mutations that depend on
+those effects wait; independent CIDs remain eligible. Read-only
 reconciliation does not restart the terminal task or grant a replacement Submit.
 
 Drain and upgrade all gateway writers and workers together, with a database backup.

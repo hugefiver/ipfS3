@@ -373,7 +373,7 @@ async fn quota_waiter_keeps_fifo_source_when_suffix_has_no_capacity_or_operator_
             remote_pin_ledger::Entity::insert(remote_pin_ledger::ActiveModel {
                 route: Set(Some(serde_json::to_string(&historical).unwrap())),
                 provider: Set("fast".to_owned()),
-                cid: Set("bafy-unresolved-fast".to_owned()),
+                cid: Set(CID.to_owned()),
                 ownership: Set("unknown".to_owned()),
                 effect: Set("unknown".to_owned()),
                 ..Default::default()
@@ -898,8 +898,8 @@ async fn stateful_keyset_terminates_bad_source_and_advances_independent_provider
             .unwrap()
             .unwrap()
             .state,
-        "quota_waiting",
-        "the blocked provider tail must not bypass its queue head"
+        "error",
+        "a different CID on the same invalid source is classified independently"
     );
 
     super::super::quota_waiter::coordinate_with_state(
@@ -1099,8 +1099,11 @@ async fn quota_waiter_executes_under_current_managed_route_without_gaining_clean
 }
 
 #[tokio::test]
-async fn failed_page_head_is_retried_before_same_source_tail_on_the_next_tick() {
+async fn failed_page_head_rolls_back_without_delaying_healthy_cid_and_is_revisited() {
     let mut fixture = fixture_with_noop_limits([], 100, 1).await;
+    PinningCoordinator::configure_worker_for_test(&mut fixture.coordinator, |settings| {
+        settings.claim_limit = 1
+    });
     let now = seed_one_quota_waiter(&mut fixture).await;
     let tail_created = now + chrono::Duration::nanoseconds(1);
     fixture
@@ -1126,44 +1129,75 @@ async fn failed_page_head_is_retried_before_same_source_tail_on_the_next_tick() 
         .unwrap();
     let mut scan = super::super::quota_waiter::ScanState::default();
 
-    pin_lease_target::Entity::update_many()
-        .col_expr(
-            pin_lease_target::Column::Id,
-            Expr::value("target-page-head"),
+    let db = fixture.store.db();
+    db.execute_unprepared(&format!("CREATE TRIGGER fail_head BEFORE INSERT ON pin_lease_targets WHEN NEW.provider='fast' AND NEW.cid='{CID}' BEGIN SELECT RAISE(ABORT,'target temporarily unavailable'); END")).await.unwrap();
+    for _ in 0..2 {
+        super::super::quota_waiter::coordinate_with_state(
+            &fixture.coordinator,
+            &fixture.store,
+            now,
+            &mut scan,
         )
-        .filter(pin_lease_target::Column::Id.eq(SOURCE_TARGET_ID))
-        .exec(fixture.store.db())
         .await
         .unwrap();
-    for tick in 1..=2 {
-        super::super::quota_waiter::fail_candidate_once("target-page-head").await;
-        assert!(
-            super::super::quota_waiter::coordinate_with_state(
-                &fixture.coordinator,
-                &fixture.store,
-                now,
-                &mut scan,
-            )
-            .await
-            .is_err(),
-            "tick {tick} must retry the unresolved page head"
-        );
-        assert_eq!(
-            pin_lease_target::Entity::find_by_id("target-page-tail")
-                .one(fixture.store.db())
-                .await
-                .unwrap()
-                .unwrap()
-                .state,
-            "quota_waiting",
-            "an errored head must not publish a cursor past its same-source tail"
-        );
-        assert!(
-            pin_provider_usage::Entity::find_by_id("fast")
-                .one(fixture.store.db())
-                .await
-                .unwrap()
-                .is_none()
-        );
     }
+    assert_eq!(
+        pin_lease_target::Entity::find_by_id(SOURCE_TARGET_ID)
+            .one(db)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        "quota_waiting"
+    );
+    assert_eq!(
+        pin_lease_target::Entity::find_by_id("target-page-tail")
+            .one(db)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        "released"
+    );
+    assert!(
+        remote_pin::Entity::find_by_id(("fast".to_string(), CID.to_string()))
+            .one(db)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let usage = pin_provider_usage::Entity::find_by_id("fast")
+        .one(db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((usage.reserved_bytes, usage.reserved_pins), (100, 1));
+    db.execute_unprepared("DROP TRIGGER fail_head")
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        super::super::quota_waiter::coordinate_with_state(
+            &fixture.coordinator,
+            &fixture.store,
+            now,
+            &mut scan,
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        pin_lease_target::Entity::find_by_id(SOURCE_TARGET_ID)
+            .one(db)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        "released"
+    );
+    let usage = pin_provider_usage::Entity::find_by_id("fast")
+        .one(db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((usage.reserved_bytes, usage.reserved_pins), (200, 2));
 }

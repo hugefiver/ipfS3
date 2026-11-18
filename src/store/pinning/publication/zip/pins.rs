@@ -51,7 +51,7 @@ pub(super) struct LockedPins {
     usages: BTreeMap<String, pin_provider_usage::Model>,
     jobs: BTreeMap<String, pin_job::Model>,
     invocations: BTreeMap<String, pin_invocation_route::Model>,
-    barriers: BTreeMap<String, AdmissionBarrier>,
+    barriers: BTreeMap<Pair, AdmissionBarrier>,
     retired_sources: BTreeSet<Pair>,
     unconfirmed_sources: BTreeSet<Pair>,
     new_allocation_safe: bool,

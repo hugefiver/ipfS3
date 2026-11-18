@@ -273,7 +273,7 @@ fn collect_current_proposal(
 
     match context.candidate.target.kind {
         VersionKind::Object => {
-            let Some(due_at) = current_due_at(expiration, context.candidate)? else {
+            let Some(due_at) = current_due_at(expiration, context.candidate) else {
                 return Ok(());
             };
             if context.facts.database_now >= due_at {
@@ -301,7 +301,7 @@ fn collect_current_proposal(
             CurrentExpiration::Date { .. } | CurrentExpiration::Days { .. }
                 if context.facts.public_version_count == 1 =>
             {
-                let Some(due_at) = current_due_at(expiration, context.candidate)? else {
+                let Some(due_at) = current_due_at(expiration, context.candidate) else {
                     return Ok(());
                 };
                 if context.facts.database_now >= due_at {
@@ -394,8 +394,11 @@ fn collect_noncurrent_proposal(
     let Some(became_noncurrent_at) = context.candidate.became_noncurrent_at else {
         return Ok(());
     };
-    let due_at =
-        next_utc_midnight_after_full_days(became_noncurrent_at, expiration.noncurrent_days)?;
+    let Ok(due_at) =
+        next_utc_midnight_after_full_days(became_noncurrent_at, expiration.noncurrent_days)
+    else {
+        return Ok(());
+    };
     let newer_satisfied = expiration
         .newer_noncurrent_versions
         .is_none_or(|required| context.facts.newer_noncurrent_count > u64::from(required));
@@ -414,13 +417,13 @@ fn collect_noncurrent_proposal(
 fn current_due_at(
     expiration: &CurrentExpiration,
     candidate: &VersionLifecycleCandidate,
-) -> AppResult<Option<DateTime<Utc>>> {
+) -> Option<DateTime<Utc>> {
     match expiration {
-        CurrentExpiration::Date { utc_midnight } => Ok(Some(*utc_midnight)),
+        CurrentExpiration::Date { utc_midnight } => Some(*utc_midnight),
         CurrentExpiration::Days { days } => {
-            next_utc_midnight_after_full_days(candidate.lifecycle_age_started_at, *days).map(Some)
+            next_utc_midnight_after_full_days(candidate.lifecycle_age_started_at, *days).ok()
         }
-        CurrentExpiration::ExpiredObjectDeleteMarker => Ok(None),
+        CurrentExpiration::ExpiredObjectDeleteMarker => None,
     }
 }
 
@@ -1206,7 +1209,18 @@ mod tests {
             noncurrent_days: 1,
             newer_noncurrent_versions: None,
         };
-        let rules = configuration(vec![rule("nve", all(), None, Some(expiration))]);
+        let rules = configuration(vec![
+            rule(
+                "far-future",
+                all(),
+                None,
+                Some(NoncurrentExpiration {
+                    noncurrent_days: i32::MAX as u32,
+                    newer_noncurrent_versions: None,
+                }),
+            ),
+            rule("nve", all(), None, Some(expiration)),
+        ]);
         for kind in [VersionKind::Object, VersionKind::DeleteMarker] {
             let candidate = noncurrent(kind, at(1, 0, 0));
             let action = evaluate_candidate(&context(&candidate, &[], 2, 0, &rules, at(3, 0, 0)))
@@ -1430,21 +1444,31 @@ mod tests {
         .await
         .unwrap();
 
-        let rules = configuration(vec![rule(
-            "tagged-current",
-            CanonicalRuleSelector::Modern {
-                filter: CanonicalFilter::Tag {
-                    tag: CanonicalTag {
-                        key: "class".to_owned(),
-                        value: "cold".to_owned(),
+        let rules = configuration(vec![
+            rule(
+                "far-future",
+                all(),
+                Some(CurrentExpiration::Days {
+                    days: i32::MAX as u32,
+                }),
+                None,
+            ),
+            rule(
+                "tagged-current",
+                CanonicalRuleSelector::Modern {
+                    filter: CanonicalFilter::Tag {
+                        tag: CanonicalTag {
+                            key: "class".to_owned(),
+                            value: "cold".to_owned(),
+                        },
                     },
                 },
-            },
-            Some(CurrentExpiration::Date {
-                utc_midnight: at(1, 0, 0),
-            }),
-            None,
-        )]);
+                Some(CurrentExpiration::Date {
+                    utc_midnight: at(1, 0, 0),
+                }),
+                None,
+            ),
+        ]);
         let claim = ClaimedLifecycleScan {
             bucket: "bucket".to_owned(),
             config_revision: 7,
