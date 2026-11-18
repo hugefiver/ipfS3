@@ -246,7 +246,11 @@ pub(super) fn send_error(error_value: reqwest::Error, mutation: bool) -> Provide
         } else {
             ProviderErrorClass::Transient
         },
-        "RPC transport request failed",
+        if error_value.is_timeout() {
+            "RPC transport request timed out"
+        } else {
+            "RPC transport request failed"
+        },
     )
 }
 

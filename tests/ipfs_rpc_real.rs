@@ -19,7 +19,7 @@ use ipfs_s3_gateway::{
             IpfsRpcProvider, RpcAuth, RpcPinKind, RpcPinObservation, RpcProfile, RpcResourceStatus,
             RpcStrategy, RpcSubmitEffect, RpcTimeouts,
         },
-        provider::{RemotePinStatus, SubmitPin},
+        provider::{PinningProvider, RemotePinStatus, SubmitPin},
     },
 };
 use std::{collections::BTreeMap, time::Duration};
@@ -71,10 +71,15 @@ async fn submit(provider: &IpfsRpcProvider, cid: &str) -> Result<()> {
         "not exact single-root evidence: {observation:?}"
     );
     let resource = &observation.resources[0];
+    let expected = if provider.invocation_route().1 == "cid" {
+        RpcResourceStatus::PinAccepted
+    } else {
+        RpcResourceStatus::RecursiveVerified
+    };
     ensure!(
         resource.cid == car::canonical(cid)?
             && resource.ownership == Ownership::Unknown
-            && resource.status == RpcResourceStatus::RecursiveVerified,
+            && resource.status == expected,
         "invalid evidence: {observation:?}"
     );
     let pin = observation.result?;
@@ -83,8 +88,8 @@ async fn submit(provider: &IpfsRpcProvider, cid: &str) -> Result<()> {
         "provider accepted a noncanonical/wrong root: {pin:?}"
     );
     println!(
-        "provider_submit cid={} recursive_verified=true ownership=Unknown",
-        pin.cid
+        "provider_submit cid={} evidence={:?} ownership=Unknown",
+        pin.cid, resource.status
     );
     Ok(())
 }
@@ -321,14 +326,7 @@ async fn rpc_provider_real_transports_and_local_dags() -> Result<()> {
             submit(&car_provider, &case.cid).await?;
             verify(&target, &car_provider, &case).await?;
         }
-        if let Err(error) = submit(&upload, &case.cid).await {
-            let response = target.diagnose_upload(&source, &case.cid).await;
-            eprintln!(
-                "diagnostic_direct_streamed_add pin=false not_provider_acceptance cid={} response={response:?}",
-                case.cid
-            );
-            return Err(error);
-        }
+        submit(&upload, &case.cid).await?;
         verify(&target, &upload, &case).await?;
         cases.push(case);
     }

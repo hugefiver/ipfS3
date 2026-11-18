@@ -202,14 +202,24 @@ impl SubmitEvidence {
 
 impl IpfsRpcProvider {
     pub async fn submit_observed(&self, request: SubmitPin) -> RpcSubmitObservation {
+        let started = std::time::Instant::now();
         let mut evidence = SubmitEvidence::new();
-        let result = self.submit_recorded(request, &mut evidence).await;
-        evidence.finish(result)
+        let result = self.submit_recorded(&request, &mut evidence).await;
+        let observation = evidence.finish(result);
+        if observation.effect == RpcSubmitEffect::Unknown
+            && let Err(error) = &observation.result
+        {
+            tracing::warn!(provider = %self.name, profile = self.profile.api_profile(),
+                strategy = self.strategy.as_str(), cid = %request.cid,
+                elapsed_ms = started.elapsed().as_millis(), reason = %error.message,
+                "RPC submit outcome unknown");
+        }
+        observation
     }
 
     async fn submit_recorded(
         &self,
-        request: SubmitPin,
+        request: &SubmitPin,
         evidence: &mut SubmitEvidence,
     ) -> Result<RemotePin, ProviderError> {
         cid::parse(&request.cid)?;

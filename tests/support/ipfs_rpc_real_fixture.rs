@@ -280,42 +280,6 @@ impl Rpc {
         .await
     }
 
-    /// Diagnostic replay only: same streamed bytes/add options, pin=false. It
-    /// cannot turn a failed provider observation into an acceptance success.
-    pub async fn diagnose_upload(&self, source: &Self, cid: &str) -> Result<String> {
-        let response = source.post("cat", &[("arg", cid)]).await?;
-        let body = reqwest::Body::wrap_stream(response.bytes_stream());
-        let form =
-            multipart::Form::new().part("file", multipart::Part::stream(body).file_name("object"));
-        let mut response = self
-            .client
-            .post(self.url(
-                "add",
-                &[
-                    ("cid-version", "1"),
-                    ("wrap-with-directory", "false"),
-                    ("raw-leaves", "true"),
-                    ("chunker", "size-262144"),
-                    ("hash", "sha2-256"),
-                    ("pin", "false"),
-                    ("progress", "true"),
-                ],
-            )?)
-            .multipart(form)
-            .send()
-            .await?
-            .error_for_status()?;
-        let mut records = Vec::new();
-        while let Some(chunk) = response.chunk().await? {
-            ensure!(
-                records.len() + chunk.len() <= 64 * 1024,
-                "diagnostic add response exceeds budget"
-            );
-            records.extend_from_slice(&chunk);
-        }
-        Ok(String::from_utf8(records)?)
-    }
-
     /// Explicit fixture preseed, never credited as a CID-strategy byte transfer.
     pub async fn preseed(&self, car: &[u8], root: &str, pin: bool) -> Result<()> {
         let blocks = super::car::blocks(car, root)?;
