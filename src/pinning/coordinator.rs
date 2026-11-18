@@ -60,15 +60,12 @@ pub struct WorkerSettings {
 }
 
 pub struct PinningCoordinator {
-    effective_config: ValidatedPinningConfig,
     source_kubo: Option<KuboClient>,
-    control_mode: OptionalPinControlMode,
     decompress_zip_config: DecompressZipConfig,
     zip_output_rules: ValidatedZipOutputRules,
     policy: PinPolicyEvaluator,
     policy_providers: HashMap<String, Vec<String>>,
     providers: HashMap<String, Arc<dyn PinningProvider>>,
-    limits: ProviderLimitMap,
     settings: WorkerSettings,
     provider_runtime: HashMap<String, ProviderRuntime>,
     identities: HashMap<String, ProviderIdentity>,
@@ -262,21 +259,16 @@ impl PinningCoordinator {
             max_attempts: 8,
             shutdown_grace: Duration::from_secs(30),
         };
-        let policy = PinPolicyEvaluator::with_mode(&config, mode);
         let policy_providers = config
             .policies
             .iter()
             .map(|policy| (policy.identity.clone(), policy.providers.clone()))
             .collect();
-        let limits = config.provider_limits.clone();
-        // Preserve the same alias-resolved snapshot used by the policy and worker,
-        // before provider construction consumes credentials and route options.
-        let effective_config = config.clone();
         let mut providers: HashMap<String, Arc<dyn PinningProvider>> = HashMap::new();
         let mut provider_runtime = HashMap::new();
         let mut identities = HashMap::new();
 
-        for provider in config.providers {
+        for provider in &config.providers {
             let name = provider.name.clone();
             if identities.contains_key(&name) {
                 continue;
@@ -303,30 +295,33 @@ impl PinningCoordinator {
                 },
             );
             let implementation: Arc<dyn PinningProvider> = match provider.kind {
-                ProviderKind::Cluster => build_cluster_provider(&provider, kubo.clone())?,
-                ProviderKind::IpfsRpc => Arc::new(build_rpc_provider(&provider, kubo.clone())?),
+                ProviderKind::Cluster => build_cluster_provider(provider, kubo.clone())?,
+                ProviderKind::IpfsRpc => Arc::new(build_rpc_provider(provider, kubo.clone())?),
                 ProviderKind::Filebase if provider.rpc.is_some() => {
-                    Arc::new(build_rpc_provider(&provider, kubo.clone())?)
+                    Arc::new(build_rpc_provider(provider, kubo.clone())?)
                 }
                 ProviderKind::Pinata => Arc::new(build_pinata_with_options(
-                    provider.name,
+                    name.clone(),
                     provider
                         .token
+                        .clone()
                         .context("validated Pinata provider is missing its token")?,
-                    provider.endpoint,
+                    provider.endpoint.clone(),
                     provider
                         .pinata
+                        .clone()
                         .context("validated Pinata provider is missing its options")?,
                     kubo.clone(),
                 )),
                 ProviderKind::Filebase => Arc::new(build_filebase(
-                    provider.name,
+                    name.clone(),
                     provider
                         .token
+                        .clone()
                         .context("validated Filebase provider is missing its token")?,
-                    provider.endpoint,
+                    provider.endpoint.clone(),
                 )),
-                ProviderKind::Noop => Arc::new(NoopProvider::new(provider.name)),
+                ProviderKind::Noop => Arc::new(NoopProvider::new(name.clone())),
             };
             if providers.insert(name.clone(), implementation).is_some() {
                 return Err(anyhow!("duplicate validated provider `{name}`"));
@@ -334,15 +329,15 @@ impl PinningCoordinator {
         }
 
         Ok(Arc::new(Self {
-            effective_config,
             source_kubo: kubo,
-            control_mode: mode,
             decompress_zip_config: zip.clone(),
             zip_output_rules,
-            policy,
+            policy: PinPolicyEvaluator {
+                config,
+                optional_control: mode,
+            },
             policy_providers,
             providers,
-            limits,
             settings,
             provider_runtime,
             identities,
@@ -362,7 +357,7 @@ impl PinningCoordinator {
 
     /// Internal-only: contains resolved provider tokens; never log or expose over HTTP.
     pub fn effective_config(&self) -> &ValidatedPinningConfig {
-        &self.effective_config
+        &self.policy.config
     }
 
     pub(crate) fn management_source(&self) -> Option<&KuboClient> {
@@ -370,7 +365,7 @@ impl PinningCoordinator {
     }
 
     pub fn control_mode(&self) -> OptionalPinControlMode {
-        self.control_mode
+        self.policy.optional_control
     }
 
     pub fn zip_root_default(&self) -> bool {
@@ -390,7 +385,7 @@ impl PinningCoordinator {
     }
 
     pub fn provider_limits(&self) -> &ProviderLimitMap {
-        &self.limits
+        &self.effective_config().provider_limits
     }
 
     pub fn provider(&self, name: &str) -> Option<Arc<dyn PinningProvider>> {
@@ -419,7 +414,7 @@ impl PinningCoordinator {
         // Match provider construction: canonical order, first alias per allocation.
         // The validated route also captures its confirmation requirement.
         let mut registered = std::collections::HashSet::new();
-        for provider in &self.effective_config.providers {
+        for provider in &self.effective_config().providers {
             if !registered.insert(&provider.name) {
                 continue;
             }
@@ -453,7 +448,7 @@ impl PinningCoordinator {
         route: &crate::pinning::identity::ProviderRouteSnapshot,
     ) -> Option<&str> {
         let provider = self
-            .effective_config
+            .effective_config()
             .providers
             .iter()
             .find(|provider| provider.name == key)?;
@@ -501,7 +496,7 @@ impl PinningCoordinator {
         let mut eligible = vec![failed_provider.to_owned()];
         for provider in &configured[failed_index + 1..] {
             if !self
-                .limits
+                .provider_limits()
                 .get(provider)
                 .is_some_and(|limits| limits.enabled)
             {
@@ -577,11 +572,9 @@ impl PinningCoordinator {
         coordinator
             .policy_providers
             .insert(policy_id.to_owned(), providers.clone());
-        coordinator
-            .effective_config
-            .policies
-            .retain(|policy| !(policy.bucket == "bucket" && policy.prefix == "one/"));
-        coordinator.effective_config.policies.insert(
+        let policies = &mut coordinator.policy.config.policies;
+        policies.retain(|policy| !(policy.bucket == "bucket" && policy.prefix == "one/"));
+        policies.insert(
             0,
             super::config::ValidatedPolicy {
                 identity: policy_id.to_owned(),
@@ -595,8 +588,6 @@ impl PinningCoordinator {
                 allow_decompressed: true,
             },
         );
-        coordinator.policy =
-            PinPolicyEvaluator::with_mode(&coordinator.effective_config, coordinator.control_mode);
     }
 }
 

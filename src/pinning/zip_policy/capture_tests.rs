@@ -790,6 +790,40 @@ fn accepted_manual_control_resolves_current_scope_duration_and_provider_order() 
 }
 
 #[test]
+fn current_resolution_rejects_unrepresentable_persisted_controls_before_policy_lookup() {
+    let mut config = fixture();
+    let original = capture(&config, &enabled(), true, &[], &[]).unwrap();
+    let mut value = serde_json::to_value(original).unwrap();
+    value["source_decision"]["effect"] = "skipped".into();
+    value["source_decision"]["warning"] = "no_matching_policy".into();
+    config.policies.clear();
+    for (control, expected) in [
+        (
+            serde_json::json!({"request": {"duration": 0, "content": "object"}}),
+            "invalid lease duration",
+        ),
+        (
+            serde_json::json!({"request": {"duration": u64::MAX, "content": "object"}}),
+            "invalid lease duration",
+        ),
+        (
+            serde_json::json!({"renew": {"retain_until": "+010000-01-01T00:00:00Z"}}),
+            "invalid ipfs-s3:retain-until",
+        ),
+    ] {
+        value["source_decision"]["control"] = control;
+        let decoded = CapturedZipIntent::decode_json(&value.to_string()).unwrap();
+        let error = decoded
+            .resolve_current(&config, &enabled(), OptionalPinControlMode::Warn)
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("invalid pinning request: {expected}")
+        );
+    }
+}
+
+#[test]
 fn current_automatic_remote_candidates_require_durable_identity_after_admission() {
     let mut explicit = fixture();
     let provider = &mut explicit.providers[0];

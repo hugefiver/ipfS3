@@ -34,14 +34,10 @@ fn zip_limits_for_call(
     state: &AppState,
     max_decompressed_bytes: u64,
 ) -> crate::zip::extract::ZipExtractionLimits {
-    let limits = state.pinning.zip_extraction_limits();
-    let total = limits.max_decompressed_bytes().min(max_decompressed_bytes);
-    limits
-        .with_decompressed_bytes(total)
-        .and_then(|limits| {
-            limits.with_single_entry_bytes(limits.max_single_entry_bytes().min(total))
-        })
-        .expect("minimum of validated ZIP budgets must remain valid")
+    state
+        .pinning
+        .zip_extraction_limits()
+        .cap_decompressed_bytes(max_decompressed_bytes)
 }
 
 fn raw_zip_input_too_large() -> s3s::S3Error {

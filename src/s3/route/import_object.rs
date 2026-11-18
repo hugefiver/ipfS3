@@ -33,7 +33,7 @@ use crate::{
         ownership, results,
     },
     store::zip::{execution, import_intake},
-    zip::options::{ZipOptions, parse_authenticated_zip_controls},
+    zip::options::{ParsedZipControls, ZipOptions},
 };
 
 pub struct ImportObjectRoute {
@@ -84,14 +84,16 @@ impl ImportObjectRoute {
         let client_token = parse_client_token(&req.headers)?;
         let object_content_type =
             optional_single_header(&req.headers, "x-ipfs3-object-content-type")?;
-        let tags = parse_tags(&req.headers, parsed_query.decompress_prefix.is_some())?;
-        let controls = parse_authenticated_zip_controls(
+        let is_zip = parsed_query.zip_query.0.is_some();
+        let tags = parse_tags(&req.headers, is_zip)?;
+        let controls = ParsedZipControls::from_query(
             &req.headers,
-            &crate::s3::query::decoded_query_pairs(&req.uri)?,
+            parsed_query.zip_query,
             &tags,
-            parsed_query.decompress_prefix.is_some(),
+            is_zip,
             self.root_default,
         )?;
+        let decompress_prefix = controls.as_ref().and_then(|c| c.target_prefix.as_deref());
         let root_capture = controls.as_ref().map(|controls| controls.root);
         let metadata = parse_metadata(&req.headers);
         let zip_options = controls
@@ -102,7 +104,7 @@ impl ImportObjectRoute {
         let mut expected_sha256 = None;
         if let ZipOptions::V2(options) = &zip_options {
             validate_v2_import_headers(options, client_token.as_deref())?;
-            if parsed_query.decompress_prefix.is_none() {
+            if !is_zip {
                 return Err(s3s::s3_error!(
                     InvalidRequest,
                     "unsupported ZIP v2 import publication mode"
@@ -118,10 +120,7 @@ impl ImportObjectRoute {
         };
         let principal = crate::s3::ops::object::principal_id(&req)?;
         if let ZipOptions::V2(mut options) = zip_options {
-            let prefix = parsed_query
-                .decompress_prefix
-                .as_deref()
-                .expect("v2 prefix validated");
+            let prefix = decompress_prefix.expect("v2 prefix validated");
             let saved = execution::read_by_identity(
                 self.state.store.db(),
                 &principal,
@@ -283,9 +282,9 @@ impl ImportObjectRoute {
             object_content_type.as_deref(),
             &metadata,
             &tags,
-            parsed_query.decompress_prefix.as_deref(),
+            decompress_prefix,
         )?;
-        let request_fingerprint = match (parsed_query.decompress_prefix.as_deref(), root_capture) {
+        let request_fingerprint = match (decompress_prefix, root_capture) {
             (Some(prefix), Some(capture)) => request_zip_fingerprint(
                 &source,
                 &principal,
@@ -311,7 +310,7 @@ impl ImportObjectRoute {
                 Ok(Some(existing)) => return accepted_response(&req.uri, &existing),
                 Ok(None) => {}
                 Err(AppError::ImportIdempotencyConflict) => {
-                    if parsed_query.decompress_prefix.is_some() {
+                    if is_zip {
                         match ownership::preflight_idempotent_submission(
                             self.state.store.db(),
                             &parsed_query.bucket,
@@ -337,7 +336,7 @@ impl ImportObjectRoute {
                         object_content_type.as_deref(),
                         &metadata,
                         &tags,
-                        parsed_query.decompress_prefix.as_deref(),
+                        decompress_prefix,
                     )?;
                     match ownership::preflight_idempotent_submission(
                         self.state.store.db(),
@@ -381,30 +380,29 @@ impl ImportObjectRoute {
         }
 
         let job_id = uuid::Uuid::new_v4().to_string();
-        let zip_intent = if let (Some(prefix), Some(controls)) =
-            (parsed_query.decompress_prefix.as_deref(), controls.as_ref())
-        {
-            Some(
-                capture_zip_intent(
-                    self.state.pinning.effective_config(),
-                    self.state.pinning.decompress_zip_config(),
-                    self.state.pinning.control_mode(),
-                    ZipCaptureContext {
-                        bucket: &parsed_query.bucket,
-                        source_key: &parsed_query.key,
-                        target_prefix: prefix,
-                        tags: &tags,
-                    },
-                    controls,
-                    DecisionOrigin::new(&principal, &job_id),
+        let zip_intent =
+            if let (Some(prefix), Some(controls)) = (decompress_prefix, controls.as_ref()) {
+                Some(
+                    capture_zip_intent(
+                        self.state.pinning.effective_config(),
+                        self.state.pinning.decompress_zip_config(),
+                        self.state.pinning.control_mode(),
+                        ZipCaptureContext {
+                            bucket: &parsed_query.bucket,
+                            source_key: &parsed_query.key,
+                            target_prefix: prefix,
+                            tags: &tags,
+                        },
+                        controls,
+                        DecisionOrigin::new(&principal, &job_id),
+                    )
+                    .map_err(|_| {
+                        AppError::InvalidPinningRequest("invalid ZIP intent capture".into())
+                    })?,
                 )
-                .map_err(|_| {
-                    AppError::InvalidPinningRequest("invalid ZIP intent capture".into())
-                })?,
-            )
-        } else {
-            None
-        };
+            } else {
+                None
+            };
         let decision = if let Some(intent) = &zip_intent {
             intent.source_decision().clone()
         } else {
@@ -416,7 +414,7 @@ impl ImportObjectRoute {
                         bucket: &parsed_query.bucket,
                         key: &parsed_query.key,
                         tags: &tags,
-                        is_decompress_zip: parsed_query.decompress_prefix.is_some(),
+                        is_decompress_zip: is_zip,
                     },
                     DecisionOrigin::new(&principal, &job_id),
                 )
@@ -446,7 +444,7 @@ impl ImportObjectRoute {
             object_content_type,
             metadata,
             tags,
-            decompress_prefix: parsed_query.decompress_prefix,
+            decompress_prefix: controls.and_then(|controls| controls.target_prefix),
         };
         let submitted = ownership::submit_store(
             &self.state.store,

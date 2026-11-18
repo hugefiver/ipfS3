@@ -1031,7 +1031,9 @@ async fn late_mismatch_and_extra_root_never_recover_from_expected_pin() {
             .start(fixture.store.clone(), CancellationToken::new());
         held_start(&fixture).await;
         fixture.expire_submit_claim().await;
-        let recovery = fixture.coordinator.start(fixture.store.clone(), CancellationToken::new());
+        let recovery = fixture
+            .coordinator
+            .start(fixture.store.clone(), CancellationToken::new());
         wait_for(|| async { fixture.submit().await.state == "error" }).await;
         recovery.shutdown(Duration::from_secs(2)).await;
         fixture.target.release.add_permits(1);

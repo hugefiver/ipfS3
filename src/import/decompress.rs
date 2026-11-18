@@ -114,14 +114,10 @@ pub(crate) async fn decompress_import_with_context(
     let mut observer =
         ImportExtractionObserver::new(state, &job.bucket, &job.key, claim, cancellation, reporter);
     let outcome = {
-        let limits = state.pinning.zip_extraction_limits();
-        let total = max_decompressed_bytes.min(limits.max_decompressed_bytes());
-        let limits = limits
-            .with_decompressed_bytes(total)
-            .and_then(|limits| {
-                limits.with_single_entry_bytes(limits.max_single_entry_bytes().min(total))
-            })
-            .expect("minimum of validated ZIP budgets must remain valid");
+        let limits = state
+            .pinning
+            .zip_extraction_limits()
+            .cap_decompressed_bytes(max_decompressed_bytes);
         let extraction = extract_zip_stream_observed_with_limits(
             state,
             &target_prefix,

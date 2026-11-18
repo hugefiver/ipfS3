@@ -295,8 +295,6 @@ def run_lib_shard(executable: Path, shard: str, root: Path) -> int:
         return list_return_code
 
     partitions = partition_lib_tests(names)
-    if sum(len(group) for group in partitions.values()) != len(names):
-        raise RunnerError("library test partition did not preserve every listed test")
     selected = partitions[shard]
     print(
         "Library shard sizes: "

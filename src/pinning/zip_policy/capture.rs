@@ -1,4 +1,5 @@
 use anyhow::{Context, ensure};
+use chrono::Datelike;
 use serde::{Deserialize, Serialize};
 
 use super::{rules::CapturedProvider, *};
@@ -7,7 +8,7 @@ use crate::{
     pinning::{
         config::{PolicyTrigger, ValidatedPinningConfig},
         decision::{DecisionOrigin, ExtensionDecision},
-        policy::{LeaseSource, PinPolicyEvaluator, PublicationContext},
+        policy::{LeaseSource, PolicyError, PublicationContext},
         tags::{ContentMode, ObjectTag, PinControl, ZipRootCapture},
     },
     zip::options::{ParsedZipControls, ZipOptions, ZipTargets as WireTargets},
@@ -147,49 +148,34 @@ impl CapturedZipIntent {
         &self,
         config: &ValidatedPinningConfig,
         rules: &ValidatedZipOutputRules,
-        mode: OptionalPinControlMode,
+        _mode: OptionalPinControlMode,
     ) -> anyhow::Result<Self> {
         self.validate()?;
         let normalized = super::rules::normalized_for_zip(config)?;
         let config = normalized.as_ref();
-        let mut tags = Vec::new();
-        match &self.source_decision.control {
-            PinControl::Absent => {}
-            PinControl::Cancel => tags.push(ObjectTag::new("ipfs-s3:pin", "false")),
-            PinControl::Request { duration, content } => {
-                tags.push(ObjectTag::new("ipfs-s3:pin", "true"));
-                if let Some(duration) = duration {
-                    tags.push(ObjectTag::new(
-                        "ipfs-s3:duration",
-                        format!("{}s", duration.as_seconds()),
-                    ));
-                }
-                if *content == ContentMode::Decompressed {
-                    tags.push(ObjectTag::new("ipfs-s3:content", "decompressed"));
-                }
+        // Persisted controls can represent values outside the authenticated tag grammar.
+        match self.source_decision.control {
+            PinControl::Request {
+                duration: Some(duration),
+                ..
+            } if !(1..=i64::MAX as u64).contains(&duration.as_seconds()) => {
+                return Err(PolicyError::InvalidRequest("invalid lease duration".into()).into());
             }
-            PinControl::Renew { retain_until } => {
-                tags.push(ObjectTag::new("ipfs-s3:pin", "true"));
-                tags.push(ObjectTag::new(
-                    "ipfs-s3:retain-until",
-                    retain_until.to_rfc3339(),
-                ));
+            PinControl::Renew { retain_until } if !(0..=9999).contains(&retain_until.year()) => {
+                return Err(
+                    PolicyError::InvalidRequest("invalid ipfs-s3:retain-until".into()).into(),
+                );
             }
+            _ => {}
         }
-        let mut source = PinPolicyEvaluator::with_mode(config, mode).resolve_captured_publication(
-            PublicationContext {
-                bucket: &self.bucket,
-                key: &self.source_key,
-                tags: &tags,
-                is_decompress_zip: true,
-            },
+        let mut intents = config.resolve_captured_leases(
+            &self.bucket,
+            &self.source_key,
+            true,
             &self.source_decision,
         )?;
-        source
-            .leases
-            .retain(|intent| intent.source == LeaseSource::Manual);
-        let names = source
-            .leases
+        intents.retain(|intent| intent.source == LeaseSource::Manual);
+        let names = intents
             .iter()
             .flat_map(|intent| intent.providers.iter().cloned())
             .collect::<std::collections::BTreeSet<_>>()
@@ -198,7 +184,7 @@ impl CapturedZipIntent {
         let mut resolved = self.clone();
         resolved.policy = rules.clone();
         resolved.resolved_source = Some(ResolvedZipSource {
-            intents: source.leases,
+            intents,
             providers: super::rules::capture_providers(&names, config)?,
         });
         resolved.ensure_automatic_durable()?;
@@ -577,8 +563,9 @@ pub fn capture_zip_intent(
 ) -> anyhow::Result<CapturedZipIntent> {
     let normalized = super::rules::normalized_for_zip(config)?;
     let config = normalized.as_ref();
+    let control = PinControl::from_tags(context.tags)?;
     ensure!(
-        PinControl::from_tags(context.tags)? == parsed.pin,
+        control == parsed.pin,
         "ZIP capture controls do not match authenticated tags"
     );
     ensure!(
@@ -639,24 +626,21 @@ pub fn capture_zip_intent(
         controls.publish_source || matches!(parsed.pin, PinControl::Absent),
         "archive-owned manual pinning requires a published source"
     );
-    let (mut source_policy, mut source_decision) = PinPolicyEvaluator::with_mode(config, mode)
-        .evaluate_publication_decision(
-            PublicationContext {
-                bucket: context.bucket,
-                key: context.source_key,
-                tags: context.tags,
-                is_decompress_zip: true,
-            },
-            origin,
-        )?;
+    let mut source_decision = config.publication_decision(
+        mode,
+        &PublicationContext {
+            bucket: context.bucket,
+            key: context.source_key,
+            tags: context.tags,
+            is_decompress_zip: true,
+        },
+        control,
+        origin,
+    )?;
     // The archive owns manual groups; automatic work is selected per exact output.
-    source_policy
-        .leases
-        .retain(|intent| intent.source == LeaseSource::Manual);
-    source_decision.effective_intents = source_policy.leases.clone();
     source_decision
-        .validate_policy(&source_policy)
-        .map_err(anyhow::Error::msg)?;
+        .effective_intents
+        .retain(|intent| intent.source == LeaseSource::Manual);
     let names = source_decision
         .effective_intents
         .iter()

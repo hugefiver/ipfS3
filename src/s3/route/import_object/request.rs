@@ -22,7 +22,7 @@ pub(super) const MAX_RESULTS: u64 = 1_000;
 pub(super) struct ParsedSubmitQuery {
     pub bucket: String,
     pub key: String,
-    pub decompress_prefix: Option<String>,
+    pub zip_query: (Option<String>, bool, bool),
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -75,11 +75,10 @@ pub(super) fn parse_submit_query(uri: &Uri) -> S3Result<ParsedSubmitQuery> {
     if import_value != Some("") {
         return Err(invalid_import());
     }
-    let (decompress_prefix, _, _) = crate::zip::options::parse_authenticated_zip_query(&query)?;
     Ok(ParsedSubmitQuery {
         bucket,
         key,
-        decompress_prefix,
+        zip_query: crate::zip::options::parse_authenticated_zip_query(&query)?,
     })
 }
 

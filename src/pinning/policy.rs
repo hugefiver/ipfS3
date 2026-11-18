@@ -46,8 +46,8 @@ pub struct PublicationPolicy {
 
 #[derive(Debug, Clone)]
 pub struct PinPolicyEvaluator {
-    config: ValidatedPinningConfig,
-    optional_control: OptionalPinControlMode,
+    pub(super) config: ValidatedPinningConfig,
+    pub(super) optional_control: OptionalPinControlMode,
 }
 
 impl PinPolicyEvaluator {
@@ -71,79 +71,13 @@ impl PinPolicyEvaluator {
         origin: DecisionOrigin,
     ) -> Result<(PublicationPolicy, ExtensionDecision), PolicyError> {
         let control = pin_control(context.tags)?;
-        // A decompressed request outside ZIP is invalid even without a matching policy.
-        if matches!(
-            control,
-            PinControl::Request {
-                content: ContentMode::Decompressed,
-                ..
-            }
-        ) && !context.is_decompress_zip
-        {
-            return Err(invalid_request(
-                "decompressed pinning requires a decompress-zip upload",
-            ));
-        }
-        let selected = self.matching_policy(context.bucket, context.key);
-        let mut policy = match self.evaluate_publication(context.clone()) {
-            Ok(policy) => policy,
-            Err(_error)
-                if self.optional_control == OptionalPinControlMode::Warn
-                    && selected.is_none()
-                    && matches!(control, PinControl::Request { .. } | PinControl::Cancel) =>
-            {
-                // Only the absence of a policy is optional; parsing and structure already passed.
-                PublicationPolicy {
-                    tags: context.tags.to_vec(),
-                    leases: Vec::new(),
-                }
-            }
-            Err(error) => return Err(error),
+        let decision =
+            self.config
+                .publication_decision(self.optional_control, &context, control, origin)?;
+        let policy = PublicationPolicy {
+            tags: context.tags.to_vec(),
+            leases: decision.effective_intents.clone(),
         };
-        let warning = if selected.is_none() && !matches!(control, PinControl::Absent) {
-            Some(WarningCode::NoMatchingPolicy)
-        } else if let Some(selected) = selected {
-            let enabled = selected
-                .providers
-                .iter()
-                .filter(|name| {
-                    self.config
-                        .provider_limits
-                        .get(*name)
-                        .is_some_and(|limits| limits.enabled)
-                })
-                .count();
-            if !matches!(control, PinControl::Request { .. })
-                || (enabled > 0
-                    && (selected.provider_mode != ProviderMode::All
-                        || enabled == selected.providers.len()))
-            {
-                None
-            } else if self.optional_control == OptionalPinControlMode::Warn {
-                policy
-                    .leases
-                    .retain(|intent| intent.source != LeaseSource::Manual);
-                Some(WarningCode::NoAvailableProvider)
-            } else {
-                return Err(invalid_request("manual pinning has no available provider"));
-            }
-        } else {
-            None
-        };
-        let effect = if warning.is_some() {
-            DecisionEffect::Skipped
-        } else if policy
-            .leases
-            .iter()
-            .any(|intent| intent.source == LeaseSource::Manual)
-        {
-            DecisionEffect::Accepted
-        } else {
-            DecisionEffect::NoIntent
-        };
-        let decision = ExtensionDecision::capture(origin, effect, warning, control, &policy)
-            .map_err(invalid_request)?;
-        decision.validate_policy(&policy).map_err(invalid_request)?;
         Ok((policy, decision))
     }
 
@@ -158,16 +92,105 @@ impl PinPolicyEvaluator {
                 "captured control does not match publication tags",
             ));
         }
-        let Some(policy) = self.matching_policy(context.bucket, context.key) else {
+        let leases = self.config.resolve_captured_leases(
+            context.bucket,
+            context.key,
+            context.is_decompress_zip,
+            captured,
+        )?;
+        Ok(PublicationPolicy {
+            tags: context.tags.to_vec(),
+            leases,
+        })
+    }
+}
+
+impl ValidatedPinningConfig {
+    pub(super) fn publication_decision(
+        &self,
+        mode: OptionalPinControlMode,
+        context: &PublicationContext<'_>,
+        control: PinControl,
+        origin: DecisionOrigin,
+    ) -> Result<ExtensionDecision, PolicyError> {
+        // A decompressed request outside ZIP is invalid even without a matching policy.
+        if matches!(
+            control,
+            PinControl::Request {
+                content: ContentMode::Decompressed,
+                ..
+            }
+        ) && !context.is_decompress_zip
+        {
+            return Err(invalid_request(
+                "decompressed pinning requires a decompress-zip upload",
+            ));
+        }
+        let selected = self.matching_policy(context.bucket, context.key);
+        let no_matching_policy = selected.is_none()
+            && mode == OptionalPinControlMode::Warn
+            && matches!(control, PinControl::Request { .. } | PinControl::Cancel);
+        let mut leases = if no_matching_policy {
+            Vec::new()
+        } else {
+            publication_leases(selected, &control, context.is_decompress_zip)?
+        };
+        let warning = if no_matching_policy {
+            Some(WarningCode::NoMatchingPolicy)
+        } else if let Some(selected) =
+            selected.filter(|_| matches!(control, PinControl::Request { .. }))
+        {
+            let enabled = selected
+                .providers
+                .iter()
+                .filter(|name| {
+                    self.provider_limits
+                        .get(*name)
+                        .is_some_and(|limits| limits.enabled)
+                })
+                .count();
+            if enabled > 0
+                && (selected.provider_mode != ProviderMode::All
+                    || enabled == selected.providers.len())
+            {
+                None
+            } else if mode == OptionalPinControlMode::Warn {
+                leases.retain(|intent| intent.source != LeaseSource::Manual);
+                Some(WarningCode::NoAvailableProvider)
+            } else {
+                return Err(invalid_request("manual pinning has no available provider"));
+            }
+        } else {
+            None
+        };
+        let effect = if warning.is_some() {
+            DecisionEffect::Skipped
+        } else if leases
+            .iter()
+            .any(|intent| intent.source == LeaseSource::Manual)
+        {
+            DecisionEffect::Accepted
+        } else {
+            DecisionEffect::NoIntent
+        };
+        ExtensionDecision::from_parsed_control(origin, effect, warning, false, control, leases)
+            .map_err(invalid_request)
+    }
+
+    pub(super) fn resolve_captured_leases(
+        &self,
+        bucket: &str,
+        key: &str,
+        is_decompress_zip: bool,
+        captured: &ExtensionDecision,
+    ) -> Result<Vec<LeaseIntent>, PolicyError> {
+        let Some(policy) = self.matching_policy(bucket, key) else {
             if captured.effect == DecisionEffect::Accepted {
                 return Err(invalid_request(
                     "no pinning policy matches the accepted control",
                 ));
             }
-            return Ok(PublicationPolicy {
-                tags: context.tags.to_vec(),
-                leases: Vec::new(),
-            });
+            return Ok(Vec::new());
         };
         let mut leases = Vec::new();
         if policy.trigger == PolicyTrigger::Always {
@@ -183,7 +206,7 @@ impl PinPolicyEvaluator {
                 .providers
                 .iter()
                 .filter(|name| {
-                    self.config.providers.iter().any(|provider| {
+                    self.providers.iter().any(|provider| {
                         provider.name == **name
                             && provider.limits.enabled
                             && !provider.identity.retired
@@ -205,15 +228,20 @@ impl PinPolicyEvaluator {
             if duration > policy.max_duration {
                 return Err(invalid_request("requested duration exceeds policy maximum"));
             }
-            validate_manual_content(content, context.is_decompress_zip, policy)?;
+            validate_manual_content(content, is_decompress_zip, policy)?;
             leases.push(lease_intent(policy, LeaseSource::Manual, content, duration));
         }
-        Ok(PublicationPolicy {
-            tags: context.tags.to_vec(),
-            leases,
-        })
+        Ok(leases)
     }
 
+    fn matching_policy(&self, bucket: &str, key: &str) -> Option<&ValidatedPolicy> {
+        self.policies.iter().find(|policy| {
+            (policy.bucket == "*" || policy.bucket == bucket) && key.starts_with(&policy.prefix)
+        })
+    }
+}
+
+impl PinPolicyEvaluator {
     pub fn resolve_lease_policy(
         &self,
         bucket: &str,
@@ -237,43 +265,11 @@ impl PinPolicyEvaluator {
         context: PublicationContext<'_>,
     ) -> Result<PublicationPolicy, PolicyError> {
         let control = pin_control(context.tags)?;
-        let Some(policy) = self.matching_policy(context.bucket, context.key) else {
-            if matches!(control, PinControl::Absent) {
-                return Ok(PublicationPolicy {
-                    tags: context.tags.to_vec(),
-                    leases: Vec::new(),
-                });
-            }
-            return Err(invalid_request("no pinning policy matches this object"));
-        };
-
-        let mut leases = Vec::new();
-        if policy.trigger == PolicyTrigger::Always {
-            leases.push(lease_intent(
-                policy,
-                LeaseSource::Automatic,
-                ContentMode::Object,
-                policy.default_duration,
-            ));
-        }
-
-        match control {
-            PinControl::Absent | PinControl::Cancel => {}
-            PinControl::Request { duration, content } => {
-                let duration = duration.unwrap_or(policy.default_duration);
-                if duration > policy.max_duration {
-                    return Err(invalid_request("requested duration exceeds policy maximum"));
-                }
-                validate_manual_content(content, context.is_decompress_zip, policy)?;
-                leases.push(lease_intent(policy, LeaseSource::Manual, content, duration));
-            }
-            PinControl::Renew { .. } => {
-                return Err(invalid_request(
-                    "ipfs-s3:retain-until is invalid for an initial pin request",
-                ));
-            }
-        }
-
+        let leases = publication_leases(
+            self.matching_policy(context.bucket, context.key),
+            &control,
+            context.is_decompress_zip,
+        )?;
         Ok(PublicationPolicy {
             tags: context.tags.to_vec(),
             leases,
@@ -316,9 +312,7 @@ impl PinPolicyEvaluator {
     }
 
     pub fn matching_policy(&self, bucket: &str, key: &str) -> Option<&ValidatedPolicy> {
-        self.config.policies.iter().find(|policy| {
-            (policy.bucket == "*" || policy.bucket == bucket) && key.starts_with(&policy.prefix)
-        })
+        self.config.matching_policy(bucket, key)
     }
 
     fn evaluate_renewal(
@@ -416,6 +410,45 @@ impl From<PolicyError> for AppError {
 
 fn pin_control(tags: &[ObjectTag]) -> Result<PinControl, PolicyError> {
     PinControl::from_tags(tags).map_err(|error| invalid_request(error.to_string()))
+}
+
+fn publication_leases(
+    selected: Option<&ValidatedPolicy>,
+    control: &PinControl,
+    is_decompress_zip: bool,
+) -> Result<Vec<LeaseIntent>, PolicyError> {
+    let Some(policy) = selected else {
+        if matches!(control, PinControl::Absent) {
+            return Ok(Vec::new());
+        }
+        return Err(invalid_request("no pinning policy matches this object"));
+    };
+    let mut leases = Vec::new();
+    if policy.trigger == PolicyTrigger::Always {
+        leases.push(lease_intent(
+            policy,
+            LeaseSource::Automatic,
+            ContentMode::Object,
+            policy.default_duration,
+        ));
+    }
+    match *control {
+        PinControl::Absent | PinControl::Cancel => {}
+        PinControl::Request { duration, content } => {
+            let duration = duration.unwrap_or(policy.default_duration);
+            if duration > policy.max_duration {
+                return Err(invalid_request("requested duration exceeds policy maximum"));
+            }
+            validate_manual_content(content, is_decompress_zip, policy)?;
+            leases.push(lease_intent(policy, LeaseSource::Manual, content, duration));
+        }
+        PinControl::Renew { .. } => {
+            return Err(invalid_request(
+                "ipfs-s3:retain-until is invalid for an initial pin request",
+            ));
+        }
+    }
+    Ok(leases)
 }
 
 pub(crate) fn lease_intent(

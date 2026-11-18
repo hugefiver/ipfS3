@@ -142,6 +142,29 @@ impl ExtensionDecision {
         control: PinControl,
         policy: &PublicationPolicy,
     ) -> Result<Self, &'static str> {
+        if PinControl::from_tags(&policy.tags).map_err(|_| "invalid captured control tags")?
+            != control
+        {
+            return Err("invalid or mismatched extension decision");
+        }
+        Self::from_parsed_control(
+            origin,
+            effect,
+            warning,
+            legacy_unknown,
+            control,
+            policy.leases.clone(),
+        )
+    }
+
+    pub(super) fn from_parsed_control(
+        origin: DecisionOrigin,
+        effect: DecisionEffect,
+        warning: Option<WarningCode>,
+        legacy_unknown: bool,
+        control: PinControl,
+        effective_intents: Vec<LeaseIntent>,
+    ) -> Result<Self, &'static str> {
         let decision = Self {
             effect,
             warning,
@@ -149,9 +172,9 @@ impl ExtensionDecision {
             origin,
             control_revision: uuid::Uuid::new_v4().to_string(),
             control,
-            effective_intents: policy.leases.clone(),
+            effective_intents,
         };
-        decision.validate_policy(policy)?;
+        decision.validate_snapshot()?;
         Ok(decision)
     }
 

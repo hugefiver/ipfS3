@@ -567,7 +567,7 @@ async fn admission_context_refreshes_own_writes_and_preserves_reserved_rpc_excep
 }
 
 #[tokio::test]
-async fn admission_context_missing_references_deny_and_decode_errors_propagate() {
+async fn admission_context_missing_or_unreadable_rows_deny_the_affected_resource() {
     let fixture = fixture().await;
     for column in [pin_job::Column::TargetId, pin_job::Column::LeaseId] {
         let tx = fixture.db.begin().await.unwrap();
@@ -619,7 +619,10 @@ async fn admission_context_missing_references_deny_and_decode_errors_propagate()
         .exec(&tx)
         .await
         .unwrap();
-    assert!(admission_barrier(&tx, &fixture.provider).await.is_err());
+    assert_eq!(
+        admission_barrier(&tx, &fixture.provider).await.unwrap(),
+        AdmissionBarrier::Operator
+    );
     tx.rollback().await.unwrap();
     assert_eq!(
         admission_barrier(&fixture.db, &fixture.provider)

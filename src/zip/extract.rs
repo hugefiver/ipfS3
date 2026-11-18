@@ -237,6 +237,12 @@ impl ZipExtractionLimits {
         Ok(self)
     }
 
+    pub(crate) fn cap_decompressed_bytes(mut self, bytes: u64) -> Self {
+        self.max_decompressed_bytes = self.max_decompressed_bytes.min(bytes);
+        self.max_single_entry_bytes = self.max_single_entry_bytes.min(self.max_decompressed_bytes);
+        self
+    }
+
     pub fn with_decompressed_bytes(mut self, bytes: u64) -> Result<Self, &'static str> {
         self.max_decompressed_bytes = bytes;
         self.validate()?;

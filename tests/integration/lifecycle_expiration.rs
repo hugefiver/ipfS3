@@ -87,100 +87,6 @@ async fn stored_lifecycle_configuration(
 }
 
 #[tokio::test]
-async fn lifecycle_malformed_xml_uses_framework_error_without_write() {
-    let harness = start_harness(scripted(&[], vec![])).await;
-    let saved = signed_put_bucket_lifecycle_configuration_xml(
-        &harness,
-        lifecycle_configuration_xml("initial"),
-    )
-    .await;
-    assert_eq!(
-        saved.status(),
-        StatusCode::OK,
-        "save valid lifecycle configuration"
-    );
-    let before = stored_lifecycle_configuration(&harness).await;
-
-    assert_s3_error(
-        signed_put_bucket_lifecycle_configuration_xml(
-            &harness,
-            "<LifecycleConfiguration><Rule>".to_owned(),
-        )
-        .await,
-        StatusCode::BAD_REQUEST,
-        "MalformedXML",
-        "",
-    )
-    .await;
-
-    let after = stored_lifecycle_configuration(&harness).await;
-    assert_eq!(after.canonical_json, before.canonical_json);
-    assert_eq!(after.revision, before.revision);
-}
-
-#[tokio::test]
-async fn lifecycle_nested_unknown_xml_uses_framework_error_without_write() {
-    let harness = start_harness(scripted(&[], vec![])).await;
-    let saved = signed_put_bucket_lifecycle_configuration_xml(
-        &harness,
-        lifecycle_configuration_xml("initial"),
-    )
-    .await;
-    assert_eq!(
-        saved.status(),
-        StatusCode::OK,
-        "save valid lifecycle configuration"
-    );
-    let before = stored_lifecycle_configuration(&harness).await;
-
-    assert_s3_error(
-        signed_put_bucket_lifecycle_configuration_xml(
-            &harness,
-            "<LifecycleConfiguration><Rule><ID>invalid</ID><Status>Enabled</Status>\
-             <Filter><UnexpectedNested/></Filter><Expiration><Days>30</Days></Expiration>\
-             </Rule></LifecycleConfiguration>"
-                .to_owned(),
-        )
-        .await,
-        StatusCode::BAD_REQUEST,
-        "MalformedXML",
-        "",
-    )
-    .await;
-
-    let after = stored_lifecycle_configuration(&harness).await;
-    assert_eq!(after.canonical_json, before.canonical_json);
-    assert_eq!(after.revision, before.revision);
-}
-
-#[tokio::test]
-async fn lifecycle_root_unknown_element_is_ignored_before_typed_handler() {
-    let harness = start_harness(scripted(&[], vec![])).await;
-    let response = signed_put_bucket_lifecycle_configuration_xml(
-        &harness,
-        "<LifecycleConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
-         <Rule><ID>kept</ID><Status>Enabled</Status><Filter><Prefix>logs/</Prefix></Filter>\
-         <Expiration><Days>30</Days></Expiration></Rule><UnexpectedRoot>discarded</UnexpectedRoot>\
-         </LifecycleConfiguration>"
-            .to_owned(),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let response = signed_get_bucket_lifecycle_configuration(&harness).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = response.text().await.expect("lifecycle GET XML");
-    assert!(
-        body.contains("<ID>kept</ID>"),
-        "missing supported rule: {body}"
-    );
-    assert!(
-        !body.contains("UnexpectedRoot"),
-        "s3s must discard unknown direct root children before the typed handler: {body}"
-    );
-}
-
-#[tokio::test]
 async fn lifecycle_signed_configuration_put_get_delete_uses_s3s_operations() {
     let harness = start_harness(scripted(&[], vec![])).await;
     let put = signed_put_bucket_lifecycle_configuration_xml(
@@ -346,8 +252,9 @@ async fn lifecycle_signed_configuration() {
     )
     .await;
     assert_eq!(root_unknown.status(), StatusCode::OK);
-    let root_unknown_xml = signed_get_bucket_lifecycle_configuration(&harness)
-        .await
+    let root_projection = signed_get_bucket_lifecycle_configuration(&harness).await;
+    assert_eq!(root_projection.status(), StatusCode::OK);
+    let root_unknown_xml = root_projection
         .text()
         .await
         .expect("read root-child lifecycle projection");

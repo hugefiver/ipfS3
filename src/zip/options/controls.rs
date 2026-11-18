@@ -85,71 +85,88 @@ pub fn parse_authenticated_zip_controls(
     is_zip: bool,
     root_default: bool,
 ) -> s3s::S3Result<Option<ParsedZipControls>> {
-    let (prefix, result_enabled, has_query_control) = parse_authenticated_zip_query(query)?;
-    let has_zip_tag = tags.iter().any(|tag| {
-        tag.key.starts_with("ipfs-s3:zip-")
-            || (tag.key == "ipfs-s3:content" && tag.value == "decompressed")
-    });
-    if !is_zip
-        && !has_query_control
-        && !has_zip_tag
-        && !headers
-            .keys()
-            .any(|name| name.as_str().starts_with("x-ipfs3-zip-"))
-    {
-        // Let the unchanged ordinary-object path classify its own pin/tags.
-        return Ok(None);
-    }
-    let root = resolve_zip_root_option(tags, root_default)
-        .map_err(|_| invalid("invalid ZIP control tags"))?;
-    let pin = PinControl::from_tags(tags).map_err(|_| invalid("invalid pin control tags"))?;
-    let root_override = match root {
-        ZipRootCapture::Configured(_) => None,
-        ZipRootCapture::Tagged(value) => Some(value),
-    };
-    let options = parse_zip_options_impl(headers, result_enabled, root_override, root_default)?;
-    let has_zip_control = has_query_control
-        || root_override.is_some()
-        || !matches!(options, ZipOptions::Legacy)
-        || matches!(
-            pin,
-            PinControl::Request {
-                content: ContentMode::Decompressed,
-                ..
-            }
-        );
-    if !is_zip && has_zip_control {
-        return Err(invalid("ZIP controls require a decompress-zip request"));
-    }
-    if is_zip && matches!(pin, PinControl::Renew { .. }) {
-        return Err(invalid("ZIP admission cannot renew a manual lease"));
-    }
-    if let ZipOptions::V2(v2) = &options {
-        if !matches!(pin, PinControl::Absent) && !v2.publish_source {
-            return Err(invalid(
-                "archive-owned manual pinning requires a published source",
-            ));
-        }
-        if matches!(
-            pin,
-            PinControl::Request {
-                content: ContentMode::Decompressed,
-                ..
-            }
-        ) && !v2.publish_extracted
+    ParsedZipControls::from_query(
+        headers,
+        parse_authenticated_zip_query(query)?,
+        tags,
+        is_zip,
+        root_default,
+    )
+}
+
+impl ParsedZipControls {
+    pub(crate) fn from_query(
+        headers: &HeaderMap,
+        (prefix, result_enabled, has_query_control): (Option<String>, bool, bool),
+        tags: &[ObjectTag],
+        is_zip: bool,
+        root_default: bool,
+    ) -> s3s::S3Result<Option<Self>> {
+        let has_zip_tag = tags.iter().any(|tag| {
+            tag.key.starts_with("ipfs-s3:zip-")
+                || (tag.key == "ipfs-s3:content" && tag.value == "decompressed")
+        });
+        if !is_zip
+            && !has_query_control
+            && !has_zip_tag
+            && !headers
+                .keys()
+                .any(|name| name.as_str().starts_with("x-ipfs3-zip-"))
         {
-            return Err(invalid(
-                "decompressed manual pinning requires extracted outputs",
-            ));
+            // Let the unchanged ordinary-object path classify its own pin/tags.
+            return Ok(None);
         }
+        let root = resolve_zip_root_option(tags, root_default)
+            .map_err(|_| invalid("invalid ZIP control tags"))?;
+        let pin = PinControl::from_tags(tags).map_err(|_| invalid("invalid pin control tags"))?;
+        let root_override = match root {
+            ZipRootCapture::Configured(_) => None,
+            ZipRootCapture::Tagged(value) => Some(value),
+        };
+        let options = parse_zip_options_impl(headers, result_enabled, root_override, root_default)?;
+        let has_zip_control = has_query_control
+            || root_override.is_some()
+            || !matches!(options, ZipOptions::Legacy)
+            || matches!(
+                pin,
+                PinControl::Request {
+                    content: ContentMode::Decompressed,
+                    ..
+                }
+            );
+        if !is_zip && has_zip_control {
+            return Err(invalid("ZIP controls require a decompress-zip request"));
+        }
+        if is_zip && matches!(pin, PinControl::Renew { .. }) {
+            return Err(invalid("ZIP admission cannot renew a manual lease"));
+        }
+        if let ZipOptions::V2(v2) = &options {
+            if !matches!(pin, PinControl::Absent) && !v2.publish_source {
+                return Err(invalid(
+                    "archive-owned manual pinning requires a published source",
+                ));
+            }
+            if matches!(
+                pin,
+                PinControl::Request {
+                    content: ContentMode::Decompressed,
+                    ..
+                }
+            ) && !v2.publish_extracted
+            {
+                return Err(invalid(
+                    "decompressed manual pinning requires extracted outputs",
+                ));
+            }
+        }
+        Ok(Some(ParsedZipControls {
+            options,
+            target_prefix: prefix,
+            result_enabled,
+            root,
+            pin,
+            targets_explicit: headers.contains_key(ZIP_TARGETS),
+            token_supplied: headers.contains_key(ZIP_TOKEN),
+        }))
     }
-    Ok(Some(ParsedZipControls {
-        options,
-        target_prefix: prefix,
-        result_enabled,
-        root,
-        pin,
-        targets_explicit: headers.contains_key(ZIP_TARGETS),
-        token_supplied: headers.contains_key(ZIP_TOKEN),
-    }))
 }
