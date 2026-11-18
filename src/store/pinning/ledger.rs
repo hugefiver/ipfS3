@@ -21,7 +21,7 @@ use crate::{
 pub use crate::pinning::identity::Ownership;
 
 pub(in crate::store::pinning) mod unpin;
-pub(crate) use unpin::{bind_file_handle, prepare_runtime_unpin_effect, transport_handle};
+pub(crate) use unpin::prepare_runtime_unpin_effect;
 
 #[path = "submission.rs"]
 pub mod submission;
@@ -698,12 +698,6 @@ pub(super) async fn archive_release_row<C: ConnectionTrait>(
     unpin_accepted: Option<bool>,
 ) -> AppResult<()> {
     use crate::store::entities::pin_resource_history;
-    db.execute(sea_orm::Statement::from_sql_and_values(
-        db.get_database_backend(),
-        "DELETE FROM pin_cleanup_ownership WHERE provider=$1 AND cid=$2",
-        [remote.provider.clone().into(), remote.cid.clone().into()],
-    ))
-    .await?;
     if let Some(row) = row {
         let evidence = serde_json::json!({ "ledger": row, "request_id": remote.request_id, "status_before_release": remote.status, "confirmed_absent": unpin_accepted == Some(false), "unpin_accepted": unpin_accepted == Some(true), "request_superseded": unpin_accepted.is_none() }).to_string();
         pin_resource_history::Entity::insert(pin_resource_history::ActiveModel {
@@ -1397,7 +1391,12 @@ async fn observe_inner<C: ConnectionTrait>(
     status: RemotePinStatus,
     ownership: Ownership,
     now: DateTime<Utc>,
-    claim: Option<(&pin_job::Model, &str, bool, bool)>,
+    claim: Option<(
+        &pin_job::Model,
+        &str,
+        bool,
+        Option<&crate::pinning::provider::RemotePin>,
+    )>,
 ) -> AppResult<()> {
     observe_core(db, provider, cid, (status, ownership), now, claim, None).await
 }
@@ -1407,7 +1406,11 @@ pub(crate) async fn observe_runtime_claimed(
     job: &pin_job::Model,
     request_id: &str,
     has_desired_refs: bool,
-    observed: (RemotePinStatus, Ownership, bool),
+    observed: (
+        RemotePinStatus,
+        Ownership,
+        Option<&crate::pinning::provider::RemotePin>,
+    ),
     now: DateTime<Utc>,
     work: super::management::records::DecodeWork<'_>,
 ) -> AppResult<()> {
@@ -1429,7 +1432,12 @@ async fn observe_core<C: ConnectionTrait>(
     cid: &str,
     (status, ownership): (RemotePinStatus, Ownership),
     now: DateTime<Utc>,
-    claim: Option<(&pin_job::Model, &str, bool, bool)>,
+    claim: Option<(
+        &pin_job::Model,
+        &str,
+        bool,
+        Option<&crate::pinning::provider::RemotePin>,
+    )>,
     runtime: Option<(
         super::legacy_migration::ReceiptCatalog<'_>,
         super::management::records::DecodeWork<'_>,
@@ -1458,13 +1466,11 @@ async fn observe_core<C: ConnectionTrait>(
         if status == RemotePinStatus::Pinned && row.remote_pinned_at.is_none() {
             active.remote_pinned_at = Set(Some(now));
         }
-        if let (Some((_, request_id, _, true)), Some(route)) = (claim, row.route.as_deref())
-            && status != RemotePinStatus::Failed
+        if let Some((job, _, _, Some(remote))) = claim
+            && let Some(route) = decode_route(&row)
+            && !submission::is_rpc(&route)
         {
-            db.execute(sea_orm::Statement::from_sql_and_values(db.get_database_backend(),
-                "INSERT INTO pin_cleanup_ownership(provider,cid,request_id,route) VALUES ($1,$2,$3,$4) ON CONFLICT(provider,cid) DO UPDATE SET request_id=excluded.request_id, route=excluded.route, file_id=NULL",
-                [row.provider.clone().into(), row.cid.clone().into(), request_id.into(), route.into()],
-            )).await?;
+            unpin::record_request_receipt(db, job, &route, remote, now).await?;
         }
         if row.ownership == "unknown" && row.route.is_some() {
             active.ownership = Set(match ownership {
@@ -1687,11 +1693,6 @@ async fn cleanup_from_candidates_core(
     {
         return Ok(false);
     }
-    // Keep submit authority separate from actual ownership on shared-CID backends.
-    if catalog.query_one(sea_orm::Statement::from_sql_and_values(catalog.get_database_backend(),
-        "SELECT 1 FROM pin_cleanup_ownership p JOIN remote_pins r ON r.provider=p.provider AND r.cid=p.cid AND r.request_id=p.request_id WHERE p.provider=$1 AND p.cid=$2 AND p.route=$3",
-        [row.provider.clone().into(), row.cid.clone().into(), raw.into()],
-    )).await?.is_some() { return Ok(true); }
     unpin::historical_submission(&catalog, &row, &route, raw, work).await
 }
 

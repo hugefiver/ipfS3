@@ -9,3 +9,6 @@ pub mod publication;
 pub mod quota;
 pub(super) mod runtime_schema;
 pub mod tags;
+
+#[cfg(test)]
+pub(crate) mod test_support;

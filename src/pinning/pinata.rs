@@ -21,6 +21,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_FAILURE_REASON_CHARS: usize = 256;
 const MAX_SUCCESS_RESPONSE_BYTES: usize = 1024 * 1024;
 const V3_REQUEST_ID_PREFIX: &str = "pinata-v3:";
+pub(crate) const V3_FILE_PREFIX: &str = "pinata-v3:file:";
 const LEGACY_REQUEST_ID_PREFIX: &str = "pinata-legacy:";
 
 #[cfg(test)]
@@ -705,15 +706,18 @@ impl PinataClient {
         request_id: &str,
         reference: &PinataRequestRef,
     ) -> Result<(RemotePin, Option<String>), ProviderError> {
+        let exact_file =
+            request_id.starts_with(V3_FILE_PREFIX) || self.strategy == PinataStrategy::Upload;
         let mut matched = None;
         for file in self.list_files(reference.cid.as_deref()).await? {
             reference.ensure_file_correlation(&file)?;
-            let bound = match self.strategy {
-                PinataStrategy::Upload => file.id == reference.provider_id,
-                PinataStrategy::Cid => reference.metadata.as_ref().is_some_and(|m| {
+            let bound = if exact_file {
+                file.id == reference.provider_id
+            } else {
+                reference.metadata.as_ref().is_some_and(|m| {
                     m.get("gateway_job_id").is_some_and(|id| !id.is_empty())
                         && metadata_contains(&file.keyvalues, m)
-                }),
+                })
             };
             if !bound && file.id != reference.provider_id {
                 continue;
@@ -725,9 +729,19 @@ impl PinataClient {
             }
         }
         if let Some((file, bound)) = matched {
-            let handle =
-                bound.then(|| format!("pinata-file-id:{}", URL_SAFE_NO_PAD.encode(&file.id)));
+            let handle = reference
+                .metadata
+                .as_ref()
+                .filter(|_| bound && !exact_file)
+                .map(|m| encode_request_id_with_prefix(V3_FILE_PREFIX, &file.id, &file.cid, m));
             return Ok((self.remote_from_file(file, request_id.to_owned())?, handle));
+        }
+        if request_id.starts_with(V3_FILE_PREFIX) {
+            return Err(ProviderError {
+                class: ProviderErrorClass::NotFound,
+                message: "provider file was not found".into(),
+                retry_after: None,
+            });
         }
         for job in self.list_queue(reference.cid.as_deref()).await? {
             reference.ensure_job_correlation(&job)?;
@@ -918,7 +932,10 @@ impl PinataClient {
     }
 
     fn request_ref(&self, request_id: &str) -> Result<PinataRequestRef, ProviderError> {
-        if let Some(encoded) = request_id.strip_prefix(V3_REQUEST_ID_PREFIX) {
+        if let Some(encoded) = request_id
+            .strip_prefix(V3_FILE_PREFIX)
+            .or_else(|| request_id.strip_prefix(V3_REQUEST_ID_PREFIX))
+        {
             let parts = encoded.split(':').collect::<Vec<_>>();
             if parts.len() != 3 {
                 return Err(protocol_error("provider request ID is invalid"));
@@ -1158,26 +1175,30 @@ impl PinningProvider for PinataClient {
 
     async fn unpin_owned(&self, id: &str) -> Result<(), ProviderError> {
         if self.api == PinataApi::V3 && self.legacy_psa.is_none() {
-            if let Some(file) = id.strip_prefix("pinata-file-id:") {
-                let url = self.file_url(&decode_request_component(file)?)?;
-                let response = self
-                    .execute(self.http.delete(url), Operation::Unpin)
-                    .await?;
-                if response.status() != StatusCode::NOT_FOUND {
-                    self.require_success(response, Operation::Unpin).await?;
-                }
-                return Ok(());
-            }
-            if self.strategy == PinataStrategy::Cid && id.starts_with(V3_REQUEST_ID_PREFIX) {
+            if self.strategy == PinataStrategy::Cid
+                && id.starts_with(V3_REQUEST_ID_PREFIX)
+                && !id.starts_with(V3_FILE_PREFIX)
+            {
                 let queue = self.request_ref(id)?;
                 let url = self.pin_by_cid_request_url(&queue.provider_id)?;
                 let response = self
                     .execute(self.http.delete(url), Operation::Unpin)
                     .await?;
                 if response.status() == StatusCode::NOT_FOUND {
-                    return Err(protocol_error(
-                        "queue request unavailable without a bound completed file",
-                    ));
+                    // The queue entry may have become a file before its first poll.
+                    let (_, file) = self.observe_v3(id, &queue).await.map_err(|err| {
+                        if err.class == ProviderErrorClass::NotFound {
+                            protocol_error(
+                                "queue request unavailable without a bound completed file",
+                            )
+                        } else {
+                            err
+                        }
+                    })?;
+                    let file = file.ok_or_else(|| {
+                        protocol_error("queue request unavailable without a bound completed file")
+                    })?;
+                    return self.unpin(&file).await;
                 }
                 self.require_success(response, Operation::Unpin).await?;
                 return Ok(());
@@ -1352,7 +1373,7 @@ impl PinningProvider for PinataClient {
             )
             .await?;
         if response.status() == StatusCode::NOT_FOUND {
-            if self.strategy == PinataStrategy::Upload {
+            if self.strategy == PinataStrategy::Upload || request_id.starts_with(V3_FILE_PREFIX) {
                 return Ok(());
             }
             // A historical pin-by-CID handle can denote a queue request instead
@@ -1571,6 +1592,7 @@ pub(crate) fn submission_correlation(
 ) -> Option<String> {
     let prefix = match profile {
         "pinata-legacy" => LEGACY_REQUEST_ID_PREFIX,
+        "pinata-v3" if id.starts_with(V3_FILE_PREFIX) => V3_FILE_PREFIX,
         "pinata-v3" => V3_REQUEST_ID_PREFIX,
         _ => return None,
     };
@@ -2297,6 +2319,41 @@ mod tests {
             request.method.as_str() == "DELETE"
                 && request.url.path() == "/v3/files/public/wrong-file-id"
         }));
+    }
+
+    #[tokio::test]
+    async fn completed_queue_is_unpinned_by_its_file_when_cancel_precedes_the_first_poll() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/v3/files/public/pin_by_cid/queue-1"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v3/files/public"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"data":{"files":[
+                    {"id":"other","cid":"bafy-target","keyvalues":{}},
+                    {"id":"ours","cid":"bafy-target","keyvalues":{"gateway_job_id":"job"}}
+                ]}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/v3/files/public/ours"))
+            .respond_with(ResponseTemplate::new(202))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let queue = encode_request_id(
+            "queue-1",
+            "bafy-target",
+            &BTreeMap::from([("gateway_job_id".into(), "job".into())]),
+        );
+        provider(&server).unpin_owned(&queue).await.unwrap();
+        assert_eq!(requests(&server).await.len(), 3);
     }
 
     #[tokio::test]

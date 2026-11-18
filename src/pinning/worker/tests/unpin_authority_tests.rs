@@ -90,7 +90,7 @@ async fn managed_unpin_writer_parks_revoked_cleanup_without_recording_ordinary_r
     unknown.update(&tx).await.unwrap();
     tx.execute(sea_orm::Statement::from_sql_and_values(
         tx.get_database_backend(),
-        "DELETE FROM pin_cleanup_ownership WHERE provider=$1 AND cid=$2",
+        "DELETE FROM pin_submit_observations WHERE provider=$1 AND expected_cid=$2",
         [
             claimed.model.provider.clone().into(),
             claimed.model.cid.clone().into(),

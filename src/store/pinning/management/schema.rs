@@ -3,7 +3,7 @@ use super::{ManagementError, Result};
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 use sea_orm_migration::MigratorTrait;
 
-pub const VERSION: &str = crate::store::migrations::m20261110_000001_cleanup_identity::VERSION;
+pub const VERSION: &str = crate::store::migrations::m20261110_000001_requeue_retained::VERSION;
 mod installation;
 pub(crate) use installation::expressions::table_shape;
 pub mod storage;
@@ -180,16 +180,6 @@ fn installation_catalog() -> &'static [super::native::NativeTable] {
         std::sync::LazyLock::new(|| {
             let mut tables = previous_installation_catalog().to_vec();
             tables.push(entity::<crate::store::pinning::cid_comparison::Entity>());
-            tables.push(super::native::raw(
-                "pin_cleanup_job_targets",
-                "job_id,target_id",
-                "job_id",
-            ));
-            tables.push(super::native::raw(
-                "pin_cleanup_ownership",
-                "provider,cid,request_id,route,file_id",
-                "provider,cid",
-            ));
             tables
         });
     &CATALOG

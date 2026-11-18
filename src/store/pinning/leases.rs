@@ -4944,7 +4944,7 @@ pub(in crate::store::pinning) async fn evict_provider_cids_core<C: ConnectionTra
 
     // Phase 2: target transitions use the original snapshot in stable `(created_at, id)` order.
     // The caller-provided transaction must roll back if a target CAS is stale after a lease CAS.
-    let mut last_evicted = BTreeMap::new();
+    let mut evicted_pairs = BTreeSet::new();
     for desired in &targets {
         let target = &desired.target;
 
@@ -4968,10 +4968,7 @@ pub(in crate::store::pinning) async fn evict_provider_cids_core<C: ConnectionTra
         if updated.rows_affected != 1 {
             return Err(stale_lifecycle_error("eviction target"));
         }
-        last_evicted.insert(
-            (target.provider.as_str(), target.cid.as_str()),
-            target.id.as_str(),
-        );
+        evicted_pairs.insert((target.provider.as_str(), target.cid.as_str()));
     }
     // A lease-generation bump must not strand a non-evicted all-mode sibling behind an old
     // target-scoped Submit/Poll generation. Reproject every sibling while its complete frontier
@@ -4990,14 +4987,13 @@ pub(in crate::store::pinning) async fn evict_provider_cids_core<C: ConnectionTra
         )
         .await?;
     }
-    for ((provider, cid), target_id) in last_evicted {
+    for (provider, cid) in evicted_pairs {
         if let Some(epoch) = bump_remote_epoch(db, provider, cid, now).await? {
             let session = SharedDecodeBudget::default();
             schedule_after_desired_change_core(
                 db,
                 (provider, cid),
                 epoch,
-                Some(target_id),
                 now,
                 DecodeWork::shared(&session),
                 runtime,
@@ -7240,7 +7236,7 @@ async fn end_leases_core<C: ConnectionTrait>(
 ) -> AppResult<()> {
     work.with(|work| work.nodes(2 + leases.len()))
         .map_err(work_error)?;
-    let mut last_released = BTreeMap::new();
+    let mut released_pairs = BTreeSet::new();
     let mut ordered_leases: Vec<_> = leases
         .iter()
         .filter(|lease| lease.state == LEASE_ACTIVE)
@@ -7318,10 +7314,10 @@ async fn end_leases_core<C: ConnectionTrait>(
             return Err(stale_lifecycle_error("ending target"));
         }
         if is_desired_target_state(&target.state) || target.state == "error" {
-            last_released.insert((target.provider, target.cid), target.id);
+            released_pairs.insert((target.provider, target.cid));
         }
     }
-    for ((provider, cid), target_id) in last_released {
+    for (provider, cid) in released_pairs {
         if let Some(remote) =
             records::current_model::<remote_pin::Entity, _>(db, &[&provider, &cid], work)
                 .await
@@ -7330,16 +7326,8 @@ async fn end_leases_core<C: ConnectionTrait>(
             let epoch = bump_snapshotted_remote_epoch(db, &remote, now)
                 .await
                 .map_err(confirmed_renewal_error)?;
-            schedule_after_desired_change_core(
-                db,
-                (&provider, &cid),
-                epoch,
-                Some(&target_id),
-                now,
-                work,
-                runtime,
-            )
-            .await?;
+            schedule_after_desired_change_core(db, (&provider, &cid), epoch, now, work, runtime)
+                .await?;
         }
     }
     Ok(())
@@ -7371,14 +7359,13 @@ async fn schedule_after_desired_change_with_work<C: ConnectionTrait>(
     now: DateTimeUtc,
     work: DecodeWork<'_>,
 ) -> AppResult<()> {
-    schedule_after_desired_change_core(db, (provider, cid), epoch, None, now, work, None).await
+    schedule_after_desired_change_core(db, (provider, cid), epoch, now, work, None).await
 }
 
 async fn schedule_after_desired_change_core<C: ConnectionTrait>(
     db: &C,
     (provider, cid): (&str, &str),
     epoch: i64,
-    last_target: Option<&str>,
     now: DateTimeUtc,
     work: DecodeWork<'_>,
     runtime: Option<&crate::store::RuntimeTransaction>,
@@ -7404,20 +7391,10 @@ async fn schedule_after_desired_change_core<C: ConnectionTrait>(
             unreachable!("unpin constructor is remote scoped")
         };
         work.copy(&job.id).map_err(work_error)?;
-        let job_id = job.id.clone();
-        let inserted = match runtime {
+        match runtime {
             Some(tx) => jobs::insert_runtime_job(tx, NewPinJob::Remote(job), now, work).await?,
             None => jobs::insert_new_job_with_work(db, NewPinJob::Remote(job), now, work).await?,
         };
-        if inserted && let Some(target_id) = last_target {
-            work.copy(&target_id).map_err(work_error)?;
-            db.execute(sea_orm::Statement::from_sql_and_values(
-                db.get_database_backend(),
-                "INSERT INTO pin_cleanup_job_targets(job_id,target_id) VALUES ($1,$2) ON CONFLICT(job_id) DO NOTHING",
-                [job_id.into(), target_id.into()],
-            ))
-            .await?;
-        }
     }
     Ok(())
 }
@@ -11429,7 +11406,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn last_released_reference_owns_cleanup_even_when_it_ended_in_error() {
+    async fn last_reference_queues_one_unpin_even_when_it_ended_in_error() {
         let db = setup().await;
         let cid = "shared-release";
         seed_remote(&db, "pinata", cid, "pinned", Some("request"), 1).await;
@@ -11468,16 +11445,19 @@ mod tests {
             .await
             .unwrap();
         tx.commit().await.unwrap();
-        let links = db.query_all(sea_orm::Statement::from_string(db.get_database_backend(),
-            "SELECT j.expected_remote_epoch, t.target_id FROM pin_cleanup_job_targets t JOIN pin_jobs j ON j.id=t.job_id WHERE j.operation='unpin'",
-        )).await.unwrap();
-        assert_eq!(links.len(), 1);
-        assert_eq!(links[0].try_get::<String>("", "target_id").unwrap(), "c");
+        let jobs = pin_job::Entity::find()
+            .filter(pin_job::Column::Operation.eq("unpin"))
+            .all(&db)
+            .await
+            .unwrap();
+        assert_eq!(jobs.len(), 1);
         assert_eq!(
-            links[0]
-                .try_get::<i64>("", "expected_remote_epoch")
-                .unwrap(),
-            3
+            (
+                jobs[0].provider.as_str(),
+                jobs[0].cid.as_str(),
+                jobs[0].expected_remote_epoch
+            ),
+            ("pinata", cid, Some(3))
         );
         let last = pin_lease_target::Entity::find_by_id("c")
             .one(&db)
@@ -11633,14 +11613,12 @@ mod tests {
             GenerationDecision::Current
         );
         assert_eq!(remote(&db, "pinata", "bafy-evict").await.epoch, 2);
-        let owner = db.query_one(sea_orm::Statement::from_string(
-            db.get_database_backend(),
-            "SELECT target_id FROM pin_cleanup_job_targets WHERE job_id='unpin:pinata:bafy-evict:e2'",
-        )).await.unwrap().unwrap();
-        assert_eq!(
-            owner.try_get::<String>("", "target_id").unwrap(),
-            "target-evict-shared"
-        );
+        let unpin = pin_job::Entity::find_by_id("unpin:pinata:bafy-evict:e2")
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unpin.state, "pending");
     }
 
     #[tokio::test]
@@ -13033,7 +13011,7 @@ mod tests {
         ledger::capture_reservation(&db, "pinata", cid)
             .await
             .unwrap();
-        db.execute_unprepared("INSERT INTO pin_cleanup_ownership(provider,cid,route,request_id) SELECT provider,cid,route,'failed-request' FROM remote_pin_ledger WHERE cid='bafy-resubmit-order'").await.unwrap();
+        crate::store::pinning::test_support::seed_direct_request_receipt(&db, "pinata", cid).await;
         let store = crate::store::Store::new(db.clone());
         let budget = SharedDecodeBudget::default();
         let tx = store

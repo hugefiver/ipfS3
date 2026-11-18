@@ -208,12 +208,12 @@ pub(super) async fn confirmed_cleanup() -> Fixture {
         "UPDATE remote_pins SET status='pinned',request_id='cleanup-resource'; \
          UPDATE remote_pin_ledger SET ownership='application_created',effect='confirmed', \
          first_observed_at=CURRENT_TIMESTAMP,last_observed_at=CURRENT_TIMESTAMP,remote_pinned_at=CURRENT_TIMESTAMP; \
-         INSERT INTO pin_cleanup_ownership(provider,cid,request_id,route) \
-         SELECT provider,cid,'cleanup-resource',route FROM remote_pin_ledger; \
          UPDATE pin_jobs SET state='done',locked_until=NULL; \
          UPDATE pin_leases SET state='cancelled',generation=generation+1; \
          UPDATE pin_lease_targets SET state='released'",
     ).await.unwrap();
+    crate::store::pinning::test_support::seed_direct_request_receipt(&tx, &provider.name, CID)
+        .await;
     tx.commit().await.unwrap();
     let remote = remote_pin::Entity::find().one(&db).await.unwrap().unwrap();
     let route = RouteIdentity::from_original(provider.route_snapshot());

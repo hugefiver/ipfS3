@@ -3293,25 +3293,7 @@ async fn persist_typed_observation_status_phase(
                 })
             })
             .map_or(ledger::Ownership::Unknown, |resource| resource.ownership);
-        if claimed.model.operation == "poll"
-            && let Some(file) = typed.and_then(|o| {
-                o.resources.iter().find(|r| {
-                    r.resource_type == crate::pinning::identity::RemoteResourceType::HostedFile
-                        && r.cid == claimed.model.cid
-                        && r.request_id.starts_with("pinata-file-id:")
-                })
-            })
-        {
-            ledger::bind_file_handle(
-                &txn,
-                &claimed.model,
-                observation_request_id,
-                &file.request_id,
-                DecodeWork::shared(&work),
-            )
-            .await?;
-        }
-        crate::store::pinning::ledger::observe_runtime_claimed(
+        ledger::observe_runtime_claimed(
             &txn,
             &claimed.model,
             observation_request_id,
@@ -3319,12 +3301,35 @@ async fn persist_typed_observation_status_phase(
             (
                 observation_status,
                 ownership,
-                source == ObservationSource::DirectSubmit,
+                typed
+                    .filter(|_| source == ObservationSource::DirectSubmit)
+                    .and_then(|o| o.result.as_ref().ok()),
             ),
             observation_time,
             DecodeWork::shared(&work),
         )
         .await?;
+        if claimed.model.operation == "poll"
+            && let Some(file) = typed.and_then(|o| {
+                o.resources.iter().find(|r| {
+                    r.resource_type == crate::pinning::identity::RemoteResourceType::HostedFile
+                        && r.cid == claimed.model.cid
+                        && r.request_id
+                            .starts_with(crate::pinning::pinata::V3_FILE_PREFIX)
+                })
+            })
+        {
+            remote_pin::Entity::update_many()
+                .col_expr(
+                    remote_pin::Column::RequestId,
+                    Expr::value(file.request_id.clone()),
+                )
+                .filter(remote_pin::Column::Provider.eq(&claimed.model.provider))
+                .filter(remote_pin::Column::Cid.eq(&claimed.model.cid))
+                .filter(remote_pin::Column::RequestId.eq(observation_request_id))
+                .exec(txn.db())
+                .await?;
+        }
         match source {
             ObservationSource::RpcRecovery(sequence) => {
                 ledger::submission::settle_runtime_recovery(
@@ -3409,8 +3414,7 @@ async fn execute_unpin(
         return Ok(());
     }
 
-    let request_for_call =
-        ledger::transport_handle(store.db(), &claimed.model, &request_id).await?;
+    let request_for_call = request_id.clone();
     let preflight_job = claimed.model.clone();
     let preflight_request_id = request_id.clone();
     let (result, capture) = match provider_call_with_heartbeat(
@@ -4253,8 +4257,7 @@ async fn reconcile_failed(
         finish_and_reconcile(store, &claimed, Utc::now()).await?;
         return Ok(());
     }
-    let request_for_call =
-        ledger::transport_handle(store.db(), &claimed.model, &request_id).await?;
+    let request_for_call = request_id.clone();
     let preflight_job = claimed.model.clone();
     let preflight_request_id = request_id.clone();
     let result = match provider_call_with_heartbeat(

@@ -314,7 +314,7 @@ async fn prepare_upgrade(
         if !with_comparisons {
             super::migrations::m20261109_000001_pin_cid_comparisons::install(tx).await?;
         }
-        super::migrations::m20261110_000001_cleanup_identity::install(tx).await?;
+        super::migrations::m20261110_000001_requeue_retained::requeue(tx).await?;
         tx.execute_unprepared("DELETE FROM seaql_migrations")
             .await?;
         for version in &known {

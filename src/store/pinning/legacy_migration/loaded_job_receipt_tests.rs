@@ -471,7 +471,8 @@ async fn cleanup_compound_keeps_fresh_alias_identity_and_ordinary_ownership_rule
     .await
     .unwrap();
     db.execute(Statement::from_sql_and_values(db.get_database_backend(), "UPDATE remote_pins SET request_id='alias-request' WHERE provider=$1 AND cid='cleanup-alias'", [target.clone().into()])).await.unwrap();
-    db.execute(Statement::from_sql_and_values(db.get_database_backend(), "INSERT INTO pin_cleanup_ownership(provider,cid,request_id,route) SELECT provider,cid,'alias-request',route FROM remote_pin_ledger WHERE provider=$1 AND cid='cleanup-alias'", [target.clone().into()])).await.unwrap();
+    crate::store::pinning::test_support::seed_direct_request_receipt(&db, &target, "cleanup-alias")
+        .await;
     let release = serde_json::json!({"confirmed_absent":true,"ledger":{"provider":target,"cid":"cleanup-alias"}}).to_string();
     db.execute(Statement::from_sql_and_values(db.get_database_backend(),
         "INSERT INTO pin_resource_history(provider,cid,epoch,ledger) VALUES ($1,'cleanup-alias',1,$2)",

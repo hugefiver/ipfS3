@@ -80,7 +80,7 @@ pub fn has_current_pinning_layout(versions: &[String]) -> bool {
                 super::baseline::VERSION,
                 CURRENT_PINNING,
                 CID_COMPARISONS,
-                super::m20261110_000001_cleanup_identity::VERSION,
+                super::m20261110_000001_requeue_retained::VERSION,
             ]
 }
 

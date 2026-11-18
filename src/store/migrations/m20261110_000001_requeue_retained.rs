@@ -1,7 +1,7 @@
 use sea_orm::{ConnectionTrait, DbErr};
 use sea_orm_migration::prelude::*;
 
-pub const VERSION: &str = "m20261110_000001_cleanup_identity";
+pub const VERSION: &str = "m20261110_000001_requeue_retained";
 pub struct Migration;
 
 impl MigrationName for Migration {
@@ -13,7 +13,7 @@ impl MigrationName for Migration {
 #[async_trait::async_trait]
 impl super::bridge::SharedMigration for Migration {
     async fn up_body(&self, manager: &super::bridge::Manager<'_>) -> Result<(), DbErr> {
-        install(manager.get_connection()).await
+        requeue(manager.get_connection()).await
     }
 }
 
@@ -25,15 +25,12 @@ impl MigrationTrait for Migration {
     }
     async fn down(&self, _: &SchemaManager) -> Result<(), DbErr> {
         Err(DbErr::Migration(
-            "cleanup identity requires forward repair".into(),
+            "requeued pin jobs cannot be rolled back".into(),
         ))
     }
 }
 
-pub(crate) async fn install<C: ConnectionTrait>(db: &C) -> Result<(), DbErr> {
-    db.execute_unprepared("CREATE TABLE pin_cleanup_job_targets (job_id TEXT NOT NULL PRIMARY KEY, target_id TEXT NOT NULL);\n        CREATE TABLE pin_cleanup_ownership (provider TEXT NOT NULL, cid TEXT NOT NULL, request_id TEXT NOT NULL, route TEXT NOT NULL, file_id TEXT, PRIMARY KEY(provider,cid));").await?;
-    // Earlier ownership labels were not bound to the request currently in remote_pins.
-    // Preserve old routing/receipt documents; visit each retained lifetime once.
+pub(crate) async fn requeue<C: ConnectionTrait>(db: &C) -> Result<(), DbErr> {
     db.execute_unprepared("UPDATE remote_pin_ledger SET last_error='cleanup needs attention: verify historical submission or creation receipt' WHERE effect='retained' AND last_error IS NULL;\n        UPDATE pin_jobs SET state='pending', attempts=0, next_attempt_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE operation='reconcile' AND state='done' AND EXISTS (SELECT 1 FROM remote_pin_ledger l JOIN remote_pins r ON r.provider=l.provider AND r.cid=l.cid WHERE l.effect='retained' AND l.provider=pin_jobs.provider AND l.cid=pin_jobs.cid AND r.epoch=pin_jobs.expected_remote_epoch)").await?;
     // A pruned reconcile job must be recreated with the old route, not today's configuration.
     let retained = "SELECT 'reconcile:' || l.provider || ':' || l.cid || ':e' || CAST(r.epoch AS TEXT) AS id,l.provider,l.cid,l.route,r.epoch FROM remote_pin_ledger l JOIN remote_pins r ON r.provider=l.provider AND r.cid=l.cid WHERE l.effect='retained' AND l.route IS NOT NULL AND r.request_id IS NOT NULL";

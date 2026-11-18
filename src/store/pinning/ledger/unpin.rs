@@ -5,44 +5,38 @@ use crate::store::pinning::{
     management::{self, records::DecodeWork},
 };
 
-pub(crate) async fn transport_handle<C: ConnectionTrait>(
+pub(super) async fn record_request_receipt<C: ConnectionTrait>(
     db: &C,
     job: &pin_job::Model,
-    request_id: &str,
-) -> AppResult<String> {
-    let row = db.query_one(sea_orm::Statement::from_sql_and_values(db.get_database_backend(),
-        "SELECT p.file_id FROM pin_cleanup_ownership p JOIN pin_invocation_routes i ON i.route=p.route WHERE i.job_id=$1 AND p.provider=$2 AND p.cid=$3 AND p.request_id=$4 AND p.file_id IS NOT NULL",
-        [job.id.clone().into(), job.provider.clone().into(), job.cid.clone().into(), request_id.into()])).await?;
-    Ok(match row {
-        Some(row) => row.try_get("", "file_id")?,
-        None => request_id.to_owned(),
-    })
-}
-
-pub(crate) async fn bind_file_handle(
-    tx: &crate::store::RuntimeTransaction,
-    job: &pin_job::Model,
-    request_id: &str,
-    file_id: &str,
-    work: DecodeWork<'_>,
+    route: &ProviderRouteSnapshot,
+    remote: &crate::pinning::provider::RemotePin,
+    now: DateTime<Utc>,
 ) -> AppResult<()> {
-    let db = tx.db();
-    let values = [
-        file_id.into(),
-        job.provider.clone().into(),
-        job.cid.clone().into(),
-        request_id.into(),
-        job.id.clone().into(),
-    ];
-    let updated = db.execute(sea_orm::Statement::from_sql_and_values(db.get_database_backend(),
-        "UPDATE pin_cleanup_ownership SET file_id=$1 WHERE provider=$2 AND cid=$3 AND request_id=$4 AND route=(SELECT route FROM pin_invocation_routes WHERE job_id=$5) AND file_id IS NULL", values.clone())).await?;
-    if updated.rows_affected() == 0
-        && cleanup_allowed_catalog(tx.catalog(work), &job.provider, &job.cid, work).await?
-    {
-        // A pre-upgrade Submit may be authorized only by its historical receipt.
-        db.execute(sea_orm::Statement::from_sql_and_values(db.get_database_backend(),
-            "INSERT INTO pin_cleanup_ownership(provider,cid,request_id,route,file_id) SELECT l.provider,l.cid,r.request_id,l.route,$1 FROM remote_pin_ledger l JOIN remote_pins r ON r.provider=l.provider AND r.cid=l.cid JOIN pin_invocation_routes i ON i.route=l.route WHERE l.provider=$2 AND l.cid=$3 AND r.request_id=$4 AND i.job_id=$5 ON CONFLICT(provider,cid) DO NOTHING",values)).await?;
-    }
+    use crate::pinning::provider::{ObservedResource, ObservedResourceStatus};
+    let outcome = match remote.status {
+        RemotePinStatus::Queued => "ReportedQueued",
+        RemotePinStatus::Pinning => "ReportedPinning",
+        RemotePinStatus::Pinned => "ReportedPinned",
+        RemotePinStatus::Failed => return Ok(()),
+    };
+    let resource = submission::resource_evidence_for_route(
+        route,
+        ObservedResource {
+            resource_type: route.resource_type(),
+            cid: remote.cid.clone(),
+            request_id: remote.request_id.clone(),
+            status: ObservedResourceStatus::Reported,
+            ownership: Ownership::Unknown,
+            replica_evidence: None,
+        },
+    );
+    let resources =
+        serde_json::to_string(&[resource]).map_err(|e| AppError::Internal(e.to_string()))?;
+    db.execute(sea_orm::Statement::from_sql_and_values(db.get_database_backend(),
+        "INSERT INTO pin_submit_observations (id,job_id,submit_call,provider,expected_cid,route,remote_epoch,claim_until,started_at,observed_at,effect,resources,outcome,needs_attention) \
+         SELECT h.job_id || ':call:' || CAST(h.submit_calls AS TEXT),h.job_id,h.submit_calls,$2,$3,i.route,i.remote_epoch,$4,h.started_at,$5,'observed',$6,$7,FALSE \
+         FROM pin_submit_history h JOIN pin_invocation_routes i ON i.job_id=h.job_id WHERE h.job_id=$1 AND h.submit_calls>0 ON CONFLICT(job_id,submit_call) DO NOTHING",
+        [job.id.clone().into(),job.provider.clone().into(),job.cid.clone().into(),job.locked_until.into(),now.into(),resources.into(),outcome.into()])).await?;
     Ok(())
 }
 
@@ -100,16 +94,46 @@ pub(super) async fn historical_submission<C: ConnectionTrait>(
         raw.into(),
         remote.epoch.into(),
     ];
-    if matches!(route.api_profile.as_str(), "pinata-legacy" | "pinata-v3") {
-        let Some(correlation) =
-            crate::pinning::pinata::submission_correlation(id, &ledger.cid, &route.api_profile)
-        else {
-            return Ok(false);
-        };
+    let correlation = |request: &str| {
+        crate::pinning::pinata::submission_correlation(request, &ledger.cid, &route.api_profile)
+    };
+    let promoted = id
+        .starts_with(crate::pinning::pinata::V3_FILE_PREFIX)
+        .then(|| correlation(id))
+        .flatten();
+    let rpc = submission::is_rpc(route);
+    let mut receipt_values = values.clone();
+    receipt_values.push(rpc.into());
+    let row = db.query_one(sea_orm::Statement::from_sql_and_values(db.get_database_backend(),
+        "SELECT e.resources FROM pin_submit_observations e WHERE e.provider=$1 AND e.expected_cid=$2 AND e.route=$3 AND e.remote_epoch <= $4 AND e.effect='observed' AND (($5 AND e.outcome IN ('matched','accepted')) OR (NOT $5 AND e.outcome IN ('ReportedPinned','ReportedQueued','ReportedPinning'))) AND e.needs_attention=FALSE AND NOT EXISTS (SELECT 1 FROM pin_resource_history x WHERE x.provider=e.provider AND x.cid=e.expected_cid AND x.epoch>=e.remote_epoch AND x.epoch<$4) ORDER BY e.remote_epoch DESC,e.observed_at DESC,e.submit_call DESC LIMIT 1", receipt_values)).await?;
+    if let Some(row) = row {
+        let resources: String = row.try_get("", "resources")?;
+        let evidence = work
+            .with(|w| w.typed::<Vec<submission::ResourceEvidence>>(&resources))
+            .map_err(management::admission::work_error)?;
+        return Ok(!evidence.is_empty()
+            && evidence.iter().all(|r| {
+                (r.resource.request_id == id
+                    || promoted.as_ref().is_some_and(|key| {
+                        correlation(&r.resource.request_id).as_ref() == Some(key)
+                    }))
+                    && r.resource.resource_type == route.resource_type()
+                    && (!rpc && r.resource.cid == ledger.cid
+                        || r.key.as_ref().is_some_and(|key| {
+                            key.backend == route.backend
+                                && key.scope == route.scope
+                                && key.resource_type == route.resource_type()
+                                && key.resource_id == ledger.cid
+                        }))
+            }));
+    }
+    if let Some(key) = correlation(id) {
         let mut values = values;
-        values.push(correlation.into());
-        values.push(route.api_profile.replace('-', "_").into());
-        values.push(route.strategy.clone().into());
+        values.extend([
+            key.into(),
+            route.api_profile.replace('-', "_").into(),
+            route.strategy.clone().into(),
+        ]);
         return Ok(db.query_one(sea_orm::Statement::from_sql_and_values(db.get_database_backend(),
             "SELECT 1 FROM pin_jobs j JOIN pin_submit_history h ON h.job_id=j.id JOIN pin_invocation_routes i ON i.job_id=j.id WHERE j.provider=$1 AND j.cid=$2 AND j.operation='submit' AND i.route=$3 AND i.remote_epoch <= $4 AND COALESCE(h.correlation,j.id)=$5 AND h.api=$6 AND h.strategy=$7 AND h.effect='created' AND h.state='settled' AND h.submit_calls>0 AND h.recovery_queries=0 AND NOT EXISTS (SELECT 1 FROM pin_resource_history x WHERE x.provider=j.provider AND x.cid=j.cid AND x.epoch>=i.remote_epoch AND x.epoch<$4) LIMIT 1", values)).await?.is_some());
     }
@@ -128,24 +152,7 @@ pub(super) async fn historical_submission<C: ConnectionTrait>(
                 id,
             ));
     }
-    let row = db.query_one(sea_orm::Statement::from_sql_and_values(db.get_database_backend(),
-        "SELECT e.resources FROM pin_submit_observations e WHERE e.provider=$1 AND e.expected_cid=$2 AND e.route=$3 AND e.remote_epoch <= $4 AND e.effect='observed' AND e.outcome IN ('matched','accepted') AND e.needs_attention=FALSE AND NOT EXISTS (SELECT 1 FROM pin_resource_history x WHERE x.provider=e.provider AND x.cid=e.expected_cid AND x.epoch>=e.remote_epoch AND x.epoch<$4) ORDER BY e.remote_epoch DESC,e.submit_call DESC LIMIT 1", values)).await?;
-    let Some(row) = row else { return Ok(false) };
-    let resources: String = row.try_get("", "resources")?;
-    let evidence = work
-        .with(|work| work.typed::<Vec<submission::ResourceEvidence>>(&resources))
-        .map_err(management::admission::work_error)?;
-    Ok(!evidence.is_empty()
-        && evidence.iter().all(|r| {
-            r.resource.request_id == id
-                && r.resource.resource_type == route.resource_type()
-                && r.key.as_ref().is_some_and(|key| {
-                    key.backend == route.backend
-                        && key.scope == route.scope
-                        && key.resource_type == route.resource_type()
-                        && key.resource_id == ledger.cid
-                })
-        }))
+    Ok(false)
 }
 
 #[cfg(test)]

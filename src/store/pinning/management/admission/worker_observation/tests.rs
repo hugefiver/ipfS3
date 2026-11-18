@@ -165,9 +165,8 @@ async fn store_observations_reload_business_rows() {
         ))
         .await
         .unwrap();
-    store.db().execute_unprepared(
-        "INSERT INTO pin_cleanup_ownership(provider,cid,request_id,route) SELECT provider,cid,'observed-request',route FROM remote_pin_ledger",
-    ).await.unwrap();
+    crate::store::pinning::test_support::seed_direct_request_receipt(store.db(), "provider", "cid")
+        .await;
     let (may_delete, snapshot) = observe().await.unwrap();
     assert!(may_delete);
     assert_eq!(

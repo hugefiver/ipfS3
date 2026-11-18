@@ -342,12 +342,6 @@ async fn worker_releases_a_shared_backup_cid_from_its_historical_submit_receipt(
     assert_eq!(targets.len(), 2);
     assert!(targets.iter().all(|target| target.state == "pinned"));
     fixture.assert_held().await;
-    fixture
-        .store
-        .db()
-        .execute_unprepared("DELETE FROM pin_cleanup_ownership")
-        .await
-        .unwrap();
     assert!(
         ledger::cleanup_allowed(fixture.store.db(), &fixture.provider, CID)
             .await

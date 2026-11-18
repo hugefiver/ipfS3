@@ -392,7 +392,7 @@ async fn exercise_stage2(db: sea_orm::DatabaseConnection) {
         .db()
         .execute(sea_orm::Statement::from_sql_and_values(
             store.db().get_database_backend(),
-            "DELETE FROM pin_cleanup_ownership WHERE provider=$1 AND cid='bafy-shared'",
+            "DELETE FROM pin_submit_observations WHERE provider=$1 AND expected_cid='bafy-shared'",
             [provider.clone().into()],
         ))
         .await
@@ -1081,23 +1081,30 @@ async fn default_pinata_queue_cleans_only_its_bound_file_after_restart() {
     })
     .await;
     worker.shutdown(Duration::from_secs(5)).await;
-    // Pre-upgrade submissions have a durable queue receipt but no file binding.
-    let cleared = store
+    // An active reference can reattach to a retained queue request before its next poll.
+    store
         .db()
         .execute(sea_orm::Statement::from_sql_and_values(
             store.db().get_database_backend(),
-            "DELETE FROM pin_cleanup_ownership WHERE provider=$1 AND cid=$2 AND file_id IS NULL",
-            [provider.clone().into(), "bafy-file".into()],
+            "UPDATE remote_pin_ledger SET effect='retained' WHERE provider=$1 AND cid='bafy-file'",
+            [provider.clone().into()],
         ))
         .await
         .unwrap();
-    assert_eq!(cleared.rows_affected(), 1);
     let worker = coordinator(&cfg).start(store.clone(), CancellationToken::new());
     wait_for("mapped file", || {
         remote_is(&store, &provider, "bafy-file", "pinned")
     })
     .await;
     worker.shutdown(Duration::from_secs(5)).await;
+    assert_eq!(
+        ledger::get(store.db(), &provider, "bafy-file")
+            .await
+            .unwrap()
+            .unwrap()
+            .effect,
+        "confirmed"
+    );
     let lease = lease_rows(&store, &provider).await.remove(0);
     end_lease_with_transaction_retry(&store, Some(&lease.id)).await;
     let restarted = coordinator(&cfg);
