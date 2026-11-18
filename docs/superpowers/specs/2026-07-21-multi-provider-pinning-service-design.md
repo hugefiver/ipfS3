@@ -33,7 +33,7 @@ The gateway must support:
 ## Confirmed decisions
 
 1. Remote operations are asynchronous. An S3 publication succeeds after its database transaction, without waiting for a provider.
-2. At least one provider reaching `pinned` is the availability success line. In `all` mode, remaining providers continue until they converge or remain degraded.
+2. Remote pinning is best effort during the lease. A file is reported as remotely available when at least one provider reaches `pinned`; no file is guaranteed to reach that state by a deadline or even before expiry. `one` and `all` select which providers to try, not a minimum number of completed copies.
 3. Quotas are local soft limits measured per provider by unique CID bytes and unique remote pin count.
 4. Lease time starts when the S3 object publication commits.
 5. Expiry, cancellation, or eviction affects only remote provider pins.
@@ -258,7 +258,7 @@ Add the following durable entities through a reversible migration:
 - Reserved unique CID count.
 - Last optional provider-observed usage snapshot and observation time.
 
-The first target for `(provider, cid)` atomically creates `remote_pins` and reserves capacity. Additional leases reuse it without increasing usage. Capacity is released only after unpin succeeds or the provider confirms NotFound.
+The first target for `(provider, cid)` atomically creates `remote_pins` and reserves capacity. Additional leases reuse it without increasing usage. After the last reference ends, an unused local reservation is released locally. If a remote pin may exist, keep its charge until the remote removal is accepted or absence is confirmed.
 
 All publication-related object, tag, lease, target, usage reservation, and outbox changes occur in the same database transaction. No provider HTTP request occurs inside a database transaction.
 
@@ -276,7 +276,7 @@ All publication-related object, tag, lease, target, usage reservation, and outbo
 
 ### `all` mode
 
-Create a target for every referenced provider. One successful target satisfies the availability success line, while incomplete targets remain degraded and continue retrying. Quota eviction can remove one provider target without cancelling the lease's remaining targets.
+Create a target for every referenced provider and try each independently while its lease is active and its retry budget remains. Report availability when a target reaches `pinned`. The lease can end with no successful targets. Quota eviction can remove one provider target without cancelling the lease's remaining targets.
 
 ## Local quota and oldest-pin eviction
 
@@ -307,6 +307,8 @@ Before acting, a job reloads the current lease and target state:
 - Unpin is skipped when another active target still needs the provider/CID pin.
 - If unpin was already in flight when a renewal committed, successful removal is followed by a new submit job.
 - Duplicate poll and unpin execution is idempotent.
+
+When the lease ends (expiry, cancellation, or lease eviction), stop new submissions, retries, and failover for its targets. An undispatched request needs no remote removal. An in-flight request may still create a pin: retain its original provider and request evidence for cleanup. When the last live reference to that provider/CID ends, withdraw any pin attributable to this gateway. A late success does not reactivate the lease. For Kubo, removal ends at the `pin/rm` acknowledgement; physical block collection is separate.
 
 The worker stops claiming jobs during shutdown, allows in-flight calls a bounded grace period, then leaves locks to expire for recovery by the next process.
 
@@ -422,4 +424,4 @@ Update `README.md`, `config.example.toml`, `.env.example`, Docker configuration 
 7. Provider tokens are never persisted or logged.
 8. Decompressed mode pins only successfully published extracted entry CIDs for that lease.
 9. `one` assignments are sticky until failure or eviction; `all` keeps independent provider targets.
-10. Capacity is released only after remote deletion is confirmed or the pin is already absent.
+10. Ending a lease releases its unused local reservation or schedules cleanup of an attributable remote pin. Unresolved remote effects remain accounted for.

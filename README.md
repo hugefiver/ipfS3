@@ -764,12 +764,16 @@ procedure. Changing this value can make an existing SSE-C object inaccessible.
 
 ## Remote Pinning
 
-Remote pinning is asynchronous: when a policy or manual request selects it, a
-successful S3 write publishes the object and its pinning intent durably, but
-does not wait for a remote provider. At least one configured provider reaching
-`pinned` is the availability success line. Other provider work may still be
-pending or degraded. Remote lease durations are retention requests and control
-signals, not guaranteed provider TTLs.
+Remote pinning is best effort. A successful S3 write commits the object and its
+pinning intent without waiting for a provider. The gateway tries the configured
+providers while the lease is active. A file may reach expiry without a remote
+copy, even if it never left the queue. `pinned` reports an observed result, not
+a promise made at upload time.
+
+When a lease ends, the gateway stops trying to create its pins. It releases
+unused reservations locally and cleans up attributable remote pins after the
+last reference on that provider ends. A late receipt can identify a pin for
+cleanup; it does not renew the lease.
 
 Soft leases, including manual leases, are eligible for quota eviction only when
 their resource is eligible for managed cleanup. Retain/external/unknown resources
