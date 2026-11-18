@@ -178,6 +178,61 @@ async fn targets(db: &DatabaseConnection, claim: &execution::Claim, keys: &[&str
 }
 
 #[tokio::test]
+#[ignore = "requires isolated PostgreSQL 17 or 18"]
+async fn import_claim_skips_locked_bucket_and_claims_other_bucket() {
+    pg_isolated(|a, b| async move {
+        use ipfs_s3_gateway::store::zip::import_intake;
+        store::bucket::create(&a, "other", None).await.unwrap();
+        for (token, bucket) in [("busy", "bucket"), ("free", "other")] {
+            let mut admission = request(token);
+            admission.bucket = bucket.into();
+            admission.source = "import".into();
+            import_intake::admit(
+                &a,
+                &import_intake::Request {
+                    admission,
+                    prefix: "out/".into(),
+                    source_descriptor: "[\"cid\",\"fixture\"]".into(),
+                    expected_sha256: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let held = a.begin().await.unwrap();
+        ownership::lock_bucket_for_ownership(&held, "bucket")
+            .await
+            .unwrap();
+        assert_eq!(
+            import_intake::pending_ids(&b, "", 2).await.unwrap(),
+            ["id-busy", "id-free"]
+        );
+        assert!(
+            execution::claim(&b, "id-busy", "worker", 30)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            execution::claim(&b, "id-free", "worker", 30)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        held.rollback().await.unwrap();
+        assert_eq!(
+            execution::claim(&b, "id-busy", "worker", 30)
+                .await
+                .unwrap()
+                .unwrap()
+                .epoch,
+            1
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn signed_token_freezes_headers_and_clean_input_bytes() {
     let (_dir, a, b) = setup().await;
     execution::admit(&a, &request("same")).await.unwrap();

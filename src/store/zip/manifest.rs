@@ -87,6 +87,8 @@ async fn prepare_in_transaction(
         None
     };
     let mut paths = HashSet::new();
+    let mut inserts = Vec::new();
+    let now = Utc::now();
     for item in items {
         let (path, object_key, cid, size, error_code) = match item {
             ManifestItem::Success {
@@ -121,7 +123,7 @@ async fn prepare_in_transaction(
             }
             continue;
         }
-        zip_manifest_entry::Entity::insert(zip_manifest_entry::ActiveModel {
+        inserts.push(zip_manifest_entry::ActiveModel {
             batch_id: Set(id.to_owned()),
             path: Set(path.clone()),
             object_key: Set(object_key),
@@ -129,10 +131,18 @@ async fn prepare_in_transaction(
             size: Set(size),
             version_row_id: Set(None),
             error_code: Set(error_code),
-            created_at: Set(Utc::now()),
-        })
-        .exec(tx)
-        .await?;
+            created_at: Set(now),
+        });
+        if inserts.len() == 100 {
+            zip_manifest_entry::Entity::insert_many(inserts.drain(..))
+                .exec_without_returning(tx)
+                .await?;
+        }
+    }
+    if !inserts.is_empty() {
+        zip_manifest_entry::Entity::insert_many(inserts)
+            .exec_without_returning(tx)
+            .await?;
     }
     if let Some(existing) = existing {
         return if existing.len() == paths.len() {

@@ -791,10 +791,11 @@ async fn admitted_recovery_rotates_exact_guards_without_cat_reextract_or_re_admi
 }
 
 #[tokio::test]
-async fn admitted_root_recovery_waits_for_old_intent_without_burning_retry_epochs() {
+async fn live_predecessor_root_leaves_the_only_slot_free_without_burning_retry_epochs() {
     let harness = start_import_harness(ImportHarnessConfig {
+        worker_concurrency: 1,
         poll_interval_ms: 1_000,
-        max_attempts: 3,
+        max_attempts: 2,
         ..ImportHarnessConfig::default()
     })
     .await;
@@ -817,13 +818,61 @@ async fn admitted_root_recovery_waits_for_old_intent_without_burning_retry_epoch
         .unwrap()
         .to_owned();
     let old = admit_one_output(&harness, &id, &legal_single_entry_zip()).await;
-    let old_root = zip::claim_root(harness.state.store.db(), &id, "crashed-root", 2)
-        .await
-        .unwrap();
-    zip::mark_invoked(harness.state.store.db(), &old_root)
-        .await
-        .unwrap();
+    let db = harness.state.store.db();
+    let old_root = zip::claim_root(db, &id, "crashed-root", 60).await.unwrap();
+    zip::mark_invoked(db, &old_root).await.unwrap();
     expire_claim(&harness, &id).await;
+    assert!(
+        import_intake::pending_ids(db, "", 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        execution::claim(db, &id, "contender", 30)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // Make another root owner win immediately after the execution claim checks eligibility.
+    db.execute_unprepared("CREATE TRIGGER competing_root AFTER UPDATE OF epoch ON zip_v2_executions \
+        WHEN NEW.state='admitted' AND NEW.epoch=2 BEGIN \
+        INSERT INTO zip_root_builds(batch_id,revision,epoch,worker,lease_until,status,created_at,updated_at) \
+        SELECT id,root_revision,root_epoch+1,'racer',datetime('now','+1 minute'),'intent',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP \
+        FROM zip_batches WHERE id=NEW.id; \
+        UPDATE zip_batches SET root_epoch=root_epoch+1 WHERE id=NEW.id; END").await.unwrap();
+    let expire_root = || {
+        Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE zip_root_builds SET lease_until=datetime('now','-1 minute') WHERE batch_id=?",
+            [id.clone().into()],
+        )
+    };
+    db.execute(expire_root()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let row = execution::read(db, &id).await.unwrap().unwrap();
+            assert_eq!(row.state, "admitted");
+            if row.epoch == old.epoch + 1
+                && row.lease_until.unwrap()
+                    <= store::database_clock::database_now(db).await.unwrap()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("root contention releases the execution without retry settlement");
+    harness.set_cat_body(CID, legal_two_entry_zip());
+    let peer = submit(&harness, "independent-root-disabled", &cid_xml()).await;
+    assert_eq!(wait_for_state(&harness, &peer).await, "ready");
+    assert_eq!(
+        execution::read(db, &id).await.unwrap().unwrap().epoch,
+        old.epoch + 1
+    );
+    let peer_cat_calls = harness.kubo_call_count("/api/v0/cat").await;
+    db.execute(expire_root()).await.unwrap();
     assert_eq!(wait_for_state(&harness, &id).await, "ready");
     let after = execution::read(harness.state.store.db(), &id)
         .await
@@ -831,8 +880,8 @@ async fn admitted_root_recovery_waits_for_old_intent_without_burning_retry_epoch
         .unwrap();
     assert_eq!(
         after.epoch,
-        old.epoch + 1,
-        "root intent wait must not consume claim retries"
+        old.epoch + 2,
+        "one contended claim and one successful takeover"
     );
     let status = import_intake::read_for_path(
         harness.state.store.db(),
@@ -845,7 +894,7 @@ async fn admitted_root_recovery_waits_for_old_intent_without_burning_retry_epoch
     .unwrap()
     .unwrap();
     assert_eq!(status.root_status.as_deref(), Some("failed"));
-    assert_eq!(harness.kubo_call_count("/api/v0/cat").await, 0);
+    assert_eq!(harness.kubo_call_count("/api/v0/cat").await, peer_cat_calls);
     harness.shutdown().await;
 }
 

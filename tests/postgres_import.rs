@@ -848,19 +848,20 @@ async fn lock_job_for_update(transaction: &sea_orm::DatabaseTransaction, job_id:
         .expect("fixture import job must exist");
 }
 
-async fn wait_for_claim_and_assert_empty(
-    operation: &str,
-    task: JoinHandle<AppResult<Vec<ipfs_s3_gateway::store::import::jobs::ClaimedImportJob>>>,
+async fn assert_claim_skips_locked_head(
+    db: &DatabaseConnection,
+    now: DateTime<Utc>,
+    expected: &str,
 ) {
-    let claimed = tokio::time::timeout(std::time::Duration::from_secs(5), task)
-        .await
-        .unwrap_or_else(|_| panic!("{operation} claimant did not finish after holder commit"))
-        .unwrap()
-        .unwrap_or_else(|error| panic!("{operation} claimant failed: {error:?}"));
-    assert!(
-        claimed.is_empty(),
-        "{operation} returned stale claimed work"
-    );
+    let claimed = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        claim_due(db, "claimant", now, now + Duration::seconds(30), 1),
+    )
+    .await
+    .expect("claim_due waited on the locked head")
+    .unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].job.id, expected);
 }
 
 fn publication_request(
@@ -1316,7 +1317,7 @@ async fn postgres_claim_due_contends_with_prefix_and_bucket_supersession_without
     let prefix_a = format!("a-prefix-{prefix_suffix}");
     let prefix_z = format!("z-prefix-{prefix_suffix}");
     let prefix_trigger = format!("trigger-prefix-{prefix_suffix}");
-    let (holder, contender, observer) = connect_triplet(&url, &prefix_bucket).await;
+    let (holder, contender, _) = connect_triplet(&url, &prefix_bucket).await;
     submit(
         &holder,
         request(&prefix_z, &prefix_bucket, "out/z", None),
@@ -1338,28 +1339,13 @@ async fn postgres_claim_due_contends_with_prefix_and_bucket_supersession_without
     )
     .await
     .unwrap();
-    let holder_pid = backend_pid(&holder).await;
-    let contender_pid = backend_pid(&contender).await;
     let holder_transaction = holder.begin().await.unwrap();
     lock_bucket_for_ownership(&holder_transaction, &prefix_bucket)
         .await
         .unwrap();
-    lock_job_for_update(&holder_transaction, &prefix_a).await;
-    let (started_tx, started_rx) = oneshot::channel();
+    lock_job_for_update(&holder_transaction, &prefix_z).await;
     let claim_now = base + Duration::seconds(2);
-    let claim_task = tokio::spawn(async move {
-        started_tx.send(()).unwrap();
-        claim_due(
-            &contender,
-            "prefix-claimant",
-            claim_now,
-            claim_now + Duration::seconds(30),
-            2,
-        )
-        .await
-    });
-    started_rx.await.unwrap();
-    assert_blocked_by_holder(&observer, holder_pid, contender_pid).await;
+    assert_claim_skips_locked_head(&contender, claim_now, &prefix_a).await;
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
         install_prefix_claim(
@@ -1374,7 +1360,6 @@ async fn postgres_claim_due_contends_with_prefix_and_bucket_supersession_without
     .expect("prefix supersession deadlocked with claim_due")
     .unwrap();
     holder_transaction.commit().await.unwrap();
-    wait_for_claim_and_assert_empty("prefix supersession", claim_task).await;
     assert_eq!(job(&holder, &prefix_a).await.state, "superseded");
     assert_eq!(job(&holder, &prefix_z).await.state, "superseded");
     assert_eq!(job(&holder, &prefix_trigger).await.state, "queued");
@@ -1388,7 +1373,7 @@ async fn postgres_claim_due_contends_with_prefix_and_bucket_supersession_without
     let bucket_suffix = uuid::Uuid::new_v4();
     let bucket_a = format!("a-bucket-{bucket_suffix}");
     let bucket_z = format!("z-bucket-{bucket_suffix}");
-    let (holder, contender, observer) = connect_triplet(&url, &bucket_name).await;
+    let (holder, contender, _) = connect_triplet(&url, &bucket_name).await;
     submit(
         &holder,
         request(&bucket_z, &bucket_name, "key-a", None),
@@ -1403,28 +1388,13 @@ async fn postgres_claim_due_contends_with_prefix_and_bucket_supersession_without
     )
     .await
     .unwrap();
-    let holder_pid = backend_pid(&holder).await;
-    let contender_pid = backend_pid(&contender).await;
     let holder_transaction = holder.begin().await.unwrap();
     lock_bucket_for_ownership(&holder_transaction, &bucket_name)
         .await
         .unwrap();
-    lock_job_for_update(&holder_transaction, &bucket_a).await;
-    let (started_tx, started_rx) = oneshot::channel();
+    lock_job_for_update(&holder_transaction, &bucket_z).await;
     let claim_now = base + Duration::seconds(12);
-    let claim_task = tokio::spawn(async move {
-        started_tx.send(()).unwrap();
-        claim_due(
-            &contender,
-            "bucket-claimant",
-            claim_now,
-            claim_now + Duration::seconds(30),
-            2,
-        )
-        .await
-    });
-    started_rx.await.unwrap();
-    assert_blocked_by_holder(&observer, holder_pid, contender_pid).await;
+    assert_claim_skips_locked_head(&contender, claim_now, &bucket_a).await;
     let superseded = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         supersede_bucket(&holder_transaction, &bucket_name, claim_now),
@@ -1434,7 +1404,6 @@ async fn postgres_claim_due_contends_with_prefix_and_bucket_supersession_without
     .unwrap();
     assert_eq!(superseded, 2);
     holder_transaction.commit().await.unwrap();
-    wait_for_claim_and_assert_empty("bucket supersession", claim_task).await;
     assert_eq!(job(&holder, &bucket_a).await.state, "superseded");
     assert_eq!(job(&holder, &bucket_z).await.state, "superseded");
     for key in ["key-a", "key-z"] {

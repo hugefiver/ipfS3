@@ -163,18 +163,29 @@ pub(super) async fn claim_due(
 ) -> AppResult<Vec<execution::Claim>> {
     let mut claimed = Vec::new();
     for _ in 0..MAX_PAGES_PER_POLL {
-        let page = import_intake::pending_ids(db, after, PAGE).await?;
+        let page = match import_intake::pending_ids(db, after, PAGE).await {
+            Ok(page) => page,
+            Err(error) if claimed.is_empty() => return Err(error),
+            Err(_) => {
+                tracing::warn!("ZIP import discovery stopped after partial claim");
+                break;
+            }
+        };
         if page.is_empty() {
             after.clear();
             break;
         }
         for id in &page {
             *after = id.clone();
-            if let Some(claim) = execution::claim(db, id, worker, lease_seconds).await? {
-                claimed.push(claim);
-                if claimed.len() >= capacity {
-                    return Ok(claimed);
+            match execution::claim(db, id, worker, lease_seconds).await {
+                Ok(Some(claim)) => {
+                    claimed.push(claim);
+                    if claimed.len() >= capacity {
+                        return Ok(claimed);
+                    }
                 }
+                Ok(None) => {}
+                Err(_) => tracing::warn!(batch_id = %id, "ZIP import candidate claim failed"),
             }
         }
         if page.len() < PAGE as usize {
@@ -660,7 +671,6 @@ async fn execute_inner(
         build_root(
             state,
             claim,
-            &mirror,
             &files,
             cancel,
             root_lease_seconds(coordinator),
@@ -868,7 +878,6 @@ struct RootBuildCapture<'a> {
 async fn build_root(
     state: &Arc<AppState>,
     claim: &execution::Claim,
-    mirror: &zip::BatchSnapshot,
     files: &[DirectoryFile],
     cancel: &CancellationToken,
     root_lease: i64,
@@ -876,29 +885,19 @@ async fn build_root(
 ) -> Result<zip::RootOutcome, RunError> {
     let RootBuildCapture { current, candidate } = capture;
     let db = state.store.db();
-    if let Some(previous) = mirror.builds.iter().find(|build| {
-        build.revision == mirror.batch.root_revision && build.epoch == mirror.batch.root_epoch
-    }) {
-        // The previous process may have crashed after starting root I/O. Wait
-        // for its DB-clock lease rather than burning every retry epoch against
-        // a root claim that is not yet available. The execution heartbeat
-        // remains active throughout this cancellable wait.
-        let now = crate::store::database_clock::database_now(db)
-            .await
-            .map_err(|_| RunError::Retry)?;
-        if previous.lease_until > now {
-            let remaining = (previous.lease_until - now)
-                .to_std()
+    let root = match zip::claim_root(db, &claim.batch_id, &claim.worker, root_lease).await {
+        Ok(root) => root,
+        Err(_) => {
+            let yielded = import_intake::yield_to_live_root(db, claim)
+                .await
                 .map_err(|_| RunError::Retry)?;
-            tokio::select! {
-                _ = cancel.cancelled() => return Err(RunError::Lost),
-                _ = tokio::time::sleep(remaining.min(Duration::from_secs(60))) => {}
-            }
+            return Err(if yielded {
+                RunError::Lost
+            } else {
+                RunError::Retry
+            });
         }
-    }
-    let root = zip::claim_root(db, &claim.batch_id, &claim.worker, root_lease)
-        .await
-        .map_err(|_| RunError::Retry)?;
+    };
     *current.lock().await = Some(root.clone());
     zip::mark_invoked(db, &root)
         .await

@@ -278,8 +278,8 @@ pub(crate) async fn insert_queued_with_zip_intent<C: ConnectionTrait>(
 
 /// Claims due queued work and expired running leases in stable due-time order.
 ///
-/// Each candidate is conditionally updated, so competing workers can observe the same candidate
-/// but only one receives its newly incremented claim epoch.
+/// PostgreSQL skips locked candidates. The conditional update fences SQLite claimants
+/// that observed the same due job.
 pub async fn claim_due(
     db: &DatabaseConnection,
     worker_id: &str,
@@ -351,29 +351,29 @@ async fn claim_due_in_transaction<C: ConnectionTrait>(
     ),
     sea_orm::DbErr,
 > {
-    let id_bytes = if db.get_database_backend() == DatabaseBackend::Sqlite {
-        "length(CAST(id AS BLOB))"
+    let backend = db.get_database_backend();
+    let readable_candidate = if backend == DatabaseBackend::Sqlite {
+        "length(CAST(id AS BLOB))<=1024 AND typeof(attempts)='integer'"
     } else {
-        "octet_length(id)"
+        "octet_length(id)<=1024"
     };
-    let candidates = import_job::Entity::find_state()
+    let mut query = import_job::Entity::find_state()
         .select_only()
-        .column_as(
-            Expr::cust(format!("CASE WHEN {id_bytes}<=1024 THEN id END")),
-            import_job::Column::Id,
-        )
-        .column_as(
-            Expr::cust("CASE WHEN source_type IN ('cid','url') THEN source_type END"),
-            import_job::Column::SourceType,
-        )
+        .columns([import_job::Column::Id, import_job::Column::SourceType])
         .filter(due_claim_condition(now))
+        .filter(Expr::cust(readable_candidate))
+        .filter(import_job::Column::SourceType.is_in(["cid", "url"]))
+        .filter(import_job::Column::Attempts.between(0, i32::MAX - 1))
+        .filter(import_job::Column::ClaimEpoch.lt(i64::MAX))
         .order_by_asc(import_job::Column::NextAttemptAt)
         .order_by_asc(import_job::Column::CreatedAt)
         .order_by_asc(import_job::Column::Id)
-        .limit(limit.min(256))
-        .into_model::<ClaimCandidate>()
-        .all(db)
-        .await?;
+        .limit(limit.min(256));
+    if backend == DatabaseBackend::Postgres {
+        use sea_orm::sea_query::{LockBehavior, LockType};
+        query = query.lock_with_behavior(LockType::Update, LockBehavior::SkipLocked);
+    }
+    let candidates = query.into_model::<ClaimCandidate>().all(db).await?;
     let mut claimed = Vec::with_capacity(candidates.len());
     for (due_rank, candidate) in candidates_in_lock_order(candidates) {
         if claim_candidate(db, &candidate, worker_id, now, lease_until).await? {
@@ -1218,6 +1218,49 @@ mod tests {
 
         assert_eq!(persisted(&db, "job-c").await.claim_epoch, 2);
         assert_eq!(persisted(&db, "job-c").await.attempts, 2);
+    }
+
+    #[tokio::test]
+    async fn unclaimable_heads_leave_ownership_intact_and_allow_independent_work() {
+        let db = setup().await;
+        let long_id = "a".repeat(1025);
+        for (id, key) in [
+            (long_id.as_str(), "oversized-id"),
+            ("b", "exhausted-attempt"),
+            ("c", "fractional-attempt"),
+            ("d", "independent"),
+        ] {
+            crate::store::import::ownership::submit(&db, request(id, key), time(0))
+                .await
+                .unwrap();
+        }
+        db.execute_unprepared("UPDATE import_jobs SET attempts=2147483647 WHERE id='b'; UPDATE import_jobs SET attempts=1.5 WHERE id='c'")
+            .await.unwrap();
+
+        assert_eq!(claim_one(&db, "worker", time(0)).await.job.id, "d");
+        for (id, key) in [
+            (long_id.as_str(), "oversized-id"),
+            ("b", "exhausted-attempt"),
+            ("c", "fractional-attempt"),
+        ] {
+            let (state, epoch) = import_job::Entity::find_state()
+                .select_only()
+                .columns([import_job::Column::State, import_job::Column::ClaimEpoch])
+                .filter(import_job::Column::Id.eq(id))
+                .into_tuple::<(String, i64)>()
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!((state.as_str(), epoch), (STATE_QUEUED, 0));
+            let owner =
+                import_destination::Entity::find_by_id(("bucket".to_owned(), key.to_owned()))
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(owner.owner_job_id.as_deref(), Some(id));
+        }
     }
 
     #[tokio::test]

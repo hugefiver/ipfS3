@@ -192,6 +192,56 @@ async fn fixture() -> Fixture {
     }
 }
 
+#[tokio::test]
+async fn claim_batch_keeps_successes_on_both_sides_of_a_candidate_error() {
+    use sea_orm::ConnectionTrait;
+    let db = store::connect_database("sqlite::memory:").await.unwrap();
+    store::run_migrations(&db).await.unwrap();
+    store::bucket::create(&db, "bucket", None).await.unwrap();
+    for id in ["a", "b", "c"] {
+        import_intake::admit(
+            &db,
+            &import_intake::Request {
+                admission: execution::Admission {
+                    id: id.into(),
+                    owner: "owner".into(),
+                    source: "import".into(),
+                    token: id.into(),
+                    request_fingerprint: hex::encode(Sha256::digest(id.as_bytes())),
+                    request_contract: id.into(),
+                    bucket: "bucket".into(),
+                    source_key: "archive".into(),
+                    captured_options: "{}".into(),
+                },
+                prefix: "out/".into(),
+                source_descriptor: "[\"cid\",\"fixture\"]".into(),
+                expected_sha256: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    db.execute_unprepared(
+        "CREATE TRIGGER fail_b BEFORE UPDATE OF epoch ON zip_v2_executions \
+        WHEN OLD.id='b' BEGIN SELECT RAISE(ABORT,'claim fault'); END",
+    )
+    .await
+    .unwrap();
+    let mut cursor = String::new();
+    let claims = claim_due(&db, "worker", 30, 3, &mut cursor).await.unwrap();
+    assert_eq!(
+        claims
+            .iter()
+            .map(|c| c.batch_id.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "c"]
+    );
+    db.execute_unprepared("DROP TRIGGER fail_b").await.unwrap();
+    let retry = claim_due(&db, "worker", 30, 3, &mut cursor).await.unwrap();
+    assert_eq!(retry.len(), 1);
+    assert_eq!((retry[0].batch_id.as_str(), retry[0].epoch), ("b", 1));
+}
+
 async fn compete_with_heartbeat(
     fixture: &Fixture,
     shutdown: &CancellationToken,

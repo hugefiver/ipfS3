@@ -127,6 +127,25 @@ pub async fn lock_bucket_for_ownership<C: ConnectionTrait>(
     Err(AppError::NoSuchBucket(bucket_name.to_owned()))
 }
 
+/// Background claims skip a locked PostgreSQL bucket; SQLite uses its single writer.
+pub(crate) async fn try_lock_bucket_for_ownership<C: ConnectionTrait>(
+    txn: &C,
+    bucket_name: &str,
+) -> AppResult<bool> {
+    if txn.get_database_backend() == DatabaseBackend::Postgres {
+        return Ok(txn
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT name FROM buckets WHERE name = $1 FOR NO KEY UPDATE SKIP LOCKED",
+                [bucket_name.to_owned().into()],
+            ))
+            .await?
+            .is_some());
+    }
+    lock_bucket_for_ownership(txn, bucket_name).await?;
+    Ok(true)
+}
+
 fn postgres_bucket_ownership_lock_statement(bucket_name: &str) -> Statement {
     Statement::from_sql_and_values(
         DatabaseBackend::Postgres,

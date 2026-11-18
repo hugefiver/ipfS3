@@ -477,6 +477,19 @@ pub async fn read_for_path(
     row.map(status_from_row).transpose()
 }
 
+/// Only the build selected by the batch can still exclude a successor in claim_root.
+pub(super) fn live_root_sql(backend: DatabaseBackend) -> String {
+    let active = if backend == DatabaseBackend::Postgres {
+        "rb.lease_until > clock_timestamp()"
+    } else {
+        "julianday(rb.lease_until) > julianday('now')"
+    };
+    format!(
+        "EXISTS (SELECT 1 FROM zip_batches b JOIN zip_root_builds rb ON rb.batch_id=b.id \
+         AND rb.revision=b.root_revision AND rb.epoch=b.root_epoch WHERE b.id=e.id AND {active})"
+    )
+}
+
 /// Bounded keyset discovery of due pending and admitted work. The database
 /// clock, not the polling process's clock, decides whether a claim is due.
 /// Discovery is never authority to fetch a private source or publish outputs.
@@ -488,13 +501,36 @@ pub async fn pending_ids(
     if !(1..=256).contains(&limit) {
         return Err(AppError::InvalidImportRequest);
     }
-    let rows = db.query_all(sql(db,
-        "SELECT r.batch_id FROM zip_v2_import_requests r JOIN zip_v2_executions e ON e.id=r.batch_id WHERE r.job_state='pending' AND e.state IN ('pending','admitted') AND (e.lease_until IS NULL OR julianday(e.lease_until)<=julianday('now')) AND r.batch_id>? ORDER BY r.batch_id LIMIT ?",
-        "SELECT r.batch_id FROM zip_v2_import_requests r JOIN zip_v2_executions e ON e.id=r.batch_id WHERE r.job_state='pending' AND e.state IN ('pending','admitted') AND (e.lease_until IS NULL OR e.lease_until<=clock_timestamp()) AND r.batch_id>$1 ORDER BY r.batch_id LIMIT $2",
-        vec![after.into(), (limit as i64).into()])).await?;
+    let backend = db.get_database_backend();
+    let expired = if backend == DatabaseBackend::Postgres {
+        "e.lease_until<=clock_timestamp()"
+    } else {
+        "julianday(e.lease_until)<=julianday('now')"
+    };
+    let root_busy = live_root_sql(backend);
+    let rows = db.query_all(Statement::from_sql_and_values(backend, format!(
+        "SELECT r.batch_id FROM zip_v2_import_requests r JOIN zip_v2_executions e ON e.id=r.batch_id \
+         WHERE r.job_state='pending' AND e.state IN ('pending','admitted') AND (e.lease_until IS NULL OR {expired}) \
+         AND NOT {root_busy} AND r.batch_id>$1 ORDER BY r.batch_id LIMIT $2"),
+        [after.into(), (limit as i64).into()])).await?;
     rows.into_iter()
         .map(|row| row.try_get("", "batch_id").map_err(Into::into))
         .collect()
+}
+
+/// A root taken after discovery excludes work, not a failed attempt. Expire
+/// only this execution lease; discovery will wait for the exact root lease.
+pub(crate) async fn yield_to_live_root(
+    db: &DatabaseConnection,
+    claim: &execution::Claim,
+) -> AppResult<bool> {
+    let backend = db.get_database_backend();
+    let root_busy = live_root_sql(backend);
+    let changed = db.execute(Statement::from_sql_and_values(backend, format!(
+        "UPDATE zip_v2_executions AS e SET lease_until=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP \
+         WHERE e.id=$1 AND e.epoch=$2 AND e.worker=$3 AND e.state='admitted' AND {root_busy}"),
+        [claim.batch_id.clone().into(), claim.epoch.into(), claim.worker.clone().into()])).await?;
+    Ok(changed.rows_affected() == 1)
 }
 
 pub struct ClaimedSource {

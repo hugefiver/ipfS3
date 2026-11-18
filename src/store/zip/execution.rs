@@ -506,35 +506,76 @@ pub async fn admit_manifest_in_transaction(
         now,
     )
     .await?;
-    for item in items {
-        let (path, key, cid, size, code) = match item {
-            ManifestItem::Success {
-                path,
-                object_key,
-                cid,
-                size,
-            } => (
-                path,
-                Some(object_key.clone()),
-                Some(cid.clone()),
-                Some(*size),
-                None,
-            ),
-            ManifestItem::Failure { path, code } => (path, None, None, None, Some(code.clone())),
-        };
-        tx.execute(statement(tx,
-            "INSERT INTO zip_v2_manifest (batch_id,path,object_key,cid,size,error_code,created_at) VALUES (?,?,?,?,?,?,?)",
-            "INSERT INTO zip_v2_manifest (batch_id,path,object_key,cid,size,error_code,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7)",
-            vec![claim.batch_id.clone().into(),path.clone().into(),key.into(),cid.into(),size.into(),code.into(),now.into()])).await?;
-    }
-    for guard in guards {
-        if guard.mutation_prefix.is_some() || guard.key == batch.source_key {
-            return Err(stale());
+    use sea_orm::sea_query::{Alias, Query};
+    for chunk in items.chunks(100) {
+        let mut insert = Query::insert();
+        insert.into_table(Alias::new("zip_v2_manifest")).columns(
+            [
+                "batch_id",
+                "path",
+                "object_key",
+                "cid",
+                "size",
+                "error_code",
+                "created_at",
+            ]
+            .map(Alias::new),
+        );
+        for item in chunk {
+            let (path, key, cid, size, code) = match item {
+                ManifestItem::Success {
+                    path,
+                    object_key,
+                    cid,
+                    size,
+                } => (
+                    path,
+                    Some(object_key.clone()),
+                    Some(cid.clone()),
+                    Some(*size),
+                    None,
+                ),
+                ManifestItem::Failure { path, code } => {
+                    (path, None, None, None, Some(code.clone()))
+                }
+            };
+            insert.values_panic([
+                claim.batch_id.clone().into(),
+                path.clone().into(),
+                key.into(),
+                cid.into(),
+                size.into(),
+                code.into(),
+                now.into(),
+            ]);
         }
-        tx.execute(statement(tx,
-            "INSERT INTO zip_v2_targets (batch_id,object_key,mutation_id,expected_generation,epoch) VALUES (?,?,?,?,?)",
-            "INSERT INTO zip_v2_targets (batch_id,object_key,mutation_id,expected_generation,epoch) VALUES ($1,$2,$3,$4,$5)",
-            vec![claim.batch_id.clone().into(),guard.key.into(),guard.mutation_id.into(),guard.expected_generation.into(),claim.epoch.into()])).await?;
+        tx.execute(tx.get_database_backend().build(&insert)).await?;
+    }
+    for chunk in guards.chunks(100) {
+        let mut insert = Query::insert();
+        insert.into_table(Alias::new("zip_v2_targets")).columns(
+            [
+                "batch_id",
+                "object_key",
+                "mutation_id",
+                "expected_generation",
+                "epoch",
+            ]
+            .map(Alias::new),
+        );
+        for guard in chunk {
+            if guard.mutation_prefix.is_some() || guard.key == batch.source_key {
+                return Err(stale());
+            }
+            insert.values_panic([
+                claim.batch_id.clone().into(),
+                guard.key.clone().into(),
+                guard.mutation_id.clone().into(),
+                guard.expected_generation.into(),
+                claim.epoch.into(),
+            ]);
+        }
+        tx.execute(tx.get_database_backend().build(&insert)).await?;
     }
     let changed = tx.execute(statement(tx,
         "UPDATE zip_v2_executions SET state='admitted',updated_at=? WHERE id=? AND epoch=? AND worker=? AND state='pending'",
@@ -614,8 +655,25 @@ pub async fn claim(
         return Ok(None);
     };
     let tx = db.begin().await?;
-    ownership::lock_bucket_for_ownership(&tx, &initial.bucket).await?;
-    let batch = read(&tx, id).await?.ok_or_else(stale)?;
+    let batch = if initial.source == "import" {
+        if !ownership::try_lock_bucket_for_ownership(&tx, &initial.bucket).await? {
+            return Ok(None);
+        }
+        let backend = tx.get_database_backend();
+        let root_busy = super::import_intake::live_root_sql(backend);
+        let row = tx
+            .query_one(Statement::from_sql_and_values(
+                backend,
+                format!("SELECT e.* FROM zip_v2_executions e WHERE e.id=$1 AND NOT {root_busy}"),
+                [id.into()],
+            ))
+            .await?;
+        let Some(row) = row else { return Ok(None) };
+        decode(row)?
+    } else {
+        ownership::lock_bucket_for_ownership(&tx, &initial.bucket).await?;
+        read(&tx, id).await?.ok_or_else(stale)?
+    };
     let now = database_now(&tx).await?;
     if batch.bucket != initial.bucket
         || !matches!(batch.state.as_str(), "pending" | "admitted")
@@ -671,7 +729,11 @@ pub async fn claim(
             Ok(rotated_guard) => rotated.push(rotated_guard),
             Err(AppError::StaleContentMutation) => {
                 tx.rollback().await?;
-                fence_if_lost(db, &old).await?;
+                // A due import will fence the expired guard on its next scan;
+                // do not reacquire a possibly busy bucket on the polling path.
+                if initial.source != "import" {
+                    fence_if_lost(db, &old).await?;
+                }
                 return Ok(None);
             }
             Err(other) => return Err(other),
