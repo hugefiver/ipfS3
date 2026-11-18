@@ -1,7 +1,10 @@
 use ipfs_s3_gateway::store::{
     self,
     initialization::{self, UpgradeRequest},
-    migrations::{Historical, baseline, history},
+    migrations::{
+        Historical, baseline, history, m20261108_000001_current_pinning_config as current_pinning,
+        m20261109_000001_pin_cid_comparisons as cid_comparisons,
+    },
     pinning::management::{native, schema},
 };
 use sea_orm::{ConnectionTrait, Database, DatabaseBackend, DatabaseConnection, Statement};
@@ -165,7 +168,12 @@ async fn exercise(db: &DatabaseConnection, source: Option<&str>) {
     initialization::open(db).await.unwrap();
     assert_eq!(
         schema::validate(db).await.unwrap(),
-        [baseline::VERSION, schema::VERSION]
+        [
+            baseline::VERSION,
+            current_pinning::VERSION,
+            cid_comparisons::VERSION,
+            schema::VERSION,
+        ]
     );
     store::bucket::create(db, "baseline", None).await.unwrap();
     store::object::upsert(
@@ -417,7 +425,16 @@ async fn ledger_failure_rolls_back_m23_conversion_and_preserves_source() {
         .map(|r| r.try_get::<String>("", "version").unwrap())
         .collect::<Vec<_>>();
     assert!(history::is_m23(&versions));
-    assert!(db.query_one(Statement::from_string(DatabaseBackend::Sqlite,"SELECT 1 FROM pin_management_inline_archive WHERE archive_id='history:upgrade:m20261108_000001_current_pinning_config'")).await.unwrap().is_none());
+    assert!(
+        db.query_one(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "SELECT 1 FROM pin_management_inline_archive WHERE archive_id=$1",
+            [format!("history:upgrade:{}", request().target_version).into()],
+        ))
+        .await
+        .unwrap()
+        .is_none()
+    );
     db.execute_unprepared("DROP TRIGGER fail_normalization")
         .await
         .unwrap();

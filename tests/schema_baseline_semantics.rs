@@ -1,6 +1,8 @@
-use ipfs_s3_gateway::store::{initialization, migrations::Historical};
+use ipfs_s3_gateway::store::migrations::{
+    Historical, m20261027_000001_schema_baseline::Migration as Baseline,
+};
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement, TransactionTrait};
-use sea_orm_migration::MigratorTrait;
+use sea_orm_migration::{MigrationTrait, MigratorTrait, SchemaManager};
 #[path = "support/baseline_catalog.rs"]
 mod catalog;
 #[path = "support/baseline_postgres.rs"]
@@ -138,7 +140,7 @@ async fn sqlite_final_predicates_and_guard_behavior_match_history() {
     let old = Database::connect("sqlite::memory:").await.unwrap();
     let fresh = Database::connect("sqlite::memory:").await.unwrap();
     Historical::up(&old, None).await.unwrap();
-    initialization::open(&fresh).await.unwrap();
+    Baseline.up(&SchemaManager::new(&fresh)).await.unwrap();
     let expected = catalog::sqlite(&old).await;
     let actual = catalog::sqlite(&fresh).await;
     assert!(actual.keys().eq(expected.keys()));
@@ -155,7 +157,7 @@ async fn postgres_final_catalog_and_guard_behavior_match_history() {
     postgres::with_schema(|old| async move {
         Historical::up(&old, None).await.unwrap();
         postgres::with_schema(|fresh| async move {
-            initialization::open(&fresh).await.unwrap();
+            Baseline.up(&SchemaManager::new(&fresh)).await.unwrap();
             let expected = catalog::postgres(&old).await;
             for (kind, actual) in catalog::postgres(&fresh).await {
                 let old = &expected[&kind];
