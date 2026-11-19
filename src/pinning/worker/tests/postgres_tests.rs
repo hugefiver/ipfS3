@@ -4,7 +4,7 @@ use chrono::Utc;
 use futures_util::FutureExt;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectOptions, ConnectionTrait, Database, DatabaseBackend,
-    DatabaseConnection, EntityTrait, IntoActiveModel, QueryFilter, TransactionTrait,
+    DatabaseConnection, EntityTrait, IntoActiveModel, QueryFilter, Statement, TransactionTrait,
 };
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
@@ -16,7 +16,10 @@ use crate::{
     pinning::{config::ValidatedPinningConfig, coordinator::PinningCoordinator},
     store::{
         Store,
-        entities::{pin_job, pin_lease_target, pin_provider_usage, remote_pin, remote_pin_ledger},
+        entities::{
+            pin_invocation_route, pin_job, pin_lease_target, pin_provider_usage, remote_pin,
+            remote_pin_ledger,
+        },
         pinning::{jobs, ledger},
     },
 };
@@ -447,6 +450,105 @@ async fn postgres_unavailable_provider_rechecks_claim_and_current_remote_epoch()
         assert_no_provider_calls(&fixture);
     })
     .await;
+}
+
+#[tokio::test]
+#[ignore = "requires IPFS_S3_TEST_POSTGRES_URL; run explicitly with --ignored"]
+async fn postgres_reserved_reconcile_submit_creates_under_usage_and_route_locks() {
+    with_postgres_fixture(|fixture| reconcile_reserved_submit_under_locks(fixture, false)).await;
+}
+
+#[tokio::test]
+#[ignore = "requires IPFS_S3_TEST_POSTGRES_URL; run explicitly with --ignored"]
+async fn postgres_reserved_reconcile_submit_reuses_under_usage_and_route_locks() {
+    with_postgres_fixture(|fixture| reconcile_reserved_submit_under_locks(fixture, true)).await;
+}
+
+async fn reconcile_reserved_submit_under_locks(fixture: Fixture, reuse_submit: bool) {
+    let db = fixture.store.db();
+    fixture
+        .coordinator
+        .register_identities(&fixture.store)
+        .await
+        .unwrap();
+    let reservation = db.begin().await.unwrap();
+    ledger::capture_reservation(&reservation, "noop", "bafy-worker")
+        .await
+        .unwrap();
+    reservation.commit().await.unwrap();
+    let claimed = enqueue_reconcile(&fixture).await;
+    let reconcile_id = claimed.model.id.clone();
+    let before = resource_state(&fixture).await;
+    assert_eq!((before.1.reserved_bytes, before.1.reserved_pins), (100, 1));
+    let expected_route = ledger_row(&fixture).await.route.unwrap();
+    if reuse_submit {
+        let tx = db.begin().await.unwrap();
+        jobs::enqueue_job(
+            &tx,
+            jobs::submit_job("noop", "bafy-worker", "lease-1", "target-1", 1, Utc::now()),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+    let submits = pin_job::Entity::find().filter(pin_job::Column::Operation.eq("submit"));
+    let previous_submits = submits.clone().all(db).await.unwrap();
+    assert_eq!(previous_submits.len(), if reuse_submit { 1 } else { 0 });
+
+    let lock_holder = db.begin().await.unwrap();
+    for sql in [
+        "SELECT provider FROM pin_provider_usage WHERE provider='noop' FOR UPDATE",
+        "SELECT provider FROM pin_provider_routes WHERE provider='noop' FOR SHARE",
+    ] {
+        lock_holder
+            .query_one(Statement::from_string(DatabaseBackend::Postgres, sql))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        worker::execute_claimed_job(
+            &fixture.store,
+            &fixture.coordinator,
+            &Arc::new(Semaphore::new(1)),
+            claimed,
+        ),
+    )
+    .await
+    .expect("reserved Reconcile must settle while the usage and route locks are held")
+    .unwrap();
+
+    let reconcile = job(&fixture, &reconcile_id).await;
+    assert_eq!(reconcile.state, "done");
+    assert_eq!(reconcile.locked_until, None);
+    let rows = submits.all(db).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    if reuse_submit {
+        assert_eq!(rows, previous_submits);
+    }
+    let submit = &rows[0];
+    assert_eq!(submit.provider, "noop");
+    assert_eq!(submit.cid, "bafy-worker");
+    assert_eq!(submit.lease_id.as_deref(), Some("lease-1"));
+    assert_eq!(submit.target_id.as_deref(), Some("target-1"));
+    assert_eq!(submit.expected_generation, Some(1));
+    assert_eq!(submit.expected_remote_epoch, None);
+    assert_eq!(submit.state, "pending");
+    assert_eq!(submit.submit_phase.as_deref(), Some("ready"));
+    assert_eq!(submit.attempts, 0);
+    assert_eq!(submit.locked_until, None);
+    assert!(submit.next_attempt_at <= Utc::now());
+    let capture = pin_invocation_route::Entity::find_by_id(&submit.id)
+        .one(db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(capture.route, expected_route);
+    assert_eq!(capture.remote_epoch, before.0.epoch);
+    assert_eq!(resource_state(&fixture).await, before);
+    assert_no_provider_calls(&fixture);
+    lock_holder.rollback().await.unwrap();
 }
 
 #[tokio::test]

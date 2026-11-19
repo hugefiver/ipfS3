@@ -9,10 +9,11 @@ use super::management::{
     records::{self, DecodeWork, FrozenRows, RowView, SharedDecodeBudget},
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use sea_orm::sea_query::{Condition, Expr, Func};
+use sea_orm::sea_query::{Condition, Expr, Func, LockBehavior, LockType};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, QueryFilter, QueryOrder,
-    QuerySelect, QueryTrait, Set, TransactionTrait, TryInsertResult,
+    ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseTransaction, DbErr, EntityTrait,
+    QueryFilter, QueryOrder, QuerySelect, QueryTrait, Set, Statement, TransactionTrait,
+    TryInsertResult,
 };
 use sha2::{Digest, Sha256};
 
@@ -2021,23 +2022,45 @@ pub async fn claim_due_jobs<C: ConnectionTrait + TransactionTrait>(
     limit: u64,
 ) -> AppResult<Vec<ClaimedPinJob>> {
     let locked_until = now + lock_for;
+    if db.get_database_backend() == DatabaseBackend::Postgres {
+        let tx = db.begin().await?;
+        let claimed = async {
+            let candidates = ordered_due_jobs(due_claim_condition(now))
+                .limit(limit)
+                .lock_with_behavior(LockType::Update, LockBehavior::SkipLocked)
+                .all(&tx)
+                .await?;
+            let plan = candidates
+                .into_iter()
+                .enumerate()
+                .map(|(rank, candidate)| RankedClaimCandidate { rank, candidate })
+                .collect();
+            write_claim_batch(&tx, now, locked_until, plan, None).await
+        }
+        .await;
+        return Ok(finish_claim_batch(tx, claimed).await?);
+    }
     for attempt in 0..=MAX_SQLITE_CLAIM_RETRIES {
         let result = db
             .transaction(|txn| {
                 Box::pin(async move {
                     lock_sqlite_claim_writer(txn).await?;
-                    let candidates = pin_job::Entity::find()
-                        .filter(due_claim_condition(now))
-                        .order_by_asc(pin_job::Column::NextAttemptAt)
-                        .order_by_asc(pin_job::Column::Id)
+                    let candidates = ordered_due_jobs(due_claim_condition(now))
                         .limit(limit)
                         .all(txn)
                         .await?;
                     let mut claimed = Vec::with_capacity(candidates.len());
 
                     for candidate in candidates {
-                        if let Some(job) =
-                            claim_candidate(txn, candidate, now, locked_until).await?
+                        if let Some(job) = write_claim_candidate(
+                            txn,
+                            candidate,
+                            now,
+                            locked_until,
+                            SharedDecodeBudget::default(),
+                            None,
+                        )
+                        .await?
                         {
                             claimed.push(job);
                         }
@@ -2125,14 +2148,26 @@ pub(crate) async fn claim_due_management_jobs(
         {
             continue;
         }
-        if let Some(job) = claim_candidate_core(
+        let candidate = if tx.get_database_backend() == DatabaseBackend::Postgres {
+            let Some(current) = pin_job::Entity::find_by_id(&candidate.id)
+                .filter(due_claim_condition(now))
+                .lock_with_behavior(LockType::Update, LockBehavior::SkipLocked)
+                .one(tx.db())
+                .await?
+            else {
+                continue;
+            };
+            current
+        } else {
+            candidate
+        };
+        if let Some(job) = write_claim_candidate(
             tx.db(),
             candidate,
             now,
             now + lock_for,
             work.clone(),
             Some(&tx),
-            WorkerClaimLane::All,
         )
         .await?
         {
@@ -2195,9 +2230,8 @@ pub(crate) struct WorkerClaimSchedule<'a> {
 
 /// Claims due work using provider occupancy and recent-service tickets for fair scheduling.
 ///
-/// SQLite reserves its writer before candidate reads. The selected rows are then claimed in globally stable
-/// job-id order so concurrent PostgreSQL claimants cannot acquire overlapping row locks in
-/// opposite provider-local orders. Successful claims are returned in their original fair order.
+/// SQLite reserves its writer before candidate reads. PostgreSQL skips locked rows in the
+/// selected provider's queue. Writes are ordered by job ID, and claims are returned in fair order.
 pub async fn claim_due_jobs_fair<C: ConnectionTrait + TransactionTrait>(
     db: &C,
     now: DateTimeUtc,
@@ -2238,16 +2272,8 @@ pub(crate) async fn claim_due_worker_jobs_fair<C: ConnectionTrait + TransactionT
     for attempt in 0..=MAX_SQLITE_CLAIM_RETRIES {
         let result = async {
             let tx = db.begin().await?;
-            match claim_worker_batch(&tx, now, locked_until, limit, schedule, None).await {
-                Ok(claimed) => {
-                    tx.commit().await?;
-                    Ok(claimed)
-                }
-                Err(error) => {
-                    tx.rollback().await?;
-                    Err(error)
-                }
-            }
+            let claimed = claim_worker_batch(&tx, now, locked_until, limit, schedule, None).await;
+            finish_claim_batch(tx, claimed).await
         }
         .await;
         match result {
@@ -2280,9 +2306,13 @@ pub(crate) async fn claim_due_worker_jobs_store(
         let result =
             claim_worker_batch(tx.db(), now, now + lock_for, limit, schedule, Some(&tx)).await;
         match result {
-            Ok(claimed) => {
+            Ok(Some(claimed)) => {
                 tx.commit().await?;
                 return Ok(claimed);
+            }
+            Ok(None) => {
+                tx.rollback().await?;
+                return Ok(Vec::new());
             }
             Err(error) => {
                 tx.rollback().await?;
@@ -2297,14 +2327,35 @@ pub(crate) async fn claim_due_worker_jobs_store(
     unreachable!("SQLite claim retry loop always returns or errors")
 }
 
+async fn finish_claim_batch(
+    tx: DatabaseTransaction,
+    result: Result<Option<Vec<ClaimedPinJob>>, DbErr>,
+) -> Result<Vec<ClaimedPinJob>, DbErr> {
+    match result {
+        Ok(Some(claimed)) => {
+            tx.commit().await?;
+            Ok(claimed)
+        }
+        Ok(None) => {
+            // Rolling back also releases candidate locks when tx is a nested savepoint.
+            tx.rollback().await?;
+            Ok(Vec::new())
+        }
+        Err(error) => {
+            tx.rollback().await?;
+            Err(error)
+        }
+    }
+}
+
 async fn claim_worker_batch(
-    tx: &sea_orm::DatabaseTransaction,
+    tx: &DatabaseTransaction,
     now: DateTimeUtc,
     locked_until: DateTimeUtc,
     limit: u64,
     schedule: WorkerClaimSchedule<'_>,
     runtime: Option<&crate::store::RuntimeTransaction>,
-) -> Result<Vec<ClaimedPinJob>, sea_orm::DbErr> {
+) -> Result<Option<Vec<ClaimedPinJob>>, DbErr> {
     lock_sqlite_claim_writer(tx).await?;
     let mut due = Condition::all().add(schedule.lane.due(now));
     if !schedule.active_job_ids.is_empty() {
@@ -2318,53 +2369,73 @@ async fn claim_worker_batch(
         .into_tuple()
         .all(tx)
         .await?;
-    let mut candidates_by_provider = BTreeMap::new();
+    let pg = tx.get_database_backend() == DatabaseBackend::Postgres;
+    let mut queues = BTreeMap::new();
     for provider in providers {
-        let candidates = pin_job::Entity::find()
-            .filter(due.clone())
-            .filter(pin_job::Column::Provider.eq(provider.clone()))
-            .order_by_asc(pin_job::Column::NextAttemptAt)
-            .order_by_asc(pin_job::Column::Id)
-            .limit(limit)
-            .all(tx)
-            .await?;
-        if !candidates.is_empty() {
-            candidates_by_provider.insert(provider, VecDeque::from(candidates));
+        let source = if pg {
+            ProviderCandidates::Postgres { after: None }
+        } else {
+            let candidates = ordered_due_jobs(due.clone())
+                .filter(pin_job::Column::Provider.eq(&provider))
+                .limit(limit)
+                .all(tx)
+                .await?;
+            ProviderCandidates::Buffered(candidates.into())
+        };
+        let queue = FairClaimQueue {
+            source,
+            occupancy: schedule
+                .in_flight_by_provider
+                .get(&provider)
+                .copied()
+                .unwrap_or_default(),
+            ticket: EffectiveServiceTicket::Existing(
+                schedule
+                    .last_served_ticket_by_provider
+                    .get(&provider)
+                    .copied()
+                    .unwrap_or_default(),
+            ),
+            priority: schedule
+                .configured_priorities
+                .get(&provider)
+                .copied()
+                .unwrap_or(u32::MAX),
+        };
+        queues.insert(provider, queue);
+    }
+
+    let capacity = usize::try_from(limit).unwrap_or(usize::MAX);
+    let mut plan = Vec::with_capacity(capacity.min(queues.len()));
+    while plan.len() < capacity {
+        let Some((provider, queue)) = queues.iter_mut().min_by_key(|(provider, queue)| {
+            (queue.occupancy, queue.ticket, queue.priority, *provider)
+        }) else {
+            break;
+        };
+        if let Some(candidate) = queue.source.next(tx, &due, provider).await? {
+            let rank = plan.len();
+            queue.occupancy = queue.occupancy.saturating_add(1);
+            queue.ticket = EffectiveServiceTicket::Selected(rank);
+            plan.push(RankedClaimCandidate { rank, candidate });
+        } else {
+            let exhausted = provider.clone();
+            queues.remove(&exhausted);
         }
     }
-    let fair_plan = select_fair_candidates(
-        candidates_by_provider,
-        usize::try_from(limit).unwrap_or(usize::MAX),
-        schedule.in_flight_by_provider,
-        schedule.last_served_ticket_by_provider,
-        schedule.configured_priorities,
-    );
-    let mut update_plan = fair_plan.clone();
-    update_plan.sort_by(|left, right| left.candidate.id.cmp(&right.candidate.id));
-    let mut claimed = Vec::with_capacity(update_plan.len());
-    for ranked in update_plan {
-        let result = claim_candidate_core(
-            tx,
-            ranked.candidate,
-            now,
-            locked_until,
-            SharedDecodeBudget::default(),
-            runtime,
-            schedule.lane,
-        )
-        .await?;
-        if let Some(job) = result {
-            claimed.push((ranked.fair_rank, job));
-        }
-    }
-    claimed.sort_by_key(|(rank, _)| *rank);
-    Ok(claimed.into_iter().map(|(_, job)| job).collect())
+    write_claim_batch(tx, now, locked_until, plan, runtime).await
 }
 
-#[derive(Clone)]
 struct RankedClaimCandidate {
-    fair_rank: usize,
+    rank: usize,
     candidate: pin_job::Model,
+}
+
+struct FairClaimQueue {
+    source: ProviderCandidates,
+    occupancy: usize,
+    ticket: EffectiveServiceTicket,
+    priority: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -2373,142 +2444,122 @@ enum EffectiveServiceTicket {
     Selected(usize),
 }
 
-fn select_fair_candidates(
-    mut candidates_by_provider: BTreeMap<String, VecDeque<pin_job::Model>>,
-    capacity: usize,
-    in_flight_by_provider: &BTreeMap<String, usize>,
-    last_served_ticket_by_provider: &BTreeMap<String, u64>,
-    configured_priorities: &BTreeMap<String, u32>,
-) -> Vec<RankedClaimCandidate> {
-    let mut selected_by_provider = BTreeMap::<String, usize>::new();
-    let mut effective_service = last_served_ticket_by_provider
-        .iter()
-        .map(|(provider, ticket)| (provider.clone(), EffectiveServiceTicket::Existing(*ticket)))
-        .collect::<BTreeMap<_, _>>();
-    let mut selected = Vec::with_capacity(capacity.min(candidates_by_provider.len()));
+enum ProviderCandidates {
+    Buffered(VecDeque<pin_job::Model>),
+    Postgres {
+        after: Option<(DateTimeUtc, String)>,
+    },
+}
 
-    while selected.len() < capacity && !candidates_by_provider.is_empty() {
-        let Some(provider) = candidates_by_provider
-            .keys()
-            .min_by(|left, right| {
-                effective_provider_occupancy(left, in_flight_by_provider, &selected_by_provider)
-                    .cmp(&effective_provider_occupancy(
-                        right,
-                        in_flight_by_provider,
-                        &selected_by_provider,
-                    ))
-                    .then_with(|| {
-                        effective_service
-                            .get(*left)
-                            .copied()
-                            .unwrap_or(EffectiveServiceTicket::Existing(0))
-                            .cmp(
-                                &effective_service
-                                    .get(*right)
-                                    .copied()
-                                    .unwrap_or(EffectiveServiceTicket::Existing(0)),
-                            )
-                    })
-                    .then_with(|| {
-                        configured_priorities
-                            .get(*left)
-                            .copied()
-                            .unwrap_or(u32::MAX)
-                            .cmp(
-                                &configured_priorities
-                                    .get(*right)
-                                    .copied()
-                                    .unwrap_or(u32::MAX),
-                            )
-                    })
-                    .then_with(|| left.cmp(right))
-            })
-            .cloned()
-        else {
-            break;
-        };
-        let (candidate, queue_is_empty) = match candidates_by_provider.get_mut(&provider) {
-            Some(queue) => (queue.pop_front(), queue.is_empty()),
-            None => (None, true),
-        };
-        if queue_is_empty {
-            candidates_by_provider.remove(&provider);
+impl ProviderCandidates {
+    async fn next(
+        &mut self,
+        tx: &DatabaseTransaction,
+        due: &Condition,
+        provider: &str,
+    ) -> Result<Option<pin_job::Model>, DbErr> {
+        match self {
+            Self::Buffered(queue) => Ok(queue.pop_front()),
+            Self::Postgres { after } => {
+                let mut query =
+                    ordered_due_jobs(due.clone()).filter(pin_job::Column::Provider.eq(provider));
+                if let Some((at, id)) = after {
+                    // Our own row locks are visible to this transaction's next selection.
+                    query = query.filter(
+                        Condition::any()
+                            .add(pin_job::Column::NextAttemptAt.gt(*at))
+                            .add(
+                                Condition::all()
+                                    .add(pin_job::Column::NextAttemptAt.eq(*at))
+                                    .add(pin_job::Column::Id.gt(id.as_str())),
+                            ),
+                    );
+                }
+                let candidate = query
+                    .limit(1)
+                    .lock_with_behavior(LockType::Update, LockBehavior::SkipLocked)
+                    .one(tx)
+                    .await?;
+                if let Some(candidate) = &candidate {
+                    *after = Some((candidate.next_attempt_at, candidate.id.clone()));
+                }
+                Ok(candidate)
+            }
         }
-        let Some(candidate) = candidate else {
-            continue;
-        };
-        let fair_rank = selected.len();
-        *selected_by_provider.entry(provider.clone()).or_default() += 1;
-        effective_service.insert(provider, EffectiveServiceTicket::Selected(fair_rank));
-        selected.push(RankedClaimCandidate {
-            fair_rank,
-            candidate,
-        });
     }
-    selected
 }
 
-fn effective_provider_occupancy(
-    provider: &str,
-    in_flight_by_provider: &BTreeMap<String, usize>,
-    selected_by_provider: &BTreeMap<String, usize>,
-) -> usize {
-    in_flight_by_provider
-        .get(provider)
-        .copied()
-        .unwrap_or_default()
-        .saturating_add(
-            selected_by_provider
-                .get(provider)
-                .copied()
-                .unwrap_or_default(),
-        )
+fn ordered_due_jobs(due: Condition) -> sea_orm::Select<pin_job::Entity> {
+    pin_job::Entity::find()
+        .filter(due)
+        .order_by_asc(pin_job::Column::NextAttemptAt)
+        .order_by_asc(pin_job::Column::Id)
 }
 
-async fn claim_candidate<C: ConnectionTrait>(
-    db: &C,
-    candidate: pin_job::Model,
+async fn write_claim_batch(
+    tx: &DatabaseTransaction,
     now: DateTimeUtc,
     locked_until: DateTimeUtc,
-) -> Result<Option<ClaimedPinJob>, sea_orm::DbErr> {
-    claim_candidate_core(
-        db,
-        candidate,
-        now,
-        locked_until,
-        SharedDecodeBudget::default(),
-        None,
-        WorkerClaimLane::All,
-    )
-    .await
+    mut plan: Vec<RankedClaimCandidate>,
+    runtime: Option<&crate::store::RuntimeTransaction>,
+) -> Result<Option<Vec<ClaimedPinJob>>, DbErr> {
+    if !plan.is_empty()
+        && tx.get_database_backend() == DatabaseBackend::Postgres
+        && !try_lock_job_revision(tx, runtime.is_some()).await?
+    {
+        return Ok(None);
+    }
+    plan.sort_unstable_by(|left, right| left.candidate.id.cmp(&right.candidate.id));
+    let mut claimed = Vec::with_capacity(plan.len());
+    for ranked in plan {
+        if let Some(job) = write_claim_candidate(
+            tx,
+            ranked.candidate,
+            now,
+            locked_until,
+            SharedDecodeBudget::default(),
+            runtime,
+        )
+        .await?
+        {
+            claimed.push((ranked.rank, job));
+        }
+    }
+    claimed.sort_unstable_by_key(|(rank, _)| *rank);
+    Ok(Some(claimed.into_iter().map(|(_, job)| job).collect()))
 }
 
-async fn claim_candidate_core<C: ConnectionTrait>(
+async fn try_lock_job_revision(tx: &DatabaseTransaction, qualified: bool) -> Result<bool, DbErr> {
+    // Standalone callers may use a layout without management revision triggers.
+    if !qualified
+        && tx
+            .query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT 1 WHERE to_regclass('pin_management_revision') IS NULL",
+            ))
+            .await?
+            .is_some()
+    {
+        return Ok(true);
+    }
+    // Cleanup may already hold the revision and need a candidate row locked by this claim.
+    Ok(tx
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT 1 FROM pin_management_revision WHERE source_table='pin_jobs' FOR UPDATE SKIP LOCKED",
+        ))
+        .await?
+        .is_some())
+}
+
+async fn write_claim_candidate<C: ConnectionTrait>(
     db: &C,
     candidate: pin_job::Model,
     now: DateTimeUtc,
     locked_until: DateTimeUtc,
     work: SharedDecodeBudget,
     runtime: Option<&crate::store::RuntimeTransaction>,
-    lane: WorkerClaimLane<'_>,
-) -> Result<Option<ClaimedPinJob>, sea_orm::DbErr> {
-    let candidate = if db.get_database_backend() == DatabaseBackend::Postgres {
-        // A previous claim in this batch already holds the pin_jobs revision row.
-        let Some(current) = pin_job::Entity::find_by_id(&candidate.id)
-            .filter(lane.due(now))
-            .lock_with_behavior(
-                sea_orm::sea_query::LockType::Update,
-                sea_orm::sea_query::LockBehavior::SkipLocked,
-            )
-            .one(db)
-            .await?
-        else {
-            return Ok(None);
-        };
-        current
-    } else {
-        candidate
-    };
+) -> Result<Option<ClaimedPinJob>, DbErr> {
     let context = DecodeWork::shared(&work);
     let budget_error =
         |_| sea_orm::DbErr::Custom("claim data could not be read within its budget".into());
@@ -3526,7 +3577,7 @@ pub(crate) async fn insert_new_job_with_work<C: ConnectionTrait>(
     now: DateTimeUtc,
     work: DecodeWork<'_>,
 ) -> AppResult<bool> {
-    insert_job_core(db, job, now, work, None).await
+    insert_job_core(db, job, now, work, JobInsertAdmission::Standalone(None)).await
 }
 
 pub(crate) async fn insert_runtime_job(
@@ -3535,7 +3586,36 @@ pub(crate) async fn insert_runtime_job(
     now: DateTimeUtc,
     work: DecodeWork<'_>,
 ) -> AppResult<bool> {
-    insert_job_core(tx.db(), job, now, work, Some(tx)).await
+    insert_job_core(
+        tx.db(),
+        job,
+        now,
+        work,
+        JobInsertAdmission::Standalone(Some(tx)),
+    )
+    .await
+}
+
+/// The projection holds the lifecycle and remote frontier and has already admitted this route.
+pub(in crate::store::pinning) async fn insert_prelocked_runtime_submit(
+    tx: &crate::store::RuntimeTransaction,
+    job: TargetPinJob,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+) -> AppResult<bool> {
+    insert_job_core(
+        tx.db(),
+        NewPinJob::Target(job),
+        now,
+        work,
+        JobInsertAdmission::PrelockedRuntimeSubmit(tx),
+    )
+    .await
+}
+
+enum JobInsertAdmission<'a> {
+    Standalone(Option<&'a crate::store::RuntimeTransaction>),
+    PrelockedRuntimeSubmit(&'a crate::store::RuntimeTransaction),
 }
 
 async fn insert_job_core<C: ConnectionTrait>(
@@ -3543,7 +3623,7 @@ async fn insert_job_core<C: ConnectionTrait>(
     job: NewPinJob,
     now: DateTimeUtc,
     work: DecodeWork<'_>,
-    runtime: Option<&crate::store::RuntimeTransaction>,
+    admission: JobInsertAdmission<'_>,
 ) -> AppResult<bool> {
     if let NewPinJob::Target(target_job) = &job
         && target_work_terminal(db, target_job, work).await?
@@ -3571,7 +3651,9 @@ async fn insert_job_core<C: ConnectionTrait>(
     let job_id = model.id.as_ref().to_owned();
     let provider = model.provider.as_ref().to_owned();
     let cid = model.cid.as_ref().to_owned();
-    if model.operation.as_ref() == PinJobOperation::Submit.persisted() {
+    if operation == PinJobOperation::Submit
+        && let JobInsertAdmission::Standalone(runtime) = admission
+    {
         match runtime {
             Some(tx) => {
                 super::quota::lock_runtime_allocation_admission(tx, &provider, work).await?
@@ -3585,12 +3667,13 @@ async fn insert_job_core<C: ConnectionTrait>(
         .await?;
     let inserted = matches!(result, TryInsertResult::Inserted(_));
     if inserted {
-        match runtime {
-            Some(tx) => {
+        match admission {
+            JobInsertAdmission::Standalone(Some(tx))
+            | JobInsertAdmission::PrelockedRuntimeSubmit(tx) => {
                 super::ledger::capture_runtime_invocation(tx, &job_id, &provider, &cid, work)
                     .await?
             }
-            None => {
+            JobInsertAdmission::Standalone(None) => {
                 super::ledger::capture_invocation_with_work(db, &job_id, &provider, &cid, work)
                     .await?
             }
@@ -4392,6 +4475,8 @@ mod tests {
             "/tests/support/postgres_pinning_stage3.rs"
         ));
     }
+
+    mod postgres_claim_tests;
 
     #[tokio::test]
     #[ignore = "requires an authorized isolated IPFS_S3_TEST_POSTGRES_URL"]

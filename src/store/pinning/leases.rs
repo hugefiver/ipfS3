@@ -6570,8 +6570,12 @@ async fn projection_schedule_work<C: ConnectionTrait>(
         ProjectionAccess::Admission => {
             match runtime {
                 Some(tx) => {
-                    quota::lock_runtime_allocation_admission(tx, &desired.target.provider, work)
-                        .await?
+                    super::management::admission::lock_runtime_provider_shared(
+                        tx,
+                        &desired.target.provider,
+                        work,
+                    )
+                    .await?
                 }
                 None => {
                     quota::lock_allocation_admission_with_work(db, &desired.target.provider, work)
@@ -6912,7 +6916,8 @@ async fn ensure_prelocked_target_job_with_work<C: ConnectionTrait>(
         jobs::TargetJobOperation::Submit => Some("ready"),
         jobs::TargetJobOperation::Poll => None,
     };
-    if submit_phase.is_some() && matches!(access, ProjectionAccess::Observation { .. }) {
+    let admission_submit = submit_phase.is_some() && matches!(access, ProjectionAccess::Admission);
+    if submit_phase.is_some() && !admission_submit {
         match runtime {
             Some(tx) => quota::lock_runtime_allocation_admission(tx, &job.provider, work).await?,
             None => quota::lock_allocation_admission_with_work(db, &job.provider, work).await?,
@@ -6934,16 +6939,16 @@ async fn ensure_prelocked_target_job_with_work<C: ConnectionTrait>(
             .map_err(super::management::admission::work_error)?
     else {
         match runtime {
+            Some(tx) if admission_submit => {
+                jobs::insert_prelocked_runtime_submit(tx, job, now, work).await?
+            }
             Some(tx) => jobs::insert_runtime_job(tx, NewPinJob::Target(job), now, work).await?,
             None => jobs::insert_new_job_with_work(db, NewPinJob::Target(job), now, work).await?,
         };
         return Ok(());
     };
-    if submit_phase.is_some() && matches!(access, ProjectionAccess::Admission) {
-        match runtime {
-            Some(tx) => quota::lock_runtime_allocation_admission(tx, &job.provider, work).await?,
-            None => quota::lock_allocation_admission_with_work(db, &job.provider, work).await?,
-        };
+    if admission_submit && runtime.is_none() {
+        quota::lock_allocation_admission_with_work(db, &job.provider, work).await?;
     }
     match existing.state.as_str() {
         JOB_PENDING | JOB_RUNNING => Ok(()),

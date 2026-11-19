@@ -190,13 +190,21 @@ pub(in crate::store::pinning) async fn lock_runtime_provider(
     lock_runtime_provider_admission(tx, provider, work, true).await
 }
 
+pub(in crate::store::pinning) async fn lock_runtime_provider_shared(
+    tx: &crate::store::RuntimeTransaction,
+    provider: &str,
+    work: DecodeWork<'_>,
+) -> AppResult<()> {
+    // The shared route-table fence already excludes registration changes.
+    lock_runtime_provider_admission(tx, provider, work, false).await
+}
+
 pub(in crate::store::pinning) async fn lock_runtime_submit_dispatch(
     tx: &crate::store::RuntimeTransaction,
     job: &crate::store::entities::pin_job::Model,
     work: DecodeWork<'_>,
 ) -> AppResult<()> {
-    // The shared route-table fence already excludes registration changes.
-    lock_runtime_provider_admission(tx, &job.provider, work, false).await?;
+    lock_runtime_provider_shared(tx, &job.provider, work).await?;
     if !super::super::ledger::submit_dispatch_open_catalog(tx.catalog(work), job, work).await? {
         return Err(needs_attention());
     }
