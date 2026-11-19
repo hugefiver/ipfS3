@@ -1,9 +1,9 @@
-//! Real predecessor DDL, including prerequisites for non-pin migration tests.
+//! Predecessor schema fixtures for shared storage migrations.
 use crate::store::migrations::bridge;
 pub mod m20250701_000001_init;
 pub mod m20260707_000001_decompress_zip;
 pub mod m20260720_000001_sse_c_key_fingerprint;
-pub mod m20260721_000001_multi_provider_pinning;
+pub mod m20260721_000001_object_tagging;
 pub mod m20260729_000001_ipfs3_import;
 pub mod m20260729_000002_postgres_utc_timestamps;
 pub mod m20260730_000001_standard_mutation_fence;
@@ -15,12 +15,6 @@ pub mod m20260901_000001_lifecycle_abort_multipart;
 pub mod m20260912_000001_residency_references;
 pub mod m20260912_000002_lifecycle_transition;
 pub mod m20260919_000001_standard_mutation_lease;
-pub mod m20260920_000001_pin_submit_history;
-pub mod m20260920_000002_pin_identity_ledger;
-pub mod m20260920_000003_pin_extension_decision;
-pub mod m20260920_000004_multipart_pin_decision;
-pub mod m20260920_000005_import_pin_decision;
-pub mod m20260920_000006_pin_submit_correlation;
 pub mod m20260927_000001_zip_batches;
 pub mod m20260927_000002_import_zip_root_capture;
 pub mod m20260927_000003_zip_mpu_replay;

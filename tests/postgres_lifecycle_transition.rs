@@ -14,7 +14,7 @@ impl MigratorTrait for PreTransitionMigrator {
             Box::new(m20250701_000001_init::Migration),
             Box::new(m20260707_000001_decompress_zip::Migration),
             Box::new(m20260720_000001_sse_c_key_fingerprint::Migration),
-            Box::new(m20260721_000001_multi_provider_pinning::Migration),
+            Box::new(m20260721_000001_object_tagging::Migration),
             Box::new(m20260729_000001_ipfs3_import::Migration),
             Box::new(m20260729_000002_postgres_utc_timestamps::Migration),
             Box::new(m20260730_000001_standard_mutation_fence::Migration),

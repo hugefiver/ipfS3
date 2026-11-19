@@ -698,7 +698,7 @@ async fn zip_batch_migration_preserves_existing_objects() {
                 Box::new(m20250701_000001_init::Migration),
                 Box::new(m20260707_000001_decompress_zip::Migration),
                 Box::new(m20260720_000001_sse_c_key_fingerprint::Migration),
-                Box::new(m20260721_000001_multi_provider_pinning::Migration),
+                Box::new(m20260721_000001_object_tagging::Migration),
                 Box::new(m20260729_000001_ipfs3_import::Migration),
                 Box::new(m20260729_000002_postgres_utc_timestamps::Migration),
                 Box::new(m20260730_000001_standard_mutation_fence::Migration),
@@ -710,12 +710,6 @@ async fn zip_batch_migration_preserves_existing_objects() {
                 Box::new(m20260912_000001_residency_references::Migration),
                 Box::new(m20260912_000002_lifecycle_transition::Migration),
                 Box::new(m20260919_000001_standard_mutation_lease::Migration),
-                Box::new(m20260920_000001_pin_submit_history::Migration),
-                Box::new(m20260920_000002_pin_identity_ledger::Migration),
-                Box::new(m20260920_000003_pin_extension_decision::Migration),
-                Box::new(m20260920_000004_multipart_pin_decision::Migration),
-                Box::new(m20260920_000005_import_pin_decision::Migration),
-                Box::new(m20260920_000006_pin_submit_correlation::Migration),
             ]
         }
     }
@@ -726,22 +720,31 @@ async fn zip_batch_migration_preserves_existing_objects() {
     Previous::up(&db, None).await.unwrap();
     store::bucket::create(&db, "bucket", None).await.unwrap();
     db.execute_unprepared("INSERT INTO objects (id,bucket,key,cid,size,etag) VALUES ('old','bucket','old','legacy',1,'legacy')").await.unwrap();
+    db.execute_unprepared("INSERT INTO object_tags (object_id,key,value) VALUES ('old','env','test')")
+        .await
+        .unwrap();
+    let manager = SchemaManager::new(&db);
     store::migrations::m20260927_000001_zip_batches::Migration
-        .up(&SchemaManager::new(&db))
+        .up(&manager)
+        .await
+        .unwrap();
+    store::migrations::m20261008_000001_zip_intent_capture::Migration
+        .up(&manager)
         .await
         .unwrap();
     zip::admit(&db, &admission("new")).await.unwrap();
-    let count: i64 = db
+    let tag: String = db
         .query_one(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Sqlite,
-            "SELECT count(*) AS count FROM objects WHERE id='old' AND cid='legacy'",
+            "SELECT t.value FROM objects o JOIN object_tags t ON t.object_id=o.id \
+             WHERE o.id='old' AND o.cid='legacy' AND t.key='env'",
         ))
         .await
         .unwrap()
         .unwrap()
-        .try_get("", "count")
+        .try_get("", "value")
         .unwrap();
-    assert_eq!(count, 1);
+    assert_eq!(tag, "test");
 }
 
 #[tokio::test]
