@@ -3,7 +3,7 @@ use super::*;
 #[tokio::test]
 async fn fresh_first_intake_capture_and_exact_native_guards_are_ready_before_publication() {
     let (_dir, first, second) = setup().await;
-    let claim = prepared(&first, &[("one", "out/one", "cid-1")]).await;
+    let claim = prepared(&first, &[("one", "out/one", OUTPUT_CID)]).await;
     let execution = execution::read(&second, &claim.batch_id)
         .await
         .unwrap()
@@ -20,7 +20,7 @@ async fn fresh_first_intake_capture_and_exact_native_guards_are_ready_before_pub
         execution.input_sha256.as_deref(),
         Some("a".repeat(64).as_str())
     );
-    assert_eq!(execution.input_art_cid.as_deref(), Some("input-cid"));
+    assert_eq!(execution.input_art_cid.as_deref(), Some(ARCHIVE_CID));
     assert_eq!(execution.input_art_size, Some(99));
     assert_eq!(execution.epoch, claim.epoch);
     assert_eq!(execution.worker.as_deref(), Some(claim.worker.as_str()));
@@ -43,7 +43,7 @@ async fn fresh_first_intake_capture_and_exact_native_guards_are_ready_before_pub
         object_version::Entity::find().count(&second).await.unwrap(),
         0
     );
-    assert_eq!(pin_lease::Entity::find().count(&second).await.unwrap(), 0);
+    assert_eq!(pin_rows::count(&second, "pin_refs").await, 0);
 }
 
 #[tokio::test]
@@ -54,7 +54,7 @@ async fn historical_options_without_original_control_evidence_never_backfill_per
         let (_dir, first, second) = setup().await;
         let claim = r25_review_publication::historical_revision_only(
             &first,
-            &[("one", "out/a/one", "cid-1")],
+            &[("one", "out/a/one", OUTPUT_CID)],
             ZipTargets::Extracted,
             revision,
         )
@@ -69,7 +69,7 @@ async fn historical_options_without_original_control_evidence_never_backfill_per
             .unwrap();
         let mut request = request(
             claim.clone(),
-            vec![success("one", "out/a/one", "cid-1", "one")],
+            vec![success("one", "out/a/one", OUTPUT_CID, "one")],
         );
         request.targets = ZipTargets::Extracted;
         let error =
@@ -97,15 +97,8 @@ async fn historical_options_without_original_control_evidence_never_backfill_per
             object_version::Entity::find().count(&second).await.unwrap(),
             0
         );
-        assert_eq!(pin_lease::Entity::find().count(&second).await.unwrap(), 0);
-        assert_eq!(
-            pin_lease_target::Entity::find()
-                .count(&second)
-                .await
-                .unwrap(),
-            0
-        );
-        assert_eq!(remote_pin::Entity::find().count(&second).await.unwrap(), 0);
+        assert_eq!(pin_rows::count(&second, "pin_refs").await, 0);
+        assert_eq!(pin_rows::count(&second, "pin_resources").await, 0);
         let tx = first.begin().await.unwrap();
         store::import::ownership::lock_bucket_for_ownership(&tx, "bucket")
             .await
@@ -126,14 +119,9 @@ async fn current_policy_routes_and_duration_apply_without_rewriting_raw_capture_
  {
     let (_dir, first, second) = setup().await;
     let original_config = pin_config();
-    for provider in &original_config.providers {
-        ledger::register_route(&first, &provider.name, &provider.identity)
-            .await
-            .unwrap();
-    }
     let claim = prepared_with_controls(
         &first,
-        &[("one", "out/a/one", "cid-1")],
+        &[("one", "out/a/one", OUTPUT_CID)],
         false,
         ZipTargets::Extracted,
     )
@@ -152,7 +140,7 @@ async fn current_policy_routes_and_duration_apply_without_rewriting_raw_capture_
     let later_rules = ValidatedZipOutputRules::compile(&current_rules, &later_config).unwrap();
     let mut request = request(
         claim.clone(),
-        vec![success("one", "out/a/one", "cid-1", "one")],
+        vec![success("one", "out/a/one", OUTPUT_CID, "one")],
     );
     request.targets = ZipTargets::Extracted;
     first.execute_unprepared("CREATE TRIGGER fail_review_publication_tail BEFORE UPDATE OF state ON zip_v2_executions WHEN NEW.state='completed' BEGIN SELECT RAISE(FAIL, 'review publication terminal tail'); END;").await.unwrap();
@@ -193,23 +181,8 @@ async fn current_policy_routes_and_duration_apply_without_rewriting_raw_capture_
         object_version::Entity::find().count(&second).await.unwrap(),
         0
     );
-    assert_eq!(pin_lease::Entity::find().count(&second).await.unwrap(), 0);
-    assert_eq!(
-        pin_lease_target::Entity::find()
-            .count(&second)
-            .await
-            .unwrap(),
-        0
-    );
-    assert_eq!(remote_pin::Entity::find().count(&second).await.unwrap(), 0);
-    assert!(
-        pin_provider_usage::Entity::find()
-            .all(&second)
-            .await
-            .unwrap()
-            .iter()
-            .all(|usage| usage.reserved_bytes == 0 && usage.reserved_pins == 0)
-    );
+    assert_eq!(pin_rows::count(&second, "pin_refs").await, 0);
+    assert_eq!(pin_rows::count(&second, "pin_resources").await, 0);
     let tx = first.begin().await.unwrap();
     store::import::ownership::lock_bucket_for_ownership(&tx, "bucket")
         .await
@@ -256,16 +229,20 @@ async fn current_policy_routes_and_duration_apply_without_rewriting_raw_capture_
             .unwrap();
     assert_eq!(version.object_id.as_deref(), Some("one"));
     assert_eq!(version.key, "out/a/one");
-    let leases = pin_lease::Entity::find().all(&first).await.unwrap();
-    assert_eq!(leases.len(), 1);
-    assert_eq!(leases[0].owner_object_id, version.object_id.unwrap());
-    assert_eq!(leases[0].source, "automatic");
+    let refs = pin_rows::refs(&first).await;
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs[0].owner_object_id, version.object_id.unwrap());
     assert_eq!(
-        (leases[0].expires_at - leases[0].created_at).num_seconds(),
-        7200
+        (
+            refs[0].source.as_str(),
+            refs[0].provider.as_str(),
+            refs[0].cid.as_str()
+        ),
+        ("automatic", "b", OUTPUT_CID)
     );
-    let targets = pin_lease_target::Entity::find().all(&first).await.unwrap();
-    assert_eq!(targets.len(), 1);
-    assert_eq!(targets[0].provider, "b");
-    assert_eq!(remote_pin::Entity::find().count(&first).await.unwrap(), 1);
+    assert_eq!(
+        refs[0].expires_at - version.created_at.timestamp_micros(),
+        7_200_000_000
+    );
+    assert_eq!(pin_rows::count(&first, "pin_resources").await, 1);
 }

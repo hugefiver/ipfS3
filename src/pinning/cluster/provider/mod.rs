@@ -1,135 +1,72 @@
-//! Cluster v1.1.6 write leaf. No registration, ownership grant or automatic repair.
+//! Cluster v1.1.6 write transport.
 mod add_response;
 mod car;
 mod cbor;
 mod dagpb;
 mod http;
-mod observation;
 mod options;
 mod remove;
 mod response;
 mod stream;
 mod submit;
 
-// Structural CAR verification only; no Cluster transport or strategy authority.
+pub use super::error::{ClusterFailureCode, ClusterWriteFailure};
 pub(crate) use car::{Car as CarValidator, DirectoryCarLimits, DirectoryRootKind};
-
-pub use observation::{
-    ClusterFailureCode, ClusterObservedResource, ClusterRemoteRef, ClusterResourceStatus,
-    ClusterWriteEffect, ClusterWriteFailure, ClusterWriteObservation, ClusterWriteReceipt,
-};
 pub use options::{
     ClusterProtocol, ClusterProviderOptions, ClusterSource, ClusterStrategy, ClusterTransferLimits,
     ClusterUnixfsOptions,
 };
 
-use super::{ClusterNetworkPolicy, ClusterReplicaVerifier, ClusterResourceKey, ClusterRestProfile};
-use crate::pinning::identity::Ownership;
+use super::{ClusterNetworkPolicy, ClusterResourceKey};
 use ClusterFailureCode as Code;
 use ClusterWriteFailure as Failure;
+use cid::Cid;
 use http::Http;
+
+#[derive(Debug)]
+pub struct ClusterWriteReceipt {
+    pub resource: ClusterResourceKey,
+    pub request_id: String,
+}
 
 pub struct ClusterProvider {
     options: ClusterProviderOptions,
-    verifier: ClusterReplicaVerifier,
     target: Http,
     source: Option<Http>,
 }
 
 impl ClusterProvider {
     pub fn new(options: ClusterProviderOptions) -> Result<Self, ClusterWriteFailure> {
-        options.validate()?;
+        let (rest, proxy, source) = options.validate()?;
         let policy =
             ClusterNetworkPolicy::from_allow_private_network(options.allow_private_network);
-        let profile = ClusterRestProfile::new_with_network_policy(
-            options.pinset.clone(),
-            Some(&options.rest_endpoint),
-            options.rest_auth.clone(),
-            options.min_replicas,
-            options.verifier_limits,
-            policy,
-        )
-        .map_err(|_| Failure::new(Code::InvalidConfiguration))?;
-        let target_profile = match options.protocol {
-            ClusterProtocol::Rest => profile.clone(),
-            ClusterProtocol::Proxy => ClusterRestProfile::new_with_network_policy(
-                options.pinset.clone(),
-                options.proxy_endpoint.as_deref(),
-                options.proxy_auth.clone(),
-                options.min_replicas,
-                options.verifier_limits,
-                policy,
-            )
-            .map_err(|_| Failure::new(Code::InvalidConfiguration))?,
+        let (target, auth) = match proxy {
+            Some(proxy) => (proxy, options.proxy_auth.as_ref()),
+            None => (rest, options.rest_auth.as_ref()),
         };
-        let target = Http::new(target_profile, options.transfer_limits)?;
-        let source = options
-            .source
-            .as_ref()
-            .map(|s| {
-                let profile = ClusterRestProfile::new_with_network_policy(
-                    options.pinset.clone(),
-                    Some(&s.endpoint),
-                    s.auth.clone(),
-                    options.min_replicas,
-                    options.verifier_limits,
-                    policy,
-                )
-                .map_err(|_| Failure::new(Code::InvalidConfiguration))?;
-                Http::new(profile, options.transfer_limits)
+        let target = Http::new(target, auth, policy, options.transfer_limits)?;
+        let source = source
+            .zip(options.source.as_ref())
+            .map(|(url, source)| {
+                Http::new(url, source.auth.as_ref(), policy, options.transfer_limits)
             })
             .transpose()?;
-        let verifier = ClusterReplicaVerifier::new(profile)
-            .map_err(|_| Failure::new(Code::InvalidConfiguration))?;
         Ok(Self {
             options,
-            verifier,
             target,
             source,
         })
     }
 
     pub fn resource_key(&self, cid: &str) -> Result<ClusterResourceKey, Failure> {
+        let cid = cid.parse().map_err(|_| Failure::new(Code::InvalidCid))?;
         Ok(ClusterResourceKey {
             pinset: self.options.pinset.clone(),
-            cid: canonical_cid(cid)?,
+            cid: canonical_cid(&cid).to_string(),
         })
-    }
-
-    /// Always fresh; 404/403/empty allocations are never an absence certificate.
-    pub async fn observe(&self, cid: &str) -> super::ReplicaObservation {
-        self.verifier.observe(cid).await
-    }
-
-    pub(super) fn record(
-        &self,
-        observation: &mut ClusterWriteObservation,
-        cid: &str,
-        status: ClusterResourceStatus,
-    ) -> Result<usize, Failure> {
-        let resource = self.resource_key(cid)?;
-        if let Some(index) = observation
-            .resources
-            .iter()
-            .position(|r| r.resource == resource)
-        {
-            observation.resources[index].status = status;
-            return Ok(index);
-        }
-        observation.resources.push(ClusterObservedResource {
-            resource,
-            protocol: self.options.protocol,
-            strategy: self.options.strategy,
-            status,
-            ownership: Ownership::Unknown,
-            reported_allocations: None,
-            observed_at: chrono::Utc::now(),
-        });
-        Ok(observation.resources.len() - 1)
     }
 }
 
-fn canonical_cid(value: &str) -> Result<String, Failure> {
-    let cid = cid::Cid::try_from(value).map_err(|_| Failure::new(Code::InvalidCid))?;
-    Ok(cid::Cid::new_v1(cid.codec(), *cid.hash()).to_string())
+fn canonical_cid(cid: &Cid) -> Cid {
+    Cid::new_v1(cid.codec(), *cid.hash())
 }

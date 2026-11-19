@@ -19,12 +19,14 @@ use crate::support::import::{
     get_import_status, post_import, start_import_harness, start_strict_import_harness,
     wait_for_import_state,
 };
+use crate::support::pin_rows;
 use chrono::{Duration as ChronoDuration, Utc};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use ipfs_s3_gateway::state::AppState;
 use ipfs_s3_gateway::store;
 use sea_orm::{
-    ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, TransactionTrait,
+    ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
+    TransactionTrait,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -594,7 +596,7 @@ async fn versioning_multipart_publication_loses_to_newer_import_atomically() {
     assert_eq!(
         import_side_effect_counts_for_state(&harness.state).await,
         rows_after_import,
-        "the stale standard ZIP completion must not add object/result/lease/provider-job state"
+        "the stale standard ZIP completion must not add objects, results, or pin state"
     );
     assert_eq!(
         store::object::get_latest(
@@ -822,9 +824,7 @@ async fn wait_for_import_pin_progress(harness: &ImportHarness, job_id: &str) {
 struct ImportSideEffectCounts {
     objects: u64,
     results: u64,
-    leases: u64,
-    provider_jobs: u64,
-    remote_pins: u64,
+    pins: PinCounts,
 }
 
 async fn import_side_effect_counts(harness: &ImportHarness) -> ImportSideEffectCounts {
@@ -841,59 +841,7 @@ async fn import_side_effect_counts_for_state(state: &Arc<AppState>) -> ImportSid
             .count(state.store.db())
             .await
             .expect("count import results"),
-        leases: store::entities::pin_lease::Entity::find()
-            .count(state.store.db())
-            .await
-            .expect("count pin leases"),
-        provider_jobs: store::entities::pin_job::Entity::find()
-            .count(state.store.db())
-            .await
-            .expect("count provider jobs"),
-        remote_pins: store::entities::remote_pin::Entity::find()
-            .count(state.store.db())
-            .await
-            .expect("count remote pins"),
-    }
-}
-
-#[derive(Debug, PartialEq)]
-struct RawImportRows {
-    objects: Vec<store::entities::object::Model>,
-    results: Vec<store::entities::import_job_result::Model>,
-    leases: Vec<store::entities::pin_lease::Model>,
-    provider_jobs: Vec<store::entities::pin_job::Model>,
-    remote_pins: Vec<store::entities::remote_pin::Model>,
-}
-
-async fn raw_import_rows(harness: &ImportHarness) -> RawImportRows {
-    RawImportRows {
-        objects: store::entities::object::Entity::find()
-            .order_by_asc(store::entities::object::Column::Id)
-            .all(harness.state.store.db())
-            .await
-            .expect("load raw object rows"),
-        results: store::entities::import_job_result::Entity::find()
-            .order_by_asc(store::entities::import_job_result::Column::JobId)
-            .order_by_asc(store::entities::import_job_result::Column::Sequence)
-            .all(harness.state.store.db())
-            .await
-            .expect("load raw import result rows"),
-        leases: store::entities::pin_lease::Entity::find()
-            .order_by_asc(store::entities::pin_lease::Column::Id)
-            .all(harness.state.store.db())
-            .await
-            .expect("load raw pin lease rows"),
-        provider_jobs: store::entities::pin_job::Entity::find()
-            .order_by_asc(store::entities::pin_job::Column::Id)
-            .all(harness.state.store.db())
-            .await
-            .expect("load raw provider job rows"),
-        remote_pins: store::entities::remote_pin::Entity::find()
-            .order_by_asc(store::entities::remote_pin::Column::Provider)
-            .order_by_asc(store::entities::remote_pin::Column::Cid)
-            .all(harness.state.store.db())
-            .await
-            .expect("load raw remote pin rows"),
+        pins: pin_counts(state.store.db()).await,
     }
 }
 
@@ -923,31 +871,16 @@ async fn mutation_target_snapshot(harness: &ImportHarness, key: &str) -> Mutatio
     }
 }
 
-#[derive(Debug, PartialEq)]
-struct PinControlRows {
-    leases: Vec<store::entities::pin_lease::Model>,
-    provider_jobs: Vec<store::entities::pin_job::Model>,
-    remote_pins: Vec<store::entities::remote_pin::Model>,
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PinCounts {
+    references: u64,
+    resources: u64,
 }
 
-async fn pin_control_rows(harness: &ImportHarness) -> PinControlRows {
-    PinControlRows {
-        leases: store::entities::pin_lease::Entity::find()
-            .order_by_asc(store::entities::pin_lease::Column::Id)
-            .all(harness.state.store.db())
-            .await
-            .expect("load pin leases"),
-        provider_jobs: store::entities::pin_job::Entity::find()
-            .order_by_asc(store::entities::pin_job::Column::Id)
-            .all(harness.state.store.db())
-            .await
-            .expect("load provider jobs"),
-        remote_pins: store::entities::remote_pin::Entity::find()
-            .order_by_asc(store::entities::remote_pin::Column::Provider)
-            .order_by_asc(store::entities::remote_pin::Column::Cid)
-            .all(harness.state.store.db())
-            .await
-            .expect("load remote pins"),
+async fn pin_counts(db: &DatabaseConnection) -> PinCounts {
+    PinCounts {
+        references: pin_rows::count(db, "pin_refs").await,
+        resources: pin_rows::count(db, "pin_resources").await,
     }
 }
 
@@ -1296,12 +1229,8 @@ async fn test_new_import_supersedes_blocked_old_worker() {
         0
     );
     assert_eq!(
-        pin_control_rows(&harness).await,
-        PinControlRows {
-            leases: Vec::new(),
-            provider_jobs: Vec::new(),
-            remote_pins: Vec::new(),
-        }
+        pin_counts(harness.state.store.db()).await,
+        PinCounts::default()
     );
     let race_destination = store::entities::import_destination::Entity::find_by_id((
         harness.bucket.clone(),
@@ -1384,15 +1313,8 @@ async fn assert_mutation_canceled_blocked_import(
         .all(harness.state.store.db())
         .await
         .expect("load stale import targets");
-    let pin_rows_after_mutation = pin_control_rows(harness).await;
-    assert_eq!(
-        pin_rows_after_mutation,
-        PinControlRows {
-            leases: Vec::new(),
-            provider_jobs: Vec::new(),
-            remote_pins: Vec::new(),
-        }
-    );
+    let pins_after_mutation = pin_counts(harness.state.store.db()).await;
+    assert_eq!(pins_after_mutation, PinCounts::default());
     let old_pin_calls = harness
         .kubo_args("/api/v0/pin/add")
         .await
@@ -1434,7 +1356,10 @@ async fn assert_mutation_canceled_blocked_import(
             .expect("reload stale import targets"),
         old_targets
     );
-    assert_eq!(pin_control_rows(harness).await, pin_rows_after_mutation);
+    assert_eq!(
+        pin_counts(harness.state.store.db()).await,
+        pins_after_mutation
+    );
     assert_eq!(import_result_count(harness, job_id).await, 0);
     assert_eq!(
         harness
@@ -1709,12 +1634,10 @@ async fn test_combined_import_zip_publishes_once_and_pages_results() {
     publication_gate.wait_until_blocked(&job_id).await;
     let running = wait_for_import_state(&harness, &job_id, &["running"]).await;
     assert_eq!(running.phase, "decompressing");
-    let unpublished_rows = raw_import_rows(&harness).await;
-    assert!(unpublished_rows.objects.is_empty());
-    assert!(unpublished_rows.results.is_empty());
-    assert!(unpublished_rows.leases.is_empty());
-    assert!(unpublished_rows.provider_jobs.is_empty());
-    assert!(unpublished_rows.remote_pins.is_empty());
+    let unpublished_rows = import_side_effect_counts(&harness).await;
+    assert_eq!(unpublished_rows.objects, 0);
+    assert_eq!(unpublished_rows.results, 0);
+    assert_eq!(unpublished_rows.pins, PinCounts::default());
     assert_s3_error(
         signed_get(&harness, "archive.zip").await,
         StatusCode::NOT_FOUND,
@@ -1754,12 +1677,10 @@ async fn test_combined_import_zip_publishes_once_and_pages_results() {
     assert_eq!(completed.entries_succeeded, 1);
     assert_eq!(completed.entries_failed, 1);
     assert_eq!(import_result_count(&harness, &job_id).await, 3);
-    let published_rows = raw_import_rows(&harness).await;
-    assert_eq!(published_rows.objects.len(), 2);
-    assert_eq!(published_rows.results.len(), 3);
-    assert!(published_rows.leases.is_empty());
-    assert!(published_rows.provider_jobs.is_empty());
-    assert!(published_rows.remote_pins.is_empty());
+    let published_rows = import_side_effect_counts(&harness).await;
+    assert_eq!(published_rows.objects, 2);
+    assert_eq!(published_rows.results, 3);
+    assert_eq!(published_rows.pins, PinCounts::default());
     let latest = store::object::list(harness.state.store.db(), &harness.bucket, None, None, 100)
         .await
         .expect("list atomic ZIP publication");
@@ -1979,9 +1900,7 @@ async fn test_import_redirect_and_forbidden_dns_fail_without_fetch_escape() {
         ImportSideEffectCounts {
             objects: 0,
             results: 0,
-            leases: 0,
-            provider_jobs: 0,
-            remote_pins: 0,
+            pins: PinCounts::default(),
         }
     );
     strict.shutdown().await;
@@ -2108,15 +2027,8 @@ async fn test_import_worker_restart_reclaims_without_double_publication() {
         .await
         .expect("load epoch-two import results");
     assert_eq!(restart_results_before.len(), 1);
-    let pin_rows_before = pin_control_rows(&harness).await;
-    assert_eq!(
-        pin_rows_before,
-        PinControlRows {
-            leases: Vec::new(),
-            provider_jobs: Vec::new(),
-            remote_pins: Vec::new(),
-        }
-    );
+    let pins_before = pin_counts(harness.state.store.db()).await;
+    assert_eq!(pins_before, PinCounts::default());
 
     // Stop epoch two so the distinct probe can only be claimed by the original
     // worker after its stale epoch-one execution leaves the single slot.
@@ -2146,7 +2058,7 @@ async fn test_import_worker_restart_reclaims_without_double_publication() {
             .expect("reload epoch-two import results"),
         restart_results_before
     );
-    assert_eq!(pin_control_rows(&harness).await, pin_rows_before);
+    assert_eq!(pin_counts(harness.state.store.db()).await, pins_before);
     assert_eq!(
         harness
             .kubo_args("/api/v0/pin/add")

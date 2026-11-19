@@ -1,34 +1,33 @@
-use super::super::{ClusterRestProfile, network};
+use super::super::{ClusterAuth, ClusterNetworkPolicy, network};
 use super::{ClusterFailureCode as Code, ClusterTransferLimits, ClusterWriteFailure as Failure};
 use bytes::Bytes;
 use http_body_util::BodyExt as _;
-use reqwest::{Client, Method, RequestBuilder, Response};
+use reqwest::{Client, Method, RequestBuilder, Response, Url, header::HeaderValue};
 
 pub(super) struct Http {
     client: Client,
-    pub profile: ClusterRestProfile,
-    pub limits: ClusterTransferLimits,
+    base: Url,
+    authorization: Option<HeaderValue>,
+    limits: ClusterTransferLimits,
 }
 impl Http {
     pub fn new(
-        profile: ClusterRestProfile,
+        base: Url,
+        auth: Option<&ClusterAuth>,
+        policy: ClusterNetworkPolicy,
         limits: ClusterTransferLimits,
     ) -> Result<Self, Failure> {
-        let client = network::client(
-            &profile.base,
-            profile.network_policy,
-            limits.connect_timeout,
-            None,
-        )
-        .map_err(|_| Failure::new(Code::InvalidConfiguration))?;
+        let client = network::client(&base, policy, limits.connect_timeout, None)
+            .map_err(|_| Failure::new(Code::InvalidConfiguration))?;
         Ok(Self {
             client,
-            profile,
+            base,
+            authorization: auth.map(ClusterAuth::header).transpose()?,
             limits,
         })
     }
     pub fn request(&self, method: Method, path: &str, query: &[(&str, &str)]) -> RequestBuilder {
-        let mut url = self.profile.base.clone();
+        let mut url = self.base.clone();
         url.set_path(&format!("{}{path}", url.path().trim_end_matches('/')));
         url.query_pairs_mut().extend_pairs(query.iter().copied());
         let mut request = self
@@ -36,19 +35,13 @@ impl Http {
             .request(method, url)
             .header(reqwest::header::CACHE_CONTROL, "no-cache, no-store")
             .header(reqwest::header::TE, "trailers");
-        if let Some(auth) = &self.profile.authorization {
+        if let Some(auth) = &self.authorization {
             request = request.header(reqwest::header::AUTHORIZATION, auth.clone());
         }
         request
     }
     pub fn rpc(&self, command: &str, query: &[(&str, &str)]) -> RequestBuilder {
-        let prefix = if self
-            .profile
-            .base
-            .path()
-            .trim_end_matches('/')
-            .ends_with("/api/v0")
-        {
+        let prefix = if self.base.path().trim_end_matches('/').ends_with("/api/v0") {
             ""
         } else {
             "/api/v0"

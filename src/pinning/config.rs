@@ -189,19 +189,7 @@ pub struct ValidatedProvider {
 
 impl ValidatedProvider {
     pub fn route_snapshot(&self) -> crate::pinning::identity::ProviderRouteSnapshot {
-        let mut snapshot = self.identity.route_snapshot();
-        snapshot.confirmation = self.cluster.as_ref().map(|options| options.confirmation());
-        snapshot
-    }
-
-    pub fn validate_route_snapshot(
-        &self,
-        snapshot: &crate::pinning::identity::ProviderRouteSnapshot,
-    ) -> anyhow::Result<()> {
-        if !self.route_snapshot().execution_compatible(snapshot) {
-            bail!("historical provider route or confirmation revision unavailable");
-        }
-        Ok(())
+        self.identity.route_snapshot()
     }
 }
 
@@ -284,6 +272,30 @@ impl ValidatedPinningConfig {
             config.pinning_control.unavailable,
             get_env,
         )?;
+        for provider in &validated.providers {
+            let rpc = provider.rpc.as_ref().map(|_| {
+                provider
+                    .endpoint
+                    .as_deref()
+                    .unwrap_or("https://rpc.filebase.io")
+            });
+            let cluster = provider.cluster.as_ref();
+            for target in [
+                rpc,
+                cluster.map(|c| c.rest_endpoint.as_str()),
+                cluster.and_then(|c| c.proxy_endpoint.as_deref()),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if std::iter::once(&config.kubo)
+                    .chain(&config.cold_kubo)
+                    .any(|node| super::ipfs_rpc::same_endpoint(target, &node.rpc_url))
+                {
+                    bail!("pinning target must be independent of hot and cold Kubo storage");
+                }
+            }
+        }
         super::zip_policy::validate_zip_config(&config.decompress_zip, &validated)?;
         Ok(validated)
     }

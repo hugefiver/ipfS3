@@ -6,8 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::pinning::{
     config::SecretToken,
     provider::{
-        FindPin, PinningProvider, ProviderError, ProviderErrorClass, RemotePin, RemotePinStatus,
-        SubmitPin,
+        PinningProvider, ProviderError, ProviderErrorClass, RemotePin, RemotePinStatus, SubmitPin,
     },
 };
 
@@ -25,6 +24,7 @@ pub struct PsaClient {
 impl PsaClient {
     pub fn new(name: String, endpoint: String, token: SecretToken) -> Self {
         let http = Client::builder()
+            .retry(reqwest::retry::never())
             .redirect(reqwest::redirect::Policy::none())
             .timeout(DEFAULT_TIMEOUT)
             .build()
@@ -69,14 +69,6 @@ impl PsaClient {
         Ok(url)
     }
 
-    fn find_url(&self, cid: &str, metadata: &str) -> Result<Url, ProviderError> {
-        let mut url = self.pins_url()?;
-        url.query_pairs_mut()
-            .append_pair("cid", cid)
-            .append_pair("meta", metadata);
-        Ok(url)
-    }
-
     async fn execute(
         &self,
         request: RequestBuilder,
@@ -103,7 +95,6 @@ impl PsaClient {
         let class = match status.as_u16() {
             401 => ProviderErrorClass::Authentication,
             403 => super::provider::classify_forbidden_response(response, DEFAULT_TIMEOUT).await,
-            404 if operation == Operation::Get => ProviderErrorClass::NotFound,
             409 if operation == Operation::Submit => ProviderErrorClass::Ambiguous,
             429 => ProviderErrorClass::RateLimited,
             507 => ProviderErrorClass::Quota,
@@ -125,16 +116,6 @@ impl PsaClient {
         response: Response,
         operation: Operation,
     ) -> Result<PsaStatus, ProviderError> {
-        let body = self.read_success_body(response, operation).await?;
-        serde_json::from_slice(&body)
-            .map_err(|_| protocol_error("provider returned an invalid success response"))
-    }
-
-    async fn decode_list(
-        &self,
-        response: Response,
-        operation: Operation,
-    ) -> Result<PsaList, ProviderError> {
         let body = self.read_success_body(response, operation).await?;
         serde_json::from_slice(&body)
             .map_err(|_| protocol_error("provider returned an invalid success response"))
@@ -262,116 +243,29 @@ impl PsaClient {
 
 #[async_trait::async_trait]
 impl PinningProvider for PsaClient {
-    fn invocation_route(&self) -> (&'static str, &'static str) {
-        ("psa", "cid")
-    }
-
     fn name(&self) -> &str {
         &self.name
     }
 
     async fn submit(&self, request: SubmitPin) -> Result<RemotePin, ProviderError> {
-        self.submit_observed(request).await.result
-    }
-
-    async fn submit_observed(
-        &self,
-        request: SubmitPin,
-    ) -> crate::pinning::provider::SubmitObservation {
-        use crate::pinning::{
-            identity::{Ownership, RemoteResourceType},
-            provider::{ObservedResource, ObservedResourceStatus, SubmitObservation},
+        let body = PsaPin {
+            cid: &request.cid,
+            name: &request.name,
+            origins: Vec::new(),
+            meta: &request.metadata,
         };
-        let mut created = false;
-        let result = async {
-            let body = PsaPin {
-                cid: &request.cid,
-                name: &request.name,
-                origins: Vec::new(),
-                meta: &request.metadata,
-            };
-            let response = self
-                .execute(
-                    self.http.post(self.pins_url()?).json(&body),
-                    Operation::Submit,
-                )
-                .await?;
-            created = response.status() == StatusCode::CREATED;
-            let status = self
-                .decode_status(
-                    self.require_success(response, Operation::Submit).await?,
-                    Operation::Submit,
-                )
-                .await?;
-            let remote = self.remote_pin(status)?;
-            if remote.cid != request.cid {
-                return Err(protocol_error("provider response failed pin correlation"));
-            }
-            Ok(remote)
-        }
-        .await;
-        let mut observation = SubmitObservation::from(result);
-        if created && let Ok(remote) = &observation.result {
-            observation.resources.push(ObservedResource {
-                resource_type: RemoteResourceType::PsaRequest,
-                cid: remote.cid.clone(),
-                request_id: remote.request_id.clone(),
-                status: ObservedResourceStatus::PinAccepted,
-                ownership: Ownership::ApplicationCreated,
-                replica_evidence: None,
-            });
-        }
-        observation
-    }
-
-    async fn get(&self, request_id: &str) -> Result<RemotePin, ProviderError> {
-        let url = self.pin_url(request_id)?;
-        let response = self.execute(self.http.get(url), Operation::Get).await?;
-        let status = self
-            .decode_status(
-                self.require_success(response, Operation::Get).await?,
-                Operation::Get,
-            )
-            .await?;
-        let remote_pin = self.remote_pin(status)?;
-        if remote_pin.request_id != request_id {
-            return Err(protocol_error(
-                "provider response request ID did not match the requested ID",
-            ));
-        }
-        Ok(remote_pin)
-    }
-
-    async fn find(&self, query: FindPin) -> Result<Vec<RemotePin>, ProviderError> {
-        let metadata = serde_json::to_string(&query.metadata)
-            .map_err(|_| protocol_error("pin metadata could not be encoded"))?;
         let response = self
             .execute(
-                self.http.get(self.find_url(&query.cid, &metadata)?),
-                Operation::Find,
+                self.http.post(self.pins_url()?).json(&body),
+                Operation::Submit,
             )
             .await?;
-        let response = self.require_success(response, Operation::Find).await?;
-        let list = self.decode_list(response, Operation::Find).await?;
-        let result_count = u64::try_from(list.results.len())
-            .map_err(|_| protocol_error("provider returned an incomplete pin list"))?;
-        if list.count != result_count {
-            return Err(protocol_error("provider returned an incomplete pin list"));
+        let response = self.require_success(response, Operation::Submit).await?;
+        let remote = self.remote_pin(self.decode_status(response, Operation::Submit).await?)?;
+        if remote.cid != request.cid {
+            return Err(protocol_error("provider response failed pin correlation"));
         }
-        list.results
-            .into_iter()
-            .map(|status| {
-                if status.pin.cid != query.cid
-                    || query
-                        .metadata
-                        .iter()
-                        .any(|(key, value)| status.pin.meta.get(key) != Some(value))
-                {
-                    return Err(protocol_error("provider response failed pin correlation"));
-                }
-                self.remote_pin(status)
-            })
-            .collect()
+        Ok(remote)
     }
 
     async fn unpin(&self, request_id: &str) -> Result<(), ProviderError> {
@@ -390,8 +284,6 @@ impl PinningProvider for PsaClient {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Operation {
     Submit,
-    Get,
-    Find,
     Unpin,
 }
 
@@ -415,14 +307,6 @@ struct PsaStatus {
 #[derive(Deserialize)]
 struct PsaResponsePin {
     cid: String,
-    #[serde(default)]
-    meta: BTreeMap<String, String>,
-}
-
-#[derive(Deserialize)]
-struct PsaList {
-    count: u64,
-    results: Vec<PsaStatus>,
 }
 
 fn parse_base_url(endpoint: &str) -> Result<Url, ()> {
@@ -513,45 +397,19 @@ mod tests {
     };
 
     use crate::pinning::{
-        config::ProviderKind,
         filebase::build_filebase,
-        provider::{FindPin, PinningProvider, ProviderErrorClass, RemotePinStatus, SubmitPin},
+        provider::{PinningProvider, ProviderErrorClass, RemotePinStatus, SubmitPin},
     };
 
     use super::PsaClient;
 
     const TOKEN: &str = "provider-token";
 
-    fn provider_for(kind: ProviderKind, server: &MockServer) -> PsaClient {
-        match kind {
-            ProviderKind::Filebase => build_filebase(
-                "filebase".to_owned(),
-                super::test_token(TOKEN),
-                Some(format!("{}/v1/ipfs", server.uri())),
-            ),
-            ProviderKind::Pinata
-            | ProviderKind::IpfsRpc
-            | ProviderKind::Cluster
-            | ProviderKind::Noop => {
-                unreachable!("PSA tests only cover Filebase")
-            }
-        }
-    }
-
     fn status(request_id: &str, state: &str, cid: &str) -> serde_json::Value {
-        status_with_meta(request_id, state, cid, BTreeMap::new())
-    }
-
-    fn status_with_meta(
-        request_id: &str,
-        state: &str,
-        cid: &str,
-        metadata: BTreeMap<String, String>,
-    ) -> serde_json::Value {
         json!({
             "requestid": request_id,
             "status": state,
-            "pin": { "cid": cid, "name": "bucket/key", "origins": [], "meta": metadata },
+            "pin": { "cid": cid, "name": "bucket/key", "origins": [], "meta": {} },
             "info": {},
         })
     }
@@ -560,142 +418,60 @@ mod tests {
         server.received_requests().await.unwrap()
     }
 
-    async fn mount_contract(server: &MockServer, prefix: &str) {
-        let pins = format!("{prefix}/pins");
-        let request = format!("{pins}/request-7");
+    #[tokio::test]
+    async fn filebase_uses_submit_and_exact_delete_acks_without_polling() {
+        let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path(pins.clone()))
-            .respond_with(ResponseTemplate::new(200).set_body_json(status(
+            .and(path("/v1/ipfs/pins"))
+            .and(wiremock::matchers::body_json(json!({
+                "cid": "bafy-target",
+                "name": "bucket/key",
+                "origins": [],
+                "meta": {"gateway_job_id": "job-7", "gateway_lease_id": "lease-7"},
+            })))
+            .respond_with(ResponseTemplate::new(202).set_body_json(status(
                 "request-7",
                 "queued",
                 "bafy-target",
             )))
-            .mount(server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path(request.clone()))
-            .respond_with(ResponseTemplate::new(200).set_body_json(status(
-                "request-7",
-                "pinned",
-                "bafy-target",
-            )))
-            .mount(server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path(pins.clone()))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "count": 1,
-                "results": [status_with_meta(
-                    "request-7",
-                    "pinning",
-                    "bafy-target",
-                    BTreeMap::from([("gateway_job_id".to_owned(), "job-7".to_owned())]),
-                )],
-            })))
-            .mount(server)
+            .expect(1)
+            .mount(&server)
             .await;
         Mock::given(method("DELETE"))
-            .and(path(request))
+            .and(path("/v1/ipfs/pins/request-7"))
             .respond_with(ResponseTemplate::new(204))
-            .mount(server)
+            .expect(1)
+            .mount(&server)
             .await;
-    }
+        let provider = build_filebase(
+            "filebase".to_owned(),
+            super::test_token(TOKEN),
+            Some(format!("{}/v1/ipfs", server.uri())),
+        );
+        let submitted = provider
+            .submit(SubmitPin {
+                cid: "bafy-target".to_owned(),
+                name: "bucket/key".to_owned(),
+                metadata: BTreeMap::from([
+                    ("gateway_job_id".to_owned(), "job-7".to_owned()),
+                    ("gateway_lease_id".to_owned(), "lease-7".to_owned()),
+                ]),
+            })
+            .await
+            .unwrap();
+        assert_eq!(submitted.request_id, "request-7");
+        assert_eq!(submitted.status, RemotePinStatus::Queued);
+        provider.unpin(&submitted.request_id).await.unwrap();
 
-    #[tokio::test]
-    async fn filebase_obeys_the_psa_contract() {
-        for (kind, prefix) in [(ProviderKind::Filebase, "/v1/ipfs")] {
-            let server = MockServer::start().await;
-            mount_contract(&server, prefix).await;
-            let provider = provider_for(kind, &server);
-            let submitted = provider
-                .submit(SubmitPin {
-                    cid: "bafy-target".to_owned(),
-                    name: "bucket/key".to_owned(),
-                    metadata: BTreeMap::from([
-                        ("gateway_job_id".to_owned(), "job-7".to_owned()),
-                        ("gateway_lease_id".to_owned(), "lease-7".to_owned()),
-                    ]),
-                })
-                .await
-                .unwrap();
-            assert_eq!(submitted.request_id, "request-7");
-            assert_eq!(submitted.status, RemotePinStatus::Queued);
-            assert_eq!(
-                provider.get("request-7").await.unwrap().status,
-                RemotePinStatus::Pinned
-            );
-            assert_eq!(
-                provider
-                    .find(FindPin::for_job("bafy-target", "job-7"))
-                    .await
-                    .unwrap()[0]
-                    .status,
-                RemotePinStatus::Pinning
-            );
-            provider.unpin("request-7").await.unwrap();
-
-            let received = requests(&server).await;
-            assert_eq!(received.len(), 4);
-            for request in &received {
-                assert_eq!(
-                    request
-                        .headers
-                        .get("authorization")
-                        .unwrap()
-                        .to_str()
-                        .unwrap(),
-                    "Bearer provider-token"
-                );
-            }
-            let pins = format!("{prefix}/pins");
-            let post = received
-                .iter()
-                .find(|request| request.method.as_str() == "POST" && request.url.path() == pins)
-                .unwrap();
-            assert_eq!(
-                post.headers.get("authorization").unwrap().to_str().unwrap(),
-                "Bearer provider-token"
-            );
-            assert_eq!(
-                serde_json::from_slice::<serde_json::Value>(&post.body).unwrap(),
-                json!({
-                    "cid": "bafy-target",
-                    "name": "bucket/key",
-                    "origins": [],
-                    "meta": {
-                        "gateway_job_id": "job-7",
-                        "gateway_lease_id": "lease-7",
-                    },
-                })
-            );
-            let list = received
-                .iter()
-                .find(|request| request.method.as_str() == "GET" && request.url.path() == pins)
-                .unwrap();
-            let query = list
-                .url
-                .query_pairs()
-                .map(|(key, value)| (key.into_owned(), value.into_owned()))
-                .collect::<Vec<_>>();
-            assert_eq!(
-                query,
-                vec![
-                    ("cid".to_owned(), "bafy-target".to_owned()),
-                    (
-                        "meta".to_owned(),
-                        "{\"gateway_job_id\":\"job-7\"}".to_owned(),
-                    ),
-                ]
-            );
-            assert!(received.iter().any(|request| {
-                request.method.as_str() == "GET"
-                    && request.url.path() == format!("{pins}/request-7")
-            }));
-            assert!(received.iter().any(|request| {
-                request.method.as_str() == "DELETE"
-                    && request.url.path() == format!("{pins}/request-7")
-            }));
-        }
+        let received = requests(&server).await;
+        assert_eq!(received.len(), 2);
+        assert!(received.iter().all(|request| {
+            request
+                .headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                == Some("Bearer provider-token")
+        }));
     }
 
     #[tokio::test]
@@ -864,23 +640,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_404_is_not_found_and_delete_404_is_idempotent() {
+    async fn delete_404_is_idempotent() {
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/pins/request-7"))
-            .respond_with(ResponseTemplate::new(404).set_body_string("provider-token"))
-            .mount(&server)
-            .await;
         Mock::given(method("DELETE"))
             .and(path("/pins/request-7"))
             .respond_with(ResponseTemplate::new(404).set_body_string("provider-token"))
             .mount(&server)
             .await;
         let provider = PsaClient::new("test".to_owned(), server.uri(), super::test_token(TOKEN));
-        assert_eq!(
-            provider.get("request-7").await.unwrap_err().class,
-            ProviderErrorClass::NotFound
-        );
         provider.unpin("request-7").await.unwrap();
     }
 
@@ -920,7 +687,7 @@ mod tests {
             "http://127.0.0.1:1".to_owned(),
             super::test_token(TOKEN),
         )
-        .get("request-7")
+        .unpin("request-7")
         .await
         .unwrap_err();
         assert_eq!(error.class, ProviderErrorClass::Transient);
@@ -996,12 +763,8 @@ mod tests {
             ("already%2Fencoded", "already%252Fencoded"),
         ] {
             let server = MockServer::start().await;
-            Mock::given(method("GET"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(status(
-                    request_id,
-                    "pinned",
-                    "bafy-target",
-                )))
+            Mock::given(method("DELETE"))
+                .respond_with(ResponseTemplate::new(204))
                 .mount(&server)
                 .await;
             let provider = PsaClient::new(
@@ -1010,7 +773,7 @@ mod tests {
                 super::test_token(TOKEN),
             );
 
-            provider.get(request_id).await.unwrap();
+            provider.unpin(request_id).await.unwrap();
 
             let received = requests(&server).await;
             assert_eq!(received.len(), 1, "request ID {request_id:?}");
@@ -1047,41 +810,13 @@ mod tests {
             let provider =
                 PsaClient::new("test".to_owned(), server.uri(), super::test_token(TOKEN));
 
-            for error in [
-                provider.get(request_id).await.unwrap_err(),
-                provider.unpin(request_id).await.unwrap_err(),
-            ] {
-                assert_eq!(error.class, ProviderErrorClass::Protocol, "{request_id:?}");
-                for rendered in [format!("{error:?}"), error.to_string(), error.message] {
-                    assert!(!rendered.contains(TOKEN));
-                    assert!(!rendered.to_ascii_lowercase().contains("bearer "));
-                }
+            let error = provider.unpin(request_id).await.unwrap_err();
+            assert_eq!(error.class, ProviderErrorClass::Protocol, "{request_id:?}");
+            for rendered in [format!("{error:?}"), error.to_string(), error.message] {
+                assert!(!rendered.contains(TOKEN));
+                assert!(!rendered.to_ascii_lowercase().contains("bearer "));
             }
             assert!(requests(&server).await.is_empty(), "{request_id:?}");
-        }
-    }
-
-    #[tokio::test]
-    async fn get_requires_the_response_request_id_to_match_the_requested_id() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/pins/request-a"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(status(
-                "request-b",
-                "pinned",
-                "bafy-target",
-            )))
-            .mount(&server)
-            .await;
-
-        let error = PsaClient::new("test".to_owned(), server.uri(), super::test_token(TOKEN))
-            .get("request-a")
-            .await
-            .unwrap_err();
-        assert_eq!(error.class, ProviderErrorClass::Protocol);
-        for rendered in [format!("{error:?}"), error.to_string(), error.message] {
-            assert!(!rendered.contains(TOKEN));
-            assert!(!rendered.contains("request-b"));
         }
     }
 
@@ -1094,7 +829,7 @@ mod tests {
                 format!("{}/psa{endpoint_suffix}", server.uri()),
                 super::test_token(TOKEN),
             );
-            let error = provider.get("request-7").await.unwrap_err();
+            let error = provider.unpin("request-7").await.unwrap_err();
             assert_eq!(error.class, ProviderErrorClass::Protocol);
             assert!(!format!("{error:?}").contains(TOKEN));
             assert!(requests(&server).await.is_empty());
@@ -1106,7 +841,7 @@ mod tests {
                 endpoint.to_owned(),
                 super::test_token(TOKEN),
             )
-            .get("request-7")
+            .unpin("request-7")
             .await
             .unwrap_err();
             assert_eq!(error.class, ProviderErrorClass::Protocol);
@@ -1120,7 +855,7 @@ mod tests {
             server.uri(),
             super::test_token(invalid_token),
         )
-        .get("request-7")
+        .unpin("request-7")
         .await
         .unwrap_err();
         assert_eq!(error.class, ProviderErrorClass::Protocol);
@@ -1144,15 +879,19 @@ mod tests {
             ("request-7", "bEaReR upstream-secret"),
         ] {
             let server = MockServer::start().await;
-            Mock::given(method("GET"))
-                .and(path("/pins/request-7"))
+            Mock::given(method("POST"))
+                .and(path("/pins"))
                 .respond_with(
                     ResponseTemplate::new(200).set_body_json(status(request_id, "failed", cid)),
                 )
                 .mount(&server)
                 .await;
             let error = PsaClient::new("test".to_owned(), server.uri(), super::test_token(TOKEN))
-                .get("request-7")
+                .submit(SubmitPin {
+                    cid: cid.to_owned(),
+                    name: "bucket/key".to_owned(),
+                    metadata: BTreeMap::new(),
+                })
                 .await
                 .unwrap_err();
             assert_eq!(error.class, ProviderErrorClass::Protocol);
@@ -1165,33 +904,10 @@ mod tests {
                 );
             }
         }
-
-        for reason in ["provider-token from upstream", "bEaReR upstream-secret"] {
-            let server = MockServer::start().await;
-            let mut failed = status("request-7", "failed", "bafy-target");
-            failed["info"] = json!({ "reason": reason });
-            Mock::given(method("GET"))
-                .and(path("/pins/request-7"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(failed))
-                .mount(&server)
-                .await;
-            let remote = PsaClient::new("test".to_owned(), server.uri(), super::test_token(TOKEN))
-                .get("request-7")
-                .await
-                .unwrap();
-            assert_eq!(remote.failure_reason, None);
-            let rendered = format!("{remote:?}");
-            assert!(!rendered.contains(TOKEN));
-            assert!(
-                !rendered
-                    .to_ascii_lowercase()
-                    .contains("bearer upstream-secret")
-            );
-        }
     }
 
     #[tokio::test]
-    async fn reconciliation_results_must_correlate_and_lists_must_be_complete() {
+    async fn submit_ack_must_match_the_requested_cid() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/pins"))
@@ -1211,91 +927,10 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.class, ProviderErrorClass::Protocol);
-
-        let metadata = BTreeMap::from([("gateway_job_id".to_owned(), "job-7".to_owned())]);
-        for result in [
-            status_with_meta("request-7", "pinned", "bafy-unrelated", metadata.clone()),
-            status("request-7", "pinned", "bafy-target"),
-            status_with_meta(
-                "request-7",
-                "pinned",
-                "bafy-target",
-                BTreeMap::from([("gateway_job_id".to_owned(), "wrong-job".to_owned())]),
-            ),
-        ] {
-            let server = MockServer::start().await;
-            Mock::given(method("GET"))
-                .and(path("/pins"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                    "count": 1,
-                    "results": [result],
-                })))
-                .mount(&server)
-                .await;
-            let error = PsaClient::new("test".to_owned(), server.uri(), super::test_token(TOKEN))
-                .find(FindPin {
-                    cid: "bafy-target".to_owned(),
-                    metadata: metadata.clone(),
-                })
-                .await
-                .unwrap_err();
-            assert_eq!(error.class, ProviderErrorClass::Protocol);
-        }
-
-        for count in [0_usize, 1, 2] {
-            let server = MockServer::start().await;
-            let results = (0..count)
-                .map(|index| {
-                    status_with_meta(
-                        &format!("request-{index}"),
-                        "pinned",
-                        "bafy-target",
-                        metadata.clone(),
-                    )
-                })
-                .collect::<Vec<_>>();
-            Mock::given(method("GET"))
-                .and(path("/pins"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                    "count": count,
-                    "results": results,
-                })))
-                .mount(&server)
-                .await;
-            let found = PsaClient::new("test".to_owned(), server.uri(), super::test_token(TOKEN))
-                .find(FindPin {
-                    cid: "bafy-target".to_owned(),
-                    metadata: metadata.clone(),
-                })
-                .await
-                .unwrap();
-            assert_eq!(found.len(), count);
-        }
-
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/pins"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "count": 2,
-                "results": [status_with_meta(
-                    "request-7",
-                    "pinned",
-                    "bafy-target",
-                    metadata,
-                )],
-            })))
-            .mount(&server)
-            .await;
-        let error = PsaClient::new("test".to_owned(), server.uri(), super::test_token(TOKEN))
-            .find(FindPin::for_job("bafy-target", "job-7"))
-            .await
-            .unwrap_err();
-        assert_eq!(error.class, ProviderErrorClass::Protocol);
     }
 
     #[tokio::test]
     async fn success_response_bodies_are_capped_without_leaking_contents() {
-        let metadata = BTreeMap::from([("gateway_job_id".to_owned(), "job-7".to_owned())]);
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/pins"))
@@ -1304,19 +939,6 @@ mod tests {
                 "pinned",
                 "bafy-target",
             )))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/pins"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "count": 1,
-                "results": [status_with_meta(
-                    "request-7",
-                    "pinned",
-                    "bafy-target",
-                    metadata.clone(),
-                )],
-            })))
             .mount(&server)
             .await;
         let provider = PsaClient::new("test".to_owned(), server.uri(), super::test_token(TOKEN));
@@ -1331,17 +953,6 @@ mod tests {
                 .unwrap()
                 .request_id,
             "request-7"
-        );
-        assert_eq!(
-            provider
-                .find(FindPin {
-                    cid: "bafy-target".to_owned(),
-                    metadata: metadata.clone(),
-                })
-                .await
-                .unwrap()
-                .len(),
-            1
         );
 
         let oversized_padding = format!("{TOKEN} success-body-{}", "x".repeat(1_048_576));
@@ -1364,27 +975,6 @@ mod tests {
                 name: "bucket/key".to_owned(),
                 metadata: BTreeMap::new(),
             })
-            .await
-            .unwrap_err();
-        assert_eq!(error.class, ProviderErrorClass::Protocol);
-        for rendered in [format!("{error:?}"), error.to_string(), error.message] {
-            assert!(!rendered.contains(TOKEN));
-            assert!(!rendered.contains("success-body"));
-        }
-
-        let server = MockServer::start().await;
-        let oversized_list = json!({
-            "count": 0,
-            "results": [],
-            "padding": format!("{TOKEN} success-body-{}", "x".repeat(1_048_576)),
-        });
-        Mock::given(method("GET"))
-            .and(path("/pins"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(oversized_list))
-            .mount(&server)
-            .await;
-        let error = PsaClient::new("test".to_owned(), server.uri(), super::test_token(TOKEN))
-            .find(FindPin::for_job("bafy-target", "job-7"))
             .await
             .unwrap_err();
         assert_eq!(error.class, ProviderErrorClass::Protocol);

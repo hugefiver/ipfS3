@@ -10,9 +10,7 @@ use ipfs_s3_gateway::store;
 use s3::bucket::Bucket;
 use s3::creds::Credentials;
 use s3::region::Region;
-use sea_orm::{
-    ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, Set, TransactionTrait,
-};
+use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, Set, TransactionTrait};
 use std::collections::HashMap;
 
 pub(super) async fn assert_mpu_s3_error(response: reqwest::Response, code: &str) {
@@ -797,6 +795,7 @@ pub(super) async fn install_unversioned_content_version(
                         version_id: Set(version_id),
                         kind: Set("object".to_owned()),
                         object_id: Set(Some(object.id)),
+                        pin_decision: Set(None),
                         sequence: Set(1),
                         is_latest: Set(true),
                         lifecycle_age_started_at: Set(now),
@@ -897,31 +896,6 @@ pub(super) async fn latest_pinning_object(
     store::object::get_latest(harness.state.store.db(), &harness.bucket, key)
         .await
         .expect("latest pinning object")
-}
-
-pub(super) async fn owner_leases(
-    harness: &PinningHarness,
-    owner_object_id: &str,
-) -> Vec<store::entities::pin_lease::Model> {
-    store::entities::pin_lease::Entity::find()
-        .filter(store::entities::pin_lease::Column::OwnerObjectId.eq(owner_object_id))
-        .order_by_asc(store::entities::pin_lease::Column::Source)
-        .all(harness.state.store.db())
-        .await
-        .expect("owner pinning leases")
-}
-
-pub(super) async fn lease_targets(
-    harness: &PinningHarness,
-    lease_id: &str,
-) -> Vec<store::entities::pin_lease_target::Model> {
-    store::entities::pin_lease_target::Entity::find()
-        .filter(store::entities::pin_lease_target::Column::LeaseId.eq(lease_id))
-        .order_by_asc(store::entities::pin_lease_target::Column::Provider)
-        .order_by_asc(store::entities::pin_lease_target::Column::Id)
-        .all(harness.state.store.db())
-        .await
-        .expect("lease targets")
 }
 
 pub(super) async fn assert_no_kubo_pin_removes(harness: &PinningHarness) {

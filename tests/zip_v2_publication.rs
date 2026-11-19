@@ -1,4 +1,10 @@
+#[path = "support/pin_rows.rs"]
+mod pin_rows;
+mod stage9_zip_support;
+
 use chrono::Utc;
+use stage9_zip_support::{ARCHIVE_CID, OUTPUT_CID, fixture_cid};
+const SECOND_CID: &str = "bafkreigh2akiscaildc6ii5zji4bq7kly5k3s7svv6q2wx2nn5rtj5xuu4";
 use ipfs_s3_gateway::{
     config::{PinningConfig, PolicyConfig, ProviderConfig},
     import::SupersedeReason,
@@ -9,24 +15,16 @@ use ipfs_s3_gateway::{
     },
     store::{
         self,
-        entities::{
-            object, object_version, pin_lease, pin_lease_target, pin_provider_usage, remote_pin,
-        },
-        pinning::{
-            ledger,
-            publication::{
-                self, PublicationObject, ZipV2Publication, ZipV2Success, v2_execution as execution,
-            },
+        entities::{object, object_version},
+        pinning::publication::{
+            self, PublicationObject, ZipV2Publication, ZipV2Success, v2_execution as execution,
         },
         zip,
     },
     zip::options::ZipTargets,
 };
 use sea_orm::{ConnectionTrait, DatabaseConnection, EntityTrait, PaginatorTrait, TransactionTrait};
-use sea_orm_migration::{MigrationTrait, SchemaManager};
 use sha2::{Digest, Sha256};
-
-use ipfs_s3_gateway::store::migrations::m20260927_000004_zip_v2_execution as v2_schema;
 
 #[path = "support/r25_review_publication.rs"]
 mod r25_review_publication;
@@ -46,20 +44,6 @@ async fn setup() -> (tempfile::TempDir, DatabaseConnection, DatabaseConnection) 
     );
     let first = store::connect_database(&url).await.unwrap();
     store::run_migrations(&first).await.unwrap();
-    if first
-        .query_one(sea_orm::Statement::from_string(
-            sea_orm::DatabaseBackend::Sqlite,
-            "SELECT name FROM sqlite_master WHERE name='zip_v2_executions'",
-        ))
-        .await
-        .unwrap()
-        .is_none()
-    {
-        v2_schema::Migration
-            .up(&SchemaManager::new(&first))
-            .await
-            .unwrap();
-    }
     store::bucket::create(&first, "bucket", None).await.unwrap();
     let second = store::connect_database(&url).await.unwrap();
     (dir, first, second)
@@ -227,18 +211,13 @@ async fn each_output_gets_independent_automatic_policy_private_gets_no_lease_and
     let (_dir, first, second) = setup().await;
     let config = pin_config();
     let rules = output_rules(&config);
-    for provider in &config.providers {
-        ledger::register_route(&first, &provider.name, &provider.identity)
-            .await
-            .unwrap();
-    }
     let claim = prepared_with_controls(
         &first,
         &[
-            ("a-one", "out/a/one", "shared-cid"),
-            ("a-two", "out/a/two", "shared-cid"),
-            ("b-one", "out/b/one", "shared-cid"),
-            ("private", "out/private/secret", "shared-cid"),
+            ("a-one", "out/a/one", OUTPUT_CID),
+            ("a-two", "out/a/two", OUTPUT_CID),
+            ("b-one", "out/b/one", OUTPUT_CID),
+            ("private", "out/private/secret", OUTPUT_CID),
         ],
         false,
         ZipTargets::Extracted,
@@ -247,10 +226,10 @@ async fn each_output_gets_independent_automatic_policy_private_gets_no_lease_and
     let mut publication = request(
         claim,
         vec![
-            success("a-one", "out/a/one", "shared-cid", "one"),
-            success("a-two", "out/a/two", "shared-cid", "two"),
-            success("b-one", "out/b/one", "shared-cid", "three"),
-            success("private", "out/private/secret", "shared-cid", "four"),
+            success("a-one", "out/a/one", OUTPUT_CID, "one"),
+            success("a-two", "out/a/two", OUTPUT_CID, "two"),
+            success("b-one", "out/b/one", OUTPUT_CID, "three"),
+            success("private", "out/private/secret", OUTPUT_CID, "four"),
         ],
     );
     publication.targets = ZipTargets::Extracted;
@@ -264,59 +243,54 @@ async fn each_output_gets_independent_automatic_policy_private_gets_no_lease_and
     .await
     .unwrap();
     assert_eq!(object::Entity::find().count(&first).await.unwrap(), 4);
-    assert_eq!(pin_lease::Entity::find().count(&first).await.unwrap(), 3);
+    let refs = pin_rows::refs(&first).await;
     assert_eq!(
-        pin_lease_target::Entity::find()
-            .count(&first)
-            .await
-            .unwrap(),
-        3
-    );
-    assert_eq!(remote_pin::Entity::find().count(&first).await.unwrap(), 2);
-    for name in ["a", "b"] {
-        let usage = pin_provider_usage::Entity::find_by_id(name)
-            .one(&first)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!((usage.reserved_bytes, usage.reserved_pins), (7, 1));
-    }
-    let targets = pin_lease_target::Entity::find().all(&first).await.unwrap();
-    assert_eq!(
-        targets
-            .iter()
-            .filter(|target| target.provider == "a")
-            .count(),
-        2
-    );
-    assert_eq!(
-        targets
-            .iter()
-            .filter(|target| target.provider == "b")
-            .count(),
-        1
+        refs.iter()
+            .map(|r| (r.owner_object_id.as_str(), r.provider.as_str()))
+            .collect::<Vec<_>>(),
+        [("one", "a"), ("three", "b"), ("two", "a")]
     );
     assert!(
-        pin_lease::Entity::find()
-            .all(&first)
-            .await
-            .unwrap()
-            .iter()
-            .all(|lease| lease.source == "automatic")
+        refs.iter()
+            .all(|r| r.cid == OUTPUT_CID && r.source == "automatic")
     );
+    let resources = pin_rows::resources(&first).await;
+    assert_eq!(resources.len(), 2);
+    for (resource, provider) in resources.iter().zip(["a", "b"]) {
+        assert_eq!(
+            (
+                resource.provider.as_str(),
+                resource.cid.as_str(),
+                resource.logical_size
+            ),
+            (provider, OUTPUT_CID, 7)
+        );
+        assert_eq!(
+            (resource.status.as_str(), resource.action.as_deref()),
+            ("waiting", Some("submit"))
+        );
+    }
+    for version in object_version::Entity::find().all(&first).await.unwrap() {
+        let decision: ipfs_s3_gateway::pinning::decision::ExtensionDecision =
+            serde_json::from_str(version.pin_decision.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            decision.effective_intents.len(),
+            usize::from(version.object_id.as_deref() != Some("four"))
+        );
+    }
 }
 
 #[tokio::test]
 async fn source_absent_publishes_only_final_successes_from_two_connections() {
     let (_dir, first, second) = setup().await;
-    let claim = prepared(&first, &[("one.txt", "out/one.txt", "cid-1")]).await;
+    let claim = prepared(&first, &[("one.txt", "out/one.txt", OUTPUT_CID)]).await;
     let config = ValidatedPinningConfig::from_raw(&Default::default(), |_| None).unwrap();
     let rules = ValidatedZipOutputRules::compile(&[], &config).unwrap();
     publication::publish_zip_v2(
         &second,
         request(
             claim,
-            vec![success("one.txt", "out/one.txt", "cid-1", "output-1")],
+            vec![success("one.txt", "out/one.txt", OUTPUT_CID, "output-1")],
         ),
         &rules,
         &config,
@@ -331,7 +305,7 @@ async fn source_absent_publishes_only_final_successes_from_two_connections() {
         object_version::Entity::find().count(&second).await.unwrap(),
         1
     );
-    assert_eq!(pin_lease::Entity::find().count(&second).await.unwrap(), 0);
+    assert_eq!(pin_rows::count(&second, "pin_refs").await, 0);
     assert_eq!(
         execution::read(&first, "v2-execution")
             .await
@@ -350,25 +324,25 @@ async fn source_absent_publishes_only_final_successes_from_two_connections() {
 }
 
 #[tokio::test]
-async fn mismatched_final_cid_cannot_publish_any_object_or_complete_guards() {
+async fn mismatched_final_cid_fences_the_claim_without_publishing() {
     let (_dir, first, second) = setup().await;
-    let claim = prepared(&first, &[("one.txt", "out/one.txt", "cid-1")]).await;
+    let claim = prepared(&first, &[("one.txt", "out/one.txt", OUTPUT_CID)]).await;
     let config = ValidatedPinningConfig::from_raw(&Default::default(), |_| None).unwrap();
     let rules = ValidatedZipOutputRules::compile(&[], &config).unwrap();
-    assert!(
+    assert!(matches!(
         publication::publish_zip_v2(
             &second,
             request(
                 claim,
-                vec![success("one.txt", "out/one.txt", "wrong", "output-1")]
+                vec![success("one.txt", "out/one.txt", SECOND_CID, "output-1")]
             ),
             &rules,
             &config,
             &config.provider_limits
         )
-        .await
-        .is_err()
-    );
+        .await,
+        Err(ipfs_s3_gateway::error::AppError::InvalidPinningRequest(_))
+    ));
     assert_eq!(object::Entity::find().count(&first).await.unwrap(), 0);
     assert_eq!(
         object_version::Entity::find().count(&first).await.unwrap(),
@@ -380,7 +354,7 @@ async fn mismatched_final_cid_cannot_publish_any_object_or_complete_guards() {
             .unwrap()
             .unwrap()
             .state,
-        "admitted"
+        "fenced"
     );
     assert_eq!(
         zip::read(&first, "v2-execution")
@@ -395,7 +369,7 @@ async fn mismatched_final_cid_cannot_publish_any_object_or_complete_guards() {
 #[tokio::test]
 async fn a_mirror_with_actual_digest_instead_of_pending_is_not_a_v2_mirror() {
     let (_dir, first, second) = setup().await;
-    let claim = prepared(&first, &[("one", "out/one", "cid-1")]).await;
+    let claim = prepared(&first, &[("one", "out/one", OUTPUT_CID)]).await;
     let config = ValidatedPinningConfig::from_raw(&Default::default(), |_| None).unwrap();
     let rules = ValidatedZipOutputRules::compile(&[], &config).unwrap();
     for (column, value, original) in [
@@ -422,7 +396,7 @@ async fn a_mirror_with_actual_digest_instead_of_pending_is_not_a_v2_mirror() {
                 &second,
                 request(
                     claim.clone(),
-                    vec![success("one", "out/one", "cid-1", "output-1")]
+                    vec![success("one", "out/one", OUTPUT_CID, "output-1")]
                 ),
                 &rules,
                 &config,
@@ -446,7 +420,7 @@ async fn a_mirror_with_actual_digest_instead_of_pending_is_not_a_v2_mirror() {
 #[tokio::test]
 async fn bucket_lock_precedes_transaction_snapshot_and_rechecks_immutable_execution_owner() {
     let (_dir, first, second) = setup().await;
-    let claim = prepared(&first, &[("one", "out/one", "cid-1")]).await;
+    let claim = prepared(&first, &[("one", "out/one", OUTPUT_CID)]).await;
     first
         .execute_unprepared("PRAGMA journal_mode=WAL")
         .await
@@ -472,7 +446,10 @@ async fn bucket_lock_precedes_transaction_snapshot_and_rechecks_immutable_execut
     let published = tokio::spawn(async move {
         publication::publish_zip_v2(
             &second,
-            request(claim, vec![success("one", "out/one", "cid-1", "output-1")]),
+            request(
+                claim,
+                vec![success("one", "out/one", OUTPUT_CID, "output-1")],
+            ),
             &rules,
             &config,
             &config.provider_limits,
@@ -505,7 +482,7 @@ async fn bucket_lock_precedes_transaction_snapshot_and_rechecks_immutable_execut
         Err(ipfs_s3_gateway::error::AppError::InvalidPinningRequest(_))
     ));
     assert_eq!(object::Entity::find().count(&first).await.unwrap(), 0);
-    assert_eq!(pin_lease::Entity::find().count(&first).await.unwrap(), 0);
+    assert_eq!(pin_rows::count(&first, "pin_refs").await, 0);
 }
 
 #[tokio::test]
@@ -555,7 +532,7 @@ async fn all_failed_manifest_seals_disabled_root_and_execution_without_objects()
     assert_eq!(batch.batch.root_status, "disabled");
     assert_eq!(batch.entries.len(), 1);
     assert!(batch.entries[0].version_row_id.is_none());
-    assert_eq!(pin_lease::Entity::find().count(&first).await.unwrap(), 0);
+    assert_eq!(pin_rows::count(&first, "pin_refs").await, 0);
     let admitted = execution::Admission {
         id: execution.id,
         owner: execution.owner,
@@ -580,109 +557,131 @@ async fn all_failed_manifest_seals_disabled_root_and_execution_without_objects()
 
 #[tokio::test]
 async fn all_failed_manifest_with_root_enabled_seals_empty_without_a_cid() {
-    let (_dir, first, second) = setup().await;
-    let claim = prepared_manifest_with_controls(
-        &first,
-        &[],
-        &[("failed/file", "invalid_zip")],
-        true,
-        ZipTargets::None,
-    )
-    .await;
     let config = ValidatedPinningConfig::from_raw(&Default::default(), |_| None).unwrap();
     let rules = ValidatedZipOutputRules::compile(&[], &config).unwrap();
-    assert!(
-        publication::publish_zip_v2(
-            &second,
-            request(claim.clone(), vec![]),
-            &rules,
-            &config,
-            &config.provider_limits
+    for reject_first in [true, false] {
+        let (_dir, first, second) = setup().await;
+        let claim = prepared_manifest_with_controls(
+            &first,
+            &[],
+            &[("failed/file", "invalid_zip")],
+            true,
+            ZipTargets::None,
         )
-        .await
-        .is_err()
-    );
-    let mut request = request(claim, vec![]);
-    request.root_outcome = zip::RootOutcome::Empty;
-    assert!(matches!(
-        publication::publish_zip_v2(&second, request, &rules, &config, &config.provider_limits)
-            .await
-            .unwrap(),
-        publication::ZipV2PublicationResult::Published(results) if results.is_empty()
-    ));
-    assert_eq!(object::Entity::find().count(&first).await.unwrap(), 0);
-    let batch = zip::snapshot(&first, "v2-execution")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(batch.batch.state, "published");
-    assert_eq!(batch.batch.root_status, "empty");
-    assert!(batch.batch.root_cid.is_none());
-    assert_eq!(batch.entries.len(), 1);
-    assert_eq!(
-        execution::read(&first, "v2-execution")
+        .await;
+        if reject_first {
+            assert!(matches!(
+                publication::publish_zip_v2(
+                    &second,
+                    request(claim.clone(), vec![]),
+                    &rules,
+                    &config,
+                    &config.provider_limits,
+                )
+                .await,
+                Err(ipfs_s3_gateway::error::AppError::InvalidPinningRequest(_))
+            ));
+        }
+        let mut valid = request(claim, vec![]);
+        valid.root_outcome = zip::RootOutcome::Empty;
+        let result =
+            publication::publish_zip_v2(&second, valid, &rules, &config, &config.provider_limits)
+                .await;
+        assert_eq!(object::Entity::find().count(&first).await.unwrap(), 0);
+        let batch = zip::snapshot(&first, "v2-execution")
             .await
             .unwrap()
+            .unwrap();
+        assert_eq!(batch.entries.len(), 1);
+        assert!(batch.batch.root_cid.is_none());
+        let execution = execution::read(&first, "v2-execution")
+            .await
             .unwrap()
-            .state,
-        "completed"
-    );
+            .unwrap();
+        if reject_first {
+            assert!(result.is_err());
+            assert_eq!(execution.state, "fenced");
+            assert_eq!(batch.batch.state, "open");
+        } else {
+            assert!(
+                matches!(result.unwrap(), publication::ZipV2PublicationResult::Published(results) if results.is_empty())
+            );
+            assert_eq!(execution.state, "completed");
+            assert_eq!(batch.batch.state, "published");
+            assert_eq!(batch.batch.root_status, "empty");
+        }
+    }
 }
 
 #[tokio::test]
 async fn every_durable_target_must_be_written_or_the_entire_publication_rolls_back() {
-    let (_dir, first, second) = setup().await;
-    let claim = prepared(
-        &first,
-        &[("one", "out/one", "cid-1"), ("two", "out/two", "cid-2")],
-    )
-    .await;
     let config = ValidatedPinningConfig::from_raw(&Default::default(), |_| None).unwrap();
     let rules = ValidatedZipOutputRules::compile(&[], &config).unwrap();
-    assert!(
-        publication::publish_zip_v2(
+    for reject_first in [true, false] {
+        let (_dir, first, second) = setup().await;
+        let claim = prepared(
+            &first,
+            &[
+                ("one", "out/one", OUTPUT_CID),
+                ("two", "out/two", SECOND_CID),
+            ],
+        )
+        .await;
+        let outputs = vec![
+            success("one", "out/one", OUTPUT_CID, "output-1"),
+            success("two", "out/two", SECOND_CID, "output-2"),
+        ];
+        if reject_first {
+            assert!(matches!(
+                publication::publish_zip_v2(
+                    &second,
+                    request(claim.clone(), outputs[..1].to_vec()),
+                    &rules,
+                    &config,
+                    &config.provider_limits,
+                )
+                .await,
+                Err(ipfs_s3_gateway::error::AppError::InvalidPinningRequest(_))
+            ));
+        }
+        let result = publication::publish_zip_v2(
             &second,
-            request(
-                claim.clone(),
-                vec![success("one", "out/one", "cid-1", "output-1")]
-            ),
+            request(claim, outputs),
             &rules,
             &config,
-            &config.provider_limits
+            &config.provider_limits,
         )
-        .await
-        .is_err()
-    );
-    assert_eq!(object::Entity::find().count(&first).await.unwrap(), 0);
-    assert_eq!(
-        object_version::Entity::find().count(&first).await.unwrap(),
-        0
-    );
-    let completed = publication::publish_zip_v2(
-        &second,
-        request(
-            claim,
-            vec![
-                success("one", "out/one", "cid-1", "output-1"),
-                success("two", "out/two", "cid-2", "output-2"),
-            ],
-        ),
-        &rules,
-        &config,
-        &config.provider_limits,
-    )
-    .await
-    .unwrap();
-    assert!(
-        matches!(completed, publication::ZipV2PublicationResult::Published(rows) if rows.len() == 2)
-    );
-    assert_eq!(object::Entity::find().count(&first).await.unwrap(), 2);
+        .await;
+        let execution = execution::read(&first, "v2-execution")
+            .await
+            .unwrap()
+            .unwrap();
+        let expected_rows = if reject_first {
+            assert!(result.is_err());
+            assert_eq!(execution.state, "fenced");
+            0
+        } else {
+            assert!(
+                matches!(result.unwrap(), publication::ZipV2PublicationResult::Published(rows) if rows.len() == 2)
+            );
+            assert_eq!(execution.state, "completed");
+            2
+        };
+        assert_eq!(
+            object::Entity::find().count(&first).await.unwrap(),
+            expected_rows
+        );
+        assert_eq!(
+            object_version::Entity::find().count(&first).await.unwrap(),
+            expected_rows
+        );
+    }
 }
 
 #[tokio::test]
 async fn lost_exact_output_guard_fences_old_claim_instead_of_recapturing_a_key() {
     let (_dir, first, second) = setup().await;
-    let claim = prepared(&first, &[("one", "out/one", "cid-1")]).await;
+    let claim = prepared(&first, &[("one", "out/one", OUTPUT_CID)]).await;
     store::import::ownership::admit_content_mutation(
         &second,
         "bucket",
@@ -698,7 +697,10 @@ async fn lost_exact_output_guard_fences_old_claim_instead_of_recapturing_a_key()
     assert!(
         publication::publish_zip_v2(
             &first,
-            request(claim, vec![success("one", "out/one", "cid-1", "output-1")]),
+            request(
+                claim,
+                vec![success("one", "out/one", OUTPUT_CID, "output-1")]
+            ),
             &rules,
             &config,
             &config.provider_limits
@@ -720,10 +722,13 @@ async fn lost_exact_output_guard_fences_old_claim_instead_of_recapturing_a_key()
 #[tokio::test]
 async fn failed_root_is_durable_but_does_not_erase_successful_output() {
     let (_dir, first, second) = setup().await;
-    let claim = prepared_with_root(&first, &[("one", "out/one", "cid-1")], true).await;
+    let claim = prepared_with_root(&first, &[("one", "out/one", OUTPUT_CID)], true).await;
     let config = ValidatedPinningConfig::from_raw(&Default::default(), |_| None).unwrap();
     let rules = ValidatedZipOutputRules::compile(&[], &config).unwrap();
-    let mut result = request(claim, vec![success("one", "out/one", "cid-1", "output-1")]);
+    let mut result = request(
+        claim,
+        vec![success("one", "out/one", OUTPUT_CID, "output-1")],
+    );
     result.root_outcome = zip::RootOutcome::Failed {
         code: "build_failed",
     };
@@ -745,21 +750,16 @@ async fn unverified_root_cid_cannot_commit_written_output_leases_or_guard_comple
     let (_dir, first, second) = setup().await;
     let config = pin_config();
     let rules = output_rules(&config);
-    for provider in &config.providers {
-        ledger::register_route(&first, &provider.name, &provider.identity)
-            .await
-            .unwrap();
-    }
     let claim = prepared_with_controls(
         &first,
-        &[("one", "out/a/one", "cid-1")],
+        &[("one", "out/a/one", OUTPUT_CID)],
         true,
         ZipTargets::Extracted,
     )
     .await;
     let mut publication = request(
         claim.clone(),
-        vec![success("one", "out/a/one", "cid-1", "one")],
+        vec![success("one", "out/a/one", OUTPUT_CID, "one")],
     );
     publication.targets = ZipTargets::Extracted;
     publication.root_outcome = zip::RootOutcome::Verified {
@@ -771,7 +771,7 @@ async fn unverified_root_cid_cannot_commit_written_output_leases_or_guard_comple
         },
         node_identity: "hot".into(),
         tier: "hot".into(),
-        cid: "unverified-candidate".into(),
+        cid: fixture_cid("unverified-candidate"),
     };
     assert!(
         publication::publish_zip_v2(
@@ -789,15 +789,8 @@ async fn unverified_root_cid_cannot_commit_written_output_leases_or_guard_comple
         object_version::Entity::find().count(&first).await.unwrap(),
         0
     );
-    assert_eq!(pin_lease::Entity::find().count(&first).await.unwrap(), 0);
-    assert_eq!(
-        pin_lease_target::Entity::find()
-            .count(&first)
-            .await
-            .unwrap(),
-        0
-    );
-    assert_eq!(remote_pin::Entity::find().count(&first).await.unwrap(), 0);
+    assert_eq!(pin_rows::count(&first, "pin_refs").await, 0);
+    assert_eq!(pin_rows::count(&first, "pin_resources").await, 0);
     assert_eq!(
         execution::read(&first, &claim.batch_id)
             .await
@@ -821,7 +814,11 @@ async fn source_key_is_never_replaced_or_versioned_for_any_bucket_versioning_sta
                 .await
                 .unwrap();
         }
-        let old = published("prior-source", "source.zip", "source-original");
+        let old = published(
+            "prior-source",
+            "source.zip",
+            &fixture_cid("source-original"),
+        );
         publication::publish_object(
             &first,
             publication::PublicationRequest {
@@ -846,12 +843,15 @@ async fn source_key_is_never_replaced_or_versioned_for_any_bucket_versioning_sta
             .unwrap()
             .unwrap();
         let count_before = object_version::Entity::find().count(&first).await.unwrap();
-        let claim = prepared(&first, &[("one", "out/one", "cid-1")]).await;
+        let claim = prepared(&first, &[("one", "out/one", OUTPUT_CID)]).await;
         let config = ValidatedPinningConfig::from_raw(&Default::default(), |_| None).unwrap();
         let rules = ValidatedZipOutputRules::compile(&[], &config).unwrap();
         publication::publish_zip_v2(
             &second,
-            request(claim, vec![success("one", "out/one", "cid-1", "output-1")]),
+            request(
+                claim,
+                vec![success("one", "out/one", OUTPUT_CID, "output-1")],
+            ),
             &rules,
             &config,
             &config.provider_limits,

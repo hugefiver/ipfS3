@@ -592,26 +592,13 @@ pub async fn create_or_replay_with_zip_intent(
     create(db, request, Some(intent)).await
 }
 
-pub(crate) async fn create_or_replay_store(
-    store: &crate::store::Store,
-    request: &Intake,
-    intent: &CapturedZipIntent,
-) -> AppResult<String> {
-    use crate::store::pinning::management::records::{DecodeWork, SharedDecodeBudget};
-    let work = SharedDecodeBudget::default();
-    let tx = store.begin_runtime(DecodeWork::shared(&work)).await?;
-    let id = create_in_transaction(tx.db(), request, Some(intent), Some(&tx)).await?;
-    tx.commit().await?;
-    Ok(id)
-}
-
 async fn create(
     db: &DatabaseConnection,
     request: &Intake,
     intent: Option<&CapturedZipIntent>,
 ) -> AppResult<String> {
     let tx = db.begin().await?;
-    let id = create_in_transaction(&tx, request, intent, None).await?;
+    let id = create_in_transaction(&tx, request, intent).await?;
     tx.commit().await?;
     Ok(id)
 }
@@ -620,7 +607,6 @@ async fn create_in_transaction(
     tx: &DatabaseTransaction,
     request: &Intake,
     intent: Option<&CapturedZipIntent>,
-    runtime: Option<&crate::store::RuntimeTransaction>,
 ) -> AppResult<String> {
     if (!request.options.publish_extracted && !request.options.publish_source)
         || request.options.token != request.token
@@ -645,7 +631,7 @@ async fn create_in_transaction(
     }
     let intent = intent.ok_or_else(capture::attention)?;
     let captured_options = capture::envelope(request, intent)?;
-    let execution = crate::store::zip::execution::admit_in_transaction_core(
+    let execution = crate::store::zip::execution::admit_in_transaction(
         tx,
         &crate::store::zip::execution::Admission {
             id: request.upload_id.clone(),
@@ -658,7 +644,6 @@ async fn create_in_transaction(
             source_key: request.key.clone(),
             captured_options: captured_options.clone(),
         },
-        runtime,
     )
     .await
     .map_err(|error| match error {
@@ -669,7 +654,7 @@ async fn create_in_transaction(
         let old = replay(tx, &execution.id, request, Some(intent)).await?;
         return Ok(old);
     }
-    super::create_upload_with_zip_intent_core(
+    super::create_upload_with_zip_intent(
         tx,
         &request.upload_id,
         &request.object_id,
@@ -685,7 +670,6 @@ async fn create_in_transaction(
         intent.controls().result_enabled,
         Some(intent.source_decision()),
         Some(intent),
-        runtime,
     )
     .await?;
     let now = crate::store::database_clock::database_now(tx).await?;

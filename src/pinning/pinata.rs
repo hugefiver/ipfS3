@@ -10,8 +10,8 @@ use crate::{
     pinning::{
         config::{PinataApi, PinataProviderOptions, PinataStrategy, SecretToken},
         provider::{
-            FindPin, PinningProvider, ProviderError, ProviderErrorClass, RemotePin,
-            RemotePinStatus, SubmitPin,
+            PinningProvider, ProviderError, ProviderErrorClass, RemotePin, RemotePinStatus,
+            SubmitPin,
         },
         psa::PsaClient,
     },
@@ -20,9 +20,10 @@ use crate::{
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_FAILURE_REASON_CHARS: usize = 256;
 const MAX_SUCCESS_RESPONSE_BYTES: usize = 1024 * 1024;
-const V3_REQUEST_ID_PREFIX: &str = "pinata-v3:";
+const V3_QUEUE_PREFIX: &str = "pinata-v3:queue:";
 pub(crate) const V3_FILE_PREFIX: &str = "pinata-v3:file:";
-const LEGACY_REQUEST_ID_PREFIX: &str = "pinata-legacy:";
+const REUSED_PREFIX: &str = "pinata:reused:";
+const LEGACY_REQUEST_ID_PREFIX: &str = "pinata-legacy:cid:";
 
 #[cfg(test)]
 #[path = "pinata_stage1_tests.rs"]
@@ -63,8 +64,7 @@ pub fn build_pinata_with_options(
 #[derive(Clone)]
 pub struct PinataClient {
     name: String,
-    v3_base_url: Result<Url, ()>,
-    legacy_base_url: Result<Url, ()>,
+    base_url: Result<Url, ()>,
     upload_base_url: Result<Url, ()>,
     token: SecretToken,
     http: Client,
@@ -73,36 +73,10 @@ pub struct PinataClient {
     api: PinataApi,
     strategy: PinataStrategy,
     kubo: Option<KuboClient>,
-    legacy_psa: Option<PsaClient>,
-    legacy_request_psa: Option<PsaClient>,
+    psa: Option<PsaClient>,
 }
 
 impl PinataClient {
-    fn historical(&self, api: &str, strategy: &str) -> Result<Self, ProviderError> {
-        let mut historical = self.clone();
-        if api == "psa" && strategy == "cid" {
-            historical.legacy_psa = self
-                .legacy_psa
-                .clone()
-                .or_else(|| self.legacy_request_psa.clone());
-            if historical.legacy_psa.is_none() {
-                return Err(protocol_error("historical provider route unavailable"));
-            }
-            return Ok(historical);
-        }
-        historical.legacy_psa = None;
-        historical.api = match api {
-            "pinata_v3" => PinataApi::V3,
-            "pinata_legacy" => PinataApi::Legacy,
-            _ => return Err(protocol_error("historical provider route unavailable")),
-        };
-        historical.strategy = match strategy {
-            "cid" => PinataStrategy::Cid,
-            "upload" => PinataStrategy::Upload,
-            _ => return Err(protocol_error("historical provider route unavailable")),
-        };
-        Ok(historical)
-    }
     pub fn new(
         name: String,
         endpoint: String,
@@ -111,6 +85,7 @@ impl PinataClient {
         token: SecretToken,
     ) -> Self {
         let http = Client::builder()
+            .retry(reqwest::retry::never())
             .redirect(reqwest::redirect::Policy::none())
             .timeout(DEFAULT_TIMEOUT)
             .build()
@@ -118,6 +93,7 @@ impl PinataClient {
         // Streaming uploads must not inherit a whole-request deadline; large objects
         // legitimately outlive it, so only the connect phase is bounded.
         let upload_http = Client::builder()
+            .retry(reqwest::retry::never())
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(DEFAULT_TIMEOUT)
             .build()
@@ -136,34 +112,19 @@ impl PinataClient {
         http: Client,
         upload_http: Client,
     ) -> Self {
-        let normalized = normalize_base(endpoint.clone());
-        let upload_endpoint = options
-            .upload_endpoint
-            .clone()
-            .unwrap_or_else(|| PINATA_UPLOAD_BASE_URL.to_owned());
-        let v3_endpoint = match options.api {
-            PinataApi::V3 => normalized.clone(),
-            PinataApi::Legacy => pinata_v3_endpoint(&endpoint),
-        };
-        let legacy_endpoint = match options.api {
-            PinataApi::V3 => pinata_legacy_endpoint(&endpoint),
-            PinataApi::Legacy => normalized.clone(),
-        };
-        let legacy_psa = normalized
+        let endpoint = normalize_base(endpoint);
+        let psa = endpoint
             .ends_with("/psa")
-            .then(|| PsaClient::new(name.clone(), normalized, token.clone()));
-        let legacy_request_psa = legacy_psa.is_none().then(|| {
-            PsaClient::new(
-                name.clone(),
-                pinata_legacy_psa_endpoint(&endpoint),
-                token.clone(),
-            )
-        });
+            .then(|| PsaClient::new(name.clone(), endpoint.clone(), token.clone()));
         Self {
             name,
-            v3_base_url: parse_base_url(&v3_endpoint),
-            legacy_base_url: parse_base_url(&legacy_endpoint),
-            upload_base_url: parse_base_url(&upload_endpoint),
+            base_url: parse_base_url(&endpoint),
+            upload_base_url: parse_base_url(
+                options
+                    .upload_endpoint
+                    .as_deref()
+                    .unwrap_or(PINATA_UPLOAD_BASE_URL),
+            ),
             token,
             http,
             upload_http,
@@ -171,35 +132,17 @@ impl PinataClient {
             api: options.api,
             strategy: options.strategy,
             kubo,
-            legacy_psa,
-            legacy_request_psa,
+            psa,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn base_url(&self) -> &str {
-        match self.api {
-            PinataApi::V3 => self
-                .v3_base_url
-                .as_ref()
-                .map(Url::as_str)
-                .unwrap_or_default(),
-            PinataApi::Legacy => self
-                .legacy_base_url
-                .as_ref()
-                .map(Url::as_str)
-                .unwrap_or_default(),
-        }
+        self.base_url.as_ref().map(Url::as_str).unwrap_or_default()
     }
 
-    fn validated_v3_base_url(&self) -> Result<&Url, ProviderError> {
-        self.v3_base_url
-            .as_ref()
-            .map_err(|_| protocol_error("provider endpoint is invalid"))
-    }
-
-    fn validated_legacy_base_url(&self) -> Result<&Url, ProviderError> {
-        self.legacy_base_url
+    fn validated_base_url(&self) -> Result<&Url, ProviderError> {
+        self.base_url
             .as_ref()
             .map_err(|_| protocol_error("provider endpoint is invalid"))
     }
@@ -211,7 +154,7 @@ impl PinataClient {
     }
 
     fn pin_by_cid_url(&self) -> Result<Url, ProviderError> {
-        let mut url = self.validated_v3_base_url()?.clone();
+        let mut url = self.validated_base_url()?.clone();
         url.path_segments_mut()
             .map_err(|_| protocol_error("provider endpoint is invalid"))?
             .extend(["files", "public", "pin_by_cid"]);
@@ -227,32 +170,14 @@ impl PinataClient {
         Ok(url)
     }
 
-    fn files_url(&self, cid: Option<&str>, page_token: Option<&str>) -> Result<Url, ProviderError> {
-        let mut url = self.validated_v3_base_url()?.clone();
+    fn files_url(&self, cid: &str, page_token: Option<&str>) -> Result<Url, ProviderError> {
+        let mut url = self.validated_base_url()?.clone();
         url.path_segments_mut()
             .map_err(|_| protocol_error("provider endpoint is invalid"))?
             .extend(["files", "public"]);
         {
             let mut query = url.query_pairs_mut();
-            query.append_pair("limit", "100");
-            if let Some(cid) = cid {
-                query.append_pair("cid", cid);
-            }
-            if let Some(page_token) = page_token {
-                query.append_pair("pageToken", page_token);
-            }
-        }
-        Ok(url)
-    }
-
-    fn queue_url(&self, cid: Option<&str>, page_token: Option<&str>) -> Result<Url, ProviderError> {
-        let mut url = self.pin_by_cid_url()?;
-        {
-            let mut query = url.query_pairs_mut();
-            query.append_pair("limit", "100");
-            if let Some(cid) = cid {
-                query.append_pair("cid", cid);
-            }
+            query.append_pair("limit", "100").append_pair("cid", cid);
             if let Some(page_token) = page_token {
                 query.append_pair("pageToken", page_token);
             }
@@ -262,7 +187,7 @@ impl PinataClient {
 
     fn file_url(&self, provider_id: &str) -> Result<Url, ProviderError> {
         self.validate_provider_field(provider_id)?;
-        let mut url = self.validated_v3_base_url()?.clone();
+        let mut url = self.validated_base_url()?.clone();
         url.path_segments_mut()
             .map_err(|_| protocol_error("provider endpoint is invalid"))?
             .extend(["files", "public", provider_id]);
@@ -278,7 +203,7 @@ impl PinataClient {
     }
 
     fn legacy_pin_by_hash_url(&self) -> Result<Url, ProviderError> {
-        let mut url = self.validated_legacy_base_url()?.clone();
+        let mut url = self.validated_base_url()?.clone();
         url.path_segments_mut()
             .map_err(|_| protocol_error("provider endpoint is invalid"))?
             .extend(["pinning", "pinByHash"]);
@@ -286,34 +211,10 @@ impl PinataClient {
     }
 
     fn legacy_pin_file_url(&self) -> Result<Url, ProviderError> {
-        let mut url = self.validated_legacy_base_url()?.clone();
+        let mut url = self.validated_base_url()?.clone();
         url.path_segments_mut()
             .map_err(|_| protocol_error("provider endpoint is invalid"))?
             .extend(["pinning", "pinFileToIPFS"]);
-        Ok(url)
-    }
-
-    fn legacy_pin_list_url(&self, cid: &str) -> Result<Url, ProviderError> {
-        let mut url = self.validated_legacy_base_url()?.clone();
-        url.path_segments_mut()
-            .map_err(|_| protocol_error("provider endpoint is invalid"))?
-            .extend(["data", "pinList"]);
-        url.query_pairs_mut()
-            .append_pair("hashContains", cid)
-            .append_pair("pageLimit", "100")
-            .append_pair("status", "pinned");
-        Ok(url)
-    }
-
-    fn legacy_pin_jobs_url(&self, cid: &str, offset: usize) -> Result<Url, ProviderError> {
-        let mut url = self.validated_legacy_base_url()?.clone();
-        url.path_segments_mut()
-            .map_err(|_| protocol_error("provider endpoint is invalid"))?
-            .extend(["pinning", "pinJobs"]);
-        url.query_pairs_mut()
-            .append_pair("ipfs_pin_hash", cid)
-            .append_pair("limit", "100")
-            .append_pair("offset", &offset.to_string());
         Ok(url)
     }
 
@@ -384,7 +285,6 @@ impl PinataClient {
         let class = match status.as_u16() {
             401 => ProviderErrorClass::Authentication,
             403 => super::provider::classify_forbidden_response(response, self.upload_idle).await,
-            404 if operation == Operation::Get => ProviderErrorClass::NotFound,
             // Intentional divergence from the PSA baseline, which maps only 507 to
             // Quota: Pinata reports free-tier plan limits as 402.
             402 | 507 => ProviderErrorClass::Quota,
@@ -447,22 +347,47 @@ impl PinataClient {
         Ok(body)
     }
 
-    async fn list_files(&self, cid: Option<&str>) -> Result<Vec<PinataFile>, ProviderError> {
+    async fn completed_file_id(
+        &self,
+        cid: &str,
+        metadata: &BTreeMap<String, String>,
+    ) -> Result<String, ProviderError> {
+        if !metadata
+            .get("gateway_job_id")
+            .is_some_and(|id| !id.is_empty())
+        {
+            return Err(protocol_error(
+                "queue handle has no file correlation metadata",
+            ));
+        }
+        // A queue request can disappear when it becomes a file. Only its own
+        // submission metadata can authorize replacing the queue ID with a file ID.
         let mut page_token = None;
         let mut seen = std::collections::BTreeSet::new();
         let mut expected_count = None;
-        let mut files = Vec::new();
+        let mut file_count = 0;
+        let mut file_id = None;
         for _ in 0..10 {
             let response = self
                 .execute(
                     self.http.get(self.files_url(cid, page_token.as_deref())?),
-                    Operation::Find,
+                    Operation::Unpin,
                 )
                 .await?;
-            let response = self.require_success(response, Operation::Find).await?;
-            let page: PinataData<PinataFilesPage> = self.decode(response, Operation::Find).await?;
+            let response = self.require_success(response, Operation::Unpin).await?;
+            let page: PinataData<PinataFilesPage> = self.decode(response, Operation::Unpin).await?;
             check_page_count(&mut expected_count, page.data.count)?;
-            files.extend(page.data.files);
+            file_count += page.data.files.len();
+            for file in page.data.files {
+                if file.cid != cid {
+                    return Err(protocol_error("provider response failed pin correlation"));
+                }
+                if metadata_contains(&file.keyvalues, metadata)
+                    && file_id.replace(file.id).is_some()
+                {
+                    return Err(protocol_error("multiple files match the pin request"));
+                }
+            }
             page_token = page.data.next_page_token.filter(|token| !token.is_empty());
             if page_token
                 .as_ref()
@@ -471,87 +396,17 @@ impl PinataClient {
                 return Err(protocol_error("provider returned a pagination cycle"));
             }
             if page_token.is_none() {
-                if expected_count.is_some_and(|count| count != files.len()) {
+                if expected_count.is_some_and(|count| count != file_count) {
                     return Err(protocol_error("provider returned an incomplete file list"));
                 }
-                return Ok(files);
+                return file_id.ok_or_else(|| ProviderError {
+                    class: ProviderErrorClass::Transient,
+                    message: "provider has no file bound to the queue handle".to_owned(),
+                    retry_after: None,
+                });
             }
         }
         Err(protocol_error("provider returned an incomplete file list"))
-    }
-
-    async fn list_queue(&self, cid: Option<&str>) -> Result<Vec<PinataJob>, ProviderError> {
-        let mut page_token = None;
-        let mut seen = std::collections::BTreeSet::new();
-        let mut expected_count = None;
-        let mut jobs = Vec::new();
-        for _ in 0..10 {
-            let response = self
-                .execute(
-                    self.http.get(self.queue_url(cid, page_token.as_deref())?),
-                    Operation::Find,
-                )
-                .await?;
-            let response = self.require_success(response, Operation::Find).await?;
-            let page: PinataData<PinataQueuePage> = self.decode(response, Operation::Find).await?;
-            check_page_count(&mut expected_count, page.data.count)?;
-            jobs.extend(page.data.jobs);
-            page_token = page.data.next_page_token.filter(|token| !token.is_empty());
-            if page_token
-                .as_ref()
-                .is_some_and(|token| !seen.insert(token.clone()))
-            {
-                return Err(protocol_error("provider returned a pagination cycle"));
-            }
-            if page_token.is_none() {
-                if expected_count.is_some_and(|count| count != jobs.len()) {
-                    return Err(protocol_error("provider returned an incomplete pin queue"));
-                }
-                return Ok(jobs);
-            }
-        }
-        Err(protocol_error("provider returned an incomplete pin queue"))
-    }
-
-    async fn list_legacy_pins(&self, cid: &str) -> Result<Vec<LegacyPinRow>, ProviderError> {
-        let response = self
-            .execute(
-                self.http.get(self.legacy_pin_list_url(cid)?),
-                Operation::Find,
-            )
-            .await?;
-        let response = self.require_success(response, Operation::Find).await?;
-        let list: LegacyPinList = self.decode(response, Operation::Find).await?;
-        if list.rows.len() >= 100 || list.count.is_some_and(|count| count != list.rows.len()) {
-            return Err(protocol_error(
-                "provider returned an incomplete legacy file list",
-            ));
-        }
-        Ok(list.rows)
-    }
-
-    async fn list_legacy_jobs(&self, cid: &str) -> Result<Vec<LegacyPinJob>, ProviderError> {
-        let mut jobs = Vec::new();
-        for page in 0..10 {
-            let response = self
-                .execute(
-                    self.http.get(self.legacy_pin_jobs_url(cid, page * 100)?),
-                    Operation::Find,
-                )
-                .await?;
-            let response = self.require_success(response, Operation::Find).await?;
-            let list: LegacyPinJobs = self.decode(response, Operation::Find).await?;
-            let count = list.count;
-            let page_len = list.rows.len();
-            jobs.extend(list.rows);
-            if jobs.len() == count {
-                return Ok(jobs);
-            }
-            if jobs.len() > count || page_len < 100 {
-                return Err(protocol_error("provider returned an incomplete pin queue"));
-            }
-        }
-        Err(protocol_error("provider returned an incomplete pin queue"))
     }
 
     async fn submit_v3_cid(&self, request: SubmitPin) -> Result<RemotePin, ProviderError> {
@@ -568,11 +423,20 @@ impl PinataClient {
             .await?;
         let response = self.require_success(response, Operation::Submit).await?;
         let response: PinataData<PinataJob> = self.decode(response, Operation::Submit).await?;
-        let remote = self.remote_from_job_with_metadata(response.data, &request.metadata)?;
-        if remote.cid != request.cid {
+        let job = response.data;
+        self.validate_provider_field(&job.id)?;
+        self.validate_provider_field(&job.cid)?;
+        if job.cid != request.cid {
             return Err(protocol_error("provider response failed pin correlation"));
         }
-        Ok(remote)
+        let (status, failure_reason) = self.normalize_status(&job.status)?;
+        Ok(RemotePin {
+            request_id: encode_queue_handle(&job.id, &job.cid, &request.metadata),
+            cid: job.cid,
+            status,
+            raw_status: job.status,
+            failure_reason,
+        })
     }
 
     async fn submit_legacy_cid(&self, request: SubmitPin) -> Result<RemotePin, ProviderError> {
@@ -591,23 +455,10 @@ impl PinataClient {
             .await?;
         let response = self.require_success(response, Operation::Submit).await?;
         let pinned: LegacyPinResponse = self.decode(response, Operation::Submit).await?;
-        self.remote_from_legacy_pin_response(pinned, &request.cid, &request.metadata)
+        self.remote_from_legacy_pin_response(pinned, &request.cid)
     }
 
-    async fn submit_upload(&self, request: SubmitPin) -> Result<RemotePin, ProviderError> {
-        match self.api {
-            PinataApi::V3 => self
-                .submit_v3_upload(request)
-                .await
-                .map(|(remote, _)| remote),
-            PinataApi::Legacy => self.submit_legacy_upload(request).await,
-        }
-    }
-
-    async fn submit_v3_upload(
-        &self,
-        request: SubmitPin,
-    ) -> Result<(RemotePin, crate::pinning::identity::Ownership), ProviderError> {
+    async fn submit_v3_upload(&self, request: SubmitPin) -> Result<RemotePin, ProviderError> {
         let part = self.content_part(&request).await?;
         let keyvalues = serde_json::to_string(&request.metadata)
             .map_err(|_| protocol_error("pin metadata could not be encoded"))?;
@@ -623,22 +474,25 @@ impl PinataClient {
         let uploaded = uploaded.data;
         self.validate_provider_field(&uploaded.id)?;
         self.validate_provider_field(&uploaded.cid)?;
-        use crate::pinning::identity::Ownership;
-        let ownership = match uploaded.is_duplicate {
-            Some(false) => Ownership::ApplicationCreated,
-            Some(true) => Ownership::ExternalExisting,
-            None => Ownership::Unknown,
-        };
         if uploaded.cid != request.cid {
-            if ownership == Ownership::ApplicationCreated {
-                self.cleanup_uploaded_file(&uploaded.id).await;
+            if uploaded.is_duplicate == Some(false) {
+                // Cleanup must not mask the CID mismatch or remove an existing file.
+                let _ = self.delete_file(&uploaded.id).await;
             }
             return Err(upload_correlation_error());
         }
-        Ok((
-            self.remote_from_v3_upload(uploaded, &request.metadata)?,
-            ownership,
-        ))
+        let prefix = if uploaded.is_duplicate == Some(true) {
+            REUSED_PREFIX
+        } else {
+            V3_FILE_PREFIX
+        };
+        Ok(RemotePin {
+            request_id: format!("{prefix}{}", URL_SAFE_NO_PAD.encode(uploaded.id)),
+            cid: uploaded.cid,
+            status: RemotePinStatus::Pinned,
+            raw_status: "pinned".to_owned(),
+            failure_reason: None,
+        })
     }
 
     async fn submit_legacy_upload(&self, request: SubmitPin) -> Result<RemotePin, ProviderError> {
@@ -662,16 +516,20 @@ impl PinataClient {
         if pinned.ipfs_hash != request.cid {
             return Err(upload_correlation_error());
         }
-        self.remote_from_legacy_pin_response(pinned, &request.cid, &request.metadata)
+        self.remote_from_legacy_pin_response(pinned, &request.cid)
     }
 
-    /// Best-effort removal of an upload-strategy artifact whose CID did not match
-    /// the requested CID; failures must not mask the original mismatch error.
-    async fn cleanup_uploaded_file(&self, provider_id: &str) {
-        let Ok(url) = self.file_url(provider_id) else {
-            return;
-        };
-        let _ = self.execute(self.http.delete(url), Operation::Unpin).await;
+    async fn delete_file(&self, provider_id: &str) -> Result<(), ProviderError> {
+        let response = self
+            .execute(
+                self.http.delete(self.file_url(provider_id)?),
+                Operation::Unpin,
+            )
+            .await?;
+        if response.status() != StatusCode::NOT_FOUND {
+            self.require_success(response, Operation::Unpin).await?;
+        }
+        Ok(())
     }
 
     async fn content_part(&self, request: &SubmitPin) -> Result<multipart::Part, ProviderError> {
@@ -701,214 +559,28 @@ impl PinataClient {
             .map_err(|_| protocol_error("provider upload part could not be built"))
     }
 
-    async fn observe_v3(
-        &self,
-        request_id: &str,
-        reference: &PinataRequestRef,
-    ) -> Result<(RemotePin, Option<String>), ProviderError> {
-        let exact_file =
-            request_id.starts_with(V3_FILE_PREFIX) || self.strategy == PinataStrategy::Upload;
-        let mut matched = None;
-        for file in self.list_files(reference.cid.as_deref()).await? {
-            reference.ensure_file_correlation(&file)?;
-            let bound = if exact_file {
-                file.id == reference.provider_id
-            } else {
-                reference.metadata.as_ref().is_some_and(|m| {
-                    m.get("gateway_job_id").is_some_and(|id| !id.is_empty())
-                        && metadata_contains(&file.keyvalues, m)
-                })
-            };
-            if !bound && file.id != reference.provider_id {
-                continue;
-            }
-            if matched.replace((file, bound)).is_some() {
-                return Err(protocol_error(
-                    "multiple files match the historical pin request",
-                ));
-            }
-        }
-        if let Some((file, bound)) = matched {
-            let handle = reference
-                .metadata
-                .as_ref()
-                .filter(|_| bound && !exact_file)
-                .map(|m| encode_request_id_with_prefix(V3_FILE_PREFIX, &file.id, &file.cid, m));
-            return Ok((self.remote_from_file(file, request_id.to_owned())?, handle));
-        }
-        if request_id.starts_with(V3_FILE_PREFIX) {
-            return Err(ProviderError {
-                class: ProviderErrorClass::NotFound,
-                message: "provider file was not found".into(),
-                retry_after: None,
-            });
-        }
-        for job in self.list_queue(reference.cid.as_deref()).await? {
-            reference.ensure_job_correlation(&job)?;
-            if job.id == reference.provider_id {
-                return Ok((
-                    self.remote_from_job_with_request_id(job, request_id.to_owned())?,
-                    None,
-                ));
-            }
-        }
-        Err(ProviderError {
-            class: ProviderErrorClass::NotFound,
-            message: "provider request was not found".into(),
-            retry_after: None,
-        })
-    }
-
-    fn remote_from_job_with_metadata(
-        &self,
-        job: PinataJob,
-        metadata: &BTreeMap<String, String>,
-    ) -> Result<RemotePin, ProviderError> {
-        let request_id = encode_request_id(&job.id, &job.cid, metadata);
-        self.remote_from_job_with_request_id(job, request_id)
-    }
-
-    fn remote_from_job_with_request_id(
-        &self,
-        job: PinataJob,
-        request_id: String,
-    ) -> Result<RemotePin, ProviderError> {
-        self.validate_provider_field(&job.id)?;
-        self.validate_provider_field(&job.cid)?;
-        let (status, failure_reason) = self.normalize_status(&job.status)?;
-        Ok(RemotePin {
-            request_id,
-            cid: job.cid,
-            status,
-            raw_status: job.status,
-            failure_reason,
-        })
-    }
-
-    fn remote_from_file(
-        &self,
-        file: PinataFile,
-        request_id: String,
-    ) -> Result<RemotePin, ProviderError> {
-        self.validate_provider_field(&file.id)?;
-        self.validate_provider_field(&file.cid)?;
-        Ok(RemotePin {
-            request_id,
-            cid: file.cid,
-            status: RemotePinStatus::Pinned,
-            raw_status: "pinned".to_owned(),
-            failure_reason: None,
-        })
-    }
-
-    fn remote_from_v3_upload(
-        &self,
-        file: PinataFileUpload,
-        metadata: &BTreeMap<String, String>,
-    ) -> Result<RemotePin, ProviderError> {
-        self.validate_provider_field(&file.id)?;
-        self.validate_provider_field(&file.cid)?;
-        Ok(RemotePin {
-            request_id: encode_request_id_with_prefix(
-                V3_REQUEST_ID_PREFIX,
-                &file.id,
-                &file.cid,
-                metadata,
-            ),
-            cid: file.cid,
-            status: RemotePinStatus::Pinned,
-            raw_status: "pinned".to_owned(),
-            failure_reason: None,
-        })
-    }
-
     fn remote_from_legacy_pin_response(
         &self,
         pinned: LegacyPinResponse,
         expected_cid: &str,
-        metadata: &BTreeMap<String, String>,
     ) -> Result<RemotePin, ProviderError> {
         self.validate_provider_field(&pinned.ipfs_hash)?;
         if pinned.ipfs_hash != expected_cid {
             return Err(protocol_error("provider response failed pin correlation"));
         }
-        let provider_id = pinned.id.as_deref().unwrap_or(&pinned.ipfs_hash);
-        self.validate_provider_field(provider_id)?;
+        let prefix = if pinned.is_duplicate {
+            REUSED_PREFIX
+        } else {
+            LEGACY_REQUEST_ID_PREFIX
+        };
         let (status, failure_reason) = self.normalize_status(&pinned.status)?;
         Ok(RemotePin {
-            request_id: encode_request_id_with_prefix(
-                LEGACY_REQUEST_ID_PREFIX,
-                provider_id,
-                &pinned.ipfs_hash,
-                metadata,
-            ),
+            request_id: format!("{prefix}{}", URL_SAFE_NO_PAD.encode(&pinned.ipfs_hash)),
             cid: pinned.ipfs_hash,
             status,
             raw_status: pinned.status,
             failure_reason,
         })
-    }
-
-    fn remote_from_legacy_row(
-        &self,
-        row: LegacyPinRow,
-        request_id: String,
-    ) -> Result<RemotePin, ProviderError> {
-        self.validate_provider_field(&row.ipfs_pin_hash)?;
-        Ok(RemotePin {
-            request_id,
-            cid: row.ipfs_pin_hash,
-            status: RemotePinStatus::Pinned,
-            raw_status: "pinned".to_owned(),
-            failure_reason: None,
-        })
-    }
-
-    fn remote_from_legacy_row_with_metadata(
-        &self,
-        row: LegacyPinRow,
-        metadata: &BTreeMap<String, String>,
-    ) -> Result<RemotePin, ProviderError> {
-        self.validate_provider_field(&row.id)?;
-        self.validate_provider_field(&row.ipfs_pin_hash)?;
-        let request_id = encode_request_id_with_prefix(
-            LEGACY_REQUEST_ID_PREFIX,
-            &row.id,
-            &row.ipfs_pin_hash,
-            metadata,
-        );
-        self.remote_from_legacy_row(row, request_id)
-    }
-
-    fn remote_from_legacy_job_with_request_id(
-        &self,
-        job: LegacyPinJob,
-        request_id: String,
-    ) -> Result<RemotePin, ProviderError> {
-        self.validate_provider_field(&job.id)?;
-        self.validate_provider_field(&job.ipfs_pin_hash)?;
-        let (status, failure_reason) = self.normalize_status(&job.status)?;
-        Ok(RemotePin {
-            request_id,
-            cid: job.ipfs_pin_hash,
-            status,
-            raw_status: job.status,
-            failure_reason,
-        })
-    }
-
-    fn remote_from_legacy_job_with_metadata(
-        &self,
-        job: LegacyPinJob,
-        metadata: &BTreeMap<String, String>,
-    ) -> Result<RemotePin, ProviderError> {
-        let request_id = encode_request_id_with_prefix(
-            LEGACY_REQUEST_ID_PREFIX,
-            &job.id,
-            &job.ipfs_pin_hash,
-            metadata,
-        );
-        self.remote_from_legacy_job_with_request_id(job, request_id)
     }
 
     fn normalize_status(
@@ -929,53 +601,6 @@ impl PinataClient {
             .then(|| self.bounded_token_free_reason(status))
             .flatten();
         Ok((normalized, failure_reason))
-    }
-
-    fn request_ref(&self, request_id: &str) -> Result<PinataRequestRef, ProviderError> {
-        if let Some(encoded) = request_id
-            .strip_prefix(V3_FILE_PREFIX)
-            .or_else(|| request_id.strip_prefix(V3_REQUEST_ID_PREFIX))
-        {
-            let parts = encoded.split(':').collect::<Vec<_>>();
-            if parts.len() != 3 {
-                return Err(protocol_error("provider request ID is invalid"));
-            }
-            let provider_id = decode_request_component(parts[0])?;
-            let cid = decode_request_component(parts[1])?;
-            let metadata = decode_request_metadata(parts[2])?;
-            self.validate_provider_field(&provider_id)?;
-            self.validate_provider_field(&cid)?;
-            return Ok(PinataRequestRef {
-                api: PinataApi::V3,
-                provider_id,
-                cid: Some(cid),
-                metadata: Some(metadata),
-            });
-        }
-        if let Some(encoded) = request_id.strip_prefix(LEGACY_REQUEST_ID_PREFIX) {
-            let parts = encoded.split(':').collect::<Vec<_>>();
-            if parts.len() != 3 {
-                return Err(protocol_error("provider request ID is invalid"));
-            }
-            let provider_id = decode_request_component(parts[0])?;
-            let cid = decode_request_component(parts[1])?;
-            let metadata = decode_request_metadata(parts[2])?;
-            self.validate_provider_field(&provider_id)?;
-            self.validate_provider_field(&cid)?;
-            return Ok(PinataRequestRef {
-                api: PinataApi::Legacy,
-                provider_id,
-                cid: Some(cid),
-                metadata: Some(metadata),
-            });
-        }
-        self.validate_provider_field(request_id)?;
-        Err(ProviderError {
-            class: ProviderErrorClass::Protocol,
-            message: "legacy Pinata PSA request ID requires a /psa endpoint or migration"
-                .to_owned(),
-            retry_after: None,
-        })
     }
 
     fn validate_provider_field(&self, value: &str) -> Result<(), ProviderError> {
@@ -1031,412 +656,70 @@ impl PinningProvider for PinataClient {
         &self.name
     }
 
-    fn invocation_route(&self) -> (&'static str, &'static str) {
-        if self.legacy_psa.is_some() {
-            return ("psa", "cid");
-        }
-        (
-            match self.api {
-                PinataApi::V3 => "pinata_v3",
-                PinataApi::Legacy => "pinata_legacy",
-            },
-            match self.strategy {
-                PinataStrategy::Cid => "cid",
-                PinataStrategy::Upload => "upload",
-            },
-        )
-    }
-
-    async fn find_historical(
-        &self,
-        query: FindPin,
-        api: &str,
-        strategy: &str,
-    ) -> Result<Vec<RemotePin>, ProviderError> {
-        if api == "psa" {
-            return match self
-                .legacy_psa
-                .as_ref()
-                .or(self.legacy_request_psa.as_ref())
-            {
-                Some(psa) if strategy == "cid" => psa.find(query).await,
-                _ => Err(protocol_error("historical provider route unavailable")),
-            };
-        }
-        let mut historical = self.clone();
-        historical.legacy_psa = None;
-        historical.api = match api {
-            "pinata_v3" => PinataApi::V3,
-            "pinata_legacy" => PinataApi::Legacy,
-            _ => return Err(protocol_error("historical provider route unavailable")),
-        };
-        historical.strategy = match strategy {
-            "cid" => PinataStrategy::Cid,
-            "upload" => PinataStrategy::Upload,
-            _ => return Err(protocol_error("historical provider route unavailable")),
-        };
-        historical.find(query).await
-    }
-
     async fn submit(&self, request: SubmitPin) -> Result<RemotePin, ProviderError> {
-        if let Some(legacy) = &self.legacy_psa {
-            return legacy.submit(request).await;
+        if let Some(psa) = &self.psa {
+            return psa.submit(request).await;
         }
         match (self.api, self.strategy) {
             (PinataApi::V3, PinataStrategy::Cid) => self.submit_v3_cid(request).await,
             (PinataApi::Legacy, PinataStrategy::Cid) => self.submit_legacy_cid(request).await,
-            (_, PinataStrategy::Upload) => self.submit_upload(request).await,
+            (PinataApi::V3, PinataStrategy::Upload) => self.submit_v3_upload(request).await,
+            (PinataApi::Legacy, PinataStrategy::Upload) => self.submit_legacy_upload(request).await,
         }
-    }
-
-    async fn submit_observed(
-        &self,
-        request: SubmitPin,
-    ) -> crate::pinning::provider::SubmitObservation {
-        use crate::pinning::{
-            identity::RemoteResourceType,
-            provider::{ObservedResource, ObservedResourceStatus, SubmitObservation},
-        };
-        if let Some(psa) = &self.legacy_psa {
-            return psa.submit_observed(request).await;
-        }
-        if (self.api, self.strategy) != (PinataApi::V3, PinataStrategy::Upload) {
-            return self.submit(request).await.into();
-        }
-        match self.submit_v3_upload(request).await {
-            Ok((remote, ownership)) => {
-                let resource = ObservedResource {
-                    resource_type: RemoteResourceType::HostedFile,
-                    cid: remote.cid.clone(),
-                    request_id: remote.request_id.clone(),
-                    status: ObservedResourceStatus::Stored,
-                    ownership,
-                    replica_evidence: None,
-                };
-                let mut observation = SubmitObservation::from(Ok(remote));
-                observation.resources.push(resource);
-                observation
-            }
-            Err(error) => Err(error).into(),
-        }
-    }
-
-    async fn get_historical(
-        &self,
-        request_id: &str,
-        api: &str,
-        strategy: &str,
-    ) -> Result<RemotePin, ProviderError> {
-        self.historical(api, strategy)?.get(request_id).await
-    }
-
-    async fn get_observed(&self, id: &str) -> crate::pinning::provider::PinObservation {
-        use crate::pinning::{
-            identity::{Ownership, RemoteResourceType},
-            provider::{ObservedResource, ObservedResourceStatus, PinObservation},
-        };
-        let mut resources = Vec::new();
-        let result = if self.legacy_psa.is_none() && id.starts_with(V3_REQUEST_ID_PREFIX) {
-            async {
-                let (remote, file) = self.observe_v3(id, &self.request_ref(id)?).await?;
-                if let Some(handle) = file {
-                    resources.push(ObservedResource {
-                        resource_type: RemoteResourceType::HostedFile,
-                        cid: remote.cid.clone(),
-                        request_id: handle,
-                        status: ObservedResourceStatus::Stored,
-                        ownership: Ownership::Unknown,
-                        replica_evidence: None,
-                    });
-                }
-                Ok(remote)
-            }
-            .await
-        } else {
-            self.get(id).await
-        };
-        PinObservation { result, resources }
-    }
-
-    async fn get_observed_historical(
-        &self,
-        id: &str,
-        api: &str,
-        strategy: &str,
-    ) -> crate::pinning::provider::PinObservation {
-        match self.historical(api, strategy) {
-            Ok(provider) => provider.get_observed(id).await,
-            Err(error) => crate::pinning::provider::PinObservation {
-                result: Err(error),
-                resources: Vec::new(),
-            },
-        }
-    }
-
-    async fn unpin_owned(&self, id: &str) -> Result<(), ProviderError> {
-        if self.api == PinataApi::V3
-            && self.legacy_psa.is_none()
-            && self.strategy == PinataStrategy::Cid
-            && id.starts_with(V3_REQUEST_ID_PREFIX)
-            && !id.starts_with(V3_FILE_PREFIX)
-        {
-            let queue = self.request_ref(id)?;
-            let url = self.pin_by_cid_request_url(&queue.provider_id)?;
-            let response = self
-                .execute(self.http.delete(url), Operation::Unpin)
-                .await?;
-            if response.status() == StatusCode::NOT_FOUND {
-                // The queue entry may have become a file before its first poll.
-                let (_, file) = self.observe_v3(id, &queue).await.map_err(|err| {
-                    if err.class == ProviderErrorClass::NotFound {
-                        protocol_error("queue request unavailable without a bound completed file")
-                    } else {
-                        err
-                    }
-                })?;
-                let file = file.ok_or_else(|| {
-                    protocol_error("queue request unavailable without a bound completed file")
-                })?;
-                return self.unpin(&file).await;
-            }
-            self.require_success(response, Operation::Unpin).await?;
-            return Ok(());
-        }
-        if self.api != PinataApi::Legacy || self.legacy_psa.is_some() {
-            return self.unpin(id).await;
-        }
-        let reference = self.request_ref(id)?;
-        let cid = reference
-            .cid
-            .filter(|_| reference.api == PinataApi::Legacy)
-            .ok_or_else(|| protocol_error("missing historical legacy CID"))?;
-        let mut url = self.validated_legacy_base_url()?.clone();
-        url.path_segments_mut()
-            .map_err(|_| protocol_error("invalid legacy endpoint"))?
-            .extend(["pinning", "unpin", &cid]);
-        let response = self
-            .execute(self.http.delete(url), Operation::Unpin)
-            .await?;
-        if response.status() != StatusCode::NOT_FOUND {
-            self.require_success(response, Operation::Unpin).await?;
-        }
-        Ok(())
-    }
-
-    async fn unpin_historical(
-        &self,
-        request_id: &str,
-        api: &str,
-        strategy: &str,
-    ) -> Result<(), ProviderError> {
-        self.historical(api, strategy)?
-            .unpin_owned(request_id)
-            .await
-    }
-
-    async fn get(&self, request_id: &str) -> Result<RemotePin, ProviderError> {
-        if let Some(legacy) = &self.legacy_psa {
-            return legacy.get(request_id).await;
-        }
-        if !request_id.starts_with(V3_REQUEST_ID_PREFIX)
-            && !request_id.starts_with(LEGACY_REQUEST_ID_PREFIX)
-        {
-            self.validate_provider_field(request_id)?;
-            if let Some(legacy) = &self.legacy_request_psa {
-                return legacy.get(request_id).await;
-            }
-        }
-        let reference = self.request_ref(request_id)?;
-        if reference.api == PinataApi::V3 {
-            return self
-                .observe_v3(request_id, &reference)
-                .await
-                .map(|(remote, _)| remote);
-        }
-        if reference.api == PinataApi::Legacy
-            && let Some(cid) = reference.cid.as_deref()
-        {
-            for row in self.list_legacy_pins(cid).await? {
-                if row.ipfs_pin_hash != cid {
-                    return Err(protocol_error("provider response failed pin correlation"));
-                }
-                if reference.matches_legacy(&row) {
-                    return self.remote_from_legacy_row(row, request_id.to_owned());
-                }
-            }
-            for job in self.list_legacy_jobs(cid).await? {
-                if job.ipfs_pin_hash != cid {
-                    return Err(protocol_error("provider response failed pin correlation"));
-                }
-                if job.id == reference.provider_id {
-                    return self.remote_from_legacy_job_with_request_id(job, request_id.to_owned());
-                }
-            }
-        }
-        Err(ProviderError {
-            class: ProviderErrorClass::NotFound,
-            message: "provider request was not found".to_owned(),
-            retry_after: None,
-        })
-    }
-
-    async fn find(&self, query: FindPin) -> Result<Vec<RemotePin>, ProviderError> {
-        if let Some(legacy) = &self.legacy_psa {
-            return legacy.find(query).await;
-        }
-        let mut remotes = Vec::new();
-        if self.api == PinataApi::V3 {
-            let files = self.list_files(Some(&query.cid)).await?;
-            for file in files {
-                if file.cid != query.cid {
-                    return Err(protocol_error("provider response failed pin correlation"));
-                }
-                if metadata_contains(&file.keyvalues, &query.metadata) {
-                    let request_id = encode_request_id(&file.id, &file.cid, &query.metadata);
-                    remotes.push(self.remote_from_file(file, request_id)?);
-                }
-            }
-            let known_ids = remotes
-                .iter()
-                .filter_map(|remote| self.request_ref(&remote.request_id).ok())
-                .map(|reference| reference.provider_id)
-                .collect::<std::collections::BTreeSet<_>>();
-            let jobs = if self.strategy == PinataStrategy::Cid {
-                self.list_queue(Some(&query.cid)).await?
-            } else {
-                Vec::new()
-            };
-            for job in jobs {
-                if job.cid != query.cid {
-                    return Err(protocol_error("provider response failed pin correlation"));
-                }
-                if !known_ids.contains(&job.id)
-                    && metadata_contains(&job.keyvalues, &query.metadata)
-                {
-                    remotes.push(self.remote_from_job_with_metadata(job, &query.metadata)?);
-                }
-            }
-        }
-        if remotes.iter().any(|remote| remote.cid != query.cid) {
-            return Err(protocol_error("provider response failed pin correlation"));
-        }
-        if self.api == PinataApi::Legacy {
-            for row in self.list_legacy_pins(&query.cid).await? {
-                if row.ipfs_pin_hash != query.cid {
-                    return Err(protocol_error("provider response failed pin correlation"));
-                }
-                if metadata_contains(&row.metadata.keyvalues, &query.metadata) {
-                    remotes.push(self.remote_from_legacy_row_with_metadata(row, &query.metadata)?);
-                }
-            }
-            let jobs = if self.strategy == PinataStrategy::Cid {
-                self.list_legacy_jobs(&query.cid).await?
-            } else {
-                Vec::new()
-            };
-            for job in jobs {
-                if job.ipfs_pin_hash != query.cid {
-                    return Err(protocol_error("provider response failed pin correlation"));
-                }
-                if metadata_contains(&job.keyvalues, &query.metadata) {
-                    remotes.push(self.remote_from_legacy_job_with_metadata(job, &query.metadata)?);
-                }
-            }
-        }
-        Ok(remotes)
     }
 
     async fn unpin(&self, request_id: &str) -> Result<(), ProviderError> {
-        if let Some(legacy) = &self.legacy_psa {
-            return legacy.unpin(request_id).await;
+        if let Some(psa) = &self.psa {
+            return psa.unpin(request_id).await;
         }
-        if !request_id.starts_with(V3_REQUEST_ID_PREFIX)
-            && !request_id.starts_with(LEGACY_REQUEST_ID_PREFIX)
-        {
-            self.validate_provider_field(request_id)?;
-            if let Some(legacy) = &self.legacy_request_psa {
-                return legacy.unpin(request_id).await;
+        if request_id.starts_with(REUSED_PREFIX) {
+            return Ok(());
+        }
+        if self.api == PinataApi::Legacy {
+            let encoded = request_id
+                .strip_prefix(LEGACY_REQUEST_ID_PREFIX)
+                .ok_or_else(|| protocol_error("invalid legacy CID handle"))?;
+            let cid = decode_request_component(encoded)?;
+            self.validate_provider_field(&cid)?;
+            let mut url = self.validated_base_url()?.clone();
+            url.path_segments_mut()
+                .map_err(|_| protocol_error("provider endpoint is invalid"))?
+                .extend(["pinning", "unpin", &cid]);
+            let response = self
+                .execute(self.http.delete(url), Operation::Unpin)
+                .await?;
+            if response.status() != StatusCode::NOT_FOUND {
+                self.require_success(response, Operation::Unpin).await?;
             }
+            return Ok(());
         }
-        let reference = self.request_ref(request_id)?;
-        if reference.api == PinataApi::Legacy {
-            return Err(protocol_error(
-                "provider only supports deletion by shared CID",
-            ));
+        if let Some(encoded) = request_id.strip_prefix(V3_FILE_PREFIX) {
+            return self.delete_file(&decode_request_component(encoded)?).await;
         }
+        let queue = request_id
+            .strip_prefix(V3_QUEUE_PREFIX)
+            .ok_or_else(|| protocol_error("provider request ID is invalid"))?;
+        let (id, cid, metadata) = decode_queue_handle(queue)?;
+        self.validate_provider_field(&cid)?;
         let response = self
             .execute(
-                self.http.delete(self.file_url(&reference.provider_id)?),
+                self.http.delete(self.pin_by_cid_request_url(&id)?),
                 Operation::Unpin,
             )
             .await?;
-        if response.status() == StatusCode::NOT_FOUND {
-            if self.strategy == PinataStrategy::Upload || request_id.starts_with(V3_FILE_PREFIX) {
-                return Ok(());
-            }
-            // A historical pin-by-CID handle can denote a queue request instead
-            // of a file. Never replace that handle with another file of the CID.
-            let cancel = self
-                .execute(
-                    self.http
-                        .delete(self.pin_by_cid_request_url(&reference.provider_id)?),
-                    Operation::Unpin,
-                )
-                .await?;
-            if cancel.status() == StatusCode::NOT_FOUND {
-                return Err(ProviderError {
-                    class: ProviderErrorClass::Transient,
-                    message: "provider has no deletable file or queued request for this handle"
-                        .into(),
-                    retry_after: None,
-                });
-            }
-            self.require_success(cancel, Operation::Unpin).await?;
+        if response.status() != StatusCode::NOT_FOUND {
+            self.require_success(response, Operation::Unpin).await?;
             return Ok(());
         }
-        self.require_success(response, Operation::Unpin).await?;
-        Ok(())
+        let file_id = self.completed_file_id(&cid, &metadata).await?;
+        self.delete_file(&file_id).await
     }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Operation {
     Submit,
-    Get,
-    Find,
     Unpin,
-}
-
-struct PinataRequestRef {
-    api: PinataApi,
-    provider_id: String,
-    cid: Option<String>,
-    metadata: Option<BTreeMap<String, String>>,
-}
-
-impl PinataRequestRef {
-    fn ensure_file_correlation(&self, file: &PinataFile) -> Result<(), ProviderError> {
-        if self.cid.as_deref().is_some_and(|cid| file.cid != cid) {
-            return Err(protocol_error("provider response failed pin correlation"));
-        }
-        Ok(())
-    }
-
-    fn ensure_job_correlation(&self, job: &PinataJob) -> Result<(), ProviderError> {
-        if self.cid.as_deref().is_some_and(|cid| job.cid != cid) {
-            return Err(protocol_error("provider response failed pin correlation"));
-        }
-        Ok(())
-    }
-
-    fn matches_legacy(&self, row: &LegacyPinRow) -> bool {
-        row.id == self.provider_id
-            || self.cid.as_deref() == Some(row.ipfs_pin_hash.as_str())
-                && self
-                    .metadata
-                    .as_ref()
-                    .is_some_and(|metadata| metadata_contains(&row.metadata.keyvalues, metadata))
-    }
 }
 
 #[derive(Serialize)]
@@ -1456,18 +739,6 @@ struct PinataJob {
     id: String,
     cid: String,
     status: String,
-    #[serde(default)]
-    keyvalues: BTreeMap<String, String>,
-}
-
-#[derive(Deserialize)]
-struct PinataQueuePage {
-    #[serde(default)]
-    count: Option<usize>,
-    #[serde(default, deserialize_with = "nullable_list")]
-    jobs: Vec<PinataJob>,
-    #[serde(default, alias = "nextPageToken")]
-    next_page_token: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1532,95 +803,47 @@ struct LegacyPinMetadata<'a> {
 struct LegacyPinResponse {
     #[serde(rename = "IpfsHash", alias = "ipfsHash")]
     ipfs_hash: String,
-    #[serde(rename = "ID", alias = "id", default)]
-    id: Option<String>,
+    #[serde(rename = "isDuplicate", alias = "is_duplicate", default)]
+    is_duplicate: bool,
     #[serde(default = "pinned_status")]
     status: String,
-}
-
-#[derive(Deserialize)]
-struct LegacyPinList {
-    #[serde(default)]
-    count: Option<usize>,
-    #[serde(default, deserialize_with = "nullable_list")]
-    rows: Vec<LegacyPinRow>,
-}
-
-#[derive(Deserialize)]
-struct LegacyPinRow {
-    #[serde(default)]
-    id: String,
-    #[serde(rename = "ipfs_pin_hash")]
-    ipfs_pin_hash: String,
-    #[serde(default)]
-    metadata: LegacyPinRowMetadata,
-}
-
-#[derive(Default, Deserialize)]
-struct LegacyPinRowMetadata {
-    #[serde(default)]
-    keyvalues: BTreeMap<String, String>,
-}
-
-#[derive(Deserialize)]
-struct LegacyPinJobs {
-    #[serde(default)]
-    count: usize,
-    #[serde(default, deserialize_with = "nullable_list")]
-    rows: Vec<LegacyPinJob>,
-}
-
-#[derive(Deserialize)]
-struct LegacyPinJob {
-    id: String,
-    ipfs_pin_hash: String,
-    status: String,
-    #[serde(default)]
-    keyvalues: BTreeMap<String, String>,
 }
 
 fn pinned_status() -> String {
     "pinned".to_owned()
 }
 
-pub(crate) fn submission_correlation(
-    id: &str,
-    expected_cid: &str,
-    profile: &str,
-) -> Option<String> {
-    let prefix = match profile {
-        "pinata-legacy" => LEGACY_REQUEST_ID_PREFIX,
-        "pinata-v3" if id.starts_with(V3_FILE_PREFIX) => V3_FILE_PREFIX,
-        "pinata-v3" => V3_REQUEST_ID_PREFIX,
-        _ => return None,
-    };
-    let mut parts = id.strip_prefix(prefix)?.split(':');
-    let file = decode_request_component(parts.next()?).ok()?;
-    let cid = decode_request_component(parts.next()?).ok()?;
-    let mut metadata = decode_request_metadata(parts.next()?).ok()?;
-    if file.is_empty() || cid != expected_cid || parts.next().is_some() {
-        return None;
-    }
-    metadata.remove("gateway_job_id")
-}
-
-fn encode_request_id(provider_id: &str, cid: &str, metadata: &BTreeMap<String, String>) -> String {
-    encode_request_id_with_prefix(V3_REQUEST_ID_PREFIX, provider_id, cid, metadata)
-}
-
-fn encode_request_id_with_prefix(
-    prefix: &str,
+fn encode_queue_handle(
     provider_id: &str,
     cid: &str,
     metadata: &BTreeMap<String, String>,
 ) -> String {
     let metadata = serde_json::to_vec(metadata).expect("Pinata metadata must serialize");
     format!(
-        "{prefix}{}:{}:{}",
+        "{V3_QUEUE_PREFIX}{}:{}:{}",
         URL_SAFE_NO_PAD.encode(provider_id),
         URL_SAFE_NO_PAD.encode(cid),
         URL_SAFE_NO_PAD.encode(metadata)
     )
+}
+
+fn decode_queue_handle(
+    encoded: &str,
+) -> Result<(String, String, BTreeMap<String, String>), ProviderError> {
+    let mut parts = encoded.split(':');
+    let (Some(id), Some(cid), Some(metadata), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(protocol_error("provider request ID is invalid"));
+    };
+    let metadata = decode_request_component(metadata)?;
+    let metadata = serde_json::from_str(&metadata)
+        .map_err(|_| protocol_error("provider request ID is invalid"))?;
+    Ok((
+        decode_request_component(id)?,
+        decode_request_component(cid)?,
+        metadata,
+    ))
 }
 
 fn safe_file_name(name: &str) -> String {
@@ -1645,13 +868,6 @@ fn decode_request_component(value: &str) -> Result<String, ProviderError> {
         .decode(value)
         .map_err(|_| protocol_error("provider request ID is invalid"))?;
     String::from_utf8(bytes).map_err(|_| protocol_error("provider request ID is invalid"))
-}
-
-fn decode_request_metadata(value: &str) -> Result<BTreeMap<String, String>, ProviderError> {
-    let bytes = URL_SAFE_NO_PAD
-        .decode(value)
-        .map_err(|_| protocol_error("provider request ID is invalid"))?;
-    serde_json::from_slice(&bytes).map_err(|_| protocol_error("provider request ID is invalid"))
 }
 
 fn metadata_contains(
@@ -1685,60 +901,6 @@ fn normalize_base(mut endpoint: String) -> String {
         endpoint.pop();
     }
     endpoint
-}
-
-fn pinata_v3_endpoint(endpoint: &str) -> String {
-    let normalized = normalize_base(endpoint.to_owned());
-    let Ok(mut url) = Url::parse(&normalized) else {
-        return normalized;
-    };
-    let path_ends_with_v3 = url.path().rsplit('/').next() == Some("v3");
-    if path_ends_with_v3 {
-        return normalized;
-    }
-    let Some(mut segments) = url.path_segments_mut().ok() else {
-        return normalized;
-    };
-    segments.pop_if_empty();
-    segments.push("v3");
-    drop(segments);
-    normalize_base(url.to_string())
-}
-
-fn pinata_legacy_endpoint(endpoint: &str) -> String {
-    let normalized = normalize_base(endpoint.to_owned());
-    let Ok(mut url) = Url::parse(&normalized) else {
-        return normalized;
-    };
-    let path_ends_with_v3 = url.path().rsplit('/').next() == Some("v3");
-    if !path_ends_with_v3 {
-        return normalized;
-    }
-    let Some(mut segments) = url.path_segments_mut().ok() else {
-        return normalized;
-    };
-    segments.pop_if_empty();
-    segments.pop();
-    drop(segments);
-    normalize_base(url.to_string())
-}
-
-fn pinata_legacy_psa_endpoint(endpoint: &str) -> String {
-    let normalized = normalize_base(endpoint.to_owned());
-    let Ok(mut url) = Url::parse(&normalized) else {
-        return normalized;
-    };
-    let path_ends_with_v3 = url.path().rsplit('/').next() == Some("v3");
-    let Some(mut segments) = url.path_segments_mut().ok() else {
-        return normalized;
-    };
-    segments.pop_if_empty();
-    if path_ends_with_v3 {
-        segments.pop();
-    }
-    segments.push("psa");
-    drop(segments);
-    normalize_base(url.to_string())
 }
 
 fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
@@ -1790,8 +952,10 @@ mod tests {
         kubo::KuboClient,
         pinning::{
             config::{PinataApi, PinataProviderOptions, PinataStrategy},
-            pinata::{PINATA_BASE_URL, build_pinata, build_pinata_with_options, encode_request_id},
-            provider::{FindPin, PinningProvider, ProviderErrorClass, RemotePinStatus, SubmitPin},
+            pinata::{
+                PINATA_BASE_URL, build_pinata, build_pinata_with_options, encode_queue_handle,
+            },
+            provider::{PinningProvider, ProviderErrorClass, RemotePinStatus, SubmitPin},
             psa::test_token,
         },
     };
@@ -1841,80 +1005,6 @@ mod tests {
             .expect("idle upload must release its slot before outer deadline")
             .unwrap_err();
         assert_eq!(error.class, ProviderErrorClass::Ambiguous);
-        assert_eq!(requests(&server).await.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn stage1_nullable_lists_and_camel_pagination_are_complete() {
-        for empty in [json!(null), json!([])] {
-            let server = MockServer::start().await;
-            Mock::given(method("GET"))
-                .and(path("/v3/files/public"))
-                .respond_with(
-                    ResponseTemplate::new(200).set_body_json(json!({"data":{"files":empty}})),
-                )
-                .mount(&server)
-                .await;
-            Mock::given(method("GET"))
-                .and(path("/v3/files/public/pin_by_cid"))
-                .respond_with(
-                    ResponseTemplate::new(200).set_body_json(json!({"data":{"jobs":empty}})),
-                )
-                .mount(&server)
-                .await;
-            assert!(
-                provider(&server)
-                    .find(FindPin::for_job("cid", "job-7"))
-                    .await
-                    .unwrap()
-                    .is_empty()
-            );
-            assert_eq!(requests(&server).await.len(), 2);
-        }
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v3/files/public"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({"data":{"files":[],"nextPageToken":"again"}})),
-            )
-            .mount(&server)
-            .await;
-        assert!(
-            provider(&server)
-                .find(FindPin::for_job("cid", "job-7"))
-                .await
-                .is_err()
-        );
-        assert_eq!(
-            requests(&server).await.len(),
-            2,
-            "cycle must be detected before repeating HTTP"
-        );
-    }
-
-    #[tokio::test]
-    async fn stage1_upload_find_never_calls_cid_queue() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v3/files/public"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":{"files":[]}})))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/v3/files/public/pin_by_cid"))
-            .respond_with(ResponseTemplate::new(403))
-            .mount(&server)
-            .await;
-        let mut client = provider(&server);
-        client.strategy = PinataStrategy::Upload;
-        assert!(
-            client
-                .find(FindPin::for_job("cid", "job-7"))
-                .await
-                .unwrap()
-                .is_empty()
-        );
         assert_eq!(requests(&server).await.len(), 1);
     }
 
@@ -1991,290 +1081,81 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn submit_get_find_and_unpin_use_the_v3_resource_api() {
+    async fn configured_psa_endpoint_uses_exact_request_acks() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/v3/files/public/pin_by_cid"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": job("request-7", "prechecking", "bafy-target"),
+            .and(path("/psa/pins"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({
+                "requestid": "request-7", "status": "queued", "pin": {"cid": "bafy-target"},
             })))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/v3/files/public"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": {
-                    "files": [{
-                        "id": "request-7",
-                        "cid": "bafy-target",
-                        "keyvalues": {
-                            "gateway_job_id": "job-7",
-                            "gateway_lease_id": "lease-7",
-                        },
-                    }],
-                },
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/v3/files/public/pin_by_cid"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": { "jobs": [] },
-            })))
+            .expect(1)
             .mount(&server)
             .await;
         Mock::given(method("DELETE"))
-            .and(path("/v3/files/public/request-7"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": null })))
-            .mount(&server)
-            .await;
-
-        let provider = provider(&server);
-        let submitted = provider
-            .submit(SubmitPin {
-                cid: "bafy-target".to_owned(),
-                name: "bucket/key".to_owned(),
-                metadata: BTreeMap::from([
-                    ("gateway_job_id".to_owned(), "job-7".to_owned()),
-                    ("gateway_lease_id".to_owned(), "lease-7".to_owned()),
-                ]),
-            })
-            .await
-            .unwrap();
-        let expected_request_id = encode_request_id(
-            "request-7",
-            "bafy-target",
-            &BTreeMap::from([
-                ("gateway_job_id".to_owned(), "job-7".to_owned()),
-                ("gateway_lease_id".to_owned(), "lease-7".to_owned()),
-            ]),
-        );
-        assert_eq!(submitted.request_id, expected_request_id);
-        assert_eq!(submitted.status, RemotePinStatus::Pinning);
-        assert_eq!(submitted.raw_status, "prechecking");
-        assert_eq!(
-            provider.get(&submitted.request_id).await.unwrap().status,
-            RemotePinStatus::Pinned
-        );
-        assert_eq!(
-            provider
-                .find(FindPin::for_job("bafy-target", "job-7"))
-                .await
-                .unwrap()[0]
-                .status,
-            RemotePinStatus::Pinned
-        );
-        provider.unpin(&submitted.request_id).await.unwrap();
-
-        let received = requests(&server).await;
-        assert!(received.iter().all(|request| {
-            request
-                .headers
-                .get("authorization")
-                .and_then(|value| value.to_str().ok())
-                == Some("Bearer provider-token")
-        }));
-        let post = received
-            .iter()
-            .find(|request| request.method.as_str() == "POST")
-            .unwrap();
-        assert_eq!(post.url.path(), "/v3/files/public/pin_by_cid");
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&post.body).unwrap(),
-            json!({
-                "cid": "bafy-target",
-                "name": "bucket/key",
-                "keyvalues": {
-                    "gateway_job_id": "job-7",
-                    "gateway_lease_id": "lease-7",
-                },
-            })
-        );
-        assert!(received.iter().any(|request| {
-            request.method.as_str() == "GET" && request.url.path() == "/v3/files/public"
-        }));
-        assert!(received.iter().any(|request| {
-            request.method.as_str() == "DELETE"
-                && request.url.path() == "/v3/files/public/request-7"
-        }));
-    }
-
-    #[tokio::test]
-    async fn find_uses_the_pin_by_cid_queue_when_the_file_is_not_pinned_yet() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v3/files/public"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": { "files": [] },
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/v3/files/public/pin_by_cid"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": { "jobs": [job("request-7", "searching", "bafy-target")] },
-            })))
-            .mount(&server)
-            .await;
-
-        let found = provider(&server)
-            .find(FindPin::for_job("bafy-target", "job-7"))
-            .await
-            .unwrap();
-
-        assert_eq!(found.len(), 1);
-        assert_eq!(
-            found[0].request_id,
-            encode_request_id(
-                "request-7",
-                "bafy-target",
-                &BTreeMap::from([("gateway_job_id".to_owned(), "job-7".to_owned())]),
-            )
-        );
-        assert_eq!(found[0].status, RemotePinStatus::Pinning);
-        let received = requests(&server).await;
-        for request in received {
-            let query = request
-                .url
-                .query_pairs()
-                .map(|(key, value)| (key.into_owned(), value.into_owned()))
-                .collect::<BTreeMap<_, _>>();
-            assert_eq!(query.get("cid"), Some(&"bafy-target".to_owned()));
-            assert_eq!(query.get("limit"), Some(&"100".to_owned()));
-        }
-    }
-
-    #[tokio::test]
-    async fn get_preserves_the_original_request_id_when_queue_metadata_changes() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v3/files/public"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": { "files": [] },
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/v3/files/public/pin_by_cid"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": {
-                    "jobs": [{
-                        "id": "request-7",
-                        "cid": "bafy-target",
-                        "status": "searching",
-                        "keyvalues": {
-                            "gateway_job_id": "job-7",
-                            "provider_extra": "provider-token"
-                        }
-                    }]
-                },
-            })))
-            .mount(&server)
-            .await;
-
-        let original_request_id = encode_request_id(
-            "request-7",
-            "bafy-target",
-            &BTreeMap::from([
-                ("gateway_job_id".to_owned(), "job-7".to_owned()),
-                ("gateway_lease_id".to_owned(), "lease-7".to_owned()),
-            ]),
-        );
-
-        let remote = provider(&server).get(&original_request_id).await.unwrap();
-
-        assert_eq!(remote.request_id, original_request_id);
-        assert_eq!(remote.status, RemotePinStatus::Pinning);
-        assert!(!remote.request_id.contains("provider-token"));
-    }
-
-    #[tokio::test]
-    async fn legacy_psa_request_ids_use_the_derived_psa_endpoint() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/psa/pins/legacy-psa-request-7"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "requestid": "legacy-psa-request-7",
-                "status": "pinned",
-                "pin": {
-                    "cid": "bafy-target",
-                    "name": "bucket/key",
-                    "origins": [],
-                    "meta": {}
-                },
-                "info": {},
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("DELETE"))
-            .and(path("/psa/pins/legacy-psa-request-7"))
-            .respond_with(ResponseTemplate::new(204))
-            .mount(&server)
-            .await;
-        let provider = provider(&server);
-
-        let remote = provider.get("legacy-psa-request-7").await.unwrap();
-        provider.unpin("legacy-psa-request-7").await.unwrap();
-
-        assert_eq!(remote.request_id, "legacy-psa-request-7");
-        assert_eq!(remote.status, RemotePinStatus::Pinned);
-        let received = requests(&server).await;
-        assert!(received.iter().any(|request| {
-            request.method.as_str() == "GET"
-                && request.url.path() == "/psa/pins/legacy-psa-request-7"
-        }));
-        assert!(received.iter().any(|request| {
-            request.method.as_str() == "DELETE"
-                && request.url.path() == "/psa/pins/legacy-psa-request-7"
-        }));
-        assert!(!received.iter().any(|request| {
-            request.method.as_str() == "DELETE"
-                && request.url.path() == "/v3/files/public/legacy-psa-request-7"
-        }));
-    }
-
-    #[tokio::test]
-    async fn stage2_historical_reference_routes_survive_current_psa_profile() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET")).and(path("/v3/files/public"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":{"files":[{"id":"file-7","cid":"bafy-target","keyvalues":{"gateway_job_id":"job-7"}}]}})))
-            .expect(1).mount(&server).await;
-        Mock::given(method("DELETE"))
-            .and(path("/v3/files/public/file-7"))
+            .and(path("/psa/pins/request-7"))
             .respond_with(ResponseTemplate::new(204))
             .expect(1)
             .mount(&server)
             .await;
-        let mut current = provider(&server);
-        current.legacy_psa = current.legacy_request_psa.clone();
-        assert_eq!(current.invocation_route(), ("psa", "cid"));
-        let id = encode_request_id(
-            "file-7",
-            "bafy-target",
-            &BTreeMap::from([("gateway_job_id".into(), "job-7".into())]),
+        let provider = build_pinata(
+            "pinata".into(),
+            test_token(TOKEN),
+            Some(format!("{}/psa/", server.uri())),
         );
-        let observed = current
-            .get_observed_historical(&id, "pinata_v3", "cid")
-            .await;
-        assert_eq!(observed.result.unwrap().status, RemotePinStatus::Pinned);
-        current
-            .unpin_historical(&observed.resources[0].request_id, "pinata_v3", "cid")
+        let remote = provider
+            .submit(SubmitPin {
+                cid: "bafy-target".into(),
+                name: "bucket/key".into(),
+                metadata: BTreeMap::new(),
+            })
             .await
             .unwrap();
-        assert!(
-            requests(&server)
-                .await
-                .iter()
-                .all(|request| !request.url.path().starts_with("/psa"))
-        );
+        assert_eq!(remote.status, RemotePinStatus::Queued);
+        provider.unpin(&remote.request_id).await.unwrap();
+        assert_eq!(requests(&server).await.len(), 2);
     }
 
     #[tokio::test]
-    async fn missing_handles_never_delete_a_different_file_of_the_same_cid() {
+    async fn legacy_cid_uses_pin_by_hash_without_polling() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/pinning/pinByHash"))
+            .and(wiremock::matchers::body_json(json!({
+                "hashToPin": "bafy-target", "pinataMetadata": {"name": "bucket/key", "keyvalues": {}},
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ipfsHash": "bafy-target", "id": "request-7", "status": "prechecking",
+            })))
+            .expect(1).mount(&server).await;
+        let provider = build_pinata_with_options(
+            "pinata".into(),
+            test_token(TOKEN),
+            Some(server.uri()),
+            PinataProviderOptions {
+                api: PinataApi::Legacy,
+                strategy: PinataStrategy::Cid,
+                upload_endpoint: None,
+            },
+            None,
+        );
+        let remote = provider
+            .submit(SubmitPin {
+                cid: "bafy-target".into(),
+                name: "bucket/key".into(),
+                metadata: BTreeMap::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(remote.status, RemotePinStatus::Pinning);
+        assert_eq!(requests(&server).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn missing_queue_never_deletes_an_unrelated_file_of_the_same_cid() {
         let server = MockServer::start().await;
         Mock::given(method("DELETE"))
-            .and(path("/v3/files/public/request-7"))
+            .and(path("/v3/files/public/pin_by_cid/request-7"))
             .respond_with(ResponseTemplate::new(404))
+            .expect(1)
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -2286,7 +1167,7 @@ mod tests {
                         "cid": "bafy-target",
                         "keyvalues": {
                             "gateway_job_id": "job-7",
-                            "gateway_lease_id": "lease-7",
+                            "gateway_lease_id": "other-lease",
                         }
                     }]
                 },
@@ -2295,7 +1176,7 @@ mod tests {
             .await;
 
         let error = provider(&server)
-            .unpin(&encode_request_id(
+            .unpin(&encode_queue_handle(
                 "request-7",
                 "bafy-target",
                 &BTreeMap::from([
@@ -2308,20 +1189,22 @@ mod tests {
 
         assert_eq!(error.class, ProviderErrorClass::Transient);
         let received = requests(&server).await;
-        assert!(
-            received
-                .iter()
-                .all(|request| request.method.as_str() == "DELETE")
-        );
-        assert!(!received.iter().any(|request| {
-            request.method.as_str() == "DELETE"
-                && request.url.path() == "/v3/files/public/wrong-file-id"
-        }));
+        assert_eq!(received.len(), 2);
+        assert_eq!(received[1].method.as_str(), "GET");
+        assert_eq!(received[1].url.path(), "/v3/files/public");
     }
 
     #[tokio::test]
-    async fn completed_queue_is_unpinned_by_its_file_when_cancel_precedes_the_first_poll() {
+    async fn completed_queue_is_unpinned_by_its_correlated_file_id() {
         let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v3/files/public/pin_by_cid"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {"id": "queue-1", "cid": "bafy-target", "status": "prechecking"},
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
         Mock::given(method("DELETE"))
             .and(path("/v3/files/public/pin_by_cid/queue-1"))
             .respond_with(ResponseTemplate::new(404))
@@ -2345,17 +1228,21 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let queue = encode_request_id(
-            "queue-1",
-            "bafy-target",
-            &BTreeMap::from([("gateway_job_id".into(), "job".into())]),
-        );
-        provider(&server).unpin_owned(&queue).await.unwrap();
-        assert_eq!(requests(&server).await.len(), 3);
+        let provider = provider(&server);
+        let remote = provider
+            .submit(SubmitPin {
+                cid: "bafy-target".into(),
+                name: "bucket/key".into(),
+                metadata: BTreeMap::from([("gateway_job_id".into(), "job".into())]),
+            })
+            .await
+            .unwrap();
+        provider.unpin(&remote.request_id).await.unwrap();
+        assert_eq!(requests(&server).await.len(), 4);
     }
 
     #[tokio::test]
-    async fn v3_upload_strategy_streams_kubo_content_to_the_upload_api() {
+    async fn v3_upload_streams_kubo_content_and_deletes_the_exact_file() {
         let server = MockServer::start().await;
         let kubo = MockServer::start().await;
         Mock::given(method("POST"))
@@ -2368,9 +1255,16 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": {
                     "id": "file-7",
-                    "cid": "bafy-target"
+                    "cid": "bafy-target",
+                    "is_duplicate": false,
                 }
             })))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/v3/files/public/file-7"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
             .mount(&server)
             .await;
 
@@ -2396,15 +1290,12 @@ mod tests {
 
         assert_eq!(remote.status, RemotePinStatus::Pinned);
         assert_eq!(remote.cid, "bafy-target");
-        assert!(remote.request_id.starts_with(super::V3_REQUEST_ID_PREFIX));
-        let received = requests(&server).await;
-        assert!(received.iter().any(|request| {
-            request.method.as_str() == "POST" && request.url.path() == "/uploads/v3/files"
-        }));
+        provider.unpin(&remote.request_id).await.unwrap();
+        assert_eq!(requests(&server).await.len(), 2);
     }
 
     #[tokio::test]
-    async fn legacy_upload_strategy_uses_pin_file_to_ipfs_and_unpins_by_cid() {
+    async fn legacy_upload_ack_deletes_by_returned_cid_without_inspection() {
         let server = MockServer::start().await;
         let kubo = MockServer::start().await;
         Mock::given(method("POST"))
@@ -2421,12 +1312,6 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        Mock::given(method("DELETE"))
-            .and(path("/pinning/unpin/bafy-target"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("OK"))
-            .mount(&server)
-            .await;
-
         let provider = build_pinata_with_options(
             "pinata".to_owned(),
             test_token(TOKEN),
@@ -2446,7 +1331,13 @@ mod tests {
             })
             .await
             .unwrap();
-        provider.unpin_owned(&remote.request_id).await.unwrap();
+        Mock::given(method("DELETE"))
+            .and(path("/pinning/unpin/bafy-target"))
+            .respond_with(ResponseTemplate::new(202))
+            .expect(1)
+            .mount(&server)
+            .await;
+        provider.unpin(&remote.request_id).await.unwrap();
 
         assert_eq!(remote.status, RemotePinStatus::Pinned);
         assert!(
@@ -2454,14 +1345,7 @@ mod tests {
                 .request_id
                 .starts_with(super::LEGACY_REQUEST_ID_PREFIX)
         );
-        let received = requests(&server).await;
-        assert!(received.iter().any(|request| {
-            request.method.as_str() == "POST" && request.url.path() == "/pinning/pinFileToIPFS"
-        }));
-        assert!(received.iter().any(|request| {
-            request.method.as_str() == "DELETE"
-                && request.url.path() == "/pinning/unpin/bafy-target"
-        }));
+        assert_eq!(requests(&server).await.len(), 2);
     }
 
     #[tokio::test]
@@ -2933,191 +1817,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v3_upload_recovers_an_ambiguous_submit_through_find() {
-        let server = MockServer::start().await;
-        let kubo = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/api/v0/cat"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("hello from kubo"))
-            .mount(&kubo)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/uploads/v3/files"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_delay(Duration::from_secs(2))
-                    .set_body_json(json!({ "data": { "id": "file-7", "cid": "bafy-target" } })),
-            )
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/v3/files/public"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": {
-                    "files": [{
-                        "id": "file-7",
-                        "cid": "bafy-target",
-                        "keyvalues": { "gateway_job_id": "job-7" },
-                    }],
-                },
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/v3/files/public/pin_by_cid"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": { "jobs": [] },
-            })))
-            .mount(&server)
-            .await;
-
-        let provider = crate::pinning::pinata::PinataClient::with_http(
-            "pinata".to_owned(),
-            format!("{}/v3", server.uri()),
-            PinataProviderOptions {
-                api: PinataApi::V3,
-                strategy: PinataStrategy::Upload,
-                upload_endpoint: Some(format!("{}/uploads/v3", server.uri())),
-            },
-            Some(KuboClient::new(kubo.uri())),
-            test_token(TOKEN),
-            reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .unwrap(),
-            reqwest::Client::builder()
-                .timeout(Duration::from_secs(1))
-                .build()
-                .unwrap(),
-        );
-        let error = provider
-            .submit(SubmitPin {
-                cid: "bafy-target".to_owned(),
-                name: "bucket/key.txt".to_owned(),
-                metadata: BTreeMap::from([("gateway_job_id".to_owned(), "job-7".to_owned())]),
-            })
-            .await
-            .unwrap_err();
-        assert_eq!(error.class, ProviderErrorClass::Ambiguous);
-
-        let found = provider
-            .find(FindPin::for_job("bafy-target", "job-7"))
-            .await
-            .unwrap();
-
-        assert_eq!(found.len(), 1);
-        assert_eq!(
-            found[0].request_id,
-            encode_request_id(
-                "file-7",
-                "bafy-target",
-                &BTreeMap::from([("gateway_job_id".to_owned(), "job-7".to_owned())]),
-            )
-        );
-        assert_eq!(found[0].status, RemotePinStatus::Pinned);
-        let received = requests(&server).await;
-        assert_eq!(
-            received
-                .iter()
-                .filter(|request| request.url.path() == "/uploads/v3/files")
-                .count(),
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn legacy_upload_recovers_an_ambiguous_submit_through_find() {
-        let server = MockServer::start().await;
-        let kubo = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/api/v0/cat"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("hello legacy"))
-            .mount(&kubo)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/pinning/pinFileToIPFS"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_delay(Duration::from_secs(2))
-                    .set_body_json(json!({ "IpfsHash": "bafy-target", "ID": "legacy-file-7" })),
-            )
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/data/pinList"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "rows": [{
-                    "id": "legacy-file-7",
-                    "ipfs_pin_hash": "bafy-target",
-                    "metadata": { "keyvalues": { "gateway_job_id": "job-7" } }
-                }]
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/pinning/pinJobs"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({ "count": 0, "rows": [] })),
-            )
-            .mount(&server)
-            .await;
-
-        let provider = crate::pinning::pinata::PinataClient::with_http(
-            "pinata".to_owned(),
-            server.uri(),
-            PinataProviderOptions {
-                api: PinataApi::Legacy,
-                strategy: PinataStrategy::Upload,
-                upload_endpoint: None,
-            },
-            Some(KuboClient::new(kubo.uri())),
-            test_token(TOKEN),
-            reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .unwrap(),
-            reqwest::Client::builder()
-                .timeout(Duration::from_secs(1))
-                .build()
-                .unwrap(),
-        );
-        let error = provider
-            .submit(SubmitPin {
-                cid: "bafy-target".to_owned(),
-                name: "bucket/key.txt".to_owned(),
-                metadata: BTreeMap::from([("gateway_job_id".to_owned(), "job-7".to_owned())]),
-            })
-            .await
-            .unwrap_err();
-        assert_eq!(error.class, ProviderErrorClass::Ambiguous);
-
-        let found = provider
-            .find(FindPin::for_job("bafy-target", "job-7"))
-            .await
-            .unwrap();
-
-        assert_eq!(found.len(), 1);
-        assert_eq!(
-            found[0].request_id,
-            super::encode_request_id_with_prefix(
-                super::LEGACY_REQUEST_ID_PREFIX,
-                "legacy-file-7",
-                "bafy-target",
-                &BTreeMap::from([("gateway_job_id".to_owned(), "job-7".to_owned())]),
-            )
-        );
-        assert_eq!(found[0].status, RemotePinStatus::Pinned);
-        let received = requests(&server).await;
-        assert_eq!(
-            received
-                .iter()
-                .filter(|request| request.url.path() == "/pinning/pinFileToIPFS")
-                .count(),
-            1
-        );
-    }
-
-    #[tokio::test]
     async fn submit_http_error_statuses_map_to_their_provider_error_classes() {
         for (status, expected) in [
             (401, ProviderErrorClass::Authentication),
@@ -3157,230 +1856,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_cid_strategy_uses_pin_by_hash_and_pin_list_find() {
+    async fn v3_submit_ack_supplies_the_exact_queue_cancel_handle() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/pinning/pinByHash"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "IpfsHash": "bafy-target",
-                "ID": "legacy-request-7",
-                "status": "prechecking"
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/data/pinList"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "rows": [{
-                    "id": "legacy-request-7",
-                    "ipfs_pin_hash": "bafy-target",
-                    "metadata": {
-                        "keyvalues": { "gateway_job_id": "job-7" }
-                    }
-                }]
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/pinning/pinJobs"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "count": 0,
-                "rows": []
-            })))
-            .mount(&server)
-            .await;
-
-        let provider = build_pinata_with_options(
-            "pinata".to_owned(),
-            test_token(TOKEN),
-            Some(server.uri()),
-            PinataProviderOptions {
-                api: PinataApi::Legacy,
-                strategy: PinataStrategy::Cid,
-                upload_endpoint: None,
-            },
-            None,
-        );
-        let remote = provider
-            .submit(SubmitPin {
-                cid: "bafy-target".to_owned(),
-                name: "bucket/key.txt".to_owned(),
-                metadata: BTreeMap::from([("gateway_job_id".to_owned(), "job-7".to_owned())]),
-            })
-            .await
-            .unwrap();
-        let found = provider
-            .find(FindPin::for_job("bafy-target", "job-7"))
-            .await
-            .unwrap();
-
-        assert_eq!(remote.status, RemotePinStatus::Pinning);
-        assert_eq!(remote.raw_status, "prechecking");
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].cid, "bafy-target");
-        let received = requests(&server).await;
-        assert!(received.iter().any(|request| {
-            request.method.as_str() == "POST" && request.url.path() == "/pinning/pinByHash"
-        }));
-        assert!(received.iter().any(|request| {
-            request.method.as_str() == "GET" && request.url.path() == "/data/pinList"
-        }));
-    }
-
-    #[tokio::test]
-    async fn legacy_pin_jobs_are_polled_until_the_pin_is_listed() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/data/pinList"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "rows": []
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/pinning/pinJobs"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "count": 1,
-                "rows": [{
-                    "id": "legacy-request-7",
-                    "ipfs_pin_hash": "bafy-target",
-                    "status": "retrieving",
-                    "keyvalues": { "gateway_job_id": "job-7" }
-                }]
-            })))
-            .mount(&server)
-            .await;
-        let provider = build_pinata_with_options(
-            "pinata".to_owned(),
-            test_token(TOKEN),
-            Some(server.uri()),
-            PinataProviderOptions {
-                api: PinataApi::Legacy,
-                strategy: PinataStrategy::Cid,
-                upload_endpoint: None,
-            },
-            None,
-        );
-        let request_id = super::encode_request_id_with_prefix(
-            super::LEGACY_REQUEST_ID_PREFIX,
-            "legacy-request-7",
-            "bafy-target",
-            &BTreeMap::from([("gateway_job_id".to_owned(), "job-7".to_owned())]),
-        );
-
-        let remote = provider.get(&request_id).await.unwrap();
-        let found = provider
-            .find(FindPin::for_job("bafy-target", "job-7"))
-            .await
-            .unwrap();
-
-        assert_eq!(remote.request_id, request_id);
-        assert_eq!(remote.status, RemotePinStatus::Pinning);
-        assert_eq!(remote.raw_status, "retrieving");
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].status, RemotePinStatus::Pinning);
-    }
-
-    #[tokio::test]
-    async fn prefixed_request_ids_route_to_their_original_api_flavor() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/data/pinList"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "rows": [{
-                    "id": "legacy-request-7",
-                    "ipfs_pin_hash": "bafy-target",
-                    "metadata": {
-                        "keyvalues": { "gateway_job_id": "job-7" }
-                    }
-                }]
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("DELETE"))
-            .and(path("/pinning/unpin/bafy-target"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("OK"))
-            .mount(&server)
-            .await;
-        let provider = build_pinata_with_options(
-            "pinata".to_owned(),
-            test_token(TOKEN),
-            Some(format!("{}/v3", server.uri())),
-            PinataProviderOptions {
-                api: PinataApi::V3,
-                strategy: PinataStrategy::Cid,
-                upload_endpoint: None,
-            },
-            None,
-        );
-        let request_id = super::encode_request_id_with_prefix(
-            super::LEGACY_REQUEST_ID_PREFIX,
-            "legacy-request-7",
-            "bafy-target",
-            &BTreeMap::from([("gateway_job_id".to_owned(), "job-7".to_owned())]),
-        );
-
-        let remote = provider.get(&request_id).await.unwrap();
-        assert_eq!(
-            provider.unpin(&request_id).await.unwrap_err().class,
-            ProviderErrorClass::Protocol
-        );
-
-        assert_eq!(remote.status, RemotePinStatus::Pinned);
-        let received = requests(&server).await;
-        assert!(received.iter().any(|request| {
-            request.method.as_str() == "GET" && request.url.path() == "/data/pinList"
-        }));
-        assert!(!received.iter().any(|request| {
-            request.method.as_str() == "DELETE"
-                && request.url.path() == "/pinning/unpin/bafy-target"
-        }));
-        assert!(!received.iter().any(|request| {
-            request.method.as_str() == "GET" && request.url.path() == "/v3/files/public"
-        }));
-    }
-
-    #[tokio::test]
-    async fn v3_unpin_cancels_pending_pin_by_cid_requests() {
-        let server = MockServer::start().await;
-        Mock::given(method("DELETE"))
-            .and(path("/v3/files/public/request-7"))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/v3/files/public"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": { "files": [] },
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
             .and(path("/v3/files/public/pin_by_cid"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": { "jobs": [job("request-7", "searching", "bafy-target")] },
+            .and(wiremock::matchers::body_json(json!({
+                "cid": "bafy-target", "name": "bucket/key",
+                "keyvalues": {"gateway_job_id": "job-7"},
             })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": job("request-7", "prechecking", "bafy-target"),
+            })))
+            .expect(1)
             .mount(&server)
             .await;
         Mock::given(method("DELETE"))
             .and(path("/v3/files/public/pin_by_cid/request-7"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": null })))
+            .respond_with(ResponseTemplate::new(202))
+            .expect(1)
             .mount(&server)
             .await;
 
-        provider(&server)
-            .unpin(&encode_request_id(
-                "request-7",
-                "bafy-target",
-                &BTreeMap::from([("gateway_job_id".to_owned(), "job-7".to_owned())]),
-            ))
+        let provider = provider(&server);
+        let remote = provider
+            .submit(SubmitPin {
+                cid: "bafy-target".to_owned(),
+                name: "bucket/key".to_owned(),
+                metadata: BTreeMap::from([("gateway_job_id".to_owned(), "job-7".to_owned())]),
+            })
             .await
             .unwrap();
-
+        assert_eq!(remote.status, RemotePinStatus::Pinning);
+        provider.unpin(&remote.request_id).await.unwrap();
         let received = requests(&server).await;
-        assert!(received.iter().any(|request| {
-            request.method.as_str() == "DELETE"
-                && request.url.path() == "/v3/files/public/pin_by_cid/request-7"
+        assert_eq!(received.len(), 2);
+        assert!(received.iter().all(|request| {
+            request
+                .headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                == Some("Bearer provider-token")
         }));
     }
 
@@ -3441,19 +1956,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn submit_timeout_is_ambiguous_and_delete_404_waits_for_pending_queue_jobs() {
+    async fn submit_timeout_is_ambiguous_and_does_not_retry() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v3/files/public/pin_by_cid"))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_delay(Duration::from_millis(100))
+                    .set_delay(Duration::from_millis(300))
                     .set_body_json(json!({ "data": job("request-7", "searching", "bafy-target") })),
             )
             .mount(&server)
             .await;
         let fast_http = reqwest::Client::builder()
-            .timeout(Duration::from_millis(10))
+            .timeout(Duration::from_millis(100))
             .build()
             .unwrap();
         let error = crate::pinning::pinata::PinataClient::with_http(
@@ -3477,39 +1992,6 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(error.class, ProviderErrorClass::Ambiguous);
-
-        let server = MockServer::start().await;
-        Mock::given(method("DELETE"))
-            .and(path("/v3/files/public/request-7"))
-            .respond_with(ResponseTemplate::new(404).set_body_string("provider-token"))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/v3/files/public"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": { "files": [] },
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/v3/files/public/pin_by_cid"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": { "jobs": [job("request-7", "searching", "bafy-target")] },
-            })))
-            .mount(&server)
-            .await;
-        let error = provider(&server)
-            .unpin(&encode_request_id(
-                "request-7",
-                "bafy-target",
-                &BTreeMap::from([
-                    ("gateway_job_id".to_owned(), "job-7".to_owned()),
-                    ("gateway_lease_id".to_owned(), "lease-7".to_owned()),
-                ]),
-            ))
-            .await
-            .unwrap_err();
-        assert_eq!(error.class, ProviderErrorClass::Transient);
-        assert!(!format!("{error:?}").contains(TOKEN));
+        assert_eq!(requests(&server).await.len(), 1);
     }
 }

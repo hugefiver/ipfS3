@@ -7,13 +7,13 @@ mod support;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use ipfs_s3_gateway::store::{
     self,
-    entities::{object, object_version, pin_job, pin_lease},
+    entities::{object, object_version},
     import::ownership,
     zip::{self, execution, import_intake},
 };
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, PaginatorTrait, QueryFilter,
-    Statement, TransactionTrait,
+    QueryOrder, Statement, TransactionTrait,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -25,6 +25,7 @@ use support::{
     import::{
         ImportHarness, ImportHarnessConfig, TestHttpsReply, get_import_status, start_import_harness,
     },
+    pin_rows,
     sigv4::send_sigv4,
 };
 
@@ -245,12 +246,11 @@ async fn url_first_verified_read_is_replayed_without_a_second_get_after_source_c
             .unwrap(),
         1
     );
-    assert_eq!(
-        pin_job::Entity::find()
-            .count(harness.state.store.db())
+    assert!(pin_rows::refs(harness.state.store.db()).await.is_empty());
+    assert!(
+        pin_rows::resources(harness.state.store.db())
             .await
-            .unwrap(),
-        0
+            .is_empty()
     );
     harness.shutdown().await;
 }
@@ -1164,16 +1164,28 @@ async fn extracted_target_policy_is_evaluated_per_output_without_source_manual_i
         matchers::{method, path},
     };
 
+    const FIRST_OUTPUT_CID: &str = "bafkreifrzrmgjjyinm4ouxml5agww3xdc3v5hn2rrkbrademswu3t73qay";
+    const SECOND_OUTPUT_CID: &str = "bafkreicjejslxnsavqzukvy2a2en3wv2kr6sczpojs4glh7fjamktm7454";
     let kubo = start_kubo_harness(KuboScript {
-        add_replies: vec![AddReply::Ok(CID), AddReply::Ok(CID)],
+        add_replies: vec![
+            AddReply::Ok(FIRST_OUTPUT_CID),
+            AddReply::Ok(SECOND_OUTPUT_CID),
+        ],
         cat_bodies: std::collections::HashMap::from([(CID.into(), legal_two_entry_zip())]),
     })
     .await;
     Mock::given(method("POST"))
         .and(path("/api/v0/pin/add"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
-            "{{\"Progress\":1,\"Bytes\":15}}\n{{\"Pins\":[\"{CID}\"]}}\n"
-        )))
+        .respond_with(|request: &wiremock::Request| {
+            let (_, cid) = request
+                .url
+                .query_pairs()
+                .find(|(key, _)| key == "arg")
+                .unwrap();
+            ResponseTemplate::new(200).set_body_string(format!(
+                "{{\"Progress\":1,\"Bytes\":15}}\n{{\"Pins\":[\"{cid}\"]}}\n"
+            ))
+        })
         .with_priority(1)
         .mount(&kubo.server)
         .await;
@@ -1276,17 +1288,19 @@ async fn extracted_target_policy_is_evaluated_per_output_without_source_manual_i
         "x-amz-tagging",
         HeaderValue::from_static("ipfs-s3%3Azip-root=false"),
     );
-    let accepted = send_sigv4(
-        reqwest::Method::POST,
-        &server.endpoint,
-        "test-bkt",
-        "archive.zip",
-        &[("ipfs3-import", ""), ("decompress-zip", "out/")],
-        cid_xml().into_bytes(),
-        controls,
-        "test",
-    )
-    .await;
+    let submit_extracted = || {
+        send_sigv4(
+            reqwest::Method::POST,
+            &server.endpoint,
+            "test-bkt",
+            "archive.zip",
+            &[("ipfs3-import", ""), ("decompress-zip", "out/")],
+            cid_xml().into_bytes(),
+            controls.clone(),
+            "test",
+        )
+    };
+    let accepted = submit_extracted().await;
     assert_eq!(accepted.status(), StatusCode::ACCEPTED);
     let id = accepted.headers()["x-ipfs3-import-job-id"]
         .to_str()
@@ -1327,30 +1341,23 @@ async fn extracted_target_policy_is_evaluated_per_output_without_source_manual_i
         }
     };
     assert_eq!(status, "ready");
-    let leases = pin_lease::Entity::find()
-        .all(state.store.db())
+    let db = state.store.db();
+    let first = store::object::get_latest(db, "test-bkt", "out/first.txt")
         .await
         .unwrap();
-    let first = object::Entity::find()
-        .filter(object::Column::Key.eq("out/first.txt"))
-        .one(state.store.db())
+    let second = store::object::get_latest(db, "test-bkt", "out/second.txt")
         .await
-        .unwrap()
         .unwrap();
-    assert_eq!(leases.len(), 1);
-    assert_eq!(leases[0].owner_object_id, first.id);
-    assert_eq!(leases[0].policy_id, normalized.policies[0].identity);
-    let second = object::Entity::find()
-        .filter(object::Column::Key.eq("out/second.txt"))
-        .one(state.store.db())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        leases
-            .iter()
-            .all(|lease| lease.owner_object_id != second.id)
-    );
+    assert_ne!(first.cid, second.cid);
+    let references = pin_rows::refs(db).await;
+    let selected_policy = &normalized.policies[0];
+    let provider = &selected_policy.providers[0];
+    assert_eq!(references.len(), 1);
+    assert_eq!(references[0].owner_object_id, first.id);
+    assert_eq!(references[0].cid, first.cid);
+    assert_eq!(references[0].source, "automatic");
+    assert_eq!(references[0].policy_id, selected_policy.identity);
+    assert_eq!(references[0].provider, *provider);
     assert_eq!(
         object::Entity::find()
             .filter(object::Column::Key.eq("archive.zip"))
@@ -1359,26 +1366,44 @@ async fn extracted_target_policy_is_evaluated_per_output_without_source_manual_i
             .unwrap(),
         0
     );
+    let versions = object_version::Entity::find()
+        .order_by_asc(object_version::Column::Id)
+        .all(db)
+        .await
+        .unwrap();
+    assert_eq!(versions.len(), 2);
+    assert_eq!(object::Entity::find().count(db).await.unwrap(), 2);
+    let queued = pin_rows::resources(db).await;
+    assert_eq!(
+        queued,
+        vec![pin_rows::Resource {
+            provider: provider.clone(),
+            cid: first.cid,
+            logical_size: first.size,
+            status: "waiting".into(),
+            action: Some("submit".into()),
+            handle: None,
+        }]
+    );
+
+    let request_count = kubo.server.received_requests().await.unwrap().len();
+    let replay = submit_extracted().await;
+    assert_eq!(replay.status(), StatusCode::ACCEPTED);
+    assert_eq!(replay.headers()["x-ipfs3-import-job-id"], id.as_str());
+    assert_eq!(native::execution_count(&state).await, 1);
     assert_eq!(
         object_version::Entity::find()
-            .count(state.store.db())
+            .order_by_asc(object_version::Column::Id)
+            .all(db)
             .await
             .unwrap(),
-        2
+        versions
     );
+    assert_eq!(pin_rows::refs(db).await, references);
+    assert_eq!(pin_rows::resources(db).await, queued);
     assert_eq!(
-        object::Entity::find()
-            .count(state.store.db())
-            .await
-            .unwrap(),
-        2
-    );
-    assert_eq!(
-        pin_job::Entity::find()
-            .count(state.store.db())
-            .await
-            .unwrap(),
-        1
+        kubo.server.received_requests().await.unwrap().len(),
+        request_count
     );
     worker.shutdown(Duration::from_secs(2)).await;
     server.shutdown().await;

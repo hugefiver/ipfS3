@@ -1,5 +1,4 @@
 use super::*;
-use reqwest::Method;
 #[path = "sql_trace.rs"]
 mod sql_trace;
 use sql_trace::SqlTrace;
@@ -48,16 +47,6 @@ async fn postgres_s3_worker_warm_paths_do_not_revalidate_structure() {
 
 async fn exercise(db: sea_orm::DatabaseConnection, trace: SqlTrace) {
     let mut config = PinningHarnessConfig::request_one();
-    config.explicit_identity = true;
-    config.pinata_script = vec![
-        PsaReply::submit_status("/psa/pins", "observed-request", TEST_CID, "queued"),
-        PsaReply::pin_status(
-            "/psa/pins/observed-request",
-            "observed-request",
-            TEST_CID,
-            "pinned",
-        ),
-    ];
     let archive = legal_two_entry_zip();
     config.kubo_script.add_replies = vec![
         AddReply::Ok(TEST_CID),
@@ -73,60 +62,30 @@ async fn exercise(db: sea_orm::DatabaseConnection, trace: SqlTrace) {
         (PIN_CID_ENTRY1.to_owned(), FIRST_ENTRY_BYTES.to_vec()),
         (PIN_CID_ENTRY2.to_owned(), SECOND_ENTRY_BYTES.to_vec()),
     ]);
-    let mut harness = support::pinning::start_pinning_harness_with_database(config, db).await;
+    let harness = support::pinning::start_pinning_harness_with_database(config, db).await;
     trace.take("cold initialization", false);
     let put = signed_put_with_tagging(&harness, "warm.txt", b"body".to_vec(), "").await;
     assert_eq!(put.status(), StatusCode::OK);
     assert_put_cid_headers(&put, TEST_CID);
     trace.take("first PUT after initialization", true);
-    harness
-        .state
-        .pinning
-        .register_identities(&harness.state.store)
-        .await
-        .unwrap();
-    trace.take("qualified provider registration", true);
     let put =
         signed_put_with_tagging(&harness, "warm.txt", b"body".to_vec(), "ipfs-s3%3Apin=true").await;
     assert_eq!(put.status(), StatusCode::OK);
     trace.take("warm PUT overwrite", true);
-    harness.run_worker_until_idle().await;
-    trace.take("warm worker claim/submit", true);
-    let jobs = harness.pin_jobs().await;
-    let poll = jobs
-        .iter()
-        .find(|job| job.operation == "poll")
-        .expect("submit schedules poll");
-    harness.advance_job_due(&poll.id).await;
-    harness.run_worker_until_idle().await;
-    trace.take("warm worker poll/completion", true);
-    assert_eq!(
-        harness
-            .target_states("warm.txt")
-            .await
-            .into_iter()
-            .map(|(_, state)| state)
-            .collect::<Vec<_>>(),
-        vec!["pinned"]
-    );
-    let requests = harness.provider_requests().await;
-    assert_eq!(
-        requests
-            .iter()
-            .filter(|request| request.method == Method::POST)
-            .count(),
-        1
-    );
+    harness.run_until_resource_status("accepted").await;
+    trace.take("warm worker submit and settlement", true);
+    let requests = harness.pinata.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method.as_str(), "POST");
     let get = signed_get(&harness, "warm.txt").await;
     assert_eq!(get.status(), StatusCode::OK);
     assert_eq!(get.bytes().await.unwrap().as_ref(), b"body");
     let object = latest_pinning_object(&harness, "warm.txt").await;
-    let leases = owner_leases(&harness, &object.id).await;
-    let manual = leases
-        .iter()
-        .find(|lease| lease.source == "manual")
-        .unwrap();
-    let retain_until = (manual.expires_at + ChronoDuration::hours(1)).to_rfc3339();
+    let db = harness.state.store.db();
+    let manual = support::pin_rows::refs(db).await.remove(0);
+    assert_eq!(manual.owner_object_id, object.id);
+    let expires = chrono::DateTime::from_timestamp_micros(manual.expires_at).unwrap();
+    let retain_until = (expires + ChronoDuration::hours(1)).to_rfc3339();
     let response = signed_put_object_tagging(
         &harness,
         "warm.txt",
@@ -137,8 +96,9 @@ async fn exercise(db: sea_orm::DatabaseConnection, trace: SqlTrace) {
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
-    let renewed = owner_leases(&harness, &object.id).await;
-    assert_eq!(renewed[0].generation, manual.generation + 1);
+    let renewed = support::pin_rows::refs(db).await;
+    assert_eq!(renewed.len(), 1);
+    assert!(renewed[0].expires_at > manual.expires_at);
     trace.take("warm tagging renewal", true);
     assert_eq!(
         signed_copy_with_tagging(&harness, "warm.txt", "copy.txt", "ipfs-s3%3Apin=true")
@@ -151,7 +111,7 @@ async fn exercise(db: sea_orm::DatabaseConnection, trace: SqlTrace) {
         signed_delete_object(&harness, "copy.txt").await.status(),
         StatusCode::NO_CONTENT
     );
-    trace.take("warm DELETE lease closure", true);
+    trace.take("warm DELETE reference release", true);
     assert_eq!(
         signed_delete_object_tagging(&harness, "warm.txt")
             .await

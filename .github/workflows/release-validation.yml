@@ -47,8 +47,8 @@ jobs:
       - name: Run live PostgreSQL import tests
         run: cargo test --test postgres_import -- --nocapture --test-threads=1
 
-      - name: Run live PostgreSQL current pinning migration tests
-        run: cargo test --test postgres_current_pinning -- --include-ignored --nocapture --test-threads=1
+      - name: Run PostgreSQL file pin upgrade and publication tests
+        run: cargo test --test file_pin_schema --test postgres_pinning_stage3 -- --include-ignored --nocapture --test-threads=1
 
   postgres-production-deployment:
     runs-on: ubuntu-latest
@@ -165,11 +165,11 @@ jobs:
       - name: Verify latest migration, JSON columns, and application role
         shell: pwsh
         run: |
-          $migrationOutput = @(docker compose --project-name $env:COMPOSE_PROJECT_NAME -f docker-compose.postgres.yml -f tests/compose.postgres-production-validation.yml exec -T postgres psql -U postgres -d ipfs3 -tA -c "SELECT version FROM seaql_migrations WHERE version = 'm20260813_000001_postgres_json_columns'; SELECT rolname || ':' || rolsuper::text FROM pg_roles WHERE rolname = 'ipfs3'; SELECT table_name || '.' || column_name || ':' || data_type FROM information_schema.columns WHERE table_schema = current_schema() AND (table_name, column_name) IN (('multipart_uploads', 'metadata'), ('multipart_uploads', 'tags_json'), ('objects', 'metadata')) ORDER BY table_name, column_name;")
+          $migrationOutput = @(docker compose --project-name $env:COMPOSE_PROJECT_NAME -f docker-compose.postgres.yml -f tests/compose.postgres-production-validation.yml exec -T postgres psql -U postgres -d ipfs3 -tA -c "SELECT version FROM seaql_migrations WHERE version = 'm20261120_000001_file_pins'; SELECT rolname || ':' || rolsuper::text FROM pg_roles WHERE rolname = 'ipfs3'; SELECT table_name || '.' || column_name || ':' || data_type FROM information_schema.columns WHERE table_schema = current_schema() AND (table_name, column_name) IN (('multipart_uploads', 'metadata'), ('multipart_uploads', 'tags_json'), ('objects', 'metadata')) ORDER BY table_name, column_name;")
           if ($LASTEXITCODE -ne 0) { throw "Migration, JSON-column, and application-role query failed" }
           $databaseContract = @($migrationOutput | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
           $expectedDatabaseContract = @(
-            "m20260813_000001_postgres_json_columns",
+            "m20261120_000001_file_pins",
             "ipfs3:false",
             "multipart_uploads.metadata:jsonb",
             "multipart_uploads.tags_json:jsonb",
@@ -346,19 +346,8 @@ jobs:
           $migrationOutput = @(docker compose --project-name $env:COMPOSE_PROJECT_NAME -f docker-compose.multi-gateway.yml -f tests/compose.multi-gateway-validation.yml exec -T postgres psql -U postgres -d ipfs3 -tA -c "SELECT version || ':' || COUNT(*)::text FROM seaql_migrations GROUP BY version ORDER BY version;")
           if ($LASTEXITCODE -ne 0) { throw "Migration marker query failed" }
           $actualMigrations = @($migrationOutput | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
-          $expectedMigrations = @(
-            "m20250701_000001_init:1",
-            "m20260707_000001_decompress_zip:1",
-            "m20260720_000001_sse_c_key_fingerprint:1",
-            "m20260721_000001_multi_provider_pinning:1",
-            "m20260729_000001_ipfs3_import:1",
-            "m20260729_000002_postgres_utc_timestamps:1",
-            "m20260730_000001_standard_mutation_fence:1",
-            "m20260813_000001_postgres_json_columns:1"
-          )
-          if ($actualMigrations.Count -ne $expectedMigrations.Count) { throw "Unexpected migration marker count" }
-          for ($index = 0; $index -lt $expectedMigrations.Count; $index++) {
-            if ($actualMigrations[$index] -cne $expectedMigrations[$index]) { throw "Unexpected migration marker at index $index" }
+          if ($actualMigrations.Count -ne 1 -or $actualMigrations[0] -cne "m20261120_000001_file_pins:1") {
+            throw "Unexpected fresh schema migration markers: $($actualMigrations -join ', ')"
           }
 
       - name: Run direct cross-replica acceptance

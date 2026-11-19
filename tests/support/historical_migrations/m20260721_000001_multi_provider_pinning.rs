@@ -428,15 +428,6 @@ mod tests {
     use crate::store::migrations::m20260707_000001_decompress_zip::Migration as DecompressZipMigration;
     use crate::store::migrations::m20260720_000001_sse_c_key_fingerprint::Migration as SseCKeyFingerprintMigration;
 
-    const PINNING_TABLES: [&str; 6] = [
-        "object_tags",
-        "pin_leases",
-        "pin_lease_targets",
-        "remote_pins",
-        "pin_jobs",
-        "pin_provider_usage",
-    ];
-
     async fn seed_previous_schema(db: &DatabaseConnection) {
         db.execute_unprepared(
             "INSERT INTO buckets (name, created_at, owner) \
@@ -502,24 +493,6 @@ mod tests {
         rows
     }
 
-    async fn sqlite_table_names(db: &DatabaseConnection) -> Vec<String> {
-        db.query_all(Statement::from_string(
-            DatabaseBackend::Sqlite,
-            "SELECT name FROM sqlite_master WHERE type = 'table' \
-             AND name IN ('object_tags', 'pin_leases', 'pin_lease_targets', \
-                          'remote_pins', 'pin_jobs', 'pin_provider_usage') \
-             ORDER BY name",
-        ))
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|row| {
-            let name: String = row.try_get_by(0).unwrap();
-            name
-        })
-        .collect()
-    }
-
     #[tokio::test]
     async fn up_down_preserves_seeded_rows_and_multipart_part_cascade_on_sqlite() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
@@ -535,9 +508,6 @@ mod tests {
 
         Migration.up(&manager).await.unwrap();
         Migration.up(&manager).await.unwrap();
-        let mut expected_tables = PINNING_TABLES.map(str::to_owned).to_vec();
-        expected_tables.sort();
-        assert_eq!(sqlite_table_names(&db).await, expected_tables);
         let tags = db
             .query_one(Statement::from_string(
                 DatabaseBackend::Sqlite,
@@ -550,7 +520,6 @@ mod tests {
 
         Migration.down(&manager).await.unwrap();
         Migration.down(&manager).await.unwrap();
-        assert!(sqlite_table_names(&db).await.is_empty());
         assert_eq!(snapshot_seeded_rows(&db).await, before);
 
         let upload_columns = db
@@ -593,208 +562,5 @@ mod tests {
             .try_get_by(0)
             .unwrap();
         assert_eq!(part_count, 0);
-    }
-
-    #[tokio::test]
-    async fn deleting_bucket_cascades_objects_leases_and_targets_on_sqlite() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        db.execute_unprepared("PRAGMA foreign_keys = ON")
-            .await
-            .unwrap();
-        let manager = SchemaManager::new(&db);
-        InitMigration.up(&manager).await.unwrap();
-        DecompressZipMigration.up(&manager).await.unwrap();
-        SseCKeyFingerprintMigration.up(&manager).await.unwrap();
-        seed_previous_schema(&db).await;
-        Migration.up(&manager).await.unwrap();
-
-        db.execute_unprepared(
-            "INSERT INTO pin_leases \
-             (id, owner_object_id, source, policy_id, provider_mode, content_mode, created_at, \
-              last_touched_at, expires_at, generation, state) \
-             VALUES ('lease-1', 'object-1', 'historical', 'policy', 'all', 'full', \
-                     CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 1, 'expired')",
-        )
-        .await
-        .unwrap();
-        db.execute_unprepared(
-            "INSERT INTO pin_lease_targets \
-             (id, lease_id, cid, logical_size, provider, state, created_at, last_touched_at) \
-             VALUES ('target-1', 'lease-1', 'QmTarget', 7, 'pinata', 'released', \
-                     CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
-        )
-        .await
-        .unwrap();
-
-        db.execute_unprepared("DELETE FROM buckets WHERE name = 'bucket'")
-            .await
-            .unwrap();
-        for table in ["objects", "pin_leases", "pin_lease_targets"] {
-            let count: i64 = db
-                .query_one(Statement::from_string(
-                    DatabaseBackend::Sqlite,
-                    format!("SELECT COUNT(*) FROM {table}"),
-                ))
-                .await
-                .unwrap()
-                .unwrap()
-                .try_get_by(0)
-                .unwrap();
-            assert_eq!(count, 0, "{table} must be deleted with its bucket");
-        }
-    }
-
-    #[test]
-    fn postgres_rendering_covers_schema_indexes_and_reversible_alter() {
-        let creates: Vec<String> = create_tables()
-            .iter()
-            .map(|statement| statement.to_string(PostgresQueryBuilder))
-            .collect();
-        assert_eq!(creates.len(), PINNING_TABLES.len());
-        for table in PINNING_TABLES {
-            assert_eq!(
-                creates
-                    .iter()
-                    .filter(|statement| {
-                        statement.starts_with(&format!("CREATE TABLE IF NOT EXISTS \"{table}\""))
-                    })
-                    .count(),
-                1,
-                "expected exactly one PostgreSQL create statement for {table}: {creates:#?}"
-            );
-        }
-
-        let object_tags = creates
-            .iter()
-            .find(|statement| statement.contains("\"object_tags\""))
-            .unwrap();
-        assert!(object_tags.contains("PRIMARY KEY (\"object_id\", \"key\")"));
-        assert!(object_tags.contains(
-            "FOREIGN KEY (\"object_id\") REFERENCES \"objects\" (\"id\") ON DELETE CASCADE"
-        ));
-
-        let leases = creates
-            .iter()
-            .find(|statement| statement.contains("\"pin_leases\""))
-            .unwrap();
-        assert!(leases.contains("\"generation\" bigint NOT NULL"));
-        assert!(leases.contains(
-            "FOREIGN KEY (\"owner_object_id\") REFERENCES \"objects\" (\"id\") ON DELETE CASCADE"
-        ));
-        assert!(
-            leases.contains("CHECK (\"state\" IN ('active', 'expired', 'cancelled', 'evicted'))")
-        );
-
-        let targets = creates
-            .iter()
-            .find(|statement| statement.contains("\"pin_lease_targets\""))
-            .unwrap();
-        assert!(targets.contains("\"logical_size\" bigint NOT NULL"));
-        assert!(targets.contains("CHECK (\"state\" IN ('waiting', 'submitted', 'pinned', 'degraded', 'quota_waiting', 'quota_blocked', 'evicted', 'released'))"));
-
-        let remote = creates
-            .iter()
-            .find(|statement| statement.contains("\"remote_pins\""))
-            .unwrap();
-        for required in [
-            "PRIMARY KEY (\"provider\", \"cid\")",
-            "\"request_id\" text",
-            "\"cid_size\" bigint NOT NULL",
-            "\"next_retry_at\" timestamp with time zone",
-            "\"last_failed_request_id\" text",
-            "\"last_error_class\" text",
-            "\"last_error_text\" text",
-            "\"failure_attempts\" integer NOT NULL DEFAULT 0",
-            "CHECK (\"epoch\" >= 1)",
-            "CHECK (\"failure_attempts\" >= 0)",
-            "CHECK (\"status\" IN ('reserved', 'queued', 'pinning', 'pinned', 'failed', 'absent'))",
-        ] {
-            assert!(remote.contains(required), "missing {required} in {remote}");
-        }
-
-        let jobs = creates
-            .iter()
-            .find(|statement| statement.contains("\"pin_jobs\""))
-            .unwrap();
-        for required in [
-            "\"next_attempt_at\" timestamp with time zone NOT NULL",
-            "\"expected_remote_epoch\" bigint",
-            "\"submit_phase\" text DEFAULT 'ready'",
-            "CHECK (\"state\" IN ('pending', 'running', 'done'))",
-            PIN_JOB_SCOPE_CHECK,
-            PIN_JOB_SUBMIT_PHASE_CHECK,
-        ] {
-            assert!(jobs.contains(required), "missing {required} in {jobs}");
-        }
-
-        let usage = creates
-            .iter()
-            .find(|statement| statement.contains("\"pin_provider_usage\""))
-            .unwrap();
-        assert!(usage.contains("\"reserved_bytes\" bigint NOT NULL DEFAULT 0"));
-        assert!(usage.contains("\"observed_at\" timestamp with time zone"));
-
-        let indexes: Vec<String> = create_indexes()
-            .iter()
-            .map(|statement| statement.to_string(PostgresQueryBuilder))
-            .collect();
-        for required in [
-            "CREATE UNIQUE INDEX IF NOT EXISTS \"uq_pin_leases_owner_object_source\" ON \"pin_leases\" (\"owner_object_id\", \"source\")",
-            "CREATE UNIQUE INDEX IF NOT EXISTS \"uq_pin_lease_targets_lease_cid_provider\" ON \"pin_lease_targets\" (\"lease_id\", \"cid\", \"provider\")",
-            "CREATE INDEX IF NOT EXISTS \"idx_pin_jobs_state_next_attempt_locked\" ON \"pin_jobs\" (\"state\", \"next_attempt_at\", \"locked_until\")",
-            "CREATE INDEX IF NOT EXISTS \"idx_remote_pins_provider_last_touched\" ON \"remote_pins\" (\"provider\", \"last_touched_at\")",
-            "CREATE INDEX IF NOT EXISTS \"idx_pin_lease_targets_provider_cid_state\" ON \"pin_lease_targets\" (\"provider\", \"cid\", \"state\")",
-            "CREATE INDEX IF NOT EXISTS \"idx_pin_leases_state_expires\" ON \"pin_leases\" (\"state\", \"expires_at\")",
-        ] {
-            assert!(
-                indexes.iter().any(|statement| statement == required),
-                "missing PostgreSQL index SQL: {required}; actual: {indexes:#?}"
-            );
-        }
-
-        let drops: Vec<String> = drop_tables()
-            .iter()
-            .map(|statement| statement.to_string(PostgresQueryBuilder))
-            .collect();
-        assert_eq!(drops.len(), PINNING_TABLES.len());
-        for table in PINNING_TABLES {
-            assert!(
-                drops
-                    .iter()
-                    .any(|statement| statement == &format!("DROP TABLE IF EXISTS \"{table}\"")),
-                "missing PostgreSQL drop statement for {table}: {drops:#?}"
-            );
-        }
-        let index_drops: Vec<String> = drop_indexes()
-            .iter()
-            .map(|statement| statement.to_string(PostgresQueryBuilder))
-            .collect();
-        assert_eq!(index_drops.len(), indexes.len());
-        for index in [
-            "idx_pin_jobs_state_next_attempt_locked",
-            "idx_pin_lease_targets_provider_cid_state",
-            "uq_pin_lease_targets_lease_cid_provider",
-            "idx_pin_leases_state_expires",
-            "uq_pin_leases_owner_object_source",
-            "idx_remote_pins_provider_last_touched",
-        ] {
-            assert!(
-                index_drops
-                    .iter()
-                    .any(|statement| statement == &format!("DROP INDEX IF EXISTS \"{index}\"")),
-                "missing PostgreSQL drop index for {index}: {index_drops:#?}"
-            );
-        }
-
-        let add_tags = add_multipart_tags_column().to_string(PostgresQueryBuilder);
-        let drop_tags = drop_multipart_tags_column().to_string(PostgresQueryBuilder);
-        assert_eq!(
-            add_tags,
-            "ALTER TABLE \"multipart_uploads\" ADD COLUMN \"tags_json\" text NOT NULL DEFAULT '[]'"
-        );
-        assert_eq!(
-            drop_tags,
-            "ALTER TABLE \"multipart_uploads\" DROP COLUMN \"tags_json\""
-        );
     }
 }

@@ -1,5 +1,6 @@
-use super::tests::{CID, OTHER, provider, source_file, submit};
-use super::{RpcProfile, RpcResourceStatus, RpcStrategy, RpcSubmitEffect};
+use super::tests::{CID, provider, source_file, submit};
+use super::{RpcProfile, RpcStrategy};
+use crate::pinning::provider::PinningProvider;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{method, path},
@@ -23,23 +24,13 @@ async fn upload_forwards_zero_small_raw_multiblock_and_sse_stored_bytes_exactly(
         Mock::given(method("POST"))
             .and(path("/api/v0/add"))
             .respond_with(
-                ResponseTemplate::new(200).set_body_string(format!("{{\"Hash\":\"{OTHER}\"}}\n")),
+                ResponseTemplate::new(200).set_body_string(format!("{{\"Hash\":\"{CID}\"}}\n")),
             )
             .expect(1)
             .mount(&target)
             .await;
         let rpc = provider(&target, &source, RpcProfile::Filebase, RpcStrategy::Upload);
-        let observation = rpc.submit_observed(submit(CID)).await;
-        assert!(
-            observation.result.is_err(),
-            "mocked different root must not confirm {shape}"
-        );
-        assert_eq!(observation.effect, RpcSubmitEffect::Observed);
-        assert_eq!(observation.resources[0].cid, OTHER);
-        assert_eq!(
-            observation.resources[0].status,
-            RpcResourceStatus::PinAccepted
-        );
+        rpc.submit(submit(CID)).await.unwrap();
         let requests = target.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
         let request = &requests[0];

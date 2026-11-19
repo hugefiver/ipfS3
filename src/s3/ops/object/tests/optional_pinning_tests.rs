@@ -3,8 +3,7 @@ use crate::config::{OptionalPinControlMode, PinningConfig, PolicyConfig, Provide
 use crate::pinning::config::ValidatedPinningConfig;
 use crate::s3::sigv4;
 use crate::store::entities::{import_destination, import_job};
-use crate::store::entities::{pin_job, pin_lease, pin_provider_usage, remote_pin};
-use sea_orm::{Database, EntityTrait, PaginatorTrait};
+use sea_orm::{Database, EntityTrait};
 
 async fn queued_import(state: &Arc<AppState>, id: &str, key: &str) {
     let result = crate::store::import::ownership::submit(
@@ -294,13 +293,7 @@ async fn real_sigv4_put_copy_and_tagging_return_standard_responses_with_safe_war
 
 async fn assert_no_remote_work(state: &Arc<AppState>) {
     let db = state.store.db();
-    assert_eq!(pin_lease::Entity::find().count(db).await.unwrap(), 0);
-    assert_eq!(pin_job::Entity::find().count(db).await.unwrap(), 0);
-    assert_eq!(remote_pin::Entity::find().count(db).await.unwrap(), 0);
-    assert_eq!(
-        pin_provider_usage::Entity::find().count(db).await.unwrap(),
-        0
-    );
+    assert!(pin_resources(db).await.is_empty());
 }
 
 fn available_policy() -> Arc<crate::pinning::coordinator::PinningCoordinator> {
@@ -725,36 +718,20 @@ async fn strict_copy_of_legacy_control_only_runs_destination_automatic_policy() 
             .all(|intent| intent.source == crate::pinning::policy::LeaseSource::Automatic)
     );
     assert_eq!(
-        lease_sources_for_latest(&state, "dest/automatic").await,
+        pin_sources_for_latest(&state, "dest/automatic").await,
         vec!["automatic"]
     );
     assert_eq!(
-        pin_lease::Entity::find()
-            .count(state.store.db())
-            .await
-            .unwrap(),
-        1
+        pin_resources(state.store.db()).await,
+        vec![PinResource {
+            provider: "alpha".into(),
+            cid: CID.into(),
+            logical_size: 4,
+            status: "waiting".into(),
+            action: Some("submit".into()),
+            handle: None,
+        }]
     );
-    assert_eq!(
-        pin_job::Entity::find()
-            .count(state.store.db())
-            .await
-            .unwrap(),
-        1
-    );
-    assert_eq!(
-        remote_pin::Entity::find()
-            .count(state.store.db())
-            .await
-            .unwrap(),
-        1
-    );
-    let usage = pin_provider_usage::Entity::find_by_id("alpha")
-        .one(state.store.db())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!((usage.reserved_bytes, usage.reserved_pins), (4, 1));
 }
 
 #[tokio::test]
@@ -790,7 +767,7 @@ async fn legacy_invalid_control_still_rejected_but_replace_is_fresh() {
     .await
     .unwrap();
     assert_eq!(
-        lease_sources_for_latest(&state, "dest/replaced").await,
+        pin_sources_for_latest(&state, "dest/replaced").await,
         vec!["manual"]
     );
 }

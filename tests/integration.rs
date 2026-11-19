@@ -6,16 +6,15 @@ mod support;
 use chrono::Duration as ChronoDuration;
 use common::{
     FIRST_ENTRY_BYTES, PIN_CID_ENTRY1, PIN_CID_ENTRY2, PIN_CID_PART, PIN_CID_ROOT,
-    SECOND_ENTRY_BYTES, assert_put_cid_headers, latest_pinning_object, owner_leases,
-    signed_complete_multipart, signed_copy_with_tagging,
-    signed_create_multipart_zip_upload_with_tagging, signed_delete_object,
-    signed_delete_object_tagging, signed_get, signed_put_object_tagging, signed_put_with_tagging,
-    signed_upload_part, xml_text,
+    SECOND_ENTRY_BYTES, assert_put_cid_headers, latest_pinning_object, signed_complete_multipart,
+    signed_copy_with_tagging, signed_create_multipart_zip_upload_with_tagging,
+    signed_delete_object, signed_delete_object_tagging, signed_get, signed_put_object_tagging,
+    signed_put_with_tagging, signed_upload_part, xml_text,
 };
 use http::StatusCode;
 use ipfs_s3_gateway::store;
 use support::decompress::{AddReply, legal_two_entry_zip};
-use support::pinning::{PinningHarnessConfig, PsaReply, TEST_CID};
+use support::pinning::{PinningHarnessConfig, TEST_CID};
 
 #[path = "integration/basics.rs"]
 mod basics;

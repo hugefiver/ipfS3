@@ -375,6 +375,7 @@ async fn seed_version(
         version_id: Set(public_version_id.map(str::to_owned)),
         kind: Set("object".to_owned()),
         object_id: Set(Some(object_id.clone())),
+        pin_decision: Set(None),
         sequence: Set(sequence),
         is_latest: Set(is_latest),
         lifecycle_age_started_at: Set(created_at),

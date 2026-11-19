@@ -1,137 +1,88 @@
-use super::{IpfsRpcProvider, Pins, RpcProfile, cid, error};
-use crate::pinning::{
-    identity::{Ownership, RemoteResourceType},
-    provider::{
-        FindPin, ObservedResource, ObservedResourceStatus, PinObservation, PinningProvider,
-        ProviderError, ProviderErrorClass, QueryObservation, RemotePin, SubmitObservation,
-        SubmitPin,
-    },
+use super::{IpfsRpcProvider, RpcProfile, RpcStrategy, cid, error, transport::ControlResponse};
+use crate::pinning::provider::{
+    PinningProvider, ProviderError, RemotePin, RemotePinStatus, SubmitPin,
 };
+use ::cid::Cid;
+use serde::Deserialize;
 
 #[async_trait::async_trait]
 impl PinningProvider for IpfsRpcProvider {
     fn name(&self) -> &str {
         &self.name
     }
-    fn invocation_route(&self) -> (&'static str, &'static str) {
-        (self.profile.api_profile(), self.strategy.as_str())
-    }
 
     async fn submit(&self, request: SubmitPin) -> Result<RemotePin, ProviderError> {
-        self.submit_observed(request).await.result
+        let requested = cid::parse(&request.cid)?;
+        let canonical = cid::canonical(&requested);
+        let pinned = match self.strategy {
+            RpcStrategy::Cid => self.pin_cid(&canonical).await?,
+            RpcStrategy::Upload => self.upload(&requested).await?,
+            RpcStrategy::Car => self.import_car(&canonical).await?,
+        };
+        Ok(RemotePin {
+            // Kubo's pin index distinguishes CIDv0 and CIDv1 for the same block.
+            request_id: format!("rpc-pin:{}:{pinned}", self.profile.id()),
+            cid: canonical.to_string(),
+            status: RemotePinStatus::Pinned,
+            raw_status: "pinned".into(),
+            failure_reason: None,
+        })
     }
 
-    async fn submit_observed(&self, request: SubmitPin) -> SubmitObservation {
-        IpfsRpcProvider::submit_observed(self, request).await.into()
-    }
-
-    async fn get(&self, request_id: &str) -> Result<RemotePin, ProviderError> {
-        let cid = cid::decode(self.profile, request_id)?;
-        self.find_verified(&cid)
-            .await?
-            .into_iter()
-            .next()
-            .ok_or_else(|| {
-                error::error(
-                    ProviderErrorClass::NotFound,
-                    "RPC pin is authoritatively absent",
-                )
-            })
-    }
-
-    async fn get_observed(&self, request_id: &str) -> PinObservation {
-        let result = self.get(request_id).await;
-        let resources = result
-            .as_ref()
-            .ok()
-            .map(|remote| {
-                vec![ObservedResource {
-                    resource_type: RemoteResourceType::RpcPin,
-                    cid: remote.cid.clone(),
-                    request_id: remote.request_id.clone(),
-                    status: ObservedResourceStatus::RecursiveVerified,
-                    ownership: Ownership::Unknown,
-                    replica_evidence: None,
-                }]
-            })
-            .unwrap_or_default();
-        PinObservation { result, resources }
-    }
-
-    async fn find(&self, query: FindPin) -> Result<Vec<RemotePin>, ProviderError> {
-        self.find_verified(&query.cid).await
-    }
-
-    /// Only invoke AFTER the outer ledger authorizes this exact resource. There
-    /// is intentionally no automatic cleanup, bulk unpin or garbage collection.
+    /// The caller selects the provider and authorizes removal of this handle.
     async fn unpin(&self, request_id: &str) -> Result<(), ProviderError> {
         let cid = cid::decode(self.profile, request_id)?;
-        let filebase = [("arg", cid.as_str())];
-        let kubo = [("arg", cid.as_str()), ("recursive", "true")];
-        let query = if self.profile == RpcProfile::Filebase {
-            &filebase[..]
-        } else {
-            &kubo[..]
-        };
-        let response = self.target.control("pin/rm", query, true).await?;
-        response.check(true)?;
-        if matches!(response.status.as_u16(), 202 | 204) {
-            return Ok(());
-        }
-        let pins: Pins = response.json()?;
-        if pins.pins.len() != 1 || !cid::equivalent(&pins.pins[0], &cid).unwrap_or(false) {
-            return Err(error::protocol("RPC pin/rm did not confirm the exact root"));
+        let arg = cid.to_string();
+        let query = [("arg", arg.as_str()), ("recursive", "true")];
+        let response = self
+            .target
+            .control(
+                "pin/rm",
+                if self.profile == RpcProfile::Filebase {
+                    &query[..1]
+                } else {
+                    &query
+                },
+                true,
+            )
+            .await?;
+        if pins_ack(response)? != cid {
+            return Err(error::mismatch());
         }
         Ok(())
     }
+}
 
-    async fn find_historical(
-        &self,
-        query: FindPin,
-        api: &str,
-        strategy: &str,
-    ) -> Result<Vec<RemotePin>, ProviderError> {
-        self.historical_route(api, strategy)?;
-        self.find(query).await
-    }
-
-    async fn observe_historical(
-        &self,
-        query: FindPin,
-        api: &str,
-        strategy: &str,
-    ) -> Result<QueryObservation, ProviderError> {
-        self.historical_route(api, strategy)?;
-        Ok(self.observe(query).await)
-    }
-
-    async fn get_historical(
-        &self,
-        id: &str,
-        api: &str,
-        strategy: &str,
-    ) -> Result<RemotePin, ProviderError> {
-        self.historical_route(api, strategy)?;
-        self.get(id).await
-    }
-
-    async fn get_observed_historical(&self, id: &str, api: &str, strategy: &str) -> PinObservation {
-        match self.historical_route(api, strategy) {
-            Ok(()) => self.get_observed(id).await,
-            Err(error) => PinObservation {
-                result: Err(error),
-                resources: Vec::new(),
-            },
+impl IpfsRpcProvider {
+    async fn pin_cid(&self, requested: &Cid) -> Result<Cid, ProviderError> {
+        let arg = requested.to_string();
+        let response = self
+            .target
+            .control(
+                "pin/add",
+                &[("arg", &arg), ("recursive", "true"), ("progress", "false")],
+                true,
+            )
+            .await?;
+        let pinned = pins_ack(response)?;
+        if !cid::equivalent(&pinned, requested) {
+            return Err(error::mismatch());
         }
+        Ok(pinned)
     }
+}
 
-    async fn unpin_historical(
-        &self,
-        id: &str,
-        api: &str,
-        strategy: &str,
-    ) -> Result<(), ProviderError> {
-        self.historical_route(api, strategy)?;
-        self.unpin(id).await
-    }
+#[derive(Deserialize)]
+struct Pins {
+    #[serde(rename = "Pins")]
+    pins: Vec<String>,
+}
+
+fn pins_ack(response: ControlResponse) -> Result<Cid, ProviderError> {
+    response.check(true)?;
+    let pins: Pins = response.json()?;
+    let [pin] = pins.pins.as_slice() else {
+        return Err(error::protocol("RPC pin response did not contain one root"));
+    };
+    cid::parse_ack(pin)
 }

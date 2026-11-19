@@ -1667,7 +1667,9 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hello"))
             .mount(&server)
             .await;
-        let state = test_state(server.uri()).await;
+        let mut state = test_state(server.uri()).await;
+        Arc::get_mut(&mut state).unwrap().pinning =
+            crate::import::test_support::automatic_pinning();
         let created_at = Utc::now();
         submit(
             &state,
@@ -1734,6 +1736,10 @@ mod tests {
                 .await
                 .unwrap(),
             0
+        );
+        assert_eq!(
+            crate::import::test_support::pin_counts(state.store.db()).await,
+            (0, 0)
         );
 
         let now = Utc::now();

@@ -1,23 +1,21 @@
 //! ZIP v2 fanout through signed S3, the durable pin worker and real provider HTTP.
+#[path = "support/pin_rows.rs"]
+mod pin_rows;
 #[allow(dead_code)]
 mod support;
 
 use std::{
     collections::{BTreeSet, HashMap},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
 use axum::{
     Json, Router,
-    extract::{Query, State},
-    http::{HeaderMap, StatusCode},
+    extract::State,
+    http::{HeaderMap, Method, StatusCode},
     routing::post,
 };
-use chrono::Utc;
 use http::HeaderValue;
 use ipfs_s3_gateway::{
     config::{Config, OptionalPinControlMode},
@@ -28,112 +26,53 @@ use ipfs_s3_gateway::{
         zip_policy::{ZipOutputRuleConfig, ZipRuleEffect},
     },
     state::AppState,
-    store::{
-        self,
-        entities::{pin_job, pin_lease_target, pin_provider_usage, remote_pin},
-        pinning::jobs,
-    },
+    store::{self, entities::object_version},
 };
-use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, Set};
+use sea_orm::{EntityTrait, PaginatorTrait};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use support::decompress::{AddReply, KuboScript, start_kubo_harness, start_s3_server};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Semaphore, watch};
 use tokio_util::sync::CancellationToken;
 
 const W: usize = 4;
-const BLOCKED: &str = "QmBlocked";
-const RECOVERED: &str = "QmA25";
-const FAILED: &str = "QmB11";
-const NORMAL: &str = "QmNormal";
-
-#[derive(Clone, Debug)]
-struct Call {
-    provider: &'static str,
-    method: &'static str,
-    cid: String,
-}
+const BLOCKED_PAYLOAD: &[u8] = &[b'x'; 200];
+const FAILED_PAYLOAD: &[u8] = b"b-11";
+const NORMAL_PAYLOAD: &[u8] = b"data";
 
 #[derive(Default)]
 struct Traffic {
-    events: Vec<Call>,
+    posts: Vec<(&'static str, String)>,
+    unexpected: Vec<Method>,
     current: usize,
     max_global: usize,
-    a: usize,
-    b: usize,
-    max_a: usize,
-    max_b: usize,
 }
 
 #[derive(Clone)]
 struct ProviderState {
     name: &'static str,
     shared: Arc<Mutex<Traffic>>,
-    changed: Arc<Notify>,
-    first: Arc<AtomicBool>,
-    release: Arc<Notify>,
-    released: Arc<AtomicBool>,
+    failed_cid: String,
+    first_cid: watch::Sender<Option<String>>,
+    release: Arc<Semaphore>,
 }
 
-struct ActiveCall(ProviderState);
+struct ActiveCall(Arc<Mutex<Traffic>>);
 impl Drop for ActiveCall {
     fn drop(&mut self) {
-        let state = self.0.clone();
-        tokio::spawn(async move {
-            let mut traffic = state.shared.lock().await;
-            traffic.current -= 1;
-            if state.name == "a" {
-                traffic.a -= 1;
-            } else {
-                traffic.b -= 1;
-            }
-            state.changed.notify_waiters();
-        });
+        self.0.lock().unwrap().current -= 1;
     }
 }
 
 impl ProviderState {
-    async fn enter(&self, method: &'static str, cid: String) -> ActiveCall {
-        let mut t = self.shared.lock().await;
-        t.events.push(Call {
-            provider: self.name,
-            method,
-            cid,
-        });
-        t.current += 1;
-        t.max_global = t.max_global.max(t.current);
-        if self.name == "a" {
-            t.a += 1;
-            t.max_a = t.max_a.max(t.a);
-        } else {
-            t.b += 1;
-            t.max_b = t.max_b.max(t.b);
-        }
-        self.changed.notify_waiters();
-        ActiveCall(self.clone())
-    }
-    async fn wait_first_post(&self) {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let notified = self.changed.notified();
-                if self
-                    .shared
-                    .lock()
-                    .await
-                    .events
-                    .iter()
-                    .any(|e| e.provider == self.name && e.method == "POST")
-                {
-                    break;
-                }
-                notified.await;
-            }
-        })
-        .await
-        .expect("first provider POST reached the barrier");
-    }
-    fn open(&self) {
-        self.released.store(true, Ordering::SeqCst);
-        self.release.notify_waiters();
+    async fn wait_first_post(&self) -> String {
+        let mut first_cid = self.first_cid.subscribe();
+        let reached =
+            tokio::time::timeout(Duration::from_secs(10), first_cid.wait_for(Option::is_some))
+                .await
+                .expect("first provider POST reached the barrier")
+                .unwrap();
+        reached.clone().unwrap()
     }
 }
 
@@ -144,66 +83,57 @@ async fn submit(
 ) -> (StatusCode, Json<Value>) {
     assert_eq!(headers.get("authorization").unwrap(), "Bearer test-token");
     let cid = body["cid"].as_str().expect("PSA CID").to_owned();
-    let _active = state.enter("POST", cid.clone()).await;
-    if !state.first.swap(true, Ordering::SeqCst) {
-        while !state.released.load(Ordering::SeqCst) {
-            state.release.notified().await;
-        }
+    {
+        let mut traffic = state.shared.lock().unwrap();
+        traffic.posts.push((state.name, cid.clone()));
+        traffic.current += 1;
+        traffic.max_global = traffic.max_global.max(traffic.current);
     }
-    // Allows actual overlapping HTTP handlers to be measured after the explicit barrier.
-    tokio::time::sleep(Duration::from_millis(25)).await;
-    if cid == FAILED {
+    let _active = ActiveCall(state.shared.clone());
+    if state.first_cid.send_if_modified(|first| {
+        if first.is_some() {
+            return false;
+        }
+        *first = Some(cid.clone());
+        true
+    }) {
+        state.release.acquire().await.unwrap().forget();
+    }
+    if cid == state.failed_cid {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error":"invalid CID"})),
         );
     }
     (
-        StatusCode::OK,
+        StatusCode::ACCEPTED,
         Json(
-            json!({"requestid": format!("request-{cid}"), "status":"pinned", "pin":{"cid":cid,"meta":{}}, "info":{}}),
+            json!({"requestid": format!("request-{cid}"), "status":"queued", "pin":{"cid":cid,"meta":{}}, "info":{}}),
         ),
     )
 }
 
-async fn find(
-    State(state): State<ProviderState>,
-    headers: HeaderMap,
-    Query(query): Query<HashMap<String, String>>,
-) -> Json<Value> {
-    assert_eq!(headers.get("authorization").unwrap(), "Bearer test-token");
-    let cid = query.get("cid").expect("find CID").clone();
-    let metadata: Value =
-        serde_json::from_str(query.get("meta").expect("find correlation")).unwrap();
-    assert!(metadata["gateway_job_id"].is_string());
-    let _active = state.enter("GET", cid.clone()).await;
-    tokio::time::sleep(Duration::from_millis(25)).await;
-    if cid == RECOVERED {
-        Json(
-            json!({"count":1,"results":[{"requestid":format!("request-{cid}"),"status":"pinned","pin":{"cid":cid,"meta":metadata},"info":{}}]}),
-        )
-    } else {
-        Json(json!({"count":0,"results":[]}))
-    }
+async fn unexpected(State(state): State<ProviderState>, method: Method) -> StatusCode {
+    state.shared.lock().unwrap().unexpected.push(method);
+    StatusCode::METHOD_NOT_ALLOWED
 }
 
 async fn provider(
     name: &'static str,
     shared: Arc<Mutex<Traffic>>,
-    changed: Arc<Notify>,
 ) -> (ProviderState, tokio::task::JoinHandle<()>, String) {
     let state = ProviderState {
         name,
         shared,
-        changed,
-        first: Arc::new(AtomicBool::new(false)),
-        release: Arc::new(Notify::new()),
-        released: Arc::new(AtomicBool::new(false)),
+        failed_cid: raw_cid(FAILED_PAYLOAD),
+        first_cid: watch::channel(None).0,
+        release: Arc::new(Semaphore::new(0)),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let app = Router::new()
-        .route("/v1/ipfs/pins", post(submit).get(find))
+        .route("/v1/ipfs/pins", post(submit).fallback(unexpected))
+        .fallback(unexpected)
         .with_state(state.clone());
     let handle = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
@@ -227,17 +157,12 @@ fn crc(data: &[u8]) -> u32 {
     }
     !crc
 }
-fn archive(names: &[String]) -> Vec<u8> {
+fn archive(entries: &[(String, Vec<u8>)]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut central = Vec::new();
-    for name in names {
-        let data = if name == "b/blocked.txt" {
-            vec![b'x'; 200]
-        } else {
-            b"data".to_vec()
-        };
+    for (name, data) in entries {
         let offset = out.len();
-        let checksum = crc(&data);
+        let checksum = crc(data);
         u32_into(&mut out, 0x04034b50);
         for n in [20, 0, 0, 0, 0] {
             u16_into(&mut out, n);
@@ -248,7 +173,7 @@ fn archive(names: &[String]) -> Vec<u8> {
         u16_into(&mut out, name.len());
         u16_into(&mut out, 0);
         out.extend_from_slice(name.as_bytes());
-        out.extend_from_slice(&data);
+        out.extend_from_slice(data);
         u32_into(&mut central, 0x02014b50);
         for n in [20, 20, 0, 0, 0, 0] {
             u16_into(&mut central, n);
@@ -267,7 +192,7 @@ fn archive(names: &[String]) -> Vec<u8> {
     let central_size = central.len();
     out.extend_from_slice(&central);
     u32_into(&mut out, 0x06054b50);
-    for n in [0, 0, names.len(), names.len()] {
+    for n in [0, 0, entries.len(), entries.len()] {
         u16_into(&mut out, n);
     }
     u32_into(&mut out, central_size);
@@ -276,8 +201,9 @@ fn archive(names: &[String]) -> Vec<u8> {
     out
 }
 
-fn cid(s: String) -> &'static str {
-    Box::leak(s.into_boxed_str())
+fn raw_cid(bytes: &[u8]) -> String {
+    let hash = cid::multihash::Multihash::<64>::wrap(0x12, &Sha256::digest(bytes)).unwrap();
+    cid::Cid::new_v1(0x55, hash).to_string()
 }
 fn zip_headers(token: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
@@ -296,37 +222,61 @@ fn zip_headers(token: &str) -> HeaderMap {
 
 #[tokio::test]
 #[ignore = "run explicitly for the multi-provider ZIP fanout acceptance gate"]
-async fn signed_zip_batches_share_quota_but_not_logical_leases_and_worker_remains_fair() {
+async fn signed_zip_batches_share_resources_and_provider_acks_leave_s3_unblocked() {
     let shared = Arc::new(Mutex::new(Traffic::default()));
-    let changed = Arc::new(Notify::new());
-    let (a, a_handle, a_url) = provider("a", shared.clone(), changed.clone()).await;
-    let (b, b_handle, b_url) = provider("b", shared.clone(), changed).await;
+    let (a, a_handle, a_url) = provider("a", shared.clone()).await;
+    let (b, b_handle, b_url) = provider("b", shared.clone()).await;
 
     let first = (0..33)
-        .map(|i| format!("a/first-{i:02}.txt"))
-        .chain((0..31).map(|i| format!("b/first-{i:02}.txt")))
-        .chain(std::iter::once("b/blocked.txt".into()))
+        .map(|i| {
+            (
+                format!("a/first-{i:02}.txt"),
+                format!("a-{:02}", i % 26).into_bytes(),
+            )
+        })
+        .chain((0..31).map(|i| {
+            (
+                format!("b/first-{i:02}.txt"),
+                format!("b-{:02}", i % 10).into_bytes(),
+            )
+        }))
+        .chain(std::iter::once((
+            "b/blocked.txt".into(),
+            BLOCKED_PAYLOAD.to_vec(),
+        )))
         .collect::<Vec<_>>();
     let second = (0..15)
-        .map(|i| format!("a/second-{i:02}.txt"))
-        .chain((0..15).map(|i| format!("b/second-{i:02}.txt")))
+        .map(|i| {
+            (
+                format!("a/second-{i:02}.txt"),
+                format!("a-{:02}", (i + 14) % 28).into_bytes(),
+            )
+        })
+        .chain((0..15).map(|i| {
+            (
+                format!("b/second-{i:02}.txt"),
+                format!("b-{:02}", i % 12).into_bytes(),
+            )
+        }))
         .collect::<Vec<_>>();
     let first_zip = archive(&first);
     let second_zip = archive(&second);
-    let mut replies = vec![AddReply::Ok("QmArchive1")];
-    replies.extend((0..33).map(|i| AddReply::Ok(cid(format!("QmA{:02}", i % 26)))));
-    replies.extend((0..31).map(|i| AddReply::Ok(cid(format!("QmB{:02}", i % 10)))));
-    replies.push(AddReply::Ok(BLOCKED));
-    replies.push(AddReply::Ok("QmArchive2"));
-    replies.extend((0..15).map(|i| AddReply::Ok(cid(format!("QmA{:02}", (i + 14) % 28)))));
-    replies.extend((0..15).map(|i| AddReply::Ok(cid(format!("QmB{:02}", i % 12)))));
-    replies.push(AddReply::Ok(NORMAL));
+    let mut replies = Vec::new();
+    let mut cat_bodies = HashMap::new();
+    for (zip, entries) in [(&first_zip, &first), (&second_zip, &second)] {
+        let cid: &'static str = raw_cid(zip).leak();
+        replies.push(AddReply::Ok(cid));
+        cat_bodies.insert(cid.to_owned(), zip.clone());
+        replies.extend(
+            entries
+                .iter()
+                .map(|(_, data)| AddReply::Ok(raw_cid(data).leak())),
+        );
+    }
+    replies.push(AddReply::Ok(raw_cid(NORMAL_PAYLOAD).leak()));
     let kubo = start_kubo_harness(KuboScript {
         add_replies: replies,
-        cat_bodies: HashMap::from([
-            ("QmArchive1".into(), first_zip.clone()),
-            ("QmArchive2".into(), second_zip.clone()),
-        ]),
+        cat_bodies,
     })
     .await;
     let raw = format!(
@@ -335,6 +285,8 @@ async fn signed_zip_batches_share_quota_but_not_logical_leases_and_worker_remain
         rpc_url = {:?}
         [storage]
         database_url = "sqlite::memory:"
+        [decompress_zip]
+        auto_pin_outputs = true
         [pinning]
         worker_interval = "1s"
         worker_concurrency = 4
@@ -446,7 +398,7 @@ async fn signed_zip_batches_share_quota_but_not_logical_leases_and_worker_remain
         validated,
         None,
         OptionalPinControlMode::Strict,
-        true,
+        false,
         &config.decompress_zip.pin_output_rules,
     )
     .unwrap();
@@ -454,7 +406,6 @@ async fn signed_zip_batches_share_quota_but_not_logical_leases_and_worker_remain
     store::run_migrations(&db).await.unwrap();
     store::bucket::create(&db, "test-bkt", None).await.unwrap();
     let store = store::Store::new(db);
-    pinning.register_identities(&store).await.unwrap();
     let state = Arc::new(AppState {
         kubo: ipfs_s3_gateway::kubo::KuboClient::new(kubo.server.uri()),
         cold_kubo: None,
@@ -463,7 +414,7 @@ async fn signed_zip_batches_share_quota_but_not_logical_leases_and_worker_remain
         master_key: ipfs_s3_gateway::crypto::key::MasterKey::from_hex(&"0".repeat(64)).unwrap(),
         pinning,
     });
-    let server = start_s3_server(state.clone(), Arc::new(Mutex::new(Vec::new()))).await;
+    let server = start_s3_server(state.clone(), Arc::default()).await;
 
     for (source, token, bytes, count) in [
         ("first.zip", "first-load", first_zip, 65),
@@ -490,237 +441,159 @@ async fn signed_zip_batches_share_quota_but_not_logical_leases_and_worker_remain
         assert!(xml.contains("<RootStatus>disabled</RootStatus>"), "{xml}");
     }
     let db = state.store.db();
-    assert_eq!(
-        pin_lease_target::Entity::find().count(db).await.unwrap(),
-        95,
-        "logical ZIP targets"
-    );
-    assert_eq!(
-        remote_pin::Entity::find().count(db).await.unwrap(),
-        40,
-        "28 A + 12 B; quota-blocked CID has no remote allocation"
-    );
-    assert!(
-        remote_pin::Entity::find_by_id((b_key.clone(), BLOCKED.to_owned()))
-            .one(db)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    let blocked = pin_lease_target::Entity::find()
-        .filter(pin_lease_target::Column::Provider.eq(&b_key))
-        .filter(pin_lease_target::Column::Cid.eq(BLOCKED))
-        .one(db)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(blocked.state, "quota_blocked");
-    let before = shared.lock().await;
-    assert!(
-        before.events.is_empty(),
-        "publication does not perform remote HTTP"
-    );
-    drop(before);
-
-    // A durable expired running Submit with an unknown outbound effect: the worker
-    // must query the same historical PSA route, not repeat the uncertain POST.
-    let job = pin_job::Entity::find()
-        .filter(pin_job::Column::Cid.eq(RECOVERED))
-        .filter(pin_job::Column::Operation.eq("submit"))
-        .one(db)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(job.state, "pending");
-    let mut crashed: pin_job::ActiveModel = job.clone().into();
-    crashed.state = Set("running".into());
-    crashed.locked_until = Set(Some(Utc::now() - chrono::Duration::seconds(1)));
-    crashed.submit_phase = Set(Some("calling".into()));
-    crashed.update(db).await.unwrap();
-    jobs::history::Entity::insert(jobs::history::ActiveModel {
-        job_id: Set(job.id.clone()),
-        correlation: Set(None),
-        api: Set("psa".into()),
-        strategy: Set("cid".into()),
-        effect: Set("unknown".into()),
-        state: Set("active".into()),
-        first_error: Set(None),
-        last_error: Set(None),
-        submit_calls: Set(1),
-        recovery_queries: Set(0),
-        started_at: Set(Utc::now()),
-    })
-    .exec(db)
-    .await
-    .unwrap();
+    assert_eq!(object_version::Entity::find().count(db).await.unwrap(), 95);
+    assert_eq!(pin_rows::count(db, "pin_refs").await, 95);
+    let resources = pin_rows::resources(db).await;
+    assert_eq!(resources.len(), 41, "28 A + 12 B + one oversized CID");
+    assert!(resources.iter().all(|r| r.status == "waiting"
+        && r.action.as_deref() == Some("submit")
+        && r.handle.is_none()));
+    {
+        let traffic = shared.lock().unwrap();
+        assert!(
+            traffic.posts.is_empty() && traffic.unexpected.is_empty(),
+            "publication does not perform remote HTTP"
+        );
+    }
+    let blocked_cid = raw_cid(BLOCKED_PAYLOAD);
+    let failed_cid = raw_cid(FAILED_PAYLOAD);
+    let normal_cid = raw_cid(NORMAL_PAYLOAD);
 
     let worker = state
         .pinning
         .start(state.store.clone(), CancellationToken::new());
-    a.wait_first_post().await;
+    let first_a = a.wait_first_post().await;
     b.wait_first_post().await;
-    let normal = support::sigv4::send_sigv4(
-        reqwest::Method::PUT,
-        &server.endpoint,
-        "test-bkt",
-        "normal/job",
-        &[],
-        b"data".to_vec(),
-        HeaderMap::new(),
-        "test",
+    let normal = tokio::time::timeout(
+        Duration::from_secs(10),
+        support::sigv4::send_sigv4(
+            reqwest::Method::PUT,
+            &server.endpoint,
+            "test-bkt",
+            "normal/file",
+            &[],
+            NORMAL_PAYLOAD.to_vec(),
+            HeaderMap::new(),
+            "test",
+        ),
     )
-    .await;
+    .await
+    .expect("S3 PUT must finish while both provider acknowledgments are blocked");
     assert_eq!(
         normal.status(),
         StatusCode::OK,
         "{}",
         normal.text().await.unwrap()
     );
-    assert_eq!(
-        pin_lease_target::Entity::find().count(db).await.unwrap(),
-        96
+    let ordinary = store::object::get_latest(db, "test-bkt", "normal/file")
+        .await
+        .unwrap();
+    assert_eq!(ordinary.cid, normal_cid);
+    assert_eq!(object_version::Entity::find().count(db).await.unwrap(), 96);
+    let refs = pin_rows::refs(db).await;
+    assert_eq!(refs.len(), 96);
+    assert!(
+        refs.iter().any(|r| r.owner_object_id == ordinary.id
+            && r.provider == b_key
+            && r.cid == normal_cid)
     );
-    a.open();
-    b.open();
-
-    tokio::time::timeout(Duration::from_secs(45), async {
+    b.release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            let jobs = pin_job::Entity::find().all(db).await.unwrap();
-            let traffic = shared.lock().await;
-            let normal_seen = traffic
-                .events
+            let rows = pin_rows::resources(db).await;
+            if rows
                 .iter()
-                .any(|event| event.cid == NORMAL && event.method == "POST");
-            let recovered = traffic
-                .events
-                .iter()
-                .any(|event| event.cid == RECOVERED && event.method == "GET");
-            let posts = traffic
-                .events
-                .iter()
-                .filter(|event| event.method == "POST")
-                .count();
-            drop(traffic);
-            if normal_seen
-                && recovered
-                && posts == 40
-                && jobs.iter().all(|job| {
-                    job.state == "done"
-                        || (job.state == "pending" && job.next_attempt_at > Utc::now())
-                        || (job.state == "running"
-                            && job.locked_until.is_none()
-                            && matches!(
-                                (job.operation.as_str(), job.last_error.as_deref()),
-                                ("submit", Some("provider rejected invalid input"))
-                                    | ("reconcile", Some("submit requires operator attention"))
-                                    | (
-                                        "reconcile",
-                                        Some("historical identity unavailable; needs_attention")
-                                    )
-                            ))
-                })
+                .any(|r| r.cid == normal_cid && r.status == "accepted")
             {
+                let stalled = rows.iter().find(|r| r.cid == first_a).unwrap();
+                assert_eq!(stalled.status, "pending");
+                assert!(stalled.handle.is_none());
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("ZIP fanout and ordinary/recovery work reach a safe settled or parked state");
+    .expect("ordinary pin reached ACK on B while A still had a blocked ZIP pin");
+    a.release.add_permits(1);
+
+    let settled = tokio::time::timeout(Duration::from_secs(45), async {
+        loop {
+            let rows = pin_rows::resources(db).await;
+            if rows.iter().all(|r| {
+                r.status
+                    == if r.cid == blocked_cid {
+                        "waiting"
+                    } else if r.cid == failed_cid {
+                        "failed"
+                    } else {
+                        "accepted"
+                    }
+            }) {
+                break rows;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("ZIP fanout receives each ACK or terminal rejection except the oversized CID");
     worker.shutdown(Duration::from_secs(2)).await;
 
-    let targets = pin_lease_target::Entity::find().all(db).await.unwrap();
-    assert_eq!(targets.len(), 96);
-    assert_eq!(targets.iter().filter(|t| t.provider == a_key).count(), 48);
-    assert_eq!(targets.iter().filter(|t| t.provider == b_key).count(), 48);
+    assert_eq!(refs.iter().filter(|r| r.provider == a_key).count(), 48);
+    assert_eq!(refs.iter().filter(|r| r.provider == b_key).count(), 48);
     assert_eq!(
-        targets
-            .iter()
-            .filter(|t| t.state == "quota_blocked")
-            .count(),
-        1
+        refs.iter()
+            .map(|r| &r.owner_object_id)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        96
     );
-    let remotes = remote_pin::Entity::find().all(db).await.unwrap();
-    let distinct = remotes
-        .iter()
-        .map(|r| (r.provider.clone(), r.cid.clone()))
-        .collect::<BTreeSet<_>>();
-    assert_eq!(distinct.len(), remotes.len(), "one DB row per provider/CID");
-    assert_eq!(remotes.len(), 41, "28 A + 12 B + normal");
-    let usage_a = pin_provider_usage::Entity::find_by_id(&a_key)
-        .one(db)
-        .await
-        .unwrap()
-        .unwrap();
-    let usage_b = pin_provider_usage::Entity::find_by_id(&b_key)
-        .one(db)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(usage_a.reserved_pins, 28);
-    assert_eq!(usage_b.reserved_pins, 13);
+    assert_eq!(settled.len(), 42, "28 A + 12 B + oversized + ordinary");
+    for r in &settled {
+        if r.cid == blocked_cid {
+            assert_eq!(r.provider, b_key);
+            assert_eq!(r.logical_size, BLOCKED_PAYLOAD.len() as i64);
+            assert_eq!(r.action.as_deref(), Some("submit"));
+            assert!(r.handle.is_none());
+        } else {
+            assert!(r.action.is_none());
+            if r.cid == failed_cid {
+                assert!(r.handle.is_none());
+            } else {
+                assert_eq!(r.handle, Some(format!("request-{}", r.cid)));
+            }
+        }
+    }
 
-    let traffic = shared.lock().await;
-    let posts = traffic
-        .events
-        .iter()
-        .filter(|e| e.method == "POST")
-        .collect::<Vec<_>>();
-    assert_eq!(posts.len(), 40, "unique remotes minus adopted recovery");
-    assert_eq!(
-        posts.iter().filter(|e| e.cid == FAILED).count(),
-        1,
-        "terminal error has bounded attempts"
-    );
-    assert!(!posts.iter().any(|e| e.cid == BLOCKED || e.cid == RECOVERED));
-    assert_eq!(
-        traffic
-            .events
+    {
+        let traffic = shared.lock().unwrap();
+        assert!(
+            traffic.unexpected.is_empty(),
+            "ACKs need no verification HTTP: {:?}",
+            traffic.unexpected
+        );
+        assert!(
+            (2..=W).contains(&traffic.max_global),
+            "in-flight POST peak: {}",
+            traffic.max_global
+        );
+        let expected: BTreeSet<_> = settled
             .iter()
-            .filter(|e| e.method == "GET" && e.cid == RECOVERED)
-            .count(),
-        1
-    );
-    assert!(
-        traffic.max_global <= W && traffic.max_a <= W && traffic.max_b <= W,
-        "global/provider in-flight max: {}/{}/{}",
-        traffic.max_global,
-        traffic.max_a,
-        traffic.max_b
-    );
-    assert!(
-        traffic.max_global >= 2,
-        "the barriers observed both providers in flight"
-    );
-    let normal_index = traffic
-        .events
-        .iter()
-        .position(|e| e.cid == NORMAL && e.method == "POST")
-        .unwrap();
-    let final_zip_index = traffic
-        .events
-        .iter()
-        .rposition(|e| e.method == "POST" && e.cid != NORMAL)
-        .unwrap();
-    assert!(
-        normal_index < final_zip_index,
-        "normal PUT received service before ZIP backlog drained"
-    );
-    let recovery_index = traffic
-        .events
-        .iter()
-        .position(|e| e.cid == RECOVERED && e.method == "GET")
-        .unwrap();
-    assert!(
-        recovery_index < final_zip_index,
-        "reclaimed work received service during ZIP fanout"
-    );
-    drop(traffic);
-    let history = jobs::submission_history(db, &job.id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!((history.submit_calls, history.recovery_queries), (1, 1));
+            .filter(|r| r.cid != blocked_cid)
+            .map(|r| (if r.provider == a_key { "a" } else { "b" }, r.cid.as_str()))
+            .collect();
+        let posts: BTreeSet<_> = traffic
+            .posts
+            .iter()
+            .map(|(provider, cid)| (*provider, cid.as_str()))
+            .collect();
+        assert_eq!(
+            traffic.posts.len(),
+            expected.len(),
+            "one POST per eligible provider/CID, including the rejected CID"
+        );
+        assert_eq!(posts, expected);
+    }
     server.shutdown().await;
     a_handle.abort();
     b_handle.abort();

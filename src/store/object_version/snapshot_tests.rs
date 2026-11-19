@@ -82,7 +82,7 @@ async fn exercise_interleavings(db: &DatabaseConnection) {
                 )
                 .await
                 .unwrap();
-                crate::store::pinning::publication::delete_version_with_leases_guarded(
+                crate::store::pinning::publication::delete_version_guarded(
                     db,
                     &bucket,
                     "key",

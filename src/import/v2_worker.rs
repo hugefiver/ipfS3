@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use sea_orm::DatabaseConnection;
+use sea_orm::{DatabaseConnection, TransactionTrait};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -24,7 +24,7 @@ use crate::{
         import::ownership,
         pinning::publication::{
             CapturedZipPublication, PublicationObject, ZipExecutionSettlement,
-            ZipPublicationAuthority, application::publish_captured_zip, decode_zip_capture_json,
+            ZipPublicationAuthority, decode_zip_capture_json, publish_captured_zip,
         },
         zip::{self, execution, import_intake},
     },
@@ -345,14 +345,12 @@ async fn execute_inner(
         .map_err(|_| RunError::Fenced)?;
     if snapshot.state == "pending" {
         crate::store::pinning::publication::preflight_captured_zip_routes(
-            &state.store,
             &intent,
             state.pinning.effective_config(),
             state.pinning.zip_output_rules(),
             state.pinning.control_mode(),
             None,
         )
-        .await
         .map_err(|error| match error {
             AppError::InvalidPinningRequest(_) => RunError::Fenced,
             _ => RunError::Retry,
@@ -445,12 +443,7 @@ async fn execute_inner(
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        let work = crate::store::pinning::management::records::SharedDecodeBudget::default();
-        let tx = state
-            .store
-            .begin_runtime(crate::store::pinning::management::records::DecodeWork::shared(&work))
-            .await
-            .map_err(|_| RunError::Retry)?;
+        let tx = db.begin().await.map_err(|_| RunError::Retry)?;
         ownership::lock_bucket_for_ownership(&tx, &snapshot.bucket)
             .await
             .map_err(|_| RunError::Retry)?;
@@ -490,7 +483,7 @@ async fn execute_inner(
             input_identity: "pending".into(),
             captured_options: snapshot.captured_options.clone(),
         };
-        zip::BatchAdmission::admit_runtime_mirror(&tx, &mirror)
+        zip::BatchAdmission::admit_in_transaction(&tx, &mirror)
             .await
             .map_err(|_| RunError::Retry)?;
         execution::admit_manifest_in_transaction(&tx, claim, &v2_items, &mutation_ids)
@@ -643,14 +636,12 @@ async fn execute_inner(
     }
     manifest.root_error = root_error;
     crate::store::pinning::publication::preflight_captured_zip_routes(
-        &state.store,
         &intent,
         state.pinning.effective_config(),
         state.pinning.zip_output_rules(),
         state.pinning.control_mode(),
         Some(&manifest),
     )
-    .await
     .map_err(|error| match error {
         AppError::InvalidPinningRequest(_) => RunError::Fenced,
         _ => RunError::Retry,
@@ -710,7 +701,7 @@ async fn execute_inner(
         terminal_result: terminal,
     };
     match publish_captured_zip(
-        &state.store,
+        db,
         request,
         state.pinning.effective_config(),
         state.pinning.zip_output_rules(),

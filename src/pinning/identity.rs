@@ -9,24 +9,6 @@ pub enum CleanupMode {
     Managed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Ownership {
-    ApplicationCreated,
-    ExternalExisting,
-    Unknown,
-}
-
-impl Ownership {
-    pub(crate) fn from_persisted(raw: &str) -> Self {
-        match raw {
-            "application_created" => Self::ApplicationCreated,
-            "external_existing" => Self::ExternalExisting,
-            _ => Self::Unknown,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PinningIdentityConfig {

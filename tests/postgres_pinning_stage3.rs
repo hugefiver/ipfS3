@@ -1,17 +1,22 @@
-//! Real PostgreSQL 17/18 evidence. Each ignored test requires an explicit test URL
-//! and creates/drops only its own UUID-named schema (never the public schema).
+//! Publication transactions on SQLite and real PostgreSQL 17/18. Each PostgreSQL
+//! test requires an explicit URL and creates/drops its own UUID-named schema.
+#[path = "support/pin_rows.rs"]
+mod pin_rows;
 #[path = "support/postgres_pinning_stage3.rs"]
 mod postgres;
+#[allow(dead_code)]
+mod stage9_zip_support;
 
 use std::collections::HashMap;
 
 use chrono::Utc;
 use ipfs_s3_gateway::{
-    config::{OptionalPinControlMode, PinningConfig},
+    config::OptionalPinControlMode,
+    error::AppError,
     import::ImportSource,
     lifecycle::model::MultipartUploadTargetIdentity,
     pinning::{
-        config::{ProviderLimitMap, ValidatedPinningConfig},
+        config::ValidatedPinningConfig,
         decision::{DecisionEffect, DecisionOrigin, ExtensionDecision},
         policy::{PinPolicyEvaluator, PublicationContext, PublicationPolicy},
         tags::ObjectTag,
@@ -23,54 +28,57 @@ use ipfs_s3_gateway::{
             jobs,
             ownership::{self, ExpectedImportTarget, ImportPublicationGuard},
         },
+        multipart::CommitCompletedUploadError,
         pinning::{
-            decision as stored_decision,
+            decision::read_for_version,
             publication::{
                 self, DecidedPublish, PinTargetSpec, PublicationObject, PublicationRequest,
-                ZipPublicationRequest,
             },
         },
     },
 };
 use postgres::isolated;
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, Database, DatabaseBackend, DatabaseConnection, DbErr,
-    EntityTrait, PaginatorTrait, QueryFilter, Statement, TransactionTrait,
+    ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait, PaginatorTrait,
+    QueryFilter, Statement,
 };
+use stage9_zip_support::{ARCHIVE_CID as CID, config, prepared, publish_captured, setup};
 
-const BUCKET: &str = "stage3-bucket";
-const CID: &str = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
+const BUCKET: &str = "bucket";
+const ORDINARY_KEY: &str = "out/ordinary";
+const MPU_KEY: &str = "out/mpu";
+const IMPORT_KEY: &str = "out/import";
 
 fn captured(
+    config: &ValidatedPinningConfig,
     key: &str,
     admission: &str,
-) -> (PublicationPolicy, ExtensionDecision, ValidatedPinningConfig) {
-    let config = ValidatedPinningConfig::from_raw(&PinningConfig::default(), |_| None).unwrap();
-    let tags = vec![
+) -> (PublicationPolicy, ExtensionDecision) {
+    let tags = [
         ObjectTag::new("ipfs-s3:pin", "true"),
         ObjectTag::new("private", "do-not-leak"),
     ];
-    let (policy, decision) = PinPolicyEvaluator::with_mode(&config, OptionalPinControlMode::Warn)
+    let (policy, decision) = PinPolicyEvaluator::with_mode(config, OptionalPinControlMode::Warn)
         .evaluate_publication_decision(
             PublicationContext {
                 bucket: BUCKET,
                 key,
                 tags: &tags,
-                is_decompress_zip: true,
+                is_decompress_zip: false,
             },
             DecisionOrigin::new("stage3-test", admission),
         )
         .unwrap();
-    assert_eq!(decision.effect, DecisionEffect::Skipped);
-    (policy, decision, config)
+    assert_eq!(decision.effect, DecisionEffect::Accepted);
+    (policy, decision)
 }
 
 fn request(id: &str, key: &str, policy: PublicationPolicy) -> PublicationRequest {
     let object = PublicationObject::from_put(
-        id.to_owned(),
+        id.into(),
         BUCKET,
         key,
-        CID.to_owned(),
+        CID.into(),
         1,
         None,
         None,
@@ -83,7 +91,7 @@ fn request(id: &str, key: &str, policy: PublicationPolicy) -> PublicationRequest
         tags: policy.tags.clone(),
         object_target: PinTargetSpec {
             cid: object.cid.clone(),
-            logical_size: 1,
+            logical_size: object.logical_size,
         },
         object,
         policy,
@@ -93,355 +101,127 @@ fn request(id: &str, key: &str, policy: PublicationPolicy) -> PublicationRequest
 fn captured_args<'a>(
     decision: &'a ExtensionDecision,
     config: &'a ValidatedPinningConfig,
-    limits: &'a ProviderLimitMap,
 ) -> DecidedPublish<'a> {
     DecidedPublish {
         decision,
         config,
         mode: OptionalPinControlMode::Warn,
-        limits,
-    }
-}
-
-async fn count(db: &DatabaseConnection, table: &str) -> u64 {
-    match table {
-        "objects" => object::Entity::find().count(db).await.unwrap(),
-        "object_versions" => object_version::Entity::find().count(db).await.unwrap(),
-        "pin_extension_decisions" => {
-            ipfs_s3_gateway::store::entities::pin_extension_decision::Entity::find()
-                .count(db)
-                .await
-                .unwrap()
-        }
-        other => panic!("unexpected count table {other}"),
+        limits: &config.provider_limits,
     }
 }
 
 async fn assert_no_published_objects(db: &DatabaseConnection) {
-    for table in ["objects", "object_versions", "pin_extension_decisions"] {
-        assert_eq!(count(db, table).await, 0, "orphan in {table}");
-    }
+    assert_eq!(object::Entity::find().count(db).await.unwrap(), 0);
+    assert_eq!(object_version::Entity::find().count(db).await.unwrap(), 0);
+    assert_eq!(pin_rows::count(db, "pin_refs").await, 0);
+    assert_eq!(pin_rows::count(db, "pin_resources").await, 0);
 }
 
-async fn seeded_bucket(db: &DatabaseConnection) {
-    store::bucket::create(db, BUCKET, None).await.unwrap();
-}
-
-fn assert_pg_constraint(error: DbErr, sqlstate: &str, constraint: &str) {
-    let detail = format!("{error:?}");
+fn assert_database_fault(error: AppError, marker: &str) {
     assert!(
-        detail.contains(&format!("code: \"{sqlstate}\"")) && detail.contains(constraint),
-        "expected PostgreSQL SQLSTATE {sqlstate} from {constraint}, got {detail}"
+        matches!(&error, AppError::Database(message) if message.contains(marker)),
+        "expected injected database fault {marker}, got {error:?}"
     );
 }
 
-fn decision_insert(
-    version: &str,
-    owner: &str,
-    revision: &str,
-    effect: &str,
-    snapshot: &str,
-) -> Statement {
-    Statement::from_sql_and_values(
-        DatabaseBackend::Postgres,
-        "INSERT INTO pin_extension_decisions (version_row_id,object_id,control_revision,effect,snapshot) VALUES ($1,$2,$3,$4,$5)",
-        [
-            version.into(),
-            owner.into(),
-            revision.into(),
-            effect.into(),
-            snapshot.into(),
-        ],
+async fn assert_object_and_zip_rollback(db: &DatabaseConnection) {
+    let (reject, restore) = match db.get_database_backend() {
+        DatabaseBackend::Postgres => (
+            "CREATE FUNCTION stage3_reject_ref() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN RAISE EXCEPTION 'stage3-pin-ref'; END $$;
+             CREATE TRIGGER stage3_reject_ref BEFORE INSERT ON pin_refs
+             FOR EACH ROW EXECUTE FUNCTION stage3_reject_ref()",
+            "DROP TRIGGER stage3_reject_ref ON pin_refs",
+        ),
+        _ => (
+            "CREATE TRIGGER stage3_reject_ref BEFORE INSERT ON pin_refs
+             BEGIN SELECT RAISE(ABORT, 'stage3-pin-ref'); END",
+            "DROP TRIGGER stage3_reject_ref",
+        ),
+    };
+    db.execute_unprepared(reject).await.unwrap();
+    let config = config();
+    let (policy, decision) = captured(&config, ORDINARY_KEY, "ordinary-object");
+    let ordinary = request("ordinary-object", ORDINARY_KEY, policy);
+    let error = publication::publish_decided_object(
+        db,
+        ordinary.clone(),
+        captured_args(&decision, &config),
     )
-}
+    .await
+    .unwrap_err();
+    assert_database_fault(error, "stage3-pin-ref");
+    assert_no_published_objects(db).await;
 
-#[tokio::test]
-#[ignore = "requires IPFS_S3_TEST_POSTGRES_URL to an isolated PostgreSQL 17 or 18 test container"]
-async fn pg17_exact_version_owner_fk_checks_and_snapshot_read() {
-    isolated(true, |db| async move {
-        seeded_bucket(&db).await;
-        let limits = ProviderLimitMap::new();
-        for (id, key) in [("owner-one", "one"), ("owner-two", "two")] {
-            let (policy, decision, config) = captured(key, id);
-            publication::publish_decided_object(
-                &db,
-                request(id, key, policy),
-                captured_args(&decision, &config, &limits),
-            )
-            .await
-            .unwrap();
-        }
-        let (policy, free_decision, _) = captured("three", "owner-three");
-        publication::publish_object(&db, request("owner-three", "three", policy), &limits)
-            .await
-            .unwrap();
-        let row = object_version::Entity::find()
-            .filter(object_version::Column::ObjectId.eq("owner-one"))
-            .one(&db)
-            .await
-            .unwrap()
-            .unwrap();
-        let unclaimed = object_version::Entity::find()
-            .filter(object_version::Column::ObjectId.eq("owner-three"))
-            .one(&db)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(unclaimed.object_id.as_deref(), Some("owner-three"));
-        assert!(
-            stored_decision::read_for_version(&db, &unclaimed.id)
-                .await
-                .unwrap()
-                .is_none(),
-            "wrong-owner fixture must have an unoccupied version row"
-        );
-        let restored = stored_decision::read_for_version(&db, &row.id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(restored.origin.request_id, "owner-one");
-        assert_eq!(restored.effect, DecisionEffect::Skipped);
-        let snapshot = serde_json::to_string(&free_decision).unwrap();
-        let bad_source = decision_insert(
-            "missing-version",
-            "owner-one",
-            "revision-missing",
-            "skipped",
-            &snapshot,
-        );
-        assert_pg_constraint(
-            db.execute(bad_source).await.unwrap_err(),
-            "23503",
-            "fk_pin_extension_decisions_owner",
-        );
-        // Both the version and owner exist independently, but this exact pair does not.
-        let bad_owner = decision_insert(
-            &unclaimed.id,
-            "owner-two",
-            "revision-wrong-owner",
-            "skipped",
-            &snapshot,
-        );
-        assert_pg_constraint(
-            db.execute(bad_owner).await.unwrap_err(),
-            "23503",
-            "fk_pin_extension_decisions_owner",
-        );
-        assert_eq!(count(&db, "pin_extension_decisions").await, 2);
-        let bad_effect = decision_insert(
-            &unclaimed.id,
-            "owner-three",
-            "revision-effect",
-            "maybe",
-            &snapshot,
-        );
-        assert_pg_constraint(
-            db.execute(bad_effect).await.unwrap_err(),
-            "23514",
-            "pin_extension_decisions_effect_check",
-        );
-        let original_revision = restored.control_revision;
-        let duplicate = decision_insert(
-            &unclaimed.id,
-            "owner-three",
-            &original_revision,
-            "skipped",
-            &snapshot,
-        );
-        assert_pg_constraint(
-            db.execute(duplicate).await.unwrap_err(),
-            "23505",
-            "pin_extension_decisions_control_revision_key",
-        );
-
-        // The same version/owner pair accepts a fully valid capture; leave no test decision behind.
-        let transaction = db.begin().await.unwrap();
-        transaction
-            .execute(decision_insert(
-                &unclaimed.id,
-                "owner-three",
-                &free_decision.control_revision,
-                "skipped",
-                &snapshot,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(
-            stored_decision::read_for_version(&transaction, &unclaimed.id)
-                .await
-                .unwrap(),
-            Some(free_decision)
-        );
-        transaction.rollback().await.unwrap();
-        assert!(
-            stored_decision::read_for_version(&db, &unclaimed.id)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(count(&db, "pin_extension_decisions").await, 2);
-    })
-    .await;
-}
-
-#[tokio::test]
-#[ignore = "requires IPFS_S3_TEST_POSTGRES_URL to an isolated PostgreSQL 17 or 18 test container"]
-async fn pg17_object_and_zip_decision_insert_failure_roll_back_all_rows() {
-    isolated(true, |db| async move {
-        seeded_bucket(&db).await;
-        db.execute_unprepared("CREATE FUNCTION stage3_reject_decision() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'stage3-decision-insert'; END $$; CREATE TRIGGER stage3_reject BEFORE INSERT ON pin_extension_decisions FOR EACH ROW EXECUTE FUNCTION stage3_reject_decision()").await.unwrap();
-        let limits = ProviderLimitMap::new();
-        let (policy, decision, config) = captured("ordinary", "ordinary-object");
-        let error = publication::publish_decided_object(&db, request("ordinary-object", "ordinary", policy), captured_args(&decision, &config, &limits)).await.unwrap_err();
-        assert!(format!("{error:?}").contains("stage3-decision-insert"), "{error:?}");
-        assert_no_published_objects(&db).await;
-        let (policy, decision, config) = captured("archive.zip", "archive-object");
-        let entry = PublicationObject::from_put("entry-object".into(), BUCKET, "unzipped/item", CID.into(), 1, None, None, false, None, None, Utc::now());
-        let result = publication::publish_decided_zip(&db, ZipPublicationRequest {
-            archive: request("archive-object", "archive.zip", policy), entries: vec![entry],
-        }, None, captured_args(&decision, &config, &limits),
-        &ipfs_s3_gateway::pinning::zip_policy::ValidatedZipOutputRules::compile(&[], &config).unwrap()).await;
-        // The decision-insert trigger or the admission preflight must reject the
-        // publication; either way no durable row may survive.
-        assert!(result.is_err(), "{result:?}");
-        assert_no_published_objects(&db).await;
-    }).await;
-}
-
-#[tokio::test]
-#[ignore = "requires IPFS_S3_TEST_POSTGRES_URL to an isolated PostgreSQL 17 or 18 test container"]
-async fn pg17_mpu_jsonb_roundtrip_and_failed_completion_preserves_upload() {
-    isolated(true, |db| async move {
-        seeded_bucket(&db).await;
-        let (policy, decision, config) = captured("mpu", "upload-stage3");
-        store::multipart::create_upload_with_decision(&db, "upload-stage3", "multipart-object", BUCKET, "mpu", "none", None, None, None, None, &policy.tags, None, false, Some(&decision)).await.unwrap();
-        let saved = store::multipart::get_upload(&db, "upload-stage3").await.unwrap();
-        assert_eq!(store::multipart::decision_from_upload(&saved).unwrap().unwrap(), decision);
-        let kind = db.query_one(Statement::from_string(DatabaseBackend::Postgres,
-            "SELECT pg_typeof(pin_decision_json)::text AS kind FROM multipart_uploads WHERE upload_id='upload-stage3'"
-        )).await.unwrap().unwrap();
-        assert!(
-            kind.try_get::<String>("", "kind").unwrap() == "jsonb"
-                || kind.try_get::<String>("", "kind").unwrap() == "text",
-            "decision storage kind must round-trip the captured decision"
-        );
-        let target = MultipartUploadTargetIdentity { bucket: BUCKET.into(), key: "mpu".into(), upload_id: saved.upload_id.clone(), initiated_at: saved.created_at };
-        db.execute_unprepared("CREATE FUNCTION stage3_reject_delete() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'stage3-upload-delete'; END $$; CREATE TRIGGER stage3_fail_upload BEFORE DELETE ON multipart_uploads FOR EACH ROW EXECUTE FUNCTION stage3_reject_delete()").await.unwrap();
-        let limits = ProviderLimitMap::new();
-        let error = publication::publish_decided_completed_upload(&db, &target, request("completed-object", "mpu", policy), None, captured_args(&decision, &config, &limits)).await.unwrap_err();
-        assert!(format!("{error:?}").contains("stage3-upload-delete"), "{error:?}");
-        assert_no_published_objects(&db).await;
-        let still_there = store::multipart::get_upload(&db, "upload-stage3").await.unwrap();
-        assert_eq!(store::multipart::decision_from_upload(&still_there).unwrap(), Some(decision));
-    }).await;
-}
-
-#[tokio::test]
-#[ignore = "requires IPFS_S3_TEST_POSTGRES_URL to an isolated PostgreSQL 17 or 18 test container"]
-async fn pg17_import_text_decision_and_failed_final_update_roll_back_publication() {
-    isolated(true, |db| async move {
-        seeded_bucket(&db).await;
-        let (policy, decision, config) = captured("import", "job-stage3");
-        let now = Utc::now();
-        let submitted = ownership::submit_decided(&db, jobs::NewImportJob {
-            id: "job-stage3".into(), bucket: BUCKET.into(), key: "import".into(),
-            source: ImportSource::Cid(CID.into()), request_fingerprint: "fingerprint".into(),
-            client_token: None, object_content_type: None, metadata: HashMap::new(),
-            tags: policy.tags.clone(), decompress_prefix: None,
-        }, decision.clone(), now).await.unwrap();
-        assert!(matches!(submitted, jobs::SubmitImportOutcome::Created(_)));
-        let saved = import_job::Entity::find_by_id("job-stage3").one(&db).await.unwrap().unwrap();
-        let text = saved.pin_decision_json.as_deref().unwrap();
-        assert_eq!(serde_json::from_str::<ExtensionDecision>(text).unwrap(), decision);
-        assert!(!text.contains("do-not-leak"));
-        let kind = db.query_one(Statement::from_string(DatabaseBackend::Postgres,
-            "SELECT pg_typeof(pin_decision_json)::text AS kind FROM import_job_requests WHERE job_id='job-stage3'"
-        )).await.unwrap().unwrap();
-        assert_eq!(kind.try_get::<String>("", "kind").unwrap(), "text");
-        let claimed = jobs::claim_due(&db, "stage3-worker", Utc::now(), Utc::now() + chrono::Duration::minutes(2), 1).await.unwrap().pop().unwrap();
-        let destination = import_destination::Entity::find_by_id((BUCKET.to_owned(), "import".to_owned())).one(&db).await.unwrap().unwrap();
-        let guard = ImportPublicationGuard { job_id: "job-stage3".into(), worker_id: "stage3-worker".into(), claim_epoch: claimed.claim.claim_epoch,
-            targets: vec![ExpectedImportTarget { bucket: BUCKET.into(), key: "import".into(), generation: destination.generation }],
-        };
-        db.execute_unprepared("CREATE FUNCTION stage3_reject_finish() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.state = 'completed' THEN RAISE EXCEPTION 'stage3-import-completion'; END IF; RETURN NEW; END $$; CREATE TRIGGER stage3_fail_import BEFORE UPDATE ON import_jobs FOR EACH ROW EXECUTE FUNCTION stage3_reject_finish()").await.unwrap();
-        let limits = ProviderLimitMap::new();
-        let error = publication::publish_decided_import_object(&db, request("import-object", "import", policy), guard, Vec::new(), Utc::now(), captured_args(&decision, &config, &limits)).await.unwrap_err();
-        assert!(format!("{error:?}").contains("stage3-import-completion"), "{error:?}");
-        assert_no_published_objects(&db).await;
-        let job = import_job::Entity::find_by_id("job-stage3").one(&db).await.unwrap().unwrap();
-        assert_eq!(job.state, "running");
-        assert_eq!(job.pin_decision_json, Some(text.to_owned()));
-        let current = import_destination::Entity::find_by_id((BUCKET.to_owned(), "import".to_owned())).one(&db).await.unwrap().unwrap();
-        assert_eq!(current.owner_job_id.as_deref(), Some("job-stage3"));
-    }).await;
-}
-
-#[tokio::test]
-async fn sqlite_decision_write_failure_rolls_back_object_and_zip_publication() {
-    let db = Database::connect("sqlite::memory:").await.unwrap();
-    db.execute_unprepared("PRAGMA foreign_keys = ON")
+    let (objects, batch, capture, guard) = prepared(db, &config, vec![]).await;
+    let error = publish_captured(
+        db,
+        &config,
+        objects.clone(),
+        batch.clone(),
+        &capture,
+        guard.clone(),
+    )
+    .await
+    .unwrap_err();
+    assert_database_fault(error, "stage3-pin-ref");
+    assert_no_published_objects(db).await;
+    let snapshot = store::zip::snapshot(db, &batch.batch_id)
         .await
+        .unwrap()
         .unwrap();
-    store::run_migrations(&db).await.unwrap();
-    seeded_bucket(&db).await;
-    db.execute_unprepared("CREATE TRIGGER stage3_reject BEFORE INSERT ON pin_extension_decisions BEGIN SELECT RAISE(ABORT, 'stage3-decision-insert'); END").await.unwrap();
-    let limits = ProviderLimitMap::new();
-    let (policy, decision, config) = captured("ordinary", "ordinary-object");
-    let result = publication::publish_decided_object(
-        &db,
-        request("ordinary-object", "ordinary", policy),
-        captured_args(&decision, &config, &limits),
-    )
-    .await;
-    assert!(result.is_err());
-    assert_no_published_objects(&db).await;
-    let (policy, decision, config) = captured("archive.zip", "archive-object");
-    let entry = PublicationObject::from_put(
-        "entry-object".into(),
-        BUCKET,
-        "unzipped/item",
-        CID.into(),
-        1,
-        None,
-        None,
-        false,
-        None,
-        None,
-        Utc::now(),
+    assert_eq!(snapshot.batch.state, "open");
+    assert!(
+        snapshot
+            .entries
+            .iter()
+            .all(|entry| entry.version_row_id.is_none())
     );
-    let result = publication::publish_decided_zip(
-        &db,
-        ZipPublicationRequest {
-            archive: request("archive-object", "archive.zip", policy),
-            entries: vec![entry],
-        },
-        None,
-        captured_args(&decision, &config, &limits),
-        &ipfs_s3_gateway::pinning::zip_policy::ValidatedZipOutputRules::compile(&[], &config)
-            .unwrap(),
-    )
-    .await;
-    assert!(result.is_err());
-    assert_no_published_objects(&db).await;
-}
 
-#[tokio::test]
-async fn sqlite_late_mpu_and_import_failures_do_not_orphan_decisions() {
-    let db = Database::connect("sqlite::memory:").await.unwrap();
-    db.execute_unprepared("PRAGMA foreign_keys = ON")
+    db.execute_unprepared(restore).await.unwrap();
+    let results = publish_captured(db, &config, objects, batch, &capture, guard)
         .await
         .unwrap();
-    store::run_migrations(&db).await.unwrap();
-    seeded_bucket(&db).await;
-    let limits = ProviderLimitMap::new();
+    assert_eq!(results.len(), 3);
+    let refs = pin_rows::refs(db).await;
+    assert_eq!(
+        refs.iter()
+            .map(|r| r.owner_object_id.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "b"]
+    );
+    let resources = pin_rows::resources(db).await;
+    assert_eq!(resources.len(), 1);
+    assert_eq!(resources[0].cid, stage9_zip_support::OUTPUT_CID);
 
-    let (policy, decision, config) = captured("mpu", "upload-stage3");
+    let published =
+        publication::publish_decided_object(db, ordinary, captured_args(&decision, &config))
+            .await
+            .unwrap();
+    let version = object_version::Entity::find()
+        .filter(object_version::Column::ObjectId.eq(&published.object_id))
+        .one(db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        read_for_version(db, &version.id).await.unwrap(),
+        Some(decision)
+    );
+    assert!(pin_rows::refs(db).await.iter().any(|r| {
+        r.owner_object_id == published.object_id && r.cid == CID && r.source == "manual"
+    }));
+}
+
+async fn assert_mpu_rollback(db: &DatabaseConnection) {
+    let config = config();
+    let (policy, decision) = captured(&config, MPU_KEY, "upload-stage3");
     store::multipart::create_upload_with_decision(
-        &db,
+        db,
         "upload-stage3",
         "multipart-object",
         BUCKET,
-        "mpu",
+        MPU_KEY,
         "none",
         None,
         None,
@@ -454,42 +234,90 @@ async fn sqlite_late_mpu_and_import_failures_do_not_orphan_decisions() {
     )
     .await
     .unwrap();
-    let saved = store::multipart::get_upload(&db, "upload-stage3")
+    let saved = store::multipart::get_upload(db, "upload-stage3")
         .await
         .unwrap();
+    assert_eq!(
+        store::multipart::decision_from_upload(&saved).unwrap(),
+        Some(decision.clone())
+    );
+
+    let reject = match db.get_database_backend() {
+        DatabaseBackend::Postgres => {
+            let kind: String = db.query_one(Statement::from_string(DatabaseBackend::Postgres,
+                "SELECT pg_typeof(pin_decision_json)::text AS kind FROM multipart_uploads WHERE upload_id='upload-stage3'"))
+                .await.unwrap().unwrap().try_get("", "kind").unwrap();
+            assert_eq!(kind, "jsonb");
+            "CREATE FUNCTION stage3_reject_mpu() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN RAISE EXCEPTION 'stage3-upload-delete'; END $$;
+             CREATE TRIGGER stage3_reject_mpu BEFORE DELETE ON multipart_uploads
+             FOR EACH ROW EXECUTE FUNCTION stage3_reject_mpu()"
+        }
+        _ => {
+            "CREATE TRIGGER stage3_reject_mpu BEFORE DELETE ON multipart_uploads
+              BEGIN SELECT RAISE(ABORT, 'stage3-upload-delete'); END"
+        }
+    };
+    db.execute_unprepared(reject).await.unwrap();
     let target = MultipartUploadTargetIdentity {
-        bucket: BUCKET.into(),
-        key: "mpu".into(),
+        bucket: saved.bucket.clone(),
+        key: saved.key.clone(),
         upload_id: saved.upload_id.clone(),
         initiated_at: saved.created_at,
     };
-    db.execute_unprepared("CREATE TRIGGER stage3_upload_abort BEFORE DELETE ON multipart_uploads BEGIN SELECT RAISE(ABORT, 'stage3-upload-delete'); END")
-        .await
-        .unwrap();
-    let result = publication::publish_decided_completed_upload(
-        &db,
+    let mut completion = request("completed-object", MPU_KEY, policy);
+    completion.object.multipart = true;
+    let error = publication::publish_decided_completed_upload(
+        db,
         &target,
-        request("completed-object", "mpu", policy),
+        completion,
         None,
-        captured_args(&decision, &config, &limits),
+        captured_args(&decision, &config),
     )
-    .await;
-    assert!(result.is_err());
-    assert_no_published_objects(&db).await;
-    assert!(
-        store::multipart::get_upload(&db, "upload-stage3")
+    .await
+    .unwrap_err();
+    let CommitCompletedUploadError::RolledBack { source, .. } = error else {
+        panic!("expected known completion rollback, got {error:?}");
+    };
+    assert_database_fault(source, "stage3-upload-delete");
+    assert_no_published_objects(db).await;
+    assert_eq!(
+        store::multipart::get_upload(db, &saved.upload_id)
             .await
-            .is_ok()
+            .unwrap(),
+        saved
     );
+}
 
-    let (policy, decision, config) = captured("import", "job-stage3");
-    let now = Utc::now();
-    ownership::submit_decided(
-        &db,
+#[tokio::test]
+#[ignore = "requires IPFS_S3_TEST_POSTGRES_URL to an isolated PostgreSQL 17 or 18 test container"]
+async fn pg17_object_and_zip_pin_ref_failure_roll_back_publication() {
+    isolated(|db| async move {
+        store::bucket::create(&db, BUCKET, None).await.unwrap();
+        assert_object_and_zip_rollback(&db).await;
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires IPFS_S3_TEST_POSTGRES_URL to an isolated PostgreSQL 17 or 18 test container"]
+async fn pg17_mpu_jsonb_roundtrip_and_failed_completion_preserves_upload() {
+    isolated(|db| async move {
+        store::bucket::create(&db, BUCKET, None).await.unwrap();
+        assert_mpu_rollback(&db).await;
+    })
+    .await;
+}
+
+async fn assert_import_rollback(db: &DatabaseConnection) {
+    let config = config();
+    let (policy, decision) = captured(&config, IMPORT_KEY, "job-stage3");
+    let submitted = ownership::submit_decided(
+        db,
         jobs::NewImportJob {
             id: "job-stage3".into(),
             bucket: BUCKET.into(),
-            key: "import".into(),
+            key: IMPORT_KEY.into(),
             source: ImportSource::Cid(CID.into()),
             request_fingerprint: "fingerprint".into(),
             client_token: None,
@@ -499,23 +327,37 @@ async fn sqlite_late_mpu_and_import_failures_do_not_orphan_decisions() {
             decompress_prefix: None,
         },
         decision.clone(),
-        now,
+        Utc::now(),
     )
     .await
     .unwrap();
+    assert!(matches!(submitted, jobs::SubmitImportOutcome::Created(_)));
+    let saved = import_job::Entity::find_by_id("job-stage3")
+        .one(db)
+        .await
+        .unwrap()
+        .unwrap();
+    let text = saved.pin_decision_json.as_deref().unwrap();
+    assert_eq!(
+        serde_json::from_str::<ExtensionDecision>(text).unwrap(),
+        decision
+    );
+    assert!(!text.contains("do-not-leak"));
+    let now = Utc::now();
     let claimed = jobs::claim_due(
-        &db,
+        db,
         "stage3-worker",
-        Utc::now(),
-        Utc::now() + chrono::Duration::minutes(2),
+        now,
+        now + chrono::Duration::minutes(2),
         1,
     )
     .await
     .unwrap()
     .pop()
     .unwrap();
-    let destination = import_destination::Entity::find_by_id((BUCKET.to_owned(), "import".into()))
-        .one(&db)
+    let destination_key = (BUCKET.to_owned(), IMPORT_KEY.to_owned());
+    let destination = import_destination::Entity::find_by_id(destination_key.clone())
+        .one(db)
         .await
         .unwrap()
         .unwrap();
@@ -525,33 +367,73 @@ async fn sqlite_late_mpu_and_import_failures_do_not_orphan_decisions() {
         claim_epoch: claimed.claim.claim_epoch,
         targets: vec![ExpectedImportTarget {
             bucket: BUCKET.into(),
-            key: "import".into(),
+            key: IMPORT_KEY.into(),
             generation: destination.generation,
         }],
     };
-    db.execute_unprepared("CREATE TRIGGER stage3_import_abort BEFORE UPDATE ON import_jobs WHEN NEW.state='completed' BEGIN SELECT RAISE(ABORT, 'stage3-import-completion'); END")
-        .await
-        .unwrap();
-    let result = publication::publish_decided_import_object(
-        &db,
-        request("import-object", "import", policy),
+    let reject = match db.get_database_backend() {
+        DatabaseBackend::Postgres => {
+            let kind: String = db.query_one(Statement::from_string(DatabaseBackend::Postgres,
+                "SELECT pg_typeof(pin_decision_json)::text AS kind FROM import_job_requests WHERE job_id='job-stage3'"))
+                .await.unwrap().unwrap().try_get("", "kind").unwrap();
+            assert_eq!(kind, "text");
+            "CREATE FUNCTION stage3_reject_import() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN IF NEW.state = 'completed' THEN RAISE EXCEPTION 'stage3-import-completion'; END IF;
+             RETURN NEW; END $$;
+             CREATE TRIGGER stage3_reject_import BEFORE UPDATE ON import_jobs
+             FOR EACH ROW EXECUTE FUNCTION stage3_reject_import()"
+        }
+        _ => {
+            "CREATE TRIGGER stage3_reject_import BEFORE UPDATE ON import_jobs
+              WHEN NEW.state='completed' BEGIN SELECT RAISE(ABORT, 'stage3-import-completion'); END"
+        }
+    };
+    db.execute_unprepared(reject).await.unwrap();
+    let error = publication::publish_decided_import_object(
+        db,
+        request("import-object", IMPORT_KEY, policy),
         guard,
         Vec::new(),
         Utc::now(),
-        captured_args(&decision, &config, &limits),
+        captured_args(&decision, &config),
     )
-    .await;
-    assert!(result.is_err());
-    assert_no_published_objects(&db).await;
-    let saved = import_job::Entity::find_by_id("job-stage3")
-        .one(&db)
+    .await
+    .unwrap_err();
+    assert_database_fault(error, "stage3-import-completion");
+    assert_no_published_objects(db).await;
+    let job = import_job::Entity::find_by_id("job-stage3")
+        .one(db)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(saved.state, "running");
-    assert_eq!(
-        serde_json::from_str::<ExtensionDecision>(saved.pin_decision_json.as_deref().unwrap())
-            .unwrap(),
-        decision
-    );
+    assert_eq!(job.state, "running");
+    assert_eq!(job.pin_decision_json, saved.pin_decision_json);
+    let current = import_destination::Entity::find_by_id(destination_key)
+        .one(db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current, destination);
+}
+
+#[tokio::test]
+#[ignore = "requires IPFS_S3_TEST_POSTGRES_URL to an isolated PostgreSQL 17 or 18 test container"]
+async fn pg17_import_text_decision_and_failed_final_update_roll_back_publication() {
+    isolated(|db| async move {
+        store::bucket::create(&db, BUCKET, None).await.unwrap();
+        assert_import_rollback(&db).await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn sqlite_pin_ref_failure_rolls_back_object_and_zip_publication() {
+    assert_object_and_zip_rollback(&setup().await).await;
+}
+
+#[tokio::test]
+async fn sqlite_late_mpu_and_import_failures_do_not_orphan_pin_rows() {
+    let db = setup().await;
+    assert_mpu_rollback(&db).await;
+    assert_import_rollback(&db).await;
 }

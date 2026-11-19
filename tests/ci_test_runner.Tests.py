@@ -23,10 +23,8 @@ class CiTestRunnerTests(unittest.TestCase):
     def test_partitions_are_exhaustive_and_mutually_exclusive(self) -> None:
         names = [
             "config::tests::new_top_level_case",
-            "store::pinning::legacy_migration::live_legacy_points_jobs_and_poll_share_remaining_receipt_work",
-            "pinning::worker::tests::polls",
-            "store::pinning::publication::tests::publishes",
-            "store::pinning::management::actions::execution::review_tests::executed_submit_rejects_birth_after_read_attestation_expiry",
+            "pinning::worker::tests::submits",
+            "store::pinning::resources::tests::publishes",
         ]
 
         partitions = RUNNER.partition_lib_tests(names)
@@ -34,16 +32,14 @@ class CiTestRunnerTests(unittest.TestCase):
         selected = [test for shard in RUNNER.SHARDS for test in partitions[shard]]
         self.assertCountEqual(selected, names)
         self.assertEqual(len(selected), len(set(selected)))
-        self.assertIn(names[0], partitions["core-legacy-remainder"])
-        self.assertIn(names[1], partitions["core-legacy-remainder"])
-        self.assertIn(names[2], partitions["worker-providers"])
-        self.assertIn(names[3], partitions["store-pinning-control"])
-        self.assertIn(names[4], partitions["management"])
+        self.assertIn(names[0], partitions["core-remainder"])
+        self.assertIn(names[1], partitions["worker-providers"])
+        self.assertIn(names[2], partitions["store-pinning"])
 
     def test_unknown_module_goes_to_remainder(self) -> None:
         self.assertEqual(
             RUNNER.classify_lib_test("future_module::tests::case"),
-            "core-legacy-remainder",
+            "core-remainder",
         )
 
     def test_cargo_artifact_identity_uses_package_target_and_test_profile(self) -> None:
@@ -66,7 +62,7 @@ class CiTestRunnerTests(unittest.TestCase):
         )
         with mock.patch.object(RUNNER.subprocess, "run", return_value=listed) as run:
             with self.assertRaises(RUNNER.RunnerError):
-                RUNNER.run_lib_shard(Path("fake-harness"), "management", ROOT)
+                RUNNER.run_lib_shard(Path("fake-harness"), "store-pinning", ROOT)
 
         self.assertEqual(run.call_count, 1)
         self.assertIn("--list", run.call_args.args[0])

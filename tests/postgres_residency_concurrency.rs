@@ -12,6 +12,7 @@ use ipfs_s3_gateway::{
         },
         worker::{LifecycleAfterClaimGate, LifecycleWorkerTestControl, start_worker_for_test},
     },
+    pinning::policy::ExistingManualLeaseState,
     residency::{
         ClaimedResidencyBackfill, ResidencyBackfillCursor, VerificationState,
         VersionResidencyIdentity,
@@ -20,13 +21,16 @@ use ipfs_s3_gateway::{
         Store,
         database_clock::database_now,
         entities::{
-            lifecycle_action, object_version, physical_residency, pin_lease, pin_lease_target,
-            residency_backfill, residency_reference, version_residency,
+            lifecycle_action, object_version, physical_residency, residency_backfill,
+            residency_reference, version_residency,
         },
         import::ownership::admit_content_mutation,
         lifecycle_config::put_configuration,
         object_version::{BucketVersioningState, PublicVersionId, VersionSelector},
-        pinning::publication::{delete_version_with_leases_guarded, publish_standard_object},
+        pinning::{
+            publication::{delete_version_guarded, publish_standard_object},
+            resources,
+        },
         residency::{
             checkpoint_residency_backfill_in_transaction, claim_residency_backfill,
             mark_hot_verified_in_transaction, pending_hot_residency_page,
@@ -441,7 +445,7 @@ async fn postgres_backfill_writeback_blocks_exact_delete_then_preserves_only_phy
         .await
         .expect("admit contending exact delete");
         actor_started.notify_one();
-        delete_version_with_leases_guarded(
+        delete_version_guarded(
             &contender_db,
             "delete-writeback-winner",
             "key",
@@ -538,7 +542,7 @@ async fn wait_for_terminal_action(
 #[tokio::test]
 #[ignore = "requires IPFS_S3_TEST_POSTGRES_URL (real PostgreSQL)"]
 async fn postgres_lifecycle_expiration_releases_only_selected_shared_cid_owner() {
-    const SHARED_CID: &str = "bafy-pg-lifecycle-shared";
+    const SHARED_CID: &str = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
     let fixture = PgResidencyFixture::new().await;
     let bucket = "lifecycle-shared-owner";
     create_bucket(&fixture.db, bucket, BucketVersioningState::Enabled).await;
@@ -562,6 +566,12 @@ async fn postgres_lifecycle_expiration_releases_only_selected_shared_cid_owner()
     .await;
     let old_version = version_for_object(&fixture.db, "lifecycle-old-object").await;
     let current_version = version_for_object(&fixture.db, "lifecycle-current-object").await;
+    let now = database_now(&fixture.db).await.expect("read fixture clock");
+    let old_pin = resources::manual(&fixture.db, "lifecycle-old-object", now)
+        .await
+        .expect("load selected owner's pin reference")
+        .expect("selected owner starts with a pin reference");
+    assert_eq!(old_pin.state, ExistingManualLeaseState::Active);
 
     fixture
         .db
@@ -695,31 +705,38 @@ async fn postgres_lifecycle_expiration_releases_only_selected_shared_cid_owner()
     assert_eq!(retained.len(), 1);
     assert_eq!(retained[0].version_row_id, current_version.id);
 
-    let old_lease = pin_lease::Entity::find()
-        .filter(pin_lease::Column::OwnerObjectId.eq("lifecycle-old-object"))
-        .one(&fixture.db)
+    let pin_refs = fixture
+        .db
+        .query_all(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT owner_object_id, provider, cid, source, content_mode, expires_at, logical_size, status \
+             FROM pin_refs JOIN pin_resources USING (provider, cid)",
+        ))
         .await
-        .expect("load selected owner's lease")
-        .expect("selected owner's lease remains auditable");
-    let current_lease = pin_lease::Entity::find()
-        .filter(pin_lease::Column::OwnerObjectId.eq("lifecycle-current-object"))
-        .one(&fixture.db)
-        .await
-        .expect("load surviving owner's lease")
-        .expect("surviving owner's lease exists");
-    assert_ne!(old_lease.state, "active");
-    assert_eq!(current_lease.state, "active");
-    let active_target = pin_lease_target::Entity::find()
-        .filter(pin_lease_target::Column::LeaseId.eq(&current_lease.id))
-        .filter(pin_lease_target::Column::Cid.eq(SHARED_CID))
-        .one(&fixture.db)
-        .await
-        .expect("load surviving shared-CID lease target")
-        .expect("surviving shared-CID lease target exists");
-    assert!(matches!(
-        active_target.state.as_str(),
-        "waiting" | "submitted" | "pinned" | "degraded" | "quota_waiting" | "quota_blocked"
-    ));
+        .expect("load pin references and their resources after expiration");
+    let [current_pin] = pin_refs.as_slice() else {
+        panic!("only the surviving owner's pin reference should remain");
+    };
+    for (column, expected) in [
+        ("owner_object_id", "lifecycle-current-object"),
+        ("provider", "pinata"),
+        ("cid", SHARED_CID),
+        ("source", "manual"),
+        ("content_mode", "object"),
+        ("status", "waiting"),
+    ] {
+        assert_eq!(
+            current_pin.try_get::<String>("", column).unwrap(),
+            expected,
+            "{column}"
+        );
+    }
+    assert_eq!(current_pin.try_get::<i64>("", "logical_size").unwrap(), 7);
+    let expires_at = current_pin.try_get::<i64>("", "expires_at").unwrap();
+    assert!(
+        chrono::DateTime::from_timestamp_micros(expires_at).expect("valid pin reference expiry")
+            > database_now(&fixture.db).await.expect("read fixture clock")
+    );
     assert_eq!(
         physical_residency::Entity::find()
             .filter(physical_residency::Column::Tier.eq("hot"))

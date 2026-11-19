@@ -1,49 +1,20 @@
 use super::{
-    ClusterFailureCode as Code, ClusterProtocol, ClusterProvider, ClusterRemoteRef,
-    ClusterResourceStatus, ClusterWriteEffect, ClusterWriteFailure as Failure,
-    ClusterWriteObservation, ClusterWriteReceipt, stream::Progress,
+    ClusterFailureCode as Code, ClusterProtocol, ClusterProvider, ClusterWriteFailure as Failure,
+    canonical_cid, stream::Progress,
 };
+use cid::Cid;
 use reqwest::Method;
 use tokio_util::sync::CancellationToken;
 
 impl ClusterProvider {
-    /// Restricted primitive ONLY: parent ledger must prove ownership, zero
-    /// references/in-flight writes and the current fence before invoking it.
-    /// This does not infer ownership or run cleanup in submit/observe/error paths.
-    pub async fn unpin_authorized_ref(
-        &self,
-        reference: &ClusterRemoteRef,
-        cancel: &CancellationToken,
-    ) -> ClusterWriteObservation {
-        let mut out = ClusterWriteObservation {
-            result: Err(Failure::new(Code::InvalidReference)),
-            effect: ClusterWriteEffect::NotSubmitted,
-            resources: vec![],
-            replicas: None,
-            http_status: None,
-        };
-        out.result = self.remove(reference, &mut out, cancel).await;
-        out
-    }
-    async fn remove(
-        &self,
-        reference: &ClusterRemoteRef,
-        out: &mut ClusterWriteObservation,
-        cancel: &CancellationToken,
-    ) -> Result<ClusterWriteReceipt, Failure> {
-        let resource = self.resource_key(&reference.resource.cid)?;
-        if resource != reference.resource
-            || reference.protocol != self.options.protocol
-            || reference.strategy != self.options.strategy
-        {
-            return Err(Failure::new(Code::InvalidReference));
-        }
-        if cancel.is_cancelled() {
-            return Err(Failure::new(Code::Cancelled));
-        }
-        let cid = &resource.cid;
-        let request = match reference.protocol {
-            ClusterProtocol::Proxy => self.target.rpc("pin/rm", &[("arg", cid)]),
+    pub async fn unpin(&self, request_id: &str) -> Result<(), Failure> {
+        let handle: Cid = request_id
+            .parse()
+            .map_err(|_| Failure::new(Code::InvalidCid))?;
+        let cid = handle.to_string();
+        let protocol = self.options.protocol;
+        let request = match protocol {
+            ClusterProtocol::Proxy => self.target.rpc("pin/rm", &[("arg", &cid)]),
             ClusterProtocol::Rest => {
                 self.target
                     .request(Method::DELETE, &format!("/pins/{cid}"), &[])
@@ -51,36 +22,31 @@ impl ClusterProvider {
         }
         .build()
         .map_err(|_| Failure::new(Code::Protocol))?;
-        self.record(out, cid, ClusterResourceStatus::DispatchIntent)?;
-        out.effect = ClusterWriteEffect::Unknown;
         let progress = Progress::new();
-        let result = tokio::time::timeout(
+        tokio::time::timeout(
             self.options.transfer_limits.control_timeout,
-            progress.run(self.options.transfer_limits.idle_timeout, cancel, async {
-                let response = self.target.execute(request).await?;
-                out.http_status = Some(response.status().as_u16());
-                if matches!(response.status().as_u16(), 202 | 204) {
-                    self.record(out, cid, ClusterResourceStatus::UnpinAccepted)?;
-                    Ok(cid.clone())
-                } else {
-                    self.parse_pin(response, out, &progress).await
-                }
-            }),
+            progress.run(
+                self.options.transfer_limits.idle_timeout,
+                &CancellationToken::new(),
+                async {
+                    let response = self.target.execute(request).await?;
+                    if protocol == ClusterProtocol::Rest
+                        && matches!(response.status().as_u16(), 202 | 204)
+                    {
+                        if !self.read_ack(response, &progress).await?.is_empty() {
+                            return Err(Failure::new(Code::Protocol));
+                        }
+                        return Ok(());
+                    }
+                    let reported = self.parse_pin(response, &progress).await?;
+                    if canonical_cid(&reported) != canonical_cid(&handle) {
+                        return Err(Failure::new(Code::CidMismatch));
+                    }
+                    Ok(())
+                },
+            ),
         )
         .await
-        .map_err(|_| Failure::new(Code::ControlTimeout))??;
-        for r in &mut out.resources {
-            if r.status == ClusterResourceStatus::Reported {
-                r.status = ClusterResourceStatus::UnpinAccepted;
-            }
-        }
-        if result != *cid {
-            return Err(Failure::new(Code::CidMismatch));
-        }
-        out.effect = ClusterWriteEffect::Observed;
-        Ok(ClusterWriteReceipt {
-            resource,
-            accepted_at: chrono::Utc::now(),
-        })
+        .map_err(|_| Failure::new(Code::ControlTimeout))?
     }
 }

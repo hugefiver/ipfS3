@@ -102,23 +102,30 @@ async fn seed_old_schema(db: &DatabaseConnection) {
     ] {
         db.execute_unprepared(statement).await.unwrap();
     }
-    db.execute_unprepared(
-        "INSERT INTO pin_leases \
-         (id, owner_object_id, source, policy_id, provider_mode, content_mode, created_at, \
-          last_touched_at, expires_at, generation, state) \
-         VALUES ('lease', 'shared-b', 'put_object', 'policy', 'all', 'full', CURRENT_TIMESTAMP, \
-                 CURRENT_TIMESTAMP, '2099-01-01T00:00:00Z', 1, 'active')",
-    )
-    .await
-    .unwrap();
-    db.execute_unprepared(
-        "INSERT INTO pin_lease_targets \
-         (id, lease_id, cid, logical_size, provider, state, created_at, last_touched_at) \
-         VALUES ('target', 'lease', 'QmShared', 11, 'pinata', 'pinned', \
-                 CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
-    )
-    .await
-    .unwrap();
+}
+
+async fn upgrade_residency(db: &DatabaseConnection) -> Result<(), sea_orm::DbErr> {
+    m20260912_000001_residency_references::Migration
+        .up(&SchemaManager::new(db))
+        .await
+}
+
+async fn current_residency_fixture() -> DatabaseConnection {
+    let db = Database::connect("sqlite::memory:").await.unwrap();
+    store::run_migrations(&db).await.unwrap();
+    seed_old_schema(&db).await;
+    upgrade_residency(&db).await.unwrap();
+    db
+}
+
+const TARGET: &str = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
+
+async fn seed_waiting_ref(db: &DatabaseConnection) {
+    db.execute(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
+        "INSERT INTO pin_resources(provider,cid,logical_size,status,action) VALUES ('pinata',$1,11,'waiting','submit')", [TARGET.into()])).await.unwrap();
+    db.execute(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
+        "INSERT INTO pin_refs(owner_object_id,provider,cid,source,policy_id,content_mode,expires_at) VALUES ('shared-b','pinata',$1,'manual','policy','decompressed',$2)",
+        [TARGET.into(), (chrono::Utc::now() + Duration::hours(1)).timestamp_micros().into()])).await.unwrap();
 }
 
 async fn seed_old_lifecycle_state(db: &DatabaseConnection) {
@@ -238,32 +245,30 @@ async fn scalar_i64(db: &DatabaseConnection, sql: &str) -> i64 {
 
 #[tokio::test]
 async fn quota_delayed_lease_targets_still_protect_only_hot_content() {
-    let db = old_schema().await;
-    seed_old_schema(&db).await;
-    store::run_migrations(&db).await.unwrap();
-    for state in ["quota_waiting", "quota_blocked"] {
-        db.execute_unprepared(&format!(
-            "UPDATE pin_lease_targets SET state = '{state}' WHERE id = 'target'"
-        ))
-        .await
-        .unwrap();
+    let db = current_residency_fixture().await;
+    seed_waiting_ref(&db).await;
+    for expired in [false, true] {
         let txn = db.begin().await.unwrap();
-        let hot = reference_summary_in_transaction(
-            &txn,
-            &ResidencyLocation::new(KuboTier::Hot, "QmShared"),
-        )
-        .await
-        .unwrap();
-        assert_eq!(hot.active_lease_targets, 1);
-        assert_eq!(hot.active_lease_owners, 1);
-        let cold = reference_summary_in_transaction(
-            &txn,
-            &ResidencyLocation::new(KuboTier::Cold, "QmShared"),
-        )
-        .await
-        .unwrap();
-        assert_eq!(cold.active_lease_targets, 0);
-        assert_eq!(cold.active_lease_owners, 0);
+        if expired {
+            txn.execute_unprepared("UPDATE pin_refs SET expires_at=0")
+                .await
+                .unwrap();
+        }
+        let live = u64::from(!expired);
+        for (tier, cid, owners, targets) in [
+            (KuboTier::Hot, "QmShared", live, 0),
+            (KuboTier::Hot, TARGET, 0, live),
+            (KuboTier::Cold, "QmShared", 0, 0),
+            (KuboTier::Cold, TARGET, 0, 0),
+        ] {
+            let count = reference_summary_in_transaction(&txn, &ResidencyLocation::new(tier, cid))
+                .await
+                .unwrap();
+            assert_eq!(
+                (count.active_lease_owners, count.active_lease_targets),
+                (owners, targets)
+            );
+        }
         txn.commit().await.unwrap();
     }
 }
@@ -288,7 +293,7 @@ async fn upgrade_backfills_only_live_content_versions_without_changing_identity(
         .await
         .unwrap();
 
-    store::run_migrations(&db).await.unwrap();
+    upgrade_residency(&db).await.unwrap();
 
     assert_eq!(
         scalar_i64(&db, "SELECT COUNT(*) FROM version_residencies").await,
@@ -384,7 +389,7 @@ async fn upgrade_preserves_every_lifecycle_configuration_and_action_field() {
     let configs_before = lifecycle_config_snapshot(&db).await;
     let actions_before = lifecycle_action_snapshot(&db).await;
 
-    store::run_migrations(&db).await.unwrap();
+    upgrade_residency(&db).await.unwrap();
 
     assert_eq!(lifecycle_config_snapshot(&db).await, configs_before);
     assert_eq!(lifecycle_action_snapshot(&db).await, actions_before);
@@ -392,9 +397,7 @@ async fn upgrade_preserves_every_lifecycle_configuration_and_action_field() {
 
 #[tokio::test]
 async fn schema_rejects_markers_invalid_states_and_invalid_owner_shapes() {
-    let db = old_schema().await;
-    seed_old_schema(&db).await;
-    store::run_migrations(&db).await.unwrap();
+    let db = current_residency_fixture().await;
 
     for sql in [
         "INSERT INTO physical_residencies \
@@ -424,9 +427,8 @@ async fn schema_rejects_markers_invalid_states_and_invalid_owner_shapes() {
 
 #[tokio::test]
 async fn attach_resolve_release_and_summary_preserve_shared_physical_state() {
-    let db = old_schema().await;
-    seed_old_schema(&db).await;
-    store::run_migrations(&db).await.unwrap();
+    let db = current_residency_fixture().await;
+    seed_waiting_ref(&db).await;
     let shared = VersionResidencyIdentity::new("version-old", "old-a", "QmShared");
     let location = ResidencyLocation::new(KuboTier::Hot, "QmShared");
 
@@ -481,7 +483,7 @@ async fn attach_resolve_release_and_summary_preserve_shared_physical_state() {
     assert_eq!(before.retained_versions, 2);
     assert_eq!(before.transition_staging_holds, 1);
     assert_eq!(before.transition_cleanup_holds, 0);
-    assert_eq!(before.active_lease_targets, 1);
+    assert_eq!(before.active_lease_owners, 1);
 
     assert!(
         release_version_reference_in_transaction(&txn, "version-old")
@@ -523,9 +525,7 @@ async fn attach_resolve_release_and_summary_preserve_shared_physical_state() {
 
 #[tokio::test]
 async fn owner_validation_rejects_marker_mismatch_and_missing_version() {
-    let db = old_schema().await;
-    seed_old_schema(&db).await;
-    store::run_migrations(&db).await.unwrap();
+    let db = current_residency_fixture().await;
 
     for identity in [
         VersionResidencyIdentity::new("marker", "current-a", "QmCurrent"),
@@ -544,9 +544,7 @@ async fn owner_validation_rejects_marker_mismatch_and_missing_version() {
 
 #[tokio::test]
 async fn backfill_claim_cursor_is_bounded_fenced_and_does_not_resurrect_deleted_versions() {
-    let db = old_schema().await;
-    seed_old_schema(&db).await;
-    store::run_migrations(&db).await.unwrap();
+    let db = current_residency_fixture().await;
 
     let claim = claim_residency_backfill(&db, "worker-a", Duration::seconds(30))
         .await
@@ -640,7 +638,7 @@ async fn backfill_claim_cursor_is_bounded_fenced_and_does_not_resurrect_deleted_
 async fn downgrade_is_allowed_only_for_reconstructable_pending_standard_state() {
     let pending_db = old_schema().await;
     seed_old_schema(&pending_db).await;
-    store::run_migrations(&pending_db).await.unwrap();
+    upgrade_residency(&pending_db).await.unwrap();
     m20260912_000001_residency_references::Migration
         .down(&SchemaManager::new(&pending_db))
         .await
@@ -661,7 +659,7 @@ async fn downgrade_is_allowed_only_for_reconstructable_pending_standard_state() 
     ] {
         let db = old_schema().await;
         seed_old_schema(&db).await;
-        store::run_migrations(&db).await.unwrap();
+        upgrade_residency(&db).await.unwrap();
         db.execute_unprepared(mutation).await.unwrap();
         let result = m20260912_000001_residency_references::Migration
             .down(&SchemaManager::new(&db))
@@ -674,9 +672,7 @@ async fn downgrade_is_allowed_only_for_reconstructable_pending_standard_state() 
         );
     }
 
-    let db = old_schema().await;
-    seed_old_schema(&db).await;
-    store::run_migrations(&db).await.unwrap();
+    let db = current_residency_fixture().await;
     db.execute_unprepared(
         "INSERT INTO physical_residencies \
          (tier, cid, node_identity, verification_state, verification_receipt, verified_at, \
@@ -718,13 +714,11 @@ async fn repeated_and_two_connection_upgrade_is_safe() {
 
     let first = store::connect_database(&url).await.unwrap();
     let second = store::connect_database(&url).await.unwrap();
-    let (first_result, second_result) = tokio::join!(
-        store::run_migrations(&first),
-        store::run_migrations(&second)
-    );
+    let (first_result, second_result) =
+        tokio::join!(upgrade_residency(&first), upgrade_residency(&second));
     first_result.unwrap();
     second_result.unwrap();
-    store::run_migrations(&first).await.unwrap();
+    upgrade_residency(&first).await.unwrap();
 
     assert_eq!(
         scalar_i64(&first, "SELECT COUNT(*) FROM version_residencies").await,
@@ -733,8 +727,7 @@ async fn repeated_and_two_connection_upgrade_is_safe() {
     assert_eq!(
         scalar_i64(
             &first,
-            "SELECT COUNT(*) FROM seaql_migrations \
-             WHERE version = 'm20260912_000001_residency_references'",
+            "SELECT COUNT(*) FROM residency_backfill WHERE id = 'hot_verification'",
         )
         .await,
         1

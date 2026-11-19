@@ -13,20 +13,17 @@ use ipfs_s3_gateway::{
     },
     s3::{handler::S3Impl, route::decompress_zip::DecompressZipRoute},
     state::AppState,
-    store::{
-        self, Store,
-        entities::{multipart_upload, pin_job, pin_lease},
-    },
+    store::{self, Store, entities::multipart_upload, object_version::VersionSelector},
 };
 use s3s::service::S3ServiceBuilder;
 use sea_orm::{Database, EntityTrait, PaginatorTrait};
-use sea_orm_migration::{MigrationTrait, SchemaManager};
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{method, path},
 };
 
-use ipfs_s3_gateway::store::migrations::m20260920_000004_multipart_pin_decision as pending_migration;
+#[path = "support/pin_rows.rs"]
+mod pin_rows;
 #[path = "support/sigv4.rs"]
 #[allow(dead_code)]
 mod sigv4;
@@ -133,14 +130,6 @@ fn available_policy(trigger: &str) -> PinningConfig {
 async fn state(kubo: &MockServer, mode: OptionalPinControlMode) -> Arc<AppState> {
     let db = Database::connect("sqlite::memory:").await.unwrap();
     store::run_migrations(&db).await.unwrap();
-    let manager = SchemaManager::new(&db);
-    if !manager
-        .has_column("multipart_uploads", "pin_decision_json")
-        .await
-        .unwrap()
-    {
-        pending_migration::Migration.up(&manager).await.unwrap();
-    }
     store::bucket::create(&db, "bucket", None).await.unwrap();
     Arc::new(AppState {
         kubo: KuboClient::new(kubo.uri()),
@@ -153,11 +142,6 @@ async fn state(kubo: &MockServer, mode: OptionalPinControlMode) -> Arc<AppState>
 }
 
 async fn serve(state: Arc<AppState>) -> (String, tokio::task::JoinHandle<()>) {
-    state
-        .pinning
-        .register_identities(&state.store)
-        .await
-        .unwrap();
     let mut builder = S3ServiceBuilder::new(S3Impl::new(state.clone()));
     builder.set_auth(GatewayAuth::new(state.clone()));
     builder.set_route(DecompressZipRoute::new(state));
@@ -233,20 +217,8 @@ async fn complete(endpoint: &str, key: &str, upload_id: &str) -> reqwest::Respon
 }
 
 async fn no_remote_work(state: &AppState) {
-    assert_eq!(
-        pin_lease::Entity::find()
-            .count(state.store.db())
-            .await
-            .unwrap(),
-        0
-    );
-    assert_eq!(
-        pin_job::Entity::find()
-            .count(state.store.db())
-            .await
-            .unwrap(),
-        0
-    );
+    assert!(pin_rows::refs(state.store.db()).await.is_empty());
+    assert!(pin_rows::resources(state.store.db()).await.is_empty());
 }
 
 #[tokio::test]
@@ -518,7 +490,7 @@ async fn old_uncaptured_raw_pin_tags_cannot_gain_authority_under_new_policy() {
 }
 
 #[tokio::test]
-async fn warn_never_drops_automatic_policy_when_provider_is_unavailable() {
+async fn warn_keeps_automatic_all_policy_and_complete_rolls_back_if_provider_is_unavailable() {
     let kubo = kubo().await;
     let first = state(&kubo, OptionalPinControlMode::Warn).await;
     let mut raw = available_policy("always");
@@ -572,14 +544,17 @@ async fn warn_never_drops_automatic_policy_when_provider_is_unavailable() {
     let done = complete(&endpoint, "auto", &id).await;
     assert_eq!(done.status(), reqwest::StatusCode::BAD_REQUEST);
     let xml = done.text().await.unwrap();
-    assert!(
-        xml.contains("all-provider intent includes a disabled or retired provider"),
-        "{xml}"
+    assert!(xml.contains("<Code>InvalidArgument</Code>"), "{xml}");
+    let db = updated.store.db();
+    assert!(store::multipart::get_upload(db, &id).await.is_ok());
+    assert_eq!(
+        store::multipart::get_part(db, &id, 1).await.unwrap().etag,
+        CID
     );
     assert!(
-        store::multipart::get_upload(updated.store.db(), &id)
+        store::object::get_latest(db, "bucket", "auto")
             .await
-            .is_ok()
+            .is_err()
     );
     no_remote_work(&updated).await;
     server.abort();
@@ -637,22 +612,49 @@ async fn accepted_multipart_uses_current_duration_after_unrelated_config_changes
         pinning: pinning(current, OptionalPinControlMode::Strict),
     });
     let (endpoint, server) = serve(restarted.clone()).await;
+    let db = restarted.store.db();
+    let before = store::database_clock::database_now(db).await.unwrap();
     let completed = complete(&endpoint, "captured", &id).await;
     assert_eq!(completed.status(), reqwest::StatusCode::OK);
+    let after = store::database_clock::database_now(db).await.unwrap();
     assert!(completed.headers()["etag"].to_str().unwrap().contains(CID));
     assert!(
         store::multipart::get_upload(first.store.db(), &id)
             .await
             .is_err()
     );
-    let leases = pin_lease::Entity::find()
-        .all(first.store.db())
-        .await
-        .unwrap();
-    assert_eq!(leases.len(), 1);
+    let version =
+        store::object_version::resolve_version(db, "bucket", "captured", &VersionSelector::Current)
+            .await
+            .unwrap();
+    let object = version.object.unwrap();
+    let refs = pin_rows::refs(db).await;
+    let [reference] = refs.as_slice() else {
+        panic!("expected one manual file pin, got {refs:?}");
+    };
+    assert_eq!(reference.owner_object_id, object.id);
+    assert_eq!(reference.source, "manual");
+    assert_eq!(reference.provider, "new-provider");
+    assert_eq!(reference.cid, CID);
+    assert_eq!(reference.content_mode, "object");
     assert_eq!(
-        (leases[0].expires_at - leases[0].created_at).num_seconds(),
-        7200
+        pin_rows::resources(db).await,
+        [pin_rows::Resource {
+            provider: reference.provider.clone(),
+            cid: reference.cid.clone(),
+            logical_size: object.size,
+            status: "waiting".into(),
+            action: Some("submit".into()),
+            handle: None,
+        }],
     );
+    let requested_ttl = chrono::TimeDelta::hours(2);
+    let expires_at = chrono::DateTime::from_timestamp_micros(reference.expires_at).unwrap();
+    assert!((before + requested_ttl..=after + requested_ttl).contains(&expires_at));
+    let published = store::pinning::decision::read_for_version(db, &version.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(published.control_revision, snapshot.control_revision);
     server.abort();
 }

@@ -1,4 +1,6 @@
 //! ZIP v2 MPU source publication through authenticated Create and Complete.
+#[path = "support/pin_rows.rs"]
+mod pin_rows;
 #[allow(dead_code)]
 mod support;
 
@@ -13,10 +15,7 @@ use ipfs_s3_gateway::{
         zip_policy::{ZipOutputRuleConfig, ZipRuleEffect},
     },
     store,
-    store::{
-        entities::{object_version, pin_lease, remote_pin},
-        object_version::BucketVersioningState,
-    },
+    store::{entities::object_version, object_version::BucketVersioningState},
 };
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, PaginatorTrait, QueryFilter,
@@ -26,6 +25,9 @@ use support::decompress::{
     AddReply, KuboScript, TestHarness, legal_single_entry_zip, start_harness_with_root_default,
     start_kubo_harness,
 };
+
+const ARCHIVE: &str = "bafkreigh2akiscaildc6ii5zji4bq7kly5k3s7svv6q2wx2nn5rtj5xuu4";
+const OUTPUT: &str = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
 
 #[tokio::test]
 async fn source_only_publishes_the_verified_archive_and_replays_its_exact_receipt() {
@@ -781,10 +783,10 @@ async fn source_and_entries_targets_intersect_per_output_deny_and_do_not_copy_ar
     for (targets, expected_remote) in [("both", 1), ("extracted", 0)] {
         let archive = legal_single_entry_zip();
         let kubo = start_kubo_harness(KuboScript {
-            add_replies: vec![AddReply::Ok("QmArchive"), AddReply::Ok("QmOutput")],
+            add_replies: vec![AddReply::Ok(ARCHIVE), AddReply::Ok(OUTPUT)],
             cat_bodies: [
                 ("QmPart".to_owned(), archive.clone()),
-                ("QmArchive".to_owned(), archive.clone()),
+                (ARCHIVE.into(), archive.clone()),
             ]
             .into(),
         })
@@ -887,46 +889,63 @@ async fn source_and_entries_targets_intersect_per_output_deny_and_do_not_copy_ar
         )
         .await
         .unwrap();
-        let response = support::sigv4::send_sigv4(
-            reqwest::Method::POST,
-            &server.endpoint,
-            "test-bkt",
-            "archive.zip",
-            &[("uploadId", id)],
-            complete_body(None),
-            HeaderMap::new(),
-            "test",
-        )
-        .await;
+        let query = [("uploadId", id)];
+        let send = || {
+            support::sigv4::send_sigv4(
+                reqwest::Method::POST,
+                &server.endpoint,
+                "test-bkt",
+                "archive.zip",
+                &query,
+                complete_body(None),
+                HeaderMap::new(),
+                "test",
+            )
+        };
+        let response = send().await;
         let status = response.status();
+        let etag = response.headers().get(http::header::ETAG).cloned();
         let xml = response.text().await.unwrap();
         assert_eq!(status, StatusCode::OK, "{targets}: {xml}");
-        let source = store::object::get_latest(state.store.db(), "test-bkt", "archive.zip")
+        let db = state.store.db();
+        let source = store::object::get_latest(db, "test-bkt", "archive.zip")
             .await
             .unwrap();
+        assert_eq!(source.cid, ARCHIVE);
         assert_eq!(
-            store::object::get_latest(state.store.db(), "test-bkt", "out/file.txt")
+            store::object::get_latest(db, "test-bkt", "out/file.txt")
                 .await
                 .unwrap()
                 .cid,
-            "QmOutput"
+            OUTPUT
         );
-        let leases = pin_lease::Entity::find()
-            .all(state.store.db())
-            .await
-            .unwrap();
-        assert_eq!(leases.len(), expected_remote);
-        assert!(
-            leases
-                .iter()
-                .all(|lease| lease.owner_object_id == source.id && lease.source == "automatic")
-        );
-        let remotes = remote_pin::Entity::find()
-            .all(state.store.db())
-            .await
-            .unwrap();
-        assert_eq!(remotes.len(), expected_remote);
-        assert!(remotes.iter().all(|remote| remote.cid == "QmArchive"));
+        let refs = pin_rows::refs(db).await;
+        let resources = pin_rows::resources(db).await;
+        assert_eq!(refs.len(), expected_remote);
+        assert_eq!(resources.len(), expected_remote);
+        for pin_ref in &refs {
+            assert_eq!(pin_ref.owner_object_id, source.id);
+            assert_eq!(pin_ref.provider, "alpha");
+            assert_eq!(pin_ref.cid, ARCHIVE);
+            assert_eq!(pin_ref.source, "automatic");
+            assert_eq!(pin_ref.content_mode, "object");
+        }
+        for resource in &resources {
+            assert_eq!(resource.cid, ARCHIVE);
+            assert_eq!(resource.logical_size, archive.len() as i64);
+            assert_eq!(resource.status, "waiting");
+            assert_eq!(resource.action.as_deref(), Some("submit"));
+            assert!(resource.handle.is_none());
+        }
+        let calls = kubo.server.received_requests().await.unwrap().len();
+        let replay = send().await;
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(replay.headers().get(http::header::ETAG), etag.as_ref());
+        assert_eq!(replay.text().await.unwrap(), xml);
+        assert_eq!(kubo.server.received_requests().await.unwrap().len(), calls);
+        assert_eq!(pin_rows::count(db, "object_versions").await, 2);
+        assert_eq!(pin_rows::refs(db).await, refs);
+        assert_eq!(pin_rows::resources(db).await, resources);
     }
 }
 
@@ -935,10 +954,10 @@ async fn current_automatic_deny_after_create_publishes_source_and_entries_withou
     let archive = legal_single_entry_zip();
     let mut harness = start_harness_with_root_default(
         KuboScript {
-            add_replies: vec![AddReply::Ok("QmArchive"), AddReply::Ok("QmOutput")],
+            add_replies: vec![AddReply::Ok(ARCHIVE), AddReply::Ok(OUTPUT)],
             cat_bodies: [
                 ("QmPart".into(), archive.clone()),
-                ("QmArchive".into(), archive.clone()),
+                (ARCHIVE.into(), archive.clone()),
             ]
             .into(),
         },
@@ -1074,30 +1093,19 @@ async fn current_automatic_deny_after_create_publishes_source_and_entries_withou
             .await
             .unwrap()
             .cid,
-        "QmArchive"
+        ARCHIVE
     );
     assert_eq!(
         store::object::get_latest(db, &harness.bucket, "out/file.txt")
             .await
             .unwrap()
             .cid,
-        "QmOutput"
+        OUTPUT
     );
     assert_eq!(versions(&harness, "archive.zip").await, 1);
     assert_eq!(versions(&harness, "out/file.txt").await, 1);
-    for table in ["pin_leases", "pin_lease_targets", "remote_pins", "pin_jobs"] {
-        assert_eq!(count(&harness, table).await, 0, "{table}");
-    }
-    let usage = db.query_one(Statement::from_string(db.get_database_backend(),
-        "SELECT COALESCE(SUM(reserved_bytes),0) AS bytes, COALESCE(SUM(reserved_pins),0) AS pins FROM pin_provider_usage".to_owned(),
-    )).await.unwrap().unwrap();
-    assert_eq!(
-        (
-            usage.try_get::<i64>("", "bytes").unwrap(),
-            usage.try_get::<i64>("", "pins").unwrap()
-        ),
-        (0, 0)
-    );
+    assert_eq!(pin_rows::count(db, "pin_refs").await, 0);
+    assert_eq!(pin_rows::count(db, "pin_resources").await, 0);
     let retained = store::multipart::v2_zip::read_by_upload(db, &id)
         .await
         .unwrap()
@@ -1425,7 +1433,8 @@ async fn changed_verified_source_cid_or_size_inside_publication_rolls_back_every
         assert_ne!(result.status(), StatusCode::OK, "{changed}");
         assert_eq!(count(&harness, "objects").await, 0, "{changed}");
         assert_eq!(count(&harness, "object_versions").await, 0, "{changed}");
-        assert_eq!(count(&harness, "pin_leases").await, 0, "{changed}");
+        assert_eq!(pin_rows::count(db, "pin_refs").await, 0, "{changed}");
+        assert_eq!(pin_rows::count(db, "pin_resources").await, 0, "{changed}");
         assert_eq!(count(&harness, "multipart_uploads").await, 1, "{changed}");
         let execution = store::zip::execution::read(db, &id).await.unwrap().unwrap();
         assert_eq!(execution.state, "admitted", "{changed}");

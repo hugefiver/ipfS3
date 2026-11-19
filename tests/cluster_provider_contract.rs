@@ -1,15 +1,13 @@
-use ipfs_s3_gateway::pinning;
-
-#[path = "../src/pinning/cluster/mod.rs"]
-#[allow(dead_code, unused_imports)] // Standalone leaf wiring, not shared registration.
-mod cluster;
-
-use cluster::provider::{
-    ClusterFailureCode, ClusterProtocol, ClusterProvider, ClusterProviderOptions, ClusterRemoteRef,
-    ClusterResourceStatus, ClusterSource, ClusterStrategy, ClusterWriteEffect,
+use ipfs_s3_gateway::pinning::{
+    cluster::{
+        self, ClusterAuth, ClusterPinset,
+        provider::{
+            ClusterFailureCode, ClusterProtocol, ClusterProvider, ClusterProviderOptions,
+            ClusterSource, ClusterStrategy,
+        },
+    },
+    provider::SubmitPin,
 };
-use cluster::{ClusterAuth, ClusterPinset, ReplicaOutcome};
-use pinning::{identity::Ownership, provider::SubmitPin};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -33,7 +31,6 @@ fn options(
         rest_endpoint: server.uri(),
         proxy_endpoint: (protocol == ClusterProtocol::Proxy).then(|| server.uri()),
         pinset: ClusterPinset::new("cluster-contract", "pinset").unwrap(),
-        min_replicas: 1,
         allow_private_network: true,
         ..ClusterProviderOptions::default()
     }
@@ -47,26 +44,8 @@ fn request(cid: &str) -> SubmitPin {
     }
 }
 
-async fn replicas(server: &MockServer, cid: &str, state: &str) {
-    let created = (chrono::Utc::now() - chrono::Duration::seconds(60)).to_rfc3339();
-    let observed = (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
-    Mock::given(method("GET"))
-        .and(path("/version"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(serde_json::json!({"version":"1.1.6"})),
-        )
-        .mount(server)
-        .await;
-    Mock::given(method("GET")).and(path(format!("/allocations/{cid}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"cid":cid,"allocations":[PEER],"timestamp":created,"replication_factor_min":1,"replication_factor_max":1})))
-        .mount(server).await;
-    Mock::given(method("GET")).and(path(format!("/pins/{cid}"))).and(query_param("local", "false"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"cid":cid,"allocations":[PEER],"created":created,"peer_map":{PEER:{"status":state,"timestamp":observed,"error":""}}})))
-        .mount(server).await;
-}
-
 #[tokio::test]
-async fn cid_protocols_use_one_write_endpoint_then_fresh_rest_proof() {
+async fn cid_protocols_acknowledge_one_write_without_reading_replica_status() {
     for protocol in [ClusterProtocol::Proxy, ClusterProtocol::Rest] {
         let server = MockServer::start().await;
         let route = if protocol == ClusterProtocol::Proxy {
@@ -85,27 +64,27 @@ async fn cid_protocols_use_one_write_endpoint_then_fresh_rest_proof() {
             .expect(1)
             .mount(&server)
             .await;
-        replicas(&server, CID, "pinned").await;
         let provider =
             ClusterProvider::new(options(&server, protocol, ClusterStrategy::Cid)).unwrap();
-        let result = provider.submit_observed(request(CID)).await;
-        assert!(result.result.is_ok(), "{result:?}");
-        assert_eq!(result.effect, ClusterWriteEffect::Observed);
-        assert_eq!(result.replication_outcome(), ReplicaOutcome::Complete);
-        assert!(
-            result
-                .resources
-                .iter()
-                .all(|r| r.ownership == Ownership::Unknown)
-        );
+        let ack = provider.submit(request(CID)).await.unwrap();
+        assert_eq!(ack.resource, provider.resource_key(CID).unwrap());
+        assert_eq!(ack.request_id, CID);
         let requests = server.received_requests().await.unwrap();
-        assert_eq!(requests.iter().filter(|r| r.method == "POST").count(), 1);
-        assert!(!format!("{requests:?}").contains("private-object-name"));
+        assert_eq!(requests.len(), 1);
+        let query: BTreeMap<_, _> = requests[0].url.query_pairs().collect();
+        if protocol == ClusterProtocol::Proxy {
+            assert_eq!(query.len(), 2);
+            assert_eq!(query["arg"], CID);
+            assert_eq!(query["type"], "recursive");
+        } else {
+            assert!(query.is_empty());
+        }
+        assert!(requests[0].body.is_empty());
     }
 }
 
 #[tokio::test]
-async fn forbidden_after_dispatch_retains_typed_unknown_footprint_without_repost() {
+async fn forbidden_ack_preserves_http_status_without_exposing_body_or_reposting() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/v0/pin/add"))
@@ -119,12 +98,11 @@ async fn forbidden_after_dispatch_retains_typed_unknown_footprint_without_repost
         ClusterStrategy::Cid,
     ))
     .unwrap();
-    let result = provider.submit_observed(request(CID)).await;
-    assert!(result.result.is_err());
-    assert_eq!(result.effect, ClusterWriteEffect::Unknown);
-    assert_eq!(result.resources.len(), 1);
-    assert_eq!(result.resources[0].resource.cid, CID);
-    assert_eq!(result.result.unwrap_err().http_status, Some(403));
+    let error = provider.submit(request(CID)).await.unwrap_err();
+    assert_eq!(error.code, ClusterFailureCode::HttpStatus);
+    assert_eq!(error.http_status, Some(403));
+    assert!(!error.to_string().contains("secret upstream body"));
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -293,7 +271,6 @@ async fn proxy_pascalcase_and_rest_lowercase_add_dtos_are_independent_in_both_mo
                 .expect(1)
                 .mount(&target)
                 .await;
-            replicas(&target, CID, "pinned").await;
             let mut opts = options(&target, protocol, ClusterStrategy::Car);
             opts.stream_channels = stream;
             opts.source = Some(ClusterSource {
@@ -302,10 +279,9 @@ async fn proxy_pascalcase_and_rest_lowercase_add_dtos_are_independent_in_both_mo
             });
             let out = ClusterProvider::new(opts)
                 .unwrap()
-                .submit_observed(request(CID))
+                .submit(request(CID))
                 .await;
-            assert!(out.result.is_ok(), "{protocol:?} stream={stream} {out:?}");
-            assert_eq!(out.replication_outcome(), ReplicaOutcome::Complete);
+            assert!(out.is_ok(), "{protocol:?} stream={stream} {out:?}");
         }
     }
 }
@@ -354,11 +330,9 @@ async fn wrong_protocol_and_wrong_size_types_fail_without_translation_or_fallbac
             });
             let out = ClusterProvider::new(opts)
                 .unwrap()
-                .submit_observed(request(CID))
+                .submit(request(CID))
                 .await;
-            assert_eq!(out.result.unwrap_err().code, ClusterFailureCode::Protocol);
-            assert_eq!(out.effect, ClusterWriteEffect::Unknown);
-            assert!(out.replicas.is_none());
+            assert_eq!(out.unwrap_err().code, ClusterFailureCode::Protocol);
             assert_eq!(target.received_requests().await.unwrap().len(), 1);
         }
     }
@@ -400,7 +374,6 @@ async fn stored_ciphertext_upload_is_opaque_and_auth_is_separate_in_both_respons
             .mount(&source)
             .await;
         mount_add(&target, protocol, &root, false, stream).await;
-        replicas(&target, &root, "pinned").await;
         let mut opts = options(&target, protocol, ClusterStrategy::Upload);
         opts.stream_channels = stream;
         opts.source = Some(ClusterSource {
@@ -413,11 +386,9 @@ async fn stored_ciphertext_upload_is_opaque_and_auth_is_separate_in_both_respons
         }
         let result = ClusterProvider::new(opts)
             .unwrap()
-            .submit_observed(request(&root))
+            .submit(request(&root))
             .await;
-        assert!(result.result.is_ok(), "{result:?}");
-        assert_eq!(result.replication_outcome(), ReplicaOutcome::Complete);
-        assert!(result.result.unwrap().accepted_at <= chrono::Utc::now());
+        assert!(result.is_ok(), "{result:?}");
         let requests = target.received_requests().await.unwrap();
         let post = requests.iter().find(|r| r.method == "POST").unwrap();
         assert!(
@@ -436,12 +407,6 @@ async fn stored_ciphertext_upload_is_opaque_and_auth_is_separate_in_both_respons
                 "Bearer rest-only"
             }
         );
-        for r in &requests {
-            assert!(!r.url.query().unwrap_or("").contains("replication-"));
-            if r.method == "GET" {
-                assert_eq!(r.headers["authorization"], "Bearer rest-only");
-            }
-        }
         assert!(
             source
                 .received_requests()
@@ -476,13 +441,12 @@ async fn directory_upload_is_rejected_before_cat_and_directory_car_has_complete_
         });
         let result = ClusterProvider::new(opts.clone())
             .unwrap()
-            .submit_observed(request(&root))
+            .submit(request(&root))
             .await;
         assert_eq!(
-            result.result.unwrap_err().code,
+            result.unwrap_err().code,
             ClusterFailureCode::DirectoryRequiresCar
         );
-        assert_eq!(result.effect, ClusterWriteEffect::NotSubmitted);
         assert!(target.received_requests().await.unwrap().is_empty());
         opts.strategy = ClusterStrategy::Car;
         mount_export(
@@ -498,13 +462,11 @@ async fn directory_upload_is_rejected_before_cat_and_directory_car_has_complete_
         )
         .await;
         mount_add(&target, protocol, &root, true, true).await;
-        replicas(&target, &root, "pinned").await;
         let result = ClusterProvider::new(opts)
             .unwrap()
-            .submit_observed(request(&root))
+            .submit(request(&root))
             .await;
-        assert!(result.result.is_ok(), "{result:?}");
-        assert_eq!(result.replication_outcome(), ReplicaOutcome::Complete);
+        assert!(result.is_ok(), "{result:?}");
         assert!(
             source
                 .received_requests()
@@ -573,23 +535,9 @@ async fn incomplete_multiroot_wrongroot_duplicate_corrupt_and_trailing_cars_cann
             });
             let result = ClusterProvider::new(opts)
                 .unwrap()
-                .submit_observed(request(&root))
+                .submit(request(&root))
                 .await;
-            assert_eq!(
-                result.result.unwrap_err().code,
-                ClusterFailureCode::InvalidCar
-            );
-            assert_eq!(result.effect, ClusterWriteEffect::Unknown);
-            assert_eq!(result.resources[0].resource.cid, root);
-            assert!(result.replicas.is_none());
-            assert!(
-                target
-                    .received_requests()
-                    .await
-                    .unwrap()
-                    .iter()
-                    .all(|r| r.method != "GET")
-            );
+            assert_eq!(result.unwrap_err().code, ClusterFailureCode::InvalidCar);
         }
     }
 }
@@ -617,37 +565,26 @@ async fn zero_and_small_stored_uploads_use_one_selected_protocol_and_preserve_ci
                 .mount(&source)
                 .await;
             mount_add(&target, protocol, &root, false, true).await;
-            replicas(&target, &root, "pinned").await;
             let mut opts = options(&target, protocol, ClusterStrategy::Upload);
             opts.source = Some(ClusterSource {
                 endpoint: source.uri(),
                 auth: None,
             });
-            let out = ClusterProvider::new(opts)
+            let ack = ClusterProvider::new(opts)
                 .unwrap()
-                .submit_observed(request(&root))
-                .await;
-            assert!(out.result.is_ok(), "{protocol:?} {out:?}");
-            assert_eq!(out.replication_outcome(), ReplicaOutcome::Complete);
-            assert_eq!(out.resources.len(), 1);
-            assert_eq!(out.resources[0].resource.cid, root);
+                .submit(request(&root))
+                .await
+                .unwrap();
+            assert_eq!(ack.resource.cid, root);
+            assert_eq!(ack.request_id, root);
             assert_eq!(source.received_requests().await.unwrap().len(), 2);
-            assert_eq!(
-                target
-                    .received_requests()
-                    .await
-                    .unwrap()
-                    .iter()
-                    .filter(|r| r.method == "POST")
-                    .count(),
-                1
-            );
+            assert_eq!(target.received_requests().await.unwrap().len(), 1);
         }
     }
 }
 
 #[tokio::test]
-async fn upload_dag_mismatch_keeps_unexpected_pin_and_never_falls_back_to_car_or_other_protocol() {
+async fn upload_dag_mismatch_is_rejected_without_falling_back_to_car_or_other_protocol() {
     for protocol in [ClusterProtocol::Proxy, ClusterProtocol::Rest] {
         for stream in [false, true] {
             let source = MockServer::start().await;
@@ -684,24 +621,9 @@ async fn upload_dag_mismatch_keeps_unexpected_pin_and_never_falls_back_to_car_or
             });
             let out = ClusterProvider::new(opts)
                 .unwrap()
-                .submit_observed(request(&root))
+                .submit(request(&root))
                 .await;
-            assert_eq!(
-                out.result.unwrap_err().code,
-                ClusterFailureCode::CidMismatch
-            );
-            assert_eq!(out.effect, ClusterWriteEffect::Unknown);
-            assert_eq!(out.resources.len(), 2);
-            assert!(
-                out.resources.iter().any(|r| r.resource.cid == unexpected
-                    && r.status == ClusterResourceStatus::PinAccepted)
-            );
-            assert!(
-                out.resources
-                    .iter()
-                    .all(|r| r.ownership == Ownership::Unknown)
-            );
-            assert!(out.replicas.is_none());
+            assert_eq!(out.unwrap_err().code, ClusterFailureCode::CidMismatch);
             assert_eq!(source.received_requests().await.unwrap().len(), 2); // stat + cat; never dag/export
             let requests = target.received_requests().await.unwrap();
             assert_eq!(requests.len(), 1); // no alternate protocol, GET or cleanup
@@ -715,7 +637,7 @@ async fn upload_dag_mismatch_keeps_unexpected_pin_and_never_falls_back_to_car_or
 }
 
 #[tokio::test]
-async fn source_rejection_before_dispatch_has_no_cluster_write_or_ownership_footprint() {
+async fn source_rejection_does_not_dispatch_a_cluster_write() {
     for strategy in [ClusterStrategy::Upload, ClusterStrategy::Car] {
         for protocol in [ClusterProtocol::Proxy, ClusterProtocol::Rest] {
             let source = MockServer::start().await;
@@ -740,11 +662,9 @@ async fn source_rejection_before_dispatch_has_no_cluster_write_or_ownership_foot
             });
             let out = ClusterProvider::new(opts)
                 .unwrap()
-                .submit_observed(request(CID))
+                .submit(request(CID))
                 .await;
-            assert_eq!(out.result.unwrap_err().http_status, Some(403));
-            assert_eq!(out.effect, ClusterWriteEffect::NotSubmitted);
-            assert!(out.resources.is_empty() && out.replicas.is_none());
+            assert_eq!(out.unwrap_err().http_status, Some(403));
             assert!(target.received_requests().await.unwrap().is_empty());
         }
     }
@@ -766,7 +686,6 @@ async fn complete_single_root_car_copies_real_aes_gcm_stored_bytes_without_plain
         let target = MockServer::start().await;
         mount_export(&source, &root, car.clone()).await;
         mount_add(&target, protocol, &root, true, true).await;
-        replicas(&target, &root, "pinned").await;
         let mut opts = options(&target, protocol, ClusterStrategy::Car);
         opts.source = Some(ClusterSource {
             endpoint: source.uri(),
@@ -774,10 +693,9 @@ async fn complete_single_root_car_copies_real_aes_gcm_stored_bytes_without_plain
         });
         let out = ClusterProvider::new(opts)
             .unwrap()
-            .submit_observed(request(&root))
+            .submit(request(&root))
             .await;
-        assert!(out.result.is_ok(), "{out:?}");
-        assert_eq!(out.replication_outcome(), ReplicaOutcome::Complete);
+        assert!(out.is_ok(), "{out:?}");
         let requests = target.received_requests().await.unwrap();
         let post = requests.iter().find(|r| r.method == "POST").unwrap();
         assert!(post.body.windows(car.len()).any(|bytes| bytes == car));
@@ -792,7 +710,7 @@ async fn complete_single_root_car_copies_real_aes_gcm_stored_bytes_without_plain
 }
 
 #[tokio::test]
-async fn cid_alias_is_equivalent_but_codec_mismatch_preserves_both_resources() {
+async fn cid_alias_preserves_ack_handle_but_codec_mismatch_is_rejected() {
     let dagpb = raw_cid(b"block", 0x70);
     let cid = cid::Cid::try_from(dagpb.as_str()).unwrap();
     let alias = cid::Cid::new_v0(*cid.hash()).unwrap().to_string();
@@ -806,69 +724,25 @@ async fn cid_alias_is_equivalent_but_codec_mismatch_preserves_both_resources() {
             .expect(1)
             .mount(&server)
             .await;
-        replicas(&server, &dagpb, "pinned").await;
         let provider = ClusterProvider::new(options(
             &server,
             ClusterProtocol::Proxy,
             ClusterStrategy::Cid,
         ))
         .unwrap();
-        let out = provider.submit_observed(request(&dagpb)).await;
+        let out = provider.submit(request(&dagpb)).await;
         if returned.starts_with("Qm") {
-            assert!(out.result.is_ok());
-            assert_eq!(out.resources.len(), 1);
+            let ack = out.unwrap();
+            assert_eq!(ack.request_id, returned);
+            assert_eq!(ack.resource.cid, dagpb);
         } else {
-            assert_eq!(
-                out.result.unwrap_err().code,
-                ClusterFailureCode::CidMismatch
-            );
-            assert_eq!(out.effect, ClusterWriteEffect::Unknown);
-            assert_eq!(out.resources.len(), 2);
-            assert!(
-                out.resources.iter().any(|r| r.resource.cid == returned
-                    && r.status == ClusterResourceStatus::PinAccepted)
-            );
+            assert_eq!(out.unwrap_err().code, ClusterFailureCode::CidMismatch);
         }
     }
 }
 
 #[tokio::test]
-async fn insufficient_or_unavailable_verifier_never_turns_write_receipt_into_complete() {
-    for state in ["remote", "pinned"] {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path(format!("/pins/{CID}")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"cid":CID})))
-            .expect(1)
-            .mount(&server)
-            .await;
-        replicas(&server, CID, state).await;
-        let mut opts = options(&server, ClusterProtocol::Rest, ClusterStrategy::Cid);
-        opts.min_replicas = 2;
-        let provider = ClusterProvider::new(opts).unwrap();
-        let out = provider.submit_observed(request(CID)).await;
-        assert!(out.result.is_ok());
-        assert_eq!(out.replication_outcome(), ReplicaOutcome::Insufficient);
-        assert_eq!(
-            server
-                .received_requests()
-                .await
-                .unwrap()
-                .iter()
-                .filter(|r| r.method == "POST")
-                .count(),
-            1
-        );
-        server.reset().await;
-        let unknown = provider.observe(CID).await;
-        assert_eq!(unknown.outcome(), ReplicaOutcome::Unknown);
-        assert_eq!(out.replication_outcome(), ReplicaOutcome::Unknown); // Superseded, historical evidence retained.
-        assert!(out.replicas.unwrap().evidence().is_some());
-    }
-}
-
-#[tokio::test]
-async fn redirected_and_timed_out_writes_are_unknown_and_never_fallback_or_repost() {
+async fn redirected_and_timed_out_writes_never_acknowledge_follow_or_repost() {
     for status in [302, 200] {
         let server = MockServer::start().await;
         let response = if status == 302 {
@@ -890,52 +764,69 @@ async fn redirected_and_timed_out_writes_are_unknown_and_never_fallback_or_repos
         opts.transfer_limits.idle_timeout = Duration::from_millis(20);
         let out = ClusterProvider::new(opts)
             .unwrap()
-            .submit_observed(request(CID))
+            .submit(request(CID))
             .await;
-        assert!(out.result.is_err());
-        assert_eq!(out.effect, ClusterWriteEffect::Unknown);
-        assert_eq!(out.resources.len(), 1);
+        let error = out.unwrap_err();
+        if status == 302 {
+            assert_eq!(error.code, ClusterFailureCode::RedirectRejected);
+            assert_eq!(error.http_status, Some(302));
+        } else {
+            assert_eq!(error.code, ClusterFailureCode::IdleTimeout);
+        }
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 }
 
 #[tokio::test]
-async fn typed_unpin_primitive_rejects_wrong_scope_and_never_runs_during_submit() {
-    let server = MockServer::start().await;
-    let provider = ClusterProvider::new(options(
-        &server,
-        ClusterProtocol::Rest,
-        ClusterStrategy::Cid,
-    ))
-    .unwrap();
-    let mut reference = ClusterRemoteRef {
-        resource: provider.resource_key(CID).unwrap(),
-        protocol: ClusterProtocol::Rest,
-        strategy: ClusterStrategy::Cid,
-    };
-    reference.resource.pinset.scope = "other-scope".into();
-    let out = provider
-        .unpin_authorized_ref(&reference, &CancellationToken::new())
-        .await;
-    assert_eq!(
-        out.result.unwrap_err().code,
-        ClusterFailureCode::InvalidReference
-    );
-    assert_eq!(out.effect, ClusterWriteEffect::NotSubmitted);
-    assert!(server.received_requests().await.unwrap().is_empty());
-    reference.resource = provider.resource_key(CID).unwrap();
-    Mock::given(method("DELETE"))
-        .and(path(format!("/pins/{}", reference.resource.cid)))
-        .respond_with(ResponseTemplate::new(202))
-        .expect(1)
-        .mount(&server)
-        .await;
-    let out = provider
-        .unpin_authorized_ref(&reference, &CancellationToken::new())
-        .await;
-    assert!(out.result.is_ok());
-    assert_eq!(out.effect, ClusterWriteEffect::Observed);
-    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+async fn unpin_uses_the_selected_protocol_and_requires_its_acknowledgment() {
+    let other = raw_cid(b"wrong deletion CID", 0x55);
+    for (protocol, status, reported, expected) in [
+        (ClusterProtocol::Proxy, 200, CID, Ok(())),
+        (
+            ClusterProtocol::Proxy,
+            200,
+            other.as_str(),
+            Err(ClusterFailureCode::CidMismatch),
+        ),
+        (ClusterProtocol::Rest, 200, CID, Ok(())),
+        (ClusterProtocol::Rest, 202, CID, Ok(())),
+        (ClusterProtocol::Rest, 204, CID, Ok(())),
+        (
+            ClusterProtocol::Rest,
+            200,
+            other.as_str(),
+            Err(ClusterFailureCode::CidMismatch),
+        ),
+    ] {
+        let server = MockServer::start().await;
+        let provider =
+            ClusterProvider::new(options(&server, protocol, ClusterStrategy::Cid)).unwrap();
+        assert_eq!(
+            provider.unpin("invalid CID").await.unwrap_err().code,
+            ClusterFailureCode::InvalidCid
+        );
+        let mut response = ResponseTemplate::new(status);
+        let write = match protocol {
+            ClusterProtocol::Proxy => {
+                response = response.set_body_json(serde_json::json!({"Pins":[reported]}));
+                Mock::given(method("POST"))
+                    .and(path("/api/v0/pin/rm"))
+                    .and(query_param("arg", CID))
+            }
+            ClusterProtocol::Rest => {
+                if status == 200 {
+                    response = response.set_body_json(serde_json::json!({"cid":reported}));
+                }
+                Mock::given(method("DELETE")).and(path(format!("/pins/{CID}")))
+            }
+        };
+        write.respond_with(response).expect(1).mount(&server).await;
+        assert_eq!(
+            provider.unpin(CID).await.map_err(|error| error.code),
+            expected
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
 }
 
 mod loopback {
@@ -1134,29 +1025,9 @@ async fn source_and_target_trailers_or_source_disconnect_cannot_fake_completion(
         let target = loopback::target(&root, mode).await;
         let out = ClusterProvider::new(loopback::opts(&source, &target, ClusterStrategy::Car))
             .unwrap()
-            .submit_observed(request(&root))
+            .submit(request(&root))
             .await;
-        assert!(out.result.is_err(), "mode={} {out:?}", mode as u8);
-        if mode == Mode::SourceDisconnect && out.resources.is_empty() {
-            assert_eq!(out.effect, ClusterWriteEffect::NotSubmitted);
-        } else {
-            assert_eq!(
-                out.effect,
-                ClusterWriteEffect::Unknown,
-                "mode={} {out:?}",
-                mode as u8
-            );
-        }
-        assert_eq!(out.replication_outcome(), ReplicaOutcome::Unknown);
-        assert!(out.replicas.is_none());
-        if mode == Mode::TargetTrailer {
-            assert_eq!(out.http_status, Some(200));
-            assert!(
-                out.resources
-                    .iter()
-                    .any(|r| r.status == ClusterResourceStatus::Reported)
-            );
-        }
+        assert!(out.is_err(), "mode={} {out:?}", mode as u8);
     }
 }
 
@@ -1176,12 +1047,10 @@ async fn continuous_slow_source_progress_outlives_idle_window_without_absolute_t
     let start = tokio::time::Instant::now();
     let out = ClusterProvider::new(opts)
         .unwrap()
-        .submit_observed(request(&root))
+        .submit(request(&root))
         .await;
-    assert!(out.result.is_ok(), "{out:?}");
+    assert!(out.is_ok(), "{out:?}");
     assert!(start.elapsed() > Duration::from_millis(100));
-    // Target REST is deliberately unavailable; acceptance is not N/N proof.
-    assert_eq!(out.replication_outcome(), ReplicaOutcome::Unknown);
 }
 
 #[tokio::test]
@@ -1192,19 +1061,9 @@ async fn early_destination_response_does_not_replace_source_and_multipart_eof() 
     let target = loopback::early_target(&root).await;
     let out = ClusterProvider::new(loopback::opts(&source, &target, ClusterStrategy::Upload))
         .unwrap()
-        .submit_observed(request(&root))
+        .submit(request(&root))
         .await;
-    assert_eq!(
-        out.result.unwrap_err().code,
-        ClusterFailureCode::IncompleteUpload
-    );
-    assert_eq!(out.http_status, Some(200));
-    assert_eq!(out.effect, ClusterWriteEffect::Unknown);
-    assert!(
-        out.resources
-            .iter()
-            .any(|r| r.status == ClusterResourceStatus::Reported)
-    );
+    assert_eq!(out.unwrap_err().code, ClusterFailureCode::IncompleteUpload);
 }
 
 #[tokio::test]
@@ -1231,14 +1090,13 @@ async fn idle_timeout_and_explicit_cancel_drop_source_without_unbounded_prefetch
             future.await
         };
         assert_eq!(
-            out.result.unwrap_err().code,
+            out.unwrap_err().code,
             if cancel_write {
                 ClusterFailureCode::Cancelled
             } else {
                 ClusterFailureCode::IdleTimeout
             }
         );
-        assert_eq!(out.effect, ClusterWriteEffect::Unknown);
         tokio::time::timeout(Duration::from_secs(2), async {
             while !source.dropped.load(Ordering::Acquire) {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1254,7 +1112,7 @@ async fn idle_timeout_and_explicit_cancel_drop_source_without_unbounded_prefetch
 }
 
 #[tokio::test]
-async fn source_stall_and_pre_dispatch_cancel_preserve_distinct_effect_certainty() {
+async fn pre_cancelled_and_stalled_source_requests_return_distinct_errors() {
     let data = vec![0x51; 16 * 1024];
     let root = raw_cid(&data, 0x55);
     let source = loopback::source(
@@ -1269,57 +1127,17 @@ async fn source_stall_and_pre_dispatch_cancel_preserve_distinct_effect_certainty
     let provider = ClusterProvider::new(opts).unwrap();
     let token = CancellationToken::new();
     token.cancel();
-    let not_sent = provider.submit_with_cancel(request(&root), &token).await;
-    assert_eq!(not_sent.effect, ClusterWriteEffect::NotSubmitted);
-    assert!(not_sent.resources.is_empty());
-    let unknown = provider.submit_observed(request(&root)).await;
-    assert_eq!(
-        unknown.result.unwrap_err().code,
-        ClusterFailureCode::IdleTimeout
-    );
-    assert_eq!(unknown.effect, ClusterWriteEffect::Unknown);
+    let cancelled = provider
+        .submit_with_cancel(request(&root), &token)
+        .await
+        .unwrap_err();
+    assert_eq!(cancelled.code, ClusterFailureCode::Cancelled);
+    let stalled = provider.submit(request(&root)).await.unwrap_err();
+    assert_eq!(stalled.code, ClusterFailureCode::IdleTimeout);
 }
 
 #[tokio::test]
-async fn same_pinset_addresses_share_one_ledger_resource_and_proof_expiration_is_dynamic() {
-    let one = MockServer::start().await;
-    let two = MockServer::start().await;
-    for server in [&one, &two] {
-        Mock::given(method("POST"))
-            .and(path(format!("/pins/{CID}")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"cid":CID})))
-            .expect(1)
-            .mount(server)
-            .await;
-        replicas(server, CID, "pinned").await;
-    }
-    let mut first = options(&one, ClusterProtocol::Rest, ClusterStrategy::Cid);
-    first.verifier_limits.max_observation_age = Duration::from_millis(20);
-    let first = ClusterProvider::new(first)
-        .unwrap()
-        .submit_observed(request(CID))
-        .await;
-    let second = ClusterProvider::new(options(&two, ClusterProtocol::Rest, ClusterStrategy::Cid))
-        .unwrap()
-        .submit_observed(request(CID))
-        .await;
-    assert_eq!(
-        first.resources[0].ledger_key(),
-        second.resources[0].ledger_key()
-    );
-    assert_eq!(
-        first.resources[0].ledger_key().resource_type,
-        pinning::identity::RemoteResourceType::ClusterPin
-    );
-    assert_eq!(first.resources[0].ownership, Ownership::Unknown);
-    assert_eq!(second.replication_outcome(), ReplicaOutcome::Complete);
-    tokio::time::sleep(Duration::from_millis(25)).await;
-    assert_eq!(first.replication_outcome(), ReplicaOutcome::Unknown);
-    assert!(first.replicas.unwrap().evidence().is_some());
-}
-
-#[tokio::test]
-async fn malformed_duplicate_wrong_content_type_and_forbidden_receipts_keep_actual_cids() {
+async fn malformed_duplicate_wrong_content_type_and_forbidden_add_replies_are_not_acks() {
     let source = MockServer::start().await;
     let data = b"stored bytes";
     let root = raw_cid(data, 0x55);
@@ -1378,18 +1196,9 @@ async fn malformed_duplicate_wrong_content_type_and_forbidden_receipts_keep_actu
         });
         let out = ClusterProvider::new(opts)
             .unwrap()
-            .submit_observed(request(&root))
+            .submit(request(&root))
             .await;
-        assert!(out.result.is_err());
-        assert_eq!(out.effect, ClusterWriteEffect::Unknown);
-        assert_eq!(out.http_status, Some(status));
-        assert!(
-            out.resources
-                .iter()
-                .any(|r| r.resource.cid == other && r.status == ClusterResourceStatus::Reported)
-        );
-        assert!(out.resources.iter().any(|r| r.resource.cid == root));
-        assert!(out.replicas.is_none());
+        assert!(out.is_err());
         assert_eq!(target.received_requests().await.unwrap().len(), 1);
     }
 }
@@ -1418,7 +1227,6 @@ async fn dag_cbor_links_and_sha512_block_hashes_are_validated_without_codec_subs
     )
     .await;
     mount_add(&target, ClusterProtocol::Rest, &root, true, true).await;
-    replicas(&target, &root, "pinned").await;
     let mut opts = options(&target, ClusterProtocol::Rest, ClusterStrategy::Car);
     opts.source = Some(ClusterSource {
         endpoint: source.uri(),
@@ -1426,17 +1234,15 @@ async fn dag_cbor_links_and_sha512_block_hashes_are_validated_without_codec_subs
     });
     let out = ClusterProvider::new(opts)
         .unwrap()
-        .submit_observed(request(&root))
+        .submit(request(&root))
         .await;
-    assert!(out.result.is_ok(), "{out:?}");
-    assert_eq!(out.replication_outcome(), ReplicaOutcome::Complete);
+    assert!(out.is_ok(), "{out:?}");
 }
 
 #[tokio::test]
-async fn malformed_add_record_does_not_discard_later_reported_cids_in_stream_or_array() {
+async fn malformed_add_record_invalidates_later_matching_ack_in_stream_or_array() {
     let root = raw_cid(b"stored", 0x55);
     let first = raw_cid(b"first unexpected resource", 0x55);
-    let later = raw_cid(b"later unexpected resource", 0x55);
     for protocol in [ClusterProtocol::Proxy, ClusterProtocol::Rest] {
         for stream in [false, true] {
             let source = MockServer::start().await;
@@ -1456,7 +1262,7 @@ async fn malformed_add_record_does_not_discard_later_reported_cids_in_stream_or_
             } else {
                 "name"
             }] = serde_json::json!(3);
-            let valid = added(protocol, &later);
+            let valid = added(protocol, &root);
             let body = if stream {
                 format!("{malformed}\n{valid}\n")
             } else {
@@ -1485,23 +1291,9 @@ async fn malformed_add_record_does_not_discard_later_reported_cids_in_stream_or_
             });
             let out = ClusterProvider::new(opts)
                 .unwrap()
-                .submit_observed(request(&root))
+                .submit(request(&root))
                 .await;
-            assert_eq!(out.result.unwrap_err().code, ClusterFailureCode::Protocol);
-            assert_eq!(out.effect, ClusterWriteEffect::Unknown);
-            for cid in [&root, &first, &later] {
-                assert!(
-                    out.resources.iter().any(|r| &r.resource.cid == cid),
-                    "lost {cid}: {protocol:?}, stream={stream}, {:?}",
-                    out.resources
-                );
-            }
-            assert!(
-                out.resources
-                    .iter()
-                    .all(|r| r.ownership == Ownership::Unknown)
-            );
-            assert!(out.replicas.is_none());
+            assert_eq!(out.unwrap_err().code, ClusterFailureCode::Protocol);
             assert_eq!(target.received_requests().await.unwrap().len(), 1);
         }
     }
@@ -1527,7 +1319,6 @@ async fn v0_unixfs_import_parameters_are_preserved_and_car_budgets_fail_closed()
         .mount(&source)
         .await;
     mount_add(&target, ClusterProtocol::Proxy, &v0, false, true).await;
-    replicas(&target, &root, "pinned").await;
     let mut opts = options(&target, ClusterProtocol::Proxy, ClusterStrategy::Upload);
     opts.source = Some(ClusterSource {
         endpoint: source.uri(),
@@ -1535,9 +1326,9 @@ async fn v0_unixfs_import_parameters_are_preserved_and_car_budgets_fail_closed()
     });
     let out = ClusterProvider::new(opts)
         .unwrap()
-        .submit_observed(request(&v0))
+        .submit(request(&v0))
         .await;
-    assert!(out.result.is_ok(), "{out:?}");
+    assert!(out.is_ok(), "{out:?}");
     let posts = target.received_requests().await.unwrap();
     let post = posts.iter().find(|r| r.method == "POST").unwrap();
     let params: BTreeMap<_, _> = post.url.query_pairs().collect();
@@ -1560,10 +1351,9 @@ async fn v0_unixfs_import_parameters_are_preserved_and_car_budgets_fail_closed()
     opts.transfer_limits.max_block_bytes = 128;
     let out = ClusterProvider::new(opts)
         .unwrap()
-        .submit_observed(request(&root))
+        .submit(request(&root))
         .await;
-    assert!(out.result.is_err());
-    assert_eq!(out.replication_outcome(), ReplicaOutcome::Unknown);
+    assert!(out.is_err());
 }
 
 #[tokio::test]
@@ -1590,67 +1380,8 @@ async fn source_control_timeout_is_not_a_dispatched_cluster_mutation() {
     opts.transfer_limits.idle_timeout = Duration::from_millis(200);
     let out = ClusterProvider::new(opts)
         .unwrap()
-        .submit_observed(request(CID))
+        .submit(request(CID))
         .await;
-    assert_eq!(
-        out.result.unwrap_err().code,
-        ClusterFailureCode::ControlTimeout
-    );
-    assert_eq!(out.effect, ClusterWriteEffect::NotSubmitted);
-    assert!(out.resources.is_empty());
+    assert_eq!(out.unwrap_err().code, ClusterFailureCode::ControlTimeout);
     assert!(target.received_requests().await.unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn forbidden_missing_and_empty_rest_evidence_do_not_establish_absence_or_cleanup() {
-    for status in [403, 404, 200] {
-        let target = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path(format!("/pins/{CID}")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"cid":CID})))
-            .expect(1)
-            .mount(&target)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/version"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({"version":"1.1.6"})),
-            )
-            .mount(&target)
-            .await;
-        let created = (chrono::Utc::now() - chrono::Duration::seconds(60)).to_rfc3339();
-        Mock::given(method("GET")).and(path(format!("/allocations/{CID}")))
-            .respond_with(ResponseTemplate::new(status).set_body_json(serde_json::json!({"cid":CID,"allocations":[],"timestamp":created,"replication_factor_min":1,"replication_factor_max":1})))
-            .mount(&target).await;
-        Mock::given(method("GET"))
-            .and(path(format!("/pins/{CID}")))
-            .and(query_param("local", "false"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({"cid":CID,"allocations":[],"created":created,"peer_map":{}}),
-            ))
-            .mount(&target)
-            .await;
-        let out = ClusterProvider::new(options(
-            &target,
-            ClusterProtocol::Rest,
-            ClusterStrategy::Cid,
-        ))
-        .unwrap()
-        .submit_observed(request(CID))
-        .await;
-        assert!(out.result.is_ok());
-        assert!(matches!(
-            out.replication_outcome(),
-            ReplicaOutcome::Unknown | ReplicaOutcome::Insufficient
-        ));
-        assert_eq!(out.resources[0].ownership, Ownership::Unknown);
-        assert!(out.replicas.is_some());
-        let requests = target.received_requests().await.unwrap();
-        assert_eq!(requests.iter().filter(|r| r.method == "POST").count(), 1);
-        assert!(
-            requests
-                .iter()
-                .all(|r| r.method != "DELETE" && !r.url.path().contains("pin/rm"))
-        );
-    }
 }

@@ -7,6 +7,7 @@ use std::{
 
 use http::{HeaderMap, StatusCode};
 use s3s::{Body, S3Request, S3Response, S3Result, dto::CompleteMultipartUploadInput};
+use sea_orm::TransactionTrait as _;
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
@@ -19,7 +20,7 @@ use crate::{
         multipart::v2_zip::{CompleteReceipt, CompleteState, Record},
         pinning::publication::{
             CapturedZipPublication, PublicationObject, ZipExecutionSettlement,
-            ZipPublicationAuthority, application::publish_captured_zip,
+            ZipPublicationAuthority, publish_captured_zip,
         },
         zip::{self, execution},
     },
@@ -218,13 +219,7 @@ async fn admit_manifest(
     manifest: &FinalZipManifest,
     publish_source: bool,
 ) -> S3Result<Option<StandardMutationGuard>> {
-    let work = store::pinning::management::records::SharedDecodeBudget::default();
-    let tx = state
-        .store
-        .begin_runtime(store::pinning::management::records::DecodeWork::shared(
-            &work,
-        ))
-        .await?;
+    let tx = state.store.db().begin().await.map_err(AppError::from)?;
     store::import::ownership::lock_bucket_for_ownership(&tx, &intake.bucket).await?;
     let items = manifest
         .successful
@@ -269,7 +264,7 @@ async fn admit_manifest(
     execution::admit_manifest_in_transaction(&tx, claim, &items, &ids)
         .await
         .map_err(store_error)?;
-    zip::BatchAdmission::admit_runtime_mirror(
+    zip::BatchAdmission::admit_in_transaction(
         &tx,
         &zip::BatchAdmission {
             id: claim.batch_id.clone(),
@@ -297,7 +292,7 @@ async fn admit_manifest(
             .await
             .map_err(store_error)?;
     }
-    tx.commit().await?;
+    tx.commit().await.map_err(AppError::from)?;
     Ok(source_guard)
 }
 
@@ -611,7 +606,7 @@ pub(super) async fn complete(
         return Err(conflict());
     }
     let publication = publish_captured_zip(
-        &state.store,
+        db,
         request,
         state.pinning.effective_config(),
         state.pinning.zip_output_rules(),

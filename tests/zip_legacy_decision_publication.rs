@@ -1,3 +1,5 @@
+#[path = "support/pin_rows.rs"]
+mod pin_rows;
 #[allow(dead_code)]
 mod stage9_zip_support;
 
@@ -11,7 +13,7 @@ use ipfs_s3_gateway::{
     },
     store::{
         self,
-        entities::{object_version, pin_lease, zip_batch},
+        entities::{object_version, zip_batch},
         pinning::publication::{
             self, CapturedZipPublication, LegacyZipAuthority, ZipPublicationAuthority,
         },
@@ -116,7 +118,7 @@ async fn mpu_final_publication_rereads_decision_and_accepts_single_authority() {
         "out/archive.zip",
         "batch",
         &parts,
-        "archive-cid",
+        stage9_zip_support::ARCHIVE_CID,
     )
     .await
     .unwrap();
@@ -160,7 +162,8 @@ async fn mpu_final_publication_rereads_decision_and_accepts_single_authority() {
             }),
         })),
         root_outcome: batch.root_outcome,
-        terminal_result: serde_json::json!({"archive_cid":"archive-cid"}).to_string(),
+        terminal_result: serde_json::json!({"archive_cid":stage9_zip_support::ARCHIVE_CID})
+            .to_string(),
     };
     let mut conflicting = capture.source_decision().clone();
     assert_eq!(conflicting.control, PinControl::Absent);
@@ -196,7 +199,7 @@ async fn mpu_final_publication_rereads_decision_and_accepts_single_authority() {
         Err(ipfs_s3_gateway::error::AppError::InvalidPinningRequest(_))
     ));
     assert_eq!(object_version::Entity::find().count(&db).await.unwrap(), 0);
-    assert_eq!(pin_lease::Entity::find().count(&db).await.unwrap(), 0);
+    assert_eq!(pin_rows::count(&db, "pin_refs").await, 0);
     assert!(store::multipart::get_upload(&db, "batch").await.is_ok());
     assert_eq!(
         store::zip::read(&db, "batch").await.unwrap().unwrap().state,

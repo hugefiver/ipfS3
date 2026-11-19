@@ -688,7 +688,7 @@ async fn verified_root_is_adopted_only_by_atomic_publication_and_survives_source
 }
 
 #[tokio::test]
-async fn old_database_migrates_without_rewriting_existing_objects() {
+async fn zip_batch_migration_preserves_existing_objects() {
     use sea_orm_migration::MigratorTrait;
     struct Previous;
     impl MigratorTrait for Previous {
@@ -726,7 +726,10 @@ async fn old_database_migrates_without_rewriting_existing_objects() {
     Previous::up(&db, None).await.unwrap();
     store::bucket::create(&db, "bucket", None).await.unwrap();
     db.execute_unprepared("INSERT INTO objects (id,bucket,key,cid,size,etag) VALUES ('old','bucket','old','legacy',1,'legacy')").await.unwrap();
-    store::run_migrations(&db).await.unwrap();
+    store::migrations::m20260927_000001_zip_batches::Migration
+        .up(&SchemaManager::new(&db))
+        .await
+        .unwrap();
     zip::admit(&db, &admission("new")).await.unwrap();
     let count: i64 = db
         .query_one(sea_orm::Statement::from_string(

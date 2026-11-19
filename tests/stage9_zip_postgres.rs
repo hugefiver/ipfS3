@@ -1,11 +1,10 @@
 //! Explicit opt-in only; owns a fresh UUID schema in an authorized PostgreSQL 17/18 test DB.
 //! IPFS_S3_TEST_POSTGRES_URL + --ignored. No production or account access.
+#[path = "support/pin_rows.rs"]
+mod pin_rows;
 mod stage9_zip_support;
 use futures_util::FutureExt;
-use ipfs_s3_gateway::store::{
-    self,
-    entities::{object_version, pin_lease, pin_provider_usage},
-};
+use ipfs_s3_gateway::store::{self, entities::object_version};
 use sea_orm::{
     ConnectOptions, ConnectionTrait, Database, DatabaseBackend, EntityTrait, PaginatorTrait,
     Statement,
@@ -75,8 +74,8 @@ async fn r25_pg_tail_rollback_then_exact_shared_cid_publication() {
         db.execute_unprepared("CREATE TRIGGER r25_tail BEFORE UPDATE ON zip_batches FOR EACH ROW EXECUTE FUNCTION r25_tail()").await.unwrap();
         assert!(ipfs_s3_gateway::store::pinning::publication::publish_captured_zip(&db, common.clone(), &config, &output_rules(&config), ipfs_s3_gateway::config::OptionalPinControlMode::Warn).await.unwrap_err().to_string().contains("r25 PG tail"));
         assert_eq!(object_version::Entity::find().count(&db).await.unwrap(), 0);
-        assert_eq!(pin_lease::Entity::find().count(&db).await.unwrap(), 0);
-        assert_eq!(pin_provider_usage::Entity::find().count(&db).await.unwrap(), 0);
+        assert_eq!(pin_rows::count(&db, "pin_refs").await, 0);
+        assert_eq!(pin_rows::count(&db, "pin_resources").await, 0);
         let snapshot = store::zip::snapshot(&db, "batch").await.unwrap().unwrap();
         assert_eq!(snapshot.batch.state, "open");
         assert!(snapshot.entries.iter().all(|e| e.version_row_id.is_none()));
@@ -84,9 +83,11 @@ async fn r25_pg_tail_rollback_then_exact_shared_cid_publication() {
         // Known rollback keeps the claim; retry the same exact captured request.
         ipfs_s3_gateway::store::pinning::publication::publish_captured_zip(&db, common, &config, &output_rules(&config), ipfs_s3_gateway::config::OptionalPinControlMode::Warn).await.unwrap();
         assert_eq!(object_version::Entity::find().count(&db).await.unwrap(), 3);
-        assert_eq!(pin_lease::Entity::find().count(&db).await.unwrap(), 2);
-        let usage = pin_provider_usage::Entity::find().one(&db).await.unwrap().unwrap();
-        assert_eq!((usage.reserved_bytes, usage.reserved_pins), (5, 1));
+        let refs = pin_rows::refs(&db).await;
+        assert_eq!(refs.iter().map(|r| r.owner_object_id.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+        let resources = pin_rows::resources(&db).await;
+        assert_eq!(resources.len(), 1);
+        assert_eq!((resources[0].logical_size, resources[0].cid.as_str()), (5, OUTPUT_CID));
         assert!(publish(&db, &config, request, batch, &capture, guard).await.is_err());
         assert_eq!(object_version::Entity::find().count(&db).await.unwrap(), 3);
     }).catch_unwind().await;

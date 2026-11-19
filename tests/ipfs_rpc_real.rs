@@ -14,11 +14,7 @@ use ipfs_s3_gateway::{
     crypto::{aes_gcm::encrypt_chunk, key::ObjectKey},
     kubo::KuboClient,
     pinning::{
-        identity::Ownership,
-        ipfs_rpc::{
-            IpfsRpcProvider, RpcAuth, RpcPinKind, RpcPinObservation, RpcProfile, RpcResourceStatus,
-            RpcStrategy, RpcSubmitEffect, RpcTimeouts,
-        },
+        ipfs_rpc::{IpfsRpcProvider, RpcAuth, RpcProfile, RpcStrategy, RpcTimeouts},
         provider::{PinningProvider, RemotePinStatus, SubmitPin},
     },
 };
@@ -61,35 +57,10 @@ fn provider(
 }
 
 async fn submit(provider: &IpfsRpcProvider, cid: &str) -> Result<()> {
-    let observation = provider.submit_observed(request(cid)).await;
-    ensure!(
-        observation.effect == RpcSubmitEffect::Observed,
-        "submit evidence: {observation:?}"
-    );
-    ensure!(
-        observation.resources.len() == 1,
-        "not exact single-root evidence: {observation:?}"
-    );
-    let resource = &observation.resources[0];
-    let expected = if provider.invocation_route().1 == "cid" {
-        RpcResourceStatus::PinAccepted
-    } else {
-        RpcResourceStatus::RecursiveVerified
-    };
-    ensure!(
-        resource.cid == car::canonical(cid)?
-            && resource.ownership == Ownership::Unknown
-            && resource.status == expected,
-        "invalid evidence: {observation:?}"
-    );
-    let pin = observation.result?;
+    let pin = provider.submit(request(cid)).await?;
     ensure!(
         pin.cid == car::canonical(cid)? && pin.status == RemotePinStatus::Pinned,
         "provider accepted a noncanonical/wrong root: {pin:?}"
-    );
-    println!(
-        "provider_submit cid={} evidence={:?} ownership=Unknown",
-        pin.cid, resource.status
     );
     Ok(())
 }
@@ -124,11 +95,7 @@ async fn file(source: &Rpc, name: &'static str, bytes: Vec<u8>, chunker: &str) -
     })
 }
 
-async fn verify(target: &Rpc, provider: &IpfsRpcProvider, case: &Case) -> Result<()> {
-    ensure!(
-        provider.observe_pin(&case.cid).await? == RpcPinObservation::Present(RpcPinKind::Recursive),
-        "target root is not recursively pinned"
-    );
+async fn verify(target: &Rpc, case: &Case) -> Result<()> {
     let path = format!("/ipfs/{}", case.cid);
     let stat = target
         .json(
@@ -160,7 +127,7 @@ async fn verify(target: &Rpc, provider: &IpfsRpcProvider, case: &Case) -> Result
         );
     }
     println!(
-        "target_verify name={} cid={} recursive_pin=true single_root_car=true complete_local=true all_bytes=true offline=true",
+        "target_verify name={} cid={} single_root_car=true complete_local=true all_bytes=true offline=true",
         case.name,
         car::canonical(&case.cid)?
     );
@@ -202,8 +169,6 @@ async fn rpc_preseed_import_contract_probe() -> Result<()> {
         blocks.len(),
         case.car.len()
     );
-    let observer = provider(&source, &target, RpcStrategy::Cid, None)?;
-    ensure!(observer.observe_pin(&case.cid).await? == RpcPinObservation::Absent);
     for pin in [false, true] {
         let raw = import::exchange(&target.base, &case.car, pin).await?;
         let records: Vec<serde_json::Value> = std::str::from_utf8(&raw)?
@@ -229,15 +194,6 @@ async fn rpc_preseed_import_contract_probe() -> Result<()> {
                     == *expected
             );
         }
-        let expected = if pin {
-            RpcPinObservation::Present(RpcPinKind::Recursive)
-        } else {
-            RpcPinObservation::Absent
-        };
-        ensure!(observer.observe_pin(&case.cid).await? == expected);
-        println!(
-            "probe pin_roots={pin} complete_header_blocks=true all_bytes=true offline=true pin_observation={expected:?}"
-        );
     }
     println!("preseed_probe=PASS diagnostic_only=true no_provider_submit=true no_pin_rm=true");
     Ok(())
@@ -316,18 +272,14 @@ async fn rpc_provider_real_transports_and_local_dags() -> Result<()> {
         ),
     ] {
         let case = file(&source, name, bytes, "size-262144").await?;
-        ensure!(
-            upload.observe_pin(&case.cid).await? == RpcPinObservation::Absent,
-            "target not initially independent"
-        );
         // The empty raw CAR really reaches an initially empty target, including
         // its legal zero-block-byte stats; Upload then repeats the exact root.
         if name == "empty-raw" {
             submit(&car_provider, &case.cid).await?;
-            verify(&target, &car_provider, &case).await?;
+            verify(&target, &case).await?;
         }
         submit(&upload, &case.cid).await?;
-        verify(&target, &upload, &case).await?;
+        verify(&target, &case).await?;
         cases.push(case);
     }
 
@@ -338,18 +290,9 @@ async fn rpc_provider_real_transports_and_local_dags() -> Result<()> {
         "size-65536",
     )
     .await?;
-    ensure!(
-        cid_provider.observe_pin(&cid_case.cid).await? == RpcPinObservation::Absent,
-        "CID fixture root was pinned before unpinned preseed"
-    );
     target.preseed(&cid_case.car, &cid_case.cid, false).await?;
-    ensure!(
-        cid_provider.observe_pin(&cid_case.cid).await? == RpcPinObservation::Absent,
-        "CID preseed unexpectedly pinned"
-    );
-    println!("cid_preseed pin_roots=false pin_observation=Absent before_provider_submit=true");
     submit(&cid_provider, &cid_case.cid).await?;
-    verify(&target, &cid_provider, &cid_case).await?;
+    verify(&target, &cid_case).await?;
     cases.push(cid_case);
 
     let arbitrary = file(
@@ -361,23 +304,13 @@ async fn rpc_provider_real_transports_and_local_dags() -> Result<()> {
         "size-65536",
     )
     .await?;
-    let mismatch = upload.submit_observed(request(&arbitrary.cid)).await;
+    let mismatch = upload.submit(request(&arbitrary.cid)).await;
     ensure!(
-        mismatch.result.is_err()
-            && !mismatch.resources.is_empty()
-            && mismatch
-                .resources
-                .iter()
-                .all(|r| r.cid != car::canonical(&arbitrary.cid).unwrap()
-                    && r.ownership == Ownership::Unknown),
-        "byte upload must not accept a changed UnixFS root: {mismatch:?}"
-    );
-    ensure!(
-        upload.observe_pin(&arbitrary.cid).await? == RpcPinObservation::Absent,
-        "wrong original root was pinned"
+        mismatch.is_err(),
+        "byte upload accepted a changed UnixFS root"
     );
     submit(&car_provider, &arbitrary.cid).await?;
-    verify(&target, &car_provider, &arbitrary).await?;
+    verify(&target, &arbitrary).await?;
     cases.push(arbitrary);
 
     let plaintext: Vec<u8> = (0..600_017).map(|i| ((i * 19) % 253) as u8).collect();
@@ -395,7 +328,7 @@ async fn rpc_provider_real_transports_and_local_dags() -> Result<()> {
     )
     .await?;
     submit(&upload, &encrypted.cid).await?;
-    verify(&target, &upload, &encrypted).await?;
+    verify(&target, &encrypted).await?;
     cases.push(encrypted);
 
     source
@@ -441,15 +374,13 @@ async fn rpc_provider_real_transports_and_local_dags() -> Result<()> {
         car::canonical(&directory.cid)?,
         car::blocks(&directory.car, &directory.cid)?.len()
     );
-    let rejected = upload.submit_observed(request(&directory.cid)).await;
+    let rejected = upload.submit(request(&directory.cid)).await.unwrap_err();
     ensure!(
-        rejected.result.is_err()
-            && rejected.resources.is_empty()
-            && rejected.effect == RpcSubmitEffect::NotSubmitted,
-        "directory byte upload was not rejected before mutation: {rejected:?}"
+        rejected.definitely_not_submitted(),
+        "directory byte upload was not rejected before dispatch: {rejected:?}"
     );
     submit(&car_provider, &directory.cid).await?;
-    verify(&target, &car_provider, &directory).await?;
+    verify(&target, &directory).await?;
     cases.push(directory);
 
     let shared = file(
@@ -459,13 +390,7 @@ async fn rpc_provider_real_transports_and_local_dags() -> Result<()> {
         "size-262144",
     )
     .await?;
-    ensure!(cid_provider.observe_pin(&shared.cid).await? == RpcPinObservation::Absent);
     target.preseed(&shared.car, &shared.cid, true).await?;
-    ensure!(
-        cid_provider.observe_pin(&shared.cid).await?
-            == RpcPinObservation::Present(RpcPinKind::Recursive)
-    );
-    println!("shared_preexisting_pin=true recursive_verified=true before_provider_submit=true");
     // Anonymous Kubo exercises actual None/Basic/Bearer header transport only;
     // this is NOT a claim of authorization enforcement (adapter mocks own it).
     for (strategy, auth) in [
@@ -484,7 +409,7 @@ async fn rpc_provider_real_transports_and_local_dags() -> Result<()> {
     ] {
         let existing = provider(&source, &target, strategy, auth)?;
         submit(&existing, &shared.cid).await?;
-        verify(&target, &existing, &shared).await?;
+        verify(&target, &shared).await?;
     }
     cases.push(shared);
 
@@ -494,7 +419,7 @@ async fn rpc_provider_real_transports_and_local_dags() -> Result<()> {
         "source RPC still reachable after isolation"
     );
     for case in &cases {
-        verify(&target, &cid_provider, case).await?;
+        verify(&target, case).await?;
     }
     ensure!(
         target.json("id", &[]).await?["ID"] == target_identity,

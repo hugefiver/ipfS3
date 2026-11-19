@@ -1,6 +1,9 @@
-use super::stage9_zip_support::{config, setup};
+use super::{
+    pin_rows,
+    stage9_zip_support::{ARCHIVE_CID, config, fixture_cid, setup},
+};
 use ipfs_s3_gateway::store::{
-    entities::{object, pin_lease},
+    entities::object,
     import::ownership,
     pinning::publication::{
         self, CapturedZipPublication, ZipExecutionSettlement, ZipPublicationAuthority,
@@ -178,12 +181,13 @@ async fn r25_v2_mpu_envelope_and_historical_bare_preserve_empty_receipt_not_null
                     .is_none()
             );
         }
+        let part_cid = fixture_cid("part");
         let parts = [s3s::dto::CompletedPart {
             part_number: Some(1),
-            e_tag: Some(s3s::dto::ETag::Strong("part-cid".into())),
+            e_tag: Some(s3s::dto::ETag::Strong(part_cid.clone())),
             ..Default::default()
         }];
-        multipart::upsert_part(&db, &request.upload_id, 1, "part-cid", 5, "part-cid")
+        multipart::upsert_part(&db, &request.upload_id, 1, &part_cid, 5, &part_cid)
             .await
             .unwrap();
         assert!(matches!(
@@ -205,7 +209,7 @@ async fn r25_v2_mpu_envelope_and_historical_bare_preserve_empty_receipt_not_null
             .unwrap()
             .unwrap();
         let sha = "c".repeat(64);
-        execution::bind_clean_input(&db, &claim, &sha, "archive-cid", 5)
+        execution::bind_clean_input(&db, &claim, &sha, ARCHIVE_CID, 5)
             .await
             .unwrap();
         let tx = db.begin().await.unwrap();
@@ -333,7 +337,7 @@ async fn r25_v2_mpu_envelope_and_historical_bare_preserve_empty_receipt_not_null
                 .is_err()
         );
         assert_eq!(object::Entity::find().count(&db).await.unwrap(), 0);
-        assert_eq!(pin_lease::Entity::find().count(&db).await.unwrap(), 0);
+        assert_eq!(pin_rows::count(&db, "pin_refs").await, 0);
     }
     let db = setup().await;
     let (request, _) = intake("fresh-no-capture", true, false);

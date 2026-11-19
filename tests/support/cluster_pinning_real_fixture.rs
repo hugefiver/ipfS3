@@ -1,13 +1,9 @@
-//! Dedicated helper for the existing Cluster verifier target; no duplicate mocks.
-//! Every write is restricted to the runner's fresh, loopback-only labeled fixture.
-// Shared by two independent targets: each deliberately uses only its own phase.
-#![allow(dead_code)]
+//! Every write is restricted to the fresh, loopback-only provider fixture.
 use anyhow::{Context, Result, bail, ensure};
 use futures_util::StreamExt;
 use reqwest::{Client, Method, StatusCode, Url};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::OpenOptions,
@@ -384,9 +380,6 @@ impl RealClusterFixture {
     pub fn rest_b(&self) -> &str {
         &self.manifest.rest_b
     }
-    pub fn peer_a(&self) -> &str {
-        &self.manifest.cluster_a_id
-    }
     pub fn rpc_a(&self) -> &str {
         &self.manifest.rpc_a
     }
@@ -740,97 +733,6 @@ impl RealClusterFixture {
         }
         Ok(())
     }
-
-    async fn preseed(&self, rpc: &str, payload: &[u8]) -> Result<String> {
-        self.assert_no_swarm(rpc).await?;
-        let hash = cid::multihash::Multihash::<64>::wrap(0x12, &Sha256::digest(payload))?;
-        let expected = cid::Cid::new_v1(0x55, hash).to_string();
-        let form = reqwest::multipart::Form::new().part(
-            "file",
-            reqwest::multipart::Part::bytes(payload.to_vec()).file_name("fixture.raw"),
-        );
-        let (status, bytes) = self
-            .request(
-                Method::POST,
-                rpc,
-                "/api/v0/block/put?cid-codec=raw&mhtype=sha2-256&pin=false",
-                Some(form),
-            )
-            .await?;
-        ensure!(status.is_success());
-        let result: Value = serde_json::from_slice(&bytes)?;
-        ensure!(result["Key"] == expected, "preseed changed CID");
-        let pins = self
-            .json(Method::POST, rpc, "/api/v0/pin/ls?type=recursive")
-            .await?;
-        ensure!(
-            !pins["Keys"]
-                .as_object()
-                .context("missing Kubo pin set")?
-                .contains_key(&expected),
-            "preseed must not pin"
-        );
-        Ok(expected)
-    }
-
-    pub async fn preseed_a(&self, payload: &[u8]) -> Result<String> {
-        self.preseed(&self.manifest.rpc_a, payload).await
-    }
-    pub async fn preseed_b(&self, cid: &str, payload: &[u8]) -> Result<()> {
-        ensure!(self.preseed(&self.manifest.rpc_b, payload).await? == cid);
-        Ok(())
-    }
-
-    pub async fn assert_local_absent_on_b(&self, cid: &str) -> Result<()> {
-        self.assert_no_swarm(&self.manifest.rpc_b).await?;
-        let (status, bytes) = self
-            .request(
-                Method::POST,
-                &self.manifest.rpc_b,
-                "/api/v0/refs/local",
-                None,
-            )
-            .await?;
-        ensure!(status.is_success());
-        for line in std::str::from_utf8(&bytes)?
-            .lines()
-            .filter(|s| !s.trim().is_empty())
-        {
-            let block: Value = serde_json::from_str(line)?;
-            ensure!(block["Err"].as_str().unwrap_or("").is_empty());
-            let local =
-                cid::Cid::try_from(block["Ref"].as_str().context("missing local block CID")?)?;
-            ensure!(
-                local != cid::Cid::try_from(cid)?,
-                "B already has the fixture block"
-            );
-        }
-        Ok(())
-    }
-
-    pub async fn pin_in_cluster(&self, cid: &str) -> Result<()> {
-        self.json(
-            Method::POST,
-            self.rest_a(),
-            &format!(
-                "/pins/{cid}?replication-min=2&replication-max=2&user-allocations={},{}",
-                self.manifest.cluster_a_id, self.manifest.cluster_b_id
-            ),
-        )
-        .await?;
-        Ok(())
-    }
-
-    pub async fn recover_b(&self, cid: &str) -> Result<()> {
-        self.json(
-            Method::POST,
-            self.rest_b(),
-            &format!("/pins/{cid}/recover?local=true"),
-        )
-        .await?;
-        Ok(())
-    }
-
     pub async fn wait_for_pinned(&self, rest: &str, cid: &str, count: usize) -> Result<Snapshot> {
         let deadline = tokio::time::Instant::now() + POLL_LIMIT;
         let poll = async {
@@ -888,16 +790,7 @@ impl RealClusterFixture {
                     "allocation changed during acceptance snapshot"
                 );
                 self.record("raw-global-snapshot", &format!("{snapshot:?}"))?;
-                // The initial B pin attempt must have finished with a real error
-                // before preseed/recover, otherwise pin=false readback races a
-                // still-running Cluster pin. Automatic recovery is set to 1h.
-                let b_failed = matches!(
-                    snapshot.peer_map[&self.manifest.cluster_b_id]
-                        .status
-                        .as_str(),
-                    "pin_error" | "cluster_error"
-                );
-                if snapshot.pinned_peers().len() == count && (count != 1 || b_failed) {
+                if snapshot.pinned_peers().len() == count {
                     return Ok(snapshot);
                 }
                 tokio::time::sleep(Duration::from_millis(250)).await;
@@ -907,50 +800,6 @@ impl RealClusterFixture {
             Ok(result) => result,
             Err(_) => bail!("real Cluster never reached actual {count}/2 before polling deadline"),
         }
-    }
-
-    pub async fn assert_local_complete(&self, cid: &str, payload: &[u8]) -> Result<()> {
-        for rpc in [&self.manifest.rpc_a, &self.manifest.rpc_b] {
-            self.assert_no_swarm(rpc).await?;
-            let pins = self
-                .json(
-                    Method::POST,
-                    rpc,
-                    &format!("/api/v0/pin/ls?arg={cid}&type=recursive"),
-                )
-                .await?;
-            ensure!(pins["Keys"][cid]["Type"] == "recursive");
-            let (status, bytes) = self
-                .request(
-                    Method::POST,
-                    rpc,
-                    &format!("/api/v0/block/get?arg={cid}&offline=true"),
-                    None,
-                )
-                .await?;
-            ensure!(
-                status.is_success() && bytes == payload,
-                "local complete raw-block bytes differ"
-            );
-        }
-        Ok(())
-    }
-
-    pub async fn stop_owned_kubo_b(&self) -> Result<()> {
-        let node = self
-            .owned_inspect("container", &self.manifest.kubo_b)
-            .await?;
-        ensure!(node["State"]["Running"] == true);
-        self.docker(&["container", "stop", "--time", "5", &self.manifest.kubo_b])
-            .await?;
-        let node = self
-            .owned_inspect("container", &self.manifest.kubo_b)
-            .await?;
-        ensure!(
-            node["State"]["Running"] == false,
-            "allocated Kubo B did not stop"
-        );
-        Ok(())
     }
 
     pub async fn stop_owned_source(&self) -> Result<()> {

@@ -108,8 +108,8 @@ pub async fn publish_plain_object(
         chrono::Utc::now(),
     );
     object.multipart = multipart;
-    crate::store::pinning::publication::application::publish_object(
-        &state.store,
+    crate::store::pinning::publication::publish_object(
+        state.store.db(),
         PublicationRequest {
             object,
             tags: policy.tags.clone(),
@@ -984,8 +984,8 @@ pub async fn put_object(
         };
         let publication_result = lease
             .commit(
-                crate::store::pinning::publication::application::publish_decided_standard_object(
-                    &state.store,
+                crate::store::pinning::publication::publish_decided_standard_object(
+                    state.store.db(),
                     publication,
                     mutation_guard,
                     decided_publish(state, &decision),
@@ -1255,16 +1255,14 @@ pub async fn delete_object(
 
     crate::store::import::ownership::run_mutation(db, &mutation_guard.clone(), |lease| async move {
         let result = lease
-            .commit(
-                crate::store::pinning::publication::delete_runtime_version_with_leases_guarded(
-                    &state.store,
-                    bucket,
-                    key,
-                    selector,
-                    mutation_guard,
-                    chrono::Utc::now(),
-                ),
-            )
+            .commit(crate::store::pinning::publication::delete_version_guarded(
+                state.store.db(),
+                bucket,
+                key,
+                selector,
+                mutation_guard,
+                chrono::Utc::now(),
+            ))
             .await?;
 
         Ok(S3Response::new(DeleteObjectOutput {
@@ -1404,16 +1402,14 @@ pub async fn delete_objects(
             let key = &key;
             async move {
                 lease
-                    .commit(
-                        crate::store::pinning::publication::delete_runtime_version_with_leases_guarded(
-                            &state.store,
-                            bucket,
-                            key,
-                            selector,
-                            guard,
-                            chrono::Utc::now(),
-                        ),
-                    )
+                    .commit(crate::store::pinning::publication::delete_version_guarded(
+                        state.store.db(),
+                        bucket,
+                        key,
+                        selector,
+                        guard,
+                        chrono::Utc::now(),
+                    ))
                     .await
             }
         })
@@ -1667,8 +1663,8 @@ pub async fn copy_object(
         let publication_result = match hot_receipt {
             Some(receipt) => lease
                 .commit(
-                    crate::store::pinning::publication::application::publish_decided_standard_object_with_hot_receipt(
-                        &state.store,
+                    crate::store::pinning::publication::publish_decided_standard_object_with_hot_receipt(
+                        state.store.db(),
                         publication,
                         mutation_guard,
                         receipt,
@@ -1678,8 +1674,8 @@ pub async fn copy_object(
                 .await?,
             None => {
                 lease
-                    .commit(crate::store::pinning::publication::application::publish_decided_standard_object(
-                        &state.store,
+                    .commit(crate::store::pinning::publication::publish_decided_standard_object(
+                        state.store.db(),
                         publication,
                         mutation_guard,
                         decided_publish(state, &decision),
@@ -2115,13 +2111,13 @@ impl ListingPage {
 mod tests {
     use super::*;
     use crate::store::entities::{
-        object, object_tag, object_version, physical_residency, pin_job, pin_lease,
-        pin_lease_target, pin_provider_usage, remote_pin, version_residency,
+        object, object_tag, object_version, physical_residency, version_residency,
     };
     use chrono::Utc;
     use sea_orm::{
-        ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, IntoActiveModel,
-        PaginatorTrait, QueryFilter, QueryOrder, Set, TransactionTrait,
+        ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait,
+        FromQueryResult, IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, Set, Statement,
+        TransactionTrait,
     };
 
     mod copy_hot_receipt_tests;
@@ -2226,7 +2222,6 @@ mod tests {
 
         let store = crate::store::Store::new(db);
         let pinning = configured_coordinator(&kubo_uri, trigger, provider_mode, prefix);
-        pinning.register_identities(&store).await.unwrap();
         Arc::new(AppState {
             kubo: crate::kubo::KuboClient::new(kubo_uri.clone()),
             cold_kubo: cold_kubo_uri.map(crate::kubo::KuboClient::new),
@@ -2620,33 +2615,61 @@ mod tests {
         delete_object_version_request(key, None)
     }
 
-    async fn lease_sources_for_latest(state: &Arc<AppState>, key: &str) -> Vec<String> {
-        let latest = crate::store::object::get_latest(state.store.db(), "bucket", key)
+    #[derive(Debug, PartialEq, Eq, FromQueryResult)]
+    struct PinReference {
+        source: String,
+        provider: String,
+        cid: String,
+        expires_at: i64,
+    }
+
+    async fn pin_references(db: &DatabaseConnection, owner: &str) -> Vec<PinReference> {
+        PinReference::find_by_statement(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            "SELECT source, provider, cid, expires_at FROM pin_refs
+             WHERE owner_object_id = $1 ORDER BY source, provider, cid",
+            [owner.into()],
+        ))
+        .all(db)
+        .await
+        .unwrap()
+    }
+
+    async fn pin_sources_for_latest(state: &Arc<AppState>, key: &str) -> Vec<String> {
+        let db = state.store.db();
+        let latest = crate::store::object::get_latest(db, "bucket", key)
             .await
             .unwrap();
-        pin_lease::Entity::find()
-            .filter(pin_lease::Column::OwnerObjectId.eq(latest.id))
-            .filter(pin_lease::Column::State.eq("active"))
-            .order_by_asc(pin_lease::Column::Source)
-            .all(state.store.db())
+        pin_references(db, &latest.id)
             .await
-            .unwrap()
             .into_iter()
-            .map(|lease| lease.source)
+            .map(|reference| reference.source)
             .collect()
     }
 
-    async fn pending_operations(state: &Arc<AppState>) -> Vec<String> {
-        pin_job::Entity::find()
-            .filter(pin_job::Column::State.eq("pending"))
-            .order_by_asc(pin_job::Column::Provider)
-            .all(state.store.db())
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|job| job.operation)
-            .collect()
+    #[derive(Debug, PartialEq, Eq, FromQueryResult)]
+    struct PinResource {
+        provider: String,
+        cid: String,
+        logical_size: i64,
+        status: String,
+        action: Option<String>,
+        handle: Option<String>,
     }
+
+    async fn pin_resources(db: &DatabaseConnection) -> Vec<PinResource> {
+        PinResource::find_by_statement(Statement::from_string(
+            db.get_database_backend(),
+            "SELECT provider, cid, logical_size, status, action, handle
+             FROM pin_resources ORDER BY provider, cid",
+        ))
+        .all(db)
+        .await
+        .unwrap()
+    }
+
+    const PIN_CID: &str = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
+    const OTHER_PIN_CID: &str = "bafkreigh2akiscaildc6ii5zji4bq7kly5k3s7svv6q2wx2nn5rtj5xuu4";
 
     async fn publish_seed(
         state: &Arc<AppState>,
@@ -4222,8 +4245,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pinning_put_automatic_commits_outbox_without_provider_request() {
-        let kubo = kubo_server("bafy-put").await;
+    async fn pinning_put_automatic_creates_file_refs_without_provider_request() {
+        let kubo = kubo_server(PIN_CID).await;
         let state = pinning_state(kubo.uri(), "always", "all", "").await;
         crate::store::bucket::set_versioning_state(
             state.store.db(),
@@ -4239,14 +4262,37 @@ mod tests {
 
         assert_eq!(
             response.output.e_tag.as_ref().map(ETag::value),
-            Some("bafy-put")
+            Some(PIN_CID)
         );
         uuid::Uuid::parse_str(response.output.version_id.as_deref().unwrap()).unwrap();
-        assert_eq!(
-            lease_sources_for_latest(&state, "automatic").await,
-            vec!["automatic"]
-        );
-        assert_eq!(pending_operations(&state).await, vec!["submit", "submit"]);
+        let db = state.store.db();
+        let object = crate::store::object::get_latest(db, "bucket", "automatic")
+            .await
+            .unwrap();
+        let references = pin_references(db, &object.id).await;
+        let resources = pin_resources(db).await;
+        assert_eq!(references.len(), 2);
+        assert_eq!(resources.len(), 2);
+        for ((reference, resource), provider) in
+            references.iter().zip(&resources).zip(["alpha", "beta"])
+        {
+            assert_eq!(
+                (
+                    reference.provider.as_str(),
+                    reference.source.as_str(),
+                    reference.cid.as_str()
+                ),
+                (provider, "automatic", PIN_CID)
+            );
+            assert_eq!(
+                (
+                    resource.provider.as_str(),
+                    resource.cid.as_str(),
+                    resource.action.as_deref()
+                ),
+                (provider, PIN_CID, Some("submit"))
+            );
+        }
         let requests = kubo.received_requests().await.unwrap();
         assert_eq!(
             requests
@@ -4449,15 +4495,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pinning_put_request_manual_and_always_manual_create_expected_leases() {
-        let request_kubo = kubo_server("bafy-request").await;
+    async fn pinning_put_request_and_automatic_policies_create_expected_file_refs() {
+        let request_kubo = kubo_server(PIN_CID).await;
         let request_state = pinning_state(request_kubo.uri(), "request", "one", "").await;
 
         put_object(&request_state, put_request("ordinary", None))
             .await
             .unwrap();
         assert!(
-            lease_sources_for_latest(&request_state, "ordinary")
+            pin_sources_for_latest(&request_state, "ordinary")
                 .await
                 .is_empty()
         );
@@ -4468,11 +4514,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            lease_sources_for_latest(&request_state, "manual").await,
+            pin_sources_for_latest(&request_state, "manual").await,
             vec!["manual"]
         );
 
-        let always_kubo = kubo_server("bafy-always").await;
+        let always_kubo = kubo_server(PIN_CID).await;
         let always_state = pinning_state(always_kubo.uri(), "always", "one", "").await;
         put_object(
             &always_state,
@@ -4484,26 +4530,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            lease_sources_for_latest(&always_state, "combined").await,
+            pin_sources_for_latest(&always_state, "combined").await,
             vec!["automatic", "manual"]
         );
-        assert_eq!(
-            pin_lease::Entity::find()
-                .filter(
-                    pin_lease::Column::OwnerObjectId.eq(crate::store::object::get_latest(
-                        always_state.store.db(),
-                        "bucket",
-                        "combined",
-                    )
-                    .await
-                    .unwrap()
-                    .id,)
-                )
-                .count(always_state.store.db())
-                .await
-                .unwrap(),
-            2
-        );
+        assert_eq!(pin_resources(always_state.store.db()).await.len(), 1);
     }
 
     #[tokio::test]
@@ -4602,10 +4632,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pinning_overwrite_ends_old_leases_and_publishes_new_latest_together() {
-        let kubo = kubo_server("bafy-new").await;
+    async fn pinning_overwrite_releases_old_refs_and_publishes_new_latest_together() {
+        let kubo = kubo_server(PIN_CID).await;
         let state = pinning_state(kubo.uri(), "always", "one", "").await;
-        publish_seed(&state, "old-object", "key", "bafy-old", Vec::new()).await;
+        publish_seed(&state, "old-object", "key", OTHER_PIN_CID, Vec::new()).await;
+        assert_eq!(
+            pin_references(state.store.db(), "old-object").await.len(),
+            1
+        );
 
         put_object(
             &state,
@@ -4614,21 +4648,24 @@ mod tests {
         .await
         .unwrap();
 
-        let old = pin_lease::Entity::find()
-            .filter(pin_lease::Column::OwnerObjectId.eq("old-object"))
-            .all(state.store.db())
-            .await
-            .unwrap();
-        assert_eq!(old.len(), 1);
-        assert_eq!(old[0].state, "cancelled");
-        assert_eq!(old[0].generation, 2);
+        assert!(
+            pin_references(state.store.db(), "old-object")
+                .await
+                .is_empty()
+        );
+        assert!(
+            pin_resources(state.store.db())
+                .await
+                .iter()
+                .all(|resource| resource.cid != OTHER_PIN_CID)
+        );
         let latest = crate::store::object::get_latest(state.store.db(), "bucket", "key")
             .await
             .unwrap();
-        assert_eq!(latest.cid, "bafy-new");
+        assert_eq!(latest.cid, PIN_CID);
         assert_ne!(latest.id, "old-object");
         assert_eq!(
-            lease_sources_for_latest(&state, "key").await,
+            pin_sources_for_latest(&state, "key").await,
             vec!["automatic", "manual"]
         );
     }
@@ -4645,7 +4682,7 @@ mod tests {
             &state,
             "source-source",
             "source",
-            "bafy-shared",
+            PIN_CID,
             vec![crate::pinning::tags::ObjectTag::new("team", "source")],
         )
         .await;
@@ -4712,7 +4749,7 @@ mod tests {
             let object = crate::store::object::get_latest(state.store.db(), "bucket", key)
                 .await
                 .unwrap();
-            assert_eq!(object.cid, "bafy-shared");
+            assert_eq!(object.cid, PIN_CID);
             assert_eq!(
                 crate::store::pinning::tags::list_object_tags(state.store.db(), &object.id)
                     .await
@@ -4736,7 +4773,7 @@ mod tests {
             assert!(decision.legacy_unknown);
             assert_eq!(decision.warning, None);
             assert!(decision.effective_intents.is_empty());
-            assert!(lease_sources_for_latest(&state, key).await.is_empty());
+            assert!(pin_sources_for_latest(&state, key).await.is_empty());
         }
         assert!(
             crate::store::pinning::tags::list_object_tags(
@@ -4766,20 +4803,20 @@ mod tests {
             ]
         );
         assert_eq!(
-            lease_sources_for_latest(&state, "dest/replaced").await,
+            pin_sources_for_latest(&state, "dest/replaced").await,
             vec!["manual"]
         );
         assert!(
-            lease_sources_for_latest(&state, "dest/empty")
+            pin_sources_for_latest(&state, "dest/empty")
                 .await
                 .is_empty()
         );
-        let usage = pin_provider_usage::Entity::find_by_id("alpha")
-            .one(state.store.db())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!((usage.reserved_bytes, usage.reserved_pins), (4, 1));
+        let resources = pin_resources(state.store.db()).await;
+        assert_eq!(resources.len(), 1);
+        assert_eq!(
+            (resources[0].provider.as_str(), resources[0].logical_size),
+            ("alpha", 4)
+        );
         let requests = kubo.received_requests().await.unwrap();
         assert_eq!(requests.len(), 4);
         assert!(
@@ -4791,11 +4828,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pinning_copy_reuses_pinned_remote_without_submit_or_poll() {
+    async fn pinning_copy_reuses_the_accepted_resource_without_another_submit() {
+        use crate::store::pinning::resources::{Outcome, claim, settle};
+
         let kubo = kubo_server("unused-add-response").await;
         let state = pinning_state(kubo.uri(), "request", "one", "dest/").await;
         let source_tags = vec![crate::pinning::tags::ObjectTag::new("ipfs-s3:pin", "true")];
-        seed_copy_source(&state, "source", "bafy-pinned-copy", &source_tags).await;
+        seed_copy_source(&state, "source", PIN_CID, &source_tags).await;
         copy_object(
             &state,
             copy_request(
@@ -4807,21 +4846,27 @@ mod tests {
         )
         .await
         .unwrap();
-        remote_pin::Entity::update_many()
-            .col_expr(remote_pin::Column::Status, "pinned".into())
-            .col_expr(
-                remote_pin::Column::RequestId,
-                Some("remote-request".to_owned()).into(),
-            )
-            .filter(remote_pin::Column::Provider.eq("alpha"))
-            .filter(remote_pin::Column::Cid.eq("bafy-pinned-copy"))
-            .exec(state.store.db())
-            .await
-            .unwrap();
-        pin_job::Entity::delete_many()
-            .exec(state.store.db())
-            .await
-            .unwrap();
+        let db = state.store.db();
+        let now = Utc::now();
+        let limits = &state.pinning.provider_limits()["alpha"];
+        let submission = claim(
+            db,
+            "alpha",
+            limits,
+            now,
+            now + chrono::TimeDelta::minutes(1),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        settle(
+            db,
+            &submission,
+            Outcome::Submitted("remote-request".into()),
+            now,
+        )
+        .await
+        .unwrap();
 
         copy_object(
             &state,
@@ -4835,27 +4880,22 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(pending_operations(&state).await.is_empty());
-        let latest = crate::store::object::get_latest(state.store.db(), "bucket", "dest/second")
-            .await
-            .unwrap();
-        let lease = pin_lease::Entity::find()
-            .filter(pin_lease::Column::OwnerObjectId.eq(latest.id))
-            .one(state.store.db())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(lease.state, "active");
-        assert_eq!(
-            pin_lease_target::Entity::find()
-                .filter(pin_lease_target::Column::LeaseId.eq(lease.id))
-                .one(state.store.db())
+        for key in ["dest/first", "dest/second"] {
+            let object = crate::store::object::get_latest(db, "bucket", key)
                 .await
-                .unwrap()
-                .unwrap()
-                .state,
-            "pinned"
-        );
+                .unwrap();
+            let references = pin_references(db, &object.id).await;
+            assert_eq!(references.len(), 1);
+            assert_eq!(
+                (references[0].provider.as_str(), references[0].cid.as_str()),
+                ("alpha", PIN_CID)
+            );
+        }
+        let resources = pin_resources(db).await;
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].status, "accepted");
+        assert_eq!(resources[0].handle.as_deref(), Some("remote-request"));
+        assert!(resources[0].action.is_none());
     }
 
     #[tokio::test]
@@ -4866,10 +4906,16 @@ mod tests {
             &state,
             "unversioned-delete",
             "key",
-            "bafy-unversioned",
+            PIN_CID,
             vec![crate::pinning::tags::ObjectTag::new("team", "storage")],
         )
         .await;
+        assert_eq!(
+            pin_references(state.store.db(), "unversioned-delete")
+                .await
+                .len(),
+            1
+        );
 
         let exact_error = delete_object(&state, delete_object_version_request("key", Some("null")))
             .await
@@ -4915,13 +4961,9 @@ mod tests {
             0
         );
         assert!(
-            pin_lease::Entity::find()
-                .filter(pin_lease::Column::OwnerObjectId.eq("unversioned-delete"))
-                .all(state.store.db())
+            pin_references(state.store.db(), "unversioned-delete")
                 .await
-                .unwrap()
-                .iter()
-                .all(|lease| lease.state == "cancelled")
+                .is_empty()
         );
     }
 
@@ -4936,7 +4978,9 @@ mod tests {
         )
         .await
         .unwrap();
-        publish_seed(&state, "enabled-delete", "key", "bafy-enabled", vec![]).await;
+        publish_seed(&state, "enabled-delete", "key", PIN_CID, vec![]).await;
+        let before = pin_references(state.store.db(), "enabled-delete").await;
+        assert_eq!(before.len(), 1);
 
         let first = delete_object(&state, delete_object_request("key"))
             .await
@@ -4949,14 +4993,9 @@ mod tests {
             crate::store::object::get_latest(state.store.db(), "bucket", "key").await,
             Err(crate::error::AppError::NoSuchKey(_))
         ));
-        assert!(
-            pin_lease::Entity::find()
-                .filter(pin_lease::Column::OwnerObjectId.eq("enabled-delete"))
-                .all(state.store.db())
-                .await
-                .unwrap()
-                .iter()
-                .all(|lease| lease.state == "active")
+        assert_eq!(
+            pin_references(state.store.db(), "enabled-delete").await,
+            before
         );
 
         let second = delete_object(&state, delete_object_request("key"))
@@ -5002,7 +5041,7 @@ mod tests {
         )
         .await
         .unwrap();
-        publish_seed(&state, "opaque-old", "key", "bafy-opaque-old", vec![]).await;
+        publish_seed(&state, "opaque-old", "key", PIN_CID, vec![]).await;
         crate::store::bucket::set_versioning_state(
             state.store.db(),
             "bucket",
@@ -5014,7 +5053,7 @@ mod tests {
             &state,
             "null-old",
             "key",
-            "bafy-null-old",
+            OTHER_PIN_CID,
             vec![crate::pinning::tags::ObjectTag::new("team", "null")],
         )
         .await;
@@ -5025,14 +5064,7 @@ mod tests {
         )
         .await
         .unwrap();
-        publish_seed(
-            &state,
-            "opaque-current",
-            "key",
-            "bafy-opaque-current",
-            vec![],
-        )
-        .await;
+        publish_seed(&state, "opaque-current", "key", PIN_CID, vec![]).await;
         crate::store::bucket::set_versioning_state(
             state.store.db(),
             "bucket",
@@ -5041,6 +5073,13 @@ mod tests {
         .await
         .unwrap();
 
+        let db = state.store.db();
+        let retained = [
+            pin_references(db, "opaque-old").await,
+            pin_references(db, "opaque-current").await,
+        ];
+        assert_eq!(retained.each_ref().map(Vec::len), [1, 1]);
+        assert_eq!(pin_references(db, "null-old").await.len(), 1);
         let output = delete_object(&state, delete_object_request("key"))
             .await
             .unwrap()
@@ -5065,26 +5104,14 @@ mod tests {
             crate::store::object::get_latest(state.store.db(), "bucket", "key").await,
             Err(crate::error::AppError::NoSuchKey(_))
         ));
-        for retained in ["opaque-old", "opaque-current"] {
-            assert!(
-                pin_lease::Entity::find()
-                    .filter(pin_lease::Column::OwnerObjectId.eq(retained))
-                    .all(state.store.db())
-                    .await
-                    .unwrap()
-                    .iter()
-                    .all(|lease| lease.state == "active")
-            );
-        }
-        assert!(
-            pin_lease::Entity::find()
-                .filter(pin_lease::Column::OwnerObjectId.eq("null-old"))
-                .all(state.store.db())
-                .await
-                .unwrap()
-                .iter()
-                .all(|lease| lease.state == "cancelled")
+        assert_eq!(
+            [
+                pin_references(db, "opaque-old").await,
+                pin_references(db, "opaque-current").await
+            ],
+            retained
         );
+        assert!(pin_references(db, "null-old").await.is_empty());
         assert_eq!(
             object_tag::Entity::find()
                 .filter(object_tag::Column::ObjectId.eq("null-old"))
@@ -5094,11 +5121,7 @@ mod tests {
             0
         );
 
-        let lifecycle_before_marker_replacement = pin_lease::Entity::find()
-            .order_by_asc(pin_lease::Column::Id)
-            .all(state.store.db())
-            .await
-            .unwrap();
+        let resources_before_marker_replacement = pin_resources(db).await;
         let replacement = delete_object(&state, delete_object_request("key"))
             .await
             .unwrap()
@@ -5106,13 +5129,13 @@ mod tests {
         assert_eq!(replacement.delete_marker, Some(true));
         assert_eq!(replacement.version_id.as_deref(), Some("null"));
         assert_eq!(
-            pin_lease::Entity::find()
-                .order_by_asc(pin_lease::Column::Id)
-                .all(state.store.db())
-                .await
-                .unwrap(),
-            lifecycle_before_marker_replacement
+            [
+                pin_references(db, "opaque-old").await,
+                pin_references(db, "opaque-current").await
+            ],
+            retained
         );
+        assert_eq!(pin_resources(db).await, resources_before_marker_replacement);
         assert_eq!(
             object_version::Entity::find()
                 .filter(object_version::Column::Bucket.eq("bucket"))
@@ -5135,7 +5158,7 @@ mod tests {
         )
         .await
         .unwrap();
-        publish_seed(&state, "never-unpin", "key", "bafy-never-unpin", vec![]).await;
+        publish_seed(&state, "never-unpin", "key", PIN_CID, vec![]).await;
         let content_version = object_version::Entity::find()
             .filter(object_version::Column::ObjectId.eq("never-unpin"))
             .one(state.store.db())
@@ -5170,11 +5193,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pinning_delete_operations_close_only_removed_latest_owner_leases_without_kubo_unpin() {
+    async fn pinning_delete_operations_release_only_removed_file_refs_without_kubo_unpin() {
         let kubo = kubo_server("unused-add-response").await;
         let state = pinning_state(kubo.uri(), "always", "one", "").await;
-        publish_seed(&state, "delete-a", "a", "bafy-a", Vec::new()).await;
-        publish_seed(&state, "delete-b", "b", "bafy-b", Vec::new()).await;
+        publish_seed(&state, "delete-a", "a", PIN_CID, Vec::new()).await;
+        publish_seed(&state, "delete-b", "b", PIN_CID, Vec::new()).await;
+        let db = state.store.db();
+        let retained = pin_references(db, "delete-b").await;
+        assert_eq!(pin_references(db, "delete-a").await.len(), 1);
+        assert_eq!(retained.len(), 1);
+        assert_eq!(pin_resources(db).await.len(), 1);
 
         delete_object(&state, delete_object_request("a"))
             .await
@@ -5182,26 +5210,9 @@ mod tests {
         delete_object(&state, delete_object_request("missing"))
             .await
             .expect("missing unversioned simple delete is idempotent");
-        assert_eq!(
-            pin_lease::Entity::find()
-                .filter(pin_lease::Column::OwnerObjectId.eq("delete-a"))
-                .one(state.store.db())
-                .await
-                .unwrap()
-                .unwrap()
-                .state,
-            "cancelled"
-        );
-        assert_eq!(
-            pin_lease::Entity::find()
-                .filter(pin_lease::Column::OwnerObjectId.eq("delete-b"))
-                .one(state.store.db())
-                .await
-                .unwrap()
-                .unwrap()
-                .state,
-            "active"
-        );
+        assert!(pin_references(db, "delete-a").await.is_empty());
+        assert_eq!(pin_references(db, "delete-b").await, retained);
+        assert_eq!(pin_resources(db).await.len(), 1);
 
         let output = delete_objects(
             &state,
@@ -5219,16 +5230,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["missing", "b", "b"]
         );
-        assert_eq!(
-            pin_lease::Entity::find()
-                .filter(pin_lease::Column::OwnerObjectId.eq("delete-b"))
-                .one(state.store.db())
-                .await
-                .unwrap()
-                .unwrap()
-                .state,
-            "cancelled"
-        );
+        assert!(pin_references(db, "delete-b").await.is_empty());
+        assert!(pin_resources(db).await.is_empty());
         assert!(
             kubo.received_requests()
                 .await
@@ -5456,8 +5459,8 @@ mod tests {
         )
         .await
         .unwrap();
-        publish_seed(&state, "batch-a", "a", "bafy-a", vec![]).await;
-        publish_seed(&state, "batch-b", "b", "bafy-b", vec![]).await;
+        publish_seed(&state, "batch-a", "a", PIN_CID, vec![]).await;
+        publish_seed(&state, "batch-b", "b", OTHER_PIN_CID, vec![]).await;
         let retained_a = object_version::Entity::find()
             .filter(object_version::Column::Bucket.eq("bucket"))
             .filter(object_version::Column::Key.eq("a"))

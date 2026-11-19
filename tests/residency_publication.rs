@@ -9,14 +9,12 @@ use ipfs_s3_gateway::{
     residency::{KuboTier, ResidencyLocation, StorageClass, VerificationState},
     store::{
         self,
-        entities::{
-            object_version, physical_residency, pin_lease, residency_reference, version_residency,
-        },
+        entities::{object_version, physical_residency, residency_reference, version_residency},
         import::ownership::admit_content_mutation,
         object_version::{BucketVersioningState, PublicVersionId, VersionSelector},
         pinning::publication::{
-            PinTargetSpec, PublicationObject, PublicationRequest,
-            delete_version_with_leases_guarded, publish_object,
+            PinTargetSpec, PublicationObject, PublicationRequest, delete_version_guarded,
+            publish_object,
         },
         residency::{reference_summary_in_transaction, resolve_version_residency},
     },
@@ -26,7 +24,7 @@ use sea_orm::{
     EntityTrait, PaginatorTrait, QueryFilter, Set, Statement, TransactionTrait,
 };
 
-const SHARED_CID: &str = "bafy-store-residency-shared";
+const SHARED_CID: &str = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
 
 async fn sqlite_db() -> DatabaseConnection {
     let db = Database::connect("sqlite::memory:").await.unwrap();
@@ -130,7 +128,7 @@ async fn guarded_delete(
     let guard = admit_content_mutation(db, bucket, key, None, SupersedeReason::DeleteObject, now)
         .await
         .unwrap();
-    delete_version_with_leases_guarded(db, bucket, key, selector, guard, now)
+    delete_version_guarded(db, bucket, key, selector, guard, now)
         .await
         .unwrap()
 }
@@ -511,20 +509,18 @@ async fn exact_delete_promotion_scenario(db: &DatabaseConnection, shared_cid: &s
         "exact deletion must release only the selected version"
     );
 
-    let old_lease = pin_lease::Entity::find()
-        .filter(pin_lease::Column::OwnerObjectId.eq("res-promote-old"))
-        .one(db)
+    let now = Utc::now();
+    let old = store::pinning::resources::manual(db, "res-promote-old", now)
         .await
         .unwrap()
-        .expect("older publication lease must exist");
-    let deleted_lease = pin_lease::Entity::find()
-        .filter(pin_lease::Column::OwnerObjectId.eq("res-promote-current"))
-        .one(db)
-        .await
-        .unwrap()
-        .expect("deleted publication lease must remain auditable");
-    assert_eq!(old_lease.state, "active");
-    assert_ne!(deleted_lease.state, "active");
+        .unwrap();
+    assert!(old.expires_at > now);
+    assert!(
+        store::pinning::resources::manual(db, "res-promote-current", now)
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     let txn = db.begin().await.unwrap();
     let summary =
@@ -585,9 +581,13 @@ async fn postgres_reuses_publication_and_delete_residency_scenarios() {
 
     publication_shared_cid_scenario(&db, "bafy-pg-residency-publication-shared").await;
     null_overwrite_scenario(&db, "bafy-pg-residency-null-overwrite").await;
-    enabled_marker_scenario(&db, "bafy-pg-residency-enabled-marker").await;
+    enabled_marker_scenario(&db, SHARED_CID).await;
     suspended_marker_scenario(&db, "bafy-pg-residency-suspended-marker").await;
-    exact_delete_promotion_scenario(&db, "bafy-pg-residency-exact-promotion").await;
+    exact_delete_promotion_scenario(
+        &db,
+        "bafybeib4r26s6xrk5uqyy6k5lkwxmrsfecmfxluvlz44b2qnt3rottiw3u",
+    )
+    .await;
 
     db.execute(Statement::from_string(
         DatabaseBackend::Postgres,

@@ -415,10 +415,6 @@ impl CapturedZipIntent {
     }
 
     pub(super) fn validate(&self) -> anyhow::Result<()> {
-        let route_complete = |route: &crate::pinning::identity::ProviderRouteSnapshot| {
-            route.resource_type() != crate::pinning::identity::RemoteResourceType::ClusterPin
-                || route.confirmation.is_some()
-        };
         ensure!(
             self.schema_version == 1,
             "ZIP capture needs_attention: unsupported schema version"
@@ -490,18 +486,6 @@ impl CapturedZipIntent {
                 "ZIP capture needs_attention: missing original provider route evidence"
             );
         }
-        ensure!(
-            self.source_providers
-                .iter()
-                .chain(
-                    self.policy
-                        .policies
-                        .iter()
-                        .flat_map(|policy| &policy.providers)
-                )
-                .all(|provider| route_complete(&provider.selected.route)),
-            "ZIP capture needs_attention: missing original Stage 6 confirmation evidence"
-        );
         if let Some(plan) = &self.historical_plan {
             ensure!(
                 self.semantics == CaptureSemantics::LegacyV2
@@ -538,13 +522,6 @@ impl CapturedZipIntent {
                                 .zip(&intent.providers)
                                 .all(|(name, provider)| name == &provider.config_name),
                         "historical ZIP capture needs_attention: incomplete original provider evidence"
-                    );
-                    ensure!(
-                        intent
-                            .providers
-                            .iter()
-                            .all(|provider| route_complete(&provider.route)),
-                        "historical ZIP capture needs_attention: missing original Stage 6 confirmation evidence"
                     );
                 }
             }

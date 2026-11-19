@@ -1,16 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use http::{HeaderMap, StatusCode};
-use ipfs_s3_gateway::{
-    config::Config,
-    state::AppState,
-    store::{
-        self,
-        entities::{pin_job, pin_lease_target},
-        pinning::ledger,
-    },
-};
-use sea_orm::EntityTrait;
+use ipfs_s3_gateway::{config::Config, state::AppState, store};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -38,28 +29,22 @@ pub struct Harness {
     pub gateway: cors::S3ServerHandle,
     pub observed: Arc<tokio::sync::Mutex<Vec<ObservedHttpRequest>>>,
     pub provider: String,
-    pub history: Option<crate::history::History>,
-    directory: Option<tempfile::TempDir>,
 }
 
 impl Harness {
     pub async fn start(root: bool, auto: bool) -> Self {
-        Self::start_with_history(root, auto, false).await
-    }
-
-    pub async fn start_with_history(root: bool, auto: bool, history: bool) -> Self {
-        Self::start_with_capacity(root, auto, history, 8192).await
+        Self::start_with_capacity(root, auto, 8192).await
     }
 
     pub async fn start_for_client_multipart() -> Self {
-        Self::start_with_capacity(false, false, false, 32 * 1024 * 1024).await
+        Self::start_with_capacity(false, false, 32 * 1024 * 1024).await
     }
 
-    async fn start_with_capacity(root: bool, auto: bool, history: bool, max_bytes: u64) -> Self {
+    async fn start_with_capacity(root: bool, auto: bool, max_bytes: u64) -> Self {
         let source = HttpNode::start(false).await;
         let target = HttpNode::start(true).await;
         // Synthetic test-only configuration; no files/environment credentials read.
-        let mut config: Config = toml::from_str(&format!(
+        let config: Config = toml::from_str(&format!(
             r#"
             [kubo]
             rpc_url = '{}'
@@ -118,23 +103,6 @@ impl Harness {
             target.server.uri()
         ))
         .unwrap();
-        let directory = history.then(|| {
-            tempfile::Builder::new()
-                .prefix("stage75-pixivbot-")
-                .tempdir()
-                .unwrap()
-        });
-        if let Some(directory) = &directory {
-            config.storage.database_url = format!(
-                "sqlite://{}?mode=rwc",
-                directory
-                    .path()
-                    .join("gateway.sqlite")
-                    .to_string_lossy()
-                    .replace('\\', "/")
-            );
-            crate::history::add_route(&mut config);
-        }
         let state = AppState::new(&config)
             .await
             .expect("fresh isolated gateway initialization");
@@ -147,22 +115,9 @@ impl Harness {
             .unwrap()
             .name
             .clone();
-        assert_eq!(
-            state
-                .pinning
-                .provider(&provider)
-                .unwrap()
-                .invocation_route(),
-            ("kubo", "upload")
-        );
         store::bucket::create(state.store.db(), BUCKET, Some("test"))
             .await
             .unwrap();
-        let history = if history {
-            Some(crate::history::History::prepare(&state, &config).await)
-        } else {
-            None
-        };
         let observed: Arc<tokio::sync::Mutex<Vec<ObservedHttpRequest>>> = Arc::default();
         let gateway = decompress::start_s3_server_with_imports(
             state.clone(),
@@ -177,8 +132,6 @@ impl Harness {
             gateway,
             observed,
             provider,
-            history,
-            directory,
         };
         let response = harness
             .send(
@@ -217,13 +170,6 @@ impl Harness {
 
     pub async fn shutdown(self) {
         self.gateway.shutdown().await;
-        self.state.store.db().clone().close().await.unwrap();
-        drop(self.state);
-        if let Some(directory) = self.directory {
-            directory
-                .close()
-                .expect("remove only owned Pixivbot test database");
-        }
     }
 
     pub async fn run_worker(&self, target_count: usize) {
@@ -235,17 +181,12 @@ impl Harness {
         let result = tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 let db = self.state.store.db();
-                let targets = pin_lease_target::Entity::find().all(db).await.unwrap();
-                let jobs = pin_job::Entity::find().all(db).await.unwrap();
-                let observations = ledger::submission::observations(db, &self.provider)
-                    .await
-                    .unwrap();
-                if targets.len() == target_count
-                    && targets.iter().all(|t| t.state == "pinned")
-                    && !jobs.is_empty()
-                    && jobs.iter().all(|j| j.state == "done")
-                    && observations.len() == ENTRIES.len()
-                    && observations.iter().all(|o| o.outcome == "matched")
+                let resources = crate::pin_rows::resources(db).await;
+                if resources.len() == ENTRIES.len()
+                    && resources
+                        .iter()
+                        .all(|r| r.status == "accepted" && r.action.is_none() && r.handle.is_some())
+                    && crate::pin_rows::count(db, "pin_refs").await == target_count as u64
                 {
                     break;
                 }
@@ -253,23 +194,13 @@ impl Harness {
             }
         })
         .await;
-        if result.is_ok() {
-            // Allow the restarted worker to perform an ordinary idle queue pass.
-            tokio::time::sleep(Duration::from_millis(1100)).await;
-        }
         cancel.cancel();
         worker.shutdown(Duration::from_secs(3)).await;
         if let Err(error) = result {
-            let db = self.state.store.db();
             panic!(
-                "registered worker incomplete: {error}; targets={:?}; jobs={:?}; observations={:?}; source_calls={:?}; target_calls={:?}",
-                pin_lease_target::Entity::find().all(db).await.unwrap(),
-                pin_job::Entity::find().all(db).await.unwrap(),
-                ledger::submission::observations(db, &self.provider)
-                    .await
-                    .unwrap(),
-                self.source.calls().await,
-                self.target.calls().await,
+                "worker timeout: {error}; resources: {:?}; target: {:?}",
+                crate::pin_rows::resources(self.state.store.db()).await,
+                self.target.calls().await
             );
         }
     }

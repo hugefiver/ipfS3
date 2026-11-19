@@ -375,6 +375,7 @@ mod tests {
             version_id: Set(None),
             kind: Set("object".to_owned()),
             object_id: Set(Some(object_id.clone())),
+            pin_decision: Set(None),
             sequence: Set(1),
             is_latest: Set(true),
             lifecycle_age_started_at: Set(now),
@@ -628,7 +629,7 @@ mod tests {
         )
         .await
         .unwrap();
-        crate::store::pinning::publication::delete_version_with_leases_guarded(
+        crate::store::pinning::publication::delete_version_guarded(
             store.db(),
             "bucket",
             "key-a",

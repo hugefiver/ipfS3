@@ -564,6 +564,7 @@ mod tests {
                 "delete_marker".to_owned()
             }),
             object_id: Set(object_id.map(str::to_owned)),
+            pin_decision: Set(None),
             sequence: Set(sequence),
             is_latest: Set(is_latest),
             lifecycle_age_started_at: Set(now),

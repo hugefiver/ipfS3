@@ -112,9 +112,7 @@ pub async fn delete<C: ConnectionTrait + TransactionTrait>(db: &C, name: &str) -
                 .one(txn)
                 .await?
                 .is_some();
-            if has_versions
-                || super::pinning::leases::bucket_has_expiry_in_progress(txn, &name).await?
-            {
+            if has_versions {
                 return Err(AppError::BucketNotEmpty(name));
             }
 
@@ -134,6 +132,12 @@ pub async fn delete<C: ConnectionTrait + TransactionTrait>(db: &C, name: &str) -
                 super::lifecycle_transition::delete_settled_in_transaction(txn, &saga.id).await?;
             }
 
+            let owners = txn.query_all(sea_orm::Statement::from_sql_and_values(txn.get_database_backend(),
+                "SELECT DISTINCT r.owner_object_id FROM pin_refs r JOIN objects o ON o.id=r.owner_object_id WHERE o.bucket=$1", [name.clone().into()])).await?;
+            for row in owners {
+                let owner: String = row.try_get("", "owner_object_id")?;
+                super::pinning::resources::release_owner(txn, &owner, Utc::now()).await?;
+            }
             super::import::ownership::supersede_bucket(txn, &name, Utc::now()).await?;
             let result = bucket::Entity::delete_by_id(name.clone()).exec(txn).await?;
             if result.rows_affected != 1 {
@@ -421,6 +425,7 @@ mod tests {
             version_id: Set(None),
             kind: Set("object".to_owned()),
             object_id: Set(Some("unversioned-current".to_owned())),
+            pin_decision: Set(None),
             sequence: Set(1),
             is_latest: Set(true),
             lifecycle_age_started_at: Set(now),
@@ -454,6 +459,7 @@ mod tests {
             version_id: Set(Some(uuid::Uuid::new_v4().to_string())),
             kind: Set("object".to_owned()),
             object_id: Set(Some("retained-object".to_owned())),
+            pin_decision: Set(None),
             sequence: Set(1),
             is_latest: Set(false),
             lifecycle_age_started_at: Set(now),
@@ -482,6 +488,7 @@ mod tests {
             version_id: Set(Some(uuid::Uuid::new_v4().to_string())),
             kind: Set("delete_marker".to_owned()),
             object_id: Set(None),
+            pin_decision: Set(None),
             sequence: Set(2),
             is_latest: Set(true),
             lifecycle_age_started_at: Set(now),
@@ -511,13 +518,18 @@ mod tests {
             .await
             .unwrap();
 
-        db.execute_unprepared("INSERT INTO pin_leases (id,owner_object_id,source,policy_id,provider_mode,content_mode,created_at,last_touched_at,expires_at,generation,state) VALUES ('ending','legacy-hidden','manual','p','all','object',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,2,'expired');
-            INSERT INTO pin_lease_targets (id,lease_id,cid,logical_size,provider,state,created_at,last_touched_at) VALUES ('remaining','ending','cid',7,'side','pinned',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
-        assert_not_empty(&db, "legacy-bucket").await;
-        db.execute_unprepared("UPDATE pin_lease_targets SET state='released' WHERE id='remaining'")
-            .await
-            .unwrap();
+        db.execute_unprepared("INSERT INTO pin_resources(provider,cid,logical_size,status,handle) VALUES ('side','cid',7,'accepted','handle');
+            INSERT INTO pin_refs(owner_object_id,provider,cid,source,policy_id,content_mode,expires_at) VALUES ('legacy-hidden','side','cid','manual','p','object',9223372036854775807)").await.unwrap();
         delete(&db, "legacy-bucket").await.unwrap();
+        let remote = db
+            .query_one(sea_orm::Statement::from_string(
+                db.get_database_backend(),
+                "SELECT action FROM pin_resources WHERE provider='side' AND cid='cid'",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(remote.try_get::<String>("", "action").unwrap(), "delete");
 
         assert!(!exists(&db, "legacy-bucket").await.unwrap());
         assert_eq!(

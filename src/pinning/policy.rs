@@ -975,22 +975,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn omitted_control_legacy_route_decides_and_publishes_without_managed_cleanup() {
+    async fn default_control_publishes_automatic_and_manual_references() {
         use crate::{
             config::{Config, OptionalPinControlMode},
             pinning::decision::{DecisionEffect, DecisionOrigin},
             store::{
                 self,
-                pinning::{
-                    ledger,
-                    publication::{
-                        DecidedPublish, PinTargetSpec, PublicationObject, PublicationRequest,
-                        publish_decided_object,
-                    },
+                pinning::publication::{
+                    DecidedPublish, PinTargetSpec, PublicationObject, PublicationRequest,
+                    publish_decided_object,
                 },
             },
         };
-        use sea_orm::{Database, EntityTrait, PaginatorTrait};
+        use sea_orm::{ConnectionTrait, Database, Statement};
+        const CID: &str = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
 
         let config: Config = toml::from_str(
             r#"
@@ -1023,9 +1021,6 @@ mod tests {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         store::run_migrations(&db).await.unwrap();
         store::bucket::create(&db, "bucket", None).await.unwrap();
-        ledger::register_route(&db, "remote", &validated.providers[0].identity)
-            .await
-            .unwrap();
 
         let tags = tags(&[("ipfs-s3:pin", "true")]);
         let (policy, decision) = PinPolicyEvaluator::new(&validated)
@@ -1052,7 +1047,7 @@ mod tests {
             "object-id".into(),
             "bucket",
             "object",
-            "bafy-legacy".into(),
+            CID.into(),
             7,
             None,
             None,
@@ -1068,7 +1063,7 @@ mod tests {
                 tags,
                 policy,
                 object_target: PinTargetSpec {
-                    cid: "bafy-legacy".into(),
+                    cid: CID.into(),
                     logical_size: 7,
                 },
             },
@@ -1081,23 +1076,19 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(
-            store::entities::pin_lease::Entity::find()
-                .count(&db)
-                .await
-                .unwrap(),
-            2
-        );
-        let remote = ledger::get(&db, "remote", "bafy-legacy")
+        let refs = db
+            .query_all(Statement::from_sql_and_values(
+                db.get_database_backend(),
+                "SELECT source FROM pin_refs WHERE owner_object_id=$1 AND cid=$2 ORDER BY source",
+                ["object-id".into(), CID.into()],
+            ))
             .await
-            .unwrap()
             .unwrap();
-        assert_eq!(remote.ownership, "unknown");
-        assert!(
-            !ledger::cleanup_allowed(&db, "remote", "bafy-legacy")
-                .await
-                .unwrap()
-        );
+        let sources: Vec<String> = refs
+            .into_iter()
+            .map(|row| row.try_get("", "source").unwrap())
+            .collect();
+        assert_eq!(sources, ["automatic", "manual"]);
     }
 
     #[test]

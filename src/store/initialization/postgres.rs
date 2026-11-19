@@ -31,19 +31,14 @@ pub(crate) fn failed() -> DbErr {
 struct Stop(Arc<StopState>);
 struct StopState {
     deadline: Instant,
-    retain_sql_errors: bool,
     reason: AtomicU8,
     wake: CancellationToken,
     stopped_at: std::sync::OnceLock<Instant>,
 }
 impl Stop {
     fn new(deadline: Instant) -> Self {
-        Self::with_error_policy(deadline, false)
-    }
-    fn with_error_policy(deadline: Instant, retain_sql_errors: bool) -> Self {
         Self(Arc::new(StopState {
             deadline,
-            retain_sql_errors,
             reason: AtomicU8::new(0),
             wake: CancellationToken::new(),
             stopped_at: std::sync::OnceLock::new(),
@@ -101,27 +96,7 @@ pub(super) async fn open(db: &DatabaseConnection) -> Result<(), DbErr> {
     result
 }
 
-pub(super) async fn maintenance<T, F, W>(db: &DatabaseConnection, work: F) -> Result<T, DbErr>
-where
-    T: Send + 'static,
-    F: FnOnce(Guarded) -> W + Send + 'static,
-    W: std::future::Future<Output = Result<T, DbErr>> + Send + 'static,
-{
-    let stop = Stop::with_error_policy(Instant::now() + BUDGET, true);
-    let caller = Caller(stop.clone());
-    let pool = db.get_postgres_connection_pool().clone();
-    let task = tokio::spawn(executor::own_work(pool, stop, work).with_current_subscriber());
-    let result = task.await.map_err(|_| failed())?;
-    drop(caller);
-    result
-}
-
 async fn workflow(db: Guarded, stop: &Stop) -> Result<(), DbErr> {
-    match super::classify(&db).await? {
-        super::SchemaState::Current => return super::validate_catalog(&db).await,
-        super::SchemaState::UpgradeRequired => return Err(super::required()),
-        super::SchemaState::Empty => {}
-    }
     let root = db.begin().await?;
     tracing::info!(
         migration_lock = "waiting",
@@ -147,9 +122,18 @@ async fn workflow(db: Guarded, stop: &Stop) -> Result<(), DbErr> {
         migration_lock = "acquired",
         "Acquired PostgreSQL migration lock"
     );
-    if super::names(&db).await?.is_empty() {
-        crate::store::migrations::bridge::initialize(&db).await?;
+    db.execute_unprepared(
+        "SELECT set_config('search_path', quote_ident(current_schema()) || ', pg_temp', true)",
+    )
+    .await?;
+    match super::classify(&db).await? {
+        super::SchemaState::Empty => {
+            db.execute_unprepared(crate::store::migrations::CREATE_LEDGER)
+                .await?;
+            crate::store::migrations::install(&db).await?;
+        }
+        super::SchemaState::Current => {}
+        super::SchemaState::UpgradeRequired => return Err(super::required()),
     }
-    super::validate_existing(&db).await?;
     root.commit().await
 }

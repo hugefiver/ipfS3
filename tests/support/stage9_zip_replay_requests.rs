@@ -3,12 +3,13 @@ use std::time::Duration;
 
 use http::{HeaderMap, HeaderValue, StatusCode};
 use ipfs_s3_gateway::store::{
-    entities::{
-        object, object_version, pin_lease, pin_lease_target, pin_provider_usage, remote_pin,
-    },
+    entities::{object, object_version},
     zip::{execution, import_intake},
 };
 use sea_orm::{EntityTrait, QueryOrder};
+
+#[path = "pin_rows.rs"]
+mod pin_rows;
 
 use crate::support::{
     decompress::S3TestEndpoint,
@@ -247,10 +248,8 @@ impl Receipt {
 pub struct Ledger {
     objects: Vec<object::Model>,
     versions: Vec<object_version::Model>,
-    leases: Vec<pin_lease::Model>,
-    targets: Vec<pin_lease_target::Model>,
-    remotes: Vec<remote_pin::Model>,
-    usage: Vec<pin_provider_usage::Model>,
+    refs: Vec<pin_rows::Ref>,
+    resources: Vec<pin_rows::Resource>,
 }
 
 impl Ledger {
@@ -267,27 +266,8 @@ impl Ledger {
                 .all(db)
                 .await
                 .unwrap(),
-            leases: pin_lease::Entity::find()
-                .order_by_asc(pin_lease::Column::Id)
-                .all(db)
-                .await
-                .unwrap(),
-            targets: pin_lease_target::Entity::find()
-                .order_by_asc(pin_lease_target::Column::Id)
-                .all(db)
-                .await
-                .unwrap(),
-            remotes: remote_pin::Entity::find()
-                .order_by_asc(remote_pin::Column::Provider)
-                .order_by_asc(remote_pin::Column::Cid)
-                .all(db)
-                .await
-                .unwrap(),
-            usage: pin_provider_usage::Entity::find()
-                .order_by_asc(pin_provider_usage::Column::Provider)
-                .all(db)
-                .await
-                .unwrap(),
+            refs: pin_rows::refs(db).await,
+            resources: pin_rows::resources(db).await,
         }
     }
 
@@ -297,13 +277,7 @@ impl Ledger {
             "{self:?}"
         );
         assert!(
-            self.leases.is_empty() && self.targets.is_empty() && self.remotes.is_empty(),
-            "{self:?}"
-        );
-        assert!(
-            self.usage
-                .iter()
-                .all(|usage| usage.reserved_bytes == 0 && usage.reserved_pins == 0),
+            self.refs.is_empty() && self.resources.is_empty(),
             "{self:?}"
         );
     }

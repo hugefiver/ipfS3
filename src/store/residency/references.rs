@@ -1,7 +1,7 @@
 use sea_orm::{
     ActiveValue::Set,
     ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseTransaction, EntityTrait,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Statement,
     sea_query::{Expr, OnConflict},
 };
 
@@ -15,23 +15,13 @@ use crate::{
     store::{
         database_clock::database_now,
         entities::{
-            object, object_version, physical_residency, pin_lease, pin_lease_target,
-            residency_reference, version_residency,
+            object, object_version, physical_residency, residency_reference, version_residency,
         },
     },
 };
 
 const OWNER_VERSION: &str = "version";
 const OWNER_TRANSITION: &str = "transition";
-const ACTIVE_LEASE: &str = "active";
-const ACTIVE_TARGET_STATES: [&str; 6] = [
-    "waiting",
-    "submitted",
-    "pinned",
-    "degraded",
-    "quota_waiting",
-    "quota_blocked",
-];
 
 /// Reserve shared hot physical rows in CID order after the publication's
 /// ownership/version/lease frontier. This also orders inserts of previously
@@ -406,24 +396,22 @@ pub async fn reference_summary_in_transaction(
     let transition_staging_holds = count_reason(ReferenceReason::TransitionStaging).await?;
     let transition_cleanup_holds = count_reason(ReferenceReason::TransitionCleanupHold).await?;
 
-    // Provider leases describe hot retention, never proof of a cold copy.
-    // Expiry is deliberately state-based until the authoritative lease worker
-    // ends the lease; quota delays must not remove its protection.
+    // Hot retention follows live demand, including references still waiting for quota.
     let (active_lease_targets, active_lease_owners) = if location.tier == KuboTier::Hot {
-        let targets = pin_lease_target::Entity::find()
-            .inner_join(pin_lease::Entity)
-            .filter(pin_lease_target::Column::Cid.eq(&location.cid))
-            .filter(pin_lease_target::Column::State.is_in(ACTIVE_TARGET_STATES))
-            .filter(pin_lease::Column::State.eq(ACTIVE_LEASE))
-            .count(txn)
-            .await?;
-        let owners = pin_lease::Entity::find()
-            .inner_join(object::Entity)
-            .filter(object::Column::Cid.eq(&location.cid))
-            .filter(pin_lease::Column::State.eq(ACTIVE_LEASE))
-            .count(txn)
-            .await?;
-        (targets, owners)
+        let now = database_now(txn).await?.timestamp_micros();
+        // Resource keys normalize CIDv0 to CIDv1; object metadata keeps the original spelling.
+        let target = crate::pinning::provider::canonical_resource_cid(&location.cid).ok();
+        let counts = txn.query_one(Statement::from_sql_and_values(
+            txn.get_database_backend(),
+            "SELECT (SELECT COUNT(*) FROM pin_refs WHERE cid = $1 AND expires_at > $2) AS targets, \
+                    (SELECT COUNT(DISTINCT r.owner_object_id) FROM pin_refs r JOIN objects o ON o.id = r.owner_object_id \
+                     WHERE o.cid = $3 AND r.expires_at > $2) AS owners",
+            [target.into(), now.into(), location.cid.clone().into()],
+        )).await?.expect("aggregate counts always return a row");
+        (
+            counts.try_get::<i64>("", "targets")? as u64,
+            counts.try_get::<i64>("", "owners")? as u64,
+        )
     } else {
         (0, 0)
     };

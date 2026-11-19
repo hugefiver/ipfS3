@@ -45,7 +45,6 @@ impl AppState {
 
         let db = crate::store::connect_database(&cfg.storage.database_url).await?;
         let store = Store::open(db).await?;
-        pinning.register_identities(&store).await?;
 
         let credentials: HashMap<String, SecretKey> = cfg
             .auth

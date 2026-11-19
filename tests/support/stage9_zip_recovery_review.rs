@@ -3,6 +3,9 @@ use http::{HeaderMap, StatusCode};
 use ipfs_s3_gateway::store::{self, zip::execution};
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 
+#[path = "pin_rows.rs"]
+mod pin_rows;
+
 use crate::support::{
     decompress::{AddReply, KuboScript, TestHarness, start_harness_with_root_default},
     sigv4::send_sigv4,
@@ -35,9 +38,11 @@ pub struct Receipt {
 
 impl Receipt {
     pub async fn read(response: reqwest::Response) -> Self {
+        let mut headers = response.headers().clone();
+        headers.remove(http::header::DATE);
         Self {
             status: response.status(),
-            headers: response.headers().clone(),
+            headers,
             body: response.text().await.unwrap(),
         }
     }
@@ -128,7 +133,8 @@ pub async fn count(h: &TestHarness, table: &str) -> i64 {
 pub struct Effects {
     pub rpc: Vec<(String, String)>,
     pub rows: Vec<(&'static str, i64)>,
-    pub quota: Vec<(String, i64, i64)>,
+    pub refs: Vec<pin_rows::Ref>,
+    pub resources: Vec<pin_rows::Resource>,
 }
 
 impl Effects {
@@ -150,10 +156,6 @@ impl Effects {
         for table in [
             "objects",
             "object_versions",
-            "pin_leases",
-            "pin_lease_targets",
-            "pin_jobs",
-            "remote_pins",
             "zip_v2_manifest",
             "zip_v2_targets",
             "zip_batches",
@@ -161,9 +163,13 @@ impl Effects {
         ] {
             rows.push((table, count(h, table).await));
         }
-        let quota = h.state.store.db().query_all(Statement::from_string(DatabaseBackend::Sqlite,
-            "SELECT provider,reserved_bytes,reserved_pins FROM pin_provider_usage ORDER BY provider".to_owned())).await.unwrap().into_iter().map(|row| (row.try_get("", "provider").unwrap(), row.try_get("", "reserved_bytes").unwrap(), row.try_get("", "reserved_pins").unwrap())).collect();
-        Self { rpc, rows, quota }
+        let db = h.state.store.db();
+        Self {
+            rpc,
+            rows,
+            refs: pin_rows::refs(db).await,
+            resources: pin_rows::resources(db).await,
+        }
     }
 
     pub fn rpc_count(&self, path: &str) -> usize {

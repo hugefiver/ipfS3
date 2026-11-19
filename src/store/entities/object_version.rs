@@ -10,6 +10,7 @@ pub struct Model {
     pub version_id: Option<String>,
     pub kind: String,
     pub object_id: Option<String>,
+    pub pin_decision: Option<String>,
     pub sequence: i64,
     pub is_latest: bool,
     pub lifecycle_age_started_at: DateTimeUtc,

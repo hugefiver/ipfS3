@@ -17,9 +17,6 @@ pub mod residency;
 pub mod zip;
 
 use sea_orm::DatabaseConnection;
-use std::sync::Arc;
-
-pub(crate) use pinning::runtime_schema::RuntimeTransaction;
 
 /// Busy timeout applied to every SQLite connection. Without it, a concurrent
 /// writer fails immediately with `database is locked (code 5)` instead of
@@ -53,40 +50,21 @@ pub async fn connect_database(database_url: &str) -> Result<DatabaseConnection, 
 
 #[derive(Clone)]
 pub struct Store {
-    inner: Arc<StoreInner>,
-}
-
-struct StoreInner {
     db: DatabaseConnection,
-    qualification: tokio::sync::OnceCell<pinning::runtime_schema::StaticQualification>,
 }
 
 impl Store {
-    /// Own a trusted pool. All connections must use the same fixed PostgreSQL
-    /// search_path (or SQLite database), with no connection-local schema shadows.
-    /// Structural maintenance requires draining operations and rebuilding Store.
     pub fn new(db: DatabaseConnection) -> Self {
-        Self {
-            inner: Arc::new(StoreInner {
-                db,
-                qualification: tokio::sync::OnceCell::new(),
-            }),
-        }
+        Self { db }
+    }
+
+    pub(crate) async fn open(db: DatabaseConnection) -> Result<Self, sea_orm::DbErr> {
+        initialization::open(&db).await?;
+        Ok(Self::new(db))
     }
 
     pub fn db(&self) -> &DatabaseConnection {
-        &self.inner.db
-    }
-}
-
-mod migrator {
-    use sea_orm_migration::prelude::*;
-
-    pub struct Migrator;
-    impl MigratorTrait for Migrator {
-        fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-            super::migrations::registry::native()
-        }
+        &self.db
     }
 }
 
@@ -143,8 +121,8 @@ mod tests {
                 "SELECT GROUP_CONCAT(name, ',') FROM (\
                  SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (\
                       'buckets', 'objects', 'multipart_uploads', 'multipart_parts', \
-                       'object_tags', 'pin_leases', 'pin_lease_targets', 'remote_pins', \
-                       'pin_jobs', 'pin_provider_usage', 'import_jobs', 'import_destinations', \
+                       'object_tags', 'pin_refs', 'pin_resources', 'import_job_requests', \
+                       'import_jobs', 'import_destinations', \
                        'import_prefix_claims', 'import_job_targets', 'import_job_results', \
                         'object_versions', 'bucket_lifecycle_configs', 'lifecycle_actions', \
                         'bucket_cors_configs', 'physical_residencies', 'version_residencies', \
@@ -163,11 +141,9 @@ mod tests {
             "multipart_uploads",
             "multipart_parts",
             "object_tags",
-            "pin_leases",
-            "pin_lease_targets",
-            "remote_pins",
-            "pin_jobs",
-            "pin_provider_usage",
+            "pin_refs",
+            "pin_resources",
+            "import_job_requests",
             "import_jobs",
             "import_destinations",
             "import_prefix_claims",
@@ -185,10 +161,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        assert_eq!(
-            table_names, expected,
-            "all twenty-four application tables must exist"
-        );
+        assert_eq!(table_names, expected);
     }
 
     #[tokio::test]

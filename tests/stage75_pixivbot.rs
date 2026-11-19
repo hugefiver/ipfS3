@@ -1,5 +1,4 @@
-//! Stage 7.5 acceptance 6: actual Pixivbot v1 wire shape and registered worker.
-//! Loopback protocol evidence only; this target is not the full Stage 7.5 gate.
+//! Signed Pixivbot v1 publication, replay and exact-version reads.
 
 #[allow(dead_code)]
 mod support {
@@ -13,21 +12,15 @@ mod checks;
 mod client;
 #[path = "support/stage75_pixivbot_fixture.rs"]
 mod fixture;
-#[path = "support/stage75_pixivbot_history.rs"]
-mod history;
-#[allow(dead_code)]
-#[path = "support/stage7_management.rs"]
-mod history_base;
 #[path = "support/stage75_pixivbot_node.rs"]
 mod node;
+#[path = "support/pin_rows.rs"]
+mod pin_rows;
 
 use http::{HeaderMap, HeaderValue, StatusCode};
 use ipfs_s3_gateway::store::{
     self,
-    entities::{
-        object_version, pin_job, pin_lease, pin_lease_target, zip_batch, zip_manifest_entry,
-    },
-    pinning::ledger,
+    entities::{object_version, zip_batch, zip_manifest_entry},
 };
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
@@ -79,11 +72,7 @@ async fn upload(h: &Harness, key: &str, bytes: Vec<u8>, zip: bool) -> (String, V
     let part_etag = etag(&part);
     if zip {
         assert!(
-            pin_lease_target::Entity::find()
-                .all(h.state.store.db())
-                .await
-                .unwrap()
-                .is_empty(),
+            pin_rows::refs(h.state.store.db()).await.is_empty(),
             "Create/UploadPart cannot publish pin intents"
         );
         assert!(h.target.calls().await.is_empty());
@@ -91,8 +80,8 @@ async fn upload(h: &Harness, key: &str, bytes: Vec<u8>, zip: bool) -> (String, V
     (id, format!("<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"{part_etag}\"</ETag></Part></CompleteMultipartUpload>").into_bytes())
 }
 
-async fn case(mpu: bool, root: bool, auto: bool, history: bool) {
-    let h = Harness::start_with_history(root, auto, history).await;
+async fn case(mpu: bool, root: bool, auto: bool) {
+    let h = Harness::start(root, auto).await;
     let archive = support::decompress::legal_two_entry_zip();
     // requested_entries_sha256 remains client-local; no fingerprint header.
     let completion = if mpu {
@@ -129,18 +118,12 @@ async fn case(mpu: bool, root: bool, auto: bool, history: bool) {
     h.run_worker(targets).await;
     checks::worker_evidence(&h, auto).await;
 
-    // Preserve exact public versions, intents, completion and independent ledger
-    // across worker restart and (for MPU) exact signed Complete replay.
     let db = h.state.store.db();
     let versions = object_version::Entity::find().all(db).await.unwrap();
-    let leases = pin_lease::Entity::find().all(db).await.unwrap();
-    let bound = pin_lease_target::Entity::find().all(db).await.unwrap();
-    let jobs = pin_job::Entity::find().all(db).await.unwrap();
+    let refs = pin_rows::refs(db).await;
+    let resources = pin_rows::resources(db).await;
     let batches = zip_batch::Entity::find().all(db).await.unwrap();
     let manifests = zip_manifest_entry::Entity::find().all(db).await.unwrap();
-    let observations = ledger::submission::observations(db, &h.provider)
-        .await
-        .unwrap();
     let source_calls = h.source.calls().await;
     let target_calls = h.target.calls().await;
     if let Some((id, body)) = &completion {
@@ -175,26 +158,13 @@ async fn case(mpu: bool, root: bool, auto: bool, history: bool) {
         object_version::Entity::find().all(db).await.unwrap(),
         versions
     );
-    assert_eq!(pin_lease::Entity::find().all(db).await.unwrap(), leases);
-    assert_eq!(
-        pin_lease_target::Entity::find().all(db).await.unwrap(),
-        bound
-    );
-    assert_eq!(pin_job::Entity::find().all(db).await.unwrap(), jobs);
+    assert_eq!(pin_rows::refs(db).await, refs);
+    assert_eq!(pin_rows::resources(db).await, resources);
     assert_eq!(zip_batch::Entity::find().all(db).await.unwrap(), batches);
     assert_eq!(
         zip_manifest_entry::Entity::find().all(db).await.unwrap(),
         manifests
     );
-    assert_eq!(
-        ledger::submission::observations(db, &h.provider)
-            .await
-            .unwrap(),
-        observations
-    );
-    if let Some(history) = &h.history {
-        history.assert_intact(&h.state).await;
-    }
 
     // Current-key replacement cannot change the exact extracted version.
     let key = format!("{PREFIX}first.txt");
@@ -232,7 +202,7 @@ macro_rules! acceptance {
     ($name:ident, $mpu:literal, $root:literal, $auto:literal) => {
         #[tokio::test]
         async fn $name() {
-            Box::pin(case($mpu, $root, $auto, false)).await;
+            Box::pin(case($mpu, $root, $auto)).await;
         }
     };
 }
@@ -245,16 +215,6 @@ acceptance!(v1_mpu_root_off_auto_off, true, false, false);
 acceptance!(v1_mpu_root_off_auto_on, true, false, true);
 acceptance!(v1_mpu_root_on_auto_off, true, true, false);
 acceptance!(v1_mpu_root_on_auto_on, true, true, true);
-
-#[tokio::test]
-async fn v1_put_with_unrelated_applied_retirement_and_legacy_history() {
-    Box::pin(case(false, false, false, true)).await;
-}
-
-#[tokio::test]
-async fn v1_mpu_with_unrelated_applied_retirement_and_legacy_history() {
-    Box::pin(case(true, true, true, true)).await;
-}
 
 #[tokio::test]
 async fn ordinary_put_get_mpu_copy_and_exact_version_remain_available() {

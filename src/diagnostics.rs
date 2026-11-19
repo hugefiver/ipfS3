@@ -7,37 +7,11 @@ use chrono::Utc;
 use ipfs_s3_gateway::{
     config::Config,
     pinning::{
-        config::{
-            PolicyTrigger, ProviderKind, ProviderMode, ValidatedPinningConfig, ValidatedProvider,
-        },
+        config::{ProviderKind, ValidatedPinningConfig, ValidatedProvider},
         coordinator::normalize_validated_config,
-        ipfs_rpc::{RpcProfile, RpcStrategy},
     },
 };
 use serde_json::{Value, json};
-
-#[path = "diagnostics/legacy_migration.rs"]
-pub mod legacy_migration;
-#[path = "diagnostics/management.rs"]
-pub mod management;
-#[path = "diagnostics/status.rs"]
-mod status;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Command {
-    Doctor,
-    ConfigExplain,
-    PolicyExplain {
-        bucket: String,
-        key: String,
-    },
-    Status {
-        bucket: String,
-        key: String,
-        version_id: Option<String>,
-        cursor: Option<String>,
-    },
-}
 
 fn local_config() -> anyhow::Result<(Config, Value)> {
     // Only emit provenance labels, never the path, env values, URL or parser
@@ -60,7 +34,7 @@ fn local_config() -> anyhow::Result<(Config, Value)> {
     let provenance = json!({
         "evidence": "independent_local_cli_load_not_running_gateway",
         "running_gateway_configuration": "not_observed",
-        "gateway_startup_checks": "not_performed",
+        "gateway_startup_checks": "pinning_config_only_no_full_startup",
         "config_file": if file_present { "present" } else { "missing" },
         "config_path_override": if env("IPFS_S3_CONFIG").is_some() { "present" } else { "missing" },
         "effective_sources": {
@@ -150,17 +124,9 @@ fn capability(operation: &'static str, configured: &'static str) -> Value {
 }
 
 fn provider_strategy(provider: &ValidatedProvider) -> &'static str {
-    if let Some(cluster) = &provider.cluster {
-        return cluster.strategy.as_str();
-    }
-    if let Some(rpc) = &provider.rpc {
-        return rpc.strategy.as_str();
-    }
     if provider.kind == ProviderKind::Noop {
         return "noop";
     }
-    // Legacy routes come from the validated identity, never endpoint guesses
-    // or Pinata-only options. Only allowlisted strings may be emitted.
     match provider.identity.strategy.as_str() {
         "cid" => "cid",
         "upload" => "upload",
@@ -170,20 +136,15 @@ fn provider_strategy(provider: &ValidatedProvider) -> &'static str {
 }
 
 fn provider_profile(provider: &ValidatedProvider) -> &'static str {
-    if let Some(cluster) = &provider.cluster {
-        return cluster.protocol.api_profile();
-    }
-    if let Some(rpc) = &provider.rpc {
-        return match rpc.profile {
-            RpcProfile::Kubo => "kubo",
-            RpcProfile::Filebase => "filebase-rpc",
-        };
-    }
     match provider.identity.api_profile.as_str() {
         "pinata-v3" => "pinata-v3",
         "pinata-legacy" => "pinata-legacy",
         "pinata-psa" => "pinata-psa",
         "filebase-psa" => "filebase-psa",
+        "filebase-rpc" => "filebase-rpc",
+        "kubo" => "kubo",
+        "cluster-proxy" => "cluster-proxy",
+        "cluster-rest" => "cluster-rest",
         "noop" => "noop",
         _ => "unknown",
     }
@@ -223,58 +184,24 @@ fn provider_credential(provider: &ValidatedProvider) -> &'static str {
     }
 }
 
-fn provider_operations(provider: &ValidatedProvider) -> Value {
-    let active = provider.limits.enabled;
-    let kind = provider.kind;
-    let route = provider_strategy(provider);
-    let (cid, upload, car, recursive) = match (&provider.rpc, &provider.cluster) {
-        (_, Some(cluster)) => (
-            cluster.strategy.as_str() == "cid",
-            cluster.strategy.as_str() == "upload",
-            cluster.strategy.as_str() == "car",
-            false, // Local recursive pins are never Cluster N/N confirmation.
-        ),
-        (Some(rpc), _) => (
-            rpc.profile == RpcProfile::Kubo && rpc.strategy == RpcStrategy::Cid,
-            rpc.strategy == RpcStrategy::Upload,
-            rpc.profile == RpcProfile::Kubo && rpc.strategy == RpcStrategy::Car,
-            true,
-        ),
-        _ => (
-            route == "cid",
-            kind == ProviderKind::Pinata && route == "upload",
-            false,
-            false,
-        ),
-    };
-    let supported = |operation: &'static str, route_allowed: bool| {
+fn provider_operations(provider: &ValidatedProvider, strategy: &str) -> Value {
+    let active = provider.limits.enabled && provider.kind != ProviderKind::Noop;
+    let configured = |operation, route_allowed| {
         capability(
             operation,
-            if !active || kind == ProviderKind::Noop || !route_allowed {
-                "denied"
-            } else {
+            if active && route_allowed {
                 "supported"
+            } else {
+                "denied"
             },
         )
     };
-    let cleanup = if active && kind != ProviderKind::Noop {
-        "unknown"
-    } else {
-        "denied"
-    };
-    let mut operations = vec![
-        supported("submit_cid", cid),
-        supported("upload_bytes", upload),
-        supported("query_remote", true),
-        capability("remove_remote", cleanup),
-        // Append new evidence without changing the legacy operation indices.
-        supported("import_car", car),
-        supported("query_recursive", recursive),
-    ];
-    if provider.cluster.is_some() {
-        operations.push(supported("query_cluster_replicas", true));
-    }
-    json!(operations)
+    json!([
+        configured("submit_cid", strategy == "cid"),
+        configured("upload_bytes", strategy == "upload"),
+        configured("import_car", strategy == "car"),
+        configured("remove_remote", true),
+    ])
 }
 
 fn providers(validated: &ValidatedPinningConfig, explicit_identity: bool) -> Vec<Value> {
@@ -291,6 +218,7 @@ fn providers(validated: &ValidatedPinningConfig, explicit_identity: bool) -> Vec
             let scope = *scopes
                 .entry((identity.backend.clone(), identity.scope.clone()))
                 .or_insert(next);
+            let strategy = provider_strategy(provider);
             let mut report = json!({
                 "provider_index": index,
                 "scope_ref": scope,
@@ -302,18 +230,10 @@ fn providers(validated: &ValidatedPinningConfig, explicit_identity: bool) -> Vec
                 "enabled": provider.limits.enabled,
                 "retired": identity.retired,
                 "credential": provider_credential(provider),
-                "strategy": provider_strategy(provider),
-                "operations": provider_operations(provider),
+                "strategy": strategy,
+                "operations": provider_operations(provider, strategy),
             });
             if let Some(cluster) = &provider.cluster {
-                report["confirmation"] = json!({
-                    "kind": "cluster_replicas", "min_replicas": cluster.min_replicas,
-                    "max_age_secs": cluster.verifier_limits.max_observation_age.as_secs(),
-                    "configured_route": "fresh_rest_allocated_distinct_pinned_peers",
-                    "remote_permission": "unknown", "remote_observation": "not_performed",
-                    "account_replication": "not_proven", "failure_domain_independence": "not_proven",
-                    "replication_factor": "not_modified_by_confirmation_threshold",
-                });
                 report["route_credentials"] = json!({
                     "proxy": if cluster.proxy_auth.is_some() { "present" } else { "not_required" },
                     "rest": if cluster.rest_auth.is_some() { "present" } else { "not_required" },
@@ -326,98 +246,17 @@ fn providers(validated: &ValidatedPinningConfig, explicit_identity: bool) -> Vec
         .collect()
 }
 
-fn explain_policy(validated: &ValidatedPinningConfig, bucket: &str, key: &str) -> Value {
-    let matched = validated.policies.iter().enumerate().find(|(_, policy)| {
-        (policy.bucket == "*" || policy.bucket == bucket) && key.starts_with(&policy.prefix)
-    });
-    let Some((index, policy)) = matched else {
-        return json!({
-            "match": "none",
-            "scope_ref": "requested_object_not_printed",
-            "config_revision": "unknown",
-            "operations": [capability("automatic_pin", "denied"), capability("manual_pin", "denied")],
-            "remote_permission": "unknown"
-        });
-    };
-    let active = policy
-        .providers
-        .iter()
-        .filter(|name| {
-            validated.providers.iter().any(|provider| {
-                &provider.name == *name
-                    && provider.limits.enabled
-                    && provider.kind != ProviderKind::Noop
-            })
-        })
-        .count();
-    let pin_capability = if active == 0
-        || (policy.provider_mode == ProviderMode::All && active != policy.providers.len())
-    {
-        "denied"
-    } else {
-        "supported"
-    };
-    json!({
-        "match": "first_matching_rule",
-        "scope_ref": "requested_object_not_printed",
-        "policy_index": index,
-        // ValidatedPolicy.identity is a SHA digest; do not emit it.
-        "config_revision": "unknown",
-        "provider_mode": if policy.provider_mode == ProviderMode::All { "all" } else { "one" },
-        "provider_indices": policy.providers.iter().filter_map(|name| validated.providers.iter().position(|provider| &provider.name == name)).collect::<Vec<_>>(),
-        "allow_decompressed": policy.allow_decompressed,
-        "operations": [
-            capability("automatic_pin", if policy.trigger == PolicyTrigger::Always { pin_capability } else { "denied" }),
-            capability("manual_pin", pin_capability),
-            capability("decompressed_pin", if policy.allow_decompressed { pin_capability } else { "denied" }),
-        ],
-        "caveat": "local_rule_match_only_no_tags_or_object_version_or_remote_permissions_checked"
-    })
-}
-
-pub async fn run(command: Command) -> anyhow::Result<()> {
+pub fn config_explain() -> anyhow::Result<()> {
     let (cfg, mut provenance) = local_config()?;
-    if let Command::Status {
-        bucket,
-        key,
-        version_id,
-        cursor,
-    } = &command
-    {
-        let result = status::snapshot(
-            &cfg.storage.database_url,
-            bucket,
-            key,
-            version_id.as_deref(),
-            cursor.as_deref(),
-        )
-        .await?;
-        return print_report(&json!({
-            "command": "pinning_status",
-            "access_scope": "local_administrator_cli_no_http_endpoint",
-            "build_version": env!("CARGO_PKG_VERSION"),
-            "observed_at": Utc::now().to_rfc3339(),
-            "provenance": provenance,
-            "status": result,
-            "side_effects": "read_only_database_snapshot_no_remote_probe_no_migrations",
-        }));
-    }
     provenance["variables"]["provider_tokens"] = json!(provider_token_variables(&cfg));
-    provenance["gateway_startup_checks"] = json!("pinning_config_only_no_full_startup");
     let validation = ValidatedPinningConfig::from_config(&cfg, |name| std::env::var(name).ok())
         .and_then(normalize_validated_config);
-    let command_name = match &command {
-        Command::Doctor => "pinning_doctor",
-        Command::ConfigExplain => "config_explain",
-        Command::PolicyExplain { .. } => "pinning_policy_explain",
-        Command::Status { .. } => unreachable!("status is handled before config validation"),
-    };
     let observed_at = Utc::now().to_rfc3339();
     let validated = match validation {
         Ok(validated) => validated,
         Err(_) => {
             let report = json!({
-                "command": command_name,
+                "command": "config_explain",
                 "build_version": env!("CARGO_PKG_VERSION"),
                 "observed_at": observed_at,
                 "provenance": provenance,
@@ -437,8 +276,8 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             ));
         }
     };
-    let mut report = json!({
-        "command": command_name,
+    print_report(&json!({
+        "command": "config_explain",
         "build_version": env!("CARGO_PKG_VERSION"),
         "observed_at": observed_at,
         "provenance": provenance,
@@ -447,16 +286,14 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             "configured_providers": validated.providers.len(),
             "configured_policies": validated.policies.len(),
             "providers": providers(&validated, !cfg.pinning_identity.providers.is_empty()),
+            "worker_completion": "provider_ack",
+            "physical_replicas": "not_observed",
             "config_revision": "unknown",
             "remote_capabilities": "unknown_not_probed",
             "database_status": "not_observed",
         },
         "side_effects": "no_database_connection_no_remote_probe_no_upload",
-    });
-    if let Command::PolicyExplain { bucket, key } = command {
-        report["policy_explain"] = explain_policy(&validated, &bucket, &key);
-    }
-    print_report(&report)
+    }))
 }
 
 fn print_report(report: &Value) -> anyhow::Result<()> {

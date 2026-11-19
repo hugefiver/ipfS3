@@ -69,10 +69,9 @@ jobs:
       fail-fast: false
       matrix:
         shard:
-          - core-legacy-remainder
+          - core-remainder
           - worker-providers
-          - store-pinning-control
-          - management
+          - store-pinning
     steps:
       - uses: actions/checkout@v7
 
@@ -113,7 +112,7 @@ jobs:
           http_admission
           object_read_snapshot
           bucket_config_owner_atomicity
-          schema_baseline
+          file_pin_schema
           schema_baseline_semantics
 
   native-runner:

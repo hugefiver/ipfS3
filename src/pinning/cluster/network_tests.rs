@@ -1,4 +1,4 @@
-use super::{network, tests::*, *};
+use super::{ClusterNetworkPolicy, network};
 use reqwest::dns::{Name, Resolve, Resolving};
 use std::{
     net::SocketAddr,
@@ -222,81 +222,49 @@ async fn connection_uses_only_the_current_dns_answer_without_hostname_rewrite_or
 }
 
 #[tokio::test]
-async fn public_verifier_dns_denial_never_connects_or_mints_proof() {
+async fn mixed_public_private_dns_answer_blocks_a_write_before_connecting() {
     let server = MockServer::start().await;
-    let base = format!(
-        "https://bound.cluster.example.com:{}",
+    let base = reqwest::Url::parse(&format!(
+        "https://bound.cluster.example.com:{}/add",
         server.address().port()
-    );
-    let p = ClusterRestProfile::new(
-        ClusterPinset::new("cluster", "policy").unwrap(),
-        Some(&base),
-        Some(ClusterAuth::Bearer("auth-sentinel".into())),
-        1,
-        RestLimits::default(),
-    )
+    ))
     .unwrap();
     let dns = Dns::new(Answer::Addresses(vec![
         "8.8.8.8:0".parse().unwrap(),
         *server.address(),
     ]));
-    let verifier = ClusterReplicaVerifier::with_resolver(p, dns.clone()).unwrap();
-    let proof = verifier.observe(CID).await;
-    assert_eq!(proof.outcome(), ReplicaOutcome::Unknown);
-    assert_eq!(proof.failure().unwrap().code, VerificationCode::Transport);
-    assert!(proof.evidence().is_none());
+    let client = network::client_with_resolver(
+        &base,
+        ClusterNetworkPolicy::PublicOnly,
+        Duration::from_millis(250),
+        Some(Duration::from_secs(1)),
+        dns.clone(),
+    )
+    .unwrap();
+    assert!(client.post(base).send().await.is_err());
     assert_eq!(dns.calls.load(Ordering::SeqCst), 1);
     assert!(server.received_requests().await.unwrap().is_empty());
-    assert!(!format!("{proof:?}").contains("auth-sentinel"));
 }
 
 #[tokio::test]
-async fn denied_empty_failed_or_deadline_dns_supersedes_proof_without_revival() {
+async fn dns_timeout_cancels_the_pending_lookup() {
     let server = MockServer::start().await;
-    mounts(
-        &server,
-        allocation(&["a", "b"]),
-        global(&["a", "b"], &[("a", "pinned"), ("b", "pinned")]),
-    )
-    .await;
-    let base = format!(
-        "http://bound.cluster.example.com:{}",
+    let base = reqwest::Url::parse(&format!(
+        "http://bound.cluster.example.com:{}/add",
         server.address().port()
-    );
-    let mut p = profile(&base, 2); // Explicit AllowPrivate loopback fixture.
-    p.limits.connect_timeout = Duration::from_millis(60);
-    p.limits.idle_timeout = Duration::from_millis(300);
-    p.limits.total_timeout = Duration::from_secs(1);
-    let dns = Dns::new(Answer::Addresses(vec![*server.address()]));
-    let verifier = ClusterReplicaVerifier::with_resolver(p, dns.clone()).unwrap();
-    let mut previous = verifier.observe(CID).await;
-    assert_eq!(previous.outcome(), ReplicaOutcome::Complete);
-    for answer in [Answer::Addresses(Vec::new()), Answer::Fail, Answer::Stall] {
-        *dns.answer.lock().unwrap() = answer;
-        let denied = verifier.observe(CID).await;
-        assert_eq!(denied.outcome(), ReplicaOutcome::Unknown);
-        assert!(denied.evidence().is_none());
-        assert_eq!(denied.failure().unwrap().code, VerificationCode::Transport);
-        assert_eq!(previous.outcome(), ReplicaOutcome::Unknown);
-        assert_eq!(
-            previous.failure().unwrap().code,
-            VerificationCode::StaleObservation
-        );
-        assert_eq!(previous.evidence().unwrap().pinned_peers.len(), 2);
-        assert_eq!(
-            dns.active.load(Ordering::SeqCst),
-            0,
-            "DNS future escaped its deadline"
-        );
-        *dns.answer.lock().unwrap() = Answer::Addresses(vec![*server.address()]);
-        let refreshed = verifier.observe(CID).await;
-        assert_eq!(refreshed.outcome(), ReplicaOutcome::Complete);
-        assert_eq!(
-            previous.outcome(),
-            ReplicaOutcome::Unknown,
-            "a new success resurrected an old proof"
-        );
-        previous = refreshed;
-    }
-    assert_eq!(dns.calls.load(Ordering::SeqCst), 19); // 4 + (1 denied + 4 fresh) * 3.
+    ))
+    .unwrap();
+    let dns = Dns::new(Answer::Stall);
+    let client = network::client_with_resolver(
+        &base,
+        ClusterNetworkPolicy::AllowPrivate,
+        Duration::from_millis(60),
+        Some(Duration::from_secs(1)),
+        dns.clone(),
+    )
+    .unwrap();
+    assert!(client.post(base).send().await.is_err());
+    assert_eq!(dns.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(dns.active.load(Ordering::SeqCst), 0);
+    assert!(server.received_requests().await.unwrap().is_empty());
 }

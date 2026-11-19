@@ -315,46 +315,8 @@ async fn versioning_direct_zip_publication_rollback_is_atomic_and_keeps_pins() {
             .is_empty(),
         "atomic ZIP publication must leave no object tags"
     );
-    assert!(
-        store::entities::pin_lease::Entity::find()
-            .all(db)
-            .await
-            .expect("load pin leases after atomic rollback")
-            .is_empty(),
-        "atomic ZIP publication must leave no pin leases"
-    );
-    assert!(
-        store::entities::pin_lease_target::Entity::find()
-            .all(db)
-            .await
-            .expect("load pin targets after atomic rollback")
-            .is_empty(),
-        "atomic ZIP publication must leave no pin targets"
-    );
-    assert!(
-        store::entities::remote_pin::Entity::find()
-            .all(db)
-            .await
-            .expect("load remote pins after atomic rollback")
-            .is_empty(),
-        "atomic ZIP publication must leave no remote pins"
-    );
-    assert!(
-        store::entities::pin_provider_usage::Entity::find()
-            .all(db)
-            .await
-            .expect("load provider usage after atomic rollback")
-            .is_empty(),
-        "atomic ZIP publication must leave no provider usage"
-    );
-    assert!(
-        store::entities::pin_job::Entity::find()
-            .all(db)
-            .await
-            .expect("load pin jobs after atomic rollback")
-            .is_empty(),
-        "atomic ZIP publication must leave no pin jobs"
-    );
+    assert!(crate::support::pin_rows::refs(db).await.is_empty());
+    assert!(crate::support::pin_rows::resources(db).await.is_empty());
     assert_pin_calls(
         &harness,
         "/api/v0/pin/rm",

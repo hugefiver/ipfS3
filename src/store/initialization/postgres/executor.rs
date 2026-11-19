@@ -104,7 +104,7 @@ where
     cleanup?;
     // An unfinished root cancels its owner on Drop. After successful cleanup,
     // preserve the operation's original error rather than replacing it with
-    // that secondary cancellation (maintenance callers retain SQLSTATE).
+    // that secondary cancellation.
     let output = work?;
     stop.check()?;
     served?;
@@ -340,13 +340,7 @@ where
     tokio::select! {
         biased;
         result = &mut future => {
-            let result = result.map_err(|error| {
-                if stop.0.retain_sql_errors {
-                    DbErr::Exec(sea_orm::RuntimeErr::SqlxError(error))
-                } else {
-                    failed()
-                }
-            });
+            let result = result.map_err(|_| failed());
             stop.check()?;
             return result;
         }

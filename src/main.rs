@@ -35,10 +35,8 @@ const READY_PROBE_URL: &str = "http://127.0.0.1:9000/ready";
 enum RunMode {
     Gateway,
     ReadyProbe,
-    Diagnostics(diagnostics::Command),
-    LegacyMigration(diagnostics::legacy_migration::Command),
-    Management(diagnostics::management::Command),
-    ManagementUpgrade(diagnostics::management::UpgradeCommand),
+    ConfigExplain,
+    UpgradeDatabase,
 }
 
 async fn health_check() -> &'static str {
@@ -46,74 +44,15 @@ async fn health_check() -> &'static str {
 }
 
 fn parse_run_mode(args: &[String]) -> anyhow::Result<RunMode> {
-    if let Some(command) = diagnostics::management::parse_upgrade(args)? {
-        return Ok(RunMode::ManagementUpgrade(command));
-    }
-    let legacy = diagnostics::legacy_migration::parse(args)?;
-    if args
-        .iter()
-        .skip(1)
-        .any(|argument| argument == "--pinning-manage")
-    {
-        return Err(diagnostic_usage());
-    }
-    if let Some(command) = legacy {
-        return Ok(RunMode::LegacyMigration(command));
-    }
-    if let Some(command) = diagnostics::management::parse(args)? {
-        return Ok(RunMode::Management(command));
-    }
-    if let [flag, bucket, key, rest @ ..] = args
-        && flag == "--pinning-status"
-        && !bucket.is_empty()
-        && !key.is_empty()
-    {
-        let mut version_id = None;
-        let mut cursor = None;
-        let mut options = rest.iter();
-        while let Some(option) = options.next() {
-            match option.as_str() {
-                "--version-id" if version_id.is_none() => version_id = options.next().cloned(),
-                "--cursor" if cursor.is_none() => cursor = options.next().cloned(),
-                _ => return Err(diagnostic_usage()),
-            }
-        }
-        if version_id.as_deref().is_some_and(str::is_empty)
-            || cursor.as_deref().is_some_and(str::is_empty)
-            || rest.len() != 2 * (usize::from(version_id.is_some()) + usize::from(cursor.is_some()))
-        {
-            return Err(diagnostic_usage());
-        }
-        return Ok(RunMode::Diagnostics(diagnostics::Command::Status {
-            bucket: bucket.clone(),
-            key: key.clone(),
-            version_id,
-            cursor,
-        }));
-    }
     match args {
         [] => Ok(RunMode::Gateway),
         [flag] if flag == "--ready-probe" => Ok(RunMode::ReadyProbe),
-        [flag] if flag == "--pinning-doctor" => {
-            Ok(RunMode::Diagnostics(diagnostics::Command::Doctor))
-        }
-        [flag] if flag == "--config-explain" => {
-            Ok(RunMode::Diagnostics(diagnostics::Command::ConfigExplain))
-        }
-        [flag, bucket, key] if flag == "--pinning-policy-explain" => {
-            Ok(RunMode::Diagnostics(diagnostics::Command::PolicyExplain {
-                bucket: bucket.clone(),
-                key: key.clone(),
-            }))
-        }
-        _ => Err(diagnostic_usage()),
+        [flag] if flag == "--config-explain" => Ok(RunMode::ConfigExplain),
+        [flag] if flag == "--upgrade-database" => Ok(RunMode::UpgradeDatabase),
+        _ => anyhow::bail!(
+            "usage: ipfs-s3-gateway [--ready-probe | --config-explain | --upgrade-database]"
+        ),
     }
-}
-
-fn diagnostic_usage() -> anyhow::Error {
-    anyhow::anyhow!(
-        "usage: ipfs-s3-gateway [--ready-probe | --pinning-doctor | --config-explain | --pinning-policy-explain BUCKET KEY | --pinning-status BUCKET KEY [--version-id ID] [--cursor OFFSET] | --pinning-migrate-legacy DECLARATION [--apply CONFIRMATION] | --rollback RECEIPT CONFIRMATION | --pinning-manage (see --pinning-manage --help) | --pinning-manage-upgrade --database-url URL --native-identity ID --database-scope SCOPE --source-version VERSION --target-version VERSION]"
-    )
 }
 
 async fn readiness_response<F>(ping: F, deadline: Duration) -> Response
@@ -295,10 +234,13 @@ async fn main() -> anyhow::Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     match parse_run_mode(&args)? {
         RunMode::Gateway => run_gateway().await,
-        RunMode::Diagnostics(command) => diagnostics::run(command).await,
-        RunMode::LegacyMigration(command) => diagnostics::legacy_migration::run(command).await,
-        RunMode::Management(command) => diagnostics::management::run(command).await,
-        RunMode::ManagementUpgrade(command) => diagnostics::management::run_upgrade(command).await,
+        RunMode::ConfigExplain => diagnostics::config_explain(),
+        RunMode::UpgradeDatabase => {
+            let config = Config::load()?;
+            let db = ipfs_s3_gateway::store::connect_database(&config.storage.database_url).await?;
+            ipfs_s3_gateway::store::initialization::upgrade_existing(&db).await?;
+            Ok(())
+        }
         RunMode::ReadyProbe => {
             if ready_probe().await {
                 Ok(())
@@ -570,66 +512,15 @@ mod tests {
             RunMode::ReadyProbe
         );
         assert_eq!(
-            parse_run_mode(&["--pinning-doctor".to_owned()]).unwrap(),
-            RunMode::Diagnostics(diagnostics::Command::Doctor)
-        );
-        assert_eq!(
             parse_run_mode(&["--config-explain".to_owned()]).unwrap(),
-            RunMode::Diagnostics(diagnostics::Command::ConfigExplain)
+            RunMode::ConfigExplain
         );
         assert_eq!(
-            parse_run_mode(&[
-                "--pinning-policy-explain".to_owned(),
-                "bucket".to_owned(),
-                "key".to_owned()
-            ])
-            .unwrap(),
-            RunMode::Diagnostics(diagnostics::Command::PolicyExplain {
-                bucket: "bucket".to_owned(),
-                key: "key".to_owned()
-            })
+            parse_run_mode(&["--upgrade-database".to_owned()]).unwrap(),
+            RunMode::UpgradeDatabase
         );
         assert!(parse_run_mode(&["--unknown".to_owned()]).is_err());
         assert!(parse_run_mode(&["--ready-probe".to_owned(), "extra".to_owned()]).is_err());
-        assert_eq!(
-            parse_run_mode(
-                &[
-                    "--pinning-status",
-                    "bucket",
-                    "key",
-                    "--cursor",
-                    "50",
-                    "--version-id",
-                    "null"
-                ]
-                .map(str::to_owned)
-            )
-            .unwrap(),
-            RunMode::Diagnostics(diagnostics::Command::Status {
-                bucket: "bucket".into(),
-                key: "key".into(),
-                version_id: Some("null".into()),
-                cursor: Some("50".into()),
-            })
-        );
-        for args in [
-            vec!["--pinning-status", "bucket"],
-            vec!["--pinning-status", "bucket", "key", "--cursor"],
-            vec![
-                "--pinning-status",
-                "bucket",
-                "key",
-                "--cursor",
-                "0",
-                "--cursor",
-                "1",
-            ],
-            vec!["--pinning-status", "bucket", "key", "--version-id", ""],
-        ] {
-            assert!(
-                parse_run_mode(&args.into_iter().map(str::to_owned).collect::<Vec<_>>()).is_err()
-            );
-        }
     }
 
     #[tokio::test]

@@ -9,6 +9,7 @@ use bytes::{Buf as _, Bytes};
 use http::{HeaderMap, StatusCode};
 use http_body_util::BodyExt as _;
 use s3s::{Body, S3Request, S3Response, S3Result};
+use sea_orm::TransactionTrait as _;
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
@@ -213,15 +214,12 @@ pub(super) async fn preflight_current(
     manifest: Option<&crate::zip::batch::FinalZipManifest>,
 ) -> S3Result<()> {
     if let Err(error) = publication::preflight_captured_zip_routes(
-        &state.store,
         capture,
         state.pinning.effective_config(),
         state.pinning.zip_output_rules(),
         state.pinning.control_mode(),
         manifest,
-    )
-    .await
-    {
+    ) {
         if matches!(error, AppError::InvalidPinningRequest(_)) {
             execution::fence(state.store.db(), claim)
                 .await
@@ -853,7 +851,7 @@ pub(super) async fn put(
             source_key: parsed.key.clone(),
             captured_options: captured,
         };
-        let execution = execution::admit_store(&state.store, &request)
+        let execution = execution::admit(state.store.db(), &request)
             .await
             .map_err(store_error)?;
         (request, None, execution)
@@ -1139,11 +1137,7 @@ pub(super) async fn put(
             input_identity: "pending".into(),
             captured_options: execution.captured_options.clone(),
         };
-        let work = crate::store::pinning::management::records::SharedDecodeBudget::default();
-        let tx = state
-            .store
-            .begin_runtime(crate::store::pinning::management::records::DecodeWork::shared(&work))
-            .await?;
+        let tx = state.store.db().begin().await.map_err(AppError::from)?;
         crate::store::import::ownership::lock_bucket_for_ownership(&tx, &parsed.bucket).await?;
         let items = manifest
             .successful
@@ -1186,7 +1180,7 @@ pub(super) async fn put(
                 None
             };
             execution::admit_manifest_in_transaction(&tx, &claim, &items, &ids).await?;
-            zip::BatchAdmission::admit_runtime_mirror(&tx, &batch).await?;
+            zip::BatchAdmission::admit_in_transaction(&tx, &batch).await?;
             zip::ManifestItem::prepare_manifest_in_transaction(
                 &tx,
                 &id,
@@ -1205,11 +1199,11 @@ pub(super) async fn put(
         let source_guard = match admission {
             Ok(guard) => guard,
             Err(error) => {
-                tx.rollback().await?;
+                tx.rollback().await.map_err(AppError::from)?;
                 return Err(store_error(error));
             }
         };
-        tx.commit().await?;
+        tx.commit().await.map_err(AppError::from)?;
         source_guard
     };
     if !crate::store::import::ownership::renew_zip_v2_direct_group(
@@ -1283,8 +1277,8 @@ pub(super) async fn put(
     if lease.cancelled.is_cancelled() {
         return Err(conflict());
     }
-    if let Err(error) = publication::application::publish_captured_zip(
-        &state.store,
+    if let Err(error) = publication::publish_captured_zip(
+        state.store.db(),
         publication,
         state.pinning.effective_config(),
         state.pinning.zip_output_rules(),

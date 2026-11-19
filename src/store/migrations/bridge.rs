@@ -1,4 +1,4 @@
-//! The native migrator and guarded empty startup execute the same migration bodies.
+//! Connection adapters for historical DDL fixtures.
 use crate::store::initialization::postgres::Guarded;
 #[cfg(any(test, feature = "historical-fixtures"))]
 use crate::store::initialization::postgres::GuardedTransaction;
@@ -172,24 +172,3 @@ macro_rules! delegate_connection {
 delegate_connection!(Connection<'_>);
 #[cfg(any(test, feature = "historical-fixtures"))]
 delegate_connection!(Transaction);
-
-pub(crate) async fn initialize(db: &Guarded) -> Result<(), DbErr> {
-    use sea_orm::{EntityTrait, Set};
-    use sea_orm_migration::{MigratorTrait, seaql_migrations};
-    crate::store::migrator::Migrator::install(db).await?;
-    let manager = Manager::guarded(db.clone());
-    for migration in super::registry::shared() {
-        migration.up_body(&manager).await?;
-        let applied_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|_| crate::store::initialization::postgres::failed())?
-            .as_secs() as i64;
-        seaql_migrations::Entity::insert(seaql_migrations::ActiveModel {
-            version: Set(migration.name().to_owned()),
-            applied_at: Set(applied_at),
-        })
-        .exec(db)
-        .await?;
-    }
-    Ok(())
-}

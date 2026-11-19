@@ -4,6 +4,8 @@ mod support {
     pub mod cors;
     #[path = "decompress.rs"]
     pub mod decompress;
+    #[path = "pin_rows.rs"]
+    pub mod pin_rows;
     #[path = "sigv4.rs"]
     pub mod sigv4;
 }
@@ -18,7 +20,7 @@ use chrono::Utc;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use ipfs_s3_gateway::store::{
     self,
-    entities::{object, object_tag, object_version, pin_lease},
+    entities::{object, object_tag, object_version},
     import::ownership::admit_content_mutation,
     migrations::{
         m20250701_000001_init, m20260707_000001_decompress_zip,
@@ -29,7 +31,7 @@ use ipfs_s3_gateway::store::{
     },
     object_version::{BucketVersioningState, PublicVersionId, VersionSelector},
     pinning::publication::{
-        PinTargetSpec, PublicationObject, PublicationRequest, delete_version_with_leases_guarded,
+        PinTargetSpec, PublicationObject, PublicationRequest, delete_version_guarded,
         publish_object, publish_standard_object,
     },
 };
@@ -58,6 +60,7 @@ use sea_orm::{
 use sea_orm_migration::{MigrationTrait, MigratorTrait, SchemaManager};
 use support::{
     decompress::{AddReply, KuboScript, start_kubo_harness, start_s3_server},
+    pin_rows,
     sigv4::send_sigv4,
 };
 
@@ -399,6 +402,11 @@ fn contention_limits() -> ProviderLimitMap {
     )])
 }
 
+fn contention_cid(label: &str) -> String {
+    let multihash = cid::multihash::Multihash::wrap(0x00, label.as_bytes()).unwrap();
+    cid::Cid::new_v1(0x55, multihash).to_string()
+}
+
 fn contention_request(id: &str, key: &str, cid: &str) -> PublicationRequest {
     let tags = vec![
         ObjectTag::new("owner", id),
@@ -493,7 +501,7 @@ async fn parallel_publish(
         first_barrier.wait().await;
         publish_object(
             &first,
-            contention_request(first_id, key, &format!("bafy-{first_id}")),
+            contention_request(first_id, key, &contention_cid(first_id)),
             &contention_limits(),
         )
         .await
@@ -503,7 +511,7 @@ async fn parallel_publish(
         second_barrier.wait().await;
         publish_object(
             &second,
-            contention_request(second_id, key, &format!("bafy-{second_id}")),
+            contention_request(second_id, key, &contention_cid(second_id)),
             &contention_limits(),
         )
         .await
@@ -835,6 +843,9 @@ async fn postgres_parallel_publish_delete_tag_serializes_without_deadlock() {
         1
     );
     assert!(enabled.iter().all(|version| version.version_id.is_some()));
+    let refs = pin_rows::refs(&fixture.db).await;
+    assert_eq!(refs.len(), 2);
+    let now = Utc::now().timestamp_micros();
     for owner in ["pg-enabled-first", "pg-enabled-second"] {
         assert_eq!(
             object_tag::Entity::find()
@@ -844,15 +855,12 @@ async fn postgres_parallel_publish_delete_tag_serializes_without_deadlock() {
                 .unwrap(),
             3
         );
-        assert!(
-            pin_lease::Entity::find()
-                .filter(pin_lease::Column::OwnerObjectId.eq(owner))
-                .all(&fixture.db)
-                .await
-                .unwrap()
-                .iter()
-                .all(|lease| lease.state == "active")
-        );
+        let reference = refs
+            .iter()
+            .find(|row| row.owner_object_id == owner)
+            .unwrap();
+        assert_eq!(reference.cid, contention_cid(owner));
+        assert!(reference.expires_at > now);
         let owner_tags = store::pinning::tags::list_object_tags(&fixture.db, owner)
             .await
             .unwrap();
@@ -908,7 +916,7 @@ async fn postgres_parallel_publish_delete_tag_serializes_without_deadlock() {
     )
     .await
     .unwrap();
-    delete_version_with_leases_guarded(
+    delete_version_guarded(
         &second,
         "versioning-bucket",
         "enabled-race",
@@ -928,24 +936,10 @@ async fn postgres_parallel_publish_delete_tag_serializes_without_deadlock() {
             .unwrap(),
         0
     );
-    assert!(
-        pin_lease::Entity::find()
-            .filter(pin_lease::Column::OwnerObjectId.eq(historical_owner))
-            .all(&fixture.db)
-            .await
-            .unwrap()
-            .iter()
-            .all(|lease| lease.state == "cancelled")
-    );
-    assert!(
-        pin_lease::Entity::find()
-            .filter(pin_lease::Column::OwnerObjectId.eq(current_owner))
-            .all(&fixture.db)
-            .await
-            .unwrap()
-            .iter()
-            .all(|lease| lease.state == "active")
-    );
+    let remaining_refs = pin_rows::refs(&fixture.db).await;
+    assert_eq!(remaining_refs.len(), 1);
+    assert_eq!(remaining_refs[0].owner_object_id, current_owner);
+    assert!(remaining_refs[0].expires_at > Utc::now().timestamp_micros());
 
     let simple_guard = admit_content_mutation(
         &fixture.db,
@@ -957,7 +951,7 @@ async fn postgres_parallel_publish_delete_tag_serializes_without_deadlock() {
     )
     .await
     .unwrap();
-    let simple = delete_version_with_leases_guarded(
+    let simple = delete_version_guarded(
         &second,
         "versioning-bucket",
         "enabled-race",
@@ -968,6 +962,7 @@ async fn postgres_parallel_publish_delete_tag_serializes_without_deadlock() {
     .await
     .unwrap();
     assert!(simple.created_delete_marker);
+    assert_eq!(pin_rows::refs(&fixture.db).await, remaining_refs);
 
     store::bucket::set_versioning_state(
         &fixture.db,
@@ -1018,7 +1013,11 @@ async fn postgres_parallel_publish_delete_tag_serializes_without_deadlock() {
     .unwrap();
     let stale = publish_standard_object(
         &fixture.db,
-        contention_request("pg-stale-loser", "stale-race", "bafy-pg-stale"),
+        contention_request(
+            "pg-stale-loser",
+            "stale-race",
+            &contention_cid("pg-stale-loser"),
+        ),
         stale_guard,
         &contention_limits(),
     )
@@ -1027,7 +1026,11 @@ async fn postgres_parallel_publish_delete_tag_serializes_without_deadlock() {
     assert!(matches!(stale, AppError::StaleContentMutation));
     publish_standard_object(
         &second,
-        contention_request("pg-stale-winner", "stale-race", "bafy-pg-winner"),
+        contention_request(
+            "pg-stale-winner",
+            "stale-race",
+            &contention_cid("pg-stale-winner"),
+        ),
         winner_guard,
         &contention_limits(),
     )
@@ -1065,14 +1068,14 @@ async fn postgres_synchronized_publish_exact_delete_tag_serializes_without_deadl
     .unwrap();
     publish_object(
         &fixture.db,
-        contention_request("pg-sync-first", key, "bafy-pg-sync-first"),
+        contention_request("pg-sync-first", key, &contention_cid("pg-sync-first")),
         &contention_limits(),
     )
     .await
     .unwrap();
     publish_object(
         &fixture.db,
-        contention_request("pg-sync-second", key, "bafy-pg-sync-second"),
+        contention_request("pg-sync-second", key, &contention_cid("pg-sync-second")),
         &contention_limits(),
     )
     .await
@@ -1136,7 +1139,7 @@ async fn postgres_synchronized_publish_exact_delete_tag_serializes_without_deadl
             contention_request(
                 "pg-sync-race-publication",
                 &publish_key,
-                "bafy-pg-sync-race-publication",
+                &contention_cid("pg-sync-race-publication"),
             ),
             publication_guard,
             &contention_limits(),
@@ -1148,7 +1151,7 @@ async fn postgres_synchronized_publish_exact_delete_tag_serializes_without_deadl
     let tagging_version_id = historical_version_id.clone();
     let deletion = tokio::spawn(async move {
         delete_barrier.wait().await;
-        delete_version_with_leases_guarded(
+        delete_version_guarded(
             &deleter,
             "versioning-bucket",
             &delete_key,
@@ -1272,15 +1275,6 @@ async fn postgres_synchronized_publish_exact_delete_tag_serializes_without_deadl
                 .unwrap(),
             0
         );
-        assert!(
-            pin_lease::Entity::find()
-                .filter(pin_lease::Column::OwnerObjectId.eq(&historical_owner))
-                .all(&fixture.db)
-                .await
-                .unwrap()
-                .iter()
-                .all(|lease| lease.state == "cancelled")
-        );
     } else {
         assert!(tag_succeeded);
         assert_eq!(
@@ -1292,34 +1286,22 @@ async fn postgres_synchronized_publish_exact_delete_tag_serializes_without_deadl
                 ObjectTag::new("race", "public-operation"),
             ]
         );
-        assert!(
-            pin_lease::Entity::find()
-                .filter(pin_lease::Column::OwnerObjectId.eq(&historical_owner))
-                .all(&fixture.db)
-                .await
-                .unwrap()
-                .iter()
-                .all(|lease| lease.state == "cancelled")
-        );
     }
-    for owner in versions
+    let refs = pin_rows::refs(&fixture.db).await;
+    let expected_owners = versions
         .iter()
         .filter_map(|version| version.object_id.as_deref())
-    {
-        if owner == historical_owner.as_str() {
-            assert!(deletion_stale && tag_succeeded);
-            continue;
-        }
-        assert!(
-            pin_lease::Entity::find()
-                .filter(pin_lease::Column::OwnerObjectId.eq(owner))
-                .all(&fixture.db)
-                .await
-                .unwrap()
-                .iter()
-                .all(|lease| lease.state == "active")
-        );
-    }
+        .filter(|owner| *owner != historical_owner.as_str())
+        .collect::<HashSet<_>>();
+    assert_eq!(refs.len(), expected_owners.len());
+    assert_eq!(
+        refs.iter()
+            .map(|row| row.owner_object_id.as_str())
+            .collect::<HashSet<_>>(),
+        expected_owners
+    );
+    let now = Utc::now().timestamp_micros();
+    assert!(refs.iter().all(|row| row.expires_at > now));
     let current_tags = store::pinning::tags::list_object_tags(
         &fixture.db,
         latest
@@ -1344,9 +1326,9 @@ async fn postgres_suspended_null_replacement_preserves_opaque_versions() {
         return;
     };
     let key = "suspended-aws-parity";
-    let opaque_one_cid = "bafy-pg-aws-enabled-first";
-    let shared_cid = "bafy-pg-aws-enabled-second";
-    let null_replacement_cid = "bafy-pg-aws-suspended-first";
+    let opaque_one_cid = contention_cid("pg-aws-enabled-first");
+    let shared_cid = contention_cid("pg-aws-enabled-second");
+    let null_replacement_cid = contention_cid("pg-aws-suspended-first");
     store::bucket::set_versioning_state(
         &fixture.db,
         "versioning-bucket",
@@ -1357,7 +1339,7 @@ async fn postgres_suspended_null_replacement_preserves_opaque_versions() {
 
     let first_opaque = publish_object(
         &fixture.db,
-        contention_request("pg-aws-enabled-first", key, opaque_one_cid),
+        contention_request("pg-aws-enabled-first", key, &opaque_one_cid),
         &contention_limits(),
     )
     .await
@@ -1366,7 +1348,7 @@ async fn postgres_suspended_null_replacement_preserves_opaque_versions() {
     .expect("enabled publication must return an opaque public version ID");
     let second_opaque = publish_object(
         &fixture.db,
-        contention_request("pg-aws-enabled-second", key, shared_cid),
+        contention_request("pg-aws-enabled-second", key, &shared_cid),
         &contention_limits(),
     )
     .await
@@ -1394,7 +1376,7 @@ async fn postgres_suspended_null_replacement_preserves_opaque_versions() {
     )
     .await
     .unwrap();
-    let marker = delete_version_with_leases_guarded(
+    let marker = delete_version_guarded(
         &fixture.db,
         "versioning-bucket",
         key,
@@ -1433,7 +1415,7 @@ async fn postgres_suspended_null_replacement_preserves_opaque_versions() {
     )
     .await
     .unwrap();
-    let marker_delete = delete_version_with_leases_guarded(
+    let marker_delete = delete_version_guarded(
         &fixture.db,
         "versioning-bucket",
         key,
@@ -1476,8 +1458,8 @@ async fn postgres_suspended_null_replacement_preserves_opaque_versions() {
     .await
     .unwrap();
     for (id, cid) in [
-        ("pg-aws-suspended-first", null_replacement_cid),
-        ("pg-aws-suspended-second", shared_cid),
+        ("pg-aws-suspended-first", null_replacement_cid.as_str()),
+        ("pg-aws-suspended-second", shared_cid.as_str()),
     ] {
         let version_id = publish_object(
             &fixture.db,

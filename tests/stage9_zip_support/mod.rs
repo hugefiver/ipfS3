@@ -25,6 +25,16 @@ use ipfs_s3_gateway::{
     zip::options::parse_authenticated_zip_controls,
 };
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
+use sha2::{Digest, Sha256};
+
+pub const ARCHIVE_CID: &str = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
+pub const OUTPUT_CID: &str = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyk4";
+
+#[allow(dead_code)]
+pub fn fixture_cid(label: &str) -> String {
+    let hash = cid::multihash::Multihash::wrap(0x12, &Sha256::digest(label)).unwrap();
+    cid::Cid::new_v1(0x55, hash).to_string()
+}
 
 pub fn config() -> ValidatedPinningConfig {
     normalize_validated_config(
@@ -120,8 +130,8 @@ pub async fn prepared(
         config,
         tags,
         vec![
-            ("a".into(), object("a", "out/a", "shared-cid")),
-            ("b".into(), object("b", "out/b", "shared-cid")),
+            ("a".into(), object("a", "out/a", OUTPUT_CID)),
+            ("b".into(), object("b", "out/b", OUTPUT_CID)),
         ],
     )
     .await
@@ -138,15 +148,6 @@ pub async fn prepared_with_outputs(
     CapturedZipIntent,
     StandardMutationGuard,
 ) {
-    for provider in &config.providers {
-        store::pinning::ledger::register_configured_route(
-            db,
-            &provider.identity.allocation_key(),
-            provider,
-        )
-        .await
-        .unwrap();
-    }
     let guard = admit_content_and_prefix_mutation(
         db,
         "bucket",
@@ -214,7 +215,7 @@ pub async fn prepared_with_outputs(
     )
     .await
     .unwrap();
-    let source = object("archive", "out/archive.zip", "archive-cid");
+    let source = object("archive", "out/archive.zip", ARCHIVE_CID);
     let request = ZipPublicationRequest {
         archive: PublicationRequest {
             object_target: PinTargetSpec {

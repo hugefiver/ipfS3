@@ -118,14 +118,7 @@ async fn ordinary_put_rejects_all_zip_control_forms_in_current_bucket_states() {
                     let (status, body) = h.request(Entry::Ordinary, BUCKET, &[], headers).await;
                     assert_eq!(status, StatusCode::OK, "seed: {body}");
                     let seeded = snapshot(h.state.store.db()).await;
-                    for table in [
-                        "objects",
-                        "object_versions",
-                        "pin_leases",
-                        "pin_lease_targets",
-                        "pin_provider_usage",
-                        "pin_jobs",
-                    ] {
+                    for table in ["objects", "object_versions", "pin_refs", "pin_resources"] {
                         assert!(
                             !seeded[table].is_empty(),
                             "nonempty overwrite witness: {table}"

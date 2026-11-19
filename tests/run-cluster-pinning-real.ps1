@@ -1,31 +1,21 @@
 #requires -Version 7.0
 <#
-Stage6 isolated Cluster leaf acceptance, NOT complete Stage6 QA.
+Isolated Cluster Proxy and REST provider acceptance.
 From the repository root: pwsh -NoProfile -File tests/run-cluster-pinning-real.ps1
-Independent-source provider increment: add -ProviderPhase (does not rerun old matrix).
-Requires the two exact images already cached, Docker and the existing Rust tools.
-No pull/install/accounts/production resources. Two allocated fresh Kubo repositories
-and two fresh Cluster identities, plus an independent source in ProviderPhase,
-on one internal network. No Docker ports are
-published: random host-loopback raw TCP relays use exact owned docker exec nc.
-No gateway, DB or physical GC. The Stage5 relay source is read-only; a
-strict name/port adaptation is compiled only inside this run's unique temp dir.
+Requires Docker, the two exact cached images, offline Cargo dependencies, and an
+existing output parent. Two fresh Cluster peers, their allocated Kubo nodes, and
+an independent offline source share one internal network. Only loopback TCP
+relays expose fixture endpoints. No gateway, DB, accounts, or physical GC.
 
-Online Kubo is intentional: offline Kubo rejects swarm APIs used by Cluster.
-Kubo swarm listeners are empty; routing/discovery/autoconf/telemetry are disabled.
-The Docker internal network is the egress boundary, not config alone. All config
-syntax/source references are pinned in cluster-pinning-real.kubo-config.json.
-Cluster uses explicit CRDT bootstrap, no mDNS, no automatic repinning, long
-automatic recovery interval and an explicit CID-scoped recovery in the test.
+Allocated Kubo nodes stay online because Cluster uses swarm APIs. Kubo swarm
+listeners, routing, discovery, AutoConf, and telemetry are disabled. The Docker
+internal network enforces isolation.
 
-Compilation is attempted ONCE before creating resources, offline/locked. The
-provider phase runs only its new bounded contracts and exact ignored real case.
-Do not invoke ProviderPhase until the parent confirms the integrated tree is ready.
-Logs precede deletion, cleanup touches only exact names with this unique label,
-and exit-0 empty inventories are mandatory. Logs/summary stay in OS temp/opencode.
+Compilation and fixture argument checks precede node startup. Logs and summary
+stay in the output directory; cleanup is restricted to exact run-owned resources.
 #>
 [CmdletBinding()]
-param([switch]$ProviderPhase, [string]$OutputParent = (Join-Path ([IO.Path]::GetTempPath()) 'opencode'))
+param([string]$OutputParent = (Join-Path ([IO.Path]::GetTempPath()) 'opencode'))
 
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
@@ -58,15 +48,14 @@ $KuboB = "$Prefix-kubo-b"
 $Source = "$Prefix-source"
 $ClusterA = "$Prefix-cluster-a"
 $ClusterB = "$Prefix-cluster-b"
-$Containers = @($KuboA, $KuboB, $ClusterA, $ClusterB)
-if ($ProviderPhase) { $Containers += $Source }
+$Containers = @($KuboA, $KuboB, $ClusterA, $ClusterB, $Source)
 $Volumes = @($Containers | ForEach-Object { "$_-data" })
 $ResourcesAuthorized = $false
 $DaemonProcesses = @()
 $Relays = @()
 $SavedEnvironment = @{}
 $Summary = [ordered]@{
-    run_id = $RunId; status = 'FAIL'; scope = 'Cluster REST replica verifier leaf only'
+    run_id = $RunId; status = 'FAIL'; scope = 'Independent-source Cluster Proxy and REST provider transports'
     kubo_image = $KuboImage; cluster_image = $ClusterImage
     kubo_image_id = $null; cluster_image_id = $null
     compile = 'NOT RUN'; test = 'NOT RUN'; cleanup = 'NOT RUN'; failure = $null
@@ -74,17 +63,12 @@ $Summary = [ordered]@{
     default_tests = 'NOT RUN'; missing_endpoints = 'NOT RUN'; relay_compile = 'NOT RUN'
     host_forwarding = 'loopback-docker-exec-nc'; relay_cleanup = 'NOT RUN'
     wire_capture = 'unmodified Cluster request/response TCP bytes, max 32 MiB per connection/direction, run-owned files only'
-    assertions = '1/2 -> 2/2 single raw CID; local bytes; allocated Kubo outage; supersession; one logical pinset across two REST addresses'
-    exclusions = 'provider/worker/Proxy/CAR/S3/account integration; disaster recovery; continuous N/N; physical reclamation'
+    assertions = 'Proxy and REST transport ACKs; independent source; local DAGs and stored bytes on both targets after source stops'
+    exclusions = 'worker, S3, authentication, paid accounts, continuous availability, and GC'
     output = $ResultDir
 }
-if ($ProviderPhase) {
-    $Summary.scope = 'Independent-source Proxy+REST provider transport and fresh REST 2/2 leaf'
-    $Summary.assertions = 'ten original DAGs absent on both targets; independent CAR file/nested directory/product-crypto and upload/plain+product-crypto stored bytes; two real chunker mismatches preserve unexpected CID/no original fallback; two source-only CID roots never copied; source stopped; both targets offline twelve full reachable hashverified DAGs/bytes including unexpected roots; cid-only re-pin; fresh 2/2; ownership Unknown; new CAR fault contracts'
-    $Summary.exclusions = 'full Stage6; worker/registry/S3/auth/account; continuous availability; disaster recovery; GC'
-}
-$Target = if ($ProviderPhase) { 'cluster_provider_real' } else { 'cluster_replica_verifier' }
-$TestName = if ($ProviderPhase) { 'cluster_provider_real_independent_source_car' } else { 'cluster_replica_verifier_real_two_peer_lifecycle' }
+$Target = 'cluster_provider_real'
+$TestName = 'cluster_provider_real_independent_source_car'
 $EnvironmentNames = @('RUSTUP_AUTO_INSTALL', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
     'IPFS_S3_REAL_CLUSTER', 'IPFS_S3_REAL_CLUSTER_FIXTURE', 'IPFS_S3_REAL_CLUSTER_REST_A',
     'IPFS_S3_REAL_CLUSTER_REST_B', 'IPFS_S3_REAL_CLUSTER_RPC_A', 'IPFS_S3_REAL_CLUSTER_RPC_B',
@@ -207,7 +191,7 @@ function Start-OwnedRelay([string]$Name, [int]$Port) {
 function Read-IsolationConfig {
     $config = [IO.File]::ReadAllText($ConfigPath) | ConvertFrom-Json
     if ($config.version -cne '0.43.0' -or $config.daemon_mode -cne 'online-without-content-swarm') { throw 'Isolation version/mode mismatch.' }
-    if ($ProviderPhase -and $config.source_daemon_mode -cne 'offline') { throw 'Provider source must be explicitly offline.' }
+    if ($config.source_daemon_mode -cne 'offline') { throw 'Provider source must be explicitly offline.' }
     if ($config.environment.Count -ne 1 -or $config.environment[0].name -cne 'IPFS_TELEMETRY' -or $config.environment[0].value -cne 'off') {
         throw 'Official telemetry-off environment is required before init and daemon.'
     }
@@ -301,11 +285,9 @@ function Start-Cluster([string]$Name, [string]$KuboName, [string]$Secret, [strin
     # v1.1.6 balanced/config.go defines allocate_by; wait for both real metrics.
     Set-Field $config.allocator.balanced 'allocate_by' @('freespace')
     Set-Field $config.api.restapi 'http_listen_multiaddress' @('/ip4/0.0.0.0/tcp/9094')
-    if ($ProviderPhase) {
-        Set-Field $config.api.ipfsproxy 'listen_multiaddress' @('/ip4/127.0.0.1/tcp/9095')
-        Set-Field $config.api.ipfsproxy 'node_multiaddress' "/dns4/$KuboName/tcp/5001"
-        Set-Field $config.api.ipfsproxy 'log_file' '/data/ipfs-cluster/proxy-access.log'
-    }
+    Set-Field $config.api.ipfsproxy 'listen_multiaddress' @('/ip4/127.0.0.1/tcp/9095')
+    Set-Field $config.api.ipfsproxy 'node_multiaddress' "/dns4/$KuboName/tcp/5001"
+    Set-Field $config.api.ipfsproxy 'log_file' '/data/ipfs-cluster/proxy-access.log'
     Set-Field $config.ipfs_connector.ipfshttp 'node_multiaddress' "/dns4/$KuboName/tcp/5001"
     Set-Field $config.ipfs_connector.ipfshttp 'connect_swarms_delay' '1h'
     Set-Field $config.ipfs_connector.ipfshttp 'ipfs_request_timeout' '3s'
@@ -365,7 +347,7 @@ function Wait-Identity([string]$Url, [bool]$Kubo) {
 
 function Remove-OwnedResources {
     $failed = $false
-    # Collect ALL logs before removing ANY resource, including the stopped B.
+    # Collect logs before removing any resource, including the stopped source.
     foreach ($name in $Containers) {
         if (-not $ResourcesAuthorized) { continue }
         try {
@@ -373,7 +355,7 @@ function Remove-OwnedResources {
                 [void](Assert-Owned 'container' $name)
                 [IO.File]::WriteAllText((Join-Path $ResultDir "$name.container.log"), (Invoke-Docker @('logs', $name)))
                 [IO.File]::WriteAllText((Join-Path $ResultDir "$name.inspect.json"), (Invoke-Docker @('container', 'inspect', $name)))
-                if ($ProviderPhase -and $name -in @($ClusterA, $ClusterB)) {
+                if ($name -in @($ClusterA, $ClusterB)) {
                     # Cluster's own proxy access log proves /api/v0/add, not dag/import.
                     [void](Invoke-Docker @('cp', "${name}:/data/ipfs-cluster/proxy-access.log", (Join-Path $ResultDir "$name.proxy-access.log")))
                 }
@@ -442,17 +424,6 @@ function Remove-OwnedResources {
 }
 
 try {
-    [IO.File]::WriteAllText((Join-Path $ResultDir 'qa-journal.txt'), @"
-Entry: pwsh -NoProfile -File tests/run-cluster-pinning-real.ps1 -ProviderPhase:$ProviderPhase (one authorized phase attempt)
-H1 fixture transport/config: readiness.log, per-node daemon/relay logs and exact owned inspect distinguish unavailable endpoints/config errors.
-H2 asynchronous membership/allocation/pin convergence: bounded real /peers, freespace metrics, allocation/global snapshots distinguish pending vs actual 1/2 and 2/2.
-H3 leaf interpretation/freshness defect: observations.jsonl compares raw allocation/global snapshots with provider observations and original/target hashverified CAR blocks and bytes.
-Artifacts planned before launch: exact run=$RunId, exact nodes=$($Containers -join ','), their data volumes, $NetworkName internal network, own loopback relays/exec children, attached daemon loggers. Provider source is independent offline, never allocated A or B.
-Derived relay source/assembly and logs are retained ONLY here: $ResultDir. Stage5 relay source is read-only. No extra repository journal or Git writes.
-Cluster-only raw TCP request/response tee files are retained here, with exact relay/exec pairing and a 32 MiB per-direction connection budget. No response interpretation/translation. Anonymous fixture only, never account auth.
-Cleanup: collect all node logs first, dispose only our relays/children, remove exact labeled owned nodes/volumes/network, require exit-0 empty inventories.
-Stop rule: retain first unexpected FAIL; only a narrow evidenced fixture fix and one related new run are authorized. No unchanged old-matrix loops.
-"@)
     $config = Read-IsolationConfig
     foreach ($name in $EnvironmentNames) {
         $SavedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
@@ -475,7 +446,6 @@ Stop rule: retain first unexpected FAIL; only a narrow evidenced fixture fix and
     $listed = & $artifacts[0] --ignored --exact $TestName --list 2>&1
     if ($LASTEXITCODE -ne 0 -or @($listed | Where-Object { $_.ToString() -ceq "${TestName}: test" }).Count -ne 1) { throw 'Exact real test not registered; zero tests is not success.' }
     $defaultArguments = @('--nocapture', '--test-threads=1')
-    if ($ProviderPhase) { $defaultArguments += @('--skip', 'cluster::') }
     $defaultLines = [Collections.Generic.List[string]]::new()
     & $artifacts[0] @defaultArguments 2>&1 | ForEach-Object {
         $defaultLines.Add($_.ToString())
@@ -485,34 +455,31 @@ Stop rule: retain first unexpected FAIL; only a narrow evidenced fixture fix and
         $Summary.default_tests = 'FAIL'; throw 'Default bounded contracts failed or zero tests ran.'
     }
     $Summary.default_tests = 'PASS (real case ignored)'
-    if ($ProviderPhase) {
-        # Missing-env proof runs before image checks, relays and owned Docker/content writes.
-        $required = @('IPFS_S3_REAL_CLUSTER_PROVIDER', 'IPFS_S3_REAL_CLUSTER', 'IPFS_S3_REAL_CLUSTER_FIXTURE',
-            'IPFS_S3_REAL_CLUSTER_REST_A', 'IPFS_S3_REAL_CLUSTER_REST_B', 'IPFS_S3_REAL_CLUSTER_RPC_A',
-            'IPFS_S3_REAL_CLUSTER_RPC_B', 'IPFS_S3_REAL_CLUSTER_SOURCE_RPC', 'IPFS_S3_REAL_CLUSTER_PROXY_A')
-        foreach ($name in $required) { [Environment]::SetEnvironmentVariable($name, 'not-a-real-fixture', 'Process') }
-        $env:IPFS_S3_REAL_CLUSTER_PROVIDER = '1'
-        $env:IPFS_S3_REAL_CLUSTER = '1'
-        $env:IPFS_S3_REAL_CLUSTER_FIXTURE = Join-Path $ResultDir 'not-created-gate-fixture.json'
-        $port = 64001
-        foreach ($name in $required[3..8]) { [Environment]::SetEnvironmentVariable($name, "http://127.0.0.1:$port", 'Process'); $port++ }
-        foreach ($name in $required) {
-            $current = [Environment]::GetEnvironmentVariable($name, 'Process')
-            foreach ($case in @('missing', 'empty')) {
-                $value = if ($case -eq 'missing') { [NullString]::Value } else { ' ' }
-                [Environment]::SetEnvironmentVariable($name, $value, 'Process')
-                $negative = & $artifacts[0] --ignored --exact $TestName --nocapture --test-threads=1 2>&1
-                $negativeExit = $LASTEXITCODE
-                [Environment]::SetEnvironmentVariable($name, $current, 'Process')
-                $negativeText = ($negative | ForEach-Object { $_.ToString() }) -join "`n"
-                [IO.File]::WriteAllText((Join-Path $ResultDir "$case-$name.log"), "exit=$negativeExit`n$negativeText`n")
-                if ($negativeExit -eq 0 -or $negativeText -notmatch "(?:missing|empty) explicit fixture env: $name" -or $negativeText -notmatch 'test result: FAILED\. 0 passed; 1 failed;') {
-                    $Summary.missing_endpoints = 'FAIL'; throw "Provider env did not fail closed ($case): $name"
-                }
+    # Missing inputs must fail before Docker inspection, network calls, or content writes.
+    $required = @('IPFS_S3_REAL_CLUSTER_PROVIDER', 'IPFS_S3_REAL_CLUSTER', 'IPFS_S3_REAL_CLUSTER_FIXTURE',
+        'IPFS_S3_REAL_CLUSTER_REST_A', 'IPFS_S3_REAL_CLUSTER_REST_B', 'IPFS_S3_REAL_CLUSTER_RPC_A',
+        'IPFS_S3_REAL_CLUSTER_RPC_B', 'IPFS_S3_REAL_CLUSTER_SOURCE_RPC', 'IPFS_S3_REAL_CLUSTER_PROXY_A')
+    $env:IPFS_S3_REAL_CLUSTER_PROVIDER = '1'
+    $env:IPFS_S3_REAL_CLUSTER = '1'
+    $env:IPFS_S3_REAL_CLUSTER_FIXTURE = Join-Path $ResultDir 'not-created-gate-fixture.json'
+    $port = 64001
+    foreach ($name in $required[3..8]) { [Environment]::SetEnvironmentVariable($name, "http://127.0.0.1:$port", 'Process'); $port++ }
+    foreach ($name in $required) {
+        $current = [Environment]::GetEnvironmentVariable($name, 'Process')
+        foreach ($case in @('missing', 'empty')) {
+            $value = if ($case -eq 'missing') { [NullString]::Value } else { ' ' }
+            [Environment]::SetEnvironmentVariable($name, $value, 'Process')
+            $negative = & $artifacts[0] --ignored --exact $TestName --nocapture --test-threads=1 2>&1
+            $negativeExit = $LASTEXITCODE
+            [Environment]::SetEnvironmentVariable($name, $current, 'Process')
+            $negativeText = ($negative | ForEach-Object { $_.ToString() }) -join "`n"
+            [IO.File]::WriteAllText((Join-Path $ResultDir "$case-$name.log"), "exit=$negativeExit`n$negativeText`n")
+            if ($negativeExit -eq 0 -or $negativeText -notmatch "(?:missing|empty) explicit fixture env: $name" -or $negativeText -notmatch 'test result: FAILED\. 0 passed; 1 failed;') {
+                $Summary.missing_endpoints = 'FAIL'; throw "Provider env did not fail closed ($case): $name"
             }
         }
-        $Summary.missing_endpoints = 'PASS (nine required envs each missing+empty fail before manifest/Docker/network/write; selector/origin/duplicate-port negatives in pure default contracts)'
     }
+    $Summary.missing_endpoints = 'PASS (all required inputs reject absence and whitespace)'
     Initialize-Relay
     $kuboInspect = @(Invoke-Docker @('image', 'inspect', $KuboImage) | ConvertFrom-Json)
     $clusterInspect = @(Invoke-Docker @('image', 'inspect', $ClusterImage) | ConvertFrom-Json)
@@ -540,21 +507,18 @@ Stop rule: retain first unexpected FAIL; only a narrow evidenced fixture fix and
     $kuboAId = (Wait-Identity $rpcA $true).ID
     $kuboBId = (Wait-Identity $rpcB $true).ID
     if ($kuboAId -ceq $kuboBId) { throw 'Kubo identities are not independent.' }
-    if ($ProviderPhase) {
-        $sourceRpc = Start-Kubo $Source $config $true
-        $sourceId = (Wait-Identity $sourceRpc $true).ID
-        if ($sourceId -in @($kuboAId, $kuboBId)) { throw 'Source identity must be independent of both allocations.' }
-        # Official offline Kubo rejects this online-only API. Capture that proof.
-        [void](Invoke-Docker @('exec', $Source, 'ipfs', 'version'))
-        [void](Invoke-Docker @('top', $Source, '-eo', 'pid,args'))
-    }
+    $sourceRpc = Start-Kubo $Source $config $true
+    $sourceId = (Wait-Identity $sourceRpc $true).ID
+    if ($sourceId -in @($kuboAId, $kuboBId)) { throw 'Source identity must be independent of both allocations.' }
+    [void](Invoke-Docker @('exec', $Source, 'ipfs', 'version'))
+    [void](Invoke-Docker @('top', $Source, '-eo', 'pid,args'))
     $secret = [Convert]::ToHexString([Security.Cryptography.RandomNumberGenerator]::GetBytes(32)).ToLowerInvariant()
     $restA = Start-Cluster $ClusterA $KuboA $secret
     $clusterAId = (Wait-Identity $restA $false).id
     $restB = Start-Cluster $ClusterB $KuboB $secret "/dns4/$ClusterA/tcp/9096/p2p/$clusterAId"
     $clusterBId = (Wait-Identity $restB $false).id
     if ($clusterAId -ceq $clusterBId) { throw 'Cluster identities are not independent.' }
-    if ($ProviderPhase) { $proxyA = Start-OwnedRelay $ClusterA 9095 }
+    $proxyA = Start-OwnedRelay $ClusterA 9095
     # Readiness is not convergence. The helper requires both real /peers views to
     # converge to this exact two-peer membership before making any content write.
     $fixturePath = Join-Path $ResultDir 'fixture.json'
@@ -566,11 +530,9 @@ Stop rule: retain first unexpected FAIL; only a narrow evidenced fixture fix and
         kubo_image_id = $Summary.kubo_image_id; cluster_image_id = $Summary.cluster_image_id
         relays = @($Relays | ForEach-Object { [ordered]@{ node = $_.Node; port = $_.Port; url = $_.Url } })
     }
-    if ($ProviderPhase) {
-        $fixture.source = $Source; $fixture.source_id = $sourceId; $fixture.source_rpc = $sourceRpc
-        $fixture.source_mode = 'offline'; $fixture.proxy_a = $proxyA
-        $Summary.nodes = [ordered]@{ source = $sourceId; kubo_a = $kuboAId; kubo_b = $kuboBId; cluster_a = $clusterAId; cluster_b = $clusterBId }
-    }
+    $fixture.source = $Source; $fixture.source_id = $sourceId; $fixture.source_rpc = $sourceRpc
+    $fixture.source_mode = 'offline'; $fixture.proxy_a = $proxyA
+    $Summary.nodes = [ordered]@{ source = $sourceId; kubo_a = $kuboAId; kubo_b = $kuboBId; cluster_a = $clusterAId; cluster_b = $clusterBId }
     [IO.File]::WriteAllText($fixturePath, ($fixture | ConvertTo-Json))
     $env:IPFS_S3_REAL_CLUSTER = '1'
     $env:IPFS_S3_REAL_CLUSTER_FIXTURE = $fixturePath
@@ -578,27 +540,9 @@ Stop rule: retain first unexpected FAIL; only a narrow evidenced fixture fix and
     $env:IPFS_S3_REAL_CLUSTER_REST_B = $restB
     $env:IPFS_S3_REAL_CLUSTER_RPC_A = $rpcA
     $env:IPFS_S3_REAL_CLUSTER_RPC_B = $rpcB
-    if ($ProviderPhase) {
-        $env:IPFS_S3_REAL_CLUSTER_PROVIDER = '1'
-        $env:IPFS_S3_REAL_CLUSTER_SOURCE_RPC = $sourceRpc
-        $env:IPFS_S3_REAL_CLUSTER_PROXY_A = $proxyA
-    }
-    # Every missing-origin case must fail in from_environment before any HTTP,
-    # Docker inspection or content write. These are expected negative cases,
-    # not extra acceptance attempts or retries of a failed fixture.
-    if (-not $ProviderPhase) { foreach ($name in @('IPFS_S3_REAL_CLUSTER_REST_A', 'IPFS_S3_REAL_CLUSTER_REST_B', 'IPFS_S3_REAL_CLUSTER_RPC_A', 'IPFS_S3_REAL_CLUSTER_RPC_B')) {
-        $current = [Environment]::GetEnvironmentVariable($name, 'Process')
-        [Environment]::SetEnvironmentVariable($name, [NullString]::Value, 'Process')
-        $negative = & $artifacts[0] --ignored --exact $TestName --nocapture --test-threads=1 2>&1
-        $negativeExit = $LASTEXITCODE
-        [Environment]::SetEnvironmentVariable($name, $current, 'Process')
-        $negativeText = ($negative | ForEach-Object { $_.ToString() }) -join "`n"
-        [IO.File]::WriteAllText((Join-Path $ResultDir "missing-$name.log"), "exit=$negativeExit`n$negativeText`n")
-        if ($negativeExit -eq 0 -or $negativeText -notmatch "(?:missing|empty) explicit fixture env: $name" -or $negativeText -notmatch 'test result: FAILED\. 0 passed; 1 failed;') {
-            $Summary.missing_endpoints = 'FAIL'; throw "Missing-origin invocation did not fail closed: $name"
-        }
-    }
-    $Summary.missing_endpoints = 'PASS (four missing origins each fail before network/write)' }
+    $env:IPFS_S3_REAL_CLUSTER_PROVIDER = '1'
+    $env:IPFS_S3_REAL_CLUSTER_SOURCE_RPC = $sourceRpc
+    $env:IPFS_S3_REAL_CLUSTER_PROXY_A = $proxyA
     $testLines = [Collections.Generic.List[string]]::new()
     & $artifacts[0] --ignored --exact $TestName --nocapture --test-threads=1 2>&1 | ForEach-Object {
         $line = $_.ToString()
@@ -610,8 +554,7 @@ Stop rule: retain first unexpected FAIL; only a narrow evidenced fixture fix and
         $Summary.test = 'FAIL'; throw 'Real acceptance did not prove exactly one passed case.'
     }
     foreach ($daemon in $DaemonProcesses) {
-        $expectedStop = if ($ProviderPhase) { $Source } else { $KuboB }
-        if ($daemon.Name -cne $expectedStop -and $daemon.Process.HasExited) { throw "Unexpected daemon exit=$($daemon.Process.ExitCode): $($daemon.Name)" }
+        if ($daemon.Name -cne $Source -and $daemon.Process.HasExited) { throw "Unexpected daemon exit=$($daemon.Process.ExitCode): $($daemon.Name)" }
     }
     $Summary.test = 'PASS'
 } catch {

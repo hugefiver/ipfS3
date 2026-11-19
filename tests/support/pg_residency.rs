@@ -14,8 +14,8 @@ use ipfs_s3_gateway::{
         import::ownership::admit_content_mutation,
         object_version::{BucketVersioningState, PublicVersionId, VersionSelector},
         pinning::publication::{
-            PinTargetSpec, PublicationObject, PublicationRequest,
-            delete_version_with_leases_guarded, publish_object, publish_standard_object,
+            PinTargetSpec, PublicationObject, PublicationRequest, delete_version_guarded,
+            publish_object, publish_standard_object,
         },
     },
 };
@@ -317,7 +317,7 @@ pub async fn guarded_exact_delete(
     let guard = admit_content_mutation(db, bucket, key, None, SupersedeReason::DeleteObject, now)
         .await
         .expect("admit guarded exact delete");
-    delete_version_with_leases_guarded(
+    delete_version_guarded(
         db,
         bucket,
         key,

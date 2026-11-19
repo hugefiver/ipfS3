@@ -1,15 +1,13 @@
+use crate::store::initialization::import_requests;
 use sea_orm_migration::prelude::*;
 
 #[derive(DeriveMigrationName)]
 pub struct Migration;
-use crate::store::initialization::import_requests;
 
 #[async_trait::async_trait]
 impl super::bridge::SharedMigration for Migration {
     async fn up_body(&self, manager: &super::bridge::Manager<'_>) -> Result<(), DbErr> {
-        import_requests::migrate(manager.get_connection()).await?;
-        crate::store::pinning::management::schema::storage::install_inline(manager.get_connection())
-            .await
+        import_requests::migrate(manager.get_connection()).await
     }
 }
 #[async_trait::async_trait]
@@ -20,7 +18,7 @@ impl MigrationTrait for Migration {
     }
     async fn down(&self, _: &SchemaManager) -> Result<(), DbErr> {
         Err(DbErr::Migration(
-            "immutable documents require authorized forward repair".into(),
+            "import request storage cannot be downgraded".into(),
         ))
     }
 }

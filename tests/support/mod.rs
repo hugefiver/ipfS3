@@ -3,6 +3,7 @@ pub mod cors;
 pub mod decompress;
 pub mod import;
 pub mod lifecycle;
+pub mod pin_rows;
 pub mod pinning;
 pub mod residency;
 pub mod sigv4;

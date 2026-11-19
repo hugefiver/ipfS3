@@ -1,12 +1,11 @@
-//! New transport contracts only; no repeat of the unchanged verifier matrix.
 //! DTOs match pinned v1.1.6 source, without fixture-side protocol translation.
 use crate::{car, cluster, pinning, stored_crypto};
+use cluster::ClusterPinset;
 use cluster::provider::{
-    ClusterFailureCode, ClusterProtocol, ClusterProvider, ClusterProviderOptions,
-    ClusterResourceStatus, ClusterSource, ClusterStrategy, ClusterWriteEffect,
+    ClusterFailureCode, ClusterProtocol, ClusterProvider, ClusterProviderOptions, ClusterSource,
+    ClusterStrategy,
 };
-use cluster::{ClusterPinset, ReplicaOutcome};
-use pinning::{identity::Ownership, provider::SubmitPin};
+use pinning::provider::SubmitPin;
 use serde_json::json;
 use std::collections::BTreeMap;
 use wiremock::{
@@ -93,20 +92,12 @@ async fn cluster_provider_real_contract_car_negatives_preserve_unknown_without_f
                 true,
             ))
             .unwrap()
-            .submit_observed(request(&root))
+            .submit(request(&root))
             .await;
             assert_eq!(
-                out.result.unwrap_err().code,
+                out.unwrap_err().code,
                 ClusterFailureCode::InvalidCar,
                 "{protocol:?}/{case}"
-            );
-            assert_eq!(out.effect, ClusterWriteEffect::Unknown, "{case}");
-            assert!(out.replicas.is_none());
-            assert!(out.resources.iter().any(|r| r.resource.cid == root));
-            assert!(
-                out.resources
-                    .iter()
-                    .all(|r| r.ownership == Ownership::Unknown)
             );
             let writes = target.received_requests().await.unwrap();
             assert!(
@@ -170,27 +161,13 @@ async fn cluster_provider_real_contract_crypto_upload_and_mismatch_never_retry_c
                     stream,
                 ))
                 .unwrap()
-                .submit_observed(request(&root))
+                .submit(request(&root))
                 .await;
                 if mismatch {
-                    assert_eq!(
-                        out.result.unwrap_err().code,
-                        ClusterFailureCode::CidMismatch
-                    );
-                    assert_eq!(out.effect, ClusterWriteEffect::Unknown);
-                    assert!(out.resources.iter().any(|r| r.resource.cid == other
-                        && r.status == ClusterResourceStatus::PinAccepted));
-                    assert!(out.replicas.is_none());
+                    assert_eq!(out.unwrap_err().code, ClusterFailureCode::CidMismatch);
                 } else {
-                    assert!(out.result.is_ok(), "{out:?}");
-                    assert_eq!(out.effect, ClusterWriteEffect::Observed);
-                    assert_eq!(out.replication_outcome(), ReplicaOutcome::Unknown); // no fake N/N endpoint
+                    assert_eq!(out.unwrap().resource.cid, root);
                 }
-                assert!(
-                    out.resources
-                        .iter()
-                        .all(|r| r.ownership == Ownership::Unknown)
-                );
                 let all = target.received_requests().await.unwrap();
                 let posts: Vec<_> = all.iter().filter(|r| r.method == "POST").collect();
                 assert_eq!(posts.len(), 1, "no repost/cid/CAR fallback");
@@ -244,16 +221,9 @@ async fn cluster_provider_real_contract_cid_failure_never_reads_source_or_upload
             true,
         ))
         .unwrap()
-        .submit_observed(request(&root))
+        .submit(request(&root))
         .await;
-        assert!(out.result.is_err());
-        assert_eq!(out.effect, ClusterWriteEffect::Unknown);
-        assert!(
-            out.resources
-                .iter()
-                .all(|r| r.ownership == Ownership::Unknown)
-        );
-        assert!(out.replicas.is_none());
+        assert!(out.is_err());
         assert!(source.received_requests().await.unwrap().is_empty());
         assert_eq!(target.received_requests().await.unwrap().len(), 1);
     }

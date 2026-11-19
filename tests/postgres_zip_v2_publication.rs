@@ -1,6 +1,8 @@
 //! Explicit PostgreSQL 17/18 publication evidence, not an extrapolation from legacy ZIP batches.
 //! Run this target with IPFS_S3_TEST_POSTGRES_URL and --ignored. Each test owns
 //! only a fresh UUID schema, including its fault-injection trigger.
+#[path = "support/pin_rows.rs"]
+mod pin_rows;
 use std::{collections::BTreeMap, future::Future, panic::AssertUnwindSafe, time::Duration};
 
 use chrono::Utc;
@@ -22,14 +24,11 @@ use ipfs_s3_gateway::{
     },
     store::{
         self,
-        entities::{import_job, object_version, pin_lease, pin_lease_target, pin_provider_usage},
+        entities::{import_job, object_version},
         import::{jobs::NewImportJob, ownership},
-        pinning::{
-            ledger,
-            publication::{
-                self, PublicationObject, ZipV2Publication, ZipV2PublicationResult, ZipV2Success,
-                v2_execution as execution,
-            },
+        pinning::publication::{
+            self, PublicationObject, ZipV2Publication, ZipV2PublicationResult, ZipV2Success,
+            v2_execution as execution,
         },
         zip,
     },
@@ -258,7 +257,7 @@ struct Policy {
 }
 
 impl Policy {
-    async fn new(db: &DatabaseConnection) -> Self {
+    fn new() -> Self {
         let config = ValidatedPinningConfig::from_raw(
             &PinningConfig {
                 providers: vec![ProviderConfig {
@@ -304,9 +303,6 @@ impl Policy {
             ..Default::default()
         };
         let rules = ValidatedZipOutputRules::from_config(&zip_config, &config).unwrap();
-        ledger::register_route(db, "remote", &config.providers[0].identity)
-            .await
-            .unwrap();
         Self {
             config,
             rules,
@@ -563,13 +559,7 @@ async fn expire(db: &DatabaseConnection, claim: &execution::Claim) {
 }
 
 async fn assert_published(db: &DatabaseConnection, id: &str, expected: i64) {
-    for table in [
-        "objects",
-        "object_versions",
-        "zip_v2_targets",
-        "pin_leases",
-        "pin_lease_targets",
-    ] {
+    for table in ["objects", "object_versions", "zip_v2_targets", "pin_refs"] {
         assert_eq!(count(db, table).await, expected, "unexpected {table} count");
     }
     assert_eq!(count(db, "zip_v2_executions").await, 1);
@@ -581,8 +571,8 @@ async fn assert_published(db: &DatabaseConnection, id: &str, expected: i64) {
     assert_eq!(batch.batch.terminal_result, execution.terminal_result);
     assert_eq!(batch.entries.len(), expected as usize);
     let versions = object_version::Entity::find().all(db).await.unwrap();
-    let leases = pin_lease::Entity::find().all(db).await.unwrap();
-    let targets = pin_lease_target::Entity::find().all(db).await.unwrap();
+    let refs = pin_rows::refs(db).await;
+    let resources = pin_rows::resources(db).await;
     for entry in batch.entries {
         let version = versions
             .iter()
@@ -590,15 +580,20 @@ async fn assert_published(db: &DatabaseConnection, id: &str, expected: i64) {
             .unwrap();
         assert_eq!(Some(&version.key), entry.object_key.as_ref());
         assert!(version.is_latest && version.version_id.is_some());
-        let lease = leases
+        let reference = refs
             .iter()
-            .find(|l| Some(&l.owner_object_id) == version.object_id.as_ref())
+            .find(|r| Some(&r.owner_object_id) == version.object_id.as_ref())
             .unwrap();
-        assert_eq!(lease.source, "automatic");
-        let target = targets.iter().find(|t| t.lease_id == lease.id).unwrap();
-        assert_eq!(Some(&target.cid), entry.cid.as_ref());
-        assert_eq!(target.logical_size, 7);
-        assert_eq!(target.provider, "remote");
+        assert_eq!(reference.source, "automatic");
+        assert_eq!(Some(&reference.cid), entry.cid.as_ref());
+        let resource = resources
+            .iter()
+            .find(|r| r.provider == reference.provider && r.cid == reference.cid)
+            .unwrap();
+        assert_eq!(
+            (resource.logical_size, resource.action.as_deref()),
+            (7, Some("submit"))
+        );
     }
     assert_eq!(count(db, "standard_mutation_leases").await, 0);
     let uncleared = db
@@ -614,23 +609,14 @@ async fn assert_published(db: &DatabaseConnection, id: &str, expected: i64) {
         uncleared, 0,
         "publication left an exact mutation authority active"
     );
-    let usage = pin_provider_usage::Entity::find_by_id("remote")
-        .one(db)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        (usage.reserved_bytes, usage.reserved_pins),
-        (7 * expected, expected)
-    );
-    assert_eq!(count(db, "remote_pins").await, expected);
+    assert_eq!(resources.len(), expected as usize);
 }
 
 #[tokio::test]
 #[ignore = "requires explicitly authorized IPFS_S3_TEST_POSTGRES_URL to PostgreSQL 17 or 18"]
 async fn same_token_same_input_two_connections_commit_one_version_targets_and_quota() {
     isolated(|pg| async move {
-        let policy = Policy::new(&pg.a).await;
+        let policy = Policy::new();
         let mut a = policy.admission("request-A", "source.zip", false);
         let b = policy.admission("request-B", "source.zip", false);
         let barrier = tokio::sync::Barrier::new(2);
@@ -647,7 +633,11 @@ async fn same_token_same_input_two_connections_commit_one_version_targets_and_qu
         assert_eq!(first.id, second.id);
         a.id = first.id;
         a.captured_options = first.captured_options;
-        let outputs = [("one", "out/one", "cid-one")];
+        let outputs = [(
+            "one",
+            "out/one",
+            "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku",
+        )];
         let claim = prepare(&pg.a, &a, &outputs).await;
         assert!(
             execution::claim(&pg.b, &claim.batch_id, "gateway-B", 60)
@@ -715,7 +705,7 @@ async fn same_token_same_input_two_connections_commit_one_version_targets_and_qu
 #[ignore = "requires explicitly authorized IPFS_S3_TEST_POSTGRES_URL to PostgreSQL 17 or 18"]
 async fn source_prefix_owners_are_not_superseded_by_v2_output_admission() {
     isolated(|pg| async move {
-        let policy = Policy::new(&pg.a).await;
+        let policy = Policy::new();
         let source = published("original-source", "source.zip", "original-cid");
         publication::publish_object(
             &pg.a,
@@ -753,7 +743,7 @@ async fn source_prefix_owners_are_not_superseded_by_v2_output_admission() {
         let items = [execution::ManifestItem::Success {
             path: "one".into(),
             object_key: "out/one".into(),
-            cid: "cid-one".into(),
+            cid: "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku".into(),
             size: 7,
         }];
         let ids = BTreeMap::from([("out/one".into(), "output-mutation".into())]);
@@ -848,8 +838,8 @@ async fn source_prefix_owners_are_not_superseded_by_v2_output_admission() {
 #[ignore = "requires explicitly authorized IPFS_S3_TEST_POSTGRES_URL to PostgreSQL 17 or 18"]
 async fn final_authority_failure_rolls_back_every_row_and_valid_admitted_epoch_recovers() {
     isolated(|pg| async move {
-        let policy = Policy::new(&pg.a).await;
-        let outputs = [("one", "out/one", "cid-one")];
+        let policy = Policy::new();
+        let outputs = [("one", "out/one", "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku")];
         let admission = policy.admission("late-failure", "source.zip", true);
         let old = prepare(&pg.a, &admission, &outputs).await;
         let root = zip::claim_root(&pg.a, &old.batch_id, "root-worker", 60).await.unwrap();
@@ -866,11 +856,8 @@ async fn final_authority_failure_rolls_back_every_row_and_valid_admitted_epoch_r
                 IF NEW.state = 'completed' THEN
                     IF (SELECT count(*) FROM objects) <> 1
                         OR (SELECT count(*) FROM object_versions) <> 1
-                        OR (SELECT count(*) FROM pin_leases) <> 1
-                        OR (SELECT count(*) FROM pin_lease_targets) <> 1
-                        OR (SELECT count(*) FROM remote_pins) <> 1
-                        OR NOT EXISTS (SELECT 1 FROM pin_provider_usage WHERE provider='remote'
-                            AND reserved_bytes=7 AND reserved_pins=1)
+                        OR (SELECT count(*) FROM pin_refs) <> 1
+                        OR NOT EXISTS (SELECT 1 FROM pin_resources WHERE logical_size=7 AND action='submit')
                         OR NOT EXISTS (SELECT 1 FROM zip_batches WHERE id=NEW.id AND state='published')
                         OR NOT EXISTS (SELECT 1 FROM zip_manifest_entries WHERE batch_id=NEW.id
                             AND version_row_id IS NOT NULL)
@@ -920,8 +907,8 @@ async fn final_authority_failure_rolls_back_every_row_and_valid_admitted_epoch_r
 #[ignore = "requires explicitly authorized IPFS_S3_TEST_POSTGRES_URL to PostgreSQL 17 or 18"]
 async fn claim_expiring_behind_bucket_lock_cannot_publish_or_consume_intact_admission() {
     isolated(|pg| async move {
-        let policy = Policy::new(&pg.a).await;
-        let outputs = [("one", "out/one", "cid-one")];
+        let policy = Policy::new();
+        let outputs = [("one", "out/one", "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku")];
         let old = prepare(&pg.a, &policy.admission("expires-at-gate", "source.zip", false), &outputs).await;
         let (waiter, holder_pid) = (pid(&pg.a).await, pid(&pg.control).await);
         let holder = pg.control.begin().await.unwrap();
@@ -941,7 +928,7 @@ async fn claim_expiring_behind_bucket_lock_cannot_publish_or_consume_intact_admi
         );
         assert!(matches!(result, Err(AppError::StaleContentMutation)), "expired publication outcome: {result:?}");
         assert_eq!(rows(&pg.b).await, after_expiry, "expired publication changed more than the injected lease deadline");
-        for table in ["objects", "object_versions", "pin_leases", "pin_lease_targets", "remote_pins", "pin_provider_usage"] {
+        for table in ["objects", "object_versions", "pin_refs", "pin_resources"] {
             assert_eq!(count(&pg.b, table).await, 0, "expired claim wrote {table}");
         }
         assert_eq!(execution::read(&pg.b, &old.batch_id).await.unwrap().unwrap().state, "admitted");
@@ -959,8 +946,19 @@ async fn claim_expiring_behind_bucket_lock_cannot_publish_or_consume_intact_admi
 #[ignore = "requires explicitly authorized IPFS_S3_TEST_POSTGRES_URL to PostgreSQL 17 or 18"]
 async fn one_displaced_exact_guard_after_hint_fences_whole_publication_without_recapture() {
     isolated(|pg| async move {
-        let policy = Policy::new(&pg.a).await;
-        let outputs = [("one", "out/one", "cid-one"), ("two", "out/two", "cid-two")];
+        let policy = Policy::new();
+        let outputs = [
+            (
+                "one",
+                "out/one",
+                "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku",
+            ),
+            (
+                "two",
+                "out/two",
+                "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyk4",
+            ),
+        ];
         let old = prepare(
             &pg.a,
             &policy.admission("displaced", "source.zip", false),
@@ -1000,14 +998,7 @@ async fn one_displaced_exact_guard_after_hint_fences_whole_publication_without_r
             matches!(result, Err(AppError::StaleContentMutation)),
             "lost-guard publication outcome: {result:?}"
         );
-        for table in [
-            "objects",
-            "object_versions",
-            "pin_leases",
-            "pin_lease_targets",
-            "remote_pins",
-            "pin_provider_usage",
-        ] {
+        for table in ["objects", "object_versions", "pin_refs", "pin_resources"] {
             assert_eq!(
                 count(&pg.b, table).await,
                 0,

@@ -1,5 +1,5 @@
 use crate::pinning::provider::{
-    FindPin, PinningProvider, ProviderError, RemotePin, RemotePinStatus, SubmitPin,
+    PinningProvider, ProviderError, RemotePin, RemotePinStatus, SubmitPin,
 };
 
 pub struct NoopProvider {
@@ -9,16 +9,6 @@ pub struct NoopProvider {
 impl NoopProvider {
     pub fn new(name: String) -> Self {
         Self { name }
-    }
-
-    fn pinned(request_id: String, cid: String) -> RemotePin {
-        RemotePin {
-            request_id,
-            cid,
-            status: RemotePinStatus::Pinned,
-            raw_status: "pinned".to_owned(),
-            failure_reason: None,
-        }
     }
 }
 
@@ -30,27 +20,18 @@ impl Default for NoopProvider {
 
 #[async_trait::async_trait]
 impl PinningProvider for NoopProvider {
-    fn invocation_route(&self) -> (&'static str, &'static str) {
-        ("noop", "cid")
-    }
     fn name(&self) -> &str {
         &self.name
     }
 
     async fn submit(&self, request: SubmitPin) -> Result<RemotePin, ProviderError> {
-        Ok(Self::pinned(format!("noop:{}", request.cid), request.cid))
-    }
-
-    async fn get(&self, request_id: &str) -> Result<RemotePin, ProviderError> {
-        let cid = request_id
-            .strip_prefix("noop:")
-            .unwrap_or(request_id)
-            .to_owned();
-        Ok(Self::pinned(request_id.to_owned(), cid))
-    }
-
-    async fn find(&self, query: FindPin) -> Result<Vec<RemotePin>, ProviderError> {
-        Ok(vec![Self::pinned(format!("noop:{}", query.cid), query.cid)])
+        Ok(RemotePin {
+            request_id: format!("noop:{}", request.cid),
+            cid: request.cid,
+            status: RemotePinStatus::Pinned,
+            raw_status: "pinned".to_owned(),
+            failure_reason: None,
+        })
     }
 
     async fn unpin(&self, _request_id: &str) -> Result<(), ProviderError> {
@@ -64,7 +45,7 @@ mod tests {
 
     use crate::pinning::{
         noop::NoopProvider,
-        provider::{FindPin, PinningProvider, RemotePinStatus, SubmitPin},
+        provider::{PinningProvider, RemotePinStatus, SubmitPin},
     };
 
     #[tokio::test]
@@ -85,29 +66,6 @@ mod tests {
         assert_eq!(submitted.status, RemotePinStatus::Pinned);
         assert_eq!(submitted.raw_status, "pinned");
         assert_eq!(submitted.failure_reason, None);
-        assert_eq!(
-            provider.get("noop:bafy-target").await.unwrap(),
-            crate::pinning::provider::RemotePin {
-                request_id: "noop:bafy-target".to_owned(),
-                cid: "bafy-target".to_owned(),
-                status: RemotePinStatus::Pinned,
-                raw_status: "pinned".to_owned(),
-                failure_reason: None,
-            }
-        );
-        assert_eq!(
-            provider
-                .find(FindPin::for_job("bafy-target", "job-7"))
-                .await
-                .unwrap(),
-            vec![crate::pinning::provider::RemotePin {
-                request_id: "noop:bafy-target".to_owned(),
-                cid: "bafy-target".to_owned(),
-                status: RemotePinStatus::Pinned,
-                raw_status: "pinned".to_owned(),
-                failure_reason: None,
-            }]
-        );
-        provider.unpin("request-ignored").await.unwrap();
+        provider.unpin(&submitted.request_id).await.unwrap();
     }
 }

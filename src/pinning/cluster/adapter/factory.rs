@@ -1,4 +1,4 @@
-use super::{ClusterAdapter, unavailable};
+use super::{ClusterAdapter, write_error};
 use crate::pinning::cluster::{
     ClusterNetworkPolicy,
     config::{normalized_endpoint, validate_independence},
@@ -8,7 +8,7 @@ use crate::{
     kubo::KuboClient,
     pinning::{
         config::{ProviderKind, ValidatedProvider},
-        provider::{PinningProvider, ProviderError},
+        provider::{PinningProvider, ProviderError, ProviderErrorClass},
     },
 };
 use std::sync::Arc;
@@ -19,6 +19,11 @@ pub fn build_cluster_provider(
     provider: &ValidatedProvider,
     kubo: Option<KuboClient>,
 ) -> Result<Arc<dyn PinningProvider>, ProviderError> {
+    let unavailable = || ProviderError {
+        class: ProviderErrorClass::InvalidInput,
+        message: "Cluster route configuration does not match the provider".into(),
+        retry_after: None,
+    };
     if provider.kind != ProviderKind::Cluster {
         return Err(unavailable());
     }
@@ -49,13 +54,9 @@ pub fn build_cluster_provider(
     } else if options.strategy != ClusterStrategy::Cid {
         return Err(unavailable());
     }
-    let protocol = options.protocol;
-    let strategy = options.strategy;
-    let leaf = ClusterProvider::new(options).map_err(super::observation::write_error)?;
+    let leaf = ClusterProvider::new(options).map_err(write_error)?;
     Ok(Arc::new(ClusterAdapter {
         name: provider.name.clone(),
-        protocol,
-        strategy,
         leaf,
     }))
 }

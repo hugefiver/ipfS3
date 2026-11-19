@@ -1,9 +1,6 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::{Context, anyhow};
-use chrono::Duration as ChronoDuration;
-use tokio::sync::{Mutex, RwLock, Semaphore};
-use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{DecompressZipConfig, OptionalPinControlMode};
@@ -19,13 +16,11 @@ use crate::pinning::{
     zip_policy::{ValidatedZipOutputRules, ZipOutputRuleConfig},
 };
 use crate::store::Store;
-use crate::store::pinning::jobs::POLL_INTERVAL;
 use crate::zip::extract::ZipExtractionLimits;
 
 pub use crate::pinning::cluster::build_cluster_provider;
 pub use crate::pinning::worker::PinningWorkerHandle;
 
-/// Also used by worker historical adapters. No network IO or source-token reuse.
 pub(crate) fn build_rpc_provider(
     provider: &ValidatedProvider,
     kubo: Option<KuboClient>,
@@ -46,46 +41,12 @@ pub(crate) fn build_rpc_provider(
     .map_err(Into::into)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkerSettings {
-    pub interval: Duration,
-    pub poll_interval: Duration,
-    pub worker_concurrency: usize,
-    pub claim_limit: u64,
-    pub lock_for: ChronoDuration,
-    pub base_backoff: Duration,
-    pub max_backoff: Duration,
-    pub max_attempts: u32,
-    pub shutdown_grace: Duration,
-}
-
 pub struct PinningCoordinator {
-    source_kubo: Option<KuboClient>,
     decompress_zip_config: DecompressZipConfig,
     zip_output_rules: ValidatedZipOutputRules,
     policy: PinPolicyEvaluator,
-    policy_providers: HashMap<String, Vec<String>>,
     providers: HashMap<String, Arc<dyn PinningProvider>>,
-    settings: WorkerSettings,
-    pub(crate) http_slots: Arc<Semaphore>,
-    provider_runtime: HashMap<String, ProviderRuntime>,
-    identities: HashMap<String, ProviderIdentity>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProviderHealth {
-    Healthy,
-    Degraded,
-    Terminal,
-}
-
-#[derive(Debug, Clone)]
-pub struct ProviderRuntime {
-    pub priority: u32,
-    pub concurrency: Arc<Semaphore>,
-    pub min_request_interval: Duration,
-    pub health: Arc<RwLock<ProviderHealth>>,
-    pub(crate) next_request_at: Arc<Mutex<Option<Instant>>>,
+    request_intervals: HashMap<String, Duration>,
 }
 
 /// Resolve the physical allocation namespace and reject incompatible aliases.
@@ -137,7 +98,7 @@ pub fn normalize_validated_config(
             }
             if existing != &alias {
                 return Err(anyhow!(
-                    "aliases in the same Cluster pinset must agree on transport, credentials and confirmation"
+                    "aliases in the same Cluster pinset must agree on transport and credentials"
                 ));
             }
         } else {
@@ -240,41 +201,16 @@ impl PinningCoordinator {
         mode: OptionalPinControlMode,
         zip: &DecompressZipConfig,
     ) -> anyhow::Result<Arc<Self>> {
-        // Resolve aliases before policy evaluation: all later target, quota and
-        // job keys use the same physical resource namespace.
         let config = normalize_validated_config(config)?;
         let zip_output_rules = ValidatedZipOutputRules::from_config(zip, &config)?;
-        let claim_limit = config
-            .worker_concurrency
-            .checked_mul(2)
-            .and_then(|limit| u64::try_from(limit).ok())
-            .ok_or_else(|| anyhow!("worker claim limit overflow"))?;
-        let settings = WorkerSettings {
-            interval: Duration::from_secs(config.worker_interval.as_seconds()),
-            poll_interval: POLL_INTERVAL,
-            worker_concurrency: config.worker_concurrency,
-            claim_limit,
-            lock_for: ChronoDuration::seconds(30),
-            base_backoff: Duration::from_secs(1),
-            max_backoff: Duration::from_secs(300),
-            max_attempts: 8,
-            shutdown_grace: Duration::from_secs(30),
-        };
-        let policy_providers = config
-            .policies
-            .iter()
-            .map(|policy| (policy.identity.clone(), policy.providers.clone()))
-            .collect();
         let mut providers: HashMap<String, Arc<dyn PinningProvider>> = HashMap::new();
-        let mut provider_runtime = HashMap::new();
-        let mut identities = HashMap::new();
+        let mut request_intervals = HashMap::new();
 
         for provider in &config.providers {
             let name = provider.name.clone();
-            if identities.contains_key(&name) {
+            if providers.contains_key(&name) {
                 continue;
             }
-            identities.insert(name.clone(), provider.identity.clone());
             let kind = provider.kind;
             let min_request_interval = match kind {
                 ProviderKind::Noop => Duration::ZERO,
@@ -285,16 +221,7 @@ impl PinningCoordinator {
                     1.0 / f64::from(provider.requests_per_second.unwrap_or(1)),
                 ),
             };
-            provider_runtime.insert(
-                name.clone(),
-                ProviderRuntime {
-                    priority: provider.limits.priority,
-                    concurrency: Arc::new(Semaphore::new(settings.worker_concurrency)),
-                    min_request_interval,
-                    health: Arc::new(RwLock::new(ProviderHealth::Healthy)),
-                    next_request_at: Arc::new(Mutex::new(None)),
-                },
-            );
+            request_intervals.insert(name.clone(), min_request_interval);
             let implementation: Arc<dyn PinningProvider> = match provider.kind {
                 ProviderKind::Cluster => build_cluster_provider(provider, kubo.clone())?,
                 ProviderKind::IpfsRpc => Arc::new(build_rpc_provider(provider, kubo.clone())?),
@@ -324,25 +251,18 @@ impl PinningCoordinator {
                 )),
                 ProviderKind::Noop => Arc::new(NoopProvider::new(name.clone())),
             };
-            if providers.insert(name.clone(), implementation).is_some() {
-                return Err(anyhow!("duplicate validated provider `{name}`"));
-            }
+            providers.insert(name, implementation);
         }
 
         Ok(Arc::new(Self {
-            source_kubo: kubo,
             decompress_zip_config: zip.clone(),
             zip_output_rules,
             policy: PinPolicyEvaluator {
                 config,
                 optional_control: mode,
             },
-            policy_providers,
             providers,
-            http_slots: Arc::new(Semaphore::new(settings.worker_concurrency)),
-            settings,
-            provider_runtime,
-            identities,
+            request_intervals,
         }))
     }
 
@@ -360,10 +280,6 @@ impl PinningCoordinator {
     /// Internal-only: contains resolved provider tokens; never log or expose over HTTP.
     pub fn effective_config(&self) -> &ValidatedPinningConfig {
         &self.policy.config
-    }
-
-    pub(crate) fn management_source(&self) -> Option<&KuboClient> {
-        self.source_kubo.as_ref()
     }
 
     pub fn control_mode(&self) -> OptionalPinControlMode {
@@ -391,210 +307,21 @@ impl PinningCoordinator {
     }
 
     pub fn provider(&self, name: &str) -> Option<Arc<dyn PinningProvider>> {
-        self.providers.get(self.route_key(name)?).cloned()
+        self.providers.get(name).cloned()
     }
 
-    pub fn provider_identity(&self, key: &str) -> Option<&ProviderIdentity> {
-        self.identities.get(self.route_key(key)?)
-    }
-
-    fn route_key<'a>(&'a self, key: &'a str) -> Option<&'a str> {
-        if self.identities.contains_key(key) {
-            return Some(key);
-        }
-        self.identities
-            .iter()
-            .filter(|(_, identity)| identity.allocation_key() == key)
-            .min_by_key(|(_, identity)| &identity.provider_id)
-            .map(|(key, _)| key.as_str())
-    }
-
-    /// Register the current allocation routes before accepting publications.
-    /// Existing resource snapshots are never overwritten by this operation.
-    pub async fn register_identities(&self, store: &Store) -> crate::error::AppResult<()> {
-        use crate::store::pinning::management::records::{DecodeWork, SharedDecodeBudget};
-        // Match provider construction: canonical order, first alias per allocation.
-        // The validated route also captures its confirmation requirement.
-        let mut registered = std::collections::HashSet::new();
-        for provider in &self.effective_config().providers {
-            if !registered.insert(&provider.name) {
-                continue;
-            }
-            let work = SharedDecodeBudget::default();
-            let tx = store.begin_runtime(DecodeWork::shared(&work)).await?;
-            crate::store::pinning::ledger::register_configured_route_in_transaction(
-                &tx,
-                &provider.name,
-                provider,
-            )
-            .await?;
-            tx.commit().await?;
-        }
-        Ok(())
-    }
-
-    pub fn settings(&self) -> &WorkerSettings {
-        &self.settings
-    }
-
-    pub fn provider_runtime(&self, name: &str) -> Option<&ProviderRuntime> {
-        self.provider_runtime.get(self.route_key(name)?)
-    }
-
-    /// Only a caller with a verified original job/slot may use this adapter.
-    /// Alias labels can change in a canonical domain; account, resource family,
-    /// credentials, endpoint revision and the frozen reader remain exact.
-    pub(crate) fn historical_runtime_key(
-        &self,
-        key: &str,
-        route: &crate::pinning::identity::ProviderRouteSnapshot,
-    ) -> Option<&str> {
-        let provider = self
-            .effective_config()
-            .providers
-            .iter()
-            .find(|provider| provider.name == key)?;
-        let current = provider.route_snapshot();
-        if current.resource_type() != route.resource_type() {
-            return None;
-        }
-        let mut original = route.clone();
-        if crate::store::pinning::management::admission::allocation_domain(route)
-            .ok()
-            .as_deref()
-            == Some(key)
-        {
-            original.provider_id.clone_from(&current.provider_id);
-        }
-        crate::store::entities::pin_lease_requirement::contract::read_route_compatible(
-            &original, &current,
-        )
-        .then_some(provider.name.as_str())
-    }
-
-    /// One receipt-scoped pass, with the existing worker's claim/heartbeat/IO
-    /// protocol. Does not start the background worker or expire/scan old queues.
-    pub async fn management_tick(
-        &self,
-        store: &Store,
-        scope: &crate::pinning::worker::ManagementJobScope,
-        cancellation: &CancellationToken,
-    ) -> crate::error::AppResult<crate::pinning::worker::ManagementJobReport> {
-        crate::pinning::worker::management_tick(self, store, scope, cancellation).await
-    }
-
-    /// Returns the captured policy order anchored at the failed provider, excluding unhealthy
-    /// candidates. The anchor is retained even when it is terminal so the store can advance only
-    /// to lower-preference providers and never automatically fail back.
-    pub async fn ordered_failover_providers(
-        &self,
-        policy_id: &str,
-        failed_provider: &str,
-    ) -> Option<Vec<String>> {
-        let configured = self.policy_providers.get(policy_id)?;
-        let failed_index = configured
-            .iter()
-            .position(|provider| provider == failed_provider)?;
-        let mut eligible = vec![failed_provider.to_owned()];
-        for provider in &configured[failed_index + 1..] {
-            if !self
-                .provider_limits()
-                .get(provider)
-                .is_some_and(|limits| limits.enabled)
-            {
-                continue;
-            }
-            let Some(runtime) = self.provider_runtime.get(provider) else {
-                continue;
-            };
-            if *runtime.health.read().await == ProviderHealth::Healthy {
-                eligible.push(provider.clone());
-            }
-        }
-        Some(eligible)
+    pub(crate) fn request_interval(&self, name: &str) -> Duration {
+        self.request_intervals[name]
     }
 
     pub fn start(self: &Arc<Self>, store: Store, parent: CancellationToken) -> PinningWorkerHandle {
         crate::pinning::worker::start(self.clone(), store, parent)
     }
-
-    #[cfg(test)]
-    pub(crate) fn replace_provider_for_test(
-        coordinator: &mut Arc<Self>,
-        name: &str,
-        provider: Arc<dyn PinningProvider>,
-    ) {
-        Arc::get_mut(coordinator)
-            .expect("test coordinator must not yet be shared")
-            .providers
-            .insert(name.to_owned(), provider);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn configure_worker_for_test(
-        coordinator: &mut Arc<Self>,
-        configure: impl FnOnce(&mut WorkerSettings),
-    ) {
-        let coordinator =
-            Arc::get_mut(coordinator).expect("test coordinator must not yet be shared");
-        configure(&mut coordinator.settings);
-        coordinator.http_slots = Arc::new(Semaphore::new(coordinator.settings.worker_concurrency));
-    }
-
-    #[cfg(test)]
-    pub(crate) fn configure_provider_runtime_for_test(
-        coordinator: &mut Arc<Self>,
-        name: &str,
-        concurrency: usize,
-        min_request_interval: Duration,
-    ) {
-        let runtime = Arc::get_mut(coordinator)
-            .expect("test coordinator must not yet be shared")
-            .provider_runtime
-            .get_mut(name)
-            .expect("test provider runtime must exist");
-        runtime.concurrency = Arc::new(Semaphore::new(concurrency));
-        runtime.min_request_interval = min_request_interval;
-        runtime.next_request_at = Arc::new(Mutex::new(None));
-    }
-
-    #[cfg(test)]
-    pub(crate) fn configure_policy_providers_for_test(
-        coordinator: &mut Arc<Self>,
-        policy_id: &str,
-        providers: &[&str],
-    ) {
-        let coordinator =
-            Arc::get_mut(coordinator).expect("test coordinator must not yet be shared");
-        let providers = providers
-            .iter()
-            .map(|provider| (*provider).to_owned())
-            .collect::<Vec<_>>();
-        coordinator
-            .policy_providers
-            .insert(policy_id.to_owned(), providers.clone());
-        let policies = &mut coordinator.policy.config.policies;
-        policies.retain(|policy| !(policy.bucket == "bucket" && policy.prefix == "one/"));
-        policies.insert(
-            0,
-            super::config::ValidatedPolicy {
-                identity: policy_id.to_owned(),
-                bucket: "bucket".to_owned(),
-                prefix: "one/".to_owned(),
-                trigger: super::config::PolicyTrigger::Always,
-                provider_mode: super::config::ProviderMode::One,
-                providers,
-                default_duration: super::config::LeaseDuration::parse("1h").unwrap(),
-                max_duration: super::config::LeaseDuration::parse("24h").unwrap(),
-                allow_decompressed: true,
-            },
-        );
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::PinningCoordinator;
+    use super::{Duration, PinningCoordinator};
     use crate::{
         config::{Config, OptionalPinControlMode, PinningConfig, PolicyConfig, ProviderConfig},
         pinning::{
@@ -645,7 +372,7 @@ mod tests {
     }
 
     #[test]
-    fn foundation_exposes_policy_limits_registry_settings_and_disabled_fixture() {
+    fn coordinator_exposes_configured_policy_limits_and_providers() {
         let coordinator = PinningCoordinator::build(validated_noop_fixture()).unwrap();
         assert_eq!(coordinator.control_mode(), OptionalPinControlMode::Strict);
         assert_eq!(coordinator.effective_config().policies.len(), 1);
@@ -666,42 +393,6 @@ mod tests {
         );
         assert_eq!(coordinator.provider_limits()["noop"].max_pins, 10);
         assert_eq!(coordinator.provider("noop").unwrap().name(), "noop");
-        let runtime = coordinator.provider_runtime("noop").unwrap();
-        assert_eq!(runtime.priority, 1);
-        assert_eq!(runtime.min_request_interval, std::time::Duration::ZERO);
-        assert_eq!(runtime.concurrency.available_permits(), 3);
-        assert_eq!(
-            *runtime.health.blocking_read(),
-            super::ProviderHealth::Healthy
-        );
-        assert_eq!(
-            coordinator.settings().interval,
-            std::time::Duration::from_secs(7)
-        );
-        assert_eq!(coordinator.settings().claim_limit, 6);
-        assert_eq!(coordinator.settings().worker_concurrency, 3);
-        assert_eq!(
-            coordinator.settings().lock_for,
-            chrono::Duration::seconds(30)
-        );
-        assert_eq!(
-            coordinator.settings().base_backoff,
-            std::time::Duration::from_secs(1)
-        );
-        assert_eq!(
-            coordinator.settings().max_backoff,
-            std::time::Duration::from_secs(300)
-        );
-        assert_eq!(coordinator.settings().max_attempts, 8);
-        assert_eq!(
-            coordinator.settings().shutdown_grace,
-            std::time::Duration::from_secs(30)
-        );
-        assert_eq!(
-            coordinator.settings().poll_interval,
-            std::time::Duration::from_secs(5)
-        );
-
         let disabled = PinningCoordinator::disabled_for_test();
         assert_eq!(disabled.control_mode(), OptionalPinControlMode::Strict);
         assert!(disabled.provider_limits().is_empty());
@@ -979,89 +670,12 @@ mod tests {
         .unwrap();
         let coordinator = PinningCoordinator::build(validated).unwrap();
         assert_eq!(
-            coordinator
-                .provider_runtime("pinata")
-                .unwrap()
-                .min_request_interval,
-            std::time::Duration::from_secs(1)
+            coordinator.request_interval("pinata"),
+            Duration::from_secs(1)
         );
         assert_eq!(
-            coordinator
-                .provider_runtime("filebase")
-                .unwrap()
-                .min_request_interval,
-            std::time::Duration::from_millis(250)
-        );
-    }
-
-    #[tokio::test]
-    async fn failover_order_never_moves_backward_and_skips_disabled_or_degraded_candidates() {
-        let provider = |name: &str, priority: u32, enabled: bool| ProviderConfig {
-            name: name.to_owned(),
-            kind: "noop".to_owned(),
-            token_env: None,
-            endpoint: None,
-            api: None,
-            strategy: None,
-            upload_endpoint: None,
-            cluster: None,
-            enabled,
-            priority,
-            max_bytes: 1_000,
-            max_pins: 10,
-            requests_per_second: None,
-        };
-        let validated = ValidatedPinningConfig::from_raw(
-            &PinningConfig {
-                worker_interval: "1s".to_owned(),
-                worker_concurrency: 2,
-                providers: vec![
-                    provider("primary", 1, true),
-                    provider("degraded", 2, true),
-                    provider("disabled", 3, false),
-                    provider("fallback", 4, true),
-                ],
-                policies: vec![PolicyConfig {
-                    bucket: "bucket".to_owned(),
-                    prefix: String::new(),
-                    trigger: "always".to_owned(),
-                    provider_mode: "one".to_owned(),
-                    providers: vec![
-                        "fallback".to_owned(),
-                        "disabled".to_owned(),
-                        "degraded".to_owned(),
-                        "primary".to_owned(),
-                    ],
-                    default_duration: "1h".to_owned(),
-                    max_duration: "2h".to_owned(),
-                    allow_decompressed: false,
-                }],
-            },
-            |_| None,
-        )
-        .unwrap();
-        let policy_id = validated.policies[0].identity.clone();
-        let coordinator = PinningCoordinator::build(validated).unwrap();
-        *coordinator
-            .provider_runtime("degraded")
-            .unwrap()
-            .health
-            .write()
-            .await = super::ProviderHealth::Degraded;
-
-        assert_eq!(
-            coordinator
-                .ordered_failover_providers(&policy_id, "primary")
-                .await
-                .unwrap(),
-            vec!["primary".to_owned(), "fallback".to_owned()]
-        );
-        assert_eq!(
-            coordinator
-                .ordered_failover_providers(&policy_id, "degraded")
-                .await
-                .unwrap(),
-            vec!["degraded".to_owned(), "fallback".to_owned()]
+            coordinator.request_interval("filebase"),
+            Duration::from_millis(250)
         );
     }
 }

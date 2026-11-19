@@ -1433,6 +1433,7 @@ mod tests {
             version_id: Set(Some("00000000-0000-4000-8000-000000000001".to_owned())),
             kind: Set("object".to_owned()),
             object_id: Set(Some("object-id".to_owned())),
+            pin_decision: Set(None),
             sequence: Set(1),
             is_latest: Set(true),
             lifecycle_age_started_at: Set(created_at),

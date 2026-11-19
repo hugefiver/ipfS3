@@ -1,512 +1,335 @@
-use super::*;
-use crate::store::{
-    entities::{
-        object, object_tag, object_version, physical_residency, pin_extension_decision,
-        residency_reference, version_residency,
-    },
-    pinning::management::{native::meter::ResidentGuard, records::DecodeWork},
-};
+use std::collections::{BTreeSet, HashMap, HashSet};
+
 use chrono::{DateTime, Utc};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DatabaseTransaction, EntityTrait, QueryFilter, Set, Statement,
+    sea_query::{CaseStatement, Expr, OnConflict},
+};
+use uuid::Uuid;
 
-mod write;
+use super::{CapturedZipPublication, PublicationObject, invalid_publication};
+use crate::{
+    error::{AppError, AppResult},
+    pinning::zip_policy::{
+        CapturedZipIntent, ZipBoundOutput, ZipSelectedLease, select_zip_intents,
+    },
+    residency::{KuboTier, ReferenceReason, StorageClass},
+    store::{
+        entities::{
+            object, object_tag, object_version, physical_residency, residency_reference,
+            version_residency,
+        },
+        object_version::{BucketVersioningState, NULL_VERSION_ID, PublicationResult},
+        zip::{VersionBinding, binding_for_published_object, publication_lease::PublicationLease},
+    },
+};
 
-pub(super) struct LockedObjects {
-    objects: Vec<object::Model>,
-    versions: Vec<object_version::Model>,
-    tags: Vec<object_tag::Model>,
-    resident: Vec<ResidentGuard>,
+const SQL_PARAMS: usize = 900;
+
+struct NewObject<'a> {
+    object: &'a PublicationObject,
+    row_id: String,
+    public_id: Option<String>,
 }
 
-pub(super) struct ObjectWriteSet {
-    pub owners: Vec<String>,
-    pub results: Vec<(String, PublicationResult)>,
-    pub outputs: Vec<ZipBoundOutput>,
-    pub source: Option<ZipBoundOutput>,
-    pub bindings: Vec<VersionBinding>,
-    new_objects: Vec<object::Model>,
-    old_objects: Vec<(object::Model, object::Model)>,
-    new_versions: Vec<object_version::Model>,
-    old_versions: Vec<(object_version::Model, object_version::Model)>,
-    removed_versions: Vec<object_version::Model>,
-    residencies: Vec<version_residency::Model>,
-    references: Vec<residency_reference::Model>,
-    decisions: Vec<pin_extension_decision::Model>,
-    old_tags: Vec<object_tag::Model>,
-    new_tags: Vec<object_tag::Model>,
-    resident: Vec<ResidentGuard>,
-}
-
-pub(super) struct PhysicalFrontier {
-    rows: BTreeMap<String, physical_residency::Model>,
-    _resident: Vec<ResidentGuard>,
-}
-
-pub(super) async fn prepare_physical<C: ConnectionTrait>(
-    db: &C,
-    cids: Vec<String>,
+pub(super) async fn publish_objects(
+    tx: &DatabaseTransaction,
+    request: &CapturedZipPublication,
+    state: BucketVersioningState,
     now: DateTime<Utc>,
-    work: DecodeWork<'_>,
-    mut maintenance: Option<&mut super::PublicationLease<'_>>,
-) -> AppResult<PhysicalFrontier> {
-    let cids = cids
-        .into_iter()
+    maintenance: &mut PublicationLease<'_>,
+    selection: &CapturedZipIntent,
+) -> AppResult<(
+    Vec<(String, PublicationResult)>,
+    Vec<VersionBinding>,
+    Vec<ZipSelectedLease>,
+)> {
+    let ordered = super::objects(request);
+    let existing = existing_keys(tx, request.capture.bucket(), &ordered, maintenance).await?;
+    prepare_hot_physical(tx, &ordered, now, maintenance).await?;
+
+    let paths: HashMap<_, _> = request
+        .manifest
+        .successful
+        .iter()
+        .map(|entry| (entry.object_key.as_str(), entry.relative_path.as_str()))
+        .collect();
+    let mut fresh = Vec::with_capacity(ordered.len() - existing.len());
+    let mut results = Vec::with_capacity(ordered.len());
+    let mut bindings = Vec::with_capacity(paths.len());
+    let mut source = None;
+    let mut outputs = Vec::with_capacity(paths.len());
+    for object in ordered {
+        let path = paths.get(object.key.as_str()).copied();
+        let (row_id, result) = if existing.contains(&object.key) {
+            maintenance.checkpoint(tx).await?;
+            let result =
+                super::super::write_object_version_and_update_lifecycle(tx, object, state, now)
+                    .await?;
+            let binding =
+                binding_for_published_object(tx, path.unwrap_or("source"), &object.id).await?;
+            (binding.version_row_id, result)
+        } else {
+            let row_id = Uuid::new_v4().to_string();
+            let public_id =
+                (state == BucketVersioningState::Enabled).then(|| Uuid::new_v4().to_string());
+            let version_id = match state {
+                BucketVersioningState::Unversioned => None,
+                BucketVersioningState::Enabled => public_id.clone(),
+                BucketVersioningState::Suspended => Some(NULL_VERSION_ID.to_owned()),
+            };
+            fresh.push(NewObject {
+                object,
+                row_id: row_id.clone(),
+                public_id,
+            });
+            (
+                row_id,
+                PublicationResult {
+                    object_id: object.id.clone(),
+                    version_id,
+                },
+            )
+        };
+        let bound = ZipBoundOutput {
+            object_id: object.id.clone(),
+            key: object.key.clone(),
+            bucket: object.bucket.clone(),
+            cid: object.cid.clone(),
+            logical_size: object.logical_size,
+            version_id: row_id,
+        };
+        if let Some(path) = path {
+            bindings.push(VersionBinding {
+                path: path.to_owned(),
+                version_row_id: bound.version_id.clone(),
+            });
+            outputs.push(bound);
+        } else {
+            source = Some(bound);
+        }
+        results.push((object.key.clone(), result));
+    }
+
+    let selected = select_zip_intents(selection, &request.manifest, source.as_ref(), &outputs)
+        .map_err(|error| invalid_publication(&error.to_string()))?;
+    let snapshots = source.into_iter().zip(selected.source_decision).chain(
+        selected
+            .output_decisions
+            .into_iter()
+            .map(|(bound, mut decision)| {
+                decision.control_revision = Uuid::new_v4().to_string();
+                (bound, decision)
+            }),
+    );
+    let mut decisions = snapshots
+        .map(|(bound, decision)| {
+            let snapshot = serde_json::to_string(&decision).map_err(|_| {
+                AppError::Internal("extension decision serialization failed".into())
+            })?;
+            Ok((bound.version_id, snapshot))
+        })
+        .collect::<AppResult<HashMap<_, _>>>()?;
+
+    insert_new_objects(tx, &fresh, &mut decisions, now, maintenance).await?;
+    update_replaced_decisions(tx, decisions, maintenance).await?;
+    if let Some(source) = &request.source
+        && !request.source_tags.is_empty()
+    {
+        object_tag::Entity::insert_many(request.source_tags.iter().map(|tag| {
+            object_tag::ActiveModel {
+                object_id: Set(source.id.clone()),
+                key: Set(tag.key.clone()),
+                value: Set(tag.value.clone()),
+            }
+        }))
+        .exec_without_returning(tx)
+        .await?;
+    }
+    Ok((results, bindings, selected.leases))
+}
+
+async fn existing_keys(
+    tx: &DatabaseTransaction,
+    bucket: &str,
+    ordered: &[&PublicationObject],
+    maintenance: &mut PublicationLease<'_>,
+) -> AppResult<HashSet<String>> {
+    let mut keys = HashSet::new();
+    for chunk in ordered.chunks(SQL_PARAMS - 1) {
+        maintenance.checkpoint(tx).await?;
+        let slots = (2..=chunk.len() + 1)
+            .map(|index| format!("${index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        // Older objects can have a current object row without a version index row.
+        let sql = format!(
+            "SELECT key FROM object_versions WHERE bucket = $1 AND key IN ({slots}) \
+             UNION SELECT key FROM objects WHERE bucket = $1 AND key IN ({slots}) AND is_latest = TRUE"
+        );
+        let values =
+            std::iter::once(bucket.into()).chain(chunk.iter().map(|o| o.key.as_str().into()));
+        for row in tx
+            .query_all(Statement::from_sql_and_values(
+                tx.get_database_backend(),
+                sql,
+                values,
+            ))
+            .await?
+        {
+            keys.insert(row.try_get("", "key")?);
+        }
+    }
+    Ok(keys)
+}
+
+async fn prepare_hot_physical(
+    tx: &DatabaseTransaction,
+    ordered: &[&PublicationObject],
+    now: DateTime<Utc>,
+    maintenance: &mut PublicationLease<'_>,
+) -> AppResult<()> {
+    let cids = ordered
+        .iter()
+        .map(|o| o.cid.as_str())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    let mut existing = BTreeMap::new();
-    let mut resident = Vec::new();
-    for chunk in cids.chunks(sql::PARAMS) {
-        let values = chunk.iter().cloned().map(Into::into).collect::<Vec<_>>();
-        let predicate = format!("tier='hot' AND cid IN ({})", sql::slots(chunk.len(), 0));
-        sql::lock(
-            db,
-            "physical_residencies",
-            &predicate,
-            values.clone(),
-            "tier,cid",
-            work,
-            maintenance.as_deref_mut(),
+    for chunk in cids.chunks(SQL_PARAMS / 8) {
+        maintenance.checkpoint(tx).await?;
+        physical_residency::Entity::insert_many(chunk.iter().map(|cid| {
+            physical_residency::ActiveModel {
+                tier: Set(KuboTier::Hot.as_db_str().to_owned()),
+                cid: Set((*cid).to_owned()),
+                node_identity: Set(None),
+                verification_state: Set("pending".to_owned()),
+                verification_receipt: Set(None),
+                verified_at: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+        }))
+        // PostgreSQL locks conflicts in the same CID order as new rows, without
+        // changing an existing physical verification receipt or timestamp.
+        .on_conflict(
+            OnConflict::columns([
+                physical_residency::Column::Tier,
+                physical_residency::Column::Cid,
+            ])
+            .update_column(physical_residency::Column::UpdatedAt)
+            .action_and_where(Expr::cust("FALSE"))
+            .to_owned(),
         )
+        .exec_without_returning(tx)
         .await?;
-        for row in sql::read::<physical_residency::Entity, _>(
-            db,
-            &predicate,
-            values,
-            "tier,cid",
-            work,
-            &mut resident,
-            maintenance.as_deref_mut(),
-        )
-        .await?
-        {
-            existing.insert(row.cid.clone(), row);
-        }
     }
-    let inserted = cids
-        .iter()
-        .filter(|cid| !existing.contains_key(*cid))
-        .map(|cid| physical_residency::Model {
-            tier: "hot".into(),
-            cid: cid.clone(),
-            node_identity: None,
-            verification_state: "pending".into(),
-            verification_receipt: None,
-            verified_at: None,
-            created_at: now,
-            updated_at: now,
-        })
-        .collect::<Vec<_>>();
-    let inserted_bytes = inserted.iter().try_fold(0usize, |total, row| {
-        total
-            .checked_add(row.cid.len())
-            .and_then(|n| n.checked_add(256))
-            .ok_or(AppError::ManagementBudget)
-    })?;
-    resident.push(sql::retain_copy(work, inserted_bytes)?);
-    sql::insert::<physical_residency::Entity, _>(db, &inserted, work, maintenance.as_deref_mut())
-        .await?;
-    existing.extend(inserted.into_iter().map(|row| (row.cid.clone(), row)));
-    let frontier = PhysicalFrontier {
-        rows: existing,
-        _resident: resident,
-    };
-    frontier.verify(db, work, maintenance).await?;
-    Ok(frontier)
+    Ok(())
 }
 
-impl PhysicalFrontier {
-    pub(super) async fn verify<C: ConnectionTrait>(
-        &self,
-        db: &C,
-        work: DecodeWork<'_>,
-        mut maintenance: Option<&mut super::PublicationLease<'_>>,
-    ) -> AppResult<()> {
-        let cids = self.rows.keys().collect::<Vec<_>>();
-        for chunk in cids.chunks(sql::PARAMS) {
-            let mut checked = Vec::new();
-            let rows = sql::read::<physical_residency::Entity, _>(
-                db,
-                &format!("tier='hot' AND cid IN ({})", sql::slots(chunk.len(), 0)),
-                chunk.iter().map(|cid| cid.as_str().into()).collect(),
-                "tier,cid",
-                work,
-                &mut checked,
-                maintenance.as_deref_mut(),
-            )
-            .await?;
-            if rows.len() != chunk.len()
-                || rows.iter().any(|row| {
-                    self.rows.get(&row.cid) != Some(row)
-                        || row.tier != "hot"
-                        || row.cid.is_empty()
-                        || match row.verification_state.as_str() {
-                            "verified" => {
-                                row.node_identity.as_ref().is_none_or(String::is_empty)
-                                    || row
-                                        .verification_receipt
-                                        .as_ref()
-                                        .is_none_or(String::is_empty)
-                                    || row.verified_at.is_none()
-                            }
-                            "pending" | "failed" => {
-                                row.node_identity.is_some()
-                                    || row.verification_receipt.is_some()
-                                    || row.verified_at.is_some()
-                            }
-                            _ => true,
-                        }
-                })
-            {
-                return Err(invalid());
+async fn insert_new_objects(
+    tx: &DatabaseTransaction,
+    fresh: &[NewObject<'_>],
+    decisions: &mut HashMap<String, String>,
+    now: DateTime<Utc>,
+    maintenance: &mut PublicationLease<'_>,
+) -> AppResult<()> {
+    for chunk in fresh.chunks(SQL_PARAMS / 14) {
+        maintenance.checkpoint(tx).await?;
+        object::Entity::insert_many(chunk.iter().map(|planned| {
+            let row = planned.object;
+            object::ActiveModel {
+                id: Set(row.id.clone()),
+                bucket: Set(row.bucket.clone()),
+                key: Set(row.key.clone()),
+                cid: Set(row.cid.clone()),
+                size: Set(row.logical_size),
+                content_type: Set(row.content_type.clone()),
+                etag: Set(row.etag.clone()),
+                metadata: Set(row.metadata.clone()),
+                encrypted: Set(row.encrypted),
+                key_wrap: Set(row.key_wrap.clone()),
+                sse_c_key_fingerprint: Set(row.sse_c_key_fingerprint.clone()),
+                multipart: Set(row.multipart),
+                is_latest: Set(true),
+                created_at: Set(now),
             }
-        }
-        Ok(())
+        }))
+        .exec_without_returning(tx)
+        .await?;
+        object_version::Entity::insert_many(chunk.iter().map(|planned| {
+            object_version::ActiveModel {
+                id: Set(planned.row_id.clone()),
+                bucket: Set(planned.object.bucket.clone()),
+                key: Set(planned.object.key.clone()),
+                version_id: Set(planned.public_id.clone()),
+                kind: Set("object".to_owned()),
+                object_id: Set(Some(planned.object.id.clone())),
+                pin_decision: Set(decisions.remove(&planned.row_id)),
+                sequence: Set(1),
+                is_latest: Set(true),
+                lifecycle_age_started_at: Set(now),
+                became_noncurrent_at: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+        }))
+        .exec_without_returning(tx)
+        .await?;
+        version_residency::Entity::insert_many(chunk.iter().map(|row| {
+            version_residency::ActiveModel {
+                version_row_id: Set(row.row_id.clone()),
+                object_id: Set(row.object.id.clone()),
+                primary_tier: Set(KuboTier::Hot.as_db_str().to_owned()),
+                storage_class: Set(StorageClass::Standard.as_db_str().to_owned()),
+                cid: Set(row.object.cid.clone()),
+                revision: Set(1),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+        }))
+        .exec_without_returning(tx)
+        .await?;
+        residency_reference::Entity::insert_many(chunk.iter().map(|row| {
+            residency_reference::ActiveModel {
+                owner_kind: Set("version".to_owned()),
+                owner_id: Set(row.row_id.clone()),
+                reason: Set(ReferenceReason::RetainedVersion.as_db_str().to_owned()),
+                version_row_id: Set(row.row_id.clone()),
+                object_id: Set(row.object.id.clone()),
+                tier: Set(KuboTier::Hot.as_db_str().to_owned()),
+                cid: Set(row.object.cid.clone()),
+                created_at: Set(now),
+            }
+        }))
+        .exec_without_returning(tx)
+        .await?;
     }
+    Ok(())
 }
 
-impl LockedObjects {
-    pub async fn load<C: ConnectionTrait>(
-        db: &C,
-        request: &CapturedZipPublication,
-        work: DecodeWork<'_>,
-        mut maintenance: Option<&mut super::PublicationLease<'_>>,
-    ) -> AppResult<Self> {
-        let mut result = Self {
-            objects: Vec::new(),
-            versions: Vec::new(),
-            tags: Vec::new(),
-            resident: Vec::new(),
-        };
-        let ordered = objects(request);
-        for chunk in ordered.chunks(sql::PARAMS - 1) {
-            let mut values = vec![request.capture.bucket().into()];
-            values.extend(chunk.iter().map(|o| o.key.clone().into()));
-            let predicate = format!("bucket=$1 AND key IN ({})", sql::slots(chunk.len(), 1));
-            let relevant = format!(
-                "{predicate} AND (is_latest=TRUE OR version_id IS NULL OR sequence=(SELECT MAX(v.sequence) FROM object_versions v WHERE v.bucket=object_versions.bucket AND v.key=object_versions.key))"
-            );
-            sql::lock(
-                db,
-                "object_versions",
-                &relevant,
-                values.clone(),
-                "bucket,key,sequence",
-                work,
-                maintenance.as_deref_mut(),
+async fn update_replaced_decisions(
+    tx: &DatabaseTransaction,
+    decisions: HashMap<String, String>,
+    maintenance: &mut PublicationLease<'_>,
+) -> AppResult<()> {
+    let decisions = decisions.into_iter().collect::<Vec<_>>();
+    for chunk in decisions.chunks(SQL_PARAMS / 3) {
+        maintenance.checkpoint(tx).await?;
+        let mut snapshots = CaseStatement::new();
+        for (row_id, decision) in chunk {
+            snapshots =
+                snapshots.case(object_version::Column::Id.eq(row_id), Expr::value(decision));
+        }
+        object_version::Entity::update_many()
+            .col_expr(
+                object_version::Column::PinDecision,
+                snapshots
+                    .finally(Expr::col(object_version::Column::PinDecision))
+                    .into(),
             )
+            .filter(object_version::Column::Id.is_in(chunk.iter().map(|(row_id, _)| row_id)))
+            .exec(tx)
             .await?;
-            result.versions.extend(
-                sql::read::<object_version::Entity, _>(
-                    db,
-                    &relevant,
-                    values.clone(),
-                    "bucket,key,sequence",
-                    work,
-                    &mut result.resident,
-                    maintenance.as_deref_mut(),
-                )
-                .await?,
-            );
-            let latest = format!("{predicate} AND is_latest=TRUE");
-            sql::lock(
-                db,
-                "objects",
-                &latest,
-                values.clone(),
-                "bucket,key,id",
-                work,
-                maintenance.as_deref_mut(),
-            )
-            .await?;
-            result.objects.extend(
-                sql::read::<object::Entity, _>(
-                    db,
-                    &latest,
-                    values,
-                    "bucket,key,id",
-                    work,
-                    &mut result.resident,
-                    maintenance.as_deref_mut(),
-                )
-                .await?,
-            );
-        }
-        let owner_ids = result
-            .objects
-            .iter()
-            .map(|row| row.id.clone())
-            .chain(
-                result
-                    .versions
-                    .iter()
-                    .filter_map(|row| row.object_id.clone()),
-            )
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        for chunk in owner_ids.chunks(sql::PARAMS) {
-            let values = chunk.iter().cloned().map(Into::into).collect::<Vec<_>>();
-            let predicate = format!("object_id IN ({})", sql::slots(chunk.len(), 0));
-            sql::lock(
-                db,
-                "object_tags",
-                &predicate,
-                values.clone(),
-                "object_id,key",
-                work,
-                maintenance.as_deref_mut(),
-            )
-            .await?;
-            result.tags.extend(
-                sql::read::<object_tag::Entity, _>(
-                    db,
-                    &predicate,
-                    values,
-                    "object_id,key",
-                    work,
-                    &mut result.resident,
-                    maintenance.as_deref_mut(),
-                )
-                .await?,
-            );
-        }
-        Ok(result)
     }
-
-    pub fn owners(&self, state: BucketVersioningState) -> Vec<String> {
-        match state {
-            BucketVersioningState::Unversioned => {
-                self.objects.iter().map(|o| o.id.clone()).collect()
-            }
-            BucketVersioningState::Enabled => Vec::new(),
-            BucketVersioningState::Suspended => self
-                .versions
-                .iter()
-                .filter(|v| v.version_id.is_none())
-                .filter_map(|v| v.object_id.clone())
-                .collect(),
-        }
-    }
-
-    pub fn plan(
-        self,
-        request: &CapturedZipPublication,
-        state: BucketVersioningState,
-        now: DateTime<Utc>,
-        work: DecodeWork<'_>,
-    ) -> AppResult<ObjectWriteSet> {
-        let current_versions = self
-            .versions
-            .iter()
-            .filter(|row| row.is_latest)
-            .map(|row| (&row.key, row))
-            .collect::<BTreeMap<_, _>>();
-        let current_objects = self
-            .objects
-            .iter()
-            .map(|row| (&row.key, row))
-            .collect::<BTreeMap<_, _>>();
-        for item in objects(request) {
-            match (
-                current_versions.get(&item.key),
-                current_objects.get(&item.key),
-            ) {
-                (None, None) => {}
-                (None, Some(_)) if state == BucketVersioningState::Unversioned => {}
-                (Some(version), Some(object))
-                    if version.kind == "object"
-                        && version.object_id.as_deref() == Some(object.id.as_str()) => {}
-                (Some(version), None)
-                    if version.kind == "delete_marker" && version.object_id.is_none() => {}
-                _ => return Err(invalid()),
-            }
-        }
-        let cloned = self.resident.iter().try_fold(0usize, |total, guard| {
-            total
-                .checked_add(guard.bytes())
-                .ok_or(AppError::ManagementBudget)
-        })?;
-        let planned = objects(request)
-            .into_iter()
-            .try_fold(0usize, |total, item| {
-                let metadata = item
-                    .metadata
-                    .as_ref()
-                    .map_or(0, |value| value.to_string().len());
-                let strings = item
-                    .id
-                    .len()
-                    .checked_add(item.bucket.len())
-                    .and_then(|n| n.checked_add(item.key.len()))
-                    .and_then(|n| n.checked_add(item.cid.len()))
-                    .and_then(|n| n.checked_add(item.etag.len()))
-                    .and_then(|n| n.checked_add(item.content_type.as_ref().map_or(0, String::len)))
-                    .and_then(|n| n.checked_add(item.key_wrap.as_ref().map_or(0, String::len)))
-                    .and_then(|n| {
-                        n.checked_add(item.sse_c_key_fingerprint.as_ref().map_or(0, String::len))
-                    })
-                    .and_then(|n| n.checked_add(metadata))
-                    .ok_or(AppError::ManagementBudget)?;
-                total
-                    .checked_add(
-                        strings
-                            .checked_mul(4)
-                            .and_then(|n| n.checked_add(1536))
-                            .ok_or(AppError::ManagementBudget)?,
-                    )
-                    .ok_or(AppError::ManagementBudget)
-            })?;
-        let owners = self.owners(state);
-        let owner_ids = owners.iter().collect::<BTreeSet<_>>();
-        let old_tags = self
-            .tags
-            .into_iter()
-            .filter(|tag| owner_ids.contains(&tag.object_id))
-            .collect();
-        let mut resident = self.resident;
-        resident.push(sql::retain_copy(
-            work,
-            cloned
-                .checked_add(planned)
-                .ok_or(AppError::ManagementBudget)?,
-        )?);
-        let mut writes = ObjectWriteSet {
-            owners,
-            results: Vec::new(),
-            outputs: Vec::new(),
-            source: None,
-            bindings: Vec::new(),
-            new_objects: Vec::new(),
-            old_objects: Vec::new(),
-            new_versions: Vec::new(),
-            old_versions: Vec::new(),
-            removed_versions: Vec::new(),
-            residencies: Vec::new(),
-            references: Vec::new(),
-            decisions: Vec::new(),
-            old_tags,
-            new_tags: Vec::new(),
-            resident,
-        };
-        for old in self.objects {
-            let mut new = old.clone();
-            new.is_latest = false;
-            writes.old_objects.push((old, new));
-        }
-        let mut sequences = BTreeMap::new();
-        for old in self.versions {
-            let next = old.sequence.checked_add(1).ok_or_else(invalid)?;
-            sequences
-                .entry(old.key.clone())
-                .and_modify(|n: &mut i64| *n = (*n).max(next))
-                .or_insert(next);
-            if state != BucketVersioningState::Enabled && old.version_id.is_none() {
-                writes.removed_versions.push(old);
-            } else if old.is_latest {
-                let mut new = old.clone();
-                new.is_latest = false;
-                new.became_noncurrent_at = Some(now);
-                new.updated_at = now;
-                writes.old_versions.push((old, new));
-            }
-        }
-        let paths = request
-            .manifest
-            .successful
-            .iter()
-            .map(|f| (&f.object_key, &f.relative_path))
-            .collect::<BTreeMap<_, _>>();
-        for item in objects(request) {
-            let row_id = uuid::Uuid::new_v4().to_string();
-            let public_id = if state == BucketVersioningState::Enabled {
-                Some(uuid::Uuid::new_v4().to_string())
-            } else {
-                None
-            };
-            writes.new_objects.push(object::Model {
-                id: item.id.clone(),
-                bucket: item.bucket.clone(),
-                key: item.key.clone(),
-                cid: item.cid.clone(),
-                size: item.logical_size,
-                content_type: item.content_type.clone(),
-                etag: item.etag.clone(),
-                metadata: item.metadata.clone(),
-                encrypted: item.encrypted,
-                key_wrap: item.key_wrap.clone(),
-                sse_c_key_fingerprint: item.sse_c_key_fingerprint.clone(),
-                multipart: item.multipart,
-                is_latest: true,
-                created_at: now,
-            });
-            writes.new_versions.push(object_version::Model {
-                id: row_id.clone(),
-                bucket: item.bucket.clone(),
-                key: item.key.clone(),
-                version_id: public_id.clone(),
-                kind: "object".into(),
-                object_id: Some(item.id.clone()),
-                sequence: sequences.get(&item.key).copied().unwrap_or(1),
-                is_latest: true,
-                lifecycle_age_started_at: now,
-                became_noncurrent_at: None,
-                created_at: now,
-                updated_at: now,
-            });
-            writes.residencies.push(version_residency::Model {
-                version_row_id: row_id.clone(),
-                object_id: item.id.clone(),
-                primary_tier: "hot".into(),
-                storage_class: "STANDARD".into(),
-                cid: item.cid.clone(),
-                revision: 1,
-                created_at: now,
-                updated_at: now,
-            });
-            writes.references.push(residency_reference::Model {
-                owner_kind: "version".into(),
-                owner_id: row_id.clone(),
-                reason: "retained_version".into(),
-                version_row_id: row_id.clone(),
-                object_id: item.id.clone(),
-                tier: "hot".into(),
-                cid: item.cid.clone(),
-                created_at: now,
-            });
-            let mut bound = candidate_binding(item);
-            bound.version_id = row_id.clone();
-            if request.source.as_ref().is_some_and(|s| s.id == item.id) {
-                writes.source = Some(bound);
-            } else {
-                writes.outputs.push(bound);
-                writes.bindings.push(VersionBinding {
-                    path: paths.get(&item.key).ok_or_else(invalid)?.to_string(),
-                    version_row_id: row_id,
-                });
-            }
-            writes.results.push((
-                item.key.clone(),
-                PublicationResult {
-                    object_id: item.id.clone(),
-                    version_id: match state {
-                        BucketVersioningState::Unversioned => None,
-                        _ => Some(public_id.unwrap_or_else(|| "null".into())),
-                    },
-                },
-            ));
-        }
-        let mut outputs = std::mem::take(&mut writes.outputs)
-            .into_iter()
-            .map(|output| (output.key.clone(), output))
-            .collect::<BTreeMap<_, _>>();
-        writes.outputs = request
-            .successes
-            .iter()
-            .map(|object| outputs.remove(&object.key).ok_or_else(invalid))
-            .collect::<AppResult<Vec<_>>>()?;
-        if !outputs.is_empty() {
-            return Err(invalid());
-        }
-        Ok(writes)
-    }
+    Ok(())
 }

@@ -6,7 +6,7 @@ use sea_orm::{
     ConnectOptions, ConnectionTrait, Database, DatabaseBackend, DatabaseConnection, Statement,
 };
 
-pub(crate) async fn isolated<F, Fut>(migrate: bool, body: F)
+pub(crate) async fn isolated<F, Fut>(body: F)
 where
     F: FnOnce(DatabaseConnection) -> Fut,
     Fut: Future<Output = ()>,
@@ -50,9 +50,7 @@ where
         db.execute_unprepared("SET statement_timeout TO '15s'")
             .await
             .unwrap();
-        if migrate {
-            store::run_migrations(&db).await.unwrap();
-        }
+        store::run_migrations(&db).await.unwrap();
         body(db.clone()).await;
         db.close().await.unwrap();
     })

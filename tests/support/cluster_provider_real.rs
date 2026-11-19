@@ -4,13 +4,13 @@ use crate::{
     car, cluster, cluster_pinning_real_fixture::RealClusterFixture, pinning, stored_crypto,
 };
 use anyhow::{Context, Result, ensure};
+use cluster::ClusterPinset;
 use cluster::provider::{
-    ClusterFailureCode, ClusterProtocol, ClusterProvider, ClusterProviderOptions,
-    ClusterResourceStatus, ClusterSource, ClusterStrategy, ClusterWriteEffect,
+    ClusterFailureCode, ClusterProtocol, ClusterProvider, ClusterProviderOptions, ClusterSource,
+    ClusterStrategy,
 };
-use cluster::{ClusterPinset, ReplicaOutcome};
 use futures_util::StreamExt;
-use pinning::{identity::Ownership, provider::SubmitPin};
+use pinning::provider::SubmitPin;
 use reqwest::{Client, Method};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -350,7 +350,6 @@ impl Fixture {
             }
             .into(),
             pinset: ClusterPinset::new("cluster-real", self.owned.run_id())?,
-            min_replicas: 2,
             allow_private_network: true,
             stream_channels: true,
             ..ClusterProviderOptions::default()
@@ -398,7 +397,7 @@ impl Fixture {
         );
         let out = self
             .provider(protocol, ClusterStrategy::Upload)?
-            .submit_observed(submit(&dag.cid))
+            .submit(submit(&dag.cid))
             .await;
         self.owned.record(
             "upload-mismatch-no-fallback",
@@ -407,20 +406,7 @@ impl Fixture {
                 dag.name, dag.cid
             ),
         )?;
-        ensure!(out.result.as_ref().err().map(|e| e.code) == Some(ClusterFailureCode::CidMismatch));
-        ensure!(out.effect == ClusterWriteEffect::Unknown && out.replicas.is_none());
-        ensure!(
-            out.resources
-                .iter()
-                .all(|r| r.ownership == Ownership::Unknown)
-        );
-        ensure!(out.resources.iter().any(|r| r.resource.cid == dag.cid));
-        ensure!(
-            out.resources
-                .iter()
-                .any(|r| r.resource.cid == expected_other
-                    && r.status == ClusterResourceStatus::PinAccepted)
-        );
+        ensure!(out.unwrap_err().code == ClusterFailureCode::CidMismatch);
         self.assert_original_root_absent(&dag).await?;
         // Audit the real unexpected DAG too, without making the requested job a
         // success. This source-only default import is AFTER the actual provider
@@ -445,12 +431,7 @@ impl Fixture {
             protocol,
             strategy: ClusterStrategy::Upload,
         };
-        self.fresh_complete(
-            &self.provider(protocol, ClusterStrategy::Cid)?,
-            &unexpected,
-            "unexpected-cid-audit-only",
-        )
-        .await?;
+        self.wait_for_dag(&unexpected).await?;
         Ok((dag, unexpected))
     }
 
@@ -492,66 +473,24 @@ impl Fixture {
         };
         self.assert_absent(&dag).await?;
         let provider = self.provider(protocol, ClusterStrategy::Cid)?;
-        let out = provider.submit_observed(submit(&dag.cid)).await;
+        let out = provider.submit(submit(&dag.cid)).await;
         self.owned.record(
             "cid-source-only-no-fallback",
             &format!("case={} result={out:?}", dag.name),
         )?;
-        ensure!(
-            out.result.is_ok() && out.effect == ClusterWriteEffect::Observed,
-            "CID registration failed: {out:?}"
-        );
-        ensure!(out.replication_outcome() != ReplicaOutcome::Complete);
-        ensure!(
-            out.resources
-                .iter()
-                .all(|r| r.ownership == Ownership::Unknown && r.strategy == ClusterStrategy::Cid)
-        );
-        ensure!(provider.observe(&dag.cid).await.outcome() != ReplicaOutcome::Complete);
+        ensure!(out?.resource.cid == dag.cid);
         self.assert_absent(&dag).await?;
         Ok(dag)
     }
 
-    async fn fresh_complete(
-        &self,
-        provider: &ClusterProvider,
-        dag: &Dag,
-        phase: &str,
-    ) -> Result<()> {
+    async fn wait_for_dag(&self, dag: &Dag) -> Result<()> {
         self.owned
             .wait_for_pinned(self.owned.rest_a(), &dag.cid, 2)
             .await?;
         self.owned
             .wait_for_pinned(self.owned.rest_b(), &dag.cid, 2)
             .await?;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
-        loop {
-            let proof = provider.observe(&dag.cid).await;
-            self.owned
-                .record(phase, &format!("{} {} fresh={proof:?}", dag.name, dag.cid))?;
-            if proof.outcome() == ReplicaOutcome::Complete {
-                let evidence = proof.evidence().context("Complete without evidence")?;
-                ensure!(
-                    evidence.required_replicas == 2
-                        && evidence.pinned_peers == self.owned.expected_peers()
-                );
-                ensure!(evidence.allocation.peers == self.owned.expected_peers());
-                ensure!(
-                    evidence.allocation.replication_factor_min == 2
-                        && evidence.allocation.replication_factor_max == 2
-                );
-                println!(
-                    "{phase} case={} cid={} REST=2/2 fresh=Complete allocated_peers={:?}",
-                    dag.name, dag.cid, evidence.pinned_peers
-                );
-                return Ok(());
-            }
-            ensure!(
-                tokio::time::Instant::now() < deadline,
-                "fresh provider proof never reached actual 2/2"
-            );
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
+        Ok(())
     }
 
     async fn verify_offline(&self, dag: &Dag) -> Result<()> {
@@ -691,7 +630,7 @@ pub async fn acceptance() -> Result<()> {
     }
     for dag in &dags {
         let provider = fixture.provider(dag.protocol, dag.strategy)?;
-        let observation = provider.submit_observed(submit(&dag.cid)).await;
+        let observation = provider.submit(submit(&dag.cid)).await;
         fixture.owned.record(
             "provider-submit",
             &format!(
@@ -699,37 +638,8 @@ pub async fn acceptance() -> Result<()> {
                 dag.name, dag.protocol, dag.strategy
             ),
         )?;
-        ensure!(
-            observation.result.is_ok(),
-            "real provider write failed: {observation:?}"
-        );
-        ensure!(observation.effect == ClusterWriteEffect::Observed);
-        ensure!(
-            !observation.resources.is_empty()
-                && observation
-                    .resources
-                    .iter()
-                    .all(|r| r.ownership == Ownership::Unknown)
-        );
-        ensure!(
-            observation.result.as_ref().unwrap().resource.cid == dag.cid,
-            "original CID changed"
-        );
-        if observation.replication_outcome() == ReplicaOutcome::Complete {
-            ensure!(
-                observation
-                    .replicas
-                    .as_ref()
-                    .context("missing submit replicas")?
-                    .evidence()
-                    .context("missing submit evidence")?
-                    .pinned_peers
-                    == fixture.owned.expected_peers()
-            );
-        }
-        fixture
-            .fresh_complete(&provider, dag, "after-upload")
-            .await?;
+        ensure!(observation?.resource.cid == dag.cid);
+        fixture.wait_for_dag(dag).await?;
     }
     let mut source_only = Vec::new();
     let mut mismatched_originals = Vec::new();
@@ -745,14 +655,6 @@ pub async fn acceptance() -> Result<()> {
     }
     for dag in &source_only {
         fixture.assert_absent(dag).await?;
-        ensure!(
-            fixture
-                .provider(dag.protocol, ClusterStrategy::Cid)?
-                .observe(&dag.cid)
-                .await
-                .outcome()
-                != ReplicaOutcome::Complete
-        );
     }
     for dag in &dags {
         fixture.verify_offline(dag).await?;
@@ -760,16 +662,8 @@ pub async fn acceptance() -> Result<()> {
         // CID-only cannot copy source-only content with these intentionally empty
         // content swarms. Positive CID is therefore a re-pin of the DAG naturally
         // delivered by the provider (never target-preseeded), after source stop.
-        let out = provider.submit_observed(submit(&dag.cid)).await;
-        ensure!(
-            out.result.is_ok() && out.effect == ClusterWriteEffect::Observed,
-            "CID-only re-pin failed: {out:?}"
-        );
-        ensure!(
-            out.resources
-                .iter()
-                .all(|r| r.ownership == Ownership::Unknown && r.strategy == ClusterStrategy::Cid)
-        );
+        let out = provider.submit(submit(&dag.cid)).await;
+        ensure!(out.as_ref().is_ok_and(|ack| ack.resource.cid == dag.cid));
         fixture.owned.record(
             "cid-only-after-source-stop",
             &format!(
@@ -777,10 +671,7 @@ pub async fn acceptance() -> Result<()> {
                 dag.name, dag.protocol
             ),
         )?;
-        fixture
-            .fresh_complete(&provider, dag, "after-source-stop")
-            .await?;
     }
-    fixture.owned.record("acceptance-scope", "PASS: leaf Proxy+REST CAR/upload/stored-crypto/mismatch-no-fallback; cid-only re-pin after independent source stop; offline complete DAG/bytes and fresh REST 2/2; all ownership Unknown. NOT full Stage6/worker/S3/auth/account/continuous availability; no pin/rm, unpin or GC")?;
+    fixture.owned.record("acceptance-scope", "PASS: Proxy/REST CID, CAR, upload and stored bytes; independent offline DAG after source shutdown")?;
     Ok(())
 }

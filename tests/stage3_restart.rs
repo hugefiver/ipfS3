@@ -12,7 +12,9 @@ use ipfs_s3_gateway::{
     pinning::decision::{DecisionEffect, ExtensionDecision},
     store::{
         self,
-        entities::{multipart_upload, object, pin_job, pin_lease, pin_lease_target, remote_pin},
+        database_clock::database_now,
+        entities::{multipart_upload, object, object_version},
+        pinning::decision::read_for_version,
     },
 };
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter};
@@ -21,6 +23,8 @@ use wiremock::{
     matchers::{method, path},
 };
 
+#[path = "support/pin_rows.rs"]
+mod pin_rows;
 #[path = "support/sigv4.rs"]
 #[allow(dead_code)]
 mod sigv4;
@@ -69,8 +73,7 @@ fn config(
     kubo: &MockServer,
     pinata: &MockServer,
     port: u16,
-    credential: u64,
-    endpoint: u64,
+    duration: &str,
 ) -> String {
     format!(
         r#"
@@ -91,8 +94,8 @@ display_name = "Test Pinata"
 backend = "pinata"
 scope = "test-account"
 storage_domain = "remote"
-credential_revision = {credential}
-endpoint_revision = {endpoint}
+credential_revision = 1
+endpoint_revision = 1
 secret_ref = "env:STAGE3_RESTART_PINATA_TOKEN"
 api_profile = "pinata-v3"
 strategy = "cid"
@@ -111,7 +114,7 @@ bucket = "{BUCKET}"
 trigger = "request"
 provider_mode = "one"
 providers = ["remote"]
-default_duration = "1h"
+default_duration = "{duration}"
 max_duration = "24h"
 [pinning]
 worker_interval = "1h"
@@ -248,27 +251,6 @@ async fn decision(db: &DatabaseConnection, id: &str) -> ExtensionDecision {
         .unwrap()
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct Rows {
-    objects: u64,
-    uploads: u64,
-    leases: u64,
-    targets: u64,
-    remotes: u64,
-    jobs: u64,
-}
-
-async fn rows(db: &DatabaseConnection) -> Rows {
-    Rows {
-        objects: object::Entity::find().count(db).await.unwrap(),
-        uploads: multipart_upload::Entity::find().count(db).await.unwrap(),
-        leases: pin_lease::Entity::find().count(db).await.unwrap(),
-        targets: pin_lease_target::Entity::find().count(db).await.unwrap(),
-        remotes: remote_pin::Entity::find().count(db).await.unwrap(),
-        jobs: pin_job::Entity::find().count(db).await.unwrap(),
-    }
-}
-
 async fn kubo_counts(kubo: &MockServer) -> [usize; 3] {
     let requests = kubo.received_requests().await.unwrap();
     ["/api/v0/cat", "/api/v0/add", "/api/v0/pin/add"].map(|path| {
@@ -280,7 +262,7 @@ async fn kubo_counts(kubo: &MockServer) -> [usize; 3] {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn accepted_mpu_survives_real_restart_and_uses_current_policy_without_digest_fence() {
+async fn accepted_mpu_survives_real_restart_and_uses_current_policy() {
     let directory = tempfile::tempdir().expect("own test files");
     let kubo = MockServer::start().await;
     let pinata = MockServer::start().await;
@@ -326,7 +308,7 @@ async fn accepted_mpu_survives_real_restart_and_uses_current_policy_without_dige
     );
     let config_file = directory.path().join("config.toml");
     let port = available_port();
-    std::fs::write(&config_file, config(&db_url, &kubo, &pinata, port, 1, 1)).unwrap();
+    std::fs::write(&config_file, config(&db_url, &kubo, &pinata, port, "1h")).unwrap();
     let mut a = start_gateway(directory.path(), &config_file, port, "process-a").await;
     let bucket = sigv4::send_sigv4(
         reqwest::Method::PUT,
@@ -346,137 +328,91 @@ async fn accepted_mpu_survives_real_restart_and_uses_current_policy_without_dige
         "bucket: {}",
         bucket.text().await.unwrap()
     );
-    let good = admit(&a.endpoint, "good").await;
-    let credential = admit(&a.endpoint, "credential").await;
-    let endpoint_id = admit(&a.endpoint, "endpoint").await;
+    let id = admit(&a.endpoint, "item").await;
     let db = store::connect_database(&db_url).await.unwrap();
-    let captured = decision(&db, &good).await;
+    let captured = decision(&db, &id).await;
     assert_eq!(captured.effect, DecisionEffect::Accepted);
     assert_eq!(captured.origin.principal_id, "test");
-    assert_eq!(captured.origin.request_id, good);
-    assert_eq!(
-        decision(&db, &credential).await.effect,
-        DecisionEffect::Accepted
-    );
-    assert_eq!(
-        decision(&db, &endpoint_id).await.effect,
-        DecisionEffect::Accepted
-    );
-    assert_eq!(
-        rows(&db).await,
-        Rows {
-            objects: 0,
-            uploads: 3,
-            leases: 0,
-            targets: 0,
-            remotes: 0,
-            jobs: 0
-        }
-    );
-    assert_eq!(kubo_counts(&kubo).await, [0, 3, 3]);
-    a.stop(); // A is fully reaped before B opens the same SQLite file.
+    assert_eq!(captured.origin.request_id, id);
+    assert_eq!(captured.effective_intents[0].duration.as_seconds(), 3600);
+    assert_eq!(object::Entity::find().count(&db).await.unwrap(), 0);
+    assert!(pin_rows::refs(&db).await.is_empty());
+    assert!(pin_rows::resources(&db).await.is_empty());
+    assert_eq!(kubo_counts(&kubo).await, [0, 1, 1]);
+    a.stop();
 
-    let mut b = start_gateway(directory.path(), &config_file, port, "process-b-stable").await;
-    assert_eq!(decision(&db, &good).await, captured);
-    let (status, body) = complete(&b.endpoint, "good", &good).await;
-    assert_eq!(status, reqwest::StatusCode::OK, "stable replay: {body}");
+    std::fs::write(&config_file, config(&db_url, &kubo, &pinata, port, "2h")).unwrap();
+    let mut b = start_gateway(directory.path(), &config_file, port, "process-b").await;
+    assert_eq!(decision(&db, &id).await, captured);
+    let before = database_now(&db).await.unwrap();
+    let (status, body) = complete(&b.endpoint, "item", &id).await;
+    let after = database_now(&db).await.unwrap();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "complete after restart: {body}"
+    );
     assert!(body.contains(CID));
     assert_eq!(
-        object::Entity::find()
-            .filter(object::Column::Key.eq("good"))
-            .count(&db)
-            .await
-            .unwrap(),
-        1
+        multipart_upload::Entity::find().count(&db).await.unwrap(),
+        0
     );
-    assert!(
-        multipart_upload::Entity::find_by_id(&good)
-            .one(&db)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    let published = rows(&db).await;
-    assert_eq!(published.objects, 1);
-    assert_eq!(published.uploads, 2);
-    assert_eq!(
-        published.leases, 1,
-        "captured pin intent must publish, not just the S3 object"
-    );
-    assert_eq!(published.targets, 1);
-    assert_eq!(published.remotes, 1);
-    assert_eq!(published.jobs, 1);
-    assert_eq!(kubo_counts(&kubo).await, [1, 4, 4]);
+    assert_eq!(kubo_counts(&kubo).await, [1, 2, 2]);
+
     let root = object::Entity::find()
-        .filter(object::Column::Key.eq("good"))
+        .filter(object::Column::Key.eq("item"))
         .one(&db)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(root.cid, CID);
     assert_eq!(root.size, PART.len() as i64);
-    let adds = kubo.received_requests().await.unwrap();
-    let adds: Vec<_> = adds
-        .iter()
-        .filter(|request| request.url.path() == "/api/v0/add")
-        .collect();
-    assert_eq!(adds.len(), 4);
+    let version = object_version::Entity::find()
+        .filter(object_version::Column::ObjectId.eq(&root.id))
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        read_for_version(&db, &version.id).await.unwrap(),
+        Some(captured.clone())
+    );
+
+    let refs = pin_rows::refs(&db).await;
+    let [reference] = refs.as_slice() else {
+        panic!("expected one published pin reference: {refs:?}");
+    };
+    assert_eq!(reference.owner_object_id, root.id);
+    assert_eq!(reference.cid, CID);
+    assert_eq!(reference.source, "manual");
+    assert_eq!(
+        reference.provider,
+        captured.effective_intents[0].providers[0]
+    );
+    let ttl = chrono::Duration::hours(2);
     assert!(
-        adds.iter().all(|request| request
-            .body
-            .windows(PART.len())
-            .any(|window| window == PART)),
+        ((before + ttl).timestamp_micros()..=(after + ttl).timestamp_micros())
+            .contains(&reference.expires_at)
+    );
+
+    let resources = pin_rows::resources(&db).await;
+    let [resource] = resources.as_slice() else {
+        panic!("expected one published pin resource: {resources:?}");
+    };
+    assert_eq!(resource.provider, reference.provider);
+    assert_eq!(resource.cid, reference.cid);
+    assert_eq!(resource.logical_size, root.size);
+
+    let requests = kubo.received_requests().await.unwrap();
+    assert!(
+        requests
+            .iter()
+            .filter(|request| request.url.path() == "/api/v0/add")
+            .all(|request| request
+                .body
+                .windows(PART.len())
+                .any(|window| window == PART)),
         "part and reassembled root add must contain the entire payload"
     );
     b.stop();
-
-    for (label, duration, key, id) in [
-        ("priority-quota", "2h", "credential", &credential),
-        ("policy-duration", "3h", "endpoint", &endpoint_id),
-    ] {
-        std::fs::write(
-            &config_file,
-            config(&db_url, &kubo, &pinata, port, 1, 1)
-                .replace("priority = 1", "priority = 9")
-                .replace("max_bytes = 100000", "max_bytes = 200000")
-                .replace("max_pins = 100", "max_pins = 200")
-                .replace(
-                    "default_duration = \"1h\"",
-                    &format!("default_duration = \"{duration}\""),
-                ),
-        )
-        .unwrap();
-        let mut changed = start_gateway(directory.path(), &config_file, port, label).await;
-        assert_eq!(decision(&db, id).await.effect, DecisionEffect::Accepted);
-        let before_kubo = kubo_counts(&kubo).await;
-        let (status, body) = complete(&changed.endpoint, key, id).await;
-        assert_eq!(status, reqwest::StatusCode::OK, "{label}: {body}");
-        let object = object::Entity::find()
-            .filter(object::Column::Key.eq(key))
-            .one(&db)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(object.cid, CID);
-        let lease = pin_lease::Entity::find()
-            .filter(pin_lease::Column::OwnerObjectId.eq(&object.id))
-            .one(&db)
-            .await
-            .unwrap()
-            .unwrap();
-        let expected_seconds = if duration == "2h" { 7200 } else { 10800 };
-        assert_eq!(
-            (lease.expires_at - lease.created_at).num_seconds(),
-            expected_seconds
-        );
-        let after_kubo = kubo_counts(&kubo).await;
-        assert_eq!(after_kubo, before_kubo.map(|count| count + 1));
-        changed.stop();
-    }
-    let completed = rows(&db).await;
-    assert_eq!(completed.objects, 3);
-    assert_eq!(completed.uploads, 0);
-    assert_eq!(completed.leases, 3);
-    drop(db);
-    // All child processes are reaped before the mock servers and temporary directory drop.
 }

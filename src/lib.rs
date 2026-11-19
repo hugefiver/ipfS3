@@ -6,10 +6,6 @@
 extern crate self as ipfs_s3_gateway;
 
 #[cfg(test)]
-#[path = "../tests/support/stage7_management_actions.rs"]
-pub mod stage7_management_test_support;
-
-#[cfg(test)]
 #[path = "../tests/support/sql_trace.rs"]
 pub(crate) mod sql_trace;
 

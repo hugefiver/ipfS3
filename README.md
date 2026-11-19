@@ -610,17 +610,13 @@ physical reclaim, even after a later object delete. ZIP extraction doesn't
 support SSE-S3 or SSE-C. Root-only recovery uses the stored manifest and never
 republishes the source or extracted object versions.
 
-### ZIP output pinning and configuration migration (R25)
+### ZIP output pinning
 
-Legacy direct PUT, MPU Complete and durable ZIP import use one publication
-core: capture authorization at admission, bind the final successful manifest to
-the exact persisted object versions, then publish objects and their pin intents
-atomically. Automatic output pinning selects only those successful extracted
-files, never the archive, UnixFS root, failed entries, empty directories or the
-prefix itself. Ordinary non-ZIP behavior doesn't change. An explicitly requested
-manual `content=decompressed` group remains archive-owned; its existing
-cancellation scope doesn't become a prefix-wide cancellation of automatic
-output leases.
+Direct PUT, multipart completion and durable ZIP import publish objects and
+their pin references atomically. Automatic output pinning selects successfully
+extracted files, not the archive, UnixFS root, failed entries, empty directories
+or prefix. A manual `content=decompressed` request addresses the archive's
+selected outputs; cancelling it does not release other files' references.
 
 `[decompress_zip].auto_pin_outputs` is the single ZIP automatic-output switch:
 omitted means the safe default, off; explicit `false` disables ZIP automatic
@@ -633,21 +629,15 @@ authorized v2 target plan.
 When `pin_output_rules` is omitted, selection uses ordinary ordered,
 first-match `pinning.policies`. Explicit `pin_output_rules = []` authorizes no
 outputs. With rules supplied, unmatched outputs are excluded and any matching
-ZIP deny vetoes an allow. A globally denied output set creates zero automatic
-jobs. Each selected provider still has its captured TTL limits and byte/pin
-quota boundaries; logical output leases don't remove shared-CID accounting or
-turn queue admission into remote completion.
+ZIP deny vetoes an allow. Only eligible outputs get automatic pin references;
+publication does not wait for the provider.
 
 An old configuration with effective Always remote policies or supplied v2
 `pin_output_rules` must choose `auto_pin_outputs` explicitly. Startup reports a
 migration error if the field is omitted, rather than silently sending newly
 selected outputs to a remote provider. Set `true` to adopt extracted-output
 automatic semantics, or `false` to disable ZIP automatic outputs without
-changing ordinary objects or manual requests. Existing captures and historical
-plans keep their recorded controls, policy, provider routes and limits across
-restart and replay; they aren't reinterpreted using the current configuration.
-Missing or unknown historical evidence requires `needs_attention`, not guessed
-defaults.
+changing ordinary objects or manual requests.
 
 ### ZIP v2 request and replay contract
 
@@ -764,807 +754,42 @@ procedure. Changing this value can make an existing SSE-C object inaccessible.
 
 ## Remote Pinning
 
-Remote pinning is best effort. A successful S3 write commits the object and its
-pinning intent without waiting for a provider. The gateway tries the configured
-providers while the lease is active. A file may reach expiry without a remote
-copy, even if it never left the queue. `pinned` reports an observed result, not
-a promise made at upload time.
-
-When a lease ends, the gateway stops trying to create its pins. It releases
-unused reservations locally and cleans up attributable remote pins after the
-last reference on that provider ends. A late receipt can identify a pin for
-cleanup; it does not renew the lease.
-
-Soft leases, including manual leases, are eligible for quota eviction only when
-their resource is eligible for managed cleanup. Retain/external/unknown resources
-cannot be evicted to manufacture headroom. Local
-quota admission counts each unique CID by its logical S3 byte size and one pin;
-shared leases do not multiply that local charge. This is a soft local control,
-not provider billing or usage truth. Expiry, eviction, an explicit unpin, and
-remote provider release never delete S3 metadata or IPFS content and never
-remove the gateway's local Kubo pins. `UploadPart` is never remotely pinned.
-Objects published by `PutObject`, `CopyObject`, or `CompleteMultipartUpload`
-are evaluated against the configured destination policy; evaluation can
-legitimately produce no remote work when no rule or manual request matches.
-
-Provider credentials are never literal config values. Each provider's
-`token_env` names an environment variable such as `PINATA_JWT` or
-`FILEBASE_PINNING_TOKEN`. Pinata and Filebase use their built-in public
-endpoints by default. Pinata also supports `api = "v3" | "legacy"` and
-`strategy = "cid" | "upload"`. The CID strategy asks Pinata to pin the gateway's
-existing Kubo CID; the upload strategy streams the object back from local Kubo
-and uploads it to Pinata, which can support free-plan accounts that reject
-pin-by-CID. Uploads have a 30s **idle** deadline, not a short total deadline:
-the whole multipart send (including transport backpressure), response headers,
-and response body through EOF must keep progressing. Active large transfers can
-outlive 30s. A timed-out/cancelled dispatch may already have created a resource;
-it is not permission to upload again. The upload strategy requires the same
-CID the gateway computed, otherwise the submit fails permanently. An `endpoint`
-override is only for tests or private compatible services; Pinata V3 upload
-endpoint overrides use `upload_endpoint`.
-
-### Pinning Stage 1 upgrade and recovery safety
-
-Before applying `m20260920_000001_pin_submit_history`, **stop and drain every old
-gateway writer and pinning worker**, including other replicas. Back up the DB;
-then migrate and start only upgraded binaries. This is a stop-the-world upgrade,
-not mixed-version rolling operation: an old writer cannot produce the required
-execution history. Do not change provider account/scope or endpoint during this
-upgrade. The Stage 2 identity migration below adds scope evidence without guessing
-it for these historical records.
-
-`pin_submit_history` records the actual API/strategy selected before dispatch,
-effect certainty, finite safe first/last error evidence, and separate submission
-and recovery budgets. Its counters count durable **dispatch intents**, not HTTP
-requests or billing: crashes can interrupt an intent before network IO and one
-Find can paginate. New recovery uses the historical route, not the current
-strategy. Existing unfinished jobs with no history are isolated as
-`unknown / needs_attention`; their original API is never guessed from TOML.
-
-401 blocks the credential runtime until an explicit configuration repair and
-restart. Known plan/permission 403 and unknown 403 remain distinct; they block
-that submission, not unrelated upload/list operations. Definitive rejection
-does not trigger recovery Find. Explicit transient non-creation retries with
-backoff; uncertain dispatches reconcile first. Automatic recovery is bounded by
-eight recovery attempts and one hour from initial dispatch; new dispatches also
-have an eight-attempt ceiling. Exhaustion becomes `needs_attention`, not absent.
-
-Blocked/attention rows preserve lease/remote responsibility and reservations.
-For compatibility, the corresponding `pin_jobs` row is **running with a NULL
-lock**, deliberately unclaimable by old and new workers while retaining the
-existing no-request ambiguity barrier. Do not manually clear its phase, delete
-its history, release quota, or set it pending as a retry procedure. Stage 1 has
-no new public management/reapply API; its internal
-`resume_rejected_submit_after_repair` hook accepts only an explicitly repaired,
-definitively uncreated blocked call on the same historical route. It cannot
-resume unknown effects. Public reconciliation/repair tooling is a follow-up,
-not automatic strategy fallback. Do not mix up accepted local
-publication, a remote submission, and a confirmed remote pin.
-
-Rollback requires stopping allocation and workers first. The down migration
-refuses unsettled/orphaned histories rather than erasing remote responsibility.
-Keep the upgraded database and historical routes until reconciliation is
-complete; do not drop the history table to force an old binary to run.
-
-### Stable identities, ownership and the resource ledger (Stage 2)
-
-Use the optional **top-level** `[pinning_identity]` section with one
-`[[pinning_identity.providers]]` entry for every configured provider. See the
-complete example in `config.example.toml`. `config_name` joins the existing
-`[[pinning.providers]].name`; policies still refer to that config name.
-
-- `provider_id` is a stable administrative identity, not a display label.
-  `display_name` and `config_name` may be renamed without changing existing
-  resource/job keys. `backend` is `pinata`, `filebase`, `kubo` or `noop`.
-- `scope` identifies an account/bucket/pinset, and `storage_domain` identifies
-  its independent storage domain. They are administrator assertions, **not**
-  derived from the URL, token or a token hash. Moving to another account/bucket
-  requires a different scope. Explicit identities require
-  `primary_storage_domain`; matching the primary domain is rejected, not counted
-  as an independent backup. Noop remains a test provider, not a real replica.
-- `credential_revision` and `endpoint_revision` are positive administrator
-  revisions. Bump them on credential/endpoint changes; never silently change an
-  account while leaving its scope/revisions unchanged. `secret_ref` is an
-  `env:VARIABLE` reference matching `token_env`. Only the reference/revisions are
-  persisted—never credentials, credential hashes or endpoint URLs.
-- `api_profile` must match the configured implementation: `pinata-v3`,
-   `pinata-legacy`, `pinata-psa`, `filebase-psa`, `kubo`, `filebase-rpc`, or `noop`;
-   `strategy` must match the configured strategy (RPC also supports Kubo CAR).
-   No implicit strategy fallback is added.
-- After the last reference, cleanup uses the original independent storage domain.
-  For Kubo/Filebase RPC, Cluster and Pinata legacy, a matching gateway submit
-  receipt authorizes removing the CID from that backup node, including any
-  independent pin of the same CID there. A CID seen only by lookup, an adopted
-  request or an unproven historical ownership label remains visible and charged.
-  Old `cleanup = "retain"` and `"managed"` values are accepted and ignored.
-  PSA deletes by request ID. Pinata v3 cancels the original queue request or
-  deletes its associated file ID. An accepted unpin (including HTTP 202) releases
-  local quota. The gateway does not poll for physical removal or trigger GC.
-  `retired = true` prevents new allocations while keeping the configured route
-  available for historical work. Keep its credentials until cleanup is complete.
-
-Provider aliases in the same backend/scope/resource namespace share remote rows,
-locks and quota. They must agree on limits, protocol/strategy, revisions, storage
-domain. The lexically first stable provider ID is the representative;
-keep that historical ID configured (renaming it is fine). Removing it or replacing
-it with another alias is not an ownership migration. Different objects referencing
-one CID retain independent lease deadlines and share one physical reservation.
-TTL starts at the original accepted/publication time; retries and late successful
-responses never restart it. Late success records the resource even if the lease
-has already expired.
-
-`remote_pins` remains the canonical epoch/request/quota row. Its companion
-`remote_pin_ledger` stores the captured route, typed ownership/effect evidence,
-first/latest observations and errors, and separate remote-pinned, gateway-verified
-and content-verified timestamps. The latter two remain unset unless actually
-verified. Lease expiry/cancel does **not** release retain, unknown, cleanup-pending
-or failed-cleanup capacity. Only confirmed absence under the existing claim,
-generation, reference and epoch fences releases quota. Historical confirmation
-is not erased by a later unknown/error observation.
-
-Unscoped occupied rows from an older database cannot be attributed to a new
-explicit account from TOML alone. Such historical capacity blocks new explicit
-allocations until an evidenced migration is available; read-only access to old
-records remains. An already confirmed absent historical row does not block a
-new allocation. Do not clear old reservations merely to bypass this safeguard.
-
-`pin_invocation_routes` freezes each dispatched job's identity separately from
-the current resource lifetime. Confirmed release archives the old reference and
-ledger in `pin_resource_history`; a genuinely absent CID may then be allocated
-under a new credential revision without rewriting the old invocation evidence.
-
-Before `m20260920_000002_pin_identity_ledger`, stop/drain **all writers and all
-workers on all replicas**, back up the database, migrate, then start only the new
-binaries. Mixed-version rolling operation is unsupported. Existing remote rows
-keep their request IDs, epochs and reservations; because old schema has no
-trustworthy account/ownership evidence, they are quarantined as unknown, and
-unfinished jobs are made unclaimable (`running`, NULL lock). Existing Stage 1
-protocol history is preserved, but is not sufficient proof of an account scope.
-Do not fill missing history from the current TOML or clear these locks manually.
-Historical reapply/retirement management uses the separate registered
-[management CLI](#local-pinning-management-cli-stage-75), not the R26 legacy namespace
-migration CLI. Local validation and external-operation limits are documented below.
-This migration deliberately refuses downgrade: stop allocation/workers and
-preserve the ledger rather than dropping it to run old binaries.
-
-For compatibility, configurations without `[pinning_identity]` retain the old
-name-based request routing **for newly allocated work**; names are then
-immutable account identities, not renameable aliases. Do not rotate accounts or
-change those endpoints under the same legacy name. Adopt explicit identities
-before such changes. Old migrated resources are still unknown and do not gain
-delete rights from legacy compatibility. Credential revisions are administrative
-assertions; the gateway intentionally cannot detect an unannounced account change
-by hashing or inspecting a secret.
-
-Internal integration APIs (not a new public HTTP/CLI surface):
-`ValidatedPinningConfig::from_config`, `PinningCoordinator::register_identities`
-(must complete before accepting publications), `provider_identity`,
-`store::pinning::ledger::{status, lease_status, invocation_snapshot}` and typed
-`provider::{RemoteRef, QueryObservation}`. Historical PSA/Pinata get/find/unpin
-routing remains available; a missing or mismatched scope, credential revision or
-endpoint revision terminates the affected task with an error before network IO.
-A changed strategy cannot resend an old pending submit. Ambiguous calls retain
-their responsibility; supported read-only reconciliation uses their original
-protocol and resource identity without restarting terminal work.
-
-Stage 2 regression tests use real SQLite/PostgreSQL transactions and local mock
-HTTP providers, including concurrent shared-CID publication/cancel/expiry,
-renaming, revision isolation, retained capacity, cleanup-failure handling for
-independently attested ownership and late success. Current PSA responses alone
-do not supply such ownership attestation or trigger managed deletion.
-They are not evidence of a live provider account write or of remote content
-verification. No production account or remote data is touched by these tests.
-
-### Optional pin controls and local diagnostics (Stage 3)
-
-Omitting `[pinning_control]` keeps `unavailable = "strict"` for existing
-deployments. To allow an optional manual pin control to be skipped when its
-policy or provider is unavailable, set this explicitly:
-
-```toml
-[pinning_control]
-unavailable = "warn"
-```
-
-On a successful S3 write or tagging response, `x-ipfs3-pin-warning` can report
-`pin-policy-unavailable` or `pin-provider-unavailable`. A skipped request
-retains its valid tags and durable decision, but creates no executable **manual**
-pin work. A later provider addition, restart, ordinary tag edit, or copy does
-not replay that control. Inherited controls without a captured decision are
-treated as legacy unknown, not as a new manual request. Automatic `always`
-policies still apply independently: warn doesn't relax their provider set or
-turn `all` into a subset. Invalid tag structure, authentication failures,
-server-enforced restrictions, and primary Kubo/DB write failures still fail.
-Warnings aren't proof of cancellation or renewal at a remote provider.
-
-Multipart initiation captures the decision and can return the warning on a
-successful CreateMultipartUpload; completion reuses a captured skipped decision
-and returns its warning after successful publication, even if provider configuration
-changed in between. An accepted intent whose route becomes unsafe fails closed
-rather than being silently remapped. The import `202` warning describes
-admission only, not job completion or a remote pin. Successful direct ZIP
-responses can also carry the warning; the Stage 3 warning alone isn't proof
-of a Stage 4 ZIP batch or verified UnixFS root.
-
-Before accepting a new multipart upload or import with executable non-Noop
-remote intent, configure an explicit `[[pinning_identity.providers]]` entry for
-every executable configured non-Noop provider, including operator-maintained
-`credential_revision` and `endpoint_revision`. New legacy async work is refused, rather than guessed
-from a provider name. Noop and requests with no executable remote intent remain
-allowed; historical jobs retain their captured route and aren't rewritten.
-Pinning tasks resolve policies, provider order and capacity from the current
-configuration. New publications and renewals enforce current retention limits;
-existing lease expiry timestamps remain unchanged. A captured skipped or
-cancelled request is not reactivated by a configuration edit. Existing remote resources and invocations
-retain their exact account, route and epoch: an actual identity or state mismatch
-terminates the affected work with an error rather than repeatedly parking it.
-Historical cleanup responsibility is retained. See the
-[recovery and upgrade runbook](docs/pinning-recovery.md#configuration-and-terminal-errors)
-for task errors, unresolved remote effects and database upgrades.
-
-New remote submissions use an opaque UUID
-correlation; older jobs retain their original structured ID for recovery Find.
-
-Operators can run the following locally with the gateway binary. These aren't
-HTTP endpoints and don't start the gateway or run migrations:
-
-```powershell
-cargo run -- --pinning-doctor
-cargo run -- --config-explain
-cargo run -- --pinning-policy-explain my-bucket file.txt
-cargo run -- --pinning-status my-bucket file.txt
-cargo run -- --pinning-status my-bucket file.txt --version-id null --cursor 50
-```
-
-The first three load this CLI process's effective local config and report
-redacted provenance, configured routes and rule matches. They don't observe
-the running gateway or test the provider account's real permissions. Policy
-explain doesn't evaluate live tags, an object version or remote state.
-`--pinning-status` reads one bounded page of stored evidence for the current or
-specified version from the configured DB; `--cursor` is a page offset, not a
-stable continuation across concurrent writes. It doesn't query Kubo or remote
-providers. SQLite opens read-only without creating a missing file; PostgreSQL
-uses a read-only transaction. Protect local CLI and database access accordingly.
-
-For a browser to read `x-ipfs3-pin-warning`, configure the bucket's authorized
-CORS rule for that origin and method with `ExposeHeader` set to
-`x-ipfs3-pin-warning` using the signed `PutBucketCors` API. Matching rules alone
-don't expose it automatically; only the first matching bucket rule applies.
-Don't use a global wildcard or expose private headers just to read warnings.
-
-Before applying Stage 3 migrations `m20260920_000003_pin_extension_decision`,
-`m20260920_000004_multipart_pin_decision`,
-`m20260920_000005_import_pin_decision` and
-`m20260920_000006_pin_submit_correlation`, stop and drain **all old gateway writers
-and workers across replicas**, then back up and upgrade together. Never run old
-writers alongside the upgraded schema: they can't preserve captured decisions.
-Rollback is not a table drop or a return to an old writer that reinterprets raw
-tags. Stop new writes/workers, retain the decision rows and historical routes,
-and plan a compatible recovery before changing binaries. The Stage 2 rules for
-unknown ownership, retained capacity and historical routing still apply.
-
-### Explicit legacy namespace migration (R26)
-
-Legacy nonzero usage, capacity-bearing remote rows, and non-absent ledger rows
-without a captured route continue to block new allocation. Do not clear those
-rows to unblock pinning. The local migration CLI moves explicitly identified
-operational bindings to a declared account/pinset namespace while retaining
-immutable history and the same capacity/ownership obligations. Current TOML,
-provider names, endpoints, or credentials do not prove a legacy row's account.
-
-```powershell
-$env:IPFS_S3_CONFIG = "gateway.toml"
-cargo run -- --pinning-migrate-legacy declaration.json
-cargo run -- --pinning-migrate-legacy declaration.json --apply private-confirmation.json
-cargo run -- --pinning-migrate-legacy rollback-declaration.json
-cargo run -- --rollback committed-receipt-id private-rollback-confirmation.json
-```
-
-The first command is a bounded, read-only dry-run. It does not start the
-gateway, register providers, run schema migrations, or contact Kubo/providers;
-missing provider secrets do not prevent local inventory. The declaration uses
-`version = 1`, an operator-chosen `database_scope`, a bounded `ttl_seconds`,
-`maintenance` assertions, a new private `confirmation_file` path, and explicit
-`namespaces` pairs. Each pair names source/target, backend, scope, resource type,
-the captured target route, and the exact row/JSON-pointer
-`bindings` with their historical route evidence. Binding-only work remains
-explicit. Missing provenance must be investigated, not guessed from configuration.
-
-Keep the exported confirmation private: it contains the complete native DB
-images needed for a fresh comparison, and is never overwritten. Neither that
-file nor stdout is a trusted execution receipt. Before **apply or rollback**,
-back up the database and stop/drain every writer and worker sharing it, including
-old binaries. The schema upgrade is separate; this CLI never repairs a missing
-or unknown schema. DB-native clock/TTL and fresh transaction fences reject
-drift or new work; changes and per-item receipts commit atomically. Repeating
-the same operation reads the durable DB receipt rather than moving or charging
-again. A forged receipt file cannot authorize rollback. Rollback is refused
-once new work changes the post-state; it is not an unconditional restore. For
-a fresh rollback preview, retain the original namespace declarations, set
-`rollback_receipt` to the committed apply receipt ID, and choose a new private
-`confirmation_file`. An expired apply confirmation is not fresh rollback
-authorization.
-
-This operation never grants delete/unpin rights, frees retained quota, discards
-Unknown debt, or runs GC. It is not a provider-account migration or a production
-operation authorization. R26 local isolated acceptance passed; see
-[`docs/testing.md`](docs/testing.md#r26-legacy-namespace-migration-acceptance)
-for the final evidence and real-account limitations.
-
-### Scoped IPFS RPC providers (Stage 5)
-
-RPC providers are wired into the existing configuration and coordinator. They
-don't need another provider registry. Use `[[pinning.providers]]` for the route,
-`[[pinning_rpc.providers]]` for RPC options, and
-`[[pinning_identity.providers]]` for the stable identity. Both companion entries
-join the provider's `name` through `config_name`; policies still use that name.
-The commented examples in [`config.example.toml`](config.example.toml) keep the
-existing PSA/Pinata setup unchanged until explicitly enabled.
-
-| Route | Provider configuration | RPC profile / auth | Identity backend / api_profile |
-| --- | --- | --- | --- |
-| Independent Kubo | `kind = "ipfs_rpc"`, optional `api = "rpc"`, explicit `strategy = "cid"`, `"upload"` or `"car"`, required `endpoint` | `kubo` / `none`, `bearer` or `basic` | `kubo` / `kubo` |
-| Filebase RPC | `kind = "filebase"`, `api = "rpc"`, `strategy = "upload"`; default endpoint `https://rpc.filebase.io` | `filebase` / `bearer` only | `filebase` / `filebase-rpc` |
-| Historical Filebase PSA | `kind = "filebase"`, omitted `api` (or explicit `api = "psa"`, `strategy = "cid"`) | No RPC options | `filebase` / `filebase-psa` |
-
-Filebase PSA/upload and Filebase RPC/cid or CAR are rejected. Filebase CAR is
-not enabled by calling it experimental. Pinata V3, legacy and historical PSA
-routes remain available; changing the current route doesn't rewrite an old
-invocation or authorize a resend through RPC.
-
-RPC requires an explicit stable `provider_id`, `backend`, `scope`, independent
-`storage_domain`, and positive `credential_revision` / `endpoint_revision`.
-The identity's profile and strategy must match its route. Scope is an
-administrator assertion, not inferred from a URL or credential. Bump revisions
-when credentials (including a Basic username) or endpoints change, and use a new
-scope for another account/pinset. A successful add/import, recursive pin or
-matching CID alone does not prove `ApplicationCreated` ownership.
-
-Secrets are environment references only. `token_env` on the provider names the
-Bearer token or Basic password variable; Basic also uses `username_env` on the
-RPC options entry. Identity `secret_ref = "env:VARIABLE"` must match `token_env`.
-For Kubo `auth = "none"`, omit `token_env`, `username_env` and `secret_ref`.
-RPC references use uppercase letters, digits and underscores. No example
-contains a real credential; don't put secret values in TOML, URLs or logs.
-Source Kubo, target RPC and public gateway credentials aren't interchangeable.
-
-`allow_private_network` defaults to `false`: public RPC requires HTTPS and
-public resolved addresses. Explicitly set it to `true` only for an authorized
-private target, such as an isolated loopback Kubo. All endpoint URLs reject
-userinfo, query strings and fragments. Redirects aren't followed, so credentials
-aren't forwarded to a redirected destination. Certificate verification stays
-enabled. Custom `tls_ca_pem`, `tls_client_cert_pem`, `tls_client_key_pem`, and
-`tls_insecure = true` are explicitly rejected, not silently ignored or supported.
-
-Kubo CID pinning needs the DAG available to the target. Its `cid` completion
-contract is a complete successful `pin/add` response containing exactly one
-CID-equivalent root from the captured provider route. The receipt retains
-`PinAccepted` evidence; it does not claim an independent recursive/local-content
-verification. A later confirmation query is not required to complete this submit.
-Upload and CAR retain their recursive and local-content verification requirements.
-
-Upload streams the actual
-stored bytes from source Kubo (ciphertext for encrypted objects); it can't upload
-a directory with `cat(root)`. CAR transfers a complete single-root DAG and verifies
-the recursive root and local completeness. Filebase upload sends only
-`cid-version` and `wrap-with-directory=false`, not Kubo-specific `raw-leaves`,
-`chunker`, `pin=false` or `progress=true`; it doesn't append `pin/add` after add.
-CID comparison checks **codec and multihash**, allowing equivalent CIDv0/v1
-representations but rejecting a different DAG. It never rewrites an object's
-S3 ETag or stored CID. HTTP 200 plus a Hash isn't success if the stream's terminal
-record, EOF or trailer fails.
-
-Unknown effects and mismatched/reported roots remain durable in
-`pin_submit_observations`, alongside historical route and reservation evidence.
-They block automatic re-POST and deletion; a terminal job or expired lease doesn't
-erase that responsibility or manufacture quota headroom. Stop and drain **all old
-writers and workers on every replica**, back up the database, then apply
-`m20261004_000001_rpc_submission_ledger` and start only upgraded binaries. Don't
-mix versions, infer old scope from current TOML, clear evidence, or switch an old
-PSA job to RPC. The down migration explicitly refuses an unsafe downgrade;
-preserve the upgraded ledger and historical routes instead of dropping tables.
-
-**Local isolated acceptance passed.**
-The [test commands and evidence boundaries](docs/testing.md#stage-5-rpc-verification)
-separate config/worker/publication/diagnostic checks from real leaf RPC testing.
-Basic/Bearer headers sent to anonymous Kubo don't prove authentication enforcement
-or Filebase account access. Real Filebase/Pinata account tests remain **NOT RUN**.
-
-### Independent Cluster provider (Stage 6)
-
-An opt-in `kind = "cluster"` provider backs up the main Kubo rather than replacing
-it. Its nested `[pinning.providers.cluster]` options explicitly choose `proxy` or
-`rest` and `cid`, `upload` or `car`. Both require a REST status verifier;
-Proxy additionally has its own endpoint and authentication. Native REST uses its
-own add/CAR and status protocol, not Proxy `dag/import` forwarding. The commented
-[configuration example](config.example.toml) leaves existing routes unchanged.
-Cluster backend and pinset scope labels accept letters, digits and `-_.` only.
-
-Proxy, REST verification and source-Kubo credentials are independent environment
-references. Private endpoints require explicit `allow_private_network = true`;
-redirects are not followed and certificate verification is not disabled. Upload
-reads stored bytes (including ciphertext), while CAR preserves a complete
-single-root DAG and its codec/multihash. Mismatch never rewrites the S3 CID or
-silently falls back to another strategy.
-
-`min_replicas` is a confirmation threshold, **not** a change to Cluster's
-`replication_min/max`. A lease captures the full provider and confirmation
-requirements at birth, including temporarily unavailable candidates. Fresh,
-deduplicated allocated-peer evidence must satisfy the Cluster threshold before
-policy `one`/`all` aggregation. Missing, remote, queued, failed and stale peers
-do not count as pinned replicas. Historical evidence is preserved for audit, not
-treated as continuous availability. Multiple endpoints for the same pinset/CID
-represent one logical resource and do not establish independent disaster recovery.
-
-Stop/drain old writers and workers and back up before the replica-contract
-migration. Keep the captured requirements and append-only observations; do not
-bypass a refused downgrade by deleting tables. A successful add, matched CID or
-replica observation does not establish ownership or authorize deletion. Unknown
-and retained effects continue to occupy the logical ledger.
-
-**Local isolated acceptance passed:** configuration, registered-worker, native
-PostgreSQL and real provider transport results are recorded separately in
-[Stage 6 acceptance](docs/testing.md#stage-6-cluster-acceptance). Verifier-only
-results aren't provider CAR acceptance. Anonymous test-node auth
-headers do not prove account authentication, and Filebase/Pinata account writes
-remain **NOT RUN**. Two same-host peers are not multi-host high availability.
-
-### Local pinning management CLI (Stage 7.5)
-
-**Stage 7.5 acceptance is not complete.** Earlier Stage 7 results don't establish
-large-registry usability, complete history conversion or the current v3 workflow.
-See [Stage 7.5 acceptance](docs/testing.md#stage-75-management-scale-acceptance).
-These interfaces don't authorize production upgrades or prove external account capabilities.
-
-`--pinning-manage REQUEST.json` defaults to a bounded, read-only plan against an
-existing SQLite or PostgreSQL database with the formal management schema. It
-doesn't create a database, initialize AppState, migrate, register identities,
-start workers, or perform source/provider IO. `--output` exports an unconfirmed
-proposal. `--source-node` asserts the expected local peer; it isn't a probe or
-proof that content is readable. There is no management HTTP endpoint.
-
-Local actions read the complete dependency closure for their exact selectors,
-including shared resources, historical epochs, source evidence and empty membership
-sets. Scoped budgets apply to that related work, not to every unrelated row in the
-database. The old all-registry 4096-row/4 MiB gate isn't a database capacity limit.
-Relevant fan-out can still exceed a scoped budget and must fail, not truncate.
-Retirement uses a bounded, keyset-paged domain inventory with revision checks and
-a final seal, followed by a short atomic publication transaction. A changed scan
-isn't a complete inventory. Continuous writes can require a new scan and review.
-`retire_with` migration must cover all active targets; controlled cleanup must
-cover all eligible current resources. An actual mutation set above the request
-budget is rejected, never split into successful prefixes. There are at most 128
-explicit items per request; this isn't an inventory or database row limit.
-
-The input is `PlanRequest` (`plan_id`, `items`) from
-[`model.rs`](src/pinning/management/model.rs). Each item selects an action and
-an exact object/target or provider route. Object binding includes bucket, key,
-explicit public version (including `null`, never “current”), private version ID,
-object ID and canonical CID. Provider selection binds stable identity, backend,
-scope, storage domain, API/strategy and revisions, including the original route;
-it isn't just a config alias. Selection remains subject to local policy and
-stored evidence. Don't infer ZIP ownership from a prefix or old log.
-
-For stalled submissions, admission barriers and safe retry prerequisites, see the
-[pinning recovery runbook](docs/pinning-recovery.md).
-
-The nine action families are:
-
-| Action | Local management intent |
-| --- | --- |
-| `create` | Create a new explicitly authorized lease/target intent. |
-| `renew` | Extend the selected lease without restarting its original clock. |
-| `cancel` | Cancel logical intent, not delete S3 content or reclaim physical storage. |
-| `reapply` | Explicitly request a new intent rather than silently replay a skipped control. |
-| `backfill` | Add intent for exact selected historical content; legacy ZIP candidates need separate acknowledgement. |
-| `retry` | Retry eligible selected work with effect/route fences; uncertain work requires observation, not blind resubmission. |
-| `migrate` | Add destination execution while preserving source responsibility and the original lease deadline. |
-| `reconcile` | Schedule observation of the captured current/historical resource, not replacement Submit or Unpin authority. |
-| `retire` | Stop new allocations in the canonical allocation domain and retain its responsibilities. |
-
-`--confirm OUTPUT.v3` explicitly stages and confirms the reviewed plan in the
-DB. Every candidate requires its own `--ack-item ID`; acknowledgement doesn't
-turn inferred history into ownership proof. Confirmation TTL defaults to 300
-seconds, with `--ttl-seconds` accepting 1 to 900. Requests, plan/item IDs, UUIDs,
-exported files and imported applied claims aren't authorization. The local
-configuration principal (`local_configuration`), DB scope and native physical
-database identity must match the stored complete original bindings and evidence.
-Protect local configuration, database access and artifact directories accordingly.
-Read-only authority never becomes Submit, upload or cleanup permission through
-confirmation, import, retry or worker execution. Same-plan successors must follow
-the original reviewed order and exact predecessor bindings.
-
-Exports use exclusive `create_new`, never overwrite and don't create parent
-directories. Confirmation reserves the file before DB staging. A failed confirm
-can leave an empty or incomplete reserved file, and DB confirmation may already
-have committed if export failed. Don't treat that file as usable confirmation or
-retry by overwriting it. Inspect the failure and retained DB state first. Operators
-must protect the artifact directories and local configuration. New Unix files
-use owner-only permissions; Windows files use `CREATE_NEW` with a protected
-owner/SYSTEM-only ACL, verified on the same handle before writing.
-
-`--prepare PREPARE.json` is a separate explicit offline local-source read and DB
-evidence write, with no provider IO. Its input names `record_id`, exact `identity`,
-`expected_node`, `max_stored_bytes`, `ttl_seconds` (1 to 3600) and `directory`.
-File proof requires clean EOF and measures stored bytes, including ciphertext
-for encrypted objects, not plaintext size. Directory proof verifies the complete
-locally reachable directory/HAMT root and counts each unique reachable block's
-raw serialized payload once, excluding CAR header, CID bytes and framing. This
-logical byte hold isn't physical disk usage, global deduplication or provider
-billing. A file-only upload route can't authorize a directory. Evidence retains
-exact object/version tuples, node/read configuration, proof and original expiry;
-old size-less directory evidence doesn't become a byte proof on replay.
-
-`--apply CONFIRMED.v3` uses the original exported confirmation and local DB
-records. New business needs fresh native fences and unexpired original authority;
-actions and receipts commit together, not as a successful prefix. Exact committed
-receipt replay doesn't create or charge again, even after confirmation expiry or
-a later legitimate state change or configuration drift. Replay is checked before
-new-business TTL/configuration checks and doesn't renew confirmation. `--status`
-validates the committed action and computes current lease/job, expiry, observation
-freshness and unresolved responsibility from the DB clock and current facts. It
-doesn't rewrite the frozen receipt, perform source/provider IO or grant a fresh
-TTL. An incomplete, changed or over-budget current scan isn't historical success.
-This also applies to explicitly converted committed history: status reads current
-responsibility, while review and committed replay preserve the original result.
-Optional `--run` makes one due-job pass scoped to
-verified receipts, never a global queue drain or background worker. Due times and
-claim caps still apply. A failed/interrupted run doesn't undo a committed apply
-or prove that no remote effect occurred; inspect status before further action.
-
-Retirement is canonical and irreversible through this CLI: aliases or restarting
-with `retired = false` don't grant a new allocation domain. Unknown, in-flight,
-retained and cleanup-pending responsibilities remain recorded and can require
-`needs_attention`. The default disposition is retain, with no cleanup grant.
-Explicit `retire_with` can select evidenced prior migrations or exact controlled
-cleanup resources, but cannot invent ownership or erase unknown debt. Controlled
-cleanup still requires independently eligible managed resources and fresh fences.
-Retirement isn't route deletion, quota release, local unpin or GC permission.
-
-An explicit `retire_with` selection can release exact ZIP root references using
-`release_root_references { references: [...] }`. Each reference is a `NativeKey`
-with `table = "zip_root_references"` and string `values` in this order:
-`batch_id`, `revision`, `epoch`, `node_identity`, `tier`, `cid`. This isn't a
-prefix selector or a fabricated S3 version/ETag, and doesn't make directory roots
-directly supported by all nine actions. See the
-[root reference contract](src/pinning/management/README.md#精确-root-引用解除).
-
-Confirmation binds the DB-derived batch owner, full reference/build/batch tuples
-and private verification evidence. New release requires fresh confirmation and
-atomic action/receipt publication; UUIDs and imported claims aren't authorization.
-`logical_released_at = NULL` means logically active; a non-NULL timestamp means
-logically released. The original retained/adopted state, verification, manifest,
-root history and legacy ZIP/MPU responses remain intact, as do other shared-CID
-references. Default retire/retain never releases roots. Release doesn't promise
-unpin, GC or physical reclamation.
-
-#### Management wire v3 and private history
-
-Request and preparation inputs remain JSON. Plan/confirmation artifacts are
-sequential management wire v3 files, not JSON documents: a versioned header,
-length-bounded frames, segmented cells and a verified terminal trailer. Frames
-are bounded to 1 MiB and cell slices to 64 KiB. Unknown/duplicate fields, invalid
-structure and incomplete files are rejected. File claims, including applied
-results, remain untrusted until matched to locally authorized originals.
-
-`--review`, `--export` and `--import` work on frozen v3 files without loading
-configuration or opening the business DB. Import validates and freezes data; it
-doesn't restore a confirmation, receipt or write permission. Default output is a
-redacted review. `--private-input` explicitly accepts a private artifact but still
-exports a redacted review. `--private-recovery` explicitly accepts and preserves
-private originals in a new protected file. It can't recover secrets missing from
-a redacted source. Private recovery is archive-only, not a restore into current
-business tables or a transfer of physical database identity.
-
-The history contract preserves complete original reviews and dependencies,
-foreign/private cells, SQL NULL distinct from empty text, original UTF-8 text,
-TTL/created_at and BirthContract, plus committed idempotency bindings/results.
-It doesn't rebuild an old review from today's object or reset its deadline.
-Normal file input rejects v2. The separate file-only conversion command accepts
-supported Stage 7 v2 JSON and preserves the original document in an archive-only
-v3 file:
-
-```powershell
-ipfs-s3-gateway --pinning-manage --convert-v2 INPUT.json --output NEW.v3 --private-recovery
-```
-
-Conversion doesn't load gateway configuration, open the business DB or perform
-RPC. The output has no execution request, ACK or confirmation deadline; preserved
-applied claims remain untrusted. It is not a confirmation that can be applied.
-The explicit database upgrade is the conversion path for supported stored history; old unexecuted
-prepared/confirmed records don't become new write authority and need a new plan
-ID, review and confirmation. Converted committed records retain original replay
-identity and results without execution or charging again.
-
-The file commands don't directly export the DB's full private history. The
-public `pinning::management::wire::v3::history` API provides bounded DB history
-export through `Export::start`, `advance`, `suspend`/`resume` and `write_private`.
-It includes management records, retirement originals and archive segments,
-including unreferenced segments. Source changes invalidate an unfinished scan;
-sealed exports remain frozen. Resume retains cumulative work and the original
-deadline rather than starting a new allowance. `restore_private` returns a
-read-only recovery archive with cell, original-review and archive-part readers;
-it never writes recovered rows, receipts or identity into a target database.
-
-Streaming CLI file work has an 8 GiB work-byte ceiling, 10 million rows, 32 MiB
-accounted resident memory and a 120-second operation budget. Dry-run and confirmation
-use a 120-second work window; other ordinary DB-backed management commands retain
-their 30-second window. Cancellation allows at most 5 seconds of owned-work drain.
-Existing checkpoints retain their original cumulative caps and spent work: newer
-defaults never enlarge a retained task's allowance. The CLI exposes no cumulative
-task budget override. These limits aren't proof of acceptance-scale capacity;
-don't treat partial files or scan pages as success.
-
-Provider-wide dry-run and confirmation support an explicit protected checkpoint
-directory. `--checkpoint` creates a new directory; `--resume` reopens that same
-directory with the original request, principal, configuration and database binding.
-The options are mutually exclusive. `--scan-pages 1..512` limits this invocation
-only (default 64), not the task's cumulative allowance:
-
-```powershell
-ipfs-s3-gateway --pinning-manage REQUEST.json --source-node PEER --checkpoint NEW_CHECKPOINT --scan-pages 1 --output NEW_REVIEW.v3
-# Only when the result is incomplete, continue the retained checkpoint:
-ipfs-s3-gateway --pinning-manage REQUEST.json --source-node PEER --resume NEW_CHECKPOINT --scan-pages 64 --output NEW_REVIEW.v3
-```
-
-An incomplete result is not a plan or confirmation and does not reserve the output
-file. Dry-run writes only its protected local workspace, never the target database.
-Explicit confirmation may commit non-executable archive pages while verifying live
-originals and canonical results. Its report includes the current phase and actual
-database effects, including committed staging pages; staging is not authority or
-an applied business prefix. Complete confirmation still requires
-`--confirm NEW_CONFIRMED.v3`, the original item ACKs and the normal TTL checks.
-The confirmation TTL starts only at the first atomic publication, not at planning.
-Source drift rejects the old pass and requires a fresh scan; it never mixes pages
-or renews an existing grant. A failed output or confirmation retains the checkpoint;
-retry with a new exclusive-create output, not by appending to or overwriting a
-partial file. If confirmation committed before output failed, recovery exports that
-exact original confirmation without publishing it again or changing its ACKs or
-deadline, and retains the checkpoint. Normal successful completion removes only
-its owned checkpoint workspace.
-
-Recovered exports preserve complete content and confirmation semantics, but need
-not use identical JSON encoding or physical chunk boundaries. Every file must
-independently pass its integrity and EOF checks. Stored original archive bytes and
-their integrity references remain exact.
-
-Management wire v3 is unrelated to ZIP v2. Pixivbot's signed ZIP v1 direct PUT
-keeps `decompress-zip=<prefix>/`; MPU captures that query at Create and continues
-with the original UploadPart/Complete protocol. Its tag remains
-`ipfs-s3%3Apin=true&ipfs-s3%3Aduration=1d&ipfs-s3%3Acontent=decompressed`.
-No ZIP v2 or expected-sha256-specific header is required by management.
-
-#### Explicit existing-database upgrade
-
-Ordinary startup classifies an existing schema read-only before migrations,
-identity registration or workers. Unsupported, partial, backfill or non-ready
-schemas are refused with upgrade-required, without automatic migration or resume.
-Only a genuinely empty application schema may initialize the current schema;
-missing migration metadata alone doesn't establish emptiness. A ready current
-schema is validated before normal startup proceeds.
-
-SQLite and PostgreSQL validate database structure once per `Store` lifecycle.
-Startup validates the complete native, management, receipt and route layouts,
-constraints, indexes, triggers, migration versions, readiness and applicable
-TEMP shadows, then reuses that qualification for runtime operations. Clones
-share the qualification; a new Store qualifies independently. A Store built
-directly from a trusted pool qualifies on its first runtime operation. Failure,
-cancellation or incomplete transaction cleanup cannot publish qualification.
-
-Warm S3 and worker operations do not repeat structural catalog, version,
-readiness or TEMP checks. Permissions, source/locator seals and membership,
-original bindings, retirement, quota, claims, epochs, generations, TTL and
-acknowledgements remain live checks. PostgreSQL permanent RPC fact-relation
-OID/schema binding also remains enforced: fact capture is independent of
-runtime qualification and admission. Bare-database management, historical
-readers, explicit upgrades and management-file imports retain full validation.
-
-The pool is trusted to keep every connection on the same database/schema.
-PostgreSQL startup options and database/role `search_path` defaults must remain
-fixed and identical across connections, including replacement connections.
-Custom pools must initialize that path for every connection, not just issue
-`SET search_path` on one checkout. Do not inject connection-local TEMP objects
-or change the path after qualification.
-
-Schema, migration-version, readiness and TEMP changes are offline maintenance,
-not an online tamper-detection contract. Readiness is written by installation,
-explicit upgrade and backfill, not used as a live runtime switch. Stop all
-related gateways, workers and management processes, drain operations and release
-their Stores, clones and pools before maintenance. Perform explicit full
-validation or upgrade, then restart with newly qualified Stores. Never resume
-an old Store after failed or completed maintenance.
-
-The separate `--pinning-manage-upgrade` command requires the exact existing DB
-URL, native physical identity, database scope, source version and target version.
-It doesn't load gateway config, construct AppState, register identities, start
-workers or perform source/provider RPC. Supported sources are the exact historical
-ledgers ending at `m20261013_000001_zip_root_logical_release`,
-`m20261017_000001_management_storage`, `m20261023_000001_inline_documents`,
-`m20261027_000001_schema_baseline`, or `m20261108_000001_current_pinning_config`.
-The target is `m20261109_000001_pin_cid_comparisons`. Obtain the actual identity/scope from
-authorized database records, not a guessed UUID or a file claim. No identity
-discovery CLI is provided here.
-
-Empty databases install the baseline and registered current migrations. The CID
-comparison migration builds an indexed canonical comparison key for existing remote
-and ledger CIDs without changing their original values or object ETags. New pin
-allocations maintain this index in their existing write transaction and query only
-equivalent CID aliases; they do not enumerate the provider's full CID history.
-A ready m23 database retains its tables, indexes, identity, scope and historical
-archives; maintenance normalizes the live migration ledger and adds a separately
-bound conversion stamp without rerunning history backfill. m13/m17 conversions
-prepare the final layout atomically, convert each historical original in a separate
-transaction, then publish readiness behind the revision fence. Existing immutable
-stamps keep their original targets and bytes, including recoverable m13/m17-to-m23
-backfill interruptions. Repeating an upgrade requires its matching persisted stamp;
-a baseline ledger alone cannot prove an arbitrary source conversion. Historical
-catalog compatibility permits reading old evidence, not renewing old execution
-confirmations or checkpoints.
-
-An upgrade requires separate authorization for that database, stopped/drained old
-writers and workers, and a verified recoverable backup. Don't mix binary versions.
-Failure keeps the database unavailable until an explicitly identity-bound upgrade
-can complete. There is no automatic down migration: once new-format business or
-confirmation records exist, don't drop them or resume traffic on an old backup.
-
-These PowerShell examples assume `ipfs-s3-gateway` is available on PATH, an explicitly selected
-existing database/configuration, reviewed request files and a protected existing
-artifact directory. Replace `candidate-item-id` with each actual candidate ID;
-omit the flag when there are none. Preparation, if required, comes before review
-and confirmation. Commands are examples, not acceptance results.
-
-```powershell
-$env:IPFS_S3_CONFIG = "gateway.toml"
-ipfs-s3-gateway --pinning-manage --prepare ./prepare.json
-ipfs-s3-gateway --pinning-manage ./request.json --output ./private/plan.v3
-ipfs-s3-gateway --pinning-manage --review ./private/plan.v3
-ipfs-s3-gateway --pinning-manage ./request.json --confirm ./private/confirmed.v3 --ack-item candidate-item-id --ttl-seconds 300
-ipfs-s3-gateway --pinning-manage --apply ./private/confirmed.v3
-ipfs-s3-gateway --pinning-manage --status ./private/confirmed.v3
-# Explicit opt-in to one receipt-scoped pass, also valid on exact apply replay:
-ipfs-s3-gateway --pinning-manage --apply ./private/confirmed.v3 --run
-ipfs-s3-gateway --pinning-manage --export ./private/confirmed.v3 --output ./private/review-copy.v3
-ipfs-s3-gateway --pinning-manage --import ./private/review-copy.v3 --output ./private/validated-copy.v3
-```
-
-For an already available complete private v3 artifact, explicit private handling
-uses these file-only commands. Each output name must be new:
-
-```powershell
-ipfs-s3-gateway --pinning-manage --review ./private/history.v3 --private-input
-ipfs-s3-gateway --pinning-manage --export ./private/history.v3 --output ./private/history-redacted.v3 --private-input
-ipfs-s3-gateway --pinning-manage --export ./private/history.v3 --output ./private/history-recovery.v3 --private-recovery
-```
-
-Only after separately authorizing maintenance of the exact target, the upgrade
-command shape is as follows. Set these variables to verified local values first;
-the example isn't permission to run an upgrade:
-
-```powershell
-ipfs-s3-gateway --pinning-manage-upgrade `
-  --database-url $upgradeDatabaseUrl `
-  --native-identity $upgradeNativeIdentity `
-  --database-scope $upgradeDatabaseScope `
-  --source-version m20261013_000001_zip_root_logical_release `
-  --target-version m20261109_000001_pin_cid_comparisons
-```
-
-### Policies and coordination
-
-Policies use ordered first-match evaluation. A rule matches an exact bucket or
-`*`, followed by a literal key-prefix match. An `always` rule creates automatic
-pinning intent; a `request` rule permits manual tag control. In `one` mode,
-providers are considered by priority and the chosen provider is sticky, with
-failover rather than continuous rebalancing. In `all` mode, work fans out to
-every provider named by the rule.
-
-The durable worker coordinates retries per unique provider/CID request, not
-once per lease. Failed requests use bounded backoff and stop after eight failed
-attempts. For historical PSA/Pinata routes, an ambiguous crash-recovered `Submit`
-job uses provider `find` before another `POST`; the local quota reservation
-remains held while that ambiguity is unresolved. RPC uses typed observations and
-captured routes instead: unknown effects or mismatched resources block automatic
-re-POST, not a guessed PSA Find or strategy fallback.
+Manage remote pins through signed S3 requests. `PutObject`, `CopyObject`,
+`CompleteMultipartUpload`, import and ZIP publication commit file references
+alongside their objects. They do not wait for a backup provider. Individual
+multipart parts are not pinned remotely.
+
+A reference identifies the file version or task requesting a pin and its expiry.
+References to the same CID on the same provider share one resource and one
+logical quota charge. The worker submits the pin, stores the provider's
+acknowledgment and handle, and requests removal when the last reference ends.
+An acknowledgment is the service's acceptance of an operation, not a check of
+physical storage, replica count or garbage collection. A request can expire
+without ever receiving a submit acknowledgment. Expiry does not delete the S3
+object or unpin it from the primary Kubo node.
+
+### Configure a backup provider
+
+`[[pinning.providers]]` defines the service. Pinata supports CID and upload;
+Filebase supports PSA by CID or RPC upload. Independent Kubo RPC and IPFS
+Cluster providers can use CID, upload or CAR. Use separate backup storage:
+a CID-based remove acts on that CID at the destination, including an identical
+pin made there by another client. Request- or file-based services remove by
+handle. Pinata's legacy API removes by CID after a direct submission ACK; an
+explicit duplicate response does not authorize removing the pre-existing pin.
+When moving to a different backup account or pinset, configure a new provider
+scope and retain the old route and its credentials until cleanup completes.
+Changing a token or revision under the same scope does not create a separate
+resource namespace.
+
+`[[pinning.policies]]` uses the first matching bucket (`*` or exact name) and
+key prefix. Use `trigger = "always"` for automatic pinning or `"request"` for
+tagged requests. `provider_mode = "one"` selects one provider; `"all"` targets
+each provider in the rule. The policy supplies the default and maximum duration.
+The [configuration example](config.example.toml) includes provider identities,
+RPC/Cluster routes and credential environment variables. `--config-explain`
+reads local configuration without exposing secrets or connecting to providers
+or the database. `--ready-probe` checks the running gateway's readiness.
 
 ### Standard S3 tag control
 
@@ -1616,11 +841,20 @@ this form:
 ipfs-s3%3Apin=true&ipfs-s3%3Aduration=30d&ipfs-s3%3Acontent=decompressed
 ```
 
-An expired manual lease may be restored with `ipfs-s3:retain-until` only when
-the original remote reservation still exists because the unpin/release race
-has not been confirmed. Once release is confirmed, renewal is rejected.
-Renewal never reconstructs decompressed targets, and cancelled or evicted
-leases cannot be revived.
+Use `--version-id` with the tagging commands to address a specific object
+version. `PutObjectTagging` replaces the tag set: include any application tags
+you want to retain. `GetObjectTagging` shows the object's tags. To check the
+worker's result, send a SigV4-signed `GET /my-bucket/file.txt?ipfs3-pin-status`;
+add `&versionId=VERSION` for a specific version. The JSON response includes
+`version_id` and the active `references`, with `provider`, `cid`, `source`,
+`expires_at` and `status` for each. `accepted` means the provider acknowledged
+the request; an empty array means the selected version has no active reference.
+
+For deployment from the old pin schema, drain the old writers and workers and
+release old pins on their backup providers and back up the database. Run
+`ipfs-s3-gateway --upgrade-database` with the deployment's database configuration
+before starting the new gateway. The upgrade does not reconstruct remote handles
+or replay old pin requests. See the [supported source layouts and upgrade procedure](docs/pinning-recovery.md#upgrade-from-the-old-pin-database-layout).
 
 ## Architecture
 
@@ -1638,7 +872,7 @@ s3s (SigV4 verify + standard S3 dispatch + custom S3Route)
     │   ├── ops/bucket.rs     → store/bucket.rs   (sea-orm)
     │   ├── ops/object.rs     → store/object.rs   + kubo/add,cat,pin + crypto
     │   ├── ops/multipart.rs  → store/multipart.rs + kubo + crypto
-    │   └── pinning/          → Pinata/PSA/RPC clients + durable jobs + policy/lease coordination
+    │   └── pinning/          → provider clients + file references + shared resource worker
     │
     └── GatewayRoute (composite custom route)
         ├── ImportObjectRoute → persisted import jobs and status XML

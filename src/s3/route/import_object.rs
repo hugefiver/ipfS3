@@ -262,7 +262,7 @@ impl ImportObjectRoute {
             if let ImportSource::Url(url) = &source {
                 self.coordinator.authorize_url_for_submission(url).await?;
             }
-            let status = import_intake::admit_store(&self.state.store, &intake).await?;
+            let status = import_intake::admit(self.state.store.db(), &intake).await?;
             return accepted_v2_response(&req.uri, &status);
         }
         if let Some(token) = client_token.as_deref()
@@ -446,8 +446,8 @@ impl ImportObjectRoute {
             tags,
             decompress_prefix: controls.and_then(|controls| controls.target_prefix),
         };
-        let submitted = ownership::submit_store(
-            &self.state.store,
+        let submitted = ownership::submit_captured(
+            self.state.store.db(),
             request,
             Some(decision),
             zip_intent,

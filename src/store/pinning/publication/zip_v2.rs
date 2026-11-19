@@ -184,7 +184,7 @@ async fn publish(
             root_outcome: request.root_outcome,
             terminal_result: request.terminal_result,
         },
-        Some(limits),
+        limits,
         &selection,
     )
     .await;

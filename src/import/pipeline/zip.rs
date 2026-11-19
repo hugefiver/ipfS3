@@ -51,14 +51,12 @@ pub(super) async fn execute_zip_job(
             )
         })?;
     crate::store::pinning::publication::preflight_captured_zip_routes(
-        &state.store,
         &capture,
         state.pinning.effective_config(),
         state.pinning.zip_output_rules(),
         state.pinning.control_mode(),
         None,
     )
-    .await
     .map_err(|error| map_publication_error(error, cancellation))?;
     let batch = zip::read(db, &job.id)
         .await

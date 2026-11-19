@@ -1,3 +1,5 @@
+#[path = "support/pin_rows.rs"]
+mod pin_rows;
 #[path = "stage9_zip_support/renew.rs"]
 mod renew;
 mod stage9_zip_support;
@@ -8,60 +10,34 @@ use ipfs_s3_gateway::{
     pinning::{config::ValidatedPinningConfig, tags::ObjectTag},
     store::{
         self,
-        entities::{
-            object, object_version, physical_residency, pin_extension_decision,
-            pin_invocation_route, pin_job, pin_lease, pin_lease_target, pin_provider_usage,
-            remote_pin, remote_pin_ledger,
-        },
+        entities::{object, object_version, physical_residency},
         pinning::publication,
     },
 };
 use sea_orm::{ConnectionTrait, EntityTrait, PaginatorTrait};
 use stage9_zip_support::*;
 
-async fn sqlite_publication_snapshot(
+async fn assert_publication_rolled_back(
     db: &sea_orm::DatabaseConnection,
-) -> std::collections::BTreeMap<String, Vec<serde_json::Value>> {
-    use sea_orm::{DatabaseBackend, Statement};
-    let tables = db.query_all(Statement::from_string(DatabaseBackend::Sqlite,
-        "SELECT name FROM sqlite_master WHERE type='table' AND substr(name,1,7)!='sqlite_' ORDER BY name".to_owned(),
-    )).await.unwrap();
-    let mut snapshot = std::collections::BTreeMap::new();
-    for table in tables {
-        let name: String = table.try_get("", "name").unwrap();
-        // Identifiers come only from this migrated SQLite schema. Preserve each
-        // native cell's type as well as value, including any blob bytes.
-        let quoted = format!("\"{}\"", name.replace('"', "\"\""));
-        let columns = db
-            .query_all(Statement::from_string(
-                DatabaseBackend::Sqlite,
-                format!("PRAGMA table_info({quoted})"),
-            ))
-            .await
-            .unwrap();
-        let fields = columns.into_iter().map(|column| {
-            let column: String = column.try_get("", "name").unwrap();
-            let key = column.replace('\'', "''");
-            let id = format!("\"{}\"", column.replace('"', "\"\""));
-            format!("'{key}',json_object('type',typeof({id}),'value',CASE WHEN typeof({id})='blob' THEN hex({id}) ELSE {id} END)")
-        }).collect::<Vec<_>>().join(",");
-        let rows = db
-            .query_all(Statement::from_string(
-                DatabaseBackend::Sqlite,
-                format!("SELECT json_object({fields}) AS row_json FROM {quoted} ORDER BY row_json"),
-            ))
-            .await
-            .unwrap();
-        snapshot.insert(
-            name,
-            rows.into_iter()
-                .map(|row| {
-                    serde_json::from_str(&row.try_get::<String>("", "row_json").unwrap()).unwrap()
-                })
-                .collect(),
-        );
+    before: store::zip::BatchSnapshot,
+) {
+    let after = store::zip::snapshot(db, &before.batch.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.batch, before.batch);
+    assert_eq!(after.entries, before.entries);
+    assert_eq!(after.references, before.references);
+    assert_eq!(pin_rows::count(db, "standard_mutation_leases").await, 1);
+    for table in [
+        "objects",
+        "object_versions",
+        "pin_refs",
+        "pin_resources",
+        "physical_residencies",
+    ] {
+        assert_eq!(pin_rows::count(db, table).await, 0, "{table}");
     }
-    snapshot
 }
 
 #[tokio::test]
@@ -75,10 +51,10 @@ async fn r25_store_nonfinal_duplicate_collection_rejected_without_admitted_state
         &config,
         vec![],
         vec![
-            ("first".into(), object("first", "out/same.txt", "first-cid")),
+            ("first".into(), object("first", "out/same.txt", ARCHIVE_CID)),
             (
                 "second".into(),
-                object("second", "out/same.txt", "second-cid"),
+                object("second", "out/same.txt", OUTPUT_CID),
             ),
         ],
     )
@@ -97,9 +73,8 @@ async fn r25_store_nonfinal_duplicate_collection_rejected_without_admitted_state
             .collect(),
         ..Default::default()
     };
-    let before = sqlite_publication_snapshot(&db).await;
-    assert_eq!(before["zip_batches"].len(), 1);
-    assert_eq!(before["zip_manifest_entries"].len(), 2);
+    let before = store::zip::snapshot(&db, "batch").await.unwrap().unwrap();
+    assert_eq!(before.entries.len(), 2);
     let error = publication::publish_captured_zip(
         &db,
         CapturedZipPublication {
@@ -129,7 +104,7 @@ async fn r25_store_nonfinal_duplicate_collection_rejected_without_admitted_state
         error,
         ipfs_s3_gateway::error::AppError::InvalidPinningRequest(_)
     ));
-    assert_eq!(sqlite_publication_snapshot(&db).await, before);
+    assert_publication_rolled_back(&db, before).await;
 }
 
 #[tokio::test]
@@ -146,8 +121,8 @@ async fn r25_store_duplicate_final_winner_owns_only_last_exact_cid_and_version()
     .unwrap();
     let config = config();
     let raw = [
-        object("first", "out/same.txt", "first-cid"),
-        object("second", "out/same.txt", "second-cid"),
+        object("first", "out/same.txt", ARCHIVE_CID),
+        object("second", "out/same.txt", OUTPUT_CID),
     ];
     let manifest = final_zip_manifest(
         &raw.iter()
@@ -161,7 +136,7 @@ async fn r25_store_duplicate_final_winner_owns_only_last_exact_cid_and_version()
         "out/",
     );
     assert_eq!(manifest.successful.len(), 1);
-    assert_eq!(manifest.successful[0].cid, "second-cid");
+    assert_eq!(manifest.successful[0].cid, OUTPUT_CID);
     let winners = manifest
         .successful
         .iter()
@@ -183,7 +158,7 @@ async fn r25_store_duplicate_final_winner_owns_only_last_exact_cid_and_version()
         .unwrap();
     assert_eq!(
         (latest.id.as_str(), latest.cid.as_str()),
-        ("second", "second-cid")
+        ("second", OUTPUT_CID)
     );
     assert!(
         object::Entity::find_by_id("first")
@@ -199,18 +174,16 @@ async fn r25_store_duplicate_final_winner_owns_only_last_exact_cid_and_version()
         .unwrap();
     assert_eq!(versions.len(), 1);
     assert_eq!(versions[0].object_id.as_deref(), Some("second"));
-    let leases = pin_lease::Entity::find().all(&db).await.unwrap();
-    assert_eq!(leases.len(), 1);
+    let refs = pin_rows::refs(&db).await;
+    assert_eq!(refs.len(), 1);
     assert_eq!(
         (
-            leases[0].source.as_str(),
-            leases[0].owner_object_id.as_str()
+            refs[0].source.as_str(),
+            refs[0].owner_object_id.as_str(),
+            refs[0].cid.as_str()
         ),
-        ("automatic", "second")
+        ("automatic", "second", OUTPUT_CID)
     );
-    let targets = pin_lease_target::Entity::find().all(&db).await.unwrap();
-    assert_eq!(targets.len(), 1);
-    assert_eq!(targets[0].cid, "second-cid");
     let snapshot = store::zip::snapshot(&db, "batch").await.unwrap().unwrap();
     assert_eq!(snapshot.entries.len(), 1);
     assert_eq!(
@@ -235,30 +208,35 @@ async fn r25_store_exact_outputs_own_automatic_shared_cid_once() {
     publish(&db, &config, request, batch, &capture, guard)
         .await
         .unwrap();
-    let leases = pin_lease::Entity::find().all(&db).await.unwrap();
-    assert_eq!(leases.len(), 2);
-    assert!(
-        leases
-            .iter()
-            .all(|l| l.source == "automatic" && ["a", "b"].contains(&l.owner_object_id.as_str()))
-    );
+    let refs = pin_rows::refs(&db).await;
     assert_eq!(
-        pin_lease_target::Entity::find().count(&db).await.unwrap(),
-        2
+        refs.iter()
+            .map(|r| r.owner_object_id.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "b"]
     );
-    let usage = pin_provider_usage::Entity::find()
-        .one(&db)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!((usage.reserved_bytes, usage.reserved_pins), (5, 1));
+    assert!(
+        refs.iter()
+            .all(|r| r.source == "automatic" && r.cid == OUTPUT_CID)
+    );
+    let resources = pin_rows::resources(&db).await;
+    assert_eq!(resources.len(), 1);
+    assert_eq!(
+        (resources[0].logical_size, resources[0].cid.as_str()),
+        (5, OUTPUT_CID)
+    );
     assert_eq!(object::Entity::find().count(&db).await.unwrap(), 3);
-    assert_eq!(object_version::Entity::find().count(&db).await.unwrap(), 3);
-    let decisions = pin_extension_decision::Entity::find()
-        .all(&db)
-        .await
-        .unwrap();
-    assert_eq!(decisions.len(), 3);
+    let versions = object_version::Entity::find().all(&db).await.unwrap();
+    assert_eq!(versions.len(), 3);
+    let decisions = versions
+        .iter()
+        .map(|version| {
+            serde_json::from_str::<ipfs_s3_gateway::pinning::decision::ExtensionDecision>(
+                version.pin_decision.as_deref().unwrap(),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
     assert_eq!(
         decisions
             .iter()
@@ -284,28 +262,8 @@ async fn r25_store_tail_manifest_fault_rolls_back_versions_leases_quota_jobs_and
     assert!(error.to_string().contains("r25 tail failure"));
     assert_eq!(object::Entity::find().count(&db).await.unwrap(), 0);
     assert_eq!(object_version::Entity::find().count(&db).await.unwrap(), 0);
-    assert_eq!(pin_lease::Entity::find().count(&db).await.unwrap(), 0);
-    assert_eq!(
-        pin_lease_target::Entity::find().count(&db).await.unwrap(),
-        0
-    );
-    assert_eq!(
-        pin_provider_usage::Entity::find().count(&db).await.unwrap(),
-        0
-    );
-    assert_eq!(pin_job::Entity::find().count(&db).await.unwrap(), 0);
-    assert_eq!(
-        pin_invocation_route::Entity::find()
-            .count(&db)
-            .await
-            .unwrap(),
-        0
-    );
-    assert_eq!(remote_pin::Entity::find().count(&db).await.unwrap(), 0);
-    assert_eq!(
-        remote_pin_ledger::Entity::find().count(&db).await.unwrap(),
-        0
-    );
+    assert_eq!(pin_rows::count(&db, "pin_refs").await, 0);
+    assert_eq!(pin_rows::count(&db, "pin_resources").await, 0);
     assert_eq!(
         physical_residency::Entity::find().count(&db).await.unwrap(),
         0
@@ -319,9 +277,8 @@ async fn r25_store_tail_manifest_fault_rolls_back_versions_leases_quota_jobs_and
 #[tokio::test]
 async fn zip_settlement_manifest_drift_rolls_back_the_entire_publication() {
     for mutation in [
-        "UPDATE zip_manifest_entries SET cid='tampered' WHERE batch_id=NEW.id AND cid IS NOT NULL;",
+        "UPDATE zip_manifest_entries SET cid=(SELECT cid FROM objects WHERE id='archive') WHERE batch_id=NEW.id AND cid IS NOT NULL;",
         "UPDATE zip_manifest_entries SET size=size+1 WHERE batch_id=NEW.id AND cid IS NOT NULL;",
-        "UPDATE physical_residencies SET verification_state='failed';",
         "INSERT INTO zip_manifest_entries(batch_id,path,error_code,created_at) SELECT NEW.id,'extra-failure','invalid_path',created_at FROM zip_manifest_entries WHERE batch_id=NEW.id LIMIT 1;",
     ] {
         let db = setup().await;
@@ -332,7 +289,7 @@ async fn zip_settlement_manifest_drift_rolls_back_the_entire_publication() {
         ))
         .await
         .unwrap();
-        let before = sqlite_publication_snapshot(&db).await;
+        let before = store::zip::snapshot(&db, "batch").await.unwrap().unwrap();
         let result = publish_captured(&db, &config, request, batch, &capture, guard).await;
         assert!(
             matches!(
@@ -342,7 +299,7 @@ async fn zip_settlement_manifest_drift_rolls_back_the_entire_publication() {
             ),
             "manifest mutation must reach final validation: {mutation}; got {result:?}"
         );
-        assert_eq!(sqlite_publication_snapshot(&db).await, before);
+        assert_publication_rolled_back(&db, before).await;
     }
 }
 
@@ -356,8 +313,8 @@ async fn r25_store_current_config_without_policy_publishes_without_remote_leases
         .await
         .unwrap();
     assert_eq!(object::Entity::find().count(&db).await.unwrap(), 3);
-    assert_eq!(pin_lease::Entity::find().count(&db).await.unwrap(), 0);
-    assert_eq!(pin_job::Entity::find().count(&db).await.unwrap(), 0);
+    assert_eq!(pin_rows::count(&db, "pin_refs").await, 0);
+    assert_eq!(pin_rows::count(&db, "pin_resources").await, 0);
 }
 
 #[tokio::test]
@@ -372,29 +329,28 @@ async fn r25_store_manual_decompressed_retains_archive_owner_beside_output_autom
     publish(&db, &config, request, batch, &capture, guard)
         .await
         .unwrap();
-    let leases = pin_lease::Entity::find().all(&db).await.unwrap();
-    assert_eq!(leases.len(), 3);
-    assert!(
-        leases
-            .iter()
-            .any(|l| l.source == "manual" && l.owner_object_id == "archive")
-    );
-    assert!(
-        leases
-            .iter()
-            .filter(|l| l.source == "automatic")
-            .all(|l| ["a", "b"].contains(&l.owner_object_id.as_str()))
-    );
+    let refs = pin_rows::refs(&db).await;
     assert_eq!(
-        pin_lease_target::Entity::find().count(&db).await.unwrap(),
-        3
+        refs.iter()
+            .map(|r| (
+                r.owner_object_id.as_str(),
+                r.source.as_str(),
+                r.content_mode.as_str()
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("a", "automatic", "object"),
+            ("archive", "manual", "decompressed"),
+            ("b", "automatic", "object")
+        ]
     );
-    let usage = pin_provider_usage::Entity::find()
-        .one(&db)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!((usage.reserved_bytes, usage.reserved_pins), (5, 1));
+    assert!(refs.iter().all(|r| r.cid == OUTPUT_CID));
+    let resources = pin_rows::resources(&db).await;
+    assert_eq!(resources.len(), 1);
+    assert_eq!(
+        (resources[0].logical_size, resources[0].cid.as_str()),
+        (5, OUTPUT_CID)
+    );
 }
 
 #[tokio::test]
@@ -402,14 +358,14 @@ async fn r25_store_mismatched_final_binding_cannot_bypass_durable_capture() {
     let db = setup().await;
     let config = config();
     let (mut request, batch, capture, guard) = prepared(&db, &config, vec![]).await;
-    request.entries[0].cid = "not-the-prepared-cid".into();
+    request.entries[0].cid = fixture_cid("not-the-prepared-cid");
     assert!(
         publish(&db, &config, request, batch, &capture, guard)
             .await
             .is_err()
     );
     assert_eq!(object_version::Entity::find().count(&db).await.unwrap(), 0);
-    assert_eq!(pin_lease::Entity::find().count(&db).await.unwrap(), 0);
+    assert_eq!(pin_rows::count(&db, "pin_refs").await, 0);
 }
 
 #[test]
@@ -483,7 +439,7 @@ async fn r25_store_durable_mpu_capture_cannot_replace_output_ownership_guard() {
         "out/archive.zip",
         "batch",
         &parts,
-        "archive-cid",
+        ARCHIVE_CID,
     )
     .await
     .unwrap();
@@ -529,7 +485,7 @@ async fn r25_store_durable_mpu_capture_cannot_replace_output_ownership_guard() {
             },
         )),
         root_outcome: batch.root_outcome,
-        terminal_result: serde_json::json!({"archive_cid": "archive-cid"}).to_string(),
+        terminal_result: serde_json::json!({"archive_cid": ARCHIVE_CID}).to_string(),
     };
     let error = publication::publish_captured_zip(
         &db,
@@ -547,7 +503,7 @@ async fn r25_store_durable_mpu_capture_cannot_replace_output_ownership_guard() {
         "{error}"
     );
     assert_eq!(object_version::Entity::find().count(&db).await.unwrap(), 0);
-    assert_eq!(pin_lease::Entity::find().count(&db).await.unwrap(), 0);
+    assert_eq!(pin_rows::count(&db, "pin_refs").await, 0);
     assert!(
         store::multipart::get_upload(&db, &upload.upload_id)
             .await
@@ -946,14 +902,14 @@ async fn r25_legacy_url_input_proof_is_complete_immutable_and_claim_fenced() {
             .is_none()
     );
     assert!(
-        publication::bind_legacy_import_input(&db, &claim, "CID-is-not-a-digest", "archive-cid", 5)
+        publication::bind_legacy_import_input(&db, &claim, "CID-is-not-a-digest", ARCHIVE_CID, 5)
             .await
             .is_err()
     );
     db.execute_unprepared("CREATE TRIGGER r25_input_tail BEFORE UPDATE OF legacy_input_proof_json ON zip_batches BEGIN SELECT RAISE(ABORT,'r25 input tail'); END").await.unwrap();
     let sha = "a".repeat(64);
     assert!(
-        publication::bind_legacy_import_input(&db, &claim, &sha, "archive-cid", 5)
+        publication::bind_legacy_import_input(&db, &claim, &sha, ARCHIVE_CID, 5)
             .await
             .unwrap_err()
             .to_string()
@@ -968,12 +924,12 @@ async fn r25_legacy_url_input_proof_is_complete_immutable_and_claim_fenced() {
     db.execute_unprepared("DROP TRIGGER r25_input_tail")
         .await
         .unwrap();
-    let proof = publication::bind_legacy_import_input(&db, &claim, &sha, "archive-cid", 5)
+    let proof = publication::bind_legacy_import_input(&db, &claim, &sha, ARCHIVE_CID, 5)
         .await
         .unwrap();
     assert_eq!(
         (proof.sha256(), proof.cid(), proof.size()),
-        (sha.as_str(), "archive-cid", 5)
+        (sha.as_str(), ARCHIVE_CID, 5)
     );
     assert_eq!(
         publication::read_legacy_import_input(&db, "url-job")
@@ -982,7 +938,7 @@ async fn r25_legacy_url_input_proof_is_complete_immutable_and_claim_fenced() {
         Some(proof.clone())
     );
     assert!(
-        publication::bind_legacy_import_input(&db, &claim, &"b".repeat(64), "archive-cid", 5)
+        publication::bind_legacy_import_input(&db, &claim, &"b".repeat(64), ARCHIVE_CID, 5)
             .await
             .is_err()
     );
@@ -1003,12 +959,12 @@ async fn r25_legacy_url_input_proof_is_complete_immutable_and_claim_fenced() {
     .remove(0)
     .claim;
     assert!(
-        publication::bind_legacy_import_input(&db, &claim, &sha, "archive-cid", 5)
+        publication::bind_legacy_import_input(&db, &claim, &sha, ARCHIVE_CID, 5)
             .await
             .is_err()
     );
     assert_eq!(
-        publication::bind_legacy_import_input(&db, &next, &sha, "archive-cid", 5)
+        publication::bind_legacy_import_input(&db, &next, &sha, ARCHIVE_CID, 5)
             .await
             .unwrap(),
         proof
@@ -1018,5 +974,5 @@ async fn r25_legacy_url_input_proof_is_complete_immutable_and_claim_fenced() {
     assert_eq!(batch.fingerprint, admission.fingerprint);
     assert_eq!(batch.captured_options, admission.captured_options);
     assert_eq!(object_version::Entity::find().count(&db).await.unwrap(), 0);
-    assert_eq!(pin_lease::Entity::find().count(&db).await.unwrap(), 0);
+    assert_eq!(pin_rows::count(&db, "pin_refs").await, 0);
 }

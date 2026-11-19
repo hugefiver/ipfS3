@@ -1,34 +1,24 @@
 //! One locked transaction algorithm for legacy and negotiated ZIP publications.
 use std::collections::{BTreeMap, BTreeSet};
 
-use sea_orm::{
-    ConnectionTrait, DatabaseConnection, DatabaseTransaction, TransactionError, TransactionTrait,
-};
+use sea_orm::{DatabaseConnection, DatabaseTransaction, TransactionError, TransactionTrait};
 
-use super::{PublicationObject, invalid_publication, ledger};
+use super::{PinTargetSpec, PublicationObject, invalid_publication};
 use crate::{
     error::{AppError, AppResult},
-    pinning::{
-        tags::ObjectTag,
-        zip_policy::{CapturedZipIntent, ZipBoundOutput},
-    },
+    pinning::{tags::ObjectTag, zip_policy::CapturedZipIntent},
     store::{
-        object_version::{BucketVersioningState, PublicationResult},
-        zip::{self as storage, VersionBinding, publication_lease::PublicationLease},
+        object_version::PublicationResult,
+        zip::{self as storage, publication_lease::PublicationLease},
     },
     zip::batch::FinalZipManifest,
 };
 
-pub(super) mod allocation;
 mod capture;
 mod execution;
 mod input;
-mod keys;
 mod legacy;
 mod objects;
-mod pins;
-mod sql;
-mod work;
 
 pub use execution::ZipExecutionSettlement;
 pub use input::{LegacyZipInputProof, bind_legacy_import_input, read_legacy_import_input};
@@ -82,38 +72,26 @@ pub async fn publish_captured_zip(
         .capture
         .resolve_current_with_rules(config, rules, mode)
         .map_err(|error| AppError::InvalidPinningRequest(error.to_string()))?;
-    publish_captured_zip_with_limits(db, request, Some(&config.provider_limits), &selection).await
+    publish_captured_zip_with_limits(db, request, &config.provider_limits, &selection).await
 }
 
 pub(super) async fn publish_captured_zip_with_limits(
     db: &DatabaseConnection,
     request: CapturedZipPublication,
-    current_limits: Option<&crate::pinning::config::ProviderLimitMap>,
+    current_limits: &crate::pinning::config::ProviderLimitMap,
     selection: &CapturedZipIntent,
 ) -> AppResult<Vec<(String, PublicationResult)>> {
     let selection = std::sync::Arc::new(selection.clone());
-    let current_limits = current_limits.cloned().map(std::sync::Arc::new);
+    let current_limits = std::sync::Arc::new(current_limits.clone());
     let request = std::sync::Arc::new(request);
-    let session = work::session();
     for retry in 0..=super::MAX_TRANSACTION_RETRIES {
-        work::begin_attempt(&session)?;
         let request = request.clone();
-        let session = session.clone();
         let current_limits = current_limits.clone();
         let selection = selection.clone();
         match db
             .transaction(|tx| {
                 Box::pin(async move {
-                    publish_with_reservations(
-                        &mut super::reservations::BorrowedWithWork {
-                            db: tx,
-                            work: &session,
-                        },
-                        &request,
-                        current_limits.as_deref(),
-                        &selection,
-                    )
-                    .await
+                    publish_in_transaction(tx, &request, &current_limits, &selection).await
                 })
             })
             .await
@@ -127,58 +105,6 @@ pub(super) async fn publish_captured_zip_with_limits(
             }
             // Connection/commit errors never qualify as known rollback retries.
             Err(error) => return Err(super::transaction_error_into_app(error)),
-        }
-    }
-    unreachable!("ZIP retry loop always returns")
-}
-
-pub(crate) async fn publish_captured_zip_store(
-    store: &crate::store::Store,
-    request: CapturedZipPublication,
-    config: &crate::pinning::config::ValidatedPinningConfig,
-    rules: &crate::pinning::zip_policy::ValidatedZipOutputRules,
-    mode: crate::config::OptionalPinControlMode,
-) -> AppResult<Vec<(String, PublicationResult)>> {
-    let selection = request
-        .capture
-        .resolve_current_with_rules(config, rules, mode)
-        .map_err(|error| AppError::InvalidPinningRequest(error.to_string()))?;
-    let current_limits = &config.provider_limits;
-    let session = work::session();
-    for retry in 0..=super::MAX_TRANSACTION_RETRIES {
-        work::begin_attempt(&session)?;
-        let tx = store
-            .begin_publication_runtime(super::super::management::records::DecodeWork::shared(
-                &session,
-            ))
-            .await
-            .map_err(super::transaction_error_into_app)?;
-        let mut owner = super::PublicationTransaction::Runtime(tx, session.clone());
-        let result = Box::pin(publish_with_reservations(
-            &mut owner,
-            &request,
-            Some(current_limits),
-            &selection,
-        ))
-        .await;
-        let result = match result {
-            Ok(result) => {
-                owner.into_db().commit().await.map_err(|error| {
-                    super::transaction_error_into_app(TransactionError::Connection(error))
-                })?;
-                return Ok(result);
-            }
-            Err(error) => {
-                owner.into_db().rollback().await?;
-                error
-            }
-        };
-        if super::is_retryable_transaction_conflict(&result)
-            && retry < super::MAX_TRANSACTION_RETRIES
-        {
-            super::publication_retry_delay(retry).await;
-        } else {
-            return Err(result);
         }
     }
     unreachable!("ZIP retry loop always returns")
@@ -266,94 +192,16 @@ fn validate(request: &CapturedZipPublication) -> AppResult<()> {
     Ok(())
 }
 
-pub(super) async fn lock_version_frontier<C: ConnectionTrait>(
-    tx: &C,
-    objects: &[&PublicationObject],
-    state: BucketVersioningState,
-    mut maintenance: Option<&mut PublicationLease<'_>>,
-) -> AppResult<Vec<String>> {
-    let locations = objects
-        .iter()
-        .map(|o| (&o.bucket, &o.key))
-        .collect::<BTreeSet<_>>();
-    let mut owners = BTreeSet::new();
-    for (bucket, key) in locations {
-        if let Some(lease) = maintenance.as_deref_mut() {
-            lease.checkpoint(tx).await?;
-        }
-        crate::store::object_version::lock_current_row(tx, bucket, key).await?;
-        if let Some(lease) = maintenance.as_deref_mut() {
-            lease.checkpoint(tx).await?;
-        }
-        crate::store::object_version::allocate_next_sequence(tx, bucket, key).await?;
-        if let Some(lease) = maintenance.as_deref_mut() {
-            lease.checkpoint(tx).await?;
-        }
-        let current = super::lock_current_object_projection(tx, bucket, key).await?;
-        match state {
-            BucketVersioningState::Unversioned => {
-                if let Some(current) = current {
-                    owners.insert(current.id);
-                }
-            }
-            BucketVersioningState::Enabled => {}
-            BucketVersioningState::Suspended => {
-                if let Some(id) = super::lock_null_object_id(tx, bucket, key).await? {
-                    super::lock_object_by_id(tx, &id).await?;
-                    owners.insert(id);
-                }
-            }
-        }
-    }
-    Ok(owners.into_iter().collect())
-}
-
-fn candidate_binding(object: &PublicationObject) -> ZipBoundOutput {
-    ZipBoundOutput {
-        object_id: object.id.clone(),
-        bucket: object.bucket.clone(),
-        key: object.key.clone(),
-        version_id: format!("candidate:{}", object.id),
-        cid: object.cid.clone(),
-        logical_size: object.logical_size,
-    }
-}
-
+#[tracing::instrument(name = "zip_publication", skip_all, fields(batch_id = %request.batch_id, outputs = request.successes.len()))]
 pub(super) async fn publish_in_transaction(
     tx: &DatabaseTransaction,
     request: &CapturedZipPublication,
     current_limits: &crate::pinning::config::ProviderLimitMap,
     selection: &CapturedZipIntent,
 ) -> AppResult<Vec<(String, PublicationResult)>> {
-    publish_with_reservations(
-        &mut super::reservations::Borrowed(tx),
-        request,
-        Some(current_limits),
-        selection,
-    )
-    .await
-}
-
-#[tracing::instrument(name = "zip_publication", skip_all, fields(batch_id = %request.batch_id, outputs = request.successes.len()))]
-async fn publish_with_reservations<
-    R: super::reservations::Reservations<Connection = DatabaseTransaction>,
->(
-    reservations: &mut R,
-    request: &CapturedZipPublication,
-    current_limits: Option<&crate::pinning::config::ProviderLimitMap>,
-    selection: &CapturedZipIntent,
-) -> AppResult<Vec<(String, PublicationResult)>> {
-    let tx = reservations.db();
     validate(request)?;
     crate::store::import::ownership::lock_bucket_for_ownership(tx, request.capture.bucket())
         .await?;
-    let session = match reservations.runtime_work() {
-        Some(session) => session.clone(),
-        None => work::session(),
-    };
-    let work = super::super::management::records::DecodeWork::shared(&session);
-    work.with(|session| session.check())
-        .map_err(super::super::management::admission::work_error)?;
     // Admission readers below run only after the bucket write/fence, before any frontier locks.
     let admission = match &request.authority {
         ZipPublicationAuthority::Legacy(authority) => {
@@ -376,11 +224,7 @@ async fn publish_with_reservations<
         _ => None,
     };
     let mut maintenance = PublicationLease::start(tx, maintained_guard, &request.batch_id).await?;
-    let ordered = objects(request);
     let state = crate::store::bucket::lock_versioning_state(tx, request.capture.bucket()).await?;
-    let locked_objects =
-        objects::LockedObjects::load(tx, request, work, Some(&mut maintenance)).await?;
-    let owners = locked_objects.owners(state);
     maintenance.checkpoint(tx).await?;
     let batch_before = capture::verify_batch(tx, request).await?;
     if let storage::RootOutcome::Verified { claim, .. } = &request.root_outcome {
@@ -395,103 +239,33 @@ async fn publish_with_reservations<
     }
     let manifest_before = capture::verify_manifest(tx, request).await?;
 
-    // Real immutable row IDs replace all placeholders before any decision/lease is written.
-
-    let source_candidate = request.source.as_ref().map(candidate_binding);
-    let candidates = request
-        .successes
-        .iter()
-        .map(candidate_binding)
-        .collect::<Vec<_>>();
-    let candidate = work::select(
-        selection,
-        &request.manifest,
-        source_candidate.as_ref(),
-        &candidates,
-        work,
-    )?;
-    drop(source_candidate);
-    drop(candidates);
-    let allocation_keys = keys::AllocationKeys::load(
-        tx,
-        selection,
-        &candidate,
-        current_limits,
-        work,
-        Some(&mut maintenance),
-    )
-    .await?;
-    let routes = &allocation_keys.routes;
-    let allocatable = &allocation_keys.enabled;
-    maintenance.checkpoint(tx).await?;
     let now = crate::store::database_clock::database_now(tx).await?;
-    let pin_snapshot = pins::LockedPins::load(
-        reservations,
-        &allocation_keys,
-        &candidate,
-        &owners,
-        now,
-        work,
-        Some(&mut maintenance),
-    )
-    .await?;
-    let candidate_shape = allocation::selection_shape(&candidate);
-    drop(candidate);
-    maintenance.checkpoint(reservations.db()).await?;
-    let tx = reservations.db();
-    allocation_keys
-        .verify_aliases(tx, work, Some(&mut maintenance))
-        .await?;
-    if let Some(owner) = reservations.runtime() {
-        ledger::verify_runtime_birth_routes(owner, routes, allocatable, true, work).await?;
-    } else if allocatable.len() == routes.len() {
-        ledger::verify_selected_routes(tx, routes, true).await?;
-    } else {
-        ledger::verify_birth_candidate_routes(tx, routes, allocatable, true).await?;
+    let (results, bindings, leases) =
+        objects::publish_objects(tx, request, state, now, &mut maintenance, selection).await?;
+    let mut references = Vec::new();
+    for lease in leases {
+        let targets: BTreeMap<_, _> = lease
+            .targets
+            .into_iter()
+            .map(|t| (t.cid, t.logical_size))
+            .collect();
+        for (cid, logical_size) in targets {
+            references.push((
+                lease.owner.object_id.clone(),
+                PinTargetSpec { cid, logical_size },
+                lease.intent.clone(),
+            ));
+        }
     }
+    super::resources::attach_many(tx, &references, current_limits, now).await?;
     maintenance.checkpoint(tx).await?;
-    let physical_frontier = objects::prepare_physical(
-        tx,
-        ordered.iter().map(|object| object.cid.clone()).collect(),
-        now,
-        work,
-        Some(&mut maintenance),
-    )
-    .await?;
-    maintenance.checkpoint(tx).await?;
-    pin_snapshot
-        .lock_tail(tx, work, Some(&mut maintenance))
-        .await?;
-    let mut object_writes = locked_objects.plan(request, state, now, work)?;
-    let selected = work::select(
-        selection,
-        &request.manifest,
-        object_writes.source.as_ref(),
-        &object_writes.outputs,
-        work,
-    )?;
-    allocation::verify_candidate(&candidate_shape, &selected)?;
-    object_writes.decisions(request, &selected, work)?;
-    let pin_writes = pin_snapshot.plan(&selected, &allocation_keys, &owners, request, now, work)?;
-    drop(selected);
-    drop(candidate_shape);
-    let results = &object_writes.results;
-    let bindings = &object_writes.bindings;
-    object_writes
-        .persist(reservations.db(), work, &mut maintenance)
-        .await?;
-    pin_writes
-        .persist(reservations.db(), work, &mut maintenance)
-        .await?;
-    let tx = reservations.db();
-    maintenance.checkpoint(tx).await?;
-    let terminal = execution::terminal_result(tx, request, results).await?;
+    let terminal = execution::terminal_result(tx, request, &results).await?;
     match &request.root_outcome {
         storage::RootOutcome::ClaimedFailed { claim, code } => {
             storage::publish_with_maintenance(
                 tx,
                 &claim.batch_id,
-                bindings,
+                &bindings,
                 request.source.is_some(),
                 &terminal,
                 storage::RootOutcome::Failed { code },
@@ -504,7 +278,7 @@ async fn publish_with_reservations<
             storage::publish_with_maintenance(
                 tx,
                 &request.batch_id,
-                bindings,
+                &bindings,
                 request.source.is_some(),
                 &terminal,
                 outcome.clone(),
@@ -517,7 +291,7 @@ async fn publish_with_reservations<
     maintenance.checkpoint(tx).await?;
     match &request.authority {
         ZipPublicationAuthority::Legacy(authority) => {
-            legacy::settle(tx, request, authority, results, now).await?
+            legacy::settle(tx, request, authority, &results, now).await?
         }
         ZipPublicationAuthority::Execution {
             claim,
@@ -531,7 +305,7 @@ async fn publish_with_reservations<
                 claim,
                 source_guard.as_ref(),
                 settlement,
-                results,
+                &results,
                 &terminal,
                 now,
             )
@@ -542,24 +316,13 @@ async fn publish_with_reservations<
         tx,
         &batch_before,
         &manifest_before,
-        bindings,
+        &bindings,
         request.source.is_some(),
         &terminal,
         &request.root_outcome,
     )
     .await?;
-    object_writes.verify(tx, work).await?;
-    physical_frontier.verify(tx, work, None).await?;
-    pin_writes.verify(reservations, work).await?;
-    if let Some(owner) = reservations.runtime() {
-        ledger::verify_runtime_birth_routes(owner, routes, allocatable, false, work).await?;
-    } else {
-        ledger::verify_birth_candidate_routes(tx, routes, allocatable, false).await?;
-    }
-    allocation_keys.verify_aliases(tx, work, None).await?;
-    work.with(|session| session.check())
-        .map_err(super::super::management::admission::work_error)?;
-    Ok(object_writes.results)
+    Ok(results)
 }
 
 pub(super) use capture::read_capture;

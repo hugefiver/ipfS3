@@ -109,7 +109,7 @@ pub(super) async fn prepare_with_envelope(
         .await
         .unwrap()
         .unwrap();
-    execution::bind_clean_input(db, &claim, &"a".repeat(64), "input-cid", 99)
+    execution::bind_clean_input(db, &claim, &"a".repeat(64), ARCHIVE_CID, 99)
         .await
         .unwrap();
     let tx = db.begin().await.unwrap();

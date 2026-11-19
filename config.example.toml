@@ -115,7 +115,8 @@ kind = "pinata"
 token_env = "PINATA_JWT"
 # Pinata options:
 # - api = "v3" uses Pinata's current Resource/Upload APIs.
-# - api = "legacy" uses pinByHash/pinFileToIPFS.
+# - api = "legacy" uses pinByHash/pinFileToIPFS and removes by acknowledged CID
+#   on this backup account, except when the service reported a duplicate.
 # - strategy = "cid" asks Pinata to pin an existing CID.
 # - strategy = "upload" reads the object from local Kubo and uploads the bytes
 #   to Pinata; this can work on free plans that reject pin-by-CID.
@@ -135,22 +136,15 @@ priority = 20
 max_bytes = 107374182400
 max_pins = 10000
 
-# Stable runtime identities are separate from routing aliases (`name`). New
-# accepted MPU/import with executable remote intent requires an explicit entry
-# for every executable configured non-Noop provider; legacy name-only async work
-# is refused.
-# Noop or no executable intent does not require these entries. Historical jobs
-# keep their captured routes. Revisions are administrator-managed and must
-# increase when the referenced credential or endpoint changes; a change before
-# accepted MPU completion fails closed, before side effects. Snapshots persist
-# only secret references such as env names, never secret values or hashes.
-#
-# `storage_domain` is the physical/account pin domain. A provider whose domain
-# equals `primary_storage_domain` is rejected because it is not an independent
-# backup. Aliases for the same backend + scope intentionally share canonical
-# resource accounting. After the final reference expires, cleanup uses the
-# recorded submission or creation receipt, exact resource and historical route. Old cleanup
-# settings are accepted but do not grant or suppress deletion authority.
+# Use stable identities for backup providers. `config_name` joins the routing
+# alias; `scope` identifies the account or pinset, and `storage_domain` must
+# differ from the primary storage domain. Aliases with the same backend and
+# scope and resource type share a resource for each CID. Rotate credentials in
+# place only for the same account. For another account or pinset, use a new
+# scope and keep the old route and credentials until cleanup completes.
+# Raising credential_revision or endpoint_revision does not change the scope.
+# Provider ACKs complete submissions and removals. The worker removes an
+# acknowledged resource by its saved handle once the final reference ends.
 [pinning_identity]
 primary_storage_domain = "kubo:primary"
 
@@ -194,20 +188,10 @@ default_duration = "30d"
 max_duration = "365d"
 allow_decompressed = true
 
-# Stage 5 opt-in RPC examples. All lines below are commented out, so the existing
-# PSA/Pinata routes and policy above are unchanged. Enable each provider/options/
-# identity triple together and explicitly select its name in a policy. Reuse the
-# existing [pinning_identity] table; don't create a second identity registry.
-# RPC requires an explicit identity, positive revisions and an independent domain.
-# Scope/backend are administrator assertions, not inferred from endpoint/token.
-# Bump credential_revision for password/token/Basic username changes and
-# endpoint_revision for endpoint changes. Another account/pinset needs a new scope.
-# A successful, bound gateway submission authorizes CID-wide removal on the
-# selected backup node after the final reference. Independent pins of that CID
-# there are removed too. A read-only match alone remains visible and charged.
-# Stop/drain all old writers/workers and back up before the RPC ledger migration;
-# mixed versions and dangerous down/table deletion are unsupported.
-# Stage 5 verification is running; this example isn't a PASS or account receipt.
+# Optional RPC providers: enable the provider, its RPC options and its identity
+# together, then select its name in a policy. RPC requires positive revisions
+# and an independent storage domain. A CID-based unpin after the last reference
+# releases that CID on the backup node, including an identical independent pin.
 
 # Independent private Kubo: cid, upload or car (explicit strategy required).
 # cid needs target access to the DAG; upload uses stored bytes, not S3 plaintext.
@@ -254,8 +238,8 @@ allow_decompressed = true
 # outside TOML; references accept uppercase letters, digits and underscores.
 # Never reuse source-node credentials or forward RPC credentials to a gateway.
 
-# Filebase RPC: upload only, Bearer only. This does not replace filebase-primary's
-# historical PSA route. Real Filebase/Pinata account tests remain NOT RUN.
+# Filebase RPC: upload only, Bearer only. Configure this separately from
+# filebase-primary's PSA route.
 # [[pinning.providers]]
 # name = "filebase-rpc-backup"
 # kind = "filebase"
@@ -295,13 +279,12 @@ allow_decompressed = true
 # raw-leaves/chunker/pin=false/progress=true, and never appends pin/add after add.
 # Filebase RPC cid/CAR and PSA upload are rejected; no automatic fallback.
 # Codec + multihash must match (equivalent CIDv0/v1 is allowed). S3 ETag/CID stays
-# unchanged. Unknown/mismatch footprints remain durable and block automatic
-# re-POST/deletion; timeout/terminal job/lease expiry doesn't release that debt.
+# unchanged. A lost upload response can leave a remote pin with no known handle.
 
-# Stage 6 opt-in independent Cluster provider. This does not replace the main
-# [kubo] endpoint or change the Cluster deployment's replication_min/max.
+# Optional independent Cluster provider. This does not replace the main [kubo]
+# endpoint or change the Cluster deployment's replication_min/max.
 # Enable the provider/identity together and explicitly select it in a policy.
-# Proxy requires both proxy_endpoint and the independent REST status verifier.
+# Proxy requires both proxy_endpoint and rest_endpoint in the configuration.
 # For native REST, set protocol = "rest", omit proxy_endpoint/proxy_auth, and
 # use api_profile = "cluster-rest". Both protocols require explicit cid/upload/car.
 # [[pinning.providers]]
@@ -316,12 +299,8 @@ allow_decompressed = true
 # protocol = "proxy"
 # proxy_endpoint = "http://127.0.0.1:9095"
 # rest_endpoint = "http://127.0.0.1:9094"
-# min_replicas = 2
 # allow_private_network = true
 # stream_channels = true
-#
-# [pinning.providers.cluster.verifier_limits]
-# max_age_secs = 30
 #
 # [[pinning_identity.providers]]
 # config_name = "cluster-backup"
@@ -343,8 +322,5 @@ allow_decompressed = true
 # Bump credential/endpoint revisions when any of these independent routes changes.
 # CID strategy does not use source credentials. Upload/CAR only read the captured
 # main Kubo source; no alternate source URL or plaintext decryption is configured.
-# min_replicas is a fresh confirmation threshold, not a deployment RF setting.
-# Same backend/pinset/CID via multiple addresses is one logical resource, not
-# independent disaster recovery. Unknown ownership never authorizes deletion.
-# Stop/drain old writers/workers and back up before the replica-contract migration;
-# keep immutable requirements/observations and do not bypass a refused down.
+# Submission completes on the Cluster response. No peer count or physical
+# replication check follows it. Multiple addresses for one pinset share pins.

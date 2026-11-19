@@ -1,5 +1,5 @@
 //! Lossless vertical partition. Cold cells stay SQL text/NULL, never JSON casts.
-use crate::store::{entities::import_job, pinning::management::schema::storage};
+use crate::store::entities::import_job;
 use sea_orm::{ConnectionTrait, DatabaseBackend, DbErr, Iterable, Statement, sea_query::Iden};
 
 async fn source_page<C: ConnectionTrait>(
@@ -67,19 +67,6 @@ pub(crate) async fn migrate<C: ConnectionTrait>(db: &C) -> Result<(), DbErr> {
     for column in columns {
         db.execute_unprepared(&format!("ALTER TABLE import_jobs DROP COLUMN {column}"))
             .await?;
-    }
-    db.execute_unprepared("INSERT INTO pin_management_revision VALUES ('import_job_requests',0)")
-        .await?;
-    for (name, table, event, body) in storage::triggers(db.get_database_backend())
-        .into_iter()
-        .filter(|(_, table, _, _)| table == "import_job_requests")
-    {
-        for ddl in storage::trigger_ddl(db.get_database_backend(), &name, &table, event, &body) {
-            db.execute_unprepared(&ddl).await?;
-        }
-    }
-    if db.get_database_backend() == DatabaseBackend::Postgres {
-        db.execute_unprepared("CREATE TRIGGER s75_import_job_requests_truncate BEFORE TRUNCATE ON import_job_requests FOR EACH STATEMENT EXECUTE FUNCTION s75_no_truncate()").await?;
     }
     Ok(())
 }

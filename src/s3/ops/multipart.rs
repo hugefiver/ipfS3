@@ -238,8 +238,8 @@ pub async fn create_multipart_upload(
                 "ZIP multipart Create request conflict"
             ));
         }
-        let original_id = crate::store::multipart::v2_zip::create_or_replay_store(
-            &state.store,
+        let original_id = crate::store::multipart::v2_zip::create_or_replay_with_zip_intent(
+            db,
             &crate::store::multipart::v2_zip::Intake {
                 upload_id,
                 object_id,
@@ -347,11 +347,7 @@ pub async fn create_multipart_upload(
         EncryptionMode::None => (None, None),
     };
 
-    let work = crate::store::pinning::management::records::SharedDecodeBudget::default();
-    let txn = state
-        .store
-        .begin_runtime(crate::store::pinning::management::records::DecodeWork::shared(&work))
-        .await?;
+    let txn = db.begin().await.map_err(crate::error::AppError::from)?;
     crate::store::import::ownership::lock_bucket_for_ownership(&txn, bucket).await?;
     if let Some(intent) = &zip_intent {
         let mut admission = crate::s3::route::decompress_zip::legacy_batch_admission(
@@ -372,7 +368,8 @@ pub async fn create_multipart_upload(
         })
         .to_string();
         let original =
-            crate::store::zip::BatchAdmission::admit_legacy_runtime(&txn, &admission).await?;
+            crate::store::zip::BatchAdmission::admit_legacy_in_transaction(&txn, &admission)
+                .await?;
         if crate::store::pinning::publication::decode_zip_capture_json(&original.captured_options)?
             != *intent
         {
@@ -382,7 +379,7 @@ pub async fn create_multipart_upload(
             ));
         }
     }
-    crate::store::multipart::create_upload_with_zip_intent_core(
+    crate::store::multipart::create_upload_with_zip_intent(
         &txn,
         &upload_id,
         &object_id,
@@ -398,10 +395,9 @@ pub async fn create_multipart_upload(
         decompress_zip_result,
         Some(&decision),
         zip_intent.as_ref(),
-        Some(&txn),
     )
     .await?;
-    txn.commit().await?;
+    txn.commit().await.map_err(crate::error::AppError::from)?;
 
     let server_side_encryption = if enc_mode == EncryptionMode::SseS3 {
         Some(ServerSideEncryption::from_static("AES256"))
@@ -1193,7 +1189,7 @@ pub(crate) trait CompletedUploadFinalizerStore: Send + Sync {
 }
 
 struct DatabaseCompletedUploadFinalizer<'a> {
-    store: &'a crate::store::Store,
+    db: &'a sea_orm::DatabaseConnection,
     pinning: &'a crate::pinning::coordinator::PinningCoordinator,
 }
 
@@ -1207,8 +1203,8 @@ impl CompletedUploadFinalizerStore for DatabaseCompletedUploadFinalizer<'_> {
         _limits: &ProviderLimitMap,
         decision: &ExtensionDecision,
     ) -> Result<PublicationResult, crate::store::multipart::CommitCompletedUploadError> {
-        crate::store::pinning::publication::application::publish_decided_completed_upload(
-            self.store,
+        crate::store::pinning::publication::publish_decided_completed_upload(
+            self.db,
             upload_target,
             request,
             Some(guard),
@@ -1230,8 +1226,8 @@ impl CompletedUploadFinalizerStore for DatabaseCompletedUploadFinalizer<'_> {
         _limits: &ProviderLimitMap,
         decision: &ExtensionDecision,
     ) -> Result<PublicationResult, crate::store::multipart::CommitCompletedUploadError> {
-        crate::store::pinning::publication::application::publish_decided_completed_zip(
-            self.store,
+        crate::store::pinning::publication::publish_decided_completed_zip(
+            self.db,
             upload_target,
             request,
             Some(guard),
@@ -1253,8 +1249,8 @@ impl CompletedUploadFinalizerStore for DatabaseCompletedUploadFinalizer<'_> {
         guard: crate::store::import::ownership::StandardMutationGuard,
         limits: &ProviderLimitMap,
     ) -> Result<PublicationResult, crate::store::multipart::CommitCompletedUploadError> {
-        crate::store::pinning::publication::application::publish_standard_completed_upload(
-            self.store,
+        crate::store::pinning::publication::publish_standard_completed_upload(
+            self.db,
             upload_target,
             request,
             guard,
@@ -1270,8 +1266,8 @@ impl CompletedUploadFinalizerStore for DatabaseCompletedUploadFinalizer<'_> {
         guard: crate::store::import::ownership::StandardMutationGuard,
         limits: &ProviderLimitMap,
     ) -> Result<PublicationResult, crate::store::multipart::CommitCompletedUploadError> {
-        crate::store::pinning::publication::application::publish_standard_completed_zip(
-            self.store,
+        crate::store::pinning::publication::publish_standard_completed_zip(
+            self.db,
             upload_target,
             request,
             guard,
@@ -1286,7 +1282,7 @@ impl CompletedUploadFinalizerStore for DatabaseCompletedUploadFinalizer<'_> {
         expected_archive: &PublicationObject,
     ) -> crate::store::pinning::publication::ReconciledPublicationOutcome {
         crate::store::pinning::publication::reconcile_completed_publication(
-            self.store.db(),
+            self.db,
             upload_id,
             expected_archive,
         )
@@ -1328,7 +1324,7 @@ pub async fn finalize_completed_multipart_zip(
     request: ZipPublicationRequest,
 ) -> S3Result<PublicationResult> {
     let store = DatabaseCompletedUploadFinalizer {
-        store: &state.store,
+        db: state.store.db(),
         pinning: &state.pinning,
     };
     let work = finalize_completed_multipart_zip_with_store(
@@ -1366,8 +1362,8 @@ pub async fn finalize_completed_multipart_zip_batch(
     }
     let work = async {
         Ok::<_, s3s::S3Error>(
-            crate::store::pinning::publication::application::publish_captured_zip(
-                &state.store,
+            crate::store::pinning::publication::publish_captured_zip(
+                state.store.db(),
                 request,
                 state.pinning.effective_config(),
                 state.pinning.zip_output_rules(),
@@ -1513,7 +1509,7 @@ pub async fn finalize_completed_multipart_archive(
     completed: &CompletedMultipartArchive,
 ) -> S3Result<PublicationResult> {
     let store = DatabaseCompletedUploadFinalizer {
-        store: &state.store,
+        db: state.store.db(),
         pinning: &state.pinning,
     };
     let work = finalize_completed_multipart_archive_with_store(
@@ -1827,21 +1823,16 @@ pub async fn complete_multipart_upload_inner(
         policy
     };
 
-    // This read rejects an already-overwritten route before admission or Kubo I/O.
-    // Publication will lock and recheck the same route after the usage frontier.
     if let Some(intent) = &zip_intent {
         crate::store::pinning::publication::preflight_captured_zip_routes(
-            &state.store,
             intent,
             state.pinning.effective_config(),
             state.pinning.zip_output_rules(),
             state.pinning.control_mode(),
             None,
-        )
-        .await?;
+        )?;
     } else if let Some(decision) = &pin_decision {
         crate::store::pinning::publication::preflight_decided_routes(
-            db,
             DecidedPublish {
                 decision,
                 config: state.pinning.effective_config(),
@@ -1849,8 +1840,7 @@ pub async fn complete_multipart_upload_inner(
                 limits: state.pinning.provider_limits(),
             },
             &publication_policy,
-        )
-        .await?;
+        )?;
     }
 
     let enc_mode = EncryptionMode::parse(&upload.encryption_mode);
@@ -2260,8 +2250,8 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use sea_orm::{
-        ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, PaginatorTrait, QueryFilter,
-        Statement, TransactionTrait,
+        ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, FromQueryResult,
+        PaginatorTrait, QueryFilter, Statement, TransactionTrait,
     };
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -2586,7 +2576,6 @@ mod tests {
         let store = crate::store::Store::new(db);
         let pinning =
             configured_pinning_coordinator(trigger, provider_mode, prefix, allow_decompressed);
-        pinning.register_identities(&store).await.unwrap();
         Arc::new(AppState {
             kubo: crate::kubo::KuboClient::new(kubo_uri),
             cold_kubo: None,
@@ -2624,34 +2613,49 @@ mod tests {
         .unwrap()
     }
 
-    async fn pinning_row_counts(state: &Arc<AppState>) -> [u64; 5] {
-        use crate::store::entities::{
-            pin_job, pin_lease, pin_lease_target, pin_provider_usage, remote_pin,
-        };
-
+    async fn pinning_row_counts(state: &Arc<AppState>) -> [i64; 2] {
+        let db = state.store.db();
+        let row = db
+            .query_one(Statement::from_string(
+                db.get_database_backend(),
+                "SELECT (SELECT COUNT(*) FROM pin_refs) AS refs,
+                    (SELECT COUNT(*) FROM pin_resources) AS resources",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
         [
-            pin_lease::Entity::find()
-                .count(state.store.db())
-                .await
-                .unwrap(),
-            pin_lease_target::Entity::find()
-                .count(state.store.db())
-                .await
-                .unwrap(),
-            remote_pin::Entity::find()
-                .count(state.store.db())
-                .await
-                .unwrap(),
-            pin_provider_usage::Entity::find()
-                .count(state.store.db())
-                .await
-                .unwrap(),
-            pin_job::Entity::find()
-                .count(state.store.db())
-                .await
-                .unwrap(),
+            row.try_get("", "refs").unwrap(),
+            row.try_get("", "resources").unwrap(),
         ]
     }
+
+    #[derive(FromQueryResult)]
+    struct FilePin {
+        provider: String,
+        cid: String,
+        source: String,
+        expires_at: i64,
+        logical_size: i64,
+        action: Option<String>,
+    }
+
+    async fn file_pins(state: &Arc<AppState>, owner: &str) -> Vec<FilePin> {
+        let db = state.store.db();
+        FilePin::find_by_statement(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            "SELECT r.provider, r.cid, r.source, r.expires_at, p.logical_size, p.action
+             FROM pin_refs r JOIN pin_resources p ON p.provider = r.provider AND p.cid = r.cid
+             WHERE r.owner_object_id = $1 ORDER BY r.provider",
+            [owner.into()],
+        ))
+        .all(db)
+        .await
+        .unwrap()
+    }
+
+    const PIN_ROOT_CID: &str = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
+    const PREVIOUS_PIN_CID: &str = "bafkreigh2akiscaildc6ii5zji4bq7kly5k3s7svv6q2wx2nn5rtj5xuu4";
 
     async fn file_backed_test_state_with_bucket_and_kubo(
         name: &str,
@@ -4718,7 +4722,7 @@ mod tests {
                 crate::pinning::tags::ObjectTag::new("space", "hello world"),
             ]
         );
-        assert_eq!(pinning_row_counts(&state).await, [0; 5]);
+        assert_eq!(pinning_row_counts(&state).await, [0; 2]);
         assert!(kubo.received_requests().await.unwrap().is_empty());
     }
 
@@ -4796,7 +4800,7 @@ mod tests {
                 .unwrap(),
             0
         );
-        assert_eq!(pinning_row_counts(&state).await, [0; 5]);
+        assert_eq!(pinning_row_counts(&state).await, [0; 2]);
         assert!(kubo.received_requests().await.unwrap().is_empty());
     }
 
@@ -4901,7 +4905,7 @@ mod tests {
                 .unwrap(),
             0
         );
-        assert_eq!(pinning_row_counts(&state).await, [0; 5]);
+        assert_eq!(pinning_row_counts(&state).await, [0; 2]);
         assert!(kubo.received_requests().await.unwrap().is_empty());
     }
 
@@ -4935,7 +4939,7 @@ mod tests {
                 crate::pinning::tags::ObjectTag::new("ipfs-s3:content", "decompressed"),
             ]
         );
-        assert_eq!(pinning_row_counts(&state).await, [0; 5]);
+        assert_eq!(pinning_row_counts(&state).await, [0; 2]);
         assert!(kubo.received_requests().await.unwrap().is_empty());
     }
 
@@ -4949,17 +4953,17 @@ mod tests {
         upload_part(&state, upload_part_request(&upload_id, b"part"))
             .await
             .unwrap();
-        assert_eq!(pinning_row_counts(&state).await, [0; 5]);
+        assert_eq!(pinning_row_counts(&state).await, [0; 2]);
 
         abort_multipart_upload(&state, abort_request(&upload_id))
             .await
             .unwrap();
-        assert_eq!(pinning_row_counts(&state).await, [0; 5]);
+        assert_eq!(pinning_row_counts(&state).await, [0; 2]);
         assert_no_pin_removes(&kubo, &["QmPart"]).await;
     }
 
     #[tokio::test]
-    async fn multipart_runtime_route_mismatch_rejects_before_admission_or_kubo() {
+    async fn multipart_unavailable_manual_provider_rejects_before_admission_or_kubo() {
         use crate::pinning::decision::DecisionEffect;
         use crate::store::entities::{import_destination, standard_mutation_lease};
 
@@ -5048,10 +5052,12 @@ mod tests {
                 assert_eq!(kubo.received_requests().await.unwrap().len(), before.len());
             }
 
-            let mut rotated = state.pinning.effective_config().clone();
-            rotated.providers[0].identity.endpoint_revision += 1;
+            let mut current = state.pinning.effective_config().clone();
+            for provider in &mut current.providers {
+                provider.identity.retired = true;
+            }
             Arc::get_mut(&mut state).unwrap().pinning =
-                crate::pinning::coordinator::PinningCoordinator::build(rotated).unwrap();
+                crate::pinning::coordinator::PinningCoordinator::build(current).unwrap();
 
             let mut complete = complete_request(&upload_id, part_etag.value());
             if zip {
@@ -5091,19 +5097,16 @@ mod tests {
                     .await
                     .is_ok()
             );
-            assert_eq!(pinning_row_counts(&state).await, [0; 5]);
+            assert_eq!(pinning_row_counts(&state).await, [0; 2]);
         }
     }
 
     #[tokio::test]
-    async fn registered_route_override_rejects_accepted_complete_before_kubo_or_admission() {
+    async fn missing_durable_provider_identity_rejects_complete_before_kubo_or_admission() {
         use crate::{
             config::Config,
             pinning::{config::ValidatedPinningConfig, coordinator::PinningCoordinator},
-            store::{
-                entities::{import_destination, standard_mutation_lease},
-                pinning::ledger,
-            },
+            store::entities::{import_destination, standard_mutation_lease},
         };
 
         for zip in [false, true] {
@@ -5153,11 +5156,6 @@ mod tests {
             )
             .unwrap();
             Arc::get_mut(&mut state).unwrap().pinning = pinning;
-            state
-                .pinning
-                .register_identities(&state.store)
-                .await
-                .unwrap();
             let mut create = multipart_create_request_with_tagging(
                 "test-bucket",
                 "archive.zip",
@@ -5227,12 +5225,9 @@ mod tests {
                 );
                 assert!(kubo.received_requests().await.unwrap().is_empty());
             }
-            let provider = &state.pinning.effective_config().providers[0];
-            let mut r2 = provider.identity.clone();
-            r2.credential_revision += 1;
-            ledger::register_route(state.store.db(), &provider.name, &r2)
-                .await
-                .unwrap();
+            let mut current = state.pinning.effective_config().clone();
+            current.providers[0].identity.provider_id = "legacy:remote".into();
+            Arc::get_mut(&mut state).unwrap().pinning = PinningCoordinator::build(current).unwrap();
 
             let mut complete = complete_request(&upload_id, "QmPart");
             if zip {
@@ -5246,7 +5241,6 @@ mod tests {
             let result = complete_multipart_upload_inner(&state, complete).await;
             let error = result.unwrap_err();
             assert_eq!(error.code().as_str(), "InvalidArgument", "zip={zip}");
-            assert!(error.to_string().contains("route"));
             assert!(
                 kubo.received_requests().await.unwrap().is_empty(),
                 "zip={zip}"
@@ -5270,7 +5264,7 @@ mod tests {
                     .await
                     .is_ok()
             );
-            assert_eq!(pinning_row_counts(&state).await, [0; 5]);
+            assert_eq!(pinning_row_counts(&state).await, [0; 2]);
         }
     }
 
@@ -5304,22 +5298,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn zip_mpu_current_route_mismatch_rejects_before_io_and_unavailable_auto_is_skipped() {
+    async fn zip_mpu_skips_unavailable_automatic_pinning() {
         use crate::pinning::coordinator::PinningCoordinator;
-        use crate::store::entities::{import_destination, object, standard_mutation_lease};
 
-        for field in [
-            "endpoint",
-            "credential",
-            "account",
-            "backend",
-            "scope",
-            "storage_domain",
-            "api_profile",
-            "strategy",
-            "retired",
-            "disabled",
-        ] {
+        for retired in [false, true] {
             let kubo = multipart_kubo(&["QmUnexpectedRoot"]).await;
             Mock::given(method("POST"))
                 .and(path("/api/v0/cat"))
@@ -5354,27 +5336,11 @@ mod tests {
             assert!(capture.source_decision().effective_intents.is_empty());
             assert!(capture.controls().targets.extracted);
             let mut current = state.pinning.effective_config().clone();
-            let provider = &mut current.providers[0];
-            match field {
-                "endpoint" => provider.identity.endpoint_revision += 1,
-                "credential" => provider.identity.credential_revision += 1,
-                "account" => provider.identity.provider_id.push_str("-changed"),
-                "backend" => provider.identity.backend = "changed".into(),
-                "scope" => provider.identity.scope.push_str("-changed"),
-                "storage_domain" => provider.identity.storage_domain.push_str("-changed"),
-                "api_profile" => provider.identity.api_profile = "changed".into(),
-                "strategy" => provider.identity.strategy = "changed".into(),
-                "retired" => provider.identity.retired = true,
-                "disabled" => provider.limits.enabled = false,
-                _ => unreachable!(),
-            }
-            if matches!(field, "retired" | "disabled") {
-                for provider in &mut current.providers {
-                    if field == "retired" {
-                        provider.identity.retired = true;
-                    } else {
-                        provider.limits.enabled = false;
-                    }
+            for provider in &mut current.providers {
+                if retired {
+                    provider.identity.retired = true;
+                } else {
+                    provider.limits.enabled = false;
                 }
             }
             Arc::get_mut(&mut state).unwrap().pinning =
@@ -5385,41 +5351,15 @@ mod tests {
                     &zip,
                 )
                 .unwrap();
-            let result = complete_multipart_upload_inner(
+            let completed = complete_multipart_upload_inner(
                 &state,
                 r25_authenticated_complete(&upload.upload_id),
             )
-            .await;
-            if matches!(field, "retired" | "disabled") {
-                let completed = result.unwrap();
-                assert_eq!(completed.zip_intent.as_ref(), Some(&capture));
-                assert!(completed.publication_policy.leases.is_empty());
-                assert_eq!(pinning_row_counts(&state).await, [0; 5]);
-                continue;
-            }
-            let error = result.unwrap_err();
-            assert_eq!(error.code().as_str(), "InvalidArgument", "{field}: {error}");
-            assert!(
-                kubo.received_requests().await.unwrap().is_empty(),
-                "{field}"
-            );
-            for count in [
-                import_destination::Entity::find()
-                    .count(state.store.db())
-                    .await
-                    .unwrap(),
-                standard_mutation_lease::Entity::find()
-                    .count(state.store.db())
-                    .await
-                    .unwrap(),
-                object::Entity::find()
-                    .count(state.store.db())
-                    .await
-                    .unwrap(),
-            ] {
-                assert_eq!(count, 0, "{field}");
-            }
-            assert_eq!(pinning_row_counts(&state).await, [0; 5], "{field}");
+            .await
+            .unwrap();
+            assert_eq!(completed.zip_intent.as_ref(), Some(&capture));
+            assert!(completed.publication_policy.leases.is_empty());
+            assert_eq!(pinning_row_counts(&state).await, [0; 2]);
             assert_eq!(
                 crate::store::multipart::get_upload(state.store.db(), &upload.upload_id)
                     .await
@@ -5522,7 +5462,7 @@ mod tests {
                 .captured_options,
             batch.captured_options
         );
-        assert_eq!(pinning_row_counts(&state).await, [0; 5]);
+        assert_eq!(pinning_row_counts(&state).await, [0; 2]);
         assert!(
             crate::store::entities::object::Entity::find()
                 .all(state.store.db())
@@ -5603,7 +5543,7 @@ mod tests {
             .unwrap();
             assert_eq!(completed.zip_intent.as_ref(), Some(&capture));
             assert!(completed.publication_policy.leases.is_empty());
-            assert_eq!(pinning_row_counts(&state).await, [0; 5]);
+            assert_eq!(pinning_row_counts(&state).await, [0; 2]);
             assert_eq!(
                 crate::store::multipart::get_upload(state.store.db(), &upload.upload_id)
                     .await
@@ -5623,9 +5563,9 @@ mod tests {
 
     #[tokio::test]
     async fn pinning_complete_atomically_publishes_all_mode_from_commit_time() {
-        use crate::store::entities::{pin_job, pin_lease, pin_lease_target, pin_provider_usage};
+        use crate::store::database_clock::database_now;
 
-        let kubo = multipart_kubo(&["QmRoot"]).await;
+        let kubo = multipart_kubo(&[PIN_ROOT_CID]).await;
         Mock::given(method("POST"))
             .and(path("/api/v0/cat"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(b"part data"))
@@ -5653,10 +5593,11 @@ mod tests {
         .await
         .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-
+        let before = database_now(state.store.db()).await.unwrap();
         complete_multipart_upload(&state, complete_request(&upload_id, "QmPart"))
             .await
             .unwrap();
+        let after = database_now(state.store.db()).await.unwrap();
 
         let object =
             crate::store::object::get_latest(state.store.db(), "test-bucket", "archive.zip")
@@ -5664,7 +5605,7 @@ mod tests {
                 .unwrap();
         uuid::Uuid::parse_str(&object.id).unwrap();
         assert!(object.multipart);
-        assert_eq!(object.cid, "QmRoot");
+        assert_eq!(object.cid, PIN_ROOT_CID);
         assert_eq!(
             crate::store::pinning::tags::list_object_tags(state.store.db(), &object.id)
                 .await
@@ -5675,38 +5616,19 @@ mod tests {
                 crate::pinning::tags::ObjectTag::new("team", "storage"),
             ]
         );
-        let lease = pin_lease::Entity::find()
-            .filter(pin_lease::Column::OwnerObjectId.eq(&object.id))
-            .one(state.store.db())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(lease.created_at > upload_created_at);
-        assert_eq!((lease.expires_at - lease.created_at).num_seconds(), 3_600);
-        assert_eq!(
-            pin_lease_target::Entity::find()
-                .filter(pin_lease_target::Column::LeaseId.eq(&lease.id))
-                .count(state.store.db())
-                .await
-                .unwrap(),
-            2
-        );
-        for provider in ["alpha", "beta"] {
-            let usage = pin_provider_usage::Entity::find_by_id(provider)
-                .one(state.store.db())
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!((usage.reserved_bytes, usage.reserved_pins), (9, 1));
+        let pins = file_pins(&state, &object.id).await;
+        assert_eq!(pins.len(), 2);
+        for (pin, provider) in pins.iter().zip(["alpha", "beta"]) {
+            assert_eq!(pin.provider, provider);
+            assert_eq!(pin.cid, PIN_ROOT_CID);
+            assert_eq!(pin.source, "manual");
+            assert_eq!(pin.logical_size, 9);
+            assert_eq!(pin.action.as_deref(), Some("submit"));
+            let expires = chrono::DateTime::from_timestamp_micros(pin.expires_at).unwrap();
+            let requested_at = expires - chrono::TimeDelta::hours(1);
+            assert!(requested_at > upload_created_at);
+            assert!((before..=after).contains(&requested_at));
         }
-        assert_eq!(
-            pin_job::Entity::find()
-                .filter(pin_job::Column::Operation.eq("submit"))
-                .count(state.store.db())
-                .await
-                .unwrap(),
-            2
-        );
         assert!(
             crate::store::multipart::get_upload(state.store.db(), &upload_id)
                 .await
@@ -5718,23 +5640,17 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert_pin_add_count(&kubo, "QmRoot", 1).await;
-        assert_no_pin_removes(&kubo, &["QmRoot", "QmPart"]).await;
+        assert_pin_add_count(&kubo, PIN_ROOT_CID, 1).await;
+        assert_no_pin_removes(&kubo, &[PIN_ROOT_CID, "QmPart"]).await;
     }
 
     #[tokio::test]
-    async fn pinning_complete_lease_or_job_failure_rolls_back_every_database_change() {
-        for (failure, trigger) in [
-            (
-                "lease",
-                "CREATE TRIGGER fail_complete_publication BEFORE INSERT ON pin_leases BEGIN SELECT RAISE(FAIL, 'forced lease failure'); END;",
-            ),
-            (
-                "job",
-                "CREATE TRIGGER fail_complete_publication BEFORE INSERT ON pin_jobs BEGIN SELECT RAISE(FAIL, 'forced job failure'); END;",
-            ),
-        ] {
-            let kubo = multipart_kubo(&["QmRoot"]).await;
+    async fn pinning_complete_ref_or_resource_failure_rolls_back_every_database_change() {
+        for failure in ["pin_refs", "pin_resources"] {
+            let trigger = format!(
+                "CREATE TRIGGER fail_complete_publication BEFORE INSERT ON {failure} BEGIN SELECT RAISE(FAIL, 'forced pin write failure'); END;"
+            );
+            let kubo = multipart_kubo(&[PIN_ROOT_CID]).await;
             Mock::given(method("POST"))
                 .and(path("/api/v0/cat"))
                 .respond_with(ResponseTemplate::new(200).set_body_bytes(b"part data"))
@@ -5771,7 +5687,7 @@ mod tests {
             )
             .await
             .unwrap();
-            state.store.db().execute_unprepared(trigger).await.unwrap();
+            state.store.db().execute_unprepared(&trigger).await.unwrap();
 
             let error = complete_multipart_upload(&state, complete_request(&upload_id, "QmPart"))
                 .await
@@ -5800,7 +5716,7 @@ mod tests {
                 1,
                 "{failure}"
             );
-            assert_eq!(pinning_row_counts(&state).await, [0; 5], "{failure}");
+            assert_eq!(pinning_row_counts(&state).await, [0; 2], "{failure}");
             assert_eq!(
                 crate::store::entities::object::Entity::find()
                     .count(state.store.db())
@@ -5817,19 +5733,18 @@ mod tests {
                 0,
                 "{failure}"
             );
-            assert_no_pin_removes(&kubo, &["QmRoot", "QmPart"]).await;
+            assert_no_pin_removes(&kubo, &[PIN_ROOT_CID, "QmPart"]).await;
         }
     }
 
     #[tokio::test]
-    async fn pinning_complete_overwrite_ends_previous_leases() {
+    async fn pinning_complete_overwrite_releases_previous_file_refs() {
         use crate::pinning::policy::PublicationContext;
-        use crate::store::entities::{pin_lease, pin_lease_target};
         use crate::store::pinning::publication::{
             PinTargetSpec, PublicationObject, PublicationRequest,
         };
 
-        let kubo = multipart_kubo(&["QmRoot"]).await;
+        let kubo = multipart_kubo(&[PIN_ROOT_CID]).await;
         Mock::given(method("POST"))
             .and(path("/api/v0/cat"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(b"part data"))
@@ -5854,7 +5769,7 @@ mod tests {
                     "old-object".to_owned(),
                     "test-bucket",
                     "archive.zip",
-                    "QmOld".to_owned(),
+                    PREVIOUS_PIN_CID.to_owned(),
                     3,
                     Some("text/plain".to_owned()),
                     None,
@@ -5866,7 +5781,7 @@ mod tests {
                 tags: old_policy.tags.clone(),
                 policy: old_policy,
                 object_target: PinTargetSpec {
-                    cid: "QmOld".to_owned(),
+                    cid: PREVIOUS_PIN_CID.to_owned(),
                     logical_size: 3,
                 },
             },
@@ -5874,6 +5789,7 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(file_pins(&state, "old-object").await.len(), 1);
         let upload_id =
             create_tagged_upload(&state, "archive.zip", "ipfs-s3%3Apin=true&team=new").await;
         crate::store::multipart::upsert_part(
@@ -5891,36 +5807,15 @@ mod tests {
             .await
             .unwrap();
 
-        let old_lease = pin_lease::Entity::find()
-            .filter(pin_lease::Column::OwnerObjectId.eq("old-object"))
-            .one(state.store.db())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(old_lease.state, "cancelled");
-        assert_eq!(old_lease.generation, 2);
-        assert!(
-            pin_lease_target::Entity::find()
-                .filter(pin_lease_target::Column::LeaseId.eq(&old_lease.id))
-                .all(state.store.db())
-                .await
-                .unwrap()
-                .iter()
-                .all(|target| target.state == "released")
-        );
+        assert!(file_pins(&state, "old-object").await.is_empty());
         let latest =
             crate::store::object::get_latest(state.store.db(), "test-bucket", "archive.zip")
                 .await
                 .unwrap();
-        assert_eq!(
-            pin_lease::Entity::find()
-                .filter(pin_lease::Column::OwnerObjectId.eq(latest.id))
-                .filter(pin_lease::Column::State.eq("active"))
-                .count(state.store.db())
-                .await
-                .unwrap(),
-            1
-        );
-        assert_no_pin_removes(&kubo, &["QmOld", "QmRoot", "QmPart"]).await;
+        let pins = file_pins(&state, &latest.id).await;
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0].cid, PIN_ROOT_CID);
+        assert_eq!(pinning_row_counts(&state).await, [1, 1]);
+        assert_no_pin_removes(&kubo, &[PREVIOUS_PIN_CID, PIN_ROOT_CID, "QmPart"]).await;
     }
 }

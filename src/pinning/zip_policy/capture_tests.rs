@@ -507,49 +507,6 @@ fn current_config_edits_change_execution_without_rewriting_capture_receipts() {
 }
 
 #[test]
-fn r25_stage6_confirmation_is_frozen_in_output_and_manual_routes() {
-    let mut config = fixture();
-    config.providers[0].cluster = Some(crate::pinning::cluster::provider::ClusterProviderOptions {
-        min_replicas: 3,
-        ..Default::default()
-    });
-    let required = config.providers[0].route_snapshot().confirmation;
-    assert!(required.is_some());
-    let captured = capture(
-        &config,
-        &enabled(),
-        false,
-        &[],
-        &[ObjectTag::new("ipfs-s3:pin", "true")],
-    )
-    .unwrap();
-    let source = bound("exports/archive.zip", "source");
-    let outputs = [bound("exports/a", "output")];
-    let selected =
-        select_zip_intents(&captured, &manifest(&outputs), Some(&source), &outputs).unwrap();
-    assert_eq!(selected.leases.len(), 2);
-    for lease in selected.leases {
-        assert_eq!(lease.providers[0].route.confirmation, required);
-    }
-    let json = serde_json::to_string(&captured).unwrap();
-    assert_eq!(CapturedZipIntent::decode_json(&json).unwrap(), captured);
-    config.providers[0].cluster.as_mut().unwrap().min_replicas = 5;
-    let current = captured
-        .resolve_current(&config, &enabled(), OptionalPinControlMode::Warn)
-        .unwrap();
-    let selected =
-        select_zip_intents(&current, &manifest(&outputs), Some(&source), &outputs).unwrap();
-    for lease in selected.leases {
-        assert_eq!(
-            lease.providers[0].route.confirmation,
-            config.providers[0].route_snapshot().confirmation
-        );
-        assert_ne!(lease.providers[0].route.confirmation, required);
-    }
-    assert_eq!(serde_json::to_string(&captured).unwrap(), json);
-}
-
-#[test]
 fn legacy_v1_receipt_keeps_original_evidence_and_resolves_current_manual_owner() {
     let config = fixture();
     let tags = [
@@ -723,14 +680,6 @@ fn legacy_v2_receipt_survives_current_config_changes_and_rejects_evidence_loss()
     let mut wrong = outputs[0].clone();
     wrong.cid = "wrong-cid".into();
     assert!(select_zip_intents(&current, &manifest(&outputs), Some(&source), &[wrong]).is_err());
-    historical["pin_plan"]["outputs"][0]["intents"][0]["providers"][0]["route"]["api_profile"] =
-        "cluster-rest".into();
-    assert!(
-        decode_legacy_v2_intent(&historical.to_string())
-            .unwrap_err()
-            .to_string()
-            .contains("confirmation")
-    );
 }
 
 #[test]

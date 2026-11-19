@@ -1,4 +1,6 @@
 //! Real signed legacy HTTP intake plus native proof/prepared recovery.
+#[path = "support/pin_rows.rs"]
+mod pin_rows;
 #[allow(dead_code)]
 mod support {
     pub mod cors;
@@ -23,7 +25,7 @@ use ipfs_s3_gateway::{
     },
     pinning::zip_policy::CapturedZipIntent,
     store::{
-        entities::{import_job, object, object_version, pin_lease},
+        entities::{import_job, object, object_version},
         import::jobs,
         pinning::publication::{bind_legacy_import_input, read_legacy_import_input},
         zip::{self, BatchAdmission},
@@ -202,9 +204,20 @@ async fn legacy_bound_restart_source_404_publishes_original_input_without_get() 
             assert_eq!(h.source.calls(), 1); assert_eq!(calls.load(Ordering::SeqCst), 0);
             let objects = object::Entity::find().all(h.state.store.db()).await.unwrap();
             let versions = object_version::Entity::find().all(h.state.store.db()).await.unwrap();
-            let leases = pin_lease::Entity::find().all(h.state.store.db()).await.unwrap();
-            assert_eq!(versions.len(), 2); assert_eq!(leases.len(), 1);
-            assert!(leases.iter().all(|l| objects.iter().any(|o| o.id == l.owner_object_id && o.key == "out/file.txt")));
+            let db = h.state.store.db();
+            let output = objects.iter().find(|object| object.key == "out/file.txt").unwrap();
+            assert_eq!(versions.len(), 2);
+            assert!(versions.iter().any(|version| version.object_id.as_deref() == Some(output.id.as_str())));
+            let refs = pin_rows::refs(db).await;
+            let resources = pin_rows::resources(db).await;
+            assert_eq!(refs.len(), 1);
+            assert_eq!(resources.len(), 1);
+            assert_eq!(refs[0].owner_object_id, output.id);
+            assert_eq!(refs[0].source, "automatic");
+            assert_eq!(refs[0].cid, ipfs_s3_gateway::pinning::provider::canonical_cid(&output.cid).unwrap());
+            assert_eq!(resources[0].cid, refs[0].cid);
+            assert_eq!(resources[0].provider, refs[0].provider);
+            assert_eq!(resources[0].logical_size, output.size);
             assert_eq!(h.adds().await, 2);
             println!("R25_LEGACY_BOUND size={} sha256={} source_gets={} resumed_gets={} artifact_and_entry_adds={}", proof.size(),proof.sha256(),h.source.calls(),calls.load(Ordering::SeqCst),h.adds().await);
         }).catch_unwind().await;

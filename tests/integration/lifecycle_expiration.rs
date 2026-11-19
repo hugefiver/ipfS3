@@ -1,6 +1,6 @@
 use super::common::{
-    OwnedTestEndpoint, assert_mpu_s3_error, assert_s3_error, assert_signed_body, scripted,
-    signed_delete_bucket_lifecycle_configuration,
+    OwnedTestEndpoint, PIN_CID_ROOT, assert_mpu_s3_error, assert_s3_error, assert_signed_body,
+    scripted, signed_delete_bucket_lifecycle_configuration,
     signed_delete_bucket_lifecycle_configuration_with_headers, signed_delete_object,
     signed_delete_object_version, signed_get, signed_get_bucket_lifecycle_configuration,
     signed_get_bucket_lifecycle_configuration_with_headers, signed_get_version,
@@ -15,8 +15,18 @@ use crate::support::decompress::{KuboBlockTarget, KuboScript, TestHarness, start
 use crate::support::lifecycle::{LifecycleHarness, start_lifecycle_harness};
 use chrono::Duration as ChronoDuration;
 use http::{HeaderMap, HeaderValue, StatusCode};
-use ipfs_s3_gateway::store;
-use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, Set};
+use ipfs_s3_gateway::{
+    pinning::{
+        config::{LeaseDuration, ProviderLimitMap, ProviderLimits, ProviderMode},
+        policy::{LeaseIntent, LeaseSource},
+        tags::ContentMode,
+    },
+    store::{
+        self,
+        pinning::{publication::PinTargetSpec, resources},
+    },
+};
+use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, TransactionTrait};
 use std::collections::HashMap;
 
 fn lifecycle_configuration_xml(rule_id: &str) -> String {
@@ -1344,12 +1354,73 @@ async fn lifecycle_expiration_invariants_publication_delete_race() {
     publication_delete_race.shutdown().await;
 }
 
+const LIFECYCLE_PIN_PROVIDER: &str = "lifecycle-acceptance";
+const LIFECYCLE_PIN_HANDLE: &str = "lifecycle-ack";
+
+async fn seed_accepted_file_pins(harness: &LifecycleHarness, keys: &[&str]) {
+    let db = harness.state.store.db();
+    let provider = LIFECYCLE_PIN_PROVIDER;
+    let limits = ProviderLimitMap::from([(
+        provider.to_owned(),
+        ProviderLimits {
+            priority: 1,
+            max_bytes: 1024,
+            max_pins: 1,
+            enabled: true,
+        },
+    )]);
+    let intent = LeaseIntent {
+        source: LeaseSource::Manual,
+        policy_id: provider.to_owned(),
+        provider_mode: ProviderMode::One,
+        providers: vec![provider.to_owned()],
+        content_mode: ContentMode::Object,
+        duration: LeaseDuration::parse("24h").unwrap(),
+    };
+    let now = store::database_clock::database_now(db).await.unwrap();
+    let txn = db.begin().await.unwrap();
+    for key in keys {
+        let object = store::object::get_latest(&txn, &harness.bucket, key)
+            .await
+            .unwrap();
+        let target = PinTargetSpec {
+            cid: object.cid,
+            logical_size: object.size,
+        };
+        resources::attach(&txn, &object.id, &target, &intent, &limits, now)
+            .await
+            .unwrap();
+    }
+    txn.commit().await.unwrap();
+
+    let submit = resources::claim(
+        db,
+        provider,
+        &limits[provider],
+        now,
+        now + ChronoDuration::minutes(1),
+    )
+    .await
+    .unwrap()
+    .expect("published file pin resource can be submitted");
+    assert_eq!(submit.action, resources::Action::Submit);
+    assert_eq!(submit.cid, PIN_CID_ROOT);
+    resources::settle(
+        db,
+        &submit,
+        resources::Outcome::Submitted(LIFECYCLE_PIN_HANDLE.to_owned()),
+        now,
+    )
+    .await
+    .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lifecycle_expiration_invariants_shared_cid() {
     let mut shared_cid = start_lifecycle_harness(KuboScript::repeated_add(
-        "QmLifecycleSharedCid",
+        PIN_CID_ROOT,
         2,
-        HashMap::from([("QmLifecycleSharedCid".to_owned(), b"shared".to_vec())]),
+        HashMap::from([(PIN_CID_ROOT.to_owned(), b"shared".to_vec())]),
     ))
     .await;
     for key in ["shared-a", "shared-b"] {
@@ -1360,6 +1431,19 @@ async fn lifecycle_expiration_invariants_shared_cid() {
             StatusCode::OK
         );
     }
+    seed_accepted_file_pins(&shared_cid, &["shared-a", "shared-b"]).await;
+    let db = shared_cid.state.store.db();
+    let removed = store::object::get_latest(db, &shared_cid.bucket, "shared-a")
+        .await
+        .unwrap();
+    let mut remaining = support::pin_rows::refs(db).await;
+    assert_eq!(remaining.len(), 2);
+    remaining.retain(|reference| reference.owner_object_id != removed.id);
+    assert_eq!(remaining.len(), 1);
+    let accepted = support::pin_rows::resources(db).await;
+    assert_eq!(accepted.len(), 1);
+    assert_eq!(accepted[0].status, "accepted");
+    assert_eq!(accepted[0].handle.as_deref(), Some(LIFECYCLE_PIN_HANDLE));
     let claim = schedule_lifecycle_action(
         &shared_cid,
         "<LifecycleConfiguration><Rule><ID>shared-cid</ID><Status>Enabled</Status>\
@@ -1370,7 +1454,10 @@ async fn lifecycle_expiration_invariants_shared_cid() {
     )
     .await;
     assert_eq!(shared_cid.execute_claim(&claim).await.state, "succeeded");
-    assert_eq!(shared_cid.version_rows("shared-a").await.len(), 0);
+    assert!(shared_cid.version_rows("shared-a").await.is_empty());
+    let db = shared_cid.state.store.db();
+    assert_eq!(support::pin_rows::refs(db).await, remaining);
+    assert_eq!(support::pin_rows::resources(db).await, accepted);
     assert_signed_body(&shared_cid, "shared-b", b"shared").await;
     shared_cid.assert_no_pin_removal().await;
     shared_cid.shutdown().await;
@@ -1424,57 +1511,28 @@ async fn lifecycle_expiration_invariants_encryption_matrix() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn lifecycle_expiration_invariants_tags_leases_retry() {
-    let mut tags_leases_retry = start_lifecycle_harness(KuboScript::repeated_add(
-        "QmLifecycleLeaseRetry",
-        1,
-        HashMap::new(),
-    ))
-    .await;
+async fn lifecycle_expiration_invariants_tags_and_file_pins_retry() {
+    let mut harness =
+        start_lifecycle_harness(KuboScript::repeated_add(PIN_CID_ROOT, 1, HashMap::new())).await;
     assert_eq!(
-        signed_put_with_tagging(
-            &tags_leases_retry,
-            "tags-leases",
-            b"body".to_vec(),
-            "class=old"
-        )
-        .await
-        .status(),
+        signed_put_with_tagging(&harness, "tagged-file", b"body".to_vec(), "class=old")
+            .await
+            .status(),
         StatusCode::OK
     );
-    let object = store::object::get_latest(
-        tags_leases_retry.state.store.db(),
-        &tags_leases_retry.bucket,
-        "tags-leases",
-    )
-    .await
-    .expect("load tags and leases lifecycle object");
-    let now =
-        ipfs_s3_gateway::store::database_clock::database_now(tags_leases_retry.state.store.db())
-            .await
-            .expect("read tags and leases database clock");
-    let lease_id = uuid::Uuid::new_v4().to_string();
-    store::entities::pin_lease::Entity::insert(store::entities::pin_lease::ActiveModel {
-        id: Set(lease_id.clone()),
-        owner_object_id: Set(object.id.clone()),
-        source: Set("lifecycle-acceptance".to_owned()),
-        policy_id: Set("lifecycle-acceptance".to_owned()),
-        provider_mode: Set("one".to_owned()),
-        content_mode: Set("object".to_owned()),
-        created_at: Set(now),
-        last_touched_at: Set(now),
-        expires_at: Set(now + ChronoDuration::days(1)),
-        generation: Set(1),
-        state: Set("active".to_owned()),
-    })
-    .exec(tags_leases_retry.state.store.db())
-    .await
-    .expect("seed active lifecycle lease");
+    seed_accepted_file_pins(&harness, &["tagged-file"]).await;
+    let db = harness.state.store.db();
+    let object = store::object::get_latest(db, &harness.bucket, "tagged-file")
+        .await
+        .expect("load tagged lifecycle object");
+    let references = support::pin_rows::refs(db).await;
+    assert_eq!(references.len(), 1);
+    assert_eq!(references[0].owner_object_id, object.id);
     assert_eq!(
         signed_put_bucket_lifecycle_configuration_xml(
-            &tags_leases_retry,
+            &harness,
             lifecycle_current_expiration_xml(
-                "tags-leases-retry",
+                "tags-file-pins-retry",
                 "<Expiration><Date>2020-01-01T00:00:00Z</Date></Expiration>",
             ),
         )
@@ -1482,9 +1540,10 @@ async fn lifecycle_expiration_invariants_tags_leases_retry() {
         .status(),
         StatusCode::OK
     );
-    tags_leases_retry.run_one_scan_page().await;
-    let claim = tags_leases_retry.stop_after_claim().await;
-    let terminal = tags_leases_retry.execute_claim(&claim).await;
+    harness.run_one_scan_page().await;
+    let claim = harness.stop_after_claim().await;
+    let terminal = harness.execute_claim(&claim).await;
+    let db = harness.state.store.db();
     assert_eq!(terminal.state, "succeeded");
     assert_eq!(
         terminal.attempts, 2,
@@ -1493,20 +1552,23 @@ async fn lifecycle_expiration_invariants_tags_leases_retry() {
     assert_eq!(
         store::entities::object_tag::Entity::find()
             .filter(store::entities::object_tag::Column::ObjectId.eq(&object.id))
-            .count(tags_leases_retry.state.store.db())
+            .count(db)
             .await
             .expect("count cleared lifecycle tags"),
         0
     );
+    assert!(support::pin_rows::refs(db).await.is_empty());
     assert_eq!(
-        store::entities::pin_lease::Entity::find_by_id(lease_id)
-            .one(tags_leases_retry.state.store.db())
-            .await
-            .expect("load ended lifecycle lease")
-            .expect("seeded lifecycle lease exists")
-            .state,
-        "cancelled"
+        support::pin_rows::resources(db).await,
+        vec![support::pin_rows::Resource {
+            provider: LIFECYCLE_PIN_PROVIDER.to_owned(),
+            cid: PIN_CID_ROOT.to_owned(),
+            logical_size: object.size,
+            status: "pending".to_owned(),
+            action: Some("delete".to_owned()),
+            handle: Some(LIFECYCLE_PIN_HANDLE.to_owned()),
+        }]
     );
-    tags_leases_retry.assert_no_pin_removal().await;
-    tags_leases_retry.shutdown().await;
+    harness.assert_no_pin_removal().await;
+    harness.shutdown().await;
 }

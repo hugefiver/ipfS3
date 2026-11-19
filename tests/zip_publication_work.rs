@@ -12,8 +12,10 @@ mod fixture;
 #[path = "support/stage9_zip_http_zip.rs"]
 mod zip_fixture;
 
-use ipfs_s3_gateway::store::entities::{object, pin_lease_target, pin_resource_history};
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
+#[path = "support/pin_rows.rs"]
+mod pin_rows;
+use ipfs_s3_gateway::store::entities::object;
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use std::sync::{Arc, Mutex};
 use support::decompress::S3TestEndpoint;
 use tracing_subscriber::{layer::SubscriberExt, registry::LookupSpan};
@@ -90,7 +92,7 @@ where
     }
 }
 
-async fn signed_small_zip_publication_ignores_unrelated_released_history() {
+async fn signed_zip_outputs_are_readable_and_have_file_references() {
     for entry in fixture::ENTRY_POINTS {
         let archive = zip_fixture::distinct_outputs_zip(2);
         let replies = zip_fixture::distinct_output_cids(2)
@@ -99,19 +101,6 @@ async fn signed_small_zip_publication_ignores_unrelated_released_history() {
             .collect();
         let fixture = fixture::Fixture::new(entry, true, &archive, replies).await;
         let db = fixture.state.store.db();
-        for start in (0..20_000).step_by(100) {
-            pin_resource_history::Entity::insert_many((start..start + 100).map(|n| {
-                pin_resource_history::ActiveModel {
-                    provider: Set(fixture.provider.clone()),
-                    cid: Set(format!("released-history-{n}")),
-                    epoch: Set(1),
-                    ledger: Set("{}".into()),
-                }
-            }))
-            .exec(db)
-            .await
-            .unwrap();
-        }
         fixture.publish(entry, archive, true, false).await;
         for index in 0usize..2 {
             let key = format!("expanded/entry-{index:02}.txt");
@@ -123,14 +112,18 @@ async fn signed_small_zip_publication_ignores_unrelated_released_history() {
                 .unwrap()
                 .unwrap();
             assert_eq!(row.cid, zip_fixture::distinct_output_cid(index));
-            let target = pin_lease_target::Entity::find()
-                .filter(pin_lease_target::Column::Provider.eq(&fixture.provider))
-                .filter(pin_lease_target::Column::Cid.eq(&row.cid))
-                .one(db)
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(target.state, "waiting");
+            let refs = pin_rows::refs(db).await;
+            assert!(refs.iter().any(|r| r.owner_object_id == row.id
+                && r.provider == fixture.provider
+                && r.cid == row.cid));
+            assert!(
+                pin_rows::resources(db)
+                    .await
+                    .iter()
+                    .any(|r| r.provider == fixture.provider
+                        && r.cid == row.cid
+                        && r.action.as_deref() == Some("submit"))
+            );
             let response = support::sigv4::send_sigv4(
                 reqwest::Method::GET,
                 fixture.endpoint(),
@@ -190,5 +183,5 @@ async fn signed_zip_publication_batches_database_work() {
             "publication still repeats database work per target: {measured:?}"
         );
     }
-    signed_small_zip_publication_ignores_unrelated_released_history().await;
+    signed_zip_outputs_are_readable_and_have_file_references().await;
 }

@@ -30,7 +30,6 @@ use crate::{
             FAILURE_CANCELLED_STALE, FAILURE_INTERNAL_DEPENDENCY, lock_claim_for_execution,
             mark_cancelled, mark_succeeded, retry_at, schedule_retry,
         },
-        pinning::leases::lock_publication_lifecycle_frontier,
         residency::{
             attach_transition_hold_in_transaction, lock_residency_frontier,
             release_transition_hold_in_transaction,
@@ -1180,8 +1179,8 @@ pub async fn current_lifecycle_mutation_guard_in_transaction(
 }
 
 /// Locks the exact transition mutation frontier in the same order as version
-/// deletion/publication: version row, immutable object owner, active lease
-/// lifecycle, then residency/reference/physical rows in stable tier/CID order.
+/// deletion/publication: version row, immutable object owner, then
+/// residency/reference/physical rows in stable tier/CID order.
 /// The caller must already hold the claim, saga (when present), and bucket lock.
 async fn lock_transition_frontier(
     txn: &DatabaseTransaction,
@@ -1227,8 +1226,6 @@ async fn lock_transition_frontier(
     if !allow_deleted_target && (version.is_none() || owner.is_none()) {
         return Err(invalid_state("transition frontier target missing"));
     }
-
-    lock_publication_lifecycle_frontier(txn, &[object_id.to_owned()], &[]).await?;
 
     let cid = match expected_cid {
         Some(cid) if !cid.is_empty() => Some(cid.to_owned()),

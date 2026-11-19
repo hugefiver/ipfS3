@@ -92,7 +92,7 @@ async fn delete_exact_version(fixture: &Fixture, key: &str, version: &object_ver
             .expect("enabled fixture version has a public ID"),
     )
     .unwrap();
-    delete_version_with_leases_guarded(
+    delete_version_guarded(
         fixture.db(),
         BUCKET,
         key,
@@ -158,18 +158,7 @@ async fn final_import_failure_settles_and_unblocks_version_and_bucket_deletion()
     shared_request.object.bucket = "retained-bucket".to_owned();
     let shared = publish_request(fixture.db(), shared_request, &manual_limits()).await;
     verify_hot(fixture.db(), &shared).await;
-    let lease_before = pin_lease::Entity::find()
-        .filter(pin_lease::Column::OwnerObjectId.eq("shared-object"))
-        .filter(pin_lease::Column::Source.eq("manual"))
-        .one(fixture.db())
-        .await
-        .unwrap()
-        .unwrap();
-    let targets_before = pin_lease_target::Entity::find()
-        .filter(pin_lease_target::Column::LeaseId.eq(&lease_before.id))
-        .all(fixture.db())
-        .await
-        .unwrap();
+    let pin_before = manual_pin_snapshot(fixture.db(), "shared-object").await;
     let harness = TierHarness::new(ImportBehavior::Failure, HOT_NODE).await;
 
     execute(
@@ -188,20 +177,8 @@ async fn final_import_failure_settles_and_unblocks_version_and_bucket_deletion()
     assert_eq!(shared_residency.primary.tier, KuboTier::Hot);
     assert_eq!(shared_residency.storage_class, StorageClass::Standard);
     assert_eq!(
-        pin_lease::Entity::find_by_id(&lease_before.id)
-            .one(fixture.db())
-            .await
-            .unwrap()
-            .unwrap(),
-        lease_before
-    );
-    assert_eq!(
-        pin_lease_target::Entity::find()
-            .filter(pin_lease_target::Column::LeaseId.eq(&lease_before.id))
-            .all(fixture.db())
-            .await
-            .unwrap(),
-        targets_before
+        manual_pin_snapshot(fixture.db(), "shared-object").await,
+        pin_before
     );
     assert_no_pin_removal(&harness).await;
 
@@ -209,39 +186,15 @@ async fn final_import_failure_settles_and_unblocks_version_and_bucket_deletion()
     delete_exact_version(&fixture, KEY, &fixture.version).await;
     assert_eq!(residency(&fixture, &shared.id).await, shared_residency);
     assert_eq!(
-        pin_lease::Entity::find_by_id(&lease_before.id)
-            .one(fixture.db())
-            .await
-            .unwrap()
-            .unwrap(),
-        lease_before
-    );
-    assert_eq!(
-        pin_lease_target::Entity::find()
-            .filter(pin_lease_target::Column::LeaseId.eq(&lease_before.id))
-            .all(fixture.db())
-            .await
-            .unwrap(),
-        targets_before
+        manual_pin_snapshot(fixture.db(), "shared-object").await,
+        pin_before
     );
     store::bucket::delete(fixture.db(), BUCKET).await.unwrap();
     assert!(!store::bucket::exists(fixture.db(), BUCKET).await.unwrap());
     assert_eq!(residency(&fixture, &shared.id).await, shared_residency);
     assert_eq!(
-        pin_lease::Entity::find_by_id(&lease_before.id)
-            .one(fixture.db())
-            .await
-            .unwrap()
-            .unwrap(),
-        lease_before
-    );
-    assert_eq!(
-        pin_lease_target::Entity::find()
-            .filter(pin_lease_target::Column::LeaseId.eq(&lease_before.id))
-            .all(fixture.db())
-            .await
-            .unwrap(),
-        targets_before
+        manual_pin_snapshot(fixture.db(), "shared-object").await,
+        pin_before
     );
     assert_no_pin_removal(&harness).await;
 }

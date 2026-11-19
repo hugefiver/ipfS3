@@ -650,7 +650,7 @@ async fn source_and_outputs_prelock_new_residencies_in_one_order_without_retry()
         assert_bindings(&pg.gate, &a).await;
         assert_bindings(&pg.gate, &b).await;
         for (table, expected) in [("objects", 4), ("object_versions", 4), ("version_residencies", 4),
-            ("residency_references", 4), ("physical_residencies", 2), ("pin_leases", 0), ("standard_mutation_leases", 0)] {
+            ("residency_references", 4), ("physical_residencies", 2), ("pin_refs", 0), ("standard_mutation_leases", 0)] {
             let actual: i64 = pg.gate.query_one(sql(&format!("SELECT count(*) AS n FROM {table}")))
                 .await.unwrap().unwrap().try_get("", "n").unwrap();
             assert_eq!(actual, expected, "unexpected {table} count");

@@ -22,7 +22,6 @@ use ipfs_s3_gateway::{
                 lock_bucket_for_ownership, submit, supersede_bucket,
             },
         },
-        multipart,
         pinning::publication::{
             PinTargetSpec, PublicationObject, PublicationRequest, publish_import_object,
             publish_object, publish_standard_object,
@@ -34,13 +33,12 @@ use sea_orm::{
     DbErr, EntityTrait, FromQueryResult, PaginatorTrait, QueryFilter, Statement, TransactionError,
     TransactionTrait,
 };
-use sea_orm_migration::{MigrationTrait, MigratorTrait};
+use sea_orm_migration::{MigrationName, MigrationTrait, MigratorTrait};
 use tokio::{sync::oneshot, task::JoinHandle};
 use tracing_subscriber::{Layer, layer::SubscriberExt};
 
-#[allow(dead_code)]
-#[path = "support/pg_residency.rs"]
-mod ownership_pg;
+#[path = "support/baseline_postgres.rs"]
+mod postgres;
 
 use ipfs_s3_gateway::store::migrations::{
     m20250701_000001_init, m20260707_000001_decompress_zip, m20260720_000001_sse_c_key_fingerprint,
@@ -191,16 +189,9 @@ async fn compatibility_upload_json(
 
 impl MigratorTrait for CurrentJsonCompatibilityMigrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-        vec![
-            Box::new(m20250701_000001_init::Migration),
-            Box::new(m20260707_000001_decompress_zip::Migration),
-            Box::new(m20260720_000001_sse_c_key_fingerprint::Migration),
-            Box::new(m20260721_000001_multi_provider_pinning::Migration),
-            Box::new(m20260729_000001_ipfs3_import::Migration),
-            Box::new(m20260729_000002_postgres_utc_timestamps::Migration),
-            Box::new(m20260730_000001_standard_mutation_fence::Migration),
-            Box::new(m20260813_000001_postgres_json_columns::Migration),
-        ]
+        let mut migrations = PreJsonCompatibilityMigrator::migrations();
+        migrations.push(Box::new(m20260813_000001_postgres_json_columns::Migration));
+        migrations
     }
 }
 
@@ -549,14 +540,19 @@ async fn connect_triplet(
 }
 
 async fn connect_ownership_triplet(
-    fixture: &ownership_pg::PgResidencyFixture,
+    url: &str,
+    schema: &str,
     bucket_name: &str,
 ) -> (DatabaseConnection, DatabaseConnection, DatabaseConnection) {
-    let holder = fixture.connection().await;
-    assert_postgres_utc_timestamp_columns(&holder).await;
+    let mut options = ConnectOptions::new(url.to_owned());
+    options
+        .max_connections(1)
+        .min_connections(1)
+        .set_schema_search_path(schema);
+    let holder = Database::connect(options.clone()).await.unwrap();
     crate_bucket(&holder, bucket_name).await;
-    let contender = fixture.connection().await;
-    let observer = fixture.connection().await;
+    let contender = Database::connect(options.clone()).await.unwrap();
+    let observer = Database::connect(options).await.unwrap();
     (holder, contender, observer)
 }
 
@@ -658,7 +654,16 @@ async fn current_postgres_schema_is_complete(db: &DatabaseConnection) -> Result<
                  EXISTS (SELECT 1 FROM information_schema.columns \
                          WHERE table_schema = current_schema() \
                            AND table_name = 'standard_mutation_leases' AND column_name = 'lease_until' \
-                           AND data_type = 'timestamp with time zone') AS mutation_leases",
+                           AND data_type = 'timestamp with time zone') AS mutation_leases, \
+                 EXISTS (SELECT 1 FROM information_schema.tables \
+                         WHERE table_schema = current_schema() AND table_type = 'BASE TABLE' \
+                           AND table_name = 'import_job_requests') AS import_requests, \
+                 EXISTS (SELECT 1 FROM information_schema.tables \
+                         WHERE table_schema = current_schema() AND table_type = 'BASE TABLE' \
+                           AND table_name = 'pin_refs') AS pin_refs, \
+                 EXISTS (SELECT 1 FROM information_schema.tables \
+                         WHERE table_schema = current_schema() AND table_type = 'BASE TABLE' \
+                           AND table_name = 'pin_resources') AS pin_resources",
         ))
         .await?
         .ok_or_else(|| DbErr::Custom("migration schema validation returned no row".to_owned()))?;
@@ -668,7 +673,10 @@ async fn current_postgres_schema_is_complete(db: &DatabaseConnection) -> Result<
         && row.try_get::<bool>("", "bucket_cors")?
         && row.try_get::<bool>("", "lifecycle_targets")?
         && row.try_get::<bool>("", "lifecycle_transitions")?
-        && row.try_get::<bool>("", "mutation_leases")?)
+        && row.try_get::<bool>("", "mutation_leases")?
+        && row.try_get::<bool>("", "import_requests")?
+        && row.try_get::<bool>("", "pin_refs")?
+        && row.try_get::<bool>("", "pin_resources")?)
 }
 
 async fn job(db: &DatabaseConnection, id: &str) -> import_job::Model {
@@ -1416,18 +1424,35 @@ async fn postgres_claim_due_contends_with_prefix_and_bucket_supersession_without
 }
 
 #[tokio::test]
-async fn postgres_bucket_first_ownership_serializes_all_task_four_races() {
-    let Ok(_) = std::env::var("IPFS_S3_TEST_POSTGRES_URL") else {
+async fn postgres_bucket_first_ownership_serializes_import_races() {
+    let Ok(url) = std::env::var("IPFS_S3_TEST_POSTGRES_URL") else {
         eprintln!("skipping PostgreSQL import ownership test: IPFS_S3_TEST_POSTGRES_URL is unset");
         return;
     };
     let _serial = POSTGRES_TEST_SERIAL.lock().await;
-    let fixture = ownership_pg::PgResidencyFixture::new().await;
+    postgres::with_schema(|db| async move {
+        store::run_migrations(&db).await.unwrap();
+        let schema: String = db
+            .query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT current_schema() AS name",
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "name")
+            .unwrap();
+        assert_bucket_first_ownership_races(&url, &schema).await;
+    })
+    .await;
+}
+
+async fn assert_bucket_first_ownership_races(url: &str, schema: &str) {
     let now = Utc::now();
 
     let bucket_exact_submit = format!("pg-import-exact-submit-{}", uuid::Uuid::new_v4());
     let (exact_holder, exact_contender, exact_observer) =
-        connect_ownership_triplet(&fixture, &bucket_exact_submit).await;
+        connect_ownership_triplet(url, schema, &bucket_exact_submit).await;
     submit(
         &exact_holder,
         request("exact-old", &bucket_exact_submit, "key", None),
@@ -1482,7 +1507,7 @@ async fn postgres_bucket_first_ownership_serializes_all_task_four_races() {
 
     let bucket_exact_admit = format!("pg-import-exact-admit-{}", uuid::Uuid::new_v4());
     let (exact_holder, exact_contender, exact_observer) =
-        connect_ownership_triplet(&fixture, &bucket_exact_admit).await;
+        connect_ownership_triplet(url, schema, &bucket_exact_admit).await;
     submit(
         &exact_holder,
         request("exact-admit-old", &bucket_exact_admit, "key", None),
@@ -1550,7 +1575,7 @@ async fn postgres_bucket_first_ownership_serializes_all_task_four_races() {
 
     let bucket_prefix_submit = format!("pg-import-prefix-submit-{}", uuid::Uuid::new_v4());
     let (prefix_holder, prefix_contender, prefix_observer) =
-        connect_ownership_triplet(&fixture, &bucket_prefix_submit).await;
+        connect_ownership_triplet(url, schema, &bucket_prefix_submit).await;
     submit(
         &prefix_holder,
         request(
@@ -1612,7 +1637,7 @@ async fn postgres_bucket_first_ownership_serializes_all_task_four_races() {
 
     let bucket_prefix_admit = format!("pg-import-prefix-admit-{}", uuid::Uuid::new_v4());
     let (prefix_holder, prefix_contender, prefix_observer) =
-        connect_ownership_triplet(&fixture, &bucket_prefix_admit).await;
+        connect_ownership_triplet(url, schema, &bucket_prefix_admit).await;
     submit(
         &prefix_holder,
         request(
@@ -1690,7 +1715,7 @@ async fn postgres_bucket_first_ownership_serializes_all_task_four_races() {
 
     let bucket_empty_admit = format!("pg-import-empty-admit-{}", uuid::Uuid::new_v4());
     let (empty_holder, empty_contender, empty_observer) =
-        connect_ownership_triplet(&fixture, &bucket_empty_admit).await;
+        connect_ownership_triplet(url, schema, &bucket_empty_admit).await;
     submit(
         &empty_holder,
         request("empty-old", &bucket_empty_admit, "archive", Some("")),
@@ -1747,7 +1772,7 @@ async fn postgres_bucket_first_ownership_serializes_all_task_four_races() {
 
     let bucket_empty_submit = format!("pg-import-empty-submit-{}", uuid::Uuid::new_v4());
     let (empty_holder, empty_contender, empty_observer) =
-        connect_ownership_triplet(&fixture, &bucket_empty_submit).await;
+        connect_ownership_triplet(url, schema, &bucket_empty_submit).await;
     submit(
         &empty_holder,
         request(
@@ -1806,7 +1831,7 @@ async fn postgres_bucket_first_ownership_serializes_all_task_four_races() {
 
     let bucket_extracted_claim = format!("pg-import-extracted-claim-{}", uuid::Uuid::new_v4());
     let (extracted_holder, extracted_contender, extracted_observer) =
-        connect_ownership_triplet(&fixture, &bucket_extracted_claim).await;
+        connect_ownership_triplet(url, schema, &bucket_extracted_claim).await;
     submit(
         &extracted_holder,
         request(
@@ -1881,7 +1906,7 @@ async fn postgres_bucket_first_ownership_serializes_all_task_four_races() {
 
     let bucket_extracted_admit = format!("pg-import-extracted-admit-{}", uuid::Uuid::new_v4());
     let (extracted_holder, extracted_contender, extracted_observer) =
-        connect_ownership_triplet(&fixture, &bucket_extracted_admit).await;
+        connect_ownership_triplet(url, schema, &bucket_extracted_admit).await;
     submit(
         &extracted_holder,
         request(
@@ -1953,7 +1978,7 @@ async fn postgres_bucket_first_ownership_serializes_all_task_four_races() {
 
     let bucket_delete_submit = format!("pg-import-delete-submit-{}", uuid::Uuid::new_v4());
     let (delete_holder, delete_contender, delete_observer) =
-        connect_ownership_triplet(&fixture, &bucket_delete_submit).await;
+        connect_ownership_triplet(url, schema, &bucket_delete_submit).await;
     submit(
         &delete_holder,
         request("delete-old", &bucket_delete_submit, "old", None),
@@ -2014,7 +2039,7 @@ async fn postgres_bucket_first_ownership_serializes_all_task_four_races() {
 
     let bucket_delete_first = format!("pg-import-delete-first-{}", uuid::Uuid::new_v4());
     let (delete_holder, delete_contender, delete_observer) =
-        connect_ownership_triplet(&fixture, &bucket_delete_first).await;
+        connect_ownership_triplet(url, schema, &bucket_delete_first).await;
     submit(
         &delete_holder,
         request("delete-first-old", &bucket_delete_first, "old", None),
@@ -2082,7 +2107,6 @@ async fn postgres_bucket_first_ownership_serializes_all_task_four_races() {
     ] {
         supersede_active_test_jobs(&delete_holder, bucket_name, Utc::now()).await;
     }
-    fixture.cleanup().await;
 }
 
 #[tokio::test]
@@ -2116,7 +2140,13 @@ async fn postgres_json_columns_require_compatibility_migration() {
         .execute_unprepared(&format!("SET search_path TO {schema}"))
         .await
         .unwrap();
-    PreJsonCompatibilityMigrator::up(&fixture, None)
+    let before_utc = PreJsonCompatibilityMigrator::migrations()
+        .iter()
+        .position(|migration| {
+            migration.name() == m20260729_000002_postgres_utc_timestamps::Migration.name()
+        })
+        .unwrap();
+    PreJsonCompatibilityMigrator::up(&fixture, Some(before_utc as u32))
         .await
         .unwrap();
     create_pre_json_bucket(&fixture, &bucket_name).await;
@@ -2147,6 +2177,24 @@ async fn postgres_json_columns_require_compatibility_migration() {
             .await
             .unwrap();
     }
+
+    fixture
+        .execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "INSERT INTO multipart_parts (upload_id, part_number, cid, size, etag, uploaded_at) \
+             VALUES ($1, 1, 'bafy-six-mib-part', 6291456, 'bafy-six-mib-part', TIMESTAMP '2026-07-30 12:00:00')",
+            [upload_id.clone().into()],
+        ))
+        .await
+        .unwrap();
+    fixture
+        .execute_unprepared("SET TIME ZONE 'Asia/Tokyo'")
+        .await
+        .unwrap();
+    PreJsonCompatibilityMigrator::up(&fixture, None)
+        .await
+        .unwrap();
+    assert_postgres_utc_timestamp_columns(&fixture).await;
 
     let decode_error = compatibility_upload_json(&fixture, &upload_id)
         .await
@@ -2338,18 +2386,20 @@ async fn postgres_json_columns_require_compatibility_migration() {
         .unwrap();
     assert_eq!(payload.metadata, Some(payload_metadata));
     assert_eq!(payload.tags_json, payload_tags);
-    multipart::upsert_part(
-        &fixture,
-        &upload_id,
-        1,
-        "bafy-six-mib-part",
-        6_291_456,
-        "bafy-six-mib-part",
-    )
-    .await
-    .unwrap();
-    let part = multipart::get_part(&fixture, &upload_id, 1).await.unwrap();
-    assert_eq!(part.size, 6_291_456);
+    let part = fixture
+        .query_one(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT size, uploaded_at FROM multipart_parts WHERE upload_id = $1 AND part_number = 1",
+            [upload_id.into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(part.try_get::<i64>("", "size").unwrap(), 6_291_456);
+    assert_eq!(
+        part.try_get::<DateTime<Utc>>("", "uploaded_at").unwrap(),
+        "2026-07-30T12:00:00Z".parse::<DateTime<Utc>>().unwrap()
+    );
 
     fixture.close().await.unwrap();
     let cleanup = connect_single(&url).await;
@@ -2450,9 +2500,9 @@ fn postgres_concurrent_startup_uses_transaction_advisory_lock_once() {
                         .collect::<Result<Vec<_>, DbErr>>();
                     match actual {
                         Ok(actual) => {
-                            if actual.is_empty() || actual.iter().any(|(_, count)| *count != 1) {
+                            if actual != [(store::migrations::VERSION.to_owned(), 1)] {
                                 failure.get_or_insert(
-                                    "migration markers were absent or recorded more than once",
+                                    "concurrent startup did not publish exactly one current marker",
                                 );
                             }
                         }
@@ -2820,7 +2870,7 @@ async fn postgres_dropped_startup_rolls_back_migration_ddl_before_gate_release()
 }
 
 #[tokio::test]
-async fn postgres_dropped_startup_rolls_back_nested_migration_before_gate_release() {
+async fn postgres_dropped_startup_rolls_back_late_baseline_ddl_before_gate_release() {
     let url = std::env::var("IPFS_S3_TEST_POSTGRES_URL")
         .expect("IPFS_S3_TEST_POSTGRES_URL is required for the migration cancellation test");
     let failures = cancelled_migration_case(&url, Some("zip_batches")).await;

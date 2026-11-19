@@ -1,5 +1,6 @@
 use super::tests::{CID, submit};
 use super::*;
+use crate::pinning::provider::{PinningProvider, ProviderErrorClass};
 use std::{
     sync::{
         Arc,
@@ -57,16 +58,12 @@ async fn self_signed_target_is_not_accepted_and_receives_no_authenticated_http()
         Some(RpcAuth::Bearer("tls-secret-sentinel".into())),
     )
     .unwrap();
-    let observation = tokio::time::timeout(
-        Duration::from_secs(5),
-        provider.submit_observed(submit(CID)),
-    )
-    .await
-    .unwrap();
-    let error = observation.result.unwrap_err();
+    let error = tokio::time::timeout(Duration::from_secs(5), provider.submit(submit(CID)))
+        .await
+        .unwrap()
+        .unwrap_err();
     assert!(!format!("{error:?}").contains("tls-secret-sentinel"));
-    assert_eq!(observation.effect, RpcSubmitEffect::NotSubmitted);
-    assert!(observation.resources.is_empty());
+    assert_eq!(error.class, ProviderErrorClass::NotSubmitted);
     server.await.unwrap();
 }
 
@@ -125,17 +122,12 @@ async fn target_backpressure_stops_source_polling_and_times_out_as_unknown() {
         },
     )
     .unwrap();
-    let result = tokio::time::timeout(
-        Duration::from_secs(5),
-        provider.submit_observed(submit(CID)),
-    )
-    .await;
+    let result = tokio::time::timeout(Duration::from_secs(5), provider.submit(submit(CID))).await;
     source.abort();
     target.abort();
-    let observation = result.unwrap();
-    assert!(observation.result.is_err());
-    assert_eq!(observation.effect, RpcSubmitEffect::Unknown);
-    assert!(observation.resources.is_empty());
+    let error = result.unwrap().unwrap_err();
+    assert_eq!(error.class, ProviderErrorClass::Transient);
+    assert!(!error.definitely_not_submitted());
     assert!(
         chunks.load(Ordering::SeqCst) < 1024,
         "backpressure must bound source reads"

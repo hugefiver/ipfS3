@@ -1,4 +1,4 @@
-use super::tests::{CID, OTHER, local, provider, query, source_file, submit};
+use super::tests::{CID, OTHER, provider, source_file, submit};
 use super::*;
 use crate::pinning::provider::{PinningProvider, ProviderErrorClass};
 use std::time::Duration;
@@ -93,28 +93,21 @@ async fn hash_then_error_trailer_is_not_success_or_not_created() {
         Some(RpcAuth::Bearer("secret-token".into())),
     )
     .unwrap();
-    let observation = p.submit_observed(submit(CID)).await;
-    let error = observation.result.unwrap_err();
+    let error = p.submit(submit(CID)).await.unwrap_err();
+    assert_eq!(error.class, ProviderErrorClass::Protocol);
     assert!(!error.definitely_not_submitted());
     assert!(!format!("{error:?}").contains("secret-backend-marker"));
     assert!(!format!("{error:?}").contains("secret-token"));
-    assert_eq!(observation.effect, RpcSubmitEffect::Unknown);
-    assert_eq!(observation.resources.len(), 1);
-    assert_eq!(observation.resources[0].status, RpcResourceStatus::Reported);
-    assert_eq!(observation.resources[0].cid, CID);
-    assert_eq!(
-        observation.resources[0].ownership,
-        crate::pinning::identity::Ownership::Unknown
-    );
     server.await.unwrap();
 }
 
 #[tokio::test]
-async fn pin_ls_trailers_and_truncated_success_do_not_prove_absence() {
+async fn pin_rm_requires_a_complete_ack_without_stream_errors() {
+    let record = format!("{{\"Pins\":[\"{CID}\"]}}");
     for bytes in [
-        trailer_response("{\"Keys\":{}}", "failure"),
-        b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{\"Keys\":{}}"
-            .to_vec(),
+        trailer_response(&record, "failure"),
+        format!("HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{record}")
+            .into_bytes(),
     ] {
         let source = MockServer::start().await;
         let (endpoint, server) = raw_response(bytes, false).await;
@@ -127,10 +120,8 @@ async fn pin_ls_trailers_and_truncated_success_do_not_prove_absence() {
             None,
         )
         .unwrap();
-        assert!(matches!(
-            p.observe(query(CID)).await,
-            QueryObservation::Unknown(_)
-        ));
+        let error = p.unpin(&format!("rpc-pin:kubo:{CID}")).await.unwrap_err();
+        assert_eq!(error.class, ProviderErrorClass::Protocol);
         server.await.unwrap();
     }
 }
@@ -160,20 +151,11 @@ async fn name_only_progress_does_not_mask_root_error_trailer_or_truncated_eof() 
             None,
         )
         .unwrap();
-        let observation = p.submit_observed(submit(CID)).await;
+        let error = p.submit(submit(CID)).await.unwrap_err();
         server.await.unwrap();
-        let error = observation.result.unwrap_err();
         assert_eq!(error.class, ProviderErrorClass::Protocol);
         assert!(!error.definitely_not_submitted());
         assert!(!format!("{error:?}").contains("private-backend-failure"));
-        assert_eq!(observation.effect, RpcSubmitEffect::Unknown);
-        assert_eq!(observation.resources.len(), 1);
-        assert_eq!(observation.resources[0].cid, CID);
-        assert_eq!(observation.resources[0].status, RpcResourceStatus::Reported);
-        assert_eq!(
-            observation.resources[0].ownership,
-            crate::pinning::identity::Ownership::Unknown
-        );
     }
 }
 
@@ -276,14 +258,11 @@ async fn assert_zero_progress_idle(record: &str, profile: RpcProfile) {
     )
     .unwrap();
     let started = tokio::time::Instant::now();
-    let observation = tokio::time::timeout(Duration::from_secs(3), p.submit_observed(submit(CID)))
-        .await
-        .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(3), p.submit(submit(CID))).await;
     server.abort();
-    let error = observation.result.unwrap_err();
+    let error = result.unwrap().unwrap_err();
     assert_eq!(error.class, ProviderErrorClass::Transient);
-    assert_eq!(observation.effect, RpcSubmitEffect::Unknown);
-    assert!(observation.resources.is_empty());
+    assert!(!error.definitely_not_submitted());
     assert!(
         started.elapsed() < Duration::from_millis(800),
         "non-progress bytes must not keep an upload alive"
@@ -297,6 +276,9 @@ async fn malformed_multi_root_or_failed_car_imports_never_unpin() {
             "{{\"Root\":{{\"Cid\":{{\"/\":\"{CID}\"}},\"PinErrorMsg\":\"private failure\"}}}}\n{{\"Stats\":{{\"BlockCount\":1,\"BlockBytesCount\":3}}}}\n"
         ),
         format!("{{\"Root\":{{\"Cid\":{{\"/\":\"{CID}\"}},\"PinErrorMsg\":\"\"}}}}\n"),
+        format!(
+            "{{\"Root\":{{\"Cid\":{{\"/\":\"{OTHER}\"}},\"PinErrorMsg\":\"\"}}}}\n{{\"Stats\":{{\"BlockCount\":1,\"BlockBytesCount\":3}}}}\n"
+        ),
         format!(
             "{{\"Root\":{{\"Cid\":{{\"/\":\"{CID}\"}},\"PinErrorMsg\":\"\"}}}}\n{{\"Root\":{{\"Cid\":{{\"/\":\"{OTHER}\"}},\"PinErrorMsg\":\"\"}}}}\n{{\"Stats\":{{\"BlockCount\":2,\"BlockBytesCount\":3}}}}\n"
         ),
@@ -320,112 +302,74 @@ async fn malformed_multi_root_or_failed_car_imports_never_unpin() {
         let error = p.submit(submit(CID)).await.unwrap_err();
         assert!(!error.definitely_not_submitted());
         assert!(!format!("{error:?}").contains("private failure"));
-        assert!(
-            target
-                .received_requests()
-                .await
-                .unwrap()
-                .iter()
-                .all(|r| r.url.path() != "/api/v0/pin/rm")
-        );
+        let requests = target.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url.path(), "/api/v0/dag/import");
     }
 }
 
 #[tokio::test]
-async fn upload_confirmation_permission_error_never_completes_submit() {
-    let source = MockServer::start().await;
-    let target = MockServer::start().await;
-    source_file(&source, CID, b"stored").await;
-    Mock::given(method("POST"))
-        .and(path("/api/v0/add"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_string(format!("{{\"Hash\":\"{CID}\"}}\n")),
-        )
-        .mount(&target)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/api/v0/pin/add"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"Pins": [CID]})))
-        .mount(&target)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/api/v0/pin/ls"))
-        .respond_with(ResponseTemplate::new(403))
-        .mount(&target)
-        .await;
-    let p = provider(&target, &source, RpcProfile::Kubo, RpcStrategy::Upload);
-    let observation = p.submit_observed(submit(CID)).await;
-    let error = observation.result.unwrap_err();
-    assert!(!error.definitely_not_submitted());
-    assert_eq!(error.class, ProviderErrorClass::Protocol);
-    assert_eq!(observation.effect, RpcSubmitEffect::Observed);
-    assert!(
-        observation
-            .resources
-            .iter()
-            .all(|resource| resource.ownership == crate::pinning::identity::Ownership::Unknown)
-    );
+async fn exact_unpin_sends_only_the_handle_cid_with_profile_parameters() {
+    for (profile, strategy, id, expected_query) in [
+        (
+            RpcProfile::Kubo,
+            RpcStrategy::Cid,
+            "kubo",
+            vec![("arg", CID), ("recursive", "true")],
+        ),
+        (
+            RpcProfile::Filebase,
+            RpcStrategy::Upload,
+            "filebase",
+            vec![("arg", CID)],
+        ),
+    ] {
+        let source = MockServer::start().await;
+        let target = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/pin/rm"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"Pins": [CID]})),
+            )
+            .expect(1)
+            .mount(&target)
+            .await;
+        let p = provider(&target, &source, profile, strategy);
+        p.unpin(&format!("rpc-pin:{id}:{CID}")).await.unwrap();
+        let requests = target.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let query: Vec<_> = requests[0]
+            .url
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        assert_eq!(
+            query,
+            expected_query
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect::<Vec<_>>()
+        );
+        assert!(source.received_requests().await.unwrap().is_empty());
+    }
 }
 
 #[tokio::test]
-async fn car_confirmation_permission_error_never_completes_submit() {
+async fn unpin_rejects_a_different_cid_without_retrying() {
     let source = MockServer::start().await;
     let target = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/api/v0/dag/export"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"mock CAR"))
-        .mount(&source)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/api/v0/dag/import"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
-            "{{\"Root\":{{\"Cid\":{{\"/\":\"{CID}\"}},\"PinErrorMsg\":\"\"}}}}\n{{\"Stats\":{{\"BlockCount\":1,\"BlockBytesCount\":8}}}}\n"
-        )))
-        .mount(&target)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/api/v0/pin/ls"))
-        .respond_with(ResponseTemplate::new(403))
-        .mount(&target)
-        .await;
-    let p = provider(&target, &source, RpcProfile::Kubo, RpcStrategy::Car);
-    let observation = p.submit_observed(submit(CID)).await;
-    let error = observation.result.unwrap_err();
-    assert!(!error.definitely_not_submitted());
-    assert_eq!(error.class, ProviderErrorClass::Protocol);
-    assert_eq!(observation.effect, RpcSubmitEffect::Observed);
-    assert!(
-        observation
-            .resources
-            .iter()
-            .all(|resource| resource.ownership == crate::pinning::identity::Ownership::Unknown)
-    );
-}
-
-#[tokio::test]
-async fn exact_unpin_is_separate_from_submit_and_has_no_bulk_gc() {
-    let source = MockServer::start().await;
-    let target = MockServer::start().await;
-    local(&target, CID).await;
     Mock::given(method("POST"))
         .and(path("/api/v0/pin/rm"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"Pins": [CID]})))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"Pins": [OTHER]})),
+        )
         .expect(1)
         .mount(&target)
         .await;
     let p = provider(&target, &source, RpcProfile::Kubo, RpcStrategy::Cid);
-    let pin = p.find(query(CID)).await.unwrap().remove(0);
-    p.unpin(&pin.request_id).await.unwrap();
-    let requests = target.received_requests().await.unwrap();
-    let rm = requests
-        .iter()
-        .find(|r| r.url.path() == "/api/v0/pin/rm")
-        .unwrap();
-    assert_eq!(
-        rm.url.query_pairs().find(|(k, _)| k == "arg").unwrap().1,
-        CID
-    );
-    assert!(!requests.iter().any(|r| r.url.path().contains("gc")));
+    let error = p.unpin(&format!("rpc-pin:kubo:{CID}")).await.unwrap_err();
+    assert_eq!(error.class, ProviderErrorClass::Protocol);
+    assert_eq!(target.received_requests().await.unwrap().len(), 1);
 }
 
 #[test]

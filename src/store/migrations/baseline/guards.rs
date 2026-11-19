@@ -16,11 +16,6 @@ pub(super) async fn install<C: ConnectionTrait>(db: &C) -> Result<(), DbErr> {
         ] {
             db.execute_unprepared(&format!("CREATE TRIGGER {name} BEFORE {event} ON import_jobs WHEN NEW.client_token IS NOT NULL AND EXISTS (SELECT 1 FROM zip_v2_import_requests WHERE bucket=NEW.bucket AND source_key=NEW.key AND client_token=NEW.client_token) BEGIN SELECT RAISE(ABORT, 'zip_v2_import_token_conflict'); END")).await?;
         }
-        for table in ["pin_lease_requirements", "pin_replica_observations"] {
-            for event in ["UPDATE", "DELETE"] {
-                db.execute_unprepared(&format!("CREATE TRIGGER {table}_no_{} BEFORE {event} ON {table} BEGIN SELECT RAISE(ABORT, 'immutable pin history'); END", event.to_lowercase())).await?;
-            }
-        }
     } else {
         let old = columns
             .split(',')
@@ -39,10 +34,6 @@ pub(super) async fn install<C: ConnectionTrait>(db: &C) -> Result<(), DbErr> {
         db.execute_unprepared("CREATE FUNCTION zip_v2_import_guard() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF TG_TABLE_NAME='import_jobs' THEN IF NEW.client_token IS NOT NULL AND EXISTS (SELECT 1 FROM zip_v2_import_requests WHERE bucket=NEW.bucket AND source_key=NEW.key AND client_token=NEW.client_token) THEN RAISE EXCEPTION 'zip_v2_import_token_conflict'; END IF; ELSE IF EXISTS (SELECT 1 FROM import_jobs WHERE bucket=NEW.bucket AND key=NEW.source_key AND client_token=NEW.client_token) THEN RAISE EXCEPTION 'zip_v2_import_token_conflict'; END IF; END IF; RETURN NEW; END $$").await?;
         db.execute_unprepared("CREATE TRIGGER zip_v2_import_legacy_conflict BEFORE INSERT ON zip_v2_import_requests FOR EACH ROW EXECUTE FUNCTION zip_v2_import_guard()").await?;
         db.execute_unprepared("CREATE TRIGGER zip_v2_legacy_import_conflict BEFORE INSERT OR UPDATE OF bucket,key,client_token ON import_jobs FOR EACH ROW EXECUTE FUNCTION zip_v2_import_guard()").await?;
-        db.execute_unprepared("CREATE FUNCTION reject_pin_history_mutation() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'immutable pin history'; END $$").await?;
-        for table in ["pin_lease_requirements", "pin_replica_observations"] {
-            db.execute_unprepared(&format!("CREATE TRIGGER {table}_immutable BEFORE UPDATE OR DELETE ON {table} FOR EACH ROW EXECUTE FUNCTION reject_pin_history_mutation()")).await?;
-        }
     }
     Ok(())
 }

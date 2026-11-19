@@ -184,15 +184,6 @@ allow_decompressed = true
         ))
         .unwrap();
         let state = AppState::new(&config).await.unwrap();
-        let provider = &state.pinning.effective_config().providers[0];
-        assert_eq!(
-            state
-                .pinning
-                .provider(&provider.identity.allocation_key())
-                .unwrap()
-                .invocation_route(),
-            ("noop", "cid")
-        );
         store::bucket::create(state.store.db(), BUCKET, Some("test"))
             .await
             .unwrap();

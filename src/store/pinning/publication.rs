@@ -1,28 +1,24 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::time::Duration;
 
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, Utc};
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, DatabaseTransaction,
-    EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionError, TransactionTrait,
+    EntityTrait, QueryFilter, QuerySelect, Set, TransactionError, TransactionTrait,
 };
 
 use crate::{
     error::{AppError, AppResult},
     lifecycle::model::MultipartUploadTargetIdentity,
     pinning::{
-        config::{ProviderLimitMap, ProviderMode},
+        config::ProviderLimitMap,
         decision::ExtensionDecision,
-        identity::ProviderRouteSnapshot,
-        policy::{LeaseIntent, LeaseSource, PublicationPolicy},
+        policy::PublicationPolicy,
         tags::{ContentMode, ObjectTag},
     },
     store::{
-        entities::{
-            bucket, import_job_result, multipart_upload, object, object_version, pin_lease,
-            pin_lease_target, remote_pin,
-        },
+        entities::{bucket, import_job_result, multipart_upload, object, object_version},
         import::ownership::{
             ImportPublicationGuard, StandardMutationGuard, complete_publication_in_transaction,
             complete_standard_mutation_in_transaction, lock_bucket_for_ownership,
@@ -39,14 +35,8 @@ use crate::{
     },
 };
 
-use super::{jobs, leases, ledger, quota, tags};
-
-pub(crate) mod application;
+use super::{resources, tags};
 mod hot_receipt;
-mod reservations;
-use reservations::PublicationDatabase;
-pub(in crate::store::pinning) use reservations::PublicationTransaction;
-pub mod management;
 mod zip;
 mod zip_v2;
 
@@ -61,11 +51,6 @@ pub use zip_v2::{ZipV2Publication, ZipV2PublicationResult, ZipV2Success, publish
 use hot_receipt::HotPublicationReceipt;
 
 const MAX_TRANSACTION_RETRIES: usize = 3;
-const LEASE_ACTIVE: &str = "active";
-const TARGET_WAITING: &str = "waiting";
-const TARGET_QUOTA_WAITING: &str = "quota_waiting";
-const TARGET_QUOTA_BLOCKED: &str = "quota_blocked";
-const REMOTE_FAILED: &str = "failed";
 
 #[cfg(test)]
 pub(crate) mod test_gates {
@@ -294,8 +279,6 @@ impl DecidedPublish<'_> {
     }
 
     fn snapshot(&self, policy: &PublicationPolicy) -> AppResult<DecidedSnapshot> {
-        let mut routes = BTreeMap::new();
-        let mut allocatable = BTreeSet::new();
         let mut limits = self.limits.clone();
         for name in policy.leases.iter().flat_map(|intent| &intent.providers) {
             let provider = self
@@ -308,15 +291,9 @@ impl DecidedPublish<'_> {
                 .get_mut(name)
                 .ok_or_else(|| invalid_publication("current provider limits unavailable"))?;
             limit.enabled &= !provider.identity.retired;
-            if limit.enabled {
-                allocatable.insert(name.clone());
-            }
-            routes.insert(name.clone(), provider.route_snapshot());
         }
         Ok(DecidedSnapshot {
             decision: self.decision.clone(),
-            routes,
-            allocatable,
             limits,
             zip_current: None,
         })
@@ -331,36 +308,21 @@ struct DecidedSnapshot {
         crate::config::OptionalPinControlMode,
     )>,
     decision: ExtensionDecision,
-    routes: BTreeMap<String, ProviderRouteSnapshot>,
-    allocatable: BTreeSet<String>,
     limits: ProviderLimitMap,
 }
-
-/// Cheap fail-fast check before a durable completion/import starts source or Kubo I/O.
-/// The publication transaction repeats it under locks; this read is not the fence.
-pub async fn preflight_decided_routes(
-    db: &DatabaseConnection,
+pub fn preflight_decided_routes(
     captured: DecidedPublish<'_>,
     policy: &PublicationPolicy,
 ) -> AppResult<()> {
-    let snapshot = captured.snapshot(policy)?;
-    ledger::verify_birth_candidate_routes(db, &snapshot.routes, &snapshot.allocatable, false).await
+    captured.snapshot(policy).map(|_| ())
 }
-
-/// Fail fast on an unavailable original transport before ZIP source I/O. Frozen
-/// policy/TTL/limits are not reinterpreted; publication repeats the full route
-/// fence under its existing locks with exact final bindings.
-pub(crate) async fn preflight_captured_zip_routes(
-    store: &crate::store::Store,
+pub(crate) fn preflight_captured_zip_routes(
     capture: &crate::pinning::zip_policy::CapturedZipIntent,
     current: &crate::pinning::config::ValidatedPinningConfig,
     rules: &crate::pinning::zip_policy::ValidatedZipOutputRules,
     mode: crate::config::OptionalPinControlMode,
     manifest: Option<&crate::zip::batch::FinalZipManifest>,
 ) -> AppResult<()> {
-    let mut routes = BTreeMap::new();
-    let mut flags = BTreeMap::new();
-    let mut allocatable = BTreeSet::new();
     let selection = capture
         .resolve_current_with_rules(current, rules, mode)
         .map_err(|error| invalid_publication(&error.to_string()))?;
@@ -379,29 +341,9 @@ pub(crate) async fn preflight_captured_zip_routes(
         {
             return Err(unavailable());
         }
-        if routes
-            .insert(frozen.config_name.clone(), frozen.route.clone())
-            .is_some_and(|old| old != frozen.route)
-            || flags
-                .insert(frozen.config_name.clone(), frozen.enabled)
-                .is_some_and(|old| old != frozen.enabled)
-        {
-            return Err(invalid_publication("captured provider route is ambiguous"));
-        }
-        if frozen.enabled {
-            allocatable.insert(frozen.config_name.clone());
-        }
     }
-    let budget = std::sync::Arc::new(std::sync::Mutex::new(
-        super::management::records::ReadSession::for_publication(),
-    ));
-    let work = super::management::records::DecodeWork::shared(&budget);
-    let tx = store.begin_runtime(work).await?;
-    let result = ledger::verify_runtime_birth_routes(&tx, &routes, &allocatable, false, work).await;
-    tx.rollback().await?;
-    result
+    Ok(())
 }
-
 pub async fn publish_decided_object(
     db: &DatabaseConnection,
     request: PublicationRequest,
@@ -410,7 +352,7 @@ pub async fn publish_decided_object(
     captured.validate(&request)?;
     let snapshot = captured.snapshot(&request.policy)?;
     run_publication_with_retries_and_hot_receipt(
-        db.into(),
+        db,
         request,
         Vec::new(),
         None,
@@ -438,7 +380,7 @@ pub async fn publish_decided_standard_object(
     let snapshot = captured.snapshot(&request.policy)?;
     require_decision_origin(captured.decision, &guard.mutation_id)?;
     run_publication_with_retries_and_hot_receipt(
-        db.into(),
+        db,
         request,
         Vec::new(),
         None,
@@ -474,7 +416,7 @@ pub async fn publish_decided_standard_object_with_hot_receipt(
         }
     };
     run_publication_with_retries_and_hot_receipt(
-        db.into(),
+        db,
         request,
         Vec::new(),
         None,
@@ -512,7 +454,7 @@ pub async fn publish_decided_completed_upload(
         }
     })?;
     run_completed_publication_with_retries_and_decision(
-        db.into(),
+        db,
         upload_target,
         request,
         Vec::new(),
@@ -537,7 +479,7 @@ pub async fn publish_decided_import_object(
     let snapshot = captured.snapshot(&request.policy)?;
     require_decision_origin(captured.decision, &guard.job_id)?;
     run_publication_with_retries_and_hot_receipt(
-        db.into(),
+        db,
         request,
         Vec::new(),
         None,
@@ -566,7 +508,7 @@ pub async fn publish_decided_zip(
 }
 
 /// Finalizes the prepared manifest in the very same transaction that writes
-/// archive, entries, pin leases and the standard mutation completion.
+/// archive, entries, pin references and the standard mutation completion.
 pub async fn publish_decided_zip_batch(
     db: &DatabaseConnection,
     request: ZipPublicationRequest,
@@ -597,7 +539,7 @@ async fn publish_decided_zip_with_batch(
         batch.validate(&request.archive.object, &request.entries)?;
     }
     run_publication_with_retries_and_hot_receipt(
-        db.into(),
+        db,
         request.archive,
         request.entries,
         batch,
@@ -694,7 +636,7 @@ async fn publish_decided_completed_zip_with_batch(
         }
     })?;
     run_completed_publication_with_retries_and_decision(
-        db.into(),
+        db,
         upload_target,
         request.archive,
         request.entries,
@@ -774,7 +716,7 @@ async fn publish_decided_import_zip_with_batch(
         batch.validate(&request.archive.object, &request.entries)?;
     }
     run_publication_with_retries_and_hot_receipt(
-        db.into(),
+        db,
         request.archive,
         request.entries,
         batch,
@@ -812,8 +754,6 @@ fn zip_decided_snapshot(
     decision.validate_snapshot().map_err(invalid_publication)?;
     Ok(DecidedSnapshot {
         decision: decision.clone(),
-        routes: BTreeMap::new(),
-        allocatable: BTreeSet::new(),
         limits: captured.limits.clone(),
         zip_current: Some((captured.config.clone(), rules.clone(), captured.mode)),
     })
@@ -858,7 +798,7 @@ pub async fn publish_standard_object_with_hot_receipt(
         }
     };
     run_publication_with_retries_and_hot_receipt(
-        db.into(),
+        db,
         request,
         Vec::new(),
         None,
@@ -1095,38 +1035,8 @@ async fn publication_result_for_internal_object<C: ConnectionTrait>(
     })
 }
 
-pub async fn delete_version_with_leases_guarded(
+pub async fn delete_version_guarded(
     db: &DatabaseConnection,
-    bucket: &str,
-    key: &str,
-    selector: VersionSelector,
-    guard: StandardMutationGuard,
-    now: DateTime<Utc>,
-) -> AppResult<DeleteVersionResult> {
-    delete_version_with_database(db.into(), bucket, key, selector, guard, now).await
-}
-
-pub(crate) async fn delete_runtime_version_with_leases_guarded(
-    store: &crate::store::Store,
-    bucket: &str,
-    key: &str,
-    selector: VersionSelector,
-    guard: StandardMutationGuard,
-    now: DateTime<Utc>,
-) -> AppResult<DeleteVersionResult> {
-    delete_version_with_database(
-        reservations::PublicationDatabase::Store(store),
-        bucket,
-        key,
-        selector,
-        guard,
-        now,
-    )
-    .await
-}
-
-async fn delete_version_with_database(
-    db: reservations::PublicationDatabase<'_>,
     bucket: &str,
     key: &str,
     selector: VersionSelector,
@@ -1151,7 +1061,7 @@ async fn delete_version_with_database(
         unreachable!("guarded version delete retry loop exhausted without returning")
     }
     .await;
-    release_failed_mutation(&db, Some(&guard), result.is_err()).await;
+    release_failed_mutation(db, Some(&guard), result.is_err()).await;
     result
 }
 
@@ -1177,98 +1087,58 @@ async fn release_failed_mutation(
 }
 
 async fn delete_version_attempt(
-    db: reservations::PublicationDatabase<'_>,
+    db: &DatabaseConnection,
     bucket: &str,
     key: &str,
     selector: VersionSelector,
     guard: StandardMutationGuard,
     now: DateTime<Utc>,
 ) -> Result<DeleteVersionResult, TransactionError<AppError>> {
-    use reservations::{PublicationTransaction, Reservations};
-    let transaction = match db {
-        reservations::PublicationDatabase::Full(db) => {
-            PublicationTransaction::Full(db.begin().await.map_err(TransactionError::Connection)?)
-        }
-        reservations::PublicationDatabase::Store(store) => {
-            let work = std::sync::Arc::new(std::sync::Mutex::new(
-                super::management::records::ReadSession::for_publication(),
-            ));
-            let tx = store
-                .begin_publication_runtime(super::management::records::DecodeWork::shared(&work))
-                .await?;
-            PublicationTransaction::Runtime(tx, work)
-        }
-    };
-    let txn = transaction.db();
-    let runtime = transaction.runtime();
-    let result = async {
-        lock_bucket_for_ownership(txn, bucket).await?;
-        verify_standard_mutation_guard(txn, &guard, bucket, key, &[]).await?;
-        let state = crate::store::bucket::get_versioning_state(txn, bucket).await?;
-        if state == BucketVersioningState::Unversioned
-            && matches!(&selector, VersionSelector::Exact(_))
-        {
-            return Err(AppError::InvalidArgument(
-                "version IDs are unavailable for an unversioned bucket".to_owned(),
-            ));
-        }
-
-        let _ = crate::store::object_version::lock_current_row(txn, bucket, key).await?;
-        let result = match selector {
-            VersionSelector::Current => match state {
-                BucketVersioningState::Unversioned => {
-                    delete_unversioned_current_core(txn, bucket, key, now, runtime).await?
-                }
-                BucketVersioningState::Enabled => {
-                    delete_enabled_current_in_transaction(txn, bucket, key, now).await?
-                }
-                BucketVersioningState::Suspended => {
-                    delete_suspended_current_core(txn, bucket, key, now, runtime).await?
-                }
-            },
-            VersionSelector::Exact(version_id) => {
-                delete_exact_core(txn, bucket, key, version_id, now, runtime).await?
+    let bucket = bucket.to_owned();
+    let key = key.to_owned();
+    db.transaction(move |txn| {
+        Box::pin(async move {
+            let (bucket, key) = (bucket.as_str(), key.as_str());
+            lock_bucket_for_ownership(txn, bucket).await?;
+            verify_standard_mutation_guard(txn, &guard, bucket, key, &[]).await?;
+            let state = crate::store::bucket::get_versioning_state(txn, bucket).await?;
+            if state == BucketVersioningState::Unversioned
+                && matches!(&selector, VersionSelector::Exact(_))
+            {
+                return Err(AppError::InvalidArgument(
+                    "version IDs are unavailable for an unversioned bucket".to_owned(),
+                ));
             }
-        };
-        complete_standard_mutation_in_transaction(txn, &guard, now).await?;
-        Ok(result)
-    }
-    .await;
-    match result {
-        Ok(result) => {
-            transaction
-                .into_db()
-                .commit()
-                .await
-                .map_err(TransactionError::Connection)?;
+
+            let _ = crate::store::object_version::lock_current_row(txn, bucket, key).await?;
+            let result = match selector {
+                VersionSelector::Current => match state {
+                    BucketVersioningState::Unversioned => {
+                        delete_unversioned_current_in_transaction(txn, bucket, key, now).await?
+                    }
+                    BucketVersioningState::Enabled => {
+                        delete_enabled_current_in_transaction(txn, bucket, key, now).await?
+                    }
+                    BucketVersioningState::Suspended => {
+                        delete_suspended_current_in_transaction(txn, bucket, key, now).await?
+                    }
+                },
+                VersionSelector::Exact(version_id) => {
+                    delete_exact_in_transaction(txn, bucket, key, version_id, now).await?
+                }
+            };
+            complete_standard_mutation_in_transaction(txn, &guard, now).await?;
             Ok(result)
-        }
-        Err(error) => {
-            transaction
-                .into_db()
-                .rollback()
-                .await
-                .map_err(TransactionError::Connection)?;
-            Err(TransactionError::Transaction(error))
-        }
-    }
+        })
+    })
+    .await
 }
 
-pub(crate) async fn delete_unversioned_current_in_transaction<C: ConnectionTrait>(
-    db: &C,
+pub(crate) async fn delete_unversioned_current_in_transaction(
+    db: &DatabaseTransaction,
     bucket: &str,
     key: &str,
     now: DateTime<Utc>,
-) -> AppResult<DeleteVersionResult> {
-    delete_unversioned_current_core(db, bucket, key, now, None).await
-}
-
-async fn delete_unversioned_current_core<C: ConnectionTrait>(
-    db: &C,
-    bucket: &str,
-    key: &str,
-    now: DateTime<Utc>,
-    runtime: Option<&crate::store::RuntimeTransaction>,
 ) -> AppResult<DeleteVersionResult> {
     let null_slot =
         crate::store::object_version::lock_indexed_version(db, bucket, key, &PublicVersionId::Null)
@@ -1282,10 +1152,8 @@ async fn delete_unversioned_current_core<C: ConnectionTrait>(
         ));
     }
     if let Some(current) = current {
-        leases::lock_publication_lifecycle_frontier(db, std::slice::from_ref(&current.id), &[])
-            .await?;
         crate::store::object::set_only_latest(db, bucket, key, None).await?;
-        leases::end_active_leases_for_object_core(db, &current.id, now, runtime).await?;
+        resources::release_owner(db, &current.id, now).await?;
         tags::replace_object_tags(db, &current.id, &[]).await?;
     }
     crate::store::object_version::remove_null_slot(db, bucket, key).await?;
@@ -1317,21 +1185,11 @@ pub(crate) async fn delete_enabled_current_in_transaction<C: ConnectionTrait>(
     })
 }
 
-pub(crate) async fn delete_suspended_current_in_transaction<C: ConnectionTrait>(
-    db: &C,
+pub(crate) async fn delete_suspended_current_in_transaction(
+    db: &DatabaseTransaction,
     bucket: &str,
     key: &str,
     now: DateTime<Utc>,
-) -> AppResult<DeleteVersionResult> {
-    delete_suspended_current_core(db, bucket, key, now, None).await
-}
-
-async fn delete_suspended_current_core<C: ConnectionTrait>(
-    db: &C,
-    bucket: &str,
-    key: &str,
-    now: DateTime<Utc>,
-    runtime: Option<&crate::store::RuntimeTransaction>,
 ) -> AppResult<DeleteVersionResult> {
     let null_slot =
         crate::store::object_version::lock_indexed_version(db, bucket, key, &PublicVersionId::Null)
@@ -1347,9 +1205,7 @@ async fn delete_suspended_current_core<C: ConnectionTrait>(
                 "null version object changed during delete".to_owned(),
             ));
         }
-        leases::lock_publication_lifecycle_frontier(db, std::slice::from_ref(&object.id), &[])
-            .await?;
-        leases::end_active_leases_for_object_core(db, &object.id, now, runtime).await?;
+        resources::release_owner(db, &object.id, now).await?;
         tags::replace_object_tags(db, &object.id, &[]).await?;
     }
     let version_id = crate::store::object_version::install_delete_marker(
@@ -1372,23 +1228,12 @@ async fn delete_suspended_current_core<C: ConnectionTrait>(
 /// revalidated the exact internal version-row identity; content ownership is
 /// ended for that selected object only, while delete markers touch no content
 /// ownership records.
-pub(crate) async fn delete_exact_in_transaction<C: ConnectionTrait>(
-    db: &C,
+pub(crate) async fn delete_exact_in_transaction(
+    db: &DatabaseTransaction,
     bucket: &str,
     key: &str,
     version_id: PublicVersionId,
     now: DateTime<Utc>,
-) -> AppResult<DeleteVersionResult> {
-    delete_exact_core(db, bucket, key, version_id, now, None).await
-}
-
-async fn delete_exact_core<C: ConnectionTrait>(
-    db: &C,
-    bucket: &str,
-    key: &str,
-    version_id: PublicVersionId,
-    now: DateTime<Utc>,
-    runtime: Option<&crate::store::RuntimeTransaction>,
 ) -> AppResult<DeleteVersionResult> {
     let requested_version_id = version_id.as_s3_str().to_owned();
     let (selected, resolved) =
@@ -1407,9 +1252,7 @@ async fn delete_exact_core<C: ConnectionTrait>(
                 "selected version object changed during delete".to_owned(),
             ));
         }
-        leases::lock_publication_lifecycle_frontier(db, std::slice::from_ref(&object.id), &[])
-            .await?;
-        leases::end_active_leases_for_object_core(db, &object.id, now, runtime).await?;
+        resources::release_owner(db, &object.id, now).await?;
         tags::replace_object_tags(db, &object.id, &[]).await?;
     }
     let deleted_delete_marker = resolved.kind == VersionKind::DeleteMarker;
@@ -1419,34 +1262,6 @@ async fn delete_exact_core<C: ConnectionTrait>(
         deleted_delete_marker,
         created_delete_marker: false,
     })
-}
-
-#[cfg(test)]
-pub async fn delete_latest_with_leases(
-    db: &DatabaseConnection,
-    bucket: &str,
-    key: &str,
-    now: DateTime<Utc>,
-) -> AppResult<bool> {
-    let bucket = bucket.to_owned();
-    let key = key.to_owned();
-    db.transaction(move |txn| {
-        Box::pin(async move {
-            acquire_sqlite_publication_write_intent(txn, &bucket).await?;
-            let latest = lock_current_object_projection(txn, &bucket, &key).await?;
-            let Some(latest) = latest else {
-                return Ok(false);
-            };
-            leases::lock_publication_lifecycle_frontier(txn, std::slice::from_ref(&latest.id), &[])
-                .await?;
-            crate::store::object::set_only_latest(txn, &bucket, &key, None).await?;
-            leases::end_active_leases_for_object(txn, &latest.id, now).await?;
-            tags::replace_object_tags(txn, &latest.id, &[]).await?;
-            Ok(true)
-        })
-    })
-    .await
-    .map_err(transaction_error_into_app)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1462,7 +1277,7 @@ async fn run_publication_with_retries(
     limits: &ProviderLimitMap,
 ) -> AppResult<PublicationResult> {
     run_publication_with_retries_and_hot_receipt(
-        db.into(),
+        db,
         request,
         entries,
         None,
@@ -1480,7 +1295,7 @@ async fn run_publication_with_retries(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_publication_with_retries_and_hot_receipt(
-    db: PublicationDatabase<'_>,
+    db: &DatabaseConnection,
     request: PublicationRequest,
     entries: Vec<PublicationObject>,
     batch: Option<ZipBatchPublication>,
@@ -1493,9 +1308,6 @@ async fn run_publication_with_retries_and_hot_receipt(
     limits: &ProviderLimitMap,
     decision: Option<DecidedSnapshot>,
 ) -> AppResult<PublicationResult> {
-    let session = std::sync::Arc::new(std::sync::Mutex::new(
-        super::management::records::ReadSession::for_publication(),
-    ));
     let result = async {
         for retry in 0..=MAX_TRANSACTION_RETRIES {
             match publication_attempt(
@@ -1512,7 +1324,6 @@ async fn run_publication_with_retries_and_hot_receipt(
                 limits.clone(),
                 decision.clone(),
                 None,
-                &session,
             )
             .await
             {
@@ -1529,7 +1340,7 @@ async fn run_publication_with_retries_and_hot_receipt(
         unreachable!("publication retry loop exhausted without returning")
     }
     .await;
-    release_failed_mutation(&db, standard_guard.as_ref(), result.is_err()).await;
+    release_failed_mutation(db, standard_guard.as_ref(), result.is_err()).await;
     result
 }
 
@@ -1542,7 +1353,7 @@ async fn run_completed_publication_with_retries(
     limits: &ProviderLimitMap,
 ) -> Result<PublicationResult, CommitCompletedUploadError> {
     run_completed_publication_with_retries_and_decision(
-        db.into(),
+        db,
         upload_target,
         request,
         entries,
@@ -1557,7 +1368,7 @@ async fn run_completed_publication_with_retries(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_completed_publication_with_retries_and_decision(
-    db: PublicationDatabase<'_>,
+    db: &DatabaseConnection,
     upload_target: &MultipartUploadTargetIdentity,
     request: PublicationRequest,
     entries: Vec<PublicationObject>,
@@ -1567,9 +1378,6 @@ async fn run_completed_publication_with_retries_and_decision(
     decision: Option<DecidedSnapshot>,
     replay: Option<ZipCompletedReplay>,
 ) -> Result<PublicationResult, CommitCompletedUploadError> {
-    let session = std::sync::Arc::new(std::sync::Mutex::new(
-        super::management::records::ReadSession::for_publication(),
-    ));
     let completion_attempt_id = request.object.id.clone();
     let result = async {
         for retry in 0..=MAX_TRANSACTION_RETRIES {
@@ -1587,7 +1395,6 @@ async fn run_completed_publication_with_retries_and_decision(
                 limits.clone(),
                 decision.clone(),
                 replay.clone(),
-                &session,
             )
             .await
             {
@@ -1614,13 +1421,13 @@ async fn run_completed_publication_with_retries_and_decision(
         unreachable!("completed publication retry loop exhausted without returning")
     }
     .await;
-    release_failed_mutation(&db, standard_guard.as_ref(), result.is_err()).await;
+    release_failed_mutation(db, standard_guard.as_ref(), result.is_err()).await;
     result
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn publication_attempt(
-    db: PublicationDatabase<'_>,
+    db: &DatabaseConnection,
     request: PublicationRequest,
     entries: Vec<PublicationObject>,
     batch: Option<ZipBatchPublication>,
@@ -1633,29 +1440,7 @@ async fn publication_attempt(
     limits: ProviderLimitMap,
     decision: Option<DecidedSnapshot>,
     replay: Option<ZipCompletedReplay>,
-    session: &super::management::records::SharedDecodeBudget,
 ) -> Result<PublicationResult, TransactionError<AppError>> {
-    if matches!(db, PublicationDatabase::Store(_))
-        || db.get_database_backend() == DatabaseBackend::Sqlite
-    {
-        return Box::pin(reservations::attempt(
-            db,
-            request,
-            entries,
-            batch,
-            upload_target,
-            standard_guard,
-            import_guard,
-            result_rows,
-            import_now,
-            hot_receipt,
-            limits,
-            decision,
-            replay,
-            session,
-        ))
-        .await;
-    }
     db.transaction(|txn| {
         Box::pin(async move {
             publish_in_transaction_with_batch(
@@ -1707,42 +1492,6 @@ async fn publish_in_transaction_with_batch(
     upload_target: Option<&MultipartUploadTargetIdentity>,
     standard_guard: Option<&StandardMutationGuard>,
     import_guard: Option<&ImportPublicationGuard>,
-    result_rows: Vec<import_job_result::ActiveModel>,
-    _import_now: Option<DateTime<Utc>>,
-    hot_receipt: Option<&HotPublicationReceipt>,
-    limits: &ProviderLimitMap,
-    decided: Option<&DecidedSnapshot>,
-    replay: Option<&ZipCompletedReplay>,
-) -> AppResult<PublicationResult> {
-    publish_with_reservations(
-        &mut reservations::Borrowed(db),
-        request,
-        entries,
-        batch,
-        upload_target,
-        standard_guard,
-        import_guard,
-        result_rows,
-        _import_now,
-        hot_receipt,
-        limits,
-        decided,
-        replay,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn publish_with_reservations<
-    R: reservations::Reservations<Connection = DatabaseTransaction>,
->(
-    reservations: &mut R,
-    request: PublicationRequest,
-    entries: Vec<PublicationObject>,
-    batch: Option<&ZipBatchPublication>,
-    upload_target: Option<&MultipartUploadTargetIdentity>,
-    standard_guard: Option<&StandardMutationGuard>,
-    import_guard: Option<&ImportPublicationGuard>,
     mut result_rows: Vec<import_job_result::ActiveModel>,
     _import_now: Option<DateTime<Utc>>,
     hot_receipt: Option<&HotPublicationReceipt>,
@@ -1750,7 +1499,6 @@ async fn publish_with_reservations<
     decided: Option<&DecidedSnapshot>,
     replay: Option<&ZipCompletedReplay>,
 ) -> AppResult<PublicationResult> {
-    let db = reservations.db();
     validate_request(&request)?;
     if let Some(batch) = batch {
         batch.validate(&request.object, &entries)?;
@@ -1774,7 +1522,6 @@ async fn publish_with_reservations<
             "ZIP publication requires its durable captured admission; needs_attention",
         ));
     }
-    let limits = decided.map_or(limits, |snapshot| &snapshot.limits);
     if let Some(decision) = decided.map(|snapshot| &snapshot.decision) {
         decision
             .replay_policy(request.policy.tags.clone())
@@ -1793,80 +1540,25 @@ async fn publish_with_reservations<
     }
     if let Some(guard) = standard_guard {
         lock_bucket_for_ownership(db, &request.object.bucket).await?;
-        let entry_keys = entries
-            .iter()
-            .map(|entry| entry.key.clone())
-            .collect::<Vec<_>>();
-        verify_standard_mutation_guard(
-            db,
-            guard,
-            &request.object.bucket,
-            &request.object.key,
-            &entry_keys,
-        )
-        .await?;
+        verify_standard_mutation_guard(db, guard, &request.object.bucket, &request.object.key, &[])
+            .await?;
     } else if let Some(guard) = import_guard {
         lock_bucket_for_ownership(db, &request.object.bucket).await?;
-        let publication_targets = publication_locations(&request.object, &entries);
+        let publication_targets = [(request.object.bucket.clone(), request.object.key.clone())];
         verify_publication_guard(db, guard, &request.object.bucket, &publication_targets).await?;
     } else if upload_target.is_some() {
         lock_bucket_for_ownership(db, &request.object.bucket).await?;
     } else {
         acquire_sqlite_publication_write_intent(db, &request.object.bucket).await?;
     }
-    let session = reservations.runtime_work().cloned().unwrap_or_else(|| {
-        std::sync::Arc::new(std::sync::Mutex::new(
-            super::management::records::ReadSession::for_publication(),
-        ))
-    });
-    let work = super::management::records::DecodeWork::shared(&session);
-    work.with(|session| session.check())
-        .map_err(super::management::admission::work_error)?;
     let versioning_state =
         crate::store::bucket::lock_versioning_state(db, &request.object.bucket).await?;
     let object_id = request.object.id.clone();
 
-    let previous_owner_ids =
-        lock_publication_version_frontier(db, versioning_state, &request.object, &entries).await?;
-    let attachment_pairs =
-        publication_attachment_pairs(reservations, &request, &entries, limits, work).await?;
-    leases::lock_publication_lifecycle_frontier(db, &previous_owner_ids, &attachment_pairs).await?;
-    let attachment_providers: Vec<_> = attachment_pairs
-        .iter()
-        .map(|(provider, _)| provider.clone())
-        .collect();
-    quota::lock_publication_usage_rows(db, &attachment_providers).await?;
-    if let Some(snapshot) = decided {
-        match reservations.runtime() {
-            Some(tx) => {
-                ledger::verify_runtime_birth_routes(
-                    tx,
-                    &snapshot.routes,
-                    &snapshot.allocatable,
-                    true,
-                    work,
-                )
-                .await?
-            }
-            None => {
-                ledger::verify_birth_candidate_routes(
-                    db,
-                    &snapshot.routes,
-                    &snapshot.allocatable,
-                    true,
-                )
-                .await?
-            }
-        }
-    }
-    crate::store::residency::prepare_hot_publication_frontier(
-        db,
-        ordered_publication_objects(&request.object, &entries)
-            .into_iter()
-            .map(|object| object.cid.clone())
-            .collect(),
-    )
-    .await?;
+    crate::store::object_version::lock_current_row(db, &request.object.bucket, &request.object.key)
+        .await?;
+    crate::store::residency::prepare_hot_publication_frontier(db, vec![request.object.cid.clone()])
+        .await?;
     if let Some(receipt) = hot_receipt {
         crate::store::residency::apply_hot_publication_verification(
             db,
@@ -1882,7 +1574,6 @@ async fn publish_with_reservations<
         &request.object,
         versioning_state,
         publication_time,
-        reservations.runtime(),
     )
     .await?;
     tags::replace_object_tags(db, &object_id, &request.tags).await?;
@@ -1891,9 +1582,20 @@ async fn publish_with_reservations<
         super::decision::write_for_object_in_transaction(db, &object_id, decision).await?;
     }
 
-    create_publication_leases(reservations, &request, &entries, limits, publication_time).await?;
-    let db = reservations.db();
-
+    let limits = decided.map_or(limits, |snapshot| &snapshot.limits);
+    for intent in &request.policy.leases {
+        if intent.content_mode == ContentMode::Object {
+            resources::attach(
+                db,
+                &object_id,
+                &request.object_target,
+                intent,
+                limits,
+                publication_time,
+            )
+            .await?;
+        }
+    }
     if let Some(upload_target) = upload_target {
         match crate::store::multipart::abort_exact_incomplete_upload_in_transaction(
             db,
@@ -1931,8 +1633,6 @@ async fn publish_with_reservations<
         )
         .await?;
     }
-    work.with(|session| session.check())
-        .map_err(super::management::admission::work_error)?;
     Ok(publication_result)
 }
 
@@ -1943,48 +1643,6 @@ async fn pause_before_import_completion_for_test(job_id: &str) {
         gate.arrived.notify_one();
         gate.resume.notified().await;
     }
-}
-
-fn publication_locations(
-    archive: &PublicationObject,
-    entries: &[PublicationObject],
-) -> Vec<(String, String)> {
-    let mut locations = Vec::with_capacity(entries.len() + 1);
-    locations.push((archive.bucket.clone(), archive.key.clone()));
-    locations.extend(
-        entries
-            .iter()
-            .map(|entry| (entry.bucket.clone(), entry.key.clone())),
-    );
-    locations
-}
-
-fn ordered_publication_objects<'a>(
-    archive: &'a PublicationObject,
-    entries: &'a [PublicationObject],
-) -> Vec<&'a PublicationObject> {
-    let mut objects = Vec::with_capacity(entries.len() + 1);
-    objects.push(archive);
-    objects.extend(entries);
-    // ZIP winner orchestration belongs to the captured core; this helper also
-    // provides stable location ordering for ordinary publication frontiers.
-    objects.sort_by(|left, right| (&left.bucket, &left.key).cmp(&(&right.bucket, &right.key)));
-    objects
-}
-
-async fn lock_publication_version_frontier<C: ConnectionTrait>(
-    db: &C,
-    state: BucketVersioningState,
-    archive: &PublicationObject,
-    entries: &[PublicationObject],
-) -> AppResult<Vec<String>> {
-    zip::lock_version_frontier(
-        db,
-        &ordered_publication_objects(archive, entries),
-        state,
-        None,
-    )
-    .await
 }
 
 async fn lock_current_object_projection<C: ConnectionTrait>(
@@ -2035,37 +1693,6 @@ async fn lock_object_by_id<C: ConnectionTrait>(
     })
 }
 
-async fn publication_attachment_pairs<R: reservations::Reservations>(
-    reservations: &R,
-    request: &PublicationRequest,
-    entries: &[PublicationObject],
-    limits: &ProviderLimitMap,
-    work: super::management::records::DecodeWork<'_>,
-) -> AppResult<Vec<(String, String)>> {
-    let db = reservations.db();
-    let mut pairs = BTreeSet::new();
-    for intent in &request.policy.leases {
-        let providers = ordered_enabled_providers(intent, limits)?;
-        for target in target_specs(request, entries, intent.content_mode) {
-            for provider in &providers {
-                let cid = if reservations.runtime().is_some() {
-                    ledger::allocation_cid_with_work(
-                        &reservations.catalog(work),
-                        provider,
-                        &target.cid,
-                        work,
-                    )
-                    .await?
-                } else {
-                    ledger::allocation_cid(db, provider, &target.cid).await?
-                };
-                pairs.insert((provider.clone(), cid));
-            }
-        }
-    }
-    Ok(pairs.into_iter().collect())
-}
-
 fn validate_request(request: &PublicationRequest) -> AppResult<()> {
     if request.tags != request.policy.tags {
         return Err(invalid_publication(
@@ -2087,12 +1714,11 @@ fn validate_request(request: &PublicationRequest) -> AppResult<()> {
     Ok(())
 }
 
-async fn write_object_version_and_update_lifecycle<C: ConnectionTrait>(
-    db: &C,
+async fn write_object_version_and_update_lifecycle(
+    db: &DatabaseTransaction,
     object: &PublicationObject,
     state: BucketVersioningState,
     now: DateTime<Utc>,
-    runtime: Option<&crate::store::RuntimeTransaction>,
 ) -> AppResult<PublicationResult> {
     if object.logical_size < 0 {
         return Err(invalid_publication(
@@ -2116,7 +1742,7 @@ async fn write_object_version_and_update_lifecycle<C: ConnectionTrait>(
     let inserted =
         crate::store::object::insert_immutable_in_transaction(db, immutable_object).await?;
     if let Some(displaced_object_id) = displaced_object_id {
-        leases::end_active_leases_for_object_core(db, &displaced_object_id, now, runtime).await?;
+        resources::release_owner(db, &displaced_object_id, now).await?;
         tags::replace_object_tags(db, &displaced_object_id, &[]).await?;
     }
     let public_version_id =
@@ -2131,740 +1757,6 @@ async fn write_object_version_and_update_lifecycle<C: ConnectionTrait>(
         object_id: object.id.clone(),
         version_id,
     })
-}
-
-async fn create_publication_leases<R: reservations::Reservations>(
-    reservations: &mut R,
-    request: &PublicationRequest,
-    entries: &[PublicationObject],
-    limits: &ProviderLimitMap,
-    now: DateTime<Utc>,
-) -> AppResult<()> {
-    let mut affected_remotes = BTreeSet::new();
-    let mut failed_user_touches = BTreeSet::new();
-    for intent in &request.policy.leases {
-        let lease_id = lease_id(&request.object.id, intent.source);
-        let targets = target_specs(request, entries, intent.content_mode);
-        insert_lease(
-            reservations.db(),
-            &lease_id,
-            &request.object.id,
-            intent,
-            &targets,
-            now,
-        )
-        .await?;
-        // Decompressed entries can have distinct object CID spellings but the
-        // same provider resource. Keep one target/reference per lease/resource.
-        let mut assigned_targets = BTreeMap::new();
-        for target in targets {
-            let work = reservations.runtime_work().cloned().unwrap_or_else(|| {
-                std::sync::Arc::new(std::sync::Mutex::new(
-                    super::management::records::ReadSession::for_publication(),
-                ))
-            });
-            assign_target_providers_core(
-                reservations,
-                &lease_id,
-                intent,
-                &target,
-                limits,
-                now,
-                &mut assigned_targets,
-                &mut affected_remotes,
-                &mut failed_user_touches,
-                super::management::records::DecodeWork::shared(&work),
-            )
-            .await?;
-        }
-    }
-
-    settle_publication_remotes(
-        reservations,
-        affected_remotes,
-        failed_user_touches,
-        now,
-        None,
-    )
-    .await
-}
-
-async fn insert_lease<C: ConnectionTrait>(
-    db: &C,
-    lease_id: &str,
-    owner_object_id: &str,
-    intent: &LeaseIntent,
-    targets: &[PinTargetSpec],
-    now: DateTime<Utc>,
-) -> AppResult<()> {
-    let seconds = i64::try_from(intent.duration.as_seconds())
-        .map_err(|_| invalid_publication("lease duration is too large"))?;
-    let expires_at = now
-        .checked_add_signed(TimeDelta::seconds(seconds))
-        .ok_or_else(|| invalid_publication("lease expiry is out of range"))?;
-    insert_absolute_lease(
-        db,
-        lease_id,
-        owner_object_id,
-        source_name(intent.source),
-        intent,
-        targets,
-        now,
-        expires_at,
-        now,
-        None,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn insert_absolute_lease<C: ConnectionTrait>(
-    db: &C,
-    lease_id: &str,
-    owner_object_id: &str,
-    source: &str,
-    intent: &LeaseIntent,
-    targets: &[PinTargetSpec],
-    started_at: DateTime<Utc>,
-    expires_at: DateTime<Utc>,
-    now: DateTime<Utc>,
-    requirements: Option<&crate::pinning::management::Requirements>,
-) -> AppResult<()> {
-    let work = std::sync::Arc::new(std::sync::Mutex::new(
-        super::management::records::ReadSession::for_publication(),
-    ));
-    insert_absolute_lease_with_work(
-        db,
-        lease_id,
-        owner_object_id,
-        source,
-        intent,
-        targets,
-        started_at,
-        expires_at,
-        now,
-        requirements,
-        super::management::records::DecodeWork::shared(&work),
-    )
-    .await
-}
-#[allow(clippy::too_many_arguments)]
-async fn insert_absolute_lease_with_work<C: ConnectionTrait>(
-    db: &C,
-    lease_id: &str,
-    owner_object_id: &str,
-    source: &str,
-    intent: &LeaseIntent,
-    targets: &[PinTargetSpec],
-    started_at: DateTime<Utc>,
-    expires_at: DateTime<Utc>,
-    now: DateTime<Utc>,
-    requirements: Option<&crate::pinning::management::Requirements>,
-    work: super::management::records::DecodeWork<'_>,
-) -> AppResult<()> {
-    if expires_at <= started_at {
-        return Err(invalid_publication("invalid absolute lease interval"));
-    }
-    pin_lease::Entity::insert(pin_lease::ActiveModel {
-        id: Set(lease_id.to_owned()),
-        owner_object_id: Set(owner_object_id.to_owned()),
-        source: Set(source.to_owned()),
-        policy_id: Set(intent.policy_id.clone()),
-        provider_mode: Set(provider_mode_name(intent.provider_mode).to_owned()),
-        content_mode: Set(content_mode_name(intent.content_mode).to_owned()),
-        created_at: Set(started_at),
-        last_touched_at: Set(now),
-        expires_at: Set(expires_at),
-        generation: Set(1),
-        state: Set(LEASE_ACTIVE.to_owned()),
-    })
-    .exec(db)
-    .await?;
-    if let Some(requirements) = requirements {
-        for target in targets {
-            work.copy(&target.cid)
-                .map_err(super::management::admission::work_error)?;
-        }
-        crate::store::entities::pin_lease_requirement::contract::insert_management_with_work(
-            db,
-            lease_id,
-            owner_object_id,
-            provider_mode_name(intent.provider_mode),
-            content_mode_name(intent.content_mode),
-            targets.iter().map(|target| target.cid.clone()),
-            &intent.providers,
-            started_at,
-            requirements,
-            work,
-        )
-        .await?;
-    } else {
-        crate::store::entities::pin_lease_requirement::contract::insert(
-            db,
-            lease_id,
-            owner_object_id,
-            provider_mode_name(intent.provider_mode),
-            content_mode_name(intent.content_mode),
-            targets.iter().map(|target| target.cid.clone()),
-            &intent.providers,
-            started_at,
-        )
-        .await?;
-    }
-    Ok(())
-}
-
-fn target_specs(
-    request: &PublicationRequest,
-    entries: &[PublicationObject],
-    content_mode: ContentMode,
-) -> Vec<PinTargetSpec> {
-    match content_mode {
-        ContentMode::Object => vec![request.object_target.clone()],
-        ContentMode::Decompressed => {
-            let mut unique = BTreeMap::new();
-            for entry in entries {
-                unique
-                    .entry(entry.cid.clone())
-                    .or_insert(entry.logical_size);
-            }
-            unique
-                .into_iter()
-                .map(|(cid, logical_size)| PinTargetSpec { cid, logical_size })
-                .collect()
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn assign_target_providers_with_work<C: ConnectionTrait>(
-    db: &C,
-    lease_id: &str,
-    intent: &LeaseIntent,
-    target: &PinTargetSpec,
-    limits: &ProviderLimitMap,
-    now: DateTime<Utc>,
-    assigned_targets: &mut BTreeMap<(String, String), quota::ReservationOutcome>,
-    affected_remotes: &mut BTreeSet<(String, String)>,
-    failed_user_touches: &mut BTreeSet<(String, String)>,
-    work: super::management::records::DecodeWork<'_>,
-) -> AppResult<()> {
-    assign_target_providers_core(
-        &mut reservations::Borrowed(db),
-        lease_id,
-        intent,
-        target,
-        limits,
-        now,
-        assigned_targets,
-        affected_remotes,
-        failed_user_touches,
-        work,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn assign_target_providers_core<R: reservations::Reservations>(
-    reservations: &mut R,
-    lease_id: &str,
-    intent: &LeaseIntent,
-    target: &PinTargetSpec,
-    limits: &ProviderLimitMap,
-    now: DateTime<Utc>,
-    assigned_targets: &mut BTreeMap<(String, String), quota::ReservationOutcome>,
-    affected_remotes: &mut BTreeSet<(String, String)>,
-    failed_user_touches: &mut BTreeSet<(String, String)>,
-    work: super::management::records::DecodeWork<'_>,
-) -> AppResult<()> {
-    let providers = ordered_enabled_providers(intent, limits)?;
-    match intent.provider_mode {
-        ProviderMode::All => {
-            for provider in providers {
-                let target = PinTargetSpec {
-                    cid: ledger::allocation_cid_with_work(
-                        &reservations.catalog(work),
-                        &provider,
-                        &target.cid,
-                        work,
-                    )
-                    .await?,
-                    logical_size: target.logical_size,
-                };
-                let pair = (provider.clone(), target.cid.clone());
-                if assigned_targets.contains_key(&pair) {
-                    continue;
-                }
-                let outcome = reserve_and_insert_target_core(
-                    reservations,
-                    lease_id,
-                    &provider,
-                    &target,
-                    limits,
-                    now,
-                    affected_remotes,
-                    failed_user_touches,
-                    work,
-                )
-                .await?;
-                assigned_targets.insert(pair, outcome);
-            }
-        }
-        ProviderMode::One => {
-            let mut first_unavailable = None;
-            for provider in providers {
-                let target = PinTargetSpec {
-                    cid: ledger::allocation_cid_with_work(
-                        &reservations.catalog(work),
-                        &provider,
-                        &target.cid,
-                        work,
-                    )
-                    .await?,
-                    logical_size: target.logical_size,
-                };
-                let pair = (provider.clone(), target.cid.clone());
-                if let Some(outcome) = assigned_targets.get(&pair) {
-                    if matches!(
-                        outcome,
-                        quota::ReservationOutcome::Reserved | quota::ReservationOutcome::Reused
-                    ) {
-                        return Ok(());
-                    }
-                    if first_unavailable.is_none() {
-                        first_unavailable = Some((provider, target, outcome.clone()));
-                    }
-                    // A raw alias may still be a different resource on a later
-                    // non-RPC provider. Preserve that provider's fallback chance.
-                    continue;
-                }
-                let original_route =
-                    original_lease_route(reservations, lease_id, &provider, work).await?;
-                let outcome = reservations
-                    .reserve(
-                        &provider,
-                        &target,
-                        limits,
-                        now,
-                        work,
-                        original_route.as_ref(),
-                    )
-                    .await?;
-                if matches!(
-                    outcome,
-                    quota::ReservationOutcome::Reserved | quota::ReservationOutcome::Reused
-                ) {
-                    let was_failed =
-                        remote_is_failed(reservations.db(), &provider, &target.cid).await?;
-                    insert_reserved_target(
-                        reservations,
-                        lease_id,
-                        &provider,
-                        &target,
-                        &outcome,
-                        now,
-                        work,
-                    )
-                    .await?;
-                    record_reserved_target(
-                        reservations.db(),
-                        &provider,
-                        &target,
-                        was_failed,
-                        affected_remotes,
-                        failed_user_touches,
-                    )
-                    .await?;
-                    assigned_targets.insert(pair, outcome);
-                    return Ok(());
-                }
-                if first_unavailable.is_none() {
-                    first_unavailable = Some((provider, target, outcome));
-                }
-            }
-            let Some((provider, target, outcome)) = first_unavailable else {
-                return Err(invalid_publication("pinning lease has no enabled provider"));
-            };
-            let pair = (provider.clone(), target.cid.clone());
-            if let std::collections::btree_map::Entry::Vacant(entry) = assigned_targets.entry(pair)
-            {
-                insert_reserved_target(
-                    reservations,
-                    lease_id,
-                    &provider,
-                    &target,
-                    &outcome,
-                    now,
-                    work,
-                )
-                .await?;
-                entry.insert(outcome);
-            }
-        }
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn reserve_and_insert_target_with_work<C: ConnectionTrait>(
-    db: &C,
-    lease_id: &str,
-    provider: &str,
-    target: &PinTargetSpec,
-    limits: &ProviderLimitMap,
-    now: DateTime<Utc>,
-    affected_remotes: &mut BTreeSet<(String, String)>,
-    failed_user_touches: &mut BTreeSet<(String, String)>,
-    work: super::management::records::DecodeWork<'_>,
-) -> AppResult<quota::ReservationOutcome> {
-    reserve_and_insert_target_core(
-        &mut reservations::Borrowed(db),
-        lease_id,
-        provider,
-        target,
-        limits,
-        now,
-        affected_remotes,
-        failed_user_touches,
-        work,
-    )
-    .await
-}
-
-async fn original_lease_route<R: reservations::Reservations>(
-    reservations: &R,
-    lease_id: &str,
-    provider: &str,
-    work: super::management::records::DecodeWork<'_>,
-) -> AppResult<Option<ProviderRouteSnapshot>> {
-    let row = super::management::records::current_model::<
-        crate::store::entities::pin_lease_requirement::Entity,
-        _,
-    >(&reservations.catalog(work), &[lease_id], work)
-    .await
-    .map_err(super::management::admission::work_error)?;
-    let Some(row) = row else {
-        return Ok(None);
-    };
-    let birth: crate::store::entities::pin_lease_requirement::contract::BirthContract =
-        serde_json::from_str(&row.contract)
-            .map_err(|_| invalid_publication("invalid lease resource contract"))?;
-    Ok(birth.candidates.get(provider).cloned().flatten())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn reserve_and_insert_target_core<R: reservations::Reservations>(
-    reservations: &mut R,
-    lease_id: &str,
-    provider: &str,
-    target: &PinTargetSpec,
-    limits: &ProviderLimitMap,
-    now: DateTime<Utc>,
-    affected_remotes: &mut BTreeSet<(String, String)>,
-    failed_user_touches: &mut BTreeSet<(String, String)>,
-    work: super::management::records::DecodeWork<'_>,
-) -> AppResult<quota::ReservationOutcome> {
-    let original_route = original_lease_route(reservations, lease_id, provider, work).await?;
-    let outcome = reservations
-        .reserve(provider, target, limits, now, work, original_route.as_ref())
-        .await?;
-    insert_reserved_target(
-        reservations,
-        lease_id,
-        provider,
-        target,
-        &outcome,
-        now,
-        work,
-    )
-    .await?;
-    if matches!(
-        outcome,
-        quota::ReservationOutcome::Reserved | quota::ReservationOutcome::Reused
-    ) {
-        let was_failed = remote_is_failed(reservations.db(), provider, &target.cid).await?;
-        record_reserved_target(
-            reservations.db(),
-            provider,
-            target,
-            was_failed,
-            affected_remotes,
-            failed_user_touches,
-        )
-        .await?;
-    }
-    Ok(outcome)
-}
-
-async fn ensure_failed_attachment_reconcile_core<C: ConnectionTrait>(
-    db: &C,
-    provider: &str,
-    cid: &str,
-    now: DateTime<Utc>,
-    runtime: Option<(
-        &crate::store::RuntimeTransaction,
-        super::management::records::DecodeWork<'_>,
-    )>,
-) -> AppResult<()> {
-    let Some(remote) = remote_pin::Entity::find_by_id((provider.to_owned(), cid.to_owned()))
-        .one(db)
-        .await?
-    else {
-        return Ok(());
-    };
-    if remote.status != REMOTE_FAILED {
-        return Ok(());
-    }
-    let jobs::NewPinJob::Remote(job) = jobs::reconcile_job(
-        provider,
-        cid,
-        remote.epoch,
-        remote.next_retry_at.unwrap_or(now),
-    ) else {
-        unreachable!("reconcile constructor is remote scoped")
-    };
-    match runtime {
-        Some((tx, work)) => jobs::ensure_runtime_reconcile(tx, job, now, work).await?,
-        None => jobs::ensure_or_reactivate_reconcile_job(db, job, now).await?,
-    };
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn insert_reserved_target<R: reservations::Reservations>(
-    reservations: &R,
-    lease_id: &str,
-    provider: &str,
-    target: &PinTargetSpec,
-    outcome: &quota::ReservationOutcome,
-    now: DateTime<Utc>,
-    work: super::management::records::DecodeWork<'_>,
-) -> AppResult<()> {
-    if reservations.runtime().is_some() {
-        super::management::admission::check_provider_catalog(
-            reservations.catalog(work),
-            provider,
-            work,
-        )
-        .await?;
-    }
-    insert_target(reservations.db(), lease_id, provider, target, outcome, now).await
-}
-
-async fn settle_publication_remotes<R: reservations::Reservations>(
-    reservations: &R,
-    affected: BTreeSet<(String, String)>,
-    failed: BTreeSet<(String, String)>,
-    now: DateTime<Utc>,
-    mut maintenance: Option<&mut crate::store::zip::publication_lease::PublicationLease<'_>>,
-) -> AppResult<()> {
-    let session = reservations.runtime_work().cloned().unwrap_or_else(|| {
-        std::sync::Arc::new(std::sync::Mutex::new(
-            super::management::records::ReadSession::for_publication(),
-        ))
-    });
-    let work = super::management::records::DecodeWork::shared(&session);
-    let runtime = reservations.runtime().map(|tx| (tx, work));
-    let db = reservations.db();
-    for (provider, cid) in failed {
-        if let Some(lease) = maintenance.as_deref_mut() {
-            lease.checkpoint(db).await?;
-        }
-        leases::reset_failed_publication_retry(
-            db,
-            &provider,
-            &cid,
-            now,
-            maintenance.as_deref_mut(),
-            runtime,
-        )
-        .await?;
-        ensure_failed_attachment_reconcile_core(db, &provider, &cid, now, runtime).await?;
-    }
-    for (provider, cid) in affected {
-        project_desired_remote_targets_core(
-            db,
-            &provider,
-            &cid,
-            now,
-            maintenance.as_deref_mut(),
-            runtime,
-        )
-        .await?;
-    }
-    Ok(())
-}
-
-async fn insert_target<C: ConnectionTrait>(
-    db: &C,
-    lease_id: &str,
-    provider: &str,
-    target: &PinTargetSpec,
-    outcome: &quota::ReservationOutcome,
-    now: DateTime<Utc>,
-) -> AppResult<()> {
-    let state = match outcome {
-        quota::ReservationOutcome::Reserved | quota::ReservationOutcome::Reused => TARGET_WAITING,
-        quota::ReservationOutcome::QuotaWaiting { .. } => TARGET_QUOTA_WAITING,
-        quota::ReservationOutcome::QuotaBlocked => TARGET_QUOTA_BLOCKED,
-    };
-    pin_lease_target::Entity::insert(pin_lease_target::ActiveModel {
-        id: Set(leases::target_id(lease_id, provider, &target.cid)),
-        lease_id: Set(lease_id.to_owned()),
-        cid: Set(target.cid.clone()),
-        logical_size: Set(target.logical_size),
-        provider: Set(provider.to_owned()),
-        state: Set(state.to_owned()),
-        last_error: Set(None),
-        created_at: Set(now),
-        last_touched_at: Set(now),
-    })
-    .exec(db)
-    .await?;
-    Ok(())
-}
-
-async fn record_reserved_target<C: ConnectionTrait>(
-    db: &C,
-    provider: &str,
-    target: &PinTargetSpec,
-    was_failed: bool,
-    affected_remotes: &mut BTreeSet<(String, String)>,
-    failed_user_touches: &mut BTreeSet<(String, String)>,
-) -> AppResult<()> {
-    quota::refresh_remote_max_active_touch(db, provider, &target.cid).await?;
-    let pair = (provider.to_owned(), target.cid.clone());
-    affected_remotes.insert(pair.clone());
-    if was_failed {
-        failed_user_touches.insert(pair);
-    }
-    Ok(())
-}
-
-async fn project_desired_remote_targets_core<C: ConnectionTrait>(
-    db: &C,
-    provider: &str,
-    cid: &str,
-    now: DateTime<Utc>,
-    mut maintenance: Option<&mut crate::store::zip::publication_lease::PublicationLease<'_>>,
-    runtime: Option<(
-        &crate::store::RuntimeTransaction,
-        super::management::records::DecodeWork<'_>,
-    )>,
-) -> AppResult<()> {
-    let target_ids = pin_lease_target::Entity::find()
-        .inner_join(pin_lease::Entity)
-        .filter(pin_lease_target::Column::Provider.eq(provider))
-        .filter(pin_lease_target::Column::Cid.eq(cid))
-        .filter(pin_lease_target::Column::State.is_in([
-            "waiting",
-            "submitted",
-            "pinned",
-            "degraded",
-        ]))
-        .filter(pin_lease::Column::State.eq(LEASE_ACTIVE))
-        .order_by_asc(pin_lease_target::Column::CreatedAt)
-        .order_by_asc(pin_lease_target::Column::Id)
-        .all(db)
-        .await?
-        .into_iter()
-        .map(|target| target.id)
-        .collect::<Vec<_>>();
-    for target_id in target_ids {
-        if let Some(lease) = maintenance.as_deref_mut() {
-            lease.checkpoint(db).await?;
-        }
-        match runtime {
-            Some((tx, work)) => {
-                leases::project_runtime_publication_target(
-                    tx,
-                    &target_id,
-                    now,
-                    maintenance.as_deref_mut(),
-                    work,
-                )
-                .await?;
-            }
-            None => {
-                leases::project_target_from_remote_with_maintenance(
-                    db,
-                    &target_id,
-                    now,
-                    maintenance.as_deref_mut(),
-                )
-                .await?;
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn remote_is_failed<C: ConnectionTrait>(
-    db: &C,
-    provider: &str,
-    cid: &str,
-) -> AppResult<bool> {
-    Ok(
-        remote_pin::Entity::find_by_id((provider.to_owned(), cid.to_owned()))
-            .one(db)
-            .await?
-            .is_some_and(|remote| remote.status == REMOTE_FAILED),
-    )
-}
-
-fn ordered_enabled_providers(
-    intent: &LeaseIntent,
-    limits: &ProviderLimitMap,
-) -> AppResult<Vec<String>> {
-    let mut providers = BTreeSet::new();
-    for provider in &intent.providers {
-        let provider_limits = limits
-            .get(provider)
-            .ok_or_else(|| invalid_publication("pinning lease references an unknown provider"))?;
-        if provider_limits.enabled {
-            providers.insert(provider.clone());
-        } else if intent.provider_mode == ProviderMode::All {
-            return Err(invalid_publication(
-                "all-provider intent includes a disabled or retired provider",
-            ));
-        }
-    }
-    let mut providers = providers.into_iter().collect::<Vec<_>>();
-    providers.sort_by(|left, right| {
-        limits[left]
-            .priority
-            .cmp(&limits[right].priority)
-            .then_with(|| left.cmp(right))
-    });
-    if providers.is_empty() {
-        return Err(invalid_publication("pinning lease has no enabled provider"));
-    }
-    Ok(providers)
-}
-
-fn lease_id(object_id: &str, source: LeaseSource) -> String {
-    format!("lease:{object_id}:{}", source_name(source))
-}
-
-fn source_name(source: LeaseSource) -> &'static str {
-    match source {
-        LeaseSource::Automatic => "automatic",
-        LeaseSource::Manual => "manual",
-    }
-}
-
-fn provider_mode_name(mode: ProviderMode) -> &'static str {
-    match mode {
-        ProviderMode::One => "one",
-        ProviderMode::All => "all",
-    }
-}
-
-fn content_mode_name(mode: ContentMode) -> &'static str {
-    match mode {
-        ContentMode::Object => "full",
-        ContentMode::Decompressed => "decompressed",
-    }
 }
 
 fn invalid_publication(message: &str) -> AppError {
@@ -2915,8 +1807,6 @@ fn transaction_error_into_app(error: TransactionError<AppError>) -> AppError {
 }
 
 #[cfg(test)]
-mod allocation_tests;
-#[cfg(test)]
 mod tests;
 
 #[cfg(test)]
@@ -2930,7 +1820,7 @@ mod zip_batch_publication_tests {
             policy::{LeaseIntent, LeaseSource},
         },
         store::{
-            entities::{object, object_version, pin_lease, pin_lease_target},
+            entities::{object, object_version},
             import::ownership::admit_content_and_prefix_mutation,
             zip::{self, BatchAdmission, ManifestItem, RootOutcome},
         },
@@ -2983,8 +1873,7 @@ mod zip_batch_publication_tests {
         )
         .await
         .unwrap();
-        let capture =
-            tests::zip_fixture::original_capture(&tx, archive, prefix, &guard.mutation_id).await;
+        let capture = tests::zip_fixture::original_capture(archive, prefix, &guard.mutation_id);
         BatchAdmission::admit_legacy_in_transaction(
             &tx,
             &BatchAdmission {
@@ -3086,7 +1975,10 @@ mod zip_batch_publication_tests {
         ));
         assert_eq!(object::Entity::find().count(&db).await.unwrap(), 0);
         assert_eq!(object_version::Entity::find().count(&db).await.unwrap(), 0);
-        assert_eq!(pin_lease::Entity::find().count(&db).await.unwrap(), 0);
+        assert_eq!(
+            tests::sql_count(&db, "SELECT COUNT(*) n FROM pin_refs").await,
+            0
+        );
         let snapshot = zip::snapshot(&db, "batch").await.unwrap().unwrap();
         assert_eq!(snapshot.batch.state, "open");
         assert!(snapshot.entries[0].version_row_id.is_none());
@@ -3144,7 +2036,7 @@ mod zip_batch_publication_tests {
         )
         .await;
         let error = publication_attempt(
-            (&db).into(),
+            &db,
             zip_request.archive,
             zip_request.entries,
             Some(batch),
@@ -3157,7 +2049,6 @@ mod zip_batch_publication_tests {
             limits,
             Some(decided),
             None,
-            &Default::default(),
         )
         .await
         .unwrap_err();
@@ -3167,9 +2058,12 @@ mod zip_batch_publication_tests {
         );
         assert_eq!(object::Entity::find().count(&db).await.unwrap(), 0);
         assert_eq!(object_version::Entity::find().count(&db).await.unwrap(), 0);
-        assert_eq!(pin_lease::Entity::find().count(&db).await.unwrap(), 0);
         assert_eq!(
-            pin_lease_target::Entity::find().count(&db).await.unwrap(),
+            tests::sql_count(&db, "SELECT COUNT(*) n FROM pin_refs").await,
+            0
+        );
+        assert_eq!(
+            tests::sql_count(&db, "SELECT COUNT(*) n FROM pin_resources").await,
             0
         );
         let tx = db.begin().await.unwrap();

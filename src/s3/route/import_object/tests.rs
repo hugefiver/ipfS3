@@ -21,6 +21,7 @@ use crate::{
             DownloadError, DownloadLimits, ImportResolver, ReqwestImportHttpTransport,
             SourceDownloader, StrictPublicAddressPolicy,
         },
+        test_support::pin_counts,
     },
     s3::sigv4,
     store::{
@@ -610,7 +611,6 @@ async fn signed_import_restarts_worker_with_new_policy_without_replaying_skipped
     use crate::{
         config::{OptionalPinControlMode, PinningConfig, PolicyConfig, ProviderConfig},
         pinning::config::ValidatedPinningConfig,
-        store::entities::{pin_job, pin_lease, pin_provider_usage, remote_pin},
     };
     use sea_orm::ConnectOptions;
     use wiremock::{
@@ -816,26 +816,7 @@ async fn signed_import_restarts_worker_with_new_policy_without_replaying_skipped
     assert!(xml.contains("<State>completed</State>"));
     assert!(!xml.contains("Warning"));
     assert!(!xml.contains("do-not-leak"));
-    for count in [
-        pin_lease::Entity::find()
-            .count(restarted.store.db())
-            .await
-            .unwrap(),
-        pin_job::Entity::find()
-            .count(restarted.store.db())
-            .await
-            .unwrap(),
-        pin_provider_usage::Entity::find()
-            .count(restarted.store.db())
-            .await
-            .unwrap(),
-        remote_pin::Entity::find()
-            .count(restarted.store.db())
-            .await
-            .unwrap(),
-    ] {
-        assert_eq!(count, 0);
-    }
+    assert_eq!(pin_counts(restarted.store.db()).await, (0, 0));
     server.abort();
 }
 
@@ -881,7 +862,7 @@ async fn assert_prepared_zip_is_unpublished(
     entry_cid: &str,
 ) {
     use crate::store::{
-        entities::{object, object_version, pin_job, pin_lease, pin_provider_usage, remote_pin},
+        entities::{object, object_version},
         pinning::publication::decode_zip_capture_json,
     };
     let snapshot = crate::store::zip::snapshot(state.store.db(), &admitted.id)
@@ -942,25 +923,10 @@ async fn assert_prepared_zip_is_unpublished(
             .count(state.store.db())
             .await
             .unwrap(),
-        pin_lease::Entity::find()
-            .count(state.store.db())
-            .await
-            .unwrap(),
-        pin_job::Entity::find()
-            .count(state.store.db())
-            .await
-            .unwrap(),
-        pin_provider_usage::Entity::find()
-            .count(state.store.db())
-            .await
-            .unwrap(),
-        remote_pin::Entity::find()
-            .count(state.store.db())
-            .await
-            .unwrap(),
     ] {
         assert_eq!(count, 0);
     }
+    assert_eq!(pin_counts(state.store.db()).await, (0, 0));
 }
 
 async fn assert_bound_zip_source_phases(
@@ -1016,27 +982,7 @@ async fn assert_bound_zip_source_phases(
         requests[3].url.query(),
         Some(format!("arg={CID}&recursive=true&progress=true").as_str())
     );
-    use crate::store::entities::{pin_job, pin_lease, pin_provider_usage, remote_pin};
-    for count in [
-        pin_lease::Entity::find()
-            .count(state.store.db())
-            .await
-            .unwrap(),
-        pin_job::Entity::find()
-            .count(state.store.db())
-            .await
-            .unwrap(),
-        pin_provider_usage::Entity::find()
-            .count(state.store.db())
-            .await
-            .unwrap(),
-        remote_pin::Entity::find()
-            .count(state.store.db())
-            .await
-            .unwrap(),
-    ] {
-        assert_eq!(count, 0);
-    }
+    assert_eq!(pin_counts(state.store.db()).await, (0, 0));
     proof
 }
 

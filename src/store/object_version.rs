@@ -558,6 +558,7 @@ async fn insert_version_row<C: ConnectionTrait>(
         version_id: Set(version_id.as_db_value()),
         kind: Set(kind.to_owned()),
         object_id: Set(object_id),
+        pin_decision: Set(None),
         sequence: Set(sequence),
         is_latest: Set(true),
         lifecycle_age_started_at: Set(now),

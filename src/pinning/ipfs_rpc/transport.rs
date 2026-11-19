@@ -142,6 +142,7 @@ impl Transport {
             let builder = Client::builder()
                 .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
                 .connect_timeout(timeouts.connect);
             if allow_private_network {
                 builder

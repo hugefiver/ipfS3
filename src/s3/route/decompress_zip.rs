@@ -7,16 +7,12 @@ use s3s::dto::{ETag, ParseETagError};
 use s3s::route::S3Route;
 use s3s::{Body, S3Request, S3Response, S3Result};
 
-#[cfg(test)]
-use crate::pinning::policy::PublicationContext;
-#[cfg(test)]
-use crate::store::pinning::publication::{PinTargetSpec, PublicationRequest};
 use crate::{
     pinning::{decision::DecisionOrigin, tags::ObjectTag},
     state::AppState,
     store::pinning::publication::{
         CapturedZipPublication, LegacyZipAuthority, PublicationObject, ZipPublicationAuthority,
-        application::publish_captured_zip, decode_zip_capture_json,
+        decode_zip_capture_json, publish_captured_zip,
     },
 };
 
@@ -992,9 +988,7 @@ impl DecompressZipRoute {
                     "tags": tags,
                 })
                 .to_string();
-                let admitted =
-                    crate::store::zip::BatchAdmission::admit_store(&self.state.store, &admission)
-                        .await?;
+                let admitted = crate::store::zip::admit(self.state.store.db(), &admission).await?;
                 let zip_intent = decode_zip_capture_json(&admitted.captured_options)?;
                 if zip_intent.origin().request_id != batch_id
                     || zip_intent.origin().principal_id != principal
@@ -1101,7 +1095,7 @@ impl DecompressZipRoute {
                 };
                 let results = lease
                     .commit(publish_captured_zip(
-                        &self.state.store,
+                        self.state.store.db(),
                         request,
                         self.state.pinning.effective_config(),
                         self.state.pinning.zip_output_rules(),
@@ -1585,6 +1579,7 @@ mod tests {
     use http_body_util::BodyExt;
     use sea_orm::{
         ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
+        Statement,
     };
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1592,6 +1587,8 @@ mod tests {
     use super::*;
 
     const HELLO: &[u8] = b"hello";
+    const ENTRY_CID_A: &str = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
+    const ENTRY_CID_B: &str = "bafkreigh2akiscaildc6ii5zji4bq7kly5k3s7svv6q2wx2nn5rtj5xuu4";
 
     #[derive(Clone, Copy)]
     struct ZipEntryFixture<'a> {
@@ -1712,7 +1709,6 @@ mod tests {
         let db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
         crate::store::run_migrations(&db).await.unwrap();
         let store = crate::store::Store::new(db);
-        pinning.register_identities(&store).await.unwrap();
         let state = Arc::new(AppState {
             kubo: crate::kubo::KuboClient::new(kubo.uri()),
             cold_kubo: None,
@@ -1841,180 +1837,46 @@ mod tests {
         request
     }
 
-    async fn archive_leases(
-        state: &Arc<AppState>,
-    ) -> Vec<crate::store::entities::pin_lease::Model> {
-        use crate::store::entities::pin_lease;
-
-        let archive = crate::store::object::get_latest(state.store.db(), "bucket", "archive.zip")
-            .await
-            .unwrap();
-        pin_lease::Entity::find()
-            .filter(pin_lease::Column::OwnerObjectId.eq(archive.id))
-            .order_by_asc(pin_lease::Column::Source)
-            .all(state.store.db())
-            .await
-            .unwrap()
+    async fn pin_references(state: &AppState) -> Vec<(String, String, String, String, i64)> {
+        let db = state.store.db();
+        db.query_all(Statement::from_string(
+            db.get_database_backend(),
+            "SELECT refs.owner_object_id, refs.source, refs.provider, refs.cid, resources.logical_size \
+             FROM pin_refs AS refs JOIN pin_resources AS resources USING (provider, cid) \
+             ORDER BY refs.source, refs.provider, refs.cid",
+        ))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| {
+            (
+                row.try_get("", "owner_object_id").unwrap(),
+                row.try_get("", "source").unwrap(),
+                row.try_get("", "provider").unwrap(),
+                row.try_get("", "cid").unwrap(),
+                row.try_get("", "logical_size").unwrap(),
+            )
+        })
+        .collect()
     }
 
-    async fn lease_target_cids(state: &Arc<AppState>, lease_id: &str) -> Vec<String> {
-        use crate::store::entities::pin_lease_target;
+    async fn assert_no_zip_publication_rows(state: &AppState) {
+        use crate::store::entities::{object, object_tag, object_version};
 
-        let mut cids = pin_lease_target::Entity::find()
-            .filter(pin_lease_target::Column::LeaseId.eq(lease_id))
-            .all(state.store.db())
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|target| target.cid)
-            .collect::<Vec<_>>();
-        cids.sort();
-        cids
-    }
-
-    async fn lease_targets(
-        state: &Arc<AppState>,
-        lease_id: &str,
-    ) -> Vec<crate::store::entities::pin_lease_target::Model> {
-        use crate::store::entities::pin_lease_target;
-
-        pin_lease_target::Entity::find()
-            .filter(pin_lease_target::Column::LeaseId.eq(lease_id))
-            .order_by_asc(pin_lease_target::Column::Provider)
-            .order_by_asc(pin_lease_target::Column::Cid)
-            .all(state.store.db())
-            .await
-            .unwrap()
-    }
-
-    async fn assert_no_zip_publication_rows(state: &Arc<AppState>) {
-        use crate::store::entities::{
-            object, object_tag, pin_job, pin_lease, pin_lease_target, pin_provider_usage,
-            remote_pin,
-        };
-
-        assert_eq!(
-            object::Entity::find()
-                .count(state.store.db())
+        let db = state.store.db();
+        assert_eq!(object::Entity::find().count(db).await.unwrap(), 0);
+        assert_eq!(object_tag::Entity::find().count(db).await.unwrap(), 0);
+        assert_eq!(object_version::Entity::find().count(db).await.unwrap(), 0);
+        for table in ["pin_refs", "pin_resources"] {
+            let row = db
+                .query_one(Statement::from_string(
+                    db.get_database_backend(),
+                    format!("SELECT 1 FROM {table} LIMIT 1"),
+                ))
                 .await
-                .unwrap(),
-            0
-        );
-        assert_eq!(
-            object_tag::Entity::find()
-                .count(state.store.db())
-                .await
-                .unwrap(),
-            0
-        );
-        assert_eq!(
-            pin_lease::Entity::find()
-                .count(state.store.db())
-                .await
-                .unwrap(),
-            0
-        );
-        assert_eq!(
-            pin_lease_target::Entity::find()
-                .count(state.store.db())
-                .await
-                .unwrap(),
-            0
-        );
-        assert_eq!(
-            remote_pin::Entity::find()
-                .count(state.store.db())
-                .await
-                .unwrap(),
-            0
-        );
-        assert_eq!(
-            pin_provider_usage::Entity::find()
-                .count(state.store.db())
-                .await
-                .unwrap(),
-            0
-        );
-        assert_eq!(
-            pin_job::Entity::find()
-                .count(state.store.db())
-                .await
-                .unwrap(),
-            0
-        );
-    }
-
-    fn put_tagging_request(
-        key: &str,
-        pairs: &[(&str, &str)],
-    ) -> S3Request<s3s::dto::PutObjectTaggingInput> {
-        S3Request {
-            input: s3s::dto::PutObjectTaggingInput {
-                bucket: "bucket".to_owned(),
-                checksum_algorithm: None,
-                content_md5: None,
-                expected_bucket_owner: None,
-                key: key.to_owned(),
-                request_payer: None,
-                tagging: s3s::dto::Tagging {
-                    tag_set: pairs
-                        .iter()
-                        .map(|(key, value)| s3s::dto::Tag {
-                            key: Some((*key).to_owned()),
-                            value: Some((*value).to_owned()),
-                        })
-                        .collect(),
-                },
-                version_id: None,
-            },
-            method: Method::PUT,
-            uri: format!("/bucket/{key}?tagging").parse().unwrap(),
-            headers: HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: Some(s3s::auth::Credentials {
-                access_key: "test".to_owned(),
-                secret_key: s3s::auth::SecretKey::from("test"),
-            }),
-            region: Some("us-east-1".parse().unwrap()),
-            service: Some("s3".to_owned()),
-            trailing_headers: None,
+                .unwrap();
+            assert!(row.is_none(), "unexpected rows in {table}");
         }
-    }
-
-    async fn published_pinning_zip(provider_mode: &str) -> (Arc<AppState>, MockServer) {
-        let archive_body = zip(&[
-            ZipEntryFixture {
-                name: b"a.txt",
-                data: HELLO,
-            },
-            ZipEntryFixture {
-                name: b"b.txt",
-                data: HELLO,
-            },
-        ]);
-        let (route, state, kubo) = pinning_route_with_mock_kubo(
-            vec![
-                "{\"Hash\":\"QmArchive\",\"Size\":\"13\"}\n",
-                "{\"Hash\":\"QmEntryA\",\"Size\":\"5\"}\n",
-                "{\"Hash\":\"QmEntryB\",\"Size\":\"5\"}\n",
-            ],
-            archive_body,
-            "always",
-            provider_mode,
-        )
-        .await;
-        crate::store::bucket::create(state.store.db(), "bucket", None)
-            .await
-            .unwrap();
-        route
-            .call(decompressed_tagging_request(
-                Method::PUT,
-                "/bucket/archive.zip?decompress-zip=prefix/",
-                Body::from("archive bytes".to_owned()),
-            ))
-            .await
-            .unwrap();
-        (state, kubo)
     }
 
     fn signed_route_request(method: Method, uri: &str, body: Body) -> S3Request<Body> {
@@ -2179,15 +2041,19 @@ mod tests {
     }
 
     async fn pinning_route_with_seeded_plain_multipart(
-        provider_mode: &str,
         archive_body: Vec<u8>,
-        add_bodies: Vec<&'static str>,
     ) -> (DecompressZipRoute, Arc<AppState>, MockServer) {
         let part_size = archive_body.len() as i64;
-        let (route, state, kubo) = route_with_mock_kubo_and_coordinator(
-            add_bodies,
+        let (route, state, kubo) = route_with_mock_kubo_responses_and_coordinator(
+            ["QmRoot", ENTRY_CID_A, ENTRY_CID_B]
+                .into_iter()
+                .map(|cid| {
+                    ResponseTemplate::new(200)
+                        .set_body_string(format!("{{\"Hash\":\"{cid}\",\"Size\":\"5\"}}\n"))
+                })
+                .collect(),
             archive_body,
-            pinning_coordinator_with_zip_auto("always", provider_mode, Some(true)),
+            pinning_coordinator_with_zip_auto("always", "all", Some(true)),
         )
         .await;
         crate::store::bucket::create(state.store.db(), "bucket", None)
@@ -2857,109 +2723,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pinning_decompressed_preserves_archive_manual_and_output_automatic_ownership() {
-        use crate::store::entities::{object_tag, object_version, pin_lease};
-
-        for auto_pin_outputs in [false, true] {
-            let archive_body = zip(&[ZipEntryFixture {
-                name: b"file.txt",
-                data: HELLO,
-            }]);
-            let (route, state, _kubo) = route_with_mock_kubo_and_coordinator(
-                vec![
-                    "{\"Hash\":\"QmArchive\",\"Size\":\"13\"}\n",
-                    "{\"Hash\":\"QmEntry\",\"Size\":\"5\"}\n",
-                ],
-                archive_body,
-                pinning_coordinator_with_zip_auto("always", "one", Some(auto_pin_outputs)),
-            )
-            .await;
-            crate::store::bucket::create(state.store.db(), "bucket", None)
-                .await
-                .unwrap();
-
-            route
-                .call(decompressed_tagging_request(
-                    Method::PUT,
-                    "/bucket/archive.zip?decompress-zip=prefix/",
-                    Body::from("archive bytes".to_owned()),
-                ))
-                .await
-                .unwrap();
-
-            let leases = archive_leases(&state).await;
-            assert_eq!(leases.len(), 1);
-            let archive =
-                crate::store::object::get_latest(state.store.db(), "bucket", "archive.zip")
-                    .await
-                    .unwrap();
-            let version = object_version::Entity::find()
-                .filter(object_version::Column::ObjectId.eq(&archive.id))
-                .one(state.store.db())
-                .await
-                .unwrap()
-                .unwrap();
-            let decision =
-                crate::store::pinning::decision::read_for_version(state.store.db(), &version.id)
-                    .await
-                    .unwrap()
-                    .unwrap();
-            assert_eq!(decision.origin.principal_id, "test");
-            uuid::Uuid::parse_str(&decision.origin.request_id).unwrap();
-            assert_ne!(decision.origin.request_id, "preflight");
-            let manual = leases
-                .iter()
-                .find(|lease| lease.source == "manual")
-                .unwrap();
-            assert_eq!(manual.owner_object_id, archive.id);
-            assert_eq!(manual.provider_mode, "one");
-            assert_eq!((manual.expires_at - manual.created_at).num_seconds(), 3600);
-            assert_eq!(lease_target_cids(&state, &manual.id).await, vec!["QmEntry"]);
-
-            let entry =
-                crate::store::object::get_latest(state.store.db(), "bucket", "prefix/file.txt")
-                    .await
-                    .unwrap();
-            let output_leases = pin_lease::Entity::find()
-                .filter(pin_lease::Column::OwnerObjectId.eq(&entry.id))
-                .all(state.store.db())
-                .await
-                .unwrap();
-            assert_eq!(output_leases.len(), usize::from(auto_pin_outputs));
-            for automatic in &output_leases {
-                assert_eq!(automatic.source, "automatic");
-                assert_eq!(automatic.owner_object_id, entry.id);
-                assert_eq!(automatic.provider_mode, "one");
-                assert_eq!(
-                    (automatic.expires_at - automatic.created_at).num_seconds(),
-                    3600
-                );
-                assert_eq!(
-                    lease_target_cids(&state, &automatic.id).await,
-                    vec!["QmEntry"]
-                );
-            }
-            assert_eq!(
-                pin_lease::Entity::find()
-                    .count(state.store.db())
-                    .await
-                    .unwrap(),
-                1 + u64::from(auto_pin_outputs),
-            );
-            assert_eq!(
-                object_tag::Entity::find()
-                    .filter(object_tag::Column::ObjectId.eq(entry.id))
-                    .count(state.store.db())
-                    .await
-                    .unwrap(),
-                0
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn pinning_partial_extraction_targets_only_successfully_staged_entry() {
-        use crate::store::entities::pin_lease;
+    async fn partial_extraction_creates_pin_references_only_for_published_files() {
+        use crate::store::entities::object_tag;
 
         for auto_pin_outputs in [false, true] {
             let archive_body = zip(&[
@@ -2977,8 +2742,9 @@ mod tests {
                     ResponseTemplate::new(200)
                         .set_body_string("{\"Hash\":\"QmArchive\",\"Size\":\"13\"}\n"),
                     ResponseTemplate::new(500).set_body_string("forced entry add failure"),
-                    ResponseTemplate::new(200)
-                        .set_body_string("{\"Hash\":\"QmPublished\",\"Size\":\"5\"}\n"),
+                    ResponseTemplate::new(200).set_body_string(format!(
+                        "{{\"Hash\":\"{ENTRY_CID_A}\",\"Size\":\"5\"}}\n"
+                    )),
                 ],
                 archive_body,
                 pinning_coordinator_with_zip_auto("always", "one", Some(auto_pin_outputs)),
@@ -3014,537 +2780,39 @@ mod tests {
             )
             .await
             .unwrap();
-            assert_eq!(published.cid, "QmPublished");
-            let leases = archive_leases(&state).await;
-            assert_eq!(leases.len(), 1);
-            let manual = leases
-                .iter()
-                .find(|lease| lease.source == "manual")
-                .unwrap();
-            assert_eq!(
-                lease_target_cids(&state, &manual.id).await,
-                vec!["QmPublished"]
-            );
-            let output_leases = pin_lease::Entity::find()
-                .filter(pin_lease::Column::OwnerObjectId.eq(&published.id))
-                .all(state.store.db())
-                .await
-                .unwrap();
-            assert_eq!(output_leases.len(), usize::from(auto_pin_outputs));
-            for automatic in &output_leases {
-                assert_eq!(automatic.source, "automatic");
-                assert_eq!(automatic.owner_object_id, published.id);
-                assert_eq!(
-                    lease_target_cids(&state, &automatic.id).await,
-                    vec!["QmPublished"]
-                );
-            }
-            assert_eq!(
-                pin_lease::Entity::find()
-                    .count(state.store.db())
-                    .await
-                    .unwrap(),
-                1 + u64::from(auto_pin_outputs)
-            );
-            assert_no_pin_removes(&kubo, &["QmArchive", "QmPublished"]).await;
-        }
-    }
-
-    #[tokio::test]
-    async fn pinning_decompressed_provider_all_mode_targets_each_entry_on_each_provider() {
-        use crate::store::entities::pin_lease;
-
-        for auto_pin_outputs in [false, true] {
-            let archive_body = zip(&[ZipEntryFixture {
-                name: b"file.txt",
-                data: HELLO,
-            }]);
-            let (route, state, _kubo) = route_with_mock_kubo_and_coordinator(
-                vec![
-                    "{\"Hash\":\"QmArchive\",\"Size\":\"13\"}\n",
-                    "{\"Hash\":\"QmEntry\",\"Size\":\"5\"}\n",
-                ],
-                archive_body,
-                pinning_coordinator_with_zip_auto("always", "all", Some(auto_pin_outputs)),
-            )
-            .await;
-            crate::store::bucket::create(state.store.db(), "bucket", None)
-                .await
-                .unwrap();
-
-            route
-                .call(decompressed_tagging_request(
-                    Method::PUT,
-                    "/bucket/archive.zip?decompress-zip=prefix/",
-                    Body::from("archive bytes".to_owned()),
-                ))
-                .await
-                .unwrap();
-
-            let leases = archive_leases(&state).await;
-            assert_eq!(leases.len(), 1);
-            let manual = leases
-                .iter()
-                .find(|lease| lease.source == "manual")
-                .unwrap();
-            let manual_pairs = lease_targets(&state, &manual.id)
-                .await
-                .into_iter()
-                .map(|target| (target.provider, target.cid))
-                .collect::<Vec<_>>();
-            assert_eq!(
-                manual_pairs,
-                vec![
-                    ("alpha".to_owned(), "QmEntry".to_owned()),
-                    ("beta".to_owned(), "QmEntry".to_owned()),
-                ]
-            );
-            let output =
-                crate::store::object::get_latest(state.store.db(), "bucket", "prefix/file.txt")
+            assert_eq!(published.cid, ENTRY_CID_A);
+            let archive =
+                crate::store::object::get_latest(state.store.db(), "bucket", "archive.zip")
                     .await
                     .unwrap();
-            let output_leases = pin_lease::Entity::find()
-                .filter(pin_lease::Column::OwnerObjectId.eq(&output.id))
-                .all(state.store.db())
-                .await
-                .unwrap();
-            assert_eq!(output_leases.len(), usize::from(auto_pin_outputs));
-            for automatic in &output_leases {
-                assert_eq!(automatic.source, "automatic");
-                assert_eq!(automatic.owner_object_id, output.id);
-                assert_eq!(automatic.provider_mode, "all");
-                let pairs = lease_targets(&state, &automatic.id)
-                    .await
-                    .into_iter()
-                    .map(|target| (target.provider, target.cid))
-                    .collect::<Vec<_>>();
-                assert_eq!(
-                    pairs,
-                    vec![
-                        ("alpha".to_owned(), "QmEntry".to_owned()),
-                        ("beta".to_owned(), "QmEntry".to_owned())
-                    ]
-                );
+            let mut expected = Vec::new();
+            if auto_pin_outputs {
+                expected.push((
+                    published.id.clone(),
+                    "automatic".to_owned(),
+                    "alpha".to_owned(),
+                    published.cid.clone(),
+                    5,
+                ));
             }
-            assert_eq!(
-                pin_lease::Entity::find()
-                    .count(state.store.db())
-                    .await
-                    .unwrap(),
-                1 + u64::from(auto_pin_outputs)
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn pinning_archive_renewal_touches_all_targets_entry_delete_does_not_cancel_owner_and_later_put_is_independent()
-     {
-        use crate::store::entities::pin_lease;
-
-        let (state, _) = published_pinning_zip("one").await;
-        let leases = archive_leases(&state).await;
-        let manual = leases
-            .iter()
-            .find(|lease| lease.source == "manual")
-            .unwrap()
-            .clone();
-        let original_targets = lease_targets(&state, &manual.id).await;
-        assert_eq!(
-            original_targets
-                .iter()
-                .map(|target| target.cid.as_str())
-                .collect::<Vec<_>>(),
-            vec!["QmEntryA", "QmEntryB"]
-        );
-
-        let delete_time = chrono::Utc::now();
-        assert!(
-            crate::store::pinning::publication::delete_latest_with_leases(
-                state.store.db(),
-                "bucket",
-                "prefix/a.txt",
-                delete_time,
-            )
-            .await
-            .unwrap()
-        );
-        assert_eq!(
-            pin_lease::Entity::find_by_id(&manual.id)
-                .one(state.store.db())
-                .await
-                .unwrap()
-                .unwrap()
-                .state,
-            "active"
-        );
-
-        let renew_time = delete_time + chrono::TimeDelta::minutes(1);
-        let retain_until = renew_time + chrono::TimeDelta::hours(2);
-        let retain_until_text = retain_until.to_rfc3339();
-        crate::s3::ops::tagging::put_object_tagging_at(
-            &state,
-            put_tagging_request(
-                "archive.zip",
-                &[
-                    ("team", "storage"),
-                    ("ipfs-s3:pin", "true"),
-                    ("ipfs-s3:retain-until", retain_until_text.as_str()),
-                ],
-            ),
-            renew_time,
-        )
-        .await
-        .unwrap();
-
-        let renewed = pin_lease::Entity::find_by_id(&manual.id)
-            .one(state.store.db())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(renewed.generation, manual.generation + 1);
-        assert_eq!(renewed.expires_at, retain_until);
-        let renewed_targets = lease_targets(&state, &manual.id).await;
-        assert_eq!(
-            renewed_targets
-                .iter()
-                .map(|target| target.id.as_str())
-                .collect::<Vec<_>>(),
-            original_targets
-                .iter()
-                .map(|target| target.id.as_str())
-                .collect::<Vec<_>>()
-        );
-        assert!(
-            renewed_targets
-                .iter()
-                .all(|target| target.last_touched_at == renew_time)
-        );
-
-        let entry_tags = vec![
-            ObjectTag::new("ipfs-s3:pin", "true"),
-            ObjectTag::new("ipfs-s3:duration", "1h"),
-            ObjectTag::new("ipfs-s3:content", "object"),
-        ];
-        let entry_policy = state
-            .pinning
-            .policy()
-            .evaluate_publication(PublicationContext {
-                bucket: "bucket",
-                key: "prefix/a.txt",
-                tags: &entry_tags,
-                is_decompress_zip: false,
-            })
-            .unwrap();
-        let entry_object = PublicationObject::from_put(
-            "independent-entry".to_owned(),
-            "bucket",
-            "prefix/a.txt",
-            "QmIndependent".to_owned(),
-            8,
-            None,
-            None,
-            false,
-            None,
-            None,
-            chrono::Utc::now(),
-        );
-        crate::store::pinning::publication::publish_object(
-            state.store.db(),
-            PublicationRequest {
-                object: entry_object,
-                tags: entry_tags,
-                policy: entry_policy,
-                object_target: PinTargetSpec {
-                    cid: "QmIndependent".to_owned(),
-                    logical_size: 8,
-                },
-            },
-            state.pinning.provider_limits(),
-        )
-        .await
-        .unwrap();
-
-        let independent_leases = pin_lease::Entity::find()
-            .filter(pin_lease::Column::OwnerObjectId.eq("independent-entry"))
-            .all(state.store.db())
-            .await
-            .unwrap();
-        assert_eq!(independent_leases.len(), 2);
-        assert!(independent_leases.iter().all(|lease| {
-            lease.id != manual.id && lease.owner_object_id == "independent-entry"
-        }));
-        assert_eq!(
-            pin_lease::Entity::find_by_id(&manual.id)
-                .one(state.store.db())
-                .await
-                .unwrap()
-                .unwrap()
-                .state,
-            "active"
-        );
-        assert_eq!(
-            lease_target_cids(&state, &manual.id).await,
-            vec!["QmEntryA", "QmEntryB"]
-        );
-    }
-
-    #[tokio::test]
-    async fn pinning_archive_cancel_delete_and_overwrite_end_all_owned_entry_targets() {
-        use crate::store::entities::pin_lease;
-
-        let (cancel_state, _) = published_pinning_zip("one").await;
-        let cancel_manual = archive_leases(&cancel_state)
-            .await
-            .into_iter()
-            .find(|lease| lease.source == "manual")
-            .unwrap();
-        crate::s3::ops::tagging::put_object_tagging_at(
-            &cancel_state,
-            put_tagging_request(
-                "archive.zip",
-                &[("team", "storage"), ("ipfs-s3:pin", "false")],
-            ),
-            chrono::Utc::now(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            pin_lease::Entity::find_by_id(&cancel_manual.id)
-                .one(cancel_state.store.db())
-                .await
-                .unwrap()
-                .unwrap()
-                .state,
-            "cancelled"
-        );
-        assert!(
-            lease_targets(&cancel_state, &cancel_manual.id)
-                .await
-                .iter()
-                .all(|target| target.state == "released")
-        );
-
-        let (delete_state, _) = published_pinning_zip("one").await;
-        let delete_archive =
-            crate::store::object::get_latest(delete_state.store.db(), "bucket", "archive.zip")
-                .await
-                .unwrap();
-        let delete_leases = archive_leases(&delete_state).await;
-        assert!(
-            crate::store::pinning::publication::delete_latest_with_leases(
-                delete_state.store.db(),
-                "bucket",
-                "archive.zip",
-                chrono::Utc::now(),
-            )
-            .await
-            .unwrap()
-        );
-        assert!(
-            crate::store::object::get_latest(delete_state.store.db(), "bucket", "archive.zip",)
-                .await
-                .is_err()
-        );
-        for lease in delete_leases {
-            assert_eq!(
-                pin_lease::Entity::find_by_id(&lease.id)
-                    .one(delete_state.store.db())
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .state,
-                "cancelled"
-            );
-            assert!(
-                lease_targets(&delete_state, &lease.id)
-                    .await
-                    .iter()
-                    .all(|target| target.state == "released")
-            );
-        }
-        assert!(
-            !crate::store::entities::object::Entity::find_by_id(delete_archive.id)
-                .one(delete_state.store.db())
-                .await
-                .unwrap()
-                .unwrap()
-                .is_latest
-        );
-
-        let (overwrite_state, _) = published_pinning_zip("one").await;
-        let old_leases = archive_leases(&overwrite_state).await;
-        let replacement_policy = overwrite_state
-            .pinning
-            .policy()
-            .evaluate_publication(PublicationContext {
-                bucket: "bucket",
-                key: "archive.zip",
-                tags: &[],
-                is_decompress_zip: false,
-            })
-            .unwrap();
-        let replacement = PublicationObject::from_put(
-            "replacement-archive".to_owned(),
-            "bucket",
-            "archive.zip",
-            "QmReplacement".to_owned(),
-            9,
-            Some("application/octet-stream".to_owned()),
-            None,
-            false,
-            None,
-            None,
-            chrono::Utc::now(),
-        );
-        crate::store::pinning::publication::publish_object(
-            overwrite_state.store.db(),
-            PublicationRequest {
-                object: replacement,
-                tags: Vec::new(),
-                policy: replacement_policy,
-                object_target: PinTargetSpec {
-                    cid: "QmReplacement".to_owned(),
-                    logical_size: 9,
-                },
-            },
-            overwrite_state.pinning.provider_limits(),
-        )
-        .await
-        .unwrap();
-        for lease in old_leases {
-            assert_eq!(
-                pin_lease::Entity::find_by_id(&lease.id)
-                    .one(overwrite_state.store.db())
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .state,
-                "cancelled"
-            );
-            assert!(
-                lease_targets(&overwrite_state, &lease.id)
-                    .await
-                    .iter()
-                    .all(|target| target.state == "released")
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn pinning_confirmed_release_expired_renew_fails_without_reconstructing_targets() {
-        use crate::store::entities::{pin_lease, pin_lease_target, remote_pin};
-
-        let (state, kubo) = published_pinning_zip("one").await;
-        let manual = archive_leases(&state)
-            .await
-            .into_iter()
-            .find(|lease| lease.source == "manual")
-            .unwrap();
-        let original_targets = lease_targets(&state, &manual.id).await;
-        let expire_time = manual.expires_at + chrono::TimeDelta::seconds(1);
-        crate::store::pinning::leases::expire_due_leases(state.store.db(), expire_time)
-            .await
-            .unwrap();
-
-        for target in &original_targets {
-            let remote =
-                remote_pin::Entity::find_by_id((target.provider.clone(), target.cid.clone()))
-                    .one(state.store.db())
-                    .await
-                    .unwrap()
-                    .unwrap();
-            let outcome = crate::store::pinning::quota::confirmed_release(
-                state.store.db(),
-                &target.provider,
-                &target.cid,
-                remote.epoch,
-                expire_time + chrono::TimeDelta::seconds(1),
-            )
-            .await
-            .unwrap();
-            assert!(matches!(
-                outcome,
-                crate::store::pinning::quota::ConfirmedReleaseOutcome::Released
-                    | crate::store::pinning::quota::ConfirmedReleaseOutcome::AlreadyAbsent
+            expected.push((
+                archive.id,
+                "manual".to_owned(),
+                "alpha".to_owned(),
+                published.cid,
+                5,
             ));
+            assert_eq!(pin_references(&state).await, expected);
+            assert_eq!(
+                object_tag::Entity::find()
+                    .filter(object_tag::Column::ObjectId.eq(published.id))
+                    .count(state.store.db())
+                    .await
+                    .unwrap(),
+                0
+            );
+            assert_no_pin_removes(&kubo, &["QmArchive", ENTRY_CID_A]).await;
         }
-
-        let expired = pin_lease::Entity::find_by_id(&manual.id)
-            .one(state.store.db())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(expired.state, "expired");
-        let preserved_targets = lease_targets(&state, &manual.id).await;
-        assert_eq!(
-            preserved_targets
-                .iter()
-                .map(|target| target.id.as_str())
-                .collect::<Vec<_>>(),
-            original_targets
-                .iter()
-                .map(|target| target.id.as_str())
-                .collect::<Vec<_>>()
-        );
-        assert!(
-            preserved_targets
-                .iter()
-                .all(|target| target.state == "released")
-        );
-        let target_count = pin_lease_target::Entity::find()
-            .count(state.store.db())
-            .await
-            .unwrap();
-        let kubo_request_count = kubo.received_requests().await.unwrap().len();
-
-        let renew_time = expire_time + chrono::TimeDelta::minutes(1);
-        let retain_until_text = (renew_time + chrono::TimeDelta::hours(1)).to_rfc3339();
-        let error = crate::s3::ops::tagging::put_object_tagging_at(
-            &state,
-            put_tagging_request(
-                "archive.zip",
-                &[
-                    ("team", "storage"),
-                    ("ipfs-s3:pin", "true"),
-                    ("ipfs-s3:retain-until", retain_until_text.as_str()),
-                ],
-            ),
-            renew_time,
-        )
-        .await
-        .unwrap_err();
-
-        assert_eq!(error.code().as_str(), "InvalidArgument");
-        let still_expired = pin_lease::Entity::find_by_id(&manual.id)
-            .one(state.store.db())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(still_expired.state, "expired");
-        assert_eq!(still_expired.generation, expired.generation);
-        assert_eq!(
-            lease_targets(&state, &manual.id)
-                .await
-                .into_iter()
-                .map(|target| target.id)
-                .collect::<Vec<_>>(),
-            preserved_targets
-                .into_iter()
-                .map(|target| target.id)
-                .collect::<Vec<_>>()
-        );
-        assert_eq!(
-            pin_lease_target::Entity::find()
-                .count(state.store.db())
-                .await
-                .unwrap(),
-            target_count
-        );
-        assert_eq!(
-            kubo.received_requests().await.unwrap().len(),
-            kubo_request_count,
-            "tagging renewal must not reopen or re-extract the ZIP"
-        );
     }
 
     #[tokio::test]
@@ -4085,10 +3353,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pinning_multipart_zip_success_commits_publication_and_deletes_upload_atomically() {
-        use crate::store::entities::{
-            object, object_tag, pin_job, pin_lease, pin_provider_usage, remote_pin,
-        };
+    async fn multipart_zip_commits_file_pin_references_and_deletes_upload_atomically() {
+        use crate::store::entities::{object, object_tag};
 
         let archive_body = zip(&[
             ZipEntryFixture {
@@ -4101,32 +3367,24 @@ mod tests {
             },
         ]);
         let archive_size = archive_body.len() as i64;
-        let (route, state, _kubo) = pinning_route_with_seeded_plain_multipart(
-            "all",
-            archive_body,
-            vec![
-                "{\"Hash\":\"QmRoot\",\"Size\":\"5\"}\n",
-                "{\"Hash\":\"QmEntryA\",\"Size\":\"5\"}\n",
-                "{\"Hash\":\"QmEntryB\",\"Size\":\"5\"}\n",
-            ],
+        let (route, state, kubo) = pinning_route_with_seeded_plain_multipart(archive_body).await;
+        let complete = || {
+            signed_route_request(
+            Method::POST,
+            "/bucket/archive.zip?uploadId=upload-1",
+            Body::from(
+                "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"QmPart\"</ETag></Part></CompleteMultipartUpload>"
+                    .to_owned(),
+            ),
         )
-        .await;
+        };
 
-        let response = route
-            .call(signed_route_request(
-                Method::POST,
-                "/bucket/archive.zip?uploadId=upload-1",
-                Body::from(
-                    "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"QmPart\"</ETag></Part></CompleteMultipartUpload>"
-                        .to_owned(),
-                ),
-            ))
-            .await
-            .unwrap();
+        let response = route.call(complete()).await.unwrap();
+        let first_headers = response.headers.clone();
         let body = response.output.collect().await.unwrap().to_bytes();
-        let body = std::str::from_utf8(&body).unwrap();
-        assert!(body.contains("<Key>prefix/a.txt</Key>"));
-        assert!(body.contains("<Key>prefix/b.txt</Key>"));
+        let xml = std::str::from_utf8(&body).unwrap();
+        assert!(xml.contains("<Key>prefix/a.txt</Key>"));
+        assert!(xml.contains("<Key>prefix/b.txt</Key>"));
 
         assert!(
             crate::store::multipart::get_upload(state.store.db(), "upload-1")
@@ -4162,94 +3420,53 @@ mod tests {
         );
         let entries = object::Entity::find()
             .filter(object::Column::Key.is_in(["prefix/a.txt", "prefix/b.txt"]))
+            .order_by_asc(object::Column::Cid)
             .all(state.store.db())
             .await
             .unwrap();
-        let entry_ids = entries
-            .iter()
-            .map(|entry| entry.id.clone())
-            .collect::<Vec<_>>();
-        assert_eq!(entry_ids.len(), 2);
+        assert_eq!(entries.len(), 2);
         assert_eq!(
             object_tag::Entity::find()
-                .filter(object_tag::Column::ObjectId.is_in(entry_ids.clone()))
+                .filter(
+                    object_tag::Column::ObjectId
+                        .is_in(entries.iter().map(|entry| entry.id.clone()))
+                )
                 .count(state.store.db())
                 .await
                 .unwrap(),
             0
         );
-        let output_leases = pin_lease::Entity::find()
-            .filter(pin_lease::Column::OwnerObjectId.is_in(entry_ids))
-            .all(state.store.db())
-            .await
-            .unwrap();
-        assert_eq!(output_leases.len(), 2);
-        for entry in &entries {
-            let automatic = output_leases
-                .iter()
-                .find(|lease| lease.owner_object_id == entry.id)
-                .unwrap();
-            assert_eq!(automatic.source, "automatic");
-            assert_eq!(automatic.provider_mode, "all");
-            let pairs = lease_targets(&state, &automatic.id)
-                .await
-                .into_iter()
-                .map(|target| (target.provider, target.cid))
-                .collect::<Vec<_>>();
-            assert_eq!(
-                pairs,
-                vec![
-                    ("alpha".to_owned(), entry.cid.clone()),
-                    ("beta".to_owned(), entry.cid.clone())
-                ]
-            );
+        let mut expected = Vec::new();
+        for source in ["automatic", "manual"] {
+            for provider in ["alpha", "beta"] {
+                for entry in &entries {
+                    let owner = if source == "manual" {
+                        &archive.id
+                    } else {
+                        &entry.id
+                    };
+                    expected.push((
+                        owner.clone(),
+                        source.to_owned(),
+                        provider.to_owned(),
+                        entry.cid.clone(),
+                        5,
+                    ));
+                }
+            }
         }
+        assert_eq!(pin_references(&state).await, expected);
 
-        let leases = archive_leases(&state).await;
-        assert_eq!(leases.len(), 1);
-        let manual = leases
-            .iter()
-            .find(|lease| lease.source == "manual")
-            .unwrap();
-        assert_eq!(manual.owner_object_id, archive.id);
-        assert_eq!(
-            lease_target_cids(&state, &manual.id).await,
-            vec!["QmEntryA", "QmEntryA", "QmEntryB", "QmEntryB"]
-        );
-        assert_eq!(
-            remote_pin::Entity::find()
-                .count(state.store.db())
-                .await
-                .unwrap(),
-            4
-        );
-        assert_eq!(
-            pin_job::Entity::find()
-                .count(state.store.db())
-                .await
-                .unwrap(),
-            4
-        );
-        for provider in ["alpha", "beta"] {
-            let usage = pin_provider_usage::Entity::find_by_id(provider)
-                .one(state.store.db())
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(usage.reserved_pins, 2);
-            assert_eq!(usage.reserved_bytes, 10);
-        }
-        assert_eq!(
-            pin_lease::Entity::find()
-                .count(state.store.db())
-                .await
-                .unwrap(),
-            3
-        );
+        let kubo_requests = kubo.received_requests().await.unwrap().len();
+        let replay = route.call(complete()).await.unwrap();
+        assert_eq!(replay.headers, first_headers);
+        assert_eq!(replay.output.collect().await.unwrap().to_bytes(), body);
+        assert_eq!(kubo.received_requests().await.unwrap().len(), kubo_requests);
+        assert_eq!(pin_references(&state).await, expected);
     }
 
     #[tokio::test]
-    async fn pinning_multipart_zip_outbox_failure_rolls_back_and_keeps_upload_parts_and_local_pins()
+    async fn multipart_zip_pin_reference_failure_rolls_back_and_keeps_upload_parts_and_local_pins()
     {
         let archive_body = zip(&[
             ZipEntryFixture {
@@ -4261,22 +3478,13 @@ mod tests {
                 data: HELLO,
             },
         ]);
-        let (route, state, kubo) = pinning_route_with_seeded_plain_multipart(
-            "all",
-            archive_body,
-            vec![
-                "{\"Hash\":\"QmRoot\",\"Size\":\"5\"}\n",
-                "{\"Hash\":\"QmEntryA\",\"Size\":\"5\"}\n",
-                "{\"Hash\":\"QmEntryB\",\"Size\":\"5\"}\n",
-            ],
-        )
-        .await;
+        let (route, state, kubo) = pinning_route_with_seeded_plain_multipart(archive_body).await;
         state
             .store
             .db()
             .execute_unprepared(
-                "CREATE TRIGGER fail_zip_outbox BEFORE INSERT ON pin_jobs \
-                 BEGIN SELECT RAISE(FAIL, 'forced zip outbox failure'); END",
+                "CREATE TRIGGER fail_zip_reference BEFORE INSERT ON pin_refs \
+                 BEGIN SELECT RAISE(FAIL, 'forced ZIP pin reference failure'); END",
             )
             .await
             .unwrap();
@@ -4307,7 +3515,7 @@ mod tests {
             1
         );
         assert_no_zip_publication_rows(&state).await;
-        assert_no_pin_removes(&kubo, &["QmPart", "QmRoot", "QmEntryA", "QmEntryB"]).await;
+        assert_no_pin_removes(&kubo, &["QmPart", "QmRoot", ENTRY_CID_A, ENTRY_CID_B]).await;
     }
 
     #[tokio::test]

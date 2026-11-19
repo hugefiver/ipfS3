@@ -1,16 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use http::{HeaderMap, StatusCode};
-use ipfs_s3_gateway::{
-    pinning::provider::ObservedResourceStatus,
-    store::{
-        self,
-        entities::{
-            object, object_version, pin_lease, pin_lease_target, remote_pin, zip_batch,
-            zip_manifest_entry, zip_root_reference,
-        },
-        pinning::{ledger, quota},
-    },
+use ipfs_s3_gateway::store::{
+    self,
+    entities::{object, object_version, zip_batch, zip_manifest_entry, zip_root_reference},
 };
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
@@ -181,132 +174,66 @@ pub async fn publication(
         assert!(headers.get("x-ipfs-s3-zip-root-cid").is_none());
         assert!(!h.source.calls().await.contains_key("/api/v0/dag/put"));
     }
-    let leases = pin_lease::Entity::find().all(db).await.unwrap();
-    let targets = pin_lease_target::Entity::find().all(db).await.unwrap();
-    assert_eq!(leases.len(), 1 + if auto { ENTRIES.len() } else { 0 });
-    let manual: Vec<_> = leases
-        .iter()
-        .filter(|lease| lease.source == "manual")
-        .collect();
-    assert_eq!(manual.len(), 1);
-    let manual = manual[0];
-    assert_eq!(manual.owner_object_id, archive.id);
-    assert_eq!(manual.content_mode, "decompressed");
-    assert_eq!(
-        (manual.expires_at - manual.created_at).num_seconds(),
-        86400,
-        "Pixivbot 1d must not be clamped"
-    );
-    let automatic: Vec<_> = leases
-        .iter()
-        .filter(|lease| lease.source == "automatic")
-        .collect();
+    let refs = crate::pin_rows::refs(db).await;
+    let manual: Vec<_> = refs.iter().filter(|r| r.source == "manual").collect();
+    assert_eq!(manual.len(), ENTRIES.len());
+    for reference in manual {
+        assert_eq!(reference.owner_object_id, archive.id);
+        assert_eq!(reference.provider, h.provider);
+        assert_eq!(reference.content_mode, "decompressed");
+        assert_eq!(
+            reference.expires_at - archive.created_at.timestamp_micros(),
+            86_400_000_000
+        );
+        assert!(
+            ENTRIES
+                .iter()
+                .any(|(_, bytes)| content_cid(0x55, bytes) == reference.cid)
+        );
+    }
+    let automatic: Vec<_> = refs.iter().filter(|r| r.source == "automatic").collect();
     assert_eq!(
         automatic
             .iter()
-            .map(|lease| lease.owner_object_id.clone())
+            .map(|r| r.owner_object_id.clone())
             .collect::<BTreeSet<_>>(),
         if auto { owners } else { BTreeSet::new() }
     );
-    for lease in &leases {
-        assert_eq!(lease.state, "active");
-        let bound: Vec<_> = targets
-            .iter()
-            .filter(|target| target.lease_id == lease.id)
-            .collect();
-        assert_eq!(
-            bound.len(),
-            if lease.source == "manual" {
-                ENTRIES.len()
-            } else {
-                1
-            }
-        );
-        for target in bound {
-            let (_, bytes) = ENTRIES
-                .iter()
-                .find(|(_, bytes)| content_cid(0x55, bytes) == target.cid)
-                .unwrap();
-            assert_eq!(target.logical_size, bytes.len() as i64);
-            assert_eq!(target.provider, h.provider);
-            if lease.source == "automatic" {
-                assert_eq!(lease.content_mode, "full");
-                let output = object::Entity::find_by_id(&lease.owner_object_id)
-                    .one(db)
-                    .await
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(target.cid, output.cid);
-            }
-        }
+    for reference in automatic {
+        assert_eq!(reference.content_mode, "object");
+        let output = object::Entity::find_by_id(&reference.owner_object_id)
+            .one(db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reference.cid, output.cid);
     }
-    assert_eq!(targets.len(), ENTRIES.len() * if auto { 2 } else { 1 });
 }
 
 pub async fn worker_evidence(h: &Harness, auto: bool) {
     let db = h.state.store.db();
-    let targets = pin_lease_target::Entity::find().all(db).await.unwrap();
-    assert_eq!(targets.len(), ENTRIES.len() * if auto { 2 } else { 1 });
-    assert!(targets.iter().all(|target| target.state == "pinned"));
-    let remotes = remote_pin::Entity::find().all(db).await.unwrap();
-    let observations = ledger::submission::observations(db, &h.provider)
-        .await
-        .unwrap();
-    assert_eq!(remotes.len(), ENTRIES.len());
-    assert_eq!(observations.len(), ENTRIES.len());
+    assert_eq!(
+        crate::pin_rows::refs(db).await.len(),
+        ENTRIES.len() * if auto { 2 } else { 1 }
+    );
+    let resources = crate::pin_rows::resources(db).await;
+    assert_eq!(resources.len(), ENTRIES.len());
     for (_, bytes) in ENTRIES {
         let cid = content_cid(0x55, bytes);
-        assert_eq!(h.target.stored(&cid), bytes);
-        let remote = remotes.iter().find(|row| row.cid == cid).unwrap();
-        assert_eq!(remote.status, "pinned");
-        assert_eq!(remote.cid_size, bytes.len() as i64);
-        let observation = observations
+        let resource = resources
             .iter()
-            .find(|row| row.expected_cid == cid)
+            .find(|r| r.cid == cid && r.provider == h.provider)
             .unwrap();
-        assert_eq!(
-            (
-                observation.effect.as_str(),
-                observation.outcome.as_str(),
-                observation.submit_call
-            ),
-            ("observed", "matched", 1)
-        );
-        assert!(!observation.needs_attention);
-        assert!(observation.observed_at.is_some());
-        let resources: Vec<ledger::submission::ResourceEvidence> =
-            serde_json::from_str(&observation.resources).unwrap();
-        assert_eq!(resources.len(), 1);
-        assert_eq!(resources[0].resource.cid, cid);
-        assert_eq!(
-            resources[0].resource.status,
-            ObservedResourceStatus::RecursiveVerified
-        );
-        assert_eq!(
-            remote.request_id.as_deref(),
-            Some(resources[0].resource.request_id.as_str())
-        );
-        let durable = ledger::get(db, &h.provider, &cid).await.unwrap().unwrap();
-        assert_eq!(durable.effect, "confirmed");
-        assert!(durable.remote_pinned_at.is_some());
+        assert_eq!(resource.status, "accepted");
+        assert_eq!(resource.logical_size, bytes.len() as i64);
+        assert!(resource.handle.is_some() && resource.action.is_none());
+        assert_eq!(h.target.stored(&cid), bytes);
     }
-    let usage = quota::read_usage(db, &h.provider).await.unwrap().unwrap();
-    assert_eq!(
-        (usage.reserved_pins, usage.reserved_bytes),
-        (2, ENTRIES.iter().map(|(_, bytes)| bytes.len() as i64).sum())
-    );
     assert_eq!(
         h.target.calls().await,
-        BTreeMap::from([
-            ("/api/v0/add".into(), 2),
-            ("/api/v0/pin/add".into(), 2),
-            ("/api/v0/pin/ls".into(), 4),
-            ("/api/v0/files/stat".into(), 2),
-            ("/api/v0/id".into(), 4),
-        ])
+        BTreeMap::from([("/api/v0/add".into(), ENTRIES.len())])
     );
 }
-
 pub async fn wire_shape(h: &Harness, mpu: bool) {
     let observed = h.observed.lock().await;
     for request in observed.iter() {

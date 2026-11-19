@@ -47,12 +47,8 @@ async fn assert_zero_mpu(empty: bool) {
         };
         assert_eq!(*n, expected, "{table}: {before:?}");
     }
-    assert!(
-        before
-            .quota
-            .iter()
-            .all(|(_, bytes, pins)| *bytes == 0 && *pins == 0)
-    );
+    assert!(before.refs.is_empty());
+    assert!(before.resources.is_empty());
     assert_eq!(count(&h, "multipart_uploads").await, 0);
     let get = status(&h, &id, KEY).await;
     eprintln!(
@@ -74,15 +70,7 @@ async fn assert_zero_mpu(empty: bool) {
         StatusCode::NOT_FOUND
     );
     assert_eq!(complete(&h, &id, &etag).await, first);
-    let repeated_status = status(&h, &id, KEY).await;
-    assert_eq!(repeated_status.status, get.status);
-    assert_eq!(repeated_status.body, get.body);
-    // Status GET has a transport Date; Complete's saved receipt above does not.
-    let mut original_headers = get.headers;
-    let mut repeated_headers = repeated_status.headers;
-    original_headers.remove(http::header::DATE);
-    repeated_headers.remove(http::header::DATE);
-    assert_eq!(repeated_headers, original_headers);
+    assert_eq!(status(&h, &id, KEY).await, get);
     assert_eq!(Effects::read(&h).await, before);
 }
 
@@ -277,7 +265,8 @@ async fn missing_or_corrupt_bound_artifact_is_diagnostic_not_a_new_upload() {
             before.rpc_count("/api/v0/cat") + 1
         );
         assert_eq!(after.rows, before.rows);
-        assert_eq!(after.quota, before.quota);
+        assert_eq!(after.refs, before.refs);
+        assert_eq!(after.resources, before.resources);
     }
 }
 
@@ -328,7 +317,8 @@ async fn admitted_recovery_uses_only_frozen_manifest_and_whole_original_guard_gr
         let response = put(&h, &saved.token, archive).await;
         let after = Effects::read(&h).await;
         assert_eq!(after.rpc, before.rpc);
-        assert_eq!(after.quota, before.quota);
+        assert_eq!(after.refs, before.refs);
+        assert_eq!(after.resources, before.resources);
         let final_row = execution::read(h.state.store.db(), &saved.id)
             .await
             .unwrap()
@@ -457,9 +447,6 @@ async fn current_automatic_deny_resumes_bound_direct_locally_and_preserves_raw_i
         .await;
     assert_eq!(response.status, StatusCode::OK, "{response:?}");
     assert_eq!(count(&fixture.h, "objects").await, 1);
-    for table in ["pin_leases", "pin_lease_targets", "remote_pins", "pin_jobs"] {
-        assert_eq!(count(&fixture.h, table).await, 0, "{table}");
-    }
     let retained = execution::read(fixture.h.state.store.db(), &saved.id)
         .await
         .unwrap()
@@ -469,12 +456,8 @@ async fn current_automatic_deny_resumes_bound_direct_locally_and_preserves_raw_i
     assert_eq!(retained.request_fingerprint, saved.request_fingerprint);
     assert_eq!(retained.input_sha256, saved.input_sha256);
     let after = Effects::read(&fixture.h).await;
-    assert!(
-        after
-            .quota
-            .iter()
-            .all(|(_, bytes, pins)| *bytes == 0 && *pins == 0)
-    );
+    assert!(after.refs.is_empty());
+    assert!(after.resources.is_empty());
     let changed = fixture
         .direct(
             &saved.token,
@@ -527,9 +510,6 @@ async fn current_automatic_deny_resumes_mpu_locally_without_rewriting_capture() 
     assert!(retained.active_upload_id.is_none());
     assert_eq!(count(&fixture.h, "objects").await, 2);
     assert_eq!(count(&fixture.h, "multipart_uploads").await, 0);
-    for table in ["pin_leases", "pin_lease_targets", "remote_pins", "pin_jobs"] {
-        assert_eq!(count(&fixture.h, table).await, 0, "{table}");
-    }
     let terminal = execution::read(fixture.h.state.store.db(), &id)
         .await
         .unwrap()
@@ -537,12 +517,8 @@ async fn current_automatic_deny_resumes_mpu_locally_without_rewriting_capture() 
     assert_eq!(terminal.state, "completed");
     assert_eq!(terminal.captured_options, saved.captured_options);
     let after = Effects::read(&fixture.h).await;
-    assert!(
-        after
-            .quota
-            .iter()
-            .all(|(_, bytes, pins)| *bytes == 0 && *pins == 0)
-    );
+    assert!(after.refs.is_empty());
+    assert!(after.resources.is_empty());
     assert_eq!(complete(&fixture.h, &id, &etag).await, response);
     assert_eq!(Effects::read(&fixture.h).await, after);
 }
@@ -578,15 +554,17 @@ async fn current_unrelated_deny_or_allow_changes_do_not_freeze_original_capture(
             saved.captured_options
         );
         if effect == ZipRuleEffect::Allow {
-            use sea_orm::EntityTrait as _;
-            let leases = ipfs_s3_gateway::store::entities::pin_lease::Entity::find()
-                .all(fixture.h.state.store.db())
+            let db = fixture.h.state.store.db();
+            let output = ipfs_s3_gateway::store::object::get_latest(db, bucket, "out/file.txt")
                 .await
                 .unwrap();
-            assert_eq!(leases.len(), 1);
+            let effects = Effects::read(&fixture.h).await;
+            assert_eq!(effects.refs.len(), 1);
+            assert_eq!(effects.refs[0].cid, OUTPUT);
+            assert_eq!(effects.refs[0].owner_object_id, output.id);
             assert_eq!(
-                (leases[0].expires_at - leases[0].created_at).num_seconds(),
-                7200
+                effects.refs[0].expires_at,
+                (output.created_at + chrono::TimeDelta::hours(2)).timestamp_micros()
             );
         }
     }
@@ -610,8 +588,8 @@ async fn original_deny_stays_local_only_not_a_new_safety_revocation() {
         .await;
     assert_eq!(response.status, StatusCode::OK, "{response:?}");
     assert_eq!(count(&fixture.h, "objects").await, 1);
-    assert_eq!(count(&fixture.h, "pin_leases").await, 0);
-    assert_eq!(count(&fixture.h, "pin_jobs").await, 0);
+    assert_eq!(count(&fixture.h, "pin_refs").await, 0);
+    assert_eq!(count(&fixture.h, "pin_resources").await, 0);
     assert_eq!(
         execution::read(fixture.h.state.store.db(), &saved.id)
             .await
@@ -811,15 +789,9 @@ async fn assert_p2_explicit_source_is_local_only(
         after.rpc_count("/api/v0/cat"),
         before.rpc_count("/api/v0/cat") + 1
     );
-    assert_eq!(after.quota, before.quota);
-    for table in [
-        "pin_leases",
-        "pin_lease_targets",
-        "pin_jobs",
-        "remote_pins",
-        "zip_v2_manifest",
-        "zip_v2_targets",
-    ] {
+    assert_eq!(after.refs, before.refs);
+    assert_eq!(after.resources, before.resources);
+    for table in ["zip_v2_manifest", "zip_v2_targets"] {
         assert_eq!(count(&fixture.h, table).await, 0, "{table}: {after:?}");
     }
     assert_eq!(count(&fixture.h, "objects").await, 1);
@@ -1029,29 +1001,32 @@ async fn assert_p2_admitted_exact_outputs(mpu: bool, intersects: bool) {
         count(&fixture.h, "object_versions").await,
         if mpu { 2 } else { 1 }
     );
-    let remote_count = i64::from(mpu) + i64::from(!intersects);
-    for table in ["pin_leases", "pin_lease_targets", "pin_jobs", "remote_pins"] {
-        assert_eq!(count(&fixture.h, table).await, remote_count, "{table}");
+    let db = fixture.h.state.store.db();
+    let output =
+        ipfs_s3_gateway::store::object::get_latest(db, &fixture.h.bucket, "out/public/file.txt")
+            .await
+            .unwrap();
+    assert_eq!(output.cid, OUTPUT);
+    let mut expected = Vec::new();
+    if mpu {
+        let source = ipfs_s3_gateway::store::object::get_latest(db, &fixture.h.bucket, KEY)
+            .await
+            .unwrap();
+        assert_eq!(source.cid, ARCHIVE);
+        expected.push((ARCHIVE, source.id, fixture.archive.len() as i64));
     }
-    assert_eq!(
-        after.quota.iter().map(|(_, bytes, _)| *bytes).sum::<i64>(),
-        (if intersects { 0 } else { 18 }) + if mpu { fixture.archive.len() as i64 } else { 0 }
-    );
-    assert_eq!(
-        after.quota.iter().map(|(_, _, pins)| *pins).sum::<i64>(),
-        remote_count
-    );
-    assert_eq!(
-        ipfs_s3_gateway::store::object::get_latest(
-            fixture.h.state.store.db(),
-            &fixture.h.bucket,
-            "out/public/file.txt"
-        )
-        .await
-        .unwrap()
-        .cid,
-        OUTPUT
-    );
+    if !intersects {
+        expected.push((OUTPUT, output.id, 18));
+    }
+    assert_eq!(after.refs.len(), expected.len());
+    assert_eq!(after.resources.len(), expected.len());
+    for (cid, owner, size) in expected {
+        let reference = after.refs.iter().find(|row| row.cid == cid).unwrap();
+        let resource = after.resources.iter().find(|row| row.cid == cid).unwrap();
+        assert_eq!(reference.owner_object_id, owner);
+        assert_eq!(resource.provider, reference.provider);
+        assert_eq!(resource.logical_size, size);
+    }
 }
 
 #[tokio::test]

@@ -35,10 +35,7 @@ fn admission(capture: &CapturedZipIntent, source: &str) -> BatchAdmission {
     }
 }
 
-pub(in crate::store::pinning::publication) async fn original_capture<
-    C: ConnectionTrait + sea_orm::TransactionTrait,
->(
-    db: &C,
+pub(in crate::store::pinning::publication) fn original_capture(
     archive: &PublicationRequest,
     prefix: &str,
     origin: &str,
@@ -51,9 +48,6 @@ pub(in crate::store::pinning::publication) async fn original_capture<
         .flat_map(|intent| &intent.providers)
     {
         let identity = ProviderIdentity::legacy(name, "noop", None, "psa", "psa");
-        super::super::super::ledger::register_route(db, name, &identity)
-            .await
-            .unwrap();
         providers.insert(name.clone(), serde_json::json!({
             "selected": {"config_name": name, "route": identity.route_snapshot(), "enabled": true},
             "limits": limits()[name], "requests_per_second": null,
@@ -119,7 +113,7 @@ pub(super) async fn direct(
     )
     .await
     .unwrap();
-    let capture = original_capture(&tx, archive, prefix, &guard.mutation_id).await;
+    let capture = original_capture(archive, prefix, &guard.mutation_id);
     BatchAdmission::admit_legacy_in_transaction(&tx, &admission(&capture, "direct"))
         .await
         .unwrap();
@@ -141,7 +135,7 @@ pub(super) async fn with_guard(
     lock_bucket_for_ownership(&tx, &archive.object.bucket)
         .await
         .unwrap();
-    let capture = original_capture(&tx, archive, prefix, &guard.mutation_id).await;
+    let capture = original_capture(archive, prefix, &guard.mutation_id);
     BatchAdmission::admit_legacy_in_transaction(&tx, &admission(&capture, "direct"))
         .await
         .unwrap();
@@ -460,7 +454,7 @@ pub(super) async fn upload(
     lock_bucket_for_ownership(&tx, &archive.object.bucket)
         .await
         .unwrap();
-    let capture = original_capture(&tx, archive, prefix, id).await;
+    let capture = original_capture(archive, prefix, id);
     multipart::create_upload_with_zip_intent(
         &tx,
         id,
@@ -542,7 +536,7 @@ pub(super) async fn claimed_import(
     prefix: &str,
     now: DateTime<Utc>,
 ) -> (AdmittedZip, crate::import::ImportClaim) {
-    let capture = original_capture(db, archive, prefix, id).await;
+    let capture = original_capture(archive, prefix, id);
     let mut job = import_request(id, &archive.object.key, Some(prefix));
     job.tags = archive.tags.clone();
     crate::store::import::ownership::submit_captured_zip(db, job, capture.clone(), now)

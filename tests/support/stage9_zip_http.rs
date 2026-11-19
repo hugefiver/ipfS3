@@ -242,17 +242,6 @@ allow_decompressed = true
             .expect("initialize configured gateway and routes");
         let effective = state.pinning.effective_config();
         assert_eq!(effective.providers.len(), 4);
-        for configured in &effective.providers {
-            let provider = configured.identity.allocation_key();
-            assert_eq!(
-                state
-                    .pinning
-                    .provider(&provider)
-                    .unwrap()
-                    .invocation_route(),
-                ("psa", "cid")
-            );
-        }
         let provider = effective
             .providers
             .iter()

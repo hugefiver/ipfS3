@@ -1,12 +1,12 @@
 use super::{
-    ClusterFailureCode as Code, ClusterProtocol, ClusterProvider, ClusterResourceStatus as Status,
-    ClusterStrategy, ClusterWriteEffect, ClusterWriteFailure as Failure, ClusterWriteObservation,
-    ClusterWriteReceipt, canonical_cid,
+    ClusterFailureCode as Code, ClusterProtocol, ClusterProvider, ClusterResourceKey,
+    ClusterStrategy, ClusterWriteFailure as Failure, ClusterWriteReceipt, canonical_cid,
     car::Car,
     http::Body,
     stream::{Progress, Transfer},
 };
 use crate::pinning::provider::SubmitPin;
+use cid::{Cid, Version};
 use reqwest::{Method, multipart};
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
@@ -20,45 +20,22 @@ struct Stat {
 }
 
 impl ClusterProvider {
-    pub async fn submit_observed(&self, request: SubmitPin) -> ClusterWriteObservation {
+    pub async fn submit(&self, request: SubmitPin) -> Result<ClusterWriteReceipt, Failure> {
         self.submit_with_cancel(request, &CancellationToken::new())
             .await
     }
 
-    /// The parent records in-flight intent/fence BEFORE calling this method.
-    /// Cancellation is observed here so dispatched footprints survive in the
-    /// return value; dropping the entire future still requires ledger recovery.
     pub async fn submit_with_cancel(
         &self,
         request: SubmitPin,
         cancel: &CancellationToken,
-    ) -> ClusterWriteObservation {
-        let mut observation = ClusterWriteObservation {
-            result: Err(Failure::new(Code::Protocol)),
-            effect: ClusterWriteEffect::NotSubmitted,
-            resources: vec![],
-            replicas: None,
-            http_status: None,
-        };
-        observation.result = self.write(&request.cid, &mut observation, cancel).await;
-        if let Ok(receipt) = &observation.result {
-            observation.replicas = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => None,
-                proof = self.verifier.observe(&receipt.resource.cid) => Some(proof),
-            };
-        }
-        observation
-    }
-
-    async fn write(
-        &self,
-        requested: &str,
-        observation: &mut ClusterWriteObservation,
-        cancel: &CancellationToken,
     ) -> Result<ClusterWriteReceipt, Failure> {
-        let resource = self.resource_key(requested)?;
-        let cid = &resource.cid;
+        let requested: Cid = request
+            .cid
+            .parse()
+            .map_err(|_| Failure::new(Code::InvalidCid))?;
+        let canonical = canonical_cid(&requested);
+        let cid = canonical.to_string();
         if cancel.is_cancelled() {
             return Err(Failure::new(Code::Cancelled));
         }
@@ -68,7 +45,7 @@ impl ClusterProvider {
             match self.options.protocol {
                 ClusterProtocol::Proxy => self
                     .target
-                    .rpc("pin/add", &[("arg", cid), ("type", "recursive")]),
+                    .rpc("pin/add", &[("arg", &cid), ("type", "recursive")]),
                 // v1.1.6 ParseCidOrFail does NOT parse PinOptions for this route.
                 ClusterProtocol::Rest => {
                     self.target
@@ -82,22 +59,19 @@ impl ClusterProvider {
                 .run(
                     self.options.transfer_limits.idle_timeout,
                     cancel,
-                    self.upload_request(cid, requested),
+                    self.upload_request(&cid, &requested),
                 )
                 .await?;
             transfer = Some(state);
             request
         };
-        self.record(observation, cid, Status::DispatchIntent)?;
-        observation.effect = ClusterWriteEffect::Unknown;
         let progress = transfer.as_ref().map(|t| &t.progress).unwrap_or(&progress);
         let operation = async {
             let response = self.target.execute(request).await?;
-            observation.http_status = Some(response.status().as_u16());
             if self.options.strategy == ClusterStrategy::Cid {
-                self.parse_pin(response, observation, progress).await
+                self.parse_pin(response, progress).await
             } else {
-                self.parse_add(response, observation, progress).await
+                self.parse_add(response, progress).await
             }
         };
         let result = if self.options.strategy == ClusterStrategy::Cid {
@@ -121,25 +95,22 @@ impl ClusterProvider {
         if let Some(transfer) = &transfer {
             transfer.complete()?;
         }
-        for r in &mut observation.resources {
-            if r.status == Status::Reported {
-                r.status = Status::PinAccepted;
-            }
-        }
-        if reported != *cid {
+        if canonical_cid(&reported) != canonical {
             return Err(Failure::new(Code::CidMismatch));
         }
-        observation.effect = ClusterWriteEffect::Observed;
         Ok(ClusterWriteReceipt {
-            resource,
-            accepted_at: chrono::Utc::now(),
+            resource: ClusterResourceKey {
+                pinset: self.options.pinset.clone(),
+                cid,
+            },
+            request_id: reported.to_string(),
         })
     }
 
     async fn upload_request(
         &self,
         cid: &str,
-        requested: &str,
+        requested: &Cid,
     ) -> Result<(reqwest::Request, Transfer), Failure> {
         let source = self
             .source
@@ -159,7 +130,11 @@ impl ClusterProvider {
             .map_err(|_| Failure::new(Code::ControlTimeout))??;
             let stat: Stat =
                 serde_json::from_slice(&bytes).map_err(|_| Failure::new(Code::Protocol))?;
-            if canonical_cid(&stat.hash)? != cid {
+            let stat_cid = stat
+                .hash
+                .parse()
+                .map_err(|_| Failure::new(Code::Protocol))?;
+            if canonical_cid(&stat_cid) != canonical_cid(requested) {
                 return Err(Failure::new(Code::CidMismatch));
             }
             if matches!(stat.kind.as_str(), "directory" | "hamt-sharded-directory") {
@@ -194,8 +169,7 @@ impl ClusterProvider {
         } else {
             "false"
         };
-        let expected = cid::Cid::try_from(requested).map_err(|_| Failure::new(Code::InvalidCid))?;
-        let v0 = expected.version() == cid::Version::V0;
+        let v0 = requested.version() == Version::V0;
         let unixfs = self.options.unixfs.unwrap_or(super::ClusterUnixfsOptions {
             cid_version: if v0 { 0 } else { 1 },
             raw_leaves: !v0,
@@ -212,8 +186,7 @@ impl ClusterProvider {
             ("shard", "false"),
         ];
         if !car {
-            let parsed = cid::Cid::try_from(cid).map_err(|_| Failure::new(Code::InvalidCid))?;
-            if !matches!(parsed.codec(), 0x55 | 0x70) || parsed.hash().code() != 0x12 {
+            if !matches!(requested.codec(), 0x55 | 0x70) || requested.hash().code() != 0x12 {
                 return Err(Failure::new(Code::InvalidConfiguration));
             }
             query.extend([

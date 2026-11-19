@@ -13,8 +13,7 @@ use chrono::Duration as ChronoDuration;
 use http::{HeaderMap, StatusCode};
 use ipfs_s3_gateway::store;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, QueryFilter,
-    QueryOrder, Set, Statement,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set,
 };
 use std::sync::Arc;
 
@@ -258,22 +257,11 @@ async fn lifecycle_abort_multipart_complete_race_has_both_winners() {
                 "objects",
                 "object_versions",
                 "object_tags",
-                "pin_leases",
-                "pin_jobs",
+                "pin_refs",
+                "pin_resources",
             ] {
-                let row = harness
-                    .state
-                    .store
-                    .db()
-                    .query_one(Statement::from_string(
-                        DatabaseBackend::Sqlite,
-                        format!("SELECT COUNT(*) AS count FROM {table}"),
-                    ))
-                    .await
-                    .unwrap()
-                    .unwrap();
                 assert_eq!(
-                    row.try_get::<i64>("", "count").unwrap(),
+                    support::pin_rows::count(harness.state.store.db(), table).await,
                     0,
                     "no publication residue in {table}"
                 );

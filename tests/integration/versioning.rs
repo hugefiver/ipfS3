@@ -1,17 +1,16 @@
 use super::common::{
     IMPORT_CID, IMPORT_TEST_CID_V0, OwnedTestEndpoint, SINGLE_ENTRY_BYTES,
     assert_no_kubo_pin_removes, assert_s3_error, delete_headers, delete_identifiers_xml,
-    import_result_count, import_url_xml, lease_targets, owner_leases, scripted,
-    signed_complete_multipart, signed_copy, signed_copy_with_tagging,
-    signed_create_multipart_upload_with_tagging, signed_create_multipart_zip_upload_with_tagging,
-    signed_decompress_zip_put, signed_delete_bucket, signed_delete_object,
-    signed_delete_object_tagging_version, signed_delete_object_version, signed_get,
-    signed_get_object_tagging, signed_get_object_tagging_version, signed_get_version,
-    signed_get_version_with_headers, signed_get_with_headers, signed_head,
-    signed_head_with_headers, signed_list_object_versions, signed_list_objects, signed_put,
-    signed_put_bucket_versioning, signed_put_bucket_versioning_xml,
-    signed_put_object_tagging_version, signed_put_with_tagging, signed_upload_part,
-    sse_c_headers_for, tagging_pairs, xml_element_text, xml_element_values,
+    import_result_count, import_url_xml, scripted, signed_complete_multipart, signed_copy,
+    signed_copy_with_tagging, signed_create_multipart_upload_with_tagging,
+    signed_create_multipart_zip_upload_with_tagging, signed_decompress_zip_put,
+    signed_delete_bucket, signed_delete_object, signed_delete_object_tagging_version,
+    signed_delete_object_version, signed_get, signed_get_object_tagging,
+    signed_get_object_tagging_version, signed_get_version, signed_get_version_with_headers,
+    signed_get_with_headers, signed_head, signed_head_with_headers, signed_list_object_versions,
+    signed_list_objects, signed_put, signed_put_bucket_versioning,
+    signed_put_bucket_versioning_xml, signed_put_object_tagging_version, signed_put_with_tagging,
+    signed_upload_part, sse_c_headers_for, tagging_pairs, xml_element_text, xml_element_values,
 };
 use crate::support::decompress::{
     AddReply, KuboScript, S3TestEndpoint, legal_single_entry_zip, start_harness,
@@ -19,6 +18,7 @@ use crate::support::decompress::{
 use crate::support::import::{
     ImportHarnessConfig, TestHttpsReply, start_import_harness, wait_for_import_state,
 };
+use crate::support::pin_rows;
 use crate::support::pinning::{PinningHarness, PinningHarnessConfig, start_pinning_harness};
 use crate::support::sigv4::send_sigv4;
 use http::{HeaderMap, HeaderValue, StatusCode};
@@ -1055,7 +1055,7 @@ async fn versioning_suspend_replaces_null_reenable_unique_and_bucket_cleanup() {
     );
 }
 
-async fn marker_nonversion_side_effect_counts(state: &Arc<AppState>) -> [u64; 7] {
+async fn marker_nonversion_side_effect_counts(state: &Arc<AppState>) -> [u64; 4] {
     [
         store::entities::object::Entity::find()
             .count(state.store.db())
@@ -1065,26 +1065,8 @@ async fn marker_nonversion_side_effect_counts(state: &Arc<AppState>) -> [u64; 7]
             .count(state.store.db())
             .await
             .unwrap(),
-        store::entities::pin_lease::Entity::find()
-            .count(state.store.db())
-            .await
-            .unwrap(),
-        store::entities::pin_lease_target::Entity::find()
-            .count(state.store.db())
-            .await
-            .unwrap(),
-        store::entities::pin_job::Entity::find()
-            .count(state.store.db())
-            .await
-            .unwrap(),
-        store::entities::pin_provider_usage::Entity::find()
-            .count(state.store.db())
-            .await
-            .unwrap(),
-        store::entities::remote_pin::Entity::find()
-            .count(state.store.db())
-            .await
-            .unwrap(),
+        pin_rows::count(state.store.db(), "pin_refs").await,
+        pin_rows::count(state.store.db(), "pin_resources").await,
     ]
 }
 
@@ -1673,59 +1655,31 @@ async fn assert_publication_matrix_pinning(
     before: &PublicationMatrixBefore,
     current_object_id: &str,
 ) {
-    let current_leases = owner_leases(harness, current_object_id).await;
-    assert_eq!(current_leases.len(), 1, "one current manual lease");
-    let current = &current_leases[0];
-    assert_eq!(current.owner_object_id, current_object_id);
-    assert_eq!(current.state, "active");
-    let targets = lease_targets(harness, &current.id).await;
-    assert!(!targets.is_empty(), "current lease has provider targets");
-    assert!(targets.iter().all(|target| target.lease_id == current.id));
-    assert!(
-        harness
-            .pin_jobs()
-            .await
-            .iter()
-            .any(|job| job.lease_id.as_deref() == Some(current.id.as_str()))
-    );
-    let usage = harness
-        .provider_usage(&harness.provider_key("pinata-primary"))
-        .await;
-    assert!(usage.reserved_pins > 0);
-    assert!(usage.reserved_bytes > 0);
-
-    let previous_ids = before
-        .rows
+    let db = harness.state.store.db();
+    let refs = pin_rows::refs(db).await;
+    let owned: Vec<_> = refs
         .iter()
-        .map(|row| row.object_id.as_deref().expect("baseline lease owner"))
-        .collect::<Vec<_>>();
-    match matrix_state {
-        PublicationMatrixState::Unversioned => assert!(
-            owner_leases(harness, previous_ids[0])
-                .await
-                .iter()
-                .all(|lease| lease.state == "cancelled")
-        ),
-        PublicationMatrixState::Enabled => assert!(
-            owner_leases(harness, previous_ids[0])
-                .await
-                .iter()
-                .all(|lease| lease.state == "active")
-        ),
-        PublicationMatrixState::Suspended => {
-            assert!(
-                owner_leases(harness, previous_ids[0])
-                    .await
-                    .iter()
-                    .all(|lease| lease.state == "active")
-            );
-            assert!(
-                owner_leases(harness, previous_ids[1])
-                    .await
-                    .iter()
-                    .all(|lease| lease.state == "cancelled")
-            );
-        }
+        .filter(|r| r.owner_object_id == current_object_id)
+        .collect();
+    assert_eq!(owned.len(), 1);
+    let current = owned[0];
+    assert_eq!(current.source, "manual");
+    let resources = pin_rows::resources(db).await;
+    let resource = resources
+        .iter()
+        .find(|r| r.provider == current.provider && r.cid == current.cid)
+        .unwrap();
+    assert_eq!(resource.action.as_deref(), Some("submit"));
+    assert!(resource.logical_size > 0);
+
+    for row in &before.rows {
+        let previous_owner = row.object_id.as_deref().unwrap();
+        let retained =
+            matrix_state != PublicationMatrixState::Unversioned && row.version_id.is_some();
+        assert_eq!(
+            refs.iter().any(|r| r.owner_object_id == previous_owner),
+            retained
+        );
     }
 }
 
@@ -1761,41 +1715,8 @@ async fn assert_public_ids_are_external(state: &Arc<AppState>, bucket: &str) {
 }
 
 async fn assert_no_remote_publication_rows(state: &Arc<AppState>) {
-    assert_eq!(
-        store::entities::pin_lease::Entity::find()
-            .count(state.store.db())
-            .await
-            .unwrap(),
-        0
-    );
-    assert_eq!(
-        store::entities::pin_lease_target::Entity::find()
-            .count(state.store.db())
-            .await
-            .unwrap(),
-        0
-    );
-    assert_eq!(
-        store::entities::pin_job::Entity::find()
-            .count(state.store.db())
-            .await
-            .unwrap(),
-        0
-    );
-    assert_eq!(
-        store::entities::pin_provider_usage::Entity::find()
-            .count(state.store.db())
-            .await
-            .unwrap(),
-        0
-    );
-    assert_eq!(
-        store::entities::remote_pin::Entity::find()
-            .count(state.store.db())
-            .await
-            .unwrap(),
-        0
-    );
+    assert!(pin_rows::refs(state.store.db()).await.is_empty());
+    assert!(pin_rows::resources(state.store.db()).await.is_empty());
 }
 
 async fn signed_post_import_matrix(
@@ -1851,13 +1772,13 @@ const MATRIX_ZIP_PIN_TAGS: &str =
 async fn versioning_publication_path_put() {
     let config = matrix_pinning_config(
         [
-            "QmPutUBase",
-            "QmPutU",
-            "QmPutEBase",
-            "QmPutE",
-            "QmPutSOpaque",
-            "QmPutSNull",
-            "QmPutS",
+            "bafkqaccqov2fkqtbonsq",
+            "bafkqabcqov2fk",
+            "bafkqaccqov2ekqtbonsq",
+            "bafkqabcqov2ek",
+            "bafkqacsqov2fgt3qmfyxkzi",
+            "bafkqaccqov2fgttvnrwa",
+            "bafkqabcqov2fg",
         ]
         .into_iter()
         .map(AddReply::Ok)
@@ -1866,9 +1787,9 @@ async fn versioning_publication_path_put() {
     );
     let harness = start_pinning_harness(config).await;
     for (matrix_state, expected_cid) in [
-        (PublicationMatrixState::Unversioned, "QmPutU"),
-        (PublicationMatrixState::Enabled, "QmPutE"),
-        (PublicationMatrixState::Suspended, "QmPutS"),
+        (PublicationMatrixState::Unversioned, "bafkqabcqov2fk"),
+        (PublicationMatrixState::Enabled, "bafkqabcqov2ek"),
+        (PublicationMatrixState::Suspended, "bafkqabcqov2fg"),
     ] {
         let key = format!("matrix/{}/put.bin", matrix_state.label());
         let before = prepare_publication_matrix_state(
@@ -1917,13 +1838,13 @@ async fn versioning_publication_path_put() {
 async fn versioning_publication_path_copy() {
     let config = matrix_pinning_config(
         [
-            "QmCopyUBase",
-            "QmCopyUSource",
-            "QmCopyEBase",
-            "QmCopyESource",
-            "QmCopySOpaque",
-            "QmCopySNull",
-            "QmCopySSource",
+            "bafkqackdn5yhsvkcmfzwk",
+            "bafkqac2dn5yhsvktn52xey3f",
+            "bafkqackdn5yhsrkcmfzwk",
+            "bafkqac2dn5yhsrktn52xey3f",
+            "bafkqac2dn5yhsu2pobqxc5lf",
+            "bafkqackdn5yhsu2oovwgy",
+            "bafkqac2dn5yhsu2tn52xey3f",
         ]
         .into_iter()
         .map(AddReply::Ok)
@@ -1932,9 +1853,15 @@ async fn versioning_publication_path_copy() {
     );
     let harness = start_pinning_harness(config).await;
     for (matrix_state, expected_cid) in [
-        (PublicationMatrixState::Unversioned, "QmCopyUSource"),
-        (PublicationMatrixState::Enabled, "QmCopyESource"),
-        (PublicationMatrixState::Suspended, "QmCopySSource"),
+        (
+            PublicationMatrixState::Unversioned,
+            "bafkqac2dn5yhsvktn52xey3f",
+        ),
+        (PublicationMatrixState::Enabled, "bafkqac2dn5yhsrktn52xey3f"),
+        (
+            PublicationMatrixState::Suspended,
+            "bafkqac2dn5yhsu2tn52xey3f",
+        ),
     ] {
         let destination = format!("matrix/{}/copy.bin", matrix_state.label());
         let source = format!("matrix/{}/copy-source.bin", matrix_state.label());
@@ -1979,45 +1906,53 @@ async fn versioning_publication_path_copy() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn versioning_publication_path_multipart() {
-    let mut config = matrix_pinning_config(
+    let config = matrix_pinning_config(
         [
-            "QmMultipartUBase",
-            "QmMultipartUPart",
-            "QmMultipartURoot",
-            "QmMultipartEBase",
-            "QmMultipartEPart",
-            "QmMultipartERoot",
-            "QmMultipartSOpaque",
-            "QmMultipartSNull",
-            "QmMultipartSPart",
-            "QmMultipartSRoot",
+            "bafkqadsnovwhi2lqmfzhivkcmfzwk",
+            "bafkqadsnovwhi2lqmfzhivkqmfzhi",
+            "bafkqadsnovwhi2lqmfzhivksn5xxi",
+            "bafkqadsnovwhi2lqmfzhirkcmfzwk",
+            "bafkqadsnovwhi2lqmfzhirkqmfzhi",
+            "bafkqadsnovwhi2lqmfzhirksn5xxi",
+            "bafkqaecnovwhi2lqmfzhiu2pobqxc5lf",
+            "bafkqadsnovwhi2lqmfzhiu2oovwgy",
+            "bafkqadsnovwhi2lqmfzhiu2qmfzhi",
+            "bafkqadsnovwhi2lqmfzhiu2sn5xxi",
         ]
         .into_iter()
         .map(AddReply::Ok)
         .collect(),
         HashMap::from([
-            ("QmMultipartUPart".to_owned(), b"multipart U".to_vec()),
-            ("QmMultipartEPart".to_owned(), b"multipart E".to_vec()),
-            ("QmMultipartSPart".to_owned(), b"multipart S".to_vec()),
+            (
+                "bafkqadsnovwhi2lqmfzhivkqmfzhi".to_owned(),
+                b"multipart U".to_vec(),
+            ),
+            (
+                "bafkqadsnovwhi2lqmfzhirkqmfzhi".to_owned(),
+                b"multipart E".to_vec(),
+            ),
+            (
+                "bafkqadsnovwhi2lqmfzhiu2qmfzhi".to_owned(),
+                b"multipart S".to_vec(),
+            ),
         ]),
     );
-    config.explicit_identity = true;
     let harness = start_pinning_harness(config).await;
     for (matrix_state, part_body, expected_cid) in [
         (
             PublicationMatrixState::Unversioned,
             b"multipart U".as_slice(),
-            "QmMultipartURoot",
+            "bafkqadsnovwhi2lqmfzhivksn5xxi",
         ),
         (
             PublicationMatrixState::Enabled,
             b"multipart E".as_slice(),
-            "QmMultipartERoot",
+            "bafkqadsnovwhi2lqmfzhirksn5xxi",
         ),
         (
             PublicationMatrixState::Suspended,
             b"multipart S".as_slice(),
-            "QmMultipartSRoot",
+            "bafkqadsnovwhi2lqmfzhiu2sn5xxi",
         ),
     ] {
         let key = format!("matrix/{}/multipart.bin", matrix_state.label());
@@ -2346,46 +2281,54 @@ async fn versioning_publication_path_import_zip() {
 async fn versioning_publication_path_direct_zip() {
     let archive = legal_single_entry_zip();
     let add_cids = [
-        "QmDirectZipUArchiveBase",
-        "QmDirectZipUEntryBase",
-        "QmDirectZipUArchive",
-        "QmDirectZipUEntry",
-        "QmDirectZipEArchiveBase",
-        "QmDirectZipEEntryBase",
-        "QmDirectZipEArchive",
-        "QmDirectZipEEntry",
-        "QmDirectZipSOpaqueArchive",
-        "QmDirectZipSOpaqueEntry",
-        "QmDirectZipSNullArchive",
-        "QmDirectZipSNullEntry",
-        "QmDirectZipSArchive",
-        "QmDirectZipSEntry",
+        "bafkqafkenfzgky3uljuxavkbojrwq2lwmvbgc43f",
+        "bafkqae2enfzgky3uljuxavkfnz2he6kcmfzwk",
+        "bafkqaekenfzgky3uljuxavkbojrwq2lwmu",
+        "bafkqad2enfzgky3uljuxavkfnz2he6i",
+        "bafkqafkenfzgky3uljuxarkbojrwq2lwmvbgc43f",
+        "bafkqae2enfzgky3uljuxarkfnz2he6kcmfzwk",
+        "bafkqaekenfzgky3uljuxarkbojrwq2lwmu",
+        "bafkqad2enfzgky3uljuxarkfnz2he6i",
+        "bafkqaf2enfzgky3uljuxau2pobqxc5lfifzgg2djozsq",
+        "bafkqafkenfzgky3uljuxau2pobqxc5lfivxhi4tz",
+        "bafkqafkenfzgky3uljuxau2oovwgyqlsmnugs5tf",
+        "bafkqae2enfzgky3uljuxau2oovwgyrloorzhs",
+        "bafkqaekenfzgky3uljuxau2bojrwq2lwmu",
+        "bafkqad2enfzgky3uljuxau2fnz2he6i",
     ];
-    let mut config = matrix_pinning_config(
+    let config = matrix_pinning_config(
         add_cids.into_iter().map(AddReply::Ok).collect(),
         HashMap::from([
-            ("QmDirectZipUArchive".to_owned(), archive.clone()),
-            ("QmDirectZipEArchive".to_owned(), archive.clone()),
-            ("QmDirectZipSArchive".to_owned(), archive.clone()),
+            (
+                "bafkqaekenfzgky3uljuxavkbojrwq2lwmu".to_owned(),
+                archive.clone(),
+            ),
+            (
+                "bafkqaekenfzgky3uljuxarkbojrwq2lwmu".to_owned(),
+                archive.clone(),
+            ),
+            (
+                "bafkqaekenfzgky3uljuxau2bojrwq2lwmu".to_owned(),
+                archive.clone(),
+            ),
         ]),
     );
-    config.explicit_identity = true;
     let harness = start_pinning_harness(config).await;
     for (matrix_state, archive_cid, entry_cid) in [
         (
             PublicationMatrixState::Unversioned,
-            "QmDirectZipUArchive",
-            "QmDirectZipUEntry",
+            "bafkqaekenfzgky3uljuxavkbojrwq2lwmu",
+            "bafkqad2enfzgky3uljuxavkfnz2he6i",
         ),
         (
             PublicationMatrixState::Enabled,
-            "QmDirectZipEArchive",
-            "QmDirectZipEEntry",
+            "bafkqaekenfzgky3uljuxarkbojrwq2lwmu",
+            "bafkqad2enfzgky3uljuxarkfnz2he6i",
         ),
         (
             PublicationMatrixState::Suspended,
-            "QmDirectZipSArchive",
-            "QmDirectZipSEntry",
+            "bafkqaekenfzgky3uljuxau2bojrwq2lwmu",
+            "bafkqad2enfzgky3uljuxau2fnz2he6i",
         ),
     ] {
         let archive_key = format!("matrix/{}/direct.zip", matrix_state.label());
@@ -2446,52 +2389,69 @@ async fn versioning_publication_path_direct_zip() {
 async fn versioning_publication_path_multipart_zip() {
     let archive = legal_single_entry_zip();
     let add_cids = [
-        "QmMultipartZipUArchiveBase",
-        "QmMultipartZipUEntryBase",
-        "QmMultipartZipUPart",
-        "QmMultipartZipURoot",
-        "QmMultipartZipUEntry",
-        "QmMultipartZipEArchiveBase",
-        "QmMultipartZipEEntryBase",
-        "QmMultipartZipEPart",
-        "QmMultipartZipERoot",
-        "QmMultipartZipEEntry",
-        "QmMultipartZipSOpaqueArchive",
-        "QmMultipartZipSOpaqueEntry",
-        "QmMultipartZipSNullArchive",
-        "QmMultipartZipSNullEntry",
-        "QmMultipartZipSPart",
-        "QmMultipartZipSRoot",
-        "QmMultipartZipSEntry",
+        "bafkqagcnovwhi2lqmfzhiwtjobkuc4tdnbuxmzkcmfzwk",
+        "bafkqafsnovwhi2lqmfzhiwtjobkuk3tuoj4ueyltmu",
+        "bafkqaeknovwhi2lqmfzhiwtjobkvaylsoq",
+        "bafkqaeknovwhi2lqmfzhiwtjobkve33poq",
+        "bafkqaesnovwhi2lqmfzhiwtjobkuk3tuoj4q",
+        "bafkqagcnovwhi2lqmfzhiwtjobcuc4tdnbuxmzkcmfzwk",
+        "bafkqafsnovwhi2lqmfzhiwtjobcuk3tuoj4ueyltmu",
+        "bafkqaeknovwhi2lqmfzhiwtjobcvaylsoq",
+        "bafkqaeknovwhi2lqmfzhiwtjobcve33poq",
+        "bafkqaesnovwhi2lqmfzhiwtjobcuk3tuoj4q",
+        "bafkqagsnovwhi2lqmfzhiwtjobju64dbof2wkqlsmnugs5tf",
+        "bafkqagcnovwhi2lqmfzhiwtjobju64dbof2wkrloorzhs",
+        "bafkqagcnovwhi2lqmfzhiwtjobju45lmnraxey3inf3gk",
+        "bafkqafsnovwhi2lqmfzhiwtjobju45lmnrcw45dspe",
+        "bafkqaeknovwhi2lqmfzhiwtjobjvaylsoq",
+        "bafkqaeknovwhi2lqmfzhiwtjobjve33poq",
+        "bafkqaesnovwhi2lqmfzhiwtjobjuk3tuoj4q",
     ];
-    let mut config = matrix_pinning_config(
+    let config = matrix_pinning_config(
         add_cids.into_iter().map(AddReply::Ok).collect(),
         HashMap::from([
-            ("QmMultipartZipUPart".to_owned(), archive.clone()),
-            ("QmMultipartZipURoot".to_owned(), archive.clone()),
-            ("QmMultipartZipEPart".to_owned(), archive.clone()),
-            ("QmMultipartZipERoot".to_owned(), archive.clone()),
-            ("QmMultipartZipSPart".to_owned(), archive.clone()),
-            ("QmMultipartZipSRoot".to_owned(), archive.clone()),
+            (
+                "bafkqaeknovwhi2lqmfzhiwtjobkvaylsoq".to_owned(),
+                archive.clone(),
+            ),
+            (
+                "bafkqaeknovwhi2lqmfzhiwtjobkve33poq".to_owned(),
+                archive.clone(),
+            ),
+            (
+                "bafkqaeknovwhi2lqmfzhiwtjobcvaylsoq".to_owned(),
+                archive.clone(),
+            ),
+            (
+                "bafkqaeknovwhi2lqmfzhiwtjobcve33poq".to_owned(),
+                archive.clone(),
+            ),
+            (
+                "bafkqaeknovwhi2lqmfzhiwtjobjvaylsoq".to_owned(),
+                archive.clone(),
+            ),
+            (
+                "bafkqaeknovwhi2lqmfzhiwtjobjve33poq".to_owned(),
+                archive.clone(),
+            ),
         ]),
     );
-    config.explicit_identity = true;
     let harness = start_pinning_harness(config).await;
     for (matrix_state, root_cid, entry_cid) in [
         (
             PublicationMatrixState::Unversioned,
-            "QmMultipartZipURoot",
-            "QmMultipartZipUEntry",
+            "bafkqaeknovwhi2lqmfzhiwtjobkve33poq",
+            "bafkqaesnovwhi2lqmfzhiwtjobkuk3tuoj4q",
         ),
         (
             PublicationMatrixState::Enabled,
-            "QmMultipartZipERoot",
-            "QmMultipartZipEEntry",
+            "bafkqaeknovwhi2lqmfzhiwtjobcve33poq",
+            "bafkqaesnovwhi2lqmfzhiwtjobcuk3tuoj4q",
         ),
         (
             PublicationMatrixState::Suspended,
-            "QmMultipartZipSRoot",
-            "QmMultipartZipSEntry",
+            "bafkqaeknovwhi2lqmfzhiwtjobjve33poq",
+            "bafkqaesnovwhi2lqmfzhiwtjobjuk3tuoj4q",
         ),
     ] {
         let archive_key = format!("matrix/{}/multipart.zip", matrix_state.label());

@@ -4,6 +4,8 @@ use crate::{
         ImportClaim, ImportConfig, pipeline::ImportCoordinator, v2_source::fetch_v2_zip_source,
     },
     pinning::{
+        config::ValidatedPinningConfig,
+        coordinator::PinningCoordinator,
         decision::DecisionOrigin,
         zip_policy::{CapturedZipIntent, ZipCaptureContext, capture_zip_intent},
     },
@@ -15,11 +17,51 @@ use crate::{
         zip::{self, BatchAdmission},
     },
 };
+use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use tokio_util::sync::CancellationToken;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{method, path},
 };
+
+pub(crate) fn automatic_pinning() -> std::sync::Arc<PinningCoordinator> {
+    let raw = toml::from_str(
+        r#"
+        [[providers]]
+        name = 'remote'
+        kind = 'noop'
+        priority = 1
+        max_bytes = 1000
+        max_pins = 100
+
+        [[policies]]
+        bucket = 'bucket'
+        trigger = 'always'
+        provider_mode = 'one'
+        providers = ['remote']
+        default_duration = '1h'
+        max_duration = '24h'
+        "#,
+    )
+    .unwrap();
+    PinningCoordinator::build(ValidatedPinningConfig::from_raw(&raw, |_| None).unwrap()).unwrap()
+}
+
+pub(crate) async fn pin_counts(db: &DatabaseConnection) -> (i64, i64) {
+    let row = db
+        .query_one(Statement::from_string(
+            db.get_database_backend(),
+            "SELECT (SELECT COUNT(*) FROM pin_refs) AS refs, \
+                    (SELECT COUNT(*) FROM pin_resources) AS resources",
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    (
+        row.try_get("", "refs").unwrap(),
+        row.try_get("", "resources").unwrap(),
+    )
+}
 
 pub(crate) fn capture_legacy(
     state: &AppState,

@@ -1,3 +1,5 @@
+#[path = "support/pin_rows.rs"]
+mod pin_rows;
 mod stage9_zip_support;
 use chrono::Utc;
 use ipfs_s3_gateway::{
@@ -10,7 +12,7 @@ use ipfs_s3_gateway::{
     },
     store::{
         self,
-        entities::{object as object_entity, pin_lease, pin_provider_usage},
+        entities::object as object_entity,
         import::ownership,
         object_version::{BucketVersioningState, PublicVersionId, VersionSelector},
         pinning::publication::{
@@ -40,7 +42,7 @@ async fn overwrite(db: &DatabaseConnection, key: &str, id: &str) {
     )
     .await
     .unwrap();
-    let object = object(id, key, "replacement");
+    let object = object(id, key, &fixture_cid("replacement"));
     publication::publish_standard_object(
         db,
         PublicationRequest {
@@ -81,33 +83,33 @@ async fn r25_automatic_owners_follow_only_exact_displaced_versions() {
             .await
             .unwrap();
         overwrite(&db, "out/archive.zip", "new-source").await;
-        assert!(
-            pin_lease::Entity::find()
-                .all(&db)
-                .await
-                .unwrap()
-                .iter()
-                .all(|l| l.state == "active")
+        let refs = pin_rows::refs(&db).await;
+        assert_eq!(
+            refs.iter()
+                .map(|r| r.owner_object_id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
         );
         overwrite(&db, "out/a", "new-a").await;
-        let leases = pin_lease::Entity::find().all(&db).await.unwrap();
-        let a = leases.iter().find(|l| l.owner_object_id == "a").unwrap();
-        let b = leases.iter().find(|l| l.owner_object_id == "b").unwrap();
+        let refs = pin_rows::refs(&db).await;
+        let owners = refs
+            .iter()
+            .map(|r| r.owner_object_id.as_str())
+            .collect::<Vec<_>>();
         assert_eq!(
-            a.state,
+            owners,
             if state == BucketVersioningState::Enabled {
-                "active"
+                vec!["a", "b"]
             } else {
-                "cancelled"
+                vec!["b"]
             }
         );
-        assert_eq!(b.state, "active");
-        let usage = pin_provider_usage::Entity::find()
-            .one(&db)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!((usage.reserved_bytes, usage.reserved_pins), (5, 1));
+        let resources = pin_rows::resources(&db).await;
+        assert_eq!(resources.len(), 1);
+        assert_eq!(
+            (resources[0].logical_size, resources[0].cid.as_str()),
+            (5, OUTPUT_CID)
+        );
     }
 }
 
@@ -136,7 +138,7 @@ async fn r25_enabled_delete_marker_preserves_owner_exact_delete_ends_only_one() 
     )
     .await
     .unwrap();
-    publication::delete_version_with_leases_guarded(
+    publication::delete_version_guarded(
         &db,
         "bucket",
         "out/a",
@@ -146,13 +148,12 @@ async fn r25_enabled_delete_marker_preserves_owner_exact_delete_ends_only_one() 
     )
     .await
     .unwrap();
-    assert!(
-        pin_lease::Entity::find()
-            .all(&db)
-            .await
-            .unwrap()
-            .iter()
-            .all(|l| l.state == "active")
+    let refs = pin_rows::refs(&db).await;
+    assert_eq!(
+        refs.iter()
+            .map(|r| r.owner_object_id.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "b"]
     );
     let guard = ownership::admit_content_mutation(
         &db,
@@ -164,7 +165,7 @@ async fn r25_enabled_delete_marker_preserves_owner_exact_delete_ends_only_one() 
     )
     .await
     .unwrap();
-    publication::delete_version_with_leases_guarded(
+    publication::delete_version_guarded(
         &db,
         "bucket",
         "out/a",
@@ -174,45 +175,16 @@ async fn r25_enabled_delete_marker_preserves_owner_exact_delete_ends_only_one() 
     )
     .await
     .unwrap();
-    let leases = pin_lease::Entity::find().all(&db).await.unwrap();
-    assert_eq!(
-        leases
-            .iter()
-            .find(|l| l.owner_object_id == "a")
-            .unwrap()
-            .state,
-        "cancelled"
-    );
-    assert_eq!(
-        leases
-            .iter()
-            .find(|l| l.owner_object_id == "b")
-            .unwrap()
-            .state,
-        "active"
-    );
-    assert_eq!(
-        pin_provider_usage::Entity::find()
-            .one(&db)
-            .await
-            .unwrap()
-            .unwrap()
-            .reserved_pins,
-        1
-    );
+    let refs = pin_rows::refs(&db).await;
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs[0].owner_object_id, "b");
+    let resources = pin_rows::resources(&db).await;
+    assert_eq!(resources.len(), 1);
+    assert_eq!(resources[0].cid, OUTPUT_CID);
 }
 
 async fn prepared_source_false(db: &DatabaseConnection, empty: bool) -> CapturedZipPublication {
     let config = config();
-    for provider in &config.providers {
-        store::pinning::ledger::register_configured_route(
-            db,
-            &provider.identity.allocation_key(),
-            provider,
-        )
-        .await
-        .unwrap();
-    }
     let mut headers = http::HeaderMap::new();
     headers.insert(options::ZIP_CONTRACT, "v2".parse().unwrap());
     headers.insert(options::PUBLISH_SOURCE, "false".parse().unwrap());
@@ -270,15 +242,15 @@ async fn prepared_source_false(db: &DatabaseConnection, empty: bool) -> Captured
         .await
         .unwrap()
         .unwrap();
-    execution::bind_clean_input(db, &claim, &"1".repeat(64), "archive-cid", 5)
+    execution::bind_clean_input(db, &claim, &"1".repeat(64), ARCHIVE_CID, 5)
         .await
         .unwrap();
     let successes = if empty {
         vec![]
     } else {
         vec![
-            object("a", "out/a", "shared-cid"),
-            object("b", "out/b", "shared-cid"),
+            object("a", "out/a", OUTPUT_CID),
+            object("b", "out/b", OUTPUT_CID),
         ]
     };
     let files = successes
@@ -370,7 +342,7 @@ async fn r25_source_false_shared_core_has_no_virtual_archive_or_empty_lease() {
         let error = db.execute_unprepared("UPDATE zip_v2_executions SET input_art_cid=NULL,input_art_size=NULL WHERE id='v2-batch'").await.unwrap_err();
         assert!(error.to_string().contains("ck_zip_v2_input"), "{error}");
         assert_eq!(object_entity::Entity::find().count(&db).await.unwrap(), 0);
-        assert_eq!(pin_lease::Entity::find().count(&db).await.unwrap(), 0);
+        assert_eq!(pin_rows::count(&db, "pin_refs").await, 0);
         publication::publish_captured_zip(
             &db,
             request,
@@ -385,7 +357,7 @@ async fn r25_source_false_shared_core_has_no_virtual_archive_or_empty_lease() {
             if empty { 0 } else { 2 }
         );
         assert_eq!(
-            pin_lease::Entity::find().count(&db).await.unwrap(),
+            pin_rows::count(&db, "pin_refs").await,
             if empty { 0 } else { 2 }
         );
         let terminal = execution::read(&db, "v2-batch").await.unwrap().unwrap();
@@ -422,11 +394,8 @@ async fn r25_execution_completion_fault_restores_entire_common_publication() {
         .contains("execution tail")
     );
     assert_eq!(object_entity::Entity::find().count(&db).await.unwrap(), 0);
-    assert_eq!(pin_lease::Entity::find().count(&db).await.unwrap(), 0);
-    assert_eq!(
-        pin_provider_usage::Entity::find().count(&db).await.unwrap(),
-        0
-    );
+    assert_eq!(pin_rows::count(&db, "pin_refs").await, 0);
+    assert_eq!(pin_rows::count(&db, "pin_resources").await, 0);
     assert_eq!(
         execution::read(&db, "v2-batch")
             .await

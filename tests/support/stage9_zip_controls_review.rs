@@ -124,18 +124,6 @@ allow_decompressed = true
         ))
         .unwrap();
         let state = AppState::new(&config).await.unwrap();
-        assert_eq!(
-            state
-                .pinning
-                .provider(
-                    &state.pinning.effective_config().providers[0]
-                        .identity
-                        .allocation_key()
-                )
-                .unwrap()
-                .invocation_route(),
-            ("noop", "cid")
-        );
         store::bucket::create(state.store.db(), BUCKET, Some("test"))
             .await
             .unwrap();
@@ -227,8 +215,7 @@ pub fn tagging(value: &str) -> HeaderMap {
     headers
 }
 
-/// Entire SQLite state, including object metadata, decisions, mutations, ZIP
-/// intake, jobs, quota and native leases. SQL quote() also preserves NULL/BLOB.
+/// Snapshot the state that rejected requests must leave untouched, preserving NULL/BLOB.
 pub async fn snapshot(db: &DatabaseConnection) -> BTreeMap<String, Vec<String>> {
     let tables = db
         .query_all(Statement::from_string(

@@ -1,12 +1,10 @@
-//! Stage 5: signed S3 publication -> registered RPC worker -> stored-byte HTTP
-//! transfer -> independent submission ledger. These are protocol mocks, not real
-//! Kubo DAG/replica or provider-account evidence. ZIP directory building is off.
+//! Signed S3 publication and ciphertext transfer through the registered RPC provider.
 
-// Import helpers only, not support/mod.rs and its unrelated selftests.
 #[allow(dead_code)]
 mod support {
     pub mod cors;
     pub mod decompress;
+    pub mod pin_rows;
     pub mod sigv4;
 }
 
@@ -20,16 +18,12 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use ipfs_s3_gateway::{
     config::Config,
-    pinning::{
-        identity::{CleanupMode, Ownership, ProviderRouteSnapshot, RemoteResourceType},
-        provider::{ObservedResourceStatus, canonical_resource_cid},
-    },
+    pinning::provider::canonical_resource_cid,
     state::AppState,
     store::{
         self,
-        entities::{object, object_version, pin_job, pin_lease, pin_lease_target, remote_pin},
+        entities::{object, object_version},
         object_version::BucketVersioningState,
-        pinning::{ledger, quota},
     },
 };
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
@@ -51,7 +45,6 @@ struct AddedFile {
 struct NodeState {
     files: BTreeMap<String, Vec<u8>>,
     adds: Vec<AddedFile>,
-    pins: BTreeSet<String>,
 }
 
 struct HttpNode {
@@ -138,9 +131,9 @@ impl HttpNode {
                         "/api/v0/add" => {
                             let mut expected = vec![
                                 ("cid-version", "1"),
-                                ("pin", "false"),
+                                ("pin", if target { "true" } else { "false" }),
                                 ("wrap-with-directory", "false"),
-                                ("progress", "true"),
+                                ("progress", if target { "true" } else { "false" }),
                             ];
                             if target {
                                 expected.extend([
@@ -172,42 +165,19 @@ impl HttpNode {
                         }
                         "/api/v0/pin/add" => {
                             let cid = canonical_resource_cid(&args["arg"]).unwrap();
-                            let mut expected = vec![("arg", args["arg"].as_str())];
-                            if target {
-                                expected.extend([("recursive", "true"), ("progress", "false")]);
-                            }
-                            assert_query(&args, &expected);
+                            assert!(!target, "the upload itself pins the remote content");
+                            assert_query(&args, &[("arg", args["arg"].as_str())]);
                             assert!(node.files.contains_key(&cid), "cannot pin bytes never uploaded");
-                            node.pins.insert(cid.clone());
                             serde_json::json!({"Pins":[cid]})
-                        }
-                        "/api/v0/pin/ls" => {
-                            assert!(target);
-                            let cid = canonical_resource_cid(&args["arg"]).unwrap();
-                            assert_query(&args, &[
-                                ("arg", cid.as_str()), ("stream", "false"), ("names", "false"),
-                                ("type", "all"), ("offline", "true"),
-                            ]);
-                            assert!(node.pins.contains(&cid), "no invented recursive evidence");
-                            serde_json::json!({"Keys":{(cid):{"Type":"recursive"}}})
                         }
                         "/api/v0/files/stat" => {
                             let path = &args["arg"];
                             let cid = canonical_resource_cid(path.strip_prefix("/ipfs/").unwrap()).unwrap();
-                            let mut expected = vec![("arg", path.as_str())];
-                            if target {
-                                expected.extend([("with-local", "true"), ("offline", "true")]);
-                                assert!(node.pins.contains(&cid));
-                            }
-                            assert_query(&args, &expected);
+                            assert!(!target);
+                            assert_query(&args, &[("arg", path.as_str())]);
                             let bytes = node.files.get(&cid).expect("stat must inspect actual stored bytes");
                             assert_eq!(raw_cid(bytes).to_string(), cid);
                             serde_json::json!({"Hash":cid,"Type":"file","Size":bytes.len(),"WithLocality":true,"Local":true})
-                        }
-                        "/api/v0/id" => {
-                            assert!(target);
-                            assert_query(&args, &[("peerid-base", "b58mh")]);
-                            serde_json::json!({"ID":"QmYwAPJzv5CZsnAzt8auVTL7VYhESWDFoCPTqCkiP6fKGE"})
                         }
                         endpoint => panic!("unexpected RPC, including forbidden cleanup/root work: {endpoint}"),
                     };
@@ -298,14 +268,6 @@ impl Harness {
         // IpfsRpcProvider. No custom registry or replacement PinningProvider.
         let state = AppState::new(&config).await.unwrap();
         let provider = state.pinning.effective_config().providers[0].name.clone();
-        assert_eq!(
-            state
-                .pinning
-                .provider(&provider)
-                .unwrap()
-                .invocation_route(),
-            ("kubo", "upload")
-        );
         store::bucket::create(state.store.db(), BUCKET, Some("test"))
             .await
             .unwrap();
@@ -412,11 +374,9 @@ impl Harness {
                 .unwrap()
                 .is_empty()
         );
-        assert!(
-            ledger::submission::observations(self.state.store.db(), &self.provider)
-                .await
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            support::pin_rows::refs(self.state.store.db()).await.len(),
+            target_count
         );
         let cancellation = CancellationToken::new();
         let worker = self
@@ -425,19 +385,8 @@ impl Harness {
             .start(self.state.store.clone(), cancellation.clone());
         let result = tokio::time::timeout(Duration::from_secs(15), async {
             loop {
-                let targets = pin_lease_target::Entity::find()
-                    .all(self.state.store.db())
-                    .await
-                    .unwrap();
-                let observations =
-                    ledger::submission::observations(self.state.store.db(), &self.provider)
-                        .await
-                        .unwrap();
-                if targets.len() == target_count
-                    && targets.iter().all(|target| target.state == "pinned")
-                    && observations.len() == resource_count
-                    && observations.iter().all(|row| row.outcome == "matched")
-                {
+                let rows = support::pin_rows::resources(self.state.store.db()).await;
+                if rows.len() == resource_count && rows.iter().all(|r| r.status == "accepted") {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -446,122 +395,34 @@ impl Harness {
         .await;
         cancellation.cancel();
         worker.shutdown(Duration::from_secs(3)).await;
-        result.expect("actual registered RPC worker did not reach pinned + matched ledger within bounded budget");
+        result.expect("actual registered RPC worker did not reach accepted resource handles within bounded budget");
     }
 
     async fn assert_resources(&self, expected: &[(String, i64, usize)]) {
         let db = self.state.store.db();
-        let identity = self
-            .state
-            .pinning
-            .provider_identity(&self.provider)
-            .unwrap();
-        let remotes = remote_pin::Entity::find().all(db).await.unwrap();
-        assert_eq!(remotes.len(), expected.len());
-        let targets = pin_lease_target::Entity::find().all(db).await.unwrap();
+        let resources = support::pin_rows::resources(db).await;
+        let refs = support::pin_rows::refs(db).await;
+        assert_eq!(resources.len(), expected.len());
         assert_eq!(
-            targets.len(),
+            refs.len(),
             expected.iter().map(|(_, _, refs)| refs).sum::<usize>()
         );
-        let observations = ledger::submission::observations(db, &self.provider)
-            .await
-            .unwrap();
-        assert_eq!(observations.len(), expected.len());
-        for (cid, size, refs) in expected {
-            let remote = remotes.iter().find(|remote| &remote.cid == cid).unwrap();
-            assert_eq!(remote.provider, self.provider);
-            assert_eq!((remote.status.as_str(), remote.cid_size), ("pinned", *size));
-            let references: Vec<_> = targets.iter().filter(|target| &target.cid == cid).collect();
-            assert_eq!(references.len(), *refs);
+        for (cid, size, owners) in expected {
+            let row = resources.iter().find(|r| &r.cid == cid).unwrap();
+            assert_eq!((&row.provider, row.logical_size), (&self.provider, *size));
             assert_eq!(
-                references
-                    .iter()
-                    .map(|target| &target.lease_id)
+                row.handle.as_deref(),
+                Some(format!("rpc-pin:kubo:{cid}").as_str())
+            );
+            assert_eq!(
+                refs.iter()
+                    .filter(|r| &r.cid == cid && r.provider == self.provider)
+                    .map(|r| &r.owner_object_id)
                     .collect::<BTreeSet<_>>()
                     .len(),
-                *refs
-            );
-            for target in references {
-                assert_eq!(
-                    (
-                        target.provider.as_str(),
-                        target.state.as_str(),
-                        target.logical_size
-                    ),
-                    (self.provider.as_str(), "pinned", *size)
-                );
-                assert_eq!(
-                    pin_lease::Entity::find_by_id(&target.lease_id)
-                        .one(db)
-                        .await
-                        .unwrap()
-                        .unwrap()
-                        .state,
-                    "active"
-                );
-            }
-            let row = observations
-                .iter()
-                .find(|row| &row.expected_cid == cid)
-                .unwrap();
-            assert_eq!(
-                (row.effect.as_str(), row.outcome.as_str(), row.submit_call),
-                ("observed", "matched", 1)
-            );
-            assert!(!row.needs_attention);
-            assert!(row.safe_error.is_none());
-            assert!(row.observed_at.is_some());
-            let route: ProviderRouteSnapshot = serde_json::from_str(&row.route).unwrap();
-            assert_eq!(route, identity.route_snapshot());
-            assert_eq!(route.resource_type(), RemoteResourceType::RpcPin);
-            assert_eq!(route.cleanup, CleanupMode::Managed);
-            let resources: Vec<ledger::submission::ResourceEvidence> =
-                serde_json::from_str(&row.resources).unwrap();
-            assert_eq!(resources.len(), 1);
-            let resource = &resources[0];
-            assert_eq!(resource.resource.resource_type, RemoteResourceType::RpcPin);
-            assert_eq!(
-                resource.resource.status,
-                ObservedResourceStatus::RecursiveVerified
-            );
-            assert_eq!(resource.resource.ownership, Ownership::Unknown);
-            assert_eq!(resource.resource.cid, *cid);
-            assert_eq!(
-                remote.request_id.as_deref(),
-                Some(resource.resource.request_id.as_str())
-            );
-            let key = resource.key.as_ref().unwrap();
-            assert_eq!(
-                (&key.backend, &key.scope, &key.resource_id),
-                (&route.backend, &route.scope, cid)
-            );
-            assert_eq!(key.resource_type, RemoteResourceType::RpcPin);
-            let evidence = ledger::get(db, &self.provider, cid).await.unwrap().unwrap();
-            assert_eq!(
-                (evidence.ownership.as_str(), evidence.effect.as_str()),
-                ("unknown", "confirmed")
-            );
-            assert!(evidence.remote_pinned_at.is_some());
-            assert!(
-                ledger::cleanup_allowed(db, &self.provider, cid)
-                    .await
-                    .unwrap()
+                *owners
             );
         }
-        let usage = quota::read_usage(db, &self.provider)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            (usage.reserved_bytes, usage.reserved_pins),
-            (
-                expected.iter().map(|(_, size, _)| size).sum::<i64>(),
-                expected.len() as i64
-            )
-        );
-
-        // Independent wire evidence, not job counts: one streamed add + exact
-        // recursive pin and stable/offline verification for each unique CID.
         let requests = self.target.server.received_requests().await.unwrap();
         for request in &requests {
             // Metadata is checked separately from object bytes: plain content is
@@ -583,16 +444,7 @@ impl Harness {
                 *counts.entry(request.url.path()).or_insert(0usize) += 1;
                 counts
             });
-        assert_eq!(
-            counts,
-            BTreeMap::from([
-                ("/api/v0/add", expected.len()),
-                ("/api/v0/pin/add", expected.len()),
-                ("/api/v0/pin/ls", expected.len() * 2),
-                ("/api/v0/files/stat", expected.len()),
-                ("/api/v0/id", expected.len() * 2),
-            ])
-        );
+        assert_eq!(counts, BTreeMap::from([("/api/v0/add", expected.len()),]));
         let adds = self.target.added();
         assert_eq!(adds.len(), expected.len());
         for added in &adds {
@@ -761,7 +613,7 @@ async fn sigv4_put_shared_aliases_and_sse_c_transfer_actual_stored_ciphertext() 
 }
 
 #[tokio::test]
-async fn sigv4_mpu_complete_and_zip_entry_reach_registered_worker_and_durable_ledger() {
+async fn sigv4_mpu_complete_and_zip_entry_store_acknowledged_remote_handles() {
     let harness = Harness::start().await;
     let body = b"short final multipart bytes".to_vec();
     let created = harness
@@ -803,10 +655,8 @@ async fn sigv4_mpu_complete_and_zip_entry_reach_registered_worker_and_durable_le
             .is_empty()
     );
     assert!(
-        pin_lease_target::Entity::find()
-            .all(harness.state.store.db())
+        support::pin_rows::refs(harness.state.store.db())
             .await
-            .unwrap()
             .is_empty(),
         "parts must not publish remote pin intents"
     );
@@ -908,25 +758,5 @@ async fn sigv4_mpu_complete_and_zip_entry_reach_registered_worker_and_durable_le
             .await;
     }
 
-    // Terminal jobs are queue machinery, not ownership of the RPC evidence.
-    let before = ledger::submission::observations(harness.state.store.db(), &harness.provider)
-        .await
-        .unwrap();
-    let deleted = pin_job::Entity::delete_many()
-        .filter(pin_job::Column::State.eq("done"))
-        .exec(harness.state.store.db())
-        .await
-        .unwrap();
-    assert!(
-        deleted.rows_affected > 0,
-        "durability proof must delete actual terminal jobs"
-    );
-    let after = ledger::submission::observations(harness.state.store.db(), &harness.provider)
-        .await
-        .unwrap();
-    assert_eq!(
-        after, before,
-        "terminal job deletion erased independent submission evidence"
-    );
     harness.gateway.shutdown().await;
 }

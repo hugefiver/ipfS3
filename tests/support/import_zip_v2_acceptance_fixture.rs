@@ -11,16 +11,15 @@ use ipfs_s3_gateway::{
     },
     state::AppState,
     store::{
-        entities::{
-            object, object_version, pin_job, pin_lease, pin_lease_target, pin_provider_usage,
-            remote_pin_ledger,
-        },
+        entities::{object, object_version},
         zip::{execution, import_intake},
     },
     zip::options::{ZipTargets, ZipV2Options},
 };
 use sea_orm::{ConnectionTrait, EntityTrait, PaginatorTrait, Statement};
 use sha2::{Digest, Sha256};
+
+use crate::support::pin_rows;
 
 pub async fn historical_empty(
     state: &AppState,
@@ -127,17 +126,11 @@ pub async fn assert_no_publication_or_charge(state: &AppState) {
     let counts = [
         object::Entity::find().count(db).await.unwrap(),
         object_version::Entity::find().count(db).await.unwrap(),
-        pin_lease::Entity::find().count(db).await.unwrap(),
-        pin_lease_target::Entity::find().count(db).await.unwrap(),
-        pin_job::Entity::find().count(db).await.unwrap(),
-        remote_pin_ledger::Entity::find().count(db).await.unwrap(),
+        pin_rows::count(db, "pin_refs").await,
+        pin_rows::count(db, "pin_resources").await,
     ];
     assert_eq!(
-        counts, [0; 6],
+        counts, [0; 4],
         "rejection/intake must not publish or allocate remote work"
     );
-    for usage in pin_provider_usage::Entity::find().all(db).await.unwrap() {
-        assert_eq!(usage.reserved_bytes, 0);
-        assert_eq!(usage.reserved_pins, 0);
-    }
 }

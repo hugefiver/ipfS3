@@ -24,9 +24,7 @@ use crate::{
     state::AppState,
     store::{
         Store,
-        entities::{
-            import_destination, import_job, import_job_result, import_job_target, object, pin_lease,
-        },
+        entities::{import_destination, import_job, import_job_result, import_job_target, object},
         import::{
             jobs::{self, NewImportJob},
             ownership,
@@ -984,10 +982,7 @@ impl UnpublishedAdmission {
                 .iter()
                 .all(|entry| entry.version_row_id.is_none())
         );
-        use crate::store::entities::{
-            object_version, pin_extension_decision, pin_job, pin_lease_target, pin_provider_usage,
-            remote_pin, remote_pin_ledger,
-        };
+        use crate::store::entities::object_version;
         let counts = [
             object::Entity::find()
                 .count(state.store.db())
@@ -1001,38 +996,11 @@ impl UnpublishedAdmission {
                 .count(state.store.db())
                 .await
                 .unwrap(),
-            pin_extension_decision::Entity::find()
-                .count(state.store.db())
-                .await
-                .unwrap(),
-            pin_lease::Entity::find()
-                .count(state.store.db())
-                .await
-                .unwrap(),
-            pin_lease_target::Entity::find()
-                .count(state.store.db())
-                .await
-                .unwrap(),
-            pin_job::Entity::find()
-                .count(state.store.db())
-                .await
-                .unwrap(),
-            remote_pin::Entity::find()
-                .count(state.store.db())
-                .await
-                .unwrap(),
-            remote_pin_ledger::Entity::find()
-                .count(state.store.db())
-                .await
-                .unwrap(),
-            pin_provider_usage::Entity::find()
-                .count(state.store.db())
-                .await
-                .unwrap(),
         ];
+        assert_eq!(counts, [0; 3], "no published objects, versions, or results");
         assert_eq!(
-            counts, [0; 10],
-            "no published objects/versions/results/decisions, leases/targets/jobs, remote or quota rows"
+            crate::import::test_support::pin_counts(state.store.db()).await,
+            (0, 0)
         );
         Self { snapshot, proof }
     }
@@ -1324,7 +1292,7 @@ async fn successful_import_publishes_archive_entry_results_and_progress_atomical
     );
     assert_eq!(rows[0].cid.as_deref(), Some(ARCHIVE_CID));
     assert_eq!(rows[1].cid.as_deref(), Some(ENTRY_CID));
-    use crate::store::entities::{object_version, pin_job, pin_lease_target, pin_provider_usage};
+    use crate::store::entities::object_version;
     let versions = object_version::Entity::find()
         .all(state.store.db())
         .await
@@ -1352,32 +1320,8 @@ async fn successful_import_publishes_archive_entry_results_and_progress_atomical
         }
     }
     assert_eq!(
-        pin_lease::Entity::find()
-            .count(state.store.db())
-            .await
-            .unwrap(),
-        0
-    );
-    assert_eq!(
-        pin_lease_target::Entity::find()
-            .count(state.store.db())
-            .await
-            .unwrap(),
-        0
-    );
-    assert_eq!(
-        pin_job::Entity::find()
-            .count(state.store.db())
-            .await
-            .unwrap(),
-        0
-    );
-    assert_eq!(
-        pin_provider_usage::Entity::find()
-            .count(state.store.db())
-            .await
-            .unwrap(),
-        0
+        crate::import::test_support::pin_counts(state.store.db()).await,
+        (0, 0)
     );
     let requests = server.received_requests().await.unwrap();
     assert!(requests.iter().all(|request| matches!(
@@ -2054,11 +1998,8 @@ async fn midstream_kubo_cat_failure_is_retryable_without_publication() {
         0
     );
     assert_eq!(
-        pin_lease::Entity::find()
-            .count(state.store.db())
-            .await
-            .unwrap(),
-        0
+        crate::import::test_support::pin_counts(state.store.db()).await,
+        (0, 0)
     );
     assert_eq!(
         import_job_target::Entity::find()

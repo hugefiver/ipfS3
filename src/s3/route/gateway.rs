@@ -11,6 +11,7 @@ use crate::{
 };
 
 pub struct GatewayRoute {
+    state: Arc<AppState>,
     imports: ImportObjectRoute,
     decompress: DecompressZipRoute,
 }
@@ -27,7 +28,8 @@ impl GatewayRoute {
     ) -> Self {
         Self {
             imports: ImportObjectRoute::with_root_default(state.clone(), coordinator, root_default),
-            decompress: DecompressZipRoute::new(state),
+            decompress: DecompressZipRoute::new(state.clone()),
+            state,
         }
     }
 }
@@ -41,11 +43,15 @@ impl S3Route for GatewayRoute {
         headers: &HeaderMap,
         extensions: &mut http::Extensions,
     ) -> bool {
-        self.imports.is_match(method, uri, headers, extensions)
+        crate::s3::ops::tagging::status::matches(uri)
+            || self.imports.is_match(method, uri, headers, extensions)
             || self.decompress.is_match(method, uri, headers, extensions)
     }
 
     async fn call(&self, mut req: S3Request<Body>) -> S3Result<S3Response<Body>> {
+        if crate::s3::ops::tagging::status::matches(&req.uri) {
+            return crate::s3::ops::tagging::status::get(&self.state, req).await;
+        }
         if self
             .imports
             .is_match(&req.method, &req.uri, &req.headers, &mut req.extensions)

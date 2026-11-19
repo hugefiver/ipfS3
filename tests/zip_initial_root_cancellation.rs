@@ -1,4 +1,6 @@
 //! Actual initial ZIP v2 builders canceled while the root recursive pin is inflight.
+#[path = "support/pin_rows.rs"]
+mod pin_rows;
 #[allow(dead_code)]
 mod support;
 
@@ -56,6 +58,7 @@ async fn rig(job_timeout_secs: u64) -> Rig {
         database_url = "sqlite::memory:"
         [decompress_zip]
         unixfs_directory_root = true
+        auto_pin_outputs = true
         [[pinning.providers]]
         name = "alpha"
         kind = "noop"
@@ -264,26 +267,9 @@ async fn assert_retained_only(
             "only the pre-cancellation heartbeat may extend the lease; cancellation must not release it"
         );
     }
-    for table in [
-        "objects",
-        "object_versions",
-        "pin_jobs",
-        "remote_pins",
-        "pin_leases",
-    ] {
-        let row = rig
-            .state
-            .store
-            .db()
-            .query_one(Statement::from_string(
-                rig.state.store.db().get_database_backend(),
-                format!("SELECT COUNT(*) AS total FROM {table}"),
-            ))
-            .await
-            .unwrap()
-            .unwrap();
+    for table in ["objects", "object_versions", "pin_refs", "pin_resources"] {
         assert_eq!(
-            row.try_get::<i64>("", "total").unwrap(),
+            pin_rows::count(rig.state.store.db(), table).await,
             0,
             "canceled actor must not publish {table}"
         );

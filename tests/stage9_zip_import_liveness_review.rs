@@ -1,6 +1,8 @@
-//! Published source conserves its captured authority, quota and replay receipt.
+//! Published source preserves its captured authority, pin references and replay receipt.
 #[path = "support/r25_review_wire_fixtures_historical.rs"]
 mod historical;
+#[path = "support/pin_rows.rs"]
+mod pin_rows;
 #[allow(dead_code)]
 #[path = "support/r25_review_wire_fixtures_import.rs"]
 mod r25_fixture;
@@ -37,7 +39,7 @@ async fn sealed_receipt(harness: &ImportHarness, id: &str) -> String {
 }
 
 #[tokio::test]
-async fn published_original_source_has_one_version_manual_group_and_conserved_quota_on_replay() {
+async fn published_original_source_has_one_version_and_preserves_its_manual_reference_on_replay() {
     let gate = Arc::new(ImportPublicationBlockControl::new());
     let harness = start_import_harness(ImportHarnessConfig {
         execution_observer: Some(gate.clone()),
@@ -111,10 +113,6 @@ async fn published_original_source_has_one_version_manual_group_and_conserved_qu
     for (table, expected) in [
         ("objects", 1),
         ("object_versions", 1),
-        ("pin_leases", 1),
-        ("pin_lease_targets", 1),
-        ("pin_jobs", 1),
-        ("remote_pins", 1),
         ("standard_mutation_leases", 0),
     ] {
         let row = db
@@ -127,20 +125,13 @@ async fn published_original_source_has_one_version_manual_group_and_conserved_qu
             .unwrap();
         assert_eq!(row.try_get::<i64>("", "n").unwrap(), expected, "{table}");
     }
-    let usage = db
-        .query_one(Statement::from_string(
-            DatabaseBackend::Sqlite,
-            "SELECT COUNT(*) AS n,SUM(reserved_bytes) AS bytes,SUM(reserved_pins) AS pins FROM pin_provider_usage".to_owned(),
-        ))
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(usage.try_get::<i64>("", "n").unwrap(), 1);
-    assert_eq!(
-        usage.try_get::<i64>("", "bytes").unwrap(),
-        archive.len() as i64
-    );
-    assert_eq!(usage.try_get::<i64>("", "pins").unwrap(), 1);
+    let refs = pin_rows::refs(db).await;
+    let resources = pin_rows::resources(db).await;
+    assert_eq!(refs.len(), 1);
+    assert_eq!(resources.len(), 1);
+    assert_eq!(resources[0].provider, refs[0].provider);
+    assert_eq!(resources[0].cid, refs[0].cid);
+    assert_eq!(resources[0].logical_size, archive.len() as i64);
     assert_eq!(harness.source.requests().len(), 1);
     assert_eq!(harness.kubo_call_count("/api/v0/add").await, 1);
     assert_eq!(harness.kubo_call_count("/api/v0/pin/add").await, 1);
@@ -156,18 +147,8 @@ async fn published_original_source_has_one_version_manual_group_and_conserved_qu
     assert_eq!(replay, receipt);
     assert_eq!(harness.kubo_total_call_count().await, io);
     assert_eq!(harness.source.requests().len(), 1);
-    let replay_usage = db
-        .query_one(Statement::from_string(
-            DatabaseBackend::Sqlite,
-            "SELECT SUM(reserved_bytes) AS bytes,SUM(reserved_pins) AS pins FROM pin_provider_usage".to_owned(),
-        ))
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        replay_usage.try_get::<i64>("", "bytes").unwrap(),
-        archive.len() as i64
-    );
-    assert_eq!(replay_usage.try_get::<i64>("", "pins").unwrap(), 1);
+    assert_eq!(pin_rows::refs(db).await, refs);
+    assert_eq!(pin_rows::resources(db).await, resources);
+    assert_eq!(pin_rows::count(db, "object_versions").await, 1);
     harness.shutdown().await;
 }

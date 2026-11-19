@@ -1,24 +1,25 @@
-use ipfs_s3_gateway::pinning;
+use ipfs_s3_gateway::{crypto, pinning};
+use pinning::{
+    cluster::{
+        ClusterAuth, ClusterPinset,
+        provider::{
+            ClusterProtocol, ClusterProvider, ClusterProviderOptions, ClusterSource,
+            ClusterStrategy,
+        },
+    },
+    provider::SubmitPin,
+};
+
 #[path = "../src/pinning/cluster/mod.rs"]
 #[allow(dead_code, unused_imports)]
 mod cluster;
-
-use cluster::provider::{
-    ClusterProtocol, ClusterProvider, ClusterProviderOptions, ClusterSource, ClusterStrategy,
-};
-use cluster::{
-    ClusterAuth, ClusterNetworkPolicy, ClusterPinset, ClusterReplicaVerifier, ClusterRestProfile,
-    ReplicaOutcome, RestLimits,
-};
-use pinning::provider::SubmitPin;
 use std::{collections::BTreeMap, time::Duration};
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
-    matchers::{method, path, query_param},
+    matchers::{method, path},
 };
 
 const CID: &str = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
-const PEER: &str = "QmYwAPJzv5CZsnAzt8auVTL7VYhESWDFoCPTqCkiP6fKGE";
 
 #[test]
 fn public_dns_endpoints_are_accepted_without_constructor_network_io() {
@@ -42,40 +43,22 @@ fn public_dns_endpoints_are_accepted_without_constructor_network_io() {
 }
 
 #[test]
-fn legacy_profile_constructor_cannot_silently_authorize_private_networks() {
+fn provider_constructor_requires_opt_in_for_private_endpoints() {
     for endpoint in [
         "http://127.0.0.1:9094",
         "https://localhost:9094",
         "https://169.254.169.254",
     ] {
         assert!(
-            ClusterRestProfile::new(
-                ClusterPinset::new("cluster", "scope").unwrap(),
-                Some(endpoint),
-                None,
-                1,
-                RestLimits::default()
-            )
+            ClusterProvider::new(ClusterProviderOptions {
+                rest_endpoint: endpoint.into(),
+                pinset: ClusterPinset::new("cluster", "scope").unwrap(),
+                ..ClusterProviderOptions::default()
+            })
             .is_err(),
-            "default profile bypassed policy: {endpoint}"
+            "default provider bypassed network policy: {endpoint}"
         );
     }
-}
-
-async fn proof_mocks(server: &MockServer) {
-    let created = (chrono::Utc::now() - chrono::Duration::seconds(60)).to_rfc3339();
-    let timestamp = (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
-    Mock::given(method("GET"))
-        .and(path("/version"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(serde_json::json!({"version":"1.1.6"})),
-        )
-        .mount(server)
-        .await;
-    Mock::given(method("GET")).and(path(format!("/allocations/{CID}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"cid":CID,"allocations":[PEER],"timestamp":created,"replication_factor_min":1,"replication_factor_max":1}))).mount(server).await;
-    Mock::given(method("GET")).and(path(format!("/pins/{CID}"))).and(query_param("local", "false"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"cid":CID,"allocations":[PEER],"created":created,"peer_map":{PEER:{"status":"pinned","timestamp":timestamp,"error":""}}}))).mount(server).await;
 }
 
 #[tokio::test]
@@ -129,23 +112,7 @@ async fn network_proxy_child_entry() {
     );
     let source = MockServer::start().await;
     let target = MockServer::start().await;
-    proof_mocks(&target).await;
-    let profile = ClusterRestProfile::new_with_network_policy(
-        ClusterPinset::new("cluster", "network-contract").unwrap(),
-        Some(&target.uri()),
-        Some(ClusterAuth::Bearer("rest-only".into())),
-        1,
-        RestLimits::default(),
-        ClusterNetworkPolicy::AllowPrivate,
-    )
-    .unwrap();
-    let verifier = ClusterReplicaVerifier::new(profile).unwrap();
-    let proof = verifier.observe(CID).await;
-    assert_eq!(
-        proof.outcome(),
-        ReplicaOutcome::Complete,
-        "verifier followed ambient proxy: {proof:?}"
-    );
+    let rest = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/v0/files/stat"))
         .respond_with(
@@ -170,10 +137,10 @@ async fn network_proxy_child_entry() {
         .expect(1)
         .mount(&target)
         .await;
-    let provider = ClusterProvider::new(ClusterProviderOptions {
+    let options = ClusterProviderOptions {
         protocol: ClusterProtocol::Proxy,
         strategy: ClusterStrategy::Upload,
-        rest_endpoint: target.uri(),
+        rest_endpoint: rest.uri(),
         proxy_endpoint: Some(target.uri()),
         rest_auth: Some(ClusterAuth::Bearer("rest-only".into())),
         proxy_auth: Some(ClusterAuth::Bearer("proxy-only".into())),
@@ -184,27 +151,38 @@ async fn network_proxy_child_entry() {
         pinset: ClusterPinset::new("cluster", "network-contract").unwrap(),
         allow_private_network: true,
         ..ClusterProviderOptions::default()
+    };
+    let request = SubmitPin {
+        cid: CID.into(),
+        name: "opaque".into(),
+        metadata: BTreeMap::new(),
+    };
+    let proxy = ClusterProvider::new(options.clone()).unwrap();
+    assert_eq!(proxy.submit(request.clone()).await.unwrap().request_id, CID);
+    let writes = target.received_requests().await.unwrap();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].headers["authorization"], "Bearer proxy-only");
+    assert!(rest.received_requests().await.unwrap().is_empty());
+
+    Mock::given(method("POST"))
+        .and(path(format!("/pins/{CID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"cid":CID})))
+        .expect(1)
+        .mount(&rest)
+        .await;
+    let native = ClusterProvider::new(ClusterProviderOptions {
+        protocol: ClusterProtocol::Rest,
+        strategy: ClusterStrategy::Cid,
+        proxy_endpoint: None,
+        proxy_auth: None,
+        source: None,
+        ..options
     })
     .unwrap();
-    let write = provider
-        .submit_observed(SubmitPin {
-            cid: CID.into(),
-            name: "opaque".into(),
-            metadata: BTreeMap::new(),
-        })
-        .await;
-    assert!(write.result.is_ok(), "{write:?}");
-    assert_eq!(write.replication_outcome(), ReplicaOutcome::Complete);
-    for request in target.received_requests().await.unwrap() {
-        assert_eq!(
-            request.headers["authorization"],
-            if request.method == "POST" {
-                "Bearer proxy-only"
-            } else {
-                "Bearer rest-only"
-            }
-        );
-    }
+    assert_eq!(native.submit(request).await.unwrap().request_id, CID);
+    let writes = rest.received_requests().await.unwrap();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].headers["authorization"], "Bearer rest-only");
     assert!(
         source
             .received_requests()

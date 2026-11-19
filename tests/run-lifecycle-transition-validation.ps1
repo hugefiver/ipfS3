@@ -39,7 +39,7 @@ function Set-RunEnv([string]$Name, [string]$Value) {
     [Environment]::SetEnvironmentVariable($Name, $Value, 'Process')
 }
 function Invoke-Step {
-    param([string]$Name, [string]$File, [string[]]$Arguments, [switch]$Tests, [int]$ExpectedIgnored=0)
+    param([string]$Name, [string]$File, [string[]]$Arguments, [switch]$Tests, [Nullable[int]]$ExpectedIgnored)
     $info = [Diagnostics.ProcessStartInfo]::new($File)
     $info.WorkingDirectory = $RepoRoot
     $info.UseShellExecute = $false
@@ -61,7 +61,7 @@ function Invoke-Step {
         foreach ($m in $matches) {
             $counts = @{passed=[int]$m.Groups[1].Value; failed=[int]$m.Groups[2].Value; ignored=[int]$m.Groups[3].Value; filtered=[int]$m.Groups[5].Value}
             $step.counts += $counts
-            if ($counts.passed -le 0 -or $counts.failed -ne 0 -or $counts.ignored -ne $ExpectedIgnored) { throw "$Name unexpected test counts" }
+            if ($counts.passed -le 0 -or $counts.failed -ne 0 -or ($null -ne $ExpectedIgnored -and $counts.ignored -ne $ExpectedIgnored)) { throw "$Name unexpected test counts" }
         }
     }
     $step.status = 'PASS'
@@ -93,7 +93,7 @@ function Start-Owned([string]$Name, [string]$File, [string[]]$Arguments) {
     $p = [Diagnostics.Process]::Start($info)
     $script:Children.Add(@{name=$Name; process=$p; stdout=$p.StandardOutput.ReadToEndAsync(); stderr=$p.StandardError.ReadToEndAsync()})
 }
-function Cargo-Test([string]$Target, [string]$Filter='', [switch]$Ignored, [switch]$IncludeIgnored, [int]$ExpectedIgnored=0) {
+function Cargo-Test([string]$Target, [string]$Filter='', [switch]$Ignored, [switch]$IncludeIgnored, [Nullable[int]]$ExpectedIgnored) {
     if ($script:ResumePending) {
         if ($Target -ceq $ResumeFromTest -or $Filter -ceq $ResumeFromTest) { $script:ResumePending = $false }
         else { $summary.steps += @{name=$Target; status='NOT RUN'; reason='explicit resume'; exit_code=$null}; return }
@@ -104,6 +104,7 @@ function Cargo-Test([string]$Target, [string]$Filter='', [switch]$Ignored, [swit
     if ($Ignored) { $arguments += '--ignored' }
     if ($IncludeIgnored) { $arguments += '--include-ignored' }
     if ($Filter) { $arguments += '--exact' }
+    if ($Ignored -or $IncludeIgnored) { $ExpectedIgnored = 0 }
     $name = if ($Filter) {"$Target-$Filter"} else {$Target}
     $null = Invoke-Step $name cargo $arguments -Tests -ExpectedIgnored $ExpectedIgnored
     if ($Filter -eq 'real_lifecycle_transition_integrity_empty_and_multiblock_cross_range') {

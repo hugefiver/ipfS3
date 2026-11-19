@@ -170,27 +170,66 @@ async fn stage1_slow_active_upload_outlives_idle_and_succeeds() {
 }
 
 #[tokio::test]
-async fn stage1_malformed_conflicting_and_incomplete_pages_never_prove_absence() {
+async fn duplicate_upload_ack_does_not_authorize_file_deletion() {
+    let source = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v0/cat"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("data"))
+        .mount(&source)
+        .await;
+    let target = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v3/files"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {"id": "existing", "cid": "cid", "is_duplicate": true},
+        })))
+        .expect(1)
+        .mount(&target)
+        .await;
+    let provider = upload_client(target.uri(), source.uri());
+    let ack = provider.submit(request()).await.unwrap();
+    assert_eq!(ack.status, RemotePinStatus::Pinned);
+    provider.unpin(&ack.request_id).await.unwrap();
+    assert_eq!(target.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn queue_cancel_requires_complete_pages_and_a_unique_file_match() {
     for data in [
         json!({"files":{}}),
         json!({"files":[],"next_page_token":"a","nextPageToken":"b"}),
         json!({"files":[],"nextPageToken":12}),
-        json!({"files":[],"count":2}),
+        json!({"files":[{"id":"found","cid":"cid","keyvalues":{"gateway_job_id":"job"}}],"count":2}),
+        json!({"files":[
+            {"id":"found","cid":"cid","keyvalues":{"gateway_job_id":"job"}},
+            {"id":"also-found","cid":"cid","keyvalues":{"gateway_job_id":"job"}},
+        ]}),
     ] {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":data})))
             .mount(&server)
             .await;
-        let mut client = build_pinata(
+        Mock::given(method("DELETE"))
+            .and(path("/v3/files/public/pin_by_cid/queue-id"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = build_pinata(
             "pinata".into(),
             super::super::psa::test_token("test-token"),
             Some(format!("{}/v3", server.uri())),
         );
-        client.strategy = PinataStrategy::Upload;
-        assert!(
-            client.find(FindPin::for_job("cid", "job")).await.is_err(),
-            "malformed/incomplete page must not be absent"
+        let handle = encode_queue_handle(
+            "queue-id",
+            "cid",
+            &BTreeMap::from([("gateway_job_id".into(), "job".into())]),
         );
+        assert_eq!(
+            client.unpin(&handle).await.unwrap_err().class,
+            ProviderErrorClass::Protocol
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
     }
 }

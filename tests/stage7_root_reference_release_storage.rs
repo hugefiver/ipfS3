@@ -55,8 +55,6 @@ async fn prepared(db: &DatabaseConnection) -> zip::RootClaim {
     claim
 }
 
-// The management action owns authorization, exact CAS and its receipt. Storage
-// consumer tests set the marker at that boundary without duplicating the action.
 async fn mark_released(db: &DatabaseConnection) {
     db.execute_unprepared("UPDATE zip_root_references SET logical_released_at='2026-10-13T01:02:03.456789Z' WHERE batch_id='batch' AND revision=1 AND epoch=1 AND node_identity='node-a' AND tier='hot' AND cid='root'").await.unwrap();
 }
@@ -161,49 +159,32 @@ async fn migration_roundtrip(db: &DatabaseConnection) {
     let manager = SchemaManager::new(db);
     Migration.down(&manager).await.unwrap();
     assert_eq!(native_root_rows(db).await, before);
-    assert!(matches!(
-        store::run_migrations(db).await,
-        Err(sea_orm::DbErr::Migration(_))
-    ));
-    Migration.up(&manager).await.unwrap();
-    store::run_migrations(db).await.unwrap();
-    assert_eq!(native_root_rows(db).await, before);
-    let frame = store::pinning::management::native::capture(db)
-        .await
-        .unwrap();
-    frame.validate().unwrap();
-    let root = frame.table("zip_root_references").unwrap();
-    assert_eq!(root.rows[0].get("logical_released_at"), Some(&None));
-    let marker = root
-        .definitions
-        .iter()
-        .find(|column| column.name == "logical_released_at")
-        .unwrap();
-    assert!(marker.nullable);
-    assert_eq!(marker.sqlite_type, "TEXT");
-    assert_eq!(marker.postgres_type, "timestamp with time zone");
-    for name in ["created_at", "updated_at"] {
-        let time = root
-            .definitions
-            .iter()
-            .find(|column| column.name == name)
-            .unwrap();
-        assert!(!time.nullable);
-        assert_eq!(time.sqlite_type, "TIMESTAMP");
-        assert_eq!(time.postgres_type, "timestamp with time zone");
-    }
-    mark_released(db).await;
-    let marked = store::pinning::management::native::capture(db)
-        .await
-        .unwrap();
-    assert!(marked.table("zip_root_references").unwrap().rows[0]["logical_released_at"].is_some());
-    assert!(Migration.down(&manager).await.is_err());
-    assert_eq!(native_root_rows(db).await, before);
     assert!(
-        store::pinning::management::native::capture(db)
+        !manager
+            .has_column("zip_root_references", "logical_released_at")
             .await
             .unwrap()
-            == marked
+    );
+    Migration.up(&manager).await.unwrap();
+    assert_eq!(native_root_rows(db).await, before);
+    let snapshot = zip::snapshot(db, "batch").await.unwrap().unwrap();
+    assert!(snapshot.references[0].logical_released_at.is_none());
+    mark_released(db).await;
+    let marked = zip::snapshot(db, "batch")
+        .await
+        .unwrap()
+        .unwrap()
+        .references;
+    assert!(marked[0].logical_released_at.is_some());
+    assert!(Migration.down(&manager).await.is_err());
+    assert_eq!(native_root_rows(db).await, before);
+    assert_eq!(
+        zip::snapshot(db, "batch")
+            .await
+            .unwrap()
+            .unwrap()
+            .references,
+        marked
     );
 }
 

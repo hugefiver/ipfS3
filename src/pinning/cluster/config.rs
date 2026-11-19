@@ -6,9 +6,9 @@ use anyhow::{anyhow, bail, ensure};
 use serde::Deserialize;
 
 use super::provider::{ClusterProtocol, ClusterProviderOptions, ClusterSource, ClusterStrategy};
-use super::{ClusterAuth, ClusterNetworkPolicy, ClusterPinset, ClusterRestProfile};
+use super::{ClusterAuth, ClusterNetworkPolicy, ClusterPinset};
 use crate::pinning::{identity::ProviderIdentity, ipfs_rpc::validate_env_reference};
-pub use limits::{ClusterTransferConfig, ClusterVerifierConfig};
+pub use limits::ClusterTransferConfig;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -24,13 +24,10 @@ pub struct ClusterProviderConfig {
     /// Main Kubo bytes/DAG only. No alternate source endpoint is accepted.
     #[serde(default)]
     pub source: ClusterCredentialConfig,
-    pub min_replicas: u32,
     #[serde(default)]
     pub allow_private_network: bool,
     #[serde(default)]
     pub transfer_limits: ClusterTransferConfig,
-    #[serde(default)]
-    pub verifier_limits: ClusterVerifierConfig,
     #[serde(default = "stream_channels")]
     pub stream_channels: bool,
 }
@@ -127,8 +124,6 @@ impl ClusterProviderConfig {
                     && self.proxy_auth.username_env.is_none()),
             "native Cluster REST must not configure Proxy options"
         );
-        // The identity reference tracks the write credential. Endpoint/credential
-        // revisions also bind independent verifier/source credentials in the ledger.
         let write_auth = match protocol {
             ClusterProtocol::Proxy => &self.proxy_auth,
             ClusterProtocol::Rest => &self.rest_auth,
@@ -171,22 +166,12 @@ impl ClusterProviderConfig {
             rest_auth: self.rest_auth.resolve(get_env)?,
             source,
             pinset: ClusterPinset::new(&identity.backend, &identity.scope)?,
-            min_replicas: self.min_replicas as usize,
             allow_private_network: self.allow_private_network,
             transfer_limits: self.transfer_limits.validate()?,
-            verifier_limits: self.verifier_limits.validate()?,
             stream_channels: self.stream_channels,
             unixfs: None,
         };
         options.validate()?;
-        ClusterRestProfile::new_with_network_policy(
-            options.pinset.clone(),
-            Some(&options.rest_endpoint),
-            options.rest_auth.clone(),
-            options.min_replicas,
-            options.verifier_limits,
-            policy,
-        )?;
         Ok(options)
     }
 }

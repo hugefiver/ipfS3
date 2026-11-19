@@ -1,4 +1,5 @@
-use super::super::{ClusterAuth, ClusterPinset, RestLimits};
+use super::super::{ClusterAuth, ClusterPinset};
+use reqwest::Url;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,8 +14,8 @@ pub enum ClusterStrategy {
     Car,
 }
 
-/// Explicit UnixFS import parameters for byte upload. Different parameters may
-/// produce another DAG: mismatch is retained, never followed by a CAR retry.
+/// Explicit UnixFS import parameters for byte upload. A different DAG cannot
+/// acknowledge the requested CID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClusterUnixfsOptions {
     pub cid_version: u8,
@@ -65,11 +66,8 @@ pub struct ClusterProviderOptions {
     pub rest_auth: Option<ClusterAuth>,
     pub source: Option<ClusterSource>,
     pub pinset: ClusterPinset,
-    /// Confirmation threshold only. Never sent as replication-min/max.
-    pub min_replicas: usize,
     pub allow_private_network: bool,
     pub transfer_limits: ClusterTransferLimits,
-    pub verifier_limits: RestLimits,
     /// Official add response mode. false uses a bounded JSON array.
     pub stream_channels: bool,
     /// None uses cid-version from the requested spelling, raw leaves for v1,
@@ -90,10 +88,8 @@ impl Default for ClusterProviderOptions {
                 backend: String::new(),
                 scope: String::new(),
             },
-            min_replicas: 1,
             allow_private_network: false,
             transfer_limits: ClusterTransferLimits::default(),
-            verifier_limits: RestLimits::default(),
             stream_channels: true,
             unixfs: None,
         }
@@ -101,52 +97,46 @@ impl Default for ClusterProviderOptions {
 }
 
 impl ClusterProviderOptions {
-    pub(crate) fn validate(&self) -> Result<(), super::ClusterWriteFailure> {
+    pub(crate) fn validate(
+        &self,
+    ) -> Result<(Url, Option<Url>, Option<Url>), super::ClusterWriteFailure> {
         use super::super::{ClusterNetworkPolicy, network};
         use super::{ClusterFailureCode as Code, ClusterWriteFailure as Failure};
+        let invalid = || Failure::new(Code::InvalidConfiguration);
+        ClusterPinset::new(&self.pinset.backend, &self.pinset.scope)?;
         let policy = ClusterNetworkPolicy::from_allow_private_network(self.allow_private_network);
-        let endpoint = |value: &str| {
-            network::endpoint(value, policy).map_err(|_| Failure::new(Code::InvalidConfiguration))
-        };
-        endpoint(&self.rest_endpoint)?;
-        match self.protocol {
-            ClusterProtocol::Proxy => {
-                endpoint(
-                    self.proxy_endpoint
-                        .as_deref()
-                        .ok_or_else(|| Failure::new(Code::InvalidConfiguration))?,
-                )?;
-            }
+        let endpoint = |value: &str| network::endpoint(value, policy).map_err(|_| invalid());
+        let rest = endpoint(&self.rest_endpoint)?;
+        let proxy = match self.protocol {
+            ClusterProtocol::Proxy => Some(endpoint(
+                self.proxy_endpoint.as_deref().ok_or_else(invalid)?,
+            )?),
             ClusterProtocol::Rest if self.proxy_endpoint.is_some() || self.proxy_auth.is_some() => {
-                return Err(Failure::new(Code::InvalidConfiguration));
+                return Err(invalid());
             }
-            _ => {}
+            ClusterProtocol::Rest => None,
+        };
+        let source = self
+            .source
+            .as_ref()
+            .map(|source| endpoint(&source.endpoint))
+            .transpose()?;
+        if self.strategy != ClusterStrategy::Cid && source.is_none() {
+            return Err(invalid());
         }
-        if self.strategy != ClusterStrategy::Cid && self.source.is_none() {
-            return Err(Failure::new(Code::InvalidConfiguration));
-        }
-        if let Some(source) = &self.source {
-            let source = endpoint(&source.endpoint)?;
-            let normalize = |mut url: reqwest::Url| {
-                let path = url
-                    .path()
-                    .trim_end_matches('/')
-                    .trim_end_matches("/api/v0")
-                    .to_owned();
-                url.set_path(&path);
-                url
+        if let Some(source) = &source {
+            let normalize = |url: &Url| {
+                let path = url.path().trim_end_matches('/').trim_end_matches("/api/v0");
+                let mut normalized = url.clone();
+                normalized.set_path(path);
+                normalized
             };
             let source = normalize(source);
-            for target in [
-                Some(self.rest_endpoint.as_str()),
-                self.proxy_endpoint.as_deref(),
-            ]
-            .into_iter()
-            .flatten()
+            if std::iter::once(&rest)
+                .chain(proxy.as_ref())
+                .any(|target| normalize(target) == source)
             {
-                if normalize(endpoint(target)?) == source {
-                    return Err(Failure::new(Code::InvalidConfiguration));
-                }
+                return Err(invalid());
             }
         }
         let limits = self.transfer_limits;
@@ -171,12 +161,10 @@ impl ClusterProviderOptions {
             || limits.max_car_bytes == 0
             || limits.max_dag_metadata_bytes == 0
             || limits.max_dag_metadata_bytes > 256 * 1024 * 1024
-            || self.min_replicas == 0
-            || self.min_replicas > 1024
         {
-            return Err(Failure::new(Code::InvalidConfiguration));
+            return Err(invalid());
         }
-        Ok(())
+        Ok((rest, proxy, source))
     }
 }
 
@@ -186,7 +174,6 @@ impl std::fmt::Debug for ClusterProviderOptions {
             .field("protocol", &self.protocol)
             .field("strategy", &self.strategy)
             .field("pinset", &self.pinset)
-            .field("min_replicas", &self.min_replicas)
             .field("allow_private_network", &self.allow_private_network)
             .finish_non_exhaustive()
     }
@@ -206,15 +193,6 @@ impl ClusterStrategy {
             Self::Cid => "cid",
             Self::Upload => "upload",
             Self::Car => "car",
-        }
-    }
-}
-
-impl ClusterProviderOptions {
-    pub fn confirmation(&self) -> crate::pinning::identity::ConfirmationRequirement {
-        crate::pinning::identity::ConfirmationRequirement::ClusterReplicas {
-            min_replicas: self.min_replicas as u32,
-            max_age_secs: self.verifier_limits.max_observation_age.as_secs() as u32,
         }
     }
 }

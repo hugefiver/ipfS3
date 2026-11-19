@@ -141,7 +141,7 @@ impl HttpNode {
                     "/api/v0/add" => {
                         let progress = args["progress"].as_str();
                         assert!(matches!(progress, "true" | "false"));
-                        let mut expected = vec![("cid-version","1"),("pin","false"),("wrap-with-directory","false"),("progress",progress)];
+                        let mut expected = vec![("cid-version","1"),("pin",if target { "true" } else { "false" }),("wrap-with-directory","false"),("progress",progress)];
                         if target { expected.extend([("raw-leaves","true"),("chunker","size-262144"),("hash","sha2-256")]); }
                         expect_query(&args, &expected);
                         assert_eq!(request.headers["transfer-encoding"], "chunked");

@@ -652,6 +652,7 @@ async fn seed_object(
         version_id: Set(None),
         kind: Set("object".to_owned()),
         object_id: Set(Some(object_id.clone())),
+        pin_decision: Set(None),
         sequence: Set(1),
         is_latest: Set(true),
         lifecycle_age_started_at: Set(now),

@@ -1,13 +1,13 @@
 use super::{
-    IpfsRpcProvider, MAX_OBSERVED_RESOURCES, RpcProfile, RpcResourceStatus,
+    IpfsRpcProvider, RpcProfile,
     body::ResponseBody,
     cid,
     error::{mismatch, protocol},
     streaming::{Progress, Transfer},
-    submit_observation::SubmitEvidence,
     transport::{collect_control, send_error},
 };
 use crate::{kubo::NdjsonBuffer, pinning::provider::ProviderError};
+use ::cid::{Cid, Version};
 use reqwest::multipart;
 use serde::Deserialize;
 
@@ -20,13 +20,8 @@ struct SourceStat {
 }
 
 impl IpfsRpcProvider {
-    pub(super) async fn upload(
-        &self,
-        requested: &str,
-        evidence: &mut SubmitEvidence,
-    ) -> Result<(), ProviderError> {
-        let expected = cid::parse(requested)?;
-        let source_cid = cid::canonical(requested)?;
+    pub(super) async fn upload(&self, requested: &Cid) -> Result<Cid, ProviderError> {
+        let source_cid = cid::canonical(requested).to_string();
         let source = self
             .source
             .as_ref()
@@ -43,7 +38,9 @@ impl IpfsRpcProvider {
         let stat: SourceStat = stat
             .json()
             .map_err(|_| super::not_submitted("RPC source inspection was invalid before submit"))?;
-        if !cid::equivalent(&stat.hash, requested).unwrap_or(false) || stat.kind != "file" {
+        if stat.kind != "file"
+            || !cid::parse(&stat.hash).is_ok_and(|root| cid::equivalent(&root, requested))
+        {
             return Err(super::not_submitted(
                 "RPC byte upload requires a matching UnixFS file; directories require CAR",
             ));
@@ -63,15 +60,9 @@ impl IpfsRpcProvider {
             .mime_str("application/octet-stream")
             .map_err(|_| protocol("RPC upload part construction failed"))?;
         let form = multipart::Form::new().part("file", part);
-        let version = if expected.version() == ::cid::Version::V0 {
-            "0"
-        } else {
-            "1"
-        };
-        let raw_leaves = if expected.version() == ::cid::Version::V0 {
-            "false"
-        } else {
-            "true"
+        let (version, raw_leaves) = match requested.version() {
+            Version::V0 => ("0", "false"),
+            Version::V1 => ("1", "true"),
         };
         let filebase_query = [("cid-version", version), ("wrap-with-directory", "false")];
         let kubo_query = [
@@ -80,7 +71,7 @@ impl IpfsRpcProvider {
             ("raw-leaves", raw_leaves),
             ("chunker", "size-262144"),
             ("hash", "sha2-256"),
-            ("pin", "false"),
+            ("pin", "true"),
             ("progress", "true"),
         ];
         let query = if self.profile == RpcProfile::Filebase {
@@ -97,8 +88,7 @@ impl IpfsRpcProvider {
         transfer
             .wrap_request(&mut request)
             .map_err(|_| super::not_submitted("RPC upload request construction failed"))?;
-        evidence.begin_write();
-        let observed = transfer
+        transfer
             .progress
             .run(self.target.timeouts.idle, async {
                 let response = self
@@ -112,38 +102,11 @@ impl IpfsRpcProvider {
                     response.check(true)?;
                     return Err(protocol("unexpected RPC add status"));
                 }
-                let observed =
-                    parse_add(response, &transfer.progress, self.profile, evidence).await?;
-                let status = if self.profile == RpcProfile::Kubo {
-                    RpcResourceStatus::Stored
-                } else {
-                    RpcResourceStatus::PinAccepted
-                };
-                evidence.clean(
-                    self.profile,
-                    observed.roots.iter().cloned().map(|cid| (cid, status)),
-                )?;
-                if let Err(error) = transfer.ensure_complete() {
-                    evidence.unknown();
-                    return Err(error);
-                }
-                if !observed.final_root {
-                    return Err(protocol("RPC add omitted terminal root"));
-                }
-                if observed.roots.len() != 1 {
-                    return Err(protocol("RPC add returned multiple roots"));
-                }
-                Ok(observed.roots.into_iter().next().expect("length checked"))
+                let root = parse_add(response, &transfer.progress, self.profile, requested).await?;
+                transfer.ensure_complete()?;
+                Ok(root)
             })
-            .await?;
-        if !cid::equivalent(&observed, requested).unwrap_or(false) {
-            return Err(mismatch());
-        }
-        // Filebase add already pins. Never follow it with unsupported pin/add.
-        if self.profile == RpcProfile::Kubo {
-            self.pin_cid(requested, evidence).await?;
-        }
-        Ok(())
+            .await
     }
 }
 
@@ -165,29 +128,29 @@ struct ZeroProgressRecord {
 }
 
 #[derive(Default)]
-struct AddEvidence {
+struct AddAck {
     bytes: u64,
-    roots: Vec<String>,
-    final_root: bool,
+    root: Option<Cid>,
 }
 
-impl AddEvidence {
+impl AddAck {
     fn record(
         &mut self,
         line: &[u8],
         progress: &Progress,
         profile: RpcProfile,
-        evidence: &mut SubmitEvidence,
+        expected: &Cid,
     ) -> Result<(), ProviderError> {
+        if self.root.is_some() {
+            return Err(protocol("RPC add returned a record after the root"));
+        }
         let record: AddRecord =
             serde_json::from_slice(line).map_err(|_| protocol("invalid RPC add record"))?;
         if record.hash.is_none() && record.bytes.is_none() {
             // Kubo omits Bytes=0 with progress=true. Only the exact uploaded
-            // file name, before any byte progress/root, represents that zero;
-            // accepting it must not advance idle or acknowledge a resource.
+            // file name before positive byte progress represents that zero.
             if profile == RpcProfile::Kubo
                 && self.bytes == 0
-                && self.roots.is_empty()
                 && serde_json::from_slice::<ZeroProgressRecord>(line)
                     .is_ok_and(|record| record.name == "object")
             {
@@ -204,21 +167,16 @@ impl AddEvidence {
                 progress.advance();
             }
         }
-        self.final_root = false;
         if let Some(root) = record.hash {
-            let root = cid::canonical(&root).map_err(|_| protocol("invalid RPC add root CID"))?;
-            evidence.reported(profile, root.clone())?;
+            let root = cid::parse_ack(&root)?;
+            if !cid::equivalent(&root, expected) {
+                return Err(mismatch());
+            }
             if record.size.is_some_and(|v| v.parse::<u64>().is_err()) {
                 return Err(protocol("invalid RPC add root size"));
             }
-            if self.roots.len() == MAX_OBSERVED_RESOURCES {
-                return Err(protocol("RPC add root observation exceeds bound"));
-            }
-            if !self.roots.contains(&root) {
-                progress.advance();
-            }
-            self.roots.push(root);
-            self.final_root = true;
+            self.root = Some(root);
+            progress.advance();
         }
         Ok(())
     }
@@ -228,11 +186,11 @@ async fn parse_add(
     response: reqwest::Response,
     progress: &Progress,
     profile: RpcProfile,
-    submit_evidence: &mut SubmitEvidence,
-) -> Result<AddEvidence, ProviderError> {
+    expected: &Cid,
+) -> Result<Cid, ProviderError> {
     let mut body = ResponseBody::new(response, None)?;
     let mut lines = NdjsonBuffer::new();
-    let mut evidence = AddEvidence::default();
+    let mut ack = AddAck::default();
     while let Some(data) = body.next().await? {
         lines
             .push(data)
@@ -241,11 +199,12 @@ async fn parse_add(
             .next_record()
             .map_err(|_| protocol("invalid RPC add framing"))?
         {
-            evidence.record(&record, progress, profile, submit_evidence)?;
+            ack.record(&record, progress, profile, expected)?;
         }
     }
     if let Some(record) = lines.finish() {
-        evidence.record(&record, progress, profile, submit_evidence)?;
+        ack.record(&record, progress, profile, expected)?;
     }
-    Ok(evidence)
+    ack.root
+        .ok_or_else(|| protocol("RPC add omitted terminal root"))
 }

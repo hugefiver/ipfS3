@@ -209,7 +209,7 @@ pub async fn submit(
     request: NewImportJob,
     now: DateTime<Utc>,
 ) -> AppResult<SubmitImportOutcome> {
-    submit_with_decision(db, request, None, None, None, now, None).await
+    submit_with_decision(db, request, None, None, None, now).await
 }
 
 /// The decision is written in the same ownership transaction as the fingerprint,
@@ -220,7 +220,7 @@ pub async fn submit_decided(
     decision: ExtensionDecision,
     now: DateTime<Utc>,
 ) -> AppResult<SubmitImportOutcome> {
-    submit_with_decision(db, request, Some(decision), None, None, now, None).await
+    submit_with_decision(db, request, Some(decision), None, None, now).await
 }
 
 /// Persist the signed ZIP-root choice alongside the job, ownership and pin decision.
@@ -231,16 +231,7 @@ pub async fn submit_decided_zip(
     root_capture: ZipRootCapture,
     now: DateTime<Utc>,
 ) -> AppResult<SubmitImportOutcome> {
-    submit_with_decision(
-        db,
-        request,
-        Some(decision),
-        Some(root_capture),
-        None,
-        now,
-        None,
-    )
-    .await
+    submit_with_decision(db, request, Some(decision), Some(root_capture), None, now).await
 }
 
 /// R25 intake persists the original intent with the job and ownership, before I/O.
@@ -250,20 +241,11 @@ pub async fn submit_captured_zip(
     capture: crate::pinning::zip_policy::CapturedZipIntent,
     now: DateTime<Utc>,
 ) -> AppResult<SubmitImportOutcome> {
-    submit_with_decision(
-        db,
-        request,
-        Some(capture.source_decision().clone()),
-        Some(capture.controls().root),
-        Some(capture),
-        now,
-        None,
-    )
-    .await
+    submit_captured(db, request, None, Some(capture), now).await
 }
 
-pub(crate) async fn submit_store(
-    store: &crate::store::Store,
+pub(crate) async fn submit_captured(
+    db: &DatabaseConnection,
     request: NewImportJob,
     decision: Option<ExtensionDecision>,
     zip: Option<crate::pinning::zip_policy::CapturedZipIntent>,
@@ -274,7 +256,7 @@ pub(crate) async fn submit_store(
         .map(|capture| capture.source_decision().clone())
         .or(decision);
     let root = zip.as_ref().map(|capture| capture.controls().root);
-    submit_with_decision(store.db(), request, decision, root, zip, now, Some(store)).await
+    submit_with_decision(db, request, decision, root, zip, now).await
 }
 
 async fn submit_with_decision(
@@ -284,51 +266,15 @@ async fn submit_with_decision(
     root_capture: Option<ZipRootCapture>,
     zip_intent: Option<crate::pinning::zip_policy::CapturedZipIntent>,
     now: DateTime<Utc>,
-    store: Option<&crate::store::Store>,
 ) -> AppResult<SubmitImportOutcome> {
-    let bucket_name = request.bucket.clone();
     for retry in 0..=MAX_OWNERSHIP_TRANSACTION_RETRIES {
         let request = request.clone();
         let decision = decision.clone();
         let zip_intent = zip_intent.clone();
-        let bucket_name = bucket_name.clone();
-        let outcome = if let Some(store) = store {
-            use crate::store::pinning::management::records::{DecodeWork, SharedDecodeBudget};
-            let work = SharedDecodeBudget::default();
-            let tx = store
-                .begin_publication_runtime(DecodeWork::shared(&work))
-                .await
-                .map_err(transaction_error_into_app)?;
-            let result = async {
-                lock_bucket_for_ownership(tx.db(), &bucket_name).await?;
-                submit_decided_in_transaction(
-                    tx.db(),
-                    request,
-                    decision.as_ref(),
-                    root_capture,
-                    zip_intent.as_ref(),
-                    now,
-                    Some(&tx),
-                )
-                .await
-            }
-            .await;
-            match result {
-                Ok(value) => tx
-                    .into_db()
-                    .commit()
-                    .await
-                    .map(|_| value)
-                    .map_err(TransactionError::Connection),
-                Err(error) => {
-                    tx.into_db().rollback().await?;
-                    Err(TransactionError::Transaction(error))
-                }
-            }
-        } else {
-            db.transaction(move |txn| {
+        let outcome = db
+            .transaction(move |txn| {
                 Box::pin(async move {
-                    lock_bucket_for_ownership(txn, &bucket_name).await?;
+                    lock_bucket_for_ownership(txn, &request.bucket).await?;
                     submit_decided_in_transaction(
                         txn,
                         request,
@@ -336,13 +282,11 @@ async fn submit_with_decision(
                         root_capture,
                         zip_intent.as_ref(),
                         now,
-                        None,
                     )
                     .await
                 })
             })
-            .await
-        };
+            .await;
         match outcome {
             Ok(outcome) => return Ok(outcome),
             Err(TransactionError::Transaction(error))
@@ -363,7 +307,7 @@ async fn submit_in_transaction<C: ConnectionTrait>(
     request: NewImportJob,
     now: DateTime<Utc>,
 ) -> AppResult<SubmitImportOutcome> {
-    submit_decided_in_transaction(txn, request, None, None, None, now, None).await
+    submit_decided_in_transaction(txn, request, None, None, None, now).await
 }
 
 async fn submit_decided_in_transaction<C: ConnectionTrait>(
@@ -373,7 +317,6 @@ async fn submit_decided_in_transaction<C: ConnectionTrait>(
     root_capture: Option<ZipRootCapture>,
     zip_intent: Option<&crate::pinning::zip_policy::CapturedZipIntent>,
     now: DateTime<Utc>,
-    runtime: Option<&crate::store::RuntimeTransaction>,
 ) -> AppResult<SubmitImportOutcome> {
     if let Some(token) = request.client_token.as_deref()
         && let Some(existing) = find_idempotent(txn, &request.bucket, &request.key, token).await?
@@ -407,20 +350,6 @@ async fn submit_decided_in_transaction<C: ConnectionTrait>(
     .await?;
     if let Some(prefix) = job.decompress_prefix.as_deref() {
         install_prefix_claim(txn, &job.id, &job.bucket, prefix, now).await?;
-    }
-    match runtime {
-        Some(tx) => {
-            crate::store::pinning::management::admission::lock_runtime_intake(
-                tx, decision, zip_intent,
-            )
-            .await?
-        }
-        None => {
-            crate::store::pinning::management::admission::lock_intake_in_caller_transaction(
-                txn, decision, zip_intent,
-            )
-            .await?
-        }
     }
     Ok(SubmitImportOutcome::Created(job))
 }

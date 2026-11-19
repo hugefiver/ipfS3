@@ -2,8 +2,8 @@ use std::time::Duration as StdDuration;
 
 use chrono::{Duration, TimeZone, Utc};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
-    TransactionTrait, sea_query::Expr,
+    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, FromQueryResult, PaginatorTrait,
+    QueryFilter, Statement, TransactionTrait, sea_query::Expr,
 };
 use tokio_util::sync::CancellationToken;
 use wiremock::{
@@ -38,7 +38,7 @@ use crate::{
         self, Store,
         entities::{
             bucket_lifecycle_config, lifecycle_action, lifecycle_transition, object,
-            object_version, physical_residency, pin_lease, pin_lease_target, residency_reference,
+            object_version, physical_residency, residency_reference,
         },
         import::ownership::{
             StandardMutationGuard, admit_content_mutation, try_admit_lifecycle_mutation,
@@ -52,8 +52,8 @@ use crate::{
         object_version::{BucketVersioningState, PublicVersionId, VersionSelector},
         pinning::{
             publication::{
-                PinTargetSpec, PublicationObject, PublicationRequest,
-                delete_version_with_leases_guarded, publish_object, publish_standard_object,
+                PinTargetSpec, PublicationObject, PublicationRequest, delete_version_guarded,
+                publish_object, publish_standard_object,
             },
             tags::{list_object_tags, replace_object_tags},
         },
@@ -1407,21 +1407,33 @@ async fn guarded_put_and_copy_during_io_supersede_without_publishing_old_transit
     }
 }
 
+#[derive(Debug, PartialEq, Eq, FromQueryResult)]
+struct ManualPinSnapshot {
+    provider: String,
+    cid: String,
+    expires_at: i64,
+    status: String,
+    action: Option<String>,
+}
+
+async fn manual_pin_snapshot(db: &DatabaseConnection, owner: &str) -> ManualPinSnapshot {
+    ManualPinSnapshot::find_by_statement(Statement::from_sql_and_values(
+        db.get_database_backend(),
+        "SELECT r.provider, r.cid, r.expires_at, p.status, p.action FROM pin_refs r
+         JOIN pin_resources p ON p.provider = r.provider AND p.cid = r.cid
+         WHERE r.owner_object_id = $1 AND r.source = 'manual'",
+        [owner.into()],
+    ))
+    .one(db)
+    .await
+    .unwrap()
+    .expect("manual reference and its resource")
+}
+
 #[tokio::test]
-async fn guarded_exact_delete_promotes_shared_leased_version_without_revival() {
+async fn guarded_exact_delete_preserves_the_promoted_version_pin_ref() {
     let (fixture, predecessor) = current_with_predecessor_fixture().await;
-    let lease_before = pin_lease::Entity::find()
-        .filter(pin_lease::Column::OwnerObjectId.eq("leased-predecessor"))
-        .filter(pin_lease::Column::Source.eq("manual"))
-        .one(fixture.db())
-        .await
-        .unwrap()
-        .unwrap();
-    let targets_before = pin_lease_target::Entity::find()
-        .filter(pin_lease_target::Column::LeaseId.eq(&lease_before.id))
-        .all(fixture.db())
-        .await
-        .unwrap();
+    let pin_before = manual_pin_snapshot(fixture.db(), "leased-predecessor").await;
     let harness = TierHarness::new(ImportBehavior::Delayed, HOT_NODE).await;
     let task = spawn_execute(&fixture, &harness, worker_config());
     wait_for_import(&harness.cold_server).await;
@@ -1447,7 +1459,7 @@ async fn guarded_exact_delete_promotes_shared_leased_version_without_revival() {
             .expect("enabled target has a public version"),
     )
     .unwrap();
-    delete_version_with_leases_guarded(
+    delete_version_guarded(
         fixture.db(),
         BUCKET,
         KEY,
@@ -1478,20 +1490,8 @@ async fn guarded_exact_delete_promotes_shared_leased_version_without_revival() {
     assert_eq!(promoted_residency.primary.tier, KuboTier::Hot);
     assert_eq!(promoted_residency.storage_class, StorageClass::Standard);
     assert_eq!(
-        pin_lease::Entity::find_by_id(&lease_before.id)
-            .one(fixture.db())
-            .await
-            .unwrap()
-            .unwrap(),
-        lease_before
-    );
-    assert_eq!(
-        pin_lease_target::Entity::find()
-            .filter(pin_lease_target::Column::LeaseId.eq(&lease_before.id))
-            .all(fixture.db())
-            .await
-            .unwrap(),
-        targets_before
+        manual_pin_snapshot(fixture.db(), "leased-predecessor").await,
+        pin_before
     );
     let saga = stored_saga(&fixture).await;
     assert!(saga.publication_receipt.is_none());

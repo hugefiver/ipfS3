@@ -1,4 +1,7 @@
-use super::{stage9_zip_support::setup, v2_mpu::intake_with_source};
+use super::{
+    stage9_zip_support::{ARCHIVE_CID, OUTPUT_CID, setup},
+    v2_mpu::intake_with_source,
+};
 use ipfs_s3_gateway::store::{
     import::ownership,
     multipart::v2_zip,
@@ -20,7 +23,7 @@ async fn prepared(source: bool) -> (DatabaseConnection, execution::Claim) {
         .await
         .unwrap()
         .unwrap();
-    execution::bind_clean_input(&db, &claim, &"d".repeat(64), "archive-cid", 5)
+    execution::bind_clean_input(&db, &claim, &"d".repeat(64), ARCHIVE_CID, 5)
         .await
         .unwrap();
     let row = execution::read(&db, ID).await.unwrap().unwrap();
@@ -43,7 +46,7 @@ async fn prepared(source: bool) -> (DatabaseConnection, execution::Claim) {
     let manifest = ["a", "b"].map(|name| execution::ManifestItem::Success {
         path: name.into(),
         object_key: format!("out/{name}"),
-        cid: "output-cid".into(),
+        cid: OUTPUT_CID.into(),
         size: 5,
     });
     zip::prepare_manifest(

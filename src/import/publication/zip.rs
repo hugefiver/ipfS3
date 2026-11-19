@@ -19,7 +19,7 @@ use crate::{
         },
         pinning::publication::{
             CapturedZipPublication, LegacyZipAuthority, PublicationObject, PublicationResult,
-            ZipPublicationAuthority, application::publish_captured_zip,
+            ZipPublicationAuthority, publish_captured_zip,
         },
     },
     zip::{batch::FinalZipManifest, response::ExtractedEntry},
@@ -142,14 +142,34 @@ pub(crate) async fn publish_zip_import(
         )
     })?;
     let root_enabled = capture.controls().root.enabled();
-    let published = publish_captured_zip(&state.store, CapturedZipPublication {
-        batch_id: job.id.clone(), source: Some(archive_object), source_tags, successes,
-        manifest: manifest.clone(), capture,
-        authority: ZipPublicationAuthority::Legacy(Box::new(LegacyZipAuthority {
-            standard_guard: None, upload_target: None, import_guard: Some(guard), result_rows, replay: None,
-        })), root_outcome,
-        terminal_result: serde_json::json!({"batch_id": job.id, "archive_cid": artifact.cid, "root_enabled": root_enabled}).to_string(),
-    }, state.pinning.effective_config(), state.pinning.zip_output_rules(), state.pinning.control_mode()).await.map_err(|error| map_publication_error(error, cancellation))?;
+    let published = publish_captured_zip(
+        state.store.db(),
+        CapturedZipPublication {
+            batch_id: job.id.clone(),
+            source: Some(archive_object),
+            source_tags,
+            successes,
+            manifest: manifest.clone(),
+            capture,
+            authority: ZipPublicationAuthority::Legacy(Box::new(LegacyZipAuthority {
+                standard_guard: None,
+                upload_target: None,
+                import_guard: Some(guard),
+                result_rows,
+                replay: None,
+            })),
+            root_outcome,
+            terminal_result: serde_json::json!({
+                "batch_id": job.id, "archive_cid": artifact.cid, "root_enabled": root_enabled,
+            })
+            .to_string(),
+        },
+        state.pinning.effective_config(),
+        state.pinning.zip_output_rules(),
+        state.pinning.control_mode(),
+    )
+    .await
+    .map_err(|error| map_publication_error(error, cancellation))?;
     published
         .into_iter()
         .find(|(key, _)| key == &job.key)

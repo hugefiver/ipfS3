@@ -1,4 +1,6 @@
 //! Configured ZIP budgets at the authenticated product entrypoints.
+#[path = "support/pin_rows.rs"]
+mod pin_rows;
 #[allow(dead_code)]
 mod support;
 
@@ -21,8 +23,8 @@ use ipfs_s3_gateway::{
     store::{
         self,
         entities::{
-            import_job, multipart_upload, object, object_version, pin_lease,
-            standard_mutation_lease, zip_batch, zip_manifest_entry,
+            import_job, multipart_upload, object, object_version, standard_mutation_lease,
+            zip_batch, zip_manifest_entry,
         },
     },
 };
@@ -142,13 +144,7 @@ async fn assert_nothing_published(state: &AppState) {
 
 async fn assert_direct_zip_not_published(state: &AppState) {
     assert_nothing_published(state).await;
-    assert_eq!(
-        pin_lease::Entity::find()
-            .count(state.store.db())
-            .await
-            .unwrap(),
-        0
-    );
+    assert_eq!(pin_rows::count(state.store.db(), "pin_refs").await, 0);
     assert_eq!(
         zip_manifest_entry::Entity::find()
             .count(state.store.db())

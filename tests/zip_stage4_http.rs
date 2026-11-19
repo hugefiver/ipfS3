@@ -1,4 +1,6 @@
 //! Signed HTTP regression tests for the legacy ZIP root opt-in/out and batch receipt.
+#[path = "support/pin_rows.rs"]
+mod pin_rows;
 #[allow(dead_code)]
 mod support;
 
@@ -1526,13 +1528,9 @@ async fn signed_multipart_batch_transaction_rollback_reuses_prepared_manifest_on
             .unwrap(),
         1
     );
-    assert_eq!(
-        ipfs_s3_gateway::store::entities::pin_lease::Entity::find()
-            .count(harness.state.store.db())
-            .await
-            .unwrap(),
-        0
-    );
+    let db = harness.state.store.db();
+    assert_eq!(pin_rows::count(db, "pin_refs").await, 0);
+    assert_eq!(pin_rows::count(db, "pin_resources").await, 0);
 }
 
 #[tokio::test]
@@ -1701,13 +1699,8 @@ async fn signed_multipart_prepared_manifest_rejects_changed_cid_or_failed_extrac
                 .unwrap(),
             0
         );
-        assert_eq!(
-            ipfs_s3_gateway::store::entities::pin_lease::Entity::find()
-                .count(db)
-                .await
-                .unwrap(),
-            0
-        );
+        assert_eq!(pin_rows::count(db, "pin_refs").await, 0);
+        assert_eq!(pin_rows::count(db, "pin_resources").await, 0);
     }
 }
 

@@ -1,4 +1,6 @@
 //! Real SigV4 MPU publication followed by the production root-only recovery page.
+#[path = "support/pin_rows.rs"]
+mod pin_rows;
 #[allow(dead_code)]
 mod support;
 
@@ -207,39 +209,20 @@ async fn rows(harness: &TestHarness) -> (Vec<object::Model>, Vec<object_version:
     )
 }
 
-async fn remote_counts(harness: &TestHarness) -> Vec<i64> {
-    let mut counts = Vec::new();
-    for table in [
-        "pin_jobs",
-        "pin_leases",
-        "pin_lease_targets",
-        "remote_pins",
-        "remote_pin_ledger",
-    ] {
-        counts.push(
-            harness
-                .state
-                .store
-                .db()
-                .query_one(Statement::from_string(
-                    DatabaseBackend::Sqlite,
-                    format!("SELECT COUNT(*) AS n FROM {table}"),
-                ))
-                .await
-                .unwrap()
-                .unwrap()
-                .try_get("", "n")
-                .unwrap(),
-        );
-    }
-    counts
+async fn pin_counts(harness: &TestHarness) -> [u64; 2] {
+    let db = harness.state.store.db();
+    [
+        pin_rows::count(db, "pin_refs").await,
+        pin_rows::count(db, "pin_resources").await,
+    ]
 }
 
 async fn assert_root_recovered(source: bool) {
     let (harness, id) = create_and_upload(source, true).await;
     let first = complete(&harness, &id).await;
     let status = first.status();
-    let headers = first.headers().clone();
+    let mut headers = first.headers().clone();
+    headers.remove(http::header::DATE);
     let xml = first.text().await.unwrap();
     assert_eq!(status, StatusCode::OK, "{xml}");
     assert_eq!(headers["x-ipfs-s3-zip-root-status"], "failed");
@@ -276,8 +259,8 @@ async fn assert_root_recovered(source: bool) {
     let published = rows(&harness).await;
     assert_eq!(published.0.len(), 1 + usize::from(source));
     assert_eq!(published.1.len(), 1 + usize::from(source));
-    let remotes = remote_counts(&harness).await;
-    assert_eq!(remotes, vec![0; 5]);
+    let pin_before = pin_counts(&harness).await;
+    assert_eq!(pin_before, [0, 0]);
     let execution = zip::execution::read(db, &id).await.unwrap().unwrap();
     assert!(
         zip::recovery::due_page(db).await.unwrap().is_empty(),
@@ -323,7 +306,7 @@ async fn assert_root_recovered(source: bool) {
         published,
         "root recovery cannot publish a new object/version"
     );
-    assert_eq!(remote_counts(&harness).await, remotes);
+    assert_eq!(pin_counts(&harness).await, pin_before);
     assert_eq!(
         zip::execution::read(db, &id).await.unwrap().unwrap(),
         execution
@@ -342,7 +325,9 @@ async fn assert_root_recovered(source: bool) {
     );
     let replay = complete(&harness, &id).await;
     assert_eq!(replay.status(), StatusCode::OK);
-    assert_eq!(replay.headers(), &headers);
+    let mut replay_headers = replay.headers().clone();
+    replay_headers.remove(http::header::DATE);
+    assert_eq!(replay_headers, headers);
     assert_eq!(replay.text().await.unwrap(), xml);
     let batch_status = support::sigv4::send_sigv4(
         reqwest::Method::GET,
@@ -526,7 +511,7 @@ async fn persisted_mpu_capture_requires_exact_protocol_flags_token_and_root_iden
         "complete bare options are shape-valid, not original-capture authorization"
     );
     let published = rows(&harness).await;
-    let remotes = remote_counts(&harness).await;
+    let pin_before = pin_counts(&harness).await;
     let execution = zip::execution::read(db, &id).await.unwrap().unwrap();
     let intake = store::multipart::v2_zip::read_by_upload(db, &id)
         .await
@@ -558,7 +543,7 @@ async fn persisted_mpu_capture_requires_exact_protocol_flags_token_and_root_iden
     );
     assert_eq!(harness.captured_add_file_bytes(), additions);
     assert_eq!(rows(&harness).await, published);
-    assert_eq!(remote_counts(&harness).await, remotes);
+    assert_eq!(pin_counts(&harness).await, pin_before);
     let after = zip::snapshot(db, &id).await.unwrap().unwrap();
     assert_eq!(after.batch.captured_options, legacy.batch.captured_options);
     assert_eq!(after.batch.terminal_result, snapshot.batch.terminal_result);
@@ -745,7 +730,7 @@ async fn paired_original_mpu_envelope_tampering_is_409_before_rpc_or_publication
             before
         );
         assert_eq!(rows(&harness).await, (vec![], vec![]));
-        assert_eq!(remote_counts(&harness).await, vec![0; 5]);
+        assert_eq!(pin_counts(&harness).await, [0, 0]);
         assert_eq!(
             status,
             StatusCode::CONFLICT,

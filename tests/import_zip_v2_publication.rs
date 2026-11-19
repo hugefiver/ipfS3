@@ -9,7 +9,7 @@ use ipfs_s3_gateway::{
     },
     store::{
         self,
-        entities::{object, object_version, pin_lease, zip_manifest_entry},
+        entities::{object, object_version, zip_manifest_entry},
         pinning::publication::{
             PublicationObject, ZipV2Publication, ZipV2PublicationResult, ZipV2Success,
         },
@@ -24,6 +24,8 @@ use sha2::{Digest, Sha256};
 
 #[path = "support/import_zip_v2_publication.rs"]
 mod native;
+#[path = "support/pin_rows.rs"]
+mod pin_rows;
 
 async fn setup() -> (tempfile::TempDir, DatabaseConnection, DatabaseConnection) {
     let dir = tempfile::tempdir().unwrap();
@@ -221,7 +223,8 @@ async fn late_import_receipt_failure_rolls_back_versions_guards_and_both_termina
         object_version::Entity::find().count(&first).await.unwrap(),
         0
     );
-    assert_eq!(pin_lease::Entity::find().count(&first).await.unwrap(), 0);
+    assert!(pin_rows::refs(&first).await.is_empty());
+    assert!(pin_rows::resources(&first).await.is_empty());
     assert!(
         zip_manifest_entry::Entity::find()
             .all(&first)

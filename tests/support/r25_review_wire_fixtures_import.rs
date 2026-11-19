@@ -121,7 +121,7 @@ pub use original::{
 
 pub async fn assert_manual_source(db: &sea_orm::DatabaseConnection, id: &str) {
     use ipfs_s3_gateway::store::{
-        entities::{object, object_tag, object_version, pin_lease, pin_lease_target},
+        entities::{object, object_tag, object_version},
         zip::execution,
     };
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
@@ -141,25 +141,33 @@ pub async fn assert_manual_source(db: &sea_orm::DatabaseConnection, id: &str) {
         .unwrap();
     assert_eq!(source.key, "archive.zip");
     assert_eq!(source.cid, persisted.input_art_cid.unwrap());
-    let leases = pin_lease::Entity::find().all(db).await.unwrap();
+    use sea_orm::{ConnectionTrait, Statement};
+    let rows = db.query_all(Statement::from_string(db.get_database_backend(),
+        "SELECT r.owner_object_id,r.cid,r.source,r.content_mode,r.expires_at,p.logical_size FROM pin_refs r JOIN pin_resources p ON p.provider=r.provider AND p.cid=r.cid")).await.unwrap();
+    let [reference] = rows.as_slice() else {
+        panic!("expected only the source manual reference")
+    };
     assert_eq!(
-        leases.len(),
-        1,
-        "auto=false/targets=none cannot suppress the source manual request or create Automatic leases"
+        reference.try_get::<String>("", "owner_object_id").unwrap(),
+        source.id
     );
-    let lease = &leases[0];
-    assert_eq!(lease.source, "manual");
-    assert_eq!(lease.owner_object_id, source.id);
-    assert_eq!(lease.content_mode, "full");
-    assert_eq!((lease.expires_at - lease.created_at).num_seconds(), 3600);
-    let targets = pin_lease_target::Entity::find()
-        .filter(pin_lease_target::Column::LeaseId.eq(&lease.id))
-        .all(db)
-        .await
-        .unwrap();
-    assert_eq!(targets.len(), 1);
-    assert_eq!(targets[0].cid, source.cid);
-    assert_eq!(targets[0].logical_size, source.size);
+    assert_eq!(reference.try_get::<String>("", "source").unwrap(), "manual");
+    assert_eq!(
+        reference.try_get::<String>("", "content_mode").unwrap(),
+        "object"
+    );
+    assert_eq!(
+        reference.try_get::<i64>("", "expires_at").unwrap() - version.created_at.timestamp_micros(),
+        3_600_000_000
+    );
+    assert_eq!(
+        reference.try_get::<String>("", "cid").unwrap(),
+        ipfs_s3_gateway::pinning::provider::canonical_resource_cid(&source.cid).unwrap()
+    );
+    assert_eq!(
+        reference.try_get::<i64>("", "logical_size").unwrap(),
+        source.size
+    );
     let tags = object_tag::Entity::find()
         .filter(object_tag::Column::ObjectId.eq(&source.id))
         .all(db)

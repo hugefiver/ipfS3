@@ -22,6 +22,7 @@ use sea_orm::{ConnectionTrait, EntityTrait, PaginatorTrait, Statement};
 use sha2::{Digest, Sha256};
 use support::{
     decompress::{duplicate_entry_zip, legal_single_entry_zip},
+    pin_rows,
     sigv4::send_sigv4,
 };
 
@@ -390,25 +391,9 @@ async fn source_only_url_sha_mismatch_publishes_nothing_and_replays_without_io()
     assert_eq!(original.expected_sha256.as_deref(), Some(sha.as_str()));
     assert_eq!(failed.captured_options, request.admission.captured_options);
     assert_eq!(h.kubo_call_count("/api/v0/pin/add").await, 0);
-    for table in [
-        "pin_leases",
-        "pin_lease_targets",
-        "pin_jobs",
-        "object_versions",
-    ] {
-        let row = h
-            .state
-            .store
-            .db()
-            .query_one(Statement::from_string(
-                sea_orm::DatabaseBackend::Sqlite,
-                format!("SELECT COUNT(*) AS n FROM {table}"),
-            ))
-            .await
-            .unwrap()
-            .unwrap();
+    for table in ["pin_refs", "pin_resources", "object_versions"] {
         assert_eq!(
-            row.try_get::<i64>("", "n").unwrap(),
+            pin_rows::count(h.state.store.db(), table).await,
             0,
             "historical mismatch: {table}"
         );
@@ -471,24 +456,14 @@ async fn removed_expected_sha_header_rejects_without_intake_then_original_url_is
         "zip_batches",
         "objects",
         "object_versions",
-        "pin_leases",
-        "pin_jobs",
-        "pin_lease_targets",
-        "remote_pins",
-        "pin_provider_usage",
+        "pin_refs",
+        "pin_resources",
     ] {
-        let row = h
-            .state
-            .store
-            .db()
-            .query_one(Statement::from_string(
-                sea_orm::DatabaseBackend::Sqlite,
-                format!("SELECT COUNT(*) AS n FROM {table}"),
-            ))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(row.try_get::<i64>("", "n").unwrap(), 0, "{table}");
+        assert_eq!(
+            pin_rows::count(h.state.store.db(), table).await,
+            0,
+            "{table}"
+        );
     }
     let id = submit(&h, "removed-control", false, &xml).await;
     assert_eq!(wait(&h, &id).await, "ready");
@@ -564,41 +539,14 @@ async fn source_false_with_original_manual_pin_tag_is_400_before_any_effect() {
         "zip_batches",
         "objects",
         "object_versions",
-        "pin_leases",
-        "pin_lease_targets",
-        "pin_jobs",
-        "remote_pins",
+        "pin_refs",
+        "pin_resources",
     ] {
-        let row = h
-            .state
-            .store
-            .db()
-            .query_one(Statement::from_string(
-                sea_orm::DatabaseBackend::Sqlite,
-                format!("SELECT COUNT(*) AS n FROM {table}"),
-            ))
-            .await
-            .unwrap()
-            .unwrap();
         assert_eq!(
-            row.try_get::<i64>("", "n").unwrap(),
+            pin_rows::count(h.state.store.db(), table).await,
             0,
             "source=false manual: {table}"
         );
-    }
-    for row in h
-        .state
-        .store
-        .db()
-        .query_all(Statement::from_string(
-            sea_orm::DatabaseBackend::Sqlite,
-            "SELECT reserved_bytes,reserved_pins FROM pin_provider_usage".to_owned(),
-        ))
-        .await
-        .unwrap()
-    {
-        assert_eq!(row.try_get::<i64>("", "reserved_bytes").unwrap(), 0);
-        assert_eq!(row.try_get::<i64>("", "reserved_pins").unwrap(), 0);
     }
     h.shutdown().await;
 }
@@ -829,6 +777,8 @@ async fn lost_source_guard_never_readmits_or_publishes_either_output() {
     gate.release();
     assert_eq!(wait(&h, &id).await, "failed");
     assert_eq!(object::Entity::find().count(db).await.unwrap(), 0);
+    assert_eq!(pin_rows::count(db, "pin_refs").await, 0);
+    assert_eq!(pin_rows::count(db, "pin_resources").await, 0);
     assert_eq!(h.kubo_total_call_count().await, io);
     let destination = db
         .query_one(Statement::from_sql_and_values(
@@ -874,6 +824,8 @@ async fn late_receipt_failure_rolls_back_source_versions_and_guards_then_recover
     .unwrap();
     assert_eq!(object::Entity::find().count(db).await.unwrap(), 0);
     assert_eq!(object_version::Entity::find().count(db).await.unwrap(), 0);
+    assert_eq!(pin_rows::count(db, "pin_refs").await, 0);
+    assert_eq!(pin_rows::count(db, "pin_resources").await, 0);
     assert!(sealed_receipt(&h, &id).await.is_none());
     assert!(
         execution::read(db, &id)
@@ -927,7 +879,7 @@ async fn each_target_uses_its_own_automatic_rule_intersection_without_source_man
             coordinator::normalize_validated_config,
             zip_policy::{ZipOutputRuleConfig, ZipRuleEffect},
         },
-        store::{self, entities::pin_lease},
+        store,
     };
     use sea_orm::{ColumnTrait, QueryFilter};
     use support::decompress::{
@@ -938,8 +890,10 @@ async fn each_target_uses_its_own_automatic_rule_intersection_without_source_man
         matchers::{method, path},
     };
 
-    // Valid scoped rules deny source independently of each extracted key. Its
-    // signed manual pin tag must not fill a denied automatic-rule intersection.
+    const FIRST_ENTRY_CID: &str = "bafkreigh2akiscaildc6ii5zji4bq7kly5k3s7svv6q2wx2nn5rtj5xuu4";
+    const SECOND_ENTRY_CID: &str = "bafkreid7q7afsgkz6piz7vg4jtn7dgnvhmlu4fbwfqcgicwnrsxdviutpm";
+
+    // The manual source request does not grant automatic pin eligibility to any output.
     for (target, source_rule_matches, expected_key) in [
         ("source", true, Some("archive.zip")),
         ("both", false, Some("out/first.txt")),
@@ -947,15 +901,26 @@ async fn each_target_uses_its_own_automatic_rule_intersection_without_source_man
         ("none", false, None),
     ] {
         let kubo = start_kubo_harness(KuboScript {
-            add_replies: vec![AddReply::Ok(CID), AddReply::Ok(CID)],
+            add_replies: vec![
+                AddReply::Ok(FIRST_ENTRY_CID),
+                AddReply::Ok(SECOND_ENTRY_CID),
+            ],
             cat_bodies: std::collections::HashMap::from([(CID.into(), legal_two_entry_zip())]),
         })
         .await;
         Mock::given(method("POST"))
             .and(path("/api/v0/pin/add"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
-                "{{\"Progress\":1,\"Bytes\":15}}\n{{\"Pins\":[\"{CID}\"]}}\n"
-            )))
+            .respond_with(|request: &wiremock::Request| {
+                let cid = request
+                    .url
+                    .query_pairs()
+                    .find(|(name, _)| name == "arg")
+                    .unwrap()
+                    .1;
+                ResponseTemplate::new(200).set_body_string(format!(
+                    "{{\"Progress\":1,\"Bytes\":15}}\n{{\"Pins\":[\"{cid}\"]}}\n"
+                ))
+            })
             .with_priority(1)
             .mount(&kubo.server)
             .await;
@@ -1103,62 +1068,69 @@ async fn each_target_uses_its_own_automatic_rule_intersection_without_source_man
                 .unwrap(),
             3
         );
-        let leases = pin_lease::Entity::find()
-            .all(state.store.db())
-            .await
-            .unwrap();
-        let manual = leases
+        let db = state.store.db();
+        let refs = pin_rows::refs(db).await;
+        let manual = refs
             .iter()
-            .filter(|lease| lease.source == "manual")
+            .filter(|row| row.source == "manual")
             .collect::<Vec<_>>();
-        let automatic = leases
+        let automatic = refs
             .iter()
-            .filter(|lease| lease.source == "automatic")
+            .filter(|row| row.source == "automatic")
             .collect::<Vec<_>>();
-        assert_eq!(
-            manual.len(),
-            1,
-            "original pin=true must retain its separate manual group"
-        );
+        let [manual] = manual.as_slice() else {
+            panic!("target={target}: expected one manual source reference");
+        };
         let source = object::Entity::find()
             .filter(object::Column::Key.eq("archive.zip"))
-            .one(state.store.db())
+            .one(db)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(manual[0].owner_object_id, source.id);
-        assert_eq!(manual[0].policy_id, normalized.policies[0].identity);
-        assert_eq!(manual[0].content_mode, "full");
+        assert_eq!(manual.owner_object_id, source.id);
+        assert_eq!(manual.policy_id, normalized.policies[0].identity);
+        assert_eq!(manual.content_mode, "object");
+        assert_eq!(manual.provider, "alpha");
+        assert_eq!(manual.cid, source.cid);
         assert_eq!(
-            (manual[0].expires_at - manual[0].created_at).num_seconds(),
-            3600
+            manual.expires_at,
+            (source.created_at + chrono::TimeDelta::hours(1)).timestamp_micros()
         );
-        let manual_targets = ipfs_s3_gateway::store::entities::pin_lease_target::Entity::find()
-            .filter(
-                ipfs_s3_gateway::store::entities::pin_lease_target::Column::LeaseId
-                    .eq(&manual[0].id),
-            )
-            .all(state.store.db())
-            .await
-            .unwrap();
-        assert_eq!(manual_targets.len(), 1);
-        assert_eq!(manual_targets[0].cid, source.cid);
-        assert_eq!(automatic.len() + manual.len(), leases.len());
+        assert_eq!(refs.len(), 1 + automatic.len());
         assert_eq!(
             automatic.len(),
             usize::from(expected_key.is_some()),
             "target={target}"
         );
+        let mut expected_resources = std::collections::BTreeMap::from([(source.cid, source.size)]);
         if let Some(key) = expected_key {
             let expected = object::Entity::find()
                 .filter(object::Column::Key.eq(key))
-                .one(state.store.db())
+                .one(db)
                 .await
                 .unwrap()
                 .unwrap();
+            let policy = usize::from(key != "archive.zip");
             assert_eq!(automatic[0].owner_object_id, expected.id, "target={target}");
-            assert_eq!(automatic[0].source, "automatic");
+            assert_eq!(automatic[0].policy_id, normalized.policies[policy].identity);
+            assert_eq!(automatic[0].content_mode, "object");
+            assert_eq!(automatic[0].provider, "alpha");
+            assert_eq!(automatic[0].cid, expected.cid);
+            expected_resources.insert(expected.cid, expected.size);
         }
+        let resources = pin_rows::resources(db).await;
+        assert_eq!(resources.len(), expected_resources.len());
+        assert_eq!(
+            resources
+                .into_iter()
+                .map(|row| {
+                    assert_eq!(row.provider, "alpha");
+                    assert_eq!(row.action.as_deref(), Some("submit"));
+                    (row.cid, row.logical_size)
+                })
+                .collect::<std::collections::BTreeMap<_, _>>(),
+            expected_resources
+        );
         worker.shutdown(Duration::from_secs(2)).await;
         server.shutdown().await;
     }

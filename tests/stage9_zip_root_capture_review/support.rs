@@ -129,15 +129,7 @@ pub async fn counters(harness: &decompress::TestHarness) -> Vec<i64> {
 
 pub async fn db_counters(db: &sea_orm::DatabaseConnection) -> Vec<i64> {
     let mut result = Vec::new();
-    for table in [
-        "objects",
-        "object_versions",
-        "pin_leases",
-        "pin_lease_targets",
-        "pin_jobs",
-        "remote_pins",
-        "remote_pin_ledger",
-    ] {
+    for table in ["objects", "object_versions", "pin_refs", "pin_resources"] {
         result.push(
             db.query_one(Statement::from_string(
                 DatabaseBackend::Sqlite,
@@ -150,19 +142,17 @@ pub async fn db_counters(db: &sea_orm::DatabaseConnection) -> Vec<i64> {
             .unwrap(),
         );
     }
-    for column in ["reserved_bytes", "reserved_pins"] {
-        result.push(
-            db.query_one(Statement::from_string(
-                DatabaseBackend::Sqlite,
-                format!("SELECT COALESCE(SUM({column}),0) AS n FROM pin_provider_usage"),
-            ))
-            .await
-            .unwrap()
-            .unwrap()
-            .try_get("", "n")
-            .unwrap(),
-        );
-    }
+    result.push(
+        db.query_one(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "SELECT COALESCE(SUM(logical_size),0) AS n FROM pin_resources",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "n")
+        .unwrap(),
+    );
     result
 }
 

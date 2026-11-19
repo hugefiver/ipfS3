@@ -1,5 +1,7 @@
 //! ZIP v2 contract at the real authenticated Axum/s3s HTTP boundary.
 //! Real SigV4, transport, replay and output ownership boundaries.
+#[path = "support/pin_rows.rs"]
+mod pin_rows;
 #[allow(dead_code)]
 mod support;
 
@@ -19,7 +21,7 @@ use ipfs_s3_gateway::{
         self,
         entities::{
             import_destination, import_job, import_prefix_claim, object, object_tag,
-            object_version, pin_job, pin_lease, pin_lease_target, remote_pin, zip_batch,
+            object_version, zip_batch,
         },
         import::{jobs::NewImportJob, ownership},
     },
@@ -37,6 +39,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 const SOURCE: &str = "source.zip";
 const OUTPUT: &str = "out/file.txt";
 const QUERY: &[(&str, &str)] = &[("decompress-zip", "out/")];
+const SHARED_OUTPUT_CID: &str = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
 
 fn controls(token: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
@@ -176,12 +179,23 @@ async fn source_only_preserves_versioning_contract_for_each_bucket_state() {
             source_controls(&format!("versioning-{versioning:?}"), false, "none"),
         )
         .await;
+        let original_version = response.headers().get("x-amz-version-id").cloned();
         assert_eq!(
             response.status(),
             StatusCode::OK,
             "{}",
             response.text().await.unwrap()
         );
+        match versioning {
+            State::Unversioned => assert!(original_version.is_none()),
+            State::Enabled => {
+                assert!(
+                    uuid::Uuid::parse_str(original_version.as_ref().unwrap().to_str().unwrap())
+                        .is_ok()
+                )
+            }
+            State::Suspended => assert_eq!(original_version.as_ref().unwrap(), "null"),
+        }
         let replay = signed_zip(
             &harness,
             QUERY,
@@ -191,25 +205,9 @@ async fn source_only_preserves_versioning_contract_for_each_bucket_state() {
         .await;
         assert_eq!(replay.status(), StatusCode::OK);
         assert_eq!(
-            replay
-                .headers()
-                .get("x-amz-version-id")
-                .and_then(|value| value.to_str().ok()),
-            match versioning {
-                State::Unversioned => None,
-                State::Enabled => replay
-                    .headers()
-                    .get("x-amz-version-id")
-                    .and_then(|value| value.to_str().ok()),
-                State::Suspended => Some("null"),
-            }
+            replay.headers().get("x-amz-version-id"),
+            original_version.as_ref()
         );
-        if versioning == State::Enabled {
-            assert!(
-                uuid::Uuid::parse_str(replay.headers()["x-amz-version-id"].to_str().unwrap())
-                    .is_ok()
-            );
-        }
         assert_eq!(
             object_version::Entity::find()
                 .count(harness.state.store.db())
@@ -391,13 +389,12 @@ async fn source_snapshot(
     (objects, versions, tags, owner)
 }
 
-async fn remote_counts(harness: &TestHarness) -> (u64, u64, u64) {
+async fn pin_counts(harness: &TestHarness) -> [u64; 2] {
     let db = harness.state.store.db();
-    (
-        pin_job::Entity::find().count(db).await.unwrap(),
-        pin_lease::Entity::find().count(db).await.unwrap(),
-        pin_lease_target::Entity::find().count(db).await.unwrap(),
-    )
+    [
+        pin_rows::count(db, "pin_refs").await,
+        pin_rows::count(db, "pin_resources").await,
+    ]
 }
 
 fn assert_v2_ack(response: &reqwest::Response) {
@@ -474,8 +471,8 @@ async fn signed_v2_extracted_only_preserves_existing_source_versions_tags_and_ow
     assert_eq!(snapshot.entries.len(), 1);
     assert!(snapshot.entries[0].version_row_id.is_some());
     assert_eq!(
-        remote_counts(&harness).await,
-        (0, 0, 0),
+        pin_counts(&harness).await,
+        [0, 0],
         "targets=none is local only"
     );
 }
@@ -586,7 +583,7 @@ async fn signed_v2_token_replays_original_batch_after_source_overwrite_but_rejec
             .unwrap(),
         batches
     );
-    assert_eq!(remote_counts(&harness).await, (0, 0, 0));
+    assert_eq!(pin_counts(&harness).await, [0, 0]);
 }
 
 fn hmac(key: &[u8], value: &[u8]) -> Vec<u8> {
@@ -817,7 +814,7 @@ async fn sigv4_valid_unsigned_v2_token_publishes_verified_body_and_replays_witho
     assert_eq!(harness.kubo.received_requests().await.unwrap().len(), io);
     assert_eq!(object_version::Entity::find().count(db).await.unwrap(), 1);
     assert_eq!(zip_batch::Entity::find().count(db).await.unwrap(), 1);
-    assert_eq!(remote_counts(&harness).await, (0, 0, 0));
+    assert_eq!(pin_counts(&harness).await, [0, 0]);
 }
 
 #[tokio::test]
@@ -894,7 +891,7 @@ async fn authenticated_unsigned_source_content_type_is_published_and_contract_bo
             .unwrap(),
         1
     );
-    assert_eq!(remote_counts(&harness).await, (0, 0, 0));
+    assert_eq!(pin_counts(&harness).await, [0, 0]);
 }
 
 async fn send_complete_wire(harness: &TestHarness, headers: &str, body: &[u8]) -> String {
@@ -992,7 +989,7 @@ async fn assert_source_guard_survives_v2(harness: &TestHarness) {
             .await
             .is_err()
     );
-    assert_eq!(remote_counts(harness).await, (0, 0, 0));
+    assert_eq!(pin_counts(harness).await, [0, 0]);
 }
 
 #[tokio::test]
@@ -1063,7 +1060,7 @@ async fn active_source_prefix_mutation_guard_is_not_invalidated_by_v2_output_adm
             .await
             .is_err()
     );
-    assert_eq!(remote_counts(&harness).await, (0, 0, 0));
+    assert_eq!(pin_counts(&harness).await, [0, 0]);
 }
 
 #[tokio::test]
@@ -1824,7 +1821,7 @@ fn remote_controls(token: &str) -> HeaderMap {
 async fn signed_private_output_rule_denies_remote_pin_without_dropping_local_object() {
     let harness = rule_harness(
         KuboScript {
-            add_replies: vec![AddReply::Ok("QmArchive"), AddReply::Ok("QmShared")],
+            add_replies: vec![AddReply::Ok("QmArchive"), AddReply::Ok(SHARED_OUTPUT_CID)],
             cat_bodies: HashMap::from([("QmArchive".into(), legal_single_entry_zip())]),
         },
         false,
@@ -1853,29 +1850,11 @@ async fn signed_private_output_rule_denies_remote_pin_without_dropping_local_obj
             .await
             .unwrap()
             .cid,
-        "QmShared"
+        SHARED_OUTPUT_CID
     );
-    assert_eq!(
-        pin_job::Entity::find()
-            .count(harness.state.store.db())
-            .await
-            .unwrap(),
-        0
-    );
-    assert_eq!(
-        pin_lease::Entity::find()
-            .count(harness.state.store.db())
-            .await
-            .unwrap(),
-        0
-    );
-    assert_eq!(
-        remote_pin::Entity::find()
-            .count(harness.state.store.db())
-            .await
-            .unwrap(),
-        0
-    );
+    let db = harness.state.store.db();
+    assert_eq!(pin_rows::count(db, "pin_refs").await, 0);
+    assert_eq!(pin_rows::count(db, "pin_resources").await, 0);
 }
 
 #[tokio::test]
@@ -1883,8 +1862,8 @@ async fn signed_two_outputs_use_independent_rules_and_same_cid_dedups_remote_tar
     let script = || KuboScript {
         add_replies: vec![
             AddReply::Ok("QmArchive"),
-            AddReply::Ok("QmShared"),
-            AddReply::Ok("QmShared"),
+            AddReply::Ok(SHARED_OUTPUT_CID),
+            AddReply::Ok(SHARED_OUTPUT_CID),
         ],
         cat_bodies: HashMap::from([("QmArchive".into(), legal_two_entry_zip())]),
     };
@@ -1906,87 +1885,74 @@ async fn signed_two_outputs_use_independent_rules_and_same_cid_dedups_remote_tar
         "{}",
         response.text().await.unwrap()
     );
-    let leases = pin_lease::Entity::find()
-        .all(distinct.state.store.db())
-        .await
-        .unwrap();
-    assert_eq!(leases.len(), 2);
-    assert_ne!(
-        leases[0].policy_id, leases[1].policy_id,
-        "each full output key has its own policy"
-    );
-    assert_eq!(
-        remote_pin::Entity::find()
-            .count(distinct.state.store.db())
+    let db = distinct.state.store.db();
+    let refs = pin_rows::refs(db).await;
+    assert_eq!(refs.len(), 2);
+    assert_ne!(refs[0].policy_id, refs[1].policy_id);
+    for (key, provider) in [("out/first.txt", "alpha"), ("out/second.txt", "beta")] {
+        let output = store::object::get_latest(db, &distinct.bucket, key)
             .await
-            .unwrap(),
-        2
-    );
+            .unwrap();
+        let pin_ref = refs
+            .iter()
+            .find(|r| r.owner_object_id == output.id)
+            .unwrap();
+        assert_eq!(pin_ref.provider, provider);
+        assert_eq!(pin_ref.cid, output.cid);
+        assert_eq!(pin_ref.source, "automatic");
+        assert_eq!(pin_ref.content_mode, "object");
+    }
+    assert_eq!(pin_rows::count(db, "pin_resources").await, 2);
 
     let shared = rule_harness(script(), false, false).await;
-    let response = support::sigv4::send_sigv4(
-        reqwest::Method::PUT,
-        &shared.endpoint,
-        &shared.bucket,
-        SOURCE,
-        QUERY,
-        legal_two_entry_zip(),
-        remote_controls("shared-output-cid"),
-        "test",
-    )
-    .await;
-    assert_eq!(
-        response.status(),
-        StatusCode::OK,
-        "{}",
-        response.text().await.unwrap()
-    );
-    assert_eq!(
-        pin_lease::Entity::find()
-            .count(shared.state.store.db())
-            .await
-            .unwrap(),
-        2
-    );
-    assert_eq!(
-        pin_lease_target::Entity::find()
-            .count(shared.state.store.db())
-            .await
-            .unwrap(),
-        2
-    );
-    assert_eq!(
-        remote_pin::Entity::find()
-            .count(shared.state.store.db())
-            .await
-            .unwrap(),
-        1
-    );
-    let jobs = pin_job::Entity::find()
-        .all(shared.state.store.db())
-        .await
-        .unwrap();
+    let send = || {
+        support::sigv4::send_sigv4(
+            reqwest::Method::PUT,
+            &shared.endpoint,
+            &shared.bucket,
+            SOURCE,
+            QUERY,
+            legal_two_entry_zip(),
+            remote_controls("shared-output-cid"),
+            "test",
+        )
+    };
+    let response = send().await;
+    let status = response.status();
+    let xml = response.text().await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{xml}");
+    let db = shared.state.store.db();
+    let refs = pin_rows::refs(db).await;
+    assert_eq!(refs.len(), 2);
+    assert_ne!(refs[0].owner_object_id, refs[1].owner_object_id);
     assert!(
-        jobs.iter()
-            .all(|job| job.provider == "alpha" && job.cid == "QmShared")
+        refs.iter()
+            .all(|r| r.provider == "alpha" && r.cid == SHARED_OUTPUT_CID)
     );
-    assert_eq!(
-        jobs.iter().filter(|job| job.operation == "submit").count(),
-        1,
-        "two output leases must not create two outbound submit jobs"
-    );
-    assert!(
-        jobs.iter()
-            .all(|job| matches!(job.operation.as_str(), "submit" | "reconcile")),
-        "the shared CID may also need a remote-epoch reconcile job"
-    );
+    let resources = pin_rows::resources(db).await;
+    assert_eq!(resources.len(), 1);
+    let resource = &resources[0];
+    assert_eq!(resource.provider, "alpha");
+    assert_eq!(resource.cid, SHARED_OUTPUT_CID);
+    assert_eq!(resource.status, "waiting");
+    assert_eq!(resource.action.as_deref(), Some("submit"));
+    assert!(resource.handle.is_none());
+
+    let calls = shared._kubo.received_requests().await.unwrap().len();
+    let replay = send().await;
+    assert_eq!(replay.status(), StatusCode::OK);
+    assert_eq!(replay.text().await.unwrap(), xml);
+    assert_eq!(shared._kubo.received_requests().await.unwrap().len(), calls);
+    assert_eq!(object_version::Entity::find().count(db).await.unwrap(), 2);
+    assert_eq!(pin_rows::refs(db).await, refs);
+    assert_eq!(pin_rows::resources(db).await, resources);
 }
 
 #[tokio::test]
-async fn signed_remote_route_drift_during_publication_rolls_back_versions_and_remote_intents() {
+async fn signed_pin_ref_write_failure_rolls_back_objects_versions_and_resources() {
     let harness = rule_harness(
         KuboScript {
-            add_replies: vec![AddReply::Ok("QmArchive"), AddReply::Ok("QmShared")],
+            add_replies: vec![AddReply::Ok("QmArchive"), AddReply::Ok(SHARED_OUTPUT_CID)],
             cat_bodies: HashMap::from([("QmArchive".into(), legal_single_entry_zip())]),
         },
         false,
@@ -1994,18 +1960,7 @@ async fn signed_remote_route_drift_during_publication_rolls_back_versions_and_re
     )
     .await;
     let db = harness.state.store.db();
-    let original = db
-        .query_one(Statement::from_string(
-            db.get_database_backend(),
-            "SELECT snapshot FROM pin_provider_routes ORDER BY provider LIMIT 1",
-        ))
-        .await
-        .unwrap()
-        .unwrap();
-    let original: String = original.try_get("", "snapshot").unwrap();
-    // Trigger runs *inside* the publication transaction after the preflight;
-    // provider route verification must reject it, with every write rolled back.
-    db.execute_unprepared("CREATE TRIGGER zip_v2_route_drift AFTER INSERT ON object_versions WHEN NEW.key='out/file.txt' BEGIN UPDATE pin_provider_routes SET snapshot='{}'; END")
+    db.execute_unprepared("CREATE TRIGGER zip_v2_reject_ref BEFORE INSERT ON pin_refs BEGIN SELECT RAISE(ABORT, 'force pin reference rollback'); END")
         .await.unwrap();
     let response = support::sigv4::send_sigv4(
         reqwest::Method::PUT,
@@ -2014,40 +1969,18 @@ async fn signed_remote_route_drift_during_publication_rolls_back_versions_and_re
         SOURCE,
         QUERY,
         legal_single_entry_zip(),
-        remote_controls("route-drift-v2"),
+        remote_controls("pin-ref-rollback-v2"),
         "test",
     )
     .await;
     assert_ne!(
         response.status(),
         StatusCode::OK,
-        "route drift must reject the entire transaction"
+        "pin reference write failure must reject the entire transaction"
     );
-    assert!(
-        store::object::get_latest(db, &harness.bucket, OUTPUT)
-            .await
-            .is_err()
-    );
-    assert_eq!(object_version::Entity::find().count(db).await.unwrap(), 0);
-    assert_eq!(remote_pin::Entity::find().count(db).await.unwrap(), 0);
-    assert_eq!(pin_lease::Entity::find().count(db).await.unwrap(), 0);
-    let unchanged: String = db
-        .query_one(Statement::from_string(
-            db.get_database_backend(),
-            "SELECT snapshot FROM pin_provider_routes ORDER BY provider LIMIT 1",
-        ))
-        .await
-        .unwrap()
-        .unwrap()
-        .try_get("", "snapshot")
-        .unwrap();
-    assert_eq!(
-        unchanged, original,
-        "route drift cannot persist on rollback"
-    );
-    db.execute_unprepared("DROP TRIGGER zip_v2_route_drift")
-        .await
-        .unwrap();
+    for table in ["objects", "object_versions", "pin_refs", "pin_resources"] {
+        assert_eq!(pin_rows::count(db, table).await, 0, "{table}");
+    }
 }
 
 #[tokio::test]
@@ -2056,8 +1989,8 @@ async fn current_automatic_deny_resumes_pending_retry_with_local_publication_onl
         KuboScript {
             add_replies: vec![
                 AddReply::Ok("QmArchive"),
-                AddReply::Ok("QmShared"),
-                AddReply::Ok("QmShared"),
+                AddReply::Ok(SHARED_OUTPUT_CID),
+                AddReply::Ok(SHARED_OUTPUT_CID),
             ],
             cat_bodies: HashMap::from([("QmArchive".into(), legal_single_entry_zip())]),
         },
@@ -2145,27 +2078,15 @@ async fn current_automatic_deny_resumes_pending_retry_with_local_publication_onl
             .await
             .unwrap()
             .cid,
-        "QmShared"
+        SHARED_OUTPUT_CID
     );
     assert!(
         store::object::get_latest(db, &harness.bucket, SOURCE)
             .await
             .is_err()
     );
-    assert_eq!(pin_lease::Entity::find().count(db).await.unwrap(), 0);
-    assert_eq!(pin_lease_target::Entity::find().count(db).await.unwrap(), 0);
-    assert_eq!(remote_pin::Entity::find().count(db).await.unwrap(), 0);
-    assert_eq!(pin_job::Entity::find().count(db).await.unwrap(), 0);
-    let usage = db.query_one(Statement::from_string(db.get_database_backend(),
-        "SELECT COALESCE(SUM(reserved_bytes),0) AS bytes, COALESCE(SUM(reserved_pins),0) AS pins FROM pin_provider_usage".to_owned(),
-    )).await.unwrap().unwrap();
-    assert_eq!(
-        (
-            usage.try_get::<i64>("", "bytes").unwrap(),
-            usage.try_get::<i64>("", "pins").unwrap()
-        ),
-        (0, 0)
-    );
+    assert_eq!(pin_rows::count(db, "pin_refs").await, 0);
+    assert_eq!(pin_rows::count(db, "pin_resources").await, 0);
     let replay = support::sigv4::send_sigv4(
         reqwest::Method::PUT,
         &server.endpoint,

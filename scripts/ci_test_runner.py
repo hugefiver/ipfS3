@@ -22,7 +22,7 @@ TEST_TARGETS = (
     "http_admission",
     "object_read_snapshot",
     "bucket_config_owner_atomicity",
-    "schema_baseline",
+    "file_pin_schema",
     "schema_baseline_semantics",
 )
 
@@ -34,10 +34,9 @@ HARNESS_SPECS = {
 GATEWAY_SPEC = ("bin", PACKAGE_NAME, False)
 
 SHARDS = (
-    "core-legacy-remainder",
+    "core-remainder",
     "worker-providers",
-    "store-pinning-control",
-    "management",
+    "store-pinning",
 )
 
 
@@ -46,15 +45,11 @@ class RunnerError(RuntimeError):
 
 
 def classify_lib_test(name: str) -> str:
-    if name.startswith("store::pinning::management::"):
-        return "management"
-    if name.startswith("store::pinning::legacy_migration::"):
-        return "core-legacy-remainder"
     if name.startswith("store::pinning::"):
-        return "store-pinning-control"
+        return "store-pinning"
     if name.startswith("pinning::"):
         return "worker-providers"
-    return "core-legacy-remainder"
+    return "core-remainder"
 
 
 def partition_lib_tests(names: list[str]) -> dict[str, list[str]]:

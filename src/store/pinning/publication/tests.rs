@@ -28,8 +28,7 @@ use crate::{
         database_clock::database_now,
         entities::{
             import_destination, import_job, import_job_result, import_job_target, lifecycle_action,
-            object, object_tag, object_version, pin_job, pin_lease, pin_lease_target,
-            pin_provider_usage, remote_pin,
+            object, object_tag, object_version,
         },
         import::{
             jobs::{NewImportJob, claim_due},
@@ -47,8 +46,6 @@ use crate::{
 mod delete_lock_tests;
 mod hot_receipt_tests;
 mod publication_lease_tests;
-mod quota_window_tests;
-mod runtime_publication_tests;
 pub(super) mod zip_fixture;
 
 fn limits() -> ProviderLimitMap {
@@ -72,23 +69,6 @@ fn limits() -> ProviderLimitMap {
             },
         ),
     ])
-}
-
-#[test]
-fn zip_object_writes_use_location_order_even_when_entries_are_reversed() {
-    let archive = object("archive", "z/archive.zip", "bafy-archive", 7);
-    let entries = vec![
-        object("entry-z", "z/file.txt", "bafy-z", 1),
-        object("entry-a", "a/file.txt", "bafy-a", 1),
-    ];
-
-    assert_eq!(
-        ordered_publication_objects(&archive, &entries)
-            .into_iter()
-            .map(|object| object.id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["entry-a", "archive", "entry-z"]
-    );
 }
 
 #[tokio::test]
@@ -119,7 +99,7 @@ async fn zip_duplicate_entry_location_preserves_last_entry_wins() {
         .unwrap();
     assert_eq!(
         (latest.id.as_str(), latest.cid.as_str()),
-        ("a-second", "bafy-second")
+        ("a-second", fixture_cid("bafy-second").as_str())
     );
 }
 
@@ -150,12 +130,21 @@ fn intent(
     }
 }
 
+fn fixture_cid(label: &str) -> String {
+    let hash = cid::multihash::Multihash::<64>::wrap(0, label.as_bytes()).unwrap();
+    cid::Cid::new_v1(0x55, hash).to_string()
+}
+
 fn object(id: &str, key: &str, cid: &str, logical_size: i64) -> PublicationObject {
     PublicationObject::from_put(
         id.to_owned(),
         "bucket",
         key,
-        cid.to_owned(),
+        if cid.starts_with("bafy-") {
+            fixture_cid(cid)
+        } else {
+            cid.to_owned()
+        },
         logical_size,
         Some("application/octet-stream".to_owned()),
         Some(serde_json::json!({"fixture": true})),
@@ -280,8 +269,11 @@ async fn decided_publication_binds_skipped_snapshot_to_exact_version_atomically(
     assert_eq!(persisted.effect, DecisionEffect::Skipped);
     let raw = serde_json::to_string(&persisted).unwrap();
     assert!(!raw.contains("private-value"));
-    assert_eq!(pin_lease::Entity::find().count(&db).await.unwrap(), 0);
-    assert_eq!(pin_job::Entity::find().count(&db).await.unwrap(), 0);
+    assert_eq!(sql_count(&db, "SELECT COUNT(*) n FROM pin_refs").await, 0);
+    assert_eq!(
+        sql_count(&db, "SELECT COUNT(*) n FROM pin_resources").await,
+        0
+    );
     assert!(
         decision
             .replay_policy(vec![tag("ipfs-s3:pin", "false")])
@@ -403,9 +395,6 @@ async fn captured_skip_never_becomes_a_new_pin_when_provider_is_added() {
         ..PinningConfig::default()
     };
     let after = ValidatedPinningConfig::from_raw(&configured, |_| None).unwrap();
-    super::super::ledger::register_route(&db, "pinata", &after.providers[0].identity)
-        .await
-        .unwrap();
     let policy = captured.replay_policy(tags.clone()).unwrap();
     let mut publication = request(object("late-id", "late", "bafy-late", 7), tags, vec![]);
     publication.policy = policy;
@@ -421,8 +410,11 @@ async fn captured_skip_never_becomes_a_new_pin_when_provider_is_added() {
     )
     .await
     .unwrap();
-    assert_eq!(pin_lease::Entity::find().count(&db).await.unwrap(), 0);
-    assert_eq!(pin_job::Entity::find().count(&db).await.unwrap(), 0);
+    assert_eq!(sql_count(&db, "SELECT COUNT(*) n FROM pin_refs").await, 0);
+    assert_eq!(
+        sql_count(&db, "SELECT COUNT(*) n FROM pin_resources").await,
+        0
+    );
 
     let tags = vec![tag("ipfs-s3:pin", "true")];
     let (accepted_policy, accepted) =
@@ -455,7 +447,7 @@ async fn captured_skip_never_becomes_a_new_pin_when_provider_is_added() {
     )
     .await
     .unwrap();
-    assert_eq!(pin_lease::Entity::find().count(&db).await.unwrap(), 1);
+    assert_eq!(sql_count(&db, "SELECT COUNT(*) n FROM pin_refs").await, 1);
     let version = versions_for(&db, "other").await.remove(0);
     assert_eq!(
         crate::store::pinning::decision::read_for_version(&db, &version.id)
@@ -523,9 +515,6 @@ async fn strict_legacy_provider_capture_publishes_automatic_and_manual_intents()
     );
     let validated =
         ValidatedPinningConfig::from_config(&config, |_| Some("do-not-persist-me".into())).unwrap();
-    super::super::ledger::register_route(&db, "pinata", &validated.providers[0].identity)
-        .await
-        .unwrap();
     let tags = vec![tag("ipfs-s3:pin", "true")];
     let (policy, decision) = PinPolicyEvaluator::new(&validated)
         .evaluate_publication_decision(
@@ -570,17 +559,7 @@ async fn strict_legacy_provider_capture_publishes_automatic_and_manual_intents()
     )
     .await
     .unwrap();
-    assert_eq!(pin_lease::Entity::find().count(&db).await.unwrap(), 2);
-    let remote = super::super::ledger::get(&db, "pinata", "bafy-legacy")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(remote.ownership, "unknown");
-    assert!(
-        !super::super::ledger::cleanup_allowed(&db, "pinata", "bafy-legacy")
-            .await
-            .unwrap()
-    );
+    assert_eq!(sql_count(&db, "SELECT COUNT(*) n FROM pin_refs").await, 2);
     let version = versions_for(&db, "legacy").await.remove(0);
     assert_eq!(
         crate::store::pinning::decision::read_for_version(&db, &version.id)
@@ -661,7 +640,7 @@ async fn guarded_delete(
 ) -> AppResult<crate::store::object_version::DeleteVersionResult> {
     let guard =
         admit_content_mutation(db, "bucket", key, None, SupersedeReason::DeleteObject, now).await?;
-    delete_version_with_leases_guarded(db, "bucket", key, selector, guard, now).await
+    delete_version_guarded(db, "bucket", key, selector, guard, now).await
 }
 
 async fn assert_version_projection_agrees(db: &DatabaseConnection, key: &str) {
@@ -802,13 +781,9 @@ async fn lifecycle_current_expiration_applies_each_current_versioning_state() {
         0
     );
     assert!(
-        pin_lease::Entity::find()
-            .filter(pin_lease::Column::OwnerObjectId.eq("unversioned-current"))
-            .all(&db)
+        targets_for_object(&db, "unversioned-current")
             .await
-            .unwrap()
-            .iter()
-            .all(|lease| lease.state == "cancelled")
+            .is_empty()
     );
     assert_eq!(
         crate::store::object::get_latest(&db, "bucket", "shared")
@@ -817,15 +792,7 @@ async fn lifecycle_current_expiration_applies_each_current_versioning_state() {
             .id,
         "shared-other"
     );
-    assert!(
-        pin_lease::Entity::find()
-            .filter(pin_lease::Column::OwnerObjectId.eq("shared-other"))
-            .all(&db)
-            .await
-            .unwrap()
-            .iter()
-            .all(|lease| lease.state == "active")
-    );
+    assert!(targets_for_object(&db, "shared-other").await.len() == 3);
     assert_eq!(lifecycle_action_snapshot(&db).await, actions_before);
 
     set_versioning(&db, BucketVersioningState::Enabled).await;
@@ -898,15 +865,7 @@ async fn lifecycle_current_expiration_applies_each_current_versioning_state() {
                 .unwrap(),
             3
         );
-        assert!(
-            pin_lease::Entity::find()
-                .filter(pin_lease::Column::OwnerObjectId.eq(object_id))
-                .all(&db)
-                .await
-                .unwrap()
-                .iter()
-                .all(|lease| lease.state == "active")
-        );
+        assert!(targets_for_object(&db, object_id).await.len() == 3);
     }
     assert_eq!(lifecycle_action_snapshot(&db).await, actions_before);
 
@@ -972,15 +931,7 @@ async fn lifecycle_current_expiration_applies_each_current_versioning_state() {
             .unwrap(),
         0
     );
-    assert!(
-        pin_lease::Entity::find()
-            .filter(pin_lease::Column::OwnerObjectId.eq("suspended-sse-c"))
-            .all(&db)
-            .await
-            .unwrap()
-            .iter()
-            .all(|lease| lease.state == "cancelled")
-    );
+    assert!(targets_for_object(&db, "suspended-sse-c").await.is_empty());
     assert_eq!(
         object_tag::Entity::find()
             .filter(object_tag::Column::ObjectId.eq("suspended-opaque"))
@@ -989,15 +940,7 @@ async fn lifecycle_current_expiration_applies_each_current_versioning_state() {
             .unwrap(),
         3
     );
-    assert!(
-        pin_lease::Entity::find()
-            .filter(pin_lease::Column::OwnerObjectId.eq("suspended-opaque"))
-            .all(&db)
-            .await
-            .unwrap()
-            .iter()
-            .all(|lease| lease.state == "active")
-    );
+    assert!(targets_for_object(&db, "suspended-opaque").await.len() == 3);
     assert_eq!(lifecycle_action_snapshot(&db).await, actions_before);
 }
 
@@ -1169,11 +1112,7 @@ async fn lifecycle_current_expiration_deletes_only_a_sole_current_marker() {
             .find(|version| version.version_id.as_deref() == Some(marker.as_str()))
             .unwrap(),
     );
-    let leases_before = pin_lease::Entity::find()
-        .order_by_asc(pin_lease::Column::Id)
-        .all(&db)
-        .await
-        .unwrap();
+    let refs_before = targets_for_object(&db, "marker-owner").await;
     let tags_before = crate::store::pinning::tags::list_object_tags(&db, "marker-owner")
         .await
         .unwrap();
@@ -1195,14 +1134,7 @@ async fn lifecycle_current_expiration_deletes_only_a_sole_current_marker() {
         crate::store::object::get_latest(&db, "bucket", "marker").await,
         Err(AppError::NoSuchKey(_))
     ));
-    assert_eq!(
-        pin_lease::Entity::find()
-            .order_by_asc(pin_lease::Column::Id)
-            .all(&db)
-            .await
-            .unwrap(),
-        leases_before
-    );
+    assert_eq!(targets_for_object(&db, "marker-owner").await, refs_before);
     assert_eq!(
         crate::store::pinning::tags::list_object_tags(&db, "marker-owner")
             .await
@@ -1345,7 +1277,7 @@ async fn lifecycle_timestamp_publication_demotion_and_promotion_use_database_tim
     )
     .await
     .unwrap();
-    delete_version_with_leases_guarded(
+    delete_version_guarded(
         &db,
         "bucket",
         "lifecycle-time-key",
@@ -1669,15 +1601,7 @@ async fn sqlite_parallel_publish_delete_tag_has_one_latest_and_no_null_leak() {
                 .unwrap(),
             3
         );
-        assert!(
-            pin_lease::Entity::find()
-                .filter(pin_lease::Column::OwnerObjectId.eq(object_id))
-                .all(&first)
-                .await
-                .unwrap()
-                .iter()
-                .all(|lease| lease.state == "active")
-        );
+        assert!(targets_for_object(&first, object_id).await.len() == 3);
     }
 
     let current = enabled.iter().find(|version| version.is_latest).unwrap();
@@ -1717,7 +1641,7 @@ async fn sqlite_parallel_publish_delete_tag_has_one_latest_and_no_null_leak() {
         let start = start.clone();
         tokio::spawn(async move {
             start.wait().await;
-            delete_version_with_leases_guarded(
+            delete_version_guarded(
                 &db,
                 "bucket",
                 "enabled-race",
@@ -1763,15 +1687,7 @@ async fn sqlite_parallel_publish_delete_tag_has_one_latest_and_no_null_leak() {
             tag("team", "retained-after-delete"),
         ]
     );
-    assert!(
-        pin_lease::Entity::find()
-            .filter(pin_lease::Column::OwnerObjectId.eq(&current_owner))
-            .all(&first)
-            .await
-            .unwrap()
-            .iter()
-            .all(|lease| lease.state == "active")
-    );
+    assert!(targets_for_object(&first, &current_owner).await.len() == 3);
 
     let exact_guard = admit_content_mutation(
         &first,
@@ -1783,7 +1699,7 @@ async fn sqlite_parallel_publish_delete_tag_has_one_latest_and_no_null_leak() {
     )
     .await
     .unwrap();
-    delete_version_with_leases_guarded(
+    delete_version_guarded(
         &second,
         "bucket",
         "enabled-race",
@@ -1801,15 +1717,7 @@ async fn sqlite_parallel_publish_delete_tag_has_one_latest_and_no_null_leak() {
             .unwrap(),
         0
     );
-    assert!(
-        pin_lease::Entity::find()
-            .filter(pin_lease::Column::OwnerObjectId.eq(&current_owner))
-            .all(&first)
-            .await
-            .unwrap()
-            .iter()
-            .all(|lease| lease.state == "cancelled")
-    );
+    assert!(targets_for_object(&first, &current_owner).await.is_empty());
 
     set_versioning(&first, BucketVersioningState::Suspended).await;
     let start = Arc::new(tokio::sync::Barrier::new(3));
@@ -1875,15 +1783,7 @@ async fn sqlite_parallel_publish_delete_tag_has_one_latest_and_no_null_leak() {
             .unwrap(),
         0
     );
-    assert!(
-        pin_lease::Entity::find()
-            .filter(pin_lease::Column::OwnerObjectId.eq(loser))
-            .all(&first)
-            .await
-            .unwrap()
-            .iter()
-            .all(|lease| lease.state == "cancelled")
-    );
+    assert!(targets_for_object(&first, loser).await.is_empty());
 
     crate::store::pinning::tags::replace_object_tags(
         &second,
@@ -2042,15 +1942,7 @@ async fn failed_transition_rolls_back_index_projection_and_leases() {
             .unwrap(),
         3
     );
-    assert!(
-        pin_lease::Entity::find()
-            .filter(pin_lease::Column::OwnerObjectId.eq("rollback-owner"))
-            .all(&first)
-            .await
-            .unwrap()
-            .iter()
-            .all(|lease| lease.state == "active" && lease.generation == 1)
-    );
+    assert!(targets_for_object(&first, "rollback-owner").await.len() == 3);
 }
 
 #[tokio::test]
@@ -2090,7 +1982,11 @@ async fn sqlite_publication_waits_for_existing_writer_before_starting_read_snaps
         .unwrap();
     assert_eq!(
         (latest.id.as_str(), latest.cid.as_str(), latest.is_latest),
-        ("write-intent-publication", "bafy-write-intent", true)
+        (
+            "write-intent-publication",
+            fixture_cid("bafy-write-intent").as_str(),
+            true
+        )
     );
 }
 
@@ -2136,23 +2032,33 @@ where
     T::find().count(db).await.unwrap()
 }
 
-async fn jobs(db: &DatabaseConnection) -> Vec<pin_job::Model> {
-    pin_job::Entity::find()
-        .order_by_asc(pin_job::Column::Id)
-        .all(db)
+pub(super) async fn sql_count(db: &DatabaseConnection, sql: &str) -> u64 {
+    db.query_one(Statement::from_string(db.get_database_backend(), sql))
         .await
         .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "n")
+        .unwrap() as u64
 }
 
+async fn targets_for_object(
+    db: &DatabaseConnection,
+    owner: &str,
+) -> Vec<(String, String, String, i64)> {
+    db.query_all(Statement::from_sql_and_values(db.get_database_backend(),
+        "SELECT provider, cid, source, expires_at FROM pin_refs WHERE owner_object_id=$1 ORDER BY provider,cid,source", [owner.into()])).await.unwrap().into_iter().map(|row| (
+        row.try_get("", "provider").unwrap(),row.try_get("", "cid").unwrap(),row.try_get("", "source").unwrap(),row.try_get("", "expires_at").unwrap()
+    )).collect()
+}
 async fn assert_no_publication_rows(db: &DatabaseConnection) {
     assert_eq!(rows::<object::Entity>(db).await, 0);
     assert_eq!(rows::<object_version::Entity>(db).await, 0);
     assert_eq!(rows::<object_tag::Entity>(db).await, 0);
-    assert_eq!(rows::<pin_lease::Entity>(db).await, 0);
-    assert_eq!(rows::<pin_lease_target::Entity>(db).await, 0);
-    assert_eq!(rows::<remote_pin::Entity>(db).await, 0);
-    assert_eq!(rows::<pin_provider_usage::Entity>(db).await, 0);
-    assert_eq!(rows::<pin_job::Entity>(db).await, 0);
+    assert_eq!(sql_count(db, "SELECT COUNT(*) n FROM pin_refs").await, 0);
+    assert_eq!(
+        sql_count(db, "SELECT COUNT(*) n FROM pin_resources").await,
+        0
+    );
 }
 
 #[tokio::test]
@@ -2200,13 +2106,7 @@ async fn unversioned_publication_replaces_hidden_null_and_ends_displaced_lease()
             .unwrap(),
         0
     );
-    let displaced = pin_lease::Entity::find()
-        .filter(pin_lease::Column::OwnerObjectId.eq("unversioned-old"))
-        .all(&db)
-        .await
-        .unwrap();
-    assert_eq!(displaced.len(), 2);
-    assert!(displaced.iter().all(|lease| lease.state == "cancelled"));
+    assert!(targets_for_object(&db, "unversioned-old").await.is_empty());
 }
 
 #[tokio::test]
@@ -2254,13 +2154,7 @@ async fn enabled_publication_retains_prior_version_tags_and_lease() {
             .unwrap(),
         3
     );
-    let retained = pin_lease::Entity::find()
-        .filter(pin_lease::Column::OwnerObjectId.eq("enabled-old"))
-        .all(&db)
-        .await
-        .unwrap();
-    assert_eq!(retained.len(), 2);
-    assert!(retained.iter().all(|lease| lease.state == "active"));
+    assert_eq!(targets_for_object(&db, "enabled-old").await.len(), 3);
 }
 
 #[tokio::test]
@@ -2324,25 +2218,9 @@ async fn suspended_publication_replaces_null_and_ends_only_displaced_null_lease(
         Some("null-new")
     );
     for retained_id in ["opaque-old", "opaque-current"] {
-        assert!(
-            pin_lease::Entity::find()
-                .filter(pin_lease::Column::OwnerObjectId.eq(retained_id))
-                .all(&db)
-                .await
-                .unwrap()
-                .iter()
-                .all(|lease| lease.state == "active")
-        );
+        assert!(targets_for_object(&db, retained_id).await.len() == 3);
     }
-    assert!(
-        pin_lease::Entity::find()
-            .filter(pin_lease::Column::OwnerObjectId.eq("null-old"))
-            .all(&db)
-            .await
-            .unwrap()
-            .iter()
-            .all(|lease| lease.state == "cancelled")
-    );
+    assert!(targets_for_object(&db, "null-old").await.is_empty());
     assert_eq!(
         object_tag::Entity::find()
             .filter(object_tag::Column::ObjectId.eq("null-old"))
@@ -2362,7 +2240,7 @@ async fn suspended_publication_replaces_null_and_ends_only_displaced_null_lease(
 }
 
 #[tokio::test]
-async fn publication_rollback_preserves_index_projection_tags_leases_quota_and_jobs() {
+async fn publication_rollback_preserves_versions_tags_and_refs() {
     let db = setup().await;
     publish_object(
         &db,
@@ -2374,7 +2252,7 @@ async fn publication_rollback_preserves_index_projection_tags_leases_quota_and_j
     let before_versions = versions_for(&db, "key").await;
     let before_counts = publication_row_counts(&db).await;
     db.execute_unprepared(
-        "CREATE TRIGGER fail_new_pin_job BEFORE INSERT ON pin_jobs \
+        "CREATE TRIGGER fail_new_pin_job BEFORE INSERT ON pin_resources \
          BEGIN SELECT RAISE(FAIL, 'forced new pin job failure'); END;",
     )
     .await
@@ -2406,24 +2284,7 @@ async fn publication_rollback_preserves_index_projection_tags_leases_quota_and_j
             .unwrap(),
         3
     );
-    assert!(
-        pin_lease::Entity::find()
-            .filter(pin_lease::Column::OwnerObjectId.eq("rollback-old"))
-            .all(&db)
-            .await
-            .unwrap()
-            .iter()
-            .all(|lease| lease.state == "active" && lease.generation == 1)
-    );
-    for provider in ["pinata", "filebase"] {
-        let usage = pin_provider_usage::Entity::find_by_id(provider)
-            .one(&db)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!((usage.reserved_bytes, usage.reserved_pins), (7, 1));
-    }
-    assert_eq!(jobs(&db).await.len(), 2);
+    assert!(targets_for_object(&db, "rollback-old").await.len() == 3);
 }
 
 #[tokio::test]
@@ -2591,24 +2452,8 @@ async fn exact_content_delete_ends_only_selected_internal_owner() {
             .id,
         "exact-retained"
     );
-    assert!(
-        pin_lease::Entity::find()
-            .filter(pin_lease::Column::OwnerObjectId.eq("exact-selected"))
-            .all(&db)
-            .await
-            .unwrap()
-            .iter()
-            .all(|lease| lease.state == "cancelled")
-    );
-    assert!(
-        pin_lease::Entity::find()
-            .filter(pin_lease::Column::OwnerObjectId.eq("exact-retained"))
-            .all(&db)
-            .await
-            .unwrap()
-            .iter()
-            .all(|lease| lease.state == "active")
-    );
+    assert!(targets_for_object(&db, "exact-selected").await.is_empty());
+    assert!(targets_for_object(&db, "exact-retained").await.len() == 3);
     assert_eq!(
         object_tag::Entity::find()
             .filter(object_tag::Column::ObjectId.eq("exact-selected"))
@@ -2643,23 +2488,7 @@ async fn exact_marker_delete_has_no_lease_work() {
         .unwrap()
         .version_id
         .unwrap();
-    let leases_before = pin_lease::Entity::find()
-        .order_by_asc(pin_lease::Column::Id)
-        .all(&db)
-        .await
-        .unwrap();
-    let targets_before = pin_lease_target::Entity::find()
-        .order_by_asc(pin_lease_target::Column::Id)
-        .all(&db)
-        .await
-        .unwrap();
-    let remotes_before = remote_pin::Entity::find()
-        .order_by_asc(remote_pin::Column::Provider)
-        .order_by_asc(remote_pin::Column::Cid)
-        .all(&db)
-        .await
-        .unwrap();
-    let jobs_before = jobs(&db).await;
+    let refs_before = targets_for_object(&db, "marker-owner").await;
 
     let result = guarded_delete(
         &db,
@@ -2680,32 +2509,7 @@ async fn exact_marker_delete_has_no_lease_work() {
             .id,
         "marker-owner"
     );
-    assert_eq!(
-        pin_lease::Entity::find()
-            .order_by_asc(pin_lease::Column::Id)
-            .all(&db)
-            .await
-            .unwrap(),
-        leases_before
-    );
-    assert_eq!(
-        pin_lease_target::Entity::find()
-            .order_by_asc(pin_lease_target::Column::Id)
-            .all(&db)
-            .await
-            .unwrap(),
-        targets_before
-    );
-    assert_eq!(
-        remote_pin::Entity::find()
-            .order_by_asc(remote_pin::Column::Provider)
-            .order_by_asc(remote_pin::Column::Cid)
-            .all(&db)
-            .await
-            .unwrap(),
-        remotes_before
-    );
-    assert_eq!(jobs(&db).await, jobs_before);
+    assert_eq!(targets_for_object(&db, "marker-owner").await, refs_before);
 }
 
 #[tokio::test]
@@ -2816,16 +2620,9 @@ async fn delete_race_loses_to_newer_mutation_fence() {
             .unwrap();
     let versions_before = versions_for(&db, "race").await;
 
-    let error = delete_version_with_leases_guarded(
-        &db,
-        "bucket",
-        "race",
-        VersionSelector::Current,
-        stale,
-        now,
-    )
-    .await
-    .unwrap_err();
+    let error = delete_version_guarded(&db, "bucket", "race", VersionSelector::Current, stale, now)
+        .await
+        .unwrap_err();
     assert!(matches!(error, AppError::StaleContentMutation));
     assert_eq!(versions_for(&db, "race").await, versions_before);
     assert_eq!(
@@ -2836,16 +2633,10 @@ async fn delete_race_loses_to_newer_mutation_fence() {
         "race-owner"
     );
 
-    let result = delete_version_with_leases_guarded(
-        &db,
-        "bucket",
-        "race",
-        VersionSelector::Current,
-        winner,
-        now,
-    )
-    .await
-    .unwrap();
+    let result =
+        delete_version_guarded(&db, "bucket", "race", VersionSelector::Current, winner, now)
+            .await
+            .unwrap();
     assert!(result.created_delete_marker);
 }
 
@@ -2927,15 +2718,12 @@ async fn publish_import_winner(
     .unwrap();
 }
 
-async fn publication_row_counts(db: &DatabaseConnection) -> [u64; 7] {
+async fn publication_row_counts(db: &DatabaseConnection) -> [u64; 4] {
     [
         rows::<object::Entity>(db).await,
         rows::<object_tag::Entity>(db).await,
-        rows::<pin_lease::Entity>(db).await,
-        rows::<pin_lease_target::Entity>(db).await,
-        rows::<remote_pin::Entity>(db).await,
-        rows::<pin_provider_usage::Entity>(db).await,
-        rows::<pin_job::Entity>(db).await,
+        sql_count(db, "SELECT COUNT(*) n FROM pin_refs").await,
+        sql_count(db, "SELECT COUNT(*) n FROM pin_resources").await,
     ]
 }
 
@@ -2981,7 +2769,7 @@ async fn newer_completed_import_fences_every_older_exact_standard_publication() 
                 .await
                 .unwrap()
                 .cid,
-            format!("bafy-newer-{key}")
+            fixture_cid(&format!("bafy-newer-{key}"))
         );
     }
 }
@@ -3033,16 +2821,10 @@ async fn newer_completed_import_fences_older_delete_and_delete_objects_keys() {
         .await;
         let rows_after_import = publication_row_counts(&db).await;
 
-        let error = delete_version_with_leases_guarded(
-            &db,
-            "bucket",
-            key,
-            VersionSelector::Current,
-            guard,
-            now,
-        )
-        .await
-        .unwrap_err();
+        let error =
+            delete_version_guarded(&db, "bucket", key, VersionSelector::Current, guard, now)
+                .await
+                .unwrap_err();
 
         assert!(matches!(error, AppError::StaleContentMutation));
         assert_eq!(publication_row_counts(&db).await, rows_after_import);
@@ -3051,7 +2833,7 @@ async fn newer_completed_import_fences_older_delete_and_delete_objects_keys() {
                 .await
                 .unwrap()
                 .cid,
-            format!("bafy-newer-{label}")
+            fixture_cid(&format!("bafy-newer-{label}"))
         );
     }
 }
@@ -3120,7 +2902,7 @@ async fn newer_exact_import_fences_older_prefix_publication_without_side_effects
             .await
             .unwrap()
             .cid,
-        "bafy-newer-prefix"
+        fixture_cid("bafy-newer-prefix")
     );
 }
 
@@ -3179,14 +2961,14 @@ async fn unrelated_exact_import_does_not_fence_older_prefix_publication() {
             .await
             .unwrap()
             .cid,
-        "bafy-entry"
+        fixture_cid("bafy-entry")
     );
     assert_eq!(
         crate::store::object::get_latest(&db, "bucket", "outside/file.txt")
             .await
             .unwrap()
             .cid,
-        "bafy-unrelated"
+        fixture_cid("bafy-unrelated")
     );
 }
 
@@ -3401,7 +3183,11 @@ async fn guarded_import_publication_completes_and_releases_ownership() {
             job.final_cid.as_deref(),
             job.logical_size
         ),
-        ("completed", Some("bafy-published"), Some(7))
+        (
+            "completed",
+            Some(fixture_cid("bafy-published").as_str()),
+            Some(7)
+        )
     );
     let destination = crate::store::entities::import_destination::Entity::find_by_id((
         "bucket".to_owned(),
@@ -3565,11 +3351,8 @@ async fn guarded_import_completion_after_capped_job_deadline_rolls_back() {
              (SELECT COUNT(*) FROM objects) = 0 OR
              (SELECT COUNT(*) FROM object_versions) = 0 OR
              (SELECT COUNT(*) FROM object_tags) = 0 OR
-             (SELECT COUNT(*) FROM pin_leases) = 0 OR
-             (SELECT COUNT(*) FROM pin_lease_targets) = 0 OR
-             (SELECT COUNT(*) FROM remote_pins) = 0 OR
-             (SELECT COUNT(*) FROM pin_provider_usage) = 0 OR
-             (SELECT COUNT(*) FROM pin_jobs) = 0
+             (SELECT COUNT(*) FROM pin_refs) = 0 OR
+             (SELECT COUNT(*) FROM pin_resources) = 0
            THEN RAISE(FAIL, 'publication writes must precede completion') END;
            UPDATE import_jobs
              SET locked_until = strftime('%Y-%m-%d %H:%M:%f+00:00', 'now')
@@ -3917,47 +3700,8 @@ async fn persisted_pin_control_without_policy_tags_is_rejected_before_any_mutati
     assert_no_publication_rows(&db).await;
 }
 
-async fn remote(db: &DatabaseConnection, provider: &str, cid: &str) -> remote_pin::Model {
-    remote_pin::Entity::find_by_id((provider.to_owned(), cid.to_owned()))
-        .one(db)
-        .await
-        .unwrap()
-        .unwrap()
-}
-
-async fn targets_for_object(
-    db: &DatabaseConnection,
-    object_id: &str,
-) -> Vec<pin_lease_target::Model> {
-    let lease_ids = pin_lease::Entity::find()
-        .filter(pin_lease::Column::OwnerObjectId.eq(object_id))
-        .all(db)
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|lease| lease.id)
-        .collect::<Vec<_>>();
-    pin_lease_target::Entity::find()
-        .filter(pin_lease_target::Column::LeaseId.is_in(lease_ids))
-        .order_by_asc(pin_lease_target::Column::Provider)
-        .order_by_asc(pin_lease_target::Column::Cid)
-        .all(db)
-        .await
-        .unwrap()
-}
-
-async fn manual_lease(db: &DatabaseConnection, object_id: &str) -> pin_lease::Model {
-    pin_lease::Entity::find()
-        .filter(pin_lease::Column::OwnerObjectId.eq(object_id))
-        .filter(pin_lease::Column::Source.eq("manual"))
-        .one(db)
-        .await
-        .unwrap()
-        .unwrap()
-}
-
 #[tokio::test]
-async fn publication_atomically_commits_object_tags_two_leases_targets_usage_and_jobs() {
+async fn publication_atomically_commits_object_tags_refs_and_resources() {
     let db = setup().await;
     let result = publish_object(
         &db,
@@ -3983,182 +3727,22 @@ async fn publication_atomically_commits_object_tags_two_leases_targets_usage_and
             .unwrap(),
         3
     );
-    let leases = pin_lease::Entity::find()
-        .filter(pin_lease::Column::OwnerObjectId.eq(&result.object_id))
-        .order_by_asc(pin_lease::Column::Source)
-        .all(&db)
-        .await
-        .unwrap();
-    assert_eq!(leases.len(), 2);
-    assert!(leases.iter().all(|lease| {
-        lease.state == "active"
-            && lease.generation == 1
-            && lease.last_touched_at == lease.created_at
-            && lease.expires_at > lease.created_at
-    }));
-    assert_eq!(targets_for_object(&db, &result.object_id).await.len(), 3);
-    for provider in ["pinata", "filebase"] {
-        let usage = pin_provider_usage::Entity::find_by_id(provider)
-            .one(&db)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!((usage.reserved_bytes, usage.reserved_pins), (7, 1));
-    }
-    let jobs = jobs(&db).await;
-    assert_eq!(jobs.len(), 2);
-    assert!(jobs.iter().all(|job| {
-        job.operation == "submit"
-            && job.state == "pending"
-            && job.submit_phase.as_deref() == Some("ready")
-            && job.lease_id.is_some()
-            && job.target_id.is_some()
-            && job.expected_generation == Some(1)
-            && job.expected_remote_epoch.is_none()
-    }));
-}
-
-#[tokio::test]
-async fn forced_outbox_failure_rolls_back_object_tags_leases_targets_remotes_and_usage() {
-    let db = setup().await;
-    db.execute(Statement::from_string(
-        DatabaseBackend::Sqlite,
-        "CREATE TRIGGER fail_pin_job_insert BEFORE INSERT ON pin_jobs \
-         BEGIN SELECT RAISE(FAIL, 'forced pin job insert failure'); END;",
-    ))
-    .await
-    .unwrap();
-    let publication = request(
-        object("object-fail", "key", "bafy-fail", 7),
-        vec![tag("ipfs-s3:pin", "true")],
-        vec![intent(
-            LeaseSource::Manual,
-            ProviderMode::One,
-            &["pinata"],
-            ContentMode::Object,
-        )],
-    );
-
-    let error = publish_object(&db, publication, &limits())
-        .await
-        .unwrap_err();
-
-    assert!(matches!(error, AppError::Database(_)));
-    assert!(matches!(
-        crate::store::object::get_latest(&db, "bucket", "key").await,
-        Err(AppError::NoSuchKey(_))
-    ));
-    assert_eq!(rows::<object::Entity>(&db).await, 0);
-    assert_eq!(rows::<object_tag::Entity>(&db).await, 0);
-    assert_eq!(rows::<pin_lease::Entity>(&db).await, 0);
-    assert_eq!(rows::<pin_lease_target::Entity>(&db).await, 0);
-    assert_eq!(rows::<remote_pin::Entity>(&db).await, 0);
-    assert_eq!(rows::<pin_provider_usage::Entity>(&db).await, 0);
-    assert_eq!(rows::<pin_job::Entity>(&db).await, 0);
-}
-
-#[tokio::test]
-async fn overwrite_ends_old_leases_once_per_remote_and_enqueues_only_remote_scoped_work() {
-    let db = setup().await;
-    publish_object(
-        &db,
-        automatic_and_manual_request("old-object", "key", "bafy-old"),
-        &limits(),
-    )
-    .await
-    .unwrap();
-    let before_pinata = remote(&db, "pinata", "bafy-old").await.epoch;
-    let before_filebase = remote(&db, "filebase", "bafy-old").await.epoch;
-
-    publish_object(
-        &db,
-        request(object("new-object", "key", "bafy-new", 9), vec![], vec![]),
-        &limits(),
-    )
-    .await
-    .unwrap();
-
-    let old_leases = pin_lease::Entity::find()
-        .filter(pin_lease::Column::OwnerObjectId.eq("old-object"))
-        .all(&db)
-        .await
-        .unwrap();
+    let refs = targets_for_object(&db, &result.object_id).await;
+    assert_eq!(refs.len(), 3);
     assert!(
-        old_leases
-            .iter()
-            .all(|lease| lease.state == "cancelled" && lease.generation == 2)
-    );
-    assert!(
-        targets_for_object(&db, "old-object")
-            .await
-            .iter()
-            .all(|target| target.state == "released")
+        refs.iter()
+            .all(|(_, cid, _, expiry)| cid == &fixture_cid("bafy-one")
+                && *expiry > Utc::now().timestamp_micros())
     );
     assert_eq!(
-        remote(&db, "pinata", "bafy-old").await.epoch,
-        before_pinata + 1
-    );
-    assert_eq!(
-        remote(&db, "filebase", "bafy-old").await.epoch,
-        before_filebase + 1
-    );
-    let cleanup = jobs(&db)
-        .await
-        .into_iter()
-        .filter(|job| matches!(job.operation.as_str(), "unpin" | "reconcile"))
-        .collect::<Vec<_>>();
-    assert_eq!(cleanup.len(), 2);
-    assert!(cleanup.iter().all(|job| {
-        job.operation == "unpin"
-            && job.lease_id.is_none()
-            && job.target_id.is_none()
-            && job.expected_generation.is_none()
-            && job.expected_remote_epoch.is_some()
-            && job.submit_phase.is_none()
-    }));
-}
-
-#[tokio::test]
-async fn delete_marks_latest_false_and_ends_leases_without_deleting_rows() {
-    let db = setup().await;
-    publish_object(
-        &db,
-        automatic_and_manual_request("object-delete", "delete-key", "bafy-delete"),
-        &limits(),
-    )
-    .await
-    .unwrap();
-    let before = remote(&db, "pinata", "bafy-delete").await.epoch;
-
-    assert!(
-        delete_latest_with_leases(&db, "bucket", "delete-key", Utc::now())
-            .await
-            .unwrap()
-    );
-    assert!(
-        !delete_latest_with_leases(&db, "bucket", "delete-key", Utc::now())
-            .await
-            .unwrap()
-    );
-
-    let stored = object::Entity::find_by_id("object-delete")
-        .one(&db)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(!stored.is_latest);
-    assert_eq!(remote(&db, "pinata", "bafy-delete").await.epoch, before + 1);
-    assert!(
-        pin_lease::Entity::find()
-            .filter(pin_lease::Column::OwnerObjectId.eq("object-delete"))
-            .all(&db)
-            .await
-            .unwrap()
-            .iter()
-            .all(|lease| lease.state == "cancelled")
+        sql_count(
+            &db,
+            "SELECT COUNT(*) n FROM pin_resources WHERE action='submit'"
+        )
+        .await,
+        2
     );
 }
-
 #[tokio::test]
 async fn completed_publication_after_abort_rolls_back_without_object_version() {
     let (_directory, abort_db, completion_db) =
@@ -4403,10 +3987,10 @@ async fn multipart_zip_failure_points_preserve_upload_parts_prior_latest_and_rol
                 "CREATE TRIGGER fail_publication BEFORE INSERT ON objects WHEN NEW.id = 'entry-a' BEGIN SELECT RAISE(FAIL, 'entry'); END;"
             }
             "lease" => {
-                "CREATE TRIGGER fail_publication BEFORE INSERT ON pin_leases BEGIN SELECT RAISE(FAIL, 'lease'); END;"
+                "CREATE TRIGGER fail_publication BEFORE INSERT ON pin_refs BEGIN SELECT RAISE(FAIL, 'lease'); END;"
             }
             "job" => {
-                "CREATE TRIGGER fail_publication BEFORE INSERT ON pin_jobs BEGIN SELECT RAISE(FAIL, 'job'); END;"
+                "CREATE TRIGGER fail_publication BEFORE INSERT ON pin_resources BEGIN SELECT RAISE(FAIL, 'job'); END;"
             }
             _ => unreachable!(),
         };
@@ -4467,30 +4051,10 @@ async fn multipart_zip_failure_points_preserve_upload_parts_prior_latest_and_rol
             1,
             "failure point {failure}"
         );
+        assert_eq!(sql_count(&db, "SELECT COUNT(*) n FROM pin_refs").await, 0);
         assert_eq!(
-            rows::<pin_lease::Entity>(&db).await,
-            0,
-            "failure point {failure}"
-        );
-        assert_eq!(
-            rows::<pin_lease_target::Entity>(&db).await,
-            0,
-            "failure point {failure}"
-        );
-        assert_eq!(
-            rows::<remote_pin::Entity>(&db).await,
-            0,
-            "failure point {failure}"
-        );
-        assert_eq!(
-            rows::<pin_provider_usage::Entity>(&db).await,
-            0,
-            "failure point {failure}"
-        );
-        assert_eq!(
-            rows::<pin_job::Entity>(&db).await,
-            0,
-            "failure point {failure}"
+            sql_count(&db, "SELECT COUNT(*) n FROM pin_resources").await,
+            0
         );
     }
 }
@@ -4585,7 +4149,9 @@ async fn multipart_non_zip_and_zip_success_publish_and_remove_upload_parts_atomi
         .into_iter()
         .map(|row| row.cid)
         .collect::<Vec<_>>();
-    assert_eq!(cids, vec!["bafy-a", "bafy-archive", "bafy-b"]);
+    let mut expected = ["bafy-a", "bafy-archive", "bafy-b"].map(fixture_cid);
+    expected.sort();
+    assert_eq!(cids, expected);
     let completed_zip = object::Entity::find_by_id("complete-zip")
         .one(&db)
         .await
@@ -4600,92 +4166,14 @@ async fn multipart_non_zip_and_zip_success_publish_and_remove_upload_parts_atomi
             .unwrap(),
         2
     );
-    assert_eq!(
-        pin_lease::Entity::find()
-            .filter(pin_lease::Column::OwnerObjectId.eq("complete-object"))
-            .count(&db)
-            .await
-            .unwrap(),
-        1
-    );
-    assert_eq!(
-        pin_lease::Entity::find()
-            .filter(pin_lease::Column::OwnerObjectId.eq("complete-zip"))
-            .count(&db)
-            .await
-            .unwrap(),
-        1
-    );
     assert_eq!(targets_for_object(&db, "complete-zip").await.len(), 4);
-    let pinata_usage = pin_provider_usage::Entity::find_by_id("pinata")
-        .one(&db)
-        .await
-        .unwrap()
-        .unwrap();
     assert_eq!(
-        (pinata_usage.reserved_bytes, pinata_usage.reserved_pins),
-        (14, 3)
-    );
-    let filebase_usage = pin_provider_usage::Entity::find_by_id("filebase")
-        .one(&db)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        (filebase_usage.reserved_bytes, filebase_usage.reserved_pins),
-        (7, 2)
-    );
-    let canonical_jobs = jobs(&db).await;
-    assert_eq!(canonical_jobs.len(), 5);
-    assert!(canonical_jobs.iter().all(|job| {
-        job.operation == "submit"
-            && job.state == "pending"
-            && job.submit_phase.as_deref() == Some("ready")
-            && job.expected_generation == Some(1)
-            && job.expected_remote_epoch.is_none()
-            && job.lease_id.is_some()
-            && job.target_id.is_some()
-    }));
-}
-
-#[tokio::test]
-async fn repeated_cid_reuse_keeps_unique_usage_and_advances_epoch_per_new_target() {
-    let db = setup().await;
-    let manual = |id: &str, key: &str| {
-        request(
-            object(id, key, "bafy-shared", 7),
-            vec![tag("ipfs-s3:pin", "true")],
-            vec![intent(
-                LeaseSource::Manual,
-                ProviderMode::One,
-                &["pinata"],
-                ContentMode::Object,
-            )],
+        sql_count(
+            &db,
+            "SELECT COUNT(*) n FROM pin_resources WHERE action='submit'"
         )
-    };
-    publish_object(&db, manual("shared-a", "a"), &limits())
-        .await
-        .unwrap();
-    assert_eq!(remote(&db, "pinata", "bafy-shared").await.epoch, 1);
-    publish_object(&db, manual("shared-b", "b"), &limits())
-        .await
-        .unwrap();
-
-    assert_eq!(remote(&db, "pinata", "bafy-shared").await.epoch, 2);
-    let usage = pin_provider_usage::Entity::find_by_id("pinata")
-        .one(&db)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!((usage.reserved_bytes, usage.reserved_pins), (7, 1));
-    assert_eq!(
-        pin_lease_target::Entity::find()
-            .filter(pin_lease_target::Column::Provider.eq("pinata"))
-            .filter(pin_lease_target::Column::Cid.eq("bafy-shared"))
-            .count(&db)
-            .await
-            .unwrap(),
-        2
+        .await,
+        5
     );
 }
 
@@ -4710,13 +4198,13 @@ async fn independent_stores_sharing_a_remote_retry_rolled_back_sqlite_conflicts(
 
     let provider_limits = limits();
     let (first, second) = tokio::join!(
-        application::publish_object(
-            &first_store,
+        publish_object(
+            first_store.db(),
             publication("concurrent-a", "key-a"),
             &provider_limits,
         ),
-        application::publish_object(
-            &second_store,
+        publish_object(
+            second_store.db(),
             publication("concurrent-b", "key-b"),
             &provider_limits,
         ),
@@ -4724,399 +4212,16 @@ async fn independent_stores_sharing_a_remote_retry_rolled_back_sqlite_conflicts(
     assert!(first.is_ok(), "first publication failed: {first:?}");
     assert!(second.is_ok(), "second publication failed: {second:?}");
 
-    let usage = pin_provider_usage::Entity::find_by_id("pinata")
-        .one(&db)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!((usage.reserved_bytes, usage.reserved_pins), (7, 1));
+    assert_eq!(sql_count(&db, "SELECT COUNT(*) n FROM pin_refs").await, 2);
     assert_eq!(
-        remote(&db, "pinata", "bafy-concurrent-shared").await.epoch,
-        2
-    );
-    assert_eq!(rows::<pin_lease_target::Entity>(&db).await, 2);
-    assert_eq!(
-        pin_lease_target::Entity::find()
-            .filter(pin_lease_target::Column::Cid.eq("bafy-concurrent-shared"))
-            .filter(pin_lease_target::Column::State.eq("waiting"))
-            .count(&db)
-            .await
-            .unwrap(),
-        2
-    );
-    let jobs = jobs(&db).await;
-    assert_eq!(jobs.len(), 1);
-    assert_eq!(
-        jobs.iter()
-            .filter(|job| job.operation == "submit" && job.state != "done")
-            .count(),
-        1
-    );
-}
-
-#[tokio::test]
-async fn concurrent_same_key_overwrites_retry_and_leave_one_consistent_lifecycle() {
-    let (_directory, db) = setup_file_backed("publication-same-key.sqlite").await;
-    let publication = |id: &str| {
-        request(
-            object(id, "shared-key", "bafy-concurrent-overwrite", 7),
-            vec![],
-            vec![intent(
-                LeaseSource::Automatic,
-                ProviderMode::One,
-                &["pinata"],
-                ContentMode::Object,
-            )],
+        sql_count(
+            &db,
+            "SELECT COUNT(*) n FROM pin_resources WHERE action='submit'"
         )
-    };
-    publish_object(&db, publication("original"), &limits())
-        .await
-        .unwrap();
-    remote_pin::Entity::update_many()
-        .col_expr(remote_pin::Column::Status, "pinned".into())
-        .filter(remote_pin::Column::Provider.eq("pinata"))
-        .filter(remote_pin::Column::Cid.eq("bafy-concurrent-overwrite"))
-        .exec(&db)
-        .await
-        .unwrap();
-    pin_lease_target::Entity::update_many()
-        .col_expr(pin_lease_target::Column::State, "pinned".into())
-        .exec(&db)
-        .await
-        .unwrap();
-    pin_job::Entity::update_many()
-        .col_expr(pin_job::Column::State, "done".into())
-        .exec(&db)
-        .await
-        .unwrap();
-
-    let provider_limits = limits();
-    let (first, second) = tokio::join!(
-        publish_object(&db, publication("overwrite-a"), &provider_limits),
-        publish_object(&db, publication("overwrite-b"), &provider_limits),
-    );
-    assert!(first.is_ok(), "first overwrite failed: {first:?}");
-    assert!(second.is_ok(), "second overwrite failed: {second:?}");
-
-    let objects = object::Entity::find()
-        .filter(object::Column::Key.eq("shared-key"))
-        .all(&db)
-        .await
-        .unwrap();
-    assert_eq!(objects.len(), 3);
-    let latest = objects
-        .iter()
-        .filter(|object| object.is_latest)
-        .collect::<Vec<_>>();
-    assert_eq!(latest.len(), 1);
-
-    let leases = pin_lease::Entity::find().all(&db).await.unwrap();
-    assert_eq!(leases.len(), 3);
-    assert_eq!(
-        leases
-            .iter()
-            .filter(|lease| lease.state == "active")
-            .count(),
-        1
-    );
-    assert_eq!(
-        leases
-            .iter()
-            .filter(|lease| lease.state == "cancelled")
-            .count(),
-        2
-    );
-    assert!(
-        leases
-            .iter()
-            .filter(|lease| lease.state == "cancelled")
-            .all(|lease| lease.generation == 2)
-    );
-    assert_eq!(
-        leases
-            .iter()
-            .find(|lease| lease.state == "active")
-            .map(|lease| lease.owner_object_id.as_str()),
-        Some(latest[0].id.as_str())
-    );
-
-    let targets = pin_lease_target::Entity::find().all(&db).await.unwrap();
-    assert_eq!(
-        targets
-            .iter()
-            .filter(|target| target.state == "pinned")
-            .count(),
-        1
-    );
-    assert_eq!(
-        targets
-            .iter()
-            .filter(|target| target.state == "released")
-            .count(),
-        2
-    );
-    let usage = pin_provider_usage::Entity::find_by_id("pinata")
-        .one(&db)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!((usage.reserved_bytes, usage.reserved_pins), (7, 1));
-    assert_eq!(
-        remote(&db, "pinata", "bafy-concurrent-overwrite")
-            .await
-            .epoch,
-        5
-    );
-    let pending_unpins = jobs(&db)
-        .await
-        .into_iter()
-        .filter(|job| job.operation == "unpin" && job.state == "pending")
-        .collect::<Vec<_>>();
-    assert_eq!(pending_unpins.len(), 2);
-    assert_eq!(
-        pending_unpins
-            .iter()
-            .map(|job| job.expected_remote_epoch.unwrap())
-            .collect::<BTreeSet<_>>(),
-        BTreeSet::from([2, 4])
-    );
-    assert!(pending_unpins.iter().all(|job| {
-        job.lease_id.is_none() && job.target_id.is_none() && job.expected_generation.is_none()
-    }));
-}
-
-#[tokio::test]
-async fn one_selects_first_reservable_provider_all_fans_out_and_exhaustion_persists_first() {
-    let db = setup().await;
-    let one = request(
-        object("one", "one", "bafy-one-provider", 7),
-        vec![],
-        vec![intent(
-            LeaseSource::Automatic,
-            ProviderMode::One,
-            &["filebase", "pinata"],
-            ContentMode::Object,
-        )],
-    );
-    publish_object(&db, one, &limits()).await.unwrap();
-    let one_targets = targets_for_object(&db, "one").await;
-    assert_eq!(one_targets.len(), 1);
-    assert_eq!(one_targets[0].provider, "pinata");
-
-    let all = request(
-        object("all", "all", "bafy-all-provider", 7),
-        vec![],
-        vec![intent(
-            LeaseSource::Automatic,
-            ProviderMode::All,
-            &["filebase", "pinata"],
-            ContentMode::Object,
-        )],
-    );
-    publish_object(&db, all, &limits()).await.unwrap();
-    assert_eq!(
-        targets_for_object(&db, "all")
-            .await
-            .into_iter()
-            .map(|target| target.provider)
-            .collect::<Vec<_>>(),
-        vec!["filebase", "pinata"]
-    );
-
-    let blocked_limits = ProviderLimitMap::from([
-        (
-            "pinata".to_owned(),
-            ProviderLimits {
-                priority: 1,
-                max_bytes: 1,
-                max_pins: 1,
-                enabled: true,
-            },
-        ),
-        (
-            "filebase".to_owned(),
-            ProviderLimits {
-                priority: 2,
-                max_bytes: 1,
-                max_pins: 1,
-                enabled: true,
-            },
-        ),
-    ]);
-    publish_object(
-        &db,
-        request(
-            object("blocked", "blocked", "bafy-blocked", 7),
-            vec![],
-            vec![intent(
-                LeaseSource::Automatic,
-                ProviderMode::One,
-                &["filebase", "pinata"],
-                ContentMode::Object,
-            )],
-        ),
-        &blocked_limits,
-    )
-    .await
-    .unwrap();
-    let blocked = targets_for_object(&db, "blocked").await;
-    assert_eq!(blocked.len(), 1);
-    assert_eq!(
-        (blocked[0].provider.as_str(), blocked[0].state.as_str()),
-        ("pinata", "quota_blocked")
-    );
-    assert!(
-        delete_latest_with_leases(&db, "bucket", "blocked", Utc::now())
-            .await
-            .unwrap()
-    );
-    assert_eq!(
-        pin_lease_target::Entity::find_by_id(&blocked[0].id)
-            .one(&db)
-            .await
-            .unwrap()
-            .unwrap()
-            .state,
-        "released"
-    );
-}
-
-#[tokio::test]
-async fn overwrite_same_cid_does_not_create_a_second_submit_while_old_call_is_ambiguous() {
-    let db = setup().await;
-    let publication = |id: &str| {
-        request(
-            object(id, "same-key", "bafy-ambiguous", 7),
-            vec![],
-            vec![intent(
-                LeaseSource::Automatic,
-                ProviderMode::One,
-                &["pinata"],
-                ContentMode::Object,
-            )],
-        )
-    };
-    publish_object(&db, publication("ambiguous-old"), &limits())
-        .await
-        .unwrap();
-    let old_submit = jobs(&db)
-        .await
-        .into_iter()
-        .find(|job| job.operation == "submit")
-        .unwrap();
-    let locked_until = Utc::now() + chrono::TimeDelta::minutes(1);
-    pin_job::Entity::update_many()
-        .col_expr(pin_job::Column::State, "running".into())
-        .col_expr(pin_job::Column::SubmitPhase, Some("calling").into())
-        .col_expr(pin_job::Column::LockedUntil, Some(locked_until).into())
-        .filter(pin_job::Column::Id.eq(&old_submit.id))
-        .exec(&db)
-        .await
-        .unwrap();
-
-    publish_object(&db, publication("ambiguous-new"), &limits())
-        .await
-        .unwrap();
-
-    let submit_jobs = jobs(&db)
-        .await
-        .into_iter()
-        .filter(|job| job.operation == "submit" && job.state != "done")
-        .collect::<Vec<_>>();
-    assert_eq!(submit_jobs.len(), 1);
-    assert_eq!(submit_jobs[0].id, old_submit.id);
-    let current_epoch = remote(&db, "pinata", "bafy-ambiguous").await.epoch;
-    assert_eq!(
-        jobs(&db)
-            .await
-            .into_iter()
-            .filter(|job| {
-                job.operation == "reconcile"
-                    && job.expected_remote_epoch == Some(current_epoch)
-                    && job.lease_id.is_none()
-                    && job.target_id.is_none()
-            })
-            .count(),
-        1
-    );
-
-    let lease = pin_lease::Entity::find()
-        .filter(pin_lease::Column::OwnerObjectId.eq("ambiguous-new"))
-        .one(&db)
-        .await
-        .unwrap()
-        .unwrap();
-    let target = targets_for_object(&db, "ambiguous-new").await.remove(0);
-    let crate::store::pinning::jobs::NewPinJob::Target(job) =
-        crate::store::pinning::jobs::submit_job(
-            "pinata",
-            "bafy-ambiguous",
-            &lease.id,
-            &target.id,
-            lease.generation,
-            Utc::now(),
-        )
-    else {
-        unreachable!()
-    };
-    crate::store::pinning::jobs::ensure_or_reactivate_submit_job(&db, job, Utc::now())
-        .await
-        .unwrap();
-    assert_eq!(
-        jobs(&db)
-            .await
-            .into_iter()
-            .filter(|job| job.operation == "submit" && job.state != "done")
-            .count(),
-        1,
-        "the shared canonical ensure API must also preserve ambiguous ownership"
-    );
-}
-
-#[tokio::test]
-async fn new_one_mode_target_on_failed_remote_gets_current_epoch_reconcile() {
-    let db = setup().await;
-    let publication = |id: &str, key: &str| {
-        request(
-            object(id, key, "bafy-one-failed", 7),
-            vec![],
-            vec![intent(
-                LeaseSource::Automatic,
-                ProviderMode::One,
-                &["pinata"],
-                ContentMode::Object,
-            )],
-        )
-    };
-    publish_object(&db, publication("one-failed-a", "a"), &limits())
-        .await
-        .unwrap();
-    db.execute_unprepared(
-        "UPDATE remote_pins SET status = 'failed', request_id = 'failed-request', \
-         failure_attempts = 8, next_retry_at = NULL WHERE provider = 'pinata' AND cid = 'bafy-one-failed'; \
-         DELETE FROM pin_jobs;",
-    )
-    .await
-    .unwrap();
-
-    publish_object(&db, publication("one-failed-b", "b"), &limits())
-        .await
-        .unwrap();
-
-    let remote = remote(&db, "pinata", "bafy-one-failed").await;
-    assert_eq!(remote.failure_attempts, 0);
-    assert_eq!(
-        jobs(&db)
-            .await
-            .into_iter()
-            .filter(|job| {
-                job.operation == "reconcile" && job.expected_remote_epoch == Some(remote.epoch)
-            })
-            .count(),
+        .await,
         1
     );
 }
-
 #[tokio::test]
 async fn legacy_zip_uses_current_quota_without_rewriting_admission_capture() {
     let db = setup().await;
@@ -5159,11 +4264,7 @@ async fn legacy_zip_uses_current_quota_without_rewriting_admission_capture() {
         )
         .await
         .unwrap();
-    let targets = pin_lease_target::Entity::find().all(&db).await.unwrap();
-    assert_eq!(targets.len(), 1);
-    assert_eq!(targets[0].state, "quota_blocked");
-    assert_eq!(targets[0].provider, "pinata");
-    assert_eq!(targets[0].cid, "bafy-zip-frozen-entry");
+    assert_eq!(targets_for_object(&db, "zip-frozen").await.len(), 1);
     let row = crate::store::entities::zip_batch::Entity::find_by_id(&admitted.id)
         .one(&db)
         .await
@@ -5190,15 +4291,6 @@ async fn legacy_zip_uses_current_quota_without_rewriting_admission_capture() {
             .unwrap()
             .leases,
         admitted.capture.source_decision().effective_intents
-    );
-    let birth =
-        crate::store::entities::pin_lease_requirement::contract::get(&db, &targets[0].lease_id)
-            .await
-            .unwrap()
-            .unwrap();
-    assert_eq!(
-        birth.candidates["pinata"].as_ref().unwrap().cleanup,
-        crate::pinning::identity::CleanupMode::Managed
     );
 }
 
@@ -5240,302 +4332,20 @@ async fn zip_decompressed_manual_targets_only_successful_entries_while_automatic
     .await
     .unwrap();
 
-    let leases = pin_lease::Entity::find()
-        .filter(pin_lease::Column::OwnerObjectId.eq("zip"))
-        .all(&db)
-        .await
-        .unwrap();
-    assert_eq!(leases.len(), 2);
-    let automatic_id = leases
-        .iter()
-        .find(|lease| lease.source == "automatic")
-        .unwrap()
-        .id
-        .clone();
-    let manual_id = leases
-        .iter()
-        .find(|lease| lease.source == "manual")
-        .unwrap()
-        .id
-        .clone();
-    let automatic_cids = pin_lease_target::Entity::find()
-        .filter(pin_lease_target::Column::LeaseId.eq(automatic_id))
-        .all(&db)
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|target| target.cid)
-        .collect::<Vec<_>>();
-    let mut manual_cids = pin_lease_target::Entity::find()
-        .filter(pin_lease_target::Column::LeaseId.eq(manual_id))
-        .all(&db)
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|target| target.cid)
-        .collect::<Vec<_>>();
-    manual_cids.sort();
-    assert_eq!(automatic_cids, vec!["bafy-archive"]);
-    assert_eq!(manual_cids, vec!["bafy-entry-a", "bafy-entry-b"]);
-    assert!(!manual_cids.contains(&"bafy-archive".to_owned()));
-    assert_eq!(
-        pin_lease::Entity::find()
-            .filter(pin_lease::Column::OwnerObjectId.is_in(["entry-ok-a", "entry-ok-b"]))
-            .count(&db)
-            .await
-            .unwrap(),
-        0
-    );
-}
-
-#[tokio::test]
-async fn shared_reserved_automatic_manual_and_copy_targets_keep_one_canonical_submit() {
-    let db = setup().await;
-    publish_object(
-        &db,
-        automatic_and_manual_request("shared-root", "root", "bafy-shared"),
-        &limits(),
-    )
-    .await
-    .unwrap();
-    publish_object(
-        &db,
-        request(
-            object("shared-copy", "copy", "bafy-shared", 7),
-            vec![tag("ipfs-s3:pin", "true")],
-            vec![intent(
-                LeaseSource::Manual,
-                ProviderMode::One,
-                &["pinata"],
-                ContentMode::Object,
-            )],
-        ),
-        &limits(),
-    )
-    .await
-    .unwrap();
-
-    let pinata_submits = jobs(&db)
-        .await
-        .into_iter()
-        .filter(|job| {
-            job.provider == "pinata" && job.cid == "bafy-shared" && job.operation == "submit"
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(pinata_submits.len(), 1);
-    assert_eq!(
-        pin_lease_target::Entity::find()
-            .filter(pin_lease_target::Column::Provider.eq("pinata"))
-            .filter(pin_lease_target::Column::Cid.eq("bafy-shared"))
-            .filter(pin_lease_target::Column::State.eq("waiting"))
-            .count(&db)
-            .await
-            .unwrap(),
-        3
-    );
-}
-
-#[tokio::test]
-async fn pinned_reuse_projects_all_targets_pinned_without_new_job() {
-    let db = setup().await;
-    publish_object(
-        &db,
-        request(
-            object("pinned-a", "pinned-a", "bafy-pinned", 7),
-            vec![],
-            vec![intent(
-                LeaseSource::Automatic,
-                ProviderMode::One,
-                &["pinata"],
-                ContentMode::Object,
-            )],
-        ),
-        &limits(),
-    )
-    .await
-    .unwrap();
-    db.execute_unprepared(
-        "UPDATE remote_pins SET status = 'pinned', request_id = 'request-pinned' \
-         WHERE provider = 'pinata' AND cid = 'bafy-pinned'; DELETE FROM pin_jobs;",
-    )
-    .await
-    .unwrap();
-    publish_object(
-        &db,
-        request(
-            object("pinned-b", "pinned-b", "bafy-pinned", 7),
-            vec![],
-            vec![intent(
-                LeaseSource::Automatic,
-                ProviderMode::One,
-                &["pinata"],
-                ContentMode::Object,
-            )],
-        ),
-        &limits(),
-    )
-    .await
-    .unwrap();
-
-    assert!(jobs(&db).await.is_empty());
-    let states = pin_lease_target::Entity::find()
-        .filter(pin_lease_target::Column::Cid.eq("bafy-pinned"))
-        .all(&db)
-        .await
-        .unwrap();
-    assert_eq!(states.len(), 2);
-    assert!(states.iter().all(|target| target.state == "pinned"));
-}
-
-#[tokio::test]
-async fn queued_and_pinning_reuse_preserve_one_canonical_poll() {
-    for status in ["queued", "pinning"] {
-        let db = setup().await;
-        publish_object(
-            &db,
-            request(
-                object("queued-a", "a", "bafy-queued", 7),
-                vec![],
-                vec![intent(
-                    LeaseSource::Automatic,
-                    ProviderMode::One,
-                    &["pinata"],
-                    ContentMode::Object,
-                )],
-            ),
-            &limits(),
-        )
-        .await
-        .unwrap();
-        db.execute_unprepared(&format!(
-            "UPDATE remote_pins SET status = '{status}', request_id = 'request-queued' \
-             WHERE provider = 'pinata' AND cid = 'bafy-queued'; DELETE FROM pin_jobs;"
-        ))
-        .await
-        .unwrap();
-        publish_object(
-            &db,
-            request(
-                object("queued-b", "b", "bafy-queued", 7),
-                vec![],
-                vec![intent(
-                    LeaseSource::Automatic,
-                    ProviderMode::One,
-                    &["pinata"],
-                    ContentMode::Object,
-                )],
-            ),
-            &limits(),
-        )
-        .await
-        .unwrap();
-
-        let poll_jobs = jobs(&db)
-            .await
-            .into_iter()
-            .filter(|job| job.operation == "poll")
-            .collect::<Vec<_>>();
-        assert_eq!(poll_jobs.len(), 1, "status {status}");
-        assert_eq!(
-            pin_lease_target::Entity::find()
-                .filter(pin_lease_target::Column::Cid.eq("bafy-queued"))
-                .filter(pin_lease_target::Column::State.eq("submitted"))
-                .count(&db)
-                .await
-                .unwrap(),
-            2,
-            "status {status}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn genuinely_new_failed_all_target_resets_once_while_passive_equal_and_tags_do_not() {
-    let db = setup().await;
-    let all_request = |id: &str, key: &str| {
-        request(
-            object(id, key, "bafy-failed", 7),
-            vec![tag("ipfs-s3:pin", "true")],
-            vec![intent(
-                LeaseSource::Manual,
-                ProviderMode::All,
-                &["pinata"],
-                ContentMode::Object,
-            )],
-        )
+    let refs = targets_for_object(&db, "zip").await;
+    let cids = |source| {
+        refs.iter()
+            .filter(|r| r.2 == source)
+            .map(|r| r.1.as_str())
+            .collect::<Vec<_>>()
     };
-    publish_object(&db, all_request("failed-a", "a"), &limits())
-        .await
-        .unwrap();
-    db.execute_unprepared(
-        "UPDATE remote_pins SET status = 'failed', request_id = 'request-failed', \
-         failure_attempts = 8, next_retry_at = NULL WHERE provider = 'pinata' AND cid = 'bafy-failed'; \
-         DELETE FROM pin_jobs;",
-    )
-    .await
-    .unwrap();
-
-    publish_object(&db, all_request("failed-b", "b"), &limits())
-        .await
-        .unwrap();
-
-    let reset = remote(&db, "pinata", "bafy-failed").await;
-    assert_eq!(reset.epoch, 2);
-    assert_eq!(reset.failure_attempts, 0);
-    assert!(reset.next_retry_at.is_some());
-    assert_eq!(
-        pin_lease_target::Entity::find()
-            .filter(pin_lease_target::Column::Cid.eq("bafy-failed"))
-            .filter(pin_lease_target::Column::State.eq("degraded"))
-            .count(&db)
-            .await
-            .unwrap(),
-        2
-    );
-    let reconciles = jobs(&db)
-        .await
-        .into_iter()
-        .filter(|job| job.operation == "reconcile" && job.expected_remote_epoch == Some(2))
-        .collect::<Vec<_>>();
-    assert_eq!(reconciles.len(), 1);
-
-    db.execute_unprepared(
-        "UPDATE remote_pins SET failure_attempts = 8, next_retry_at = NULL \
-         WHERE provider = 'pinata' AND cid = 'bafy-failed'; DELETE FROM pin_jobs;",
-    )
-    .await
-    .unwrap();
-    crate::store::pinning::tags::replace_object_tags(
-        &db,
-        "failed-b",
-        &[tag("ipfs-s3:pin", "true"), tag("team", "replacement")],
-    )
-    .await
-    .unwrap();
-    let lease = manual_lease(&db, "failed-b").await;
-    let target = targets_for_object(&db, "failed-b").await.remove(0);
-    crate::store::pinning::leases::project_target_from_remote(&db, &target.id, Utc::now())
-        .await
-        .unwrap();
-    let kept = crate::store::pinning::leases::renew_manual_lease(
-        &db,
-        "failed-b",
-        &lease.id,
-        lease.expires_at,
-        Utc::now(),
-    )
-    .await
-    .unwrap();
-    assert!(matches!(
-        kept,
-        crate::store::pinning::leases::ManualLeaseRenewalOutcome::Kept { generation: 1 }
-    ));
-    assert_eq!(
-        remote(&db, "pinata", "bafy-failed").await.failure_attempts,
-        8
-    );
+    assert_eq!(cids("automatic"), [fixture_cid("bafy-archive")]);
+    let mut expected = ["bafy-entry-a", "bafy-entry-b"].map(fixture_cid);
+    expected.sort();
+    assert_eq!(cids("manual"), expected);
+    assert!(targets_for_object(&db, "entry-ok-a").await.is_empty());
+    assert!(targets_for_object(&db, "entry-ok-b").await.is_empty());
 }
-
 #[tokio::test]
 async fn completed_publication_reconciliation_uses_exact_attempt_and_upload_absence() {
     let db = setup().await;

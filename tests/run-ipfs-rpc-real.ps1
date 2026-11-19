@@ -1,13 +1,10 @@
 #requires -Version 7.0
 <#
-Stage5 leaf RPC/DAG/stored-byte acceptance. Not worker/config/S3/account/main QA.
-Only cached ipfs/kubo:v0.43.0 is used. No pull/install, no external swarm, no
-existing-environment operations. CID uses explicit unpinned CAR preseed.
-The checked-in v0.43.0 isolation values were officially confirmed by the parent.
-Config alone is not egress proof: Docker internal network is mandatory, along
-with fresh repositories (no 0.43.0 legacy bootstrap backup) and offline daemons.
-Logs and summary remain under OutputParent; only this run's labeled Docker
-containers/volumes/network are removed, even on test failure.
+Isolated Kubo RPC transport, DAG, and stored-byte acceptance.
+Uses cached ipfs/kubo:v0.43.0 and two fresh offline repositories on a Docker
+internal network. CID mode uses explicit unpinned CAR preseed. Logs and summary
+stay under OutputParent; cleanup removes only this run's labeled resources.
+Use -PreseedProbe for the isolated CAR import diagnostic only.
 #>
 [CmdletBinding()]
 param(
@@ -45,7 +42,8 @@ $Summary = [ordered]@{
     cleanup = 'NOT RUN'; output = $ResultDir; failure = $null
 }
 if ($PreseedProbe) { $Summary.scope = 'preseed import diagnostic only; NOT full provider acceptance' }
-$RealTestName = if ($PreseedProbe) { 'rpc_preseed_import_contract_probe' } else { 'rpc_provider_real_transports_and_local_dags' }
+$AcceptanceTest = 'rpc_provider_real_transports_and_local_dags'
+$RealTestName = if ($PreseedProbe) { 'rpc_preseed_import_contract_probe' } else { $AcceptanceTest }
 
 function Write-Log([string]$Text) {
     [IO.File]::AppendAllText($Diagnostic, "$Text`n")
@@ -246,6 +244,10 @@ try {
         throw 'Real fixture compilation failed; retained files/logs, no retries and no Docker nodes started.'
     }
     $Summary.compile = 'PASS'
+    $listed = & $artifacts[0] --ignored --exact $RealTestName --list 2>&1
+    if ($LASTEXITCODE -ne 0 -or @($listed | Where-Object { $_.ToString() -ceq "${RealTestName}: test" }).Count -ne 1) {
+        throw 'Exact real RPC test is not registered.'
+    }
     $defaultLog = Join-Path $ResultDir 'default-tests.log'
     & $artifacts[0] --nocapture --test-threads=1 2>&1 | ForEach-Object {
         [IO.File]::AppendAllText($defaultLog, "$($_.ToString())`n")
@@ -258,7 +260,7 @@ try {
     foreach ($missing in @('SOURCE', 'TARGET')) {
         $missingLog = Join-Path $ResultDir "missing-$($missing.ToLowerInvariant())-url.log"
         $lines = @()
-        & $artifacts[0] --ignored --exact rpc_provider_real_transports_and_local_dags --nocapture --test-threads=1 2>&1 | ForEach-Object {
+        & $artifacts[0] --ignored --exact $AcceptanceTest --nocapture --test-threads=1 2>&1 | ForEach-Object {
             $line = $_.ToString(); $lines += $line
             [IO.File]::AppendAllText($missingLog, "$line`n")
         }
@@ -299,13 +301,16 @@ try {
     $env:IPFS_S3_REAL_RPC_TARGET_URL = $targetUrl
     $env:IPFS_S3_REAL_RPC_FIXTURE = $fixturePath
     $testLog = Join-Path $ResultDir 'acceptance.log'
-    & $artifacts[0] --ignored --exact $RealTestName --nocapture --test-threads=1 2>&1 | ForEach-Object {
+    $testLines = & $artifacts[0] --ignored --exact $RealTestName --nocapture --test-threads=1 2>&1
+    $Summary.test_exit_code = $LASTEXITCODE
+    $testLines | ForEach-Object {
         $line = $_.ToString()
         [IO.File]::AppendAllText($testLog, "$line`n")
         $line
     }
-    $Summary.test_exit_code = $LASTEXITCODE
-    if ($Summary.test_exit_code -ne 0) { $Summary.test = 'FAIL'; throw 'Real RPC acceptance failed; see acceptance.log.' }
+    if ($Summary.test_exit_code -ne 0 -or @($testLines | Where-Object { $_ -match '^test result: ok\. 1 passed; 0 failed;' }).Count -ne 1) {
+        $Summary.test = 'FAIL'; throw 'Real RPC acceptance did not pass exactly one case; see acceptance.log.'
+    }
     $Summary.test = 'PASS'
 } catch {
     $Summary.failure = $_.Exception.Message

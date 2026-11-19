@@ -1,23 +1,19 @@
 use super::{
-    IpfsRpcProvider, MAX_OBSERVED_RESOURCES, RpcProfile, RpcResourceStatus,
+    IpfsRpcProvider,
     body::ResponseBody,
     cid,
     error::{mismatch, protocol},
     streaming::{Progress, Transfer},
-    submit_observation::SubmitEvidence,
     transport::{collect_control, send_error},
 };
 use crate::{kubo::NdjsonBuffer, pinning::provider::ProviderError};
+use ::cid::Cid;
 use reqwest::multipart;
 use serde::Deserialize;
 
 impl IpfsRpcProvider {
-    pub(super) async fn import_car(
-        &self,
-        requested: &str,
-        evidence: &mut SubmitEvidence,
-    ) -> Result<(), ProviderError> {
-        let source_cid = cid::canonical(requested)?;
+    pub(super) async fn import_car(&self, requested: &Cid) -> Result<Cid, ProviderError> {
+        let source_cid = requested.to_string();
         let source = self
             .source
             .as_ref()
@@ -64,8 +60,7 @@ impl IpfsRpcProvider {
         transfer
             .wrap_request(&mut request)
             .map_err(|_| super::not_submitted("RPC CAR request construction failed"))?;
-        evidence.begin_write();
-        let observed = transfer
+        transfer
             .progress
             .run(self.target.timeouts.idle, async {
                 let response = self
@@ -79,42 +74,23 @@ impl IpfsRpcProvider {
                     response.check(true)?;
                     return Err(protocol("unexpected RPC import status"));
                 }
-                let observed =
-                    parse_import(response, &transfer.progress, self.profile, evidence).await?;
-                evidence.clean(self.profile, observed.roots.iter().cloned())?;
-                if let Err(error) = transfer.ensure_complete() {
-                    evidence.unknown();
-                    return Err(error);
-                }
-                if !observed.stats {
-                    return Err(protocol("RPC import omitted terminal stats"));
-                }
-                if observed.roots.len() != 1 {
-                    return Err(protocol("RPC import returned multiple roots"));
-                }
-                let (root, status) = observed.roots.into_iter().next().expect("length checked");
-                if status == RpcResourceStatus::PinError {
-                    return Err(protocol("RPC import root pin failed"));
-                }
+                let root = parse_import(response, &transfer.progress, requested).await?;
+                transfer.ensure_complete()?;
                 Ok(root)
             })
-            .await?;
-        if !cid::equivalent(requested, &observed).unwrap_or(false) {
-            return Err(mismatch());
-        }
-        // Import Root.PinErrorMsg and stats alone are not a recursive/local
-        // residency proof. The common submit path performs that proof next.
-        Ok(())
+            .await
     }
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ImportRecord {
-    #[serde(rename = "Root")]
-    root: Option<ImportRoot>,
-    #[serde(rename = "Stats")]
-    stats: Option<ImportStats>,
+enum ImportRecord {
+    Root(ImportRoot),
+    Stats {
+        #[serde(rename = "BlockCount")]
+        _blocks: u64,
+        #[serde(rename = "BlockBytesCount")]
+        _bytes: u64,
+    },
 }
 
 #[derive(Deserialize)]
@@ -131,61 +107,36 @@ struct ImportCid {
     value: String,
 }
 
-#[derive(Deserialize)]
-struct ImportStats {
-    #[serde(rename = "BlockCount")]
-    blocks: u64,
-    #[serde(rename = "BlockBytesCount")]
-    bytes: u64,
+enum ImportAck {
+    AwaitingRoot,
+    AwaitingStats(Cid),
+    Complete(Cid),
 }
 
-#[derive(Default)]
-struct ImportEvidence {
-    roots: Vec<(String, RpcResourceStatus)>,
-    stats: bool,
-}
-
-impl ImportEvidence {
+impl ImportAck {
     fn record(
         &mut self,
         record: &[u8],
         progress: &Progress,
-        profile: RpcProfile,
-        evidence: &mut SubmitEvidence,
+        expected: &Cid,
     ) -> Result<(), ProviderError> {
         let record: ImportRecord =
             serde_json::from_slice(record).map_err(|_| protocol("invalid RPC import record"))?;
-        if self.stats || record.root.is_some() == record.stats.is_some() {
-            return Err(protocol("invalid RPC import terminal sequence"));
-        }
-        if let Some(root) = record.root {
-            let cid = cid::canonical(&root.cid.value)
-                .map_err(|_| protocol("invalid RPC import root CID"))?;
-            evidence.reported(profile, cid.clone())?;
-            if self.roots.len() == MAX_OBSERVED_RESOURCES {
-                return Err(protocol("RPC import root observation exceeds bound"));
+        *self = match (&*self, record) {
+            (Self::AwaitingRoot, ImportRecord::Root(root)) => {
+                if !root.pin_error.is_empty() {
+                    return Err(protocol("RPC import root pin failed"));
+                }
+                let root = cid::parse_ack(&root.cid.value)?;
+                if !cid::equivalent(&root, expected) {
+                    return Err(mismatch());
+                }
+                Self::AwaitingStats(root)
             }
-            let status = if root.pin_error.is_empty() {
-                RpcResourceStatus::PinAccepted
-            } else {
-                RpcResourceStatus::PinError
-            };
-            if !self.roots.iter().any(|(existing, _)| existing == &cid) {
-                progress.advance();
-            }
-            self.roots.push((cid, status));
-        }
-        if let Some(stats) = record.stats {
-            if self.roots.is_empty() || stats.blocks == 0 {
-                return Err(protocol(
-                    "RPC import omitted complete single-root DAG evidence",
-                ));
-            }
-            // A raw empty root can legitimately have zero block bytes.
-            let _ = stats.bytes;
-            self.stats = true;
-            progress.advance();
-        }
+            (Self::AwaitingStats(cid), ImportRecord::Stats { .. }) => Self::Complete(*cid),
+            _ => return Err(protocol("invalid RPC import terminal sequence")),
+        };
+        progress.advance();
         Ok(())
     }
 }
@@ -193,12 +144,11 @@ impl ImportEvidence {
 async fn parse_import(
     response: reqwest::Response,
     progress: &Progress,
-    profile: RpcProfile,
-    submit_evidence: &mut SubmitEvidence,
-) -> Result<ImportEvidence, ProviderError> {
+    expected: &Cid,
+) -> Result<Cid, ProviderError> {
     let mut body = ResponseBody::new(response, Some(128 * 1024))?;
     let mut lines = NdjsonBuffer::new();
-    let mut evidence = ImportEvidence::default();
+    let mut ack = ImportAck::AwaitingRoot;
     while let Some(data) = body.next().await? {
         lines
             .push(data)
@@ -207,11 +157,14 @@ async fn parse_import(
             .next_record()
             .map_err(|_| protocol("invalid RPC import framing"))?
         {
-            evidence.record(&record, progress, profile, submit_evidence)?;
+            ack.record(&record, progress, expected)?;
         }
     }
     if let Some(record) = lines.finish() {
-        evidence.record(&record, progress, profile, submit_evidence)?;
+        ack.record(&record, progress, expected)?;
     }
-    Ok(evidence)
+    match ack {
+        ImportAck::Complete(root) => Ok(root),
+        _ => Err(protocol("RPC import omitted terminal stats")),
+    }
 }

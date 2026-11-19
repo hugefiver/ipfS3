@@ -2,13 +2,12 @@
 use crate::{car, cluster, pinning};
 use axum::{Router, body::Body, extract::Request, response::Response, routing::post};
 use bytes::Bytes;
+use cluster::ClusterPinset;
 use cluster::provider::{
     ClusterProtocol, ClusterProvider, ClusterProviderOptions, ClusterSource, ClusterStrategy,
-    ClusterWriteEffect,
 };
-use cluster::{ClusterPinset, ReplicaOutcome};
 use http_body_util::{BodyExt, StreamBody};
-use pinning::{identity::Ownership, provider::SubmitPin};
+use pinning::provider::SubmitPin;
 use serde_json::json;
 use std::{
     collections::BTreeMap,
@@ -140,7 +139,7 @@ async fn cluster_provider_real_contract_source_interruption_or_error_trailer_nev
             .unwrap();
             let out = tokio::time::timeout(
                 Duration::from_secs(10),
-                provider.submit_observed(SubmitPin {
+                provider.submit(SubmitPin {
                     cid: root.clone(),
                     name: "not-sent".into(),
                     metadata: BTreeMap::new(),
@@ -148,16 +147,7 @@ async fn cluster_provider_real_contract_source_interruption_or_error_trailer_nev
             )
             .await
             .expect("source fault contract deadline");
-            assert!(out.result.is_err(), "source fault was accepted: {out:?}");
-            assert_eq!(out.effect, ClusterWriteEffect::Unknown);
-            assert_eq!(out.replication_outcome(), ReplicaOutcome::Unknown);
-            assert!(out.replicas.is_none());
-            assert!(out.resources.iter().any(|r| r.resource.cid == root));
-            assert!(
-                out.resources
-                    .iter()
-                    .all(|r| r.ownership == Ownership::Unknown)
-            );
+            assert!(out.is_err(), "source fault was accepted: {out:?}");
             assert_eq!(reads.load(Ordering::SeqCst), 1);
             assert_eq!(
                 writes.load(Ordering::SeqCst),

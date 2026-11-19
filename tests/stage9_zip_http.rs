@@ -1,4 +1,6 @@
-//! R25-D prerequisite: real SigV4 legacy ZIP output-pin acceptance (baseline may be RED).
+//! Signed legacy ZIP publication and output pinning.
+#[path = "support/pin_rows.rs"]
+mod pin_rows;
 
 #[allow(dead_code)]
 mod support {
@@ -19,13 +21,10 @@ use futures_util::FutureExt;
 use http::{HeaderMap, StatusCode};
 use ipfs_s3_gateway::store::{
     self,
-    entities::{
-        object, object_version, pin_invocation_route, pin_job, pin_lease, pin_lease_target,
-        pin_provider_usage, remote_pin,
-    },
+    entities::{object, object_version},
     zip,
 };
-use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
+use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder};
 
 use fixture::{
     ARCHIVE_CID, ARCHIVE_KEY, BUCKET, ENTRY_POINTS, EntryPoint, Fixture, OUTPUT_BODY, OUTPUT_CID,
@@ -242,25 +241,20 @@ async fn assert_zip_pins(
     owners: &BTreeSet<String>,
 ) {
     let db = fixture.state.store.db();
-    let leases = pin_lease::Entity::find().all(db).await.unwrap();
-    let targets = pin_lease_target::Entity::find().all(db).await.unwrap();
+    let refs = pin_rows::refs(db).await;
+    let resources = pin_rows::resources(db).await;
     let archive = store::object::get_latest(db, BUCKET, ARCHIVE_KEY)
         .await
         .unwrap();
-    let automatic = leases
+    let automatic = refs
         .iter()
-        .filter(|lease| lease.source == "automatic")
+        .filter(|row| row.source == "automatic")
         .collect::<Vec<_>>();
     let expected_auto = if auto { owners.len() } else { 0 };
-    assert_eq!(
-        automatic.len(),
-        expected_auto,
-        "{scenario:?}: auto_pin_outputs={auto} requires output-owned Automatic leases only; archive_id={} leases={leases:?} targets={targets:?}",
-        archive.id
-    );
+    assert_eq!(automatic.len(), expected_auto, "{scenario:?}: {refs:?}");
     let actual_owners = automatic
         .iter()
-        .map(|lease| lease.owner_object_id.clone())
+        .map(|row| row.owner_object_id.clone())
         .collect::<BTreeSet<_>>();
     assert_eq!(
         actual_owners,
@@ -268,110 +262,65 @@ async fn assert_zip_pins(
             owners.clone()
         } else {
             BTreeSet::new()
-        },
-        "automatic owner must bind the exact output versions, never archive/root"
+        }
     );
-    assert!(automatic.iter().all(|lease| lease.state == "active"
-        && lease.content_mode == "full"
-        && lease.owner_object_id != archive.id));
+    assert!(
+        automatic
+            .iter()
+            .all(|row| row.content_mode == "object" && row.owner_object_id != archive.id)
+    );
     if matches!(scenario, Scenario::Manual) {
         assert_eq!(
-            leases.len(),
+            refs.len(),
             1,
-            "auto-off preserves explicit legacy manual decompressed pin"
+            "auto-off preserves explicit manual decompressed pin"
         );
         assert_eq!(
             (
-                leases[0].source.as_str(),
-                leases[0].owner_object_id.as_str(),
-                leases[0].content_mode.as_str(),
-                leases[0].state.as_str()
+                refs[0].source.as_str(),
+                refs[0].owner_object_id.as_str(),
+                refs[0].content_mode.as_str()
             ),
-            ("manual", archive.id.as_str(), "decompressed", "active")
+            ("manual", archive.id.as_str(), "decompressed")
         );
     } else {
         assert_eq!(
-            leases.len(),
+            refs.len(),
             expected_auto,
-            "no implicit manual or archive/root lease"
-        );
-    }
-    assert_eq!(
-        targets.len(),
-        leases.len(),
-        "each lease targets the one shared output CID"
-    );
-    for lease in &leases {
-        let target = targets
-            .iter()
-            .filter(|target| target.lease_id == lease.id)
-            .collect::<Vec<_>>();
-        assert_eq!(target.len(), 1, "exact lease target binding");
-        assert_eq!(
-            (
-                target[0].cid.as_str(),
-                target[0].logical_size,
-                target[0].provider.as_str(),
-                target[0].state.as_str()
-            ),
-            (
-                OUTPUT_CID,
-                OUTPUT_BODY.len() as i64,
-                fixture.provider.as_str(),
-                "waiting"
-            )
+            "no implicit manual or archive/root pin"
         );
     }
     assert!(
-        targets
-            .iter()
-            .all(|target| target.cid != ARCHIVE_CID && target.cid != ROOT_CID)
+        refs.iter()
+            .all(|row| row.provider == fixture.provider && row.cid == OUTPUT_CID)
     );
-    assert_quota(
-        fixture,
-        !leases.is_empty(),
-        OUTPUT_CID,
-        OUTPUT_BODY.len() as i64,
-    )
-    .await;
-}
-
-async fn assert_quota(fixture: &Fixture, occupied: bool, cid: &str, size: i64) {
-    let db = fixture.state.store.db();
-    let remotes = remote_pin::Entity::find().all(db).await.unwrap();
     assert_eq!(
-        remotes.len(),
-        usize::from(occupied),
-        "shared CID is one reservation, not one per output/version"
+        resources.len(),
+        usize::from(!refs.is_empty()),
+        "shared output CID uses one resource"
     );
-    if occupied {
+    if let Some(resource) = resources.first() {
         assert_eq!(
             (
-                remotes[0].provider.as_str(),
-                remotes[0].cid.as_str(),
-                remotes[0].cid_size
+                resource.provider.as_str(),
+                resource.cid.as_str(),
+                resource.logical_size
             ),
-            (fixture.provider.as_str(), cid, size)
+            (
+                fixture.provider.as_str(),
+                OUTPUT_CID,
+                OUTPUT_BODY.len() as i64
+            )
         );
-        assert_ne!(
-            remotes[0].status, "pinned",
-            "fixture must not pretend remote work completed"
+        assert_eq!(
+            (
+                resource.status.as_str(),
+                resource.action.as_deref(),
+                resource.handle.as_deref()
+            ),
+            ("waiting", Some("submit"), None)
         );
     }
-    let usages = pin_provider_usage::Entity::find().all(db).await.unwrap();
-    assert_eq!(usages.len(), if occupied { 4 } else { 0 });
-    assert!(usages.iter().all(|usage| {
-        usage.provider == fixture.provider
-            || (usage.reserved_pins == 0 && usage.reserved_bytes == 0)
-    }));
-    assert_eq!(
-        usages.iter().map(|usage| usage.reserved_pins).sum::<i64>(),
-        i64::from(occupied)
-    );
-    assert_eq!(
-        usages.iter().map(|usage| usage.reserved_bytes).sum::<i64>(),
-        if occupied { size } else { 0 }
-    );
 }
 
 async fn assert_non_zip_automatic(fixture: &Fixture) {
@@ -379,20 +328,6 @@ async fn assert_non_zip_automatic(fixture: &Fixture) {
     let object = store::object::get_latest(db, BUCKET, ARCHIVE_KEY)
         .await
         .unwrap();
-    let leases = pin_lease::Entity::find().all(db).await.unwrap();
-    assert_eq!(
-        leases.len(),
-        1,
-        "non-ZIP Always unchanged for either auto-output flag"
-    );
-    assert_eq!(
-        (
-            leases[0].source.as_str(),
-            leases[0].owner_object_id.as_str(),
-            leases[0].state.as_str()
-        ),
-        ("automatic", object.id.as_str(), "active")
-    );
     let versions = object_version::Entity::find()
         .filter(object_version::Column::ObjectId.eq(&object.id))
         .all(db)
@@ -400,21 +335,36 @@ async fn assert_non_zip_automatic(fixture: &Fixture) {
         .unwrap();
     assert_eq!(versions.len(), 1);
     assert!(versions[0].version_id.is_some());
-    let targets = pin_lease_target::Entity::find().all(db).await.unwrap();
-    assert_eq!(targets.len(), 1);
+    let refs = pin_rows::refs(db).await;
+    assert_eq!(
+        refs.len(),
+        1,
+        "non-ZIP Always unchanged for either auto-output flag"
+    );
     assert_eq!(
         (
-            targets[0].lease_id.as_str(),
-            targets[0].cid.as_str(),
-            targets[0].provider.as_str()
+            refs[0].source.as_str(),
+            refs[0].owner_object_id.as_str(),
+            refs[0].provider.as_str(),
+            refs[0].cid.as_str()
         ),
         (
-            leases[0].id.as_str(),
-            ARCHIVE_CID,
-            fixture.provider.as_str()
+            "automatic",
+            object.id.as_str(),
+            fixture.provider.as_str(),
+            ARCHIVE_CID
         )
     );
-    assert_quota(fixture, true, ARCHIVE_CID, object.size).await;
+    let resources = pin_rows::resources(db).await;
+    assert_eq!(resources.len(), 1);
+    assert_eq!(
+        (
+            resources[0].provider.as_str(),
+            resources[0].cid.as_str(),
+            resources[0].logical_size
+        ),
+        (fixture.provider.as_str(), ARCHIVE_CID, object.size)
+    );
 }
 
 async fn run_distinct_output_batch(outputs: usize) {
@@ -458,45 +408,48 @@ async fn run_distinct_output_batch(outputs: usize) {
             object::Entity::find().count(db).await.unwrap(),
             (outputs + 1) as u64
         );
+        let refs = pin_rows::refs(db).await;
+        let resources = pin_rows::resources(db).await;
+        assert_eq!(refs.len(), outputs);
+        assert_eq!(resources.len(), outputs);
         assert_eq!(
-            object_version::Entity::find().count(db).await.unwrap(),
-            (outputs + 1) as u64
+            resources
+                .iter()
+                .map(|row| row.cid.as_str())
+                .collect::<BTreeSet<_>>(),
+            actual_cids
         );
-        let leases = pin_lease::Entity::find().all(db).await.unwrap();
-        assert_eq!(leases.len(), outputs);
-        assert!(leases.iter().all(|lease| {
-            lease.source == "automatic" && lease.provider_mode == "one" && lease.state == "active"
-        }));
-        let targets = pin_lease_target::Entity::find().all(db).await.unwrap();
-        assert_eq!(targets.len(), outputs);
-        assert!(targets.iter().all(|target| {
-            target.provider == fixture.provider
-                && target.state == "waiting"
-                && actual_cids.contains(target.cid.as_str())
-        }));
-        let remotes = remote_pin::Entity::find().all(db).await.unwrap();
-        assert_eq!(remotes.len(), outputs);
-        assert_eq!(
-            pin_job::Entity::find().count(db).await.unwrap(),
-            outputs as u64
-        );
-        assert_eq!(
-            pin_invocation_route::Entity::find()
-                .count(db)
-                .await
-                .unwrap(),
-            outputs as u64
-        );
-        let usages = pin_provider_usage::Entity::find().all(db).await.unwrap();
-        assert_eq!(usages.len(), 4);
-        assert_eq!(
-            usages.iter().map(|usage| usage.reserved_pins).sum::<i64>(),
-            outputs as i64
-        );
-        assert_eq!(
-            usages.iter().map(|usage| usage.reserved_bytes).sum::<i64>(),
-            outputs as i64 * 8
-        );
+        assert!(resources.iter().all(|row| row.provider == fixture.provider
+            && row.logical_size == 8
+            && row.status == "waiting"));
+        let versions = object_version::Entity::find()
+            .order_by_asc(object_version::Column::Id)
+            .all(db)
+            .await
+            .unwrap();
+        assert_eq!(versions.len(), outputs + 1);
+        let owners = versions
+            .iter()
+            .map(|row| (row.id.as_str(), row.object_id.as_deref().unwrap()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let expected_refs = snapshot
+            .entries
+            .iter()
+            .map(|entry| {
+                (
+                    owners[entry.version_row_id.as_deref().unwrap()],
+                    entry.cid.as_deref().unwrap(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        let actual_refs = refs
+            .iter()
+            .map(|row| (row.owner_object_id.as_str(), row.cid.as_str()))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual_refs, expected_refs);
+        assert!(refs.iter().all(|row| row.source == "automatic"
+            && row.content_mode == "object"
+            && row.provider == fixture.provider));
         for index in [0, outputs / 2, outputs - 1] {
             let key = format!("expanded/entry-{index:02}.txt");
             let response = send_sigv4(
@@ -517,17 +470,6 @@ async fn run_distinct_output_batch(outputs: usize) {
             );
         }
 
-        let before_replay = (
-            object_version::Entity::find().count(db).await.unwrap(),
-            pin_lease::Entity::find().count(db).await.unwrap(),
-            pin_lease_target::Entity::find().count(db).await.unwrap(),
-            remote_pin::Entity::find().count(db).await.unwrap(),
-            pin_job::Entity::find().count(db).await.unwrap(),
-            pin_invocation_route::Entity::find()
-                .count(db)
-                .await
-                .unwrap(),
-        );
         let replay = support::decompress::complete_multipart(
             &fixture,
             ARCHIVE_KEY,
@@ -540,19 +482,15 @@ async fn run_distinct_output_batch(outputs: usize) {
         assert_eq!(status, StatusCode::OK, "Complete replay: {body}");
         assert!(body.contains(ARCHIVE_CID), "{body}");
         assert_eq!(
-            (
-                object_version::Entity::find().count(db).await.unwrap(),
-                pin_lease::Entity::find().count(db).await.unwrap(),
-                pin_lease_target::Entity::find().count(db).await.unwrap(),
-                remote_pin::Entity::find().count(db).await.unwrap(),
-                pin_job::Entity::find().count(db).await.unwrap(),
-                pin_invocation_route::Entity::find()
-                    .count(db)
-                    .await
-                    .unwrap(),
-            ),
-            before_replay
+            object_version::Entity::find()
+                .order_by_asc(object_version::Column::Id)
+                .all(db)
+                .await
+                .unwrap(),
+            versions
         );
+        assert_eq!(pin_rows::refs(db).await, refs);
+        assert_eq!(pin_rows::resources(db).await, resources);
     })
     .catch_unwind()
     .await;
@@ -582,7 +520,7 @@ async fn legacy_put_auto_on_pins_exact_outputs_not_archive_or_root() {
     run_case(EntryPoint::Put, true, Scenario::SharedOutputs).await;
 }
 #[tokio::test]
-async fn legacy_put_auto_off_creates_no_automatic_zip_lease() {
+async fn legacy_put_auto_off_creates_no_automatic_zip_reference() {
     run_case(EntryPoint::Put, false, Scenario::SharedOutputs).await;
 }
 #[tokio::test]
@@ -590,7 +528,7 @@ async fn legacy_complete_mpu_auto_on_pins_exact_outputs_not_archive_or_root() {
     run_case(EntryPoint::CompleteMpu, true, Scenario::SharedOutputs).await;
 }
 #[tokio::test]
-async fn legacy_complete_mpu_auto_off_creates_no_automatic_zip_lease() {
+async fn legacy_complete_mpu_auto_off_creates_no_automatic_zip_reference() {
     run_case(EntryPoint::CompleteMpu, false, Scenario::SharedOutputs).await;
 }
 #[tokio::test]
@@ -598,7 +536,7 @@ async fn legacy_import_auto_on_pins_exact_outputs_not_archive_or_root() {
     run_case(EntryPoint::Import, true, Scenario::SharedOutputs).await;
 }
 #[tokio::test]
-async fn legacy_import_auto_off_creates_no_automatic_zip_lease() {
+async fn legacy_import_auto_off_creates_no_automatic_zip_reference() {
     run_case(EntryPoint::Import, false, Scenario::SharedOutputs).await;
 }
 
@@ -628,15 +566,15 @@ async fn legacy_import_auto_on_excludes_failed_output() {
     run_case(EntryPoint::Import, true, Scenario::Partial).await;
 }
 #[tokio::test]
-async fn legacy_put_auto_on_empty_has_no_automatic_lease() {
+async fn legacy_put_auto_on_empty_has_no_automatic_reference() {
     run_case(EntryPoint::Put, true, Scenario::Empty).await;
 }
 #[tokio::test]
-async fn legacy_complete_mpu_auto_on_empty_has_no_automatic_lease() {
+async fn legacy_complete_mpu_auto_on_empty_has_no_automatic_reference() {
     run_case(EntryPoint::CompleteMpu, true, Scenario::Empty).await;
 }
 #[tokio::test]
-async fn legacy_import_auto_on_empty_has_no_automatic_lease() {
+async fn legacy_import_auto_on_empty_has_no_automatic_reference() {
     run_case(EntryPoint::Import, true, Scenario::Empty).await;
 }
 

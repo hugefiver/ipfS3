@@ -6,7 +6,7 @@ use ipfs_s3_gateway::{
         coordinator::{PinningCoordinator, normalize_validated_config},
         identity::{CleanupMode, RemoteResourceType},
         ipfs_rpc::{RpcAuth, RpcStrategy},
-        provider::{ObservedResourceStatus, SubmitEffect, SubmitPin},
+        provider::{ProviderErrorClass, SubmitPin},
     },
 };
 use wiremock::{
@@ -111,10 +111,7 @@ fn independent_kubo_all_strategies_and_auth_profiles_build_without_network_io() 
                 Some(KuboClient::new("http://127.0.0.1:5001".into())),
             )
             .unwrap();
-            assert_eq!(
-                coordinator.provider(&key).unwrap().invocation_route(),
-                ("kubo", strategy)
-            );
+            assert_eq!(coordinator.provider(&key).unwrap().name(), key);
         }
     }
     let cid = validate(&sample("ipfs_rpc", "cid", "none", "http://127.0.0.1:5002")).unwrap();
@@ -151,11 +148,8 @@ fn old_filebase_omission_remains_psa_and_explicit_psa_cid_is_compatible() {
         assert_eq!(validated.providers[0].identity.api_profile, "filebase-psa");
         let coordinator = PinningCoordinator::build(validated).unwrap();
         assert_eq!(
-            coordinator
-                .provider("old-filebase")
-                .unwrap()
-                .invocation_route(),
-            ("psa", "cid")
+            coordinator.provider("old-filebase").unwrap().name(),
+            "old-filebase"
         );
     }
 }
@@ -176,10 +170,7 @@ fn filebase_rpc_upload_builds_but_psa_upload_car_and_other_auth_are_rejected() {
         Some(KuboClient::new("http://127.0.0.1:5001".into())),
     )
     .unwrap();
-    assert_eq!(
-        coordinator.provider(&key).unwrap().invocation_route(),
-        ("filebase-rpc", "upload")
-    );
+    assert_eq!(coordinator.provider(&key).unwrap().name(), key);
     for bad in [
         text.replace("api = \"rpc\"", "api = \"psa\""),
         sample("filebase", "car", "bearer", "https://rpc.filebase.io"),
@@ -238,6 +229,18 @@ fn administrator_url_private_network_and_tls_capabilities_are_fail_closed() {
             "allow_private_network = false",
         );
     validate(&public).unwrap();
+    for tier in ["kubo", "cold_kubo"] {
+        assert!(
+            validate(&format!(
+                "{base}\n[{tier}]\nrpc_url = 'http://127.0.0.1:5002/api/v0/'"
+            ))
+            .is_err()
+        );
+    }
+    validate(&format!(
+        "{base}\n[cold_kubo]\nrpc_url = 'http://127.0.0.1:5003/'"
+    ))
+    .unwrap();
     let primary = validate(&base).unwrap();
     assert!(
         PinningCoordinator::build_with_kubo(
@@ -297,7 +300,7 @@ fn rpc_aliases_deduplicate_one_backend_scope_without_changing_object_cid() {
 }
 
 #[tokio::test]
-async fn configured_filebase_typed_trait_keeps_mismatch_resources_and_source_auth_isolated() {
+async fn configured_filebase_rejects_mismatched_ack_and_keeps_source_auth_isolated() {
     let target = MockServer::start().await;
     let source = MockServer::start().await;
     for (command, response) in [
@@ -331,23 +334,16 @@ async fn configured_filebase_typed_trait_keeps_mismatch_resources_and_source_aut
     let coordinator =
         PinningCoordinator::build_with_kubo(validated, Some(KuboClient::new(source.uri())))
             .unwrap();
-    let observation = coordinator
+    let result = coordinator
         .provider(&key)
         .unwrap()
-        .submit_observed(SubmitPin {
+        .submit(SubmitPin {
             cid: CID.into(),
             name: "not-exported".into(),
             metadata: Default::default(),
         })
         .await;
-    assert!(observation.result.is_err());
-    assert_eq!(observation.effect, SubmitEffect::Observed);
-    assert_eq!(observation.resources.len(), 1);
-    assert_eq!(observation.resources[0].cid, OTHER);
-    assert_eq!(
-        observation.resources[0].status,
-        ObservedResourceStatus::PinAccepted
-    );
+    assert_eq!(result.unwrap_err().class, ProviderErrorClass::Protocol);
     assert!(
         source
             .received_requests()

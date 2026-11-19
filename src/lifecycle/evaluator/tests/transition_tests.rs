@@ -308,6 +308,7 @@ async fn pending_hot_is_rediscovered_without_revision_change_and_actions_dedupli
             version_id: Set(Some(uuid::Uuid::new_v4().to_string())),
             kind: Set("object".into()),
             object_id: Set(Some(id.into())),
+            pin_decision: Set(None),
             sequence: Set(sequence),
             is_latest: Set(latest),
             lifecycle_age_started_at: Set(now),

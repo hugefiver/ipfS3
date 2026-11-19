@@ -13,6 +13,8 @@ mod support {
     pub mod decompress;
     pub mod sigv4;
 }
+#[path = "support/pin_rows.rs"]
+mod pin_rows;
 
 use std::{
     fs::File,
@@ -38,7 +40,7 @@ use ipfs_s3_gateway::{
     state::AppState,
     store::{
         self,
-        entities::{object, object_version, pin_job, pin_lease, pin_lease_target, remote_pin},
+        entities::{object, object_version},
         zip::{self, execution, import_intake},
     },
 };
@@ -467,14 +469,12 @@ async fn status(endpoint: &str, id: &str) -> String {
     .1
 }
 
-async fn rows(db: &DatabaseConnection) -> [u64; 6] {
+async fn rows(db: &DatabaseConnection) -> [u64; 4] {
     [
         object::Entity::find().count(db).await.unwrap(),
         object_version::Entity::find().count(db).await.unwrap(),
-        pin_job::Entity::find().count(db).await.unwrap(),
-        pin_lease::Entity::find().count(db).await.unwrap(),
-        pin_lease_target::Entity::find().count(db).await.unwrap(),
-        remote_pin::Entity::find().count(db).await.unwrap(),
+        pin_rows::count(db, "pin_refs").await,
+        pin_rows::count(db, "pin_resources").await,
     ]
 }
 
@@ -641,7 +641,7 @@ poll_interval_ms = 25
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(rows(&db_a).await, [1, 1, 0, 0, 0, 0]);
+    assert_eq!(rows(&db_a).await, [1, 1, 0, 0]);
     let xml = format!(
         "<IPFS3ImportRequest><URL>{}{SOURCE_PATH}</URL></IPFS3ImportRequest>",
         source.origin()
@@ -666,7 +666,7 @@ poll_interval_ms = 25
     assert_eq!(bound.input_art_size, Some(archive.len() as i64));
     assert_eq!(bound.epoch, 1);
     assert!(bound.lease_until.unwrap() > store::database_clock::database_now(&db_a).await.unwrap());
-    assert_eq!(rows(&db_a).await, [1, 1, 0, 0, 0, 0]);
+    assert_eq!(rows(&db_a).await, [1, 1, 0, 0]);
     let old_claim = execution::Claim {
         batch_id: id.clone(),
         epoch: bound.epoch,
@@ -753,7 +753,7 @@ poll_interval_ms = 25
         1,
         "B must use the bound artifact, not GET the changed URL"
     );
-    assert_eq!(rows(&db).await, [2, 2, 0, 0, 0, 0]);
+    assert_eq!(rows(&db).await, [2, 2, 0, 0]);
     let historical = zip::snapshot(&db, &id).await.unwrap().unwrap();
     assert_eq!(historical.batch.state, "published");
     assert!(!historical.batch.source_published);
@@ -875,7 +875,7 @@ poll_interval_ms = 25
         .unwrap();
     assert_eq!(versions_before.len(), 3);
     let before_rows = rows(&db).await;
-    assert_eq!(before_rows, [3, 3, 0, 0, 0, 0]);
+    assert_eq!(before_rows, [3, 3, 0, 0]);
     let before_kubo = kubo.received_requests().await.unwrap().len();
     assert_eq!(submit(&b.endpoint, &xml).await, id);
     assert_eq!(status(&b.endpoint, &id).await, ready_xml);
@@ -889,7 +889,7 @@ poll_interval_ms = 25
     assert_eq!(
         rows(&db).await,
         before_rows,
-        "zero new versions or remote jobs/leases/targets/resources"
+        "replay adds no object, version, pin reference or resource"
     );
     assert_eq!(
         object_version::Entity::find()
@@ -937,7 +937,7 @@ poll_interval_ms = 25
     assert_eq!(after_get.len(), before_kubo + 1);
     assert_eq!(after_get.last().unwrap().url.path(), "/api/v0/cat");
     eprintln!(
-        "PROCESS_EVIDENCE child=test-executable pid_a={pid_a} kill_a={exit_a} pid_b={} epoch={}->{} url_gets=1 artifact_adds=1 import_outputs=1 versions_after_independent_overwrite=3 root=disabled replay_new_url_get=0 replay_new_kubo_add=0 replay_new_versions=0 replay_new_remote_jobs=0",
+        "PROCESS_EVIDENCE child=test-executable pid_a={pid_a} kill_a={exit_a} pid_b={} epoch={}->{} url_gets=1 artifact_adds=1 import_outputs=1 versions_after_independent_overwrite=3 root=disabled replay_new_url_get=0 replay_new_kubo_add=0 replay_new_versions=0 replay_new_pin_refs=0 replay_new_pin_resources=0",
         b.child.id(),
         bound.epoch,
         completed.epoch
