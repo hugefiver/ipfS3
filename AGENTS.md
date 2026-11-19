@@ -123,6 +123,10 @@ Key env vars:
 - `IPFS_S3_ACCESS_KEY_ID` / `IPFS_S3_SECRET_ACCESS_KEY` — S3 credentials
 - `IPFS_S3_MASTER_KEY` — hex-encoded 32-byte master key for SSE-S3
 
+## Worker writeback
+
+Use optimistic writes. Once an operation has a recorded terminal result, write it back to that task and resource version directly; an identical replay is a no-op. Do not pre-read and lock related records or audit provider history to reconfirm that result. Keep network I/O, scans, and expensive computation outside write transactions and shared critical sections.
+
 ## Spec
 
 See `docs/superpowers/specs/2026-07-02-ipfs-s3-gateway-design.md` for the full design document.
