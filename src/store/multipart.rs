@@ -12,6 +12,8 @@ use super::entities::{multipart_part, multipart_upload};
 use crate::pinning::decision::ExtensionDecision;
 use crate::pinning::tags::ObjectTag;
 
+mod cancel;
+pub(crate) use cancel::cancel_exact_incomplete_upload_in_transaction;
 pub mod v2_zip;
 
 #[allow(clippy::too_many_arguments)]

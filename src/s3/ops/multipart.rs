@@ -2187,7 +2187,7 @@ pub async fn abort_multipart_upload(
         initiated_at: upload.created_at,
     };
     use crate::store::multipart::AbortExactIncompleteUploadResult;
-    match crate::store::multipart::abort_exact_incomplete_upload_in_transaction(&txn, &target)
+    match crate::store::multipart::cancel_exact_incomplete_upload_in_transaction(&txn, &target)
         .await?
     {
         AbortExactIncompleteUploadResult::Applied => {}

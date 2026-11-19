@@ -22,6 +22,14 @@ pub struct RootClaim {
     pub worker: String,
 }
 
+fn upload_aborted(batch: &zip_batch::Model) -> bool {
+    batch.state == "open"
+        && batch.source == "mpu"
+        && batch.fingerprint == "pending"
+        && batch.root_status == "failed"
+        && batch.root_error_code.as_deref() == Some(super::ROOT_UPLOAD_ABORTED)
+}
+
 /// Start an intent BEFORE any root RPC. A takeover retains earlier intents and
 /// candidates; expired workers cannot validate or publish into the new epoch.
 pub async fn claim_root(
@@ -35,7 +43,8 @@ pub async fn claim_root(
     }
     let tx = db.begin().await?;
     let batch = lock_batch(&tx, id).await?;
-    if !batch.manifest_prepared
+    if upload_aborted(&batch)
+        || !batch.manifest_prepared
         || matches!(
             batch.root_status.as_str(),
             "complete" | "partial" | "disabled" | "empty"
@@ -115,7 +124,8 @@ pub(super) async fn current_claim<C: ConnectionTrait>(
         .one(tx)
         .await?
         .ok_or_else(stale)?;
-    if batch.root_revision != claim.revision
+    if upload_aborted(&batch)
+        || batch.root_revision != claim.revision
         || batch.root_epoch != claim.epoch
         || build.worker != claim.worker
         || build.lease_until <= database_now(tx).await?

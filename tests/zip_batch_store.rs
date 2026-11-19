@@ -720,9 +720,11 @@ async fn zip_batch_migration_preserves_existing_objects() {
     Previous::up(&db, None).await.unwrap();
     store::bucket::create(&db, "bucket", None).await.unwrap();
     db.execute_unprepared("INSERT INTO objects (id,bucket,key,cid,size,etag) VALUES ('old','bucket','old','legacy',1,'legacy')").await.unwrap();
-    db.execute_unprepared("INSERT INTO object_tags (object_id,key,value) VALUES ('old','env','test')")
-        .await
-        .unwrap();
+    db.execute_unprepared(
+        "INSERT INTO object_tags (object_id,key,value) VALUES ('old','env','test')",
+    )
+    .await
+    .unwrap();
     let manager = SchemaManager::new(&db);
     store::migrations::m20260927_000001_zip_batches::Migration
         .up(&manager)

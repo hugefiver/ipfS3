@@ -11,7 +11,7 @@ use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::Response as AxumResponse;
 use sea_orm::Database;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 pub trait S3TestEndpoint {
@@ -92,6 +92,7 @@ pub struct KuboHarness {
 pub enum KuboBlockTarget {
     Add,
     Cat,
+    CatCid(&'static str),
     PinAdd,
 }
 
@@ -140,20 +141,22 @@ pub async fn block_next_kubo_request(
     };
     let endpoint = match target {
         KuboBlockTarget::Add => "/api/v0/add",
-        KuboBlockTarget::Cat => "/api/v0/cat",
+        KuboBlockTarget::Cat | KuboBlockTarget::CatCid(_) => "/api/v0/cat",
         KuboBlockTarget::PinAdd => "/api/v0/pin/add",
     };
-    Mock::given(method("POST"))
-        .and(path(endpoint))
-        .respond_with(move |_: &wiremock::Request| {
-            blocker.block_once(target);
-            response.clone()
-        })
-        .with_priority(1)
-        .up_to_n_times(1)
-        .expect(1)
-        .mount(server)
-        .await;
+    let mut mock = Mock::given(method("POST")).and(path(endpoint));
+    if let KuboBlockTarget::CatCid(cid) = target {
+        mock = mock.and(query_param("arg", cid));
+    }
+    mock.respond_with(move |_: &wiremock::Request| {
+        blocker.block_once(target);
+        response.clone()
+    })
+    .with_priority(1)
+    .up_to_n_times(1)
+    .expect(1)
+    .mount(server)
+    .await;
     KuboBlockControl {
         reached: Some(reached_rx),
         release: Some(release_tx),

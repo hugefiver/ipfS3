@@ -414,7 +414,14 @@ async fn import_shutdown_after_root_takeover_cannot_adopt_or_register_for_succes
     import_cancellation(ImportStop::Shutdown, true).await;
 }
 
-async fn handler_loss(mpu: bool, takeover: bool) {
+#[derive(Clone, Copy)]
+enum HandlerStop {
+    LostExecution,
+    RootTakeover,
+    Abort,
+}
+
+async fn handler_cancellation(mpu: bool, stop: HandlerStop) {
     let rig = rig(30).await;
     let query;
     let body;
@@ -481,27 +488,77 @@ async fn handler_loss(mpu: bool, takeover: bool) {
         snapshot = wait_for_root_pin(&rig) => snapshot,
         response = &mut request => panic!("handler returned before root gate: {}", response.status()),
     };
-    let new = if takeover {
+    let new = if matches!(stop, HandlerStop::RootTakeover) {
         Some(take_over_root(&rig, &old).await)
     } else {
         None
     };
-    rig.state
-        .store
-        .db()
-        .execute_unprepared("UPDATE zip_v2_executions SET worker='successor',epoch=epoch+1")
-        .await
-        .unwrap();
+    let db = rig.state.store.db();
+    let aborted_claim = if matches!(stop, HandlerStop::Abort) {
+        let original = zip::RootClaim {
+            batch_id: upload.clone(),
+            revision: old.batch.root_revision,
+            epoch: old.batch.root_epoch,
+            worker: old.builds[0].worker.clone(),
+        };
+        let abort = support::sigv4::send_sigv4(
+            reqwest::Method::DELETE,
+            &endpoint,
+            BUCKET,
+            "archive.zip",
+            &[("uploadId", &upload)],
+            vec![],
+            HeaderMap::new(),
+            "test",
+        )
+        .await;
+        assert_eq!(
+            abort.status(),
+            StatusCode::NO_CONTENT,
+            "{}",
+            abort.text().await.unwrap()
+        );
+        assert!(zip::renew_claim(db, &original, 30).await.is_err());
+        Some(original)
+    } else {
+        db.execute_unprepared("UPDATE zip_v2_executions SET worker='successor',epoch=epoch+1")
+            .await
+            .unwrap();
+        None
+    };
     let response = tokio::time::timeout(Duration::from_secs(12), &mut request)
         .await
         .expect("lease loss stops handler without waiting for gated root pin");
     assert_eq!(response.status(), StatusCode::CONFLICT);
     assert_retained_only(&rig, &old, new.as_ref()).await;
-    if mpu {
+    if let Some(original) = aborted_claim {
+        let snapshot = zip::snapshot(db, &upload).await.unwrap().unwrap();
+        assert_eq!(snapshot.batch.root_status, "failed");
+        assert_eq!(
+            snapshot.batch.root_error_code.as_deref(),
+            Some("upload_aborted")
+        );
         assert!(
-            store::multipart::get_upload(rig.state.store.db(), &upload)
+            zip::verify_root(db, &original, "initialRootNode", "hot", ROOT, "{}")
                 .await
-                .is_ok(),
+                .is_err()
+        );
+        db.execute(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            "UPDATE zip_root_builds SET lease_until='2000-01-01T00:00:00Z' WHERE batch_id=?",
+            [upload.clone().into()],
+        ))
+        .await
+        .unwrap();
+        assert!(
+            zip::claim_root(db, &upload, "late-root-worker", 30)
+                .await
+                .is_err()
+        );
+        assert!(zip::recovery::due_page(db).await.unwrap().is_empty());
+    } else if mpu {
+        assert!(
+            store::multipart::get_upload(db, &upload).await.is_ok(),
             "a canceled complete must not consume its MPU upload"
         );
     }
@@ -510,20 +567,25 @@ async fn handler_loss(mpu: bool, takeover: bool) {
 
 #[tokio::test]
 async fn direct_lost_execution_retains_inflight_initial_root_without_publication() {
-    handler_loss(false, false).await;
+    handler_cancellation(false, HandlerStop::LostExecution).await;
 }
 
 #[tokio::test]
 async fn mpu_lost_execution_retains_inflight_initial_root_without_publication() {
-    handler_loss(true, false).await;
+    handler_cancellation(true, HandlerStop::LostExecution).await;
 }
 
 #[tokio::test]
 async fn direct_root_takeover_rejects_old_actor_and_preserves_original_candidate() {
-    handler_loss(false, true).await;
+    handler_cancellation(false, HandlerStop::RootTakeover).await;
 }
 
 #[tokio::test]
 async fn mpu_root_takeover_rejects_old_actor_and_preserves_original_candidate() {
-    handler_loss(true, true).await;
+    handler_cancellation(true, HandlerStop::RootTakeover).await;
+}
+
+#[tokio::test]
+async fn signed_abort_fences_root_claims_and_retains_candidate_from_late_complete() {
+    handler_cancellation(true, HandlerStop::Abort).await;
 }

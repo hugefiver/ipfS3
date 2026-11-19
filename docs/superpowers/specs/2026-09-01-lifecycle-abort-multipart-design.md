@@ -8,7 +8,12 @@ Claims, retries, leases and rule revisions are shared with version actions.
 An incomplete upload has no published object version, so abort doesn't take a
 standard content-mutation admission token. The short final write uses the
 bucket lock to resolve conflicts with multipart completion, explicit abort and
-bucket deletion. S3 abort response headers and `ListMultipartUploads` are
+bucket deletion. For a ZIP v2 upload, both lifecycle and explicit Abort stop
+that upload's execution and release only the source and output reservations
+it still owns. An interrupted Complete can be retried while the upload is
+active; after Abort, a late Complete cannot publish objects or adopt a root.
+Abort does not unpin blocks or change a completed upload's replay receipt.
+S3 abort response headers and `ListMultipartUploads` are
 unsupported.
 
 ## Configuration Contract

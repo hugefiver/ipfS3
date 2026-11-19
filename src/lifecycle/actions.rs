@@ -38,7 +38,7 @@ use crate::{
             waiting_for_dependency,
         },
         multipart::{
-            AbortExactIncompleteUploadResult, abort_exact_incomplete_upload_in_transaction,
+            AbortExactIncompleteUploadResult, cancel_exact_incomplete_upload_in_transaction,
         },
         object_version::{
             BucketVersioningState, ExactCurrentMarkerDeleteResult, VersionKind,
@@ -377,7 +377,7 @@ async fn execute_multipart_in_transaction<C: ConnectionTrait>(
     }
     // Absence is successful only after policy and due-time revalidation; the
     // action must retain its audit outcome even when completion removed the upload.
-    match abort_exact_incomplete_upload_in_transaction(txn, target).await? {
+    match cancel_exact_incomplete_upload_in_transaction(txn, target).await? {
         AbortExactIncompleteUploadResult::Applied
         | AbortExactIncompleteUploadResult::AlreadySatisfied => {
             if !mark_succeeded(txn, claim, now).await? {
@@ -1216,7 +1216,6 @@ mod tests {
 
     async fn multipart_fixture() -> (DatabaseConnection, ClaimedLifecycleAction) {
         let db = setup().await;
-        let (revision, _) = configure(&db, vec![abort_rule()]).await;
         multipart::create_upload(
             &db,
             "upload",
@@ -1234,16 +1233,23 @@ mod tests {
         )
         .await
         .unwrap();
-        let initiated_at = database_now(&db).await.unwrap() - Duration::days(3);
+        let claim = claim_multipart_fixture(&db).await;
+        (db, claim)
+    }
+
+    async fn claim_multipart_fixture(db: &DatabaseConnection) -> ClaimedLifecycleAction {
+        let (revision, _) = configure(db, vec![abort_rule()]).await;
+        let initiated_at = database_now(db).await.unwrap() - Duration::days(3);
         multipart_upload::Entity::update_many()
             .col_expr(
                 multipart_upload::Column::CreatedAt,
                 Expr::value(initiated_at),
             )
-            .exec(&db)
+            .filter(multipart_upload::Column::UploadId.eq("upload"))
+            .exec(db)
             .await
             .unwrap();
-        multipart::upsert_part(&db, "upload", 1, "part-cid", 5, "part-cid")
+        multipart::upsert_part(db, "upload", 1, "part-cid", 5, "part-cid")
             .await
             .unwrap();
         let action = NewLifecycleAction {
@@ -1261,15 +1267,14 @@ mod tests {
             due_at: crate::lifecycle::evaluator::next_utc_midnight_after_full_days(initiated_at, 1)
                 .unwrap(),
         };
-        insert_idempotent(&db, action, database_now(&db).await.unwrap())
+        insert_idempotent(db, action, database_now(db).await.unwrap())
             .await
             .unwrap();
-        let claim = claim_due(&db, WORKER, Duration::seconds(30), 1)
+        claim_due(db, WORKER, Duration::seconds(30), 1)
             .await
             .unwrap()
             .pop()
-            .unwrap();
-        (db, claim)
+            .unwrap()
     }
 
     async fn stored_action(
@@ -1866,6 +1871,135 @@ mod tests {
         execute(&db, &next).await;
         assert_eq!(state(&db, &next).await.as_deref(), Some("succeeded"));
         assert_upload_present(&db, false).await;
+    }
+
+    #[tokio::test]
+    async fn multipart_zip_v2_abort_rolls_back_on_terminal_write_failure_then_fences() {
+        use crate::{
+            config::{DecompressZipConfig, OptionalPinControlMode, PinningConfig},
+            pinning::{
+                config::ValidatedPinningConfig,
+                decision::DecisionOrigin,
+                zip_policy::{ZipCaptureContext, capture_zip_intent},
+            },
+            store::{multipart::v2_zip, zip::execution},
+            zip::options::{
+                PUBLISH_SOURCE, ZIP_CONTRACT, ZIP_TOKEN, parse_authenticated_zip_controls,
+            },
+        };
+
+        let db = setup().await;
+        let zip_config = DecompressZipConfig::default();
+        let mut headers = http::HeaderMap::new();
+        for (name, value) in [
+            (ZIP_CONTRACT, "v2"),
+            (PUBLISH_SOURCE, "false"),
+            (ZIP_TOKEN, "lifecycle-abort"),
+        ] {
+            headers.insert(name, http::HeaderValue::from_static(value));
+        }
+        let controls = parse_authenticated_zip_controls(
+            &headers,
+            &[("decompress-zip".into(), "out/".into())],
+            &[],
+            true,
+            zip_config.unixfs_directory_root,
+        )
+        .unwrap()
+        .unwrap();
+        let pinning =
+            ValidatedPinningConfig::from_raw(&PinningConfig::default(), |_| None).unwrap();
+        let intent = capture_zip_intent(
+            &pinning,
+            &zip_config,
+            OptionalPinControlMode::Warn,
+            ZipCaptureContext {
+                bucket: "bucket",
+                source_key: "logs/key",
+                target_prefix: "out/",
+                tags: &[],
+            },
+            &controls,
+            DecisionOrigin::new("owner", "upload"),
+        )
+        .unwrap();
+        v2_zip::create_or_replay_with_zip_intent(
+            &db,
+            &v2_zip::Intake {
+                upload_id: "upload".into(),
+                object_id: "mpu-object".into(),
+                owner: "owner".into(),
+                token: "lifecycle-abort".into(),
+                bucket: "bucket".into(),
+                key: "logs/key".into(),
+                target_prefix: "out/".into(),
+                request_contract: r#"{"version":2}"#.into(),
+                options: intent.v2_options().unwrap(),
+                captured_config: serde_json::json!({
+                    "root_default": zip_config.unixfs_directory_root,
+                })
+                .to_string(),
+                content_type: None,
+                metadata: None,
+                tags: vec![],
+            },
+            &intent,
+        )
+        .await
+        .unwrap();
+        let claim = claim_multipart_fixture(&db).await;
+        let initial_upload = multipart::get_upload(&db, "upload").await.unwrap();
+        let initial_parts = multipart::list_parts(&db, "upload").await.unwrap();
+        let initial_execution = execution::read(&db, "upload").await.unwrap().unwrap();
+        assert_eq!(initial_execution.state, "pending");
+
+        let _failure =
+            action_store::test_hooks::fail_next_succeeded(&claim.action.id).temporarily();
+        execute(&db, &claim).await;
+        let pending = stored_action(&db, &claim).await;
+        assert_eq!(pending.state, "pending");
+        assert_eq!(
+            pending.failure_class.as_deref(),
+            Some(action_store::FAILURE_DATABASE_CONTENTION)
+        );
+        assert_eq!(
+            multipart::get_upload(&db, "upload").await.unwrap(),
+            initial_upload
+        );
+        assert_eq!(
+            multipart::list_parts(&db, "upload").await.unwrap(),
+            initial_parts
+        );
+        let intake = v2_zip::read_by_upload(&db, "upload")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(intake.active_upload_id.as_deref(), Some("upload"));
+        assert_eq!(intake.execution_id, initial_execution.id);
+        assert_eq!(
+            execution::read(&db, "upload").await.unwrap(),
+            Some(initial_execution)
+        );
+
+        let next = reclaim_multipart(&db, &claim).await;
+        execute(&db, &next).await;
+        assert_eq!(state(&db, &next).await.as_deref(), Some("succeeded"));
+        assert_upload_present(&db, false).await;
+        let intake = v2_zip::read_by_upload(&db, "upload")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(intake.active_upload_id, None);
+        assert_eq!(
+            execution::read(&db, "upload").await.unwrap().unwrap().state,
+            "fenced"
+        );
+        assert!(
+            execution::claim(&db, "upload", "late-complete", 30)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

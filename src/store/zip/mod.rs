@@ -27,6 +27,8 @@ use super::entities::zip_batch;
 use crate::error::{AppError, AppResult};
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseTransaction, EntityTrait, QuerySelect};
 
+pub(crate) const ROOT_UPLOAD_ABORTED: &str = "upload_aborted";
+
 pub struct BatchSnapshot {
     pub batch: zip_batch::Model,
     pub entries: Vec<super::entities::zip_manifest_entry::Model>,
