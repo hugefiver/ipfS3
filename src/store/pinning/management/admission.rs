@@ -187,6 +187,28 @@ pub(in crate::store::pinning) async fn lock_runtime_provider(
     provider: &str,
     work: DecodeWork<'_>,
 ) -> AppResult<()> {
+    lock_runtime_provider_admission(tx, provider, work, true).await
+}
+
+pub(in crate::store::pinning) async fn lock_runtime_submit_dispatch(
+    tx: &crate::store::RuntimeTransaction,
+    job: &crate::store::entities::pin_job::Model,
+    work: DecodeWork<'_>,
+) -> AppResult<()> {
+    // The shared route-table fence already excludes registration changes.
+    lock_runtime_provider_admission(tx, &job.provider, work, false).await?;
+    if !super::super::ledger::submit_dispatch_open_catalog(tx.catalog(work), job, work).await? {
+        return Err(needs_attention());
+    }
+    Ok(())
+}
+
+async fn lock_runtime_provider_admission(
+    tx: &crate::store::RuntimeTransaction,
+    provider: &str,
+    work: DecodeWork<'_>,
+    lock_route_rows: bool,
+) -> AppResult<()> {
     locks::serialize(tx.db(), locks::RetirementAccess::Admission).await?;
     locks::serialize_routes(tx.db(), false).await?;
     let catalog = tx.catalog(work);
@@ -199,7 +221,9 @@ pub(in crate::store::pinning) async fn lock_runtime_provider(
             Err(needs_attention())
         };
     }
-    locks::lock_route_rows_with_work(tx.db(), &routes, work).await?;
+    if lock_route_rows {
+        locks::lock_route_rows_with_work(tx.db(), &routes, work).await?;
+    }
     if retirement::closed_with_role(&routes, &schema, false, None, work, catalog).await? {
         return Err(retired());
     }

@@ -3259,38 +3259,56 @@ async fn prepare_failed_remote_resubmit_prelocked<C: ConnectionTrait>(
     })
 }
 
-/// Fresh Submit crosses admission before its job/history tail is locked. A
-/// reclaimed invocation instead follows the existing read-only recovery path.
+/// Hold only Submit's own lifecycle rows; canonical selection is read-only.
+/// `Some` returns the locked lease's expiry after dispatch admission.
 pub(crate) async fn lock_submit_admission_frontier(
     runtime: &crate::store::RuntimeTransaction,
     job: &pin_job::Model,
-) -> AppResult<()> {
+    work: DecodeWork<'_>,
+) -> AppResult<Option<DateTimeUtc>> {
     let tx = runtime.db();
     super::management::admission::lock_sqlite_writer_in_caller_transaction(tx).await?;
-    match ordered_desired_lifecycle_snapshot(tx, &job.provider, &job.cid).await? {
-        OrderedDesiredLifecycleSnapshotOutcome::Current(snapshot) => {
-            if !snapshot.desired.iter().any(|desired| {
-                Some(desired.target.id.as_str()) == job.target_id.as_deref()
-                    && Some(desired.lease.id.as_str()) == job.lease_id.as_deref()
-                    && Some(desired.lease.generation) == job.expected_generation
-            }) {
-                // The original prepare path completes/reconciles stale work;
-                // it cannot dispatch without a matching desired generation.
-                return Ok(());
-            }
-            let session = SharedDecodeBudget::default();
-            quota::lock_runtime_allocation_admission(
-                runtime,
-                &job.provider,
-                DecodeWork::shared(&session),
-            )
-            .await
-        }
-        OrderedDesiredLifecycleSnapshotOutcome::Stale => {
-            Err(stale_lifecycle_error("Submit admission frontier"))
-        }
-        OrderedDesiredLifecycleSnapshotOutcome::MissingRemote => Ok(()),
+    let (Some(lease_id), Some(target_id), Some(generation)) =
+        (&job.lease_id, &job.target_id, job.expected_generation)
+    else {
+        return Ok(None);
+    };
+    if job.operation != "submit" || job.expected_remote_epoch.is_some() {
+        return Ok(None);
     }
+
+    let postgres = tx.get_database_backend() == DatabaseBackend::Postgres;
+    let mut lease = pin_lease::Entity::find_by_id(lease_id.clone())
+        .filter(pin_lease::Column::State.eq(LEASE_ACTIVE))
+        .filter(pin_lease::Column::Generation.eq(generation));
+    let mut target = pin_lease_target::Entity::find_by_id(target_id.clone())
+        .filter(pin_lease_target::Column::LeaseId.eq(lease_id))
+        .filter(pin_lease_target::Column::Provider.eq(&job.provider))
+        .filter(pin_lease_target::Column::Cid.eq(&job.cid))
+        .filter(pin_lease_target::Column::State.is_in(active_target_states()));
+    if postgres {
+        lease = lease.lock_shared();
+        target = target.lock_shared();
+    }
+    let lease = lease.one(tx).await?;
+    let target_current = lease.is_some() && target.one(tx).await?.is_some();
+    let remote = lock_remote_after_lifecycle(tx, &job.provider, &job.cid).await?;
+    let Some(lease) = lease.filter(|_| target_current) else {
+        return Ok(None);
+    };
+    if !remote.is_some_and(|remote| remote.status == REMOTE_RESERVED && remote.request_id.is_none())
+    {
+        return Ok(None);
+    }
+    let canonical =
+        jobs::canonical_submit_target_with_work(tx, &job.provider, &job.cid, Utc::now(), work)
+            .await
+            .map_err(work_error)?;
+    if !canonical.is_some_and(|target| target.id == *target_id) {
+        return Ok(None);
+    }
+    super::management::admission::lock_runtime_submit_dispatch(runtime, job, work).await?;
+    Ok(Some(lease.expires_at))
 }
 
 /// Renews only a manual lease still owned by the supplied immutable latest object.

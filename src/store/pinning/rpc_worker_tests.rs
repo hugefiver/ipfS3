@@ -2236,16 +2236,45 @@ async fn observed_terminal_receipt(mut db: sea_orm::DatabaseConnection) {
     let fixture = fixture_on_database(raw, db).await;
     trace.take("RPC cold fixture", false);
     let claim = fixture.claim().await.unwrap();
-    let dispatched = dispatch_submit(
-        &fixture.store,
-        &fixture.coordinator,
-        &Arc::new(Semaphore::new(2)),
-        claim,
-        &CancellationToken::new(),
+    let quota_writer = if fixture.store.db().get_database_backend() == DatabaseBackend::Postgres {
+        let tx = fixture.store.db().begin().await.unwrap();
+        tx.query_one(sea_orm::Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT provider FROM pin_provider_usage WHERE provider=$1 FOR UPDATE",
+            [fixture.provider.clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+        tx.query_one(sea_orm::Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT provider FROM pin_provider_routes WHERE provider=$1 FOR SHARE",
+            [fixture.provider.clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+        Some(tx)
+    } else {
+        None
+    };
+    let dispatched = tokio::time::timeout(
+        Duration::from_secs(10),
+        dispatch_submit(
+            &fixture.store,
+            &fixture.coordinator,
+            &Arc::new(Semaphore::new(2)),
+            claim,
+            &CancellationToken::new(),
+        ),
     )
     .await
+    .expect("an already reserved Submit must not wait for the provider's accounting row")
     .unwrap()
     .unwrap();
+    if let Some(tx) = quota_writer {
+        tx.rollback().await.unwrap();
+    }
     let job_id = dispatched.claimed.model.id.clone();
     jobs::park_submit_store(
         &fixture.store,
@@ -2346,7 +2375,13 @@ async fn postgres_shared_cid_receipt_projection_orders_all_leases_before_remote(
             .filter(pin_lease_target::Column::LeaseId.ne(original_lease))
             .one(fixture.store.db()).await.unwrap().unwrap();
         assert_eq!(other.state, "waiting");
-        let dispatched = dispatch_submit(&fixture.store, &fixture.coordinator, &Arc::new(Semaphore::new(2)), claimed, &CancellationToken::new()).await.unwrap().unwrap();
+        let dispatch_peer = peer.begin().await.unwrap();
+        dispatch_peer.query_one(sea_orm::Statement::from_sql_and_values(DatabaseBackend::Postgres,
+            "SELECT id FROM pin_leases WHERE id=$1 FOR SHARE", [claimed.model.lease_id.clone().unwrap().into()])).await.unwrap().unwrap();
+        dispatch_peer.query_one(sea_orm::Statement::from_sql_and_values(DatabaseBackend::Postgres,
+            "SELECT id FROM pin_lease_targets WHERE id=$1 FOR UPDATE", [other.id.clone().into()])).await.unwrap().unwrap();
+        let dispatched = tokio::time::timeout(Duration::from_secs(10), dispatch_submit(&fixture.store, &fixture.coordinator, &Arc::new(Semaphore::new(2)), claimed, &CancellationToken::new())).await.expect("Submit needs only its own shared lease and target before HTTP").unwrap().unwrap();
+        dispatch_peer.rollback().await.unwrap();
         let peer_tx = peer.begin().await.unwrap();
         let peer_pid = peer_tx.query_one(sea_orm::Statement::from_string(DatabaseBackend::Postgres, "SELECT pg_backend_pid() AS pid")).await.unwrap().unwrap().try_get::<i32>("", "pid").unwrap();
         peer_tx.query_one(sea_orm::Statement::from_sql_and_values(DatabaseBackend::Postgres,

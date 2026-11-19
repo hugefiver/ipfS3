@@ -679,21 +679,16 @@ async fn record_invocation_core<C: ConnectionTrait>(
     work: DecodeWork<'_>,
     runtime: Option<&crate::store::RuntimeTransaction>,
 ) -> AppResult<Option<history::Model>> {
-    super::management::admission::lock_sqlite_writer_in_caller_transaction(db).await?;
-    let dispatch_open = match runtime {
-        Some(tx) => {
-            super::ledger::submit_dispatch_open_catalog(tx.catalog(work), &claimed.model, work)
-                .await?
+    if runtime.is_none() {
+        super::management::admission::lock_sqlite_writer_in_caller_transaction(db).await?;
+        if !super::ledger::submit_dispatch_open_with_work(db, &claimed.model, work).await? {
+            return Err(invalid_job(
+                "retired domain cannot start another invocation",
+            ));
         }
-        None => super::ledger::submit_dispatch_open_with_work(db, &claimed.model, work).await?,
-    };
-    if !dispatch_open {
-        return Err(invalid_job(
-            "retired domain cannot start another invocation",
-        ));
-    }
-    if !fence_job_claim(db, &claimed.model.id, claimed_lock(&claimed.model)?).await? {
-        return Err(stale_claim_error(&claimed.model.id));
+        if !fence_job_claim(db, &claimed.model.id, claimed_lock(&claimed.model)?).await? {
+            return Err(stale_claim_error(&claimed.model.id));
+        }
     }
     if super::ledger::submission::latest_rpc(db, &claimed.model.id)
         .await?
@@ -732,7 +727,6 @@ async fn record_invocation_core<C: ConnectionTrait>(
     }
     if let Some(tx) = runtime {
         super::ledger::advance_runtime_submit_epoch(tx, claimed, api, strategy, work).await?;
-        super::quota::lock_runtime_allocation_admission(tx, &claimed.model.provider, work).await?;
     } else {
         super::ledger::advance_submit_invocation_epoch(db, claimed, api, strategy).await?;
         super::quota::lock_allocation_admission_with_work(db, &claimed.model.provider, work)
@@ -2670,6 +2664,24 @@ pub async fn fence_job_claim<C: ConnectionTrait>(
     Ok(fenced.rows_affected == 1)
 }
 
+/// A receipt can own the job while waiting for our earlier Submit remote lock.
+pub(crate) async fn fence_submit_claim_nowait(
+    tx: &crate::store::RuntimeTransaction,
+    claimed: &ClaimedPinJob,
+) -> AppResult<bool> {
+    let job = &claimed.model;
+    let until = claimed_lock(job)?;
+    let db = tx.db();
+    if db.get_database_backend() != DatabaseBackend::Postgres {
+        return fence_job_claim(db, &job.id, until).await;
+    }
+    Ok(db.query_one(sea_orm::Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "SELECT id FROM pin_jobs WHERE id=$1 AND state='running' AND locked_until=$2 FOR UPDATE NOWAIT",
+        [job.id.as_str().into(), until.into()],
+    )).await?.is_some())
+}
+
 /// Reschedules a successfully observed Poll without creating work or increasing attempts.
 pub async fn reschedule_poll_job<C: ConnectionTrait>(
     db: &C,
@@ -2961,25 +2973,6 @@ pub(crate) async fn prepare_submit_call_with_work<C: ConnectionTrait>(
     now: DateTimeUtc,
     work: DecodeWork<'_>,
 ) -> AppResult<SubmitCallDecision> {
-    prepare_submit_core(db, claimed, now, work, None).await
-}
-
-pub(crate) async fn prepare_runtime_submit_call(
-    tx: &crate::store::RuntimeTransaction,
-    claimed: &ClaimedPinJob,
-    now: DateTimeUtc,
-    work: DecodeWork<'_>,
-) -> AppResult<SubmitCallDecision> {
-    prepare_submit_core(tx.db(), claimed, now, work, Some(tx)).await
-}
-
-async fn prepare_submit_core<C: ConnectionTrait>(
-    db: &C,
-    claimed: &ClaimedPinJob,
-    now: DateTimeUtc,
-    work: DecodeWork<'_>,
-    runtime: Option<&crate::store::RuntimeTransaction>,
-) -> AppResult<SubmitCallDecision> {
     super::management::admission::lock_sqlite_writer_in_caller_transaction(db).await?;
     let job = &claimed.model;
     let locked_until = claimed_lock(job)?;
@@ -2995,23 +2988,11 @@ async fn prepare_submit_core<C: ConnectionTrait>(
         && remote_is_reserved_without_request(db, &job.provider, &job.cid).await?;
     if !current {
         complete_job(db, &job.id, locked_until, now).await?;
-        ensure_current_reconcile(db, &job.provider, &job.cid, now, runtime).await?;
+        ensure_current_reconcile(db, &job.provider, &job.cid, now, None).await?;
         return Ok(SubmitCallDecision::NoLongerDesired);
     }
-    if !matches!(
-        job.submit_phase.as_deref(),
-        Some(SUBMIT_PHASE_READY | SUBMIT_PHASE_RECOVERY_BACKOFF)
-    ) {
-        return Err(invalid_job(
-            "submit phase is not eligible to call the provider",
-        ));
-    }
-    match runtime {
-        Some(tx) => {
-            super::quota::lock_runtime_allocation_admission(tx, &job.provider, work).await?
-        }
-        None => super::quota::lock_allocation_admission_with_work(db, &job.provider, work).await?,
-    };
+    validate_submit_call_phase(job)?;
+    super::quota::lock_allocation_admission_with_work(db, &job.provider, work).await?;
     if db.get_database_backend() == DatabaseBackend::Postgres {
         // This is the new-dispatch tail, not the historical receipt append.
         // A job-first receipt may be waiting for our earlier remote lock.
@@ -3022,7 +3003,50 @@ async fn prepare_submit_core<C: ConnectionTrait>(
         ))
         .await?;
     }
+    mark_submit_calling(db, job, locked_until, now).await?;
+    Ok(SubmitCallDecision::ReadyToCall)
+}
 
+/// The worker has already acquired the exact claim and dispatch admission.
+pub(crate) async fn prepare_runtime_submit_call(
+    tx: &crate::store::RuntimeTransaction,
+    claimed: &ClaimedPinJob,
+    now: DateTimeUtc,
+) -> AppResult<()> {
+    let job = &claimed.model;
+    validate_submit_call_phase(job)?;
+    mark_submit_calling(tx.db(), job, claimed_lock(job)?, now).await
+}
+
+pub(crate) async fn finish_stale_runtime_submit(
+    tx: &crate::store::RuntimeTransaction,
+    claimed: &ClaimedPinJob,
+    now: DateTimeUtc,
+) -> AppResult<()> {
+    let job = &claimed.model;
+    complete_job(tx.db(), &job.id, claimed_lock(job)?, now).await?;
+    ensure_current_reconcile(tx.db(), &job.provider, &job.cid, now, Some(tx)).await?;
+    Ok(())
+}
+
+fn validate_submit_call_phase(job: &pin_job::Model) -> AppResult<()> {
+    if !matches!(
+        job.submit_phase.as_deref(),
+        Some(SUBMIT_PHASE_READY | SUBMIT_PHASE_RECOVERY_BACKOFF)
+    ) {
+        return Err(invalid_job(
+            "submit phase is not eligible to call the provider",
+        ));
+    }
+    Ok(())
+}
+
+async fn mark_submit_calling<C: ConnectionTrait>(
+    db: &C,
+    job: &pin_job::Model,
+    locked_until: DateTimeUtc,
+    now: DateTimeUtc,
+) -> AppResult<()> {
     let result = pin_job::Entity::update_many()
         .col_expr(
             pin_job::Column::SubmitPhase,
@@ -3043,7 +3067,7 @@ async fn prepare_submit_core<C: ConnectionTrait>(
     if result.rows_affected != 1 {
         return Err(stale_claim_error(&job.id));
     }
-    Ok(SubmitCallDecision::ReadyToCall)
+    Ok(())
 }
 
 /// Durably records that a provider Submit may have been accepted before any recovery lookup.

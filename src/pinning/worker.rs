@@ -32,7 +32,7 @@ use crate::{
         Store,
         entities::{object, pin_job, pin_lease, pin_lease_target, pin_provider_route, remote_pin},
         pinning::{
-            jobs::{self, ClaimedPinJob, NewPinJob, SubmitCallDecision},
+            jobs::{self, ClaimedPinJob, NewPinJob},
             leases::{
                 self, FailedRemoteResubmitDecision, MAX_FAILED_REQUEST_ATTEMPTS,
                 NoRequestRemoteCompletion, RemoteDeleteCompletion, RemoteStatusApplyResult,
@@ -1727,7 +1727,13 @@ async fn dispatch_submit(
         read_context_for_job_with_work(store, coordinator, &claimed.model, work.clone()).await?;
     let txn = store.begin_runtime(DecodeWork::shared(&work)).await?;
     job_authority::lock_runtime_source(&txn, &claimed.model, work.clone()).await?;
-    leases::lock_submit_admission_frontier(&txn, &claimed.model).await?;
+    let submit_expiry =
+        leases::lock_submit_admission_frontier(&txn, &claimed.model, DecodeWork::shared(&work))
+            .await?;
+    if !jobs::fence_submit_claim_nowait(&txn, &claimed).await? {
+        txn.rollback().await?;
+        return Ok(None);
+    }
     let authority =
         job_authority::fence_runtime_authority(&txn, &claimed.model, work.clone()).await?;
     if !authority
@@ -1745,57 +1751,52 @@ async fn dispatch_submit(
         return Ok(None);
     }
     let now = Utc::now();
-    let decision =
-        jobs::prepare_runtime_submit_call(&txn, &claimed, now, DecodeWork::shared(&work)).await?;
-    let mut correlation = None;
-    let mut rpc_invocation = None;
-    if decision == SubmitCallDecision::ReadyToCall {
-        let (api, strategy) = slot.provider.invocation_route();
-        let history = jobs::record_runtime_submit_invocation(
-            &txn,
-            &claimed,
-            api,
-            strategy,
-            now,
-            DecodeWork::shared(&work),
-        )
-        .await?;
-        correlation = match history {
-            Some(history) => history.correlation,
-            None => {
-                let opaque = uuid::Uuid::new_v4().to_string();
-                let updated = jobs::history::Entity::update_many()
-                    .col_expr(jobs::history::Column::Correlation, Expr::value(&opaque))
-                    .filter(jobs::history::Column::JobId.eq(&claimed.model.id))
-                    .filter(jobs::history::Column::Correlation.is_null())
-                    .exec(&txn)
-                    .await?;
-                if updated.rows_affected != 1 {
-                    return Err(AppError::Internal(
-                        "submit correlation was not captured".to_owned(),
-                    ));
-                }
-                Some(opaque)
+    if submit_expiry.is_none_or(|expiry| expiry <= now) {
+        jobs::finish_stale_runtime_submit(&txn, &claimed, now).await?;
+        txn.commit().await?;
+        transition(&claimed, "running", "done_current_reconcile", None);
+        return Ok(None);
+    }
+    jobs::prepare_runtime_submit_call(&txn, &claimed, now).await?;
+    let (api, strategy) = slot.provider.invocation_route();
+    let history = jobs::record_runtime_submit_invocation(
+        &txn,
+        &claimed,
+        api,
+        strategy,
+        now,
+        DecodeWork::shared(&work),
+    )
+    .await?;
+    let correlation = match history {
+        Some(history) => history.correlation,
+        None => {
+            let opaque = uuid::Uuid::new_v4().to_string();
+            let updated = jobs::history::Entity::update_many()
+                .col_expr(jobs::history::Column::Correlation, Expr::value(&opaque))
+                .filter(jobs::history::Column::JobId.eq(&claimed.model.id))
+                .filter(jobs::history::Column::Correlation.is_null())
+                .exec(&txn)
+                .await?;
+            if updated.rows_affected != 1 {
+                return Err(AppError::Internal(
+                    "submit correlation was not captured".to_owned(),
+                ));
             }
-        };
-        rpc_invocation = ledger::submission::begin(&txn, &claimed, now).await?;
-        if ledger::submission::is_rpc_api(slot.provider.invocation_route().0)
-            && rpc_invocation.is_none()
-        {
-            return Err(AppError::Internal(
-                "RPC Submit lacks a captured invocation footprint".into(),
-            ));
+            Some(opaque)
         }
+    };
+    let rpc_invocation = ledger::submission::begin(&txn, &claimed, now).await?;
+    if ledger::submission::is_rpc_api(api) && rpc_invocation.is_none() {
+        return Err(AppError::Internal(
+            "RPC Submit lacks a captured invocation footprint".into(),
+        ));
     }
     let rpc_fact = match rpc_invocation.as_deref() {
         Some(id) => Some(ledger::submission::capture_fact(&txn, &claimed, id).await?),
         None => None,
     };
     txn.commit().await?;
-    if decision == SubmitCallDecision::NoLongerDesired {
-        transition(&claimed, "running", "done_current_reconcile", None);
-        return Ok(None);
-    }
     let context = context.ok_or_else(|| {
         AppError::Internal("current Submit target has no immutable owner context".to_owned())
     })?;
@@ -5057,13 +5058,29 @@ async fn capture_managed_invocation(
 ) -> AppResult<InvocationPreflight> {
     let work = crate::store::pinning::management::records::SharedDecodeBudget::default();
     let tx = store.begin_runtime(DecodeWork::shared(&work)).await?;
-    if !jobs::fence_job_claim(&tx, &claimed.model.id, claimed_lock(claimed)?).await? {
+    let submit_expiry = if matches!(managed_call, ManagedCall::Submit) {
+        job_authority::lock_runtime_source(&tx, &claimed.model, work.clone()).await?;
+        match leases::lock_submit_admission_frontier(&tx, &claimed.model, DecodeWork::shared(&work))
+            .await
+        {
+            Ok(Some(expiry)) => Some(expiry),
+            Ok(None) | Err(AppError::InvalidPinningRequest(_)) => {
+                tx.rollback().await?;
+                return Ok(InvocationPreflight::Rejected);
+            }
+            Err(error) => return Err(error),
+        }
+    } else {
+        None
+    };
+    let live = if submit_expiry.is_some() {
+        jobs::fence_submit_claim_nowait(&tx, claimed).await?
+    } else {
+        jobs::fence_job_claim(&tx, &claimed.model.id, claimed_lock(claimed)?).await?
+    };
+    if !live {
         tx.rollback().await?;
         return Ok(InvocationPreflight::StaleClaim);
-    }
-    if matches!(managed_call, ManagedCall::Submit) {
-        job_authority::lock_runtime_source(&tx, &claimed.model, work.clone()).await?;
-        leases::lock_submit_admission_frontier(&tx, &claimed.model).await?;
     }
     let authority =
         job_authority::fence_runtime_authority(&tx, &claimed.model, work.clone()).await?;
@@ -5085,7 +5102,9 @@ async fn capture_managed_invocation(
         crate::store::pinning::management::records::DecodeWork::shared(&work),
     )
     .await?;
-    if invocation_route_for_snapshot(&capture.route) != Some(provider_route) {
+    if invocation_route_for_snapshot(&capture.route) != Some(provider_route)
+        || submit_expiry.is_some_and(|expiry| expiry <= Utc::now())
+    {
         tx.rollback().await?;
         return Ok(InvocationPreflight::Rejected);
     }
