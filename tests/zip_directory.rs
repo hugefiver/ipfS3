@@ -17,7 +17,7 @@ fn file(path: &str, cid: &str) -> DirectoryFile {
     }
 }
 
-async fn mount_one_file_root(server: &MockServer, pin_status: u16) {
+async fn mount_file_root(server: &MockServer, pin_status: u16, builds: u64) {
     Mock::given(method("POST"))
         .and(path("/api/v0/files/stat"))
         .and(query_param("arg", format!("/ipfs/{EMPTY_RAW}")))
@@ -41,7 +41,7 @@ async fn mount_one_file_root(server: &MockServer, pin_status: u16) {
             ResponseTemplate::new(200)
                 .set_body_string(format!("{{\"Cid\":{{\"/\":\"{DIRECTORY_CID}\"}}}}")),
         )
-        .expect(1)
+        .expect(builds)
         .mount(server)
         .await;
     Mock::given(method("POST"))
@@ -52,7 +52,7 @@ async fn mount_one_file_root(server: &MockServer, pin_status: u16) {
             ResponseTemplate::new(pin_status)
                 .set_body_string(format!("{{\"Pins\":[\"{DIRECTORY_CID}\"]}}")),
         )
-        .expect(1)
+        .expect(builds)
         .mount(server)
         .await;
 }
@@ -70,7 +70,7 @@ async fn mount_identity(server: &MockServer) {
 #[tokio::test]
 async fn confirmed_pin_then_bad_path_retains_known_root_without_receipt() {
     let server = MockServer::start().await;
-    mount_one_file_root(&server, 200).await;
+    mount_file_root(&server, 200, 1).await;
     Mock::given(method("POST"))
         .and(path("/api/v0/resolve"))
         .respond_with(
@@ -98,7 +98,7 @@ async fn confirmed_pin_then_bad_path_retains_known_root_without_receipt() {
 #[tokio::test]
 async fn root_pin_failure_still_retains_candidate_without_receipt() {
     let server = MockServer::start().await;
-    mount_one_file_root(&server, 503).await;
+    mount_file_root(&server, 503, 1).await;
     let error = build_directory(
         &KuboClient::new(server.uri()),
         &[file("a", EMPTY_RAW)],
@@ -114,7 +114,7 @@ async fn root_pin_failure_still_retains_candidate_without_receipt() {
 #[tokio::test]
 async fn failed_local_verification_retains_candidate_without_receipt() {
     let server = MockServer::start().await;
-    mount_one_file_root(&server, 200).await;
+    mount_file_root(&server, 200, 1).await;
     Mock::given(method("POST"))
         .and(path("/api/v0/resolve"))
         .respond_with(
@@ -201,7 +201,7 @@ async fn child_directory_is_pinned_on_put_before_parent_write() {
 #[tokio::test]
 async fn cancellation_after_root_emission_retains_candidate_without_success() {
     let server = MockServer::start().await;
-    mount_one_file_root(&server, 200).await;
+    mount_file_root(&server, 200, 1).await;
     let (started, ready) = tokio::sync::oneshot::channel();
     let started = std::sync::Mutex::new(Some(started));
     Mock::given(method("POST"))
@@ -236,6 +236,152 @@ async fn cancellation_after_root_emission_retains_candidate_without_success() {
     let candidate = error.candidate().expect("root emitted before cancellation");
     assert_eq!(candidate.cid, DIRECTORY_CID);
     assert_eq!(candidate.node_identity, NODE_ID);
+}
+
+#[tokio::test]
+async fn queued_directory_build_starts_between_verification_rpcs_with_four_slot_cap() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use axum::{Router, body::to_bytes, extract::Request};
+    use tokio::sync::{mpsc, oneshot};
+    use tokio::time::timeout;
+
+    let kubo = MockServer::start().await;
+    mount_file_root(&kubo, 200, 5).await;
+    for (rpc, body) in [
+        ("resolve", format!("{{\"Path\":\"/ipfs/{EMPTY_RAW}\"}}")),
+        (
+            "pin/ls",
+            format!("{{\"Keys\":{{\"{DIRECTORY_CID}\":{{\"Type\":\"recursive\"}}}}}}"),
+        ),
+        (
+            "files/stat",
+            format!("{{\"Hash\":\"{DIRECTORY_CID}\",\"WithLocality\":true,\"Local\":true}}"),
+        ),
+    ] {
+        let mut mock = Mock::given(method("POST")).and(path(format!("/api/v0/{rpc}")));
+        if rpc == "files/stat" {
+            mock = mock.and(query_param("with-local", "true"));
+        }
+        mock.respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&kubo)
+            .await;
+    }
+
+    let (arrived, mut arrivals) = mpsc::unbounded_channel::<(bool, oneshot::Sender<()>)>();
+    let release_rest = CancellationToken::new();
+    let release = release_rest.clone();
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let observed_peak = peak.clone();
+    let backend = kubo.uri();
+    let http = reqwest::Client::new();
+    let proxy = Router::new().fallback(move |request: Request| {
+        let (arrived, release, active, peak, backend, http) = (
+            arrived.clone(),
+            release.clone(),
+            active.clone(),
+            peak.clone(),
+            backend.clone(),
+            http.clone(),
+        );
+        async move {
+            peak.fetch_max(active.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+            let (parts, body) = request.into_parts();
+            let target = parts.uri.path_and_query().unwrap().as_str();
+            let (next_build, target) = match target.strip_prefix("/next") {
+                Some(target) => (true, target),
+                None => (false, target),
+            };
+            if !release.is_cancelled()
+                && (target.starts_with("/api/v0/resolve?")
+                    || next_build && target.starts_with("/api/v0/files/stat?"))
+            {
+                let (resume, wait) = oneshot::channel();
+                arrived.send((next_build, resume)).unwrap();
+                tokio::select! {
+                    _ = release.cancelled() => {},
+                    _ = wait => {},
+                }
+            }
+            let response = http
+                .request(parts.method, format!("{backend}{target}"))
+                .body(to_bytes(body, MAX_DIRECTORY_BLOCK_BYTES).await.unwrap())
+                .send()
+                .await
+                .unwrap();
+            let reply = (response.status(), response.bytes().await.unwrap());
+            active.fetch_sub(1, Ordering::SeqCst);
+            reply
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, proxy).await.unwrap() });
+
+    let mut builds = tokio::task::JoinSet::new();
+    for _ in 0..4 {
+        let client = KuboClient::new(endpoint.clone());
+        builds.spawn(async move {
+            build_directory(
+                &client,
+                &[file("a", EMPTY_RAW), file("b", EMPTY_RAW)],
+                &CancellationToken::new(),
+            )
+            .await
+        });
+    }
+    let limit = Duration::from_secs(10);
+    let mut blocked = Vec::new();
+    for _ in 0..4 {
+        let (next_build, resume) = timeout(limit, arrivals.recv()).await.unwrap().unwrap();
+        assert!(!next_build);
+        blocked.push(resume);
+    }
+    let (polled, queued) = oneshot::channel();
+    builds.spawn(async move {
+        let client = KuboClient::new(format!("{endpoint}/next"));
+        let files = [file("next", EMPTY_RAW)];
+        let cancel = CancellationToken::new();
+        let build = build_directory(&client, &files, &cancel);
+        tokio::pin!(build);
+        assert!(futures_util::poll!(&mut build).is_pending());
+        polled.send(()).unwrap();
+        build.await
+    });
+    queued.await.unwrap();
+    assert!(
+        timeout(Duration::from_millis(100), arrivals.recv())
+            .await
+            .is_err(),
+        "the queued build must not issue I/O while all four verification RPCs are blocked"
+    );
+
+    blocked.pop().unwrap().send(()).unwrap();
+    let (next_build, resume) = timeout(limit, arrivals.recv())
+        .await
+        .expect("queued build should start before any older build completes verification")
+        .unwrap();
+    assert!(
+        next_build,
+        "the queued build must get the released slot first"
+    );
+    assert_eq!(observed_peak.load(Ordering::SeqCst), 4);
+    release_rest.cancel();
+    drop((blocked, resume));
+
+    timeout(limit, async {
+        while let Some(result) = builds.join_next().await {
+            let root = result.unwrap().unwrap().unwrap();
+            assert_eq!(root.local_residency.cid, DIRECTORY_CID);
+        }
+    })
+    .await
+    .expect("all directory builds should finish verification once released");
+    assert_eq!(observed_peak.load(Ordering::SeqCst), 4);
+    server.abort();
 }
 
 #[tokio::test]

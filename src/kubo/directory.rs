@@ -9,7 +9,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use http_body_util::BodyExt as _;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, SemaphorePermit};
 use tokio_util::sync::CancellationToken;
 
 use super::{KuboClient, LocalResidencyVerificationReceipt, send_request};
@@ -236,11 +236,71 @@ async fn build(
     if files.is_empty() {
         return Ok(None);
     }
-    let _slot = tokio::select! {
-        _ = cancel.cancelled() => return Err(DirectoryBuildError::Canceled),
-        slot = BUILD_SLOTS.acquire() => slot.expect("directory builder semaphore is never closed"),
+    let root = build_root(kubo, files, cancel, candidate).await?;
+    let root_cid = root.to_string();
+    let url = rpc_url(
+        kubo,
+        "pin/add",
+        &[("arg", &root_cid), ("recursive", "true")],
+    )?;
+    let pin: PinResponse = {
+        let _slot = acquire_slot(cancel).await?;
+        rpc_json(kubo, kubo.http().post(url), cancel).await?
     };
+    if pin.pins.len() != 1 || parse_cid(&pin.pins[0])? != root {
+        return Err(DirectoryBuildError::Kubo(AppError::kubo_rpc_detail(
+            "Kubo directory recursive pin was not confirmed",
+        )));
+    }
 
+    // Kubo must actually resolve every original leaf by its path; a complete
+    // local root alone cannot establish the requested mapping of names to CIDs.
+    for file in files {
+        let expected = parse_cid(&file.cid).expect("file CID validated during construction");
+        let path = format!("/ipfs/{root_cid}/{}", file.path);
+        let url = rpc_url(kubo, "resolve", &[("arg", &path)])?;
+        let resolved: ResolveResponse = {
+            let _slot = acquire_slot(cancel).await?;
+            rpc_json(kubo, kubo.http().post(url), cancel).await?
+        };
+        let terminal = resolved
+            .path
+            .strip_prefix("/ipfs/")
+            .filter(|suffix| !suffix.contains('/'))
+            .ok_or_else(|| AppError::kubo_rpc_detail("invalid Kubo directory path resolution"))?;
+        if parse_cid(terminal)? != expected {
+            return Err(DirectoryBuildError::Kubo(AppError::kubo_rpc_detail(
+                "Kubo directory path did not resolve to the original CID",
+            )));
+        }
+    }
+    let local_residency = {
+        let _slot = acquire_slot(cancel).await?;
+        tokio::select! {
+            _ = cancel.cancelled() => return Err(DirectoryBuildError::Canceled),
+            result = kubo.verify_local_residency(&root_cid) => result?,
+        }
+    };
+    Ok(Some(DirectoryRoot {
+        cid: root_cid,
+        local_residency,
+    }))
+}
+
+async fn acquire_slot(cancel: &CancellationToken) -> BuildResult<SemaphorePermit<'static>> {
+    tokio::select! {
+        _ = cancel.cancelled() => Err(DirectoryBuildError::Canceled),
+        slot = BUILD_SLOTS.acquire() => Ok(slot.expect("directory builder semaphore is never closed")),
+    }
+}
+
+async fn build_root(
+    kubo: &KuboClient,
+    files: &[DirectoryFile],
+    cancel: &CancellationToken,
+    candidate: &mut Option<DirectoryCandidate>,
+) -> BuildResult<cid::Cid> {
+    let _slot = acquire_slot(cancel).await?;
     let mut used_bytes = 0_usize;
     let mut paths = BTreeSet::<Vec<String>>::new();
     let mut directories = BTreeMap::<Vec<String>, Vec<Link>>::new();
@@ -337,45 +397,7 @@ async fn build(
                 });
         }
     }
-    let root = root.expect("nonempty manifest has root");
-    let root_cid = root.to_string();
-    let url = rpc_url(
-        kubo,
-        "pin/add",
-        &[("arg", &root_cid), ("recursive", "true")],
-    )?;
-    let pin: PinResponse = rpc_json(kubo, kubo.http().post(url), cancel).await?;
-    if pin.pins.len() != 1 || parse_cid(&pin.pins[0])? != root {
-        return Err(DirectoryBuildError::Kubo(AppError::kubo_rpc_detail(
-            "Kubo directory recursive pin was not confirmed",
-        )));
-    }
-
-    // Kubo must actually resolve every original leaf by its path; a complete
-    // local root alone cannot establish the requested mapping of names to CIDs.
-    for (parts, expected) in entries {
-        let path = format!("/ipfs/{}/{}", root_cid, parts.join("/"));
-        let url = rpc_url(kubo, "resolve", &[("arg", &path)])?;
-        let resolved: ResolveResponse = rpc_json(kubo, kubo.http().post(url), cancel).await?;
-        let terminal = resolved
-            .path
-            .strip_prefix("/ipfs/")
-            .filter(|suffix| !suffix.contains('/'))
-            .ok_or_else(|| AppError::kubo_rpc_detail("invalid Kubo directory path resolution"))?;
-        if parse_cid(terminal)? != expected {
-            return Err(DirectoryBuildError::Kubo(AppError::kubo_rpc_detail(
-                "Kubo directory path did not resolve to the original CID",
-            )));
-        }
-    }
-    let local_residency = tokio::select! {
-        _ = cancel.cancelled() => return Err(DirectoryBuildError::Canceled),
-        result = kubo.verify_local_residency(&root_cid) => result?,
-    };
-    Ok(Some(DirectoryRoot {
-        cid: root_cid,
-        local_residency,
-    }))
+    Ok(root.expect("nonempty manifest has root"))
 }
 
 fn parse_cid(text: &str) -> BuildResult<cid::Cid> {
